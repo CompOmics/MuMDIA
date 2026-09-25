@@ -516,6 +516,13 @@ pub struct Evidence {
     /// several test fixtures fill it with `vec![]`, and a short profile would degrade
     /// silently rather than fail (see the comment in `interference::values`).
     pub ref_profile_full: Vec<f64>,
+    /// The pairwise and reference correlations several families and `fragment_features`
+    /// all computed from `traces`, `ref_profile`, `traces_full` and `ref_profile_full`,
+    /// computed once per PSM by `PairStats::new` from exactly those fields. `Some` only
+    /// from `evidence_from`; a reader uses it when its shape matches the evidence it is
+    /// reading (`PairStats::fits`) and computes the value itself otherwise, which is
+    /// what the `vec![]`-filled test fixtures (with `None`) exercise.
+    pub pair_stats: Option<PairStats>,
     // --- scalars (filled by the caller after build) ---
     pub apex_rt: f64,
     pub rt_pred_cal: f64,
@@ -582,10 +589,243 @@ fn weighted_reference_full(traces_full: &[Vec<f64>], pred: &[f64], t: usize) -> 
     r
 }
 
+/// Observed intensity at the scan nearest the apex, per row (the first of two equally near
+/// scans, by the strict `<`), widened to f64. `fragment_features` and `build_evidence` each
+/// ran this K x T search over the same rows; the caller now runs it once per PSM and hands
+/// the result to both.
+fn apex_intensities(rows: &[ChromRow], apex_rt: f64) -> Vec<f64> {
+    rows.iter()
+        .map(|r| {
+            let mut best = 0.0f32;
+            let mut bestd = f64::MAX;
+            for (k, &rt) in r.rt.iter().enumerate() {
+                let d = (rt as f64 - apex_rt).abs();
+                if d < bestd {
+                    bestd = d;
+                    best = r.inten[k];
+                }
+            }
+            best as f64
+        })
+        .collect()
+}
+
+/// The elution-peak window `lo..=hi` on the union axis: the global half-widths when a
+/// confident set gave them, otherwise the walk down the smoothed top-3-predicted profile
+/// from the apex-nearest scan; the whole axis below three points. `fragment_features`
+/// (under `bound_features`) and `build_evidence` each carried this block, identical term
+/// for term, and computed it twice per PSM.
+fn peak_window(
+    axis_full: &[f32],
+    traces_full: &[Vec<f64>],
+    pred: &[f64],
+    apex_rt: f64,
+    frac: f64,
+    grace: usize,
+    global_bounds: Option<(f64, f64)>,
+) -> (usize, usize) {
+    if axis_full.len() < 3 {
+        return (0, axis_full.len().saturating_sub(1));
+    }
+    let ai = axis_full
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (**a as f64 - apex_rt)
+                .abs()
+                .total_cmp(&(**b as f64 - apex_rt).abs())
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    match global_bounds {
+        Some((l, r)) => global_bound_indices(axis_full, apex_rt, ai, l, r),
+        None => {
+            let mut ord: Vec<usize> = (0..pred.len()).collect();
+            ord.sort_by(|&a, &b| pred[b].total_cmp(&pred[a]));
+            let k3: Vec<usize> = ord.into_iter().take(3).collect();
+            let prof_raw: Vec<f64> = (0..axis_full.len())
+                .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
+                .collect();
+            let prof = smooth3(&prof_raw);
+            peak_bounds(&prof, ai, frac, grace)
+        }
+    }
+}
+
+/// The pairwise and fragment-vs-reference statistics of one PSM's peak-window traces,
+/// computed once and read by `fragment_features` and the `coelution`, `interference`,
+/// `ion_series` and `nonzero` families.
+///
+/// Each of them computed some of these itself, from the same traces: the pair Pearson
+/// matrix and the lag-optimised cross-correlation of every pair (in `fragment_features`
+/// and again in `coelution`, which docs/28 section 3.1 found bit-identical as columns),
+/// subsets of the same pair matrix (`ion_series` per series and for complementary pairs,
+/// `nonzero` when every scan carries signal), every fragment against the reference
+/// profile (four times per fragment) and every full-window trace against the full-window
+/// reference (twice). Every entry here is produced by the same kernel call the reader made
+/// (`pearson_pairs`, `best_xcorr_normed`, `pearson_vs`), on the same arguments in the same
+/// order, so a read is bit-identical to the computation it replaces. Pearson is exactly
+/// symmetric, so `corr(b, a)` serves a pair asked for the other way round; the
+/// cross-correlation is not, and is stored for `a < b` only, the one order every reader uses.
+pub struct PairStats {
+    k: usize,
+    np: usize,
+    /// `k x k` row-major, `pearson(traces[a], traces[b])` off the diagonal, 1.0 on it.
+    corr: Vec<f64>,
+    /// `k x k` row-major, `best_xcorr_normed(traces[a], traces[b], 5, ..)` for `a < b`.
+    xcorr: Vec<(i32, f64)>,
+    /// `xcorr_norm(traces[f])`.
+    norms: Vec<f64>,
+    /// `pearson(traces[f], ref_profile)`.
+    ref_corr: Vec<f64>,
+    /// `pearson(traces_full[f], ref_profile_full)`, or empty when `traces_full` does not
+    /// have one row per fragment.
+    ref_corr_full: Vec<f64>,
+}
+
+impl PairStats {
+    fn new(
+        traces: &[Vec<f64>],
+        np: usize,
+        ref_profile: &[f64],
+        traces_full: &[Vec<f64>],
+        ref_profile_full: &[f64],
+    ) -> PairStats {
+        let k = traces.len();
+        let mut pairs: Vec<f64> = Vec::with_capacity(k * k.saturating_sub(1) / 2);
+        pearson_pairs(traces, &mut pairs);
+        let mut pairs = pairs.into_iter();
+        let norms: Vec<f64> = traces.iter().map(|t| xcorr_norm(t)).collect();
+        let mut corr = vec![0.0f64; k * k];
+        let mut xcorr = vec![(0i32, 0.0f64); k * k];
+        for a in 0..k {
+            corr[a * k + a] = 1.0;
+            for b in (a + 1)..k {
+                let p = pairs.next().expect("one correlation per pair");
+                corr[a * k + b] = p;
+                corr[b * k + a] = p;
+                xcorr[a * k + b] = best_xcorr_normed(
+                    &traces[a],
+                    &traces[b],
+                    XCORR_MAXLAG as i32,
+                    norms[a],
+                    norms[b],
+                );
+            }
+        }
+        let rc = Centered::new(ref_profile);
+        let ref_corr = traces
+            .iter()
+            .map(|t| pearson_vs(t, ref_profile, &rc))
+            .collect();
+        let ref_corr_full = if traces_full.len() == k {
+            let rfc = Centered::new(ref_profile_full);
+            traces_full
+                .iter()
+                .map(|t| pearson_vs(t, ref_profile_full, &rfc))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        PairStats {
+            k,
+            np,
+            corr,
+            xcorr,
+            norms,
+            ref_corr,
+            ref_corr_full,
+        }
+    }
+
+    /// Whether these statistics describe `k` fragments on an `np`-point peak window. A
+    /// reader checks it before trusting a read: `Evidence` has `pub` fields and could be
+    /// assembled around statistics of other traces.
+    pub(crate) fn fits(&self, k: usize, np: usize) -> bool {
+        self.k == k && self.np == np
+    }
+
+    /// `pearson(traces[a], traces[b])`, either order; 1.0 when `a == b`.
+    pub(crate) fn corr(&self, a: usize, b: usize) -> f64 {
+        self.corr[a * self.k + b]
+    }
+
+    /// The `k x k` pair matrix, row-major, 1.0 on the diagonal.
+    pub(crate) fn corr_matrix(&self) -> &[f64] {
+        &self.corr
+    }
+
+    /// `best_xcorr(traces[a], traces[b], 5)` for `a < b`.
+    pub(crate) fn xcorr(&self, a: usize, b: usize) -> (i32, f64) {
+        debug_assert!(a < b, "the cross-correlation is stored for a < b only");
+        self.xcorr[a * self.k + b]
+    }
+
+    pub(crate) fn norms(&self) -> &[f64] {
+        &self.norms
+    }
+
+    pub(crate) fn ref_corr(&self) -> &[f64] {
+        &self.ref_corr
+    }
+
+    /// `pearson(traces_full[f], ref_profile_full)` per fragment, when it was computed.
+    pub(crate) fn ref_corr_full(&self) -> Option<&[f64]> {
+        (self.ref_corr_full.len() == self.k).then_some(&self.ref_corr_full[..])
+    }
+}
+
+/// One PSM's elution-peak window and everything `fragment_features` and
+/// [`evidence_from`] both need from it: the window, the traces sliced to it, the
+/// predicted-intensity-weighted reference profile over it (clamped weights) and over the
+/// whole window (raw weights), and the [`PairStats`]. Built once per PSM from the
+/// alignment; `fragment_features` borrows it when `bound_features` makes its window the
+/// same one, and the Evidence then takes it over.
+struct PeakTraces {
+    lo: usize,
+    hi: usize,
+    traces: Vec<Vec<f64>>,
+    ref_profile: Vec<f64>,
+    ref_profile_full: Vec<f64>,
+    stats: PairStats,
+}
+
+impl PeakTraces {
+    fn new(al: &TraceAlign, pred: &[f64], (lo, hi): (usize, usize)) -> PeakTraces {
+        let traces: Vec<Vec<f64>> = al.traces_full.iter().map(|t| t[lo..=hi].to_vec()).collect();
+        let np = al.axis_full[lo..=hi].len();
+        let mut ref_profile = vec![0.0f64; np];
+        for (fi, tr) in traces.iter().enumerate() {
+            let w = pred[fi].max(0.0);
+            for k in 0..np {
+                ref_profile[k] += w * tr[k];
+            }
+        }
+        let ref_profile_full = weighted_reference_full(&al.traces_full, pred, al.axis_full.len());
+        let stats = PairStats::new(
+            &traces,
+            np,
+            &ref_profile,
+            &al.traces_full,
+            &ref_profile_full,
+        );
+        PeakTraces {
+            lo,
+            hi,
+            traces,
+            ref_profile,
+            ref_profile_full,
+            stats,
+        }
+    }
+}
+
 /// Build the trace-derived fields of [`Evidence`] from a PSM's chromatogram
-/// rows (scalar fields default; the caller fills them). Mirrors the alignment
-/// and peak-bounding of [`fragment_features`] so the extended families see the
-/// same elution peak the legacy features use.
+/// rows (scalar fields default; the caller fills them), in one call. The chunked pass
+/// builds the same parts itself ([`apex_intensities`], [`peak_window`], [`PeakTraces`])
+/// so that `fragment_features` can share them, then calls [`evidence_from`]; this is the
+/// one-call form the tests use.
+#[cfg(test)]
 fn build_evidence(
     rows: &[ChromRow],
     al: TraceAlign,
@@ -595,9 +835,35 @@ fn build_evidence(
     grace: usize,
     global_bounds: Option<(f64, f64)>,
 ) -> Evidence {
+    let obs = apex_intensities(rows, apex_rt);
+    let pred: Vec<f64> = rows.iter().map(|r| r.pred_int as f64).collect();
+    let win = peak_window(
+        &al.axis_full,
+        &al.traces_full,
+        &pred,
+        apex_rt,
+        frac,
+        grace,
+        global_bounds,
+    );
+    let peak = PeakTraces::new(&al, &pred, win);
+    evidence_from(rows, al, obs, pred, peak, ms1_rows, apex_rt)
+}
+
+/// The trace-derived fields of [`Evidence`] from parts built once per PSM: the apex
+/// intensities, the predicted intensities, the alignment (moved in: the Evidence owns it)
+/// and the peak window with its statistics. The families therefore see the same elution
+/// peak the legacy features use.
+fn evidence_from(
+    rows: &[ChromRow],
+    al: TraceAlign,
+    obs_apex: Vec<f64>,
+    pred: Vec<f64>,
+    peak: PeakTraces,
+    ms1_rows: &[ChromRow],
+    apex_rt: f64,
+) -> Evidence {
     let m = rows.len();
-    let mut obs_apex = Vec::with_capacity(m);
-    let mut pred = Vec::with_capacity(m);
     let mut is_b = Vec::with_capacity(m);
     let mut ordinal = Vec::with_capacity(m);
     let mut frag_charge = Vec::with_capacity(m);
@@ -605,17 +871,6 @@ fn build_evidence(
     let mut frag_obs_mz = Vec::with_capacity(m);
     let mut mass_err_ppm = Vec::with_capacity(m);
     for r in rows {
-        let mut best = 0.0f32;
-        let mut bestd = f64::MAX;
-        for (k, &rt) in r.rt.iter().enumerate() {
-            let d = (rt as f64 - apex_rt).abs();
-            if d < bestd {
-                bestd = d;
-                best = r.inten[k];
-            }
-        }
-        obs_apex.push(best as f64);
-        pred.push(r.pred_int as f64);
         let (b, o, c) = parse_ion(r.frag_name);
         is_b.push(b);
         ordinal.push(o);
@@ -631,39 +886,15 @@ fn build_evidence(
         axis_full,
         traces_full,
     } = al;
-
-    let (lo_i, hi_i) = if axis_full.len() >= 3 {
-        let ai = axis_full
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                (**a as f64 - apex_rt)
-                    .abs()
-                    .total_cmp(&(**b as f64 - apex_rt).abs())
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        match global_bounds {
-            Some((l, r)) => global_bound_indices(&axis_full, apex_rt, ai, l, r),
-            None => {
-                let mut ord: Vec<usize> = (0..pred.len()).collect();
-                ord.sort_by(|&a, &b| pred[b].total_cmp(&pred[a]));
-                let k3: Vec<usize> = ord.into_iter().take(3).collect();
-                let prof_raw: Vec<f64> = (0..axis_full.len())
-                    .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
-                    .collect();
-                let prof = smooth3(&prof_raw);
-                peak_bounds(&prof, ai, frac, grace)
-            }
-        }
-    } else {
-        (0, axis_full.len().saturating_sub(1))
-    };
+    let PeakTraces {
+        lo: lo_i,
+        hi: hi_i,
+        traces,
+        ref_profile,
+        ref_profile_full,
+        stats,
+    } = peak;
     let axis: Vec<f64> = axis_full[lo_i..=hi_i].iter().map(|&x| x as f64).collect();
-    let traces: Vec<Vec<f64>> = traces_full
-        .iter()
-        .map(|t| t[lo_i..=hi_i].to_vec())
-        .collect();
     let axis_full_f: Vec<f64> = axis_full.iter().map(|&x| x as f64).collect();
 
     let apex_idx = axis
@@ -672,16 +903,6 @@ fn build_evidence(
         .min_by(|(_, a), (_, b)| (*a - apex_rt).abs().total_cmp(&(*b - apex_rt).abs()))
         .map(|(i, _)| i)
         .unwrap_or(0);
-
-    let np = axis.len();
-    let mut ref_profile = vec![0.0f64; np];
-    for (fi, tr) in traces.iter().enumerate() {
-        let w = pred[fi].max(0.0);
-        for k in 0..np {
-            ref_profile[k] += w * tr[k];
-        }
-    }
-    let ref_profile_full = weighted_reference_full(&traces_full, &pred, axis_full_f.len());
 
     // MS1 isotope XICs [mono, +1, +2] sampled on the same grid as the fragments,
     // mapped onto axis_full then sliced to the elution peak. Present only when the
@@ -748,6 +969,7 @@ fn build_evidence(
         apex_idx,
         ref_profile,
         ref_profile_full,
+        pair_stats: Some(stats),
         apex_rt,
         rt_pred_cal: 0.0,
         rt_err: 0.0,
@@ -2752,12 +2974,45 @@ fn run_chunked(
                     // values, as before.
                     return FragFeatures::default();
                 }
-                // One alignment per PSM, read by `fragment_features` and then moved
-                // into the Evidence: it used to be rebuilt inside each of them.
+                // One alignment and one apex-intensity search per PSM, read by
+                // `fragment_features` and then moved into the Evidence: they used to be
+                // rebuilt inside each of them.
                 let al = align_traces(&rows);
+                let obs = apex_intensities(&rows, apex_rt[i]);
+                if ext.is_empty() {
+                    return fragment_features(
+                        &rows,
+                        &al,
+                        &obs,
+                        None,
+                        apex_rt[i],
+                        p.cfg.coelution_corr_threshold,
+                        p.cfg.bound_features,
+                        p.cfg.bound_peak_fraction,
+                        p.cfg.bound_peak_grace,
+                        global_bounds,
+                    );
+                }
+                // The Extended set: the peak window, its traces, the reference profiles
+                // and the pair statistics once. `fragment_features` shares them when
+                // `bound_features` makes its window this one; without it, it scores the
+                // whole extracted window and computes its own.
+                let pred: Vec<f64> = rows.iter().map(|r| r.pred_int as f64).collect();
+                let win = peak_window(
+                    &al.axis_full,
+                    &al.traces_full,
+                    &pred,
+                    apex_rt[i],
+                    p.cfg.bound_peak_fraction,
+                    p.cfg.bound_peak_grace,
+                    global_bounds,
+                );
+                let peak = PeakTraces::new(&al, &pred, win);
                 let ff = fragment_features(
                     &rows,
                     &al,
+                    &obs,
+                    p.cfg.bound_features.then_some(&peak),
                     apex_rt[i],
                     p.cfg.coelution_corr_threshold,
                     p.cfg.bound_features,
@@ -2765,19 +3020,11 @@ fn run_chunked(
                     p.cfg.bound_peak_grace,
                     global_bounds,
                 );
-                if !ext.is_empty() {
+                {
                     let ms1_rows = ci
                         .map(|c| store.rows(&store.ms1, c, &names))
                         .unwrap_or_default();
-                    let mut ev = build_evidence(
-                        &rows,
-                        al,
-                        &ms1_rows,
-                        apex_rt[i],
-                        p.cfg.bound_peak_fraction,
-                        p.cfg.bound_peak_grace,
-                        global_bounds,
-                    );
+                    let mut ev = evidence_from(&rows, al, obs, pred, peak, &ms1_rows, apex_rt[i]);
                     ev.rt_pred_cal = rt_cal[i];
                     ev.rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
                     ev.gradient = gradient;
@@ -3261,11 +3508,19 @@ fn elution_peak_rt_bounds(
 }
 
 // The peak-bounding knobs (`bound`, `frac`, `grace`, `global_bounds`) are passed through
-// from the config as they always were; the alignment is the eighth.
+// from the config as they always were; the alignment, the apex intensities and the shared
+// peak window are the others.
+//
+// `shared` is the PSM's [`PeakTraces`] when the caller built one AND `bound` is set, which
+// is exactly when this function's own peak window is that one: both walk the same profile
+// with the same knobs (`peak_window`). Without `bound` it scores the whole extracted window
+// and must not share.
 #[allow(clippy::too_many_arguments)]
 fn fragment_features(
     rows: &[ChromRow],
     al: &TraceAlign,
+    obs: &[f64],
+    shared: Option<&PeakTraces>,
     apex_rt: f64,
     coel_thresh: f64,
     bound: bool,
@@ -3273,42 +3528,36 @@ fn fragment_features(
     grace: usize,
     global_bounds: Option<(f64, f64)>,
 ) -> FragFeatures {
+    debug_assert!(
+        bound || shared.is_none(),
+        "the whole-window path must not share"
+    );
     let mut f = FragFeatures::default();
-    // Observed apex intensity per fragment (nearest scan to apex).
-    let mut obs = Vec::with_capacity(rows.len());
+    // Observed apex intensity per fragment (nearest scan to apex): `obs`, from
+    // `apex_intensities`, the f64 widening of the value this loop used to find itself.
     let mut pred = Vec::with_capacity(rows.len());
     let mut mass_err = Vec::new();
     let mut mass_w = Vec::new();
-    for r in rows {
-        let mut best = 0.0f32;
-        let mut bestd = f64::MAX;
-        for (k, &rt) in r.rt.iter().enumerate() {
-            let d = (rt as f64 - apex_rt).abs();
-            if d < bestd {
-                bestd = d;
-                best = r.inten[k];
-            }
-        }
-        obs.push(best as f64);
+    for (r, &best) in rows.iter().zip(obs) {
         pred.push(r.pred_int as f64);
         let pe = ppm_diff(r.frag_obs_mz, r.frag_mz).abs();
         mass_err.push(pe);
-        mass_w.push(best as f64);
+        mass_w.push(best);
         let is_b = r.frag_name.starts_with('b');
         if is_b {
-            f.sum_b += best as f64;
+            f.sum_b += best;
             f.n_b += 1.0;
         } else {
-            f.sum_y += best as f64;
+            f.sum_y += best;
             f.n_y += 1.0;
         }
     }
-    f.frag_corr = pearson(&obs, &pred);
-    f.frag_cosine = cosine(&obs, &pred);
-    f.spectral_angle = spectral_angle(&obs, &pred);
+    f.frag_corr = pearson(obs, &pred);
+    f.frag_cosine = cosine(obs, &pred);
+    f.spectral_angle = spectral_angle(obs, &pred);
 
     // normalized manhattan + rmsd on sum-normalized vectors
-    let (on, pn) = (normalize_sum(&obs), normalize_sum(&pred));
+    let (on, pn) = (normalize_sum(obs), normalize_sum(&pred));
     f.norm_manhattan = on.iter().zip(&pn).map(|(a, b)| (a - b).abs()).sum();
     let m = on.len().max(1) as f64;
     f.rmsd = (on
@@ -3343,39 +3592,32 @@ fn fragment_features(
     // co-elution/profile scores).
     let axis_full = &al.axis_full;
     let traces_full = &al.traces_full;
-    let (lo_i, hi_i) = if bound && axis_full.len() >= 3 {
-        // boundary on the smoothed summed top-3-predicted-fragment profile, around apex
-        let ai = axis_full
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                (**a as f64 - apex_rt)
-                    .abs()
-                    .total_cmp(&(**b as f64 - apex_rt).abs())
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        match global_bounds {
-            Some((l, r)) => global_bound_indices(axis_full, apex_rt, ai, l, r),
-            None => {
-                let mut ord: Vec<usize> = (0..pred.len()).collect();
-                ord.sort_by(|&a, &b| pred[b].total_cmp(&pred[a]));
-                let k3: Vec<usize> = ord.into_iter().take(3).collect();
-                let prof_raw: Vec<f64> = (0..axis_full.len())
-                    .map(|k| k3.iter().map(|&i| traces_full[i][k]).sum::<f64>())
-                    .collect();
-                let prof = smooth3(&prof_raw);
-                peak_bounds(&prof, ai, frac, grace)
-            }
-        }
-    } else {
-        (0, axis_full.len().saturating_sub(1))
+    // boundary on the smoothed summed top-3-predicted-fragment profile, around apex
+    let (lo_i, hi_i) = match shared {
+        Some(pk) => (pk.lo, pk.hi),
+        None if bound => peak_window(
+            axis_full,
+            traces_full,
+            &pred,
+            apex_rt,
+            frac,
+            grace,
+            global_bounds,
+        ),
+        None => (0, axis_full.len().saturating_sub(1)),
     };
-    let axis: Vec<f32> = axis_full[lo_i..=hi_i].to_vec();
-    let traces: Vec<Vec<f64>> = traces_full
-        .iter()
-        .map(|t| t[lo_i..=hi_i].to_vec())
-        .collect();
+    let axis: &[f32] = &axis_full[lo_i..=hi_i];
+    let traces_owned: Vec<Vec<f64>>;
+    let traces: &[Vec<f64>] = match shared {
+        Some(pk) => &pk.traces,
+        None => {
+            traces_owned = traces_full
+                .iter()
+                .map(|t| t[lo_i..=hi_i].to_vec())
+                .collect();
+            &traces_owned
+        }
+    };
     f.n_observations = axis.len() as f64;
     f.elution_lo = axis.first().map(|&x| x as f64).unwrap_or(0.0);
     f.elution_hi = axis.last().map(|&x| x as f64).unwrap_or(0.0);
@@ -3388,16 +3630,30 @@ fn fragment_features(
     let mut lags = Vec::new();
     let mut shapes = Vec::new();
     if axis.len() >= 2 {
-        // Every pair's correlation from traces centred once (`pearson_pairs`, bit-identical
-        // to `pearson` pair by pair), in the same (a, b) order the loop below visits.
-        pearson_pairs(&traces, &mut corrs);
-        // Each trace's norm once, not once per pair it is in.
-        let norms: Vec<f64> = traces.iter().map(|t| xcorr_norm(t)).collect();
-        for a in 0..traces.len() {
-            for b in (a + 1)..traces.len() {
-                let (lag, shape) = best_xcorr_normed(&traces[a], &traces[b], 5, norms[a], norms[b]);
-                lags.push(lag.abs() as f64);
-                shapes.push(shape);
+        if let Some(pk) = shared {
+            // The PSM's pair statistics, computed by the same calls on the same traces.
+            let st = &pk.stats;
+            for a in 0..traces.len() {
+                for b in (a + 1)..traces.len() {
+                    corrs.push(st.corr(a, b));
+                    let (lag, shape) = st.xcorr(a, b);
+                    lags.push(lag.abs() as f64);
+                    shapes.push(shape);
+                }
+            }
+        } else {
+            // Every pair's correlation from traces centred once (`pearson_pairs`,
+            // bit-identical to `pearson` pair by pair), in the (a, b) order below.
+            pearson_pairs(traces, &mut corrs);
+            // Each trace's norm once, not once per pair it is in.
+            let norms: Vec<f64> = traces.iter().map(|t| xcorr_norm(t)).collect();
+            for a in 0..traces.len() {
+                for b in (a + 1)..traces.len() {
+                    let (lag, shape) =
+                        best_xcorr_normed(&traces[a], &traces[b], 5, norms[a], norms[b]);
+                    lags.push(lag.abs() as f64);
+                    shapes.push(shape);
+                }
             }
         }
     }
@@ -3414,13 +3670,22 @@ fn fragment_features(
     // Reference elution profile = predicted-intensity-weighted sum of fragment XICs.
     if !traces.is_empty() && axis.len() >= 2 {
         let np = axis.len();
-        let mut refp = vec![0.0f64; np];
-        for (fi, tr) in traces.iter().enumerate() {
-            let w = pred[fi].max(0.0);
-            for k in 0..np {
-                refp[k] += w * tr[k];
+        // The shared window's reference profile is this one, term for term.
+        let refp_owned: Vec<f64>;
+        let refp: &[f64] = match shared {
+            Some(pk) => &pk.ref_profile,
+            None => {
+                let mut r = vec![0.0f64; np];
+                for (fi, tr) in traces.iter().enumerate() {
+                    let w = pred[fi].max(0.0);
+                    for k in 0..np {
+                        r[k] += w * tr[k];
+                    }
+                }
+                refp_owned = r;
+                &refp_owned
             }
-        }
+        };
         // pCos: at each scan, cosine(observed fragment vector, predicted vector),
         // weighted by reference-profile^2 (concentrates on the elution peak).
         let (mut num, mut den) = (0.0, 0.0);
@@ -3439,12 +3704,18 @@ fn fragment_features(
         }
         f.profile_cos = if den > 0.0 { num / den } else { 0.0 };
         // pTimeCorr: each fragment XIC correlated with the reference profile, which is
-        // centred once for all of them.
-        let refp_c = Centered::new(&refp);
-        let rc: Vec<f64> = traces
-            .iter()
-            .map(|tr| pearson_vs(tr, &refp, &refp_c))
-            .collect();
+        // centred once for all of them (or read from the shared statistics, which made
+        // the same calls).
+        let rc: Vec<f64> = match shared {
+            Some(pk) => pk.stats.ref_corr().to_vec(),
+            None => {
+                let refp_c = Centered::new(refp);
+                traces
+                    .iter()
+                    .map(|tr| pearson_vs(tr, refp, &refp_c))
+                    .collect()
+            }
+        };
         f.ref_corr = mean(&rc);
         f.best_ref_corr = rc.iter().cloned().fold(f64::MIN, f64::max).max(0.0);
         // pResCorr proxy: co-elution of the low-predicted-intensity fragments.
@@ -3473,7 +3744,7 @@ fn fragment_features(
         // Scratch reused across fragments; the per-fragment allocation it replaces was
         // one heap block per fragment per PSM.
         let mut others: Vec<f64> = Vec::with_capacity(np);
-        for tr in &traces {
+        for tr in traces {
             others.clear();
             others.extend((0..np).map(|k| total[k] - tr[k]));
             contrasts.push(pearson(tr, &others));
@@ -3489,8 +3760,8 @@ fn fragment_features(
         let mut residuals: Vec<Vec<f64>> = Vec::with_capacity(traces.len());
         let mut shadow_num = 0.0;
         let mut total_int = 0.0;
-        for tr in &traces {
-            let rk: f64 = tr.iter().zip(&refp).map(|(a, b)| a * b).sum::<f64>() / rr;
+        for tr in traces {
+            let rk: f64 = tr.iter().zip(refp).map(|(a, b)| a * b).sum::<f64>() / rr;
             let cl: Vec<f64> = (0..np)
                 .map(|k| {
                     let cap = (1.5 * rk * refp[k]).max(0.0);
@@ -4225,6 +4496,157 @@ mod tests {
             }
         }
         assert_eq!(quantile_select(&mut [], 0.5), 0.0);
+    }
+
+    /// Every field of a `FragFeatures` as bit patterns, for exact comparison.
+    fn ff_bits(f: &FragFeatures) -> Vec<u64> {
+        [
+            f.frag_corr,
+            f.frag_cosine,
+            f.spectral_angle,
+            f.coelution_mean,
+            f.coelution_best,
+            f.n_coelution_above,
+            f.norm_manhattan,
+            f.rmsd,
+            f.xcorr_coelution,
+            f.xcorr_shape,
+            f.sum_b,
+            f.sum_y,
+            f.n_b,
+            f.n_y,
+            f.weighted_mass_error,
+            f.mean_mass_error,
+            f.log_sn,
+            f.n_observations,
+            f.base_width_rt,
+            f.profile_cos,
+            f.ref_corr,
+            f.best_ref_corr,
+            f.low_frag_coel,
+            f.evidence,
+            f.contrast_min,
+            f.resid_corr,
+            f.coel_clean,
+            f.shadow_frac,
+            f.elution_lo,
+            f.elution_hi,
+        ]
+        .iter()
+        .map(|v| v.to_bits())
+        .collect()
+    }
+
+    #[test]
+    fn shared_pair_statistics_equal_the_per_reader_computations_bit_for_bit() {
+        // Per PSM, the shared path against each reader's own computation on the SAME
+        // evidence: `fragment_features` with and without the shared peak window, and the
+        // Extended families with the `PairStats` cache and with it removed (every reader
+        // then takes its fallback). Random traces with dropouts and ties, 1-12 fragments,
+        // 3-60 points, per-candidate and global bounds, an empty trace now and then.
+        let mut rng = Lcg(0x5a5a_1234_0f0f_9876);
+        let mut checked = 0usize;
+        for case in 0..400u32 {
+            let k = 1 + rng.below(12) as usize;
+            let npts = 3 + rng.below(58) as usize;
+            let grid: Vec<f32> = (0..npts).map(|i| 300.0 + i as f32 * 1.25).collect();
+            let centre = rng.below(npts as u32) as f64;
+            let traces: Vec<Vec<f32>> = (0..k)
+                .map(|f| {
+                    if f > 0 && rng.below(15) == 0 {
+                        return Vec::new();
+                    }
+                    let h = 10f64.powf(1.0 + 3.0 * rng.unit());
+                    let w = 1.0 + 4.0 * rng.unit();
+                    (0..npts)
+                        .map(|i| {
+                            if rng.below(4) == 0 {
+                                return 0.0;
+                            }
+                            let x = (i as f64 - centre - (f % 3) as f64) / w;
+                            let v = h * (-0.5 * x * x).exp() + h * 0.05 * rng.unit();
+                            if case % 5 == 0 {
+                                ((v / 50.0).round() * 50.0) as f32
+                            } else {
+                                v as f32
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let names: Vec<String> = (0..k)
+                .map(|_| {
+                    let s = if rng.below(2) == 0 { 'b' } else { 'y' };
+                    let z = if rng.below(4) == 0 { "^2" } else { "" };
+                    format!("{s}{}{z}", 1 + rng.below(14))
+                })
+                .collect();
+            let preds: Vec<f32> = (0..k).map(|_| rng.unit() as f32).collect();
+            let rows: Vec<ChromRow> = (0..k)
+                .map(|f| {
+                    let rt: &[f32] = if traces[f].is_empty() { &[] } else { &grid };
+                    ChromRow {
+                        frag_name: &names[f],
+                        frag_mz: 200.0 + f as f64 * 50.0,
+                        frag_obs_mz: 200.0 + f as f64 * 50.0 + 0.001,
+                        pred_int: preds[f],
+                        rt,
+                        inten: &traces[f],
+                    }
+                })
+                .collect();
+            let apex = grid[centre as usize] as f64 + 0.3;
+            let bounds = if case % 2 == 0 {
+                None
+            } else {
+                Some((4.0, 6.5))
+            };
+            let (frac, grace) = (1.0 / 3.0, (case % 3 == 0) as usize);
+
+            let al = align_traces(&rows);
+            let obs = apex_intensities(&rows, apex);
+            let pred: Vec<f64> = rows.iter().map(|r| r.pred_int as f64).collect();
+            let win = peak_window(
+                &al.axis_full,
+                &al.traces_full,
+                &pred,
+                apex,
+                frac,
+                grace,
+                bounds,
+            );
+            let peak = PeakTraces::new(&al, &pred, win);
+            let shared = fragment_features(
+                &rows,
+                &al,
+                &obs,
+                Some(&peak),
+                apex,
+                0.9,
+                true,
+                frac,
+                grace,
+                bounds,
+            );
+            let own =
+                fragment_features(&rows, &al, &obs, None, apex, 0.9, true, frac, grace, bounds);
+            assert_eq!(
+                ff_bits(&shared),
+                ff_bits(&own),
+                "fragment_features, case {case}"
+            );
+
+            let mut ev = evidence_from(&rows, al, obs, pred, peak, &[], apex);
+            ev.n_matched = k as i32;
+            ev.n_predicted = k as i32;
+            let with_cache = extended_values(&ev);
+            ev.pair_stats = None;
+            let without = extended_values(&ev);
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&with_cache), bits(&without), "families, case {case}");
+            checked += 1;
+        }
+        assert_eq!(checked, 400);
     }
 
     #[test]

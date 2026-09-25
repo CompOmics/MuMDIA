@@ -92,9 +92,10 @@ fn longest_consecutive(ords: &HashSet<u32>) -> u32 {
     best
 }
 
-/// Mean pairwise population Pearson over the given peak traces (index order).
-fn mean_pairwise_pearson(traces: &[&Vec<f64>]) -> f64 {
-    let n = traces.len();
+/// Mean pairwise population Pearson over the peak traces of the fragments `idx` (in that
+/// order), with `corr(a, b)` the correlation of fragments `a` and `b`.
+fn mean_pairwise_pearson(idx: &[usize], corr: impl Fn(usize, usize) -> f64) -> f64 {
+    let n = idx.len();
     if n < 2 {
         return 0.0;
     }
@@ -102,7 +103,7 @@ fn mean_pairwise_pearson(traces: &[&Vec<f64>]) -> f64 {
     let mut cnt = 0.0;
     for i in 0..n {
         for j in (i + 1)..n {
-            sum += fin(pearson(traces[i], traces[j]));
+            sum += fin(corr(idx[i], idx[j]));
             cnt += 1.0;
         }
     }
@@ -366,6 +367,20 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         }
     };
 
+    // The PSM's shared pair statistics (`super::PairStats`) when they describe these
+    // traces: the pair matrix and the reference correlations, from the same kernel calls
+    // on the same traces, so each read below equals the `pearson` beside it.
+    let stats = e
+        .pair_stats
+        .as_ref()
+        .filter(|s| e.traces.len() == k && s.fits(k, e.ref_profile.len()));
+    let pair_corr = |a: usize, b: usize| -> f64 {
+        match stats {
+            Some(s) => s.corr(a, b),
+            None => pearson(&e.traces[a], &e.traces[b]),
+        }
+    };
+
     // by_complement_coelution: mean pearson over matched complementary pairs'
     // peak traces.
     let by_complement_coelution = {
@@ -384,7 +399,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
                 let comp_u = comp as u32;
                 for &yi in &y_idx {
                     if e.ordinal[yi] == comp_u && matched(e, yi) {
-                        acc += fin(pearson(&e.traces[bi], &e.traces[yi]));
+                        acc += fin(pair_corr(bi, yi));
                         cnt += 1.0;
                         break;
                     }
@@ -419,22 +434,14 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // Per-series co-elution: mean pairwise pearson among matched peak traces.
     let has_traces = e.traces.len() == k;
     let series_coelution_y = if has_traces {
-        let t: Vec<&Vec<f64>> = y_idx
-            .iter()
-            .filter(|&&i| matched(e, i))
-            .map(|&i| &e.traces[i])
-            .collect();
-        mean_pairwise_pearson(&t)
+        let t: Vec<usize> = y_idx.iter().copied().filter(|&i| matched(e, i)).collect();
+        mean_pairwise_pearson(&t, pair_corr)
     } else {
         0.0
     };
     let series_coelution_b = if has_traces {
-        let t: Vec<&Vec<f64>> = b_idx
-            .iter()
-            .filter(|&&i| matched(e, i))
-            .map(|&i| &e.traces[i])
-            .collect();
-        mean_pairwise_pearson(&t)
+        let t: Vec<usize> = b_idx.iter().copied().filter(|&i| matched(e, i)).collect();
+        mean_pairwise_pearson(&t, pair_corr)
     } else {
         0.0
     };
@@ -469,11 +476,17 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // charge_corr_balance: min/max of mean ref-profile correlation per charge.
     let charge_corr_balance = if has_traces && e.ref_profile.len() == e.axis.len() {
         let ref_c = Centered::new(&e.ref_profile);
+        let ref_corr = |i: usize| -> f64 {
+            match stats {
+                Some(st) => st.ref_corr()[i],
+                None => pearson_vs(&e.traces[i], &e.ref_profile, &ref_c),
+            }
+        };
         let mean_refcorr = |idx: &[usize]| -> f64 {
             let mut s = 0.0;
             let mut c = 0.0;
             for &i in idx {
-                s += fin(pearson_vs(&e.traces[i], &e.ref_profile, &ref_c));
+                s += fin(ref_corr(i));
                 c += 1.0;
             }
             if c > 0.0 {

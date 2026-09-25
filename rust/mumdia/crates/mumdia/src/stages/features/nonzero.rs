@@ -88,7 +88,15 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // The summed-positive gather does not depend on the pair, so it is done ONCE per
     // fragment rather than twice per pair: it was three of the five Vecs this loop
     // allocated per pair, which is O(k^2) allocations per PSM for an O(k) quantity.
-    let sm_gathered: Vec<Vec<f64>> = if sm.len() >= 2 {
+    // When every scan carries signal the gathered traces ARE the peak traces, and the
+    // summed-positive pairs are the PSM's shared pair matrix (`super::PairStats`), which
+    // the same `pearson_pairs` call produced from the same values.
+    let kt = e.traces.len();
+    let stats = e
+        .pair_stats
+        .as_ref()
+        .filter(|s| sm.len() == np && e.traces.iter().all(|t| t.len() == np) && s.fits(kt, np));
+    let sm_gathered: Vec<Vec<f64>> = if sm.len() >= 2 && stats.is_none() {
         e.traces
             .iter()
             .map(|tr| sm.iter().map(|&t| tr[t]).collect())
@@ -99,7 +107,16 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // The summed-positive pairs over rows centred once, in the (a, b) order of the loop
     // below (`pearson_pairs` is `pearson` pair by pair, bit for bit).
     if sm.len() >= 2 {
-        pearson_pairs(&sm_gathered, &mut summpos);
+        match stats {
+            Some(s) => {
+                for a in 0..kt {
+                    for b in (a + 1)..kt {
+                        summpos.push(s.corr(a, b));
+                    }
+                }
+            }
+            None => pearson_pairs(&sm_gathered, &mut summpos),
+        }
     }
     // The both-positive index set IS pair-dependent, so only its buffers are reused.
     let mut idx: Vec<usize> = Vec::with_capacity(np);

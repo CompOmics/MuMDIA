@@ -1004,6 +1004,7 @@ mod tests {
             apex_idx: tp / 2,
             ref_profile: vec![],
             ref_profile_full,
+            pair_stats: None,
             apex_rt: 0.0,
             rt_pred_cal: 0.0,
             rt_err: 0.0,

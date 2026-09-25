@@ -103,16 +103,25 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     // requires `f < e.traces.len()`, and feature 18 keeps its own bounds check).
     //
     // `r` is centred once for all of them (`pearson_vs` is `pearson` bit for bit).
+    // With the PSM's shared statistics (`super::PairStats`) the values are read, not
+    // recomputed: they come from the same `pearson_vs` calls on the same traces.
+    let stats = e
+        .pair_stats
+        .as_ref()
+        .filter(|s| e.traces.len() == k && s.fits(k, tp));
     let r_c = Centered::new(r);
-    let corr_ref: Vec<f64> = (0..k)
-        .map(|f| {
-            if f < e.traces.len() {
-                pearson_vs(&e.traces[f], r, &r_c)
-            } else {
-                0.0
-            }
-        })
-        .collect();
+    let corr_ref: Vec<f64> = match stats {
+        Some(s) => s.ref_corr().to_vec(),
+        None => (0..k)
+            .map(|f| {
+                if f < e.traces.len() {
+                    pearson_vs(&e.traces[f], r, &r_c)
+                } else {
+                    0.0
+                }
+            })
+            .collect(),
+    };
 
     // ---- 1. explained_variance_ref ----
     let mut num1 = 0.0;
@@ -273,11 +282,19 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let mut sp_corr = 0.0;
     let mut sf_corr = 0.0;
     let mut c_corr = 0usize;
+    // The shared full-window correlations are of `ref_profile_full` itself, so they
+    // answer only when `rfull` is that profile rather than a rebuild.
+    let full_stats = matches!(rfull_owned, Cow::Borrowed(_))
+        .then(|| stats.and_then(|s| s.ref_corr_full()))
+        .flatten();
     let rfull_c = Centered::new(rfull);
     for &f in &matched {
         sp_corr += corr_ref[f];
         let full_corr = if f < e.traces_full.len() {
-            pearson_vs(&e.traces_full[f], rfull, &rfull_c)
+            match full_stats {
+                Some(v) => v[f],
+                None => pearson_vs(&e.traces_full[f], rfull, &rfull_c),
+            }
         } else {
             0.0
         };
