@@ -115,10 +115,45 @@ def _windows_physical_cores():
         return None
 
 
+def _sysfs_physical_cores(cpus, sysfs="/sys/devices/system/cpu"):
+    """The number of physical cores behind the logical CPUs `cpus`, from sysfs, or None.
+
+    Each CPU's `topology/core_cpus_list` (Linux 5.5 and later; `thread_siblings_list`
+    before) names the logical CPUs that share its physical core, so its contents identify
+    that core on every architecture, and the hyperthreads of one core count once. The
+    `(physical_package_id, core_id)` pair is the fallback only: on many device-tree ARM64
+    systems `core_id` restarts in each cluster and the package id is the same for every
+    CPU, so the pairs of two clusters collide and eight cores count as four. None when a
+    CPU has no topology at all (some containers), which leaves the count to the caller.
+    """
+    cores = set()
+    for cpu in cpus:
+        topo = "%s/cpu%d/topology/" % (sysfs, cpu)
+        key = None
+        for name in ("core_cpus_list", "thread_siblings_list"):
+            try:
+                with open(topo + name, encoding="ascii") as fh:
+                    key = "cpus " + fh.read().strip()
+                break
+            except OSError:
+                continue
+        if key is None:
+            try:
+                with open(topo + "physical_package_id", encoding="ascii") as fh:
+                    package = fh.read().strip()
+                with open(topo + "core_id", encoding="ascii") as fh:
+                    core = fh.read().strip()
+            except OSError:
+                return None
+            key = "pair %s/%s" % (package, core)
+        cores.add(key)
+    return len(cores) or None
+
+
 def physical_cores():
     """`(count, how)`: the physical cores this process may run on, or `(None, why)`.
 
-    Linux: the unique (physical_package_id, core_id) pairs from sysfs over the CPUs in
+    Linux: the distinct physical cores (`_sysfs_physical_cores`) behind the CPUs in
     `sched_getaffinity(0)`, so a container or a `taskset` mask is respected and two
     hyperthreads of one core count once. Windows: every physical core of the machine.
     Anywhere else the count is unknown and nothing is capped.
@@ -129,19 +164,10 @@ def physical_cores():
         except OSError:
             cpus = []
         if cpus:
-            pairs = set()
-            for cpu in cpus:
-                topo = "/sys/devices/system/cpu/cpu%d/topology/" % cpu
-                try:
-                    with open(topo + "physical_package_id", encoding="ascii") as fh:
-                        package = fh.read().strip()
-                    with open(topo + "core_id", encoding="ascii") as fh:
-                        core = fh.read().strip()
-                except OSError:
-                    return len(cpus), "%d CPUs in the affinity mask (no sysfs topology)" % len(cpus)
-                pairs.add((package, core))
-            return len(pairs), "%d physical cores under the affinity mask of %d CPUs" % (
-                len(pairs), len(cpus))
+            n = _sysfs_physical_cores(cpus)
+            if n is None:
+                return len(cpus), "%d CPUs in the affinity mask (no sysfs topology)" % len(cpus)
+            return n, "%d physical cores under the affinity mask of %d CPUs" % (n, len(cpus))
     if sys.platform == "win32":
         n = _windows_physical_cores()
         if n:
@@ -155,14 +181,17 @@ def deeplc_thread_cap():
     Measured on doxy (EPYC, 64 cores, 128 CPUs): the multi-head step took 10:41 at 96
     requested threads and 18:09 at 128, because every OpenMP-parallel op waits for its
     slowest thread and a second hyperthread on a busy core is the slowest one. The cap is a
-    ceiling on what the engine asks for, never a target, so below it nothing changes.
-    `MUMDIA_DEEPLC_THREAD_CAP` sets it explicitly; 0 disables it.
+    ceiling on what the engine asks for, never a target: a request at or below it is
+    taken as given. The engine asks for every logical CPU unless `--threads` says
+    otherwise, so on an SMT host the cap binds by default. `MUMDIA_DEEPLC_THREAD_CAP` sets
+    it explicitly; 0 disables it. A value that is not a finite number (`twelve`, `nan`,
+    `inf`) is reported and ignored.
     """
     raw = os.environ.get("MUMDIA_DEEPLC_THREAD_CAP", "auto").strip().lower()
     if raw not in ("", "auto"):
         try:
             value = int(float(raw))
-        except ValueError:
+        except (ValueError, OverflowError):
             print("WARNING: MUMDIA_DEEPLC_THREAD_CAP=%r is not a number, 0 or auto; "
                   "using auto" % raw, flush=True)
         else:

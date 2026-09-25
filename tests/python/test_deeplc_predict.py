@@ -20,6 +20,7 @@ from conftest import SCRIPTS, run_worker_ok
 DEEPLC_WORKERS = ["deeplc_worker.py", "deeplc_finetune.py"]
 THREAD_HELPERS = [
     "_windows_physical_cores",
+    "_sysfs_physical_cores",
     "physical_cores",
     "deeplc_thread_cap",
     "capped_threads",
@@ -76,9 +77,50 @@ def test_the_environment_override_sets_or_disables_the_cap(monkeypatch):
     monkeypatch.setenv("MUMDIA_DEEPLC_THREAD_CAP", "12")
     assert helpers["deeplc_thread_cap"]() == (12, "MUMDIA_DEEPLC_THREAD_CAP")
     auto = helpers["physical_cores"]()[0] or 0
-    for raw in ("auto", "", "twelve"):
+    # `int(float("inf"))` raises OverflowError, not ValueError, and used to crash both
+    # workers at start-up instead of falling back to auto.
+    for raw in ("auto", "", "twelve", "nan", "inf", "-inf", "1e400"):
         monkeypatch.setenv("MUMDIA_DEEPLC_THREAD_CAP", raw)
         assert helpers["deeplc_thread_cap"]()[0] == auto, raw
+
+
+def _fake_sysfs(root, cpus):
+    """A sysfs `cpu` tree: `cpus` maps a CPU number to the topology files it has."""
+    for cpu, files in cpus.items():
+        topo = root / "cpu{}".format(cpu) / "topology"
+        topo.mkdir(parents=True)
+        for name, value in files.items():
+            (topo / name).write_text(value + "\n", encoding="ascii")
+    return str(root)
+
+
+def test_the_sysfs_core_count_keys_on_the_sibling_list(tmp_path):
+    """Hyperthreads of one core count once; cores of two ARM64 clusters count twice.
+
+    The (physical_package_id, core_id) pair alone collapses a device-tree ARM64 SoC:
+    `core_id` restarts in each cluster and the package id is -1 for every CPU.
+    """
+    count = _thread_helpers()["_sysfs_physical_cores"]
+    # ARM64, two clusters of four: core_id 0-3 twice, one package, no SMT.
+    arm = {c: {"core_cpus_list": str(c), "thread_siblings_list": str(c),
+               "physical_package_id": "-1", "core_id": str(c % 4)} for c in range(8)}
+    assert count(range(8), _fake_sysfs(tmp_path / "arm", arm)) == 8
+    # x86 with SMT: CPUs 0-3 are cores 0-3, CPUs 4-7 their second hyperthreads.
+    smt = {c: {"core_cpus_list": "{},{}".format(c % 4, c % 4 + 4),
+               "physical_package_id": "0", "core_id": str(c % 4)} for c in range(8)}
+    assert count(range(8), _fake_sysfs(tmp_path / "smt", smt)) == 4
+    # An affinity mask of one hyperthread per core, and of both hyperthreads of one core.
+    assert count([0, 1, 2, 3], _fake_sysfs(tmp_path / "smt_a", smt)) == 4
+    assert count([0, 4], _fake_sysfs(tmp_path / "smt_b", smt)) == 1
+    # A kernel before 5.5 has only thread_siblings_list.
+    old = {c: {"thread_siblings_list": "{}-{}".format(c - c % 2, c - c % 2 + 1)}
+           for c in range(6)}
+    assert count(range(6), _fake_sysfs(tmp_path / "old", old)) == 3
+    # Neither sibling list: the pair is the fallback.
+    pairs = {c: {"physical_package_id": str(c // 4), "core_id": str(c % 2)} for c in range(8)}
+    assert count(range(8), _fake_sysfs(tmp_path / "pairs", pairs)) == 4
+    # No topology at all: unknown, and the caller falls back to the CPU count.
+    assert count(range(4), str(tmp_path / "missing")) is None
 
 
 def test_the_physical_core_count_is_plausible():

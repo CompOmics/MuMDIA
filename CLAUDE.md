@@ -586,8 +586,8 @@ sections 10-16:
   DeepLC interpreter, because `deeplc_finetune.py` imports the last three too.
 - Every DeepLC call site asks for the engine's thread count (the fine-tune's training
   pool keeps its own bound of 8), and both DeepLC workers cap what they give torch at the
-  physical cores available to the process: sysfs (package, core) pairs under
-  `sched_getaffinity` on Linux, every physical core on Windows.
+  physical cores available to the process: the distinct sysfs `core_cpus_list` sets
+  under `sched_getaffinity` on Linux, every physical core on Windows.
   `MUMDIA_DEEPLC_THREAD_CAP=N` overrides it and `0` disables it; the resolved numbers are
   under `torch_threads` in `<lib_out>.summary.json`. Measured on doxy (64 cores, 128
   CPUs): the multi-head step took 10:41 at 96 threads and 18:09 at 128. The cap is a

@@ -378,9 +378,11 @@ the thread cap below for what that does). Each child holds its own model copy
 
 **DeepLC thread cap.** Every DeepLC call site asks for the engine's rayon thread count
 (the fine-tune's training pool keeps its own bound), and both workers cap what they
-give torch at the physical cores available to the process: the unique
-`(physical_package_id, core_id)` pairs from sysfs over `sched_getaffinity(0)` on Linux,
-so a container or `taskset` mask is respected, and every physical core
+give torch at the physical cores available to the process: on Linux the physical cores
+behind the CPUs of `sched_getaffinity(0)`, so a container or `taskset` mask is
+respected, counted as the distinct sysfs `core_cpus_list` sets (`thread_siblings_list`
+before Linux 5.5; the `(physical_package_id, core_id)` pair only where neither exists,
+because on many ARM64 systems `core_id` restarts in each cluster), and every physical core
 (`GetLogicalProcessorInformationEx`) on Windows. Elsewhere the count is unknown and
 nothing is capped. The cap is a ceiling, never a target: a request at or below it is
 taken as given, so the default path changes only on a host where the engine's thread
