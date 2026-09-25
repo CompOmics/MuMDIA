@@ -253,7 +253,10 @@ is additionally asked (`SearchSeedParams::emit_calibrants`) to write
 row per deviation, for every target PSM of the band and not only its own confident ones,
 so the pooled q rather than the band's own q chooses the calibrants (a fixed prefix of the
 band's 2,000 best targets was short at 2 and 4 bands; `docs/33_window_groups.md` section
-4a). An ungrouped run writes no sidecar and is byte-identical.
+4a). The report's stats then carry `calibrant_deviations`, `calibrant_bytes` (16 B each) and
+`calibrant_target_rows`; the count is bounded by the band's scans times `report_psms` times
+the fragments per candidate, not by the library. An ungrouped run writes no sidecar, adds
+no stats and is byte-identical.
 
 **7. Write** `seed_psms.parquet` (`write_table`, `:233`) and the `ArtifactReport`
 (`:256-274`), then log `psms`, `confident`, `elapsed_ms`.

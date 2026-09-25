@@ -261,7 +261,8 @@ calibration already uses the pooled anchors under `groups.calibration = global`:
 - `search-seed`, asked for it (`SearchSeedParams::emit_calibrants`, set only by the grouped
   path), writes `<seed>.masscal.parquet` beside the masscal: `candidate_id` (LIBRARY-WIDE,
   the band's local id plus its fragment offset), `scan_index`, `frag_mz` and `ppm`, one row
-  per matched fragment. 16 B per deviation, a few MB for a whole run.
+  per matched fragment of every target PSM of the band. 16 B per deviation; the size is
+  bounded below.
 - `seed-pool` reads them, keeps the deviations whose PSM the POOLED q accepts at
   `search_seed.fdr_seed`, and fits `masscal::MassCal::fit_from` -- the same function
   `search-seed` calls -- once. A deviation is kept only from the band whose row the pool
@@ -309,8 +310,22 @@ on the fixture, and `tests/pipeline.rs`
 so that one band's own q rejects hundreds of targets the pooled q accepts, which the old
 prefix failed by 2,000 deviations of 30,000. Its second arm makes the two windows overlap
 across the cut (400-501 and 500-600, 13 shared targets): keyed on the scan alone the pool
-counted their deviations twice, 30,052 against the unbanded 30,000. The sidecar stays 16 B per deviation, now for every
-target of the band.
+counted their deviations twice, 30,052 against the unbanded 30,000.
+
+The sidecar stays 16 B per deviation, now for every target of the band, and its size
+follows the band's scans rather than its library. The seed keeps one row per candidate and
+each MS2 scan contributes at most `search_seed.report_psms` candidates (5 by default), and
+a row adds at most one deviation per library fragment of its candidate. A band therefore
+holds at most `served scans x report_psms x fragments per candidate` deviations whatever its
+precursor count: for a run of 100,000 MS2 scans, 5 rows per scan and 12 fragments per
+candidate, 6M deviations and 96 MB over all its bands together, which is a bound and not a
+measurement. The band's `search-seed` holds them in memory until the write, which moves the
+columns rather than copying them. `seed-pool` decodes one band's sidecar at a time. Each
+band's seed report records `calibrant_deviations`, `calibrant_bytes` and
+`calibrant_target_rows`, and the seed-pool log line records `band_deviations`,
+`band_deviation_bytes` and `largest_band_bytes`. On the CI fixture at two bands that is 616
+and 452 deviations (9,856 and 7,232 B, from 103 and 76 target rows), all 1,068 of them
+accepted. Not yet measured at scale: see section 10.
 
 `masscal.json` gains `masscal_source`, which reads `pooled_deviations` or `band_scalars`. A
 band directory seeded before the sidecar existed has none, and the pool then combines the
@@ -796,6 +811,12 @@ candidates into the scored table. How much of that this fix returns is not yet m
   once_per_run` and `balance = cost` (peptides at 1% inside the seed spread on two
   acquisitions), and the projection cache (`rt_im_train.deeplc_projection_cache`) under
   `rt_library_scope = per_run`. The fixture runs pin their output effect, not their gain.
+- The calibrant sidecar's size and the grouped seed phase's peak at scale, now that every
+  target is offered (section 4a): the per-band `calibrant_bytes` and the seed and seed-pool
+  peaks on HYE at 2 bands and on the 63-band immunopeptidomics plan. The bound in section 4a
+  says they follow the run's scans and not its library; if a band's sidecar turns out to
+  matter beside the seed's own tables, the seed can stream it to the parquet in row groups
+  and `seed-pool` can filter it row group by row group.
 - `experiment.overlap_front_threads` overlaps the convert and seed of runs 2..N with the
   first run's adaptation only for ungrouped runs; a grouped run seeds inside its band loop,
   so overlapping it would need the band loop split between runs.

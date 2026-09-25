@@ -345,13 +345,23 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     // deviations of a grouped run.
     let cal = crate::masscal::MassCal::fit_from(&devs, &dev_mz, p.cfg);
     mumdia_io::json::write_json(&crate::masscal::json_path(p.out), &cal.to_json())?;
-    if p.emit_calibrants {
-        let n_cal = crate::masscal::write_calibrants(p.out, &calibrants)?;
+    // `(deviations, in-memory bytes, target rows)` of the sidecar, for the artifact report:
+    // every target row of the band is offered, so this is what an at-scale run needs to
+    // see to size the grouped seed phase (`crate::masscal` has the bound).
+    let calibrant_stats = if p.emit_calibrants {
+        let bytes = calibrants.bytes();
+        let n_targets = is_dec.iter().filter(|d| !**d).count();
+        let n_cal = crate::masscal::write_calibrants(p.out, calibrants)?;
         info!(
             calibrant_deviations = n_cal,
+            calibrant_bytes = bytes,
+            target_rows = n_targets,
             "search-seed: wrote the calibrant deviations for the pooled mass calibration"
         );
-    }
+        Some((n_cal, bytes, n_targets))
+    } else {
+        None
+    };
     info!(
         frag_ppm_offset = cal.frag_ppm_offset,
         frag_tol_learned = cal.frag_tol_ppm,
@@ -386,6 +396,11 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("psms".to_string(), json!(n));
     stats.insert(format!("targets_at_q{}", p.cfg.fdr_seed), json!(n_at_1pct));
+    if let Some((n_cal, bytes, n_targets)) = calibrant_stats {
+        stats.insert("calibrant_deviations".to_string(), json!(n_cal));
+        stats.insert("calibrant_bytes".to_string(), json!(bytes));
+        stats.insert("calibrant_target_rows".to_string(), json!(n_targets));
+    }
     ArtifactReport {
         logical_name: artifact::SEED_PSMS.0.to_string(),
         schema_name: artifact::SEED_PSMS.0.to_string(),

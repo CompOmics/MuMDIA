@@ -271,9 +271,13 @@ fn pooled_masscal(
     let mut devs: Vec<f64> = Vec::new();
     let mut dev_mz: Vec<f64> = Vec::new();
     let mut n_band = 0usize;
+    // The largest band's sidecar is what this stage holds decoded at once, beside the
+    // accepted deviations.
+    let mut largest_band_bytes = 0u64;
     for (bi, path) in p.calibrants.iter().enumerate() {
         let c = crate::masscal::read_calibrants(path)?;
         n_band += c.len();
+        largest_band_bytes = largest_band_bytes.max(c.bytes());
         for i in 0..c.len() {
             if accepted.get(&c.candidate_id[i]) == Some(&(c.scan_index[i], bi)) {
                 devs.push(c.ppm[i] as f64);
@@ -291,6 +295,8 @@ fn pooled_masscal(
     }
     info!(
         band_deviations = n_band,
+        band_deviation_bytes = (n_band * crate::masscal::Calibrants::BYTES_PER_DEVIATION) as u64,
+        largest_band_bytes,
         pooled_deviations = devs.len(),
         frag_ppm_offset = cal.frag_ppm_offset,
         frag_tol_ppm = cal.frag_tol_ppm,
@@ -639,7 +645,7 @@ mod tests {
                     m.push(fmz as f64);
                 }
             }
-            crate::masscal::write_calibrants(&path, &c).unwrap();
+            crate::masscal::write_calibrants(&path, c).unwrap();
             // The band's own scalar fit, so the fallback path has something to combine
             // and the pooled path can be shown not to be it.
             let band = MassCal::fit_from(&d, &m, &seed_cfg(0.012));
