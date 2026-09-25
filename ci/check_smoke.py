@@ -69,8 +69,13 @@ F64_FEATURE_COLUMNS = {
     "peak_contested_frac", "contested_frac",
 }
 F64_BOOKKEEPING_COLUMNS = {"apex_rt", "elution_lo", "elution_hi", "precursor_mz", "prelim_score"}
+# The whole of `NON_FEATURE_COLUMNS` in stages/features.rs, so a bookkeeping column that
+# is not written today (`peptidoform_id`, `source`, `unique_evidence`) is never taken for
+# a feature of the wrong width. tests/python/test_check_smoke_columns.py holds both sets
+# to the Rust constants.
 NON_FEATURE_COLUMNS = F64_BOOKKEEPING_COLUMNS | {
-    "candidate_id", "peak_rank", "label", "base_peptide_id", "peptidoform", "protein",
+    "candidate_id", "peptidoform_id", "base_peptide_id", "peptidoform", "protein", "label",
+    "peak_rank", "source", "unique_evidence",
 }
 
 
