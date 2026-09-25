@@ -2091,11 +2091,58 @@ impl TableFile {
         Ok(Some(meta))
     }
 
+    /// Stream only the rows `runs` keeps, in file order: `runs` is `(rows, keep)` pairs
+    /// covering the whole file front to back. The footer is read again with its offset
+    /// index, so where the file carries one (the engine's writer writes it) the reader
+    /// skips the pages that hold no kept row instead of decoding and discarding them.
+    ///
+    /// Whole-file handles only: a span already is a selection.
+    pub fn batches_selected(
+        &self,
+        columns: Option<&[&str]>,
+        batch_size: usize,
+        runs: &[(usize, bool)],
+    ) -> Result<BatchReader> {
+        if self.selection.is_some() {
+            anyhow::bail!(
+                "TableFile::batches_selected: {} is a row span; select from the whole file",
+                self.path
+            );
+        }
+        let covered: usize = runs.iter().map(|r| r.0).sum();
+        if covered != self.nrows {
+            anyhow::bail!(
+                "TableFile::batches_selected: the selection covers {covered} rows of {}, which \
+                 has {}",
+                self.path,
+                self.nrows
+            );
+        }
+        let file =
+            std::fs::File::open(&self.path).with_context(|| format!("opening {}", self.path))?;
+        let meta = ArrowReaderMetadata::load(
+            &file,
+            ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional),
+        )
+        .with_context(|| format!("reading parquet offset index {}", self.path))?;
+        self.batches_with_selection(&meta, columns, batch_size, Some(runs))
+    }
+
     fn batches_with(
         &self,
         meta: &ArrowReaderMetadata,
         columns: Option<&[&str]>,
         batch_size: usize,
+    ) -> Result<BatchReader> {
+        self.batches_with_selection(meta, columns, batch_size, None)
+    }
+
+    fn batches_with_selection(
+        &self,
+        meta: &ArrowReaderMetadata,
+        columns: Option<&[&str]>,
+        batch_size: usize,
+        runs: Option<&[(usize, bool)]>,
     ) -> Result<BatchReader> {
         let file =
             std::fs::File::open(&self.path).with_context(|| format!("opening {}", self.path))?;
@@ -2103,7 +2150,20 @@ impl TableFile {
         // call to this, and a stage reads a dozen columns.
         let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, meta.clone())
             .with_batch_size(batch_size.max(1));
-        if let Some(span) = &self.selection {
+        if let Some(runs) = runs {
+            let sel: Vec<RowSelector> = runs
+                .iter()
+                .filter(|r| r.0 > 0)
+                .map(|&(n, keep)| {
+                    if keep {
+                        RowSelector::select(n)
+                    } else {
+                        RowSelector::skip(n)
+                    }
+                })
+                .collect();
+            builder = builder.with_row_selection(RowSelection::from(sel));
+        } else if let Some(span) = &self.selection {
             // The selection counts rows of the SELECTED row groups only, front to back, so
             // it is skip / take / skip over exactly the groups named here.
             let mut sel = Vec::with_capacity(3);
