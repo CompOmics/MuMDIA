@@ -911,6 +911,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 .is_some()
             {
                 pre.first_stage("library-cache");
+                // A reused output directory may still hold an earlier build's digest and
+                // peptidoforms, which did not produce this library.
+                crate::library_cache::remove_build_intermediates(p.out_dir);
             } else {
                 let dig = d("peptides.parquet");
                 pre.first_stage("digest");
@@ -1133,7 +1136,18 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             // Not in per-run pools: a conversion already takes its share of the engine's
             // pool by dividing it among the live conversions (`convert::LIVE_CONVERTS`),
             // and inside a pool of its own that division would count the others twice.
-            conv = crate::sched::map_bounded(&all, plan.par, |&i| convert_one(i))?;
+            // With a memory reading the first conversion runs alone and its peak bounds
+            // how many of the rest run at once, as the chains are bounded later: the
+            // thread-sized count alone is no memory bound.
+            conv = crate::sched::run_first_alone(
+                plan,
+                threads_budget,
+                "run-experiment",
+                "the first conversion",
+                &all,
+                |&i| convert_one(i),
+                |p, rest| crate::sched::map_bounded(rest, p.par, |&i| convert_one(i)),
+            )?;
         } else {
             for chunk in all.chunks(par) {
                 let done: Vec<convert::ConvertOutputs> =
@@ -1170,7 +1184,17 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             )
         };
         if plan.is_auto() {
-            seeds = plan.map_pooled(&all, |&i| seed_one(i))?;
+            // Bounded the same way: the first seed alone, from a reset high-water mark, so
+            // its peak is one seed over the resident seed library.
+            seeds = crate::sched::run_first_alone(
+                plan,
+                threads_budget,
+                "run-experiment",
+                "the first seed",
+                &all,
+                |&i| seed_one(i),
+                |p, rest| p.map_pooled(rest, |&i| seed_one(i)),
+            )?;
         } else {
             for chunk in all.chunks(par) {
                 let done: Vec<String> =
@@ -1220,6 +1244,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
 
     let mut shared_ft: Option<String> = None;
     let mut first: usize = 0;
+    // Opened just before the first run's chain when it runs alone under
+    // `parallel_runs = auto`, so its peak sizes the chains after it.
+    let mut first_window: Option<crate::sched::PeakWindow> = None;
     if overlapped {
         // Run 1's front, then its RT adaptation beside the fronts of runs 2..N on disjoint
         // thread budgets, then every run's rest on the whole pool.
@@ -1340,6 +1367,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         });
         let (lib0, produced) = adapted?;
         let fronts = fronts?;
+        // Under `parallel_runs = auto`, the first run's finish is what every later run
+        // repeats after its reused adaptation, so its peak alone sizes them.
+        let window = plan.is_auto().then(crate::sched::PeakWindow::open);
         let (comp0, chrom0) = finish_run(cfg, &ch, &lib0, &lib_f, &co0, &seed0, &out0)?;
         competed.push(vec![comp0]);
         chroms.push(vec![ChromTable::whole(&chrom0)]);
@@ -1368,8 +1398,21 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             (1..n_runs).zip(fronts.iter()).collect();
         if plan.is_auto() {
             // Run 1 finished alone above, so its peak is the measurement the rest is sized
-            // on (`sched::bound_by_measured_peak`).
-            plan = crate::sched::bound_by_measured_peak(plan, threads_budget, "run-experiment");
+            // on (`sched::bound_by_measured_peak`), unless each of them adapts the library
+            // itself in a DeepLC worker the measurement cannot see.
+            plan = match (produced.is_none(), window) {
+                (true, _) => {
+                    crate::sched::one_at_a_time_for_sidecars(plan, threads_budget, "run-experiment")
+                }
+                (false, Some(w)) => crate::sched::bound_by_measured_peak(
+                    plan,
+                    threads_budget,
+                    "run-experiment",
+                    "the first run's chain",
+                    w,
+                ),
+                (false, None) => plan,
+            };
             let done = plan.map_pooled(&items, |&(i, f)| back(i, f))?;
             for (comp, chrom) in done {
                 competed.push(vec![comp]);
@@ -1401,6 +1444,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             n = n_runs,
             "run-experiment: adapting the library's retention times on the first run only;              the remaining runs reuse that library and fit their own RT calibration on it              (experiment.rt_library_scope = per_run to adapt for every run instead)"
         );
+        // Under `parallel_runs = auto` the first run's peak sizes the rest (below).
+        first_window = plan.is_auto().then(crate::sched::PeakWindow::open);
         let (comp, chrom, ft) = run_one(0, None, None)?;
         competed.push(comp);
         chroms.push(chrom);
@@ -1417,8 +1462,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             ),
         }
         first = 1;
-        // The first run ran alone: under `parallel_runs = auto` its peak sizes the rest.
-        plan = crate::sched::bound_by_measured_peak(plan, threads_budget, "run-experiment");
     }
 
     // A grouped run writes a band out only where a DeepLC sidecar rewrites it, and the runs
@@ -1429,15 +1472,33 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let rest: Vec<usize> = (first..n_runs).collect();
     if plan.is_auto() && first < n_runs {
         // Under `parallel_runs = auto` the chains are pulled from a queue, each in its own
-        // pool. When no chain has run alone yet and there is a memory reading to take, the
-        // first one runs alone so the rest are sized on its measured peak; without a
+        // pool. A chain that adapts the library itself (no adapted library to share) runs
+        // a DeepLC worker no memory reading of this process includes, so those chains run
+        // one at a time. Otherwise the first run, when it ran alone above, sizes the rest;
+        // and when no chain has run alone yet and there is a memory reading to take, the
+        // first one runs alone now so the rest are sized on its measured peak. Without a
         // reading that would only cost concurrency.
         let mut queue: &[usize] = &rest;
-        if first == 0 && plan.par > 1 && rest.len() > 1 && crate::sched::memory_reading().is_some()
+        if adapts_rt_library && shared_ft.is_none() {
+            plan = crate::sched::one_at_a_time_for_sidecars(plan, threads_budget, "run-experiment");
+        } else if let Some(w) = first_window {
+            plan = crate::sched::bound_by_measured_peak(
+                plan,
+                threads_budget,
+                "run-experiment",
+                "the first run's chain",
+                w,
+            );
+        } else if first == 0
+            && plan.par > 1
+            && rest.len() > 1
+            && crate::sched::memory_reading().is_some()
         {
             let i = rest[0];
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain, alone to size the rest (parallel_runs = auto)");
-            // On the engine's whole pool, exactly as the sequential loop runs it.
+            // On the engine's whole pool, exactly as the sequential loop runs it, from a
+            // reset high-water mark so the conversions and seeds before it are not counted.
+            let window = crate::sched::PeakWindow::open();
             let (comp, chrom, groups_dir) =
                 run_one(i, shared_ft.as_deref(), slice_source.as_deref())?;
             competed.push(comp);
@@ -1445,7 +1506,13 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             if grouped && slice_source.is_none() {
                 slice_source = groups_dir;
             }
-            plan = crate::sched::bound_by_measured_peak(plan, threads_budget, "run-experiment");
+            plan = crate::sched::bound_by_measured_peak(
+                plan,
+                threads_budget,
+                "run-experiment",
+                "the first chain",
+                window,
+            );
             queue = &rest[1..];
         }
         info!(
