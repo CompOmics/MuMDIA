@@ -26,7 +26,7 @@ recipe use `Extended`.
 
 | path | role |
 |---|---|
-| `rust/mumdia/crates/mumdia/src/stages/features.rs` | stage entry point, `run`, `Evidence`, `build_evidence`, `fragment_features`, boundary detection, `prelim_score`, PIN, schema hash, the Minimal/Rich column lists, and the Extended family registry |
+| `rust/mumdia/crates/mumdia/src/stages/features.rs` | stage entry point, `run`, `Evidence`, `evidence_from` (and its test-only wrapper `build_evidence`), `fragment_features`, boundary detection, `prelim_score`, PIN, schema hash, the Minimal/Rich column lists, and the Extended family registry |
 | `rust/mumdia/crates/mumdia/src/stages/features/similarity.rs` | Extended family: observed-vs-library intensity agreement kernels (64 names) |
 | `rust/mumdia/crates/mumdia/src/stages/features/entropy.rs` | Extended family: spectral-entropy / information-divergence (18 names); also exports the gate kernel `spectral_entropy_similarity_sqrt` |
 | `rust/mumdia/crates/mumdia/src/stages/features/coelution.rs` | Extended family: fragment-vs-reference and pairwise co-elution + cross-correlation (38 names) |
@@ -119,8 +119,9 @@ Control flow of `run` (`features.rs:548`):
    `peptidoform` (`features.rs:714`-`734`).
 7. In parallel over rows (`features.rs:757`-`808`), compute the two expensive
    per-PSM pieces: `fragment_features` (the Minimal/Rich fragment battery) and,
-   when Extended, `build_evidence` + `extended_values`. Results collect into a
-   `Vec<PerPsm>` indexed by row, preserving order.
+   when Extended, the Evidence (`peak_window`, `PeakTraces`, `evidence_from`) +
+   `extended_values`. Results go into a per-row `FragFeatures` vector and one
+   flat `rows x n_ext` value buffer, both indexed by row, preserving order.
 8. Serially assemble `fmap` (name -> per-row value vector), `prelim`, and the
    elution bounds (`features.rs:810`-`905`). The serial loop reads `per[i]` and
    pushes each named value with the `push` closure (`features.rs:738`).
@@ -209,8 +210,9 @@ averagine differs from the `0.000594` used by the Extended `ms1` family
 
 ### The Evidence struct (`features.rs:293`)
 
-`build_evidence` (`features.rs:360`) constructs the per-PSM `Evidence` handed to
-every Extended family. It mirrors the alignment and peak-bounding of
+`evidence_from` constructs the per-PSM `Evidence` handed to every Extended
+family, from parts the chunked pass builds once per PSM (see the end of this
+section). It mirrors the alignment and peak-bounding of
 `fragment_features` so families see the same elution peak. Fields:
 
 - Time series: `axis` (RT seconds over the detected elution peak), `traces`
@@ -221,14 +223,14 @@ every Extended family. It mirrors the alignment and peak-bounding of
   `obs_apex` (intensity at the apex scan; `> 0` defines "matched"), `is_b`,
   `ordinal`, `frag_charge`, `frag_mz` (theoretical), `frag_obs_mz` (intensity-
   weighted observed), `mass_err_ppm` (signed ppm).
-- `apex_rt` is set inside `build_evidence` itself (`features.rs:517`) from its
-  `apex_rt` argument, not by the caller.
+- `apex_rt` is set inside `evidence_from` itself from its `apex_rt` argument,
+  not by the caller.
 - Scalars filled by the caller after build (`features.rs:784`-`798`):
   `rt_pred_cal`, `rt_err` (via `calibrated_rt_error`), `gradient`,
   `precursor_mz`, `charge`, `seq_len`, `n_matched`, `n_predicted`, `seed_score`,
   `seed_identified`, `apex_intensity` (plus the MS1 apex isotopes below,
   `features.rs:795`-`798`). All start at a zero/`None` default set by
-  `build_evidence` (`features.rs:517`-`533`).
+  `evidence_from`.
 - MS1: `ms1_mono`/`ms1_iso1`/`ms1_iso2`/`ms1_isom1` (apex isotope intensities,
   `None` when no MS1) and `ms1_xic` (the `[mono,+1,+2]` XICs resampled onto
   `axis`; empty unless the extract stage persisted `ms1_*` chromatogram rows).
@@ -242,7 +244,9 @@ In the chunked pass the parts are built once per PSM and shared with
 `peak_window` (the elution-peak window; global half-widths or the walk down the
 smoothed top-3 profile), and `PeakTraces` (the window, the sliced traces, both
 reference profiles and a `PairStats`). `evidence_from` then assembles the
-Evidence from them; `build_evidence` is the one-call form the tests use.
+Evidence from them. `build_evidence` is a test-only (`#[cfg(test)]`) wrapper
+that builds those parts and calls `evidence_from` in one step; a release build
+has no `build_evidence`.
 
 #### Per-PSM shared statistics (`PairStats`)
 
@@ -594,8 +598,9 @@ a real-peptide-width window centred on its apex rather than one it can widen or
 narrow. With fewer than 20 anchors the stage logs a warning and falls back to
 per-candidate boundary detection for that run. When the flag is false, every
 candidate detects its own peak boundary from its top-3-predicted-fragment
-profile (the legacy path). The same `global_bounds` argument threads into both
-`fragment_features` and `build_evidence`, so Minimal/Rich and Extended see the
+profile (the legacy path). The same `global_bounds` argument threads into
+`peak_window`, which sets the window of both `fragment_features` (under
+`bound_features`) and the Extended Evidence, so Minimal/Rich and Extended see the
 identical window.
 
 ## The shared stats kernel (`stats.rs`)
@@ -657,7 +662,7 @@ variant no longer exists).
 | `set` | `Minimal` | which set `active_features` returns (Minimal 14 / Rich 44 / Extended 381) |
 | `coelution_corr_threshold` | 0.9 | threshold for `n_coelution_above` (count of pairwise fragment correlations at or above it) |
 | `prec_tol_ppm` | 20.0 | precursor tolerance carried for feature bookkeeping |
-| `bound_features` | true | restrict trace-based features to the elution peak instead of the whole extracted window; **gates only the Minimal/Rich `fragment_features` path** (Extended `build_evidence` always peak-bounds, see gotchas) |
+| `bound_features` | true | restrict trace-based features to the elution peak instead of the whole extracted window; **gates only the Minimal/Rich `fragment_features` path** (the Extended Evidence always peak-bounds, see gotchas) |
 | `bound_peak_fraction` | 1/3 | peak-boundary threshold as a fraction of apex height (DIA-NN-style; matched DIA-NN RT bounds best) |
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge before stopping (0 = stop at first miss; 1 bridges a single-scan dip) |
 | `bound_from_confident` | true | learn one global left/right half-width from the confident seed set and apply it to every candidate; false = per-candidate detection |
@@ -753,7 +758,8 @@ set `chrom_loaders: 1` there if that matters.
   leave the features at 0.0.
 - `bound_features` gates only the Minimal/Rich `fragment_features` path
   (`features.rs:1286`): when false, that path scores over the whole extracted
-  window. The Extended `build_evidence` (`features.rs:360`) takes no such flag
+  window. The Extended Evidence build (`peak_window`, `PeakTraces`,
+  `evidence_from`) takes no such flag
   and always peak-bounds `axis`/`traces` while still retaining
   `axis_full`/`traces_full`, so Extended families read whichever window they
   name regardless of `bound_features`, and `global_bounds` from

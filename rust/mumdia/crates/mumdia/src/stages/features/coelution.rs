@@ -133,15 +133,17 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let tf = &e.traces_full;
     let has_full = tf.len() == k && k > 0 && !e.axis_full.is_empty();
     // R over the full window. This used to be a second build of the profile
-    // `interference` also builds inline, term for term the same sum; `build_evidence`
-    // now builds it once (see `super::weighted_reference_full`). It is read only under
+    // `interference` also builds inline, term for term the same sum; the Evidence build
+    // (`PeakTraces::new`, handed on by `evidence_from`) now builds it once (see
+    // `super::weighted_reference_full`). It is read only under
     // `has_full`, which requires `traces_full.len() == pred.len()` -- the condition that
     // made the two builds identical.
     //
     // The length is checked rather than assumed, for the reason `interference` gives:
     // `Evidence` is `pub` with `pub` fields, and a short profile would quietly shorten
-    // every `pearson` below instead of failing. On `build_evidence`, the one constructor,
-    // the check is a comparison and the rebuild never runs.
+    // every `pearson` below instead of failing. On `evidence_from`, the one production
+    // constructor (`build_evidence` is its test-only wrapper), the check is a comparison
+    // and the rebuild never runs.
     let r_full_owned: Cow<[f64]> = if !has_full {
         Cow::Borrowed(&[][..])
     } else if e.ref_profile_full.len() == e.axis_full.len() {

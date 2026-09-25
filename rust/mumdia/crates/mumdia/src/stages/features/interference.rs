@@ -72,13 +72,14 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     }
 
     // Reference profile over the full extraction window (pred-weighted sum), built once
-    // in `build_evidence` rather than here and again in `coelution`; the inline loop this
+    // in the Evidence build (`PeakTraces::new`, handed on by `evidence_from`) rather than
+    // here and again in `coelution`; the inline loop this
     // replaces is reproduced term for term by `super::weighted_reference_full`.
     //
     // `full_apex` below is a position on `axis_full` and indexes this profile, which the
     // inline build made `tf` long by construction. A `debug_assert` would not hold that
-    // in a release build: `Evidence` is `pub` with `pub` fields, `build_evidence` is only
-    // today's sole constructor, and a shorter profile degrades SILENTLY here --
+    // in a release build: `Evidence` is `pub` with `pub` fields, `evidence_from` is only
+    // today's sole production constructor, and a shorter profile degrades SILENTLY here --
     // `sum_full_profile` becomes 0, the `rfull.len() >= 2` and `>= 3` guards below skip
     // `peak_bounds` and the second-peak scan, and `pearson` correlates over the shorter
     // overlap. So the length is checked and the profile rebuilt rather than trusted; on

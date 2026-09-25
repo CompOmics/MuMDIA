@@ -470,7 +470,10 @@ fn align_union(rows: &[ChromRow]) -> TraceAlign {
 /// Per-PSM evidence handed to the extended feature families. All arrays are
 /// f64. Fragment-indexed arrays share one order; time-series share `axis`
 /// (elution-peak-bounded) or `axis_full` (whole extracted window). Built once
-/// per PSM by `build_evidence`, then scalar fields are filled by the caller.
+/// per PSM by `evidence_from` from the parts the chunked pass builds once
+/// (`apex_intensities`, `peak_window`, `PeakTraces`), then scalar fields are
+/// filled by the caller. `build_evidence` is the test-only wrapper that builds those
+/// parts and calls `evidence_from` in one step.
 /// The family modules in `stages/features/` read this and return feature values.
 pub struct Evidence {
     /// RT axis (seconds) restricted to the detected elution peak.
@@ -511,7 +514,8 @@ pub struct Evidence {
     /// intensity is negative (`index.rs` rejects only non-finite ones), so it keeps its
     /// own build.
     ///
-    /// The length is a contract of `build_evidence`, not of the type, so both readers
+    /// The length is a contract of `evidence_from` (the profile comes from
+    /// `PeakTraces::new` over the same alignment), not of the type, so both readers
     /// CHECK it and rebuild rather than trust it: this struct is `pub` with `pub` fields,
     /// several test fixtures fill it with `vec![]`, and a short profile would degrade
     /// silently rather than fail (see the comment in `interference::values`).
@@ -575,8 +579,9 @@ fn parse_ion(name: &str) -> (bool, u32, u32) {
 /// written once and the equality of the two it replaced can be read off it. It reproduces
 /// `interference`'s inline loop exactly (`for f in 0..k` under an `f < traces_full.len()`
 /// guard, `n = x.len().min(t)`), and `coelution`'s `weighted_reference` whenever
-/// `traces_full.len() == pred.len()` -- which `build_evidence` guarantees, since both are
-/// built per row of the same `rows`, and which coelution's `has_full` guard requires
+/// `traces_full.len() == pred.len()` -- which the Evidence build guarantees
+/// ([`PeakTraces::new`] and [`evidence_from`] take `al.traces_full` and `pred` from the
+/// same `rows`, one entry per row), and which coelution's `has_full` guard requires
 /// anyway. Fragment-outer, time-inner, so the f64 accumulation order is the old one.
 fn weighted_reference_full(traces_full: &[Vec<f64>], pred: &[f64], t: usize) -> Vec<f64> {
     let mut r = vec![0.0f64; t];
@@ -590,9 +595,9 @@ fn weighted_reference_full(traces_full: &[Vec<f64>], pred: &[f64], t: usize) -> 
 }
 
 /// Observed intensity at the scan nearest the apex, per row (the first of two equally near
-/// scans, by the strict `<`), widened to f64. `fragment_features` and `build_evidence` each
-/// ran this K x T search over the same rows; the caller now runs it once per PSM and hands
-/// the result to both.
+/// scans, by the strict `<`), widened to f64. `fragment_features` and the Evidence build
+/// each ran this K x T search over the same rows; the caller now runs it once per PSM and
+/// hands the result to both.
 fn apex_intensities(rows: &[ChromRow], apex_rt: f64) -> Vec<f64> {
     rows.iter()
         .map(|r| {
@@ -613,8 +618,8 @@ fn apex_intensities(rows: &[ChromRow], apex_rt: f64) -> Vec<f64> {
 /// The elution-peak window `lo..=hi` on the union axis: the global half-widths when a
 /// confident set gave them, otherwise the walk down the smoothed top-3-predicted profile
 /// from the apex-nearest scan; the whole axis below three points. `fragment_features`
-/// (under `bound_features`) and `build_evidence` each carried this block, identical term
-/// for term, and computed it twice per PSM.
+/// (under `bound_features`) and the Evidence build each carried this block, identical
+/// term for term, and computed it twice per PSM.
 fn peak_window(
     axis_full: &[f32],
     traces_full: &[Vec<f64>],
@@ -2556,7 +2561,8 @@ struct PassTimers {
     loader_blocked_ns: std::sync::atomic::AtomicU64,
     /// The computation waiting for the next chunk to be decoded.
     wait_loader_ns: std::sync::atomic::AtomicU64,
-    /// The parallel per-PSM kernels (`fragment_features`, `build_evidence`, families).
+    /// The parallel per-PSM kernels (`fragment_features`, the Evidence build through
+    /// [`PeakTraces`] and [`evidence_from`], the families).
     compute_ns: std::sync::atomic::AtomicU64,
     /// The serial assembly of the value matrix, the PIN and the output columns.
     assemble_ns: std::sync::atomic::AtomicU64,
@@ -2824,7 +2830,7 @@ fn run_chunked(
     let ext_names = extended_name_refs();
 
     // The two expensive per-PSM computations (`fragment_features` and, when the
-    // extended set is active, `build_evidence` + `extended_values`) are pure
+    // extended set is active, `PeakTraces` + `evidence_from` + `extended_values`) are pure
     // functions of that PSM's own inputs, so they are computed in parallel over the
     // chunk and indexed by row. The serial assembly below reads them back by row and
     // is otherwise unchanged, so the feature values are identical to the whole-run
@@ -3471,7 +3477,8 @@ fn global_bound_indices(
 /// top-3 predicted-intensity fragments, walked from the apex-nearest scan while
 /// >= `frac` x apex height, bridging <= `grace` sub-threshold scans. Returns
 /// > (lo_rt, hi_rt), or None when fewer than 3 distinct scans. Mirrors the boundary
-/// > logic inside `fragment_features`/`build_evidence` so the confident-set half-widths
+/// > logic of `peak_window` (shared by `fragment_features` and the Evidence build) so the
+/// > confident-set half-widths
 /// > match the per-candidate detector they replace when `bound_from_confident` is set.
 fn elution_peak_rt_bounds(
     rows: &[ChromRow],
