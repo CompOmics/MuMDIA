@@ -45,6 +45,8 @@ EXPECTED_SCHEMA_VERSIONS = {
     "seed_psms": 1,
     "run_windows": 1,
     "psms_extracted": 2,
+    # 2 only under `extract.chromatogram_schema = 2` (CHROMATOGRAMS_V2), which smoke arm
+    # 4e runs and checks itself; every run this script reads writes the default, 1.
     "chromatograms": 1,
     "features": 2,
     "psms_competed": 4,

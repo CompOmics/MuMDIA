@@ -4242,6 +4242,8 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                                     rows.trace_offset.push(e.trace_offset);
                                     rows.trace_len.push(e.trace_len);
                                 }
+                                // A row the encoder refuses stops the loop like a failed
+                                // psms write, and the table is abandoned the same way.
                                 Err(e) => {
                                     psms_err = Some(e);
                                     return false;

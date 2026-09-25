@@ -223,7 +223,7 @@ impl Encoder {
 
     /// Encode the next row: candidate `cid`, with its v1 axis and trace.
     pub fn encode(&mut self, cid: u32, rt: Vec<f32>, intensity: Vec<f32>) -> Result<EncodedRow> {
-        if self.row % self.row_group_rows == 0 {
+        if self.row.is_multiple_of(self.row_group_rows) {
             // A new row group: nothing written before it may be referred to.
             self.open = None;
         }
@@ -657,26 +657,27 @@ mod tests {
     /// candidate.
     fn rows_fixture() -> Vec<(u32, Vec<f32>, Vec<f32>)> {
         let grid = |n: usize, t0: f32| (0..n).map(|k| t0 + k as f32).collect::<Vec<f32>>();
-        let mut v = Vec::new();
-        // Candidate 3: absent first, then grid rows, then MS1-like rows on the same grid.
-        v.push((3, vec![], vec![]));
-        v.push((3, grid(6, 10.0), vec![0.0, 0.0, 5.0, 7.0, 0.0, 0.0]));
-        v.push((3, grid(6, 10.0), vec![1.0, 0.0, 5.0, 7.0, 0.0, 2.0]));
-        v.push((3, vec![], vec![]));
-        v.push((3, grid(6, 10.0), vec![0.0; 6]));
-        v.push((3, grid(6, 10.0), vec![-0.0, 0.0, 0.0, 0.0, 0.0, f32::NAN]));
-        v.push((3, grid(6, 10.0), vec![0.0, 0.0, 0.0, 0.0, 0.0, 3.0]));
-        // Candidate 4: sparse mode, a different axis on most rows, one repeated, and one
-        // that differs from the one before only in the sign of a zero.
-        v.push((4, vec![1.0, 3.0], vec![2.0, 0.0]));
-        v.push((4, vec![0.0, 4.0, 9.0], vec![0.0, 1.5, 0.0]));
-        v.push((4, vec![0.0, 4.0, 9.0], vec![0.0, 0.0, 0.0]));
-        v.push((4, vec![-0.0, 4.0, 9.0], vec![0.0, 0.0, 8.0]));
-        // Candidate 7: a single row.
-        v.push((7, grid(3, 50.0), vec![0.5, 0.25, 0.125]));
-        // Candidate 9: only absent rows.
-        v.push((9, vec![], vec![]));
-        v.push((9, vec![], vec![]));
+        let mut v = vec![
+            // Candidate 3: absent first, then grid rows, then MS1-like rows on the same grid.
+            (3, vec![], vec![]),
+            (3, grid(6, 10.0), vec![0.0, 0.0, 5.0, 7.0, 0.0, 0.0]),
+            (3, grid(6, 10.0), vec![1.0, 0.0, 5.0, 7.0, 0.0, 2.0]),
+            (3, vec![], vec![]),
+            (3, grid(6, 10.0), vec![0.0; 6]),
+            (3, grid(6, 10.0), vec![-0.0, 0.0, 0.0, 0.0, 0.0, f32::NAN]),
+            (3, grid(6, 10.0), vec![0.0, 0.0, 0.0, 0.0, 0.0, 3.0]),
+            // Candidate 4: sparse mode, a different axis on most rows, one repeated, and one
+            // that differs from the one before only in the sign of a zero.
+            (4, vec![1.0, 3.0], vec![2.0, 0.0]),
+            (4, vec![0.0, 4.0, 9.0], vec![0.0, 1.5, 0.0]),
+            (4, vec![0.0, 4.0, 9.0], vec![0.0, 0.0, 0.0]),
+            (4, vec![-0.0, 4.0, 9.0], vec![0.0, 0.0, 8.0]),
+            // Candidate 7: a single row.
+            (7, grid(3, 50.0), vec![0.5, 0.25, 0.125]),
+            // Candidate 9: only absent rows.
+            (9, vec![], vec![]),
+            (9, vec![], vec![]),
+        ];
         // Candidate 12: a long grid.
         let g = grid(40, 100.0);
         for f in 0..5 {
@@ -860,7 +861,10 @@ mod tests {
         w.close().unwrap();
     }
 
-    fn dense_rows(path: &str) -> Vec<(u32, String, u64, u64, u32, Vec<u32>, Vec<u32>)> {
+    /// One row as [`for_each_row`] hands it over, every float as its bit pattern.
+    type RowBits = (u32, String, u64, u64, u32, Vec<u32>, Vec<u32>);
+
+    fn dense_rows(path: &str) -> Vec<RowBits> {
         let tf = TableFile::open(path).unwrap();
         let mut out = Vec::new();
         for_each_row(&tf, |r| {
@@ -978,7 +982,12 @@ mod tests {
             return;
         };
         std::fs::create_dir_all(&out).unwrap();
-        let at = |d: &str, f: &str| std::path::Path::new(d).join(f).to_string_lossy().to_string();
+        let at = |d: &str, f: &str| {
+            std::path::Path::new(d)
+                .join(f)
+                .to_string_lossy()
+                .to_string()
+        };
         let src = at(&dir, "chromatograms.parquet");
         let size = |p: &str| std::fs::metadata(p).unwrap().len();
         let mb = |b: u64| b as f64 / 1e6;

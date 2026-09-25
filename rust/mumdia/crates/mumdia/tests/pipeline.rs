@@ -489,7 +489,7 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
     .unwrap();
     let scored = tmp(&format!("v2_{tag}_scored.parquet"));
     stages::rescore::run(stages::rescore::RescoreParams {
-        competed: &[competed.clone()],
+        competed: std::slice::from_ref(&competed),
         sources: None,
         out: &scored,
         work_dir: &tmp(&format!("v2_{tag}_rescore_work")),
