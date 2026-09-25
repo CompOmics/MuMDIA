@@ -159,6 +159,13 @@ than a number. Both are recorded in every run's `manifest.json`.
   dictionary indices, so the AIF chromatograms are 12.0% smaller than with the planned
   dictionary (160.9 against 182.8 MB) with identical values. Writers can name such columns
   with `WriteOptions::plain_column` (docs/09 "Output: chromatograms").
+- **Parquet columns are encoded in parallel.** Every writer encodes a row group's columns
+  concurrently on a dedicated codec pool (at most 8 threads, `--threads` when it is lower,
+  serial at `--threads 1` or `MUMDIA_PARQUET_THREADS=1`) and appends them in schema order,
+  which writes the serial writer's file byte for byte. Encoding the AIF features table took
+  0.14 s on 8 threads against 0.45 s, the competed table 0.16 against 0.42 s, the
+  chromatograms 4.4 against 8.1 s. Writers called from inside a rayon pool keep encoding on
+  their own thread (docs/03 "Parallel column codec").
 
 - **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
   `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort

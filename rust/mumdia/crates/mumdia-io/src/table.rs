@@ -19,7 +19,9 @@ use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
     RowSelector,
 };
-use parquet::arrow::{ArrowSchemaConverter, ArrowWriter};
+use parquet::arrow::ArrowSchemaConverter;
+#[cfg(test)]
+use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, LogicalType, Type as PhysicalType};
 use parquet::column::writer::ColumnCloseResult;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
@@ -28,6 +30,7 @@ use parquet::file::statistics::Statistics;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::ColumnPath;
 
+use crate::codec::{codec_pool, ColumnEncoder};
 pub use crate::report::Written;
 pub use crate::span_cache::SpanReadOptions;
 
@@ -401,7 +404,7 @@ struct FloatLeaf {
 
 /// The parquet leaves of `schema` whose physical type is FLOAT or DOUBLE, as the writer
 /// will name them, with their Arrow root columns. Derived with the same converter the
-/// [`ArrowWriter`] uses, so a list column's leaf path (`trace.list.item`) is the writer's own
+/// [`ArrowWriter`](parquet::arrow::ArrowWriter) uses, so a list column's leaf path (`trace.list.item`) is the writer's own
 /// spelling rather than a guess. A schema the converter rejects yields no leaves; the writer
 /// reports that failure itself.
 fn float_leaves(schema: &Schema) -> Vec<FloatLeaf> {
@@ -798,7 +801,8 @@ impl std::io::Write for Sink {
 /// with [`writer_props`]. A capped writer first holds its first [`plan_sample_rows`] rows,
 /// plans its float encodings from them ([`EncodingPlan`]), and then encodes the held batches
 /// in the order and the chunks they arrived in, so every column writer sees the sequence of
-/// writes it would have seen without the plan.
+/// writes it would have seen without the plan. The columns of a row group are encoded on the
+/// codec pool ([`crate::codec`]), which writes the serial arrow writer's bytes.
 struct Encoder {
     state: EncoderState,
 }
@@ -814,7 +818,7 @@ enum EncoderState {
         /// [`WriteOptions::plain_column`].
         plain: Vec<String>,
     },
-    Writing(Box<ArrowWriter<Sink>>),
+    Writing(Box<ColumnEncoder<Sink>>),
     /// Only while a transition is in flight, or after one failed.
     Poisoned,
 }
@@ -846,7 +850,12 @@ impl Encoder {
             }
             _ => {
                 let props = writer_props(&schema, row_group_rows, None, &plain);
-                EncoderState::Writing(Box::new(ArrowWriter::try_new(sink, schema, Some(props))?))
+                EncoderState::Writing(Box::new(ColumnEncoder::try_new(
+                    sink,
+                    schema,
+                    props,
+                    codec_pool(),
+                )?))
             }
         };
         Ok(Encoder { state })
@@ -893,7 +902,7 @@ impl Encoder {
         };
         let plan = EncodingPlan::of(&schema, &pending, plan_sample_rows(row_group_rows));
         let props = writer_props(&schema, Some(row_group_rows), Some(&plan), &plain);
-        let mut w = ArrowWriter::try_new(*sink, schema, Some(props))?;
+        let mut w = ColumnEncoder::try_new(*sink, schema, props, codec_pool())?;
         for b in &pending {
             w.write(b)?;
         }
@@ -905,7 +914,7 @@ impl Encoder {
     fn finish(mut self) -> Result<Sink> {
         self.start()?;
         match self.state {
-            EncoderState::Writing(w) => Ok(w.into_inner()?),
+            EncoderState::Writing(w) => w.into_inner(),
             _ => Err(anyhow!("parquet writer used after a failed write")),
         }
     }
@@ -5270,6 +5279,91 @@ mod writer_bench {
                 median(reads[k].clone()),
                 peak as f64 / 1e6,
             );
+        }
+    }
+
+    /// The parallel column codec against the serial one on a REAL artifact, under the
+    /// shipped writer properties at the source's own row-group size:
+    ///
+    /// ```text
+    /// MUMDIA_BENCH_PARQUET=out_aif02/features.parquet MUMDIA_BENCH_ROW_GROUP=65536 \
+    ///   cargo test -p mumdia-io --release -- --ignored --nocapture bench_parallel_encode
+    /// ```
+    ///
+    /// The batches are re-chunked to 65,536 rows first (the decoded ones are 1,024), which
+    /// is what the engine's stage writers hand the codec. Every arm must produce the serial
+    /// arm's bytes; the median of `MUMDIA_BENCH_REPEATS` (default 3) interleaved rounds is
+    /// printed per thread count.
+    #[test]
+    #[ignore = "benchmark; needs MUMDIA_BENCH_PARQUET"]
+    fn bench_parallel_encode_a_real_artifact() {
+        let Ok(src) = std::env::var("MUMDIA_BENCH_PARQUET") else {
+            println!("set MUMDIA_BENCH_PARQUET to a real artifact to run this");
+            return;
+        };
+        let cap = std::env::var("MUMDIA_BENCH_ROW_GROUP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0);
+        let repeats: usize = std::env::var("MUMDIA_BENCH_REPEATS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3)
+            .max(1);
+        let table = Table::read(&src).unwrap();
+        let mut chunks = Vec::new();
+        let mut at = 0usize;
+        let whole = arrow::compute::concat_batches(&table.schema, &table.batches).unwrap();
+        while at < table.nrows {
+            let k = (table.nrows - at).min(1 << 16);
+            chunks.push(whole.slice(at, k));
+            at += k;
+        }
+        let plan = cap.map(|c| EncodingPlan::of(&table.schema, &chunks, plan_sample_rows(c)));
+        let props = || writer_props(&table.schema, cap, plan.as_ref(), &[]);
+        let write = |threads: usize| -> (Vec<u8>, f64) {
+            let pool = (threads > 1).then(|| {
+                Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap(),
+                )
+            });
+            let t = Instant::now();
+            let mut out = Vec::with_capacity(1 << 28);
+            let mut w =
+                ColumnEncoder::try_new(&mut out, table.schema.clone(), props(), pool).unwrap();
+            for b in &chunks {
+                w.write(b).unwrap();
+            }
+            w.into_inner().unwrap();
+            (out, t.elapsed().as_secs_f64())
+        };
+        let arms = [1usize, 2, 4, 8];
+        let mut times: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
+        let mut reference: Option<Vec<u8>> = None;
+        for _ in 0..repeats {
+            for (k, &threads) in arms.iter().enumerate() {
+                let (bytes, secs) = write(threads);
+                match &reference {
+                    None => reference = Some(bytes),
+                    Some(r) => assert!(*r == bytes, "{threads} threads: bytes differ"),
+                }
+                times[k].push(secs);
+            }
+        }
+        println!(
+            "{src}: {} rows x {} columns, row group {cap:?}, {:.1} MB; median encode of \
+             {repeats} rounds (every arm byte-identical to 1 thread):",
+            table.nrows,
+            table.schema.fields().len(),
+            reference.as_ref().map_or(0, |r| r.len()) as f64 / 1e6
+        );
+        for (k, &threads) in arms.iter().enumerate() {
+            let mut v = times[k].clone();
+            v.sort_by(f64::total_cmp);
+            println!("  {threads} threads: {:.2} s", v[v.len() / 2]);
         }
     }
 

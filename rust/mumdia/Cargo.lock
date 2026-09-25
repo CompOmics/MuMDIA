@@ -1059,6 +1059,7 @@ dependencies = [
  "bytes",
  "mumdia-core",
  "parquet",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror",

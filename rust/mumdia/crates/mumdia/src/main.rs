@@ -89,6 +89,8 @@ fn apply_threads(threads: Option<usize>) -> Result<()> {
         .num_threads(n)
         .build_global()
         .map_err(|e| anyhow::anyhow!("cannot set --threads {n}: {e}"))?;
+    // The parquet codec's own pool: at most `n` threads, none at `--threads 1`.
+    mumdia_io::codec::set_codec_threads(n);
     for var in ["MUMDIA_NN_THREADS", "OMP_NUM_THREADS"] {
         if std::env::var_os(var).is_none() {
             std::env::set_var(var, n.to_string());

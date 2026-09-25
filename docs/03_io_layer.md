@@ -231,6 +231,43 @@ the planned dictionary (160.9 against 182.8 MB; 17.5% against the unplanned
 layout), written in 5.4 against 7.2 s. This is X6 of the survey. An unknown
 column name is an error when the writer opens.
 
+#### Parallel column codec (`codec.rs`)
+
+parquet-rs's `ArrowWriter` encodes a row group's columns one after another on
+the calling thread. Every writer here (`TableWriter`, `BatchWriter`,
+`write_batches`) encodes through `codec::ColumnEncoder` instead, which builds
+the same parts (`ArrowWriter::try_new(..).into_serialized_writer()`, then one
+`ArrowColumnWriter` per leaf from the `ArrowRowGroupWriterFactory`) and encodes
+the root columns of each batch concurrently. It splits a batch at the row-group
+cap where `ArrowWriter::write` splits it, skips empty batches, gives each column
+writer one `write` per (split) batch so the page checks fall where they fell,
+closes the column chunks concurrently and appends them in schema order, and
+inherits the `ARROW:schema` metadata from `try_new`. The file is the serial
+writer's file byte for byte: `the_parallel_encoder_writes_the_serial_writers_bytes`
+and `a_wide_table_on_a_pool_is_the_serial_writers_file` compare them over several
+row groups, list columns, nulls, empty and straddling batches, pools of 1, 4
+and 6 threads and no pool. A byte row-group cap or content-defined chunking is
+refused rather than reproduced; no writer here sets either.
+
+The work runs on a dedicated rayon pool, never the global one. Its size is
+`MUMDIA_PARQUET_THREADS` when set (0 or 1 is serial), else `--threads` capped at
+8 (`set_codec_threads`, called by the CLI; `--threads 1` is serial), else the
+machine's parallelism capped at 8. A writer called from inside any rayon pool
+encodes on its own thread instead: rayon lets a worker that waits on another
+pool steal jobs of its own pool meanwhile, and such a job could take a lock the
+writer's caller holds. The parallel path is therefore used from plain threads
+(the main thread, extract's chromatogram writer thread, the features writer
+thread, rescore's handoff and psms_scored writers); a band or a run that already
+runs on the global pool is parallel at that level.
+
+Measured on the AIF artifacts re-chunked to 65,536-row batches under the shipped
+properties (`bench_parallel_encode_a_real_artifact`, median of 3 rounds, every
+arm byte-identical): features 0.45 s serial, 0.26 s on 2 threads, 0.19 s on 4,
+0.14 s on 8; psms_competed 0.42 / 0.27 / 0.19 / 0.16 s; chromatograms 8.07 /
+4.57 / 4.40 / 4.41 s (two list columns carry nearly all of it, so two threads
+take the whole gain); spectra_ms2 0.42 / 0.25 / 0.26 / 0.27 s. This is R2 of
+the 2026-09-25 performance survey.
+
 ### Read side: Parquet -> `Table` -> typed `Vec`
 
 `Table` (`table.rs:200-204`) holds the `Arc<Schema>`, the `Vec<RecordBatch>`,

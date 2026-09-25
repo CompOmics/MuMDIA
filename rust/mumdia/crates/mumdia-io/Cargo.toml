@@ -24,6 +24,7 @@ blake3.workspace = true
 bytes.workspace = true
 arrow.workspace = true
 parquet.workspace = true
+rayon.workspace = true
 
 [lints]
 workspace = true
