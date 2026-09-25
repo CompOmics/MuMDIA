@@ -17,7 +17,9 @@ use mumdia_core::config::{CompeteConfig, CompeteGroupBy, CompetitionMode};
 use mumdia_core::rejection::RejectionReason;
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
-use mumdia_io::table::{require_no_nulls, write_table, BatchWriter, Col, TableFile};
+use mumdia_io::table::{
+    publish_copy_of, require_no_nulls, write_table, BatchWriter, Col, FileCopy, TableFile,
+};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -35,6 +37,11 @@ pub struct CompeteParams<'a> {
     pub out: &'a str,
     pub cfg: &'a CompeteConfig,
     pub config_hash: &'a str,
+    /// The features table's content hash, when the caller already has it (the features
+    /// stage's own report hash, from `features::run_hashed`). It is used only when the
+    /// competed table is published as the features file's own bytes, which then have
+    /// exactly that hash; otherwise, or when `None`, the output is hashed.
+    pub features_hash: Option<&'a str>,
 }
 
 pub fn run(p: CompeteParams) -> Result<u64> {
@@ -206,13 +213,14 @@ pub fn run_hashed(p: CompeteParams) -> Result<Written> {
     let resolve_ms = t_resolve.elapsed().as_millis();
     let t_write = Instant::now();
 
-    let rows = copy_kept_rows(
+    let (rows, published) = publish_competed(
         &t,
+        p.features,
         p.out,
         feat_names,
         synth_peak_rank,
+        audit,
         &keep,
-        COMPETED_ROW_GROUP_ROWS,
     )?;
     // Feature schema companion: unchanged feature list, so rescore validates the same schema.
     mumdia_io::json::write_json(&format!("{}.schema.json", p.out), &schema)?;
@@ -274,7 +282,13 @@ pub fn run_hashed(p: CompeteParams) -> Result<Written> {
     }
     let audit_ms = t_audit.elapsed().as_millis();
     let t_hash = Instant::now();
-    let content_hash = mumdia_io::hash::blake3_file(p.out)?;
+    // Published as the features file's bytes: its hash is the features hash, which the
+    // caller may already hold. Hashing the output again would read the widest artifact of
+    // the run for a value that is known.
+    let content_hash = match (published, p.features_hash) {
+        (Published::FeaturesFile(_), Some(h)) => h.to_string(),
+        _ => mumdia_io::hash::blake3_file(p.out)?,
+    };
     let hash_ms = t_hash.elapsed().as_millis();
 
     let elapsed = t0.elapsed().as_millis();
@@ -282,6 +296,9 @@ pub fn run_hashed(p: CompeteParams) -> Result<Written> {
     stats.insert("input_rows".to_string(), json!(n));
     stats.insert("kept".to_string(), json!(rows));
     stats.insert("removed".to_string(), json!(removed.len()));
+    // How the table reached disk: `hard_link` / `byte_copy` (the features file's own bytes)
+    // or `rewritten`. The values are the same either way; the file bytes and hash are not.
+    stats.insert("publish".to_string(), json!(published.as_str()));
     let report = ArtifactReport {
         logical_name: artifact::PSMS_COMPETED.0.to_string(),
         schema_name: artifact::PSMS_COMPETED.0.to_string(),
@@ -306,6 +323,7 @@ pub fn run_hashed(p: CompeteParams) -> Result<Written> {
         audit_ms,
         hash_ms,
         elapsed_ms = elapsed,
+        publish = published.as_str(),
         "compete: phase timings"
     );
     info!(
@@ -402,19 +420,143 @@ const COPY_BATCH_ROWS: usize = 1 << 14;
 /// row order are unchanged.
 const COMPETED_ROW_GROUP_ROWS: usize = 131_072;
 
-/// Copy the surviving rows (`keep`, sorted ascending) of the features table into `out`,
-/// one input batch at a time, in exactly the column set and order the previous typed
-/// rewrite produced: the 11 bookkeeping columns, then the schema's feature columns, all
-/// non-nullable. The kept rows of a batch are one contiguous slice of `keep`, and `take`
-/// preserves their order, so the output row order is unchanged.
-fn copy_kept_rows(
+/// How the competed table reached disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Published {
+    /// Every row survived and the features file already is the competed table, so its bytes
+    /// were published unchanged: a hard link, or a byte copy where the link failed.
+    FeaturesFile(FileCopy),
+    /// Decoded and re-encoded batch by batch ([`copy_kept_rows`]).
+    Rewritten,
+}
+
+impl Published {
+    fn as_str(self) -> &'static str {
+        match self {
+            Published::FeaturesFile(how) => how.as_str(),
+            Published::Rewritten => "rewritten",
+        }
+    }
+}
+
+/// Whether the features file's own bytes can stand in for the competed table.
+enum Reuse {
+    /// They can, row group for row group.
+    Yes,
+    /// They cannot, for this reason.
+    No(&'static str),
+}
+
+/// Whether the features file, as written, is already byte for byte what [`copy_kept_rows`]
+/// would write for the rows it holds.
+///
+/// Four conditions, each necessary:
+///
+/// - the Arrow schema is EXACTLY the competed schema: the same fields in the same order,
+///   with the same types, nullability and metadata, nothing extra and nothing missing,
+///   and no schema metadata of its own. The copy writes that column set only;
+/// - every parquet leaf is REQUIRED, so no value can be null. The copy turns a null into
+///   NaN, "" or the buffer value (`densify`) or refuses it, and a file with none has
+///   nothing for it to change;
+/// - every row group holds at most [`COMPETED_ROW_GROUP_ROWS`] rows, so a reader of the
+///   competed table decodes no more per group than it would from the copy. `features`
+///   writes 65,536-row groups;
+/// - the table has its own `peak_rank` column (the copy synthesises one for a pre-v2
+///   table) and the audit is off. The audit does not interact with the table; it is kept
+///   on the path it was validated on.
+///
+/// A column that is missing or has the wrong type is the error the copy would raise.
+fn features_bytes_reusable(
     t: &TableFile,
+    feat_names: &[String],
+    synth_peak_rank: bool,
+    audit: bool,
+) -> Result<Reuse> {
+    if synth_peak_rank {
+        return Ok(Reuse::No("the features table has no peak_rank column"));
+    }
+    if audit {
+        return Ok(Reuse::No("compete.emit_competition_audit is on"));
+    }
+    let (out_schema, _) = competed_schema(t, feat_names, synth_peak_rank)?;
+    if t.schema.fields() != out_schema.fields() || t.schema.metadata() != out_schema.metadata() {
+        return Ok(Reuse::No(
+            "the features table's columns are not exactly the competed columns",
+        ));
+    }
+    if !t.all_leaves_required() {
+        return Ok(Reuse::No("a features column is stored as nullable"));
+    }
+    if t.row_group_rows()
+        .iter()
+        .any(|&r| r > COMPETED_ROW_GROUP_ROWS)
+    {
+        return Ok(Reuse::No(
+            "a features row group is larger than the competed row-group cap",
+        ));
+    }
+    Ok(Reuse::Yes)
+}
+
+/// Write the competed table (the rows `keep` of the features table) to `out`.
+///
+/// Under the shipped grouping every row survives (`peptidoform_charge` groups are
+/// singletons, and `removed` is 0), and then the competed table is the features table:
+/// the same columns, the same rows in the same order, the same values. When the features
+/// file's bytes are exactly what the copy would write ([`features_bytes_reusable`]) they
+/// are published as the competed table with a hard link, or a byte copy where linking
+/// fails, instead of being decoded and re-encoded column by column. Otherwise, and if the
+/// link and the copy both fail, the rows are rewritten by [`copy_kept_rows`].
+///
+/// The competed file then has the features file's row groups (65,536 rows) and bytes, and
+/// so the features file's content hash. Every reader decodes the same values in the same
+/// order, which is what the downstream stages see.
+fn publish_competed(
+    t: &TableFile,
+    features: &str,
     out: &str,
     feat_names: &[String],
     synth_peak_rank: bool,
+    audit: bool,
     keep: &[usize],
-    row_group_rows: usize,
-) -> Result<u64> {
+) -> Result<(u64, Published)> {
+    let n = t.nrows;
+    match features_bytes_reusable(t, feat_names, synth_peak_rank, audit)? {
+        // `keep` is sorted and unique within 0..n, so n entries are every row.
+        Reuse::Yes if keep.len() == n => match publish_copy_of(features, out) {
+            Ok(how) => return Ok((n as u64, Published::FeaturesFile(how))),
+            Err(e) => warn!(
+                error = %format!("{e:#}"),
+                "compete: every row survived, but the features table could not be linked or \
+                 copied as the competed table; rewriting it"
+            ),
+        },
+        Reuse::Yes => {}
+        Reuse::No(reason) => info!(
+            reason,
+            "compete: the features table's bytes cannot be reused; rewriting the rows"
+        ),
+    }
+    let rows = copy_kept_rows(
+        t,
+        out,
+        feat_names,
+        synth_peak_rank,
+        keep,
+        COMPETED_ROW_GROUP_ROWS,
+    )?;
+    Ok((rows, Published::Rewritten))
+}
+
+/// The competed table's schema, in exactly the column set and order the previous typed
+/// rewrite produced: the 11 bookkeeping columns, then the schema's feature columns, all
+/// non-nullable. Also the source column of each output field (`None` = synthesised zeros),
+/// and every source column is checked to exist with the declared type.
+fn competed_schema(
+    t: &TableFile,
+    feat_names: &[String],
+    synth_peak_rank: bool,
+) -> Result<(Arc<Schema>, Vec<Option<String>>)> {
     let mut fields: Vec<Field> = Vec::with_capacity(META_COLUMNS.len() + feat_names.len());
     // Source column per output field; None = synthesised zeros (a pre-v2 features table
     // without `peak_rank`, which the typed path also emitted as zeros).
@@ -446,7 +588,22 @@ fn copy_kept_rows(
             }
         }
     }
-    let out_schema = Arc::new(Schema::new(fields));
+    Ok((Arc::new(Schema::new(fields)), source))
+}
+
+/// Copy the surviving rows (`keep`, sorted ascending) of the features table into `out`,
+/// one input batch at a time, in the column set of [`competed_schema`]. The kept rows of a
+/// batch are one contiguous slice of `keep`, and `take` preserves their order, so the
+/// output row order is unchanged.
+fn copy_kept_rows(
+    t: &TableFile,
+    out: &str,
+    feat_names: &[String],
+    synth_peak_rank: bool,
+    keep: &[usize],
+    row_group_rows: usize,
+) -> Result<u64> {
+    let (out_schema, source) = competed_schema(t, feat_names, synth_peak_rank)?;
     let proj: Vec<&str> = source.iter().flatten().map(String::as_str).collect();
     let reader = t.batches(Some(&proj), COPY_BATCH_ROWS)?;
     let in_schema = reader.schema();
@@ -724,6 +881,7 @@ mod tests {
             out: features.to_str().unwrap(),
             cfg: &cfg,
             config_hash: "h",
+            features_hash: None,
         })
         .unwrap_err()
         .to_string();
@@ -1157,5 +1315,216 @@ mod tests {
         assert_eq!(dense_peptidoform_ids(&t).unwrap(), want);
         assert_eq!(want, vec![0, 1, 0, 2, 1, 2, 3]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A features table as the features stage writes it: `TableWriter` row groups of
+    /// `rg_rows`, the 11 bookkeeping columns plus `charge` and `n_matched_fragments`, and
+    /// the schema companion naming those two as the feature columns. Rows `dups` take the
+    /// peptidoform of the row two before them, which under the default
+    /// `peptidoform_charge` grouping makes each a second member of that row's group (same
+    /// charge parity; the callers pick rows whose label matches too). `extra` adds a column
+    /// the competed schema does not have; `peak_rank = false` leaves out `peak_rank`.
+    fn write_features_table(
+        path: &str,
+        n: usize,
+        rg_rows: usize,
+        dups: &[usize],
+        extra: bool,
+        peak_rank: bool,
+    ) {
+        let f = |g: &dyn Fn(usize) -> f64| (0..n).map(g).collect::<Vec<f64>>();
+        let pform = |i: usize| {
+            let src = if dups.contains(&i) { i - 2 } else { i };
+            format!("PEP{}", src / 2)
+        };
+        let mut cols = vec![IoCol::U32("candidate_id".into(), (0..n as u32).collect())];
+        if peak_rank {
+            cols.push(IoCol::I32("peak_rank".into(), vec![0; n]));
+        }
+        cols.extend([
+            IoCol::Str(
+                "label".into(),
+                (0..n)
+                    .map(|i| if i % 3 == 0 { "decoy" } else { "target" }.to_string())
+                    .collect(),
+            ),
+            IoCol::U32(
+                "base_peptide_id".into(),
+                (0..n as u32).map(|i| i / 2).collect(),
+            ),
+            IoCol::Str("peptidoform".into(), (0..n).map(pform).collect()),
+            IoCol::Str("protein".into(), (0..n).map(|i| format!("P{i}")).collect()),
+            IoCol::F64("apex_rt".into(), f(&|i| i as f64)),
+            IoCol::F64("elution_lo".into(), f(&|i| i as f64 - 1.0)),
+            IoCol::F64("elution_hi".into(), f(&|i| i as f64 + 1.0)),
+            IoCol::F64("precursor_mz".into(), f(&|i| 400.0 + i as f64)),
+            IoCol::F64("prelim_score".into(), f(&|i| (i % 7) as f64 / 7.0)),
+            IoCol::F64("charge".into(), f(&|i| 2.0 + (i % 2) as f64)),
+            IoCol::F64("n_matched_fragments".into(), f(&|i| (i % 5) as f64)),
+        ]);
+        if extra {
+            cols.push(IoCol::F64("not_a_feature".into(), f(&|i| i as f64)));
+        }
+        let mut w = mumdia_io::table::TableWriter::new(path).with_row_group_rows(rg_rows);
+        w.write_cols(cols).unwrap();
+        w.close().unwrap();
+        mumdia_io::json::write_json(
+            &format!("{path}.schema.json"),
+            &FeatureSchema {
+                feature_columns: vec!["charge".to_string(), "n_matched_fragments".to_string()],
+                schema_id: "test".to_string(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// Every row of a parquet file as one batch, for a value-for-value comparison.
+    fn whole_table(path: &str) -> RecordBatch {
+        let t = mumdia_io::table::Table::read(path).unwrap();
+        arrow::compute::concat_batches(&t.schema, &t.batches).unwrap()
+    }
+
+    fn compete_with(
+        features: &str,
+        out: &str,
+        cfg: &CompeteConfig,
+        features_hash: Option<&str>,
+    ) -> (Written, ArtifactReport) {
+        let w = run_hashed(CompeteParams {
+            features,
+            out,
+            cfg,
+            config_hash: "h",
+            features_hash,
+        })
+        .unwrap();
+        let rep: ArtifactReport =
+            mumdia_io::json::read_json(&format!("{out}.report.json")).unwrap();
+        (w, rep)
+    }
+
+    /// What the rewrite path writes for `keep`, for comparison with the fast paths.
+    fn rewritten_reference(features: &str, out: &str, keep: &[usize]) {
+        let t = TableFile::open(features).unwrap();
+        let schema = FeatureSchema::read(features).unwrap();
+        copy_kept_rows(
+            &t,
+            out,
+            &schema.feature_columns,
+            false,
+            keep,
+            COMPETED_ROW_GROUP_ROWS,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_table_that_keeps_every_row_is_published_as_the_features_file() {
+        let dir = tmp_dir("identity");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        write_features_table(feats, 21, 4, &[], false, true);
+        let out = dir.join("competed.parquet");
+        let out = out.to_str().unwrap();
+        let cfg = CompeteConfig::default();
+        let (w, rep) = compete_with(feats, out, &cfg, None);
+        assert_eq!(rep.stats["removed"], json!(0));
+        let publish = rep.stats["publish"].as_str().unwrap().to_string();
+        assert!(
+            publish == "hard_link" || publish == "byte_copy",
+            "the identity fast path did not apply: {publish}"
+        );
+        // The competed file IS the features file, byte for byte, and its hash is the
+        // features hash, both in the report and in what the stage returns.
+        assert_eq!(std::fs::read(out).unwrap(), std::fs::read(feats).unwrap());
+        let feats_hash = mumdia_io::hash::blake3_file(feats).unwrap();
+        assert_eq!(rep.content_hash, feats_hash);
+        assert_eq!(w.content_hash, feats_hash);
+        assert_eq!(w.rows, 21);
+        // And it holds exactly the values the rewrite would have written.
+        let reference = dir.join("reference.parquet");
+        let reference = reference.to_str().unwrap();
+        rewritten_reference(feats, reference, &(0..21).collect::<Vec<_>>());
+        assert_eq!(whole_table(out), whole_table(reference));
+        // The schema companion is written as before.
+        assert_eq!(
+            FeatureSchema::read(out).unwrap().feature_columns,
+            vec!["charge".to_string(), "n_matched_fragments".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_features_hash_a_caller_supplies_is_the_one_recorded() {
+        // Published as the features bytes, the output is not hashed again: the value the
+        // caller already holds (the features stage's report hash) is recorded.
+        let dir = tmp_dir("given_hash");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        write_features_table(feats, 9, 4, &[], false, true);
+        let out = dir.join("competed.parquet");
+        let out = out.to_str().unwrap();
+        let cfg = CompeteConfig::default();
+        let given = "f".repeat(64);
+        let (w, rep) = compete_with(feats, out, &cfg, Some(&given));
+        assert_eq!(rep.content_hash, given);
+        assert_eq!(w.content_hash, given);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn competing_again_over_a_linked_output_leaves_no_temporary_file() {
+        let dir = tmp_dir("rerun");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        write_features_table(feats, 9, 4, &[], false, true);
+        let out = dir.join("competed.parquet");
+        let out = out.to_str().unwrap();
+        let cfg = CompeteConfig::default();
+        compete_with(feats, out, &cfg, None);
+        compete_with(feats, out, &cfg, None);
+        assert_eq!(std::fs::read(out).unwrap(), std::fs::read(feats).unwrap());
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.contains(".tmp-")),
+            "a temporary file survived: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_table_the_competed_schema_does_not_describe_exactly_is_rewritten() {
+        // Three ways the features bytes differ from what the copy writes: a column the
+        // competed table does not carry, a pre-v2 table without `peak_rank` (the copy
+        // synthesises zeros), and the audit on (kept on the validated path). Each is
+        // rewritten, and the rewrite is what it always was.
+        let cfg = CompeteConfig::default();
+        let audit = CompeteConfig {
+            emit_competition_audit: true,
+            ..CompeteConfig::default()
+        };
+        for (tag, extra, peak_rank, cfg) in [
+            ("extra", true, true, &cfg),
+            ("no_peak_rank", false, false, &cfg),
+            ("audit", false, true, &audit),
+        ] {
+            let dir = tmp_dir(&format!("fallback_{tag}"));
+            let feats = dir.join("features.parquet");
+            let feats = feats.to_str().unwrap();
+            write_features_table(feats, 9, 4, &[], extra, peak_rank);
+            let out = dir.join("competed.parquet");
+            let out = out.to_str().unwrap();
+            let (w, rep) = compete_with(feats, out, cfg, None);
+            assert_eq!(rep.stats["publish"], json!("rewritten"), "{tag}");
+            assert_eq!(w.rows, 9, "{tag}");
+            assert_eq!(rep.content_hash, mumdia_io::hash::blake3_file(out).unwrap());
+            let t = TableFile::open(out).unwrap();
+            assert!(!t.has_column("not_a_feature"), "{tag}");
+            assert_eq!(t.i32("peak_rank").unwrap(), vec![0; 9], "{tag}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

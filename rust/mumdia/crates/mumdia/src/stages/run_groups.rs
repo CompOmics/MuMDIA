@@ -786,6 +786,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 out: &competed,
                 cfg: &cfg.compete,
                 config_hash: ch,
+                features_hash: Some(&features_written.content_hash),
             })?;
             if keep_records {
                 recs.push(competed_written.record(

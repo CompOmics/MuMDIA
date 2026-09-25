@@ -308,6 +308,12 @@ Two of the four tables an ungrouped run writes are not pooled, because nothing r
   run's second-widest artifact, so pooling it cost a full read and a full write for a file
   nothing opened.
 
+Within a band, the competed table is normally a hard link to the band's feature table: under
+the shipped grouping compete removes no row, so it publishes the features file's own bytes
+instead of rewriting them (docs/11 "compete: how the competed table is published"). The two
+names then cost the disk once, and deleting one band file does not free the space while the
+other name exists. The pool splices from the competed name as before.
+
 Each pooled table is hashed once, for the manifest record and the report beside it
 together. At experiment scale those tables are tens of GB, and hashing reads all of it.
 The band artifacts are hashed once as well, by the stage that writes them, for its own

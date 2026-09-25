@@ -638,6 +638,7 @@ pub fn run(p: RunParams) -> Result<()> {
                 out: &competed,
                 cfg: &cfg.compete,
                 config_hash: &ch,
+                features_hash: Some(&wf.content_hash),
             })?;
             man.record(w.record(
                 artifact::PSMS_COMPETED.0,

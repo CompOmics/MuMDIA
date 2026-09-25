@@ -281,6 +281,7 @@ fn features_compete_rescore_run_on_crafted_input() {
         out: &competed,
         cfg: &cfg.compete,
         config_hash: "test",
+        features_hash: None,
     })
     .unwrap();
 

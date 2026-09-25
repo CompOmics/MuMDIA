@@ -334,7 +334,7 @@ fn process_run(
         config_hash: ch,
     })?;
     let feats = d("features.parquet");
-    features::run(features::FeaturesParams {
+    let features_written = features::run_hashed(features::FeaturesParams {
         psms: &psms,
         chromatograms: &chrom,
         seed: Some(&seed),
@@ -349,6 +349,7 @@ fn process_run(
         out: &competed,
         cfg: &cfg.compete,
         config_hash: ch,
+        features_hash: Some(&features_written.content_hash),
     })?;
     Ok((competed, chrom, produced_rt_lib))
 }
