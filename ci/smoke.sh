@@ -286,7 +286,8 @@ PYEOF
 # 4e. The chromatogram v2 layout (`extract.chromatogram_schema = 2`, docs/15 "Layout v2"):
 #     the RT axis once per candidate per row group, each trace trimmed to its nonzero run.
 #     Every reader rebuilds the v1 rows from it, so every table after extract must be the
-#     v1 run's in `$work/out`, byte for byte, while the chromatogram table says schema 2.
+#     v1 run's in `$work/out`, byte for byte, while the chromatogram table says schema 2
+#     and stores its lists as `rt_axis`/`intensity_trimmed`, never as `rt`/`intensity`.
 #     A second v2 run puts a row-group seam at EVERY row (`MUMDIA_CHROM_ROW_GROUP_ROWS=1`,
 #     a test knob that moves only the seams), so no row may take its axis from another
 #     row and every read that starts at a seam must still find one; the same bytes again.
@@ -354,19 +355,26 @@ for d in ("out_chrom_v2", "out_chrom_v2_rg1", "out_grouped_v2"):
     check(rec(d)["schema_version"] == 2, f"{d} does not record chromatograms schema 2")
 f1, f2, fr = pq.ParquetFile(v1), pq.ParquetFile(v2), pq.ParquetFile(rg1)
 names = lambda f: f.schema_arrow.names
-check("trace_len" not in names(f1), "the default table has v2 columns")
-check({"trace_offset", "trace_len"} <= set(names(f2)), "the v2 table lacks its trace columns")
+V1_LISTS = {"rt", "intensity"}
+V2_COLS = {"rt_axis", "intensity_trimmed", "trace_offset", "trace_len"}
+check(V1_LISTS <= set(names(f1)) and not V2_COLS & set(names(f1)),
+      "the default table is not v1: it lacks rt/intensity or has a v2 column")
+# The v2 lists are renamed so that a reader that knows only v1 stops at the missing `rt`
+# instead of taking an empty axis beside a trimmed trace for an observed row.
+for f, d in ((f2, "out_chrom_v2"), (fr, "out_chrom_v2_rg1")):
+    check(V2_COLS <= set(names(f)) and not V1_LISTS & set(names(f)),
+          f"the {d} table does not have the v2 columns in place of rt/intensity")
 check(f1.metadata.num_rows == f2.metadata.num_rows == fr.metadata.num_rows,
       "the layouts hold different row counts")
 check(all(fr.metadata.row_group(i).num_rows == 1 for i in range(fr.metadata.num_row_groups)),
       "MUMDIA_CHROM_ROW_GROUP_ROWS=1 did not put a seam at every row")
 t1 = pq.read_table(v1, columns=["rt", "intensity"])
-t2 = pq.read_table(v2, columns=["rt", "intensity"])
+t2 = pq.read_table(v2, columns=["rt_axis", "intensity_trimmed"])
 vals = lambda t, c: sum(len(x) for x in t.column(c).to_pylist())
 s1, s2 = os.path.getsize(v1), os.path.getsize(v2)
 print("    ok: %d rows; rt values %d -> %d, intensity values %d -> %d; %d -> %d bytes (%.1f%% smaller)"
-      % (f1.metadata.num_rows, vals(t1, "rt"), vals(t2, "rt"), vals(t1, "intensity"),
-         vals(t2, "intensity"), s1, s2, 100.0 * (1 - s2 / s1)))
+      % (f1.metadata.num_rows, vals(t1, "rt"), vals(t2, "rt_axis"), vals(t1, "intensity"),
+         vals(t2, "intensity_trimmed"), s1, s2, 100.0 * (1 - s2 / s1)))
 PYEOF
 echo "    ok: every table after extract byte-identical to v1, ungrouped (default seams and a seam at every row) and grouped (pooled and per band)"
 

@@ -47,17 +47,20 @@ than a number. Both are recorded in every run's `manifest.json`.
   with identical downstream tables.** Each candidate's retention-time axis is stored once
   per parquet row group instead of on every row, each intensity trace from its first to
   its last nonzero value, and two `u32` columns (`trace_offset`, `trace_len`) rebuild the
-  full trace. The rule restarts at every row group, so each group decodes on its own, and
-  features, quant and the pool rebuild the v1 rows bit for bit: `features.parquet`,
+  full trace. The two list columns are named `rt_axis` and `intensity_trimmed` in v2, so a
+  reader that knows only v1 (an older engine binary, a script reading `rt`) stops at the
+  missing column instead of misreading the table. The rule restarts at every row group, so
+  each group decodes on its own, and features, quant and the pool rebuild the v1 rows bit
+  for bit: `features.parquet`,
   `psms_competed.parquet`, `psms_scored.parquet` and the quant tables are byte-identical to
   a v1 run, checked in the Rust suite at every row-group size from one row to the whole
   table, by `ci/smoke.sh` (ungrouped, grouped pooled and per band, and with a seam at every
   row through the test knob `MUMDIA_CHROM_ROW_GROUP_ROWS`), and on three real runs. The
   table was 28.7% smaller on an AIF run, 50.3% on an AIF entrapment run and 15.5% on an
-  Astral run (docs/15, "Layout v2"). The default stays 1, because a reader outside the
-  engine that expects a full axis on every row would misread v2;
-  `mumdia::chromatograms::rewrite` converts between the layouts. Validate on a new dataset
-  by running once with each setting and comparing those tables with `cmp`.
+  Astral run (docs/15, "Layout v2"). The default stays 1, because readers outside the
+  engine and older engine binaries read only v1; `mumdia::chromatograms::rewrite` converts
+  between the layouts. Validate on a new dataset by running once with each setting and
+  comparing those tables with `cmp`.
 - **`rescore.handoff = raw`, an opt-in handoff with no parquet codec on either side.** The
   `nn_torch` worker is given a `.raw.json` description naming a row-major little-endian
   f32 `.npy` matrix and a small parquet of the metadata columns. The engine writes each

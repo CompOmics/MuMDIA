@@ -28,8 +28,9 @@ pub mod artifact {
     /// v1: every row stores its whole `rt` axis and its whole `intensity` trace.
     pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 1);
     /// v2, written only under `extract.chromatogram_schema = 2`: the axis once per candidate
-    /// per row group, each trace trimmed to its nonzero run, and `trace_offset` / `trace_len`
-    /// to rebuild it (`mumdia::chromatograms`). Every reader accepts both.
+    /// per row group (`rt_axis`), each trace trimmed to its nonzero run (`intensity_trimmed`),
+    /// and `trace_offset` / `trace_len` to rebuild it (`mumdia::chromatograms`). Every reader
+    /// in the engine accepts both; the renamed lists make a v1-only reader fail on v2.
     pub const CHROMATOGRAMS_V2: (&str, u32) = ("chromatograms", 2);
     /// v2: the feature columns are Float32 except the few `F64_FEATURE_COLUMNS` of
     /// `stages/features.rs`; v1 stored every feature as Float64. Every reader accepts both.

@@ -3445,7 +3445,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
     // Chromatogram rows stream to parquet chunk by chunk (see the candidate loop below).
     // Hashed as it is written: the report's content hash then needs no read-back of the
     // run's largest artifact (docs/03_io_layer.md, "Hash on write"). The layout and the
-    // encodings are the shared ones ([`crate::chromatograms::writer`]: the `rt` axis PLAIN).
+    // encodings are the shared ones ([`crate::chromatograms::writer`]: the axis PLAIN).
     // Under v2 every row passes through one `Encoder` in table order, which counts the rows
     // to know where each row group starts, so it and the writer take the same row-group
     // size.
@@ -3459,7 +3459,8 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
             crate::chromatograms::ROW_GROUP_ROWS_ENV
         );
     }
-    let chrom_writer = crate::chromatograms::writer(p.out_chrom, chrom_rg_rows).with_content_hash();
+    let chrom_writer =
+        crate::chromatograms::writer(p.out_chrom, chrom_rg_rows, chrom_layout).with_content_hash();
     let mut chrom_encoder = crate::chromatograms::Encoder::new(chrom_rg_rows);
 
     // Deterministic output order (a HashMap's iteration order is randomized,

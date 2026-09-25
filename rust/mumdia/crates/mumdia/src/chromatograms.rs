@@ -14,22 +14,29 @@
 //! `rt` column held 10.8 times the values that one axis per candidate needs, and 57% of
 //! the `intensity` values lay outside their trace's nonzero run.
 //!
-//! **v2** (`extract.chromatogram_schema = 2`) adds two `u32` columns and changes what the
-//! two list columns hold:
+//! **v2** (`extract.chromatogram_schema = 2`) stores the two traces in two list columns of
+//! other names, `rt_axis` and `intensity_trimmed`, and adds two `u32` columns:
 //!
 //! * `trace_len` is the length of the row's full trace, and 0 for a fragment that was never
 //!   observed. `trace_offset` is the position, in that full trace, of the first stored
 //!   intensity.
-//! * `intensity` holds the full trace from its first to its last value that is not `+0.0`.
-//!   The comparison is on the bit pattern, so a `-0.0` or a NaN is stored as it is. Every
-//!   value outside the stored run is `+0.0`, and a trace that is `+0.0` throughout stores
-//!   no value at all (`trace_len` still says how long it is).
-//! * `rt` holds the row's axis only where a reader cannot know it already. A row with a
-//!   non-empty trace writes its axis, unless the last row that wrote an axis in the same
+//! * `intensity_trimmed` holds the full trace from its first to its last value that is not
+//!   `+0.0`. The comparison is on the bit pattern, so a `-0.0` or a NaN is stored as it is.
+//!   Every value outside the stored run is `+0.0`, and a trace that is `+0.0` throughout
+//!   stores no value at all (`trace_len` still says how long it is).
+//! * `rt_axis` holds the row's axis only where a reader cannot know it already. A row with
+//!   a non-empty trace writes its axis, unless the last row that wrote an axis in the same
 //!   parquet row group belongs to the same candidate and wrote a bit-identical axis. Then
-//!   the row writes an empty `rt`, and its axis is that one. In window-grid mode this is one
-//!   axis per candidate per row group. In sparse mode (`extract.emit_window_grid = false`)
-//!   each fragment has an axis of its own, so nearly every row writes one.
+//!   the row writes an empty `rt_axis`, and its axis is that one. In window-grid mode this
+//!   is one axis per candidate per row group. In sparse mode
+//!   (`extract.emit_window_grid = false`) each fragment has an axis of its own, so nearly
+//!   every row writes one.
+//!
+//! The list columns are renamed rather than reused so that a reader that knows only v1
+//! fails on a v2 table instead of misreading it. An older engine binary, or a script that
+//! reads `rt` and `intensity`, stops at the missing column; with the v1 names kept it would
+//! take an empty `rt` beside a trimmed trace as an observed row, and compute from it
+//! without an error.
 //!
 //! The rule restarts at every row group, so **each row group can be read on its own**. That
 //! is what makes the layout safe at the seams the readers cut. Quant reads the table row
@@ -48,6 +55,16 @@ use arrow::array::{Array, ArrayRef, Float32Array, Float64Array, StringArray, UIn
 use arrow::record_batch::RecordBatch;
 use mumdia_io::table::{Col, ListF32, TableFile, TableWriter};
 
+/// The v1 list column holding a row's retention-time axis.
+pub const RT: &str = "rt";
+/// The v1 list column holding a row's full intensity trace.
+pub const INTENSITY: &str = "intensity";
+/// The v2 list column holding a row's retention-time axis, where no earlier row of its
+/// candidate in the row group supplies it (module docs).
+pub const RT_AXIS: &str = "rt_axis";
+/// The v2 list column holding a row's trace from its first to its last value that is not
+/// `+0.0`.
+pub const INTENSITY_TRIMMED: &str = "intensity_trimmed";
 /// The v2 column holding where a row's stored intensities start in its full trace.
 pub const TRACE_OFFSET: &str = "trace_offset";
 /// The v2 column holding the length of a row's full trace (0: never observed).
@@ -101,25 +118,57 @@ impl Layout {
         }
     }
 
-    /// The layout of an open table, from its columns: v2 carries both trace columns and v1
-    /// neither. One without the other is an error rather than a guess.
+    /// The layout of an open table, from its columns: v2 carries all four of its trace
+    /// columns and neither v1 list column, v1 none of the four. Anything in between is an
+    /// error rather than a guess. A v1 table missing `rt` or `intensity` is V1 here and
+    /// fails at the projection, with the missing column named, as it always has.
     pub fn of(tf: &TableFile) -> Result<Layout> {
-        match (tf.has_column(TRACE_OFFSET), tf.has_column(TRACE_LEN)) {
-            (false, false) => Ok(Layout::V1),
-            (true, true) => Ok(Layout::V2),
+        let v2: Vec<&str> = Layout::V2
+            .trace_columns()
+            .iter()
+            .copied()
+            .filter(|c| tf.has_column(c))
+            .collect();
+        let v1: Vec<&str> = [RT, INTENSITY]
+            .into_iter()
+            .filter(|c| tf.has_column(c))
+            .collect();
+        match v2.len() {
+            0 => Ok(Layout::V1),
+            4 if v1.is_empty() => Ok(Layout::V2),
             _ => bail!(
-                "{} has one of the chromatogram v2 columns '{TRACE_OFFSET}' and \
-                 '{TRACE_LEN}' but not the other; it is neither layout",
-                tf.path()
+                "{} has the chromatogram v2 columns {v2:?} of {:?} and the v1 columns \
+                 {v1:?}; a v2 table carries all four v2 columns and neither v1 list column, \
+                 so it is neither layout",
+                tf.path(),
+                Layout::V2.trace_columns()
             ),
         }
     }
 
-    /// The columns a reader projects in addition to the v1 ones.
+    /// The list column holding a row's retention-time axis.
+    pub fn rt_column(self) -> &'static str {
+        match self {
+            Layout::V1 => RT,
+            Layout::V2 => RT_AXIS,
+        }
+    }
+
+    /// The list column holding a row's intensities.
+    pub fn intensity_column(self) -> &'static str {
+        match self {
+            Layout::V1 => INTENSITY,
+            Layout::V2 => INTENSITY_TRIMMED,
+        }
+    }
+
+    /// Every column that holds a row's traces, which a reader projects beside
+    /// `candidate_id` and the per-fragment columns: the two list columns, then in v2 the
+    /// two trace columns.
     pub fn trace_columns(self) -> &'static [&'static str] {
         match self {
-            Layout::V1 => &[],
-            Layout::V2 => &[TRACE_OFFSET, TRACE_LEN],
+            Layout::V1 => &[RT, INTENSITY],
+            Layout::V2 => &[RT_AXIS, INTENSITY_TRIMMED, TRACE_OFFSET, TRACE_LEN],
         }
     }
 }
@@ -456,8 +505,9 @@ impl Rows {
             // LargeList (64-bit offsets): the total chromatogram list-value count can exceed
             // the ~2.1B limit of a 32-bit ListArray offset buffer when extraction accepts a
             // very large candidate set (e.g. gates opened up).
-            Col::LargeListF32("rt".into(), self.rt),
-            Col::LargeListF32("intensity".into(), self.intensity),
+            // The names follow the layout: v2's lists are not v1's lists (module docs).
+            Col::LargeListF32(layout.rt_column().into(), self.rt),
+            Col::LargeListF32(layout.intensity_column().into(), self.intensity),
         ]);
         if layout == Layout::V2 {
             cols.push(Col::U32(TRACE_OFFSET.into(), self.trace_offset));
@@ -467,19 +517,19 @@ impl Rows {
     }
 }
 
-/// A writer for a chromatogram table, laid out as extract lays it out: `row_group_rows`
-/// rows per row group and the `rt` axis written PLAIN. Every fragment row of a v1 candidate
-/// carries the same axis, and snappy shortens those repeated PLAIN runs far better than a
-/// dictionary's bit-packed indices (AIF chromatograms 12.0% smaller; docs/03 "Float
-/// encodings planned from the first rows"). In v2 the column holds about one axis per
-/// candidate and mostly empty lists, and PLAIN is kept there as well: against a dictionary
-/// `rt` it measured 2.7% smaller on an AIF run and 3.2% and 0.3% larger on an entrapment
-/// and an Astral run (`v2_on_a_real_artifact`, docs/15_data_dictionary.md "Layout v2"),
-/// which is no case for a second rule.
-pub fn writer(path: &str, row_group_rows: usize) -> TableWriter {
+/// A writer for a chromatogram table in `layout`, laid out as extract lays it out:
+/// `row_group_rows` rows per row group and the axis column (`rt`, v2 `rt_axis`) written
+/// PLAIN. Every fragment row of a v1 candidate carries the same axis, and snappy shortens
+/// those repeated PLAIN runs far better than a dictionary's bit-packed indices (AIF
+/// chromatograms 12.0% smaller; docs/03 "Float encodings planned from the first rows"). In
+/// v2 the column holds about one axis per candidate and mostly empty lists, and PLAIN is
+/// kept there as well: against a dictionary axis it measured 2.7% smaller on an AIF run and
+/// 3.2% and 0.3% larger on an entrapment and an Astral run (`v2_on_a_real_artifact`,
+/// docs/15_data_dictionary.md "Layout v2"), which is no case for a second rule.
+pub fn writer(path: &str, row_group_rows: usize, layout: Layout) -> TableWriter {
     TableWriter::new(path)
         .with_row_group_rows(row_group_rows)
-        .with_plain_column("rt")
+        .with_plain_column(layout.rt_column())
 }
 
 /// One row of a chromatogram table in its v1 form, as [`for_each_row`] hands it over.
@@ -500,13 +550,7 @@ pub struct DenseRow<'a> {
 pub fn for_each_row(tf: &TableFile, mut f: impl FnMut(&DenseRow) -> Result<()>) -> Result<()> {
     let layout = Layout::of(tf)?;
     let opt = Optional::of(tf);
-    let mut cols = vec![
-        "candidate_id",
-        "frag_name",
-        "predicted_intensity",
-        "rt",
-        "intensity",
-    ];
+    let mut cols = vec!["candidate_id", "frag_name", "predicted_intensity"];
     if opt.frag_mz {
         cols.push("frag_mz");
     }
@@ -514,6 +558,7 @@ pub fn for_each_row(tf: &TableFile, mut f: impl FnMut(&DenseRow) -> Result<()>) 
         cols.push("frag_obs_mz");
     }
     cols.extend_from_slice(layout.trace_columns());
+    let (rt_col, int_col) = (layout.rt_column(), layout.intensity_column());
     let mut dec = Decoder::new();
     for b in tf.batches(Some(&cols), 1 << 12)? {
         let b = b?;
@@ -556,16 +601,16 @@ pub fn for_each_row(tf: &TableFile, mut f: impl FnMut(&DenseRow) -> Result<()>) 
             .as_any()
             .downcast_ref::<Float32Array>()
             .ok_or_else(|| anyhow!("chromatograms column 'predicted_intensity' is not f32"))?;
-        let rt = ListF32::of(col("rt")?, "rt")?;
-        let int = ListF32::of(col("intensity")?, "intensity")?;
+        let rt = ListF32::of(col(rt_col)?, rt_col)?;
+        let int = ListF32::of(col(int_col)?, int_col)?;
         let trace = match layout {
             Layout::V1 => None,
             Layout::V2 => Some(TraceCols::of(&b)?),
         };
         for k in 0..b.num_rows() {
             let c = cid.value(k);
-            let rt_k = rt.row_slice(k, "rt")?;
-            let int_k = int.row_slice(k, "intensity")?;
+            let rt_k = rt.row_slice(k, rt_col)?;
+            let int_k = int.row_slice(k, int_col)?;
             let (rt_k, int_k) = match &trace {
                 None => (rt_k, int_k),
                 Some(t) => dec.row(c, rt_k, int_k, t.offset(k), t.len(k))?,
@@ -592,7 +637,12 @@ pub fn rewrite(src: &str, out: &str, layout: Layout, row_group_rows: usize) -> R
     if std::path::Path::new(src) == std::path::Path::new(out) {
         bail!("chromatograms rewrite: the output {out} is the input");
     }
-    rewrite_into(src, layout, row_group_rows, writer(out, row_group_rows))
+    rewrite_into(
+        src,
+        layout,
+        row_group_rows,
+        writer(out, row_group_rows, layout),
+    )
 }
 
 /// [`rewrite`] into a writer of the caller's, which must cut row groups every
@@ -845,7 +895,7 @@ mod tests {
 
     /// Write `rows` as a v1 table of `rg`-row groups (List or LargeList per `large`).
     fn write_v1(path: &str, rows: &[(u32, Vec<f32>, Vec<f32>)], rg: usize) {
-        let mut w = writer(path, rg);
+        let mut w = writer(path, rg, Layout::V1);
         let mut r = Rows::default();
         for (i, (c, rt, it)) in rows.iter().enumerate() {
             r.cid.push(*c);
@@ -945,13 +995,46 @@ mod tests {
 
     #[test]
     fn half_a_v2_schema_is_neither_layout() {
+        // A v1 table with one v2 column, and a v2 table that kept a v1 list column.
         let p = scratch("half.parquet");
-        let mut w = writer(&p, 16);
+        let mut w = writer(&p, 16, Layout::V1);
         let mut cols = Rows::default().into_cols(Layout::V1, Optional::ALL);
         cols.push(Col::U32(TRACE_LEN.into(), Vec::new()));
         w.write_cols(cols).unwrap();
         w.close().unwrap();
         assert!(Layout::of(&TableFile::open(&p).unwrap()).is_err());
+        let p = scratch("v2_with_rt.parquet");
+        let mut w = writer(&p, 16, Layout::V2);
+        let mut cols = Rows::default().into_cols(Layout::V2, Optional::ALL);
+        cols.push(Col::LargeListF32(RT.into(), Vec::new()));
+        w.write_cols(cols).unwrap();
+        w.close().unwrap();
+        let err = Layout::of(&TableFile::open(&p).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("neither layout"), "{err}");
+    }
+
+    #[test]
+    fn a_reader_that_knows_only_v1_fails_on_a_v2_table() {
+        // The reason the v2 lists have names of their own: a v1 projection of a v2 table
+        // stops at the missing column instead of taking an empty `rt` beside a trimmed
+        // trace for an observed row.
+        let v1 = scratch("only_v1_src.parquet");
+        write_v1(&v1, &rows_fixture(), 1 << 16);
+        let v2 = scratch("only_v1_v2.parquet");
+        rewrite(&v1, &v2, Layout::V2, 1 << 16).unwrap();
+        let tf = TableFile::open(&v2).unwrap();
+        assert!(!tf.has_column(RT) && !tf.has_column(INTENSITY));
+        assert!(tf.has_column(RT_AXIS) && tf.has_column(INTENSITY_TRIMMED));
+        for col in [RT, INTENSITY] {
+            let read = tf
+                .batches(Some(&["candidate_id", col]), 1 << 12)
+                .and_then(|r| r.collect::<Result<Vec<_>>>());
+            assert!(read.is_err(), "a v1 projection of '{col}' read a v2 table");
+        }
+        // The v1 table has the v1 names and none of the v2 ones.
+        let tf = TableFile::open(&v1).unwrap();
+        assert!(tf.has_column(RT) && tf.has_column(INTENSITY));
+        assert!(Layout::V2.trace_columns().iter().all(|c| !tf.has_column(c)));
     }
 
     /// The layouts measured on a real run, and held to the same downstream bytes.
@@ -1004,8 +1087,18 @@ mod tests {
         let v1 = at(&out, "chrom_v1.parquet");
         let v2 = at(&out, "chrom_v2.parquet");
         let v2_dict = at(&out, "chrom_v2_dict_rt.parquet");
-        arm("v1", Layout::V1, writer(&v1, ROW_GROUP_ROWS), &v1);
-        arm("v2", Layout::V2, writer(&v2, ROW_GROUP_ROWS), &v2);
+        arm(
+            "v1",
+            Layout::V1,
+            writer(&v1, ROW_GROUP_ROWS, Layout::V1),
+            &v1,
+        );
+        arm(
+            "v2",
+            Layout::V2,
+            writer(&v2, ROW_GROUP_ROWS, Layout::V2),
+            &v2,
+        );
         arm(
             "v2, rt dictionary",
             Layout::V2,
@@ -1019,12 +1112,14 @@ mod tests {
         // Stored values, the survey's measure.
         let values = |p: &str| -> (u64, u64) {
             let tf = TableFile::open(p).unwrap();
+            let layout = Layout::of(&tf).unwrap();
+            let (rc, ic) = (layout.rt_column(), layout.intensity_column());
             let (mut r, mut i) = (0u64, 0u64);
-            for b in tf.batches(Some(&["rt", "intensity"]), 1 << 14).unwrap() {
+            for b in tf.batches(Some(&[rc, ic]), 1 << 14).unwrap() {
                 let b = b.unwrap();
                 let s = b.schema();
-                let rt = ListF32::of(b.column(s.index_of("rt").unwrap()), "rt").unwrap();
-                let it = ListF32::of(b.column(s.index_of("intensity").unwrap()), "i").unwrap();
+                let rt = ListF32::of(b.column(s.index_of(rc).unwrap()), "rt").unwrap();
+                let it = ListF32::of(b.column(s.index_of(ic).unwrap()), "i").unwrap();
                 for k in 0..b.num_rows() {
                     r += rt.row_slice(k, "rt").unwrap().len() as u64;
                     i += it.row_slice(k, "i").unwrap().len() as u64;

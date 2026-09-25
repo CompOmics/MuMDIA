@@ -19,7 +19,9 @@ use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{column_names, write_table, Col, ListF32, TableFile};
 
-use crate::chromatograms::{Decoder, Layout, TraceCols, TRACE_LEN, TRACE_OFFSET};
+use crate::chromatograms::{
+    Decoder, Layout, TraceCols, INTENSITY, INTENSITY_TRIMMED, RT, RT_AXIS, TRACE_LEN, TRACE_OFFSET,
+};
 use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
@@ -1406,16 +1408,12 @@ fn load_chromatograms(
     threads: usize,
     selective: bool,
 ) -> Result<ChromStore> {
+    // The trace columns, whose names follow the layout, are added per table
+    // ([`ChromRead::projection`]).
     let cols: Vec<&str> = if has_pred {
-        vec![
-            "candidate_id",
-            "frag_name",
-            "predicted_intensity",
-            "rt",
-            "intensity",
-        ]
+        vec!["candidate_id", "frag_name", "predicted_intensity"]
     } else {
-        vec!["candidate_id", "frag_name", "rt", "intensity"]
+        vec!["candidate_id", "frag_name"]
     };
     let read = ChromRead {
         cols: &cols,
@@ -1584,6 +1582,8 @@ fn chrom_spans(
 
 /// What one chromatogram read keeps, and how it reads it: shared by every span of a plan.
 struct ChromRead<'a> {
+    /// The columns read besides the trace columns, whose names follow each table's layout
+    /// ([`ChromRead::projection`]).
     cols: &'a [&'a str],
     has_pred: bool,
     keep_all: bool,
@@ -1613,8 +1613,9 @@ struct ChromCols<'a> {
 
 impl<'a> ChromCols<'a> {
     /// The columns of `b` by name, with the type checks and messages the single pass has
-    /// always made, in its order (`frag_name`, `rt`, `intensity`, `predicted_intensity`).
-    fn of(b: &'a RecordBatch, has_pred: bool) -> Result<ChromCols<'a>> {
+    /// always made, in its order (`frag_name`, `rt`, `intensity`, `predicted_intensity`;
+    /// the two lists under their v2 names in a v2 table).
+    fn of(b: &'a RecordBatch, has_pred: bool, layout: Layout) -> Result<ChromCols<'a>> {
         let sch = b.schema();
         let ix = |n: &str| {
             sch.index_of(n)
@@ -1625,8 +1626,9 @@ impl<'a> ChromCols<'a> {
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| anyhow!("column 'frag_name' is not utf8"))?;
-        let rt = ListF32::of(b.column(ix("rt")?), "rt")?;
-        let int = ListF32::of(b.column(ix("intensity")?), "intensity")?;
+        let (rc, ic) = (layout.rt_column(), layout.intensity_column());
+        let rt = ListF32::of(b.column(ix(rc)?), rc)?;
+        let int = ListF32::of(b.column(ix(ic)?), ic)?;
         let pred = if has_pred {
             Some(
                 b.column(ix("predicted_intensity")?)
@@ -1738,11 +1740,18 @@ impl ChromRead<'_> {
         self.one_pass(tf)
     }
 
-    /// The projection of `tf`: this read's columns, and the trace columns of a v2 table.
+    /// The projection of `tf`: this read's columns, and the trace columns of its layout
+    /// (`rt` and `intensity`, or the two v2 lists and the two v2 trace columns).
     fn projection(&self, tf: &TableFile) -> Result<(Layout, Vec<&str>)> {
         let layout = Layout::of(tf)?;
         let mut cols: Vec<&str> = self.cols.to_vec();
-        cols.extend_from_slice(layout.trace_columns());
+        // Once each: [`ChromRead::selected`] reads every projected column on its own, so a
+        // name listed twice would be read, and its rows kept, twice.
+        for &c in layout.trace_columns() {
+            if !cols.contains(&c) {
+                cols.push(c);
+            }
+        }
         Ok((layout, cols))
     }
 
@@ -1768,7 +1777,7 @@ impl ChromRead<'_> {
                 .as_any()
                 .downcast_ref::<UInt32Array>()
                 .ok_or_else(|| anyhow!("column 'candidate_id' is not u32"))?;
-            let v = ChromCols::of(&b, self.has_pred)?;
+            let v = ChromCols::of(&b, self.has_pred, layout)?;
             let trace = match layout {
                 Layout::V1 => None,
                 Layout::V2 => Some(TraceCols::of(&b)?),
@@ -1783,8 +1792,8 @@ impl ChromRead<'_> {
                 } else {
                     v.name.value(k)
                 };
-                let rt = v.rt.row_slice(k, "rt")?;
-                let it = v.int.row_slice(k, "intensity")?;
+                let rt = v.rt.row_slice(k, layout.rt_column())?;
+                let it = v.int.row_slice(k, layout.intensity_column())?;
                 let pred = v.pred.map_or(0.0, |a| a.value(k));
                 match &trace {
                     None => self.push_row(&mut store, c, nm, rt, it, pred)?,
@@ -1849,7 +1858,7 @@ impl ChromRead<'_> {
             }
         }
         // The column types the one pass checks on its first batch, after `candidate_id`'s.
-        ChromCols::of(&RecordBatch::new_empty(schema), self.has_pred)?;
+        ChromCols::of(&RecordBatch::new_empty(schema), self.has_pred, layout)?;
         let keep: Vec<bool> = ids.iter().map(|&c| self.keeps(c)).collect();
         let n_kept = keep.iter().filter(|&&k| k).count();
         let rest: Vec<&str> = cols
@@ -1907,9 +1916,10 @@ impl ChromRead<'_> {
                             }
                         }
                     }
-                    "rt" | "intensity" => {
+                    RT | INTENSITY | RT_AXIS | INTENSITY_TRIMMED => {
                         let l = ListF32::of(a, col)?;
-                        let (vals, ends) = if col == "rt" {
+                        // The projection holds only this layout's two lists.
+                        let (vals, ends) = if col == layout.rt_column() {
                             (&mut kept.rt, &mut kept.rt_end)
                         } else {
                             (&mut kept.int, &mut kept.int_end)
@@ -4694,13 +4704,9 @@ mod tests {
         path
     }
 
-    const CHROM_COLS: [&str; 5] = [
-        "candidate_id",
-        "frag_name",
-        "predicted_intensity",
-        "rt",
-        "intensity",
-    ];
+    /// What `load_chromatograms` passes: the trace columns come from the table's layout
+    /// ([`ChromRead::projection`]).
+    const CHROM_COLS: [&str; 3] = ["candidate_id", "frag_name", "predicted_intensity"];
 
     /// The reference read: one pass over every row of `tf`, keeping `wanted`'s rows, with
     /// no row-group plan and no row selection.

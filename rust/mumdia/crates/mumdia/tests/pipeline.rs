@@ -581,9 +581,12 @@ fn chromatograms_v2_leave_every_downstream_table_byte_identical() {
     );
     // The v2 table carries each candidate's axis once and says it is schema 2. (Its size is not
     // asserted: on a table of a few rows the two extra columns' footer entries outweigh what
-    // v2 saves. The saving is measured on the smoke fixture and on a real run.)
+    // v2 saves. The saving is measured on the smoke fixture and on a real run.) Its lists
+    // have names of their own, so a reader that knows only v1 stops at the missing `rt`.
+    assert!(t1.has_column("rt") && t1.has_column("intensity"));
+    assert!(!t2.has_column("rt") && !t2.has_column("intensity"));
     let axes = t2
-        .list_f32("rt")
+        .list_f32("rt_axis")
         .unwrap()
         .iter()
         .filter(|a| !a.is_empty())

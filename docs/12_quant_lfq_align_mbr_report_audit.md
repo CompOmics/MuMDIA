@@ -254,8 +254,9 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    Both chromatogram layouts are read (docs/15_data_dictionary.md, "Layout v2"). Every
    span quant reads is a whole file or whole row groups, and a v2 span is decoded from
    its first row by a `chromatograms::Decoder` of its own, in the single pass and in the
-   page-selective read, which reads `trace_offset` and `trace_len` under the same
-   selection as the other columns. Only kept rows are decoded. That is enough because a
+   page-selective read, which reads the four v2 columns (`rt_axis`,
+   `intensity_trimmed`, `trace_offset`, `trace_len`) under the same selection as the
+   other columns. Only kept rows are decoded. That is enough because a
    candidate is kept or dropped whole, so a kept candidate's rows in a row group include
    the row that carries its axis. MS1 rows are checked and followed but not rebuilt,
    since quant drops them. The store is the v1 table's, axis ids included, so every

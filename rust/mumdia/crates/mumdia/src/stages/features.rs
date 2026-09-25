@@ -1336,12 +1336,11 @@ impl ChromStream {
             "frag_name",
             "frag_mz",
             "predicted_intensity",
-            "rt",
-            "intensity",
         ];
         if has_obs_mz {
             cols.push("frag_obs_mz");
         }
+        // `rt` and `intensity` in v1; the v2 lists and trace columns in v2.
         cols.extend_from_slice(layout.trace_columns());
         Ok(ChromStream {
             inner: ch.batches(Some(&cols), CHROM_BATCH_ROWS)?,
@@ -1401,14 +1400,15 @@ impl ChromStream {
                 .as_any()
                 .downcast_ref::<UInt32Array>()
                 .ok_or_else(|| anyhow!("chromatograms column 'candidate_id' is not u32"))?;
-            let rt = ListF32::of(col("rt")?, "rt")?;
-            let inten = ListF32::of(col("intensity")?, "intensity")?;
+            let (rc, ic) = (self.layout.rt_column(), self.layout.intensity_column());
+            let rt = ListF32::of(col(rc)?, rc)?;
+            let inten = ListF32::of(col(ic)?, ic)?;
             let tr = TraceCols::of(&b)?;
             for j in 0..k {
                 self.dec.skip(
                     cid.value(j),
-                    rt.row_slice(j, "rt")?,
-                    inten.row_slice(j, "intensity")?,
+                    rt.row_slice(j, rc)?,
+                    inten.row_slice(j, ic)?,
                     tr.offset(j),
                     tr.len(j),
                 )?;
@@ -1489,8 +1489,9 @@ impl ChromStream {
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| anyhow!("chromatograms column 'predicted_intensity' is not f32"))?;
-            let rt = ListF32::of(col("rt")?, "rt")?;
-            let inten = ListF32::of(col("intensity")?, "intensity")?;
+            let (rc, ic) = (self.layout.rt_column(), self.layout.intensity_column());
+            let rt = ListF32::of(col(rc)?, rc)?;
+            let inten = ListF32::of(col(ic)?, ic)?;
             let trace = match self.layout {
                 Layout::V1 => None,
                 Layout::V2 => Some(TraceCols::of(&b)?),
@@ -1517,8 +1518,8 @@ impl ChromStream {
                     chunk.open_candidate(c);
                     open = Some(c);
                 }
-                let rt_row = rt.row_slice(k, "rt")?;
-                let int_row = inten.row_slice(k, "intensity")?;
+                let rt_row = rt.row_slice(k, rc)?;
+                let int_row = inten.row_slice(k, ic)?;
                 let (rt_row, int_row) = match &trace {
                     None => (rt_row, int_row),
                     Some(t) => self.dec.row(c, rt_row, int_row, t.offset(k), t.len(k))?,

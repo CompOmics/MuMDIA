@@ -987,12 +987,13 @@ pub struct ExtractConfig {
     /// On-disk layout of `chromatograms.parquet` (docs/15_data_dictionary.md). `1`, the
     /// default, stores every row's retention-time axis and its whole trace, zero-filled over
     /// the candidate's window in window-grid mode. `2` stores the axis once per candidate per
-    /// parquet row group and each trace from its first to its last nonzero value, with two
-    /// extra columns (`trace_offset`, `trace_len`) that rebuild it. Every reader (features,
-    /// quant, the pool) accepts both layouts and rebuilds the same rows bit for bit, so every
-    /// table downstream of extract is byte-identical; only the chromatogram table changes
-    /// (smaller, with a different content hash). Opt-in because a reader outside the engine
-    /// that expects one full axis per row would misread a v2 table;
+    /// parquet row group (`rt_axis`) and each trace from its first to its last nonzero value
+    /// (`intensity_trimmed`), with two extra columns (`trace_offset`, `trace_len`) that
+    /// rebuild it. Every reader (features, quant, the pool) accepts both layouts and rebuilds
+    /// the same rows bit for bit, so every table downstream of extract is byte-identical;
+    /// only the chromatogram table changes (smaller, with a different content hash). Opt-in
+    /// because a reader outside the engine, or an engine binary from before v2, reads only
+    /// `rt` and `intensity` and stops at their absence from a v2 table;
     /// `mumdia::chromatograms::rewrite` converts a table between the layouts. The pool
     /// splices band tables of one layout only, so all bands of a grouped run share it.
     pub chromatogram_schema: u32,
