@@ -226,70 +226,111 @@ pub fn run(p: RunParams) -> Result<()> {
             // Build the library from the FASTA digest. preflight guarantees the
             // FASTA is present in this branch.
             let fasta = p.fasta.expect("preflight guarantees --fasta in build mode");
-            let dig = d("peptides.parquet");
-            pre.first_stage("digest");
-            let w = digest::run_hashed(digest::DigestParams {
-                fasta,
-                out: &dig,
-                cfg: &cfg.digest,
-                rng_seed: cfg.rng_seed,
-                config_hash: &ch,
-            })?;
-            man.record(w.record(
-                artifact::PEPTIDES.0,
-                artifact::PEPTIDES,
-                &dig,
-                "digest",
-                &ch,
-            ));
-
-            let pf = d("peptidoforms.parquet");
-            let w = peptidoforms::run_hashed(peptidoforms::PeptidoformsParams {
-                peptides: &dig,
-                out: &pf,
-                cfg: &cfg.peptidoforms,
-                config_hash: &ch,
-            })?;
-            man.record(w.record(
-                artifact::PEPTIDOFORMS.0,
-                artifact::PEPTIDOFORMS,
-                &pf,
-                "peptidoforms",
-                &ch,
-            ));
-
             let lib_p = d("fragment_library_precursors.parquet");
             let lib_f = d("fragment_library_fragments.parquet");
-            if cfg.predict_frag.defer_deeplc_to_multihead && !rt_placeholder {
-                info!(
-                    "run: predict_frag.defer_deeplc_to_multihead is set, but no multi-head \
-                     calibration re-predicts this library (it needs rt_predictor = deeplc \
-                     and a DeepLC interpreter); predicting it with DeepLC as usual"
-                );
-            }
-            let (wp, wf) = predict_frag::run_hashed(predict_frag::PredictFragParams {
+            // `predict_frag.library_cache`: a library stored by an earlier run with the same
+            // FASTA, build settings, predictor versions and engine is published here instead
+            // of being built (`library_cache`).
+            let cache = crate::library_cache::LibraryCache::for_config(
+                cfg,
+                fasta,
                 rt_placeholder,
-                peptidoforms: &pf,
-                out_precursors: &lib_p,
-                out_fragments: &lib_f,
-                work_dir: &d("sidecar_work"),
-                cfg: &cfg.predict_frag,
-                config_hash: &ch,
-            })?;
-            man.record(wp.record(
-                artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                artifact::FRAGMENT_LIBRARY_PRECURSORS,
-                &lib_p,
-                "predict-frag",
-                &ch,
-            ));
-            man.record(wf.record(
-                artifact::FRAGMENT_LIBRARY_FRAGMENTS.0,
-                artifact::FRAGMENT_LIBRARY_FRAGMENTS,
-                &lib_f,
-                "predict-frag",
-                &ch,
-            ));
+                (&man.mumdia_version, &man.git_sha),
+            );
+            if let Some((wp, wf)) = cache.as_ref().and_then(|c| c.restore(&lib_p, &lib_f)) {
+                pre.first_stage("library-cache");
+                man.record(wp.record(
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    &lib_p,
+                    "library-cache",
+                    &ch,
+                ));
+                man.record(wf.record(
+                    artifact::FRAGMENT_LIBRARY_FRAGMENTS.0,
+                    artifact::FRAGMENT_LIBRARY_FRAGMENTS,
+                    &lib_f,
+                    "library-cache",
+                    &ch,
+                ));
+            } else {
+                let dig = d("peptides.parquet");
+                pre.first_stage("digest");
+                let w = digest::run_hashed(digest::DigestParams {
+                    fasta,
+                    out: &dig,
+                    cfg: &cfg.digest,
+                    rng_seed: cfg.rng_seed,
+                    config_hash: &ch,
+                })?;
+                man.record(w.record(
+                    artifact::PEPTIDES.0,
+                    artifact::PEPTIDES,
+                    &dig,
+                    "digest",
+                    &ch,
+                ));
+
+                let pf = d("peptidoforms.parquet");
+                let w = peptidoforms::run_hashed(peptidoforms::PeptidoformsParams {
+                    peptides: &dig,
+                    out: &pf,
+                    cfg: &cfg.peptidoforms,
+                    config_hash: &ch,
+                })?;
+                man.record(w.record(
+                    artifact::PEPTIDOFORMS.0,
+                    artifact::PEPTIDOFORMS,
+                    &pf,
+                    "peptidoforms",
+                    &ch,
+                ));
+
+                if cfg.predict_frag.defer_deeplc_to_multihead && !rt_placeholder {
+                    info!(
+                        "run: predict_frag.defer_deeplc_to_multihead is set, but no multi-head \
+                         calibration re-predicts this library (it needs rt_predictor = deeplc \
+                         and a DeepLC interpreter); predicting it with DeepLC as usual"
+                    );
+                }
+                let (wp, wf) = predict_frag::run_hashed(predict_frag::PredictFragParams {
+                    rt_placeholder,
+                    peptidoforms: &pf,
+                    out_precursors: &lib_p,
+                    out_fragments: &lib_f,
+                    work_dir: &d("sidecar_work"),
+                    cfg: &cfg.predict_frag,
+                    config_hash: &ch,
+                })?;
+                man.record(wp.record(
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    &lib_p,
+                    "predict-frag",
+                    &ch,
+                ));
+                man.record(wf.record(
+                    artifact::FRAGMENT_LIBRARY_FRAGMENTS.0,
+                    artifact::FRAGMENT_LIBRARY_FRAGMENTS,
+                    &lib_f,
+                    "predict-frag",
+                    &ch,
+                ));
+                match &cache {
+                    Some(c) => c.store(&lib_p, &lib_f),
+                    None => {
+                        if let Some(hint) =
+                            crate::library_cache::reuse_hint(cfg, &lib_p, &lib_f, rt_placeholder)
+                        {
+                            info!(
+                                "run: to search another file against this library without \
+                                 building it again, pass {hint}, or set \
+                                 predict_frag.library_cache to a directory and keep --fasta"
+                            );
+                        }
+                    }
+                }
+            }
             (lib_p, lib_f)
         }
     };

@@ -895,33 +895,63 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         }
         _ => {
             let fasta = p.fasta.expect("preflight guarantees --fasta in build mode");
-            let dig = d("peptides.parquet");
-            pre.first_stage("digest");
-            digest::run(digest::DigestParams {
-                fasta,
-                out: &dig,
-                cfg: &cfg.digest,
-                rng_seed: cfg.rng_seed,
-                config_hash: &ch,
-            })?;
-            let pf = d("peptidoforms.parquet");
-            peptidoforms::run(peptidoforms::PeptidoformsParams {
-                peptides: &dig,
-                out: &pf,
-                cfg: &cfg.peptidoforms,
-                config_hash: &ch,
-            })?;
             let lib_p = d("fragment_library_precursors.parquet");
             let lib_f = d("fragment_library_fragments.parquet");
-            predict_frag::run(predict_frag::PredictFragParams {
-                rt_placeholder: irt_placeholder,
-                peptidoforms: &pf,
-                out_precursors: &lib_p,
-                out_fragments: &lib_f,
-                work_dir: &d("sidecar_work"),
-                cfg: &cfg.predict_frag,
-                config_hash: &ch,
-            })?;
+            // `predict_frag.library_cache`, as in `run`: a stored library with the same key
+            // is published here instead of being built.
+            let cache = crate::library_cache::LibraryCache::for_config(
+                cfg,
+                fasta,
+                irt_placeholder,
+                (&prov.mumdia_version, &prov.git_sha),
+            );
+            if cache
+                .as_ref()
+                .and_then(|c| c.restore(&lib_p, &lib_f))
+                .is_some()
+            {
+                pre.first_stage("library-cache");
+            } else {
+                let dig = d("peptides.parquet");
+                pre.first_stage("digest");
+                digest::run(digest::DigestParams {
+                    fasta,
+                    out: &dig,
+                    cfg: &cfg.digest,
+                    rng_seed: cfg.rng_seed,
+                    config_hash: &ch,
+                })?;
+                let pf = d("peptidoforms.parquet");
+                peptidoforms::run(peptidoforms::PeptidoformsParams {
+                    peptides: &dig,
+                    out: &pf,
+                    cfg: &cfg.peptidoforms,
+                    config_hash: &ch,
+                })?;
+                predict_frag::run(predict_frag::PredictFragParams {
+                    rt_placeholder: irt_placeholder,
+                    peptidoforms: &pf,
+                    out_precursors: &lib_p,
+                    out_fragments: &lib_f,
+                    work_dir: &d("sidecar_work"),
+                    cfg: &cfg.predict_frag,
+                    config_hash: &ch,
+                })?;
+                match &cache {
+                    Some(c) => c.store(&lib_p, &lib_f),
+                    None => {
+                        if let Some(hint) =
+                            crate::library_cache::reuse_hint(cfg, &lib_p, &lib_f, irt_placeholder)
+                        {
+                            info!(
+                                "run-experiment: to search other files against this library \
+                                 without building it again, pass {hint}, or set \
+                                 predict_frag.library_cache to a directory and keep --fasta"
+                            );
+                        }
+                    }
+                }
+            }
             (lib_p, lib_f)
         }
     };

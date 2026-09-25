@@ -43,6 +43,17 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **`predict_frag.library_cache` reuses a FASTA-built library across runs.** Set to a
+  directory, `run` and `run-experiment` look the library up under a key of the FASTA's
+  content hash, the `digest`, `peptidoforms` and `predict_frag` settings, `rng_seed`, the
+  installed predictor versions, the worker scripts and the engine binary, publish a hit
+  at the paths a build writes and skip digest, peptidoforms and predict-frag; a miss is
+  built and stored. The run stays in FASTA mode. Default unset: every FASTA run builds
+  its library as before, and now logs the `--lib-precursors` / `--lib-fragments`
+  arguments, with the `rt_im_train.library_irt` value that keeps its retention-time
+  handling, that would reuse it. A hit is byte-identical to a rebuild for the native
+  predictors (checked in `ci/smoke.sh`); validate a sidecar configuration by searching
+  one file twice with the same cache and comparing `peptides.tsv` and `proteins.tsv`.
 - **`experiment.parallel_runs = "auto"` sizes the per-run concurrency from the thread
   budget.** One run per 16 threads of `--threads` at most, never more than the runs, and
   each concurrent chain runs in a rayon pool of its own `threads / runs` threads, so

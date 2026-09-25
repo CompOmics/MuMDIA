@@ -570,6 +570,19 @@
       "source_struct": "PredictFragConfig"
     },
     {
+      "path": "predict_frag.library_cache",
+      "name": "library_cache",
+      "section": "predict_frag",
+      "rust_type": "Option<String>",
+      "kind": "other",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "A directory in which `run` and `run-experiment` keep the library they build from a FASTA, and reuse it on a later run. Unset (default): every FASTA run builds its library, as before. A FASTA-mode run digests, expands peptidoforms and predicts the library on every invocation, and one `run` per file is the way to search files separately, so each file paid the whole build again (about an hour of predict-frag on the 9.8M-peptidoform HYE library). Set, the orchestrator looks the library up under a key of everything that determines it: the FASTA's content hash, the `digest`, `peptidoforms` and `predict_frag` sections (all but this field), `rng_seed`, whether the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep or DeepLC version the build uses, the worker scripts' content and the running executable's content. A hit is published at the paths a build writes (a hard link where the filesystem allows) and digest, peptidoforms and predict-frag are skipped; a miss is built and then stored. When a predictor version cannot be read, nothing is looked up or stored. The run stays in FASTA mode, so every other decision is the one a rebuild makes. A hit is byte-identical to a rebuild when the build is deterministic, which the native predictors are; with a sidecar predictor it reuses the stored prediction. The manifest records the two library tables with the stage `library-cache`, and the run directory then holds no `peptides.parquet` or `peptidoforms.parquet`. Validate by running one FASTA search twice with the same cache directory and comparing `peptides.tsv` and `proteins.tsv` (the smoke test does this). Entries are never deleted by the engine; remove the directory to reclaim the space.",
+      "gates": [],
+      "source_struct": "PredictFragConfig"
+    },
+    {
       "path": "search_seed.fdr_seed",
       "name": "fdr_seed",
       "section": "search_seed",

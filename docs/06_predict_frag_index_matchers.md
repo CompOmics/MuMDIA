@@ -673,6 +673,47 @@ so the struct holds exactly these fields and unknown keys are rejected):
 | `ms2pip_python` | `None` | interpreter for the MS2PIP sidecar; required when `predictor=ms2pip`, else the stage errors |
 | `deeplc_python` | `None` | interpreter for the DeepLC sidecar; required when `rt_predictor=deeplc`, else the stage errors |
 | `sidecar_script_dir` | `"scripts"` | directory searched by `resolve_script` for the worker scripts |
+| `library_cache` | `None` | directory in which `run` and `run-experiment` store a FASTA-built library and reuse it on a later run with the same key (see "Reusing a FASTA-built library" below) |
+
+### Reusing a FASTA-built library
+
+A FASTA-mode `run` builds its library on every invocation, and one `run` per file is
+the way to search files separately, so every file paid digest, peptidoforms and
+predict-frag again: about an hour of predict-frag on the 9.8M-peptidoform HYE library.
+Two ways out exist.
+
+Without any setting, a FASTA run logs, after the build, the `--lib-precursors` /
+`--lib-fragments` arguments that point at the library it just wrote, together with the
+`rt_im_train.library_irt` value that keeps this run's retention-time handling in
+library-input mode (`library_cache::reuse_hint`). Library-input mode decides two things
+differently from FASTA mode: whether the retention times count as DeepLC's (which turns
+the automatic multi-head calibration on) and whether the imported iRT is re-predicted
+with the base model first. `deeplc` is named when this run's multi-head calibration runs
+on DeepLC retention times, `library` otherwise, and under either the head count is the
+same and nothing is re-predicted. The manifest of such a run records the library as
+imported. A library whose iRT is a deferred DeepLC placeholder
+(`defer_deeplc_to_multihead`) is never offered this way.
+
+With `predict_frag.library_cache` set to a directory, the run stays in FASTA mode and
+reuses the library by itself (`library_cache::LibraryCache`). The key is a hash of the
+FASTA's content, the `digest`, `peptidoforms` and `predict_frag` sections (all but the
+cache directory), `rng_seed`, whether the iRT is a deferred placeholder, the installed
+MS2PIP, AlphaPeptDeep and DeepLC versions the build uses, the content of the worker
+scripts it runs and the content of the running executable. An entry is a directory
+`<key>` holding the two tables, their `.report.json` files and an `entry.json` with the
+key material and every file's size. It is written to a private temporary directory and
+renamed into place, so a reader sees a complete entry or none, and two concurrent runs
+that build the same key keep the first. A hit is published at the paths a build writes
+(`fragment_library_precursors.parquet`, `fragment_library_fragments.parquet`), by a hard
+link where the filesystem allows and a copy otherwise, and the manifest records both
+with the stage `library-cache` and the content hashes of the stored reports. A stored
+file whose size changed is a miss and is rebuilt. When a predictor version cannot be
+read the run builds as usual and stores nothing. The engine never deletes entries.
+
+A hit is byte-identical to a rebuild when the build is deterministic, which the native
+predictors are; the smoke test runs one FASTA search twice with a cache (store, then
+reuse) and compares both TSVs with the plain run. With a sidecar predictor a hit reuses
+the stored prediction.
 
 Matcher selection (both stages default to `Fragindex`):
 

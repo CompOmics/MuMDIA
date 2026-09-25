@@ -108,6 +108,35 @@ echo "=== smoke: run again for determinism"
     --out-dir "$work/out2" --config "$cfg" --threads 2 > "$work/run2.log" 2>&1 \
     || { tail -20 "$work/run2.log"; exit 1; }
 
+# 4a. `predict_frag.library_cache`: the first FASTA run builds the library and stores it,
+#     the second finds it and skips digest, peptidoforms and predict-frag. Both must give
+#     the plain run's TSVs byte for byte, and a plain FASTA run names the --lib-* reuse.
+echo "=== smoke: FASTA library reused through predict_frag.library_cache"
+grep -q "to search another file against this library without building it again" "$work/run2.log" \
+    || { echo "a FASTA run did not print the --lib-* reuse hint"; exit 1; }
+"$PY" - "$cfg" "$work/libcache.json" "$work/libcache" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("predict_frag", {})["library_cache"] = sys.argv[3]
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+for arm in cache_store cache_hit; do
+    "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+        --out-dir "$work/out_$arm" --config "$work/libcache.json" --threads 2 \
+        > "$work/$arm.log" 2>&1 || { tail -20 "$work/$arm.log"; echo "library-cache arm $arm failed"; exit 1; }
+    for f in peptides.tsv proteins.tsv; do
+        cmp -s "$work/out/$f" "$work/out_$arm/$f" \
+            || { echo "library-cache arm $arm changed $f"; exit 1; }
+    done
+done
+grep -q "library cache: stored this library" "$work/cache_store.log" \
+    || { echo "the first cached run did not store its library"; exit 1; }
+grep -q "library cache: reusing the stored library" "$work/cache_hit.log" \
+    || { echo "the second cached run did not reuse the stored library"; exit 1; }
+[ ! -e "$work/out_cache_hit/peptides.parquet" ] \
+    || { echo "the cache hit ran the digest anyway"; exit 1; }
+echo "    ok: stored, reused (digest skipped), both byte-identical to the plain run"
+
 # 4b. A malformed retention time must not abort the run.
 #
 #     Regression test for a reproduced crash: one `NaN` scan start time in one scan of
