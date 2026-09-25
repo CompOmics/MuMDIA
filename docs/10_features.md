@@ -604,10 +604,64 @@ variant no longer exists).
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge before stopping (0 = stop at first miss; 1 bridges a single-scan dip) |
 | `bound_from_confident` | true | learn one global left/right half-width from the confident seed set and apply it to every candidate; false = per-candidate detection |
 | `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
+| `chrom_loaders` | 3 | chromatogram decode threads in the main pass (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded
 `FRAG_TOL_PPM = 20.0` (`mass_accuracy.rs:44`), not `prec_tol_ppm`; Evidence does
 not carry the configured fragment tolerance.
+
+## The chunked pass: loaders, computation, writer
+
+`run_chunked` processes the run in chunks planned up front from the
+`candidate_id` columns (`plan_chunks`; a chunk closes at `CHUNK_CHROM_ROWS`
+chromatogram rows or `CHUNK_PSM_ROWS` PSM rows and never cuts a candidate). Each
+chunk passes three stages on their own threads:
+
+1. **Loaders.** `features.chrom_loaders` threads (default 3) each claim the next
+   unclaimed chunk, open that chunk's row span of the chromatogram table
+   (`TableFile::span`) and decode it into a `ChromChunk` with a fragment-name
+   table of its own (`load_chunk`). A loader may claim chunk `j` only while
+   `j < taken + loaders`, where `taken` counts the chunks the computation has
+   taken, so at most `chrom_loaders + 1` chunks are resident; one loader is the
+   previous single-loader bound of two. Loaders beyond the first come from a
+   process-wide pool of four (`MAIN_LOADER_EXTRAS`), so concurrent bands or runs
+   share it rather than multiply it.
+2. **Computation.** The calling thread takes the chunks strictly in table order
+   (`ChunkLoader::take`), runs the per-PSM kernels in parallel (rayon), then
+   assembles the value matrix and the output columns serially.
+3. **Writer.** One thread encodes the previous chunk's columns
+   (`TableWriter::write_cols`) and publishes the table only after the commit
+   marker.
+
+Because a chunk's rows are fixed by the plan and the computation takes chunks in
+order, every `write_cols` call receives the same columns at every loader count:
+the features table is byte-identical
+(`the_loader_count_moves_no_byte_of_the_features_table` checks 1, 2, 3 and 7
+loaders, including zero-row chunks). A failed chunk is handed over in order like
+any other, so the error surfaces at the same chunk as with one loader; a loader
+panic stops the pass and is reported rather than waited on.
+
+Every pass logs one `features: pass timers` line: loader busy and blocked time
+(summed over loaders), the computation's wait for the loaders, per-PSM compute,
+serial assembly, the wait for the writer, writer busy and idle time, and a
+`binding` hint naming the busiest stage per thread. A large
+`wait_for_loader_ms` with a small `loader_blocked_ms` means the pass is
+decode-bound; a large `wait_for_writer_ms` means the encoder binds.
+
+Measured on the local desktop (32 threads, shared with other builds, so single
+runs carry noise):
+
+| input | loaders | wall | binding | notes |
+|---|---|---|---|---|
+| Astral 15-min run, 522,237 PSMs, ~8 points per trace, 8 chunks | 1 | 7.6 s | writer | loader busy 5.3 s, compute 2.0 s, assembly 3.1 s, writer 6.8 s |
+| same | 3 | 8.2-8.5 s | writer | no gain: the encoder binds |
+| HYE-shaped fixture (`write_kernel_bench_fixture`, 400,000 PSMs, 150-240-point traces, 7 chunks) | 1 | 25.0-26.2 s | loader | loader busy 24 s |
+| same | 3 | 13.3-13.6 s | compute / writer | peak working set 1.83 -> 3.23 GiB |
+
+So the loaders pay where traces are long (a 2 h gradient, the immunopeptidomics
+windows). Where the encoder binds they buy nothing and cost memory plus some
+contention with the writer (the Astral run was 0.6-0.9 s slower at 3 loaders);
+set `chrom_loaders: 1` there if that matters.
 
 ## Invariants, determinism, gotchas
 

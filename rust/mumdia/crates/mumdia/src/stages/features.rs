@@ -1634,6 +1634,11 @@ impl DecoderLease {
     fn decoders(&self) -> usize {
         self.n.max(1)
     }
+
+    /// What the budget actually granted, which may be zero.
+    fn granted(&self) -> usize {
+        self.n
+    }
 }
 
 impl Drop for DecoderLease {
@@ -2078,6 +2083,210 @@ enum BoundsSource {
     Given(Option<(f64, f64)>),
 }
 
+/// Main-pass loaders beyond each pass's first, PROCESS-WIDE, for the reason
+/// [`BOUNDS_DECODERS`] is: [`run`] is called from inside a rayon `par_iter` when
+/// `groups.parallel > 1` or `experiment.parallel_runs > 1`, and each loader holds one
+/// decoded chunk (0.92 GiB of traces at the HYE benchmark shape), so a per-pass allowance
+/// would multiply with the concurrency. Every pass keeps the one loader it always had and
+/// takes up to `features.chrom_loaders - 1` more from this pool, whatever is left of it, so
+/// `C` concurrent passes run at most `C + MAIN_LOADER_EXTRAS` loaders.
+const MAIN_LOADER_EXTRAS: usize = 4;
+
+/// Extra main-pass loaders of the [`MAIN_LOADER_EXTRAS`] pool not currently leased.
+static MAIN_LOADER_BUDGET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(MAIN_LOADER_EXTRAS);
+
+/// Decode one planned chunk -- `n_rows` chromatogram rows from `first` -- on its own, from
+/// its row span, with a fragment-name table of its own.
+///
+/// The chunk is the same whichever thread reads it and whatever was read before it: its
+/// rows are fixed by the plan, [`ChromChunk`] is built from them in table order, and the
+/// candidate grouping, the axis dedup and every stored value depend on those rows alone.
+/// The name ids do differ from a table shared across chunks, but nothing reads an id
+/// except to look its string up in the table the chunk travels with
+/// ([`ChromChunk::rows`]). A zero-row chunk (PSM rows with no chromatogram rows) is an
+/// empty chunk, as the sequential stream returned for it.
+///
+/// A span decodes whole row groups, so a chunk that starts or ends inside one decodes
+/// and discards the rest of it: at most one 65,536-row group at each end of a ~1M-row
+/// chunk, against the single sequential stream that decoded every row once.
+fn load_chunk(ch: &TableFile, first: usize, n_rows: usize) -> Result<(ChromChunk, NameTab)> {
+    let mut names = NameTab::default();
+    if n_rows == 0 {
+        return Ok((ChromChunk::new(), names));
+    }
+    let span = ch.span(first, n_rows)?;
+    let mut stream = ChromStream::open(&span)?;
+    let chunk = stream.read_chunk(n_rows, &mut names)?;
+    Ok((chunk, names))
+}
+
+/// The main pass's chromatogram loaders and the ordered hand-over to the computation.
+///
+/// `loaders` threads each claim the next unclaimed chunk, decode it with [`load_chunk`] and
+/// park it; the computation takes chunk `j` only after chunk `j - 1`, so the features are
+/// computed, assembled and written in table order exactly as with one sequential loader.
+/// A loader may claim chunk `j` only while `j < taken + loaders`, where `taken` is the
+/// number of chunks the computation has taken, so at most `loaders` chunks are decoded or
+/// being decoded ahead of it, and `loaders + 1` are resident with the one it is computing.
+/// With one loader that is the previous bound exactly: one chunk computed, one decoded.
+///
+/// Errors keep the order too. A failed chunk is parked like any other and no further chunk
+/// is claimed; the chunks before it were claimed earlier (claims are in order), so the
+/// computation receives them first and then the error, at the same chunk as before. A
+/// loader that dies without parking its chunk (a panic) is counted out, so the computation
+/// reports that the loaders stopped instead of waiting for a chunk that will never come.
+struct ChunkLoader<'a> {
+    ch: &'a TableFile,
+    first: &'a [usize],
+    rows: &'a [usize],
+    loaders: usize,
+    state: std::sync::Mutex<LoadState>,
+    cv: std::sync::Condvar,
+}
+
+/// [`ChunkLoader`]'s shared state; see there.
+struct LoadState {
+    /// The next chunk no loader has claimed.
+    next: usize,
+    /// Chunks the computation has taken.
+    taken: usize,
+    /// Decoded chunks the computation has not taken yet, by chunk index. An ordered map so
+    /// that nothing about the hand-over depends on hash iteration.
+    ready: std::collections::BTreeMap<usize, Result<(ChromChunk, NameTab)>>,
+    /// Claim nothing more: a chunk failed, or the computation has stopped.
+    stop: bool,
+    /// Loaders still running.
+    live: usize,
+}
+
+impl<'a> ChunkLoader<'a> {
+    fn new(
+        ch: &'a TableFile,
+        first: &'a [usize],
+        rows: &'a [usize],
+        loaders: usize,
+    ) -> ChunkLoader<'a> {
+        ChunkLoader {
+            ch,
+            first,
+            rows,
+            loaders: loaders.max(1),
+            state: std::sync::Mutex::new(LoadState {
+                next: 0,
+                taken: 0,
+                ready: std::collections::BTreeMap::new(),
+                stop: false,
+                live: loaders.max(1),
+            }),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// The state, whether or not another thread panicked holding it: every update below
+    /// leaves the state consistent before it can panic, and the only panics possible while
+    /// the lock is held are allocation failures.
+    fn lock(&self) -> std::sync::MutexGuard<'_, LoadState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn wait<'g>(
+        &self,
+        g: std::sync::MutexGuard<'g, LoadState>,
+    ) -> std::sync::MutexGuard<'g, LoadState> {
+        self.cv
+            .wait(g)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// One loader thread's loop: claim, decode, park, until every chunk is claimed or the
+    /// pass stops.
+    fn run(&self, timers: &PassTimers) {
+        // Counted out on every exit, a panic included, so `take` cannot wait forever. A
+        // panic also stops the pass: the chunk it was decoding is never parked, so the
+        // other loaders would otherwise fill the window past it and wait for a computation
+        // that is itself waiting for the missing chunk.
+        struct Exit<'l, 'a>(&'l ChunkLoader<'a>);
+        impl Drop for Exit<'_, '_> {
+            fn drop(&mut self) {
+                let mut st = self.0.lock();
+                st.live -= 1;
+                if std::thread::panicking() {
+                    st.stop = true;
+                }
+                drop(st);
+                self.0.cv.notify_all();
+            }
+        }
+        let _exit = Exit(self);
+        loop {
+            let j = {
+                let mut st = self.lock();
+                loop {
+                    if st.stop || st.next >= self.rows.len() {
+                        return;
+                    }
+                    if st.next < st.taken + self.loaders {
+                        break;
+                    }
+                    let blocked = Instant::now();
+                    st = self.wait(st);
+                    timers.add(&timers.loader_blocked_ns, blocked);
+                }
+                st.next += 1;
+                // The window: never more than `loaders` chunks claimed ahead of the
+                // computation, which is what bounds the resident chunks at `loaders + 1`.
+                debug_assert!(st.next - st.taken <= self.loaders);
+                st.next - 1
+            };
+            let busy = Instant::now();
+            let r = load_chunk(self.ch, self.first[j], self.rows[j]);
+            timers.add(&timers.loader_busy_ns, busy);
+            let mut st = self.lock();
+            if r.is_err() {
+                st.stop = true;
+            }
+            st.ready.insert(j, r);
+            drop(st);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Chunk `j`, blocking until a loader has parked it. `None` when every loader has
+    /// exited without parking it, which only a loader panic can cause.
+    fn take(&self, j: usize) -> Option<Result<(ChromChunk, NameTab)>> {
+        let mut st = self.lock();
+        loop {
+            if let Some(r) = st.ready.remove(&j) {
+                st.taken += 1;
+                drop(st);
+                self.cv.notify_all();
+                return Some(r);
+            }
+            if st.live == 0 {
+                return None;
+            }
+            st = self.wait(st);
+        }
+    }
+
+    /// Stop the loaders when the returned guard drops: nothing more is claimed and every
+    /// loader waiting for the window wakes and exits. A loader in the middle of a decode
+    /// finishes it first, and its chunk is dropped with the loader.
+    fn release_on_drop(&self) -> impl Drop + '_ {
+        struct Release<'l, 'a>(&'l ChunkLoader<'a>);
+        impl Drop for Release<'_, '_> {
+            fn drop(&mut self) {
+                self.0.lock().stop = true;
+                self.0.cv.notify_all();
+            }
+        }
+        Release(self)
+    }
+}
+
 /// Where the chunked pass spends its time (perf survey P0), so the next optimisation can
 /// be sized from a log line instead of from a cost model.
 ///
@@ -2097,7 +2306,8 @@ enum BoundsSource {
 struct PassTimers {
     /// Loader threads decoding and storing chunks, summed over loaders.
     loader_busy_ns: std::sync::atomic::AtomicU64,
-    /// Loader threads holding a decoded chunk the computation has not taken yet.
+    /// Loader threads waiting for the computation to take a chunk, because the decode
+    /// window ([`ChunkLoader`]) is full; summed over loaders.
     loader_blocked_ns: std::sync::atomic::AtomicU64,
     /// The computation waiting for the next chunk to be decoded.
     wait_loader_ns: std::sync::atomic::AtomicU64,
@@ -2409,29 +2619,36 @@ fn run_chunked(
     // The chunk decode is single-threaded parquet work and it ran in series with the
     // feature computation, which is what left a 24-thread features process at 1.6-2.8 cores
     // (measured on the 8-12-mer immunopeptidomics run: 3.7 of a 4-minute stage were the
-    // load). The loader now runs on its own thread, one chunk ahead of the computation, so
-    // decode and compute overlap; at most two chunks are resident. Each chunk travels with a
-    // snapshot of the fragment-name table as it stood when the chunk was read, which is
-    // exactly what the serial code saw at that point.
+    // load). It then moved onto one loader thread, one chunk ahead of the computation, so
+    // decode and compute overlapped but the decode itself stayed on one core. Now
+    // `chrom_loaders` threads each decode a whole chunk from that chunk's row span (see
+    // [`ChunkLoader`]), and the computation takes the chunks in table order.
     let chunk_rows: Vec<usize> = chunks.iter().map(|c| c.chrom_rows).collect();
-    let ch_ref = &ch;
+    let chunk_first: Vec<usize> = chunk_rows
+        .iter()
+        .scan(0usize, |acc, &n| {
+            let first = *acc;
+            *acc += n;
+            Some(first)
+        })
+        .collect();
+    let want_loaders = p.cfg.chrom_loaders.max(1).min(chunks.len().max(1));
+    // Loaders beyond the first come from the process-wide pool; this pass's own first loader
+    // is never leased, so a pass always runs even when the pool is empty.
+    let extra_lease = DecoderLease::take_from(&MAIN_LOADER_BUDGET, want_loaders - 1);
+    let n_loaders = 1 + extra_lease.granted();
+    let loader = ChunkLoader::new(&ch, &chunk_first, &chunk_rows, n_loaders);
     let timers = PassTimers::default();
     let pass_start = Instant::now();
     let rows = std::thread::scope(|sc| -> Result<u64> {
-        // A RENDEZVOUS channel, not a one-deep buffer. `sync_channel(1)` let the loader
-        // finish a chunk, park it in the buffer and start a third, so three chunks of
-        // traces were resident where the comment claimed two. At depth 0 the loader's
-        // `send` blocks until this loop takes the chunk, which still overlaps decode with
-        // compute fully (the loader is free again the instant the chunk is handed over)
-        // and holds exactly two: the one being computed and the one being decoded.
-        //
-        // Both channels are created HERE rather than outside the scope so that both
-        // receivers drop when this closure returns. An error return used to leave `rx`
-        // alive in the enclosing frame while the scope waited to join the loader, and the
-        // loader was blocked in `send` on a channel that would never be received from
-        // again: the stage hung instead of reporting the error. Depth 0 makes that more
-        // reachable, not less, so it is fixed rather than papered over.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(ChromChunk, NameTab)>>(0);
+        // The queue is created outside the scope (the loaders borrow it), so its stop
+        // flag, not the drop of a channel, is what releases them when this closure returns
+        // early. The guard is declared FIRST so it drops LAST among this closure's locals,
+        // and it drops before the scope joins the loaders: an error return here therefore
+        // wakes every loader waiting for the window to open instead of leaving the scope
+        // to join threads that would never wake -- the hang the rendezvous channel was
+        // once fixed for, in its new form.
+        let _release = loader.release_on_drop();
         // The parquet encode is single-threaded; on its own thread it overlaps with the
         // next chunk's computation instead of stalling it. Rendezvous again, so the
         // encoder never queues a backlog of value matrices.
@@ -2475,38 +2692,15 @@ fn run_chunked(
             timers_w.add(&timers_w.writer_busy_ns, busy);
             rows
         });
-        let timers_l = &timers;
-        sc.spawn(move || {
-            let busy = Instant::now();
-            let mut stream = match ChromStream::open(ch_ref) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    return;
-                }
-            };
-            timers_l.add(&timers_l.loader_busy_ns, busy);
-            let mut names = NameTab::default();
-            for want in chunk_rows {
-                let busy = Instant::now();
-                let r = stream
-                    .read_chunk(want, &mut names)
-                    .map(|store| (store, names.clone()));
-                timers_l.add(&timers_l.loader_busy_ns, busy);
-                let failed = r.is_err();
-                let blocked = Instant::now();
-                let sent = tx.send(r).is_ok();
-                timers_l.add(&timers_l.loader_blocked_ns, blocked);
-                if !sent || failed {
-                    return;
-                }
-            }
-        });
-        for chunk in &chunks {
+        for _ in 0..n_loaders {
+            let (loader, timers) = (&loader, &timers);
+            sc.spawn(move || loader.run(timers));
+        }
+        for (j, chunk) in chunks.iter().enumerate() {
             let waited = Instant::now();
-            let (store, names) = rx.recv().map_err(|_| {
+            let (store, names) = loader.take(j).ok_or_else(|| {
                 anyhow!(
-                    "features: the chromatogram loader stopped before chunk {}..{}",
+                    "features: the chromatogram loaders stopped before chunk {}..{}",
                     chunk.psm_lo,
                     chunk.psm_hi
                 )
@@ -2786,7 +2980,8 @@ fn run_chunked(
         wh.join()
             .map_err(|_| anyhow!("features: the parquet writer thread panicked"))?
     })?;
-    timers.log(pass_start.elapsed(), 1, chunks.len());
+    drop(extra_lease);
+    timers.log(pass_start.elapsed(), n_loaders, chunks.len());
 
     crate::memlog::report(
         "features chromatogram store",
@@ -5190,20 +5385,44 @@ mod tests {
             ],
         )
         .unwrap();
-        mumdia_io::table::write_table(
-            &chrom,
-            vec![
-                Col::U32("candidate_id".into(), ccid),
-                Col::Str("frag_name".into(), cname),
-                Col::F64("frag_mz".into(), cfmz),
-                Col::F64("frag_obs_mz".into(), cobsmz),
-                Col::F32("predicted_intensity".into(), cpint),
-                Col::ListF32("rt".into(), crt),
-                Col::ListF32("intensity".into(), cint),
-            ],
-        )
+        // Extract's row-group size, so a benchmark on a large instance of this fixture
+        // decodes the row groups a production table has.
+        let mut w = TableWriter::new(&chrom).with_row_group_rows(1 << 16);
+        w.write_cols(vec![
+            Col::U32("candidate_id".into(), ccid),
+            Col::Str("frag_name".into(), cname),
+            Col::F64("frag_mz".into(), cfmz),
+            Col::F64("frag_obs_mz".into(), cobsmz),
+            Col::F32("predicted_intensity".into(), cpint),
+            Col::ListF32("rt".into(), crt),
+            Col::ListF32("intensity".into(), cint),
+        ])
         .unwrap();
+        w.close().unwrap();
         (psms, chrom)
+    }
+
+    #[test]
+    #[ignore = "benchmark fixture: set MUMDIA_BENCH_OUT (and MUMDIA_BENCH_CANDS); writes GBs"]
+    fn write_kernel_bench_fixture() {
+        // Writes a large instance of `craft_kernel_inputs` for an A/B of two `mumdia
+        // features` binaries on HYE-shaped traces (mostly 12 fragments on 150-240-point
+        // grids), which the local real runs (a 15-minute Astral gradient, ~8 points per
+        // trace) do not have. Run with `--ignored --nocapture`, then point `mumdia
+        // features --psms-extracted <out>/psms_kernel.parquet --chromatograms
+        // <out>/chrom_kernel.parquet` at it with the Extended set.
+        let Ok(out) = std::env::var("MUMDIA_BENCH_OUT") else {
+            eprintln!("MUMDIA_BENCH_OUT is not set; nothing written");
+            return;
+        };
+        let n: u32 = std::env::var("MUMDIA_BENCH_CANDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40_000);
+        let dir = std::path::PathBuf::from(out);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (psms, chrom) = craft_kernel_inputs(&dir, n);
+        eprintln!("wrote {psms} and {chrom} ({n} candidates)");
     }
 
     #[test]
@@ -5379,6 +5598,57 @@ mod tests {
             "the charge-state count never reached 3"
         );
         assert!(n_charge.iter().all(|&v| (1.0..=3.0).contains(&v)));
+    }
+
+    #[test]
+    fn the_loader_count_moves_no_byte_of_the_features_table() {
+        // `features.chrom_loaders` decodes chunks on several threads from their own row
+        // spans. The claim is stronger than equal values: the chunk boundaries are fixed by
+        // the plan and the computation takes the chunks in table order, so every
+        // `write_cols` call receives the same columns and the file is byte-identical. Two
+        // chunkings: chromatogram-row chunks, and one PSM per chunk, which makes the
+        // zero-row chunks of the PSMs that have no chromatogram rows (`load_chunk` returns
+        // an empty chunk for those without opening a span).
+        let dir = std::env::temp_dir().join("mumdia_features_loaders");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (psms, chrom) = craft_kernel_inputs(&dir, 120);
+        for (tag, chunk_rows, max_psm_rows) in [("rows", 150usize, usize::MAX), ("psm", 1 << 20, 1)]
+        {
+            let mut hashes: Vec<(usize, String)> = Vec::new();
+            for loaders in [1usize, 2, 3, 7] {
+                let out = dir
+                    .join(format!("features_{tag}_{loaders}.parquet"))
+                    .to_string_lossy()
+                    .to_string();
+                let cfg = FeaturesConfig {
+                    set: FeatureSet::Extended,
+                    bound_from_confident: false,
+                    chrom_loaders: loaders,
+                    ..Default::default()
+                };
+                run_with_chunk_limits(
+                    FeaturesParams {
+                        psms: &psms,
+                        chromatograms: &chrom,
+                        seed: None,
+                        out: &out,
+                        out_pin: "",
+                        cfg: &cfg,
+                        config_hash: "test",
+                    },
+                    chunk_rows,
+                    max_psm_rows,
+                )
+                .unwrap();
+                hashes.push((loaders, mumdia_io::hash::blake3_file(&out).unwrap()));
+            }
+            for (loaders, h) in &hashes[1..] {
+                assert_eq!(
+                    h, &hashes[0].1,
+                    "chunking {tag}: {loaders} loaders wrote different bytes than one"
+                );
+            }
+        }
     }
 
     #[test]
