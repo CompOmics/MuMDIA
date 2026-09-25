@@ -791,6 +791,8 @@ def main():
     summary["torch_threads"] = thread_record
     summary["shards"] = shard_record
     summary["timings_s"] = timings
+    if calibration is not None:
+        summary["multihead"] = multihead_record(calibration, args.multihead, len(ref_psms))
     with open(args.lib_out + ".summary.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     print(f"wrote library with re-predicted iRT ({which}): {args.lib_out}")
@@ -803,6 +805,26 @@ def main():
               f"({100.0 * summary['retained_imported'] / max(1, summary['rows']):.2f}%) keep "
               f"their imported iRT, which is on the imported model's scale, not {which}'s; "
               f"the counts are in {args.lib_out}.summary.json", flush=True)
+
+
+def multihead_record(calibration, requested, anchors):
+    """What the multi-head fit chose, so two runs can be compared head for head.
+
+    A thread-count or version change moves the reference predictions in the last bits, and
+    the survey's validation asks whether the selected heads stayed the same. None of these
+    are read back by the engine.
+    """
+    idx = getattr(calibration, "_head_idx", None)
+    ridge = getattr(calibration, "_ridge", None)
+    alpha = getattr(ridge, "alpha_", None)
+    best = getattr(calibration, "selected_model_head", None)
+    return {
+        "heads_requested": int(requested),
+        "anchors": int(anchors),
+        "heads": None if idx is None else [int(h) for h in idx],
+        "best_head": None if best is None else int(best),
+        "ridge_alpha": None if alpha is None else float(alpha),
+    }
 
 
 def _fmt_s(value):

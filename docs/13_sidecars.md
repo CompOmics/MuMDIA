@@ -147,7 +147,9 @@ code.
   sequences predicted (`unique_predicted`), the torch threads used (`torch_threads`)
   and the wall time per phase in seconds (`timings_s`: `read_library`, `model_load`,
   `reference`, `fit`, `unique`, `predict`, `featurisation`, `forward`, `rewrite`,
-  `write`). `featurisation` (PSM parsing, dataset construction, length bucketing and
+  `write`), and after a multi-head fit what it chose (`multihead`: the heads in rank
+  order, the best head, the ridge strength and the anchor count), so two runs can be
+  compared head for head. `featurisation` (PSM parsing, dataset construction, length bucketing and
   batch encoding) and `forward` (the model's forward calls) are measured inside
   `predict` by wrapping DeepLC's own steps (`PredictTimers`); the rest of `predict` is
   the calibration transform and copies. A phase that did not run, or that DeepLC's
