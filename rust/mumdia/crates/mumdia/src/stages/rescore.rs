@@ -16,7 +16,7 @@ use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::fdr::{entrapment_q, target_decoy_q};
+use crate::fdr::{entrapment_q, target_decoy_q_by, target_decoy_q_split};
 use crate::rescoring::{percolator_lite, FeatureMatrix, RescoreInput};
 use crate::stages::features::FeatureSchema;
 
@@ -943,16 +943,11 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     timings.collapse_ms = t_collapse.elapsed().as_millis();
     let t_q = Instant::now();
 
-    // PSM-level q-values against the selected null.
+    // PSM-level q-values against the selected null. The split form reads the two columns
+    // in place: the pair form made the stage copy them into an `n * 16` byte buffer first,
+    // 4.1 GB at the 258.75M-row immunopeptidomics pool, for one walk into the kernel.
     let psm_q = match qmode {
-        QMode::Decoy => {
-            let sd: Vec<(f64, bool)> = scores
-                .iter()
-                .cloned()
-                .zip(is_decoy.iter().cloned())
-                .collect();
-            target_decoy_q(&sd)
-        }
+        QMode::Decoy => target_decoy_q_split(&scores, &is_decoy),
         QMode::Entrapment => entrapment_q(
             &scores,
             &is_entrapment,
@@ -979,6 +974,10 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     // order) so protein-group grouping runs over integers exactly like the peptide
     // path, avoiding hashing/cloning ~574k strings per grouped_q lookup. The map is
     // bijective, so grouping and the resulting per-PSM q-values are unchanged.
+    //
+    // The interner grows with the DISTINCT keys and is not presized: `with_capacity(n)`
+    // would size it by rows, 17.7 GB at the immunopeptidomics pool, for a key set that
+    // is a small fraction of them (69,958 proteins over 879,027 rows on HYE).
     let protein_id: Vec<u32> = {
         let mut interner: HashMap<&str, u32> = HashMap::new();
         let mut ids = Vec::with_capacity(protein.len());
@@ -1004,36 +1003,18 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     // `experiment_psm_q` are kept as byte-identical aliases of the pooled q for
     // backward-compat, and are written from the SAME Arrow array below rather than from
     // two more copies of the column (see `write_scored_table`).
-    // Per-run PSM q: TDA within each source separately, scattered back by row index.
-    // Single-run (source all-zero) => equals `q_value`. Sorted (BTree) source
-    // iteration keeps it deterministic; no floats are summed.
-    let run_psm_q = {
-        let mut by_src: std::collections::BTreeMap<u32, Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for (i, &s) in source.iter().enumerate() {
-            by_src.entry(s).or_default().push(i);
-        }
-        let mut rq = vec![1.0f64; n];
-        for (_s, idxs) in by_src {
-            let q = match qmode {
-                QMode::Decoy => {
-                    let sd: Vec<(f64, bool)> =
-                        idxs.iter().map(|&i| (scores[i], is_decoy[i])).collect();
-                    target_decoy_q(&sd)
-                }
-                QMode::Entrapment => {
-                    let sc: Vec<f64> = idxs.iter().map(|&i| scores[i]).collect();
-                    let en: Vec<bool> = idxs.iter().map(|&i| is_entrapment[i]).collect();
-                    let re: Vec<bool> = idxs.iter().map(|&i| is_real_target[i]).collect();
-                    entrapment_q(&sc, &en, &re, p.cfg.entrapment_ratio)
-                }
-            };
-            for (k, &i) in idxs.iter().enumerate() {
-                rq[i] = q[k];
-            }
-        }
-        rq
-    };
+    // Per-run PSM q: TDA within each source separately (`per_source_q`). Single-run
+    // (source all-zero) => equals `q_value`. No floats are summed.
+    let run_psm_q = per_source_q(
+        &source,
+        &scores,
+        &is_decoy,
+        &is_entrapment,
+        &is_real_target,
+        qmode,
+        p.cfg.entrapment_ratio,
+        &psm_q,
+    );
     // Precursor-level q: group on peptidoform+charge (interned to dense u32 like the
     // protein path) and run TDA over the best PSM per precursor.
     let precursor_id: Vec<u32> = {
@@ -1547,6 +1528,96 @@ fn classify_entrapment(
     (ent, real)
 }
 
+/// The per-source PSM q column: the pooled kernel (`qmode`) re-run within each source,
+/// scattered back to the rows.
+///
+/// The rows of one source are one contiguous run whenever `source` does not decrease,
+/// which is how the stage concatenates its inputs, so each source's rows are a slice and
+/// the kernel reads them in place. The previous form collected one row-index vector per
+/// source (8 bytes per row, all alive at once) and copied the scores and labels out
+/// through them; the slice holds the same rows in the same order, so the kernel sees the
+/// same input and returns the same q. With a single source the input IS the pooled one,
+/// and `pooled` (the kernel's output on it) is returned as is. A `source` that decreases
+/// somewhere takes the index form, which is exact in every case.
+#[allow(clippy::too_many_arguments)]
+fn per_source_q(
+    source: &[u32],
+    scores: &[f64],
+    is_decoy: &[bool],
+    is_entrapment: &[bool],
+    is_real: &[bool],
+    qmode: QMode,
+    ratio: f64,
+    pooled: &[f64],
+) -> Vec<f64> {
+    let n = scores.len();
+    let kernel = |lo: usize, hi: usize| match qmode {
+        QMode::Decoy => target_decoy_q_split(&scores[lo..hi], &is_decoy[lo..hi]),
+        QMode::Entrapment => entrapment_q(
+            &scores[lo..hi],
+            &is_entrapment[lo..hi],
+            &is_real[lo..hi],
+            ratio,
+        ),
+    };
+    if source.windows(2).all(|w| w[0] == w[1]) {
+        return pooled.to_vec();
+    }
+    if source.windows(2).all(|w| w[0] <= w[1]) {
+        let mut rq = vec![1.0f64; n];
+        let mut lo = 0usize;
+        while lo < n {
+            let s = source[lo];
+            let hi = lo + source[lo..].iter().take_while(|&&x| x == s).count();
+            rq[lo..hi].copy_from_slice(&kernel(lo, hi));
+            lo = hi;
+        }
+        return rq;
+    }
+    per_source_q_by_index(
+        source,
+        scores,
+        is_decoy,
+        is_entrapment,
+        is_real,
+        qmode,
+        ratio,
+    )
+}
+
+/// [`per_source_q`] for a `source` column in any order: one row-index vector per source,
+/// in ascending source order (a `BTreeMap`, so the result does not depend on hashing).
+fn per_source_q_by_index(
+    source: &[u32],
+    scores: &[f64],
+    is_decoy: &[bool],
+    is_entrapment: &[bool],
+    is_real: &[bool],
+    qmode: QMode,
+    ratio: f64,
+) -> Vec<f64> {
+    let mut by_src: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+    for (i, &s) in source.iter().enumerate() {
+        by_src.entry(s).or_default().push(i);
+    }
+    let mut rq = vec![1.0f64; scores.len()];
+    for (_s, idxs) in by_src {
+        let q = match qmode {
+            QMode::Decoy => target_decoy_q_by(idxs.len(), |k| (scores[idxs[k]], is_decoy[idxs[k]])),
+            QMode::Entrapment => {
+                let sc: Vec<f64> = idxs.iter().map(|&i| scores[i]).collect();
+                let en: Vec<bool> = idxs.iter().map(|&i| is_entrapment[i]).collect();
+                let re: Vec<bool> = idxs.iter().map(|&i| is_real[i]).collect();
+                entrapment_q(&sc, &en, &re, ratio)
+            }
+        };
+        for (k, &i) in idxs.iter().enumerate() {
+            rq[i] = q[k];
+        }
+    }
+    rq
+}
+
 /// Whether every `(source, candidate_id)` pair occurs once, which is when the top-K
 /// collapse keeps every row and can be skipped.
 ///
@@ -1719,10 +1790,8 @@ fn grouped_q(
     picked.extend(best.into_iter().flatten());
     debug_assert_eq!(picked.len(), n_groups);
     let qv = match qmode {
-        QMode::Decoy => {
-            let sd: Vec<(f64, bool)> = picked.iter().map(|g| (g.0, g.1)).collect();
-            target_decoy_q(&sd)
-        }
+        // Read in place, not through an `n_groups * 16` byte pair buffer.
+        QMode::Decoy => target_decoy_q_by(picked.len(), |k| (picked[k].0, picked[k].1)),
         QMode::Entrapment => {
             let sc: Vec<f64> = picked.iter().map(|g| g.0).collect();
             let e: Vec<bool> = picked.iter().map(|g| g.2).collect();
@@ -2803,6 +2872,7 @@ fn align_sidecar_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fdr::target_decoy_q;
 
     fn cfg_with(features: Option<Vec<&str>>, file: Option<&str>) -> RescoreConfig {
         RescoreConfig {
@@ -4385,6 +4455,94 @@ b
             schema_id: "schema-b".into(),
         };
         assert!(validate_feature_schema(&expected, &different_id, "id.parquet").is_err());
+    }
+
+    /// `run_psm_q` exactly as `run` computed it before `per_source_q`: one index vector per
+    /// source, the pair form of the kernel.
+    fn per_source_q_reference(
+        source: &[u32],
+        scores: &[f64],
+        is_decoy: &[bool],
+        is_entrapment: &[bool],
+        is_real: &[bool],
+        qmode: QMode,
+        ratio: f64,
+    ) -> Vec<f64> {
+        let mut by_src: std::collections::BTreeMap<u32, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, &s) in source.iter().enumerate() {
+            by_src.entry(s).or_default().push(i);
+        }
+        let mut rq = vec![1.0f64; scores.len()];
+        for (_s, idxs) in by_src {
+            let q = match qmode {
+                QMode::Decoy => {
+                    let sd: Vec<(f64, bool)> =
+                        idxs.iter().map(|&i| (scores[i], is_decoy[i])).collect();
+                    target_decoy_q(&sd)
+                }
+                QMode::Entrapment => {
+                    let sc: Vec<f64> = idxs.iter().map(|&i| scores[i]).collect();
+                    let en: Vec<bool> = idxs.iter().map(|&i| is_entrapment[i]).collect();
+                    let re: Vec<bool> = idxs.iter().map(|&i| is_real[i]).collect();
+                    entrapment_q(&sc, &en, &re, ratio)
+                }
+            };
+            for (k, &i) in idxs.iter().enumerate() {
+                rq[i] = q[k];
+            }
+        }
+        rq
+    }
+
+    #[test]
+    fn per_source_q_reproduces_the_index_vector_form() {
+        // Contiguous sources (the stage's own layout), one source, and a shuffled source
+        // column that has to take the index path; ties in the scores; both nulls.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let n = 3_000usize;
+        let scores: Vec<f64> = (0..n).map(|_| (next() % 400) as f64 * 0.25).collect();
+        let is_decoy: Vec<bool> = (0..n).map(|_| next() % 3 == 0).collect();
+        let is_ent: Vec<bool> = (0..n).map(|i| !is_decoy[i] && next() % 7 == 0).collect();
+        let is_real: Vec<bool> = (0..n).map(|i| !is_decoy[i] && !is_ent[i]).collect();
+        let contiguous: Vec<u32> = (0..n).map(|i| (i * 4 / n) as u32).collect();
+        let single = vec![0u32; n];
+        let shuffled: Vec<u32> = (0..n).map(|_| (next() % 4) as u32).collect();
+        for qmode in [QMode::Decoy, QMode::Entrapment] {
+            let pooled = match qmode {
+                QMode::Decoy => {
+                    let sd: Vec<(f64, bool)> = scores
+                        .iter()
+                        .copied()
+                        .zip(is_decoy.iter().copied())
+                        .collect();
+                    target_decoy_q(&sd)
+                }
+                QMode::Entrapment => entrapment_q(&scores, &is_ent, &is_real, 1.5),
+            };
+            // The split form of the pooled q is the pair form.
+            if qmode == QMode::Decoy {
+                assert_eq!(target_decoy_q_split(&scores, &is_decoy), pooled);
+            }
+            for source in [&contiguous, &single, &shuffled] {
+                let want = per_source_q_reference(
+                    source, &scores, &is_decoy, &is_ent, &is_real, qmode, 1.5,
+                );
+                let got = per_source_q(
+                    source, &scores, &is_decoy, &is_ent, &is_real, qmode, 1.5, &pooled,
+                );
+                assert_eq!(
+                    got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]

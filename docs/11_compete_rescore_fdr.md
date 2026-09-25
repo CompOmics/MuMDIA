@@ -591,6 +591,18 @@ before.
 
 ### rescore: the multi-context q columns
 
+The q columns are computed without per-row staging copies: the pooled PSM q reads
+`score` and the label bit in place (`target_decoy_q_split`, where the pair form
+built an `n * 16` byte buffer, 4.1 GB at the 258.75M-row immunopeptidomics pool);
+`run_psm_q` runs the kernel on each source's rows as one slice, because the rows of
+one input are contiguous (`per_source_q`; one source returns the pooled q, which is
+the kernel's output on the same input, and a source column in any other order keeps
+the index form); `grouped_q` reads its picked groups through `target_decoy_q_by`.
+The protein and precursor interners grow with the distinct keys and are not
+presized: by rows they would take 17.7 GB at that pool for a key set that is a
+small fraction of them. Every q is the kernel's output on the same input as
+before (`per_source_q_reproduces_the_index_vector_form`).
+
 After scoring, the stage computes q-values at several aggregation levels, each an
 **independent** target-decoy (or entrapment) analysis run on the appropriate
 best-per-group reduction. This is deliberate: q-values at different levels are not
