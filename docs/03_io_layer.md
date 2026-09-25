@@ -366,6 +366,14 @@ string (`main.rs:713`).
 | `Table::str` | `table.rs:357` | string getter; null -> `""` |
 | `Table::opt_f64` | `table.rs:377` | only null-preserving getter; -> `Vec<Option<f64>>` |
 | `Table::list_f32` | `table.rs:396` | f32 list getter; reads `List` and `LargeList`; null row -> empty `Vec` |
+| `TableFile` / `TableFile::open` / `open_rows` | `table.rs:1673` / `:1742` / `:1765` | footer-only handle whose getters stream one column batch by batch; `open_rows` is a row span of the file that behaves as a smaller file |
+| `TableFile::row_parts` | `table.rs:1868` | cut a handle into at most `max_parts` row-contiguous parts, in order: whole row groups, merged, and page-aligned ranges inside a group that has an offset index (a group without one is never split) |
+| `TableFile::batches` / `batches_dict` | `table.rs:2038` / `:2050` | streaming batch reader over the named columns; `batches_dict` reads the named `Utf8` columns as `Dictionary(Int32, Utf8)`, with the same row values |
+| `TableFile::batches_selected` | `table.rs:2100` | stream only the rows of `(rows, keep)` runs, skipping pages with no kept row where the file has an offset index (whole-file handles only) |
+| `TableFile::str_interned` / `str_flat` | `table.rs:2309` / `:2358` | a string column as one id per row plus its distinct values (first appearance), or as one text arena plus offsets; both refuse a NULL with the row |
+| `StrBatch` / `StrInterner` | `table.rs:1517` / `:1550` | one batch of a string column, plain or through its dictionary; first-appearance interning with a per-batch key memo |
+| `ListF32` | `table.rs:1422` | borrowed view of a batch's f32 list column (row slices of the batch's own buffer) |
+| `require_no_nulls` | `table.rs:1203` | refuse a NULL in a required column of a batch a reader walks itself, naming the absolute row |
 | `ArtifactReport` | `report.rs:11` | per-artifact JSON summary struct |
 | `ArtifactReport::write_for` | `report.rs:28` | write `<artifact>.report.json` |
 | `blake3_file` | `hash.rs:8` | streamed blake3 hex digest of a file (`content_hash`) |

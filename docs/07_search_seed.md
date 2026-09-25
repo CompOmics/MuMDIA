@@ -124,7 +124,8 @@ formatted threshold, e.g. `targets_at_q0.01`), `model_identity =
 
 ## How it works
 
-Entry point: `search_seed::run(SearchSeedParams)` (`search_seed.rs:45-283`).
+Entry point: `search_seed::run(SearchSeedParams)` (`search_seed.rs:175`), a wrapper
+over `run_returning_scans` (`search_seed.rs:182`).
 
 **1. Load** the library and MS2 scans (`load_ms2`), then log candidate and scan
 counts. On the fragindex matcher the library is the m/z-only one
@@ -229,21 +230,25 @@ and monotonizes from worst to best score so q is non-increasing. The output colu
 is `spectrum_q`. `count_targets_at_q(q, is_decoy, fdr_seed)` (`fdr.rs:115`) reports
 the confident target count into `stats` (`search_seed.rs:148`).
 
-**6. Fragment mass recalibration** (`search_seed.rs:150-231`). A
-`scan_index -> &Ms2Scan` map is built (`:155-158`). For every **confident target**
-PSM (`!is_decoy && q <= fdr_seed`, `:161`), each library fragment m/z of that
-candidate (`lib.cand_frags(cid)`, `index.rs:209`) is searched against the best
-scan's peaks inside a **hardcoded 50 ppm window** (`ppm_bounds(fmz, 50.0)`,
-`:167`; `partition_point` finds the low edge, then a linear scan to the high edge).
+**6. Fragment mass recalibration** (`search_seed.rs:376-468`). A
+`scan_index -> &Ms2Scan` map is built (`:381-384`). For every **confident target**
+PSM (`!is_decoy && q <= fdr_seed`, `:400-410`), each library fragment m/z of that
+candidate (`lib.cand_frag_mz(cid)`, `:417`; `index.rs:1566`) is searched against the
+best scan's peaks. `cand_frag_mz` is the only fragment accessor the m/z-only seed
+library serves: `cand_frags` hands out intensities and names too, and panics on a
+library that does not hold them. The search window is `max(50 ppm,
+fragment_tol_ppm)` (`ppm_bounds(fmz, collect_ppm)`, `:425-429`; `partition_point`
+finds the low edge, then a linear scan to the high edge).
 This `partition_point` + linear scan **assumes `scan.peaks` is m/z-ascending**;
 `load_ms2` does not re-sort peaks by m/z (`spectra.rs:20-97`), so the assumption
 rests on `convert` writing peaks in m/z order. The nearest peak by absolute m/z
 distance contributes one signed ppm deviation (`ppm_diff(peak_mz, fmz)`,
-`constants.rs:66`) to `devs` (`:160-184`). Every library fragment of the candidate
+`constants.rs:66`) to `devs` (`:426-449`). Every library fragment of the candidate
 is probed, not only those that matched during scoring, so a fragment that found no
-scoring posting can still supply a calibrant. The 50 ppm net is deliberately wider
-than `fragment_tol_ppm` so a systematic offset larger than the tolerance can still
-be measured.
+scoring posting can still supply a calibrant. The 50 ppm floor keeps the net wider
+than a narrow `fragment_tol_ppm`, so a systematic offset larger than the tolerance can
+still be measured; on a wide-tolerance search the net is the tolerance itself, so the
+percentile that sets the learned tolerance is not truncated by the net.
 
 The fit closure (`:187-194`) takes deviations, sorts them, takes the median as the
 offset (`sorted[len/2]`, the upper-middle element for even-length inputs, not the
@@ -288,25 +293,29 @@ tolerance (falling back to the config value if the file is absent,
 
 | name | file:line | what it does |
 |---|---|---|
-| `run` | `search_seed.rs:45` | stage entry point; orchestrates load, score, q, masscal, write |
-| `SearchSeedParams` | `search_seed.rs:27` | input struct (`ms2`, `library_precursors`, `library_fragments`, `out` output-path prefix, `cfg`, `bucket_size`, `config_hash`) |
-| `Best` | `search_seed.rs:37` | per-candidate best `{ score, rt, matched, scan_index }` |
-| `seed_fragindex_windows` | `search_seed.rs:313` | parallel per-window fragindex scoring + deterministic merge |
-| `select_peaks` | `search_seed.rs:288` | top-N-by-intensity peak selection, re-sorted to index order |
-| `hyperscore` | `search_seed.rs:413` | `ln(matched!) + ln(1 + sum_obs)` |
-| `FragIndex::build` | `fragindex.rs:46` | build CSR inverted index at a fixed tolerance |
-| `FragIndex::probe_peak` | `fragindex.rs:152` | matched postings for one peak in a candidate range |
-| `SeedScratch::accumulate` | `fragindex.rs:214` | epoch-stamped fused `(count, obs_sum)` accumulation |
-| `Library::candidate_range` | `index.rs:238` | half-open candidate id range for an isolation window |
-| `Library::page_search` | `index.rs:247` | bucketed inverted-index probe (bucketed backend) |
-| `Library::cand_frags` | `index.rs:209` | `(m/z, intensity, name)` slices for a candidate |
-| `target_decoy_q` | `fdr.rs:7` | tied-block, monotonized `(n_decoys+1)/max(1,n_targets)` q |
-| `count_targets_at_q` | `fdr.rs:115` | target count at or below a q threshold |
-| `ln_factorial` | `fdr.rs:137` | `ln(n!)` via summed logs |
-| `ppm_diff` / `ppm_bounds` | `constants.rs:66` / `:78` | signed ppm (theoretical-relative) and ppm window bounds (query-relative) |
-| `within_ppm` | `constants.rs:92` | min-relative tolerance predicate used by the fragindex match (differs at the edge from the two above) |
-| `load_ms2` | `spectra.rs:101` | reads `spectra_ms2.parquet` into `Vec<Ms2Scan>`, RT-sorted |
-| `percentile` | `calibrate.rs:156` | nearest-rank percentile (used for the tolerance) |
+| `run` | `search_seed.rs:175` | stage entry point; orchestrates load, score, q, masscal, write |
+| `run_returning_scans` | `search_seed.rs:182` | `run`, handing back the MS2 scans it decoded itself (`None` when they were lent), for a caller that lends them on to extract |
+| `SearchSeedParams` | `search_seed.rs:27` | input struct (`ms2`, `library_precursors`, `library_fragments`, `out` output-path prefix, `cfg`, `bucket_size`, `config_hash`, `fragment_offset`, `ms2_scans`, `emit_calibrants`, `library`) |
+| `SeedLibrary` / `SeedLibrary::load` | `search_seed.rs:92` / `:120` | a seed's library and index, loaded once and lent to every seed of `run-experiment`; records how it was built and is refused by a seed with other settings |
+| `Best` | `search_seed.rs:168` | per-candidate best `{ score, rt, matched, scan_index }` |
+| `seed_fragindex_windows` | `search_seed.rs:695` | parallel per-window fragindex scoring + deterministic merge |
+| `select_peaks` | `search_seed.rs:563` | top-N-by-intensity peak selection, re-sorted to index order |
+| `hyperscore` | `search_seed.rs:850` | `ln(matched!) + ln(1 + sum_obs)` |
+| `Library::load_mz_only` | `index.rs:1133` | the seed's library: precursor columns and fragment m/z; the payload is decoded and checked as the full load checks it, then discarded |
+| `FragIndex::build` / `build_mz_only` | `fragindex.rs:78` / `:99` | build the CSR inverted index at a fixed tolerance; `build_mz_only` without the intensity and fragment-ordinal payload (`has_payload`, `:105`) |
+| `FragIndex::probe_peak` / `probe_peak_cand` | `fragindex.rs:396` / `:425` | matched postings for one peak in a candidate range; `probe_peak_cand` reports the candidate only and is what the seed probes through (it also serves an m/z-only index) |
+| `SeedScratch::with_min_count` / `accumulate` / `qualified` | `fragindex.rs:667` / `:691` / `:741` | epoch-stamped `(count, obs_sum)` accumulator, one 16-byte slot per candidate; `qualified` lists the candidates that reached `min_matched_peaks`, in first-reached order |
+| `Library::candidate_range` | `index.rs:1612` | half-open candidate id range for an isolation window |
+| `Library::page_search` | `index.rs:1621` | bucketed inverted-index probe (bucketed backend) |
+| `Library::cand_frag_mz` | `index.rs:1566` | fragment m/z slice for a candidate; the one fragment accessor an m/z-only library serves |
+| `Library::cand_frags` | `index.rs:1549` | `(m/z, intensity, name id)` slices for a candidate; panics on a library without the payload |
+| `target_decoy_q` | `fdr.rs:51` | tied-block, monotonized `(n_decoys+1)/max(1,n_targets)` q |
+| `count_targets_at_q` | `fdr.rs:238` | target count at or below a q threshold |
+| `ln_factorial` | `fdr.rs:260` | `ln(n!)` via summed logs |
+| `ppm_diff` / `ppm_bounds` | `constants.rs:97` / `:109` | signed ppm (theoretical-relative) and ppm window bounds (query-relative) |
+| `within_ppm` | `constants.rs:130` | min-relative tolerance predicate used by the fragindex match (differs at the edge from the two above) |
+| `load_ms2` | `spectra.rs:86` | reads `spectra_ms2.parquet` into `Vec<Ms2Scan>`, RT-sorted, decoding row-contiguous parts in parallel |
+| `percentile` | `calibrate.rs:250` | nearest-rank percentile (used for the tolerance) |
 
 ## Configuration
 

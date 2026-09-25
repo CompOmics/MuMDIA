@@ -590,7 +590,7 @@ sections 10-16:
   time: zstd", "column 'peptidoform' is not utf8").
 - A library must carry `candidate_id` as the contiguous row-aligned range
   `0..ncand` (`index.rs:215-245`) and precursors ascending by `precursor_mz`
-  (`index.rs:1264-1275`). Both are hard errors. Fragments are grouped by a
+  (`index.rs:1288-1299`). Both are hard errors. Fragments are grouped by a
   counting sort, so they need valid ids but not a sorted order; a table whose
   ids ascend (what every library writer produces) takes the parallel fill.
 - The `nn_torch` worker selects its backend at `MUMDIA_NN_STREAM_GB`
