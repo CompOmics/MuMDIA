@@ -285,10 +285,18 @@ wrote 127 byte-identical artifacts against a binary built from the parent commit
 five that differ are logs and a work-directory path inside `planted.json`).
 
 Two matcher backends dispatch through `Prober::probe` (`extract.rs:57`):
-- `MatcherKind::Fragindex` (default): builds a `FragIndex` once at the learned
-  tolerance (`extract.rs:1431`). `FragIndex::probe_peak` (`fragindex.rs:169`)
-  probes bins `bin-1 ..= bin+1`, verifies each posting with the exact f64 ppm
-  predicate, and carries the **true generating fragment ordinal** in `post_frag`.
+- `MatcherKind::Fragindex` (default): probes bins `bin-1 ..= bin+1` of the
+  whole-library log-space geometry at the learned tolerance, verifies each posting
+  with the exact f64 ppm predicate, and carries the **true generating fragment
+  ordinal** in `post_frag`. On the default streamed path each probing task builds a
+  `LocalIndex` over its own candidate sub-range and the global `FragIndex` is not
+  built; the two-pass arbitration and `emit_demix_features`, which probe arbitrary
+  candidate windows, build the global index as before (docs/06, "Task-local
+  indexes"). The postings a task sees, and their order, are the narrowed global
+  index's, so the outputs are the same either way
+  (`candidate_range_split_reproduces_the_unsplit_accumulation` compares the two
+  probes callback for callback on every task shape of its fixture and the two
+  accumulations hit for hit).
 - Bucketed fallback (`MatcherKind::Bucketed`): `Library::page_search`
   (`index.rs:350`) resolves the fragment ordinal by nearest stored m/z via
   `Library::local_frag_index` (`index.rs:325`). This is a semantic difference for

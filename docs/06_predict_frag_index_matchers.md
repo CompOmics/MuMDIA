@@ -450,6 +450,36 @@ even though the number of `ln()` calls is identical, because the separate pass t
 the `ln()` off the dependency chain the bin-cache load and then the posting loads
 hang from (`docs/09_extract.md`, `tests/bench_fragindex.rs`).
 
+**Task-local indexes (`LocalIndex`, 2026-09-25).** Extract's default streamed
+accumulation no longer probes the global index at all. Each probing task owns one
+candidate sub-range `[cand_lo, cand_hi)` of one isolation window, and builds a
+`LocalIndex` over exactly that sub-range's fragments: a counting sort by bin,
+scattered in candidate order and, within a candidate, in fragment order. Within a
+bin that is the order the global build leaves the postings in (`post_cand`
+ascending, then the ordinal), and a narrowed global bin is a contiguous run of it, so
+every bin of the local index holds the narrowed global bin's postings in the same
+order. The bins are the whole library's geometry (`FragIndex::geometry`, the same
+`LogBins` `build` uses); a geometry fitted to the sub-range would partition m/z
+differently and emit the same matches in a different order across the three probed
+bins. The three probed bins are adjacent in the local CSR, so the local probe
+verifies one contiguous run of postings with the same `within_ppm` predicate.
+`BinnedProbe` is the common entry point: `LocalIndex` and `NarrowedProbe` (the
+global index plus a `WindowNarrow`, the previous path, kept as the reference)
+implement it, and `a_local_index_probes_exactly_what_the_narrowed_global_index_probes`
+compares the two callback for callback over empty, single-candidate, gappy, ragged
+and whole-library sub-ranges at 20 and 7.5 ppm, including clamped and non-finite
+probe m/z.
+
+A task's local index holds 14 bytes per posting of its sub-range plus 4 bytes per bin
+between its first and last occupied bin, which is less than the 8 bytes per bin of
+the `WindowNarrow` it replaces. Extract then builds the global index only when a path
+needs arbitrary candidate windows (the two-pass arbitration, `emit_demix_features`),
+so the default run skips the global build and its 14 bytes per library fragment
+(about 1.9 GB on the HYE library, 34 GB on a monolithic 203M-precursor library).
+Extract logs `extract: task-local fragment indexes` with the task count, the postings
+indexed across tasks (a candidate in overlapping windows is indexed once per window),
+the library's fragment count and the largest task index in bytes.
+
 Sharing one fill between several tasks is a different thing and was tried and
 reverted: see `docs/09_extract.md`. `bin` is clamped into range, so a stale one
 cannot index out of bounds, but it will probe the wrong bins and drop matches
@@ -584,6 +614,7 @@ m/z (`Library::local_frag_index`, `index.rs:325`).
 | `FragIndex::build` / `build_mz_only` / `has_payload` | `fragindex.rs:78` / `:99` / `:105` | CSR build at a fixed tolerance, in parallel and bit-identical to the serial counting sort; derives the m/z range from the library. `build_mz_only` omits the intensity and ordinal postings, and `has_payload` says which kind an index is |
 | `FragIndex::probe_peak` / `probe_peak_cand` | `fragindex.rs:396` / `:425` | +/-1 bin probe + `within_ppm` verify, candidate-window narrowed; `probe_peak` calls back `(cid, mz, int, frag)` and needs the payload, `probe_peak_cand` calls back `(cid)` in the same order and serves an m/z-only index |
 | `FragIndex::probe_peak_win` / `window_narrow` / `WindowNarrow` | `fragindex.rs:470` / `:579` / `:612` | same probe with the per-window bin-narrowing cache amortized |
+| `LocalIndex` / `BinnedProbe` / `NarrowedProbe` / `FragIndex::geometry` | `fragindex.rs` | task-local compact index over one candidate sub-range, whole-library geometry; the probe trait both it and the narrowed global index implement |
 | `FragIndex::probe_peak_win_binned` / `bin_of` | `fragindex.rs:489` / `:461` | same probe again with the bin handed in, for a caller that computes the per-peak setup in a pass of its own; `bin_of` is the bin it expects |
 | `FragIndex::candidate_range` / `n_cand` / `tol_ppm` | `fragindex.rs:381` / `:369` / `:373` | index-side isolation-window narrowing + accessors |
 | `SeedScratch` / `SeedScratch::with_min_count` | `fragindex.rs:632` / `:667` | epoch-stamped, window-relative `(count, obs_sum)` accumulator, one 16-byte slot per candidate; `with_min_count` sets the count at which a candidate enters `qualified` |

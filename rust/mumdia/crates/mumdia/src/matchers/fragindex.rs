@@ -256,8 +256,9 @@ impl FragIndex {
     }
 
     /// The bin geometry for `lib` at `tol_ppm`: log-space bins over the finite fragment
-    /// m/z range.
-    fn geometry(lib: &Library, tol_ppm: f64) -> LogBins {
+    /// m/z range. It is what [`FragIndex::build`] bins with, and what a [`LocalIndex`]
+    /// must be built with to probe the same bins in the same order.
+    pub fn geometry(lib: &Library, tol_ppm: f64) -> LogBins {
         // m/z range from the library fragments (guard > 0), spec geometry in f64.
         //
         // Skip non-finite values rather than letting one of them decide the range. A single
@@ -368,6 +369,11 @@ impl FragIndex {
 
     pub fn n_cand(&self) -> usize {
         self.n_cand
+    }
+
+    /// The bin geometry this index was built with ([`FragIndex::geometry`]).
+    pub fn bins(&self) -> &LogBins {
+        &self.bins
     }
 
     pub fn tol_ppm(&self) -> f64 {
@@ -613,6 +619,192 @@ pub struct WindowNarrow {
     cand_lo: u32,
     cand_hi: u32,
     range: Vec<(u32, u32)>,
+}
+
+/// One probe of a fixed candidate window with the bin already computed: the entry point a
+/// probing task calls per peak, whether it probes the global index through a
+/// [`WindowNarrow`] ([`NarrowedProbe`]) or a [`LocalIndex`] of its own. Both call
+/// `f(cid, post_mz_f64, post_int, post_frag)` for the same postings in the same order
+/// (`a_local_index_probes_exactly_what_the_narrowed_global_index_probes`).
+pub trait BinnedProbe {
+    /// `bin` must be the whole-library geometry's bin of `peak_mz`
+    /// ([`FragIndex::bin_of`], or [`LogBins::bin`] of [`FragIndex::geometry`]).
+    fn probe_binned<F: FnMut(u32, f64, f32, u16)>(&mut self, peak_mz: f64, bin: u32, f: F);
+}
+
+/// The global index probed through a per-window narrowing cache: the probe extract's
+/// streamed accumulation made before [`LocalIndex`], and the reference it is tested
+/// against.
+pub struct NarrowedProbe<'a> {
+    pub idx: &'a FragIndex,
+    pub nw: WindowNarrow,
+}
+
+impl BinnedProbe for NarrowedProbe<'_> {
+    #[inline]
+    fn probe_binned<F: FnMut(u32, f64, f32, u16)>(&mut self, peak_mz: f64, bin: u32, f: F) {
+        self.idx
+            .probe_peak_win_binned(&mut self.nw, peak_mz, bin, f)
+    }
+}
+
+/// A compact inverted index over the postings of ONE candidate sub-range `[cand_lo,
+/// cand_hi)`, built by the probing task that owns the sub-range.
+///
+/// Extract's streamed accumulation used to build the global [`FragIndex`] over every
+/// library fragment, then give each probing task a [`WindowNarrow`] that binary-searched
+/// every bin it touched down to the task's candidates. The task only ever sees its own
+/// sub-range, so this indexes just those postings: a counting sort of the sub-range's
+/// fragments by bin, scattered in candidate order and, within a candidate, in fragment
+/// order. Within a bin that is exactly the order the global build leaves them in
+/// (`post_cand` ascending, then the fragment ordinal), and a narrowed global bin is a
+/// contiguous run of it, so the postings of every bin are the narrowed global ones in the
+/// same order. The bins are the WHOLE LIBRARY's geometry ([`FragIndex::geometry`]): a
+/// sub-range geometry would be a different partition of m/z and would emit the same
+/// matches in a different order across the three probed bins.
+///
+/// The global index is then not needed for this path at all, which removes its build and
+/// its 14 bytes per library fragment. What a task holds instead is 14 bytes per posting of
+/// its own sub-range plus 4 bytes per bin between the first and the last occupied one, less
+/// than the 8 bytes per bin of the narrowing cache it replaces.
+pub struct LocalIndex {
+    /// Bins of the whole-library geometry (the probe clamps into `0..n_bins`).
+    n_bins: usize,
+    /// First bin holding a posting; `start` covers bins `bin0..bin0 + start.len() - 1`.
+    bin0: usize,
+    /// CSR offsets over the occupied bin span; empty when the sub-range has no postings.
+    start: Vec<u32>,
+    post_cand: Vec<u32>,
+    post_mz: Vec<f32>,
+    post_int: Vec<f32>,
+    post_frag: Vec<u16>,
+    tol_ppm: f64,
+}
+
+impl LocalIndex {
+    /// Index the fragments of candidates `cand_lo..cand_hi` of `lib`, binned by `bins`
+    /// (which must be [`FragIndex::geometry`] of `lib` at `tol_ppm`).
+    pub fn build(
+        lib: &Library,
+        bins: &LogBins,
+        tol_ppm: f64,
+        cand_lo: u32,
+        cand_hi: u32,
+    ) -> LocalIndex {
+        assert!(
+            !lib.fragment_payload_released(),
+            "LocalIndex::build needs the library's fragment payload (predicted intensities)"
+        );
+        let mut out = LocalIndex {
+            n_bins: bins.n_bins,
+            bin0: 0,
+            start: Vec::new(),
+            post_cand: Vec::new(),
+            post_mz: Vec::new(),
+            post_int: Vec::new(),
+            post_frag: Vec::new(),
+            tol_ppm,
+        };
+        if cand_hi <= cand_lo {
+            return out;
+        }
+        let a = lib.frag_offsets[cand_lo as usize] as usize;
+        let z = lib.frag_offsets[cand_hi as usize] as usize;
+        let n = z - a;
+        if n == 0 {
+            return out;
+        }
+        // Bin each posting once, by the stored f32 m/z widened, as the global build does.
+        let bin: Vec<u32> = lib.frag_mz[a..z]
+            .iter()
+            .map(|&mz| bins.bin(mz as f64) as u32)
+            .collect();
+        let (lo_b, hi_b) = bin
+            .iter()
+            .fold((u32::MAX, 0u32), |(l, h), &b| (l.min(b), h.max(b)));
+        let span = (hi_b - lo_b) as usize + 1;
+        let mut start = vec![0u32; span + 1];
+        for &b in &bin {
+            start[(b - lo_b) as usize + 1] += 1;
+        }
+        for i in 0..span {
+            start[i + 1] += start[i];
+        }
+        let mut cursor: Vec<u32> = start[..span].to_vec();
+        let mut post_cand = vec![0u32; n];
+        let mut post_mz = vec![0f32; n];
+        let mut post_int = vec![0f32; n];
+        let mut post_frag = vec![0u16; n];
+        for c in cand_lo..cand_hi {
+            for (k, gi) in lib.frag_range(c).enumerate() {
+                let b = (bin[gi - a] - lo_b) as usize;
+                let slot = cursor[b] as usize;
+                cursor[b] += 1;
+                post_cand[slot] = c;
+                post_mz[slot] = lib.frag_mz[gi];
+                post_int[slot] = lib.frag_int[gi];
+                post_frag[slot] = k as u16;
+            }
+        }
+        out.bin0 = lo_b as usize;
+        out.start = start;
+        out.post_cand = post_cand;
+        out.post_mz = post_mz;
+        out.post_int = post_int;
+        out.post_frag = post_frag;
+        out
+    }
+
+    /// Postings held (the sub-range's fragment count).
+    pub fn len(&self) -> usize {
+        self.post_mz.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.post_mz.is_empty()
+    }
+
+    /// Bytes this index holds, for the memory accounting of its callers.
+    pub fn heap_bytes(&self) -> usize {
+        self.start.len() * 4 + self.post_mz.len() * (4 + 4 + 4 + 2)
+    }
+}
+
+impl BinnedProbe for LocalIndex {
+    /// [`FragIndex::probe_peak_win_binned`] over the sub-range: bins `bin - 1 ..= bin + 1`
+    /// clamped to the whole-library geometry, each bin's postings in index order, every
+    /// posting verified with the same exact f64 predicate.
+    #[inline]
+    fn probe_binned<F: FnMut(u32, f64, f32, u16)>(&mut self, peak_mz: f64, bin: u32, mut f: F) {
+        if self.start.is_empty() {
+            return;
+        }
+        let b = (bin as usize).min(self.n_bins - 1);
+        let lo_bin = b.saturating_sub(1).max(self.bin0);
+        let hi_bin = (b + 1)
+            .min(self.n_bins - 1)
+            .min(self.bin0 + self.start.len() - 2);
+        if hi_bin < lo_bin {
+            return;
+        }
+        let a = self.start[lo_bin - self.bin0] as usize;
+        let z = self.start[hi_bin - self.bin0 + 1] as usize;
+        // The three bins are adjacent in the CSR, so their postings are one contiguous run
+        // in bin order: the order the per-bin loop of the global probe emits them in.
+        if z <= a {
+            return;
+        }
+        let mzs = &self.post_mz[a..z];
+        let cands = &self.post_cand[a..z];
+        let ints = &self.post_int[a..z];
+        let frags = &self.post_frag[a..z];
+        for (((&mz, &cid), &pint), &pfrag) in mzs.iter().zip(cands).zip(ints).zip(frags) {
+            let pmz = mz as f64;
+            if within_ppm(pmz, peak_mz, self.tol_ppm) {
+                f(cid, pmz, pint, pfrag);
+            }
+        }
+    }
 }
 
 /// Epoch-stamped dense accumulator for the seed's fused `(count, obs_sum)` semiring
@@ -1263,6 +1455,81 @@ mod tests {
         assert_eq!(serial.bins.bin(f64::NAN), 0);
         assert_eq!(serial.bins.bin(f64::NEG_INFINITY), 0);
         assert_eq!(serial.bins.bin(f64::INFINITY), serial.bins.n_bins - 1);
+    }
+
+    /// A [`LocalIndex`] over any candidate sub-range probes exactly what the global index,
+    /// narrowed to that sub-range, probes: the same postings in the same order with the same
+    /// bits, for every probe m/z. The sub-ranges include the empty one, single candidates,
+    /// runs of candidates without fragments, the whole library and ragged cuts; the probes
+    /// include every third fragment m/z nudged inside and outside the tolerance, the
+    /// geometry's clamped edges and non-finite values. Two tolerances, so the bin width
+    /// differs.
+    #[test]
+    fn a_local_index_probes_exactly_what_the_narrowed_global_index_probes() {
+        let mut libs = vec![random_lib(1_500, 0x10ca1)];
+        // Candidates without fragments at the ends and in the middle.
+        let mut gappy: Vec<(Vec<(f64, f32)>, f64)> = Vec::new();
+        for i in 0..120 {
+            let frags = if i % 4 == 0 || !(3..=110).contains(&i) {
+                Vec::new()
+            } else {
+                vec![(300.0 + i as f64 * 1.7, 1.0), (900.0 - i as f64, 0.5)]
+            };
+            gappy.push((frags, 400.0 + i as f64));
+        }
+        libs.push(lib_from(&gappy));
+        for lib in &libs {
+            let n = lib.n_candidates() as u32;
+            for tol in [20.0, 7.5] {
+                let idx = FragIndex::build(lib, tol);
+                let bins = FragIndex::geometry(lib, tol);
+                assert_eq!(format!("{bins:?}"), format!("{:?}", idx.bins()));
+                let mut ranges: Vec<(u32, u32)> = vec![(0, n), (0, 0), (0, 1), (n - 1, n)];
+                for &(a, b) in &[(3u32, 17u32), (100, 101), (5, 5), (40, n / 2)] {
+                    ranges.push((a.min(n), b.min(n)));
+                }
+                let step = (n / 9).max(1);
+                let mut lo = 0u32;
+                while lo < n {
+                    ranges.push((lo, (lo + step + 3).min(n)));
+                    lo += step;
+                }
+                let mut probes: Vec<f64> = Vec::new();
+                for (i, &m) in lib.frag_mz.iter().enumerate().step_by(3) {
+                    let f = [0.0, 0.97, -0.97, 1.02, -1.5][i % 5];
+                    probes.push(m as f64 * (1.0 + f * tol * 1e-6));
+                }
+                probes.extend([0.0, -1.0, 1.0, 50.0, 1e6, f64::NAN, f64::INFINITY]);
+                let mut n_emitted = 0usize;
+                for &(lo, hi) in &ranges {
+                    let mut local = LocalIndex::build(lib, &bins, tol, lo, hi);
+                    let want_len = lib.frag_offsets[hi.max(lo) as usize] as usize
+                        - lib.frag_offsets[lo as usize] as usize;
+                    assert_eq!(local.len(), want_len, "postings of {lo}..{hi}");
+                    let mut narrowed = NarrowedProbe {
+                        idx: &idx,
+                        nw: idx.window_narrow(lo, hi),
+                    };
+                    for &q in &probes {
+                        let bin = idx.bin_of(q);
+                        assert_eq!(bin as usize, bins.bin(q));
+                        let (mut a, mut b) = (Vec::new(), Vec::new());
+                        local.probe_binned(q, bin, |c, m, it, f| {
+                            a.push((c, m.to_bits(), it.to_bits(), f))
+                        });
+                        narrowed.probe_binned(q, bin, |c, m, it, f| {
+                            b.push((c, m.to_bits(), it.to_bits(), f))
+                        });
+                        assert_eq!(a, b, "tol {tol} range {lo}..{hi} q {q}");
+                        n_emitted += a.len();
+                    }
+                }
+                assert!(
+                    n_emitted > lib.frag_mz.len() / 4,
+                    "tol {tol}: too little traffic ({n_emitted})"
+                );
+            }
+        }
     }
 
     /// The seed's m/z-only index is the full index without its payload: the same geometry,

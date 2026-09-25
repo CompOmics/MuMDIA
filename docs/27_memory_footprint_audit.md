@@ -237,7 +237,8 @@ Resident at once:
 - all MS2 scans (`load_ms2`, `8P`) and, if MS1 is given, all MS1 scans
   (`spectra.rs:12-16`, `Ms1Scan.mz` is `Vec<f64>`, so 12 bytes per MS1 peak);
 - the library (section 1.2 steady state);
-- per-window narrowing caches (`window_narrow`, `extract.rs:699,836`), one per
+- per-window narrowing caches (`window_narrow`, `extract.rs:699,836`; on the default
+  streamed path replaced by task-local `LocalIndex`es since 2026-09-25), one per
   isolation window in flight under rayon;
 - the full output before write: `Vec<ChromOutputRow>` (`extract.rs:1698,2081`)
   holding one `Vec<f32>` RT trace and one `Vec<f32>` intensity trace per

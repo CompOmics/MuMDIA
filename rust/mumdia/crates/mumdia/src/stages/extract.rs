@@ -26,7 +26,10 @@ use tracing::{info, warn};
 use mumdia_core::constants::{ppm_bounds, ISOTOPE_SPACING};
 
 use crate::index::Library;
-use crate::matchers::fragindex::{FragIndex, WindowNarrow};
+use crate::matchers::binning::LogBins;
+#[cfg(test)]
+use crate::matchers::fragindex::NarrowedProbe;
+use crate::matchers::fragindex::{BinnedProbe, FragIndex, LocalIndex, WindowNarrow};
 use crate::spectra::{load_ms1, load_ms2, Ms1Scan};
 use crate::stages::rt_im_train::RtWindows;
 use mumdia_core::config::MatcherKind;
@@ -1224,7 +1227,7 @@ struct WinGroup {
 }
 
 /// Group the run's scans by isolation window, ascending.
-fn window_groups(idx: &FragIndex, scans: &[Ms2Scan]) -> Vec<WinGroup> {
+fn window_groups(lib: &Library, scans: &[Ms2Scan]) -> Vec<WinGroup> {
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
     for (si, scan) in scans.iter().enumerate() {
@@ -1240,7 +1243,7 @@ fn window_groups(idx: &FragIndex, scans: &[Ms2Scan]) -> Vec<WinGroup> {
         .into_values()
         .filter_map(|ids| {
             let w = &scans[*ids.first()?].window;
-            let (lo, hi) = idx.candidate_range(w.lower_mz, w.upper_mz);
+            let (lo, hi) = lib.candidate_range(w.lower_mz, w.upper_mz);
             (hi > lo).then_some(WinGroup {
                 lo_cid: lo,
                 hi_cid: hi,
@@ -1248,6 +1251,211 @@ fn window_groups(idx: &FragIndex, scans: &[Ms2Scan]) -> Vec<WinGroup> {
             })
         })
         .collect()
+}
+
+/// One probing task of the streamed accumulation: the scans of one window against the
+/// candidates of one sub-range `[lo, hi)`.
+#[derive(Clone, Copy)]
+struct ProbeTask<'a> {
+    ids: &'a [usize],
+    scans: &'a [Ms2Scan],
+    rt_lo: &'a [f64],
+    rt_hi: &'a [f64],
+    mass_off: &'a MassOffset,
+    cfg: &'a ExtractConfig,
+    restrict: Option<&'a CandMask>,
+    /// The whole-library bin geometry the index `run` is handed was built with.
+    bins: &'a LogBins,
+    lo: u32,
+    hi: u32,
+}
+
+impl ProbeTask<'_> {
+    /// Probe every peak of the task's scans through `ix` and return the task's hits grouped
+    /// by candidate. Generic over the index so the production [`LocalIndex`] and the
+    /// reference [`NarrowedProbe`] run the same code, monomorphised, with nothing but the
+    /// index between them.
+    fn run<I: BinnedProbe>(&self, ix: &mut I) -> HitStore {
+        let ProbeTask {
+            ids,
+            scans,
+            rt_lo,
+            rt_hi,
+            mass_off,
+            cfg,
+            restrict,
+            bins,
+            lo,
+            hi,
+        } = *self;
+        // Flat `(cid, hit)` pairs in probe order, grouped by candidate at the end of
+        // the task with a stable counting sort. The task-local `HashMap<u32,
+        // Vec<Hit>>` this replaces was one of the two populations of medium heap
+        // blocks that exhausted the mapping table.
+        let mut flat_cid: Vec<u32> = Vec::new();
+        let mut flat_hit: Vec<Hit> = Vec::new();
+        let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
+        // One scan's `(q_mz, bin)`, refilled per scan and reused. A few KB at 300-2000
+        // peaks a scan, task-local, so it is not the per-window buffer that the comment in
+        // `accumulate_groups` records as tried and reverted: nothing
+        // is shared, nothing is filled before the pool starts, and no thread waits.
+        //
+        // It still pays, with exactly the same number of `ln()` calls the probe made
+        // per peak, because a separate pass takes the `ln()` off the dependency chain
+        // that the bin-cache load and then the posting loads hang from. Measured over
+        // rayon at this task shape (`tests/bench_fragindex.rs` `bench_wall`, 32
+        // threads, min of 9, two independent passes): -11.7 / -6.4% on the default
+        // shape, -15.1 / -17.9% with smaller windows, -17.4 / -18.6% with one wide
+        // window in the batch. Single thread, sorted production-shaped peaks
+        // (`bench_probe`): -9.1 / -12.7 / -6.7% for a narrow / medium / wide
+        // candidate window.
+        //
+        // It carries `q_mz` and not just the bin so `factor_at` still runs ONCE per
+        // peak. That is free here and is not free for the caller: under
+        // `search_seed.mass_cal_loess` the offset is a ~74-point grid and `factor_at`
+        // is a binary search plus an interpolation, measured 8.3 ns/peak against
+        // 0.725 for the scalar default, and a bin-only scratch (which recomputes
+        // `q_mz` in the peak loop) turned that arm from -1.7% into +5.6%.
+        let mut setup: Vec<(f64, u32)> = Vec::new();
+        for &si in ids {
+            let scan = &scans[si];
+            let rt = scan.rt_seconds;
+            let hs = si as u32;
+            setup.clear();
+            setup.extend(scan.peaks.iter().map(|p| {
+                let mz = p.mz as f64;
+                let q = mz / mass_off.factor_at(mz);
+                (q, bins.bin(q) as u32)
+            }));
+            for (peak, &(q_mz, bin)) in scan.peaks.iter().zip(&setup) {
+                let inten = peak.intensity;
+                let obs_mz = peak.mz;
+                claimants.clear();
+                ix.probe_binned(q_mz, bin, |cid, _pmz, pint, frag| {
+                    let c = cid as usize;
+                    if rt < rt_lo[c] || rt > rt_hi[c] {
+                        return;
+                    }
+                    // The allowlist is applied here, before the claim, exactly where the
+                    // serial path applies it: a candidate outside the list neither
+                    // collects hits nor competes for a shared peak.
+                    if let Some(s) = restrict {
+                        if !s.contains(cid) {
+                            return;
+                        }
+                    }
+                    claimants.push((cid, frag, pint));
+                });
+                if claimants.is_empty() {
+                    continue;
+                }
+                match cfg.peak_claim {
+                    PeakClaim::WinnerPredictedIntensity => {
+                        let mut best = 0usize;
+                        for i in 1..claimants.len() {
+                            let a = claimants[i];
+                            let b = claimants[best];
+                            if a.2 > b.2 || (a.2 == b.2 && a.0 < b.0) {
+                                best = i;
+                            }
+                        }
+                        let (cid, frag, _) = claimants[best];
+                        flat_cid.push(cid);
+                        flat_hit.push(Hit {
+                            scan: hs,
+                            frag,
+                            inten,
+                            obs_mz,
+                        });
+                    }
+                    PeakClaim::Proportional => {
+                        let sump: f32 = claimants.iter().map(|c| c.2.max(0.0)).sum();
+                        for &(cid, frag, pi) in &claimants {
+                            let share = if sump > 0.0 {
+                                inten * (pi.max(0.0) / sump)
+                            } else {
+                                inten / claimants.len() as f32
+                            };
+                            flat_cid.push(cid);
+                            flat_hit.push(Hit {
+                                scan: hs,
+                                frag,
+                                inten: share,
+                                obs_mz,
+                            });
+                        }
+                    }
+                    _ => {
+                        for &(cid, frag, _) in &claimants {
+                            flat_cid.push(cid);
+                            flat_hit.push(Hit {
+                                scan: hs,
+                                frag,
+                                inten,
+                                obs_mz,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let (cids, offs) = group_hits_by_candidate(lo, hi, &mut flat_cid, &mut flat_hit);
+        drop(flat_cid);
+        // Not shrunk: the buffer's doubling slack is the same slack the per-candidate
+        // vectors carried, and `shrink_to_fit` here measured 2,520-2,560 MB of peak
+        // RSS against 2,456-2,505 MB without it on the AIF fixture, i.e. its copy
+        // costs more than the slack it returns.
+        HitStore {
+            cids,
+            offs,
+            hits: flat_hit,
+        }
+    }
+}
+
+/// How the probing tasks of the streamed accumulation reach the fragment index.
+#[derive(Clone, Copy)]
+enum TaskProbe<'a> {
+    /// Each task builds a [`LocalIndex`] over its own candidate sub-range, binned with the
+    /// whole library's geometry. The default, and the only production path.
+    Local {
+        lib: &'a Library,
+        bins: &'a LogBins,
+        tol_ppm: f64,
+        stats: &'a LocalIndexStats,
+    },
+    /// Each task probes the global [`FragIndex`] through a [`WindowNarrow`]: the path this
+    /// replaced, kept as the reference the local index is compared against.
+    #[cfg(test)]
+    Global(&'a FragIndex),
+}
+
+impl TaskProbe<'_> {
+    fn bins(&self) -> &LogBins {
+        match self {
+            TaskProbe::Local { bins, .. } => bins,
+            #[cfg(test)]
+            TaskProbe::Global(idx) => idx.bins(),
+        }
+    }
+}
+
+/// What the task-local indexes of one extract cost, summed over every task: logged once
+/// at the end of the accumulation.
+#[derive(Default)]
+struct LocalIndexStats {
+    tasks: std::sync::atomic::AtomicU64,
+    postings: std::sync::atomic::AtomicU64,
+    largest_bytes: std::sync::atomic::AtomicUsize,
+}
+
+impl LocalIndexStats {
+    fn record(&self, ix: &LocalIndex) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.tasks.fetch_add(1, Relaxed);
+        self.postings.fetch_add(ix.len() as u64, Relaxed);
+        self.largest_bytes.fetch_max(ix.heap_bytes(), Relaxed);
+    }
 }
 
 /// Probe one batch of isolation windows and flush what each candidate sub-range finalises,
@@ -1278,7 +1486,7 @@ fn window_groups(idx: &FragIndex, scans: &[Ms2Scan]) -> Vec<WinGroup> {
 /// Returns true when `flush` asked to stop (the chromatogram writer went away).
 #[allow(clippy::too_many_arguments)]
 fn accumulate_groups(
-    idx: &FragIndex,
+    probe: TaskProbe<'_>,
     sibling_bands: usize,
     groups: &[WinGroup],
     scans: &[Ms2Scan],
@@ -1299,8 +1507,9 @@ fn accumulate_groups(
     }
     // `current_num_threads()` is the whole pool, and under `groups.parallel` every band in
     // flight computes this independently: 24 bands each fanning out to twice the pool gave
-    // thousands of live narrowed-bin caches (1-2 MB each) allocated in lockstep. Divide by
-    // the bands beside this one so the fan-out describes this band's share.
+    // thousands of live narrowed-bin caches (1-2 MB each) allocated in lockstep, which is
+    // what a task's local index is now (4 bytes per occupied bin plus its postings). Divide
+    // by the bands beside this one so the fan-out describes this band's share.
     let threads = (rayon::current_num_threads() / sibling_bands.max(1)).max(1);
     let tasks_per_window = (threads * 2).div_ceil(groups.len()).max(1);
     // The sub-range WIDTH is taken from the mean window span divided by
@@ -1384,131 +1593,36 @@ fn accumulate_groups(
     let (tx, rx) = std::sync::mpsc::channel::<(usize, usize, HitStore)>();
     {
         let probe_range = |gi: usize, lo: u32, hi: u32| -> HitStore {
-            let ids = &groups[gi].scans;
-            // Flat `(cid, hit)` pairs in probe order, grouped by candidate at the end of
-            // the task with a stable counting sort. The task-local `HashMap<u32,
-            // Vec<Hit>>` this replaces was one of the two populations of medium heap
-            // blocks that exhausted the mapping table.
-            let mut flat_cid: Vec<u32> = Vec::new();
-            let mut flat_hit: Vec<Hit> = Vec::new();
-            let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
-            // `(lo, hi)` is fixed for this whole sub-range and every scan of the window
-            // reprobes the same bins, so cache each bin's narrowed posting range once
-            // instead of binary-searching it per peak.
-            let mut nw = idx.window_narrow(lo, hi);
-            // One scan's `(q_mz, bin)`, refilled per scan and reused. A few KB at 300-2000
-            // peaks a scan, task-local, so it is not the per-window buffer above: nothing
-            // is shared, nothing is filled before the pool starts, and no thread waits.
-            //
-            // It still pays, with exactly the same number of `ln()` calls the probe made
-            // per peak, because a separate pass takes the `ln()` off the dependency chain
-            // that the bin-cache load and then the posting loads hang from. Measured over
-            // rayon at this task shape (`tests/bench_fragindex.rs` `bench_wall`, 32
-            // threads, min of 9, two independent passes): -11.7 / -6.4% on the default
-            // shape, -15.1 / -17.9% with smaller windows, -17.4 / -18.6% with one wide
-            // window in the batch. Single thread, sorted production-shaped peaks
-            // (`bench_probe`): -9.1 / -12.7 / -6.7% for a narrow / medium / wide
-            // candidate window.
-            //
-            // It carries `q_mz` and not just the bin so `factor_at` still runs ONCE per
-            // peak. That is free here and is not free for the caller: under
-            // `search_seed.mass_cal_loess` the offset is a ~74-point grid and `factor_at`
-            // is a binary search plus an interpolation, measured 8.3 ns/peak against
-            // 0.725 for the scalar default, and a bin-only scratch (which recomputes
-            // `q_mz` in the peak loop) turned that arm from -1.7% into +5.6%.
-            let mut setup: Vec<(f64, u32)> = Vec::new();
-            for &si in ids {
-                let scan = &scans[si];
-                let rt = scan.rt_seconds;
-                let hs = si as u32;
-                setup.clear();
-                setup.extend(scan.peaks.iter().map(|p| {
-                    let mz = p.mz as f64;
-                    let q = mz / mass_off.factor_at(mz);
-                    (q, idx.bin_of(q))
-                }));
-                for (peak, &(q_mz, bin)) in scan.peaks.iter().zip(&setup) {
-                    let inten = peak.intensity;
-                    let obs_mz = peak.mz;
-                    claimants.clear();
-                    idx.probe_peak_win_binned(&mut nw, q_mz, bin, |cid, _pmz, pint, frag| {
-                        let c = cid as usize;
-                        if rt < rt_lo[c] || rt > rt_hi[c] {
-                            return;
-                        }
-                        // The allowlist is applied here, before the claim, exactly where the
-                        // serial path applies it: a candidate outside the list neither
-                        // collects hits nor competes for a shared peak.
-                        if let Some(s) = restrict {
-                            if !s.contains(cid) {
-                                return;
-                            }
-                        }
-                        claimants.push((cid, frag, pint));
-                    });
-                    if claimants.is_empty() {
-                        continue;
-                    }
-                    match cfg.peak_claim {
-                        PeakClaim::WinnerPredictedIntensity => {
-                            let mut best = 0usize;
-                            for i in 1..claimants.len() {
-                                let a = claimants[i];
-                                let b = claimants[best];
-                                if a.2 > b.2 || (a.2 == b.2 && a.0 < b.0) {
-                                    best = i;
-                                }
-                            }
-                            let (cid, frag, _) = claimants[best];
-                            flat_cid.push(cid);
-                            flat_hit.push(Hit {
-                                scan: hs,
-                                frag,
-                                inten,
-                                obs_mz,
-                            });
-                        }
-                        PeakClaim::Proportional => {
-                            let sump: f32 = claimants.iter().map(|c| c.2.max(0.0)).sum();
-                            for &(cid, frag, pi) in &claimants {
-                                let share = if sump > 0.0 {
-                                    inten * (pi.max(0.0) / sump)
-                                } else {
-                                    inten / claimants.len() as f32
-                                };
-                                flat_cid.push(cid);
-                                flat_hit.push(Hit {
-                                    scan: hs,
-                                    frag,
-                                    inten: share,
-                                    obs_mz,
-                                });
-                            }
-                        }
-                        _ => {
-                            for &(cid, frag, _) in &claimants {
-                                flat_cid.push(cid);
-                                flat_hit.push(Hit {
-                                    scan: hs,
-                                    frag,
-                                    inten,
-                                    obs_mz,
-                                });
-                            }
-                        }
-                    }
+            let task = ProbeTask {
+                ids: &groups[gi].scans,
+                scans,
+                rt_lo,
+                rt_hi,
+                mass_off,
+                cfg,
+                restrict,
+                bins: probe.bins(),
+                lo,
+                hi,
+            };
+            match probe {
+                // The task indexes its own sub-range: the postings the narrowed global
+                // index would have handed it, in the same order, and nothing else.
+                TaskProbe::Local {
+                    lib,
+                    bins,
+                    tol_ppm,
+                    stats,
+                } => {
+                    let mut ix = LocalIndex::build(lib, bins, tol_ppm, lo, hi);
+                    stats.record(&ix);
+                    task.run(&mut ix)
                 }
-            }
-            let (cids, offs) = group_hits_by_candidate(lo, hi, &mut flat_cid, &mut flat_hit);
-            drop(flat_cid);
-            // Not shrunk: the buffer's doubling slack is the same slack the per-candidate
-            // vectors carried, and `shrink_to_fit` here measured 2,520-2,560 MB of peak
-            // RSS against 2,456-2,505 MB without it on the AIF fixture, i.e. its copy
-            // costs more than the slack it returns.
-            HitStore {
-                cids,
-                offs,
-                hits: flat_hit,
+                #[cfg(test)]
+                TaskProbe::Global(idx) => task.run(&mut NarrowedProbe {
+                    idx,
+                    nw: idx.window_narrow(lo, hi),
+                }),
             }
         };
         let n = tasks.len();
@@ -2300,12 +2414,28 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
     // copies of every library fragment.
     let fragindex = matches!(p.cfg.matcher, MatcherKind::Fragindex);
     let build_bucketed = !fragindex;
+    // The two co-elution strategies and the contested feature need a first pass to
+    // build per-candidate elution profiles before shared peaks can be arbitrated.
+    let two_pass = matches!(
+        p.cfg.peak_claim,
+        PeakClaim::CoelutionWinner
+            | PeakClaim::CoelutionProportional
+            | PeakClaim::CoelutionWinnerMargin
+            | PeakClaim::CoelutionMultiCue
+            | PeakClaim::CoelutionDemix
+            | PeakClaim::CoelutionShadow
+    ) || p.cfg.emit_contested_features;
+    // The GLOBAL fragment index is needed only by the paths that probe arbitrary candidate
+    // windows through it: the two-pass arbitration and the per-apex-scan demix. The
+    // default streamed accumulation gives each probing task a `LocalIndex` of its own
+    // sub-range instead, and needs only the whole library's bin geometry.
+    let global_index = fragindex && (two_pass || p.cfg.emit_demix_features);
     // The mass calibration is read FIRST: it is one small JSON file, and its learned
     // tolerance is what the fragment index is built at, so building the index while the
     // spectra decode needs it up front. Its errors and its log lines stay where they were,
     // after the spectra (`mass?` below).
     let mass = read_mass_cal(&p);
-    let load_indexed = || -> Result<(Library, Option<FragIndex>)> {
+    let load_indexed = || -> Result<(Library, Option<FragIndex>, Option<LogBins>)> {
         let lib = match p.fragment_offset {
             None => Library::load_with(
                 p.library_precursors,
@@ -2321,14 +2451,21 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                 build_bucketed,
             )?,
         };
-        // fragindex backend, built once at the learned fragment tolerance when selected
-        // (`MatcherKind::Fragindex`); otherwise the bucketed `Library::page_search` path
-        // is used. `Prober::probe` dispatches on this per peak.
-        let fidx = match (&mass, fragindex) {
-            (Ok(m), true) => Some(FragIndex::build(&lib, m.frag_tol)),
-            _ => None,
+        // fragindex backend, built once at the learned fragment tolerance when a path
+        // needs the global index; otherwise the bucketed `Library::page_search` path is
+        // used. `Prober::probe` dispatches on this per peak. The geometry is the global
+        // index's own when it is built, and computed on its own when it is not; either
+        // way it is `FragIndex::geometry` at the learned tolerance.
+        let (fidx, bins) = match (&mass, fragindex, global_index) {
+            (Ok(m), true, true) => {
+                let f = FragIndex::build(&lib, m.frag_tol);
+                let b = f.bins().clone();
+                (Some(f), Some(b))
+            }
+            (Ok(m), true, false) => (None, Some(FragIndex::geometry(&lib, m.frag_tol))),
+            _ => (None, None),
         };
-        Ok((lib, fidx))
+        Ok((lib, fidx, bins))
     };
     // On the fragindex path the spectra decode runs concurrently with the library load and
     // the index build: they are independent, and the scans are resident during the index
@@ -2342,7 +2479,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
     } else {
         (load_indexed(), None)
     };
-    let (lib, prebuilt_fidx) = loaded?;
+    let (lib, prebuilt_fidx, prebuilt_bins) = loaded?;
 
     // Optional candidate allowlist (gate-first-then-compete): restrict extraction to
     // the accepted survivors of a prior gate-on run so the two-pass peak-claim profile
@@ -2493,12 +2630,23 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         }
     };
 
-    // The fragment index, built with the library above at this same learned tolerance.
-    let fidx = match (fragindex, prebuilt_fidx) {
+    // The fragment index, built with the library above at this same learned tolerance,
+    // when a path needs the global one; and the geometry the streamed path's task-local
+    // indexes bin with.
+    let fidx = match (global_index, prebuilt_fidx) {
         (true, Some(f)) => Some(f),
         (true, None) => Some(FragIndex::build(&lib, frag_tol)),
         (false, _) => None,
     };
+    let stream_bins: Option<LogBins> = match (fragindex, prebuilt_bins) {
+        (true, Some(b)) => Some(b),
+        (true, None) => Some(match &fidx {
+            Some(f) => f.bins().clone(),
+            None => FragIndex::geometry(&lib, frag_tol),
+        }),
+        (false, _) => None,
+    };
+    let local_stats = LocalIndexStats::default();
 
     // Peak-major accumulation. The fast path (single pass, fragment index, no candidate
     // allowlist) leaves `acc` empty and fills `stream_groups` instead; every other path
@@ -2510,21 +2658,10 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
     // Per-candidate contested-peak stats under the co-elution arbitration, for the
     // non-destructive soft competition features. Populated only on the two-pass path.
     let mut contested: HashMap<u32, Contested> = HashMap::new();
-    // The two co-elution strategies and the contested feature need a first pass to
-    // build per-candidate elution profiles before shared peaks can be arbitrated.
-    let two_pass = matches!(
-        p.cfg.peak_claim,
-        PeakClaim::CoelutionWinner
-            | PeakClaim::CoelutionProportional
-            | PeakClaim::CoelutionWinnerMargin
-            | PeakClaim::CoelutionMultiCue
-            | PeakClaim::CoelutionDemix
-            | PeakClaim::CoelutionShadow
-    ) || p.cfg.emit_contested_features;
     let claim_margin = p.cfg.peak_claim_margin as f32;
 
     if !two_pass {
-        if let Some(idx) = fidx.as_ref() {
+        if stream_bins.is_some() {
             // Parallel across isolation-window groups (bit-identical to serial: the
             // cascade rt-sorts each candidate's hits before summing), with or without a
             // candidate allowlist: the allowlist is applied inside the probe, before the
@@ -2536,7 +2673,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
             // candidate out as soon as no later window can add a hit to it, so the whole
             // run's hits are never resident. Measured at 1.6 billion hits (35.9 GiB of
             // payload) on the HYE benchmark, which was 60% of extract's 61.3 GiB peak.
-            stream_groups = Some(window_groups(idx, scans));
+            stream_groups = Some(window_groups(&lib, scans));
         } else {
             let pr = Prober {
                 fidx: fidx.as_ref(),
@@ -3658,8 +3795,14 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                 // so the accumulator holds a sub-range of the band rather than the band.
                 let bound = groups.get(upto).map(|g| g.lo_cid).unwrap_or(u32::MAX);
                 let mut stopped = accumulate_groups(
-                    fidx.as_ref()
-                        .expect("streamed path implies a fragment index"),
+                    TaskProbe::Local {
+                        lib: &lib,
+                        bins: stream_bins
+                            .as_ref()
+                            .expect("the streamed path implies the fragindex geometry"),
+                        tol_ppm: frag_tol,
+                        stats: &local_stats,
+                    },
                     p.sibling_bands,
                     &groups[gi..upto],
                     scans,
@@ -3705,6 +3848,17 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                 windows_in_flight = step,
                 "extract: candidates with evidence"
             );
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                info!(
+                    tasks = local_stats.tasks.load(Relaxed),
+                    postings = local_stats.postings.load(Relaxed),
+                    library_fragments = lib.frag_mz.len(),
+                    largest_task_index_bytes = local_stats.largest_bytes.load(Relaxed),
+                    bins = stream_bins.as_ref().map(|b| b.n_bins).unwrap_or(0),
+                    "extract: task-local fragment indexes"
+                );
+            }
         } else {
             // Eager paths: move each chunk of candidates out of the whole-run
             // `HashMap<u32, Vec<Hit>>` into the CSR buffer in ascending id order, freeing
@@ -4302,34 +4456,85 @@ mod accumulate_tests {
             grid_ppm: Vec::new(),
         };
         let cfg = ExtractConfig::default();
+        let bins = FragIndex::geometry(&lib, 20.0);
+        let stats = LocalIndexStats::default();
+        let local = TaskProbe::Local {
+            lib: &lib,
+            bins: &bins,
+            tol_ppm: 20.0,
+            stats: &stats,
+        };
+        let global = TaskProbe::Global(&idx);
+
+        // Callback for callback: every task shape this fixture produces (each window whole,
+        // and cut into 2, 3 and 7 sub-ranges, which covers the grids of the pool sizes
+        // below), every scan of the window, every peak. The task-local index must hand the
+        // probe exactly the postings the narrowed global index handed it, in the same order,
+        // with the same m/z, intensity and ordinal bits.
+        let mut n_callbacks = 0usize;
+        for g in &groups {
+            for pieces in [1u32, 2, 3, 7] {
+                let span = g.hi_cid - g.lo_cid;
+                for k in 0..pieces {
+                    let lo = g.lo_cid + span * k / pieces;
+                    let hi = g.lo_cid + span * (k + 1) / pieces;
+                    let mut li = LocalIndex::build(&lib, &bins, 20.0, lo, hi);
+                    let mut np = NarrowedProbe {
+                        idx: &idx,
+                        nw: idx.window_narrow(lo, hi),
+                    };
+                    for &si in &g.scans {
+                        for peak in &sc[si].peaks {
+                            let mz = peak.mz as f64;
+                            let q = mz / mass_off.factor_at(mz);
+                            let bin = bins.bin(q) as u32;
+                            assert_eq!(bin, idx.bin_of(q), "one geometry");
+                            let (mut a, mut b) = (Vec::new(), Vec::new());
+                            li.probe_binned(q, bin, |c, m, it, f| {
+                                a.push((c, m.to_bits(), it.to_bits(), f))
+                            });
+                            np.probe_binned(q, bin, |c, m, it, f| {
+                                b.push((c, m.to_bits(), it.to_bits(), f))
+                            });
+                            assert_eq!(a, b, "sub-range {lo}..{hi} scan {si} peak m/z {q}");
+                            n_callbacks += a.len();
+                        }
+                    }
+                }
+            }
+        }
+        assert!(n_callbacks > 10_000, "the comparison must see real traffic");
+
         // `bound = 0` flushes nothing, so the whole batch stays in the accumulator and the
         // comparison is over the accumulation itself. `flush_all` below runs the same
         // fixture with the flush live.
-        let run = |threads: usize, bound: u32| -> (HitAcc, Vec<(u32, Vec<Hit>)>) {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .expect("thread pool");
-            let mut acc = HitAcc::default();
-            let mut chunk = HitStore::default();
-            let mut flushed: Vec<(u32, Vec<Hit>)> = Vec::new();
-            pool.install(|| {
-                let mut sink = |c: &mut HitStore| -> bool {
-                    for (cid, hits) in c.slices_mut() {
-                        flushed.push((cid, hits.to_vec()));
-                    }
-                    true
-                };
-                accumulate_groups(
-                    // One band in this test, so the probing fan-out is the whole pool.
-                    &idx, 1, &groups, &sc, &rt_lo, &rt_hi, &mass_off, &cfg, None, bound, &mut acc,
-                    &mut chunk, &mut sink,
-                );
-            });
-            (acc, flushed)
-        };
-        // Two threads: 2 * 2 / 4 windows = one sub-range per window, the unsplit path.
-        let (acc, empty) = run(2, 0);
+        let run =
+            |probe: TaskProbe<'_>, threads: usize, bound: u32| -> (HitAcc, Vec<(u32, Vec<Hit>)>) {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("thread pool");
+                let mut acc = HitAcc::default();
+                let mut chunk = HitStore::default();
+                let mut flushed: Vec<(u32, Vec<Hit>)> = Vec::new();
+                pool.install(|| {
+                    let mut sink = |c: &mut HitStore| -> bool {
+                        for (cid, hits) in c.slices_mut() {
+                            flushed.push((cid, hits.to_vec()));
+                        }
+                        true
+                    };
+                    accumulate_groups(
+                        // One band in this test, so the probing fan-out is the whole pool.
+                        probe, 1, &groups, &sc, &rt_lo, &rt_hi, &mass_off, &cfg, None, bound,
+                        &mut acc, &mut chunk, &mut sink,
+                    );
+                });
+                (acc, flushed)
+            };
+        // Two threads: 2 * 2 / 4 windows = one sub-range per window, the unsplit path, over
+        // the global index: the reference both probes are held to.
+        let (acc, empty) = run(global, 2, 0);
         assert!(empty.is_empty(), "bound 0 must flush nothing");
         let unsplit = materialize(acc);
         assert!(!unsplit.is_empty(), "the fixture must produce hits");
@@ -4337,26 +4542,34 @@ mod accumulate_tests {
             unsplit.values().any(|v| v.len() > 1),
             "candidates must collect several hits, or hit order proves nothing"
         );
-        for threads in [8, 16] {
-            let split = materialize(run(threads, 0).0);
-            assert_eq!(
-                split.len(),
-                unsplit.len(),
-                "{threads} threads: candidate count"
-            );
-            for (cid, hits) in &unsplit {
+        for (probe, what) in [(global, "global"), (local, "local")] {
+            for threads in [2, 8, 16] {
+                let split = materialize(run(probe, threads, 0).0);
                 assert_eq!(
-                    split.get(cid),
-                    Some(hits),
-                    "{threads} threads: candidate {cid} hits differ"
+                    split.len(),
+                    unsplit.len(),
+                    "{what}, {threads} threads: candidate count"
                 );
+                for (cid, hits) in &unsplit {
+                    assert_eq!(
+                        split.get(cid),
+                        Some(hits),
+                        "{what}, {threads} threads: candidate {cid} hits differ"
+                    );
+                }
             }
         }
         // Flushing per candidate sub-range instead of per batch must deliver exactly the
         // same candidates, ascending, with the same hits in the same order: the sub-range
         // grid is where a candidate becomes final, not where its evidence changes.
-        for threads in [2, 8, 16] {
-            let (acc, flushed) = run(threads, u32::MAX);
+        for (probe, threads) in [
+            (global, 2),
+            (global, 16),
+            (local, 2),
+            (local, 8),
+            (local, 16),
+        ] {
+            let (acc, flushed) = run(probe, threads, u32::MAX);
             assert_eq!(acc.n_hits(), 0, "{threads} threads: nothing may stay open");
             assert!(
                 flushed.windows(2).all(|w| w[0].0 < w[1].0),
