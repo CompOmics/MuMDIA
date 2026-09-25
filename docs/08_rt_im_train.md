@@ -713,6 +713,28 @@ the scratch directory is removed either way. `<lib_out>.summary.json` records th
 under `shards` (requested, used, threads per shard, and per shard its rows, threads,
 model load and prediction time). With the default of one process nothing changes.
 
+Measured on one desktop (i9-13900KS, 24 physical cores, other jobs running; DeepLC 4.5.0
+on the CPU; base-model prediction of 322,908 unique sequences from an 800,628-row
+synthetic library, calls of 25,000):
+
+| processes x threads | prediction | featurisation | forward pass |
+|---|---|---|---|
+| 1 x 8 | 53.5 s | 11.5 s | 40.3 s |
+| 4 x 2 | 52.7 s | 19.0 s (summed) | 136.2 s (summed) |
+| 7 x 1 | 101.4 s | 33.4 s (summed) | 567.2 s (summed) |
+| 1 x 2 | 310.0 s | 22.5 s | 283.7 s |
+| 1 x 1 | 587.7 s | 22.2 s | 561.8 s |
+
+4 x 2 and 7 x 1 wrote a `predicted_irt` column bit-identical to 1 x 2 and 1 x 1 over all
+800,628 rows; 4 x 2 against 1 x 8 differed on 6,507 rows by at most 4.6e-5. On this CPU
+the forward pass, not featurisation, dominates at eight threads or fewer and it scales
+with threads inside one process, so sharding a budget of 8 gained nothing (four processes
+of two threads are 5.9x faster than one process of two, which is the scaling the shards
+offer). The case sharding is for is the one doxy measured: one process stops scaling
+past about 64 threads (10:41 at 96, 18:09 at 128), and the featurisation share, 11.5 s of
+53.5 here, becomes the bound as the forward pass shrinks. Whether it pays there is the
+doxy A/B that remains; the survey's arithmetic is 10:41 to 2.5-4.5 min at 8-12 shards.
+
 ## Key types and functions
 
 | name | file:line | what it does |

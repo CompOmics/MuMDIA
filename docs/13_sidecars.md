@@ -402,7 +402,7 @@ predictions differed in the last bits between 8 threads and each of 1, 2, 4, 16 
 multi-head calibration amplifies this for a few sequences: DeepLC's per-head spline
 hands over to a linear trail outside the reference's range, so a sequence at that edge
 can move by tens of seconds. On a 12,002-row synthetic library, 32 threads against the
-capped 24 moved the median row by 0.002 s, 63 rows by more than 1 s and one by 129 s,
+capped 24 moved the median row by 0.002 s and 63 rows by more than 1 s (at most 129 s),
 with the same 80 heads, ridge strength and best head; the unmodified worker at 8
 against 32 threads differs the same way (75 rows above 1 s, 179 s at most). Where the
 cap does not bind, old and new worker wrote byte-identical libraries. Predictions on a
