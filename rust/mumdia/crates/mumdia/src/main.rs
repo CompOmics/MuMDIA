@@ -1109,6 +1109,8 @@ fn load_config(path: &Option<String>) -> Result<Config> {
 }
 
 fn main() -> Result<()> {
+    // The reference point for the orchestrators' pre-stage timer, before anything else.
+    mumdia::prestage::mark_process_start();
     // The dispatch in `real_main` is one large function whose arms keep their locals in
     // a single frame, and without optimisation that frame exceeds the 1 MiB main-thread
     // stack Windows reserves: the debug binary overflowed on `--version` before printing

@@ -139,6 +139,8 @@ fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
 
 pub fn run(p: RunParams) -> Result<()> {
     let t0 = Instant::now();
+    // The time from here to the first stage, by step (`prestage::PreStageTimer`).
+    let mut pre = crate::prestage::PreStageTimer::start("run");
     // Fill in the sidecar interpreters and the worker directory before anything is
     // validated or hashed, so every stage sees a concrete path and the manifest
     // records the interpreter that actually ran rather than the word "auto".
@@ -146,8 +148,10 @@ pub fn run(p: RunParams) -> Result<()> {
     resolved.predict_frag.sidecar_script_dir =
         crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
     crate::python::resolve(&mut resolved)?;
+    pre.step("resolve_interpreters");
     let cfg = &resolved;
     preflight(&p, cfg)?;
+    pre.step("preflight");
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
     std::fs::create_dir_all(p.out_dir).ok();
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
@@ -181,6 +185,7 @@ pub fn run(p: RunParams) -> Result<()> {
     // that records an adapted precursor table under the same logical name wins, exactly as
     // it did when this record was inserted first and then overwritten (end of `run`).
     let mut library_input_records: Vec<LibraryInputRecord> = Vec::new();
+    pre.step("provenance");
 
     // A FASTA build may leave DeepLC to the multi-head calibration, which re-predicts every
     // row before anything reads the iRT (`predict_frag.defer_deeplc_to_multihead`).
@@ -222,6 +227,7 @@ pub fn run(p: RunParams) -> Result<()> {
             // FASTA is present in this branch.
             let fasta = p.fasta.expect("preflight guarantees --fasta in build mode");
             let dig = d("peptides.parquet");
+            pre.first_stage("digest");
             let w = digest::run_hashed(digest::DigestParams {
                 fasta,
                 out: &dig,
@@ -302,6 +308,7 @@ pub fn run(p: RunParams) -> Result<()> {
         p.top_peaks_ms2,
         0
     ));
+    pre.first_stage("convert");
     info!(stage = %"convert", "run: stage start");
     let co = convert::run(convert::ConvertParams {
         mzml: p.mzml,

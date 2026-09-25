@@ -349,7 +349,10 @@ than a number. Both are recorded in every run's `manifest.json`.
   roles, paths, sizes and hashes. The single-run library-input records reuse that hash
   instead of reading the library again. Vendor inputs convert up to
   `convert.parallel_conversions` at once (default 4, `1` is the old serial loop); each
-  conversion keeps its own destination and lock, so the mzML files are unchanged.
+  conversion keeps its own destination and lock, so the mzML files are unchanged. Each
+  orchestrator logs one `pre-stage time` line when its first stage starts, splitting the
+  time since its entry into interpreter discovery, preflight, provenance and setup, and
+  giving the time since process start.
 - **Rescore's feature stream and its post-classifier tail do less.** The feature stream
   and compete's pass-through copy can read each row group's projected column chunks in
   one sequential read (the span cache, `MUMDIA_WIDE_SCAN=coalesced`), and the feature

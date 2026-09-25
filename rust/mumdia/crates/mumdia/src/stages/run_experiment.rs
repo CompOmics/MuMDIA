@@ -795,6 +795,8 @@ fn portable_dir_name_problem(name: &str) -> Option<&'static str> {
 
 pub fn run(p: RunExperimentParams) -> Result<()> {
     let t0 = Instant::now();
+    // The time from here to the first stage, by step (`prestage::PreStageTimer`).
+    let mut pre = crate::prestage::PreStageTimer::start("run-experiment");
     // Same contract as the single-run orchestrator, and it matters more here: an
     // 83-file batch must not fail on a missing interpreter after the first run has
     // already been searched.
@@ -802,12 +804,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     resolved.predict_frag.sidecar_script_dir =
         crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
     crate::python::resolve(&mut resolved)?;
+    pre.step("resolve_interpreters");
     let p = RunExperimentParams {
         config: &resolved,
         ..p
     };
     let cfg = p.config;
     preflight(&p)?;
+    pre.step("preflight");
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
     std::fs::create_dir_all(p.out_dir).ok();
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
@@ -840,6 +844,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         hash_order.push((format!("mzml[{i}]"), m.clone()));
     }
     let input_hashes = crate::prestage::InputHashes::spawn("run-experiment", hash_order);
+    pre.step("provenance");
     // Reject a bad --run-names rather than silently substituting r0..rN-1.
     //
     // The old `_ =>` arm swallowed any count mismatch with no warning, and accepted
@@ -891,6 +896,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         _ => {
             let fasta = p.fasta.expect("preflight guarantees --fasta in build mode");
             let dig = d("peptides.parquet");
+            pre.first_stage("digest");
             digest::run(digest::DigestParams {
                 fasta,
                 out: &dig,
@@ -927,6 +933,13 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         p.lib_precursors.is_some(),
         cfg.predict_frag.deeplc_python.is_some(),
     );
+    // Library-input mode: the next stage is the base-model re-prediction or the first
+    // run's conversion. A FASTA build logged at its digest already, and this is a no-op.
+    pre.first_stage(if library_irt_repredicted {
+        "deeplc-repredict"
+    } else {
+        "convert"
+    });
     let lib_p_base = if library_irt_repredicted {
         let python = cfg
             .predict_frag
