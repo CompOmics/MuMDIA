@@ -3,6 +3,7 @@
 //! lets integration tests drive stages directly (docs/01_overview_and_dataflow.md).
 
 pub mod calibrate;
+pub mod chromatograms;
 pub mod colread;
 pub mod fdr;
 pub mod groups;
