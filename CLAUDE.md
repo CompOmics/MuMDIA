@@ -719,7 +719,10 @@ sensitivity result for it.
   Precursor and fragment m/z of the FASTA library agree with the DIA-NN library to
   0.1 ppm on 3.66M shared keys, so this was intensity ranking, not mass. Library
   build for those 9.8M peptidoforms: DeepLC 19 min, MS2PIP 4.2.0 35-39 min at 32
-  processes (docs/13).
+  processes (docs/13). Since 2026-09-25 the two workers run at the same time, which
+  leaves the library byte-identical (`MUMDIA_PREDICT_FRAG_SERIAL=1` restores the
+  sequence), and `predict_frag.defer_deeplc_to_multihead` (opt-in) skips the DeepLC pass
+  when the multi-head calibration re-predicts every row anyway (docs/06).
 
 ## Changes that remain benchmark-gated
 

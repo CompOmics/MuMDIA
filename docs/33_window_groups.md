@@ -31,12 +31,16 @@ on.
 |---|---|---|
 | `window_groups` | `1` | Number of groups. `1` is the ordinary single-library search. Clamped to the number of distinct isolation windows; groups whose band selects no precursor are merged into a neighbour, so the number actually searched can be smaller (the log and `groups/plan.json` say how many). |
 | `calibration` | `global` | Whose seed anchors calibrate each group's retention time and mass: `global` pools every group's seeds first (section 4); `per_group` uses the group's own. |
+| `parallel` | `1` | Bands in flight at a time, through a bounded queue that starts the most expensive band first (section 8, "Scheduling the bands"). Clamped below the thread count. |
+| `rt_adaptation` | `per_band` | `once_per_run` adapts the library's retention times in one DeepLC worker per run over the union of the bands, under `global` calibration (section 4b). Float-equivalent, opt-in. |
+| `balance` | `precursors` | `cost` balances the cuts on precursors times MS2 peaks per window instead (section 2). Output-changing, opt-in. |
+| `delete_band_intermediates` | `false` | Delete each band's `psms_extracted` and `features` tables once the pool is written (section 6). Disk only. |
 
-`run-experiment` (and `run` with several `--mzml`, which dispatches to it) refuses a
-grouped configuration rather than searching each run against the whole library while the
-key says otherwise. Run each file with `mumdia run --mzml <one file>` and pool the competed
-tables with `mumdia rescore --competed a b c`, which stamps `source` and computes the
-per-source `run_psm_q` (`docs/11_compete_rescore_fdr.md`).
+`run-experiment` (and `run` with several `--mzml`, which dispatches to it) searches every run
+grouped, with one experiment-wide rescore over the pooled competed tables and the
+per-source `run_psm_q` (`docs/11_compete_rescore_fdr.md`). Under
+`experiment.rt_library_scope = first_run_only` the runs after the first reuse the first
+run's adapted bands (section 3).
 
 ## 2. Planning the groups
 
@@ -55,7 +59,7 @@ peak the largest band's, not the average's.
 `groups.balance = cost` (default `precursors`) balances the cuts on an estimate of the search
 cost instead: per window, the precursors it selects times the MS2 peaks its scans carry
 (`groups::window_costs`; the run's MS2 is decoded before the plan for this, and for the
-dispatch order of section 3). Band cost follows spectral density more than precursor count:
+dispatch order, section 8). Band cost follows spectral density more than precursor count:
 on the immunopeptidomics search two bands of 2.98M and 3.03M precursors took 42 s and 460 s,
 and at 81-94 bands the slowest single windows (418-460 s) set the floor of the run. The
 bands' `est_precursors` and the merge of empty bands are unchanged, and `plan.json` records
@@ -774,14 +778,20 @@ candidates into the scored table. How much of that this fix returns is not yet m
 
 ## 10. What is not there yet
 
-- Groups run one after another in one process. Running them as child processes in parallel
-  is the next step and needs nothing in the artifacts: the band directories are already
-  independent, and the pool reads whatever is there.
+- Bands run in one process, `groups.parallel` at a time through the bounded queue. Running
+  them as child processes is still open and needs nothing in the artifacts: the band
+  directories are already independent, and the pool reads whatever is there.
 - Choosing `window_groups` from a memory budget rather than by hand. The plan's
   `est_precursors` per band and the measured bytes per precursor of extract are what it
   would use.
-- `run-experiment`: per-run grouped search with the pooled `rescore --competed` and the
-  per-source `run_psm_q` it already provides.
+- Measurements at scale of the 2026-09-25 changes: the band queue and the chunked seed
+  (per-band wall times on the immunopeptidomics or HYE banded arms), `rt_adaptation =
+  once_per_run` and `balance = cost` (peptides at 1% inside the seed spread on two
+  acquisitions), and the projection cache (`rt_im_train.deeplc_projection_cache`) under
+  `rt_library_scope = per_run`. The fixture runs pin their output effect, not their gain.
+- `experiment.overlap_front_threads` overlaps the convert and seed of runs 2..N with the
+  first run's adaptation only for ungrouped runs; a grouped run seeds inside its band loop,
+  so overlapping it would need the band loop split between runs.
 - Entrapment validation. The grouped search computes the same scores from the same
   evidence, and the fixture shows identical identifications within tie noise, but the
   policy in `docs/20` asks for an empirical null on two acquisitions before any default
