@@ -774,7 +774,7 @@ fn sweep_stale_partials(out_dir: &Path, out: &Path) {
 /// and did so one after another, so an experiment of N vendor files paid N converter
 /// runs of several minutes each before any search began (perf survey critic item 4).
 /// Each conversion is its own child process writing its own destination under its own
-/// [`ConvertLock`], so running several at once changes nothing but the wall time: the
+/// conversion lock, so running several at once changes nothing but the wall time: the
 /// returned paths, and the files behind them, are what the serial loop produced. An
 /// mzML input passes through without taking a slot.
 ///
