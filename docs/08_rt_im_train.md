@@ -553,6 +553,22 @@ accumulates. The fine-tune's measured cost of sharing is the guide until the mul
 equivalent is measured: +47% median RT residual across five reusing runs, monotonic in
 acquisition order.
 
+While the first run adapts the library, the others have nothing to wait for until
+rt-im-train: they convert their spectra and seed on the base library, and the seed is
+iRT-independent. `experiment.overlap_front_threads = N` (default `0`, off) runs those
+fronts, convert and seed of runs 2..N, on a pool of `N` threads while the first run's DeepLC
+worker gets the remaining `threads - N`, and every run's rest follows once the first has
+finished (`run_experiment::convert_run`, `seed_run`, `adapt_rt_library`, `finish_run`). On
+the six-file HYE Astral experiment a front is convert 1.9-2.5 min plus seed 0.4 min, against
+a first-run multi-head step of 11.7 min. Ungrouped runs only: a grouped run seeds per band
+inside its band loop. The fronts are byte-identical; the first run's DeepLC predicts on
+`threads - N` torch threads, which moves the adapted library in the last bits unless the
+DeepLC thread cap binds both counts to one number. Measured on the fixture (three runs,
+multi-head 80, DeepLC 4.5.0 on CPU, 4 threads): with the cap at 2 on both sides every artifact
+of the overlapped experiment equals the sequential one byte for byte; without the cap the
+first run's library moved in the last bits and the scored tables with it. Opt-in; not
+measured at scale.
+
 The fine-tune has the same shape, which is what `experiment.finetune_scope`
 exists to amortise, and multi-head cannot share by construction. Since every AIF run chose
 the same head, a shared-selection variant is worth measuring before that cost is made

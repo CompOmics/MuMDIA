@@ -1914,6 +1914,27 @@ pub struct ExperimentConfig {
     /// does a long batch where drift accumulates (see the measured cost above).
     #[serde(alias = "finetune_scope")]
     pub rt_library_scope: RtLibraryScope,
+    /// Threads given to converting and seeding runs 2..N while run 1 adapts the library's
+    /// retention times, under `rt_library_scope = first_run_only`. `0` (the default) runs
+    /// them after run 1, as before.
+    ///
+    /// Runs 2..N convert their spectra and seed on the base library (the seed is
+    /// iRT-independent), so nothing of theirs waits for run 1's adapted library until
+    /// rt-im-train. Set to `N`, those fronts run on a pool of `N` threads while run 1's
+    /// DeepLC sidecar gets the remaining `threads - N` (disjoint budgets), and every run's
+    /// rest follows once run 1 has finished. On the six-file HYE Astral experiment a
+    /// front is convert 1.9-2.5 min plus seed 0.4 min per file, against a first-run
+    /// multi-head step of 11.7 min, so up to about 12 minutes of fronts fit behind it.
+    ///
+    /// Ungrouped runs only: a grouped run seeds per band inside its band loop, and its
+    /// adaptation sits between those band seeds and its extract. The fronts' outputs are
+    /// byte-identical; run 1's DeepLC predicts on `threads - N` torch threads instead of
+    /// `threads`, which moves the adapted library in the last bits unless the DeepLC thread
+    /// cap binds both counts to the same number (on an SMT host with `N` below the
+    /// logical-minus-physical core count it does). Float-equivalent, hence opt-in. The
+    /// fronts' seeds hold their library and fragment index beside the DeepLC worker, which
+    /// is where the experiment's peak can sit. Not measured at scale.
+    pub overlap_front_threads: usize,
 }
 
 impl Default for ExperimentConfig {
@@ -1921,6 +1942,7 @@ impl Default for ExperimentConfig {
         Self {
             parallel_runs: 1,
             rt_library_scope: RtLibraryScope::FirstRunOnly,
+            overlap_front_threads: 0,
         }
     }
 }

@@ -33,7 +33,7 @@
       "default_text": "0",
       "help": "",
       "gates": [],
-      "source_line": 2079
+      "source_line": 2101
     },
     {
       "path": "convert.thermo_raw_parser",
@@ -2444,6 +2444,19 @@
       ]
     },
     {
+      "path": "experiment.overlap_front_threads",
+      "name": "overlap_front_threads",
+      "section": "experiment",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 0,
+      "default_text": "0",
+      "help": "Threads given to converting and seeding runs 2..N while run 1 adapts the library's retention times, under `rt_library_scope = first_run_only`. `0` (the default) runs them after run 1, as before. Runs 2..N convert their spectra and seed on the base library (the seed is iRT-independent), so nothing of theirs waits for run 1's adapted library until rt-im-train. Set to `N`, those fronts run on a pool of `N` threads while run 1's DeepLC sidecar gets the remaining `threads - N` (disjoint budgets), and every run's rest follows once run 1 has finished. On the six-file HYE Astral experiment a front is convert 1.9-2.5 min plus seed 0.4 min per file, against a first-run multi-head step of 11.7 min, so up to about 12 minutes of fronts fit behind it. Ungrouped runs only: a grouped run seeds per band inside its band loop, and its adaptation sits between those band seeds and its extract. The fronts' outputs are byte-identical; run 1's DeepLC predicts on `threads - N` torch threads instead of `threads`, which moves the adapted library in the last bits unless the DeepLC thread cap binds both counts to the same number (on an SMT host with `N` below the logical-minus-physical core count it does). Float-equivalent, hence opt-in. The fronts' seeds hold their library and fragment index beside the DeepLC worker, which is where the experiment's peak can sit. Not measured at scale.",
+      "gates": [],
+      "source_line": 1937
+    },
+    {
       "path": "groups.window_groups",
       "name": "window_groups",
       "section": "groups",
@@ -2454,7 +2467,7 @@
       "default_text": "1",
       "help": "Number of window groups. `1` (the default) is the ordinary single-library search. Groups are contiguous bands of isolation windows balanced by the number of library precursors they select, read from the precursor table's row-group statistics.",
       "gates": [],
-      "source_line": 1989
+      "source_line": 2011
     },
     {
       "path": "groups.calibration",
@@ -2467,7 +2480,7 @@
       "default_text": "`global`",
       "help": "Anchors for the RT calibration of each group; see `GroupCalibration`.",
       "gates": [],
-      "source_line": 1991,
+      "source_line": 2013,
       "choices": [
         "global",
         "per_group"
@@ -2484,7 +2497,7 @@
       "default_text": "1",
       "help": "Bands searched at the same time inside one run. `1` (the default) is one band at a time, which is what bounds the memory: each band in flight holds its own extraction working set, so the peak is this many bands' worth. Raise it to fill a large machine, after checking one band's peak RSS: on a 203M-precursor library at 63 bands the largest band took 39 GB and the median far less. Results do not depend on it; bands are independent and their artifacts are pooled in band order either way. The bands go through a bounded queue: this many workers each take the next band as soon as their current one is done, most expensive first (estimated precursors times MS2 peaks of the band's windows for the seed and extract, accepted rows for features and compete), rather than in fixed chunks that waited for their slowest band. It must stay below the thread count: a band in flight parks one worker on its accumulation channel, so as many bands as there are threads leaves nothing to do the probing and the run deadlocks. A larger value is clamped to `threads - 1` with a warning rather than hanging.",
       "gates": [],
-      "source_line": 2008
+      "source_line": 2030
     },
     {
       "path": "groups.rt_adaptation",
@@ -2497,7 +2510,7 @@
       "default_text": "`per_band`",
       "help": "How often the library's retention times are adapted under `calibration = global`: `per_band` (the default) runs one DeepLC sidecar per band, `once_per_run` one per run over the union of the bands. `per_group` calibration always adapts per band. Each per-band sidecar starts an interpreter, imports torch and DeepLC, reads the pooled seed, refits the same heads on the same anchors (head 2503 in every band of the HYE sweep) and predicts every sequence of its band, so a sequence whose charge states fall in two bands is predicted twice (10.9M HYE rows are 4.91M unique sequences). On HYE Astral the multi-head step took about 13 min unbanded and 19-24 min at 2-16 bands. `once_per_run` fits once, predicts the union once and writes each band's table under the name a per-band run gives it (`groups/gNN/lib_precursors_multihead.parquet` or `lib_precursors_deeplc.parquet`), so the shared-band reuse of later runs and the seed refresh are unchanged. Under `run-experiment` with the multi-head calibration off, the library is re-predicted once for the experiment, and the bands then keep those values instead of each band of each run re-predicting them. Float-equivalent, not bit-identical: a sequence is predicted in different company, and torch's CPU kernels round by batch. On a synthetic library, one call over contiguous bands writes exactly the whole-library column band by band (`tests/python/test_deeplc_predict.py`). Validate on two acquisitions (peptides at 1% inside the seed spread, the per-band max |delta predicted_irt| and the selected heads) before defaulting it on.",
       "gates": [],
-      "source_line": 2032,
+      "source_line": 2054,
       "choices": [
         "per_band",
         "once_per_run"
@@ -2514,7 +2527,7 @@
       "default_text": "`precursors`",
       "help": "What the band plan balances: `precursors` (the default), the estimated library precursors per band, or `cost`, per window the precursors it selects times the MS2 peaks of its scans. Band cost follows spectral density more than precursor count: on the immunopeptidomics search two bands of 2.98M and 3.03M precursors took 42 s and 460 s, and at 81-94 bands the slowest windows (418-460 s) set the floor of the run. The queue already starts the most expensive bands first whatever this says; `cost` also moves the cuts, so that no band is several times the work of the others. Output-changing, hence opt-in: the cuts decide which candidates sit at a band edge, which the overlap deduplication and the edge candidates' neighbours depend on, and the pooled row order the classifier sees. Validate like a band-count change (docs/33 section 8): peptides at 1% inside the seed spread against `precursors`, and the per-band wall times, on two acquisitions. Note that the MS2 is decoded before the plan under either setting.",
       "gates": [],
-      "source_line": 2049,
+      "source_line": 2071,
       "choices": [
         "precursors",
         "cost"
@@ -2531,7 +2544,7 @@
       "default_text": "false",
       "help": "Delete each band's `psms_extracted.parquet` and `features.parquet` (with their reports and schema companions, and `run.pin` where one was written) once the pool is written. Default `false`. Disk only: no stage reads them after pooling. The features are carried by the competed table and the extracted table's one reader, the candidate audit, reads the pooled copy. On the immunopeptidomics runs the band features alone were 55 GB per run, in an experiment that wrote about 2.7 TB of artifacts. The manifest keeps their records, and the band directories can no longer be re-featured; the chromatograms and competed tables that `mumdia pool --groups-dir` re-pools from are kept.",
       "gates": [],
-      "source_line": 2059
+      "source_line": 2081
     }
   ],
   "list_sections": [
