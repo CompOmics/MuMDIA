@@ -102,18 +102,28 @@ feature table, and the streaming memmap backend, which must also delete its
 targets outscore decoys (so the scores are aligned to the rows), a single-class
 PIN exits nonzero, and an unknown `MUMDIA_NN_FEATURES` name aborts.
 
-The worker's default-path speed-ups must not move a score: the worker is run with
+The worker's default-path speed-ups must not move a score. The worker is run with
 every switch back to the replaced code (`MUMDIA_NN_FINAL_POOL_SCORE=1`,
 `MUMDIA_NN_GATHER=numpy`, `MUMDIA_NN_SCAN_THREADS=1`, `MUMDIA_NN_LOAD_THREADS=0`,
-`MUMDIA_NN_SELECT=full`) and with the defaults, and the score bytes must be equal, on
-a pool with several row groups, non-finite cells, a float64 overflow column, nulls,
-ties and a constant column, for the in-memory and the streaming backend.
-`MUMDIA_NN_PARALLEL` must give the same bytes for one and three processes, and neither
-it nor a failing run may leave the memmap or its side arrays behind. Without torch:
-the threaded load reproduces the serial loop's matrix, moments, mean and std bytes;
-the threaded init scan returns the serial (column, sign, count); `desc_order` equals
-the stable descending argsort (ties, +-0.0, infinities, subnormals, signed NaN); and
-the windowed positive selection equals the full `tda_q` selection or declines.
+`MUMDIA_NN_SELECT=full`) and with the defaults, for the in-memory and the streaming
+backend; and the worker as it was before those changes, extracted with `git show`
+from `REFERENCE_COMMIT`, is run against the current one, for the in-memory,
+streaming and TSV paths (skipped when the clone lacks that commit). The score bytes
+must be equal, on a pool with several row groups, non-finite cells, a float64
+overflow column, nulls, ties, a constant column and subnormal cells, and the default
+arm must run the threaded init scan (`MUMDIA_NN_SCAN_ROWS_PER_THREAD=500`). These are
+comparisons on one host, not committed hashes, so they hold on any CPU. When a later
+change moves the default scores on purpose, move `REFERENCE_COMMIT` to the commit that
+made it. Under flush-to-zero the threaded fill, standardisation and init scan must
+match the serial code on inputs where the thread state decides the bytes.
+`MUMDIA_NN_PARALLEL` must give the same bytes for one and three processes, for all three paths, and neither it nor a failing
+run may leave the memmap or its side arrays behind; a failing child's log must reach
+the worker's stderr. Without torch: the threaded load reproduces the serial loop's
+matrix, moments, mean and std bytes, and a single-threaded load releases its moment
+buffer; the threaded init scan returns the serial (column, sign, count), and its
+thread count respects the row and memory caps; `desc_order` equals the stable
+descending argsort (ties, +-0.0, infinities, subnormals, signed NaN); and the windowed
+positive selection equals the full `tda_q` selection or declines.
 
 ### `test_mokapot_worker.py` (needs mokapot)
 

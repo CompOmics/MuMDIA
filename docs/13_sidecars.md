@@ -800,11 +800,25 @@ MLP. Set it explicitly for the logreg path.
     5M-decoy order. The worker prints how many selections used the window. `full`
     restores the full sort everywhere.
   - Pool threads get the main thread's flush-to-zero state through their
-    initializer, because a thread started on Windows does not inherit it.
+    initializer, because a thread started on Windows does not inherit it. Without it,
+    measured on Windows, a fill thread narrows a float64 value that is subnormal in
+    float32 to that subnormal where the main thread gives 0.0, and a scan thread ranks
+    a float32 subnormal above 0.0 where the main thread ties them.
 
-  `test_default_speedups_leave_scores_byte_identical` (`tests/python`, needs torch)
-  runs the worker with every switch set back and with the defaults and asserts equal
-  score bytes, for the in-memory and the streaming backend.
+  Three tests in `tests/python` (they need torch) hold the default path to the old
+  scores on the host that runs them. `test_default_speedups_leave_scores_byte_identical`
+  runs the worker with every switch set back and with the defaults, for the in-memory
+  and the streaming backend. `test_default_path_scores_as_the_reference_worker` runs the
+  worker as it was before these changes (extracted with `git show` from
+  `REFERENCE_COMMIT`, skipped without the history) against the current one, for the
+  in-memory, streaming and TSV paths, which also covers the refactors that have no
+  switch (the training loop moved into `_build_trainer`, the `_entry` wrapper). Both use
+  a pool with several row groups, non-finite and subnormal cells, nulls and ties, and
+  make the default arm run the threaded init scan. `test_thread_pools_compute_under_the_main_threads_flush_to_zero`
+  compares the threaded fill, standardisation and scan with the serial code under
+  flush-to-zero, on inputs where the thread state decides the bytes. When a later
+  change moves the default scores on purpose, `REFERENCE_COMMIT` is moved to the
+  commit that made it.
 - **Concurrent fold training is opt-in** (`MUMDIA_NN_PARALLEL`, default 0). The folds,
   and the seeds when `MUMDIA_NN_SEEDS > 1`, train one after another on at most 16
   threads, while the MLP does not get faster past 16 (8 on an EPYC 9354), so most of a
