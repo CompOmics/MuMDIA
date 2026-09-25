@@ -1833,9 +1833,10 @@ def main():
         else max(1, int(float(_scan_raw)))
     )
     # The two caps on those threads: sample rows per thread, and the transient memory the
-    # tasks in flight may hold together (see `scan_workers`).
-    SCAN_ROWS_PER_THREAD = max(1, env_i("MUMDIA_NN_SCAN_ROWS_PER_THREAD", _SCAN_ROWS_PER_THREAD))
-    SCAN_MEM_BYTES = int(env_f("MUMDIA_NN_SCAN_MEM_GB", _SCAN_MEM_BYTES / 1024 ** 3) * 1024 ** 3)
+    # tasks in flight may hold together (see `scan_workers`). The defaults are those of
+    # `_SCAN_ROWS_PER_THREAD` and `_SCAN_MEM_BYTES`, written out for the config reference.
+    SCAN_ROWS_PER_THREAD = max(1, env_i("MUMDIA_NN_SCAN_ROWS_PER_THREAD", 20000))
+    SCAN_MEM_BYTES = int(env_f("MUMDIA_NN_SCAN_MEM_GB", 1.0) * 1024 ** 3)
 
     stream_env = os.environ.get("MUMDIA_NN_STREAM", "auto").lower()
     filesize = os.path.getsize(pin_path)
