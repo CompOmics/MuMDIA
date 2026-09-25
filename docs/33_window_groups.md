@@ -486,6 +486,14 @@ hardware and single-threaded: 110% CPU throughout. The spliced output holds the 
 the same order with the same values; its row groups are the bands' own, so it is not
 byte-identical to a re-encoded pool.
 
+Under `extract.chromatogram_schema = 2` the band chromatogram tables are v2
+(docs/15_data_dictionary.md, "Layout v2"), and every band of a run has the same layout,
+since the splice refuses a band whose columns differ. A v2 row group decodes on its own,
+so splicing whole groups keeps the pooled table readable. The groups the pool decodes
+and filters are written back as one group each, whatever their size: the filter drops
+whole candidates, which keeps every surviving candidate's axis row, while a split would
+leave the rows after it without one.
+
 `mumdia pool --groups-dir <run>/groups` runs the same stage standalone, which is how those
 numbers were taken, and is what to reach for when a grouped search finished but the run did
 not: the band directories hold everything, and pooling them is a copy. The feature and competed schema companions

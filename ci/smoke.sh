@@ -283,6 +283,93 @@ print("    ok: 2 bands, %d calibrant deviations, frag_tol_ppm %.6g, as ungrouped
       % (two["n_dev"], float(two["frag_tol_ppm"])))
 PYEOF
 
+# 4e. The chromatogram v2 layout (`extract.chromatogram_schema = 2`, docs/15 "Layout v2"):
+#     the RT axis once per candidate per row group, each trace trimmed to its nonzero run.
+#     Every reader rebuilds the v1 rows from it, so every table after extract must be the
+#     v1 run's in `$work/out`, byte for byte, while the chromatogram table says schema 2.
+#     A second v2 run puts a row-group seam at EVERY row (`MUMDIA_CHROM_ROW_GROUP_ROWS=1`,
+#     a test knob that moves only the seams), so no row may take its axis from another
+#     row and every read that starts at a seam must still find one; the same bytes again.
+#     Then the grouped run of 4c under v2, pooled and per band: the pool splices v2 band
+#     tables (re-encoding the groups that hold an overlap loser) and quant reads either.
+echo "=== smoke: chromatograms v2 leave every downstream table byte-identical"
+"$PY" - "$cfg" "$work/chrom_v2.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1], encoding="utf-8"))
+c.setdefault("extract", {})["chromatogram_schema"] = 2
+json.dump(c, open(sys.argv[2], "w", encoding="utf-8"), indent=2)
+PYEOF
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_chrom_v2" --config "$work/chrom_v2.json" --threads 2 \
+    > "$work/chrom_v2.log" 2>&1 \
+    || { tail -30 "$work/chrom_v2.log"; echo "the chromatograms v2 run failed"; exit 1; }
+MUMDIA_CHROM_ROW_GROUP_ROWS=1 "$BIN" run --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --out-dir "$work/out_chrom_v2_rg1" \
+    --config "$work/chrom_v2.json" --threads 2 > "$work/chrom_v2_rg1.log" 2>&1 \
+    || { tail -30 "$work/chrom_v2_rg1.log"; echo "the v2 run with a seam at every row failed"; exit 1; }
+grep -q 'chromatogram row groups resized' "$work/chrom_v2_rg1.log" \
+    || { echo "MUMDIA_CHROM_ROW_GROUP_ROWS did not reach extract"; exit 1; }
+for d in out_chrom_v2 out_chrom_v2_rg1; do
+    for f in psms_extracted.parquet features.parquet psms_competed.parquet psms_scored.parquet \
+             peptide_quant.parquet protein_group_quant.parquet fragment_quant.parquet \
+             peptides.tsv proteins.tsv; do
+        cmp -s "$work/out/$f" "$work/$d/$f" \
+            || { echo "chromatograms v2 ($d) changed $f"; exit 1; }
+    done
+done
+"$PY" - "$work/grouped.json" "$work/grouped_v2.json" "$work/grouped_nopool_v2.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1], encoding="utf-8"))
+c.setdefault("extract", {})["chromatogram_schema"] = 2
+json.dump(c, open(sys.argv[2], "w", encoding="utf-8"), indent=2)
+c["groups"]["pool_chromatograms"] = False
+json.dump(c, open(sys.argv[3], "w", encoding="utf-8"), indent=2)
+PYEOF
+for arm in grouped_v2 grouped_nopool_v2; do
+    "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+        --out-dir "$work/out_$arm" --config "$work/$arm.json" --threads 4 \
+        > "$work/$arm.log" 2>&1 \
+        || { tail -30 "$work/$arm.log"; echo "the grouped chromatograms v2 run ($arm) failed"; exit 1; }
+    for f in psms_scored.parquet peptide_quant.parquet protein_group_quant.parquet \
+             fragment_quant.parquet peptides.tsv proteins.tsv; do
+        cmp -s "$work/out_grouped/$f" "$work/out_$arm/$f" \
+            || { echo "chromatograms v2 changed $f of the grouped run ($arm)"; exit 1; }
+    done
+done
+"$PY" - "$work" <<'PYEOF'
+import json, os, sys
+import pyarrow.parquet as pq
+work = sys.argv[1]
+def rec(d):
+    m = json.load(open(os.path.join(work, d, "manifest.json"), encoding="utf-8"))
+    return m["artifacts"]["chromatograms"]
+def check(ok, what):
+    if not ok:
+        sys.exit("chromatograms v2: " + what)
+v1 = os.path.join(work, "out", "chromatograms.parquet")
+v2 = os.path.join(work, "out_chrom_v2", "chromatograms.parquet")
+rg1 = os.path.join(work, "out_chrom_v2_rg1", "chromatograms.parquet")
+check(rec("out")["schema_version"] == 1, "the default run no longer records schema 1")
+for d in ("out_chrom_v2", "out_chrom_v2_rg1", "out_grouped_v2"):
+    check(rec(d)["schema_version"] == 2, f"{d} does not record chromatograms schema 2")
+f1, f2, fr = pq.ParquetFile(v1), pq.ParquetFile(v2), pq.ParquetFile(rg1)
+names = lambda f: f.schema_arrow.names
+check("trace_len" not in names(f1), "the default table has v2 columns")
+check({"trace_offset", "trace_len"} <= set(names(f2)), "the v2 table lacks its trace columns")
+check(f1.metadata.num_rows == f2.metadata.num_rows == fr.metadata.num_rows,
+      "the layouts hold different row counts")
+check(all(fr.metadata.row_group(i).num_rows == 1 for i in range(fr.metadata.num_row_groups)),
+      "MUMDIA_CHROM_ROW_GROUP_ROWS=1 did not put a seam at every row")
+t1 = pq.read_table(v1, columns=["rt", "intensity"])
+t2 = pq.read_table(v2, columns=["rt", "intensity"])
+vals = lambda t, c: sum(len(x) for x in t.column(c).to_pylist())
+s1, s2 = os.path.getsize(v1), os.path.getsize(v2)
+print("    ok: %d rows; rt values %d -> %d, intensity values %d -> %d; %d -> %d bytes (%.1f%% smaller)"
+      % (f1.metadata.num_rows, vals(t1, "rt"), vals(t2, "rt"), vals(t1, "intensity"),
+         vals(t2, "intensity"), s1, s2, 100.0 * (1 - s2 / s1)))
+PYEOF
+echo "    ok: every table after extract byte-identical to v1, ungrouped (default seams and a seam at every row) and grouped (pooled and per band)"
+
 # 5. The multi-run orchestrator. Nothing tested it: `run-experiment` has a pooled
 #    rescore, a by-source split, per-run quant and a cross-run LFQ that the
 #    single-run path never reaches, and a split that drops rows produces plausible

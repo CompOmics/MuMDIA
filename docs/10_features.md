@@ -70,6 +70,16 @@ optional; falls back to `frag_mz`), `predicted_intensity` (f32), `rt`
 `ms1_` are routed to a separate `ms1x` map and fed to the MS1 XIC evidence;
 all others are the fragment chromatograms.
 
+Either chromatogram layout is read (docs/15_data_dictionary.md, "Layout v2").
+`ChromStream` passes every v2 row through a `chromatograms::Decoder` before the row
+is stored, so a chunk holds exactly the v1 rows and every feature is the same. The
+main pass starts each chunk at a candidate's first row, where the decoder needs
+nothing earlier. The confident-bounds pass reads sub-chunks on the absolute
+`chunk_rows` grid, which can start inside a row group and inside a candidate. There
+`ChromStream::open_at` opens the table at that row group's first row and follows the
+rows before the sub-chunk through the decoder without keeping them, so the samples
+are v1's in order, bit for bit.
+
 ### Consumed: seed PSMs (optional, `features.rs:620`-`652`)
 
 `candidate_id` (u32), `score` (f64), `spectrum_q` (f64), `label` (str). Builds

@@ -198,6 +198,26 @@ chromatograms that is 12.0% smaller than the planned dictionary (160.9 against
 planned encodings (docs/03_io_layer.md, "Float encodings planned from the first
 rows").
 
+`extract.chromatogram_schema = 2` (default 1) writes the same rows in the v2
+layout (docs/15_data_dictionary.md, "Layout v2"): each candidate's axis once per
+row group, each intensity trace from its first to its last nonzero value, and
+`trace_offset` / `trace_len` to rebuild it. Every row passes through one
+`chromatograms::Encoder` in table order. The encoder counts rows to know where each
+row group starts, so it and the writer take the row-group size from one place
+(`chromatograms::row_group_rows`). The report and the run manifest record schema
+version 2. Every table downstream of extract (features, competed, scored, quant) is
+byte-identical to the v1 run's; only the chromatogram table and its content hash
+change. It is opt-in because a reader outside the engine that expects a full axis on
+every row would misread a v2 table; `mumdia::chromatograms::rewrite` converts one.
+
+To validate v2 on a new dataset, run the same configuration twice, once with
+`extract.chromatogram_schema = 2`, and compare `features.parquet`,
+`psms_competed.parquet`, `psms_scored.parquet` and the three quant tables with `cmp`.
+`ci/smoke.sh` (arm 4e) does this on the fixture, ungrouped and grouped, and once more
+with `MUMDIA_CHROM_ROW_GROUP_ROWS=1`. That environment variable is a test knob: it
+sets the rows per chromatogram row group (default 65,536), which moves the seams of the
+table and nothing downstream, so at 1 every row is its own group.
+
 ### Output: top-K peaks sidecar (`<out_psms>.peaks.parquet`)
 
 Written only when `retain_top_peaks > 1` produced rows (`extract.rs:2544`), one

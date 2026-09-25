@@ -60,7 +60,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`predict_frag`](#predict_frag) | `PredictFragConfig` | 14 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
 | [`search_seed`](#search_seed) | `SearchSeedConfig` | 8 | [docs/07_search_seed.md](07_search_seed.md) |
 | [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 19 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
-| [`extract`](#extract) | `ExtractConfig` | 36 | [docs/09_extract.md](09_extract.md) |
+| [`extract`](#extract) | `ExtractConfig` | 37 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
 | [`features`](#features) | `FeaturesConfig` | 11 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
@@ -241,6 +241,7 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 | `apex_count_window` | `usize` | `1` |  | Rolling-window width (in scan groups, centered, odd) for the distinct- fragment count that drives apex selection. Low-intensity fragments flicker in and out scan-to-scan; a single-scan count then spikes at noise scans and misplaces the apex. This sums the per-scan distinct-fragment count over a centered window so the apex lands in the region of *sustained* fragment presence, not an isolated flicker. A sum (not a mean) is used deliberately: edge truncation makes interior positions accumulate more, center-weighting the apex toward the RT-window centre (~= predicted RT) as a mild RT-prior; measured to beat a mean by ~+300 IDs on AIF. 1 = no smoothing (per-scan). |
 | `apex_gaussian_sigma_scans` | `f64` | `0.0` | benchmark-gated | Gaussian matched-filter smoothing of the per-scan fragment-count series before apex selection, as a sigma in scan units. 0.0 (default) keeps the `apex_count_window` rolling-sum smoother unchanged. When > 0, the count series is convolved with a Gaussian kernel (radius = 3*sigma) instead, which localizes the apex more robustly than a uniform window against scan-to-scan flicker. Opt-in and benchmark-gated: it changes apex selection and therefore identifications. |
 | `emit_window_grid` | `bool` | `true` |  | Emit per-fragment chromatograms on the FULL isolation-window scan grid with 0.0 where a fragment is absent (aggregating scans of the same isolation window), so the elution profile drops to zero between peaks and the features-stage boundary calling is not misled by interpolated gaps. |
+| `chromatogram_schema` | `u32` | `1` |  | On-disk layout of `chromatograms.parquet` (docs/15_data_dictionary.md). `1`, the default, stores every row's retention-time axis and its whole trace, zero-filled over the candidate's window in window-grid mode. `2` stores the axis once per candidate per parquet row group and each trace from its first to its last nonzero value, with two extra columns (`trace_offset`, `trace_len`) that rebuild it. Every reader (features, quant, the pool) accepts both layouts and rebuilds the same rows bit for bit, so every table downstream of extract is byte-identical; only the chromatogram table changes (smaller, with a different content hash). Opt-in because a reader outside the engine that expects one full axis per row would misread a v2 table; `mumdia::chromatograms::rewrite` converts a table between the layouts. The pool splices band tables of one layout only, so all bands of a grouped run share it. |
 | `bucket_size` | `usize` | `8192` |  | m/z bucket size (power of two). |
 | `peak_claim` | `PeakClaim` | `none` |  | How a shared observed peak's intensity is apportioned among co-isolated, co-eluting candidates that all match it (see `PeakClaim`). |
 | `claim_cues` | `ClaimCues` | the `ClaimCues` section's own defaults |  | Composable claim-weight cues for `PeakClaim::CoelutionMultiCue` (modular fragment-competition framework). All default off (weight 1.0). |
@@ -781,6 +782,7 @@ moves to another function.
 | `CONDA_PREFIX` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `DEEPLC_FT_THREADS` | sidecar | `"8"` | `scripts/deeplc_finetune.py::<module>` |
 | `MUMDIA_BREW_ITERS` | sidecar | `"20"` | `scripts/mokapot_worker.py::make_model` |
+| `MUMDIA_CHROM_ROW_GROUP_ROWS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/chromatograms.rs::row_group_rows` |
 | `MUMDIA_CONVERT_THREADS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/convert.rs::convert_threads` |
 | `MUMDIA_DEEPLC_RAW_OUTPUT` | sidecar | `""` | `scripts/deeplc_finetune.py::quiet_deeplc_progress`, `scripts/deeplc_worker.py::quiet_deeplc_progress` |
 | `MUMDIA_DEEPLC_THREAD_CAP` | sidecar | `"auto"` | `scripts/deeplc_finetune.py::deeplc_thread_cap`, `scripts/deeplc_worker.py::deeplc_thread_cap` |
@@ -868,7 +870,7 @@ moves to another function.
 | `ProgramFiles(x86)` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate_msconvert` |
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 
-89 variables are read: 27 engine-side, 65 sidecar-side, 3 on both sides.
+90 variables are read: 28 engine-side, 65 sidecar-side, 3 on both sides.
 
 ### Variables the code sets
 
@@ -921,6 +923,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-19 structs and 203 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 27 enumerations, 1 named profile(s), 89 environment variables read and 19 set.
+19 structs and 204 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 27 enumerations, 1 named profile(s), 90 environment variables read and 19 set.
 
 20 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

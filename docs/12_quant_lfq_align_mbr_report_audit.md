@@ -251,6 +251,16 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    `selective_read_on_a_real_artifact` prints, for a real table and scored table,
    how many pages hold an accepted row and both load times.
 
+   Both chromatogram layouts are read (docs/15_data_dictionary.md, "Layout v2"). Every
+   span quant reads is a whole file or whole row groups, and a v2 span is decoded from
+   its first row by a `chromatograms::Decoder` of its own, in the single pass and in the
+   page-selective read, which reads `trace_offset` and `trace_len` under the same
+   selection as the other columns. Only kept rows are decoded. That is enough because a
+   candidate is kept or dropped whole, so a kept candidate's rows in a row group include
+   the row that carries its axis. MS1 rows are checked and followed but not rebuilt,
+   since quant drops them. The store is the v1 table's, axis ids included, so every
+   output is byte-identical.
+
    A run's chromatograms can be several tables (`QuantParams::chromatograms`, a list of
    `ChromTable`): a grouped run under `groups.pool_chromatograms = false` hands quant its
    bands' tables in band order, each with the overlap losers it does not contribute

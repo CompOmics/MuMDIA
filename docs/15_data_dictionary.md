@@ -285,6 +285,55 @@ grid are available.
 `rt`/`intensity` use `LargeList` (64-bit offsets) because the total list-value
 count can exceed the 32-bit `ListArray` offset ceiling on large candidate sets.
 
+The table above is schema version 1, the default. Version 2 is the layout below.
+
+#### Layout v2 (`extract.chromatogram_schema = 2`)
+
+Schema version 2 holds the same rows in the same order, with two more columns, and
+is written only under `extract.chromatogram_schema = 2`. Every reader in the engine
+(features, quant, the pool) accepts both layouts and tells them apart by these
+columns (`mumdia::chromatograms::Layout::of`).
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `trace_offset` | UInt32 | no | points | position in the full trace of the first stored `intensity` value |
+| `trace_len` | UInt32 | no | points | length of the full trace; 0 for a never-observed transition |
+
+In v2, `intensity` holds the full trace from its first to its last value that is not
+`+0.0`. The comparison is on the bit pattern, so a `-0.0` or a NaN is stored as a
+value. Every other point of the full trace is `+0.0`, and a trace that is `+0.0`
+throughout stores no value. `rt` holds a row's axis only where no earlier row can
+supply it: an observed row writes its axis unless the last row that wrote an axis in
+the same parquet row group belongs to the same candidate and wrote the same bit
+patterns. Then it writes an empty `rt` and uses that axis. In window-grid mode this is
+one axis per candidate per row group.
+
+The rule restarts at every row group, so each row group can be decoded on its own. A
+reader that starts inside a row group and inside a candidate must first read the rows
+from the row group's first row. To rebuild a v1 row, take the row's own `rt`, or else
+the last `rt` its candidate carried in the row group, and `trace_len` zeros with the
+stored `intensity` copied in at `trace_offset`. `mumdia::chromatograms::Decoder` does
+exactly this, and `mumdia::chromatograms::rewrite` converts a table between the two
+layouts. A pooled table has the bands' layout, and the pool refuses bands of different
+layouts.
+
+Measured on three real runs by the ignored test `v2_on_a_real_artifact`
+(`chromatograms.rs`), each artifact rewritten in both layouts by today's writer
+(65,536-row groups, snappy, `rt` PLAIN):
+
+| run | rows | v1 | v2 | `rt` values | `intensity` values |
+|---|---|---|---|---|---|
+| AIF E. coli | 671,362 | 82.2 MB | 58.6 MB (-28.7%) | 62.5 M -> 5.79 M | 62.5 M -> 26.6 M |
+| AIF entrapment | 348,138 | 297.7 MB | 148.1 MB (-50.3%) | 287.9 M -> 34.9 M | 287.9 M -> 179.9 M |
+| Astral HYE (15-min gradient) | 9,388,687 | 610.2 MB | 515.6 MB (-15.5%) | 348.5 M -> 26.9 M | 348.5 M -> 196.7 M |
+
+On the same three, the features stage (Extended set, confident bounds) and quant wrote
+byte-identical tables from both layouts. The saving grows with trace length: the
+Astral run's traces are short (about 37 points a row), so the zero margins and the
+repeated axis are a smaller part of it. A dictionary-encoded `rt` was 2.7% larger on
+the AIF run and 3.2% and 0.3% smaller on the other two, so `rt` stays PLAIN in both
+layouts.
+
 ### `<psms>.peaks.parquet`, top-K peak retention (`extract.rs:1532-1543`)
 
 Written next to the PSM table only when `extract.retain_top_peaks > 1`; one row
