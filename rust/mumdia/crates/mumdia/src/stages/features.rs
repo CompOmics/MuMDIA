@@ -686,10 +686,33 @@ fn build_evidence(
     // MS1 isotope XICs [mono, +1, +2] sampled on the same grid as the fragments,
     // mapped onto axis_full then sliced to the elution peak. Present only when the
     // extract stage emitted them (grid mode + MS1 data); else empty.
+    //
+    // Extract writes an MS1 row on the fragments' own window grid (the same `grid_rt` every
+    // fragment row carries), so the usual row samples `axis_full` itself and the map below
+    // is the identity. `ms1_on_axis` recognises that case and slices the row directly: the
+    // map built three SipHash tables and a full-window vector per PSM to return, at every
+    // position, the value already stored there. Bit-identical: on a strictly ascending axis
+    // every bit pattern is distinct, so `map[axis_full[k]]` is exactly `r.inten[k]`, and
+    // both paths widen the same f32 to f64. Any other row -- another grid, a length
+    // mismatch, an axis that is not strictly ascending -- still goes through the map.
+    let axis_ascending = axis_full.windows(2).all(|w| w[0] < w[1]);
+    let ms1_on_axis = |r: &ChromRow| -> bool {
+        axis_ascending
+            && r.rt.len() == axis_full.len()
+            && r.inten.len() == r.rt.len()
+            && r.rt
+                .iter()
+                .zip(&axis_full)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    };
     let ms1_xic: Vec<Vec<f64>> = {
         let mut out = Vec::new();
         for name in ["ms1_mono", "ms1_iso1", "ms1_iso2"] {
             if let Some(r) = ms1_rows.iter().find(|r| r.frag_name == name) {
+                if ms1_on_axis(r) {
+                    out.push(r.inten[lo_i..=hi_i].iter().map(|&v| v as f64).collect());
+                    continue;
+                }
                 let map: HashMap<u32, f32> =
                     r.rt.iter()
                         .zip(r.inten.iter())
@@ -3764,6 +3787,130 @@ mod tests {
                 y.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 "fragment {i} trace differs"
             );
+        }
+    }
+
+    /// The MS1 XIC resampling exactly as it stood before the identity fast path: one map
+    /// per isotope keyed on the RT bit pattern, a full-window vector, then the peak slice.
+    /// A transcription of the replaced code, kept as the reference.
+    fn old_ms1_xic(
+        axis_full: &[f32],
+        ms1_rows: &[ChromRow],
+        lo: usize,
+        hi: usize,
+    ) -> Vec<Vec<f64>> {
+        let mut out = Vec::new();
+        for name in ["ms1_mono", "ms1_iso1", "ms1_iso2"] {
+            if let Some(r) = ms1_rows.iter().find(|r| r.frag_name == name) {
+                let map: HashMap<u32, f32> =
+                    r.rt.iter()
+                        .zip(r.inten.iter())
+                        .map(|(&t, &v)| (t.to_bits(), v))
+                        .collect();
+                let full: Vec<f64> = axis_full
+                    .iter()
+                    .map(|t| *map.get(&t.to_bits()).unwrap_or(&0.0) as f64)
+                    .collect();
+                out.push(full[lo..=hi].to_vec());
+            }
+        }
+        if out.len() == 3 {
+            out
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn ms1_rows_on_the_fragment_axis_skip_the_map_bit_for_bit() {
+        // The fast path applies when the MS1 row samples the fragments' own axis, which is
+        // what extract writes; every other shape must still reach the map. Both must equal
+        // the map build it replaced, bit for bit, including signed zeros and subnormals.
+        let grid: Vec<f32> = (0..12).map(|k| 100.0 + k as f32 * 1.5).collect();
+        let shifted: Vec<f32> = grid.iter().map(|t| t + 0.25).collect();
+        let every_other: Vec<f32> = grid.iter().step_by(2).copied().collect();
+        let tr_a: Vec<f32> = (0..12)
+            .map(|k| ((k as f32 - 6.0).abs() * -3.0 + 20.0).max(0.0))
+            .collect();
+        let tr_b: Vec<f32> = (0..12).map(|k| (k * 7 % 5) as f32).collect();
+        let iso = |k: usize| -> Vec<f32> {
+            let mut v: Vec<f32> = (0..12).map(|i| (i * (k + 3) % 11) as f32 * 10.0).collect();
+            v[1] = -0.0;
+            v[2] = f32::MIN_POSITIVE / 4.0; // subnormal
+            v
+        };
+        let (i0, i1, i2) = (iso(0), iso(1), iso(2));
+        let long: Vec<f32> = i1.iter().chain([5.0f32, 6.0].iter()).copied().collect();
+        let short_vals: Vec<f32> = i2.iter().step_by(2).copied().collect();
+        let frags = vec![row("y1", 1.0, &grid, &tr_a), row("b2", 0.5, &grid, &tr_b)];
+        let cases: Vec<(&str, Vec<ChromRow>)> = vec![
+            (
+                "on axis",
+                vec![
+                    row("ms1_mono", 0.0, &grid, &i0),
+                    row("ms1_iso1", 0.0, &grid, &i1),
+                    row("ms1_iso2", 0.0, &grid, &i2),
+                ],
+            ),
+            (
+                "shifted grid",
+                vec![
+                    row("ms1_mono", 0.0, &shifted, &i0),
+                    row("ms1_iso1", 0.0, &grid, &i1),
+                    row("ms1_iso2", 0.0, &grid, &i2),
+                ],
+            ),
+            (
+                "sub-grid",
+                vec![
+                    row("ms1_mono", 0.0, &grid, &i0),
+                    row("ms1_iso1", 0.0, &grid, &i1),
+                    row("ms1_iso2", 0.0, &every_other, &short_vals),
+                ],
+            ),
+            (
+                "longer intensity",
+                vec![
+                    row("ms1_mono", 0.0, &grid, &i0),
+                    row("ms1_iso1", 0.0, &grid, &long),
+                    row("ms1_iso2", 0.0, &grid, &i2),
+                ],
+            ),
+            (
+                "empty trace",
+                vec![
+                    row("ms1_mono", 0.0, &grid, &i0),
+                    row("ms1_iso1", 0.0, &[], &[]),
+                    row("ms1_iso2", 0.0, &grid, &i2),
+                ],
+            ),
+            (
+                "two isotopes",
+                vec![
+                    row("ms1_mono", 0.0, &grid, &i0),
+                    row("ms1_iso1", 0.0, &grid, &i1),
+                ],
+            ),
+        ];
+        for (tag, ms1) in &cases {
+            for (apex, bounds) in [(109.0, None), (104.5, Some((3.0, 4.0))), (90.0, None)] {
+                let al = align_traces(&frags);
+                let axis_full = al.axis_full.clone();
+                let ev = build_evidence(&frags, al, ms1, apex, 1.0 / 3.0, 0, bounds);
+                // The peak window as positions on the full axis.
+                let lo = axis_full
+                    .iter()
+                    .position(|&t| t as f64 == ev.axis[0])
+                    .unwrap();
+                let hi = lo + ev.axis.len() - 1;
+                let want = old_ms1_xic(&axis_full, ms1, lo, hi);
+                let bits = |v: &Vec<Vec<f64>>| -> Vec<Vec<u64>> {
+                    v.iter()
+                        .map(|t| t.iter().map(|x| x.to_bits()).collect())
+                        .collect()
+                };
+                assert_eq!(bits(&ev.ms1_xic), bits(&want), "{tag}, apex {apex}");
+            }
         }
     }
 
