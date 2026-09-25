@@ -422,9 +422,11 @@ sections 10-16:
   identifications. Under `rescore.strict` (the production setting) with a sidecar classifier
   the engine releases its own `FeatureMatrix` as soon as the handoff parquet is written,
   because strict has no native fallback that could still read it; the handoff is written in
-  131,072-row groups; and the worker loads it one row group at a time, since pyarrow's
-  `iter_batches` reads ahead and its buffered batches were a second copy of the matrix (the
-  worker climbed to 11.2 GB while filling a 4.85 GB matrix, then fell to 6.3). Measured on
+  131,072-row groups; and the worker loads it row group by row group, holding at most two
+  decoded groups (one filling, one read ahead on a reader thread since 2026-09-25), since
+  pyarrow's `iter_batches` reads ahead without bound and its buffered batches were a second
+  copy of the matrix (the worker climbed to 11.2 GB while filling a 4.85 GB matrix, then
+  fell to 6.3). Measured on
   the fleet (EPYC 9354, 32 threads, process-tree peaks): the six-run Astral pool
   (3,133,636 x 387) 17.9 GB -> 9.3 GB in 19.4 against 19.4 min, HYE B01
   (1,838,344 x 387) 12.0 GB -> 5.05 GB in 5.2 against 5.0 min, 63,270 peptides in both HYE

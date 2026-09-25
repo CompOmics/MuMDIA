@@ -163,6 +163,17 @@ Env knobs (all optional):
     MUMDIA_NN_PREGATHER_GB= 8        pre-gather the fold's training rows when they fit in
                                      this many GB (one gather per iteration instead of a
                                      fancy-index copy per minibatch)
+    MUMDIA_NN_LOAD_THREADS = auto    threads that fill the in-memory matrix from a parquet
+                                     handoff: each 32,768-row moment sub-block of a row group
+                                     is written straight into its rows and its float64 sums
+                                     are added in the original order, so the matrix, mean and
+                                     std are byte-identical. auto = min(8, torch CPU threads);
+                                     each thread holds a 32,768 x features float64 buffer.
+                                     0 = the original serial loop (no read-ahead/pre_buffer).
+    MUMDIA_NN_READ_AHEAD  = 1        decode row group r+1 on a reader thread while r is being
+                                     filled (at most two decoded groups resident). 0 = off.
+    MUMDIA_NN_PRE_BUFFER  = 1        open the reader's ParquetFile with pre_buffer=True
+                                     (coalesced column-chunk reads). 0 = off.
     MUMDIA_NN_SCAN_THREADS = auto    threads for the init feature scan (one column, both
                                      signs, per task; the winner is reduced in the serial
                                      (column, sign) order, so the choice is identical).
@@ -193,6 +204,7 @@ import hashlib
 import os
 import re
 import sys
+import threading
 import time
 
 import numpy as np
@@ -428,6 +440,231 @@ def _accumulate_moments(blk, s1, s2, rows=32768):
         s1 += sub.sum(axis=0)
         np.square(sub, out=sub)
         s2 += sub.sum(axis=0)
+
+
+# Rows per moment sub-block. The per-column float64 sums are accumulated one sub-block at a
+# time, in this partition, so any loader that reproduces the partition reproduces the sums.
+_MOMENT_ROWS = 32768
+
+
+def moment_blocks(rows, chunk, sub=_MOMENT_ROWS):
+    """(start, stop) rows of one row group's moment sub-blocks, in accumulation order.
+
+    The partition of the original loop: the row group is sliced into `chunk`-row pieces from
+    its first row, and each piece into `sub`-row sub-blocks from the piece's first row. The
+    float64 sums depend on this partition (addition is not associative), so it is kept.
+    """
+    out = []
+    for c0 in range(0, rows, chunk):
+        k = min(chunk, rows - c0)
+        for a in range(0, k, sub):
+            out.append((c0 + a, c0 + min(a + sub, k)))
+    return out
+
+
+def moments_to_mean_std(s1, s2, n):
+    """Mean and standard deviation (float32) from float64 column sums, as every backend does."""
+    mean = (s1 / n).astype(np.float32)
+    std = np.sqrt(np.maximum(s2 / n - (s1 / n) ** 2, 1e-12)).astype(np.float32)
+    std[std == 0] = 1.0
+    return mean, std
+
+
+def _column_to_numpy(col):
+    """A decoded column as numpy, nulls as NaN (older pyarrow lacks the keyword)."""
+    try:
+        return col.to_numpy(zero_copy_only=False)
+    except TypeError:
+        return col.to_numpy()
+
+
+def _open_parquet(path, pre_buffer):
+    """`pq.ParquetFile`, with `pre_buffer` (coalesced column-chunk reads) when available."""
+    if pre_buffer:
+        try:
+            return pq.ParquetFile(path, pre_buffer=True)
+        except TypeError:  # pragma: no cover - pyarrow without the keyword
+            pass
+    return pq.ParquetFile(path)
+
+
+_TLS = threading.local()
+
+
+def _fill_block(arrays, dst, r0, r1):
+    """Write rows `r0:r1` of one decoded row group into `dst` and return their moments.
+
+    `dst` is the matrix's view of exactly those rows. Each column is narrowed to float32
+    first (the cast the original `blk[:, j] = column` assignment made), then its non-finite
+    cells are set to 0.0 on that narrowed column, which is what `np.nan_to_num` did to the
+    block: a finite float64 beyond float32 range becomes inf in the cast and 0.0 here, as
+    before. The moments are the original sub-block's: the rows cast to a C-contiguous
+    float64 block of the same shape, summed, squared in place and summed again. The float64
+    block is a per-thread buffer, reused across calls.
+    """
+    for j, a in enumerate(arrays):
+        src = a[r0:r1]
+        if src.dtype != np.float32:
+            src = src.astype(np.float32)
+        finite = np.isfinite(src)
+        if not finite.all():
+            src = np.where(finite, src, np.float32(0.0))
+        dst[:, j] = src
+    k = r1 - r0
+    nf = dst.shape[1]
+    buf = getattr(_TLS, "moments", None)
+    if buf is None or buf.shape[1] != nf or buf.shape[0] < k:
+        buf = _TLS.moments = np.empty((max(k, _MOMENT_ROWS), nf), np.float64)
+    sub = buf[:k]
+    np.copyto(sub, dst)
+    p1 = sub.sum(axis=0)
+    np.square(sub, out=sub)
+    p2 = sub.sum(axis=0)
+    return p1, p2
+
+
+def fill_parquet_matrix(pin_path, feat_cols, n, chunk, out, threads=1, read_ahead=True,
+                        pre_buffer=True, initializer=None):
+    """Decode the handoff's feature columns into `out` (n x nf float32); return (s1, s2).
+
+    Byte-for-byte the matrix and the float64 column sums of the original loop
+    (`_fill_parquet_matrix_legacy`), produced faster:
+      - `read_ahead`: one reader thread, with its own ParquetFile, decodes row group r+1
+        while row group r is filled, so at most two decoded groups are held;
+      - `pre_buffer`: that ParquetFile coalesces column-chunk reads;
+      - `threads`: the moment sub-blocks of a group (see `moment_blocks`) are filled into
+        disjoint row ranges of `out` in parallel, straight from the decoded columns, with no
+        intermediate block, and their partial sums are added in sub-block order.
+    `initializer` runs once per pool thread (the worker's flush-to-zero setting).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    nf = len(feat_cols)
+    s1 = np.zeros(nf, np.float64)
+    s2 = np.zeros(nf, np.float64)
+    nrg = pq.read_metadata(pin_path).num_row_groups
+    state = {}
+
+    def read(rg):
+        t0 = time.time()
+        pf = state.get("pf")
+        if pf is None:
+            pf = state["pf"] = _open_parquet(pin_path, pre_buffer)
+        tbl = pf.read_row_group(rg, columns=feat_cols)
+        rows = tbl.num_rows
+        arrays = [_column_to_numpy(tbl.column(j)) for j in range(tbl.num_columns)]
+        del tbl
+        return rows, arrays, time.time() - t0
+
+    reader = ThreadPoolExecutor(max_workers=1, initializer=initializer) if read_ahead else None
+    pool = (ThreadPoolExecutor(max_workers=int(threads), initializer=initializer)
+            if threads > 1 else None)
+    off = 0
+    try:
+        pending = reader.submit(read, 0) if (reader is not None and nrg) else None
+        for rg in range(nrg):
+            tw = time.time()
+            if reader is not None:
+                rows, arrays, busy = pending.result()
+                _detail("load: read wait", time.time() - tw)
+                pending = reader.submit(read, rg + 1) if rg + 1 < nrg else None
+            else:
+                rows, arrays, busy = read(rg)
+            _detail("load: read", busy)
+            tf = time.time()
+            if off + rows > n:
+                raise RuntimeError(
+                    f"parquet row mismatch: metadata {n}, features at least {off + rows}")
+            blocks = moment_blocks(rows, chunk)
+            if pool is not None:
+                futs = [pool.submit(_fill_block, arrays, out[off + a:off + b], a, b)
+                        for a, b in blocks]
+                parts = [fu.result() for fu in futs]
+            else:
+                parts = [_fill_block(arrays, out[off + a:off + b], a, b) for a, b in blocks]
+            for p1, p2 in parts:
+                s1 += p1
+                s2 += p2
+            off += rows
+            del arrays, parts
+            _detail("load: fill + moments", time.time() - tf)
+    finally:
+        if reader is not None:
+            reader.shutdown(wait=True)
+        if pool is not None:
+            pool.shutdown(wait=True)
+        state.clear()
+    if off != n:
+        raise RuntimeError(f"parquet row mismatch: metadata {n}, features {off}")
+    return s1, s2
+
+
+def _fill_parquet_matrix_legacy(pin_path, feat_cols, n, chunk, out):
+    """The original serial load loop (MUMDIA_NN_LOAD_THREADS=0); returns (s1, s2)."""
+    nf = len(feat_cols)
+    s1 = np.zeros(nf, np.float64)
+    s2 = np.zeros(nf, np.float64)
+    _pf = pq.ParquetFile(pin_path)
+    off = 0
+    _tbl = _b = None
+    # One row group at a time. `iter_batches` reads ahead and decodes groups in
+    # parallel, and its buffered batches grew into a second copy of the matrix:
+    # measured, the worker climbed to 11.2 GB while filling a 4.85 GB `Xs`, then
+    # fell to 6.3 GB the moment the loop ended. Reading a group, slicing it into
+    # CHUNK-row blocks and dropping it bounds the transient to one group, which the
+    # engine writes at 131,072 rows (200 MB at 387 features); a file with parquet's
+    # default 1,048,576-row groups still loads, at 1.6 GB per group.
+    for _rg in range(_pf.num_row_groups):
+        _tr = time.time()
+        _tbl = _pf.read_row_group(_rg, columns=feat_cols)
+        _tf = time.time()
+        _detail("load: read", _tf - _tr)
+        for _s0 in range(0, _tbl.num_rows, chunk):
+            _b = _tbl.slice(_s0, chunk)
+            k = _b.num_rows
+            blk = np.empty((k, nf), np.float32)
+            for j in range(nf):
+                blk[:, j] = _b.column(j).to_numpy(zero_copy_only=False)
+            np.nan_to_num(blk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            out[off:off + k] = blk
+            _accumulate_moments(blk, s1, s2)
+            off += k
+            del blk
+        del _tbl, _b
+        _tbl = _b = None
+        _detail("load: fill + moments", time.time() - _tf)
+    del _pf, _tbl, _b
+    if off != n:
+        raise RuntimeError(f"parquet row mismatch: metadata {n}, features {off}")
+    return s1, s2
+
+
+def _standardise_rows(X, mean, std, i0, i1):
+    view = X[i0:i1]
+    np.subtract(view, mean, out=view)
+    np.divide(view, std, out=view)
+    np.clip(view, -8, 8, out=view)
+
+
+def standardise_matrix(X, mean, std, chunk, threads=1, initializer=None, block=65536):
+    """`X = clip((X - mean) / std, -8, 8)` in place.
+
+    Every operation is elementwise, so the bytes do not depend on how the rows are
+    partitioned; with `threads > 1` row blocks are processed on a thread pool. `threads <= 1`
+    is the original serial loop over `chunk`-row views.
+    """
+    n = X.shape[0]
+    if threads <= 1:
+        # In place on each chunk: `(Xs[i:j] - mean) / std` made two chunk-sized copies.
+        for i in range(0, n, chunk):
+            _standardise_rows(X, mean, std, i, i + chunk)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+
+    step = max(1, min(int(chunk), int(block)))
+    with ThreadPoolExecutor(max_workers=int(threads), initializer=initializer) as ex:
+        list(ex.map(lambda i: _standardise_rows(X, mean, std, i, i + step),
+                    range(0, n, step)))
 
 
 def _row_ids(spec_ids):
@@ -802,6 +1039,18 @@ def main():
         if FLUSH_DENORMAL:
             torch.set_flush_denormal(True)
 
+    # The parquet in-memory load: threads that fill the matrix (0 = the original serial loop,
+    # with no read-ahead and no pre_buffer), a one-deep row-group read-ahead, and pre_buffer.
+    # auto is at most 8: each fill thread holds a 32,768-row float64 moment buffer (0.1 GB at
+    # 387 features), and the fill is memory-bound well before 8 threads.
+    _load_raw = os.environ.get("MUMDIA_NN_LOAD_THREADS", "auto").strip().lower()
+    LOAD_THREADS = (
+        min(8, torch.get_num_threads())
+        if _load_raw in ("", "auto")
+        else max(0, int(float(_load_raw)))
+    )
+    READ_AHEAD = env_i("MUMDIA_NN_READ_AHEAD", 1) != 0
+    PRE_BUFFER = env_i("MUMDIA_NN_PRE_BUFFER", 1) != 0
     # Threads for the worker's own numpy thread pools (the init scan here). Defaults to the
     # torch CPU thread count resolved above, which already carries the cap.
     _scan_raw = os.environ.get("MUMDIA_NN_SCAN_THREADS", "auto").strip().lower()
@@ -967,53 +1216,21 @@ def main():
                 fold = _folds(_tb.column("Peptide").to_pylist())
             del _tb
             Xs = np.empty((n, nf), np.float32)
-            s1 = np.zeros(nf, np.float64)
-            s2 = np.zeros(nf, np.float64)
-            _pf = pq.ParquetFile(pin_path)
-            off = 0
-            _tbl = _b = None
-            # One row group at a time. `iter_batches` reads ahead and decodes groups in
-            # parallel, and its buffered batches grew into a second copy of the matrix:
-            # measured, the worker climbed to 11.2 GB while filling a 4.85 GB `Xs`, then
-            # fell to 6.3 GB the moment the loop ended. Reading a group, slicing it into
-            # CHUNK-row blocks and dropping it bounds the transient to one group, which the
-            # engine writes at 131,072 rows (200 MB at 387 features); a file with parquet's
-            # default 1,048,576-row groups still loads, at 1.6 GB per group.
-            for _rg in range(_pf.num_row_groups):
-                _tr = time.time()
-                _tbl = _pf.read_row_group(_rg, columns=feat_cols)
-                _tf = time.time()
-                _detail("load: read", _tf - _tr)
-                for _s0 in range(0, _tbl.num_rows, CHUNK):
-                    _b = _tbl.slice(_s0, CHUNK)
-                    k = _b.num_rows
-                    blk = np.empty((k, nf), np.float32)
-                    for j in range(nf):
-                        blk[:, j] = _b.column(j).to_numpy(zero_copy_only=False)
-                    np.nan_to_num(blk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                    Xs[off:off + k] = blk
-                    _accumulate_moments(blk, s1, s2)
-                    off += k
-                    del blk
-                del _tbl, _b
-                _tbl = _b = None
-                _detail("load: fill + moments", time.time() - _tf)
-            del _pf, _tbl, _b
-            if off != n:
-                raise RuntimeError(f"parquet row mismatch: metadata {n}, features {off}")
+            if LOAD_THREADS == 0:
+                s1, s2 = _fill_parquet_matrix_legacy(pin_path, feat_cols, n, CHUNK, Xs)
+            else:
+                s1, s2 = fill_parquet_matrix(
+                    pin_path, feat_cols, n, CHUNK, Xs, threads=LOAD_THREADS,
+                    read_ahead=READ_AHEAD, pre_buffer=PRE_BUFFER,
+                    initializer=_fp_thread_init,
+                )
             # The decoded Arrow buffers are garbage now; hand them back before training
             # starts, or they stay in RSS for the whole run.
             _release_allocator_slack()
             _ts = time.time()
-            mean = (s1 / n).astype(np.float32)
-            std = np.sqrt(np.maximum(s2 / n - (s1 / n) ** 2, 1e-12)).astype(np.float32)
-            std[std == 0] = 1.0
-            # In place on each chunk: `(Xs[i:j] - mean) / std` made two chunk-sized copies.
-            for i in range(0, n, CHUNK):
-                view = Xs[i:i + CHUNK]
-                np.subtract(view, mean, out=view)
-                np.divide(view, std, out=view)
-                np.clip(view, -8, 8, out=view)
+            mean, std = moments_to_mean_std(s1, s2, n)
+            standardise_matrix(Xs, mean, std, CHUNK, threads=LOAD_THREADS,
+                               initializer=_fp_thread_init)
             _detail("load: standardise", time.time() - _ts)
             get = lambda idx: Xs[idx]
             get_col = lambda idx, j: np.asarray(Xs[idx, j])

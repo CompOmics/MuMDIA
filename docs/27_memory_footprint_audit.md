@@ -164,6 +164,9 @@ Three changes, all in `rescore.rs`, `table.rs` and `nn_rescore_worker.py`:
   accumulates the moments in 32k-row float64 sub-blocks, parses the SpecId suffix in Arrow,
   standardises in place, and returns the load's transients to the OS
   (`pa.default_memory_pool().release_unused()`, `malloc_trim` on glibc) before training.
+  Since 2026-09-25 one further row group is decoded ahead on a reader thread and the fill
+  runs on up to 8 threads, each with a 32k-row float64 moment buffer (0.1 GB at 387
+  features); the matrix and its moments are byte-identical (`docs/13`).
 
 | pool | before | after | peptides |
 |------|--------|-------|----------|

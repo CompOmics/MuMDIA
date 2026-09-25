@@ -352,6 +352,8 @@ LEGACY_ENV = {
     "MUMDIA_NN_GATHER": "numpy",
     # W5: scan the init features on one thread.
     "MUMDIA_NN_SCAN_THREADS": "1",
+    # W2/W3: the serial load loop, without read-ahead or pre_buffer.
+    "MUMDIA_NN_LOAD_THREADS": "0",
 }
 
 IDENTITY_ENV = dict(
@@ -474,3 +476,53 @@ def test_threaded_init_scan_picks_the_serial_feature_and_count():
     assert w.scan_workers(16, 300000, 387) == 15
     assert w.scan_workers(16, 10000, 387) == 1
     assert w.scan_workers(16, 300000, 3) == 3
+
+
+@pytest.mark.parametrize("chunk", [250000, 700])
+def test_parallel_parquet_load_reproduces_the_serial_matrix_and_moments(tmp_path, chunk):
+    """The threaded, read-ahead load must give the serial loop's matrix, mean and std bytes.
+
+    The float64 column sums depend on the order of their additions, so the parallel loader
+    keeps the serial loop's sub-block partition and adds the partial sums in that order.
+    The pool carries non-finite cells, a float64 column beyond float32 range, nulls, -0.0
+    and a CHUNK smaller than a row group (700 rows against 1,500).
+    """
+    w = _import_worker()
+    import pyarrow.parquet as pq
+
+    features, _keys, n = _identity_pool(tmp_path)
+    names = [c for c in pq.read_schema(str(features)).names if c not in w.NON_FEATURE]
+    nf = len(names)
+
+    ref = np.empty((n, nf), np.float32)
+    r1, r2 = w._fill_parquet_matrix_legacy(str(features), names, n, chunk, ref)
+    rmean, rstd = w.moments_to_mean_std(r1, r2, n)
+    w.standardise_matrix(ref, rmean, rstd, chunk, threads=1)
+
+    for threads, read_ahead, pre_buffer in [(1, False, False), (1, True, True),
+                                            (3, True, True), (8, False, True)]:
+        got = np.empty((n, nf), np.float32)
+        g1, g2 = w.fill_parquet_matrix(str(features), names, n, chunk, got, threads=threads,
+                                       read_ahead=read_ahead, pre_buffer=pre_buffer)
+        assert g1.tobytes() == r1.tobytes() and g2.tobytes() == r2.tobytes(), (
+            "column sums differ at threads=%d read_ahead=%s" % (threads, read_ahead))
+        gmean, gstd = w.moments_to_mean_std(g1, g2, n)
+        w.standardise_matrix(got, gmean, gstd, chunk, threads=threads, block=256)
+        assert gmean.tobytes() == rmean.tobytes() and gstd.tobytes() == rstd.tobytes()
+        assert got.tobytes() == ref.tobytes(), (
+            "matrix differs at threads=%d read_ahead=%s" % (threads, read_ahead))
+    assert np.isfinite(ref).all()
+
+
+def test_moment_blocks_follow_the_serial_partition():
+    w = _import_worker()
+    assert w.moment_blocks(7000, 3000, sub=1000) == [
+        (0, 1000), (1000, 2000), (2000, 3000),
+        (3000, 4000), (4000, 5000), (5000, 6000),
+        (6000, 7000),
+    ]
+    assert w.moment_blocks(131072, 250000) == [
+        (0, 32768), (32768, 65536), (65536, 98304), (98304, 131072)
+    ]
+    assert w.moment_blocks(5, 2, sub=32768) == [(0, 2), (2, 4), (4, 5)]
+    assert w.moment_blocks(0, 250000) == []

@@ -711,8 +711,9 @@ MLP. Set it explicitly for the logreg path.
 - **The in-memory backend holds one matrix and little else** (2026-09-16). The
   engine writes the handoff parquet in 131,072-row groups and releases its own
   `FeatureMatrix` before the worker starts (under `rescore.strict`, which has no
-  native fallback), and the worker reads one row group at a time; pyarrow's
-  `iter_batches` reads ahead and had buffered a second copy of the matrix. Six-run
+  native fallback), and the worker reads row group by row group, holding at most two
+  decoded groups (the one being filled and the next, read ahead); pyarrow's
+  `iter_batches` reads ahead without bound and had buffered a second copy of the matrix. Six-run
   Astral pool: process tree 17.9 GB before, under 10 after; HYE B01 12.0 -> 5.05 GB,
   identical identifications (`docs/27` section 0.1).
 - **Torch CPU threads are capped** at 16, or at the performance-core count on a
@@ -727,8 +728,10 @@ MLP. Set it explicitly for the logreg path.
   `score_holdout`) are disjoint wall intervals, and `MEASURED TOTAL` is their sum. The
   sub-timers are printed after it and are not added to that total: `load: read`,
   `load: fill + moments` and `load: standardise` split `pin_read_standardise` on the
-  parquet in-memory path, and `selection` is the positive re-selection between a pool
-  score and the next training round, which no phase covers.
+  parquet in-memory path (with the read-ahead below, `load: read` is the reader
+  thread's busy time and `load: read wait` is how long the fill loop waited for it), and
+  `selection` is the positive re-selection between a pool score and the next training
+  round, which no phase covers.
 - **The worker's speed-ups on the default path keep the scores byte-identical**, and
   each keeps a switch back to the code it replaced, so a suspected difference can be
   checked on the same host and seed:
@@ -750,6 +753,18 @@ MLP. Set it explicitly for the logreg path.
     with the same strict `>`, so the chosen feature, sign and count are identical
     (400,000 x 120 synthetic pool: 24.9 s against 4.3 s at 8 threads). `1` runs it
     serially.
+  - `MUMDIA_NN_LOAD_THREADS` (default `min(8, torch CPU threads)`),
+    `MUMDIA_NN_READ_AHEAD` (1) and `MUMDIA_NN_PRE_BUFFER` (1): the parquet in-memory
+    load decodes row group r+1 on a reader thread (its own `ParquetFile`, opened with
+    `pre_buffer=True`) while row group r is written straight into the matrix by the
+    fill threads, each taking one 32,768-row moment sub-block. Each column is narrowed
+    to float32 before its non-finite cells are zeroed, as the old block cast did, and
+    the float64 partial sums are added in the old sub-block order, so the matrix, mean
+    and std are byte-identical. Standardisation is elementwise and runs on the same
+    threads. Measured on a 1,000,000 x 387 handoff: 11.8 s (fill 10.9, standardise
+    1.0) against 2.4 s at 8 threads. Each fill thread holds a 32,768 x features float64
+    buffer (0.1 GB at 387 features) and one extra decoded row group is resident.
+    `MUMDIA_NN_LOAD_THREADS=0` restores the old serial loop without read-ahead.
   - Pool threads get the main thread's flush-to-zero state through their
     initializer, because a thread started on Windows does not inherit it.
 
