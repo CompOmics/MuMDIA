@@ -25,6 +25,12 @@ use std::sync::Arc;
 /// Fragment rows per decoded batch while streaming the fragment table (a few MB).
 const FRAG_BATCH_ROWS: usize = 1 << 16;
 
+/// Most parts a fragment table is decoded in at once. A part decoder holds its own page
+/// buffers and batches (about 4-5 MB each on the AIF library in 1M-row groups: 16 parts
+/// put 70 MB on the seed peak), so the count is bounded rather than left to the thread
+/// count of a large host.
+const LOAD_PARTS_MAX: usize = 16;
+
 /// Precursor rows per decoded batch for the two columns that are validated in a streaming
 /// pass and never kept (`label`, `candidate_id`).
 const PREC_BATCH_ROWS: usize = 1 << 16;
@@ -1099,7 +1105,7 @@ impl Library {
             frag_offset,
             ncand,
             partial,
-            rayon::current_num_threads(),
+            rayon::current_num_threads().min(LOAD_PARTS_MAX),
         )?;
         let fragment_ms = t_load.elapsed().as_millis() as u64 - precursor_ms;
         let n_frag_rows = fc.frag_mz.len();
