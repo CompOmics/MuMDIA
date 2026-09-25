@@ -1300,6 +1300,9 @@ fn real_main() -> Result<()> {
             stages::extract::run(stages::extract::ExtractParams {
                 fragment_offset,
                 sibling_bands: 1,
+                // Standalone: the windows come from the named file, which is this stage's
+                // contract; only the orchestrators hand them over in memory.
+                rt_windows: None,
                 // Standalone: this invocation decodes the run itself.
                 scans: None,
                 ms2: &ms2,

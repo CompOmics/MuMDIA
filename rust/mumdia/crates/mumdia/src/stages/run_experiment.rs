@@ -366,7 +366,8 @@ fn chain_after_seed(
         lib_p_base.to_string()
     };
     let windows = d("run_windows.parquet");
-    rt_im_train::run(rt_im_train::RtImTrainParams {
+    // Handed to extract in memory; see `rt_im_train::RtWindows`.
+    let (_, fitted_windows) = rt_im_train::run_in_memory(rt_im_train::RtImTrainParams {
         anchor_irt_from_seed: false,
         seed_psms: seed,
         library_precursors: &lib_p,
@@ -380,6 +381,7 @@ fn chain_after_seed(
     extract::run(extract::ExtractParams {
         fragment_offset: None,
         sibling_bands: 1,
+        rt_windows: fitted_windows,
         scans: None,
         ms2: &co.ms2,
         library_precursors: &lib_p,

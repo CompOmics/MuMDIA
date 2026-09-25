@@ -91,6 +91,24 @@ The unbounded row `(NaN, -inf, +inf)` is materialized by `candidate_window`
 infinite bounds make the downstream extractor scan the full isolation-window RT
 range (recall-safe) rather than a numeric window.
 
+**The in-memory handoff to extract.** The orchestrators (`run`, `run-experiment`
+and the band loop of a grouped run) call `rt_im_train::run_in_memory`, which writes
+the same file and also returns `RtWindows`: the three dense per-candidate arrays
+(`rt_cal`, `rt_lo`, `rt_hi`, 24 bytes per candidate) that `extract` builds from
+`run_windows.parquet`, filled from the rows as they are written. `extract` takes
+them when they cover exactly its library's candidates, logs `extract: RT windows
+handed over in memory; run_windows is not re-read`, and otherwise reads the file.
+The arrays are the ones the file would produce, bit for bit
+(`the_windows_kept_in_memory_are_the_windows_extract_reads_back`), so the handoff
+changes no output; it saves the decode of the table just written, 1-2 s per run on
+HYE and an estimated 20-60 s on an unbanded immunopeptidomics library. A table
+with a NaN bound is never handed over, so `extract` reads it and rejects it with the
+row named, as before. The file stays the artifact and the contract of the
+standalone stages: `mumdia extract` always reads it. One memory consequence: the
+24-byte-per-candidate arrays now exist from the end of `rt-im-train` through
+extract's library load, where extract used to allocate them (and a 28-byte decode
+beside them) only after the load.
+
 **`cal.json`** (side artifact, written with `mumdia_io::json::write_json`,
 rt_im_train.rs:309-325). Fields:
 

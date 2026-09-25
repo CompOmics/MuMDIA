@@ -76,7 +76,12 @@ the CLI in `main.rs:535` (`Cmd::Extract`) and from the orchestrator in
   window row keep `[-inf, +inf]` and `rt_cal = NaN`, the same "calibration
   unavailable" sentinel `rt-im-train` writes; the NaN disables the Gaussian RT prior
   for those candidates (the prior requires `rt_cal > 0`). A NaN `rt_lo` or `rt_hi` is
-  rejected with the row named, because a NaN bound would match every scan.
+  rejected with the row named, because a NaN bound would match every scan. An
+  orchestrator hands the same three arrays over in memory
+  (`ExtractParams::rt_windows`, from `rt_im_train::run_in_memory`); extract uses
+  them when they cover exactly its library's candidates and reads the file
+  otherwise, so the arrays and every output are the same either way (docs/08, "The
+  in-memory handoff to extract").
 - `ms1` (optional Parquet): MS1 scans via `load_ms1` (`extract.rs:1350`). When
   absent, all MS1 columns are null.
 - `mass_cal` (optional JSON, the seed's `<seed>.masscal.json`): reads

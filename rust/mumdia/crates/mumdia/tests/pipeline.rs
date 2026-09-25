@@ -199,6 +199,7 @@ fn run_extract(prec: &str, frag: &str, ms2: &str, win: &str, tag: &str) -> (Stri
     let chrom = tmp(&format!("chrom_{tag}.parquet"));
     stages::extract::run(stages::extract::ExtractParams {
         fragment_offset: None,
+        rt_windows: None,
         sibling_bands: 1,
         scans: None,
         ms2,
@@ -582,6 +583,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         let chrom = tmp(&format!("chrom_{tag}.parquet"));
         let (npsm, _) = stages::extract::run(stages::extract::ExtractParams {
             fragment_offset: None,
+            rt_windows: None,
             sibling_bands: 1,
             scans: shared,
             ms2: &ms2,
@@ -666,6 +668,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     let chrom_noclaim = tmp("chrom_noclaim.parquet");
     stages::extract::run(stages::extract::ExtractParams {
         fragment_offset: None,
+        rt_windows: None,
         sibling_bands: 1,
         scans: None,
         ms2: &ms2,
@@ -693,6 +696,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     let chrom_no_ms1 = tmp("chrom_no_ms1.parquet");
     stages::extract::run(stages::extract::ExtractParams {
         fragment_offset: None,
+        rt_windows: None,
         sibling_bands: 1,
         scans: None,
         ms2: &ms2,
@@ -736,6 +740,7 @@ fn extract_does_not_believe_an_empty_lent_ms1_over_a_named_one() {
         let chrom = tmp(&format!("chrom_{tag}.parquet"));
         stages::extract::run(stages::extract::ExtractParams {
             fragment_offset: None,
+            rt_windows: None,
             sibling_bands: 1,
             scans: shared,
             ms2: &ms2,
@@ -927,6 +932,7 @@ fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
         let chrom = tmp(&format!("chrom_handback_{tag}.parquet"));
         stages::extract::run(stages::extract::ExtractParams {
             fragment_offset: None,
+            rt_windows: None,
             sibling_bands: 1,
             scans: shared,
             ms2: &ms2,
@@ -985,6 +991,7 @@ fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
     let no_ms1_psms = tmp("psms_handback_no_ms1.parquet");
     stages::extract::run(stages::extract::ExtractParams {
         fragment_offset: None,
+        rt_windows: None,
         sibling_bands: 1,
         scans: Some(stages::extract::SharedScans {
             ms2: &handed,

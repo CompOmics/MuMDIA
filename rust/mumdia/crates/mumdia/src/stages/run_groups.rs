@@ -589,15 +589,17 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 (None, false) => (b.seed.clone(), false),
             };
             info!(stage = %"rt-im-train", group = b.index, "run: stage start");
-            let rows = rt_im_train::run(rt_im_train::RtImTrainParams {
-                seed_psms: &seed_for_windows,
-                library_precursors: &b.prec,
-                out_windows: &windows,
-                out_cal: &cal,
-                cfg: &cfg.rt_im_train,
-                config_hash: ch,
-                anchor_irt_from_seed: from_seed,
-            })?;
+            // Handed to this band's extract in memory; see `rt_im_train::RtWindows`.
+            let (rows, fitted_windows) =
+                rt_im_train::run_in_memory(rt_im_train::RtImTrainParams {
+                    seed_psms: &seed_for_windows,
+                    library_precursors: &b.prec,
+                    out_windows: &windows,
+                    out_cal: &cal,
+                    cfg: &cfg.rt_im_train,
+                    config_hash: ch,
+                    anchor_irt_from_seed: from_seed,
+                })?;
             recs.push(record_artifact(
                 &format!("{}[g{:02}]", artifact::RUN_WINDOWS.0, b.index),
                 artifact::RUN_WINDOWS,
@@ -628,6 +630,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 config_hash: ch,
                 fragment_offset: Some(b.offset),
                 sibling_bands: par,
+                rt_windows: fitted_windows,
                 scans: Some(extract::SharedScans {
                     ms2: &ms2_scans,
                     ms1: Some(&ms1_scans),

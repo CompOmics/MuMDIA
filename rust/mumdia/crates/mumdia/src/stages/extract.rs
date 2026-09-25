@@ -28,6 +28,7 @@ use mumdia_core::constants::{ppm_bounds, ISOTOPE_SPACING};
 use crate::index::Library;
 use crate::matchers::fragindex::{FragIndex, WindowNarrow};
 use crate::spectra::{load_ms1, load_ms2, Ms1Scan};
+use crate::stages::rt_im_train::RtWindows;
 use mumdia_core::config::MatcherKind;
 use mumdia_core::types::Ms2Scan;
 use rayon::prelude::*;
@@ -138,6 +139,12 @@ pub struct ExtractParams<'a> {
     /// decode it keeps that decode concurrent with the library load and after the
     /// library's errors, where a standalone extract has it.
     pub scans: Option<SharedScans<'a>>,
+    /// The windows `rt-im-train` just fitted and wrote to `run_windows`, handed over in
+    /// memory by an orchestrator (`rt_im_train::run_in_memory`) so the table is not
+    /// decoded again. Used only when it covers exactly this library's candidates, and then
+    /// it is what the file would have produced; otherwise, and whenever it is `None`, the
+    /// `run_windows` file is read. A standalone `mumdia extract` always reads the file.
+    pub rt_windows: Option<crate::stages::rt_im_train::RtWindows>,
 }
 
 /// One run's decoded spectra, lent to a stage instead of being re-decoded by it.
@@ -2194,22 +2201,14 @@ fn decode_unlent(p: &ExtractParams) -> Result<(Option<Vec<Ms2Scan>>, Option<Vec<
     }
 }
 
-/// The per-candidate RT windows as extract uses them: three dense arrays indexed by
-/// candidate id, `rt_cal[c]`, `rt_lo[c]` and `rt_hi[c]`.
-struct DenseRtWindows {
-    rt_cal: Vec<f64>,
-    rt_lo: Vec<f64>,
-    rt_hi: Vec<f64>,
-}
-
-/// Read `run_windows` and scatter it into the dense arrays for a library of `ncand`
-/// candidates.
+/// Read `run_windows` and scatter it into the dense per-candidate arrays extract uses,
+/// `rt_cal[c]`, `rt_lo[c]` and `rt_hi[c]`, for a library of `ncand` candidates.
 ///
 /// The decoded columns (`candidate_id`, `rt_pred_cal`, `rt_lo`, `rt_hi`: 28 bytes per
 /// row) are dropped when this returns, rather than living until the end of the stage
 /// beside the 24-byte-per-candidate dense copy they were scattered into. On an unbounded
 /// 203M-candidate library that is 5.7 GB that used to sit through the whole extraction.
-fn read_run_windows(path: &str, ncand: usize) -> Result<DenseRtWindows> {
+pub(crate) fn read_run_windows(path: &str, ncand: usize) -> Result<RtWindows> {
     let rw = TableFile::open(path)?;
     let rw_cid = rw.u32("candidate_id")?;
     let rw_cal = rw.f64("rt_pred_cal")?;
@@ -2250,15 +2249,17 @@ fn read_run_windows(path: &str, ncand: usize) -> Result<DenseRtWindows> {
             rt_cal[c] = rw_cal[i];
         }
     }
-    Ok(DenseRtWindows {
+    Ok(RtWindows {
         rt_cal,
         rt_lo,
         rt_hi,
     })
 }
 
-pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
+pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
     let t0 = Instant::now();
+    // Taken out before the closures below borrow `p`; consumed where the file is read.
+    let handed_windows = p.rt_windows.take();
     // Neither output may be one of the inputs (docs/31 F6).
     let inputs = [
         ("--ms2", p.ms2),
@@ -2335,13 +2336,34 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         None => None,
     };
 
-    // run windows indexed by candidate_id
+    // run windows indexed by candidate_id: the orchestrator's in-memory copy when it
+    // covers this library (`rt_im_train::RtWindows` says why that is the same arrays),
+    // the file otherwise.
     let ncand = lib.n_candidates();
-    let DenseRtWindows {
+    let RtWindows {
         rt_cal,
         rt_lo,
         rt_hi,
-    } = read_run_windows(p.run_windows, ncand)?;
+    } = match handed_windows {
+        Some(w) if w.len() == ncand => {
+            info!(
+                candidates = ncand,
+                "extract: RT windows handed over in memory; run_windows is not re-read"
+            );
+            w
+        }
+        other => {
+            if let Some(w) = other {
+                warn!(
+                    handed = w.len(),
+                    candidates = ncand,
+                    run_windows = p.run_windows,
+                    "extract: the RT windows handed over cover a different candidate count;                      reading the run_windows file instead"
+                );
+            }
+            read_run_windows(p.run_windows, ncand)?
+        }
+    };
 
     // Decoded here unless the caller lent its own copies (see `ExtractParams::scans` and
     // `decode_unlent`); on the fragindex path the decode already ran, concurrently with the

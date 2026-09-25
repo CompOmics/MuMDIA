@@ -548,7 +548,10 @@ pub fn run(p: RunParams) -> Result<()> {
             let windows = d("run_windows.parquet");
             let cal = d("cal.json");
             info!(stage = %"rt-im-train", "run: stage start");
-            let n = rt_im_train::run(rt_im_train::RtImTrainParams {
+            // In memory as well as on disk: extract reads the same library, so it takes the
+            // fitted windows as they are instead of decoding the table written here
+            // (`rt_im_train::RtWindows`). The file stays the artifact.
+            let (n, fitted_windows) = rt_im_train::run_in_memory(rt_im_train::RtImTrainParams {
                 anchor_irt_from_seed: false,
                 seed_psms: &seed,
                 library_precursors: &lib_p,
@@ -575,6 +578,7 @@ pub fn run(p: RunParams) -> Result<()> {
             let (npsm, nchr) = extract::run(extract::ExtractParams {
                 fragment_offset: None,
                 sibling_bands: 1,
+                rt_windows: fitted_windows,
                 scans: lent_ms2
                     .as_deref()
                     .map(|ms2| extract::SharedScans { ms2, ms1: None }),

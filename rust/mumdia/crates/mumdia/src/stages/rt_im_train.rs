@@ -145,7 +145,85 @@ fn candidate_window(calibrated_rt: Option<f64>, width: Option<f64>) -> (f64, f64
     }
 }
 
+/// The fitted windows, handed from `rt-im-train` to `extract` in memory by the
+/// orchestrators (`run`, `run-experiment`, the grouped band loop) instead of through a
+/// re-read of `run_windows.parquet`.
+///
+/// It is exactly what `extract` would build from the file it was just written to: three
+/// arrays indexed by candidate id over the library's `n` rows, `(NaN, -inf, +inf)` for a
+/// candidate with no row, and for every row `i` with `candidate_id[i] < n`, in row order,
+/// that row's `(rt_pred_cal, rt_lo, rt_hi)`. The file is still written and is still the
+/// contract of the standalone stages; `extract` takes this only when its own library has
+/// the same `n` candidates, and reads the file otherwise.
+pub struct RtWindows {
+    pub(crate) rt_cal: Vec<f64>,
+    pub(crate) rt_lo: Vec<f64>,
+    pub(crate) rt_hi: Vec<f64>,
+}
+
+impl RtWindows {
+    /// Candidates covered (the library's row count).
+    pub fn len(&self) -> usize {
+        self.rt_cal.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rt_cal.is_empty()
+    }
+}
+
+/// Collects the dense windows while the table is streamed out, or refuses to.
+struct RtWindowsBuilder {
+    w: RtWindows,
+    /// A row with a NaN `rt_lo` or `rt_hi` was seen. `extract` rejects such a table with
+    /// the row named; the in-memory form is then withheld, so `extract` reads the file
+    /// and reports exactly that error.
+    poisoned: bool,
+}
+
+impl RtWindowsBuilder {
+    fn new(n: usize) -> RtWindowsBuilder {
+        RtWindowsBuilder {
+            w: RtWindows {
+                rt_cal: vec![f64::NAN; n],
+                rt_lo: vec![f64::NEG_INFINITY; n],
+                rt_hi: vec![f64::INFINITY; n],
+            },
+            poisoned: false,
+        }
+    }
+
+    /// One written row, in row order: the scatter `extract` applies to the file.
+    #[inline]
+    fn row(&mut self, cid: u32, cal: f64, lo: f64, hi: f64) {
+        let c = cid as usize;
+        if c < self.w.rt_cal.len() {
+            if lo.is_nan() || hi.is_nan() {
+                self.poisoned = true;
+            }
+            self.w.rt_cal[c] = cal;
+            self.w.rt_lo[c] = lo;
+            self.w.rt_hi[c] = hi;
+        }
+    }
+
+    fn finish(self) -> Option<RtWindows> {
+        (!self.poisoned).then_some(self.w)
+    }
+}
+
 pub fn run(p: RtImTrainParams) -> Result<u64> {
+    run_impl(p, false).map(|(rows, _)| rows)
+}
+
+/// [`run`], also returning the fitted windows in the form `extract` consumes, so an
+/// orchestrator can hand them over instead of having `extract` decode the table it just
+/// wrote. `None` only when the table holds a NaN bound (see [`RtWindows`]).
+pub fn run_in_memory(p: RtImTrainParams) -> Result<(u64, Option<RtWindows>)> {
+    run_impl(p, true)
+}
+
+fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(u64, Option<RtWindows>)> {
     let t0 = Instant::now();
     // `--out` must not be one of this stage's own inputs: every input is read
     // before the output is published, so writing over one replaces it and exits 0
@@ -437,6 +515,7 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     let irt = lib_irt;
     let n = lib.nrows;
     let mut n_nonfinite_irt = 0u64;
+    let mut kept = keep_windows.then(|| RtWindowsBuilder::new(n));
     let rows = write_table_chunked(p.out_windows, n, |r| {
         let k = r.len();
         let (mut cid_c, mut cal_c, mut lo_c, mut hi_c) = (
@@ -465,6 +544,9 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
                 None => w_rt.expect("available RT calibration requires a bounded window"),
             });
             let (cal, lo, hi) = candidate_window(calibrated_rt, width);
+            if let Some(b) = kept.as_mut() {
+                b.row(cid[i], cal, lo, hi);
+            }
             cid_c.push(cid[i]);
             cal_c.push(cal);
             lo_c.push(lo);
@@ -581,12 +663,13 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         elapsed_ms = elapsed,
         "rt-im-train: done"
     );
-    Ok(rows)
+    Ok((rows, kept.and_then(RtWindowsBuilder::finish)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mumdia_io::table::write_table;
 
     #[test]
     fn anchor_vectors_are_sorted_by_base_peptide_id() {
@@ -641,6 +724,194 @@ mod tests {
         assert_eq!(IrtJoin::Unused.get(0), None);
         // An empty library joins nothing.
         assert_eq!(IrtJoin::new(&[], &[]).get(0), None);
+    }
+
+    /// A per-process scratch path; tests in this module run concurrently.
+    fn scratch(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("mumdia_rt_im_train_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name).to_str().unwrap().to_string()
+    }
+
+    /// Bit patterns of a window set, for exact comparison (NaN included).
+    fn bits(w: &RtWindows) -> Vec<(u64, u64, u64)> {
+        (0..w.len())
+            .map(|c| {
+                (
+                    w.rt_cal[c].to_bits(),
+                    w.rt_lo[c].to_bits(),
+                    w.rt_hi[c].to_bits(),
+                )
+            })
+            .collect()
+    }
+
+    /// The windows handed to extract in memory are the arrays extract builds from the file
+    /// the same call wrote, bit for bit, under each window plan: calibrated LOESS, adaptive
+    /// per-bin widths, and the unbounded plan of a run without anchors. The library has
+    /// candidates with a non-finite iRT, which take the unbounded sentinel.
+    #[test]
+    fn the_windows_kept_in_memory_are_the_windows_extract_reads_back() {
+        let n = 3_000usize;
+        let prec = scratch("inmem_prec.parquet");
+        let irt: Vec<f32> = (0..n)
+            .map(|i| {
+                if i % 97 == 5 {
+                    f32::NAN
+                } else {
+                    i as f32 * 0.05
+                }
+            })
+            .collect();
+        write_table(
+            &prec,
+            vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::F32("predicted_irt".into(), irt.clone()),
+            ],
+        )
+        .unwrap();
+        // One confident target anchor per base peptide on a curved gradient, plus decoys and
+        // unconfident rows that must not anchor.
+        let seed_rows: Vec<usize> = (0..n).step_by(7).filter(|i| irt[*i].is_finite()).collect();
+        let seed_table = |path: &str, rows: &[usize]| {
+            let m = rows.len();
+            write_table(
+                path,
+                vec![
+                    Col::U32(
+                        "candidate_id".into(),
+                        rows.iter().map(|&i| i as u32).collect(),
+                    ),
+                    Col::U32(
+                        "base_peptide_id".into(),
+                        rows.iter().map(|&i| i as u32).collect(),
+                    ),
+                    Col::F64(
+                        "spectrum_q".into(),
+                        rows.iter()
+                            .map(|&i| if i % 5 == 0 { 0.5 } else { 0.001 })
+                            .collect(),
+                    ),
+                    Col::F64("score".into(), (0..m).map(|k| 1.0 + k as f64).collect()),
+                    Col::F64(
+                        "observed_rt".into(),
+                        rows.iter()
+                            .map(|&i| {
+                                let x = irt[i] as f64;
+                                60.0 + 30.0 * x + 0.4 * x * x + ((i * 37) % 11) as f64
+                            })
+                            .collect(),
+                    ),
+                    Col::Str(
+                        "label".into(),
+                        rows.iter()
+                            .map(|&i| if i % 3 == 0 { "decoy" } else { "target" }.to_string())
+                            .collect(),
+                    ),
+                ],
+            )
+            .unwrap();
+        };
+        let seed = scratch("inmem_seed.parquet");
+        seed_table(&seed, &seed_rows);
+        let empty_seed = scratch("inmem_seed_empty.parquet");
+        seed_table(&empty_seed, &[]);
+
+        let adaptive = RtImTrainConfig {
+            adaptive_rt_window: true,
+            ..RtImTrainConfig::default()
+        };
+        for (tag, cfg, seed_path, want_status) in [
+            ("loess", RtImTrainConfig::default(), &seed, "loess"),
+            ("adaptive", adaptive, &seed, "loess"),
+            (
+                "unbounded",
+                RtImTrainConfig::default(),
+                &empty_seed,
+                INSUFFICIENT_ANCHORS_STATUS,
+            ),
+        ] {
+            let windows = scratch(&format!("inmem_windows_{tag}.parquet"));
+            let cal = scratch(&format!("inmem_cal_{tag}.json"));
+            let params = || RtImTrainParams {
+                seed_psms: seed_path,
+                library_precursors: &prec,
+                out_windows: &windows,
+                out_cal: &cal,
+                cfg: &cfg,
+                config_hash: "test",
+                anchor_irt_from_seed: false,
+            };
+            let (rows, kept) = run_in_memory(params()).unwrap();
+            assert_eq!(rows, n as u64);
+            let kept = kept.expect("no NaN bound, so the windows are kept");
+            let status: serde_json::Value = mumdia_io::json::read_json(&cal).unwrap();
+            assert_eq!(status["calibration_status"], want_status, "{tag}");
+            let from_file = crate::stages::extract::read_run_windows(&windows, n).unwrap();
+            assert_eq!(
+                bits(&kept),
+                bits(&from_file),
+                "{tag}: in memory != read back"
+            );
+            // `run` writes the same file as `run_in_memory`.
+            let bytes = std::fs::read(&windows).unwrap();
+            assert_eq!(run(params()).unwrap(), n as u64);
+            assert_eq!(
+                std::fs::read(&windows).unwrap(),
+                bytes,
+                "{tag}: run vs run_in_memory"
+            );
+        }
+    }
+
+    /// The builder is the scatter extract applies: last row wins for a repeated id, ids past
+    /// the library are ignored, and a NaN bound withholds the in-memory form so extract
+    /// reads the file and names the row.
+    #[test]
+    fn the_windows_builder_is_the_scatter_extract_applies() {
+        let rows: Vec<(u32, f64, f64, f64)> = vec![
+            (2, 10.0, 5.0, 15.0),
+            (0, f64::NAN, f64::NEG_INFINITY, f64::INFINITY),
+            (2, 11.0, 6.0, 16.0), // repeated: this one wins
+            (9, 1.0, 0.0, 2.0),   // past the library
+        ];
+        let path = scratch("builder_windows.parquet");
+        let write = |path: &str, rows: &[(u32, f64, f64, f64)]| {
+            write_table(
+                path,
+                vec![
+                    Col::U32("candidate_id".into(), rows.iter().map(|r| r.0).collect()),
+                    Col::F64("rt_pred_cal".into(), rows.iter().map(|r| r.1).collect()),
+                    Col::F64("rt_lo".into(), rows.iter().map(|r| r.2).collect()),
+                    Col::F64("rt_hi".into(), rows.iter().map(|r| r.3).collect()),
+                ],
+            )
+            .unwrap();
+        };
+        write(&path, &rows);
+        let mut b = RtWindowsBuilder::new(4);
+        for &(c, cal, lo, hi) in &rows {
+            b.row(c, cal, lo, hi);
+        }
+        let kept = b.finish().expect("no NaN bound");
+        let read = crate::stages::extract::read_run_windows(&path, 4).unwrap();
+        assert_eq!(bits(&kept), bits(&read));
+        assert_eq!(kept.rt_cal[2], 11.0);
+        assert!(kept.rt_cal[1].is_nan() && kept.rt_lo[3] == f64::NEG_INFINITY);
+
+        write(&path, &[(1u32, 3.0, f64::NAN, 4.0)]);
+        let mut b = RtWindowsBuilder::new(4);
+        b.row(1, 3.0, f64::NAN, 4.0);
+        assert!(b.finish().is_none(), "a NaN bound must not be handed over");
+        let err = crate::stages::extract::read_run_windows(&path, 4)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("NaN RT bound"), "{err}");
+        // A NaN bound on a row past the library is not checked by extract either.
+        let mut b = RtWindowsBuilder::new(1);
+        b.row(1, 3.0, f64::NAN, 4.0);
+        assert!(b.finish().is_some());
     }
 
     #[test]
