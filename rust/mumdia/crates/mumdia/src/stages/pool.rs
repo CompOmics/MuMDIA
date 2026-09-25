@@ -18,6 +18,10 @@
 //! extracted rows are already on disk per band; copying them into a run-level table that no
 //! stage opens was a full read and a full write of the run's widest non-chromatogram
 //! artifact.
+//!
+//! `chromatograms` is pooled unless the run leaves it per band (`groups.pool_chromatograms =
+//! false`): quant then reads the bands' tables in band order and drops the overlap losers
+//! itself, from the loser sets this stage writes to `overlap_losers.parquet`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -25,7 +29,7 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Result};
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
-use mumdia_io::table::{BatchWriter, SpliceWriter, TableFile, Written};
+use mumdia_io::table::{write_table_hashed, BatchWriter, Col, SpliceWriter, TableFile, Written};
 use tracing::info;
 
 const BATCH_ROWS: usize = 1 << 16;
@@ -46,7 +50,15 @@ pub struct PoolParams<'a> {
     /// one -- so the caller passes `None` unless the candidate audit is on, which is the
     /// one consumer. The per-band tables are written either way.
     pub out_psms: Option<&'a str>,
-    pub out_chromatograms: &'a str,
+    /// Where to pool the chromatograms, or `None` when quant reads the bands' tables
+    /// directly (`groups.pool_chromatograms = false`), which `out_losers` then makes
+    /// possible where the bands overlap.
+    pub out_chromatograms: Option<&'a str>,
+    /// Where to write the overlap losers, one row per `(band, candidate_id)` the dedup
+    /// dropped from that band ([`write_losers`]), or `None`. They are a function of the
+    /// competed tables, so a later reader of the band tables can drop exactly the rows the
+    /// pooled tables do not hold without pooling anything.
+    pub out_losers: Option<&'a str>,
     /// Where to pool the competed rows, or `None` when rescore reads the bands' competed
     /// tables directly (`groups.pool_competed = false`, allowed only with `bands_disjoint`).
     pub out_competed: Option<&'a str>,
@@ -61,16 +73,68 @@ pub struct PoolParams<'a> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PoolStats {
     pub psms: u64,
+    /// 0 when the chromatograms were not pooled.
     pub chromatograms: u64,
     pub competed: u64,
     /// Content hashes of the pooled tables, computed while they were spliced, in the order
     /// psms (when pooled), chromatograms, competed.
     pub psms_hash: Option<String>,
-    pub chromatograms_hash: String,
+    /// `None` when the chromatograms were not pooled.
+    pub chromatograms_hash: Option<String>,
     /// `None` when the competed rows were not pooled.
     pub competed_hash: Option<String>,
     /// Candidates that appeared in two bands and were kept from one.
     pub duplicates: u64,
+    /// Per band, ascending, the candidates the dedup dropped from it because another band's
+    /// row won them. Empty sets for disjoint bands.
+    pub losers: Vec<Vec<u32>>,
+    /// `overlap_losers.parquet` as written, when `out_losers` asked for it.
+    pub losers_written: Option<Written>,
+}
+
+/// Write the overlap losers as `band` (the band's position in pool order) and
+/// `candidate_id`, one row per dropped candidate, ascending by band then candidate. A run
+/// whose bands are disjoint writes the table with no rows, which says as much.
+pub fn write_losers(path: &str, losers: &[Vec<u32>]) -> Result<Written> {
+    let mut band: Vec<u32> = Vec::new();
+    let mut cid: Vec<u32> = Vec::new();
+    for (b, set) in losers.iter().enumerate() {
+        for &c in set {
+            band.push(b as u32);
+            cid.push(c);
+        }
+    }
+    write_table_hashed(
+        path,
+        vec![
+            Col::U32("band".into(), band),
+            Col::U32("candidate_id".into(), cid),
+        ],
+    )
+}
+
+/// Read [`write_losers`]'s table back as one ascending, distinct set per band, for `n_bands`
+/// bands. A band index outside the list is refused: it names a table the caller did not
+/// give.
+pub fn read_losers(path: &str, n_bands: usize) -> Result<Vec<Vec<u32>>> {
+    let t = TableFile::open(path)?;
+    let band = t.u32("band")?;
+    let cid = t.u32("candidate_id")?;
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); n_bands];
+    for (&b, &c) in band.iter().zip(&cid) {
+        let Some(set) = out.get_mut(b as usize) else {
+            bail!(
+                "{path} drops candidate {c} from band {b}, but {n_bands} chromatogram \
+                 table(s) were given; give every band's table, in band order"
+            );
+        };
+        set.push(c);
+    }
+    for set in &mut out {
+        set.sort_unstable();
+        set.dedup();
+    }
+    Ok(out)
 }
 
 /// Per band, the local ids to drop because another band's row won the candidate.
@@ -263,7 +327,22 @@ pub fn run(p: PoolParams) -> Result<PoolStats> {
         Some(out) => Some(pool_table(with(|b| &b.psms).into_iter(), out)?),
         None => None,
     };
-    let chromatograms = pool_table(with(|b| &b.chromatograms).into_iter(), p.out_chromatograms)?;
+    let chromatograms = match p.out_chromatograms {
+        Some(out) => Some(pool_table(with(|b| &b.chromatograms).into_iter(), out)?),
+        None => None,
+    };
+    let loser_lists: Vec<Vec<u32>> = losers
+        .iter()
+        .map(|set| {
+            let mut v: Vec<u32> = set.iter().copied().collect();
+            v.sort_unstable();
+            v
+        })
+        .collect();
+    let losers_written = match p.out_losers {
+        Some(out) => Some(write_losers(out, &loser_lists)?),
+        None => None,
+    };
     let competed = match p.out_competed {
         Some(out) => Some(pool_table(with(|b| &b.competed).into_iter(), out)?),
         None => {
@@ -278,17 +357,20 @@ pub fn run(p: PoolParams) -> Result<PoolStats> {
     };
     let stats = PoolStats {
         psms: psms.as_ref().map_or(0, |w| w.rows),
-        chromatograms: chromatograms.rows,
+        chromatograms: chromatograms.as_ref().map_or(0, |w| w.rows),
         competed: competed.as_ref().map_or(0, |w| w.rows),
         psms_hash: psms.map(|w| w.content_hash),
-        chromatograms_hash: chromatograms.content_hash,
+        chromatograms_hash: chromatograms.map(|w| w.content_hash),
         competed_hash: competed.map(|w| w.content_hash),
         duplicates,
+        losers: loser_lists,
+        losers_written,
     };
     info!(
         groups = p.bands.len(),
         psms = stats.psms,
         psms_pooled = p.out_psms.is_some(),
+        chromatograms_pooled = p.out_chromatograms.is_some(),
         competed_pooled = p.out_competed.is_some(),
         chromatograms = stats.chromatograms,
         competed = stats.competed,
@@ -371,7 +453,8 @@ mod tests {
         let stats = run(PoolParams {
             bands: &[b0, b1],
             out_psms: Some(op.as_str()),
-            out_chromatograms: &oc,
+            out_chromatograms: Some(&oc),
+            out_losers: None,
             out_competed: Some(ok.as_str()),
             bands_disjoint: false,
         })
@@ -470,7 +553,8 @@ mod tests {
         let stats = run(PoolParams {
             bands: &[b0, b1],
             out_psms: Some(op.as_str()),
-            out_chromatograms: &oc,
+            out_chromatograms: Some(&oc),
+            out_losers: None,
             out_competed: Some(ok.as_str()),
             bands_disjoint: false,
         })
@@ -507,7 +591,8 @@ mod tests {
         let stats = run(PoolParams {
             bands: &[b0, b1],
             out_psms: None,
-            out_chromatograms: &oc,
+            out_chromatograms: Some(&oc),
+            out_losers: None,
             out_competed: Some(ok.as_str()),
             bands_disjoint: false,
         })
@@ -544,7 +629,8 @@ mod tests {
             let stats = run(PoolParams {
                 bands: &bands,
                 out_psms: None,
-                out_chromatograms: &oc,
+                out_chromatograms: Some(&oc),
+                out_losers: None,
                 out_competed: Some(ok.as_str()),
                 bands_disjoint: disjoint,
             })
@@ -568,7 +654,8 @@ mod tests {
         let stats = run(PoolParams {
             bands: &bands,
             out_psms: None,
-            out_chromatograms: &oc,
+            out_chromatograms: Some(&oc),
+            out_losers: None,
             out_competed: None,
             bands_disjoint: true,
         })
@@ -579,7 +666,8 @@ mod tests {
         let e = run(PoolParams {
             bands: &bands,
             out_psms: None,
-            out_chromatograms: &out("refused_chrom"),
+            out_chromatograms: Some(&out("refused_chrom")),
+            out_losers: None,
             out_competed: None,
             bands_disjoint: false,
         })

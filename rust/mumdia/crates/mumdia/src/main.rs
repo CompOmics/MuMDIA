@@ -334,8 +334,15 @@ enum Cmd {
     Quant {
         #[arg(long)]
         psms_scored: String,
+        /// The run's chromatogram table, or a grouped run's band tables in band order
+        /// (`groups/gNN/chromatograms.parquet`) when it did not pool them.
+        #[arg(long, num_args = 1..)]
+        chromatograms: Vec<String>,
+        /// A grouped run's `groups/overlap_losers.parquet`: the candidates each band table
+        /// does not contribute, because the pool's overlap dedup gave them to another
+        /// band. Its `band` column indexes the `--chromatograms` list.
         #[arg(long)]
-        chromatograms: String,
+        overlap_losers: Option<String>,
         #[arg(long)]
         out_peptide: String,
         #[arg(long)]
@@ -1441,7 +1448,8 @@ fn real_main() -> Result<()> {
             let stats = stages::pool::run(stages::pool::PoolParams {
                 bands: &bands,
                 out_psms: psms.then_some(op.as_str()),
-                out_chromatograms: &oc,
+                out_chromatograms: Some(&oc),
+                out_losers: None,
                 out_competed: Some(ok.as_str()),
                 // The band directories carry no plan here, so the pool looks.
                 bands_disjoint: false,
@@ -1602,6 +1610,7 @@ fn real_main() -> Result<()> {
         Cmd::Quant {
             psms_scored,
             chromatograms,
+            overlap_losers,
             out_peptide,
             out_protein,
             out_fragment,
@@ -1610,9 +1619,21 @@ fn real_main() -> Result<()> {
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            let losers = match &overlap_losers {
+                Some(path) => stages::pool::read_losers(path, chromatograms.len())?,
+                None => vec![Vec::new(); chromatograms.len()],
+            };
+            let tables: Vec<stages::quant::ChromTable> = chromatograms
+                .iter()
+                .zip(losers)
+                .map(|(path, drop)| stages::quant::ChromTable {
+                    path: path.clone(),
+                    drop,
+                })
+                .collect();
             stages::quant::run(stages::quant::QuantParams {
                 psms_scored: &psms_scored,
-                chromatograms: &chromatograms,
+                chromatograms: &tables,
                 out_peptide: &out_peptide,
                 out_protein: &out_protein,
                 out_fragment: out_fragment.as_deref(),

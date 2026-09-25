@@ -710,6 +710,7 @@ pub fn run(p: RunParams) -> Result<()> {
                 "compete",
                 &ch,
             ));
+            let chrom = vec![quant::ChromTable::whole(&chrom)];
             (seed, lib_p, psms, chrom, feats, vec![competed], None)
         };
     let _ = &feats;

@@ -27,6 +27,7 @@ use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
 
+use crate::stages::quant::ChromTable;
 use crate::stages::*;
 
 pub struct RunExperimentParams<'a> {
@@ -183,7 +184,7 @@ fn process_run(
     // `lib_p_base` carries placeholder iRT the multi-head calibration must replace in full
     // (`predict_frag.defer_deeplc_to_multihead`).
     irt_placeholder: bool,
-) -> Result<(Vec<String>, String, Option<String>)> {
+) -> Result<(Vec<String>, Vec<ChromTable>, Option<String>)> {
     let co = convert_run(cfg, mzml, out, top_peaks_ms2, max_spectra)?;
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let mh_heads = cfg
@@ -309,7 +310,7 @@ fn chain_after_seed(
     seed: &str,
     shared_rt_lib: Option<&str>,
     irt_placeholder: bool,
-) -> Result<(Vec<String>, String, Option<String>)> {
+) -> Result<(Vec<String>, Vec<ChromTable>, Option<String>)> {
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let mh_heads = cfg
         .rt_im_train
@@ -325,7 +326,11 @@ fn chain_after_seed(
         rayon::current_num_threads(),
     )?;
     let (competed, chrom) = finish_run(cfg, ch, &lib_p, lib_f, co, seed, out)?;
-    Ok((vec![competed], chrom, produced_rt_lib))
+    Ok((
+        vec![competed],
+        vec![ChromTable::whole(&chrom)],
+        produced_rt_lib,
+    ))
 }
 
 /// Choose the precursor table the rest of an ungrouped run reads: a previous run's adapted
@@ -987,7 +992,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let par = cfg.experiment.parallel_runs.max(1);
     // Each run's competed tables, in row order (see `process_run`).
     let mut competed: Vec<Vec<String>> = Vec::with_capacity(n_runs);
-    let mut chroms: Vec<String> = Vec::with_capacity(n_runs);
+    // Each run's chromatogram tables, in row order: one, or a grouped run's band tables
+    // (`groups.pool_chromatograms = false`).
+    let mut chroms: Vec<Vec<ChromTable>> = Vec::with_capacity(n_runs);
 
     // Under `RtLibraryScope::FirstRunOnly` (the default) the first run is processed alone
     // so the library it adapted can be handed to all the others. That adaptation -- the
@@ -1113,7 +1120,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let run_one = |i: usize,
                    shared: Option<&str>,
                    slices_from: Option<&str>|
-     -> Result<(Vec<String>, String, Option<String>)> {
+     -> Result<(Vec<String>, Vec<ChromTable>, Option<String>)> {
         match &prepared[i] {
             Some((co, seed)) => chain_after_seed(
                 cfg,
@@ -1269,7 +1276,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         let fronts = fronts?;
         let (comp0, chrom0) = finish_run(cfg, &ch, &lib0, &lib_f, &co0, &seed0, &out0)?;
         competed.push(vec![comp0]);
-        chroms.push(chrom0);
+        chroms.push(vec![ChromTable::whole(&chrom0)]);
         if produced.is_none() {
             warn!(
                 "run-experiment: the first run produced no adapted library; the remaining \
@@ -1307,7 +1314,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             };
             for (comp, chrom) in done {
                 competed.push(vec![comp]);
-                chroms.push(chrom);
+                chroms.push(vec![ChromTable::whole(&chrom)]);
             }
         }
         first = n_runs;
@@ -1359,7 +1366,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "run-experiment: per-run chains in parallel (each run can hold tens of GB;              lower experiment.parallel_runs if memory is tight)"
         );
         for chunk in rest.chunks(par) {
-            let done: Vec<(Vec<String>, String, Option<String>)> = chunk
+            let done: Vec<(Vec<String>, Vec<ChromTable>, Option<String>)> = chunk
                 .par_iter()
                 .map(|&i| {
                     info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");

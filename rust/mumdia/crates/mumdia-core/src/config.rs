@@ -2169,6 +2169,28 @@ pub struct GroupsConfig {
     /// on a grouped run by comparing `psms_scored.parquet` byte for byte against a run with
     /// the default.
     pub pool_competed: bool,
+    /// Write the run's pooled `chromatograms.parquet`. Default `true`. With `false`, quant
+    /// reads the bands' own chromatogram tables in band order, dropping from each the
+    /// candidates the pool's overlap dedup gave to another band, and the pooled copy is not
+    /// written: one full splice write, hash and read of the run's largest artifact less
+    /// (about 68 GB per run on the immunopeptidomics experiment). The pool writes those
+    /// loser sets to `groups/overlap_losers.parquet` (`band`, `candidate_id`), so a later
+    /// `mumdia quant --chromatograms <band tables> --overlap-losers <that file>` reads the
+    /// same rows. Unlike `pool_competed` this holds for overlapping bands as well, and
+    /// nothing but quant reads the pooled table (the candidate audit and match-between-runs
+    /// do not).
+    ///
+    /// The quant tables are byte-identical either way; what changes is the artifact set.
+    /// There is no pooled `chromatograms.parquet` (one an earlier run left in the
+    /// directory is removed) and no manifest record for it, `overlap_losers.parquet` is
+    /// written and recorded instead, and the quant report's `chromatograms` lists the band
+    /// tables with `chromatogram_dropped_candidates`. The band chromatogram tables are then
+    /// the run's only chromatograms, so the band directories are no longer disposable once
+    /// the run is accepted: deleting them loses re-quantification. `mumdia pool
+    /// --groups-dir` rebuilds the pooled table from them. Validate on a grouped run by
+    /// comparing `peptide_quant.parquet`, `protein_group_quant.parquet` and
+    /// `fragment_quant.parquet` byte for byte against a run with the default.
+    pub pool_chromatograms: bool,
 }
 impl Default for GroupsConfig {
     fn default() -> Self {
@@ -2180,6 +2202,7 @@ impl Default for GroupsConfig {
             balance: GroupBalance::Precursors,
             delete_band_intermediates: false,
             pool_competed: true,
+            pool_chromatograms: true,
         }
     }
 }

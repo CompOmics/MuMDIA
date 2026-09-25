@@ -95,7 +95,11 @@ struct BandExtract {
 pub struct Pooled {
     pub seed: String,
     pub psms: String,
-    pub chromatograms: String,
+    /// The chromatogram tables quant reads for this run, in row order: the pooled
+    /// `chromatograms.parquet`, or, when it was not written (`groups.pool_chromatograms =
+    /// false`), the bands' own tables in band order, each with the overlap losers it does
+    /// not contribute.
+    pub chromatograms: Vec<super::quant::ChromTable>,
     pub features: String,
     /// The competed tables rescore reads for this run, in row order: the pooled
     /// `psms_competed.parquet`, or, when it was not written (`groups.pool_competed =
@@ -1089,10 +1093,38 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             }
         }
     }
-    let out = Pooled {
+    // The chromatograms have one reader, quant, which can read the band tables itself with
+    // the overlap losers (`groups.pool_chromatograms`).
+    let pooled_chrom_path = d("chromatograms.parquet");
+    let losers_path = d("groups/overlap_losers.parquet");
+    let pool_chromatograms = cfg.groups.pool_chromatograms;
+    if !pool_chromatograms {
+        info!(
+            groups = arts.len(),
+            bands_disjoint,
+            "groups: the chromatograms stay per band and quant reads the band tables with the \
+             overlap losers (groups.pool_chromatograms = false)"
+        );
+    }
+    // A pooled table (or loser sets) an earlier run left here under the other setting is
+    // not this run's, and nothing would say so: take it away with its report, so that
+    // neither a later standalone quant nor a reader of the directory mistakes it for this
+    // run's.
+    let stale = if pool_chromatograms {
+        &losers_path
+    } else {
+        &pooled_chrom_path
+    };
+    for f in [stale.clone(), format!("{stale}.report.json")] {
+        if std::path::Path::new(&f).exists() {
+            std::fs::remove_file(&f).with_context(|| format!("removing an earlier run's {f}"))?;
+        }
+    }
+    let mut out = Pooled {
         seed: pooled_seed,
         psms: d("psms_extracted.parquet"),
-        chromatograms: d("chromatograms.parquet"),
+        // Filled in below, once the pool has found the overlap losers.
+        chromatograms: Vec::new(),
         // Not pooled: nothing reads a run-level features table (compete's output carries
         // the feature columns), and on a real run it is 55 GB of writes per run.
         features: String::new(),
@@ -1117,11 +1149,23 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     let stats = pool::run(pool::PoolParams {
         bands: &arts,
         out_psms: pool_psms.then_some(out.psms.as_str()),
-        out_chromatograms: &out.chromatograms,
+        out_chromatograms: pool_chromatograms.then_some(pooled_chrom_path.as_str()),
+        out_losers: (!pool_chromatograms).then_some(losers_path.as_str()),
         out_competed: pool_competed.then_some(pooled_competed_path.as_str()),
         bands_disjoint,
     })
     .context("pooling the window groups")?;
+    out.chromatograms = if pool_chromatograms {
+        vec![super::quant::ChromTable::whole(&pooled_chrom_path)]
+    } else {
+        arts.iter()
+            .zip(&stats.losers)
+            .map(|(a, drop)| super::quant::ChromTable {
+                path: a.chromatograms.clone(),
+                drop: drop.clone(),
+            })
+            .collect()
+    };
     let pooled_artifacts = stats
         .psms_hash
         .clone()
@@ -1136,13 +1180,24 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             )
         })
         .into_iter()
-        .chain([(
-            artifact::CHROMATOGRAMS.0,
-            artifact::CHROMATOGRAMS,
-            &out.chromatograms,
-            stats.chromatograms,
-            stats.chromatograms_hash.clone(),
-        )])
+        .chain(stats.chromatograms_hash.clone().map(|h| {
+            (
+                artifact::CHROMATOGRAMS.0,
+                artifact::CHROMATOGRAMS,
+                &pooled_chrom_path,
+                stats.chromatograms,
+                h,
+            )
+        }))
+        .chain(stats.losers_written.clone().map(|w| {
+            (
+                artifact::OVERLAP_LOSERS.0,
+                artifact::OVERLAP_LOSERS,
+                &losers_path,
+                w.rows,
+                w.content_hash,
+            )
+        }))
         .chain(stats.competed_hash.clone().map(|h| {
             (
                 artifact::PSMS_COMPETED.0,

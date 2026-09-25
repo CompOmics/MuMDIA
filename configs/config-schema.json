@@ -2585,6 +2585,19 @@
       "help": "Write the run's pooled `psms_competed.parquet`. Default `true`. With `false`, rescore reads the bands' own competed tables in band order, each with the run's `source`, and the pooled copy is not written: one full write and read of the run's widest artifact less (about 83 GB per run on the immunopeptidomics experiment). This happens only where it cannot change a result: the bands' library row spans must be disjoint, so no candidate was searched in two bands and there is no overlap duplicate to drop, and neither the candidate audit (`extract.emit_candidate_audit`) nor match-between-runs (`mbr.strategy`), which read the pooled table, may be on. Otherwise the table is pooled as with `true`, and the log says why. `psms_scored.parquet` is byte-identical either way; what changes is the artifact set. The run's manifest then has no pooled `psms_competed` record, the scored table's report lists the band tables under `competed_inputs` with their `competed_sources`, and a later standalone `mumdia rescore` or audit needs the table rebuilt first with `mumdia pool --groups-dir`, which the band tables allow. Validate on a grouped run by comparing `psms_scored.parquet` byte for byte against a run with the default.",
       "gates": [],
       "source_struct": "GroupsConfig"
+    },
+    {
+      "path": "groups.pool_chromatograms",
+      "name": "pool_chromatograms",
+      "section": "groups",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": true,
+      "default_text": "true",
+      "help": "Write the run's pooled `chromatograms.parquet`. Default `true`. With `false`, quant reads the bands' own chromatogram tables in band order, dropping from each the candidates the pool's overlap dedup gave to another band, and the pooled copy is not written: one full splice write, hash and read of the run's largest artifact less (about 68 GB per run on the immunopeptidomics experiment). The pool writes those loser sets to `groups/overlap_losers.parquet` (`band`, `candidate_id`), so a later `mumdia quant --chromatograms <band tables> --overlap-losers <that file>` reads the same rows. Unlike `pool_competed` this holds for overlapping bands as well, and nothing but quant reads the pooled table (the candidate audit and match-between-runs do not). The quant tables are byte-identical either way; what changes is the artifact set. There is no pooled `chromatograms.parquet` (one an earlier run left in the directory is removed) and no manifest record for it, `overlap_losers.parquet` is written and recorded instead, and the quant report's `chromatograms` lists the band tables with `chromatogram_dropped_candidates`. The band chromatogram tables are then the run's only chromatograms, so the band directories are no longer disposable once the run is accepted: deleting them loses re-quantification. `mumdia pool --groups-dir` rebuilds the pooled table from them. Validate on a grouped run by comparing `peptide_quant.parquet`, `protein_group_quant.parquet` and `fragment_quant.parquet` byte for byte against a run with the default.",
+      "gates": [],
+      "source_struct": "GroupsConfig"
     }
   ],
   "list_sections": [

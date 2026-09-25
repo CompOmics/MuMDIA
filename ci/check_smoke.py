@@ -55,6 +55,8 @@ EXPECTED_SCHEMA_VERSIONS = {
     # single-run manifest. Listed because this dict is the frozen record of
     # schema.rs, and the loop below only checks the schemas it actually sees.
     "lfq_maxlfq": 1,
+    # Written only by a grouped run under `groups.pool_chromatograms = false`.
+    "overlap_losers": 1,
 }
 
 BLAKE3_HEX = re.compile(r"^[0-9a-f]{64}$")

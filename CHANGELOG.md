@@ -53,6 +53,19 @@ than a number. Both are recorded in every run's `manifest.json`.
   table). The file is 4 bytes a value, so it pays where the codec, not the disk, is the
   limit. Validate a new host by rescoring one pool with each handoff and comparing
   `psms_scored.parquet` byte for byte.
+- **`groups.pool_chromatograms = false` has quant read a grouped run's band chromatogram
+  tables directly.** The pool writes the overlap losers it finds anyway to
+  `groups/overlap_losers.parquet` (`band`, `candidate_id`), and quant reads the bands'
+  tables in band order, dropping each band's losers, so the pooled `chromatograms.parquet`
+  (about 68 GB a run on the immunopeptidomics experiment) is neither written, hashed nor
+  read. It holds for overlapping bands too. Default `true`. The quant tables are
+  byte-identical either way (tests with two overlapping bands and with a candidate
+  straddling two band files; a smoke arm compares the quant tables and TSVs of the
+  three-band fixture). What changes is the artifact set: no pooled chromatogram record,
+  an `overlap_losers` record (schema `overlap_losers` 1), and the quant report lists the
+  band tables with `chromatogram_dropped_candidates`. The band directories are then the
+  run's only chromatograms. `mumdia quant` takes several `--chromatograms` and
+  `--overlap-losers` for the same read by hand.
 - **`groups.pool_competed = false` has rescore read a grouped run's band tables directly.**
   Rescore takes a table-to-source map (`competed_sources` in the scored report), so the
   bands' competed tables in band order give exactly the rows the pooled

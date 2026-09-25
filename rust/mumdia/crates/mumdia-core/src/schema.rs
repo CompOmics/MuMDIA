@@ -38,4 +38,7 @@ pub mod artifact {
     pub const FRAGMENT_QUANT: (&str, u32) = ("fragment_quant", 1);
     /// Cross-run MaxLFQ table, written only by `run-experiment` and `quant-lfq`.
     pub const LFQ_MAXLFQ: (&str, u32) = ("lfq_maxlfq", 1);
+    /// The candidates a grouped run's pool dropped from each band (`band`,
+    /// `candidate_id`), written only under `groups.pool_chromatograms = false`.
+    pub const OVERLAP_LOSERS: (&str, u32) = ("overlap_losers", 1);
 }

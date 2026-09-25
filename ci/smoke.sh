@@ -208,14 +208,17 @@ diff "$work/out_grouped/peptides.tsv" "$work/out_grouped2/peptides.tsv" > /dev/n
     || { echo "two grouped runs of the same input disagree"; exit 1; }
 echo "    ok: 3 bands, $n_ms2 MS2 + $n_ms1 MS1 decodes, $n_grouped peptides, reproducible"
 
-# The same grouped run with the competed rows left per band (`groups.pool_competed =
-# false`): rescore reads the three band tables with a table-to-source map instead of the
-# pooled copy, which must give the same scored table byte for byte. The fixture's bands do
-# not overlap, so the option applies; the log line and the absent pooled table prove it did.
-echo "=== smoke: the grouped run with the competed rows left per band"
-sed 's/"calibration": "per_group" }/"calibration": "per_group", "pool_competed": false }/' \
+# The same grouped run with the competed rows and the chromatograms left per band
+# (`groups.pool_competed = false`, `groups.pool_chromatograms = false`): rescore reads the
+# three band tables with a table-to-source map instead of the pooled copy, which must give
+# the same scored table byte for byte, and quant reads the three band chromatogram tables
+# with the overlap losers, which must give the same quant tables byte for byte. The
+# fixture's bands do not overlap, so the competed option applies; the log lines and the
+# absent pooled tables prove both did.
+echo "=== smoke: the grouped run with the competed rows and chromatograms left per band"
+sed 's/"calibration": "per_group" }/"calibration": "per_group", "pool_competed": false, "pool_chromatograms": false }/' \
     "$work/grouped.json" > "$work/grouped_nopool.json"
-grep -q '"pool_competed": false' "$work/grouped_nopool.json" \
+grep -q '"pool_chromatograms": false' "$work/grouped_nopool.json" \
     || { echo "could not derive the pool_competed = false config"; exit 1; }
 "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
     --out-dir "$work/out_grouped_nopool" --config "$work/grouped_nopool.json" --threads 4 \
@@ -227,7 +230,17 @@ test ! -e "$work/out_grouped_nopool/psms_competed.parquet" \
     || { echo "a pooled psms_competed.parquet was written under pool_competed = false"; exit 1; }
 cmp -s "$work/out_grouped/psms_scored.parquet" "$work/out_grouped_nopool/psms_scored.parquet" \
     || { echo "rescoring the band tables changed psms_scored.parquet"; exit 1; }
-echo "    ok: band tables rescored, psms_scored.parquet byte-identical to the pooled run's"
+grep -q 'the chromatograms stay per band' "$work/grouped_nopool.log" \
+    || { echo "groups.pool_chromatograms = false did not leave the chromatograms per band"; exit 1; }
+test ! -e "$work/out_grouped_nopool/chromatograms.parquet" \
+    || { echo "a pooled chromatograms.parquet was written under pool_chromatograms = false"; exit 1; }
+test -s "$work/out_grouped_nopool/groups/overlap_losers.parquet" \
+    || { echo "the overlap losers were not persisted under pool_chromatograms = false"; exit 1; }
+for f in peptide_quant.parquet protein_group_quant.parquet fragment_quant.parquet peptides.tsv proteins.tsv; do
+    cmp -s "$work/out_grouped/$f" "$work/out_grouped_nopool/$f" \
+        || { echo "quantifying the band chromatogram tables changed $f"; exit 1; }
+done
+echo "    ok: band tables rescored and quantified; psms_scored and the quant tables byte-identical to the pooled run's"
 
 # 4d. Two bands under the default `calibration: global`: the pooled fragment mass
 #     calibration is the one the ungrouped run fitted (docs/33 section 4a). Until

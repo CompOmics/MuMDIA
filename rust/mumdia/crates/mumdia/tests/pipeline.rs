@@ -450,7 +450,7 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
     let qfrag = tmp("quant_fragment_hashed.parquet");
     let wq = stages::quant::run_hashed(stages::quant::QuantParams {
         psms_scored: &scored,
-        chromatograms: &chrom,
+        chromatograms: &[stages::quant::ChromTable::whole(&chrom)],
         out_peptide: &qpep,
         out_protein: &qprot,
         out_fragment: Some(&qfrag),

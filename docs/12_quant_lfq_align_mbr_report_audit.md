@@ -250,6 +250,18 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    against each other; the outputs do not change. The ignored test
    `selective_read_on_a_real_artifact` prints, for a real table and scored table,
    how many pages hold an accepted row and both load times.
+
+   A run's chromatograms can be several tables (`QuantParams::chromatograms`, a list of
+   `ChromTable`): a grouped run under `groups.pool_chromatograms = false` hands quant its
+   bands' tables in band order, each with the overlap losers it does not contribute
+   (`docs/33_window_groups.md`, section 5). They are read in order, each without its
+   losers, and joined with the same `ChromStore::append` that joins row groups, so the
+   store and every output are the pooled table's. A candidate with rows in two tables is
+   refused, since it can only mean the losers were not given. From the command line:
+   `mumdia quant --chromatograms <band tables in band order> --overlap-losers
+   groups/overlap_losers.parquet`. The report's `chromatograms` is then the list of
+   tables, and `chromatogram_dropped_candidates` the number of losers each did not
+   contribute; for one table with no losers both read as before.
 3. **Phase 1** (only when `cfg.bound_peak`): compute a per-candidate elution
    window `(lo_rt, hi_rt, apex_rt)` via `peak_window`. Schema-v3 scored tables
    carry the exact identification apex through compete/rescore; quant anchors the
