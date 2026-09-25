@@ -3387,11 +3387,13 @@ fn fragment_features(
     let mut corrs = Vec::new();
     let mut lags = Vec::new();
     let mut shapes = Vec::new();
+    // Each trace's norm once, not once per pair it is in.
+    let norms: Vec<f64> = traces.iter().map(|t| xcorr_norm(t)).collect();
     for a in 0..traces.len() {
         for b in (a + 1)..traces.len() {
             if axis.len() >= 2 {
                 corrs.push(pearson(&traces[a], &traces[b]));
-                let (lag, shape) = best_xcorr(&traces[a], &traces[b], 5);
+                let (lag, shape) = best_xcorr_normed(&traces[a], &traces[b], 5, norms[a], norms[b]);
                 lags.push(lag.abs() as f64);
                 shapes.push(shape);
             }
@@ -3551,17 +3553,61 @@ fn mean(v: &[f64]) -> f64 {
 
 /// Best cross-correlation of two traces over integer lags in [-maxlag, maxlag].
 /// Returns (lag_of_max, normalized_max_value).
+///
+/// The one-call form, for a family that correlates a pair once. The shipped callers
+/// correlate every pair of a PSM and pass cached norms to [`best_xcorr_normed`] instead
+/// (through [`PairStats`] or directly), so outside the tests nothing calls this today.
+#[cfg_attr(not(test), allow(dead_code))]
 fn best_xcorr(a: &[f64], b: &[f64], maxlag: i32) -> (i32, f64) {
+    if a.len() < 2 {
+        return (0, 0.0);
+    }
+    best_xcorr_normed(a, b, maxlag, xcorr_norm(a), xcorr_norm(b))
+}
+
+/// The Euclidean norm of one trace, exactly as [`best_xcorr`] computes it for each of its
+/// two arguments. A pair matrix calls `best_xcorr` K - 1 times per trace, so the norms are
+/// computed once per trace with this and handed to [`best_xcorr_normed`].
+fn xcorr_norm(a: &[f64]) -> f64 {
+    (a.iter().map(|x| x * x).sum::<f64>()).sqrt()
+}
+
+/// The lag at which every call site cross-correlates, and the lag-window width.
+const XCORR_MAXLAG: usize = 5;
+const XCORR_LAGS: usize = 2 * XCORR_MAXLAG + 1;
+
+/// [`best_xcorr`] with both norms supplied; `na` and `nb` must be [`xcorr_norm`] of `a`
+/// and `b`, which makes the two functions agree bit for bit.
+///
+/// The correlation used to be one serial pass per lag: each lag's dot product a single
+/// dependent chain of adds with a bounds branch inside, 11 chains one after another.
+/// [`lag_dots`] runs the 11 accumulators side by side instead. Every accumulator still
+/// receives exactly its old terms in ascending `i`, starting from `0.0`, each a separate
+/// multiply and add (Rust never contracts them into a fused multiply-add), so every dot
+/// product, every `dot / (na * nb)` and the strict `>` first-maximum selection are
+/// unchanged. Any other lag window, or a `b` shorter than `a` (which indexed out of
+/// bounds before and still does), takes the per-lag loop as it was.
+fn best_xcorr_normed(a: &[f64], b: &[f64], maxlag: i32, na: f64, nb: f64) -> (i32, f64) {
     let n = a.len();
     if n < 2 {
         return (0, 0.0);
     }
-    let na = (a.iter().map(|x| x * x).sum::<f64>()).sqrt();
-    let nb = (b.iter().map(|x| x * x).sum::<f64>()).sqrt();
     if na <= 0.0 || nb <= 0.0 {
         return (0, 0.0);
     }
     let (mut best_lag, mut best_val) = (0i32, f64::MIN);
+    if maxlag == XCORR_MAXLAG as i32 && b.len() >= n {
+        // `b[..n]`: the old loop never read past `n`, whatever `b.len()` was.
+        let dots = lag_dots(a, &b[..n]);
+        for (li, &dot) in dots.iter().enumerate() {
+            let v = dot / (na * nb);
+            if v > best_val {
+                best_val = v;
+                best_lag = li as i32 - maxlag;
+            }
+        }
+        return (best_lag, best_val.max(0.0));
+    }
     for lag in -maxlag..=maxlag {
         let mut dot = 0.0;
         #[allow(clippy::needless_range_loop)] // i also drives j = i + lag
@@ -3578,6 +3624,38 @@ fn best_xcorr(a: &[f64], b: &[f64], maxlag: i32) -> (i32, f64) {
         }
     }
     (best_lag, best_val.max(0.0))
+}
+
+/// The dot products `sum_i a[i] * b[i + lag]` for every lag in
+/// `-XCORR_MAXLAG..=XCORR_MAXLAG`, in that order, over the `i` where `i + lag` is inside
+/// `0..n`. `b` must be exactly as long as `a`.
+///
+/// `i` is the outer loop, so each accumulator gets its terms in ascending `i` exactly as
+/// the one-lag-at-a-time loop gave them. Away from the two ends every lag is valid and
+/// the body is branch-free over an 11-wide window of `b`; within `XCORR_MAXLAG` of either
+/// end each lag keeps its bounds test.
+fn lag_dots(a: &[f64], b: &[f64]) -> [f64; XCORR_LAGS] {
+    let n = a.len();
+    debug_assert_eq!(b.len(), n);
+    let l = XCORR_MAXLAG;
+    let mut acc = [0.0f64; XCORR_LAGS];
+    for (i, &ai) in a.iter().enumerate() {
+        if i >= l && i + l < n {
+            let w: &[f64; XCORR_LAGS] =
+                b[i - l..=i + l].try_into().expect("an 11-wide window of b");
+            for (dst, &bj) in acc.iter_mut().zip(w) {
+                *dst += ai * bj;
+            }
+        } else {
+            for (li, dst) in acc.iter_mut().enumerate() {
+                // lag = li - l, so j = i + li - l.
+                if i + li >= l && i + li - l < n {
+                    *dst += ai * b[i + li - l];
+                }
+            }
+        }
+    }
+    acc
 }
 
 /// Averagine isotope-envelope agreement from MS1 apex intensities.
@@ -3912,6 +3990,101 @@ mod tests {
                 assert_eq!(bits(&ev.ms1_xic), bits(&want), "{tag}, apex {apex}");
             }
         }
+    }
+
+    /// `best_xcorr` exactly as it stood before the lag-parallel kernel: one serial pass
+    /// per lag, norms recomputed per call. A transcription kept as the reference.
+    fn old_best_xcorr(a: &[f64], b: &[f64], maxlag: i32) -> (i32, f64) {
+        let n = a.len();
+        if n < 2 {
+            return (0, 0.0);
+        }
+        let na = (a.iter().map(|x| x * x).sum::<f64>()).sqrt();
+        let nb = (b.iter().map(|x| x * x).sum::<f64>()).sqrt();
+        if na <= 0.0 || nb <= 0.0 {
+            return (0, 0.0);
+        }
+        let (mut best_lag, mut best_val) = (0i32, f64::MIN);
+        for lag in -maxlag..=maxlag {
+            let mut dot = 0.0;
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..n {
+                let j = i as i32 + lag;
+                if j >= 0 && (j as usize) < n {
+                    dot += a[i] * b[j as usize];
+                }
+            }
+            let v = dot / (na * nb);
+            if v > best_val {
+                best_val = v;
+                best_lag = lag;
+            }
+        }
+        (best_lag, best_val.max(0.0))
+    }
+
+    #[test]
+    fn lag_parallel_xcorr_matches_the_per_lag_loop_bit_for_bit() {
+        // Random, sparse, constant, all-zero, single-spike, signed and tied traces at
+        // every length through the 11-lag window and past it, including the lengths below
+        // 2 * maxlag + 1 where no position has every lag valid, and a `b` longer than `a`
+        // (the old loop read only its first `n` values but normed all of it).
+        let mut rng = Lcg(0xc0ff_ee00_1234_5678);
+        let mut checked = 0usize;
+        for n in 0..48usize {
+            for shape in 0..8u32 {
+                let gen = |rng: &mut Lcg, len: usize| -> Vec<f64> {
+                    (0..len)
+                        .map(|i| match shape {
+                            0 => rng.unit() * 1e4,
+                            1 => {
+                                if rng.below(3) == 0 {
+                                    rng.unit() * 50.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            2 => 7.0,
+                            3 => 0.0,
+                            4 => {
+                                if i == len / 2 {
+                                    3.5
+                                } else {
+                                    0.0
+                                }
+                            }
+                            5 => rng.unit() - 0.5,
+                            6 => (rng.below(4) as f64) * 0.25,
+                            _ => {
+                                if i % 2 == 0 {
+                                    -0.0
+                                } else {
+                                    f64::MIN_POSITIVE * rng.unit()
+                                }
+                            }
+                        })
+                        .collect()
+                };
+                let a = gen(&mut rng, n);
+                for extra in [0usize, 3] {
+                    let b = gen(&mut rng, n + extra);
+                    for maxlag in [5i32, 3] {
+                        let want = old_best_xcorr(&a, &b, maxlag);
+                        let got = best_xcorr(&a, &b, maxlag);
+                        assert_eq!(
+                            (got.0, got.1.to_bits()),
+                            (want.0, want.1.to_bits()),
+                            "n {n}, shape {shape}, extra {extra}, maxlag {maxlag}"
+                        );
+                        let normed =
+                            best_xcorr_normed(&a, &b, maxlag, xcorr_norm(&a), xcorr_norm(&b));
+                        assert_eq!((normed.0, normed.1.to_bits()), (want.0, want.1.to_bits()));
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 48 * 8 * 2 * 2);
     }
 
     #[test]

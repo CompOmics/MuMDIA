@@ -17,7 +17,7 @@
 //! here under the `pairwise_coelution_weighted` name only.
 use std::borrow::Cow;
 
-use super::{best_xcorr, Evidence};
+use super::{best_xcorr_normed, xcorr_norm, Evidence};
 use crate::stats::pearson;
 
 pub const NAMES: &[&str] = &[
@@ -171,6 +171,13 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let mut by_lag_sum = 0.0f64;
     let mut chg_sum = 0.0f64;
     let mut chg_cnt = 0.0f64;
+    // Each trace's cross-correlation norm once (it was recomputed for every pair and for
+    // the reference pass below); `xcorr_norm` is the expression `best_xcorr` evaluates.
+    let norms: Vec<f64> = if has_traces {
+        traces.iter().take(k).map(|t| xcorr_norm(t)).collect()
+    } else {
+        Vec::new()
+    };
     if has_traces {
         for a in 0..k {
             corr[a * k + a] = 1.0;
@@ -180,7 +187,8 @@ pub fn values(e: &Evidence) -> Vec<f64> {
                 corr[b * k + a] = p;
                 pair_p.push(p);
                 pair_w.push(e.pred[a] * e.pred[b]);
-                let (lag, xv) = best_xcorr(&traces[a], &traces[b], MAXLAG);
+                let (lag, xv) =
+                    best_xcorr_normed(&traces[a], &traces[b], MAXLAG, norms[a], norms[b]);
                 xvals.push(xv);
                 xlags.push(lag as f64);
                 // b x y cross pairs
@@ -265,8 +273,9 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let mut ref_lag_abs: Vec<f64> = Vec::new();
     let mut ref_xval: Vec<f64> = Vec::new();
     if has_traces {
-        for trace in traces.iter().take(k) {
-            let (lag, xv) = best_xcorr(trace, r, MAXLAG);
+        let norm_r = xcorr_norm(r);
+        for (trace, &norm_t) in traces.iter().take(k).zip(&norms) {
+            let (lag, xv) = best_xcorr_normed(trace, r, MAXLAG, norm_t, norm_r);
             ref_lag_abs.push((lag as f64).abs());
             ref_xval.push(xv);
         }
