@@ -52,8 +52,10 @@ import json
 import pickle
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
 import time
 import deeplc                                    # import before numpy (OpenMP load order)
 import sys
@@ -118,6 +120,9 @@ PREDICT_CHUNK = 100_000
 # recommended layout on a 64-core host (K = 8 shards of 8 threads) and the per-shard rate
 # docs/32 measured with 12 shards; not swept.
 SHARD_AUTO_THREADS = 8
+# Exit status of a prediction shard that noticed its parent had gone
+# (`_exit_when_the_parent_exits`).
+SHARD_ORPHANED_STATUS = 3
 
 
 
@@ -959,64 +964,134 @@ def predict_sharded(uniq, shards, threads, chunk, ft_model, calibration, lib_out
     different head at rank 80 from last-bit differences in the reference predictions. Each
     child's slice starts at a multiple of `chunk` and it predicts in `chunk`-sized calls
     from there, which are the calls the one process would have made. A child that exits
-    non-zero stops the others and fails the stage; nothing is written then. The scratch
-    directory beside `lib_out` is removed either way.
+    non-zero stops the others and fails the stage; nothing is written then.
+
+    The scratch directory beside `lib_out` is removed on every exit Python sees, and
+    SIGTERM (a Stop in the desktop application, a `kill`) is made one of them
+    (`exit_on_termination_signals`). A kill Python cannot see (SIGKILL, `taskkill /F`)
+    leaves it behind, so the directory and every file in it carry a `.tmp-<pid>` token,
+    which the desktop application's sweep of a stopped run removes. Each child watches a
+    pipe the parent holds on its stdin and ends itself when the parent is gone, whatever
+    ended it (`_exit_when_the_parent_exits`), so no shard keeps predicting for nobody.
+    There is no timeout: a slow shard on a large library cannot be told from a hung one.
     """
     bounds = shard_bounds(len(uniq), shards, chunk)
     base_dir = os.path.dirname(os.path.abspath(lib_out))
-    work = tempfile.mkdtemp(prefix=os.path.basename(lib_out) + ".shards.", dir=base_dir)
+    token = f"tmp-{os.getpid()}"
     procs = []
-    try:
-        cal_path = model_path = None
-        if calibration is not None:
-            cal_path = os.path.join(work, "calibration.pkl")
-            with open(cal_path, "wb") as fh:
-                pickle.dump(calibration, fh, protocol=pickle.HIGHEST_PROTOCOL)
-        if ft_model is not None:
-            model_path = os.path.join(work, "model.pt")
-            torch.save(ft_model, model_path)
-        specs = []
-        for j, (a, b) in enumerate(bounds):
-            stem = os.path.join(work, f"shard_{j:03d}")
-            pq.write_table(pa.table({"seq": uniq.slice(a, b - a)}), stem + "_seqs.parquet")
-            spec = {
-                "shard": j,
-                "label": f"shard {j + 1}/{len(bounds)}",
-                "seqs": stem + "_seqs.parquet",
-                "out": stem + "_values.npy",
-                "timings": stem + "_timings.json",
-                "threads": threads,
-                "chunk": chunk,
-                "calibration": cal_path,
-                "model": model_path,
-                "rows": b - a,
-            }
-            with open(stem + "_spec.json", "w", encoding="utf-8") as fh:
-                json.dump(spec, fh)
-            specs.append(spec)
-        script = os.path.abspath(__file__)
-        for j, spec in enumerate(specs):
-            spec_path = os.path.join(work, f"shard_{j:03d}_spec.json")
-            procs.append(subprocess.Popen([sys.executable, script, "--shard-worker", spec_path]))
-        _wait_for_shards(procs)
-        parts, per_shard = [], []
-        for spec in specs:
-            v = np.load(spec["out"])
-            if v.shape != (spec["rows"],):
-                raise SystemExit(
-                    f"prediction {spec['label']} returned {v.shape[0]} values for "
-                    f"{spec['rows']} sequences; refusing to rewrite the library")
-            parts.append(v)
-            with open(spec["timings"], encoding="utf-8") as fh:
-                per_shard.append(json.load(fh))
-        values = np.concatenate(parts) if parts else np.empty(0, dtype=np.float64)
-    finally:
-        for proc in procs:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-        shutil.rmtree(work, ignore_errors=True)
+    with exit_on_termination_signals():
+        work = tempfile.mkdtemp(prefix=f"{os.path.basename(lib_out)}.{token}.shards.",
+                                dir=base_dir)
+        try:
+            cal_path = model_path = None
+            if calibration is not None:
+                cal_path = os.path.join(work, f"calibration.{token}.pkl")
+                with open(cal_path, "wb") as fh:
+                    pickle.dump(calibration, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            if ft_model is not None:
+                model_path = os.path.join(work, f"model.{token}.pt")
+                torch.save(ft_model, model_path)
+            specs = []
+            for j, (a, b) in enumerate(bounds):
+                stem = os.path.join(work, f"shard_{j:03d}.{token}")
+                pq.write_table(pa.table({"seq": uniq.slice(a, b - a)}), stem + ".seqs.parquet")
+                spec = {
+                    "shard": j,
+                    "label": f"shard {j + 1}/{len(bounds)}",
+                    "seqs": stem + ".seqs.parquet",
+                    "out": stem + ".values.npy",
+                    "timings": stem + ".timings.json",
+                    "spec": stem + ".spec.json",
+                    "threads": threads,
+                    "chunk": chunk,
+                    "calibration": cal_path,
+                    "model": model_path,
+                    "rows": b - a,
+                    "watch_parent": True,
+                }
+                with open(spec["spec"], "w", encoding="utf-8") as fh:
+                    json.dump(spec, fh)
+                specs.append(spec)
+            script = os.path.abspath(__file__)
+            for spec in specs:
+                # stdin is the parent-liveness pipe; nothing is ever written to it.
+                procs.append(subprocess.Popen(
+                    [sys.executable, script, "--shard-worker", spec["spec"]],
+                    stdin=subprocess.PIPE))
+            _wait_for_shards(procs)
+            parts, per_shard = [], []
+            for spec in specs:
+                v = np.load(spec["out"])
+                if v.shape != (spec["rows"],):
+                    raise SystemExit(
+                        f"prediction {spec['label']} returned {v.shape[0]} values for "
+                        f"{spec['rows']} sequences; refusing to rewrite the library")
+                parts.append(v)
+                with open(spec["timings"], encoding="utf-8") as fh:
+                    per_shard.append(json.load(fh))
+            values = np.concatenate(parts) if parts else np.empty(0, dtype=np.float64)
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            shutil.rmtree(work, ignore_errors=True)
     return values, per_shard
+
+
+@contextlib.contextmanager
+def exit_on_termination_signals():
+    """While sharding, turn SIGTERM (and SIGHUP, SIGBREAK where they exist) into SystemExit.
+
+    Python's default SIGTERM action ends the process without unwinding, so no `finally`
+    runs: the shard children would outlive the parent and the scratch directory would stay
+    beside the library. The desktop application stops a run with SIGTERM to the process
+    group and SIGKILL 1.5 s later. A signal that is ignored (`nohup`) or already handled
+    is left alone, and every handler is restored on the way out.
+    """
+    def _raise_exit(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    previous = {}
+    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            if signal.getsignal(sig) is signal.SIG_DFL:
+                previous[sig] = signal.signal(sig, _raise_exit)
+        except (ValueError, OSError):  # not the main thread, or not settable here
+            continue
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+
+
+def _exit_when_the_parent_exits():
+    """In a shard: end this process once the parent's end of its stdin pipe closes.
+
+    The parent holds the write end of a pipe on each child's stdin and never writes to it.
+    However the parent ends (SIGKILL from the OOM killer, `taskkill /F`, a crash), the
+    operating system closes that end and the read returns, so a shard cannot keep
+    predicting on every core for a parent that is gone. It reads the raw descriptor rather
+    than `sys.stdin`, whose buffered reader holds a lock that would stall interpreter
+    shutdown while this thread waits. Runs on a daemon thread.
+    """
+    try:
+        while os.read(0, 4096):
+            pass
+    except OSError:
+        pass
+    print("prediction shard: the parent process is gone; stopping", file=sys.stderr,
+          flush=True)
+    os._exit(SHARD_ORPHANED_STATUS)
 
 
 def _wait_for_shards(procs):
@@ -1046,6 +1121,10 @@ def shard_main(spec_path):
     """One prediction shard (`--shard-worker <spec.json>`), started by `predict_sharded`."""
     with open(spec_path, encoding="utf-8") as fh:
         spec = json.load(fh)
+    if spec.get("watch_parent"):
+        # Only when `predict_sharded` started us: its stdin is the liveness pipe. A shard
+        # started by hand may have a terminal or /dev/null there, which is not.
+        threading.Thread(target=_exit_when_the_parent_exits, daemon=True).start()
     torch.set_num_threads(max(1, int(spec["threads"])))
     try:
         torch.set_num_interop_threads(1)

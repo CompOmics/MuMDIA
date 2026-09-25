@@ -369,7 +369,15 @@ order before its single rewrite. `K` and the threads per child follow from the r
 and the prediction thread budget only (`shard_plan`: `budget / K` each; `K = 0` is one
 child per 8 threads; never more children than threads or whole calls; one process on a
 GPU). A child that exits non-zero stops the others and fails the stage with no library
-written; the scratch directory beside `<lib_out>` is removed either way. At equal threads
+written; the scratch directory beside `<lib_out>` is removed either way, SIGTERM
+included (the desktop application's Stop), because the parent turns it into a normal
+exit while it shards. A kill no process can intercept (SIGKILL, `taskkill /F`) leaves the
+scratch files behind, so the directory and every file in it are named with a
+`.tmp-<pid>` token, which the desktop application's sweep of a stopped run removes. Each
+child watches a pipe the parent holds on its stdin and exits (status 3) when the parent
+is gone, so an out-of-memory kill of the parent does not leave shards predicting on every
+core; measured on Windows with `taskkill /F` of the parent alone. There is no timeout,
+because a slow shard on a large library cannot be told from a hung one. At equal threads
 per process the result is bit-identical to one process
 (`tests/python/test_deeplc_predict.py`, base model and multi-head); at the same engine
 thread count it is float-equivalent, because each child predicts on fewer threads (see

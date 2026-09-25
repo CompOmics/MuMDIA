@@ -487,3 +487,120 @@ def test_a_failed_shard_fails_the_stage_and_writes_nothing(tmp_path):
     assert "prediction shard 2/2 exited with status 7" in (stdout + stderr)
     assert not out.exists()
     assert not list(tmp_path.glob("*.shards.*")), "the shard scratch directory was left behind"
+
+
+# ------------------------------------------------ shard clean-up (no DeepLC needed)
+
+
+def _module_source(names):
+    """The top-level statements of `deeplc_finetune.py` that define `names`, as source."""
+    text = (SCRIPTS / "deeplc_finetune.py").read_text(encoding="utf-8")
+    tree = ast.parse(text)
+    parts = []
+    for node in tree.body:
+        defined = (
+            [node.name] if isinstance(node, ast.FunctionDef)
+            else [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if isinstance(node, ast.Assign) else []
+        )
+        if any(n in names for n in defined):
+            # `get_source_segment` leaves out decorators; they start the segment here.
+            start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+            lines = text.splitlines()[start - 1:node.end_lineno]
+            parts.append("\n".join(lines))
+    assert len(parts) == len(names), "deeplc_finetune.py no longer defines {}".format(names)
+    return "\n\n".join(parts)
+
+
+def test_a_shard_ends_itself_when_its_parent_is_killed(tmp_path):
+    """Hard-kill a parent that holds a shard's stdin pipe: the shard notices and exits.
+
+    The kill is the one Python cannot intercept (SIGKILL, `TerminateProcess`), so the
+    parent's own clean-up never runs and only the child's watchdog can end it. The child
+    runs the worker's `_exit_when_the_parent_exits` with `os._exit` wrapped to leave a
+    marker, because a process that is not ours to wait on has no other way to report.
+    """
+    import subprocess
+    import time
+
+    source = _module_source(["SHARD_ORPHANED_STATUS", "_exit_when_the_parent_exits"])
+    marker = tmp_path / "exited"
+    child = (
+        "import os, sys, threading, time\n"
+        "class _Os:\n"
+        "    read = staticmethod(os.read)\n"
+        "    @staticmethod\n"
+        "    def _exit(status):\n"
+        "        with open(sys.argv[1], 'w') as fh:\n"
+        "            fh.write(str(status))\n"
+        "        os._exit(status)\n"
+        "ns = {'os': _Os, 'sys': sys}\n"
+        "exec(compile(sys.argv[2], 'deeplc_finetune.py', 'exec'), ns)\n"
+        "threading.Thread(target=ns['_exit_when_the_parent_exits'], daemon=True).start()\n"
+        "time.sleep(120)\n"
+    )
+    parent = (
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2], sys.argv[3]],\n"
+        "                     stdin=subprocess.PIPE)\n"
+        "print(p.pid, flush=True)\n"
+        "time.sleep(120)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", parent, child, str(marker), source],
+                            stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip().isdigit(), "the parent did not start its child"
+        time.sleep(1.0)
+        assert not marker.exists(), "the child exited while its parent was alive"
+        proc.kill()
+        proc.wait(timeout=30)
+        deadline = time.monotonic() + 30
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert marker.exists(), "the child outlived its killed parent"
+        ns = {}
+        exec(compile(source, "deeplc_finetune.py", "exec"), ns)  # noqa: S102
+        assert marker.read_text() == str(ns["SHARD_ORPHANED_STATUS"])
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close()
+
+
+def test_sigterm_during_sharding_unwinds_and_restores_the_handler():
+    """SIGTERM inside `exit_on_termination_signals` is a SystemExit, so `finally` runs.
+
+    Run in a subprocess: a handler that failed to install would let SIGTERM end pytest.
+    An ignored signal (`nohup`) must stay ignored, and the default comes back afterwards.
+    """
+    import subprocess
+
+    source = _module_source(["exit_on_termination_signals"])
+    code = (
+        "import contextlib, signal, sys\n"
+        "ns = {'contextlib': contextlib, 'signal': signal}\n"
+        "exec(compile(sys.argv[1], 'deeplc_finetune.py', 'exec'), ns)\n"
+        "guard = ns['exit_on_termination_signals']\n"
+        "cleaned = []\n"
+        "try:\n"
+        "    with guard():\n"
+        "        try:\n"
+        "            signal.raise_signal(signal.SIGTERM)\n"
+        "            for _ in range(1000):\n"
+        "                pass\n"
+        "        finally:\n"
+        "            cleaned.append(True)\n"
+        "    print('no exit')\n"
+        "except SystemExit as exc:\n"
+        "    assert exc.code == 128 + signal.SIGTERM, exc.code\n"
+        "assert cleaned == [True]\n"
+        "assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "with guard():\n"
+        "    assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN\n"
+        "assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN\n"
+        "print('OK')\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code, source], capture_output=True, text=True,
+                          timeout=60)
+    assert done.returncode == 0 and done.stdout.strip() == "OK", (done.stdout, done.stderr)
