@@ -65,8 +65,12 @@ crates read and write. Two things it owns appear on disk:
 `logical_name`, `path`, `format` (always `"parquet"`), `schema_name`,
 `schema_version`, `rows`, `content_hash` (blake3 of the file bytes),
 `producing_stage`, `config_hash`. Built by `record_artifact`
-(`mumdia-io/src/lib.rs:20-39`), which hashes the written Parquet file with
-`blake3_file` (`hash.rs:8-20`, streamed in 64 KiB chunks).
+(`mumdia-io/src/lib.rs:83-101`), which hashes the written Parquet file with
+`blake3_file` (`hash.rs:14-26`, streamed in 64 KiB chunks), or by
+`record_artifact_with_hash` (`lib.rs:107-127`) from a hash the caller already
+has. The writers of the large artifacts compute the same digest while they
+write (`HashingWrite`, docs/03_io_layer.md "Hash on write"), and their stages
+record that digest instead of reading the file back.
 
 **`ArtifactReport`** / `<artifact>.report.json` (`report.rs:11-24`) is written
 alongside each artifact by its producing stage, not by core: `logical_name`,
