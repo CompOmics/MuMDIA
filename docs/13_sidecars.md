@@ -347,8 +347,9 @@ the three it passes for a base-model re-prediction (`--no-finetune --threads N
 engine's rayon thread count because prediction is forward-only), the worker exposes
 CLI-only knobs that `run` never sets:
 `--device cpu|cuda` (cuda aborts with `SystemExit` if `torch.cuda.is_available()`
-is false, `deeplc_finetune.py:79-81`), `--threads` (torch CPU pool, defaults to
-`DEEPLC_FT_THREADS`), `--max-ref N` (cap reference PSMs), `--predict-limit N`
+is false, `deeplc_finetune.py:79-81`), `--threads` (torch training pool, defaults to
+`DEEPLC_FT_THREADS`; the engine passes it only in the multi-head and re-prediction
+modes), `--max-ref N` (cap reference PSMs), `--predict-limit N`
 (cap peptidoforms predicted), and `--skip-predict` (fine-tune only, exercise the
 crash path without the full-library prediction, `deeplc_finetune.py:71-76,
 131-133`). The long
@@ -382,8 +383,13 @@ per process the result is bit-identical to one process
 (`tests/python/test_deeplc_predict.py`: base model, multi-head, and a seeded one-thread
 fine-tune whose saved module every child loads with `torch.load`); at the same engine
 thread count it is float-equivalent, because each child predicts on fewer threads (see
-the thread cap below for what that does). Each child holds its own model copy
-(0.3-0.5 GB).
+the thread cap below for what that does). Each child is a Python process with torch
+and DeepLC loaded: 0.54 GB resident after import and 0.57 GB after the model load on the
+Windows desktop measured, so the model itself is about 35 MB (10.3 MB of parameters) and
+the per-child cost is the runtime. The parent drops its own model copy before the children
+start. Whether sharding is faster at all is open: on that desktop the forward pass
+dominated and scaled with threads, so four processes of two threads were no faster than
+one of eight (`docs/08_rt_im_train.md`, "Sharded whole-library prediction").
 
 **DeepLC thread cap.** Every DeepLC call site asks for the engine's rayon thread count
 (the fine-tune's training pool keeps its own bound), and both workers cap what they
@@ -394,10 +400,19 @@ before Linux 5.5; the `(physical_package_id, core_id)` pair only where neither e
 because on many ARM64 systems `core_id` restarts in each cluster), and every physical core
 (`GetLogicalProcessorInformationEx`) on Windows. Elsewhere the count is unknown and
 nothing is capped. The cap is a ceiling, never a target: a request at or below it is
-taken as given, so the default path changes only on a host where the engine's thread
-count exceeds the physical cores, which is the default on any SMT machine run without
-`--threads`. `deeplc_worker.py` took torch's own default before (the physical cores on
-an MKL build), so it now also follows an explicit `--threads` below that. Measured on
+taken as given. The engine asks for every logical CPU unless `--threads` says otherwise,
+so on an SMT host run without `--threads` the cap binds by default (128 to 64 threads on
+doxy, 32 to 24 on the i9 desktop), and the default output there changes the way any change
+of `--threads` changes it (below). Two changes do not depend on the cap.
+`deeplc_worker.py` took torch's own default before (the physical cores on an MKL build),
+so it now also follows an explicit `--threads` below that. And the prediction after a
+fine-tune ran on the 8 training threads (`DEEPLC_FT_THREADS`) and now runs on the engine's
+thread count, so the `finetune_deeplc` output changes on every host with more than 8
+physical cores. It is float-equivalent: on a 6,600-row fixture with a seeded fine-tune,
+predicting on 24 threads instead of 8 moved 36 rows in the last bit (at most 6.1e-5), far
+inside the fine-tune's own draw variance. `DEEPLC_FT_THREADS` now bounds training only,
+and `--threads` or
+`MUMDIA_DEEPLC_THREAD_CAP` bounds the prediction. Measured on
 doxy (64 cores, 128 CPUs), the multi-head step took 10:41 at 96 threads and 18:09 at
 128, because every OpenMP-parallel op waits for its slowest thread.
 `MUMDIA_DEEPLC_THREAD_CAP=N` sets the cap explicitly, and `0` disables it. The
@@ -412,14 +427,18 @@ predictions differed in the last bits between 8 threads and each of 1, 2, 4, 16 
 (at most 3.1e-5), and 1,701 at 32 threads, past the physical cores (at most 1.4e-4). The
 multi-head calibration amplifies this for a few sequences: DeepLC's per-head spline
 hands over to a linear trail outside the reference's range, so a sequence at that edge
-can move by tens of seconds. On a 12,002-row synthetic library, 32 threads against the
-capped 24 moved the median row by 0.002 s and 63 rows by more than 1 s (at most 129 s),
-with the same 80 heads, ridge strength and best head; the unmodified worker at 8
-against 32 threads differs the same way (75 rows above 1 s, 179 s at most). Where the
-cap does not bind, old and new worker wrote byte-identical libraries. Predictions on a
-GPU do not depend on the torch thread count. The cap-binding sweep on a 64-core host,
-with peptides at 1% on `run_psm_q` over seeds, is the validation that remains
-(`docs/08_rt_im_train.md` section 4d).
+can move by up to about two minutes. On a 12,002-row synthetic library, 32 threads
+against the capped 24 moved the median row by 0.002 s and 63 rows by more than 1 s (at
+most 129 s), with the same 80 heads, ridge strength and best head; the unmodified worker
+at 8 against 32 threads differs the same way (75 rows above 1 s, 179 s at most). Where the
+cap does not bind, old and new worker wrote byte-identical libraries (the fine-tune
+path excepted, see above). Predictions on a GPU do not depend on the torch thread count.
+Head identity was checked on the synthetic fixture only. The validation that remains, and
+that the default rests on until it is done, is the survey's sweep on one 64-core host
+(32, 48, 64, 96 and 128 threads on HYE and AIF: max |delta predicted_irt|, the head set in
+`summary.multihead`, and peptides at 1% on `run_psm_q` with the empirical decoy fraction,
+mean of three NN seeds; entrapment if the counts leave the seed spread), to be recorded
+in `docs/08_rt_im_train.md` section 4d.
 
 ### Rescorers (Stage F)
 
@@ -733,8 +752,8 @@ plus the three the Rust caller injects: `MUMDIA_NN_FOLDS` (worker default
 `rescore.num_iter` = 10), `MUMDIA_NN_TRAIN_FDR` (0.01). These worker defaults
 apply only when the sidecar is run standalone. `entrapment_worker.py`:
 `MUMDIA_ENTRAPMENT_MODEL` (`gbm`|`nn`). `deeplc_finetune.py`: `DEEPLC_FT_THREADS`
-(8) plus argparse flags. Note the mokapot worker's **code default model is `nn`**
-(the sklearn MLP inside mokapot), even though the recommended portable path
+(8, the training pool) plus argparse flags. Note the mokapot worker's **code default
+model is `nn`** (the sklearn MLP inside mokapot), even though the recommended portable path
 (`env/mumdia-rescore.yml`) sets `MUMDIA_RESCORE_MODEL=logreg`; the Rust caller
 does not set `MUMDIA_RESCORE_MODEL`, so unless the environment sets it you get the
 MLP. Set it explicitly for the logreg path.

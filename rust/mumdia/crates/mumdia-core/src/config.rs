@@ -734,21 +734,27 @@ pub struct RtImTrainConfig {
     /// one process, the behaviour before this setting existed; `0` is automatic, one
     /// process per 8 threads of the budget. A GPU always gets one process.
     ///
-    /// Featurisation is single-threaded Python and bounds the prediction (about 6,000
-    /// sequences per second per process, docs/32), so more processes help where more
-    /// threads do not: the 4.91M-sequence HYE step took 10:41 in one process at 96 threads,
-    /// and the survey's arithmetic for 8 to 12 shards is 2.5 to 4.5 minutes. Unmeasured
-    /// through the engine. With `K` processes at the same threads each as one process the
-    /// `predicted_irt` column is bit-identical (`tests/python/test_deeplc_predict.py`). At
-    /// the same engine thread count the fit is the same, but each process predicts on
-    /// `budget / K` threads instead of `budget`, and torch's CPU kernels round differently
-    /// at a different thread count: most rows move in the last bits, and the multi-head
-    /// calibration can move a sequence at the edge of its reference range by tens of
-    /// seconds (docs/13, "DeepLC thread cap"). A sharded run is therefore float-equivalent
-    /// to an unsharded one, not bit-identical. Each process holds its own copy of the model
-    /// (0.3-0.5 GB), and this step can hold the process-tree peak. Validate on two
-    /// acquisitions (peptides at 1% inside the seed spread, `docs/08_rt_im_train.md`
-    /// section 4d) before defaulting it on.
+    /// Whether sharding pays is not established. docs/32 attributes the per-process rate
+    /// (about 6,000 sequences per second) to featurisation, which is single-threaded
+    /// Python. On the one CPU measured so far (an i9 desktop, docs/08, "Sharded
+    /// whole-library prediction") the forward pass dominated at 8 threads or fewer and
+    /// scaled with threads inside one
+    /// process, so four processes of two threads were no faster than one of eight.
+    /// Sharding is expected to help only where one process stops scaling with threads,
+    /// as the multi-head step did on doxy (10:41 at 96 threads, 18:09 at 128); the survey's
+    /// arithmetic for HYE at 8 to 12 shards is 2.5 to 4.5 minutes, unmeasured. With `K`
+    /// processes at the same threads each as one process the `predicted_irt` column is
+    /// bit-identical (`tests/python/test_deeplc_predict.py`). At the same engine thread
+    /// count the fit is the same, but each process predicts on `budget / K` threads
+    /// instead of `budget`, and torch's CPU kernels round differently at a different thread
+    /// count: most rows move in the last bits, and under the multi-head calibration a few
+    /// sequences at the edge of the reference range move by up to about two minutes (129 s
+    /// measured, docs/13, "DeepLC thread cap"). A sharded run is therefore float-equivalent
+    /// to an unsharded one, not bit-identical. Each process is its own Python process with
+    /// torch and DeepLC loaded (0.57 GB resident after the model load on the desktop
+    /// measured, of which the model is about 35 MB), and this step can hold the
+    /// process-tree peak. Validate on two acquisitions (peptides at 1% inside the seed
+    /// spread, `docs/08_rt_im_train.md` section 4d) before defaulting it on.
     pub deeplc_predict_shards: usize,
 }
 

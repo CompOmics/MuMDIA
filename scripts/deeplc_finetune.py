@@ -646,10 +646,15 @@ def main():
                          "handed to each. 1 (default) predicts in this process; 0 is "
                          "automatic, one shard per %d threads of the prediction thread "
                          "budget. The budget (--predict-threads after the thread cap) is "
-                         "divided evenly, so K shards of budget/K threads each. Featurisation "
-                         "is single-threaded Python, which is why more processes help where "
-                         "more threads do not. Each child holds its own copy of the model "
-                         "(0.3-0.5 GB). One process when a GPU is available." % SHARD_AUTO_THREADS)
+                         "divided evenly, so K shards of budget/K threads each. Whether it "
+                         "pays is unmeasured where it is meant to: docs/32 attributes the "
+                         "per-process rate to featurisation (single-threaded Python), but on "
+                         "the one desktop measured the forward pass dominated at 8 threads or "
+                         "fewer and 4 shards of 2 threads were no faster than 1 process of 8 "
+                         "(docs/08). Expected to help only where one process stops scaling "
+                         "with threads. Each child is a Python process with torch and DeepLC "
+                         "loaded (about 0.57 GB; the model itself about 35 MB). One process "
+                         "when a GPU is available." % SHARD_AUTO_THREADS)
     ap.add_argument("--predict-chunk", type=int, default=PREDICT_CHUNK, metavar="N",
                     help="unique peptidoforms per prediction call (default %d). Shards are "
                          "cut at multiples of it. Changing it changes how DeepLC batches the "

@@ -326,7 +326,10 @@ pub fn run_deeplc(
 /// Training keeps the worker's bounded pool (`--threads`, default 8: the documented
 /// OpenMP crash was the backward pass). The whole-library prediction after it is
 /// forward-only and gets `threads` (`--predict-threads`), which the worker caps at the
-/// physical cores available to it; before, it ran on the 8 training threads.
+/// physical cores available to it; before, it ran on the 8 training threads. On a host
+/// with more than 8 physical cores that moves the output in the last bits whether or not
+/// the cap binds, and `DEEPLC_FT_THREADS` now bounds training only (docs/13, "DeepLC
+/// thread cap").
 #[allow(clippy::too_many_arguments)]
 pub fn run_deeplc_finetune(
     python: &str,

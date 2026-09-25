@@ -591,13 +591,24 @@ sections 10-16:
   `MUMDIA_DEEPLC_THREAD_CAP=N` overrides it and `0` disables it; the resolved numbers are
   under `torch_threads` in `<lib_out>.summary.json`. Measured on doxy (64 cores, 128
   CPUs): the multi-head step took 10:41 at 96 threads and 18:09 at 128. The cap is a
-  ceiling, so below it nothing changes; where it binds the output is float-equivalent,
-  like any change of `--threads` (docs/13, "DeepLC thread cap").
+  ceiling, and a request at or below it is taken as given, but the engine asks for every
+  logical CPU unless `--threads` says otherwise, so on an SMT host the cap binds by
+  default (128 to 64 on doxy). Where it binds, the output changes as between any two
+  `--threads` values: most rows in the last bits, and under the multi-head calibration a
+  few sequences at the edge of the reference range by up to about two minutes (63 of
+  12,002 fixture rows above 1 s, at most 129 s, same heads). Separately from the cap,
+  the prediction after a fine-tune now runs on the engine thread count instead of the 8
+  training threads, which moves the `finetune_deeplc` output in the last bits on every
+  host with more than 8 cores (`DEEPLC_FT_THREADS` bounds training only). The default
+  still owes the survey's doxy sweep (32-128 threads on HYE and AIF, head set, peptides at
+  1% on `run_psm_q` over three NN seeds; docs/13, "DeepLC thread cap").
 - `rt_im_train.deeplc_predict_shards` (default 1) splits that whole-library prediction
   across processes of `budget / K` threads, with the calibration or fine-tuned model
   fitted once in the parent and no refit per shard. Bit-identical to one process at
-  equal threads per process, float-equivalent at the same `--threads`; unmeasured
-  through the engine, so it stays opt-in until two acquisitions say otherwise.
+  equal threads per process, float-equivalent at the same `--threads`. It is not known to
+  pay: on the one desktop measured the forward pass dominated and scaled with threads,
+  so 4 x 2 threads equalled 1 x 8 (docs/08, "Sharded whole-library prediction"); it stays
+  opt-in until measured where one process stops scaling, on two acquisitions.
 - Any parquet written outside `mumdia-io` and read by the engine must be
   snappy-compressed with arrow `utf8` string columns. Polars defaults to zstd
   and `large_utf8`, and the engine rejects both ("Disabled feature at compile
