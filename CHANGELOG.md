@@ -132,6 +132,23 @@ than a number. Both are recorded in every run's `manifest.json`.
   depended on the previous order. `scripts/sort_fragments.py` applies the same rewrite to a
   table written before this change; the engine still loads an unsorted table through a
   filtered scan, with a warning.
+- **The generated config reference cites functions, not line numbers.**
+  `ci/gen_config_reference.py` cited every environment read as `path:line` and every
+  config struct and enum by its line, and `configs/config-schema.json` carried a
+  `source_line` per setting. Any merge that moved lines in `rescore.rs`, `config.rs`,
+  `main.rs` or a sidecar script therefore made both files stale on every other open pull
+  request, although no variable, field or default had changed. A read is now cited as
+  `path::function` (`Type::method`, `Trait::method`, `module::function` and
+  `outer::inner` in Rust, `Class.method` in Python, `<module>` outside any function), a
+  struct or enum by its name, and the schema field
+  `source_line` is replaced by `source_struct`, the declaring struct (the desktop editor
+  never read either). `--check` also regenerates from copies of every input with blank
+  lines inserted and fails if either artifact differs;
+  `tests/python/test_gen_config_reference.py` pins the same property on synthetic
+  sources. Two reads in one function now share one citation, so the `Read at` column
+  has fewer entries. In the list of reads whose name is not a literal, such reads share
+  one entry that gives their number, and the header still counts reads. The variables,
+  their defaults, the fields and the settings are unchanged.
 ### Added
 
 - **`mumdia pool` pools a grouped run's band artifacts from the command line.** `run` does
