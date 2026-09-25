@@ -568,6 +568,32 @@ impl ChromStore {
         &self.int_vals[self.int_off[row]..self.int_off[row + 1]]
     }
 
+    /// The number of points of axis `id` (0 for [`NO_AXIS`]), or `None` when `id` names
+    /// no stored axis.
+    fn axis_len(&self, id: u32) -> Option<usize> {
+        if id == NO_AXIS {
+            return Some(0);
+        }
+        let a = id as usize;
+        (a + 1 < self.axis_off.len()).then(|| self.axis_off[a + 1] - self.axis_off[a])
+    }
+
+    /// The first row whose axis is not as long as its intensity trace, or whose axis id
+    /// names no stored axis.
+    ///
+    /// Every row's two traces are checked for equal length when it is read
+    /// ([`ChromRead::push_row`]), so this can only fire if the store's own bookkeeping went
+    /// wrong: an axis id minted, deduped or remapped across a row-group or table seam
+    /// ([`ChromStore::append`]) onto an axis of another length. Every integration below
+    /// slices the intensities with indices taken from the axis, so such a row would panic
+    /// deep inside [`trapezoid`] with an index message that names no candidate. One pass
+    /// over the offsets, after the load, turns that into an error that names it.
+    fn first_misaligned_row(&self) -> Option<usize> {
+        (0..self.nrows()).find(|&r| {
+            self.axis_len(self.axis_id[r]) != Some(self.int_off[r + 1] - self.int_off[r])
+        })
+    }
+
     fn name(&self, row: usize) -> &str {
         self.names.get(self.name_id[row])
     }
@@ -1463,6 +1489,22 @@ fn load_chrom_tables(
             store.append(part)?;
         }
         table_end.push(store.nrows());
+    }
+    if let Some(row) = store.first_misaligned_row() {
+        let id = store.axis_id[row];
+        anyhow::bail!(
+            "quant: the chromatogram store pairs a row of candidate_id {} from {} with a \
+             retention-time axis of {} (axis id {id}) and an intensity trace of {} points. \
+             Every row's two traces were the same length when it was read, so this is an \
+             inconsistency in how the axes were shared across row groups or tables, not a \
+             malformed table; please report it with the table and the --threads value.",
+            store.cid[row],
+            tables[table_end.partition_point(|&e| e <= row)].path,
+            store
+                .axis_len(id)
+                .map_or("no stored axis".to_string(), |n| format!("{n} points")),
+            store.inten(row).len()
+        );
     }
     Ok((store, table_end))
 }
@@ -4201,6 +4243,36 @@ mod tests {
         assert_eq!(s.rt(4), grid.as_slice());
         assert!(s.rt_sorted);
         assert!(s.axis_strict[s.axis_id[0] as usize]);
+        assert_eq!(
+            s.first_misaligned_row(),
+            None,
+            "a store built by push is aligned"
+        );
+    }
+
+    #[test]
+    fn a_row_paired_with_an_axis_of_another_length_is_found_before_integration() {
+        // A release binary once panicked inside `trapezoid` with an index message naming
+        // no candidate. Every row is length-checked when it is read, so only the store's
+        // own axis bookkeeping could get there; the load now looks for it and names it.
+        let mut s = ChromStore::new();
+        s.push(3, "y1", 0.0, &[0.0, 1.0, 2.0], &[1.0, 2.0, 1.0])
+            .unwrap();
+        s.push(3, "y2", 0.0, &[0.0, 1.0], &[4.0, 5.0]).unwrap();
+        s.push(3, "b2", 0.0, &[], &[]).unwrap();
+        assert_eq!(s.first_misaligned_row(), None);
+        // Row 1 handed row 0's three-point axis: the shape a wrong seam remap would give.
+        let good = s.axis_id[1];
+        s.axis_id[1] = s.axis_id[0];
+        assert_eq!(s.first_misaligned_row(), Some(1));
+        // An id past the stored axes is found too, rather than indexed.
+        s.axis_id[1] = 99;
+        assert_eq!(s.axis_len(99), None);
+        assert_eq!(s.first_misaligned_row(), Some(1));
+        // And an empty-trace row given a real axis.
+        s.axis_id[1] = good;
+        s.axis_id[2] = s.axis_id[0];
+        assert_eq!(s.first_misaligned_row(), Some(2));
     }
 
     #[test]
