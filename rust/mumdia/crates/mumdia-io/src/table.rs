@@ -820,6 +820,69 @@ impl Drop for AtomicPath {
     }
 }
 
+/// How [`publish_copy_of`] put the bytes at the destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileCopy {
+    /// A second directory entry for the same file: no byte was read or written.
+    HardLink,
+    /// The filesystem refused the link, so the bytes were copied.
+    ByteCopy,
+}
+
+impl FileCopy {
+    /// The spelling a report records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileCopy::HardLink => "hard_link",
+            FileCopy::ByteCopy => "byte_copy",
+        }
+    }
+}
+
+/// Publish the bytes of `src` at `out`, unchanged and without decoding them.
+///
+/// A hard link into the [`AtomicPath`] temp name, then the usual rename, so a reader of
+/// `out` sees its previous content or the complete new one and never a partial file. A
+/// filesystem that cannot link (another volume, FAT, some network and sync folders) falls
+/// back to a byte copy into the same temp name. An error here leaves `out` as it was.
+///
+/// The two names share one file after a link. Every writer in this crate (the parquet
+/// writers, [`write_batches`], this function and `json::write_json`) publishes by renaming
+/// a new file over its destination, which replaces the directory entry and leaves the other
+/// name's file alone, so rewriting either artifact through them never changes the other.
+/// That does not hold for a writer that opens its destination with `File::create`, which
+/// truncates the shared file and so writes through both names. The engine has two, the
+/// `features` PIN and rescore's tab-separated handoff, and neither writes a parquet
+/// artifact path. A tool that edits one of the linked files IN PLACE changes both.
+pub fn publish_copy_of(src: &str, out: &str) -> Result<FileCopy> {
+    publish_copy_of_with(src, out, true)
+}
+
+fn publish_copy_of_with(src: &str, out: &str, allow_link: bool) -> Result<FileCopy> {
+    let target = AtomicPath::new(out)?;
+    let tmp = target.tmp().to_path_buf();
+    // A temp name left by a killed process with the same pid and counter would make the
+    // link fail, and a byte copy onto it would write THROUGH it if it is itself a link to
+    // `src`, truncating the source. Start both from a fresh name.
+    let _ = std::fs::remove_file(&tmp);
+    let linked = allow_link && std::fs::hard_link(src, &tmp).is_ok();
+    let how = if linked {
+        FileCopy::HardLink
+    } else {
+        std::fs::copy(src, &tmp).with_context(|| format!("copying {src} -> {}", tmp.display()))?;
+        FileCopy::ByteCopy
+    };
+    target.publish()?;
+    // POSIX `rename` does nothing and succeeds when both names already refer to the same
+    // file, which is the case when `out` is a link to `src` from a previous run. The temp
+    // name then survives the rename; it is a third name for that same file, so removing it
+    // loses nothing.
+    if tmp.exists() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(how)
+}
+
 /// Write pre-built Arrow record batches to a Snappy Parquet file, preserving
 /// their schema exactly. Unlike [`write_table`] (which builds columns from typed
 /// vecs) this is for passing an existing schema through unchanged, e.g. filtering
@@ -1752,6 +1815,27 @@ impl TableFile {
             .collect()
     }
 
+    /// Rows of each row group of the file, in file order, from the footer this handle
+    /// holds. On a span handle these are still the whole file's row groups.
+    pub fn row_group_rows(&self) -> Vec<usize> {
+        let meta: &ParquetMetaData = self.meta.metadata();
+        (0..meta.num_row_groups())
+            .map(|i| meta.row_group(i).num_rows().max(0) as usize)
+            .collect()
+    }
+
+    /// Whether every parquet leaf column is REQUIRED (maximum definition level 0). Then no
+    /// value in the file can be null, whatever the Arrow schema in its metadata claims.
+    pub fn all_leaves_required(&self) -> bool {
+        self.meta
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .columns()
+            .iter()
+            .all(|c| c.max_def_level() == 0)
+    }
+
     pub fn has_column(&self, name: &str) -> bool {
         self.schema.index_of(name).is_ok()
     }
@@ -2016,6 +2100,45 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(TableFile::open_rows(&p, 8, 5).is_err());
+    }
+
+    #[test]
+    fn row_group_rows_and_required_leaves_describe_the_footer() {
+        // compete reuses a features file's bytes only when both hold (docs/11), so each is
+        // pinned here on its own: the row-group sizes in file order, also through a span
+        // handle, and REQUIRED leaves for plain columns but not for an optional one.
+        let dir = std::env::temp_dir().join(format!("mumdia_table_footer_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let req = dir.join("required.parquet").to_str().unwrap().to_string();
+        let mut w = TableWriter::new(&req).with_row_group_rows(4);
+        w.write_cols(vec![
+            Col::U32("id".into(), (0..10).collect()),
+            Col::F64("v".into(), (0..10).map(|i| i as f64).collect()),
+            Col::Str("s".into(), (0..10).map(|i| format!("s{i}")).collect()),
+        ])
+        .unwrap();
+        w.close().unwrap();
+        let t = TableFile::open(&req).unwrap();
+        assert_eq!(t.row_group_rows(), vec![4, 4, 2]);
+        assert_eq!(
+            TableFile::open_rows(&req, 5, 2).unwrap().row_group_rows(),
+            vec![4, 4, 2]
+        );
+        assert!(t.all_leaves_required());
+
+        let opt = dir.join("optional.parquet").to_str().unwrap().to_string();
+        write_table(
+            &opt,
+            vec![
+                Col::U32("id".into(), vec![0, 1]),
+                Col::OptF64("v".into(), vec![Some(1.0), Some(2.0)]),
+            ],
+        )
+        .unwrap();
+        let t = TableFile::open(&opt).unwrap();
+        assert_eq!(t.row_group_rows(), vec![2]);
+        assert!(!t.all_leaves_required());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2954,6 +3077,69 @@ mod atomic_path_tests {
             std::fs::read_dir(&d).unwrap().count() == 1,
             "no temporary file may remain after publication"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_published_copy_is_the_source_bytes_by_link_and_by_copy() {
+        let d = dir("copy_of");
+        let src = d.join("features.parquet");
+        std::fs::write(&src, b"PAR1 the source bytes PAR1").unwrap();
+        let src_s = src.to_str().unwrap();
+        for (allow_link, want) in [(true, FileCopy::HardLink), (false, FileCopy::ByteCopy)] {
+            let out = d.join(format!("competed_{allow_link}.parquet"));
+            let out_s = out.to_str().unwrap();
+            // Twice: the second publication lands on a destination that already holds the
+            // same bytes, and for the link case already IS the same file.
+            for _ in 0..2 {
+                let how = publish_copy_of_with(src_s, out_s, allow_link).unwrap();
+                // A filesystem without hard links degrades to the copy; both are correct.
+                assert!(how == want || how == FileCopy::ByteCopy, "{how:?}");
+                assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&src).unwrap());
+            }
+        }
+        // The source is intact, and no temporary name survived either publication: the
+        // second link publication renamed a link onto a link to the same file, which POSIX
+        // turns into a no-op that leaves the temporary name behind.
+        assert_eq!(std::fs::read(&src).unwrap(), b"PAR1 the source bytes PAR1");
+        let names: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.contains(".tmp-")),
+            "a temporary file survived: {names:?}"
+        );
+        assert_eq!(names.len(), 3, "{names:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn republishing_either_name_leaves_the_other_file_alone() {
+        // After a link the two names share one file. The writers publish by renaming a new
+        // file over the destination, so rewriting the source must not change the copy.
+        let d = dir("link_independence");
+        let src = d.join("features.parquet");
+        let out = d.join("competed.parquet");
+        std::fs::write(&src, b"v1").unwrap();
+        publish_copy_of(src.to_str().unwrap(), out.to_str().unwrap()).unwrap();
+        let rewrite = AtomicPath::new(src.to_str().unwrap()).unwrap();
+        std::fs::write(rewrite.tmp(), b"v2").unwrap();
+        rewrite.publish().unwrap();
+        assert_eq!(std::fs::read(&src).unwrap(), b"v2");
+        assert_eq!(std::fs::read(&out).unwrap(), b"v1");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_failed_copy_leaves_the_destination_as_it_was() {
+        let d = dir("copy_fails");
+        let out = d.join("competed.parquet");
+        std::fs::write(&out, b"previous").unwrap();
+        let missing = d.join("no_such_features.parquet");
+        assert!(publish_copy_of(missing.to_str().unwrap(), out.to_str().unwrap()).is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"previous");
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&d);
     }
 

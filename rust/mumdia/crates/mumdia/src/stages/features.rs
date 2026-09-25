@@ -15,7 +15,7 @@ use arrow::record_batch::RecordBatch;
 use mumdia_core::config::{FeatureSet, FeaturesConfig};
 use mumdia_core::constants::{ppm_diff, PROTON};
 use mumdia_core::schema::artifact;
-use mumdia_io::report::ArtifactReport;
+use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{Col, ListF32, TableFile, TableWriter};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -2174,6 +2174,12 @@ pub fn bounds_from_samples(s: &BoundSamples, cfg: &FeaturesConfig) -> Option<(f6
 }
 
 pub fn run(p: FeaturesParams) -> Result<u64> {
+    run_hashed(p).map(|w| w.rows)
+}
+
+/// [`run`], returning the output's row count and the content hash its report records, so
+/// an orchestrator can record the artifact without reading and hashing it again.
+pub fn run_hashed(p: FeaturesParams) -> Result<Written> {
     // Neither output may be one of the inputs (docs/31 F6).
     let mut inputs = vec![("--psms", p.psms), ("--chromatograms", p.chromatograms)];
     if let Some(seed) = p.seed {
@@ -2183,7 +2189,14 @@ pub fn run(p: FeaturesParams) -> Result<u64> {
     if !p.out_pin.is_empty() {
         mumdia_io::refuse_output_over_input(p.out_pin, &inputs)?;
     }
-    run_with_chunk_rows(p, CHUNK_CHROM_ROWS)
+    run_chunked(
+        p,
+        CHUNK_CHROM_ROWS,
+        CHUNK_PSM_ROWS,
+        PinFinish::Normal,
+        BoundsSource::Learn,
+        LoaderSource::Leased,
+    )
 }
 
 /// [`run_with_chunk_rows`] with the PSM-row bound exposed as well; see `CHUNK_PSM_ROWS`.
@@ -2201,6 +2214,7 @@ pub fn run_with_chunk_limits(
         BoundsSource::Learn,
         LoaderSource::Leased,
     )
+    .map(|w| w.rows)
 }
 
 /// How the PIN is closed. `Fail` exists only under `cfg(test)` and injects a failure at
@@ -2236,7 +2250,13 @@ impl PinFinish {
 /// whose chunk boundaries move therefore writes a features.parquet with the same values
 /// and different BYTES once the table exceeds one row group
 /// (`moving_a_chunk_boundary_moves_parquet_bytes_above_one_row_group` measures it), and
-/// both chunk limits move boundaries. Nothing downstream reads those bytes.
+/// both chunk limits move boundaries. No stage decodes a different value because of it,
+/// but the bytes are not private to this stage: when compete keeps every row it publishes
+/// these exact bytes as `psms_competed.parquet` (docs/11 "compete: how the competed table
+/// is published"), so a change to `CHUNK_CHROM_ROWS`, `CHUNK_PSM_ROWS` or the writer
+/// thread's chunking also moves the competed table's bytes and its recorded content hash,
+/// and on a grouped run the pooled competed table's. `psms_scored.parquet` and everything
+/// after it are unaffected.
 pub fn run_with_chunk_rows(p: FeaturesParams, chunk_rows: usize) -> Result<u64> {
     run_chunked(
         p,
@@ -2246,6 +2266,7 @@ pub fn run_with_chunk_rows(p: FeaturesParams, chunk_rows: usize) -> Result<u64> 
         BoundsSource::Learn,
         LoaderSource::Leased,
     )
+    .map(|w| w.rows)
 }
 
 /// [`run`] with the run's pooled confident elution half-widths supplied.
@@ -2255,6 +2276,12 @@ pub fn run_with_chunk_rows(p: FeaturesParams, chunk_rows: usize) -> Result<u64> 
 /// its own and falls below the 20-anchor floor: measured on a seven-file
 /// immunopeptidomics search, 735 pooled anchors arrived as 0 or 1 per band.
 pub fn run_with_bounds(p: FeaturesParams, bounds: Option<(f64, f64)>) -> Result<u64> {
+    run_with_bounds_hashed(p, bounds).map(|w| w.rows)
+}
+
+/// [`run_with_bounds`], returning the output's row count and the content hash its report
+/// records, so an orchestrator can record the artifact without reading and hashing it again.
+pub fn run_with_bounds_hashed(p: FeaturesParams, bounds: Option<(f64, f64)>) -> Result<Written> {
     let mut inputs = vec![("--psms", p.psms), ("--chromatograms", p.chromatograms)];
     if let Some(seed) = p.seed {
         inputs.push(("--seed-psms", seed));
@@ -2724,7 +2751,7 @@ fn run_chunked(
     pin_finish: PinFinish,
     bounds: BoundsSource,
     loaders: LoaderSource,
-) -> Result<u64> {
+) -> Result<Written> {
     let t0 = Instant::now();
     let ps = TableFile::open(p.psms)?;
     let cid = ps.u32("candidate_id")?;
@@ -3424,7 +3451,7 @@ fn run_chunked(
     stats.insert("feature_schema_id".to_string(), json!(schema_id));
     stats.insert("n_features".to_string(), json!(cols_active.len()));
     stats.insert("set".to_string(), json!(format!("{:?}", p.cfg.set)));
-    ArtifactReport {
+    let report = ArtifactReport {
         logical_name: artifact::FEATURES.0.to_string(),
         schema_name: artifact::FEATURES.0.to_string(),
         schema_version: artifact::FEATURES.1,
@@ -3435,11 +3462,11 @@ fn run_chunked(
         stats,
         model_identity: None,
         elapsed_ms: elapsed,
-    }
-    .write_for(p.out)?;
+    };
+    report.write_for(p.out)?;
 
     info!(rows, features = cols_active.len(), set = ?p.cfg.set, elapsed_ms = elapsed, "features: done");
-    Ok(rows)
+    Ok(report.written())
 }
 
 #[derive(Clone, Default)]
