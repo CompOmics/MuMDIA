@@ -700,15 +700,22 @@ FASTA's content, the `digest`, `peptidoforms` and `predict_frag` sections (all b
 cache directory), `rng_seed`, whether the iRT is a deferred placeholder, the installed
 MS2PIP, AlphaPeptDeep and DeepLC versions the build uses, the content of the worker
 scripts it runs and the content of the running executable. An entry is a directory
-`<key>` holding the two tables, their `.report.json` files and an `entry.json` with the
-key material and every file's size. It is written to a private temporary directory and
-renamed into place, so a reader sees a complete entry or none, and two concurrent runs
-that build the same key keep the first. A hit is published at the paths a build writes
-(`fragment_library_precursors.parquet`, `fragment_library_fragments.parquet`), by a hard
-link where the filesystem allows and a copy otherwise, and the manifest records both
-with the stage `library-cache` and the content hashes of the stored reports. A stored
-file whose size changed is a miss and is rebuilt. When a predictor version cannot be
-read the run builds as usual and stores nothing. The engine never deletes entries.
+`<key>` holding byte copies of the two tables and their `.report.json` files, and an
+`entry.json` with the key material and every file's size and blake3. It is written to a
+private temporary directory `<key>.partial-<pid>-<ns>` and renamed into place, so a
+reader sees a complete entry or none, and two concurrent runs that build the same key
+keep the first. A hit is copied to the paths a build writes
+(`fragment_library_precursors.parquet`, `fragment_library_fragments.parquet`), and each
+copy is hashed against `entry.json`; the manifest records both tables with the stage
+`library-cache` and the content hashes of the stored reports, and an earlier build's
+`peptides.parquet` and `peptidoforms.parquet` in the output directory are removed. The
+cache never shares a file with a run directory in either direction, so a tool that
+rewrites a run's library in place (rather than by rename) changes neither the cache nor
+another run. A stored file whose size or content changed is a miss: the run rebuilds,
+and its store moves the unusable entry aside and replaces it, so the next run hits again.
+A store also removes temporary directories a killed store left behind once they have
+gone unwritten for an hour. When a predictor version cannot be read the run builds as
+usual and stores nothing. The engine never deletes a usable entry.
 
 A hit is byte-identical to a rebuild when the build is deterministic, which the native
 predictors are; the smoke test runs one FASTA search twice with a cache (store, then

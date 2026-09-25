@@ -46,9 +46,12 @@ than a number. Both are recorded in every run's `manifest.json`.
 - **`predict_frag.library_cache` reuses a FASTA-built library across runs.** Set to a
   directory, `run` and `run-experiment` look the library up under a key of the FASTA's
   content hash, the `digest`, `peptidoforms` and `predict_frag` settings, `rng_seed`, the
-  installed predictor versions, the worker scripts and the engine binary, publish a hit
-  at the paths a build writes and skip digest, peptidoforms and predict-frag; a miss is
-  built and stored. The run stays in FASTA mode. Default unset: every FASTA run builds
+  installed predictor versions, the worker scripts and the engine binary, copy a hit to
+  the paths a build writes and skip digest, peptidoforms and predict-frag; a miss is
+  built and stored. Entries are byte copies with a blake3 per file, checked on every hit,
+  so the cache never shares a file with a run directory; a changed entry is rebuilt and
+  replaced, and a killed store's temporary directory is removed after an hour. The run
+  stays in FASTA mode. Default unset: every FASTA run builds
   its library as before, and now logs the `--lib-precursors` / `--lib-fragments`
   arguments, with the `rt_im_train.library_irt` value that keeps its retention-time
   handling, that would reuse it. A hit is byte-identical to a rebuild for the native
@@ -57,17 +60,22 @@ than a number. Both are recorded in every run's `manifest.json`.
 - **`experiment.parallel_runs = "auto"` sizes the per-run concurrency from the thread
   budget.** One run per 16 threads of `--threads` at most, never more than the runs, and
   each concurrent chain runs in a rayon pool of its own `threads / runs` threads, so
-  extract's fan-out, the feature loaders and a per-run DeepLC worker see that run's share
-  instead of each the whole pool. Chains are pulled from a queue, so a slow run no longer
-  holds its chunk-mates' slots idle. On Linux the first chain that runs alone is measured
-  (`VmHWM` against `MemAvailable`) and bounds how many run at once after it; elsewhere
-  the sizing uses threads only and the log says so. `0` means the same. An explicit
-  number keeps the chunked scheduler on the engine's one pool, and the default stays 1.
-  Opt-in because a narrower pool can lay out intermediate files differently and a
-  per-run DeepLC worker predicts on fewer torch threads. The smoke test checks that
-  every parquet and TSV of the two-run fixture experiment is byte-identical to the
-  sequential run; validate on real data by running one experiment at `1` and at
-  `"auto"` and comparing `peptides.tsv` and `proteins.tsv`. Not measured at scale.
+  extract's fan-out and the feature loaders see that run's share instead of each the
+  whole pool. Chains are pulled from a queue, so a slow run no longer holds its
+  chunk-mates' slots idle. On Linux the first conversion, the first seed and the first
+  chain each run alone from a reset high-water mark and bound how many of the rest run
+  at once (`VmHWM` against `MemAvailable`, lowered to the memory cgroup's headroom inside
+  a container or a batch job); elsewhere the sizing uses threads only and the log says
+  so. `VmHWM` does not count child processes, so chains that each run their own DeepLC
+  adaptation (`rt_library_scope = per_run`) run one at a time under `"auto"`. The reset
+  means `/usr/bin/time -v` no longer reports the lifetime peak of an `"auto"` experiment;
+  use a sampling profiler. `0` means the same as `"auto"`. An explicit number keeps the
+  chunked scheduler on the engine's one pool, and the default stays 1. Opt-in because a
+  narrower pool can lay out intermediate files differently. The smoke test checks that
+  every parquet and TSV of a three-run fixture experiment is byte-identical to the
+  sequential run with two chains at once; validate on real data by running one
+  experiment at `1` and at `"auto"` and comparing `peptides.tsv` and `proteins.tsv`. Not
+  measured at scale.
 - **`extract.chromatogram_schema = 2`, an opt-in chromatogram layout (schema version 2)
   with identical downstream tables.** Each candidate's retention-time axis is stored once
   per parquet row group instead of on every row, each intensity trace from its first to

@@ -591,19 +591,21 @@ pub struct PredictFragConfig {
     /// `peptidoforms` and `predict_frag` sections (all but this field), `rng_seed`, whether
     /// the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep or
     /// DeepLC version the build uses, the worker scripts' content and the running
-    /// executable's content. A hit is published at the paths a build writes (a hard link
-    /// where the filesystem allows) and digest, peptidoforms and predict-frag are skipped; a
-    /// miss is built and then stored. When a predictor version cannot be read, nothing is
-    /// looked up or stored. The run stays in FASTA mode, so every other decision is the one
-    /// a rebuild makes.
+    /// executable's content. A hit is copied to the paths a build writes (a byte copy, never
+    /// a hard link, and checked against the blake3 recorded when it was stored) and digest,
+    /// peptidoforms and predict-frag are skipped; a miss is built and then stored. When a
+    /// predictor version cannot be read, nothing is looked up or stored. The run stays in
+    /// FASTA mode, so every other decision is the one a rebuild makes.
     ///
     /// A hit is byte-identical to a rebuild when the build is deterministic, which the
     /// native predictors are; with a sidecar predictor it reuses the stored prediction. The
     /// manifest records the two library tables with the stage `library-cache`, and the run
-    /// directory then holds no `peptides.parquet` or `peptidoforms.parquet`. Validate by
-    /// running one FASTA search twice with the same cache directory and comparing
-    /// `peptides.tsv` and `proteins.tsv` (the smoke test does this). Entries are never
-    /// deleted by the engine; remove the directory to reclaim the space.
+    /// directory then holds no `peptides.parquet` or `peptidoforms.parquet` (an earlier
+    /// build's are removed). Validate by running one FASTA search twice with the same cache
+    /// directory and comparing `peptides.tsv` and `proteins.tsv` (the smoke test does this).
+    /// A stored entry whose files changed is rebuilt and replaced, and temporary
+    /// directories left by a killed store are removed after an hour; entries themselves are
+    /// never deleted by the engine, so remove the directory to reclaim the space.
     pub library_cache: Option<String>,
 }
 impl Default for PredictFragConfig {
@@ -2044,19 +2046,25 @@ pub struct ExperimentConfig {
     /// `"auto"` (also written `0`) sizes the concurrency from the thread budget: at most
     /// one run per 16 threads of `--threads`, and never more than the runs left. Each
     /// concurrent chain then runs in a thread pool of its own, `threads / runs` wide, so
-    /// extract's fan-out, the feature loaders and a per-run DeepLC worker are sized to that
-    /// run's share instead of each to the whole pool, and a run starts as soon as a slot is
-    /// free rather than at a chunk boundary. On Linux the first chain that runs alone is
-    /// measured, and the rest run at most `0.7 x (MemAvailable + resident) / peak` at once,
-    /// where the peak is the process high-water mark after that chain (`VmHWM`, which
-    /// includes everything the process held before it, so the bound is conservative).
-    /// Elsewhere there is no memory reading, and the log says the sizing used threads only.
-    /// Conversion and seeding, which run before any chain, use the thread-sized count.
-    /// The rows are the same as at `1`; a stage inside a narrower pool can lay out its
-    /// intermediate files differently, as a different `--threads` does, and a per-run
-    /// DeepLC worker predicts on fewer torch threads, which can move the adapted library in
-    /// the last bits. Hence opt-in. To validate on a host, run one experiment at `1` and at
-    /// `"auto"` and compare `peptides.tsv` and `proteins.tsv`. Not measured at scale.
+    /// extract's fan-out and the feature loaders are sized to that run's share instead of
+    /// each to the whole pool, and a run starts as soon as a slot is free rather than at a
+    /// chunk boundary. On Linux the conversions, the seeds and the chains are each bounded
+    /// by memory: the first of them runs alone, from a reset high-water mark
+    /// (`/proc/self/clear_refs`), and the rest run at most
+    /// `0.7 x (available + resident) / peak` at once, where the peak is the process's
+    /// `VmHWM` after that step and `available` is `MemAvailable`, lowered to the headroom
+    /// of the process's memory cgroup (a container's or a batch job's limit) when that is
+    /// smaller. The peak counts this process only, not its child processes, so chains that
+    /// each run their own DeepLC adaptation (`rt_library_scope = per_run`) run one at a
+    /// time under `"auto"`; give a number to run such chains concurrently. Elsewhere there
+    /// is no memory reading, and the log says the sizing used threads only. Because of the
+    /// reset, a lifetime peak read from the process's resource usage (`/usr/bin/time -v`)
+    /// covers only the time since the last measured step; measure an `"auto"` experiment's
+    /// memory with a sampling profiler (`bench/mem_profile.py`). The rows are the same as at
+    /// `1`; a stage inside a narrower pool can lay out its intermediate files differently,
+    /// as a different `--threads` does. Hence opt-in. To validate on a host, run one
+    /// experiment at `1` and at `"auto"` and compare `peptides.tsv` and `proteins.tsv`. Not
+    /// measured at scale.
     #[serde(deserialize_with = "de_parallel_runs")]
     pub parallel_runs: usize,
     /// How often the library's retention times are adapted to a run: once on the first
