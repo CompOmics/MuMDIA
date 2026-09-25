@@ -1135,6 +1135,11 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "min(`--threads`, 8), or min(cores, 8) without `--threads`. `0` or `1` is serial "
         "(`codec.rs` `codec_threads`)"
     ),
+    "MUMDIA_QUANT_SELECTIVE_READ": (
+        "on (quant skips, unread, the chromatogram data pages that hold no kept row). "
+        "`0` reads every page of every row group it opens; the outputs are the same "
+        "(`stages/quant.rs` `selective_read_enabled`)"
+    ),
     "MUMDIA_SIDECAR_DIR": (
         "`<out-dir>/sidecar_work` under `run` and `run-experiment`; `sidecar_work` in the "
         "current directory, or `--work-dir`, for `mumdia rescore`. A path moves the "

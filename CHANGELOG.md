@@ -79,6 +79,21 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **Quant reads less of its two inputs.** The scored table's identity columns
+  (`peptidoform`, `protein_group`, `charge`, `base_peptide_id`) are read at the accepted
+  rows only, and the identification-apex map holds only the candidates whose
+  chromatograms are loaded; the report's `candidates_with_scored_apex` still counts the
+  whole table. The chromatogram table is opened with its offset index: a row group whose
+  `candidate_id` statistics hold no accepted id is not opened, and in an opened group each
+  column skips, unread, every data page that holds no kept row. Rows are never skipped
+  inside a page, because parquet-rs steps over a long list row slower than it decodes it.
+  Every quant table and report is byte-identical (checked against the previous binary on
+  a per-run split of the six-file Astral experiment and on the AIF benchmark, in both the
+  old single-row-group and the current chromatogram layouts). On those tables every list
+  page holds an accepted row, so no page is skipped and the read time does not move; the
+  gain is on tables whose accepted candidates cluster more coarsely than their pages,
+  which `selective_read_on_a_real_artifact` measures from a real footer.
+  `MUMDIA_QUANT_SELECTIVE_READ=0` turns the page selection off for an A/B.
 - **`features.parquet` and `psms_competed.parquet` store the feature columns as float32.**
   Every classifier narrows every feature to f32 before it sees it, so the features stage
   now stores `v as f32` and the classifier inputs, the scores and every scored output are

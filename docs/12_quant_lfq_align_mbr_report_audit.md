@@ -230,6 +230,26 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
 2. Group chromatogram rows by `candidate_id` into `cand_rows` (`quant.rs:301`). Rows
    whose `frag_name` starts with `ms1_` are MS1 isotope XIC pseudo-traces, not
    fragment ions; they are excluded from both peak detection and the top-N sum.
+
+   Only the accepted candidates' rows are kept (and, in consensus mode, the reliable
+   anchors'), except under `--out-peak-bounds`, which keeps every candidate and reads
+   the table as it always has. The table is read row group by row group
+   (`load_chromatograms`). A row group whose `candidate_id` statistics hold no
+   accepted id is not opened: its `[min, max]` is tested against the sorted accepted
+   ids, which is sharper than the accepted range as a whole. In an opened group the
+   `candidate_id` column is read first, and then each other column on its own
+   selection, which skips unread every data page of that column that holds no kept
+   row (the offset index gives the page boundaries; `docs/03_io_layer.md`, "Row
+   selections and page skipping"). Rows are never skipped inside a page, which in
+   parquet-rs costs more than decoding them on long traces, and a group with no whole
+   page to skip is read in one pass. The store is the one pass's, field for field, so
+   every output is byte-identical to a full read. How much is skipped depends on how
+   the accepted rows fall against the pages: on the AIF and Astral HYE tables every
+   list page holds an accepted row, so nothing is skipped and the read costs what it
+   did. `MUMDIA_QUANT_SELECTIVE_READ=0` turns the selection off, to time the two reads
+   against each other; the outputs do not change. The ignored test
+   `selective_read_on_a_real_artifact` prints, for a real table and scored table,
+   how many pages hold an accepted row and both load times.
 3. **Phase 1** (only when `cfg.bound_peak`): compute a per-candidate elution
    window `(lo_rt, hi_rt, apex_rt)` via `peak_window`. Schema-v3 scored tables
    carry the exact identification apex through compete/rescore; quant anchors the

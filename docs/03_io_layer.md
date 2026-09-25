@@ -479,6 +479,35 @@ against 0.44 s. Coalesced reads split into the same automatic group counts,
 which a coalesced scan now uses only when `decode_threads` asks for them: 0.43,
 0.47, 2.97 and 0.46 s.
 
+#### Row selections and page skipping
+
+`TableFile::open` parses the footer only. `TableFile::open_with_offset_index`
+also loads the offset index, the location and first row of every data page of
+every column chunk, where the file carries one (the engine's writer writes it;
+pyarrow does not by default, and such a file opens as with `open`). A reader
+built on that footer and given a row selection skips a page that holds no
+selected row without reading or decompressing it. `TableFile::batches_runs`
+takes a selection as `(rows, keep)` runs over the handle's own rows, on a whole
+file or a span, and reuses the handle's footer, so a caller that selects row
+group by row group parses the footer once. It always materialises the selection
+as a queue of selectors (`RowSelectionPolicy::Selectors`): parquet-rs's
+automatic choice may pick a bitmask, which decodes every row of a chunk and
+filters afterwards, and so reads every page.
+
+Skipping rows inside a page is not free. parquet-rs steps over the rows of a
+list column one repetition level at a time, which on long lists costs more than
+decoding them: on the AIF chromatograms rewritten in the current layout (90
+points per trace on average, 65,536-row groups) selecting 11% of one group's
+`rt` rows took 101 ms against 78 ms for the whole group, while on a run of the
+six-file Astral LFQ experiment (21 points per trace) selecting 7% took 4.2 ms
+against 12.3 ms. A caller that wants a
+selection to cost no more than a full read therefore cuts it at page boundaries
+(`TableFile::page_starts` gives the rows at which a column's pages begin) and
+reads each column on its own selection, which is what quant does
+(`docs/12_quant_lfq_align_mbr_report_audit.md`). What a skipped page holds is
+never checked, so a corrupt page there goes unnoticed where a full read would
+have refused it.
+
 ### Parquet written outside this crate
 
 Several tables the engine reads are produced by a Python helper rather than by
@@ -728,6 +757,10 @@ string (`main.rs:713`).
 | `TableFile::row_parts` | `table.rs:1868` | cut a handle into at most `max_parts` row-contiguous parts, in order: whole row groups, merged, and page-aligned ranges inside a group that has an offset index (a group without one is never split) |
 | `TableFile::batches` / `batches_dict` | `table.rs:2038` / `:2050` | streaming batch reader over the named columns; `batches_dict` reads the named `Utf8` columns as `Dictionary(Int32, Utf8)`, with the same row values |
 | `TableFile::batches_selected` | `table.rs:2100` | stream only the rows of `(rows, keep)` runs, skipping pages with no kept row where the file has an offset index (whole-file handles only) |
+| `TableFile::open_with_offset_index` / `offset_indexed` | `table.rs` | `open` with the page locations of every column chunk loaded as well (opt-in); whether a handle holds them for every row group it covers |
+| `TableFile::batches_runs` | `table.rs` | stream only the rows of `(rows, keep)` runs of this handle, a whole file or a span, through the footer it already holds, always as a queue of selectors; a page with no kept row is skipped unread on an offset-indexed handle |
+| `TableFile::row_group_parts` / `page_starts` | `table.rs` | a handle cut at the file's row-group boundaries; the handle rows at which a column's data pages begin, from the offset index |
+| `TableFile::str_flat_rows` | `table.rs` | `str_flat` at given rows only: one text arena plus offsets for the picked rows, the same null policy |
 | `TableFile::str_interned` / `str_flat` | `table.rs:2309` / `:2358` | a string column as one id per row plus its distinct values (first appearance), or as one text arena plus offsets; both refuse a NULL with the row |
 | `StrBatch` / `StrInterner` | `table.rs:1517` / `:1550` | one batch of a string column, plain or through its dictionary; first-appearance interning with a per-batch key memo |
 | `ListF32` | `table.rs:1422` | borrowed view of a batch's f32 list column (row slices of the batch's own buffer) |

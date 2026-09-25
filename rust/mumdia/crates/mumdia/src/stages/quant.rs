@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use arrow::array::{Array, Float32Array, StringArray, UInt32Array};
+use arrow::record_batch::RecordBatch;
 use mumdia_core::config::{
     FragmentSelection, NormalizeMethod, PeakWindowMode, QuantConfig, QuantQColumn, RollupMethod,
 };
@@ -110,8 +111,8 @@ const CID_BITSET_MAX_BYTES: usize = 64 << 20;
 /// candidate ids by the band's `lib.global_offset`, so a band's accepted ids can start
 /// anywhere in the library.
 enum CidSet {
-    /// `bits` covers `base..=top`; bit `c - base` is set when `c` is wanted.
-    Bits { base: u32, top: u32, bits: Vec<u64> },
+    /// Bit `c - base` is set when `c` is wanted; `bits` ends at the largest wanted id.
+    Bits { base: u32, bits: Vec<u64> },
     /// The id range is too wide to be worth a bit each (see [`CID_BITSET_MAX_BYTES`]).
     Hashed(std::collections::HashSet<u32>),
 }
@@ -120,7 +121,6 @@ impl CidSet {
     fn empty() -> CidSet {
         CidSet::Bits {
             base: 0,
-            top: 0,
             bits: Vec::new(),
         }
     }
@@ -142,7 +142,7 @@ impl CidSet {
             let k = (c - base) as usize;
             bits[k >> 6] |= 1u64 << (k & 63);
         }
-        CidSet::Bits { base, top, bits }
+        CidSet::Bits { base, bits }
     }
 
     #[inline]
@@ -160,17 +160,49 @@ impl CidSet {
     }
 
     /// Inclusive `(min, max)` of the ids in the set, or `None` when it is empty. A row
-    /// group whose `candidate_id` statistics lie outside this range holds no wanted row.
+    /// group whose `candidate_id` statistics lie outside this range holds no wanted row;
+    /// the read plan tests the sharper [`any_in_range`] instead, and this stays as the
+    /// description the tests hold the set to.
+    #[cfg(test)]
     fn range(&self) -> Option<(u32, u32)> {
+        let ids = self.sorted_ids();
+        ids.first().copied().zip(ids.last().copied())
+    }
+
+    /// The ids in the set, ascending and distinct. The read plan tests each row group's
+    /// `candidate_id` range against this with a binary search ([`any_in_range`]), which
+    /// the bitset cannot answer without scanning every word the range covers.
+    fn sorted_ids(&self) -> Vec<u32> {
         match self {
-            CidSet::Bits { bits, .. } if bits.is_empty() => None,
-            CidSet::Bits { base, top, .. } => Some((*base, *top)),
-            CidSet::Hashed(h) => match (h.iter().min(), h.iter().max()) {
-                (Some(&lo), Some(&hi)) => Some((lo, hi)),
-                _ => None,
-            },
+            CidSet::Bits { base, bits, .. } => {
+                let mut out = Vec::new();
+                for (w, &word) in bits.iter().enumerate() {
+                    let mut rest = word;
+                    while rest != 0 {
+                        let b = rest.trailing_zeros() as usize;
+                        out.push(*base + (w * 64 + b) as u32);
+                        rest &= rest - 1;
+                    }
+                }
+                out
+            }
+            CidSet::Hashed(h) => {
+                let mut out: Vec<u32> = h.iter().copied().collect();
+                out.sort_unstable();
+                out
+            }
         }
     }
+}
+
+/// Whether some id of `sorted` (ascending) lies in `[lo, hi]`: the membership test of a row
+/// group's `candidate_id` statistics against the wanted ids. A group can hold a wanted
+/// candidate only if one does, which is a sharper test than the range of the whole set: on
+/// a band table of a grouped run, or a table sorted by candidate, most groups lie inside
+/// the accepted range and hold no accepted candidate at all.
+fn any_in_range(sorted: &[u32], lo: f64, hi: f64) -> bool {
+    let at = sorted.partition_point(|&c| f64::from(c) < lo);
+    at < sorted.len() && f64::from(sorted[at]) <= hi
 }
 
 /// Distinct candidate ids marked so far, one bit per id over a range fixed up front (the
@@ -298,7 +330,7 @@ impl ChromStore {
     /// and move the profile, the apex, the walked window and the quantity. Extract's grid
     /// is positive mzML scan times, but `mumdia quant --chromatograms` takes a table
     /// written by anything, which is the same reason the rt/intensity length check in
-    /// [`load_chrom_span`] exists. (A NaN-carrying axis dedups against an identical one,
+    /// [`ChromRead::push_row`] exists. (A NaN-carrying axis dedups against an identical one,
     /// which `==` never did; the values stored are the same bits either way.)
     fn open_axis_matching(&self, rt: &[f32]) -> Option<u32> {
         (self.open_axis_lo..self.axis_off.len() - 1)
@@ -1261,28 +1293,53 @@ fn chrom_byte_readers(path: &str, nrows: usize, widest: usize) -> usize {
     (CHROM_BYTES_IN_FLIGHT / per_group).max(1) as usize
 }
 
+/// Whether quant reads a chromatogram row group through a row selection over the
+/// candidates it keeps (`MUMDIA_QUANT_SELECTIVE_READ`, default on; `0` decodes every row of
+/// every row group it opens, as before). The store, and so every output, is identical
+/// either way; the switch exists to time the two reads against each other on a new host or
+/// disk.
+fn selective_read_enabled() -> bool {
+    !matches!(
+        std::env::var("MUMDIA_QUANT_SELECTIVE_READ")
+            .as_deref()
+            .map(str::trim),
+        Ok("0")
+    )
+}
+
 /// Read the chromatogram table into one [`ChromStore`], row group by row group.
 ///
 /// Row groups are disjoint, contiguous row spans of the file, so each is read into its own
 /// store and the stores are concatenated in file order ([`ChromStore::append`]): the same
-/// rows, in the same order, as the single pass this replaces. Two things follow, and they
+/// rows, in the same order, as the single pass this replaces. Three things follow, and they
 /// are the whole point.
 ///
 /// * The read runs in parallel, while both phases that consume the store already do
 ///   (`par_iter` over candidates). The load is most of quant's wall: on the six-file HYE
 ///   benchmark the stage is 9 s per file and the table is 802 MB of snappy decompressing
 ///   to 3.62 GB, all of it independent per row group.
-/// * A row group whose `candidate_id` statistics lie outside the accepted range is never
-///   opened. On an unbanded run every group holds an accepted candidate, so this does not
-///   fire; on a banded run, where a band's accepted ids are a narrow slice of the library,
-///   it skips whole groups from the footer alone.
+/// * A row group whose `candidate_id` statistics hold no accepted id is never opened: its
+///   `[min, max]` is tested against the sorted accepted ids ([`any_in_range`]), not only
+///   against their overall range. On an unbanded run nearly every group holds an accepted
+///   candidate, so this seldom fires; on a banded run, where a band's accepted ids are a
+///   narrow slice of the library, it skips whole groups from the footer alone.
+/// * With `selective` (the default outside `keep_all`), an opened group reads its
+///   `candidate_id` first and then skips, unread, every data page of the other columns
+///   that holds no accepted row ([`ChromRead::selected`], over the offset index that
+///   [`TableFile::open_with_offset_index`] loads). How much that saves depends on how the
+///   accepted rows fall against the pages, which the file's own offset index shows
+///   (`selective_read_on_a_real_artifact`): on the AIF and Astral HYE tables every list
+///   page holds an accepted row, so nothing is skipped and the read costs what it did
+///   (within the noise of a warm page cache); a table whose accepted candidates cluster
+///   more coarsely than its pages reads correspondingly fewer bytes.
 ///
 /// It falls back to a single pass when the footer offers no usable layout, when there is
 /// one row group, and when the groups are large enough that neither parallelism nor
 /// pruning would apply -- in which case the per-span copy would be pure loss. Which of the
 /// two runs is therefore a function of `threads` and of the writer's row-group size, and
 /// neither may reach the output: [`ChromStore::append`] rebuilds the single pass's store
-/// exactly, axis ids included, which is what makes that safe.
+/// exactly, axis ids included, which is what makes that safe. The same property makes the
+/// selective read safe, since it too builds its store one row group at a time.
 fn load_chromatograms(
     ch: &TableFile,
     has_pred: bool,
@@ -1290,6 +1347,7 @@ fn load_chromatograms(
     wanted: &CidSet,
     path: &str,
     threads: usize,
+    selective: bool,
 ) -> Result<ChromStore> {
     let cols: Vec<&str> = if has_pred {
         vec![
@@ -1302,18 +1360,23 @@ fn load_chromatograms(
     } else {
         vec!["candidate_id", "frag_name", "rt", "intensity"]
     };
+    let read = ChromRead {
+        cols: &cols,
+        has_pred,
+        keep_all,
+        wanted,
+        path,
+        selective,
+    };
     let Some((spans, readers)) = chrom_spans(ch, keep_all, wanted, threads, path) else {
-        return load_chrom_span(ch, &cols, has_pred, keep_all, wanted, path);
+        return read.span(ch);
     };
     let mut store = ChromStore::new();
     // Chunked rather than one `par_iter` over every span, because that bounds two things
     // at once: the arrow buffers in flight, and the number of finished per-span stores
     // waiting to be merged, which held all at once would be a second copy of the store.
     for chunk in spans.chunks(readers) {
-        let parts: Vec<Result<ChromStore>> = chunk
-            .par_iter()
-            .map(|span| load_chrom_span(span, &cols, has_pred, keep_all, wanted, path))
-            .collect();
+        let parts: Vec<Result<ChromStore>> = chunk.par_iter().map(|span| read.span(span)).collect();
         // Consumed in span order, so a malformed row is reported by the same error the
         // single pass reports and not by whichever thread happened to finish first.
         for part in parts {
@@ -1352,7 +1415,11 @@ fn chrom_spans(
         .min(chrom_byte_readers(path, ch.nrows, widest))
         .clamp(1, threads.max(1));
     // `keep_all` (`--out-peak-bounds`) wants every candidate, so nothing may be skipped.
-    let accepted = if keep_all { None } else { wanted.range() };
+    let accepted: Option<Vec<u32>> = if keep_all {
+        None
+    } else {
+        Some(wanted.sorted_ids())
+    };
     let mut spans = Vec::with_capacity(stats.len());
     let mut pruned = 0usize;
     let mut first = 0usize;
@@ -1364,11 +1431,11 @@ fn chrom_spans(
             continue;
         }
         probe = probe.or(Some((start, s.rows)));
-        // A group outside the accepted id range holds no row this stage would store. Note
-        // that the per-row rt/intensity length guard already runs only on kept rows (the
-        // filter `continue`s before it), so skipping such a group withdraws no check.
-        if let (Some((lo, hi)), Some(gmin), Some(gmax)) = (accepted, s.min, s.max) {
-            if gmax < f64::from(lo) || gmin > f64::from(hi) {
+        // A group whose id range holds no accepted id holds no row this stage would store.
+        // Note that the per-row rt/intensity length guard already runs only on kept rows
+        // (the filter `continue`s before it), so skipping such a group withdraws no check.
+        if let (Some(ids), Some(gmin), Some(gmax)) = (&accepted, s.min, s.max) {
+            if !any_in_range(ids, gmin, gmax) {
                 pruned += 1;
                 continue;
             }
@@ -1392,119 +1459,426 @@ fn chrom_spans(
     Some((spans, readers))
 }
 
-/// One pass over `tf` -- the whole file, or one row-group span of it -- into a new store.
-///
-/// The MS1 isotope XIC pseudo-traces (`frag_name` "ms1_*") are precursor channels, not
-/// fragment ions, and neither the peak-window detection nor the top-N sum ever reads one,
-/// so they are not stored at all rather than loaded and skipped later.
-///
-/// Zero, not NaN, for an absent `predicted_intensity`: the value is only a ranking key,
-/// and `total_cmp` orders NaN above every real intensity, which would silently invert the
-/// `predicted` ranking rather than fail.
-fn load_chrom_span(
-    tf: &TableFile,
-    cols: &[&str],
+/// What one chromatogram read keeps, and how it reads it: shared by every span of a plan.
+struct ChromRead<'a> {
+    cols: &'a [&'a str],
     has_pred: bool,
     keep_all: bool,
-    wanted: &CidSet,
-    path: &str,
-) -> Result<ChromStore> {
-    let mut store = ChromStore::new();
-    let reader = tf.batches(Some(cols), 4096)?;
-    let sch = reader.schema();
-    let ix = |n: &str| {
-        sch.index_of(n)
-            .map_err(|_| anyhow!("chromatogram table has no column '{n}'"))
-    };
-    let (i_cid, i_name, i_rt, i_int) = (
-        ix("candidate_id")?,
-        ix("frag_name")?,
-        ix("rt")?,
-        ix("intensity")?,
-    );
-    let i_pred = if has_pred {
-        Some(ix("predicted_intensity")?)
-    } else {
-        None
-    };
-    // Trace values are appended into scratch buffers and then copied into the store,
-    // because the RT axis is deduplicated against the candidate's earlier rows before
-    // it is stored.
-    let mut rt_buf: Vec<f32> = Vec::new();
-    let mut int_buf: Vec<f32> = Vec::new();
-    for b in reader {
-        let b = b?;
-        let a_cid = b
-            .column(i_cid)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| anyhow!("column 'candidate_id' is not u32"))?;
-        let a_name = b
-            .column(i_name)
+    wanted: &'a CidSet,
+    path: &'a str,
+    selective: bool,
+}
+
+/// The typed columns of one decoded chromatogram batch, other than `candidate_id`.
+struct ChromCols<'a> {
+    name: &'a StringArray,
+    rt: ListF32<'a>,
+    int: ListF32<'a>,
+    pred: Option<&'a Float32Array>,
+}
+
+impl<'a> ChromCols<'a> {
+    /// The columns of `b` by name, with the type checks and messages the single pass has
+    /// always made, in its order (`frag_name`, `rt`, `intensity`, `predicted_intensity`).
+    fn of(b: &'a RecordBatch, has_pred: bool) -> Result<ChromCols<'a>> {
+        let sch = b.schema();
+        let ix = |n: &str| {
+            sch.index_of(n)
+                .map_err(|_| anyhow!("chromatogram table has no column '{n}'"))
+        };
+        let name = b
+            .column(ix("frag_name")?)
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| anyhow!("column 'frag_name' is not utf8"))?;
-        let a_rt = ListF32::of(b.column(i_rt), "rt")?;
-        let a_int = ListF32::of(b.column(i_int), "intensity")?;
-        let a_pred = match i_pred {
-            Some(i) => Some(
-                b.column(i)
+        let rt = ListF32::of(b.column(ix("rt")?), "rt")?;
+        let int = ListF32::of(b.column(ix("intensity")?), "intensity")?;
+        let pred = if has_pred {
+            Some(
+                b.column(ix("predicted_intensity")?)
                     .as_any()
                     .downcast_ref::<Float32Array>()
                     .ok_or_else(|| anyhow!("column 'predicted_intensity' is not f32"))?,
-            ),
-            None => None,
+            )
+        } else {
+            None
         };
-        for k in 0..b.num_rows() {
-            let c = a_cid.value(k);
-            if !keep_all && !wanted.contains(c) {
-                continue;
-            }
-            let nm = if a_name.is_null(k) {
-                ""
-            } else {
-                a_name.value(k)
-            };
-            rt_buf.clear();
-            int_buf.clear();
-            a_rt.append_row(k, &mut rt_buf, "rt")?;
-            a_int.append_row(k, &mut int_buf, "intensity")?;
-            let (rt, it) = (&rt_buf, &int_buf);
-            // `rt` and `intensity` are two independent list columns, and every
-            // integration below slices `intensity` with indices computed from the LENGTH
-            // OF `rt`. Extract writes them from paired vectors so they always match, but
-            // a chromatograms table is path-addressable: `mumdia quant --chromatograms`
-            // accepts one written by anything, and a shorter intensity trace would panic
-            // with a slice-index message naming no candidate. Checked here, per row,
-            // while the row can still be named.
-            if rt.len() != it.len() {
-                anyhow::bail!(
-                    "chromatogram row for candidate_id {c} has {} retention-time points \
-                     but {} intensity points; every integration window is derived from \
-                     the retention-time trace and applied to the intensity trace, so the \
-                     two must be the same length in {}",
-                    rt.len(),
-                    it.len(),
-                    path
-                );
-            }
-            // The MS1 isotope XIC pseudo-traces are precursor channels, not fragment
-            // ions, and no phase below reads one, so they are dropped rather than
-            // stored and skipped later. Dropped AFTER the length check, which is a
-            // guard on the table rather than on what this stage happens to consume.
-            if nm.starts_with("ms1_") {
-                continue;
-            }
-            let pred = match a_pred {
-                Some(a) => a.value(k),
-                None => 0.0,
-            };
-            store.push(c, nm, pred, rt, it)?;
-        }
+        Ok(ChromCols {
+            name,
+            rt,
+            int,
+            pred,
+        })
     }
-    Ok(store)
 }
 
+impl ChromRead<'_> {
+    /// One kept row, for candidate `c`, into `store`: its fragment name, its two traces and
+    /// its predicted intensity (`0.0` when the table has none).
+    ///
+    /// The MS1 isotope XIC pseudo-traces (`frag_name` "ms1_*") are precursor channels, not
+    /// fragment ions, and neither the peak-window detection nor the top-N sum ever reads
+    /// one, so they are not stored at all rather than loaded and skipped later.
+    ///
+    /// Zero, not NaN, for an absent `predicted_intensity`: the value is only a ranking key,
+    /// and `total_cmp` orders NaN above every real intensity, which would silently invert
+    /// the `predicted` ranking rather than fail.
+    fn push_row(
+        &self,
+        store: &mut ChromStore,
+        c: u32,
+        nm: &str,
+        rt: &[f32],
+        it: &[f32],
+        pred: f32,
+    ) -> Result<()> {
+        // `rt` and `intensity` are two independent list columns, and every integration
+        // below slices `intensity` with indices computed from the LENGTH OF `rt`. Extract
+        // writes them from paired vectors so they always match, but a chromatograms table
+        // is path-addressable: `mumdia quant --chromatograms` accepts one written by
+        // anything, and a shorter intensity trace would panic with a slice-index message
+        // naming no candidate. Checked here, per row, while the row can still be named.
+        if rt.len() != it.len() {
+            anyhow::bail!(
+                "chromatogram row for candidate_id {c} has {} retention-time points \
+                 but {} intensity points; every integration window is derived from \
+                 the retention-time trace and applied to the intensity trace, so the \
+                 two must be the same length in {}",
+                rt.len(),
+                it.len(),
+                self.path
+            );
+        }
+        // The MS1 isotope XIC pseudo-traces are precursor channels, not fragment ions, and
+        // no phase below reads one, so they are dropped rather than stored and skipped
+        // later. Dropped AFTER the length check, which is a guard on the table rather than
+        // on what this stage happens to consume.
+        if nm.starts_with("ms1_") {
+            return Ok(());
+        }
+        // The store dedups the RT axis against the candidate's earlier rows and copies the
+        // values it keeps, so the traces are borrowed straight from the decoded batch.
+        store.push(c, nm, pred, rt, it)
+    }
+
+    /// `tf` -- the whole file, or one row-group span of it -- into a new store: row group
+    /// by row group, each skipping the pages that hold no kept row where that applies
+    /// ([`ChromRead::selected`]), else in one pass ([`ChromRead::one_pass`]).
+    fn span(&self, tf: &TableFile) -> Result<ChromStore> {
+        if self.selective && !self.keep_all && tf.offset_indexed() {
+            let mut store = ChromStore::new();
+            for part in tf.row_group_parts()? {
+                store.append(self.selected(&part)?)?;
+            }
+            return Ok(store);
+        }
+        self.one_pass(tf)
+    }
+
+    /// One pass over every row of `tf`, keeping the accepted candidates' rows.
+    fn one_pass(&self, tf: &TableFile) -> Result<ChromStore> {
+        let mut store = ChromStore::new();
+        let reader = tf.batches(Some(self.cols), 4096)?;
+        let i_cid = reader
+            .schema()
+            .index_of("candidate_id")
+            .map_err(|_| anyhow!("chromatogram table has no column 'candidate_id'"))?;
+        for b in reader {
+            let b = b?;
+            let a_cid = b
+                .column(i_cid)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| anyhow!("column 'candidate_id' is not u32"))?;
+            let v = ChromCols::of(&b, self.has_pred)?;
+            for k in 0..b.num_rows() {
+                let c = a_cid.value(k);
+                if !self.keep_all && !self.wanted.contains(c) {
+                    continue;
+                }
+                let nm = if v.name.is_null(k) {
+                    ""
+                } else {
+                    v.name.value(k)
+                };
+                let rt = v.rt.row_slice(k, "rt")?;
+                let it = v.int.row_slice(k, "intensity")?;
+                let pred = v.pred.map_or(0.0, |a| a.value(k));
+                self.push_row(&mut store, c, nm, rt, it, pred)?;
+            }
+        }
+        Ok(store)
+    }
+
+    /// One row group (`part`), reading no data page that holds only rows it does not keep.
+    ///
+    /// Its `candidate_id` is read first, which says which rows are kept. Each other column
+    /// is then read on its own, through a row selection that skips exactly the runs of
+    /// rows that fill whole data pages of that column and hold no kept row
+    /// ([`page_aligned_runs`], from the column's page starts in the offset index). A
+    /// skipped page is neither read nor decompressed. Nothing is skipped inside a page:
+    /// parquet-rs steps over the rows of a list column one level at a time, which on the
+    /// AIF benchmark's 90-point traces took longer than decoding them (11% of a 65,536-row
+    /// group of `rt` in 101 ms against 78 ms for all of it), so the rows a read page holds
+    /// are decoded as the one pass decodes them and the unkept ones dropped. When no column has a whole page to
+    /// skip, the group is simply read in one pass.
+    ///
+    /// The store is [`ChromRead::one_pass`]'s over the same rows, field for field: the same
+    /// rows are kept, in the same order, through the same [`ChromRead::push_row`]. The
+    /// checks are the same too: the projection and every column type are checked before
+    /// any row is read (on an empty batch of the projected schema, so a group that keeps no
+    /// row checks them as a full read would have on its first batch), and the per-row
+    /// length guard runs on the kept rows, which is where it ran before. A `candidate_id`
+    /// holding a null goes to the one pass instead, which reads the raw slot behind the
+    /// validity bitmap as it always has.
+    fn selected(&self, part: &TableFile) -> Result<ChromStore> {
+        // The projection check the one pass makes first. The reader is built to take its
+        // schema, and not read.
+        let schema = part.batches(Some(self.cols), 4096)?.schema();
+        schema
+            .index_of("candidate_id")
+            .map_err(|_| anyhow!("chromatogram table has no column 'candidate_id'"))?;
+        let mut ids: Vec<u32> = Vec::with_capacity(part.nrows);
+        {
+            for b in part.batches(Some(&["candidate_id"]), 1 << 16)? {
+                let b = b?;
+                let a = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| anyhow!("column 'candidate_id' is not u32"))?;
+                if a.null_count() > 0 {
+                    return self.one_pass(part);
+                }
+                ids.extend_from_slice(a.values());
+            }
+        }
+        // The column types the one pass checks on its first batch, after `candidate_id`'s.
+        ChromCols::of(&RecordBatch::new_empty(schema), self.has_pred)?;
+        let keep: Vec<bool> = ids.iter().map(|&c| self.wanted.contains(c)).collect();
+        let n_kept = keep.iter().filter(|&&k| k).count();
+        let rest: Vec<&str> = self
+            .cols
+            .iter()
+            .copied()
+            .filter(|&c| c != "candidate_id")
+            .collect();
+        // Per column, the selection that skips its whole unkept pages, or the one pass when
+        // no column has one (or a column has no page index).
+        let mut runs: Vec<Vec<(usize, bool)>> = Vec::with_capacity(rest.len());
+        if n_kept > 0 {
+            for &col in &rest {
+                let Some(starts) = part.page_starts(col)? else {
+                    return self.one_pass(part);
+                };
+                runs.push(page_aligned_runs(&keep, &starts));
+            }
+            if !runs.iter().flatten().any(|r| !r.1) {
+                return self.one_pass(part);
+            }
+        }
+        let mut store = ChromStore::new();
+        if n_kept == 0 {
+            return Ok(store);
+        }
+        // The kept rows, column by column, in row order.
+        let mut kept = KeptRows::default();
+        for (&col, col_runs) in rest.iter().zip(&runs) {
+            let mut rows = SelectedRows::new(col_runs);
+            for b in part.batches_runs(Some(&[col]), 4096, col_runs)? {
+                let b = b?;
+                let a = b.column(0);
+                match col {
+                    "frag_name" => {
+                        let s = a
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .ok_or_else(|| anyhow!("column 'frag_name' is not utf8"))?;
+                        for k in 0..s.len() {
+                            if keep[rows.next_row(self.path)?] {
+                                kept.name_txt
+                                    .push_str(if s.is_null(k) { "" } else { s.value(k) });
+                                kept.name_end.push(kept.name_txt.len());
+                            }
+                        }
+                    }
+                    "predicted_intensity" => {
+                        let f = a
+                            .as_any()
+                            .downcast_ref::<Float32Array>()
+                            .ok_or_else(|| anyhow!("column 'predicted_intensity' is not f32"))?;
+                        for k in 0..f.len() {
+                            if keep[rows.next_row(self.path)?] {
+                                kept.pred.push(f.value(k));
+                            }
+                        }
+                    }
+                    "rt" | "intensity" => {
+                        let l = ListF32::of(a, col)?;
+                        let (vals, ends) = if col == "rt" {
+                            (&mut kept.rt, &mut kept.rt_end)
+                        } else {
+                            (&mut kept.int, &mut kept.int_end)
+                        };
+                        for k in 0..l.len() {
+                            if keep[rows.next_row(self.path)?] {
+                                vals.extend_from_slice(l.row_slice(k, col)?);
+                                ends.push(vals.len());
+                            }
+                        }
+                    }
+                    other => anyhow::bail!("the chromatogram read does not project '{other}'"),
+                }
+            }
+            rows.finish(self.path)?;
+        }
+        if kept.name_end.len() != n_kept
+            || kept.rt_end.len() != n_kept
+            || kept.int_end.len() != n_kept
+            || (self.has_pred && kept.pred.len() != n_kept)
+        {
+            anyhow::bail!(
+                "the page-selective read of {} did not return every kept row",
+                self.path
+            );
+        }
+        let at = |ends: &[usize], j: usize| (if j == 0 { 0 } else { ends[j - 1] }, ends[j]);
+        let kept_ids = ids.iter().zip(&keep).filter(|(_, &k)| k).map(|(&c, _)| c);
+        for (j, c) in kept_ids.enumerate() {
+            let (n0, n1) = at(&kept.name_end, j);
+            let (r0, r1) = at(&kept.rt_end, j);
+            let (i0, i1) = at(&kept.int_end, j);
+            let pred = if self.has_pred { kept.pred[j] } else { 0.0 };
+            self.push_row(
+                &mut store,
+                c,
+                &kept.name_txt[n0..n1],
+                &kept.rt[r0..r1],
+                &kept.int[i0..i1],
+                pred,
+            )?;
+        }
+        Ok(store)
+    }
+}
+
+/// The kept rows of one row group, column by column: row `j`'s name is
+/// `name_txt[name_end[j - 1]..name_end[j]]`, and likewise for the two traces.
+#[derive(Default)]
+struct KeptRows {
+    name_txt: String,
+    name_end: Vec<usize>,
+    pred: Vec<f32>,
+    rt: Vec<f32>,
+    rt_end: Vec<usize>,
+    int: Vec<f32>,
+    int_end: Vec<usize>,
+}
+
+/// The row indices a `(rows, keep)` selection reads, in order, handed out one at a time as
+/// the reader's rows arrive.
+struct SelectedRows<'a> {
+    runs: &'a [(usize, bool)],
+    run: usize,
+    left: usize,
+    row: usize,
+}
+
+impl<'a> SelectedRows<'a> {
+    fn new(runs: &'a [(usize, bool)]) -> SelectedRows<'a> {
+        let mut s = SelectedRows {
+            runs,
+            run: 0,
+            left: 0,
+            row: 0,
+        };
+        s.settle();
+        s
+    }
+
+    /// Move to the next selected row, stepping over skipped runs.
+    fn settle(&mut self) {
+        while self.left == 0 && self.run < self.runs.len() {
+            let (n, keep) = self.runs[self.run];
+            if keep {
+                self.left = n;
+            } else {
+                self.row += n;
+            }
+            self.run += 1;
+        }
+    }
+
+    fn next_row(&mut self, path: &str) -> Result<usize> {
+        if self.left == 0 {
+            anyhow::bail!("the page-selective read of {path} returned more rows than it selected");
+        }
+        let r = self.row;
+        self.row += 1;
+        self.left -= 1;
+        self.settle();
+        Ok(r)
+    }
+
+    fn finish(&self, path: &str) -> Result<()> {
+        if self.left != 0 {
+            anyhow::bail!("the page-selective read of {path} returned fewer rows than it selected");
+        }
+        Ok(())
+    }
+}
+
+/// A `(rows, keep)` selection over `keep.len()` rows that skips exactly the runs of whole
+/// pages holding no kept row, and reads every other row.
+///
+/// `starts` are the rows at which the column's pages begin, ascending and starting at 0
+/// ([`TableFile::page_starts`]). Every maximal run of unkept rows `[a, b)` is shrunk to the
+/// page starts it spans, `[first start >= a, last start <= b)` (with the row count as the
+/// last start), and skipped when that is not empty. The rows at its two ends, which share a
+/// page with a kept row, are read. So the reader skips whole pages or nothing, and every
+/// kept row is read.
+fn page_aligned_runs(keep: &[bool], starts: &[usize]) -> Vec<(usize, bool)> {
+    let n = keep.len();
+    let mut bounds: Vec<usize> = starts.iter().copied().filter(|&s| s <= n).collect();
+    if bounds.first() != Some(&0) {
+        bounds.insert(0, 0);
+    }
+    if bounds.last() != Some(&n) {
+        bounds.push(n);
+    }
+    let mut runs: Vec<(usize, bool)> = Vec::new();
+    let push = |len: usize, k: bool, runs: &mut Vec<(usize, bool)>| {
+        if len == 0 {
+            return;
+        }
+        match runs.last_mut() {
+            Some(r) if r.1 == k => r.0 += len,
+            _ => runs.push((len, k)),
+        }
+    };
+    let mut cursor = 0usize;
+    let mut r = 0usize;
+    while r < n {
+        if keep[r] {
+            r += 1;
+            continue;
+        }
+        let a = r;
+        while r < n && !keep[r] {
+            r += 1;
+        }
+        let b = r;
+        let p = bounds[bounds.partition_point(|&x| x < a)];
+        let q = bounds[bounds.partition_point(|&x| x <= b) - 1];
+        if p < q {
+            push(p - cursor, true, &mut runs);
+            push(q - p, false, &mut runs);
+            cursor = q;
+        }
+    }
+    push(n - cursor, true, &mut runs);
+    runs
+}
 pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     run_hashed(p).map(|w| (w.peptide.rows, w.protein.rows))
 }
@@ -1752,7 +2126,15 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             p.chromatograms
         );
     }
-    let ch = TableFile::open(p.chromatograms)?;
+    // The selective read wants the table's offset index, so that the pages holding no
+    // accepted row are never fetched; `keep_all` reads every row, and opens the table as it
+    // always has.
+    let selective = !keep_all && selective_read_enabled();
+    let ch = if selective {
+        TableFile::open_with_offset_index(p.chromatograms)?
+    } else {
+        TableFile::open(p.chromatograms)?
+    };
     // Flat, grouped-by-candidate store (see [`ChromStore`]), read row group by row group
     // in parallel (see [`load_chromatograms`]).
     let store = load_chromatograms(
@@ -1762,6 +2144,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         &wanted,
         p.chromatograms,
         rayon::current_num_threads(),
+        selective,
     )?;
     drop(wanted);
     // Group the fragment chromatogram rows by candidate, ascending by candidate id and in
@@ -3995,6 +4378,21 @@ mod tests {
         "intensity",
     ];
 
+    /// The reference read: one pass over every row of `tf`, keeping `wanted`'s rows, with
+    /// no row-group plan and no row selection.
+    fn one_pass(tf: &TableFile, wanted: &CidSet, path: &str) -> ChromStore {
+        ChromRead {
+            cols: &CHROM_COLS,
+            has_pred: true,
+            keep_all: false,
+            wanted,
+            path,
+            selective: false,
+        }
+        .one_pass(tf)
+        .unwrap()
+    }
+
     #[test]
     fn the_accepted_candidate_bitset_answers_exactly_what_the_hash_set_did() {
         // A banded search offsets candidate ids by the band's `lib.global_offset`, so the
@@ -4098,10 +4496,15 @@ mod tests {
         // 6 candidates x 3 fragments = 18 rows in row groups of 4, so candidates straddle
         // seams. Only some candidates are accepted, so the filter runs inside each span.
         let path = chrom_fixture("spans.parquet", 6, 3, 4);
-        let ch = TableFile::open(&path).unwrap();
+        // With the offset index, so the planned read below takes the row selection.
+        let ch = TableFile::open_with_offset_index(&path).unwrap();
+        assert!(
+            ch.offset_indexed(),
+            "the engine's writer writes an offset index"
+        );
         let wanted = CidSet::from_ids(&[1, 2, 4, 5]);
 
-        let one_pass = load_chrom_span(&ch, &CHROM_COLS, true, false, &wanted, &path).unwrap();
+        let single = one_pass(&ch, &wanted, &path);
 
         // Per-span stores concatenated in file order, built explicitly so the assertion
         // does not depend on how many threads this machine has.
@@ -4111,15 +4514,13 @@ mod tests {
         let mut first = 0usize;
         for s in &stats {
             let span = ch.span(first, s.rows).unwrap();
-            by_span
-                .append(load_chrom_span(&span, &CHROM_COLS, true, false, &wanted, &path).unwrap())
-                .unwrap();
+            by_span.append(one_pass(&span, &wanted, &path)).unwrap();
             first += s.rows;
         }
-        assert_eq!(snapshot(&by_span), snapshot(&one_pass));
+        assert_eq!(snapshot(&by_span), snapshot(&single));
         // And the planner's own result, whichever path it chose on this machine.
-        let planned = load_chromatograms(&ch, true, false, &wanted, &path, 4).unwrap();
-        assert_eq!(snapshot(&planned), snapshot(&one_pass));
+        let planned = load_chromatograms(&ch, true, false, &wanted, &path, 4, true).unwrap();
+        assert_eq!(snapshot(&planned), snapshot(&single));
 
         // The comparison only proves something if a candidate really does straddle a seam,
         // which is the case `append` has to reconstruct. Candidate 1 owns file rows 3..6
@@ -4129,8 +4530,8 @@ mod tests {
             stats[0].rows, 4,
             "the fixture's row groups must hold 4 rows"
         );
-        let rows_of_1: Vec<usize> = (0..one_pass.nrows())
-            .filter(|&r| one_pass.cid[r] == 1)
+        let rows_of_1: Vec<usize> = (0..single.nrows())
+            .filter(|&r| single.cid[r] == 1)
             .collect();
         assert_eq!(rows_of_1.len(), 3);
         // One axis id for it in BOTH stores: `append` deduped its second part against the
@@ -4266,6 +4667,213 @@ mod tests {
             s.push(4, "y3", 4.0, &grid, &[1.0, 2.0, 3.0]).unwrap();
         }
         assert_eq!(snapshot(&pushed), snapshot(&direct));
+
+        // The same property through a FILE split into row groups and read through a row
+        // selection. The fixture's list leaves span several pages inside every row group,
+        // candidates straddle the group seams, and each selection below starts and ends
+        // runs inside pages, so the reader must skip part of a page as well as whole ones.
+        let path = multi_page_chrom_fixture("plan_pages.parquet");
+        let plain = TableFile::open(&path).unwrap();
+        let indexed = TableFile::open_with_offset_index(&path).unwrap();
+        assert!(indexed.offset_indexed() && !plain.offset_indexed());
+        let groups = indexed.row_group_parts().unwrap();
+        assert!(
+            groups.len() >= 4,
+            "the fixture must have several row groups"
+        );
+        {
+            let f = std::fs::File::open(&path).unwrap();
+            let meta = parquet::arrow::arrow_reader::ArrowReaderMetadata::load(
+                &f,
+                parquet::arrow::arrow_reader::ArrowReaderOptions::new()
+                    .with_offset_index_policy(parquet::file::metadata::PageIndexPolicy::Optional),
+            )
+            .unwrap();
+            let md = meta.metadata();
+            let leaves = md.file_metadata().schema_descr();
+            let rt_leaf = (0..leaves.num_columns())
+                .find(|&c| leaves.column(c).path().string().starts_with("rt"))
+                .unwrap();
+            for (g, rg) in md.offset_index().unwrap().iter().enumerate() {
+                let pages = rg[rt_leaf].page_locations().len();
+                assert!(pages >= 2, "row group {g}: the rt leaf is {pages} page(s)");
+            }
+        }
+        // The fixture's pages are small enough that a sparse selection skips some of them,
+        // so the comparison below goes through the page-selective read and not only the
+        // one pass it falls back to.
+        {
+            let one = CidSet::from_ids(&[17]);
+            let g = &groups[0];
+            let ids = g.u32("candidate_id").unwrap();
+            let keep: Vec<bool> = ids.iter().map(|&c| one.contains(c)).collect();
+            let starts = g.page_starts("rt").unwrap().unwrap();
+            assert!(page_aligned_runs(&keep, &starts).iter().any(|r| !r.1));
+        }
+        let n_cand = 30u32;
+        for (label, ids) in [
+            (
+                "every third candidate",
+                (0..n_cand).step_by(3).collect::<Vec<u32>>(),
+            ),
+            (
+                "the candidates either side of each seam",
+                vec![6, 12, 19, 25],
+            ),
+            ("one candidate", vec![17]),
+            ("every candidate", (0..n_cand).collect()),
+            ("none in the file", vec![1_000]),
+        ] {
+            let wanted = CidSet::from_ids(&ids);
+            let reference = one_pass(&plain, &wanted, &path);
+            let read = ChromRead {
+                cols: &CHROM_COLS,
+                has_pred: true,
+                keep_all: false,
+                wanted: &wanted,
+                path: &path,
+                selective: true,
+            };
+            let mut by_group = ChromStore::new();
+            for g in &groups {
+                by_group.append(read.selected(g).unwrap()).unwrap();
+            }
+            assert_eq!(
+                snapshot(&by_group),
+                snapshot(&reference),
+                "{label}: by group"
+            );
+            assert_eq!(
+                snapshot(&read.span(&indexed).unwrap()),
+                snapshot(&reference),
+                "{label}: the whole handle"
+            );
+            for threads in [1, 4] {
+                let planned =
+                    load_chromatograms(&indexed, true, false, &wanted, &path, threads, true)
+                        .unwrap();
+                assert_eq!(
+                    snapshot(&planned),
+                    snapshot(&reference),
+                    "{label}: the plan at {threads} threads"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_page_aligned_selection_skips_whole_pages_and_reads_every_kept_row() {
+        let t = true;
+        let f = false;
+        // Pages start at 0, 3, 6 and 9. The gap 1..7 holds the whole page 3..6 only, and the
+        // gap 8..10 the whole last page 9..10; the rows around them share a page with a
+        // kept row and are read.
+        let keep = [t, f, f, f, f, f, f, t, f, f];
+        assert_eq!(
+            page_aligned_runs(&keep, &[0, 3, 6, 9]),
+            vec![(3, t), (3, f), (3, t), (1, f)]
+        );
+        // One page per group: nothing to skip unless nothing is kept.
+        assert_eq!(page_aligned_runs(&keep, &[0]), vec![(10, t)]);
+        assert_eq!(page_aligned_runs(&[f; 4], &[0]), vec![(4, f)]);
+        assert_eq!(page_aligned_runs(&[t; 4], &[0, 1, 2, 3]), vec![(4, t)]);
+        // Every row its own page: the selection is the kept rows exactly.
+        assert_eq!(
+            page_aligned_runs(&[f, t, t, f, f, t], &[0, 1, 2, 3, 4, 5]),
+            vec![(1, f), (2, t), (2, f), (1, t)]
+        );
+        // Exhaustively over short patterns and page layouts: the runs cover the rows, every
+        // kept row is read, and every skipped run starts and ends on a page start (or the
+        // end).
+        for n in 1..=9usize {
+            for mask in 0u32..(1 << n) {
+                let keep: Vec<bool> = (0..n).map(|i| mask >> i & 1 == 1).collect();
+                for layout in 0u32..(1 << (n - 1)) {
+                    let mut starts = vec![0usize];
+                    starts.extend((1..n).filter(|&i| layout >> (i - 1) & 1 == 1));
+                    let runs = page_aligned_runs(&keep, &starts);
+                    assert_eq!(runs.iter().map(|r| r.0).sum::<usize>(), n);
+                    let mut row = 0usize;
+                    for &(len, read) in &runs {
+                        if !read {
+                            let at_bound = |x: usize| x == n || starts.contains(&x);
+                            assert!(at_bound(row) && at_bound(row + len), "{keep:?} {starts:?}");
+                            assert!(!keep[row..row + len].iter().any(|&k| k));
+                        }
+                        row += len;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A chromatogram table whose `rt` and `intensity` leaves are cut into small pages (a
+    /// few rows each) inside 32-row groups: 30 candidates of 5 rows, so candidates straddle
+    /// row-group seams. Candidate 4 has an `ms1_mono` pseudo-trace, candidate 9 an empty
+    /// trace, and every third candidate samples a grid of its own for one fragment, so the
+    /// axis dedup has something to do at every seam.
+    fn multi_page_chrom_fixture(name: &str) -> String {
+        use arrow::array::{Float32Builder, LargeListBuilder, StringBuilder, UInt32Builder};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let path = quant_test_path(name);
+        let (mut cid, mut nm, mut pred) = (
+            UInt32Builder::new(),
+            StringBuilder::new(),
+            Float32Builder::new(),
+        );
+        let mut rt = LargeListBuilder::new(Float32Builder::new());
+        let mut it = LargeListBuilder::new(Float32Builder::new());
+        for c in 0..30u32 {
+            for f in 0..5usize {
+                cid.append_value(c);
+                let name = if c == 4 && f == 2 {
+                    "ms1_mono".to_string()
+                } else {
+                    format!("y{f}")
+                };
+                nm.append_value(name);
+                pred.append_value(f as f32 * 0.5);
+                let n = if c == 9 && f == 1 { 0 } else { 24 };
+                let shift = if c % 3 == 0 && f == 3 { 0.5 } else { 0.0 };
+                for k in 0..n {
+                    rt.values().append_value(k as f32 * 2.0 + shift);
+                    it.values()
+                        .append_value(((c as usize + 1) * (f + 1) * (k + 1)) as f32);
+                }
+                rt.append(true);
+                it.append(true);
+            }
+        }
+        let item = || Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("candidate_id", DataType::UInt32, false),
+            Field::new("frag_name", DataType::Utf8, false),
+            Field::new("predicted_intensity", DataType::Float32, false),
+            Field::new("rt", DataType::LargeList(item()), true),
+            Field::new("intensity", DataType::LargeList(item()), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(cid.finish()),
+                Arc::new(nm.finish()),
+                Arc::new(pred.finish()),
+                Arc::new(rt.finish()),
+                Arc::new(it.finish()),
+            ],
+        )
+        .unwrap();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(32))
+            .set_data_page_size_limit(256)
+            .set_write_batch_size(3)
+            .build();
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(f, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        path
     }
 
     #[test]
@@ -4273,7 +4881,7 @@ mod tests {
         // 8 candidates x 2 fragments in row groups of 4, so each group holds exactly two
         // candidates. Accepting only candidate 0 leaves one group to read.
         let path = chrom_fixture("prune.parquet", 8, 2, 4);
-        let ch = TableFile::open(&path).unwrap();
+        let ch = TableFile::open_with_offset_index(&path).unwrap();
         let stats = ch.row_group_stats("candidate_id").unwrap();
         assert_eq!(stats.len(), 4);
 
@@ -4284,8 +4892,8 @@ mod tests {
 
         // Pruning is a read plan, not a filter: the store is what the full read would
         // have produced.
-        let pruned = load_chromatograms(&ch, true, false, &wanted, &path, 4).unwrap();
-        let full = load_chrom_span(&ch, &CHROM_COLS, true, false, &wanted, &path).unwrap();
+        let pruned = load_chromatograms(&ch, true, false, &wanted, &path, 4, true).unwrap();
+        let full = one_pass(&ch, &wanted, &path);
         assert_eq!(snapshot(&pruned), snapshot(&full));
         assert_eq!(pruned.nrows(), 2);
 
@@ -4312,11 +4920,8 @@ mod tests {
             "one group, not four, and not the whole file"
         );
         assert_eq!(probe[0].nrows, 4);
-        let empty = load_chromatograms(&ch, true, false, &none, &path, 4).unwrap();
-        assert_eq!(
-            snapshot(&empty),
-            snapshot(&load_chrom_span(&ch, &CHROM_COLS, true, false, &none, &path).unwrap())
-        );
+        let empty = load_chromatograms(&ch, true, false, &none, &path, 4, true).unwrap();
+        assert_eq!(snapshot(&empty), snapshot(&one_pass(&ch, &none, &path)));
         assert_eq!(empty.nrows(), 0);
         // And the projection is still checked: a multi-group table missing `rt` fails even
         // though every one of its groups is pruned.
@@ -4328,9 +4933,14 @@ mod tests {
         ])
         .unwrap();
         w.close().unwrap();
-        let bt = TableFile::open(&bad).unwrap();
-        assert_eq!(bt.row_group_stats("candidate_id").unwrap().len(), 2);
-        assert!(load_chromatograms(&bt, false, false, &none, &bad, 4).is_err());
+        // Through the one pass and through the row selection alike.
+        for bt in [
+            TableFile::open(&bad).unwrap(),
+            TableFile::open_with_offset_index(&bad).unwrap(),
+        ] {
+            assert_eq!(bt.row_group_stats("candidate_id").unwrap().len(), 2);
+            assert!(load_chromatograms(&bt, false, false, &none, &bad, 4, true).is_err());
+        }
     }
 
     #[test]
@@ -4447,13 +5057,14 @@ mod tests {
                 // Swapped, so neither arm is always the one that finds the file cold.
                 let mut run_serial = || {
                     let t = Instant::now();
-                    let s = load_chrom_span(&ch, &CHROM_COLS, true, false, wanted, &path).unwrap();
+                    let s = one_pass(&ch, wanted, &path);
                     serial_ms.push(t.elapsed().as_secs_f64() * 1e3);
                     s
                 };
                 let mut run_planned = || {
                     let t = Instant::now();
-                    let s = load_chromatograms(&ch, true, false, wanted, &path, threads).unwrap();
+                    let s =
+                        load_chromatograms(&ch, true, false, wanted, &path, threads, true).unwrap();
                     planned_ms.push(t.elapsed().as_secs_f64() * 1e3);
                     s
                 };
@@ -4475,6 +5086,275 @@ mod tests {
                 ch.nrows,
             );
         }
+    }
+
+    /// The selective read on a REAL artifact: how many of the list leaves' data pages hold
+    /// an accepted row (read off the file's own offset index), and the planned load with and
+    /// without the row selection, each arm twice and in both orders. Point it at a run:
+    ///
+    /// ```text
+    /// MUMDIA_BENCH_CHROM=out/chromatograms.parquet MUMDIA_BENCH_SCORED=out/psms_scored.parquet \
+    ///   cargo test -p mumdia --release -- --ignored --nocapture selective_read_on_a_real
+    /// ```
+    ///
+    /// The accepted set is quant's under `MUMDIA_BENCH_Q` (default `q_value`, the column
+    /// `run-experiment` gates on) at 0.01, targets only. The stores of the two arms must be
+    /// identical, and the test fails otherwise.
+    #[test]
+    #[ignore = "benchmark; needs MUMDIA_BENCH_CHROM and MUMDIA_BENCH_SCORED"]
+    fn selective_read_on_a_real_artifact() {
+        selective_read_bench();
+    }
+
+    /// Rewrite a chromatogram table in the layout extract writes today (65,536-row groups,
+    /// `rt` PLAIN, the engine's page rules), for [`selective_read_on_a_real_artifact`] on an
+    /// artifact written before that layout existed:
+    ///
+    /// ```text
+    /// MUMDIA_BENCH_CHROM=old/chromatograms.parquet MUMDIA_BENCH_REWRITE=new.parquet \
+    ///   cargo test -p mumdia --release -- --ignored --nocapture rewrite_a_chromatogram
+    /// ```
+    #[test]
+    #[ignore = "benchmark helper; needs MUMDIA_BENCH_CHROM and MUMDIA_BENCH_REWRITE"]
+    fn rewrite_a_chromatogram_table_in_the_current_layout() {
+        let (Ok(src), Ok(out)) = (
+            std::env::var("MUMDIA_BENCH_CHROM"),
+            std::env::var("MUMDIA_BENCH_REWRITE"),
+        ) else {
+            println!("set MUMDIA_BENCH_CHROM and MUMDIA_BENCH_REWRITE to run this");
+            return;
+        };
+        let t = TableFile::open(&src).unwrap();
+        let mut w = mumdia_io::table::TableWriter::new(&out)
+            .with_row_group_rows(1 << 16)
+            .with_plain_column("rt");
+        for b in t.batches(None, 1 << 16).unwrap() {
+            let b = b.unwrap();
+            let mut cols = Vec::new();
+            for (f, a) in b.schema().fields().iter().zip(b.columns()) {
+                let n = f.name().clone();
+                use arrow::datatypes::DataType as T;
+                cols.push(match f.data_type() {
+                    T::UInt32 => Col::U32(
+                        n,
+                        a.as_any()
+                            .downcast_ref::<UInt32Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec(),
+                    ),
+                    T::Float32 => Col::F32(
+                        n,
+                        a.as_any()
+                            .downcast_ref::<Float32Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec(),
+                    ),
+                    T::Float64 => Col::F64(
+                        n,
+                        a.as_any()
+                            .downcast_ref::<arrow::array::Float64Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec(),
+                    ),
+                    T::Utf8 => {
+                        let s = a.as_any().downcast_ref::<StringArray>().unwrap();
+                        Col::Str(n, (0..s.len()).map(|k| s.value(k).to_string()).collect())
+                    }
+                    T::LargeList(_) | T::List(_) => {
+                        let l = ListF32::of(a, "list").unwrap();
+                        Col::LargeListF32(
+                            n,
+                            (0..l.len()).map(|k| l.row(k, "list").unwrap()).collect(),
+                        )
+                    }
+                    other => panic!("unexpected column type {other:?}"),
+                });
+            }
+            w.write_cols(cols).unwrap();
+        }
+        let rows = w.close().unwrap();
+        println!("{out}: {rows} rows");
+    }
+
+    /// Why the selective read skips whole pages only: one row group's columns read in full
+    /// against the same columns through a ROW-level selection of the accepted rows (one
+    /// run per candidate), five reads each, per read. On long traces the row-level skip is
+    /// the slower of the two (docs/03_io_layer.md, "Row selections and page skipping").
+    ///
+    /// ```text
+    /// MUMDIA_PARQUET_DECODE_THREADS=1 MUMDIA_BENCH_CHROM=... MUMDIA_BENCH_SCORED=... \
+    ///   cargo test -p mumdia --release -- --ignored --nocapture row_level_skip_against
+    /// ```
+    #[test]
+    #[ignore = "benchmark; needs MUMDIA_BENCH_CHROM and MUMDIA_BENCH_SCORED"]
+    fn row_level_skip_against_a_full_decode_per_column() {
+        let (Ok(chrom), Ok(scored)) = (
+            std::env::var("MUMDIA_BENCH_CHROM"),
+            std::env::var("MUMDIA_BENCH_SCORED"),
+        ) else {
+            return;
+        };
+        let ps = TableFile::open(&scored).unwrap();
+        let cid = ps.u32("candidate_id").unwrap();
+        let q = ps.f64("q_value").unwrap();
+        let decoy = ps.str_eq("label", "decoy").unwrap();
+        let ids: Vec<u32> = (0..ps.nrows)
+            .filter(|&i| passes_quant_filter(decoy[i], q[i], 0.01, false))
+            .map(|i| cid[i])
+            .collect();
+        let wanted = CidSet::from_ids(&ids);
+        let t = TableFile::open_with_offset_index(&chrom).unwrap();
+        let part = &t.row_group_parts().unwrap()[1];
+        let ids = part.u32("candidate_id").unwrap();
+        let mut runs: Vec<(usize, bool)> = Vec::new();
+        for &c in &ids {
+            let k = wanted.contains(c);
+            match runs.last_mut() {
+                Some(r) if r.1 == k => r.0 += 1,
+                _ => runs.push((1, k)),
+            }
+        }
+        println!("{} rows, {} runs", part.nrows, runs.len());
+        for col in ["frag_name", "predicted_intensity", "rt", "intensity"] {
+            let tm = Instant::now();
+            let mut n = 0;
+            for _ in 0..5 {
+                for b in part.batches(Some(&[col]), 4096).unwrap() {
+                    n += b.unwrap().num_rows();
+                }
+            }
+            let plain = tm.elapsed().as_secs_f64() * 200.0;
+            let tm = Instant::now();
+            let mut m = 0;
+            for _ in 0..5 {
+                for b in part.batches_runs(Some(&[col]), 4096, &runs).unwrap() {
+                    m += b.unwrap().num_rows();
+                }
+            }
+            let sel = tm.elapsed().as_secs_f64() * 200.0;
+            println!("{col}: plain {plain:.1} ms ({n}) | selected {sel:.1} ms ({m})");
+        }
+    }
+
+    fn selective_read_bench() {
+        let (Ok(chrom), Ok(scored)) = (
+            std::env::var("MUMDIA_BENCH_CHROM"),
+            std::env::var("MUMDIA_BENCH_SCORED"),
+        ) else {
+            println!("set MUMDIA_BENCH_CHROM and MUMDIA_BENCH_SCORED to run this");
+            return;
+        };
+        let qcol = std::env::var("MUMDIA_BENCH_Q").unwrap_or_else(|_| "q_value".to_string());
+        let ps = TableFile::open(&scored).unwrap();
+        let cid = ps.u32("candidate_id").unwrap();
+        let q = ps.f64(&qcol).unwrap();
+        let decoy = ps.str_eq("label", "decoy").unwrap();
+        let ids: Vec<u32> = (0..ps.nrows)
+            .filter(|&i| passes_quant_filter(decoy[i], q[i], 0.01, false))
+            .map(|i| cid[i])
+            .collect();
+        let wanted = CidSet::from_ids(&ids);
+        let indexed = TableFile::open_with_offset_index(&chrom).unwrap();
+        let plain = TableFile::open(&chrom).unwrap();
+
+        // Pages of each leaf that hold at least one accepted row, from the offset index.
+        let f = std::fs::File::open(&chrom).unwrap();
+        let meta = parquet::arrow::arrow_reader::ArrowReaderMetadata::load(
+            &f,
+            parquet::arrow::arrow_reader::ArrowReaderOptions::new()
+                .with_offset_index_policy(parquet::file::metadata::PageIndexPolicy::Optional),
+        )
+        .unwrap();
+        let md = meta.metadata();
+        let descr = md.file_metadata().schema_descr();
+        let all_ids = plain.u32("candidate_id").unwrap();
+        let mut group_start = 0usize;
+        let mut totals: BTreeMap<String, (usize, usize, u64, u64)> = BTreeMap::new();
+        let mut kept_rows = 0usize;
+        let mut opened_groups = 0usize;
+        for g in 0..md.num_row_groups() {
+            let rows = md.row_group(g).num_rows() as usize;
+            let keep: Vec<bool> = all_ids[group_start..group_start + rows]
+                .iter()
+                .map(|&c| wanted.contains(c))
+                .collect();
+            let n_keep = keep.iter().filter(|&&k| k).count();
+            kept_rows += n_keep;
+            opened_groups += usize::from(n_keep > 0);
+            let Some(oi) = md.offset_index() else {
+                println!("{chrom} has no offset index");
+                return;
+            };
+            for (c, col) in oi[g].iter().enumerate() {
+                let name = descr.column(c).path().string();
+                let locs = col.page_locations();
+                let e = totals.entry(name).or_default();
+                for (p, loc) in locs.iter().enumerate() {
+                    let lo = loc.first_row_index as usize;
+                    let hi = locs.get(p + 1).map_or(rows, |n| n.first_row_index as usize);
+                    let touched = keep[lo..hi].iter().any(|&k| k);
+                    e.0 += 1;
+                    e.2 += loc.compressed_page_size as u64;
+                    if touched && n_keep > 0 {
+                        e.1 += 1;
+                        e.3 += loc.compressed_page_size as u64;
+                    }
+                }
+            }
+            group_start += rows;
+        }
+        println!(
+            "{chrom}: {} rows in {} row groups; {} accepted candidates keep {kept_rows} rows \
+             ({:.2}%) in {opened_groups} groups",
+            plain.nrows,
+            md.num_row_groups(),
+            ids.len(),
+            100.0 * kept_rows as f64 / plain.nrows.max(1) as f64
+        );
+        for (leaf, (pages, touched, bytes, tbytes)) in &totals {
+            println!(
+                "  {leaf}: {touched} of {pages} pages hold an accepted row, {:.1} of {:.1} MB \
+                 ({:.1}%)",
+                *tbytes as f64 / 1e6,
+                *bytes as f64 / 1e6,
+                100.0 * *tbytes as f64 / (*bytes).max(1) as f64
+            );
+        }
+        let threads = rayon::current_num_threads();
+        let (mut plain_ms, mut sel_ms) = (Vec::new(), Vec::new());
+        for round in 0..2 {
+            let mut arm = |selective: bool| {
+                let tf = if selective { &indexed } else { &plain };
+                let t = Instant::now();
+                let s = load_chromatograms(tf, true, false, &wanted, &chrom, threads, selective)
+                    .unwrap();
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                if selective {
+                    sel_ms.push(ms);
+                } else {
+                    plain_ms.push(ms);
+                }
+                s
+            };
+            let (a, b) = if round == 0 {
+                (arm(false), arm(true))
+            } else {
+                let b = arm(true);
+                (arm(false), b)
+            };
+            assert_eq!(
+                snapshot(&a),
+                snapshot(&b),
+                "the two reads must store the same rows"
+            );
+        }
+        println!(
+            "  load at {threads} threads: every row {plain_ms:.0?} ms | row selection \
+             {sel_ms:.0?} ms"
+        );
     }
 
     /// The accepted-candidate probe, at the shape it runs at on the six-run HYE artifact:

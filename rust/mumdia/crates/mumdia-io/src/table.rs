@@ -17,7 +17,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
-    RowSelector,
+    RowSelectionPolicy, RowSelector,
 };
 use parquet::arrow::ArrowSchemaConverter;
 #[cfg(test)]
@@ -2664,9 +2664,15 @@ struct ReadSpec {
     roots: Option<Vec<usize>>,
     batch_size: usize,
     coalesce: Option<SpanReadOptions>,
-    /// `(rows, keep)` runs over the whole file ([`TableFile::batches_selected`]), applied
-    /// in place of `selection`, which is then `None`.
+    /// `(rows, keep)` runs over the handle's rows ([`TableFile::batches_selected`] on a
+    /// whole file, [`TableFile::batches_runs`] on a whole file or a span). On a span they
+    /// select within the span's rows: the span's own skips frame them.
     runs: Option<Vec<(usize, bool)>>,
+    /// Materialise `runs` as a queue of selectors ([`RowSelectionPolicy::Selectors`])
+    /// rather than letting the reader choose. A mask decodes every row of a chunk and
+    /// filters afterwards, so it would read and decompress the very pages a selection over
+    /// an offset-indexed file exists to skip.
+    selectors: bool,
 }
 
 impl ReadSpec {
@@ -2769,18 +2775,33 @@ impl ReadSpec {
             ParquetRecordBatchReaderBuilder::new_with_metadata(input, self.meta.clone())
                 .with_batch_size(self.batch_size);
         if let Some(runs) = &self.runs {
-            let sel: Vec<RowSelector> = runs
-                .iter()
-                .filter(|r| r.0 > 0)
-                .map(|&(n, keep)| {
-                    if keep {
-                        RowSelector::select(n)
-                    } else {
-                        RowSelector::skip(n)
-                    }
-                })
-                .collect();
+            // On a span, the runs cover the span's rows, which are the selected row groups'
+            // rows less the span's own front and back skips.
+            let (before, after) = self
+                .selection
+                .as_ref()
+                .map_or((0, 0), |s| (s.skip_before, s.skip_after));
+            let mut sel: Vec<RowSelector> = Vec::with_capacity(runs.len() + 2);
+            if before > 0 {
+                sel.push(RowSelector::skip(before));
+            }
+            sel.extend(runs.iter().filter(|r| r.0 > 0).map(|&(n, keep)| {
+                if keep {
+                    RowSelector::select(n)
+                } else {
+                    RowSelector::skip(n)
+                }
+            }));
+            if after > 0 {
+                sel.push(RowSelector::skip(after));
+            }
+            if let Some(span) = &self.selection {
+                builder = builder.with_row_groups(span.row_groups.clone());
+            }
             builder = builder.with_row_selection(RowSelection::from(sel));
+            if self.selectors {
+                builder = builder.with_row_selection_policy(RowSelectionPolicy::Selectors);
+            }
         } else if let Some(span) = &self.selection {
             // The selection counts rows of the SELECTED row groups only, front to back, so
             // it is skip / take / skip over exactly the groups named here.
@@ -2889,8 +2910,30 @@ impl TableFile {
     /// kept on the handle, so every getter, batch reader and [`TableFile::span`] taken
     /// from it reads the file without parsing the footer again.
     pub fn open(path: &str) -> Result<TableFile> {
+        TableFile::open_with(path, ArrowReaderOptions::default())
+    }
+
+    /// [`TableFile::open`], with the file's offset index (the location of every data page
+    /// of every column chunk) loaded as well, where the file carries one. The engine's
+    /// writer writes it; pyarrow does not by default, and such a file opens exactly as
+    /// [`TableFile::open`] opens it ([`TableFile::offset_indexed`] then says `false`).
+    ///
+    /// Opt-in, because the index is read from the file in addition to the footer, and it
+    /// pays only for a caller that reads a row selection ([`TableFile::batches_runs`]): a
+    /// reader built on this footer skips a page that holds no selected row without reading
+    /// or decompressing it, where one built on [`TableFile::open`]'s footer must decode the
+    /// page to find where its rows end. Every span taken from this handle carries the
+    /// index. The values read are the same either way; only which bytes are fetched moves.
+    pub fn open_with_offset_index(path: &str) -> Result<TableFile> {
+        TableFile::open_with(
+            path,
+            ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional),
+        )
+    }
+
+    fn open_with(path: &str, options: ArrowReaderOptions) -> Result<TableFile> {
         let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
-        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
+        let meta = ArrowReaderMetadata::load(&file, options)
             .with_context(|| format!("reading parquet footer {path}"))?;
         let nrows = meta.metadata().file_metadata().num_rows().max(0) as usize;
         let schema = meta.schema().clone();
@@ -2901,6 +2944,88 @@ impl TableFile {
             meta,
             selection: None,
         })
+    }
+
+    /// Whether this handle's footer holds page locations for every column of every row
+    /// group it covers, so that a row selection skips whole pages instead of decoding
+    /// them. Only a handle from [`TableFile::open_with_offset_index`] (or a span of one)
+    /// can say `true`.
+    pub fn offset_indexed(&self) -> bool {
+        let meta = self.meta.metadata();
+        match &self.selection {
+            Some(span) => span.row_groups.iter().all(|&g| has_offset_index(meta, g)),
+            None => (0..meta.num_row_groups()).all(|g| has_offset_index(meta, g)),
+        }
+    }
+
+    /// This handle's rows cut at the file's row-group boundaries, in row order: one span
+    /// per row group it covers, each clipped to the handle. Concatenated, the parts' rows
+    /// are this handle's rows. Empty for an empty handle.
+    pub fn row_group_parts(&self) -> Result<Vec<TableFile>> {
+        let (first, n) = self.file_row_range();
+        let meta = self.meta.metadata();
+        let mut parts = Vec::new();
+        let mut start = 0usize;
+        for g in 0..meta.num_row_groups() {
+            let rows = meta.row_group(g).num_rows().max(0) as usize;
+            let (s, e) = (start.max(first), (start + rows).min(first + n));
+            if s < e {
+                parts.push(self.span_on(&self.meta, s, e - s)?);
+            }
+            start += rows;
+        }
+        Ok(parts)
+    }
+
+    /// The rows of this handle at which a data page of `column` begins, ascending, as row
+    /// indices of the handle (0 is its first row): for every row group the handle covers,
+    /// the first row it covers there and the first row of each page of each leaf under the
+    /// column, from the offset index. A run of rows `[a, b)` holds whole pages of the
+    /// column exactly when `a` and `b` are both in this list (or `b` is the handle's row
+    /// count), which is what a caller needs to cut a selection that skips pages rather than
+    /// rows inside them. `None` when the footer carries no offset index for a covered
+    /// group ([`TableFile::offset_indexed`]); an error for a column the file does not have.
+    pub fn page_starts(&self, column: &str) -> Result<Option<Vec<usize>>> {
+        let root = self
+            .projection_roots(Some(&[column]))?
+            .expect("a projection")[0];
+        let meta = self.meta.metadata();
+        let Some(oi) = meta.offset_index() else {
+            return Ok(None);
+        };
+        let descr = meta.file_metadata().schema_descr();
+        let leaves: Vec<usize> = (0..descr.num_columns())
+            .filter(|&c| descr.get_column_root_idx(c) == root)
+            .collect();
+        let (first, n) = self.file_row_range();
+        let mut out: Vec<usize> = Vec::new();
+        let mut start = 0usize;
+        for g in 0..meta.num_row_groups() {
+            let rows = meta.row_group(g).num_rows().max(0) as usize;
+            let (s, e) = (start.max(first), (start + rows).min(first + n));
+            if s < e {
+                out.push(s - first);
+                for &leaf in &leaves {
+                    let Some(locs) = oi.get(g).and_then(|cols| cols.get(leaf)) else {
+                        return Ok(None);
+                    };
+                    let locs = locs.page_locations();
+                    if locs.is_empty() {
+                        return Ok(None);
+                    }
+                    for loc in locs {
+                        let at = start + loc.first_row_index.max(0) as usize;
+                        if at > s && at < e {
+                            out.push(at - first);
+                        }
+                    }
+                }
+            }
+            start += rows;
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(Some(out))
     }
 
     /// Open only the rows `[first_row, first_row + n_rows)` of `path`. The row groups that
@@ -3302,6 +3427,41 @@ impl TableFile {
         self.scan_spec(spec, &ScanOptions::default())
     }
 
+    /// Stream only the rows `runs` keeps of THIS handle, a whole file or a span, in row
+    /// order: `runs` is `(rows, keep)` pairs covering the handle's rows front to back. The
+    /// kept rows come back exactly as a full read of the handle would give them.
+    ///
+    /// Unlike [`TableFile::batches_selected`], this reads the footer the handle already
+    /// holds, so a caller that takes many selections (one per row group of a large table)
+    /// parses the file's footer once, not once per call: open the table with
+    /// [`TableFile::open_with_offset_index`] for the reader to skip, unread, every page
+    /// that holds no kept row. On a handle without the index the kept rows are the same,
+    /// and the skipped pages are decoded to be stepped over. The selection is always a
+    /// queue of selectors ([`RowSelectionPolicy::Selectors`]), never parquet-rs's
+    /// automatic choice, whose mask strategy decodes every row of a chunk and so every
+    /// page. What a skipped page holds is never checked, so a corrupt page there goes
+    /// unnoticed, where a full read would have refused it.
+    pub fn batches_runs(
+        &self,
+        columns: Option<&[&str]>,
+        batch_size: usize,
+        runs: &[(usize, bool)],
+    ) -> Result<BatchReader> {
+        let covered: usize = runs.iter().map(|r| r.0).sum();
+        if covered != self.nrows {
+            anyhow::bail!(
+                "TableFile::batches_runs: the selection covers {covered} rows of a handle on {} \
+                 with {}",
+                self.path,
+                self.nrows
+            );
+        }
+        let mut spec = self.read_spec(columns, batch_size, None)?;
+        spec.runs = Some(runs.to_vec());
+        spec.selectors = true;
+        self.scan_spec(spec, &ScanOptions::default())
+    }
+
     /// [`TableFile::batches`] under explicit read options. With [`ScanOptions::default`]
     /// this is `batches` exactly. The batches are identical whatever the options: the same
     /// rows, the same row-group boundaries, the same values, because the options change
@@ -3418,6 +3578,7 @@ impl TableFile {
             batch_size: batch_size.max(1),
             coalesce,
             runs: None,
+            selectors: false,
         })
     }
 
@@ -6501,6 +6662,237 @@ mod encoding_tests {
         // can actually produce.
         let empty: ArrayRef = Arc::new(ListBuilder::new(Float32Builder::new()).finish());
         assert_eq!(ListF32::of(&empty, "trace").unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("mumdia_table_select_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name).to_str().unwrap().to_string()
+    }
+
+    /// One decoded row, floats as bits: `(id, name, trace)`.
+    type Row = (u32, String, Vec<u32>);
+
+    fn rows_of(reader: BatchReader) -> Vec<Row> {
+        let mut out = Vec::new();
+        for b in reader {
+            let b = b.unwrap();
+            let s = b.schema();
+            let id = b
+                .column(s.index_of("id").unwrap())
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .clone();
+            let name = b
+                .column(s.index_of("name").unwrap())
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone();
+            let trace_col = b.column(s.index_of("trace").unwrap()).clone();
+            let trace = ListF32::of(&trace_col, "trace").unwrap();
+            for k in 0..b.num_rows() {
+                out.push((
+                    id.value(k),
+                    name.value(k).to_string(),
+                    trace
+                        .row_slice(k, "trace")
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect(),
+                ));
+            }
+        }
+        out
+    }
+
+    fn runs_of(keep: &[bool]) -> Vec<(usize, bool)> {
+        let mut runs: Vec<(usize, bool)> = Vec::new();
+        for &k in keep {
+            match runs.last_mut() {
+                Some(r) if r.1 == k => r.0 += 1,
+                _ => runs.push((1, k)),
+            }
+        }
+        runs
+    }
+
+    /// A selection over list columns whose pages end mid row group, and whose skipped runs
+    /// start and end inside pages, reads exactly the kept rows of a full read: from the
+    /// whole file and from every row-group part, with the offset index (pages skipped) and
+    /// without it (pages decoded and stepped over).
+    #[test]
+    fn a_selection_over_multi_page_lists_reads_exactly_the_kept_rows() {
+        let path = tmp("multi_page.parquet");
+        let n = 700usize;
+        let ids: Vec<u32> = (0..n as u32).map(|i| 1_000 + i / 7).collect();
+        let names: Vec<String> = (0..n).map(|i| format!("y{}", i % 7)).collect();
+        // Traces of 0 to 36 values, so pages hold uneven row counts and some rows are empty.
+        let traces: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                (0..(i * 11) % 37)
+                    .map(|k| (i * 100 + k) as f32 * 0.25)
+                    .collect()
+            })
+            .collect();
+        let (schema, batch) = cols_to_batch(
+            &path,
+            vec![
+                Col::U32("id".into(), ids),
+                Col::Str("name".into(), names),
+                Col::LargeListF32("trace".into(), traces),
+            ],
+        )
+        .unwrap();
+        // Tiny pages checked every few values, so every leaf of every row group is many
+        // pages and a page boundary falls inside most runs of the selections below.
+        let props = WriterProperties::builder()
+            .set_compression(codec())
+            .set_max_row_group_row_count(Some(128))
+            .set_data_page_size_limit(512)
+            .set_write_batch_size(5)
+            .build();
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let (_, meta) = splice_meta(&path).unwrap();
+        let oi = meta
+            .offset_index()
+            .expect("the writer writes an offset index");
+        assert!(meta.num_row_groups() >= 5);
+        for rg in oi.iter() {
+            let trace_pages = rg[2].page_locations().len();
+            assert!(
+                trace_pages >= 2,
+                "the trace leaf must span pages: {trace_pages}"
+            );
+        }
+
+        let plain = TableFile::open(&path).unwrap();
+        let indexed = TableFile::open_with_offset_index(&path).unwrap();
+        assert!(!plain.offset_indexed());
+        assert!(indexed.offset_indexed());
+        let full = rows_of(plain.batches(None, 64).unwrap());
+        assert_eq!(full.len(), n);
+
+        let patterns: Vec<(&str, Vec<bool>)> = vec![
+            ("every third row", (0..n).map(|i| i % 3 == 0).collect()),
+            (
+                "runs of 9 kept, 23 skipped",
+                (0..n).map(|i| i % 32 < 9).collect(),
+            ),
+            (
+                "one candidate in five",
+                (0..n).map(|i| (i / 7) % 5 == 2).collect(),
+            ),
+            ("nothing", vec![false; n]),
+            ("everything", vec![true; n]),
+            (
+                "the first and the last row",
+                (0..n).map(|i| i == 0 || i == n - 1).collect(),
+            ),
+        ];
+        for (label, keep) in &patterns {
+            let expect: Vec<Row> = full
+                .iter()
+                .zip(keep)
+                .filter(|(_, &k)| k)
+                .map(|(r, _)| r.clone())
+                .collect();
+            let runs = runs_of(keep);
+            for (handle_label, handle) in [("indexed", &indexed), ("plain", &plain)] {
+                let got = rows_of(handle.batches_runs(None, 17, &runs).unwrap());
+                assert_eq!(got, expect, "{label}, whole {handle_label} file");
+                // Row group by row group, each part given its own slice of the selection.
+                let mut by_part: Vec<Row> = Vec::new();
+                let mut first = 0usize;
+                for part in handle.row_group_parts().unwrap() {
+                    let slice = &keep[first..first + part.nrows];
+                    first += part.nrows;
+                    assert_eq!(part.offset_indexed(), handle.offset_indexed());
+                    by_part.extend(rows_of(
+                        part.batches_runs(None, 17, &runs_of(slice)).unwrap(),
+                    ));
+                }
+                assert_eq!(first, n, "the parts cover the handle");
+                assert_eq!(by_part, expect, "{label}, {handle_label} row-group parts");
+            }
+            // A projection that leaves the id out still selects the same rows.
+            let names_only: Vec<String> = indexed
+                .batches_runs(Some(&["name", "trace"]), 64, &runs)
+                .unwrap()
+                .flat_map(|b| {
+                    let b = b.unwrap();
+                    let a = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .clone();
+                    (0..a.len()).map(move |k| a.value(k).to_string())
+                })
+                .collect();
+            assert_eq!(
+                names_only,
+                expect.iter().map(|r| r.1.clone()).collect::<Vec<_>>(),
+                "{label}, projected"
+            );
+        }
+        // Page starts: every group's first row plus each trace page's first row, as rows of
+        // the handle; none without the index; a span sees its own rows.
+        let starts = indexed.page_starts("trace").unwrap().unwrap();
+        let mut expect_starts: Vec<usize> = Vec::new();
+        let mut group_start = 0usize;
+        for (g, rg) in oi.iter().enumerate() {
+            expect_starts.push(group_start);
+            for loc in rg[2].page_locations() {
+                expect_starts.push(group_start + loc.first_row_index as usize);
+            }
+            group_start += meta.row_group(g).num_rows() as usize;
+        }
+        expect_starts.sort_unstable();
+        expect_starts.dedup();
+        assert_eq!(starts, expect_starts);
+        assert!(plain.page_starts("trace").unwrap().is_none());
+        assert!(indexed.page_starts("no_such_column").is_err());
+        let span_starts = indexed
+            .span(100, 300)
+            .unwrap()
+            .page_starts("trace")
+            .unwrap()
+            .unwrap();
+        assert_eq!(span_starts[0], 0);
+        assert_eq!(
+            span_starts[1..].to_vec(),
+            starts
+                .iter()
+                .filter(|&&r| r > 100 && r < 400)
+                .map(|&r| r - 100)
+                .collect::<Vec<_>>()
+        );
+        // A span in the middle of a row group: the runs select within the span's rows.
+        let span = indexed.span(100, 300).unwrap();
+        let keep: Vec<bool> = (0..300).map(|i| i % 4 == 1).collect();
+        let got = rows_of(span.batches_runs(None, 64, &runs_of(&keep)).unwrap());
+        let expect: Vec<Row> = full[100..400]
+            .iter()
+            .zip(&keep)
+            .filter(|(_, &k)| k)
+            .map(|(r, _)| r.clone())
+            .collect();
+        assert_eq!(got, expect, "a span that starts and ends inside row groups");
+        // The selection must cover the handle.
+        assert!(indexed.batches_runs(None, 64, &[(n - 1, true)]).is_err());
+        std::fs::remove_file(&path).ok();
     }
 }
 
