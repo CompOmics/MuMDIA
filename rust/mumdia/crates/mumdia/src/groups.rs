@@ -277,7 +277,8 @@ pub fn longest_first(cost: &[f64]) -> Vec<usize> {
 /// `par <= 1` runs the items one after another in item order, which is what the chunked
 /// loops did. On an error no further item is started, the items already running finish,
 /// and the error of the lowest-indexed failed item is returned, so the reported error does
-/// not depend on scheduling.
+/// not depend on scheduling. A panicking item stops the queue the same way: no further
+/// item is started, and the panic resumes from here once the running items have finished.
 ///
 /// The workers are rayon tasks, and each blocks its worker thread for as long as its item
 /// runs, exactly as the chunked `par_iter` did; `run_groups` keeps `par` below the thread
@@ -288,12 +289,40 @@ where
     R: Send,
     F: Fn(&T) -> Result<R> + Sync,
 {
+    run_bounded_ranked(items, par, order, |_, t| f(t))
+}
+
+/// Sets the queue's stop flag when dropped armed, which is what an unwinding item does: a
+/// panic in one band must stop the others from taking more bands, as an `Err` does, or a
+/// 63-band run keeps working for hours before the panic surfaces.
+struct StopOnUnwind<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+    armed: bool,
+}
+
+impl Drop for StopOnUnwind<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// [`run_bounded`], with `f` also given the dispatch rank `k` it was taken at: item
+/// `order[k]` is the `k`-th item any worker took from the queue. The rank is what a test
+/// can check exactly, where the moment an item STARTS depends on thread scheduling.
+fn run_bounded_ranked<T, R, F>(items: &[T], par: usize, order: &[usize], f: F) -> Result<Vec<R>>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(usize, &T) -> Result<R> + Sync,
+{
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     let n = items.len();
     if par <= 1 || n <= 1 {
-        return items.iter().map(&f).collect();
+        return items.iter().enumerate().map(|(k, t)| f(k, t)).collect();
     }
     debug_assert_eq!(order.len(), n, "the dispatch order must list every item");
     let next = AtomicUsize::new(0);
@@ -310,7 +339,12 @@ where
                     break;
                 }
                 let i = order[k];
-                let r = f(&items[i]);
+                let mut guard = StopOnUnwind {
+                    flag: &failed,
+                    armed: true,
+                };
+                let r = f(k, &items[i]);
+                guard.armed = false;
                 if r.is_err() {
                     failed.store(true, Ordering::SeqCst);
                 }
@@ -699,11 +733,15 @@ mod tests {
         for par in [1usize, 2, 3, 8, 40] {
             let live = AtomicUsize::new(0);
             let peak = AtomicUsize::new(0);
-            let started = std::sync::Mutex::new(Vec::new());
-            let out = run_bounded(&items, par, &order, |&i| {
+            // (dispatch rank, item), as the queue handed them out. The rank is recorded by
+            // the queue itself, so this does not depend on when a worker thread gets to
+            // run the item it took (a check on the START order did, and could fail on a
+            // loaded runner where one worker is preempted between taking and starting).
+            let taken = std::sync::Mutex::new(Vec::new());
+            let out = super::run_bounded_ranked(&items, par, &order, |k, &i| {
                 let now = live.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
-                started.lock().unwrap().push(i);
+                taken.lock().unwrap().push((k, i));
                 std::thread::sleep(std::time::Duration::from_millis(1 + (i % 3) as u64));
                 live.fetch_sub(1, Ordering::SeqCst);
                 Ok(i * 10)
@@ -715,22 +753,55 @@ mod tests {
                 "par {par}: results come back in item order"
             );
             assert!(peak.load(Ordering::SeqCst) <= par.max(1), "par {par}");
-            let started = started.into_inner().unwrap();
+            let mut taken = taken.into_inner().unwrap();
             if par <= 1 {
-                assert_eq!(started, items, "one at a time runs in item order");
+                let seq: Vec<usize> = taken.iter().map(|&(_, i)| i).collect();
+                assert_eq!(seq, items, "one at a time runs in item order");
             } else {
-                // Items are taken in dispatch order; at most `par - 1` other workers can sit
-                // between taking an item and starting it, so no item starts more than
-                // `par - 1` places away from its rank in the order.
-                for (pos, i) in started.iter().enumerate() {
-                    let rank = order.iter().position(|o| o == i).unwrap();
-                    assert!(
-                        pos.abs_diff(rank) < par,
-                        "par {par}: item {i} of rank {rank} started at {pos}"
-                    );
-                }
+                // Every rank was taken exactly once, and rank k was item order[k]: the
+                // queue dispatches in the order it was given.
+                taken.sort_unstable();
+                let ranks: Vec<usize> = taken.iter().map(|&(k, _)| k).collect();
+                assert_eq!(ranks, (0..items.len()).collect::<Vec<_>>(), "par {par}");
+                let seq: Vec<usize> = taken.iter().map(|&(_, i)| i).collect();
+                assert_eq!(seq, order, "par {par}: items are taken in dispatch order");
             }
         }
+    }
+
+    #[test]
+    fn a_panicking_band_stops_the_queue() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let items: Vec<usize> = (0..60).collect();
+        let order: Vec<usize> = (0..60).collect();
+        let ran = AtomicUsize::new(0);
+        let panicking = AtomicBool::new(false);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_bounded(&items, 3, &order, |&i| {
+                ran.fetch_add(1, Ordering::SeqCst);
+                if i == 4 {
+                    panicking.store(true, Ordering::SeqCst);
+                    panic!("band {i} panicked");
+                }
+                if i > 4 {
+                    // Item 4 is taken before any later item, so this cannot wait forever.
+                    // Holding the later items until well after the panic makes the check
+                    // below independent of how fast the machine is.
+                    let t0 = std::time::Instant::now();
+                    while !panicking.load(Ordering::SeqCst) && t0.elapsed().as_secs() < 10 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                }
+                Ok(i)
+            })
+        }));
+        assert!(caught.is_err(), "the panic resumes from the queue");
+        // Items 0..=4 and the one or two items each other worker held when item 4 unwound.
+        // Without the stop flag all 60 run.
+        let n = ran.load(Ordering::SeqCst);
+        assert!(n < 30, "{n} items ran after a panic in item 4");
     }
 
     #[test]
