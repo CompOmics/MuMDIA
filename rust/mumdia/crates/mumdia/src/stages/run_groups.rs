@@ -60,6 +60,11 @@ pub struct GroupRun<'a> {
     /// rather than re-predicting their slices of the same table; under `per_band` they
     /// re-predict as before. Only a caller that did the re-prediction may set it.
     pub library_irt_repredicted: bool,
+    /// A previous run's `groups/` directory whose band slices (`gNN/lib_precursors.parquet`)
+    /// this run may take instead of writing its own, when its plan is this run's plan: the
+    /// runs of one experiment search one library, so equal plans give equal slices. Only a
+    /// band a DeepLC sidecar rewrites is written out at all.
+    pub slices_from: Option<&'a str>,
 }
 
 /// Paths the pooled stages continue with.
@@ -108,6 +113,17 @@ fn band_lib_name(rt_model: &str) -> &'static str {
         "lib_precursors_ft.parquet"
     } else {
         "lib_precursors_deeplc.parquet"
+    }
+}
+
+/// Whether two `groups/plan.json` files plan the same bands: same windows, same m/z bounds.
+/// A slice is a function of the library and the band's m/z range, so equal plans over one
+/// library give byte-identical slices. Unreadable or absent is "not the same".
+fn same_plan(a: &str, b: &str) -> bool {
+    let read = |p: &str| mumdia_io::json::read_json::<serde_json::Value>(p).ok();
+    match (read(a), read(b)) {
+        (Some(x), Some(y)) => x.get("bands").is_some() && x.get("bands") == y.get("bands"),
+        _ => false,
     }
 }
 
@@ -222,12 +238,16 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         }),
     )?;
 
-    // --- band files and seeds
+    // --- band seeds
     struct Band {
         index: usize,
         offset: u32,
         n: usize,
+        /// The band's precursor table: the whole library read by row span while `span` is
+        /// set, else a band file with local ids (its slice, or the adapted table a DeepLC
+        /// sidecar wrote).
         prec: String,
+        span: Option<(usize, usize)>,
         seed: String,
     }
     let mut bands: Vec<Band> = Vec::new();
@@ -300,46 +320,25 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 return Ok(None);
             }
             std::fs::create_dir_all(gd(b.index, ""))?;
-            let mut prec = gd(b.index, "lib_precursors.parquet");
-            // A band's slice is a deterministic function of the library and the row span,
-            // and a shared-band run searches the same library under the same plan, so the
-            // first run's slice is the same bytes. Take it rather than write the whole
-            // precursor table again: only the seed reads it, and the adapted table replaces
-            // it for everything downstream.
-            let shared_slice = g
-                .shared_bands
-                .map(|s| format!("{s}/g{:02}/lib_precursors.parquet", b.index))
-                .filter(|p| {
-                    std::path::Path::new(p).exists()
-                        && mumdia_io::table::nrows(p).is_ok_and(|r| r == n as u64)
-                });
-            match shared_slice {
-                Some(p) => {
-                    info!(
-                        stage = %"band-slice",
-                        group = b.index,
-                        rows = n,
-                        reused = %p,
-                        "run: stage skipped"
-                    );
-                    prec = p;
-                }
-                None => {
-                    info!(stage = %"band-slice", group = b.index, rows = n, "run: stage start");
-                    groups::write_band_slice(g.lib_precursors, first, n, &prec)?;
-                }
-            }
+            // The seed reads the band straight from the library by row span: the same
+            // library, value for value, as a band file of those rows
+            // (`Library::load_row_span_with`), without writing one. Until 2026-09-25 every
+            // band was written out first, whether or not anything rewrote it, which on a
+            // 203.5M-precursor library without an RT model was the whole precursor table
+            // written again for every run. A band file is now written only where a DeepLC
+            // sidecar rewrites the band (below).
             let seed = gd(b.index, "seed_psms.parquet");
             info!(stage = %"search-seed", group = b.index, "run: stage start");
             let rows = search_seed::run(search_seed::SearchSeedParams {
+                precursor_span: Some((first, n)),
                 ms2: &g.converted.ms2,
-                library_precursors: &prec,
+                library_precursors: g.lib_precursors,
                 library_fragments: g.lib_fragments,
                 out: &seed,
                 cfg: &cfg.search_seed,
                 bucket_size: cfg.extract.bucket_size,
                 config_hash: ch,
-                fragment_offset: Some(first as u32),
+                fragment_offset: None,
                 ms2_scans: Some(&ms2_scans),
                 // The band writes its calibrant deviations so `seed-pool` can fit the
                 // mass calibration once over the whole run rather than average the
@@ -359,7 +358,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     index: b.index,
                     offset: first as u32,
                     n,
-                    prec,
+                    prec: g.lib_precursors.to_string(),
+                    span: Some((first, n)),
                     seed,
                 },
                 rec,
@@ -473,6 +473,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             }
             repredicted.push((from.clone(), b.offset));
             b.prec = from;
+            b.span = None;
         }
         info!(
             groups = bands.len(),
@@ -492,6 +493,47 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
              whole experiment; the bands keep those values (groups.rt_adaptation = \
              once_per_run)"
         );
+    }
+    // A DeepLC sidecar rewrites a band's precursor FILE, so the bands it adapts are written
+    // out here, and only then: without an adaptation every stage reads the band by row span.
+    // A previous run of the same experiment that planned the same bands under the same
+    // library wrote the same bytes (a slice is a deterministic function of the library and
+    // the row span), so its slices are taken instead where `slices_from` offers them.
+    let per_band_sidecar = g.shared_bands.is_none()
+        && !keep_caller_irt
+        && (g.mh_heads > 0 || cfg.rt_im_train.finetune_deeplc || repredict);
+    if per_band_sidecar {
+        let reuse_dir = g
+            .slices_from
+            .filter(|dir| same_plan(&format!("{dir}/plan.json"), &d("groups/plan.json")));
+        let write_one = |b: &Band| -> Result<String> {
+            let (first, n) = b.span.expect("bands are read by span until adapted");
+            if let Some(dir) = reuse_dir {
+                let from = format!("{dir}/g{:02}/lib_precursors.parquet", b.index);
+                if std::path::Path::new(&from).exists()
+                    && mumdia_io::table::nrows(&from).is_ok_and(|r| r == n as u64)
+                {
+                    info!(
+                        stage = %"band-slice",
+                        group = b.index,
+                        rows = n,
+                        reused = %from,
+                        "run: stage skipped"
+                    );
+                    return Ok(from);
+                }
+            }
+            let out = gd(b.index, "lib_precursors.parquet");
+            info!(stage = %"band-slice", group = b.index, rows = n, "run: stage start");
+            groups::write_band_slice(g.lib_precursors, first, n, &out)?;
+            Ok(out)
+        };
+        let order: Vec<usize> = (0..bands.len()).collect();
+        let files = groups::run_bounded(&bands, par, &order, write_one)?;
+        for (b, file) in bands.iter_mut().zip(files) {
+            b.prec = file;
+            b.span = None;
+        }
     }
     if union_mode {
         let name = band_lib_name(&rt_model);
@@ -540,6 +582,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             );
             repredicted.push((out.clone(), b.offset));
             b.prec = out;
+            b.span = None;
         }
     }
     for b in bands
@@ -697,6 +740,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 Some(fit) => rt_im_train::apply(
                     fit,
                     &rt_im_train::ApplyParams {
+                        precursor_span: b.span,
                         library_precursors: &b.prec,
                         out_windows: &windows,
                         out_cal: &cal,
@@ -706,6 +750,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 )?,
                 // Per group: this band's own anchors, iRT joined from its own table.
                 None => rt_im_train::run(rt_im_train::RtImTrainParams {
+                    precursor_span: b.span,
                     seed_psms: &b.seed,
                     library_precursors: &b.prec,
                     out_windows: &windows,
@@ -732,6 +777,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             let chrom = gd(b.index, "chromatograms.parquet");
             info!(stage = %"extract", group = b.index, candidates = b.n, "run: stage start");
             let (npsm, nchr) = extract::run(extract::ExtractParams {
+                precursor_span: b.span,
                 ms2: &g.converted.ms2,
                 library_precursors: &b.prec,
                 library_fragments: g.lib_fragments,
@@ -743,7 +789,9 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 restrict_candidates: None,
                 cfg: &cfg.extract,
                 config_hash: ch,
-                fragment_offset: Some(b.offset),
+                // A band file carries local ids with its fragments at the band's offset; a
+                // span implies it.
+                fragment_offset: b.span.is_none().then_some(b.offset),
                 sibling_bands: par,
                 scans: Some(extract::SharedScans {
                     ms2: &ms2_scans,

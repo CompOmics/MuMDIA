@@ -37,6 +37,13 @@ pub struct SearchSeedParams<'a> {
     /// table at ids `offset..offset + n`. The seed table is then in band-local ids. `None`
     /// is the ordinary whole-library search.
     pub fragment_offset: Option<u32>,
+    /// `library_precursors` is the WHOLE library and this stage searches its rows
+    /// `[first, first + n)`, loaded directly by row span (`Library::load_row_span_with`):
+    /// local ids `0..n`, fragments at library-wide ids `first..first + n`, outputs in local
+    /// ids exactly as for a band file. A grouped run loads a band this way wherever nothing
+    /// rewrites the band's precursor table, instead of writing the band out first.
+    /// `fragment_offset` is then `None` (or `Some(first)`). `None` is the ordinary load.
+    pub precursor_span: Option<(usize, usize)>,
     /// This run's MS2 scans, already decoded. A grouped search
     /// (`groups.window_groups > 1`) decodes the run once in `run_groups` and lends the
     /// same buffer to every band, because every band re-reads the whole run and only the
@@ -100,21 +107,21 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     )?;
     // See extract: the bucketed index is dead weight on the fragindex path.
     let build_bucketed = !matches!(p.cfg.matcher, MatcherKind::Fragindex);
-    let mut lib = match p.fragment_offset {
-        None => Library::load_with(
-            p.library_precursors,
-            p.library_fragments,
-            p.bucket_size,
-            build_bucketed,
-        )?,
-        Some(offset) => Library::load_with_fragment_offset(
-            p.library_precursors,
-            p.library_fragments,
-            offset,
-            p.bucket_size,
-            build_bucketed,
-        )?,
-    };
+    let mut lib = Library::load_for_stage(
+        p.library_precursors,
+        p.library_fragments,
+        p.fragment_offset,
+        p.precursor_span,
+        p.bucket_size,
+        build_bucketed,
+    )?;
+    // The calibrant ids are library-wide: local id plus where the band starts, which is the
+    // fragment offset of a band file and the first row of a span.
+    let gid_base = p
+        .precursor_span
+        .map(|(first, _)| first as u32)
+        .or(p.fragment_offset)
+        .unwrap_or(0);
     // Decoded here unless the caller lent its own copy (see `ms2_scans`). The owned
     // buffer is declared first so it outlives the borrow. An empty lent slice is not
     // believed over the path: it means the caller had nothing to lend.
@@ -265,7 +272,6 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     let mut dev_mz: Vec<f64> = Vec::new();
     // The same deviations keyed by library-wide candidate id and scan, written beside the
     // masscal for a grouped run to pool. Stays empty otherwise.
-    let gid_base = p.fragment_offset.unwrap_or(0);
     let mut calibrants = crate::masscal::Calibrants::default();
     for (i, (cid, b)) in rows.iter().enumerate() {
         if is_dec[i] {

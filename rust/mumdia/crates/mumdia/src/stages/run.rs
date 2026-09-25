@@ -340,6 +340,7 @@ pub fn run(p: RunParams) -> Result<()> {
                 library_input: p.lib_precursors.is_some(),
                 // A single run re-predicts nothing before banding.
                 library_irt_repredicted: false,
+                slices_from: None,
             })?;
             (
                 pooled.seed,
@@ -354,6 +355,7 @@ pub fn run(p: RunParams) -> Result<()> {
             let seed = d("seed_psms.parquet");
             info!(stage = %"search-seed", "run: stage start");
             let n = search_seed::run(search_seed::SearchSeedParams {
+                precursor_span: None,
                 fragment_offset: None,
                 // Ungrouped: the seed and the extract below are the only readers of the
                 // spectra and they run minutes apart, so each decodes its own and drops
@@ -533,6 +535,7 @@ pub fn run(p: RunParams) -> Result<()> {
             let cal = d("cal.json");
             info!(stage = %"rt-im-train", "run: stage start");
             let n = rt_im_train::run(rt_im_train::RtImTrainParams {
+                precursor_span: None,
                 anchor_irt_from_seed: false,
                 seed_psms: &seed,
                 library_precursors: &lib_p,
@@ -554,6 +557,7 @@ pub fn run(p: RunParams) -> Result<()> {
             let chrom = d("chromatograms.parquet");
             info!(stage = %"extract", "run: stage start");
             let (npsm, nchr) = extract::run(extract::ExtractParams {
+                precursor_span: None,
                 fragment_offset: None,
                 sibling_bands: 1,
                 scans: None,

@@ -198,6 +198,7 @@ fn run_extract(prec: &str, frag: &str, ms2: &str, win: &str, tag: &str) -> (Stri
     let psms = tmp(&format!("psms_{tag}.parquet"));
     let chrom = tmp(&format!("chrom_{tag}.parquet"));
     stages::extract::run(stages::extract::ExtractParams {
+        precursor_span: None,
         fragment_offset: None,
         sibling_bands: 1,
         scans: None,
@@ -581,6 +582,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         let psms = tmp(&format!("psms_{tag}.parquet"));
         let chrom = tmp(&format!("chrom_{tag}.parquet"));
         let (npsm, _) = stages::extract::run(stages::extract::ExtractParams {
+            precursor_span: None,
             fragment_offset: None,
             sibling_bands: 1,
             scans: shared,
@@ -665,6 +667,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     let psms_noclaim = tmp("psms_noclaim.parquet");
     let chrom_noclaim = tmp("chrom_noclaim.parquet");
     stages::extract::run(stages::extract::ExtractParams {
+        precursor_span: None,
         fragment_offset: None,
         sibling_bands: 1,
         scans: None,
@@ -692,6 +695,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     let psms_no_ms1 = tmp("psms_no_ms1.parquet");
     let chrom_no_ms1 = tmp("chrom_no_ms1.parquet");
     stages::extract::run(stages::extract::ExtractParams {
+        precursor_span: None,
         fragment_offset: None,
         sibling_bands: 1,
         scans: None,
@@ -735,6 +739,7 @@ fn extract_does_not_believe_an_empty_lent_ms1_over_a_named_one() {
         let psms = tmp(&format!("psms_{tag}.parquet"));
         let chrom = tmp(&format!("chrom_{tag}.parquet"));
         stages::extract::run(stages::extract::ExtractParams {
+            precursor_span: None,
             fragment_offset: None,
             sibling_bands: 1,
             scans: shared,
@@ -809,6 +814,7 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     let run_one = |shared: Option<&[Ms2Scan]>, tag: &str| -> (String, u64) {
         let out = tmp(&format!("seed_{tag}.parquet"));
         let rows = stages::search_seed::run(stages::search_seed::SearchSeedParams {
+            precursor_span: None,
             fragment_offset: None,
             ms2_scans: shared,
             emit_calibrants: false,
@@ -854,6 +860,7 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     uncapped.search_seed.top_n_peaks = 0;
     let out = tmp("seed_uncapped.parquet");
     stages::search_seed::run(stages::search_seed::SearchSeedParams {
+        precursor_span: None,
         fragment_offset: None,
         ms2_scans: None,
         emit_calibrants: false,
@@ -1111,6 +1118,7 @@ fn a_two_band_pooled_mass_calibration_equals_the_unbanded_fit() {
     let seed = |prec: &str, offset: Option<u32>, emit: bool, tag: &str| -> String {
         let out = tmp(&format!("two_band_seed_{tag}.parquet"));
         stages::search_seed::run(stages::search_seed::SearchSeedParams {
+            precursor_span: None,
             fragment_offset: offset,
             ms2_scans: None,
             emit_calibrants: emit,

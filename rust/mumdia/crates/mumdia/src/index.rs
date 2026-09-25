@@ -277,6 +277,72 @@ impl Library {
         )
     }
 
+    /// Load the precursor rows `[first_row, first_row + n_rows)` of the whole library, with
+    /// their fragments, as a library of its own: local ids `0..n_rows` and
+    /// [`Library::global_offset`] `first_row`. The same library, value for value, as
+    /// [`Library::load_with_fragment_offset`] over a band file that
+    /// `groups::write_band_slice` wrote from those rows, without the file: a grouped run
+    /// loads a band this way wherever nothing rewrites the band's precursor table.
+    pub fn load_row_span_with(
+        precursors: &str,
+        fragments: &str,
+        first_row: usize,
+        n_rows: usize,
+        bucket_size: usize,
+        build_bucketed: bool,
+    ) -> Result<Library> {
+        if n_rows == 0 {
+            anyhow::bail!("an empty row span of {precursors} is not a library");
+        }
+        Self::load_impl(
+            precursors,
+            fragments,
+            bucket_size,
+            build_bucketed,
+            Some((first_row, n_rows)),
+            Some(first_row),
+        )
+    }
+
+    /// The load a stage asks for: the whole table, a band file (`fragment_offset`), or a
+    /// row span of the whole table (`precursor_span`, with `fragment_offset` either absent
+    /// or equal to the span's first row).
+    pub fn load_for_stage(
+        precursors: &str,
+        fragments: &str,
+        fragment_offset: Option<u32>,
+        precursor_span: Option<(usize, usize)>,
+        bucket_size: usize,
+        build_bucketed: bool,
+    ) -> Result<Library> {
+        match (precursor_span, fragment_offset) {
+            (None, None) => Self::load_with(precursors, fragments, bucket_size, build_bucketed),
+            (None, Some(offset)) => Self::load_with_fragment_offset(
+                precursors,
+                fragments,
+                offset,
+                bucket_size,
+                build_bucketed,
+            ),
+            (Some((first, n)), off) => {
+                if off.is_some_and(|o| o as usize != first) {
+                    anyhow::bail!(
+                        "a row span starting at {first} was asked for with fragment offset \
+                         {off:?}; the span's first row is the offset"
+                    );
+                }
+                Self::load_row_span_with(
+                    precursors,
+                    fragments,
+                    first,
+                    n,
+                    bucket_size,
+                    build_bucketed,
+                )
+            }
+        }
+    }
+
     /// The row span `[first_row, first_row + n)` of the m/z-sorted precursor table whose
     /// `precursor_mz` lies in `[mz_lo, mz_hi]`. Row groups that cannot contain the range are
     /// skipped from their statistics; the ones that can are decoded (one column) and the
@@ -1153,6 +1219,52 @@ mod tests {
             assert_eq!(frag_slice(&lib, c), frag_slice(&by_mz, c));
             assert_eq!(lib.cands[c].precursor_mz, by_mz.cands[c].precursor_mz);
         }
+        // And as loading the same rows by span, with no band file at all: what a grouped
+        // run does wherever nothing rewrites the band's precursor table.
+        let by_span = Library::load_for_stage(&p, &f, None, Some((1, 3)), 8, false).unwrap();
+        assert_eq!(by_span.global_offset, lib.global_offset);
+        assert_eq!(by_span.n_candidates(), lib.n_candidates());
+        assert_eq!(by_span.frag_mz, lib.frag_mz);
+        assert_eq!(by_span.frag_int, lib.frag_int);
+        assert_eq!(by_span.frag_name_id, lib.frag_name_id);
+        assert_eq!(by_span.frag_name_dict, lib.frag_name_dict);
+        assert_eq!(by_span.prec_mz, lib.prec_mz);
+        for c in 0..3 {
+            let (a, b) = (&by_span.cands[c], &lib.cands[c]);
+            assert_eq!(
+                (
+                    a.candidate_id,
+                    a.peptidoform_id,
+                    a.base_peptide_id,
+                    a.charge
+                ),
+                (
+                    b.candidate_id,
+                    b.peptidoform_id,
+                    b.base_peptide_id,
+                    b.charge
+                )
+            );
+            assert_eq!((a.frag_start, a.n_frag), (b.frag_start, b.n_frag));
+            assert_eq!((&a.peptidoform, &a.protein), (&b.peptidoform, &b.protein));
+            assert_eq!(
+                (
+                    a.precursor_mz.to_bits(),
+                    a.predicted_irt.to_bits(),
+                    a.is_decoy
+                ),
+                (
+                    b.precursor_mz.to_bits(),
+                    b.predicted_irt.to_bits(),
+                    b.is_decoy
+                )
+            );
+        }
+        // A span with its own first row as the fragment offset is the same request; any
+        // other offset is refused.
+        assert!(Library::load_for_stage(&p, &f, Some(1), Some((1, 3)), 8, false).is_ok());
+        assert!(Library::load_for_stage(&p, &f, Some(2), Some((1, 3)), 8, false).is_err());
+        assert!(Library::load_for_stage(&p, &f, None, Some((1, 0)), 8, false).is_err());
     }
 
     /// The FIRST band starts at library row 0, and it is still a band: the shared fragment

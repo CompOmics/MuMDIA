@@ -1202,6 +1202,7 @@ fn real_main() -> Result<()> {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::search_seed::run(stages::search_seed::SearchSeedParams {
+                precursor_span: None,
                 fragment_offset: None,
                 // Standalone: this invocation decodes the run itself.
                 ms2_scans: None,
@@ -1244,6 +1245,7 @@ fn real_main() -> Result<()> {
             }
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::rt_im_train::run(stages::rt_im_train::RtImTrainParams {
+                precursor_span: None,
                 anchor_irt_from_seed: false,
                 seed_psms: &seed_psms,
                 library_precursors: &lib_precursors,
@@ -1297,6 +1299,7 @@ fn real_main() -> Result<()> {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::extract::run(stages::extract::ExtractParams {
+                precursor_span: None,
                 fragment_offset,
                 sibling_bands: 1,
                 // Standalone: this invocation decodes the run itself.

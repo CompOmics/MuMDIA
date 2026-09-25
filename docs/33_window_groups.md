@@ -64,38 +64,54 @@ A band is the union of its windows' m/z ranges. Two consequences are written to
 
 ## 3. One band, one library
 
-For each group the orchestrator writes the band as a precursor table of its own,
-`groups/gNN/lib_precursors.parquet`, with band-local ids `0..n`
-(`groups::write_band_slice`, which reads only the row groups that cover the span through
-`TableFile::open_rows`). The band's first library row is its offset; local id plus offset is
-the library-wide id, and every stage below carries it in the manifest as `name[gNN]`.
+A band is the precursor rows `[first, first + n)` of the m/z-sorted library whose m/z lies in
+the band's range (`Library::precursor_row_span`, from the row-group statistics and one decode
+of `precursor_mz` over the boundary groups). The band's first library row is its offset;
+local id plus offset is the library-wide id, and every stage below carries it in the manifest
+as `name[gNN]`.
 
-The stages then run unchanged on that table, as if it were the library:
+The stages then run unchanged on that band, as if it were the library:
 
-- `search-seed` loads the band with `Library::load_with_fragment_offset`: the band file plus
-  the fragments whose ids lie in the band's range, read from the shared, library-wide
-  fragment table. When that table is sorted by `candidate_id` at row-group granularity
-  (`scripts/sort_fragments.py`; every library writer ends with the sort) the read is
-  selective; an unsorted table still loads through a filtered scan of the whole table, with a
-  warning, and costs the scan per band.
+- `search-seed` loads the band straight from the library by row span
+  (`Library::load_row_span_with`: local ids `0..n`, the fragments whose ids lie in the band's
+  range read from the shared, library-wide fragment table). When that table is sorted by
+  `candidate_id` at row-group granularity (`scripts/sort_fragments.py`; every library writer
+  ends with the sort) the read is selective; an unsorted table still loads through a filtered
+  scan of the whole table, with a warning, and costs the scan per band.
 - the RT model (multi-head calibration, the optional fine-tune, or the base-model
   re-prediction, whichever the configuration resolves to; `docs/08_rt_im_train.md`) runs
   on the band table and writes the band's re-predicted table. The DeepLC sidecars rewrite a
-  precursor file, which is why the band is a file rather than an in-memory slice.
+  precursor FILE, so a band that an RT model adapts is first written out as a precursor table
+  of its own, `groups/gNN/lib_precursors.parquet`, with band-local ids `0..n`
+  (`groups::write_band_slice`, which reads only the row groups that cover the span through
+  `TableFile::open_rows`).
 - `rt-im-train` writes the band's `run_windows.parquet` and `cal.json`.
 - `extract`, `features` and `compete` write the band's `psms_extracted`, `chromatograms`,
   `features` and `psms_competed`. The id columns are library-wide on the way out
   (local id plus `Library::global_offset`), so a band's table means the same thing as the
   run's and pooling is a concatenation.
 
+`rt-im-train` and `extract` read the adapted band file where an RT model ran, and the band by
+row span from the library where none did (`rt_model` `library`, or the bands keeping a
+re-prediction the caller made, section 4b). A span load is the same library, value for value,
+as a band file of the same rows (`band_slice_file_loads_with_the_fragment_offset_and_matches_the_range_load`
+in `index.rs`), and every artifact of a grouped fixture run is byte-identical either way.
+Until 2026-09-25 every band was written out before its seed whether or not anything rewrote
+it: on a 203.5M-precursor library searched without an RT model, that was the whole precursor
+table decoded and re-encoded once per run, for a file only the seed, `rt-im-train` and
+`extract` read.
+
 Nothing outside the band is resident during any of these, except the run's spectra, which
 are decoded once for all the bands (next section).
 
 Under `experiment.rt_library_scope = first_run_only` the runs after the first reuse the first
-run's adapted bands, and then they reuse its band slices too: a slice is a deterministic
-function of the library and the row span, so rewriting it would produce the same bytes. Only
-the seed reads it, and the adapted table replaces it everywhere else. On a 203M-precursor
-library that is the whole precursor table not written, per run after the first.
+run's adapted bands, and they need no slice at all: the seed reads the band by span, and the
+adapted table replaces it everywhere else. Where every run adapts its own bands
+(`rt_library_scope = per_run`), a run after the first takes the first grouped run's slices
+(`GroupRun::slices_from`) when the two `groups/plan.json` list the same bands: a slice is a
+deterministic function of the library and the row span, so rewriting it would produce the
+same bytes. On a 203M-precursor library that is the whole precursor table not written, per
+run after the first.
 
 ### The run's spectra, decoded once per phase
 
@@ -430,7 +446,7 @@ RT model identity says `(per window group)` after the model that ran.
 out/
   spectra/                           convert, as always
   groups/plan.json                   bands, windows, estimates, calibration mode
-  groups/gNN/lib_precursors.parquet  the band (local ids)
+  groups/gNN/lib_precursors.parquet  the band (local ids), only where an RT model rewrites it
   groups/gNN/seed_psms.parquet       band seed (+ .masscal.json)
   groups/gNN/seed_psms_pooled.parquet  the band's view of the pooled seed
   groups/gNN/lib_precursors_<model>.parquet  re-predicted band, when an RT model ran

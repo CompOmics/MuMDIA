@@ -30,6 +30,10 @@ pub struct RtImTrainParams<'a> {
     /// has refreshed the column from the re-predicted band libraries, so the seed is the
     /// source of truth there. Off, anchors outside the library are dropped silently.
     pub anchor_irt_from_seed: bool,
+    /// `library_precursors` is the WHOLE library and the windows are written for its rows
+    /// `[first, first + n)` only, with local ids `0..n`: what the same rows written out as a
+    /// band file would give. `None` reads the whole table.
+    pub precursor_span: Option<(usize, usize)>,
 }
 
 const INSUFFICIENT_ANCHORS_STATUS: &str = "insufficient_anchors_unbounded";
@@ -148,6 +152,8 @@ impl RtFit {
 /// What [`apply`] writes: the windows of one library table and its `cal.json`.
 pub struct ApplyParams<'a> {
     pub library_precursors: &'a str,
+    /// As [`RtImTrainParams::precursor_span`].
+    pub precursor_span: Option<(usize, usize)>,
     pub out_windows: &'a str,
     pub out_cal: &'a str,
     pub cfg: &'a RtImTrainConfig,
@@ -190,14 +196,12 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
 
     // Library predicted iRT, keyed by candidate_id (single source of truth, so
     // a patched/updated library iRT is used for both training and application).
-    let lib = TableFile::open(p.library_precursors)?;
-    let lib_cid = lib.u32("candidate_id")?;
-    let lib_irt = lib.f32("predicted_irt")?;
+    let (lib_cid, lib_irt) = library_irt(p.library_precursors, p.precursor_span)?;
     // The join map is built only when the anchors take their iRT from the library; with
     // `anchor_irt_from_seed` nothing reads it.
     let irt_by_cid: Option<HashMap<u32, f64>> = (!p.anchor_irt_from_seed).then(|| {
-        let mut m: HashMap<u32, f64> = HashMap::with_capacity(lib.nrows);
-        for i in 0..lib.nrows {
+        let mut m: HashMap<u32, f64> = HashMap::with_capacity(lib_cid.len());
+        for i in 0..lib_cid.len() {
             m.insert(lib_cid[i], lib_irt[i] as f64);
         }
         m
@@ -212,11 +216,43 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
             out_cal: p.out_cal,
             cfg: p.cfg,
             config_hash: p.config_hash,
+            precursor_span: p.precursor_span,
         },
         lib_cid,
         lib_irt,
         t0,
     )
+}
+
+/// A library's `candidate_id` and `predicted_irt`: the whole table, or its rows
+/// `[first, first + n)` with the ids made local (`id - first`), which is what the same rows
+/// written as a band file carry. The span's ids must be the row-aligned range the library
+/// invariant promises.
+fn library_irt(path: &str, span: Option<(usize, usize)>) -> Result<(Vec<u32>, Vec<f32>)> {
+    match span {
+        None => {
+            let lib = TableFile::open(path)?;
+            Ok((lib.u32("candidate_id")?, lib.f32("predicted_irt")?))
+        }
+        Some((first, n)) => {
+            let lib = TableFile::open_rows(path, first, n)?;
+            let mut cid = lib.u32("candidate_id")?;
+            let first32 = u32::try_from(first)
+                .map_err(|_| anyhow::anyhow!("row span start {first} does not fit u32"))?;
+            for (k, c) in cid.iter_mut().enumerate() {
+                if *c != first32 + k as u32 {
+                    anyhow::bail!(
+                        "{path}: row {} has candidate_id {c}, expected {}; the library must \
+                         carry candidate_id as the contiguous row-aligned range",
+                        first + k,
+                        first32 + k as u32
+                    );
+                }
+                *c -= first32;
+            }
+            Ok((cid, lib.f32("predicted_irt")?))
+        }
+    }
 }
 
 /// Fit the calibration on a seed table whose own `predicted_irt` column carries the anchors'
@@ -235,9 +271,7 @@ pub fn apply(fit: &RtFit, p: &ApplyParams) -> Result<u64> {
     for out in [p.out_windows, p.out_cal] {
         mumdia_io::refuse_output_over_input(out, &[("--lib-precursors", p.library_precursors)])?;
     }
-    let lib = TableFile::open(p.library_precursors)?;
-    let lib_cid = lib.u32("candidate_id")?;
-    let lib_irt = lib.f32("predicted_irt")?;
+    let (lib_cid, lib_irt) = library_irt(p.library_precursors, p.precursor_span)?;
     write_windows(fit, p, lib_cid, lib_irt, t0)
 }
 
@@ -816,6 +850,7 @@ mod tests {
             let (seed, lib) = anchors_and_library(&sub, n);
             let out = |name: &str| sub.join(name).to_str().unwrap().to_string();
             run(RtImTrainParams {
+                precursor_span: None,
                 seed_psms: &seed,
                 library_precursors: &lib,
                 out_windows: &out("w_run.parquet"),
@@ -829,6 +864,7 @@ mod tests {
             apply(
                 &fit,
                 &ApplyParams {
+                    precursor_span: None,
                     library_precursors: &lib,
                     out_windows: &out("w_apply.parquet"),
                     out_cal: &out("cal_apply.json"),

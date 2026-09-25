@@ -175,6 +175,8 @@ fn process_run(
     shared_rt_lib: Option<&str>,
     // `lib_p_base` is the experiment-level base-model re-prediction of the imported iRT.
     library_irt_repredicted: bool,
+    // An earlier grouped run's `groups/` directory whose band slices this run may reuse.
+    slices_from: Option<&str>,
 ) -> Result<(String, String, Option<String>)> {
     let d = |name: &str| format!("{out}/{name}");
     std::fs::create_dir_all(out).ok();
@@ -220,6 +222,7 @@ fn process_run(
             mh_heads,
             library_input,
             library_irt_repredicted,
+            slices_from,
         })?;
         return Ok((
             pooled.competed,
@@ -229,6 +232,7 @@ fn process_run(
     }
     let seed = d("seed_psms.parquet");
     search_seed::run(search_seed::SearchSeedParams {
+        precursor_span: None,
         fragment_offset: None,
         // One reader at a time, as in the ungrouped `run`.
         ms2_scans: None,
@@ -313,6 +317,7 @@ fn process_run(
     };
     let windows = d("run_windows.parquet");
     rt_im_train::run(rt_im_train::RtImTrainParams {
+        precursor_span: None,
         anchor_irt_from_seed: false,
         seed_psms: &seed,
         library_precursors: &lib_p,
@@ -324,6 +329,7 @@ fn process_run(
     let psms = d("psms_extracted.parquet");
     let chrom = d("chromatograms.parquet");
     extract::run(extract::ExtractParams {
+        precursor_span: None,
         fragment_offset: None,
         sibling_bands: 1,
         scans: None,
@@ -728,6 +734,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             p.max_spectra,
             None,
             library_irt_repredicted,
+            None,
         )?;
         competed.push(comp);
         chroms.push(chrom);
@@ -746,11 +753,16 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         first = 1;
     }
 
+    // A grouped run writes a band out only where a DeepLC sidecar rewrites it, and the runs
+    // of one experiment plan the same bands over the same library, so a run after the
+    // first takes the first grouped run's slices where the plans agree (`run_groups`).
+    let grouped = cfg.groups.window_groups > 1;
+    let mut slice_source: Option<String> = if grouped { shared_ft.clone() } else { None };
     let rest: Vec<usize> = (first..n_runs).collect();
     if par == 1 {
         for &i in &rest {
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
-            let (comp, chrom, _) = process_run(
+            let (comp, chrom, groups_dir) = process_run(
                 cfg,
                 &ch,
                 &lib_p_base,
@@ -762,9 +774,13 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 p.max_spectra,
                 shared_ft.as_deref(),
                 library_irt_repredicted,
+                slice_source.as_deref(),
             )?;
             competed.push(comp);
             chroms.push(chrom);
+            if grouped && slice_source.is_none() {
+                slice_source = groups_dir;
+            }
         }
     } else {
         info!(
@@ -789,12 +805,16 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                         p.max_spectra,
                         shared_ft.as_deref(),
                         library_irt_repredicted,
+                        slice_source.as_deref(),
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
-            for (comp, chrom, _) in done {
+            for (comp, chrom, groups_dir) in done {
                 competed.push(comp);
                 chroms.push(chrom);
+                if grouped && slice_source.is_none() {
+                    slice_source = groups_dir;
+                }
             }
         }
     }

@@ -107,6 +107,13 @@ pub struct ExtractParams<'a> {
     /// are still read, and scans of other windows find no candidate. `None` is the ordinary
     /// whole-library extract.
     pub fragment_offset: Option<u32>,
+    /// `library_precursors` is the WHOLE library and this stage searches its rows
+    /// `[first, first + n)`, loaded directly by row span (`Library::load_row_span_with`):
+    /// local ids `0..n`, fragments at library-wide ids `first..first + n`, outputs in local
+    /// ids exactly as for a band file. A grouped run loads a band this way wherever nothing
+    /// rewrites the band's precursor table, instead of writing the band out first.
+    /// `fragment_offset` is then `None` (or `Some(first)`). `None` is the ordinary load.
+    pub precursor_span: Option<(usize, usize)>,
     /// How many bands of the same run are being searched beside this one
     /// (`groups.parallel`). The probing fan-out is this band's share of the thread pool,
     /// not the whole pool, because every band in flight computes it independently.
@@ -2093,21 +2100,14 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     // default): it is never read on that path and costs a full sort plus several full
     // copies of every library fragment.
     let build_bucketed = !matches!(p.cfg.matcher, MatcherKind::Fragindex);
-    let lib = match p.fragment_offset {
-        None => Library::load_with(
-            p.library_precursors,
-            p.library_fragments,
-            p.cfg.bucket_size,
-            build_bucketed,
-        )?,
-        Some(offset) => Library::load_with_fragment_offset(
-            p.library_precursors,
-            p.library_fragments,
-            offset,
-            p.cfg.bucket_size,
-            build_bucketed,
-        )?,
-    };
+    let lib = Library::load_for_stage(
+        p.library_precursors,
+        p.library_fragments,
+        p.fragment_offset,
+        p.precursor_span,
+        p.cfg.bucket_size,
+        build_bucketed,
+    )?;
 
     // Optional candidate allowlist (gate-first-then-compete): restrict extraction to
     // the accepted survivors of a prior gate-on run so the two-pass peak-claim profile
