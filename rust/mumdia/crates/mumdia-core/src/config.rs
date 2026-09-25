@@ -545,6 +545,27 @@ pub struct PredictFragConfig {
     pub deeplc_python: Option<String>,
     /// Directory holding the sidecar worker scripts.
     pub sidecar_script_dir: String,
+    /// Skip DeepLC in a FASTA library build (`rt_predictor = deeplc`) when the multi-head
+    /// calibration will re-predict every row anyway. Default `false`.
+    ///
+    /// With `rt_predictor = deeplc` the automatic multi-head calibration runs, and it
+    /// rewrites the `predicted_irt` of every standard-residue row against the run's anchors
+    /// (the only rows it keeps are non-standard ones, and a FASTA digest emits none), so the
+    /// library's own DeepLC pass is work whose only output is overwritten: about 19 minutes
+    /// on the 9.8M-peptidoform HYE FASTA library. Nothing reads the library's iRT before the
+    /// calibration: the seed is iRT-independent and only passes the column through. Set, the
+    /// orchestrators (`run`, `run-experiment`, and their grouped path) write the native
+    /// model's iRT as a placeholder, the library's model identity says so, and the run fails
+    /// if the calibration's summary reports any row it did not re-predict
+    /// (`retained_imported > 0`), because such a row would keep the placeholder. Ignored
+    /// where the multi-head calibration does not run, and by the standalone `predict-frag`.
+    ///
+    /// Final outputs are then byte-identical to the default's; the intermediate library
+    /// table, the seed's pass-through iRT column and the predict-frag report differ. Opt-in
+    /// because the library table is no longer a DeepLC library, which matters to anyone who
+    /// reuses it as `--lib-precursors` elsewhere. Validate by comparing `psms_scored.parquet`
+    /// against a default FASTA run (on CPU, where DeepLC's base prediction is deterministic).
+    pub defer_deeplc_to_multihead: bool,
 }
 impl Default for PredictFragConfig {
     fn default() -> Self {
@@ -562,6 +583,7 @@ impl Default for PredictFragConfig {
             peptdeep_python: None,
             deeplc_python: None,
             sidecar_script_dir: "scripts".to_string(),
+            defer_deeplc_to_multihead: false,
         }
     }
 }
@@ -2114,6 +2136,19 @@ impl Config {
         }
     }
 
+    /// Whether a FASTA library build writes the native model's iRT as a placeholder
+    /// instead of running DeepLC (`predict_frag.defer_deeplc_to_multihead`): set, with
+    /// `rt_predictor = deeplc`, and the multi-head calibration going to re-predict every row.
+    pub fn defers_library_deeplc(&self, library_input: bool, has_deeplc: bool) -> bool {
+        !library_input
+            && self.predict_frag.defer_deeplc_to_multihead
+            && self.predict_frag.rt_predictor == RtPredictorKind::Deeplc
+            && self
+                .rt_im_train
+                .multihead_heads(has_deeplc, self.deeplc_rt_source(false, has_deeplc))
+                > 0
+    }
+
     /// Parse from a JSON string, rejecting unknown keys, then validate.
     pub fn from_json(s: &str) -> Result<Self, crate::error::ConfigError> {
         let c: Config =
@@ -3124,6 +3159,27 @@ mod tests {
         assert_eq!(c.rt_im_train.deeplc_predict_shards, 8);
         let auto = Config::from_json(r#"{"rt_im_train":{"deeplc_predict_shards":0}}"#).unwrap();
         assert_eq!(auto.rt_im_train.deeplc_predict_shards, 0);
+    }
+
+    #[test]
+    fn the_library_deeplc_pass_is_deferred_only_where_the_multihead_replaces_it() {
+        let on = |json: &str| Config::from_json(json).unwrap();
+        let deferred =
+            on(r#"{"predict_frag":{"rt_predictor":"deeplc","defer_deeplc_to_multihead":true}}"#);
+        assert!(deferred.defers_library_deeplc(false, true));
+        // Off by default; never for an imported library; not without an interpreter (no
+        // multi-head runs); not with the multi-head calibration off; not for native RT.
+        let default = on(r#"{"predict_frag":{"rt_predictor":"deeplc"}}"#);
+        assert!(!default.defers_library_deeplc(false, true));
+        assert!(!deferred.defers_library_deeplc(true, true));
+        assert!(!deferred.defers_library_deeplc(false, false));
+        let no_mh = on(
+            r#"{"predict_frag":{"rt_predictor":"deeplc","defer_deeplc_to_multihead":true},
+                          "rt_im_train":{"multihead_calibration":0}}"#,
+        );
+        assert!(!no_mh.defers_library_deeplc(false, true));
+        let native = on(r#"{"predict_frag":{"defer_deeplc_to_multihead":true}}"#);
+        assert!(!native.defers_library_deeplc(false, true));
     }
 
     #[test]

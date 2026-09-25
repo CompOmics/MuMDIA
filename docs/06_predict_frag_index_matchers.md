@@ -186,6 +186,34 @@ DeepLC miss, rather than receiving the native heuristic under an MS2PIP model id
 otherwise (`predict_frag.rs:371-374`); its model id is `format!("ms2pip-{model}")`
 (`predict_frag.rs:446`).
 
+**Both sidecars at once** (`assign_predictions`). When the iRT comes from DeepLC and the
+intensities from MS2PIP or AlphaPeptDeep, the two workers run at the same time: they write
+disjoint fields of each candidate, and each gets exactly the request and the thread count it
+gets alone, so the library is byte-identical either way (measured on the fixture library,
+3,820 precursors, DeepLC 4.5.0 and MS2PIP 4.2.0: identical precursor, fragment and seed
+tables; the stage took 9.1 s concurrent against 14.7 s one after the other). On the
+9.8M-peptidoform HYE FASTA library the two were DeepLC 19 min and MS2PIP 35-39 min in
+sequence. Both workers' memory is then resident at once;
+`MUMDIA_PREDICT_FRAG_SERIAL=1` runs them one after the other again. A DeepLC error is still
+reported first.
+
+**Deferred DeepLC** (`predict_frag.defer_deeplc_to_multihead`, default `false`). With
+`rt_predictor = deeplc` the automatic multi-head calibration rewrites the iRT of every
+standard-residue row against the run's anchors before anything reads it (the seed is
+iRT-independent and only passes the column through), and a FASTA digest emits only standard
+residues, so the library's DeepLC pass is work whose output is overwritten: about 19 minutes
+on the HYE FASTA library. Set, `run` and `run-experiment` (grouped or not) write the native
+model's iRT as a placeholder (`PredictFragParams::rt_placeholder`; the library's model
+identity says `(placeholder: DeepLC deferred to the multi-head calibration)`), log that they
+do, and fail if a multi-head summary reports any row it kept (`retained_imported > 0`,
+`sidecar::require_every_row_repredicted`), because that row would keep the placeholder.
+Ignored where the multi-head calibration does not run, with a log line, and by the standalone
+`predict-frag`. Measured on the fixture with DeepLC 4.5.0 on CPU and the native fragment
+model: every output from the multi-head library on is byte-identical to a default run's,
+including `psms_scored.parquet` and `peptides.tsv`; only the library table and the seed's
+pass-through iRT column differ, and the run took 11 s against 21 s. Opt-in because the
+library table is no longer a DeepLC library for anyone who reuses it as `--lib-precursors`.
+
 **finite guard** (`predict_frag.rs:140-153`). Between assignment and top-N, every
 candidate's iRT and every fragment intensity is checked for finiteness and a
 non-finite value is a hard error. A NaN from a misbehaving sidecar would otherwise

@@ -267,6 +267,38 @@ fn warn_on_retained_imported(lib_out: &str) {
     }
 }
 
+/// Refuse a calibrated library that kept any row's input iRT, when that input was the
+/// native placeholder a deferred FASTA build wrote (`predict_frag.defer_deeplc_to_multihead`):
+/// such a row would keep an iRT from another model, on another scale, where the default
+/// build would have had DeepLC's. Reads `<lib_out>.summary.json`.
+pub fn require_every_row_repredicted(lib_out: &str) -> Result<()> {
+    let path = format!("{lib_out}.summary.json");
+    let v: serde_json::Value = mumdia_io::json::read_json(&path)
+        .with_context(|| format!("reading {path} to check the deferred DeepLC pass"))?;
+    let n = |k: &str| v.get(k).and_then(|x| x.as_u64());
+    let retained = n("retained_imported")
+        .ok_or_else(|| anyhow::anyhow!("{path} does not report retained_imported"))?;
+    if retained > 0 {
+        bail!(
+            "the multi-head calibration kept the input iRT of {retained} of {} library rows \
+             ({} with non-standard residues, {} without a finite prediction), and under \
+             predict_frag.defer_deeplc_to_multihead that input is the native model's \
+             placeholder, not a DeepLC prediction. Set predict_frag.defer_deeplc_to_multihead \
+             = false to predict the library with DeepLC first; {path} has the counts",
+            n("rows").unwrap_or(0),
+            n("retained_non_standard").unwrap_or(0),
+            n("retained_no_prediction").unwrap_or(0),
+        );
+    }
+    info!(
+        rows = n("rows").unwrap_or(0),
+        library = lib_out,
+        "sidecar: the multi-head calibration re-predicted every library row, so the deferred \
+         DeepLC pass was not needed"
+    );
+    Ok(())
+}
+
 /// DeepLC: predict retention time per peptidoform. Returns `id -> predicted_rt`.
 pub fn run_deeplc(
     python: &str,
@@ -717,6 +749,40 @@ fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::require_every_row_repredicted;
+
+    #[test]
+    fn a_deferred_build_fails_when_the_calibration_kept_a_row() {
+        let dir = std::env::temp_dir().join(format!("mumdia_placeholder_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = dir.join("lib.parquet").to_str().unwrap().to_string();
+        let summary = format!("{lib}.summary.json");
+        std::fs::write(
+            &summary,
+            r#"{"rows": 10, "repredicted": 10, "retained_imported": 0}"#,
+        )
+        .unwrap();
+        require_every_row_repredicted(&lib).unwrap();
+        std::fs::write(
+            &summary,
+            r#"{"rows": 10, "repredicted": 9, "retained_imported": 1,
+                "retained_non_standard": 0, "retained_no_prediction": 1}"#,
+        )
+        .unwrap();
+        let e = require_every_row_repredicted(&lib).unwrap_err().to_string();
+        assert!(e.contains("1 of 10"), "{e}");
+        assert!(e.contains("defer_deeplc_to_multihead"), "{e}");
+        // No summary, or one without the count, is not a pass.
+        std::fs::write(&summary, r#"{"rows": 10}"#).unwrap();
+        assert!(require_every_row_repredicted(&lib).is_err());
+        std::fs::remove_file(&summary).unwrap();
+        assert!(require_every_row_repredicted(&lib).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

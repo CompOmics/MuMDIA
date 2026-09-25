@@ -65,6 +65,10 @@ pub struct GroupRun<'a> {
     /// runs of one experiment search one library, so equal plans give equal slices. Only a
     /// band a DeepLC sidecar rewrites is written out at all.
     pub slices_from: Option<&'a str>,
+    /// `lib_precursors` carries the native model's iRT as a placeholder for a DeepLC pass
+    /// the multi-head calibration replaces (`predict_frag.defer_deeplc_to_multihead`): every
+    /// band's calibrated table must then have re-predicted every row.
+    pub irt_placeholder: bool,
 }
 
 /// Paths the pooled stages continue with.
@@ -586,6 +590,9 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             cfg.rt_im_train.deeplc_predict_shards,
         )?;
         for (b, (_, out)) in bands.iter_mut().zip(pairs) {
+            if g.irt_placeholder && g.mh_heads > 0 {
+                crate::sidecar::require_every_row_repredicted(&out)?;
+            }
             let rows = mumdia_io::table::nrows(&out)?;
             record_opt(
                 g.man.as_deref_mut(),
@@ -627,6 +634,9 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 rayon::current_num_threads(),
                 cfg.rt_im_train.deeplc_predict_shards,
             )?;
+            if g.irt_placeholder {
+                crate::sidecar::require_every_row_repredicted(&out)?;
+            }
             Some(out)
         } else if cfg.rt_im_train.finetune_deeplc {
             let out = gd(b.index, "lib_precursors_ft.parquet");

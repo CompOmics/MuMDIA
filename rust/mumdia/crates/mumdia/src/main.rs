@@ -1184,6 +1184,8 @@ fn real_main() -> Result<()> {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::predict_frag::run(stages::predict_frag::PredictFragParams {
+                // The standalone stage cannot know that a multi-head calibration follows.
+                rt_placeholder: false,
                 peptidoforms: &peptidoforms,
                 out_precursors: &out_precursors,
                 out_fragments: &out_fragments,

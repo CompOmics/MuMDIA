@@ -177,6 +177,9 @@ fn process_run(
     library_irt_repredicted: bool,
     // An earlier grouped run's `groups/` directory whose band slices this run may reuse.
     slices_from: Option<&str>,
+    // `lib_p_base` carries placeholder iRT the multi-head calibration must replace in full
+    // (`predict_frag.defer_deeplc_to_multihead`).
+    irt_placeholder: bool,
 ) -> Result<(String, String, Option<String>)> {
     let d = |name: &str| format!("{out}/{name}");
     std::fs::create_dir_all(out).ok();
@@ -223,6 +226,7 @@ fn process_run(
             library_input,
             library_irt_repredicted,
             slices_from,
+            irt_placeholder,
         })?;
         return Ok((
             pooled.competed,
@@ -280,6 +284,9 @@ fn process_run(
             rayon::current_num_threads(),
             cfg.rt_im_train.deeplc_predict_shards,
         )?;
+        if irt_placeholder {
+            crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
+        }
         produced_rt_lib = Some(lib_p_mh.clone());
         lib_p_mh
     } else if cfg.rt_im_train.finetune_deeplc {
@@ -573,6 +580,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         None => (0..n_runs).map(|i| format!("r{i}")).collect(),
     };
 
+    // A FASTA build may leave DeepLC to the multi-head calibration of each run, which
+    // re-predicts every row before anything reads the iRT
+    // (`predict_frag.defer_deeplc_to_multihead`).
+    let irt_placeholder = cfg.defers_library_deeplc(
+        p.lib_precursors.is_some(),
+        cfg.predict_frag.deeplc_python.is_some(),
+    );
+
     // --- shared library (imported or digested once) ---
     let (lib_p_base, lib_f) = match (p.lib_precursors, p.lib_fragments) {
         (Some(lp), Some(lf)) => {
@@ -599,6 +614,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             let lib_p = d("fragment_library_precursors.parquet");
             let lib_f = d("fragment_library_fragments.parquet");
             predict_frag::run(predict_frag::PredictFragParams {
+                rt_placeholder: irt_placeholder,
                 peptidoforms: &pf,
                 out_precursors: &lib_p,
                 out_fragments: &lib_f,
@@ -735,6 +751,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             None,
             library_irt_repredicted,
             None,
+            irt_placeholder,
         )?;
         competed.push(comp);
         chroms.push(chrom);
@@ -775,6 +792,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 shared_ft.as_deref(),
                 library_irt_repredicted,
                 slice_source.as_deref(),
+                irt_placeholder,
             )?;
             competed.push(comp);
             chroms.push(chrom);
@@ -806,6 +824,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                         shared_ft.as_deref(),
                         library_irt_repredicted,
                         slice_source.as_deref(),
+                        irt_placeholder,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;

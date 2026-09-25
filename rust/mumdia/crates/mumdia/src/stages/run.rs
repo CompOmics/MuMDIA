@@ -168,6 +168,13 @@ pub fn run(p: RunParams) -> Result<()> {
         }
     }
 
+    // A FASTA build may leave DeepLC to the multi-head calibration, which re-predicts every
+    // row before anything reads the iRT (`predict_frag.defer_deeplc_to_multihead`).
+    let rt_placeholder = cfg.defers_library_deeplc(
+        p.lib_precursors.is_some(),
+        cfg.predict_frag.deeplc_python.is_some(),
+    );
+
     // --- experiment-wide artifacts: the spectral library ---
     // Either digest the FASTA (default) or consume a prebuilt library
     // (library-input mode), then feed the same lib_p/lib_f downstream.
@@ -239,7 +246,15 @@ pub fn run(p: RunParams) -> Result<()> {
 
             let lib_p = d("fragment_library_precursors.parquet");
             let lib_f = d("fragment_library_fragments.parquet");
+            if cfg.predict_frag.defer_deeplc_to_multihead && !rt_placeholder {
+                info!(
+                    "run: predict_frag.defer_deeplc_to_multihead is set, but no multi-head \
+                     calibration re-predicts this library (it needs rt_predictor = deeplc \
+                     and a DeepLC interpreter); predicting it with DeepLC as usual"
+                );
+            }
             let (np, nf) = predict_frag::run(predict_frag::PredictFragParams {
+                rt_placeholder,
                 peptidoforms: &pf,
                 out_precursors: &lib_p,
                 out_fragments: &lib_f,
@@ -341,6 +356,7 @@ pub fn run(p: RunParams) -> Result<()> {
                 // A single run re-predicts nothing before banding.
                 library_irt_repredicted: false,
                 slices_from: None,
+                irt_placeholder: rt_placeholder,
             })?;
             (
                 pooled.seed,
@@ -412,6 +428,9 @@ pub fn run(p: RunParams) -> Result<()> {
                     rayon::current_num_threads(),
                     cfg.rt_im_train.deeplc_predict_shards,
                 )?;
+                if rt_placeholder {
+                    crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
+                }
                 let n_mh = mumdia_io::table::nrows(&lib_p_mh)?;
                 man.record(record_artifact(
                     artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
