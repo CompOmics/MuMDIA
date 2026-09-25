@@ -26,7 +26,6 @@ use mumdia_core::schema::artifact;
 use mumdia_io::record_artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::TableFile;
-use rayon::prelude::*;
 use serde_json::json;
 use tracing::info;
 
@@ -65,6 +64,8 @@ pub struct GroupRun<'a> {
 /// features on the pooled window.
 struct BandExtract {
     index: usize,
+    /// Rows this band's extract accepted: the cost the features phase is dispatched on.
+    npsm: u64,
     psms: String,
     chrom: String,
     /// `(index, cal.json)`, as `summarise_cal` wants it.
@@ -224,6 +225,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         seed: String,
     }
     let mut bands: Vec<Band> = Vec::new();
+    // Estimated cost per band index, filled once the run's MS2 is decoded below.
+    let mut band_cost: BTreeMap<usize, f64> = BTreeMap::new();
     // Bands in flight are driven from the rayon pool, and each one's extraction blocks its
     // own thread on the accumulation channel while the probing tasks run on the others. A
     // band in flight therefore occupies a worker that cannot do the work it is waiting for,
@@ -267,11 +270,19 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             "groups: MS2 decoded once for the seeding phase and shared"
         );
         let fp = scan_fingerprint(&ms2_scans, &[]);
+        // Each band's estimated cost, its windows' precursors times their MS2 peaks, so the
+        // band queues below start the longest bands first (`groups::window_costs`).
+        let window_cost =
+            groups::window_costs(&plan.windows, &stats, &groups::peaks_per_window(&ms2_scans));
+        for b in &plan.bands {
+            band_cost.insert(b.index, b.windows.iter().map(|&w| window_cost[w]).sum());
+        }
 
-        // Bands are independent, so `groups.parallel` of them are sliced and seeded at once.
-        // Chunked rather than a free-running pool: the chunk bounds how many extraction working
-        // sets are resident, which is the whole point of banding. Results do not depend on it,
-        // and the records below are merged in band order.
+        // Bands are independent, so `groups.parallel` of them are sliced and seeded at once,
+        // through a bounded queue: at most that many in flight, which bounds how many
+        // working sets are resident (the whole point of banding), and a free slot takes the
+        // next band at once instead of waiting for a chunk's slowest band. Results do not
+        // depend on the schedule, and the records below are merged in band order.
         let slice_one =
         |b: &groups::Band| -> Result<Option<(Band, Vec<mumdia_core::manifest::ArtifactRecord>)>> {
             let (first, n) = Library::precursor_row_span(g.lib_precursors, b.mz_lo, b.mz_hi)?;
@@ -348,22 +359,19 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 rec,
             )))
         };
-        for chunk in plan.bands.chunks(par) {
-            let done: Vec<Option<(Band, Vec<mumdia_core::manifest::ArtifactRecord>)>> = if par == 1
-            {
-                chunk.iter().map(slice_one).collect::<Result<Vec<_>>>()?
-            } else {
-                chunk
-                    .par_iter()
-                    .map(slice_one)
-                    .collect::<Result<Vec<_>>>()?
-            };
-            for (band, recs) in done.into_iter().flatten() {
-                for r in recs {
-                    record_opt(g.man.as_deref_mut(), r);
-                }
-                bands.push(band);
+        let seed_order = groups::longest_first(
+            &plan
+                .bands
+                .iter()
+                .map(|b| band_cost[&b.index])
+                .collect::<Vec<f64>>(),
+        );
+        let done = groups::run_bounded(&plan.bands, par, &seed_order, slice_one)?;
+        for (band, recs) in done.into_iter().flatten() {
+            for r in recs {
+                record_opt(g.man.as_deref_mut(), r);
             }
+            bands.push(band);
         }
         debug_assert_eq!(
             fp,
@@ -593,9 +601,10 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             bands = bands.len(),
             "groups: spectra decoded once for the extraction phase and shared"
         );
-        // `groups.parallel` bands at a time. Each band in flight holds its own extraction
-        // working set, so this chunk is what the stage's memory scales with; the artifacts are
-        // pooled in band order regardless of which band finishes first.
+        // `groups.parallel` bands at a time, through the same bounded queue as the seeding
+        // phase, most expensive first. Each band in flight holds its own extraction working
+        // set, so that bound is what the stage's memory scales with; the artifacts are pooled
+        // in band order regardless of which band finishes first.
         // Phase 1 of two: retention-time windows and extraction for every band. The
         // confident elution half-widths are a property of the RUN, so features cannot
         // start until every band has contributed its anchors (see the pooling below).
@@ -691,6 +700,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             })?;
             Ok(BandExtract {
                 index: b.index,
+                npsm,
                 psms,
                 chrom,
                 cal: (b.index, gd(b.index, "cal.json")),
@@ -698,18 +708,14 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 recs,
             })
         };
-        let mut extracted: Vec<BandExtract> = Vec::with_capacity(bands.len());
-        for chunk in bands.chunks(par) {
-            let done: Vec<BandExtract> = if par == 1 {
-                chunk.iter().map(band_extract).collect::<Result<Vec<_>>>()?
-            } else {
-                chunk
-                    .par_iter()
-                    .map(band_extract)
-                    .collect::<Result<Vec<_>>>()?
-            };
-            extracted.extend(done);
-        }
+        let extract_order = groups::longest_first(
+            &bands
+                .iter()
+                .map(|b| band_cost.get(&b.index).copied().unwrap_or(0.0))
+                .collect::<Vec<f64>>(),
+        );
+        let mut extracted: Vec<BandExtract> =
+            groups::run_bounded(&bands, par, &extract_order, band_extract)?;
         debug_assert_eq!(
             extract_fingerprint,
             scan_fingerprint(&ms2_scans, &ms1_scans),
@@ -800,29 +806,21 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 recs,
             ))
         };
-        for chunk in extracted.chunks(par) {
-            let done: Vec<(
-                pool::BandArtifacts,
-                (usize, String),
-                Vec<mumdia_core::manifest::ArtifactRecord>,
-            )> = if par == 1 {
-                chunk
-                    .iter()
-                    .map(band_features)
-                    .collect::<Result<Vec<_>>>()?
-            } else {
-                chunk
-                    .par_iter()
-                    .map(band_features)
-                    .collect::<Result<Vec<_>>>()?
-            };
-            for (art, cal, recs) in done {
-                for r in recs {
-                    record_opt(g.man.as_deref_mut(), r);
-                }
-                cals.push(cal);
-                arts.push(art);
+        // Features and compete follow the band's accepted rows, which extract has just
+        // counted, so that is the cost this phase is dispatched on.
+        let features_order = groups::longest_first(
+            &extracted
+                .iter()
+                .map(|e| e.npsm as f64)
+                .collect::<Vec<f64>>(),
+        );
+        let done = groups::run_bounded(&extracted, par, &features_order, band_features)?;
+        for (art, cal, recs) in done {
+            for r in recs {
+                record_opt(g.man.as_deref_mut(), r);
             }
+            cals.push(cal);
+            arts.push(art);
         }
         for e in extracted {
             for r in e.recs {

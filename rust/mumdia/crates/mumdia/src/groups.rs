@@ -17,6 +17,8 @@
 //! acquisition's top window, typically) belong to no band and are never loaded, which is
 //! the right outcome for something the run cannot measure; the plan reports how many.
 
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Context, Result};
 use mumdia_io::table::RowGroupStats;
 use serde_json::{json, Value};
@@ -197,6 +199,127 @@ pub fn plan(windows: &[(f64, f64)], stats: &[RowGroupStats], n: usize) -> Result
         est_unselectable,
         est_duplicated,
     })
+}
+
+/// MS2 peaks per isolation window, keyed by the window's exact `(lower, upper)` bits.
+///
+/// Convert writes the isolation-window table from the same `(lower, upper)` values it
+/// stamps on every scan, so these keys match the plan's windows bit for bit.
+pub fn peaks_per_window(ms2: &[mumdia_core::types::Ms2Scan]) -> BTreeMap<(u64, u64), u64> {
+    let mut peaks: BTreeMap<(u64, u64), u64> = BTreeMap::new();
+    for s in ms2 {
+        *peaks
+            .entry((s.window.lower_mz.to_bits(), s.window.upper_mz.to_bits()))
+            .or_default() += s.peaks.len() as u64;
+    }
+    peaks
+}
+
+/// Estimated search cost of each plan window: the precursors it selects times the MS2 peaks
+/// its scans carry. Both factors are known before the seed. The seed and extract probe every
+/// peak of a window's scans against that window's candidates, so a band's work follows this
+/// product rather than its precursor count: on the immunopeptidomics library a band of 2.98M
+/// precursors at m/z 659 took 42 s and one of 3.03M at m/z 394 took 460 s (measured on the
+/// 63-band immunopeptidomics search, 2026-09-21). A window with no scan in `peaks` costs 0.
+pub fn window_costs(
+    windows: &[(f64, f64)],
+    stats: &[RowGroupStats],
+    peaks: &BTreeMap<(u64, u64), u64>,
+) -> Vec<f64> {
+    windows
+        .iter()
+        .map(|&(lo, hi)| {
+            let p = peaks
+                .get(&(lo.to_bits(), hi.to_bits()))
+                .copied()
+                .unwrap_or(0);
+            est_precursors(stats, lo, hi) * p as f64
+        })
+        .collect()
+}
+
+/// The order to dispatch items in: largest `cost` first, ties by index. Only the order in
+/// which bands START depends on it; results are merged in band order either way.
+pub fn longest_first(cost: &[f64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..cost.len()).collect();
+    order.sort_by(|&a, &b| cost[b].total_cmp(&cost[a]).then(a.cmp(&b)));
+    order
+}
+
+/// Run `f` over `items` with at most `par` in flight, starting them in `order` (a
+/// permutation of `0..items.len()`), and return the results in ITEM order.
+///
+/// A bounded work queue rather than chunks with a barrier after each: `par` long-lived
+/// workers each take the next item as soon as their current one finishes, so a slow band no
+/// longer holds `par - 1` idle slots until the rest of its chunk is done. The bound on the
+/// resident set is the same, since no more than `par` items are ever in flight.
+///
+/// `par <= 1` runs the items one after another in item order, which is what the chunked
+/// loops did. On an error no further item is started, the items already running finish,
+/// and the error of the lowest-indexed failed item is returned, so the reported error does
+/// not depend on scheduling.
+///
+/// The workers are rayon tasks, and each blocks its worker thread for as long as its item
+/// runs, exactly as the chunked `par_iter` did; `run_groups` keeps `par` below the thread
+/// count for that reason (see the clamp there).
+pub fn run_bounded<T, R, F>(items: &[T], par: usize, order: &[usize], f: F) -> Result<Vec<R>>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> Result<R> + Sync,
+{
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let n = items.len();
+    if par <= 1 || n <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    debug_assert_eq!(order.len(), n, "the dispatch order must list every item");
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let slots: Vec<Mutex<Option<Result<R>>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    rayon::scope(|s| {
+        for _ in 0..par.min(n) {
+            s.spawn(|_| loop {
+                if failed.load(Ordering::SeqCst) {
+                    break;
+                }
+                let k = next.fetch_add(1, Ordering::SeqCst);
+                if k >= n {
+                    break;
+                }
+                let i = order[k];
+                let r = f(&items[i]);
+                if r.is_err() {
+                    failed.store(true, Ordering::SeqCst);
+                }
+                *slots[i].lock().expect("a band worker panicked") = Some(r);
+            });
+        }
+    });
+    let results: Vec<Option<Result<R>>> = slots
+        .into_iter()
+        .map(|m| m.into_inner().expect("a band worker panicked"))
+        .collect();
+    let mut out = Vec::with_capacity(n);
+    let mut first_err = None;
+    for r in results {
+        match r {
+            Some(Ok(v)) => out.push(v),
+            Some(Err(e)) => {
+                first_err.get_or_insert(e);
+            }
+            None => {}
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => {
+            debug_assert_eq!(out.len(), n, "every item ran when none failed");
+            Ok(out)
+        }
+    }
 }
 
 /// Write the precursor rows `[first_row, first_row + n)` of `precursors` to `out` with
@@ -542,5 +665,104 @@ mod tests {
         );
         assert_eq!(v["groups_calibration"], json!("global"));
         assert_eq!(v["groups"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_band_queue_returns_item_order_and_never_exceeds_the_bound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let items: Vec<usize> = (0..23).collect();
+        // Longest first on a cost that is not the index order.
+        let cost: Vec<f64> = items.iter().map(|&i| ((i * 7) % 11) as f64).collect();
+        let order = longest_first(&cost);
+        assert_eq!(order.len(), items.len());
+        assert!(order.windows(2).all(|w| cost[w[0]] >= cost[w[1]]));
+        for par in [1usize, 2, 3, 8, 40] {
+            let live = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let started = std::sync::Mutex::new(Vec::new());
+            let out = run_bounded(&items, par, &order, |&i| {
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                started.lock().unwrap().push(i);
+                std::thread::sleep(std::time::Duration::from_millis(1 + (i % 3) as u64));
+                live.fetch_sub(1, Ordering::SeqCst);
+                Ok(i * 10)
+            })
+            .unwrap();
+            assert_eq!(
+                out,
+                items.iter().map(|i| i * 10).collect::<Vec<_>>(),
+                "par {par}: results come back in item order"
+            );
+            assert!(peak.load(Ordering::SeqCst) <= par.max(1), "par {par}");
+            let started = started.into_inner().unwrap();
+            if par <= 1 {
+                assert_eq!(started, items, "one at a time runs in item order");
+            } else {
+                // Items are taken in dispatch order; at most `par - 1` other workers can sit
+                // between taking an item and starting it, so no item starts more than
+                // `par - 1` places away from its rank in the order.
+                for (pos, i) in started.iter().enumerate() {
+                    let rank = order.iter().position(|o| o == i).unwrap();
+                    assert!(
+                        pos.abs_diff(rank) < par,
+                        "par {par}: item {i} of rank {rank} started at {pos}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_failing_band_stops_the_queue_and_reports_the_lowest_failed_band() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let items: Vec<usize> = (0..50).collect();
+        let order: Vec<usize> = (0..50).collect();
+        let ran = AtomicUsize::new(0);
+        let err = run_bounded(&items, 4, &order, |&i| {
+            ran.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            if i == 5 || i == 7 {
+                anyhow::bail!("band {i} failed")
+            }
+            Ok(i)
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, "band 5 failed");
+        assert!(
+            ran.load(Ordering::SeqCst) < items.len(),
+            "no band starts after one has failed"
+        );
+        // Sequential: the first failure in item order, and nothing after it runs.
+        let ran = AtomicUsize::new(0);
+        let err = run_bounded(&items, 1, &order, |&i| {
+            ran.fetch_add(1, Ordering::SeqCst);
+            if i == 3 {
+                anyhow::bail!("band {i} failed")
+            }
+            Ok(i)
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, "band 3 failed");
+        assert_eq!(ran.load(Ordering::SeqCst), 4);
+        // Nothing to do is not an error.
+        let none: Vec<usize> = Vec::new();
+        assert!(run_bounded(&none, 4, &[], |&i| Ok(i)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn window_cost_is_precursors_times_peaks() {
+        let windows = contiguous_windows(400.0, 10.0, 3);
+        let stats = uniform_stats(400.0, 430.0, 3, 100);
+        let mut peaks = BTreeMap::new();
+        peaks.insert((400.0f64.to_bits(), 410.0f64.to_bits()), 5u64);
+        peaks.insert((420.0f64.to_bits(), 430.0f64.to_bits()), 2u64);
+        let c = window_costs(&windows, &stats, &peaks);
+        assert_eq!(c.len(), 3);
+        assert!((c[0] - 500.0).abs() < 1e-9);
+        assert_eq!(c[1], 0.0, "a window without scans costs nothing");
+        assert!((c[2] - 200.0).abs() < 1e-9);
     }
 }

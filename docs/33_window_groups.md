@@ -605,6 +605,26 @@ the unbanded arm, which is the same noise in the other direction. Banding is
 identification-neutral on this data once the calibration is fitted once, and what it costs
 is the fixed per-band work above.
 
+### Scheduling the bands: a bounded queue, longest first
+
+`groups.parallel` bands are in flight at a time in each of the three band phases (seed,
+retention-time windows and extract, features and compete). They go through a bounded work
+queue (`groups::run_bounded`): that many workers each take the next band as soon as their
+current one is done. Until 2026-09-25 the phases ran in fixed chunks of `parallel` bands
+with a barrier after each chunk, so a chunk waited for its slowest band while the other
+slots sat idle. The bound on the resident set is the same, since no more than `parallel`
+bands are ever in flight, and results are still merged in band order, so the artifacts and
+the manifest do not depend on the schedule.
+
+The queue starts the most expensive bands first. Band cost follows spectral density rather
+than the precursor count the plan balances: on the immunopeptidomics search two bands of
+2.98M and 3.03M precursors took 42 s and 460 s (2026-09-21). The seed and extract phases
+estimate a band's cost as the sum over its windows of the window's estimated precursors
+times the MS2 peaks of its scans (`groups::window_costs`, both known before the seed); the
+features phase uses the rows the band's extract accepted. Starting the long bands first
+keeps one of them from arriving last and running alone. The gain is not measured; it is
+zero at the default `parallel: 1`, and it applies only where the band phases are CPU-bound.
+
 ### `groups.parallel` and the thread count
 
 A band in flight occupies one rayon worker, which then blocks on its own extraction's

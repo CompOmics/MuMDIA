@@ -1944,6 +1944,11 @@ pub struct GroupsConfig {
     /// bands the largest band took 39 GB and the median far less. Results do not depend on
     /// it; bands are independent and their artifacts are pooled in band order either way.
     ///
+    /// The bands go through a bounded queue: this many workers each take the next band as
+    /// soon as their current one is done, most expensive first (estimated precursors times
+    /// MS2 peaks of the band's windows for the seed and extract, accepted rows for features
+    /// and compete), rather than in fixed chunks that waited for their slowest band.
+    ///
     /// It must stay below the thread count: a band in flight parks one worker on its
     /// accumulation channel, so as many bands as there are threads leaves nothing to do the
     /// probing and the run deadlocks. A larger value is clamped to `threads - 1` with a
