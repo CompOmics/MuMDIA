@@ -815,8 +815,13 @@ impl FragSet {
 /// window grid meant one tree per grid scan and a node allocation for every group that
 /// held a fragment. Here the whole candidate is three flat buffers: the RTs, a dense
 /// `groups x width` value array and a presence bitmask of the same shape. `width` is one
-/// past the largest ordinal among the candidate's hits, so the value array is at most
-/// the size of the grid-mode traces the candidate emits for its observed fragments.
+/// past the largest ordinal among the candidate's hits, not the number of fragments it
+/// observed, so the buffers are `groups x (max observed ordinal + 1)` f32 values plus
+/// `groups x ceil(width / 64)` presence words. Ordinals are candidate-local, so that is
+/// at most `groups x n_predicted_fragments` values. It can exceed what the candidate
+/// emits: one that observed only ordinal 11 holds 12 values per group against one trace,
+/// and in sparse (non-grid) mode a trace covers only the groups where its fragment
+/// occurs.
 ///
 /// It answers every question the trees answered with the same values in the same order:
 /// `count` is the tree's `len`, `frags` its keys ascending, `sum` its values summed in key

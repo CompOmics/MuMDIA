@@ -445,8 +445,14 @@ The cheap-to-expensive acceptance cascade, in order:
    the same `Iterator::sum`) with the same values, so the f32 apex sum is
    deterministic and unchanged, and it allocates three buffers per candidate
    instead of a tree node per occupied group
-   (`dense_groups_answer_what_the_trees_answered`). The value array is at most the
-   size of the grid-mode traces the candidate emits for its observed fragments.
+   (`dense_groups_answer_what_the_trees_answered`). Because `width` is one past the
+   largest observed ordinal rather than the number of observed fragments, the
+   buffers hold `groups x (max observed ordinal + 1)` f32 values plus the presence
+   words, at most `groups x n_predicted_fragments` values since ordinals are
+   candidate-local. That can exceed the traces the candidate emits: a candidate
+   that observed only ordinal 11 holds 12 values per group against one trace, and
+   in sparse (non-grid) mode a trace covers only the groups where its fragment
+   occurs.
    Presence is a bit rather than a sentinel value, and a fragment first seen by a
    later hit of the same group starts from 0.0 before the max, exactly as the tree's
    `entry(..).or_insert(0.0)` did.
