@@ -110,12 +110,13 @@ impl SeedLibrary {
     /// Load the library a seed with these settings searches, and its index. On the
     /// fragindex matcher this is the m/z-only library and index: the seed reads neither
     /// predicted intensities nor fragment names (the hyperscore is a match count plus
-    /// observed intensity, and the mass recalibration walks `frag_mz`), so the two payload
-    /// columns are never decoded and neither the library nor the index holds them, 12
-    /// bytes per fragment at the build peak ([`Library::load_mz_only`],
-    /// [`FragIndex::build_mz_only`]). Their schema is still checked here; their values by
-    /// extract, which loads the full payload. The bucketed matcher keeps the full load,
-    /// because `page_search` serves `idx_int` out of arrays built from the intensities.
+    /// observed intensity, and the mass recalibration walks `frag_mz`), so neither the
+    /// library nor the index holds the two payload columns, 12 bytes per fragment at the
+    /// build peak ([`Library::load_mz_only`], [`FragIndex::build_mz_only`]). They are still
+    /// decoded and checked here exactly as the full load checks them, batch by batch, and
+    /// discarded, so a library extract would refuse is refused by the seed, before any
+    /// DeepLC step. The bucketed matcher keeps the full load, because `page_search` serves
+    /// `idx_int` out of arrays built from the intensities.
     pub fn load(
         precursors: &str,
         fragments: &str,
