@@ -99,6 +99,7 @@ impl<'a> FloatList<'a> {
 }
 
 pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
+    let t0 = std::time::Instant::now();
     let t = TableFile::open(path).with_context(|| format!("loading ms2 {path}"))?;
     let scan_index = t.u32("scan_index")?;
     let rt = t.f64("rt_seconds")?;
@@ -168,11 +169,22 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
             ("scan_spine", std::mem::size_of_val(out.as_slice())),
         ],
     );
+    // The decode's own wall time. The stage logs bracket it together with the library load
+    // and the index build, so without this line no log could say which of the three a seed
+    // or an extract spent its load phase on.
+    tracing::info!(
+        ms2 = path,
+        scans = out.len(),
+        peaks = peak_bytes / std::mem::size_of::<Peak>(),
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "spectra: decoded MS2"
+    );
     Ok(out)
 }
 
 /// Load MS1 scans (spectra_ms1.parquet), RT-sorted.
 pub fn load_ms1(path: &str) -> Result<Vec<Ms1Scan>> {
+    let t0 = std::time::Instant::now();
     let t = TableFile::open(path).with_context(|| format!("loading ms1 {path}"))?;
     let scan_index = t.u32("scan_index")?;
     let rt = t.f64("rt_seconds")?;
@@ -228,6 +240,13 @@ pub fn load_ms1(path: &str) -> Result<Vec<Ms1Scan>> {
             ("intensity", int_bytes),
             ("scan_spine", std::mem::size_of_val(out.as_slice())),
         ],
+    );
+    tracing::info!(
+        ms1 = path,
+        scans = out.len(),
+        peaks = mz_bytes / std::mem::size_of::<f32>(),
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "spectra: decoded MS1"
     );
     Ok(out)
 }

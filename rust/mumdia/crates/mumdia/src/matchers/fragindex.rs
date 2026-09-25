@@ -45,6 +45,7 @@ impl FragIndex {
     /// (docs/06_predict_frag_index_matchers.md, two-pass counting sort).
     /// Deterministic: candidate-order scatter, no parallel sort, no hashing.
     pub fn build(lib: &Library, tol_ppm: f64) -> FragIndex {
+        let t0 = std::time::Instant::now();
         let n_cand = lib.cands.len();
         // Precondition (docs/06_predict_frag_index_matchers.md, CLAUDE.md
         // index.rs:73): candidate_id is dense 0..n_cand so it indexes the
@@ -126,6 +127,13 @@ impl FragIndex {
             }
         }
 
+        tracing::info!(
+            postings = total,
+            bins = bins.n_bins,
+            tol_ppm,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "fragindex: built"
+        );
         FragIndex {
             bins,
             bin_start,

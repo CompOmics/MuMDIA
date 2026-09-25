@@ -372,6 +372,11 @@ impl Library {
         span: Option<(usize, usize)>,
         frag_offset: Option<usize>,
     ) -> Result<Library> {
+        // Phase timers for the load-path work (`library: loaded` below). The stage logs
+        // bracket the library load together with the spectra decode and the index build, so
+        // before these lines no log could say which of the three a seed or extract spent its
+        // load phase on.
+        let t_load = std::time::Instant::now();
         let partial = span.is_some() || frag_offset.is_some();
         let frag_offset = frag_offset.unwrap_or(0);
         let offset = span.map(|(first, _)| first).unwrap_or(0);
@@ -466,6 +471,7 @@ impl Library {
         // file row c + offset, so the slice's ids must be exactly offset..offset + ncand.
         check_candidate_ids(&pt, precursors, offset, ncand)?;
         drop(pt);
+        let precursor_ms = t_load.elapsed().as_millis() as u64;
 
         // Fragment table: two streaming passes over the four columns the library needs (the
         // artifact also carries `ion_type`, `ordinal`, `frag_charge` and `cardinality`, which
@@ -656,6 +662,7 @@ impl Library {
             }
         }
         drop(name_lookup);
+        let fragment_ms = t_load.elapsed().as_millis() as u64 - precursor_ms;
 
         // `prec_mz` IS the decoded `precursor_mz` column: row c is candidate c, in the same
         // order, so the second array was a copy of the first. Move it instead of pushing a
@@ -768,6 +775,15 @@ impl Library {
                 ("cands", crate::memlog::bytes_of(&cands)),
                 ("prec_mz", crate::memlog::bytes_of(&prec_mz)),
             ],
+        );
+        tracing::info!(
+            library = precursors,
+            candidates = ncand,
+            fragments = n_frag_rows,
+            precursor_ms,
+            fragment_ms,
+            elapsed_ms = t_load.elapsed().as_millis() as u64,
+            "library: loaded"
         );
         Ok(Library {
             cands,
