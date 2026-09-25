@@ -543,6 +543,66 @@ def test_default_path_scores_as_the_reference_worker(torch_available, tmp_path, 
     _assert_same_scores(ref, new, n, "the current worker (against %s)" % REFERENCE_COMMIT[:7])
 
 
+def test_scoring_forward_does_not_depend_on_the_batch_address(torch_available):
+    """The MLP forward must give the same bytes wherever its input batch sits in memory.
+
+    W1 hands the model one reused buffer where the numpy fancy index handed it a fresh
+    allocation per batch. The worker allocates that buffer with numpy, as the fancy index
+    was, but its address still differs from batch to batch of the old path (16 bytes past
+    a 64-byte boundary on glibc for an mmap'd block, any 16-byte multiple from the heap).
+    A BLAS kernel may choose its code path by alignment, so the production shape is
+    checked here: a 16,384-row scoring batch (MUMDIA_NN_BATCH 4096 x 4) of 387 features
+    through the 128-64 network in eval mode, fed from the numpy gather, from the worker's
+    numpy-backed buffer and a 64-byte aligned `torch.empty` one, and from numpy views at
+    4 to 48 bytes past a 64-byte boundary.
+    """
+    torch = pytest.importorskip("torch")
+    nn = torch.nn
+    threads = torch.get_num_threads()
+    torch.set_num_threads(max(1, min(8, threads)))
+    try:
+        torch.manual_seed(0)
+        nf, step = 387, 16384
+        layers, d = [], nf
+        for h in (128, 64):
+            layers += [nn.Linear(d, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(0.3)]
+            d = h
+        model = nn.Sequential(*layers, nn.Linear(d, 1))
+        with torch.no_grad():
+            model.train()
+            for _ in range(3):                  # non-trivial BatchNorm running statistics
+                model(torch.randn(4096, nf))
+        model.eval()
+
+        def forward(x):
+            with torch.no_grad():
+                return model(x).squeeze(-1).numpy().tobytes()
+
+        rng = np.random.default_rng(1)
+        xs = np.clip(rng.normal(size=(20000, nf)).astype(np.float32), -8, 8)
+        idx = np.sort(rng.choice(len(xs), step, replace=False)).astype(np.int64)
+        want = forward(torch.from_numpy(xs[idx]))            # the numpy gather
+        for buf in (torch.from_numpy(np.empty((step, nf), np.float32)),   # the worker's
+                    torch.empty((step, nf), dtype=torch.float32)):
+            torch.index_select(torch.from_numpy(xs), 0, torch.from_numpy(idx), out=buf)
+            assert forward(buf) == want, "the torch gather changed the forward pass"
+            # The last, partial batch is gathered into a leading view of the same buffer.
+            torch.index_select(torch.from_numpy(xs), 0, torch.from_numpy(idx[:5000]),
+                               out=buf[:5000])
+            assert forward(buf[:5000]) == forward(torch.from_numpy(xs[idx[:5000]]))
+        raw = np.empty(step * nf * 4 + 128, np.uint8)
+        base = (-raw.ctypes.data) % 64
+        for off in (0, 4, 8, 16, 32, 48):
+            view = raw[base + off:base + off + step * nf * 4].view(np.float32)
+            view = view.reshape(step, nf)
+            view[:] = xs[idx]
+            assert view.ctypes.data % 64 == off
+            assert forward(torch.from_numpy(view)) == want, (
+                "the forward pass depends on the input address (%d bytes past 64)" % off)
+    finally:
+        torch.set_num_threads(threads)
+
+
 def test_threaded_init_scan_picks_the_serial_feature_and_count():
     """The threaded init scan must return the serial scan's (column, sign, count) exactly.
 

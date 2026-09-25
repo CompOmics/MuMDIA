@@ -118,8 +118,9 @@ than a number. Both are recorded in every run's `manifest.json`.
   2.4 s); the init feature scan counts its columns on a thread pool (400,000 x 120:
   24.9 s to 4.3 s), with at most 1 GiB of sort transients in flight
   (`MUMDIA_NN_SCAN_MEM_GB`) when the init sample escalates toward the whole fold;
-  scoring batches are gathered with `torch.index_select` into one reused buffer (4.7x
-  on the gather); each round's positives come from a certified top window instead of a
+  scoring batches are gathered with `torch.index_select` into one reused
+  numpy-allocated buffer (4.7x on the gather; identity checked on Windows x86-64 with
+  torch 2.6, CPU and CUDA, not yet on the Linux fleet); each round's positives come from a certified top window instead of a
   full stable sort (10M scores: 1.69 s to 0.08 s), and the decoy order of the hybrid cap
   from one uint64 key sort; the training pool is no longer scored after the last round,
   whose scores fed only a log line. Every change keeps a switch back to the code it

@@ -115,8 +115,12 @@ arm must run the threaded init scan (`MUMDIA_NN_SCAN_ROWS_PER_THREAD=500`). Thes
 comparisons on one host, not committed hashes, so they hold on any CPU. When a later
 change moves the default scores on purpose, move `REFERENCE_COMMIT` to the commit that
 made it. Under flush-to-zero the threaded fill, standardisation and init scan must
-match the serial code on inputs where the thread state decides the bytes.
-`MUMDIA_NN_PARALLEL` must give the same bytes for one and three processes, for all three paths, and neither it nor a failing
+match the serial code on inputs where the thread state decides the bytes, and the
+MLP forward of a production-shape scoring batch (16,384 x 387) must not depend on
+the address of its input (the worker's reused numpy-allocated buffer and a 64-byte
+aligned `torch.empty` one against the numpy fancy index, and views 4 to 48 bytes past a
+64-byte boundary). `MUMDIA_NN_PARALLEL` must give the same
+bytes for one and three processes, for all three paths, and neither it nor a failing
 run may leave the memmap or its side arrays behind; a failing child's log must reach
 the worker's stderr. Without torch: the threaded load reproduces the serial loop's
 matrix, moments, mean and std bytes, and a single-threaded load releases its moment

@@ -754,9 +754,16 @@ MLP. Set it explicitly for the logreg path.
     batch is gathered with `torch.index_select` into one buffer reused for the whole
     run, on the intra-op threads, instead of a single-threaded numpy fancy index and
     a fresh allocation per batch (660,000 rows x 387 features: 0.39 s against
-    0.08 s at 8 threads). Same values and shapes, so the scores are identical, on
-    CPU and on CUDA. `numpy` restores the old gather; the streaming backend always
-    uses it.
+    0.08 s at 8 threads). Same values and shapes. The buffer is allocated by numpy, as
+    the fancy index was, so the model's input does not move to torch's 64-byte
+    alignment; a BLAS kernel may pick its code path by input alignment. The scores
+    were checked byte-identical on Windows x86-64 with torch 2.6, on CPU and on CUDA
+    (RTX 4090), and on synthetic pools of 40 and 120 features;
+    `test_scoring_forward_does_not_depend_on_the_batch_address` repeats the check at
+    the production batch shape (16,384 x 387) on the host that runs it. The Linux
+    fleet has not been checked yet: before relying on identity there, run that test
+    and the two score-identity tests below on one fleet host. `numpy` restores the old
+    gather; the streaming backend always uses it.
   - `MUMDIA_NN_SCAN_THREADS` (default: the torch CPU thread count): the init feature
     scan counts its columns on a thread pool, one task per column with both signs
     from one column read. Each count is computed as before and the winner is reduced in

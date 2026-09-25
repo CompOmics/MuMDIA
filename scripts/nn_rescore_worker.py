@@ -193,10 +193,12 @@ Env knobs (all optional):
                                      argsort exactly. full = the previous full sort each round.
     MUMDIA_NN_GATHER      = torch    how `score_idx` gathers a scoring batch on the
                                      in-memory backend: torch = `torch.index_select` into
-                                     one reused buffer (multi-threaded); numpy = the
-                                     previous `Xs[idx]` fancy index. Same values, same
-                                     shapes, byte-identical scores. The streaming backend
-                                     always uses the numpy path.
+                                     one reused numpy-allocated buffer (multi-threaded);
+                                     numpy = the previous `Xs[idx]` fancy index. Same
+                                     values, same shapes; byte-identical scores where
+                                     checked (Windows x86-64, torch 2.6, CPU and CUDA; the
+                                     tests repeat it on the host that runs them). The
+                                     streaming backend always uses the numpy path.
     MUMDIA_NN_PARALLEL    = 0        opt-in: > 0 trains the (seed, fold) tasks in that many
                                      spawned processes at once. The matrix is shared through
                                      a read-only memmap next to the output (the in-memory
@@ -1257,11 +1259,14 @@ def _build_trainer(torch, cfg, X, stream, y, fold, feat_cols, keyed_shuffle=Fals
         # buffer that lives for the whole run. `Xs[b]` was a single-threaded numpy fancy
         # index plus a fresh 25 MB allocation per batch (16,384 x 387 float32); the torch
         # gather runs on the intra-op threads and writes the same values into the same
-        # shape. The streaming backend keeps the numpy path above, which reads the memmap.
+        # shape. The buffer is allocated by numpy, as `Xs[b]` was, and wrapped without a
+        # copy, so the model's input keeps the old allocator's alignment rather than
+        # torch's 64-byte one: a BLAS kernel may pick its code path by input alignment.
+        # The streaming backend keeps the numpy path above, which reads the memmap.
         idx_t = torch.from_numpy(np.ascontiguousarray(idx, dtype=np.int64))
         buf = _score_buf[0]
         if buf is None:
-            buf = _score_buf[0] = torch.empty((step, nf), dtype=torch.float32)
+            buf = _score_buf[0] = torch.from_numpy(np.empty((step, nf), np.float32))
         for i in range(0, len(idx), step):
             k = min(step, len(idx) - i)
             xb = buf[:k]
