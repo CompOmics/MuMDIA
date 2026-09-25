@@ -143,6 +143,17 @@ than a number. Both are recorded in every run's `manifest.json`.
   Values are unchanged; the bytes and content hashes of files from capped writers change,
   and uncapped writers are byte-identical to before (docs/03 "Page layout of capped
   writers").
+- **Capped writers plan their float encodings from their first rows.** A writer with a
+  row-group cap holds its first quarter row group, writes every float leaf whose sampled
+  values are more than 80% distinct PLAIN from the first page (instead of paying for a
+  dictionary prefix until the dictionary limit fills), and sizes the dictionary limit of the
+  other float leaves from their values per row group rather than their rows, which gives the
+  chromatogram traces back the dictionary the row-sized limit cut at 128 KB. Against the
+  unplanned layout on the AIF artifacts: features -8.6%, psms_competed -14.9%,
+  chromatograms -6.3%, spectra -0.2%, and the competed rewrite encodes in 0.54 s against
+  1.31 s with half the writer buffer. Values are unchanged; bytes and content hashes of
+  capped writers change; `MUMDIA_PARQUET_PLAN=0` restores the unplanned layout (docs/03
+  "Float encodings planned from the first rows").
 
 - **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
   `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort

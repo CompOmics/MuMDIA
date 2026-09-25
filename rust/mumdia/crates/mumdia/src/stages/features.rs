@@ -4448,9 +4448,16 @@ mod tests {
         // lands the checks in different places. Only the feature VALUES are invariant, and
         // those are what `extended_features_are_chunk_invariant` pins. Nothing downstream
         // of features reads parquet bytes; the artifact hash in the manifest is provenance.
+        //
+        // The column is 75% distinct, so the writer's encoding plan (mumdia-io
+        // `EncodingPlan`) keeps its dictionary and the dictionary limit falls back to PLAIN
+        // part-way through each row group, at a page check. A near-unique column is the
+        // opposite case since the plan: it is written PLAIN, its pages are cut only at the
+        // 1 MB page size, and a 65,536-row f64 chunk is one page, so no call pattern moves it
+        // (the last assertion).
         let dir = std::env::temp_dir().join("mumdia_features_writecalls");
         std::fs::create_dir_all(&dir).unwrap();
-        let write = |tag: &str, n: usize, step: usize| -> String {
+        let write_values = |tag: &str, n: usize, step: usize, value: fn(usize) -> f64| {
             let p = dir
                 .join(format!("wcb_{tag}.parquet"))
                 .to_string_lossy()
@@ -4459,12 +4466,15 @@ mod tests {
             let mut lo = 0usize;
             while lo < n {
                 let hi = (lo + step).min(n);
-                let vals: Vec<f64> = (lo..hi).map(|i| (i as f64) * 1.000_001).collect();
+                let vals: Vec<f64> = (lo..hi).map(value).collect();
                 w.write_cols(vec![Col::F64("v".into(), vals)]).unwrap();
                 lo = hi;
             }
             w.close().unwrap();
             p
+        };
+        let write = |tag: &str, n: usize, step: usize| -> String {
+            write_values(tag, n, step, |i| ((i * 3 / 4) as f64) * 1.000_001)
         };
         let hash = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
 
@@ -4497,6 +4507,17 @@ mod tests {
             hash(&write("big_rg", big, FEATURE_ROW_GROUP_ROWS)),
             "a step equal to the row group size lands every page check where one call did"
         );
+        let unique = |tag: &str, step: usize| {
+            hash(&write_values(tag, big, step, |i| (i as f64) * 1.000_001))
+        };
+        let one_unique = unique("uniq_one", big);
+        for step in [1_000usize, 40_000, 68_523] {
+            assert_eq!(
+                one_unique,
+                unique(&format!("uniq_{step}"), step),
+                "step {step}: a near-unique column is one PLAIN page per row group"
+            );
+        }
     }
 
     #[test]

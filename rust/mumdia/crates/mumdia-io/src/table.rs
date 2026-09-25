@@ -262,24 +262,12 @@ fn cols_to_batch(path: &str, cols: Vec<Col>) -> Result<(Arc<Schema>, RecordBatch
     Ok((schema, batch))
 }
 
-/// The parquet leaves of `schema` whose physical type is FLOAT or DOUBLE, as the writer
-/// will name them. Derived with the same converter the [`ArrowWriter`] uses, so a list
-/// column's leaf path (`trace.list.item`) is the writer's own spelling rather than a guess.
-/// A schema the converter rejects yields no paths; the writer reports that failure itself.
+/// The FLOAT and DOUBLE leaves of `schema` as (path, width), for the tests and benches.
+#[cfg(test)]
 fn float_leaf_paths(schema: &Schema) -> Vec<(ColumnPath, usize)> {
-    let Ok(desc) = ArrowSchemaConverter::new()
-        .with_coerce_types(false)
-        .convert(schema)
-    else {
-        return Vec::new();
-    };
-    desc.columns()
-        .iter()
-        .filter_map(|c| match c.physical_type() {
-            PhysicalType::FLOAT => Some((c.path().clone(), 4)),
-            PhysicalType::DOUBLE => Some((c.path().clone(), 8)),
-            _ => None,
-        })
+    float_leaves(schema)
+        .into_iter()
+        .map(|l| (l.path, l.width))
         .collect()
 }
 
@@ -349,6 +337,252 @@ fn float_dictionary_page_size_limit(
 /// this value, so the bound only stops a future, larger cap from buffering a whole
 /// multi-million-row chunk per column.
 const MAX_DATA_PAGE_ROWS: usize = 1 << 17;
+
+/// Above this fraction of distinct values in the planning sample, a float leaf of a capped
+/// writer is written without a dictionary at all ([`EncodingPlan`]).
+///
+/// The break-even of a disable against a full dictionary is c = 0.75 of the chunk's values
+/// distinct, and a disable gains 19.7% at c = 1 and costs 34% at c = 0.5
+/// ([`float_dictionary_page_size_limit`] has the sweep). The threshold is applied to the
+/// sample, a quarter of a row group ([`PLAN_SAMPLE_FRACTION`]), so it only means the same c
+/// when a leaf's repeats scale with the rows, which is what the engine's float columns look
+/// like: a few values repeated often (zeros, a noise floor, a clamp) and a near-unique rest.
+/// Measured on the AIF artifacts rewritten at their own row-group sizes
+/// (`bench_rewrite_a_real_artifact`), 0.8 is the best of the three thresholds tried on
+/// every table, against the unplanned layout:
+///
+/// | artifact (row group) | 0.8 | 0.9 | 0.95 |
+/// |---|---|---|---|
+/// | features (65,536) | -8.6% | -7.9% | -7.3% |
+/// | psms_competed (131,072) | -14.9% | -13.8% | -12.6% |
+/// | chromatograms (65,536) | -6.3% | -5.8% | -5.8% |
+/// | spectra_ms2 (2,048) | -0.2% | +1.8% | +1.8% |
+///
+/// The case it can get wrong is a leaf drawn evenly from a vocabulary of about twice the
+/// sample's rows: its sample is 80% distinct while the whole chunk is only about 46%, where
+/// the disable costs about 40%. No measured column has that shape; a quantised feature
+/// that does would show up in the bench as a leaf the plan lost on.
+const PLAN_PLAIN_ABOVE_DISTINCT: f64 = 0.8;
+
+/// A sample with fewer non-null values of a leaf than this does not disable that leaf's
+/// dictionary: the distinct fraction of a handful of values says little about a row group.
+const PLAN_MIN_VALUES: usize = 4_096;
+
+/// A capped writer plans its float encodings from the first `cap / PLAN_SAMPLE_FRACTION`
+/// rows it is given, whatever the chunks they arrive in.
+const PLAN_SAMPLE_FRACTION: usize = 4;
+
+/// The rows a writer capped at `row_group_rows` samples before it plans.
+fn plan_sample_rows(row_group_rows: usize) -> usize {
+    row_group_rows.div_ceil(PLAN_SAMPLE_FRACTION).max(1)
+}
+
+/// Whether capped writers plan their float encodings. On unless `MUMDIA_PARQUET_PLAN` is
+/// `0`, `off`, `false` or `no`, which restores the unplanned layout of [`writer_props`] for a
+/// byte comparison against a binary from before the plan.
+fn plan_enabled() -> bool {
+    !matches!(
+        std::env::var("MUMDIA_PARQUET_PLAN")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "off" | "false" | "no"
+    )
+}
+
+/// One FLOAT or DOUBLE parquet leaf of an Arrow schema: its path as the writer spells it,
+/// its value width, and the Arrow root column it lives under.
+struct FloatLeaf {
+    path: ColumnPath,
+    width: usize,
+    root: usize,
+}
+
+/// The parquet leaves of `schema` whose physical type is FLOAT or DOUBLE, as the writer
+/// will name them, with their Arrow root columns. Derived with the same converter the
+/// [`ArrowWriter`] uses, so a list column's leaf path (`trace.list.item`) is the writer's own
+/// spelling rather than a guess. A schema the converter rejects yields no leaves; the writer
+/// reports that failure itself.
+fn float_leaves(schema: &Schema) -> Vec<FloatLeaf> {
+    let Ok(desc) = ArrowSchemaConverter::new()
+        .with_coerce_types(false)
+        .convert(schema)
+    else {
+        return Vec::new();
+    };
+    (0..desc.num_columns())
+        .filter_map(|i| {
+            let c = desc.column(i);
+            let width = match c.physical_type() {
+                PhysicalType::FLOAT => 4,
+                PhysicalType::DOUBLE => 8,
+                _ => return None,
+            };
+            Some(FloatLeaf {
+                path: c.path().clone(),
+                width,
+                root: desc.get_column_root_idx(i),
+            })
+        })
+        .collect()
+}
+
+/// What a capped writer learned about one float leaf from its first rows.
+#[derive(Clone, Debug, PartialEq)]
+struct LeafPlan {
+    path: ColumnPath,
+    /// Rows of the sample.
+    rows: usize,
+    /// Non-null values of the leaf in the sample: at most one per row for a scalar, the
+    /// summed list lengths for a list leaf.
+    values: usize,
+    /// At least [`PLAN_MIN_VALUES`] values, of which more than [`PLAN_PLAIN_ABOVE_DISTINCT`]
+    /// are distinct.
+    near_unique: bool,
+}
+
+impl LeafPlan {
+    /// Values of the leaf per row, rounded up and at least one.
+    fn values_per_row(&self) -> usize {
+        self.values.div_ceil(self.rows.max(1)).max(1)
+    }
+}
+
+/// The float encodings of a capped writer, planned from the first rows it is given
+/// (docs/03_io_layer.md, "Float encodings planned from the first rows").
+///
+/// [`writer_props`] decides each float leaf's dictionary before a single value is seen, so
+/// it sizes a dictionary LIMIT from the row-group cap and lets parquet fall back to PLAIN
+/// when the limit fills. The fallback is prefix-based: the pages written before it fires
+/// keep their dictionary, so a near-unique column still pays for a dictionary page and for
+/// the index pages that address it. And the limit counts ROWS, which is wrong for a list
+/// leaf, whose chunk holds a list's worth of values per row: the chromatogram `rt` and
+/// `intensity` leaves (about 50 values a row) had their dictionary cut at 128 KB of a 13 MB
+/// chunk, where the dictionary was worth keeping.
+///
+/// The plan looks at the first [`plan_sample_rows`] rows before the first byte is encoded:
+///
+/// * a leaf whose sampled values are near-unique ([`PLAN_PLAIN_ABOVE_DISTINCT`]) is written
+///   PLAIN from its first page, with no dictionary to pay for;
+/// * every other float leaf keeps the dictionary limit of [`writer_props`], sized from the
+///   leaf's VALUES per row group (the sampled values per row times the cap) instead of its
+///   rows, so a list leaf keeps parquet's 1 MB default and a scalar leaf is as before.
+///
+/// The sample is taken by rows, not by chunks: the same rows written in any chunking plan
+/// the same encodings. Distinct values are counted by bit pattern, which is how parquet's
+/// dictionary interns floats, and a distinct COUNT does not depend on hash iteration order,
+/// so a plan is a deterministic function of the first rows.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct EncodingPlan {
+    leaves: Vec<LeafPlan>,
+}
+
+impl EncodingPlan {
+    /// Plan the float leaves of `schema` from the first `sample_rows` rows of `batches`.
+    fn of(schema: &Schema, batches: &[RecordBatch], sample_rows: usize) -> EncodingPlan {
+        Self::with_threshold(schema, batches, sample_rows, PLAN_PLAIN_ABOVE_DISTINCT)
+    }
+
+    /// [`EncodingPlan::of`] at another distinct-fraction threshold (the benches sweep it).
+    fn with_threshold(
+        schema: &Schema,
+        batches: &[RecordBatch],
+        sample_rows: usize,
+        threshold: f64,
+    ) -> EncodingPlan {
+        let mut sample: Vec<RecordBatch> = Vec::new();
+        let mut rows = 0usize;
+        for b in batches {
+            if rows >= sample_rows {
+                break;
+            }
+            let take = b.num_rows().min(sample_rows - rows);
+            if take > 0 {
+                sample.push(b.slice(0, take));
+                rows += take;
+            }
+        }
+        let leaves = float_leaves(schema)
+            .into_iter()
+            .filter_map(|leaf| {
+                let mut bits: Vec<u64> = Vec::new();
+                for b in &sample {
+                    push_float_bits(b.column(leaf.root), &mut bits)?;
+                }
+                Some(LeafPlan {
+                    path: leaf.path,
+                    rows,
+                    values: bits.len(),
+                    near_unique: near_unique(&bits, threshold),
+                })
+            })
+            .collect();
+        EncodingPlan { leaves }
+    }
+
+    fn leaf(&self, path: &ColumnPath) -> Option<&LeafPlan> {
+        self.leaves.iter().find(|l| &l.path == path)
+    }
+}
+
+/// Append the bit patterns of the non-null float values under `col` (a Float32 or Float64
+/// array, or a List or LargeList of one) to `out`. `None` for any other shape, whose leaf
+/// then keeps the unplanned rule.
+fn push_float_bits(col: &ArrayRef, out: &mut Vec<u64>) -> Option<()> {
+    fn flat(values: &ArrayRef, out: &mut Vec<u64>) -> Option<()> {
+        match values.data_type() {
+            DataType::Float64 => {
+                let a = values.as_any().downcast_ref::<Float64Array>()?;
+                out.extend(a.iter().flatten().map(f64::to_bits));
+            }
+            DataType::Float32 => {
+                let a = values.as_any().downcast_ref::<Float32Array>()?;
+                out.extend(a.iter().flatten().map(|v| u64::from(v.to_bits())));
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+    match col.data_type() {
+        DataType::Float64 | DataType::Float32 => flat(col, out),
+        DataType::List(_) => {
+            let l = col.as_any().downcast_ref::<ListArray>()?;
+            let offsets = l.value_offsets();
+            let (lo, hi) = (*offsets.first()? as usize, *offsets.last()? as usize);
+            flat(&l.values().slice(lo, hi - lo), out)
+        }
+        DataType::LargeList(_) => {
+            let l = col.as_any().downcast_ref::<LargeListArray>()?;
+            let offsets = l.value_offsets();
+            let (lo, hi) = (*offsets.first()? as usize, *offsets.last()? as usize);
+            flat(&l.values().slice(lo, hi - lo), out)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `bits` holds at least [`PLAN_MIN_VALUES`] values of which more than `threshold`
+/// ([`PLAN_PLAIN_ABOVE_DISTINCT`] in the writers) are distinct. The count stops as soon as
+/// too many repeats have been seen to pass, so a low-cardinality leaf costs a fraction of a
+/// pass.
+fn near_unique(bits: &[u64], threshold: f64) -> bool {
+    if bits.len() < PLAN_MIN_VALUES {
+        return false;
+    }
+    let allowed_repeats = ((1.0 - threshold) * bits.len() as f64) as usize;
+    let mut seen = std::collections::HashSet::with_capacity(bits.len());
+    let mut repeats = 0usize;
+    for &b in bits {
+        if !seen.insert(b) {
+            repeats += 1;
+            if repeats > allowed_repeats {
+                return false;
+            }
+        }
+    }
+    true
+}
 
 /// Writer properties for one artifact: the codec, an optional row-group cap, and a
 /// row-group-sized dictionary page size limit on the f32/f64 leaves.
@@ -436,15 +670,36 @@ const MAX_DATA_PAGE_ROWS: usize = 1 << 17;
 /// 1,141 -> 947 at +0.05%. Read and write times from the page cache did not move beyond the
 /// run-to-run noise. The values are unchanged, and the uncapped writers' files do not move.
 fn writer_props(schema: &Schema, row_group_rows: Option<usize>) -> WriterProperties {
+    writer_props_planned(schema, row_group_rows, None)
+}
+
+/// [`writer_props`], with every float leaf that `plan` covers decided by the plan instead:
+/// written PLAIN when its sample was near-unique, otherwise given the dictionary limit sized
+/// from its values per row group rather than its rows ([`EncodingPlan`]). A leaf the plan
+/// does not cover keeps the unplanned rule, and so does every leaf when `plan` is `None`.
+fn writer_props_planned(
+    schema: &Schema,
+    row_group_rows: Option<usize>,
+    plan: Option<&EncodingPlan>,
+) -> WriterProperties {
     let mut b = WriterProperties::builder().set_compression(codec());
     if let Some(n) = row_group_rows {
         b = b
             .set_max_row_group_row_count(Some(n.max(1)))
             .set_data_page_row_count_limit(data_page_rows(n));
     }
-    for (leaf, width) in float_leaf_paths(schema) {
-        if let Some(limit) = float_dictionary_page_size_limit(row_group_rows, width) {
-            b = b.set_column_dictionary_page_size_limit(leaf, limit);
+    for leaf in float_leaves(schema) {
+        let planned = plan.and_then(|p| p.leaf(&leaf.path));
+        if planned.is_some_and(|l| l.near_unique) {
+            b = b.set_column_dictionary_enabled(leaf.path, false);
+            continue;
+        }
+        let chunk_values = match planned {
+            Some(l) => row_group_rows.map(|r| r.saturating_mul(l.values_per_row())),
+            None => row_group_rows,
+        };
+        if let Some(limit) = float_dictionary_page_size_limit(chunk_values, leaf.width) {
+            b = b.set_column_dictionary_page_size_limit(leaf.path, limit);
         }
     }
     b.build()
@@ -507,6 +762,109 @@ impl std::io::Write for Sink {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.0.flush()
+    }
+}
+
+/// The parquet encoder behind [`TableWriter`], [`BatchWriter`] and [`write_batches`].
+///
+/// An uncapped writer, or one whose schema has no float leaf, encodes from the first batch
+/// with [`writer_props`]. A capped writer first holds its first [`plan_sample_rows`] rows,
+/// plans its float encodings from them ([`EncodingPlan`]), and then encodes the held batches
+/// in the order and the chunks they arrived in, so every column writer sees the sequence of
+/// writes it would have seen without the plan.
+struct Encoder {
+    state: EncoderState,
+}
+
+enum EncoderState {
+    /// Holding the first rows of a capped writer until there are enough to plan from.
+    Sampling {
+        sink: Box<Sink>,
+        schema: Arc<Schema>,
+        row_group_rows: usize,
+        pending: Vec<RecordBatch>,
+        rows: usize,
+    },
+    Writing(Box<ArrowWriter<Sink>>),
+    /// Only while a transition is in flight, or after one failed.
+    Poisoned,
+}
+
+impl Encoder {
+    fn new(sink: Sink, schema: Arc<Schema>, row_group_rows: Option<usize>) -> Result<Encoder> {
+        let state = match row_group_rows {
+            Some(cap) if plan_enabled() && !float_leaves(&schema).is_empty() => {
+                EncoderState::Sampling {
+                    sink: Box::new(sink),
+                    schema,
+                    row_group_rows: cap.max(1),
+                    pending: Vec::new(),
+                    rows: 0,
+                }
+            }
+            _ => {
+                let props = writer_props(&schema, row_group_rows);
+                EncoderState::Writing(Box::new(ArrowWriter::try_new(sink, schema, Some(props))?))
+            }
+        };
+        Ok(Encoder { state })
+    }
+
+    fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        match &mut self.state {
+            EncoderState::Writing(w) => Ok(w.write(batch)?),
+            EncoderState::Sampling {
+                pending,
+                rows,
+                row_group_rows,
+                ..
+            } => {
+                // An empty batch writes nothing, as the arrow writer skips it too.
+                if batch.num_rows() > 0 {
+                    pending.push(batch.clone());
+                    *rows += batch.num_rows();
+                }
+                if *rows >= plan_sample_rows(*row_group_rows) {
+                    self.start()?;
+                }
+                Ok(())
+            }
+            EncoderState::Poisoned => Err(anyhow!("parquet writer used after a failed write")),
+        }
+    }
+
+    /// Plan from the held rows, open the arrow writer and encode them. A no-op once writing.
+    fn start(&mut self) -> Result<()> {
+        if !matches!(self.state, EncoderState::Sampling { .. }) {
+            return Ok(());
+        }
+        let EncoderState::Sampling {
+            sink,
+            schema,
+            row_group_rows,
+            pending,
+            ..
+        } = std::mem::replace(&mut self.state, EncoderState::Poisoned)
+        else {
+            unreachable!("checked above");
+        };
+        let plan = EncodingPlan::of(&schema, &pending, plan_sample_rows(row_group_rows));
+        let props = writer_props_planned(&schema, Some(row_group_rows), Some(&plan));
+        let mut w = ArrowWriter::try_new(*sink, schema, Some(props))?;
+        for b in &pending {
+            w.write(b)?;
+        }
+        self.state = EncoderState::Writing(Box::new(w));
+        Ok(())
+    }
+
+    /// Encode whatever is still held, write the footer and return the sink.
+    fn finish(mut self) -> Result<Sink> {
+        self.start()?;
+        match self.state {
+            EncoderState::Writing(w) => Ok(w.into_inner()?),
+            _ => Err(anyhow!("parquet writer used after a failed write")),
+        }
     }
 }
 
@@ -811,7 +1169,7 @@ fn write_table_to(mut w: TableWriter, path: &str, cols: Vec<Col>) -> Result<Tabl
 pub struct TableWriter {
     path: String,
     schema: Option<Arc<Schema>>,
-    writer: Option<ArrowWriter<Sink>>,
+    writer: Option<Encoder>,
     target: Option<AtomicPath>,
     rows: u64,
     opts: WriteOptions,
@@ -857,10 +1215,10 @@ impl TableWriter {
                 let target = AtomicPath::new(&self.path)?;
                 let file = Sink::create(target.tmp(), self.opts.content_hash)?;
                 self.target = Some(target);
-                self.writer = Some(ArrowWriter::try_new(
+                self.writer = Some(Encoder::new(
                     file,
                     schema.clone(),
-                    Some(writer_props(&schema, self.opts.row_group_rows)),
+                    self.opts.row_group_rows,
                 )?);
                 self.schema = Some(schema);
             }
@@ -911,10 +1269,10 @@ impl TableWriter {
                 self.path
             )
         })?;
-        // `into_inner` writes the footer (the same bytes `close` writes) and returns the sink,
+        // `finish` writes the footer (the same bytes `close` writes) and returns the sink,
         // whose digest therefore covers the whole file.
         let sink = w
-            .into_inner()
+            .finish()
             .with_context(|| format!("closing parquet writer {}", self.path))?;
         let digest = sink.finish()?;
         if let Some(t) = self.target.take() {
@@ -1082,7 +1440,7 @@ fn publish_copy_of_with(src: &str, out: &str, allow_link: bool) -> Result<FileCo
 /// is fine for ordinary artifacts but not for the rescoring feature matrix - hundreds of
 /// columns over millions of rows, where the caller already holds the data once.
 pub struct BatchWriter {
-    writer: Option<ArrowWriter<Sink>>,
+    writer: Option<Encoder>,
     rows: u64,
     target: Option<AtomicPath>,
 }
@@ -1114,9 +1472,8 @@ impl BatchWriter {
     ) -> Result<BatchWriter> {
         let target = AtomicPath::new(path)?;
         let file = Sink::create(target.tmp(), opts.content_hash)?;
-        let props = writer_props(&schema, opts.row_group_rows);
         Ok(BatchWriter {
-            writer: Some(ArrowWriter::try_new(file, schema, Some(props))?),
+            writer: Some(Encoder::new(file, schema, opts.row_group_rows)?),
             rows: 0,
             target: Some(target),
         })
@@ -1154,7 +1511,7 @@ impl BatchWriter {
     fn finish(mut self) -> Result<(u64, Option<String>)> {
         let mut digest = None;
         if let Some(w) = self.writer.take() {
-            let sink = w.into_inner().context("closing parquet writer")?;
+            let sink = w.finish().context("closing parquet writer")?;
             digest = sink.finish()?;
         }
         if let Some(t) = self.target.take() {
@@ -1186,17 +1543,16 @@ fn write_batches_with(
 ) -> Result<(u64, Option<String>)> {
     let target = AtomicPath::new(path)?;
     let file = Sink::create(target.tmp(), hash)?;
-    // The same properties [`TableWriter`] uses, minus the row-group cap: this path and the
+    // The same encoder [`TableWriter`] uses, minus the row-group cap: this path and the
     // chunked one must produce the same file, which
     // `write_table_matches_one_batch_byte_for_byte_on_scalars` asserts.
-    let props = writer_props(&schema, None);
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    let mut writer = Encoder::new(file, schema, None)?;
     let mut n = 0u64;
     for b in batches {
         writer.write(b)?;
         n += b.num_rows() as u64;
     }
-    let digest = writer.into_inner()?.finish()?;
+    let digest = writer.finish()?.finish()?;
     target.publish()?;
     Ok((n, digest))
 }
@@ -3947,10 +4303,10 @@ mod encoding_tests {
         dw.close().unwrap();
 
         // Three row groups of two columns. 65,536 f64 are 512 KB and the indices of a
-        // run-length id column far less, both under the 1 MB page size, so the id column is
-        // one page per group. `mz` is two: the dictionary fallback of the float rule closes
-        // the dictionary-encoded prefix as a page of its own and writes the rest PLAIN.
-        assert_eq!(pages(&p), vec![2, 1, 2, 1, 2, 1]);
+        // run-length id column far less, both under the 1 MB page size, so each chunk is one
+        // page. (`mz` is near-unique, so the plan writes it PLAIN; unplanned, the dictionary
+        // fallback would close the dictionary-encoded prefix as a second page.)
+        assert_eq!(pages(&p), vec![1; 6]);
         assert!(pages(&q).iter().all(|&k| k >= 4), "{:?}", pages(&q));
         let (a, b) = (Table::read(&p).unwrap(), Table::read(&q).unwrap());
         assert_eq!(a.f64("mz").unwrap(), b.f64("mz").unwrap());
@@ -3963,6 +4319,180 @@ mod encoding_tests {
         assert!(pages(&p).iter().all(|&k| k > 1), "{:?}", pages(&p));
         assert_eq!(data_page_rows(65_536), 65_536);
         assert_eq!(data_page_rows(1 << 20), MAX_DATA_PAGE_ROWS);
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&q).ok();
+    }
+
+    /// Write `cols` as a capped writer would WITHOUT the plan ([`writer_props`] at `cap`).
+    fn write_unplanned(path: &str, cols: Vec<Col>, cap: usize) {
+        let (schema, batch) = cols_to_batch(path, cols).unwrap();
+        let props = writer_props(&schema, Some(cap));
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// Columns for the plan: near-unique scalars and lists, low-cardinality scalars, and a
+    /// list leaf of ~50 values a row that repeats (a chromatogram trace), whose dictionary
+    /// the unplanned rule cut at a row-sized limit.
+    fn planned_cols(n: usize) -> Vec<Col> {
+        vec![
+            Col::F64("mz".into(), (0..n).map(|i| i as f64 * 1.000_7).collect()),
+            Col::F64("const_feat".into(), vec![0.5; n]),
+            Col::F64("count".into(), (0..n).map(|i| (i % 20) as f64).collect()),
+            // Scattered draws from 100,000 values: a dictionary's 17-bit indices beat four
+            // PLAIN bytes that snappy cannot shorten. (A leaf whose rows repeat whole runs
+            // of values, like the chromatogram `rt` axis, is the opposite case: snappy
+            // shortens the PLAIN runs, and that leaf is written PLAIN by its writer.)
+            Col::ListF32(
+                "trace".into(),
+                (0..n)
+                    .map(|i| {
+                        (0..50u64)
+                            .map(|j| {
+                                ((i as u64 * 50 + j).wrapping_mul(2_654_435_761) % 100_000) as f32
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            ),
+            Col::LargeListF32(
+                "big".into(),
+                (0..n)
+                    .map(|i| vec![i as f32 * 3.0, i as f32 * 3.0 + 1.0])
+                    .collect(),
+            ),
+        ]
+    }
+
+    /// The plan of a capped writer (F2 of the 2026-09-25 survey): near-unique float leaves,
+    /// scalar or list, are written PLAIN from the first page; low-cardinality leaves keep
+    /// exactly the dictionary they had; a repeating list leaf keeps a dictionary sized from
+    /// its values, not its rows, and comes out smaller; every value is unchanged.
+    #[test]
+    fn the_plan_writes_near_unique_floats_plain_and_sizes_list_dictionaries_by_values() {
+        let (n, cap) = (65_536usize, 65_536usize);
+        let p = tmp("planned.parquet");
+        let q = tmp("unplanned.parquet");
+        let mut w = TableWriter::new(&p).with_row_group_rows(cap);
+        w.write_cols(planned_cols(n)).unwrap();
+        w.close().unwrap();
+        write_unplanned(&q, planned_cols(n), cap);
+
+        for leaf in ["mz", "big.list.item"] {
+            assert!(
+                !encodings(&p, leaf).contains(&Encoding::RLE_DICTIONARY),
+                "{leaf} is near-unique and should have no dictionary"
+            );
+            assert!(encodings(&q, leaf).contains(&Encoding::RLE_DICTIONARY));
+            assert!(
+                leaf_bytes(&p, leaf) < leaf_bytes(&q, leaf),
+                "{leaf}: {} against {}",
+                leaf_bytes(&p, leaf),
+                leaf_bytes(&q, leaf)
+            );
+        }
+        for leaf in ["const_feat", "count"] {
+            assert!(encodings(&p, leaf).contains(&Encoding::RLE_DICTIONARY));
+            assert_eq!(leaf_bytes(&p, leaf), leaf_bytes(&q, leaf), "{leaf}");
+        }
+        // 100,000 distinct f32 are 400 KB of dictionary: under the 1 MB the plan leaves a
+        // 50-values-a-row leaf, over the 128 KB the row-sized limit gave it.
+        assert!(encodings(&p, "trace.list.item").contains(&Encoding::RLE_DICTIONARY));
+        assert!(
+            leaf_bytes(&p, "trace.list.item") < leaf_bytes(&q, "trace.list.item"),
+            "trace: {} against {}",
+            leaf_bytes(&p, "trace.list.item"),
+            leaf_bytes(&q, "trace.list.item")
+        );
+        let (a, b) = (Table::read(&p).unwrap(), Table::read(&q).unwrap());
+        assert_eq!(a.f64("mz").unwrap(), b.f64("mz").unwrap());
+        assert_eq!(a.f64("count").unwrap(), b.f64("count").unwrap());
+        assert_eq!(a.list_f32("trace").unwrap(), b.list_f32("trace").unwrap());
+        assert_eq!(a.list_f32("big").unwrap(), b.list_f32("big").unwrap());
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&q).ok();
+    }
+
+    /// The plan is a function of the first rows, not of the chunks they arrive in: the same
+    /// rows split any way plan the same encodings, and scalar columns written in chunks that
+    /// are whole multiples of the encoder's 1,024-value mini-batch make the same file. (A list
+    /// leaf's page boundaries depend on the chunking with or without a plan;
+    /// `write_table_matches_one_batch_row_for_row_on_lists` has that.)
+    #[test]
+    fn the_plan_depends_on_the_rows_not_the_chunks() {
+        let n = 65_536usize;
+        let (schema, whole) = cols_to_batch("plan", planned_cols(n)).unwrap();
+        let sample = plan_sample_rows(n);
+        let one = EncodingPlan::of(&schema, std::slice::from_ref(&whole), sample);
+        let mut pieces = Vec::new();
+        let mut at = 0usize;
+        for k in [0usize, 1, 999, 0, 4_096, 7, 30_000, 30_433] {
+            pieces.push(whole.slice(at, k));
+            at += k;
+        }
+        assert_eq!(at, n);
+        assert_eq!(one, EncodingPlan::of(&schema, &pieces, sample));
+        assert_eq!(one.leaves.len(), 5);
+        assert!(one.leaf(&ColumnPath::from("mz")).unwrap().near_unique);
+        let trace = ColumnPath::new(vec!["trace".into(), "list".into(), "item".into()]);
+        assert_eq!(one.leaf(&trace).unwrap().values_per_row(), 50);
+
+        let scalars = || -> Vec<Col> {
+            planned_cols(n)
+                .into_iter()
+                .filter(|c| matches!(c, Col::F64(..)))
+                .collect()
+        };
+        let p = tmp("plan_whole.parquet");
+        let q = tmp("plan_chunked.parquet");
+        let mut w = TableWriter::new(&p).with_row_group_rows(n);
+        w.write_cols(scalars()).unwrap();
+        w.close().unwrap();
+        let mut w = TableWriter::new(&q).with_row_group_rows(n);
+        let cols = scalars();
+        for c in 0..8 {
+            let (a, b) = (c * 8_192, (c + 1) * 8_192);
+            w.write_cols(cols.iter().map(|col| slice_col(col, a, b)).collect())
+                .unwrap();
+        }
+        w.close().unwrap();
+        let (a, b) = (std::fs::read(&p).unwrap(), std::fs::read(&q).unwrap());
+        assert!(a == b, "{} bytes against {}", a.len(), b.len());
+        assert!(!encodings(&p, "mz").contains(&Encoding::RLE_DICTIONARY));
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&q).ok();
+    }
+
+    /// Rows `a..b` of one f64 column, for the chunking test.
+    fn slice_col(c: &Col, a: usize, b: usize) -> Col {
+        match c {
+            Col::F64(n, v) => Col::F64(n.clone(), v[a..b].to_vec()),
+            _ => unreachable!("the chunking test writes f64 columns only"),
+        }
+    }
+
+    /// A table too short for the sample to hold [`PLAN_MIN_VALUES`] values of a scalar leaf
+    /// plans nothing for it: its file is the unplanned writer's file byte for byte.
+    #[test]
+    fn a_sample_too_small_to_plan_leaves_the_unplanned_layout() {
+        let cols = || {
+            vec![
+                Col::F64(
+                    "mz".into(),
+                    (0..3_000).map(|i| i as f64 * 1.000_7).collect(),
+                ),
+                Col::F32("irt".into(), (0..3_000).map(|i| i as f32 * 0.5).collect()),
+            ]
+        };
+        let p = tmp("small_planned.parquet");
+        let q = tmp("small_unplanned.parquet");
+        let mut w = TableWriter::new(&p).with_row_group_rows(65_536);
+        w.write_cols(cols()).unwrap();
+        w.close().unwrap();
+        write_unplanned(&q, cols(), 65_536);
+        assert_eq!(std::fs::read(&p).unwrap(), std::fs::read(&q).unwrap());
         std::fs::remove_file(&p).ok();
         std::fs::remove_file(&q).ok();
     }
@@ -4309,8 +4839,23 @@ mod writer_bench {
         FloatC075,
         FloatC025,
         GlobalLimited,
-        Writer,
+        /// The unplanned [`writer_props`]: the c = 0.5 rule with pages cut by size.
+        WriterUnplanned,
+        /// [`writer_props_planned`] with a plan from the first `cap / sample_div` rows at a
+        /// distinct-fraction `threshold`; `rt_plain` also drops the chromatogram `rt` leaf's
+        /// dictionary whatever the plan says (X6 of the 2026-09-25 survey).
+        Planned {
+            sample_div: usize,
+            threshold: f64,
+            rt_plain: bool,
+        },
     }
+
+    const WRITER: DictRule = DictRule::Planned {
+        sample_div: PLAN_SAMPLE_FRACTION,
+        threshold: PLAN_PLAIN_ABOVE_DISTINCT,
+        rt_plain: false,
+    };
 
     const DICT_RULES: &[(&str, DictRule)] = &[
         ("default", DictRule::Default),
@@ -4320,12 +4865,84 @@ mod writer_bench {
         ("c0.75", DictRule::FloatC075),
         ("c0.25", DictRule::FloatC025),
         ("global-16K", DictRule::GlobalLimited),
-        ("writer", DictRule::Writer),
+        ("unplanned", DictRule::WriterUnplanned),
+        ("writer", WRITER),
+        (
+            "plan-0.9",
+            DictRule::Planned {
+                sample_div: PLAN_SAMPLE_FRACTION,
+                threshold: 0.9,
+                rt_plain: false,
+            },
+        ),
+        (
+            "plan-0.95",
+            DictRule::Planned {
+                sample_div: PLAN_SAMPLE_FRACTION,
+                threshold: 0.95,
+                rt_plain: false,
+            },
+        ),
+        (
+            "plan-group",
+            DictRule::Planned {
+                sample_div: 1,
+                threshold: PLAN_PLAIN_ABOVE_DISTINCT,
+                rt_plain: false,
+            },
+        ),
+        (
+            "writer+rt-plain",
+            DictRule::Planned {
+                sample_div: PLAN_SAMPLE_FRACTION,
+                threshold: PLAN_PLAIN_ABOVE_DISTINCT,
+                rt_plain: true,
+            },
+        ),
     ];
 
+    /// The properties `rule` writes `batches` with. A planned rule samples `batches` the way
+    /// a capped writer samples its first rows.
+    fn props_for(
+        rule: DictRule,
+        schema: &Schema,
+        cap: Option<usize>,
+        batches: &[RecordBatch],
+    ) -> WriterProperties {
+        let DictRule::Planned {
+            sample_div,
+            threshold,
+            rt_plain,
+        } = rule
+        else {
+            return props_under(rule, schema, cap);
+        };
+        let Some(rows) = cap else {
+            return writer_props(schema, None);
+        };
+        let plan = EncodingPlan::with_threshold(
+            schema,
+            batches,
+            rows.div_ceil(sample_div).max(1),
+            threshold,
+        );
+        if !rt_plain {
+            return writer_props_planned(schema, cap, Some(&plan));
+        }
+        let mut plan = plan;
+        for l in &mut plan.leaves {
+            if l.path.string() == "rt.list.item" {
+                l.near_unique = true;
+            }
+        }
+        writer_props_planned(schema, cap, Some(&plan))
+    }
+
     fn props_under(rule: DictRule, schema: &Schema, cap: Option<usize>) -> WriterProperties {
-        if let DictRule::Writer = rule {
-            return writer_props(schema, cap);
+        match rule {
+            DictRule::WriterUnplanned => return writer_props(schema, cap),
+            DictRule::Planned { .. } => panic!("a planned rule needs the batches: props_for"),
+            _ => {}
         }
         let mut b = WriterProperties::builder().set_compression(codec());
         if let Some(n) = cap {
@@ -4367,7 +4984,7 @@ mod writer_bench {
             DictRule::GlobalLimited => {
                 b = b.set_dictionary_page_size_limit(16 * 1024);
             }
-            DictRule::Writer => unreachable!("returned above"),
+            DictRule::WriterUnplanned | DictRule::Planned { .. } => unreachable!("above"),
         }
         b.build()
     }
@@ -4376,7 +4993,7 @@ mod writer_bench {
     /// any timer the caller keeps, so only the encode differs between arms.
     fn write_under(path: &str, cols: Vec<Col>, rule: DictRule, cap: Option<usize>) -> u64 {
         let (schema, batch) = cols_to_batch(path, cols).unwrap();
-        let props = props_under(rule, &schema, cap);
+        let props = props_for(rule, &schema, cap, std::slice::from_ref(&batch));
         let f = std::fs::File::create(path).unwrap();
         let mut w = ArrowWriter::try_new(f, schema, Some(props)).unwrap();
         w.write(&batch).unwrap();
@@ -4437,7 +5054,7 @@ mod writer_bench {
         // `memory_size` (its in-progress row group: compressed pages plus the buffered values
         // of each column's open page), sampled after every batch.
         let rewrite = |path: &str, rule: DictRule| -> (u64, f64, usize) {
-            let props = props_under(rule, &table.schema, cap);
+            let props = props_for(rule, &table.schema, cap, &table.batches);
             let t = Instant::now();
             let f = std::fs::File::create(path).unwrap();
             let mut w = ArrowWriter::try_new(f, table.schema.clone(), Some(props)).unwrap();

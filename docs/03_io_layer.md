@@ -186,6 +186,40 @@ writers (`write_table`, `write_batches`, `BatchWriter::new`) are byte-identical
 to parquet-rs's defaults. This is step 3 of R1 in the 2026-09-25 performance
 survey.
 
+#### Float encodings planned from the first rows
+
+A capped writer does not decide its float dictionaries blind. Before it encodes
+a byte it holds its first `cap / 4` rows (`plan_sample_rows`, whatever chunks
+they arrive in), and `EncodingPlan::of` looks at every FLOAT and DOUBLE leaf,
+scalar or list item:
+
+- a leaf with at least 4,096 sampled values of which more than 80% are distinct
+  (`PLAN_PLAIN_ABOVE_DISTINCT`, counted by bit pattern as parquet's dictionary
+  interns them) is written PLAIN from its first page;
+- every other float leaf keeps the c = 0.5 dictionary limit of `writer_props`,
+  sized from the leaf's values per row group (sampled values per row times the
+  cap) instead of its rows, so a list leaf keeps parquet's 1 MB default where
+  the row-sized limit cut the chromatogram traces' dictionaries at 128 KB.
+
+The held batches are then encoded in the order and the chunks they arrived in.
+The unplanned rule fell back to PLAIN only after the dictionary filled, and the
+pages before the fallback kept their dictionary; the plan does not pay for that
+prefix. Measured on the AIF artifacts at their own row-group sizes
+(`bench_rewrite_a_real_artifact`, against the unplanned layout): features
+-8.6%, psms_competed -14.9%, chromatograms -6.3%, spectra_ms2 -0.2%. Encoding
+is also cheaper where a column skips dictionary interning: the competed
+rewrite took 0.54 s against 1.31 s and its writer peak `memory_size` fell from
+620 to 297 MB; the features rewrite 0.65 s against 1.00 s, 316 to 269 MB.
+
+Values are unchanged; bytes and content hashes of capped writers change;
+uncapped writers do not plan and are byte-identical to parquet-rs's defaults.
+The same rows plan the same encodings in any chunking
+(`the_plan_depends_on_the_rows_not_the_chunks`), so the output stays
+deterministic. `MUMDIA_PARQUET_PLAN=0` restores the unplanned layout, for a
+byte comparison against a binary from before the plan. A pooled table spliced
+from band artifacts carries each band's own plan in its row groups, which is
+legal parquet. This is F2 of the 2026-09-25 performance survey.
+
 ### Read side: Parquet -> `Table` -> typed `Vec`
 
 `Table` (`table.rs:200-204`) holds the `Arc<Schema>`, the `Vec<RecordBatch>`,

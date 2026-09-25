@@ -784,7 +784,8 @@ listed with the file it is in.
 | `MUMDIA_NN_WARM_EPOCHS` | sidecar | `0` | `scripts/nn_rescore_worker.py:622` |
 | `MUMDIA_NN_WARM_START` | sidecar | `0` | `scripts/nn_rescore_worker.py:621` |
 | `MUMDIA_NN_WD` | sidecar | `1e-4` | `scripts/nn_rescore_worker.py:635` |
-| `MUMDIA_PARQUET_COMPRESSION` | engine | none (unset means off) | `rust/mumdia/crates/mumdia-io/src/table.rs:61` |
+| `MUMDIA_PARQUET_COMPRESSION` | engine | none (unset means off) | `rust/mumdia/crates/mumdia-io/src/table.rs:62` |
+| `MUMDIA_PARQUET_PLAN` | engine | none (unset means off) | `rust/mumdia/crates/mumdia-io/src/table.rs:385` |
 | `MUMDIA_PEPTDEEP_DEVICE` | sidecar | `"auto"` | `scripts/peptdeep_worker.py:214` |
 | `MUMDIA_PYTHON` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:233` |
 | `MUMDIA_PYTHON_DEEPLC` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:232` |
@@ -805,7 +806,7 @@ listed with the file it is in.
 | `ProgramFiles(x86)` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:202` |
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:242` |
 
-68 variables are read: 18 engine-side, 53 sidecar-side, 3 on both sides.
+69 variables are read: 19 engine-side, 53 sidecar-side, 3 on both sides.
 
 ### Variables the code sets
 
@@ -856,6 +857,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-19 structs and 193 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 25 enumerations, 1 named profile(s), 68 environment variables read and 19 set.
+19 structs and 193 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 25 enumerations, 1 named profile(s), 69 environment variables read and 19 set.
 
 20 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
