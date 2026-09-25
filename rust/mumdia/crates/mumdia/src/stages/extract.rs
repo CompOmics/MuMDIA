@@ -18,7 +18,7 @@ use std::time::Instant;
 use anyhow::Result;
 use mumdia_core::config::{ExtractConfig, GateMode, PeakClaim};
 use mumdia_core::schema::artifact;
-use mumdia_io::report::ArtifactReport;
+use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{write_table, Col, TableFile, TableWriter};
 use serde_json::json;
 use tracing::{info, warn};
@@ -2080,6 +2080,13 @@ fn extract_twopass_windows(
 }
 
 pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
+    run_hashed(p).map(|(psms, chrom)| (psms.rows, chrom.rows))
+}
+
+/// [`run`], returning each output's row count and the content hash its report records
+/// (`psms_extracted`, then `chromatograms`), so an orchestrator can record both artifacts
+/// without reading and hashing them again.
+pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     let t0 = Instant::now();
     // Neither output may be one of the inputs (docs/31 F6).
     let inputs = [
@@ -3691,11 +3698,12 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("accepted".to_string(), json!(n_accepted));
     stats.insert("scan_window".to_string(), json!(scan_window));
+    let mut written: Vec<Written> = Vec::with_capacity(2);
     for (path, schema, rows) in [
         (p.out_psms, artifact::PSMS_EXTRACTED, n_psms),
         (p.out_chrom, artifact::CHROMATOGRAMS, n_chrom),
     ] {
-        ArtifactReport {
+        let report = ArtifactReport {
             logical_name: schema.0.to_string(),
             schema_name: schema.0.to_string(),
             schema_version: schema.1,
@@ -3716,8 +3724,9 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             stats: stats.clone(),
             model_identity: None,
             elapsed_ms: elapsed,
-        }
-        .write_for(path)?;
+        };
+        report.write_for(path)?;
+        written.push(report.written());
     }
 
     info!(
@@ -3726,7 +3735,9 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         elapsed_ms = elapsed,
         "extract: done"
     );
-    Ok((n_psms, n_chrom))
+    let chrom = written.pop().expect("two reports written");
+    let psms = written.pop().expect("two reports written");
+    Ok((psms, chrom))
 }
 
 #[cfg(test)]
