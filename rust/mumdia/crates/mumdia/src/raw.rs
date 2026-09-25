@@ -799,57 +799,7 @@ pub fn ensure_mzml_all(
             "convert: converting the vendor inputs concurrently (convert.parallel_conversions)"
         );
     }
-    map_bounded(inputs, limit, |m| ensure_mzml(m, cfg, fallback_dir))
-}
-
-/// Apply `f` to every item on at most `limit` threads, returning the results in item
-/// order, or the error of the lowest-index item that failed.
-///
-/// Once any item has failed no further item is started. With `limit <= 1` this is the
-/// plain serial loop, on the calling thread.
-fn map_bounded<T, R, F>(items: &[T], limit: usize, f: F) -> Result<Vec<R>>
-where
-    T: Sync,
-    R: Send,
-    F: Fn(&T) -> Result<R> + Sync,
-{
-    if limit <= 1 || items.len() <= 1 {
-        return items.iter().map(&f).collect();
-    }
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Mutex;
-    let next = AtomicUsize::new(0);
-    let failed = AtomicBool::new(false);
-    let slots: Vec<Mutex<Option<Result<R>>>> = items.iter().map(|_| Mutex::new(None)).collect();
-    std::thread::scope(|scope| {
-        for _ in 0..limit.min(items.len()) {
-            scope.spawn(|| loop {
-                if failed.load(Ordering::SeqCst) {
-                    return;
-                }
-                let i = next.fetch_add(1, Ordering::SeqCst);
-                let Some(item) = items.get(i) else {
-                    return;
-                };
-                let r = f(item);
-                if r.is_err() {
-                    failed.store(true, Ordering::SeqCst);
-                }
-                *slots[i].lock().unwrap_or_else(|p| p.into_inner()) = Some(r);
-            });
-        }
-    });
-    // Items are claimed in index order, so the started items are a prefix of the list
-    // and every failure lies inside it: walking the slots in order meets the
-    // lowest-index error before it can meet a slot that was never started.
-    let mut out = Vec::with_capacity(items.len());
-    for (i, slot) in slots.into_iter().enumerate() {
-        match slot.into_inner().unwrap_or_else(|p| p.into_inner()) {
-            Some(r) => out.push(r?),
-            None => bail!("internal: input {i} was never converted and no earlier one failed"),
-        }
-    }
-    Ok(out)
+    crate::sched::map_bounded(inputs, limit, |m| ensure_mzml(m, cfg, fallback_dir))
 }
 
 pub fn ensure_mzml(
@@ -1670,73 +1620,6 @@ mod tests {
         assert!(!stem_is_ambiguous(&e, "sample", &only));
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&e);
-    }
-
-    #[test]
-    fn bounded_conversion_keeps_input_order_and_the_concurrency_bound() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let items: Vec<usize> = (0..12).collect();
-        let live = AtomicUsize::new(0);
-        let peak = AtomicUsize::new(0);
-        let out = map_bounded(&items, 3, |&i| {
-            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
-            peak.fetch_max(now, Ordering::SeqCst);
-            // Later items finish first, so any reordering would show.
-            std::thread::sleep(std::time::Duration::from_millis(30 - 2 * i as u64));
-            live.fetch_sub(1, Ordering::SeqCst);
-            Ok(i * 10)
-        })
-        .unwrap();
-        assert_eq!(out, (0..12).map(|i| i * 10).collect::<Vec<_>>());
-        let peak = peak.load(Ordering::SeqCst);
-        assert!(peak <= 3, "at most `limit` at once, saw {peak}");
-        assert!(
-            peak >= 2,
-            "the bound is a bound, not a serial loop: saw {peak}"
-        );
-    }
-
-    #[test]
-    fn bounded_conversion_reports_the_first_failure_in_input_order_and_stops() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let items: Vec<usize> = (0..40).collect();
-        let started = AtomicUsize::new(0);
-        let err = map_bounded(&items, 4, |&i| {
-            started.fetch_add(1, Ordering::SeqCst);
-            // Item 5 fails slowly, item 6 fails at once: the reported error must still be
-            // item 5's, as the serial loop would have reported.
-            match i {
-                5 => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    bail!("input 5 failed")
-                }
-                6 => bail!("input 6 failed"),
-                // Slow enough that the other workers cannot claim every remaining item
-                // before item 6's failure is seen.
-                _ => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    Ok(i)
-                }
-            }
-        })
-        .unwrap_err();
-        assert_eq!(err.to_string(), "input 5 failed");
-        assert!(
-            started.load(Ordering::SeqCst) < items.len(),
-            "no conversion may start after one has failed"
-        );
-        // Serial (limit 1) stops at the first failure too.
-        let n = AtomicUsize::new(0);
-        let err = map_bounded(&items, 1, |&i| {
-            n.fetch_add(1, Ordering::SeqCst);
-            if i == 2 {
-                bail!("two")
-            }
-            Ok(i)
-        })
-        .unwrap_err();
-        assert_eq!(err.to_string(), "two");
-        assert_eq!(n.load(Ordering::SeqCst), 3);
     }
 
     #[test]

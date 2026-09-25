@@ -438,8 +438,34 @@ while read -r f; do
 done < "$work/exp_files.txt"
 [ "$n_tables" -ge 20 ] \
     || { echo "only $n_tables experiment tables compared; expected at least 20"; exit 1; }
+# `parallel_runs = "auto"`: the other scheduler (one run per 16 threads, each chain in a
+# thread pool of its own, pulled from a queue). At --threads 32 it runs both chains at once
+# in two 16-thread pools, and on Linux the first chain runs alone to be measured first.
+# Every table must still be the sequential experiment's.
+"$PY" - "$cfg" "$work/exp_auto.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("experiment", {})["parallel_runs"] = "auto"
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+"$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" \
+    --run-names a --run-names b --threads 32 \
+    --out-dir "$work/exp_auto" --config "$work/exp_auto.json" > "$work/exp_auto.log" 2>&1 \
+    || { tail -30 "$work/exp_auto.log"; echo "run-experiment with parallel_runs = auto failed"; exit 1; }
+grep -q "each in a pool of its own (parallel_runs = auto)" "$work/exp_auto.log" \
+    || { echo "parallel_runs = auto did not take the pooled path"; exit 1; }
+(cd "$work/exp_auto" && find . -type f \( -name '*.parquet' -o -name '*.tsv' \) | sort) \
+    > "$work/exp_auto_files.txt"
+diff "$work/exp_files.txt" "$work/exp_auto_files.txt" > /dev/null \
+    || { echo "parallel_runs = auto wrote a different set of tables"; \
+         diff "$work/exp_files.txt" "$work/exp_auto_files.txt"; exit 1; }
+while read -r f; do
+    cmp -s "$work/exp/$f" "$work/exp_auto/$f" \
+        || { echo "parallel_runs = auto changed $f"; exit 1; }
+done < "$work/exp_files.txt"
 printf 'this is not an mzML file\n' > "$work/fixture_bad.mzML"
-for exp_cfg in "$cfg" "$work/exp_par.json"; do
+for exp_cfg in "$cfg" "$work/exp_par.json" "$work/exp_auto.json"; do
     rm -rf "$work/exp_fail"
     if "$BIN" run-experiment --fasta test_data/fixture.fasta \
         --mzml "$work/fixture.mzML" --mzml "$work/fixture_bad.mzML" \
@@ -456,7 +482,7 @@ for exp_cfg in "$cfg" "$work/exp_par.json"; do
             || { echo "run a reached $f although run b's conversion failed ($exp_cfg)"; exit 1; }
     done
 done
-echo "    ok: $n_tables tables byte-identical under parallel_runs = 2; a failed conversion stops before any seed"
+echo "    ok: $n_tables tables byte-identical under parallel_runs = 2 and auto; a failed conversion stops before any seed"
 
 # 5c. The DeepLC branches of the orchestrators, with a stub worker.
 #

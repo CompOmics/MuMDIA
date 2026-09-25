@@ -867,6 +867,16 @@ sequential behavior. Runs are independent so raising it scales nearly linearly i
 wall time, but each concurrent run holds its own extraction working set, so the
 practical ceiling is memory rather than cores. Results are unaffected: chunks are
 processed in index order and completion order never reaches the output.
+`"auto"` (stored as `0`, so the canonical configuration of every numeric setting is
+unchanged) is a second scheduler (`sched::RunConcurrency`): one run per 16 threads of
+`--threads` at most, never more than the runs, each concurrent chain inside a rayon pool
+of its own `threads / runs` threads, and a chain started as soon as a slot frees rather
+than at a chunk boundary. On Linux the first chain that runs alone is measured and the
+rest run at most `0.7 x (MemAvailable + VmRSS) / VmHWM` at once; elsewhere there is no
+memory reading and the sizing uses threads only. It is opt-in because a stage in a
+narrower pool can lay out intermediate files differently and a per-run DeepLC worker
+predicts on fewer torch threads; the smoke test asserts that every parquet and TSV of the
+two-run fixture experiment is byte-identical to the sequential one.
 `rt_library_scope` (default `first_run_only`, and still accepted under its old name
 `finetune_scope`) is consulted whenever the library's retention times are adapted to a
 run: `rt_im_train.finetune_deeplc` or `rt_im_train.multihead_calibration`. See

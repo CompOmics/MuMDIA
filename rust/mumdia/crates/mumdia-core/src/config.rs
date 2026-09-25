@@ -1976,11 +1976,34 @@ pub enum Handoff {
     Raw,
 }
 
+/// `experiment.parallel_runs`: a count, or `"auto"`, which is stored as `0`.
+///
+/// Stored as a plain `usize` so the canonical configuration (and with it the config hash)
+/// of every existing setting is unchanged, and so the settings form keeps it a number.
+fn de_parallel_runs<'de, D>(d: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Runs {
+        Count(usize),
+        Word(String),
+    }
+    match Runs::deserialize(d)? {
+        Runs::Count(n) => Ok(n),
+        Runs::Word(w) if w.trim().eq_ignore_ascii_case("auto") => Ok(0),
+        Runs::Word(w) => Err(serde::de::Error::custom(format!(
+            "experiment.parallel_runs must be a number of runs or \"auto\" (got \"{w}\")"
+        ))),
+    }
+}
+
 /// Options for the experiment-wide orchestrator (`mumdia run-experiment`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExperimentConfig {
-    /// How many per-run search chains to execute concurrently.
+    /// How many per-run search chains to execute concurrently, or `"auto"`.
     ///
     /// 1 (default) is strictly sequential, i.e. the historical behaviour. Runs are
     /// independent, so raising this scales nearly linearly in wall time, but EACH
@@ -1988,7 +2011,26 @@ pub struct ExperimentConfig {
     /// library), so the practical ceiling is memory, not cores. Raise it deliberately
     /// after checking peak RSS for a single run; 2-4 is a reasonable start on a
     /// large-memory machine. Results are unaffected: chunks are processed in index
-    /// order and completion order never reaches the output.
+    /// order and completion order never reaches the output. An explicit number runs the
+    /// chains in chunks of that size on the engine's one thread pool, as it always has.
+    ///
+    /// `"auto"` (also written `0`) sizes the concurrency from the thread budget: at most
+    /// one run per 16 threads of `--threads`, and never more than the runs left. Each
+    /// concurrent chain then runs in a thread pool of its own, `threads / runs` wide, so
+    /// extract's fan-out, the feature loaders and a per-run DeepLC worker are sized to that
+    /// run's share instead of each to the whole pool, and a run starts as soon as a slot is
+    /// free rather than at a chunk boundary. On Linux the first chain that runs alone is
+    /// measured, and the rest run at most `0.7 x (MemAvailable + resident) / peak` at once,
+    /// where the peak is the process high-water mark after that chain (`VmHWM`, which
+    /// includes everything the process held before it, so the bound is conservative).
+    /// Elsewhere there is no memory reading, and the log says the sizing used threads only.
+    /// Conversion and seeding, which run before any chain, use the thread-sized count.
+    /// The rows are the same as at `1`; a stage inside a narrower pool can lay out its
+    /// intermediate files differently, as a different `--threads` does, and a per-run
+    /// DeepLC worker predicts on fewer torch threads, which can move the adapted library in
+    /// the last bits. Hence opt-in. To validate on a host, run one experiment at `1` and at
+    /// `"auto"` and compare `peptides.tsv` and `proteins.tsv`. Not measured at scale.
+    #[serde(deserialize_with = "de_parallel_runs")]
     pub parallel_runs: usize,
     /// How often the library's retention times are adapted to a run: once on the first
     /// run and reused (`first_run_only`, the default) or separately for every run
@@ -2684,7 +2726,6 @@ impl Config {
                 "extract.presence_min_fragments",
                 self.extract.presence_min_fragments,
             ),
-            ("experiment.parallel_runs", self.experiment.parallel_runs),
             (
                 "convert.parallel_conversions",
                 self.convert.parallel_conversions,
@@ -3131,6 +3172,25 @@ mod tests {
     }
 
     #[test]
+    fn experiment_parallel_runs_accepts_auto_as_zero() {
+        // "auto" is stored as 0, so the canonical JSON of every numeric setting, and so
+        // its config hash, is what it was before the word existed.
+        for text in [
+            r#"{"experiment":{"parallel_runs":"auto"}}"#,
+            r#"{"experiment":{"parallel_runs":"AUTO"}}"#,
+            r#"{"experiment":{"parallel_runs":0}}"#,
+        ] {
+            let c = Config::from_json(text).expect("auto parses");
+            assert_eq!(c.experiment.parallel_runs, 0, "{text}");
+        }
+        let err = Config::from_json(r#"{"experiment":{"parallel_runs":"many"}}"#)
+            .expect_err("an unknown word is refused");
+        assert!(err.to_string().contains("parallel_runs"), "{err}");
+        let three = Config::from_json(r#"{"experiment":{"parallel_runs":3}}"#).unwrap();
+        assert!(three.canonical_json().contains(r#""parallel_runs":3"#));
+    }
+
+    #[test]
     fn default_roundtrips() {
         let c = Config::default();
         let j = serde_json::to_string(&c).unwrap();
@@ -3191,7 +3251,6 @@ mod tests {
             r#"{"rt_im_train":{"window_holdout_frac":1.0}}"#,
             r#"{"rt_im_train":{"p_rt":0.0}}"#,
             r#"{"search_seed":{"min_matched_peaks":0}}"#,
-            r#"{"experiment":{"parallel_runs":0}}"#,
             r#"{"convert":{"parallel_conversions":0}}"#,
             r#"{"rescore":{"train_neg_ratio":-1.0}}"#,
             r#"{"predict_frag":{"top_n_fragments":0}}"#,

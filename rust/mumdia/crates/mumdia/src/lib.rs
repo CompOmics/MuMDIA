@@ -18,6 +18,7 @@ pub mod python;
 pub mod quant_lfq;
 pub mod raw;
 pub mod rescoring;
+pub mod sched;
 pub mod sidecar;
 pub mod solve;
 pub mod spectra;

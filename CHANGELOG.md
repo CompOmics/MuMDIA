@@ -43,6 +43,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **`experiment.parallel_runs = "auto"` sizes the per-run concurrency from the thread
+  budget.** One run per 16 threads of `--threads` at most, never more than the runs, and
+  each concurrent chain runs in a rayon pool of its own `threads / runs` threads, so
+  extract's fan-out, the feature loaders and a per-run DeepLC worker see that run's share
+  instead of each the whole pool. Chains are pulled from a queue, so a slow run no longer
+  holds its chunk-mates' slots idle. On Linux the first chain that runs alone is measured
+  (`VmHWM` against `MemAvailable`) and bounds how many run at once after it; elsewhere
+  the sizing uses threads only and the log says so. `0` means the same. An explicit
+  number keeps the chunked scheduler on the engine's one pool, and the default stays 1.
+  Opt-in because a narrower pool can lay out intermediate files differently and a
+  per-run DeepLC worker predicts on fewer torch threads. The smoke test checks that
+  every parquet and TSV of the two-run fixture experiment is byte-identical to the
+  sequential run; validate on real data by running one experiment at `1` and at
+  `"auto"` and comparing `peptides.tsv` and `proteins.tsv`. Not measured at scale.
 - **`extract.chromatogram_schema = 2`, an opt-in chromatogram layout (schema version 2)
   with identical downstream tables.** Each candidate's retention-time axis is stored once
   per parquet row group instead of on every row, each intensity trace from its first to
