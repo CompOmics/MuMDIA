@@ -128,7 +128,9 @@ immunopeptidomics run). `the_streamed_psms_table_is_the_write_table_file` checks
 bytes at 0, 1, 65,536, 65,537 and 131,075 rows, with every optional column group.
 The one exception is `emit_demix_features`: its five columns are patched in after the
 candidate loop, so the rows are kept whole and written at the end through
-`write_table`, which produces the same chunks. The stage logs `extract:
+`write_table_hashed`, which produces the same chunks. Either way the table, like the
+chromatograms, is hashed as it is written, so the report's content hash needs no
+read-back (`docs/03_io_layer.md`, "Hash on write"). The stage logs `extract:
 psms_extracted writer` with the row count, whether the table was streamed and the
 writer's busy time.
 
@@ -186,6 +188,15 @@ the ~2.1B 32-bit `ListArray` offset ceiling when gates are opened wide
 (`extract.rs:2534`). `frag_name` is written as a string but the library stores
 fragment names as interned u16 dictionary ids, resolved back through
 `Library::frag_name_str` (`extract.rs:2137`).
+
+The table is written in 65,536-row groups (`CHROM_ROW_GROUP_ROWS`) with the
+`rt` column PLAIN (`TableWriter::with_plain_column("rt")`): every fragment row
+of a candidate carries the same axis, and snappy shortens those repeated PLAIN
+runs far better than a dictionary's bit-packed indices. On the AIF
+chromatograms that is 12.0% smaller than the planned dictionary (160.9 against
+182.8 MB) with identical values. The other float columns keep the writer's
+planned encodings (docs/03_io_layer.md, "Float encodings planned from the first
+rows").
 
 ### Output: top-K peaks sidecar (`<out_psms>.peaks.parquet`)
 

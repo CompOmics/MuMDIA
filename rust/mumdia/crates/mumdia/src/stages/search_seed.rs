@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use mumdia_core::config::{MatcherKind, SearchSeedConfig};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
-use mumdia_io::table::{write_table, Col};
+use mumdia_io::table::{write_table_hashed, Col};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -179,7 +179,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
 /// [`run`], returning the output's row count and the content hash its report records, so
 /// an orchestrator can record the artifact without reading and hashing it again.
 pub fn run_hashed(p: SearchSeedParams) -> Result<Written> {
-    run_returning_scans(p).map(|(written, _)| written)
+    run_returning_scans(p).map(|(w, _)| w)
 }
 
 /// [`run_hashed`], handing back the MS2 scans when the stage decoded them itself (`None`
@@ -487,7 +487,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
         "search-seed: mass recalibration"
     );
 
-    let n = write_table(
+    let seed_written = write_table_hashed(
         p.out,
         vec![
             Col::U32("candidate_id".into(), cid_c),
@@ -509,6 +509,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             Col::U32("scan_index".into(), scan_c),
         ],
     )?;
+    let n = seed_written.rows;
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
@@ -520,7 +521,8 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
         schema_version: artifact::SEED_PSMS.1,
         stage: "search-seed".to_string(),
         rows: n,
-        content_hash: mumdia_io::hash::blake3_file(p.out)?,
+        // Computed while the table was written.
+        content_hash: seed_written.content_hash,
         params: json!({
             "fragment_tol_ppm": p.cfg.fragment_tol_ppm,
             "report_psms": p.cfg.report_psms,

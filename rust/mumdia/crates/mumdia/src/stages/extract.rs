@@ -19,7 +19,9 @@ use anyhow::Result;
 use mumdia_core::config::{ExtractConfig, GateMode, PeakClaim};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
-use mumdia_io::table::{write_table, Col, TableFile, TableWriter, WRITE_TABLE_CHUNK_ROWS};
+use mumdia_io::table::{
+    write_table, write_table_hashed, Col, TableFile, TableWriter, WRITE_TABLE_CHUNK_ROWS,
+};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -2910,12 +2912,13 @@ impl PsmRows {
 /// `psms_extracted` as the candidate loop produces it (X7).
 ///
 /// Streamed, every `WRITE_TABLE_CHUNK_ROWS` pushed rows are written as one chunk through a
-/// `TableWriter` opened as `write_table` opens it, and `finish` writes the short tail, or
-/// the one empty chunk that fixes the schema of an empty table, then the footer. That is
-/// the chunk sequence `write_table` cuts from the whole table, so the file is the
+/// `TableWriter` opened as `write_table_hashed` opens it, and `finish` writes the short
+/// tail, or the one empty chunk that fixes the schema of an empty table, then the footer.
+/// That is the chunk sequence `write_table` cuts from the whole table, so the file is the
 /// `write_table` file (`the_streamed_psms_table_is_the_write_table_file`). Unstreamed, the
-/// rows are kept whole and `finish` hands them to `write_table`; the demix pass needs that,
-/// because it patches rows after the loop.
+/// rows are kept whole and `finish` hands them to `write_table_hashed`; the demix pass
+/// needs that, because it patches rows after the loop. Either way the file is hashed as it
+/// is written, so its report needs no read-back (docs/03_io_layer.md, "Hash on write").
 struct PsmStream {
     /// The rows not yet written; unstreamed, every row.
     rows: PsmRows,
@@ -2932,7 +2935,7 @@ impl PsmStream {
     fn new(path: &str, streamed: bool, offset: u32) -> PsmStream {
         PsmStream {
             rows: PsmRows::default(),
-            writer: streamed.then(|| TableWriter::new(path)),
+            writer: streamed.then(|| TableWriter::new(path).with_content_hash()),
             path: path.to_string(),
             offset,
             busy: std::time::Duration::ZERO,
@@ -2954,8 +2957,9 @@ impl PsmStream {
         Ok(())
     }
 
-    /// Write what is pending and publish the table: the row count and the total write time.
-    fn finish(mut self, cfg: &ExtractConfig) -> Result<(u64, std::time::Duration)> {
+    /// Write what is pending and publish the table: its rows and content hash, and the
+    /// total write time.
+    fn finish(mut self, cfg: &ExtractConfig) -> Result<(Written, std::time::Duration)> {
         let t = Instant::now();
         let n = match self.writer.take() {
             Some(mut w) => {
@@ -2965,9 +2969,9 @@ impl PsmStream {
                 if self.rows.len() > 0 || w.rows() == 0 {
                     w.write_cols(self.rows.take_cols(self.offset, cfg))?;
                 }
-                w.close()?
+                w.close_hashed()?
             }
-            None => write_table(&self.path, self.rows.take_cols(self.offset, cfg))?,
+            None => write_table_hashed(&self.path, self.rows.take_cols(self.offset, cfg))?,
         };
         self.busy += t.elapsed();
         Ok((n, self.busy))
@@ -2981,14 +2985,16 @@ impl PsmStream {
 /// that point. It is then not published: the writer is dropped unclosed, which removes its
 /// temporary file (`AtomicPath`), and a chromatograms table already at the path stays as
 /// it was, as the `psms_extracted` one does. Publishing it would put a truncated table
-/// beside an older `psms_extracted`, a pair no extract wrote together.
-fn close_chromatograms(w: TableWriter, psms_failed: Option<anyhow::Error>) -> Result<u64> {
+/// beside an older `psms_extracted`, a pair no extract wrote together. Published, the
+/// table's rows and content hash are returned; the writer must have been built
+/// [`TableWriter::with_content_hash`].
+fn close_chromatograms(w: TableWriter, psms_failed: Option<anyhow::Error>) -> Result<Written> {
     match psms_failed {
         Some(e) => {
             drop(w);
             Err(e)
         }
-        None => w.close(),
+        None => w.close_hashed(),
     }
 }
 
@@ -3450,7 +3456,16 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
     let scan_window = p.cfg.fixed_scan_window.max(1);
 
     // Chromatogram rows stream to parquet chunk by chunk (see the candidate loop below).
-    let chrom_writer = TableWriter::new(p.out_chrom).with_row_group_rows(CHROM_ROW_GROUP_ROWS);
+    // Hashed as it is written: the report's content hash then needs no read-back of the
+    // run's largest artifact (docs/03_io_layer.md, "Hash on write"). The `rt` axis is
+    // written PLAIN: every fragment row of a candidate carries the same axis, and snappy
+    // shortens those repeated PLAIN runs far better than a dictionary's bit-packed indices
+    // (AIF chromatograms 12.0% smaller; same values, docs/03 "Float encodings planned
+    // from the first rows").
+    let chrom_writer = TableWriter::new(p.out_chrom)
+        .with_row_group_rows(CHROM_ROW_GROUP_ROWS)
+        .with_content_hash()
+        .with_plain_column("rt");
 
     // Deterministic output order (a HashMap's iteration order is randomized,
     // and downstream floating-point sums in the rescorer are order-sensitive).
@@ -4172,7 +4187,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
     // the stage means the serial encoder bounds extract; a small one means it does not.
     let mut chrom_send_blocked = std::time::Duration::ZERO;
     let mut chrom_chunks_sent = 0u64;
-    let n_chrom = std::thread::scope(|sc| -> Result<u64> {
+    let chrom_written = std::thread::scope(|sc| -> Result<Written> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Col>>(2);
         // The writer is handed back unclosed: whether the table is published depends on
         // how the loop ended (`close_chromatograms`), which only this side knows.
@@ -4466,9 +4481,9 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
     // The last, short chunk (or the one empty chunk that fixes the schema of an empty
     // table), then the footer. Unstreamed, the whole table goes through `write_table`,
     // which cuts the same chunks.
-    let (n_psms, psms_write_busy) = psms.finish(p.cfg)?;
+    let (psms_written, psms_write_busy) = psms.finish(p.cfg)?;
     info!(
-        rows = n_psms,
+        rows = psms_written.rows,
         streamed = stream_psms,
         writer_busy_ms = psms_write_busy.as_millis() as u64,
         "extract: psms_extracted writer"
@@ -4502,18 +4517,20 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("accepted".to_string(), json!(n_accepted));
     stats.insert("scan_window".to_string(), json!(scan_window));
+    let n_chrom = chrom_written.rows;
     let mut written: Vec<Written> = Vec::with_capacity(2);
-    for (path, schema, rows) in [
-        (p.out_psms, artifact::PSMS_EXTRACTED, n_psms),
-        (p.out_chrom, artifact::CHROMATOGRAMS, n_chrom),
+    for (path, schema, file) in [
+        (p.out_psms, artifact::PSMS_EXTRACTED, psms_written),
+        (p.out_chrom, artifact::CHROMATOGRAMS, chrom_written),
     ] {
         let report = ArtifactReport {
             logical_name: schema.0.to_string(),
             schema_name: schema.0.to_string(),
             schema_version: schema.1,
             stage: "extract".to_string(),
-            rows,
-            content_hash: mumdia_io::hash::blake3_file(path)?,
+            rows: file.rows,
+            // Both files were hashed while they were written.
+            content_hash: file.content_hash,
             params: json!({
                 "frag_tol_ppm": p.cfg.frag_tol_ppm,
                 "effective_frag_tol_ppm": frag_tol,
@@ -5575,13 +5592,22 @@ mod psms_stream_tests {
                 assert_eq!(s.rows.len(), (i + 1) % c, "{tag} {n}: pending rows");
                 assert_eq!(w.rows.len(), i + 1);
             }
-            assert_eq!(s.finish(cfg).unwrap().0, n as u64, "{tag} {n}");
-            assert_eq!(w.finish(cfg).unwrap().0, n as u64, "{tag} {n}");
+            let (s_written, _) = s.finish(cfg).unwrap();
+            let (w_written, _) = w.finish(cfg).unwrap();
+            assert_eq!(s_written.rows, n as u64, "{tag} {n}");
+            assert_eq!(w_written.rows, n as u64, "{tag} {n}");
             assert_eq!(
                 std::fs::read(&streamed).unwrap(),
                 std::fs::read(&whole).unwrap(),
                 "{tag}, {n} rows: streamed psms_extracted differs from write_table's"
             );
+            // The hash taken while writing is the hash of the published file.
+            assert_eq!(
+                s_written.content_hash,
+                mumdia_io::hash::blake3_file(&streamed).unwrap(),
+                "{tag} {n}: streamed hash"
+            );
+            assert_eq!(s_written.content_hash, w_written.content_hash, "{tag} {n}");
             let t = TableFile::open(&streamed).unwrap();
             assert_eq!(t.nrows, n);
             if n > 0 {
@@ -5634,7 +5660,7 @@ mod psms_stream_tests {
         write_table(&path, table(vec![1, 2, 3])).unwrap();
         let before = std::fs::read(&path).unwrap();
 
-        let mut w = TableWriter::new(&path);
+        let mut w = TableWriter::new(&path).with_content_hash();
         w.write_cols(table(vec![9])).unwrap();
         let err =
             close_chromatograms(w, Some(anyhow::anyhow!("psms chunk write failed"))).unwrap_err();
@@ -5646,9 +5672,14 @@ mod psms_stream_tests {
         );
         assert!(leftovers(&path).is_empty(), "{:?}", leftovers(&path));
 
-        let mut w = TableWriter::new(&path);
+        let mut w = TableWriter::new(&path).with_content_hash();
         w.write_cols(table(vec![9])).unwrap();
-        assert_eq!(close_chromatograms(w, None).unwrap(), 1);
+        let published = close_chromatograms(w, None).unwrap();
+        assert_eq!(published.rows, 1);
+        assert_eq!(
+            published.content_hash,
+            mumdia_io::hash::blake3_file(&path).unwrap()
+        );
         assert_eq!(
             TableFile::open(&path).unwrap().u32("candidate_id").unwrap(),
             vec![9]

@@ -331,6 +331,7 @@ fn chain_after_seed(
             cfg.rt_im_train.q_train,
             cfg.rt_im_train.window_holdout_frac,
             rayon::current_num_threads(),
+            cfg.rt_im_train.deeplc_predict_shards,
         )?;
         produced_rt_lib = Some(lib_p_mh.clone());
         lib_p_mh
@@ -359,6 +360,8 @@ fn chain_after_seed(
             // split (see run.rs); 0.0 (default) changes nothing.
             cfg.rt_im_train.window_holdout_frac,
             cfg.rng_seed,
+            rayon::current_num_threads(),
+            cfg.rt_im_train.deeplc_predict_shards,
         )?;
         produced_rt_lib = Some(lib_p_ft.clone());
         lib_p_ft
@@ -688,6 +691,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             &lib_p_base,
             &out,
             rayon::current_num_threads(),
+            cfg.rt_im_train.deeplc_predict_shards,
         )?;
         out
     } else {

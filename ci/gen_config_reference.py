@@ -1112,6 +1112,32 @@ PY_ENV_FN = re.compile(
 )
 
 
+# Variables whose unset behaviour is computed by the reading code rather than given as a
+# literal fallback, so the scanner finds no default and would otherwise print "none (unset
+# means off)" for a setting that is ON when unset. Each entry is the behaviour when the
+# variable is unset, then what setting it does, as the reading function implements it.
+# Keep an entry in step with that function; a name that no longer appears among the reads
+# is an error, so a removed variable cannot leave a stale row behind.
+COMPUTED_ENV_DEFAULTS: dict[str, str] = {
+    "MUMDIA_PARQUET_COMPRESSION": (
+        "snappy. `zstd`, or `uncompressed` / `none`, changes the codec (`table.rs` `codec`)"
+    ),
+    "MUMDIA_PARQUET_DECODE_THREADS": (
+        "automatic column groups, up to the codec pool's threads; one reader for a "
+        "coalesced scan or inside a rayon pool. `k` asks for k groups, `1` is one reader "
+        "(`table.rs` `automatic_decode_groups`)"
+    ),
+    "MUMDIA_PARQUET_PLAN": (
+        "on (capped writers plan their float encodings). `0` / `off` / `false` / `no` "
+        "restores the unplanned layout (`table.rs` `plan_enabled`)"
+    ),
+    "MUMDIA_PARQUET_THREADS": (
+        "min(`--threads`, 8), or min(cores, 8) without `--threads`. `0` or `1` is serial "
+        "(`codec.rs` `codec_threads`)"
+    ),
+}
+
+
 class EnvVar:
     """One variable, with every distinct default the code shows for it.
 
@@ -1133,6 +1159,8 @@ class EnvVar:
             self.defaults.setdefault(value, set()).add(site)
 
     def render_default(self) -> str:
+        if not self.defaults and self.name in COMPUTED_ENV_DEFAULTS:
+            return f"computed: {md_cell(COMPUTED_ENV_DEFAULTS[self.name])}"
         if not self.defaults:
             return "none (unset means off)"
         if len(self.defaults) == 1:
@@ -1152,101 +1180,8 @@ def add(store: dict[str, EnvVar], name: str, default: str | None, site: str) -> 
     var.sites.add(site)
 
 
-# The first word of an attributed element that makes it an item: an item ends at a
-# `;` or at the close of its body, never at a `,` (`fn f<A, B>()`, `impl<'a, T>`).
-# Anything else (an enum variant, a struct field, a match arm, an expression statement)
-# also ends at a `,`. A macro invocation (`thread_local! { .. }`) counts as an item.
-RUST_ITEM_KEYWORDS = frozenset(
-    (
-        "async",
-        "const",
-        "enum",
-        "extern",
-        "fn",
-        "impl",
-        "let",
-        "mod",
-        "static",
-        "struct",
-        "trait",
-        "type",
-        "union",
-        "unsafe",
-        "use",
-    )
-)
-RUST_ELEMENT_HEAD = re.compile(
-    r"(?:pub(?:\s*\([^()]*\))?\s+)?([A-Za-z_][A-Za-z0-9_]*)(\s*!)?"
-)
-
-
-def rust_attributed_end(code: str, start: int) -> int:
-    """Offset one past the element an outer attribute ending at `start` applies to.
-
-    `code` is masked (`mask_rust_literals`), so every bracket in it is code. Further
-    attributes are skipped first. The element then ends at the first of:
-
-    - a `;` outside brackets (a statement, `mod name;`, `use ..;`, a unit struct);
-    - for an item (`RUST_ITEM_KEYWORDS` or a macro), the `}` that closes its body,
-      together with a `;` or `,` that follows it;
-    - for anything else, a `,` outside brackets (a variant, a field, a match arm), or
-      the `}` closing a match arm's `=> { .. }` block, which may omit its comma;
-    - the `}` of the enclosing block, which ends the element just before it (the last
-      variant or field without a trailing comma, or a tail expression).
-
-    The last case is the safety property: an element never extends past the block
-    that contains it, so blanking it cannot remove a brace that closes real code.
-    """
-    n = len(code)
-    k = start
-    while True:
-        while k < n and code[k].isspace():
-            k += 1
-        if not code.startswith("#[", k):
-            break
-        depth = 0
-        while k < n:
-            if code[k] == "[":
-                depth += 1
-            elif code[k] == "]":
-                depth -= 1
-                if depth == 0:
-                    k += 1
-                    break
-            k += 1
-    head = RUST_ELEMENT_HEAD.match(code, k)
-    item = bool(head) and (head.group(1) in RUST_ITEM_KEYWORDS or bool(head.group(2)))
-
-    def with_separator(end: int) -> int:
-        m = re.compile(r"\s*[;,]").match(code, end)
-        return m.end() if m else end
-
-    depth = 0
-    last = k
-    arm_block = False
-    j = k
-    while j < n:
-        c = code[j]
-        if c in "([{":
-            if depth == 0 and c == "{" and not item:
-                arm_block = code[last - 2 : last] == "=>" if last >= 2 else False
-            depth += 1
-        elif c in ")]}":
-            if depth == 0:
-                return last
-            depth -= 1
-            if depth == 0 and c == "}" and (item or arm_block):
-                return with_separator(j + 1)
-        elif depth == 0 and (c == ";" or (c == "," and not item)):
-            return j + 1
-        if not c.isspace():
-            last = j + 1
-        j += 1
-    return n
-
-
 def blank_cfg_test(text: str) -> str:
-    """Blank out `#[cfg(test)]` elements, preserving offsets and line numbers.
+    """Blank out `#[cfg(test)]` blocks, preserving line numbers.
 
     The environment-variable table is built by scanning the Rust sources for reads and
     sets. Test code is not the engine, so a `std::env::set_var` inside a test must not
@@ -1263,32 +1198,110 @@ def blank_cfg_test(text: str) -> str:
     this has to cope with any source file, including an inline test module followed by
     more real code.
 
-    The attribute applies to one element, which is not always a braced item: it can
-    be an enum variant, a match arm or a statement (`inject(Fault::Publish)?;`). The
-    element's extent is `rust_attributed_end`. Counting braces from the attribute to
-    the next balanced `}` instead blanked a variant together with the rest of its
-    enum and the header of the next item, which left the file's braces unbalanced;
-    on a statement it silently blanked the code up to the end of the next block.
-    Only the element's own characters are blanked (newlines kept), so code sharing
-    its first or last line survives.
+    The attribute does not only sit on items with a body. A test-only struct field, a
+    field initializer in a struct literal, an enum variant, a match arm or a statement
+    ends at a `,` or `;` and has no braces of its own, while the item after it usually
+    has them. Searching for the next `{` from such an attribute swallowed the rest of
+    the enclosing struct literal and the next function's header, which lost a closing
+    brace and made `rust_scopes` reject the file. `cfg_test_item_end` finds the real
+    end instead. Only the attribute and its item are blanked, and a line that blanking
+    leaves holding nothing but whitespace is emptied, as the whole-line blanking did.
     """
     code = mask_rust_literals(text)
     out = list(text)
     pos = 0
     while True:
-        at = code.find("#[cfg(test)]", pos)
-        if at == -1:
+        m = CFG_TEST_ATTR.search(text, pos)
+        if m is None:
             break
-        line_start = code.rfind("\n", 0, at) + 1
-        if code[line_start:at].strip():
-            pos = at + 1
-            continue
-        end = rust_attributed_end(code, at + len("#[cfg(test)]"))
-        for k in range(at, end):
+        end = cfg_test_item_end(code, m.end())
+        for k in range(m.start(), end):
             if out[k] != "\n":
                 out[k] = " "
-        pos = max(end, at + 1)
-    return "".join(out)
+        pos = max(end, m.end())
+    old_lines = text.split(chr(10))
+    new_lines = "".join(out).split(chr(10))
+    return chr(10).join(
+        "" if new != old and not new.strip() else new
+        for old, new in zip(old_lines, new_lines)
+    )
+
+
+# A `#[cfg(test)]` attribute at the start of a line, where the whole-line blanking
+# looked for it.
+CFG_TEST_ATTR = re.compile(r"(?m)^[ \t]*#\[cfg\(test\)\]")
+
+
+def cfg_test_item_end(code: str, start: int) -> int:
+    """Offset just past the item that an attribute ending at `start` applies to.
+
+    `code` is masked (`mask_rust_literals`), so a brace, comma or semicolon that is
+    left is code. Scanning forward, at parenthesis and bracket depth 0:
+
+    - a `{` opens the item's body (a `fn`, `impl`, `mod`, a braced struct or enum
+      variant, a match arm with a block); the item ends at its matching `}`;
+    - a `;` ends a statement or a braceless item (`use`, `const`, a unit struct);
+    - a `,` ends a field, a field initializer, an enum variant or a match arm,
+      unless it separates generic parameters (inside `<...>`) or bounds after
+      `where`, which belong to an item header whose body follows;
+    - a `}`, `)` or `]` that closes an enclosing group ends the item just before it:
+      the attribute sat on the last element of that group, written without a
+      trailing comma.
+
+    Braces inside parentheses or brackets (a closure argument, a `match` passed to a
+    call) are matched and skipped, so a statement such as
+    `let l = l.with(match x { .. });` ends at its `;`.
+    """
+    n = len(code)
+    paren = angle = 0
+    after_where = False
+
+    def match_brace(open_at: int) -> int:
+        depth = 0
+        for k in range(open_at, n):
+            if code[k] == "{":
+                depth += 1
+            elif code[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    return k + 1
+        return n
+
+    j = start
+    while j < n:
+        c = code[j]
+        if c in "([":
+            paren += 1
+        elif c in ")]":
+            if paren == 0:
+                return j
+            paren -= 1
+        elif c == "{":
+            end = match_brace(j)
+            if paren == 0:
+                return end
+            j = end
+            continue
+        elif c == "}":
+            return j
+        elif paren == 0 and c == ";":
+            return j + 1
+        elif paren == 0 and c == "," and angle == 0 and not after_where:
+            return j + 1
+        elif c == "<" and j > 0 and (code[j - 1].isalnum() or code[j - 1] in "_:"):
+            angle += 1
+        elif c == ">" and angle > 0 and code[j - 1] not in "-=":
+            angle -= 1
+        elif (
+            c == "w"
+            and paren == 0
+            and code.startswith("where", j)
+            and not (code[j - 1].isalnum() or code[j - 1] == "_")
+            and not (j + 5 < n and (code[j + 5].isalnum() or code[j + 5] == "_"))
+        ):
+            after_where = True
+        j += 1
+    return n
 
 
 def scan_rust_env(
@@ -1843,7 +1856,9 @@ def build_document(inputs: Inputs) -> tuple[str, dict[str, object]]:
     a("")
     a("`Default in code` is the fallback the reading code supplies when the variable")
     a("is unset. Two workers can disagree, in which case every distinct fallback is")
-    a("listed with the file it is in.")
+    a("listed with the file it is in. A default marked `computed:` has no literal")
+    a("fallback in the code: the reading function works out the behaviour, and the")
+    a("text describes it (`COMPUTED_ENV_DEFAULTS` in `ci/gen_config_reference.py`).")
     a("")
     a("`Read at` and `Site` name the file and the enclosing function as")
     a("`path::function`: `Type::method` for a Rust method, `Trait::method` for a")
@@ -1999,6 +2014,11 @@ def build_document(inputs: Inputs) -> tuple[str, dict[str, object]]:
         "env_set": len(all_set),
         "unresolved": len(set(unresolved)),
         "warnings": len(set(warnings)),
+        # Entries of COMPUTED_ENV_DEFAULTS that no scanned source reads. The entry
+        # point refuses to write or to pass --check while this is non-empty; the
+        # builder only reports it, so it stays a pure function of `inputs` and also
+        # runs on the synthetic sources the tests give it.
+        "stale_computed_env": sorted(set(COMPUTED_ENV_DEFAULTS) - set(all_read)),
     }
     return "\n".join(out) + "\n", stats
 
@@ -2285,6 +2305,11 @@ def main(argv: list[str] | None = None) -> int:
 
     inputs = load_inputs()
     generated, stats = build_document(inputs)
+    if stats["stale_computed_env"]:
+        sys.exit(
+            "error: COMPUTED_ENV_DEFAULTS names variables no code reads: "
+            + ", ".join(stats["stale_computed_env"])
+        )
     out_path = Path(args.out)
     schema = schema_text(inputs.config_text)
     schema_path = Path(args.schema_out)

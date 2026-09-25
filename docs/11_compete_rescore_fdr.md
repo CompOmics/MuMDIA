@@ -111,7 +111,9 @@ the protein-accession-set string, a duplicate of `protein`), `pg_q_value` (f64),
 rescorer kept; `0` = the up-front apex). Plus
 `<out>.report.json` whose `params` records `classifier` (the path actually taken),
 `classifier_requested`, `strict`, `folds`, `num_iter`, `train_fdr`,
-`feature_schema_id`, `competed_inputs`, `config_hash` (rescore.rs:565-575),
+`feature_schema_id`, `competed_inputs`, `config_hash` (rescore.rs:565-575), and, when
+`nn_torch` ran, `nn_env`: the `MUMDIA_NN_*` variables the worker inherited beyond the
+ones the engine sets (`inherited_nn_env`, `docs/13_sidecars.md`),
 `model_identity` (e.g. `native-percolator-lite-v1`, `mokapot-<estimator>`
 (default `mokapot-nn`), `nn-torch-semisup-sidecar-v1`,
 `entrapment-gbm-sidecar-v1`, `native-percolator-lite-entrapment-v1`,
@@ -280,13 +282,15 @@ Its fields are wall-clock milliseconds:
 |---|---|
 | `keys_ms` | footer open, the streamed key columns (`label`, `prelim_score`, `peak_rank`, the grouping columns) and the sort of the `(key, row)` array |
 | `resolve_ms` | the unique-evidence estimate (that mode only) and `resolve_competition` |
-| `write_ms` | writing the competed table and its `<out>.schema.json` |
+| `write_ms` | writing the competed table and its `<out>.schema.json`; a spliced or rewritten table is hashed during this write (docs/03 "Hash on write") |
 | `audit_ms` | the optional `<out>.compete_audit.parquet` (0 when the audit is off) |
-| `hash_ms` | the blake3 content hash recorded in `<out>.report.json` |
+| `hash_ms` | the blake3 content hash recorded in `<out>.report.json`: near 0 when the hash came from the write or is the features hash of a hard-linked table; a read-back of the file only for a linked or copied table without `features_hash` |
 | `elapsed_ms` | the whole stage |
 
-On a wide features table `write_ms` and `hash_ms` dominate: the keys are a few
-columns, the table is every feature column. The same line names how the table was
+On a wide features table `write_ms` dominates: the keys are a few columns, the
+table is every feature column, and the hash of a spliced or rewritten table is
+computed while it is written. `hash_ms` is large only for a standalone compete
+that links or copies the features file without being given its hash. The same line names how the table was
 published (`publish`, next section).
 
 ### compete: how the competed table is published

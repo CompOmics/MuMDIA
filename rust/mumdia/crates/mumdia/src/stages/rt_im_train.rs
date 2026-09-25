@@ -11,7 +11,7 @@ use anyhow::Result;
 use mumdia_core::config::{CalibrationMethod, RtImTrainConfig};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
-use mumdia_io::table::{write_table_chunked, Col, TableFile};
+use mumdia_io::table::{write_table_chunked_hashed, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -570,7 +570,7 @@ fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(Written, Option<R
     let n = lib.nrows;
     let mut n_nonfinite_irt = 0u64;
     let mut kept = keep_windows.then(|| RtWindowsBuilder::new(n));
-    let rows = write_table_chunked(p.out_windows, n, |r| {
+    let windows = write_table_chunked_hashed(p.out_windows, n, |r| {
         let k = r.len();
         let (mut cid_c, mut cal_c, mut lo_c, mut hi_c) = (
             Vec::with_capacity(k),
@@ -616,6 +616,7 @@ fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(Written, Option<R
             Col::OptF64("im_hi".into(), vec![None; k]),
         ])
     })?;
+    let rows = windows.rows;
 
     let method = if !calibration_available {
         "unavailable"
@@ -694,7 +695,8 @@ fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(Written, Option<R
         schema_version: artifact::RUN_WINDOWS.1,
         stage: "rt-im-train".to_string(),
         rows,
-        content_hash: mumdia_io::hash::blake3_file(p.out_windows)?,
+        // Computed while the table was written.
+        content_hash: windows.content_hash,
         params: json!({"q_train": p.cfg.q_train, "p_rt": p.cfg.p_rt, "method": format!("{:?}", p.cfg.calibration_method)}),
         stats,
         model_identity: None,
