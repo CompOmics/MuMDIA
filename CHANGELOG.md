@@ -43,6 +43,26 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **`rescore.handoff = raw`, an opt-in handoff with no parquet codec on either side.** The
+  `nn_torch` worker is given a `.raw.json` description naming a row-major little-endian
+  f32 `.npy` matrix and a small parquet of the metadata columns. The engine writes each
+  decoded batch straight into the matrix, and the worker copies it into its own with no
+  decode and no column-to-row transpose, summing the float64 moments over the parquet
+  handoff's 131,072-row groups, so the scores are byte-identical to `parquet` (checked on
+  a fixture for both worker backends and on a 41,910-PSM and a 522,237-PSM competed
+  table). The file is 4 bytes a value, so it pays where the codec, not the disk, is the
+  limit. Validate a new host by rescoring one pool with each handoff and comparing
+  `psms_scored.parquet` byte for byte.
+- **`groups.pool_competed = false` has rescore read a grouped run's band tables directly.**
+  Rescore takes a table-to-source map (`competed_sources` in the scored report), so the
+  bands' competed tables in band order give exactly the rows the pooled
+  `psms_competed.parquet` holds, and that copy (about 83 GB a run on the
+  immunopeptidomics experiment) is not written. It applies only when the bands' library
+  row spans are disjoint and neither the candidate audit nor match-between-runs is on;
+  otherwise the table is pooled and the log says why. Default `true`. `psms_scored.parquet`
+  is byte-identical either way (a smoke arm compares it); the manifest then has no pooled
+  competed record, and `mumdia pool --groups-dir` rebuilds the table from the bands.
+
 - **`mumdia sub-library` subsets a library to a set of candidates.** A second pass searches
   the survivors of a first pass (or of `prescan`) as a library of their own, which means
   keeping those precursors, renumbering them to the contiguous `0..n` the fragment index
@@ -58,6 +78,24 @@ than a number. Both are recorded in every run's `manifest.json`.
   note pointing at the command.
 
 ### Changed
+
+- **Rescore removes its sidecar files once the scores are read back.** The handoff, the
+  fold keys and the worker's output were named after the output and the PID and never
+  removed, so they piled up: 7.7 GB per HYE rescore, 359 GB per immunopeptidomics pool.
+  They are now removed after `align_sidecar_scores` accepts the scores (a failed worker
+  still leaves its input), unless `MUMDIA_KEEP_HANDOFF=1`. `MUMDIA_SIDECAR_DIR` moves the
+  work directory for `run`, `run-experiment` and `rescore`, and `mumdia rescore --work-dir`
+  names it for one call. Before the handoff is written the engine asks the sidecar
+  interpreter for the directory's free space and refuses a run that cannot fit, naming
+  the directory and the way out (`MUMDIA_SIDECAR_SPACE_CHECK=0` skips it). The scores are
+  unchanged.
+- **`run-experiment` splices the per-run scored tables.** A run's rows are contiguous in the
+  pooled scored table, so the by-source split copies every single-source row group as
+  bytes and re-encodes only the boundary groups. The per-run `<run>/scored.parquet` tables
+  hold the same rows, order and values, so quant and the reports are unchanged, but their
+  bytes and the `scored[<run>]` hashes in `experiment_manifest.json` change: a spliced
+  group keeps the scored table's 1,048,576-row layout. A nullable `source` (the MBR
+  worker's output) is re-encoded as before.
 
 - **The engine holds far fewer heap blocks, because that, not memory, is what a banded
   search runs out of.** A grouped search of a 203M-precursor library died at about 290 GB
@@ -219,6 +257,30 @@ than a number. Both are recorded in every run's `manifest.json`.
   unchanged by this.
 
 ### Performance
+
+- **Rescore's feature stream and its post-classifier tail do less.** The feature stream
+  reads each row group's projected column chunks in one sequential read (the span cache;
+  `MUMDIA_WIDE_SCAN=plain` restores the plain reader, the faster one from the page cache),
+  and so does compete's pass-through copy. The parquet handoff is staged column by column
+  from the decoded batches, with no row-major round trip: the streamed handoff of the HYE
+  competed table (879,018 x 387) went from 8.4-8.7 s to 3.0-4.1 s of process wall, to the
+  same bytes. The top-K collapse map is skipped when no candidate repeats (a 9.1 GB
+  transient on the immunopeptidomics pool), the q columns are computed in place and per
+  source by slice, and a grouped run whose bands' library row spans are disjoint skips
+  the overlap dedup. Each run logs `rescore: phase timings` (the metadata pass, the
+  feature stream and its encode, the classifier, the tail) and `rescore: sidecar
+  timings`. `psms_scored.parquet` is byte-identical.
+- **Both TSV reports read the scored table in two passes.** The rows that can be printed
+  come from `label`, the transfer flag and the q columns, 3 bytes a row; the printed
+  columns are then read for those rows only. The one-pass read held four string columns
+  for every row, an estimated 55 GB on the 258.75M-row pooled table, to print about 10^5
+  rows. Both TSVs are byte-identical (compared against the one-pass code in the tests).
+- **The MBR worker keeps only the confident candidates.** Its apex maps, metadata and
+  selected-peak lookup hold only candidates that are a confident target somewhere, and the
+  transfers are flagged by one sorted-key lookup instead of a Python loop over every scored
+  row: an estimated 100 GB of worker memory and 4-6 minutes on the pooled
+  immunopeptidomics experiment with MBR on. Every output is byte-identical to the worker
+  before the change, which the tests run from git history.
 
 - **The `nn_torch` worker spends less time outside training, with byte-identical
   scores.** The parquet load decodes the next row group on a reader thread
