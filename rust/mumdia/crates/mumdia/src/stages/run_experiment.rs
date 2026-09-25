@@ -1012,15 +1012,15 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 let r = pool.install(|| -> Result<Vec<(convert::ConvertOutputs, String)>> {
                     use std::sync::atomic::Ordering;
                     let mut conv: Vec<convert::ConvertOutputs> = Vec::with_capacity(n_runs - 1);
-                    for i in 1..n_runs {
+                    for (i, (name, mzml)) in names.iter().zip(p.mzmls).enumerate().skip(1) {
                         if cancel.load(Ordering::SeqCst) {
                             return Err(cancelled());
                         }
-                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: convert, overlapped");
+                        info!(run = %name, i = i + 1, n = n_runs, "run-experiment: convert, overlapped");
                         conv.push(convert_run(
                             cfg,
-                            &p.mzmls[i],
-                            &d(&names[i]),
+                            mzml,
+                            &d(name),
                             p.top_peaks_ms2,
                             p.max_spectra,
                         )?);

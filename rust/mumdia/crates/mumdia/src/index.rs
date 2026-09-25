@@ -1012,6 +1012,9 @@ impl<'a> FragBatch<'a> {
     }
 }
 
+/// `(span, frag_offset)` as [`Library::load_impl`] takes them.
+type StageRows = (Option<(usize, usize)>, Option<usize>);
+
 impl Library {
     /// Load a library and build the bucketed inverted index.
     ///
@@ -1216,7 +1219,7 @@ impl Library {
         precursors: &str,
         fragment_offset: Option<u32>,
         precursor_span: Option<(usize, usize)>,
-    ) -> Result<(Option<(usize, usize)>, Option<usize>)> {
+    ) -> Result<StageRows> {
         match (precursor_span, fragment_offset) {
             (None, off) => Ok((None, off.map(|o| o as usize))),
             (Some((first, n)), off) => {
