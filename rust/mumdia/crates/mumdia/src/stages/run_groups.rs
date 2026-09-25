@@ -899,7 +899,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 ));
                 recs.push(chrom_written.record(
                     &format!("{}[g{:02}]", artifact::CHROMATOGRAMS.0, b.index),
-                    artifact::CHROMATOGRAMS,
+                    artifact::chromatograms(cfg.extract.chromatogram_schema),
                     &chrom,
                     "extract",
                     ch,
@@ -1183,7 +1183,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         .chain(stats.chromatograms_hash.clone().map(|h| {
             (
                 artifact::CHROMATOGRAMS.0,
-                artifact::CHROMATOGRAMS,
+                // Spliced from the bands' tables, which share the configured layout.
+                artifact::chromatograms(cfg.extract.chromatogram_schema),
                 &pooled_chrom_path,
                 stats.chromatograms,
                 h,

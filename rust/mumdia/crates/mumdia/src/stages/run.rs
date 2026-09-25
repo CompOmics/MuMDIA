@@ -668,7 +668,7 @@ pub fn run(p: RunParams) -> Result<()> {
             ));
             man.record(wchr.record(
                 artifact::CHROMATOGRAMS.0,
-                artifact::CHROMATOGRAMS,
+                artifact::chromatograms(cfg.extract.chromatogram_schema),
                 &chrom,
                 "extract",
                 &ch,

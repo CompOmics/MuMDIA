@@ -984,6 +984,18 @@ pub struct ExtractConfig {
     /// window), so the elution profile drops to zero between peaks and the
     /// features-stage boundary calling is not misled by interpolated gaps.
     pub emit_window_grid: bool,
+    /// On-disk layout of `chromatograms.parquet` (docs/15_data_dictionary.md). `1`, the
+    /// default, stores every row's retention-time axis and its whole trace, zero-filled over
+    /// the candidate's window in window-grid mode. `2` stores the axis once per candidate per
+    /// parquet row group and each trace from its first to its last nonzero value, with two
+    /// extra columns (`trace_offset`, `trace_len`) that rebuild it. Every reader (features,
+    /// quant, the pool) accepts both layouts and rebuilds the same rows bit for bit, so every
+    /// table downstream of extract is byte-identical; only the chromatogram table changes
+    /// (smaller, with a different content hash). Opt-in because a reader outside the engine
+    /// that expects one full axis per row would misread a v2 table;
+    /// `mumdia::chromatograms::rewrite` converts a table between the layouts. The pool
+    /// splices band tables of one layout only, so all bands of a grouped run share it.
+    pub chromatogram_schema: u32,
     /// m/z bucket size (power of two).
     pub bucket_size: usize,
     /// How a shared observed peak's intensity is apportioned among co-isolated,
@@ -1136,6 +1148,7 @@ impl Default for ExtractConfig {
             apex_count_window: 1,  // no rolling smoothing by default (opt-in; window 5
             // cuts AIF apex misassignment, median |dRT| 131s->9s)
             emit_window_grid: true, // zero-filled window-grid chromatograms
+            chromatogram_schema: 1, // full axis and trace on every row (v2 is opt-in)
             bucket_size: 8192,
             peak_claim: PeakClaim::None,
             claim_cues: ClaimCues::default(),
@@ -2322,6 +2335,13 @@ impl Config {
                  behaviour; K>1 retains up to K peak groups per candidate)."
                     .into(),
             ));
+        }
+        if !(1..=2).contains(&self.extract.chromatogram_schema) {
+            return Err(Invalid(format!(
+                "extract.chromatogram_schema must be 1 (full traces) or 2 (the axis once per \r
+                 candidate and trimmed traces), not {}",
+                self.extract.chromatogram_schema
+            )));
         }
         if !self.extract.gate_min_score.is_finite()
             || !(0.0..=1.0).contains(&self.extract.gate_min_score)

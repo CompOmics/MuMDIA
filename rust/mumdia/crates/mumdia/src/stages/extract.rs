@@ -649,43 +649,29 @@ type ChromOutputRow = (u32, String, f64, f64, f32, Vec<f32>, Vec<f32>);
 /// core busy within a chunk, small enough that a chunk's chromatogram rows are tens of MB.
 const CAND_CHUNK: usize = 8192;
 /// Rows per parquet row group of the chromatogram table (~64k rows of two ~60-point traces
-/// is ~30 MB uncompressed), which bounds the encoder's in-progress buffer.
-const CHROM_ROW_GROUP_ROWS: usize = 1 << 16;
+/// is ~30 MB uncompressed), which bounds the encoder's in-progress buffer. Defined with the
+/// layouts in [`crate::chromatograms`], because the v2 axis rule restarts at these
+/// boundaries; the writer takes [`crate::chromatograms::row_group_rows`], which is this
+/// unless the test knob moves it.
+const CHROM_ROW_GROUP_ROWS: usize = crate::chromatograms::ROW_GROUP_ROWS;
 
-/// One chunk of chromatogram rows, drained into exactly the column set
-/// `chromatograms.parquet` has always had.
+/// One chunk of chromatogram rows, drained into the column set of the configured layout
+/// (`extract.chromatogram_schema`, [`crate::chromatograms::Layout`]).
 #[derive(Default)]
 struct ChromChunk {
-    cid: Vec<u32>,
-    name: Vec<String>,
-    fmz: Vec<f64>,
-    obsmz: Vec<f64>,
-    pint: Vec<f32>,
-    rt: Vec<Vec<f32>>,
-    int: Vec<Vec<f32>>,
+    rows: crate::chromatograms::Rows,
 }
 
 impl ChromChunk {
     /// `offset` is the library row of this band's local id 0 (`Library::global_offset`),
     /// so the table carries library-wide ids even when the stage searched one band.
-    fn cols(mut self, offset: u32) -> Vec<Col> {
+    fn cols(mut self, offset: u32, layout: crate::chromatograms::Layout) -> Vec<Col> {
         if offset != 0 {
-            for c in &mut self.cid {
+            for c in &mut self.rows.cid {
                 *c += offset;
             }
         }
-        vec![
-            Col::U32("candidate_id".into(), self.cid),
-            Col::Str("frag_name".into(), self.name),
-            Col::F64("frag_mz".into(), self.fmz),
-            Col::F64("frag_obs_mz".into(), self.obsmz),
-            Col::F32("predicted_intensity".into(), self.pint),
-            // LargeList (64-bit offsets): the total chromatogram list-value count can exceed
-            // the ~2.1B limit of a 32-bit ListArray offset buffer when extraction accepts a
-            // very large candidate set (e.g. gates opened up).
-            Col::LargeListF32("rt".into(), self.rt),
-            Col::LargeListF32("intensity".into(), self.int),
-        ]
+        self.rows.into_cols(layout, true)
     }
 }
 
@@ -3457,15 +3443,23 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
 
     // Chromatogram rows stream to parquet chunk by chunk (see the candidate loop below).
     // Hashed as it is written: the report's content hash then needs no read-back of the
-    // run's largest artifact (docs/03_io_layer.md, "Hash on write"). The `rt` axis is
-    // written PLAIN: every fragment row of a candidate carries the same axis, and snappy
-    // shortens those repeated PLAIN runs far better than a dictionary's bit-packed indices
-    // (AIF chromatograms 12.0% smaller; same values, docs/03 "Float encodings planned
-    // from the first rows").
-    let chrom_writer = TableWriter::new(p.out_chrom)
-        .with_row_group_rows(CHROM_ROW_GROUP_ROWS)
-        .with_content_hash()
-        .with_plain_column("rt");
+    // run's largest artifact (docs/03_io_layer.md, "Hash on write"). The layout and the
+    // encodings are the shared ones ([`crate::chromatograms::writer`]: the `rt` axis PLAIN).
+    // Under v2 every row passes through one `Encoder` in table order, which counts the rows
+    // to know where each row group starts, so it and the writer take the same row-group
+    // size.
+    let chrom_layout = crate::chromatograms::Layout::from_schema_version(p.cfg.chromatogram_schema)?;
+    let chrom_rg_rows = crate::chromatograms::row_group_rows();
+    if chrom_rg_rows != CHROM_ROW_GROUP_ROWS {
+        info!(
+            rows = chrom_rg_rows,
+            "extract: chromatogram row groups resized by {}",
+            crate::chromatograms::ROW_GROUP_ROWS_ENV
+        );
+    }
+    let chrom_writer =
+        crate::chromatograms::writer(p.out_chrom, chrom_rg_rows).with_content_hash();
+    let mut chrom_encoder = crate::chromatograms::Encoder::new(chrom_rg_rows);
 
     // Deterministic output order (a HashMap's iteration order is randomized,
     // and downstream floating-point sums in the rescorer are order-sensitive).
@@ -4230,30 +4224,50 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                         psms_err = Some(e);
                         return false;
                     }
+                    let rows = &mut ch.rows;
                     for (cc, nm, fmz, omz, pint, rt, it) in chrom {
-                        ch.cid.push(cc);
-                        ch.name.push(nm);
-                        ch.fmz.push(fmz);
-                        ch.obsmz.push(omz);
-                        ch.pint.push(pint);
-                        ch.rt.push(rt);
-                        ch.int.push(it);
+                        rows.cid.push(cc);
+                        rows.name.push(nm);
+                        rows.frag_mz.push(fmz);
+                        rows.frag_obs_mz.push(omz);
+                        rows.predicted_intensity.push(pint);
+                        if chrom_layout == crate::chromatograms::Layout::V2 {
+                            // The band-local id: the offset is added to every row alike,
+                            // so it cannot change which rows share a candidate.
+                            match chrom_encoder.encode(cc, rt, it) {
+                                Ok(e) => {
+                                    rows.rt.push(e.rt);
+                                    rows.intensity.push(e.intensity);
+                                    rows.trace_offset.push(e.trace_offset);
+                                    rows.trace_len.push(e.trace_len);
+                                }
+                                Err(e) => {
+                                    psms_err = Some(e);
+                                    return false;
+                                }
+                            }
+                        } else {
+                            rows.rt.push(rt);
+                            rows.intensity.push(it);
+                        }
                     }
                 }
-                let chunk_bytes = crate::memlog::bytes_of_nested(&ch.rt)
-                    + crate::memlog::bytes_of_nested(&ch.int)
-                    + crate::memlog::bytes_of(&ch.cid)
-                    + crate::memlog::bytes_of(&ch.fmz)
-                    + crate::memlog::bytes_of(&ch.obsmz)
-                    + crate::memlog::bytes_of(&ch.pint)
-                    + ch.name.iter().map(|s| s.len()).sum::<usize>();
+                let r = &ch.rows;
+                let chunk_bytes = r.trace_bytes()
+                    + crate::memlog::bytes_of(&r.cid)
+                    + crate::memlog::bytes_of(&r.frag_mz)
+                    + crate::memlog::bytes_of(&r.frag_obs_mz)
+                    + crate::memlog::bytes_of(&r.predicted_intensity)
+                    + crate::memlog::bytes_of(&r.trace_offset)
+                    + crate::memlog::bytes_of(&r.trace_len)
+                    + r.name.iter().map(|s| s.len()).sum::<usize>();
                 chrom_bytes_total += chunk_bytes;
                 chrom_bytes_max_chunk = chrom_bytes_max_chunk.max(chunk_bytes);
                 // Hand the chunk's chromatogram rows to the writer thread. A send error means
                 // the writer failed; its error surfaces at the join below. The columns are
                 // built before the clock starts, so the timer holds only the wait for a
                 // free channel slot.
-                let cols = ch.cols(chrom_offset);
+                let cols = ch.cols(chrom_offset, chrom_layout);
                 let t_send = Instant::now();
                 let sent = tx.send(cols);
                 chrom_send_blocked += t_send.elapsed();
@@ -4380,7 +4394,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
         // A final empty chunk fixes the schema when no candidate was accepted at all. Not
         // after a failed psms_extracted write, whose table is abandoned below.
         if psms_err.is_none() {
-            let _ = tx.send(ChromChunk::default().cols(0));
+            let _ = tx.send(ChromChunk::default().cols(0, chrom_layout));
         }
         drop(tx);
         let (w, mut writer_busy) = writer
@@ -4521,7 +4535,11 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
     let mut written: Vec<Written> = Vec::with_capacity(2);
     for (path, schema, file) in [
         (p.out_psms, artifact::PSMS_EXTRACTED, psms_written),
-        (p.out_chrom, artifact::CHROMATOGRAMS, chrom_written),
+        (
+            p.out_chrom,
+            artifact::chromatograms(chrom_layout.version()),
+            chrom_written,
+        ),
     ] {
         let report = ArtifactReport {
             logical_name: schema.0.to_string(),

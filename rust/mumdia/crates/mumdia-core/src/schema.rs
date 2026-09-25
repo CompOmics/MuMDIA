@@ -25,7 +25,12 @@ pub mod artifact {
     pub const SEED_PSMS: (&str, u32) = ("seed_psms", 1);
     pub const RUN_WINDOWS: (&str, u32) = ("run_windows", 1);
     pub const PSMS_EXTRACTED: (&str, u32) = ("psms_extracted", 2);
+    /// v1: every row stores its whole `rt` axis and its whole `intensity` trace.
     pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 1);
+    /// v2, written only under `extract.chromatogram_schema = 2`: the axis once per candidate
+    /// per row group, each trace trimmed to its nonzero run, and `trace_offset` / `trace_len`
+    /// to rebuild it (`mumdia::chromatograms`). Every reader accepts both.
+    pub const CHROMATOGRAMS_V2: (&str, u32) = ("chromatograms", 2);
     /// v2: the feature columns are Float32 except the few `F64_FEATURE_COLUMNS` of
     /// `stages/features.rs`; v1 stored every feature as Float64. Every reader accepts both.
     pub const FEATURES: (&str, u32) = ("features", 2);
@@ -41,4 +46,14 @@ pub mod artifact {
     /// The candidates a grouped run's pool dropped from each band (`band`,
     /// `candidate_id`), written only under `groups.pool_chromatograms = false`.
     pub const OVERLAP_LOSERS: (&str, u32) = ("overlap_losers", 1);
+
+    /// The chromatogram schema for `extract.chromatogram_schema`: [`CHROMATOGRAMS_V2`] for 2,
+    /// else [`CHROMATOGRAMS`] (config validation admits only 1 and 2).
+    pub fn chromatograms(schema: u32) -> (&'static str, u32) {
+        if schema == CHROMATOGRAMS_V2.1 {
+            CHROMATOGRAMS_V2
+        } else {
+            CHROMATOGRAMS
+        }
+    }
 }
