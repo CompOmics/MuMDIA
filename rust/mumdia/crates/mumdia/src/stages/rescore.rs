@@ -634,6 +634,8 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     let mut classifier_used = "native_tda";
     let mut model_identity = "native-percolator-lite-v1".to_string();
     let mut qmode = QMode::Decoy;
+    // The `MUMDIA_NN_*` knobs the NN worker inherited, when it ran (see `inherited_nn_env`).
+    let mut nn_env: Option<std::collections::BTreeMap<String, String>> = None;
 
     let mut scores = if n == 0 {
         classifier_used = "not_run_empty";
@@ -689,6 +691,14 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                     info!("rescore: using PyTorch NN sidecar scores");
                     classifier_used = "nn_torch";
                     model_identity = "nn-torch-semisup-sidecar-v1".to_string();
+                    let env = inherited_nn_env(std::env::vars_os());
+                    if !env.is_empty() {
+                        info!(
+                            ?env,
+                            "rescore: the NN worker inherited these MUMDIA_NN_* variables"
+                        );
+                    }
+                    nn_env = Some(env);
                     s
                 }
                 Err(e) => {
@@ -1048,6 +1058,39 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         );
         stats.insert("entrapment_peptides_at_1pct".to_string(), json!(n_entrap_1));
     }
+    let mut params = json!({
+        "classifier": classifier_used,
+        "classifier_requested": format!("{:?}", p.cfg.classifier),
+        "strict": p.cfg.strict,
+        "folds": p.cfg.folds,
+        "num_iter": p.cfg.num_iter,
+        "train_fdr": p.cfg.train_fdr,
+        "feature_schema_id": expected_schema.schema_id,
+        "train_neg_ratio": p.cfg.train_neg_ratio,
+        "train_neg_select": format!("{:?}", p.cfg.train_neg_select).to_lowercase(),
+        "train_subsample": p.cfg.train_subsample,
+        "train_warm_epochs": p.cfg.train_warm_epochs,
+        "train_margin_frac": p.cfg.train_margin_frac,
+        "seeds": p.cfg.seeds.max(1),
+        "n_features_used": feat_names.len(),
+        "n_features_available": expected_schema.feature_columns.len(),
+        "feature_preset": if p.cfg.features.is_some() || p.cfg.features_file.is_some() {
+            "explicit".to_string()
+        } else {
+            format!("{:?}", p.cfg.feature_preset).to_lowercase()
+        },
+        "feature_selection_id": crate::stages::features::feature_schema_id(&feat_names),
+        "features_used": if feat_names.len() == expected_schema.feature_columns.len() {
+            serde_json::Value::Null
+        } else {
+            json!(feat_names)
+        },
+        "competed_inputs": p.competed,
+        "config_hash": p.config_hash,
+    });
+    if let Some(env) = &nn_env {
+        params["nn_env"] = json!(env);
+    }
     let report = ArtifactReport {
         logical_name: artifact::PSMS_SCORED.0.to_string(),
         schema_name: artifact::PSMS_SCORED.0.to_string(),
@@ -1055,36 +1098,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         stage: "rescore".to_string(),
         rows,
         content_hash: mumdia_io::hash::blake3_file(p.out)?,
-        params: json!({
-            "classifier": classifier_used,
-            "classifier_requested": format!("{:?}", p.cfg.classifier),
-            "strict": p.cfg.strict,
-            "folds": p.cfg.folds,
-            "num_iter": p.cfg.num_iter,
-            "train_fdr": p.cfg.train_fdr,
-            "feature_schema_id": expected_schema.schema_id,
-            "train_neg_ratio": p.cfg.train_neg_ratio,
-            "train_neg_select": format!("{:?}", p.cfg.train_neg_select).to_lowercase(),
-            "train_subsample": p.cfg.train_subsample,
-            "train_warm_epochs": p.cfg.train_warm_epochs,
-            "train_margin_frac": p.cfg.train_margin_frac,
-            "seeds": p.cfg.seeds.max(1),
-            "n_features_used": feat_names.len(),
-            "n_features_available": expected_schema.feature_columns.len(),
-            "feature_preset": if p.cfg.features.is_some() || p.cfg.features_file.is_some() {
-                "explicit".to_string()
-            } else {
-                format!("{:?}", p.cfg.feature_preset).to_lowercase()
-            },
-            "feature_selection_id": crate::stages::features::feature_schema_id(&feat_names),
-            "features_used": if feat_names.len() == expected_schema.feature_columns.len() {
-                serde_json::Value::Null
-            } else {
-                json!(feat_names)
-            },
-            "competed_inputs": p.competed,
-            "config_hash": p.config_hash,
-        }),
+        params,
         stats,
         model_identity: Some(model_identity),
         elapsed_ms: elapsed,
@@ -2269,7 +2283,7 @@ fn run_pin_sidecar(
         // of its own defaults, and so the folds/num_iter/train_fdr recorded in the
         // report reflect the values actually used
         // (docs/18_findings_and_decisions.md). Ignored by mokapot_worker.py,
-        // which shares this PIN contract.
+        // which shares this PIN contract. `NN_ENV_SET_BY_ENGINE` lists these names.
         .env("MUMDIA_NN_FOLDS", p.cfg.folds.to_string())
         .env("MUMDIA_NN_ITERS", p.cfg.num_iter.to_string())
         .env("MUMDIA_NN_TRAIN_FDR", p.cfg.train_fdr.to_string())
@@ -2321,6 +2335,52 @@ fn run_pin_sidecar(
     align_sidecar_scores(&orow, &osc, cid.len(), script_name)
 }
 
+/// The `MUMDIA_NN_*` variables `run_pin_sidecar` sets on the worker itself. Their values
+/// are the configured ones, which the report's `params` already records. Keep this list in
+/// step with the `.env(...)` calls there.
+const NN_ENV_SET_BY_ENGINE: [&str; 11] = [
+    "MUMDIA_NN_FOLDS",
+    "MUMDIA_NN_ITERS",
+    "MUMDIA_NN_TRAIN_FDR",
+    "MUMDIA_NN_NEG_RATIO",
+    "MUMDIA_NN_NEG_SELECT",
+    "MUMDIA_NN_TRAIN_SUB",
+    "MUMDIA_NN_WARM_START",
+    "MUMDIA_NN_WARM_EPOCHS",
+    "MUMDIA_NN_MARGIN_FRAC",
+    "MUMDIA_NN_SEEDS",
+    "MUMDIA_NN_FOLD_KEYS",
+];
+
+/// The `MUMDIA_NN_*` variables in `vars` that the NN worker inherits from this process on
+/// top of the ones `run_pin_sidecar` sets, sorted by name.
+///
+/// Several of them change the scores: `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (which
+/// `--threads` sets), `MUMDIA_NN_PARALLEL` (the keyed epoch shuffle). They reach the
+/// worker only through the environment, so without this record two runs of one config
+/// could report different identifications with nothing in `psms_scored.parquet.report.json`
+/// to say why. A name or value that is not valid Unicode is kept lossily; the worker
+/// could not read such a value as a number either.
+fn inherited_nn_env<I>(vars: I) -> std::collections::BTreeMap<String, String>
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    vars.into_iter()
+        .map(|(k, v)| {
+            // Windows names are case-insensitive, and Python's `os.environ` upper-cases
+            // them, so the worker reads `mumdia_nn_seed` as `MUMDIA_NN_SEED`.
+            let k = k.to_string_lossy();
+            let k = if cfg!(windows) {
+                k.to_ascii_uppercase()
+            } else {
+                k.into_owned()
+            };
+            (k, v.to_string_lossy().into_owned())
+        })
+        .filter(|(k, _)| k.starts_with("MUMDIA_NN_") && !NN_ENV_SET_BY_ENGINE.contains(&k.as_str()))
+        .collect()
+}
+
 /// Validate and align a sidecar's `(flat_row_id, score)` response. Every input
 /// row must occur exactly once, there may be no extras, and all scores must be
 /// finite. This is shared by PIN and entrapment sidecars.
@@ -2365,6 +2425,56 @@ fn align_sidecar_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inherited_nn_env_records_only_the_knobs_the_engine_does_not_set() {
+        use std::ffi::OsString;
+        let vars = [
+            ("MUMDIA_NN_SEED", "7"),
+            ("PATH", "/usr/bin"),
+            ("MUMDIA_NN_FOLDS", "5"),
+            ("MUMDIA_NN_PARALLEL", "3"),
+            ("MUMDIA_RESCORE_MODEL", "nn"),
+            ("MUMDIA_NN_FOLD_KEYS", "/tmp/keys.parquet"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let got = inherited_nn_env(vars);
+        let want: Vec<(&str, &str)> = vec![("MUMDIA_NN_PARALLEL", "3"), ("MUMDIA_NN_SEED", "7")];
+        assert_eq!(
+            got.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+            want,
+            "sorted by name, the engine's own variables left out"
+        );
+        assert!(inherited_nn_env(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn nn_env_set_by_engine_lists_every_variable_run_pin_sidecar_sets() {
+        // The list decides what the report calls inherited, so it must name exactly the
+        // `MUMDIA_NN_*` literals of `run_pin_sidecar`'s `.env(...)` calls.
+        let src = include_str!("rescore.rs");
+        let start = src.find("\nfn run_pin_sidecar(").expect("run_pin_sidecar");
+        let body = &src[start..];
+        // Its closing brace is the first one in column 0 (the checkout may use CRLF).
+        // `\x7d` is that brace, spelled as an escape: `ci/gen_config_reference.py` counts
+        // the braces of a `#[cfg(test)]` module without masking string literals, and a
+        // bare one here would end its blanking of this module early.
+        let body = &body[..body.find("\n\x7d").expect("end of run_pin_sidecar")];
+        let mut set: Vec<&str> = body
+            .match_indices("\"MUMDIA_NN_")
+            .map(|(i, _)| {
+                let lit = &body[i + 1..];
+                &lit[..lit.find('"').expect("closing quote")]
+            })
+            .collect();
+        set.sort_unstable();
+        set.dedup();
+        let mut listed = NN_ENV_SET_BY_ENGINE.to_vec();
+        listed.sort_unstable();
+        assert_eq!(set, listed);
+    }
 
     fn cfg_with(features: Option<Vec<&str>>, file: Option<&str>) -> RescoreConfig {
         RescoreConfig {
