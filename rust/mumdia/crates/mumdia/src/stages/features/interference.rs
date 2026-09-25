@@ -560,22 +560,28 @@ fn mean_loo(e: &Evidence, set: &[usize], tp: usize) -> f64 {
 /// Top eigenvalue and (normalized) eigenvector of a symmetric `m x m` matrix stored
 /// row-major in one buffer, via power iteration. Returns (0.0, zeros) for an empty or
 /// degenerate matrix.
+///
+/// The result is the Rayleigh quotient of the 100th iterate, as it always was, but the
+/// iteration stops as soon as the 100th iterate is KNOWN. One step is a deterministic
+/// function of the current vector, so once a step returns its input bit for bit, every
+/// later step returns it too; and once a step returns the vector of two steps before, the
+/// sequence alternates between those two for good, and the 100th iterate is whichever of
+/// them has its parity. Both tests are exact bit-pattern comparisons, never a tolerance,
+/// so the returned pair is the one the full 100 iterations return.
 fn power_top(g: &[f64], m: usize) -> (f64, Vec<f64>) {
+    const ITERATIONS: usize = 100;
     if m == 0 {
         return (0.0, Vec::new());
     }
+    let same = |a: &[f64], b: &[f64]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+    // `prev` is the iterate before `v`, `nv` the one being computed. Three buffers reused
+    // across the iterations; `nv` used to be a fresh allocation on every one of them.
     let mut v = vec![1.0 / (m as f64).sqrt(); m];
-    // Two buffers reused across the 100 iterations; `nv` used to be a fresh allocation
-    // on every one of them.
     let mut nv = vec![0.0f64; m];
-    for _ in 0..100 {
-        for i in 0..m {
-            let mut s = 0.0;
-            for j in 0..m {
-                s += g[i * m + j] * v[j];
-            }
-            nv[i] = s;
-        }
+    let mut prev: Vec<f64> = vec![0.0f64; m];
+    let mut have_prev = false;
+    for t in 1..=ITERATIONS {
+        mat_vec(g, m, &v, &mut nv);
         let norm = ss(&nv).sqrt();
         if norm <= 0.0 {
             return (0.0, vec![0.0; m]);
@@ -583,16 +589,154 @@ fn power_top(g: &[f64], m: usize) -> (f64, Vec<f64>) {
         for x in nv.iter_mut() {
             *x /= norm;
         }
+        // nv is iterate t, v is iterate t - 1, prev is iterate t - 2.
+        if same(&nv, &v) {
+            std::mem::swap(&mut v, &mut nv);
+            break;
+        }
+        if have_prev && same(&nv, &prev) {
+            // Period two from here: iterate s is iterate t when s - t is even and
+            // iterate t - 1 otherwise.
+            if (ITERATIONS - t).is_multiple_of(2) {
+                std::mem::swap(&mut v, &mut nv);
+            }
+            break;
+        }
+        std::mem::swap(&mut prev, &mut v);
         std::mem::swap(&mut v, &mut nv);
+        have_prev = true;
     }
     // Rayleigh quotient: v is unit-norm, so lambda = v^T G v.
     let mut gv = vec![0.0f64; m];
-    for i in 0..m {
-        let mut s = 0.0;
-        for j in 0..m {
-            s += g[i * m + j] * v[j];
-        }
-        gv[i] = s;
-    }
+    mat_vec(g, m, &v, &mut gv);
     (dot(&v, &gv), v)
+}
+
+/// `out[i] = sum_j g[i * m + j] * v[j]`, each sum accumulated over ascending `j` from
+/// `0.0` exactly as a row-by-row loop does, but with `j` outermost so the `m` sums advance
+/// side by side instead of as `m` serial chains. The element read is `g[i * m + j]`, not
+/// its transpose: after deflation the matrix need not be bitwise symmetric.
+fn mat_vec(g: &[f64], m: usize, v: &[f64], out: &mut [f64]) {
+    out.fill(0.0);
+    for (j, &vj) in v.iter().enumerate().take(m) {
+        for (i, o) in out.iter_mut().enumerate().take(m) {
+            *o += g[i * m + j] * vj;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `power_top` exactly as it stood before the early stop and the loop interchange: 100
+    /// row-by-row iterations. A transcription kept as the reference.
+    #[allow(clippy::needless_range_loop)]
+    fn old_power_top(g: &[f64], m: usize) -> (f64, Vec<f64>) {
+        if m == 0 {
+            return (0.0, Vec::new());
+        }
+        let mut v = vec![1.0 / (m as f64).sqrt(); m];
+        let mut nv = vec![0.0f64; m];
+        for _ in 0..100 {
+            for i in 0..m {
+                let mut s = 0.0;
+                for j in 0..m {
+                    s += g[i * m + j] * v[j];
+                }
+                nv[i] = s;
+            }
+            let norm = ss(&nv).sqrt();
+            if norm <= 0.0 {
+                return (0.0, vec![0.0; m]);
+            }
+            for x in nv.iter_mut() {
+                *x /= norm;
+            }
+            std::mem::swap(&mut v, &mut nv);
+        }
+        let mut gv = vec![0.0f64; m];
+        for i in 0..m {
+            let mut s = 0.0;
+            for j in 0..m {
+                s += g[i * m + j] * v[j];
+            }
+            gv[i] = s;
+        }
+        (dot(&v, &gv), v)
+    }
+
+    #[test]
+    fn early_stopped_power_iteration_matches_the_full_hundred_bit_for_bit() {
+        // Gram matrices of traces (the production input) and their deflations (not
+        // bitwise symmetric): one shared profile (fast convergence), independent noise (a
+        // flat spectrum, slow convergence), two interleaved components (a degenerate top
+        // eigenvalue), a negated Gram matrix, a zero matrix, and one with a NaN.
+        let mut x = 0x1234_5678_9abc_def0u64;
+        let mut unit = move || {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (x >> 33) as f64 / (1u64 << 31) as f64
+        };
+        let bits = |r: &(f64, Vec<f64>)| -> (u64, Vec<u64>) {
+            (r.0.to_bits(), r.1.iter().map(|v| v.to_bits()).collect())
+        };
+        let mut cases = 0usize;
+        for m in 0..14usize {
+            for kind in 0..6u32 {
+                let t = 20usize;
+                let traces: Vec<Vec<f64>> = (0..m)
+                    .map(|f| {
+                        (0..t)
+                            .map(|i| match kind {
+                                0 => {
+                                    (-((i as f64 - 10.0).powi(2)) / 8.0).exp() * (f as f64 + 1.0)
+                                        + 0.01 * unit()
+                                }
+                                1 => unit(),
+                                2 => {
+                                    if (f + i) % 2 == 0 {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    }
+                                }
+                                _ => unit() * 10.0,
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let mut g = vec![0.0f64; m * m];
+                for i in 0..m {
+                    for j in 0..m {
+                        g[i * m + j] = dot(&traces[i], &traces[j]);
+                    }
+                }
+                match kind {
+                    3 => g.iter_mut().for_each(|v| *v = -*v),
+                    4 => g.iter_mut().for_each(|v| *v = 0.0),
+                    5 if m > 1 => g[1] = f64::NAN,
+                    _ => {}
+                }
+                let want = old_power_top(&g, m);
+                assert_eq!(bits(&power_top(&g, m)), bits(&want), "m {m}, kind {kind}");
+                // And the deflated matrix, as `values` builds it.
+                let (lam1, v1) = want;
+                let mut d = g.clone();
+                for i in 0..m {
+                    for j in 0..m {
+                        d[i * m + j] -= lam1 * v1[i] * v1[j];
+                    }
+                }
+                assert_eq!(
+                    bits(&power_top(&d, m)),
+                    bits(&old_power_top(&d, m)),
+                    "deflated, m {m}, kind {kind}"
+                );
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 14 * 6);
+    }
 }
