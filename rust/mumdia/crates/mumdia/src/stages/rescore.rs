@@ -4620,6 +4620,123 @@ b
         assert!(text.lines().nth(1).unwrap().starts_with("psm_0\t-1\t0\t"));
     }
 
+    /// A competed-shaped parquet whose feature column `j` is Float64 when `wide[j]` and
+    /// Float32 (the same value, `v as f32`) otherwise. The values are not representable in
+    /// f32, so a column that was not narrowed, or narrowed differently, shows. Column 1
+    /// carries one null per five rows when `nulls`.
+    fn crafted_competed_widths(
+        path: &str,
+        rows: usize,
+        tag: f64,
+        feat_names: &[String],
+        wide: &[bool],
+        nulls: bool,
+    ) {
+        let cols: Vec<Col> = feat_names
+            .iter()
+            .enumerate()
+            .map(|(j, name)| {
+                let v: Vec<Option<f64>> = (0..rows)
+                    .map(|i| {
+                        if nulls && j == 1 && i % 5 == 0 {
+                            None
+                        } else {
+                            Some(tag + i as f64 * 0.1 + j as f64 * 0.013)
+                        }
+                    })
+                    .collect();
+                if wide[j] {
+                    Col::OptF64(name.clone(), v)
+                } else {
+                    Col::OptF32(
+                        name.clone(),
+                        v.into_iter().map(|x| x.map(|x| x as f32)).collect(),
+                    )
+                }
+            })
+            .collect();
+        write_table(path, cols).unwrap();
+    }
+
+    #[test]
+    fn a_pool_of_both_feature_widths_is_the_pool_of_narrowed_tables() {
+        // `rescore --competed old_v3.parquet new_v4.parquet`: one input stores every
+        // feature as f64, the other most of them as f32 and one as f64. The widths are
+        // chosen per batch, so the matrix and every handoff encoding are built from a
+        // stream that changes width between inputs. They must be exactly what the same
+        // pool gives when the old input is first narrowed into the new layout.
+        let names: Vec<String> = ["f0", "f1", "f2"].iter().map(|s| s.to_string()).collect();
+        let old = scratch("mw_old_v3.parquet");
+        let old_narrowed = scratch("mw_old_as_v4.parquet");
+        let new = scratch("mw_new_v4.parquet");
+        let v4 = [true, false, false];
+        crafted_competed_widths(&old, 7, 100.0, &names, &[true, true, true], true);
+        crafted_competed_widths(&old_narrowed, 7, 100.0, &names, &v4, true);
+        crafted_competed_widths(&new, 5, 900.0, &names, &v4, true);
+        let mixed = vec![old, new.clone()];
+        let narrowed = vec![old_narrowed, new];
+        let n = 12;
+        let is_decoy: Vec<bool> = (0..n).map(|i| i % 3 == 0).collect();
+        let pform = flat(&(0..n).map(|i| format!("PEPTIDEK/{i}")).collect::<Vec<_>>());
+        let protein = flat(&(0..n).map(|i| format!("sp|P{i:05}|X")).collect::<Vec<_>>());
+        let mz: Vec<f64> = (0..n).map(|i| 400.0 + i as f64 * 1.5).collect();
+
+        let bits = |m: &FeatureMatrix| -> Vec<u32> {
+            (0..m.rows())
+                .flat_map(|i| m.row(i).iter().map(|v| v.to_bits()).collect::<Vec<_>>())
+                .collect()
+        };
+        let m_mixed = load_feature_matrix(&mixed, &names, n).unwrap();
+        let m_narrowed = load_feature_matrix(&narrowed, &names, n).unwrap();
+        assert_eq!(bits(&m_mixed), bits(&m_narrowed), "the matrix differs");
+        assert_eq!(m_mixed.find_non_finite(), Some((0, 1)), "the null is NaN");
+        assert_eq!(m_narrowed.find_non_finite(), Some((0, 1)));
+
+        // Every file one handoff writes, read back.
+        let files = |paths: &SidecarPaths| -> Vec<Vec<u8>> {
+            match paths.raw_files() {
+                Some((matrix, meta)) => {
+                    vec![std::fs::read(matrix).unwrap(), std::fs::read(meta).unwrap()]
+                }
+                None => vec![std::fs::read(&paths.handoff).unwrap()],
+            }
+        };
+        for (kind, ext) in [
+            (HandoffKind::Parquet, "parquet"),
+            (HandoffKind::Pin, "pin"),
+            (HandoffKind::Raw, "features.raw.json"),
+        ] {
+            for batch in [1usize, 3, 16_384] {
+                let write = |competed: &[String], tag: &str| -> Vec<Vec<u8>> {
+                    let paths = SidecarPaths {
+                        handoff: scratch(&format!("mw_{tag}_{batch}.{ext}")),
+                        out: String::new(),
+                        foldkeys: String::new(),
+                        kind,
+                    };
+                    let mut w =
+                        HandoffWriter::new(&paths, &names, &is_decoy, &pform, &protein, &mz)
+                            .unwrap()
+                            .with_block_rows(5);
+                    for_each_feature_batch_with(
+                        competed,
+                        &names,
+                        &mumdia_io::table::ScanOptions::default(),
+                        |_| batch,
+                        |b| w.push_batch(b),
+                    )
+                    .unwrap();
+                    assert_eq!(w.finish().unwrap(), n as u64);
+                    files(&paths)
+                };
+                assert!(
+                    write(&mixed, "mixed") == write(&narrowed, "narrowed"),
+                    "{ext} handoff of a mixed-width pool differs ({batch}-row batches)"
+                );
+            }
+        }
+    }
+
     /// Parse a C-order `<f4` `.npy` written by `npy_header`: (rows, cols, values).
     fn read_npy_f32(path: &str) -> (usize, usize, Vec<f32>) {
         let bytes = std::fs::read(path).unwrap();

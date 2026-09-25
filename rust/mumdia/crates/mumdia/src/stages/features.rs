@@ -6842,9 +6842,10 @@ mod tests {
             rep.stats["publish"].as_str().unwrap().to_string()
         };
         let rcfg = mumdia_core::config::RescoreConfig::default();
-        let rescore = |competed: &str, out: &str| -> Vec<u8> {
+        let rescore_pool = |competed: &[&str], out: &str| -> Vec<u8> {
+            let competed: Vec<String> = competed.iter().map(|c| c.to_string()).collect();
             crate::stages::rescore::run(crate::stages::rescore::RescoreParams {
-                competed: &[competed.to_string()],
+                competed: &competed,
                 sources: None,
                 out,
                 work_dir: &p("work"),
@@ -6855,6 +6856,7 @@ mod tests {
             .unwrap();
             std::fs::read(out).unwrap()
         };
+        let rescore = |competed: &str, out: &str| rescore_pool(&[competed], out);
 
         let direct1 = rescore(&f1, &p("scored_direct_v1.parquet"));
         let direct2 = rescore(&f2, &p("scored_direct_v2.parquet"));
@@ -6897,6 +6899,20 @@ mod tests {
         assert!(
             rescore(&u1, &p("scored_u1.parquet")) == rescore(&u2, &p("scored_u2.parquet")),
             "unique_evidence compete of the two layouts scores differently"
+        );
+
+        // A pool that mixes the versions, `rescore --competed old_v3 new_v4`: the stream
+        // changes width between inputs, and the pooled q columns are computed over both.
+        // It must score as the pool of v4 tables does, with the old table first and last.
+        assert!(
+            rescore_pool(&[&f1, &f2], &p("scored_pool_v3_v4.parquet"))
+                == rescore_pool(&[&f2, &f2], &p("scored_pool_v4_v4.parquet")),
+            "a v3 + v4 pool scores differently from a v4 + v4 pool"
+        );
+        assert!(
+            rescore_pool(&[&u2, &f1], &p("scored_pool_v4u_v3.parquet"))
+                == rescore_pool(&[&u2, &f2], &p("scored_pool_v4u_v4.parquet")),
+            "a v4 + v3 pool scores differently from a v4 + v4 pool"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
