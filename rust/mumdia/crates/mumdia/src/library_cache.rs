@@ -40,14 +40,121 @@ const TABLES: [&str; 2] = [
     "fragment_library_fragments.parquet",
 ];
 
-/// `entry.json` of one cache entry: the key material and the size of every stored file.
+/// How long a temporary store directory may go unwritten before the run that was
+/// writing it counts as gone and the directory is removed. A live store writes its files
+/// continuously, and a byte copy of the largest library takes minutes, not an hour.
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// One stored file in `entry.json`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+struct StoredFile {
+    bytes: u64,
+    blake3: String,
+}
+
+/// `entry.json` of one cache entry: the key material and the size and content hash of
+/// every stored file.
 #[derive(Serialize, Deserialize)]
 struct Entry {
     cache_format: u32,
     key: String,
     material: serde_json::Value,
-    /// File name (a table or its `.report.json`) to its size in bytes.
-    files: std::collections::BTreeMap<String, u64>,
+    /// File name (a table or its `.report.json`) to its size and blake3.
+    files: std::collections::BTreeMap<String, StoredFile>,
+}
+
+/// The four file names an entry holds: each table and its report.
+fn entry_files() -> Vec<String> {
+    TABLES
+        .iter()
+        .flat_map(|t| [t.to_string(), format!("{t}.report.json")])
+        .collect()
+}
+
+/// A stored file's size and content hash.
+fn stored_file(path: &Path) -> Result<StoredFile> {
+    let p = path.to_string_lossy();
+    Ok(StoredFile {
+        bytes: std::fs::metadata(path)
+            .with_context(|| format!("reading {p}"))?
+            .len(),
+        blake3: mumdia_io::hash::blake3_file(&p)?,
+    })
+}
+
+/// A temporary directory this cache writes or sets aside: `<24 hex>.partial-...` (a store
+/// in progress, or abandoned) or `<24 hex>.broken-...` (an unusable entry moved out of the
+/// way). Anything else in the cache directory is not the engine's and is never touched.
+fn leftover_kind(name: &str) -> Option<&'static str> {
+    let (key, rest) = name.split_at_checked(24)?;
+    if !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    if rest.starts_with(".partial-") {
+        Some("partial")
+    } else if rest.starts_with(".broken-") {
+        Some("broken")
+    } else {
+        None
+    }
+}
+
+/// Was `dir`, or any file directly inside it, written within [`STALE_AFTER`]? A
+/// modification time in the future counts as recent (clock skew on a shared cache is not
+/// evidence that nobody is writing, docs/31 F9).
+fn written_recently(dir: &Path) -> bool {
+    let recent = |p: &Path| match std::fs::metadata(p).and_then(|m| m.modified()) {
+        Ok(t) => match t.elapsed() {
+            Ok(age) => age < STALE_AFTER,
+            Err(_) => true,
+        },
+        Err(_) => false,
+    };
+    recent(dir)
+        || std::fs::read_dir(dir)
+            .map(|rd| rd.flatten().any(|e| recent(&e.path())))
+            .unwrap_or(false)
+}
+
+/// A name for a directory beside the entries that no other run picks: the key, `what`,
+/// this process's id and the time in nanoseconds.
+fn unique_sibling(dir: &Path, key: &str, what: &str) -> PathBuf {
+    dir.join(format!(
+        "{key}.{what}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ))
+}
+
+/// Remove the digest and peptidoform tables (and their reports) a previous build left in
+/// `out_dir`, after a cache hit published a library they did not produce. A missing file
+/// is the normal case; any other failure is a warning.
+pub fn remove_build_intermediates(out_dir: &str) {
+    for name in [
+        "peptides.parquet",
+        "peptides.parquet.report.json",
+        "peptidoforms.parquet",
+        "peptidoforms.parquet.report.json",
+    ] {
+        let path = Path::new(out_dir).join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(
+                file = %path.display(),
+                "library cache: removed an earlier build's table, which did not produce the \
+                 reused library"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                file = %path.display(),
+                error = %e,
+                "library cache: could not remove an earlier build's table beside the reused \
+                 library"
+            ),
+        }
+    }
 }
 
 /// One library's place in the cache.
@@ -97,14 +204,61 @@ impl LibraryCache {
         self.dir.join(&self.key)
     }
 
-    /// On a hit, publish the stored tables and their reports at `lib_p` and `lib_f` (a
-    /// hard link where the filesystem allows, a copy otherwise) and return what their
-    /// reports record. `None` is a miss: no entry, or one whose files are missing or not
-    /// the size they were stored at, which is logged and then rebuilt over.
+    /// The entry at `entry_dir`, if it is usable: an `entry.json` of this format and key
+    /// that lists exactly the four files, each present at its stored size. With `deep`,
+    /// every file's content hash is checked as well.
+    fn validate(&self, entry_dir: &Path, deep: bool) -> Result<Entry> {
+        let entry_path = entry_dir.join("entry.json");
+        let entry: Entry = mumdia_io::json::read_json(&entry_path.to_string_lossy())?;
+        anyhow::ensure!(
+            entry.cache_format == CACHE_FORMAT && entry.key == self.key,
+            "entry.json is for format {} key {}",
+            entry.cache_format,
+            entry.key
+        );
+        let want: std::collections::BTreeSet<String> = entry_files().into_iter().collect();
+        anyhow::ensure!(
+            entry
+                .files
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                == want,
+            "entry.json lists {:?}, not the two tables and their reports",
+            entry.files.keys().collect::<Vec<_>>()
+        );
+        for (name, stored) in &entry.files {
+            let path = entry_dir.join(name);
+            let got = std::fs::metadata(&path)
+                .with_context(|| format!("stored file {name}"))?
+                .len();
+            anyhow::ensure!(
+                got == stored.bytes,
+                "{name} is {got} bytes, stored at {}; it was changed after it was stored",
+                stored.bytes
+            );
+            if deep {
+                let h = mumdia_io::hash::blake3_file(&path.to_string_lossy())?;
+                anyhow::ensure!(
+                    h == stored.blake3,
+                    "{name} no longer has the content it was stored with"
+                );
+            }
+        }
+        Ok(entry)
+    }
+
+    /// On a hit, publish a byte copy of the stored tables and their reports at `lib_p` and
+    /// `lib_f` and return what their reports record. `None` is a miss: no entry, or one
+    /// whose files are missing or not the size or content they were stored with, which is
+    /// logged and then rebuilt over (and replaced by [`LibraryCache::store`]).
+    ///
+    /// A copy, not a hard link, so a tool that rewrites a run directory's library in place
+    /// changes neither the cache nor another run. Each published copy is hashed against
+    /// `entry.json`, which is one read of a file that is still in the page cache.
     pub fn restore(&self, lib_p: &str, lib_f: &str) -> Option<(Written, Written)> {
         let entry_dir = self.entry_dir();
-        let entry_path = entry_dir.join("entry.json");
-        if !entry_path.is_file() {
+        if !entry_dir.join("entry.json").is_file() {
             info!(
                 key = %self.key,
                 cache = %self.dir.display(),
@@ -112,7 +266,7 @@ impl LibraryCache {
             );
             return None;
         }
-        match self.try_restore(&entry_dir, &entry_path, lib_p, lib_f) {
+        match self.try_restore(&entry_dir, lib_p, lib_f) {
             Ok(w) => {
                 info!(
                     key = %self.key,
@@ -129,7 +283,8 @@ impl LibraryCache {
                     key = %self.key,
                     entry = %entry_dir.display(),
                     error = %format!("{e:#}"),
-                    "library cache: the stored library is unusable; rebuilding it"
+                    "library cache: the stored library is unusable; rebuilding it, and the \
+                     rebuild replaces the entry"
                 );
                 None
             }
@@ -139,33 +294,25 @@ impl LibraryCache {
     fn try_restore(
         &self,
         entry_dir: &Path,
-        entry_path: &Path,
         lib_p: &str,
         lib_f: &str,
     ) -> Result<(Written, Written)> {
-        let entry: Entry = mumdia_io::json::read_json(&entry_path.to_string_lossy())?;
-        anyhow::ensure!(
-            entry.cache_format == CACHE_FORMAT && entry.key == self.key,
-            "entry.json is for format {} key {}",
-            entry.cache_format,
-            entry.key
-        );
-        for (name, bytes) in &entry.files {
-            let got = std::fs::metadata(entry_dir.join(name))
-                .with_context(|| format!("stored file {name}"))?
-                .len();
-            anyhow::ensure!(
-                got == *bytes,
-                "{name} is {got} bytes, stored at {bytes}; it was changed after it was stored"
-            );
-        }
+        let entry = self.validate(entry_dir, false)?;
         let mut written = Vec::with_capacity(2);
         for (table, out) in TABLES.iter().zip([lib_p, lib_f]) {
-            let src = entry_dir.join(table);
-            let src_report = entry_dir.join(format!("{table}.report.json"));
-            mumdia_io::table::publish_copy_of(&src.to_string_lossy(), out)?;
             let out_report = format!("{out}.report.json");
-            mumdia_io::table::publish_copy_of(&src_report.to_string_lossy(), &out_report)?;
+            for (name, dest) in [
+                (table.to_string(), out.to_string()),
+                (format!("{table}.report.json"), out_report.clone()),
+            ] {
+                let src = entry_dir.join(&name);
+                mumdia_io::table::publish_byte_copy(&src.to_string_lossy(), &dest)?;
+                let got = mumdia_io::hash::blake3_file(&dest)?;
+                anyhow::ensure!(
+                    got == entry.files[&name].blake3,
+                    "{name} no longer has the content it was stored with"
+                );
+            }
             let report: ArtifactReport = mumdia_io::json::read_json(&out_report)?;
             written.push(report.written());
         }
@@ -177,9 +324,11 @@ impl LibraryCache {
     /// Store a library just built at `lib_p` and `lib_f` (with their reports). Best
     /// effort: a failure is a warning, since the run's own library is complete either way.
     ///
-    /// The files go into a private temporary directory beside the entry, which is then
-    /// renamed into place, so a reader sees a complete entry or none; when another run
-    /// stored the same key first, this copy is discarded.
+    /// The files are byte-copied into a private temporary directory beside the entry,
+    /// which is then renamed into place, so a reader sees a complete entry or none and the
+    /// entry never shares a file with a run directory. When another run stored a usable
+    /// copy of the same key first, this copy is discarded; an unusable entry is moved aside
+    /// and replaced. Temporary directories that a killed run left behind are removed first.
     pub fn store(&self, lib_p: &str, lib_f: &str) {
         match self.try_store(lib_p, lib_f) {
             Ok(true) => info!(
@@ -200,22 +349,67 @@ impl LibraryCache {
         }
     }
 
+    /// Remove the temporary directories of stores that died (unwritten for
+    /// [`STALE_AFTER`]) and of unusable entries set aside by [`LibraryCache::store`].
+    fn sweep_leftovers(&self) {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let path = e.path();
+            let Some(kind) = leftover_kind(&name) else {
+                continue;
+            };
+            if !path.is_dir() || (kind == "partial" && written_recently(&path)) {
+                continue;
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => info!(
+                    dir = %path.display(),
+                    "library cache: removed an abandoned {kind} directory"
+                ),
+                Err(err) => warn!(
+                    dir = %path.display(),
+                    error = %err,
+                    "library cache: could not remove an abandoned {kind} directory"
+                ),
+            }
+        }
+    }
+
+    /// Move an unusable entry out of the way and remove it. Another run may have done
+    /// so already, which is not an error.
+    fn set_aside(&self, final_dir: &Path, why: &anyhow::Error) {
+        warn!(
+            key = %self.key,
+            entry = %final_dir.display(),
+            error = %format!("{why:#}"),
+            "library cache: the stored library is unusable; replacing it with this build"
+        );
+        let aside = unique_sibling(&self.dir, &self.key, "broken");
+        if std::fs::rename(final_dir, &aside).is_ok() {
+            // A reader on a platform that keeps open files undeletable can make this fail;
+            // the next store's sweep retries it.
+            let _ = std::fs::remove_dir_all(&aside);
+        }
+    }
+
     fn try_store(&self, lib_p: &str, lib_f: &str) -> Result<bool> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating {}", self.dir.display()))?;
+        self.sweep_leftovers();
         let final_dir = self.entry_dir();
-        if final_dir.join("entry.json").is_file() {
-            return Ok(false);
+        if final_dir.exists() {
+            // The run that reaches here built its library for an hour, so checking every
+            // stored file's content is cheap; a same-size change would otherwise never be
+            // repaired.
+            match self.validate(&final_dir, true) {
+                Ok(_) => return Ok(false),
+                Err(e) => self.set_aside(&final_dir, &e),
+            }
         }
-        let tmp = self.dir.join(format!(
-            "{}.partial-{}-{}",
-            self.key,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let tmp = unique_sibling(&self.dir, &self.key, "partial");
         std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         let result = (|| -> Result<bool> {
             let mut files = std::collections::BTreeMap::new();
@@ -225,8 +419,8 @@ impl LibraryCache {
                     (format!("{table}.report.json"), format!("{src}.report.json")),
                 ] {
                     let to = tmp.join(&name);
-                    mumdia_io::table::publish_copy_of(&from, &to.to_string_lossy())?;
-                    files.insert(name, std::fs::metadata(&to)?.len());
+                    mumdia_io::table::publish_byte_copy(&from, &to.to_string_lossy())?;
+                    files.insert(name, stored_file(&to)?);
                 }
             }
             let entry = Entry {
@@ -239,7 +433,7 @@ impl LibraryCache {
             match std::fs::rename(&tmp, &final_dir) {
                 Ok(()) => Ok(true),
                 // Another run renamed its copy into place between the check and here.
-                Err(_) if final_dir.join("entry.json").is_file() => Ok(false),
+                Err(_) if self.validate(&final_dir, false).is_ok() => Ok(false),
                 Err(e) => Err(e).with_context(|| {
                     format!("renaming {} to {}", tmp.display(), final_dir.display())
                 }),
@@ -359,11 +553,11 @@ mod tests {
     }
 
     fn fake_build(dir: &Path, tag: &str) -> (String, String) {
+        std::fs::create_dir_all(dir).unwrap();
         let mut out = Vec::new();
         for (i, t) in TABLES.iter().enumerate() {
             let p = dir.join(t);
-            // Published by rename, as every engine writer does, so a hard link to an
-            // earlier version keeps that version's bytes.
+            // Published by rename, as every engine writer does.
             let tmp = dir.join(format!("{t}.tmp"));
             std::fs::write(&tmp, format!("{tag}-{i}").repeat(100)).unwrap();
             std::fs::rename(&tmp, &p).unwrap();
@@ -452,29 +646,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The two table paths of a fresh run directory `name` under `root`.
+    fn run_dir(root: &Path, name: &str) -> (String, String) {
+        let d = root.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        (
+            d.join(TABLES[0]).to_string_lossy().into_owned(),
+            d.join(TABLES[1]).to_string_lossy().into_owned(),
+        )
+    }
+
     #[test]
-    fn a_stored_file_that_changed_size_is_a_miss() {
+    fn a_changed_entry_is_a_miss_and_the_next_store_repairs_it() {
         let root = tmp("tamper");
         let fasta = root.join("x.fasta");
         std::fs::write(&fasta, ">P1\nPEPTIDEK\n").unwrap();
         let mut cfg = Config::default();
         let cache = cache_for(&root.join("cache"), &fasta, &mut cfg);
-        let run1 = root.join("run1");
-        std::fs::create_dir_all(&run1).unwrap();
-        let (p1, f1) = fake_build(&run1, "a");
+        let (p1, f1) = fake_build(&root.join("run1"), "a");
         cache.store(&p1, &f1);
-        // Write a new, shorter file at the stored name (a new file, so run1's copy stays).
         let stored = cache.entry_dir().join(TABLES[1]);
-        std::fs::remove_file(&stored).unwrap();
-        std::fs::write(&stored, b"short").unwrap();
-        let run2 = root.join("run2");
-        std::fs::create_dir_all(&run2).unwrap();
-        assert!(cache
-            .restore(
-                &run2.join(TABLES[0]).to_string_lossy(),
-                &run2.join(TABLES[1]).to_string_lossy()
-            )
-            .is_none());
+        let original = std::fs::read(&stored).unwrap();
+
+        // A shorter file, then a same-size one with other bytes: both are misses, and each
+        // time the store that follows the rebuild replaces the entry, so the run after it
+        // hits again instead of rebuilding for ever.
+        let mut same_size = original.clone();
+        same_size[0] ^= 1;
+        for (i, bad) in [b"short".to_vec(), same_size].into_iter().enumerate() {
+            std::fs::write(&stored, &bad).unwrap();
+            let (p, f) = run_dir(&root, &format!("miss{i}"));
+            assert!(
+                cache.restore(&p, &f).is_none(),
+                "tampered entry {i} is a miss"
+            );
+            cache.store(&p1, &f1);
+            assert_eq!(
+                std::fs::read(&stored).unwrap(),
+                original,
+                "entry {i} repaired"
+            );
+            let (p, f) = run_dir(&root, &format!("hit{i}"));
+            assert!(
+                cache.restore(&p, &f).is_some(),
+                "repaired entry {i} is a hit"
+            );
+        }
+
+        // An entry directory without entry.json is replaced too.
+        std::fs::remove_file(cache.entry_dir().join("entry.json")).unwrap();
+        let (p, f) = run_dir(&root, "noentry");
+        assert!(cache.restore(&p, &f).is_none());
+        cache.store(&p1, &f1);
+        assert!(cache.restore(&p, &f).is_some());
+
+        // Neither a hit nor a store shares a file with a run directory: rewriting a run's
+        // library IN PLACE (not by rename) reaches neither the cache nor another run.
+        let (hp, hf) = run_dir(&root, "inplace");
+        cache.restore(&hp, &hf).expect("hit");
+        let (op, of) = run_dir(&root, "other");
+        cache.restore(&op, &of).expect("hit");
+        for path in [&hf, &f1] {
+            let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            std::io::Write::write_all(&mut file, b"XX").unwrap();
+        }
+        assert_eq!(std::fs::read(&stored).unwrap(), original);
+        assert_eq!(std::fs::read(&of).unwrap(), original);
+        let (p, f) = run_dir(&root, "after");
+        assert!(cache.restore(&p, &f).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_store_removes_abandoned_temporary_directories_and_nothing_else() {
+        let root = tmp("sweep");
+        let fasta = root.join("x.fasta");
+        std::fs::write(&fasta, ">P1\nPEPTIDEK\n").unwrap();
+        let mut cfg = Config::default();
+        let cache_dir = root.join("cache");
+        let cache = cache_for(&cache_dir, &fasta, &mut cfg);
+        let k = "0123456789abcdef01234567";
+        let broken = cache_dir.join(format!("{k}.broken-1-2"));
+        let fresh = cache_dir.join(format!("{k}.partial-1-2"));
+        let foreign = cache_dir.join("notes.partial-1-2");
+        for d in [&broken, &fresh, &foreign] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join(TABLES[0]), b"x").unwrap();
+        }
+        let (p1, f1) = fake_build(&root.join("run1"), "a");
+        cache.store(&p1, &f1);
+        assert!(!broken.exists(), "a set-aside entry is removed");
+        assert!(
+            fresh.exists(),
+            "a store that is still writing is left alone"
+        );
+        assert!(
+            foreign.exists(),
+            "a directory that is not the cache's is never touched"
+        );
+        assert_eq!(leftover_kind(&format!("{k}.partial-9-9")), Some("partial"));
+        assert_eq!(leftover_kind(&format!("{k}.broken-9-9")), Some("broken"));
+        assert_eq!(leftover_kind(k), None);
+        assert_eq!(leftover_kind("zz3456789abcdef01234567.partial-1"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_store_unwritten_for_an_hour_is_removed() {
+        let root = tmp("stale");
+        let fasta = root.join("x.fasta");
+        std::fs::write(&fasta, ">P1\nPEPTIDEK\n").unwrap();
+        let mut cfg = Config::default();
+        let cache_dir = root.join("cache");
+        let cache = cache_for(&cache_dir, &fasta, &mut cfg);
+        let stale = cache_dir.join(format!("{}.partial-1-2", cache.key));
+        std::fs::create_dir_all(&stale).unwrap();
+        let file = stale.join(TABLES[0]);
+        std::fs::write(&file, b"x").unwrap();
+        let old = std::time::SystemTime::now() - 2 * STALE_AFTER;
+        for p in [&file, &stale] {
+            std::fs::File::open(p).unwrap().set_modified(old).unwrap();
+        }
+        let (p1, f1) = fake_build(&root.join("run1"), "a");
+        cache.store(&p1, &f1);
+        assert!(!stale.exists(), "an abandoned partial store is removed");
         let _ = std::fs::remove_dir_all(&root);
     }
 

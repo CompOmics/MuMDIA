@@ -239,6 +239,9 @@ pub fn run(p: RunParams) -> Result<()> {
             );
             if let Some((wp, wf)) = cache.as_ref().and_then(|c| c.restore(&lib_p, &lib_f)) {
                 pre.first_stage("library-cache");
+                // A reused output directory may still hold an earlier build's digest and
+                // peptidoforms, which did not produce this library.
+                crate::library_cache::remove_build_intermediates(p.out_dir);
                 man.record(wp.record(
                     artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
                     artifact::FRAGMENT_LIBRARY_PRECURSORS,
@@ -933,7 +936,7 @@ pub fn run(p: RunParams) -> Result<()> {
             continue;
         }
         let rec = match hashes.get(r.input_role) {
-            Some(h) => record_artifact_with_hash(
+            Some(h) => Ok(record_artifact_with_hash(
                 logical,
                 r.schema,
                 &r.path,
@@ -941,12 +944,24 @@ pub fn run(p: RunParams) -> Result<()> {
                 "library-input",
                 &ch,
                 h.clone(),
-            ),
-            // The input could not be hashed on the thread; hash it here, which fails the
-            // run with the file's error exactly as the record taken up front used to.
-            None => record_artifact(logical, r.schema, &r.path, r.rows, "library-input", &ch)?,
+            )),
+            // The input could not be hashed on the thread: try once more here. Every stage
+            // has read the library by now, so a file that is still unreadable became so
+            // during the run, and failing on it would end a finished run without its
+            // manifest. It is left out with a warning instead, as `InputHashes::record`
+            // leaves out the input itself.
+            None => record_artifact(logical, r.schema, &r.path, r.rows, "library-input", &ch),
         };
-        man.record(rec);
+        match rec {
+            Ok(rec) => man.record(rec),
+            Err(e) => warn!(
+                artifact = logical,
+                path = %r.path,
+                error = %format!("{e:#}"),
+                "run: the library input could not be hashed; its artifact record is left out \
+                 of the manifest"
+            ),
+        }
     }
 
     let manifest_path = d("manifest.json");
