@@ -464,6 +464,157 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
     assert_written(wq.fragment.as_ref().expect("out_fragment was set"), &qfrag);
 }
 
+/// Every table downstream of extract, from one chromatogram table: features, competed,
+/// scored and the three quant tables, as their bytes.
+fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec<u8>> {
+    let feats = tmp(&format!("v2_{tag}_features.parquet"));
+    stages::features::run(stages::features::FeaturesParams {
+        psms,
+        chromatograms: chrom,
+        seed: None,
+        out: &feats,
+        out_pin: "",
+        cfg: &cfg.features,
+        config_hash: "test",
+    })
+    .unwrap();
+    let competed = tmp(&format!("v2_{tag}_competed.parquet"));
+    stages::compete::run(stages::compete::CompeteParams {
+        features: &feats,
+        out: &competed,
+        cfg: &cfg.compete,
+        config_hash: "test",
+        features_hash: None,
+    })
+    .unwrap();
+    let scored = tmp(&format!("v2_{tag}_scored.parquet"));
+    stages::rescore::run(stages::rescore::RescoreParams {
+        competed: &[competed.clone()],
+        sources: None,
+        out: &scored,
+        work_dir: &tmp(&format!("v2_{tag}_rescore_work")),
+        script_dir: "scripts",
+        cfg: &cfg.rescore,
+        config_hash: "test",
+    })
+    .unwrap();
+    let (qpep, qprot, qfrag) = (
+        tmp(&format!("v2_{tag}_peptide.parquet")),
+        tmp(&format!("v2_{tag}_protein.parquet")),
+        tmp(&format!("v2_{tag}_fragment.parquet")),
+    );
+    stages::quant::run(stages::quant::QuantParams {
+        psms_scored: &scored,
+        chromatograms: &[stages::quant::ChromTable::whole(chrom)],
+        out_peptide: &qpep,
+        out_protein: &qprot,
+        out_fragment: Some(&qfrag),
+        out_peak_bounds: None,
+        cfg: &cfg.quant,
+        config_hash: "test",
+    })
+    .unwrap();
+    [feats, competed, scored, qpep, qprot, qfrag]
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect()
+}
+
+#[test]
+fn chromatograms_v2_leave_every_downstream_table_byte_identical() {
+    // Extract under `extract.chromatogram_schema = 2` against the default, on the crafted
+    // spectra with MS1 (so the table holds fragment rows and the three MS1 XIC rows of each
+    // candidate): the PSM table is the same file, the chromatogram table is v2 and smaller,
+    // and features, compete, rescore and quant write the same bytes from either. Then the
+    // v1 table rewritten as v2 with a row-group seam at every row and at every other size,
+    // which moves the seam through every row of every candidate: the same bytes again.
+    use mumdia::chromatograms::{rewrite, Layout};
+    let (prec, frag) = craft_library();
+    let ms2 = craft_ms2_with_decoy(true);
+    let win = craft_windows();
+    let ms1 = craft_ms1();
+    let extract = |cfg: &Config, tag: &str| -> (String, String) {
+        let psms = tmp(&format!("v2_{tag}_psms.parquet"));
+        let chrom = tmp(&format!("v2_{tag}_chrom.parquet"));
+        stages::extract::run(stages::extract::ExtractParams {
+            precursor_span: None,
+            fragment_offset: None,
+            rt_windows: None,
+            sibling_bands: 1,
+            scans: None,
+            ms2: &ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            run_windows: &win,
+            ms1: Some(&ms1),
+            mass_cal: None,
+            out_psms: &psms,
+            out_chrom: &chrom,
+            restrict_candidates: None,
+            cfg: &cfg.extract,
+            config_hash: "test",
+        })
+        .unwrap();
+        (psms, chrom)
+    };
+    let cfg = Config::default();
+    assert_eq!(cfg.extract.chromatogram_schema, 1, "v1 is the default");
+    let mut cfg2 = Config::default();
+    cfg2.extract.chromatogram_schema = 2;
+    cfg2.validate().unwrap();
+    let (psms1, chrom1) = extract(&cfg, "v1");
+    let (psms2, chrom2) = extract(&cfg2, "v2");
+    assert_eq!(
+        std::fs::read(&psms1).unwrap(),
+        std::fs::read(&psms2).unwrap(),
+        "the chromatogram layout moved a psms_extracted byte"
+    );
+    let t1 = TableFile::open(&chrom1).unwrap();
+    let t2 = TableFile::open(&chrom2).unwrap();
+    assert_eq!(Layout::of(&t1).unwrap(), Layout::V1);
+    assert_eq!(Layout::of(&t2).unwrap(), Layout::V2);
+    assert_eq!(t1.nrows, t2.nrows);
+    let names = t1.str("frag_name").unwrap();
+    assert!(
+        names.iter().any(|n| n.starts_with("ms1_")) && names.iter().any(|n| !n.starts_with("ms1_")),
+        "the fixture must write fragment and MS1 rows: {names:?}"
+    );
+    // The v2 table carries each candidate's axis once and says it is schema 2. (Its size is not
+    // asserted: on a table of a few rows the two extra columns' footer entries outweigh what
+    // v2 saves. The saving is measured on the smoke fixture and on a real run.)
+    let axes = t2
+        .list_f32("rt")
+        .unwrap()
+        .iter()
+        .filter(|a| !a.is_empty())
+        .count();
+    let cands = {
+        let mut c = t2.u32("candidate_id").unwrap();
+        c.dedup();
+        c.len()
+    };
+    assert_eq!(axes, cands, "one axis per candidate in one row group");
+    let rep1: mumdia_io::report::ArtifactReport =
+        mumdia_io::json::read_json(&format!("{chrom1}.report.json")).unwrap();
+    let rep2: mumdia_io::report::ArtifactReport =
+        mumdia_io::json::read_json(&format!("{chrom2}.report.json")).unwrap();
+    assert_eq!((rep1.schema_version, rep2.schema_version), (1, 2));
+
+    let want = downstream_bytes(&psms1, &chrom1, &cfg, "ref");
+    assert!(
+        downstream_bytes(&psms2, &chrom2, &cfg, "extract_v2") == want,
+        "a downstream table differs between extract's v1 and v2 chromatograms"
+    );
+    for rg in 1..=t1.nrows + 1 {
+        let v2 = tmp(&format!("v2_rewrite_{rg}.parquet"));
+        rewrite(&chrom1, &v2, Layout::V2, rg).unwrap();
+        assert!(
+            downstream_bytes(&psms1, &v2, &cfg, &format!("rg{rg}")) == want,
+            "{rg} rows per row group: a downstream table differs from v1's"
+        );
+    }
+}
+
 /// Synthetic `psms_extracted` + `chromatograms` pair with enough candidates to span
 /// several chunks: varying fragment counts, varying trace lengths, MS1 XIC rows, one
 /// never-observed fragment with an empty trace, and one candidate with no chromatogram
