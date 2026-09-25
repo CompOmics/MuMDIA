@@ -4,7 +4,8 @@
 #   ci/smoke.sh [work_dir]
 #
 # Needs: a built `mumdia` binary (found automatically, or set MUMDIA_BIN) and a
-# Python with pyarrow. No sidecar, no network, no data file in the repository: the
+# Python with pyarrow. No sidecar (arm 5b stands a stub in for the DeepLC worker), no
+# network, no data file in the repository: the
 # fixture is generated from `test_data/fixture.fasta` and from the library the
 # engine itself builds out of it, so the planted peaks cannot disagree with the
 # engine's mass model.
@@ -264,6 +265,244 @@ cp "$work/fixture.mzML" "$work/fixture_b.mzML"
 # header-only at the default threshold and the rows are asserted on this copy instead.
 "$BIN" report --experiment-dir "$work/exp" --out-dir "$work/exp_report" --q 0.05 \
     > "$work/exp_report.log" 2>&1 || { tail -20 "$work/exp_report.log"; exit 1; }
+
+# 5b. The DeepLC branches of the orchestrators, with a stub worker.
+#
+#     CI has no DeepLC, so every choice `run_groups` and `run-experiment` make about WHICH
+#     DeepLC call to make, and where its output goes, ran only on a developer machine:
+#     `groups.rt_adaptation = once_per_run` writing each band under the name a later run's
+#     `shared_bands` looks for, the bands keeping an experiment-level re-prediction without
+#     calling the worker, a later run taking the first grouped run's band slices, the refusal
+#     of a deferred library the calibration did not fully re-predict, and
+#     `experiment.overlap_front_threads`. A regression there (a later run failing with
+#     "shared bands do not match", or a calibration silently skipped) passed CI.
+#
+#     The stub stands in for `deeplc_finetune.py` under the same positional contract: it
+#     copies each `lib_in` to its `lib_out` (so every retention time is the library's own),
+#     writes the `<lib_out>.summary.json` the engine reads, and appends one JSON line per call
+#     to `MUMDIA_STUB_DEEPLC_LOG`. A `deeplc-4.5.0.dist-info` on `PYTHONPATH` answers the
+#     engine's version check. What is asserted is the calls and the files, not retention
+#     times.
+echo "=== smoke: DeepLC branch selection with a stub worker"
+stub="$work/stub"
+rm -rf "$stub"
+mkdir -p "$stub"
+# Written by Python, so the interpreter path and the directories land in the JSON in the
+# form the engine and the interpreter both read on every platform.
+stub_env=$("$PY" - "$stub" <<'PYEOF'
+import json, os, sys
+root = os.path.abspath(sys.argv[1])
+site = os.path.join(root, "site", "deeplc-4.5.0.dist-info")
+scripts = os.path.join(root, "scripts")
+os.makedirs(site)
+os.makedirs(scripts)
+with open(os.path.join(site, "METADATA"), "w", encoding="utf-8") as fh:
+    fh.write("Metadata-Version: 2.1\nName: deeplc\nVersion: 4.5.0\n")
+STUB = r'''"""Stand-in for deeplc_finetune.py in ci/smoke.sh (arm 5b). No DeepLC, no torch."""
+import json, os, shutil, sys
+import pyarrow.parquet as pq
+
+VALUED = {"--multihead", "--q-train", "--window-holdout-frac", "--threads",
+          "--predict-threads", "--shards", "--projection-cache", "--bands", "--epochs",
+          "--patience", "--batch", "--seed"}
+pos, opts, argv, i = [], {}, sys.argv[1:], 0
+while i < len(argv):
+    a = argv[i]
+    if a in VALUED:
+        opts[a] = argv[i + 1]
+        i += 2
+    elif a.startswith("--"):
+        opts[a] = True
+        i += 1
+    else:
+        pos.append(a)
+        i += 1
+lib_in, seed, lib_out = pos[:3]
+if "--bands" in opts:
+    with open(opts["--bands"], encoding="utf-8") as fh:
+        pairs = [line.split("\t") for line in fh.read().splitlines() if line]
+else:
+    pairs = [[lib_in, lib_out]]
+mode = ("multihead" if "--multihead" in opts else
+        "repredict" if "--no-finetune" in opts else "finetune")
+with open(os.environ["MUMDIA_STUB_DEEPLC_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps({"mode": mode, "bands": "--bands" in opts, "seed": seed,
+                         "pairs": pairs}) + "\n")
+if os.environ.get("MUMDIA_STUB_DEEPLC_FAIL"):
+    sys.exit("stub DeepLC worker: failing as asked (MUMDIA_STUB_DEEPLC_FAIL)")
+retain = int(os.environ.get("MUMDIA_STUB_DEEPLC_RETAIN", "0"))
+for src, dst in pairs:
+    shutil.copyfile(src, dst)
+    rows = pq.read_metadata(src).num_rows
+    with open(dst + ".summary.json", "w", encoding="utf-8") as fh:
+        json.dump({"rows": rows, "repredicted": rows - retain, "retained_imported": retain,
+                   "retained_non_standard": retain, "retained_no_prediction": 0,
+                   "model": "stub"}, fh)
+'''
+with open(os.path.join(scripts, "deeplc_finetune.py"), "w", encoding="utf-8") as fh:
+    fh.write(STUB)
+# Present so the script directory resolves as one holding workers; never called here.
+with open(os.path.join(scripts, "deeplc_worker.py"), "w", encoding="utf-8") as fh:
+    fh.write('import sys\nsys.exit("stub: deeplc_worker.py is not stubbed")\n')
+
+base = {
+    "features": {"set": "extended"},
+    "extract": {"apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2},
+    "predict_frag": {"deeplc_python": sys.executable, "sidecar_script_dir": scripts},
+}
+def arm(name, **sections):
+    cfg = json.loads(json.dumps(base))
+    for key, value in sections.items():
+        cfg.setdefault(key, {}).update(value)
+    with open(os.path.join(root, name + ".json"), "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2)
+banded = {"window_groups": 2, "calibration": "global"}
+arm("union", groups=dict(banded, rt_adaptation="once_per_run"),
+    rt_im_train={"multihead_calibration": 2})
+arm("keep", groups=dict(banded, rt_adaptation="once_per_run"),
+    rt_im_train={"multihead_calibration": 0})
+arm("perband", groups=banded, rt_im_train={"multihead_calibration": 0})
+arm("defer", groups=dict(banded, rt_adaptation="once_per_run"),
+    rt_im_train={"multihead_calibration": 2},
+    predict_frag={"rt_predictor": "deeplc", "defer_deeplc_to_multihead": True})
+arm("seq", rt_im_train={"multihead_calibration": 2})
+arm("overlap", rt_im_train={"multihead_calibration": 2},
+    experiment={"overlap_front_threads": 1})
+# No trailing newline: on Windows it would arrive as CR LF, and $( ) strips the LF only.
+sys.stdout.write(os.path.join(root, "site"))
+PYEOF
+)
+stub_site="${stub_env%$'\r'}"
+# One stub call log per arm; each command below runs with the stub on PYTHONPATH only.
+stub_run() {
+    local name="$1"; shift
+    PYTHONPATH="$stub_site" MUMDIA_STUB_DEEPLC_LOG="$stub/$name.calls.jsonl" "$@" \
+        > "$stub/$name.log" 2>&1
+}
+stub_experiment() {
+    local name="$1" cfgname="$2"; shift 2
+    stub_run "$name" "$BIN" run-experiment \
+        --lib-precursors "$work/lib_prec.parquet" --lib-fragments "$work/lib_frag.parquet" \
+        --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" \
+        --run-names a --run-names b --out-dir "$stub/$name" \
+        --config "$stub/$cfgname.json" --threads 2 "$@"
+}
+for a in union keep perband; do
+    stub_experiment "$a" "$a" \
+        || { tail -30 "$stub/$a.log"; echo "stub arm $a failed"; exit 1; }
+done
+stub_experiment seq seq || { tail -30 "$stub/seq.log"; echo "stub arm seq failed"; exit 1; }
+stub_experiment overlap overlap \
+    || { tail -30 "$stub/overlap.log"; echo "stub arm overlap failed"; exit 1; }
+# A failing adaptation under the overlap: the run fails, and with the worker's error.
+if MUMDIA_STUB_DEEPLC_FAIL=1 stub_experiment overlap_fail overlap; then
+    echo "the overlap arm succeeded although its DeepLC worker failed"; exit 1
+fi
+grep -q "DeepLC multi-head calibration failed" "$stub/overlap_fail.log" \
+    || { tail -20 "$stub/overlap_fail.log"; echo "the overlap arm did not report the worker's failure"; exit 1; }
+# The deferred FASTA build: refused when the calibration keeps a row's placeholder iRT,
+# accepted when it re-predicts every row.
+stub_run defer_fast "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$stub/defer_fast" --config "$stub/defer.json" --threads 2 \
+    || { tail -30 "$stub/defer_fast.log"; echo "the deferred-DeepLC grouped run failed"; exit 1; }
+grep -q "the deferred DeepLC pass was not needed" "$stub/defer_fast.log" \
+    || { echo "the deferred-DeepLC run did not check its bands"; exit 1; }
+if MUMDIA_STUB_DEEPLC_RETAIN=1 stub_run defer_kept "$BIN" run --fasta test_data/fixture.fasta \
+        --mzml "$work/fixture.mzML" --out-dir "$stub/defer_kept" --config "$stub/defer.json" \
+        --threads 2; then
+    echo "a deferred-DeepLC run accepted bands that kept the placeholder iRT"; exit 1
+fi
+grep -q "kept the input iRT" "$stub/defer_kept.log" \
+    || { tail -20 "$stub/defer_kept.log"; echo "the refusal did not say why"; exit 1; }
+grep -q "reusing a previous run's adapted bands" "$stub/union.log" \
+    || { echo "run b of the once_per_run arm did not reuse run a's bands"; exit 1; }
+grep -q "the bands keep those values" "$stub/keep.log" \
+    || { echo "the keep arm did not keep the experiment-level re-prediction"; exit 1; }
+"$PY" - "$stub" "$work" <<'PYEOF'
+import json, os, sys
+from pathlib import Path
+import pyarrow.parquet as pq
+
+stub, work = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
+def calls(name):
+    path = stub / (name + ".calls.jsonl")
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text("utf-8").splitlines() if line]
+def same(a, b):
+    return Path(a).resolve() == Path(b).resolve()
+def fail(msg):
+    sys.exit("stub arms: " + msg)
+bands = ("g00", "g01")
+
+# once_per_run + multi-head: ONE worker call for run a's two bands, written under the names
+# run b's shared_bands looks for; run b calls nothing and writes no band table.
+c = calls("union")
+if len(c) != 1 or c[0]["mode"] != "multihead" or not c[0]["bands"]:
+    fail("union: expected one --bands multi-head call, got %r" % c)
+want = [(stub / "union/a/groups" / g / "lib_precursors.parquet",
+         stub / "union/a/groups" / g / "lib_precursors_multihead.parquet") for g in bands]
+if [(Path(i).resolve(), Path(o).resolve()) for i, o in c[0]["pairs"]] != want:
+    fail("union: band pairs %r, expected %r" % (c[0]["pairs"], want))
+for g in bands:
+    if not (stub / "union/a/groups" / g / "lib_precursors_multihead.parquet").exists():
+        fail("union: run a wrote no adapted table for " + g)
+    if list((stub / "union/b/groups" / g).glob("lib_precursors*.parquet")):
+        fail("union: run b wrote a band table for %s although it reuses run a's" % g)
+
+# once_per_run, multi-head off: the experiment re-predicts the library once and the bands
+# keep it, so the worker runs once and no band table is written at all.
+c = calls("keep")
+if len(c) != 1 or c[0]["mode"] != "repredict" or c[0]["bands"]:
+    fail("keep: expected one whole-library re-prediction, got %r" % c)
+if not same(c[0]["pairs"][0][0], work / "lib_prec.parquet"):
+    fail("keep: re-predicted %r, not the imported library" % c[0]["pairs"][0][0])
+for run in ("a", "b"):
+    for g in bands:
+        if list((stub / "keep" / run / "groups" / g).glob("lib_precursors*.parquet")):
+            fail("keep: %s/%s wrote a band table" % (run, g))
+
+# per_band, multi-head off: the experiment re-prediction, then one per band per run, and run
+# b takes run a's band slices instead of writing its own.
+c = calls("perband")
+if [x["mode"] for x in c] != ["repredict"] * 5 or any(x["bands"] for x in c):
+    fail("perband: expected five single-table re-predictions, got %r" % c)
+for k, (run, g) in enumerate([(r, g) for r in ("a", "b") for g in bands], start=1):
+    lib_in, lib_out = c[k]["pairs"][0]
+    if not same(lib_in, stub / "perband/a/groups" / g / "lib_precursors.parquet"):
+        fail("perband: run %s band %s read %r, not run a's slice" % (run, g, lib_in))
+    if not same(lib_out, stub / "perband" / run / "groups" / g / "lib_precursors_deeplc.parquet"):
+        fail("perband: run %s band %s wrote %r" % (run, g, lib_out))
+    if (stub / "perband/b/groups" / g / "lib_precursors.parquet").exists():
+        fail("perband: run b wrote its own slice of " + g)
+
+# The overlap: the same single multi-head call on run a, and the same scored table as the
+# runs one after the other (the stub makes the adaptation a copy, so the fronts are the
+# only thing the overlap could change).
+for name in ("seq", "overlap"):
+    c = calls(name)
+    if len(c) != 1 or c[0]["mode"] != "multihead" or c[0]["bands"]:
+        fail("%s: expected one multi-head call, got %r" % (name, c))
+    if not same(c[0]["seed"], stub / name / "a/seed_psms.parquet"):
+        fail("%s: calibrated against %r" % (name, c[0]["seed"]))
+a = pq.read_table(stub / "seq/scored_combined.parquet")
+b = pq.read_table(stub / "overlap/scored_combined.parquet")
+if not a.equals(b):
+    fail("the overlapped experiment scored differently from the sequential one")
+for run in ("a", "b"):
+    if not (stub / "overlap" / run / "seed_psms.parquet").exists():
+        fail("overlap: run %s has no seed table" % run)
+
+# The deferred build: one --bands multi-head call per run, over the two bands.
+for name in ("defer_fast", "defer_kept"):
+    c = calls(name)
+    if len(c) != 1 or c[0]["mode"] != "multihead" or len(c[0]["pairs"]) != 2:
+        fail("%s: expected one two-band multi-head call, got %r" % (name, c))
+print("    ok: once_per_run union, kept re-prediction, per-band slices reused, deferred "
+      "library refused and accepted, overlap equal to sequential (%d stub calls)"
+      % sum(len(calls(n)) for n in ("union", "keep", "perband", "seq", "overlap",
+                                     "overlap_fail", "defer_fast", "defer_kept")))
+PYEOF
 
 # 6. Assertions.
 echo "=== smoke: assertions"
