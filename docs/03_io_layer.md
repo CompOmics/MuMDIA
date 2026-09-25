@@ -502,8 +502,10 @@ digest of the finished file. A writer can therefore hash while it writes:
   `BatchWriter::with_options`, `TableWriter::with_content_hash()`,
   `SpliceWriter::create_hashed`, `write_table_hashed` and
   `write_batches_hashed`. The digest is finalised after parquet has written the
-  footer (`ArrowWriter::into_inner`, `SerializedFileWriter::into_inner`, which
-  write the same footer bytes as `close`) and returned as a
+  footer (`ColumnEncoder::into_inner`, which ends in
+  `SerializedFileWriter::into_inner`, for `TableWriter`, `BatchWriter` and
+  `write_batches`; `SerializedFileWriter::into_inner` directly for
+  `SpliceWriter`; both write the same footer bytes as `close`) and returned as a
   `report::Written { rows, content_hash }` by the writer's `close_hashed`;
 - it is off for files nobody records: the pool's per-row-group rewrite temp
   files, compete's splice scratch files and the rescore sidecar handoff.
@@ -516,11 +518,15 @@ rewritten table; a hard-linked one carries the features hash), the pool's three
 spliced tables in `run_groups`, and rescore's `psms_scored`. The small tables
 (digest, peptidoforms, quant, prescan, align) still hash by reading back.
 
-The digest is the same blake3 over the same bytes, so every `content_hash` in
-the reports and manifests is unchanged; the smoke run's manifests and reports are
-identical to the previous binary's apart from the git SHA and argv
-(`hash_on_write_tests` in `table.rs` pins digest == `blake3_file` for every writer
-type: empty, one block, many row groups, list columns). `blake3_file` itself is
+The digest is the same blake3 over the same bytes, so hashing while writing
+changes no byte and no `content_hash` by itself: with only this change, the
+smoke run's manifests and reports were identical to the previous binary's apart
+from the git SHA and argv (`hash_on_write_tests` in `table.rs` pins digest ==
+`blake3_file` for every writer type: empty, one block, many row groups, list
+columns). The capped-writer layout changes in this release do change bytes and
+hashes: the page cut ("Page layout of capped writers"), the float plan ("Float
+encodings planned from the first rows") and the PLAIN chromatogram `rt` axis.
+Each recorded hash is still the blake3 of the file as written. `blake3_file` itself is
 still not memoised: `features` uses it in its tests as an independent integrity
 check of a published file.
 

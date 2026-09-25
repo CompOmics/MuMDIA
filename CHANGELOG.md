@@ -125,8 +125,10 @@ than a number. Both are recorded in every run's `manifest.json`.
   `WriteOptions::content_hash` feeds its bytes to blake3 on the way to the file and returns
   the digest when it closes, so convert, predict-frag, search-seed, rt-im-train, extract,
   features, compete, the pool and rescore no longer read their outputs back to hash them.
-  The digest is the same blake3 over the same bytes: every recorded hash and every artifact
-  byte is unchanged (docs/03 "Hash on write").
+  The digest is the same blake3 over the same bytes, so hashing while writing changes no
+  artifact byte and no recorded hash by itself (docs/03 "Hash on write"). The capped-writer
+  layout changes below (page cut, float plan, PLAIN chromatogram `rt`) do change the bytes
+  and content hashes of the files they write.
 - **`TableFile::scan` can read each row group's projection in one sequential read.**
   `ScanOptions::coalesced()` gives the parquet reader a span cache that reads every selected
   row group's projected column chunks as one byte span (split where unprojected columns
