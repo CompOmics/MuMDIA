@@ -2979,12 +2979,15 @@ impl TableFile {
 
     /// The rows of this handle at which a data page of `column` begins, ascending, as row
     /// indices of the handle (0 is its first row): for every row group the handle covers,
-    /// the first row it covers there and the first row of each page of each leaf under the
-    /// column, from the offset index. A run of rows `[a, b)` holds whole pages of the
-    /// column exactly when `a` and `b` are both in this list (or `b` is the handle's row
-    /// count), which is what a caller needs to cut a selection that skips pages rather than
-    /// rows inside them. `None` when the footer carries no offset index for a covered
-    /// group ([`TableFile::offset_indexed`]); an error for a column the file does not have.
+    /// the first row it covers there, and every row at which a page begins in EVERY leaf
+    /// under the column, from the offset index. A run of rows `[a, b)` holds whole pages of
+    /// every leaf of the column exactly when `a` and `b` are both in this list (or `b` is
+    /// the handle's row count), which is what a caller needs to cut a selection that skips
+    /// pages rather than rows inside them. A column of one leaf (every scalar and every list of scalars) lists
+    /// each of its page starts; a column of several leaves (a struct) lists the starts its
+    /// leaves share, because a start of one leaf that falls inside a page of another would
+    /// cut that page. `None` when the footer carries no offset index for a covered group
+    /// ([`TableFile::offset_indexed`]); an error for a column the file does not have.
     pub fn page_starts(&self, column: &str) -> Result<Option<Vec<usize>>> {
         let root = self
             .projection_roots(Some(&[column]))?
@@ -3005,6 +3008,8 @@ impl TableFile {
             let (s, e) = (start.max(first), (start + rows).min(first + n));
             if s < e {
                 out.push(s - first);
+                // The starts inside the covered rows that every leaf shares.
+                let mut shared: Option<Vec<usize>> = None;
                 for &leaf in &leaves {
                     let Some(locs) = oi.get(g).and_then(|cols| cols.get(leaf)) else {
                         return Ok(None);
@@ -3013,13 +3018,22 @@ impl TableFile {
                     if locs.is_empty() {
                         return Ok(None);
                     }
-                    for loc in locs {
-                        let at = start + loc.first_row_index.max(0) as usize;
-                        if at > s && at < e {
-                            out.push(at - first);
+                    let mut here: Vec<usize> = locs
+                        .iter()
+                        .map(|loc| start + loc.first_row_index.max(0) as usize)
+                        .filter(|&at| at > s && at < e)
+                        .collect();
+                    here.sort_unstable();
+                    here.dedup();
+                    shared = Some(match shared {
+                        None => here,
+                        Some(mut prev) => {
+                            prev.retain(|at| here.binary_search(at).is_ok());
+                            prev
                         }
-                    }
+                    });
                 }
+                out.extend(shared.unwrap_or_default().into_iter().map(|at| at - first));
             }
             start += rows;
         }
@@ -6892,6 +6906,104 @@ mod selection_tests {
         assert_eq!(got, expect, "a span that starts and ends inside row groups");
         // The selection must cover the handle.
         assert!(indexed.batches_runs(None, 64, &[(n - 1, true)]).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A column of two leaves whose pages break at different rows: its page starts are the
+    /// rows at which BOTH leaves start a page (plus each group's first row), never a start
+    /// of one leaf that falls inside a page of the other, which a run cut there would split.
+    #[test]
+    fn a_struct_columns_page_starts_are_the_starts_its_leaves_share() {
+        use arrow::array::StructArray;
+        let path = tmp("struct_pages.parquet");
+        let n = 600usize;
+        // An 8-byte leaf and a 40-byte leaf under one root, written without dictionaries
+        // into tiny pages, so the wide leaf breaks about five times as often as the narrow.
+        let wide: Vec<String> = (0..n).map(|i| format!("{i:040}")).collect();
+        let narrow: Vec<f64> = (0..n).map(|i| i as f64 * 0.5).collect();
+        let s = StructArray::from(vec![
+            (
+                Arc::new(Field::new("x", DataType::Float64, false)),
+                Arc::new(Float64Array::from(narrow)) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("w", DataType::Utf8, false)),
+                Arc::new(StringArray::from(wide)) as ArrayRef,
+            ),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("pair", s.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from((0..n as u32).collect::<Vec<_>>())),
+                Arc::new(s),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_compression(codec())
+            .set_dictionary_enabled(false)
+            .set_max_row_group_row_count(Some(256))
+            .set_data_page_size_limit(512)
+            .set_write_batch_size(5)
+            .build();
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let (_, meta) = splice_meta(&path).unwrap();
+        let oi = meta.offset_index().expect("an offset index");
+        // Per leaf (1 = pair.x, 2 = pair.w), every page start as a file row.
+        let mut leaf_starts: Vec<Vec<usize>> = vec![Vec::new(); 3];
+        let mut group_starts: Vec<usize> = Vec::new();
+        let mut at = 0usize;
+        for (g, rg) in oi.iter().enumerate() {
+            group_starts.push(at);
+            for (leaf, starts) in leaf_starts.iter_mut().enumerate() {
+                starts.extend(
+                    rg[leaf]
+                        .page_locations()
+                        .iter()
+                        .map(|l| at + l.first_row_index as usize),
+                );
+            }
+            at += meta.row_group(g).num_rows() as usize;
+        }
+        let only_one: Vec<usize> = leaf_starts[2]
+            .iter()
+            .copied()
+            .filter(|r| !leaf_starts[1].contains(r))
+            .collect();
+        assert!(
+            !only_one.is_empty(),
+            "the fixture must give the wide leaf page starts the narrow one lacks"
+        );
+        let indexed = TableFile::open_with_offset_index(&path).unwrap();
+        let starts = indexed.page_starts("pair").unwrap().unwrap();
+        let mut expect: Vec<usize> = group_starts.clone();
+        expect.extend(
+            leaf_starts[1]
+                .iter()
+                .copied()
+                .filter(|r| leaf_starts[2].contains(r)),
+        );
+        expect.sort_unstable();
+        expect.dedup();
+        assert_eq!(starts, expect);
+        assert!(
+            only_one.iter().all(|r| !starts.contains(r)),
+            "a start of one leaf inside a page of the other was listed"
+        );
+        // A one-leaf column still lists every page start it has.
+        let mut id_starts: Vec<usize> = group_starts;
+        id_starts.extend(leaf_starts[0].iter().copied());
+        id_starts.sort_unstable();
+        id_starts.dedup();
+        assert_eq!(indexed.page_starts("id").unwrap().unwrap(), id_starts);
         std::fs::remove_file(&path).ok();
     }
 }
