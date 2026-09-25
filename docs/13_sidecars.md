@@ -138,10 +138,12 @@ code.
 **deeplc_finetune** (`sidecar.rs:111` `run_deeplc_finetune`)
 - IN `<lib_in>` = `fragment_library_precursors.parquet` (needs `peptidoform`,
   `predicted_irt`); `<seed>` = seed PSMs (`peptidoform`, `label`, `spectrum_q`,
-  `observed_rt`).
+  `observed_rt`, and `base_peptide_id` under `--window-holdout-frac`; only these
+  columns are read).
 - OUT `<lib_out>` = `fragment_library_precursors_ft.parquet`: the input table with
-  the `predicted_irt` column replaced (`deeplc_finetune.py:156-159`). Same schema,
-  values rewritten.
+  the `predicted_irt` column replaced (`rewrite_irt`). Same schema, values rewritten.
+  Beside it `<lib_out>.summary.json` counts where each row's value came from and
+  records the torch threads used.
 
 **mokapot_worker** / **nn_rescore_worker** (`rescore.rs:740` `run_pin_sidecar`)
 - IN `rescore.pin`: Percolator tab-separated. Fixed columns
@@ -318,11 +320,14 @@ Algorithm: (1) build the reference from confident **target** seed PSMs with
 (~4k) E.coli seed; (3) `deeplc.finetune(ref_psms, train_kwargs)` transfer-learns
 the weights (`deeplc_finetune.py:128`); (4) predict every unique standard
 peptidoform on its **`DECOY_`-stripped** underlying sequence so decoys land on the
-same iRT scale as targets (`deeplc_finetune.py:44-45, 135-156`). A peptidoform
-that is non-standard (`is_std` false, e.g. a terminal mod outside `STD`) or was
-not predicted keeps its **original** `predicted_irt` unchanged, because the
-write-back is `preds.get(base_pf(pf), orig[i])` (`deeplc_finetune.py:156`), so
-only the sequences DeepLC actually re-predicted move onto the fine-tuned scale.
+same iRT scale as targets (`base_pf`, and `library_bases` for the whole column; both
+strip only a leading `DECOY_`). A peptidoform that is non-standard (`is_std` false,
+e.g. a terminal mod outside `STD`), was not predicted, or came back non-finite keeps
+its **original** `predicted_irt` unchanged (`rewrite_irt`), so only the sequences
+DeepLC actually re-predicted move onto the fine-tuned scale. The unique set, the
+seed filter and the write-back run in Arrow and the base model is loaded once
+(`load_base_model`), which measured byte-identical to the per-row Python loop they
+replace; `tests/python/test_deeplc_predict.py` pins the equivalence without DeepLC.
 Beyond the seven flags Rust passes for a fine-tune (`--epochs/--patience/--q-train/--batch/
 --window-holdout-frac/--seed/--predict-threads`, the last one the engine's rayon thread
 count for the forward-only library prediction while training keeps its bounded pool), and

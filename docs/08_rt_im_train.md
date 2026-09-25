@@ -640,16 +640,19 @@ last-write-wins in iteration order rather than best-score. The batch size
 auto-scales when `--batch 0`: `min(512, max(16, n_ref // 30))`, so each epoch runs
 at least about 30 gradient steps; a fixed large batch underfits small references
 (deeplc_finetune.py:132-135). `deeplc.finetune(ref_psms, train_kwargs=...)`
-transfer-learns the model (deeplc_finetune.py:137-146); predictions come from
-`deeplc.predict(batch, model=ft_model)` over the unique standard peptidoforms in
-chunks of 100_000 (deeplc_finetune.py:169-184). DeepLC's multitask models return a 2D
-array (one column per task head); `agg` reduces it to one iRT by averaging across
-heads (`a.mean(axis=1)`, deeplc_finetune.py:58-60, called at 175). Prediction is on
-the DECOY_-stripped underlying sequence so decoys land on the same iRT scale as
-targets (deeplc_finetune.py:45, 153-161). The rewritten column overwrites
-`predicted_irt` in place in the output parquet (deeplc_finetune.py:189-192);
-peptidoforms with no prediction, including non-standard ones, keep their original
-iRT (`preds.get(base_pf(pf), orig[i])`, deeplc_finetune.py:189).
+transfer-learns the model; predictions come from `deeplc.predict(batch,
+model=ft_model)` over the unique standard peptidoforms in chunks of 100_000
+(`PREDICT_CHUNK`). DeepLC's multitask models return a 2D array (one column per task
+head); `agg` reduces it to one iRT by averaging across heads (`a.mean(axis=1)`).
+Prediction is on the DECOY_-stripped underlying sequence (a prefix strip, as
+`base_pf`) so decoys land on the same iRT scale as targets. The unique set is built in
+Arrow (`library_bases`, `unique_standard_bases`: first-occurrence order, standard
+residues only), the seed reference reads only the five columns it uses, the base model
+is loaded once and passed to every call, and the rewrite is one Arrow `index_in` lookup
+(`rewrite_irt`); all four measured byte-identical to the per-row Python version on
+library and multi-head fixtures. The rewritten column overwrites `predicted_irt` in the
+output parquet; peptidoforms with no finite prediction, including non-standard ones,
+keep their original iRT and are counted in `<lib_out>.summary.json`.
 
 The worker also carries a documented OpenMP crash fix: numpy's OpenBLAS (GNU
 OpenMP) and torch's Intel OpenMP coexist only under `KMP_DUPLICATE_LIB_OK=TRUE`,

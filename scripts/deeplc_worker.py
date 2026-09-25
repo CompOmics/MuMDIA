@@ -262,12 +262,24 @@ def main():
     ids = tbl.column("id").to_pylist()
     pforms = tbl.column("peptidoform").to_pylist()
 
+    # One model for every chunk: `deeplc.predict` without `model=` reads the checkpoint
+    # from disk on each call. The instance is handed back unchanged and prediction runs in
+    # eval mode under no_grad, so the numbers are the same (see deeplc_finetune.py,
+    # `load_base_model`, for the measurement).
+    try:
+        from deeplc import _model_ops
+        from deeplc.core import DEFAULT_MODEL
+
+        model = _model_ops.load_model(DEFAULT_MODEL)
+    except ImportError:
+        model = None
+
     preds = np.empty(len(pforms), dtype=np.float32)
     chunk = 200_000
     with quiet_deeplc_progress():
         for start in range(0, len(pforms), chunk):
             end = min(start + chunk, len(pforms))
-            p = np.asarray(deeplc.predict(pforms[start:end]), dtype=np.float64)
+            p = np.asarray(deeplc.predict(pforms[start:end], model=model), dtype=np.float64)
             # The multitask model returns an ensemble matrix (N, n_models); average
             # across models to get a single RT prediction per peptide.
             if p.ndim == 2:

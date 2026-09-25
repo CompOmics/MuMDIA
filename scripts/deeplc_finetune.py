@@ -41,7 +41,6 @@ import argparse
 import contextlib
 import io
 import json
-import math
 import re
 import time
 import deeplc                                    # import before numpy (OpenMP load order)
@@ -83,16 +82,26 @@ def _check_deeplc_version():
 _check_deeplc_version()
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import torch
 from psm_utils import PSM, PSMList
 
 STD = set("ACDEFGHIKLMNPQRSTVWY")
-strip_mods = lambda s: re.sub(r"\[[^\]]*\]", "", s)
+MOD_RE = r"\[[^\]]*\]"
+strip_mods = lambda s: re.sub(MOD_RE, "", s)
 # Strip the decoy marker before prediction: a "DECOY_" peptidoform must be predicted on
 # its underlying sequence, else is_std rejects it (the '_') and the decoy keeps the base
 # (un-fine-tuned) iRT, landing on a different scale than the fine-tuned targets.
 base_pf = lambda s: s[6:] if s.startswith("DECOY_") else s
+# The same two rules over a whole Arrow column. The decoy strip is anchored at the start,
+# as `base_pf` is; `replace_substring` would strip every occurrence. `*` rather than `+`
+# because `is_std("")` is true.
+DECOY_PREFIX_RE = r"^DECOY_"
+STD_FULL_RE = r"^[ACDEFGHIKLMNPQRSTVWY]*$"
+# Unique peptidoforms per prediction call. Fixed, because the call is the unit DeepLC
+# length-buckets and batches within, so the same chunks give the same numbers.
+PREDICT_CHUNK = 100_000
 
 
 
@@ -277,14 +286,52 @@ def agg(a):
     return a.mean(axis=1) if a.ndim == 2 else a
 
 
+def load_base_model():
+    """The DeepLC base model, loaded once, or None to let every call load its own.
+
+    `deeplc.predict(batch)` loads the checkpoint from disk on every call, and
+    `predict_and_calibrate` twice (once to size its head source, once to predict), so a
+    whole-library prediction in 100,000-peptidoform chunks read the model 50 to 100 times.
+    `load_model` hands a module instance back unchanged, and prediction runs in eval mode
+    under `no_grad`, so passing the one instance gives the same numbers (measured
+    bit-identical on 3,002 peptidoforms, DeepLC 4.5.0). The helpers are private DeepLC API
+    (present in 4.4.0 and 4.5.0), hence the fallback.
+    """
+    try:
+        from deeplc import _model_ops
+        from deeplc.core import DEFAULT_MODEL
+    except ImportError:
+        return None
+    return _model_ops.load_model(DEFAULT_MODEL)
+
+
+def library_bases(peptidoforms):
+    """The DECOY_-stripped sequence of every library row, as `base_pf` gives it."""
+    return pc.replace_substring_regex(peptidoforms, pattern=DECOY_PREFIX_RE, replacement="")
+
+
+def unique_standard_bases(bases):
+    """Unique stripped sequences in first-occurrence order, standard residues only.
+
+    What the per-row loop `if b not in seen and is_std(pf)` produced, computed in Arrow so
+    a library of 1e7 to 1e8 rows does not become that many Python strings and a set. The
+    per-chunk uniques are widened to large_string before they are joined: at 1e8 rows they
+    can pass the 2 GiB offset limit of `string`.
+    """
+    parts = [pc.unique(chunk).cast(pa.large_string()) for chunk in bases.chunks]
+    if not parts:
+        return pa.array([], pa.large_string())
+    uniq = parts[0] if len(parts) == 1 else pc.unique(pa.concat_arrays(parts))
+    stripped = pc.replace_substring_regex(uniq, pattern=MOD_RE, replacement="")
+    return uniq.filter(pc.match_substring_regex(stripped, pattern=STD_FULL_RE))
+
+
 def build_reference(args):
     """The run's confident seed PSMs as a `PSMList`: peptidoform plus observed RT.
 
     Shared by the fine-tune and the multi-head calibration, so both adapt to exactly the
     same peptides and both honour the held-out window rule.
     """
-    # reference: confident target seed PSMs (peptidoform + observed RT, seconds)
-    seed = pq.read_table(args.seed_path).to_pydict()
     # Held-out window sizing: the same rule as rt_im_train.rs::is_holdout, on the same
     # base_peptide_id, so the peptides rt-im-train scores as held-out never enter the
     # fine-tune. Pin the shared contract with the exact cases the Rust unit test uses.
@@ -294,11 +341,25 @@ def build_reference(args):
     is_holdout = lambda bid: bid % 1000 < round(hf * 1000)
     if hf > 0.0:
         assert [299 % 1000 < round(0.3 * 1000), 300 % 1000 < round(0.3 * 1000)] == [True, False]
+    # reference: confident target seed PSMs (peptidoform + observed RT, seconds). Only the
+    # columns the rule reads, and only the confident targets become Python objects: the
+    # label and q filter runs in Arrow and keeps row order, so the dict below is built from
+    # the same rows in the same order as a loop over the whole table.
+    cols = ["peptidoform", "label", "spectrum_q", "observed_rt"]
+    if hf > 0.0:
+        cols.append("base_peptide_id")
+    seed = pq.read_table(args.seed_path, columns=cols)
+    confident = pc.and_(
+        pc.equal(seed.column("label"), "target"),
+        pc.less_equal(seed.column("spectrum_q").cast(pa.float64()),
+                      pa.scalar(float(args.q_train), pa.float64())),
+    )
+    seed = seed.filter(confident).to_pydict()
     ref = {}
     n_held = 0
     for i in range(len(seed["peptidoform"])):
         pf = seed["peptidoform"][i]
-        if seed["label"][i] == "target" and seed["spectrum_q"][i] <= args.q_train and is_std(pf):
+        if is_std(pf):
             if hf > 0.0 and is_holdout(seed["base_peptide_id"][i]):
                 n_held += 1
                 continue
@@ -315,7 +376,7 @@ def build_reference(args):
     return ref_psms
 
 
-def fit_multihead(args, ref_psms):
+def fit_multihead(args, ref_psms, model=None):
     """Fit a multi-head ridge calibration of the base model against this run.
 
     `deeplc.predict` returns ONE of the model's 6,543 LC-setup heads, the one named by
@@ -336,7 +397,7 @@ def fit_multihead(args, ref_psms):
           f"{len(ref_psms)} anchors", flush=True)
     t0 = time.time()
     with quiet_deeplc_progress():
-        cal = deeplc.calibrate(psm_list_reference=ref_psms, calibration=cal)
+        cal = deeplc.calibrate(psm_list_reference=ref_psms, calibration=cal, model=model)
     idx = getattr(cal, "_head_idx", None)
     n_fitted = 0 if idx is None else len(idx)
     print(f"multi-head calibration: {n_fitted} heads combined, best head "
@@ -482,7 +543,6 @@ def main():
               "MUMDIA_DEEPLC_THREAD_CAP=0 to take the request as given", flush=True)
 
     lib = pq.read_table(args.lib_in)
-    pform = lib.column("peptidoform").to_pylist()
     orig = np.asarray(lib.column("predicted_irt"), dtype=np.float32)
 
     if args.multihead and args.no_finetune:
@@ -493,8 +553,10 @@ def main():
         raise SystemExit(f"--multihead must be >= 0, got {args.multihead}")
 
     calibration = None
+    base_model = None
     if args.multihead:
-        calibration = fit_multihead(args, build_reference(args))
+        base_model = load_base_model()
+        calibration = fit_multihead(args, build_reference(args), model=base_model)
         ft_model = None
     elif args.no_finetune:
         ft_model = None
@@ -509,14 +571,13 @@ def main():
     # Deduplicate and predict on the DECOY_-stripped underlying sequence so decoys are
     # fine-tuned onto the same iRT scale as targets (shift-decoys reuse their target's
     # prediction; reverse-decoys get their reversed-sequence prediction).
-    uniq, seen = [], set()
-    for pf in pform:
-        b = base_pf(pf)
-        if b not in seen and is_std(pf):
-            seen.add(b)
-            uniq.append(b)
+    bases = library_bases(lib.column("peptidoform"))
+    uniq = unique_standard_bases(bases)
     if args.predict_limit:
-        uniq = uniq[: args.predict_limit]
+        uniq = uniq.slice(0, args.predict_limit)
+    if ft_model is None and base_model is None:
+        base_model = load_base_model()
+    model = ft_model if ft_model is not None else base_model
     if predict_threads != torch.get_num_threads():
         torch.set_num_threads(predict_threads)
     which = (
@@ -531,8 +592,8 @@ def main():
     # Only needed to satisfy `predict_and_calibrate`, which parses a reference before it
     # notices the calibration is already fitted.
     ref_for_transform = ref_psms_for_transform(calibration, args)
-    preds = {}
-    chunk = 100_000
+    values = np.empty(len(uniq), dtype=np.float64)
+    chunk = PREDICT_CHUNK
     t_pred0 = time.time()
     # DeepLC's progress writer emits one blank line per update when stdout is not a
     # terminal, and the engine inherits this worker's stdout, so a real run was 98%
@@ -541,16 +602,17 @@ def main():
     with quiet_deeplc_progress():
         for s in range(0, len(uniq), chunk):
             t0 = time.time()
-            batch = uniq[s:s + chunk]
+            batch = uniq.slice(s, chunk).to_pylist()
             if calibration is not None:
                 # The calibration is already fitted, so this only predicts and transforms: it
                 # pulls the head columns the ridge reads rather than materialising all 6,543,
                 # which at library scale would be terabytes. The reference is passed again
                 # because the signature requires one; the fitting step is skipped.
                 p = agg(deeplc.predict_and_calibrate(
-                    batch, psm_list_reference=ref_for_transform, calibration=calibration))
+                    batch, psm_list_reference=ref_for_transform, calibration=calibration,
+                    model=model))
             else:
-                p = agg(deeplc.predict(batch) if ft_model is None else deeplc.predict(batch, model=ft_model))
+                p = agg(deeplc.predict(batch, model=model))
             # A structurally short or long answer is a broken predictor, not a set of
             # unsupported peptidoforms: zipping it silently paired predictions with the wrong
             # peptidoforms and left the tail on its imported value (docs/30 R6).
@@ -558,8 +620,7 @@ def main():
                 raise SystemExit(
                     f"DeepLC returned {len(p)} predictions for {len(batch)} peptidoforms in one "
                     f"batch; refusing to rewrite the library from a malformed response")
-            for pf, v in zip(batch, p):
-                preds[pf] = float(v)
+            values[s:s + len(batch)] = p
             done = min(s + chunk, len(uniq))
             dt = time.time() - t0
             rate = len(batch) / dt if dt > 0 else float("inf")
@@ -568,7 +629,7 @@ def main():
                   f"({rate:.0f} peptidoforms/s, ETA {eta / 60:.1f} min)", flush=True)
     print(f"prediction phase: {time.time() - t_pred0:.1f}s total", flush=True)
 
-    new, summary = rewrite_irt(pform, orig, preds)
+    new, summary = rewrite_irt(bases, orig, uniq, values)
     idx = lib.schema.get_field_index("predicted_irt")
     lib = lib.set_column(idx, "predicted_irt", pa.array(new, pa.float32()))
     pq.write_table(lib, args.lib_out)
@@ -597,33 +658,39 @@ def ref_psms_for_transform(calibration, args):
     return PSMList(psm_list=[PSM(peptidoform="PEPTIDEK", retention_time=0.0, spectrum_id="0")])
 
 
-def rewrite_irt(pform, orig, preds):
+def rewrite_irt(bases, orig, uniq, values):
     """The new `predicted_irt` column and a count of where each value came from.
 
-    A peptidoform with a finite prediction for its DECOY_-stripped sequence takes it. A
-    peptidoform without one keeps its imported value: rows with non-standard residues are
-    never sent to DeepLC (`is_std`), and a prediction that came back non-finite is an
-    unsupported input rather than a number. Both are counted so the mixture of RT sources
-    in the written library is explicit instead of silent (docs/30 R6). `base_pf` is
-    recomputed here rather than cached from the pass above on purpose: caching it would
-    retain one extra string per library row (hundreds of MB at library scale).
+    `bases` is the DECOY_-stripped sequence of every library row, `uniq` the sequences
+    that were predicted and `values` their predictions (float64, aligned with `uniq`). A
+    row whose sequence has a finite prediction takes it, rounded to float32. A row without
+    one keeps its imported value: rows with non-standard residues are never sent to DeepLC
+    (`is_std`), rows past `--predict-limit` were not predicted, and a prediction that came
+    back non-finite is an unsupported input rather than a number. Both kinds are counted so
+    the mixture of RT sources in the written library is explicit instead of silent (docs/30
+    R6). The counts and the column are what the per-row dictionary lookup gave; only the
+    lookup moved into Arrow (`index_in`), so a 1e7-row library is not walked in Python.
     """
-    n = len(pform)
-    new = np.empty(n, dtype=np.float32)
-    repredicted = 0
-    no_prediction = 0
-    non_standard = 0
-    for i, pf in enumerate(pform):
-        v = preds.get(base_pf(pf))
-        if v is None:
-            new[i] = orig[i]
-            non_standard += 1
-        elif not math.isfinite(v):
-            new[i] = orig[i]
-            no_prediction += 1
-        else:
-            new[i] = v
-            repredicted += 1
+    n = len(bases)
+    probe, value_set = bases, uniq
+    try:
+        # `index_in` needs one string type on both sides. The library column is usually
+        # `string`; the unique set is large_string (see `unique_standard_bases`) and is
+        # narrowed when it fits, else the probe is widened.
+        value_set = uniq.cast(bases.type)
+    except (pa.ArrowInvalid, pa.ArrowCapacityError, OverflowError):
+        probe = bases.cast(pa.large_string())
+    pos = pc.fill_null(pc.index_in(probe, value_set=value_set), -1)
+    pos = np.asarray(pos.to_numpy(), dtype=np.int64)
+    found = pos >= 0
+    vals = np.full(n, np.nan, dtype=np.float64)
+    vals[found] = values[pos[found]]
+    good = np.isfinite(vals)  # NaN where not found, so this is found AND finite
+    new = orig.astype(np.float32, copy=True)
+    new[good] = vals[good].astype(np.float32)
+    repredicted = int(good.sum())
+    non_standard = int(n - found.sum())
+    no_prediction = int(found.sum()) - repredicted
     return new, {
         "rows": n,
         "repredicted": repredicted,
