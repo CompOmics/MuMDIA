@@ -3513,6 +3513,122 @@ impl TableFile {
         Ok((offsets, data))
     }
 
+    /// Visit an f64 column batch by batch: `f(first_row, values)`, with a NULL read as
+    /// NaN exactly as [`TableFile::f64`] reads it. For a caller that folds the column into
+    /// something smaller (a mask, a count) and never needs all of it at once: the
+    /// resident set is one batch rather than 8 bytes a row.
+    pub fn visit_f64(
+        &self,
+        name: &str,
+        mut f: impl FnMut(usize, &[f64]) -> Result<()>,
+    ) -> Result<()> {
+        let mut buf: Vec<f64> = Vec::with_capacity(SCALAR_BATCH_ROWS);
+        let mut first = 0usize;
+        for b in self.column(name, SCALAR_BATCH_ROWS)? {
+            buf.clear();
+            push_f64(&mut buf, b?.column(0), name)?;
+            f(first, &buf)?;
+            first += buf.len();
+        }
+        Ok(())
+    }
+
+    /// The values of `rows` (strictly ascending rows of this handle) of an f64 column:
+    /// exactly `self.f64(name)?` indexed at `rows`, decoded batch by batch so only the
+    /// picked values are held. A row past the end is an error.
+    pub fn f64_rows(&self, name: &str, rows: &[usize]) -> Result<Vec<f64>> {
+        self.gather_rows(name, rows, |col, k, out: &mut Vec<f64>| {
+            let a: &Float64Array = downcast(col, name, "f64")?;
+            out.extend(
+                k.iter()
+                    .map(|&k| if a.is_null(k) { f64::NAN } else { a.value(k) }),
+            );
+            Ok(())
+        })
+    }
+
+    /// [`TableFile::f64_rows`] for a required i32 column: `self.i32(name)?` at `rows`,
+    /// and a NULL anywhere in the column is refused, naming its row, as `i32` refuses it.
+    pub fn i32_rows(&self, name: &str, rows: &[usize]) -> Result<Vec<i32>> {
+        self.gather_rows(name, rows, |col, k, out: &mut Vec<i32>| {
+            let a: &Int32Array = downcast(col, name, "i32")?;
+            out.extend(k.iter().map(|&k| a.value(k)));
+            Ok(())
+        })
+    }
+
+    /// [`TableFile::i32_rows`] for a u32 column.
+    pub fn u32_rows(&self, name: &str, rows: &[usize]) -> Result<Vec<u32>> {
+        self.gather_rows(name, rows, |col, k, out: &mut Vec<u32>| {
+            let a: &UInt32Array = downcast(col, name, "u32")?;
+            out.extend(k.iter().map(|&k| a.value(k)));
+            Ok(())
+        })
+    }
+
+    /// [`TableFile::i32_rows`] for a string column: `self.str(name)?` at `rows`, one
+    /// `String` per picked row only.
+    pub fn str_rows(&self, name: &str, rows: &[usize]) -> Result<Vec<String>> {
+        self.gather_rows(name, rows, |col, k, out: &mut Vec<String>| {
+            let a: &StringArray = downcast(col, name, "utf8")?;
+            out.extend(k.iter().map(|&k| a.value(k).to_string()));
+            Ok(())
+        })
+    }
+
+    /// Stream `name` and hand `pick` each batch with the batch-relative indices of the
+    /// requested rows in it. The column's type is checked on every batch by `pick`, and a
+    /// NULL in a column `pick` does not read as NaN is refused with its absolute row, on
+    /// every batch, picked or not: the whole-column getters refuse it wherever it is.
+    fn gather_rows<T>(
+        &self,
+        name: &str,
+        rows: &[usize],
+        pick: impl Fn(&ArrayRef, &[usize], &mut Vec<T>) -> Result<()>,
+    ) -> Result<Vec<T>> {
+        if rows.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(anyhow!(
+                "{}: rows to read from column '{name}' must be strictly ascending",
+                self.path
+            ));
+        }
+        let nullable_as_nan = matches!(
+            self.schema.field(self.idx(name)?).data_type(),
+            DataType::Float64
+        );
+        let mut out: Vec<T> = Vec::with_capacity(rows.len());
+        let mut local: Vec<usize> = Vec::new();
+        let mut first = 0usize;
+        let mut next = 0usize;
+        for b in self.column(name, SCALAR_BATCH_ROWS)? {
+            let b = b?;
+            let col = b.column(0);
+            let len = col.len();
+            local.clear();
+            while next < rows.len() && rows[next] < first + len {
+                local.push(rows[next] - first);
+                next += 1;
+            }
+            // `pick` first, so a column of the wrong type is reported as such, as the
+            // getters report it, before any NULL in it is.
+            pick(col, &local, &mut out)?;
+            if !nullable_as_nan && col.null_count() > 0 {
+                let k = (0..len).find(|&k| col.is_null(k)).unwrap_or(0);
+                return Err(reject_null(name, first + k));
+            }
+            first += len;
+        }
+        if next < rows.len() {
+            return Err(anyhow!(
+                "{}: row {} of column '{name}' is past the end ({} rows)",
+                self.path,
+                rows[next],
+                first
+            ));
+        }
+        Ok(out)
+    }
+
     /// Read an f32 list column into one flat values buffer plus `nrows + 1` offsets
     /// (row `r` is `values[offsets[r]..offsets[r + 1]]`): one allocation for the whole
     /// column instead of one per row, which is what makes a chromatogram table with tens
@@ -3533,6 +3649,121 @@ impl TableFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row gathers are the whole-column getters indexed at the rows, across row-group
+    /// and batch boundaries; a NULL in a required column is refused with its absolute row
+    /// wherever it is, and an f64 NULL reads as NaN, as the getters do.
+    #[test]
+    fn the_row_gathers_are_the_getters_at_those_rows() {
+        let dir = std::env::temp_dir().join(format!("mumdia_rows_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("g.parquet").to_str().unwrap().to_string();
+        let n = SCALAR_BATCH_ROWS * 2 + 11;
+        let mut w = TableWriter::new(&p).with_row_group_rows(5000);
+        w.write_cols(vec![
+            Col::U32("u".into(), (0..n as u32).map(|i| i * 3).collect()),
+            Col::I32("i".into(), (0..n as i32).map(|i| -i).collect()),
+            Col::F64("f".into(), (0..n).map(|i| i as f64 * 0.5).collect()),
+            Col::Str("s".into(), (0..n).map(|i| format!("r{i}")).collect()),
+            Col::OptF64(
+                "of".into(),
+                (0..n).map(|i| (i % 7 != 0).then_some(i as f64)).collect(),
+            ),
+        ])
+        .unwrap();
+        w.close().unwrap();
+        let t = TableFile::open(&p).unwrap();
+        let rows: Vec<usize> = vec![
+            0,
+            1,
+            4999,
+            5000,
+            SCALAR_BATCH_ROWS - 1,
+            SCALAR_BATCH_ROWS,
+            n - 1,
+        ];
+        let at = |v: Vec<u64>| rows.iter().map(|&r| v[r]).collect::<Vec<u64>>();
+        assert_eq!(
+            t.u32_rows("u", &rows).unwrap(),
+            rows.iter()
+                .map(|&r| t.u32("u").unwrap()[r])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            t.i32_rows("i", &rows).unwrap(),
+            rows.iter()
+                .map(|&r| t.i32("i").unwrap()[r])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            t.f64_rows("f", &rows)
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            at(t.f64("f").unwrap().iter().map(|v| v.to_bits()).collect())
+        );
+        assert_eq!(
+            t.f64_rows("of", &rows)
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            at(t.f64("of").unwrap().iter().map(|v| v.to_bits()).collect()),
+            "a NULL reads as NaN"
+        );
+        assert_eq!(
+            t.str_rows("s", &rows).unwrap(),
+            rows.iter()
+                .map(|&r| t.str("s").unwrap()[r].clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(t.u32_rows("u", &[]).unwrap().is_empty());
+        // The folding visitor sees every value once, in order.
+        let mut seen: Vec<u64> = Vec::new();
+        t.visit_f64("of", |first, v| {
+            assert_eq!(first, seen.len());
+            seen.extend(v.iter().map(|x| x.to_bits()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            t.f64("of")
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        // Out of order, past the end, the wrong type.
+        assert!(t.u32_rows("u", &[3, 2]).is_err());
+        let e = t.u32_rows("u", &[n]).unwrap_err().to_string();
+        assert!(e.contains("past the end"), "{e}");
+        let e = t.i32_rows("u", &[0]).unwrap_err().to_string();
+        assert!(e.contains("is not i32"), "{e}");
+        let e = t.u32_rows("missing", &[0]).unwrap_err().to_string();
+        assert!(e.contains("missing"), "{e}");
+
+        // A NULL in a required column, far from any requested row, is refused with its
+        // absolute row, as the whole-column getter refuses it.
+        let q = dir.join("nulls.parquet").to_str().unwrap().to_string();
+        let mut w = TableWriter::new(&q).with_row_group_rows(5000);
+        let null_at = SCALAR_BATCH_ROWS + 3;
+        w.write_cols(vec![Col::OptStr(
+            "s".into(),
+            (0..n)
+                .map(|i| (i != null_at).then(|| format!("r{i}")))
+                .collect(),
+        )])
+        .unwrap();
+        w.close().unwrap();
+        let t = TableFile::open(&q).unwrap();
+        let whole = t.str("s").unwrap_err().to_string();
+        let picked = t.str_rows("s", &[0]).unwrap_err().to_string();
+        assert!(picked.contains(&format!("row {null_at}")), "{picked}");
+        assert_eq!(picked, whole);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// `str_interned` is `str` plus a first-appearance map, read through the dictionary:
     /// `values[ids[r]]` must be row `r`'s string for every row, the ids must be assigned in

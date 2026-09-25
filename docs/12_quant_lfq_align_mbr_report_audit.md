@@ -460,6 +460,19 @@ column only, and a separate stripped-sequence count is logged. `q_value` is prin
 targets with `pg_q_value <= q_threshold` (`report.rs:137`). Returns `(n_precursors,
 n_protein_groups)`.
 
+Both reports read the scored table in two passes (`printable_rows`). Pass 1 reads
+`label` as a bit per row, the transfer flag, and the q columns a row can be printed on
+(`peptide_q_value` and `pg_q_value`, plus `run_psm_q` for the experiment report's
+`n_runs`) as a fold, and keeps the targets that are transferred or at the threshold on
+one of them. Pass 2 reads the printed columns for those rows only (`TableFile::str_rows`
+and its siblings). The sorts and loops then run over the kept rows in file order, and a
+stable sort of that subsequence gives exactly their order in the stable sort of all
+rows, so both TSVs are byte-identical to the one-pass report's
+(`the_two_pass_reports_write_the_one_pass_bytes`). The one-pass read held four string
+columns for every row, estimated at about 55 GB and a billion allocations on the
+258.75M-row pooled immunopeptidomics table, to print about 10^5 rows; pass 1 holds 3
+bytes a row. A NULL in a required column is still refused wherever it is.
+
 This is a hybrid identification report: `peptides.tsv` has precursor-shaped rows
 but is filtered and labeled with peptide-level q. It is neither a stripped-peptide
 table nor a `precursor_q`-controlled precursor table. Report filtering is also
