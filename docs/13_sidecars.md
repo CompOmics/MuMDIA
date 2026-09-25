@@ -644,7 +644,12 @@ cores); `MUMDIA_MOKAPOT_WORKERS` (3, thread-based CV-fold parallelism).
 (300000; when no feature reaches the training FDR on that sample the init scan is
 repeated on 4x the rows up to the whole fold), `MUMDIA_NN_INIT_FDR_MAX` (0.05; ceiling
 of the first-iteration bootstrap ladder 0.02/0.05/0.1 used only when the init feature
-selects no positive at the training FDR over the whole fold, 0 = hard error as before)
+selects no positive at the training FDR over the whole fold, 0 = hard error as before),
+`MUMDIA_NN_PARALLEL` (0; opt-in concurrent fold training, see "Invariants" below) and
+`MUMDIA_NN_PARALLEL_THREADS`, and the switches back to the pre-2026-09-25 code paths
+(`MUMDIA_NN_FINAL_POOL_SCORE`, `MUMDIA_NN_GATHER`, `MUMDIA_NN_SCAN_THREADS`,
+`MUMDIA_NN_LOAD_THREADS`, `MUMDIA_NN_READ_AHEAD`, `MUMDIA_NN_PRE_BUFFER`,
+`MUMDIA_NN_SELECT`),
 plus the three the Rust caller injects: `MUMDIA_NN_FOLDS` (worker default
 3), `MUMDIA_NN_ITERS` (worker default 5, but `run_pin_sidecar` overrides it with
 `rescore.num_iter` = 10), `MUMDIA_NN_TRAIN_FDR` (0.01). These worker defaults
@@ -786,6 +791,39 @@ MLP. Set it explicitly for the logreg path.
   `test_default_speedups_leave_scores_byte_identical` (`tests/python`, needs torch)
   runs the worker with every switch set back and with the defaults and asserts equal
   score bytes, for the in-memory and the streaming backend.
+- **Concurrent fold training is opt-in** (`MUMDIA_NN_PARALLEL`, default 0). The folds,
+  and the seeds when `MUMDIA_NN_SEEDS > 1`, train one after another on at most 16
+  threads, while the MLP does not get faster past 16 (8 on an EPYC 9354), so most of a
+  large host idles through the rescore. `MUMDIA_NN_PARALLEL=K` trains the
+  (seed, fold) tasks in K spawned processes at `MUMDIA_NN_PARALLEL_THREADS` torch
+  threads each (default: the serial worker's resolved count). The matrix is shared,
+  not copied: the in-memory backend writes it to `<output>.feat.mm` instead of RAM (the
+  streaming backend already has that file) and every child maps it read-only, so the
+  page cache holds one copy; `y` and the fold index go to two small `.npy` files next
+  to it. Each child holds its own fold's gathered training rows, so the training
+  transient is K times the serial one. Needs free disk for the matrix, like the
+  streaming backend.
+  - Output effect: the epoch shuffle can no longer come from one numpy stream per seed
+    (the folds would have to run in order), so under the opt-in it is keyed per
+    (seed, fold, iteration, epoch). That changes the scores once, as a seed change
+    does. Nothing else a task computes depends on another task: torch is reseeded per
+    training call, and the negative cap and subsample already use RandomStates keyed
+    per (seed, fold, iteration). The scores therefore do not depend on K: K=1 runs the
+    same keyed tasks one after another in one child, and on the same host and per-process
+    thread count K=1 and K=3 return identical bytes
+    (`test_parallel_folds_do_not_depend_on_the_process_count`). A different per-process
+    thread count changes the arithmetic, as it does for the serial worker.
+  - Validate it as a seed change before relying on it: peptides at 1% on `run_psm_q`,
+    mean over three seeds, on two pools, against the serial default, plus the
+    entrapment pool (CLAUDE.md). Compare wall time and each task's `train` phase (the
+    worker prints the per-task phases summed over tasks, and the wall of the parallel
+    section as `parallel_folds_wall`). Measured on the 8-performance-core desktop, a
+    400,000 x 120 synthetic pool with 3 folds: 23.7 s serial at 8 threads, 13.8 s with
+    3 processes x 8 threads; the gain on a many-core server is not measured.
+  - A child exits when the worker dies (it waits on the parent's process sentinel), so
+    an engine that kills the worker does not leave folds training for nobody. The
+    memmap and side arrays are removed when the worker exits, also after an error; only
+    a hard kill leaves them. Under CUDA every child opens its own context on the device.
 - **Constant feature columns are dropped before training** (`MUMDIA_NN_DROP_CONSTANT`,
   default 1; 2026-09-16), identified from the parquet footer's per-column min/max
   without a read (11 of the 387 Extended features on the Astral pool, `has_ms1` and

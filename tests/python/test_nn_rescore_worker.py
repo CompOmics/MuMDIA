@@ -596,3 +596,48 @@ def test_windowed_positive_selection_equals_the_full_tda_q_selection(kind):
         s_nan[int(rng.integers(0, n))] = np.float32(np.nan)
         assert w.select_positives(s_nan, tgt, thr) is None
     assert windowed > 10, "the window was almost never certified; the test lost its point"
+
+
+def test_parallel_folds_do_not_depend_on_the_process_count(torch_available, tmp_path):
+    """MUMDIA_NN_PARALLEL: the scores are a function of the tasks, not of the processes.
+
+    The keyed epoch shuffle makes every (seed, fold) task self-contained, so one process
+    running the six tasks in turn and three running them at once must return the same
+    bytes, at the same per-process thread count. Every row is still scored exactly once,
+    and neither the shared memmap nor the side arrays may be left behind.
+    """
+    features, keys, n = _identity_pool(tmp_path)
+    env = dict(IDENTITY_ENV, MUMDIA_NN_FOLD_KEYS=str(keys), MUMDIA_NN_STREAM="0",
+               MUMDIA_NN_SEEDS="2", MUMDIA_NN_PARALLEL_THREADS="1")
+    outs = {}
+    for k in (1, 3):
+        out = tmp_path / ("parallel_%d.parquet" % k)
+        stdout, _ = run_worker_ok("nn_rescore_worker.py", features, out,
+                                  env=dict(env, MUMDIA_NN_PARALLEL=str(k)))
+        assert "parallel training: %d process(es) x 1 torch thread(s) for 6 task(s)" % k in stdout
+        assert_complete_finite_coverage(out, n, sidecar="nn_rescore_worker[parallel=%d]" % k)
+        outs[k] = _scores_by_row(out)
+    assert np.array_equal(outs[1][0], outs[3][0])
+    assert outs[1][1].tobytes() == outs[3][1].tobytes(), (
+        "the parallel scores depend on the process count")
+    leftovers = [p.name for p in tmp_path.iterdir()
+                 if p.name.endswith((".feat.mm", ".npy"))]
+    assert not leftovers, "parallel training left files behind: %s" % leftovers
+
+
+def test_failed_run_removes_its_memmap(torch_available, tmp_path):
+    """A worker that fails must not leave its memmap behind (Windows keeps it mapped until
+    the traceback is released, so the removal is retried after it is printed)."""
+    features, keys, n = _identity_pool(tmp_path)
+    env = dict(IDENTITY_ENV, MUMDIA_NN_FOLD_KEYS=str(keys), MUMDIA_NN_STREAM="1",
+               MUMDIA_NN_TRAIN_FDR="0.0000001", MUMDIA_NN_INIT_FDR_MAX="0")
+    out = tmp_path / "failing.parquet"
+    rc, _, err = run_worker("nn_rescore_worker.py", features, out, env=env)
+    assert rc != 0
+    assert "selected no positive targets" in err
+    assert not (tmp_path / "failing.parquet.feat.mm").exists()
+    rc, _, err = run_worker("nn_rescore_worker.py", features, out,
+                            env=dict(env, MUMDIA_NN_STREAM="0", MUMDIA_NN_PARALLEL="2"))
+    assert rc != 0
+    assert "selected no positive targets" in err
+    assert not [p.name for p in tmp_path.iterdir() if p.name.startswith("failing.parquet.")]
