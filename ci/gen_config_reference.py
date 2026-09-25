@@ -825,6 +825,32 @@ PY_ENV_FN = re.compile(
 )
 
 
+# Variables whose unset behaviour is computed by the reading code rather than given as a
+# literal fallback, so the scanner finds no default and would otherwise print "none (unset
+# means off)" for a setting that is ON when unset. Each entry is the behaviour when the
+# variable is unset, then what setting it does, as the reading function implements it.
+# Keep an entry in step with that function; a name that no longer appears among the reads
+# is an error, so a removed variable cannot leave a stale row behind.
+COMPUTED_ENV_DEFAULTS: dict[str, str] = {
+    "MUMDIA_PARQUET_COMPRESSION": (
+        "snappy. `zstd`, or `uncompressed` / `none`, changes the codec (`table.rs` `codec`)"
+    ),
+    "MUMDIA_PARQUET_DECODE_THREADS": (
+        "automatic column groups, up to the codec pool's threads; one reader for a "
+        "coalesced scan or inside a rayon pool. `k` asks for k groups, `1` is one reader "
+        "(`table.rs` `automatic_decode_groups`)"
+    ),
+    "MUMDIA_PARQUET_PLAN": (
+        "on (capped writers plan their float encodings). `0` / `off` / `false` / `no` "
+        "restores the unplanned layout (`table.rs` `plan_enabled`)"
+    ),
+    "MUMDIA_PARQUET_THREADS": (
+        "min(`--threads`, 8), or min(cores, 8) without `--threads`. `0` or `1` is serial "
+        "(`codec.rs` `codec_threads`)"
+    ),
+}
+
+
 class EnvVar:
     """One variable, with every distinct default the code shows for it.
 
@@ -846,6 +872,8 @@ class EnvVar:
             self.defaults.setdefault(value, set()).add(site)
 
     def render_default(self) -> str:
+        if not self.defaults and self.name in COMPUTED_ENV_DEFAULTS:
+            return f"computed: {md_cell(COMPUTED_ENV_DEFAULTS[self.name])}"
         if not self.defaults:
             return "none (unset means off)"
         if len(self.defaults) == 1:
@@ -1400,8 +1428,15 @@ def build_document() -> tuple[str, dict[str, object]]:
     a("")
     a("`Default in code` is the fallback the reading code supplies when the variable")
     a("is unset. Two workers can disagree, in which case every distinct fallback is")
-    a("listed with the file it is in.")
+    a("listed with the file it is in. A default marked `computed:` has no literal")
+    a("fallback in the code: the reading function works out the behaviour, and the")
+    a("text describes it (`COMPUTED_ENV_DEFAULTS` in `ci/gen_config_reference.py`).")
     a("")
+    stale = sorted(set(COMPUTED_ENV_DEFAULTS) - set(all_read))
+    if stale:
+        sys.exit(
+            "error: COMPUTED_ENV_DEFAULTS names variables no code reads: " + ", ".join(stale)
+        )
     injected = sorted(set(py_reads) & set(rust_sets))
     if injected:
         a(
