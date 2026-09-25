@@ -159,7 +159,9 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
 /// `shared_ft` is a precursor library that has ALREADY been
 /// DeepLC-fine-tuned (by an earlier run of this same experiment); when present this run
 /// uses it as-is instead of fine-tuning again, and still fits its own retention-time
-/// calibration on top. Returns `(competed, chromatograms, fine_tuned_library_if_produced)`.
+/// calibration on top. Returns `(competed, chromatograms, fine_tuned_library_if_produced)`,
+/// where `competed` is the run's competed tables in row order: one, or a grouped run's band
+/// tables when its pooled table was not written (`groups.pool_competed = false`).
 #[allow(clippy::too_many_arguments)]
 fn process_run(
     cfg: &Config,
@@ -181,7 +183,7 @@ fn process_run(
     // `lib_p_base` carries placeholder iRT the multi-head calibration must replace in full
     // (`predict_frag.defer_deeplc_to_multihead`).
     irt_placeholder: bool,
-) -> Result<(String, String, Option<String>)> {
+) -> Result<(Vec<String>, String, Option<String>)> {
     let co = convert_run(cfg, mzml, out, top_peaks_ms2, max_spectra)?;
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let mh_heads = cfg
@@ -307,7 +309,7 @@ fn chain_after_seed(
     seed: &str,
     shared_rt_lib: Option<&str>,
     irt_placeholder: bool,
-) -> Result<(String, String, Option<String>)> {
+) -> Result<(Vec<String>, String, Option<String>)> {
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let mh_heads = cfg
         .rt_im_train
@@ -323,7 +325,7 @@ fn chain_after_seed(
         rayon::current_num_threads(),
     )?;
     let (competed, chrom) = finish_run(cfg, ch, &lib_p, lib_f, co, seed, out)?;
-    Ok((competed, chrom, produced_rt_lib))
+    Ok((vec![competed], chrom, produced_rt_lib))
 }
 
 /// Choose the precursor table the rest of an ungrouped run reads: a previous run's adapted
@@ -983,7 +985,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // rayon's indexed `collect` preserves within-chunk order, so the result is identical
     // to the sequential build regardless of completion order.
     let par = cfg.experiment.parallel_runs.max(1);
-    let mut competed: Vec<String> = Vec::with_capacity(n_runs);
+    // Each run's competed tables, in row order (see `process_run`).
+    let mut competed: Vec<Vec<String>> = Vec::with_capacity(n_runs);
     let mut chroms: Vec<String> = Vec::with_capacity(n_runs);
 
     // Under `RtLibraryScope::FirstRunOnly` (the default) the first run is processed alone
@@ -1110,7 +1113,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let run_one = |i: usize,
                    shared: Option<&str>,
                    slices_from: Option<&str>|
-     -> Result<(String, String, Option<String>)> {
+     -> Result<(Vec<String>, String, Option<String>)> {
         match &prepared[i] {
             Some((co, seed)) => chain_after_seed(
                 cfg,
@@ -1265,7 +1268,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         let (lib0, produced) = adapted?;
         let fronts = fronts?;
         let (comp0, chrom0) = finish_run(cfg, &ch, &lib0, &lib_f, &co0, &seed0, &out0)?;
-        competed.push(comp0);
+        competed.push(vec![comp0]);
         chroms.push(chrom0);
         if produced.is_none() {
             warn!(
@@ -1303,7 +1306,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     .collect::<Result<Vec<_>>>()?
             };
             for (comp, chrom) in done {
-                competed.push(comp);
+                competed.push(vec![comp]);
                 chroms.push(chrom);
             }
         }
@@ -1356,7 +1359,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "run-experiment: per-run chains in parallel (each run can hold tens of GB;              lower experiment.parallel_runs if memory is tight)"
         );
         for chunk in rest.chunks(par) {
-            let done: Vec<(String, String, Option<String>)> = chunk
+            let done: Vec<(Vec<String>, String, Option<String>)> = chunk
                 .par_iter()
                 .map(|&i| {
                     info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
@@ -1374,9 +1377,21 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     }
 
     // --- one experiment-wide rescore over all competed tables ---
+    //
+    // Every table of run i carries source i. When each run is one table (every run
+    // ungrouped, or grouped with its competed table pooled) the source is the table's own
+    // index, as it always was, and the rescore report is what it was.
+    let rescore_inputs: Vec<String> = competed.iter().flatten().cloned().collect();
+    let rescore_sources: Vec<u32> = competed
+        .iter()
+        .enumerate()
+        .flat_map(|(i, tables)| std::iter::repeat_n(i as u32, tables.len()))
+        .collect();
+    let one_table_per_run = competed.iter().all(|tables| tables.len() == 1);
     let scored_combined = d("scored_combined.parquet");
     let scored_written = rescore::run_hashed(rescore::RescoreParams {
-        competed: &competed,
+        competed: &rescore_inputs,
+        sources: (!one_table_per_run).then_some(rescore_sources.as_slice()),
         out: &scored_combined,
         work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
         script_dir: &cfg.predict_frag.sidecar_script_dir,
@@ -1418,12 +1433,20 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 format!("removing a previous run's {scored_mbr} before running MBR")
             })?;
         }
-        // The competed tables carry candidate_id + apex_rt in `source` order.
+        // The competed tables carry candidate_id + apex_rt in `source` order, one per run:
+        // match-between-runs keeps a grouped run's competed table pooled (`run_groups`).
+        if !one_table_per_run {
+            anyhow::bail!(
+                "match-between-runs reads one competed table per run, and a grouped run left \
+                 its competed rows per band"
+            );
+        }
+        let mbr_competed: Vec<String> = competed.iter().map(|t| t[0].clone()).collect();
         crate::sidecar::run_mbr(
             python,
             &script,
             &scored_combined,
-            &competed,
+            &mbr_competed,
             &transferred,
             Some(&scored_mbr),
             &[],

@@ -35,6 +35,7 @@ on.
 | `rt_adaptation` | `per_band` | `once_per_run` adapts the library's retention times in one DeepLC worker per run over the union of the bands, under `global` calibration (section 4b). Float-equivalent, opt-in. |
 | `balance` | `precursors` | `cost` balances the cuts on precursors times MS2 peaks per window instead (section 2). Output-changing, opt-in. |
 | `delete_band_intermediates` | `false` | Delete each band's `psms_extracted` and `features` tables once the pool is written (section 6). Disk only. |
+| `pool_competed` | `true` | `false` leaves the competed rows per band and has rescore read the band tables with a table-to-source map, where that cannot change a result (section 5). `psms_scored.parquet` is byte-identical; the pooled competed table is not written. Opt-in. |
 
 `run-experiment` (and `run` with several `--mzml`, which dispatches to it) searches every run
 grouped, with one experiment-wide rescore over the pooled competed tables and the
@@ -491,6 +492,36 @@ not: the band directories hold everything, and pooling them is a copy. The featu
 band wrote the same one. Each pooled table gets a `.report.json` whose stage is `pool` and
 whose stats record the number of groups and the overlap duplicates removed.
 
+The overlap dedup itself is skipped when the bands' library row spans are disjoint. A band
+is a row span of the m/z-sorted precursor table and a candidate id is the band-local id
+plus the band's first row, so bands whose spans do not overlap cannot share a candidate.
+`run_groups` knows the spans from the plan and tells the pool (`bands_disjoint`), which then
+does not decode `candidate_id` and `prelim_score` of every band's competed table and build
+a map over every candidate of the run to find no duplicate. The test is on the row spans,
+not on the band m/z bounds: two bands that touch at one m/z value both hold a precursor at
+exactly that value, and the spans say so. The standalone `mumdia pool` has no plan to ask
+and looks as before. The pooled tables are byte-identical either way
+(`disjoint_bands_skip_the_dedup_and_pool_the_same_bytes`).
+
+With `groups.pool_competed = false` the competed rows are not pooled at all. Rescore
+already accepts several competed tables; it reads the bands' tables in band order with a
+table-to-source map (`RescoreParams::sources`, every band of run i stamped `source` i), so
+its input rows are exactly the rows the pooled table would hold, in its order, and
+`psms_scored.parquet` is byte-identical to the pooled run's
+(`band_tables_with_a_source_map_score_the_pooled_tables_bytes`). That saves one full write
+and read of the run's widest artifact, about 83 GB per run on the immunopeptidomics
+experiment (about 581 GB for its seven runs). It is done only where it cannot change a
+result or starve a reader: the bands' row spans must be disjoint, since otherwise the
+overlap losers have to be dropped, and neither the candidate audit nor match-between-runs
+may be on, since both read the pooled table. Otherwise the table is pooled and the log
+says why. What changes is the artifact set: there is no pooled `psms_competed.parquet`
+(one an earlier run left in the directory is removed) and no manifest record for it, and
+the scored table's report lists the band tables under `competed_inputs` with their
+`competed_sources`. A later standalone `mumdia rescore` or `mumdia audit` needs the table,
+which `mumdia pool --groups-dir` rebuilds from the bands. To validate on a data set, run
+the same grouped configuration with the default and with `false` and compare
+`psms_scored.parquet` byte for byte.
+
 From here on the run is an ordinary run: rescore, audit, quant and report read the pooled
 tables, and `psms_scored.parquet.report.json` names the classifier as always. The manifest's
 RT model identity says `(per window group)` after the model that ran.
@@ -511,7 +542,8 @@ out/
   seed_psms.parquet                  pooled seed, library-wide ids (+ .masscal.json)
   seed_psms_calibrated.parquet       pooled seed with refreshed iRT (global, after re-prediction)
   cal.json                           run-level RT calibration record (section 7)
-  {chromatograms,psms_competed}.parquet  pooled (+ .report.json)
+  {chromatograms,psms_competed}.parquet  pooled (+ .report.json); psms_competed not
+                                     under groups.pool_competed = false (section 5)
   psms_extracted.parquet             pooled only under extract.emit_candidate_audit
   psms_scored.parquet, quant, peptides.tsv, proteins.tsv, manifest.json  as always
 ```

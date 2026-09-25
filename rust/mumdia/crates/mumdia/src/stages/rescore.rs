@@ -201,6 +201,12 @@ enum QMode {
 pub struct RescoreParams<'a> {
     /// One or more competed feature tables (experiment-wide concat).
     pub competed: &'a [String],
+    /// The `source` of each competed table's rows, one entry per table, non-decreasing;
+    /// `None` is the table's own index. A grouped run whose pooled competed table was not
+    /// written (`groups.pool_competed = false`) hands its bands' tables here in band order,
+    /// every one with that run's source, so the rows arrive exactly as the pooled table
+    /// would have held them.
+    pub sources: Option<&'a [u32]>,
     pub out: &'a str,
     /// Working directory for the sidecar files (the feature handoff, the fold keys, the
     /// worker's output and its memmap), and the script dir for the sidecar (when
@@ -367,6 +373,21 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     if p.cfg.folds < 2 {
         anyhow::bail!("rescore.folds must be >= 2 for out-of-fold scoring");
     }
+    if let Some(s) = p.sources {
+        if s.len() != p.competed.len() {
+            anyhow::bail!(
+                "rescore: {} sources for {} competed tables",
+                s.len(),
+                p.competed.len()
+            );
+        }
+        // Non-decreasing, so each source's rows stay contiguous, which the per-source q and
+        // the by-source split both rely on.
+        if s.windows(2).any(|w| w[0] > w[1]) {
+            anyhow::bail!("rescore: the competed tables' sources must be non-decreasing");
+        }
+    }
+    let source_of = |k: usize| p.sources.map_or(k as u32, |s| s[k]);
 
     // Concatenate competed inputs.
     //
@@ -543,7 +564,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         merge_col(&mut apex_rt, ar, total_rows);
         merge_col(&mut elution_lo, elo, total_rows);
         merge_col(&mut elution_hi, ehi, total_rows);
-        merge_col(&mut source, vec![src as u32; t.nrows], total_rows);
+        merge_col(&mut source, vec![source_of(src); t.nrows], total_rows);
     }
     // Both text buffers were grown by `String::push_str` one value at a time, inside
     // `str_flat` and again in `merge`, so each ends with up to 2x its own length in unused
@@ -1179,6 +1200,10 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         "competed_inputs": p.competed,
         "config_hash": p.config_hash,
     });
+    // Only when given, so a report of the usual one-table-per-source call is unchanged.
+    if let Some(sources) = p.sources {
+        params["competed_sources"] = json!(sources);
+    }
     if let Some(env) = &nn_env {
         params["nn_env"] = json!(env);
     }
@@ -4434,6 +4459,166 @@ b
         write_table(path, cols).unwrap();
     }
 
+    /// Rows `lo..hi` of a larger crafted table, as a table of their own: the rows a band's
+    /// competed table holds when the pooled one is their concatenation.
+    fn crafted_rows(path: &str, lo: usize, hi: usize) {
+        let r = lo..hi;
+        let cols = vec![
+            Col::U32("candidate_id".into(), r.clone().map(|i| i as u32).collect()),
+            Col::Str(
+                "label".into(),
+                r.clone()
+                    .map(|i| if i % 3 == 0 { "decoy" } else { "target" }.to_string())
+                    .collect(),
+            ),
+            Col::U32(
+                "base_peptide_id".into(),
+                r.clone().map(|i| i as u32 / 2).collect(),
+            ),
+            Col::Str(
+                "peptidoform".into(),
+                r.clone().map(|i| format!("PEPTIDEK{}", i % 90)).collect(),
+            ),
+            Col::Str(
+                "protein".into(),
+                r.clone().map(|i| format!("sp|P{:04}|X", i % 40)).collect(),
+            ),
+            Col::F64(
+                "charge".into(),
+                r.clone().map(|i| 2.0 + (i % 2) as f64).collect(),
+            ),
+            Col::F64(
+                "prelim_score".into(),
+                r.clone().map(|i| ((i * 37) % 101) as f64 * 0.1).collect(),
+            ),
+            Col::F64(
+                "precursor_mz".into(),
+                r.clone().map(|i| 400.0 + i as f64).collect(),
+            ),
+            Col::F64(
+                "apex_rt".into(),
+                r.clone().map(|i| 10.0 + i as f64).collect(),
+            ),
+            Col::F64(
+                "elution_lo".into(),
+                r.clone().map(|i| 9.0 + i as f64).collect(),
+            ),
+            Col::F64(
+                "elution_hi".into(),
+                r.clone().map(|i| 11.0 + i as f64).collect(),
+            ),
+            Col::I32("peak_rank".into(), vec![0; hi - lo]),
+            Col::F64(
+                "feat_a".into(),
+                r.clone()
+                    .map(|i| {
+                        let noise = ((i * 7919) % 97) as f64 / 97.0;
+                        if i % 3 == 0 {
+                            noise
+                        } else {
+                            0.6 + noise
+                        }
+                    })
+                    .collect(),
+            ),
+            Col::F64(
+                "feat_b".into(),
+                r.clone().map(|i| ((i * 31) % 17) as f64 * 0.25).collect(),
+            ),
+        ];
+        write_table(path, cols).unwrap();
+    }
+
+    /// Rescore over a grouped run's band tables with a source map scores exactly what it
+    /// scores over the pooled tables they concatenate to (`groups.pool_competed = false`):
+    /// the same `psms_scored.parquet` bytes, for one run of three bands and for two runs.
+    #[test]
+    fn band_tables_with_a_source_map_score_the_pooled_tables_bytes() {
+        let bands: Vec<String> = [(0, 110), (110, 260), (260, 420)]
+            .iter()
+            .enumerate()
+            .map(|(k, &(lo, hi))| {
+                let path = scratch(&format!("srcmap_band{k}.parquet"));
+                crafted_rows(&path, lo, hi);
+                path
+            })
+            .collect();
+        let run_scored = |competed: &[String], sources: Option<&[u32]>, name: &str| {
+            let out = scratch(&format!("srcmap_{name}_scored.parquet"));
+            let cfg = RescoreConfig {
+                classifier: RescorerKind::NativeTda,
+                ..Default::default()
+            };
+            run(RescoreParams {
+                competed,
+                sources,
+                out: &out,
+                work_dir: &scratch(&format!("srcmap_{name}_work")),
+                script_dir: "scripts",
+                cfg: &cfg,
+                config_hash: "test",
+            })
+            .unwrap();
+            let report: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(format!("{out}.report.json")).unwrap(),
+            )
+            .unwrap();
+            (std::fs::read(&out).unwrap(), report)
+        };
+        // One run: the pooled table is all 420 rows.
+        let pooled = scratch("srcmap_pooled.parquet");
+        crafted_rows(&pooled, 0, 420);
+        let (want, want_report) = run_scored(std::slice::from_ref(&pooled), None, "one_pooled");
+        let (got, got_report) = run_scored(&bands, Some(&[0, 0, 0]), "one_bands");
+        assert!(
+            got == want,
+            "one run: the scored table differs from the pooled one's"
+        );
+        assert_eq!(want_report["params"]["classifier"], json!("native_tda"));
+        assert!(want_report["params"].get("competed_sources").is_none());
+        assert_eq!(got_report["params"]["competed_sources"], json!([0, 0, 0]));
+        assert_eq!(
+            got_report["stats"], want_report["stats"],
+            "the counts at 1% are the pooled run's"
+        );
+        // Two runs: bands 0 and 1 are run 0, band 2 is run 1.
+        let run0 = scratch("srcmap_run0.parquet");
+        crafted_rows(&run0, 0, 260);
+        let run1 = scratch("srcmap_run1.parquet");
+        crafted_rows(&run1, 260, 420);
+        let (want, _) = run_scored(&[run0, run1], None, "two_pooled");
+        let (got, _) = run_scored(&bands, Some(&[0, 0, 1]), "two_bands");
+        assert!(
+            got == want,
+            "two runs: the scored table differs from the pooled one's"
+        );
+        // A map of the wrong length, or one that goes back, is refused.
+        let e = run(RescoreParams {
+            competed: &bands,
+            sources: Some(&[0, 1]),
+            out: &scratch("srcmap_bad_scored.parquet"),
+            work_dir: &scratch("srcmap_bad_work"),
+            script_dir: "scripts",
+            cfg: &RescoreConfig::default(),
+            config_hash: "test",
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("2 sources for 3"), "{e}");
+        let e = run(RescoreParams {
+            competed: &bands,
+            sources: Some(&[1, 0, 1]),
+            out: &scratch("srcmap_bad2_scored.parquet"),
+            work_dir: &scratch("srcmap_bad2_work"),
+            script_dir: "scripts",
+            cfg: &RescoreConfig::default(),
+            config_hash: "test",
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("non-decreasing"), "{e}");
+    }
+
     #[test]
     fn strict_sidecar_streams_the_handoff_without_building_a_matrix() {
         // End-to-end through `run`: under strict with a PIN sidecar the features go from
@@ -4453,6 +4638,7 @@ b
         };
         let err = run(RescoreParams {
             competed: &[competed],
+            sources: None,
             out: &out,
             work_dir: &work,
             script_dir: "scripts",
@@ -4508,6 +4694,7 @@ b
         };
         let err = run(RescoreParams {
             competed: &[competed.to_string()],
+            sources: None,
             out: &out,
             work_dir: &work,
             script_dir: "scripts",

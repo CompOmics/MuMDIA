@@ -290,6 +290,7 @@ fn features_compete_rescore_run_on_crafted_input() {
     let scored = tmp("scored.parquet");
     stages::rescore::run(stages::rescore::RescoreParams {
         competed: &[competed],
+        sources: None,
         out: &scored,
         work_dir: &tmp("rescore_work"),
         script_dir: "scripts",
@@ -434,6 +435,7 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
     let scored = tmp("scored_hashed.parquet");
     let wscored = stages::rescore::run_hashed(stages::rescore::RescoreParams {
         competed: &[competed],
+        sources: None,
         out: &scored,
         work_dir: &tmp("rescore_work_hashed"),
         script_dir: "scripts",

@@ -2129,6 +2129,24 @@ pub struct GroupsConfig {
     /// be re-featured; the chromatograms and competed tables that `mumdia pool
     /// --groups-dir` re-pools from are kept.
     pub delete_band_intermediates: bool,
+    /// Write the run's pooled `psms_competed.parquet`. Default `true`. With `false`, rescore
+    /// reads the bands' own competed tables in band order, each with the run's `source`,
+    /// and the pooled copy is not written: one full write and read of the run's widest
+    /// artifact less (about 83 GB per run on the immunopeptidomics experiment). This
+    /// happens only where it cannot change a result: the bands' library row spans must be
+    /// disjoint, so no candidate was searched in two bands and there is no overlap
+    /// duplicate to drop, and neither the candidate audit (`extract.emit_candidate_audit`)
+    /// nor match-between-runs (`mbr.strategy`), which read the pooled table, may be on.
+    /// Otherwise the table is pooled as with `true`, and the log says why.
+    ///
+    /// `psms_scored.parquet` is byte-identical either way; what changes is the artifact
+    /// set. The run's manifest then has no pooled `psms_competed` record, the scored
+    /// table's report lists the band tables under `competed_inputs` with their
+    /// `competed_sources`, and a later standalone `mumdia rescore` or audit needs the table
+    /// rebuilt first with `mumdia pool --groups-dir`, which the band tables allow. Validate
+    /// on a grouped run by comparing `psms_scored.parquet` byte for byte against a run with
+    /// the default.
+    pub pool_competed: bool,
 }
 impl Default for GroupsConfig {
     fn default() -> Self {
@@ -2139,6 +2157,7 @@ impl Default for GroupsConfig {
             rt_adaptation: GroupRtAdaptation::PerBand,
             balance: GroupBalance::Precursors,
             delete_band_intermediates: false,
+            pool_competed: true,
         }
     }
 }

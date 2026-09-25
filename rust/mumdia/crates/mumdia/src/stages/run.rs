@@ -710,15 +710,19 @@ pub fn run(p: RunParams) -> Result<()> {
                 "compete",
                 &ch,
             ));
-            (seed, lib_p, psms, chrom, feats, competed, None)
+            (seed, lib_p, psms, chrom, feats, vec![competed], None)
         };
     let _ = &feats;
     let _ = &seed;
 
     let scored = d("psms_scored.parquet");
     info!(stage = %"rescore", "run: stage start");
+    // One table, or a grouped run's band tables (`groups.pool_competed = false`), which are
+    // all this run's rows: source 0 for every one.
+    let sources = vec![0u32; competed.len()];
     let w = rescore::run_hashed(rescore::RescoreParams {
-        competed: std::slice::from_ref(&competed),
+        competed: &competed,
+        sources: (competed.len() > 1).then_some(sources.as_slice()),
         out: &scored,
         work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
         script_dir: &cfg.predict_frag.sidecar_script_dir,
@@ -753,11 +757,18 @@ pub fn run(p: RunParams) -> Result<()> {
     // default (gated on extract.emit_candidate_audit); adds one cheap join pass.
     if cfg.extract.emit_candidate_audit {
         let audit_out = d("candidate_audit.parquet");
+        if competed.len() != 1 {
+            anyhow::bail!(
+                "the candidate audit reads one competed table, and this run has {}",
+                competed.len()
+            );
+        }
         info!(stage = %"audit", "run: stage start");
         audit::run(audit::AuditParams {
             library_precursors: &lib_p,
             psms: &psms,
-            competed: &competed,
+            // The audit keeps the grouped run's competed table pooled (`run_groups`).
+            competed: &competed[0],
             scored: &scored,
             out: &audit_out,
             q_threshold: 0.01,

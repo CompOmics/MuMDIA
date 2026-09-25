@@ -1442,7 +1442,9 @@ fn real_main() -> Result<()> {
                 bands: &bands,
                 out_psms: psms.then_some(op.as_str()),
                 out_chromatograms: &oc,
-                out_competed: &ok,
+                out_competed: Some(ok.as_str()),
+                // The band directories carry no plan here, so the pool looks.
+                bands_disjoint: false,
             })?;
             println!(
                 "pooled {} bands: {} competed rows, {} chromatogram rows, {} overlap                  duplicates removed{}",
@@ -1490,6 +1492,7 @@ fn real_main() -> Result<()> {
                 work_dir.unwrap_or_else(|| stages::rescore::sidecar_work_dir("sidecar_work"));
             stages::rescore::run(stages::rescore::RescoreParams {
                 competed: &competed,
+                sources: None,
                 out: &out,
                 work_dir: &work_dir,
                 script_dir: &cfg.predict_frag.sidecar_script_dir,

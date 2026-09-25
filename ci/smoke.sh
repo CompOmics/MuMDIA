@@ -208,6 +208,27 @@ diff "$work/out_grouped/peptides.tsv" "$work/out_grouped2/peptides.tsv" > /dev/n
     || { echo "two grouped runs of the same input disagree"; exit 1; }
 echo "    ok: 3 bands, $n_ms2 MS2 + $n_ms1 MS1 decodes, $n_grouped peptides, reproducible"
 
+# The same grouped run with the competed rows left per band (`groups.pool_competed =
+# false`): rescore reads the three band tables with a table-to-source map instead of the
+# pooled copy, which must give the same scored table byte for byte. The fixture's bands do
+# not overlap, so the option applies; the log line and the absent pooled table prove it did.
+echo "=== smoke: the grouped run with the competed rows left per band"
+sed 's/"calibration": "per_group" }/"calibration": "per_group", "pool_competed": false }/' \
+    "$work/grouped.json" > "$work/grouped_nopool.json"
+grep -q '"pool_competed": false' "$work/grouped_nopool.json" \
+    || { echo "could not derive the pool_competed = false config"; exit 1; }
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_grouped_nopool" --config "$work/grouped_nopool.json" --threads 4 \
+    > "$work/grouped_nopool.log" 2>&1 \
+    || { tail -30 "$work/grouped_nopool.log"; echo "the grouped run without a pooled competed table failed"; exit 1; }
+grep -q 'the competed rows stay per band' "$work/grouped_nopool.log" \
+    || { echo "groups.pool_competed = false did not leave the competed rows per band"; exit 1; }
+test ! -e "$work/out_grouped_nopool/psms_competed.parquet" \
+    || { echo "a pooled psms_competed.parquet was written under pool_competed = false"; exit 1; }
+cmp -s "$work/out_grouped/psms_scored.parquet" "$work/out_grouped_nopool/psms_scored.parquet" \
+    || { echo "rescoring the band tables changed psms_scored.parquet"; exit 1; }
+echo "    ok: band tables rescored, psms_scored.parquet byte-identical to the pooled run's"
+
 # 4d. Two bands under the default `calibration: global`: the pooled fragment mass
 #     calibration is the one the ungrouped run fitted (docs/33 section 4a). Until
 #     2026-09-25 each band offered only its 2,000 best targets as calibrants, which was

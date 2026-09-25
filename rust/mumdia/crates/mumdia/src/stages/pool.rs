@@ -47,7 +47,14 @@ pub struct PoolParams<'a> {
     /// one consumer. The per-band tables are written either way.
     pub out_psms: Option<&'a str>,
     pub out_chromatograms: &'a str,
-    pub out_competed: &'a str,
+    /// Where to pool the competed rows, or `None` when rescore reads the bands' competed
+    /// tables directly (`groups.pool_competed = false`, allowed only with `bands_disjoint`).
+    pub out_competed: Option<&'a str>,
+    /// The bands' library row spans do not overlap, so no candidate was searched in two
+    /// bands and there is no overlap duplicate to find. The caller knows it from the plan's
+    /// row spans (`run_groups`); `false` makes the pool look, as the standalone `mumdia pool`
+    /// does. Set wrongly, a candidate searched twice would be pooled twice.
+    pub bands_disjoint: bool,
 }
 
 /// Row counts of the pooled tables and how many overlap duplicates were removed.
@@ -60,7 +67,8 @@ pub struct PoolStats {
     /// psms (when pooled), chromatograms, competed.
     pub psms_hash: Option<String>,
     pub chromatograms_hash: String,
-    pub competed_hash: String,
+    /// `None` when the competed rows were not pooled.
+    pub competed_hash: Option<String>,
     /// Candidates that appeared in two bands and were kept from one.
     pub duplicates: u64,
 }
@@ -231,7 +239,19 @@ pub fn run(p: PoolParams) -> Result<PoolStats> {
     if p.bands.is_empty() {
         bail!("pool: no groups");
     }
-    let (losers, duplicates) = overlap_losers(p.bands)?;
+    // Band spans that do not overlap cannot share a candidate: the ids are library rows
+    // (band-local id plus the band's first row). The dedup then has nothing to find, and
+    // it decoded `candidate_id` and `prelim_score` of every band's competed table and built
+    // a map over every candidate of the run to find it.
+    let (losers, duplicates) = if p.bands_disjoint {
+        info!(
+            groups = p.bands.len(),
+            "pool: the bands' library row spans are disjoint; no overlap duplicate to find"
+        );
+        (vec![HashSet::new(); p.bands.len()], 0)
+    } else {
+        overlap_losers(p.bands)?
+    };
     let with = |pick: fn(&BandArtifacts) -> &String| {
         p.bands
             .iter()
@@ -244,20 +264,32 @@ pub fn run(p: PoolParams) -> Result<PoolStats> {
         None => None,
     };
     let chromatograms = pool_table(with(|b| &b.chromatograms).into_iter(), p.out_chromatograms)?;
-    let competed = pool_table(with(|b| &b.competed).into_iter(), p.out_competed)?;
+    let competed = match p.out_competed {
+        Some(out) => Some(pool_table(with(|b| &b.competed).into_iter(), out)?),
+        None => {
+            if !p.bands_disjoint {
+                bail!(
+                    "pool: the competed rows can be left per band only when the bands' \
+                     library row spans are disjoint"
+                );
+            }
+            None
+        }
+    };
     let stats = PoolStats {
         psms: psms.as_ref().map_or(0, |w| w.rows),
         chromatograms: chromatograms.rows,
-        competed: competed.rows,
+        competed: competed.as_ref().map_or(0, |w| w.rows),
         psms_hash: psms.map(|w| w.content_hash),
         chromatograms_hash: chromatograms.content_hash,
-        competed_hash: competed.content_hash,
+        competed_hash: competed.map(|w| w.content_hash),
         duplicates,
     };
     info!(
         groups = p.bands.len(),
         psms = stats.psms,
         psms_pooled = p.out_psms.is_some(),
+        competed_pooled = p.out_competed.is_some(),
         chromatograms = stats.chromatograms,
         competed = stats.competed,
         duplicates,
@@ -340,7 +372,8 @@ mod tests {
             bands: &[b0, b1],
             out_psms: Some(op.as_str()),
             out_chromatograms: &oc,
-            out_competed: &ok,
+            out_competed: Some(ok.as_str()),
+            bands_disjoint: false,
         })
         .unwrap();
         assert_eq!(stats.duplicates, 2);
@@ -438,7 +471,8 @@ mod tests {
             bands: &[b0, b1],
             out_psms: Some(op.as_str()),
             out_chromatograms: &oc,
-            out_competed: &ok,
+            out_competed: Some(ok.as_str()),
+            bands_disjoint: false,
         })
         .unwrap();
         assert_eq!(stats.duplicates, 10);
@@ -474,7 +508,8 @@ mod tests {
             bands: &[b0, b1],
             out_psms: None,
             out_chromatograms: &oc,
-            out_competed: &ok,
+            out_competed: Some(ok.as_str()),
+            bands_disjoint: false,
         })
         .unwrap();
         // The skipped table is not written, and the pooled tables that are read downstream
@@ -487,5 +522,69 @@ mod tests {
             let t = TableFile::open(path).unwrap();
             assert_eq!(t.u32("candidate_id").unwrap(), vec![0, 1, 2, 3, 4, 5, 6]);
         }
+    }
+
+    /// Disjoint bands: the dedup is skipped and the pooled tables are the ones it would
+    /// have written, byte for byte; and the competed rows can be left per band.
+    #[test]
+    fn disjoint_bands_skip_the_dedup_and_pool_the_same_bytes() {
+        let dir = std::env::temp_dir().join(format!("mumdia_pool_disjoint_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let b0 = band(&dir, "d0", 0.0, &[0, 1, 2, 3], &[9.0, 1.0, 9.0, 7.0]);
+        let b1 = band(&dir, "d1", 0.003, &[4, 5, 6], &[5.0, 6.0, 9.0]);
+        let out = |n: &str| {
+            dir.join(format!("disjoint_{n}.parquet"))
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        let bands = [b0, b1];
+        let pool_as = |tag: &str, disjoint: bool| {
+            let (oc, ok) = (out(&format!("{tag}_chrom")), out(&format!("{tag}_comp")));
+            let stats = run(PoolParams {
+                bands: &bands,
+                out_psms: None,
+                out_chromatograms: &oc,
+                out_competed: Some(ok.as_str()),
+                bands_disjoint: disjoint,
+            })
+            .unwrap();
+            (
+                stats,
+                std::fs::read(&oc).unwrap(),
+                std::fs::read(&ok).unwrap(),
+            )
+        };
+        let (looked, lc, lk) = pool_as("looked", false);
+        let (skipped, sc, sk) = pool_as("skipped", true);
+        assert_eq!(looked.duplicates, 0);
+        assert_eq!(looked, skipped);
+        assert!(
+            lc == sc && lk == sk,
+            "the skip must not change a pooled byte"
+        );
+        // Left per band: no competed table, no hash, the chromatograms unchanged.
+        let oc = out("perband_chrom");
+        let stats = run(PoolParams {
+            bands: &bands,
+            out_psms: None,
+            out_chromatograms: &oc,
+            out_competed: None,
+            bands_disjoint: true,
+        })
+        .unwrap();
+        assert_eq!((stats.competed, stats.competed_hash), (0, None));
+        assert!(std::fs::read(&oc).unwrap() == lc);
+        // And never without the disjointness that makes it safe.
+        let e = run(PoolParams {
+            bands: &bands,
+            out_psms: None,
+            out_chromatograms: &out("refused_chrom"),
+            out_competed: None,
+            bands_disjoint: false,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("disjoint"), "{e}");
     }
 }

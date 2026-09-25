@@ -97,7 +97,11 @@ pub struct Pooled {
     pub psms: String,
     pub chromatograms: String,
     pub features: String,
-    pub competed: String,
+    /// The competed tables rescore reads for this run, in row order: the pooled
+    /// `psms_competed.parquet`, or, when it was not written (`groups.pool_competed =
+    /// false`), the bands' own tables in band order. Always one table, the pooled one,
+    /// when the candidate audit or match-between-runs is on.
+    pub competed: Vec<String>,
     /// One RT-model identity string for the manifest, e.g. `multihead-80` per group.
     pub rt_model: String,
 }
@@ -451,6 +455,17 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     if bands.is_empty() {
         bail!("groups: no band selects any precursor of the library");
     }
+    // Whether any library row is in two bands. A band is a row span of the m/z-sorted
+    // precursor table, and a candidate id is the band-local id plus the band's first row,
+    // so spans that do not overlap cannot share a candidate and the pool has no overlap
+    // duplicate to find. Exact where the plan's m/z test is not: two bands that touch at one
+    // m/z value both hold a precursor at exactly that value.
+    let bands_disjoint = {
+        let mut spans: Vec<(usize, usize)> =
+            bands.iter().map(|b| (b.offset as usize, b.n)).collect();
+        spans.sort_unstable();
+        spans.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0)
+    };
 
     // --- pooled seed: library-wide ids, one q scale, one mass calibration
     let pooled_seed = d("seed_psms.parquet");
@@ -1037,6 +1052,43 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     groups::summarise_cal(&cals, global, &d("cal.json"))?;
 
     // --- pool into the single-run artifacts
+    //
+    // The competed rows are left per band only where rescore then reads exactly the rows
+    // the pooled table would hold, in its order, and nothing else reads that table: see
+    // `groups.pool_competed`.
+    let pooled_competed_path = d("psms_competed.parquet");
+    let competed_readers = cfg.extract.emit_candidate_audit
+        || cfg.mbr.strategy != mumdia_core::config::MbrStrategy::None;
+    let pool_competed = cfg.groups.pool_competed || !bands_disjoint || competed_readers;
+    if !cfg.groups.pool_competed {
+        if pool_competed {
+            info!(
+                bands_disjoint,
+                audit = cfg.extract.emit_candidate_audit,
+                mbr = ?cfg.mbr.strategy,
+                "groups: groups.pool_competed is off, but the competed table is pooled: the \
+                 bands overlap, or the candidate audit or match-between-runs reads it"
+            );
+        } else {
+            info!(
+                groups = arts.len(),
+                "groups: the competed rows stay per band and rescore reads the band tables \
+                 (groups.pool_competed = false)"
+            );
+            // A pooled table left by an earlier run into this directory is not this run's,
+            // and nothing would say so: take it away with its companions.
+            for f in [
+                pooled_competed_path.clone(),
+                format!("{pooled_competed_path}.report.json"),
+                format!("{pooled_competed_path}.schema.json"),
+            ] {
+                if std::path::Path::new(&f).exists() {
+                    std::fs::remove_file(&f)
+                        .with_context(|| format!("removing an earlier run's {f}"))?;
+                }
+            }
+        }
+    }
     let out = Pooled {
         seed: pooled_seed,
         psms: d("psms_extracted.parquet"),
@@ -1044,7 +1096,11 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         // Not pooled: nothing reads a run-level features table (compete's output carries
         // the feature columns), and on a real run it is 55 GB of writes per run.
         features: String::new(),
-        competed: d("psms_competed.parquet"),
+        competed: if pool_competed {
+            vec![pooled_competed_path.clone()]
+        } else {
+            arts.iter().map(|a| a.competed.clone()).collect()
+        },
         rt_model,
     };
     // The pooled extracted table has exactly one reader, the candidate audit, and that is
@@ -1062,7 +1118,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         bands: &arts,
         out_psms: pool_psms.then_some(out.psms.as_str()),
         out_chromatograms: &out.chromatograms,
-        out_competed: &out.competed,
+        out_competed: pool_competed.then_some(pooled_competed_path.as_str()),
+        bands_disjoint,
     })
     .context("pooling the window groups")?;
     let pooled_artifacts = stats
@@ -1079,22 +1136,22 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             )
         })
         .into_iter()
-        .chain([
-            (
-                artifact::CHROMATOGRAMS.0,
-                artifact::CHROMATOGRAMS,
-                &out.chromatograms,
-                stats.chromatograms,
-                stats.chromatograms_hash.clone(),
-            ),
+        .chain([(
+            artifact::CHROMATOGRAMS.0,
+            artifact::CHROMATOGRAMS,
+            &out.chromatograms,
+            stats.chromatograms,
+            stats.chromatograms_hash.clone(),
+        )])
+        .chain(stats.competed_hash.clone().map(|h| {
             (
                 artifact::PSMS_COMPETED.0,
                 artifact::PSMS_COMPETED,
-                &out.competed,
+                &pooled_competed_path,
                 stats.competed,
-                stats.competed_hash.clone(),
-            ),
-        ]);
+                h,
+            )
+        }));
     for (name, schema, path, rows, content_hash) in pooled_artifacts {
         // One hash for both the manifest record and the report beside the file, computed
         // by the pool while it spliced the table: these are the run's largest artifacts,
@@ -1136,10 +1193,10 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     }
     // The competed table's schema companion (`<table>.schema.json`) names the classifier's
     // columns; every band wrote the same one, so the first band's is the pool's.
-    {
+    if pool_competed {
         let src = format!("{}.schema.json", arts[0].competed);
         if std::path::Path::new(&src).exists() {
-            std::fs::copy(&src, format!("{}.schema.json", out.competed))
+            std::fs::copy(&src, format!("{pooled_competed_path}.schema.json"))
                 .with_context(|| format!("copying {src} beside the pooled table"))?;
         }
     }
