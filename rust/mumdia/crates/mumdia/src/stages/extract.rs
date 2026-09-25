@@ -19,7 +19,7 @@ use anyhow::Result;
 use mumdia_core::config::{ExtractConfig, GateMode, PeakClaim};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{write_table, Col, TableFile, TableWriter};
+use mumdia_io::table::{write_table, Col, TableFile, TableWriter, WRITE_TABLE_CHUNK_ROWS};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -3117,44 +3117,6 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
     // Cascade + apex per candidate.
     let scan_window = p.cfg.fixed_scan_window.max(1);
 
-    // psms_extracted columns
-    let (mut cid_c, mut apexrt_c, mut apexint_c) = (Vec::new(), Vec::new(), Vec::new());
-    // Top-K peak promotion (AlphaDIA #7): the peak rank of each emitted PSM row. 0 is
-    // the selected apex (the only row per candidate until promote_top_peaks > 1).
-    let mut peakrank_c: Vec<i32> = Vec::new();
-    let (mut nmatch_c, mut corun_c, mut npred_c) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut calrt_c, mut mz_c, mut z_c) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut label_c, mut base_c, mut pform_c, mut prot_c, mut irt_c) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let mut apexim_c: Vec<Option<f64>> = Vec::new();
-    // Fraction of this candidate's matched intensity that a co-eluting competitor
-    // claims more strongly (co-elution arbitration); 0 when the two-pass path is off.
-    let mut contested_c: Vec<f64> = Vec::new();
-    // Richer soft-competition columns, emitted only with emit_contested_features.
-    let (mut contested_count_c, mut apportioned_c): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
-    // MS1 apex isotope intensities (null when no MS1 provided).
-    let mut ms1_m1: Vec<Option<f64>> = Vec::new();
-    let mut ms1_mono: Vec<Option<f64>> = Vec::new();
-    let mut ms1_i1: Vec<Option<f64>> = Vec::new();
-    let mut ms1_i2: Vec<Option<f64>> = Vec::new();
-    // Gate diagnostic scores (per accepted candidate; see CandOut).
-    let (mut gate_apex_c, mut gate_peakspec_c, mut gate_coel_c, mut gate_se_c): (
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-    ) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    // Demix (D1/D2/D3) feature columns.
-    #[allow(clippy::type_complexity)]
-    let (
-        mut deconv_expl_c,
-        mut deconv_act_c,
-        mut deconv_share_c,
-        mut deconv_collin_c,
-        mut deconv_shadow_c,
-    ): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-
     // Chromatogram rows stream to parquet chunk by chunk (see the candidate loop below).
     let chrom_writer = TableWriter::new(p.out_chrom).with_row_group_rows(CHROM_ROW_GROUP_ROWS);
 
@@ -3226,6 +3188,186 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         /// selection model. Empty for K=1.
         peaks: Vec<(u8, f64, f64, f64, f64, f64)>,
     }
+
+    /// The `psms_extracted` rows not yet written, as the columns the table has always had.
+    ///
+    /// The table used to be held whole, 21 to 32 column vectors for every accepted row, and
+    /// written once at the end through `write_table`, which cut it into 65,536-row chunks.
+    /// Now a full chunk is written as soon as it fills, through the same writer, so the
+    /// writer sees the same chunks and the file is byte-identical (`write_table_chunked`
+    /// states why the chunk sequence is what matters). Only the demix features need the
+    /// whole table, because they are patched in after the loop; with
+    /// `emit_demix_features` the rows are kept and written at the end as before.
+    #[derive(Default)]
+    struct PsmRows {
+        cid: Vec<u32>,
+        peak_rank: Vec<i32>,
+        apex_rt: Vec<f64>,
+        apex_int: Vec<f32>,
+        n_match: Vec<i32>,
+        npred: Vec<i32>,
+        corun: Vec<i32>,
+        calrt: Vec<f64>,
+        mz: Vec<f64>,
+        z: Vec<i32>,
+        label: Vec<String>,
+        base: Vec<u32>,
+        pform: Vec<String>,
+        prot: Vec<String>,
+        irt: Vec<f32>,
+        contested: Vec<f64>,
+        ms1_m1: Vec<Option<f64>>,
+        ms1_mono: Vec<Option<f64>>,
+        ms1_i1: Vec<Option<f64>>,
+        ms1_i2: Vec<Option<f64>>,
+        contested_count: Vec<f64>,
+        apportioned: Vec<f64>,
+        gate_apex: Vec<f32>,
+        gate_peakspec: Vec<f32>,
+        gate_coel: Vec<f32>,
+        gate_se: Vec<f32>,
+        deconv_expl: Vec<f32>,
+        deconv_act: Vec<f32>,
+        deconv_share: Vec<f32>,
+        deconv_collin: Vec<f32>,
+        deconv_shadow: Vec<f32>,
+    }
+
+    impl PsmRows {
+        fn len(&self) -> usize {
+            self.cid.len()
+        }
+
+        /// Append one row; its chromatogram rows are the caller's.
+        fn push(&mut self, r: CandOut, cfg: &ExtractConfig) {
+            self.cid.push(r.cid);
+            self.peak_rank.push(r.peak_rank as i32);
+            self.apex_rt.push(r.apex_rt);
+            self.apex_int.push(r.apex_int);
+            self.n_match.push(r.n_match);
+            self.corun.push(r.corun);
+            self.npred.push(r.npred);
+            self.calrt.push(r.calrt);
+            self.mz.push(r.mz);
+            self.contested.push(r.contested);
+            if cfg.emit_contested_features {
+                self.contested_count.push(r.contested_count_frac);
+                self.apportioned.push(r.apportioned_frac);
+            }
+            self.z.push(r.z);
+            self.label.push(r.label);
+            self.base.push(r.base);
+            self.pform.push(r.pform);
+            self.prot.push(r.prot);
+            self.irt.push(r.irt);
+            self.ms1_m1.push(r.ms1_m1);
+            self.ms1_mono.push(r.ms1_mono);
+            self.ms1_i1.push(r.ms1_i1);
+            self.ms1_i2.push(r.ms1_i2);
+            if cfg.emit_gate_diagnostics {
+                self.gate_apex.push(r.gate_apex);
+                self.gate_peakspec.push(r.gate_peak_spectral);
+                self.gate_coel.push(r.gate_coelution);
+                self.gate_se.push(r.gate_spectral_entropy);
+            }
+            if cfg.emit_demix_features {
+                self.deconv_expl.push(r.deconv_explained);
+                self.deconv_act.push(r.deconv_active);
+                self.deconv_share.push(r.deconv_share);
+                self.deconv_collin.push(r.deconv_collin);
+                self.deconv_shadow.push(r.deconv_shadow);
+            }
+        }
+
+        /// Move the pending rows out as the table's columns, in the table's column order,
+        /// with library-wide candidate ids (`offset` is `Library::global_offset`).
+        fn take_cols(&mut self, offset: u32, cfg: &ExtractConfig) -> Vec<Col> {
+            use std::mem::take;
+            let n = self.len();
+            let mut cols = vec![
+                Col::U32(
+                    "candidate_id".into(),
+                    self.cid.iter().map(|c| c + offset).collect(),
+                ),
+                Col::I32("peak_rank".into(), take(&mut self.peak_rank)),
+                Col::F64("apex_rt".into(), take(&mut self.apex_rt)),
+                Col::OptF64("apex_im".into(), vec![None; n]),
+                Col::F32("apex_intensity".into(), take(&mut self.apex_int)),
+                Col::I32("n_matched_fragments".into(), take(&mut self.n_match)),
+                Col::I32("n_predicted_fragments".into(), take(&mut self.npred)),
+                Col::I32("coelution_run".into(), take(&mut self.corun)),
+                Col::F64("rt_pred_cal".into(), take(&mut self.calrt)),
+                Col::F64("precursor_mz".into(), take(&mut self.mz)),
+                Col::I32("charge".into(), take(&mut self.z)),
+                Col::Str("label".into(), take(&mut self.label)),
+                Col::U32("base_peptide_id".into(), take(&mut self.base)),
+                Col::Str("peptidoform".into(), take(&mut self.pform)),
+                Col::Str("protein".into(), take(&mut self.prot)),
+                Col::F32("predicted_irt".into(), take(&mut self.irt)),
+                Col::F64("contested_frac".into(), take(&mut self.contested)),
+                Col::OptF64("ms1_isom1".into(), take(&mut self.ms1_m1)),
+                Col::OptF64("ms1_mono".into(), take(&mut self.ms1_mono)),
+                Col::OptF64("ms1_iso1".into(), take(&mut self.ms1_i1)),
+                Col::OptF64("ms1_iso2".into(), take(&mut self.ms1_i2)),
+            ];
+            self.cid.clear();
+            // Richer soft-competition columns only when emit_contested_features (default-off
+            // keeps the schema byte-identical; contested_frac above is the pre-existing one).
+            if cfg.emit_contested_features {
+                cols.push(Col::F64(
+                    "contested_count_frac".into(),
+                    take(&mut self.contested_count),
+                ));
+                cols.push(Col::F64(
+                    "apportioned_frac".into(),
+                    take(&mut self.apportioned),
+                ));
+            }
+            // Diagnostic gate-score columns only when enabled (default-off keeps the schema
+            // byte-identical to the production chain).
+            if cfg.emit_gate_diagnostics {
+                cols.push(Col::F32("gate_apex".into(), take(&mut self.gate_apex)));
+                cols.push(Col::F32(
+                    "gate_peak_spectral".into(),
+                    take(&mut self.gate_peakspec),
+                ));
+                cols.push(Col::F32("gate_coelution".into(), take(&mut self.gate_coel)));
+                cols.push(Col::F32(
+                    "gate_spectral_entropy".into(),
+                    take(&mut self.gate_se),
+                ));
+            }
+            if cfg.emit_demix_features {
+                cols.push(Col::F32(
+                    "deconv_explained_frac".into(),
+                    take(&mut self.deconv_expl),
+                ));
+                cols.push(Col::F32("deconv_active".into(), take(&mut self.deconv_act)));
+                cols.push(Col::F32(
+                    "deconv_share".into(),
+                    take(&mut self.deconv_share),
+                ));
+                cols.push(Col::F32(
+                    "deconv_max_collinearity".into(),
+                    take(&mut self.deconv_collin),
+                ));
+                cols.push(Col::F32(
+                    "shadow_kept_frac".into(),
+                    take(&mut self.deconv_shadow),
+                ));
+            }
+            cols
+        }
+    }
+
+    // psms_extracted rows, streamed in `write_table`'s own chunks unless the demix pass
+    // needs the whole table (see `PsmRows`).
+    let stream_psms = !p.cfg.emit_demix_features;
+    let mut psms = PsmRows::default();
+    let mut psms_writer = stream_psms.then(|| TableWriter::new(p.out_psms));
+    let mut psms_err: Option<anyhow::Error> = None;
+    let mut psms_write_busy = std::time::Duration::ZERO;
+    let psm_offset = lib.global_offset;
 
     // Apex-scan lookup for spectrum-centric demixing (D2): rt_bits -> scan indices.
     // Built only when demixing is requested, so the default path pays nothing.
@@ -3949,7 +4091,7 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                     .map(|(cid, hits)| per_candidate(*cid, hits))
                     .collect();
                 let mut ch = ChromChunk::default();
-                for r in outs.into_iter().flatten() {
+                for mut r in outs.into_iter().flatten() {
                     n_accepted += 1;
                     let rcid = r.cid;
                     for (rank, apex, start, end, ev, area) in &r.peaks {
@@ -3961,45 +4103,20 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
                         pk_ev.push(*ev);
                         pk_area.push(*area);
                     }
-                    cid_c.push(r.cid);
-                    peakrank_c.push(r.peak_rank as i32);
-                    apexrt_c.push(r.apex_rt);
-                    apexim_c.push(None);
-                    apexint_c.push(r.apex_int);
-                    nmatch_c.push(r.n_match);
-                    corun_c.push(r.corun);
-                    npred_c.push(r.npred);
-                    calrt_c.push(r.calrt);
-                    mz_c.push(r.mz);
-                    contested_c.push(r.contested);
-                    if p.cfg.emit_contested_features {
-                        contested_count_c.push(r.contested_count_frac);
-                        apportioned_c.push(r.apportioned_frac);
+                    let chrom = std::mem::take(&mut r.chrom);
+                    psms.push(r, p.cfg);
+                    if let Some(w) = psms_writer.as_mut() {
+                        if psms.len() == WRITE_TABLE_CHUNK_ROWS {
+                            let t_write = Instant::now();
+                            let written = w.write_cols(psms.take_cols(psm_offset, p.cfg));
+                            psms_write_busy += t_write.elapsed();
+                            if let Err(e) = written {
+                                psms_err = Some(e);
+                                return false;
+                            }
+                        }
                     }
-                    z_c.push(r.z);
-                    label_c.push(r.label);
-                    base_c.push(r.base);
-                    pform_c.push(r.pform);
-                    prot_c.push(r.prot);
-                    irt_c.push(r.irt);
-                    ms1_m1.push(r.ms1_m1);
-                    ms1_mono.push(r.ms1_mono);
-                    ms1_i1.push(r.ms1_i1);
-                    ms1_i2.push(r.ms1_i2);
-                    if p.cfg.emit_gate_diagnostics {
-                        gate_apex_c.push(r.gate_apex);
-                        gate_peakspec_c.push(r.gate_peak_spectral);
-                        gate_coel_c.push(r.gate_coelution);
-                        gate_se_c.push(r.gate_spectral_entropy);
-                    }
-                    if p.cfg.emit_demix_features {
-                        deconv_expl_c.push(r.deconv_explained);
-                        deconv_act_c.push(r.deconv_active);
-                        deconv_share_c.push(r.deconv_share);
-                        deconv_collin_c.push(r.deconv_collin);
-                        deconv_shadow_c.push(r.deconv_shadow);
-                    }
-                    for (cc, nm, fmz, omz, pint, rt, it) in r.chrom {
+                    for (cc, nm, fmz, omz, pint, rt, it) in chrom {
                         ch.cid.push(cc);
                         ch.name.push(nm);
                         ch.fmz.push(fmz);
@@ -4184,12 +4301,12 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
         // Which candidates need a demix, grouped by the scan that serves them. BTreeMap so
         // the scan iteration order is deterministic.
         let mut by_scan: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
-        for i in 0..cid_c.len() {
-            if peakrank_c[i] != 0 {
+        for i in 0..psms.len() {
+            if psms.peak_rank[i] != 0 {
                 continue;
             }
-            if let Some(si) = demix_apex_scan(scans, &rt_scan, apexrt_c[i], mz_c[i]) {
-                by_scan.entry(si).or_default().push(cid_c[i]);
+            if let Some(si) = demix_apex_scan(scans, &rt_scan, psms.apex_rt[i], psms.mz[i]) {
+                by_scan.entry(si).or_default().push(psms.cid[i]);
             }
         }
         let n_scans = by_scan.len();
@@ -4225,68 +4342,44 @@ pub fn run(mut p: ExtractParams) -> Result<(u64, u64)> {
             "extract: demix features (one NNLS per apex scan)"
         );
         // Patch the rank-0 rows in place; the columns were filled in the chunk loop above.
-        for i in 0..cid_c.len() {
-            if peakrank_c[i] != 0 {
+        for i in 0..psms.len() {
+            if psms.peak_rank[i] != 0 {
                 continue;
             }
-            if let Some(&(expl, act, share, collin, shadow)) = feats.get(&cid_c[i]) {
-                deconv_expl_c[i] = expl as f32;
-                deconv_act_c[i] = act as f32;
-                deconv_share_c[i] = share as f32;
-                deconv_collin_c[i] = collin as f32;
-                deconv_shadow_c[i] = shadow as f32;
+            if let Some(&(expl, act, share, collin, shadow)) = feats.get(&psms.cid[i]) {
+                psms.deconv_expl[i] = expl as f32;
+                psms.deconv_act[i] = act as f32;
+                psms.deconv_share[i] = share as f32;
+                psms.deconv_collin[i] = collin as f32;
+                psms.deconv_shadow[i] = shadow as f32;
             }
         }
     }
 
-    let mut psms_cols = vec![
-        Col::U32(
-            "candidate_id".into(),
-            cid_c.iter().map(|c| c + lib.global_offset).collect(),
-        ),
-        Col::I32("peak_rank".into(), peakrank_c),
-        Col::F64("apex_rt".into(), apexrt_c),
-        Col::OptF64("apex_im".into(), apexim_c),
-        Col::F32("apex_intensity".into(), apexint_c),
-        Col::I32("n_matched_fragments".into(), nmatch_c),
-        Col::I32("n_predicted_fragments".into(), npred_c),
-        Col::I32("coelution_run".into(), corun_c),
-        Col::F64("rt_pred_cal".into(), calrt_c),
-        Col::F64("precursor_mz".into(), mz_c),
-        Col::I32("charge".into(), z_c),
-        Col::Str("label".into(), label_c),
-        Col::U32("base_peptide_id".into(), base_c),
-        Col::Str("peptidoform".into(), pform_c),
-        Col::Str("protein".into(), prot_c),
-        Col::F32("predicted_irt".into(), irt_c),
-        Col::F64("contested_frac".into(), contested_c),
-        Col::OptF64("ms1_isom1".into(), ms1_m1),
-        Col::OptF64("ms1_mono".into(), ms1_mono),
-        Col::OptF64("ms1_iso1".into(), ms1_i1),
-        Col::OptF64("ms1_iso2".into(), ms1_i2),
-    ];
-    // Richer soft-competition columns only when emit_contested_features (default-off
-    // keeps the schema byte-identical; contested_frac above is the pre-existing one).
-    if p.cfg.emit_contested_features {
-        psms_cols.push(Col::F64("contested_count_frac".into(), contested_count_c));
-        psms_cols.push(Col::F64("apportioned_frac".into(), apportioned_c));
+    // A psms write error inside the candidate loop stopped the loop; report it now.
+    if let Some(e) = psms_err {
+        return Err(e);
     }
-    // Diagnostic gate-score columns only when enabled (default-off keeps the schema
-    // byte-identical to the production chain).
-    if p.cfg.emit_gate_diagnostics {
-        psms_cols.push(Col::F32("gate_apex".into(), gate_apex_c));
-        psms_cols.push(Col::F32("gate_peak_spectral".into(), gate_peakspec_c));
-        psms_cols.push(Col::F32("gate_coelution".into(), gate_coel_c));
-        psms_cols.push(Col::F32("gate_spectral_entropy".into(), gate_se_c));
-    }
-    if p.cfg.emit_demix_features {
-        psms_cols.push(Col::F32("deconv_explained_frac".into(), deconv_expl_c));
-        psms_cols.push(Col::F32("deconv_active".into(), deconv_act_c));
-        psms_cols.push(Col::F32("deconv_share".into(), deconv_share_c));
-        psms_cols.push(Col::F32("deconv_max_collinearity".into(), deconv_collin_c));
-        psms_cols.push(Col::F32("shadow_kept_frac".into(), deconv_shadow_c));
-    }
-    let n_psms = write_table(p.out_psms, psms_cols)?;
+    // The last, short chunk (or the one empty chunk that fixes the schema of an empty
+    // table), then the footer. Unstreamed, the whole table goes through `write_table`,
+    // which cuts the same chunks.
+    let t_write = Instant::now();
+    let n_psms = match psms_writer {
+        Some(mut w) => {
+            if psms.len() > 0 || w.rows() == 0 {
+                w.write_cols(psms.take_cols(psm_offset, p.cfg))?;
+            }
+            w.close()?
+        }
+        None => write_table(p.out_psms, psms.take_cols(psm_offset, p.cfg))?,
+    };
+    psms_write_busy += t_write.elapsed();
+    info!(
+        rows = n_psms,
+        streamed = stream_psms,
+        writer_busy_ms = psms_write_busy.as_millis() as u64,
+        "extract: psms_extracted writer"
+    );
 
     // (chromatograms were streamed to `p.out_chrom` during the candidate loop above)
 

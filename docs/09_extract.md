@@ -118,6 +118,17 @@ Column order and types from `extract.rs:2480`:
 | `ms1_iso1` | OptF64 | MS1 +1 isotope intensity |
 | `ms1_iso2` | OptF64 | MS1 +2 isotope intensity |
 
+The rows are written as they are produced. Each time 65,536 rows have accumulated
+(`WRITE_TABLE_CHUNK_ROWS`) they go to the table's `TableWriter`, which is exactly the
+chunk sequence `write_table` cut the whole table into, so the file is byte-identical
+to the one written at the end of the stage before 2026-09-25 while only one chunk of
+rows is resident (at most about 6 GB less on an unbanded immunopeptidomics run). The
+one exception is `emit_demix_features`: its five columns are patched in after the
+candidate loop, so the rows are kept whole and written at the end through
+`write_table`, which produces the same chunks. The stage logs `extract:
+psms_extracted writer` with the row count, whether the table was streamed and the
+writer's busy time.
+
 Conditional columns (default-off, added only when the knob is set so the
 production schema stays byte-identical):
 - `emit_contested_features` -> `contested_count_frac` F64, `apportioned_frac` F64 (`extract.rs:2505`).
@@ -823,9 +834,10 @@ tests encode the behavioral invariants that gate tuning must preserve.
   `(candidate_id, peak_rank)` and entrapment validation, so it stays default-off.
 - **New per-PSM columns**: append to the `CandOut` struct (`extract.rs:1656`), set
   it in the `rank0` construction (`extract.rs:2203`) and in the promoted-alternate
-  construction (`extract.rs:2297`), push it in the serial append loop
-  (`extract.rs:2435`), and add the `Col` in the `psms_cols` vector
-  (`extract.rs:2480`). Gate any non-production column behind an `emit_*` flag to
+  construction (`extract.rs:2297`), add a vector to `PsmRows`, push it in
+  `PsmRows::push` and emit its `Col` in `PsmRows::take_cols`, which writes the
+  columns in the table's order for every streamed chunk. Gate any non-production
+  column behind an `emit_*` flag to
   preserve the byte-identical default schema, and bump the schema version in
   `schema.rs` if the default schema changes.
 - **IM / 4D**: `apex_im` and the IM data-model hooks exist but are unfilled; a
