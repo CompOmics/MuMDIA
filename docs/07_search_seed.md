@@ -60,11 +60,11 @@ DeepLC fine-tune (`run.rs:237-280`).
   own f32 width; this stage widens it with `as f64` at each comparison, which is
   exact, exactly as it already did for the library's f32 fragment m/z.
 - **Library** (`--lib-precursors` + `--lib-fragments`), loaded by
-  `Library::load` (`index.rs:54`). Provides `cands: Vec<Candidate>`
-  (`candidate_id`, `peptidoform`, `charge`, `precursor_mz`, `base_peptide_id`,
-  `protein`, `is_decoy`, `predicted_irt: f32`, `frag_start`, `n_frag`), the flat
-  fragment arrays (`frag_mz`, `frag_int`, `frag_name`), and the bucketed inverted
-  index for `page_search`.
+  `Library::load_with` (`index.rs`). Provides the per-candidate columns
+  (`peptidoform(cid)`, `charge`, `prec_mz`, `base_peptide_id`, `protein(cid)`,
+  `is_decoy`, `predicted_irt: f32`, and the CSR `frag_offsets`; `cand(cid)` reads
+  them back as one borrowed record), the flat fragment arrays (`frag_mz`,
+  `frag_int`, `frag_name_id`), and the bucketed inverted index for `page_search`.
 - **Config**: `cfg.search_seed` plus `cfg.extract.bucket_size` (the bucketed
   Library index bucket width; `run.rs:225`, `main.rs:473`).
 

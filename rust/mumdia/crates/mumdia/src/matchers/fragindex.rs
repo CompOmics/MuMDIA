@@ -34,8 +34,9 @@ pub struct FragIndex {
     post_int: Vec<f32>,
     /// Candidate-local fragment ordinal per posting.
     post_frag: Vec<u16>,
-    /// Precursor m/z indexed by candidate id (ascending); for `candidate_range`.
-    prec_mz: Vec<f64>,
+    /// Precursor m/z indexed by candidate id (ascending); for `candidate_range`. The
+    /// library's own array, shared rather than copied.
+    prec_mz: std::sync::Arc<[f64]>,
     n_cand: usize,
     tol_ppm: f64,
 }
@@ -46,17 +47,11 @@ impl FragIndex {
     /// Deterministic: candidate-order scatter, no parallel sort, no hashing.
     pub fn build(lib: &Library, tol_ppm: f64) -> FragIndex {
         let t0 = std::time::Instant::now();
-        let n_cand = lib.cands.len();
-        // Precondition (docs/06_predict_frag_index_matchers.md, CLAUDE.md
-        // index.rs:73): candidate_id is dense 0..n_cand so it indexes the
-        // accumulator and post_cand directly.
-        for (c, cand) in lib.cands.iter().enumerate() {
-            assert_eq!(
-                cand.candidate_id as usize, c,
-                "fragindex requires contiguous candidate_id (id {} at index {c})",
-                cand.candidate_id
-            );
-        }
+        let n_cand = lib.n_candidates();
+        // Precondition (docs/06_predict_frag_index_matchers.md): candidate_id is dense
+        // 0..n_cand so it indexes the accumulator and post_cand directly. The library
+        // stores its candidates as columns indexed by that id, so this holds by
+        // construction (and `Library::from_candidates` asserts it for a hand-built one).
         let total = lib.frag_mz.len();
         assert!(total <= u32::MAX as usize, "total_frags exceeds u32");
 
@@ -113,9 +108,8 @@ impl FragIndex {
         let mut post_int = vec![0f32; total];
         let mut post_frag = vec![0u16; total];
         let mut cursor: Vec<u32> = bin_start[..bins.n_bins].to_vec();
-        for (c, cand) in lib.cands.iter().enumerate() {
-            for k in 0..cand.n_frag {
-                let gi = cand.frag_start + k;
+        for c in 0..n_cand {
+            for (k, gi) in lib.frag_range(c as u32).enumerate() {
                 let mz = lib.frag_mz[gi];
                 let b = bins.bin(mz as f64); // bin by the stored (f32) value
                 let slot = cursor[b] as usize;
@@ -488,7 +482,6 @@ mod tests {
         let mut frag_mz = Vec::new();
         let mut frag_int = Vec::new();
         let mut frag_name_id: Vec<u16> = Vec::new();
-        let mut prec_mz = Vec::new();
         let mut cs = Vec::new();
         for (i, (frags, pmz)) in cands.iter().enumerate() {
             let start = frag_mz.len();
@@ -511,22 +504,8 @@ mod tests {
                 frag_start: start,
                 n_frag: frags.len(),
             });
-            prec_mz.push(*pmz);
         }
-        Library {
-            cands: cs,
-            frag_mz,
-            frag_int,
-            frag_name_id,
-            frag_name_dict: vec!["f".to_string()],
-            idx_mz: Vec::new(),
-            idx_cid: Vec::new(),
-            idx_int: Vec::new(),
-            bucket_min: Vec::new(),
-            bucket_size: 1,
-            prec_mz,
-            global_offset: 0,
-        }
+        Library::from_candidates(cs, frag_mz, frag_int, frag_name_id, vec!["f".to_string()])
     }
 
     #[test]
@@ -690,9 +669,8 @@ mod tests {
         });
         // Reference: the same predicate, over the library itself.
         let mut want: Vec<(u32, u64, u32, u16)> = Vec::new();
-        for (c, cand) in lib.cands.iter().enumerate() {
-            for k in 0..cand.n_frag {
-                let gi = cand.frag_start + k;
+        for c in 0..lib.n_candidates() {
+            for (k, gi) in lib.frag_range(c as u32).enumerate() {
                 let pmz = lib.frag_mz[gi] as f64;
                 if within_ppm(pmz, q, tol) {
                     want.push((
@@ -875,7 +853,7 @@ mod tests {
             (200.10f64, 1.0f32),
             (1500.605f64, 3.0f32),
         ];
-        let (lo, hi) = (0u32, lib.cands.len() as u32);
+        let (lo, hi) = (0u32, lib.n_candidates() as u32);
         let fi = score_scan_count_dot(&idx, &peaks, lo, hi);
         let nv = naive::score_scan_count_dot(&lib, &peaks, lo, hi, tol);
         assert_eq!(fi.len(), nv.len(), "matched-candidate set size differs");

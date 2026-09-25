@@ -714,7 +714,7 @@ fn claim_cue_multiplier(
         // envelope at the nearest MS1 scan. Absent mono precursor -> down-weight; a
         // present mono with an implausible +1/mono ratio -> mild down-weight. A decoy's
         // precursor m/z is well-defined but has no real co-eluting MS1 signal.
-        let cand = &lib.cands[cid as usize];
+        let cand = lib.cand(cid);
         let j = nearest_index(ms1_rts, rt);
         let s = &ms1_scans[j];
         let z = (cand.charge.max(1)) as f64;
@@ -2698,7 +2698,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
         // break a run) rather than only scans that happened to carry a hit. When
         // no covering-window grid is available, fall back to the sparse groups.
         let grid: Vec<f64> = if !windows.is_empty() {
-            let pm = lib.cands[cid as usize].precursor_mz;
+            let pm = lib.prec_mz[cid as usize];
             let (lo, hi) = (rt_lo[cid as usize], rt_hi[cid as usize]);
             // `windows` is sorted by lower m/z, so a covering window has
             // `lower_mz <= pm` AND, since its width is at most `window_max_width`,
@@ -2886,7 +2886,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             return Vec::new();
         }
 
-        let c = &lib.cands[cid as usize];
+        let c = lib.cand(cid);
 
         // MS1 apex isotope intensities at a given RT (nearest MS1 scan). Factored
         // so both the selected apex (rank 0) and any promoted alternate peak (#7)
@@ -3193,8 +3193,8 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             z: c.charge,
             label: if c.is_decoy { "decoy" } else { "target" }.to_string(),
             base: c.base_peptide_id,
-            pform: c.peptidoform.clone(),
-            prot: c.protein.clone(),
+            pform: c.peptidoform.to_string(),
+            prot: c.protein.to_string(),
             irt: c.predicted_irt,
             ms1_m1: o_ms1_m1,
             ms1_mono: o_ms1_mono,
@@ -3286,8 +3286,8 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
                 z: c.charge,
                 label: if c.is_decoy { "decoy" } else { "target" }.to_string(),
                 base: c.base_peptide_id,
-                pform: c.peptidoform.clone(),
-                prot: c.protein.clone(),
+                pform: c.peptidoform.to_string(),
+                prot: c.protein.to_string(),
                 irt: c.predicted_irt,
                 ms1_m1: a_m1,
                 ms1_mono: a_mono,
@@ -3991,7 +3991,6 @@ mod accumulate_tests {
         let mut frag_int = Vec::with_capacity(2 * n);
         let mut frag_name_id = Vec::with_capacity(2 * n);
         let mut cands = Vec::with_capacity(n);
-        let mut prec_mz = Vec::with_capacity(n);
         for i in 0..n {
             let start = frag_mz.len();
             // Fragments are shared across candidates on purpose (300.0 + i % 97 * 1.37),
@@ -4015,22 +4014,14 @@ mod accumulate_tests {
                 frag_start: start,
                 n_frag: 2,
             });
-            prec_mz.push(pmz);
         }
-        Library {
+        Library::from_candidates(
             cands,
             frag_mz,
             frag_int,
             frag_name_id,
-            frag_name_dict: vec!["b".to_string(), "y".to_string()],
-            idx_mz: Vec::new(),
-            idx_cid: Vec::new(),
-            idx_int: Vec::new(),
-            bucket_min: Vec::new(),
-            bucket_size: 1,
-            prec_mz,
-            global_offset: 0,
-        }
+            vec!["b".to_string(), "y".to_string()],
+        )
     }
 
     fn scans(n_scans: usize, window: IsolationWindow, base: usize) -> Vec<Ms2Scan> {

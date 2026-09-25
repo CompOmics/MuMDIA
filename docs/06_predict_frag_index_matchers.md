@@ -276,15 +276,31 @@ never read). It validates the label column (only `"target"`/`"decoy"` allowed, v
 a counting sort into flat contiguous arrays (`index.rs:126-207`), so
 `cand_frags(cid)` returns three parallel slices for one candidate
 (`index.rs:312-321`): m/z, predicted intensity, and INTERNED fragment-name ids
-(`u16` into `frag_name_dict`, resolved with `frag_name_str`, `index.rs:303`).
+(`u16` into `frag_name_dict`, resolved with `frag_name_str`).
 Names are interned rather than stored as `String` because they come from a tiny
 repeating vocabulary and a per-fragment `String` costs about 24 bytes of struct
-before any text. `n_candidates()` is the candidate count (`index.rs:297`).
-Each row becomes a `Candidate` (`index.rs:23-35`) with `candidate_id`,
-`peptidoform_id`, `base_peptide_id`, `peptidoform`, `charge`, `precursor_mz`,
-`predicted_irt`, `protein`, `frag_start`/`n_frag` (the slice bounds into the flat
-fragment arrays), and `is_decoy`, which is derived from the `label` string
-(`label == "decoy"`, `index.rs:201`); the string label is not otherwise retained.
+before any text. The `name` column is read through its parquet dictionary
+(`TableFile::batches_dict`, `Dictionary(Int32, Utf8)`), so a row costs a key lookup
+in a per-batch memo (`StrInterner`) rather than a hash of its text; the ids are
+still assigned in first-appearance order over the rows the load keeps, so a partial
+load never interns a name that only a skipped row carries.
+`n_candidates()` is the candidate count.
+
+The library is structure-of-arrays, indexed by local candidate id: one column per
+precursor field (`peptidoform_id`, `base_peptide_id`, `charge`, `predicted_irt`,
+`is_decoy`), the peptidoform text as one arena (`peptidoform(cid)`), the protein
+interned (`protein(cid)`; an empty value reads as `UNASSIGNED`), the fragment slice
+bounds as one `u32` CSR array (`frag_offsets`, `frag_range(cid)`), and `prec_mz`
+as an `Arc<[f64]>` that every `FragIndex` built from the library shares instead of
+copying. `cand(cid)` returns the fields of one candidate as a borrowed `CandInfo`.
+The struct-per-candidate layout it replaced held two owned `String`s, a duplicate
+`precursor_mz`, its own position as `candidate_id` and two `usize` bounds, about
+180 bytes per precursor against about 60 now (measured on the AIF library,
+1.8M precursors: seed peak 1,226 to 1,045 MB, extract peak 1,717 to 1,517 MB, with
+byte-identical outputs). `Candidate` survives as the owned input record of
+`Library::from_candidates`, which tests and benchmarks use to build a library in
+memory. `is_decoy` is derived from the `label` string (`label == "decoy"`); the
+string label is not otherwise retained.
 When `build_bucketed` is true, `load_with` then builds the bucketed inverted index
 (`index.rs:245-280`):
 

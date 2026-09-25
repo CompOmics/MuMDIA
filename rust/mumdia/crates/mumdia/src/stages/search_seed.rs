@@ -210,7 +210,7 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     rows.sort_by_key(|(cid, _)| *cid);
     let sd: Vec<(f64, bool)> = rows
         .iter()
-        .map(|(cid, b)| (b.score, lib.cands[*cid as usize].is_decoy))
+        .map(|(cid, b)| (b.score, lib.is_decoy[*cid as usize]))
         .collect();
     let q = target_decoy_q(&sd);
 
@@ -232,13 +232,13 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
     let mut scan_c = Vec::with_capacity(n_rows);
     let mut irt_c = Vec::with_capacity(n_rows);
     for (i, (cid, b)) in rows.iter().enumerate() {
-        let c = &lib.cands[*cid as usize];
+        let c = lib.cand(*cid);
         cid_c.push(*cid);
-        pform_c.push(c.peptidoform.clone());
+        pform_c.push(c.peptidoform.to_string());
         charge_c.push(c.charge);
         mz_c.push(c.precursor_mz);
         base_c.push(c.base_peptide_id);
-        prot_c.push(c.protein.clone());
+        prot_c.push(c.protein.to_string());
         is_dec.push(c.is_decoy);
         score_c.push(b.score);
         q_c.push(q[i]);

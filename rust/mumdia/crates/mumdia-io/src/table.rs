@@ -1499,6 +1499,135 @@ impl<'a> ListF32<'a> {
     }
 }
 
+/// The decode type a string column is read as through [`TableFile::batches_dict`].
+pub fn dict_utf8_type() -> DataType {
+    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+}
+
+/// One batch of a required string column, seen through its dictionary when the reader
+/// produced one ([`TableFile::batches_dict`]) and as plain values otherwise.
+///
+/// The point is the dictionary case. A low-cardinality column (fragment names, protein
+/// accessions, labels) repeats a few hundred values across hundreds of millions of rows,
+/// and the parquet writer stores it dictionary-encoded. Read as `Utf8`, arrow expands
+/// every row back into its own copy of the text, and an interner then hashes that copy
+/// once per row. Read as `Dictionary(Int32, Utf8)`, a row is an `i32` key into the
+/// batch's value array, so a per-batch memo resolves each distinct key once
+/// ([`StrInterner`]). Row values are the same strings either way.
+pub enum StrBatch<'a> {
+    Plain(&'a StringArray),
+    Dict {
+        keys: &'a [i32],
+        values: &'a StringArray,
+    },
+}
+
+impl<'a> StrBatch<'a> {
+    /// `None` when the column is neither `Utf8` nor `Dictionary(Int32, Utf8)`, so the
+    /// caller can name the column in its own error.
+    pub fn of(col: &'a ArrayRef) -> Option<StrBatch<'a>> {
+        if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+            return Some(StrBatch::Plain(a));
+        }
+        let d = col
+            .as_any()
+            .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()?;
+        let values = d.values().as_any().downcast_ref::<StringArray>()?;
+        Some(StrBatch::Dict {
+            keys: d.keys().values(),
+            values,
+        })
+    }
+}
+
+/// Dense ids for strings in FIRST-APPEARANCE order: the first distinct value interned is
+/// id 0, the next new one id 1, and so on, exactly what a `HashMap<String, id>` filled
+/// row by row produces. [`StrInterner::row`] adds a per-batch memo over a dictionary
+/// batch's keys, so a dictionary-encoded column costs one hash per distinct key per batch
+/// instead of one per row; since a string's id never changes once assigned, the memo
+/// cannot reorder anything.
+#[derive(Default)]
+pub struct StrInterner {
+    ids: std::collections::HashMap<String, u32>,
+    values: Vec<String>,
+    /// Key -> id for the current dictionary batch, `u32::MAX` for "not yet resolved".
+    memo: Vec<u32>,
+}
+
+impl StrInterner {
+    pub fn new() -> StrInterner {
+        StrInterner::default()
+    }
+
+    /// Id of `s`, assigning the next one if it is new.
+    pub fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.ids.get(s) {
+            return id;
+        }
+        let id = u32::try_from(self.values.len()).expect("fewer than 2^32 distinct strings");
+        self.ids.insert(s.to_owned(), id);
+        self.values.push(s.to_owned());
+        id
+    }
+
+    /// Reset the key memo for a new batch. Call it once per batch, before
+    /// [`StrInterner::row`] is used on that batch.
+    pub fn begin(&mut self, col: &StrBatch) {
+        if let StrBatch::Dict { values, .. } = col {
+            self.memo.clear();
+            self.memo.resize(values.len(), u32::MAX);
+        }
+    }
+
+    /// Id of row `k` of `col`, `None` when the row's value is NULL. The caller checks the
+    /// column's own validity (the keys) first, as for any other column; a dictionary VALUE
+    /// that is NULL is the one case that check cannot see, and it is reported here.
+    pub fn row(&mut self, col: &StrBatch, k: usize) -> Option<u32> {
+        match col {
+            StrBatch::Plain(a) => {
+                if a.is_null(k) {
+                    return None;
+                }
+                Some(self.intern(a.value(k)))
+            }
+            StrBatch::Dict { keys, values } => {
+                let key = keys[k] as usize;
+                match self.memo.get(key).copied() {
+                    Some(id) if id != u32::MAX => Some(id),
+                    _ => {
+                        if values.is_null(key) {
+                            return None;
+                        }
+                        let id = self.intern(values.value(key));
+                        if let Some(m) = self.memo.get_mut(key) {
+                            *m = id;
+                        }
+                        Some(id)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Distinct values interned so far.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// The distinct values, indexed by id.
+    pub fn values(&self) -> &[String] {
+        &self.values
+    }
+
+    pub fn into_values(self) -> Vec<String> {
+        self.values
+    }
+}
+
 /// Rows per decoded batch for scalar columns (a batch is ~0.5 MB of f64).
 const SCALAR_BATCH_ROWS: usize = 1 << 16;
 /// Rows per decoded batch for list columns, whose rows are hundreds of values each.
@@ -1768,13 +1897,73 @@ impl TableFile {
     /// projected columns in FILE order, so look them up by name (`batch.schema().index_of`)
     /// rather than by the order of `columns`.
     pub fn batches(&self, columns: Option<&[&str]>, batch_size: usize) -> Result<BatchReader> {
+        self.batches_with(&self.meta, columns, batch_size)
+    }
+
+    /// As [`TableFile::batches`], with every column named in `dict` that the file stores as
+    /// `Utf8` decoded as `Dictionary(Int32, Utf8)` ([`dict_utf8_type`]) instead, so its
+    /// batches can be read through [`StrBatch`]. A named column of any other type is read as
+    /// usual, which leaves the caller's own type check to reject it exactly as before.
+    ///
+    /// The row values do not change: a dictionary-encoded parquet column is handed over
+    /// with its dictionary, and a plain-encoded one (a writer's dictionary fallback) gets a
+    /// dictionary computed per batch by the reader.
+    pub fn batches_dict(
+        &self,
+        columns: Option<&[&str]>,
+        batch_size: usize,
+        dict: &[&str],
+    ) -> Result<BatchReader> {
+        match self.dict_meta(dict)? {
+            Some(meta) => self.batches_with(&meta, columns, batch_size),
+            None => self.batches_with(&self.meta, columns, batch_size),
+        }
+    }
+
+    /// The footer with the `dict` columns' arrow type switched to a dictionary, or `None`
+    /// when none of them is a `Utf8` column of this file.
+    fn dict_meta(&self, dict: &[&str]) -> Result<Option<ArrowReaderMetadata>> {
+        let mut changed = false;
+        let fields: Vec<Field> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if dict.contains(&f.name().as_str()) && f.data_type() == &DataType::Utf8 {
+                    changed = true;
+                    f.as_ref().clone().with_data_type(dict_utf8_type())
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+        if !changed {
+            return Ok(None);
+        }
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            self.schema.metadata().clone(),
+        ));
+        let meta = ArrowReaderMetadata::try_new(
+            self.meta.metadata().clone(),
+            ArrowReaderOptions::new().with_schema(schema),
+        )
+        .with_context(|| format!("dictionary read of {}", self.path))?;
+        Ok(Some(meta))
+    }
+
+    fn batches_with(
+        &self,
+        meta: &ArrowReaderMetadata,
+        columns: Option<&[&str]>,
+        batch_size: usize,
+    ) -> Result<BatchReader> {
         let file =
             std::fs::File::open(&self.path).with_context(|| format!("opening {}", self.path))?;
         // The footer this handle parsed at `open`, not a fresh parse: a typed getter is one
         // call to this, and a stage reads a dozen columns.
-        let mut builder =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.meta.clone())
-                .with_batch_size(batch_size.max(1));
+        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, meta.clone())
+            .with_batch_size(batch_size.max(1));
         if let Some(span) = &self.selection {
             // The selection counts rows of the SELECTED row groups only, front to back, so
             // it is skip / take / skip over exactly the groups named here.
@@ -1909,6 +2098,38 @@ impl TableFile {
         Ok(out)
     }
 
+    /// A string column as one dense id per row plus the distinct values, in
+    /// first-appearance order ([`StrInterner`]): `values[ids[r]]` is row `r`.
+    ///
+    /// For a column with few distinct values and many rows -- a protein accession column,
+    /// or `label` -- [`TableFile::str`] builds one `String` per row: 24 bytes of spine plus
+    /// a heap block each, 203 million of them on the full precursor library. This is 4
+    /// bytes per row and one `String` per distinct value, and it reads the column through
+    /// its dictionary, so the text is not even expanded per row. Same null policy as `str`:
+    /// a NULL is refused, naming the row.
+    pub fn str_interned(&self, name: &str) -> Result<(Vec<u32>, Vec<String>)> {
+        self.idx(name)?;
+        let mut ids = Vec::with_capacity(self.nrows);
+        let mut interner = StrInterner::new();
+        for b in self.batches_dict(Some(&[name]), SCALAR_BATCH_ROWS, &[name])? {
+            let b = b?;
+            let col = b.column(0);
+            let view = StrBatch::of(col).ok_or_else(|| anyhow!("column '{name}' is not utf8"))?;
+            if col.null_count() > 0 {
+                let row = (0..col.len()).find(|&i| col.is_null(i)).unwrap_or(0);
+                return Err(reject_null(name, ids.len() + row));
+            }
+            interner.begin(&view);
+            for k in 0..col.len() {
+                match interner.row(&view, k) {
+                    Some(id) => ids.push(id),
+                    None => return Err(reject_null(name, ids.len())),
+                }
+            }
+        }
+        Ok((ids, interner.into_values()))
+    }
+
     pub fn opt_f64(&self, name: &str) -> Result<Vec<Option<f64>>> {
         let mut out = Vec::with_capacity(self.nrows);
         for b in self.column(name, SCALAR_BATCH_ROWS)? {
@@ -1967,6 +2188,67 @@ impl TableFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `str_interned` is `str` plus a first-appearance map, read through the dictionary:
+    /// `values[ids[r]]` must be row `r`'s string for every row, the ids must be assigned in
+    /// first-appearance order, row groups and batch boundaries must not matter, and a NULL
+    /// must be refused with its absolute row, as `str` refuses it.
+    #[test]
+    fn str_interned_is_str_through_a_first_appearance_dictionary() {
+        let dir = std::env::temp_dir().join(format!("mumdia_str_interned_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.parquet").to_str().unwrap().to_string();
+        let n = SCALAR_BATCH_ROWS + 7;
+        let pool = ["P3", "P1", "", "P2", "UNASSIGNED"];
+        let rows: Vec<String> = (0..n).map(|i| pool[(i * 7 + i / 3) % 5].to_string()).collect();
+        let mut w = TableWriter::new(&p).with_row_group_rows(1000);
+        w.write_cols(vec![
+            Col::Str("s".into(), rows.clone()),
+            Col::U32("x".into(), (0..n as u32).collect()),
+        ])
+        .unwrap();
+        w.close().unwrap();
+        let t = TableFile::open(&p).unwrap();
+        let (ids, values) = t.str_interned("s").unwrap();
+        assert_eq!(ids.len(), n);
+        let mut first: Vec<String> = Vec::new();
+        for r in &rows {
+            if !first.contains(r) {
+                first.push(r.clone());
+            }
+        }
+        assert_eq!(values, first, "ids are not in first-appearance order");
+        for (r, id) in rows.iter().zip(&ids) {
+            assert_eq!(&values[*id as usize], r);
+        }
+        assert_eq!(t.str("s").unwrap(), rows);
+        // On a span, too: the interning sees only the span's rows.
+        let sp = t.span(SCALAR_BATCH_ROWS - 3, 9).unwrap();
+        let (sids, svals) = sp.str_interned("s").unwrap();
+        let want: Vec<String> = rows[SCALAR_BATCH_ROWS - 3..SCALAR_BATCH_ROWS + 6].to_vec();
+        let got: Vec<String> = sids.iter().map(|&i| svals[i as usize].clone()).collect();
+        assert_eq!(got, want);
+        // A non-string column is refused by type, as `str` refuses it.
+        let err = t.str_interned("x").unwrap_err().to_string();
+        assert!(err.contains("not utf8"), "{err}");
+        assert!(t.str_interned("nope").is_err());
+
+        // A NULL in the second batch is named by its absolute row.
+        let q = dir.join("null.parquet").to_str().unwrap().to_string();
+        let mut vals: Vec<Option<String>> = rows.iter().cloned().map(Some).collect();
+        vals[SCALAR_BATCH_ROWS + 2] = None;
+        write_table(&q, vec![Col::OptStr("s".into(), vals)]).unwrap();
+        let err = TableFile::open(&q)
+            .unwrap()
+            .str_interned("s")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("NULL at row {}", SCALAR_BATCH_ROWS + 2)),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn open_rows_reads_exactly_the_span_and_stats_describe_the_groups() {
