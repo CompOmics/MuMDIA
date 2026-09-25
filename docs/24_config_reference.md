@@ -747,52 +747,52 @@ listed with the file it is in.
 | `MUMDIA_MOKAPOT_WORKERS` | sidecar | `"3"` | `scripts/mokapot_worker.py:120` |
 | `MUMDIA_MSCONVERT` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:193` |
 | `MUMDIA_NN_ALPHA` | sidecar | `"1e-4"` | `scripts/mokapot_worker.py:90` |
-| `MUMDIA_NN_BATCH` | sidecar | `4096` | `scripts/nn_rescore_worker.py:1672` |
-| `MUMDIA_NN_CHUNK` | sidecar | `250000` | `scripts/nn_rescore_worker.py:1677` |
-| `MUMDIA_NN_CLAMP_TINY` | sidecar | `1e-20` | `scripts/nn_rescore_worker.py:1681` |
-| `MUMDIA_NN_DEBUG_DENORMALS` | sidecar | `0` | `scripts/nn_rescore_worker.py:1761` |
-| `MUMDIA_NN_DEVICE` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:1696` |
-| `MUMDIA_NN_DROPOUT` | sidecar | `0.3` | `scripts/nn_rescore_worker.py:1669` |
-| `MUMDIA_NN_DROP_CONSTANT` | sidecar | `1` | `scripts/nn_rescore_worker.py:1873` |
-| `MUMDIA_NN_EARLY_STOP` | sidecar | `1` | `scripts/nn_rescore_worker.py:1678` |
-| `MUMDIA_NN_EARLY_STOP_TOL` | sidecar | `0.01` | `scripts/nn_rescore_worker.py:1679` |
-| `MUMDIA_NN_EPOCHS` | sidecar | `25` | `scripts/nn_rescore_worker.py:1667` |
-| `MUMDIA_NN_FEATURES` | sidecar | `""` | `scripts/nn_rescore_worker.py:1844` |
-| `MUMDIA_NN_FINAL_POOL_SCORE` | sidecar | `0` | `scripts/nn_rescore_worker.py:1682` |
-| `MUMDIA_NN_FLUSH_DENORMAL` | sidecar | `1` | `scripts/nn_rescore_worker.py:1753` |
-| `MUMDIA_NN_FOLDS` | sidecar | `3` | `scripts/nn_rescore_worker.py:1655` |
-| `MUMDIA_NN_FOLD_KEYS` | sidecar | `""` | `scripts/nn_rescore_worker.py:1900` |
-| `MUMDIA_NN_GATHER` | sidecar | `"torch"` | `scripts/nn_rescore_worker.py:1689` |
-| `MUMDIA_NN_HIDDEN` | sidecar | `"128,64"` in nn_rescore_worker.py; `"128,64,64,32"` in mokapot_worker.py | `scripts/mokapot_worker.py:83`, `scripts/nn_rescore_worker.py:1668` |
-| `MUMDIA_NN_INIT_FDR_MAX` | sidecar | `0.05` | `scripts/nn_rescore_worker.py:1674` |
-| `MUMDIA_NN_INIT_SAMPLE` | sidecar | `300000` | `scripts/nn_rescore_worker.py:2046` |
+| `MUMDIA_NN_BATCH` | sidecar | `4096` | `scripts/nn_rescore_worker.py:1676` |
+| `MUMDIA_NN_CHUNK` | sidecar | `250000` | `scripts/nn_rescore_worker.py:1681` |
+| `MUMDIA_NN_CLAMP_TINY` | sidecar | `1e-20` | `scripts/nn_rescore_worker.py:1685` |
+| `MUMDIA_NN_DEBUG_DENORMALS` | sidecar | `0` | `scripts/nn_rescore_worker.py:1765` |
+| `MUMDIA_NN_DEVICE` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:1700` |
+| `MUMDIA_NN_DROPOUT` | sidecar | `0.3` | `scripts/nn_rescore_worker.py:1673` |
+| `MUMDIA_NN_DROP_CONSTANT` | sidecar | `1` | `scripts/nn_rescore_worker.py:1877` |
+| `MUMDIA_NN_EARLY_STOP` | sidecar | `1` | `scripts/nn_rescore_worker.py:1682` |
+| `MUMDIA_NN_EARLY_STOP_TOL` | sidecar | `0.01` | `scripts/nn_rescore_worker.py:1683` |
+| `MUMDIA_NN_EPOCHS` | sidecar | `25` | `scripts/nn_rescore_worker.py:1671` |
+| `MUMDIA_NN_FEATURES` | sidecar | `""` | `scripts/nn_rescore_worker.py:1848` |
+| `MUMDIA_NN_FINAL_POOL_SCORE` | sidecar | `0` | `scripts/nn_rescore_worker.py:1686` |
+| `MUMDIA_NN_FLUSH_DENORMAL` | sidecar | `1` | `scripts/nn_rescore_worker.py:1757` |
+| `MUMDIA_NN_FOLDS` | sidecar | `3` | `scripts/nn_rescore_worker.py:1659` |
+| `MUMDIA_NN_FOLD_KEYS` | sidecar | `""` | `scripts/nn_rescore_worker.py:1904` |
+| `MUMDIA_NN_GATHER` | sidecar | `"torch"` | `scripts/nn_rescore_worker.py:1693` |
+| `MUMDIA_NN_HIDDEN` | sidecar | `"128,64"` in nn_rescore_worker.py; `"128,64,64,32"` in mokapot_worker.py | `scripts/mokapot_worker.py:83`, `scripts/nn_rescore_worker.py:1672` |
+| `MUMDIA_NN_INIT_FDR_MAX` | sidecar | `0.05` | `scripts/nn_rescore_worker.py:1678` |
+| `MUMDIA_NN_INIT_SAMPLE` | sidecar | `300000` | `scripts/nn_rescore_worker.py:2050` |
 | `MUMDIA_NN_INIT_TOPK` | sidecar | `0` | `scripts/nn_rescore_worker.py:1276` |
-| `MUMDIA_NN_ITERS` | sidecar | `5` | `scripts/nn_rescore_worker.py:1666` |
-| `MUMDIA_NN_LOAD_THREADS` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:1769` |
-| `MUMDIA_NN_LR` | sidecar | `1e-3` | `scripts/nn_rescore_worker.py:1670` |
-| `MUMDIA_NN_MARGIN_FRAC` | sidecar | `0.5` | `scripts/nn_rescore_worker.py:1665` |
+| `MUMDIA_NN_ITERS` | sidecar | `5` | `scripts/nn_rescore_worker.py:1670` |
+| `MUMDIA_NN_LOAD_THREADS` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:1773` |
+| `MUMDIA_NN_LR` | sidecar | `1e-3` | `scripts/nn_rescore_worker.py:1674` |
+| `MUMDIA_NN_MARGIN_FRAC` | sidecar | `0.5` | `scripts/nn_rescore_worker.py:1669` |
 | `MUMDIA_NN_MAX_ITER` | sidecar | `"200"` | `scripts/mokapot_worker.py:91` |
-| `MUMDIA_NN_NEG_RATIO` | sidecar | `0.0` | `scripts/nn_rescore_worker.py:1659` |
-| `MUMDIA_NN_NEG_SELECT` | sidecar | `"random"` | `scripts/nn_rescore_worker.py:1660` |
-| `MUMDIA_NN_PARALLEL` | sidecar | `0` | `scripts/nn_rescore_worker.py:1685` |
-| `MUMDIA_NN_PARALLEL_THREADS` | sidecar | `""` | `scripts/nn_rescore_worker.py:1623` |
-| `MUMDIA_NN_PREGATHER_GB` | sidecar | `8` | `scripts/nn_rescore_worker.py:1680` |
-| `MUMDIA_NN_PRE_BUFFER` | sidecar | `1` | `scripts/nn_rescore_worker.py:1776` |
-| `MUMDIA_NN_READ_AHEAD` | sidecar | `1` | `scripts/nn_rescore_worker.py:1775` |
-| `MUMDIA_NN_SCAN_THREADS` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:1779` |
-| `MUMDIA_NN_SEED` | sidecar | `0` | `scripts/nn_rescore_worker.py:1676` |
-| `MUMDIA_NN_SEEDS` | sidecar | `1` | `scripts/nn_rescore_worker.py:1675` |
-| `MUMDIA_NN_SELECT` | sidecar | `"window"` | `scripts/nn_rescore_worker.py:1686` |
+| `MUMDIA_NN_NEG_RATIO` | sidecar | `0.0` | `scripts/nn_rescore_worker.py:1663` |
+| `MUMDIA_NN_NEG_SELECT` | sidecar | `"random"` | `scripts/nn_rescore_worker.py:1664` |
+| `MUMDIA_NN_PARALLEL` | sidecar | `0` | `scripts/nn_rescore_worker.py:1689` |
+| `MUMDIA_NN_PARALLEL_THREADS` | sidecar | `""` | `scripts/nn_rescore_worker.py:1627` |
+| `MUMDIA_NN_PREGATHER_GB` | sidecar | `8` | `scripts/nn_rescore_worker.py:1684` |
+| `MUMDIA_NN_PRE_BUFFER` | sidecar | `1` | `scripts/nn_rescore_worker.py:1780` |
+| `MUMDIA_NN_READ_AHEAD` | sidecar | `1` | `scripts/nn_rescore_worker.py:1779` |
+| `MUMDIA_NN_SCAN_THREADS` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:1783` |
+| `MUMDIA_NN_SEED` | sidecar | `0` | `scripts/nn_rescore_worker.py:1680` |
+| `MUMDIA_NN_SEEDS` | sidecar | `1` | `scripts/nn_rescore_worker.py:1679` |
+| `MUMDIA_NN_SELECT` | sidecar | `"window"` | `scripts/nn_rescore_worker.py:1690` |
 | `MUMDIA_NN_SOLVER` | sidecar | `"adam"` | `scripts/mokapot_worker.py:89` |
-| `MUMDIA_NN_STREAM` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:1786` |
-| `MUMDIA_NN_STREAM_GB` | sidecar | `4` | `scripts/nn_rescore_worker.py:1800`, `scripts/nn_rescore_worker.py:1801` |
-| `MUMDIA_NN_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker.py:1717`, `scripts/nn_rescore_worker.py:1718` |
+| `MUMDIA_NN_STREAM` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:1790` |
+| `MUMDIA_NN_STREAM_GB` | sidecar | `4` | `scripts/nn_rescore_worker.py:1804`, `scripts/nn_rescore_worker.py:1805` |
+| `MUMDIA_NN_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker.py:1721`, `scripts/nn_rescore_worker.py:1722` |
 | `MUMDIA_NN_THREAD_CAP` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:349` |
-| `MUMDIA_NN_TRAIN_FDR` | sidecar | `0.01` | `scripts/nn_rescore_worker.py:1673` |
-| `MUMDIA_NN_TRAIN_SUB` | sidecar | `0.0` | `scripts/nn_rescore_worker.py:1656` |
-| `MUMDIA_NN_WARM_EPOCHS` | sidecar | `0` | `scripts/nn_rescore_worker.py:1658` |
-| `MUMDIA_NN_WARM_START` | sidecar | `0` | `scripts/nn_rescore_worker.py:1657` |
-| `MUMDIA_NN_WD` | sidecar | `1e-4` | `scripts/nn_rescore_worker.py:1671` |
+| `MUMDIA_NN_TRAIN_FDR` | sidecar | `0.01` | `scripts/nn_rescore_worker.py:1677` |
+| `MUMDIA_NN_TRAIN_SUB` | sidecar | `0.0` | `scripts/nn_rescore_worker.py:1660` |
+| `MUMDIA_NN_WARM_EPOCHS` | sidecar | `0` | `scripts/nn_rescore_worker.py:1662` |
+| `MUMDIA_NN_WARM_START` | sidecar | `0` | `scripts/nn_rescore_worker.py:1661` |
+| `MUMDIA_NN_WD` | sidecar | `1e-4` | `scripts/nn_rescore_worker.py:1675` |
 | `MUMDIA_PARQUET_COMPRESSION` | engine | none (unset means off) | `rust/mumdia/crates/mumdia-io/src/table.rs:59` |
 | `MUMDIA_PEPTDEEP_DEVICE` | sidecar | `"auto"` | `scripts/peptdeep_worker.py:214` |
 | `MUMDIA_PYTHON` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:233` |
@@ -808,7 +808,7 @@ listed with the file it is in.
 | `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker.py:68` |
 | `MUMDIA_XGB_LR` | sidecar | `"0.1"` | `scripts/mokapot_worker.py:64` |
 | `MUMDIA_XGB_TREES` | sidecar | `"200"` | `scripts/mokapot_worker.py:62` |
-| `OMP_NUM_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker.py:1720`, `scripts/nn_rescore_worker.py:1721` |
+| `OMP_NUM_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker.py:1724`, `scripts/nn_rescore_worker.py:1725` |
 | `PATH` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:293` |
 | `ProgramFiles` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:201` |
 | `ProgramFiles(x86)` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:202` |
