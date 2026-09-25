@@ -864,8 +864,8 @@ one exception noted in its own help text: it sets `MUMDIA_NN_THREADS` and
 | `NUMEXPR_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:51` |
 | `OMP_NUM_THREADS` | both | `"1"` in deeplc_finetune.py; `n.to_string()` in main.rs | `rust/mumdia/crates/mumdia/src/main.rs:94`, `scripts/deeplc_finetune.py:48` |
 | `OPENBLAS_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:49` |
-| `PYTHONIOENCODING` | engine | `"utf-8"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:734` |
-| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:734`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1650`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2261` |
+| `PYTHONIOENCODING` | engine | `"utf-8"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:735` |
+| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:735`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1650`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2261` |
 
 ## Unresolved by the generator
 
