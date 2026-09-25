@@ -597,6 +597,7 @@ mod tests {
                     for o in &options {
                         let so = ScanOptions {
                             coalesce: Some(o.clone()),
+                            decode_threads: Some(1),
                         };
                         assert_eq!(
                             collect(t, cols, bs, &so),
@@ -758,22 +759,41 @@ mod tests {
             return;
         };
         let t = TableFile::open(&src).unwrap();
+        let serial = ScanOptions::default().with_decode_threads(1);
         let arms: Vec<(&str, ScanOptions)> = vec![
-            ("plain", ScanOptions::default()),
-            ("coalesced", ScanOptions::coalesced()),
+            ("plain, one reader", serial.clone()),
             (
-                "coalesced, no prefetch",
+                "plain, 2 decode groups",
+                serial.clone().with_decode_threads(2),
+            ),
+            (
+                "plain, 4 decode groups",
+                serial.clone().with_decode_threads(4),
+            ),
+            (
+                "plain, 8 decode groups",
+                serial.clone().with_decode_threads(8),
+            ),
+            ("plain, automatic", ScanOptions::default()),
+            (
+                "coalesced, one reader",
+                ScanOptions::coalesced().with_decode_threads(1),
+            ),
+            ("coalesced, automatic", ScanOptions::coalesced()),
+            (
+                "coalesced, no prefetch, one reader",
                 ScanOptions {
                     coalesce: Some(SpanReadOptions {
                         prefetch: false,
                         ..SpanReadOptions::default()
                     }),
+                    decode_threads: Some(1),
                 },
             ),
         ];
         let bs = 1 << 14;
         for (label, o) in &arms[1..] {
-            let a = t.scan(None, bs, &ScanOptions::default()).unwrap();
+            let a = t.scan(None, bs, &serial).unwrap();
             let b = t.scan(None, bs, o).unwrap();
             for (x, y) in a.zip(b) {
                 assert_eq!(x.unwrap(), y.unwrap(), "{label} decoded a different batch");
@@ -791,10 +811,11 @@ mod tests {
                 secs[k].push(t0.elapsed().as_secs_f64());
             }
         }
-        for ((label, _), s) in arms.iter().zip(secs.iter_mut()) {
+        for ((label, o), s) in arms.iter().zip(secs.iter_mut()) {
             s.sort_by(f64::total_cmp);
+            let groups = t.scan(None, bs, o).unwrap().decode_groups();
             println!(
-                "{label}: {} rows, median {:.2} s (min {:.2}, max {:.2})",
+                "{label} ({groups} readers): {} rows, median {:.2} s (min {:.2}, max {:.2})",
                 t.nrows, s[2], s[0], s[4]
             );
         }

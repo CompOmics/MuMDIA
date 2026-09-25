@@ -361,6 +361,43 @@ where the memory it holds (two or three row groups of the projection, about
 reader that skips pages through the page index, because a span holds whole
 column chunks.
 
+#### Parallel decode
+
+The arrow reader decodes every projected column of a batch on one thread. With
+`ScanOptions::decode_threads` a scan instead builds one reader per contiguous
+group of projected root columns (`ReadSpec::column_groups`, balanced by the
+compressed bytes of the selected row groups), advances the groups together on
+the codec pool (`codec.rs`) and joins each batch column-wise. Every group
+reader has the same row groups, row selection and batch size, so each yields
+the same rows per batch; the joined batches are the single reader's batches
+exactly, schema included (`parallel_decode_yields_the_single_readers_batches`
+covers projections, row spans trimmed at both ends, straddling batch sizes, more
+groups than columns and coalesced reads). A group that ends early or returns a
+different row count is an error, not a short batch.
+
+Because the batches are identical, this is on by default: `decode_threads: None`
+uses `codec_threads()` groups (at most 8, fewer when the projection has fewer
+root columns or less than 4 MB of compressed data per group,
+`MIN_DECODE_GROUP_BYTES`), and the single reader from inside a rayon pool, for
+the reason the encoder avoids the pool there. `Some(1)` is the single reader;
+`Some(k)` asks for k groups whatever the size, and
+`MUMDIA_PARQUET_DECODE_THREADS=k` does the same for every automatic scan of a
+process, which is how a whole run, small artifacts included, is checked end to
+end (the smoke with `MUMDIA_PARQUET_DECODE_THREADS=3` writes every artifact
+byte for byte as without it). Under `coalesce` each group holds its own spans,
+and the resident budget is divided between them.
+`BatchReader::decode_groups` reports what a scan uses. A getter that reads one
+column is unchanged.
+
+Measured on the AIF artifacts (`bench_scan_a_real_artifact`, full scans in
+16,384-row batches, median of 5 interleaved rounds on a loaded 32-thread host):
+features 1.18 s with one reader, 0.80 s with 2 groups, 0.65 s with 4, 0.60 s
+with 8, 0.51 s automatic; psms_competed 1.22 / 0.86 / 0.55 / 0.47, 0.45 s
+automatic; chromatograms 5.14 s against 2.99 s with 2 groups and 3.29 s
+automatic (7 groups: the two list columns carry the work); spectra_ms2 0.85
+against 0.44 s. Coalesced reads with automatic groups: 0.43, 0.47, 2.97 and
+0.46 s.
+
 ### Parquet written outside this crate
 
 Several tables the engine reads are produced by a Python helper rather than by

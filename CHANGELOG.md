@@ -166,6 +166,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   0.14 s on 8 threads against 0.45 s, the competed table 0.16 against 0.42 s, the
   chromatograms 4.4 against 8.1 s. Writers called from inside a rayon pool keep encoding on
   their own thread (docs/03 "Parallel column codec").
+- **Multi-column scans decode their columns in parallel.** `TableFile::scan` and
+  `TableFile::batches` split the projection into contiguous column groups, one reader each,
+  decode the groups of every batch on the codec pool and join them column-wise; the batches
+  are the single reader's exactly. Automatic by default (up to 8 groups, at least 4 MB of
+  data each, the single reader from inside a rayon pool); `ScanOptions::decode_threads`
+  sets it. A full scan of the AIF features table went from 1.18 to 0.51 s, the competed
+  table from 1.22 to 0.45 s, the chromatograms from 5.1 to 3.3 s (docs/03 "Parallel
+  decode").
 
 - **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
   `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort
