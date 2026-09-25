@@ -901,6 +901,12 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
 /// calibrants changes the fit. Every candidate has its own scan, carrying its four
 /// fragments at small, deterministic ppm deviations; consecutive fragment m/z are 60 ppm
 /// apart, so no scan matches a second candidate.
+///
+/// `overlap`: window A is 400-501 instead of 400-500, so band B's lowest-m/z targets
+/// (500.5 to 501) lie in both windows. Band A then loads them too and serves window B for
+/// them, as a grouped plan does across a cut between overlapping windows, and both bands
+/// hold the same best PSM for each: the case where the pool must take each accepted
+/// candidate's deviations from one band only.
 struct TwoBandFixture {
     prec: String,
     frag: String,
@@ -908,9 +914,12 @@ struct TwoBandFixture {
     /// `(first_row, rows)` of each band in the precursor table.
     spans: [(usize, usize); 2],
     band_b_targets: usize,
+    /// Rows both bands load (0 without `overlap`).
+    shared_rows: usize,
 }
 
-fn craft_two_band_fixture() -> TwoBandFixture {
+fn craft_two_band_fixture(overlap: bool) -> TwoBandFixture {
+    let window_a_upper = if overlap { 501.0 } else { 500.0 };
     let (n_at, n_ad, n_bt, n_bd) = (5_000usize, 5usize, 2_500usize, 60usize);
     let n_a = n_at + n_ad;
     let n = n_a + n_bt + n_bd;
@@ -966,6 +975,11 @@ fn craft_two_band_fixture() -> TwoBandFixture {
             }
         }
     };
+    // Band B rows window A also selects: the first rows of band B, in m/z order.
+    let shared_rows = prec_mz[n_a..]
+        .iter()
+        .take_while(|&&mz| mz <= window_a_upper)
+        .count();
     let prec = tmp("two_band_prec.parquet");
     write_table(
         &prec,
@@ -1064,7 +1078,7 @@ fn craft_two_band_fixture() -> TwoBandFixture {
     let (lo, hi): (Vec<f64>, Vec<f64>) = (0..n)
         .map(|i| {
             if in_a(i) {
-                (400.0, 500.0)
+                (400.0, window_a_upper)
             } else {
                 (500.0, 600.0)
             }
@@ -1100,8 +1114,9 @@ fn craft_two_band_fixture() -> TwoBandFixture {
         prec,
         frag,
         ms2,
-        spans: [(0, n_a), (n_a, n - n_a)],
+        spans: [(0, n_a + shared_rows), (n_a, n - n_a)],
         band_b_targets: n_bt,
+        shared_rows,
     }
 }
 
@@ -1111,12 +1126,23 @@ fn craft_two_band_fixture() -> TwoBandFixture {
 /// rejects its lowest targets and the pooled q accepts all 2,500, so a 2,000-target offer
 /// lost the deviations of the rest and the pooled fit came out narrower than the unbanded
 /// one, as it did on the HYE Astral benchmark at 2 and 4 bands.
+///
+/// Run twice: with adjacent windows, and with windows that overlap across the cut, where
+/// both bands hold the same PSM of each shared candidate and the pool must count its
+/// deviations once, as the unbanded seed does.
 #[test]
 fn a_two_band_pooled_mass_calibration_equals_the_unbanded_fit() {
-    let f = craft_two_band_fixture();
+    for overlap in [false, true] {
+        pooled_mass_calibration_equals_the_unbanded_fit(overlap);
+    }
+}
+
+fn pooled_mass_calibration_equals_the_unbanded_fit(overlap: bool) {
+    let f = craft_two_band_fixture(overlap);
+    let arm = if overlap { "overlap" } else { "adjacent" };
     let cfg = Config::default();
     let seed = |prec: &str, offset: Option<u32>, emit: bool, tag: &str| -> String {
-        let out = tmp(&format!("two_band_seed_{tag}.parquet"));
+        let out = tmp(&format!("two_band_seed_{arm}_{tag}.parquet"));
         stages::search_seed::run(stages::search_seed::SearchSeedParams {
             precursor_span: None,
             fragment_offset: offset,
@@ -1147,7 +1173,7 @@ fn a_two_band_pooled_mass_calibration_equals_the_unbanded_fit() {
 
     let mut bands = Vec::new();
     for (k, &(first, rows)) in f.spans.iter().enumerate() {
-        let slice = tmp(&format!("two_band_slice_{k}.parquet"));
+        let slice = tmp(&format!("two_band_slice_{arm}_{k}.parquet"));
         mumdia::groups::write_band_slice(&f.prec, first, rows, &slice).unwrap();
         let out = seed(&slice, Some(first as u32), true, &format!("band{k}"));
         bands.push((out, first as u32, rows as u32));
@@ -1170,7 +1196,7 @@ fn a_two_band_pooled_mass_calibration_equals_the_unbanded_fit() {
         f.band_b_targets
     );
 
-    let pooled = tmp("two_band_pooled.parquet");
+    let pooled = tmp(&format!("two_band_pooled_{arm}.parquet"));
     let seeds: Vec<stages::seed_pool::BandSeed> = bands
         .iter()
         .map(|(path, offset, rows)| stages::seed_pool::BandSeed {
@@ -1194,14 +1220,36 @@ fn a_two_band_pooled_mass_calibration_equals_the_unbanded_fit() {
     })
     .unwrap();
     let got = json(&pooled);
-    assert_eq!(got["masscal_source"], "pooled_deviations");
+    assert_eq!(got["masscal_source"], "pooled_deviations", "{arm}");
+    if overlap {
+        // The arm does what it is for: both bands hold the shared candidates, and each
+        // band's sidecar carries their deviations.
+        assert!(f.shared_rows >= 10, "{} shared rows", f.shared_rows);
+        let shared = f.spans[1].0 as u32..(f.spans[1].0 + f.shared_rows) as u32;
+        for (path, _, _) in &bands {
+            let c =
+                mumdia::masscal::read_calibrants(&mumdia::masscal::calibrants_path(path)).unwrap();
+            let n = c
+                .candidate_id
+                .iter()
+                .filter(|cid| shared.contains(cid))
+                .count();
+            assert_eq!(
+                n,
+                4 * f.shared_rows,
+                "{path}: every shared candidate's four deviations"
+            );
+        }
+    } else {
+        assert_eq!(f.shared_rows, 0);
+    }
     // The pooled q accepts every target of both bands, which is what the unbanded seed
     // accepts too, so the two fits see the same deviations.
     assert_eq!(confident(&pooled), 5_000 + f.band_b_targets);
     assert_eq!(confident(&unbanded_seed), 5_000 + f.band_b_targets);
     assert_eq!(
         got["n_dev"], unbanded["n_dev"],
-        "the pooled fit saw a different calibrant set than the unbanded one"
+        "{arm}: the pooled fit saw a different calibrant set than the unbanded one"
     );
     // The sidecar stores deviations as f32, so the fitted numbers agree to f32 precision
     // rather than bit for bit (docs/33 section 4a: 8.452381550 against 8.452381790).
@@ -1209,7 +1257,7 @@ fn a_two_band_pooled_mass_calibration_equals_the_unbanded_fit() {
         let (a, b) = (got[key].as_f64().unwrap(), unbanded[key].as_f64().unwrap());
         assert!(
             (a - b).abs() <= 1e-5 * b.abs().max(1.0),
-            "{key}: pooled {a} against unbanded {b}"
+            "{arm} {key}: pooled {a} against unbanded {b}"
         );
     }
 }

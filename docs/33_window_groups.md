@@ -263,9 +263,13 @@ calibration already uses the pooled anchors under `groups.calibration = global`:
   the band's local id plus its fragment offset), `scan_index`, `frag_mz` and `ppm`, one row
   per matched fragment. 16 B per deviation, a few MB for a whole run.
 - `seed-pool` reads them, keeps the deviations whose PSM the POOLED q accepts at
-  `search_seed.fdr_seed` (and whose scan is the one the pool kept, so an overlap candidate
-  contributes one PSM's fragments as an ungrouped seed would), and fits
-  `masscal::MassCal::fit_from` -- the same function `search-seed` calls -- once.
+  `search_seed.fdr_seed`, and fits `masscal::MassCal::fit_from` -- the same function
+  `search-seed` calls -- once. A deviation is kept only from the band whose row the pool
+  kept for that candidate, and only for that row's scan. A precursor in the overlap of two
+  windows across a cut is loaded by both bands, and each band serves both windows for it,
+  so both bands usually hold the same PSM with the same deviations; the band index is what
+  makes it contribute one PSM's fragments, as in an ungrouped seed. Keyed on the scan
+  alone, as it was until 2026-09-25, those deviations were counted once per band.
   `two_pass_mass_cal` and the `mass_cal_loess` grid work on this path, because both read the
   deviations rather than a scalar.
 - The band's own `<seed>.masscal.json` is unchanged: still fitted on that band's confident
@@ -298,11 +302,14 @@ six-file HYE Astral benchmark, 2026-09-24:
 
 The missing deviations belonged to the lower-scoring accepted targets, which are the
 noisier ones, so the short fits came out narrower rather than wider. With every target
-offered the pooled fit is the unbanded fit at any band count; `ci/smoke.sh` checks this at
-two bands on the fixture, and `tests/pipeline.rs`
+offered, and each accepted candidate taken from one band, the pooled fit is the unbanded
+fit at any band count and with overlapping windows; `ci/smoke.sh` checks this at two bands
+on the fixture, and `tests/pipeline.rs`
 (`a_two_band_pooled_mass_calibration_equals_the_unbanded_fit`) on a two-band library built
 so that one band's own q rejects hundreds of targets the pooled q accepts, which the old
-prefix failed by 2,000 deviations of 30,000. The sidecar stays 16 B per deviation, now for every
+prefix failed by 2,000 deviations of 30,000. Its second arm makes the two windows overlap
+across the cut (400-501 and 500-600, 13 shared targets): keyed on the scan alone the pool
+counted their deviations twice, 30,052 against the unbanded 30,000. The sidecar stays 16 B per deviation, now for every
 target of the band.
 
 `masscal.json` gains `masscal_source`, which reads `pooled_deviations` or `band_scalars`. A

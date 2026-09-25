@@ -55,7 +55,8 @@ pub const MIN_LOESS_CALIBRANTS: usize = 50;
 // against the unbanded 181,196, and fitted 7.76 and 8.24 ppm against 8.45, because a
 // band of a 2-band plan has tens of thousands of pooled-accepted targets. Every target
 // PSM of the band is therefore offered, and `seed-pool` keeps the ones the pooled q
-// accepts, so the pooled fit is the unbanded fit at any band count
+// accepts, each from the one band whose row it kept, so the pooled fit is the unbanded fit
+// at any band count and across overlapping windows
 // (`tests/pipeline.rs`, `a_two_band_pooled_mass_calibration_equals_the_unbanded_fit`).
 // The sidecar stays 16 B per deviation, now one row per matched fragment of every target
 // PSM of the band rather than of its best 2,000; `seed-pool` reads the sidecars one band
@@ -218,8 +219,10 @@ pub struct Calibrants {
     /// pooled seed can look the PSM up on its pooled q.
     pub candidate_id: Vec<u32>,
     /// The scan the PSM was matched on. Where two bands share a candidate (window overlap
-    /// across a band cut) only the PSM the pool KEPT contributes its fragments, so a
-    /// pooled fit sees one PSM per candidate exactly as an ungrouped fit does.
+    /// across a band cut) only the PSM the pool KEPT contributes its fragments, taken from
+    /// the band that row came from: both bands usually hold the same PSM, and the scan
+    /// alone would count it twice. A pooled fit then sees one PSM per candidate exactly as
+    /// an ungrouped fit does.
     pub scan_index: Vec<u32>,
     /// Fragment m/z, for the optional m/z-dependent grid. `f32` is the library's own
     /// storage width, so this round-trips exactly.

@@ -171,35 +171,42 @@ pub fn run(p: SeedPoolParams) -> Result<u64> {
         );
     }
     // One row per library-wide candidate: where two bands share a candidate (window
-    // overlap across a cut) the higher score stays, so the pooled q sees each once.
-    let mut best: HashMap<u32, Row> = HashMap::new();
+    // overlap across a cut) the higher score stays, and on a tie the earlier band, so the
+    // pooled q sees each once. The band the kept row came from is remembered for the mass
+    // calibration below.
+    let mut best: HashMap<u32, (usize, Row)> = HashMap::new();
     let mut n_in = 0usize;
-    for band in p.seeds {
+    for (bi, band) in p.seeds.iter().enumerate() {
         for r in read_rows(&band.path, band.offset)? {
             n_in += 1;
             match best.get(&r.cid) {
-                Some(b) if b.score >= r.score => {}
+                Some((_, b)) if b.score >= r.score => {}
                 _ => {
-                    best.insert(r.cid, r);
+                    best.insert(r.cid, (bi, r));
                 }
             }
         }
     }
-    let mut rows: Vec<Row> = best.into_values().collect();
-    rows.sort_by_key(|r| r.cid);
+    let mut kept: Vec<(usize, Row)> = best.into_values().collect();
+    kept.sort_by_key(|(_, r)| r.cid);
+    let (winner_band, rows): (Vec<usize>, Vec<Row>) = kept.into_iter().unzip();
     crate::fdr::validate_labels(&rows.iter().map(|r| r.label.clone()).collect::<Vec<_>>())?;
     let pairs: Vec<(f64, bool)> = rows.iter().map(|r| (r.score, r.label == "decoy")).collect();
     let q = target_decoy_q(&pairs);
     // The pooled calibrant selector: for every target candidate the POOLED q accepts at
-    // the seed threshold, the scan its winning PSM was matched on. A band's own q accepts
-    // a different, looser set -- that is half of why the banded tolerance came out wide --
-    // and the scan pins the union to one PSM per candidate where two bands overlap, which
-    // is the one-best-PSM-per-candidate population an ungrouped seed fits on.
-    let accepted: HashMap<u32, u32> = rows
+    // the seed threshold, the scan its winning PSM was matched on and the band that PSM
+    // came from. A band's own q accepts a different, looser set -- that is half of why the
+    // banded tolerance came out wide. The scan and the band pin the union to one PSM per
+    // candidate, which is the population an ungrouped seed fits on: a precursor in the
+    // overlap of two windows is loaded by both bands and each band serves both windows for
+    // it, so both usually hold the SAME (candidate, scan) PSM with the same deviations, and
+    // the scan alone would count them once per band.
+    let accepted: HashMap<u32, (u32, usize)> = rows
         .iter()
+        .zip(&winner_band)
         .zip(&q)
-        .filter(|(r, qq)| **qq <= p.cfg.fdr_seed && r.label != "decoy")
-        .map(|(r, _)| (r.cid, r.scan))
+        .filter(|((r, _), qq)| **qq <= p.cfg.fdr_seed && r.label != "decoy")
+        .map(|((r, &bi), _)| (r.cid, (r.scan, bi)))
         .collect();
     let n_out = rows.len();
     let n = write_rows(p.out, &rows, q)?;
@@ -231,11 +238,16 @@ pub fn run(p: SeedPoolParams) -> Result<u64> {
 }
 
 /// Fit the mass calibration once over the bands' calibrant deviations, keeping the ones
-/// whose PSM the POOLED q accepts (`accepted`: candidate -> winning scan).
+/// whose PSM the POOLED q accepts (`accepted`: candidate -> (winning scan, the band the
+/// winning row came from)). Only that band's rows of the candidate are taken, so a
+/// candidate two overlapping bands both matched contributes its deviations once.
 ///
 /// `Ok(None)` when a band has no sidecar, which is a band directory seeded before the
 /// sidecar existed: the caller then combines the bands' scalars as it always did.
-fn pooled_masscal(p: &SeedPoolParams, accepted: &HashMap<u32, u32>) -> Result<Option<MassCal>> {
+fn pooled_masscal(
+    p: &SeedPoolParams,
+    accepted: &HashMap<u32, (u32, usize)>,
+) -> Result<Option<MassCal>> {
     let missing = p
         .calibrants
         .iter()
@@ -259,11 +271,11 @@ fn pooled_masscal(p: &SeedPoolParams, accepted: &HashMap<u32, u32>) -> Result<Op
     let mut devs: Vec<f64> = Vec::new();
     let mut dev_mz: Vec<f64> = Vec::new();
     let mut n_band = 0usize;
-    for path in p.calibrants {
+    for (bi, path) in p.calibrants.iter().enumerate() {
         let c = crate::masscal::read_calibrants(path)?;
         n_band += c.len();
         for i in 0..c.len() {
-            if accepted.get(&c.candidate_id[i]) == Some(&c.scan_index[i]) {
+            if accepted.get(&c.candidate_id[i]) == Some(&(c.scan_index[i], bi)) {
                 devs.push(c.ppm[i] as f64);
                 dev_mz.push(c.frag_mz[i] as f64);
             }
