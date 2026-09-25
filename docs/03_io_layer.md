@@ -40,6 +40,7 @@ the schema-id tuples).
 | `rust/mumdia/crates/mumdia-io/src/lib.rs` | crate root: `init_logging`, `record_artifact`, `inspect`; re-exports the modules |
 | `rust/mumdia/crates/mumdia-io/src/table.rs` | `Col` enum (write side), `write_table`, `Table` (read side) and the typed getters |
 | `rust/mumdia/crates/mumdia-io/src/span_cache.rs` | `SpanCache`, the coalescing `ChunkReader` behind `TableFile::scan` with `ScanOptions::coalesced()` |
+| `rust/mumdia/crates/mumdia-io/src/codec.rs` | `ColumnEncoder` (parallel column encode), the codec pool (`CodecPool`, `claim`, `codec_threads`, `set_codec_threads`) shared by encode and parallel decode |
 | `rust/mumdia/crates/mumdia-io/src/report.rs` | `ArtifactReport` struct + `write_for` (the `.report.json` sidecar) |
 | `rust/mumdia/crates/mumdia-io/src/hash.rs` | `blake3_file`, `blake3_str`, `HashingWrite` (hash on write) |
 | `rust/mumdia/crates/mumdia-io/src/json.rs` | `write_json`, `read_json` (pretty JSON via serde) |
