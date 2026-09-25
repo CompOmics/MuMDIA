@@ -177,6 +177,47 @@ pub struct RescoreParams<'a> {
     pub config_hash: &'a str,
 }
 
+/// Wall time of each phase of [`run`], logged once at the end as `rescore: phase timings`
+/// (docs/11 "rescore: cost"). Log only: nothing reads them back, and the scored table and
+/// its report do not depend on them.
+///
+/// - `pass1_ms`: the metadata columns of every input, the label scan and the scalar check;
+/// - `features_ms`: the feature columns, streamed into the sidecar handoff under
+///   `rescore.strict` with a sidecar classifier, or into the engine's matrix otherwise;
+///   `handoff_encode_ms` is the part of a streamed pass spent transposing and encoding the
+///   handoff, so `features_ms - handoff_encode_ms` is the read, decode and narrowing;
+/// - `classifier_ms`: the classifier, including a sidecar's handoff write when the matrix
+///   was built first, the worker itself, and reading its scores back;
+/// - `collapse_ms`, `q_ms`, `write_ms`: the post-classifier tail, i.e. the top-K collapse,
+///   every q column and the counts at 1%, and the scored table.
+#[derive(Default)]
+struct PhaseTimings {
+    pass1_ms: u128,
+    features_ms: u128,
+    handoff_encode_ms: u128,
+    classifier_ms: u128,
+    collapse_ms: u128,
+    q_ms: u128,
+    write_ms: u128,
+}
+
+impl PhaseTimings {
+    fn log(&self, elapsed_ms: u128, classifier: &str) {
+        info!(
+            pass1_ms = self.pass1_ms as u64,
+            features_ms = self.features_ms as u64,
+            handoff_encode_ms = self.handoff_encode_ms as u64,
+            classifier_ms = self.classifier_ms as u64,
+            collapse_ms = self.collapse_ms as u64,
+            q_ms = self.q_ms as u64,
+            write_ms = self.write_ms as u64,
+            elapsed_ms = elapsed_ms as u64,
+            classifier,
+            "rescore: phase timings"
+        );
+    }
+}
+
 /// A byte count in the largest unit that keeps it readable.
 ///
 /// The matrix spans six orders of magnitude between the smoke fixture and a 40-run
@@ -406,6 +447,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     // target/decoy population are validated before anything reads a feature value, as they
     // were when both were read together. The cost is one extra parquet footer read per
     // input.
+    let t_pass1 = Instant::now();
     for (src, path) in p.competed.iter().enumerate() {
         let actual_schema = FeatureSchema::read(path)?;
         validate_feature_schema(&expected_schema, &actual_schema, path)?;
@@ -521,6 +563,11 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
             .into_par_iter()
             .find_first(|&row| !prelim[row].is_finite() || !mz[row].is_finite());
     }
+    let mut timings = PhaseTimings {
+        pass1_ms: t_pass1.elapsed().as_millis(),
+        ..PhaseTimings::default()
+    };
+    let t_features = Instant::now();
 
     // Pass 2: the feature values, either into the engine's own matrix or straight through
     // to the sidecar's handoff file.
@@ -575,10 +622,13 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
             });
             // `finish` consumes the writer, and the `Err` arm drops it, so the file is
             // closed either way before the cleanup below.
-            scan.and_then(|()| w.finish())
+            scan.and_then(|()| w.finish_timed())
         };
         let rows = match streamed {
-            Ok(rows) => rows,
+            Ok((rows, encode)) => {
+                timings.handoff_encode_ms = encode.as_millis();
+                rows
+            }
             Err(e) => {
                 // A parquet handoff is written through `AtomicPath` and never appears at
                 // its final name, but the PIN encoding writes the final path directly, so
@@ -612,6 +662,8 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         bail_non_finite(bad_feature, bad_scalar, &feat_names)?;
         feats_slot = Some(feats);
     }
+    timings.features_ms = t_features.elapsed().as_millis();
+    let t_classifier = Instant::now();
     crate::memlog::report(
         "rescore feature matrix",
         &[
@@ -790,6 +842,8 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     {
         anyhow::bail!("rescore produced non-finite score at flat row {row}: {score}");
     }
+    timings.classifier_ms = t_classifier.elapsed().as_millis();
+    let t_collapse = Instant::now();
 
     // Top-K per-candidate collapse (#7): keep only the best-scoring peak per
     // (source, candidate_id), so the rescorer (not the up-front apex pick) selects
@@ -847,6 +901,8 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
             info!(kept = n, "rescore: top-K per-candidate best-peak collapse");
         }
     }
+    timings.collapse_ms = t_collapse.elapsed().as_millis();
+    let t_q = Instant::now();
 
     // PSM-level q-values against the selected null.
     let psm_q = match qmode {
@@ -1008,6 +1064,8 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         }
         seen.len()
     };
+    timings.q_ms = t_q.elapsed().as_millis();
+    let t_write = Instant::now();
 
     let (rows, scored_hash) = write_scored(
         p.out,
@@ -1033,6 +1091,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
             peak_rank,
         },
     )?;
+    timings.write_ms = t_write.elapsed().as_millis();
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
@@ -1093,6 +1152,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     };
     report.write_for(p.out)?;
 
+    timings.log(elapsed, classifier_used);
     info!(
         psms = n,
         target_psms_at_1pct = n_psm_1,
@@ -1815,6 +1875,8 @@ struct HandoffWriter<'a> {
     /// Rows accepted so far, so `finish` reports what was written rather than what the
     /// caller's metadata columns happen to be long.
     rows: u64,
+    /// Time spent in `flush_block` (transpose, batch build, encode), for the phase log.
+    encode: std::time::Duration,
     feat_names: &'a [String],
     /// `label`, reduced to the bit the PIN's `Label` column and the parquet's need.
     is_decoy: &'a [bool],
@@ -1905,6 +1967,7 @@ impl<'a> HandoffWriter<'a> {
             sink,
             block_rows: block_rows.max(1),
             rows: 0,
+            encode: std::time::Duration::ZERO,
             feat_names,
             is_decoy,
             pform,
@@ -1972,6 +2035,7 @@ impl<'a> HandoffWriter<'a> {
         if pq.stage.is_empty() {
             return Ok(());
         }
+        let t = std::time::Instant::now();
         let start = pq.block_start;
         let k = pq.stage.len() / nf.max(1);
         let end = start + k;
@@ -2007,20 +2071,29 @@ impl<'a> HandoffWriter<'a> {
             .write(&RecordBatch::try_new(pq.schema.clone(), arrays)?)?;
         pq.stage.clear();
         pq.block_start = end;
+        self.encode += t.elapsed();
         Ok(())
     }
 
     /// Finish the file and return the rows written.
-    fn finish(mut self) -> Result<u64> {
+    fn finish(self) -> Result<u64> {
+        Ok(self.finish_timed()?.0)
+    }
+
+    /// [`HandoffWriter::finish`], also returning the time spent transposing and encoding
+    /// the parquet blocks, footer included.
+    fn finish_timed(mut self) -> Result<(u64, std::time::Duration)> {
         use std::io::Write as _;
         self.flush_block()?;
-        match self.sink {
-            HandoffSink::Parquet(pq) => pq.writer.close(),
+        let t = std::time::Instant::now();
+        let rows = match self.sink {
+            HandoffSink::Parquet(pq) => pq.writer.close()?,
             HandoffSink::Pin(mut w) => {
                 w.flush()?;
-                Ok(self.rows)
+                self.rows
             }
-        }
+        };
+        Ok((rows, self.encode + t.elapsed()))
     }
 }
 
@@ -2203,6 +2276,7 @@ fn run_pin_sidecar(
     let python = p.cfg.python.as_deref().ok_or_else(|| {
         anyhow::anyhow!("classifier sidecar {script_name} requires rescore.python")
     })?;
+    let t_handoff = Instant::now();
     let paths = match prewritten {
         Some(paths) => paths,
         None => {
@@ -2251,6 +2325,7 @@ fn run_pin_sidecar(
     // A worker that does not read it simply keeps its previous behaviour.
     let foldkeys = &paths.foldkeys;
     write_table(foldkeys, vec![Col::U32("fold_key".into(), base.to_vec())])?;
+    let handoff_ms = t_handoff.elapsed().as_millis();
 
     // Everything the worker reads is on disk now. Under `strict` a sidecar failure is an
     // error rather than a fall back to native_tda, so nothing downstream reads the engine's
@@ -2319,11 +2394,14 @@ fn run_pin_sidecar(
             // between machines.
             anyhow::anyhow!("spawning sidecar failed: {python} {script}: {e}")
         })?;
+    let t_worker = Instant::now();
     let mut guard = ChildGuard(Some(child));
     let status = guard.wait()?;
     if !status.success() {
         anyhow::bail!("{script_name} exited with {status}");
     }
+    let worker_ms = t_worker.elapsed().as_millis();
+    let t_read = Instant::now();
 
     // The worker echoes the PIN's SpecId tail as `candidate_id`, which here is the
     // flat row index. Exact, unique, finite coverage is part of the classifier
@@ -2332,7 +2410,15 @@ fn run_pin_sidecar(
     let t = TableFile::open(outp)?;
     let orow = t.u32("candidate_id")?;
     let osc = t.f64("score")?;
-    align_sidecar_scores(&orow, &osc, cid.len(), script_name)
+    let aligned = align_sidecar_scores(&orow, &osc, cid.len(), script_name)?;
+    info!(
+        script = script_name,
+        handoff_and_fold_keys_ms = handoff_ms as u64,
+        worker_ms = worker_ms as u64,
+        read_scores_ms = t_read.elapsed().as_millis() as u64,
+        "rescore: sidecar timings"
+    );
+    Ok(aligned)
 }
 
 /// Validate and align a sidecar's `(flat_row_id, score)` response. Every input
