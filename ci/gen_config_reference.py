@@ -1169,28 +1169,111 @@ def blank_cfg_test(text: str) -> str:
     `#[cfg(test)]` instead, which is fine for one file that keeps its tests at the end;
     this has to cope with any source file, including an inline test module followed by
     more real code.
+
+    The attribute does not only sit on items with a body. A test-only struct field, a
+    field initializer in a struct literal, an enum variant, a match arm or a statement
+    ends at a `,` or `;` and has no braces of its own, while the item after it usually
+    has them. Searching for the next `{` from such an attribute swallowed the rest of
+    the enclosing struct literal and the next function's header, which lost a closing
+    brace and made `rust_scopes` reject the file. `cfg_test_item_end` finds the real
+    end instead. Only the attribute and its item are blanked, and a line that blanking
+    leaves holding nothing but whitespace is emptied, as the whole-line blanking did.
     """
-    lines = text.split(chr(10))
-    i = 0
-    while i < len(lines):
-        if lines[i].lstrip().startswith("#[cfg(test)]"):
-            # Find the opening brace of the item the attribute applies to, then
-            # brace-match to its end. Runs after `decomment`, and a test module's own
-            # braces balance, so counting is enough.
-            j, depth, started = i, 0, False
-            while j < len(lines):
-                depth += lines[j].count("{") - lines[j].count("}")
-                if "{" in lines[j]:
-                    started = True
-                if started and depth <= 0:
-                    break
-                j += 1
-            for k in range(i, min(j + 1, len(lines))):
-                lines[k] = ""
-            i = j + 1
-        else:
-            i += 1
-    return chr(10).join(lines)
+    code = mask_rust_literals(text)
+    out = list(text)
+    pos = 0
+    while True:
+        m = CFG_TEST_ATTR.search(text, pos)
+        if m is None:
+            break
+        end = cfg_test_item_end(code, m.end())
+        for k in range(m.start(), end):
+            if out[k] != "\n":
+                out[k] = " "
+        pos = max(end, m.end())
+    old_lines = text.split(chr(10))
+    new_lines = "".join(out).split(chr(10))
+    return chr(10).join(
+        "" if new != old and not new.strip() else new
+        for old, new in zip(old_lines, new_lines)
+    )
+
+
+# A `#[cfg(test)]` attribute at the start of a line, where the whole-line blanking
+# looked for it.
+CFG_TEST_ATTR = re.compile(r"(?m)^[ \t]*#\[cfg\(test\)\]")
+
+
+def cfg_test_item_end(code: str, start: int) -> int:
+    """Offset just past the item that an attribute ending at `start` applies to.
+
+    `code` is masked (`mask_rust_literals`), so a brace, comma or semicolon that is
+    left is code. Scanning forward, at parenthesis and bracket depth 0:
+
+    - a `{` opens the item's body (a `fn`, `impl`, `mod`, a braced struct or enum
+      variant, a match arm with a block); the item ends at its matching `}`;
+    - a `;` ends a statement or a braceless item (`use`, `const`, a unit struct);
+    - a `,` ends a field, a field initializer, an enum variant or a match arm,
+      unless it separates generic parameters (inside `<...>`) or bounds after
+      `where`, which belong to an item header whose body follows;
+    - a `}`, `)` or `]` that closes an enclosing group ends the item just before it:
+      the attribute sat on the last element of that group, written without a
+      trailing comma.
+
+    Braces inside parentheses or brackets (a closure argument, a `match` passed to a
+    call) are matched and skipped, so a statement such as
+    `let l = l.with(match x { .. });` ends at its `;`.
+    """
+    n = len(code)
+    paren = angle = 0
+    after_where = False
+
+    def match_brace(open_at: int) -> int:
+        depth = 0
+        for k in range(open_at, n):
+            if code[k] == "{":
+                depth += 1
+            elif code[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    return k + 1
+        return n
+
+    j = start
+    while j < n:
+        c = code[j]
+        if c in "([":
+            paren += 1
+        elif c in ")]":
+            if paren == 0:
+                return j
+            paren -= 1
+        elif c == "{":
+            end = match_brace(j)
+            if paren == 0:
+                return end
+            j = end
+            continue
+        elif c == "}":
+            return j
+        elif paren == 0 and c == ";":
+            return j + 1
+        elif paren == 0 and c == "," and angle == 0 and not after_where:
+            return j + 1
+        elif c == "<" and j > 0 and (code[j - 1].isalnum() or code[j - 1] in "_:"):
+            angle += 1
+        elif c == ">" and angle > 0 and code[j - 1] not in "-=":
+            angle -= 1
+        elif (
+            c == "w"
+            and paren == 0
+            and code.startswith("where", j)
+            and not (code[j - 1].isalnum() or code[j - 1] == "_")
+            and not (j + 5 < n and (code[j + 5].isalnum() or code[j + 5] == "_"))
+        ):
+            after_where = True
+        j += 1
+    return n
 
 
 def scan_rust_env(

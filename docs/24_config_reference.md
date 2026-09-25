@@ -62,7 +62,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 17 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
 | [`extract`](#extract) | `ExtractConfig` | 36 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
-| [`features`](#features) | `FeaturesConfig` | 10 | [docs/10_features.md](10_features.md) |
+| [`features`](#features) | `FeaturesConfig` | 11 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`rescore`](#rescore) | `RescoreConfig` | 22 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`quant`](#quant) | `QuantConfig` | 17 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
@@ -292,6 +292,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `bound_from_confident` | `bool` | `true` |  | Elution-peak boundary source. When true (default) a single set of left/right half-widths (seconds) is learned once from the confident seed PSMs (`spectrum_q <= 0.01`, target-only, the same set that anchors RT calibration / DeepLC fine-tune) and applied to EVERY candidate around its own apex. This removes per-candidate boundary manipulation so a decoy is scored over a real- peptide-width window centred on its apex. When false, each candidate detects its own peak boundary from its top-3-predicted-fragment profile (per-candidate, but noisy/manipulable for chimeric decoys; the legacy behaviour). If the seed yields < 20 confident anchors the stage logs a warning and falls back to per-candidate detection for that run. |
 | `bound_confident_pct` | `f64` | `50.0` |  | Percentile (0-100) of the confident-set half-widths taken as the global left/ right elution half-width when `bound_from_confident` is true. 50 = median (typical real peak width); higher percentiles widen the shared window. |
 | `ms1_precursor_features` | `bool` | `false` | benchmark-gated | Emit the MS1 apex-isotope precursor feature `ms1_isotope_height_corr` (Pearson of the observed apex isotope heights `[i0,i1,i2]` against the Poisson-averagine model). Default false (the feature is present in the battery but returns 0.0, so the vector length is unchanged in effect). It overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and benchmark-gated rather than default-on (AlphaDIA-plan item 12). |
+| `chrom_loaders` | `usize` | `3` |  | Chromatogram decode threads in the main feature pass. The pass decodes the chromatogram table one chunk at a time while the features of the chunk before are computed; with one loader the whole decode ran on a single core, which bound the stage whenever decoding a chunk took longer than computing one (measured on an 8-12-mer immunopeptidomics run before the decode overlapped the computation: 3.7 of a 4-minute stage were the load). Each loader reads its own chunk from that chunk's row span, and the computation takes the chunks in table order, so the chunks, every feature value and the features table bytes are the same at every setting; only the time and the memory move. The pass holds up to `chrom_loaders + 1` decoded chunks (0.92 GiB of traces each at the HYE benchmark shape, docs/27 section 3.4), where one loader held two. The value is an upper bound: a pass never runs more loaders than `--threads` (the engine's thread pool) or than it has chunks, so `--threads 1` decodes on one loader as before. Loaders beyond each pass's first come from a process-wide pool of four, so concurrent bands or runs (`groups.parallel`, `experiment.parallel_runs`) share that pool instead of multiplying it. Default 3; `1` restores the single loader and `0` is read as `1`. A memory knob and a speed knob, not a sensitivity knob. |
 
 ## compete
 
@@ -862,6 +863,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-19 structs and 193 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 25 enumerations, 1 named profile(s), 68 environment variables read and 19 set.
+19 structs and 194 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 25 enumerations, 1 named profile(s), 68 environment variables read and 19 set.
 
 20 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
