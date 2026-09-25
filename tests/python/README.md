@@ -39,7 +39,7 @@ environment therefore reports "sklearn is not usable here: PydanticUserError:
 
 | needs | skips | unlocks |
 |---|---|---|
-| nothing | never | `test_mbr_worker.py`, `test_import_diann_lib.py`, `test_decoy_builders.py`, the static half of `test_predictor_workers.py` |
+| nothing | never | `test_mbr_worker.py`, `test_import_diann_lib.py`, `test_decoy_builders.py`, `test_gen_config_reference.py`, the static half of `test_predictor_workers.py` |
 | scikit-learn | `test_entrapment_worker.py` | the entrapment rescorer |
 | mokapot | `test_mokapot_worker.py` | mokapot coverage + model selection |
 | torch | `test_nn_rescore_worker.py` | `nn_torch` coverage, three input paths |
@@ -166,6 +166,23 @@ three workers carry the `__main__` guard the Windows `spawn` start method needs,
 and - with the packages installed - that a fresh interpreter really can import
 each worker and that MS2PIP emits `id`/`ion_type`/1-based `ordinal`/linear
 `intensity`.
+
+### `test_gen_config_reference.py` (no dependency, always runs)
+
+Not a worker test: it covers `ci/gen_config_reference.py`, which scans the sidecars and
+the crates for environment reads. The generator cites each read as `path::function`
+rather than `path:line`, because a cited line made `docs/24_config_reference.md` and
+`configs/config-schema.json` stale on every merge that moved lines in a large file. On
+synthetic Rust and Python sources it asserts the citation (`Type::method`,
+`Trait::method`, `module::function`, `outer::inner`, `Class.method`, `<module>`, a
+`fn` inside a string opening no scope, a `#[cfg(test)]` read left out) and that
+inserting blank lines changes no site. A Rust file whose braces do not balance after
+its literals and comments are masked is rejected with an error naming the file. On the
+committed inputs it asserts that the reference and the schema are unchanged with blank
+lines inserted into every file, and that neither carries a line number. A negative test
+makes the Rust and then the Python citation carry the position of the read and asserts
+that the check reports it, so the invariance check cannot pass because the shifting
+became a no-op.
 
 ## Conventions
 
