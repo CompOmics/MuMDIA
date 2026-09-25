@@ -526,18 +526,31 @@ the same grouped configuration with the default and with `false` and compare
 With `groups.pool_chromatograms = false` the chromatograms are not pooled either. Quant is
 the table's one reader (the candidate audit and match-between-runs do not open it), and it
 reads a run's chromatogram tables as a list: the bands' own tables in band order, each with
-the candidates it does not contribute (`quant::ChromTable`). Those are the overlap losers,
-which the pool finds for the competed tables anyway and here writes to
-`groups/overlap_losers.parquet` (`band`, `candidate_id`; no rows for disjoint bands), so
-unlike `pool_competed` this also holds for overlapping bands. Quant reads the tables in
-order, drops each one's losers, and concatenates the per-table stores with the same
-`ChromStore::append` that joins row groups, which rebuilds a file seam exactly as it
+the candidates it does not contribute (`quant::ChromTable`). Those are the overlap losers
+of the chromatogram tables, the same sets the pooled table is spliced without, and here the
+pool writes them to `groups/overlap_losers.parquet` (`band`, `candidate_id`; no rows for
+disjoint bands), so unlike `pool_competed` this also holds for overlapping bands. The losers
+are found in the chromatogram tables themselves, not only in the competed ones
+(`pool::table_losers`): a band's chromatogram table holds every candidate extract accepted,
+including ones compete then deleted there, so under `compete.group_by = base_peptide` or
+`apex` a candidate can be in two bands' chromatogram tables and one competed table. It is
+kept from the band whose competed row won it (from the first band that holds it when no
+band kept it) and dropped from the others, in the pooled table as in the band tables.
+Before this, the pooled table held both bands' rows of such a candidate and quant summed
+them; the default `peptidoform_charge` gives each candidate a group of its own and deletes
+none, so it was not affected. The loser file's footer names the band tables it belongs to,
+in order (directory and file name, row count, and the content hash of each table's
+report), and a standalone quant refuses a list of band tables that differs in count, order
+or identity. Quant reads the tables in order, drops each one's losers, and concatenates the per-table stores with the
+same `ChromStore::append` that joins row groups, which rebuilds a file seam exactly as it
 rebuilds a row-group seam: its store is the one the pooled table gives, and so are the quant
 tables, byte for byte (`quant_from_the_band_tables_writes_the_pooled_runs_bytes`, with two
-bands overlapping; `band_tables_read_in_order_rebuild_the_pooled_tables_store`, with a
-candidate straddling two band files and a band whose groups are all pruned). A candidate
-with rows in two of the tables, which is what the band tables of overlapping bands read
-without their losers give, is refused rather than quantified from both. That saves the
+bands overlapping, two of the overlap candidates deleted by compete in one band each;
+`band_tables_read_in_order_rebuild_the_pooled_tables_store`, with a band whose groups are
+all pruned). A candidate with rows in two of the tables, which is what the band tables of
+overlapping bands read without their losers give, is refused rather than quantified from
+both; so is a candidate whose rows continue from the end of one table into the next, which
+a real band table never gives, although the store rebuilds that seam. That saves the
 splice write, the hash and one read of the run's largest artifact, about 68 GB per run on
 the immunopeptidomics experiment. The artifact set changes: no pooled `chromatograms.parquet`
 (one an earlier run left is removed, as a loser table an earlier run left is under the
@@ -552,7 +565,8 @@ on its three-band fixture. Done on the AIF benchmark in four bands (augmented DI
 library, `native_tda`, 1,050,807 chromatogram rows, disjoint bands): the three quant tables,
 `psms_scored.parquet` and both TSVs were byte-identical, the pooled table the run no longer
 wrote was 237 MB, and `mumdia quant` over the four band tables with the loser file wrote
-the same quant tables again. Overlapping bands are covered by the tests above only.
+the same quant tables again. Overlapping bands are covered by the tests above only
+(`a_candidate_compete_deleted_in_one_band_is_pooled_from_one_band` for the loser sets).
 
 From here on the run is an ordinary run: rescore, audit, quant and report read the pooled
 tables (or the band tables above), and `psms_scored.parquet.report.json` names the

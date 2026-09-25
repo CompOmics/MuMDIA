@@ -259,7 +259,9 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    store and every output are the pooled table's. A candidate with rows in two tables is
    refused, since it can only mean the losers were not given. From the command line:
    `mumdia quant --chromatograms <band tables in band order> --overlap-losers
-   groups/overlap_losers.parquet`. The report's `chromatograms` is then the list of
+   groups/overlap_losers.parquet`. The loser file's footer names its band tables, and a
+   list that differs from them in count, order, name, row count or recorded content hash
+   is refused before anything is read. The report's `chromatograms` is then the list of
    tables, and `chromatogram_dropped_candidates` the number of losers each did not
    contribute; for one table with no losers both read as before.
 3. **Phase 1** (only when `cfg.bound_peak`): compute a per-candidate elution

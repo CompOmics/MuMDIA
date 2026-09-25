@@ -5197,15 +5197,113 @@ mod tests {
             store.nrows() + 6,
             "three rows each of candidates 4 and 9"
         );
+
+        // What the store rebuilds across a file seam is not what quant accepts. A real band
+        // table holds all of a candidate's rows (extract writes them together), so rows that
+        // continue from one table into the next are indistinguishable from an overlap
+        // duplicate given without its losers, and quant refuses candidate 6 here: a straddle
+        // is not a supported input, only a property of `ChromStore::append`.
+        let scored = scored_fixture("seam_scored.parquet", &[1, 4, 5, 6, 7, 9, 11, 12]);
+        let e = quant_tables(&scored, &tables, "seam")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("candidate_id 6") && e.contains("seam_band0") && e.contains("seam_band1"),
+            "{e}"
+        );
+        // A candidate in the first and the third table, with every row group of the middle
+        // one pruned (it holds no accepted id): the empty table in between does not hide
+        // that the candidate has rows in two tables.
+        let gap_rows: [Vec<ChromRow>; 3] = [
+            [
+                candidate_rows(1, 3, 5.0, 1.0),
+                candidate_rows(2, 3, 5.0, 1.0),
+            ]
+            .concat(),
+            (20..24u32)
+                .flat_map(|c| candidate_rows(c, 3, 5.0, 3.0))
+                .collect(),
+            [
+                candidate_rows(1, 3, 4.0, 7.0),
+                candidate_rows(3, 3, 5.0, 1.0),
+            ]
+            .concat(),
+        ];
+        let gap: Vec<ChromTable> = gap_rows
+            .iter()
+            .enumerate()
+            .map(|(b, rows)| {
+                let path = quant_test_path(&format!("gap_t{b}.parquet"));
+                write_chrom_rows(&path, rows, 4);
+                ChromTable::whole(&path)
+            })
+            .collect();
+        let scored = scored_fixture("gap_scored.parquet", &[1, 2, 3]);
+        let e = quant_tables(&scored, &gap, "gap").unwrap_err().to_string();
+        assert!(
+            e.contains("candidate_id 1") && e.contains("gap_t0") && e.contains("gap_t2"),
+            "{e}"
+        );
+        // With candidate 1 dropped from the third table, the same tables quantify.
+        let mut dropped = gap.clone();
+        dropped[2].drop = vec![1];
+        quant_tables(&scored, &dropped, "gap_dropped").unwrap();
+    }
+
+    /// A scored table that accepts `ids`: one target row each, peptide q 0.001, apex at 5.
+    fn scored_fixture(name: &str, ids: &[u32]) -> String {
+        let path = quant_test_path(name);
+        let n = ids.len();
+        write_table(
+            &path,
+            vec![
+                Col::U32("candidate_id".into(), ids.to_vec()),
+                Col::U32("base_peptide_id".into(), ids.to_vec()),
+                Col::Str(
+                    "peptidoform".into(),
+                    ids.iter().map(|c| format!("PEP{c}")).collect(),
+                ),
+                Col::I32("charge".into(), vec![2; n]),
+                Col::Str("label".into(), vec!["target".to_string(); n]),
+                Col::Str(
+                    "protein_group".into(),
+                    ids.iter().map(|c| format!("PG{c}")).collect(),
+                ),
+                Col::F64("peptide_q_value".into(), vec![0.001; n]),
+                Col::F64("apex_rt".into(), vec![5.0; n]),
+            ],
+        )
+        .unwrap();
+        path
+    }
+
+    /// Quantify `scored` from `tables` with the default configuration.
+    fn quant_tables(scored: &str, tables: &[ChromTable], tag: &str) -> Result<(u64, u64)> {
+        let out = |n: &str| quant_test_path(&format!("{tag}_{n}.parquet"));
+        let (pep, prot) = (out("peptide"), out("protein"));
+        run(QuantParams {
+            psms_scored: scored,
+            chromatograms: tables,
+            out_peptide: &pep,
+            out_protein: &prot,
+            out_fragment: None,
+            out_peak_bounds: None,
+            cfg: &QuantConfig::default(),
+            config_hash: "test",
+        })
     }
 
     #[test]
     fn quant_from_the_band_tables_writes_the_pooled_runs_bytes() {
         // A grouped run with `groups.pool_chromatograms = false`: quant reads the bands'
         // chromatogram tables with the pool's loser sets instead of the pooled table. Two
-        // bands overlap on candidates 5 and 6 (band 1 wins 5, band 0 wins 6), and their
-        // copies are scaled differently, so reading a loser's rows would move a quantity.
-        // A third band is disjoint from both.
+        // bands' chromatogram tables overlap on candidates 4 to 7, and their copies are
+        // scaled differently, so reading a loser's rows would move a quantity. Both bands
+        // kept 5 and 6 through compete (band 1 wins 5, band 0 wins 6); compete deleted 7 in
+        // band 0 and 4 in band 1, as a sibling that only that band holds can make it under
+        // `compete.group_by = base_peptide`, so each of those is in ONE competed table but
+        // in two chromatogram tables, and must still be quantified from one band only. A
+        // third band is disjoint from both.
         use crate::stages::pool;
         let chrom_band = |b: usize, rows: Vec<ChromRow>| {
             let path = quant_test_path(&format!("qb_band{b}_chrom.parquet"));
@@ -5232,6 +5330,8 @@ mod tests {
         let b0_ids: Vec<u32> = (0..7).collect();
         let b1_ids: Vec<u32> = (5..12).collect();
         let b2_ids: Vec<u32> = (12..16).collect();
+        let b0_chrom: Vec<u32> = (0..8).collect();
+        let b1_chrom: Vec<u32> = (4..12).collect();
         let score = |ids: &[u32], win: &[(u32, f64)]| -> Vec<f64> {
             ids.iter()
                 .map(|c| win.iter().find(|w| w.0 == *c).map_or(1.0, |w| w.1))
@@ -5240,12 +5340,12 @@ mod tests {
         let bands = [
             pool::BandArtifacts {
                 psms: String::new(),
-                chromatograms: chrom_band(0, rows_of(&b0_ids, 1.0)),
+                chromatograms: chrom_band(0, rows_of(&b0_chrom, 1.0)),
                 competed: competed(0, &b0_ids, &score(&b0_ids, &[(5, 1.0), (6, 9.0)])),
             },
             pool::BandArtifacts {
                 psms: String::new(),
-                chromatograms: chrom_band(1, rows_of(&b1_ids, 5.0)),
+                chromatograms: chrom_band(1, rows_of(&b1_chrom, 5.0)),
                 competed: competed(1, &b1_ids, &score(&b1_ids, &[(5, 9.0), (6, 1.0)])),
             },
             pool::BandArtifacts {
@@ -5267,13 +5367,63 @@ mod tests {
         })
         .unwrap();
         assert_eq!(stats.duplicates, 2);
-        assert_eq!(stats.losers, vec![vec![5], vec![6], vec![]]);
-        assert_eq!(stats.losers_written.as_ref().map(|w| w.rows), Some(2));
-        assert_eq!(pool::read_losers(&losers_path, 3).unwrap(), stats.losers);
-        assert!(
-            pool::read_losers(&losers_path, 1).is_err(),
-            "band 1 is outside a list of 1"
+        assert_eq!(stats.chromatogram_only_duplicates, 2);
+        assert_eq!(stats.losers, vec![vec![5, 7], vec![4, 6], vec![]]);
+        assert_eq!(stats.losers_written.as_ref().map(|w| w.rows), Some(4));
+        // The pooled table holds every candidate once, from the band that won it.
+        {
+            let t = TableFile::open(&pooled_chrom).unwrap();
+            let cid = t.u32("candidate_id").unwrap();
+            let mut per: BTreeMap<u32, usize> = BTreeMap::new();
+            for c in &cid {
+                *per.entry(*c).or_default() += 1;
+            }
+            assert_eq!(per.len(), 16);
+            assert!(per.values().all(|&n| n == 4), "{per:?}");
+        }
+        let band_paths: Vec<String> = bands.iter().map(|b| b.chromatograms.clone()).collect();
+        assert_eq!(
+            pool::read_losers(&losers_path, &band_paths).unwrap(),
+            stats.losers
         );
+        // The file names its band tables, so a list that is not those tables, in that order,
+        // is refused: one left out, two swapped, or a different table in a position.
+        let refused = |tables: &[String]| {
+            pool::read_losers(&losers_path, tables)
+                .unwrap_err()
+                .to_string()
+        };
+        let e = refused(&band_paths[..2]);
+        assert!(e.contains("but 2 were given"), "{e}");
+        let e = refused(&[
+            band_paths[1].clone(),
+            band_paths[0].clone(),
+            band_paths[2].clone(),
+        ]);
+        assert!(
+            e.contains("band 0 is") && e.contains("qb_band0_chrom"),
+            "{e}"
+        );
+        let e = refused(&[
+            band_paths[0].clone(),
+            band_paths[1].clone(),
+            pooled_chrom.clone(),
+        ]);
+        assert!(e.contains("band 2 is"), "{e}");
+        // A loser table that does not name its band tables is refused as well.
+        let bare = quant_test_path("qb_bare_losers.parquet");
+        write_table(
+            &bare,
+            vec![
+                Col::U32("band".into(), vec![0]),
+                Col::U32("candidate_id".into(), vec![5]),
+            ],
+        )
+        .unwrap();
+        let e = pool::read_losers(&bare, &band_paths)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(pool::LOSERS_BAND_TABLES_KEY), "{e}");
 
         let scored = quant_test_path("qb_scored.parquet");
         let n = 16usize;
@@ -5364,7 +5514,7 @@ mod tests {
                 whole == by_band,
                 "the band tables changed a quant byte (bounds {bounds})"
             );
-            let read_back = pool::read_losers(&losers_path, 3).unwrap();
+            let read_back = pool::read_losers(&losers_path, &band_paths).unwrap();
             let (from_file, _) = quantify("file", &band_tables(&read_back), bounds).unwrap();
             assert!(
                 whole == from_file,
@@ -5373,7 +5523,7 @@ mod tests {
             // The report adds what each band did not contribute, and is otherwise the same.
             assert_eq!(
                 band_rep["params"]["chromatogram_dropped_candidates"],
-                json!([1, 1, 0])
+                json!([2, 2, 0])
             );
             band_rep["params"]
                 .as_object_mut()
@@ -5381,7 +5531,7 @@ mod tests {
                 .remove("chromatogram_dropped_candidates");
             assert_eq!(band_rep, whole_rep);
         }
-        // Without the loser sets, candidates 5 and 6 have rows in two tables: refused.
+        // Without the loser sets, candidates 4 to 7 have rows in two tables: refused.
         let e = quantify("nolosers", &band_tables(&[vec![], vec![], vec![]]), false)
             .unwrap_err()
             .to_string();

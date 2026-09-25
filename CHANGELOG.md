@@ -59,13 +59,15 @@ than a number. Both are recorded in every run's `manifest.json`.
   tables in band order, dropping each band's losers, so the pooled `chromatograms.parquet`
   (about 68 GB a run on the immunopeptidomics experiment) is neither written, hashed nor
   read. It holds for overlapping bands too. Default `true`. The quant tables are
-  byte-identical either way (tests with two overlapping bands and with a candidate
-  straddling two band files; a smoke arm compares the quant tables and TSVs of the
-  three-band fixture). What changes is the artifact set: no pooled chromatogram record,
-  an `overlap_losers` record (schema `overlap_losers` 1), and the quant report lists the
-  band tables with `chromatogram_dropped_candidates`. The band directories are then the
-  run's only chromatograms. `mumdia quant` takes several `--chromatograms` and
-  `--overlap-losers` for the same read by hand.
+  byte-identical either way (tests with two overlapping bands, including overlap
+  candidates compete deleted in one band, and with a band whose row groups are all pruned;
+  a smoke arm compares the quant tables and TSVs of the three-band fixture). What changes
+  is the artifact set: no pooled chromatogram record, an `overlap_losers` record (schema
+  `overlap_losers` 1, whose footer names the band tables it belongs to), and the quant
+  report lists the band tables with `chromatogram_dropped_candidates`. The band
+  directories are then the run's only chromatograms. `mumdia quant` takes several
+  `--chromatograms` and `--overlap-losers` for the same read by hand, and refuses band
+  tables that are not the ones the loser file names, in its order.
 - **`groups.pool_competed = false` has rescore read a grouped run's band tables directly.**
   Rescore takes a table-to-source map (`competed_sources` in the scored report), so the
   bands' competed tables in band order give exactly the rows the pooled
@@ -444,6 +446,17 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **A grouped run no longer quantifies an overlap candidate from two bands.** The pool
+  found its overlap duplicates in the bands' competed tables only, but a band's
+  chromatogram (and extracted) table holds every candidate extract accepted, including
+  ones compete then deleted there. Under `compete.group_by = base_peptide` or `apex`, with
+  overlapping bands, a candidate deleted in one band and kept in the other was therefore
+  in one competed table and two chromatogram tables, and the pooled `chromatograms.parquet`
+  held both bands' rows of it, which quant summed into one quantity. The losers of the
+  chromatogram and extracted tables are now found in those tables: such a candidate is
+  kept from the band whose competed row won it, or from the first band that holds it when
+  no band kept it. The default `peptidoform_charge` gives each candidate a competition
+  group of its own and deletes none, so default runs do not change.
 - **`extract --restrict-candidates` now runs on the streaming path.** A candidate allowlist
   routed extract to the serial path, whose whole-run hit accumulator ignores
   `extract.windows_in_flight`, so a prescan-restricted extract had the memory profile of

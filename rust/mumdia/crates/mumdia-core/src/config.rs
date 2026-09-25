@@ -2174,11 +2174,13 @@ pub struct GroupsConfig {
     /// candidates the pool's overlap dedup gave to another band, and the pooled copy is not
     /// written: one full splice write, hash and read of the run's largest artifact less
     /// (about 68 GB per run on the immunopeptidomics experiment). The pool writes those
-    /// loser sets to `groups/overlap_losers.parquet` (`band`, `candidate_id`), so a later
-    /// `mumdia quant --chromatograms <band tables> --overlap-losers <that file>` reads the
-    /// same rows. Unlike `pool_competed` this holds for overlapping bands as well, and
-    /// nothing but quant reads the pooled table (the candidate audit and match-between-runs
-    /// do not).
+    /// loser sets to `groups/overlap_losers.parquet` (`band`, `candidate_id`, with the band
+    /// tables it belongs to named in its footer), so a later `mumdia quant --chromatograms
+    /// <band tables> --overlap-losers <that file>` reads the same rows, and refuses band
+    /// tables that are not the named ones in their order. Unlike `pool_competed` this holds
+    /// for overlapping bands as well, including an overlap candidate compete deleted in one
+    /// band (the losers are found in the chromatogram tables themselves), and nothing but
+    /// quant reads the pooled table (the candidate audit and match-between-runs do not).
     ///
     /// The quant tables are byte-identical either way; what changes is the artifact set.
     /// There is no pooled `chromatograms.parquet` (one an earlier run left in the

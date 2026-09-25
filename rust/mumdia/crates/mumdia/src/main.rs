@@ -340,7 +340,8 @@ enum Cmd {
         chromatograms: Vec<String>,
         /// A grouped run's `groups/overlap_losers.parquet`: the candidates each band table
         /// does not contribute, because the pool's overlap dedup gave them to another
-        /// band. Its `band` column indexes the `--chromatograms` list.
+        /// band. Its `band` column indexes the `--chromatograms` list, which must be the
+        /// band tables the file names, in its order (a mismatch is refused).
         #[arg(long)]
         overlap_losers: Option<String>,
         #[arg(long)]
@@ -1620,7 +1621,7 @@ fn real_main() -> Result<()> {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             let losers = match &overlap_losers {
-                Some(path) => stages::pool::read_losers(path, chromatograms.len())?,
+                Some(path) => stages::pool::read_losers(path, &chromatograms)?,
                 None => vec![Vec::new(); chromatograms.len()],
             };
             let tables: Vec<stages::quant::ChromTable> = chromatograms
