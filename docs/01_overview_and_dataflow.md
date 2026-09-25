@@ -292,7 +292,11 @@ Per-subcommand specifics that are easy to miss:
   `experiment.rt_library_scope` and `parallel_runs` rules as before). Every run's
   seed searched the same base library at the same tolerance, so each used to load
   and index the same arrays again; the outputs are unchanged, only the order in
-  which stages of different runs execute. A grouped run keeps its own chain. It
+  which stages of different runs execute. One consequence of that order: a run whose
+  conversion fails stops the experiment before any run is seeded, so the earlier
+  runs' directories hold only `spectra/`. The smoke test checks both this and that
+  `parallel_runs = 2` writes the same parquet and TSV bytes as the sequential
+  experiment. A grouped run keeps its own chain. It
   then rescores all competed tables in one pass
   (`run_experiment.rs:428`), then splits the scored table by `source` for per-run
   quant (`run_experiment.rs:474-477`), cross-run LFQ, and then the
