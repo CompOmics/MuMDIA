@@ -22,6 +22,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::calibrate::percentile;
+use crate::chromatograms::{Decoder, Layout, TraceCols};
 use crate::stats::{cosine, pearson, pearson_pairs, pearson_vs, spectral_angle, Centered};
 use rayon::prelude::*;
 
@@ -1304,10 +1305,19 @@ impl ChromChunk {
 /// Sequential reader over the chromatogram table that hands out one [`ChromChunk`] of a
 /// requested row count at a time. One decoded batch is resident beyond the chunk; a batch
 /// straddling a chunk boundary is sliced and its remainder kept for the next chunk.
+///
+/// Reads either chromatogram layout ([`crate::chromatograms`]). A v2 row is turned back into
+/// its v1 row by the stream's [`Decoder`] before it reaches [`ChromChunk::push_row`], so the
+/// chunk, and every feature computed from it, is the one the v1 table gives. The decoder
+/// follows the rows in order, so a stream must start at a row group or at a candidate's
+/// first row, or be opened with [`ChromStream::open_at`], which reads its way in from the
+/// start of the row group.
 struct ChromStream {
     inner: mumdia_io::table::BatchReader,
     pending: Option<RecordBatch>,
     has_obs_mz: bool,
+    layout: Layout,
+    dec: Decoder,
 }
 
 impl ChromStream {
@@ -1320,6 +1330,7 @@ impl ChromStream {
     /// per span on a table whose footer is not small.
     fn open(ch: &TableFile) -> Result<ChromStream> {
         let has_obs_mz = ch.has_column("frag_obs_mz");
+        let layout = Layout::of(ch)?;
         let mut cols = vec![
             "candidate_id",
             "frag_name",
@@ -1331,11 +1342,80 @@ impl ChromStream {
         if has_obs_mz {
             cols.push("frag_obs_mz");
         }
+        cols.extend_from_slice(layout.trace_columns());
         Ok(ChromStream {
             inner: ch.batches(Some(&cols), CHROM_BATCH_ROWS)?,
             pending: None,
             has_obs_mz,
+            layout,
+            dec: Decoder::new(),
         })
+    }
+
+    /// A stream over the file rows `first..first + n_rows` of the whole-file handle `ch`,
+    /// whatever row they start at.
+    ///
+    /// A v2 row may take its axis from an earlier row of its candidate, as far back as the
+    /// start of its row group. When `first` is inside a row group, the stream therefore
+    /// opens at that row group's first row and follows the rows before `first` through the
+    /// decoder ([`Decoder::skip`]) without keeping them, so the first row it hands out has
+    /// the axis it would have had in a read from the row group. A v1 table, and a `first`
+    /// on a row-group boundary, open as [`TableFile::span`] would.
+    fn open_at(ch: &TableFile, first: usize, n_rows: usize) -> Result<ChromStream> {
+        if Layout::of(ch)? == Layout::V1 || n_rows == 0 {
+            return ChromStream::open(&ch.span(first, n_rows)?);
+        }
+        let mut group_start = 0usize;
+        for rows in ch.row_group_rows() {
+            if group_start + rows > first {
+                break;
+            }
+            group_start += rows;
+        }
+        let lead = first - group_start;
+        let mut stream = ChromStream::open(&ch.span(group_start, lead + n_rows)?)?;
+        stream.follow(lead)?;
+        Ok(stream)
+    }
+
+    /// Read the next `n` rows through the decoder only: they are checked and their axes
+    /// followed, and nothing is kept.
+    fn follow(&mut self, n: usize) -> Result<()> {
+        let mut left = n;
+        while left > 0 {
+            let b = self
+                .next_batch()?
+                .ok_or_else(|| anyhow!("chromatograms: the table ended {left} rows early"))?;
+            let k = b.num_rows().min(left);
+            if k < b.num_rows() {
+                self.pending = Some(b.slice(k, b.num_rows() - k));
+            }
+            let col = |name: &str| -> Result<&ArrayRef> {
+                let i = b
+                    .schema()
+                    .index_of(name)
+                    .map_err(|_| anyhow!("chromatograms batch has no column '{name}'"))?;
+                Ok(b.column(i))
+            };
+            let cid = col("candidate_id")?
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| anyhow!("chromatograms column 'candidate_id' is not u32"))?;
+            let rt = ListF32::of(col("rt")?, "rt")?;
+            let inten = ListF32::of(col("intensity")?, "intensity")?;
+            let tr = TraceCols::of(&b)?;
+            for j in 0..k {
+                self.dec.skip(
+                    cid.value(j),
+                    rt.row_slice(j, "rt")?,
+                    inten.row_slice(j, "intensity")?,
+                    tr.offset(j),
+                    tr.len(j),
+                )?;
+            }
+            left -= k;
+        }
+        Ok(())
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
@@ -1411,14 +1491,22 @@ impl ChromStream {
                 .ok_or_else(|| anyhow!("chromatograms column 'predicted_intensity' is not f32"))?;
             let rt = ListF32::of(col("rt")?, "rt")?;
             let inten = ListF32::of(col("intensity")?, "intensity")?;
+            let trace = match self.layout {
+                Layout::V1 => None,
+                Layout::V2 => Some(TraceCols::of(&b)?),
+            };
             // Trace values are read as slices of the decoded batch and copied ONCE, by
             // `push_row` (the axis is deduplicated against the candidate's earlier rows
             // before it is stored, and the intensities are appended to the flat buffer).
             // They used to go through a per-row scratch buffer, which was a second full
             // copy of the payload plus an `Arc` allocation per row per column; see
-            // [`list_row`].
+            // [`list_row`]. A v2 row's trace with its zero margins is rebuilt once, in the
+            // decoder's buffer, and borrowed from there the same way.
             for k in 0..n {
                 let c = cid.value(k);
+                // A dropped candidate's rows need no decoding: the decoder's axis belongs to
+                // one candidate, so the next kept candidate's first observed row in this
+                // read sets it again.
                 if keep.is_some_and(|s| !s.contains(&c)) {
                     continue;
                 }
@@ -1431,6 +1519,10 @@ impl ChromStream {
                 }
                 let rt_row = rt.row_slice(k, "rt")?;
                 let int_row = inten.row_slice(k, "intensity")?;
+                let (rt_row, int_row) = match &trace {
+                    None => (rt_row, int_row),
+                    Some(t) => self.dec.row(c, rt_row, int_row, t.offset(k), t.len(k))?,
+                };
                 let nm = name.value(k);
                 let id = names.intern(nm);
                 chunk.push_row(
@@ -1999,8 +2091,11 @@ fn subchunk_half_widths(
     lefts: &mut Vec<f64>,
     rights: &mut Vec<f64>,
 ) -> Result<()> {
-    let span = ch.span(first, n_rows)?;
-    let mut stream = ChromStream::open(&span)?;
+    // `open_at`, not a span: a sub-chunk starts on the absolute `chunk_rows` grid, which is
+    // inside a row group and inside a candidate whenever the row groups do not divide the
+    // grid (a pooled table's band seams, or a small grid), and a v2 row there may need the
+    // axis an earlier row of its candidate carried.
+    let mut stream = ChromStream::open_at(ch, first, n_rows)?;
     // Chunk reading already groups rows by candidate, so this reuses it and keeps only
     // the confident candidates' rows long enough to bound their peak.
     let chunk = stream.read_chunk_filtered(n_rows, names, Some(keep))?;
@@ -5166,6 +5261,15 @@ mod tests {
     /// groups puts its id inside BOTH ranges and both are kept" was never exercised.
     /// The anchor pattern also leaves skipped groups between kept ones.
     fn craft_chrom_for_bounds(path: &str) -> (HashMap<u32, Vec<usize>>, Vec<f64>) {
+        craft_chrom_for_bounds_with(path, false)
+    }
+
+    /// [`craft_chrom_for_bounds`], with every trace set to zero at its two outer points on
+    /// each side when `zero_margins` is set, so a v2 rewrite trims them.
+    fn craft_chrom_for_bounds_with(
+        path: &str,
+        zero_margins: bool,
+    ) -> (HashMap<u32, Vec<usize>>, Vec<f64>) {
         let (mut cid, mut name): (Vec<u32>, Vec<String>) = (Vec::new(), Vec::new());
         let (mut fmz, mut pint): (Vec<f64>, Vec<f32>) = (Vec::new(), Vec::new());
         let (mut rt, mut inten): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
@@ -5192,6 +5296,9 @@ mod tests {
                     (0..9)
                         .map(|k| {
                             let x = k as f32 - 4.0;
+                            if zero_margins && x.abs() >= 3.0 {
+                                return 0.0;
+                            }
                             (100.0 - f as f32 * 10.0) / (1.0 + x * x)
                         })
                         .collect(),
@@ -6433,6 +6540,19 @@ mod tests {
         n_cand: u32,
         chrom_group_rows: usize,
     ) -> (String, String) {
+        craft_kernel_inputs_with(dir, n_cand, chrom_group_rows, false)
+    }
+
+    /// [`craft_kernel_inputs`]. `paired_only` gives the rows that would carry more
+    /// intensity values than axis points (which the feature code tolerates and extract never
+    /// writes) a trace of the axis length instead, so the table can be rewritten as v2,
+    /// whose rows have one trace length.
+    fn craft_kernel_inputs_with(
+        dir: &std::path::Path,
+        n_cand: u32,
+        chrom_group_rows: usize,
+        paired_only: bool,
+    ) -> (String, String) {
         let psms = dir
             .join("psms_kernel.parquet")
             .to_string_lossy()
@@ -6575,7 +6695,7 @@ mod tests {
                         crt.push(grid.iter().map(|&t| t + (0.25 * dt) as f32).collect());
                         cint.push(peak(&mut rng, npts, centre + jitter));
                     }
-                    3 => {
+                    3 if !paired_only => {
                         // More values than axis points: the union build truncates.
                         crt.push(grid.clone());
                         cint.push(peak(&mut rng, npts + 2, centre + jitter));
@@ -7196,6 +7316,166 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Row-group sizes a chromatogram v2 test rewrites its fixture at: one row per group (a
+    /// seam at every row, so every observed row carries its axis), sizes that cut
+    /// candidates at every offset, the fixture's own, and one group for the whole table.
+    const V2_GROUP_SIZES: [usize; 11] = [1, 2, 3, 4, 5, 7, 11, 12, 64, 1000, 1 << 16];
+
+    #[test]
+    fn a_v2_chromatogram_table_gives_the_features_table_v1_gives_byte_for_byte() {
+        // The kernel fixture: shared grids, a row on a shifted grid, an MS1 grid of its
+        // own, absent rows, all-zero traces and dropouts, which reach every branch of the
+        // v2 encoder. Rewritten as v2 at every size in `V2_GROUP_SIZES`, each table must
+        // give the features table the v1 table gives, byte for byte, over two chunkings
+        // and two loader counts: the main pass's chunks start at candidate boundaries that
+        // fall anywhere inside a row group.
+        let dir = std::env::temp_dir().join("mumdia_features_chrom_v2");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (psms, chrom) = craft_kernel_inputs_with(&dir, 120, 64, true);
+        let run = |chrom: &str, tag: &str, chunk_rows: usize, max_psm: usize, loaders: usize| {
+            let out = dir
+                .join(format!("features_{tag}.parquet"))
+                .to_string_lossy()
+                .to_string();
+            let cfg = FeaturesConfig {
+                set: FeatureSet::Extended,
+                bound_from_confident: false,
+                ms1_precursor_features: true,
+                ..Default::default()
+            };
+            run_chunked(
+                FeaturesParams {
+                    psms: &psms,
+                    chromatograms: chrom,
+                    seed: None,
+                    out: &out,
+                    out_pin: "",
+                    cfg: &cfg,
+                    config_hash: "test",
+                },
+                chunk_rows,
+                max_psm,
+                PinFinish::Normal,
+                BoundsSource::Learn,
+                LoaderSource::Exact {
+                    loaders,
+                    fault: None,
+                },
+            )
+            .unwrap();
+            mumdia_io::hash::blake3_file(&out).unwrap()
+        };
+        let plans = [(150usize, usize::MAX), (1 << 20, 1)];
+        let want: Vec<String> = plans
+            .iter()
+            .map(|&(c, m)| run(&chrom, &format!("v1_{c}_{m}"), c, m, 1))
+            .collect();
+        for rg in V2_GROUP_SIZES {
+            let v2 = dir
+                .join(format!("chrom_v2_{rg}.parquet"))
+                .to_string_lossy()
+                .to_string();
+            crate::chromatograms::rewrite(&chrom, &v2, crate::chromatograms::Layout::V2, rg)
+                .unwrap();
+            for (i, &(c, m)) in plans.iter().enumerate() {
+                for loaders in [1usize, 3] {
+                    let got = run(&v2, &format!("v2_{rg}_{c}_{m}_{loaders}"), c, m, loaders);
+                    assert_eq!(
+                        got, want[i],
+                        "v2 at {rg} rows per group, chunks ({c}, {m}), {loaders} loaders"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v2_confident_bounds_match_v1_at_every_row_group_and_chunk_size() {
+        // The confident-bounds pass is the one reader that starts inside a candidate: its
+        // sub-chunks follow the absolute `chunk_rows` grid. A v2 row there may need the axis
+        // an earlier row of its candidate carried, which `ChromStream::open_at` reads its
+        // way in to find. The samples, in order and bit for bit, must be v1's at every
+        // row-group size and every chunk size, from the pruned spans and the whole table.
+        let dir = std::env::temp_dir().join("mumdia_features_bounds_v2");
+        std::fs::create_dir_all(&dir).unwrap();
+        let v1 = dir.join("chrom_v1.parquet").to_string_lossy().to_string();
+        let (confident, apex_rt) = craft_chrom_for_bounds_with(&v1, true);
+        let cfg = FeaturesConfig::default();
+        let mut sorted: Vec<u32> = confident.keys().copied().collect();
+        sorted.sort_unstable();
+        let t1 = TableFile::open(&v1).unwrap();
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+        let chunks: Vec<usize> = (1..=30).chain([64, 100, 1 << 20]).collect();
+        let want: Vec<(Vec<u64>, Vec<u64>)> = chunks
+            .iter()
+            .map(|&chunk| {
+                let (l, r) = confident_half_widths_serial(
+                    &t1,
+                    &[(0, t1.nrows)],
+                    &confident,
+                    &apex_rt,
+                    &cfg,
+                    chunk,
+                )
+                .unwrap();
+                assert!(!l.is_empty());
+                (bits(&l), bits(&r))
+            })
+            .collect();
+        let mut inside = 0usize;
+        for rg in V2_GROUP_SIZES {
+            let v2 = dir
+                .join(format!("chrom_v2_{rg}.parquet"))
+                .to_string_lossy()
+                .to_string();
+            crate::chromatograms::rewrite(&v1, &v2, crate::chromatograms::Layout::V2, rg).unwrap();
+            let t2 = TableFile::open(&v2).unwrap();
+            let stats = t2.row_group_stats("candidate_id").unwrap();
+            let spans = confident_row_spans(&stats, &sorted).unwrap();
+            for (&chunk, (wl, wr)) in chunks.iter().zip(&want) {
+                inside += confident_subchunks(&spans, chunk)
+                    .iter()
+                    .filter(|&&(first, _)| first % rg != 0)
+                    .count();
+                for sp in [spans.clone(), vec![(0, t2.nrows)]] {
+                    let (l, r) =
+                        confident_half_widths(&t2, &sp, &confident, &apex_rt, &cfg, chunk).unwrap();
+                    assert_eq!(&bits(&l), wl, "rows per group {rg}, chunk {chunk}: left");
+                    assert_eq!(&bits(&r), wr, "rows per group {rg}, chunk {chunk}: right");
+                    let (l, r) =
+                        confident_half_widths_serial(&t2, &sp, &confident, &apex_rt, &cfg, chunk)
+                            .unwrap();
+                    assert_eq!(&bits(&l), wl, "serial, {rg} rows per group, chunk {chunk}");
+                    assert_eq!(&bits(&r), wr, "serial, {rg} rows per group, chunk {chunk}");
+                }
+            }
+        }
+        assert!(
+            inside > 100,
+            "only {inside} sub-chunks started inside a row group"
+        );
+
+        // And the reason `open_at` exists: a plain span that starts inside a candidate, past
+        // the row that carried its axis, cannot be read.
+        let v2 = dir
+            .join("chrom_v2_12.parquet")
+            .to_string_lossy()
+            .to_string();
+        let t2 = TableFile::open(&v2).unwrap();
+        let cids = t2.u32("candidate_id").unwrap();
+        let first = (1..cids.len())
+            .find(|&i| cids[i] == cids[i - 1] && i % 12 != 0)
+            .unwrap();
+        let mut names = NameTab::default();
+        let err = ChromStream::open(&t2.span(first, 5).unwrap())
+            .and_then(|mut s| s.read_chunk(5, &mut names))
+            .err()
+            .expect("a read from inside a candidate must fail");
+        assert!(format!("{err}").contains("no retention-time axis"), "{err}");
+        let mut s = ChromStream::open_at(&t2, first, 5).unwrap();
+        assert_eq!(s.read_chunk(5, &mut names).unwrap().frag.nrows(), 5);
     }
 
     /// What [`ChunkLoader::take`] handed over for one chunk.
