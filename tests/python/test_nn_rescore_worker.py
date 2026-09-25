@@ -336,3 +336,112 @@ def test_available_ram_is_optional_and_never_fatal():
     # Whatever it returns, the threshold is usable.
     gb, why = m.auto_stream_threshold_gb(4)
     assert gb >= 4 and isinstance(why, str)
+
+
+# ------------------------------------------ default-path speed-ups are score-identical
+
+# Every speed-up on the default path is meant to leave the output scores byte-identical,
+# so each one keeps a switch back to the code it replaced. Running the worker once with
+# all of them switched back and once with the defaults, on the same host and seed, must
+# give the same bytes. A single-seed count is not a measurement (CLAUDE.md), so nothing
+# weaker than exact equality would catch a change that only moves the arithmetic.
+LEGACY_ENV = {
+    # W6: score the training pool after the last round as well.
+    "MUMDIA_NN_FINAL_POOL_SCORE": "1",
+}
+
+IDENTITY_ENV = dict(
+    FAST_ENV,
+    MUMDIA_NN_FOLDS="3",
+    MUMDIA_NN_ITERS="3",
+    MUMDIA_NN_EPOCHS="8",
+    MUMDIA_NN_HIDDEN="16,8",
+    MUMDIA_NN_BATCH="128",
+    # Run every round, so the last one (the one W6 skips scoring after) is reached.
+    MUMDIA_NN_EARLY_STOP="0",
+    MUMDIA_NN_NEG_RATIO="2",
+    MUMDIA_NN_NEG_SELECT="hybrid",
+    MUMDIA_NN_WARM_START="1",
+    MUMDIA_NN_WARM_EPOCHS="2",
+    MUMDIA_NN_INIT_SAMPLE="2000",
+    MUMDIA_NN_CHUNK="700",
+    MUMDIA_NN_THREADS="2",
+)
+
+
+def _identity_pool(tmp_path, n=6000, nf=12, row_group=1500, seed=3):
+    """A parquet handoff with the awkward cells the load path must treat exactly as before.
+
+    Several row groups (and a CHUNK smaller than one), NaN and infinite cells, a float64
+    column with values beyond float32 range, a column with nulls, a constant column, -0.0
+    cells and heavily tied columns. Returns (features path, fold-key path, n).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rng = np.random.default_rng(seed)
+    labels = np.where(rng.random(n) < 0.5, 1, -1).astype(np.int32)
+    true = (labels == 1) & (rng.random(n) < 0.4)
+    x = rng.normal(0.0, 1.0, (n, nf))
+    x[true] += np.linspace(2.5, 0.2, nf)
+    x[:, 2] = np.round(x[:, 2], 1)
+    x[rng.random(n) < 0.02, 3] = -0.0
+    x[rng.random(n) < 0.01, 4] = np.nan
+    x[rng.random(n) < 0.005, 5] = np.inf
+    x[rng.random(n) < 0.005, 6] = -np.inf
+    x[:, 7] = 1.5
+    cols = {
+        "SpecId": pa.array(["psm_%d" % i for i in range(n)], pa.string()),
+        "Label": pa.array(labels, pa.int32()),
+        "ScanNr": pa.array(np.arange(n, dtype=np.int32), pa.int32()),
+        "ExpMass": pa.array(np.full(n, 500.0), pa.float64()),
+        "CalcMass": pa.array(np.full(n, 500.0), pa.float64()),
+    }
+    for j in range(nf):
+        if j == 8:
+            v = x[:, j].copy()
+            v[rng.random(n) < 0.005] = 1e300
+            cols["f%02d" % j] = pa.array(v, pa.float64())
+        elif j == 9:
+            cols["f%02d" % j] = pa.array(
+                x[:, j].astype(np.float32), pa.float32(), mask=rng.random(n) < 0.01
+            )
+        else:
+            cols["f%02d" % j] = pa.array(x[:, j].astype(np.float32), pa.float32())
+    cols["Peptide"] = pa.array(["-.PEP%dK.-" % (i // 2) for i in range(n)], pa.string())
+    cols["Proteins"] = pa.array(["P%d" % (i % 7) for i in range(n)], pa.string())
+    features = tmp_path / "identity.features.parquet"
+    pq.write_table(pa.table(cols), str(features), row_group_size=row_group,
+                   compression="snappy")
+    keys = tmp_path / "identity.foldkeys.parquet"
+    pq.write_table(
+        pa.table({"fold_key": pa.array((np.arange(n) // 2).astype(np.uint32), pa.uint32())}),
+        str(keys),
+    )
+    return features, keys, n
+
+
+def _scores_by_row(out_path):
+    cols = read_columns(out_path)
+    cid = np.asarray(cols["candidate_id"], dtype=np.int64)
+    return cid, np.asarray(cols["score"], dtype=np.float64)
+
+
+@pytest.mark.parametrize("backend", ["in-memory", "stream"])
+def test_default_speedups_leave_scores_byte_identical(torch_available, tmp_path, backend):
+    """The default path must score exactly as the code it replaced, on the same host."""
+    features, keys, n = _identity_pool(tmp_path)
+    env = dict(IDENTITY_ENV, MUMDIA_NN_FOLD_KEYS=str(keys),
+               MUMDIA_NN_STREAM="1" if backend == "stream" else "0")
+    ref = tmp_path / "legacy.parquet"
+    new = tmp_path / "default.parquet"
+    run_worker_ok("nn_rescore_worker.py", features, ref, env=dict(env, **LEGACY_ENV))
+    run_worker_ok("nn_rescore_worker.py", features, new, env=env)
+    rc, rs = _scores_by_row(ref)
+    nc, ns = _scores_by_row(new)
+    assert len(rs) == len(ns) == n
+    assert np.array_equal(rc, nc), "the row order of the output changed"
+    assert rs.tobytes() == ns.tobytes(), (
+        "a default-path speed-up changed the scores (%d of %d rows differ)"
+        % (int(np.count_nonzero(rs != ns)), n)
+    )

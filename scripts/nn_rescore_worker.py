@@ -163,6 +163,11 @@ Env knobs (all optional):
     MUMDIA_NN_PREGATHER_GB= 8        pre-gather the fold's training rows when they fit in
                                      this many GB (one gather per iteration instead of a
                                      fancy-index copy per minibatch)
+    MUMDIA_NN_FINAL_POOL_SCORE = 0   1 = also score the training pool after the LAST
+                                     round and log its target count. Those scores feed no
+                                     later selection, so by default the pass is skipped and
+                                     the per-fold log line reports the held-out fold's
+                                     count instead. Scores are identical either way.
 
 Performance notes (measured on a 32-core CPU box, 1.3M-PSM rescore):
     The MLP is tiny (387->128->64->1, ~58k params) but is executed ~160,500 times
@@ -669,6 +674,7 @@ def main():
     EARLY_STOP_TOL = env_f("MUMDIA_NN_EARLY_STOP_TOL", 0.01)
     PREGATHER_GB = env_f("MUMDIA_NN_PREGATHER_GB", 8)
     CLAMP_TINY = env_f("MUMDIA_NN_CLAMP_TINY", 1e-20)
+    FINAL_POOL_SCORE = env_i("MUMDIA_NN_FINAL_POOL_SCORE", 0) != 0
     # auto (default) uses the GPU when torch can see one; cuda/cpu force it. Forcing is
     # what makes a device-only comparison possible: same environment, same package
     # versions, same data, only the device differs (CUDA_VISIBLE_DEVICES="" does NOT
@@ -1169,7 +1175,8 @@ def main():
             optim = None
             prev_pos = None
             used_iters = 0
-            for _ in range(ITERS):
+            score_tr_current = True
+            for it in range(ITERS):
                 _tsel = time.time()
                 q = tda_q(score_tr, ytr)
                 pos = (q <= TRAIN_FDR) & (ytr == 1)
@@ -1315,14 +1322,25 @@ def main():
                         "adam_moments=%d" % ((seed, f) + _denormal_census(model, _xb, optim)),
                         flush=True,
                     )
-                score_tr = score_idx(model, tr_idx)
-                _t = _tick("4_score_pool_per_iter", _t)
+                if it == ITERS - 1 and not FINAL_POOL_SCORE:
+                    # The last round's pool scores would feed nothing but the log line
+                    # below: there is no next selection to make from them. Skipping the
+                    # pass leaves every score untouched (it neither trains nor draws from an
+                    # RNG), and saves one full training-pool forward pass per fold.
+                    score_tr_current = False
+                else:
+                    score_tr = score_idx(model, tr_idx)
+                    _t = _tick("4_score_pool_per_iter", _t)
                 used_iters += 1
             _t = time.time()
             oof[te_idx] = score_idx(model, te_idx)
             _t = _tick("5_score_holdout", _t)
-            print(f"  seed {seed} fold {f}: train targets@{TRAIN_FDR:.0%} = "
-                  f"{n_targets_at(score_tr, ytr, TRAIN_FDR)}", flush=True)
+            if score_tr_current:
+                print(f"  seed {seed} fold {f}: train targets@{TRAIN_FDR:.0%} = "
+                      f"{n_targets_at(score_tr, ytr, TRAIN_FDR)}", flush=True)
+            else:
+                print(f"  seed {seed} fold {f}: held-out targets@{TRAIN_FDR:.0%} = "
+                      f"{n_targets_at(oof[te_idx], y[te_idx], TRAIN_FDR)}", flush=True)
         return oof
 
     # seed ensemble: average rank-normalised out-of-fold scores across seeds

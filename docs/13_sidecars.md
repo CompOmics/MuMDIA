@@ -729,6 +729,17 @@ MLP. Set it explicitly for the logreg path.
   `load: fill + moments` and `load: standardise` split `pin_read_standardise` on the
   parquet in-memory path, and `selection` is the positive re-selection between a pool
   score and the next training round, which no phase covers.
+- **The worker's speed-ups on the default path keep the scores byte-identical**, and
+  each keeps a switch back to the code it replaced, so a suspected difference can be
+  checked on the same host and seed:
+  - `MUMDIA_NN_FINAL_POOL_SCORE` (default 0): the training pool is not scored after
+    the last round, because no later selection reads those scores. The per-fold log
+    line then reports the held-out fold's targets at the training FDR instead of the
+    training pool's. `1` restores the extra pass and the old line.
+
+  `test_default_speedups_leave_scores_byte_identical` (`tests/python`, needs torch)
+  runs the worker with every switch set back and with the defaults and asserts equal
+  score bytes, for the in-memory and the streaming backend.
 - **Constant feature columns are dropped before training** (`MUMDIA_NN_DROP_CONSTANT`,
   default 1; 2026-09-16), identified from the parquet footer's per-column min/max
   without a read (11 of the 387 Extended features on the Astral pool, `has_ms1` and
