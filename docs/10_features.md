@@ -232,6 +232,35 @@ every Extended family. It mirrors the alignment and peak-bounding of
 - MS1: `ms1_mono`/`ms1_iso1`/`ms1_iso2`/`ms1_isom1` (apex isotope intensities,
   `None` when no MS1) and `ms1_xic` (the `[mono,+1,+2]` XICs resampled onto
   `axis`; empty unless the extract stage persisted `ms1_*` chromatogram rows).
+  A row that samples `axis_full` itself (what extract writes: the fragments'
+  window grid) is sliced directly; any other grid goes through the RT-keyed map.
+- `ref_profile_full` (the raw-weighted reference over the whole window) and
+  `pair_stats` (see "Per-PSM shared statistics" below).
+
+In the chunked pass the parts are built once per PSM and shared with
+`fragment_features`: `apex_intensities` (the nearest-apex intensity per row),
+`peak_window` (the elution-peak window; global half-widths or the walk down the
+smoothed top-3 profile), and `PeakTraces` (the window, the sliced traces, both
+reference profiles and a `PairStats`). `evidence_from` then assembles the
+Evidence from them; `build_evidence` is the one-call form the tests use.
+
+#### Per-PSM shared statistics (`PairStats`)
+
+Several readers computed the same correlations from the same peak traces:
+`fragment_features` and `coelution` both built the pair Pearson matrix and every
+pair's lag-optimised cross-correlation, `ion_series` and `nonzero` read subsets
+of that matrix, four readers correlated every fragment with `ref_profile`, and
+two correlated every full-window trace with `ref_profile_full`. `PairStats`
+holds each of these once: the `k x k` Pearson matrix (1.0 on the diagonal), the
+cross-correlation for `a < b`, the per-trace norms, and the reference and
+full-window reference correlations. Every entry comes from the kernel call the
+reader made, on the same arguments in the same order, so a read equals the
+computation it replaces bit for bit. A reader uses the cache only when
+`PairStats::fits` matches its evidence (and, for the full-window values, only
+when it reads `ref_profile_full` itself rather than a rebuild); otherwise it
+computes the value, which is what the test fixtures (`pair_stats: None`)
+exercise. `fragment_features` borrows the shared window only when
+`bound_features` is set, because without it it scores the whole window.
 
 `parse_ion` (`features.rs:346`) parses `b3`, `y7`, `b3^2` into
 `(is_b, ordinal, charge)`.
@@ -572,7 +601,14 @@ identical window.
 ## The shared stats kernel (`stats.rs`)
 
 One implementation of `pearson`, `cosine`, `spectral_angle`, used by
-`fragment_features` and every family (do not reimplement). `pearson`
+`fragment_features` and every family (do not reimplement). Two faster forms of
+`pearson` return its value bit for bit: `pearson_vs(a, r, &Centered::new(r))`
+correlates many vectors with one reference centred once, and
+`pearson_pairs(rows, out)` produces every pair `a < b` from rows centred once,
+four covariances at a time. Both reproduce `pearson`'s operations exactly (the
+mean by the same `iter().sum()` over the same count, deviations and squares
+accumulated from 0.0 in ascending order) and hand a length mismatch to `pearson`
+itself. `pearson`
 (`stats.rs:6`) is population Pearson with a zero-variance guard returning 0.0
 for `n < 2` or zero variance. `cosine` (`stats.rs:29`) returns 0.0 if either
 vector is all-zero. `spectral_angle` (`stats.rs:44`) is
@@ -582,7 +618,29 @@ Pearson, Spearman via `pearson` on average ranks, Kendall tau, windowed cross-
 correlation via `super::best_xcorr`, `features.rs:1484`, which returns the best
 normalized correlation and its integer lag over `[-maxlag, maxlag]` as
 `(lag_of_max, value.max(0.0))`), but the base Pearson/cosine call the shared
-functions.
+functions. `best_xcorr_normed` takes the two norms (`xcorr_norm`) so a pair
+matrix computes each once; at the lag window every caller uses (5) it
+accumulates the 11 lags side by side (`lag_dots`), each lag's terms still in
+ascending order, so the result is the per-lag loop's bit for bit.
+
+The per-PSM order statistics (`peak_snr`'s median and MAD, the `log_sn` noise
+median, `coelution`'s median and IQR) are taken by selection
+(`order_stat`, `median_select`, `quantile_select`), not by sorting a copy;
+under `f64::total_cmp` every order statistic is unique bit for bit, so the
+values are those of the sorted copy. The interference power iteration stops as
+soon as its 100th iterate is known exactly (a bitwise fixed point, or a bitwise
+period-2 cycle whose parity gives it), and `order_consistency` ranks each scan
+column once.
+
+Measured single-threaded on one pinned P-core over a 60,000-PSM HYE-shaped
+fixture (`write_kernel_bench_fixture`, minimum of 5-7 interleaved runs, a
+desktop shared with other builds): the per-PSM compute went from 6.76 s to
+5.24 s over the seven kernel changes (MS1 slice -2.3%, lag-parallel
+cross-correlation -6.2%, centred Pearson -3 to -8%, selection -4.4%, power
+iteration -1.9%, rank cache within noise, shared statistics -6.1%). Every
+change leaves the features table byte-identical; the golden digests
+`extended_features_match_the_pre_permutation_build` and
+`production_shaped_features_match_the_pre_kernel_build` pin the values.
 
 ## Configuration
 
@@ -712,7 +770,9 @@ set `chrom_loaders: 1` there if that matters.
   `(name, values)` to `FAMILIES` (`features.rs:52`). Appending at the end keeps
   all prior schema positions stable. Reuse `crate::stats` and the parent helpers
   (`mean`, `normalize_sum`, `best_xcorr`, `smooth3`, `peak_bounds`) rather than
-  reimplementing kernels. Add an arity unit test (`values(&e).len() ==
+  reimplementing kernels. A family that needs a pair correlation, a pair
+  cross-correlation or a fragment-vs-reference correlation should read it from
+  `e.pair_stats` when `PairStats::fits` holds, and compute it otherwise. Add an arity unit test (`values(&e).len() ==
   NAMES.len()`) and a degenerate-evidence finiteness test.
 - To add a Minimal/Rich feature: append the name to `MINIMAL_FEATURES` or
   `RICH_EXTRA` and push its value in the serial loop (`features.rs:820`); make

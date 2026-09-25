@@ -914,8 +914,8 @@ fn evidence_from(
     // map built three SipHash tables and a full-window vector per PSM to return, at every
     // position, the value already stored there. Bit-identical: on a strictly ascending axis
     // every bit pattern is distinct, so `map[axis_full[k]]` is exactly `r.inten[k]`, and
-    // both paths widen the same f32 to f64. Any other row -- another grid, a length
-    // mismatch, an axis that is not strictly ascending -- still goes through the map.
+    // both paths widen the same f32 to f64. Any other row (another grid, a length
+    // mismatch, an axis that is not strictly ascending) still goes through the map.
     let axis_ascending = axis_full.windows(2).all(|w| w[0] < w[1]);
     let ms1_on_axis = |r: &ChromRow| -> bool {
         axis_ascending
@@ -2341,7 +2341,7 @@ const MAIN_LOADER_EXTRAS: usize = 4;
 static MAIN_LOADER_BUDGET: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(MAIN_LOADER_EXTRAS);
 
-/// Decode one planned chunk -- `n_rows` chromatogram rows from `first` -- on its own, from
+/// Decode one planned chunk (`n_rows` chromatogram rows from `first`) on its own, from
 /// its row span, with a fragment-name table of its own.
 ///
 /// The chunk is the same whichever thread reads it and whatever was read before it: its
@@ -2535,9 +2535,9 @@ impl<'a> ChunkLoader<'a> {
 /// Where the chunked pass spends its time (perf survey P0), so the next optimisation can
 /// be sized from a log line instead of from a cost model.
 ///
-/// The pass is a three-stage pipeline -- loader thread(s) decoding chromatogram chunks,
+/// The pass is a three-stage pipeline (loader thread(s) decoding chromatogram chunks,
 /// the calling thread computing and assembling the features of one chunk, a writer thread
-/// encoding the previous chunk's columns -- and its wall time is set by whichever stage is
+/// encoding the previous chunk's columns), and its wall time is set by whichever stage is
 /// busiest. Each stage records its BUSY time and the time it spent BLOCKED on a
 /// neighbour, so the binding stage is the one that is busy while the others wait on it: a
 /// pass whose `wait_for_loader_ms` is large and whose `loader_blocked_ms` is small is
@@ -2891,7 +2891,7 @@ fn run_chunked(
         // early. The guard is declared FIRST so it drops LAST among this closure's locals,
         // and it drops before the scope joins the loaders: an error return here therefore
         // wakes every loader waiting for the window to open instead of leaving the scope
-        // to join threads that would never wake -- the hang the rendezvous channel was
+        // to join threads that would never wake: the hang the rendezvous channel was
         // once fixed for, in its new form.
         let _release = loader.release_on_drop();
         // The parquet encode is single-threaded; on its own thread it overlaps with the
@@ -6053,7 +6053,7 @@ mod tests {
 
     /// A PRODUCTION-SHAPED Extended fixture for the per-PSM kernels: mostly 12 fragments
     /// on ~150-240-point shared grids (the HYE shape), with every degenerate case the
-    /// kernels branch on mixed in -- 0 to 11 fragments, 1- to 12-point grids, predicted but
+    /// kernels branch on mixed in: 0 to 11 fragments, 1- to 12-point grids, predicted but
     /// unobserved fragments, all-zero traces, quantised intensities (ties), zero and
     /// negative predicted intensities, rows on a shifted grid (the union alignment), a row
     /// whose intensity vector is longer than its axis, MS1 isotope XICs on the fragment
