@@ -379,29 +379,48 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
 /// fragment model id, fragment missing)`, the missing lists being candidate indices the
 /// predictor returned nothing for (the caller drops those with their pairs).
 ///
-/// When both come from sidecars (DeepLC and MS2PIP or AlphaPeptDeep) the two workers run at
-/// the same time: they write disjoint fields of each candidate, and each gets exactly the
-/// request and thread count it gets when run alone, so the library is byte-identical either
-/// way. On the 9.8M-peptidoform HYE FASTA library that was DeepLC 19 min and MS2PIP 35-39 min
-/// one after the other. `MUMDIA_PREDICT_FRAG_SERIAL=1` runs them one after the other again;
-/// running both at once holds both workers' memory at once.
+/// When both come from sidecars (DeepLC and MS2PIP or AlphaPeptDeep) and
+/// `MUMDIA_PREDICT_FRAG_CONCURRENT=1` is set, the two workers run at the same time: they
+/// write disjoint fields of each candidate, and each gets exactly the request and thread
+/// count it gets when run alone, so the library is byte-identical either way (measured on
+/// the fixture library with DeepLC 4.5.0 and MS2PIP 4.2.0: 9.1 s against 14.7 s).
+///
+/// Off by default. Each worker sizes itself from the engine's whole thread count (MS2PIP
+/// starts that many processes, DeepLC takes that many torch threads), so at once they ask
+/// for twice the CPUs and hold both workers' memory; the saving on the fixture is the
+/// workers' start-up, and at scale, where both are CPU-bound (DeepLC 19 min and MS2PIP
+/// 35-39 min on the 9.8M-peptidoform HYE FASTA library, one after the other), neither the
+/// wall time nor the process-tree peak of the pair has been measured. Splitting the thread
+/// budget instead would change DeepLC's torch thread count and with it the last bits of
+/// its predictions. Validate on a large FASTA build (wall time, peak, and a byte
+/// comparison of both library tables) before turning it on.
 fn assign_predictions(
     p: &PredictFragParams,
     raws: &mut [Raw],
 ) -> Result<(String, Vec<usize>, String, Vec<usize>)> {
     let rt_req = RtRequest::new(p, raws)?;
     let frag_req = FragRequest::new(p, raws)?;
-    let serial = std::env::var("MUMDIA_PREDICT_FRAG_SERIAL")
+    let concurrent = std::env::var("MUMDIA_PREDICT_FRAG_CONCURRENT")
         .is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0");
-    let (rt_out, frag_out) = match (&rt_req, &frag_req, serial) {
-        (RtRequest::Deeplc(rt), Some(fr), false) => {
+    let (rt_out, frag_out) = match (&rt_req, &frag_req, concurrent) {
+        (RtRequest::Deeplc(rt), Some(fr), true) => {
             info!(
                 "predict-frag: running the DeepLC and the fragment-intensity workers at the \
-                 same time (MUMDIA_PREDICT_FRAG_SERIAL=1 runs them one after the other)"
+                 same time (MUMDIA_PREDICT_FRAG_CONCURRENT)"
             );
             std::thread::scope(|scope| {
                 let deeplc = scope.spawn(|| rt.call(p));
                 let frag = fr.call(p);
+                if let Err(e) = &frag {
+                    // Said now rather than after the DeepLC join, which on a large library
+                    // is many minutes later: the stage fails either way, and the DeepLC
+                    // worker cannot be interrupted from here.
+                    tracing::error!(
+                        error = %format!("{e:#}"),
+                        "predict-frag: the fragment-intensity worker failed; waiting for the \
+                         DeepLC worker to exit before the stage fails"
+                    );
+                }
                 let rt = deeplc
                     .join()
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("the DeepLC worker thread panicked")));

@@ -186,16 +186,23 @@ DeepLC miss, rather than receiving the native heuristic under an MS2PIP model id
 otherwise (`predict_frag.rs:371-374`); its model id is `format!("ms2pip-{model}")`
 (`predict_frag.rs:446`).
 
-**Both sidecars at once** (`assign_predictions`). When the iRT comes from DeepLC and the
-intensities from MS2PIP or AlphaPeptDeep, the two workers run at the same time: they write
-disjoint fields of each candidate, and each gets exactly the request and the thread count it
-gets alone, so the library is byte-identical either way (measured on the fixture library,
-3,820 precursors, DeepLC 4.5.0 and MS2PIP 4.2.0: identical precursor, fragment and seed
-tables; the stage took 9.1 s concurrent against 14.7 s one after the other). On the
-9.8M-peptidoform HYE FASTA library the two were DeepLC 19 min and MS2PIP 35-39 min in
-sequence. Both workers' memory is then resident at once;
-`MUMDIA_PREDICT_FRAG_SERIAL=1` runs them one after the other again. A DeepLC error is still
-reported first.
+**Both sidecars at once** (`assign_predictions`, `MUMDIA_PREDICT_FRAG_CONCURRENT=1`, off by
+default). When the iRT comes from DeepLC and the intensities from MS2PIP or AlphaPeptDeep,
+the two workers can run at the same time: they write disjoint fields of each candidate, and
+each gets exactly the request and the thread count it gets alone, so the library is
+byte-identical either way (measured on the fixture library, 3,820 precursors, DeepLC 4.5.0
+and MS2PIP 4.2.0: identical precursor, fragment and seed tables; the stage took 9.1 s
+concurrent against 14.7 s one after the other). It is opt-in because each worker sizes
+itself from the engine's whole thread count: MS2PIP starts that many processes and DeepLC
+takes that many torch threads, so together they ask for twice the CPUs and hold both
+workers' memory. The fixture's saving is the workers' start-up. On the 9.8M-peptidoform HYE
+FASTA library the two were DeepLC 19 min and MS2PIP 35-39 min in sequence, both CPU-bound,
+and the pair's wall time and process-tree peak have not been measured. Giving each worker
+half the threads instead would change DeepLC's torch thread count and so the last bits of
+its predictions. To validate: a large FASTA build with and without the variable, comparing
+the wall time, the process-tree peak and both library tables byte for byte. A DeepLC error is
+reported first; a fragment-worker error is logged as soon as it happens and returned once the
+DeepLC worker has exited.
 
 **Deferred DeepLC** (`predict_frag.defer_deeplc_to_multihead`, default `false`). With
 `rt_predictor = deeplc` the automatic multi-head calibration rewrites the iRT of every
