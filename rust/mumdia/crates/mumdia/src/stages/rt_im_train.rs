@@ -93,6 +93,48 @@ struct HoldoutSizing {
     resid_abs_median_s: f64,
 }
 
+/// The `candidate_id -> predicted_irt` join the anchors are read through.
+///
+/// It used to be a `HashMap<u32, f64>` over every library row, built unconditionally:
+/// about 4.5 GB of transient on an unbanded 203M-row library, built even when
+/// `anchor_irt_from_seed` meant it was never read. A library as the engine writes and
+/// loads it carries `candidate_id` as the row-aligned range `0..n` (`index.rs` refuses
+/// anything else), so the join is an index into the iRT column itself. The hash table
+/// remains for any other id layout, and it keeps exactly the old meaning there: the LAST
+/// row with a given id wins, as repeated `insert`s did.
+enum IrtJoin<'a> {
+    /// `anchor_irt_from_seed`: the seed table carries the iRT, nothing is joined.
+    Unused,
+    /// `candidate_id[i] == i` for every row: the id is the row.
+    Dense(&'a [f32]),
+    /// Any other layout: the historical hash join.
+    Map(HashMap<u32, f64>),
+}
+
+impl<'a> IrtJoin<'a> {
+    fn new(cid: &[u32], irt: &'a [f32]) -> IrtJoin<'a> {
+        if cid.len() == irt.len() && cid.iter().enumerate().all(|(i, &c)| c as usize == i) {
+            return IrtJoin::Dense(irt);
+        }
+        let mut m: HashMap<u32, f64> = HashMap::with_capacity(cid.len());
+        for (&c, &v) in cid.iter().zip(irt) {
+            m.insert(c, v as f64);
+        }
+        IrtJoin::Map(m)
+    }
+
+    /// The library iRT of candidate `c`, widened exactly as the hash join stored it;
+    /// `None` when the library has no such candidate.
+    #[inline]
+    fn get(&self, c: u32) -> Option<f64> {
+        match self {
+            IrtJoin::Unused => None,
+            IrtJoin::Dense(irt) => irt.get(c as usize).map(|&v| v as f64),
+            IrtJoin::Map(m) => m.get(&c).copied(),
+        }
+    }
+}
+
 /// Materialize one candidate's RT metadata. `None` means calibration is
 /// unavailable: NaN is an explicit internal sentinel for `rt_pred_cal`, while
 /// infinite bounds make extraction recall-safe.
@@ -143,10 +185,6 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     let lib = TableFile::open(p.library_precursors)?;
     let lib_cid = lib.u32("candidate_id")?;
     let lib_irt = lib.f32("predicted_irt")?;
-    let mut irt_by_cid: HashMap<u32, f64> = HashMap::with_capacity(lib.nrows);
-    for i in 0..lib.nrows {
-        irt_by_cid.insert(lib_cid[i], lib_irt[i] as f64);
-    }
 
     // Training rows: confident seed PSMs, one apex (best score) per peptide;
     // predicted iRT is joined from the library by candidate_id.
@@ -163,6 +201,13 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         None
     };
 
+    // The candidate_id -> library iRT join, built only when it is used and without a hash
+    // table when the ids allow it (see `IrtJoin`).
+    let irt_join = if p.anchor_irt_from_seed {
+        IrtJoin::Unused
+    } else {
+        IrtJoin::new(&lib_cid, &lib_irt)
+    };
     let mut best_per_pep: HashMap<u32, (f64, f64, f64)> = HashMap::new(); // base -> (score, irt, rt)
     for i in 0..seed.nrows {
         if !s_q[i].is_finite()
@@ -185,8 +230,8 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
                 }
                 v
             }
-            None => match irt_by_cid.get(&s_cid[i]) {
-                Some(v) if v.is_finite() => *v,
+            None => match irt_join.get(s_cid[i]) {
+                Some(v) if v.is_finite() => v,
                 None => continue,
                 Some(_) => continue,
             },
@@ -198,6 +243,9 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
             *e = (s_score[i], irt, s_rt[i]);
         }
     }
+    // The join borrows `lib_irt`, which the application pass below takes by value; its
+    // hash-map form has drop glue, so end it here explicitly.
+    drop(irt_join);
     let (anchor_ids, train_irt, train_rt) = sorted_anchor_vectors(best_per_pep);
     let n_train = train_irt.len();
     info!(n_train, "rt-im-train: training points");
@@ -562,6 +610,40 @@ mod tests {
         );
         assert_eq!(sorted_anchor_vectors(first), expected);
         assert_eq!(sorted_anchor_vectors(shuffled), expected);
+    }
+
+    /// The direct index must answer exactly what the hash join answered, for every id a
+    /// seed table can carry, including ids past the library; and a layout that is not the
+    /// row-aligned range must still get the hash join, with its last-row-wins meaning.
+    #[test]
+    fn the_irt_join_answers_what_the_hash_join_answered() {
+        let reference = |cid: &[u32], irt: &[f32]| -> HashMap<u32, f64> {
+            let mut m = HashMap::new();
+            for (&c, &v) in cid.iter().zip(irt) {
+                m.insert(c, v as f64);
+            }
+            m
+        };
+        let irt: Vec<f32> = vec![1.5, f32::NAN, -3.25, 1e-40, 7.0];
+        let cases: Vec<Vec<u32>> = vec![
+            vec![0, 1, 2, 3, 4],      // row-aligned: the direct index
+            vec![0, 1, 2, 2, 4],      // a duplicate: the hash join, last row wins
+            vec![4, 3, 2, 1, 0],      // permuted
+            vec![10, 11, 12, 13, 14], // offset ids
+        ];
+        for cid in &cases {
+            let join = IrtJoin::new(cid, &irt);
+            let aligned = cid.iter().enumerate().all(|(i, &c)| c as usize == i);
+            assert_eq!(matches!(join, IrtJoin::Dense(_)), aligned, "{cid:?}");
+            let want = reference(cid, &irt);
+            for c in 0..20u32 {
+                let got = join.get(c).map(f64::to_bits);
+                assert_eq!(got, want.get(&c).map(|v| v.to_bits()), "{cid:?} id {c}");
+            }
+        }
+        assert_eq!(IrtJoin::Unused.get(0), None);
+        // An empty library joins nothing.
+        assert_eq!(IrtJoin::new(&[], &[]).get(0), None);
     }
 
     #[test]

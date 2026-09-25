@@ -139,9 +139,18 @@ hash and pass it as `config_hash`, but the stage never reads it (see gotchas).
 
 ### 1. Join iRT to candidates
 
-Read the library precursors and build `irt_by_cid: HashMap<u32, f64>` mapping
-`candidate_id -> predicted_irt` (rt_im_train.rs:80-83). This is the only source of
-iRT; both training and application use it.
+Read the library precursors' `candidate_id` and `predicted_irt` columns. This is
+the only source of iRT; both training and application use it. The
+`candidate_id -> predicted_irt` join the anchors are read through (`IrtJoin`) is
+built only when it is used: under `anchor_irt_from_seed` (a pooled seed of a grouped
+run) the seed table carries the iRT and nothing is joined. When it is used and the
+library carries `candidate_id` as the row-aligned range `0..n`, which is the layout
+the engine writes and `Library::load` requires, the join is a direct index into the
+iRT column. Any other layout gets the historical `HashMap<u32, f64>`, in which the
+last row with a given id wins. The hash table was built unconditionally before
+2026-09-25 and was about 4.5 GB of transient on an unbanded 203M-row library; the
+anchors it returns are the same either way
+(`the_irt_join_answers_what_the_hash_join_answered`).
 
 ### 2. Select calibration anchors
 
