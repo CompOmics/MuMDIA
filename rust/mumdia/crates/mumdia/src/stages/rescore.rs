@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context as _, Result};
-use arrow::array::{Array, Float64Array};
+use arrow::array::{Array, Float32Array, Float64Array};
 use mumdia_core::config::{FeaturePreset, RescoreConfig, RescorerKind};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
@@ -534,7 +534,9 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         let b = t.u32("base_peptide_id")?;
         let pf = t.str_flat("peptidoform")?;
         let pr = t.str_flat("protein")?;
-        let z = t.f64("charge")?; // carried as an f64 feature
+        // Carried as an f64 feature (`F64_FEATURE_COLUMNS`), read widening so an f32
+        // column would serve too.
+        let z = t.f64_widening("charge")?;
         let pl = t.f64("prelim_score")?;
         let pm = t.f64("precursor_mz")?;
         let ar = t.f64("apex_rt")?;
@@ -2762,28 +2764,68 @@ fn for_each_feature_row_with(
     })
 }
 
+/// One selected feature column of a decoded batch, in its stored width.
+///
+/// `features` v2 and `psms_competed` v4 store most features as Float32, already narrowed
+/// by `v as f32` when they were written; v1 and v3 stored every feature as Float64, and a
+/// few columns (`F64_FEATURE_COLUMNS`) are still Float64. Both are read here, so a table of
+/// either version gives the classifier the same f32 values.
+#[derive(Clone, Copy)]
+enum FeatureCol<'a> {
+    F64(&'a Float64Array),
+    F32(&'a Float32Array),
+}
+
+impl FeatureCol<'_> {
+    /// Value `k`, narrowed: an f64 by `v as f32` and a null as `f64::NAN as f32`, the
+    /// expressions the matrix path narrowed through, and an f32 as stored (a null as
+    /// `f32::NAN`, the same bits).
+    #[inline]
+    fn value(self, k: usize) -> f32 {
+        match self {
+            FeatureCol::F64(c) => {
+                if c.is_null(k) {
+                    f64::NAN as f32
+                } else {
+                    c.value(k) as f32
+                }
+            }
+            FeatureCol::F32(c) => {
+                if c.is_null(k) {
+                    f32::NAN
+                } else {
+                    c.value(k)
+                }
+            }
+        }
+    }
+
+    fn null_count(self) -> usize {
+        match self {
+            FeatureCol::F64(c) => c.null_count(),
+            FeatureCol::F32(c) => c.null_count(),
+        }
+    }
+}
+
 /// One decoded batch of the feature stream: the selected feature columns, in selection
 /// order, for the flat rows `first_row..first_row + rows`.
 ///
 /// Every value leaves it narrowed exactly as `FeatureMatrix::push` narrows it, `v as f32`,
 /// with a null read as `f64::NAN as f32` (the same expression the matrix path narrowed
-/// through, so a null cell keeps its bits). The validation then rejects it as non-finite.
+/// through, so a null cell keeps its bits). A Float32 column was narrowed that way when it
+/// was written and is used as stored. The validation then rejects a non-finite value.
 struct FeatureBatch<'a> {
     first_row: usize,
     rows: usize,
-    cols: Vec<&'a Float64Array>,
+    cols: Vec<FeatureCol<'a>>,
 }
 
 impl FeatureBatch<'_> {
     /// Value `k` (batch-local row) of selected column `j`, narrowed.
     #[inline]
     fn value(&self, j: usize, k: usize) -> f32 {
-        let c = self.cols[j];
-        if c.is_null(k) {
-            f64::NAN as f32
-        } else {
-            c.value(k) as f32
-        }
+        self.cols[j].value(k)
     }
 
     /// Batch-local row `k` into `row` (one value per selected column).
@@ -2815,10 +2857,13 @@ impl FeatureBatch<'_> {
     /// Batch-local rows `lo..hi` of column `j`, narrowed, appended to `out`.
     fn extend_column(&self, j: usize, lo: usize, hi: usize, out: &mut Vec<f32>) {
         let c = self.cols[j];
-        if c.null_count() == 0 {
-            out.extend(c.values()[lo..hi].iter().map(|&v| v as f32));
-        } else {
-            out.extend((lo..hi).map(|k| self.value(j, k)));
+        if c.null_count() > 0 {
+            out.extend((lo..hi).map(|k| c.value(k)));
+            return;
+        }
+        match c {
+            FeatureCol::F64(a) => out.extend(a.values()[lo..hi].iter().map(|&v| v as f32)),
+            FeatureCol::F32(a) => out.extend_from_slice(&a.values()[lo..hi]),
         }
     }
 
@@ -2881,15 +2926,20 @@ fn for_each_feature_batch_with(
             .collect::<Result<_>>()?;
         for b in reader {
             let b = b?;
-            let cols: Vec<&Float64Array> = order
+            let cols: Vec<FeatureCol<'_>> = order
                 .iter()
                 .map(|&i| {
-                    b.column(i)
-                        .as_any()
-                        .downcast_ref::<Float64Array>()
-                        .ok_or_else(|| {
-                            anyhow!("feature column '{}' is not f64", sch.field(i).name())
-                        })
+                    let a = b.column(i).as_any();
+                    if let Some(c) = a.downcast_ref::<Float32Array>() {
+                        Ok(FeatureCol::F32(c))
+                    } else if let Some(c) = a.downcast_ref::<Float64Array>() {
+                        Ok(FeatureCol::F64(c))
+                    } else {
+                        Err(anyhow!(
+                            "feature column '{}' is not f32 or f64",
+                            sch.field(i).name()
+                        ))
+                    }
                 })
                 .collect::<Result<_>>()?;
             let batch = FeatureBatch {

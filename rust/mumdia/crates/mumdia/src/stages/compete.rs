@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
-use arrow::array::{Array, ArrayRef, Float64Array, Int32Array, StringArray, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, Float32Array, Float64Array, Int32Array, StringArray, UInt32Array,
+};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -24,7 +26,7 @@ use mumdia_io::table::{
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::stages::features::FeatureSchema;
+use crate::stages::features::{feature_storage_type, FeatureSchema};
 
 /// Competition group key: `(base-or-peptidoform id, label code, bucket, peak rank)`.
 /// Fixed size, so a whole run's keys are one flat buffer rather than a String per PSM.
@@ -97,10 +99,11 @@ pub fn run_hashed(p: CompeteParams) -> Result<Written> {
     } else {
         Vec::new()
     };
-    // `charge` is a minimal feature column (present in every set), stored as f64.
+    // `charge` is a minimal feature column (present in every set), stored as f64
+    // (`F64_FEATURE_COLUMNS`); read widening, so an f32 column would serve as well.
     // Only the peptidoform-charge grouping needs it.
     let charge: Option<Vec<f64>> = if by_pform_charge {
-        Some(t.f64("charge").map_err(|_| {
+        Some(t.f64_widening("charge").map_err(|_| {
             anyhow!("compete group_by=peptidoform_charge requires a 'charge' feature column")
         })?)
     } else {
@@ -418,7 +421,8 @@ const META_COLUMNS: [(&str, DataType); 11] = [
     ("prelim_score", DataType::Float64),
 ];
 
-/// Input rows per streamed batch of the pass-through copy (~50 MB at ~400 f64 columns).
+/// Input rows per streamed batch of the pass-through copy (~50 MB at ~400 f64 columns,
+/// about half that since the feature columns are f32).
 const COPY_BATCH_ROWS: usize = 1 << 14;
 
 /// Row-group cap of the competed table, the same cap the rescore handoff writes with.
@@ -426,8 +430,9 @@ const COPY_BATCH_ROWS: usize = 1 << 14;
 /// Rescore reads this file back batch by batch, and a parquet reader decodes a WHOLE row
 /// group before it slices batches out of it, so on a wide table the row-group size is the
 /// reader's working set; it is also what the writer buffers before each flush. At parquet's
-/// default 1,048,576 rows and ~387 f64 feature columns that is ~3.2 GB decoded per group.
-/// 131,072 rows is ~400 MB. Row-group boundaries are the only thing this moves; values and
+/// default 1,048,576 rows and ~387 f64 feature columns that was ~3.2 GB decoded per group,
+/// and 131,072 rows ~400 MB; with the feature columns stored as f32 (schema v4) both are
+/// about half. Row-group boundaries are the only thing this moves; values and
 /// row order are unchanged.
 const COMPETED_ROW_GROUP_ROWS: usize = 131_072;
 
@@ -470,7 +475,9 @@ enum Reuse {
 ///
 /// - the Arrow schema is EXACTLY the competed schema: the same fields in the same order,
 ///   with the same types, nullability and metadata, nothing extra and nothing missing,
-///   and no schema metadata of its own. The copy writes that column set only;
+///   and no schema metadata of its own. The copy writes that column set only. A v1
+///   features table, whose feature columns are all Float64, fails here and is rewritten
+///   into the v4 layout;
 /// - every parquet leaf is REQUIRED, so no value can be null. The copy turns a null into
 ///   NaN, "" or the buffer value (`densify`) or refuses it, and a file with none has
 ///   nothing for it to change;
@@ -765,7 +772,13 @@ fn splice_kept_rows(
 /// The competed table's schema, in exactly the column set and order the previous typed
 /// rewrite produced: the 11 bookkeeping columns, then the schema's feature columns, all
 /// non-nullable. Also the source column of each output field (`None` = synthesised zeros),
-/// and every source column is checked to exist with the declared type.
+/// and every source column is checked to exist with an accepted type.
+///
+/// A feature column is declared with its storage type ([`feature_storage_type`]: Float32,
+/// or Float64 for the few that stay wide), which is what `features` v2 writes, and its
+/// source may be Float32 or Float64: a v1 features table stores every feature as Float64,
+/// and [`conform`] narrows it into the v4 layout with the `as f32` rescore applied to it
+/// on read. A bookkeeping column must have exactly its declared type.
 fn competed_schema(
     t: &TableFile,
     feat_names: &[String],
@@ -784,20 +797,30 @@ fn competed_schema(
         });
     }
     for name in feat_names {
-        fields.push(Field::new(name, DataType::Float64, false));
+        fields.push(Field::new(name, feature_storage_type(name), false));
         source.push(Some(name.clone()));
     }
-    for (f, src) in fields.iter().zip(&source) {
+    for (k, (f, src)) in fields.iter().zip(&source).enumerate() {
         if let Some(s) = src {
             let i = t
                 .schema
                 .index_of(s)
                 .map_err(|_| anyhow!("compete: features table has no column '{s}'"))?;
             let dt = t.schema.field(i).data_type();
-            if dt != f.data_type() {
+            let is_feature = k >= META_COLUMNS.len();
+            let accepted = if is_feature {
+                matches!(dt, DataType::Float32 | DataType::Float64)
+            } else {
+                dt == f.data_type()
+            };
+            if !accepted {
+                let expected = if is_feature {
+                    "Float32 or Float64".to_string()
+                } else {
+                    format!("{:?}", f.data_type())
+                };
                 anyhow::bail!(
-                    "compete: column '{s}' is {dt:?} in the features table, expected {:?}",
-                    f.data_type()
+                    "compete: column '{s}' is {dt:?} in the features table, expected {expected}"
                 );
             }
         }
@@ -893,8 +916,8 @@ fn copy_kept_rows_with(
                     }
                 }
                 arrays.push(match (si, &idx) {
-                    (Some(i), None) => densify(b.column(*i).clone(), f)?,
-                    (Some(i), Some(ix)) => densify(take(b.column(*i).as_ref(), ix, None)?, f)?,
+                    (Some(i), None) => conform(b.column(*i).clone(), f)?,
+                    (Some(i), Some(ix)) => conform(take(b.column(*i).as_ref(), ix, None)?, f)?,
                     (None, _) => Arc::new(Int32Array::from(vec![0i32; n_kept])),
                 });
             }
@@ -905,9 +928,54 @@ fn copy_kept_rows_with(
     w.close_with_digest()
 }
 
+/// Bring a source column to the type of its output field, then [`densify`] it.
+///
+/// Only a feature column can differ in type (`competed_schema` refuses anything else): a
+/// v1 features table stores every feature as Float64, and the v4 competed table stores
+/// most of them as Float32. The value is narrowed with `as f32`, the conversion rescore
+/// applied to that Float64 value when it read it, and a null becomes `f64::NAN as f32`,
+/// what rescore read a null as. A Float32 source under a Float64 field is widened exactly.
+/// A column that already has its field's type passes through untouched.
+fn conform(a: ArrayRef, f: &Field) -> Result<ArrayRef> {
+    if a.data_type() == f.data_type() {
+        return densify(a, f);
+    }
+    let n = a.len();
+    Ok(match (a.data_type(), f.data_type()) {
+        (DataType::Float64, DataType::Float32) => {
+            let x = a
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("type checked");
+            Arc::new(Float32Array::from_iter_values((0..n).map(|k| {
+                if x.is_null(k) {
+                    f64::NAN as f32
+                } else {
+                    x.value(k) as f32
+                }
+            })))
+        }
+        (DataType::Float32, DataType::Float64) => {
+            let x = a
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("type checked");
+            Arc::new(Float64Array::from_iter_values((0..n).map(|k| {
+                if x.is_null(k) {
+                    f64::NAN
+                } else {
+                    f64::from(x.value(k))
+                }
+            })))
+        }
+        (from, to) => anyhow::bail!("compete: cannot convert a {from:?} column to {to:?}"),
+    })
+}
+
 /// Apply the typed getters' null policy to a taken column so the output stays non-nullable,
-/// exactly as the old typed rewrite made it: f64 null -> NaN, utf8 null -> "", integer null
-/// -> the buffer value. Columns without nulls (the normal case) pass through untouched.
+/// exactly as the old typed rewrite made it: f64 and f32 null -> NaN, utf8 null -> "",
+/// integer null -> the buffer value. Columns without nulls (the normal case) pass through
+/// untouched.
 fn densify(a: ArrayRef, f: &Field) -> Result<ArrayRef> {
     if a.null_count() == 0 {
         return Ok(a);
@@ -922,6 +990,19 @@ fn densify(a: ArrayRef, f: &Field) -> Result<ArrayRef> {
             Arc::new(Float64Array::from_iter_values((0..n).map(|k| {
                 if x.is_null(k) {
                     f64::NAN
+                } else {
+                    x.value(k)
+                }
+            })))
+        }
+        DataType::Float32 => {
+            let x = a
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("type validated");
+            Arc::new(Float32Array::from_iter_values((0..n).map(|k| {
+                if x.is_null(k) {
+                    f32::NAN
                 } else {
                     x.value(k)
                 }
@@ -989,9 +1070,11 @@ fn prefer_peak_contested_fraction(
     peak_contested.or(legacy_contested)
 }
 
-/// Read a column as f64, accepting an i32 column (widened) as well.
+/// Read a column as f64, accepting an f32 or an i32 column (widened) as well. The columns
+/// read here are kept as f64 by the features writer (`F64_FEATURE_COLUMNS`), so the widening
+/// arms serve only a table some other writer produced.
 fn col_f64(t: &TableFile, name: &str) -> Option<Vec<f64>> {
-    t.f64(name).ok().or_else(|| {
+    t.f64_widening(name).ok().or_else(|| {
         t.i32(name)
             .ok()
             .map(|v| v.into_iter().map(|x| x as f64).collect())
@@ -1549,8 +1632,9 @@ mod tests {
     }
 
     /// A features table as the features stage writes it: `TableWriter` row groups of
-    /// `rg_rows`, the 11 bookkeeping columns plus `charge` and `n_matched_fragments`, and
-    /// the schema companion naming those two as the feature columns. Rows `dups` take the
+    /// `rg_rows`, the 11 bookkeeping columns plus `charge` and `n_matched_fragments` (f64,
+    /// as the v2 layout keeps them) and `frag_corr` (f32, as it stores every other feature),
+    /// and the schema companion naming those three as the feature columns. Rows `dups` take the
     /// peptidoform of the row two before them, which under the default
     /// `peptidoform_charge` grouping makes each a second member of that row's group (same
     /// charge parity; the callers pick rows whose label matches too). `extra` adds a column
@@ -1602,6 +1686,10 @@ mod tests {
         } else {
             IoCol::F64("n_matched_fragments".into(), f(&|i| (i % 5) as f64))
         });
+        cols.push(IoCol::F32(
+            "frag_corr".into(),
+            (0..n).map(|i| (i % 11) as f32 * 0.1).collect(),
+        ));
         if extra {
             cols.push(IoCol::F64("not_a_feature".into(), f(&|i| i as f64)));
         }
@@ -1611,12 +1699,15 @@ mod tests {
         mumdia_io::json::write_json(
             &format!("{path}.schema.json"),
             &FeatureSchema {
-                feature_columns: vec!["charge".to_string(), "n_matched_fragments".to_string()],
+                feature_columns: TABLE_FEATURES.iter().map(|s| s.to_string()).collect(),
                 schema_id: "test".to_string(),
             },
         )
         .unwrap();
     }
+
+    /// The feature columns of [`write_features_table`].
+    const TABLE_FEATURES: [&str; 3] = ["charge", "n_matched_fragments", "frag_corr"];
 
     /// Every row of a parquet file as one batch, for a value-for-value comparison.
     fn whole_table(path: &str) -> RecordBatch {
@@ -1689,7 +1780,7 @@ mod tests {
         // The schema companion is written as before.
         assert_eq!(
             FeatureSchema::read(out).unwrap().feature_columns,
-            vec!["charge".to_string(), "n_matched_fragments".to_string()]
+            TABLE_FEATURES.to_vec()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2098,5 +2189,173 @@ mod tests {
         // Only the empty group is clean.
         let keep: Vec<usize> = (0..12).filter(|&r| r % 4 != 0).collect();
         assert!(!splice_pays(&keep, &spans, 12));
+    }
+
+    /// A v1 features table: the bookkeeping columns, and every feature Float64, among them
+    /// `frag_corr` with values f32 cannot represent.
+    fn write_v1_features_table(path: &str, n: usize) -> Vec<f64> {
+        let f = |g: &dyn Fn(usize) -> f64| (0..n).map(g).collect::<Vec<f64>>();
+        let corr = f(&|i| (i % 11) as f64 * 0.1 + 1e-9);
+        let cols = vec![
+            IoCol::U32("candidate_id".into(), (0..n as u32).collect()),
+            IoCol::I32("peak_rank".into(), vec![0; n]),
+            IoCol::Str(
+                "label".into(),
+                (0..n)
+                    .map(|i| if i % 3 == 0 { "decoy" } else { "target" }.to_string())
+                    .collect(),
+            ),
+            IoCol::U32(
+                "base_peptide_id".into(),
+                (0..n as u32).map(|i| i / 2).collect(),
+            ),
+            IoCol::Str(
+                "peptidoform".into(),
+                (0..n).map(|i| format!("PEP{i}")).collect(),
+            ),
+            IoCol::Str("protein".into(), (0..n).map(|i| format!("P{i}")).collect()),
+            IoCol::F64("apex_rt".into(), f(&|i| i as f64 * 0.3)),
+            IoCol::F64("elution_lo".into(), f(&|i| i as f64 - 1.0)),
+            IoCol::F64("elution_hi".into(), f(&|i| i as f64 + 1.0)),
+            IoCol::F64("precursor_mz".into(), f(&|i| 400.1 + i as f64)),
+            IoCol::F64("prelim_score".into(), f(&|i| (i % 7) as f64 / 7.0)),
+            IoCol::F64("charge".into(), f(&|i| 2.0 + (i % 2) as f64)),
+            IoCol::F64("n_matched_fragments".into(), f(&|i| (i % 5) as f64)),
+            IoCol::F64("frag_corr".into(), corr.clone()),
+        ];
+        let mut w = mumdia_io::table::TableWriter::new(path).with_row_group_rows(1 << 16);
+        w.write_cols(cols).unwrap();
+        w.close().unwrap();
+        mumdia_io::json::write_json(
+            &format!("{path}.schema.json"),
+            &FeatureSchema {
+                feature_columns: TABLE_FEATURES.iter().map(|s| s.to_string()).collect(),
+                schema_id: "test".to_string(),
+            },
+        )
+        .unwrap();
+        corr
+    }
+
+    #[test]
+    fn a_v1_features_table_is_narrowed_into_the_v4_layout() {
+        // A v1 features table stores every feature as Float64. Compete cannot publish its
+        // bytes (its schema is not the v4 competed schema), so it rewrites the rows, and
+        // the rewrite narrows each Float32 feature with `as f32`, the conversion rescore
+        // applied to that value when it read the v3 table. The f64 columns are untouched.
+        let dir = tmp_dir("v1_input");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        let out = dir.join("competed.parquet");
+        let out = out.to_str().unwrap();
+        let corr = write_v1_features_table(feats, 50);
+        let (_, rep) = compete_with(feats, out, &CompeteConfig::default(), None);
+        assert_eq!(rep.stats["publish"], "rewritten");
+        assert_eq!(rep.schema_version, artifact::PSMS_COMPETED.1);
+        let src = TableFile::open(feats).unwrap();
+        let t = TableFile::open(out).unwrap();
+        assert_eq!(t.nrows, 50);
+        for (name, dt) in [
+            ("charge", DataType::Float64),
+            ("n_matched_fragments", DataType::Float64),
+            ("frag_corr", DataType::Float32),
+            ("prelim_score", DataType::Float64),
+        ] {
+            let i = t.schema.index_of(name).unwrap();
+            assert_eq!(t.schema.field(i).data_type(), &dt, "{name}");
+        }
+        let bits32 = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        let narrowed: Vec<f32> = corr.iter().map(|&v| v as f32).collect();
+        assert_eq!(bits32(&t.f32("frag_corr").unwrap()), bits32(&narrowed));
+        for name in ["charge", "n_matched_fragments", "precursor_mz", "apex_rt"] {
+            assert_eq!(src.f64(name).unwrap(), t.f64(name).unwrap(), "{name}");
+        }
+        // The widening getter reads the narrowed column as its f32 values, exactly.
+        let widened: Vec<f64> = narrowed.iter().map(|&v| f64::from(v)).collect();
+        assert_eq!(t.f64_widening("frag_corr").unwrap(), widened);
+        // Competing the v4 table again reuses its bytes.
+        let again = dir.join("again.parquet");
+        let (_, rep) = compete_with(
+            out,
+            again.to_str().unwrap(),
+            &CompeteConfig::default(),
+            None,
+        );
+        assert_ne!(rep.stats["publish"], "rewritten");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conform_narrows_widens_and_refuses_other_conversions() {
+        let f32_field = Field::new("x", DataType::Float32, false);
+        let f64_field = Field::new("x", DataType::Float64, false);
+        let src64: ArrayRef = Arc::new(Float64Array::from(vec![Some(0.1), None, Some(3.5)]));
+        let a = conform(src64, &f32_field).unwrap();
+        let a = a.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(a.null_count(), 0);
+        assert_eq!(a.value(0).to_bits(), (0.1f64 as f32).to_bits());
+        assert_eq!(a.value(1).to_bits(), (f64::NAN as f32).to_bits());
+        assert_eq!(a.value(2), 3.5);
+        let src32: ArrayRef = Arc::new(Float32Array::from(vec![Some(0.1f32), None]));
+        let b = conform(src32.clone(), &f64_field).unwrap();
+        let b = b.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(b.value(0), f64::from(0.1f32));
+        assert!(b.value(1).is_nan() && b.null_count() == 0);
+        // Same type: the null policy of `densify`, now with an f32 arm.
+        let c = conform(src32, &f32_field).unwrap();
+        let c = c.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(c.null_count(), 0);
+        assert_eq!(c.value(0), 0.1f32);
+        assert!(c.value(1).is_nan());
+        let ints: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        assert!(conform(ints, &f32_field).is_err());
+    }
+
+    #[test]
+    fn a_feature_column_that_is_not_a_float_is_refused() {
+        let dir = tmp_dir("int_feature");
+        let feats = dir.join("features.parquet");
+        let feats = feats.to_str().unwrap();
+        write_features_table(feats, 8, 1 << 16, &[], false, true, false);
+        // Rewrite `frag_corr` as an i32 column under the same name.
+        let t = mumdia_io::table::Table::read(feats).unwrap();
+        let mut cols: Vec<ArrayRef> = Vec::new();
+        let mut fields: Vec<Field> = Vec::new();
+        for (i, f) in t.schema.fields().iter().enumerate() {
+            let col = arrow::compute::concat(
+                &t.batches
+                    .iter()
+                    .map(|b| b.column(i).as_ref())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            if f.name() == "frag_corr" {
+                fields.push(Field::new("frag_corr", DataType::Int32, false));
+                cols.push(Arc::new(Int32Array::from(vec![1; 8])));
+            } else {
+                fields.push(f.as_ref().clone());
+                cols.push(col);
+            }
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, cols).unwrap();
+        let bad = dir.join("bad.parquet");
+        let bad = bad.to_str().unwrap();
+        mumdia_io::table::write_batches(bad, batch.schema(), &[batch]).unwrap();
+        std::fs::copy(format!("{feats}.schema.json"), format!("{bad}.schema.json")).unwrap();
+        let e = run(CompeteParams {
+            features: bad,
+            out: dir.join("out.parquet").to_str().unwrap(),
+            cfg: &CompeteConfig::default(),
+            config_hash: "test",
+            features_hash: None,
+        })
+        .unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("'frag_corr' is Int32") && msg.contains("Float32 or Float64"),
+            "{msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

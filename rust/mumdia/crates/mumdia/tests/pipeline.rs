@@ -615,12 +615,35 @@ fn features_chunking_is_value_preserving() {
         b.u32("candidate_id").unwrap()
     );
     assert_eq!(a.str("peptidoform").unwrap(), b.str("peptidoform").unwrap());
-    // Every f64 column bit for bit, so a feature that only differs in the last ulp fails.
+    // Every float column bit for bit, so a feature that only differs in the last ulp
+    // fails: the f64 bookkeeping and kept feature columns, and the f32 feature columns of
+    // the v2 layout (`features::F64_FEATURE_COLUMNS` has the ones that stay f64).
+    let (mut n64, mut n32) = (0usize, 0usize);
     for name in a.column_names() {
         if let (Ok(x), Ok(y)) = (a.f64(&name), b.f64(&name)) {
             let xb: Vec<u64> = x.iter().map(|v| v.to_bits()).collect();
             let yb: Vec<u64> = y.iter().map(|v| v.to_bits()).collect();
             assert_eq!(xb, yb, "column '{name}' differs between chunk sizes");
+            n64 += 1;
+        } else if let (Ok(x), Ok(y)) = (a.f32(&name), b.f32(&name)) {
+            let xb: Vec<u32> = x.iter().map(|v| v.to_bits()).collect();
+            let yb: Vec<u32> = y.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(xb, yb, "f32 column '{name}' differs between chunk sizes");
+            n32 += 1;
+        }
+    }
+    // The Minimal set: 14 features, of which `charge` and `n_matched_fragments` stay f64,
+    // beside the five f64 bookkeeping columns.
+    assert_eq!((n64, n32), (7, 12), "f64 and f32 columns compared");
+    let schema = mumdia_io::table::TableFile::open(&f_one).unwrap().schema;
+    for f in schema.fields() {
+        if !stages::features::NON_FEATURE_COLUMNS.contains(&f.name().as_str()) {
+            assert_eq!(
+                f.data_type(),
+                &stages::features::feature_storage_type(f.name()),
+                "feature column '{}'",
+                f.name()
+            );
         }
     }
 }

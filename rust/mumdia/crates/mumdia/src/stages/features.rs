@@ -315,6 +315,68 @@ pub const NON_FEATURE_COLUMNS: &[&str] = &[
     "unique_evidence",
 ];
 
+/// The feature columns that `features.parquet` (schema v2) and `psms_competed.parquet`
+/// (schema v4) keep as Float64. Every other feature column is stored as Float32.
+///
+/// Every classifier narrows every feature to f32 before it sees it: the native
+/// `FeatureMatrix` is flat f32 and the sidecar handoff is Float32, both built by `v as
+/// f32`. Storing a feature as `v as f32` therefore hands the rescorer the value it used
+/// before, bit for bit, at half the bytes. The columns listed here are the ones something
+/// reads as f64 BEFORE that narrowing, so they keep their width:
+///
+/// - `charge` is compete's `peptidoform_charge` key and rescore's scored charge (a small
+///   integer, exact in f32 too, kept so neither reader changes);
+/// - `n_matched_fragments`, `unique_fragment_count`, `peak_contested_frac` and
+///   `contested_frac` feed compete's opt-in `unique_evidence` estimate
+///   `n * (1 - c)`, computed in f64, where an f32 `c` could move a value that sits
+///   exactly on the integer threshold.
+///
+/// This build writes neither `unique_fragment_count` nor `contested_frac` as a feature;
+/// they are listed so that an artifact carrying them keeps them at full width.
+pub const F64_FEATURE_COLUMNS: &[&str] = &[
+    "charge",
+    "n_matched_fragments",
+    "unique_fragment_count",
+    "peak_contested_frac",
+    "contested_frac",
+];
+
+/// Whether the feature column `name` is stored as Float64 ([`F64_FEATURE_COLUMNS`]) rather
+/// than Float32.
+pub fn feature_stored_as_f64(name: &str) -> bool {
+    F64_FEATURE_COLUMNS.contains(&name)
+}
+
+/// The Arrow type the feature column `name` is stored as in `features.parquet` v2 and
+/// `psms_competed.parquet` v4.
+pub fn feature_storage_type(name: &str) -> arrow::datatypes::DataType {
+    if feature_stored_as_f64(name) {
+        arrow::datatypes::DataType::Float64
+    } else {
+        arrow::datatypes::DataType::Float32
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: write every feature column as Float64, the layout of `features.parquet`
+    /// v1. The two golden digests are claims about the f64 feature values of earlier
+    /// commits, so they are still checked on this layout, and the v2 file is then checked
+    /// against it narrowed. Per thread, because the harness runs tests concurrently and the
+    /// columns are assembled on the thread that calls the stage.
+    static V1_LAYOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the writer stores the feature column `name` as Float64: the kept columns, and in
+/// a test that asked for the v1 layout, every column.
+fn writes_as_f64(name: &str) -> bool {
+    #[cfg(test)]
+    if V1_LAYOUT.with(|v| v.get()) {
+        return true;
+    }
+    feature_stored_as_f64(name)
+}
+
 fn peptide_length(peptidoform: &str) -> i32 {
     // Strip the decoy marker so its letters (D,E,C,O,Y) are not counted as residues.
     // seq_len feeds the peptide_length feature and length-normalized features (e.g.
@@ -3363,9 +3425,22 @@ fn run_chunked(
                 Col::F64("prelim_score".into(), prelim),
             ];
             // Moved, not copied: the matrix is dropped on the next line, and copying
-            // every column is what made the matrix exist twice at this point.
+            // every column is what made the matrix exist twice at this point. A feature
+            // is stored narrowed, `v as f32`, the conversion every classifier applies when
+            // it reads the value (`feature_stored_as_f64` has the few that stay f64), so
+            // the column the writer receives is half the matrix column's bytes. The PIN
+            // above was written from the f64 matrix, so its text does not change.
+            let mut sent_bytes = 0usize;
             for (c, name) in cols_active.iter().enumerate() {
-                cols.push(Col::F64(name.clone(), m.take_column(c)));
+                let v = m.take_column(c);
+                cols.push(if writes_as_f64(name) {
+                    sent_bytes += crate::memlog::bytes_of(&v);
+                    Col::F64(name.clone(), v)
+                } else {
+                    let v: Vec<f32> = v.into_iter().map(|x| x as f32).collect();
+                    sent_bytes += crate::memlog::bytes_of(&v);
+                    Col::F32(name.clone(), v)
+                });
             }
             drop(m);
             timers.add(&timers.assemble_ns, assembling);
@@ -3382,8 +3457,9 @@ fn run_chunked(
                 break;
             }
             // The send has returned, so the writer now owns this chunk's columns and holds
-            // them while the next chunk is assembled. They are the matrix's columns, moved.
-            in_writer = matrix_bytes;
+            // them while the next chunk is assembled: the matrix's f64 columns, moved, and
+            // its narrowed f32 columns.
+            in_writer = sent_bytes;
         }
         // The PIN is flushed BEFORE the commit marker, because `writer.close()` publishes
         // `features.parquet` over the previous good one and the PIN write is the last thing
@@ -3429,10 +3505,12 @@ fn run_chunked(
     // right figure for it; the writer thread holds no copy but does hold the previous
     // chunk's columns while this chunk is assembled, and the assembly also has the extended
     // buffer live (337 of 387 columns wide at Extended, so ~0.87x a matrix). The overlap
-    // therefore peaks near 2.9x a matrix, ABOVE the 2x it replaced -- the encode came off
-    // the critical path at the cost of bytes, and the report says so rather than asserting
-    // the old figure. `max_inflight_bytes` covers only these three buffers; the chromatogram
-    // store is reported separately above and the Arrow encode's own buffers are the writer's.
+    // peaked near 2.9x a matrix, ABOVE the 2x it replaced -- the encode came off the
+    // critical path at the cost of bytes, and the report says so rather than asserting the
+    // old figure. Since the feature columns are stored as f32 the writer's copy is about
+    // half a matrix, so the peak is nearer 2.4x. `max_inflight_bytes` covers only these
+    // three buffers; the chromatogram store is reported separately above and the Arrow
+    // encode's own buffers are the writer's.
     crate::memlog::report(
         "features value matrix",
         &[
@@ -6079,14 +6157,46 @@ mod tests {
     /// then its values as raw bit patterns. Writing a value into a different column than
     /// before changes it, which is the property
     /// `extended_features_match_the_pre_permutation_build` needs.
+    ///
+    /// An f64 column hashes its 8-byte patterns under the tag `f64` and an f32 column its
+    /// 4-byte patterns under `f32`, so a table with no f32 column (the v1 layout both
+    /// goldens were captured on) digests exactly as it did before f32 columns existed.
     fn features_digest(path: &str) -> (usize, usize, u64) {
+        digest_as(path, false)
+    }
+
+    /// [`features_digest`] of a v1-layout table (every feature Float64) as the v2 writer
+    /// stores it: a feature column that v2 stores as Float32 is hashed as its values
+    /// narrowed by `as f32`, under the tag an f32 column gets. It equals `features_digest`
+    /// of the v2 table exactly when every f32 column holds the v1 values narrowed and every
+    /// other column is bit-identical.
+    fn features_digest_as_v2(v1_path: &str) -> (usize, usize, u64) {
+        digest_as(v1_path, true)
+    }
+
+    fn digest_as(path: &str, narrow_to_v2: bool) -> (usize, usize, u64) {
         let t = mumdia_io::table::Table::read(path).unwrap();
         let names = t.column_names();
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         for name in &names {
             fnv(&mut h, name.as_bytes());
+            let v2_f32 = narrow_to_v2
+                && !NON_FEATURE_COLUMNS.contains(&name.as_str())
+                && !feature_stored_as_f64(name);
             if let Ok(v) = t.f64(name) {
-                fnv(&mut h, b"f64");
+                if v2_f32 {
+                    fnv(&mut h, b"f32");
+                    for x in &v {
+                        fnv(&mut h, &(*x as f32).to_bits().to_le_bytes());
+                    }
+                } else {
+                    fnv(&mut h, b"f64");
+                    for x in &v {
+                        fnv(&mut h, &x.to_bits().to_le_bytes());
+                    }
+                }
+            } else if let Ok(v) = t.f32(name) {
+                fnv(&mut h, b"f32");
                 for x in &v {
                     fnv(&mut h, &x.to_bits().to_le_bytes());
                 }
@@ -6108,6 +6218,48 @@ mod tests {
             }
         }
         (t.nrows, names.len(), h)
+    }
+
+    /// Run `f` with the writer storing every feature column as Float64 (the v1 layout),
+    /// and restore the shipped layout afterwards, on a panic as well.
+    fn with_v1_layout<T>(f: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                V1_LAYOUT.with(|v| v.set(false));
+            }
+        }
+        V1_LAYOUT.with(|v| v.set(true));
+        let _reset = Reset;
+        f()
+    }
+
+    /// The column types of a v2 features table: the bookkeeping columns as the writer
+    /// declares them, every feature column as [`feature_storage_type`] says, and at least
+    /// one feature column in each width. Returns the number of Float32 columns.
+    fn assert_v2_layout(path: &str) -> usize {
+        let t = TableFile::open(path).unwrap();
+        let (mut n32, mut n64) = (0usize, 0usize);
+        for f in t.schema.fields() {
+            if NON_FEATURE_COLUMNS.contains(&f.name().as_str()) {
+                continue;
+            }
+            assert_eq!(
+                f.data_type(),
+                &feature_storage_type(f.name()),
+                "feature column '{}' is stored in the wrong width",
+                f.name()
+            );
+            match f.data_type() {
+                arrow::datatypes::DataType::Float32 => n32 += 1,
+                _ => n64 += 1,
+            }
+        }
+        assert!(
+            n32 > 0 && n64 > 0,
+            "{n32} f32 and {n64} f64 feature columns"
+        );
+        n32
     }
 
     #[test]
@@ -6142,6 +6294,13 @@ mod tests {
         // formats to fixed decimals, which is why the same PIN hash holds on both. A
         // platform with no entry here checks the shape and the PIN and says it has no
         // digest, rather than failing on a constant captured somewhere else.
+        //
+        // THE DIGEST IS OF THE v1 LAYOUT, every feature stored as f64, because that is
+        // what 1ac1b44^ wrote and the constant is a claim about those values. The shipped
+        // v2 layout stores most features as `v as f32`; it is checked against the v1 run
+        // of the same build instead: its digest must equal the v1 table's with those
+        // columns narrowed (`features_digest_as_v2`), and its PIN is the same golden PIN,
+        // because the PIN is written from the f64 values before they are narrowed.
         const GOLDEN_DIGEST: Option<u64> = if cfg!(target_os = "windows") {
             Some(0x4e43_7960_2b2a_a1cc)
         } else if cfg!(target_os = "linux") {
@@ -6157,14 +6316,11 @@ mod tests {
         // Both chunk sizes, because the golden was captured at both and they agreed: the
         // pin therefore covers the chunked path as well as the single-chunk one.
         for (tag, chunk) in [("one", 1usize << 20), ("many", 1usize)] {
-            let out = dir
-                .join(format!("golden_{tag}.parquet"))
-                .to_string_lossy()
-                .to_string();
-            let pin = dir
-                .join(format!("golden_{tag}.pin"))
-                .to_string_lossy()
-                .to_string();
+            let path = |layout: &str, ext: &str| {
+                dir.join(format!("golden_{tag}_{layout}.{ext}"))
+                    .to_string_lossy()
+                    .to_string()
+            };
             let mut cfg = FeaturesConfig {
                 set: FeatureSet::Extended,
                 emit_pin: true,
@@ -6172,34 +6328,59 @@ mod tests {
                 ..Default::default()
             };
             cfg.ms1_precursor_features = true;
-            run_with_chunk_rows(
-                FeaturesParams {
-                    psms: &psms,
-                    chromatograms: &chrom,
-                    seed: None,
-                    out: &out,
-                    out_pin: &pin,
-                    cfg: &cfg,
-                    config_hash: "test",
-                },
-                chunk,
-            )
-            .unwrap();
-            let (rows, ncols, digest) = features_digest(&out);
+            let run = |out: &str, pin: &str| {
+                run_with_chunk_rows(
+                    FeaturesParams {
+                        psms: &psms,
+                        chromatograms: &chrom,
+                        seed: None,
+                        out,
+                        out_pin: pin,
+                        cfg: &cfg,
+                        config_hash: "test",
+                    },
+                    chunk,
+                )
+                .unwrap()
+            };
+            let (out1, pin1) = (path("v1", "parquet"), path("v1", "pin"));
+            with_v1_layout(|| run(&out1, &pin1));
+            let (rows, ncols, digest) = features_digest(&out1);
             assert_eq!((rows, ncols), (61, 398), "chunk {tag}: table shape moved");
             match GOLDEN_DIGEST {
                 Some(golden) => assert_eq!(
                     digest, golden,
-                    "chunk {tag}: a feature value or its column differs from the                      name-keyed assembly at 1ac1b44^ (this platform computes                      0x{digest:016x})"
+                    "chunk {tag}: a feature value or its column differs from the name-keyed \
+                     assembly at 1ac1b44^ (this platform computes 0x{digest:016x})"
                 ),
                 None => eprintln!(
-                    "no feature digest is recorded for this platform; chunk {tag} computes                      0x{digest:016x}. Add it above once it has been checked against a                      platform that has one."
+                    "no feature digest is recorded for this platform; chunk {tag} computes \
+                     0x{digest:016x}. Add it above once it has been checked against a \
+                     platform that has one."
                 ),
             }
             assert_eq!(
-                mumdia_io::hash::blake3_file(&pin).unwrap(),
+                mumdia_io::hash::blake3_file(&pin1).unwrap(),
                 GOLDEN_PIN,
                 "chunk {tag}: the PIN bytes differ from the name-keyed assembly"
+            );
+
+            // The shipped layout: the same values, the f32 columns narrowed.
+            let (out2, pin2) = (path("v2", "parquet"), path("v2", "pin"));
+            run(&out2, &pin2);
+            assert!(
+                assert_v2_layout(&out2) > 300,
+                "chunk {tag}: too few f32 columns"
+            );
+            assert_eq!(
+                features_digest(&out2),
+                features_digest_as_v2(&out1),
+                "chunk {tag}: the v2 table is not the v1 table with its f32 columns narrowed"
+            );
+            assert_eq!(
+                mumdia_io::hash::blake3_file(&pin2).unwrap(),
+                GOLDEN_PIN,
+                "chunk {tag}: the v2 layout moved the PIN bytes"
             );
         }
     }
@@ -6518,6 +6699,10 @@ mod tests {
         // Linux digest reproduced in the same run. A platform with no entry prints its
         // digest and passes. REGENERATING: re-derive at the last commit whose values are
         // trusted, never from the build under test.
+        //
+        // The digest is of the v1 layout (every feature f64), which is what 6887c41 wrote;
+        // each arm's shipped v2 table is checked against its v1 run narrowed, as in
+        // `extended_features_match_the_pre_permutation_build`.
         const GOLDEN_DIGEST: Option<u64> = if cfg!(target_os = "windows") {
             Some(0x7eaa_3aa3_e1bc_0502)
         } else if cfg!(target_os = "linux") {
@@ -6535,10 +6720,11 @@ mod tests {
             ("unbounded", false, BoundsSource::Learn),
         ];
         for (tag, bound_features, bounds) in arms {
-            let out = dir
-                .join(format!("kernel_{tag}.parquet"))
-                .to_string_lossy()
-                .to_string();
+            let path = |layout: &str| {
+                dir.join(format!("kernel_{tag}_{layout}.parquet"))
+                    .to_string_lossy()
+                    .to_string()
+            };
             let mut cfg = FeaturesConfig {
                 set: FeatureSet::Extended,
                 emit_pin: false,
@@ -6547,27 +6733,43 @@ mod tests {
                 ..Default::default()
             };
             cfg.ms1_precursor_features = true;
-            run_chunked(
-                FeaturesParams {
-                    psms: &psms,
-                    chromatograms: &chrom,
-                    seed: None,
-                    out: &out,
-                    out_pin: "",
-                    cfg: &cfg,
-                    config_hash: "test",
-                },
-                300,
-                usize::MAX,
-                PinFinish::Normal,
-                bounds,
-                LoaderSource::Leased,
-            )
-            .unwrap();
-            let (rows, ncols, digest) = features_digest(&out);
+            let run = |out: &str| {
+                run_chunked(
+                    FeaturesParams {
+                        psms: &psms,
+                        chromatograms: &chrom,
+                        seed: None,
+                        out,
+                        out_pin: "",
+                        cfg: &cfg,
+                        config_hash: "test",
+                    },
+                    300,
+                    usize::MAX,
+                    PinFinish::Normal,
+                    bounds,
+                    LoaderSource::Leased,
+                )
+                .unwrap()
+            };
+            let out1 = path("v1");
+            with_v1_layout(|| run(&out1));
+            let (rows, ncols, digest) = features_digest(&out1);
             assert_eq!((rows, ncols), (400, 398), "arm {tag}: table shape moved");
             eprintln!("arm {tag}: 0x{digest:016x}");
             fnv(&mut h, &digest.to_le_bytes());
+
+            let out2 = path("v2");
+            run(&out2);
+            assert!(
+                assert_v2_layout(&out2) > 300,
+                "arm {tag}: too few f32 columns"
+            );
+            assert_eq!(
+                features_digest(&out2),
+                features_digest_as_v2(&out1),
+                "arm {tag}: the v2 table is not the v1 table with its f32 columns narrowed"
+            );
         }
         match GOLDEN_DIGEST {
             Some(golden) => assert_eq!(
@@ -6579,6 +6781,124 @@ mod tests {
                 eprintln!("no kernel digest is recorded for this platform; it computes 0x{h:016x}")
             }
         }
+    }
+
+    #[test]
+    fn both_feature_layouts_compete_and_score_identically() {
+        // The v2 layout stores most features as `v as f32`, the conversion every classifier
+        // applies when it reads a value, so nothing after the features table may move. The
+        // same features run in both layouts here, through compete and the default
+        // (`native_tda`) rescore, and the scored tables are compared byte for byte:
+        //
+        // - each features table rescored directly as a competed table, which is what
+        //   compete published for it when every row survived. The v1 table is then a v3
+        //   competed table, so this is the old-version reader against the new one;
+        // - each through compete under the shipped grouping: the v1 table cannot be reused
+        //   byte for byte and is rewritten into the v4 layout, narrowed on the way;
+        // - each through compete under `base_peptide` + `unique_evidence`, the one mode
+        //   that reads feature values, from the columns that stay f64.
+        let dir =
+            std::env::temp_dir().join(format!("mumdia_features_layouts_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = |name: &str| dir.join(name).to_string_lossy().to_string();
+        let (psms, chrom) = craft_kernel_inputs(&dir, 400, EXTRACT_CHROM_GROUP_ROWS);
+        let mut cfg = FeaturesConfig {
+            set: FeatureSet::Extended,
+            emit_pin: false,
+            bound_from_confident: false,
+            ..Default::default()
+        };
+        cfg.ms1_precursor_features = true;
+        let features = |out: &str| {
+            run(FeaturesParams {
+                psms: &psms,
+                chromatograms: &chrom,
+                seed: None,
+                out,
+                out_pin: "",
+                cfg: &cfg,
+                config_hash: "test",
+            })
+            .unwrap()
+        };
+        let (f1, f2) = (p("features_v1.parquet"), p("features_v2.parquet"));
+        with_v1_layout(|| features(&f1));
+        features(&f2);
+        assert_v2_layout(&f2);
+        assert_eq!(features_digest(&f2), features_digest_as_v2(&f1));
+
+        let compete = |features: &str, out: &str, c: &mumdia_core::config::CompeteConfig| {
+            crate::stages::compete::run(crate::stages::compete::CompeteParams {
+                features,
+                out,
+                cfg: c,
+                config_hash: "test",
+                features_hash: None,
+            })
+            .unwrap();
+            let rep: ArtifactReport =
+                mumdia_io::json::read_json(&format!("{out}.report.json")).unwrap();
+            assert_eq!(rep.schema_version, artifact::PSMS_COMPETED.1);
+            rep.stats["publish"].as_str().unwrap().to_string()
+        };
+        let rcfg = mumdia_core::config::RescoreConfig::default();
+        let rescore = |competed: &str, out: &str| -> Vec<u8> {
+            crate::stages::rescore::run(crate::stages::rescore::RescoreParams {
+                competed: &[competed.to_string()],
+                sources: None,
+                out,
+                work_dir: &p("work"),
+                script_dir: "scripts",
+                cfg: &rcfg,
+                config_hash: "test",
+            })
+            .unwrap();
+            std::fs::read(out).unwrap()
+        };
+
+        let direct1 = rescore(&f1, &p("scored_direct_v1.parquet"));
+        let direct2 = rescore(&f2, &p("scored_direct_v2.parquet"));
+        assert!(!direct1.is_empty());
+        assert!(
+            direct1 == direct2,
+            "a v3 and a v4 competed table score differently"
+        );
+
+        let shipped = mumdia_core::config::CompeteConfig::default();
+        let (c1, c2) = (p("competed_v1.parquet"), p("competed_v2.parquet"));
+        assert_eq!(compete(&f1, &c1, &shipped), "rewritten");
+        let published = compete(&f2, &c2, &shipped);
+        assert_ne!(published, "rewritten", "the v2 table was not reused");
+        assert_v2_layout(&c1);
+        assert_eq!(features_digest(&c1), features_digest(&c2));
+        assert!(
+            rescore(&c1, &p("scored_v1.parquet")) == rescore(&c2, &p("scored_v2.parquet")),
+            "compete of the two layouts scores differently"
+        );
+
+        let unique = mumdia_core::config::CompeteConfig {
+            group_by: mumdia_core::config::CompeteGroupBy::BasePeptide,
+            mode: mumdia_core::config::CompetitionMode::UniqueEvidence,
+            unique_evidence_min_fragments: 4,
+            ..Default::default()
+        };
+        let (u1, u2) = (p("unique_v1.parquet"), p("unique_v2.parquet"));
+        compete(&f1, &u1, &unique);
+        compete(&f2, &u2, &unique);
+        let kept = |t: &str| TableFile::open(t).unwrap().u32("candidate_id").unwrap();
+        let (k1, k2) = (kept(&u1), kept(&u2));
+        assert!(
+            k1.len() < 400,
+            "unique_evidence removed nothing: {}",
+            k1.len()
+        );
+        assert_eq!(k1, k2, "unique_evidence kept different candidates");
+        assert_eq!(features_digest(&u1), features_digest(&u2));
+        assert!(
+            rescore(&u1, &p("scored_u1.parquet")) == rescore(&u2, &p("scored_u2.parquet")),
+            "unique_evidence compete of the two layouts scores differently"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6627,11 +6947,14 @@ mod tests {
             .unwrap();
             out
         };
-        let one = run("one", 1 << 20, usize::MAX);
-        let many = run("many", 1, usize::MAX);
+        // The v1 layout (every feature f64), so a value that moves in its last f64 ulp
+        // is seen even where narrowing it to f32 would hide the difference. The shipped
+        // f32 layout is compared across the same boundaries below.
+        let one = with_v1_layout(|| run("one", 1 << 20, usize::MAX));
+        let many = with_v1_layout(|| run("many", 1, usize::MAX));
         // And chunks closed by the PSM-row limit rather than the chromatogram one: a
         // different set of boundaries again, over the same candidates.
-        let psm_capped = run("psmcap", 1 << 20, 3);
+        let psm_capped = with_v1_layout(|| run("psmcap", 1 << 20, 3));
 
         // Values only, and deliberately so: 61 rows is one row group, so these three files
         // happen to be byte-identical as well, but that is an artefact of the fixture's
@@ -6668,14 +6991,61 @@ mod tests {
             }
         }
         assert!(checked > 300, "only {checked} f64 columns compared");
-        // The cross-charge reduction is a whole-run quantity: three charge states per
-        // peptidoform, so it must read 3 for the peptidoforms that have all three.
-        let n_charge = a.f64("n_charge_states").unwrap();
+
+        // The shipped layout over the same three chunkings: every f32 and every f64 column
+        // bit for bit.
+        let v2: Vec<mumdia_io::table::Table> = [
+            run("one_v2", 1 << 20, usize::MAX),
+            run("many_v2", 1, usize::MAX),
+            run("psmcap_v2", 1 << 20, 3),
+        ]
+        .iter()
+        .map(|p| {
+            assert_v2_layout(p);
+            mumdia_io::table::Table::read(p).unwrap()
+        })
+        .collect();
+        assert_eq!(v2[0].column_names(), a.column_names());
+        let (mut n32, mut n64) = (0usize, 0usize);
+        for name in v2[0].column_names() {
+            if let Ok(x) = v2[0].f32(&name) {
+                let bits = |v: &[f32]| v.iter().map(|q| q.to_bits()).collect::<Vec<u32>>();
+                for (t, what) in [(&v2[1], "chunk sizes"), (&v2[2], "the PSM cap")] {
+                    assert_eq!(
+                        bits(&x),
+                        bits(&t.f32(&name).unwrap()),
+                        "f32 column '{name}' differs under {what}"
+                    );
+                }
+                n32 += 1;
+            } else if let Ok(x) = v2[0].f64(&name) {
+                let bits = |v: &[f64]| v.iter().map(|q| q.to_bits()).collect::<Vec<u64>>();
+                for (t, what) in [(&v2[1], "chunk sizes"), (&v2[2], "the PSM cap")] {
+                    assert_eq!(
+                        bits(&x),
+                        bits(&t.f64(&name).unwrap()),
+                        "f64 column '{name}' differs under {what}"
+                    );
+                }
+                n64 += 1;
+            }
+        }
         assert!(
-            n_charge.contains(&3.0),
-            "the charge-state count never reached 3"
+            n32 > 300 && n64 >= 5,
+            "only {n32} f32 and {n64} f64 columns compared"
         );
-        assert!(n_charge.iter().all(|&v| (1.0..=3.0).contains(&v)));
+
+        // The cross-charge reduction is a whole-run quantity: three charge states per
+        // peptidoform, so it must read 3 for the peptidoforms that have all three. Read
+        // from both layouts: an f32 count is the same small integer.
+        for t in [&a, &v2[0]] {
+            let n_charge = t.f64_widening("n_charge_states").unwrap();
+            assert!(
+                n_charge.contains(&3.0),
+                "the charge-state count never reached 3"
+            );
+            assert!(n_charge.iter().all(|&v| (1.0..=3.0).contains(&v)));
+        }
     }
 
     /// The kernel fixture's chunk plan: `(first chromatogram row, rows)` per chunk.

@@ -26,8 +26,12 @@ pub mod artifact {
     pub const RUN_WINDOWS: (&str, u32) = ("run_windows", 1);
     pub const PSMS_EXTRACTED: (&str, u32) = ("psms_extracted", 2);
     pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 1);
-    pub const FEATURES: (&str, u32) = ("features", 1);
-    pub const PSMS_COMPETED: (&str, u32) = ("psms_competed", 3);
+    /// v2: the feature columns are Float32 except the few `F64_FEATURE_COLUMNS` of
+    /// `stages/features.rs`; v1 stored every feature as Float64. Every reader accepts both.
+    pub const FEATURES: (&str, u32) = ("features", 2);
+    /// v4: the feature columns are stored as in `features` v2; v3 stored every feature as
+    /// Float64. Every reader accepts both, and compete given a v1 features table writes v4.
+    pub const PSMS_COMPETED: (&str, u32) = ("psms_competed", 4);
     pub const PSMS_SCORED: (&str, u32) = ("psms_scored", 4);
     pub const PEPTIDE_QUANT: (&str, u32) = ("peptide_quant", 2);
     pub const PROTEIN_GROUP_QUANT: (&str, u32) = ("protein_group_quant", 2);
