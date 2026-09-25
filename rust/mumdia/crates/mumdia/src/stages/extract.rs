@@ -2194,6 +2194,69 @@ fn decode_unlent(p: &ExtractParams) -> Result<(Option<Vec<Ms2Scan>>, Option<Vec<
     }
 }
 
+/// The per-candidate RT windows as extract uses them: three dense arrays indexed by
+/// candidate id, `rt_cal[c]`, `rt_lo[c]` and `rt_hi[c]`.
+struct DenseRtWindows {
+    rt_cal: Vec<f64>,
+    rt_lo: Vec<f64>,
+    rt_hi: Vec<f64>,
+}
+
+/// Read `run_windows` and scatter it into the dense arrays for a library of `ncand`
+/// candidates.
+///
+/// The decoded columns (`candidate_id`, `rt_pred_cal`, `rt_lo`, `rt_hi`: 28 bytes per
+/// row) are dropped when this returns, rather than living until the end of the stage
+/// beside the 24-byte-per-candidate dense copy they were scattered into. On an unbounded
+/// 203M-candidate library that is 5.7 GB that used to sit through the whole extraction.
+fn read_run_windows(path: &str, ncand: usize) -> Result<DenseRtWindows> {
+    let rw = TableFile::open(path)?;
+    let rw_cid = rw.u32("candidate_id")?;
+    let rw_cal = rw.f64("rt_pred_cal")?;
+    let rw_lo = rw.f64("rt_lo")?;
+    let rw_hi = rw.f64("rt_hi")?;
+    let mut rt_lo = vec![f64::NEG_INFINITY; ncand];
+    let mut rt_hi = vec![f64::INFINITY; ncand];
+    // NaN, not 0.0, for a candidate with no `run_windows` row. Stage B already uses NaN
+    // as the explicit "calibration unavailable" sentinel (`candidate_window`), and
+    // `calibrated_rt_error` maps a non-finite value to 0.0, i.e. no RT evidence. A 0.0
+    // here is *finite*, so it used to produce `rt_error_abs = apex_rt`, the worst possible
+    // value, for exactly the candidates the other path gives the best value to. That made
+    // the feature a proxy for "was this candidate in the window table", which is not a
+    // property of the spectrum. One sentinel, one meaning.
+    let mut rt_cal = vec![f64::NAN; ncand];
+    for i in 0..rw.nrows {
+        let c = rw_cid[i] as usize;
+        if c < ncand {
+            // The eight RT-window guards downstream are all `rt < rt_lo || rt > rt_hi`,
+            // which is false for NaN, so a NaN bound does not reject the scan, it accepts
+            // *every* scan: the candidate is searched across the whole gradient with no RT
+            // prior and no warning. The legitimate unbounded case is written as explicit
+            // -inf/+inf by `candidate_window`, so a NaN here can only mean a corrupt or
+            // externally-written window table. Reject it while the row can be named.
+            if rw_lo[i].is_nan() || rw_hi[i].is_nan() {
+                anyhow::bail!(
+                    "run_windows row {i} (candidate_id {c}) has a NaN RT bound \
+                     (rt_lo={}, rt_hi={}); an unbounded window must be written as \
+                     -inf/+inf, because a NaN bound silently matches every scan instead \
+                     of being rejected. Re-run rt-im-train to regenerate {}",
+                    rw_lo[i],
+                    rw_hi[i],
+                    path
+                );
+            }
+            rt_lo[c] = rw_lo[i];
+            rt_hi[c] = rw_hi[i];
+            rt_cal[c] = rw_cal[i];
+        }
+    }
+    Ok(DenseRtWindows {
+        rt_cal,
+        rt_lo,
+        rt_hi,
+    })
+}
+
 pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     let t0 = Instant::now();
     // Neither output may be one of the inputs (docs/31 F6).
@@ -2273,47 +2336,12 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
     };
 
     // run windows indexed by candidate_id
-    let rw = TableFile::open(p.run_windows)?;
-    let rw_cid = rw.u32("candidate_id")?;
-    let rw_cal = rw.f64("rt_pred_cal")?;
-    let rw_lo = rw.f64("rt_lo")?;
-    let rw_hi = rw.f64("rt_hi")?;
     let ncand = lib.n_candidates();
-    let mut rt_lo = vec![f64::NEG_INFINITY; ncand];
-    let mut rt_hi = vec![f64::INFINITY; ncand];
-    // NaN, not 0.0, for a candidate with no `run_windows` row. Stage B already uses NaN
-    // as the explicit "calibration unavailable" sentinel (`candidate_window`), and
-    // `calibrated_rt_error` maps a non-finite value to 0.0, i.e. no RT evidence. A 0.0
-    // here is *finite*, so it used to produce `rt_error_abs = apex_rt`, the worst possible
-    // value, for exactly the candidates the other path gives the best value to. That made
-    // the feature a proxy for "was this candidate in the window table", which is not a
-    // property of the spectrum. One sentinel, one meaning.
-    let mut rt_cal = vec![f64::NAN; ncand];
-    for i in 0..rw.nrows {
-        let c = rw_cid[i] as usize;
-        if c < ncand {
-            // The eight RT-window guards downstream are all `rt < rt_lo || rt > rt_hi`,
-            // which is false for NaN, so a NaN bound does not reject the scan, it accepts
-            // *every* scan: the candidate is searched across the whole gradient with no RT
-            // prior and no warning. The legitimate unbounded case is written as explicit
-            // -inf/+inf by `candidate_window`, so a NaN here can only mean a corrupt or
-            // externally-written window table. Reject it while the row can be named.
-            if rw_lo[i].is_nan() || rw_hi[i].is_nan() {
-                anyhow::bail!(
-                    "run_windows row {i} (candidate_id {c}) has a NaN RT bound \
-                     (rt_lo={}, rt_hi={}); an unbounded window must be written as \
-                     -inf/+inf, because a NaN bound silently matches every scan instead \
-                     of being rejected. Re-run rt-im-train to regenerate {}",
-                    rw_lo[i],
-                    rw_hi[i],
-                    p.run_windows
-                );
-            }
-            rt_lo[c] = rw_lo[i];
-            rt_hi[c] = rw_hi[i];
-            rt_cal[c] = rw_cal[i];
-        }
-    }
+    let DenseRtWindows {
+        rt_cal,
+        rt_lo,
+        rt_hi,
+    } = read_run_windows(p.run_windows, ncand)?;
 
     // Decoded here unless the caller lent its own copies (see `ExtractParams::scans` and
     // `decode_unlent`); on the fragindex path the decode already ran, concurrently with the

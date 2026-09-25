@@ -69,11 +69,14 @@ the CLI in `main.rs:535` (`Cmd::Extract`) and from the orchestrator in
   skips building the bucketed `page_search` index when the fragindex backend is
   selected (`index.rs:73`).
 - `run_windows` (Parquet): per-candidate RT windows, columns `candidate_id`,
-  `rt_pred_cal`, `rt_lo`, `rt_hi` (read at `extract.rs:1330`, scattered into the
-  dense `rt_lo`/`rt_hi`/`rt_cal` arrays indexed by `candidate_id`,
-  `extract.rs:1342`). Candidates with no window row keep `[-inf, +inf]` and
-  `rt_cal = 0.0` (`extract.rs:1336`); the `0.0` disables the Gaussian RT prior for
-  those candidates (the prior requires `rt_cal > 0`, `extract.rs:1855`).
+  `rt_pred_cal`, `rt_lo`, `rt_hi`, read by `read_run_windows` and scattered into the
+  dense `rt_lo`/`rt_hi`/`rt_cal` arrays indexed by `candidate_id`. The decoded
+  columns (28 bytes per row) are dropped as soon as the scatter is done, so only the
+  24-byte-per-candidate dense copy lives through the extraction. Candidates with no
+  window row keep `[-inf, +inf]` and `rt_cal = NaN`, the same "calibration
+  unavailable" sentinel `rt-im-train` writes; the NaN disables the Gaussian RT prior
+  for those candidates (the prior requires `rt_cal > 0`). A NaN `rt_lo` or `rt_hi` is
+  rejected with the row named, because a NaN bound would match every scan.
 - `ms1` (optional Parquet): MS1 scans via `load_ms1` (`extract.rs:1350`). When
   absent, all MS1 columns are null.
 - `mass_cal` (optional JSON, the seed's `<seed>.masscal.json`): reads
