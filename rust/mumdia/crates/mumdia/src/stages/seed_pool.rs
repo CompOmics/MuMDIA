@@ -342,25 +342,53 @@ fn combine_band_scalars(p: &SeedPoolParams) -> Result<MassCal> {
 /// Rewrite `seed_in` to `seed_out` with each row's `predicted_irt` taken from the band
 /// table that holds its candidate (`bands`: precursor table with band-local ids, and the
 /// band's first library row). Rows outside every band keep their value.
+///
+/// Bands are applied in order, so where two bands hold one candidate (windows overlapping
+/// a cut) the later band's value stays, as it always did.
+///
+/// Two shortcuts, each with the general path behind it:
+/// - A band file's ids are its rows `0..n` (`groups::write_band_slice` writes them so),
+///   and then the iRT of local id `l` is simply row `l`. A band table whose ids are not
+///   dense and ascending is looked up through a map, last row winning, as before.
+/// - The pooled seed is written sorted by candidate id (`seed_pool::run`), so the rows a
+///   band can refresh, ids `offset..offset + n`, are one slice found by binary search,
+///   instead of a pass over every row per band: 63 bands made that 63 passes over the whole
+///   pooled seed. An unsorted input is scanned whole.
 pub fn refresh_irt(seed_in: &str, seed_out: &str, bands: &[(String, u32)]) -> Result<u64> {
     let t0 = Instant::now();
     let mut rows = read_rows(seed_in, 0)?;
     let t = TableFile::open(seed_in)?;
     let q = t.f64("spectrum_q")?;
     let mut refreshed = 0usize;
+    let sorted = rows.windows(2).all(|w| w[0].cid <= w[1].cid);
     for (path, offset) in bands {
         let b = TableFile::open(path)?;
         let cid = b.u32("candidate_id")?;
         let irt = b.f32("predicted_irt")?;
         let n = b.nrows;
-        let by_local: HashMap<u32, f32> = cid.into_iter().zip(irt).collect();
-        for r in rows.iter_mut() {
+        let dense = cid.iter().enumerate().all(|(i, &c)| c as usize == i);
+        let by_local: Option<HashMap<u32, f32>> =
+            (!dense).then(|| cid.iter().copied().zip(irt.iter().copied()).collect());
+        let lookup = |local: u32| -> Option<f32> {
+            match &by_local {
+                Some(m) => m.get(&local).copied(),
+                None => irt.get(local as usize).copied(),
+            }
+        };
+        let span = if sorted {
+            let (lo, hi) = (*offset as u64, *offset as u64 + n as u64);
+            rows.partition_point(|r| (r.cid as u64) < lo)
+                ..rows.partition_point(|r| (r.cid as u64) < hi)
+        } else {
+            0..rows.len()
+        };
+        for r in rows[span].iter_mut() {
             let Some(local) = r.cid.checked_sub(*offset) else {
                 continue;
             };
             if (local as usize) < n {
-                if let Some(v) = by_local.get(&local) {
-                    r.irt = *v;
+                if let Some(v) = lookup(local) {
+                    r.irt = v;
                     refreshed += 1;
                 }
             }
@@ -520,6 +548,99 @@ mod tests {
             .f32("predicted_irt")
             .unwrap();
         assert_eq!(irt, vec![1.0, 2.0, 3.0, 40.0, 50.0, 60.0]);
+    }
+
+    /// The per-row map over every row for every band, verbatim: the reference the sliced,
+    /// direct-indexed `refresh_irt` is compared against byte for byte.
+    fn refresh_irt_reference(seed_in: &str, seed_out: &str, bands: &[(String, u32)]) {
+        let mut rows = read_rows(seed_in, 0).unwrap();
+        let q = TableFile::open(seed_in).unwrap().f64("spectrum_q").unwrap();
+        for (path, offset) in bands {
+            let b = TableFile::open(path).unwrap();
+            let cid = b.u32("candidate_id").unwrap();
+            let irt = b.f32("predicted_irt").unwrap();
+            let n = b.nrows;
+            let by_local: HashMap<u32, f32> = cid.into_iter().zip(irt).collect();
+            for r in rows.iter_mut() {
+                let Some(local) = r.cid.checked_sub(*offset) else {
+                    continue;
+                };
+                if (local as usize) < n {
+                    if let Some(v) = by_local.get(&local) {
+                        r.irt = *v;
+                    }
+                }
+            }
+        }
+        write_rows(seed_out, &rows, q).unwrap();
+    }
+
+    /// `refresh_irt` over a seed sorted by candidate (the pooled seed) and over an
+    /// unsorted one, with overlapping bands (the later wins), a band ending past the last
+    /// row, a band starting at 0, and a band table whose ids are not its rows (shuffled
+    /// and with a repeat): the bytes of the old whole-row, map-lookup version.
+    #[test]
+    fn the_sliced_refresh_writes_what_the_per_row_map_wrote() {
+        let dir =
+            std::env::temp_dir().join(format!("mumdia_seed_pool_refresh_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |t: &str| dir.join(t).to_str().unwrap().to_string();
+        let n = 40usize;
+        let sorted: Vec<u32> = (0..n as u32).map(|i| i * 2 + 1).collect();
+        let mut unsorted = sorted.clone();
+        unsorted.reverse();
+        unsorted.swap(3, 17);
+        let band = |tag: &str, ids: Vec<u32>, irt0: f32| -> String {
+            let p = path(tag);
+            let k = ids.len();
+            write_table(
+                &p,
+                vec![
+                    Col::U32("candidate_id".into(), ids),
+                    Col::F32(
+                        "predicted_irt".into(),
+                        (0..k).map(|i| irt0 + i as f32).collect(),
+                    ),
+                ],
+            )
+            .unwrap();
+            p
+        };
+        let bands = vec![
+            (band("b0.parquet", (0..30).collect(), 100.0), 0u32),
+            // Overlaps the first band from global 20: the later band wins there.
+            (band("b1.parquet", (0..25).collect(), 500.0), 20),
+            // Runs past the last seed row.
+            (band("b2.parquet", (0..60).collect(), 900.0), 50),
+            // Ids that are not the rows: shuffled, with local 3 twice (last wins).
+            (band("b3.parquet", vec![5, 3, 0, 3, 9, 1], 2000.0), 60),
+        ];
+        for (tag, cids) in [("sorted", &sorted), ("unsorted", &unsorted)] {
+            let seed_in = path(&format!("seed_{tag}.parquet"));
+            let labels: Vec<&str> = (0..n)
+                .map(|i| if i % 3 == 0 { "decoy" } else { "target" })
+                .collect();
+            let scores: Vec<f64> = (0..n).map(|i| (n - i) as f64).collect();
+            let irt: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            write_seed(&seed_in, cids, &scores, &labels, &irt);
+            let (a, b) = (
+                path(&format!("new_{tag}.parquet")),
+                path(&format!("ref_{tag}.parquet")),
+            );
+            refresh_irt(&seed_in, &a, &bands).unwrap();
+            refresh_irt_reference(&seed_in, &b, &bands);
+            assert_eq!(
+                std::fs::read(&a).unwrap(),
+                std::fs::read(&b).unwrap(),
+                "{tag}: the refreshed seed differs from the per-row map's"
+            );
+            let changed = TableFile::open(&a).unwrap().f32("predicted_irt").unwrap();
+            assert!(
+                changed.iter().zip(&irt).any(|(x, y)| x != y),
+                "{tag}: no row was refreshed, so the comparison proves nothing"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
