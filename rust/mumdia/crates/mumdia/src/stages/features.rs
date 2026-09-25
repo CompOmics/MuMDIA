@@ -3531,8 +3531,9 @@ fn fragment_features(
     let noise = if all_points.is_empty() {
         1.0
     } else {
-        all_points.sort_by(|a, b| a.total_cmp(b));
-        all_points[all_points.len() / 2].max(1.0)
+        // One order statistic, by selection: bit-identical to indexing the sorted copy.
+        let mid = all_points.len() / 2;
+        order_stat(&mut all_points, mid).max(1.0)
     };
     f.log_sn = ((apex_val + 1.0) / (noise + 1.0)).ln();
     f
@@ -3552,6 +3553,67 @@ fn mean(v: &[f64]) -> f64 {
         0.0
     } else {
         v.iter().sum::<f64>() / v.len() as f64
+    }
+}
+
+/// The `k`-th smallest value of `v` under `f64::total_cmp`, by selection (O(n)) rather than
+/// by sorting a copy (O(n log n)). `v` is permuted.
+///
+/// Bit-identical to `sorted[k]` of the sort it replaces: `total_cmp` is a total order in
+/// which two values compare equal only when their bit patterns are equal, so the sorted
+/// sequence of a multiset is unique bit for bit, whatever algorithm produced it (stable or
+/// not), and every order statistic is determined by the multiset alone.
+fn order_stat(v: &mut [f64], k: usize) -> f64 {
+    *v.select_nth_unstable_by(k, f64::total_cmp).1
+}
+
+/// The median of a NON-EMPTY `v` exactly as the families computed it from a sorted copy:
+/// the middle value, or for an even length `0.5 * (s[n / 2 - 1] + s[n / 2])`. After
+/// selecting position `n / 2`, the lower half holds the `n / 2` smallest values, so its
+/// maximum under `total_cmp` is `s[n / 2 - 1]`. `v` is permuted.
+fn median_select(v: &mut [f64]) -> f64 {
+    let n = v.len();
+    let hi = order_stat(v, n / 2);
+    if n % 2 == 1 {
+        hi
+    } else {
+        let lo = v[..n / 2]
+            .iter()
+            .copied()
+            .max_by(f64::total_cmp)
+            .expect("an even-length median has a lower half");
+        0.5 * (lo + hi)
+    }
+}
+
+/// The linearly interpolated `q`-quantile exactly as a sorted copy gave it (position
+/// `q * (n - 1)`, `s[lo] * (1 - frac) + s[hi] * frac` between the two neighbouring order
+/// statistics; 0 for an empty `v`, the value itself for one). After selecting `lo`, every
+/// value to its right is at least `s[lo]`, so their minimum is `s[lo + 1]`. `v` is
+/// permuted, and two calls on the same buffer are as good as two sorted copies, because
+/// selection depends on the multiset only.
+fn quantile_select(v: &mut [f64], q: f64) -> f64 {
+    let n = v.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n == 1 {
+        return v[0];
+    }
+    let pos = q * (n - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    let s_lo = order_stat(v, lo);
+    if lo == hi {
+        s_lo
+    } else {
+        let s_hi = v[lo + 1..]
+            .iter()
+            .copied()
+            .min_by(f64::total_cmp)
+            .expect("a value above the lower neighbour");
+        let frac = pos - lo as f64;
+        s_lo * (1.0 - frac) + s_hi * frac
     }
 }
 
@@ -4089,6 +4151,80 @@ mod tests {
             }
         }
         assert_eq!(checked, 48 * 8 * 2 * 2);
+    }
+
+    #[test]
+    fn order_statistics_by_selection_equal_the_sorted_copy_bit_for_bit() {
+        // The sort-based median and quantiles exactly as the families wrote them, against
+        // selection, on vectors with ties, zeros of both signs, subnormals, infinities and
+        // NaN (which `total_cmp` orders like any other value).
+        fn old_median(v: &[f64]) -> f64 {
+            let mut s = v.to_vec();
+            s.sort_by(|a, b| a.total_cmp(b));
+            let n = s.len();
+            if n % 2 == 1 {
+                s[n / 2]
+            } else {
+                0.5 * (s[n / 2 - 1] + s[n / 2])
+            }
+        }
+        fn old_quantile(v: &[f64], q: f64) -> f64 {
+            let mut s = v.to_vec();
+            s.sort_by(|a, b| a.total_cmp(b));
+            let n = s.len();
+            if n == 0 {
+                return 0.0;
+            }
+            if n == 1 {
+                return s[0];
+            }
+            let pos = q * (n - 1) as f64;
+            let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+            if lo == hi {
+                s[lo]
+            } else {
+                let frac = pos - lo as f64;
+                s[lo] * (1.0 - frac) + s[hi] * frac
+            }
+        }
+        let mut rng = Lcg(0x0bad_cafe_d00d_f00d);
+        for n in 1..70usize {
+            for kind in 0..4u32 {
+                let v: Vec<f64> = (0..n)
+                    .map(|_| match (kind, rng.below(12)) {
+                        (0, _) => rng.unit() * 100.0,
+                        (1, r) => (r % 4) as f64, // heavy ties
+                        (2, 0) => -0.0,
+                        (2, 1) => 0.0,
+                        (2, 2) => f64::MIN_POSITIVE / 8.0,
+                        (2, 3) => f64::INFINITY,
+                        (2, _) => rng.unit() - 0.5,
+                        (_, 0) => f64::NAN,
+                        (_, _) => rng.unit(),
+                    })
+                    .collect();
+                let bits = |x: f64| x.to_bits();
+                assert_eq!(
+                    bits(median_select(&mut v.clone())),
+                    bits(old_median(&v)),
+                    "median, n {n}, kind {kind}"
+                );
+                let mut buf = v.clone();
+                for q in [0.75, 0.25, 0.0, 1.0, 0.5, 1.0 / 3.0] {
+                    assert_eq!(
+                        bits(quantile_select(&mut buf, q)),
+                        bits(old_quantile(&v, q)),
+                        "quantile {q}, n {n}, kind {kind}"
+                    );
+                }
+                let mut sorted = v.clone();
+                sorted.sort_by(|a, b| a.total_cmp(b));
+                for k in [0, n / 2, n - 1] {
+                    assert_eq!(bits(order_stat(&mut v.clone(), k)), bits(sorted[k]));
+                }
+            }
+        }
+        assert_eq!(quantile_select(&mut [], 0.5), 0.0);
     }
 
     #[test]

@@ -474,46 +474,24 @@ fn std_pop(v: &[f64]) -> f64 {
     }
 }
 
+/// Median by selection (`super::median_select`), bit-identical to the sorted copy it
+/// replaced; 0 for an empty `v`.
 fn median(v: &[f64]) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
-    let mut s = v.to_vec();
-    s.sort_by(|a, b| a.total_cmp(b));
-    let n = s.len();
-    if n % 2 == 1 {
-        s[n / 2]
-    } else {
-        0.5 * (s[n / 2 - 1] + s[n / 2])
-    }
+    super::median_select(&mut v.to_vec())
 }
 
-fn quantile_sorted(s: &[f64], q: f64) -> f64 {
-    let n = s.len();
-    if n == 0 {
-        return 0.0;
-    }
-    if n == 1 {
-        return s[0];
-    }
-    let pos = q * (n - 1) as f64;
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil() as usize;
-    if lo == hi {
-        s[lo]
-    } else {
-        let frac = pos - lo as f64;
-        s[lo] * (1.0 - frac) + s[hi] * frac
-    }
-}
-
+/// Interquartile range by selection (`super::quantile_select`), bit-identical to the two
+/// quantiles of the sorted copy it replaced; 0 below two values.
 fn iqr(v: &[f64]) -> f64 {
     if v.len() < 2 {
         return 0.0;
     }
     let mut s = v.to_vec();
-    s.sort_by(|a, b| a.total_cmp(b));
-    quantile_sorted(&s, 0.75) - quantile_sorted(&s, 0.25)
+    let q75 = super::quantile_select(&mut s, 0.75);
+    q75 - super::quantile_select(&mut s, 0.25)
 }
 
 fn argmax(v: &[f64]) -> usize {
