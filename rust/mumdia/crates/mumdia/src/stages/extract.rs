@@ -132,9 +132,11 @@ pub struct ExtractParams<'a> {
     /// Writing it back into the scans was harmless when each band decoded its own copy
     /// and silently corrupts every later band now. See the note above the probe loop.
     ///
-    /// The two are one field because extract needs both or neither: a caller that shares
-    /// the MS2 buffer but lets extract re-decode the MS1 would keep the saving it came
-    /// for and lose half the mappings again.
+    /// A grouped search lends both, because every band would otherwise decode the MS1
+    /// again. The ungrouped `run` lends only the MS2 its seed already decoded
+    /// (`SharedScans::ms1 = None`): it has no MS1 decode to share, and letting extract
+    /// decode it keeps that decode concurrent with the library load and after the
+    /// library's errors, where a standalone extract has it.
     pub scans: Option<SharedScans<'a>>,
 }
 
@@ -149,7 +151,10 @@ pub struct ExtractParams<'a> {
 #[derive(Clone, Copy)]
 pub struct SharedScans<'a> {
     pub ms2: &'a [Ms2Scan],
-    pub ms1: &'a [Ms1Scan],
+    /// `None`: the caller lends the MS2 only, and extract decodes the MS1 from
+    /// `ExtractParams::ms1` itself, as it would with nothing lent. Not a warning case,
+    /// unlike an empty slice, which says the caller meant to lend and had nothing.
+    pub ms1: Option<&'a [Ms1Scan]>,
 }
 
 /// One observed hit: scan RT, candidate-local fragment index, observed intensity
@@ -2131,11 +2136,13 @@ fn read_mass_cal(p: &ExtractParams) -> Result<MassCalRead> {
 /// buffer is used instead.
 ///
 /// An empty lent slice is never believed over a named path. A caller that lends
-/// `SharedScans { ms2, ms1: &[] }` while still passing `ms1: Some(path)` would otherwise
-/// lose every MS1 feature and every MS1 chromatogram row with no error and no warning,
-/// because both are guarded on `!ms1_scans.is_empty()` and simply write nothing. Decoding
-/// the named artifact instead costs nothing when the run really has no MS1 rows (the
-/// decode is then empty too) and makes the silent version impossible.
+/// `SharedScans { ms2, ms1: Some(&[]) }` while still passing `ms1: Some(path)` would
+/// otherwise lose every MS1 feature and every MS1 chromatogram row with no error and no
+/// warning, because both are guarded on `!ms1_scans.is_empty()` and simply write nothing.
+/// Decoding the named artifact instead costs nothing when the run really has no MS1 rows
+/// (the decode is then empty too) and makes the silent version impossible. A lent MS1 of
+/// `None` is the caller saying it lends the MS2 only; the MS1 is then decoded without a
+/// warning.
 #[allow(clippy::type_complexity)]
 fn decode_unlent(p: &ExtractParams) -> Result<(Option<Vec<Ms2Scan>>, Option<Vec<Ms1Scan>>)> {
     match p.scans {
@@ -2154,8 +2161,9 @@ fn decode_unlent(p: &ExtractParams) -> Result<(Option<Vec<Ms2Scan>>, Option<Vec<
             } else {
                 None
             };
-            let ms1 = match p.ms1 {
-                Some(path) if shared.ms1.is_empty() => {
+            let ms1 = match (p.ms1, shared.ms1) {
+                (Some(path), None) => Some(load_ms1(path)?),
+                (Some(path), Some([])) => {
                     let owned = load_ms1(path)?;
                     if !owned.is_empty() {
                         warn!(
@@ -2320,7 +2328,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             .unwrap_or_else(|| p.scans.map(|s| s.ms2).unwrap_or(&[])),
         owned_ms1
             .as_deref()
-            .unwrap_or_else(|| p.scans.map(|s| s.ms1).unwrap_or(&[])),
+            .unwrap_or_else(|| p.scans.and_then(|s| s.ms1).unwrap_or(&[])),
     );
     let ms1_rts: Vec<f64> = ms1_scans.iter().map(|s| s.rt_seconds).collect();
     info!(

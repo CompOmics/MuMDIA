@@ -621,7 +621,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     let ms1_scans = mumdia::spectra::load_ms1(&ms1).unwrap();
     let shared = stages::extract::SharedScans {
         ms2: &ms2_scans,
-        ms1: &ms1_scans,
+        ms1: Some(&ms1_scans),
     };
     let (psms_a1, chrom_a1, _) = run_one(Some(shared), &cal_a, "shared_a1");
     let (psms_b1, _chrom_b1, _) = run_one(Some(shared), &cal_b, "shared_b1");
@@ -717,7 +717,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
 
 /// An EMPTY lent MS1 slice must not be read as "this run has no MS1".
 ///
-/// `SharedScans { ms2, ms1: &[] }` with `ms1: Some(path)` is a caller bug -- a refactor
+/// `SharedScans { ms2, ms1: Some(&[]) }` with `ms1: Some(path)` is a caller bug -- a refactor
 /// that builds the struct before the MS1 is decoded, or a caller that wants only the MS2
 /// saving -- and before the guard it cost every MS1 feature and every `ms1_mono` /
 /// `ms1_iso1` / `ms1_iso2` chromatogram row, silently, because both are written under
@@ -759,7 +759,7 @@ fn extract_does_not_believe_an_empty_lent_ms1_over_a_named_one() {
     let (psms_lent, chrom_lent) = run_one(
         Some(stages::extract::SharedScans {
             ms2: &ms2_scans,
-            ms1: &[],
+            ms1: Some(&[]),
         }),
         "ms1_lent_empty",
     );
@@ -778,7 +778,10 @@ fn extract_does_not_believe_an_empty_lent_ms1_over_a_named_one() {
     // The same rule for MS2: an empty lent slice means the caller had nothing to lend,
     // never that the run is empty.
     let (psms_no_ms2, chrom_no_ms2) = run_one(
-        Some(stages::extract::SharedScans { ms2: &[], ms1: &[] }),
+        Some(stages::extract::SharedScans {
+            ms2: &[],
+            ms1: Some(&[]),
+        }),
         "ms2_lent_empty",
     );
     assert_eq!(h(&psms_own), h(&psms_no_ms2));
@@ -886,8 +889,9 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
 /// The ungrouped `run` lends the seed's own MS2 decode to extract when no DeepLC step runs
 /// between them (`search_seed::run_returning_scans`). The scans the seed hands back must be
 /// exactly what `load_ms2` decodes, the seed must hand back nothing it was lent, and an
-/// extract over the handed-back scans (with the run's MS1) must write the bytes of an
-/// extract that decodes both artifacts itself.
+/// extract over the handed-back scans must write the bytes of an extract that decodes both
+/// artifacts itself: with the run's MS1 lent beside them, and with the MS2 lent alone
+/// (`ms1: None`, extract decoding the MS1), which is what `run` does.
 #[test]
 fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
     let (prec, frag) = craft_library();
@@ -945,9 +949,16 @@ fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
     let lent = extract(
         Some(stages::extract::SharedScans {
             ms2: &handed,
-            ms1: &ms1_scans,
+            ms1: Some(&ms1_scans),
         }),
         "lent",
+    );
+    let ms2_only = extract(
+        Some(stages::extract::SharedScans {
+            ms2: &handed,
+            ms1: None,
+        }),
+        "ms2_only",
     );
     let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
     assert!(
@@ -963,6 +974,39 @@ fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
         h(&own.1),
         h(&lent.1),
         "chromatograms differ over the lent decode"
+    );
+    assert_eq!(
+        (h(&own.0), h(&own.1)),
+        (h(&ms2_only.0), h(&ms2_only.1)),
+        "extract over a lent MS2 alone must decode the MS1 and write the same bytes"
+    );
+    // Guard: the MS1 has to reach the output, or the MS2-only arm would pass over an MS1
+    // decode nothing reads. The same extract over the lent MS2 with no MS1 artifact.
+    let no_ms1_psms = tmp("psms_handback_no_ms1.parquet");
+    stages::extract::run(stages::extract::ExtractParams {
+        fragment_offset: None,
+        sibling_bands: 1,
+        scans: Some(stages::extract::SharedScans {
+            ms2: &handed,
+            ms1: None,
+        }),
+        ms2: &ms2,
+        library_precursors: &prec,
+        library_fragments: &frag,
+        run_windows: &win,
+        ms1: None,
+        mass_cal: Some(&format!("{seed}.masscal.json")),
+        out_psms: &no_ms1_psms,
+        out_chrom: &tmp("chrom_handback_no_ms1.parquet"),
+        restrict_candidates: None,
+        cfg: &cfg.extract,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert_ne!(
+        h(&own.0),
+        h(&no_ms1_psms),
+        "the MS1 fixture does not reach psms_extracted, so the MS2-only arm is untested"
     );
 }
 

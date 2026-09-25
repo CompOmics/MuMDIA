@@ -630,7 +630,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 sibling_bands: par,
                 scans: Some(extract::SharedScans {
                     ms2: &ms2_scans,
-                    ms1: &ms1_scans,
+                    ms1: Some(&ms1_scans),
                 }),
             })?;
             recs.push(record_artifact(

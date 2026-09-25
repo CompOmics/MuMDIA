@@ -146,8 +146,11 @@ bucketed matcher keeps them in sequence, because its library load builds a sorte
 copy of every fragment and holding the scans through that transient would raise the
 peak. `run_returning_scans` hands the decoded scans back to the caller: the
 ungrouped `run` lends them to extract when no DeepLC step runs between seed and
-extract, so a run decodes its MS2 once (with a DeepLC step it does not, because the
-scans would then sit in the parent across the sidecar's peak). `load_ms2` sorts the
+extract and `extract.matcher` is `fragindex`, so a run decodes its MS2 once. With a
+DeepLC step it does not, because the scans would then sit in the parent across the
+sidecar's peak; with the bucketed extract matcher it does not either, because they
+would sit through that matcher's sorted library copy. Only the MS2 is lent: extract
+decodes the MS1 itself, concurrently with its library load. `load_ms2` sorts the
 returned `Vec<Ms2Scan>` by
 `rt_seconds` ascending (`spectra.rs:95`); this RT ordering is what makes the
 within-group strictly-greater update deterministic (earliest-RT wins a tie). It

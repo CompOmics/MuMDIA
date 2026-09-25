@@ -50,8 +50,13 @@ the CLI in `main.rs:535` (`Cmd::Extract`) and from the orchestrator in
   matcher the MS2 and MS1 decodes run concurrently with the library load and the
   index build; the mass calibration JSON is read first because its learned tolerance
   is the one the index is built at, and its log lines and errors keep their old place
-  after the spectra. A caller may lend both decodes (`ExtractParams::scans`); the
-  ungrouped `run` lends the seed's MS2 when no DeepLC step ran in between.
+  after the spectra. A caller may lend the decodes (`ExtractParams::scans`): a
+  grouped search lends both to every band, and the ungrouped `run` lends the seed's
+  MS2 alone (`SharedScans::ms1 = None`, so extract still decodes the MS1 concurrently
+  with its library load, and its errors keep their place after the library's). `run`
+  lends only when no DeepLC step ran in between and `extract.matcher` is `fragindex`:
+  the bucketed matcher's library load builds a sorted copy of every fragment, and scans
+  held from the seed would sit through that transient.
   Each `Ms2Scan` carries `rt_seconds`, an isolation `window` (`lower_mz`,
   `upper_mz`), and centroided `peaks` (`mz`, `intensity`). This stage applies no
   peak cap of its own: the MS2 peak budget is fixed at conversion time by
