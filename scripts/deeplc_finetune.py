@@ -846,8 +846,12 @@ def main():
             t_phase = time.perf_counter()
             base_model = load_base_model()
             timings["model_load"] = round(time.perf_counter() - t_phase, 3)
-        if shard_threads != torch.get_num_threads():
-            torch.set_num_threads(shard_threads)
+        # This process does the whole projection (a miss) or the head evaluation (a hit),
+        # so it takes the single-process budget. `shard_threads` is the budget of ONE of K
+        # shards, predict_threads // K, and a miss run on it was slower than both the
+        # sharded prediction and a plain one-process run.
+        if predict_threads != torch.get_num_threads():
+            torch.set_num_threads(predict_threads)
         values, cache_record, timers = predict_from_projections(
             uniq, base_model, calibration, chunk, args.projection_cache)
         if values is not None:

@@ -757,6 +757,28 @@ def test_the_projection_cache_reproduces_the_prediction_and_is_read_back(tmp_pat
     assert not [p for p in cache.iterdir() if ".tmp-" in p.name]
 
 
+def test_a_projection_cache_miss_uses_the_whole_predict_thread_budget(tmp_path):
+    """A miss computes the projection in this one process, so it gets `--predict-threads`,
+    not the budget of one of the `--shards` it replaces (2 threads here, where a 2-shard plan
+    gives each shard 1)."""
+    _deeplc_or_skip()
+    _write_shard_fixture(tmp_path)
+    lib = tmp_path / "lib.parquet"
+    out = tmp_path / "out.parquet"
+    cache = tmp_path / "cache"
+    env = {"MUMDIA_DEEPLC_THREAD_CAP": "0", "CUDA_VISIBLE_DEVICES": "-1"}
+    run_worker_ok("deeplc_finetune.py", str(lib), "-", str(out), "--no-finetune",
+                  "--threads", "2", "--predict-threads", "2", "--shards", "2",
+                  "--predict-chunk", "64", "--projection-cache", str(cache),
+                  env=env, timeout=1800)
+    summary = json.loads((tmp_path / "out.parquet.summary.json").read_text("utf-8"))
+    assert summary["projection_cache"]["used"] and not summary["projection_cache"]["hit"]
+    assert summary["shards"]["used"] == 1 and summary["shards"]["plan"] == "projection cache"
+    (entry,) = [p for p in cache.iterdir()]
+    meta = json.loads((entry / "meta.json").read_text("utf-8"))
+    assert meta["torch_threads"] == 2, meta
+
+
 # ------------------------------------------------ shard clean-up (no DeepLC needed)
 
 

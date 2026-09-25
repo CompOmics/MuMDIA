@@ -418,8 +418,12 @@ block, or the default head for the base-model re-prediction. The key is a BLAKE2
 the DeepLC version, the model file's bytes and the exact sequence list in order
 (`projection_cache_key`, `_sequence_digest`). The entry is written into a `.tmp-<pid>`
 directory and renamed into place, so a reader never sees a partial one. A miss computes the
-projection in one process (`--shards` does not apply to it); a fine-tuned model has no
-factored head and predicts as usual. The summary records `projection_cache` (`hit`, `key`,
+projection in one process with the whole `--predict-threads` budget (after the cap), the
+threads a one-process prediction gets: `--shards` does not split it, and until 2026-09-25 a
+miss under a K-shard plan ran on one shard's `budget / K` threads, slower than either the
+sharded or the one-process prediction. `meta.json` records the count as `torch_threads`
+(`test_a_projection_cache_miss_uses_the_whole_predict_thread_budget`). A fine-tuned model has
+no factored head and predicts as usual. The summary records `projection_cache` (`hit`, `key`,
 `path`, timings). The values are float-equivalent to a plain prediction: bit-identical for
 the base model on the smoke library, and within the spline edge amplification for the
 multi-head calibration (`test_the_projection_cache_reproduces_the_prediction_and_is_read_back`).

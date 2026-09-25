@@ -791,8 +791,9 @@ pub struct RtImTrainConfig {
     /// sequence, about 1.26 GB for HYE's 4.91M) and later calls over the same list read it
     /// and evaluate only the heads they need: `rt_library_scope = per_run`, every rerun of
     /// an experiment, and the bands of `groups.rt_adaptation = once_per_run` across runs.
-    /// A miss computes the projection in one process (`deeplc_predict_shards` does not
-    /// apply to it). Base model only: a fine-tune has no factored head and ignores it.
+    /// A miss computes the projection in one process on the whole prediction-thread budget,
+    /// the threads a one-process prediction gets (`deeplc_predict_shards` does not split
+    /// it). Base model only: a fine-tune has no factored head and ignores it.
     ///
     /// Float-equivalent, not bit-identical: the heads are evaluated in numpy from the cached
     /// factors instead of in torch. Measured with DeepLC 4.5.0 on CPU: the base-model
