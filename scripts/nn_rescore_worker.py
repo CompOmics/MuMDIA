@@ -1536,7 +1536,11 @@ def _parallel_child_init(spec):
                   shape=(int(spec["n"]), int(spec["nf"])))
     y = np.load(spec["y_path"])
     fold = np.load(spec["fold_path"])
-    _CHILD["run_fold"] = _build_trainer(torch, spec["cfg"], X, spec["stream"], y, fold,
+    cfg = spec["cfg"]
+    # The init scan's thread pool shares this process's budget; its result does not depend
+    # on the thread count.
+    cfg.SCAN_THREADS = max(1, min(int(cfg.SCAN_THREADS), int(spec["threads"])))
+    _CHILD["run_fold"] = _build_trainer(torch, cfg, X, spec["stream"], y, fold,
                                         spec["feat_cols"], keyed_shuffle=True)
     parent = multiprocessing.parent_process()
     if parent is not None:
