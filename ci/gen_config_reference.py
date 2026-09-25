@@ -848,6 +848,11 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "min(`--threads`, 8), or min(cores, 8) without `--threads`. `0` or `1` is serial "
         "(`codec.rs` `codec_threads`)"
     ),
+    "MUMDIA_WIDE_SCAN": (
+        "coalesced row-group reads for rescore's feature stream and compete's "
+        "pass-through copy. `plain` restores the plain reader with its parallel decode "
+        "(`stages/mod.rs` `wide_scan_options`)"
+    ),
 }
 
 

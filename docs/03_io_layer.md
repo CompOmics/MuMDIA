@@ -376,12 +376,24 @@ reader is given a `span_cache::SpanCache` instead of the `File`:
   reads). A `debug` line on drop reports spans read, bytes, prefetches and
   direct reads.
 
-Nothing in the engine turns it on by default. It is meant for the wide full scans
-on spinning storage (rescore's `for_each_feature_row`, compete's `copy_kept_rows`),
-where the memory it holds (two or three row groups of the projection, about
-0.9 GB on a 131,072-row competed group) buys a forward read; it does not help a
-reader that skips pages through the page index, because a span holds whole
-column chunks.
+Two full scans use it by default, through `stages::wide_scan_options`: rescore's
+feature stream (`for_each_feature_row`, all ~390 feature columns of every row of
+every competed input) and compete's pass-through copy (`copy_kept_rows`, every
+column of the features table). Those are the wide scans of the run on spinning
+storage, where the memory the cache holds (two or three row groups of the
+projection, about 0.9 GB on a 131,072-row competed group) buys a forward read.
+It does not help a reader that skips pages through the page index, because a
+span holds whole column chunks, so every other reader keeps the plain `File`.
+
+A coalesced scan decodes with one reader (see "Parallel decode" below), so from
+the page cache or an SSD it gives up the automatic column groups. Measured from
+the page cache on the HYE competed table (879,018 rows, 387 features, 131,072-row
+groups, `bench_feature_stream_a_real_artifact`, minimum of 4 rounds on a loaded
+host): the feature stream took 1.54 s plain and 2.50 s coalesced. One reader
+decodes about 1.1 GB/s of f64, far above the 44-133 MB/s of the spinning array
+the change is for, so the single reader does not limit a seek-bound read.
+`MUMDIA_WIDE_SCAN=plain` restores the plain reader, with its parallel decode, for
+both scans; the output is the same either way, because the batches are.
 
 #### Parallel decode
 

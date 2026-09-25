@@ -404,6 +404,21 @@ is a flat f32 `FeatureMatrix`, so the same `n_psms * n_features * 4`, and
 however many folds are configured. The stage logs the figure before allocating, and
 `rescore.max_feature_matrix_gib` makes exceeding a ceiling an error at startup.
 
+**Reading the feature columns.** The feature pass (`for_each_feature_row`) is the
+widest read of the stage: every selected feature column of every row of every
+input, once. It reads through the coalesced scan (`stages::wide_scan_options`,
+docs/03 "Sequential row-group reads"), so each row group's projected column
+chunks arrive in one sequential read instead of one seek per page, which is what
+limits it on a spinning array (44 MB/s measured on the immunopeptidomics competed
+tables against a 133 MB/s ceiling). `MUMDIA_WIDE_SCAN=plain` restores the plain
+reader with its parallel decode, the faster choice from the page cache (1.54 s
+against 2.50 s over the 879,018-row HYE competed table). Under the plain reader a
+decoded batch is one row group (`feature_batch_rows`, at most 131,072 rows), so
+the reader sweeps each column chunk before the next one; under the coalesced
+reader it stays at 16,384 rows, because the group is read whole either way. The
+rows reach the handoff and the matrix one at a time in file order whatever the
+reader and batch size (`every_read_mode_streams_the_same_feature_rows`).
+
 The NnTorch worker picks its backend from the handoff file size against
 `MUMDIA_NN_STREAM_GB` (default 4, `nn_rescore_worker.py:299-300`). A matrix
 marginally over that threshold falls silently to the disk-backed streaming memmap,
