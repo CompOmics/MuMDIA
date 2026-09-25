@@ -335,6 +335,12 @@ The getters and their exact null behaviour:
 - `f64` (`table.rs:387`), `f32` (`table.rs:407`): fast path when
   `null_count() == 0` uses `extend_from_slice(a.values())`; otherwise iterate
   and map a null to `f64::NAN` / `f32::NAN`. Nulls become NaN.
+- `f64_widening` (on `Table` and `TableFile`): an f64 column exactly as `f64`
+  reads it, or an f32 column widened by `f64::from`, which is exact; a null is
+  NaN either way, and any other type is the `f64` error. It exists for columns
+  whose stored width differs between artifact versions: the feature columns of
+  `features.parquet` v2 and `psms_competed.parquet` v4 are Float32 where v1 and
+  v3 stored Float64 (docs/15_data_dictionary.md).
 - `i64` (`table.rs:427`), `i32` (`table.rs:447`), `u32` (`table.rs:467`): fast
   path on no nulls; otherwise iterate pushing `a.value(k)` **without checking
   `is_null`**. A null therefore comes through as the underlying buffer value
@@ -712,6 +718,7 @@ string (`main.rs:713`).
 | `Table::read` | `table.rs:207` | read a Parquet file fully into memory |
 | `Table::column_names` | `table.rs:227` | schema field names, in order |
 | `Table::f64` / `f32` | `table.rs:241` / `261` | float getters; null -> NaN |
+| `Table::f64_widening` / `TableFile::f64_widening` | `push_f64_widening` | an f64 or f32 column as f64 (f32 widened exactly); null -> NaN |
 | `Table::i64`/`i32`/`u32` | `table.rs:281`/`301`/`321` | integer getters; null NOT checked (-> buffer value) |
 | `Table::bool` | `table.rs:341` | bool getter; null NOT checked |
 | `Table::str` | `table.rs:357` | string getter; null -> `""` |

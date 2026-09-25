@@ -175,8 +175,9 @@ diagnostic sidecar not yet scored downstream (see docs/18 A6, and Gotchas below)
 
 `features.parquet` (`features.rs:828`): bookkeeping columns `candidate_id`,
 `label`, `base_peptide_id`, `peptidoform`, `protein`, `apex_rt`, `elution_lo`,
-`elution_hi`, `precursor_mz`, `prelim_score`, followed by one f64 column per
-active feature name (`features.rs:839`). Sidecar `features.parquet.schema.json`
+`elution_hi`, `precursor_mz`, `prelim_score`, followed by one column per
+active feature name (`features.rs:839`), stored as Float32 except the five
+`F64_FEATURE_COLUMNS` (schema v2; docs/15_data_dictionary.md). Sidecar `features.parquet.schema.json`
 records the ordered feature-column list and its hashed `schema_id`; `run.pin` is
 the Percolator input written deterministically alongside.
 

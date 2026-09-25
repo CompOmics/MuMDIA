@@ -306,8 +306,26 @@ per (candidate, peak).
 
 ### features.parquet (`features.rs:913-932`)
 
-Bookkeeping columns followed by the active feature columns. Every feature column
-is `Float64`.
+Bookkeeping columns followed by the active feature columns. Schema version 2
+(`artifact::FEATURES`): every feature column is `Float32`, holding the value the
+stage computed in f64 narrowed by `v as f32`, except the five
+`F64_FEATURE_COLUMNS` of `stages/features.rs` (`charge`, `n_matched_fragments`,
+`unique_fragment_count`, `peak_contested_frac`, `contested_frac`), which stay
+`Float64` because compete or rescore reads them as f64 before narrowing. Every
+classifier narrows every feature to f32 with the same `as f32` (the native
+`FeatureMatrix` is flat f32 and the sidecar handoff is Float32), so the stored f32
+is the value the classifier used before, and every scored output is unchanged. The
+file is about half the bytes of version 1.
+
+Version 1 stored every feature column as `Float64`. The engine reads both
+(compete, rescore, and `TableFile::f64_widening` for a single column); a v1 table
+given to compete is rewritten into the `psms_competed` v4 layout. An external reader
+sees `float32` columns in a v2 file; widen with `astype("float64")` where a tool
+needs it, which adds no precision the engine ever used. Band tables written before
+and after the change cannot be pooled into one table, because the splice requires
+identical schemas; re-run the bands with one binary. The PIN (`features.emit_pin`)
+is written from the f64 values before they are narrowed, so its text is the same
+under both versions.
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -321,7 +339,7 @@ is `Float64`.
 | `elution_hi` | Float64 | no | s | detected elution-peak upper RT bound |
 | `precursor_mz` | Float64 | no | m/z | precursor m/z |
 | `prelim_score` | Float64 | no | - | preliminary composite score (feature-derived; rescorer warm-start) |
-| ...feature columns... | Float64 | no | varies | one column per name in `active_features(set)` (see below) |
+| ...feature columns... | Float32 (Float64 for `F64_FEATURE_COLUMNS`) | no | varies | one column per name in `active_features(set)` (see below) |
 
 The active feature list depends on `features.set`
 (`features.rs:210-231`): Minimal (14), Rich (14 + 30 = 44), or Extended
@@ -522,9 +540,13 @@ Percolator input, tab-separated text (written to `out_pin`). Header:
 
 ### psms_competed (`compete.rs:121-151`)
 
-Bookkeeping columns plus the feature columns carried from the schema (each
-`Float64`). A `<out>.schema.json` companion is copied forward
-(`compete.rs:153`).
+Bookkeeping columns plus the feature columns carried from the schema. Schema
+version 4 (`artifact::PSMS_COMPETED`) stores each feature column in the width
+`features.parquet` v2 does (`feature_storage_type`: `Float32`, or `Float64` for
+`F64_FEATURE_COLUMNS`); version 3 stored every feature column as `Float64`.
+Rescore reads both and scores them identically. Compete given a v1 features table
+narrows its Float32 features with `as f32` into the v4 layout. A `<out>.schema.json`
+companion is copied forward (`compete.rs:153`).
 
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
@@ -538,7 +560,7 @@ Bookkeeping columns plus the feature columns carried from the schema (each
 | `elution_hi` | Float64 | no | s | identified elution upper bound |
 | `precursor_mz` | Float64 | no | m/z | precursor m/z |
 | `prelim_score` | Float64 | no | - | preliminary composite score |
-| ...feature columns... | Float64 | no | varies | each `feature_columns` entry from the schema |
+| ...feature columns... | Float32 (Float64 for `F64_FEATURE_COLUMNS`) | no | varies | each `feature_columns` entry from the schema |
 
 ### `<out>.compete_audit.parquet` (`compete.rs:167-202`)
 
@@ -888,9 +910,9 @@ contract files, not engine artifacts.
 ## Schema-version registry
 
 `mumdia-core/src/schema.rs` freezes the `(logical name, version)` pairs. As of
-`schema.rs:7-25`: `psms_scored` is v4, `psms_competed` v3, and `psms_extracted`,
-`peptide_quant` and `protein_group_quant` v2; every other registered artifact is
-v1. Each artifact stamps its version into its own `report.json`
+`schema.rs:7-25`: `psms_scored` and `psms_competed` are v4, and `features`,
+`psms_extracted`, `peptide_quant` and `protein_group_quant` v2; every other
+registered artifact is v1. Each artifact stamps its version into its own `report.json`
 (`mumdia-io/src/report.rs:14`) and into `manifest.json`
 (`mumdia-core/src/manifest.rs:15`), so an artifact on disk states its own version
 rather than inheriting the engine's.

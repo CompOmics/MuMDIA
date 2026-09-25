@@ -79,6 +79,22 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **`features.parquet` and `psms_competed.parquet` store the feature columns as float32.**
+  Every classifier narrows every feature to f32 before it sees it, so the features stage
+  now stores `v as f32` and the classifier inputs, the scores and every scored output are
+  unchanged (byte-identical `psms_scored.parquet` on the smoke fixture, and in a test that
+  runs both layouts through compete and rescore, `unique_evidence` included). Five columns
+  that compete or rescore read as f64 before narrowing stay float64 (`charge`,
+  `n_matched_fragments`, `unique_fragment_count`, `peak_contested_frac`,
+  `contested_frac`), as do the bookkeeping columns. The two tables are about half the
+  bytes, which is the widest write, copy and read of a run (about 83 GB a run of
+  `psms_competed` on the immunopeptidomics experiment). The schema versions are now
+  `features` 2 and `psms_competed` 4. Compete and rescore still read the previous
+  versions: a v1 features table is rewritten into the v4 layout, and a v3 competed table
+  scores exactly as its v4 counterpart. An external reader of these files sees float32
+  columns. Band tables from before and after the change cannot be pooled into one table;
+  re-run the bands with one binary. The PIN (`features.emit_pin`) is written from the f64
+  values and does not change.
 - **Rescore removes its sidecar files once the scores are read back.** The handoff, the
   fold keys and the worker's output were named after the output and the PID and never
   removed, so they piled up: 7.7 GB per HYE rescore, 359 GB per immunopeptidomics pool.

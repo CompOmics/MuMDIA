@@ -51,19 +51,28 @@ plus its schema companion `<features>.schema.json` (read at compete.rs:46 via
 (str), `apex_rt`, `elution_lo`, `elution_hi` (f64), `precursor_mz` (f64),
 `prelim_score` (f64), `peak_rank` (i32, defaulted to 0 when absent,
 compete.rs:45), `charge`
-(f64, only needed for `peptidoform_charge` grouping), and every feature column
-named in the schema.
+(f64, only needed for `peptidoform_charge` grouping, read through the widening
+getter `TableFile::f64_widening`), and every feature column named in the schema,
+each Float32 or Float64.
 
-Produces `psms_competed` (schema version 3, `artifact::PSMS_COMPETED`,
-schema.rs:20) at `--out`. Column schema includes `candidate_id`
+Produces `psms_competed` (schema version 4, `artifact::PSMS_COMPETED`) at `--out`.
+Column schema includes `candidate_id`
 (u32), `peak_rank` (i32), `label` (str), `base_peptide_id` (u32), `peptidoform`
 (str), `protein`
 (str), `apex_rt`, `elution_lo`, `elution_hi` (f64), `precursor_mz` (f64),
-`prelim_score` (f64), then every
-feature column (f64) carried through unchanged. When every row survives and the
-features file already has exactly this schema, the competed table is the features
-file's bytes, published by hard link (see "compete: how the competed table is
-published"). It also writes
+`prelim_score` (f64), then every feature column in its storage width
+(`features::feature_storage_type`): Float32, except the five
+`features::F64_FEATURE_COLUMNS` (`charge`, `n_matched_fragments`,
+`unique_fragment_count`, `peak_contested_frac`, `contested_frac`), which stay
+Float64 because this stage or rescore reads them as f64 before any narrowing. A
+features v2 table already stores them this way and its values pass through
+unchanged. A v1 table stores every feature as Float64; compete then narrows the
+Float32 ones with `as f32` (`conform`), the conversion rescore applied to the same
+value when it read a v3 competed table, so the classifier input does not move.
+When every row survives and the features file already has exactly this schema, the
+competed table is the features file's bytes, published by hard link (see "compete:
+how the competed table is published"). A v1 features table never has it, so it is
+rewritten. It also writes
 `<out>.schema.json` (compete.rs:188) so rescore recovers the exact feature list,
 and `<out>.report.json`.
 
@@ -87,9 +96,13 @@ Consumes one or more `psms_competed` tables (`--competed`, a `Vec<String>`).
 The ordered feature schema from the first input is the expected contract, and
 every later schema companion must match it exactly before tables are
 concatenated. Reads `candidate_id`, `label`, `base_peptide_id`, `peptidoform`,
-`protein`, `charge` (f64, cast to i32), `prelim_score`, `precursor_mz`,
+`protein`, `charge` (f64 read widening, cast to i32), `prelim_score`, `precursor_mz`,
 `apex_rt`, `elution_lo`, `elution_hi`, `peak_rank` (i32, defaulted to 0 when
-absent, rescore.rs:93), and the feature columns.
+absent, rescore.rs:93), and the feature columns. A feature column may be Float32
+(`psms_competed` v4) or Float64 (v3, and the v4 columns that stay wide): a Float64
+cell is narrowed with `as f32` and a Float32 cell, narrowed that way when it was
+written, is used as stored (`FeatureCol`), so a v3 and a v4 table of the same run
+give the classifier the same values and the same scored table.
 
 Four input conditions are hard errors before any scoring: fewer than 2
 `rescore.folds` (rescore.rs:46-48), an empty `--competed` list (rescore.rs:43-45),
@@ -281,9 +294,11 @@ the winner as the highest `prelim_score`, ties broken by smallest row index
   clamped to [0,1]), else raw `n_matched_fragments`, else `None`. The contested
   fraction is resolved by `prefer_peak_contested_fraction` (compete.rs:301-306),
   which prefers the Extended-feature `peak_contested_frac` column and falls back to
-  the legacy `contested_frac` spelling. Each column is read through `col_f64`
-  (compete.rs:309-315), which accepts either an f64 or an i32 encoding, so an
-  integer-typed fragment count is handled without a schema mismatch. If the mode is
+  the legacy `contested_frac` spelling. Each column is read through `col_f64`,
+  which accepts an f64, an f32 (widened exactly) or an i32 encoding, so an
+  integer-typed fragment count is handled without a schema mismatch. The features
+  writer keeps all four columns as f64 (`F64_FEATURE_COLUMNS`), because an f32
+  contested fraction could move `n * (1 - c)` across the integer threshold. If the mode is
   selected but no column is available it warns and falls back to winner-take-all
   (compete.rs:133-139, 366 `.unwrap_or(false)`).
 - `MarginGated`: keep the winner; remove a loser only when
@@ -342,7 +357,9 @@ extra); every parquet leaf is REQUIRED, so no null exists for the rewrite to tur
 NaN or `""`; every row group holds at most 131,072 rows, the competed cap (`features`
 writes 65,536); the table has its own `peak_rank` column; and
 `compete.emit_competition_audit` is off. Otherwise the stage logs the reason and
-rewrites.
+rewrites. A features v1 table fails the first condition, because its feature
+columns are all Float64 and the competed schema declares most of them Float32, so it
+is always rewritten into the v4 layout.
 
 When some rows are removed, the same four conditions hold, and the non-empty
 features row groups that lost no row hold at least half of the table's rows
@@ -453,7 +470,8 @@ takes a batch in the layout it needs, in parallel:
 
 - the parquet handoff stages a block column by column: every feature's values are
   narrowed to f32 straight out of the decoded Arrow column into that feature's
-  block vector, and the block goes to the writer without a transpose. The row
+  block vector (a Float32 column of a v4 table is copied as stored), and the block
+  goes to the writer without a transpose. The row
   path it replaces turned the decoded columns into rows and the staged rows back
   into columns on flush. Blocks keep `HANDOFF_BATCH_ROWS` (250,000) rows and are
   flushed at the same rows, so the writer receives the same record batches and

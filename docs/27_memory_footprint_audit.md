@@ -93,6 +93,7 @@ State of the plan in section 3:
 | 3.1 streaming typed readers | shipped `503eadb` | part of 231.0 -> 86.6 GiB |
 | 3.2 extract incremental write | shipped `503eadb` | trace residency 61.8 GiB -> 0.074 GiB in flight |
 | 3.3 f32 bulk arrays | shipped `503eadb` | library 26 -> 22 B per fragment row; rescore matrix halved |
+| 3.3 f32 feature table | shipped 2026-09-25 (survey R3) | `features.parquet` v2 and `psms_competed.parquet` v4 store the feature columns as f32 (five stay f64); scored outputs byte-identical |
 | 3.4 features chunked | shipped | features stage 86.6 -> 3.03 GiB (one loader; see 3.4 for `features.chrom_loaders`) |
 | 3.10 extract window-closing flush | shipped | extract stage 61.33 -> 28.13 GiB |
 | 3.10 incremental merge + `windows_in_flight` cap | shipped 2026-09-05 | extract stage 28.13 -> 16.57 GiB (12.31 at 8 in flight) |
@@ -383,6 +384,14 @@ Concretely:
   on float32, so the classifier input is unchanged. Native linear and mokapot
   paths gain a rounding at the 7th significant digit; treat as "mostly similar"
   and validate as in section 5.
+
+  Shipped 2026-09-25 (survey item R3), and by then the caveat no longer applied:
+  the native `FeatureMatrix` had become flat f32 and every classifier narrowed
+  every feature with `as f32` on read, so storing `v as f32` moved no classifier
+  input and the scored tables are byte-identical (the smoke fixture and
+  `both_feature_layouts_compete_and_score_identically`). The five columns compete
+  or rescore read as f64 before narrowing stay f64 (`F64_FEATURE_COLUMNS`), and
+  the writer's in-flight copy of a chunk is about half a matrix instead of one.
 
 The task note allows a precision change; the direction that saves memory is
 f64 to f32 for storage, with f64 kept for arithmetic, and that is what this
