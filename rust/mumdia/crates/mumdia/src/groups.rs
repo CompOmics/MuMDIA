@@ -99,6 +99,11 @@ pub fn plan_json(plan: &Plan) -> serde_json::Value {
     })
 }
 
+/// Relative m/z tolerance when [`plan_from_json`] matches a stored band bound to a window:
+/// about a million f64 ulps at these magnitudes, and still a million times smaller than any
+/// real difference between two isolation schemes.
+pub const PLAN_MZ_TOLERANCE: f64 = 1e-10;
+
 /// Rebuild the [`Plan`] another run wrote to its `plan.json`, for THIS run's isolation
 /// windows.
 ///
@@ -112,8 +117,13 @@ pub fn plan_json(plan: &Plan) -> serde_json::Value {
 /// and failed quant.
 ///
 /// Errors when the plan does not fit these windows: a band whose window indices are out of
-/// range, not contiguous or not in order, or whose m/z bounds are not exactly those of its
-/// windows. Two acquisitions with different isolation schemes cannot share bands.
+/// range, not contiguous or not in order, or whose m/z bounds are not those of its windows.
+/// Two acquisitions with different isolation schemes cannot share bands.
+///
+/// The bounds are compared within [`PLAN_MZ_TOLERANCE`], not bit for bit, and the returned
+/// bands take their bounds from THIS run's windows. serde_json's default float parser is
+/// best-effort, and read `432.44696044921875` (an f32 window bound widened to f64) back as
+/// `432.4469604492187`, one ulp off, so an exact comparison refused a plan that fits.
 pub fn plan_from_json(value: &serde_json::Value, windows: &[(f64, f64)]) -> Result<Plan> {
     let windows = sorted_windows(windows);
     let num = |v: &serde_json::Value, what: &str| -> Result<f64> {
@@ -164,19 +174,22 @@ pub fn plan_from_json(value: &serde_json::Value, windows: &[(f64, f64)]) -> Resu
             .iter()
             .map(|w| w.1)
             .fold(f64::MIN, f64::max);
-        if mz_lo.to_bits() != lo.to_bits() || mz_hi.to_bits() != hi.to_bits() {
+        let near = |a: f64, b: f64| (a - b).abs() <= PLAN_MZ_TOLERANCE * b.abs().max(1.0);
+        if !(near(mz_lo, lo) && near(mz_hi, hi)) {
             bail!(
-                "plan.json: band {index} spans m/z {mz_lo}-{mz_hi}, but its windows span                  {lo}-{hi} in this run"
+                "plan.json: band {index} spans m/z {mz_lo}-{mz_hi}, but its windows span {lo}-{hi} in this run"
             );
         }
         let est_precursors = num(
             b.get("est_precursors").unwrap_or(&serde_json::Value::Null),
             "est_precursors",
         )?;
+        // The exact bounds are this run's windows: what the band's row span, and the plan
+        // that wrote this file, were computed from.
         bands.push(Band {
             index,
-            mz_lo,
-            mz_hi,
+            mz_lo: lo,
+            mz_hi: hi,
             windows: idx,
             est_precursors,
         });
@@ -1016,6 +1029,80 @@ mod tests {
         let mut shuffled = windows.clone();
         shuffled.reverse();
         assert_eq!(plan_from_json(&value, &shuffled).unwrap(), run1);
+    }
+
+    #[test]
+    fn a_shared_plan_round_trips_f32_window_bounds_through_the_json_files() {
+        // The real failure: HYE Astral window bounds are f32 values widened to f64, such as
+        // 432.44696044921875, and serde_json's default parser read that back from plan.json
+        // one ulp off (432.4469604492187). Go through write_json/read_json, the path the
+        // engine takes, with bounds of that kind.
+        let bounds: Vec<f64> = vec![
+            380.4232482910156,
+            408.43505859375,
+            432.44696044921875,
+            454.45599365234375,
+            478.4669494628906,
+            502.47784423828125,
+            526.48876953125,
+            550.4996337890625,
+            576.511474609375,
+        ];
+        // Every bound is an f32 widened to f64, as the converted isolation windows are.
+        assert!(bounds.iter().all(|&b| (b as f32) as f64 == b));
+        assert_eq!(
+            bounds[2], 432.44696044921875,
+            "the bound that failed on HYE"
+        );
+        let windows: Vec<(f64, f64)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
+        // Bands cut so that the failing bound starts one of them.
+        let band = |index: usize, w: std::ops::Range<usize>, est: f64| Band {
+            index,
+            mz_lo: windows[w.start].0,
+            mz_hi: windows[w.end - 1].1,
+            windows: w.collect(),
+            est_precursors: est,
+        };
+        let original = Plan {
+            bands: vec![
+                band(0, 0..2, 15_032.029_514_990_48),
+                band(1, 2..5, 14_625.944_340_894_668),
+                band(2, 5..8, 10_156.894_432_106_6),
+            ],
+            windows: windows.clone(),
+            est_unselectable: 185.131_712_008_253_1,
+            est_duplicated: 0.0,
+        };
+        assert_eq!(original.bands[1].mz_lo, 432.44696044921875);
+        let dir = std::env::temp_dir().join(format!("mumdia_plan_rt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plan.json");
+        let path = path.to_str().unwrap();
+        mumdia_io::json::write_json(path, &plan_json(&original)).unwrap();
+        let value: Value = mumdia_io::json::read_json(path).unwrap();
+        let back = plan_from_json(&value, &windows).unwrap();
+        // What the band files depend on comes back bit for bit: the windows, each band's
+        // window run and its m/z bounds. The estimates are advisory (logging, the cost order
+        // of the band queue) and may come back one ulp off through the same parser.
+        assert_eq!(back.windows, original.windows);
+        assert_eq!(back.bands.len(), original.bands.len());
+        for (x, y) in back.bands.iter().zip(&original.bands) {
+            assert_eq!((x.index, &x.windows), (y.index, &y.windows));
+            assert_eq!(
+                x.mz_lo.to_bits(),
+                y.mz_lo.to_bits(),
+                "band {} mz_lo",
+                y.index
+            );
+            assert_eq!(
+                x.mz_hi.to_bits(),
+                y.mz_hi.to_bits(),
+                "band {} mz_hi",
+                y.index
+            );
+            assert!((x.est_precursors - y.est_precursors).abs() <= 1e-9 * y.est_precursors.abs());
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

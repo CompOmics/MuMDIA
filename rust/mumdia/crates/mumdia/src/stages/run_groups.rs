@@ -233,7 +233,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     // (docs/08, once-per-library) and search that table instead.
     if cfg.rt_im_train.finetune_deeplc {
         bail!(
-            "rt_im_train.finetune_deeplc is not supported with groups.window_groups > 1: the              fine-tune would be trained separately in every group (non-deterministic, and the              training cost once per group). Fine-tune the library once beforehand and search              the fine-tuned table, or leave the default multi-head calibration on"
+            "rt_im_train.finetune_deeplc is not supported with groups.window_groups > 1: the fine-tune would be trained separately in every group (non-deterministic, and the training cost once per group). Fine-tune the library once beforehand and search the fine-tuned table, or leave the default multi-head calibration on"
         );
     }
     let d = |name: &str| format!("{}/{}", g.out_dir, name);
@@ -280,7 +280,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             })?;
             info!(
                 source = %path,
-                "groups: planning skipped; this run searches the bands of the run whose                  adapted libraries it reuses"
+                "groups: planning skipped; this run searches the bands of the run whose adapted libraries it reuses"
             );
             plan
         }
@@ -360,7 +360,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 requested = want,
                 used = most,
                 threads,
-                "groups.parallel is at least the thread count, which would deadlock: every                  band in flight parks a worker on its accumulation channel. Using one fewer                  band than there are threads; raise --threads to run more at once"
+                "groups.parallel is at least the thread count, which would deadlock: every band in flight parks a worker on its accumulation channel. Using one fewer band than there are threads; raise --threads to run more at once"
             );
             most
         } else {
@@ -1161,7 +1161,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     if !pool_psms {
         info!(
             groups = arts.len(),
-            "groups: psms_extracted stays per band (extract.emit_candidate_audit is off, and              nothing else reads the pooled table)"
+            "groups: psms_extracted stays per band (extract.emit_candidate_audit is off, and nothing else reads the pooled table)"
         );
     }
     info!(stage = %"pool", groups = arts.len(), "run: stage start");
