@@ -233,7 +233,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     // (docs/08, once-per-library) and search that table instead.
     if cfg.rt_im_train.finetune_deeplc {
         bail!(
-            "rt_im_train.finetune_deeplc is not supported with groups.window_groups > 1: the              fine-tune would be trained separately in every group (non-deterministic, and the              training cost once per group). Fine-tune the library once beforehand and search              the fine-tuned table, or leave the default multi-head calibration on"
+            "rt_im_train.finetune_deeplc is not supported with groups.window_groups > 1: the fine-tune would be trained separately in every group (non-deterministic, and the training cost once per group). Fine-tune the library once beforehand and search the fine-tuned table, or leave the default multi-head calibration on"
         );
     }
     let d = |name: &str| format!("{}/{}", g.out_dir, name);
@@ -266,14 +266,33 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 .copied()
                 .unwrap_or(0) as f64
     };
-    let plan = match cfg.groups.balance {
-        GroupBalance::Precursors => groups::plan(&windows, &stats, cfg.groups.window_groups)?,
-        GroupBalance::Cost => groups::plan_weighted(
-            &windows,
-            &stats,
-            cfg.groups.window_groups,
-            Some(&cost_weight),
-        )?,
+    let plan = match g.shared_bands {
+        // A run that takes another run's adapted band libraries searches THAT run's bands:
+        // the band files carry its row spans and candidate-id offsets. Re-planning here is not
+        // guaranteed to reproduce them, since `groups.balance = cost` weights each run's own
+        // MS2 peak density (see `groups::plan_from_json`).
+        Some(shared) => {
+            let path = format!("{shared}/plan.json");
+            let value: serde_json::Value = mumdia_io::json::read_json(&path)
+                .with_context(|| format!("reading the plan of the shared bands, {path}"))?;
+            let plan = groups::plan_from_json(&value, &windows).with_context(|| {
+                format!("the shared bands in {shared} do not fit this run's isolation windows")
+            })?;
+            info!(
+                source = %path,
+                "groups: planning skipped; this run searches the bands of the run whose adapted libraries it reuses"
+            );
+            plan
+        }
+        None => match cfg.groups.balance {
+            GroupBalance::Precursors => groups::plan(&windows, &stats, cfg.groups.window_groups)?,
+            GroupBalance::Cost => groups::plan_weighted(
+                &windows,
+                &stats,
+                cfg.groups.window_groups,
+                Some(&cost_weight),
+            )?,
+        },
     };
     info!(
         groups = plan.bands.len(),
@@ -298,13 +317,13 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     let mut plan_json = serde_json::json!({
         "window_groups": cfg.groups.window_groups,
         "calibration": format!("{:?}", cfg.groups.calibration),
-        "est_unselectable": plan.est_unselectable,
-        "est_duplicated": plan.est_duplicated,
-        "bands": plan.bands.iter().map(|b| serde_json::json!({
-            "index": b.index, "mz_lo": b.mz_lo, "mz_hi": b.mz_hi,
-            "windows": b.windows, "est_precursors": b.est_precursors,
-        })).collect::<Vec<_>>(),
     });
+    // The plan members go through `groups::plan_json`, the writer `plan_from_json` mirrors.
+    if let (Some(obj), serde_json::Value::Object(members)) =
+        (plan_json.as_object_mut(), groups::plan_json(&plan))
+    {
+        obj.extend(members);
+    }
     // Recorded only when it is not the default, so a default plan.json is what it was.
     if cfg.groups.balance != GroupBalance::Precursors {
         plan_json["balance"] = serde_json::json!(format!("{:?}", cfg.groups.balance));
@@ -341,7 +360,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 requested = want,
                 used = most,
                 threads,
-                "groups.parallel is at least the thread count, which would deadlock: every                  band in flight parks a worker on its accumulation channel. Using one fewer                  band than there are threads; raise --threads to run more at once"
+                "groups.parallel is at least the thread count, which would deadlock: every band in flight parks a worker on its accumulation channel. Using one fewer band than there are threads; raise --threads to run more at once"
             );
             most
         } else {
@@ -1142,7 +1161,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     if !pool_psms {
         info!(
             groups = arts.len(),
-            "groups: psms_extracted stays per band (extract.emit_candidate_audit is off, and              nothing else reads the pooled table)"
+            "groups: psms_extracted stays per band (extract.emit_candidate_audit is off, and nothing else reads the pooled table)"
         );
     }
     info!(stage = %"pool", groups = arts.len(), "run: stage start");
