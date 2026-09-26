@@ -109,7 +109,8 @@ than a number. Both are recorded in every run's `manifest.json`.
   `groups/overlap_losers.parquet` (`band`, `candidate_id`), and quant reads the bands'
   tables in band order, dropping each band's losers, so the pooled `chromatograms.parquet`
   (about 68 GB a run on the immunopeptidomics experiment) is neither written, hashed nor
-  read. It holds for overlapping bands too. Default `true`. The quant tables are
+  read. It holds for overlapping bands too. Default `false` since 2026-09-26 (see
+  Changed). The quant tables are
   byte-identical either way (tests with two overlapping bands, including overlap
   candidates compete deleted in one band, and with a band whose row groups are all pruned;
   a smoke arm compares the quant tables and TSVs of the three-band fixture). What changes
@@ -125,7 +126,8 @@ than a number. Both are recorded in every run's `manifest.json`.
   `psms_competed.parquet` holds, and that copy (about 83 GB a run on the
   immunopeptidomics experiment) is not written. It applies only when the bands' library
   row spans are disjoint and neither the candidate audit nor match-between-runs is on;
-  otherwise the table is pooled and the log says why. Default `true`. `psms_scored.parquet`
+  otherwise the table is pooled and the log says why. Default `false` since 2026-09-26
+  (see Changed). `psms_scored.parquet`
   is byte-identical either way (a smoke arm compares it); the manifest then has no pooled
   competed record, and `mumdia pool --groups-dir` rebuilds the table from the bands.
 
@@ -145,6 +147,24 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **`groups.pool_competed` and `groups.pool_chromatograms` default to `false`.** A grouped
+  run no longer writes the pooled `psms_competed.parquet` and `chromatograms.parquet`:
+  rescore reads the bands' competed tables and quant reads the bands' chromatogram tables
+  with the overlap losers, as both did under `false` before. The results do not change. On
+  one immunopeptidomics run (63 bands, 15,650,949 competed candidates)
+  `psms_scored.parquet`, the three quant tables and both TSVs were byte-identical to the
+  pooled run's, the run directory went from 152 to 80 GB, and the pool stage, a 77 GB
+  splice, went from 66 s (30 minutes on a disk that sustained 22 MB/s) to nothing. On a
+  six-run HYE Astral experiment (16 bands a run) all 36 outputs the two arms share were
+  byte-identical, including the experiment-wide scored table, both TSVs and the MaxLFQ
+  tables, and the experiment directory went from 31 to 22 GB at the same wall time. The
+  artifact set changes: the band directories hold the run's only chromatograms and
+  competed rows, so they are no longer disposable once the run is accepted; a later
+  standalone `mumdia quant` takes the band tables with `--overlap-losers`, and a
+  standalone `mumdia rescore` or `audit` needs `mumdia pool --groups-dir` first. `true`
+  writes the pooled tables as before. The competed table is still pooled wherever it must
+  be (overlapping bands, the candidate audit, match-between-runs). Ungrouped runs
+  (`window_groups = 1`) are unaffected.
 - **Quant reads less of its two inputs.** The scored table's identity columns
   (`peptidoform`, `protein_group`, `charge`, `base_peptide_id`) are read at the accepted
   rows only, and the identification-apex map holds only the candidates whose

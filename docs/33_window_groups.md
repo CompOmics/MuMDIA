@@ -35,8 +35,8 @@ on.
 | `rt_adaptation` | `per_band` | `once_per_run` adapts the library's retention times in one DeepLC worker per run over the union of the bands, under `global` calibration (section 4b). Float-equivalent, opt-in. |
 | `balance` | `precursors` | `cost` balances the cuts on precursors times MS2 peaks per window instead (section 2). Output-changing, opt-in. |
 | `delete_band_intermediates` | `false` | Delete each band's `psms_extracted` and `features` tables once the pool is written (section 6). Disk only. |
-| `pool_competed` | `true` | `false` leaves the competed rows per band and has rescore read the band tables with a table-to-source map, where that cannot change a result (section 5). `psms_scored.parquet` is byte-identical; the pooled competed table is not written. Opt-in. |
-| `pool_chromatograms` | `true` | `false` leaves the chromatograms per band and has quant read the band tables with the overlap losers the pool persists to `groups/overlap_losers.parquet` (section 5). The quant tables are byte-identical; the pooled chromatogram table is not written, and the band directories become the run's only chromatograms (section 6). Opt-in. |
+| `pool_competed` | `false` | `false` leaves the competed rows per band and has rescore read the band tables with a table-to-source map, where that cannot change a result (section 5). `psms_scored.parquet` is byte-identical; the pooled competed table is not written. `true` writes it. Default since 2026-09-26. |
+| `pool_chromatograms` | `false` | `false` leaves the chromatograms per band and has quant read the band tables with the overlap losers the pool persists to `groups/overlap_losers.parquet` (section 5). The quant tables are byte-identical; the pooled chromatogram table is not written, and the band directories become the run's only chromatograms (section 6). `true` writes it. Default since 2026-09-26. |
 
 `run-experiment` (and `run` with several `--mzml`, which dispatches to it) searches every run
 grouped, with one experiment-wide rescore over the pooled competed tables and the
@@ -512,74 +512,90 @@ exactly that value, and the spans say so. The standalone `mumdia pool` has no pl
 and looks as before. The pooled tables are byte-identical either way
 (`disjoint_bands_skip_the_dedup_and_pool_the_same_bytes`).
 
-With `groups.pool_competed = false` the competed rows are not pooled at all. Rescore
-already accepts several competed tables; it reads the bands' tables in band order with a
-table-to-source map (`RescoreParams::sources`, every band of run i stamped `source` i), so
-its input rows are exactly the rows the pooled table would hold, in its order, and
-`psms_scored.parquet` is byte-identical to the pooled run's
+By default (`groups.pool_competed = false` since 2026-09-26) the competed rows are not
+pooled at all. Rescore already accepts several competed tables; it reads the bands' tables
+in band order with a table-to-source map (`RescoreParams::sources`, every band of run i
+stamped `source` i), so its input rows are exactly the rows the pooled table would hold, in
+its order, and `psms_scored.parquet` is byte-identical to the pooled run's
 (`band_tables_with_a_source_map_score_the_pooled_tables_bytes`). That saves one full write
 and read of the run's widest artifact, about 83 GB per run on the immunopeptidomics
-experiment (about 581 GB for its seven runs). It is done only where it cannot change a
-result or starve a reader: the bands' row spans must be disjoint, since otherwise the
-overlap losers have to be dropped, and neither the candidate audit nor match-between-runs
-may be on, since both read the pooled table. Otherwise the table is pooled and the log
-says why. What changes is the artifact set: there is no pooled `psms_competed.parquet`
-(one an earlier run left in the directory is removed) and no manifest record for it, and
-the scored table's report lists the band tables under `competed_inputs` with their
-`competed_sources`. A later standalone `mumdia rescore` or `mumdia audit` needs the table,
-which `mumdia pool --groups-dir` rebuilds from the bands. To validate on a data set, run
-the same grouped configuration with the default and with `false` and compare
+experiment while the feature columns were f64 (about 581 GB for its seven runs), 17.5 GB on
+one of its runs with the f32 columns. It is done only where it cannot change a result or
+starve a reader: the bands' row spans must be disjoint, since otherwise the overlap losers
+have to be dropped, and neither the candidate audit nor match-between-runs may be on, since
+both read the pooled table. Otherwise the table is pooled and the log says why. What changes
+is the artifact set: there is no pooled `psms_competed.parquet` (one an earlier run left in
+the directory is removed) and no manifest record for it, and the scored table's report lists
+the band tables under `competed_inputs` with their `competed_sources`. A later standalone
+`mumdia rescore` or `mumdia audit` needs the table, which `mumdia pool --groups-dir`
+rebuilds from the bands. `true` writes the pooled table. To validate on a data set, run the
+same grouped configuration with the default and with `true` and compare
 `psms_scored.parquet` byte for byte.
 
-With `groups.pool_chromatograms = false` the chromatograms are not pooled either. Quant is
-the table's one reader (the candidate audit and match-between-runs do not open it), and it
-reads a run's chromatogram tables as a list: the bands' own tables in band order, each with
-the candidates it does not contribute (`quant::ChromTable`). Those are the overlap losers
-of the chromatogram tables, the same sets the pooled table is spliced without, and here the
-pool writes them to `groups/overlap_losers.parquet` (`band`, `candidate_id`; no rows for
-disjoint bands), so unlike `pool_competed` this also holds for overlapping bands. The losers
-are found in the chromatogram tables themselves, not only in the competed ones
-(`pool::table_losers`): a band's chromatogram table holds every candidate extract accepted,
-including ones compete then deleted there, so under `compete.group_by = base_peptide` or
-`apex` a candidate can be in two bands' chromatogram tables and one competed table. It is
-kept from the band whose competed row won it (from the first band that holds it when no
-band kept it) and dropped from the others, in the pooled table as in the band tables.
-Before this, the pooled table held both bands' rows of such a candidate and quant summed
-them; the default `peptidoform_charge` gives each candidate a group of its own and deletes
-none, so it was not affected. The loser file's footer names the band tables it belongs to,
-in order (directory and file name, row count, and the content hash of each table's
-report), and a standalone quant refuses a list of band tables that differs in count, order
-or identity. Quant reads the tables in order, drops each one's losers, and concatenates the per-table stores with the
-same `ChromStore::append` that joins row groups, which rebuilds a file seam exactly as it
-rebuilds a row-group seam: its store is the one the pooled table gives, and so are the quant
-tables, byte for byte (`quant_from_the_band_tables_writes_the_pooled_runs_bytes`, with two
-bands overlapping, two of the overlap candidates deleted by compete in one band each;
+By default (`groups.pool_chromatograms = false` since 2026-09-26) the chromatograms are not
+pooled either. Quant is the table's one reader (the candidate audit and match-between-runs
+do not open it), and it reads a run's chromatogram tables as a list: the bands' own tables
+in band order, each with the candidates it does not contribute (`quant::ChromTable`). Those
+are the overlap losers of the chromatogram tables, the same sets the pooled table is spliced
+without, and here the pool writes them to `groups/overlap_losers.parquet` (`band`,
+`candidate_id`; no rows for disjoint bands), so unlike `pool_competed` this also holds for
+overlapping bands. The losers are found in the chromatogram tables themselves, not only in
+the competed ones (`pool::table_losers`): a band's chromatogram table holds every candidate
+extract accepted, including ones compete then deleted there, so under `compete.group_by =
+base_peptide` or `apex` a candidate can be in two bands' chromatogram tables and one
+competed table. It is kept from the band whose competed row won it (from the first band that
+holds it when no band kept it) and dropped from the others, in the pooled table as in the
+band tables. Before this, the pooled table held both bands' rows of such a candidate and
+quant summed them; the default `peptidoform_charge` gives each candidate a group of its own
+and deletes none, so it was not affected. The loser file's footer names the band tables it
+belongs to, in order (directory and file name, row count, and the content hash of each
+table's report), and a standalone quant refuses a list of band tables that differs in count,
+order or identity. Quant reads the tables in order, drops each one's losers, and
+concatenates the per-table stores with the same `ChromStore::append` that joins row groups,
+which rebuilds a file seam exactly as it rebuilds a row-group seam: its store is the one the
+pooled table gives, and so are the quant tables, byte for byte
+(`quant_from_the_band_tables_writes_the_pooled_runs_bytes`, with two bands overlapping, two
+of the overlap candidates deleted by compete in one band each;
 `band_tables_read_in_order_rebuild_the_pooled_tables_store`, with a band whose groups are
 all pruned). A candidate with rows in two of the tables, which is what the band tables of
 overlapping bands read without their losers give, is refused rather than quantified from
-both; so is a candidate whose rows continue from the end of one table into the next, which
-a real band table never gives, although the store rebuilds that seam. That saves the
-splice write, the hash and one read of the run's largest artifact, about 68 GB per run on
-the immunopeptidomics experiment. The artifact set changes: no pooled `chromatograms.parquet`
-(one an earlier run left is removed, as a loser table an earlier run left is under the
-default) and no manifest record for it, an `overlap_losers` record instead, and the quant report's `chromatograms` lists the band tables with
-`chromatogram_dropped_candidates`. A later standalone quant is
-`mumdia quant --chromatograms groups/g00/chromatograms.parquet ... --overlap-losers
-groups/overlap_losers.parquet`, with the band tables in band order, or `mumdia pool
---groups-dir` rebuilds the pooled table. To validate on a data set, run the same grouped
-configuration with the default and with `false` and compare `peptide_quant.parquet`,
-`protein_group_quant.parquet` and `fragment_quant.parquet` byte for byte; the smoke does this
-on its three-band fixture. Done on the AIF benchmark in four bands (augmented DIA-NN
+both; so is a candidate whose rows continue from the end of one table into the next, which a
+real band table never gives, although the store rebuilds that seam. That saves the splice
+write, the hash and one read of the run's largest artifact, about 68 GB per run on the
+immunopeptidomics experiment (59.5 GB on the run measured below). The artifact set changes:
+no pooled `chromatograms.parquet` (one an earlier run left is removed, as a loser table an
+earlier run left is under `true`) and no manifest record for it, an `overlap_losers` record
+instead, and the quant report's `chromatograms` lists the band tables with
+`chromatogram_dropped_candidates`. A later standalone quant is `mumdia quant --chromatograms
+groups/g00/chromatograms.parquet ... --overlap-losers groups/overlap_losers.parquet`, with
+the band tables in band order, or `mumdia pool --groups-dir` rebuilds the pooled table.
+`true` writes the pooled table. To validate on a data set, run the same grouped
+configuration with the default and with `true` and compare `peptide_quant.parquet`,
+`protein_group_quant.parquet` and `fragment_quant.parquet` byte for byte; the smoke does
+this on its three-band fixture. Done on the AIF benchmark in four bands (augmented DIA-NN
 library, `native_tda`, 1,050,807 chromatogram rows, disjoint bands): the three quant tables,
 `psms_scored.parquet` and both TSVs were byte-identical, the pooled table the run no longer
-wrote was 237 MB, and `mumdia quant` over the four band tables with the loser file wrote
-the same quant tables again. Overlapping bands are covered by the tests above only
+wrote was 237 MB, and `mumdia quant` over the four band tables with the loser file wrote the
+same quant tables again. Overlapping bands are covered by the tests above only
 (`a_candidate_compete_deleted_in_one_band_is_pooled_from_one_band` for the loser sets).
 
-From here on the run is an ordinary run: rescore, audit, quant and report read the pooled
-tables (or the band tables above), and `psms_scored.parquet.report.json` names the
-classifier as always. The manifest's
-RT model identity says `(per window group)` after the model that ran.
+Both defaults changed from `true` to `false` on 2026-09-26, on that byte-identity rather
+than on a count, after two larger checks with both options changed together. On one
+immunopeptidomics run (AT10273AUH, 63 disjoint bands, 15,650,949 competed candidates,
+`nn_torch`), `psms_scored.parquet`, the three quant tables and both TSVs were byte-identical
+to the pooled run's, the run directory went from 152 to 80 GB, and the pool stage, which had
+spliced 77 GB (59.5 GB of chromatograms and 17.5 GB of competed rows), went from 66 s where
+the page cache absorbed the writes, and 30 minutes on a disk that sustained 22 MB/s, to
+nothing. On a six-run HYE Astral experiment (16 bands a run, one experiment-wide `nn_torch`
+rescore), all 36 outputs the two arms share were byte-identical: the experiment-wide scored
+table, both TSVs and the three MaxLFQ tables, and each run's scored split, seed tables and
+quant tables. The experiment directory went from 31 to 22 GB, and the wall time did not move
+(10:24 against 10:19), because there the page cache absorbed the pool's writes.
+
+From here on the run is an ordinary run: rescore, audit, quant and report read the band
+tables above (or the pooled tables where they are written), and
+`psms_scored.parquet.report.json` names the classifier as always. The manifest's RT model
+identity says `(per window group)` after the model that ran.
 
 ## 6. Output layout
 
@@ -597,27 +613,28 @@ out/
   seed_psms.parquet                  pooled seed, library-wide ids (+ .masscal.json)
   seed_psms_calibrated.parquet       pooled seed with refreshed iRT (global, after re-prediction)
   cal.json                           run-level RT calibration record (section 7)
-  {chromatograms,psms_competed}.parquet  pooled (+ .report.json); psms_competed not
-                                     under groups.pool_competed = false, chromatograms not
-                                     under groups.pool_chromatograms = false (section 5)
-  groups/overlap_losers.parquet      the pool's overlap losers per band, written under
-                                     groups.pool_chromatograms = false
+  {chromatograms,psms_competed}.parquet  pooled (+ .report.json), only under
+                                     groups.pool_chromatograms / pool_competed = true, or
+                                     where the competed table must be pooled (section 5)
+  groups/overlap_losers.parquet      the pool's overlap losers per band, written unless
+                                     groups.pool_chromatograms = true
   psms_extracted.parquet             pooled only under extract.emit_candidate_audit
   psms_scored.parquet, quant, peptides.tsv, proteins.tsv, manifest.json  as always
 ```
 
-By default the band directories are diagnostics and reproducibility material, not inputs to
-any later stage; delete them once the run is accepted if space matters. Under
-`groups.pool_chromatograms = false` they are not: the band chromatogram tables and
-`groups/overlap_losers.parquet` are then the run's only chromatograms, and deleting them
-loses re-quantification and re-pooling. `groups.delete_band_intermediates`
-(default `false`) does part of that automatically: once the pool is written, each band's
+By default (`groups.pool_chromatograms = false`) the band directories hold the run's only
+chromatograms: the band chromatogram tables and `groups/overlap_losers.parquet` are what
+quant read, and deleting them loses re-quantification and re-pooling. Under
+`groups.pool_chromatograms = true` and `pool_competed = true` the band directories are
+diagnostics and reproducibility material, not inputs to any later stage; delete them once
+the run is accepted if space matters. `groups.delete_band_intermediates` (default `false`)
+does part of that automatically: once the pool is written, each band's
 `psms_extracted.parquet` and `features.parquet` (with their reports, schema companions and
 any `run.pin`) are deleted, which on the immunopeptidomics experiment was most of the band
 directories' volume. The chromatograms and competed tables stay, because `mumdia pool
 --groups-dir` re-pools from them; the manifest keeps the deleted tables' records. Disk only:
-every output is unchanged. There is no run-level
-`run_windows.parquet`: the windows are per band, and nothing after compete reads them.
+every output is unchanged. There is no run-level `run_windows.parquet`: the windows are per
+band, and nothing after compete reads them.
 
 ## 7. The run-level `cal.json`
 
