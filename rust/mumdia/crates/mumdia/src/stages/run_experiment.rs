@@ -795,6 +795,8 @@ fn portable_dir_name_problem(name: &str) -> Option<&'static str> {
 
 pub fn run(p: RunExperimentParams) -> Result<()> {
     let t0 = Instant::now();
+    // The time from here to the first stage, by step (`prestage::PreStageTimer`).
+    let mut pre = crate::prestage::PreStageTimer::start("run-experiment");
     // Same contract as the single-run orchestrator, and it matters more here: an
     // 83-file batch must not fail on a missing interpreter after the first run has
     // already been searched.
@@ -802,44 +804,47 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     resolved.predict_frag.sidecar_script_dir =
         crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
     crate::python::resolve(&mut resolved)?;
+    pre.step("resolve_interpreters");
     let p = RunExperimentParams {
         config: &resolved,
         ..p
     };
     let cfg = p.config;
     preflight(&p)?;
+    pre.step("preflight");
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
     std::fs::create_dir_all(p.out_dir).ok();
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
     let n_runs = p.mzmls.len();
 
     // Provenance: the identity of the code, of the configuration and of the INPUTS,
-    // hashed now, before anything reads them for compute (docs/29 #15). Hashing at the
+    // hashed from the start, before any stage reads them (docs/29 #15). Hashing at the
     // end recorded whatever bytes were on disk after a multi-hour experiment, which is
-    // not necessarily what the search read; the single-run orchestrator has always
-    // hashed first, and the two now agree.
+    // not necessarily what the search read.
+    //
+    // The hashes are taken on a background thread (`prestage::InputHashes`) and joined
+    // when the manifest is written. Taken serially here they were the first, cold read of
+    // every mzML and of the library, minutes of I/O with nothing else running on a large
+    // experiment. The order is the order the chain reads the files: the first run's mzML,
+    // then the library its seed loads, then the other runs. The manifest keys inputs by
+    // role, so the order changes nothing in it.
     let mut prov = Manifest::new(cfg.canonical_json(), ch.clone());
-    for (i, m) in p.mzmls.iter().enumerate() {
-        if let (Ok(bytes), Ok(hash)) = (
-            std::fs::metadata(m).map(|x| x.len()),
-            mumdia_io::hash::blake3_file(m),
-        ) {
-            prov.record_input(&format!("mzml[{i}]"), m, bytes, hash);
-        }
-    }
+    let mut hash_order: Vec<(String, String)> = Vec::with_capacity(n_runs + 3);
+    hash_order.push(("mzml[0]".to_string(), p.mzmls[0].clone()));
     for (role, path) in [
         ("fasta", p.fasta),
         ("lib_precursors", p.lib_precursors),
         ("lib_fragments", p.lib_fragments),
     ] {
-        let Some(path) = path else { continue };
-        if let (Ok(bytes), Ok(hash)) = (
-            std::fs::metadata(path).map(|x| x.len()),
-            mumdia_io::hash::blake3_file(path),
-        ) {
-            prov.record_input(role, path, bytes, hash);
+        if let Some(path) = path {
+            hash_order.push((role.to_string(), path.to_string()));
         }
     }
+    for (i, m) in p.mzmls.iter().enumerate().skip(1) {
+        hash_order.push((format!("mzml[{i}]"), m.clone()));
+    }
+    let input_hashes = crate::prestage::InputHashes::spawn("run-experiment", hash_order);
+    pre.step("provenance");
     // Reject a bad --run-names rather than silently substituting r0..rN-1.
     //
     // The old `_ =>` arm swallowed any count mismatch with no warning, and accepted
@@ -890,32 +895,66 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         }
         _ => {
             let fasta = p.fasta.expect("preflight guarantees --fasta in build mode");
-            let dig = d("peptides.parquet");
-            digest::run(digest::DigestParams {
-                fasta,
-                out: &dig,
-                cfg: &cfg.digest,
-                rng_seed: cfg.rng_seed,
-                config_hash: &ch,
-            })?;
-            let pf = d("peptidoforms.parquet");
-            peptidoforms::run(peptidoforms::PeptidoformsParams {
-                peptides: &dig,
-                out: &pf,
-                cfg: &cfg.peptidoforms,
-                config_hash: &ch,
-            })?;
             let lib_p = d("fragment_library_precursors.parquet");
             let lib_f = d("fragment_library_fragments.parquet");
-            predict_frag::run(predict_frag::PredictFragParams {
-                rt_placeholder: irt_placeholder,
-                peptidoforms: &pf,
-                out_precursors: &lib_p,
-                out_fragments: &lib_f,
-                work_dir: &d("sidecar_work"),
-                cfg: &cfg.predict_frag,
-                config_hash: &ch,
-            })?;
+            // `predict_frag.library_cache`, as in `run`: a stored library with the same key
+            // is published here instead of being built.
+            let cache = crate::library_cache::LibraryCache::for_config(
+                cfg,
+                fasta,
+                irt_placeholder,
+                (&prov.mumdia_version, &prov.git_sha),
+            );
+            if cache
+                .as_ref()
+                .and_then(|c| c.restore(&lib_p, &lib_f))
+                .is_some()
+            {
+                pre.first_stage("library-cache");
+                // A reused output directory may still hold an earlier build's digest and
+                // peptidoforms, which did not produce this library.
+                crate::library_cache::remove_build_intermediates(p.out_dir);
+            } else {
+                let dig = d("peptides.parquet");
+                pre.first_stage("digest");
+                digest::run(digest::DigestParams {
+                    fasta,
+                    out: &dig,
+                    cfg: &cfg.digest,
+                    rng_seed: cfg.rng_seed,
+                    config_hash: &ch,
+                })?;
+                let pf = d("peptidoforms.parquet");
+                peptidoforms::run(peptidoforms::PeptidoformsParams {
+                    peptides: &dig,
+                    out: &pf,
+                    cfg: &cfg.peptidoforms,
+                    config_hash: &ch,
+                })?;
+                predict_frag::run(predict_frag::PredictFragParams {
+                    rt_placeholder: irt_placeholder,
+                    peptidoforms: &pf,
+                    out_precursors: &lib_p,
+                    out_fragments: &lib_f,
+                    work_dir: &d("sidecar_work"),
+                    cfg: &cfg.predict_frag,
+                    config_hash: &ch,
+                })?;
+                match &cache {
+                    Some(c) => c.store(&lib_p, &lib_f),
+                    None => {
+                        if let Some(hint) =
+                            crate::library_cache::reuse_hint(cfg, &lib_p, &lib_f, irt_placeholder)
+                        {
+                            info!(
+                                "run-experiment: to search other files against this library \
+                                 without building it again, pass {hint}, or set \
+                                 predict_frag.library_cache to a directory and keep --fasta"
+                            );
+                        }
+                    }
+                }
+            }
             (lib_p, lib_f)
         }
     };
@@ -927,6 +966,13 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         p.lib_precursors.is_some(),
         cfg.predict_frag.deeplc_python.is_some(),
     );
+    // Library-input mode: the next stage is the base-model re-prediction or the first
+    // run's conversion. A FASTA build logged at its digest already, and this is a no-op.
+    pre.first_stage(if library_irt_repredicted {
+        "deeplc-repredict"
+    } else {
+        "convert"
+    });
     let lib_p_base = if library_irt_repredicted {
         let python = cfg
             .predict_frag
@@ -989,7 +1035,25 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // combined rescore keys rows by `source` index. Chunks are processed in order and
     // rayon's indexed `collect` preserves within-chunk order, so the result is identical
     // to the sequential build regardless of completion order.
-    let par = cfg.experiment.parallel_runs.max(1);
+    //
+    // `parallel_runs = "auto"` (stored as 0) is the other scheduler (`sched::RunConcurrency`):
+    // the count comes from the thread budget, each chain runs in a rayon pool of its own
+    // share, and a chain starts when a slot frees rather than at a chunk boundary. The
+    // explicit count keeps the chunk loops below exactly as they were.
+    let threads_budget = rayon::current_num_threads();
+    let mut plan =
+        crate::sched::RunConcurrency::resolve(cfg.experiment.parallel_runs, n_runs, threads_budget);
+    let par = plan.par;
+    if plan.is_auto() {
+        info!(
+            parallel_runs = plan.par,
+            pool_threads = plan.pool_threads.unwrap_or(0),
+            threads = threads_budget,
+            n = n_runs,
+            "run-experiment: parallel_runs = auto, sized from the thread budget (one run per \
+             16 threads at most, each in a pool of its own)"
+        );
+    }
     // Each run's competed tables, in row order (see `process_run`).
     let mut competed: Vec<Vec<String>> = Vec::with_capacity(n_runs);
     // Each run's chromatogram tables, in row order: one, or a grouped run's band tables
@@ -1058,23 +1122,38 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     } else {
         let mut conv: Vec<convert::ConvertOutputs> = Vec::with_capacity(n_runs);
         let all: Vec<usize> = (0..n_runs).collect();
-        for chunk in all.chunks(par) {
-            let done: Vec<convert::ConvertOutputs> = crate::colread::first_err(
-                chunk
-                    .par_iter()
-                    .map(|&i| {
-                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: convert");
-                        convert_run(
-                            cfg,
-                            &p.mzmls[i],
-                            &d(&names[i]),
-                            p.top_peaks_ms2,
-                            p.max_spectra,
-                        )
-                    })
-                    .collect(),
+        let convert_one = |i: usize| {
+            info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: convert");
+            convert_run(
+                cfg,
+                &p.mzmls[i],
+                &d(&names[i]),
+                p.top_peaks_ms2,
+                p.max_spectra,
+            )
+        };
+        if plan.is_auto() {
+            // Not in per-run pools: a conversion already takes its share of the engine's
+            // pool by dividing it among the live conversions (`convert::LIVE_CONVERTS`),
+            // and inside a pool of its own that division would count the others twice.
+            // With a memory reading the first conversion runs alone and its peak bounds
+            // how many of the rest run at once, as the chains are bounded later: the
+            // thread-sized count alone is no memory bound.
+            conv = crate::sched::run_first_alone(
+                plan,
+                threads_budget,
+                "run-experiment",
+                "the first conversion",
+                &all,
+                |&i| convert_one(i),
+                |p, rest| crate::sched::map_bounded(rest, p.par, |&i| convert_one(i)),
             )?;
-            conv.extend(done);
+        } else {
+            for chunk in all.chunks(par) {
+                let done: Vec<convert::ConvertOutputs> =
+                    crate::colread::first_err(chunk.par_iter().map(|&i| convert_one(i)).collect())?;
+                conv.extend(done);
+            }
         }
         let t_lib = Instant::now();
         let seed_lib = search_seed::SeedLibrary::load(
@@ -1092,25 +1171,36 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "run-experiment: one seed library and fragment index for every run's seed"
         );
         let mut seeds: Vec<String> = Vec::with_capacity(n_runs);
-        for chunk in all.chunks(par) {
-            let done: Vec<String> = crate::colread::first_err(
-                chunk
-                    .par_iter()
-                    .map(|&i| {
-                        info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: seed");
-                        seed_run(
-                            cfg,
-                            &ch,
-                            &lib_p_base,
-                            &lib_f,
-                            &conv[i],
-                            &d(&names[i]),
-                            Some(&seed_lib),
-                        )
-                    })
-                    .collect(),
+        let seed_one = |i: usize| {
+            info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: seed");
+            seed_run(
+                cfg,
+                &ch,
+                &lib_p_base,
+                &lib_f,
+                &conv[i],
+                &d(&names[i]),
+                Some(&seed_lib),
+            )
+        };
+        if plan.is_auto() {
+            // Bounded the same way: the first seed alone, from a reset high-water mark, so
+            // its peak is one seed over the resident seed library.
+            seeds = crate::sched::run_first_alone(
+                plan,
+                threads_budget,
+                "run-experiment",
+                "the first seed",
+                &all,
+                |&i| seed_one(i),
+                |p, rest| p.map_pooled(rest, |&i| seed_one(i)),
             )?;
-            seeds.extend(done);
+        } else {
+            for chunk in all.chunks(par) {
+                let done: Vec<String> =
+                    crate::colread::first_err(chunk.par_iter().map(|&i| seed_one(i)).collect())?;
+                seeds.extend(done);
+            }
         }
         drop(seed_lib);
         conv.into_iter().zip(seeds).map(Some).collect()
@@ -1154,6 +1244,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
 
     let mut shared_ft: Option<String> = None;
     let mut first: usize = 0;
+    // Opened just before the first run's chain when it runs alone under
+    // `parallel_runs = auto`, so its peak sizes the chains after it.
+    let mut first_window: Option<crate::sched::PeakWindow> = None;
     if overlapped {
         // Run 1's front, then its RT adaptation beside the fronts of runs 2..N on disjoint
         // thread budgets, then every run's rest on the whole pool.
@@ -1274,6 +1367,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         });
         let (lib0, produced) = adapted?;
         let fronts = fronts?;
+        // Under `parallel_runs = auto`, the first run's finish is what every later run
+        // repeats after its reused adaptation, so its peak alone sizes them.
+        let window = plan.is_auto().then(crate::sched::PeakWindow::open);
         let (comp0, chrom0) = finish_run(cfg, &ch, &lib0, &lib_f, &co0, &seed0, &out0)?;
         competed.push(vec![comp0]);
         chroms.push(vec![ChromTable::whole(&chrom0)]);
@@ -1300,21 +1396,45 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         };
         let items: Vec<(usize, &(convert::ConvertOutputs, String))> =
             (1..n_runs).zip(fronts.iter()).collect();
-        for chunk in items.chunks(par) {
-            let done: Vec<(String, String)> = if par == 1 {
-                chunk
-                    .iter()
-                    .map(|&(i, f)| back(i, f))
-                    .collect::<Result<Vec<_>>>()?
-            } else {
-                chunk
-                    .par_iter()
-                    .map(|&(i, f)| back(i, f))
-                    .collect::<Result<Vec<_>>>()?
+        if plan.is_auto() {
+            // Run 1 finished alone above, so its peak is the measurement the rest is sized
+            // on (`sched::bound_by_measured_peak`), unless each of them adapts the library
+            // itself in a DeepLC worker the measurement cannot see.
+            plan = match (produced.is_none(), window) {
+                (true, _) => {
+                    crate::sched::one_at_a_time_for_sidecars(plan, threads_budget, "run-experiment")
+                }
+                (false, Some(w)) => crate::sched::bound_by_measured_peak(
+                    plan,
+                    threads_budget,
+                    "run-experiment",
+                    "the first run's chain",
+                    w,
+                ),
+                (false, None) => plan,
             };
+            let done = plan.map_pooled(&items, |&(i, f)| back(i, f))?;
             for (comp, chrom) in done {
                 competed.push(vec![comp]);
                 chroms.push(vec![ChromTable::whole(&chrom)]);
+            }
+        } else {
+            for chunk in items.chunks(par) {
+                let done: Vec<(String, String)> = if par == 1 {
+                    chunk
+                        .iter()
+                        .map(|&(i, f)| back(i, f))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    chunk
+                        .par_iter()
+                        .map(|&(i, f)| back(i, f))
+                        .collect::<Result<Vec<_>>>()?
+                };
+                for (comp, chrom) in done {
+                    competed.push(vec![comp]);
+                    chroms.push(vec![ChromTable::whole(&chrom)]);
+                }
             }
         }
         first = n_runs;
@@ -1324,6 +1444,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             n = n_runs,
             "run-experiment: adapting the library's retention times on the first run only;              the remaining runs reuse that library and fit their own RT calibration on it              (experiment.rt_library_scope = per_run to adapt for every run instead)"
         );
+        // Under `parallel_runs = auto` the first run's peak sizes the rest (below).
+        first_window = plan.is_auto().then(crate::sched::PeakWindow::open);
         let (comp, chrom, ft) = run_one(0, None, None)?;
         competed.push(comp);
         chroms.push(chrom);
@@ -1348,7 +1470,78 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let grouped = cfg.groups.window_groups > 1;
     let mut slice_source: Option<String> = if grouped { shared_ft.clone() } else { None };
     let rest: Vec<usize> = (first..n_runs).collect();
-    if par == 1 {
+    if plan.is_auto() && first < n_runs {
+        // Under `parallel_runs = auto` the chains are pulled from a queue, each in its own
+        // pool. A chain that adapts the library itself (no adapted library to share) runs
+        // a DeepLC worker no memory reading of this process includes, so those chains run
+        // one at a time. Otherwise the first run, when it ran alone above, sizes the rest;
+        // and when no chain has run alone yet and there is a memory reading to take, the
+        // first one runs alone now so the rest are sized on its measured peak. Without a
+        // reading that would only cost concurrency.
+        let mut queue: &[usize] = &rest;
+        if adapts_rt_library && shared_ft.is_none() {
+            plan = crate::sched::one_at_a_time_for_sidecars(plan, threads_budget, "run-experiment");
+        } else if let Some(w) = first_window {
+            plan = crate::sched::bound_by_measured_peak(
+                plan,
+                threads_budget,
+                "run-experiment",
+                "the first run's chain",
+                w,
+            );
+        } else if first == 0
+            && plan.par > 1
+            && rest.len() > 1
+            && crate::sched::memory_reading().is_some()
+        {
+            let i = rest[0];
+            info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain, alone to size the rest (parallel_runs = auto)");
+            // On the engine's whole pool, exactly as the sequential loop runs it, from a
+            // reset high-water mark so the conversions and seeds before it are not counted.
+            let window = crate::sched::PeakWindow::open();
+            let (comp, chrom, groups_dir) =
+                run_one(i, shared_ft.as_deref(), slice_source.as_deref())?;
+            competed.push(comp);
+            chroms.push(chrom);
+            if grouped && slice_source.is_none() {
+                slice_source = groups_dir;
+            }
+            plan = crate::sched::bound_by_measured_peak(
+                plan,
+                threads_budget,
+                "run-experiment",
+                "the first chain",
+                window,
+            );
+            queue = &rest[1..];
+        }
+        info!(
+            parallel_runs = plan.par,
+            pool_threads = plan.pool_threads.unwrap_or(0),
+            n = n_runs,
+            "run-experiment: per-run chains, each in a pool of its own (parallel_runs = auto)"
+        );
+        // A grouped run's band slices are reused by the runs that START after it finished;
+        // which run that is depends on timing, as it depended on the chunk size before,
+        // and a reused slice is the same bytes a run would have written (`run_groups`).
+        let slices = std::sync::Mutex::new(slice_source.clone());
+        let done = plan.map_pooled(queue, |&i| {
+            info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
+            let from = slices.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let r = run_one(i, shared_ft.as_deref(), from.as_deref())?;
+            if grouped {
+                let mut slot = slices.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.is_none() {
+                    slot.clone_from(&r.2);
+                }
+            }
+            Ok(r)
+        })?;
+        for (comp, chrom, _) in done {
+            competed.push(comp);
+            chroms.push(chrom);
+        }
+    } else if par == 1 {
         for &i in &rest {
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
             let (comp, chrom, groups_dir) =
@@ -1717,6 +1910,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         "quant-lfq",
         &ch,
     )?);
+
+    // The input hashes started at the top of the experiment.
+    input_hashes.record(&mut prov);
 
     // The resolved configuration itself, not only its hash: a hash identifies a
     // configuration but cannot replay one (docs/29 #15).

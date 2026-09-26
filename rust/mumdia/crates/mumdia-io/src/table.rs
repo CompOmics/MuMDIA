@@ -1627,6 +1627,13 @@ pub fn publish_copy_of(src: &str, out: &str) -> Result<FileCopy> {
     publish_copy_of_with(src, out, true)
 }
 
+/// [`publish_copy_of`] without the hard link: `out` is always a file of its own, so a tool
+/// that edits either name in place cannot change the other. For a copy that other runs
+/// read later, such as a stored library.
+pub fn publish_byte_copy(src: &str, out: &str) -> Result<()> {
+    publish_copy_of_with(src, out, false).map(|_| ())
+}
+
 fn publish_copy_of_with(src: &str, out: &str, allow_link: bool) -> Result<FileCopy> {
     let target = AtomicPath::new(out)?;
     let tmp = target.tmp().to_path_buf();

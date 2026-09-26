@@ -219,6 +219,15 @@ Human-readable outputs: `peptides.tsv`, `proteins.tsv` (report), and
 (`run_experiment.rs:522-533`) and no TSVs at all, because it never calls the
 report stage (see the CLI notes below).
 
+Both orchestrators hash their input files for the manifest on a background thread
+(`prestage::InputHashes`), started before the first stage and joined when the manifest
+is written, so the hash is no longer a serial read on the critical path and the
+manifest records the same roles, paths, sizes and hashes as before. Each also writes one
+`pre-stage time` log line when its first stage starts (`prestage::PreStageTimer`): the
+milliseconds of interpreter discovery, preflight, provenance and the remaining setup,
+the total since the orchestrator's entry, and the time since process start, which also
+covers the configuration load and any vendor conversion in `main`.
+
 ## CLI subcommands
 
 `main.rs` is a thin `clap` layer: the `Cmd` enum (`main.rs:20`) defines one
@@ -297,8 +306,9 @@ Per-subcommand specifics that are easy to miss:
   which stages of different runs execute. One consequence of that order: a run whose
   conversion fails stops the experiment before any run is seeded, so the earlier
   runs' directories hold only `spectra/`. The smoke test checks both this and that
-  `parallel_runs = 2` writes the same parquet and TSV bytes as the sequential
-  experiment. A grouped run keeps its own chain. It
+  `parallel_runs = 2` and `parallel_runs = "auto"` (per-run thread pools sized from
+  the thread budget, `sched::RunConcurrency`) write the same parquet and TSV bytes as
+  the sequential experiment. A grouped run keeps its own chain. It
   then rescores all competed tables in one pass
   (`run_experiment.rs:428`), then splits the scored table by `source` for per-run
   quant (`run_experiment.rs:474-477`), cross-run LFQ, and then the

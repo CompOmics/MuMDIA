@@ -1109,6 +1109,8 @@ fn load_config(path: &Option<String>) -> Result<Config> {
 }
 
 fn main() -> Result<()> {
+    // The reference point for the orchestrators' pre-stage timer, before anything else.
+    mumdia::prestage::mark_process_start();
     // The dispatch in `real_main` is one large function whose arms keep their locals in
     // a single frame, and without optimisation that frame exceeds the 1 MiB main-thread
     // stack Windows reserves: the debug binary overflowed on `--version` before printing
@@ -1525,13 +1527,13 @@ fn real_main() -> Result<()> {
                 cfg.apply_profile(pf)?;
             }
             // Vendor files are converted to mzML before anything else happens, so every
-            // stage below sees mzML; an mzML path passes through untouched.
-            let mzml = mzml
-                .iter()
-                .map(|m| {
-                    mumdia::raw::ensure_mzml(m, &cfg.convert, Some(std::path::Path::new(&out_dir)))
-                })
-                .collect::<Result<Vec<String>>>()?;
+            // stage below sees mzML; an mzML path passes through untouched. Several vendor
+            // files convert concurrently, `convert.parallel_conversions` at a time.
+            let mzml = mumdia::raw::ensure_mzml_all(
+                &mzml,
+                &cfg.convert,
+                Some(std::path::Path::new(&out_dir)),
+            )?;
             if mzml.len() > 1 {
                 // Files provided together are rescored together. Searching them one by
                 // one would give N unrelated FDR estimates and count a peptide found in
@@ -1584,12 +1586,11 @@ fn real_main() -> Result<()> {
             if let Some(pf) = &profile {
                 cfg.apply_profile(pf)?;
             }
-            let mzml = mzml
-                .iter()
-                .map(|m| {
-                    mumdia::raw::ensure_mzml(m, &cfg.convert, Some(std::path::Path::new(&out_dir)))
-                })
-                .collect::<Result<Vec<String>>>()?;
+            let mzml = mumdia::raw::ensure_mzml_all(
+                &mzml,
+                &cfg.convert,
+                Some(std::path::Path::new(&out_dir)),
+            )?;
             let run_names = if run_names.is_empty() {
                 None
             } else {

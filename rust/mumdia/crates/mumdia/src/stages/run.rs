@@ -37,6 +37,16 @@ pub struct RunParams<'a> {
     pub top_peaks_ms2: usize,
 }
 
+/// A library-input artifact record waiting for its input hash (see `run`).
+struct LibraryInputRecord {
+    /// The artifact schema; its name is also the manifest's logical name.
+    schema: (&'static str, u32),
+    path: String,
+    rows: u64,
+    /// The manifest input role whose hash is this file's content hash.
+    input_role: &'static str,
+}
+
 /// Validate inputs and sidecar configuration before any multi-minute compute,
 /// so a missing file or a misconfigured rescorer fails immediately with an
 /// actionable message.
@@ -129,6 +139,8 @@ fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
 
 pub fn run(p: RunParams) -> Result<()> {
     let t0 = Instant::now();
+    // The time from here to the first stage, by step (`prestage::PreStageTimer`).
+    let mut pre = crate::prestage::PreStageTimer::start("run");
     // Fill in the sidecar interpreters and the worker directory before anything is
     // validated or hashed, so every stage sees a concrete path and the manifest
     // records the interpreter that actually ran rather than the word "auto".
@@ -136,37 +148,44 @@ pub fn run(p: RunParams) -> Result<()> {
     resolved.predict_frag.sidecar_script_dir =
         crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
     crate::python::resolve(&mut resolved)?;
+    pre.step("resolve_interpreters");
     let cfg = &resolved;
     preflight(&p, cfg)?;
+    pre.step("preflight");
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
     std::fs::create_dir_all(p.out_dir).ok();
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
 
     let mut man = Manifest::new(cfg.canonical_json(), ch.clone());
     info!(provenance = %man.provenance(), "run: build provenance");
-    // Hash the inputs before any of them is read for compute. This is what lets a
-    // result be tied back to the exact bytes it came from; recording only the path
-    // does not, because a path is reused. Cost is one sequential read per input at
-    // blake3 speed, and the file is about to be read again anyway, so it comes off
-    // a warm cache.
-    for (role, path) in [
-        ("mzml", Some(p.mzml)),
-        ("fasta", p.fasta),
-        ("lib_precursors", p.lib_precursors),
-        ("lib_fragments", p.lib_fragments),
-    ] {
-        let Some(path) = path else { continue };
-        match (
-            std::fs::metadata(path).map(|m| m.len()),
-            mumdia_io::hash::blake3_file(path),
-        ) {
-            (Ok(bytes), Ok(hash)) => man.record_input(role, path, bytes, hash),
-            // A missing or unreadable input is already a preflight error; if it
-            // somehow becomes unreadable here, an incomplete manifest is a worse
-            // outcome than a warning.
-            _ => warn!(role, path, "run: could not hash input for the manifest"),
-        }
-    }
+    // Hash the inputs, starting now, before any stage reads them. This is what ties a
+    // result to the exact bytes it came from; recording only the path does not, because a
+    // path is reused. The hash is the FIRST read of each input, so it is the cold one: on
+    // a large library it is minutes of sequential I/O, and it used to sit on the critical
+    // path before the first stage, one input after another. It runs on a background thread
+    // instead, in the order the stages below read the files, and is joined only when the
+    // manifest is written, so the manifest records exactly what the serial loop recorded
+    // (`prestage::InputHashes`). A missing input is a preflight error; one that becomes
+    // unreadable since then is left out of the manifest with a warning, as before.
+    let input_hashes = crate::prestage::InputHashes::spawn(
+        "run",
+        [
+            ("mzml", Some(p.mzml)),
+            ("fasta", p.fasta),
+            ("lib_precursors", p.lib_precursors),
+            ("lib_fragments", p.lib_fragments),
+        ]
+        .into_iter()
+        .filter_map(|(role, path)| path.map(|x| (role.to_string(), x.to_string())))
+        .collect(),
+    );
+    // The two library-input records, completed once the input hashes are joined: they are
+    // the same files, so their content hash IS the input hash, and hashing them here as
+    // well read a multi-GB library a second time before the first stage. A later stage
+    // that records an adapted precursor table under the same logical name wins, exactly as
+    // it did when this record was inserted first and then overwritten (end of `run`).
+    let mut library_input_records: Vec<LibraryInputRecord> = Vec::new();
+    pre.step("provenance");
 
     // A FASTA build may leave DeepLC to the multi-head calibration, which re-predicts every
     // row before anything reads the iRT (`predict_frag.defer_deeplc_to_multihead`).
@@ -189,112 +208,132 @@ pub fn run(p: RunParams) -> Result<()> {
             );
             let np = mumdia_io::table::nrows(lp)?;
             let nf = mumdia_io::table::nrows(lf)?;
-            // The library files were hashed as INPUTS a moment ago, and nothing has written
-            // them since; the fragment table is the largest file a library search reads.
-            // Record them from that hash rather than reading them a second time. The hash
-            // is recomputed only if the input hash above failed and was skipped.
-            for (role, schema, path, rows) in [
-                (
-                    "lib_precursors",
-                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
-                    lp,
-                    np,
-                ),
-                (
-                    "lib_fragments",
-                    artifact::FRAGMENT_LIBRARY_FRAGMENTS,
-                    lf,
-                    nf,
-                ),
-            ] {
-                let known = man
-                    .inputs
-                    .get(role)
-                    .filter(|r| r.path == path)
-                    .map(|r| r.content_hash.clone());
-                let rec = match known {
-                    Some(hash) => record_artifact_with_hash(
-                        schema.0,
-                        schema,
-                        path,
-                        rows,
-                        "library-input",
-                        &ch,
-                        hash,
-                    ),
-                    None => record_artifact(schema.0, schema, path, rows, "library-input", &ch)?,
-                };
-                man.record(rec);
-            }
+            library_input_records.push(LibraryInputRecord {
+                schema: artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                path: lp.to_string(),
+                rows: np,
+                input_role: "lib_precursors",
+            });
+            library_input_records.push(LibraryInputRecord {
+                schema: artifact::FRAGMENT_LIBRARY_FRAGMENTS,
+                path: lf.to_string(),
+                rows: nf,
+                input_role: "lib_fragments",
+            });
             (lp.to_string(), lf.to_string())
         }
         _ => {
             // Build the library from the FASTA digest. preflight guarantees the
             // FASTA is present in this branch.
             let fasta = p.fasta.expect("preflight guarantees --fasta in build mode");
-            let dig = d("peptides.parquet");
-            let w = digest::run_hashed(digest::DigestParams {
-                fasta,
-                out: &dig,
-                cfg: &cfg.digest,
-                rng_seed: cfg.rng_seed,
-                config_hash: &ch,
-            })?;
-            man.record(w.record(
-                artifact::PEPTIDES.0,
-                artifact::PEPTIDES,
-                &dig,
-                "digest",
-                &ch,
-            ));
-
-            let pf = d("peptidoforms.parquet");
-            let w = peptidoforms::run_hashed(peptidoforms::PeptidoformsParams {
-                peptides: &dig,
-                out: &pf,
-                cfg: &cfg.peptidoforms,
-                config_hash: &ch,
-            })?;
-            man.record(w.record(
-                artifact::PEPTIDOFORMS.0,
-                artifact::PEPTIDOFORMS,
-                &pf,
-                "peptidoforms",
-                &ch,
-            ));
-
             let lib_p = d("fragment_library_precursors.parquet");
             let lib_f = d("fragment_library_fragments.parquet");
-            if cfg.predict_frag.defer_deeplc_to_multihead && !rt_placeholder {
-                info!(
-                    "run: predict_frag.defer_deeplc_to_multihead is set, but no multi-head \
-                     calibration re-predicts this library (it needs rt_predictor = deeplc \
-                     and a DeepLC interpreter); predicting it with DeepLC as usual"
-                );
-            }
-            let (wp, wf) = predict_frag::run_hashed(predict_frag::PredictFragParams {
+            // `predict_frag.library_cache`: a library stored by an earlier run with the same
+            // FASTA, build settings, predictor versions and engine is published here instead
+            // of being built (`library_cache`).
+            let cache = crate::library_cache::LibraryCache::for_config(
+                cfg,
+                fasta,
                 rt_placeholder,
-                peptidoforms: &pf,
-                out_precursors: &lib_p,
-                out_fragments: &lib_f,
-                work_dir: &d("sidecar_work"),
-                cfg: &cfg.predict_frag,
-                config_hash: &ch,
-            })?;
-            man.record(wp.record(
-                artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                artifact::FRAGMENT_LIBRARY_PRECURSORS,
-                &lib_p,
-                "predict-frag",
-                &ch,
-            ));
-            man.record(wf.record(
-                artifact::FRAGMENT_LIBRARY_FRAGMENTS.0,
-                artifact::FRAGMENT_LIBRARY_FRAGMENTS,
-                &lib_f,
-                "predict-frag",
-                &ch,
-            ));
+                (&man.mumdia_version, &man.git_sha),
+            );
+            if let Some((wp, wf)) = cache.as_ref().and_then(|c| c.restore(&lib_p, &lib_f)) {
+                pre.first_stage("library-cache");
+                // A reused output directory may still hold an earlier build's digest and
+                // peptidoforms, which did not produce this library.
+                crate::library_cache::remove_build_intermediates(p.out_dir);
+                man.record(wp.record(
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    &lib_p,
+                    "library-cache",
+                    &ch,
+                ));
+                man.record(wf.record(
+                    artifact::FRAGMENT_LIBRARY_FRAGMENTS.0,
+                    artifact::FRAGMENT_LIBRARY_FRAGMENTS,
+                    &lib_f,
+                    "library-cache",
+                    &ch,
+                ));
+            } else {
+                let dig = d("peptides.parquet");
+                pre.first_stage("digest");
+                let w = digest::run_hashed(digest::DigestParams {
+                    fasta,
+                    out: &dig,
+                    cfg: &cfg.digest,
+                    rng_seed: cfg.rng_seed,
+                    config_hash: &ch,
+                })?;
+                man.record(w.record(
+                    artifact::PEPTIDES.0,
+                    artifact::PEPTIDES,
+                    &dig,
+                    "digest",
+                    &ch,
+                ));
+
+                let pf = d("peptidoforms.parquet");
+                let w = peptidoforms::run_hashed(peptidoforms::PeptidoformsParams {
+                    peptides: &dig,
+                    out: &pf,
+                    cfg: &cfg.peptidoforms,
+                    config_hash: &ch,
+                })?;
+                man.record(w.record(
+                    artifact::PEPTIDOFORMS.0,
+                    artifact::PEPTIDOFORMS,
+                    &pf,
+                    "peptidoforms",
+                    &ch,
+                ));
+
+                if cfg.predict_frag.defer_deeplc_to_multihead && !rt_placeholder {
+                    info!(
+                        "run: predict_frag.defer_deeplc_to_multihead is set, but no multi-head \
+                         calibration re-predicts this library (it needs rt_predictor = deeplc \
+                         and a DeepLC interpreter); predicting it with DeepLC as usual"
+                    );
+                }
+                let (wp, wf) = predict_frag::run_hashed(predict_frag::PredictFragParams {
+                    rt_placeholder,
+                    peptidoforms: &pf,
+                    out_precursors: &lib_p,
+                    out_fragments: &lib_f,
+                    work_dir: &d("sidecar_work"),
+                    cfg: &cfg.predict_frag,
+                    config_hash: &ch,
+                })?;
+                man.record(wp.record(
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    &lib_p,
+                    "predict-frag",
+                    &ch,
+                ));
+                man.record(wf.record(
+                    artifact::FRAGMENT_LIBRARY_FRAGMENTS.0,
+                    artifact::FRAGMENT_LIBRARY_FRAGMENTS,
+                    &lib_f,
+                    "predict-frag",
+                    &ch,
+                ));
+                match &cache {
+                    Some(c) => c.store(&lib_p, &lib_f),
+                    None => {
+                        if let Some(hint) =
+                            crate::library_cache::reuse_hint(cfg, &lib_p, &lib_f, rt_placeholder)
+                        {
+                            info!(
+                                "run: to search another file against this library without \
+                                 building it again, pass {hint}, or set \
+                                 predict_frag.library_cache to a directory and keep --fasta"
+                            );
+                        }
+                    }
+                }
+            }
             (lib_p, lib_f)
         }
     };
@@ -313,6 +352,7 @@ pub fn run(p: RunParams) -> Result<()> {
         p.top_peaks_ms2,
         0
     ));
+    pre.first_stage("convert");
     info!(stage = %"convert", "run: stage start");
     let co = convert::run(convert::ConvertParams {
         mzml: p.mzml,
@@ -884,6 +924,45 @@ pub fn run(p: RunParams) -> Result<()> {
         "feature_schema_id".into(),
         features::feature_schema_id(&features::active_features(cfg.features.set)),
     );
+
+    // The input hashes, taken on the background thread started at the top, and the
+    // library-input records that share them. A record is inserted only where no later
+    // stage recorded that logical name, which is the map the old order produced: the
+    // library-input record first, then any adapted precursor table overwriting it.
+    let hashes = input_hashes.record(&mut man);
+    for r in library_input_records {
+        let logical = r.schema.0;
+        if man.artifacts.contains_key(logical) {
+            continue;
+        }
+        let rec = match hashes.get(r.input_role) {
+            Some(h) => Ok(record_artifact_with_hash(
+                logical,
+                r.schema,
+                &r.path,
+                r.rows,
+                "library-input",
+                &ch,
+                h.clone(),
+            )),
+            // The input could not be hashed on the thread: try once more here. Every stage
+            // has read the library by now, so a file that is still unreadable became so
+            // during the run, and failing on it would end a finished run without its
+            // manifest. It is left out with a warning instead, as `InputHashes::record`
+            // leaves out the input itself.
+            None => record_artifact(logical, r.schema, &r.path, r.rows, "library-input", &ch),
+        };
+        match rec {
+            Ok(rec) => man.record(rec),
+            Err(e) => warn!(
+                artifact = logical,
+                path = %r.path,
+                error = %format!("{e:#}"),
+                "run: the library input could not be hashed; its artifact record is left out \
+                 of the manifest"
+            ),
+        }
+    }
 
     let manifest_path = d("manifest.json");
     mumdia_io::json::write_json(&manifest_path, &man)?;

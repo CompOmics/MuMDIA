@@ -867,6 +867,26 @@ sequential behavior. Runs are independent so raising it scales nearly linearly i
 wall time, but each concurrent run holds its own extraction working set, so the
 practical ceiling is memory rather than cores. Results are unaffected: chunks are
 processed in index order and completion order never reaches the output.
+`"auto"` (stored as `0`, so the canonical configuration of every numeric setting is
+unchanged) is a second scheduler (`sched::RunConcurrency`): one run per 16 threads of
+`--threads` at most, never more than the runs, each concurrent chain inside a rayon pool
+of its own `threads / runs` threads, and a chain started as soon as a slot frees rather
+than at a chunk boundary. On Linux each phase is bounded by memory: the first
+conversion, the first seed and the first chain each run alone from a reset high-water
+mark (`/proc/self/clear_refs`, `sched::PeakWindow`), and the rest of that phase run at
+most `0.7 x (available + VmRSS) / VmHWM` at once, where `available` is `MemAvailable`
+lowered to the headroom of the process's memory cgroup (v2 `memory.max`, v1
+`memory.limit_in_bytes`, less the working set) when that is smaller, because
+`/proc/meminfo` shows the host's memory inside a container or a batch job. `VmHWM` does
+not include child processes, so chains that each run their own DeepLC adaptation
+(`rt_library_scope = per_run`) run one at a time under `"auto"`, with a warning; an
+explicit number runs them concurrently. Elsewhere there is no memory reading and the
+sizing uses threads only. The reset makes a lifetime peak read from resource usage
+(`/usr/bin/time -v`) cover only the time since the last measured step, so an `"auto"`
+experiment's memory is measured with a sampling profiler such as `bench/mem_profile.py`.
+It is opt-in because a stage in a narrower pool can lay out intermediate files
+differently; the smoke test asserts that every parquet and TSV of a three-run fixture
+experiment is byte-identical to the sequential one, with two chains running at once.
 `rt_library_scope` (default `first_run_only`, and still accepted under its old name
 `finetune_scope`) is consulted whenever the library's retention times are adapted to a
 run: `rt_im_train.finetune_deeplc` or `rt_im_train.multihead_calibration`. See
