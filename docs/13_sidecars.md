@@ -424,12 +424,20 @@ miss under a K-shard plan ran on one shard's `budget / K` threads, slower than e
 sharded or the one-process prediction. `meta.json` records the count as `torch_threads`
 (`test_a_projection_cache_miss_uses_the_whole_predict_thread_budget`). A fine-tuned model has
 no factored head and predicts as usual. The summary records `projection_cache` (`hit`, `key`,
-`path`, timings). The values are float-equivalent to a plain prediction: bit-identical for
-the base model on the smoke library, and within the spline edge amplification for the
-multi-head calibration (`test_the_projection_cache_reproduces_the_prediction_and_is_read_back`).
-Private DeepLC API (`FactoredPredictionMatrix._projections`, `core._default_task_idx`,
-present in 4.4.0 and 4.5.0); a release that moves them falls back to a plain prediction with
-a warning.
+`path`, timings). The values are float-equivalent to a plain prediction, because the cached path
+evaluates the heads in numpy where the plain path runs them in torch. For the base model that
+means last-bit differences: identical on all 3,820 rows of the smoke library, but 109 of the
+572 rows of the test fixture moved, by at most 1.5e-5 s (DeepLC 4.5.0, CPU). For the
+multi-head calibration the spline edges amplify them
+(`test_the_projection_cache_reproduces_the_prediction_and_is_read_back`).
+It needs DeepLC 4.5.0 or newer. The factored matrix (`deeplc._factored`,
+`FactoredPredictionMatrix._projections`) and `_model_ops.supports_factored` are private
+DeepLC API added in 4.5.0; 4.4.x, the engine's floor, has neither. There the worker prints a
+warning, records `projection_cache: {"used": false, "why": ...}` naming the version, writes
+no cache entry and predicts exactly as without the flag, so setting it is harmless but does
+nothing. A later release that moves these names falls back the same way. CI pins 4.4.0, so
+it tests that fallback (`test_the_projection_cache_falls_back_to_a_plain_prediction_before_deeplc_4_5`);
+the cache tests themselves skip below 4.5.0.
 
 **DeepLC thread cap.** Every DeepLC call site asks for the engine's rayon thread count
 (the fine-tune's training pool keeps its own bound), and both workers cap what they

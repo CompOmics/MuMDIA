@@ -1171,18 +1171,23 @@ def predict_from_projections(uniq, model, calibration, chunk, cache_dir):
     DeepLC version, the model file's bytes and the exact sequence list.
 
     Returns `(values, record, timers)`, or `(None, record, None)` when the model has no
-    factored head, in which case the caller predicts as usual. Private DeepLC API
-    (`FactoredPredictionMatrix._projections`, `_default_task_idx`, present in 4.4.0 and
-    4.5.0): a release that moves them falls back the same way, with a warning.
+    factored head, in which case the caller predicts as usual. Private DeepLC API:
+    `deeplc._factored.FactoredPredictionMatrix._projections` and
+    `_model_ops.supports_factored` were added in DeepLC 4.5.0 (`core._default_task_idx` is
+    older). DeepLC 4.4.x, the engine's floor, has neither, so there the cache warns, records
+    why, and the caller predicts as usual; a later release that moves them falls back the
+    same way.
     """
     try:
         from deeplc import _model_ops
         from deeplc._factored import FactoredPredictionMatrix
         from deeplc.core import DEFAULT_MODEL, _default_task_idx
     except ImportError as exc:
-        print("WARNING: projection cache unavailable (%s); predicting as usual" % exc,
+        why = ("DeepLC %s has no factored prediction matrix (deeplc._factored, added in "
+               "4.5.0): %s" % (getattr(deeplc, "__version__", "?"), exc))
+        print("WARNING: projection cache unavailable: %s; predicting as usual" % why,
               flush=True)
-        return None, {"used": False, "why": str(exc)}, None
+        return None, {"used": False, "why": why}, None
     if model is None or not _model_ops.supports_factored(model):
         print("WARNING: projection cache: this model has no factored head; predicting as "
               "usual", flush=True)
