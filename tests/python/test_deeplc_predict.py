@@ -508,8 +508,8 @@ def test_the_shard_plan_is_a_function_of_the_request_the_budget_and_the_library(
         assert len(b) <= k
 
 
-def _deeplc_or_skip(minimum=(4, 4, 0)):
-    """Skip unless DeepLC >= `minimum` is installed for this interpreter.
+def _deeplc_version():
+    """`(raw, (major, minor, patch))` of the installed DeepLC, or skip when it is absent.
 
     Presence and version come from the package metadata: importing deeplc inside pytest,
     after numpy and pyarrow, is the import order that breaks torch on Windows.
@@ -527,8 +527,20 @@ def _deeplc_or_skip(minimum=(4, 4, 0)):
                 break
             digits += ch
         parts.append(int(digits or 0))
-    if tuple(parts + [0] * (3 - len(parts))) < minimum:
+    return raw, tuple(parts + [0] * (3 - len(parts)))
+
+
+def _deeplc_or_skip(minimum=(4, 4, 0)):
+    """Skip unless DeepLC >= `minimum` is installed for this interpreter."""
+    raw, version = _deeplc_version()
+    if version < minimum:
         pytest.skip("DeepLC {} is older than {}".format(raw, ".".join(map(str, minimum))))
+
+
+# The projection cache reads DeepLC's factored prediction matrix (`deeplc._factored`,
+# `_model_ops.supports_factored`), which DeepLC added in 4.5.0. 4.4.0, the engine's floor
+# and the version CI pins, has neither, so there the worker warns and predicts as usual.
+PROJECTION_CACHE_DEEPLC = (4, 5, 0)
 
 
 def _write_shard_fixture(work, n_base=260):
@@ -713,10 +725,11 @@ def test_bands_write_the_whole_library_column_band_by_band(tmp_path, mode):
 
 @pytest.mark.parametrize("mode", ["base", "multihead"])
 def test_the_projection_cache_reproduces_the_prediction_and_is_read_back(tmp_path, mode):
-    """`--projection-cache`: a miss writes the projection, a hit reads it, and the values
-    match a plain prediction (bit for bit for the base model's default head, within float
-    tolerance for the multi-head transform, which evaluates the heads in numpy)."""
-    _deeplc_or_skip()
+    """`--projection-cache`: a miss writes the projection, a hit reads it bit for bit, and
+    the values are float-equivalent to a plain prediction. The cached path evaluates the
+    heads from the factors in numpy where the plain path runs them in torch, so a row can
+    differ in its last float32 bits."""
+    _deeplc_or_skip(PROJECTION_CACHE_DEEPLC)
     import numpy as np
 
     _write_shard_fixture(tmp_path)
@@ -735,7 +748,13 @@ def test_the_projection_cache_reproduces_the_prediction_and_is_read_back(tmp_pat
     plain, miss, hit = (_predicted_irt(outs[a]) for a in ("plain", "miss", "hit"))
     assert (miss == hit).all(), "a cache hit changed the values"
     if mode == "base":
-        assert (plain == miss).all(), "{} rows differ".format(int((plain != miss).sum()))
+        # Measured on this fixture with DeepLC 4.5.0 (Windows, CPU): 109 of 572 rows differ,
+        # by at most 1.5e-5 s on a -67 to 141 s scale, a few float32 ulp. The smoke library
+        # happened to be identical on all 3,820 rows, which is why this once asserted equality.
+        a = plain.view(np.float32).astype(np.float64)
+        b = miss.view(np.float32).astype(np.float64)
+        assert np.max(np.abs(a - b)) <= 1e-4, "max |delta| {:.3e} s".format(np.max(np.abs(a - b)))
+        assert np.median(np.abs(a - b)) == 0.0
     else:
         # Float-equivalent: the heads are evaluated from the cached factors in numpy, and the
         # multi-head splines amplify last-bit differences for the few sequences outside the
@@ -757,11 +776,41 @@ def test_the_projection_cache_reproduces_the_prediction_and_is_read_back(tmp_pat
     assert not [p for p in cache.iterdir() if ".tmp-" in p.name]
 
 
+def test_the_projection_cache_falls_back_to_a_plain_prediction_before_deeplc_4_5(tmp_path):
+    """DeepLC 4.4.x has no factored prediction matrix, so `--projection-cache` must warn,
+    record why it was not used, write no cache entry, and predict exactly as without it.
+    This is the path CI exercises: env/docker-deeplc.yml pins the 4.4.0 floor."""
+    raw, version = _deeplc_version()
+    if version < (4, 4, 0):
+        pytest.skip("DeepLC {} is older than the engine floor 4.4.0".format(raw))
+    if version >= PROJECTION_CACHE_DEEPLC:
+        pytest.skip("DeepLC {} has the factored matrix; the cache is used there".format(raw))
+    _write_shard_fixture(tmp_path)
+    lib = tmp_path / "lib.parquet"
+    env = {"MUMDIA_DEEPLC_THREAD_CAP": "0", "CUDA_VISIBLE_DEVICES": "-1"}
+    common = ["--no-finetune", "--threads", "1", "--predict-threads", "1", "--predict-chunk", "64"]
+    cache = tmp_path / "cache"
+    outs = {}
+    for arm, extra in [("plain", []), ("cached", ["--projection-cache", str(cache)])]:
+        out = tmp_path / "{}.parquet".format(arm)
+        stdout, _ = run_worker_ok("deeplc_finetune.py", str(lib), "-", str(out), *common,
+                                  *extra, env=env, timeout=1800)
+        outs[arm] = (out, stdout)
+    plain, cached = (_predicted_irt(outs[a][0]) for a in ("plain", "cached"))
+    assert (plain == cached).all(), "the fallback must predict exactly as without the cache"
+    summary = json.loads((tmp_path / "cached.parquet.summary.json").read_text("utf-8"))
+    record = summary["projection_cache"]
+    assert record["used"] is False, record
+    assert "4.5.0" in record["why"], record
+    assert "projection cache" in outs["cached"][1], "the fallback must warn"
+    assert not cache.exists() or not any(cache.iterdir()), list(cache.iterdir())
+
+
 def test_a_projection_cache_miss_uses_the_whole_predict_thread_budget(tmp_path):
     """A miss computes the projection in this one process, so it gets `--predict-threads`,
     not the budget of one of the `--shards` it replaces (2 threads here, where a 2-shard plan
     gives each shard 1)."""
-    _deeplc_or_skip()
+    _deeplc_or_skip(PROJECTION_CACHE_DEEPLC)
     _write_shard_fixture(tmp_path)
     lib = tmp_path / "lib.parquet"
     out = tmp_path / "out.parquet"
