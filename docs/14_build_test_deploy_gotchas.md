@@ -28,7 +28,7 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `rust/mumdia/.cargo/config.toml.example` | Committed template of the above; a fresh clone with no local copy builds into `./target` |
 | `rust/mumdia/crates/mumdia/Cargo.toml` | The bin+lib crate `mumdia`; `[[bin]]` name `mumdia` -> `src/main.rs`; all deps come from `workspace.dependencies` |
 | `rust/mumdia/crates/mumdia-core/Cargo.toml` | Core crate; depends only on `serde`/`serde_json`/`thiserror` (no arrow/parquet, so no I/O layer) |
-| `rust/mumdia/crates/mumdia-io/Cargo.toml` | I/O crate; adds `arrow`/`parquet`/`blake3` over `mumdia-core` |
+| `rust/mumdia/crates/mumdia-io/Cargo.toml` | I/O crate; adds `arrow`/`parquet`/`blake3` over `mumdia-core`, plus `rayon` for the dedicated parquet codec pool (`codec.rs`) and `bytes` for the `SpanCache` `ChunkReader` (`span_cache.rs`) |
 | `rust/mumdia/crates/mumdia/tests/pipeline.rs` | The only integration test file: extract -> features -> compete -> rescore on crafted Parquet |
 | `rust/mumdia/crates/mumdia-core/build.rs` | Stamps the git commit and build date into the crate so `manifest.json` can record them |
 | `.github/workflows/ci.yml` | Eight jobs: `lint` (fmt + clippy `-D warnings` + rustdoc), `audit` (`cargo audit` on both lockfiles, engine and desktop), `build-test` matrix on ubuntu/macos/windows, `smoke` (end-to-end `run` and `run-experiment` on a generated fixture, ubuntu + windows), `sidecar-imports` (a real conda env per sidecar, matrixed, plus `pip-audit`), `smoke-cross-platform` (asserts the two platforms produced byte-identical `peptides.tsv` and `proteins.tsv`), `desktop` (the console's own workspace: fmt, clippy, unit tests, and a frontend/backend consistency check), `sidecars` (compileall + JSON/YAML parse + doc-reference check + generated-document freshness); on push-to-`main`, every PR, weekly, and on demand |
@@ -121,8 +121,10 @@ resolver (`resolver = "2"`, `Cargo.toml:2`) and lists three members
 (`Cargo.toml:3`). Each crate declares only the subset it needs: `mumdia-core`
 depends on `serde`/`serde_json`/`thiserror` only (no arrow/parquet, so the core
 types stay I/O-free); `mumdia-io` adds `arrow`/`parquet`/`blake3` over
-`mumdia-core`; the `mumdia` bin+lib crate pulls the full set including `clap`,
-`rayon`, `mzdata`, and `tracing`. The engine needs **no cmake and no system C libraries**, which is what the feature
+`mumdia-core`, plus `rayon` for its own parquet codec pool (parallel column
+encode and decode, `codec.rs`) and `bytes` for the coalescing `ChunkReader`
+(`span_cache.rs`); the `mumdia` bin+lib crate pulls the full set including
+`clap`, `rayon`, `mzdata`, and `tracing`. The engine needs **no cmake and no system C libraries**, which is what the feature
 selection buys: `parquet` uses `default-features = false, features =
 ["arrow","snap"]` to drop the C zlib-ng backend that needs cmake and to use the
 pure-Rust SNAPPY codec (`Cargo.toml:36-37`); `mzdata` uses `["mzml",
@@ -810,11 +812,14 @@ the only thing that exercises it is a FASTA-mode library build.
 and the smoke job exercise native paths only. Inside `cargo test` there is still
 no stage-level test for `convert`, `search-seed`, `predict-frag`, the `run`
 orchestrator, `manifest.json`, `inspect`, or the library-input path; `ci/smoke.sh`
-now covers all of those except the library-input path, but it runs outside
-`cargo test`, so a green `cargo test --workspace` alone still proves none of them.
-The real sidecar strategies (MS2PIP, DeepLC, DeepLC fine-tune, mokapot, the
+now covers all of those, the library-input path only in its stub-DeepLC arm (5b), but it
+runs outside `cargo test`, so a green `cargo test --workspace` alone still proves none of
+them. The real sidecar strategies (MS2PIP, DeepLC, DeepLC fine-tune, mokapot, the
 PyTorch NN, entrapment, MBR) never run in the test suite or in CI; only the native
-fallbacks are covered. (Percolator is not a gap but a rejection: `validate`
+fallbacks are covered. Arm 5b replaces `deeplc_finetune.py` with a stub that copies
+each library table and logs its call, so what CI checks there is which DeepLC calls the
+orchestrators make and where the tables go (`groups.rt_adaptation`, band-slice reuse, the
+deferred-DeepLC refusal, `experiment.overlap_front_threads`), not any retention time. (Percolator is not a gap but a rejection: `validate`
 refuses it, `config.rs:1512`.) This gap has already shipped one real defect: a
 module-level import reordering in `scripts/deeplc_worker.py` made every
 FASTA-mode DeepLC prediction abort on Windows, and a green workspace suite plus a

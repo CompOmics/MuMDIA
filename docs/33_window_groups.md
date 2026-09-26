@@ -31,12 +31,18 @@ on.
 |---|---|---|
 | `window_groups` | `1` | Number of groups. `1` is the ordinary single-library search. Clamped to the number of distinct isolation windows; groups whose band selects no precursor are merged into a neighbour, so the number actually searched can be smaller (the log and `groups/plan.json` say how many). |
 | `calibration` | `global` | Whose seed anchors calibrate each group's retention time and mass: `global` pools every group's seeds first (section 4); `per_group` uses the group's own. |
+| `parallel` | `1` | Bands in flight at a time, through a bounded queue that starts the most expensive band first (section 8, "Scheduling the bands"). Clamped below the thread count. |
+| `rt_adaptation` | `per_band` | `once_per_run` adapts the library's retention times in one DeepLC worker per run over the union of the bands, under `global` calibration (section 4b). Float-equivalent, opt-in. |
+| `balance` | `precursors` | `cost` balances the cuts on precursors times MS2 peaks per window instead (section 2). Output-changing, opt-in. |
+| `delete_band_intermediates` | `false` | Delete each band's `psms_extracted` and `features` tables once the pool is written (section 6). Disk only. |
+| `pool_competed` | `true` | `false` leaves the competed rows per band and has rescore read the band tables with a table-to-source map, where that cannot change a result (section 5). `psms_scored.parquet` is byte-identical; the pooled competed table is not written. Opt-in. |
+| `pool_chromatograms` | `true` | `false` leaves the chromatograms per band and has quant read the band tables with the overlap losers the pool persists to `groups/overlap_losers.parquet` (section 5). The quant tables are byte-identical; the pooled chromatogram table is not written, and the band directories become the run's only chromatograms (section 6). Opt-in. |
 
-`run-experiment` (and `run` with several `--mzml`, which dispatches to it) refuses a
-grouped configuration rather than searching each run against the whole library while the
-key says otherwise. Run each file with `mumdia run --mzml <one file>` and pool the competed
-tables with `mumdia rescore --competed a b c`, which stamps `source` and computes the
-per-source `run_psm_q` (`docs/11_compete_rescore_fdr.md`).
+`run-experiment` (and `run` with several `--mzml`, which dispatches to it) searches every run
+grouped, with one experiment-wide rescore over the pooled competed tables and the
+per-source `run_psm_q` (`docs/11_compete_rescore_fdr.md`). Under
+`experiment.rt_library_scope = first_run_only` the runs after the first reuse the first
+run's adapted bands (section 3).
 
 ## 2. Planning the groups
 
@@ -52,6 +58,18 @@ than by windows matters: on the immunopeptidomics library the per-window precurs
 differed by 3x across the m/z range, and equal window counts would have made the memory
 peak the largest band's, not the average's.
 
+`groups.balance = cost` (default `precursors`) balances the cuts on an estimate of the search
+cost instead: per window, the precursors it selects times the MS2 peaks its scans carry
+(`groups::window_costs`; the run's MS2 is decoded before the plan for this, and for the
+dispatch order, section 8). Band cost follows spectral density more than precursor count:
+on the immunopeptidomics search two bands of 2.98M and 3.03M precursors took 42 s and 460 s,
+and at 81-94 bands the slowest single windows (418-460 s) set the floor of the run. The
+bands' `est_precursors` and the merge of empty bands are unchanged, and `plan.json` records
+`"balance": "Cost"`. The setting moves the cuts, and with them which candidates sit at a band
+edge and the order of the pooled rows the classifier sees, so it is output-changing and
+opt-in; validate it as a band-count change (section 8): peptides at 1% inside the seed spread
+against `precursors`, and the per-band wall times, on two acquisitions. Not measured.
+
 A band is the union of its windows' m/z ranges. Two consequences are written to
 `groups/plan.json`:
 
@@ -64,38 +82,54 @@ A band is the union of its windows' m/z ranges. Two consequences are written to
 
 ## 3. One band, one library
 
-For each group the orchestrator writes the band as a precursor table of its own,
-`groups/gNN/lib_precursors.parquet`, with band-local ids `0..n`
-(`groups::write_band_slice`, which reads only the row groups that cover the span through
-`TableFile::open_rows`). The band's first library row is its offset; local id plus offset is
-the library-wide id, and every stage below carries it in the manifest as `name[gNN]`.
+A band is the precursor rows `[first, first + n)` of the m/z-sorted library whose m/z lies in
+the band's range (`Library::precursor_row_span`, from the row-group statistics and one decode
+of `precursor_mz` over the boundary groups). The band's first library row is its offset;
+local id plus offset is the library-wide id, and every stage below carries it in the manifest
+as `name[gNN]`.
 
-The stages then run unchanged on that table, as if it were the library:
+The stages then run unchanged on that band, as if it were the library:
 
-- `search-seed` loads the band with `Library::load_with_fragment_offset`: the band file plus
-  the fragments whose ids lie in the band's range, read from the shared, library-wide
-  fragment table. When that table is sorted by `candidate_id` at row-group granularity
-  (`scripts/sort_fragments.py`; every library writer ends with the sort) the read is
-  selective; an unsorted table still loads through a filtered scan of the whole table, with a
-  warning, and costs the scan per band.
+- `search-seed` loads the band straight from the library by row span
+  (`Library::load_row_span_with`: local ids `0..n`, the fragments whose ids lie in the band's
+  range read from the shared, library-wide fragment table). When that table is sorted by
+  `candidate_id` at row-group granularity (`scripts/sort_fragments.py`; every library writer
+  ends with the sort) the read is selective; an unsorted table still loads through a filtered
+  scan of the whole table, with a warning, and costs the scan per band.
 - the RT model (multi-head calibration, the optional fine-tune, or the base-model
   re-prediction, whichever the configuration resolves to; `docs/08_rt_im_train.md`) runs
   on the band table and writes the band's re-predicted table. The DeepLC sidecars rewrite a
-  precursor file, which is why the band is a file rather than an in-memory slice.
+  precursor FILE, so a band that an RT model adapts is first written out as a precursor table
+  of its own, `groups/gNN/lib_precursors.parquet`, with band-local ids `0..n`
+  (`groups::write_band_slice`, which reads only the row groups that cover the span through
+  `TableFile::open_rows`).
 - `rt-im-train` writes the band's `run_windows.parquet` and `cal.json`.
 - `extract`, `features` and `compete` write the band's `psms_extracted`, `chromatograms`,
   `features` and `psms_competed`. The id columns are library-wide on the way out
   (local id plus `Library::global_offset`), so a band's table means the same thing as the
   run's and pooling is a concatenation.
 
+`rt-im-train` and `extract` read the adapted band file where an RT model ran, and the band by
+row span from the library where none did (`rt_model` `library`, or the bands keeping a
+re-prediction the caller made, section 4b). A span load is the same library, value for value,
+as a band file of the same rows (`band_slice_file_loads_with_the_fragment_offset_and_matches_the_range_load`
+in `index.rs`), and every artifact of a grouped fixture run is byte-identical either way.
+Until 2026-09-25 every band was written out before its seed whether or not anything rewrote
+it: on a 203.5M-precursor library searched without an RT model, that was the whole precursor
+table decoded and re-encoded once per run, for a file only the seed, `rt-im-train` and
+`extract` read.
+
 Nothing outside the band is resident during any of these, except the run's spectra, which
 are decoded once for all the bands (next section).
 
 Under `experiment.rt_library_scope = first_run_only` the runs after the first reuse the first
-run's adapted bands, and then they reuse its band slices too: a slice is a deterministic
-function of the library and the row span, so rewriting it would produce the same bytes. Only
-the seed reads it, and the adapted table replaces it everywhere else. On a 203M-precursor
-library that is the whole precursor table not written, per run after the first.
+run's adapted bands, and they need no slice at all: the seed reads the band by span, and the
+adapted table replaces it everywhere else. Where every run adapts its own bands
+(`rt_library_scope = per_run`), a run after the first takes the first grouped run's slices
+(`GroupRun::slices_from`) when the two `groups/plan.json` list the same bands: a slice is a
+deterministic function of the library and the row span, so rewriting it would produce the
+same bytes. On a 203M-precursor library that is the whole precursor table not written, per
+run after the first.
 
 ### The run's spectra, decoded once per phase
 
@@ -229,26 +263,71 @@ calibration already uses the pooled anchors under `groups.calibration = global`:
 - `search-seed`, asked for it (`SearchSeedParams::emit_calibrants`, set only by the grouped
   path), writes `<seed>.masscal.parquet` beside the masscal: `candidate_id` (LIBRARY-WIDE,
   the band's local id plus its fragment offset), `scan_index`, `frag_mz` and `ppm`, one row
-  per matched fragment. 16 B per deviation, a few MB for a whole run.
+  per matched fragment of every target PSM of the band. 16 B per deviation; the size is
+  bounded below.
 - `seed-pool` reads them, keeps the deviations whose PSM the POOLED q accepts at
-  `search_seed.fdr_seed` (and whose scan is the one the pool kept, so an overlap candidate
-  contributes one PSM's fragments as an ungrouped seed would), and fits
-  `masscal::MassCal::fit_from` -- the same function `search-seed` calls -- once.
+  `search_seed.fdr_seed`, and fits `masscal::MassCal::fit_from` -- the same function
+  `search-seed` calls -- once. A deviation is kept only from the band whose row the pool
+  kept for that candidate, and only for that row's scan. A precursor in the overlap of two
+  windows across a cut is loaded by both bands, and each band serves both windows for it,
+  so both bands usually hold the same PSM with the same deviations; the band index is what
+  makes it contribute one PSM's fragments, as in an ungrouped seed. Keyed on the scan
+  alone, as it was until 2026-09-25, those deviations were counted once per band.
   `two_pass_mass_cal` and the `mass_cal_loess` grid work on this path, because both read the
   deviations rather than a scalar.
 - The band's own `<seed>.masscal.json` is unchanged: still fitted on that band's confident
   targets alone, and still what `groups.calibration = per_group` extracts with.
 
 The band's q is not the pooled q in either direction, so the sidecar carries more than the
-band's own selection: the band's best-scoring targets down to
-`masscal::CALIBRANT_OFFER_PSMS` (2,000) are offered whatever its own q says, and the pooled
-q decides. That matters where the band q is STRICTER, which is the `1/T` case above: on the
-CI fixture at three bands, every band's own q rejects every one of its targets, so a
-strictly q-selected sidecar would be empty in all three. With the offer, the three bands
-contribute 437, 401 and 230 deviations, the pool selects all 1,068 of them and fits
-`frag_tol_ppm` 5.0 at offset 0.0 -- the same calibration, to the digit, that the ungrouped
-search of the same spectra produces. Before this the same run calibrated nothing and
-extracted at the configured 20 ppm.
+band's own selection: EVERY target PSM of the band is offered whatever its own q says, and
+the pooled q decides. That matters where the band q is STRICTER, which is the `1/T` case
+above: on the CI fixture at three bands, every band's own q rejects every one of its
+targets, so a strictly q-selected sidecar would be empty in all three. With the offer, the
+three bands contribute 437, 401 and 230 deviations, the pool selects all 1,068 of them and
+fits `frag_tol_ppm` 5.0 at offset 0.0 -- the same calibration, to the digit, that the
+ungrouped search of the same spectra produces. Before this the same run calibrated nothing
+and extracted at the configured 20 ppm.
+
+Until 2026-09-25 the offer was a fixed prefix, each band's 2,000 best targets. No rule a
+band can apply to its own data gives a superset of what the pooled q accepts, because the
+pooled threshold moves with the other bands: a band of clean, high-scoring targets lowers
+it, and the pool then accepts targets of a noisier band at scores where that band's own q is
+well above the threshold. The prefix was sized from the 100-band benchmark (about 1,000
+pooled-accepted targets per band) and was exact from 8 bands up, and short below it. On the
+six-file HYE Astral benchmark, 2026-09-24:
+
+| bands | calibrant deviations | `frag_tol_ppm` |
+|---|---|---|
+| unbanded | 181,196 | 8.45 |
+| 2, 2,000-target prefix | 167,418 | 7.76 |
+| 4, 2,000-target prefix | 177,380 | 8.24 |
+| 8 and more, 2,000-target prefix | 181,196 | 8.45 |
+
+The missing deviations belonged to the lower-scoring accepted targets, which are the
+noisier ones, so the short fits came out narrower rather than wider. With every target
+offered, and each accepted candidate taken from one band, the pooled fit is the unbanded
+fit at any band count and with overlapping windows; `ci/smoke.sh` checks this at two bands
+on the fixture, and `tests/pipeline.rs`
+(`a_two_band_pooled_mass_calibration_equals_the_unbanded_fit`) on a two-band library built
+so that one band's own q rejects hundreds of targets the pooled q accepts, which the old
+prefix failed by 2,000 deviations of 30,000. Its second arm makes the two windows overlap
+across the cut (400-501 and 500-600, 13 shared targets): keyed on the scan alone the pool
+counted their deviations twice, 30,052 against the unbanded 30,000.
+
+The sidecar stays 16 B per deviation, now for every target of the band, and its size
+follows the band's scans rather than its library. The seed keeps one row per candidate and
+each MS2 scan contributes at most `search_seed.report_psms` candidates (5 by default), and
+a row adds at most one deviation per library fragment of its candidate. A band therefore
+holds at most `served scans x report_psms x fragments per candidate` deviations whatever its
+precursor count: for a run of 100,000 MS2 scans, 5 rows per scan and 12 fragments per
+candidate, 6M deviations and 96 MB over all its bands together, which is a bound and not a
+measurement. The band's `search-seed` holds them in memory until the write, which moves the
+columns rather than copying them. `seed-pool` decodes one band's sidecar at a time. Each
+band's seed report records `calibrant_deviations`, `calibrant_bytes` and
+`calibrant_target_rows`, and the seed-pool log line records `band_deviations`,
+`band_deviation_bytes` and `largest_band_bytes`. On the CI fixture at two bands that is 616
+and 452 deviations (9,856 and 7,232 B, from 103 and 76 target rows), all 1,068 of them
+accepted. Not yet measured at scale: see section 10.
 
 `masscal.json` gains `masscal_source`, which reads `pooled_deviations` or `band_scalars`. A
 band directory seeded before the sidecar existed has none, and the pool then combines the
@@ -271,12 +350,20 @@ Under `global`, after a per-band re-prediction of the library iRT, the pooled an
 the library's iRT as it was when seeded; `seed_pool::refresh_irt` then copies each anchor's
 new value from its band's table into `seed_psms_calibrated.parquet`, which is what
 `rt-im-train` reads. The RT fit is then identical across bands (same anchors, same model),
-and only the windows differ, because the precursors do.
+and only the windows differ, because the precursors do. So it is fitted once:
+`rt_im_train::fit_from_seed` reads the pooled (or refreshed) seed and fits the curve, the
+window width and the optional held-out and adaptive sizing, and every band only applies that
+fit to its own table (`rt_im_train::apply`), writing its `run_windows.parquet` and a
+`cal.json` identical to the one it wrote when it fitted for itself
+(`one_fit_applied_writes_what_the_whole_stage_writes`). Before, each band decoded the pooled
+seed and refitted the same curve, one seed decode and one fit per band on the band loop's
+critical path; the log now shows one `stage=rt-fit` line per run. `per_group` fits per band,
+as before.
 
 Refitting per band is sound because the multi-head ridge and the base-model re-prediction
 are deterministic in their anchors: the same pooled anchors give the same head selection,
-the same ridge and the same predictions, so every band carries one model, at the cost of
-one anchor pass per band (seconds). The optional DeepLC fine-tune is not deterministic and
+the same ridge and the same predictions, so every band carries one model. What it costs is
+one DeepLC worker per band, which section 4b below removes. The optional DeepLC fine-tune is not deterministic and
 would be trained once per band, so a grouped run refuses `rt_im_train.finetune_deeplc`;
 fine-tune the library once beforehand (`docs/08_rt_im_train.md`, once per library) and
 search that table.
@@ -286,6 +373,59 @@ one pooling pass cheaper and every group is independent, but each group fits on 
 of the anchors, and the fit quality sets the RT window that the extract of every group then
 pays for. On the CI fixture it cannot fit at all (no band has a confident anchor, for the
 `1/T` reason above); on a real run every band has thousands.
+
+### 4b. One retention-time adaptation per run (`groups.rt_adaptation`)
+
+The per-band refit above is sound but not cheap. Each band's DeepLC sidecar starts an
+interpreter, imports torch and DeepLC, reads the pooled seed, refits the same heads on the
+same anchors (head 2503 in every band of the HYE sweep), and predicts every sequence of its
+own band. The charge states of one peptidoform sit at `(M + z * 1.007) / z`, which differ by
+a factor of at least 1.33, so they usually fall in different bands and each of those bands
+predicts the sequence again: the 10.9M HYE precursor rows are 4.91M unique sequences
+unbanded. Measured on HYE Astral (2026-09-24), the multi-head step took about 13 min
+unbanded and 19-24 min at 2-16 bands.
+
+`groups.rt_adaptation = once_per_run` (default `per_band`, the behaviour before the setting
+existed) runs one worker per run under `calibration = global`:
+`deeplc_finetune.py - <seed> - --bands <tsv>`, where `groups/rt_bands.tsv` lists every
+band's table and output. The worker fits the multi-head calibration once, predicts the union
+of the bands' unique sequences once, in the order the bands list them, and rewrites each band
+with the rule a single table gets, writing `groups/gNN/lib_precursors_multihead.parquet` (or
+`_deeplc` for the base-model re-prediction) and its `.summary.json` under the names a
+per-band run uses. The shared-band reuse of later runs, `seed_pool::refresh_irt` and the
+manifest records are therefore unchanged. `per_group` keeps one sidecar per band, fitted on
+the band's own anchors.
+
+The setting also covers a re-prediction the caller has already made. With the multi-head
+calibration off and `library_irt` resolving to DeepLC, `run-experiment` re-predicts the
+imported library once for the whole experiment, and each band of each run then re-predicted
+its slice of that table again, because `experiment.rt_library_scope` shares only an
+adaptation (a fine-tune or the multi-head calibration). Under `once_per_run` the bands keep
+the experiment-level values (`GroupRun::library_irt_repredicted`); under `per_band` they
+re-predict as before.
+
+Output effect: float-equivalent to `per_band`, not bit-identical. A sequence is predicted
+once, in different company from its per-band prediction, and torch's CPU kernels round by
+batch. Measured on the smoke fixture with DeepLC 4.5.0 on CPU (3,820 precursors, 4 threads):
+
+| | `per_band` | `once_per_run` |
+|---|---|---|
+| 3 bands, multi-head 80: sequences predicted | 2,954 (1,174 + 1,310 + 470) | 1,910 |
+| same, wall of the run | 25 s | 12 s |
+| same, selected heads | identical | identical |
+| same, largest per-row change of `predicted_irt` | | 0.87 s |
+| same, PSMs at `q_value` 1% / peptides at `peptide_q_value` 5% | 154 / 152 | 156 / 152 |
+| `run-experiment`, 2 runs of 2 bands, multi-head off: wall | 39 s | 9 s |
+| same, bands re-predicted | 4 | 0 |
+| same, largest change of a band value against the experiment-level one | 6.1e-5 s | 0 |
+
+On a synthetic library one `--bands` call over contiguous bands writes exactly the
+whole-library column band by band, under both the multi-head calibration and the base model
+(`tests/python/test_deeplc_predict.py`,
+`test_bands_write_the_whole_library_column_band_by_band`), so the union call reproduces what
+an unbanded run predicts. Before defaulting it on: the per-band max |delta `predicted_irt`|
+and the selected heads against `per_band`, and peptides at 1% on a banded HYE arm inside the
+seed spread, on two acquisitions.
 
 ## 5. The artifact pool
 
@@ -346,6 +486,14 @@ hardware and single-threaded: 110% CPU throughout. The spliced output holds the 
 the same order with the same values; its row groups are the bands' own, so it is not
 byte-identical to a re-encoded pool.
 
+Under `extract.chromatogram_schema = 2` the band chromatogram tables are v2
+(docs/15_data_dictionary.md, "Layout v2"), and every band of a run has the same layout,
+since the splice refuses a band whose columns differ. A v2 row group decodes on its own,
+so splicing whole groups keeps the pooled table readable. The groups the pool decodes
+and filters are written back as one group each, whatever their size: the filter drops
+whole candidates, which keeps every surviving candidate's axis row, while a split would
+leave the rows after it without one.
+
 `mumdia pool --groups-dir <run>/groups` runs the same stage standalone, which is how those
 numbers were taken, and is what to reach for when a grouped search finished but the run did
 not: the band directories hold everything, and pooling them is a copy. The feature and competed schema companions
@@ -353,8 +501,84 @@ not: the band directories hold everything, and pooling them is a copy. The featu
 band wrote the same one. Each pooled table gets a `.report.json` whose stage is `pool` and
 whose stats record the number of groups and the overlap duplicates removed.
 
+The overlap dedup itself is skipped when the bands' library row spans are disjoint. A band
+is a row span of the m/z-sorted precursor table and a candidate id is the band-local id
+plus the band's first row, so bands whose spans do not overlap cannot share a candidate.
+`run_groups` knows the spans from the plan and tells the pool (`bands_disjoint`), which then
+does not decode `candidate_id` and `prelim_score` of every band's competed table and build
+a map over every candidate of the run to find no duplicate. The test is on the row spans,
+not on the band m/z bounds: two bands that touch at one m/z value both hold a precursor at
+exactly that value, and the spans say so. The standalone `mumdia pool` has no plan to ask
+and looks as before. The pooled tables are byte-identical either way
+(`disjoint_bands_skip_the_dedup_and_pool_the_same_bytes`).
+
+With `groups.pool_competed = false` the competed rows are not pooled at all. Rescore
+already accepts several competed tables; it reads the bands' tables in band order with a
+table-to-source map (`RescoreParams::sources`, every band of run i stamped `source` i), so
+its input rows are exactly the rows the pooled table would hold, in its order, and
+`psms_scored.parquet` is byte-identical to the pooled run's
+(`band_tables_with_a_source_map_score_the_pooled_tables_bytes`). That saves one full write
+and read of the run's widest artifact, about 83 GB per run on the immunopeptidomics
+experiment (about 581 GB for its seven runs). It is done only where it cannot change a
+result or starve a reader: the bands' row spans must be disjoint, since otherwise the
+overlap losers have to be dropped, and neither the candidate audit nor match-between-runs
+may be on, since both read the pooled table. Otherwise the table is pooled and the log
+says why. What changes is the artifact set: there is no pooled `psms_competed.parquet`
+(one an earlier run left in the directory is removed) and no manifest record for it, and
+the scored table's report lists the band tables under `competed_inputs` with their
+`competed_sources`. A later standalone `mumdia rescore` or `mumdia audit` needs the table,
+which `mumdia pool --groups-dir` rebuilds from the bands. To validate on a data set, run
+the same grouped configuration with the default and with `false` and compare
+`psms_scored.parquet` byte for byte.
+
+With `groups.pool_chromatograms = false` the chromatograms are not pooled either. Quant is
+the table's one reader (the candidate audit and match-between-runs do not open it), and it
+reads a run's chromatogram tables as a list: the bands' own tables in band order, each with
+the candidates it does not contribute (`quant::ChromTable`). Those are the overlap losers
+of the chromatogram tables, the same sets the pooled table is spliced without, and here the
+pool writes them to `groups/overlap_losers.parquet` (`band`, `candidate_id`; no rows for
+disjoint bands), so unlike `pool_competed` this also holds for overlapping bands. The losers
+are found in the chromatogram tables themselves, not only in the competed ones
+(`pool::table_losers`): a band's chromatogram table holds every candidate extract accepted,
+including ones compete then deleted there, so under `compete.group_by = base_peptide` or
+`apex` a candidate can be in two bands' chromatogram tables and one competed table. It is
+kept from the band whose competed row won it (from the first band that holds it when no
+band kept it) and dropped from the others, in the pooled table as in the band tables.
+Before this, the pooled table held both bands' rows of such a candidate and quant summed
+them; the default `peptidoform_charge` gives each candidate a group of its own and deletes
+none, so it was not affected. The loser file's footer names the band tables it belongs to,
+in order (directory and file name, row count, and the content hash of each table's
+report), and a standalone quant refuses a list of band tables that differs in count, order
+or identity. Quant reads the tables in order, drops each one's losers, and concatenates the per-table stores with the
+same `ChromStore::append` that joins row groups, which rebuilds a file seam exactly as it
+rebuilds a row-group seam: its store is the one the pooled table gives, and so are the quant
+tables, byte for byte (`quant_from_the_band_tables_writes_the_pooled_runs_bytes`, with two
+bands overlapping, two of the overlap candidates deleted by compete in one band each;
+`band_tables_read_in_order_rebuild_the_pooled_tables_store`, with a band whose groups are
+all pruned). A candidate with rows in two of the tables, which is what the band tables of
+overlapping bands read without their losers give, is refused rather than quantified from
+both; so is a candidate whose rows continue from the end of one table into the next, which
+a real band table never gives, although the store rebuilds that seam. That saves the
+splice write, the hash and one read of the run's largest artifact, about 68 GB per run on
+the immunopeptidomics experiment. The artifact set changes: no pooled `chromatograms.parquet`
+(one an earlier run left is removed, as a loser table an earlier run left is under the
+default) and no manifest record for it, an `overlap_losers` record instead, and the quant report's `chromatograms` lists the band tables with
+`chromatogram_dropped_candidates`. A later standalone quant is
+`mumdia quant --chromatograms groups/g00/chromatograms.parquet ... --overlap-losers
+groups/overlap_losers.parquet`, with the band tables in band order, or `mumdia pool
+--groups-dir` rebuilds the pooled table. To validate on a data set, run the same grouped
+configuration with the default and with `false` and compare `peptide_quant.parquet`,
+`protein_group_quant.parquet` and `fragment_quant.parquet` byte for byte; the smoke does this
+on its three-band fixture. Done on the AIF benchmark in four bands (augmented DIA-NN
+library, `native_tda`, 1,050,807 chromatogram rows, disjoint bands): the three quant tables,
+`psms_scored.parquet` and both TSVs were byte-identical, the pooled table the run no longer
+wrote was 237 MB, and `mumdia quant` over the four band tables with the loser file wrote
+the same quant tables again. Overlapping bands are covered by the tests above only
+(`a_candidate_compete_deleted_in_one_band_is_pooled_from_one_band` for the loser sets).
+
 From here on the run is an ordinary run: rescore, audit, quant and report read the pooled
-tables, and `psms_scored.parquet.report.json` names the classifier as always. The manifest's
+tables (or the band tables above), and `psms_scored.parquet.report.json` names the
+classifier as always. The manifest's
 RT model identity says `(per window group)` after the model that ran.
 
 ## 6. Output layout
@@ -363,7 +587,7 @@ RT model identity says `(per window group)` after the model that ran.
 out/
   spectra/                           convert, as always
   groups/plan.json                   bands, windows, estimates, calibration mode
-  groups/gNN/lib_precursors.parquet  the band (local ids)
+  groups/gNN/lib_precursors.parquet  the band (local ids), only where an RT model rewrites it
   groups/gNN/seed_psms.parquet       band seed (+ .masscal.json)
   groups/gNN/seed_psms_pooled.parquet  the band's view of the pooled seed
   groups/gNN/lib_precursors_<model>.parquet  re-predicted band, when an RT model ran
@@ -373,13 +597,26 @@ out/
   seed_psms.parquet                  pooled seed, library-wide ids (+ .masscal.json)
   seed_psms_calibrated.parquet       pooled seed with refreshed iRT (global, after re-prediction)
   cal.json                           run-level RT calibration record (section 7)
-  {chromatograms,psms_competed}.parquet  pooled (+ .report.json)
+  {chromatograms,psms_competed}.parquet  pooled (+ .report.json); psms_competed not
+                                     under groups.pool_competed = false, chromatograms not
+                                     under groups.pool_chromatograms = false (section 5)
+  groups/overlap_losers.parquet      the pool's overlap losers per band, written under
+                                     groups.pool_chromatograms = false
   psms_extracted.parquet             pooled only under extract.emit_candidate_audit
   psms_scored.parquet, quant, peptides.tsv, proteins.tsv, manifest.json  as always
 ```
 
-The band directories are diagnostics and reproducibility material, not inputs to any later
-stage; delete them once the run is accepted if space matters. There is no run-level
+By default the band directories are diagnostics and reproducibility material, not inputs to
+any later stage; delete them once the run is accepted if space matters. Under
+`groups.pool_chromatograms = false` they are not: the band chromatogram tables and
+`groups/overlap_losers.parquet` are then the run's only chromatograms, and deleting them
+loses re-quantification and re-pooling. `groups.delete_band_intermediates`
+(default `false`) does part of that automatically: once the pool is written, each band's
+`psms_extracted.parquet` and `features.parquet` (with their reports, schema companions and
+any `run.pin`) are deleted, which on the immunopeptidomics experiment was most of the band
+directories' volume. The chromatograms and competed tables stay, because `mumdia pool
+--groups-dir` re-pools from them; the manifest keeps the deleted tables' records. Disk only:
+every output is unchanged. There is no run-level
 `run_windows.parquet`: the windows are per band, and nothing after compete reads them.
 
 ## 7. The run-level `cal.json`
@@ -591,6 +828,35 @@ the unbanded arm, which is the same noise in the other direction. Banding is
 identification-neutral on this data once the calibration is fitted once, and what it costs
 is the fixed per-band work above.
 
+### Scheduling the bands: a bounded queue, longest first
+
+`groups.parallel` bands are in flight at a time in each of the three band phases (seed,
+retention-time windows and extract, features and compete). They go through a bounded work
+queue (`groups::run_bounded`): that many workers each take the next band as soon as their
+current one is done. Until 2026-09-25 the phases ran in fixed chunks of `parallel` bands
+with a barrier after each chunk, so a chunk waited for its slowest band while the other
+slots sat idle. The bound on the resident set is the same, since no more than `parallel`
+bands are ever in flight, and results are still merged in band order, so the artifacts and
+the manifest do not depend on the schedule.
+
+The queue starts the most expensive bands first. Band cost follows spectral density rather
+than the precursor count the plan balances: on the immunopeptidomics search two bands of
+2.98M and 3.03M precursors took 42 s and 460 s (2026-09-21). The seed and extract phases
+estimate a band's cost as the sum over its windows of the window's estimated precursors
+times the MS2 peaks of its scans (`groups::window_costs`, both known before the seed); the
+features phase uses the rows the band's extract accepted. Starting the long bands first
+keeps one of them from arriving last and running alone. The gain is not measured; it is
+zero at the default `parallel: 1`, and it applies only where the band phases are CPU-bound.
+
+Inside a band, the seed's parallel unit is a contiguous RT chunk of a window group rather
+than the whole group (`docs/07_search_seed.md`, step 3). A band serves only the one to three
+isolation windows over its m/z range (114 windows over 63 bands on the immunopeptidomics
+plan, three per band on the 100-band HYE plan), so with one task per window its probe phase
+ran on one to three threads whatever `--threads` was. The chunked seed is bit-identical to
+the per-window one; the gain is not measured. The interval from a band's
+`search-seed: loaded` to its `search-seed: mass recalibration` log line is the index build
+plus the probe, which is what the change shortens.
+
 ### `groups.parallel` and the thread count
 
 A band in flight occupies one rayon worker, which then blocks on its own extraction's
@@ -644,14 +910,26 @@ candidates into the scored table. How much of that this fix returns is not yet m
 
 ## 10. What is not there yet
 
-- Groups run one after another in one process. Running them as child processes in parallel
-  is the next step and needs nothing in the artifacts: the band directories are already
-  independent, and the pool reads whatever is there.
+- Bands run in one process, `groups.parallel` at a time through the bounded queue. Running
+  them as child processes is still open and needs nothing in the artifacts: the band
+  directories are already independent, and the pool reads whatever is there.
 - Choosing `window_groups` from a memory budget rather than by hand. The plan's
   `est_precursors` per band and the measured bytes per precursor of extract are what it
   would use.
-- `run-experiment`: per-run grouped search with the pooled `rescore --competed` and the
-  per-source `run_psm_q` it already provides.
+- Measurements at scale of the 2026-09-25 changes: the band queue and the chunked seed
+  (per-band wall times on the immunopeptidomics or HYE banded arms), `rt_adaptation =
+  once_per_run` and `balance = cost` (peptides at 1% inside the seed spread on two
+  acquisitions), and the projection cache (`rt_im_train.deeplc_projection_cache`) under
+  `rt_library_scope = per_run`. The fixture runs pin their output effect, not their gain.
+- The calibrant sidecar's size and the grouped seed phase's peak at scale, now that every
+  target is offered (section 4a): the per-band `calibrant_bytes` and the seed and seed-pool
+  peaks on HYE at 2 bands and on the 63-band immunopeptidomics plan. The bound in section 4a
+  says they follow the run's scans and not its library; if a band's sidecar turns out to
+  matter beside the seed's own tables, the seed can stream it to the parquet in row groups
+  and `seed-pool` can filter it row group by row group.
+- `experiment.overlap_front_threads` overlaps the convert and seed of runs 2..N with the
+  first run's adaptation only for ungrouped runs; a grouped run seeds inside its band loop,
+  so overlapping it would need the band loop split between runs.
 - Entrapment validation. The grouped search computes the same scores from the same
   evidence, and the fixture shows identical identifications within tie noise, but the
   policy in `docs/20` asks for an empirical null on two acquisitions before any default

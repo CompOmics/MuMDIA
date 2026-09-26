@@ -35,24 +35,37 @@ pub const MIN_CALIBRANTS: usize = 20;
 /// Fewest calibrant deviations the optional m/z-dependent (LOESS) grid is fitted from.
 pub const MIN_LOESS_CALIBRANTS: usize = 50;
 
-/// How many of a band's best-scoring target PSMs are OFFERED as calibrants in the sidecar,
-/// over and above the ones the band's own q accepts.
-///
-/// A band estimates `spectrum_q` on its own PSMs, and that estimate is not the pooled one
-/// in either direction. On the HYE Astral benchmark it is looser (106,088 band-confident
-/// against 97,584 pooled), which is half of why the banded tolerance came out wide, and
-/// `seed-pool` re-selecting on the pooled q removes that. On a band with few targets it is
-/// far STRICTER instead: on the CI fixture at three bands, every band's own q rejects every
-/// one of its targets, so a sidecar of "the band's confident calibrants" is empty in all
-/// three and the pooled fit has nothing, while the same spectra searched against the whole
-/// library give 1,068 calibrants.
-///
-/// The set the pooled q accepts inside one band is a score-ranked prefix of that band's
-/// targets, so offering a prefix rather than the band's own q-selected set is the shape of
-/// superset that makes the pooled selection exact. Sized above what a band can plausibly
-/// need -- about 1,000 PSMs per band were pooled-accepted on the 100-band benchmark -- while
-/// the sidecar stays a few MB for a whole run.
-pub const CALIBRANT_OFFER_PSMS: usize = 2_000;
+// Every target is offered.
+//
+// A band estimates `spectrum_q` on its own PSMs, and that estimate is not the pooled one
+// in either direction. On the HYE Astral benchmark at 100 bands it is looser (106,088
+// band-confident against 97,584 pooled), which is half of why the banded tolerance came
+// out wide, and `seed-pool` re-selecting on the pooled q removes that. On a band with few
+// targets, or a band whose low-scoring targets sit among decoys, it is STRICTER instead:
+// on the CI fixture at three bands every band's own q rejects every one of its targets.
+//
+// So the sidecar has to carry a superset of what the pooled q will accept, and no rule a
+// band can apply on its own data gives one. The pooled threshold moves with the other
+// bands: a band of clean, high-scoring targets lowers it, and then the pool accepts
+// targets of a noisier band at a score where that band's own q is several times the
+// threshold. There was such a rule until 2026-09-25, a fixed prefix of each band's 2,000
+// best targets, sized from the 100-band benchmark, where about 1,000 per band were
+// pooled-accepted. It was exact from 8 bands up and short below: on the six-file HYE
+// Astral benchmark the pooled fit saw 167,418 deviations at 2 bands and 177,380 at 4,
+// against the unbanded 181,196, and fitted 7.76 and 8.24 ppm against 8.45, because a
+// band of a 2-band plan has tens of thousands of pooled-accepted targets. Every target
+// PSM of the band is therefore offered, and `seed-pool` keeps the ones the pooled q
+// accepts, each from the one band whose row it kept, so the pooled fit is the unbanded fit
+// at any band count and across overlapping windows
+// (`tests/pipeline.rs`, `a_two_band_pooled_mass_calibration_equals_the_unbanded_fit`).
+// The sidecar stays 16 B per deviation, now one row per matched fragment of every target
+// PSM of the band rather than of its best 2,000; `seed-pool` reads the sidecars one band
+// at a time and keeps only the accepted deviations. Its size is bounded by the band's
+// SCANS, not by its library: the seed keeps one row per candidate and each MS2 scan
+// contributes at most `search_seed.report_psms` candidates, and a row adds at most one
+// deviation per library fragment of its candidate. So a band holds at most
+// `served scans x report_psms x fragments per candidate` deviations whatever its precursor
+// count; [`Calibrants::bytes`] is what `search-seed` reports in its artifact stats.
 
 /// Median offset and `1.5 * p95(|dev - median|)` tolerance, floored at 5 ppm.
 ///
@@ -203,16 +216,19 @@ pub fn calibrants_path(seed_out: &str) -> String {
     format!("{seed_out}.masscal.parquet")
 }
 
-/// One band's calibrant deviations: one row per matched fragment of a confident target
-/// PSM. Small and typed -- 16 B per deviation, about 3 MB for a whole run's 200k.
+/// One band's calibrant deviations: one row per matched fragment of a target PSM of the
+/// band (every target, so that `seed-pool` can select on the pooled q). 16 B per deviation;
+/// see the module notes for the bound on the count.
 #[derive(Default, Clone, Debug)]
 pub struct Calibrants {
     /// LIBRARY-WIDE candidate id (a band's local id plus its fragment offset), so the
     /// pooled seed can look the PSM up on its pooled q.
     pub candidate_id: Vec<u32>,
     /// The scan the PSM was matched on. Where two bands share a candidate (window overlap
-    /// across a band cut) only the PSM the pool KEPT contributes its fragments, so a
-    /// pooled fit sees one PSM per candidate exactly as an ungrouped fit does.
+    /// across a band cut) only the PSM the pool KEPT contributes its fragments, taken from
+    /// the band that row came from: both bands usually hold the same PSM, and the scan
+    /// alone would count it twice. A pooled fit then sees one PSM per candidate exactly as
+    /// an ungrouped fit does.
     pub scan_index: Vec<u32>,
     /// Fragment m/z, for the optional m/z-dependent grid. `f32` is the library's own
     /// storage width, so this round-trips exactly.
@@ -222,8 +238,15 @@ pub struct Calibrants {
 }
 
 impl Calibrants {
+    /// Bytes per deviation, held in memory and on disk before compression.
+    pub const BYTES_PER_DEVIATION: usize = 16;
+
     pub fn len(&self) -> usize {
         self.ppm.len()
+    }
+    /// In-memory size of the four columns: [`Self::BYTES_PER_DEVIATION`] per deviation.
+    pub fn bytes(&self) -> u64 {
+        (self.len() * Self::BYTES_PER_DEVIATION) as u64
     }
     pub fn is_empty(&self) -> bool {
         self.ppm.is_empty()
@@ -232,15 +255,16 @@ impl Calibrants {
 
 /// Write the calibrant sidecar for `seed_out`. Always written when a grouped band asks for
 /// it, empty included: an existing empty sidecar says "this band found no calibrants",
-/// which is a different fact from a missing one.
-pub fn write_calibrants(seed_out: &str, c: &Calibrants) -> Result<u64> {
+/// which is a different fact from a missing one. Takes the columns by value, so the write
+/// does not hold a second copy of them.
+pub fn write_calibrants(seed_out: &str, c: Calibrants) -> Result<u64> {
     write_table(
         &calibrants_path(seed_out),
         vec![
-            Col::U32("candidate_id".into(), c.candidate_id.clone()),
-            Col::U32("scan_index".into(), c.scan_index.clone()),
-            Col::F32("frag_mz".into(), c.frag_mz.clone()),
-            Col::F32("ppm".into(), c.ppm.clone()),
+            Col::U32("candidate_id".into(), c.candidate_id),
+            Col::U32("scan_index".into(), c.scan_index),
+            Col::F32("frag_mz".into(), c.frag_mz),
+            Col::F32("ppm".into(), c.ppm),
         ],
     )
 }
@@ -370,7 +394,8 @@ mod tests {
             frag_mz: vec![301.5, 402.25, 503.125],
             ppm: vec![-1.5, 2.25, 0.5],
         };
-        assert_eq!(write_calibrants(&seed, &c).unwrap(), 3);
+        assert_eq!(c.bytes(), 48);
+        assert_eq!(write_calibrants(&seed, c.clone()).unwrap(), 3);
         let back = read_calibrants(&calibrants_path(&seed)).unwrap();
         assert_eq!(back.candidate_id, c.candidate_id);
         assert_eq!(back.scan_index, c.scan_index);
@@ -378,7 +403,7 @@ mod tests {
         assert_eq!(back.ppm, c.ppm);
         // An empty sidecar is a fact ("this band calibrated nothing"), not an absence.
         let empty = dir.join("empty.parquet").to_str().unwrap().to_string();
-        assert_eq!(write_calibrants(&empty, &Calibrants::default()).unwrap(), 0);
+        assert_eq!(write_calibrants(&empty, Calibrants::default()).unwrap(), 0);
         assert!(read_calibrants(&calibrants_path(&empty))
             .unwrap()
             .is_empty());

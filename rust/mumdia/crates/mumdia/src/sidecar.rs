@@ -267,6 +267,38 @@ fn warn_on_retained_imported(lib_out: &str) {
     }
 }
 
+/// Refuse a calibrated library that kept any row's input iRT, when that input was the
+/// native placeholder a deferred FASTA build wrote (`predict_frag.defer_deeplc_to_multihead`):
+/// such a row would keep an iRT from another model, on another scale, where the default
+/// build would have had DeepLC's. Reads `<lib_out>.summary.json`.
+pub fn require_every_row_repredicted(lib_out: &str) -> Result<()> {
+    let path = format!("{lib_out}.summary.json");
+    let v: serde_json::Value = mumdia_io::json::read_json(&path)
+        .with_context(|| format!("reading {path} to check the deferred DeepLC pass"))?;
+    let n = |k: &str| v.get(k).and_then(|x| x.as_u64());
+    let retained = n("retained_imported")
+        .ok_or_else(|| anyhow::anyhow!("{path} does not report retained_imported"))?;
+    if retained > 0 {
+        bail!(
+            "the multi-head calibration kept the input iRT of {retained} of {} library rows \
+             ({} with non-standard residues, {} without a finite prediction), and under \
+             predict_frag.defer_deeplc_to_multihead that input is the native model's \
+             placeholder, not a DeepLC prediction. Set predict_frag.defer_deeplc_to_multihead \
+             = false to predict the library with DeepLC first; {path} has the counts",
+            n("rows").unwrap_or(0),
+            n("retained_non_standard").unwrap_or(0),
+            n("retained_no_prediction").unwrap_or(0),
+        );
+    }
+    info!(
+        rows = n("rows").unwrap_or(0),
+        library = lib_out,
+        "sidecar: the multi-head calibration re-predicted every library row, so the deferred \
+         DeepLC pass was not needed"
+    );
+    Ok(())
+}
+
 /// DeepLC: predict retention time per peptidoform. Returns `id -> predicted_rt`.
 pub fn run_deeplc(
     python: &str,
@@ -288,8 +320,12 @@ pub fn run_deeplc(
             Col::Str("peptidoform".into(), peptidoforms.to_vec()),
         ],
     )?;
-    info!(n = ids.len(), "sidecar: running DeepLC");
-    run_worker(python, script, &[&inp, &outp], true).context("DeepLC worker failed")?;
+    // The worker sizes torch's CPU pool from this, capped at the physical cores available
+    // to it (`MUMDIA_DEEPLC_THREAD_CAP`). Without it torch took its own default, which
+    // ignored the engine's `--threads` (docs/13, "DeepLC thread cap").
+    let threads = rayon::current_num_threads().max(1).to_string();
+    info!(n = ids.len(), threads = %threads, "sidecar: running DeepLC");
+    run_worker(python, script, &[&inp, &outp, &threads], true).context("DeepLC worker failed")?;
 
     let t = TableFile::open(&outp)?;
     let oid = t.u32("id")?;
@@ -318,6 +354,14 @@ pub fn run_deeplc(
 /// DeepLC multitask fine-tune: adapt the RT model to this run's confident seed
 /// PSMs and rewrite the supplied library's `predicted_irt`. Positional contract:
 /// `deeplc_finetune.py <lib_in> <seed> <lib_out>`.
+///
+/// Training keeps the worker's bounded pool (`--threads`, default 8: the documented
+/// OpenMP crash was the backward pass). The whole-library prediction after it is
+/// forward-only and gets `threads` (`--predict-threads`), which the worker caps at the
+/// physical cores available to it; before, it ran on the 8 training threads. On a host
+/// with more than 8 physical cores that moves the output in the last bits whether or not
+/// the cap binds, and `DEEPLC_FT_THREADS` now bounds training only (docs/13, "DeepLC
+/// thread cap").
 #[allow(clippy::too_many_arguments)]
 pub fn run_deeplc_finetune(
     python: &str,
@@ -331,6 +375,8 @@ pub fn run_deeplc_finetune(
     batch: usize,
     window_holdout_frac: f64,
     rng_seed: u64,
+    threads: usize,
+    shards: usize,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     info!(
@@ -343,6 +389,8 @@ pub fn run_deeplc_finetune(
         batch,
         window_holdout_frac,
         rng_seed,
+        threads,
+        shards,
         "sidecar: running DeepLC multitask fine-tune"
     );
     let ep = epochs.to_string();
@@ -357,29 +405,29 @@ pub fn run_deeplc_finetune(
     // remains, so this narrows the variance rather than removing it
     // (docs/14_build_test_deploy_gotchas.md).
     let rs = rng_seed.to_string();
-    run_worker(
-        python,
-        script,
-        &[
-            lib_in,
-            seed,
-            lib_out,
-            "--epochs",
-            &ep,
-            "--patience",
-            &pa,
-            "--q-train",
-            &qt,
-            "--batch",
-            &ba,
-            "--window-holdout-frac",
-            &hf,
-            "--seed",
-            &rs,
-        ],
-        true,
-    )
-    .context("DeepLC fine-tune failed")?;
+    let pt = threads.max(1).to_string();
+    let mut args = vec![
+        lib_in,
+        seed,
+        lib_out,
+        "--epochs",
+        &ep,
+        "--patience",
+        &pa,
+        "--q-train",
+        &qt,
+        "--batch",
+        &ba,
+        "--window-holdout-frac",
+        &hf,
+        "--seed",
+        &rs,
+        "--predict-threads",
+        &pt,
+    ];
+    let sh = shards.to_string();
+    push_shards(&mut args, shards, &sh);
+    run_worker(python, script, &args, true).context("DeepLC fine-tune failed")?;
     warn_on_retained_imported(lib_out);
     Ok(())
 }
@@ -392,7 +440,9 @@ pub fn run_deeplc_finetune(
 /// writes the calibrated retention times into the library. See
 /// `RtImTrainConfig::multihead_calibration` for why one head plus a monotone curve is not
 /// the same thing. Positional contract:
-/// `deeplc_finetune.py <lib_in> <seed> <lib_out> --multihead <n_heads>`.
+/// `deeplc_finetune.py <lib_in> <seed> <lib_out> --multihead <n_heads>`. `threads` sizes
+/// both torch pools, and the worker caps it at the physical cores available to it.
+/// `shards` is `rt_im_train.deeplc_predict_shards`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_deeplc_multihead(
     python: &str,
@@ -404,37 +454,43 @@ pub fn run_deeplc_multihead(
     q_train: f64,
     window_holdout_frac: f64,
     threads: usize,
+    shards: usize,
+    projection_cache: Option<&str>,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     info!(
         lib_in,
-        seed, lib_out, n_heads, q_train, "sidecar: calibrating DeepLC over multiple heads"
+        seed,
+        lib_out,
+        n_heads,
+        q_train,
+        threads,
+        shards,
+        "sidecar: calibrating DeepLC over multiple heads"
     );
     let nh = n_heads.to_string();
     let qt = q_train.to_string();
     let hf = window_holdout_frac.to_string();
     let th = threads.max(1).to_string();
-    run_worker(
-        python,
-        script,
-        &[
-            lib_in,
-            seed,
-            lib_out,
-            "--multihead",
-            &nh,
-            "--q-train",
-            &qt,
-            "--window-holdout-frac",
-            &hf,
-            "--threads",
-            &th,
-            "--predict-threads",
-            &th,
-        ],
-        true,
-    )
-    .context("DeepLC multi-head calibration failed")?;
+    let mut args = vec![
+        lib_in,
+        seed,
+        lib_out,
+        "--multihead",
+        &nh,
+        "--q-train",
+        &qt,
+        "--window-holdout-frac",
+        &hf,
+        "--threads",
+        &th,
+        "--predict-threads",
+        &th,
+    ];
+    let sh = shards.to_string();
+    push_shards(&mut args, shards, &sh);
+    push_projection_cache(&mut args, projection_cache);
+    run_worker(python, script, &args, true).context("DeepLC multi-head calibration failed")?;
     warn_on_retained_imported(lib_out);
     Ok(())
 }
@@ -444,38 +500,169 @@ pub fn run_deeplc_multihead(
 /// peptidoform, decoys on the DECOY_-stripped sequence, rows with non-standard residues
 /// keeping the imported value) is the one the fine-tune path uses. Positional contract:
 /// `deeplc_finetune.py <lib_in> - <lib_out> --no-finetune`. Prediction is forward-only,
-/// so it takes the engine's full thread count rather than the fine-tune's bounded pool.
+/// so it asks for the engine's full thread count rather than the fine-tune's bounded pool,
+/// and the worker caps that at the physical cores available to it: past them a second
+/// hyperthread on a busy core slows every OpenMP-parallel op (the multi-head step took
+/// 10:41 at 96 threads and 18:09 at 128 on a 64-core host).
 pub fn run_deeplc_repredict(
     python: &str,
     script: &str,
     lib_in: &str,
     lib_out: &str,
     threads: usize,
+    shards: usize,
+    projection_cache: Option<&str>,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     info!(
         lib_in,
-        lib_out, threads, "sidecar: re-predicting the library iRT with the DeepLC base model"
+        lib_out,
+        threads,
+        shards,
+        "sidecar: re-predicting the library iRT with the DeepLC base model"
     );
     let th = threads.max(1).to_string();
-    run_worker(
-        python,
-        script,
-        &[
-            lib_in,
-            "-",
-            lib_out,
-            "--no-finetune",
-            "--threads",
-            &th,
-            "--predict-threads",
-            &th,
-        ],
-        true,
-    )
-    .context("DeepLC library re-prediction failed")?;
+    let mut args = vec![
+        lib_in,
+        "-",
+        lib_out,
+        "--no-finetune",
+        "--threads",
+        &th,
+        "--predict-threads",
+        &th,
+    ];
+    let sh = shards.to_string();
+    push_shards(&mut args, shards, &sh);
+    push_projection_cache(&mut args, projection_cache);
+    run_worker(python, script, &args, true).context("DeepLC library re-prediction failed")?;
     warn_on_retained_imported(lib_out);
     Ok(())
+}
+
+/// What a band-list DeepLC call ([`run_deeplc_bands`]) does to every band.
+pub enum BandAdaptation<'a> {
+    /// The multi-head calibration against `seed`, fitted once for all the bands.
+    Multihead {
+        seed: &'a str,
+        n_heads: usize,
+        q_train: f64,
+        window_holdout_frac: f64,
+    },
+    /// The base-model re-prediction.
+    Repredict,
+}
+
+/// One DeepLC worker for all the bands of a grouped run (`groups.rt_adaptation =
+/// once_per_run`): `deeplc_finetune.py - <seed|-> - --bands <tsv>`, where `tsv` lists
+/// `lib_in<TAB>lib_out` per band. The worker fits the calibration once, predicts the union
+/// of the bands' unique sequences once, and writes each `lib_out` with the rewrite a
+/// single-table call applies, each with its own `<lib_out>.summary.json`. `threads` and
+/// `shards` mean what they mean for [`run_deeplc_multihead`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_deeplc_bands(
+    python: &str,
+    script: &str,
+    pairs: &[(String, String)],
+    tsv: &str,
+    mode: BandAdaptation,
+    threads: usize,
+    shards: usize,
+    projection_cache: Option<&str>,
+) -> Result<()> {
+    require_deeplc_version(python)?;
+    if pairs.is_empty() {
+        bail!("no band to adapt");
+    }
+    let mut body = String::new();
+    for (lib_in, lib_out) in pairs {
+        if lib_in.contains(['\t', '\n', '\r']) || lib_out.contains(['\t', '\n', '\r']) {
+            bail!("a band path contains a tab or a line break: {lib_in} -> {lib_out}");
+        }
+        body.push_str(lib_in);
+        body.push('\t');
+        body.push_str(lib_out);
+        body.push('\n');
+    }
+    std::fs::write(tsv, body).with_context(|| format!("writing the band list {tsv}"))?;
+    let th = threads.max(1).to_string();
+    let sh = shards.to_string();
+    let (nh, qt, hf);
+    let mut args: Vec<&str> = Vec::new();
+    match mode {
+        BandAdaptation::Multihead {
+            seed,
+            n_heads,
+            q_train,
+            window_holdout_frac,
+        } => {
+            nh = n_heads.to_string();
+            qt = q_train.to_string();
+            hf = window_holdout_frac.to_string();
+            info!(
+                bands = pairs.len(),
+                seed,
+                n_heads,
+                q_train,
+                threads,
+                shards,
+                "sidecar: calibrating DeepLC over multiple heads once for every band"
+            );
+            args.extend_from_slice(&[
+                "-",
+                seed,
+                "-",
+                "--bands",
+                tsv,
+                "--multihead",
+                &nh,
+                "--q-train",
+                &qt,
+                "--window-holdout-frac",
+                &hf,
+            ]);
+        }
+        BandAdaptation::Repredict => {
+            info!(
+                bands = pairs.len(),
+                threads,
+                shards,
+                "sidecar: re-predicting the band libraries' iRT with the DeepLC base model \
+                 in one pass"
+            );
+            args.extend_from_slice(&["-", "-", "-", "--bands", tsv, "--no-finetune"]);
+        }
+    }
+    args.extend_from_slice(&["--threads", &th, "--predict-threads", &th]);
+    push_shards(&mut args, shards, &sh);
+    push_projection_cache(&mut args, projection_cache);
+    run_worker(python, script, &args, true).context("DeepLC band adaptation failed")?;
+    for (_, lib_out) in pairs {
+        if !std::path::Path::new(lib_out).exists() {
+            bail!("the DeepLC band worker exited 0 but wrote no {lib_out}");
+        }
+        warn_on_retained_imported(lib_out);
+    }
+    Ok(())
+}
+
+/// Append `--projection-cache <dir>` (`rt_im_train.deeplc_projection_cache`). Nothing when
+/// it is off, so the default argument list is the one an older worker accepts.
+fn push_projection_cache<'a>(args: &mut Vec<&'a str>, dir: Option<&'a str>) {
+    if let Some(dir) = dir {
+        args.push("--projection-cache");
+        args.push(dir);
+    }
+}
+
+/// Append `--shards <n>` for a sharded whole-library prediction
+/// (`rt_im_train.deeplc_predict_shards`). One process, the default, passes nothing, so the
+/// default argument list is the one an older `deeplc_finetune.py` accepts.
+fn push_shards<'a>(args: &mut Vec<&'a str>, shards: usize, rendered: &'a str) {
+    if shards != 1 {
+        args.push("--shards");
+        args.push(rendered);
+    }
 }
 
 /// MBR transfer (Stage D3): match-between-runs identification transfer over the
@@ -578,6 +765,61 @@ fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::require_every_row_repredicted;
+
+    #[test]
+    fn a_deferred_build_fails_when_the_calibration_kept_a_row() {
+        let dir = std::env::temp_dir().join(format!("mumdia_placeholder_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = dir.join("lib.parquet").to_str().unwrap().to_string();
+        let summary = format!("{lib}.summary.json");
+        std::fs::write(
+            &summary,
+            r#"{"rows": 10, "repredicted": 10, "retained_imported": 0}"#,
+        )
+        .unwrap();
+        require_every_row_repredicted(&lib).unwrap();
+        std::fs::write(
+            &summary,
+            r#"{"rows": 10, "repredicted": 9, "retained_imported": 1,
+                "retained_non_standard": 0, "retained_no_prediction": 1}"#,
+        )
+        .unwrap();
+        let e = require_every_row_repredicted(&lib).unwrap_err().to_string();
+        assert!(e.contains("1 of 10"), "{e}");
+        assert!(e.contains("defer_deeplc_to_multihead"), "{e}");
+        // No summary, or one without the count, is not a pass.
+        std::fs::write(&summary, r#"{"rows": 10}"#).unwrap();
+        assert!(require_every_row_repredicted(&lib).is_err());
+        std::fs::remove_file(&summary).unwrap();
+        assert!(require_every_row_repredicted(&lib).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod shard_arg_tests {
+    use super::push_shards;
+
+    #[test]
+    fn one_shard_adds_nothing_so_an_older_worker_still_parses_the_call() {
+        let mut args = vec!["lib_in", "-", "lib_out"];
+        push_shards(&mut args, 1, "1");
+        assert_eq!(args, ["lib_in", "-", "lib_out"]);
+    }
+
+    #[test]
+    fn several_or_automatic_shards_are_passed_through() {
+        for (n, rendered) in [(4usize, "4"), (0, "0")] {
+            let mut args = vec!["lib_in"];
+            push_shards(&mut args, n, rendered);
+            assert_eq!(args, ["lib_in", "--shards", rendered]);
+        }
+    }
 }
 
 #[cfg(test)]

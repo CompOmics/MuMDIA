@@ -93,7 +93,8 @@ State of the plan in section 3:
 | 3.1 streaming typed readers | shipped `503eadb` | part of 231.0 -> 86.6 GiB |
 | 3.2 extract incremental write | shipped `503eadb` | trace residency 61.8 GiB -> 0.074 GiB in flight |
 | 3.3 f32 bulk arrays | shipped `503eadb` | library 26 -> 22 B per fragment row; rescore matrix halved |
-| 3.4 features chunked | shipped | features stage 86.6 -> 3.03 GiB |
+| 3.3 f32 feature table | shipped 2026-09-25 (survey R3) | `features.parquet` v2 and `psms_competed.parquet` v4 store the feature columns as f32 (five stay f64); scored outputs byte-identical |
+| 3.4 features chunked | shipped | features stage 86.6 -> 3.03 GiB (one loader; see 3.4 for `features.chrom_loaders`) |
 | 3.10 extract window-closing flush | shipped | extract stage 61.33 -> 28.13 GiB |
 | 3.10 incremental merge + `windows_in_flight` cap | shipped 2026-09-05 | extract stage 28.13 -> 16.57 GiB (12.31 at 8 in flight) |
 | 3.5 rescore flat f32 matrix | half shipped `503eadb` | matrix is flat f32; the binary sidecar handoff and the early drop are not done |
@@ -164,6 +165,13 @@ Three changes, all in `rescore.rs`, `table.rs` and `nn_rescore_worker.py`:
   accumulates the moments in 32k-row float64 sub-blocks, parses the SpecId suffix in Arrow,
   standardises in place, and returns the load's transients to the OS
   (`pa.default_memory_pool().release_unused()`, `malloc_trim` on glibc) before training.
+  Since 2026-09-25 one further row group is decoded ahead on a reader thread and the fill
+  runs on up to 8 threads, each with a 32k-row float64 moment buffer (0.1 GB at 387
+  features) for the duration of the load; the matrix and its moments are byte-identical
+  (`docs/13`). The init feature scan also runs on a thread pool since then, and each task
+  in flight holds about 64 bytes per sample row; `MUMDIA_NN_SCAN_MEM_GB` (1) caps those
+  tasks together, which binds only when the init sample escalates toward the whole fold
+  (3 tasks at 4.8M rows, where 16 would have held about 4.5 GB beside the sample).
 
 | pool | before | after | peptides |
 |------|--------|-------|----------|
@@ -237,7 +245,8 @@ Resident at once:
 - all MS2 scans (`load_ms2`, `8P`) and, if MS1 is given, all MS1 scans
   (`spectra.rs:12-16`, `Ms1Scan.mz` is `Vec<f64>`, so 12 bytes per MS1 peak);
 - the library (section 1.2 steady state);
-- per-window narrowing caches (`window_narrow`, `extract.rs:699,836`), one per
+- per-window narrowing caches (`window_narrow`, `extract.rs:699,836`; on the default
+  streamed path replaced by task-local `LocalIndex`es since 2026-09-25), one per
   isolation window in flight under rayon;
 - the full output before write: `Vec<ChromOutputRow>` (`extract.rs:1698,2081`)
   holding one `Vec<f32>` RT trace and one `Vec<f32>` intensity trace per
@@ -376,6 +385,14 @@ Concretely:
   paths gain a rounding at the 7th significant digit; treat as "mostly similar"
   and validate as in section 5.
 
+  Shipped 2026-09-25 (survey item R3), and by then the caveat no longer applied:
+  the native `FeatureMatrix` had become flat f32 and every classifier narrowed
+  every feature with `as f32` on read, so storing `v as f32` moved no classifier
+  input and the scored tables are byte-identical (the smoke fixture and
+  `both_feature_layouts_compete_and_score_identically`). The five columns compete
+  or rescore read as f64 before narrowing stay f64 (`F64_FEATURE_COLUMNS`), and
+  the writer's in-flight copy of a chunk is about half a matrix instead of one.
+
 The task note allows a precision change; the direction that saves memory is
 f64 to f32 for storage, with f64 kept for arithmetic, and that is what this
 plan does.
@@ -412,6 +429,17 @@ identical. Wall time 7:15 against 5:05; the extra pass is the difference.
 `run_with_chunk_rows` exposes the chunk size, and the pipeline test runs one
 chunk against one candidate per chunk, comparing every f64 column bit for bit
 plus the PIN bytes.
+
+The 3.03 GiB (and the 3.11 GiB of the complete run in section 0) were measured
+with one chromatogram loader, which holds two decoded chunks: the one being
+computed and the next. Since the perf survey's F1, `features.chrom_loaders`
+(default 3) decodes on several loaders and holds up to `chrom_loaders + 1`
+chunks, so at the HYE shape the expected peak is about 1.8 GiB higher (two more
+chunks of about 0.92 GiB of traces), roughly 4.9 GiB. On the HYE-shaped
+synthetic fixture (400,000 PSMs, 7 chunks) the peak working set went from 1.83
+to 3.23 GiB. That default has not been measured on a real HYE run.
+`features.chrom_loaders: 1` restores the measured 3.03 GiB, and a pass never
+runs more loaders than `--threads` allows.
 
 ### 3.5 rescore: flat f32 matrix and a binary sidecar handoff
 
@@ -500,8 +528,11 @@ identical to the byte, 2,603,894 and 38,889,646 rows):
   this audit set as its target, and 12.3 GiB is available for a 9% wall cost.
 
 What remains: the open hits (6.16 GiB at 16 in flight) are the `Vec<Hit>` payload plus its
-growth slack, and `Hit` is 24 bytes where 16 would do (`obs_mz` as an f32 ppm offset from
-the theoretical m/z, `rt` as a scan index). That is a precision change and gated.
+growth slack. `Hit` was 24 bytes where 16 would do; since 2026-09-25 it is 16 (survey item
+X2), with `rt` replaced by the scan index and `obs_mz` stored at the peaks' own f32 width.
+That turned out not to be a precision change: the scan index recovers the f64 RT exactly
+and the f32 m/z is the value the f64 held, so the outputs are byte-identical. The
+payload row above is then about 24 GiB at the same hit count.
 
 ## 4. Rewrite candidates (structural changes beyond the items above)
 
@@ -572,5 +603,6 @@ carries the measured numbers and the state of each plan item. Sections 3.1-3.3 a
 3.6-3.9 shipped in `503eadb`, 3.4 and 3.10 in the commits that added those sections, and
 3.5 is half done. Stage peaks on the benchmark are now extract 16.57 GiB (default) or 12.31
 (8 windows in flight), rescore 8.95 GiB by default (parquet handoff, docs/28 section 11) or
-5.5 GiB with the opt-in recipe, and features 3.03 GiB. A single HYE run fits the 32 GB target
+5.5 GiB with the opt-in recipe, and features 3.03 GiB at one chromatogram loader (about
+4.9 GiB expected at the default three, section 3.4). A single HYE run fits the 32 GB target
 machine. The measurement to take is a full `mumdia run` on the current build.

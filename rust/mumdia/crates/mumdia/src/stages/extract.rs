@@ -19,15 +19,21 @@ use anyhow::Result;
 use mumdia_core::config::{ExtractConfig, GateMode, PeakClaim};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
-use mumdia_io::table::{write_table, Col, TableFile, TableWriter};
+use mumdia_io::table::{
+    write_table, write_table_hashed, Col, TableFile, TableWriter, WRITE_TABLE_CHUNK_ROWS,
+};
 use serde_json::json;
 use tracing::{info, warn};
 
 use mumdia_core::constants::{ppm_bounds, ISOTOPE_SPACING};
 
 use crate::index::Library;
-use crate::matchers::fragindex::{FragIndex, WindowNarrow};
+use crate::matchers::binning::LogBins;
+#[cfg(test)]
+use crate::matchers::fragindex::NarrowedProbe;
+use crate::matchers::fragindex::{BinnedProbe, FragIndex, LocalIndex, WindowNarrow};
 use crate::spectra::{load_ms1, load_ms2, Ms1Scan};
+use crate::stages::rt_im_train::RtWindows;
 use mumdia_core::config::MatcherKind;
 use mumdia_core::types::Ms2Scan;
 use rayon::prelude::*;
@@ -107,6 +113,13 @@ pub struct ExtractParams<'a> {
     /// are still read, and scans of other windows find no candidate. `None` is the ordinary
     /// whole-library extract.
     pub fragment_offset: Option<u32>,
+    /// `library_precursors` is the WHOLE library and this stage searches its rows
+    /// `[first, first + n)`, loaded directly by row span (`Library::load_row_span_with`):
+    /// local ids `0..n`, fragments at library-wide ids `first..first + n`, outputs in local
+    /// ids exactly as for a band file. A grouped run loads a band this way wherever nothing
+    /// rewrites the band's precursor table, instead of writing the band out first.
+    /// `fragment_offset` is then `None` (or `Some(first)`). `None` is the ordinary load.
+    pub precursor_span: Option<(usize, usize)>,
     /// How many bands of the same run are being searched beside this one
     /// (`groups.parallel`). The probing fan-out is this band's share of the thread pool,
     /// not the whole pool, because every band in flight computes it independently.
@@ -132,10 +145,20 @@ pub struct ExtractParams<'a> {
     /// Writing it back into the scans was harmless when each band decoded its own copy
     /// and silently corrupts every later band now. See the note above the probe loop.
     ///
-    /// The two are one field because extract needs both or neither: a caller that shares
-    /// the MS2 buffer but lets extract re-decode the MS1 would keep the saving it came
-    /// for and lose half the mappings again.
+    /// A grouped search lends both, because every band would otherwise decode the MS1
+    /// again. The ungrouped `run` lends only the MS2 its seed already decoded
+    /// (`SharedScans::ms1 = None`): it has no MS1 decode to share, and letting extract
+    /// decode it keeps that decode concurrent with the library load and after the
+    /// library's errors, where a standalone extract has it.
     pub scans: Option<SharedScans<'a>>,
+    /// The windows `rt-im-train` just fitted and wrote to `run_windows`, handed over in
+    /// memory by an orchestrator (`rt_im_train::run_in_memory`) so the table is not
+    /// decoded again. Used only when they were fitted on this `library_precursors` table,
+    /// written to this `run_windows` path, and cover exactly this library's candidates
+    /// (`RtWindows::mismatch`), and then they are what the file would have produced;
+    /// otherwise, and whenever this is `None`, the `run_windows` file is read. A standalone
+    /// `mumdia extract` always reads the file.
+    pub rt_windows: Option<crate::stages::rt_im_train::RtWindows>,
 }
 
 /// One run's decoded spectra, lent to a stage instead of being re-decoded by it.
@@ -149,18 +172,43 @@ pub struct ExtractParams<'a> {
 #[derive(Clone, Copy)]
 pub struct SharedScans<'a> {
     pub ms2: &'a [Ms2Scan],
-    pub ms1: &'a [Ms1Scan],
+    /// `None`: the caller lends the MS2 only, and extract decodes the MS1 from
+    /// `ExtractParams::ms1` itself, as it would with nothing lent. Not a warning case,
+    /// unlike an empty slice, which says the caller meant to lend and had nothing.
+    pub ms1: Option<&'a [Ms1Scan]>,
 }
 
-/// One observed hit: scan RT, candidate-local fragment index, observed intensity
-/// and observed m/z (for mass-accuracy features).
+/// One observed hit: the scan it was observed in, candidate-local fragment index,
+/// observed intensity and observed m/z (for mass-accuracy features).
+///
+/// 16 bytes. It used to be 24: the scan's RT as an f64 and the observed m/z widened to an
+/// f64. Both were redundant. Every hit comes from one scan of the stage's `scans` slice, so
+/// the scan index recovers the RT exactly (`scans[scan].rt_seconds`, the same f64 the hit
+/// used to copy), and peaks are stored at f32 width, so the f32 m/z IS the value the f64
+/// held, widened again where it is used. The hit payload is the stage's largest structure
+/// (1.6 billion hits measured on one HYE run), so a third off it is a third off the
+/// accumulator.
+///
+/// Order-sensitive code keeps reading the RT, not the index: the per-candidate pass sorts
+/// and groups hits on the looked-up RT, and the two-pass elution profile keys on the RT's
+/// bits, exactly as before. Scans are RT-sorted by the loaders, but a sort on the index
+/// would still differ from one on the RT wherever two scans share an RT.
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Hit {
-    rt: f64,
+    /// Index into the stage's `scans` slice.
+    scan: u32,
     frag: u16,
     inten: f32,
-    obs_mz: f64,
+    obs_mz: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<Hit>() == 16);
+
+/// The retention time of `h`: the RT of the scan it was observed in.
+#[inline]
+fn hit_rt(scans: &[Ms2Scan], h: &Hit) -> f64 {
+    scans[h.scan as usize].rt_seconds
 }
 
 /// Hits for many candidates in one flat buffer with per-candidate offsets (CSR).
@@ -236,14 +284,20 @@ impl HitStore {
     /// a slice sort either way, so the hits it sees and the order it sees them in are
     /// exactly those of the owned vector.
     fn slices_mut(&mut self) -> Vec<(u32, &mut [Hit])> {
+        let n = self.cids.len();
+        self.slices_mut_range(0, n)
+    }
+
+    /// [`HitStore::slices_mut`] for candidates `a..b` of the store only.
+    fn slices_mut_range(&mut self, a: usize, b: usize) -> Vec<(u32, &mut [Hit])> {
         let HitStore { cids, offs, hits } = self;
-        let mut out = Vec::with_capacity(cids.len());
-        let mut rest: &mut [Hit] = hits.as_mut_slice();
-        let mut base = 0usize;
-        for (i, &cid) in cids.iter().enumerate() {
+        let mut out = Vec::with_capacity(b - a);
+        let mut base = offs[a];
+        let mut rest: &mut [Hit] = &mut hits[base..offs[b]];
+        for i in a..b {
             let end = offs[i + 1];
             let (head, tail) = rest.split_at_mut(end - base);
-            out.push((cid, head));
+            out.push((cids[i], head));
             rest = tail;
             base = end;
         }
@@ -364,6 +418,19 @@ impl HitRun {
         self.settle();
     }
 
+    /// Step past `m` candidates of the current part.
+    fn advance_by(&mut self, m: usize) {
+        self.ci += m;
+        self.settle();
+    }
+
+    /// The next `m` candidates, all in the current part, as `(cid, hits)` slices into the
+    /// run's own store: nothing is copied.
+    fn span_mut(&mut self, m: usize) -> Vec<(u32, &mut [Hit])> {
+        let ci = self.ci;
+        self.parts[self.pi].slices_mut_range(ci, ci + m)
+    }
+
     /// Hits not yet gathered out of this run.
     fn hits_left(&self) -> usize {
         match self.parts.get(self.pi) {
@@ -453,6 +520,103 @@ fn gather_chunk(runs: &mut [HitRun], bound: u32, max_cands: usize, out: &mut Hit
     }
 }
 
+/// When the next [`gather_chunk`] of `(bound, max_cands)` would copy the hits of candidates
+/// that ALL sit in one run's current part, each as that candidate's only segment, return
+/// `(run, m)`: that run and how many of its candidates the gather would take. Flushing
+/// them straight out of the run's store then hands the flush exactly the batch the gather
+/// would have built, candidate for candidate and hit for hit, without the copy.
+///
+/// The batch has to be the SAME batch, not merely the same candidates, because each flush
+/// call becomes one chromatogram chunk and the parquet page framing follows the chunk
+/// sizes. So a span is taken only when the gather could not have gone past it: it filled
+/// `max_cands`, or nothing else below `bound` remains, in any run or in a later part of this
+/// one. Otherwise `None`, and the caller gathers.
+fn single_run_span(runs: &[HitRun], bound: u32, max_cands: usize) -> Option<(usize, usize)> {
+    // The run holding the smallest pending candidate, and the smallest of every other run.
+    let mut best: Option<(usize, u32)> = None;
+    let mut other_min = u32::MAX;
+    for (i, r) in runs.iter().enumerate() {
+        let Some(c) = r.peek() else { continue };
+        match best {
+            None => best = Some((i, c)),
+            Some((_, bc)) if c < bc => {
+                other_min = other_min.min(bc);
+                best = Some((i, c));
+            }
+            Some(_) => other_min = other_min.min(c),
+        }
+    }
+    let (r, first) = best?;
+    // Nothing flushable, or the first candidate has a segment in another run too.
+    if first >= bound || other_min == first || max_cands == 0 {
+        return None;
+    }
+    let run = &runs[r];
+    let part = &run.parts[run.pi];
+    let limit = bound.min(other_min);
+    let m = part.cids[run.ci..]
+        .partition_point(|&c| c < limit)
+        .min(max_cands);
+    if m == max_cands {
+        return Some((r, m));
+    }
+    // A short span: the gather would go on to whatever else lies below `bound`.
+    if other_min < bound {
+        return None;
+    }
+    if run.ci + m == part.len() {
+        let next = run.parts[run.pi + 1..]
+            .iter()
+            .find(|q| !q.is_empty())
+            .map(|q| q.cids[0]);
+        if next.is_some_and(|c| c < bound) {
+            return None;
+        }
+    }
+    Some((r, m))
+}
+
+/// A flush of finished candidates: `(cid, hits)` in ascending id, at most `CAND_CHUNK` of
+/// them. Returns false when the consumer went away.
+type FlushFn<'f> = dyn for<'h> FnMut(Vec<(u32, &'h mut [Hit])>) -> bool + Send + 'f;
+
+/// Flush every candidate of `runs` below `bound`, `max_cands` at a time, in ascending id.
+/// Returns true when `flush` asked to stop.
+///
+/// A batch whose candidates all come from one run's store, each as its only segment, is
+/// flushed straight out of that store ([`single_run_span`]); every other batch is gathered
+/// into `chunk` first. That is the common case by far: a sub-range reached by one window
+/// and holding no leftovers from the batch before. `zero_copy = false` always gathers,
+/// which is the reference the zero-copy batches are tested against.
+fn flush_below(
+    runs: &mut [HitRun],
+    bound: u32,
+    max_cands: usize,
+    zero_copy: bool,
+    chunk: &mut HitStore,
+    flush: &mut FlushFn<'_>,
+) -> bool {
+    loop {
+        if zero_copy {
+            if let Some((r, m)) = single_run_span(runs, bound, max_cands) {
+                let ok = flush(runs[r].span_mut(m));
+                runs[r].advance_by(m);
+                if !ok {
+                    return true;
+                }
+                continue;
+            }
+        }
+        gather_chunk(runs, bound, max_cands, chunk);
+        if chunk.is_empty() {
+            return false;
+        }
+        if !flush(chunk.slices_mut()) {
+            return true;
+        }
+    }
+}
+
 /// The streamed accumulator: one run per probed window, oldest first.
 #[derive(Default)]
 struct HitAcc {
@@ -485,49 +649,37 @@ type ChromOutputRow = (u32, String, f64, f64, f32, Vec<f32>, Vec<f32>);
 /// core busy within a chunk, small enough that a chunk's chromatogram rows are tens of MB.
 const CAND_CHUNK: usize = 8192;
 /// Rows per parquet row group of the chromatogram table (~64k rows of two ~60-point traces
-/// is ~30 MB uncompressed), which bounds the encoder's in-progress buffer.
-const CHROM_ROW_GROUP_ROWS: usize = 1 << 16;
+/// is ~30 MB uncompressed), which bounds the encoder's in-progress buffer. Defined with the
+/// layouts in [`crate::chromatograms`], because the v2 axis rule restarts at these
+/// boundaries; the writer takes [`crate::chromatograms::row_group_rows`], which is this
+/// unless the test knob moves it.
+const CHROM_ROW_GROUP_ROWS: usize = crate::chromatograms::ROW_GROUP_ROWS;
 
-/// One chunk of chromatogram rows, drained into exactly the column set
-/// `chromatograms.parquet` has always had.
+/// One chunk of chromatogram rows, drained into the column set of the configured layout
+/// (`extract.chromatogram_schema`, [`crate::chromatograms::Layout`]).
 #[derive(Default)]
 struct ChromChunk {
-    cid: Vec<u32>,
-    name: Vec<String>,
-    fmz: Vec<f64>,
-    obsmz: Vec<f64>,
-    pint: Vec<f32>,
-    rt: Vec<Vec<f32>>,
-    int: Vec<Vec<f32>>,
+    rows: crate::chromatograms::Rows,
 }
 
 impl ChromChunk {
     /// `offset` is the library row of this band's local id 0 (`Library::global_offset`),
     /// so the table carries library-wide ids even when the stage searched one band.
-    fn cols(mut self, offset: u32) -> Vec<Col> {
+    fn cols(mut self, offset: u32, layout: crate::chromatograms::Layout) -> Vec<Col> {
         if offset != 0 {
-            for c in &mut self.cid {
+            for c in &mut self.rows.cid {
                 *c += offset;
             }
         }
-        vec![
-            Col::U32("candidate_id".into(), self.cid),
-            Col::Str("frag_name".into(), self.name),
-            Col::F64("frag_mz".into(), self.fmz),
-            Col::F64("frag_obs_mz".into(), self.obsmz),
-            Col::F32("predicted_intensity".into(), self.pint),
-            // LargeList (64-bit offsets): the total chromatogram list-value count can exceed
-            // the ~2.1B limit of a 32-bit ListArray offset buffer when extraction accepts a
-            // very large candidate set (e.g. gates opened up).
-            Col::LargeListF32("rt".into(), self.rt),
-            Col::LargeListF32("intensity".into(), self.int),
-        ]
+        self.rows
+            .into_cols(layout, crate::chromatograms::Optional::ALL)
     }
 }
 
-/// One observed peak for the per-scan demix: (observed intensity, observed m/z, claimants
-/// as (candidate_id, fragment_ordinal, predicted_intensity)).
-type DemixRow = (f32, f64, Vec<(u32, u16, f32)>);
+/// One observed peak for the per-scan demix: (observed intensity, observed m/z at the
+/// artifact's f32 width, claimants as (candidate_id, fragment_ordinal,
+/// predicted_intensity)).
+type DemixRow = (f32, f32, Vec<(u32, u16, f32)>);
 
 /// Per-candidate contested-peak statistics from the co-elution arbitration
 /// (two-pass path). `won`/`lost` are the summed observed intensity of shared peaks
@@ -652,6 +804,194 @@ impl FragSet {
     }
 }
 
+/// One candidate's scan groups: per group its RT and, for each fragment ordinal
+/// `0..width`, the observed intensity when the fragment was seen in that group.
+///
+/// This replaces `Vec<(f64, BTreeMap<u16, f32>)>`, one tree per scan group, which on the
+/// window grid meant one tree per grid scan and a node allocation for every group that
+/// held a fragment. Here the whole candidate is three flat buffers: the RTs, a dense
+/// `groups x width` value array and a presence bitmask of the same shape. `width` is one
+/// past the largest ordinal among the candidate's hits, not the number of fragments it
+/// observed, so the buffers are `groups x (max observed ordinal + 1)` f32 values plus
+/// `groups x ceil(width / 64)` presence words. Ordinals are candidate-local, so that is
+/// at most `groups x n_predicted_fragments` values. It can exceed what the candidate
+/// emits: one that observed only ordinal 11 holds 12 values per group against one trace,
+/// and in sparse (non-grid) mode a trace covers only the groups where its fragment
+/// occurs.
+///
+/// It answers every question the trees answered with the same values in the same order:
+/// `count` is the tree's `len`, `frags` its keys ascending, `sum` its values summed in key
+/// order through the same `Iterator::sum`, `get` its lookup (`None` for an absent
+/// fragment, including one past `width`). Presence is a bit, not a sentinel value, because
+/// an observed intensity can be 0.0 (or negative in a hand-made artifact) and must still
+/// count as present.
+struct ScanGroups {
+    rt: Vec<f64>,
+    width: usize,
+    /// `u64` words of presence per group.
+    words: usize,
+    val: Vec<f32>,
+    bits: Vec<u64>,
+}
+
+impl ScanGroups {
+    /// No groups yet, room for ordinals `0..width`.
+    fn new(width: usize) -> ScanGroups {
+        ScanGroups {
+            rt: Vec::new(),
+            width,
+            words: width.div_ceil(64),
+            val: Vec::new(),
+            bits: Vec::new(),
+        }
+    }
+
+    /// One empty group per RT of `rts`.
+    fn empty_on(rts: &[f64], width: usize) -> ScanGroups {
+        let words = width.div_ceil(64);
+        ScanGroups {
+            rt: rts.to_vec(),
+            width,
+            words,
+            val: vec![0.0; rts.len() * width],
+            bits: vec![0; rts.len() * words],
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.rt.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rt.is_empty()
+    }
+
+    #[inline]
+    fn rt(&self, i: usize) -> f64 {
+        self.rt[i]
+    }
+
+    /// Open a new, empty group at `rt`.
+    fn push_group(&mut self, rt: f64) {
+        self.rt.push(rt);
+        self.val.resize(self.val.len() + self.width, 0.0);
+        self.bits.resize(self.bits.len() + self.words, 0);
+    }
+
+    #[inline]
+    fn present(&self, i: usize, f: usize) -> bool {
+        f < self.width && self.bits[i * self.words + f / 64] >> (f % 64) & 1 == 1
+    }
+
+    /// Fragment `f`'s intensity in group `i`, if it was observed there.
+    #[inline]
+    fn get(&self, i: usize, f: u16) -> Option<f32> {
+        let f = f as usize;
+        self.present(i, f).then(|| self.val[i * self.width + f])
+    }
+
+    /// [`ScanGroups::get`], 0.0 when absent: the tree's `get(..).unwrap_or(0.0)`.
+    #[inline]
+    fn or_zero(&self, i: usize, f: u16) -> f32 {
+        self.get(i, f).unwrap_or(0.0)
+    }
+
+    /// Distinct fragments observed in group `i`.
+    fn count(&self, i: usize) -> usize {
+        self.bits[i * self.words..(i + 1) * self.words]
+            .iter()
+            .map(|w| w.count_ones() as usize)
+            .sum()
+    }
+
+    /// The fragments observed in group `i`, ascending.
+    fn frags(&self, i: usize) -> impl Iterator<Item = u16> + '_ {
+        let row = &self.bits[i * self.words..(i + 1) * self.words];
+        row.iter().enumerate().flat_map(|(w, &word)| {
+            let mut word = word;
+            std::iter::from_fn(move || {
+                (word != 0).then(|| {
+                    let b = word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    (w * 64 + b) as u16
+                })
+            })
+        })
+    }
+
+    /// The observed intensities of group `i` summed in ascending fragment order: the tree's
+    /// `values().sum()`.
+    fn sum(&self, i: usize) -> f32 {
+        let base = i * self.width;
+        self.frags(i)
+            .map(|f| self.val[base + f as usize])
+            .sum::<f32>()
+    }
+
+    /// The first hit of a new group: the tree's `insert(frag, inten)`.
+    #[inline]
+    fn insert(&mut self, i: usize, f: u16, v: f32) {
+        let f = f as usize;
+        self.bits[i * self.words + f / 64] |= 1u64 << (f % 64);
+        self.val[i * self.width + f] = v;
+    }
+
+    /// A later hit of the same group: the tree's `entry(frag).or_insert(0.0)` followed by
+    /// `if v > *e { *e = v }`. A fragment first seen here therefore starts from 0.0, not
+    /// from `v`, exactly as the tree did.
+    #[inline]
+    fn merge_max(&mut self, i: usize, f: u16, v: f32) {
+        let fu = f as usize;
+        if !self.present(i, fu) {
+            self.insert(i, f, 0.0);
+        }
+        let e = &mut self.val[i * self.width + fu];
+        if v > *e {
+            *e = v;
+        }
+    }
+
+    /// Replace group `j` with group `i` of `src` (same width).
+    fn copy_group(&mut self, j: usize, src: &ScanGroups, i: usize) {
+        debug_assert_eq!(self.width, src.width);
+        let (w, k) = (self.width, self.words);
+        self.val[j * w..(j + 1) * w].copy_from_slice(&src.val[i * w..(i + 1) * w]);
+        self.bits[j * k..(j + 1) * k].copy_from_slice(&src.bits[i * k..(i + 1) * k]);
+    }
+
+    /// Distinct fragments observed anywhere in groups `lo..=hi`.
+    fn count_union(&self, lo: usize, hi: usize) -> usize {
+        (0..self.words)
+            .map(|w| {
+                (lo..=hi)
+                    .map(|i| self.bits[i * self.words + w])
+                    .fold(0u64, |a, b| a | b)
+                    .count_ones() as usize
+            })
+            .sum()
+    }
+
+    /// Build from `(rt, [(frag, intensity)])` rows, each fragment inserted once: the
+    /// fixtures of the gate-score tests, which were written against the tree form.
+    #[cfg(test)]
+    fn from_rows(rows: &[(f64, &[(u16, f32)])]) -> ScanGroups {
+        let width = rows
+            .iter()
+            .flat_map(|(_, fs)| fs.iter().map(|(f, _)| *f as usize + 1))
+            .max()
+            .unwrap_or(0);
+        let mut g = ScanGroups::new(width);
+        for (rt, fs) in rows {
+            g.push_group(*rt);
+            let i = g.len() - 1;
+            for &(f, v) in fs.iter() {
+                g.insert(i, f, v);
+            }
+        }
+        g
+    }
+}
+
 /// Index of the value in ascending `rts` nearest to `t` (binary search).
 fn nearest_index(rts: &[f64], t: f64) -> usize {
     if rts.is_empty() {
@@ -714,7 +1054,7 @@ fn claim_cue_multiplier(
         // envelope at the nearest MS1 scan. Absent mono precursor -> down-weight; a
         // present mono with an implausible +1/mono ratio -> mild down-weight. A decoy's
         // precursor m/z is well-defined but has no real co-eluting MS1 signal.
-        let cand = &lib.cands[cid as usize];
+        let cand = lib.cand(cid);
         let j = nearest_index(ms1_rts, rt);
         let s = &ms1_scans[j];
         let z = (cand.charge.max(1)) as f64;
@@ -1042,18 +1382,14 @@ fn sum_near(mz: &[f32], inten: &[f32], target: f64, tol_ppm: f64) -> f32 {
 /// Over the full (wide) extraction window the traces are mostly zeros and any
 /// correlation is noise; the spectral/co-elution gates are only meaningful across
 /// the elution peak itself.
-fn peak_window(
-    groups: &[(f64, std::collections::BTreeMap<u16, f32>)],
-    sig: &[u16],
-) -> Option<(usize, usize, Vec<f64>)> {
+fn peak_window(groups: &ScanGroups, sig: &[u16]) -> Option<(usize, usize, Vec<f64>)> {
     if groups.len() < 3 {
         return None;
     }
-    let refp: Vec<f64> = groups
-        .iter()
-        .map(|(_, m)| {
+    let refp: Vec<f64> = (0..groups.len())
+        .map(|i| {
             sig.iter()
-                .map(|o| *m.get(o).unwrap_or(&0.0) as f64)
+                .map(|&o| groups.or_zero(i, o) as f64)
                 .sum::<f64>()
         })
         .collect();
@@ -1083,20 +1419,15 @@ fn peak_window(
 /// (each predicted fragment integrated over the elution-peak scans) with the
 /// predicted intensities. Averaging over the peak removes the single-interfered-
 /// scan fragility of the apex-only Pearson. Returns 1.0 when no peak is resolved.
-fn peak_spectral_score(
-    groups: &[(f64, std::collections::BTreeMap<u16, f32>)],
-    sig: &[u16],
-    fints0: &[f32],
-) -> f64 {
+fn peak_spectral_score(groups: &ScanGroups, sig: &[u16], fints0: &[f32]) -> f64 {
     let (lo, hi, _refp) = match peak_window(groups, sig) {
         Some(w) => w,
         None => return 1.0,
     };
     let obs: Vec<f64> = (0..fints0.len())
         .map(|f| {
-            groups[lo..=hi]
-                .iter()
-                .map(|(_, m)| *m.get(&(f as u16)).unwrap_or(&0.0) as f64)
+            (lo..=hi)
+                .map(|i| groups.or_zero(i, f as u16) as f64)
                 .sum::<f64>()
         })
         .collect();
@@ -1109,12 +1440,7 @@ fn peak_spectral_score(
 /// reference profile, over the elution peak. High when the peptide's own fragments
 /// co-elute; low when a matched fragment only coincides at the apex. Orthogonal to
 /// the intensity-agreement of `peak_spectral_score`.
-fn coelution_gate_score(
-    groups: &[(f64, std::collections::BTreeMap<u16, f32>)],
-    distinct: &[u16],
-    sig: &[u16],
-    fints0: &[f32],
-) -> f64 {
+fn coelution_gate_score(groups: &ScanGroups, distinct: &[u16], sig: &[u16], fints0: &[f32]) -> f64 {
     let (lo, hi, refp) = match peak_window(groups, sig) {
         Some(w) => w,
         None => return 1.0,
@@ -1122,10 +1448,7 @@ fn coelution_gate_score(
     let refw = &refp[lo..=hi];
     let (mut wsum, mut wtot) = (0.0f64, 0.0f64);
     for &f in distinct {
-        let tr: Vec<f64> = groups[lo..=hi]
-            .iter()
-            .map(|(_, m)| *m.get(&f).unwrap_or(&0.0) as f64)
-            .collect();
+        let tr: Vec<f64> = (lo..=hi).map(|i| groups.or_zero(i, f) as f64).collect();
         if tr.iter().any(|x| *x > 0.0) {
             let c = crate::stats::pearson(&tr, refw).max(0.0);
             let w = *fints0.get(f as usize).unwrap_or(&0.0) as f64 + 1e-9;
@@ -1189,7 +1512,7 @@ struct WinGroup {
 }
 
 /// Group the run's scans by isolation window, ascending.
-fn window_groups(idx: &FragIndex, scans: &[Ms2Scan]) -> Vec<WinGroup> {
+fn window_groups(lib: &Library, scans: &[Ms2Scan]) -> Vec<WinGroup> {
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
     for (si, scan) in scans.iter().enumerate() {
@@ -1205,7 +1528,7 @@ fn window_groups(idx: &FragIndex, scans: &[Ms2Scan]) -> Vec<WinGroup> {
         .into_values()
         .filter_map(|ids| {
             let w = &scans[*ids.first()?].window;
-            let (lo, hi) = idx.candidate_range(w.lower_mz, w.upper_mz);
+            let (lo, hi) = lib.candidate_range(w.lower_mz, w.upper_mz);
             (hi > lo).then_some(WinGroup {
                 lo_cid: lo,
                 hi_cid: hi,
@@ -1213,6 +1536,211 @@ fn window_groups(idx: &FragIndex, scans: &[Ms2Scan]) -> Vec<WinGroup> {
             })
         })
         .collect()
+}
+
+/// One probing task of the streamed accumulation: the scans of one window against the
+/// candidates of one sub-range `[lo, hi)`.
+#[derive(Clone, Copy)]
+struct ProbeTask<'a> {
+    ids: &'a [usize],
+    scans: &'a [Ms2Scan],
+    rt_lo: &'a [f64],
+    rt_hi: &'a [f64],
+    mass_off: &'a MassOffset,
+    cfg: &'a ExtractConfig,
+    restrict: Option<&'a CandMask>,
+    /// The whole-library bin geometry the index `run` is handed was built with.
+    bins: &'a LogBins,
+    lo: u32,
+    hi: u32,
+}
+
+impl ProbeTask<'_> {
+    /// Probe every peak of the task's scans through `ix` and return the task's hits grouped
+    /// by candidate. Generic over the index so the production [`LocalIndex`] and the
+    /// reference [`NarrowedProbe`] run the same code, monomorphised, with nothing but the
+    /// index between them.
+    fn run<I: BinnedProbe>(&self, ix: &mut I) -> HitStore {
+        let ProbeTask {
+            ids,
+            scans,
+            rt_lo,
+            rt_hi,
+            mass_off,
+            cfg,
+            restrict,
+            bins,
+            lo,
+            hi,
+        } = *self;
+        // Flat `(cid, hit)` pairs in probe order, grouped by candidate at the end of
+        // the task with a stable counting sort. The task-local `HashMap<u32,
+        // Vec<Hit>>` this replaces was one of the two populations of medium heap
+        // blocks that exhausted the mapping table.
+        let mut flat_cid: Vec<u32> = Vec::new();
+        let mut flat_hit: Vec<Hit> = Vec::new();
+        let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
+        // One scan's `(q_mz, bin)`, refilled per scan and reused. A few KB at 300-2000
+        // peaks a scan, task-local, so it is not the per-window buffer that the comment in
+        // `accumulate_groups` records as tried and reverted: nothing
+        // is shared, nothing is filled before the pool starts, and no thread waits.
+        //
+        // It still pays, with exactly the same number of `ln()` calls the probe made
+        // per peak, because a separate pass takes the `ln()` off the dependency chain
+        // that the bin-cache load and then the posting loads hang from. Measured over
+        // rayon at this task shape (`tests/bench_fragindex.rs` `bench_wall`, 32
+        // threads, min of 9, two independent passes): -11.7 / -6.4% on the default
+        // shape, -15.1 / -17.9% with smaller windows, -17.4 / -18.6% with one wide
+        // window in the batch. Single thread, sorted production-shaped peaks
+        // (`bench_probe`): -9.1 / -12.7 / -6.7% for a narrow / medium / wide
+        // candidate window.
+        //
+        // It carries `q_mz` and not just the bin so `factor_at` still runs ONCE per
+        // peak. That is free here and is not free for the caller: under
+        // `search_seed.mass_cal_loess` the offset is a ~74-point grid and `factor_at`
+        // is a binary search plus an interpolation, measured 8.3 ns/peak against
+        // 0.725 for the scalar default, and a bin-only scratch (which recomputes
+        // `q_mz` in the peak loop) turned that arm from -1.7% into +5.6%.
+        let mut setup: Vec<(f64, u32)> = Vec::new();
+        for &si in ids {
+            let scan = &scans[si];
+            let rt = scan.rt_seconds;
+            let hs = si as u32;
+            setup.clear();
+            setup.extend(scan.peaks.iter().map(|p| {
+                let mz = p.mz as f64;
+                let q = mz / mass_off.factor_at(mz);
+                (q, bins.bin(q) as u32)
+            }));
+            for (peak, &(q_mz, bin)) in scan.peaks.iter().zip(&setup) {
+                let inten = peak.intensity;
+                let obs_mz = peak.mz;
+                claimants.clear();
+                ix.probe_binned(q_mz, bin, |cid, _pmz, pint, frag| {
+                    let c = cid as usize;
+                    if rt < rt_lo[c] || rt > rt_hi[c] {
+                        return;
+                    }
+                    // The allowlist is applied here, before the claim, exactly where the
+                    // serial path applies it: a candidate outside the list neither
+                    // collects hits nor competes for a shared peak.
+                    if let Some(s) = restrict {
+                        if !s.contains(cid) {
+                            return;
+                        }
+                    }
+                    claimants.push((cid, frag, pint));
+                });
+                if claimants.is_empty() {
+                    continue;
+                }
+                match cfg.peak_claim {
+                    PeakClaim::WinnerPredictedIntensity => {
+                        let mut best = 0usize;
+                        for i in 1..claimants.len() {
+                            let a = claimants[i];
+                            let b = claimants[best];
+                            if a.2 > b.2 || (a.2 == b.2 && a.0 < b.0) {
+                                best = i;
+                            }
+                        }
+                        let (cid, frag, _) = claimants[best];
+                        flat_cid.push(cid);
+                        flat_hit.push(Hit {
+                            scan: hs,
+                            frag,
+                            inten,
+                            obs_mz,
+                        });
+                    }
+                    PeakClaim::Proportional => {
+                        let sump: f32 = claimants.iter().map(|c| c.2.max(0.0)).sum();
+                        for &(cid, frag, pi) in &claimants {
+                            let share = if sump > 0.0 {
+                                inten * (pi.max(0.0) / sump)
+                            } else {
+                                inten / claimants.len() as f32
+                            };
+                            flat_cid.push(cid);
+                            flat_hit.push(Hit {
+                                scan: hs,
+                                frag,
+                                inten: share,
+                                obs_mz,
+                            });
+                        }
+                    }
+                    _ => {
+                        for &(cid, frag, _) in &claimants {
+                            flat_cid.push(cid);
+                            flat_hit.push(Hit {
+                                scan: hs,
+                                frag,
+                                inten,
+                                obs_mz,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let (cids, offs) = group_hits_by_candidate(lo, hi, &mut flat_cid, &mut flat_hit);
+        drop(flat_cid);
+        // Not shrunk: the buffer's doubling slack is the same slack the per-candidate
+        // vectors carried, and `shrink_to_fit` here measured 2,520-2,560 MB of peak
+        // RSS against 2,456-2,505 MB without it on the AIF fixture, i.e. its copy
+        // costs more than the slack it returns.
+        HitStore {
+            cids,
+            offs,
+            hits: flat_hit,
+        }
+    }
+}
+
+/// How the probing tasks of the streamed accumulation reach the fragment index.
+#[derive(Clone, Copy)]
+enum TaskProbe<'a> {
+    /// Each task builds a [`LocalIndex`] over its own candidate sub-range, binned with the
+    /// whole library's geometry. The default, and the only production path.
+    Local {
+        lib: &'a Library,
+        bins: &'a LogBins,
+        tol_ppm: f64,
+        stats: &'a LocalIndexStats,
+    },
+    /// Each task probes the global [`FragIndex`] through a [`WindowNarrow`]: the path this
+    /// replaced, kept as the reference the local index is compared against.
+    #[cfg(test)]
+    Global(&'a FragIndex),
+}
+
+impl TaskProbe<'_> {
+    fn bins(&self) -> &LogBins {
+        match self {
+            TaskProbe::Local { bins, .. } => bins,
+            #[cfg(test)]
+            TaskProbe::Global(idx) => idx.bins(),
+        }
+    }
+}
+
+/// What the task-local indexes of one extract cost, summed over every task: logged once
+/// at the end of the accumulation.
+#[derive(Default)]
+struct LocalIndexStats {
+    tasks: std::sync::atomic::AtomicU64,
+    postings: std::sync::atomic::AtomicU64,
+    largest_bytes: std::sync::atomic::AtomicUsize,
+}
+
+impl LocalIndexStats {
+    fn record(&self, ix: &LocalIndex) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.tasks.fetch_add(1, Relaxed);
+        self.postings.fetch_add(ix.len() as u64, Relaxed);
+        self.largest_bytes.fetch_max(ix.heap_bytes(), Relaxed);
+    }
 }
 
 /// Probe one batch of isolation windows and flush what each candidate sub-range finalises,
@@ -1243,7 +1771,7 @@ fn window_groups(idx: &FragIndex, scans: &[Ms2Scan]) -> Vec<WinGroup> {
 /// Returns true when `flush` asked to stop (the chromatogram writer went away).
 #[allow(clippy::too_many_arguments)]
 fn accumulate_groups(
-    idx: &FragIndex,
+    probe: TaskProbe<'_>,
     sibling_bands: usize,
     groups: &[WinGroup],
     scans: &[Ms2Scan],
@@ -1257,15 +1785,16 @@ fn accumulate_groups(
     bound: u32,
     acc: &mut HitAcc,
     chunk: &mut HitStore,
-    flush: &mut (dyn FnMut(&mut HitStore) -> bool + Send),
+    flush: &mut FlushFn<'_>,
 ) -> bool {
     if groups.is_empty() {
         return false;
     }
     // `current_num_threads()` is the whole pool, and under `groups.parallel` every band in
     // flight computes this independently: 24 bands each fanning out to twice the pool gave
-    // thousands of live narrowed-bin caches (1-2 MB each) allocated in lockstep. Divide by
-    // the bands beside this one so the fan-out describes this band's share.
+    // thousands of live narrowed-bin caches (1-2 MB each) allocated in lockstep, which is
+    // what a task's local index is now (4 bytes per occupied bin plus its postings). Divide
+    // by the bands beside this one so the fan-out describes this band's share.
     let threads = (rayon::current_num_threads() / sibling_bands.max(1)).max(1);
     let tasks_per_window = (threads * 2).div_ceil(groups.len()).max(1);
     // The sub-range WIDTH is taken from the mean window span divided by
@@ -1349,130 +1878,36 @@ fn accumulate_groups(
     let (tx, rx) = std::sync::mpsc::channel::<(usize, usize, HitStore)>();
     {
         let probe_range = |gi: usize, lo: u32, hi: u32| -> HitStore {
-            let ids = &groups[gi].scans;
-            // Flat `(cid, hit)` pairs in probe order, grouped by candidate at the end of
-            // the task with a stable counting sort. The task-local `HashMap<u32,
-            // Vec<Hit>>` this replaces was one of the two populations of medium heap
-            // blocks that exhausted the mapping table.
-            let mut flat_cid: Vec<u32> = Vec::new();
-            let mut flat_hit: Vec<Hit> = Vec::new();
-            let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
-            // `(lo, hi)` is fixed for this whole sub-range and every scan of the window
-            // reprobes the same bins, so cache each bin's narrowed posting range once
-            // instead of binary-searching it per peak.
-            let mut nw = idx.window_narrow(lo, hi);
-            // One scan's `(q_mz, bin)`, refilled per scan and reused. A few KB at 300-2000
-            // peaks a scan, task-local, so it is not the per-window buffer above: nothing
-            // is shared, nothing is filled before the pool starts, and no thread waits.
-            //
-            // It still pays, with exactly the same number of `ln()` calls the probe made
-            // per peak, because a separate pass takes the `ln()` off the dependency chain
-            // that the bin-cache load and then the posting loads hang from. Measured over
-            // rayon at this task shape (`tests/bench_fragindex.rs` `bench_wall`, 32
-            // threads, min of 9, two independent passes): -11.7 / -6.4% on the default
-            // shape, -15.1 / -17.9% with smaller windows, -17.4 / -18.6% with one wide
-            // window in the batch. Single thread, sorted production-shaped peaks
-            // (`bench_probe`): -9.1 / -12.7 / -6.7% for a narrow / medium / wide
-            // candidate window.
-            //
-            // It carries `q_mz` and not just the bin so `factor_at` still runs ONCE per
-            // peak. That is free here and is not free for the caller: under
-            // `search_seed.mass_cal_loess` the offset is a ~74-point grid and `factor_at`
-            // is a binary search plus an interpolation, measured 8.3 ns/peak against
-            // 0.725 for the scalar default, and a bin-only scratch (which recomputes
-            // `q_mz` in the peak loop) turned that arm from -1.7% into +5.6%.
-            let mut setup: Vec<(f64, u32)> = Vec::new();
-            for &si in ids {
-                let scan = &scans[si];
-                let rt = scan.rt_seconds;
-                setup.clear();
-                setup.extend(scan.peaks.iter().map(|p| {
-                    let mz = p.mz as f64;
-                    let q = mz / mass_off.factor_at(mz);
-                    (q, idx.bin_of(q))
-                }));
-                for (peak, &(q_mz, bin)) in scan.peaks.iter().zip(&setup) {
-                    let inten = peak.intensity;
-                    let obs_mz = peak.mz as f64;
-                    claimants.clear();
-                    idx.probe_peak_win_binned(&mut nw, q_mz, bin, |cid, _pmz, pint, frag| {
-                        let c = cid as usize;
-                        if rt < rt_lo[c] || rt > rt_hi[c] {
-                            return;
-                        }
-                        // The allowlist is applied here, before the claim, exactly where the
-                        // serial path applies it: a candidate outside the list neither
-                        // collects hits nor competes for a shared peak.
-                        if let Some(s) = restrict {
-                            if !s.contains(cid) {
-                                return;
-                            }
-                        }
-                        claimants.push((cid, frag, pint));
-                    });
-                    if claimants.is_empty() {
-                        continue;
-                    }
-                    match cfg.peak_claim {
-                        PeakClaim::WinnerPredictedIntensity => {
-                            let mut best = 0usize;
-                            for i in 1..claimants.len() {
-                                let a = claimants[i];
-                                let b = claimants[best];
-                                if a.2 > b.2 || (a.2 == b.2 && a.0 < b.0) {
-                                    best = i;
-                                }
-                            }
-                            let (cid, frag, _) = claimants[best];
-                            flat_cid.push(cid);
-                            flat_hit.push(Hit {
-                                rt,
-                                frag,
-                                inten,
-                                obs_mz,
-                            });
-                        }
-                        PeakClaim::Proportional => {
-                            let sump: f32 = claimants.iter().map(|c| c.2.max(0.0)).sum();
-                            for &(cid, frag, pi) in &claimants {
-                                let share = if sump > 0.0 {
-                                    inten * (pi.max(0.0) / sump)
-                                } else {
-                                    inten / claimants.len() as f32
-                                };
-                                flat_cid.push(cid);
-                                flat_hit.push(Hit {
-                                    rt,
-                                    frag,
-                                    inten: share,
-                                    obs_mz,
-                                });
-                            }
-                        }
-                        _ => {
-                            for &(cid, frag, _) in &claimants {
-                                flat_cid.push(cid);
-                                flat_hit.push(Hit {
-                                    rt,
-                                    frag,
-                                    inten,
-                                    obs_mz,
-                                });
-                            }
-                        }
-                    }
+            let task = ProbeTask {
+                ids: &groups[gi].scans,
+                scans,
+                rt_lo,
+                rt_hi,
+                mass_off,
+                cfg,
+                restrict,
+                bins: probe.bins(),
+                lo,
+                hi,
+            };
+            match probe {
+                // The task indexes its own sub-range: the postings the narrowed global
+                // index would have handed it, in the same order, and nothing else.
+                TaskProbe::Local {
+                    lib,
+                    bins,
+                    tol_ppm,
+                    stats,
+                } => {
+                    let mut ix = LocalIndex::build(lib, bins, tol_ppm, lo, hi);
+                    stats.record(&ix);
+                    task.run(&mut ix)
                 }
-            }
-            let (cids, offs) = group_hits_by_candidate(lo, hi, &mut flat_cid, &mut flat_hit);
-            drop(flat_cid);
-            // Not shrunk: the buffer's doubling slack is the same slack the per-candidate
-            // vectors carried, and `shrink_to_fit` here measured 2,520-2,560 MB of peak
-            // RSS against 2,456-2,505 MB without it on the AIF fixture, i.e. its copy
-            // costs more than the slack it returns.
-            HitStore {
-                cids,
-                offs,
-                hits: flat_hit,
+                #[cfg(test)]
+                TaskProbe::Global(idx) => task.run(&mut NarrowedProbe {
+                    idx,
+                    nw: idx.window_narrow(lo, hi),
+                }),
             }
         };
         let n = tasks.len();
@@ -1512,14 +1947,9 @@ fn accumulate_groups(
                     // Everything this sub-range owns is final, except what a later batch
                     // can still reach.
                     let sub_bound = sub_bounds(next_k).1.min(bound);
-                    while !stopped {
-                        gather_chunk(&mut runs, sub_bound, CAND_CHUNK, chunk);
-                        if chunk.is_empty() {
-                            break;
-                        }
-                        if !flush(chunk) {
-                            stopped = true;
-                        }
+                    if !stopped && flush_below(&mut runs, sub_bound, CAND_CHUNK, true, chunk, flush)
+                    {
+                        stopped = true;
                     }
                     acc.runs = runs;
                     acc.compact();
@@ -1619,10 +2049,11 @@ fn extract_twopass_windows(
             for &si in ids {
                 let scan = &scans[si];
                 let rt = scan.rt_seconds;
+                let hs = si as u32;
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let obs_mz = peak.mz as f64;
-                    let q_mz = obs_mz / mass_off.factor_at(obs_mz);
+                    let obs_mz = peak.mz;
+                    let q_mz = obs_mz as f64 / mass_off.factor_at(obs_mz as f64);
                     claimants.clear();
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
@@ -1641,7 +2072,7 @@ fn extract_twopass_windows(
                     }
                     for &(cid, frag, _) in &claimants {
                         acc1.entry(cid).or_default().push(Hit {
-                            rt,
+                            scan: hs,
                             frag,
                             inten,
                             obs_mz,
@@ -1653,7 +2084,7 @@ fn extract_twopass_windows(
             for (cid, hits) in &acc1 {
                 let m = profile.entry(*cid).or_default();
                 for h in hits {
-                    *m.entry(h.rt.to_bits()).or_insert(0.0) += h.inten;
+                    *m.entry(hit_rt(scans, h).to_bits()).or_insert(0.0) += h.inten;
                 }
             }
             // S2 uniqueness-seeded EM: re-seed each candidate's elution profile from its
@@ -1738,6 +2169,7 @@ fn extract_twopass_windows(
                 let scan = &scans[si];
                 let rt = scan.rt_seconds;
                 let rtb = rt.to_bits();
+                let hs = si as u32;
                 // Spectrum-centric demix redistribution (CoelutionDemix): solve one NNLS
                 // over this scan's co-isolated candidate x fragment matrix and split each
                 // shared peak by beta_c * D[peak,c] (smooth joint deconvolution) rather than
@@ -1771,7 +2203,7 @@ fn extract_twopass_windows(
                         for &(cid, _, _) in &claimants {
                             cand.insert(cid);
                         }
-                        prows.push((peak.intensity, obs_mz, claimants.clone()));
+                        prows.push((peak.intensity, peak.mz, claimants.clone()));
                     }
                     if prows.is_empty() {
                         continue;
@@ -1843,7 +2275,7 @@ fn extract_twopass_windows(
                                 e.n_lost += 1;
                             }
                             acc2.entry(cid).or_default().push(Hit {
-                                rt,
+                                scan: hs,
                                 frag,
                                 inten: share as f32,
                                 obs_mz: *obs_mz,
@@ -1880,7 +2312,7 @@ fn extract_twopass_windows(
                         if claimants.is_empty() {
                             continue;
                         }
-                        prows.push((peak.intensity, obs_mz, claimants.clone()));
+                        prows.push((peak.intensity, peak.mz, claimants.clone()));
                     }
                     if prows.is_empty() {
                         continue;
@@ -1920,7 +2352,7 @@ fn extract_twopass_windows(
                                 e.n_lost += 1;
                             }
                             acc2.entry(cid).or_default().push(Hit {
-                                rt,
+                                scan: hs,
                                 frag,
                                 inten: cleaned as f32,
                                 obs_mz: *obs_mz,
@@ -1932,6 +2364,7 @@ fn extract_twopass_windows(
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
                     let obs_mz = peak.mz as f64;
+                    let hit_mz = peak.mz;
                     let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                     claimants.clear();
                     {
@@ -2024,27 +2457,27 @@ fn extract_twopass_windows(
                                 PeakClaim::CoelutionWinner | PeakClaim::CoelutionMultiCue => {
                                     if cid == win {
                                         acc2.entry(cid).or_default().push(Hit {
-                                            rt,
+                                            scan: hs,
                                             frag,
                                             inten,
-                                            obs_mz,
+                                            obs_mz: hit_mz,
                                         });
                                     }
                                 }
                                 PeakClaim::CoelutionProportional => {
                                     acc2.entry(cid).or_default().push(Hit {
-                                        rt,
+                                        scan: hs,
                                         frag,
                                         inten: share,
-                                        obs_mz,
+                                        obs_mz: hit_mz,
                                     });
                                 }
                                 PeakClaim::CoelutionWinnerMargin if !dominant || cid == win => {
                                     acc2.entry(cid).or_default().push(Hit {
-                                        rt,
+                                        scan: hs,
                                         frag,
                                         inten,
-                                        obs_mz,
+                                        obs_mz: hit_mz,
                                     });
                                 }
                                 _ => {}
@@ -2079,69 +2512,129 @@ fn extract_twopass_windows(
     (acc, contested)
 }
 
-pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
-    run_hashed(p).map(|(psms, chrom)| (psms.rows, chrom.rows))
+/// The mass calibration extract applies, as read from `ExtractParams::mass_cal`.
+struct MassCalRead {
+    frag_offset: f64,
+    frag_tol: f64,
+    grid_mz: Vec<f64>,
+    grid_ppm: Vec<f64>,
+    /// The file it came from; `None` when no file was passed or it does not exist, and the
+    /// values are the configured fallback (no offset, `extract.frag_tol_ppm`).
+    from_file: Option<String>,
 }
 
-/// [`run`], returning each output's row count and the content hash its report records
-/// (`psms_extracted`, then `chromatograms`), so an orchestrator can record both artifacts
-/// without reading and hashing them again.
-pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
-    let t0 = Instant::now();
-    // Neither output may be one of the inputs (docs/31 F6).
-    let inputs = [
-        ("--ms2", p.ms2),
-        ("--lib-precursors", p.library_precursors),
-        ("--lib-fragments", p.library_fragments),
-    ];
-    mumdia_io::refuse_output_over_input(p.out_psms, &inputs)?;
-    mumdia_io::refuse_output_over_input(p.out_chrom, &inputs)?;
-    // Skip the bucketed page_search index when the fragindex backend is selected (the
-    // default): it is never read on that path and costs a full sort plus several full
-    // copies of every library fragment.
-    let build_bucketed = !matches!(p.cfg.matcher, MatcherKind::Fragindex);
-    let lib = match p.fragment_offset {
-        None => Library::load_with(
-            p.library_precursors,
-            p.library_fragments,
-            p.cfg.bucket_size,
-            build_bucketed,
-        )?,
-        Some(offset) => Library::load_with_fragment_offset(
-            p.library_precursors,
-            p.library_fragments,
-            offset,
-            p.cfg.bucket_size,
-            build_bucketed,
-        )?,
+/// Read the per-run mass recalibration: the scalar offset + learned tolerance, plus an
+/// optional m/z-dependent correction grid (mass_cal_loess). No logging here; the caller
+/// reports it once the spectra are in, where the stage always reported it.
+fn read_mass_cal(p: &ExtractParams) -> Result<MassCalRead> {
+    let read_grid = |v: &serde_json::Value, key: &str| -> Vec<f64> {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|e| e.as_f64()).collect())
+            .unwrap_or_default()
     };
-
-    // Optional candidate allowlist (gate-first-then-compete): restrict extraction to
-    // the accepted survivors of a prior gate-on run so the two-pass peak-claim profile
-    // map stays small.
-    let restrict: Option<CandMask> = match p.restrict_candidates {
-        Some(path) => {
-            let t = TableFile::open(path)?;
-            let mut s = CandMask::new(lib.n_candidates());
-            for c in t.u32("candidate_id")? {
-                s.insert(c);
-            }
-            info!(
-                restrict_candidates = s.len(),
-                "extract: restricting to candidate allowlist"
-            );
-            Some(s)
+    match p.mass_cal {
+        Some(path) if std::path::Path::new(path).exists() => {
+            let v: serde_json::Value = mumdia_io::json::read_json(path)?;
+            Ok(MassCalRead {
+                frag_offset: v
+                    .get("frag_ppm_offset")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0),
+                frag_tol: v
+                    .get("frag_tol_ppm")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(p.cfg.frag_tol_ppm),
+                grid_mz: read_grid(&v, "mz_cal_grid_mz"),
+                grid_ppm: read_grid(&v, "mz_cal_grid_ppm"),
+                from_file: Some(path.to_string()),
+            })
         }
-        None => None,
-    };
+        _ => Ok(MassCalRead {
+            frag_offset: 0.0,
+            frag_tol: p.cfg.frag_tol_ppm,
+            grid_mz: Vec::new(),
+            grid_ppm: Vec::new(),
+            from_file: None,
+        }),
+    }
+}
 
-    // run windows indexed by candidate_id
-    let rw = TableFile::open(p.run_windows)?;
+/// Decode the spectra the caller did not lend: `(ms2, ms1)`, each `None` when the lent
+/// buffer is used instead.
+///
+/// An empty lent slice is never believed over a named path. A caller that lends
+/// `SharedScans { ms2, ms1: Some(&[]) }` while still passing `ms1: Some(path)` would
+/// otherwise lose every MS1 feature and every MS1 chromatogram row with no error and no
+/// warning, because both are guarded on `!ms1_scans.is_empty()` and simply write nothing.
+/// Decoding the named artifact instead costs nothing when the run really has no MS1 rows
+/// (the decode is then empty too) and makes the silent version impossible. A lent MS1 of
+/// `None` is the caller saying it lends the MS2 only; the MS1 is then decoded without a
+/// warning.
+#[allow(clippy::type_complexity)]
+fn decode_unlent(p: &ExtractParams) -> Result<(Option<Vec<Ms2Scan>>, Option<Vec<Ms1Scan>>)> {
+    match p.scans {
+        Some(shared) => {
+            let ms2 = if shared.ms2.is_empty() {
+                let owned = load_ms2(p.ms2)?;
+                if !owned.is_empty() {
+                    warn!(
+                        ms2 = p.ms2,
+                        scans = owned.len(),
+                        "extract: the caller lent an empty MS2 buffer for a run that has \
+                         scans; decoding the artifact instead of searching nothing"
+                    );
+                }
+                Some(owned)
+            } else {
+                None
+            };
+            let ms1 = match (p.ms1, shared.ms1) {
+                (Some(path), None) => Some(load_ms1(path)?),
+                (Some(path), Some([])) => {
+                    let owned = load_ms1(path)?;
+                    if !owned.is_empty() {
+                        warn!(
+                            ms1 = path,
+                            scans = owned.len(),
+                            "extract: the caller lent an empty MS1 buffer while naming an \
+                             MS1 artifact; decoding it instead of dropping every MS1 feature"
+                        );
+                    }
+                    Some(owned)
+                }
+                _ => None,
+            };
+            Ok((ms2, ms1))
+        }
+        None => {
+            // The two artifacts are independent; the MS2 error, if any, is reported first.
+            let (ms2, ms1) = rayon::join(
+                || load_ms2(p.ms2),
+                || match p.ms1 {
+                    Some(path) => load_ms1(path),
+                    None => Ok(Vec::new()),
+                },
+            );
+            let ms2 = ms2?;
+            Ok((Some(ms2), Some(ms1?)))
+        }
+    }
+}
+
+/// Read `run_windows` and scatter it into the dense per-candidate arrays extract uses,
+/// `rt_cal[c]`, `rt_lo[c]` and `rt_hi[c]`, for a library of `ncand` candidates.
+///
+/// The decoded columns (`candidate_id`, `rt_pred_cal`, `rt_lo`, `rt_hi`: 28 bytes per
+/// row) are dropped when this returns, rather than living until the end of the stage
+/// beside the 24-byte-per-candidate dense copy they were scattered into. On an unbounded
+/// 203M-candidate library that is 5.7 GB that used to sit through the whole extraction.
+pub(crate) fn read_run_windows(path: &str, ncand: usize) -> Result<RtWindows> {
+    let rw = TableFile::open(path)?;
     let rw_cid = rw.u32("candidate_id")?;
     let rw_cal = rw.f64("rt_pred_cal")?;
     let rw_lo = rw.f64("rt_lo")?;
     let rw_hi = rw.f64("rt_hi")?;
-    let ncand = lib.n_candidates();
     let mut rt_lo = vec![f64::NEG_INFINITY; ncand];
     let mut rt_hi = vec![f64::INFINITY; ncand];
     // NaN, not 0.0, for a candidate with no `run_windows` row. Stage B already uses NaN
@@ -2169,7 +2662,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                      of being rejected. Re-run rt-im-train to regenerate {}",
                     rw_lo[i],
                     rw_hi[i],
-                    p.run_windows
+                    path
                 );
             }
             rt_lo[c] = rw_lo[i];
@@ -2177,58 +2670,482 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             rt_cal[c] = rw_cal[i];
         }
     }
+    Ok(RtWindows {
+        rt_cal,
+        rt_lo,
+        rt_hi,
+        fitted_for: None,
+    })
+}
 
-    // Decoded here unless the caller lent its own copies (see `ExtractParams::scans`).
-    // The owned buffers are declared first so they outlive the borrows.
-    //
-    // An empty lent slice is never believed over a named path. A caller that lends
-    // `SharedScans { ms2, ms1: &[] }` while still passing `ms1: Some(path)` would
-    // otherwise lose every MS1 feature and every MS1 chromatogram row with no error and
-    // no warning, because both are guarded on `!ms1_scans.is_empty()` and simply write
-    // nothing. Decoding the named artifact instead costs nothing when the run really has
-    // no MS1 rows (the decode is then empty too) and makes the silent version impossible.
-    let owned_ms2: Vec<Ms2Scan>;
-    let owned_ms1: Vec<Ms1Scan>;
-    let (scans, ms1_scans): (&[Ms2Scan], &[Ms1Scan]) = match p.scans {
-        Some(shared) => {
-            let ms2: &[Ms2Scan] = if shared.ms2.is_empty() {
-                owned_ms2 = load_ms2(p.ms2)?;
-                if !owned_ms2.is_empty() {
-                    warn!(
-                        ms2 = p.ms2,
-                        scans = owned_ms2.len(),
-                        "extract: the caller lent an empty MS2 buffer for a run that has                          scans; decoding the artifact instead of searching nothing"
-                    );
-                }
-                &owned_ms2
-            } else {
-                shared.ms2
-            };
-            let ms1: &[Ms1Scan] = match p.ms1 {
-                Some(path) if shared.ms1.is_empty() => {
-                    owned_ms1 = load_ms1(path)?;
-                    if !owned_ms1.is_empty() {
-                        warn!(
-                            ms1 = path,
-                            scans = owned_ms1.len(),
-                            "extract: the caller lent an empty MS1 buffer while naming an MS1                              artifact; decoding it instead of dropping every MS1 feature"
-                        );
-                    }
-                    &owned_ms1
-                }
-                _ => shared.ms1,
-            };
-            (ms2, ms1)
+/// One accepted candidate peak of `extract::run`: its `psms_extracted` row, its
+/// chromatogram rows and its retained alternative peaks.
+struct CandOut {
+    cid: u32,
+    /// Chromatographic peak rank (0 = selected apex). Top-K promotion (#7).
+    peak_rank: u8,
+    apex_rt: f64,
+    apex_int: f32,
+    n_match: i32,
+    corun: i32,
+    npred: i32,
+    calrt: f64,
+    mz: f64,
+    contested: f64,
+    contested_count_frac: f64,
+    apportioned_frac: f64,
+    z: i32,
+    label: String,
+    base: u32,
+    pform: String,
+    prot: String,
+    irt: f32,
+    ms1_m1: Option<f64>,
+    ms1_mono: Option<f64>,
+    ms1_i1: Option<f64>,
+    ms1_i2: Option<f64>,
+    /// Gate diagnostic scores, computed for EVERY accepted candidate regardless
+    /// of `gate_mode` (sensitivity program): the single-apex-scan intensity
+    /// Pearson, the peak-integrated spectral Pearson, and the temporal co-elution
+    /// score. Emitted so an offline analysis can compare gate metrics (and their
+    /// combination) at matched pool size, without re-extraction.
+    gate_apex: f32,
+    gate_peak_spectral: f32,
+    gate_coelution: f32,
+    gate_spectral_entropy: f32,
+    /// Spectrum-centric demix features (D2), all 0 unless `emit_demix_features`:
+    /// residual-explained fraction, active-set survival flag, and this candidate's
+    /// fraction of the total demixed abundance at its apex.
+    deconv_explained: f32,
+    deconv_active: f32,
+    deconv_share: f32,
+    deconv_collin: f32,
+    deconv_shadow: f32,
+    /// (cid, frag_name, frag_mz, frag_obs_mz, predicted_intensity, rt, intensity)
+    chrom: Vec<ChromOutputRow>,
+    /// Top-K retained peak groups (sensitivity_plan P1.1/P1.2), populated only
+    /// when `retain_top_peaks > 1`. Each: (rank, apex_rt, start_rt, end_rt,
+    /// evidence_count, area). Ranked by co-eluting fragment breadth (not
+    /// intensity). The main PSM above still reports the single selected apex,
+    /// so FDR is unaffected; these are candidate peaks for an offline peak-
+    /// selection model. Empty for K=1.
+    peaks: Vec<(u8, f64, f64, f64, f64, f64)>,
+}
+
+/// The `psms_extracted` rows not yet written, as the columns the table has always had.
+///
+/// The table used to be held whole, 21 to 32 column vectors for every accepted row, and
+/// written once at the end through `write_table`, which cut it into 65,536-row chunks.
+/// Now `PsmStream` writes a full chunk as soon as it fills, through the same writer, so
+/// the writer sees the same chunks and the file is byte-identical (`write_table_chunked`
+/// states why the chunk sequence is what matters). Only the demix features need the
+/// whole table, because they are patched in after the loop; with
+/// `emit_demix_features` the rows are kept and written at the end as before.
+#[derive(Default)]
+struct PsmRows {
+    cid: Vec<u32>,
+    peak_rank: Vec<i32>,
+    apex_rt: Vec<f64>,
+    apex_int: Vec<f32>,
+    n_match: Vec<i32>,
+    npred: Vec<i32>,
+    corun: Vec<i32>,
+    calrt: Vec<f64>,
+    mz: Vec<f64>,
+    z: Vec<i32>,
+    label: Vec<String>,
+    base: Vec<u32>,
+    pform: Vec<String>,
+    prot: Vec<String>,
+    irt: Vec<f32>,
+    contested: Vec<f64>,
+    ms1_m1: Vec<Option<f64>>,
+    ms1_mono: Vec<Option<f64>>,
+    ms1_i1: Vec<Option<f64>>,
+    ms1_i2: Vec<Option<f64>>,
+    contested_count: Vec<f64>,
+    apportioned: Vec<f64>,
+    gate_apex: Vec<f32>,
+    gate_peakspec: Vec<f32>,
+    gate_coel: Vec<f32>,
+    gate_se: Vec<f32>,
+    deconv_expl: Vec<f32>,
+    deconv_act: Vec<f32>,
+    deconv_share: Vec<f32>,
+    deconv_collin: Vec<f32>,
+    deconv_shadow: Vec<f32>,
+}
+
+impl PsmRows {
+    fn len(&self) -> usize {
+        self.cid.len()
+    }
+
+    /// Append one row; its chromatogram rows are the caller's.
+    fn push(&mut self, r: CandOut, cfg: &ExtractConfig) {
+        self.cid.push(r.cid);
+        self.peak_rank.push(r.peak_rank as i32);
+        self.apex_rt.push(r.apex_rt);
+        self.apex_int.push(r.apex_int);
+        self.n_match.push(r.n_match);
+        self.corun.push(r.corun);
+        self.npred.push(r.npred);
+        self.calrt.push(r.calrt);
+        self.mz.push(r.mz);
+        self.contested.push(r.contested);
+        if cfg.emit_contested_features {
+            self.contested_count.push(r.contested_count_frac);
+            self.apportioned.push(r.apportioned_frac);
         }
-        None => {
-            owned_ms2 = load_ms2(p.ms2)?;
-            owned_ms1 = match p.ms1 {
-                Some(path) => load_ms1(path)?,
-                None => Vec::new(),
-            };
-            (&owned_ms2, &owned_ms1)
+        self.z.push(r.z);
+        self.label.push(r.label);
+        self.base.push(r.base);
+        self.pform.push(r.pform);
+        self.prot.push(r.prot);
+        self.irt.push(r.irt);
+        self.ms1_m1.push(r.ms1_m1);
+        self.ms1_mono.push(r.ms1_mono);
+        self.ms1_i1.push(r.ms1_i1);
+        self.ms1_i2.push(r.ms1_i2);
+        if cfg.emit_gate_diagnostics {
+            self.gate_apex.push(r.gate_apex);
+            self.gate_peakspec.push(r.gate_peak_spectral);
+            self.gate_coel.push(r.gate_coelution);
+            self.gate_se.push(r.gate_spectral_entropy);
         }
+        if cfg.emit_demix_features {
+            self.deconv_expl.push(r.deconv_explained);
+            self.deconv_act.push(r.deconv_active);
+            self.deconv_share.push(r.deconv_share);
+            self.deconv_collin.push(r.deconv_collin);
+            self.deconv_shadow.push(r.deconv_shadow);
+        }
+    }
+
+    /// Move the pending rows out as the table's columns, in the table's column order,
+    /// with library-wide candidate ids (`offset` is `Library::global_offset`).
+    fn take_cols(&mut self, offset: u32, cfg: &ExtractConfig) -> Vec<Col> {
+        use std::mem::take;
+        let n = self.len();
+        let mut cols = vec![
+            Col::U32(
+                "candidate_id".into(),
+                self.cid.iter().map(|c| c + offset).collect(),
+            ),
+            Col::I32("peak_rank".into(), take(&mut self.peak_rank)),
+            Col::F64("apex_rt".into(), take(&mut self.apex_rt)),
+            Col::OptF64("apex_im".into(), vec![None; n]),
+            Col::F32("apex_intensity".into(), take(&mut self.apex_int)),
+            Col::I32("n_matched_fragments".into(), take(&mut self.n_match)),
+            Col::I32("n_predicted_fragments".into(), take(&mut self.npred)),
+            Col::I32("coelution_run".into(), take(&mut self.corun)),
+            Col::F64("rt_pred_cal".into(), take(&mut self.calrt)),
+            Col::F64("precursor_mz".into(), take(&mut self.mz)),
+            Col::I32("charge".into(), take(&mut self.z)),
+            Col::Str("label".into(), take(&mut self.label)),
+            Col::U32("base_peptide_id".into(), take(&mut self.base)),
+            Col::Str("peptidoform".into(), take(&mut self.pform)),
+            Col::Str("protein".into(), take(&mut self.prot)),
+            Col::F32("predicted_irt".into(), take(&mut self.irt)),
+            Col::F64("contested_frac".into(), take(&mut self.contested)),
+            Col::OptF64("ms1_isom1".into(), take(&mut self.ms1_m1)),
+            Col::OptF64("ms1_mono".into(), take(&mut self.ms1_mono)),
+            Col::OptF64("ms1_iso1".into(), take(&mut self.ms1_i1)),
+            Col::OptF64("ms1_iso2".into(), take(&mut self.ms1_i2)),
+        ];
+        self.cid.clear();
+        // Richer soft-competition columns only when emit_contested_features (default-off
+        // keeps the schema byte-identical; contested_frac above is the pre-existing one).
+        if cfg.emit_contested_features {
+            cols.push(Col::F64(
+                "contested_count_frac".into(),
+                take(&mut self.contested_count),
+            ));
+            cols.push(Col::F64(
+                "apportioned_frac".into(),
+                take(&mut self.apportioned),
+            ));
+        }
+        // Diagnostic gate-score columns only when enabled (default-off keeps the schema
+        // byte-identical to the production chain).
+        if cfg.emit_gate_diagnostics {
+            cols.push(Col::F32("gate_apex".into(), take(&mut self.gate_apex)));
+            cols.push(Col::F32(
+                "gate_peak_spectral".into(),
+                take(&mut self.gate_peakspec),
+            ));
+            cols.push(Col::F32("gate_coelution".into(), take(&mut self.gate_coel)));
+            cols.push(Col::F32(
+                "gate_spectral_entropy".into(),
+                take(&mut self.gate_se),
+            ));
+        }
+        if cfg.emit_demix_features {
+            cols.push(Col::F32(
+                "deconv_explained_frac".into(),
+                take(&mut self.deconv_expl),
+            ));
+            cols.push(Col::F32("deconv_active".into(), take(&mut self.deconv_act)));
+            cols.push(Col::F32(
+                "deconv_share".into(),
+                take(&mut self.deconv_share),
+            ));
+            cols.push(Col::F32(
+                "deconv_max_collinearity".into(),
+                take(&mut self.deconv_collin),
+            ));
+            cols.push(Col::F32(
+                "shadow_kept_frac".into(),
+                take(&mut self.deconv_shadow),
+            ));
+        }
+        cols
+    }
+}
+
+/// `psms_extracted` as the candidate loop produces it (X7).
+///
+/// Streamed, every `WRITE_TABLE_CHUNK_ROWS` pushed rows are written as one chunk through a
+/// `TableWriter` opened as `write_table_hashed` opens it, and `finish` writes the short
+/// tail, or the one empty chunk that fixes the schema of an empty table, then the footer.
+/// That is the chunk sequence `write_table` cuts from the whole table, so the file is the
+/// `write_table` file (`the_streamed_psms_table_is_the_write_table_file`). Unstreamed, the
+/// rows are kept whole and `finish` hands them to `write_table_hashed`; the demix pass
+/// needs that, because it patches rows after the loop. Either way the file is hashed as it
+/// is written, so its report needs no read-back (docs/03_io_layer.md, "Hash on write").
+struct PsmStream {
+    /// The rows not yet written; unstreamed, every row.
+    rows: PsmRows,
+    /// `None` on the unstreamed path.
+    writer: Option<TableWriter>,
+    path: String,
+    /// `Library::global_offset`, added to every written candidate id.
+    offset: u32,
+    /// Time spent writing, for the `extract: psms_extracted writer` log line.
+    busy: std::time::Duration,
+}
+
+impl PsmStream {
+    fn new(path: &str, streamed: bool, offset: u32) -> PsmStream {
+        PsmStream {
+            rows: PsmRows::default(),
+            writer: streamed.then(|| TableWriter::new(path).with_content_hash()),
+            path: path.to_string(),
+            offset,
+            busy: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Append one row, and write the pending rows when they make a full chunk. An error is
+    /// the chunk's write failing; the rows it held are gone, so the caller stops.
+    fn push(&mut self, r: CandOut, cfg: &ExtractConfig) -> Result<()> {
+        self.rows.push(r, cfg);
+        if let Some(w) = self.writer.as_mut() {
+            if self.rows.len() == WRITE_TABLE_CHUNK_ROWS {
+                let t = Instant::now();
+                let written = w.write_cols(self.rows.take_cols(self.offset, cfg));
+                self.busy += t.elapsed();
+                written?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write what is pending and publish the table: its rows and content hash, and the
+    /// total write time.
+    fn finish(mut self, cfg: &ExtractConfig) -> Result<(Written, std::time::Duration)> {
+        let t = Instant::now();
+        let n = match self.writer.take() {
+            Some(mut w) => {
+                // The tail, unless the rows were an exact multiple of the chunk, whose last
+                // full chunk was written by `push`; an empty table still writes its one
+                // empty chunk.
+                if self.rows.len() > 0 || w.rows() == 0 {
+                    w.write_cols(self.rows.take_cols(self.offset, cfg))?;
+                }
+                w.close_hashed()?
+            }
+            None => write_table_hashed(&self.path, self.rows.take_cols(self.offset, cfg))?,
+        };
+        self.busy += t.elapsed();
+        Ok((n, self.busy))
+    }
+}
+
+/// Finish the chromatogram table the writer thread was fed, or abandon it.
+///
+/// `psms_failed` is a `psms_extracted` chunk write that failed inside the candidate loop.
+/// The loop stopped there, so the chromatogram table holds only the candidates before
+/// that point. It is then not published: the writer is dropped unclosed, which removes its
+/// temporary file (`AtomicPath`), and a chromatograms table already at the path stays as
+/// it was, as the `psms_extracted` one does. Publishing it would put a truncated table
+/// beside an older `psms_extracted`, a pair no extract wrote together. Published, the
+/// table's rows and content hash are returned; the writer must have been built
+/// [`TableWriter::with_content_hash`].
+fn close_chromatograms(w: TableWriter, psms_failed: Option<anyhow::Error>) -> Result<Written> {
+    match psms_failed {
+        Some(e) => {
+            drop(w);
+            Err(e)
+        }
+        None => w.close_hashed(),
+    }
+}
+
+pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
+    run_hashed(p).map(|(psms, chrom)| (psms.rows, chrom.rows))
+}
+
+/// [`run`], returning each output's row count and the content hash its report records
+/// (`psms_extracted`, then `chromatograms`), so an orchestrator can record both artifacts
+/// without reading and hashing them again.
+pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
+    let t0 = Instant::now();
+    // Taken out before the closures below borrow `p`; consumed where the file is read.
+    let handed_windows = p.rt_windows.take();
+    // Neither output may be one of the inputs (docs/31 F6).
+    let inputs = [
+        ("--ms2", p.ms2),
+        ("--lib-precursors", p.library_precursors),
+        ("--lib-fragments", p.library_fragments),
+    ];
+    mumdia_io::refuse_output_over_input(p.out_psms, &inputs)?;
+    mumdia_io::refuse_output_over_input(p.out_chrom, &inputs)?;
+    // Skip the bucketed page_search index when the fragindex backend is selected (the
+    // default): it is never read on that path and costs a full sort plus several full
+    // copies of every library fragment.
+    let fragindex = matches!(p.cfg.matcher, MatcherKind::Fragindex);
+    let build_bucketed = !fragindex;
+    // The two co-elution strategies and the contested feature need a first pass to
+    // build per-candidate elution profiles before shared peaks can be arbitrated.
+    let two_pass = matches!(
+        p.cfg.peak_claim,
+        PeakClaim::CoelutionWinner
+            | PeakClaim::CoelutionProportional
+            | PeakClaim::CoelutionWinnerMargin
+            | PeakClaim::CoelutionMultiCue
+            | PeakClaim::CoelutionDemix
+            | PeakClaim::CoelutionShadow
+    ) || p.cfg.emit_contested_features;
+    // The GLOBAL fragment index is needed only by the paths that probe arbitrary candidate
+    // windows through it: the two-pass arbitration and the per-apex-scan demix. The
+    // default streamed accumulation gives each probing task a `LocalIndex` of its own
+    // sub-range instead, and needs only the whole library's bin geometry.
+    let global_index = fragindex && (two_pass || p.cfg.emit_demix_features);
+    // The mass calibration is read FIRST: it is one small JSON file, and its learned
+    // tolerance is what the fragment index is built at, so building the index while the
+    // spectra decode needs it up front. Its errors and its log lines stay where they were,
+    // after the spectra (`mass?` below).
+    let mass = read_mass_cal(&p);
+    let load_indexed = || -> Result<(Library, Option<FragIndex>, Option<LogBins>)> {
+        let lib = Library::load_for_stage(
+            p.library_precursors,
+            p.library_fragments,
+            p.fragment_offset,
+            p.precursor_span,
+            p.cfg.bucket_size,
+            build_bucketed,
+        )?;
+        // fragindex backend, built once at the learned fragment tolerance when a path
+        // needs the global index; otherwise the bucketed `Library::page_search` path is
+        // used. `Prober::probe` dispatches on this per peak. The geometry is the global
+        // index's own when it is built, and computed on its own when it is not; either
+        // way it is `FragIndex::geometry` at the learned tolerance.
+        let (fidx, bins) = match (&mass, fragindex, global_index) {
+            (Ok(m), true, true) => {
+                let f = FragIndex::build(&lib, m.frag_tol);
+                let b = f.bins().clone();
+                (Some(f), Some(b))
+            }
+            (Ok(m), true, false) => (None, Some(FragIndex::geometry(&lib, m.frag_tol))),
+            _ => (None, None),
+        };
+        Ok((lib, fidx, bins))
     };
+    // On the fragindex path the spectra decode runs concurrently with the library load and
+    // the index build: they are independent, and the scans are resident during the index
+    // build either way, so the overlap does not raise the peak. The bucketed path keeps them
+    // in sequence, because its library load builds a full sorted copy of every fragment and
+    // holding the scans through that transient would. Errors are reported in the old order:
+    // the library's, then the allowlist's and the RT windows', then the spectra's.
+    let (loaded, decoded) = if fragindex {
+        let (l, d) = rayon::join(load_indexed, || decode_unlent(&p));
+        (l, Some(d))
+    } else {
+        (load_indexed(), None)
+    };
+    let (lib, prebuilt_fidx, prebuilt_bins) = loaded?;
+
+    // Optional candidate allowlist (gate-first-then-compete): restrict extraction to
+    // the accepted survivors of a prior gate-on run so the two-pass peak-claim profile
+    // map stays small.
+    let restrict: Option<CandMask> = match p.restrict_candidates {
+        Some(path) => {
+            let t = TableFile::open(path)?;
+            let mut s = CandMask::new(lib.n_candidates());
+            for c in t.u32("candidate_id")? {
+                s.insert(c);
+            }
+            info!(
+                restrict_candidates = s.len(),
+                "extract: restricting to candidate allowlist"
+            );
+            Some(s)
+        }
+        None => None,
+    };
+
+    // run windows indexed by candidate_id: the orchestrator's in-memory copy when it was
+    // fitted for this library and this run_windows file (`rt_im_train::RtWindows` says why
+    // that is the same arrays), the file otherwise.
+    let ncand = lib.n_candidates();
+    let handed_windows = match handed_windows {
+        Some(w) => match w.mismatch(p.library_precursors, p.run_windows, ncand) {
+            None => Some(w),
+            Some(why) => {
+                warn!(
+                    handed = w.len(),
+                    candidates = ncand,
+                    run_windows = p.run_windows,
+                    "extract: the RT windows handed over are not this extract's ({why}); \
+                     reading the run_windows file instead"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let RtWindows {
+        rt_cal,
+        rt_lo,
+        rt_hi,
+        ..
+    } = match handed_windows {
+        Some(w) => {
+            info!(
+                candidates = ncand,
+                "extract: RT windows handed over in memory; run_windows is not re-read"
+            );
+            w
+        }
+        None => read_run_windows(p.run_windows, ncand)?,
+    };
+
+    // Decoded here unless the caller lent its own copies (see `ExtractParams::scans` and
+    // `decode_unlent`); on the fragindex path the decode already ran, concurrently with the
+    // library load.
+    let (owned_ms2, owned_ms1) = match decoded {
+        Some(d) => d?,
+        None => decode_unlent(&p)?,
+    };
+    let (scans, ms1_scans): (&[Ms2Scan], &[Ms1Scan]) = (
+        owned_ms2
+            .as_deref()
+            .unwrap_or_else(|| p.scans.map(|s| s.ms2).unwrap_or(&[])),
+        owned_ms1
+            .as_deref()
+            .unwrap_or_else(|| p.scans.and_then(|s| s.ms1).unwrap_or(&[])),
+    );
     let ms1_rts: Vec<f64> = ms1_scans.iter().map(|s| s.rt_seconds).collect();
     info!(
         candidates = ncand,
@@ -2267,52 +3184,39 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             .map(|w| w.1 - w.0)
             .fold(0.0f64, |a, b| if b > a { b } else { a });
 
-    // Per-run mass recalibration (optional). Reads the scalar offset + learned
-    // tolerance, plus an optional m/z-dependent correction grid (mass_cal_loess).
-    let read_grid = |v: &serde_json::Value, key: &str| -> Vec<f64> {
-        v.get(key)
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|e| e.as_f64()).collect())
-            .unwrap_or_default()
-    };
-    let (frag_offset, frag_tol, grid_mz, grid_ppm) = match p.mass_cal {
-        Some(path) if std::path::Path::new(path).exists() => {
-            let v: serde_json::Value = mumdia_io::json::read_json(path)?;
-            let off = v
-                .get("frag_ppm_offset")
-                .and_then(|x| x.as_f64())
-                .unwrap_or(0.0);
-            let tol = v
-                .get("frag_tol_ppm")
-                .and_then(|x| x.as_f64())
-                .unwrap_or(p.cfg.frag_tol_ppm);
-            let gmz = read_grid(&v, "mz_cal_grid_mz");
-            let gpp = read_grid(&v, "mz_cal_grid_ppm");
-            info!(
-                frag_ppm_offset = off,
-                frag_tol_ppm = tol,
-                mz_cal_grid = gmz.len(),
-                "extract: using mass recalibration"
+    // Per-run mass recalibration (optional): the scalar offset + learned tolerance, plus
+    // an optional m/z-dependent correction grid (mass_cal_loess), read at the top of the
+    // stage (`read_mass_cal`) and reported here, where it always was.
+    let MassCalRead {
+        frag_offset,
+        frag_tol,
+        grid_mz,
+        grid_ppm,
+        from_file,
+    } = mass?;
+    if let Some(path) = from_file.as_deref() {
+        info!(
+            frag_ppm_offset = frag_offset,
+            frag_tol_ppm = frag_tol,
+            mz_cal_grid = grid_mz.len(),
+            "extract: using mass recalibration"
+        );
+        // `extract.frag_tol_ppm` is a FALLBACK, not a setting, in any orchestrated
+        // run: search-seed always writes `frag_tol_ppm` into masscal.json --
+        // including in its calibration-failure branch, where it writes
+        // `search_seed.fragment_tol_ppm` -- and both orchestrators always pass
+        // `--mass-cal`. So a config carrying `extract.frag_tol_ppm = 40` extracted at
+        // the learned value with nothing said about it. Say it, because a config key
+        // that is read and then ignored is worse than one that is absent.
+        if (frag_tol - p.cfg.frag_tol_ppm).abs() > 1e-9 {
+            warn!(
+                configured_frag_tol_ppm = p.cfg.frag_tol_ppm,
+                learned_frag_tol_ppm = frag_tol,
+                mass_cal = path,
+                "extract: extract.frag_tol_ppm is overridden by the learned tolerance                      from mass calibration. It applies only when no --mass-cal is passed;                      to widen the search tolerance, set search_seed.fragment_tol_ppm"
             );
-            // `extract.frag_tol_ppm` is a FALLBACK, not a setting, in any orchestrated
-            // run: search-seed always writes `frag_tol_ppm` into masscal.json --
-            // including in its calibration-failure branch, where it writes
-            // `search_seed.fragment_tol_ppm` -- and both orchestrators always pass
-            // `--mass-cal`. So a config carrying `extract.frag_tol_ppm = 40` extracted at
-            // the learned value with nothing said about it. Say it, because a config key
-            // that is read and then ignored is worse than one that is absent.
-            if (tol - p.cfg.frag_tol_ppm).abs() > 1e-9 {
-                warn!(
-                    configured_frag_tol_ppm = p.cfg.frag_tol_ppm,
-                    learned_frag_tol_ppm = tol,
-                    mass_cal = path,
-                    "extract: extract.frag_tol_ppm is overridden by the learned tolerance                      from mass calibration. It applies only when no --mass-cal is passed;                      to widen the search tolerance, set search_seed.fragment_tol_ppm"
-                );
-            }
-            (off, tol, gmz, gpp)
         }
-        _ => (0.0, p.cfg.frag_tol_ppm, Vec::new(), Vec::new()),
-    };
+    }
     // The grid is used only if both arrays agree in length and have >= 2 points.
     let mass_off = if grid_mz.len() >= 2 && grid_mz.len() == grid_ppm.len() {
         MassOffset {
@@ -2328,11 +3232,23 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         }
     };
 
-    // fragindex backend, built once at the learned fragment tolerance when selected
-    // (`MatcherKind::Fragindex`); otherwise the bucketed `Library::page_search` path
-    // is used. `Prober::probe` dispatches on this per peak.
-    let fidx =
-        matches!(p.cfg.matcher, MatcherKind::Fragindex).then(|| FragIndex::build(&lib, frag_tol));
+    // The fragment index, built with the library above at this same learned tolerance,
+    // when a path needs the global one; and the geometry the streamed path's task-local
+    // indexes bin with.
+    let fidx = match (global_index, prebuilt_fidx) {
+        (true, Some(f)) => Some(f),
+        (true, None) => Some(FragIndex::build(&lib, frag_tol)),
+        (false, _) => None,
+    };
+    let stream_bins: Option<LogBins> = match (fragindex, prebuilt_bins) {
+        (true, Some(b)) => Some(b),
+        (true, None) => Some(match &fidx {
+            Some(f) => f.bins().clone(),
+            None => FragIndex::geometry(&lib, frag_tol),
+        }),
+        (false, _) => None,
+    };
+    let local_stats = LocalIndexStats::default();
 
     // Peak-major accumulation. The fast path (single pass, fragment index, no candidate
     // allowlist) leaves `acc` empty and fills `stream_groups` instead; every other path
@@ -2344,21 +3260,10 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // Per-candidate contested-peak stats under the co-elution arbitration, for the
     // non-destructive soft competition features. Populated only on the two-pass path.
     let mut contested: HashMap<u32, Contested> = HashMap::new();
-    // The two co-elution strategies and the contested feature need a first pass to
-    // build per-candidate elution profiles before shared peaks can be arbitrated.
-    let two_pass = matches!(
-        p.cfg.peak_claim,
-        PeakClaim::CoelutionWinner
-            | PeakClaim::CoelutionProportional
-            | PeakClaim::CoelutionWinnerMargin
-            | PeakClaim::CoelutionMultiCue
-            | PeakClaim::CoelutionDemix
-            | PeakClaim::CoelutionShadow
-    ) || p.cfg.emit_contested_features;
     let claim_margin = p.cfg.peak_claim_margin as f32;
 
     if !two_pass {
-        if let Some(idx) = fidx.as_ref() {
+        if stream_bins.is_some() {
             // Parallel across isolation-window groups (bit-identical to serial: the
             // cascade rt-sorts each candidate's hits before summing), with or without a
             // candidate allowlist: the allowlist is applied inside the probe, before the
@@ -2370,23 +3275,24 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             // candidate out as soon as no later window can add a hit to it, so the whole
             // run's hits are never resident. Measured at 1.6 billion hits (35.9 GiB of
             // payload) on the HYE benchmark, which was 60% of extract's 61.3 GiB peak.
-            stream_groups = Some(window_groups(idx, scans));
+            stream_groups = Some(window_groups(&lib, scans));
         } else {
             let pr = Prober {
                 fidx: fidx.as_ref(),
                 lib: &lib,
                 frag_tol,
             };
-            for scan in scans {
+            for (si, scan) in scans.iter().enumerate() {
                 let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
                 if hi <= lo {
                     continue;
                 }
                 let rt = scan.rt_seconds;
+                let hs = si as u32;
                 for peak in &scan.peaks {
                     let inten = peak.intensity;
-                    let obs_mz = peak.mz as f64;
-                    let q_mz = obs_mz / mass_off.factor_at(obs_mz);
+                    let obs_mz = peak.mz;
+                    let q_mz = obs_mz as f64 / mass_off.factor_at(obs_mz as f64);
                     // Collect every co-isolated, in-RT-window candidate matching this
                     // peak, then apportion per the claim strategy. In wide DIA one peak
                     // matches many candidates (~98% of fragments collide).
@@ -2421,7 +3327,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                             }
                             let (cid, frag, _) = claimants[best];
                             acc.entry(cid).or_default().push(Hit {
-                                rt,
+                                scan: hs,
                                 frag,
                                 inten,
                                 obs_mz,
@@ -2436,7 +3342,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                                     inten / claimants.len() as f32
                                 };
                                 acc.entry(cid).or_default().push(Hit {
-                                    rt,
+                                    scan: hs,
                                     frag,
                                     inten: share,
                                     obs_mz,
@@ -2447,7 +3353,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         _ => {
                             for &(cid, frag, _) in &claimants {
                                 acc.entry(cid).or_default().push(Hit {
-                                    rt,
+                                    scan: hs,
                                     frag,
                                     inten,
                                     obs_mz,
@@ -2536,46 +3442,26 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // Cascade + apex per candidate.
     let scan_window = p.cfg.fixed_scan_window.max(1);
 
-    // psms_extracted columns
-    let (mut cid_c, mut apexrt_c, mut apexint_c) = (Vec::new(), Vec::new(), Vec::new());
-    // Top-K peak promotion (AlphaDIA #7): the peak rank of each emitted PSM row. 0 is
-    // the selected apex (the only row per candidate until promote_top_peaks > 1).
-    let mut peakrank_c: Vec<i32> = Vec::new();
-    let (mut nmatch_c, mut corun_c, mut npred_c) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut calrt_c, mut mz_c, mut z_c) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut label_c, mut base_c, mut pform_c, mut prot_c, mut irt_c) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let mut apexim_c: Vec<Option<f64>> = Vec::new();
-    // Fraction of this candidate's matched intensity that a co-eluting competitor
-    // claims more strongly (co-elution arbitration); 0 when the two-pass path is off.
-    let mut contested_c: Vec<f64> = Vec::new();
-    // Richer soft-competition columns, emitted only with emit_contested_features.
-    let (mut contested_count_c, mut apportioned_c): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
-    // MS1 apex isotope intensities (null when no MS1 provided).
-    let mut ms1_m1: Vec<Option<f64>> = Vec::new();
-    let mut ms1_mono: Vec<Option<f64>> = Vec::new();
-    let mut ms1_i1: Vec<Option<f64>> = Vec::new();
-    let mut ms1_i2: Vec<Option<f64>> = Vec::new();
-    // Gate diagnostic scores (per accepted candidate; see CandOut).
-    let (mut gate_apex_c, mut gate_peakspec_c, mut gate_coel_c, mut gate_se_c): (
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-    ) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    // Demix (D1/D2/D3) feature columns.
-    #[allow(clippy::type_complexity)]
-    let (
-        mut deconv_expl_c,
-        mut deconv_act_c,
-        mut deconv_share_c,
-        mut deconv_collin_c,
-        mut deconv_shadow_c,
-    ): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-
     // Chromatogram rows stream to parquet chunk by chunk (see the candidate loop below).
-    let chrom_writer = TableWriter::new(p.out_chrom).with_row_group_rows(CHROM_ROW_GROUP_ROWS);
+    // Hashed as it is written: the report's content hash then needs no read-back of the
+    // run's largest artifact (docs/03_io_layer.md, "Hash on write"). The layout and the
+    // encodings are the shared ones ([`crate::chromatograms::writer`]: the axis PLAIN).
+    // Under v2 every row passes through one `Encoder` in table order, which counts the rows
+    // to know where each row group starts, so it and the writer take the same row-group
+    // size.
+    let chrom_layout =
+        crate::chromatograms::Layout::from_schema_version(p.cfg.chromatogram_schema)?;
+    let chrom_rg_rows = crate::chromatograms::row_group_rows();
+    if chrom_rg_rows != CHROM_ROW_GROUP_ROWS {
+        info!(
+            rows = chrom_rg_rows,
+            "extract: chromatogram row groups resized by {}",
+            crate::chromatograms::ROW_GROUP_ROWS_ENV
+        );
+    }
+    let chrom_writer =
+        crate::chromatograms::writer(p.out_chrom, chrom_rg_rows, chrom_layout).with_content_hash();
+    let mut chrom_encoder = crate::chromatograms::Encoder::new(chrom_rg_rows);
 
     // Deterministic output order (a HashMap's iteration order is randomized,
     // and downstream floating-point sums in the rescorer are order-sensitive).
@@ -2594,57 +3480,13 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // candidate (was a hoisted reused buffer) because buffers cannot be shared across
     // parallel candidates.
 
-    struct CandOut {
-        cid: u32,
-        /// Chromatographic peak rank (0 = selected apex). Top-K promotion (#7).
-        peak_rank: u8,
-        apex_rt: f64,
-        apex_int: f32,
-        n_match: i32,
-        corun: i32,
-        npred: i32,
-        calrt: f64,
-        mz: f64,
-        contested: f64,
-        contested_count_frac: f64,
-        apportioned_frac: f64,
-        z: i32,
-        label: String,
-        base: u32,
-        pform: String,
-        prot: String,
-        irt: f32,
-        ms1_m1: Option<f64>,
-        ms1_mono: Option<f64>,
-        ms1_i1: Option<f64>,
-        ms1_i2: Option<f64>,
-        /// Gate diagnostic scores, computed for EVERY accepted candidate regardless
-        /// of `gate_mode` (sensitivity program): the single-apex-scan intensity
-        /// Pearson, the peak-integrated spectral Pearson, and the temporal co-elution
-        /// score. Emitted so an offline analysis can compare gate metrics (and their
-        /// combination) at matched pool size, without re-extraction.
-        gate_apex: f32,
-        gate_peak_spectral: f32,
-        gate_coelution: f32,
-        gate_spectral_entropy: f32,
-        /// Spectrum-centric demix features (D2), all 0 unless `emit_demix_features`:
-        /// residual-explained fraction, active-set survival flag, and this candidate's
-        /// fraction of the total demixed abundance at its apex.
-        deconv_explained: f32,
-        deconv_active: f32,
-        deconv_share: f32,
-        deconv_collin: f32,
-        deconv_shadow: f32,
-        /// (cid, frag_name, frag_mz, frag_obs_mz, predicted_intensity, rt, intensity)
-        chrom: Vec<ChromOutputRow>,
-        /// Top-K retained peak groups (sensitivity_plan P1.1/P1.2), populated only
-        /// when `retain_top_peaks > 1`. Each: (rank, apex_rt, start_rt, end_rt,
-        /// evidence_count, area). Ranked by co-eluting fragment breadth (not
-        /// intensity). The main PSM above still reports the single selected apex,
-        /// so FDR is unaffected; these are candidate peaks for an offline peak-
-        /// selection model. Empty for K=1.
-        peaks: Vec<(u8, f64, f64, f64, f64, f64)>,
-    }
+    // psms_extracted rows, streamed in `write_table`'s own chunks unless the demix pass
+    // needs the whole table (see `PsmStream`). A chunk write that fails inside the loop
+    // stops it; the error is kept here and returned once the chromatogram writer has been
+    // stopped without publishing (`close_chromatograms`).
+    let stream_psms = !p.cfg.emit_demix_features;
+    let mut psms = PsmStream::new(p.out_psms, stream_psms, lib.global_offset);
+    let mut psms_err: Option<anyhow::Error> = None;
 
     // Apex-scan lookup for spectrum-centric demixing (D2): rt_bits -> scan indices.
     // Built only when demixing is requested, so the default path pays nothing.
@@ -2675,24 +3517,29 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // already rt-ascending in the ordinary case; the sort then allocates scratch as large
         // as the vector itself for nothing. Equal-rt hits collapse to `max` per (rt, frag)
         // below either way, so skipping a sort that would not move anything is exact.
-        if !hits.windows(2).all(|w| w[0].rt <= w[1].rt) {
-            hits.sort_by(|a, b| a.rt.total_cmp(&b.rt));
+        if !hits
+            .windows(2)
+            .all(|w| hit_rt(scans, &w[0]) <= hit_rt(scans, &w[1]))
+        {
+            hits.sort_by(|a, b| hit_rt(scans, a).total_cmp(&hit_rt(scans, b)));
         }
-        // scan groups: Vec<(rt, BTreeMap<frag,intensity>)>. A BTreeMap keeps the
-        // per-scan fragment order fixed so the f32 apex sum is deterministic.
-        let mut groups: Vec<(f64, BTreeMap<u16, f32>)> = Vec::new();
+        // Scan groups, dense (`ScanGroups`): per group its RT and each fragment's max
+        // observed intensity. The per-group fragment order is the ordinal order, as the
+        // `BTreeMap` per group this replaces fixed it, so the f32 apex sum is
+        // deterministic and unchanged.
+        let width = hits.iter().map(|h| h.frag as usize + 1).max().unwrap_or(0);
+        let mut groups = ScanGroups::new(width);
         for h in hits.iter() {
-            match groups.last_mut() {
-                Some((rt, map)) if (*rt - h.rt).abs() < 1e-9 => {
-                    let e = map.entry(h.frag).or_insert(0.0);
-                    if h.inten > *e {
-                        *e = h.inten;
-                    }
+            let h_rt = hit_rt(scans, h);
+            match groups.rt.last() {
+                Some(&rt) if (rt - h_rt).abs() < 1e-9 => {
+                    let i = groups.len() - 1;
+                    groups.merge_max(i, h.frag, h.inten);
                 }
                 _ => {
-                    let mut m = BTreeMap::new();
-                    m.insert(h.frag, h.inten);
-                    groups.push((h.rt, m));
+                    groups.push_group(h_rt);
+                    let i = groups.len() - 1;
+                    groups.insert(i, h.frag, h.inten);
                 }
             }
         }
@@ -2705,7 +3552,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // break a run) rather than only scans that happened to carry a hit. When
         // no covering-window grid is available, fall back to the sparse groups.
         let grid: Vec<f64> = if !windows.is_empty() {
-            let pm = lib.cands[cid as usize].precursor_mz;
+            let pm = lib.prec_mz[cid as usize];
             let (lo, hi) = (rt_lo[cid as usize], rt_hi[cid as usize]);
             // `windows` is sorted by lower m/z, so a covering window has
             // `lower_mz <= pm` AND, since its width is at most `window_max_width`,
@@ -2736,19 +3583,19 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             Vec::new()
         };
         if !grid.is_empty() {
-            let mut aligned: Vec<(f64, BTreeMap<u16, f32>)> =
-                grid.iter().map(|&r| (r, BTreeMap::new())).collect();
+            let mut aligned = ScanGroups::empty_on(&grid, width);
             // Both sides are ascending (`grid` is sorted and deduplicated; the scan groups
             // were built from rt-sorted hits), so this is a merge rather than a per-
             // candidate `HashMap` of the grid. The match is still on the exact bit
             // pattern, so a group whose RT is not a grid RT is dropped exactly as before.
             let mut j = 0usize;
-            for (rt, map) in std::mem::take(&mut groups) {
+            for i in 0..groups.len() {
+                let rt = groups.rt(i);
                 while j < grid.len() && grid[j] < rt {
                     j += 1;
                 }
                 if j < grid.len() && grid[j].to_bits() == rt.to_bits() {
-                    aligned[j].1 = map;
+                    aligned.copy_group(j, &groups, i);
                     j += 1;
                 }
             }
@@ -2771,7 +3618,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // (~= the predicted RT). That mild RT-prior steers off off-centre interfering
         // peaks; measured, sum beats mean by ~+300 IDs on the AIF file. Window 1
         // reproduces the exact per-scan-count behavior.
-        let counts: Vec<usize> = groups.iter().map(|(_, m)| m.len()).collect();
+        let counts: Vec<usize> = (0..groups.len()).map(|i| groups.count(i)).collect();
         let w = p.cfg.apex_count_window.max(1);
         let r = w / 2;
         let sigma = p.cfg.apex_gaussian_sigma_scans;
@@ -2833,19 +3680,17 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             ord.sort_by(|&a, &b| fints0[b].total_cmp(&fints0[a]));
             ord.into_iter().take(k_sig).map(|o| o as u16).collect()
         };
-        let mut apex_rt = groups[0].0;
+        let mut apex_rt = groups.rt(0);
         let mut apex_sum = 0.0f32;
         let mut best_sig = f32::NEG_INFINITY;
-        for (i, (rt, map)) in groups.iter().enumerate() {
-            if map.is_empty() || smoothed[i] < thresh {
+        for (i, &n_here) in counts.iter().enumerate() {
+            if n_here == 0 || smoothed[i] < thresh {
                 continue;
             }
-            let sig_sum: f32 = sig
-                .iter()
-                .map(|&o| map.get(&o).copied().unwrap_or(0.0))
-                .sum();
+            let rt = groups.rt(i);
+            let sig_sum: f32 = sig.iter().map(|&o| groups.or_zero(i, o)).sum();
             let prior = if use_prior {
-                (-0.5 * ((*rt - rt_cal_c) / rt_prior_sigma).powi(2)).exp() as f32
+                (-0.5 * ((rt - rt_cal_c) / rt_prior_sigma).powi(2)).exp() as f32
             } else {
                 1.0
             };
@@ -2855,7 +3700,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 // intensity only breaks ties within [0,1). Interference-resistant
                 // in wide-window DIA (a chimeric-intensity spike cannot outvote a
                 // scan where more of the peptide's own transitions co-elute).
-                let n_frag = map.len() as f32;
+                let n_frag = n_here as f32;
                 let tie = sig_sum / (sig_sum + 1.0);
                 (n_frag + tie) * prior
             } else {
@@ -2865,16 +3710,16 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             };
             if score > best_sig {
                 best_sig = score;
-                apex_rt = *rt;
-                apex_sum = map.values().sum(); // report full apex intensity
+                apex_rt = rt;
+                apex_sum = groups.sum(i); // report full apex intensity
             }
         }
 
         // Co-elution run: max consecutive scan groups with >= min_coelution frags.
         let mut best_run = 0usize;
         let mut cur = 0usize;
-        for (_, map) in &groups {
-            if map.len() >= p.cfg.presence_min_coelution.max(1) {
+        for &n_here in &counts {
+            if n_here >= p.cfg.presence_min_coelution.max(1) {
                 cur += 1;
                 best_run = best_run.max(cur);
             } else {
@@ -2893,7 +3738,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             return Vec::new();
         }
 
-        let c = &lib.cands[cid as usize];
+        let c = lib.cand(cid);
 
         // MS1 apex isotope intensities at a given RT (nearest MS1 scan). Factored
         // so both the selected apex (rank 0) and any promoted alternate peak (#7)
@@ -2932,17 +3777,16 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // above is the primary symmetric discriminator). With `ms1_rescue`, a
         // candidate that fails the single-scan fragment Pearson is kept when it has
         // adequate matched fragments AND MS1 isotope-pattern support.
-        let apex_map = groups
-            .iter()
-            .find(|(rt, _)| (*rt - apex_rt).abs() < 1e-9)
-            .map(|(_, m)| m);
+        // The first group within 1e-9 s of the apex RT: the group the apex was read from.
+        let apex_gi: Option<usize> =
+            (0..groups.len()).find(|&i| (groups.rt(i) - apex_rt).abs() < 1e-9);
         // Spectral-agreement score closures, evaluated lazily: the acceptance gate
         // needs only the ACTIVE `gate_mode`'s score, and the four diagnostic scores
         // are computed only when `emit_gate_diagnostics` is set (see below), so the
         // default chain pays the same per-candidate cost as before this feature.
-        let apex_obs: Option<Vec<f64>> = apex_map.map(|map| {
+        let apex_obs: Option<Vec<f64>> = apex_gi.map(|gi| {
             (0..fmzs0.len())
-                .map(|k| *map.get(&(k as u16)).unwrap_or(&0.0) as f64)
+                .map(|k| groups.or_zero(gi, k as u16) as f64)
                 .collect()
         });
         let pred_f64: Vec<f64> = fints0.iter().map(|x| *x as f64).collect();
@@ -3044,7 +3888,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         let mut wsum: Vec<(f64, f64)> = vec![(0.0, 0.0); fmzs.len()]; // (sum w*mz, sum w)
         for h in hits.iter() {
             if let Some(e) = wsum.get_mut(h.frag as usize) {
-                e.0 += h.obs_mz * h.inten as f64;
+                e.0 += h.obs_mz as f64 * h.inten as f64;
                 e.1 += h.inten as f64;
             }
         }
@@ -3064,8 +3908,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // Vec<(f64, f32)>>` over the whole candidate plus a `HashMap<u64, f32>` per
         // fragment, and produces the same values in the same order.
         let mut observed = FragSet::default();
-        for (_, m) in &groups {
-            for &f in m.keys() {
+        for i in 0..groups.len() {
+            for f in groups.frags(i) {
                 observed.insert(f);
             }
         }
@@ -3089,10 +3933,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             } else if !grid.is_empty() {
                 (
                     grid_rt.clone(),
-                    groups
-                        .iter()
-                        .map(|(_, m)| *m.get(&frag).unwrap_or(&0.0))
-                        .collect(),
+                    (0..groups.len()).map(|i| groups.or_zero(i, frag)).collect(),
                 )
             } else {
                 // Sparse mode: the groups are already ascending in RT, so the trace is
@@ -3100,10 +3941,10 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 // vector held before its (already-sorted) stable sort.
                 let mut rts: Vec<f32> = Vec::new();
                 let mut ints: Vec<f32> = Vec::new();
-                for (rt, m) in &groups {
-                    if let Some(&i) = m.get(&frag) {
-                        rts.push(*rt as f32);
-                        ints.push(i);
+                for i in 0..groups.len() {
+                    if let Some(v) = groups.get(i, frag) {
+                        rts.push(groups.rt(i) as f32);
+                        ints.push(v);
                     }
                 }
                 (rts, ints)
@@ -3157,16 +3998,16 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // selection model. Empty for K=1 (the default).
         let peaks: Vec<(u8, f64, f64, f64, f64, f64)> =
             if p.cfg.retain_top_peaks > 1 && !groups.is_empty() {
-                let count_prof: Vec<f32> = groups.iter().map(|(_, m)| m.len() as f32).collect();
+                let count_prof: Vec<f32> = counts.iter().map(|&c| c as f32).collect();
                 crate::peaks::enumerate_peaks(&count_prof, p.cfg.retain_top_peaks, 1.0 / 3.0, 0.1)
                     .into_iter()
                     .map(|pk| {
                         (
                             pk.rank as u8,
-                            groups[pk.apex_idx].0,
-                            groups[pk.start_idx].0,
-                            groups[pk.end_idx].0,
-                            groups[pk.apex_idx].1.len() as f64,
+                            groups.rt(pk.apex_idx),
+                            groups.rt(pk.start_idx),
+                            groups.rt(pk.end_idx),
+                            counts[pk.apex_idx] as f64,
                             pk.area as f64,
                         )
                     })
@@ -3200,8 +4041,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             z: c.charge,
             label: if c.is_decoy { "decoy" } else { "target" }.to_string(),
             base: c.base_peptide_id,
-            pform: c.peptidoform.clone(),
-            prot: c.protein.clone(),
+            pform: c.peptidoform.to_string(),
+            prot: c.protein.to_string(),
             irt: c.predicted_irt,
             ms1_m1: o_ms1_m1,
             ms1_mono: o_ms1_mono,
@@ -3231,12 +4072,9 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // rank 0, looked up by candidate_id downstream) and re-slices only its own
         // apex-dependent scalars + MS1; the features stage recomputes peak-shape and
         // co-elution features from the shared chrom windowed to each row's own apex.
-        let count_prof: Vec<f32> = groups.iter().map(|(_, m)| m.len() as f32).collect();
+        let count_prof: Vec<f32> = counts.iter().map(|&c| c as f32).collect();
         let alt_peaks =
             crate::peaks::enumerate_peaks(&count_prof, p.cfg.promote_top_peaks, 1.0 / 3.0, 0.1);
-        let apex_gi = groups
-            .iter()
-            .position(|(rt, _)| (*rt - apex_rt).abs() < 1e-9);
         // Reference area for the area gate: the enumerated envelope holding the
         // selected apex (0 disables the area gate if the apex is not a counted peak).
         let rank0_area = apex_gi
@@ -3259,30 +4097,27 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     continue;
                 }
             }
-            let alt_apex_rt = groups[pk.apex_idx].0;
+            let alt_apex_rt = groups.rt(pk.apex_idx);
             if (alt_apex_rt - apex_rt).abs() < p.cfg.alt_peak_min_separation_s {
                 continue;
             }
             if rank0_area > 0.0 && (pk.area as f64) < p.cfg.alt_peak_min_area_frac * rank0_area {
                 continue;
             }
-            let mut altset: std::collections::HashSet<u16> = std::collections::HashSet::new();
-            for (_, m) in &groups[pk.start_idx..=pk.end_idx] {
-                for &f in m.keys() {
-                    altset.insert(f);
-                }
-            }
-            if altset.len() < p.cfg.presence_min_matched.max(1) {
+            // Distinct fragments across the alternate envelope: the size of the union of
+            // its groups' fragment sets.
+            let alt_distinct = groups.count_union(pk.start_idx, pk.end_idx);
+            if alt_distinct < p.cfg.presence_min_matched.max(1) {
                 continue;
             }
-            let alt_apex_int: f32 = groups[pk.apex_idx].1.values().sum();
+            let alt_apex_int: f32 = groups.sum(pk.apex_idx);
             let (a_m1, a_mono, a_i1, a_i2) = ms1_at(alt_apex_rt);
             out.push(CandOut {
                 cid,
                 peak_rank: rank,
                 apex_rt: alt_apex_rt,
                 apex_int: alt_apex_int,
-                n_match: altset.len() as i32,
+                n_match: alt_distinct as i32,
                 corun: best_run as i32,
                 npred: fmzs0.len() as i32,
                 calrt: rt_cal[cid as usize],
@@ -3293,8 +4128,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 z: c.charge,
                 label: if c.is_decoy { "decoy" } else { "target" }.to_string(),
                 base: c.base_peptide_id,
-                pform: c.peptidoform.clone(),
-                prot: c.protein.clone(),
+                pform: c.peptidoform.to_string(),
+                prot: c.protein.to_string(),
                 irt: c.predicted_irt,
                 ms1_m1: a_m1,
                 ms1_mono: a_mono,
@@ -3342,29 +4177,39 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // The chromatogram writer runs on its own thread and cannot borrow the library, so the
     // band's offset travels with the chunks.
     let chrom_offset = lib.global_offset;
-    let n_chrom = std::thread::scope(|sc| -> Result<u64> {
+    // Writer-side timing (P0 instrumentation, log lines only): how long the extraction
+    // side sat blocked in `tx.send` because both channel slots were full, against how long
+    // the writer thread spent encoding. A large blocked time with a writer busy for most of
+    // the stage means the serial encoder bounds extract; a small one means it does not.
+    let mut chrom_send_blocked = std::time::Duration::ZERO;
+    let mut chrom_chunks_sent = 0u64;
+    let chrom_written = std::thread::scope(|sc| -> Result<Written> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Col>>(2);
-        let writer = sc.spawn(move || -> Result<u64> {
+        // The writer is handed back unclosed: whether the table is published depends on
+        // how the loop ended (`close_chromatograms`), which only this side knows.
+        let writer = sc.spawn(move || -> Result<(TableWriter, std::time::Duration)> {
             let mut w = chrom_writer;
+            let mut busy = std::time::Duration::ZERO;
             for cols in rx {
+                let t = Instant::now();
                 w.write_cols(cols)?;
+                busy += t.elapsed();
             }
-            w.close()
+            Ok((w, busy))
         });
         // One flush of finished candidates: score them in parallel, append their PSM
         // rows, and hand their chromatogram rows to the writer thread. Called once per
         // window batch on the streamed path and once on the eager paths, so the code
         // that produces a row is the same either way. Returns false when the writer has
         // gone away; its error surfaces at the join below.
-        let mut emit_batch = |store: &mut HitStore| -> bool {
-            let mut cand_hits = store.slices_mut();
+        let mut emit_batch = |mut cand_hits: Vec<(u32, &mut [Hit])>| -> bool {
             for chunk in cand_hits.chunks_mut(CAND_CHUNK) {
                 let outs: Vec<Vec<CandOut>> = chunk
                     .par_iter_mut()
                     .map(|(cid, hits)| per_candidate(*cid, hits))
                     .collect();
                 let mut ch = ChromChunk::default();
-                for r in outs.into_iter().flatten() {
+                for mut r in outs.into_iter().flatten() {
                     n_accepted += 1;
                     let rcid = r.cid;
                     for (rank, apex, start, end, ev, area) in &r.peaks {
@@ -3376,66 +4221,62 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         pk_ev.push(*ev);
                         pk_area.push(*area);
                     }
-                    cid_c.push(r.cid);
-                    peakrank_c.push(r.peak_rank as i32);
-                    apexrt_c.push(r.apex_rt);
-                    apexim_c.push(None);
-                    apexint_c.push(r.apex_int);
-                    nmatch_c.push(r.n_match);
-                    corun_c.push(r.corun);
-                    npred_c.push(r.npred);
-                    calrt_c.push(r.calrt);
-                    mz_c.push(r.mz);
-                    contested_c.push(r.contested);
-                    if p.cfg.emit_contested_features {
-                        contested_count_c.push(r.contested_count_frac);
-                        apportioned_c.push(r.apportioned_frac);
+                    let chrom = std::mem::take(&mut r.chrom);
+                    if let Err(e) = psms.push(r, p.cfg) {
+                        psms_err = Some(e);
+                        return false;
                     }
-                    z_c.push(r.z);
-                    label_c.push(r.label);
-                    base_c.push(r.base);
-                    pform_c.push(r.pform);
-                    prot_c.push(r.prot);
-                    irt_c.push(r.irt);
-                    ms1_m1.push(r.ms1_m1);
-                    ms1_mono.push(r.ms1_mono);
-                    ms1_i1.push(r.ms1_i1);
-                    ms1_i2.push(r.ms1_i2);
-                    if p.cfg.emit_gate_diagnostics {
-                        gate_apex_c.push(r.gate_apex);
-                        gate_peakspec_c.push(r.gate_peak_spectral);
-                        gate_coel_c.push(r.gate_coelution);
-                        gate_se_c.push(r.gate_spectral_entropy);
-                    }
-                    if p.cfg.emit_demix_features {
-                        deconv_expl_c.push(r.deconv_explained);
-                        deconv_act_c.push(r.deconv_active);
-                        deconv_share_c.push(r.deconv_share);
-                        deconv_collin_c.push(r.deconv_collin);
-                        deconv_shadow_c.push(r.deconv_shadow);
-                    }
-                    for (cc, nm, fmz, omz, pint, rt, it) in r.chrom {
-                        ch.cid.push(cc);
-                        ch.name.push(nm);
-                        ch.fmz.push(fmz);
-                        ch.obsmz.push(omz);
-                        ch.pint.push(pint);
-                        ch.rt.push(rt);
-                        ch.int.push(it);
+                    let rows = &mut ch.rows;
+                    for (cc, nm, fmz, omz, pint, rt, it) in chrom {
+                        rows.cid.push(cc);
+                        rows.name.push(nm);
+                        rows.frag_mz.push(fmz);
+                        rows.frag_obs_mz.push(omz);
+                        rows.predicted_intensity.push(pint);
+                        if chrom_layout == crate::chromatograms::Layout::V2 {
+                            // The band-local id: the offset is added to every row alike,
+                            // so it cannot change which rows share a candidate.
+                            match chrom_encoder.encode(cc, rt, it) {
+                                Ok(e) => {
+                                    rows.rt.push(e.rt);
+                                    rows.intensity.push(e.intensity);
+                                    rows.trace_offset.push(e.trace_offset);
+                                    rows.trace_len.push(e.trace_len);
+                                }
+                                // A row the encoder refuses stops the loop like a failed
+                                // psms write, and the table is abandoned the same way.
+                                Err(e) => {
+                                    psms_err = Some(e);
+                                    return false;
+                                }
+                            }
+                        } else {
+                            rows.rt.push(rt);
+                            rows.intensity.push(it);
+                        }
                     }
                 }
-                let chunk_bytes = crate::memlog::bytes_of_nested(&ch.rt)
-                    + crate::memlog::bytes_of_nested(&ch.int)
-                    + crate::memlog::bytes_of(&ch.cid)
-                    + crate::memlog::bytes_of(&ch.fmz)
-                    + crate::memlog::bytes_of(&ch.obsmz)
-                    + crate::memlog::bytes_of(&ch.pint)
-                    + ch.name.iter().map(|s| s.len()).sum::<usize>();
+                let r = &ch.rows;
+                let chunk_bytes = r.trace_bytes()
+                    + crate::memlog::bytes_of(&r.cid)
+                    + crate::memlog::bytes_of(&r.frag_mz)
+                    + crate::memlog::bytes_of(&r.frag_obs_mz)
+                    + crate::memlog::bytes_of(&r.predicted_intensity)
+                    + crate::memlog::bytes_of(&r.trace_offset)
+                    + crate::memlog::bytes_of(&r.trace_len)
+                    + r.name.iter().map(|s| s.len()).sum::<usize>();
                 chrom_bytes_total += chunk_bytes;
                 chrom_bytes_max_chunk = chrom_bytes_max_chunk.max(chunk_bytes);
                 // Hand the chunk's chromatogram rows to the writer thread. A send error means
-                // the writer failed; its error surfaces at the join below.
-                if tx.send(ch.cols(chrom_offset)).is_err() {
+                // the writer failed; its error surfaces at the join below. The columns are
+                // built before the clock starts, so the timer holds only the wait for a
+                // free channel slot.
+                let cols = ch.cols(chrom_offset, chrom_layout);
+                let t_send = Instant::now();
+                let sent = tx.send(cols);
+                chrom_send_blocked += t_send.elapsed();
+                chrom_chunks_sent += 1;
+                if sent.is_err() {
                     return false;
                 }
             }
@@ -3453,7 +4294,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         if let Some(groups) = stream_groups.as_ref() {
             // Counting the flushed candidates here rather than inside `emit_batch` keeps
             // the eager path below able to borrow `emit_batch` on its own.
-            let mut flush = |c: &mut HitStore| -> bool {
+            let mut flush = |c: Vec<(u32, &mut [Hit])>| -> bool {
                 n_materialized += c.len() as u64;
                 emit_batch(c)
             };
@@ -3468,8 +4309,14 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 // so the accumulator holds a sub-range of the band rather than the band.
                 let bound = groups.get(upto).map(|g| g.lo_cid).unwrap_or(u32::MAX);
                 let mut stopped = accumulate_groups(
-                    fidx.as_ref()
-                        .expect("streamed path implies a fragment index"),
+                    TaskProbe::Local {
+                        lib: &lib,
+                        bins: stream_bins
+                            .as_ref()
+                            .expect("the streamed path implies the fragindex geometry"),
+                        tol_ppm: frag_tol,
+                        stats: &local_stats,
+                    },
                     p.sibling_bands,
                     &groups[gi..upto],
                     scans,
@@ -3488,14 +4335,17 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 // Candidates past the batch's own sub-range grid (a window of this batch
                 // can reach past the last window's range when the windows differ in width)
                 // are final too, and the sub-range loop cannot have reached them.
-                while !stopped {
-                    gather_chunk(&mut acc_stream.runs, bound, CAND_CHUNK, &mut chunk);
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    if !flush(&mut chunk) {
-                        stopped = true;
-                    }
+                if !stopped
+                    && flush_below(
+                        &mut acc_stream.runs,
+                        bound,
+                        CAND_CHUNK,
+                        true,
+                        &mut chunk,
+                        &mut flush,
+                    )
+                {
+                    stopped = true;
                 }
                 acc_stream.compact();
                 if stopped {
@@ -3515,6 +4365,17 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 windows_in_flight = step,
                 "extract: candidates with evidence"
             );
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                info!(
+                    tasks = local_stats.tasks.load(Relaxed),
+                    postings = local_stats.postings.load(Relaxed),
+                    library_fragments = lib.frag_mz.len(),
+                    largest_task_index_bytes = local_stats.largest_bytes.load(Relaxed),
+                    bins = stream_bins.as_ref().map(|b| b.n_bins).unwrap_or(0),
+                    "extract: task-local fragment indexes"
+                );
+            }
         } else {
             // Eager paths: move each chunk of candidates out of the whole-run
             // `HashMap<u32, Vec<Hit>>` into the CSR buffer in ascending id order, freeing
@@ -3529,17 +4390,23 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     chunk.push_segment(cid, &hits);
                 }
                 i = end;
-                if !emit_batch(&mut chunk) {
+                if !emit_batch(chunk.slices_mut()) {
                     break;
                 }
             }
         }
-        // A final empty chunk fixes the schema when no candidate was accepted at all.
-        let _ = tx.send(ChromChunk::default().cols(0));
+        // A final empty chunk fixes the schema when no candidate was accepted at all. Not
+        // after a failed psms_extracted write, whose table is abandoned below.
+        if psms_err.is_none() {
+            let _ = tx.send(ChromChunk::default().cols(0, chrom_layout));
+        }
         drop(tx);
-        let n = writer
+        let (w, mut writer_busy) = writer
             .join()
-            .map_err(|_| anyhow::anyhow!("chromatogram writer thread panicked"))?;
+            .map_err(|_| anyhow::anyhow!("chromatogram writer thread panicked"))??;
+        let t_close = Instant::now();
+        let n = close_chromatograms(w, psms_err.take())?;
+        writer_busy += t_close.elapsed();
         crate::memlog::report(
             "extract chromatogram traces",
             &[
@@ -3547,7 +4414,13 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 ("run_total_streamed", chrom_bytes_total),
             ],
         );
-        n
+        info!(
+            chunks = chrom_chunks_sent,
+            send_blocked_ms = chrom_send_blocked.as_millis() as u64,
+            writer_busy_ms = writer_busy.as_millis() as u64,
+            "extract: chromatogram writer"
+        );
+        Ok(n)
     })?;
 
     // Spectrum-centric NNLS demixing (D2), second pass: solve ONCE PER APEX SCAN.
@@ -3566,12 +4439,14 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // Which candidates need a demix, grouped by the scan that serves them. BTreeMap so
         // the scan iteration order is deterministic.
         let mut by_scan: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
-        for i in 0..cid_c.len() {
-            if peakrank_c[i] != 0 {
+        for i in 0..psms.rows.len() {
+            if psms.rows.peak_rank[i] != 0 {
                 continue;
             }
-            if let Some(si) = demix_apex_scan(scans, &rt_scan, apexrt_c[i], mz_c[i]) {
-                by_scan.entry(si).or_default().push(cid_c[i]);
+            if let Some(si) =
+                demix_apex_scan(scans, &rt_scan, psms.rows.apex_rt[i], psms.rows.mz[i])
+            {
+                by_scan.entry(si).or_default().push(psms.rows.cid[i]);
             }
         }
         let n_scans = by_scan.len();
@@ -3607,68 +4482,30 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             "extract: demix features (one NNLS per apex scan)"
         );
         // Patch the rank-0 rows in place; the columns were filled in the chunk loop above.
-        for i in 0..cid_c.len() {
-            if peakrank_c[i] != 0 {
+        for i in 0..psms.rows.len() {
+            if psms.rows.peak_rank[i] != 0 {
                 continue;
             }
-            if let Some(&(expl, act, share, collin, shadow)) = feats.get(&cid_c[i]) {
-                deconv_expl_c[i] = expl as f32;
-                deconv_act_c[i] = act as f32;
-                deconv_share_c[i] = share as f32;
-                deconv_collin_c[i] = collin as f32;
-                deconv_shadow_c[i] = shadow as f32;
+            if let Some(&(expl, act, share, collin, shadow)) = feats.get(&psms.rows.cid[i]) {
+                psms.rows.deconv_expl[i] = expl as f32;
+                psms.rows.deconv_act[i] = act as f32;
+                psms.rows.deconv_share[i] = share as f32;
+                psms.rows.deconv_collin[i] = collin as f32;
+                psms.rows.deconv_shadow[i] = shadow as f32;
             }
         }
     }
 
-    let mut psms_cols = vec![
-        Col::U32(
-            "candidate_id".into(),
-            cid_c.iter().map(|c| c + lib.global_offset).collect(),
-        ),
-        Col::I32("peak_rank".into(), peakrank_c),
-        Col::F64("apex_rt".into(), apexrt_c),
-        Col::OptF64("apex_im".into(), apexim_c),
-        Col::F32("apex_intensity".into(), apexint_c),
-        Col::I32("n_matched_fragments".into(), nmatch_c),
-        Col::I32("n_predicted_fragments".into(), npred_c),
-        Col::I32("coelution_run".into(), corun_c),
-        Col::F64("rt_pred_cal".into(), calrt_c),
-        Col::F64("precursor_mz".into(), mz_c),
-        Col::I32("charge".into(), z_c),
-        Col::Str("label".into(), label_c),
-        Col::U32("base_peptide_id".into(), base_c),
-        Col::Str("peptidoform".into(), pform_c),
-        Col::Str("protein".into(), prot_c),
-        Col::F32("predicted_irt".into(), irt_c),
-        Col::F64("contested_frac".into(), contested_c),
-        Col::OptF64("ms1_isom1".into(), ms1_m1),
-        Col::OptF64("ms1_mono".into(), ms1_mono),
-        Col::OptF64("ms1_iso1".into(), ms1_i1),
-        Col::OptF64("ms1_iso2".into(), ms1_i2),
-    ];
-    // Richer soft-competition columns only when emit_contested_features (default-off
-    // keeps the schema byte-identical; contested_frac above is the pre-existing one).
-    if p.cfg.emit_contested_features {
-        psms_cols.push(Col::F64("contested_count_frac".into(), contested_count_c));
-        psms_cols.push(Col::F64("apportioned_frac".into(), apportioned_c));
-    }
-    // Diagnostic gate-score columns only when enabled (default-off keeps the schema
-    // byte-identical to the production chain).
-    if p.cfg.emit_gate_diagnostics {
-        psms_cols.push(Col::F32("gate_apex".into(), gate_apex_c));
-        psms_cols.push(Col::F32("gate_peak_spectral".into(), gate_peakspec_c));
-        psms_cols.push(Col::F32("gate_coelution".into(), gate_coel_c));
-        psms_cols.push(Col::F32("gate_spectral_entropy".into(), gate_se_c));
-    }
-    if p.cfg.emit_demix_features {
-        psms_cols.push(Col::F32("deconv_explained_frac".into(), deconv_expl_c));
-        psms_cols.push(Col::F32("deconv_active".into(), deconv_act_c));
-        psms_cols.push(Col::F32("deconv_share".into(), deconv_share_c));
-        psms_cols.push(Col::F32("deconv_max_collinearity".into(), deconv_collin_c));
-        psms_cols.push(Col::F32("shadow_kept_frac".into(), deconv_shadow_c));
-    }
-    let n_psms = write_table(p.out_psms, psms_cols)?;
+    // The last, short chunk (or the one empty chunk that fixes the schema of an empty
+    // table), then the footer. Unstreamed, the whole table goes through `write_table`,
+    // which cuts the same chunks.
+    let (psms_written, psms_write_busy) = psms.finish(p.cfg)?;
+    info!(
+        rows = psms_written.rows,
+        streamed = stream_psms,
+        writer_busy_ms = psms_write_busy.as_millis() as u64,
+        "extract: psms_extracted writer"
+    );
 
     // (chromatograms were streamed to `p.out_chrom` during the candidate loop above)
 
@@ -3698,18 +4535,24 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("accepted".to_string(), json!(n_accepted));
     stats.insert("scan_window".to_string(), json!(scan_window));
+    let n_chrom = chrom_written.rows;
     let mut written: Vec<Written> = Vec::with_capacity(2);
-    for (path, schema, rows) in [
-        (p.out_psms, artifact::PSMS_EXTRACTED, n_psms),
-        (p.out_chrom, artifact::CHROMATOGRAMS, n_chrom),
+    for (path, schema, file) in [
+        (p.out_psms, artifact::PSMS_EXTRACTED, psms_written),
+        (
+            p.out_chrom,
+            artifact::chromatograms(chrom_layout.version()),
+            chrom_written,
+        ),
     ] {
         let report = ArtifactReport {
             logical_name: schema.0.to_string(),
             schema_name: schema.0.to_string(),
             schema_version: schema.1,
             stage: "extract".to_string(),
-            rows,
-            content_hash: mumdia_io::hash::blake3_file(path)?,
+            rows: file.rows,
+            // Both files were hashed while they were written.
+            content_hash: file.content_hash,
             params: json!({
                 "frag_tol_ppm": p.cfg.frag_tol_ppm,
                 "effective_frag_tol_ppm": frag_tol,
@@ -3908,14 +4751,175 @@ mod mass_offset_tests {
 }
 
 #[cfg(test)]
-mod coelution_tests {
-    use super::{coelution_gate_score, peak_spectral_score};
+mod scan_group_tests {
+    use super::ScanGroups;
     use std::collections::BTreeMap;
 
-    fn g(rows: &[(f64, &[(u16, f32)])]) -> Vec<(f64, BTreeMap<u16, f32>)> {
-        rows.iter()
-            .map(|(rt, fs)| (*rt, fs.iter().cloned().collect()))
-            .collect()
+    type TreeGroups = Vec<(f64, BTreeMap<u16, f32>)>;
+
+    /// The per-group trees `ScanGroups` replaced, built verbatim from `(rt, frag, inten)`
+    /// hits in the order the per-candidate pass builds them.
+    fn tree_groups(hits: &[(f64, u16, f32)]) -> TreeGroups {
+        let mut groups: TreeGroups = Vec::new();
+        for &(h_rt, frag, inten) in hits {
+            match groups.last_mut() {
+                Some((rt, map)) if (*rt - h_rt).abs() < 1e-9 => {
+                    let e = map.entry(frag).or_insert(0.0);
+                    if inten > *e {
+                        *e = inten;
+                    }
+                }
+                _ => {
+                    let mut m = BTreeMap::new();
+                    m.insert(frag, inten);
+                    groups.push((h_rt, m));
+                }
+            }
+        }
+        groups
+    }
+
+    fn dense_groups(hits: &[(f64, u16, f32)]) -> ScanGroups {
+        let width = hits.iter().map(|h| h.1 as usize + 1).max().unwrap_or(0);
+        let mut groups = ScanGroups::new(width);
+        for &(h_rt, frag, inten) in hits {
+            match groups.rt.last() {
+                Some(&rt) if (rt - h_rt).abs() < 1e-9 => {
+                    let i = groups.len() - 1;
+                    groups.merge_max(i, frag, inten);
+                }
+                _ => {
+                    groups.push_group(h_rt);
+                    let i = groups.len() - 1;
+                    groups.insert(i, frag, inten);
+                }
+            }
+        }
+        groups
+    }
+
+    /// Every question the per-candidate pass asks of a scan group, asked of both forms.
+    fn assert_same(tree: &TreeGroups, dense: &ScanGroups, what: &str) {
+        assert_eq!(tree.len(), dense.len(), "{what}: group count");
+        for (i, (rt, map)) in tree.iter().enumerate() {
+            assert_eq!(rt.to_bits(), dense.rt(i).to_bits(), "{what}: rt {i}");
+            assert_eq!(map.len(), dense.count(i), "{what}: count {i}");
+            let keys: Vec<u16> = map.keys().copied().collect();
+            assert_eq!(
+                keys,
+                dense.frags(i).collect::<Vec<_>>(),
+                "{what}: frags {i}"
+            );
+            let tree_sum: f32 = map.values().sum();
+            assert_eq!(
+                tree_sum.to_bits(),
+                dense.sum(i).to_bits(),
+                "{what}: sum {i}"
+            );
+            for f in 0..(dense.width as u16 + 70) {
+                assert_eq!(
+                    map.get(&f).map(|v| v.to_bits()),
+                    dense.get(i, f).map(f32::to_bits),
+                    "{what}: group {i} frag {f}"
+                );
+            }
+        }
+    }
+
+    /// Randomised hit lists with repeated RTs, RTs within 1e-9 s of each other (which the
+    /// grouping merges), repeated fragments in a group, and intensities that are zero,
+    /// negative, negative zero and NaN: the cases where "first hit inserts, later hits take
+    /// the max starting from 0.0" differs from "take the max".
+    #[test]
+    fn dense_groups_answer_what_the_trees_answered() {
+        let mut state = 0x5ca9_u64;
+        let mut next = move |m: u64| -> u64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % m.max(1)
+        };
+        let specials = [0.0f32, -0.0, -3.5, f32::NAN, 1e-40, 7.25];
+        for case in 0..300 {
+            let width = 1 + next(if case % 5 == 0 { 140 } else { 14 }) as u16;
+            let mut rt = 100.0f64;
+            let mut hits: Vec<(f64, u16, f32)> = Vec::new();
+            for _ in 0..next(80) {
+                match next(4) {
+                    0 => rt += 1.0 + next(3) as f64,
+                    1 => rt += 1e-10, // same group
+                    _ => {}
+                }
+                let inten = if next(6) == 0 {
+                    specials[next(specials.len() as u64) as usize]
+                } else {
+                    next(1000) as f32 * 0.5
+                };
+                hits.push((rt, next(width as u64) as u16, inten));
+            }
+            let tree = tree_groups(&hits);
+            let dense = dense_groups(&hits);
+            assert_same(&tree, &dense, &format!("case {case}"));
+
+            // The grid projection: a grid holding some of the group RTs and some others.
+            let mut grid: Vec<f64> = tree
+                .iter()
+                .map(|(r, _)| *r)
+                .filter(|_| next(3) != 0)
+                .collect();
+            for _ in 0..next(5) {
+                grid.push(95.0 + next(200) as f64 * 0.5);
+            }
+            grid.sort_by(|a, b| a.total_cmp(b));
+            grid.dedup();
+            let mut aligned: TreeGroups = grid.iter().map(|&r| (r, BTreeMap::new())).collect();
+            let mut j = 0usize;
+            for (r, map) in tree.clone() {
+                while j < grid.len() && grid[j] < r {
+                    j += 1;
+                }
+                if j < grid.len() && grid[j].to_bits() == r.to_bits() {
+                    aligned[j].1 = map;
+                    j += 1;
+                }
+            }
+            let mut dense_aligned = ScanGroups::empty_on(&grid, dense.width);
+            let mut j = 0usize;
+            for i in 0..dense.len() {
+                let r = dense.rt(i);
+                while j < grid.len() && grid[j] < r {
+                    j += 1;
+                }
+                if j < grid.len() && grid[j].to_bits() == r.to_bits() {
+                    dense_aligned.copy_group(j, &dense, i);
+                    j += 1;
+                }
+            }
+            assert_same(
+                &aligned,
+                &dense_aligned,
+                &format!("case {case} on the grid"),
+            );
+            // The union count the promoted-peak gate takes over an envelope.
+            if !aligned.is_empty() {
+                let lo = next(aligned.len() as u64) as usize;
+                let hi = lo + next((aligned.len() - lo) as u64) as usize;
+                let mut set = std::collections::HashSet::new();
+                for (_, m) in &aligned[lo..=hi] {
+                    set.extend(m.keys().copied());
+                }
+                assert_eq!(set.len(), dense_aligned.count_union(lo, hi), "case {case}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod coelution_tests {
+    use super::{coelution_gate_score, peak_spectral_score, ScanGroups};
+
+    fn g(rows: &[(f64, &[(u16, f32)])]) -> ScanGroups {
+        ScanGroups::from_rows(rows)
     }
 
     #[test]
@@ -4002,7 +5006,6 @@ mod accumulate_tests {
         let mut frag_int = Vec::with_capacity(2 * n);
         let mut frag_name_id = Vec::with_capacity(2 * n);
         let mut cands = Vec::with_capacity(n);
-        let mut prec_mz = Vec::with_capacity(n);
         for i in 0..n {
             let start = frag_mz.len();
             // Fragments are shared across candidates on purpose (300.0 + i % 97 * 1.37),
@@ -4026,22 +5029,14 @@ mod accumulate_tests {
                 frag_start: start,
                 n_frag: 2,
             });
-            prec_mz.push(pmz);
         }
-        Library {
+        Library::from_candidates(
             cands,
             frag_mz,
             frag_int,
             frag_name_id,
-            frag_name_dict: vec!["b".to_string(), "y".to_string()],
-            idx_mz: Vec::new(),
-            idx_cid: Vec::new(),
-            idx_int: Vec::new(),
-            bucket_min: Vec::new(),
-            bucket_size: 1,
-            prec_mz,
-            global_offset: 0,
-        }
+            vec!["b".to_string(), "y".to_string()],
+        )
     }
 
     fn scans(n_scans: usize, window: IsolationWindow, base: usize) -> Vec<Ms2Scan> {
@@ -4119,34 +5114,85 @@ mod accumulate_tests {
             grid_ppm: Vec::new(),
         };
         let cfg = ExtractConfig::default();
+        let bins = FragIndex::geometry(&lib, 20.0);
+        let stats = LocalIndexStats::default();
+        let local = TaskProbe::Local {
+            lib: &lib,
+            bins: &bins,
+            tol_ppm: 20.0,
+            stats: &stats,
+        };
+        let global = TaskProbe::Global(&idx);
+
+        // Callback for callback: every task shape this fixture produces (each window whole,
+        // and cut into 2, 3 and 7 sub-ranges, which covers the grids of the pool sizes
+        // below), every scan of the window, every peak. The task-local index must hand the
+        // probe exactly the postings the narrowed global index handed it, in the same order,
+        // with the same m/z, intensity and ordinal bits.
+        let mut n_callbacks = 0usize;
+        for g in &groups {
+            for pieces in [1u32, 2, 3, 7] {
+                let span = g.hi_cid - g.lo_cid;
+                for k in 0..pieces {
+                    let lo = g.lo_cid + span * k / pieces;
+                    let hi = g.lo_cid + span * (k + 1) / pieces;
+                    let mut li = LocalIndex::build(&lib, &bins, 20.0, lo, hi);
+                    let mut np = NarrowedProbe {
+                        idx: &idx,
+                        nw: idx.window_narrow(lo, hi),
+                    };
+                    for &si in &g.scans {
+                        for peak in &sc[si].peaks {
+                            let mz = peak.mz as f64;
+                            let q = mz / mass_off.factor_at(mz);
+                            let bin = bins.bin(q) as u32;
+                            assert_eq!(bin, idx.bin_of(q), "one geometry");
+                            let (mut a, mut b) = (Vec::new(), Vec::new());
+                            li.probe_binned(q, bin, |c, m, it, f| {
+                                a.push((c, m.to_bits(), it.to_bits(), f))
+                            });
+                            np.probe_binned(q, bin, |c, m, it, f| {
+                                b.push((c, m.to_bits(), it.to_bits(), f))
+                            });
+                            assert_eq!(a, b, "sub-range {lo}..{hi} scan {si} peak m/z {q}");
+                            n_callbacks += a.len();
+                        }
+                    }
+                }
+            }
+        }
+        assert!(n_callbacks > 10_000, "the comparison must see real traffic");
+
         // `bound = 0` flushes nothing, so the whole batch stays in the accumulator and the
         // comparison is over the accumulation itself. `flush_all` below runs the same
         // fixture with the flush live.
-        let run = |threads: usize, bound: u32| -> (HitAcc, Vec<(u32, Vec<Hit>)>) {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .expect("thread pool");
-            let mut acc = HitAcc::default();
-            let mut chunk = HitStore::default();
-            let mut flushed: Vec<(u32, Vec<Hit>)> = Vec::new();
-            pool.install(|| {
-                let mut sink = |c: &mut HitStore| -> bool {
-                    for (cid, hits) in c.slices_mut() {
-                        flushed.push((cid, hits.to_vec()));
-                    }
-                    true
-                };
-                accumulate_groups(
-                    // One band in this test, so the probing fan-out is the whole pool.
-                    &idx, 1, &groups, &sc, &rt_lo, &rt_hi, &mass_off, &cfg, None, bound, &mut acc,
-                    &mut chunk, &mut sink,
-                );
-            });
-            (acc, flushed)
-        };
-        // Two threads: 2 * 2 / 4 windows = one sub-range per window, the unsplit path.
-        let (acc, empty) = run(2, 0);
+        let run =
+            |probe: TaskProbe<'_>, threads: usize, bound: u32| -> (HitAcc, Vec<(u32, Vec<Hit>)>) {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("thread pool");
+                let mut acc = HitAcc::default();
+                let mut chunk = HitStore::default();
+                let mut flushed: Vec<(u32, Vec<Hit>)> = Vec::new();
+                pool.install(|| {
+                    let mut sink = |c: Vec<(u32, &mut [Hit])>| -> bool {
+                        for (cid, hits) in c {
+                            flushed.push((cid, hits.to_vec()));
+                        }
+                        true
+                    };
+                    accumulate_groups(
+                        // One band in this test, so the probing fan-out is the whole pool.
+                        probe, 1, &groups, &sc, &rt_lo, &rt_hi, &mass_off, &cfg, None, bound,
+                        &mut acc, &mut chunk, &mut sink,
+                    );
+                });
+                (acc, flushed)
+            };
+        // Two threads: 2 * 2 / 4 windows = one sub-range per window, the unsplit path, over
+        // the global index: the reference both probes are held to.
+        let (acc, empty) = run(global, 2, 0);
         assert!(empty.is_empty(), "bound 0 must flush nothing");
         let unsplit = materialize(acc);
         assert!(!unsplit.is_empty(), "the fixture must produce hits");
@@ -4154,26 +5200,34 @@ mod accumulate_tests {
             unsplit.values().any(|v| v.len() > 1),
             "candidates must collect several hits, or hit order proves nothing"
         );
-        for threads in [8, 16] {
-            let split = materialize(run(threads, 0).0);
-            assert_eq!(
-                split.len(),
-                unsplit.len(),
-                "{threads} threads: candidate count"
-            );
-            for (cid, hits) in &unsplit {
+        for (probe, what) in [(global, "global"), (local, "local")] {
+            for threads in [2, 8, 16] {
+                let split = materialize(run(probe, threads, 0).0);
                 assert_eq!(
-                    split.get(cid),
-                    Some(hits),
-                    "{threads} threads: candidate {cid} hits differ"
+                    split.len(),
+                    unsplit.len(),
+                    "{what}, {threads} threads: candidate count"
                 );
+                for (cid, hits) in &unsplit {
+                    assert_eq!(
+                        split.get(cid),
+                        Some(hits),
+                        "{what}, {threads} threads: candidate {cid} hits differ"
+                    );
+                }
             }
         }
         // Flushing per candidate sub-range instead of per batch must deliver exactly the
         // same candidates, ascending, with the same hits in the same order: the sub-range
         // grid is where a candidate becomes final, not where its evidence changes.
-        for threads in [2, 8, 16] {
-            let (acc, flushed) = run(threads, u32::MAX);
+        for (probe, threads) in [
+            (global, 2),
+            (global, 16),
+            (local, 2),
+            (local, 8),
+            (local, 16),
+        ] {
+            let (acc, flushed) = run(probe, threads, u32::MAX);
             assert_eq!(acc.n_hits(), 0, "{threads} threads: nothing may stay open");
             assert!(
                 flushed.windows(2).all(|w| w[0].0 < w[1].0),
@@ -4249,10 +5303,10 @@ mod accumulate_tests {
             let c = lo + ((i * 7) % 11) + if i % 5 == 0 { 2 } else { 0 };
             let c = c.min(hi - 1);
             let h = Hit {
-                rt: 100.0 + i as f64,
+                scan: i,
                 frag: (i % 6) as u16,
                 inten: 1.0 + i as f32,
-                obs_mz: 300.0 + i as f64 * 0.01,
+                obs_mz: 300.0 + i as f32 * 0.01,
             };
             cid.push(c);
             hits.push(h);
@@ -4276,18 +5330,18 @@ mod accumulate_tests {
     /// candidate's segments run by run.
     #[test]
     fn gather_concatenates_a_candidate_across_runs_in_window_order() {
-        let h = |rt: f64| Hit {
-            rt,
+        let h = |scan: u32| Hit {
+            scan,
             frag: 0,
             inten: 1.0,
             obs_mz: 300.0,
         };
         let mut a = HitStore::default();
-        a.push_segment(4, &[h(1.0), h(2.0)]);
-        a.push_segment(9, &[h(3.0)]);
+        a.push_segment(4, &[h(1), h(2)]);
+        a.push_segment(9, &[h(3)]);
         let mut b = HitStore::default();
-        b.push_segment(4, &[h(4.0)]);
-        b.push_segment(7, &[h(5.0)]);
+        b.push_segment(4, &[h(4)]);
+        b.push_segment(7, &[h(5)]);
         let mut acc = HitAcc {
             runs: vec![HitRun::new(vec![a]), HitRun::new(vec![b])],
         };
@@ -4295,27 +5349,27 @@ mod accumulate_tests {
         gather_chunk(&mut acc.runs, u32::MAX, usize::MAX, &mut out);
         assert_eq!(out.cids, vec![4, 7, 9]);
         assert_eq!(
-            out.slice(0).iter().map(|x| x.rt).collect::<Vec<_>>(),
-            vec![1.0, 2.0, 4.0],
+            out.slice(0).iter().map(|x| x.scan).collect::<Vec<_>>(),
+            vec![1, 2, 4],
             "the earlier window's hits must come first"
         );
-        assert_eq!(out.slice(1).iter().map(|x| x.rt).collect::<Vec<_>>(), [5.0]);
-        assert_eq!(out.slice(2).iter().map(|x| x.rt).collect::<Vec<_>>(), [3.0]);
+        assert_eq!(out.slice(1).iter().map(|x| x.scan).collect::<Vec<_>>(), [5]);
+        assert_eq!(out.slice(2).iter().map(|x| x.scan).collect::<Vec<_>>(), [3]);
     }
 
     /// `bound` is the only thing holding a candidate back, and what it holds back must
     /// still be there, in order, for the next flush.
     #[test]
     fn gather_stops_at_the_bound_and_keeps_the_rest() {
-        let h = |rt: f64| Hit {
-            rt,
+        let h = |scan: u32| Hit {
+            scan,
             frag: 0,
             inten: 1.0,
             obs_mz: 300.0,
         };
         let mut a = HitStore::default();
         for c in [2u32, 5, 8, 11] {
-            a.push_segment(c, &[h(c as f64)]);
+            a.push_segment(c, &[h(c)]);
         }
         let mut acc = HitAcc {
             runs: vec![HitRun::new(vec![a])],
@@ -4330,19 +5384,120 @@ mod accumulate_tests {
         assert_eq!(acc.n_hits(), 0);
     }
 
+    /// The zero-copy flush hands over exactly the batches the gathering flush builds: the
+    /// same candidates in the same calls, the same hits in the same order, and it leaves the
+    /// runs holding the same remainder. Randomised over runs with disjoint and overlapping
+    /// candidates, several parts, empty stores, bounds inside and past the runs and small
+    /// chunk caps, so every branch of `single_run_span` is taken.
+    #[test]
+    fn the_zero_copy_flush_hands_over_the_batches_the_gather_builds() {
+        let mut state = 0x2e40_u64;
+        let mut next = move |m: u64| -> u64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % m.max(1)
+        };
+        let mut n_zero_copy_batches = 0usize;
+        for case in 0..400 {
+            // One recipe, built twice: `HitStore` is not `Clone`, on purpose.
+            let n_runs = 1 + next(4) as usize;
+            let mut recipe: Vec<Vec<Vec<(u32, u32)>>> = Vec::new(); // run -> part -> (cid, n)
+            for _ in 0..n_runs {
+                let n_parts = 1 + next(3) as usize;
+                let mut c = next(20) as u32;
+                let mut parts = Vec::new();
+                for _ in 0..n_parts {
+                    let mut part = Vec::new();
+                    for _ in 0..next(12) {
+                        part.push((c, 1 + next(3) as u32));
+                        c += 1 + next(3) as u32;
+                    }
+                    parts.push(part);
+                }
+                recipe.push(parts);
+            }
+            let build = || -> Vec<HitRun> {
+                let mut scan = 0u32;
+                recipe
+                    .iter()
+                    .map(|parts| {
+                        let stores = parts
+                            .iter()
+                            .map(|part| {
+                                let mut st = HitStore::default();
+                                for &(cid, n) in part {
+                                    let hits: Vec<Hit> = (0..n)
+                                        .map(|_| {
+                                            scan += 1;
+                                            Hit {
+                                                scan,
+                                                frag: (scan % 7) as u16,
+                                                inten: scan as f32,
+                                                obs_mz: 300.0,
+                                            }
+                                        })
+                                        .collect();
+                                    st.push_segment(cid, &hits);
+                                }
+                                st
+                            })
+                            .collect();
+                        HitRun::new(stores)
+                    })
+                    .collect()
+            };
+            let bound = [u32::MAX, next(60) as u32, 0][case % 3];
+            let cap = 1 + next(6) as usize;
+            let outcome = |zero_copy: bool| {
+                let mut runs = build();
+                let mut chunk = HitStore::default();
+                let mut batches: Vec<Vec<(u32, Vec<Hit>)>> = Vec::new();
+                let mut sink = |c: Vec<(u32, &mut [Hit])>| -> bool {
+                    batches.push(c.into_iter().map(|(cid, h)| (cid, h.to_vec())).collect());
+                    true
+                };
+                let stopped = flush_below(&mut runs, bound, cap, zero_copy, &mut chunk, &mut sink);
+                assert!(!stopped);
+                let mut rest = HitStore::default();
+                gather_chunk(&mut runs, u32::MAX, usize::MAX, &mut rest);
+                let rest: Vec<(u32, Vec<Hit>)> = rest
+                    .slices_mut()
+                    .into_iter()
+                    .map(|(c, h)| (c, h.to_vec()))
+                    .collect();
+                (batches, rest)
+            };
+            let reference = outcome(false);
+            let candidate = outcome(true);
+            assert_eq!(
+                candidate, reference,
+                "case {case}: bound {bound}, cap {cap}"
+            );
+            // Whether the first batch of this case is one the zero-copy path takes.
+            if single_run_span(&build(), bound, cap).is_some() {
+                n_zero_copy_batches += 1;
+            }
+        }
+        assert!(
+            n_zero_copy_batches > 50,
+            "the zero-copy branch must be exercised ({n_zero_copy_batches} cases)"
+        );
+    }
+
     /// The chunk cap is a flush-size limit, not a filter: chunking must not lose or
     /// reorder a candidate.
     #[test]
     fn gather_chunking_partitions_the_accumulator() {
-        let h = |rt: f64| Hit {
-            rt,
+        let h = |scan: u32| Hit {
+            scan,
             frag: 0,
             inten: 1.0,
             obs_mz: 300.0,
         };
         let mut a = HitStore::default();
         for c in 0..50u32 {
-            a.push_segment(c, &[h(c as f64), h(c as f64 + 0.5)]);
+            a.push_segment(c, &[h(2 * c), h(2 * c + 1)]);
         }
         let mut acc = HitAcc {
             runs: vec![HitRun::new(vec![a])],
@@ -4359,5 +5514,198 @@ mod accumulate_tests {
             acc.compact();
         }
         assert_eq!(seen, (0..50u32).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod psms_stream_tests {
+    use super::*;
+
+    /// A per-process scratch path; tests in this module run concurrently.
+    fn scratch(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("mumdia_psms_stream_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name).to_str().unwrap().to_string()
+    }
+
+    /// One accepted row whose every column varies with `i`, with nulls in the MS1 columns.
+    fn row(i: usize) -> CandOut {
+        let f = i as f64;
+        CandOut {
+            cid: i as u32,
+            peak_rank: (i % 3) as u8,
+            apex_rt: 100.0 + f * 0.25,
+            apex_int: 1.0 + (i % 97) as f32,
+            n_match: (i % 7) as i32,
+            corun: (i % 5) as i32,
+            npred: 6,
+            calrt: if i.is_multiple_of(11) {
+                f64::NAN
+            } else {
+                f * 0.5
+            },
+            mz: 400.0 + (i % 1000) as f64 * 0.01,
+            contested: (i % 4) as f64 * 0.25,
+            contested_count_frac: (i % 3) as f64 / 3.0,
+            apportioned_frac: (i % 2) as f64,
+            z: 2 + (i % 2) as i32,
+            label: if i.is_multiple_of(2) {
+                "target"
+            } else {
+                "decoy"
+            }
+            .to_string(),
+            base: (i / 2) as u32,
+            pform: format!("PEPT{}IDEK", i % 50),
+            prot: format!("P{}", i % 13),
+            irt: (i % 200) as f32 * 0.1,
+            ms1_m1: i.is_multiple_of(3).then_some(f),
+            ms1_mono: (!i.is_multiple_of(5)).then_some(f * 2.0),
+            ms1_i1: None,
+            ms1_i2: (i % 7 == 1).then_some(-f),
+            gate_apex: (i % 10) as f32 * 0.1,
+            gate_peak_spectral: 0.5,
+            gate_coelution: -0.25,
+            gate_spectral_entropy: (i % 9) as f32,
+            deconv_explained: 0.0,
+            deconv_active: 1.0,
+            deconv_share: 0.5,
+            deconv_collin: 0.125,
+            deconv_shadow: 0.0,
+            chrom: Vec::new(),
+            peaks: Vec::new(),
+        }
+    }
+
+    /// The streamed table is the `write_table` file: at 0 rows (the one empty chunk), one
+    /// row, exactly one chunk (whose last chunk `push` wrote, so `finish` writes no tail),
+    /// one past it, and two chunks plus a short tail. The unstreamed arm is `write_table`
+    /// over the whole table, which is how the table was written before it was streamed.
+    /// Every optional column group is covered by the second configuration.
+    #[test]
+    fn the_streamed_psms_table_is_the_write_table_file() {
+        let c = WRITE_TABLE_CHUNK_ROWS;
+        let wide = ExtractConfig {
+            emit_contested_features: true,
+            emit_gate_diagnostics: true,
+            emit_demix_features: true,
+            ..ExtractConfig::default()
+        };
+        let cases: [(&str, &ExtractConfig, usize); 7] = [
+            ("default", &ExtractConfig::default(), 0),
+            ("default", &ExtractConfig::default(), 1),
+            ("default", &ExtractConfig::default(), c),
+            ("default", &ExtractConfig::default(), c + 1),
+            ("default", &ExtractConfig::default(), 2 * c + 3),
+            ("wide", &wide, 0),
+            ("wide", &wide, c + 1),
+        ];
+        for (tag, cfg, n) in cases {
+            let streamed = scratch(&format!("streamed_{tag}_{n}.parquet"));
+            let whole = scratch(&format!("whole_{tag}_{n}.parquet"));
+            let (mut s, mut w) = (
+                PsmStream::new(&streamed, true, 7),
+                PsmStream::new(&whole, false, 7),
+            );
+            for i in 0..n {
+                s.push(row(i), cfg).unwrap();
+                w.push(row(i), cfg).unwrap();
+                // Streamed, a full chunk leaves nothing pending; whole, nothing is written.
+                assert_eq!(s.rows.len(), (i + 1) % c, "{tag} {n}: pending rows");
+                assert_eq!(w.rows.len(), i + 1);
+            }
+            let (s_written, _) = s.finish(cfg).unwrap();
+            let (w_written, _) = w.finish(cfg).unwrap();
+            assert_eq!(s_written.rows, n as u64, "{tag} {n}");
+            assert_eq!(w_written.rows, n as u64, "{tag} {n}");
+            assert_eq!(
+                std::fs::read(&streamed).unwrap(),
+                std::fs::read(&whole).unwrap(),
+                "{tag}, {n} rows: streamed psms_extracted differs from write_table's"
+            );
+            // The hash taken while writing is the hash of the published file.
+            assert_eq!(
+                s_written.content_hash,
+                mumdia_io::hash::blake3_file(&streamed).unwrap(),
+                "{tag} {n}: streamed hash"
+            );
+            assert_eq!(s_written.content_hash, w_written.content_hash, "{tag} {n}");
+            let t = TableFile::open(&streamed).unwrap();
+            assert_eq!(t.nrows, n);
+            if n > 0 {
+                // The global offset is applied to every chunk, not only the first.
+                assert_eq!(t.u32("candidate_id").unwrap()[n - 1], (n - 1) as u32 + 7);
+            }
+        }
+    }
+
+    /// A chunk that cannot be written is an error from the push that fills it, not before
+    /// and not later, and nothing is published at the path.
+    #[test]
+    fn a_failed_chunk_write_is_the_error_of_the_push_that_filled_it() {
+        // The parent of the output is a FILE, so the writer cannot create its temp file.
+        let parent = scratch("not_a_directory");
+        std::fs::write(&parent, b"a file").unwrap();
+        let out = format!("{parent}/psms_extracted.parquet");
+        let cfg = ExtractConfig::default();
+        let mut s = PsmStream::new(&out, true, 0);
+        for i in 0..WRITE_TABLE_CHUNK_ROWS - 1 {
+            s.push(row(i), &cfg).unwrap();
+        }
+        assert!(
+            s.push(row(0), &cfg).is_err(),
+            "the full chunk's write must fail"
+        );
+        drop(s);
+        assert!(!std::path::Path::new(&out).exists());
+    }
+
+    /// Temp files a writer left next to `path` (`AtomicPath` names them `<path>.tmp-*`).
+    fn leftovers(path: &str) -> Vec<String> {
+        let p = std::path::Path::new(path);
+        let stem = format!("{}.tmp-", p.file_name().unwrap().to_str().unwrap());
+        std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_str().unwrap().to_string())
+            .filter(|n| n.starts_with(&stem))
+            .collect()
+    }
+
+    /// After a failed psms_extracted write the chromatogram table the writer thread was
+    /// fed is not published: the call returns that error, the chromatograms table already
+    /// at the path is untouched and no temp file is left. Without a failure it is published.
+    #[test]
+    fn a_failed_psms_write_leaves_the_previous_chromatograms_in_place() {
+        let path = scratch("chromatograms.parquet");
+        let table = |v: Vec<u32>| vec![Col::U32("candidate_id".into(), v)];
+        write_table(&path, table(vec![1, 2, 3])).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let mut w = TableWriter::new(&path).with_content_hash();
+        w.write_cols(table(vec![9])).unwrap();
+        let err =
+            close_chromatograms(w, Some(anyhow::anyhow!("psms chunk write failed"))).unwrap_err();
+        assert!(err.to_string().contains("psms chunk write failed"), "{err}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "replaced after a failure"
+        );
+        assert!(leftovers(&path).is_empty(), "{:?}", leftovers(&path));
+
+        let mut w = TableWriter::new(&path).with_content_hash();
+        w.write_cols(table(vec![9])).unwrap();
+        let published = close_chromatograms(w, None).unwrap();
+        assert_eq!(published.rows, 1);
+        assert_eq!(
+            published.content_hash,
+            mumdia_io::hash::blake3_file(&path).unwrap()
+        );
+        assert_eq!(
+            TableFile::open(&path).unwrap().u32("candidate_id").unwrap(),
+            vec![9]
+        );
+        assert!(leftovers(&path).is_empty());
     }
 }

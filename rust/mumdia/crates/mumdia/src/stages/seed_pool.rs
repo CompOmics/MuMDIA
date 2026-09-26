@@ -171,35 +171,42 @@ pub fn run(p: SeedPoolParams) -> Result<u64> {
         );
     }
     // One row per library-wide candidate: where two bands share a candidate (window
-    // overlap across a cut) the higher score stays, so the pooled q sees each once.
-    let mut best: HashMap<u32, Row> = HashMap::new();
+    // overlap across a cut) the higher score stays, and on a tie the earlier band, so the
+    // pooled q sees each once. The band the kept row came from is remembered for the mass
+    // calibration below.
+    let mut best: HashMap<u32, (usize, Row)> = HashMap::new();
     let mut n_in = 0usize;
-    for band in p.seeds {
+    for (bi, band) in p.seeds.iter().enumerate() {
         for r in read_rows(&band.path, band.offset)? {
             n_in += 1;
             match best.get(&r.cid) {
-                Some(b) if b.score >= r.score => {}
+                Some((_, b)) if b.score >= r.score => {}
                 _ => {
-                    best.insert(r.cid, r);
+                    best.insert(r.cid, (bi, r));
                 }
             }
         }
     }
-    let mut rows: Vec<Row> = best.into_values().collect();
-    rows.sort_by_key(|r| r.cid);
+    let mut kept: Vec<(usize, Row)> = best.into_values().collect();
+    kept.sort_by_key(|(_, r)| r.cid);
+    let (winner_band, rows): (Vec<usize>, Vec<Row>) = kept.into_iter().unzip();
     crate::fdr::validate_labels(&rows.iter().map(|r| r.label.clone()).collect::<Vec<_>>())?;
     let pairs: Vec<(f64, bool)> = rows.iter().map(|r| (r.score, r.label == "decoy")).collect();
     let q = target_decoy_q(&pairs);
     // The pooled calibrant selector: for every target candidate the POOLED q accepts at
-    // the seed threshold, the scan its winning PSM was matched on. A band's own q accepts
-    // a different, looser set -- that is half of why the banded tolerance came out wide --
-    // and the scan pins the union to one PSM per candidate where two bands overlap, which
-    // is the one-best-PSM-per-candidate population an ungrouped seed fits on.
-    let accepted: HashMap<u32, u32> = rows
+    // the seed threshold, the scan its winning PSM was matched on and the band that PSM
+    // came from. A band's own q accepts a different, looser set -- that is half of why the
+    // banded tolerance came out wide. The scan and the band pin the union to one PSM per
+    // candidate, which is the population an ungrouped seed fits on: a precursor in the
+    // overlap of two windows is loaded by both bands and each band serves both windows for
+    // it, so both usually hold the SAME (candidate, scan) PSM with the same deviations, and
+    // the scan alone would count them once per band.
+    let accepted: HashMap<u32, (u32, usize)> = rows
         .iter()
+        .zip(&winner_band)
         .zip(&q)
-        .filter(|(r, qq)| **qq <= p.cfg.fdr_seed && r.label != "decoy")
-        .map(|(r, _)| (r.cid, r.scan))
+        .filter(|((r, _), qq)| **qq <= p.cfg.fdr_seed && r.label != "decoy")
+        .map(|((r, &bi), _)| (r.cid, (r.scan, bi)))
         .collect();
     let n_out = rows.len();
     let n = write_rows(p.out, &rows, q)?;
@@ -231,11 +238,16 @@ pub fn run(p: SeedPoolParams) -> Result<u64> {
 }
 
 /// Fit the mass calibration once over the bands' calibrant deviations, keeping the ones
-/// whose PSM the POOLED q accepts (`accepted`: candidate -> winning scan).
+/// whose PSM the POOLED q accepts (`accepted`: candidate -> (winning scan, the band the
+/// winning row came from)). Only that band's rows of the candidate are taken, so a
+/// candidate two overlapping bands both matched contributes its deviations once.
 ///
 /// `Ok(None)` when a band has no sidecar, which is a band directory seeded before the
 /// sidecar existed: the caller then combines the bands' scalars as it always did.
-fn pooled_masscal(p: &SeedPoolParams, accepted: &HashMap<u32, u32>) -> Result<Option<MassCal>> {
+fn pooled_masscal(
+    p: &SeedPoolParams,
+    accepted: &HashMap<u32, (u32, usize)>,
+) -> Result<Option<MassCal>> {
     let missing = p
         .calibrants
         .iter()
@@ -259,11 +271,15 @@ fn pooled_masscal(p: &SeedPoolParams, accepted: &HashMap<u32, u32>) -> Result<Op
     let mut devs: Vec<f64> = Vec::new();
     let mut dev_mz: Vec<f64> = Vec::new();
     let mut n_band = 0usize;
-    for path in p.calibrants {
+    // The largest band's sidecar is what this stage holds decoded at once, beside the
+    // accepted deviations.
+    let mut largest_band_bytes = 0u64;
+    for (bi, path) in p.calibrants.iter().enumerate() {
         let c = crate::masscal::read_calibrants(path)?;
         n_band += c.len();
+        largest_band_bytes = largest_band_bytes.max(c.bytes());
         for i in 0..c.len() {
-            if accepted.get(&c.candidate_id[i]) == Some(&c.scan_index[i]) {
+            if accepted.get(&c.candidate_id[i]) == Some(&(c.scan_index[i], bi)) {
                 devs.push(c.ppm[i] as f64);
                 dev_mz.push(c.frag_mz[i] as f64);
             }
@@ -279,6 +295,8 @@ fn pooled_masscal(p: &SeedPoolParams, accepted: &HashMap<u32, u32>) -> Result<Op
     }
     info!(
         band_deviations = n_band,
+        band_deviation_bytes = (n_band * crate::masscal::Calibrants::BYTES_PER_DEVIATION) as u64,
+        largest_band_bytes,
         pooled_deviations = devs.len(),
         frag_ppm_offset = cal.frag_ppm_offset,
         frag_tol_ppm = cal.frag_tol_ppm,
@@ -342,25 +360,53 @@ fn combine_band_scalars(p: &SeedPoolParams) -> Result<MassCal> {
 /// Rewrite `seed_in` to `seed_out` with each row's `predicted_irt` taken from the band
 /// table that holds its candidate (`bands`: precursor table with band-local ids, and the
 /// band's first library row). Rows outside every band keep their value.
+///
+/// Bands are applied in order, so where two bands hold one candidate (windows overlapping
+/// a cut) the later band's value stays, as it always did.
+///
+/// Two shortcuts, each with the general path behind it:
+/// - A band file's ids are its rows `0..n` (`groups::write_band_slice` writes them so),
+///   and then the iRT of local id `l` is simply row `l`. A band table whose ids are not
+///   dense and ascending is looked up through a map, last row winning, as before.
+/// - The pooled seed is written sorted by candidate id (`seed_pool::run`), so the rows a
+///   band can refresh, ids `offset..offset + n`, are one slice found by binary search,
+///   instead of a pass over every row per band: 63 bands made that 63 passes over the whole
+///   pooled seed. An unsorted input is scanned whole.
 pub fn refresh_irt(seed_in: &str, seed_out: &str, bands: &[(String, u32)]) -> Result<u64> {
     let t0 = Instant::now();
     let mut rows = read_rows(seed_in, 0)?;
     let t = TableFile::open(seed_in)?;
     let q = t.f64("spectrum_q")?;
     let mut refreshed = 0usize;
+    let sorted = rows.windows(2).all(|w| w[0].cid <= w[1].cid);
     for (path, offset) in bands {
         let b = TableFile::open(path)?;
         let cid = b.u32("candidate_id")?;
         let irt = b.f32("predicted_irt")?;
         let n = b.nrows;
-        let by_local: HashMap<u32, f32> = cid.into_iter().zip(irt).collect();
-        for r in rows.iter_mut() {
+        let dense = cid.iter().enumerate().all(|(i, &c)| c as usize == i);
+        let by_local: Option<HashMap<u32, f32>> =
+            (!dense).then(|| cid.iter().copied().zip(irt.iter().copied()).collect());
+        let lookup = |local: u32| -> Option<f32> {
+            match &by_local {
+                Some(m) => m.get(&local).copied(),
+                None => irt.get(local as usize).copied(),
+            }
+        };
+        let span = if sorted {
+            let (lo, hi) = (*offset as u64, *offset as u64 + n as u64);
+            rows.partition_point(|r| (r.cid as u64) < lo)
+                ..rows.partition_point(|r| (r.cid as u64) < hi)
+        } else {
+            0..rows.len()
+        };
+        for r in rows[span].iter_mut() {
             let Some(local) = r.cid.checked_sub(*offset) else {
                 continue;
             };
             if (local as usize) < n {
-                if let Some(v) = by_local.get(&local) {
-                    r.irt = *v;
+                if let Some(v) = lookup(local) {
+                    r.irt = v;
                     refreshed += 1;
                 }
             }
@@ -522,6 +568,99 @@ mod tests {
         assert_eq!(irt, vec![1.0, 2.0, 3.0, 40.0, 50.0, 60.0]);
     }
 
+    /// The per-row map over every row for every band, verbatim: the reference the sliced,
+    /// direct-indexed `refresh_irt` is compared against byte for byte.
+    fn refresh_irt_reference(seed_in: &str, seed_out: &str, bands: &[(String, u32)]) {
+        let mut rows = read_rows(seed_in, 0).unwrap();
+        let q = TableFile::open(seed_in).unwrap().f64("spectrum_q").unwrap();
+        for (path, offset) in bands {
+            let b = TableFile::open(path).unwrap();
+            let cid = b.u32("candidate_id").unwrap();
+            let irt = b.f32("predicted_irt").unwrap();
+            let n = b.nrows;
+            let by_local: HashMap<u32, f32> = cid.into_iter().zip(irt).collect();
+            for r in rows.iter_mut() {
+                let Some(local) = r.cid.checked_sub(*offset) else {
+                    continue;
+                };
+                if (local as usize) < n {
+                    if let Some(v) = by_local.get(&local) {
+                        r.irt = *v;
+                    }
+                }
+            }
+        }
+        write_rows(seed_out, &rows, q).unwrap();
+    }
+
+    /// `refresh_irt` over a seed sorted by candidate (the pooled seed) and over an
+    /// unsorted one, with overlapping bands (the later wins), a band ending past the last
+    /// row, a band starting at 0, and a band table whose ids are not its rows (shuffled
+    /// and with a repeat): the bytes of the old whole-row, map-lookup version.
+    #[test]
+    fn the_sliced_refresh_writes_what_the_per_row_map_wrote() {
+        let dir =
+            std::env::temp_dir().join(format!("mumdia_seed_pool_refresh_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |t: &str| dir.join(t).to_str().unwrap().to_string();
+        let n = 40usize;
+        let sorted: Vec<u32> = (0..n as u32).map(|i| i * 2 + 1).collect();
+        let mut unsorted = sorted.clone();
+        unsorted.reverse();
+        unsorted.swap(3, 17);
+        let band = |tag: &str, ids: Vec<u32>, irt0: f32| -> String {
+            let p = path(tag);
+            let k = ids.len();
+            write_table(
+                &p,
+                vec![
+                    Col::U32("candidate_id".into(), ids),
+                    Col::F32(
+                        "predicted_irt".into(),
+                        (0..k).map(|i| irt0 + i as f32).collect(),
+                    ),
+                ],
+            )
+            .unwrap();
+            p
+        };
+        let bands = vec![
+            (band("b0.parquet", (0..30).collect(), 100.0), 0u32),
+            // Overlaps the first band from global 20: the later band wins there.
+            (band("b1.parquet", (0..25).collect(), 500.0), 20),
+            // Runs past the last seed row.
+            (band("b2.parquet", (0..60).collect(), 900.0), 50),
+            // Ids that are not the rows: shuffled, with local 3 twice (last wins).
+            (band("b3.parquet", vec![5, 3, 0, 3, 9, 1], 2000.0), 60),
+        ];
+        for (tag, cids) in [("sorted", &sorted), ("unsorted", &unsorted)] {
+            let seed_in = path(&format!("seed_{tag}.parquet"));
+            let labels: Vec<&str> = (0..n)
+                .map(|i| if i % 3 == 0 { "decoy" } else { "target" })
+                .collect();
+            let scores: Vec<f64> = (0..n).map(|i| (n - i) as f64).collect();
+            let irt: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            write_seed(&seed_in, cids, &scores, &labels, &irt);
+            let (a, b) = (
+                path(&format!("new_{tag}.parquet")),
+                path(&format!("ref_{tag}.parquet")),
+            );
+            refresh_irt(&seed_in, &a, &bands).unwrap();
+            refresh_irt_reference(&seed_in, &b, &bands);
+            assert_eq!(
+                std::fs::read(&a).unwrap(),
+                std::fs::read(&b).unwrap(),
+                "{tag}: the refreshed seed differs from the per-row map's"
+            );
+            let changed = TableFile::open(&a).unwrap().f32("predicted_irt").unwrap();
+            assert!(
+                changed.iter().zip(&irt).any(|(x, y)| x != y),
+                "{tag}: no row was refreshed, so the comparison proves nothing"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn uncalibrated_bands_pool_to_the_configured_tolerance_not_zero() {
         let dir =
@@ -627,7 +766,7 @@ mod tests {
                     m.push(fmz as f64);
                 }
             }
-            crate::masscal::write_calibrants(&path, &c).unwrap();
+            crate::masscal::write_calibrants(&path, c).unwrap();
             // The band's own scalar fit, so the fallback path has something to combine
             // and the pooled path can be shown not to be it.
             let band = MassCal::fit_from(&d, &m, &seed_cfg(0.012));

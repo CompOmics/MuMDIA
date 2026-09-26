@@ -39,8 +39,10 @@ the schema-id tuples).
 |---|---|
 | `rust/mumdia/crates/mumdia-io/src/lib.rs` | crate root: `init_logging`, `record_artifact`, `inspect`; re-exports the modules |
 | `rust/mumdia/crates/mumdia-io/src/table.rs` | `Col` enum (write side), `write_table`, `Table` (read side) and the typed getters |
+| `rust/mumdia/crates/mumdia-io/src/span_cache.rs` | `SpanCache`, the coalescing `ChunkReader` behind `TableFile::scan` with `ScanOptions::coalesced()` |
+| `rust/mumdia/crates/mumdia-io/src/codec.rs` | `ColumnEncoder` (parallel column encode), the codec pool (`CodecPool`, `claim`, `codec_threads`, `set_codec_threads`) shared by encode and parallel decode |
 | `rust/mumdia/crates/mumdia-io/src/report.rs` | `ArtifactReport` struct + `write_for` (the `.report.json` sidecar) |
-| `rust/mumdia/crates/mumdia-io/src/hash.rs` | `blake3_file`, `blake3_str` |
+| `rust/mumdia/crates/mumdia-io/src/hash.rs` | `blake3_file`, `blake3_str`, `HashingWrite` (hash on write) |
 | `rust/mumdia/crates/mumdia-io/src/json.rs` | `write_json`, `read_json` (pretty JSON via serde) |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | frozen `(logical name, schema version)` tuples for every artifact |
 | `rust/mumdia/crates/mumdia-core/src/manifest.rs` | `ArtifactRecord` / `Manifest` (populated from `record_artifact`) |
@@ -76,6 +78,7 @@ They are `pub const` tuples in the `artifact` submodule, referenced as
 | `run_windows` | 1 | rt-im-train |
 | `psms_extracted` | 1 | extract |
 | `chromatograms` | 1 | extract |
+| `chromatograms` | 2 (`CHROMATOGRAMS_V2`, only under `extract.chromatogram_schema = 2`) | extract |
 | `features` | 1 | features |
 | `psms_competed` | 2 | compete |
 | `psms_scored` | 3 | rescore |
@@ -166,6 +169,142 @@ returns the row count as `u64`:
    (`table.rs:192-194`). One `write_table` call produces exactly one row group /
    one logical batch.
 
+The list above describes the original single-batch write. `write_table` now hands
+the writer the rows in `WRITE_TABLE_CHUNK_ROWS` (65,536-row) chunks through a
+`TableWriter`, which keeps one chunk of Arrow arrays resident instead of a second
+copy of the whole table; the row groups still fall at the writer's 1,048,576-row
+default. `write_table_chunked(path, nrows, chunk)` is the same write for a caller
+that produces its rows chunk by chunk: `chunk(start..end)` is called for exactly the
+ranges `write_table` would cut (one empty range for an empty table), so the file is
+byte-identical to `write_table` over the concatenated columns, including the page
+framing of an all-null column, which a different chunk sequence would move
+(`write_table_chunked_writes_the_write_table_file`). `write_table_chunked_hashed`
+is the same write, hashed as it is written ("Hash on write" below). `rt-im-train`
+writes `run_windows.parquet` this way, so the seven whole columns (76 bytes per
+candidate) are never resident.
+
+#### Page layout of capped writers
+
+A writer with a row-group cap (`TableWriter::with_row_group_rows`,
+`BatchWriter::with_row_group_rows`, `WriteOptions::row_group_rows`) cuts its data
+pages by size only: `writer_props` sets the data page row limit to the cap
+(at most `MAX_DATA_PAGE_ROWS`, 131,072), where parquet-rs cuts every 20,000
+rows. A scalar column of a 65,536-row group is then one page instead of four,
+and the plain reader, which fetches every page with its own seek, reads it with
+one seek. Pages still end at parquet's 1 MB data page size, so list leaves
+barely change. Measured on the AIF artifacts at their own row-group sizes
+(`bench_rewrite_a_real_artifact`): features 2,003 -> 1,039 data pages at +0.5%
+bytes, psms_competed 1,592 -> 399 at +0.5%, chromatograms 1,141 -> 947 at
++0.05%. The writer's in-progress buffers grow with the page: 551.9 -> 620.2 MB
+for one 131,072-row group of the 398-column competed table. Values are
+unchanged; file bytes and content hashes of capped writers change; uncapped
+writers (`write_table`, `write_batches`, `BatchWriter::new`) are byte-identical
+to parquet-rs's defaults. This is step 3 of R1 in the 2026-09-25 performance
+survey.
+
+#### Float encodings planned from the first rows
+
+A capped writer does not decide its float dictionaries blind. Before it encodes
+a byte it holds its first `cap / 4` rows (`plan_sample_rows`, whatever chunks
+they arrive in), and `EncodingPlan::of` looks at every FLOAT and DOUBLE leaf,
+scalar or list item:
+
+- a leaf with at least 4,096 sampled values of which more than 80% are distinct
+  (`PLAN_PLAIN_ABOVE_DISTINCT`, counted by bit pattern as parquet's dictionary
+  interns them) is written PLAIN from its first page;
+- every other float leaf keeps the c = 0.5 dictionary limit of `writer_props`,
+  sized from the leaf's values per row group (sampled values per row times the
+  cap) instead of its rows, so a list leaf keeps parquet's 1 MB default where
+  the row-sized limit cut the chromatogram traces' dictionaries at 128 KB.
+
+The held batches are then encoded in the order and the chunks they arrived in.
+The unplanned rule fell back to PLAIN only after the dictionary filled, and the
+pages before the fallback kept their dictionary; the plan does not pay for that
+prefix. Measured on the AIF artifacts at their own row-group sizes
+(`bench_rewrite_a_real_artifact`, against the unplanned layout): features
+-8.6%, psms_competed -14.9%, chromatograms -6.3%, spectra_ms2 -0.2%. Encoding
+is also cheaper where a column skips dictionary interning: the competed
+rewrite took 0.54 s against 1.31 s and its writer peak `memory_size` fell from
+620 to 297 MB; the features rewrite 0.65 s against 1.00 s, 316 to 269 MB.
+
+Values are unchanged; bytes and content hashes of capped writers change;
+uncapped writers do not plan and are byte-identical to parquet-rs's defaults.
+The same rows plan the same encodings in any chunking
+(`the_plan_depends_on_the_rows_not_the_chunks`), so the output stays
+deterministic. `MUMDIA_PARQUET_PLAN=0` restores the unplanned layout, for a
+byte comparison against a binary from before the plan. A pooled table spliced
+from band artifacts carries each band's own plan in its row groups, which is
+legal parquet. This is F2 of the 2026-09-25 performance survey.
+
+A writer can also name columns to write without any dictionary
+(`WriteOptions::plain_column`, `TableWriter::with_plain_column`), whatever the
+plan says. The distinct-fraction test cannot see the one case where PLAIN wins
+on a low-cardinality column: a list whose rows repeat whole runs of values,
+which snappy shortens in PLAIN form and cannot find in bit-packed dictionary
+indices. `extract` names the chromatogram `rt` axis, which each fragment row of
+a candidate repeats: the AIF chromatograms came out 12.0% smaller than with
+the planned dictionary (160.9 against 182.8 MB; 17.5% against the unplanned
+layout), written in 5.4 against 7.2 s. This is X6 of the survey. An unknown
+column name is an error when the writer opens.
+
+#### Parallel column codec (`codec.rs`)
+
+parquet-rs's `ArrowWriter` encodes a row group's columns one after another on
+the calling thread. Every writer here (`TableWriter`, `BatchWriter`,
+`write_batches`) encodes through `codec::ColumnEncoder` instead, which builds
+the same parts (`ArrowWriter::try_new(..).into_serialized_writer()`, then one
+`ArrowColumnWriter` per leaf from the `ArrowRowGroupWriterFactory`) and encodes
+the root columns of each batch concurrently. It splits a batch at the row-group
+cap where `ArrowWriter::write` splits it, skips empty batches, gives each column
+writer one `write` per (split) batch so the page checks fall where they fell,
+closes the column chunks concurrently and appends them in schema order, and
+inherits the `ARROW:schema` metadata from `try_new`. The file is the serial
+writer's file byte for byte: `the_parallel_encoder_writes_the_serial_writers_bytes`
+and `a_wide_table_on_a_pool_is_the_serial_writers_file` compare them over several
+row groups, list columns, nulls, empty and straddling batches, pools of 1, 4
+and 6 threads and no pool. A byte row-group cap or content-defined chunking is
+refused rather than reproduced; no writer here sets either.
+
+The work runs on a dedicated rayon pool, never the global one. Its size is
+`MUMDIA_PARQUET_THREADS` when set (0 or 1 is serial), else `--threads` capped at
+8 (`set_codec_threads`, called by the CLI; `--threads 1` is serial), else the
+machine's parallelism capped at 8. `--threads N` therefore bounds two pools
+separately, the global pool at N and the codec pool at min(N, 8), and the codec
+pool works for plain writer and loader threads while the global pool is busy
+(extract's chromatogram writer encodes while the candidate loop scores, the
+features writer while the chunk workers compute). Up to N + min(N, 8) threads
+can then be busy at once. `MUMDIA_PARQUET_THREADS=1` makes the codec serial,
+which brings a run back to N threads plus its few plain writer and loader
+threads, as before the codec pool. A writer called from inside any rayon pool
+encodes on its own thread instead: rayon lets a worker that waits on another
+pool steal jobs of its own pool meanwhile, and such a job could take a lock the
+writer's caller holds. The parallel path is therefore used from plain threads
+(the main thread, extract's chromatogram writer thread, the features writer
+thread, rescore's handoff and psms_scored writers); a band or a run that already
+runs on the global pool is parallel at that level.
+
+The pool is shared by every plain-thread writer and decoder of the process, and
+it counts the callers waiting on it (`codec::claim`). When as many callers wait
+as the pool has threads, the next caller encodes or decodes on its own thread
+instead of queueing behind them, which writes the same bytes. Under
+`groups.parallel` every band in flight has its own chromatogram writer thread,
+and features and compete writers can run beside them. Without the count, more
+than eight such writers would share eight codec threads where each used to have
+a core of its own, and a band's candidate loop would wait on its writer's
+channel. With it, encode capacity never falls below one thread per concurrent
+writer (`a_saturated_pool_sends_the_next_caller_to_its_own_thread`,
+`concurrent_writers_beyond_the_pool_size_write_the_serial_writers_file`). The
+timings below are for one writer at a time; a banded run with
+`groups.parallel >= 8` has not been timed against the serial codec.
+
+Measured on the AIF artifacts re-chunked to 65,536-row batches under the shipped
+properties (`bench_parallel_encode_a_real_artifact`, median of 3 rounds, every
+arm byte-identical): features 0.45 s serial, 0.26 s on 2 threads, 0.19 s on 4,
+0.14 s on 8; psms_competed 0.42 / 0.27 / 0.19 / 0.16 s; chromatograms 8.07 /
+4.57 / 4.40 / 4.41 s (two list columns carry nearly all of it, so two threads
+take the whole gain); spectra_ms2 0.42 / 0.25 / 0.26 / 0.27 s. This is R2 of
+the 2026-09-25 performance survey.
+
 ### Read side: Parquet -> `Table` -> typed `Vec`
 
 `Table` (`table.rs:200-204`) holds the `Arc<Schema>`, the `Vec<RecordBatch>`,
@@ -197,6 +336,12 @@ The getters and their exact null behaviour:
 - `f64` (`table.rs:387`), `f32` (`table.rs:407`): fast path when
   `null_count() == 0` uses `extend_from_slice(a.values())`; otherwise iterate
   and map a null to `f64::NAN` / `f32::NAN`. Nulls become NaN.
+- `f64_widening` (on `Table` and `TableFile`): an f64 column exactly as `f64`
+  reads it, or an f32 column widened by `f64::from`, which is exact; a null is
+  NaN either way, and any other type is the `f64` error. It exists for columns
+  whose stored width differs between artifact versions: the feature columns of
+  `features.parquet` v2 and `psms_competed.parquet` v4 are Float32 where v1 and
+  v3 stored Float64 (docs/15_data_dictionary.md).
 - `i64` (`table.rs:427`), `i32` (`table.rs:447`), `u32` (`table.rs:467`): fast
   path on no nulls; otherwise iterate pushing `a.value(k)` **without checking
   `is_null`**. A null therefore comes through as the underlying buffer value
@@ -212,6 +357,157 @@ The getters and their exact null behaviour:
   present list is materialized via `f.values().to_vec()`.
 
 `column_names()` (`table.rs:373`) returns the schema field names in order.
+
+#### Sequential row-group reads (`span_cache.rs`)
+
+parquet-rs's synchronous reader fetches every page on its own, a header read and
+a body read through a fresh seek each time, and the arrow reader advances every
+projected column in lockstep, one batch at a time. A batch of a 398-column
+features or competed table therefore issues about 400 page reads, each one column
+chunk away from the previous one, and a row group is covered in several strided
+passes. On an SSD or from the page cache that costs nothing measurable. On a
+spinning array it is seek-bound: one reader of the immunopeptidomics competed
+tables measured 44 MB/s against a 133 MB/s sequential ceiling, and seven
+concurrent readers only 47-53 MB/s together.
+
+`TableFile::scan(columns, batch_size, &ScanOptions)` is `batches` with read
+options. `ScanOptions::default()` is exactly `batches`. With
+`ScanOptions::coalesced()` (or `coalesce: Some(SpanReadOptions { .. })`) the
+reader is given a `span_cache::SpanCache` instead of the `File`:
+
+- for each selected row group, in reading order, the projected column chunks'
+  byte ranges (`ColumnChunkMetaData::byte_range`) are coalesced into spans. Two
+  chunks at most `max_gap_bytes` (1 MB) apart share a span, so a narrow
+  projection never reads the columns it skipped wholesale. A `RowSpan` handle
+  (`open_rows`, `span`) plans only its own row groups;
+- a span is read with one sequential read on first use and every page request
+  inside it is sliced from memory. Requests outside a span (the footer, an
+  unplanned column) and spans over `max_span_bytes` (512 MB) are read directly,
+  exactly as the plain reader reads them;
+- a span is released as soon as every column chunk in it has been read to its
+  end, so a forward scan holds the one or two row groups a batch straddles, plus
+  one prefetched span when `prefetch` is on: a helper thread with its own file
+  handle reads span i+1 while the decoder works through span i, within
+  `max_resident_bytes` (1 GB). The decoder never waits on the budget;
+- the decoder receives the same bytes through the same metadata, projection,
+  selection and batch size, so the batches are identical to the plain reader's
+  (`coalesced_reads_yield_the_plain_readers_batches` compares them over
+  projections, span handles, straddling batch sizes and every option corner;
+  `each_span_is_read_once_and_released_when_its_chunks_are_done` counts the
+  reads). A `debug` line on drop reports spans read, bytes, prefetches and
+  direct reads.
+
+Two full scans can use it, through `stages::wide_scan_options`: rescore's feature
+stream (`for_each_feature_batch`, all ~390 feature columns of every row of every
+competed input) and compete's pass-through copy (`copy_kept_rows`, every column of
+the features table). Those are the wide scans of the run on spinning storage, where
+the memory the cache holds (two or three row groups of the projection, about 0.9 GB
+on a 131,072-row competed group) buys a forward read. It does not help a reader
+that skips pages through the page index, because a span holds whole column chunks,
+so every other reader keeps the plain `File`.
+
+`MUMDIA_WIDE_SCAN` chooses the reader of those two scans (`stages::WideScan`):
+
+| value | reader |
+|---|---|
+| unset, `plain` (default) | the plain reader with its parallel decode, at the scans' own batch sizes |
+| `rowgroup` | the plain reader, with rescore's feature stream decoding one row group a batch |
+| `coalesced` | the span cache above, one sequential read per row group |
+
+The plain reader stays the default because it is the only one measured not to lose.
+A coalesced scan decodes with one reader (see "Parallel decode" below), so from
+the page cache or an SSD it gives up the automatic column groups. Measured from
+the page cache on the HYE competed table (879,018 rows, 387 features, 131,072-row
+groups, `bench_feature_stream_a_real_artifact`, minimum of 4 rounds on a loaded
+host): the feature stream took 1.54 s plain, 1.58 s plain at one row group a batch,
+and 2.50 s coalesced. One reader decodes about 1.1 GB/s of f64, far above the
+44-133 MB/s of the spinning array the change is for, so the single reader would not
+limit a seek-bound read, but neither `rowgroup` nor `coalesced` has been measured on
+that array yet (the iostat check of the 2026-09-25 survey). Promote one once it has.
+The output is the same under all three, because the batches are.
+
+#### Parallel decode
+
+The arrow reader decodes every projected column of a batch on one thread. With
+`ScanOptions::decode_threads` a scan instead builds one reader per contiguous
+group of projected root columns (`ReadSpec::column_groups`, balanced by the
+compressed bytes of the selected row groups), advances the groups together on
+the codec pool (`codec.rs`) and joins each batch column-wise. Every group
+reader has the same row groups, row selection and batch size, so each yields
+the same rows per batch; the joined batches are the single reader's batches
+exactly, schema included (`parallel_decode_yields_the_single_readers_batches`
+covers projections, row spans trimmed at both ends, straddling batch sizes, more
+groups than columns and coalesced reads). A group that ends early or returns a
+different row count is an error, not a short batch.
+
+Because the batches are identical, this is on by default: `decode_threads: None`
+uses `codec_threads()` groups (at most 8, fewer when the projection has fewer
+root columns or less than 4 MB of compressed data per group,
+`MIN_DECODE_GROUP_BYTES`; `automatic_decode_groups`). It uses the single reader
+from inside a rayon pool, for the reason the encoder avoids the pool there, and
+for a coalesced scan. A coalesced scan exists to give seek-bound storage one
+forward read per row group. Column groups would each hold their own spans, read
+their own slices of every row group and run their own prefetcher, so the disk
+would again see up to eight interleaved streams. `Some(1)` is the single reader;
+`Some(k)` asks for k groups whatever the size, coalesced or not, and
+`MUMDIA_PARQUET_DECODE_THREADS=k` does the same for every automatic scan of a
+process, which is how a whole run, small artifacts included, is checked end to
+end (the smoke with `MUMDIA_PARQUET_DECODE_THREADS=3` writes every artifact
+byte for byte as without it). Under `coalesce` with explicit groups each group
+holds its own spans, and the resident budget is divided between them.
+`BatchReader::decode_groups` reports what a scan uses. A getter that reads one
+column is unchanged.
+
+Automatic groups stay on for uncoalesced scans, including on spinning storage.
+The plain reader already fetches each page on its own with a seek, from every
+projected column chunk in turn (previous section). Column groups issue the same
+page reads, of the same sizes, from several threads at once, so they change the
+queue depth and not the number of seeks. On the spinning array where the plain
+reader was measured, seven concurrent strided readers reached 47-53 MB/s
+together against 44 MB/s for one, so concurrency did not lower throughput there.
+The groups themselves have not been timed on that array. If a scan on rotational
+storage is slower with them, `MUMDIA_PARQUET_DECODE_THREADS=1` restores the
+single reader for the whole process, and an `iostat` A/B on the server is the
+check.
+
+Measured on the AIF artifacts (`bench_scan_a_real_artifact`, full scans in
+16,384-row batches, median of 5 interleaved rounds on a loaded 32-thread host):
+features 1.18 s with one reader, 0.80 s with 2 groups, 0.65 s with 4, 0.60 s
+with 8, 0.51 s automatic; psms_competed 1.22 / 0.86 / 0.55 / 0.47, 0.45 s
+automatic; chromatograms 5.14 s against 2.99 s with 2 groups and 3.29 s
+automatic (7 groups: the two list columns carry the work); spectra_ms2 0.85
+against 0.44 s. Coalesced reads split into the same automatic group counts,
+which a coalesced scan now uses only when `decode_threads` asks for them: 0.43,
+0.47, 2.97 and 0.46 s.
+
+#### Row selections and page skipping
+
+`TableFile::open` parses the footer only. `TableFile::open_with_offset_index`
+also loads the offset index, the location and first row of every data page of
+every column chunk, where the file carries one (the engine's writer writes it;
+pyarrow does not by default, and such a file opens as with `open`). A reader
+built on that footer and given a row selection skips a page that holds no
+selected row without reading or decompressing it. `TableFile::batches_runs`
+takes a selection as `(rows, keep)` runs over the handle's own rows, on a whole
+file or a span, and reuses the handle's footer, so a caller that selects row
+group by row group parses the footer once. It always materialises the selection
+as a queue of selectors (`RowSelectionPolicy::Selectors`): parquet-rs's
+automatic choice may pick a bitmask, which decodes every row of a chunk and
+filters afterwards, and so reads every page.
+
+Skipping rows inside a page is not free. parquet-rs steps over the rows of a
+list column one repetition level at a time, which on long lists costs more than
+decoding them: on the AIF chromatograms rewritten in the current layout (90
+points per trace on average, 65,536-row groups) selecting 11% of one group's
+`rt` rows took 101 ms against 78 ms for the whole group, while on a run of the
+six-file Astral LFQ experiment (21 points per trace) selecting 7% took 4.2 ms
+against 12.3 ms. A caller that wants a
+selection to cost no more than a full read therefore cuts it at page boundaries
+(`TableFile::page_starts` gives the rows at which a column's pages begin) and
+reads each column on its own selection, which is what quant does
+(`docs/12_quant_lfq_align_mbr_report_audit.md`). What a skipped page holds is
+never checked, so a corrupt page there goes unnoticed where a full read would
+have refused it.
 
 ### Parquet written outside this crate
 
@@ -246,11 +542,11 @@ snappy before feeding it to the engine.
 
 ### Hashing (`hash.rs`)
 
-`blake3_file(path)` (`hash.rs:8`) streams the file in 64 KiB chunks
+`blake3_file(path)` (`hash.rs:14`) streams the file in 64 KiB chunks
 (`[0u8; 1 << 16]`) through a `blake3::Hasher` and returns the hex digest. This
 is the artifact `content_hash`. It is fallible: it returns `Result` and errors
 with context `"hashing {path}"` if the file cannot be opened or a read fails.
-`blake3_str(s)` (`hash.rs:23`) is a one-shot hex digest of a string, used for the
+`blake3_str(s)` (`hash.rs:29`) is a one-shot hex digest of a string, used for the
 `config_hash`; it is infallible and returns a plain `String` rather than a
 `Result`. The engine derives the
 config hash from `Config::canonical_json()` (`config.rs:1125`, a plain
@@ -260,6 +556,52 @@ a deliberate exception: because `--max-spectra`, `--top-peaks-ms2`, and
 of `Config`, they are folded into the hash with a unit-separator (`\u{1f}`)
 alongside the canonical config JSON so two different caps do not collapse to the
 same `config_hash` (`main.rs:402-404`).
+
+#### Hash on write
+
+Every stage used to publish its output and then read the whole file back
+through `blake3_file` for the `content_hash` in its report, so each artifact byte
+crossed the disk or the page cache twice. The parquet writers in `table.rs` only
+ever append to their sink and never seek, so the digest of the byte stream is the
+digest of the finished file. A writer can therefore hash while it writes:
+
+- `hash::HashingWrite<W>` forwards every byte to `W` and feeds the bytes `W`
+  accepted to a `blake3::Hasher`;
+- in `table.rs` the output file is a `Sink`: `File` -> `HashingWrite` -> a 1 MB
+  `BufWriter`, so blake3 sees large contiguous inputs rather than parquet's
+  page headers one at a time. An unhashed sink has a zero-capacity buffer, which
+  passes every write straight through, so it issues the same writes as before;
+- hashing is opt-in per writer: `WriteOptions::content_hash()` for
+  `BatchWriter::with_options`, `TableWriter::with_content_hash()`,
+  `SpliceWriter::create_hashed`, `write_table_hashed`,
+  `write_table_chunked_hashed` and `write_batches_hashed`. The digest is finalised after parquet has written the
+  footer (`ColumnEncoder::into_inner`, which ends in
+  `SerializedFileWriter::into_inner`, for `TableWriter`, `BatchWriter` and
+  `write_batches`; `SerializedFileWriter::into_inner` directly for
+  `SpliceWriter`; both write the same footer bytes as `close`) and returned as a
+  `report::Written { rows, content_hash }` by the writer's `close_hashed`;
+- it is off for files nobody records: the pool's per-row-group rewrite temp
+  files, compete's splice scratch files and the rescore sidecar handoff.
+
+The stages that write through `mumdia-io` and then hashed the same file now use
+the streamed digest: convert (both spectra tables, the isolation windows and the
+MS2-to-MS1 map), predict-frag (both library tables), search-seed, rt-im-train,
+extract (`psms_extracted` and `chromatograms`), features, compete (the spliced or
+rewritten table; a hard-linked one carries the features hash), the pool's three
+spliced tables in `run_groups`, and rescore's `psms_scored`. The small tables
+(digest, peptidoforms, quant, prescan, align) still hash by reading back.
+
+The digest is the same blake3 over the same bytes, so hashing while writing
+changes no byte and no `content_hash` by itself: with only this change, the
+smoke run's manifests and reports were identical to the previous binary's apart
+from the git SHA and argv (`hash_on_write_tests` in `table.rs` pins digest ==
+`blake3_file` for every writer type: empty, one block, many row groups, list
+columns). The capped-writer layout changes in this release do change bytes and
+hashes: the page cut ("Page layout of capped writers"), the float plan ("Float
+encodings planned from the first rows") and the PLAIN chromatogram `rt` axis.
+Each recorded hash is still the blake3 of the file as written. `blake3_file` itself is
+still not memoised: `features` uses it in its tests as an independent integrity
+check of a published file.
 
 ### JSON (`json.rs`)
 
@@ -353,14 +695,16 @@ The orchestrators therefore take the hash from the stage instead:
   every band artifact was hashed a second time there for a record that was then
   dropped;
 - `run-experiment` reuses the rescore and quant hashes for its experiment
-  manifest. The MBR worker's table, the by-source split, the LFQ matrix, the
-  pooled seed and the DeepLC library tables have no Rust report hash, so they
-  are still hashed by `record_artifact`.
+  manifest, and the by-source split hashes its per-run tables while it writes
+  them. The MBR worker's table, the LFQ matrix, the pooled seed and the DeepLC
+  library tables have no Rust report hash, so they are still hashed by
+  `record_artifact`.
 
 Reusing the stage hashes changes no hash value in `manifest.json`,
 `experiment_manifest.json` or the `*.report.json` files; only the second read
 is gone. `hash::blake3_file` itself is not memoised: `features` uses it as an
-independent integrity check.
+independent integrity check. The stage's own hash no longer reads the file back
+either for the large artifacts ("Hash on write" above).
 
 One hash does change in the same release, for a different reason: compete
 now publishes `psms_competed.parquet` as the features file's own bytes when
@@ -398,15 +742,31 @@ string (`main.rs:713`).
 | `Col::field` | `table.rs:83` | Arrow `Field`; scalars non-nullable, `Opt*`/lists nullable |
 | `Col::into_array` | `table.rs:107` | consuming move of the `Vec` into an `ArrayRef` (copy once) |
 | `write_table` | `table.rs:151` | validate + write one SNAPPY Parquet batch; returns row count |
+| `write_table_chunked` | `table.rs` | the `write_table` file, built from caller-produced 65,536-row chunks |
+| `write_table_chunked_hashed` | `table.rs` | `write_table_chunked`, returning the rows and the content hash taken while writing |
 | `Table` (struct) | `table.rs:200` | read-back table: schema, batches, nrows |
 | `Table::read` | `table.rs:207` | read a Parquet file fully into memory |
 | `Table::column_names` | `table.rs:227` | schema field names, in order |
 | `Table::f64` / `f32` | `table.rs:241` / `261` | float getters; null -> NaN |
+| `Table::f64_widening` / `TableFile::f64_widening` | `push_f64_widening` | an f64 or f32 column as f64 (f32 widened exactly); null -> NaN |
 | `Table::i64`/`i32`/`u32` | `table.rs:281`/`301`/`321` | integer getters; null NOT checked (-> buffer value) |
 | `Table::bool` | `table.rs:341` | bool getter; null NOT checked |
 | `Table::str` | `table.rs:357` | string getter; null -> `""` |
 | `Table::opt_f64` | `table.rs:377` | only null-preserving getter; -> `Vec<Option<f64>>` |
 | `Table::list_f32` | `table.rs:396` | f32 list getter; reads `List` and `LargeList`; null row -> empty `Vec` |
+| `TableFile` / `TableFile::open` / `open_rows` | `table.rs:1673` / `:1742` / `:1765` | footer-only handle whose getters stream one column batch by batch; `open_rows` is a row span of the file that behaves as a smaller file |
+| `TableFile::row_parts` | `table.rs:1868` | cut a handle into at most `max_parts` row-contiguous parts, in order: whole row groups, merged, and page-aligned ranges inside a group that has an offset index (a group without one is never split) |
+| `TableFile::batches` / `batches_dict` | `table.rs:2038` / `:2050` | streaming batch reader over the named columns; `batches_dict` reads the named `Utf8` columns as `Dictionary(Int32, Utf8)`, with the same row values |
+| `TableFile::batches_selected` | `table.rs:2100` | stream only the rows of `(rows, keep)` runs, skipping pages with no kept row where the file has an offset index (whole-file handles only) |
+| `TableFile::open_with_offset_index` / `offset_indexed` | `table.rs` | `open` with the page locations of every column chunk loaded as well (opt-in); whether a handle holds them for every row group it covers |
+| `TableFile::batches_runs` | `table.rs` | stream only the rows of `(rows, keep)` runs of this handle, a whole file or a span, through the footer it already holds, always as a queue of selectors; a page with no kept row is skipped unread on an offset-indexed handle |
+| `TableFile::row_group_parts` / `page_starts` | `table.rs` | a handle cut at the file's row-group boundaries; the handle rows at which a column's data pages begin in every one of its leaves, from the offset index |
+| `WriteOptions::metadata` / `TableWriter::with_metadata` / `TableFile::metadata_value` | `table.rs` | record a small fact about the whole table under a key in the footer's key-value metadata, next to the arrow schema; read it back from the footer alone (the overlap loser table names its band tables this way) |
+| `TableFile::str_flat_rows` | `table.rs` | `str_flat` at given rows only: one text arena plus offsets for the picked rows, the same null policy |
+| `TableFile::str_interned` / `str_flat` | `table.rs:2309` / `:2358` | a string column as one id per row plus its distinct values (first appearance), or as one text arena plus offsets; both refuse a NULL with the row |
+| `StrBatch` / `StrInterner` | `table.rs:1517` / `:1550` | one batch of a string column, plain or through its dictionary; first-appearance interning with a per-batch key memo |
+| `ListF32` | `table.rs:1422` | borrowed view of a batch's f32 list column (row slices of the batch's own buffer) |
+| `require_no_nulls` | `table.rs:1203` | refuse a NULL in a required column of a batch a reader walks itself, naming the absolute row |
 | `ArtifactReport` | `report.rs:11` | per-artifact JSON summary struct |
 | `ArtifactReport::write_for` | `report.rs:28` | write `<artifact>.report.json` |
 | `blake3_file` | `hash.rs:8` | streamed blake3 hex digest of a file (`content_hash`) |

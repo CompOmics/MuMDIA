@@ -422,9 +422,11 @@ sections 10-16:
   identifications. Under `rescore.strict` (the production setting) with a sidecar classifier
   the engine releases its own `FeatureMatrix` as soon as the handoff parquet is written,
   because strict has no native fallback that could still read it; the handoff is written in
-  131,072-row groups; and the worker loads it one row group at a time, since pyarrow's
-  `iter_batches` reads ahead and its buffered batches were a second copy of the matrix (the
-  worker climbed to 11.2 GB while filling a 4.85 GB matrix, then fell to 6.3). Measured on
+  131,072-row groups; and the worker loads it row group by row group, holding at most two
+  decoded groups (one filling, one read ahead on a reader thread since 2026-09-25), since
+  pyarrow's `iter_batches` reads ahead without bound and its buffered batches were a second
+  copy of the matrix (the worker climbed to 11.2 GB while filling a 4.85 GB matrix, then
+  fell to 6.3). Measured on
   the fleet (EPYC 9354, 32 threads, process-tree peaks): the six-run Astral pool
   (3,133,636 x 387) 17.9 GB -> 9.3 GB in 19.4 against 19.4 min, HYE B01
   (1,838,344 x 387) 12.0 GB -> 5.05 GB in 5.2 against 5.0 min, 63,270 peptides in both HYE
@@ -584,18 +586,55 @@ sections 10-16:
   only a FASTA-mode library build reaches it.
 - `mumdia doctor` probes `deeplc,numpy,pandas,pyarrow,torch,psm_utils` for the
   DeepLC interpreter, because `deeplc_finetune.py` imports the last three too.
+- Every DeepLC call site asks for the engine's thread count (the fine-tune's training
+  pool keeps its own bound of 8), and both DeepLC workers cap what they give torch at the
+  physical cores available to the process: the distinct sysfs `core_cpus_list` sets
+  under `sched_getaffinity` on Linux, every physical core on Windows.
+  `MUMDIA_DEEPLC_THREAD_CAP=N` overrides it and `0` disables it; the resolved numbers are
+  under `torch_threads` in `<lib_out>.summary.json`. Measured on doxy (64 cores, 128
+  CPUs): the multi-head step took 10:41 at 96 threads and 18:09 at 128. The cap is a
+  ceiling, and a request at or below it is taken as given, but the engine asks for every
+  logical CPU unless `--threads` says otherwise, so on an SMT host the cap binds by
+  default (128 to 64 on doxy). Where it binds, the output changes as between any two
+  `--threads` values: most rows in the last bits, and under the multi-head calibration a
+  few sequences at the edge of the reference range by up to about two minutes (63 of
+  12,002 fixture rows above 1 s, at most 129 s, same heads). Separately from the cap,
+  the prediction after a fine-tune now runs on the engine thread count instead of the 8
+  training threads, which moves the `finetune_deeplc` output in the last bits on every
+  host with more than 8 cores (`DEEPLC_FT_THREADS` bounds training only). The default
+  still owes the survey's doxy sweep (32-128 threads on HYE and AIF, head set, peptides at
+  1% on `run_psm_q` over three NN seeds; docs/13, "DeepLC thread cap").
+- `rt_im_train.deeplc_predict_shards` (default 1) splits that whole-library prediction
+  across processes of `budget / K` threads, with the calibration or fine-tuned model
+  fitted once in the parent and no refit per shard. Bit-identical to one process at
+  equal threads per process, float-equivalent at the same `--threads`. It is not known to
+  pay: on the one desktop measured the forward pass dominated and scaled with threads,
+  so 4 x 2 threads equalled 1 x 8 (docs/08, "Sharded whole-library prediction"); it stays
+  opt-in until measured where one process stops scaling, on two acquisitions.
 - Any parquet written outside `mumdia-io` and read by the engine must be
   snappy-compressed with arrow `utf8` string columns. Polars defaults to zstd
   and `large_utf8`, and the engine rejects both ("Disabled feature at compile
   time: zstd", "column 'peptidoform' is not utf8").
 - A library must carry `candidate_id` as the contiguous row-aligned range
-  `0..ncand` (`index.rs:112-125`) and precursors ascending by `precursor_mz`
-  (`index.rs:215-231`). Both are hard errors. Fragments are grouped by a
-  counting sort, so they need valid ids but not a sorted order.
+  `0..ncand` (`index.rs:215-245`) and precursors ascending by `precursor_mz`
+  (`index.rs:1288-1299`). Both are hard errors. Fragments are grouped by a
+  counting sort, so they need valid ids but not a sorted order; a table whose
+  ids ascend (what every library writer produces) takes the parallel fill.
 - The `nn_torch` worker selects its backend at `MUMDIA_NN_STREAM_GB`
   (default 4). A feature matrix marginally over the threshold silently falls to
   the much slower disk-backed streaming memmap; a 4.31 GB matrix against the
   4.00 GB default took the slow path.
+- `chromatograms.parquet` has two layouts. v1 (the default, schema 1) stores every row's
+  whole `rt` axis and `intensity` trace. v2 (`extract.chromatogram_schema = 2`, schema
+  2, `CHROMATOGRAMS_V2`) stores the lists as `rt_axis` and `intensity_trimmed`, plus
+  `trace_offset` and `trace_len`: each candidate's axis once per parquet row group (an
+  empty `rt_axis` means the last axis that candidate wrote in the same row group) and each
+  trace trimmed to its first-to-last run of values that are not `+0.0`. A v2 row group
+  decodes on its own, so a reader must start at a row group or at a candidate's first
+  row. `mumdia::chromatograms::Decoder` is the reference reader and
+  `mumdia::chromatograms::rewrite` converts either way; convert to v1 before handing the
+  table to a tool outside the engine. The lists are renamed so that such a tool, or an
+  engine binary from before v2, stops at the missing `rt` instead of misreading v2.
 
 ## Quantification rules
 
@@ -694,7 +733,12 @@ sensitivity result for it.
   Precursor and fragment m/z of the FASTA library agree with the DIA-NN library to
   0.1 ppm on 3.66M shared keys, so this was intensity ranking, not mass. Library
   build for those 9.8M peptidoforms: DeepLC 19 min, MS2PIP 4.2.0 35-39 min at 32
-  processes (docs/13).
+  processes (docs/13). `MUMDIA_PREDICT_FRAG_CONCURRENT=1` (opt-in) runs the two
+  workers at the same time, which leaves the library byte-identical; it is off because
+  each worker sizes itself from the whole thread count and neither the wall time nor the
+  peak of the pair was measured at that scale. `predict_frag.defer_deeplc_to_multihead`
+  (opt-in) skips the DeepLC pass when the multi-head calibration re-predicts every row
+  anyway (docs/06).
 
 ## Changes that remain benchmark-gated
 

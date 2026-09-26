@@ -45,9 +45,11 @@ EXPECTED_SCHEMA_VERSIONS = {
     "seed_psms": 1,
     "run_windows": 1,
     "psms_extracted": 2,
+    # 2 only under `extract.chromatogram_schema = 2` (CHROMATOGRAMS_V2), which smoke arm
+    # 4e runs and checks itself; every run this script reads writes the default, 1.
     "chromatograms": 1,
-    "features": 1,
-    "psms_competed": 3,
+    "features": 2,
+    "psms_competed": 4,
     "psms_scored": 4,
     "peptide_quant": 2,
     "protein_group_quant": 2,
@@ -55,9 +57,30 @@ EXPECTED_SCHEMA_VERSIONS = {
     # single-run manifest. Listed because this dict is the frozen record of
     # schema.rs, and the loop below only checks the schemas it actually sees.
     "lfq_maxlfq": 1,
+    # Written only by a grouped run under `groups.pool_chromatograms = false`.
+    "overlap_losers": 1,
 }
 
 BLAKE3_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+# features v2 and psms_competed v4 store every feature column as float32 except these,
+# which compete or rescore read as float64 before narrowing (`F64_FEATURE_COLUMNS` in
+# stages/features.rs), and the bookkeeping columns below. Frozen here for the same
+# reason as the schema versions: a writer that went back to float64 would double the
+# widest artifacts of the run without moving a single score, so nothing else notices.
+F64_FEATURE_COLUMNS = {
+    "charge", "n_matched_fragments", "unique_fragment_count",
+    "peak_contested_frac", "contested_frac",
+}
+F64_BOOKKEEPING_COLUMNS = {"apex_rt", "elution_lo", "elution_hi", "precursor_mz", "prelim_score"}
+# The whole of `NON_FEATURE_COLUMNS` in stages/features.rs, so a bookkeeping column that
+# is not written today (`peptidoform_id`, `source`, `unique_evidence`) is never taken for
+# a feature of the wrong width. tests/python/test_check_smoke_columns.py holds both sets
+# to the Rust constants.
+NON_FEATURE_COLUMNS = F64_BOOKKEEPING_COLUMNS | {
+    "candidate_id", "peptidoform_id", "base_peptide_id", "peptidoform", "protein", "label",
+    "peak_rank", "source", "unique_evidence",
+}
 
 
 class Checks:
@@ -190,6 +213,22 @@ def main() -> int:
         if schema in seen_schemas:
             c.ok(seen_schemas[schema] == version,
                  f"schema {schema} is v{version}", f"found v{seen_schemas[schema]}")
+
+    # ----------------------------------------------------------- feature storage
+    print("feature storage")
+    for table in ("features.parquet", "psms_competed.parquet"):
+        fields = {f.name: str(f.type) for f in pq.read_schema(out / table)}
+        wrong = sorted(
+            n for n, t in fields.items()
+            if n not in NON_FEATURE_COLUMNS
+            and t != ("double" if n in F64_FEATURE_COLUMNS else "float")
+        )
+        n_f32 = sum(1 for n, t in fields.items() if n not in NON_FEATURE_COLUMNS and t == "float")
+        c.ok(not wrong and n_f32 > 0,
+             f"{table} stores its feature columns as float32 except the f64 few",
+             f"{n_f32} float32; wrong width: {', '.join(wrong[:5])}")
+        c.ok(all(fields.get(n) == "double" for n in F64_BOOKKEEPING_COLUMNS),
+             f"{table} keeps its bookkeeping columns as float64")
 
     # ------------------------------------------------------------------- convert
     print("convert")

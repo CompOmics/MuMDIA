@@ -14,7 +14,7 @@ use mumdia_core::config::{FragPredictorKind, PredictFragConfig, RtPredictorKind}
 use mumdia_core::mass::{parse_peptidoform, Fragment, ParsedPeptidoform};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
-use mumdia_io::table::{write_table, Col, TableFile};
+use mumdia_io::table::{write_table_hashed, Col, TableFile};
 use serde_json::json;
 use tracing::info;
 
@@ -29,6 +29,12 @@ pub struct PredictFragParams<'a> {
     pub cfg: &'a PredictFragConfig,
     pub work_dir: &'a str,
     pub config_hash: &'a str,
+    /// Write the native retention-time model's iRT in place of DeepLC's, because the caller
+    /// will re-predict every row with the multi-head calibration before anything reads it
+    /// (`predict_frag.defer_deeplc_to_multihead`). Only an orchestrator that runs that
+    /// calibration, and checks afterwards that it re-predicted every row, may set it; the
+    /// library's model identity then says the iRT is a placeholder.
+    pub rt_placeholder: bool,
 }
 
 /// A candidate before intensity/iRT assignment.
@@ -136,8 +142,7 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         "predict-frag: parsed"
     );
 
-    let (rt_model_id, rt_missing) = assign_rt(&p, &mut raws)?;
-    let (frag_model_id, frag_missing) = assign_intensities(&p, &mut raws)?;
+    let (rt_model_id, rt_missing, frag_model_id, frag_missing) = assign_predictions(&p, &mut raws)?;
     let model_identity = format!("{rt_model_id}; {frag_model_id}");
 
     // Coverage. A candidate a predictor returned nothing for is dropped, together with
@@ -291,7 +296,7 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         }
     }
 
-    let n_prec = write_table(
+    let prec_written = write_table_hashed(
         p.out_precursors,
         vec![
             Col::U32("candidate_id".into(), cid),
@@ -312,7 +317,7 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
     // deterministic precomputed column instead of a runtime heuristic. Diagnostic;
     // no consumer yet.
     let f_card = fragment_cardinality(&f_cid, &f_mz);
-    let n_frag = write_table(
+    let frag_written = write_table_hashed(
         p.out_fragments,
         vec![
             Col::U32("candidate_id".into(), f_cid),
@@ -326,6 +331,7 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         ],
     )?;
 
+    let (n_prec, n_frag) = (prec_written.rows, frag_written.rows);
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("candidates".to_string(), json!(n_prec));
@@ -344,21 +350,26 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         json!(n_dropped_pairs),
     );
     let mut written: Vec<Written> = Vec::with_capacity(2);
-    for (path, schema) in [
-        (p.out_precursors, artifact::FRAGMENT_LIBRARY_PRECURSORS),
-        (p.out_fragments, artifact::FRAGMENT_LIBRARY_FRAGMENTS),
+    for (path, schema, file) in [
+        (
+            p.out_precursors,
+            artifact::FRAGMENT_LIBRARY_PRECURSORS,
+            prec_written,
+        ),
+        (
+            p.out_fragments,
+            artifact::FRAGMENT_LIBRARY_FRAGMENTS,
+            frag_written,
+        ),
     ] {
         let report = ArtifactReport {
             logical_name: schema.0.to_string(),
             schema_name: schema.0.to_string(),
             schema_version: schema.1,
             stage: "predict-frag".to_string(),
-            rows: if path == p.out_precursors {
-                n_prec
-            } else {
-                n_frag
-            },
-            content_hash: mumdia_io::hash::blake3_file(path)?,
+            rows: file.rows,
+            // Both tables were hashed while they were written.
+            content_hash: file.content_hash,
             params: json!({"top_n": p.cfg.top_n_fragments, "ms2pip_model": p.cfg.ms2pip_model,
                            "rt_predictor": format!("{:?}", p.cfg.rt_predictor),
                            "fragment_predictor": format!("{:?}", p.cfg.predictor)}),
@@ -381,57 +392,78 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
     Ok((prec, frag))
 }
 
-/// Assign predicted iRT to every candidate. Returns the model id and the indices of the
-/// candidates the predictor returned nothing for; the caller drops those.
-fn assign_rt(p: &PredictFragParams, raws: &mut [Raw]) -> Result<(String, Vec<usize>)> {
-    match p.cfg.rt_predictor {
-        RtPredictorKind::Native => {
-            let m = NativeRt;
-            // Per-row and independent (no cross-row reduction) -> bit-identical in parallel.
-            raws.par_iter_mut().for_each(|r| {
-                r.irt = m.predict_irt(&r.parsed);
-            });
-            Ok((m.identity(), Vec::new()))
-        }
-        RtPredictorKind::Deeplc => {
-            let python = p.cfg.deeplc_python.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("rt_predictor=deeplc requires predict_frag.deeplc_python")
-            })?;
-            let script =
-                crate::sidecar::resolve_script(&p.cfg.sidecar_script_dir, "deeplc_worker.py");
-            // Dedup by peptidoform (RT is charge-independent).
-            let mut uniq: HashMap<String, u32> = HashMap::new();
-            let (mut ids, mut peps) = (Vec::new(), Vec::new());
-            for r in raws.iter() {
-                if !uniq.contains_key(&r.peptidoform) {
-                    let id = uniq.len() as u32;
-                    uniq.insert(r.peptidoform.clone(), id);
-                    ids.push(id);
-                    peps.push(r.peptidoform.clone());
+/// Predicted iRT and fragment intensities for every candidate: `(rt model id, rt missing,
+/// fragment model id, fragment missing)`, the missing lists being candidate indices the
+/// predictor returned nothing for (the caller drops those with their pairs).
+///
+/// When both come from sidecars (DeepLC and MS2PIP or AlphaPeptDeep) and
+/// `MUMDIA_PREDICT_FRAG_CONCURRENT=1` is set, the two workers run at the same time: they
+/// write disjoint fields of each candidate, and each gets exactly the request and thread
+/// count it gets when run alone, so the library is byte-identical either way (measured on
+/// the fixture library with DeepLC 4.5.0 and MS2PIP 4.2.0: 9.1 s against 14.7 s).
+///
+/// Off by default. Each worker sizes itself from the engine's whole thread count (MS2PIP
+/// starts that many processes, DeepLC takes that many torch threads), so at once they ask
+/// for twice the CPUs and hold both workers' memory; the saving on the fixture is the
+/// workers' start-up, and at scale, where both are CPU-bound (DeepLC 19 min and MS2PIP
+/// 35-39 min on the 9.8M-peptidoform HYE FASTA library, one after the other), neither the
+/// wall time nor the process-tree peak of the pair has been measured. Splitting the thread
+/// budget instead would change DeepLC's torch thread count and with it the last bits of
+/// its predictions. Validate on a large FASTA build (wall time, peak, and a byte
+/// comparison of both library tables) before turning it on.
+fn assign_predictions(
+    p: &PredictFragParams,
+    raws: &mut [Raw],
+) -> Result<(String, Vec<usize>, String, Vec<usize>)> {
+    let rt_req = RtRequest::new(p, raws)?;
+    let frag_req = FragRequest::new(p, raws)?;
+    let concurrent = std::env::var("MUMDIA_PREDICT_FRAG_CONCURRENT")
+        .is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0");
+    let (rt_out, frag_out) = match (&rt_req, &frag_req, concurrent) {
+        (RtRequest::Deeplc(rt), Some(fr), true) => {
+            info!(
+                "predict-frag: running the DeepLC and the fragment-intensity workers at the \
+                 same time (MUMDIA_PREDICT_FRAG_CONCURRENT)"
+            );
+            std::thread::scope(|scope| {
+                let deeplc = scope.spawn(|| rt.call(p));
+                let frag = fr.call(p);
+                if let Err(e) = &frag {
+                    // Said now rather than after the DeepLC join, which on a large library
+                    // is many minutes later: the stage fails either way, and the DeepLC
+                    // worker cannot be interrupted from here.
+                    tracing::error!(
+                        error = %format!("{e:#}"),
+                        "predict-frag: the fragment-intensity worker failed; waiting for the \
+                         DeepLC worker to exit before the stage fails"
+                    );
                 }
-            }
-            let out = sidecar::run_deeplc(python, &script, p.work_dir, &ids, &peps)?;
-            let mut missing = Vec::new();
-            for (i, r) in raws.iter_mut().enumerate() {
-                let uid = uniq[&r.peptidoform];
-                match out.get(&uid) {
-                    Some(&v) => r.irt = v,
-                    None => missing.push(i),
-                }
-            }
-            // The installed DeepLC version, not a family label: two libraries predicted by
-            // different DeepLC releases are different libraries (docs/30, model identity).
-            let version = sidecar::require_deeplc_version(python)?;
-            Ok((format!("deeplc-{version}-base"), missing))
+                let rt = deeplc
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("the DeepLC worker thread panicked")));
+                (Some(rt), Some(frag))
+            })
         }
-    }
-}
-
-/// Assign a predicted intensity to every fragment. Returns the model id and the indices
-/// of the candidates the predictor returned nothing for; the caller drops those.
-fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<(String, Vec<usize>)> {
-    match p.cfg.predictor {
-        FragPredictorKind::Native => {
+        _ => {
+            let rt = match &rt_req {
+                RtRequest::Deeplc(rt) => Some(rt.call(p)),
+                _ => None,
+            };
+            // DeepLC first, as before: a failing DeepLC stops the stage before MS2PIP runs.
+            let rt = match rt {
+                Some(Err(e)) => return Err(e),
+                other => other,
+            };
+            (rt, frag_req.as_ref().map(|fr| fr.call(p)))
+        }
+    };
+    // DeepLC's error first, as when the two ran one after the other.
+    let rt_out = rt_out.transpose()?;
+    let frag_out = frag_out.transpose()?;
+    let (rt_id, rt_missing) = rt_req.apply(raws, rt_out)?;
+    let (frag_id, frag_missing) = match (frag_req, frag_out) {
+        (Some(fr), Some(map)) => fr.apply(p, raws, map)?,
+        _ => {
             let m = NativeFrag;
             // Per-row and independent: each candidate's intensities depend only on its own
             // parsed peptidoform and fragment list, with no cross-row reduction, so this is
@@ -439,154 +471,276 @@ fn assign_intensities(p: &PredictFragParams, raws: &mut [Raw]) -> Result<(String
             raws.par_iter_mut().for_each(|r| {
                 r.frag_int = m.predict_intensities(&r.parsed, &r.frags);
             });
-            Ok((m.identity(), Vec::new()))
+            (m.identity(), Vec::new())
         }
-        FragPredictorKind::Ms2pip => {
-            let python = p.cfg.ms2pip_python.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("predictor=ms2pip requires predict_frag.ms2pip_python")
-            })?;
-            let script =
-                crate::sidecar::resolve_script(&p.cfg.sidecar_script_dir, "ms2pip_worker.py");
-            let ids: Vec<u32> = (0..raws.len() as u32).collect();
-            let peps: Vec<String> = raws.iter().map(|r| r.peptidoform.clone()).collect();
-            let charges: Vec<i32> = raws.iter().map(|r| r.charge).collect();
-            let map = sidecar::run_ms2pip(
-                python,
-                &script,
-                p.work_dir,
-                &ids,
-                &peps,
-                &charges,
-                &p.cfg.ms2pip_model,
-            )?;
-            if map.is_empty() {
-                bail!("MS2PIP returned no predictions");
+    };
+    Ok((rt_id, rt_missing, frag_id, frag_missing))
+}
+
+/// How every candidate gets its iRT.
+enum RtRequest {
+    Native,
+    /// The native model's iRT as a stand-in for DeepLC's (`PredictFragParams::rt_placeholder`).
+    Placeholder,
+    Deeplc(DeeplcRequest),
+}
+
+/// The DeepLC request: one prediction per unique peptidoform (RT is charge-independent).
+struct DeeplcRequest {
+    python: String,
+    script: String,
+    uniq: HashMap<String, u32>,
+    ids: Vec<u32>,
+    peps: Vec<String>,
+}
+
+impl RtRequest {
+    fn new(p: &PredictFragParams, raws: &[Raw]) -> Result<Self> {
+        match p.cfg.rt_predictor {
+            RtPredictorKind::Native => Ok(Self::Native),
+            RtPredictorKind::Deeplc if p.rt_placeholder => {
+                info!(
+                    "predict-frag: skipping the DeepLC pass: the multi-head calibration \
+                     re-predicts every row of this library before anything reads its iRT \
+                     (predict_frag.defer_deeplc_to_multihead). The library carries the native \
+                     model's iRT as a placeholder until then, and the run fails if the \
+                     calibration leaves any row un-predicted"
+                );
+                Ok(Self::Placeholder)
             }
-            let native = NativeFrag;
-            // Parallel across rows: each row writes only its own `frag_int` and reads only
-            // its own parsed peptidoform, fragment list and MS2PIP entry. `par_iter_mut`
-            // preserves the element-to-index mapping, and the per-row float work (the native
-            // charge-2 fallback and the two per-charge-group max-normalizations) is
-            // self-contained, so this is bit-identical to the serial loop. The MS2PIP sidecar
-            // call already happened above -- what is parallelized here is the per-row native
-            // prediction and normalization, which is real CPU work, not sidecar wait.
-            //
-            // A candidate MS2PIP returned nothing for is reported to the caller, which
-            // drops it with its pair; it used to receive the native heuristic silently,
-            // under a library-wide MS2PIP model identity (docs/29 #17).
-            let covered: Vec<bool> = raws
-                .par_iter_mut()
-                .enumerate()
-                .map(|(i, r)| {
-                    let per = map.get(&(i as u32));
-                    match per {
-                        Some(per) if !per.is_empty() => {
-                            let keys: Vec<(u8, u16, u8)> = r
-                                .frags
-                                .iter()
-                                .map(|fr| {
-                                    (
-                                        fr.ion_type.symbol() as u8,
-                                        fr.ordinal as u16,
-                                        fr.charge.clamp(1, 255) as u8,
-                                    )
-                                })
-                                .collect();
-                            let nat = native.predict_intensities(&r.parsed, &r.frags);
-                            r.frag_int = ms2pip_values(&keys, per, &nat);
-                            true
-                        }
-                        _ => {
-                            r.frag_int = vec![0.0; r.frags.len()];
-                            false
-                        }
+            RtPredictorKind::Deeplc => {
+                let python = p.cfg.deeplc_python.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("rt_predictor=deeplc requires predict_frag.deeplc_python")
+                })?;
+                let script =
+                    crate::sidecar::resolve_script(&p.cfg.sidecar_script_dir, "deeplc_worker.py");
+                // Dedup by peptidoform (RT is charge-independent).
+                let mut uniq: HashMap<String, u32> = HashMap::new();
+                let (mut ids, mut peps) = (Vec::new(), Vec::new());
+                for r in raws.iter() {
+                    if !uniq.contains_key(&r.peptidoform) {
+                        let id = uniq.len() as u32;
+                        uniq.insert(r.peptidoform.clone(), id);
+                        ids.push(id);
+                        peps.push(r.peptidoform.clone());
                     }
-                })
-                .collect();
-            let missing: Vec<usize> = covered
-                .iter()
-                .enumerate()
-                .filter(|(_, &c)| !c)
-                .map(|(i, _)| i)
-                .collect();
-            let version =
-                sidecar::module_version(python, "ms2pip").unwrap_or_else(|| "unknown".into());
-            Ok((format!("ms2pip-{version}-{}", p.cfg.ms2pip_model), missing))
+                }
+                Ok(Self::Deeplc(DeeplcRequest {
+                    python: python.to_string(),
+                    script,
+                    uniq,
+                    ids,
+                    peps,
+                }))
+            }
         }
-        FragPredictorKind::Peptdeep => {
-            let python = p.cfg.peptdeep_python.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("predictor=peptdeep requires predict_frag.peptdeep_python")
-            })?;
-            let script =
-                crate::sidecar::resolve_script(&p.cfg.sidecar_script_dir, "peptdeep_worker.py");
-            let ids: Vec<u32> = (0..raws.len() as u32).collect();
-            let peps: Vec<String> = raws.iter().map(|r| r.peptidoform.clone()).collect();
-            let charges: Vec<i32> = raws.iter().map(|r| r.charge).collect();
-            let map = sidecar::run_peptdeep(
-                python,
-                &script,
+    }
+
+    /// Assign the iRT. Returns the model id and the candidates without a prediction.
+    fn apply(
+        self,
+        raws: &mut [Raw],
+        out: Option<HashMap<u32, f32>>,
+    ) -> Result<(String, Vec<usize>)> {
+        match self {
+            Self::Native | Self::Placeholder => {
+                let m = NativeRt;
+                // Per-row and independent (no cross-row reduction) -> bit-identical in parallel.
+                raws.par_iter_mut().for_each(|r| {
+                    r.irt = m.predict_irt(&r.parsed);
+                });
+                let id = if matches!(self, Self::Placeholder) {
+                    format!(
+                        "{} (placeholder: DeepLC deferred to the multi-head calibration)",
+                        m.identity()
+                    )
+                } else {
+                    m.identity()
+                };
+                Ok((id, Vec::new()))
+            }
+            Self::Deeplc(req) => {
+                let out = out.expect("a DeepLC request is called before it is applied");
+                let mut missing = Vec::new();
+                for (i, r) in raws.iter_mut().enumerate() {
+                    let uid = req.uniq[&r.peptidoform];
+                    match out.get(&uid) {
+                        Some(&v) => r.irt = v,
+                        None => missing.push(i),
+                    }
+                }
+                // The installed DeepLC version, not a family label: two libraries predicted by
+                // different DeepLC releases are different libraries (docs/30, model identity).
+                let version = sidecar::require_deeplc_version(&req.python)?;
+                Ok((format!("deeplc-{version}-base"), missing))
+            }
+        }
+    }
+}
+
+impl DeeplcRequest {
+    fn call(&self, p: &PredictFragParams) -> Result<HashMap<u32, f32>> {
+        sidecar::run_deeplc(
+            &self.python,
+            &self.script,
+            p.work_dir,
+            &self.ids,
+            &self.peps,
+        )
+    }
+}
+
+/// Which fragment-intensity worker a [`FragRequest`] calls.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FragModel {
+    Ms2pip,
+    Peptdeep,
+}
+
+/// A fragment-intensity sidecar request: one row per candidate.
+struct FragRequest {
+    model: FragModel,
+    python: String,
+    script: String,
+    ids: Vec<u32>,
+    peps: Vec<String>,
+    charges: Vec<i32>,
+}
+
+impl FragRequest {
+    /// `None` for the native predictor, which needs no sidecar.
+    fn new(p: &PredictFragParams, raws: &[Raw]) -> Result<Option<Self>> {
+        let (model, python, worker) = match p.cfg.predictor {
+            FragPredictorKind::Native => return Ok(None),
+            FragPredictorKind::Ms2pip => (
+                FragModel::Ms2pip,
+                p.cfg.ms2pip_python.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("predictor=ms2pip requires predict_frag.ms2pip_python")
+                })?,
+                "ms2pip_worker.py",
+            ),
+            FragPredictorKind::Peptdeep => (
+                FragModel::Peptdeep,
+                p.cfg.peptdeep_python.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("predictor=peptdeep requires predict_frag.peptdeep_python")
+                })?,
+                "peptdeep_worker.py",
+            ),
+        };
+        Ok(Some(Self {
+            model,
+            python: python.to_string(),
+            script: crate::sidecar::resolve_script(&p.cfg.sidecar_script_dir, worker),
+            ids: (0..raws.len() as u32).collect(),
+            peps: raws.iter().map(|r| r.peptidoform.clone()).collect(),
+            charges: raws.iter().map(|r| r.charge).collect(),
+        }))
+    }
+
+    fn call(&self, p: &PredictFragParams) -> Result<sidecar::FragmentIntensityMap> {
+        match self.model {
+            FragModel::Ms2pip => sidecar::run_ms2pip(
+                &self.python,
+                &self.script,
                 p.work_dir,
-                &ids,
-                &peps,
-                &charges,
+                &self.ids,
+                &self.peps,
+                &self.charges,
+                &p.cfg.ms2pip_model,
+            ),
+            FragModel::Peptdeep => sidecar::run_peptdeep(
+                &self.python,
+                &self.script,
+                p.work_dir,
+                &self.ids,
+                &self.peps,
+                &self.charges,
                 &p.cfg.peptdeep_model,
                 p.cfg.peptdeep_nce,
                 &p.cfg.peptdeep_instrument,
-            )?;
-            if map.is_empty() {
-                bail!("AlphaPeptDeep returned no predictions");
+            ),
+        }
+    }
+
+    /// Assign every fragment its intensity from the worker's predictions. Returns the model
+    /// id and the candidates the worker returned nothing for.
+    fn apply(
+        self,
+        p: &PredictFragParams,
+        raws: &mut [Raw],
+        map: sidecar::FragmentIntensityMap,
+    ) -> Result<(String, Vec<usize>)> {
+        if map.is_empty() {
+            match self.model {
+                FragModel::Ms2pip => bail!("MS2PIP returned no predictions"),
+                FragModel::Peptdeep => bail!("AlphaPeptDeep returned no predictions"),
             }
-            // Same assembly as the MS2PIP arm, and deliberately the same `ms2pip_values`:
-            // the worker always emits both fragment charges, so `model_has_charge2` holds
-            // and every fragment is on one scale. The native heuristic is passed for the
-            // same reason it is there -- it is what a charge-1-only model would fall back
-            // to -- and is unreachable while that stays true.
-            let native = NativeFrag;
-            let covered: Vec<bool> = raws
-                .par_iter_mut()
-                .enumerate()
-                .map(|(i, r)| match map.get(&(i as u32)) {
-                    Some(per) if !per.is_empty() => {
-                        let keys: Vec<(u8, u16, u8)> = r
-                            .frags
-                            .iter()
-                            .map(|fr| {
-                                (
-                                    fr.ion_type.symbol() as u8,
-                                    fr.ordinal as u16,
-                                    fr.charge.clamp(1, 255) as u8,
-                                )
-                            })
-                            .collect();
-                        let nat = native.predict_intensities(&r.parsed, &r.frags);
-                        r.frag_int = ms2pip_values(&keys, per, &nat);
-                        true
-                    }
-                    _ => {
-                        r.frag_int = vec![0.0; r.frags.len()];
-                        false
-                    }
-                })
-                .collect();
-            let missing: Vec<usize> = covered
-                .iter()
-                .enumerate()
-                .filter(|(_, &c)| !c)
-                .map(|(i, _)| i)
-                .collect();
-            let version =
-                sidecar::module_version(python, "peptdeep").unwrap_or_else(|| "unknown".into());
-            // The identity carries what changes the numbers: the model, the collision
-            // energy and the instrument. Two libraries built at different NCE are not
-            // the same library, and the manifest has to be able to say so.
-            Ok((
+        }
+        let native = NativeFrag;
+        // Parallel across rows: each row writes only its own `frag_int` and reads only its
+        // own parsed peptidoform, fragment list and worker entry. `par_iter_mut` preserves the
+        // element-to-index mapping, and the per-row float work (the native charge-2 fallback
+        // and the per-charge-group max-normalizations) is self-contained, so this is
+        // bit-identical to the serial loop. The worker call already happened -- what is
+        // parallelized here is the per-row native prediction and normalization, which is real
+        // CPU work, not sidecar wait.
+        //
+        // A candidate the worker returned nothing for is reported to the caller, which drops
+        // it with its pair; it used to receive the native heuristic silently, under a
+        // library-wide model identity (docs/29 #17). AlphaPeptDeep goes through the same
+        // `ms2pip_values`: its worker always emits both fragment charges, so
+        // `model_has_charge2` holds and every fragment is on one scale.
+        let covered: Vec<bool> = raws
+            .par_iter_mut()
+            .enumerate()
+            .map(|(i, r)| match map.get(&(i as u32)) {
+                Some(per) if !per.is_empty() => {
+                    let keys: Vec<(u8, u16, u8)> = r
+                        .frags
+                        .iter()
+                        .map(|fr| {
+                            (
+                                fr.ion_type.symbol() as u8,
+                                fr.ordinal as u16,
+                                fr.charge.clamp(1, 255) as u8,
+                            )
+                        })
+                        .collect();
+                    let nat = native.predict_intensities(&r.parsed, &r.frags);
+                    r.frag_int = ms2pip_values(&keys, per, &nat);
+                    true
+                }
+                _ => {
+                    r.frag_int = vec![0.0; r.frags.len()];
+                    false
+                }
+            })
+            .collect();
+        let missing: Vec<usize> = covered
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| !c)
+            .map(|(i, _)| i)
+            .collect();
+        let id = match self.model {
+            FragModel::Ms2pip => {
+                let version = sidecar::module_version(&self.python, "ms2pip")
+                    .unwrap_or_else(|| "unknown".into());
+                format!("ms2pip-{version}-{}", p.cfg.ms2pip_model)
+            }
+            FragModel::Peptdeep => {
+                let version = sidecar::module_version(&self.python, "peptdeep")
+                    .unwrap_or_else(|| "unknown".into());
+                // The identity carries what changes the numbers: the model, the collision
+                // energy and the instrument. Two libraries built at different NCE are not the
+                // same library, and the manifest has to be able to say so.
                 format!(
                     "peptdeep-{version}-{}-nce{}-{}",
                     p.cfg.peptdeep_model, p.cfg.peptdeep_nce, p.cfg.peptdeep_instrument
-                ),
-                missing,
-            ))
-        }
+                )
+            }
+        };
+        Ok((id, missing))
     }
 }
 

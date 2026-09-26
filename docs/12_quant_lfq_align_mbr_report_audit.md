@@ -214,9 +214,67 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    with the matching chromatograms. Changing `q_filter` does not select a run.
    `run-experiment` performs that split itself but forces `PsmQ`; see the
    gotchas.
+
+   Only the filter columns (`candidate_id`, `label`, the q column, `is_transferred`)
+   are read for every row. The identity columns that reach an output (`peptidoform`,
+   `charge`, `protein_group`, `base_peptide_id`) are read at the accepted rows only,
+   once those rows are known, and the identification apex (the first finite
+   `apex_rt` of a candidate in row order) is kept only for the candidates whose
+   chromatograms are loaded. The consensus mode's best target q per candidate is kept
+   for the same candidates. The values at every row that is used are the ones a whole
+   read gives, and so is the null and type policy; the report's
+   `candidates_with_scored_apex` still counts every candidate of the table with a
+   finite apex. On a per-run split of a large experiment most scored rows are not
+   accepted, so this removes most of quant's resident set before a chromatogram is
+   read.
 2. Group chromatogram rows by `candidate_id` into `cand_rows` (`quant.rs:301`). Rows
    whose `frag_name` starts with `ms1_` are MS1 isotope XIC pseudo-traces, not
    fragment ions; they are excluded from both peak detection and the top-N sum.
+
+   Only the accepted candidates' rows are kept (and, in consensus mode, the reliable
+   anchors'), except under `--out-peak-bounds`, which keeps every candidate and reads
+   the table as it always has. The table is read row group by row group
+   (`load_chromatograms`). A row group whose `candidate_id` statistics hold no
+   accepted id is not opened: its `[min, max]` is tested against the sorted accepted
+   ids, which is sharper than the accepted range as a whole. In an opened group the
+   `candidate_id` column is read first, and then each other column on its own
+   selection, which skips unread every data page of that column that holds no kept
+   row (the offset index gives the page boundaries; `docs/03_io_layer.md`, "Row
+   selections and page skipping"). Rows are never skipped inside a page, which in
+   parquet-rs costs more than decoding them on long traces, and a group with no whole
+   page to skip is read in one pass. The store is the one pass's, field for field, so
+   every output is byte-identical to a full read. How much is skipped depends on how
+   the accepted rows fall against the pages: on the AIF and Astral HYE tables every
+   list page holds an accepted row, so nothing is skipped and the read costs what it
+   did. `MUMDIA_QUANT_SELECTIVE_READ=0` turns the selection off, to time the two reads
+   against each other; the outputs do not change. The ignored test
+   `selective_read_on_a_real_artifact` prints, for a real table and scored table,
+   how many pages hold an accepted row and both load times.
+
+   Both chromatogram layouts are read (docs/15_data_dictionary.md, "Layout v2"). Every
+   span quant reads is a whole file or whole row groups, and a v2 span is decoded from
+   its first row by a `chromatograms::Decoder` of its own, in the single pass and in the
+   page-selective read, which reads the four v2 columns (`rt_axis`,
+   `intensity_trimmed`, `trace_offset`, `trace_len`) under the same selection as the
+   other columns. Only kept rows are decoded. That is enough because a
+   candidate is kept or dropped whole, so a kept candidate's rows in a row group include
+   the row that carries its axis. MS1 rows are checked and followed but not rebuilt,
+   since quant drops them. The store is the v1 table's, axis ids included, so every
+   output is byte-identical.
+
+   A run's chromatograms can be several tables (`QuantParams::chromatograms`, a list of
+   `ChromTable`): a grouped run under `groups.pool_chromatograms = false` hands quant its
+   bands' tables in band order, each with the overlap losers it does not contribute
+   (`docs/33_window_groups.md`, section 5). They are read in order, each without its
+   losers, and joined with the same `ChromStore::append` that joins row groups, so the
+   store and every output are the pooled table's. A candidate with rows in two tables is
+   refused, since it can only mean the losers were not given. From the command line:
+   `mumdia quant --chromatograms <band tables in band order> --overlap-losers
+   groups/overlap_losers.parquet`. The loser file's footer names its band tables, and a
+   list that differs from them in count, order, name, row count or recorded content hash
+   is refused before anything is read. The report's `chromatograms` is then the list of
+   tables, and `chromatogram_dropped_candidates` the number of losers each did not
+   contribute; for one table with no losers both read as before.
 3. **Phase 1** (only when `cfg.bound_peak`): compute a per-candidate elution
    window `(lo_rt, hi_rt, apex_rt)` via `peak_window`. Schema-v3 scored tables
    carry the exact identification apex through compete/rescore; quant anchors the
@@ -460,6 +518,19 @@ column only, and a separate stripped-sequence count is logged. `q_value` is prin
 targets with `pg_q_value <= q_threshold` (`report.rs:137`). Returns `(n_precursors,
 n_protein_groups)`.
 
+Both reports read the scored table in two passes (`printable_rows`). Pass 1 reads
+`label` as a bit per row, the transfer flag, and the q columns a row can be printed on
+(`peptide_q_value` and `pg_q_value`, plus `run_psm_q` for the experiment report's
+`n_runs`) as a fold, and keeps the targets that are transferred or at the threshold on
+one of them. Pass 2 reads the printed columns for those rows only (`TableFile::str_rows`
+and its siblings). The sorts and loops then run over the kept rows in file order, and a
+stable sort of that subsequence gives exactly their order in the stable sort of all
+rows, so both TSVs are byte-identical to the one-pass report's
+(`the_two_pass_reports_write_the_one_pass_bytes`). The one-pass read held four string
+columns for every row, estimated at about 55 GB and a billion allocations on the
+258.75M-row pooled immunopeptidomics table, to print about 10^5 rows; pass 1 holds 3
+bytes a row. A NULL in a required column is still refused wherever it is.
+
 This is a hybrid identification report: `peptides.tsv` has precursor-shaped rows
 but is filtered and labeled with peptide-level q. It is neither a stripped-peptide
 table nor a `precursor_q`-controlled precursor table. Report filtering is also
@@ -629,6 +700,18 @@ but do not affect the wired `mumdia mbr` path.
   (`run_experiment.rs:490-497`) and then ignored; no artifact records the
   substitution. Per-run quantities out of `run-experiment` are therefore gated on
   the pooled `q_value`, not on `run_psm_q` and not on the configured column.
+- **How the per-run split tables are written.** A run's rows are contiguous in the
+  pooled scored table (rescore appends each competed table in input order, and MBR
+  keeps the order), so every row group whose `source` statistics hold one run is
+  spliced into that run's `<run>/scored.parquet` as bytes, and only the boundary
+  groups, at most `n_runs - 1` of them, are decoded, filtered and re-encoded
+  (`split_by_source`). The per-run tables hold the same rows in the same order with
+  the same values as the re-encoded split that was the only path before, so quant and
+  the report are unchanged. Their bytes are not: a spliced group keeps the scored
+  table's 1,048,576-row groups, so the content hashes `experiment_manifest.json`
+  records for `scored[<run>]` differ from an earlier release's; they are computed
+  while the tables are written. A table whose `source` column is nullable (the MBR
+  worker's pyarrow output) is re-encoded as before, in 131,072-row groups.
 - **`run-experiment` produces no TSV report.** `report::run` is called only from
   `run.rs:484` and the `mumdia report` handler (`main.rs:798`), so an experiment
   output tree has scored, per-run split, quant, and LFQ artifacts but no

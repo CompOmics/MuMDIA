@@ -17,8 +17,8 @@
 //! here under the `pairwise_coelution_weighted` name only.
 use std::borrow::Cow;
 
-use super::{best_xcorr, Evidence};
-use crate::stats::pearson;
+use super::{best_xcorr_normed, xcorr_norm, Evidence};
+use crate::stats::{pearson, pearson_pairs, pearson_vs, Centered};
 
 pub const NAMES: &[&str] = &[
     "frag_ref_corr_mean",
@@ -70,12 +70,20 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let traces = &e.traces;
     let r = &e.ref_profile;
     let has_traces = traces.len() == k && k > 0;
+    // The PSM's shared pair statistics (`super::PairStats`), when they describe these
+    // traces; every read below is the value the fallback beside it computes.
+    let stats = e
+        .pair_stats
+        .as_ref()
+        .filter(|s| has_traces && s.fits(k, r.len()));
 
     // --- per-fragment ref correlation over the peak window ---
-    let rc: Vec<f64> = if has_traces {
-        (0..k).map(|i| pearson(&traces[i], r)).collect()
-    } else {
-        Vec::new()
+    // `r` centred once for every fragment (`pearson_vs` is `pearson` bit for bit).
+    let r_c = Centered::new(r);
+    let rc: Vec<f64> = match stats {
+        Some(s) => s.ref_corr().to_vec(),
+        None if has_traces => (0..k).map(|i| pearson_vs(&traces[i], r, &r_c)).collect(),
+        None => Vec::new(),
     };
 
     // matched indices (fragment observed at apex)
@@ -125,15 +133,17 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let tf = &e.traces_full;
     let has_full = tf.len() == k && k > 0 && !e.axis_full.is_empty();
     // R over the full window. This used to be a second build of the profile
-    // `interference` also builds inline, term for term the same sum; `build_evidence`
-    // now builds it once (see `super::weighted_reference_full`). It is read only under
+    // `interference` also builds inline, term for term the same sum; the Evidence build
+    // (`PeakTraces::new`, handed on by `evidence_from`) now builds it once (see
+    // `super::weighted_reference_full`). It is read only under
     // `has_full`, which requires `traces_full.len() == pred.len()` -- the condition that
     // made the two builds identical.
     //
     // The length is checked rather than assumed, for the reason `interference` gives:
     // `Evidence` is `pub` with `pub` fields, and a short profile would quietly shorten
-    // every `pearson` below instead of failing. On `build_evidence`, the one constructor,
-    // the check is a comparison and the rebuild never runs.
+    // every `pearson` below instead of failing. On `evidence_from`, the one production
+    // constructor (`build_evidence` is its test-only wrapper), the check is a comparison
+    // and the rebuild never runs.
     let r_full_owned: Cow<[f64]> = if !has_full {
         Cow::Borrowed(&[][..])
     } else if e.ref_profile_full.len() == e.axis_full.len() {
@@ -146,10 +156,20 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         ))
     };
     let r_full: &[f64] = &r_full_owned;
-    let rc_full: Vec<f64> = if has_full {
-        (0..k).map(|i| pearson(&tf[i], r_full)).collect()
-    } else {
-        Vec::new()
+    // The shared statistics correlated `traces_full` with `ref_profile_full`, so they
+    // answer only when `r_full` is that profile rather than a rebuild.
+    let full_from_stats = matches!(r_full_owned, Cow::Borrowed(_))
+        .then(|| stats.and_then(|s| s.ref_corr_full()))
+        .flatten();
+    let rc_full: Vec<f64> = match full_from_stats {
+        Some(v) if has_full => v.to_vec(),
+        _ if has_full => {
+            let r_full_c = Centered::new(r_full);
+            (0..k)
+                .map(|i| pearson_vs(&tf[i], r_full, &r_full_c))
+                .collect()
+        }
+        _ => Vec::new(),
     };
 
     // 9. frag_ref_corr_mean_full (all fragments)
@@ -159,8 +179,14 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let f_gain = mean_all(&rc) - f_mean_full;
 
     // --- pairwise Pearson (symmetric matrix) + cross-correlation over pairs ---
-    // Row-major flat k x k, one allocation instead of k. `corr[a * k + b]`.
-    let mut corr = vec![0.0f64; k * k];
+    // Row-major flat k x k, one allocation instead of k. `corr[a * k + b]`. With the
+    // shared statistics the matrix is theirs (same layout, 1.0 on the diagonal) and is
+    // not rebuilt.
+    let mut corr_owned = if stats.is_some() {
+        Vec::new()
+    } else {
+        vec![0.0f64; k * k]
+    };
     let mut pair_p: Vec<f64> = Vec::new();
     let mut pair_w: Vec<f64> = Vec::new(); // l_a * l_b weights aligned with pair_p
     let mut xvals: Vec<f64> = Vec::new();
@@ -171,16 +197,40 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let mut by_lag_sum = 0.0f64;
     let mut chg_sum = 0.0f64;
     let mut chg_cnt = 0.0f64;
+    // Each trace's cross-correlation norm once (it was recomputed for every pair and for
+    // the reference pass below); `xcorr_norm` is the expression `best_xcorr` evaluates.
+    let norms_owned: Vec<f64> = if has_traces && stats.is_none() {
+        traces.iter().take(k).map(|t| xcorr_norm(t)).collect()
+    } else {
+        Vec::new()
+    };
+    let norms: &[f64] = stats.map_or(&norms_owned[..], |s| s.norms());
+    // Every pair's Pearson from traces centred once, in the (a, b) order the loop reads.
+    let mut pairs: Vec<f64> = Vec::new();
+    if has_traces && stats.is_none() {
+        pearson_pairs(&traces[..k], &mut pairs);
+    }
+    let mut pairs = pairs.into_iter();
     if has_traces {
         for a in 0..k {
-            corr[a * k + a] = 1.0;
+            if stats.is_none() {
+                corr_owned[a * k + a] = 1.0;
+            }
             for b in (a + 1)..k {
-                let p = pearson(&traces[a], &traces[b]);
-                corr[a * k + b] = p;
-                corr[b * k + a] = p;
+                let (p, (lag, xv)) = match stats {
+                    Some(s) => (s.corr(a, b), s.xcorr(a, b)),
+                    None => {
+                        let p = pairs.next().expect("one correlation per pair");
+                        corr_owned[a * k + b] = p;
+                        corr_owned[b * k + a] = p;
+                        (
+                            p,
+                            best_xcorr_normed(&traces[a], &traces[b], MAXLAG, norms[a], norms[b]),
+                        )
+                    }
+                };
                 pair_p.push(p);
                 pair_w.push(e.pred[a] * e.pred[b]);
-                let (lag, xv) = best_xcorr(&traces[a], &traces[b], MAXLAG);
                 xvals.push(xv);
                 xlags.push(lag as f64);
                 // b x y cross pairs
@@ -227,8 +277,9 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let half = k / 2;
     let hi_idx: Vec<usize> = order.iter().take(half).cloned().collect();
     let lo_idx: Vec<usize> = order.iter().skip(k - half).cloned().collect();
-    let f_hi = subset_pair_mean(&corr, k, &hi_idx);
-    let f_lo = subset_pair_mean(&corr, k, &lo_idx);
+    let corr: &[f64] = stats.map_or(&corr_owned[..], |s| s.corr_matrix());
+    let f_hi = subset_pair_mean(corr, k, &hi_idx);
+    let f_lo = subset_pair_mean(corr, k, &lo_idx);
     let f_contrast = f_hi - f_lo;
 
     // 19. coelution_corr_entropy: histogram of pairwise pearson in [-1,1]
@@ -265,8 +316,9 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let mut ref_lag_abs: Vec<f64> = Vec::new();
     let mut ref_xval: Vec<f64> = Vec::new();
     if has_traces {
-        for trace in traces.iter().take(k) {
-            let (lag, xv) = best_xcorr(trace, r, MAXLAG);
+        let norm_r = xcorr_norm(r);
+        for (trace, &norm_t) in traces.iter().take(k).zip(norms) {
+            let (lag, xv) = best_xcorr_normed(trace, r, MAXLAG, norm_t, norm_r);
             ref_lag_abs.push((lag as f64).abs());
             ref_xval.push(xv);
         }
@@ -301,7 +353,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     let f_sum_corr = if s_trace.is_empty() {
         0.0
     } else {
-        pearson(&s_trace, r)
+        pearson_vs(&s_trace, r, &r_c)
     };
 
     // 32-33. leave-one-out ref correlation: R^{-f} = R - pred[f]*traces[f]
@@ -454,46 +506,24 @@ fn std_pop(v: &[f64]) -> f64 {
     }
 }
 
+/// Median by selection (`super::median_select`), bit-identical to the sorted copy it
+/// replaced; 0 for an empty `v`.
 fn median(v: &[f64]) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
-    let mut s = v.to_vec();
-    s.sort_by(|a, b| a.total_cmp(b));
-    let n = s.len();
-    if n % 2 == 1 {
-        s[n / 2]
-    } else {
-        0.5 * (s[n / 2 - 1] + s[n / 2])
-    }
+    super::median_select(&mut v.to_vec())
 }
 
-fn quantile_sorted(s: &[f64], q: f64) -> f64 {
-    let n = s.len();
-    if n == 0 {
-        return 0.0;
-    }
-    if n == 1 {
-        return s[0];
-    }
-    let pos = q * (n - 1) as f64;
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil() as usize;
-    if lo == hi {
-        s[lo]
-    } else {
-        let frac = pos - lo as f64;
-        s[lo] * (1.0 - frac) + s[hi] * frac
-    }
-}
-
+/// Interquartile range by selection (`super::quantile_select`), bit-identical to the two
+/// quantiles of the sorted copy it replaced; 0 below two values.
 fn iqr(v: &[f64]) -> f64 {
     if v.len() < 2 {
         return 0.0;
     }
     let mut s = v.to_vec();
-    s.sort_by(|a, b| a.total_cmp(b));
-    quantile_sorted(&s, 0.75) - quantile_sorted(&s, 0.25)
+    let q75 = super::quantile_select(&mut s, 0.75);
+    q75 - super::quantile_select(&mut s, 0.25)
 }
 
 fn argmax(v: &[f64]) -> usize {

@@ -64,9 +64,9 @@ Commands:
 
 Options:
       --threads <N>
-          Maximum worker threads. Default: every core.
+          Worker threads of the engine's thread pools. Default: every core.
 
-          Bounds the engine's rayon pool and is forwarded to the Python sidecars as `MUMDIA_NN_THREADS` and `OMP_NUM_THREADS` unless those are already set. Without this there was no way to bound MuMDIA at all except the undocumented `RAYON_NUM_THREADS`, which the engine never read and which does not reach the sidecars; on a shared machine that made a run antisocial. Note the NN rescore worker measured FASTER on 8 threads than on 32 (docs/13_sidecars.md).
+          Sets the engine's rayon pool to N threads and the parquet codec pool to min(N, 8) threads, serial at N = 1 (docs/03_io_layer.md, "Parallel column codec"). The codec pool encodes and decodes artifacts for writer and loader threads that run beside the rayon pool, so up to N + min(N, 8) threads can be busy at once; add `MUMDIA_PARQUET_THREADS=1` to keep the parquet codec serial and the run near N threads. N is also forwarded to the Python sidecars as `MUMDIA_NN_THREADS` and `OMP_NUM_THREADS` unless those are already set. Without this there was no way to bound MuMDIA at all except the undocumented `RAYON_NUM_THREADS`, which the engine never read and which does not reach the sidecars; on a shared machine that made a run antisocial. Note the NN rescore worker measured FASTER on 8 threads than on 32 (docs/13_sidecars.md).
 
       --log-level <LEVEL>
           Log level: `error`, `warn`, `info` (default), `debug`, or `trace`. Accepts any `RUST_LOG` filter, so `mumdia=debug,extract=trace` also works
@@ -96,7 +96,7 @@ readable, as is `-h, --help`, which every subcommand also accepts.
 |---|---|
 | `--log-level <LEVEL>` | Log level: `error`, `warn`, `info` (default), `debug`, or `trace`. Accepts any `RUST_LOG` filter, so `mumdia=debug,extract=trace` also works |
 | `-q, --quiet` | Warnings and errors only. Overridden by --log-level |
-| `--threads <N>` | Maximum worker threads. Default: every core. Bounds the engine's rayon pool and is forwarded to the Python sidecars as `MUMDIA_NN_THREADS` and `OMP_NUM_THREADS` unless those are already set. Without this there was no way to bound MuMDIA at all except the undocumented `RAYON_NUM_THREADS`, which the engine never read and which does not reach the sidecars; on a shared machine that made a run antisocial. Note the NN rescore worker measured FASTER on 8 threads than on 32 (docs/13_sidecars.md). |
+| `--threads <N>` | Worker threads of the engine's thread pools. Default: every core. Sets the engine's rayon pool to N threads and the parquet codec pool to min(N, 8) threads, serial at N = 1 (docs/03_io_layer.md, "Parallel column codec"). The codec pool encodes and decodes artifacts for writer and loader threads that run beside the rayon pool, so up to N + min(N, 8) threads can be busy at once; add `MUMDIA_PARQUET_THREADS=1` to keep the parquet codec serial and the run near N threads. N is also forwarded to the Python sidecars as `MUMDIA_NN_THREADS` and `OMP_NUM_THREADS` unless those are already set. Without this there was no way to bound MuMDIA at all except the undocumented `RAYON_NUM_THREADS`, which the engine never read and which does not reach the sidecars; on a shared machine that made a run antisocial. Note the NN rescore worker measured FASTER on 8 threads than on 32 (docs/13_sidecars.md). |
 | `-v, --verbose...` | More detail: `-v` for debug, `-vv` for trace. Overridden by --log-level |
 | `-h, --help` | Print help (see a summary with '-h') |
 
@@ -111,9 +111,9 @@ Options:
           Warnings and errors only. Overridden by --log-level
 
       --threads <N>
-          Maximum worker threads. Default: every core.
+          Worker threads of the engine's thread pools. Default: every core.
 
-          Bounds the engine's rayon pool and is forwarded to the Python sidecars as `MUMDIA_NN_THREADS` and `OMP_NUM_THREADS` unless those are already set. Without this there was no way to bound MuMDIA at all except the undocumented `RAYON_NUM_THREADS`, which the engine never read and which does not reach the sidecars; on a shared machine that made a run antisocial. Note the NN rescore worker measured FASTER on 8 threads than on 32 (docs/13_sidecars.md).
+          Sets the engine's rayon pool to N threads and the parquet codec pool to min(N, 8) threads, serial at N = 1 (docs/03_io_layer.md, "Parallel column codec"). The codec pool encodes and decodes artifacts for writer and loader threads that run beside the rayon pool, so up to N + min(N, 8) threads can be busy at once; add `MUMDIA_PARQUET_THREADS=1` to keep the parquet codec serial and the run near N threads. N is also forwarded to the Python sidecars as `MUMDIA_NN_THREADS` and `OMP_NUM_THREADS` unless those are already set. Without this there was no way to bound MuMDIA at all except the undocumented `RAYON_NUM_THREADS`, which the engine never read and which does not reach the sidecars; on a shared machine that made a run antisocial. Note the NN rescore worker measured FASTER on 8 threads than on 32 (docs/13_sidecars.md).
 
   -v, --verbose...
           More detail: `-v` for debug, `-vv` for trace. Overridden by --log-level
@@ -462,6 +462,9 @@ Options:
 
       --out <OUT>
 
+      --work-dir <WORK_DIR>
+          Directory for a sidecar classifier's files: the feature handoff, the fold keys, the worker's output and its streaming memmap. Default: `MUMDIA_SIDECAR_DIR` when set, else `sidecar_work` in the current directory. The files are removed once the scores are read back, unless `MUMDIA_KEEP_HANDOFF=1`
+
       --config <CONFIG>
 ```
 
@@ -472,12 +475,16 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ```text
 Quantify identified peptides + roll up to protein groups
 
-Usage: mumdia quant [OPTIONS] --psms-scored <PSMS_SCORED> --chromatograms <CHROMATOGRAMS> --out-peptide <OUT_PEPTIDE> --out-protein <OUT_PROTEIN>
+Usage: mumdia quant [OPTIONS] --psms-scored <PSMS_SCORED> --chromatograms <CHROMATOGRAMS>... --out-peptide <OUT_PEPTIDE> --out-protein <OUT_PROTEIN>
 
 Options:
       --psms-scored <PSMS_SCORED>
 
-      --chromatograms <CHROMATOGRAMS>
+      --chromatograms <CHROMATOGRAMS>...
+          The run's chromatogram table, or a grouped run's band tables in band order (`groups/gNN/chromatograms.parquet`) when it did not pool them
+
+      --overlap-losers <OVERLAP_LOSERS>
+          A grouped run's `groups/overlap_losers.parquet`: the candidates each band table does not contribute, because the pool's overlap dedup gave them to another band. Its `band` column indexes the `--chromatograms` list, which must be the band tables the file names, in its order (a mismatch is refused)
 
       --out-peptide <OUT_PEPTIDE>
 
