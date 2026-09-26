@@ -767,6 +767,41 @@ fn sweep_stale_partials(out_dir: &Path, out: &Path) {
     }
 }
 
+/// Convert every vendor input among `inputs` to mzML, at most
+/// `cfg.parallel_conversions` at once, and return the mzML paths in input order.
+///
+/// `run` and `run-experiment` convert all of their inputs before the first run starts,
+/// and did so one after another, so an experiment of N vendor files paid N converter
+/// runs of several minutes each before any search began (perf survey critic item 4).
+/// Each conversion is its own child process writing its own destination under its own
+/// conversion lock, so running several at once changes nothing but the wall time: the
+/// returned paths, and the files behind them, are what the serial loop produced. An
+/// mzML input passes through without taking a slot.
+///
+/// A failure is reported for the FIRST failing input in input order, as the serial loop
+/// did, and no conversion is started after one has failed. Conversions already running
+/// are allowed to finish, because killing a converter mid-write only leaves a partial
+/// file for the next run to sweep; a finished one is simply reused by that run.
+pub fn ensure_mzml_all(
+    inputs: &[String],
+    cfg: &ConvertConfig,
+    fallback_dir: Option<&Path>,
+) -> Result<Vec<String>> {
+    let vendor = inputs
+        .iter()
+        .filter(|m| detect(m).needs_conversion())
+        .count();
+    let limit = cfg.parallel_conversions.max(1).min(vendor.max(1));
+    if vendor > 1 && limit > 1 {
+        info!(
+            vendor_inputs = vendor,
+            at_once = limit,
+            "convert: converting the vendor inputs concurrently (convert.parallel_conversions)"
+        );
+    }
+    crate::sched::map_bounded(inputs, limit, |m| ensure_mzml(m, cfg, fallback_dir))
+}
+
 pub fn ensure_mzml(
     input: &str,
     cfg: &ConvertConfig,
@@ -1314,6 +1349,7 @@ mod tests {
             msconvert: "/definitely/not/here".to_string(),
             msconvert_args: Vec::new(),
             reuse_converted: true,
+            parallel_conversions: 4,
         };
         assert_eq!(ensure_mzml("run.mzML", &cfg, None).unwrap(), "run.mzML");
     }
@@ -1518,6 +1554,7 @@ mod tests {
             msconvert: "auto".to_string(),
             msconvert_args: Vec::new(),
             reuse_converted: false,
+            parallel_conversions: 4,
         };
         let err = ensure_mzml(raw.to_str().unwrap(), &cfg, Some(&d)).unwrap_err();
         let msg = err.to_string();
@@ -1583,5 +1620,39 @@ mod tests {
         assert!(!stem_is_ambiguous(&e, "sample", &only));
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&e);
+    }
+
+    #[test]
+    fn converting_many_inputs_returns_the_serial_paths_in_order() {
+        // Reused conversions and mzML inputs, which need no converter, through the
+        // concurrent entry point: the paths must be exactly the serial loop's.
+        let d = tmp("ensure-all");
+        let mut inputs = Vec::new();
+        for name in ["a", "b", "c"] {
+            let raw = d.join(format!("{name}.raw"));
+            std::fs::write(&raw, b"x").unwrap();
+            inputs.push(raw.to_string_lossy().into_owned());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for name in ["a", "b", "c"] {
+            std::fs::write(d.join(format!("{name}.mzML")), b"converted").unwrap();
+        }
+        inputs.insert(1, "plain.mzML".to_string());
+        let cfg = ConvertConfig {
+            thermo_raw_parser: "/definitely/not/here".to_string(),
+            msconvert: "/definitely/not/here".to_string(),
+            msconvert_args: Vec::new(),
+            reuse_converted: true,
+            parallel_conversions: 3,
+        };
+        let serial: Vec<String> = inputs
+            .iter()
+            .map(|m| ensure_mzml(m, &cfg, Some(&d)).unwrap())
+            .collect();
+        let concurrent = ensure_mzml_all(&inputs, &cfg, Some(&d)).unwrap();
+        assert_eq!(serial, concurrent);
+        assert_eq!(concurrent[1], "plain.mzML");
+        assert!(concurrent[3].ends_with("c.mzML"), "{}", concurrent[3]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

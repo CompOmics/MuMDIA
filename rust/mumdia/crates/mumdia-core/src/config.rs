@@ -332,6 +332,18 @@ pub struct ConvertConfig {
     /// pay for it twice. Turn it off when the neighbouring mzML may have come from
     /// a different converter or a different `.raw` of the same name.
     pub reuse_converted: bool,
+    /// How many vendor files `run` and `run-experiment` convert to mzML at once. Default 4.
+    ///
+    /// Every vendor input is converted before the first run starts, and the conversions
+    /// used to run one after another, so an experiment of N `.raw` files paid N converter
+    /// runs of several minutes each on the critical path. Each conversion is a separate
+    /// child process writing its own destination under its own lock, and its output does
+    /// not depend on what else runs beside it, so running them concurrently changes the
+    /// wall time only. The bound is there because a converter reads a multi-GB file and
+    /// writes a larger one: more at once than the disk can feed is slower, not faster.
+    /// `1` converts one at a time, as before. Only the first conversion of an input pays
+    /// this at all; `reuse_converted` skips the rest. Not measured at scale.
+    pub parallel_conversions: usize,
 }
 impl Default for ConvertConfig {
     fn default() -> Self {
@@ -340,6 +352,7 @@ impl Default for ConvertConfig {
             msconvert: "auto".to_string(),
             msconvert_args: Vec::new(),
             reuse_converted: true,
+            parallel_conversions: 4,
         }
     }
 }
@@ -566,6 +579,34 @@ pub struct PredictFragConfig {
     /// reuses it as `--lib-precursors` elsewhere. Validate by comparing `psms_scored.parquet`
     /// against a default FASTA run (on CPU, where DeepLC's base prediction is deterministic).
     pub defer_deeplc_to_multihead: bool,
+    /// A directory in which `run` and `run-experiment` keep the library they build from a
+    /// FASTA, and reuse it on a later run. Unset (default): every FASTA run builds its
+    /// library, as before.
+    ///
+    /// A FASTA-mode run digests, expands peptidoforms and predicts the library on every
+    /// invocation, and one `run` per file is the way to search files separately, so each
+    /// file paid the whole build again (about an hour of predict-frag on the
+    /// 9.8M-peptidoform HYE library). Set, the orchestrator looks the library up under a key
+    /// of everything that determines it: the FASTA's content hash, the `digest`,
+    /// `peptidoforms` and `predict_frag` sections (all but this field), `rng_seed`, whether
+    /// the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep or
+    /// DeepLC version the build uses, the worker scripts' content and the running
+    /// executable's content. A hit is copied to the paths a build writes (a byte copy, never
+    /// a hard link, and checked against the blake3 recorded when it was stored) and digest,
+    /// peptidoforms and predict-frag are skipped; a miss is built and then stored. When a
+    /// predictor version cannot be read, nothing is looked up or stored. The run stays in
+    /// FASTA mode, so every other decision is the one a rebuild makes.
+    ///
+    /// A hit is byte-identical to a rebuild when the build is deterministic, which the
+    /// native predictors are; with a sidecar predictor it reuses the stored prediction. The
+    /// manifest records the two library tables with the stage `library-cache`, and the run
+    /// directory then holds no `peptides.parquet` or `peptidoforms.parquet` (an earlier
+    /// build's are removed). Validate by running one FASTA search twice with the same cache
+    /// directory and comparing `peptides.tsv` and `proteins.tsv` (the smoke test does this).
+    /// A stored entry whose files changed is rebuilt and replaced, and temporary
+    /// directories left by a killed store are removed after an hour; entries themselves are
+    /// never deleted by the engine, so remove the directory to reclaim the space.
+    pub library_cache: Option<String>,
 }
 impl Default for PredictFragConfig {
     fn default() -> Self {
@@ -584,6 +625,7 @@ impl Default for PredictFragConfig {
             deeplc_python: None,
             sidecar_script_dir: "scripts".to_string(),
             defer_deeplc_to_multihead: false,
+            library_cache: None,
         }
     }
 }
@@ -1968,11 +2010,34 @@ pub enum Handoff {
     Raw,
 }
 
+/// `experiment.parallel_runs`: a count, or `"auto"`, which is stored as `0`.
+///
+/// Stored as a plain `usize` so the canonical configuration (and with it the config hash)
+/// of every existing setting is unchanged, and so the settings form keeps it a number.
+fn de_parallel_runs<'de, D>(d: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Runs {
+        Count(usize),
+        Word(String),
+    }
+    match Runs::deserialize(d)? {
+        Runs::Count(n) => Ok(n),
+        Runs::Word(w) if w.trim().eq_ignore_ascii_case("auto") => Ok(0),
+        Runs::Word(w) => Err(serde::de::Error::custom(format!(
+            "experiment.parallel_runs must be a number of runs or \"auto\" (got \"{w}\")"
+        ))),
+    }
+}
+
 /// Options for the experiment-wide orchestrator (`mumdia run-experiment`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExperimentConfig {
-    /// How many per-run search chains to execute concurrently.
+    /// How many per-run search chains to execute concurrently, or `"auto"`.
     ///
     /// 1 (default) is strictly sequential, i.e. the historical behaviour. Runs are
     /// independent, so raising this scales nearly linearly in wall time, but EACH
@@ -1980,7 +2045,32 @@ pub struct ExperimentConfig {
     /// library), so the practical ceiling is memory, not cores. Raise it deliberately
     /// after checking peak RSS for a single run; 2-4 is a reasonable start on a
     /// large-memory machine. Results are unaffected: chunks are processed in index
-    /// order and completion order never reaches the output.
+    /// order and completion order never reaches the output. An explicit number runs the
+    /// chains in chunks of that size on the engine's one thread pool, as it always has.
+    ///
+    /// `"auto"` (also written `0`) sizes the concurrency from the thread budget: at most
+    /// one run per 16 threads of `--threads`, and never more than the runs left. Each
+    /// concurrent chain then runs in a thread pool of its own, `threads / runs` wide, so
+    /// extract's fan-out and the feature loaders are sized to that run's share instead of
+    /// each to the whole pool, and a run starts as soon as a slot is free rather than at a
+    /// chunk boundary. On Linux the conversions, the seeds and the chains are each bounded
+    /// by memory: the first of them runs alone, from a reset high-water mark
+    /// (`/proc/self/clear_refs`), and the rest run at most
+    /// `0.7 x (available + resident) / peak` at once, where the peak is the process's
+    /// `VmHWM` after that step and `available` is `MemAvailable`, lowered to the headroom
+    /// of the process's memory cgroup (a container's or a batch job's limit) when that is
+    /// smaller. The peak counts this process only, not its child processes, so chains that
+    /// each run their own DeepLC adaptation (`rt_library_scope = per_run`) run one at a
+    /// time under `"auto"`; give a number to run such chains concurrently. Elsewhere there
+    /// is no memory reading, and the log says the sizing used threads only. Because of the
+    /// reset, a lifetime peak read from the process's resource usage (`/usr/bin/time -v`)
+    /// covers only the time since the last measured step; measure an `"auto"` experiment's
+    /// memory with a sampling profiler (`bench/mem_profile.py`). The rows are the same as at
+    /// `1`; a stage inside a narrower pool can lay out its intermediate files differently,
+    /// as a different `--threads` does. Hence opt-in. To validate on a host, run one
+    /// experiment at `1` and at `"auto"` and compare `peptides.tsv` and `proteins.tsv`. Not
+    /// measured at scale.
+    #[serde(deserialize_with = "de_parallel_runs")]
     pub parallel_runs: usize,
     /// How often the library's retention times are adapted to a run: once on the first
     /// run and reused (`first_run_only`, the default) or separately for every run
@@ -2676,7 +2766,10 @@ impl Config {
                 "extract.presence_min_fragments",
                 self.extract.presence_min_fragments,
             ),
-            ("experiment.parallel_runs", self.experiment.parallel_runs),
+            (
+                "convert.parallel_conversions",
+                self.convert.parallel_conversions,
+            ),
             ("rescore.seeds", self.rescore.seeds),
             ("groups.window_groups", self.groups.window_groups),
             ("groups.parallel", self.groups.parallel),
@@ -3119,6 +3212,25 @@ mod tests {
     }
 
     #[test]
+    fn experiment_parallel_runs_accepts_auto_as_zero() {
+        // "auto" is stored as 0, so the canonical JSON of every numeric setting, and so
+        // its config hash, is what it was before the word existed.
+        for text in [
+            r#"{"experiment":{"parallel_runs":"auto"}}"#,
+            r#"{"experiment":{"parallel_runs":"AUTO"}}"#,
+            r#"{"experiment":{"parallel_runs":0}}"#,
+        ] {
+            let c = Config::from_json(text).expect("auto parses");
+            assert_eq!(c.experiment.parallel_runs, 0, "{text}");
+        }
+        let err = Config::from_json(r#"{"experiment":{"parallel_runs":"many"}}"#)
+            .expect_err("an unknown word is refused");
+        assert!(err.to_string().contains("parallel_runs"), "{err}");
+        let three = Config::from_json(r#"{"experiment":{"parallel_runs":3}}"#).unwrap();
+        assert!(three.canonical_json().contains(r#""parallel_runs":3"#));
+    }
+
+    #[test]
     fn default_roundtrips() {
         let c = Config::default();
         let j = serde_json::to_string(&c).unwrap();
@@ -3179,7 +3291,7 @@ mod tests {
             r#"{"rt_im_train":{"window_holdout_frac":1.0}}"#,
             r#"{"rt_im_train":{"p_rt":0.0}}"#,
             r#"{"search_seed":{"min_matched_peaks":0}}"#,
-            r#"{"experiment":{"parallel_runs":0}}"#,
+            r#"{"convert":{"parallel_conversions":0}}"#,
             r#"{"rescore":{"train_neg_ratio":-1.0}}"#,
             r#"{"predict_frag":{"top_n_fragments":0}}"#,
             // docs/30 R5: the five values the follow-up review found still accepted.

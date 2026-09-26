@@ -108,6 +108,35 @@ echo "=== smoke: run again for determinism"
     --out-dir "$work/out2" --config "$cfg" --threads 2 > "$work/run2.log" 2>&1 \
     || { tail -20 "$work/run2.log"; exit 1; }
 
+# 4a. `predict_frag.library_cache`: the first FASTA run builds the library and stores it,
+#     the second finds it and skips digest, peptidoforms and predict-frag. Both must give
+#     the plain run's TSVs byte for byte, and a plain FASTA run names the --lib-* reuse.
+echo "=== smoke: FASTA library reused through predict_frag.library_cache"
+grep -q "to search another file against this library without building it again" "$work/run2.log" \
+    || { echo "a FASTA run did not print the --lib-* reuse hint"; exit 1; }
+"$PY" - "$cfg" "$work/libcache.json" "$work/libcache" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("predict_frag", {})["library_cache"] = sys.argv[3]
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+for arm in cache_store cache_hit; do
+    "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+        --out-dir "$work/out_$arm" --config "$work/libcache.json" --threads 2 \
+        > "$work/$arm.log" 2>&1 || { tail -20 "$work/$arm.log"; echo "library-cache arm $arm failed"; exit 1; }
+    for f in peptides.tsv proteins.tsv; do
+        cmp -s "$work/out/$f" "$work/out_$arm/$f" \
+            || { echo "library-cache arm $arm changed $f"; exit 1; }
+    done
+done
+grep -q "library cache: stored this library" "$work/cache_store.log" \
+    || { echo "the first cached run did not store its library"; exit 1; }
+grep -q "library cache: reusing the stored library" "$work/cache_hit.log" \
+    || { echo "the second cached run did not reuse the stored library"; exit 1; }
+[ ! -e "$work/out_cache_hit/peptides.parquet" ] \
+    || { echo "the cache hit ran the digest anyway"; exit 1; }
+echo "    ok: stored, reused (digest skipped), both byte-identical to the plain run"
+
 # 4b. A malformed retention time must not abort the run.
 #
 #     Regression test for a reproduced crash: one `NaN` scan start time in one scan of
@@ -438,12 +467,56 @@ while read -r f; do
 done < "$work/exp_files.txt"
 [ "$n_tables" -ge 20 ] \
     || { echo "only $n_tables experiment tables compared; expected at least 20"; exit 1; }
+# `parallel_runs = "auto"`: the other scheduler (one run per 16 threads, each chain in a
+# thread pool of its own, pulled from a queue), over THREE runs against a three-run
+# sequential experiment. At --threads 32 the plan is two at once in two 16-thread pools.
+# On Linux the first conversion, seed and chain each run alone to be measured, so a third
+# run is what leaves two for the pooled path to run concurrently; on Windows (no memory
+# reading) all three phases run two at once from the start. Every table must still be the
+# sequential experiment's.
+cp "$work/fixture.mzML" "$work/fixture_c.mzML"
+"$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" --mzml "$work/fixture_c.mzML" \
+    --run-names a --run-names b --run-names c \
+    --out-dir "$work/exp3" --config "$cfg" > "$work/exp3.log" 2>&1 \
+    || { tail -30 "$work/exp3.log"; echo "the three-run sequential experiment failed"; exit 1; }
+"$PY" - "$cfg" "$work/exp_auto.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("experiment", {})["parallel_runs"] = "auto"
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+"$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" --mzml "$work/fixture_c.mzML" \
+    --run-names a --run-names b --run-names c --threads 32 \
+    --out-dir "$work/exp_auto" --config "$work/exp_auto.json" > "$work/exp_auto.log" 2>&1 \
+    || { tail -30 "$work/exp_auto.log"; echo "run-experiment with parallel_runs = auto failed"; exit 1; }
+grep "each in a pool of its own (parallel_runs = auto)" "$work/exp_auto.log" \
+    | grep -q "parallel_runs=2" \
+    || { grep "parallel_runs" "$work/exp_auto.log"; \
+         echo "parallel_runs = auto did not run two chains at once in their own pools"; exit 1; }
+(cd "$work/exp3" && find . -type f \( -name '*.parquet' -o -name '*.tsv' \) | sort) \
+    > "$work/exp3_files.txt"
+(cd "$work/exp_auto" && find . -type f \( -name '*.parquet' -o -name '*.tsv' \) | sort) \
+    > "$work/exp_auto_files.txt"
+diff "$work/exp3_files.txt" "$work/exp_auto_files.txt" > /dev/null \
+    || { echo "parallel_runs = auto wrote a different set of tables"; \
+         diff "$work/exp3_files.txt" "$work/exp_auto_files.txt"; exit 1; }
+n_auto=0
+while read -r f; do
+    cmp -s "$work/exp3/$f" "$work/exp_auto/$f" \
+        || { echo "parallel_runs = auto changed $f"; exit 1; }
+    n_auto=$((n_auto + 1))
+done < "$work/exp3_files.txt"
 printf 'this is not an mzML file\n' > "$work/fixture_bad.mzML"
-for exp_cfg in "$cfg" "$work/exp_par.json"; do
+for exp_cfg in "$cfg" "$work/exp_par.json" "$work/exp_auto.json"; do
     rm -rf "$work/exp_fail"
+    # auto sizes from the thread budget, so give it the budget that runs two at once.
+    threads_arg=()
+    if [ "$exp_cfg" = "$work/exp_auto.json" ]; then threads_arg=(--threads 32); fi
     if "$BIN" run-experiment --fasta test_data/fixture.fasta \
         --mzml "$work/fixture.mzML" --mzml "$work/fixture_bad.mzML" \
-        --run-names a --run-names b \
+        --run-names a --run-names b ${threads_arg[@]+"${threads_arg[@]}"} \
         --out-dir "$work/exp_fail" --config "$exp_cfg" > "$work/exp_fail.log" 2>&1; then
         echo "run-experiment accepted an mzML it cannot convert ($exp_cfg)"; exit 1
     fi
@@ -456,7 +529,7 @@ for exp_cfg in "$cfg" "$work/exp_par.json"; do
             || { echo "run a reached $f although run b's conversion failed ($exp_cfg)"; exit 1; }
     done
 done
-echo "    ok: $n_tables tables byte-identical under parallel_runs = 2; a failed conversion stops before any seed"
+echo "    ok: $n_tables tables byte-identical under parallel_runs = 2, $n_auto over three runs under auto; a failed conversion stops before any seed"
 
 # 5c. The DeepLC branches of the orchestrators, with a stub worker.
 #

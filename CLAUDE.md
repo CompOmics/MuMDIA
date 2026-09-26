@@ -88,7 +88,13 @@ Key semantics:
   together by default (one pooled FDR, per-run quant, cross-run LFQ). Searching
   files separately is the opt-in: one `run` per file. `run` always recomputes and
   overwrites its named outputs; the manifest is provenance, not a cache or resume
-  database. Use a fresh output directory.
+  database. Use a fresh output directory. The one opt-in exception is
+  `predict_frag.library_cache`: a FASTA-mode run then reuses a library an earlier run
+  stored under a key of the FASTA hash, the build settings, the predictor versions and
+  the engine binary, and skips digest, peptidoforms and predict-frag
+  (`library_cache.rs`). Without it, a FASTA run logs the `--lib-*` command, with the
+  `rt_im_train.library_irt` value that keeps its retention-time handling, that would
+  reuse the library it just built.
 - Standalone stages can be reused manually because inputs are path-addressable.
 - Both `convert` and `run` default `--top-peaks-ms2` to `0` (uncapped). The cap
   is destructive: `convert.rs:76-79` keeps only the top N peaks per MS2 spectrum
