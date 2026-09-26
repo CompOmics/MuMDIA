@@ -79,6 +79,133 @@ pub fn est_precursors(stats: &[RowGroupStats], lo: f64, hi: f64) -> f64 {
 /// still belongs to a group (its scans are read by that group's extract and simply find no
 /// candidate). Groups that would select no precursor at all are merged into their neighbour,
 /// so every band a caller loads is non-empty; `n` is therefore an upper bound.
+/// Isolation windows in the order a [`Plan`] indexes them: by lower bound, then upper.
+fn sorted_windows(windows: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut w = windows.to_vec();
+    w.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    w
+}
+
+/// The `bands`, `est_unselectable` and `est_duplicated` members of a run's `plan.json`.
+/// [`plan_from_json`] reads back exactly what this writes.
+pub fn plan_json(plan: &Plan) -> serde_json::Value {
+    serde_json::json!({
+        "est_unselectable": plan.est_unselectable,
+        "est_duplicated": plan.est_duplicated,
+        "bands": plan.bands.iter().map(|b| serde_json::json!({
+            "index": b.index, "mz_lo": b.mz_lo, "mz_hi": b.mz_hi,
+            "windows": b.windows, "est_precursors": b.est_precursors,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Rebuild the [`Plan`] another run wrote to its `plan.json`, for THIS run's isolation
+/// windows.
+///
+/// A run that reuses another run's adapted band libraries (`run-experiment` under
+/// `experiment.rt_library_scope = first_run_only`) must search the bands that run planned:
+/// the band files carry that plan's row spans and candidate-id offsets. Re-planning is not
+/// guaranteed to give the same cuts, because under `groups.balance = cost` the weights
+/// follow each run's MS2 peak density. Measured on the six HYE Astral files at 16 bands, run
+/// 2 moved window 125 from band 10 to band 9; with run 1's band files that doubled what the
+/// experiment extracted (10.2M candidates against 5.0M), put candidates in two band tables
+/// and failed quant.
+///
+/// Errors when the plan does not fit these windows: a band whose window indices are out of
+/// range, not contiguous or not in order, or whose m/z bounds are not exactly those of its
+/// windows. Two acquisitions with different isolation schemes cannot share bands.
+pub fn plan_from_json(value: &serde_json::Value, windows: &[(f64, f64)]) -> Result<Plan> {
+    let windows = sorted_windows(windows);
+    let num = |v: &serde_json::Value, what: &str| -> Result<f64> {
+        v.as_f64()
+            .with_context(|| format!("plan.json: {what} is not a number"))
+    };
+    let bands_v = value
+        .get("bands")
+        .and_then(|b| b.as_array())
+        .context("plan.json has no bands array")?;
+    let mut bands = Vec::with_capacity(bands_v.len());
+    let mut next_window = 0usize;
+    for (pos, b) in bands_v.iter().enumerate() {
+        let index = b
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .context("plan.json: a band has no index")? as usize;
+        if index != pos {
+            bail!("plan.json: band {pos} carries index {index}");
+        }
+        let idx: Vec<usize> = b
+            .get("windows")
+            .and_then(|v| v.as_array())
+            .context("plan.json: a band has no windows")?
+            .iter()
+            .map(|w| {
+                w.as_u64()
+                    .map(|w| w as usize)
+                    .context("plan.json: a window index is not an integer")
+            })
+            .collect::<Result<_>>()?;
+        let (Some(&first), Some(&last)) = (idx.first(), idx.last()) else {
+            bail!("plan.json: band {index} has no windows");
+        };
+        if first != next_window || idx.iter().zip(first..).any(|(&w, want)| w != want) {
+            bail!("plan.json: band {index} does not continue the window order at {next_window}");
+        }
+        if last >= windows.len() {
+            bail!(
+                "plan.json: band {index} names window {last}, but this run has {} windows",
+                windows.len()
+            );
+        }
+        let mz_lo = num(b.get("mz_lo").unwrap_or(&serde_json::Value::Null), "mz_lo")?;
+        let mz_hi = num(b.get("mz_hi").unwrap_or(&serde_json::Value::Null), "mz_hi")?;
+        let lo = windows[first].0;
+        let hi = windows[first..=last]
+            .iter()
+            .map(|w| w.1)
+            .fold(f64::MIN, f64::max);
+        if mz_lo.to_bits() != lo.to_bits() || mz_hi.to_bits() != hi.to_bits() {
+            bail!(
+                "plan.json: band {index} spans m/z {mz_lo}-{mz_hi}, but its windows span                  {lo}-{hi} in this run"
+            );
+        }
+        let est_precursors = num(
+            b.get("est_precursors").unwrap_or(&serde_json::Value::Null),
+            "est_precursors",
+        )?;
+        bands.push(Band {
+            index,
+            mz_lo,
+            mz_hi,
+            windows: idx,
+            est_precursors,
+        });
+        next_window = last + 1;
+    }
+    if next_window != windows.len() {
+        bail!(
+            "plan.json covers {next_window} windows, but this run has {}",
+            windows.len()
+        );
+    }
+    Ok(Plan {
+        bands,
+        windows,
+        est_unselectable: num(
+            value
+                .get("est_unselectable")
+                .unwrap_or(&serde_json::Value::Null),
+            "est_unselectable",
+        )?,
+        est_duplicated: num(
+            value
+                .get("est_duplicated")
+                .unwrap_or(&serde_json::Value::Null),
+            "est_duplicated",
+        )?,
+    })
+}
+
 pub fn plan(windows: &[(f64, f64)], stats: &[RowGroupStats], n: usize) -> Result<Plan> {
     plan_weighted(windows, stats, n, None)
 }
@@ -106,8 +233,7 @@ pub fn plan_weighted(
              plan needs them (rewrite the table with the library writers)"
         );
     }
-    let mut windows: Vec<(f64, f64)> = windows.to_vec();
-    windows.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let windows = sorted_windows(windows);
     if windows
         .iter()
         .any(|w| !(w.0.is_finite() && w.1.is_finite()) || w.1 < w.0)
@@ -866,6 +992,60 @@ mod tests {
             by_prec
         );
         assert_eq!(plan_weighted(&windows, &stats, 2, None).unwrap(), by_prec);
+    }
+
+    #[test]
+    fn a_run_reusing_shared_bands_gets_the_plan_that_built_them() {
+        // Run 1 plans on its own MS2 cost; run 2's peak density differs, so re-planning would
+        // cut elsewhere (the HYE Astral case: window 125 moved between bands 9 and 10). A run
+        // that reuses run 1's band files must search run 1's bands, whatever its own weights.
+        let windows = contiguous_windows(400.0, 10.0, 10);
+        let stats = uniform_stats(400.0, 500.0, 20, 1000);
+        let cost1 =
+            |lo: f64, hi: f64| est_precursors(&stats, lo, hi) * if lo < 430.0 { 10.0 } else { 1.0 };
+        let cost2 =
+            |lo: f64, hi: f64| est_precursors(&stats, lo, hi) * if lo < 460.0 { 10.0 } else { 1.0 };
+        let run1 = plan_weighted(&windows, &stats, 2, Some(&cost1)).unwrap();
+        let run2_replanned = plan_weighted(&windows, &stats, 2, Some(&cost2)).unwrap();
+        assert_ne!(run1.bands[0].windows, run2_replanned.bands[0].windows);
+
+        // What run 2 reads back from run 1's plan.json is run 1's plan exactly, even with its
+        // windows handed over in a different order.
+        let written = serde_json::to_string(&plan_json(&run1)).unwrap();
+        let value: Value = serde_json::from_str(&written).unwrap();
+        let mut shuffled = windows.clone();
+        shuffled.reverse();
+        assert_eq!(plan_from_json(&value, &shuffled).unwrap(), run1);
+    }
+
+    #[test]
+    fn a_shared_plan_that_does_not_fit_this_runs_windows_is_refused() {
+        let windows = contiguous_windows(400.0, 10.0, 10);
+        let stats = uniform_stats(400.0, 500.0, 20, 1000);
+        let value = plan_json(&plan(&windows, &stats, 2).unwrap());
+
+        // One window narrower: the band bounds no longer match.
+        let mut moved = windows.clone();
+        moved[4].1 = 449.0;
+        let err = plan_from_json(&value, &moved).unwrap_err().to_string();
+        assert!(err.contains("spans m/z"), "{err}");
+
+        // Fewer windows: the plan names windows this run does not have.
+        let err = plan_from_json(&value, &windows[..8])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("this run has 8 windows"), "{err}");
+
+        // More windows: the plan leaves some uncovered.
+        let more = contiguous_windows(400.0, 10.0, 11);
+        let err = plan_from_json(&value, &more).unwrap_err().to_string();
+        assert!(err.contains("covers 10 windows"), "{err}");
+
+        // A band that skips a window.
+        let mut gap = value.clone();
+        gap["bands"][1]["windows"] = json!([6, 7, 8, 9]);
+        let err = plan_from_json(&gap, &windows).unwrap_err().to_string();
+        assert!(err.contains("does not continue the window order"), "{err}");
     }
 
     #[test]
