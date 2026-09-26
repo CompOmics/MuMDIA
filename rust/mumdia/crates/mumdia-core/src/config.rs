@@ -795,9 +795,14 @@ pub struct RtImTrainConfig {
     /// the threads a one-process prediction gets (`deeplc_predict_shards` does not split
     /// it). Base model only: a fine-tune has no factored head and ignores it.
     ///
+    /// Needs DeepLC 4.5.0 or newer, which added the factored prediction matrix it reads.
+    /// On DeepLC 4.4.x (the engine's floor) the worker warns, records why in the summary,
+    /// writes nothing and predicts exactly as without it.
+    ///
     /// Float-equivalent, not bit-identical: the heads are evaluated in numpy from the cached
     /// factors instead of in torch. Measured with DeepLC 4.5.0 on CPU: the base-model
-    /// re-prediction bit-identical on every row of the smoke library (3,820 rows); the
+    /// re-prediction bit-identical on every row of the smoke library (3,820 rows) but not in
+    /// general (on the 572-row test fixture 109 rows moved, by at most 1.5e-5 s); the
     /// multi-head calibration bit-identical on 3,782 of those rows and within 7.6e-6 s on
     /// the rest, and on a synthetic 572-row library with sequences outside the anchors'
     /// range 402 rows identical and 7 above 1e-3 s, the largest 3.7 s, which is the spline
