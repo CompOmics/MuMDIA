@@ -636,6 +636,34 @@ null, which is the 3D behaviour. `extract.im_gate` reads them (P4 in docs/TIMS_R
 Measured accuracy on the E. coli diaPASEF benchmark is in docs/TIMS_ROADMAP.md, "P2
 result".
 
+### 8. Refit on pass-1 identifications (`refit`, default off, 2026-09-27)
+
+`rt_im_train.refit = true` makes `run` and ungrouped `run-experiment` search twice
+(`stages/im_rt_refit.rs`). The measurements behind each rule are in
+the TIMS roadmap, part 2 ("L1d").
+
+1. Pass 1 is the normal chain, written to `<out>/pass1/` (`<run>/pass1/` under
+   `run-experiment`, where the pooled pass-1 rescore is `<out>/pass1/scored_combined.parquet`).
+2. Pseudo-seed `pass1_seed.parquet` (seed v2 schema): the pass-1 targets with PSM
+   `q_value` (`run_psm_q` per run under `run-experiment`) at most `q_train`, `apex_rt` as
+   `observed_rt`, extract's `apex_im` at `selected_peak_rank` as `observed_im`.
+3. Under multi-head calibration only: the 80-head fit runs twice, once per fold
+   (`pass1_seed_f0/f1.parquet`). The fold of a base peptide is the parity of its rank
+   among the library's distinct `base_peptide_id` values, so target/decoy pairs share a
+   fold. Every library row takes the prediction of the fit on the OTHER fold
+   (`fragment_library_precursors_refit.parquet`). Under `rt_library_scope =
+   first_run_only` only the first run refits; the others reuse its table.
+4. rt-im-train on the pseudo-seed (`run_windows_refit.parquet`, `cal_refit.json`). The
+   pass-2 `run_windows.parquet` takes the refit `rt_pred_cal`/`im_pred_cal` and the
+   pass-1 half-widths: the refit widths are truncated by selection, because pass-1
+   identifications can only lie inside the pass-1 windows.
+5. Extract (seed mass calibration), features (the ORIGINAL seed, so no pass-1 score
+   enters a feature), compete and rescore write the canonical names; quant and report
+   read pass 2.
+
+The rt-im-train LOESS on top is fitted in-sample on the pass-1 targets. Refused with
+`groups.window_groups > 1`. Benchmark-gated.
+
 ### DeepLC multitask fine-tune (orchestrator pre-step, default off)
 
 This is not part of `rt_im_train::run`; it runs in the `run` orchestrator between

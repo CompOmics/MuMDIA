@@ -864,6 +864,16 @@ pub struct RtImTrainConfig {
     /// residuals are optimistic and can rank models backwards (docs/08 section 4). Must
     /// lie in (0, 0.9].
     pub im_window_holdout_frac: f64,
+    /// Second pass on the pass-1 identifications (TIMS roadmap part 2, L1d). After pass 1
+    /// is rescored, its accepted targets (PSM `q_value` at most `q_train`) become a
+    /// pseudo-seed; under multi-head calibration the 80-head fit is refitted on it,
+    /// cross-fitted over two folds of base peptides (each candidate takes the fold it was
+    /// not fitted on); rt-im-train is refitted on it, and its new RT and IM centres are
+    /// used with the pass-1 half-widths (the refit widths are truncated by selection and
+    /// lost 4%). Extract, features (with the original seed), compete and rescore then run
+    /// again. Pass-1 artifacts go to `<out>/pass1/`. Single-run and ungrouped
+    /// `run-experiment` only. Default false: nothing changes. Benchmark-gated.
+    pub refit: bool,
 }
 
 /// Source of `predicted_irt` for an imported library; see `RtImTrainConfig::library_irt`.
@@ -955,6 +965,7 @@ impl Default for RtImTrainConfig {
             im_window_multiplier: 1.0,
             im_window_min: 0.005,
             im_window_holdout_frac: 0.3,
+            refit: false, // off; benchmark-gated
         }
     }
 }
@@ -2594,6 +2605,13 @@ impl Config {
                  the same confident seed PSMs, at the same point in the chain. Choose one. \
                  (Leaving multihead_calibration unset keeps the fine-tune; only asking for \
                  both explicitly is a conflict.)"
+                    .into(),
+            ));
+        }
+
+        if self.rt_im_train.refit && self.groups.window_groups > 1 {
+            return Err(Invalid(
+                "rt_im_train.refit is not implemented for grouped runs (groups.window_groups > 1)"
                     .into(),
             ));
         }

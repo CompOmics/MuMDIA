@@ -173,7 +173,7 @@ fn process_run(
     top_peaks_ms2: usize,
     max_spectra: usize,
     shared_rt_lib: Option<&str>,
-) -> Result<(String, String, Option<String>)> {
+) -> Result<PerRun> {
     let d = |name: &str| format!("{out}/{name}");
     std::fs::create_dir_all(out).ok();
     // Fold the conversion caps into the convert artifacts' provenance key, exactly as
@@ -219,11 +219,12 @@ fn process_run(
             mh_heads,
             library_input,
         })?;
-        return Ok((
-            pooled.competed,
-            pooled.chromatograms,
-            Some(format!("{out}/groups")),
-        ));
+        return Ok(PerRun {
+            competed: pooled.competed,
+            chrom: pooled.chromatograms,
+            produced_rt_lib: Some(format!("{out}/groups")),
+            pass1: None,
+        });
     }
     let seed = d("seed_psms.parquet");
     search_seed::run(search_seed::SearchSeedParams {
@@ -306,52 +307,57 @@ fn process_run(
     } else {
         lib_p_base.to_string()
     };
-    let windows = d("run_windows.parquet");
+    // `rt_im_train.refit`: pass 1 goes to `pass1/`; `run` then refits and reruns the chain.
+    let dir1 = if cfg.rt_im_train.refit {
+        d("pass1")
+    } else {
+        out.to_string()
+    };
+    std::fs::create_dir_all(&dir1).ok();
+    let windows = format!("{dir1}/run_windows.parquet");
     rt_im_train::run(rt_im_train::RtImTrainParams {
         anchor_irt_from_seed: false,
         seed_psms: &seed,
         library_precursors: &lib_p,
         out_windows: &windows,
-        out_cal: &d("cal.json"),
+        out_cal: &format!("{dir1}/cal.json"),
         cfg: &cfg.rt_im_train,
         config_hash: ch,
     })?;
-    let psms = d("psms_extracted.parquet");
-    let chrom = d("chromatograms.parquet");
-    extract::run(extract::ExtractParams {
-        fragment_offset: None,
-        sibling_bands: 1,
-        scans: None,
-        ms2: &co.ms2,
-        library_precursors: &lib_p,
-        library_fragments: lib_f,
-        run_windows: &windows,
-        ms1: Some(&co.ms1),
-        mass_cal: Some(&format!("{seed}.masscal.json")),
-        out_psms: &psms,
-        out_chrom: &chrom,
-        restrict_candidates: None,
-        cfg: &cfg.extract,
-        config_hash: ch,
-    })?;
-    let feats = d("features.parquet");
-    features::run(features::FeaturesParams {
-        psms: &psms,
-        chromatograms: &chrom,
-        seed: Some(&seed),
-        out: &feats,
-        out_pin: &d("run.pin"),
-        cfg: &cfg.features,
-        config_hash: ch,
-    })?;
-    let competed = d("psms_competed.parquet");
-    compete::run(compete::CompeteParams {
-        features: &feats,
-        out: &competed,
-        cfg: &cfg.compete,
-        config_hash: ch,
-    })?;
-    Ok((competed, chrom, produced_rt_lib))
+    let c = crate::stages::run::extract_to_compete(
+        cfg, ch, &co, &seed, &lib_p, lib_f, &windows, &dir1, None,
+    )?;
+    let pass1 = cfg.rt_im_train.refit.then(|| Pass1 {
+        co,
+        seed,
+        lib_p,
+        windows,
+        psms: c.psms,
+        out: out.to_string(),
+    });
+    Ok(PerRun {
+        competed: c.competed,
+        chrom: c.chrom,
+        produced_rt_lib,
+        pass1,
+    })
+}
+
+/// What pass 2 of `rt_im_train.refit` needs from a run's pass 1.
+struct Pass1 {
+    co: convert::ConvertOutputs,
+    seed: String,
+    lib_p: String,
+    windows: String,
+    psms: String,
+    out: String,
+}
+
+struct PerRun {
+    competed: String,
+    chrom: String,
+    produced_rt_lib: Option<String>,
+    pass1: Option<Pass1>,
 }
 
 /// Split an experiment-wide scored table into per-run tables by the `source`
@@ -668,6 +674,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let par = cfg.experiment.parallel_runs.max(1);
     let mut competed: Vec<String> = Vec::with_capacity(n_runs);
     let mut chroms: Vec<String> = Vec::with_capacity(n_runs);
+    let mut pass1s: Vec<Option<Pass1>> = Vec::with_capacity(n_runs);
 
     // Under `RtLibraryScope::FirstRunOnly` (the default) the first run is processed alone
     // so the library it adapted can be handed to all the others. That adaptation -- the
@@ -709,7 +716,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             n = n_runs,
             "run-experiment: adapting the library's retention times on the first run only;              the remaining runs reuse that library and fit their own RT calibration on it              (experiment.rt_library_scope = per_run to adapt for every run instead)"
         );
-        let (comp, chrom, ft) = process_run(
+        let r = process_run(
             cfg,
             &ch,
             &lib_p_base,
@@ -721,8 +728,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             p.max_spectra,
             None,
         )?;
-        competed.push(comp);
-        chroms.push(chrom);
+        competed.push(r.competed.clone());
+        chroms.push(r.chrom.clone());
+        let ft = r.produced_rt_lib.clone();
+        pass1s.push(r.pass1);
         match ft {
             Some(path) => {
                 info!(library = %path, "run-experiment: reusing this adapted library for the remaining runs");
@@ -742,7 +751,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     if par == 1 {
         for &i in &rest {
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
-            let (comp, chrom, _) = process_run(
+            let r = process_run(
                 cfg,
                 &ch,
                 &lib_p_base,
@@ -754,8 +763,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 p.max_spectra,
                 shared_ft.as_deref(),
             )?;
-            competed.push(comp);
-            chroms.push(chrom);
+            competed.push(r.competed);
+            chroms.push(r.chrom);
+            pass1s.push(r.pass1);
         }
     } else {
         info!(
@@ -764,7 +774,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "run-experiment: per-run chains in parallel (each run can hold tens of GB;              lower experiment.parallel_runs if memory is tight)"
         );
         for chunk in rest.chunks(par) {
-            let done: Vec<(String, String, Option<String>)> = chunk
+            let done: Vec<PerRun> = chunk
                 .par_iter()
                 .map(|&i| {
                     info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
@@ -782,10 +792,62 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
-            for (comp, chrom, _) in done {
-                competed.push(comp);
-                chroms.push(chrom);
+            for r in done {
+                competed.push(r.competed);
+                chroms.push(r.chrom);
+                pass1s.push(r.pass1);
             }
+        }
+    }
+
+    // --- `rt_im_train.refit`: pooled pass-1 rescore, per-run refit, pass-2 chains ---
+    // The refitted library is shared exactly as pass 1 shared its adapted one.
+    if cfg.rt_im_train.refit {
+        let dir1 = d("pass1");
+        std::fs::create_dir_all(&dir1).ok();
+        let scored1 = format!("{dir1}/scored_combined.parquet");
+        rescore::run(rescore::RescoreParams {
+            competed: &competed,
+            out: &scored1,
+            work_dir: &d("sidecar_work"),
+            script_dir: &cfg.predict_frag.sidecar_script_dir,
+            cfg: &cfg.rescore,
+            config_hash: &ch,
+        })?;
+        let split1: Vec<String> = (0..n_runs)
+            .map(|i| d(&format!("{}/pass1/scored.parquet", names[i])))
+            .collect();
+        split_by_source(&scored1, &split1)?;
+        let mh_heads = cfg
+            .rt_im_train
+            .multihead_heads(has_deeplc_for_scope, deeplc_rt_source_for_scope);
+        let mut shared: Option<String> = None;
+        competed.clear();
+        chroms.clear();
+        for (i, p1) in pass1s.into_iter().enumerate() {
+            let p1 = p1.expect("refit is refused for grouped runs, so every run has a pass 1");
+            info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: refit and pass 2");
+            let r = im_rt_refit::run(im_rt_refit::RefitParams {
+                cfg,
+                config_hash: &ch,
+                scored: &split1[i],
+                q_column: "run_psm_q",
+                extracted: &p1.psms,
+                lib_pass1: &p1.lib_p,
+                lib_base: &lib_p_base,
+                windows_pass1: &p1.windows,
+                out_dir: &p1.out,
+                mh_heads,
+                shared_lib: if share_ft { shared.as_deref() } else { None },
+            })?;
+            if share_ft && shared.is_none() {
+                shared = r.produced_lib.clone();
+            }
+            let c = crate::stages::run::extract_to_compete(
+                cfg, &ch, &p1.co, &p1.seed, &r.lib, &lib_f, &r.windows, &p1.out, None,
+            )?;
+            competed.push(c.competed);
+            chroms.push(c.chrom);
         }
     }
 

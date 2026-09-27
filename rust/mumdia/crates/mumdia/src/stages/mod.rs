@@ -8,6 +8,7 @@ pub mod convert;
 pub mod digest;
 pub mod extract;
 pub mod features;
+pub mod im_rt_refit;
 pub mod peptidoforms;
 pub mod pool;
 pub mod predict_frag;
