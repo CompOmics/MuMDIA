@@ -497,32 +497,39 @@ def test_default_speedups_leave_scores_byte_identical(torch_available, tmp_path,
     _assert_same_scores(ref, new, n, "a default-path speed-up")
 
 
-# The worker as it was before the default-path speed-ups (W1-W6) and the move of the
-# training loop into `_build_trainer`: origin/main when they were written. The switches in
-# LEGACY_ENV only reach code that kept a switch; comparing against this commit also covers
-# the refactors that have none. When a later change moves the default scores on purpose,
-# point this at the commit that made it.
+# The worker whose default scores the current default must reproduce. When a later change
+# moves the default scores on purpose, point this at the commit that made it: here the
+# commit that made keyed parallel training (`MUMDIA_NN_PARALLEL=auto`) the default.
 REFERENCE_COMMIT = "6887c41b7ed04ace7eb1d744d750e83bb2c93e9e"
 
+# The worker as it was before the default-path speed-ups (W1-W6) and the move of the
+# training loop into `_build_trainer`: origin/main when they were written, and the last
+# default of the serial loop. The switches in LEGACY_ENV only reach code that kept a switch;
+# comparing against this commit also covers the refactors that have none. The serial loop
+# (`MUMDIA_NN_PARALLEL=0`) must still reproduce it.
+SERIAL_REFERENCE_COMMIT = "6887c41b7ed04ace7eb1d744d750e83bb2c93e9e"
 
-def _reference_worker(tmp_path):
-    """Write the worker at REFERENCE_COMMIT to tmp_path, or skip when git cannot supply it."""
+
+def _reference_worker(tmp_path, commit=None):
+    """Write the worker at `commit` (REFERENCE_COMMIT) to tmp_path, or skip when git cannot
+    supply it."""
     import pathlib
     import shutil
     import subprocess
 
+    commit = commit or REFERENCE_COMMIT
     git = shutil.which("git")
     if git is None:
         pytest.skip("git is not available to extract the reference worker")
     root = pathlib.Path(__file__).resolve().parents[2]
     proc = subprocess.run(
-        [git, "-C", str(root), "show", REFERENCE_COMMIT + ":scripts/nn_rescore_worker.py"],
+        [git, "-C", str(root), "show", commit + ":scripts/nn_rescore_worker.py"],
         capture_output=True,
     )
     if proc.returncode != 0 or not proc.stdout:
         pytest.skip("reference commit %s is not in this clone (a shallow checkout?)"
-                    % REFERENCE_COMMIT[:7])
-    path = tmp_path / "nn_rescore_worker_reference.py"
+                    % commit[:7])
+    path = tmp_path / ("nn_rescore_worker_reference_%s.py" % commit[:7])
     path.write_bytes(proc.stdout)
     return path
 
@@ -542,6 +549,70 @@ def test_default_path_scores_as_the_reference_worker(torch_available, tmp_path, 
     run_worker_ok(str(reference), pin, ref, env=env)
     run_worker_ok("nn_rescore_worker.py", pin, new, env=env)
     _assert_same_scores(ref, new, n, "the current worker (against %s)" % REFERENCE_COMMIT[:7])
+
+
+@pytest.mark.parametrize("backend", ["in-memory", "stream", "tsv"])
+def test_the_serial_loop_scores_as_the_serial_reference_worker(torch_available, tmp_path,
+                                                              backend):
+    """`MUMDIA_NN_PARALLEL=0` keeps the serial loop, and with it the scores of the worker
+    whose default it was (SERIAL_REFERENCE_COMMIT), byte for byte on the same host.
+
+    The reference worker is run with the same variable; a worker from before keyed training
+    existed ignores it and trains serially anyway.
+    """
+    reference = _reference_worker(tmp_path, SERIAL_REFERENCE_COMMIT)
+    pin, _keys, n, env = _identity_inputs(tmp_path, backend)
+    env = dict(env, MUMDIA_NN_PARALLEL="0")
+    ref = tmp_path / "serial_reference.parquet"
+    new = tmp_path / "serial.parquet"
+    run_worker_ok(str(reference), pin, ref, env=env)
+    stdout, _ = run_worker_ok("nn_rescore_worker.py", pin, new, env=env)
+    assert "parallel training" not in stdout, "MUMDIA_NN_PARALLEL=0 did not train serially"
+    _assert_same_scores(ref, new, n,
+                        "the serial loop (against %s)" % SERIAL_REFERENCE_COMMIT[:7])
+
+
+def test_the_default_trains_keyed_tasks_in_processes_sized_from_the_host(torch_available,
+                                                                         tmp_path):
+    """The default is `MUMDIA_NN_PARALLEL=auto`: keyed tasks in child processes, as many as
+    the tasks, cores and memory allow, and the same scores as an explicit process count."""
+    pin, _keys, n, env = _identity_inputs(tmp_path, "in-memory")
+    env = dict(env, MUMDIA_NN_PARALLEL_THREADS="1")
+    env.pop("MUMDIA_NN_PARALLEL", None)
+    auto = tmp_path / "auto.parquet"
+    one = tmp_path / "one.parquet"
+    stdout, _ = run_worker_ok("nn_rescore_worker.py", pin, auto, env=env)
+    assert "MUMDIA_NN_PARALLEL=auto:" in stdout, "the default did not size its processes"
+    run_worker_ok("nn_rescore_worker.py", pin, one, env=dict(env, MUMDIA_NN_PARALLEL="1"))
+    _assert_same_scores(one, auto, n, "the automatic process count")
+
+
+def test_the_automatic_process_count_follows_tasks_cores_and_memory(monkeypatch):
+    """`auto_parallel_processes`: one on a GPU; min(tasks, cores / threads) on a CPU, the
+    performance cores on a hybrid CPU; bounded by the memory beside the shared matrix."""
+    w = _import_worker()
+    gib = 1024 ** 3
+    monkeypatch.setattr(w, "performance_cores", lambda: None)
+    monkeypatch.setattr(w, "physical_cores", lambda: 64)
+    monkeypatch.setattr(w, "available_ram_bytes", lambda: 700 * gib)
+    # 64 cores at 16 threads is 4 slots, and 3 tasks use three of them.
+    assert w.auto_parallel_processes(3, 16, 1_000_000, 377, 3, 8, "cpu")[0] == 3
+    assert w.auto_parallel_processes(9, 16, 1_000_000, 377, 3, 8, "cpu")[0] == 4
+    assert w.auto_parallel_processes(3, 16, 1_000_000, 377, 3, 8, "cuda")[0] == 1
+    # A hybrid CPU counts its performance cores: 8 of them at 8 threads is one process.
+    monkeypatch.setattr(w, "performance_cores", lambda: 8)
+    assert w.auto_parallel_processes(3, 8, 1_000_000, 377, 3, 8, "cpu")[0] == 1
+    monkeypatch.setattr(w, "performance_cores", lambda: None)
+    # 20 GiB available beside a 13 GiB matrix holds one 8 GiB training block and its child.
+    monkeypatch.setattr(w, "available_ram_bytes", lambda: 20 * gib)
+    k, why = w.auto_parallel_processes(3, 16, 9_218_534, 377, 3, 8, "cpu")
+    assert k == 1 and "bounded by" in why, why
+    # No reading of the cores falls back to the logical CPUs.
+    monkeypatch.setattr(w, "physical_cores", lambda: None)
+    monkeypatch.setattr(w, "available_ram_bytes", lambda: None)
+    monkeypatch.setattr(w.os, "cpu_count", lambda: 32)
+    k, why = w.auto_parallel_processes(3, 16, 1_000_000, 377, 3, 8, "cpu")
+    assert k == 2 and "logical CPUs" in why, why
 
 
 # The metadata columns of a handoff (`NON_FEATURE` in the worker).

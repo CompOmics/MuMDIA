@@ -147,6 +147,19 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **The NN rescorer trains its folds in parallel by default** (`MUMDIA_NN_PARALLEL=auto`;
+  `0` restores the serial loop and its scores). The (seed, fold) tasks run in child
+  processes, as many as the tasks and cores allow at the worker's torch thread count (the
+  performance cores on a hybrid CPU, one process on a GPU), bounded so that each child's
+  training rows fit in the available memory beside the shared matrix. The epoch shuffle is
+  then keyed per (seed, fold, iteration, epoch), so the scores do not depend on the
+  process count and move once, as a seed change would. Measured before the default changed
+  (EPYC 9354, one rescore at a time): a six-run Astral pool 11:51 -> 6:15 and a five-run
+  Orbitrap AIF pool 10:20 -> 7:31. Over 10 seeds a pool the peptides at 1% moved +0.02% on
+  the Astral pool (t +0.17), -0.21% on the Orbitrap pool (t -2.23) and -0.22% on the
+  entrapment pool (t -1.99, FDP 0.988 -> 0.963%): a small, consistent loss on two of three
+  pools, accepted for the wall time. The engine's disk-space check before a rescore now
+  counts the worker's matrix memmap unless `MUMDIA_NN_PARALLEL=0`.
 - **Sharded DeepLC prediction and one retention-time adaptation per banded run are
   defaults:** `rt_im_train.deeplc_predict_shards = 0` (one process per 8 threads of the
   prediction budget) and `groups.rt_adaptation = "once_per_run"`. Both are

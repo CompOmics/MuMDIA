@@ -209,16 +209,18 @@ Env knobs (all optional):
                                      checked (Windows x86-64, torch 2.6, CPU and CUDA; the
                                      tests repeat it on the host that runs them). The
                                      streaming backend always uses the numpy path.
-    MUMDIA_NN_PARALLEL    = 0        opt-in: > 0 trains the (seed, fold) tasks in that many
-                                     spawned processes at once. The matrix is shared through
+    MUMDIA_NN_PARALLEL    = auto     trains the (seed, fold) tasks in spawned processes, the
+                                     default since 2026-09-27. The matrix is shared through
                                      a read-only memmap next to the output (the in-memory
                                      backend writes it there instead of to RAM), not copied
-                                     per process. The epoch shuffle is then keyed per (seed,
+                                     per process. The epoch shuffle is keyed per (seed,
                                      fold, iteration, epoch) rather than drawn from one
-                                     stream per seed, which changes the scores once, like a
-                                     seed change; they do not depend on the process count
-                                     (1 runs the same keyed tasks one after another in one
-                                     child). 0 = the serial loop and today's scores.
+                                     stream per seed, so the scores do not depend on the
+                                     process count (1 runs the same keyed tasks one after
+                                     another in one child). auto = as many processes as the
+                                     tasks, the cores and the memory allow
+                                     (`auto_parallel_processes`); N > 0 = N processes;
+                                     0 = the serial loop, the scores before 2026-09-27.
     MUMDIA_NN_PARALLEL_THREADS = auto  torch threads per process under MUMDIA_NN_PARALLEL;
                                      auto = the serial worker's resolved thread count. Fixed
                                      per process, so the arithmetic of a task does not depend
@@ -374,6 +376,103 @@ def torch_thread_cap():
     if p_cores:
         return p_cores, f"{p_cores} performance cores on a hybrid CPU"
     return _THREAD_CAP, "flat beyond this on every CPU measured"
+
+
+def physical_cores():
+    """Physical cores this process may run on, or None when they cannot be read.
+
+    Linux: the distinct cores behind the CPUs in `sched_getaffinity(0)`, from each CPU's
+    sysfs `topology/core_cpus_list` (`thread_siblings_list` before 5.5), so a container or a
+    `taskset` mask is respected and two hyperthreads of one core count once. Windows: the
+    `RelationProcessorCore` records of `GetLogicalProcessorInformationEx`, one per core.
+    """
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            cpus = sorted(os.sched_getaffinity(0))
+        except OSError:
+            cpus = []
+        cores = set()
+        for cpu in cpus:
+            topo = "/sys/devices/system/cpu/cpu%d/topology/" % cpu
+            key = None
+            for name in ("core_cpus_list", "thread_siblings_list"):
+                try:
+                    with open(topo + name, encoding="ascii") as fh:
+                        key = fh.read().strip()
+                    break
+                except OSError:
+                    continue
+            if key is None:
+                return None
+            cores.add(key)
+        return len(cores) or None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            import struct
+            from ctypes import wintypes
+
+            k32 = ctypes.windll.kernel32
+            size = wintypes.DWORD(0)
+            k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(size))
+            buf = ctypes.create_string_buffer(size.value)
+            if not k32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(size)):
+                return None
+            raw, n, off = buf.raw, 0, 0
+            while off + 8 <= size.value:
+                relationship, record_size = struct.unpack_from("<II", raw, off)
+                if record_size < 8:
+                    return None
+                n += relationship == 0
+                off += record_size
+            return n or None
+        except Exception:  # noqa: BLE001 - best effort; None falls back to os.cpu_count
+            return None
+    return None
+
+
+# What one child process holds beside its gathered training rows: the torch runtime and
+# its allocator, the per-row arrays and a scoring batch. A round figure, not a measurement
+# of any one pool; it only keeps the memory bound from admitting a child on nothing.
+_CHILD_BASE_BYTES = 1 << 30
+
+
+def auto_parallel_processes(n_tasks, threads, n_rows, n_cols, folds, pregather_gb, device):
+    """`(processes, why)` for `MUMDIA_NN_PARALLEL=auto`.
+
+    One process on a GPU (every child would open its own context on the device).
+    Otherwise as many as the tasks, and as fit the cores at `threads` torch threads each:
+    the performance cores on a hybrid CPU, where a thread on an efficiency core sets the
+    pace of every OpenMP-parallel op (`torch_thread_cap`), else the physical cores, else
+    the logical CPUs. Then bounded by memory: the matrix is shared through the page cache,
+    and each child holds its own fold's gathered training rows (at most `pregather_gb`) and
+    `_CHILD_BASE_BYTES`, so no more children start than the available memory holds beside
+    the matrix. Never fewer than one: the keyed tasks then run one after another in one
+    child, with the same scores.
+    """
+    if device == "cuda":
+        return 1, "one process on a GPU"
+    p_cores = performance_cores()
+    cores = p_cores or physical_cores()
+    what = ("%d performance cores" % cores if p_cores
+            else "%d physical cores" % cores if cores else None)
+    if not cores:
+        cores = os.cpu_count() or 1
+        what = "%d logical CPUs" % cores
+    k = max(1, min(int(n_tasks), cores // max(1, int(threads))))
+    why = "%s / %d torch threads per process, %d task(s)" % (what, threads, n_tasks)
+    avail = available_ram_bytes()
+    if avail and k > 1:
+        matrix = int(n_rows) * int(n_cols) * 4
+        train_rows = int(n_rows) * max(1, int(folds) - 1) // max(1, int(folds))
+        per_child = min(train_rows * int(n_cols) * 4, int(pregather_gb * 1024 ** 3))
+        per_child += _CHILD_BASE_BYTES
+        fit = max(1, int(max(0, avail - matrix) // per_child))
+        if fit < k:
+            k = fit
+            why += ", bounded by the %.1f GiB available beside the %.1f GiB matrix" % (
+                avail / 1024 ** 3, matrix / 1024 ** 3)
+    return k, why
 
 
 def constant_columns(pin_path, cols):
@@ -1826,13 +1925,19 @@ def _train_in_processes(cfg, X, mm_path, out_path, stream, y, fold, feat_cols, s
     raw = os.environ.get("MUMDIA_NN_PARALLEL_THREADS", "").strip()
     threads = max(1, int(float(raw))) if raw else max(1, torch.get_num_threads())
     n_tasks = len(seeds) * folds
-    workers = max(1, min(int(parallel), n_tasks))
+    if int(parallel) < 0:
+        workers, why = auto_parallel_processes(
+            n_tasks, threads, n_rows, n_cols, folds, cfg.PREGATHER_GB, cfg.DEVICE)
+        sizing = "MUMDIA_NN_PARALLEL=auto: %s" % why
+    else:
+        workers = max(1, min(int(parallel), n_tasks))
+        sizing = "MUMDIA_NN_PARALLEL=%d" % int(parallel)
     print(
         "nn_rescore_worker: parallel training: %d process(es) x %d torch thread(s) for "
-        "%d task(s) (%d seed(s) x %d fold(s)); the epoch shuffle is keyed per (seed, fold, "
-        "iteration, epoch), so the scores differ from the serial default as a seed change "
-        "would, and do not depend on the process count" % (workers, threads, n_tasks,
-                                                           len(seeds), folds),
+        "%d task(s) (%d seed(s) x %d fold(s)); %s. The epoch shuffle is keyed per (seed, "
+        "fold, iteration, epoch), so the scores do not depend on the process count, and "
+        "differ from the serial loop (MUMDIA_NN_PARALLEL=0) as a seed change would"
+        % (workers, threads, n_tasks, len(seeds), folds, sizing),
         flush=True,
     )
     cpus = os.cpu_count() or 0
@@ -1883,9 +1988,19 @@ def main():
     PREGATHER_GB = env_f("MUMDIA_NN_PREGATHER_GB", 8)
     CLAMP_TINY = env_f("MUMDIA_NN_CLAMP_TINY", 1e-20)
     FINAL_POOL_SCORE = env_i("MUMDIA_NN_FINAL_POOL_SCORE", 0) != 0
-    # Opt-in: train the (seed, fold) tasks in this many spawned processes at once, with the
-    # epoch shuffle keyed per task. 0 (default) is the serial loop and today's scores.
-    PARALLEL = max(0, env_i("MUMDIA_NN_PARALLEL", 0))
+    # The (seed, fold) tasks in spawned processes with the epoch shuffle keyed per task, the
+    # default since 2026-09-27: "auto" (stored as -1) sizes the process count once the
+    # matrix is known (`auto_parallel_processes`), N > 0 fixes it, 0 is the serial loop
+    # with one numpy stream per seed (the default scores before then).
+    _par = os.environ.get("MUMDIA_NN_PARALLEL", "auto").strip().lower()
+    if _par in ("", "auto"):
+        PARALLEL = -1
+    else:
+        try:
+            PARALLEL = max(0, int(float(_par)))
+        except ValueError:
+            raise ValueError(
+                "MUMDIA_NN_PARALLEL must be auto, 0 or a process count (got %r)" % _par)
     SELECT = os.environ.get("MUMDIA_NN_SELECT", "window").strip().lower()
     if SELECT not in ("window", "full"):
         raise ValueError("MUMDIA_NN_SELECT must be window or full (got %r)" % SELECT)
@@ -2163,7 +2278,7 @@ def main():
             else:
                 fold = _folds(_tb.column("Peptide").to_pylist())
             del _tb
-            if PARALLEL > 0:
+            if PARALLEL != 0:
                 # The children map this file read-only instead of each copying the matrix.
                 mm_path = os.path.abspath(out_path + ".feat.mm")
                 _LEFTOVERS.append(mm_path)
@@ -2220,7 +2335,7 @@ def main():
             Xs = np.clip((X - mean) / std, -8, 8).astype(np.float32)
             del X
             n = len(y)
-            if PARALLEL > 0:
+            if PARALLEL != 0:
                 mm_path = os.path.abspath(out_path + ".feat.mm")
                 _LEFTOVERS.append(mm_path)
                 _mm = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=Xs.shape)
@@ -2316,7 +2431,7 @@ def main():
     run_fold = None
     try:
         seeds = list(range(BASE_SEED, BASE_SEED + N_SEEDS))
-        if PARALLEL > 0:
+        if PARALLEL != 0:
             _t = time.time()
             by_task = _train_in_processes(
                 cfg, X, mm_path, out_path, stream, y, fold, feat_cols, seeds, FOLDS,
@@ -2330,7 +2445,7 @@ def main():
         acc = np.zeros(n, np.float64)
         for s in seeds:
             oof = np.zeros(n, np.float32)
-            if PARALLEL > 0:
+            if PARALLEL != 0:
                 for f in range(FOLDS):
                     oof[np.where(fold == f)[0]] = by_task[(s, f)]
             else:

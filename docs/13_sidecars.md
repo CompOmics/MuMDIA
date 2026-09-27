@@ -841,7 +841,8 @@ cores); `MUMDIA_MOKAPOT_WORKERS` (3, thread-based CV-fold parallelism).
 repeated on 4x the rows up to the whole fold), `MUMDIA_NN_INIT_FDR_MAX` (0.05; ceiling
 of the first-iteration bootstrap ladder 0.02/0.05/0.1 used only when the init feature
 selects no positive at the training FDR over the whole fold, 0 = hard error as before),
-`MUMDIA_NN_PARALLEL` (0; opt-in concurrent fold training, see "Invariants" below) and
+`MUMDIA_NN_PARALLEL` (`auto`, the default since 2026-09-27; keyed fold training in child
+processes, see "Invariants" below) and
 `MUMDIA_NN_PARALLEL_THREADS`, the two caps on the init-scan threads
 (`MUMDIA_NN_SCAN_ROWS_PER_THREAD`, 20000; `MUMDIA_NN_SCAN_MEM_GB`, 1), and the switches
 back to the pre-2026-09-25 code paths
@@ -1055,12 +1056,18 @@ MLP. Set it explicitly for the logreg path.
   flush-to-zero, on inputs where the thread state decides the bytes. When a later
   change moves the default scores on purpose, `REFERENCE_COMMIT` is moved to the
   commit that made it.
-- **Concurrent fold training is opt-in** (`MUMDIA_NN_PARALLEL`, default 0). The folds,
-  and the seeds when `MUMDIA_NN_SEEDS > 1`, train one after another on at most 16
-  threads, while the MLP does not get faster past 16 (8 on an EPYC 9354), so most of a
-  large host idles through the rescore. `MUMDIA_NN_PARALLEL=K` trains the
-  (seed, fold) tasks in K spawned processes at `MUMDIA_NN_PARALLEL_THREADS` torch
-  threads each (default: the serial worker's resolved count). The matrix is shared,
+- **Concurrent fold training is the default** (`MUMDIA_NN_PARALLEL=auto` since
+  2026-09-27; `0` is the serial loop, the default before). Serially the folds, and the
+  seeds when `MUMDIA_NN_SEEDS > 1`, train one after another on at most 16 threads, while
+  the MLP does not get faster past 16 (8 on an EPYC 9354), so most of a large host idles
+  through the rescore. The worker trains the (seed, fold) tasks in spawned processes at
+  `MUMDIA_NN_PARALLEL_THREADS` torch threads each (default: the serial worker's
+  resolved count): `auto` starts as many as the tasks and the cores allow at that thread
+  count (the performance cores on a hybrid CPU, else the physical cores under the
+  affinity mask, else the logical CPUs; one on a GPU), bounded so that each child's
+  gathered training rows (at most `MUMDIA_NN_PREGATHER_GB`) and a 1 GiB base fit in the
+  available memory beside the matrix (`auto_parallel_processes`, which the log line
+  quotes); `K > 0` fixes the count. The matrix is shared,
   not copied: the in-memory backend writes it to `<output>.feat.mm` instead of RAM (the
   streaming backend already has that file) and every child maps it read-only, so the
   page cache holds one copy; `y` and the fold index go to two small `.npy` files next
@@ -1077,9 +1084,17 @@ MLP. Set it explicitly for the logreg path.
     thread count K=1 and K=3 return identical bytes
     (`test_parallel_folds_do_not_depend_on_the_process_count`). A different per-process
     thread count changes the arithmetic, as it does for the serial worker.
-  - Validate it as a seed change before relying on it: peptides at 1% on `run_psm_q`,
-    mean over three seeds, on two pools, against the serial default, plus the
-    entrapment pool (CLAUDE.md). Compare wall time and each task's `train` phase (the
+  - Validated as a seed change before the default moved (2026-09-27, EPYC 9354, 10 NN
+    seeds a pool, peptides at 1% against the serial loop): +0.02% on a six-run Astral
+    pool (t +0.17), -0.21% on a five-run Orbitrap AIF pool (t -2.23), -0.22% on the
+    entrapment pool (t -1.99) with its FDP 0.988 -> 0.963%. The loss on two pools is
+    small but consistent, and the default was taken with it for the wall time: one
+    rescore at a time on an idle host, 11:51 -> 6:15 on the Astral pool (4,987,557 PSMs)
+    and 10:20 -> 7:31 on the Orbitrap pool (9,218,534 PSMs). `MUMDIA_NN_PARALLEL=0`
+    trains serially, with the scores of the worker before the change
+    (`test_the_serial_loop_scores_as_the_serial_reference_worker`). Validate a change
+    to either path as a seed change: peptides at 1% on `run_psm_q`, mean over seeds,
+    on two pools, plus the entrapment pool (CLAUDE.md). Compare wall time and each task's `train` phase (the
     worker prints the per-task phases summed over tasks, and the wall of the parallel
     section as `parallel_folds_wall`). Measured on the 8-performance-core desktop, a
     400,000 x 120 synthetic pool with 3 folds: 23.7 s serial at 8 threads, 13.8 s with
