@@ -13,6 +13,11 @@ Units, named because they differ between engines (CLAUDE.md, "Q-value columns"):
            protein groups  distinct target protein_group with pg_q_value <= q
 The MuMDIA empirical decoy fraction is decoys / targets among peptide-level winners at q.
 Overlap is on stripped sequences with I and L merged.
+
+With --extracted (and optionally --lib), the DIA-NN-only peptides are split into the loss
+ladder of docs/TIMS_ROADMAP.md section 2: not in the library, in the library but never
+accepted by extract (no target row in psms_extracted), and extracted but below q.
+Extract acceptances are also counted (candidate rows at peak_rank 0).
 """
 import argparse
 import json
@@ -59,12 +64,29 @@ def mumdia(path: str, q: float) -> dict:
     }
 
 
+def ladder(missing: set, extracted: str, lib: str | None) -> dict:
+    ex = pd.read_parquet(extracted, columns=["peptidoform", "label", "peak_rank"])
+    t = ex[ex["label"] == "target"]
+    ext = il(t["peptidoform"].map(strip).unique())
+    out = {"extract_accepted_rank0": int((ex["peak_rank"] == 0).sum())}
+    if lib:
+        lb = pd.read_parquet(lib, columns=["peptidoform", "label"])
+        inlib = il(lb.loc[lb["label"] == "target", "peptidoform"].map(strip).unique())
+        out["not_in_library"] = len(missing - inlib)
+        missing = missing & inlib
+    out["never_extracted"] = len(missing - ext)
+    out["extracted_below_q"] = len(missing & ext)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--diann", required=True)
     ap.add_argument("--mumdia", required=True)
     ap.add_argument("--q", type=float, default=0.01)
     ap.add_argument("--json")
+    ap.add_argument("--extracted", help="psms_extracted.parquet, for the loss ladder")
+    ap.add_argument("--lib", help="fragment_library_precursors.parquet, for 'not in library'")
     a = ap.parse_args()
     d, m = diann(a.diann, a.q), mumdia(a.mumdia, a.q)
     dp, mp = d.pop("_peps"), m.pop("_peps")
@@ -73,6 +95,8 @@ def main() -> None:
         "mumdia_over_diann": {k: round(m[k] / d[k], 4) for k in ("precursors", "peptides", "protein_groups") if d[k]},
         "peptide_overlap_IL": {"both": len(dp & mp), "diann_only": len(dp - mp), "mumdia_only": len(mp - dp)},
     }
+    if a.extracted:
+        out["loss_ladder"] = ladder(dp - mp, a.extracted, a.lib)
     print(json.dumps(out, indent=2, default=int))
     if a.json:
         with open(a.json, "w") as fh:

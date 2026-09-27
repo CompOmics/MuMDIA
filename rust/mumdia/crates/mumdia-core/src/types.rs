@@ -103,6 +103,9 @@ pub struct Ms2Scan {
     pub peaks: Vec<Peak>,
     /// Per-peak 1/K0 (V s cm^-2), parallel to `peaks`. Empty for a 3D run.
     pub im: Vec<f32>,
+    /// Per-peak mobility width (1/K0), parallel to `peaks`. Empty unless the spectra
+    /// carry `im_width` (v3, `convert.tdf_im_width`).
+    pub im_width: Vec<f32>,
 }
 
 #[cfg(test)]

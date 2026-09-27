@@ -31,6 +31,8 @@ pub struct TdfParams {
     pub mz_ppm: f64,
     pub im_gap_scans: u32,
     pub min_points: u32,
+    /// Also compute each centroid's mobility width ([`Centroids::width`]).
+    pub im_width: bool,
 }
 
 impl TdfParams {
@@ -39,6 +41,7 @@ impl TdfParams {
             mz_ppm: c.tdf_mz_ppm,
             im_gap_scans: c.tdf_im_gap_scans,
             min_points: c.tdf_min_points,
+            im_width: c.tdf_im_width,
         }
     }
 }
@@ -131,6 +134,8 @@ struct Centroids {
     mz: Vec<f32>,
     inten: Vec<f32>,
     im: Vec<f32>,
+    /// Per-peak mobility width in 1/K0 (empty unless `TdfParams::im_width`).
+    width: Vec<f32>,
 }
 
 /// Centroid raw `(tof_index, scan, intensity)` points in m/z x mobility.
@@ -140,6 +145,11 @@ struct Centroids {
 /// and split where two consecutive points are more than `im_gap_scans` scans apart. A
 /// cluster yields its summed intensity and its intensity-weighted m/z and 1/K0, and is
 /// dropped when it holds fewer than `min_points` raw points.
+///
+/// With `im_width`, a cluster also yields its mobility width: the intensity-weighted SD
+/// of its scans, with the 1/12 variance of one scan's quantisation added so a
+/// single-scan cluster is not a zero-width point, converted to 1/K0 with the local slope
+/// of the calibration at the weighted mean scan.
 ///
 /// ponytail: single linkage, so a dense m/z region can chain two peaks together, and two
 /// ions of one m/z whose mobility profiles touch without a scan gap merge. Upgrade path if
@@ -152,7 +162,30 @@ fn centroid_2d(
 ) -> Centroids {
     // Total order on the full tuple, so the result does not depend on the input order.
     pts.sort_unstable();
-    let mut peaks: Vec<(f64, f32, f32)> = Vec::new();
+    let emit = |c: &[(u32, u32, u32)], peaks: &mut Vec<(f64, f32, f32, f32)>| {
+        if c.len() < p.min_points as usize {
+            return;
+        }
+        let (mut w, mut wm, mut ws, mut wss) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for &(t, s, x) in c {
+            let x = x as f64;
+            w += x;
+            wm += x * mz_of(t);
+            ws += x * s as f64;
+            wss += x * (s as f64) * (s as f64);
+        }
+        if w > 0.0 {
+            let mean = ws / w;
+            let width = if p.im_width {
+                let var = (wss / w - mean * mean).max(0.0) + 1.0 / 12.0;
+                (var.sqrt() * (im_of(mean + 0.5) - im_of(mean - 0.5)).abs()) as f32
+            } else {
+                0.0
+            };
+            peaks.push((wm / w, w as f32, im_of(mean) as f32, width));
+        }
+    };
+    let mut peaks: Vec<(f64, f32, f32, f32)> = Vec::new();
     let mut i = 0;
     while i < pts.len() {
         let mut j = i + 1;
@@ -173,18 +206,7 @@ fn centroid_2d(
             while e < trace.len() && trace[e].1 - trace[e - 1].1 <= p.im_gap_scans {
                 e += 1;
             }
-            if e - k >= p.min_points as usize {
-                let (mut w, mut wm, mut ws) = (0.0f64, 0.0f64, 0.0f64);
-                for &(t, s, x) in &trace[k..e] {
-                    let x = x as f64;
-                    w += x;
-                    wm += x * mz_of(t);
-                    ws += x * s as f64;
-                }
-                if w > 0.0 {
-                    peaks.push((wm / w, w as f32, im_of(ws / w) as f32));
-                }
-            }
+            emit(&trace[k..e], &mut peaks);
             k = e;
         }
         i = j;
@@ -194,6 +216,11 @@ fn centroid_2d(
         mz: peaks.iter().map(|p| p.0 as f32).collect(),
         inten: peaks.iter().map(|p| p.1).collect(),
         im: peaks.iter().map(|p| p.2).collect(),
+        width: if p.im_width {
+            peaks.iter().map(|p| p.3).collect()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -210,6 +237,11 @@ fn cap(c: Centroids, top: usize) -> Centroids {
         mz: idx.iter().map(|&k| c.mz[k]).collect(),
         inten: idx.iter().map(|&k| c.inten[k]).collect(),
         im: idx.iter().map(|&k| c.im[k]).collect(),
+        width: if c.width.is_empty() {
+            Vec::new()
+        } else {
+            idx.iter().map(|&k| c.width[k]).collect()
+        },
     }
 }
 
@@ -253,6 +285,7 @@ impl Ctx {
                     mz: c.mz,
                     inten: c.inten,
                     im: Some(c.im),
+                    im_width: self.p.im_width.then_some(c.width),
                     nonfinite_peaks: 0,
                 }]
             }
@@ -277,6 +310,7 @@ impl Ctx {
                             pmz: Some(target),
                             pz: None,
                             im: Some(c.im),
+                            im_width: self.p.im_width.then_some(c.width),
                             im_lo: Some(a.min(b) as f32),
                             im_hi: Some(a.max(b) as f32),
                         }))
@@ -349,6 +383,7 @@ mod tests {
         mz_ppm: 10.0,
         im_gap_scans: 5,
         min_points: 2,
+        im_width: false,
     };
 
     /// TOF index t sits at m/z 500 + t/1000 (2 ppm per index near 500), scan s at 1/K0 s.
@@ -414,10 +449,33 @@ mod tests {
             mz: vec![1.0, 2.0, 3.0],
             inten: vec![5.0, 1.0, 9.0],
             im: vec![0.7, 0.8, 0.9],
+            width: vec![0.01, 0.02, 0.03],
         };
         let k = cap(c, 2);
         assert_eq!(k.mz, vec![1.0, 3.0]);
         assert_eq!(k.im, vec![0.7, 0.9]);
+        assert_eq!(k.width, vec![0.01, 0.03]);
+    }
+
+    #[test]
+    fn width_is_the_weighted_scan_sd_plus_quantisation_in_im_units() {
+        let on = TdfParams {
+            im_width: true,
+            ..P
+        };
+        // Equal weight at scans 10 and 12: SD 1 scan; one scan is 1/K0 0.5 here.
+        let mut v = vec![(1000, 10, 2), (1000, 12, 2)];
+        let c = centroid_2d(&mut v, |t| 500.0 + t as f64 / 1000.0, |s| 0.5 * s, &on);
+        assert!((c.width[0] as f64 - 0.5 * (1.0f64 + 1.0 / 12.0).sqrt()).abs() < 1e-6);
+        // A single-scan cluster keeps the quantisation term only.
+        let mut v = vec![(1000, 10, 1), (1001, 10, 3)];
+        let c = centroid_2d(&mut v, |t| 500.0 + t as f64 / 1000.0, |s| 0.5 * s, &on);
+        assert!((c.width[0] as f64 - 0.5 / 12f64.sqrt()).abs() < 1e-6);
+        // Off: no widths, and the other columns are those of the on run.
+        let mut v = vec![(1000, 10, 2), (1000, 12, 2)];
+        let off = centroid_2d(&mut v, |t| 500.0 + t as f64 / 1000.0, |s| 0.5 * s, &P);
+        assert!(off.width.is_empty());
+        assert_eq!(off.im, vec![5.5]);
     }
 
     /// Real-data check: `MUMDIA_BENCH_TDF=/path/run.d cargo test -- --ignored tdf_real`.

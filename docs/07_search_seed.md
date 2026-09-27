@@ -95,13 +95,14 @@ a candidate that always ranks below `report_psms` gets no row even if it cleared
 | `predicted_irt` | f32 | library iRT, copied through (unused in scoring) |
 | `matched_peaks` | i32 | matched-fragment count at the best scan |
 | `scan_index` | u32 | `scan_index` of the best-scoring scan |
+| `observed_im` | f64, nullable (schema v2) | confident targets only (`spectrum_q <= fdr_seed`), on data with per-peak IM: the intensity-weighted median 1/K0 of the peaks matched to the candidate's library fragments in its best scan, counting only peaks within `fragment_tol_ppm` (the mass-calibration pass collects up to 50 ppm). Fragments carry the precursor's mobility in diaPASEF, because TIMS separation precedes fragmentation. It is the anchor rt-im-train calibrates `predicted_im` against. Null for every other row and on 3D data. Under the seed IM gate only peaks inside the candidate's window count. `seed-pool` carries it (a band's non-confident rows stay null), so a grouped run is IM-calibrated too |
 
 **`<out>.masscal.json`** (fitted and serialised by `masscal::MassCal`, `masscal.rs`):
 
 | key | type | meaning |
 |---|---|---|
 | `frag_ppm_offset` | f64 | median signed ppm of `observed_peak` relative to `predicted_fragment` (`ppm_diff(peak_mz, fmz)`), i.e. the systematic offset |
-| `frag_tol_ppm` | f64 | learned tolerance: `max(5.0, 1.5 * P95(|dev - offset|))` |
+| `frag_tol_ppm` | f64 | learned tolerance: `max(5.0, 1.5 * P95(|dev - offset|))`, or `max(5.0, k * 1.4826 * MAD)` under `frag_tol_mad_k = k > 0` |
 | `frag_ppm_sigma` | f64 | duplicate of `frag_tol_ppm` (the learned tolerance is the local mass-uncertainty estimate) |
 | `n_dev` | usize | number of fragment-to-nearest-peak deviations collected (`devs.len()`) |
 | `cal_passes` | int | 0 (fallback, too few devs), 1 (single pass), or 2 (robust second pass) |
@@ -233,6 +234,24 @@ two-element average), then sets `tol = max(5.0, 1.5 * P95(|dev - offset|))` usin
 - if `two_pass_mass_cal`: keep only deviations inside `|dev - o1| <= t1` and, when
   `>= 20` survive, re-fit to `(o2, t2, 2)`; otherwise keep the single-pass result.
   The second pass rejects random-match outliers so they cannot bias the median.
+- if `frag_tol_mad_k > 0` (default 0, benchmark-gated): the tolerance in both passes is
+  `max(5.0, frag_tol_mad_k * 1.4826 * MAD(dev - offset))` instead of the p95 rule. The
+  offset is unchanged.
+
+**Why the MAD option exists (diaPASEF, TIMS roadmap "P6 result").** On the Ultra 2 E. coli
+run the p95 rule learned 20.4-21.8 ppm whatever the seed tolerance. The deviations
+(49,283 from 4,313 confident targets) are not a core on a uniform random-match floor: only
+~2.5% lie beyond ±20 ppm. The p95 is set by a heavy, asymmetric shoulder at 6-20 ppm
+(negative side ~1.7x the positive), which grows with the fragment's predicted-intensity
+rank and shrinks with observed intensity, so it is centroid error on weak TOF peaks more
+than random matching. The MAD (2.1 ppm) follows the core. DIA-NN's own log on the same
+file reads "Optimised mass accuracy: 8 ppm" for MS2; its `Median.Mass.Acc.MS2` of 2.5 ppm
+is the median error, not a tolerance. A fixed-tolerance screen through extract gave
+6 / 8 / 10 / 12 / 15 / 18 / 21.8 ppm = 7,814 / 8,121 / 8,335 / 8,436 / 8,453 / 8,212 /
+7,947 peptides at 1% (one seed), so the optimum for MuMDIA is 12-15 ppm, not DIA-NN's 8.
+`frag_tol_mad_k: 4` learns 12.5 ppm there. `mass_cal_loess` (a +1.1 to -2.5 ppm trend
+over fragment m/z) and an MS1 `prec_tol_ppm` of 10 were neutral at 12 ppm. On Orbitrap
+data the p95 rule is unchanged and the MAD option is unmeasured.
 
 The estimator is `masscal::MassCal::fit_from` and the JSON body its `to_json`, both in
 `masscal.rs`, because a grouped search fits the very same estimator a second time: each
@@ -247,6 +266,32 @@ calibrants. An ungrouped run writes no sidecar and is byte-identical.
 
 **7. Write** `seed_psms.parquet` (`write_table`, `:233`) and the `ArtifactReport`
 (`:256-274`), then log `psms`, `confident`, `elapsed_ms`.
+
+### Ion-mobility gate (`im_gate`, diaPASEF, default off)
+
+`search_seed.im_gate` makes a matched peak count only when its 1/K0 lies within
+`im_window` (V s cm^-2, default 0.10) of the candidate's library `predicted_im`. The check
+sits in `SeedScratch::accumulate` (`matchers/fragindex.rs`), which receives the selected
+peaks' 1/K0 in parallel (`ImGateView`); the peak tuples are unchanged. The seed runs before
+any IM calibration, so two modes exist:
+
+- `fixed`: the window is centred on the raw prediction. Uncalibrated IM2Deep is offset by a
+  median 0.039 on the benchmark (p95 0.070), so the window must be wide.
+- `two_pass`: an ungated pass, then a global CCS map (`rt_im_train::fit_im_coefs`) fitted on
+  that pass's confident targets (their fragment 1/K0 from `frag_im`), then a second, gated
+  pass centred on the mapped prediction. Below 20 anchors it keeps the ungated pass with a
+  warning. It costs one extra seed pass.
+
+Under either mode, the calibrant and `observed_im` lookup in step 6 skip peaks outside the
+candidate's window. A candidate without `predicted_im`, and a 3D scan, are not gated. The
+gate needs `matcher = fragindex` (validated). The report records `im_gate`, `im_window`,
+`im_gate_applied` and, for `two_pass`, `im_gate_pass1_confident`, `im_gate_anchors` and
+`im_gate_ccs_global`.
+
+A narrow seed window biases the IM calibration downstream: it removes exactly the anchors
+whose observed IM disagrees with the prediction, so rt-im-train's held-out residuals and
+`w_im` shrink while the window recall on true precursors falls. Measured effect:
+docs/TIMS_ROADMAP.md, "P4 result".
 
 ### How the outputs are consumed
 
@@ -299,6 +344,7 @@ on load.
 | `top_n_peaks` | `300` | probe only the N most intense peaks per scan (`0` = all); seed-only, does not shrink the extract artifact |
 | `matcher` | `Fragindex` | backend; `MatcherKind::Bucketed` (`config.rs:38`) uses the serial `page_search` path |
 | `two_pass_mass_cal` | `false` | robust second-pass mass fit on the in-window inliers (sensitivity_plan P3.1) |
+| `frag_tol_mad_k` | `0.0` | tolerance estimator: 0 = `1.5 * p95`, `> 0` = `k * 1.4826 * MAD`, floored at 5 ppm; benchmark-gated (diaPASEF: `4` learns 12.5 ppm, see "How it works" step 6) |
 
 `bucket_size` for the bucketed Library index is taken from `cfg.extract.bucket_size`,
 not from `SearchSeedConfig` (`run.rs:225`). The 50 ppm mass-calibration search

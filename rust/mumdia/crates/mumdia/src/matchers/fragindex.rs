@@ -346,6 +346,16 @@ pub struct WindowNarrow {
     range: Vec<(u32, u32)>,
 }
 
+/// The seed IM gate for one scan: `peak_im` is parallel to the peaks handed to
+/// [`SeedScratch::accumulate`], and `lo`/`hi` are per-candidate 1/K0 bounds indexed by
+/// candidate id (-inf/+inf for a candidate without a predicted IM).
+#[derive(Clone, Copy)]
+pub struct ImGateView<'a> {
+    pub peak_im: &'a [f32],
+    pub lo: &'a [f32],
+    pub hi: &'a [f32],
+}
+
 /// Epoch-stamped dense accumulator for the seed's fused `(count, obs_sum)` semiring
 /// (docs/06_predict_frag_index_matchers.md). `obs_sum` sums the OBSERVED peak
 /// intensity per matched posting (predicted intensity deliberately dropped,
@@ -394,12 +404,16 @@ impl SeedScratch {
     /// in the caller's fixed order (e.g. m/z ascending, or the top-N re-sorted
     /// order) so `obs_sum` is summed deterministically. After the call, `touched()`
     /// lists the hit candidates and `count`/`obs_sum` hold their values.
+    ///
+    /// `im`, the seed IM gate: a posting counts only when the peak's 1/K0 lies inside its
+    /// candidate's window. `None` (gate off, or a 3D scan) counts every posting.
     pub fn accumulate(
         &mut self,
         idx: &FragIndex,
         peaks: &[(f64, f32)],
         cand_lo: u32,
         cand_hi: u32,
+        im: Option<ImGateView>,
     ) {
         self.epoch += 1;
         self.touched.clear();
@@ -408,8 +422,12 @@ impl SeedScratch {
         self.ensure((cand_hi.saturating_sub(cand_lo)) as usize + 1);
         let epoch = self.epoch;
         let base = self.base;
-        for &(mz, inten) in peaks {
+        for (k, &(mz, inten)) in peaks.iter().enumerate() {
+            let pim = im.map_or(0.0, |g| g.peak_im[k]);
             idx.probe_peak(mz, cand_lo, cand_hi, |cid, _pmz, _pint, _pfrag| {
+                if im.is_some_and(|g| pim < g.lo[cid as usize] || pim > g.hi[cid as usize]) {
+                    return;
+                }
                 let cc = (cid - base) as usize;
                 if self.stamp[cc] != epoch {
                     self.stamp[cc] = epoch;
@@ -901,17 +919,36 @@ mod tests {
     }
 
     #[test]
+    fn seed_im_gate_drops_postings_outside_the_candidate_window() {
+        let tol = 20.0;
+        // Both candidates carry a fragment at 600; only candidate 1's window holds 0.9.
+        let lib = lib_from(&[(vec![(600.00, 1.0)], 400.0), (vec![(600.00, 1.0)], 405.0)]);
+        let idx = FragIndex::build(&lib, tol);
+        let mut sc = SeedScratch::new(idx.n_cand());
+        let (lo, hi) = (vec![0.70f32, 0.85], vec![0.80f32, 0.95]);
+        let gate = ImGateView {
+            peak_im: &[0.9],
+            lo: &lo,
+            hi: &hi,
+        };
+        sc.accumulate(&idx, &[(600.00, 5.0)], 0, 2, Some(gate));
+        assert_eq!(sc.touched(), &[1], "candidate 0's window excludes the peak");
+        sc.accumulate(&idx, &[(600.00, 5.0)], 0, 2, None);
+        assert_eq!(sc.touched().len(), 2, "no gate counts both");
+    }
+
+    #[test]
     fn epoch_reset_no_carry_across_scans() {
         let tol = 20.0;
         let lib = lib_from(&[(vec![(600.00, 1.0)], 400.0), (vec![(800.00, 1.0)], 405.0)]);
         let idx = FragIndex::build(&lib, tol);
         let mut sc = SeedScratch::new(idx.n_cand());
         // scan 1 hits cand 0 only
-        sc.accumulate(&idx, &[(600.00, 5.0)], 0, 2);
+        sc.accumulate(&idx, &[(600.00, 5.0)], 0, 2, None);
         assert_eq!(sc.touched().len(), 1);
         assert_eq!(sc.count(0), 1);
         // scan 2 hits cand 1 only; cand 0 must NOT carry a score
-        sc.accumulate(&idx, &[(800.00, 7.0)], 0, 2);
+        sc.accumulate(&idx, &[(800.00, 7.0)], 0, 2, None);
         assert_eq!(sc.touched(), &[1u32]);
         assert_eq!(sc.count(1), 1);
         assert!((sc.obs_sum(1) - 7.0).abs() < 1e-9);

@@ -86,6 +86,18 @@ pub enum RtPredictorKind {
     Deeplc,
 }
 
+/// Source of the library's `predicted_im` (1/K0) in FASTA mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImPredictorKind {
+    /// No ion-mobility prediction: `predicted_im` is written null.
+    #[default]
+    None,
+    /// IM2Deep Python sidecar (`im2deep_worker.py`, docs/13_sidecars.md): the
+    /// single-conformer model, uncalibrated; rt-im-train calibrates it per run.
+    Im2deep,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FragPredictorKind {
@@ -349,6 +361,13 @@ pub struct ConvertConfig {
     /// Native TDF noise floor: a centroid built from fewer raw TOF x scan points than
     /// this is dropped.
     pub tdf_min_points: u32,
+    /// Native TDF: also write each centroid's mobility width (`im_width`, spectra v3):
+    /// the intensity-weighted SD of its TIMS scans, plus the 1/12-scan quantisation
+    /// term, in 1/K0 units (TIMS roadmap P7). Adds 4 B per MS1 and MS2 peak to the
+    /// artifacts and to resident memory. Default false: no `im_width` column, the other
+    /// columns unchanged. Read by extract's apex IM-shape columns (psms_extracted v5)
+    /// and `features.im_shape_features`. Benchmark-gated.
+    pub tdf_im_width: bool,
 }
 impl Default for ConvertConfig {
     fn default() -> Self {
@@ -363,6 +382,7 @@ impl Default for ConvertConfig {
             tdf_mz_ppm: 10.0,
             tdf_im_gap_scans: 30,
             tdf_min_points: 2,
+            tdf_im_width: false, // opt-in; TIMS P7, benchmark-gated
         }
     }
 }
@@ -575,6 +595,11 @@ pub struct PredictFragConfig {
     pub peptdeep_python: Option<String>,
     /// Python executable for the DeepLC sidecar (env with deeplc + pyarrow).
     pub deeplc_python: Option<String>,
+    /// Ion-mobility predictor for `predicted_im`. Default `none` (the column is null);
+    /// `im2deep` requires `im2deep_python`. Only rt-im-train reads the column so far.
+    pub im_predictor: ImPredictorKind,
+    /// Python executable for the IM2Deep sidecar (env with im2deep + psm_utils + pyarrow).
+    pub im2deep_python: Option<String>,
     /// Directory holding the sidecar worker scripts.
     pub sidecar_script_dir: String,
 }
@@ -593,6 +618,8 @@ impl Default for PredictFragConfig {
             peptdeep_instrument: "Lumos".to_string(),
             peptdeep_python: None,
             deeplc_python: None,
+            im_predictor: ImPredictorKind::None,
+            im2deep_python: None,
             sidecar_script_dir: "scripts".to_string(),
         }
     }
@@ -629,6 +656,36 @@ pub struct SearchSeedConfig {
     /// removes any m/z-correlated curvature the flat offset leaves. Default false
     /// (scalar offset unchanged), opt-in and benchmark-gated.
     pub mass_cal_loess: bool,
+    /// Fragment tolerance estimator. 0 (default) keeps `1.5 * p95(|dev - median|)`.
+    /// When > 0 the tolerance is `k * 1.4826 * MAD(dev - median)`, floored at 5 ppm: a
+    /// multiple of the robust sigma of the calibrant deviations. On diaPASEF the p95 is
+    /// set by a 6-20 ppm shoulder of the deviation distribution and lands at the search
+    /// tolerance (~20 ppm), while the MAD tracks the core (TIMS roadmap, "P6 result").
+    /// Benchmark-gated; no default is claimed.
+    pub frag_tol_mad_k: f64,
+    /// Ion-mobility gate on the seed probe (diaPASEF, docs/07_search_seed.md): a matched
+    /// peak counts only when its 1/K0 lies within `im_window` of the candidate's library
+    /// `predicted_im`. The seed runs before any IM calibration, so `fixed` gates on the raw
+    /// prediction, and `two_pass` first runs ungated, maps the prediction onto the run
+    /// with a CCS fit on that pass's confident anchors, and reruns gated. Candidates
+    /// without `predicted_im`, and 3D scans, are never gated. Default `off`.
+    pub im_gate: SeedImGate,
+    /// Half-width of the seed IM gate, in V s cm^-2. Default 0.10, wide enough for
+    /// uncalibrated IM2Deep on the benchmark (p95 |error| 0.07).
+    pub im_window: f64,
+}
+
+/// Seed IM gate mode; see [`SearchSeedConfig::im_gate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedImGate {
+    #[default]
+    Off,
+    /// Gate on the uncalibrated library `predicted_im` +/- `im_window`.
+    Fixed,
+    /// Ungated pass, a global CCS calibration on its confident anchors, then a gated
+    /// pass at +/- `im_window` around the calibrated prediction.
+    TwoPass,
 }
 impl Default for SearchSeedConfig {
     fn default() -> Self {
@@ -641,6 +698,9 @@ impl Default for SearchSeedConfig {
             matcher: MatcherKind::Fragindex,
             two_pass_mass_cal: false,
             mass_cal_loess: false,
+            frag_tol_mad_k: 0.0,
+            im_gate: SeedImGate::Off,
+            im_window: 0.10,
         }
     }
 }
@@ -755,6 +815,23 @@ pub struct RtImTrainConfig {
     /// DIA-NN library iRT and 10,181 from a per-run fine-tune, with `w_rt` 343 s against
     /// 632 s and 472 s (docs/08 section 4c). `run-experiment` predicts once per experiment.
     pub library_irt: LibraryIrt,
+    /// Ion-mobility calibration (docs/08, "IM calibration"). Runs when the library carries
+    /// `predicted_im` and the seed carries `observed_im`; otherwise the IM columns of
+    /// `run_windows` stay null. The fit is per-charge linear in CCS space,
+    /// `obs_ccs = a_z + b_z * pred_ccs`, over confident target seed anchors (best per
+    /// candidate). A charge with fewer anchors than this uses the global fit.
+    pub im_min_anchors_per_charge: usize,
+    /// Percentile of held-out |observed - calibrated| 1/K0 residuals for `w_im`.
+    pub p_im: f64,
+    /// Multiplier on that percentile.
+    pub im_window_multiplier: f64,
+    /// Lower clamp for the IM half-window, V s cm^-2.
+    pub im_window_min: f64,
+    /// Fraction of anchor peptides held out to size `w_im` (the `window_holdout_frac`
+    /// rule, keyed on `base_peptide_id`). IM is sized held-out from the start: in-sample
+    /// residuals are optimistic and can rank models backwards (docs/08 section 4). Must
+    /// lie in (0, 0.9].
+    pub im_window_holdout_frac: f64,
 }
 
 /// Source of `predicted_irt` for an imported library; see `RtImTrainConfig::library_irt`.
@@ -841,6 +918,11 @@ impl Default for RtImTrainConfig {
             rt_window_min_s: 1.0,
             window_holdout_frac: 0.0,
             library_irt: LibraryIrt::Auto,
+            im_min_anchors_per_charge: 50,
+            p_im: 0.95,
+            im_window_multiplier: 1.0,
+            im_window_min: 0.005,
+            im_window_holdout_frac: 0.3,
         }
     }
 }
@@ -1040,6 +1122,24 @@ pub struct ExtractConfig {
     /// this while the peak-integrated spectral score exceeds `gate_min_score`.
     /// Requiring BOTH is more specific (rejects interferents that pass one axis).
     pub gate_coelution_min: f64,
+    /// Ion-mobility gate (diaPASEF, docs/09_extract.md): a peak contributes to a
+    /// candidate only when its 1/K0 lies inside the candidate's calibrated
+    /// `run_windows` [`im_lo`, `im_hi`]. A candidate with a null IM window, and a 3D scan,
+    /// are not gated. Default `off`, which leaves extraction bit-identical.
+    pub im_gate: ImGate,
+}
+
+/// Extraction IM gate mode; see [`ExtractConfig::im_gate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImGate {
+    #[default]
+    Off,
+    /// Gate the fragment peaks of every MS2 trace.
+    Fragments,
+    /// Gate the fragment peaks and the MS1 precursor lookups (XICs, isotope features,
+    /// the MS1 claim cue) on the same window.
+    FragmentsMs1,
 }
 impl Default for ExtractConfig {
     fn default() -> Self {
@@ -1116,6 +1216,7 @@ impl Default for ExtractConfig {
             emit_gate_diagnostics: false, // diagnostic gate-score columns; off in production
             gate_mode: GateMode::ApexPearson, // legacy single-scan intensity Pearson
             gate_coelution_min: 0.5,      // used only by GateMode::Combined
+            im_gate: ImGate::Off,
         }
     }
 }
@@ -1196,6 +1297,22 @@ pub struct FeaturesConfig {
     /// overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and
     /// benchmark-gated rather than default-on (AlphaDIA-plan item 12).
     pub ms1_precursor_features: bool,
+    /// Append the ion-mobility feature block (docs/10_features.md, "Ion-mobility
+    /// features"; TIMS roadmap P5) after every other column: IM error against the
+    /// calibrated prediction, fragment IM dispersion at the apex, MS1 IM agreement and
+    /// the IM spread over the elution peak. Needs 4D data (psms_extracted v4,
+    /// chromatograms v2); on 3D data the columns are constant zeros. Default false: off,
+    /// the feature list, schema id and PIN column order are unchanged. Benchmark-gated.
+    pub im_features: bool,
+    /// Append the ion-mobility peak-shape block (docs/10_features.md, "Ion-mobility
+    /// features"; TIMS roadmap P7) after every other column, including the
+    /// `im_features` block: fragment mobility width and its spread at the apex, the
+    /// Gaussian overlap of each fragment's mobility peak with the fragment consensus,
+    /// and the MS1 precursor's width and overlap. Needs `convert.tdf_im_width` (spectra
+    /// v3, psms_extracted v5); without it the columns are constant zeros. Default
+    /// false: off, the feature list, schema id and PIN column order are unchanged.
+    /// Benchmark-gated.
+    pub im_shape_features: bool,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -1215,6 +1332,8 @@ impl Default for FeaturesConfig {
             bound_from_confident: true, // fixed feature window from confident-seed norm
             bound_confident_pct: 50.0, // median confident half-width
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
+            im_features: false,  // opt-in; TIMS P5, benchmark-gated
+            im_shape_features: false, // opt-in; TIMS P7, benchmark-gated
         }
     }
 }
@@ -2121,6 +2240,8 @@ impl Config {
                 "search_seed.fragment_tol_ppm",
                 self.search_seed.fragment_tol_ppm,
             ),
+            // Seed IM gate half-width; zero or negative admits no peak.
+            ("search_seed.im_window", self.search_seed.im_window),
             ("extract.frag_tol_ppm", self.extract.frag_tol_ppm),
             ("extract.prec_tol_ppm", self.extract.prec_tol_ppm),
         ] {
@@ -2133,6 +2254,13 @@ impl Config {
             }
         }
 
+        if !self.search_seed.frag_tol_mad_k.is_finite() || self.search_seed.frag_tol_mad_k < 0.0 {
+            return Err(Invalid(format!(
+                "search_seed.frag_tol_mad_k must be finite and >= 0 (got {}); 0 keeps the \
+                 p95 tolerance estimator",
+                self.search_seed.frag_tol_mad_k
+            )));
+        }
         if !self.rescore.entrapment_ratio.is_finite() || self.rescore.entrapment_ratio <= 0.0 {
             return Err(Invalid(
                 "rescore.entrapment_ratio must be finite and > 0. It is \
@@ -2432,6 +2560,15 @@ impl Config {
             ));
         }
 
+        // The seed IM gate lives in the fragindex accumulator only.
+        if self.search_seed.im_gate != SeedImGate::Off
+            && self.search_seed.matcher != MatcherKind::Fragindex
+        {
+            return Err(Invalid(
+                "search_seed.im_gate needs search_seed.matcher = fragindex".into(),
+            ));
+        }
+
         // The remaining active numeric fields, by their documented domains (docs/30 R5):
         // fractions and q-values inside their unit interval, correlations and percentiles
         // inside theirs, tolerances and widths positive, counts at least one where zero
@@ -2658,6 +2795,26 @@ mod tests {
         assert!(Config::from_json(r#"{"quant":{"baseline_quantile":-0.5}}"#).is_err());
         // Unknown enum variants must fail rather than fall back to the default ranking.
         assert!(Config::from_json(r#"{"quant":{"fragment_selection":"library"}}"#).is_err());
+    }
+
+    #[test]
+    fn im_gates_default_off_parse_and_are_validated() {
+        let d = Config::default();
+        assert_eq!(d.extract.im_gate, ImGate::Off);
+        assert_eq!(d.search_seed.im_gate, SeedImGate::Off);
+        let c = Config::from_json(
+            r#"{"extract":{"im_gate":"fragments_ms1"},
+                 "search_seed":{"im_gate":"two_pass","im_window":0.06}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.extract.im_gate, ImGate::FragmentsMs1);
+        assert_eq!(c.search_seed.im_gate, SeedImGate::TwoPass);
+        assert_eq!(c.search_seed.im_window, 0.06);
+        assert!(Config::from_json(r#"{"search_seed":{"im_window":0.0}}"#).is_err());
+        assert!(
+            Config::from_json(r#"{"search_seed":{"im_gate":"fixed","matcher":"bucketed"}}"#)
+                .is_err()
+        );
     }
 
     #[test]

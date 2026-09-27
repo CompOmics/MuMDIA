@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::{bail, Result};
-use mumdia_core::config::{FragPredictorKind, PredictFragConfig, RtPredictorKind};
+use mumdia_core::config::{FragPredictorKind, ImPredictorKind, PredictFragConfig, RtPredictorKind};
 use mumdia_core::mass::{parse_peptidoform, Fragment, ParsedPeptidoform};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
@@ -42,6 +42,8 @@ struct Raw {
     precursor_mz: f64,
     frags: Vec<Fragment>,
     irt: f32,
+    /// Predicted 1/K0 (V s cm^-2); `None` without an IM predictor.
+    im: Option<f64>,
     frag_int: Vec<f32>,
     /// Parsed form kept from phase A so `assign_rt`/`assign_intensities` reuse
     /// it instead of re-parsing `peptidoform` (identical parse output).
@@ -109,6 +111,7 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
                 precursor_mz: parsed.precursor_mz(z),
                 frags,
                 irt: 0.0,
+                im: None,
                 frag_int: Vec::new(),
                 parsed,
             })
@@ -131,7 +134,13 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
 
     let (rt_model_id, rt_missing) = assign_rt(&p, &mut raws)?;
     let (frag_model_id, frag_missing) = assign_intensities(&p, &mut raws)?;
-    let model_identity = format!("{rt_model_id}; {frag_model_id}");
+    let t_im = Instant::now();
+    let im_model_id = assign_im(&p, &mut raws)?;
+    let im_elapsed_ms = t_im.elapsed().as_millis();
+    let model_identity = match &im_model_id {
+        Some(im) => format!("{rt_model_id}; {frag_model_id}; {im}"),
+        None => format!("{rt_model_id}; {frag_model_id}"),
+    };
 
     // Coverage. A candidate a predictor returned nothing for is dropped, together with
     // every candidate sharing its pair key (base peptide, charge, modification set), so
@@ -238,7 +247,8 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
         Vec::with_capacity(n),
         Vec::with_capacity(n),
     );
-    let (mut pform_c, mut z_c, mut mz_c, mut irt_c) = (
+    let (mut pform_c, mut z_c, mut mz_c, mut irt_c, mut im_c) = (
+        Vec::with_capacity(n),
         Vec::with_capacity(n),
         Vec::with_capacity(n),
         Vec::with_capacity(n),
@@ -270,6 +280,7 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
         z_c.push(r.charge);
         mz_c.push(r.precursor_mz);
         irt_c.push(r.irt);
+        im_c.push(r.im);
         label_c.push(r.label);
         prot_c.push(r.protein);
         nfrag_c.push(r.frags.len() as i32);
@@ -297,6 +308,8 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
             Col::Str("label".into(), label_c),
             Col::Str("protein".into(), prot_c),
             Col::I32("n_fragments".into(), nfrag_c),
+            // v2: always present, null without an IM predictor (schema.rs).
+            Col::OptF64("predicted_im".into(), im_c),
         ],
     )?;
     // Fragment cardinality: distinct precursors sharing each fragment m/z (0.01 Da
@@ -324,6 +337,9 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     stats.insert("candidates".to_string(), json!(n_prec));
     stats.insert("fragments".to_string(), json!(n_frag));
     stats.insert("parse_errors".to_string(), json!(n_parse_err));
+    if im_model_id.is_some() {
+        stats.insert("im_prediction_ms".to_string(), json!(im_elapsed_ms));
+    }
     stats.insert(
         "candidates_dropped_with_their_pair".to_string(),
         json!(n_collateral),
@@ -353,6 +369,7 @@ pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
             content_hash: mumdia_io::hash::blake3_file(path)?,
             params: json!({"top_n": p.cfg.top_n_fragments, "ms2pip_model": p.cfg.ms2pip_model,
                            "rt_predictor": format!("{:?}", p.cfg.rt_predictor),
+                           "im_predictor": format!("{:?}", p.cfg.im_predictor),
                            "fragment_predictor": format!("{:?}", p.cfg.predictor)}),
             stats: stats.clone(),
             model_identity: Some(model_identity.clone()),
@@ -412,6 +429,59 @@ fn assign_rt(p: &PredictFragParams, raws: &mut [Raw]) -> Result<(String, Vec<usi
             // different DeepLC releases are different libraries (docs/30, model identity).
             let version = sidecar::require_deeplc_version(python)?;
             Ok((format!("deeplc-{version}-base"), missing))
+        }
+    }
+}
+
+/// Assign a predicted 1/K0 to every candidate. Returns the model id, or `None` when no IM
+/// predictor is configured (every `im` stays `None`). A candidate IM2Deep returns nothing
+/// for is an error, not a drop: the model covers any ProForma peptidoform DeepLC's
+/// encoding covers, so a miss means a failing worker.
+fn assign_im(p: &PredictFragParams, raws: &mut [Raw]) -> Result<Option<String>> {
+    match p.cfg.im_predictor {
+        ImPredictorKind::None => Ok(None),
+        ImPredictorKind::Im2deep => {
+            let python = p.cfg.im2deep_python.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("im_predictor=im2deep requires predict_frag.im2deep_python")
+            })?;
+            let script =
+                crate::sidecar::resolve_script(&p.cfg.sidecar_script_dir, "im2deep_worker.py");
+            // Dedup by (peptidoform, charge); the precursor m/z follows from the pair.
+            let mut uniq: std::collections::BTreeMap<(&str, i32), u32> = Default::default();
+            let (mut ids, mut peps, mut zs, mut mzs) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for r in raws.iter() {
+                let key = (r.peptidoform.as_str(), r.charge);
+                if !uniq.contains_key(&key) {
+                    let id = uniq.len() as u32;
+                    uniq.insert(key, id);
+                    ids.push(id);
+                    peps.push(r.peptidoform.clone());
+                    zs.push(r.charge);
+                    mzs.push(r.precursor_mz);
+                }
+            }
+            let ids_by_row: Vec<u32> = raws
+                .iter()
+                .map(|r| uniq[&(r.peptidoform.as_str(), r.charge)])
+                .collect();
+            let out = sidecar::run_im2deep(python, &script, p.work_dir, &ids, &peps, &zs, &mzs)?;
+            let missing = ids.iter().filter(|id| !out.contains_key(id)).count();
+            if missing > 0 {
+                bail!(
+                    "predict-frag: IM2Deep returned no prediction for {missing} of {} precursors",
+                    ids.len()
+                );
+            }
+            for (r, id) in raws.iter_mut().zip(ids_by_row) {
+                r.im = Some(out[&id]);
+            }
+            let version = sidecar::require_version(
+                python,
+                "im2deep",
+                mumdia_core::constants::MIN_IM2DEEP_VERSION,
+            )?;
+            Ok(Some(format!("im2deep-{version}-uni")))
         }
     }
 }

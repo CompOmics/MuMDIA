@@ -23,7 +23,8 @@ apportioned.
 
 RT is applied as a per-candidate window post-filter (the documented Stage D part
 2 fallback), and the MVP is 3D so the ion-mobility (IM) dimension is absent
-(`extract.rs:8`, `apex_im` is always written `None` at `extract.rs:3375`).
+(`extract.rs:8`). On diaPASEF data the native reader keeps a per-peak 1/K0, which the
+optional IM gate (section 6b) and the IM evidence columns use.
 
 ## Files
 
@@ -72,7 +73,7 @@ the CLI in `main.rs:535` (`Cmd::Extract`) and from the orchestrator in
 - `restrict_candidates` (optional prior `psms.parquet`): a `candidate_id`
   allowlist (`extract.rs:1316`) for the "gate first, then compete" workflow.
 
-### Output: `psms_extracted` (`out_psms`, schema `psms_extracted` v1)
+### Output: `psms_extracted` (`out_psms`, schema `psms_extracted` v4)
 
 Column order and types from `extract.rs:2480`:
 
@@ -81,7 +82,15 @@ Column order and types from `extract.rs:2480`:
 | `candidate_id` | U32 | Library candidate id (sorted ascending in the file) |
 | `peak_rank` | I32 | Chromatographic peak rank; 0 = selected apex. Ranks >= 1 exist only when `promote_top_peaks > 1` (`extract.rs:2205`) |
 | `apex_rt` | F64 | Selected apex RT (seconds) |
-| `apex_im` | OptF64 | Always null (3D MVP) |
+| `apex_im` | OptF64 | 4D data (schema v3): intensity-weighted median 1/K0 of the peaks nearest each library fragment in the apex scan, within the learned fragment tolerance (and inside the IM window under `im_gate`); the seed's `observed_im` definition at the extraction apex. Null on 3D data. Read by `features.im_features` |
+| `apex_im_mad` | OptF64 | 4D data (v4): intensity-weighted mean absolute deviation of the same fragment peaks' 1/K0 from `apex_im`. Null on 3D data |
+| `ms1_apex_im` | OptF64 | 4D data (v4): in the MS1 scan nearest the apex, the 1/K0 of the peak within `prec_tol_ppm` of the monoisotopic m/z that lies nearest `apex_im` (the most intense one when `apex_im` is null; inside the IM window under `fragments_ms1`). Null without an in-tolerance MS1 peak or on 3D data |
+| `im_pred_cal` | OptF64 | v4: the candidate's calibrated 1/K0 from `run_windows`, null without IM calibration |
+| `apex_im_width` | OptF64 | v5, only with spectra v3 `im_width`: intensity-weighted median mobility width of the same apex fragment peaks |
+| `apex_im_width_mad` | OptF64 | v5: their intensity-weighted mean absolute deviation from `apex_im_width` |
+| `apex_im_overlap` | OptF64 | v5: intensity-weighted mean Bhattacharyya coefficient of each fragment peak N(1/K0, width) against the consensus N(`apex_im`, `apex_im_width`) |
+| `ms1_im_width` | OptF64 | v5: mobility width of the `ms1_apex_im` peak |
+| `ms1_frag_overlap` | OptF64 | v5: Bhattacharyya coefficient of that MS1 peak against the fragment consensus |
 | `apex_intensity` | F32 | Full summed intensity of the apex scan group |
 | `n_matched_fragments` | I32 | Distinct matched predicted fragments |
 | `n_predicted_fragments` | I32 | Predicted fragment count for the candidate |
@@ -123,7 +132,7 @@ the two-pass path did not run):
   of contested intensity the candidate retains under proportional apportionment
   (1 = keeps all; ~0 = a peak-borrower stripped by its co-eluting competitors).
 
-### Output: `chromatograms` (`out_chrom`, schema `chromatograms` v1)
+### Output: `chromatograms` (`out_chrom`, schema `chromatograms` v2)
 
 Column order from `extract.rs:2528`:
 
@@ -136,6 +145,7 @@ Column order from `extract.rs:2528`:
 | `predicted_intensity` | F32 | Library predicted intensity (0.0 for MS1 rows) |
 | `rt` | LargeListF32 | Per-scan RT axis of the trace |
 | `intensity` | LargeListF32 | Per-scan intensity, 0-filled on the window grid |
+| `im` | LargeListF32 | v2, 4D data only: per-point 1/K0 parallel to `intensity`, the 1/K0 of the peak whose intensity the point carries (0.0 where the intensity is 0; empty on the MS1 rows). A 3D run does not write the column, so its table is exactly v1 |
 
 One row is emitted for **every** predicted transition (`extract.rs:2095`), so
 `features` sees the full predicted set and can penalize a missing strong ion. A
@@ -498,6 +508,56 @@ isotope offsets and `sum_near` (`extract.rs:495`) to integrate within
 are the per-PSM columns, taken from the nearest MS1 scan to the apex RT
 (`extract.rs:1957`).
 
+### 6b. Ion-mobility gate (`im_gate`, diaPASEF, default off)
+
+`extract.im_gate` makes a peak count for a candidate only when the peak's 1/K0 lies inside
+the candidate's calibrated IM window, `run_windows.im_lo`/`im_hi` (rt-im-train, docs/08
+section 7). It is a hard gate, applied in the probe callback beside each of the eight RT
+guards (the default streamed path, the four two-pass branches plus EM, demix, and the
+serial path). A gated peak therefore neither collects a hit nor competes in the peak claim.
+`Hit` and `Peak` are unchanged: the peak's 1/K0 is read from the scan's parallel `im`
+vector (`Ms2Scan::im`).
+
+- `off` (default): no IM is read, and output is bit-identical to the ungated engine.
+- `fragments`: MS2 fragment peaks are gated.
+- `fragments_ms1`: `sum_near` is also gated with the same window, so the MS1 XIC rows, the
+  apex isotope columns and the MS1 claim cue count only precursor peaks inside the window.
+
+A candidate with a null IM window keeps -inf/+inf and is not gated, as an unbounded RT
+window is not. A 3D scan (empty `im`) is never gated. If the gate is on but `run_windows`
+has no IM window at all (3D data, or no IM calibration), extract warns and runs ungated.
+The window width is sized in rt-im-train (`w_im`, `im_window_multiplier`), so a sweep of
+the gate width is a sweep of `rt_im_train.im_window_multiplier`.
+
+Candidates are accumulated per candidate across all windows, so a precursor near a slot
+boundary still produces one row. The per-candidate scan grid remains m/z-only; this is
+exact while slots have disjoint m/z ranges, which holds on both benchmark schemes (see the
+`ponytail:` note at the grid build).
+
+Measured effect: docs/TIMS_ROADMAP.md, "P4 result".
+
+**Tolerance and gate on diaPASEF (TIMS roadmap, "P6 result").** On the Ultra 2 E. coli run
+two extraction settings dominate the IM gate's own effect. The tolerance read from
+`--mass-cal` was 20.4-21.8 ppm, set by a shoulder of the calibrant deviations rather than
+by the data's precision; a fixed 12 ppm (the same offset) is +6% peptides, and
+`search_seed.frag_tol_mad_k: 4` learns it (docs/07, step 6). At that tolerance the
+spectral-agreement gate is the binding extraction loss: `gate_min_score` 0 leaves 203
+DIA-NN 1% peptides never extracted, against 3,411 at the default 0.2, and gives +11.7%
+peptides (3 seeds) at an unchanged decoy fraction, for 3.2x the candidates. Neither
+presence threshold binds there. Gate 0 is unvalidated by entrapment and is not a default.
+
+**Ion-mobility evidence for features (v4 / v2, written on every 4D run).** `Hit` carries
+the matched peak's 1/K0 as a u16 (1/K0 x 1e4, so `Hit` stays 24 bytes), read from
+`Ms2Scan::im` whatever the gate. Where two hits of one fragment share a scan, the traced
+intensity is the larger one, and the point's 1/K0 is that hit's. The per-point values are
+moved through the window-grid alignment with the intensities and written as the
+chromatograms `im` list. The `apex_im` post-pass also writes `apex_im_mad` and
+`ms1_apex_im` from the same apex-scan lookup, and `im_pred_cal` is copied from
+`run_windows`. When the spectra carry per-peak widths (v3, `convert.tdf_im_width`), the
+same post-pass writes the five v5 peak-shape columns from the same fragment and MS1 peaks
+(`features::im::apex_shape`); otherwise they are null. None of this changes a score: the features stage reads these columns only
+under `features.im_features` (docs/10_features.md, "Ion-mobility features").
+
 ### 7. Top-K peak enumeration (`retain_top_peaks`)
 
 Two independent knobs consume the enumerator, and they must not be confused:
@@ -595,7 +655,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `presence_min_matched` | 3 | Tier-b: minimum distinct matched fragments (`extract.rs:1727`) |
 | `presence_min_fragments` | 3 | Acceptance: minimum distinct fragments (`extract.rs:1926`) |
 | `presence_min_coelution` | 2 | Min simultaneously-present fragments to extend a run (`extract.rs:1915`) |
-| `gate_min_score` | **0.2** | Pearson/gate threshold; 0 disables the gate. Measured better than 0.6 for both rescorers under the current defaults; see docs/18. Renamed from `min_frag_corr`, which is not a correlation under any `gate_mode` except by coincidence |
+| `gate_min_score` | **0.2** | Pearson/gate threshold; 0 disables the gate. Measured better than 0.6 for both rescorers under the current defaults; see docs/18. Renamed from `min_frag_corr`, which is not a correlation under any `gate_mode` except by coincidence. On diaPASEF (TIMS roadmap, "P6 result") 0 measured +11.7% peptides, entrapment pending |
 | `min_matched_fraction` | 0.0 | Acceptance: min matched/predicted fraction (default off) |
 | `apex_top_fragments` | 0 | Signature-ion count for apex; 0 -> default 3 (`extract.rs:1860`). Config marks it superseded by `apex_count_tol`, kept for compat (`config.rs:545`) |
 | `apex_rt_prior_s` | 0.0 | Gaussian RT-prior sigma on apex tiebreak; 0 = off |
@@ -641,6 +701,8 @@ here for one index.
 
 | knob | extra columns / artifact | validation status |
 |---|---|---|
+| `extract.im_gate` (default `off`) | none; `apex_im` is filled on 4D data whatever the gate | benchmark-gated (docs/TIMS_ROADMAP.md P4); see section 6b |
+| `search_seed.im_gate` / `im_window` (default `off`) | none | benchmark-gated; see docs/07 "Ion-mobility gate" |
 | `extract.retain_top_peaks` (`config.rs:635`, default 1) | `<out_psms>.peaks.parquet` sidecar, unscored, written only when K>1 (`extract.rs:2544`); no PSM columns | ID loop not closed (sidecar peaks are unscored); gate pending |
 | `extract.promote_top_peaks` (`config.rs:645`, default 1) | extra `psms_extracted` rows with `peak_rank >= 1` (`extract.rs:2297`); no new columns | **not schema-neutral in rows**: changes the scored population and therefore FDR; gate pending |
 | `extract.emit_candidate_audit` (`config.rs:658`) | none in `extract.rs` (unused there); in `run` it gates the `audit` stage -> `candidate_audit.parquet` (`run.rs:428`) | diagnostic; no ID effect |
@@ -695,7 +757,7 @@ here for one index.
 - **Empty vs zero traces**: a never-observed predicted fragment carries an empty
   trace, not a grid-length zero vector (`extract.rs:2098`). Downstream code must
   treat an empty trace as `obs_apex = 0`.
-- **`apex_im` is always null** (3D MVP); do not assume an IM value.
+- **The IM columns are null on 3D data** (`apex_im`, `apex_im_mad`, `ms1_apex_im`; `im_pred_cal` without IM calibration), and the chromatograms `im` column is written only on 4D data. `features.im_features` reads them (P5 in docs/TIMS_ROADMAP.md).
 - **`restrict_candidates` only forces the serial path in the non-two-pass case.**
   In the non-two-pass branch the parallel window accumulation is used only when a
   fragindex is present **and** there is no `restrict` list (`extract.rs:1455`); a
@@ -766,6 +828,5 @@ tests encode the behavioral invariants that gate tuning must preserve.
   (`extract.rs:2480`). Gate any non-production column behind an `emit_*` flag to
   preserve the byte-identical default schema, and bump the schema version in
   `schema.rs` if the default schema changes.
-- **IM / 4D**: `apex_im` and the IM data-model hooks exist but are unfilled; a
-  diaPASEF extension adds an IM window post-filter alongside the RT window and IM
-  apex/feature families. It cannot be validated without diaPASEF data.
+- **IM / 4D**: the IM gate (section 6b) and the IM evidence columns exist; the
+  per-candidate scan grid is still m/z-only (see the `ponytail:` note at the grid build).

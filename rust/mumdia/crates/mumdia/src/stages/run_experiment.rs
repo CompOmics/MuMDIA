@@ -1028,7 +1028,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .insert("rescorer".into(), actual_rescorer_model);
     prov.model_identities.insert(
         "feature_schema_id".into(),
-        features::feature_schema_id(&features::active_features(cfg.features.set)),
+        features::feature_schema_id(&features::active_features(
+            cfg.features.set,
+            cfg.features.im_features,
+            cfg.features.im_shape_features,
+        )),
     );
     prov.model_identities
         .insert("mbr".into(), format!("{:?}", cfg.mbr.strategy));

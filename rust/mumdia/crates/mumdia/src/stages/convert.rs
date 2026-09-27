@@ -156,11 +156,13 @@ struct Ms1Chunk {
     mz: Vec<Vec<f32>>,
     inten: Vec<Vec<f32>>,
     im: Vec<Vec<f32>>,
+    im_width: Vec<Vec<f32>>,
 }
 
 impl Ms1Chunk {
-    /// `has_im` is fixed per run, so every row group has the same columns.
-    fn cols(&mut self, has_im: bool) -> Vec<Col> {
+    /// `has_im` and `has_width` are fixed per run, so every row group has the same
+    /// columns.
+    fn cols(&mut self, has_im: bool, has_width: bool) -> Vec<Col> {
         let mut c = vec![
             Col::U32("scan_index".into(), std::mem::take(&mut self.idx)),
             Col::F64("rt_seconds".into(), std::mem::take(&mut self.rt)),
@@ -169,6 +171,12 @@ impl Ms1Chunk {
         ];
         if has_im {
             c.push(Col::LargeListF32("im".into(), std::mem::take(&mut self.im)));
+        }
+        if has_width {
+            c.push(Col::LargeListF32(
+                "im_width".into(),
+                std::mem::take(&mut self.im_width),
+            ));
         }
         c
     }
@@ -191,10 +199,11 @@ struct Ms2Chunk {
     mz: Vec<Vec<f32>>,
     inten: Vec<Vec<f32>>,
     im: Vec<Vec<f32>>,
+    im_width: Vec<Vec<f32>>,
 }
 
 impl Ms2Chunk {
-    fn cols(&mut self, has_im: bool) -> Vec<Col> {
+    fn cols(&mut self, has_im: bool, has_width: bool) -> Vec<Col> {
         let mut c = vec![
             Col::U32("scan_index".into(), std::mem::take(&mut self.idx)),
             Col::Str("id".into(), std::mem::take(&mut self.id)),
@@ -212,6 +221,12 @@ impl Ms2Chunk {
         ];
         if has_im {
             c.push(Col::LargeListF32("im".into(), std::mem::take(&mut self.im)));
+        }
+        if has_width {
+            c.push(Col::LargeListF32(
+                "im_width".into(),
+                std::mem::take(&mut self.im_width),
+            ));
         }
         c
     }
@@ -265,6 +280,8 @@ enum Decoded {
         inten: Vec<f32>,
         /// Per-peak 1/K0; `None` for a 3D source.
         im: Option<Vec<f32>>,
+        /// Per-peak mobility width (`convert.tdf_im_width`); `None` otherwise.
+        im_width: Option<Vec<f32>>,
         nonfinite_peaks: usize,
     },
     Ms2(Box<Ms2Row>),
@@ -286,6 +303,8 @@ struct Ms2Row {
     pz: Option<i32>,
     /// Per-peak 1/K0 and the window's 1/K0 bounds; `None` for a 3D source.
     im: Option<Vec<f32>>,
+    /// Per-peak mobility width (`convert.tdf_im_width`); `None` otherwise.
+    im_width: Option<Vec<f32>>,
     im_lo: Option<f32>,
     im_hi: Option<f32>,
 }
@@ -306,6 +325,7 @@ fn decode_one<S: SpectrumLike>(spec: &S, top_ms1: usize, top_ms2: usize) -> Deco
                 mz,
                 inten,
                 im: None,
+                im_width: None,
                 nonfinite_peaks,
             }
         }
@@ -336,6 +356,7 @@ fn decode_one<S: SpectrumLike>(spec: &S, top_ms1: usize, top_ms2: usize) -> Deco
                 pmz,
                 pz,
                 im: None,
+                im_width: None,
                 im_lo: None,
                 im_hi: None,
             }))
@@ -363,6 +384,8 @@ struct Fold {
     ms2: Ms2Chunk,
     /// Whether the source carries ion mobility; fixes the column set of every chunk.
     has_im: bool,
+    /// Whether the source carries per-peak mobility widths (spectra v3 `im_width`).
+    has_width: bool,
     /// Distinct isolation windows (id, target, lower, upper, im_lower, im_upper); ids by
     /// first appearance in scan order.
     uniq: Vec<IsoWindow>,
@@ -378,9 +401,10 @@ struct Fold {
 }
 
 impl Fold {
-    fn new(ms1_path: &str, ms2_path: &str, has_im: bool) -> Self {
+    fn new(ms1_path: &str, ms2_path: &str, has_im: bool, has_width: bool) -> Self {
         Self {
             has_im,
+            has_width,
             ms1_w: TableWriter::new(ms1_path).with_row_group_rows(SPECTRA_CHUNK),
             ms2_w: TableWriter::new(ms2_path).with_row_group_rows(SPECTRA_CHUNK),
             ms1: Ms1Chunk::default(),
@@ -409,6 +433,7 @@ impl Fold {
                 mz,
                 inten,
                 im,
+                im_width,
                 nonfinite_peaks,
             } => {
                 self.nonfinite_peaks += nonfinite_peaks;
@@ -419,9 +444,13 @@ impl Fold {
                 if self.has_im {
                     self.ms1.im.push(im.unwrap_or_default());
                 }
+                if self.has_width {
+                    self.ms1.im_width.push(im_width.unwrap_or_default());
+                }
                 self.last_ms1_index = Some(scan_index);
                 if self.ms1.idx.len() >= SPECTRA_CHUNK {
-                    self.ms1_w.write_cols(self.ms1.cols(self.has_im))?;
+                    self.ms1_w
+                        .write_cols(self.ms1.cols(self.has_im, self.has_width))?;
                 }
             }
             Decoded::Ms2(r) => {
@@ -437,6 +466,7 @@ impl Fold {
                     pmz,
                     pz,
                     im,
+                    im_width,
                     im_lo,
                     im_hi,
                 } = *r;
@@ -476,11 +506,15 @@ impl Fold {
                 if self.has_im {
                     self.ms2.im.push(im.unwrap_or_default());
                 }
+                if self.has_width {
+                    self.ms2.im_width.push(im_width.unwrap_or_default());
+                }
                 self.map_ms2.push(scan_index);
                 self.map_ms1
                     .push(self.last_ms1_index.map(|x| x as i32).unwrap_or(-1));
                 if self.ms2.idx.len() >= SPECTRA_CHUNK {
-                    self.ms2_w.write_cols(self.ms2.cols(self.has_im))?;
+                    self.ms2_w
+                        .write_cols(self.ms2.cols(self.has_im, self.has_width))?;
                 }
             }
             Decoded::Other => {}
@@ -926,7 +960,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     let iw_path = format!("{}/isolation_windows.parquet", p.out_dir);
     let map_path = format!("{}/ms2_to_ms1.parquet", p.out_dir);
     let is_tdf = crate::raw::is_tims_tdf(p.mzml);
-    let mut fold = Fold::new(&ms1_path, &ms2_path, is_tdf);
+    let mut fold = Fold::new(&ms1_path, &ms2_path, is_tdf, is_tdf && p.tdf.im_width);
     // `declared` is the spectrum count the source promises, for the truncation check;
     // 0 skips it (a TDF's frame table is read whole by the reader, not streamed).
     let (read, declared) = if is_tdf {
@@ -959,10 +993,11 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         nonfinite_peaks,
         nonfinite_rt,
         first_bad_rt,
+        has_width,
         ..
     } = fold;
-    ms1_w.write_cols(ms1.cols(is_tdf))?;
-    ms2_w.write_cols(ms2.cols(is_tdf))?;
+    ms1_w.write_cols(ms1.cols(is_tdf, has_width))?;
+    ms2_w.write_cols(ms2.cols(is_tdf, has_width))?;
 
     // A short read means the file ended before the index said it would. `--max-spectra`
     // truncates deliberately, so it is excluded.
@@ -1130,7 +1165,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let (m1, m2) = (d.join("ms1.parquet"), d.join("ms2.parquet"));
         let (m1, m2) = (m1.to_str().unwrap(), m2.to_str().unwrap());
-        let mut fold = Fold::new(m1, m2, true);
+        let mut fold = Fold::new(m1, m2, true, false);
         for (k, (lo, hi)) in [(0.6f32, 0.8f32), (0.8, 1.0)].into_iter().enumerate() {
             let row = Ms2Row {
                 rt_s: 10.0,
@@ -1144,6 +1179,7 @@ mod tests {
                 pmz: Some(512.5),
                 pz: None,
                 im: Some(vec![lo, hi]),
+                im_width: None,
                 im_lo: Some(lo),
                 im_hi: Some(hi),
             };
@@ -1161,8 +1197,8 @@ mod tests {
             mut ms2,
             ..
         } = fold;
-        ms1_w.write_cols(ms1.cols(true)).unwrap();
-        ms2_w.write_cols(ms2.cols(true)).unwrap();
+        ms1_w.write_cols(ms1.cols(true, false)).unwrap();
+        ms2_w.write_cols(ms2.cols(true, false)).unwrap();
         ms1_w.close().unwrap();
         ms2_w.close().unwrap();
         let scans = crate::spectra::load_ms2(m2).unwrap();

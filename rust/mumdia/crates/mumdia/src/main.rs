@@ -788,6 +788,7 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
             Role::Ms2pip => cfg.predict_frag.ms2pip_python.clone(),
             Role::Peptdeep => cfg.predict_frag.peptdeep_python.clone(),
             Role::Mbr => cfg.mbr.python.clone(),
+            Role::Im2deep => cfg.predict_frag.im2deep_python.clone(),
         };
         let required = role.required_by(&cfg);
         let wanted = role.wanted_by(&cfg);
@@ -850,7 +851,9 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
                     Ok(missing) if missing.is_empty() => {
                         // Every package whose VERSION changes results, so `doctor`
                         // prints it rather than only asserting it imports.
-                        for m in ["deeplc", "torch", "mokapot", "ms2pip", "peptdeep", "numpy"] {
+                        for m in [
+                            "deeplc", "im2deep", "torch", "mokapot", "ms2pip", "peptdeep", "numpy",
+                        ] {
                             if module_refs.contains(&m) {
                                 if let Some(v) = python::module_version(interp, m) {
                                     r.versions.insert(m.to_string(), v);
@@ -863,12 +866,13 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
                         // predictions, and the 4.0.0a2 multitask preview memorised its
                         // anchors badly enough to invert RT-model rankings
                         // (docs/08_rt_im_train.md). The engine refuses to launch a DeepLC
-                        // worker below `MIN_DEEPLC_VERSION`, so doctor fails here too
+                        // (or IM2Deep) worker below its floor, so doctor fails here too
                         // rather than warning about a run that cannot start.
-                        if role == Role::DeepLc && (required || wanted) {
-                            let floor = mumdia_core::constants::MIN_DEEPLC_VERSION;
+                        if let Some((pkg, floor)) =
+                            role.version_floor().filter(|_| required || wanted)
+                        {
                             let (ma, mi, pa) = floor;
-                            match r.versions.get("deeplc") {
+                            match r.versions.get(pkg) {
                                 Some(v)
                                     if mumdia_core::constants::parse_version3(v)
                                         .is_some_and(|t| t >= floor) => {}
@@ -876,16 +880,16 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
                                     ok = false;
                                     r.status = "fail".into();
                                     r.warnings.push(format!(
-                                        "DeepLC {v} is older than the required {ma}.{mi}.{pa}; \
-                                         the engine refuses to launch the DeepLC workers with it \
-                                         (pip install 'deeplc>={ma}.{mi}.{pa}')"
+                                        "{pkg} {v} is older than the required {ma}.{mi}.{pa}; \
+                                         the engine refuses to launch its workers with it \
+                                         (pip install '{pkg}>={ma}.{mi}.{pa}')"
                                     ));
                                 }
                                 None => {
                                     ok = false;
                                     r.status = "fail".into();
                                     r.warnings.push(format!(
-                                        "cannot determine the deeplc version; {ma}.{mi}.{pa} or \
+                                        "cannot determine the {pkg} version; {ma}.{mi}.{pa} or \
                                          newer is required"
                                     ));
                                 }

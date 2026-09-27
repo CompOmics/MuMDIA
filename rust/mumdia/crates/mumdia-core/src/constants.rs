@@ -22,6 +22,34 @@ pub const PROTON: f64 = 1.007_276_466_812;
 /// neither: its `calibrate` picks a single best-correlating head.
 pub const MIN_DEEPLC_VERSION: (u32, u32, u32) = (4, 4, 0);
 
+/// Oldest IM2Deep the engine accepts. 2.x is the `im2deep.predict` + `im2deep.ccs2im` API
+/// the worker calls; 1.x exposed a different module layout.
+pub const MIN_IM2DEEP_VERSION: (u32, u32, u32) = (2, 0, 0);
+
+/// Mason-Schamp CCS <-> 1/K0 in N2, with the constants IM2Deep uses (`im2deep.utils`,
+/// adapted there from ionmob): gas mass 28.013 Da, 31.85 degC, and the summary constant
+/// 18509.8632163405. The ion mass is taken as `mz * z`, exactly as IM2Deep does, so a CCS
+/// computed here and one computed by the worker agree to rounding.
+const CCS_SUMMARY: f64 = 18_509.863_216_340_5;
+const CCS_GAS_MASS_N2: f64 = 28.013;
+const CCS_TEMP_K: f64 = 31.85 + 273.15;
+
+fn ccs_factor(mz: f64, charge: i32) -> f64 {
+    let m = mz * charge as f64;
+    let reduced_mass = m * CCS_GAS_MASS_N2 / (m + CCS_GAS_MASS_N2);
+    CCS_SUMMARY * charge as f64 / (reduced_mass * CCS_TEMP_K).sqrt()
+}
+
+/// Collisional cross section (A^2) from reduced ion mobility 1/K0 (V s cm^-2).
+pub fn im_to_ccs(im: f64, mz: f64, charge: i32) -> f64 {
+    ccs_factor(mz, charge) * im
+}
+
+/// Reduced ion mobility 1/K0 (V s cm^-2) from a collisional cross section (A^2).
+pub fn ccs_to_im(ccs: f64, mz: f64, charge: i32) -> f64 {
+    ccs / ccs_factor(mz, charge)
+}
+
 /// Parse a PEP 440-ish version string's leading numeric components. Pre-release suffixes
 /// ("4.0.0a2") are dropped, so "4.1.1rc1" compares as 4.1.1; anything unparsable is None.
 pub fn parse_version3(s: &str) -> Option<(u32, u32, u32)> {
@@ -217,5 +245,20 @@ mod version_tests {
         assert!(parse_version3("4.3.0").unwrap() < MIN_DEEPLC_VERSION);
         assert!(parse_version3("4.4.0").unwrap() >= MIN_DEEPLC_VERSION);
         assert!(parse_version3("4.5.0").unwrap() >= MIN_DEEPLC_VERSION);
+        assert!(parse_version3("1.1.0").unwrap() < MIN_IM2DEEP_VERSION);
+        assert!(parse_version3("2.0.2").unwrap() >= MIN_IM2DEEP_VERSION);
+    }
+
+    #[test]
+    fn ccs_conversion_matches_im2deep() {
+        // Reference values from `im2deep.im2ccs` 2.0.2.
+        for (im, mz, z, ccs) in [
+            (0.7, 500.0, 2, 284.250_225_658_435_9),
+            (0.95, 812.4321, 3, 573.984_125_660_762_2),
+            (1.21, 1103.55, 2, 487.671_731_593_510_5),
+        ] {
+            assert!((im_to_ccs(im, mz, z) - ccs).abs() < 1e-9, "{im} {mz} {z}");
+            assert!((ccs_to_im(ccs, mz, z) - im).abs() < 1e-12);
+        }
     }
 }

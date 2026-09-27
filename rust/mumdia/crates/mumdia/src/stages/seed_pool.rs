@@ -76,6 +76,9 @@ struct Row {
     irt: f32,
     matched: i32,
     scan: u32,
+    /// Seed `observed_im` (v2), carried so a grouped run keeps its IM anchors. Null on a
+    /// v1 seed table and on rows the band did not call confident.
+    obs_im: Option<f64>,
 }
 
 fn read_rows(path: &str, offset: u32) -> Result<Vec<Row>> {
@@ -92,6 +95,11 @@ fn read_rows(path: &str, offset: u32) -> Result<Vec<Row>> {
     let irt = t.f32("predicted_irt")?;
     let matched = t.i32("matched_peaks")?;
     let scan = t.u32("scan_index")?;
+    let obs_im = if t.has_column("observed_im") {
+        t.opt_f64("observed_im")?
+    } else {
+        vec![None; t.nrows]
+    };
     let mut rows = Vec::with_capacity(t.nrows);
     for i in 0..t.nrows {
         rows.push(Row {
@@ -109,6 +117,7 @@ fn read_rows(path: &str, offset: u32) -> Result<Vec<Row>> {
             irt: irt[i],
             matched: matched[i],
             scan: scan[i],
+            obs_im: obs_im[i],
         });
     }
     Ok(rows)
@@ -146,6 +155,10 @@ fn write_rows(path: &str, rows: &[Row], q: Vec<f64>) -> Result<u64> {
                 rows.iter().map(|r| r.matched).collect(),
             ),
             Col::U32("scan_index".into(), rows.iter().map(|r| r.scan).collect()),
+            Col::OptF64(
+                "observed_im".into(),
+                rows.iter().map(|r| r.obs_im).collect(),
+            ),
         ],
     )
 }
@@ -415,6 +428,10 @@ mod tests {
                 Col::F32("predicted_irt".into(), irt.to_vec()),
                 Col::I32("matched_peaks".into(), vec![5; n]),
                 Col::U32("scan_index".into(), (0..n as u32).collect()),
+                Col::OptF64(
+                    "observed_im".into(),
+                    irt.iter().map(|&v| Some(v as f64 / 10.0)).collect(),
+                ),
             ],
         )
         .unwrap();
@@ -520,6 +537,18 @@ mod tests {
             .f32("predicted_irt")
             .unwrap();
         assert_eq!(irt, vec![1.0, 2.0, 3.0, 40.0, 50.0, 60.0]);
+        // observed_im follows the kept row through the pool and the refresh.
+        let want: Vec<Option<f64>> = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .iter()
+            .map(|&v| Some(v as f64 / 10.0))
+            .collect();
+        for path in [&out, &refreshed] {
+            let im = TableFile::open(path)
+                .unwrap()
+                .opt_f64("observed_im")
+                .unwrap();
+            assert_eq!(im, want, "{path}");
+        }
     }
 
     #[test]

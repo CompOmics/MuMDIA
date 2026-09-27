@@ -1,8 +1,10 @@
 //! Stage B `mumdia rt-im-train`: per-run RT calibration and windows
 //! (docs/08_rt_im_train.md). Calibrates the run-independent predicted iRT to
 //! observed RT from confident seed PSMs, then sets a per-candidate RT window from
-//! the residuals. MVP is 3D, so IM columns are null. The sidecars are not re-run
-//! here.
+//! the residuals. When the library carries `predicted_im` and the seed carries
+//! `observed_im` (diaPASEF), the same anchors calibrate ion mobility: a per-charge
+//! linear map in CCS space and a held-out residual window (`fit_im`). Otherwise the IM
+//! columns are null. The sidecars are not re-run here.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -123,6 +125,13 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         ],
     )?;
 
+    let im_holdout_frac = p.cfg.im_window_holdout_frac;
+    if !(im_holdout_frac > 0.0 && im_holdout_frac <= 0.9) {
+        anyhow::bail!(
+            "rt_im_train.im_window_holdout_frac must be in (0.0, 0.9], got {im_holdout_frac}; \
+             the IM window is always sized on held-out anchors"
+        );
+    }
     let holdout_frac = p.cfg.window_holdout_frac;
     if !(0.0..=0.9).contains(&holdout_frac) {
         anyhow::bail!(
@@ -142,7 +151,15 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     // a patched/updated library iRT is used for both training and application).
     let lib = TableFile::open(p.library_precursors)?;
     let lib_cid = lib.u32("candidate_id")?;
+    let lib_mz = lib.f64("precursor_mz")?;
+    let lib_z = lib.i32("charge")?;
     let lib_irt = lib.f32("predicted_irt")?;
+    // v1 libraries and imported ones without IM carry no `predicted_im`.
+    let lib_im: Option<Vec<Option<f64>>> = if lib.has_column("predicted_im") {
+        Some(lib.opt_f64("predicted_im")?)
+    } else {
+        None
+    };
     let mut irt_by_cid: HashMap<u32, f64> = HashMap::with_capacity(lib.nrows);
     for i in 0..lib.nrows {
         irt_by_cid.insert(lib_cid[i], lib_irt[i] as f64);
@@ -199,6 +216,61 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         }
     }
     let (anchor_ids, train_irt, train_rt) = sorted_anchor_vectors(best_per_pep);
+
+    // IM anchors: the same confident targets, one per candidate (the seed table already
+    // holds one row per candidate), because 1/K0 depends on charge where RT does not.
+    let im_cal: Option<ImCal> = match &lib_im {
+        Some(lib_im) if seed.has_column("observed_im") => {
+            let s_obs_im = seed.opt_f64("observed_im")?;
+            let s_mz = seed.f64("precursor_mz")?;
+            let s_z = seed.i32("charge")?;
+            let pred_by_cid: HashMap<u32, f64> = lib_cid
+                .iter()
+                .zip(lib_im)
+                .filter_map(|(c, v)| v.map(|v| (*c, v)))
+                .collect();
+            let mut anchors: Vec<ImAnchor> = Vec::new();
+            for i in 0..seed.nrows {
+                if !s_q[i].is_finite() || s_q[i] >= p.cfg.q_train || s_label[i] != "target" {
+                    continue;
+                }
+                let (Some(obs), Some(&pred)) = (s_obs_im[i], pred_by_cid.get(&s_cid[i])) else {
+                    continue;
+                };
+                if obs.is_finite() && obs > 0.0 && pred.is_finite() && pred > 0.0 {
+                    anchors.push(ImAnchor {
+                        cid: s_cid[i],
+                        base_peptide_id: s_base[i],
+                        charge: s_z[i],
+                        mz: s_mz[i],
+                        pred_im: pred,
+                        obs_im: obs,
+                    });
+                }
+            }
+            anchors.sort_by_key(|a| a.cid);
+            let fit = fit_im(&anchors, p.cfg);
+            // A 3D run carries both columns all-null; only a run with IM on both sides and
+            // too few anchors is worth a warning.
+            let has_im = !pred_by_cid.is_empty() && s_obs_im.iter().any(|v| v.is_some());
+            if fit.is_none() && has_im {
+                warn!(
+                    n_anchors = anchors.len(),
+                    min_anchors = p.cfg.min_seed_for_calibration,
+                    "rt-im-train: too few IM anchors; IM calibration unavailable, IM windows null"
+                );
+            }
+            fit
+        }
+        Some(lib_im) if lib_im.iter().any(|v| v.is_some()) => {
+            warn!(
+                "rt-im-train: the library has predicted_im but the seed table has no \
+                 observed_im (a v1 seed); IM calibration unavailable, IM windows null"
+            );
+            None
+        }
+        _ => None,
+    };
     let n_train = train_irt.len();
     info!(n_train, "rt-im-train: training points");
 
@@ -418,9 +490,14 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         cal_c.push(cal);
         lo_c.push(lo);
         hi_c.push(hi);
-        im_c.push(None);
-        imlo_c.push(None);
-        imhi_c.push(None);
+        let im_pred = match (&im_cal, &lib_im) {
+            (Some(c), Some(v)) => v[i].map(|pred| c.predict(pred, lib_mz[i], lib_z[i])),
+            _ => None,
+        };
+        let w_im = im_cal.as_ref().map(|c| c.w_im).unwrap_or(0.0);
+        im_c.push(im_pred);
+        imlo_c.push(im_pred.map(|v| v - w_im));
+        imhi_c.push(im_pred.map(|v| v + w_im));
     }
 
     let rows = write_table(
@@ -495,6 +572,23 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
             "rt_residual_median_s": rt_residual_median_s,
             "rt_residual_abs_median_s": rt_residual_abs_median_s,
             "rt_residual_mad_s": rt_residual_mad_s,
+            // Ion-mobility calibration (null fields when unavailable). `w_im` is always
+            // sized on held-out anchors unless `w_im_sizing` says otherwise; the in-sample
+            // residual is a fit diagnostic only (docs/08 section 4).
+            "im_method": if im_cal.is_some() { "per_charge_linear_ccs" } else { "unavailable" },
+            "im_n_train": im_cal.as_ref().map(|c| c.n_train),
+            "im_global": im_cal.as_ref().map(|c| json!({"a": c.coefs.0 .0, "b": c.coefs.0 .1})),
+            "im_per_charge": im_cal.as_ref().map(|c| c.coefs.1.iter()
+                .map(|(z, (a, b, n))| (z.to_string(), json!({"a": a, "b": b, "n": n})))
+                .collect::<serde_json::Map<_, _>>()),
+            "w_im": im_cal.as_ref().map(|c| c.w_im),
+            "w_im_sizing": im_cal.as_ref().map(|c| c.sizing),
+            "p_im": p.cfg.p_im,
+            "im_window_holdout_frac": im_holdout_frac,
+            "im_n_holdout": im_cal.as_ref().map(|c| c.n_holdout),
+            "im_holdout_resid_abs_median": im_cal.as_ref().and_then(|c| c.holdout_abs_median),
+            "im_holdout_resid_p_im": im_cal.as_ref().and_then(|c| c.holdout_p_im),
+            "im_in_sample_resid_abs_median": im_cal.as_ref().map(|c| c.in_sample_abs_median),
         }),
     )?;
 
@@ -503,6 +597,11 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     stats.insert("n_train".to_string(), json!(n_train));
     stats.insert("w_rt".to_string(), json!(w_rt));
     stats.insert("calibration_status".to_string(), json!(status));
+    stats.insert(
+        "im_n_train".to_string(),
+        json!(im_cal.as_ref().map(|c| c.n_train)),
+    );
+    stats.insert("w_im".to_string(), json!(im_cal.as_ref().map(|c| c.w_im)));
     stats.insert(
         "candidates_without_finite_irt".to_string(),
         json!(n_nonfinite_irt),
@@ -539,9 +638,173 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
     Ok(rows)
 }
 
+/// One ion-mobility calibration anchor: a confident target seed PSM with an observed and
+/// a library-predicted 1/K0.
+#[derive(Clone, Debug)]
+pub(crate) struct ImAnchor {
+    pub(crate) cid: u32,
+    pub(crate) base_peptide_id: u32,
+    pub(crate) charge: i32,
+    pub(crate) mz: f64,
+    pub(crate) pred_im: f64,
+    pub(crate) obs_im: f64,
+}
+
+/// A fitted per-run IM calibration: `obs_ccs = a + b * pred_ccs`, per charge where that
+/// charge has `im_min_anchors_per_charge` anchors, else the global fit.
+struct ImCal {
+    coefs: ImCoefs,
+    w_im: f64,
+    sizing: &'static str,
+    n_train: usize,
+    n_holdout: usize,
+    holdout_abs_median: Option<f64>,
+    holdout_p_im: Option<f64>,
+    in_sample_abs_median: f64,
+}
+
+pub(crate) type ImCoefs = (
+    (f64, f64),
+    std::collections::BTreeMap<i32, (f64, f64, usize)>,
+);
+
+impl ImCal {
+    fn predict(&self, pred_im: f64, mz: f64, charge: i32) -> f64 {
+        im_predict(&self.coefs, pred_im, mz, charge)
+    }
+}
+
+pub(crate) fn im_predict(coefs: &ImCoefs, pred_im: f64, mz: f64, charge: i32) -> f64 {
+    use mumdia_core::constants::{ccs_to_im, im_to_ccs};
+    let (a, b) = coefs.1.get(&charge).map(|c| (c.0, c.1)).unwrap_or(coefs.0);
+    ccs_to_im(a + b * im_to_ccs(pred_im, mz, charge), mz, charge)
+}
+
+/// Least-squares `obs_ccs = a + b * pred_ccs`, globally and per charge. Anchors are in a
+/// fixed order (sorted by candidate id), and the per-charge map is ordered, so the fit is
+/// deterministic.
+pub(crate) fn fit_im_coefs(anchors: &[&ImAnchor], min_per_charge: usize) -> ImCoefs {
+    use mumdia_core::constants::im_to_ccs;
+    let ccs = |a: &ImAnchor| {
+        (
+            im_to_ccs(a.pred_im, a.mz, a.charge),
+            im_to_ccs(a.obs_im, a.mz, a.charge),
+        )
+    };
+    let (x, y): (Vec<f64>, Vec<f64>) = anchors.iter().map(|a| ccs(a)).unzip();
+    let (b, a) = linear_fit(&x, &y);
+    let mut by_z: std::collections::BTreeMap<i32, (Vec<f64>, Vec<f64>)> = Default::default();
+    for an in anchors {
+        let (px, py) = ccs(an);
+        let e = by_z.entry(an.charge).or_default();
+        e.0.push(px);
+        e.1.push(py);
+    }
+    let per_charge = by_z
+        .into_iter()
+        .filter(|(_, (xs, _))| xs.len() >= min_per_charge.max(2))
+        .map(|(z, (xs, ys))| {
+            let (bz, az) = linear_fit(&xs, &ys);
+            (z, (az, bz, xs.len()))
+        })
+        .collect();
+    ((a, b), per_charge)
+}
+
+/// Fit the IM calibration on every anchor and size `w_im` from anchors held out of a
+/// refit (split by base peptide, as the RT holdout). `None` below
+/// `min_seed_for_calibration` anchors: no IM window is safer than one from a handful of
+/// points, and a null window means "do not gate".
+fn fit_im(anchors: &[ImAnchor], cfg: &RtImTrainConfig) -> Option<ImCal> {
+    if anchors.len() < cfg.min_seed_for_calibration.max(2) {
+        return None;
+    }
+    let all: Vec<&ImAnchor> = anchors.iter().collect();
+    let coefs = fit_im_coefs(&all, cfg.im_min_anchors_per_charge);
+    let resid = |c: &ImCoefs, set: &[&ImAnchor]| -> Vec<f64> {
+        set.iter()
+            .map(|a| (a.obs_im - im_predict(c, a.pred_im, a.mz, a.charge)).abs())
+            .collect()
+    };
+    let in_sample = resid(&coefs, &all);
+    let (train, held): (Vec<&ImAnchor>, Vec<&ImAnchor>) = all
+        .iter()
+        .partition(|a| !is_holdout(a.base_peptide_id, cfg.im_window_holdout_frac));
+    let (p_resid, sizing, holdout) = if held.len() >= MIN_HOLDOUT_ANCHORS
+        && train.len() >= cfg.min_seed_for_calibration.max(2)
+    {
+        let r = resid(&fit_im_coefs(&train, cfg.im_min_anchors_per_charge), &held);
+        let pr = percentile(&r, cfg.p_im);
+        (pr, "holdout", Some((percentile(&r, 0.5), pr)))
+    } else {
+        warn!(
+            n_holdout = held.len(),
+            n_sizing_train = train.len(),
+            "rt-im-train: too few IM anchors on one side of the holdout split; sizing w_im \
+             in-sample"
+        );
+        (
+            percentile(&in_sample, cfg.p_im),
+            "holdout_fallback_in_sample",
+            None,
+        )
+    };
+    Some(ImCal {
+        coefs,
+        w_im: (p_resid * cfg.im_window_multiplier).max(cfg.im_window_min),
+        sizing,
+        n_train: anchors.len(),
+        n_holdout: held.len(),
+        holdout_abs_median: holdout.map(|h| h.0),
+        holdout_p_im: holdout.map(|h| h.1),
+        in_sample_abs_median: percentile(&in_sample, 0.5),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn im_calibration_recovers_a_per_charge_ccs_map_and_sizes_w_im_held_out() {
+        use mumdia_core::constants::{ccs_to_im, im_to_ccs};
+        // Charge 2: obs_ccs = 10 + 1.02 * pred_ccs; charge 3: obs_ccs = -5 + 0.98 * pred.
+        // A deterministic +/-0.004 1/K0 jitter gives a known residual scale.
+        let mut anchors = Vec::new();
+        for i in 0..600u32 {
+            let z = if i % 3 == 0 { 3 } else { 2 };
+            let mz = 400.0 + (i as f64) * 0.9;
+            let pred = 0.7 + (i as f64) * 0.0008;
+            let (a, b) = if z == 2 { (10.0, 1.02) } else { (-5.0, 0.98) };
+            let jitter = if i % 2 == 0 { 0.004 } else { -0.004 };
+            let obs = ccs_to_im(a + b * im_to_ccs(pred, mz, z), mz, z) + jitter;
+            anchors.push(ImAnchor {
+                cid: i,
+                base_peptide_id: i,
+                charge: z,
+                mz,
+                pred_im: pred,
+                obs_im: obs,
+            });
+        }
+        let cfg = RtImTrainConfig::default();
+        let cal = fit_im(&anchors, &cfg).expect("600 anchors calibrate");
+        assert_eq!(cal.sizing, "holdout");
+        assert_eq!(cal.n_holdout, 300, "ids 0..300 satisfy id % 1000 < 300");
+        let (a2, b2, _) = cal.coefs.1[&2];
+        assert!(
+            (b2 - 1.02).abs() < 0.01 && (a2 - 10.0).abs() < 5.0,
+            "{a2} {b2}"
+        );
+        let (_, b3, _) = cal.coefs.1[&3];
+        assert!((b3 - 0.98).abs() < 0.01, "{b3}");
+        // The residuals are the jitter, so the held-out p95 is ~0.004.
+        let p = cal.holdout_p_im.unwrap();
+        assert!((p - 0.004).abs() < 0.001, "{p}");
+        assert_eq!(cal.w_im, p.max(cfg.im_window_min));
+        // Too few anchors: no calibration rather than a window from a handful of points.
+        assert!(fit_im(&anchors[..10], &cfg).is_none());
+    }
 
     #[test]
     fn anchor_vectors_are_sorted_by_base_peptide_id() {

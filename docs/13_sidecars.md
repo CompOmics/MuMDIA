@@ -62,6 +62,7 @@ the column it keys the readback on.
 |---|---|---|---|
 | ms2pip_worker | `<in.parquet> <out.parquet> <model> <processes>` (`sidecar.rs`, `run_ms2pip`; `processes` is the engine's thread count) | `ms2pip_out.parquet` | `id` |
 | deeplc_worker | `<in.parquet> <out.parquet>` (`sidecar.rs:99`) | `deeplc_out.parquet` | `id` |
+| im2deep_worker | `<in.parquet> <out.parquet> <threads>` (`sidecar.rs`, `run_im2deep`; in: `id, peptidoform, charge, precursor_mz`) | `im2deep_out.parquet` (`id, ccs, predicted_im`) | `id` |
 | deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac` (`sidecar.rs`) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (new table with replaced `predicted_irt`; input unchanged) |
 | mokapot_worker / nn_rescore_worker | `<rescore.pin> <out.parquet>` + env `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` (`rescore.rs:781-792`) | `rescore_sidecar_out.parquet` | `candidate_id` (echoes the flat row index) |
 | entrapment_worker | `<in.parquet> <out.parquet> <folds>` (`rescore.rs:718-724`) | `entrapment_out.parquet` | `row_id` |
@@ -79,6 +80,7 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/ms2pip_worker.py` | Predictor: MS2PIP b/y fragment intensities per peptidoform+charge |
 | `scripts/peptdeep_worker.py` | Predictor: AlphaPeptDeep b/y fragment intensities per peptidoform+charge, conditioned on collision energy and instrument |
 | `scripts/deeplc_worker.py` | Predictor: DeepLC iRT per peptidoform (uncalibrated) |
+| `scripts/im2deep_worker.py` | Predictor: IM2Deep CCS per peptidoform+charge (single-conformer model, uncalibrated), converted to 1/K0 with IM2Deep's Mason-Schamp `ccs2im` |
 | `scripts/deeplc_finetune.py` | Predictor: transfer-learn DeepLC on this run's seed and rewrite the library iRT; with `--no-finetune` (seed `-`) rewrite it with base-model predictions instead (`rt_im_train.library_irt`) |
 | `scripts/mokapot_worker.py` | Rescorer: mokapot brew over a PIN (model env-switchable: nn/logreg/xgb/percolator) |
 | `scripts/nn_rescore_worker.py` | Rescorer: PyTorch semi-supervised MLP over a PIN, in-memory or streaming memmap |
@@ -303,6 +305,20 @@ Predictions are uncalibrated; rt-im-train's per-run LOESS/linear maps them onto
 observed RT. Its module-level imports are order-dependent: `import deeplc` must
 precede numpy and pyarrow (`deeplc_worker.py:13-29`, see **DeepLC import order**
 under gotchas).
+
+**IM2Deep** (`predict_frag.rs`, `assign_im`, worker `im2deep_worker.py`). Selected by
+`predict_frag.im_predictor = "im2deep"` (default `none`, which writes `predicted_im`
+null). One request row per unique `(peptidoform, charge)`, with the engine's precursor
+m/z. The worker calls `im2deep.predict` (IM2DeepUni, uncalibrated) in 200k-row chunks and
+converts CCS to 1/K0 with `im2deep.ccs2im` (N2, 31.85 degC). `mumdia_core::constants::
+im_to_ccs`/`ccs_to_im` port the same formula, so rt-im-train can calibrate in CCS space
+(docs/08, "IM calibration"). A precursor without a prediction, or a non-finite or
+non-positive 1/K0, is a hard error rather than a drop: IM2Deep encodes any peptidoform
+DeepLC encodes. Version floor `MIN_IM2DEEP_VERSION` (2.0.0), checked by `sidecar::
+require_version`, discovery, `doctor` and the worker. The model identity gains
+`im2deep-<version>-uni`, and the predict-frag report records `im_prediction_ms`.
+Multiconformer output (IM2DeepMulti) is not used: its two outputs are ordered by value,
+not by abundance, so neither is the main conformer.
 
 **DeepLC fine-tune** (`run.rs:242-263`, worker `deeplc_finetune.py`). Wired into
 `run` only when `rt_im_train.finetune_deeplc = true`; runs **between**
@@ -543,7 +559,7 @@ every entry on one axis before extraction, so no explicit reconciliation is done
 
 Each sidecar role has one config field naming the Python that runs it:
 `rescore.python`, `predict_frag.deeplc_python`, `predict_frag.ms2pip_python`,
-`mbr.python`. Implemented in `rust/mumdia/crates/mumdia/src/python.rs`.
+`predict_frag.peptdeep_python`, `predict_frag.im2deep_python`, `mbr.python`. Implemented in `rust/mumdia/crates/mumdia/src/python.rs`.
 
 A field may hold an absolute path, which is used as given and never
 second-guessed, or the string `"auto"` (or be absent), which asks the engine to
@@ -551,7 +567,7 @@ find one. Discovery order, from `python.rs`:
 
 | order | source | provenance reported |
 |---|---|---|
-| 1 | `MUMDIA_PYTHON_RESCORE` / `_DEEPLC` / `_MS2PIP` / `_MBR` | the variable name |
+| 1 | `MUMDIA_PYTHON_RESCORE` / `_DEEPLC` / `_MS2PIP` / `_PEPTDEEP` / `_IM2DEEP` / `_MBR` | the variable name |
 | 2 | `MUMDIA_PYTHON` (all roles) | `MUMDIA_PYTHON` |
 | 3 | `CONDA_PREFIX`: `bin/python`, `python.exe`, `Scripts/python.exe` | `CONDA_PREFIX` |
 | 4 | `VIRTUAL_ENV`, same three layouts | `VIRTUAL_ENV` |
@@ -568,6 +584,7 @@ stage hours later. The module lists live on `Role::modules` and are the same one
 | `Rescore`, mokapot or entrapment | mokapot, sklearn, numpy, pandas, pyarrow |
 | `DeepLc` | deeplc, numpy, pandas, pyarrow, torch, psm_utils |
 | `Ms2pip` | ms2pip, numpy, pandas |
+| `Im2deep` | im2deep, psm_utils, torch, numpy, pyarrow |
 | `Mbr` | numpy, pyarrow |
 
 A role is resolved only when the configuration actually uses it
@@ -600,9 +617,11 @@ configured.
 |---|---|---|
 | `predict_frag.predictor` | `native` | `ms2pip` engages `ms2pip_worker.py` (requires `ms2pip_python`) |
 | `predict_frag.rt_predictor` | `native` | `deeplc` engages `deeplc_worker.py` (requires `deeplc_python`) |
-| `predict_frag.ms2pip_model` | `"HCDch2"` | 3rd positional arg to `ms2pip_worker.py`; `*ch2` models emit the `b2`/`y2` series as `frag_charge` 2 |
+| `predict_frag.ms2pip_model` | `"HCDch2"` | 3rd positional arg to `ms2pip_worker.py`; `*ch2` models emit the `b2`/`y2` series as `frag_charge` 2. `timsTOF2024` (diaPASEF) emits charge 1 only; pair it with `predict_frag.charge2_from_precursor_charge: 99` (docs/06) |
 | `predict_frag.ms2pip_python` | `None` | interpreter for MS2PIP (env with ms2pip+pyarrow) |
 | `predict_frag.deeplc_python` | `None` | interpreter for DeepLC predict AND fine-tune |
+| `predict_frag.im_predictor` | `none` | `im2deep` engages `im2deep_worker.py` (requires `im2deep_python`) |
+| `predict_frag.im2deep_python` | `None` | interpreter for IM2Deep (env with im2deep + psm_utils + pyarrow) |
 | `predict_frag.sidecar_script_dir` | `"scripts"` | dir passed to `resolve_script` for all workers |
 | `rt_im_train.finetune_deeplc` | `false` | engage `deeplc_finetune.py` in `run` (requires `deeplc_python`) |
 | `rt_im_train.finetune_epochs` | `25` | `--epochs` upper bound (early stopping usually halts first) |

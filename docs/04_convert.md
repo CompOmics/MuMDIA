@@ -55,7 +55,7 @@ builds the nullable inner `item` field, `table.rs:98` the nullable list column),
 but convert writes neither as null. An empty scan is a non-null empty list
 (`ListBuilder::append(true)` at `table.rs:131`).
 
-### `spectra_ms1.parquet` (`SPECTRA_MS1`, schema v2; written at `convert.rs:171`)
+### `spectra_ms1.parquet` (`SPECTRA_MS1`, schema v3; written at `convert.rs:171`)
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -64,8 +64,9 @@ but convert writes neither as null. An empty scan is a non-null empty list
 | `mz` | `List<f32>` | Centroided, m/z-ascending peak m/z (widened to f64 on read). |
 | `intensity` | `List<f32>` | Peak intensities, aligned to `mz`. |
 | `im` | `List<f32>` | Per-peak 1/K0 (V s cm^-2), aligned to `mz`. Present only for a mobility source (native timsTOF reader); readers treat its absence as no mobility. |
+| `im_width` | `List<f32>` | Per-peak mobility width (1/K0), aligned to `mz` (v3): the intensity-weighted SD of the centroid's TIMS scans plus the 1/12-scan quantisation term. Present only under `convert.tdf_im_width` on the native reader; readers treat its absence as no width. |
 
-### `spectra_ms2.parquet` (`SPECTRA_MS2`, schema v2; written at `convert.rs:198`)
+### `spectra_ms2.parquet` (`SPECTRA_MS2`, schema v3; written at `convert.rs:198`)
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -82,6 +83,7 @@ but convert writes neither as null. An empty scan is a non-null empty list
 | `mz` | `List<f32>` | Centroided, m/z-ascending fragment m/z. |
 | `intensity` | `List<f32>` | Fragment intensities, aligned to `mz`. |
 | `im` | `List<f32>` | Per-peak 1/K0 (V s cm^-2), aligned to `mz`. Present only for a mobility source (native timsTOF reader); readers treat its absence as no mobility. |
+| `im_width` | `List<f32>` | Per-peak mobility width (1/K0), aligned to `mz` (v3): the intensity-weighted SD of the centroid's TIMS scans plus the 1/12-scan quantisation term. Present only under `convert.tdf_im_width` on the native reader; readers treat its absence as no width. |
 
 ### `isolation_windows.parquet` (`ISOLATION_WINDOWS`, schema v2; written at `convert.rs:215`)
 
@@ -578,6 +580,13 @@ mobility: TOF-ordered points join one m/z trace within `convert.tdf_mz_ppm` (10)
 trace splits where consecutive scans are more than `convert.tdf_im_gap_scans` (30)
 apart, and a cluster with fewer than `convert.tdf_min_points` (2) raw points is
 dropped. Every peak carries its intensity-weighted 1/K0 in the `im` column.
+Under `convert.tdf_im_width` (default false; TIMS roadmap P7) each peak also carries its
+mobility width in `im_width`: the intensity-weighted SD of its scans, with 1/12 scan^2
+added for quantisation, converted to 1/K0 with the local calibration slope. It adds
+4 B per peak (+450 MB, +37%, on the benchmark run's 1.2 GB of spectra; convert 45 s
+against 38 s) and leaves every other column unchanged. On that run the median width is
+9.4 scans (0.0081 V s cm^-2) for MS2 peaks and 13.2 scans for MS1, whose p95 of 54 scans
+shows MS1 centroids merging several ions at the 30-scan gap.
 
 - m/z uses timsrust's TOF conversion. It agrees with msconvert's vendor-calibrated
   m/z to a median of 0.02 ppm (p5/p95 -3.5/+3.7 ppm) on the TIMS benchmark run.
@@ -589,8 +598,9 @@ dropped. Every peak carries its intensity-weighted 1/K0 in the `im` column.
 - The three `tdf_*` values are provisional, taken from a peak census on one run;
   see docs/TIMS_ROADMAP.md, P1, for the measurement.
 
-Downstream stages do not yet use mobility (P3/P4 of the roadmap), apart from keying
-windows on (m/z, 1/K0) (`IsolationWindow::key`).
+Downstream, mobility is used by the opt-in IM gates, IM calibration and IM features
+(docs/TIMS_ROADMAP.md, P3-P7), and windows are keyed on (m/z, 1/K0)
+(`IsolationWindow::key`).
 
 ### Bruker through msconvert and ion mobility
 

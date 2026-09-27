@@ -31,8 +31,8 @@ policy for tuning and validation.
   - `mumdia-core`: typed config, schemas, manifest, masses/constants.
   - `mumdia-io`: Arrow/Parquet table layer, hashes, JSON, artifact reports.
   - `mumdia`: CLI/library, fragment index, FDR/rescoring, and stages.
-- `scripts/`: eight engine-invoked Python workers plus four imported-library
-  helpers (twelve scripts), and `_lib_io.py`, the shared writer the helpers use so
+- `scripts/`: nine engine-invoked Python workers plus four imported-library
+  helpers (thirteen scripts), and `_lib_io.py`, the shared writer the helpers use so
   they cannot emit a parquet the engine rejects. Includes `augment_library.py`, which adds the
   tryptic FASTA peptides an imported library is missing. Sidecars use positional
   file contracts.
@@ -137,6 +137,43 @@ Key semantics:
   eliminate a target against its decoy. Peptide-level q estimation subsequently
   performs picked target-decoy competition through the shared
   `base_peptide_id`; keep that pairing intact.
+- Ion mobility (diaPASEF, `docs/TIMS_ROADMAP.md`): `fragment_library_precursors`
+  v2 carries a nullable `predicted_im` (1/K0), from IM2Deep
+  (`predict_frag.im_predictor = im2deep`, default `none`) or from an imported
+  library's `IM`. The seed reports `observed_im` for confident targets, and
+  rt-im-train fits a per-charge linear CCS calibration on those anchors with a
+  held-out `w_im` (`docs/08` section 7), filling `run_windows.im_*`.
+  `extract.im_gate` (default `off`) gates fragment (and optionally MS1) peaks on those
+  windows, and `search_seed.im_gate` gates the seed on the library IM; with both off the
+  output is bit-identical to the ungated engine. Measured on one diaPASEF run: +6.0%
+  peptides at the calibrated width and an unchanged decoy fraction
+  (`docs/TIMS_ROADMAP.md` "P4 result"); benchmark-gated. On 4D data extract also
+  writes IM evidence (psms_extracted v4: `apex_im_mad`, `ms1_apex_im`, `im_pred_cal`;
+  chromatograms v2: a per-point `im` list, +38% artifact size), and
+  `features.im_features` (default `off`) appends nine IM features after every other
+  column; off leaves the feature list, schema id and scores bit-identical. Measured on
+  the same run with 3 `nn_torch` seeds: +1.8% peptides on top of the gate, +1.5%
+  ungated, decoy fraction unchanged, no leakage in a low-score null (`"P5 result"`);
+  benchmark-gated. The compact `feature_preset` excludes the IM block.
+  P6 (`docs/TIMS_ROADMAP.md` "P6 result"; one file, 3 seeds, nothing
+  promoted) took the same run from 7,753 to 9,507 peptides (0.50x to 0.62x DIA-NN) with
+  three settings. (1) MS2PIP `timsTOF2024` with `predict_frag.charge2_from_precursor_charge:
+  99` (+2.7%): the model is single-charge, so charge-2 fragments must not be requested, or
+  the heuristic fill crowds the top-N (see the `ms2pip_model` note below). (2)
+  `search_seed.frag_tol_mad_k: 4` (new, default 0; +5.7% on top). On this run the p95 rule
+  learned ~21 ppm from a 6-20 ppm shoulder of weak-peak centroid error, not from random
+  matches, and the MAD rule learns 12.5 ppm. (3) `extract.gate_min_score: 0` (+11.7% on
+  top, 3.2x the candidates): on a 15-min, 50 ng diaPASEF run the spectral gate is the
+  binding extraction loss. The HYE-derived 0.2 optimum does not transfer. Entrapment on
+  the combined P6 config (E. coli + 1:1 human, 3 seeds): empirical FDP 0.36-0.38% at 1%,
+  53-56 spike-ins. On ProteoBench HYE diaPASEF the default quant compresses ratios, and
+  quant `fragment_selection: predicted` + `interference_envelope` recovers most of it
+  (roadmap, "ProteoBench HYE diaPASEF").
+  P7 (`"P7 result"`) keeps a per-peak mobility width (`convert.tdf_im_width`, spectra v3)
+  and scores apex peak-shape agreement (`features.im_shape_features`, psms_extracted v5);
+  both default off, bit-identical when off. -0.9% peptides over 3 seeds, no gain: MS1
+  centroids merge neighbouring ions at the 30-scan gap (MS1 width 1.6x the fragment
+  width), so centroid splitting must come before any profile feature.
 - `extract.retain_top_peaks > 1` (default 1) writes the alternative peaks as
   additional `psms_extracted` rows with `peak_rank >= 1` (plus a diagnostic
   `.peaks.parquet`), `features` carries `peak_rank`, `compete` keys on it, and

@@ -60,13 +60,17 @@ Columns read (getter -> column): `candidate_id` (u32), `apex_rt` (f64),
 `peptidoform` (str), `protein` (str), `precursor_mz` (f64). Optional soft-
 competition columns default to 0.0 when absent: `contested_frac`,
 `contested_count_frac`, `apportioned_frac`. Optional MS1 apex isotope columns
-(`opt_f64`, default `None`): `ms1_isom1`, `ms1_mono`, `ms1_iso1`, `ms1_iso2`.
+(`opt_f64`, default `None`): `ms1_isom1`, `ms1_mono`, `ms1_iso1`, `ms1_iso2`. Under
+`im_features` only (v4, default `None`): `apex_im`, `apex_im_mad`, `ms1_apex_im`,
+`im_pred_cal`. Under `im_shape_features` only (v5, default `None`): `apex_im_width`,
+`apex_im_width_mad`, `apex_im_overlap`, `ms1_im_width`, `ms1_frag_overlap`.
 
 ### Consumed: chromatograms (`features.rs:591`-`618`)
 
 `candidate_id` (u32), `frag_name` (str), `frag_mz` (f64), `frag_obs_mz` (f64,
 optional; falls back to `frag_mz`), `predicted_intensity` (f32), `rt`
-(list<f32>), `intensity` (list<f32>). Rows whose `frag_name` starts with
+(list<f32>), `intensity` (list<f32>), and under `im_features` the v2 `im`
+(list<f32>) when present. Rows whose `frag_name` starts with
 `ms1_` are routed to a separate `ms1x` map and fed to the MS1 XIC evidence;
 all others are the fragment chromatograms.
 
@@ -523,6 +527,64 @@ Names: `frag_mass_err_median`, `frag_mass_err_abs_median`, `frag_mass_err_std`,
 (fraction in the strongest fragment), `frac_top3_pred_observed`,
 `frac_top5_pred_observed`. Has unit tests (`mass_uncertainty.rs:142`).
 
+## Ion-mobility features (`im.rs`, `features.im_features`, default off)
+
+A block of nine columns for diaPASEF data (docs/TIMS_ROADMAP.md, P5), appended after
+every other column of the configured set when `features.im_features = true`. It is not
+an Extended family: `FAMILIES` is always on under Extended, so a family there would
+change every run's feature vector. With the key off, the feature list, the schema id and
+the PIN column order are unchanged (`feature_sets_sized` asserts this).
+
+Scalars, from psms_extracted v4 (docs/09_extract.md):
+
+| name | value |
+|---|---|
+| `im_error` | `apex_im - im_pred_cal` |
+| `im_error_abs` | its absolute value |
+| `im_frag_mad` | `apex_im_mad`: intensity-weighted mean absolute deviation of the apex fragment peaks' 1/K0 |
+| `ms1_im_error_abs` | abs(`ms1_apex_im - im_pred_cal`) |
+| `ms1_frag_im_diff` | abs(`ms1_apex_im - apex_im`) |
+| `has_ms1_im` | 1 when `ms1_apex_im` exists |
+
+Over the elution peak (`[elution_lo, elution_hi]` of `fragment_features`), from the
+chromatograms v2 per-point `im`, intensity-weighted, skipping zero-intensity points:
+
+| name | value |
+|---|---|
+| `im_elution_error_abs` | abs(weighted mean 1/K0 of all fragment points - `im_pred_cal`) |
+| `im_elution_sd` | weighted SD of all fragment points' 1/K0 |
+| `im_elution_frag_sd` | SD of the per-fragment mean 1/K0, weighted by fragment intensity (0 with one fragment) |
+
+A missing input gives 0.0: on 3D data every column is a constant zero (the `nn_torch`
+worker drops constant columns), and the stage warns once when the key is on but no row
+has both `apex_im` and `im_pred_cal`. The `im` list is read only when the key is on. The
+block reads no label: targets and decoys take the same path, and IM2Deep predicts each
+decoy from its own sequence, with no offset against its paired target (median +0.0001
+V s cm^-2 over 1.13M pairs on the E. coli benchmark). `rescore.feature_preset = compact`
+and `features_file` project these columns away, because the compact list was selected
+without them.
+
+### Peak-shape block (`features.im_shape_features`, default off)
+
+Six columns (TIMS roadmap P7), appended after the block above, from psms_extracted v5,
+which needs spectra with per-peak widths (`convert.tdf_im_width`). Each apex peak is a
+Gaussian in 1/K0 (centroid, width); agreement is the Bhattacharyya coefficient.
+
+| name | value |
+|---|---|
+| `im_frag_width` | `apex_im_width` |
+| `im_frag_width_mad` | `apex_im_width_mad` |
+| `im_frag_overlap` | `apex_im_overlap` |
+| `ms1_im_width` | `ms1_im_width` |
+| `ms1_frag_overlap` | `ms1_frag_overlap` |
+| `ms1_frag_width_logratio` | ln(`ms1_im_width` / `apex_im_width`) |
+
+A missing input gives 0.0, and the stage warns once when the key is on but no row has
+`apex_im_width`. With the key off the feature list is unchanged. On the E. coli benchmark
+the block separates accepted targets moderately (best `im_frag_overlap`, AUC 0.734), shows
+no leakage in the low-score null (0.496-0.509), and does not raise identifications
+(docs/TIMS_ROADMAP.md, "P7 result").
+
 ## The Percolator PIN (`write_pin`, `features.rs:1537`)
 
 Streamed row-by-row through a `BufWriter` (not materialized as one String).
@@ -604,6 +666,8 @@ variant no longer exists).
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge before stopping (0 = stop at first miss; 1 bridges a single-scan dip) |
 | `bound_from_confident` | true | learn one global left/right half-width from the confident seed set and apply it to every candidate; false = per-candidate detection |
 | `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
+| `im_features` | false | append the ion-mobility block (see "Ion-mobility features"); benchmark-gated |
+| `im_shape_features` | false | append the IM peak-shape block after it (needs `convert.tdf_im_width`); benchmark-gated |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded
 `FRAG_TOL_PPM = 20.0` (`mass_accuracy.rs:44`), not `prec_tol_ppm`; Evidence does

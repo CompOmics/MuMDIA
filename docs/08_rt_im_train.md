@@ -82,9 +82,9 @@ library candidate. Columns (rt_im_train.rs:266-277):
 | `rt_pred_cal` | f64 | calibrated predicted RT (seconds); `NaN` when calibration is unavailable (fewer than two anchors) |
 | `rt_lo` | f64 | `rt_pred_cal - width` (window lower bound, seconds); negative infinity when calibration is unavailable |
 | `rt_hi` | f64 | `rt_pred_cal + width` (window upper bound, seconds); positive infinity when calibration is unavailable |
-| `im_pred_cal` | f64, nullable | always `None` (3D MVP) |
-| `im_lo` | f64, nullable | always `None` |
-| `im_hi` | f64, nullable | always `None` |
+| `im_pred_cal` | f64, nullable | calibrated 1/K0 (V s cm^-2); `None` unless IM calibration ran and the candidate has a `predicted_im` (section 7) |
+| `im_lo` | f64, nullable | `im_pred_cal - w_im`; `None` as above |
+| `im_hi` | f64, nullable | `im_pred_cal + w_im`; `None` as above |
 
 The unbounded row `(NaN, -inf, +inf)` is materialized by `candidate_window`
 (rt_im_train.rs:65-70) whenever no calibrated RT or window width is available; the
@@ -591,9 +591,50 @@ calibration_available.then(|| predict(irt))` (rt_im_train.rs:247), the width is
 either the adaptive per-bin value or the global `w_rt` (rt_im_train.rs:248-255), and
 `candidate_window(calibrated_rt, width)` (rt_im_train.rs:256) produces the row
 `(cal, cal - width, cal + width)`, or the unbounded `(NaN, -inf, +inf)` when either
-value is absent. The three IM columns are pushed as `None` (rt_im_train.rs:421-423).
+value is absent. The three IM columns carry the section-7 calibration, or `None`.
 The table is written (rt_im_train.rs:266-277), `cal.json` is written
 (rt_im_train.rs:309-325), and the artifact report is emitted (rt_im_train.rs:332-344).
+
+### 7. Ion-mobility calibration (2026-09-23)
+
+The IM analogue of the DeepLC iRT calibration: the library holds uncalibrated
+predictions (`predicted_im`, IM2Deep or imported), and this stage maps them onto the
+run with the run's own confident seed anchors. It runs only when the library has
+`predicted_im` and the seed has `observed_im` (docs/07); otherwise the IM columns stay
+null, which is the 3D behaviour. `extract.im_gate` reads them (P4 in docs/TIMS_ROADMAP.md).
+
+- **Anchors.** Confident target seed rows (`spectrum_q < q_train`) with a finite
+  `observed_im` and a library `predicted_im`, one per candidate. RT keys its anchors on
+  the base peptide; IM keys on the candidate, because 1/K0 depends on charge. Anchors
+  are sorted by candidate id before any fit.
+- **Fit (`fit_im`).** Per-charge linear in CCS space, `obs_ccs = a_z + b_z * pred_ccs`,
+  with both 1/K0 values converted by `mumdia_core::constants::im_to_ccs` (IM2Deep's
+  Mason-Schamp in N2). A charge with fewer than `im_min_anchors_per_charge` anchors (50)
+  uses the global fit. This is IM2Deep's own `LinearCCSCalibration` principle, a
+  per-charge CCS correction, with a slope added and fitted against this run's anchors
+  rather than against IM2Deep's bundled reference set. Fewer than
+  `min_seed_for_calibration` anchors in total gives no IM calibration: a null window
+  means "do not gate", which is safer than a window fitted through a handful of points.
+- **Width.** Always held-out. Anchors are split with the RT holdout rule
+  (`base_peptide_id % 1000 < round(im_window_holdout_frac * 1000)`, default 0.3), the fit
+  is repeated on the training side, and `w_im = max(p_im percentile of the held-out
+  |residual| * im_window_multiplier, im_window_min)` (0.95, 1.0, 0.005). Below 20
+  held-out anchors it falls back to in-sample sizing with a warning, recorded as
+  `w_im_sizing = "holdout_fallback_in_sample"`. The section-4 lesson applies here from the
+  start: in-sample residuals are optimistic and can rank two models backwards.
+- **Grouped runs.** `seed-pool` carries `observed_im` into the pooled seed, so a grouped run
+  is calibrated too. A library with `predicted_im` and a seed without `observed_im` (a v1
+  seed) warns and leaves the IM windows null.
+- **Consumers.** `extract.im_gate` gates on `im_lo`/`im_hi` (docs/09 section 6b); the
+  multiplier sweep of that gate is a sweep of `im_window_multiplier`.
+- **cal.json** gains `im_method` (`per_charge_linear_ccs` or `unavailable`),
+  `im_n_train`, `im_global {a, b}`, `im_per_charge {z: {a, b, n}}`, `w_im`,
+  `w_im_sizing`, `p_im`, `im_window_holdout_frac`, `im_n_holdout`,
+  `im_holdout_resid_abs_median`, `im_holdout_resid_p_im` and
+  `im_in_sample_resid_abs_median` (a fit diagnostic only).
+
+Measured accuracy on the E. coli diaPASEF benchmark is in docs/TIMS_ROADMAP.md, "P2
+result".
 
 ### DeepLC multitask fine-tune (orchestrator pre-step, default off)
 

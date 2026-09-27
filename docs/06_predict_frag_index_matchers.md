@@ -78,6 +78,7 @@ DeepLC.
 | `label` | str |
 | `protein` | str |
 | `n_fragments` | i32 (kept fragment count after top-N) |
+| `predicted_im` | f64, nullable (schema v2): predicted 1/K0 in V s cm^-2 from IM2Deep (`predict_frag.im_predictor = "im2deep"`) or from an imported library's `IM`/`IonMobility`; null otherwise. v1 libraries lack the column and still load, because every reader selects columns by name |
 
 **fragment_library_fragments** (schema `("fragment_library_fragments", 1)`,
 `schema.rs:14`), written at `predict_frag.rs:254-266`:
@@ -179,7 +180,19 @@ precursor charge 2) 78.6% of the kept fragments were charge-2 heuristics tied at
 1.0, and the seed search found 0 confident PSMs at 1% on a real run, 41.6% decoys
 among the top 1,000 seed scores. `HCDch2` with 12 fragments gave 19,308 confident
 seeds on the same run (DIA-NN library: 21,856; `HCD2021`, 12 fragments, charge-2
-only from charge 3: 14,412). A candidate MS2PIP returns nothing for (absent from
+only from charge 3: 14,412).
+
+**diaPASEF: `timsTOF2024` with charge-1 fragments only** (TIMS roadmap, "P6 result").
+MS2PIP's `timsTOF2024` is a single-charge model, so under the default
+`charge2_from_precursor_charge` 2 it would land in the second regime above. Set
+`charge2_from_precursor_charge: 99` with it: no charge-2 fragment is requested, the
+heuristic path is never reached, and every kept fragment is a prediction. That is also
+what DIA-NN's library holds on the benchmark diaPASEF run (charge-1 fragments only, for z2
+to z4). Measured there (3 `nn_torch` seeds, 12 fragments): +2.7% peptides against `HCDch2`
+with charge-2 fragments, while `HCDch2` with charge-1 fragments only lost 8.0% (seed 0).
+It is a setting for timsTOF configs; the engine default stays `HCDch2`.
+
+A candidate MS2PIP returns nothing for (absent from
 the map, or an empty per-candidate map) is dropped with its pair, exactly like a
 DeepLC miss, rather than receiving the native heuristic under an MS2PIP model identity
 (docs/29 #17); a fragment at `0.0` can still be dropped by top-N. MS2PIP requires `ms2pip_python` and errors
@@ -502,7 +515,7 @@ so the struct holds exactly these fields and unknown keys are rejected):
 | `charge2_from_precursor_charge` | `2` | precursor charge at/above which charge-2 fragments are added (was 3; lowered to keep the ~16% of charge-2 precursors' doubly-charged transitions) |
 | `charge_by_basic_residues` | `false` | composition cap: keep a fragment at charge z only if `z <= 1 + (#R+#H+#K in that fragment)` and `z <= precursor charge`. Supersedes `charge2_from_precursor_charge`. Benchmark-gated, it changes the scored transition set. Pairs with `peptidoforms.charge_by_basic_residues` (`config.rs:318`) |
 | `top_n_fragments` | `6` | fragments kept per candidate after intensity ranking; the FASTA + sidecar configurations set 12, the count the DIA-NN library ships and the one the HCDch2 measurement used |
-| `ms2pip_model` | `"HCDch2"` | MS2PIP model name passed as argv; `*ch2` models predict the doubly charged series too |
+| `ms2pip_model` | `"HCDch2"` | MS2PIP model name passed as argv; `*ch2` models predict the doubly charged series too. diaPASEF: `timsTOF2024` with `charge2_from_precursor_charge: 99` (see above) |
 | `ms2pip_python` | `None` | interpreter for the MS2PIP sidecar; required when `predictor=ms2pip`, else the stage errors |
 | `deeplc_python` | `None` | interpreter for the DeepLC sidecar; required when `rt_predictor=deeplc`, else the stage errors |
 | `sidecar_script_dir` | `"scripts"` | directory searched by `resolve_script` for the worker scripts |

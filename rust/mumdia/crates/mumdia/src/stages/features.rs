@@ -36,6 +36,7 @@ mod chromatographic;
 mod coelution;
 mod demix;
 pub(crate) mod entropy;
+pub(crate) mod im;
 mod interference;
 mod ion_series;
 mod mass_accuracy;
@@ -210,8 +211,10 @@ pub const RICH_EXTRA: &[&str] = &[
     "shadow_frac",
 ];
 
-/// The ordered active feature list for the configured set.
-pub fn active_features(set: FeatureSet) -> Vec<String> {
+/// The ordered active feature list for the configured set. `im_features` appends the
+/// ion-mobility block ([`im::NAMES`]) and `im_shape` the peak-shape block
+/// ([`im::SHAPE_NAMES`]) after it, so with both off the list is unchanged.
+pub fn active_features(set: FeatureSet, im_features: bool, im_shape: bool) -> Vec<String> {
     let mut v: Vec<String> = MINIMAL_FEATURES.iter().map(|s| s.to_string()).collect();
     if matches!(set, FeatureSet::Rich | FeatureSet::Extended) {
         v.extend(RICH_EXTRA.iter().map(|s| s.to_string()));
@@ -230,6 +233,12 @@ pub fn active_features(set: FeatureSet) -> Vec<String> {
         v.push("n_charge_states".to_string());
         v.push("charge_multi_flag".to_string());
         v.push("cross_charge_intensity_log".to_string());
+    }
+    if im_features {
+        v.extend(im::NAMES.iter().map(|s| s.to_string()));
+    }
+    if im_shape {
+        v.extend(im::SHAPE_NAMES.iter().map(|s| s.to_string()));
     }
     v
 }
@@ -355,6 +364,8 @@ struct ChromRow<'a> {
     pred_int: f32,
     rt: &'a [f32],
     inten: &'a [f32],
+    /// Per-point 1/K0 parallel to `inten` (chromatograms v2), empty when not read.
+    im: &'a [f32],
 }
 
 /// One PSM's fragment traces on a single union RT axis: `axis_full` ascending and
@@ -849,6 +860,8 @@ struct RowSet {
     /// Row `r`'s intensities are `int_vals[int_off[r]..int_off[r + 1]]`.
     int_off: Vec<usize>,
     int_vals: Vec<f32>,
+    /// Per-point 1/K0 on the same offsets as `int_vals`, or empty when not read.
+    im_vals: Vec<f32>,
     /// Candidate `c`'s rows are `cand_off[c]..cand_off[c + 1]`.
     cand_off: Vec<usize>,
 }
@@ -874,6 +887,7 @@ impl RowSet {
             + crate::memlog::bytes_of(&self.axis_id)
             + crate::memlog::bytes_of(&self.int_off)
             + crate::memlog::bytes_of(&self.int_vals)
+            + crate::memlog::bytes_of(&self.im_vals)
             + crate::memlog::bytes_of(&self.cand_off)
     }
 }
@@ -944,6 +958,7 @@ impl ChromChunk {
         pred_int: f32,
         rt: &[f32],
         inten: &[f32],
+        im: Option<&[f32]>,
     ) {
         let axis_id = self.axis_for(rt);
         let set = if is_ms1 {
@@ -957,6 +972,12 @@ impl ChromChunk {
         set.pred_int.push(pred_int);
         set.axis_id.push(axis_id);
         set.int_vals.extend_from_slice(inten);
+        if let Some(im) = im {
+            // An absent fragment has an empty `im` beside its empty trace; anything else
+            // is parallel to the intensities, so the two share `int_off`.
+            set.im_vals.extend_from_slice(im);
+            set.im_vals.resize(set.int_vals.len(), 0.0);
+        }
         set.int_off.push(set.int_vals.len());
     }
 
@@ -978,6 +999,10 @@ impl ChromChunk {
                 pred_int: set.pred_int[r],
                 rt: self.axis(set.axis_id[r]),
                 inten: &set.int_vals[set.int_off[r]..set.int_off[r + 1]],
+                im: set
+                    .im_vals
+                    .get(set.int_off[r]..set.int_off[r + 1])
+                    .unwrap_or(&[]),
             })
             .collect()
     }
@@ -996,6 +1021,8 @@ struct ChromStream {
     inner: mumdia_io::table::BatchReader,
     pending: Option<RecordBatch>,
     has_obs_mz: bool,
+    /// Read the v2 per-point `im` list (asked for and present).
+    has_im: bool,
 }
 
 impl ChromStream {
@@ -1006,8 +1033,9 @@ impl ChromStream {
     /// parses its footer a SECOND time for a question the handle can already answer. The
     /// confident-bounds pass opens one stream per span, so that was two full footer parses
     /// per span on a table whose footer is not small.
-    fn open(ch: &TableFile) -> Result<ChromStream> {
+    fn open(ch: &TableFile, want_im: bool) -> Result<ChromStream> {
         let has_obs_mz = ch.has_column("frag_obs_mz");
+        let has_im = want_im && ch.has_column("im");
         let mut cols = vec![
             "candidate_id",
             "frag_name",
@@ -1019,10 +1047,14 @@ impl ChromStream {
         if has_obs_mz {
             cols.push("frag_obs_mz");
         }
+        if has_im {
+            cols.push("im");
+        }
         Ok(ChromStream {
             inner: ch.batches(Some(&cols), CHROM_BATCH_ROWS)?,
             pending: None,
             has_obs_mz,
+            has_im,
         })
     }
 
@@ -1099,6 +1131,11 @@ impl ChromStream {
                 .ok_or_else(|| anyhow!("chromatograms column 'predicted_intensity' is not f32"))?;
             let rt = ListF32::of(col("rt")?, "rt")?;
             let inten = ListF32::of(col("intensity")?, "intensity")?;
+            let im = if self.has_im {
+                Some(ListF32::of(col("im")?, "im")?)
+            } else {
+                None
+            };
             // Trace values are read as slices of the decoded batch and copied ONCE, by
             // `push_row` (the axis is deduplicated against the candidate's earlier rows
             // before it is stored, and the intensities are appended to the flat buffer).
@@ -1119,6 +1156,10 @@ impl ChromStream {
                 }
                 let rt_row = rt.row_slice(k, "rt")?;
                 let int_row = inten.row_slice(k, "intensity")?;
+                let im_row = match &im {
+                    Some(a) => Some(a.row_slice(k, "im")?),
+                    None => None,
+                };
                 let nm = name.value(k);
                 let id = names.intern(nm);
                 chunk.push_row(
@@ -1129,6 +1170,7 @@ impl ChromStream {
                     pint.value(k),
                     rt_row,
                     int_row,
+                    im_row,
                 );
             }
             taken += n;
@@ -1683,7 +1725,7 @@ fn subchunk_half_widths(
     rights: &mut Vec<f64>,
 ) -> Result<()> {
     let span = ch.span(first, n_rows)?;
-    let mut stream = ChromStream::open(&span)?;
+    let mut stream = ChromStream::open(&span, false)?;
     // Chunk reading already groups rows by candidate, so this reuses it and keeps only
     // the confident candidates' rows long enough to bound their peak.
     let chunk = stream.read_chunk_filtered(n_rows, names, Some(keep))?;
@@ -1804,7 +1846,7 @@ fn confident_half_widths_serial(
     let keep: std::collections::HashSet<u32> = confident_rows.keys().copied().collect();
     for &(first, n_rows) in spans {
         let span = ch.span(first, n_rows)?;
-        let mut stream = ChromStream::open(&span)?;
+        let mut stream = ChromStream::open(&span, false)?;
         let (mut abs, end) = (first, first + n_rows);
         while abs < end {
             let want = (chunk_rows - abs % chunk_rows).min(end - abs);
@@ -2006,6 +2048,57 @@ fn run_chunked(
     let ms1_i2 = ps
         .opt_f64("ms1_iso2")
         .unwrap_or_else(|_| vec![None; ps.nrows]);
+    // Ion-mobility block (psms_extracted v4), read only when it is on. A missing column
+    // reads as all-null, which the block turns into zeros.
+    let im_on = p.cfg.im_features;
+    let im_col = |name: &str| -> Vec<Option<f64>> {
+        if im_on {
+            ps.opt_f64(name).unwrap_or_else(|_| vec![None; ps.nrows])
+        } else {
+            Vec::new()
+        }
+    };
+    let (apex_im, apex_im_mad, ms1_apex_im, im_cal) = (
+        im_col("apex_im"),
+        im_col("apex_im_mad"),
+        im_col("ms1_apex_im"),
+        im_col("im_pred_cal"),
+    );
+    // Peak-shape block (psms_extracted v5), read only when it is on.
+    let shape_on = p.cfg.im_shape_features;
+    let shape_cols: Vec<Vec<Option<f64>>> = if shape_on {
+        [
+            "apex_im_width",
+            "apex_im_width_mad",
+            "apex_im_overlap",
+            "ms1_im_width",
+            "ms1_frag_overlap",
+        ]
+        .iter()
+        .map(|n| ps.opt_f64(n).unwrap_or_else(|_| vec![None; ps.nrows]))
+        .collect()
+    } else {
+        Vec::new()
+    };
+    if shape_on && !shape_cols[0].iter().any(Option::is_some) {
+        warn!(
+            psms = p.psms,
+            "features: im_shape_features is on, but no row has apex_im_width (spectra              without per-peak widths: set convert.tdf_im_width, or psms_extracted older              than v5); the IM shape features are zero"
+        );
+    }
+    if im_on
+        && !apex_im
+            .iter()
+            .zip(&im_cal)
+            .any(|(a, c)| a.is_some() && c.is_some())
+    {
+        warn!(
+            psms = p.psms,
+            "features: im_features is on, but no row has both apex_im and im_pred_cal \
+             (3D data, no IM calibration, or psms_extracted older than v4); the IM \
+             features are zero"
+        );
+    }
 
     // The chromatogram table is the largest artifact of the run: 62.7 GiB of traces at
     // 2.6M candidates on the HYE benchmark, where the whole store used to be materialised
@@ -2102,7 +2195,7 @@ fn run_chunked(
     };
 
     let gradient = apex_rt.iter().cloned().fold(0.0f64, f64::max).max(1.0);
-    let cols_active = active_features(p.cfg.set);
+    let cols_active = active_features(p.cfg.set, p.cfg.im_features, p.cfg.im_shape_features);
     let n = ps.nrows;
 
     // --- Cross-candidate charge-state corroboration (Extended set) ---
@@ -2164,6 +2257,14 @@ fn run_chunked(
     let n_ext = if extended { ext_names.len() } else { 0 };
     // The feature -> column permutation, taken once instead of once per value per row.
     let ix = ColIx::new(&cols_active, &ext_names);
+    let im_ix: Vec<Option<usize>> = im::NAMES
+        .iter()
+        .map(|n| cols_active.iter().position(|c| c == n))
+        .collect();
+    let shape_ix: Vec<Option<usize>> = im::SHAPE_NAMES
+        .iter()
+        .map(|n| cols_active.iter().position(|c| c == n))
+        .collect();
 
     let writer = TableWriter::new(p.out).with_row_group_rows(FEATURE_ROW_GROUP_ROWS);
     let mut pin = if p.cfg.emit_pin {
@@ -2241,7 +2342,7 @@ fn run_chunked(
             writer.close()
         });
         sc.spawn(move || {
-            let mut stream = match ChromStream::open(ch_ref) {
+            let mut stream = match ChromStream::open(ch_ref, im_on) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = tx.send(Err(e));
@@ -2293,7 +2394,7 @@ fn run_chunked(
                 // One alignment per PSM, read by `fragment_features` and then moved
                 // into the Evidence: it used to be rebuilt inside each of them.
                 let al = align_traces(&rows);
-                let ff = fragment_features(
+                let mut ff = fragment_features(
                     &rows,
                     &al,
                     apex_rt[i],
@@ -2303,6 +2404,14 @@ fn run_chunked(
                     p.cfg.bound_peak_grace,
                     global_bounds,
                 );
+                if im_on {
+                    ff.im_elution = im::elution(
+                        rows.iter().map(|r| (r.rt, r.inten, r.im)),
+                        ff.elution_lo,
+                        ff.elution_hi,
+                        im_cal[i],
+                    );
+                }
                 if !ext.is_empty() {
                     let ms1_rows = ci
                         .map(|c| store.rows(&store.ms1, c, &names))
@@ -2452,6 +2561,25 @@ fn run_chunked(
                 m.set(ix.n_charge_states, r, f_n_charge[i]);
                 m.set(ix.charge_multi_flag, r, f_charge_multi[i]);
                 m.set(ix.cross_charge_intensity_log, r, f_cross_charge_int[i]);
+
+                if im_on {
+                    let sc = im::scalars(apex_im[i], im_cal[i], apex_im_mad[i], ms1_apex_im[i]);
+                    for (c, v) in im_ix.iter().zip(sc.iter().chain(&ff.im_elution)) {
+                        m.set(*c, r, if v.is_finite() { *v } else { 0.0 });
+                    }
+                }
+                if shape_on {
+                    let a = im::ApexShape {
+                        frag_width: shape_cols[0][i],
+                        frag_width_mad: shape_cols[1][i],
+                        frag_overlap: shape_cols[2][i],
+                        ms1_width: shape_cols[3][i],
+                        ms1_overlap: shape_cols[4][i],
+                    };
+                    for (c, v) in shape_ix.iter().zip(im::shape(&a)) {
+                        m.set(*c, r, if v.is_finite() { v } else { 0.0 });
+                    }
+                }
 
                 prelim[r] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
                     + ff.coelution_mean.max(0.0)
@@ -2637,6 +2765,8 @@ struct FragFeatures {
     // above; emitted so downstream (and plotting) read them rather than re-derive.
     elution_lo: f64,
     elution_hi: f64,
+    /// `im::NAMES[im::N_SCALAR..]`, filled only under `features.im_features`.
+    im_elution: [f64; im::N_ELUTION],
 }
 
 /// Fragment-intensity agreement, co-elution, ion-series, and mass-accuracy
@@ -3213,10 +3343,13 @@ mod tests {
 
     #[test]
     fn feature_sets_sized() {
-        assert_eq!(active_features(FeatureSet::Minimal).len(), 14);
-        assert_eq!(active_features(FeatureSet::Rich).len(), 14 + 30);
+        assert_eq!(active_features(FeatureSet::Minimal, false, false).len(), 14);
+        assert_eq!(
+            active_features(FeatureSet::Rich, false, false).len(),
+            14 + 30
+        );
         // Extended = minimal + rich + the family battery, and its names are unique.
-        let ext = active_features(FeatureSet::Extended);
+        let ext = active_features(FeatureSet::Extended, false, false);
         // +6 psms-derived extras: 3 co-elution peak-contest metrics
         // (peak_contested_frac + peak_contested_count_frac + peak_apportioned_frac)
         // + 3 charge-corroboration features.
@@ -3227,6 +3360,25 @@ mod tests {
             ext.len(),
             "duplicate feature name in Extended set"
         );
+        // The IM block is appended last and only when asked for, so with it off every
+        // set, and therefore every schema id and PIN order, is unchanged.
+        for set in [FeatureSet::Minimal, FeatureSet::Rich, FeatureSet::Extended] {
+            let off = active_features(set, false, false);
+            let on = active_features(set, true, false);
+            assert_eq!(on.len(), off.len() + im::NAMES.len());
+            assert_eq!(on[..off.len()], off[..]);
+            let uniq: std::collections::HashSet<&String> = on.iter().collect();
+            assert_eq!(uniq.len(), on.len(), "an IM name shadows another feature");
+            let shape = active_features(set, true, true);
+            assert_eq!(shape.len(), on.len() + im::SHAPE_NAMES.len());
+            assert_eq!(shape[..on.len()], on[..]);
+            let uniq: std::collections::HashSet<&String> = shape.iter().collect();
+            assert_eq!(
+                uniq.len(),
+                shape.len(),
+                "an IM shape name shadows another feature"
+            );
+        }
     }
 
     #[test]
@@ -3254,6 +3406,7 @@ mod tests {
             pred_int: pred,
             rt,
             inten,
+            im: &[],
         }
     }
 
@@ -3388,7 +3541,7 @@ mod tests {
     #[test]
     fn colix_covers_every_active_column() {
         for set in [FeatureSet::Minimal, FeatureSet::Rich, FeatureSet::Extended] {
-            let cols = active_features(set);
+            let cols = active_features(set, false, false);
             let ext = extended_name_refs();
             let ix = ColIx::new(&cols, &ext);
             // Every column the assembly resolves must agree with the name lookup it
@@ -3421,7 +3574,7 @@ mod tests {
         // what the string literal it replaced did, taking the names from the field list via
         // `stringify!` rather than repeating them.
         for set in [FeatureSet::Minimal, FeatureSet::Rich, FeatureSet::Extended] {
-            let cols = active_features(set);
+            let cols = active_features(set, false, false);
             let ext = extended_name_refs();
             let ix = ColIx::new(&cols, &ext);
             for (name, got) in ix.named_pairs() {
@@ -3466,7 +3619,7 @@ mod tests {
         // also the one place this change adds heap blocks rather than removing them. The
         // arithmetic that makes it acceptable: one block per column, at most two matrices in
         // flight, against the 1,048,576 mappings a process gets.
-        let cols = active_features(FeatureSet::Extended).len();
+        let cols = active_features(FeatureSet::Extended, false, false).len();
         let m = ValueMatrix::new(cols, 4096);
         assert_eq!(m.cols.len(), cols);
         assert!(
@@ -3483,7 +3636,10 @@ mod tests {
         // previous chunk's columns are still held while this chunk's matrix AND its extended
         // buffer are live, so the overlap is wider than 2x. The report measures the three;
         // this pins the arithmetic that makes the old constant wrong.
-        let (rows, n_cols) = (4096usize, active_features(FeatureSet::Extended).len());
+        let (rows, n_cols) = (
+            4096usize,
+            active_features(FeatureSet::Extended, false, false).len(),
+        );
         let n_ext = extended_name_refs().len();
         let matrix = n_cols * rows * std::mem::size_of::<f64>();
         let ext = n_ext * rows * std::mem::size_of::<f64>();
@@ -4010,6 +4166,7 @@ mod tests {
                 pred_int: preds[i],
                 rt: &axis,
                 inten: &traces[i],
+                im: &[],
             })
             .collect();
         let al = align_traces(&rows);
@@ -4109,6 +4266,7 @@ mod tests {
                     pred_int: preds[i],
                     rt: &axis,
                     inten: &traces[i],
+                    im: &[],
                 })
                 .collect();
             let al = align_traces(&rows);
@@ -4715,7 +4873,8 @@ mod tests {
         assert_eq!(a.column_names(), b.column_names());
         assert_eq!(
             a.column_names().len(),
-            active_features(FeatureSet::Extended).len() + NON_FEATURE_COLUMNS.len() - 3,
+            active_features(FeatureSet::Extended, false, false).len() + NON_FEATURE_COLUMNS.len()
+                - 3,
             "metadata columns plus every active feature"
         );
         // Every f64 column bit for bit, so a feature that differs in the last ulp fails.
@@ -4961,7 +5120,7 @@ mod tests {
             } else {
                 ch.span(offset, 8).unwrap()
             };
-            let mut stream = ChromStream::open(&handle).unwrap();
+            let mut stream = ChromStream::open(&handle, false).unwrap();
             let mut names = NameTab::default();
             let chunk = stream.read_chunk(handle.nrows, &mut names).unwrap();
             assert_eq!(chunk.cids.len(), handle.nrows / 2);
