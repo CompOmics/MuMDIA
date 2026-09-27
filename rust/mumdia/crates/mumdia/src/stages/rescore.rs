@@ -6313,7 +6313,11 @@ b
             &[("MUMDIA_NN_PARALLEL", "3"), ("MUMDIA_NN_STREAM", "0")][..],
         ] {
             let pairs: &'static [(&'static str, &'static str)] = pairs;
-            assert_eq!(nn_memmap_bytes(true, small, nf, pq, 0, env(pairs)), keyed, "{pairs:?}");
+            assert_eq!(
+                nn_memmap_bytes(true, small, nf, pq, 0, env(pairs)),
+                keyed,
+                "{pairs:?}"
+            );
         }
         // Not the NN worker: nothing, whatever the environment.
         assert_eq!(
@@ -6328,7 +6332,10 @@ b
             &[SERIAL, ("MUMDIA_NN_STREAM", "ON")][..],
         ] {
             let pairs: &'static [(&'static str, &'static str)] = forced;
-            assert_eq!(nn_memmap_bytes(true, small, nf, pq, 0, env(pairs)), small * nf * 4);
+            assert_eq!(
+                nn_memmap_bytes(true, small, nf, pq, 0, env(pairs)),
+                small * nf * 4
+            );
         }
         // A 12 GB matrix may stream under auto; an explicit threshold decides it; `0`
         // never streams.
@@ -6373,7 +6380,10 @@ b
         );
         // For a PIN the worker compares the file size, not the decoded matrix.
         let pin = HandoffFormat::Pin;
-        assert_eq!(nn_memmap_bytes(true, small, nf, pin, gib, env(&[SERIAL])), 0);
+        assert_eq!(
+            nn_memmap_bytes(true, small, nf, pin, gib, env(&[SERIAL])),
+            0
+        );
         assert_eq!(
             nn_memmap_bytes(true, small, nf, pin, 5 * gib, env(&[SERIAL])),
             small * nf * 4
