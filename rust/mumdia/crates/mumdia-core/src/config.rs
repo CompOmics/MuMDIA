@@ -697,6 +697,13 @@ pub struct SearchSeedConfig {
     /// Half-width of the seed IM gate, in V s cm^-2. Default 0.10, wide enough for
     /// uncalibrated IM2Deep on the benchmark (p95 |error| 0.07).
     pub im_window: f64,
+    /// Count each predicted fragment of a candidate at most once per spectrum, with the
+    /// intensity of its most intense matching peak, instead of once per matching peak.
+    /// On diaPASEF slot spectra the mobility pieces of one fragment ion sit at one m/z
+    /// and otherwise count as several fragments in the hyperscore's `ln(matched!)`
+    /// (TIMS roadmap part 2, mobility valley split). Fragindex matcher only. Default
+    /// false: the seed is unchanged. Benchmark-gated.
+    pub unique_fragment_matches: bool,
 }
 
 /// Seed IM gate mode; see [`SearchSeedConfig::im_gate`].
@@ -723,6 +730,7 @@ impl Default for SearchSeedConfig {
             two_pass_mass_cal: false,
             mass_cal_loess: false,
             frag_tol_mad_k: 0.0,
+            unique_fragment_matches: false, // off; benchmark-gated
             im_gate: SeedImGate::Off,
             im_window: 0.10,
         }

@@ -374,6 +374,10 @@ pub struct SeedScratch {
     /// the profiled 54.8M-candidate library), almost all of it never touched because a
     /// worker only ever sees candidates inside one window.
     base: u32,
+    /// Count each (candidate, fragment) once per scan (`search_seed.unique_fragment_matches`).
+    unique: bool,
+    /// `(candidate, fragment, peak intensity)` hits of the current scan, in unique mode.
+    hits: Vec<(u32, u16, f32)>,
 }
 
 impl SeedScratch {
@@ -387,7 +391,18 @@ impl SeedScratch {
             touched: Vec::new(),
             epoch: 0,
             base: 0,
+            unique: false,
+            hits: Vec::new(),
         }
+    }
+
+    /// Count each predicted fragment of a candidate at most once per scan, with the
+    /// intensity of its most intense matching peak, instead of once per matching peak.
+    /// Two peaks at one m/z (the mobility pieces of one fragment ion in a diaPASEF slot
+    /// spectrum) then no longer count as two fragments.
+    pub fn unique(mut self, on: bool) -> SeedScratch {
+        self.unique = on;
+        self
     }
 
     /// Ensure the window-relative arrays span `width` slots.
@@ -422,10 +437,16 @@ impl SeedScratch {
         self.ensure((cand_hi.saturating_sub(cand_lo)) as usize + 1);
         let epoch = self.epoch;
         let base = self.base;
+        let unique = self.unique;
+        self.hits.clear();
         for (k, &(mz, inten)) in peaks.iter().enumerate() {
             let pim = im.map_or(0.0, |g| g.peak_im[k]);
-            idx.probe_peak(mz, cand_lo, cand_hi, |cid, _pmz, _pint, _pfrag| {
+            idx.probe_peak(mz, cand_lo, cand_hi, |cid, _pmz, _pint, pfrag| {
                 if im.is_some_and(|g| pim < g.lo[cid as usize] || pim > g.hi[cid as usize]) {
+                    return;
+                }
+                if unique {
+                    self.hits.push((cid, pfrag, inten));
                     return;
                 }
                 let cc = (cid - base) as usize;
@@ -438,6 +459,30 @@ impl SeedScratch {
                 self.count[cc] += 1;
                 self.obs_sum[cc] += inten as f64;
             });
+        }
+        if !unique {
+            return;
+        }
+        // One match per (candidate, fragment), at its most intense peak; summed in
+        // (candidate, fragment) order, so the result does not depend on the peak order.
+        self.hits.sort_unstable_by_key(|h| (h.0, h.1));
+        let mut i = 0;
+        while i < self.hits.len() {
+            let (cid, frag, mut top) = self.hits[i];
+            i += 1;
+            while i < self.hits.len() && self.hits[i].0 == cid && self.hits[i].1 == frag {
+                top = top.max(self.hits[i].2);
+                i += 1;
+            }
+            let cc = (cid - base) as usize;
+            if self.stamp[cc] != epoch {
+                self.stamp[cc] = epoch;
+                self.count[cc] = 0;
+                self.obs_sum[cc] = 0.0;
+                self.touched.push(cid);
+            }
+            self.count[cc] += 1;
+            self.obs_sum[cc] += top as f64;
         }
     }
 
@@ -935,6 +980,34 @@ mod tests {
         assert_eq!(sc.touched(), &[1], "candidate 0's window excludes the peak");
         sc.accumulate(&idx, &[(600.00, 5.0)], 0, 2, None);
         assert_eq!(sc.touched().len(), 2, "no gate counts both");
+    }
+
+    #[test]
+    fn unique_mode_counts_a_fragment_once_at_its_most_intense_peak() {
+        let tol = 20.0;
+        // Candidate 0: fragments at 600 and 800. Two peaks at 600 (one ion cut in two
+        // along mobility) and one at 800.
+        let lib = lib_from(&[(vec![(600.00, 1.0), (800.00, 1.0)], 400.0)]);
+        let idx = FragIndex::build(&lib, tol);
+        let peaks = [(600.00, 5.0), (600.001, 3.0), (800.00, 2.0)];
+        let mut sc = SeedScratch::new(idx.n_cand());
+        sc.accumulate(&idx, &peaks, 0, 1, None);
+        assert_eq!(
+            (sc.count(0), sc.obs_sum(0)),
+            (3, 10.0),
+            "default counts peaks"
+        );
+        let mut sc = SeedScratch::new(idx.n_cand()).unique(true);
+        sc.accumulate(&idx, &peaks, 0, 1, None);
+        assert_eq!(
+            (sc.count(0), sc.obs_sum(0)),
+            (2, 7.0),
+            "unique counts fragments"
+        );
+        // The next scan starts clean.
+        sc.accumulate(&idx, &[(800.00, 4.0)], 0, 1, None);
+        assert_eq!((sc.count(0), sc.obs_sum(0)), (1, 4.0));
+        assert_eq!(sc.touched(), &[0]);
     }
 
     #[test]

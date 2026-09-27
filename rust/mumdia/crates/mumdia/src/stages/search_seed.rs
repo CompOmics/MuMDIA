@@ -179,6 +179,12 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
             None => seed_fragindex_windows(idx, scans, p.cfg, None),
         }
     } else {
+        if p.cfg.unique_fragment_matches {
+            warn!(
+                "search-seed: search_seed.unique_fragment_matches needs the fragindex matcher; \
+                 the bucketed matcher counts every matching peak"
+            );
+        }
         let mut best: HashMap<u32, Best> = HashMap::new();
         for scan in scans {
             let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
@@ -443,13 +449,20 @@ pub fn run(p: SearchSeedParams) -> Result<u64> {
         stage: "search-seed".to_string(),
         rows: n,
         content_hash: mumdia_io::hash::blake3_file(p.out)?,
-        params: json!({
-            "fragment_tol_ppm": p.cfg.fragment_tol_ppm,
-            "report_psms": p.cfg.report_psms,
-            "min_matched_peaks": p.cfg.min_matched_peaks,
-            "top_n_peaks": p.cfg.top_n_peaks,
-            "fdr_seed": p.cfg.fdr_seed,
-        }),
+        params: {
+            let mut v = json!({
+                "fragment_tol_ppm": p.cfg.fragment_tol_ppm,
+                "report_psms": p.cfg.report_psms,
+                "min_matched_peaks": p.cfg.min_matched_peaks,
+                "top_n_peaks": p.cfg.top_n_peaks,
+                "fdr_seed": p.cfg.fdr_seed,
+            });
+            // Only when on, so a default report is unchanged.
+            if p.cfg.unique_fragment_matches {
+                v["unique_fragment_matches"] = json!(true);
+            }
+            v
+        },
         stats,
         model_identity: Some("native-seed-hyperscore-v1".to_string()),
         elapsed_ms: elapsed,
@@ -781,7 +794,7 @@ fn seed_fragindex_windows(
     let partials: Vec<Vec<(u32, Best)>> = group_vec
         .par_iter()
         .map_init(
-            || SeedScratch::new(scratch_width),
+            || SeedScratch::new(scratch_width).unique(cfg.unique_fragment_matches),
             |scratch, ids| {
                 if ids.is_empty() {
                     return Vec::new();
