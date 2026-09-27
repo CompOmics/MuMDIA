@@ -174,12 +174,16 @@ Key semantics:
   both default off, bit-identical when off. -0.9% peptides over 3 seeds, no gain: MS1
   centroids merge neighbouring ions at the 30-scan gap (MS1 width 1.6x the fragment
   width), so centroid splitting must come before any profile feature.
-- `extract.retain_top_peaks > 1` (default 1) writes the alternative peaks as
-  additional `psms_extracted` rows with `peak_rank >= 1` (plus a diagnostic
-  `.peaks.parquet`), `features` carries `peak_rank`, `compete` keys on it, and
-  `rescore` keeps one row per candidate and records `selected_peak_rank`. The
-  plumbing exists; what the default still lacks is entrapment validation on two
-  acquisitions.
+- Two keys, both default 1. `extract.retain_top_peaks > 1` writes only the unscored
+  diagnostic `<psms>.peaks.parquet`. `extract.promote_top_peaks > 1` writes the
+  alternative peaks as additional `psms_extracted` rows with `peak_rank >= 1`;
+  `features` carries `peak_rank`, `compete` keys on it, and `rescore` keeps the
+  best-scoring row per candidate and records `selected_peak_rank`. Measured on the
+  diaPASEF E. coli run (docs/TIMS_ROADMAP_bis.md "L2 result"), K = 2 and 3 LOSE 5.7-5.9%
+  peptides. The rescorer barely tells a candidate's peaks apart (a wrong alternate beats
+  the right rank-0 peak in 40% of confirmed pairs), because about 40 features, the seed
+  features among them, are copied from rank 0 onto every alternate. The plumbing exists;
+  per-peak features come before any further measurement.
 
 ## Validated sensitivity workflow
 
@@ -736,8 +740,8 @@ sensitivity result for it.
 
 Do not enable these by default from a single AIF count:
 
-- model-visible top-K peaks (`extract.retain_top_peaks > 1`; implemented through
-  features, compete and rescore, default 1);
+- model-visible top-K peaks (`extract.promote_top_peaks > 1`; implemented through
+  features, compete and rescore, default 1; measured as a loss on diaPASEF, see above);
 - adaptive RT windows;
 - held-out RT window sizing (`rt_im_train.window_holdout_frac`). Implemented and
   measured on the AIF benchmark: +1.1% peptides with DeepLC 4.1.0 at unchanged

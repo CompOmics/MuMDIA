@@ -1,6 +1,6 @@
 # TIMS roadmap: diaPASEF support at DIA-NN parity
 
-Status: P0-P2 done, P3 done within the agreed scope, P4-P6 implemented and measured on the E. coli file (all new behaviour default off, P6 at 0.62x DIA-NN in peptides, entrapment FDP 0.36-0.38%); P7 (IM peak width) implemented and measured with no gain (all keys default off); 2026-09-24. Code references are to `8d3db2e`. Branch `IM`. The objective order is fixed: identification
+Status: P0-P2 done, P3 done within the agreed scope, P4-P6 implemented and measured on the E. coli file (all new behaviour default off, P6 at 0.62x DIA-NN in peptides, entrapment FDP 0.36-0.38%); P7 (IM peak width) implemented and measured with no gain (all keys default off); 2026-09-24. Continued in TIMS_ROADMAP_bis.md (loss diagnosis and next levers). Code references are to `8d3db2e`. Branch `IM`. The objective order is fixed: identification
 sensitivity at 1% first. FDR validity (entrapment), quantification accuracy and
 runtime come after the identification gap is closed, and each keeps its own gate
 from `docs/20_sensitivity_and_quantification_playbook.md`.
@@ -985,6 +985,9 @@ Reading:
   Measure it (peaks per spectrum, seed anchors, the width distribution above, and IDs)
   before re-testing this block.
 - None of the P7 keys is a candidate for promotion.
+
+The next steps, from a precursor-level loss analysis against DIA-NN, are in
+[TIMS_ROADMAP_bis.md](TIMS_ROADMAP_bis.md).
 
 ### P8: Performance
 

@@ -640,7 +640,7 @@ result".
 
 `rt_im_train.refit = true` makes `run` and ungrouped `run-experiment` search twice
 (`stages/im_rt_refit.rs`). The measurements behind each rule are in
-the TIMS roadmap, part 2 ("L1d").
+docs/TIMS_ROADMAP_bis.md, "L1d".
 
 1. Pass 1 is the normal chain, written to `<out>/pass1/` (`<run>/pass1/` under
    `run-experiment`, where the pooled pass-1 rescore is `<out>/pass1/scored_combined.parquet`).

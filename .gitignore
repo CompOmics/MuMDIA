@@ -86,3 +86,7 @@ deploy_local/
 .stopgate/state/
 .claude/settings.local.json
 .stopgate.toml
+
+# Local data and a separate checkout, never tracked (TIMS roadmap work).
+/mzcore/
+/bench/proteobench_input/
