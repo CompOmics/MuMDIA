@@ -147,6 +147,22 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **Sharded DeepLC prediction and one retention-time adaptation per banded run are
+  defaults:** `rt_im_train.deeplc_predict_shards = 0` (one process per 8 threads of the
+  prediction budget) and `groups.rt_adaptation = "once_per_run"`. Both are
+  float-equivalent rather than bit-identical, so they were gated on seeds before the
+  default moved (EPYC 9354, 128 threads). Sharded prediction, 8 processes of 8 threads
+  against one: a six-run Astral experiment 26:00 -> 18:02, a five-run Orbitrap AIF
+  experiment 29:47 -> 21:04, an entrapment run 6:27 -> 3:32; the adapted library moved in
+  at most 414 of 10,881,402 rows (at most 0.42 s) with the same 80 heads, and the peptides
+  at 1% moved -0.09%, -0.04% and -0.05% over 10 NN seeds each, every one inside the seed
+  spread, at an unchanged entrapment FDP (0.988 -> 0.984%). A budget of 8 or fewer threads
+  (a desktop under the DeepLC thread cap) is still one process. One adaptation per banded
+  run: a six-run Astral experiment at 16 bands 36:06 -> 25:39 and an eight-band entrapment
+  run 5:44 -> 3:45, with 0.8% of the band rows moving by at most 0.07 s and the peptides
+  at 1% +0.35% (3 seeds) and +0.24% (10 seeds; entrapment FDP +0.022 pp against two
+  standard errors of 0.027). `deeplc_predict_shards = 1` and `rt_adaptation = "per_band"`
+  restore the previous behaviour.
 - **Five opt-ins that change no result are defaults:** `extract.chromatogram_schema = 2`,
   `experiment.parallel_runs = "auto"`, `experiment.overlap_front_threads = "auto"`,
   `predict_frag.defer_deeplc_to_multihead = true` and `groups.delete_band_intermediates =

@@ -769,7 +769,7 @@ not been rerun against a once-fine-tuned library. Until it is, treat the choice 
 open: per-run fine-tuning is the benchmarked default, once-per-library is the
 cheaper option with equal RT residuals on the one run measured here.
 
-#### Sharded whole-library prediction (`deeplc_predict_shards`, default 1)
+#### Sharded whole-library prediction (`deeplc_predict_shards`, default 0, automatic)
 
 The whole-library prediction after the fit (the fine-tune, the multi-head calibration or
 none) can be split across processes with `rt_im_train.deeplc_predict_shards`. The premise
@@ -815,6 +815,20 @@ past the host's 64 physical cores (10:41 at 96 threads, 18:09 at 128). The hypot
 that featurisation, 11.5 s of 53.5 here, becomes the bound once the forward pass is spread
 over many cores; it has not been measured. Whether sharding pays there is the doxy A/B
 that remains; the survey's arithmetic is 10:41 to 2.5-4.5 min at 8-12 shards.
+
+**Default since 2026-09-27: `0`, automatic.** Measured on the fleet before the default
+changed (EPYC 9354, 128 threads, so a budget of 64 capped threads and 8 processes of 8),
+against one process, three pools with 10 NN seeds each:
+
+| pool | wall, one process -> automatic | rows of the adapted library moved (max) | peptides at 1% |
+|---|---|---|---|
+| Astral, 6 runs | 26:00 -> 18:02 | 413 of 10,881,402 (0.05 s) | -0.09% |
+| Orbitrap AIF, 5 runs | 29:47 -> 21:04 | 414 of 10,881,402 (0.42 s) | -0.04% |
+| entrapment, 1 run | 6:27 -> 3:32 | 298 of 5,828,348 (1.8 s) | -0.05%, FDP 0.988 -> 0.984% |
+
+The same 80 heads were selected every time, and every peptide difference lies inside the
+seed spread. On the desktop measured above, one process per 8 threads of a budget of 8 is
+one process, so the default leaves it as it was.
 
 ## Key types and functions
 
@@ -867,7 +881,7 @@ though the enum variant still exists.
 | `adaptive_rt_bins` | `12` | Number of equal-width calibrated-RT bins for the adaptive window (rt_im_train.rs:202). |
 | `rt_window_min_s` | `1.0` | Lower clamp (seconds) for any adaptive half-window (rt_im_train.rs:210); mirrors the 1s floor on the global window. |
 | `library_irt` | `auto` | Library-input mode only. `auto` re-predicts the imported `predicted_irt` with the DeepLC base model when `predict_frag.deeplc_python` is set and keeps it, with a warning, when not; `deeplc` requires the interpreter (preflight); `library` keeps the imported values. Ignored under `finetune_deeplc` and in FASTA mode. Section 4c has the measurement. |
-| `deeplc_predict_shards` | `1` | Worker processes for the whole-library DeepLC prediction (multi-head calibration, base-model re-prediction, the prediction after a fine-tune; `deeplc_finetune.py --shards`). The fit happens once, in the parent process, and is handed to every child; each child predicts a slice of the unique sequences cut at a multiple of the 100,000-sequence call, and the slices are joined in order. `K` processes share the thread budget, `budget / K` threads each; `0` is one process per 8 threads, and a GPU always gets one. Bit-identical to one process at equal threads per process, float-equivalent at the same engine thread count. Off by default: on the one desktop measured, four processes of two threads were no faster than one of eight, and the survey's arithmetic for HYE (10:41 to 2.5-4.5 min) is unmeasured; it needs two acquisitions before a default. |
+| `deeplc_predict_shards` | `0` | Worker processes for the whole-library DeepLC prediction (multi-head calibration, base-model re-prediction, the prediction after a fine-tune; `deeplc_finetune.py --shards`). The fit happens once, in the parent process, and is handed to every child; each child predicts a slice of the unique sequences cut at a multiple of the 100,000-sequence call, and the slices are joined in order. `K` processes share the thread budget, `budget / K` threads each; `0` is one process per 8 threads, and a GPU always gets one. Bit-identical to one process at equal threads per process, float-equivalent at the same engine thread count. Automatic by default since 2026-09-27 (one process per 8 threads, so one on a desktop budget of 8): 26:00 -> 18:02 and 29:47 -> 21:04 on two six- and five-run experiments with the peptides at 1% inside the seed spread (section "Sharded whole-library prediction"). |
 | `window_holdout_frac` | `0.0` | Size `w_rt` from held-out anchor residuals instead of in-sample ones (section 4b). `base_peptide_id % 1000 < round(frac*1000)` selects the holdout; the same rule excludes those peptides from the orchestrated DeepLC fine-tune. Range `[0.0, 0.9]`, `0.0` = off; mutually exclusive with `adaptive_rt_window`. Benchmark-gated. |
 
 ## Invariants, determinism, gotchas

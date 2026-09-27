@@ -655,7 +655,8 @@ arm("union", groups=dict(banded, rt_adaptation="once_per_run"),
     rt_im_train={"multihead_calibration": 2})
 arm("keep", groups=dict(banded, rt_adaptation="once_per_run"),
     rt_im_train={"multihead_calibration": 0})
-arm("perband", groups=banded, rt_im_train={"multihead_calibration": 0})
+arm("perband", groups=dict(banded, rt_adaptation="per_band"),
+    rt_im_train={"multihead_calibration": 0})
 arm("defer", groups=dict(banded, rt_adaptation="once_per_run"),
     rt_im_train={"multihead_calibration": 2},
     predict_frag={"rt_predictor": "deeplc", "defer_deeplc_to_multihead": True})

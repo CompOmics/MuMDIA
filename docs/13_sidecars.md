@@ -387,9 +387,11 @@ the thread cap below for what that does). Each child is a Python process with to
 and DeepLC loaded: 0.54 GB resident after import and 0.57 GB after the model load on the
 Windows desktop measured, so the model itself is about 35 MB (10.3 MB of parameters) and
 the per-child cost is the runtime. The parent drops its own model copy before the children
-start. Whether sharding is faster at all is open: on that desktop the forward pass
-dominated and scaled with threads, so four processes of two threads were no faster than
-one of eight (`docs/08_rt_im_train.md`, "Sharded whole-library prediction").
+start. On that desktop the forward pass dominated and scaled with threads, so four
+processes of two threads were no faster than one of eight; on a 64-core EPYC 9354 host,
+8 processes of 8 took two six- and five-run experiments from 26:00 to 18:02 and from 29:47
+to 21:04 with the peptides inside the seed spread, which is why `K = 0` is the default
+since 2026-09-27 (`docs/08_rt_im_train.md`, "Sharded whole-library prediction").
 
 **Band lists** (`groups.rt_adaptation = once_per_run`, `--bands <tsv>`). A grouped run
 under global calibration can adapt all its bands in one call:
