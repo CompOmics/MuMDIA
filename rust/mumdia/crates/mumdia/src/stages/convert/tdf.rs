@@ -33,6 +33,14 @@ pub struct TdfParams {
     pub min_points: u32,
     /// Also compute each centroid's mobility width ([`Centroids::width`]).
     pub im_width: bool,
+    /// Valley depth that splits a cluster along m/z (0 = off; [`valley_cuts`]).
+    pub mz_valley: f64,
+    /// Half-width in ppm of the m/z profile smoothing used by the valley split.
+    pub mz_smooth_ppm: f64,
+    /// Valley depth that splits a cluster along mobility (0 = off; [`valley_cuts`]).
+    pub im_valley: f64,
+    /// Half-width in TIMS scans of the mobility profile smoothing.
+    pub im_smooth_scans: f64,
 }
 
 impl TdfParams {
@@ -42,6 +50,10 @@ impl TdfParams {
             im_gap_scans: c.tdf_im_gap_scans,
             min_points: c.tdf_min_points,
             im_width: c.tdf_im_width,
+            mz_valley: c.tdf_mz_valley,
+            mz_smooth_ppm: c.tdf_mz_smooth_ppm,
+            im_valley: c.tdf_im_valley,
+            im_smooth_scans: c.tdf_im_smooth_scans,
         }
     }
 }
@@ -151,9 +163,13 @@ struct Centroids {
 /// single-scan cluster is not a zero-width point, converted to 1/K0 with the local slope
 /// of the calibration at the weighted mean scan.
 ///
+/// With `mz_valley` > 0, each such cluster is further cut at the valleys of its m/z
+/// profile, and with `im_valley` > 0 each resulting piece at the valleys of its mobility
+/// profile ([`valley_cuts`]). Every piece is a cluster of its own, floor included.
+///
 /// ponytail: single linkage, so a dense m/z region can chain two peaks together, and two
-/// ions of one m/z whose mobility profiles touch without a scan gap merge. Upgrade path if
-/// P4 needs it: split traces at minima of the smoothed mobility profile.
+/// ions of one m/z whose mobility profiles touch without a scan gap merge, unless the
+/// valley splits (both default off) cut them apart again.
 fn centroid_2d(
     pts: &mut [(u32, u32, u32)],
     mz_of: impl Fn(u32) -> f64,
@@ -185,6 +201,19 @@ fn centroid_2d(
             peaks.push((wm / w, w as f32, im_of(mean) as f32, width));
         }
     };
+    // Mobility valley split of one piece, then emit.
+    let im_split = |c: &mut [(u32, u32, u32)], peaks: &mut Vec<(f64, f32, f32, f32)>| {
+        if p.im_valley <= 0.0 {
+            return emit(c, peaks);
+        }
+        c.sort_unstable_by_key(|&(t, s, x)| (s, t, x));
+        let cuts = valley_cuts(c, |q| q.1, |s| s as f64, |_| p.im_smooth_scans, p.im_valley);
+        let mut a = 0;
+        for b in cuts.into_iter().chain([c.len()]) {
+            emit(&c[a..b], peaks);
+            a = b;
+        }
+    };
     let mut peaks: Vec<(f64, f32, f32, f32)> = Vec::new();
     let mut i = 0;
     while i < pts.len() {
@@ -206,7 +235,24 @@ fn centroid_2d(
             while e < trace.len() && trace[e].1 - trace[e - 1].1 <= p.im_gap_scans {
                 e += 1;
             }
-            emit(&trace[k..e], &mut peaks);
+            let cluster = &mut trace[k..e];
+            if p.mz_valley > 0.0 {
+                cluster.sort_unstable();
+                let cuts = valley_cuts(
+                    cluster,
+                    |q| q.0,
+                    &mz_of,
+                    |m| m * p.mz_smooth_ppm * 1e-6,
+                    p.mz_valley,
+                );
+                let mut a = 0;
+                for b in cuts.into_iter().chain([cluster.len()]) {
+                    im_split(&mut cluster[a..b], &mut peaks);
+                    a = b;
+                }
+            } else {
+                im_split(cluster, &mut peaks);
+            }
             k = e;
         }
         i = j;
@@ -222,6 +268,69 @@ fn centroid_2d(
             Vec::new()
         },
     }
+}
+
+/// Cut positions (indices into `c`, sorted by `key`) where one cluster is split at the
+/// valleys of its profile along one axis: m/z (`convert.tdf_mz_valley`, key the TOF index)
+/// or mobility (`convert.tdf_im_valley`, key the TIMS scan).
+///
+/// The profile has one entry per distinct key, at position `pos(key)`, with the summed
+/// intensity, smoothed with a triangular kernel of half-width `tol(position)`. A local
+/// minimum is a cut when it is below `valley` times the smaller of the highest point since
+/// the previous cut and the highest point after it; the minimum itself starts the
+/// right-hand piece.
+///
+/// ponytail: the right-hand hump is the maximum of the whole remainder, not the next
+/// hump only, so a small shoulder between two large ions may stay joined to one of them.
+/// Track the next maximum instead if the centroid-pair histogram shows it matters.
+fn valley_cuts(
+    c: &[(u32, u32, u32)],
+    key: impl Fn(&(u32, u32, u32)) -> u32,
+    pos: impl Fn(u32) -> f64,
+    tol: impl Fn(f64) -> f64,
+    valley: f64,
+) -> Vec<usize> {
+    // (first index in `c`, position, summed intensity) per distinct key.
+    let mut prof: Vec<(usize, f64, f64)> = Vec::new();
+    for (i, q) in c.iter().enumerate() {
+        match prof.last_mut() {
+            Some(l) if key(&c[l.0]) == key(q) => l.2 += q.2 as f64,
+            _ => prof.push((i, pos(key(q)), q.2 as f64)),
+        }
+    }
+    let n = prof.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    // ponytail: O(n x window) smoothing; clusters span tens to hundreds of TOF indices.
+    let sm: Vec<f64> = (0..n)
+        .map(|i| {
+            let (m, tol) = (prof[i].1, tol(prof[i].1));
+            let w = |d: f64| if tol > 0.0 { 1.0 - d / tol } else { 1.0 };
+            let mut s = 0.0;
+            for q in prof[..i].iter().rev().take_while(|q| m - q.1 <= tol) {
+                s += q.2 * w(m - q.1);
+            }
+            for q in prof[i..].iter().take_while(|q| q.1 - m <= tol) {
+                s += q.2 * w(q.1 - m);
+            }
+            s
+        })
+        .collect();
+    let mut rmax = sm.clone();
+    for i in (0..n - 1).rev() {
+        rmax[i] = rmax[i].max(rmax[i + 1]);
+    }
+    let (mut cuts, mut lmax) = (Vec::new(), sm[0]);
+    for m in 1..n - 1 {
+        if sm[m] < sm[m - 1] && sm[m] <= sm[m + 1] && sm[m] < valley * lmax.min(rmax[m + 1]) {
+            cuts.push(prof[m].0);
+            lmax = sm[m];
+        } else {
+            lmax = lmax.max(sm[m]);
+        }
+    }
+    cuts
 }
 
 /// Keep the `top` most intense peaks (0 = all), m/z order preserved.
@@ -384,6 +493,14 @@ mod tests {
         im_gap_scans: 5,
         min_points: 2,
         im_width: false,
+        mz_valley: 0.0,
+        mz_smooth_ppm: 4.0,
+        im_valley: 0.0,
+        im_smooth_scans: 4.0,
+    };
+    const V: TdfParams = TdfParams {
+        mz_valley: 0.5,
+        ..P
     };
 
     /// TOF index t sits at m/z 500 + t/1000 (2 ppm per index near 500), scan s at 1/K0 s.
@@ -441,6 +558,108 @@ mod tests {
         let mut rev = pts;
         rev.reverse();
         assert_eq!(run(&pts, &P), run(&rev, &P));
+    }
+
+    /// One scan, consecutive TOF indices from 1000 (2 ppm apart), given intensities.
+    fn profile(x: &[u32]) -> Vec<(u32, u32, u32)> {
+        x.iter()
+            .enumerate()
+            .map(|(i, &x)| (1000 + i as u32, 10, x))
+            .collect()
+    }
+
+    #[test]
+    fn two_humps_with_a_deep_valley_split_and_off_keeps_one_peak() {
+        // Humps at 1002 and 1007 (10 ppm apart), one chain under 10 ppm linkage.
+        let pts = profile(&[1, 4, 9, 4, 1, 1, 4, 9, 4, 1]);
+        assert_eq!(run(&pts, &P).inten, vec![38.0]);
+        // Smoothed (4 ppm = 2 indices, triangular): the minimum 3.5 at 1004 is below
+        // 0.5 x 13 and starts the right-hand piece.
+        let c = run(&pts, &V);
+        assert_eq!(c.inten, vec![18.0, 20.0]);
+        assert!(c.mz[0] < c.mz[1]);
+    }
+
+    #[test]
+    fn a_lumpy_single_ion_stays_one_peak_after_smoothing() {
+        let pts = profile(&[2, 6, 3, 6, 2]);
+        let raw = TdfParams {
+            mz_valley: 0.6,
+            mz_smooth_ppm: 0.0,
+            ..P
+        };
+        // Unsmoothed, the dip 3 is below 0.6 x 6 and cuts; smoothed there is no minimum.
+        assert_eq!(run(&pts, &raw).inten, vec![8.0, 11.0]);
+        assert_eq!(
+            run(
+                &pts,
+                &TdfParams {
+                    mz_valley: 0.6,
+                    ..P
+                }
+            )
+            .inten,
+            vec![19.0]
+        );
+        // A shallow dip does not cut even unsmoothed.
+        assert_eq!(run(&profile(&[2, 6, 5, 6, 2]), &raw).inten, vec![21.0]);
+    }
+
+    #[test]
+    fn valley_pieces_meet_the_floor_and_do_not_depend_on_input_order() {
+        // The dip 1 is below 0.5 x min(4, 8) and cuts; the left piece is the single point
+        // 4 and falls below the floor of 2 points.
+        let floor = TdfParams {
+            mz_smooth_ppm: 0.0,
+            ..V
+        };
+        assert_eq!(run(&profile(&[4, 1, 8, 3]), &floor).inten, vec![12.0]);
+        let mut pts = profile(&[1, 4, 9, 4, 1, 1, 4, 9, 4, 1]);
+        pts.extend([(1003, 11, 2), (1007, 12, 3), (1000, 50, 2), (1001, 51, 7)]);
+        let mut rev = pts.clone();
+        rev.reverse();
+        assert_eq!(run(&pts, &V), run(&rev, &V));
+    }
+
+    #[test]
+    fn two_mobility_humps_split_and_off_keeps_one_peak() {
+        // One TOF index, scans 10..=19 (one scan apart, no gap), humps at 12 and 17.
+        let x = [1, 4, 9, 4, 1, 1, 4, 9, 4, 1];
+        let pts: Vec<_> = x
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| (1000, 10 + i as u32, x))
+            .collect();
+        assert_eq!(run(&pts, &P).inten, vec![38.0]);
+        // Smoothing 1 scan: no weight on the neighbours, the raw dip 1 at scan 14 cuts.
+        let on = TdfParams {
+            im_valley: 0.5,
+            im_smooth_scans: 1.0,
+            ..P
+        };
+        let c = run(&pts, &on);
+        assert_eq!(c.inten, vec![18.0, 20.0]);
+        assert!((c.im[0] - 214.0 / 18.0).abs() < 1e-4 && c.im[1] > 16.0);
+        // A wide smoothing fills the valley: one peak.
+        assert_eq!(
+            run(
+                &pts,
+                &TdfParams {
+                    im_smooth_scans: 6.0,
+                    ..on
+                }
+            )
+            .inten,
+            vec![38.0]
+        );
+        // Both splits on, input order irrelevant.
+        let both = TdfParams {
+            mz_valley: 0.5,
+            ..on
+        };
+        let mut rev = pts.clone();
+        rev.reverse();
+        assert_eq!(run(&pts, &both), run(&rev, &both));
     }
 
     #[test]

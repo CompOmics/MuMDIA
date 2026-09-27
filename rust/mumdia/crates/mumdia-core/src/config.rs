@@ -368,6 +368,26 @@ pub struct ConvertConfig {
     /// columns unchanged. Read by extract's apex IM-shape columns (psms_extracted v5)
     /// and `features.im_shape_features`. Benchmark-gated.
     pub tdf_im_width: bool,
+    /// Native TDF: split each m/z x mobility cluster at valleys of its m/z profile
+    /// (TIMS roadmap part 2, D5 follow-up). A local minimum of the smoothed profile is a
+    /// cut when it is below this fraction of the smaller of the two humps beside it, so
+    /// one ion stays one centroid and two neighbouring ions become two. Must be in
+    /// [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated.
+    pub tdf_mz_valley: f64,
+    /// Native TDF: half-width in ppm of the triangular smoothing applied to the m/z
+    /// profile before `tdf_mz_valley` looks for valleys; 0 is no smoothing. Unused while
+    /// `tdf_mz_valley` is 0.
+    pub tdf_mz_smooth_ppm: f64,
+    /// Native TDF: split each cluster (after the m/z valley split, when that is on) at
+    /// valleys of its mobility profile: summed intensity per TIMS scan, triangular
+    /// smoothing of half-width `tdf_im_smooth_scans`, cut at a local minimum below this
+    /// fraction of the smaller hump beside it. Separates ions of one m/z whose mobility
+    /// profiles touch without a `tdf_im_gap_scans` gap. Must be in [0, 1); 0 (default) is
+    /// off and leaves the centroids unchanged. Benchmark-gated.
+    pub tdf_im_valley: f64,
+    /// Native TDF: half-width in TIMS scans of the mobility profile smoothing used by
+    /// `tdf_im_valley`; 0 is no smoothing. Unused while `tdf_im_valley` is 0.
+    pub tdf_im_smooth_scans: f64,
 }
 impl Default for ConvertConfig {
     fn default() -> Self {
@@ -383,6 +403,10 @@ impl Default for ConvertConfig {
             tdf_im_gap_scans: 30,
             tdf_min_points: 2,
             tdf_im_width: false, // opt-in; TIMS P7, benchmark-gated
+            tdf_mz_valley: 0.0,  // off; benchmark-gated
+            tdf_mz_smooth_ppm: 4.0,
+            tdf_im_valley: 0.0, // off; benchmark-gated
+            tdf_im_smooth_scans: 4.0,
         }
     }
 }
@@ -2184,6 +2208,21 @@ impl Config {
             return Err(Invalid(
                 "extract.gate_min_score must be finite and in [0, 1] (0 disables \
                 the gate)."
+                    .into(),
+            ));
+        }
+        let cv = &self.convert;
+        let frac = |v: f64| (0.0..1.0).contains(&v);
+        let width = |v: f64| v >= 0.0 && v.is_finite();
+        if !(frac(cv.tdf_mz_valley)
+            && frac(cv.tdf_im_valley)
+            && width(cv.tdf_mz_smooth_ppm)
+            && width(cv.tdf_im_smooth_scans))
+        {
+            return Err(Invalid(
+                "convert.tdf_mz_valley and convert.tdf_im_valley must be in [0, 1) (0 disables \
+                 the valley split), convert.tdf_mz_smooth_ppm and convert.tdf_im_smooth_scans \
+                 finite and >= 0."
                     .into(),
             ));
         }

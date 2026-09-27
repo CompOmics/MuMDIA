@@ -587,6 +587,14 @@ added for quantisation, converted to 1/K0 with the local calibration slope. It a
 against 38 s) and leaves every other column unchanged. On that run the median width is
 9.4 scans (0.0081 V s cm^-2) for MS2 peaks and 13.2 scans for MS1, whose p95 of 54 scans
 shows MS1 centroids merging several ions at the 30-scan gap.
+Under `convert.tdf_mz_valley` (default 0, off; TIMS roadmap part 2, D5 follow-up) each
+cluster is also cut along m/z after the mobility split. Its m/z profile (summed
+intensity per TOF index, smoothed with a triangular kernel of half-width
+`convert.tdf_mz_smooth_ppm`, 4) is cut at every local minimum that lies below
+`tdf_mz_valley` times the smaller hump beside it. Each piece is then a cluster of its own,
+subject to the same point floor. The aim is one centroid per ion at a 10 ppm linkage:
+10 ppm alone chains neighbouring ions together, and 5 ppm cuts single ions into pieces.
+With the key at 0 the centroids are unchanged.
 
 - m/z uses timsrust's TOF conversion. It agrees with msconvert's vendor-calibrated
   m/z to a median of 0.02 ppm (p5/p95 -3.5/+3.7 ppm) on the TIMS benchmark run.
