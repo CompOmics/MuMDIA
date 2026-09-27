@@ -500,7 +500,7 @@ def test_default_speedups_leave_scores_byte_identical(torch_available, tmp_path,
 # The worker whose default scores the current default must reproduce. When a later change
 # moves the default scores on purpose, point this at the commit that made it: here the
 # commit that made keyed parallel training (`MUMDIA_NN_PARALLEL=auto`) the default.
-REFERENCE_COMMIT = "6887c41b7ed04ace7eb1d744d750e83bb2c93e9e"
+REFERENCE_COMMIT = "84031cd7017d5a9d49db259fde49add764e3ebcf"
 
 # The worker as it was before the default-path speed-ups (W1-W6) and the move of the
 # training loop into `_build_trainer`: origin/main when they were written, and the last
