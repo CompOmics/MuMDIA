@@ -559,7 +559,8 @@ pub struct PredictFragConfig {
     /// Directory holding the sidecar worker scripts.
     pub sidecar_script_dir: String,
     /// Skip DeepLC in a FASTA library build (`rt_predictor = deeplc`) when the multi-head
-    /// calibration will re-predict every row anyway. Default `false`.
+    /// calibration will re-predict every row anyway. Default `true` since 2026-09-27
+    /// (previously `false`).
     ///
     /// With `rt_predictor = deeplc` the automatic multi-head calibration runs, and it
     /// rewrites the `predicted_irt` of every standard-residue row against the run's anchors
@@ -573,11 +574,14 @@ pub struct PredictFragConfig {
     /// (`retained_imported > 0`), because such a row would keep the placeholder. Ignored
     /// where the multi-head calibration does not run, and by the standalone `predict-frag`.
     ///
-    /// Final outputs are then byte-identical to the default's; the intermediate library
-    /// table, the seed's pass-through iRT column and the predict-frag report differ. Opt-in
-    /// because the library table is no longer a DeepLC library, which matters to anyone who
-    /// reuses it as `--lib-precursors` elsewhere. Validate by comparing `psms_scored.parquet`
-    /// against a default FASTA run (on CPU, where DeepLC's base prediction is deterministic).
+    /// Final outputs are then byte-identical to a run with `false`; the intermediate library
+    /// table, the seed's pass-through iRT column and the predict-frag report differ. The
+    /// library table is then not a DeepLC library, which matters to anyone who reuses it as
+    /// `--lib-precursors` elsewhere: set `false` for a build meant to be reused that way.
+    /// Measured before the default changed, on the E. coli entries of the ProteoBench HYE
+    /// FASTA against `LFQ_Orbitrap_AIF_Ecoli_01` (MS2PIP `HCDch2`, DeepLC 4.4.0, CPU):
+    /// `psms_scored.parquet`, the three quant tables and both TSVs byte-identical to a run
+    /// with `false`, and the run 14:56 -> 12:29.
     pub defer_deeplc_to_multihead: bool,
     /// A directory in which `run` and `run-experiment` keep the library they build from a
     /// FASTA, and reuse it on a later run. Unset (default): every FASTA run builds its
@@ -624,7 +628,7 @@ impl Default for PredictFragConfig {
             peptdeep_python: None,
             deeplc_python: None,
             sidecar_script_dir: "scripts".to_string(),
-            defer_deeplc_to_multihead: false,
+            defer_deeplc_to_multihead: true,
             library_cache: None,
         }
     }
@@ -1031,18 +1035,24 @@ pub struct ExtractConfig {
     /// window), so the elution profile drops to zero between peaks and the
     /// features-stage boundary calling is not misled by interpolated gaps.
     pub emit_window_grid: bool,
-    /// On-disk layout of `chromatograms.parquet` (docs/15_data_dictionary.md). `1`, the
-    /// default, stores every row's retention-time axis and its whole trace, zero-filled over
-    /// the candidate's window in window-grid mode. `2` stores the axis once per candidate per
-    /// parquet row group (`rt_axis`) and each trace from its first to its last nonzero value
+    /// On-disk layout of `chromatograms.parquet` (docs/15_data_dictionary.md). `2`, the
+    /// default since 2026-09-27, stores the axis once per candidate per parquet row group
+    /// (`rt_axis`) and each trace from its first to its last nonzero value
     /// (`intensity_trimmed`), with two extra columns (`trace_offset`, `trace_len`) that
-    /// rebuild it. Every reader (features, quant, the pool) accepts both layouts and rebuilds
-    /// the same rows bit for bit, so every table downstream of extract is byte-identical;
-    /// only the chromatogram table changes (smaller, with a different content hash). Opt-in
-    /// because a reader outside the engine, or an engine binary from before v2, reads only
-    /// `rt` and `intensity` and stops at their absence from a v2 table;
-    /// `mumdia::chromatograms::rewrite` converts a table between the layouts. The pool
-    /// splices band tables of one layout only, so all bands of a grouped run share it.
+    /// rebuild it. `1`, the previous default, stores every row's retention-time axis and its
+    /// whole trace, zero-filled over the candidate's window in window-grid mode. Every reader
+    /// (features, quant, the pool) accepts both layouts and rebuilds the same rows bit for
+    /// bit, so every table downstream of extract is byte-identical; only the chromatogram
+    /// table changes (smaller, with a different content hash). A reader outside the engine,
+    /// or an engine binary from before v2, reads only `rt` and `intensity` and stops at their
+    /// absence from a v2 table: set `1` for such a reader, or convert a table with
+    /// `mumdia::chromatograms::rewrite`. The pool splices band tables of one layout only, so
+    /// all bands of a grouped run share it.
+    ///
+    /// Measured before the default changed: on a six-run Astral experiment and a five-run
+    /// Orbitrap AIF experiment (imported HYE library, multi-head calibration, `nn_torch`)
+    /// every output after extract was byte-identical to v1, and the chromatogram tables went
+    /// from 4.75 to 3.95 GB and from 21.7 to 15.4 GB.
     pub chromatogram_schema: u32,
     /// m/z bucket size (power of two).
     pub bucket_size: usize,
@@ -1196,7 +1206,7 @@ impl Default for ExtractConfig {
             apex_count_window: 1,  // no rolling smoothing by default (opt-in; window 5
             // cuts AIF apex misassignment, median |dRT| 131s->9s)
             emit_window_grid: true, // zero-filled window-grid chromatograms
-            chromatogram_schema: 1, // full axis and trace on every row (v2 is opt-in)
+            chromatogram_schema: 2, // axis once per candidate and row group, trimmed traces
             bucket_size: 8192,
             peak_claim: PeakClaim::None,
             claim_cues: ClaimCues::default(),
@@ -2039,16 +2049,15 @@ where
 pub struct ExperimentConfig {
     /// How many per-run search chains to execute concurrently, or `"auto"`.
     ///
-    /// 1 (default) is strictly sequential, i.e. the historical behaviour. Runs are
-    /// independent, so raising this scales nearly linearly in wall time, but EACH
-    /// concurrent run holds its own extraction working set (tens of GB on a large
-    /// library), so the practical ceiling is memory, not cores. Raise it deliberately
-    /// after checking peak RSS for a single run; 2-4 is a reasonable start on a
-    /// large-memory machine. Results are unaffected: chunks are processed in index
-    /// order and completion order never reaches the output. An explicit number runs the
-    /// chains in chunks of that size on the engine's one thread pool, as it always has.
+    /// `"auto"` (also written `0`) is the default since 2026-09-27; `1`, the previous
+    /// default, is strictly sequential. Runs are independent, so concurrency scales nearly
+    /// linearly in wall time, but EACH concurrent run holds its own extraction working set
+    /// (tens of GB on a large library), so the practical ceiling is memory, not cores, and
+    /// `"auto"` measures it. Results are unaffected: chunks are processed in index order and
+    /// completion order never reaches the output. An explicit number runs the chains in
+    /// chunks of that size on the engine's one thread pool, as it always has.
     ///
-    /// `"auto"` (also written `0`) sizes the concurrency from the thread budget: at most
+    /// `"auto"` sizes the concurrency from the thread budget: at most
     /// one run per 16 threads of `--threads`, and never more than the runs left. Each
     /// concurrent chain then runs in a thread pool of its own, `threads / runs` wide, so
     /// extract's fan-out and the feature loaders are sized to that run's share instead of
@@ -2061,15 +2070,20 @@ pub struct ExperimentConfig {
     /// of the process's memory cgroup (a container's or a batch job's limit) when that is
     /// smaller. The peak counts this process only, not its child processes, so chains that
     /// each run their own DeepLC adaptation (`rt_library_scope = per_run`) run one at a
-    /// time under `"auto"`; give a number to run such chains concurrently. Elsewhere there
-    /// is no memory reading, and the log says the sizing used threads only. Because of the
-    /// reset, a lifetime peak read from the process's resource usage (`/usr/bin/time -v`)
-    /// covers only the time since the last measured step; measure an `"auto"` experiment's
-    /// memory with a sampling profiler (`bench/mem_profile.py`). The rows are the same as at
-    /// `1`; a stage inside a narrower pool can lay out its intermediate files differently,
-    /// as a different `--threads` does. Hence opt-in. To validate on a host, run one
-    /// experiment at `1` and at `"auto"` and compare `peptides.tsv` and `proteins.tsv`. Not
-    /// measured at scale.
+    /// time under `"auto"`; give a number to run such chains concurrently. Elsewhere (any
+    /// platform but Linux) there is no memory reading, so `"auto"` runs the chains one at a
+    /// time and the log says why; give a number to run them concurrently there. Because of
+    /// the reset, a lifetime peak read from the process's resource usage (`/usr/bin/time
+    /// -v`) covers only the time since the last measured step; measure an `"auto"`
+    /// experiment's memory with a sampling profiler (`bench/mem_profile.py`). The rows are
+    /// the same as at `1`; a stage inside a narrower pool can lay out its intermediate files
+    /// differently, as a different `--threads` does.
+    ///
+    /// Measured before the default changed, together with `extract.chromatogram_schema = 2`
+    /// and `overlap_front_threads = "auto"`: on a six-run Astral experiment and a five-run
+    /// Orbitrap AIF experiment (EPYC 9354, 128 threads) every final output was
+    /// byte-identical to the sequential run's (24 and 21 tables), and the experiments went
+    /// from 32:49 to 26:00 and from 44:37 to 29:47.
     #[serde(deserialize_with = "de_parallel_runs")]
     pub parallel_runs: usize,
     /// How often the library's retention times are adapted to a run: once on the first
@@ -2094,8 +2108,16 @@ pub struct ExperimentConfig {
     #[serde(alias = "finetune_scope")]
     pub rt_library_scope: RtLibraryScope,
     /// Threads given to converting and seeding runs 2..N while run 1 adapts the library's
-    /// retention times, under `rt_library_scope = first_run_only`. `0` (the default) runs
-    /// them after run 1, as before.
+    /// retention times, under `rt_library_scope = first_run_only`, or `"auto"` (also
+    /// written `null`), the default since 2026-09-27. `0`, the previous default, runs them
+    /// after run 1.
+    ///
+    /// `"auto"` gives the fronts the threads of the budget beyond the physical cores the
+    /// process may run on, which is what the DeepLC thread cap leaves idle: run 1's DeepLC
+    /// then gets exactly the physical cores, the thread count it would have had without the
+    /// overlap, so the adapted library is bit-identical. Where the physical cores cannot be
+    /// read (any platform but Linux), where the budget does not exceed them, or where
+    /// `MUMDIA_DEEPLC_THREAD_CAP` sets the cap by hand, `"auto"` is `0`.
     ///
     /// Runs 2..N convert their spectra and seed on the base library (the seed is
     /// iRT-independent), so nothing of theirs waits for run 1's adapted library until
@@ -2110,20 +2132,45 @@ pub struct ExperimentConfig {
     /// byte-identical; run 1's DeepLC predicts on `threads - N` torch threads instead of
     /// `threads`, which moves the adapted library in the last bits unless the DeepLC thread
     /// cap binds both counts to the same number (on an SMT host with `N` below the
-    /// logical-minus-physical core count it does). Float-equivalent, hence opt-in. The
-    /// fronts keep the ungrouped experiment's phase order: every conversion first, then one
-    /// seed library and fragment index for all of their seeds (run 1 seeds on its own
-    /// load before the overlap starts). That library is held beside the DeepLC worker while
-    /// the fronts seed, which is where the experiment's peak can sit. Not measured at scale.
-    pub overlap_front_threads: usize,
+    /// logical-minus-physical core count it does, and `"auto"` chooses exactly that). An
+    /// explicit count beyond it is float-equivalent, not bit-identical. The fronts keep the
+    /// ungrouped experiment's phase order: every conversion first, then one seed library and
+    /// fragment index for all of their seeds (run 1 seeds on its own load before the overlap
+    /// starts). That library is held beside the DeepLC worker while the fronts seed, which is
+    /// where the experiment's peak can sit. Measured with `parallel_runs`: see there.
+    #[serde(deserialize_with = "de_overlap_front_threads")]
+    pub overlap_front_threads: Option<usize>,
+}
+
+/// `experiment.overlap_front_threads`: a thread count, or `"auto"` / `null`, which is
+/// stored as `None`.
+fn de_overlap_front_threads<'de, D>(d: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Fronts {
+        Count(usize),
+        Word(String),
+    }
+    match Option::<Fronts>::deserialize(d)? {
+        None => Ok(None),
+        Some(Fronts::Count(n)) => Ok(Some(n)),
+        Some(Fronts::Word(w)) if w.trim().eq_ignore_ascii_case("auto") => Ok(None),
+        Some(Fronts::Word(w)) => Err(serde::de::Error::custom(format!(
+            "experiment.overlap_front_threads must be a number of threads or \"auto\" \
+             (got \"{w}\")"
+        ))),
+    }
 }
 
 impl Default for ExperimentConfig {
     fn default() -> Self {
         Self {
-            parallel_runs: 1,
+            parallel_runs: 0,
             rt_library_scope: RtLibraryScope::FirstRunOnly,
-            overlap_front_threads: 0,
+            overlap_front_threads: None,
         }
     }
 }
@@ -2252,13 +2299,15 @@ pub struct GroupsConfig {
     pub balance: GroupBalance,
     /// Delete each band's `psms_extracted.parquet` and `features.parquet` (with their
     /// reports and schema companions, and `run.pin` where one was written) once the pool is
-    /// written. Default `false`. Disk only: no stage reads them after pooling. The features
-    /// are carried by the competed table and the extracted table's one reader, the
-    /// candidate audit, reads the pooled copy. On the immunopeptidomics runs the band
-    /// features alone were 55 GB per run, in an experiment that wrote about 2.7 TB of
-    /// artifacts. The manifest keeps their records, and the band directories can no longer
-    /// be re-featured; the chromatograms and competed tables that `mumdia pool
-    /// --groups-dir` re-pools from are kept.
+    /// written. Default `true` since 2026-09-27 (previously `false`). Disk only: no stage
+    /// reads them after pooling. The features are carried by the competed table and the
+    /// extracted table's one reader, the candidate audit, reads the pooled copy. On the
+    /// immunopeptidomics runs the band features alone were 55 GB per run, in an experiment
+    /// that wrote about 2.7 TB of artifacts. The manifest keeps their records, and the band
+    /// directories can no longer be re-featured (set `false` to keep them for that); the
+    /// chromatograms and competed tables that quant, rescore and `mumdia pool --groups-dir`
+    /// read are kept. Measured before the default changed, on an eight-band entrapment run:
+    /// `psms_scored.parquet`, the three quant tables and both TSVs byte-identical.
     pub delete_band_intermediates: bool,
     /// Write the run's pooled `psms_competed.parquet`. Default `false` since 2026-09-26
     /// (previously `true`). With `false`, rescore reads the bands' own competed tables in
@@ -2319,7 +2368,7 @@ impl Default for GroupsConfig {
             parallel: 1,
             rt_adaptation: GroupRtAdaptation::PerBand,
             balance: GroupBalance::Precursors,
-            delete_band_intermediates: false,
+            delete_band_intermediates: true,
             pool_competed: false,
             pool_chromatograms: false,
         }
@@ -3207,16 +3256,40 @@ mod tests {
     }
 
     #[test]
-    fn experiment_parallel_runs_defaults_to_sequential() {
-        // The default must stay 1: concurrent per-run chains multiply peak memory,
-        // so opting in is the caller's decision, and 1 reproduces the historical
-        // sequential orchestrator exactly.
-        assert_eq!(Config::default().experiment.parallel_runs, 1);
+    fn experiment_parallel_runs_defaults_to_auto() {
+        // "auto" (0) since 2026-09-27: memory-bounded on Linux, one chain at a time where
+        // there is no memory reading (`sched::resolve_for_host`), byte-identical outputs
+        // either way. An explicit count is kept exactly, and 1 is still the historical
+        // sequential orchestrator.
+        assert_eq!(Config::default().experiment.parallel_runs, 0);
         // Old configs written before the section existed must still parse.
         let c = Config::from_json("{}").expect("empty config parses");
-        assert_eq!(c.experiment.parallel_runs, 1);
+        assert_eq!(c.experiment.parallel_runs, 0);
         let c = Config::from_json(r#"{"experiment":{"parallel_runs":4}}"#).expect("parses");
         assert_eq!(c.experiment.parallel_runs, 4);
+        let c = Config::from_json(r#"{"experiment":{"parallel_runs":1}}"#).expect("parses");
+        assert_eq!(c.experiment.parallel_runs, 1);
+    }
+
+    #[test]
+    fn overlap_front_threads_defaults_to_auto_and_parses_counts_and_the_word() {
+        assert_eq!(Config::default().experiment.overlap_front_threads, None);
+        for (text, want) in [
+            (r#"{"experiment":{"overlap_front_threads":"auto"}}"#, None),
+            (r#"{"experiment":{"overlap_front_threads":"Auto"}}"#, None),
+            (r#"{"experiment":{"overlap_front_threads":null}}"#, None),
+            (r#"{"experiment":{"overlap_front_threads":0}}"#, Some(0)),
+            (r#"{"experiment":{"overlap_front_threads":32}}"#, Some(32)),
+        ] {
+            let c = Config::from_json(text).expect("parses");
+            assert_eq!(c.experiment.overlap_front_threads, want, "{text}");
+        }
+        let err = Config::from_json(r#"{"experiment":{"overlap_front_threads":"lots"}}"#)
+            .expect_err("an unknown word is refused");
+        assert!(err.to_string().contains("overlap_front_threads"), "{err}");
+        // An explicit count round-trips as the number it was.
+        let c = Config::from_json(r#"{"experiment":{"overlap_front_threads":32}}"#).unwrap();
+        assert!(c.canonical_json().contains(r#""overlap_front_threads":32"#));
     }
 
     #[test]
@@ -3474,10 +3547,14 @@ mod tests {
         let deferred =
             on(r#"{"predict_frag":{"rt_predictor":"deeplc","defer_deeplc_to_multihead":true}}"#);
         assert!(deferred.defers_library_deeplc(false, true));
-        // Off by default; never for an imported library; not without an interpreter (no
-        // multi-head runs); not with the multi-head calibration off; not for native RT.
+        // On by default since 2026-09-27, off when asked; never for an imported library; not
+        // without an interpreter (no multi-head runs); not with the multi-head calibration
+        // off; not for native RT.
         let default = on(r#"{"predict_frag":{"rt_predictor":"deeplc"}}"#);
-        assert!(!default.defers_library_deeplc(false, true));
+        assert!(default.defers_library_deeplc(false, true));
+        let off =
+            on(r#"{"predict_frag":{"rt_predictor":"deeplc","defer_deeplc_to_multihead":false}}"#);
+        assert!(!off.defers_library_deeplc(false, true));
         assert!(!deferred.defers_library_deeplc(true, true));
         assert!(!deferred.defers_library_deeplc(false, false));
         let no_mh = on(

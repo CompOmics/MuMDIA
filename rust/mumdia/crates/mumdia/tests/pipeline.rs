@@ -522,12 +522,13 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
 
 #[test]
 fn chromatograms_v2_leave_every_downstream_table_byte_identical() {
-    // Extract under `extract.chromatogram_schema = 2` against the default, on the crafted
-    // spectra with MS1 (so the table holds fragment rows and the three MS1 XIC rows of each
-    // candidate): the PSM table is the same file, the chromatogram table is v2 and smaller,
-    // and features, compete, rescore and quant write the same bytes from either. Then the
-    // v1 table rewritten as v2 with a row-group seam at every row and at every other size,
-    // which moves the seam through every row of every candidate: the same bytes again.
+    // Extract under `extract.chromatogram_schema = 2`, the default, against 1, on the
+    // crafted spectra with MS1 (so the table holds fragment rows and the three MS1 XIC rows
+    // of each candidate): the PSM table is the same file, the chromatogram table is v2 and
+    // smaller, and features, compete, rescore and quant write the same bytes from either.
+    // Then the v1 table rewritten as v2 with a row-group seam at every row and at every
+    // other size, which moves the seam through every row of every candidate: the same bytes
+    // again.
     use mumdia::chromatograms::{rewrite, Layout};
     let (prec, frag) = craft_library();
     let ms2 = craft_ms2_with_decoy(true);
@@ -557,11 +558,11 @@ fn chromatograms_v2_leave_every_downstream_table_byte_identical() {
         .unwrap();
         (psms, chrom)
     };
-    let cfg = Config::default();
-    assert_eq!(cfg.extract.chromatogram_schema, 1, "v1 is the default");
-    let mut cfg2 = Config::default();
-    cfg2.extract.chromatogram_schema = 2;
-    cfg2.validate().unwrap();
+    let mut cfg = Config::default();
+    cfg.extract.chromatogram_schema = 1;
+    cfg.validate().unwrap();
+    let cfg2 = Config::default();
+    assert_eq!(cfg2.extract.chromatogram_schema, 2, "v2 is the default");
     let (psms1, chrom1) = extract(&cfg, "v1");
     let (psms2, chrom2) = extract(&cfg2, "v2");
     assert_eq!(

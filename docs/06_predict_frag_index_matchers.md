@@ -204,7 +204,8 @@ the wall time, the process-tree peak and both library tables byte for byte. A De
 reported first; a fragment-worker error is logged as soon as it happens and returned once the
 DeepLC worker has exited.
 
-**Deferred DeepLC** (`predict_frag.defer_deeplc_to_multihead`, default `false`). With
+**Deferred DeepLC** (`predict_frag.defer_deeplc_to_multihead`, default `true` since
+2026-09-27, previously `false`). With
 `rt_predictor = deeplc` the automatic multi-head calibration rewrites the iRT of every
 standard-residue row against the run's anchors before anything reads it (the seed is
 iRT-independent and only passes the column through), and a FASTA digest emits only standard
@@ -218,8 +219,12 @@ Ignored where the multi-head calibration does not run, with a log line, and by t
 `predict-frag`. Measured on the fixture with DeepLC 4.5.0 on CPU and the native fragment
 model: every output from the multi-head library on is byte-identical to a default run's,
 including `psms_scored.parquet` and `peptides.tsv`; only the library table and the seed's
-pass-through iRT column differ, and the run took 11 s against 21 s. Opt-in because the
-library table is no longer a DeepLC library for anyone who reuses it as `--lib-precursors`.
+pass-through iRT column differ, and the run took 11 s against 21 s. On a real FASTA (the
+E. coli entries of the ProteoBench HYE FASTA against `LFQ_Orbitrap_AIF_Ecoli_01`, MS2PIP
+`HCDch2`, DeepLC 4.4.0) `psms_scored.parquet`, the three quant tables and both TSVs were
+byte-identical and the run went from 14:56 to 12:29, which is why it is the default. The
+library table is then no longer a DeepLC library: set `false` for a build that is meant
+to be reused as `--lib-precursors`.
 
 **finite guard** (`predict_frag.rs:140-153`). Between assignment and top-N, every
 candidate's iRT and every fragment intensity is checked for finiteness and a

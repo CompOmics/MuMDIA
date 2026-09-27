@@ -321,45 +321,46 @@ print("    ok: 2 bands, %d calibrant deviations, frag_tol_ppm %.6g, as ungrouped
       % (two["n_dev"], float(two["frag_tol_ppm"])))
 PYEOF
 
-# 4e. The chromatogram v2 layout (`extract.chromatogram_schema = 2`, docs/15 "Layout v2"):
-#     the RT axis once per candidate per row group, each trace trimmed to its nonzero run.
-#     Every reader rebuilds the v1 rows from it, so every table after extract must be the
-#     v1 run's in `$work/out`, byte for byte, while the chromatogram table says schema 2
-#     and stores its lists as `rt_axis`/`intensity_trimmed`, never as `rt`/`intensity`.
-#     A second v2 run puts a row-group seam at EVERY row (`MUMDIA_CHROM_ROW_GROUP_ROWS=1`,
-#     a test knob that moves only the seams), so no row may take its axis from another
-#     row and every read that starts at a seam must still find one; the same bytes again.
-#     Then the grouped run of 4c under v2, pooled and per band: the pool splices v2 band
-#     tables (re-encoding the groups that hold an overlap loser) and quant reads either.
+# 4e. The chromatogram v2 layout (`extract.chromatogram_schema = 2`, the default since
+#     2026-09-27, docs/15 "Layout v2"): the RT axis once per candidate per row group, each
+#     trace trimmed to its nonzero run. Every reader rebuilds the v1 rows from it, so every
+#     table after extract of the default run in `$work/out` must be an explicit v1 run's,
+#     byte for byte, while the default chromatogram table says schema 2 and stores its lists
+#     as `rt_axis`/`intensity_trimmed`, never as `rt`/`intensity`. A second v2 run puts a
+#     row-group seam at EVERY row (`MUMDIA_CHROM_ROW_GROUP_ROWS=1`, a test knob that moves
+#     only the seams), so no row may take its axis from another row and every read that
+#     starts at a seam must still find one; the same bytes again. Then the grouped run of 4c
+#     under v1, pooled and per band, against the default grouped run (v2, per band): the pool
+#     splices band tables of either layout and quant reads either.
 echo "=== smoke: chromatograms v2 leave every downstream table byte-identical"
-"$PY" - "$cfg" "$work/chrom_v2.json" <<'PYEOF'
+"$PY" - "$cfg" "$work/chrom_v1.json" <<'PYEOF'
 import json, sys
 c = json.load(open(sys.argv[1], encoding="utf-8"))
-c.setdefault("extract", {})["chromatogram_schema"] = 2
+c.setdefault("extract", {})["chromatogram_schema"] = 1
 json.dump(c, open(sys.argv[2], "w", encoding="utf-8"), indent=2)
 PYEOF
 "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
-    --out-dir "$work/out_chrom_v2" --config "$work/chrom_v2.json" --threads 2 \
-    > "$work/chrom_v2.log" 2>&1 \
-    || { tail -30 "$work/chrom_v2.log"; echo "the chromatograms v2 run failed"; exit 1; }
+    --out-dir "$work/out_chrom_v1" --config "$work/chrom_v1.json" --threads 2 \
+    > "$work/chrom_v1.log" 2>&1 \
+    || { tail -30 "$work/chrom_v1.log"; echo "the chromatograms v1 run failed"; exit 1; }
 MUMDIA_CHROM_ROW_GROUP_ROWS=1 "$BIN" run --fasta test_data/fixture.fasta \
     --mzml "$work/fixture.mzML" --out-dir "$work/out_chrom_v2_rg1" \
-    --config "$work/chrom_v2.json" --threads 2 > "$work/chrom_v2_rg1.log" 2>&1 \
+    --config "$cfg" --threads 2 > "$work/chrom_v2_rg1.log" 2>&1 \
     || { tail -30 "$work/chrom_v2_rg1.log"; echo "the v2 run with a seam at every row failed"; exit 1; }
 grep -q 'chromatogram row groups resized' "$work/chrom_v2_rg1.log" \
     || { echo "MUMDIA_CHROM_ROW_GROUP_ROWS did not reach extract"; exit 1; }
-for d in out_chrom_v2 out_chrom_v2_rg1; do
+for d in out_chrom_v1 out_chrom_v2_rg1; do
     for f in psms_extracted.parquet features.parquet psms_competed.parquet psms_scored.parquet \
              peptide_quant.parquet protein_group_quant.parquet fragment_quant.parquet \
              peptides.tsv proteins.tsv; do
         cmp -s "$work/out/$f" "$work/$d/$f" \
-            || { echo "chromatograms v2 ($d) changed $f"; exit 1; }
+            || { echo "the chromatogram layout ($d) changed $f"; exit 1; }
     done
 done
-"$PY" - "$work/grouped.json" "$work/grouped_v2.json" "$work/grouped_nopool_v2.json" <<'PYEOF'
+"$PY" - "$work/grouped.json" "$work/grouped_v1.json" "$work/grouped_nopool_v1.json" <<'PYEOF'
 import json, sys
 c = json.load(open(sys.argv[1], encoding="utf-8"))
-c.setdefault("extract", {})["chromatogram_schema"] = 2
+c.setdefault("extract", {})["chromatogram_schema"] = 1
 # Pooled, because the manifest check below reads the pooled `chromatograms` record; the
 # per-band arm is the default (`groups.pool_chromatograms = false` since 2026-09-26).
 c["groups"]["pool_chromatograms"] = True
@@ -367,15 +368,15 @@ json.dump(c, open(sys.argv[2], "w", encoding="utf-8"), indent=2)
 c["groups"]["pool_chromatograms"] = False
 json.dump(c, open(sys.argv[3], "w", encoding="utf-8"), indent=2)
 PYEOF
-for arm in grouped_v2 grouped_nopool_v2; do
+for arm in grouped_v1 grouped_nopool_v1; do
     "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
         --out-dir "$work/out_$arm" --config "$work/$arm.json" --threads 4 \
         > "$work/$arm.log" 2>&1 \
-        || { tail -30 "$work/$arm.log"; echo "the grouped chromatograms v2 run ($arm) failed"; exit 1; }
+        || { tail -30 "$work/$arm.log"; echo "the grouped chromatograms v1 run ($arm) failed"; exit 1; }
     for f in psms_scored.parquet peptide_quant.parquet protein_group_quant.parquet \
              fragment_quant.parquet peptides.tsv proteins.tsv; do
         cmp -s "$work/out_grouped/$f" "$work/out_$arm/$f" \
-            || { echo "chromatograms v2 changed $f of the grouped run ($arm)"; exit 1; }
+            || { echo "the chromatogram layout changed $f of the grouped run ($arm)"; exit 1; }
     done
 done
 "$PY" - "$work" <<'PYEOF'
@@ -388,21 +389,23 @@ def rec(d):
 def check(ok, what):
     if not ok:
         sys.exit("chromatograms v2: " + what)
-v1 = os.path.join(work, "out", "chromatograms.parquet")
-v2 = os.path.join(work, "out_chrom_v2", "chromatograms.parquet")
+v1 = os.path.join(work, "out_chrom_v1", "chromatograms.parquet")
+v2 = os.path.join(work, "out", "chromatograms.parquet")
 rg1 = os.path.join(work, "out_chrom_v2_rg1", "chromatograms.parquet")
-check(rec("out")["schema_version"] == 1, "the default run no longer records schema 1")
-for d in ("out_chrom_v2", "out_chrom_v2_rg1", "out_grouped_v2"):
-    check(rec(d)["schema_version"] == 2, f"{d} does not record chromatograms schema 2")
+check(rec("out")["schema_version"] == 2, "the default run does not record schema 2")
+check(rec("out_chrom_v2_rg1")["schema_version"] == 2,
+      "out_chrom_v2_rg1 does not record chromatograms schema 2")
+for d in ("out_chrom_v1", "out_grouped_v1"):
+    check(rec(d)["schema_version"] == 1, f"{d} does not record chromatograms schema 1")
 f1, f2, fr = pq.ParquetFile(v1), pq.ParquetFile(v2), pq.ParquetFile(rg1)
 names = lambda f: f.schema_arrow.names
 V1_LISTS = {"rt", "intensity"}
 V2_COLS = {"rt_axis", "intensity_trimmed", "trace_offset", "trace_len"}
 check(V1_LISTS <= set(names(f1)) and not V2_COLS & set(names(f1)),
-      "the default table is not v1: it lacks rt/intensity or has a v2 column")
+      "the schema 1 table is not v1: it lacks rt/intensity or has a v2 column")
 # The v2 lists are renamed so that a reader that knows only v1 stops at the missing `rt`
 # instead of taking an empty axis beside a trimmed trace for an observed row.
-for f, d in ((f2, "out_chrom_v2"), (fr, "out_chrom_v2_rg1")):
+for f, d in ((f2, "out"), (fr, "out_chrom_v2_rg1")):
     check(V2_COLS <= set(names(f)) and not V1_LISTS & set(names(f)),
           f"the {d} table does not have the v2 columns in place of rt/intensity")
 check(f1.metadata.num_rows == f2.metadata.num_rows == fr.metadata.num_rows,
@@ -417,7 +420,7 @@ print("    ok: %d rows; rt values %d -> %d, intensity values %d -> %d; %d -> %d 
       % (f1.metadata.num_rows, vals(t1, "rt"), vals(t2, "rt_axis"), vals(t1, "intensity"),
          vals(t2, "intensity_trimmed"), s1, s2, 100.0 * (1 - s2 / s1)))
 PYEOF
-echo "    ok: every table after extract byte-identical to v1, ungrouped (default seams and a seam at every row) and grouped (pooled and per band)"
+echo "    ok: every table after extract byte-identical between v1 and the default v2, ungrouped (default seams and a seam at every row) and grouped (pooled and per band)"
 
 # 5. The multi-run orchestrator. Nothing tested it: `run-experiment` has a pooled
 #    rescore, a by-source split, per-run quant and a cross-run LFQ that the
@@ -426,10 +429,18 @@ echo "    ok: every table after extract byte-identical to v1, ungrouped (default
 #    per-run outputs directly comparable: identical input must give identical rows.
 echo "=== smoke: run-experiment over two runs"
 cp "$work/fixture.mzML" "$work/fixture_b.mzML"
+# The sequential reference every scheduler below is compared against. `parallel_runs` and
+# `overlap_front_threads` default to "auto" since 2026-09-27, so it is pinned by hand.
+"$PY" - "$cfg" "$work/exp_seq.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("experiment", {}).update(parallel_runs=1, overlap_front_threads=0)
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
 "$BIN" run-experiment --fasta test_data/fixture.fasta \
     --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" \
     --run-names a --run-names b \
-    --out-dir "$work/exp" --config "$cfg" > "$work/exp.log" 2>&1 \
+    --out-dir "$work/exp" --config "$work/exp_seq.json" > "$work/exp.log" 2>&1 \
     || { tail -30 "$work/exp.log"; exit 1; }
 # The experiment-wide report once more, at a looser threshold, through the standalone
 # command: on this fixture the pooled peptide-level q never reaches 1 percent (one decoy
@@ -483,14 +494,14 @@ done < "$work/exp_files.txt"
 # thread pool of its own, pulled from a queue), over THREE runs against a three-run
 # sequential experiment. At --threads 32 the plan is two at once in two 16-thread pools.
 # On Linux the first conversion, seed and chain each run alone to be measured, so a third
-# run is what leaves two for the pooled path to run concurrently; on Windows (no memory
-# reading) all three phases run two at once from the start. Every table must still be the
-# sequential experiment's.
+# run is what leaves two for the pooled path to run concurrently; elsewhere (no memory
+# reading to bound it) auto runs one chain at a time and says so. Every table must still be
+# the sequential experiment's.
 cp "$work/fixture.mzML" "$work/fixture_c.mzML"
 "$BIN" run-experiment --fasta test_data/fixture.fasta \
     --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" --mzml "$work/fixture_c.mzML" \
     --run-names a --run-names b --run-names c \
-    --out-dir "$work/exp3" --config "$cfg" > "$work/exp3.log" 2>&1 \
+    --out-dir "$work/exp3" --config "$work/exp_seq.json" > "$work/exp3.log" 2>&1 \
     || { tail -30 "$work/exp3.log"; echo "the three-run sequential experiment failed"; exit 1; }
 "$PY" - "$cfg" "$work/exp_auto.json" <<'PYEOF'
 import json, sys
@@ -503,10 +514,16 @@ PYEOF
     --run-names a --run-names b --run-names c --threads 32 \
     --out-dir "$work/exp_auto" --config "$work/exp_auto.json" > "$work/exp_auto.log" 2>&1 \
     || { tail -30 "$work/exp_auto.log"; echo "run-experiment with parallel_runs = auto failed"; exit 1; }
-grep "each in a pool of its own (parallel_runs = auto)" "$work/exp_auto.log" \
-    | grep -q "parallel_runs=2" \
-    || { grep "parallel_runs" "$work/exp_auto.log"; \
-         echo "parallel_runs = auto did not run two chains at once in their own pools"; exit 1; }
+if [ "$(uname -s)" = "Linux" ]; then
+    grep "each in a pool of its own (parallel_runs = auto)" "$work/exp_auto.log" \
+        | grep -q "parallel_runs=2" \
+        || { grep "parallel_runs" "$work/exp_auto.log"; \
+             echo "parallel_runs = auto did not run two chains at once in their own pools"; exit 1; }
+else
+    grep -q "no memory reading on this platform, so one run at a time" "$work/exp_auto.log" \
+        || { grep "parallel_runs" "$work/exp_auto.log"; \
+             echo "parallel_runs = auto without a memory reading did not run one chain at a time"; exit 1; }
+fi
 (cd "$work/exp3" && find . -type f \( -name '*.parquet' -o -name '*.tsv' \) | sort) \
     > "$work/exp3_files.txt"
 (cd "$work/exp_auto" && find . -type f \( -name '*.parquet' -o -name '*.tsv' \) | sort) \
@@ -521,7 +538,7 @@ while read -r f; do
     n_auto=$((n_auto + 1))
 done < "$work/exp3_files.txt"
 printf 'this is not an mzML file\n' > "$work/fixture_bad.mzML"
-for exp_cfg in "$cfg" "$work/exp_par.json" "$work/exp_auto.json"; do
+for exp_cfg in "$work/exp_seq.json" "$work/exp_par.json" "$work/exp_auto.json"; do
     rm -rf "$work/exp_fail"
     # auto sizes from the thread budget, so give it the budget that runs two at once.
     threads_arg=()
@@ -642,7 +659,8 @@ arm("perband", groups=banded, rt_im_train={"multihead_calibration": 0})
 arm("defer", groups=dict(banded, rt_adaptation="once_per_run"),
     rt_im_train={"multihead_calibration": 2},
     predict_frag={"rt_predictor": "deeplc", "defer_deeplc_to_multihead": True})
-arm("seq", rt_im_train={"multihead_calibration": 2})
+arm("seq", rt_im_train={"multihead_calibration": 2},
+    experiment={"parallel_runs": 1, "overlap_front_threads": 0})
 arm("overlap", rt_im_train={"multihead_calibration": 2},
     experiment={"overlap_front_threads": 1})
 # No trailing newline: on Windows it would arrive as CR LF, and $( ) strips the LF only.

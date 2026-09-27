@@ -198,7 +198,8 @@ chromatograms that is 12.0% smaller than the planned dictionary (160.9 against
 planned encodings (docs/03_io_layer.md, "Float encodings planned from the first
 rows").
 
-`extract.chromatogram_schema = 2` (default 1) writes the same rows in the v2
+`extract.chromatogram_schema = 2` (the default since 2026-09-27; 1 before) writes the
+same rows in the v2
 layout (docs/15_data_dictionary.md, "Layout v2"): each candidate's axis once per
 row group (`rt_axis`), each intensity trace from its first to its last nonzero
 value (`intensity_trimmed`), and `trace_offset` / `trace_len` to rebuild it. Every
@@ -207,9 +208,11 @@ rows to know where each row group starts, so it and the writer take the row-grou
 size from one place (`chromatograms::row_group_rows`). The report and the run
 manifest record schema version 2. Every table downstream of extract (features,
 competed, scored, quant) is byte-identical to the v1 run's; only the chromatogram
-table and its content hash change. It is opt-in because a reader outside the
-engine, or an engine binary from before v2, reads `rt` and `intensity`, which a v2
-table does not have. Such a reader stops at the missing column rather than
+table and its content hash change: on a six-run Astral and a five-run Orbitrap AIF
+experiment the chromatogram tables went from 4.75 to 3.95 GB and from 21.7 to 15.4 GB
+with every later table identical. A reader outside the engine, or an engine binary from
+before v2, reads `rt` and `intensity`, which a v2 table does not have: set
+`chromatogram_schema = 1` for it. Such a reader stops at the missing column rather than
 misreading the table, and `mumdia::chromatograms::rewrite` converts the table back
 to v1 for it.
 

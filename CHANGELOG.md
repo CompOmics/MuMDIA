@@ -147,6 +147,30 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **Five opt-ins that change no result are defaults:** `extract.chromatogram_schema = 2`,
+  `experiment.parallel_runs = "auto"`, `experiment.overlap_front_threads = "auto"`,
+  `predict_frag.defer_deeplc_to_multihead = true` and `groups.delete_band_intermediates =
+  true`. Each changes the artifact set or the schedule, and each was checked byte for byte
+  at scale before the default moved (EPYC 9354, 128 threads). The chromatogram layout,
+  parallel runs and the overlap together, on a six-run Astral experiment and a five-run
+  Orbitrap AIF experiment (imported HYE library, multi-head calibration, `nn_torch`): 24
+  and 21 final tables identical to the sequential v1 run's, the experiments 32:49 -> 26:00
+  and 44:37 -> 29:47, the chromatogram tables 4.75 -> 3.95 GB and 21.7 -> 15.4 GB. The
+  deferred library DeepLC pass, on a FASTA search of the E. coli AIF file: the scored
+  table, the three quant tables and both TSVs identical, 14:56 -> 12:29. Deleting the band
+  intermediates, on an eight-band entrapment run: the same six tables identical. What to
+  set for the old behaviour: `chromatogram_schema = 1` for a reader outside the engine
+  that reads the `rt`/`intensity` lists of `chromatograms.parquet`;
+  `defer_deeplc_to_multihead = false` for a FASTA build meant to be reused as
+  `--lib-precursors` (its iRT is otherwise the native placeholder, and its model identity
+  says so); `delete_band_intermediates = false` to re-feature a band later; `parallel_runs
+  = 1` and `overlap_front_threads = 0` for the strictly sequential experiment. `"auto"`
+  for `parallel_runs` now runs one chain at a time where there is no memory reading to
+  bound it (any platform but Linux) instead of sizing from the threads alone, and
+  `overlap_front_threads` takes `"auto"` (or `null`) beside a count: the threads beyond
+  the physical cores, which the DeepLC thread cap leaves idle, so run 1's DeepLC keeps its
+  thread count and the adapted library its bits (`0` where the cores cannot be read, on
+  anything but Linux, or when `MUMDIA_DEEPLC_THREAD_CAP` is set).
 - **`groups.pool_competed` and `groups.pool_chromatograms` default to `false`.** A grouped
   run no longer writes the pooled `psms_competed.parquet` and `chromatograms.parquet`:
   rescore reads the bands' competed tables and quant reads the bands' chromatogram tables

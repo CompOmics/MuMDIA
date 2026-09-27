@@ -6,16 +6,17 @@
 //! Candidates are ascending and each candidate's rows are contiguous. The layouts differ
 //! only in how a row's two traces are stored.
 //!
-//! **v1** (`extract.chromatogram_schema = 1`, the default) stores each trace whole. `rt` is
-//! the row's retention-time axis and `intensity` its values on that axis, the same length,
-//! and both are empty for a predicted fragment that was never observed. In window-grid mode
-//! every observed row of a candidate repeats the same axis, and a fragment's trace is zero
-//! over most of the candidate's RT window. On the AIF run of docs/15 ("Layout v2"), the
-//! `rt` column held 10.8 times the values that one axis per candidate needs, and 57% of
-//! the `intensity` values lay outside their trace's nonzero run.
+//! **v1** (`extract.chromatogram_schema = 1`, the default before 2026-09-27) stores each
+//! trace whole. `rt` is the row's retention-time axis and `intensity` its values on that
+//! axis, the same length, and both are empty for a predicted fragment that was never
+//! observed. In window-grid mode every observed row of a candidate repeats the same axis,
+//! and a fragment's trace is zero over most of the candidate's RT window. On the AIF run of
+//! docs/15 ("Layout v2"), the `rt` column held 10.8 times the values that one axis per
+//! candidate needs, and 57% of the `intensity` values lay outside their trace's nonzero run.
 //!
-//! **v2** (`extract.chromatogram_schema = 2`) stores the two traces in two list columns of
-//! other names, `rt_axis` and `intensity_trimmed`, and adds two `u32` columns:
+//! **v2** (`extract.chromatogram_schema = 2`, the default) stores the two traces in two
+//! list columns of other names, `rt_axis` and `intensity_trimmed`, and adds two `u32`
+//! columns:
 //!
 //! * `trace_len` is the length of the row's full trace, and 0 for a fragment that was never
 //!   observed. `trace_offset` is the position, in that full trace, of the first stored

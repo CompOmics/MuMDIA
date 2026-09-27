@@ -590,7 +590,8 @@ acquisition order.
 
 While the first run adapts the library, the others have nothing to wait for until
 rt-im-train: they convert their spectra and seed on the base library, and the seed is
-iRT-independent. `experiment.overlap_front_threads = N` (default `0`, off) runs those
+iRT-independent. `experiment.overlap_front_threads = N` (default `"auto"` since 2026-09-27,
+previously `0`, off) runs those
 fronts, convert and seed of runs 2..N, on a pool of `N` threads while the first run's DeepLC
 worker gets the remaining `threads - N`, and every run's rest follows once the first has
 finished (`run_experiment::convert_run`, `seed_run`, `adapt_rt_library`, `finish_run`). The
@@ -603,7 +604,14 @@ inside its band loop. The fronts are byte-identical; the first run's DeepLC pred
 DeepLC thread cap binds both counts to one number. Measured on the fixture (three runs,
 multi-head 80, DeepLC 4.5.0 on CPU, 4 threads): with the cap at 2 on both sides every artifact
 of the overlapped experiment equals the sequential one byte for byte; without the cap the
-first run's library moved in the last bits and the scored tables with it. Opt-in; not
+first run's library moved in the last bits and the scored tables with it. `"auto"` is
+the count that keeps the bits: the threads beyond the physical cores the process may run
+on (`sched::auto_overlap_threads`, Linux only; `0` elsewhere, when the budget does not
+exceed the cores, or when `MUMDIA_DEEPLC_THREAD_CAP` sets the cap), so the first run's
+DeepLC asks for exactly the physical cores and gets the count the cap gave it before. With
+`parallel_runs = "auto"` and `extract.chromatogram_schema = 2` it left every final output
+of a six-run Astral and a five-run Orbitrap AIF experiment byte-identical to the
+sequential run's, at 32:49 -> 26:00 and 44:37 -> 29:47. Before the default changed: not
 measured at scale.
 
 The fine-tune has the same shape, which is what `experiment.finetune_scope`

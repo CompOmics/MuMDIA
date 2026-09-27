@@ -27,7 +27,7 @@ pub mod artifact {
     pub const PSMS_EXTRACTED: (&str, u32) = ("psms_extracted", 2);
     /// v1: every row stores its whole `rt` axis and its whole `intensity` trace.
     pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 1);
-    /// v2, written only under `extract.chromatogram_schema = 2`: the axis once per candidate
+    /// v2, the default (`extract.chromatogram_schema = 2`): the axis once per candidate
     /// per row group (`rt_axis`), each trace trimmed to its nonzero run (`intensity_trimmed`),
     /// and `trace_offset` / `trace_len` to rebuild it (`mumdia::chromatograms`). Every reader
     /// in the engine accepts both; the renamed lists make a v1-only reader fail on v2.
@@ -45,7 +45,8 @@ pub mod artifact {
     /// Cross-run MaxLFQ table, written only by `run-experiment` and `quant-lfq`.
     pub const LFQ_MAXLFQ: (&str, u32) = ("lfq_maxlfq", 1);
     /// The candidates a grouped run's pool dropped from each band (`band`,
-    /// `candidate_id`), written only under `groups.pool_chromatograms = false`.
+    /// `candidate_id`), written by a grouped run under `groups.pool_chromatograms = false`,
+    /// the default.
     pub const OVERLAP_LOSERS: (&str, u32) = ("overlap_losers", 1);
 
     /// The chromatogram schema for `extract.chromatogram_schema`: [`CHROMATOGRAMS_V2`] for 2,
