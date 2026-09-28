@@ -155,6 +155,17 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **DeepLC 4.5.0 is the floor** (was 4.4.0): `mumdia doctor` fails below it, the engine
+  refuses to launch a DeepLC worker with an older one, and both workers repeat the check
+  (they still checked 4.1.1). Every environment pins `deeplc==4.5.0` (`env/docker-deeplc.yml`,
+  `env/mumdia-deeplc.yml`, the desktop application's `env/console-requirements.txt`), which
+  makes the projection cache, on by default, work everywhere. Measured before the floor
+  moved (docs/08 section 4e; one host, environments identical but for DeepLC, 10 NN seeds
+  per arm): an Orbitrap AIF entrapment run -0.062% peptides at 1% (Welch t -0.54, FDP
+  0.984% -> 0.994%, +0.009 pp against 2 SE of 0.025) and an Astral run +0.099% (t +0.91),
+  the same 80 heads selected on both. Rebuild an environment that has DeepLC 4.4.x; the
+  desktop application shows its analysis environment as "update needed" and upgrades it
+  in place.
 - **A library-cache store no longer fills the disk:** it is skipped with a warning when it
   would leave less than 10 GiB free on the cache's disk, measured with `df -Pk` on Unix and
   macOS and .NET `DriveInfo` on Windows (no measurement, no check).

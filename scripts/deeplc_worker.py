@@ -35,11 +35,12 @@ import time
 import deeplc  # noqa: F401  (imported for its side effect of loading torch first)
 
 
-# The engine's default retention-time workflow calibrates DeepLC's base-model predictions
-# per run without a fine-tune. That is only sound from 4.1.1 on (4.0.0a2 memorised anchors:
-# in-sample 15.9 s against held-out 195 s residuals), so an older DeepLC is refused here as
-# well as by `mumdia doctor`, which cannot see a version that changes under its feet.
-_MIN_DEEPLC = (4, 1, 1)
+# The engine's floor (`mumdia_core::constants::MIN_DEEPLC_VERSION`), repeated here because
+# `mumdia doctor` cannot see a version that changes under its feet. The base-model
+# calibration is only sound from 4.1.1 on (4.0.0a2 memorised anchors: in-sample 15.9 s
+# against held-out 195 s residuals), the multi-head calibration needs 4.4.0, and the
+# projection cache, on by default, the factored prediction matrix of 4.5.0.
+_MIN_DEEPLC = (4, 5, 0)
 
 
 def _check_deeplc_version():
@@ -63,8 +64,8 @@ def _check_deeplc_version():
         parts.append(0)
     if tuple(parts) < _MIN_DEEPLC:
         sys.exit(
-            "deeplc %s is older than the required %d.%d.%d (pip install 'deeplc>=4.4.0')"
-            % (raw, *_MIN_DEEPLC)
+            "deeplc %s is older than the required %d.%d.%d (pip install 'deeplc>=%d.%d.%d')"
+            % (raw, *_MIN_DEEPLC, *_MIN_DEEPLC)
         )
 
 

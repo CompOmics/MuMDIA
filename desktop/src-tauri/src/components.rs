@@ -58,6 +58,12 @@ pub struct Status {
     pub error: Option<String>,
     /// Whether a bundled `uv` was found, without which nothing can be installed.
     pub uv: Option<String>,
+    /// Packages this application pins exactly whose installed version differs, as
+    /// `name installed -> pinned`. Non-empty means the environment is not `complete`:
+    /// the engine refuses a DeepLC below its floor (4.5.0 since 2026-09-28), so an
+    /// environment installed by an older release would import cleanly and then fail
+    /// every search that needs DeepLC. Installing again upgrades it in place.
+    pub outdated: Vec<String>,
 }
 
 /// Every module the primary environment must provide.
@@ -292,15 +298,46 @@ pub fn find_uv() -> Option<PathBuf> {
 const REQUIREMENTS_PRIMARY: &str = include_str!("../../../env/console-requirements.txt");
 const REQUIREMENTS_MS2PIP: &str = include_str!("../../../env/console-ms2pip-requirements.txt");
 
+/// The compiled-in requirements of `env`.
+fn requirements_text(env: Env) -> &'static str {
+    match env {
+        Env::Primary => REQUIREMENTS_PRIMARY,
+        Env::Ms2pip => REQUIREMENTS_MS2PIP,
+    }
+}
+
+/// The exactly pinned packages (`name==version` lines) of `requirements` whose installed
+/// version in `versions` differs, as `name installed -> pinned`. A package that is not
+/// among the reported versions, or pinned with anything but `==`, is not compared.
+fn outdated_pins(
+    requirements: &str,
+    versions: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in requirements.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some((name, pinned)) = line.split_once("==") else {
+            continue;
+        };
+        let (name, pinned) = (name.trim().to_ascii_lowercase(), pinned.trim());
+        if name.is_empty() || name.contains(|c: char| " ;[<>!~".contains(c)) {
+            continue;
+        }
+        if let Some(installed) = versions.get(&name) {
+            if installed != pinned {
+                out.push(format!("{name} {installed} -> {pinned}"));
+            }
+        }
+    }
+    out
+}
+
 /// Write the requirements for `env` where `uv` can read them, and return the path.
 ///
 /// Into the managed data directory rather than a temporary file, so that when an
 /// installation fails the exact input is still on disk to look at.
 pub fn requirements(env: Env) -> Result<PathBuf, String> {
-    let text = match env {
-        Env::Primary => REQUIREMENTS_PRIMARY,
-        Env::Ms2pip => REQUIREMENTS_MS2PIP,
-    };
+    let text = requirements_text(env);
     let dir = data_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let path = dir.join(env.requirements_name());
@@ -376,6 +413,8 @@ pub fn status_of(env: Env) -> Status {
                 // `sklearn` is imported as `sklearn` but distributed as
                 // `scikit-learn`, so ask metadata for the name pip knows.
                 s.versions = versions(&py, REPORT_VERSIONS);
+                s.outdated = outdated_pins(requirements_text(env), &s.versions);
+                s.complete = s.outdated.is_empty();
             }
         }
         Err(e) => {
@@ -1192,6 +1231,43 @@ mod tests {
                 "the environment must not live beside the exe"
             );
         }
+    }
+
+    #[test]
+    fn an_environment_behind_the_pins_is_outdated() {
+        let reqs = "--extra-index-url https://download.pytorch.org/whl/cpu\n\
+                    # comment\n\
+                    deeplc==4.5.0\n\
+                    torch==2.14.0+cpu\n\
+                    mokapot==0.10.0  # a trailing comment\n\
+                    numpy\n\
+                    setuptools>=83\n";
+        let v = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let current = v(&[
+            ("deeplc", "4.5.0"),
+            ("torch", "2.14.0+cpu"),
+            ("mokapot", "0.10.0"),
+            ("numpy", "2.4.6"),
+        ]);
+        assert!(outdated_pins(reqs, &current).is_empty());
+        let old = v(&[
+            ("deeplc", "4.4.0"),
+            ("torch", "2.14.0+cpu"),
+            ("numpy", "1.26.4"),
+        ]);
+        assert_eq!(
+            outdated_pins(reqs, &old),
+            vec!["deeplc 4.4.0 -> 4.5.0".to_string()]
+        );
+        // The shipped requirements pin DeepLC exactly, which is what makes this work.
+        assert!(REQUIREMENTS_PRIMARY
+            .lines()
+            .any(|l| l.trim_start().starts_with("deeplc==")));
     }
 
     #[test]

@@ -15,7 +15,7 @@ import sys
 
 import pytest
 
-from conftest import SCRIPTS, run_worker_ok
+from conftest import SCRIPTS, run_worker, run_worker_ok
 
 DEEPLC_WORKERS = ["deeplc_worker.py", "deeplc_finetune.py"]
 THREAD_HELPERS = [
@@ -530,7 +530,7 @@ def _deeplc_version():
     return raw, tuple(parts + [0] * (3 - len(parts)))
 
 
-def _deeplc_or_skip(minimum=(4, 4, 0)):
+def _deeplc_or_skip(minimum=(4, 5, 0)):
     """Skip unless DeepLC >= `minimum` is installed for this interpreter."""
     raw, version = _deeplc_version()
     if version < minimum:
@@ -538,8 +538,8 @@ def _deeplc_or_skip(minimum=(4, 4, 0)):
 
 
 # The projection cache reads DeepLC's factored prediction matrix (`deeplc._factored`,
-# `_model_ops.supports_factored`), which DeepLC added in 4.5.0. 4.4.0, the engine's floor
-# and the version CI pins, has neither, so there the worker warns and predicts as usual.
+# `_model_ops.supports_factored`), which DeepLC added in 4.5.0, the engine's floor since
+# 2026-09-28 and the version CI pins. Below it the worker warns and predicts as usual.
 PROJECTION_CACHE_DEEPLC = (4, 5, 0)
 
 
@@ -838,41 +838,26 @@ def test_a_damaged_projection_cache_entry_falls_back_and_is_set_aside(tmp_path):
     assert summary["projection_cache"]["used"] is False, summary["projection_cache"]
 
 
-def test_the_projection_cache_falls_back_to_a_plain_prediction_before_deeplc_4_5(tmp_path):
-    """DeepLC 4.4.x has no factored prediction matrix, so `--projection-cache` must warn,
-    record why it was not used, write no cache entry, and predict exactly as without it.
-    This is the path CI exercises: env/docker-deeplc.yml pins the 4.4.0 floor."""
+def test_a_deeplc_below_the_floor_is_refused_before_anything_runs(tmp_path):
+    """4.5.0 is the engine's floor since 2026-09-28 (`MIN_DEEPLC_VERSION`), and both
+    workers repeat it: an older DeepLC exits non-zero naming the floor, before any output
+    is written. This runs where an older DeepLC is installed (the 4.4.x environments that
+    predate the floor); CI pins 4.5.0 and skips it. The projection cache's own fallback,
+    for a later DeepLC that moves the private API it reads, is no longer reachable with a
+    released version and so has no test of its own."""
     raw, version = _deeplc_version()
-    if version < (4, 4, 0):
-        pytest.skip("DeepLC {} is older than the engine floor 4.4.0".format(raw))
-    if version >= PROJECTION_CACHE_DEEPLC:
-        pytest.skip("DeepLC {} has the factored matrix; the cache is used there".format(raw))
+    if version >= (4, 5, 0):
+        pytest.skip("DeepLC {} meets the floor".format(raw))
+    if version < (4, 1, 1):
+        pytest.skip("DeepLC {} does not import the workers' dependencies".format(raw))
     _write_shard_fixture(tmp_path)
-    lib = tmp_path / "lib.parquet"
-    env = {"MUMDIA_DEEPLC_THREAD_CAP": "0", "CUDA_VISIBLE_DEVICES": "-1"}
-    common = ["--no-finetune", "--threads", "1", "--predict-threads", "1", "--predict-chunk", "64"]
-    cache = tmp_path / "cache"
-    outs = {}
-    for arm, extra in [("plain", []), ("cached", ["--projection-cache", str(cache)]),
-                       ("default", ["--projection-cache", str(cache),
-                                    "--projection-cache-default"])]:
-        out = tmp_path / "{}.parquet".format(arm)
-        stdout, _ = run_worker_ok("deeplc_finetune.py", str(lib), "-", str(out), *common,
-                                  *extra, env=env, timeout=1800)
-        outs[arm] = (out, stdout)
-    plain, cached, default = (_predicted_irt(outs[a][0]) for a in ("plain", "cached", "default"))
-    assert (plain == cached).all(), "the fallback must predict exactly as without the cache"
-    assert (plain == default).all(), "the default location falls back the same way"
-    # Under the engine's default location (`"auto"`) the fallback is a plain line: the
-    # default asks for the cache only where DeepLC can serve it.
-    assert "WARNING: projection cache" not in outs["default"][1], outs["default"][1]
-    assert "the engine's default" in outs["default"][1], outs["default"][1]
-    summary = json.loads((tmp_path / "cached.parquet.summary.json").read_text("utf-8"))
-    record = summary["projection_cache"]
-    assert record["used"] is False, record
-    assert "4.5.0" in record["why"], record
-    assert "WARNING: projection cache" in outs["cached"][1], "a named directory's fallback warns"
-    assert not cache.exists() or not any(cache.iterdir()), list(cache.iterdir())
+    out = tmp_path / "out.parquet"
+    rc, stdout, stderr = run_worker("deeplc_finetune.py", str(tmp_path / "lib.parquet"), "-",
+                                    str(out), "--no-finetune", "--threads", "1",
+                                    env={"MUMDIA_DEEPLC_THREAD_CAP": "0"}, timeout=600)
+    assert rc != 0, stdout
+    assert "older than the required 4.5.0" in (stdout + stderr), stdout + stderr
+    assert not out.exists()
 
 
 def test_a_projection_cache_miss_follows_the_shard_plan(tmp_path):
