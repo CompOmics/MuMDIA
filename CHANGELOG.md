@@ -147,6 +147,16 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **`rescore.handoff` defaults to `raw`** (was `parquet`). The `nn_torch` worker is given
+  a row-major f32 `.npy` matrix, a metadata parquet and a `.raw.json` description, so
+  neither side runs the parquet codec. The scores are byte-identical to `parquet`: the
+  scored tables matched on a six-run Astral pool (4,987,557 PSMs) and a five-run Orbitrap
+  AIF pool (9,218,534 PSMs), and the worker's load phase took 4.1 s with either handoff
+  on the first and went from 30.0 to 5.2 s on the second. The stage walls moved with the
+  NN training time rather than with the handoff. The matrix is exactly 4 bytes a value on disk, so the sidecar space check
+  now refuses a work directory that cannot hold it, where the parquet handoff was only
+  warned about; `rescore.handoff = "parquet"` restores the previous default, for a work
+  directory short of room. mokapot and entrapment runs still receive the tab-separated PIN.
 - **The NN rescorer trains its folds in parallel by default** (`MUMDIA_NN_PARALLEL=auto`;
   `0` restores the serial loop and its scores). The (seed, fold) tasks run in child
   processes, as many as the tasks and cores allow at the worker's torch thread count (the

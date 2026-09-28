@@ -1962,9 +1962,9 @@
       "rust_type": "Handoff",
       "kind": "enum",
       "optional": false,
-      "default": "parquet",
-      "default_text": "`parquet`",
-      "help": "How the feature matrix reaches a sidecar rescorer. See `Handoff`. Defaults to `parquet`, which applies to nn_torch only; mokapot and entrapment sidecars always receive the tab-separated PIN.",
+      "default": "raw",
+      "default_text": "`raw`",
+      "help": "How the feature matrix reaches a sidecar rescorer. See `Handoff`. Defaults to `raw`, which applies to nn_torch only; mokapot and entrapment sidecars always receive the tab-separated PIN.",
       "gates": [],
       "source_struct": "RescoreConfig",
       "choices": [

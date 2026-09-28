@@ -1786,7 +1786,7 @@ pub struct RescoreConfig {
     /// compatibility.
     pub strict: bool,
     /// How the feature matrix reaches a sidecar rescorer. See [`Handoff`]. Defaults to
-    /// `parquet`, which applies to nn_torch only; mokapot and entrapment sidecars always
+    /// `raw`, which applies to nn_torch only; mokapot and entrapment sidecars always
     /// receive the tab-separated PIN.
     #[serde(default)]
     pub handoff: Handoff,
@@ -1907,7 +1907,7 @@ impl Default for RescoreConfig {
             entrapment_contaminant_markers: Vec::new(),
             entrapment_ratio: 1.0,
             strict: true,
-            handoff: Handoff::Parquet,
+            handoff: Handoff::Raw,
             features: None,
             features_file: None,
             // The training recipe of docs/28 section 15, default since 2026-09-05: measured
@@ -1977,7 +1977,8 @@ pub enum Handoff {
     /// Tab-separated PIN. Percolator's format, and what `mokapot.read_pin` requires, so it
     /// is what a mokapot or entrapment sidecar receives whatever this is set to.
     Tsv,
-    /// Parquet feature table with f32 features, and the default since 2026-09-05.
+    /// Parquet feature table with f32 features: the default from 2026-09-05 until `Raw`
+    /// replaced it on 2026-09-28, with identical scores.
     ///
     /// The TSV path makes the worker parse every column into a float64 pandas frame before
     /// it builds its float32 matrix, so the text file, the frame and the matrix are alive
@@ -1996,12 +1997,15 @@ pub enum Handoff {
     ///
     /// nn_torch only: `mokapot_worker.py` calls `mokapot.read_pin()` and cannot read
     /// Parquet, so a mokapot run falls back to `Tsv` with a warning instead of failing.
-    #[default]
+    ///
+    /// Choose it over `Raw` where the sidecar directory is short of room: a parquet file
+    /// has no size floor, so the space check only warns for it, while a raw matrix is
+    /// exactly 4 bytes a value and is refused below that.
     Parquet,
-    /// Opt-in: the features as one row-major little-endian f32 `.npy` matrix, beside a
-    /// small parquet of the metadata columns and a `<name>.raw.json` description (feature
-    /// names, per-feature min/max, the parquet handoff's row-group size) that the worker is
-    /// given.
+    /// The default since 2026-09-28: the features as one row-major little-endian f32
+    /// `.npy` matrix, beside a small parquet of the metadata columns and a
+    /// `<name>.raw.json` description (feature names, per-feature min/max, the parquet
+    /// handoff's row-group size) that the worker is given.
     ///
     /// The engine streams each decoded batch straight into the file with no transpose and
     /// no parquet encode, and the worker copies the matrix into its own with no decode and
@@ -2010,8 +2014,9 @@ pub enum Handoff {
     /// strided fill of every column. The file is the raw size, 4 bytes a value, about 11%
     /// more than the snappy parquet there, so it pays where the codec, not the disk, is the
     /// limit (a RAM-backed `MUMDIA_SIDECAR_DIR`, an SSD). Features that compress well make
-    /// the gap much larger: docs/13 has a table where the raw write was the slower one, so
-    /// measure on the data first.
+    /// the file gap much larger, and docs/13 records a small table where the raw write was
+    /// the slower one; on the benchmark pools of the 2026-09-27 campaign the two walls were
+    /// within a minute of each other, with byte-identical scored tables.
     ///
     /// Scores are byte-identical to `Parquet`: the worker fills the same matrix and sums
     /// the float64 moments over the same partition (the description carries the row-group
@@ -2019,6 +2024,11 @@ pub enum Handoff {
     /// pool with each handoff, same seed and threads, and comparing `psms_scored.parquet`
     /// byte for byte (`tests/python/test_nn_rescore_worker.py` does it on a fixture).
     /// nn_torch only; a mokapot run falls back to `Tsv` with a warning.
+    ///
+    /// The sidecar space check refuses the run when the work directory cannot hold the
+    /// matrix (exactly 4 bytes a value, docs/13); set `Parquet` where the room is short, or
+    /// point `MUMDIA_SIDECAR_DIR` elsewhere.
+    #[default]
     Raw,
 }
 

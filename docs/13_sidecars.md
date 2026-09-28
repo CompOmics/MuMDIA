@@ -542,7 +542,8 @@ none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
   full read needs (`nn_rescore_worker.py:292-298`). The streaming backend is what
   makes an experiment-wide multi-run rescore tractable: the full matrix never
   lives in RAM.
-  The raw handoff (`rescore.handoff = raw`, opt-in) is read by `read_raw_handoff`:
+  The raw handoff (`rescore.handoff = raw`, the default since 2026-09-28) is read by
+  `read_raw_handoff`:
   the `.raw.json` description must carry format `mumdia-raw-f32` and version 1 or the
   worker refuses it, and its `.npy` matrix is memory-mapped and copied into the
   worker's matrix (`fill_raw_matrix`) group by group, each group of `row_group_rows`
@@ -559,7 +560,11 @@ none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
   features compress: on a 522,237 x 387 competed table from the page cache of a
   Windows desktop, the raw matrix was 808 MB against a far smaller parquet, the
   engine's encode took 0.75-0.78 s against 0.60-0.62 s, and the worker's load 0.5 s
-  against 0.9 s, so measure on the data before switching. Validation:
+  against 0.9 s. At scale the difference is small either way: the worker's load
+  phase (`pin_read_standardise`) took 4.1 s with either handoff on the six-run Astral
+  pool (4,987,557 PSMs) and 30.0 s against 5.2 s on the five-run Orbitrap AIF pool
+  (9,218,534 PSMs), with byte-identical scored tables, and the stage walls on those
+  pools moved with the NN training time, not with the handoff. Validation:
   `test_the_raw_handoff_scores_as_the_parquet_handoff` compares score bytes against
   the parquet handoff for both backends, with and without a feature subset; on that
   machine a real AIF competed table (41,910 PSMs) and the 522,237-PSM table (four
@@ -943,7 +948,9 @@ MLP. Set it explicitly for the logreg path.
   than, which counts uncompressed bytes alone: 9 bytes a value plus 32 a row for the
   PIN, exactly 4 bytes a value for the raw matrix. A parquet file has no such floor
   (snappy and dictionary encoding shrink a constant column to almost nothing), so
-  the default parquet handoff is never refused, only warned about. It warns when the
+  a parquet handoff is never refused, only warned about. The default raw handoff is
+  refused below its floor: set `rescore.handoff = parquet` where the work directory
+  is short of room, or move it with `MUMDIA_SIDECAR_DIR`. It warns when the
   space is below the usual size: the raw f32 size for the parquet handoff (it
   measured 0.72-0.87 of it), 11 bytes a value for the PIN, plus the fold keys, the
   output and, for `nn_torch`, the worker's float32 memmap of `rows x features x 4`

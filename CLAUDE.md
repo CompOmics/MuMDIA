@@ -419,10 +419,14 @@ fine-tuning also is not guaranteed deterministic.
 Measured 2026-09-05 on the HYE competed table (2,603,894 PSMs x 387 features), docs/28
 sections 10-16:
 
-- `rescore.handoff` defaults to `parquet` since 2026-09-05. The TSV path made the worker
-  parse every column into a float64 pandas frame before building its float32 matrix; parquet
-  took the rescore peak from 29.96 to 8.95 GB and the wall from 8:35 to 6:33 at identical
-  identifications. mokapot and entrapment sidecars still receive the tab-separated PIN
+- `rescore.handoff` defaults to `raw` since 2026-09-28 (`parquet` from 2026-09-05). The TSV
+  path made the worker parse every column into a float64 pandas frame before building its
+  float32 matrix; parquet took the rescore peak from 29.96 to 8.95 GB and the wall from 8:35
+  to 6:33 at identical identifications. `raw` hands the worker a row-major f32 `.npy`
+  matrix with no parquet encode or decode and scores byte-identically to `parquet` (checked
+  at scale on the six-run Astral and five-run AIF pools); it is 4 bytes a value on disk, so
+  the sidecar space check refuses a work directory that cannot hold that, where `parquet`
+  only warned. mokapot and entrapment sidecars still receive the tab-separated PIN
   (`mokapot.read_pin` cannot read parquet), automatically and with a warning.
 - The rescore process tree is about half as tall since 2026-09-16, at identical
   identifications. Under `rescore.strict` (the production setting) with a sidecar classifier
