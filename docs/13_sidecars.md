@@ -430,11 +430,18 @@ file exists, because a memory-mapped write that runs out of disk kills the proce
 instead of raising), a write error, and a damaged entry, which is renamed aside as
 `<key>.broken-<pid>-<ns>` for the bound to remove
 (`test_a_damaged_projection_cache_entry_falls_back_and_is_set_aside`). A miss computes the
-projection in one process with the whole `--predict-threads` budget (after the cap), the
-threads a one-process prediction gets: `--shards` does not split it, and until 2026-09-25 a
-miss under a K-shard plan ran on one shard's `budget / K` threads, slower than either the
-sharded or the one-process prediction. `meta.json` records the count as `torch_threads`
-(`test_a_projection_cache_miss_uses_the_whole_predict_thread_budget`). A fine-tuned model has
+projection in the prediction's own shard plan (`--shards`, `shard_plan`): the entry's
+`projections.npy` is created at its full size and each of the K children (`project_sharded`,
+`shard_main` in `"mode": "projections"`) opens it for writing and fills its own row range,
+whole chunks as the prediction shards take them, so nothing is copied afterwards. At the same
+threads per process the file is byte-identical to a one-process miss
+(`test_a_sharded_projection_miss_writes_the_one_process_projection`). Until 2026-09-28 a miss
+ran in one process on the whole budget, which took twice as long as the sharded prediction
+once sharding was the default (an entrapment run 3:15 -> 6:28), so the first search of every
+library paid for the cache. `meta.json` records `shards`, the threads per process as
+`torch_threads` and the per-shard timings, and the summary's shard record says `projection
+cache miss in K process(es)` or `projection cache hit`
+(`test_a_projection_cache_miss_follows_the_shard_plan`). A fine-tuned model has
 no factored head and predicts as usual. The summary records `projection_cache` (`hit`, `key`,
 `path`, timings). The values are float-equivalent to a plain prediction, because the cached path
 evaluates the heads in numpy where the plain path runs them in torch. For the base model that
