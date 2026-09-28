@@ -30,6 +30,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 blake3 = "1"
+# Already in the graph through parquet (its `ChunkReader::get_bytes` returns `bytes::Bytes`);
+# named here because mumdia-io implements that trait for its span cache.
+bytes = "1"
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
 arrow = { version = "59", features = ["prettyprint"] }

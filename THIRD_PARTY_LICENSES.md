@@ -9,7 +9,7 @@ accompanies it in every release archive and in the container image.
 
 ## Obligations
 
-185 third-party crates. Every one declares an SPDX expression; none is
+199 third-party crates. Every one declares an SPDX expression; none is
 unspecified.
 
 The following copyleft identifiers appear, in each case as one arm of a
@@ -24,8 +24,8 @@ Licence identifiers by crate count:
 
 | SPDX identifier | crates |
 |---|---|
-| `MIT` | 158 |
-| `Apache-2.0` | 152 |
+| `MIT` | 171 |
+| `Apache-2.0` | 163 |
 | `Apache-2.0 WITH LLVM-exception` | 4 |
 | `Unlicense` | 4 |
 | `CC0-1.0` | 3 |
@@ -101,9 +101,12 @@ Licence identifiers by crate count:
 | `csv` | 1.4.0 | Unlicense/MIT | `MIT` | [https://github.com/BurntSushi/rust-csv](https://github.com/BurntSushi/rust-csv) |
 | `csv-core` | 0.1.13 | Unlicense/MIT | `MIT` | [https://github.com/BurntSushi/rust-csv](https://github.com/BurntSushi/rust-csv) |
 | `digest` | 0.11.3 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/traits](https://github.com/RustCrypto/traits) |
+| `displaydoc` | 0.1.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/yaahc/displaydoc](https://github.com/yaahc/displaydoc) |
 | `either` | 1.16.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rayon-rs/either](https://github.com/rayon-rs/either) |
 | `encoding_rs` | 0.8.35 | (Apache-2.0 OR MIT) AND BSD-3-Clause | `Apache-2.0` | [https://github.com/hsivonen/encoding_rs](https://github.com/hsivonen/encoding_rs) |
 | `equivalent` | 1.0.2 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/indexmap-rs/equivalent](https://github.com/indexmap-rs/equivalent) |
+| `fallible-iterator` | 0.3.0 | MIT/Apache-2.0 | `Apache-2.0` | [https://github.com/sfackler/rust-fallible-iterator](https://github.com/sfackler/rust-fallible-iterator) |
+| `fallible-streaming-iterator` | 0.1.9 | MIT/Apache-2.0 | `Apache-2.0` | [https://github.com/sfackler/fallible-streaming-iterator](https://github.com/sfackler/fallible-streaming-iterator) |
 | `find-msvc-tools` | 0.1.9 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/cc-rs](https://github.com/rust-lang/cc-rs) |
 | `flatbuffers` | 25.12.19 | Apache-2.0 | - | [https://github.com/google/flatbuffers](https://github.com/google/flatbuffers) |
 | `flate2` | 1.1.9 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/flate2-rs](https://github.com/rust-lang/flate2-rs) |
@@ -114,7 +117,9 @@ Licence identifiers by crate count:
 | `getrandom` | 0.3.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-random/getrandom](https://github.com/rust-random/getrandom) |
 | `getrandom` | 0.4.3 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-random/getrandom](https://github.com/rust-random/getrandom) |
 | `half` | 2.7.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/VoidStarKat/half-rs](https://github.com/VoidStarKat/half-rs) |
+| `hashbrown` | 0.14.5 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/hashbrown](https://github.com/rust-lang/hashbrown) |
 | `hashbrown` | 0.17.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/hashbrown](https://github.com/rust-lang/hashbrown) |
+| `hashlink` | 0.9.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/kyren/hashlink](https://github.com/kyren/hashlink) |
 | `heck` | 0.5.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/withoutboats/heck](https://github.com/withoutboats/heck) |
 | `hex` | 0.4.3 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/KokaKiwi/rust-hex](https://github.com/KokaKiwi/rust-hex) |
 | `hybrid-array` | 0.4.15 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/hybrid-array](https://github.com/RustCrypto/hybrid-array) |
@@ -136,9 +141,12 @@ Licence identifiers by crate count:
 | `libc` | 0.2.186 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/libc](https://github.com/rust-lang/libc) |
 | `libm` | 0.2.16 | MIT | - | [https://github.com/rust-lang/compiler-builtins](https://github.com/rust-lang/compiler-builtins) |
 | `libmimalloc-sys` | 0.1.49 | MIT | - | [https://github.com/purpleprotocol/mimalloc_rust/tree/master/libmimalloc-sys](https://github.com/purpleprotocol/mimalloc_rust/tree/master/libmimalloc-sys) |
+| `libsqlite3-sys` | 0.30.1 | MIT | - | [https://github.com/rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) |
+| `linreg` | 0.2.0 | MIT | - | [https://github.com/49nord/linreg-rs.git](https://github.com/49nord/linreg-rs.git) |
 | `log` | 0.4.33 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/log](https://github.com/rust-lang/log) |
 | `matchers` | 0.2.0 | MIT | - | [https://github.com/hawkw/matchers](https://github.com/hawkw/matchers) |
 | `memchr` | 2.8.2 | Unlicense OR MIT | `MIT` | [https://github.com/BurntSushi/memchr](https://github.com/BurntSushi/memchr) |
+| `memmap2` | 0.9.11 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RazrFalcon/memmap2-rs](https://github.com/RazrFalcon/memmap2-rs) |
 | `mimalloc` | 0.1.52 | MIT | - | [https://github.com/purpleprotocol/mimalloc_rust](https://github.com/purpleprotocol/mimalloc_rust) |
 | `miniz_oxide` | 0.8.9 | MIT OR Zlib OR Apache-2.0 | `Apache-2.0` | [https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide) |
 | `mzdata` | 0.66.6 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
@@ -168,6 +176,7 @@ Licence identifiers by crate count:
 | `regex` | 1.12.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
 | `regex-automata` | 0.4.14 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
 | `regex-syntax` | 0.8.11 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
+| `rusqlite` | 0.32.1 | MIT | - | [https://github.com/rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) |
 | `rustc_version` | 0.4.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/djc/rustc-version-rs](https://github.com/djc/rustc-version-rs) |
 | `rustversion` | 1.0.22 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/rustversion](https://github.com/dtolnay/rustversion) |
 | `ryu` | 1.0.23 | Apache-2.0 OR BSL-1.0 | `Apache-2.0` | [https://github.com/dtolnay/ryu](https://github.com/dtolnay/ryu) |
@@ -186,11 +195,15 @@ Licence identifiers by crate count:
 | `smallvec` | 1.15.2 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/servo/rust-smallvec](https://github.com/servo/rust-smallvec) |
 | `snap` | 1.1.1 | BSD-3-Clause | - | [https://github.com/BurntSushi/rust-snappy](https://github.com/BurntSushi/rust-snappy) |
 | `strsim` | 0.11.1 | MIT | - | [https://github.com/rapidfuzz/strsim-rs](https://github.com/rapidfuzz/strsim-rs) |
+| `syn` | 1.0.109 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
 | `syn` | 2.0.118 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
 | `syn` | 3.0.5 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
+| `thiserror` | 1.0.69 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
 | `thiserror` | 2.0.20 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
+| `thiserror-impl` | 1.0.69 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
 | `thiserror-impl` | 2.0.20 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
 | `thread_local` | 1.1.9 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/Amanieu/thread_local-rs](https://github.com/Amanieu/thread_local-rs) |
+| `timsrust` | 0.4.2 | Apache-2.0 | - | [https://github.com/mannlabs/timsrust](https://github.com/mannlabs/timsrust) |
 | `tiny-keccak` | 2.0.2 | CC0-1.0 | - | - |
 | `tracing` | 0.1.44 | MIT | - | [https://github.com/tokio-rs/tracing](https://github.com/tokio-rs/tracing) |
 | `tracing-attributes` | 0.1.31 | MIT | - | [https://github.com/tokio-rs/tracing](https://github.com/tokio-rs/tracing) |
@@ -204,6 +217,7 @@ Licence identifiers by crate count:
 | `unicode-width` | 0.2.2 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/unicode-rs/unicode-width](https://github.com/unicode-rs/unicode-width) |
 | `utf8parse` | 0.2.2 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/alacritty/vte](https://github.com/alacritty/vte) |
 | `valuable` | 0.1.1 | MIT | - | [https://github.com/tokio-rs/valuable](https://github.com/tokio-rs/valuable) |
+| `vcpkg` | 0.2.15 | MIT/Apache-2.0 | `Apache-2.0` | [https://github.com/mcgoo/vcpkg-rs](https://github.com/mcgoo/vcpkg-rs) |
 | `version_check` | 0.9.5 | MIT/Apache-2.0 | `Apache-2.0` | [https://github.com/SergioBenitez/version_check](https://github.com/SergioBenitez/version_check) |
 | `vsimd` | 0.8.0 | MIT | - | [https://github.com/Nugine/simd](https://github.com/Nugine/simd) |
 | `wasi` | 0.11.1+wasi-snapshot-preview1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/bytecodealliance/wasi](https://github.com/bytecodealliance/wasi) |
@@ -338,7 +352,7 @@ licence text alone does not discharge the obligation: MIT requires the copyright
 notice in all copies, BSD requires it retained, and Apache-2.0 section 4(d)
 requires the contents of a NOTICE file to be propagated.
 
-Notices recovered for 133 of 185 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
+Notices recovered for 142 of 199 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
 
 **adler2 2.0.1**
 
@@ -526,6 +540,14 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2016--2023
 
+**fallible-iterator 0.3.0**
+
+- Copyright (c) 2015 The rust-openssl-verify Developers
+
+**fallible-streaming-iterator 0.1.9**
+
+- Copyright (c) 2016 The fallible-streaming-iterator Developers
+
 **find-msvc-tools 0.1.9**
 
 - Copyright (c) 2014 Alex Crichton
@@ -563,6 +585,10 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2018-2026 The rust-random Project Developers
 - Copyright (c) 2014 The Rust Project Developers
+
+**hashbrown 0.14.5**
+
+- Copyright (c) 2016 Amanieu d'Antras
 
 **hashbrown 0.17.1**
 
@@ -665,6 +691,14 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 
 - Copyright 2019 Octavian Oncescu
 
+**libsqlite3-sys 0.30.1**
+
+- Copyright (c) 2014-2021 The rusqlite developers
+
+**linreg 0.2.0**
+
+- Copyright (c) 2018 49nord GmbH
+
 **log 0.4.33**
 
 - Copyright (c) 2014 The Rust Project Developers
@@ -676,6 +710,11 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 **memchr 2.8.2**
 
 - Copyright (c) 2015 Andrew Gallant
+
+**memmap2 0.9.11**
+
+- Copyright (c) 2020 Yevhenii Reizner
+- Copyright (c) 2015 Dan Burkert
 
 **mimalloc 0.1.52**
 
@@ -758,6 +797,10 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2014 The Rust Project Developers
 
+**rusqlite 0.32.1**
+
+- Copyright (c) 2014-2021 The rusqlite developers
+
 **rustc_version 0.4.1**
 
 - Copyright (c) 2016 The Rust Project Developers
@@ -804,6 +847,10 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2016 The Rust Project Developers
 
+**timsrust 0.4.2**
+
+- Copyright 2023 []
+
 **tracing 0.1.44**
 
 - Copyright (c) 2019 Tokio Contributors
@@ -848,6 +895,10 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 **utf8parse 0.2.2**
 
 - Copyright (c) 2016 Joe Wilm
+
+**vcpkg 0.2.15**
+
+- Copyright (c) 2017 Jim McGrath
 
 **version_check 0.9.5**
 

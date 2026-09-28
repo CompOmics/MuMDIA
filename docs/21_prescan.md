@@ -75,7 +75,11 @@ the screen has become label-dependent and the modification's null is gone.
 2. **Candidate screen.** Tokenise each peptidoform into alphabet indices, take the trimers that
    cover an anchored (modified) position in both orientations, and keep the candidate if any of
    them appears in an index cell whose window contains the precursor m/z and whose RT bin overlaps
-   `[rt_lo - rt_slack_s, rt_hi + rt_slack_s]`. Parallel over candidates.
+   `[rt_lo - rt_slack_s, rt_hi + rt_slack_s]`. Parallel over candidates. A candidate's
+   trimers are a sorted list, the windows holding its m/z are found by binary search over the
+   windows sorted by lower bound (`WindowLookup`), and the library's `peptidoform` and `label`
+   are read as one text arena and an interned column rather than one `String` per precursor
+   each; the survivors are the same.
 
 Deliberately permissive: raw peak deltas, no deisotoping, no charge deconvolution. A false tag
 only fails to prune, while a missed tag discards a real candidate with no way to recover it

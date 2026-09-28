@@ -1,7 +1,12 @@
 """DeepLC sidecar worker (the file contract in docs/13_sidecars.md).
 
 Usage:
-    python deeplc_worker.py <input.parquet> <output.parquet>
+    python deeplc_worker.py <input.parquet> <output.parquet> [threads]
+
+`threads` (optional, the engine passes its own thread count) sets torch's CPU pool. It is
+capped at the physical cores available to the process, like the fine-tune worker's pools;
+MUMDIA_DEEPLC_THREAD_CAP=N sets the cap and 0 disables it. Without `threads` torch keeps
+its own default, under the same cap.
 
 Input parquet columns:  id (uint32), peptidoform (ProForma string)
 Output parquet columns: id (uint32), predicted_rt (float)
@@ -14,6 +19,7 @@ import contextlib
 import io
 import os
 import sys
+import time
 # `deeplc` MUST be imported before numpy/pyarrow. DeepLC 4.x is torch-backed, and on Windows
 # importing numpy (and the pyarrow that follows it) first makes torch's DLL initialisation fail
 # outright:
@@ -66,6 +72,164 @@ _check_deeplc_version()
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import torch  # already loaded by deeplc; named here to size its thread pool
+
+
+# The thread-cap helpers below are copied verbatim from deeplc_finetune.py, which cannot be
+# imported here (its module body pins the OpenMP pools and imports psm_utils). A test pins
+# the two copies to the same source text.
+def _windows_physical_cores():
+    """Physical core count from `GetLogicalProcessorInformationEx(RelationProcessorCore)`.
+
+    One record per physical core, across every processor group, whatever its efficiency
+    class: a hybrid CPU's efficiency cores are real cores for a forward pass, unlike a
+    second hyperthread on a core that is already busy. None when the call fails.
+    """
+    try:
+        import ctypes
+        import struct
+        from ctypes import wintypes
+
+        k32 = ctypes.windll.kernel32
+        relation_processor_core = 0
+        size = wintypes.DWORD(0)
+        k32.GetLogicalProcessorInformationEx(relation_processor_core, None, ctypes.byref(size))
+        buf = ctypes.create_string_buffer(size.value)
+        if not k32.GetLogicalProcessorInformationEx(
+            relation_processor_core, buf, ctypes.byref(size)
+        ):
+            return None
+        raw = buf.raw
+        cores = 0
+        off = 0
+        # SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX: Relationship (u32), Size (u32), payload.
+        while off + 8 <= size.value:
+            relationship, record_size = struct.unpack_from("<II", raw, off)
+            if record_size < 8:
+                return None
+            if relationship == relation_processor_core:
+                cores += 1
+            off += record_size
+        return cores or None
+    except Exception:  # noqa: BLE001 - detection is best effort; None means no cap
+        return None
+
+
+def _sysfs_physical_cores(cpus, sysfs="/sys/devices/system/cpu"):
+    """The number of physical cores behind the logical CPUs `cpus`, from sysfs, or None.
+
+    Each CPU's `topology/core_cpus_list` (Linux 5.5 and later; `thread_siblings_list`
+    before) names the logical CPUs that share its physical core, so its contents identify
+    that core on every architecture, and the hyperthreads of one core count once. The
+    `(physical_package_id, core_id)` pair is the fallback only: on many device-tree ARM64
+    systems `core_id` restarts in each cluster and the package id is the same for every
+    CPU, so the pairs of two clusters collide and eight cores count as four. None when a
+    CPU has no topology at all (some containers), which leaves the count to the caller.
+    """
+    cores = set()
+    for cpu in cpus:
+        topo = "%s/cpu%d/topology/" % (sysfs, cpu)
+        key = None
+        for name in ("core_cpus_list", "thread_siblings_list"):
+            try:
+                with open(topo + name, encoding="ascii") as fh:
+                    key = "cpus " + fh.read().strip()
+                break
+            except OSError:
+                continue
+        if key is None:
+            try:
+                with open(topo + "physical_package_id", encoding="ascii") as fh:
+                    package = fh.read().strip()
+                with open(topo + "core_id", encoding="ascii") as fh:
+                    core = fh.read().strip()
+            except OSError:
+                return None
+            key = "pair %s/%s" % (package, core)
+        cores.add(key)
+    return len(cores) or None
+
+
+def physical_cores():
+    """`(count, how)`: the physical cores this process may run on, or `(None, why)`.
+
+    Linux: the distinct physical cores (`_sysfs_physical_cores`) behind the CPUs in
+    `sched_getaffinity(0)`, so a container or a `taskset` mask is respected and two
+    hyperthreads of one core count once. Windows: every physical core of the machine.
+    Anywhere else the count is unknown and nothing is capped.
+    """
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            cpus = sorted(os.sched_getaffinity(0))
+        except OSError:
+            cpus = []
+        if cpus:
+            n = _sysfs_physical_cores(cpus)
+            if n is None:
+                return len(cpus), "%d CPUs in the affinity mask (no sysfs topology)" % len(cpus)
+            return n, "%d physical cores under the affinity mask of %d CPUs" % (n, len(cpus))
+    if sys.platform == "win32":
+        n = _windows_physical_cores()
+        if n:
+            return n, "%d physical cores (GetLogicalProcessorInformationEx)" % n
+    return None, "physical core count unknown on this platform"
+
+
+def deeplc_thread_cap():
+    """`(cap, why)` for DeepLC's torch CPU threads; a cap of 0 means none.
+
+    Measured on doxy (EPYC, 64 cores, 128 CPUs): the multi-head step took 10:41 at 96
+    requested threads and 18:09 at 128, because every OpenMP-parallel op waits for its
+    slowest thread and a second hyperthread on a busy core is the slowest one. The cap is a
+    ceiling on what the engine asks for, never a target: a request at or below it is
+    taken as given. The engine asks for every logical CPU unless `--threads` says
+    otherwise, so on an SMT host the cap binds by default. `MUMDIA_DEEPLC_THREAD_CAP` sets
+    it explicitly; 0 disables it. A value that is not a finite number (`twelve`, `nan`,
+    `inf`) is reported and ignored.
+    """
+    raw = os.environ.get("MUMDIA_DEEPLC_THREAD_CAP", "auto").strip().lower()
+    if raw not in ("", "auto"):
+        try:
+            value = int(float(raw))
+        except (ValueError, OverflowError):
+            print("WARNING: MUMDIA_DEEPLC_THREAD_CAP=%r is not a number, 0 or auto; "
+                  "using auto" % raw, flush=True)
+        else:
+            if value <= 0:
+                return 0, "MUMDIA_DEEPLC_THREAD_CAP=0 (no cap)"
+            return value, "MUMDIA_DEEPLC_THREAD_CAP"
+    n, why = physical_cores()
+    return (n or 0), why
+
+
+def capped_threads(requested, cap):
+    """`requested` bounded by `cap` (0 = no cap), and at least 1."""
+    requested = max(1, int(requested))
+    return requested if cap <= 0 else max(1, min(requested, cap))
+
+
+def load_base_model():
+    """The DeepLC base model, loaded once, or None to let every call load its own.
+
+    `deeplc.predict(batch)` loads the checkpoint from disk on every call, and
+    `predict_and_calibrate` twice (once to size its head source, once to predict), so a
+    whole-library prediction in 100,000-peptidoform chunks read the model 50 to 100 times.
+    `load_model` hands a module instance back unchanged, and prediction runs in eval mode
+    under `no_grad`, so passing the one instance gives the same numbers (measured
+    bit-identical on 3,002 peptidoforms, DeepLC 4.5.0). The helpers are private DeepLC API
+    (present in 4.4.0 and 4.5.0) and the engine sets no DeepLC ceiling, so a release that
+    moves, renames or re-signatures them returns None here, with a warning, and every call
+    loads its own model as before: slower, same numbers. Identical in both DeepLC workers.
+    """
+    try:
+        from deeplc import _model_ops
+        from deeplc.core import DEFAULT_MODEL
+
+        return _model_ops.load_model(DEFAULT_MODEL)
+    except (ImportError, AttributeError, TypeError) as exc:
+        print("WARNING: could not load the DeepLC base model once (%s: %s); every "
+              "prediction call loads its own" % (type(exc).__name__, exc), flush=True)
+        return None
 
 
 class _DropBlankProgress(io.TextIOBase):
@@ -136,29 +300,48 @@ def quiet_deeplc_progress():
 
 def main():
     in_path, out_path = sys.argv[1], sys.argv[2]
+    # The engine passes its thread count as a third argument; an older engine passes none
+    # and torch keeps its own default. Either way the cap applies.
+    asked = int(sys.argv[3]) if len(sys.argv) > 3 and int(sys.argv[3]) > 0 else 0
+    cap, cap_why = deeplc_thread_cap()
+    base = asked if asked > 0 else torch.get_num_threads()
+    use = capped_threads(base, cap)
+    if use != torch.get_num_threads():
+        torch.set_num_threads(use)
+    print("deeplc_worker: torch threads=%d (asked %s; cap %s: %s)"
+          % (torch.get_num_threads(), asked if asked > 0 else "torch default %d" % base,
+             cap if cap > 0 else "none", cap_why), flush=True)
 
     tbl = pq.read_table(in_path)
     ids = tbl.column("id").to_pylist()
     pforms = tbl.column("peptidoform").to_pylist()
+
+    # One model for every chunk: `deeplc.predict` without `model=` reads the checkpoint
+    # from disk on each call (`load_base_model`).
+    t0 = time.perf_counter()
+    model = load_base_model()
+    t_load = time.perf_counter() - t0
 
     preds = np.empty(len(pforms), dtype=np.float32)
     chunk = 200_000
     with quiet_deeplc_progress():
         for start in range(0, len(pforms), chunk):
             end = min(start + chunk, len(pforms))
-            p = np.asarray(deeplc.predict(pforms[start:end]), dtype=np.float64)
+            p = np.asarray(deeplc.predict(pforms[start:end], model=model), dtype=np.float64)
             # The multitask model returns an ensemble matrix (N, n_models); average
             # across models to get a single RT prediction per peptide.
             if p.ndim == 2:
                 p = p.mean(axis=1)
             preds[start:end] = p.astype(np.float32)
 
+    t_predict = time.perf_counter() - t0 - t_load
     out = pa.table({
         "id": pa.array(ids, pa.uint32()),
         "predicted_rt": pa.array(preds, pa.float32()),
     })
     pq.write_table(out, out_path)
-    print(f"deeplc_worker: {len(ids)} peptides predicted")
+    print(f"deeplc_worker: {len(ids)} peptides predicted (model load {t_load:.1f}s, "
+          f"prediction {t_predict:.1f}s)")
 
 
 if __name__ == "__main__":

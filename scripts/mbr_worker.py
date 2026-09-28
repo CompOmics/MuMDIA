@@ -53,7 +53,7 @@ def binned_map(x, y, nb=80):
     return lambda q: np.interp(q, cx, cy)
 
 
-def selected_apex_map(psms_path, source, selected):
+def selected_apex_map(psms_path, source, selected_for, keep=None):
     """candidate_id -> apex_rt for one run, one peak per candidate.
 
     A competed table carries several peaks per candidate when `extract.retain_top_peaks`
@@ -62,12 +62,23 @@ def selected_apex_map(psms_path, source, selected):
     row carries and quant integrates (docs/29 #8). For a candidate rescore did not select
     a peak for, the highest `prelim_score` peak stands in; a table without `peak_rank`
     has one row per candidate and its value is taken as is.
+
+    `keep`, when given, is the set of candidates the caller will look up; the map then
+    holds only those. Every decision here is per candidate, so each kept candidate gets
+    the value it gets from the whole table. On the pooled immunopeptidomics experiment
+    the whole-table maps were ~36M entries per run, of which only the confident
+    candidates of some run are ever probed. `selected_for(source)` returns rescore's
+    chosen peak per (source, candidate), and is called only when a candidate has several
+    peaks here.
     """
     names = set(pq.read_schema(psms_path).names)
     cols = ["candidate_id", "apex_rt"] + [c for c in ("peak_rank", "prelim_score") if c in names]
     d = pq.read_table(psms_path, columns=cols).to_pandas()
+    if keep is not None:
+        d = d[d.candidate_id.isin(keep)]
     if "peak_rank" not in d.columns or not d.candidate_id.duplicated().any():
         return dict(zip(d.candidate_id.astype(int), d.apex_rt.astype(float)))
+    selected = selected_for(source)
     want = np.array([selected.get((source, int(c)), -1) for c in d.candidate_id], dtype=np.int64)
     match = d[(want >= 0) & (d.peak_rank.to_numpy() == want)]
     out = dict(zip(match.candidate_id.astype(int), match.apex_rt.astype(float)))
@@ -119,26 +130,43 @@ def main():
     sc_cols = ["candidate_id", "source", "label", "q_value", "peptidoform", "charge", "protein_group"]
     has_selected = "selected_peak_rank" in set(pq.read_schema(a.scored).names)
     sc = pq.read_table(a.scored, columns=sc_cols + (["selected_peak_rank"] if has_selected else [])).to_pandas()
-    # rescore's chosen peak per (source, candidate), for the per-run apex lookup below.
-    selected = {}
-    if has_selected:
-        selected = {(int(s_), int(c)): int(r) for c, s_, r in
-                    zip(sc.candidate_id, sc.source, sc.selected_peak_rank)}
-    # meta per candidate_id (peptidoform/charge/protein_group/label) from any row
-    meta = sc.drop_duplicates("candidate_id").set_index("candidate_id")[
-        ["peptidoform", "charge", "protein_group", "label"]]
 
     # confident set per run (targets AND decoys tracked so we can measure the empirical
     # decoy fraction among accepted transfers). Anchors use targets only (a decoy anchor
     # would inject a random cross-run RT pair); decoys ride the same transfer test.
-    conf_t = {i: set(sc[(sc.source == i) & (sc.label == "target") & (sc.q_value <= a.q_anchor)].candidate_id)
-              for i in range(n_runs)}
+    # The label and q test is evaluated once, not once per run; the rows of each run are
+    # taken in the same order, so each set is built from the same sequence as before. The
+    # permuted-RT null below depends on the iteration order of `allc`, which is a function
+    # of these sets and of the order they are unioned in, so both stay as they were.
+    confident = sc[(sc.label == "target") & (sc.q_value <= a.q_anchor)]
+    conf_t = {i: set(confident.candidate_id[confident.source == i]) for i in range(n_runs)}
+    del confident
+    allc = set().union(*conf_t.values())
+    # Every lookup below is for a candidate of `allc`: the transfer and re-extraction
+    # candidates, the anchors (`conf_t[i]` is a subset) and the metadata of the accepted
+    # transfers. The per-run apex maps and the metadata are restricted to it.
+    in_allc = sc.candidate_id.isin(allc)
 
-    # per-run apex RT (all extracted candidates, the rescore-selected peak where a
-    # candidate has several) + confident-target apex (for maps)
+    def selected_for(source):
+        """rescore's chosen peak per (source, candidate) of this run, for the candidates
+        of `allc`: built only for a run whose competed table has several peaks of one
+        candidate, which the default `extract.retain_top_peaks = 1` never writes."""
+        if not has_selected:
+            return {}
+        rows = sc[in_allc & (sc.source == source)]
+        return {(int(s_), int(c)): int(r) for c, s_, r in
+                zip(rows.candidate_id, rows.source, rows.selected_peak_rank)}
+
+    # meta per candidate_id (peptidoform/charge/protein_group/label) from its first row;
+    # filtering keeps the row order, so each kept candidate has the same first row.
+    meta = sc[in_allc].drop_duplicates("candidate_id").set_index("candidate_id")[
+        ["peptidoform", "charge", "protein_group", "label"]]
+
+    # per-run apex RT (all extracted candidates of `allc`, the rescore-selected peak where
+    # a candidate has several) + confident-target apex (for maps)
     rt_all, rt_anchor = {}, {}
     for i, p in enumerate(psms_paths):
-        m = selected_apex_map(p, i, selected)
+        m = selected_apex_map(p, i, selected_for, keep=allc)
         rt_all[i] = m
         rt_anchor[i] = {c: m[c] for c in conf_t[i] if c in m}
 
@@ -153,7 +181,6 @@ def main():
                     else (lambda q: q)) for i in range(n_runs)}
 
     support_t = {}
-    allc = set().union(*conf_t.values())
     for c in allc:
         support_t[c] = sum(c in conf_t[i] for i in range(n_runs))
 
@@ -330,16 +357,12 @@ def main():
     # lowering only q_value left 34,280 of 34,664 transfers unquantified on the HYE
     # pooled run because quant gated on run_psm_q (2026-08-26).
     if a.out_scored:
+        # Nothing above is read again; the whole scored table is loaded next.
+        del sc, in_allc, meta, rt_all, rt_anchor
         full = pq.read_table(a.scored).to_pandas()
-        acc = {(int(c), int(s)): float(qq) for c, s, qq in
-               zip(cid[accept], src[accept], q[accept])}
-        key = list(zip(full.candidate_id.astype(int), full.source.astype(int)))
-        is_tr = np.zeros(len(full), dtype=bool)
-        tq = np.full(len(full), np.inf)
-        for i, k in enumerate(key):
-            if k in acc:
-                tq[i] = acc[k]
-                is_tr[i] = True
+        is_tr, tq = flag_transfers(
+            full.candidate_id.to_numpy(), full.source.to_numpy(),
+            cid[accept], src[accept], q[accept])
         for col in ("q_value", "run_psm_q", "experiment_psm_q"):
             if col in full.columns:
                 full[col] = np.minimum(full[col].to_numpy(dtype=float), tq)
@@ -350,6 +373,41 @@ def main():
         full["transfer_q"] = np.where(is_tr, tq, np.nan)
         write_engine_parquet(full, a.out_scored)
         print(f"wrote {a.out_scored} (augmented scored; {int(is_tr.sum())} rows flagged transferred)")
+
+
+def flag_transfers(row_cid, row_src, acc_cid, acc_src, acc_q):
+    """Which scored rows are accepted transfers, and at what q (inf elsewhere).
+
+    A row is flagged when its (candidate_id, source) is an accepted transfer's, and takes
+    that transfer's q; when a pair were accepted twice the later one counts, as a dict
+    built over the accepted rows in order keeps it. One sorted-key lookup rather than a
+    Python loop over every row: 258.75M rows on the pooled immunopeptidomics experiment,
+    through a list of 258M tuples.
+    """
+    n = len(row_cid)
+    is_tr = np.zeros(n, dtype=bool)
+    tq = np.full(n, np.inf)
+    if len(acc_cid) == 0 or n == 0:
+        return is_tr, tq
+
+    def key(c, s):
+        return (np.asarray(s).astype(np.uint64) << np.uint64(32)) | np.asarray(c).astype(np.uint64)
+
+    k_acc = key(acc_cid, acc_src)
+    acc_q = np.asarray(acc_q, dtype=float)
+    # The last accepted row of each key, in accepted order.
+    order = np.argsort(k_acc, kind="stable")
+    k_sorted = k_acc[order]
+    last = np.append(k_sorted[1:] != k_sorted[:-1], True)
+    uk = k_sorted[last]
+    uq = acc_q[order][last]
+    k_rows = key(row_cid, row_src)
+    pos = np.searchsorted(uk, k_rows)
+    pos_c = np.minimum(pos, len(uk) - 1)
+    hit = (pos < len(uk)) & (uk[pos_c] == k_rows)
+    is_tr[hit] = True
+    tq[hit] = uq[pos_c[hit]]
+    return is_tr, tq
 
 
 def write_empty_transfers(path):

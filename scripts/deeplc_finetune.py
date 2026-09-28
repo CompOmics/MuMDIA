@@ -20,6 +20,25 @@ Usage:
       (engine path for rt_im_train.library_irt = deeplc: predict with the DeepLC base
       model, no seed needed; per-run LOESS calibration then maps the predictions onto
       observed RT)
+  python deeplc_finetune.py - <seed_psms|-> - --bands <pairs.tsv> (--multihead N | --no-finetune)
+      (engine path for groups.rt_adaptation = once_per_run: several band tables, one line
+      `lib_in<TAB>lib_out` each. The calibration is fitted once, the union of the bands'
+      unique sequences is predicted once, and every band is written with the rewrite a
+      single table gets; see `read_band_pairs`)
+
+Both torch pools (--threads for training, --predict-threads for the whole-library
+prediction) are capped at the physical cores available to the process: the distinct
+sysfs `core_cpus_list` sets under the affinity mask on Linux, every physical core on Windows.
+MUMDIA_DEEPLC_THREAD_CAP=N sets the cap explicitly and 0 disables it. The resolved
+numbers are printed and recorded under "torch_threads" in <lib_out>.summary.json.
+
+--shards K splits the whole-library prediction across K child processes of this script
+(`--shard-worker <spec.json>`, internal). The calibration or fine-tuned model is fitted
+once, here, and handed to every child; each child predicts a contiguous slice of the
+unique sequences cut at a multiple of the prediction chunk, so it makes exactly the calls
+the single process would have made, and the parent joins the slices in order. K=1 (the
+default) is the single process. See `shard_plan` for how K and the threads per child
+follow from the thread budget.
 """
 import os
 
@@ -33,10 +52,17 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import argparse
 import contextlib
+import gc
+import hashlib
 import io
 import json
-import math
+import pickle
 import re
+import shutil
+import signal
+import subprocess
+import tempfile
+import threading
 import time
 import deeplc                                    # import before numpy (OpenMP load order)
 import sys
@@ -77,16 +103,33 @@ def _check_deeplc_version():
 _check_deeplc_version()
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import torch
 from psm_utils import PSM, PSMList
 
 STD = set("ACDEFGHIKLMNPQRSTVWY")
-strip_mods = lambda s: re.sub(r"\[[^\]]*\]", "", s)
+MOD_RE = r"\[[^\]]*\]"
+strip_mods = lambda s: re.sub(MOD_RE, "", s)
 # Strip the decoy marker before prediction: a "DECOY_" peptidoform must be predicted on
 # its underlying sequence, else is_std rejects it (the '_') and the decoy keeps the base
 # (un-fine-tuned) iRT, landing on a different scale than the fine-tuned targets.
 base_pf = lambda s: s[6:] if s.startswith("DECOY_") else s
+# The same two rules over a whole Arrow column. The decoy strip is anchored at the start,
+# as `base_pf` is; `replace_substring` would strip every occurrence. `*` rather than `+`
+# because `is_std("")` is true.
+DECOY_PREFIX_RE = r"^DECOY_"
+STD_FULL_RE = r"^[ACDEFGHIKLMNPQRSTVWY]*$"
+# Unique peptidoforms per prediction call. Fixed, because the call is the unit DeepLC
+# length-buckets and batches within, so the same chunks give the same numbers.
+PREDICT_CHUNK = 100_000
+# Torch threads per prediction shard under `--shards 0` (automatic). The survey's
+# recommended layout on a 64-core host (K = 8 shards of 8 threads) and the per-shard rate
+# docs/32 measured with 12 shards; not swept.
+SHARD_AUTO_THREADS = 8
+# Exit status of a prediction shard that noticed its parent had gone
+# (`_exit_when_the_parent_exits`).
+SHARD_ORPHANED_STATUS = 3
 
 
 
@@ -155,6 +198,234 @@ def quiet_deeplc_progress():
         proxy.close()
         sys.stdout = original
 
+class PredictTimers:
+    """Where the whole-library prediction spends its time, for `<lib_out>.summary.json`.
+
+    DeepLC does not report its own phases, so this wraps the steps it runs:
+
+    - featurisation: PSM parsing (`deeplc.core._parse_psms`), dataset construction
+      (`DeepLCDataset.from_psm_list`), the length bucketing
+      (`deeplc._model_ops._length_buckets`) and batch encoding
+      (`DeepLCDataset.encode_batch`). Only the outermost of nested calls is timed.
+    - forward: the model's forward calls, from a forward pre-hook and a forward hook on
+      the module, synchronised first when the output is on a GPU.
+
+    The wrappers call the original functions with the same arguments and the hooks return
+    nothing, so the numbers they time are unchanged. These are private DeepLC names
+    (present in 4.4.0 and 4.5.0): any that is missing leaves its total as None rather than
+    failing the run. `install` restores every original on exit.
+    """
+
+    def __init__(self):
+        self.featurisation = 0.0
+        self.forward = 0.0
+        self.have_featurisation = False
+        self.have_forward = False
+        self._depth = 0
+        self._t_forward = None
+
+    def _timed(self, func):
+        timers = self
+
+        def wrapped(*a, **k):
+            if timers._depth:
+                return func(*a, **k)
+            timers._depth += 1
+            t0 = time.perf_counter()
+            try:
+                return func(*a, **k)
+            finally:
+                timers.featurisation += time.perf_counter() - t0
+                timers._depth -= 1
+
+        return wrapped
+
+    def _pre_forward(self, module, args):
+        self._t_forward = time.perf_counter()
+
+    def _post_forward(self, module, args, output):
+        if self._t_forward is None:
+            return
+        if getattr(output, "is_cuda", False):
+            torch.cuda.synchronize()
+        self.forward += time.perf_counter() - self._t_forward
+        self._t_forward = None
+
+    @contextlib.contextmanager
+    def install(self, model):
+        restore = []
+        try:
+            import inspect
+
+            from deeplc import _model_ops
+            from deeplc import core as deeplc_core
+            from deeplc.data import DeepLCDataset
+
+            for owner, name in ((deeplc_core, "_parse_psms"), (_model_ops, "_length_buckets")):
+                original = getattr(owner, name, None)
+                if callable(original):
+                    setattr(owner, name, self._timed(original))
+                    restore.append((owner, name, original))
+            for name in ("from_psm_list", "encode_batch"):
+                static = inspect.getattr_static(DeepLCDataset, name, None)
+                if isinstance(static, classmethod):
+                    setattr(DeepLCDataset, name, classmethod(self._timed(static.__func__)))
+                elif callable(static):
+                    setattr(DeepLCDataset, name, self._timed(static))
+                else:
+                    continue
+                restore.append((DeepLCDataset, name, static))
+            self.have_featurisation = bool(restore)
+        except Exception:  # noqa: BLE001 - timing is diagnostic, never a failure
+            pass
+        hooks = []
+        if model is not None and hasattr(model, "register_forward_hook"):
+            hooks = [model.register_forward_pre_hook(self._pre_forward),
+                     model.register_forward_hook(self._post_forward)]
+            self.have_forward = True
+        try:
+            yield self
+        finally:
+            for h in hooks:
+                h.remove()
+            for owner, name, original in reversed(restore):
+                setattr(owner, name, original)
+
+    def totals(self):
+        return (round(self.featurisation, 3) if self.have_featurisation else None,
+                round(self.forward, 3) if self.have_forward else None)
+
+
+def _windows_physical_cores():
+    """Physical core count from `GetLogicalProcessorInformationEx(RelationProcessorCore)`.
+
+    One record per physical core, across every processor group, whatever its efficiency
+    class: a hybrid CPU's efficiency cores are real cores for a forward pass, unlike a
+    second hyperthread on a core that is already busy. None when the call fails.
+    """
+    try:
+        import ctypes
+        import struct
+        from ctypes import wintypes
+
+        k32 = ctypes.windll.kernel32
+        relation_processor_core = 0
+        size = wintypes.DWORD(0)
+        k32.GetLogicalProcessorInformationEx(relation_processor_core, None, ctypes.byref(size))
+        buf = ctypes.create_string_buffer(size.value)
+        if not k32.GetLogicalProcessorInformationEx(
+            relation_processor_core, buf, ctypes.byref(size)
+        ):
+            return None
+        raw = buf.raw
+        cores = 0
+        off = 0
+        # SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX: Relationship (u32), Size (u32), payload.
+        while off + 8 <= size.value:
+            relationship, record_size = struct.unpack_from("<II", raw, off)
+            if record_size < 8:
+                return None
+            if relationship == relation_processor_core:
+                cores += 1
+            off += record_size
+        return cores or None
+    except Exception:  # noqa: BLE001 - detection is best effort; None means no cap
+        return None
+
+
+def _sysfs_physical_cores(cpus, sysfs="/sys/devices/system/cpu"):
+    """The number of physical cores behind the logical CPUs `cpus`, from sysfs, or None.
+
+    Each CPU's `topology/core_cpus_list` (Linux 5.5 and later; `thread_siblings_list`
+    before) names the logical CPUs that share its physical core, so its contents identify
+    that core on every architecture, and the hyperthreads of one core count once. The
+    `(physical_package_id, core_id)` pair is the fallback only: on many device-tree ARM64
+    systems `core_id` restarts in each cluster and the package id is the same for every
+    CPU, so the pairs of two clusters collide and eight cores count as four. None when a
+    CPU has no topology at all (some containers), which leaves the count to the caller.
+    """
+    cores = set()
+    for cpu in cpus:
+        topo = "%s/cpu%d/topology/" % (sysfs, cpu)
+        key = None
+        for name in ("core_cpus_list", "thread_siblings_list"):
+            try:
+                with open(topo + name, encoding="ascii") as fh:
+                    key = "cpus " + fh.read().strip()
+                break
+            except OSError:
+                continue
+        if key is None:
+            try:
+                with open(topo + "physical_package_id", encoding="ascii") as fh:
+                    package = fh.read().strip()
+                with open(topo + "core_id", encoding="ascii") as fh:
+                    core = fh.read().strip()
+            except OSError:
+                return None
+            key = "pair %s/%s" % (package, core)
+        cores.add(key)
+    return len(cores) or None
+
+
+def physical_cores():
+    """`(count, how)`: the physical cores this process may run on, or `(None, why)`.
+
+    Linux: the distinct physical cores (`_sysfs_physical_cores`) behind the CPUs in
+    `sched_getaffinity(0)`, so a container or a `taskset` mask is respected and two
+    hyperthreads of one core count once. Windows: every physical core of the machine.
+    Anywhere else the count is unknown and nothing is capped.
+    """
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            cpus = sorted(os.sched_getaffinity(0))
+        except OSError:
+            cpus = []
+        if cpus:
+            n = _sysfs_physical_cores(cpus)
+            if n is None:
+                return len(cpus), "%d CPUs in the affinity mask (no sysfs topology)" % len(cpus)
+            return n, "%d physical cores under the affinity mask of %d CPUs" % (n, len(cpus))
+    if sys.platform == "win32":
+        n = _windows_physical_cores()
+        if n:
+            return n, "%d physical cores (GetLogicalProcessorInformationEx)" % n
+    return None, "physical core count unknown on this platform"
+
+
+def deeplc_thread_cap():
+    """`(cap, why)` for DeepLC's torch CPU threads; a cap of 0 means none.
+
+    Measured on doxy (EPYC, 64 cores, 128 CPUs): the multi-head step took 10:41 at 96
+    requested threads and 18:09 at 128, because every OpenMP-parallel op waits for its
+    slowest thread and a second hyperthread on a busy core is the slowest one. The cap is a
+    ceiling on what the engine asks for, never a target: a request at or below it is
+    taken as given. The engine asks for every logical CPU unless `--threads` says
+    otherwise, so on an SMT host the cap binds by default. `MUMDIA_DEEPLC_THREAD_CAP` sets
+    it explicitly; 0 disables it. A value that is not a finite number (`twelve`, `nan`,
+    `inf`) is reported and ignored.
+    """
+    raw = os.environ.get("MUMDIA_DEEPLC_THREAD_CAP", "auto").strip().lower()
+    if raw not in ("", "auto"):
+        try:
+            value = int(float(raw))
+        except (ValueError, OverflowError):
+            print("WARNING: MUMDIA_DEEPLC_THREAD_CAP=%r is not a number, 0 or auto; "
+                  "using auto" % raw, flush=True)
+        else:
+            if value <= 0:
+                return 0, "MUMDIA_DEEPLC_THREAD_CAP=0 (no cap)"
+            return value, "MUMDIA_DEEPLC_THREAD_CAP"
+    n, why = physical_cores()
+    return (n or 0), why
+
+
+def capped_threads(requested, cap):
+    """`requested` bounded by `cap` (0 = no cap), and at least 1."""
+    requested = max(1, int(requested))
+    return requested if cap <= 0 else max(1, min(requested, cap))
+
+
 def is_std(pf):
     # Same predicate as `all(c in STD for c in strip_mods(base_pf(pf)))`, but the regex
     # substitution only runs when there is actually a bracketed modification to strip.
@@ -170,14 +441,57 @@ def agg(a):
     return a.mean(axis=1) if a.ndim == 2 else a
 
 
+def load_base_model():
+    """The DeepLC base model, loaded once, or None to let every call load its own.
+
+    `deeplc.predict(batch)` loads the checkpoint from disk on every call, and
+    `predict_and_calibrate` twice (once to size its head source, once to predict), so a
+    whole-library prediction in 100,000-peptidoform chunks read the model 50 to 100 times.
+    `load_model` hands a module instance back unchanged, and prediction runs in eval mode
+    under `no_grad`, so passing the one instance gives the same numbers (measured
+    bit-identical on 3,002 peptidoforms, DeepLC 4.5.0). The helpers are private DeepLC API
+    (present in 4.4.0 and 4.5.0) and the engine sets no DeepLC ceiling, so a release that
+    moves, renames or re-signatures them returns None here, with a warning, and every call
+    loads its own model as before: slower, same numbers. Identical in both DeepLC workers.
+    """
+    try:
+        from deeplc import _model_ops
+        from deeplc.core import DEFAULT_MODEL
+
+        return _model_ops.load_model(DEFAULT_MODEL)
+    except (ImportError, AttributeError, TypeError) as exc:
+        print("WARNING: could not load the DeepLC base model once (%s: %s); every "
+              "prediction call loads its own" % (type(exc).__name__, exc), flush=True)
+        return None
+
+
+def library_bases(peptidoforms):
+    """The DECOY_-stripped sequence of every library row, as `base_pf` gives it."""
+    return pc.replace_substring_regex(peptidoforms, pattern=DECOY_PREFIX_RE, replacement="")
+
+
+def unique_standard_bases(bases):
+    """Unique stripped sequences in first-occurrence order, standard residues only.
+
+    What the per-row loop `if b not in seen and is_std(pf)` produced, computed in Arrow so
+    a library of 1e7 to 1e8 rows does not become that many Python strings and a set. The
+    per-chunk uniques are widened to large_string before they are joined: at 1e8 rows they
+    can pass the 2 GiB offset limit of `string`.
+    """
+    parts = [pc.unique(chunk).cast(pa.large_string()) for chunk in bases.chunks]
+    if not parts:
+        return pa.array([], pa.large_string())
+    uniq = parts[0] if len(parts) == 1 else pc.unique(pa.concat_arrays(parts))
+    stripped = pc.replace_substring_regex(uniq, pattern=MOD_RE, replacement="")
+    return uniq.filter(pc.match_substring_regex(stripped, pattern=STD_FULL_RE))
+
+
 def build_reference(args):
     """The run's confident seed PSMs as a `PSMList`: peptidoform plus observed RT.
 
     Shared by the fine-tune and the multi-head calibration, so both adapt to exactly the
     same peptides and both honour the held-out window rule.
     """
-    # reference: confident target seed PSMs (peptidoform + observed RT, seconds)
-    seed = pq.read_table(args.seed_path).to_pydict()
     # Held-out window sizing: the same rule as rt_im_train.rs::is_holdout, on the same
     # base_peptide_id, so the peptides rt-im-train scores as held-out never enter the
     # fine-tune. Pin the shared contract with the exact cases the Rust unit test uses.
@@ -187,11 +501,25 @@ def build_reference(args):
     is_holdout = lambda bid: bid % 1000 < round(hf * 1000)
     if hf > 0.0:
         assert [299 % 1000 < round(0.3 * 1000), 300 % 1000 < round(0.3 * 1000)] == [True, False]
+    # reference: confident target seed PSMs (peptidoform + observed RT, seconds). Only the
+    # columns the rule reads, and only the confident targets become Python objects: the
+    # label and q filter runs in Arrow and keeps row order, so the dict below is built from
+    # the same rows in the same order as a loop over the whole table.
+    cols = ["peptidoform", "label", "spectrum_q", "observed_rt"]
+    if hf > 0.0:
+        cols.append("base_peptide_id")
+    seed = pq.read_table(args.seed_path, columns=cols)
+    confident = pc.and_(
+        pc.equal(seed.column("label"), "target"),
+        pc.less_equal(seed.column("spectrum_q").cast(pa.float64()),
+                      pa.scalar(float(args.q_train), pa.float64())),
+    )
+    seed = seed.filter(confident).to_pydict()
     ref = {}
     n_held = 0
     for i in range(len(seed["peptidoform"])):
         pf = seed["peptidoform"][i]
-        if seed["label"][i] == "target" and seed["spectrum_q"][i] <= args.q_train and is_std(pf):
+        if is_std(pf):
             if hf > 0.0 and is_holdout(seed["base_peptide_id"][i]):
                 n_held += 1
                 continue
@@ -208,7 +536,7 @@ def build_reference(args):
     return ref_psms
 
 
-def fit_multihead(args, ref_psms):
+def fit_multihead(args, ref_psms, model=None):
     """Fit a multi-head ridge calibration of the base model against this run.
 
     `deeplc.predict` returns ONE of the model's 6,543 LC-setup heads, the one named by
@@ -229,7 +557,7 @@ def fit_multihead(args, ref_psms):
           f"{len(ref_psms)} anchors", flush=True)
     t0 = time.time()
     with quiet_deeplc_progress():
-        cal = deeplc.calibrate(psm_list_reference=ref_psms, calibration=cal)
+        cal = deeplc.calibrate(psm_list_reference=ref_psms, calibration=cal, model=model)
     idx = getattr(cal, "_head_idx", None)
     n_fitted = 0 if idx is None else len(idx)
     print(f"multi-head calibration: {n_fitted} heads combined, best head "
@@ -237,8 +565,8 @@ def fit_multihead(args, ref_psms):
     return cal
 
 
-def build_finetuned_model(args, ref_psms):
-    """Transfer-learn on the confident seed PSMs."""
+def build_finetuned_model(args, ref_psms, threads):
+    """Transfer-learn on the confident seed PSMs with `threads` torch CPU threads."""
     # Batch size: 0 -> auto-scale so each epoch runs ~30+ gradient steps. A fixed 512
     # underfits small references (e.g. ~4k E.coli seed = ~8 steps/epoch, never
     # converges); clamp to [16, 512].
@@ -255,7 +583,7 @@ def build_finetuned_model(args, ref_psms):
         "device": args.device,
     }
     if args.device == "cpu":
-        train_kwargs["num_threads"] = max(1, args.threads)   # cpu-only knob; absent in some deeplc builds
+        train_kwargs["num_threads"] = max(1, threads)   # cpu-only knob; absent in some deeplc builds
     ft_model = deeplc.finetune(ref_psms, train_kwargs=train_kwargs)   # <-- transfer learning
     print("fine-tuned model ready", flush=True)
     return ft_model
@@ -269,7 +597,9 @@ def main():
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
                     help="cuda moves training/inference onto the GPU; sidesteps the CPU OpenMP crash entirely")
     ap.add_argument("--threads", type=int, default=int(_THREADS),
-                    help="torch CPU threads for training (bounded to avoid OpenMP oversubscription; cpu only)")
+                    help="torch CPU threads for training (bounded to avoid OpenMP oversubscription; cpu only). "
+                         "Like --predict-threads it is capped at the physical cores available to the "
+                         "process; MUMDIA_DEEPLC_THREAD_CAP sets the cap, 0 disables it")
     ap.add_argument("--predict-threads", type=int, default=0,
                     help="torch CPU threads for the whole-library prediction phase; "
                          "0 (default) reuses --threads, i.e. no change in behaviour. The "
@@ -277,7 +607,11 @@ def main():
                          "sustained BACKWARD pass; prediction is forward-only, and it is the "
                          "phase that dominates wall clock on a large library, so it can "
                          "usually take more threads. Raise it deliberately and watch the "
-                         "per-chunk rate logged below.")
+                         "per-chunk rate logged below. Capped at the physical cores "
+                         "available to the process (MUMDIA_DEEPLC_THREAD_CAP, 0 = no cap): "
+                         "past that, a second hyperthread on a busy core slows every "
+                         "OpenMP-parallel op down (10:41 at 96 threads, 18:09 at 128 on a "
+                         "64-core host).")
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--batch", type=int, default=0,
                     help="fine-tune batch size; 0 (default) auto-scales to the reference "
@@ -312,6 +646,44 @@ def main():
                          "this for rt_im_train.library_irt = deeplc, replacing an imported "
                          "library's iRT with predictions that per-run calibration then maps "
                          "onto observed RT")
+    ap.add_argument("--shards", type=int, default=1, metavar="K",
+                    help="split the whole-library prediction across K child processes, "
+                         "with the calibration or fine-tuned model fitted once here and "
+                         "handed to each. 1 (default) predicts in this process; 0 is "
+                         "automatic, one shard per %d threads of the prediction thread "
+                         "budget. The budget (--predict-threads after the thread cap) is "
+                         "divided evenly, so K shards of budget/K threads each. Whether it "
+                         "pays is unmeasured where it is meant to: docs/32 attributes the "
+                         "per-process rate to featurisation (single-threaded Python), but on "
+                         "the one desktop measured the forward pass dominated at 8 threads or "
+                         "fewer and 4 shards of 2 threads were no faster than 1 process of 8 "
+                         "(docs/08). Expected to help only where one process stops scaling "
+                         "with threads. Each child is a Python process with torch and DeepLC "
+                         "loaded (about 0.57 GB; the model itself about 35 MB). One process "
+                         "when a GPU is available." % SHARD_AUTO_THREADS)
+    ap.add_argument("--bands", metavar="TSV", default=None,
+                    help="predict several band tables in one process: one line "
+                         "'lib_in<TAB>lib_out' per band, and the positional lib_in and "
+                         "lib_out are '-'. The multi-head calibration is fitted once, the "
+                         "union of the bands' unique sequences is predicted once (in the "
+                         "order the bands list them), and each band is written with the "
+                         "rewrite a single table gets, with its own <lib_out>.summary.json. "
+                         "With --multihead or --no-finetune only: a fine-tune is refused "
+                         "for banded runs by the engine.")
+    ap.add_argument("--projection-cache", metavar="DIR", default=None,
+                    help="keep the base model's run-independent trunk projection of every "
+                         "predicted sequence (64 float32 each) in DIR, keyed by the DeepLC "
+                         "version, the model file and the exact sequence list, and read it "
+                         "back on a later call over the same sequences, so only the per-run "
+                         "calibration is computed. Base model only (--multihead or "
+                         "--no-finetune); a fine-tuned model has no factored head. The "
+                         "values are float-equivalent to a plain prediction, not "
+                         "bit-identical (the heads are evaluated in numpy from the cached "
+                         "factors instead of in torch).")
+    ap.add_argument("--predict-chunk", type=int, default=PREDICT_CHUNK, metavar="N",
+                    help="unique peptidoforms per prediction call (default %d). Shards are "
+                         "cut at multiples of it. Changing it changes how DeepLC batches the "
+                         "sequences, so it is a test knob, not a tuning one." % PREDICT_CHUNK)
     ap.add_argument("--seed", type=int, default=0,
                     help="seed numpy and torch before fine-tuning, so two runs on the same "
                          "input draw the same weights. Unseeded, the draw varies enough to "
@@ -336,8 +708,22 @@ def main():
           f"{', cuda' if torch.cuda.is_available() else ''}); "
           "training kernels are not guaranteed bit-for-bit deterministic", flush=True)
 
-    # bound torch's own thread pool; only one OpenMP pool spins now (matters on cpu)
-    torch.set_num_threads(max(1, args.threads))
+    # Bound torch's own thread pool; only one OpenMP pool spins now (matters on cpu). Both
+    # the training and the prediction pool are capped at the physical cores this process
+    # may use (`deeplc_thread_cap`); a request at or below the cap is taken as given.
+    cap, cap_why = deeplc_thread_cap()
+    train_threads = capped_threads(args.threads, cap)
+    predict_asked = args.predict_threads if args.predict_threads > 0 else args.threads
+    predict_threads = capped_threads(predict_asked, cap)
+    thread_record = {
+        "requested_train": max(1, args.threads),
+        "requested_predict": max(1, predict_asked),
+        "cap": cap,
+        "cap_source": cap_why,
+        "train": train_threads,
+        "predict": predict_threads,
+    }
+    torch.set_num_threads(train_threads)
     try:
         torch.set_num_interop_threads(1)
     except RuntimeError:
@@ -346,10 +732,30 @@ def main():
         print(f"device=cuda gpu={torch.cuda.get_device_name(0)}; compute off the CPU OpenMP pools", flush=True)
     else:
         print(f"device=cpu torch threads={torch.get_num_threads()} interop=1; OMP/BLAS pinned to 1", flush=True)
+    print(f"torch thread cap {cap if cap > 0 else 'none'} ({cap_why}): training "
+          f"{train_threads} of {thread_record['requested_train']} asked, prediction "
+          f"{predict_threads} of {thread_record['requested_predict']} asked", flush=True)
+    if (train_threads < thread_record["requested_train"]
+            or predict_threads < thread_record["requested_predict"]):
+        print("the thread cap lowered the requested torch threads; set "
+              "MUMDIA_DEEPLC_THREAD_CAP=0 to take the request as given", flush=True)
 
-    lib = pq.read_table(args.lib_in)
-    pform = lib.column("peptidoform").to_pylist()
-    orig = np.asarray(lib.column("predicted_irt"), dtype=np.float32)
+    # Wall time per phase, in seconds, for the summary (survey P0). None where a phase did
+    # not run or could not be measured.
+    timings = {}
+    band_pairs = read_band_pairs(args) if args.bands else None
+    t_phase = time.perf_counter()
+    if band_pairs is None:
+        lib = pq.read_table(args.lib_in)
+        orig = np.asarray(lib.column("predicted_irt"), dtype=np.float32)
+    else:
+        # Only the sequences now; each band's whole table is read when it is written.
+        lib = orig = None
+        band_bases = [
+            library_bases(pq.read_table(src, columns=["peptidoform"]).column("peptidoform"))
+            for src, _ in band_pairs
+        ]
+    timings["read_library"] = round(time.perf_counter() - t_phase, 3)
 
     if args.multihead and args.no_finetune:
         raise SystemExit("--multihead and --no-finetune are alternatives: the first "
@@ -359,14 +765,33 @@ def main():
         raise SystemExit(f"--multihead must be >= 0, got {args.multihead}")
 
     calibration = None
+    base_model = None
+    timings["model_load"] = None
+    timings["reference"] = None
+    timings["fit"] = None
     if args.multihead:
-        calibration = fit_multihead(args, build_reference(args))
+        t_phase = time.perf_counter()
+        base_model = load_base_model()
+        timings["model_load"] = round(time.perf_counter() - t_phase, 3)
+        t_phase = time.perf_counter()
+        ref_psms = build_reference(args)
+        timings["reference"] = round(time.perf_counter() - t_phase, 3)
+        t_phase = time.perf_counter()
+        calibration = fit_multihead(args, ref_psms, model=base_model)
+        timings["fit"] = round(time.perf_counter() - t_phase, 3)
         ft_model = None
     elif args.no_finetune:
         ft_model = None
         print("no-finetune: predicting with the DeepLC base model (seed ignored)", flush=True)
     else:
-        ft_model = build_finetuned_model(args, build_reference(args))
+        t_phase = time.perf_counter()
+        ref_psms = build_reference(args)
+        timings["reference"] = round(time.perf_counter() - t_phase, 3)
+        # The fine-tune loads its own copy of the model inside `deeplc.finetune`, so that
+        # load is part of "fit" here.
+        t_phase = time.perf_counter()
+        ft_model = build_finetuned_model(args, ref_psms, train_threads)
+        timings["fit"] = round(time.perf_counter() - t_phase, 3)
 
     if args.skip_predict:
         print("skip-predict set; fine-tune smoke test complete (crash path exercised)", flush=True)
@@ -375,17 +800,27 @@ def main():
     # Deduplicate and predict on the DECOY_-stripped underlying sequence so decoys are
     # fine-tuned onto the same iRT scale as targets (shift-decoys reuse their target's
     # prediction; reverse-decoys get their reversed-sequence prediction).
-    uniq, seen = [], set()
-    for pf in pform:
-        b = base_pf(pf)
-        if b not in seen and is_std(pf):
-            seen.add(b)
-            uniq.append(b)
+    t_phase = time.perf_counter()
+    if band_pairs is None:
+        bases = library_bases(lib.column("peptidoform"))
+        uniq = unique_standard_bases(bases)
+        band_pos = None
+    else:
+        # The union over the bands, in the order the bands list the sequences, and every
+        # band row's position in it. A sequence shared by bands (charge states of one
+        # peptidoform fall in different m/z bands; window overlaps put rows in two) is
+        # predicted once instead of once per band.
+        bases = None
+        uniq, band_pos = union_positions(band_bases)
+        del band_bases
     if args.predict_limit:
-        uniq = uniq[: args.predict_limit]
-    pt = args.predict_threads if args.predict_threads > 0 else args.threads
-    if pt != torch.get_num_threads():
-        torch.set_num_threads(max(1, pt))
+        uniq = uniq.slice(0, args.predict_limit)
+    timings["unique"] = round(time.perf_counter() - t_phase, 3)
+    if args.predict_chunk < 1:
+        raise SystemExit(f"--predict-chunk must be >= 1, got {args.predict_chunk}")
+    chunk = args.predict_chunk
+    n_shards, shard_threads, shard_note = shard_plan(
+        args.shards, predict_threads, len(uniq), chunk, torch.cuda.is_available())
     which = (
         f"the base model calibrated over {args.multihead} heads"
         if calibration is not None
@@ -393,55 +828,103 @@ def main():
         if ft_model is None
         else "the fine-tuned model"
     )
-    print(f"predicting {len(uniq)} unique standard peptidoforms with {which} "
-          f"(torch threads={torch.get_num_threads()})", flush=True)
-    # Only needed to satisfy `predict_and_calibrate`, which parses a reference before it
-    # notices the calibration is already fitted.
-    ref_for_transform = ref_psms_for_transform(calibration, args)
-    preds = {}
-    chunk = 100_000
+    shard_record = {
+        "requested": args.shards,
+        "used": n_shards,
+        "threads_per_shard": shard_threads,
+        "chunk": chunk,
+        "plan": shard_note,
+    }
     t_pred0 = time.time()
-    # DeepLC's progress writer emits one blank line per update when stdout is not a
-    # terminal, and the engine inherits this worker's stdout, so a real run was 98%
-    # blank lines. The per-chunk progress printed inside the loop is not blank and
-    # still comes through.
-    with quiet_deeplc_progress():
-        for s in range(0, len(uniq), chunk):
-            t0 = time.time()
-            batch = uniq[s:s + chunk]
-            if calibration is not None:
-                # The calibration is already fitted, so this only predicts and transforms: it
-                # pulls the head columns the ridge reads rather than materialising all 6,543,
-                # which at library scale would be terabytes. The reference is passed again
-                # because the signature requires one; the fitting step is skipped.
-                p = agg(deeplc.predict_and_calibrate(
-                    batch, psm_list_reference=ref_for_transform, calibration=calibration))
-            else:
-                p = agg(deeplc.predict(batch) if ft_model is None else deeplc.predict(batch, model=ft_model))
-            # A structurally short or long answer is a broken predictor, not a set of
-            # unsupported peptidoforms: zipping it silently paired predictions with the wrong
-            # peptidoforms and left the tail on its imported value (docs/30 R6).
-            if len(p) != len(batch):
-                raise SystemExit(
-                    f"DeepLC returned {len(p)} predictions for {len(batch)} peptidoforms in one "
-                    f"batch; refusing to rewrite the library from a malformed response")
-            for pf, v in zip(batch, p):
-                preds[pf] = float(v)
-            done = min(s + chunk, len(uniq))
-            dt = time.time() - t0
-            rate = len(batch) / dt if dt > 0 else float("inf")
-            eta = (len(uniq) - done) / rate if rate > 0 else float("nan")
-            print(f"  {done}/{len(uniq)}  {dt:.1f}s for this chunk "
-                  f"({rate:.0f} peptidoforms/s, ETA {eta / 60:.1f} min)", flush=True)
-    print(f"prediction phase: {time.time() - t_pred0:.1f}s total", flush=True)
+    cache_record = None
+    values = None
+    if args.projection_cache and ft_model is not None:
+        print("projection cache: not used with a fine-tuned model, which has no factored "
+              "head; predicting as usual", flush=True)
+    if args.projection_cache and ft_model is None:
+        if base_model is None:
+            t_phase = time.perf_counter()
+            base_model = load_base_model()
+            timings["model_load"] = round(time.perf_counter() - t_phase, 3)
+        # This process does the whole projection (a miss) or the head evaluation (a hit),
+        # so it takes the single-process budget. `shard_threads` is the budget of ONE of K
+        # shards, predict_threads // K, and a miss run on it was slower than both the
+        # sharded prediction and a plain one-process run.
+        if predict_threads != torch.get_num_threads():
+            torch.set_num_threads(predict_threads)
+        values, cache_record, timers = predict_from_projections(
+            uniq, base_model, calibration, chunk, args.projection_cache)
+        if values is not None:
+            n_shards = 1
+            shard_record["used"] = 1
+            shard_record["plan"] = "projection cache"
+            timings["featurisation"], timings["forward"] = timers.totals()
+    if values is not None:
+        pass  # predicted from the projection cache
+    elif n_shards == 1:
+        if ft_model is None and base_model is None:
+            t_phase = time.perf_counter()
+            base_model = load_base_model()
+            timings["model_load"] = round(time.perf_counter() - t_phase, 3)
+        model = ft_model if ft_model is not None else base_model
+        if shard_threads != torch.get_num_threads():
+            torch.set_num_threads(shard_threads)
+        print(f"predicting {len(uniq)} unique standard peptidoforms with {which} "
+              f"(torch threads={torch.get_num_threads()})", flush=True)
+        values, timers = predict_values(uniq, model, calibration, chunk)
+        timings["featurisation"], timings["forward"] = timers.totals()
+    else:
+        print(f"predicting {len(uniq)} unique standard peptidoforms with {which} in "
+              f"{n_shards} processes of {shard_threads} torch threads ({shard_note})",
+              flush=True)
+        # The parent predicts nothing while it shards and every child loads its own model,
+        # so this process lets go of its copies before the children start: the base model
+        # the multi-head fit used, and the fine-tuned model once `predict_sharded` has
+        # saved it for the children (it is handed over in `fitted` for that reason).
+        fitted = {"model": ft_model, "calibration": calibration}
+        ft_model = base_model = None
+        gc.collect()
+        values, per_shard = predict_sharded(
+            uniq, n_shards, shard_threads, chunk, fitted,
+            args.lib_out if band_pairs is None else band_pairs[0][1])
+        shard_record["per_shard"] = per_shard
+        # Summed over the shards, so these are process-seconds rather than wall time.
+        for key in ("featurisation", "forward"):
+            parts = [p.get(key) for p in per_shard]
+            timings[key] = None if any(v is None for v in parts) else round(sum(parts), 3)
+    timings["predict"] = round(time.time() - t_pred0, 3)
+    print(f"prediction phase: {time.time() - t_pred0:.1f}s total "
+          f"(featurisation {_fmt_s(timings['featurisation'])}, "
+          f"forward pass {_fmt_s(timings['forward'])}"
+          f"{', summed over shards' if n_shards > 1 else ''})", flush=True)
 
-    new, summary = rewrite_irt(pform, orig, preds)
+    if band_pairs is not None:
+        write_bands(band_pairs, band_pos, uniq, values, which, thread_record, shard_record,
+                    timings,
+                    multihead_record(calibration, args.multihead, len(ref_psms))
+                    if calibration is not None else None,
+                    cache_record)
+        return
+
+    t_phase = time.perf_counter()
+    new, summary = rewrite_irt(bases, orig, uniq, values)
+    timings["rewrite"] = round(time.perf_counter() - t_phase, 3)
+    t_phase = time.perf_counter()
     idx = lib.schema.get_field_index("predicted_irt")
     lib = lib.set_column(idx, "predicted_irt", pa.array(new, pa.float32()))
     pq.write_table(lib, args.lib_out)
+    timings["write"] = round(time.perf_counter() - t_phase, 3)
     summary["model"] = which
     summary["lib_in"] = args.lib_in
     summary["lib_out"] = args.lib_out
+    summary["unique_predicted"] = len(uniq)
+    summary["torch_threads"] = thread_record
+    summary["shards"] = shard_record
+    summary["timings_s"] = timings
+    if cache_record is not None:
+        summary["projection_cache"] = cache_record
+    if calibration is not None:
+        summary["multihead"] = multihead_record(calibration, args.multihead, len(ref_psms))
     with open(args.lib_out + ".summary.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     print(f"wrote library with re-predicted iRT ({which}): {args.lib_out}")
@@ -456,6 +939,595 @@ def main():
               f"the counts are in {args.lib_out}.summary.json", flush=True)
 
 
+def multihead_record(calibration, requested, anchors):
+    """What the multi-head fit chose, so two runs can be compared head for head.
+
+    A thread-count or version change moves the reference predictions in the last bits, and
+    the survey's validation asks whether the selected heads stayed the same. None of these
+    are read back by the engine.
+    """
+    idx = getattr(calibration, "_head_idx", None)
+    ridge = getattr(calibration, "_ridge", None)
+    alpha = getattr(ridge, "alpha_", None)
+    best = getattr(calibration, "selected_model_head", None)
+    return {
+        "heads_requested": int(requested),
+        "anchors": int(anchors),
+        "heads": None if idx is None else [int(h) for h in idx],
+        "best_head": None if best is None else int(best),
+        "ridge_alpha": None if alpha is None else float(alpha),
+    }
+
+
+def read_band_pairs(args):
+    """The `(lib_in, lib_out)` pairs of `--bands`, validated against the other arguments.
+
+    One line per band, `lib_in<TAB>lib_out`; blank lines are skipped. The positional
+    lib_in and lib_out must be '-', so a call cannot mean both a single table and a band
+    list. A fine-tune is refused: the engine trains no fine-tune for a banded run, and one
+    fitted here would be applied to every band without that decision being made.
+    """
+    if args.lib_in != "-" or args.lib_out != "-":
+        raise SystemExit("--bands takes its tables from the TSV; pass '-' for the "
+                         "positional lib_in and lib_out")
+    if not (args.multihead or args.no_finetune):
+        raise SystemExit("--bands needs --multihead N or --no-finetune; a fine-tune is not "
+                         "supported for band tables")
+    pairs = []
+    with open(args.bands, encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            line = line.rstrip("\r\n")
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) != 2 or not all(parts):
+                raise SystemExit(f"{args.bands}:{n}: expected 'lib_in<TAB>lib_out', got {line!r}")
+            pairs.append((parts[0], parts[1]))
+    if not pairs:
+        raise SystemExit(f"{args.bands} lists no band")
+    outs = [o for _, o in pairs]
+    if len(set(outs)) != len(outs):
+        raise SystemExit(f"{args.bands} writes the same output twice")
+    return pairs
+
+
+def union_positions(band_bases):
+    """The union of the bands' standard sequences and each band row's position in it.
+
+    `band_bases` holds each band's DECOY_-stripped sequences (`library_bases`). The union
+    is `unique_standard_bases` over the bands' rows in band order, so for a single band it
+    is exactly the set, in exactly the order, a single-table call predicts. Positions come
+    from one `index_in` over all the rows against the union, rather than one hash table per
+    band, and are split back by band: -1 where a row's sequence is not in the union
+    (non-standard residues), which is what `rewrite_irt` calls not found.
+    """
+    chunks = [c.cast(pa.large_string()) for b in band_bases for c in b.chunks]
+    if not chunks:
+        return pa.array([], pa.large_string()), [np.empty(0, dtype=np.int64)
+                                                  for _ in band_bases]
+    all_bases = pa.chunked_array(chunks, type=pa.large_string())
+    uniq = unique_standard_bases(all_bases)
+    pos = pc.fill_null(pc.index_in(all_bases, value_set=uniq), -1)
+    pos = np.asarray(pos.to_numpy(), dtype=np.int64)
+    out, start = [], 0
+    for b in band_bases:
+        out.append(pos[start:start + len(b)])
+        start += len(b)
+    return uniq, out
+
+
+def write_bands(band_pairs, band_pos, uniq, values, which, thread_record, shard_record,
+                timings, multihead, cache_record=None):
+    """Rewrite and write every band of a `--bands` call, each with its own summary.
+
+    Each band's table is read whole, its `predicted_irt` rewritten from the union's
+    predictions by the same rule as a single table (`rewrite_positions`), and written with
+    the same writer. Each `<lib_out>.summary.json` carries the band's own counts and the
+    shared model, thread, shard and timing records, plus `bands` (how many, which one, and
+    the size of the union that was predicted).
+    """
+    t_rewrite = t_write = 0.0
+    totals = {"rows": 0, "repredicted": 0, "retained_imported": 0}
+    summaries = []
+    for j, ((src, dst), pos) in enumerate(zip(band_pairs, band_pos)):
+        t_phase = time.perf_counter()
+        lib = pq.read_table(src)
+        orig = np.asarray(lib.column("predicted_irt"), dtype=np.float32)
+        if len(orig) != len(pos):
+            raise SystemExit(f"{src} changed while it was being predicted: {len(orig)} rows "
+                             f"now, {len(pos)} when its sequences were read")
+        new, summary = rewrite_positions(orig, pos, values, len(uniq))
+        t_rewrite += time.perf_counter() - t_phase
+        t_phase = time.perf_counter()
+        idx = lib.schema.get_field_index("predicted_irt")
+        lib = lib.set_column(idx, "predicted_irt", pa.array(new, pa.float32()))
+        pq.write_table(lib, dst)
+        del lib
+        t_write += time.perf_counter() - t_phase
+        summary["model"] = which
+        summary["lib_in"] = src
+        summary["lib_out"] = dst
+        summary["unique_predicted"] = len(uniq)
+        summary["bands"] = {"count": len(band_pairs), "index": j, "union_unique": len(uniq)}
+        summaries.append(summary)
+        for k in totals:
+            totals[k] += summary[k]
+    timings["rewrite"] = round(t_rewrite, 3)
+    timings["write"] = round(t_write, 3)
+    for summary in summaries:
+        summary["torch_threads"] = thread_record
+        summary["shards"] = shard_record
+        summary["timings_s"] = timings
+        if cache_record is not None:
+            summary["projection_cache"] = cache_record
+        if multihead is not None:
+            summary["multihead"] = multihead
+        with open(summary["lib_out"] + ".summary.json", "w", encoding="utf-8") as fh:
+            json.dump(summary, fh, indent=2)
+    print(f"wrote {len(band_pairs)} band libraries with re-predicted iRT ({which}), "
+          f"{len(uniq)} unique sequences predicted once for all of them")
+    print(f"  rows={totals['rows']} repredicted={totals['repredicted']} "
+          f"retained_imported={totals['retained_imported']}")
+    if totals["retained_imported"]:
+        print(f"WARNING: {totals['retained_imported']} of {totals['rows']} band rows keep "
+              f"their imported iRT, which is on the imported model's scale, not {which}'s; "
+              f"the counts are in each band's <lib_out>.summary.json", flush=True)
+
+
+def _fmt_s(value):
+    return "n/a" if value is None else f"{value:.1f}s"
+
+
+def predict_values(uniq, model, calibration, chunk, label=""):
+    """Predictions (float64, aligned with `uniq`) in `chunk`-sized calls, and their timers.
+
+    The single loop both the one-process path and every shard run, so a shard makes exactly
+    the calls the one process would have made over the same slice.
+    """
+    # Only needed to satisfy `predict_and_calibrate`, which parses a reference before it
+    # notices the calibration is already fitted.
+    ref_for_transform = ref_psms_for_transform(calibration, None)
+    values = np.empty(len(uniq), dtype=np.float64)
+    timers = PredictTimers()
+    prefix = f"[{label}] " if label else ""
+    # DeepLC's progress writer emits one blank line per update when stdout is not a
+    # terminal, and the engine inherits this worker's stdout, so a real run was 98%
+    # blank lines. The per-chunk progress printed inside the loop is not blank and
+    # still comes through.
+    with quiet_deeplc_progress(), timers.install(model):
+        for s in range(0, len(uniq), chunk):
+            t0 = time.time()
+            batch = uniq.slice(s, chunk).to_pylist()
+            if calibration is not None:
+                # The calibration is already fitted, so this only predicts and transforms: it
+                # pulls the head columns the ridge reads rather than materialising all 6,543,
+                # which at library scale would be terabytes. The reference is passed again
+                # because the signature requires one; the fitting step is skipped.
+                p = agg(deeplc.predict_and_calibrate(
+                    batch, psm_list_reference=ref_for_transform, calibration=calibration,
+                    model=model))
+            else:
+                p = agg(deeplc.predict(batch, model=model))
+            # A structurally short or long answer is a broken predictor, not a set of
+            # unsupported peptidoforms: zipping it silently paired predictions with the wrong
+            # peptidoforms and left the tail on its imported value (docs/30 R6).
+            if len(p) != len(batch):
+                raise SystemExit(
+                    f"DeepLC returned {len(p)} predictions for {len(batch)} peptidoforms in one "
+                    f"batch; refusing to rewrite the library from a malformed response")
+            values[s:s + len(batch)] = p
+            done = min(s + chunk, len(uniq))
+            dt = time.time() - t0
+            rate = len(batch) / dt if dt > 0 else float("inf")
+            eta = (len(uniq) - done) / rate if rate > 0 else float("nan")
+            print(f"  {prefix}{done}/{len(uniq)}  {dt:.1f}s for this chunk "
+                  f"({rate:.0f} peptidoforms/s, ETA {eta / 60:.1f} min)", flush=True)
+    return values, timers
+
+
+def _sequence_digest(uniq, h):
+    """Feed the exact bytes of every sequence in `uniq`, in order, to the hash `h`.
+
+    Offsets are re-based per slice so the digest depends on the strings only, not on how
+    the Arrow array happens to be sliced or chunked.
+    """
+    arr = uniq.cast(pa.large_string())
+    if isinstance(arr, pa.ChunkedArray):
+        arr = arr.combine_chunks()
+    step = 1_000_000
+    for a in range(0, len(arr), step):
+        part = arr.slice(a, step)
+        offsets = np.frombuffer(part.buffers()[1], dtype=np.int64)[
+            part.offset:part.offset + len(part) + 1]
+        data = part.buffers()[2]
+        start, stop = int(offsets[0]), int(offsets[-1])
+        h.update((offsets - start).tobytes())
+        if data is not None and stop > start:
+            h.update(memoryview(data)[start:stop])
+
+
+def projection_cache_key(uniq, model_path):
+    """Hex key of a cached projection: the DeepLC version, the model file, the sequences."""
+    h = hashlib.blake2b(digest_size=20)
+    h.update(("deeplc=%s;" % getattr(deeplc, "__version__", "")).encode())
+    with open(model_path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    h.update(b";sequences=%d;" % len(uniq))
+    _sequence_digest(uniq, h)
+    return h.hexdigest()
+
+
+def predict_from_projections(uniq, model, calibration, chunk, cache_dir):
+    """Predict `uniq` from the base model's cached trunk projection, computing it once.
+
+    Calibrated RT is `ridge(spline_h(head_h(proj(trunk(x)))))` over the selected heads, and
+    only the head selection, the splines and the ridge depend on a run; `proj(trunk(x))`, 64
+    float32 per sequence, depends on the sequence and the model alone. So the projection is
+    computed on the first call over a sequence list (the same forward pass a plain
+    prediction makes), stored as `<cache_dir>/<key>/projections.npy`, and every later call
+    over the same list evaluates only the heads it needs from the factors: the multi-head
+    calibration's transform, or the default head for the base model. The key covers the
+    DeepLC version, the model file's bytes and the exact sequence list.
+
+    Returns `(values, record, timers)`, or `(None, record, None)` when the model has no
+    factored head, in which case the caller predicts as usual. Private DeepLC API:
+    `deeplc._factored.FactoredPredictionMatrix._projections` and
+    `_model_ops.supports_factored` were added in DeepLC 4.5.0 (`core._default_task_idx` is
+    older). DeepLC 4.4.x, the engine's floor, has neither, so there the cache warns, records
+    why, and the caller predicts as usual; a later release that moves them falls back the
+    same way.
+    """
+    try:
+        from deeplc import _model_ops
+        from deeplc._factored import FactoredPredictionMatrix
+        from deeplc.core import DEFAULT_MODEL, _default_task_idx
+    except ImportError as exc:
+        why = ("DeepLC %s has no factored prediction matrix (deeplc._factored, added in "
+               "4.5.0): %s" % (getattr(deeplc, "__version__", "?"), exc))
+        print("WARNING: projection cache unavailable: %s; predicting as usual" % why,
+              flush=True)
+        return None, {"used": False, "why": why}, None
+    if model is None or not _model_ops.supports_factored(model):
+        print("WARNING: projection cache: this model has no factored head; predicting as "
+              "usual", flush=True)
+        return None, {"used": False, "why": "no factored head"}, None
+    t0 = time.perf_counter()
+    key = projection_cache_key(uniq, DEFAULT_MODEL)
+    t_key = time.perf_counter() - t0
+    final = os.path.join(cache_dir, key)
+    path = os.path.join(final, "projections.npy")
+    head = model.head
+    emb = head.embedding.detach().cpu().numpy()
+    scale = head.scale.detach().cpu().numpy()
+    shift = head.shift.detach().cpu().numpy()
+    rank = emb.shape[1]
+    timers = PredictTimers()
+    hit = os.path.exists(path)
+    t1 = time.perf_counter()
+    if not hit:
+        os.makedirs(cache_dir, exist_ok=True)
+        work = tempfile.mkdtemp(prefix=f"{key}.tmp-{os.getpid()}.", dir=cache_dir)
+        try:
+            proj = np.lib.format.open_memmap(os.path.join(work, "projections.npy"), mode="w+",
+                                             dtype=np.float32, shape=(len(uniq), rank))
+            with quiet_deeplc_progress(), timers.install(model):
+                for s in range(0, len(uniq), chunk):
+                    batch = uniq.slice(s, chunk).to_pylist()
+                    m = deeplc.predict(batch, model=model, return_matrix=True)
+                    if not isinstance(m, FactoredPredictionMatrix):
+                        raise TypeError("predict(return_matrix=True) returned %s, not factors"
+                                        % type(m).__name__)
+                    block = np.asarray(m._projections, dtype=np.float32)
+                    if block.shape != (len(batch), rank):
+                        raise SystemExit(f"DeepLC returned projections of shape {block.shape} "
+                                         f"for {len(batch)} sequences")
+                    proj[s:s + len(batch)] = block
+                    print(f"  projection {min(s + chunk, len(uniq))}/{len(uniq)}", flush=True)
+            proj.flush()
+            del proj
+            with open(os.path.join(work, "meta.json"), "w", encoding="utf-8") as fh:
+                json.dump({"key": key, "sequences": len(uniq), "rank": int(rank),
+                           "deeplc": getattr(deeplc, "__version__", ""),
+                           "model": str(DEFAULT_MODEL), "chunk": chunk,
+                           "torch_threads": torch.get_num_threads()}, fh, indent=2)
+            try:
+                os.replace(work, final)
+            except OSError:
+                # Another call wrote the same key first; its projections are the same.
+                shutil.rmtree(work, ignore_errors=True)
+        except (TypeError, AttributeError) as exc:
+            shutil.rmtree(work, ignore_errors=True)
+            print("WARNING: projection cache: %s; predicting as usual" % exc, flush=True)
+            return None, {"used": False, "why": str(exc)}, None
+        except BaseException:
+            shutil.rmtree(work, ignore_errors=True)
+            raise
+    t_proj = time.perf_counter() - t1
+    proj = np.load(path, mmap_mode="r")
+    if proj.shape != (len(uniq), rank):
+        raise SystemExit(f"{path} holds {proj.shape}, expected ({len(uniq)}, {rank})")
+    t2 = time.perf_counter()
+    default_head = None if calibration is not None else int(_default_task_idx(model))
+    values = np.empty(len(uniq), dtype=np.float64)
+    for s in range(0, len(uniq), chunk):
+        block = np.ascontiguousarray(proj[s:s + chunk])
+        source = FactoredPredictionMatrix(block, emb, scale, shift)
+        if calibration is not None:
+            p = agg(calibration.transform(source))
+        else:
+            p = np.asarray(source[:, default_head], dtype=np.float64)
+        if len(p) != len(block):
+            raise SystemExit(f"the cached projection gave {len(p)} values for {len(block)} "
+                             f"sequences")
+        values[s:s + len(block)] = p
+    t_eval = time.perf_counter() - t2
+    record = {
+        "used": True,
+        "hit": bool(hit),
+        "key": key,
+        "path": path,
+        "rank": int(rank),
+        "key_s": round(t_key, 3),
+        "project_s": round(t_proj, 3) if not hit else 0.0,
+        "evaluate_s": round(t_eval, 3),
+    }
+    print(f"projection cache {'hit' if hit else 'written'}: {path} "
+          f"({len(uniq)} sequences; evaluate {t_eval:.1f}s)", flush=True)
+    return values, record, timers
+
+
+def shard_plan(requested, budget, n_items, chunk, gpu):
+    """`(shards, threads per shard, why)` for the whole-library prediction.
+
+    A deterministic function of the request, the thread budget (the prediction threads
+    after the cap) and the library, never of free memory, so two runs of one configuration
+    on one host split the same way. K = `requested`, or budget / SHARD_AUTO_THREADS when it
+    is 0, bounded by the budget (at least one thread per shard); each shard gets budget / K
+    threads, rounded down. The slices are whole chunks, so a library of fewer chunks than K
+    uses fewer shards at the same threads each, and a library of one chunk is predicted in
+    this process with the whole budget. A GPU is one device, so it always gets one process.
+    """
+    if requested < 0:
+        raise SystemExit(f"--shards must be >= 0, got {requested}")
+    budget = max(1, int(budget))
+    if gpu:
+        return 1, budget, "a GPU is available, so one process"
+    k = requested if requested > 0 else max(1, budget // SHARD_AUTO_THREADS)
+    k = max(1, min(k, budget))
+    if k == 1:
+        return 1, budget, "one process"
+    threads = max(1, budget // k)
+    n_chunks = max(1, -(-n_items // chunk))
+    per = -(-n_chunks // min(k, n_chunks))
+    used = -(-n_chunks // per)
+    if used == 1:
+        return 1, budget, f"{n_chunks} chunk(s) of {chunk}, so one process"
+    why = f"{k} requested" if requested > 0 else f"automatic: budget {budget} / {SHARD_AUTO_THREADS}"
+    if used < k:
+        why += f", {used} used for {n_chunks} chunks of {chunk}"
+    return used, threads, why
+
+
+def shard_bounds(n_items, shards, chunk):
+    """Contiguous `(start, stop)` slices of `n_items`, every start a multiple of `chunk`."""
+    n_chunks = max(1, -(-n_items // chunk))
+    per = -(-n_chunks // shards) * chunk
+    return [(a, min(a + per, n_items)) for a in range(0, n_items, per)]
+
+
+def predict_sharded(uniq, shards, threads, chunk, fitted, lib_out):
+    """Predict `uniq` in `shards` child processes and join the slices in order.
+
+    `fitted` holds the fitted `calibration` and the fine-tuned `model`, either of them None.
+    The calibration (pickled) or the model (`torch.save` of the module) is written once
+    and every child reads it, so no shard refits: a refit could select a different head at
+    rank 80 from last-bit differences in the reference predictions. The model is taken out
+    of `fitted` and released once it is on disk, so the parent does not hold a copy next
+    to the children's (the caller keeps no other reference). Each
+    child's slice starts at a multiple of `chunk` and it predicts in `chunk`-sized calls
+    from there, which are the calls the one process would have made. A child that exits
+    non-zero stops the others and fails the stage; nothing is written then.
+
+    The scratch directory beside `lib_out` is removed on every exit Python sees, and
+    SIGTERM (a Stop in the desktop application, a `kill`) is made one of them
+    (`exit_on_termination_signals`). A kill Python cannot see (SIGKILL, `taskkill /F`)
+    leaves it behind, so the directory and every file in it carry a `.tmp-<pid>` token,
+    which the desktop application's sweep of a stopped run removes. Each child watches a
+    pipe the parent holds on its stdin and ends itself when the parent is gone, whatever
+    ended it (`_exit_when_the_parent_exits`), so no shard keeps predicting for nobody.
+    There is no timeout: a slow shard on a large library cannot be told from a hung one.
+    """
+    bounds = shard_bounds(len(uniq), shards, chunk)
+    base_dir = os.path.dirname(os.path.abspath(lib_out))
+    token = f"tmp-{os.getpid()}"
+    procs = []
+    with exit_on_termination_signals():
+        work = tempfile.mkdtemp(prefix=f"{os.path.basename(lib_out)}.{token}.shards.",
+                                dir=base_dir)
+        try:
+            cal_path = model_path = None
+            calibration = fitted.get("calibration")
+            if calibration is not None:
+                cal_path = os.path.join(work, f"calibration.{token}.pkl")
+                with open(cal_path, "wb") as fh:
+                    pickle.dump(calibration, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            ft_model = fitted.pop("model", None)
+            if ft_model is not None:
+                model_path = os.path.join(work, f"model.{token}.pt")
+                torch.save(ft_model, model_path)
+                ft_model = None
+                gc.collect()
+            specs = []
+            for j, (a, b) in enumerate(bounds):
+                stem = os.path.join(work, f"shard_{j:03d}.{token}")
+                pq.write_table(pa.table({"seq": uniq.slice(a, b - a)}), stem + ".seqs.parquet")
+                spec = {
+                    "shard": j,
+                    "label": f"shard {j + 1}/{len(bounds)}",
+                    "seqs": stem + ".seqs.parquet",
+                    "out": stem + ".values.npy",
+                    "timings": stem + ".timings.json",
+                    "spec": stem + ".spec.json",
+                    "threads": threads,
+                    "chunk": chunk,
+                    "calibration": cal_path,
+                    "model": model_path,
+                    "rows": b - a,
+                    "watch_parent": True,
+                }
+                with open(spec["spec"], "w", encoding="utf-8") as fh:
+                    json.dump(spec, fh)
+                specs.append(spec)
+            script = os.path.abspath(__file__)
+            for spec in specs:
+                # stdin is the parent-liveness pipe; nothing is ever written to it.
+                procs.append(subprocess.Popen(
+                    [sys.executable, script, "--shard-worker", spec["spec"]],
+                    stdin=subprocess.PIPE))
+            _wait_for_shards(procs)
+            parts, per_shard = [], []
+            for spec in specs:
+                v = np.load(spec["out"])
+                if v.shape != (spec["rows"],):
+                    raise SystemExit(
+                        f"prediction {spec['label']} returned {v.shape[0]} values for "
+                        f"{spec['rows']} sequences; refusing to rewrite the library")
+                parts.append(v)
+                with open(spec["timings"], encoding="utf-8") as fh:
+                    per_shard.append(json.load(fh))
+            values = np.concatenate(parts) if parts else np.empty(0, dtype=np.float64)
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            shutil.rmtree(work, ignore_errors=True)
+    return values, per_shard
+
+
+@contextlib.contextmanager
+def exit_on_termination_signals():
+    """While sharding, turn SIGTERM (and SIGHUP, SIGBREAK where they exist) into SystemExit.
+
+    Python's default SIGTERM action ends the process without unwinding, so no `finally`
+    runs: the shard children would outlive the parent and the scratch directory would stay
+    beside the library. The desktop application stops a run with SIGTERM to the process
+    group and SIGKILL 1.5 s later. A signal that is ignored (`nohup`) or already handled
+    is left alone, and every handler is restored on the way out.
+    """
+    def _raise_exit(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    previous = {}
+    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            if signal.getsignal(sig) is signal.SIG_DFL:
+                previous[sig] = signal.signal(sig, _raise_exit)
+        except (ValueError, OSError):  # not the main thread, or not settable here
+            continue
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+
+
+def _exit_when_the_parent_exits():
+    """In a shard: end this process once the parent's end of its stdin pipe closes.
+
+    The parent holds the write end of a pipe on each child's stdin and never writes to it.
+    However the parent ends (SIGKILL from the OOM killer, `taskkill /F`, a crash), the
+    operating system closes that end and the read returns, so a shard cannot keep
+    predicting on every core for a parent that is gone. It reads the raw descriptor rather
+    than `sys.stdin`, whose buffered reader holds a lock that would stall interpreter
+    shutdown while this thread waits. Runs on a daemon thread.
+    """
+    try:
+        while os.read(0, 4096):
+            pass
+    except OSError:
+        pass
+    print("prediction shard: the parent process is gone; stopping", file=sys.stderr,
+          flush=True)
+    os._exit(SHARD_ORPHANED_STATUS)
+
+
+def _wait_for_shards(procs):
+    """Wait for every shard; on the first failure stop the rest and fail the stage."""
+    while True:
+        alive = 0
+        for j, proc in enumerate(procs):
+            rc = proc.poll()
+            if rc is None:
+                alive += 1
+            elif rc != 0:
+                for other in procs:
+                    if other.poll() is None:
+                        other.kill()
+                for other in procs:
+                    other.wait()
+                raise SystemExit(
+                    f"prediction shard {j + 1}/{len(procs)} exited with status {rc}; its "
+                    f"output is above. The other shards were stopped and no library was "
+                    f"written.")
+        if alive == 0:
+            return
+        time.sleep(0.25)
+
+
+def shard_main(spec_path):
+    """One prediction shard (`--shard-worker <spec.json>`), started by `predict_sharded`."""
+    with open(spec_path, encoding="utf-8") as fh:
+        spec = json.load(fh)
+    if spec.get("watch_parent"):
+        # Only when `predict_sharded` started us: its stdin is the liveness pipe. A shard
+        # started by hand may have a terminal or /dev/null there, which is not.
+        threading.Thread(target=_exit_when_the_parent_exits, daemon=True).start()
+    torch.set_num_threads(max(1, int(spec["threads"])))
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+    t0 = time.perf_counter()
+    if spec.get("model"):
+        # A module saved whole by the parent from its own fine-tune; shards run only
+        # without a GPU (`shard_plan`), so it is mapped onto the CPU.
+        model = torch.load(spec["model"], map_location="cpu", weights_only=False)
+    else:
+        model = load_base_model()
+    t_load = time.perf_counter() - t0
+    calibration = None
+    if spec.get("calibration"):
+        with open(spec["calibration"], "rb") as fh:
+            calibration = pickle.load(fh)
+    uniq = pq.read_table(spec["seqs"]).column("seq").combine_chunks()
+    t1 = time.perf_counter()
+    values, timers = predict_values(uniq, model, calibration, int(spec["chunk"]),
+                                    label=spec["label"])
+    t_predict = time.perf_counter() - t1
+    np.save(spec["out"], values)
+    featurisation, forward = timers.totals()
+    with open(spec["timings"], "w", encoding="utf-8") as fh:
+        json.dump({
+            "shard": spec["shard"],
+            "rows": len(uniq),
+            "threads": torch.get_num_threads(),
+            "model_load": round(t_load, 3),
+            "predict": round(t_predict, 3),
+            "featurisation": featurisation,
+            "forward": forward,
+        }, fh)
+
+
 def ref_psms_for_transform(calibration, args):
     """A one-row reference for the transform-only calls, or None when not calibrating."""
     if calibration is None:
@@ -463,33 +1535,49 @@ def ref_psms_for_transform(calibration, args):
     return PSMList(psm_list=[PSM(peptidoform="PEPTIDEK", retention_time=0.0, spectrum_id="0")])
 
 
-def rewrite_irt(pform, orig, preds):
+def rewrite_irt(bases, orig, uniq, values):
     """The new `predicted_irt` column and a count of where each value came from.
 
-    A peptidoform with a finite prediction for its DECOY_-stripped sequence takes it. A
-    peptidoform without one keeps its imported value: rows with non-standard residues are
-    never sent to DeepLC (`is_std`), and a prediction that came back non-finite is an
-    unsupported input rather than a number. Both are counted so the mixture of RT sources
-    in the written library is explicit instead of silent (docs/30 R6). `base_pf` is
-    recomputed here rather than cached from the pass above on purpose: caching it would
-    retain one extra string per library row (hundreds of MB at library scale).
+    `bases` is the DECOY_-stripped sequence of every library row, `uniq` the sequences
+    that were predicted and `values` their predictions (float64, aligned with `uniq`). A
+    row whose sequence has a finite prediction takes it, rounded to float32. A row without
+    one keeps its imported value: rows with non-standard residues are never sent to DeepLC
+    (`is_std`), rows past `--predict-limit` were not predicted, and a prediction that came
+    back non-finite is an unsupported input rather than a number. Both kinds are counted so
+    the mixture of RT sources in the written library is explicit instead of silent (docs/30
+    R6). The counts and the column are what the per-row dictionary lookup gave; only the
+    lookup moved into Arrow (`index_in`), so a 1e7-row library is not walked in Python.
     """
-    n = len(pform)
-    new = np.empty(n, dtype=np.float32)
-    repredicted = 0
-    no_prediction = 0
-    non_standard = 0
-    for i, pf in enumerate(pform):
-        v = preds.get(base_pf(pf))
-        if v is None:
-            new[i] = orig[i]
-            non_standard += 1
-        elif not math.isfinite(v):
-            new[i] = orig[i]
-            no_prediction += 1
-        else:
-            new[i] = v
-            repredicted += 1
+    probe, value_set = bases, uniq
+    try:
+        # `index_in` needs one string type on both sides. The library column is usually
+        # `string`; the unique set is large_string (see `unique_standard_bases`) and is
+        # narrowed when it fits, else the probe is widened.
+        value_set = uniq.cast(bases.type)
+    except (pa.ArrowInvalid, pa.ArrowCapacityError, OverflowError):
+        probe = bases.cast(pa.large_string())
+    pos = pc.fill_null(pc.index_in(probe, value_set=value_set), -1)
+    pos = np.asarray(pos.to_numpy(), dtype=np.int64)
+    return rewrite_positions(orig, pos, values, len(uniq))
+
+
+def rewrite_positions(orig, pos, values, n_uniq):
+    """`rewrite_irt` from each row's position in the predicted set (-1 = not in it).
+
+    A position at or past `n_uniq` counts as not found, which is what a set cut short by
+    `--predict-limit` gives a sequence past the limit.
+    """
+    n = len(orig)
+    pos = np.where(pos < n_uniq, pos, -1)
+    found = pos >= 0
+    vals = np.full(n, np.nan, dtype=np.float64)
+    vals[found] = values[pos[found]]
+    good = np.isfinite(vals)  # NaN where not found, so this is found AND finite
+    new = orig.astype(np.float32, copy=True)
+    new[good] = vals[good].astype(np.float32)
+    repredicted = int(good.sum())
+    non_standard = int(n - found.sum())
+    no_prediction = int(found.sum()) - repredicted
     return new, {
         "rows": n,
         "repredicted": repredicted,
@@ -500,4 +1588,7 @@ def rewrite_irt(pform, orig, preds):
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 3 and sys.argv[1] == "--shard-worker":
+        shard_main(sys.argv[2])
+    else:
+        main()

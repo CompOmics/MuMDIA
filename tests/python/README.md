@@ -39,7 +39,7 @@ environment therefore reports "sklearn is not usable here: PydanticUserError:
 
 | needs | skips | unlocks |
 |---|---|---|
-| nothing | never | `test_mbr_worker.py`, `test_import_diann_lib.py`, `test_decoy_builders.py`, the static half of `test_predictor_workers.py` |
+| nothing | never | `test_mbr_worker.py`, `test_import_diann_lib.py`, `test_decoy_builders.py`, `test_gen_config_reference.py`, the static half of `test_predictor_workers.py` |
 | scikit-learn | `test_entrapment_worker.py` | the entrapment rescorer |
 | mokapot | `test_mokapot_worker.py` | mokapot coverage + model selection |
 | torch | `test_nn_rescore_worker.py` | `nn_torch` coverage, three input paths |
@@ -101,6 +101,33 @@ feature table, and the streaming memmap backend, which must also delete its
 `<out>.feat.mm`. Plus: `q_value` written as zeros (the engine computes q),
 targets outscore decoys (so the scores are aligned to the rows), a single-class
 PIN exits nonzero, and an unknown `MUMDIA_NN_FEATURES` name aborts.
+
+The worker's default-path speed-ups must not move a score. The worker is run with
+every switch back to the replaced code (`MUMDIA_NN_FINAL_POOL_SCORE=1`,
+`MUMDIA_NN_GATHER=numpy`, `MUMDIA_NN_SCAN_THREADS=1`, `MUMDIA_NN_LOAD_THREADS=0`,
+`MUMDIA_NN_SELECT=full`) and with the defaults, for the in-memory and the streaming
+backend; and the worker as it was before those changes, extracted with `git show`
+from `REFERENCE_COMMIT`, is run against the current one, for the in-memory,
+streaming and TSV paths (skipped when the clone lacks that commit). The score bytes
+must be equal, on a pool with several row groups, non-finite cells, a float64
+overflow column, nulls, ties, a constant column and subnormal cells, and the default
+arm must run the threaded init scan (`MUMDIA_NN_SCAN_ROWS_PER_THREAD=500`). These are
+comparisons on one host, not committed hashes, so they hold on any CPU. When a later
+change moves the default scores on purpose, move `REFERENCE_COMMIT` to the commit that
+made it. Under flush-to-zero the threaded fill, standardisation and init scan must
+match the serial code on inputs where the thread state decides the bytes, and the
+MLP forward of a production-shape scoring batch (16,384 x 387) must not depend on
+the address of its input (the worker's reused numpy-allocated buffer and a 64-byte
+aligned `torch.empty` one against the numpy fancy index, and views 4 to 48 bytes past a
+64-byte boundary). `MUMDIA_NN_PARALLEL` must give the same
+bytes for one and three processes, for all three paths, and neither it nor a failing
+run may leave the memmap or its side arrays behind; a failing child's log must reach
+the worker's stderr. Without torch: the threaded load reproduces the serial loop's
+matrix, moments, mean and std bytes, and a single-threaded load releases its moment
+buffer; the threaded init scan returns the serial (column, sign, count), and its
+thread count respects the row and memory caps; `desc_order` equals the stable
+descending argsort (ties, +-0.0, infinities, subnormals, signed NaN); and the windowed
+positive selection equals the full `tda_q` selection or declines.
 
 ### `test_mokapot_worker.py` (needs mokapot)
 
@@ -166,6 +193,23 @@ three workers carry the `__main__` guard the Windows `spawn` start method needs,
 and - with the packages installed - that a fresh interpreter really can import
 each worker and that MS2PIP emits `id`/`ion_type`/1-based `ordinal`/linear
 `intensity`.
+
+### `test_gen_config_reference.py` (no dependency, always runs)
+
+Not a worker test: it covers `ci/gen_config_reference.py`, which scans the sidecars and
+the crates for environment reads. The generator cites each read as `path::function`
+rather than `path:line`, because a cited line made `docs/24_config_reference.md` and
+`configs/config-schema.json` stale on every merge that moved lines in a large file. On
+synthetic Rust and Python sources it asserts the citation (`Type::method`,
+`Trait::method`, `module::function`, `outer::inner`, `Class.method`, `<module>`, a
+`fn` inside a string opening no scope, a `#[cfg(test)]` read left out) and that
+inserting blank lines changes no site. A Rust file whose braces do not balance after
+its literals and comments are masked is rejected with an error naming the file. On the
+committed inputs it asserts that the reference and the schema are unchanged with blank
+lines inserted into every file, and that neither carries a line number. A negative test
+makes the Rust and then the Python citation carry the position of the read and asserts
+that the check reports it, so the invariance check cannot pass because the shifting
+became a no-op.
 
 ## Conventions
 

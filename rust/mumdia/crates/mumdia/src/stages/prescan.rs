@@ -142,12 +142,18 @@ impl Alphabet {
         Some(out)
     }
 
-    /// Trimers covering an anchored (modified) position, in both b and y orientation.
+    /// Trimers covering an anchored (modified) position, in both b and y orientation, sorted
+    /// and without repeats.
     ///
     /// Anchoring is the point: a trimer elsewhere in the peptide is evidence for the backbone, not
     /// for the modification, and would let unmodified signal keep a modified hypothesis alive.
-    fn anchored_tris(&self, idx: &[usize]) -> HashSet<Tri> {
-        let mut tris = HashSet::new();
+    ///
+    /// A sorted `Vec` rather than the per-candidate SipHash `HashSet` it was: a candidate holds
+    /// a handful of trimers, and the screen only walks them, so building a hash table per
+    /// candidate (hundreds of millions of them on a modification-expanded library) cost more
+    /// than the membership it served. The set of trimers is the same.
+    fn anchored_tris(&self, idx: &[usize]) -> Vec<Tri> {
+        let mut tris = Vec::new();
         let l = idx.len();
         for p in 0..l {
             if !self.anchor_all && !self.anchor.contains(&idx[p]) {
@@ -156,11 +162,13 @@ impl Alphabet {
             for a in p.saturating_sub(2)..=p {
                 if a + 2 < l {
                     let t = (idx[a] as u32, idx[a + 1] as u32, idx[a + 2] as u32);
-                    tris.insert(t);
-                    tris.insert((t.2, t.1, t.0));
+                    tris.push(t);
+                    tris.push((t.2, t.1, t.0));
                 }
             }
         }
+        tris.sort_unstable();
+        tris.dedup();
         tris
     }
 }
@@ -179,6 +187,50 @@ fn parse_mod_spec(spec: &str) -> Result<(u8, String)> {
 
 /// One trimer tag: three alphabet indices in sequence order.
 type Tri = (u32, u32, u32);
+
+/// The isolation windows sorted by lower bound, for "which windows hold this m/z" by binary
+/// search. A window holds `m` when `lower <= m && m < upper`, the test the screen always
+/// applied; a window with a NaN bound holds nothing under that test and is left out.
+struct WindowLookup {
+    /// `(lower, upper, window_id)`, ascending by `lower`.
+    sorted: Vec<(f64, f64, u32)>,
+    /// Running maximum of `upper` over `sorted[..=j]`: once it is `<= m`, no earlier window
+    /// can hold `m`.
+    upper_max: Vec<f64>,
+}
+
+impl WindowLookup {
+    fn new(id: &[u32], lower: &[f64], upper: &[f64]) -> WindowLookup {
+        let mut sorted: Vec<(f64, f64, u32)> = (0..id.len())
+            .filter(|&w| !lower[w].is_nan() && !upper[w].is_nan())
+            .map(|w| (lower[w], upper[w], id[w]))
+            .collect();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2)));
+        let mut run = f64::NEG_INFINITY;
+        let upper_max = sorted
+            .iter()
+            .map(|w| {
+                run = run.max(w.1);
+                run
+            })
+            .collect();
+        WindowLookup { sorted, upper_max }
+    }
+
+    /// Call `f(window_id)` for every window holding `m`, stopping when `f` returns true.
+    fn containing(&self, m: f64, mut f: impl FnMut(u32) -> bool) {
+        let k = self.sorted.partition_point(|w| w.0 <= m);
+        for j in (0..k).rev() {
+            if self.upper_max[j] <= m {
+                break;
+            }
+            let (lo, hi, wid) = self.sorted[j];
+            if lo <= m && m < hi && f(wid) {
+                return;
+            }
+        }
+    }
+}
 /// Index cell key: (isolation window id, RT bin).
 type Cell = (u32, i64);
 /// Observed trimer tags per (isolation window, RT bin).
@@ -317,13 +369,19 @@ pub fn run(p: PrescanParams) -> Result<u64> {
     let w_id = win.u32("window_id")?;
     let w_lo = win.f64("lower")?;
     let w_hi = win.f64("upper")?;
+    let windows = WindowLookup::new(&w_id, &w_lo, &w_hi);
 
     // ---- library + per-candidate RT bounds ----
+    // The peptidoform text as one arena and the label interned: `Vec<String>` held one heap
+    // block per precursor for each (26 s and 12 GB at 59M candidates), and the label only
+    // feeds a target/decoy count and the survivors' own label column.
     let lib = TableFile::open(p.library_precursors)?;
     let cid = lib.u32("candidate_id")?;
-    let pform = lib.str("peptidoform")?;
+    let (pform_off, pform_data) = lib.str_flat("peptidoform")?;
+    let pform = |i: usize| &pform_data[pform_off[i]..pform_off[i + 1]];
     let pmz = lib.f64("precursor_mz")?;
-    let label = lib.str("label")?;
+    let (label_id, label_dict) = lib.str_interned("label")?;
+    let label = |i: usize| label_dict[label_id[i] as usize].as_str();
     let rw = TableFile::open(p.run_windows)?;
     let r_cid = rw.u32("candidate_id")?;
     let r_lo = rw.f64("rt_lo")?;
@@ -354,7 +412,7 @@ pub fn run(p: PrescanParams) -> Result<u64> {
             // Decoy peptidoforms carry a "DECOY_" prefix that is not part of the sequence. Failing
             // to strip it makes every decoy untokenisable, which would silently screen targets
             // only and reintroduce the exchangeability bug this stage exists to avoid.
-            let pf = pform[i].strip_prefix("DECOY_").unwrap_or(&pform[i]);
+            let pf = pform(i).strip_prefix("DECOY_").unwrap_or(pform(i));
             let idx = alpha.tokenise(pf)?;
             let tris = alpha.anchored_tris(&idx);
             if tris.is_empty() {
@@ -382,19 +440,18 @@ pub fn run(p: PrescanParams) -> Result<u64> {
                 (bin_min, bin_max)
             };
             let m = pmz[i];
-            for w in 0..win.nrows {
-                if !(w_lo[w] <= m && m < w_hi[w]) {
-                    continue;
-                }
-                for b in b0..=b1 {
-                    if let Some(o) = obs.get(&(w_id[w], b)) {
-                        if tris.iter().any(|t| o.contains(t)) {
-                            return Some((cid[i], label[i].as_str()));
-                        }
-                    }
-                }
-            }
-            None
+            // The windows holding `m` (`lower <= m < upper`), found from the sorted lower
+            // bounds instead of testing every window. The screen is an existence test, so
+            // the order the windows are visited in does not matter.
+            let mut found = false;
+            windows.containing(m, |wid| {
+                found = (b0..=b1).any(|b| {
+                    obs.get(&(wid, b))
+                        .is_some_and(|o| tris.iter().any(|t| o.contains(t)))
+                });
+                found
+            });
+            found.then(|| (cid[i], label(i)))
         })
         .collect();
     // Deterministic output: rayon collects in index order, but sorting makes the artifact
@@ -584,6 +641,66 @@ mod tests {
         let tri = spectrum_trimers(&mz, &a, 0.005);
         let ia = a.plain[&b'A'] as u32;
         assert!(tri.contains(&(ia, ia, ia)));
+    }
+
+    /// The window lookup reports exactly the windows the linear `lower <= m < upper` scan
+    /// accepted, over overlapping, nested, touching, infinite and NaN-bounded windows.
+    #[test]
+    fn the_window_lookup_finds_the_windows_the_linear_scan_found() {
+        let id: Vec<u32> = (0..9).collect();
+        let lower = vec![
+            400.0,
+            425.0,
+            425.0,
+            600.0,
+            f64::NEG_INFINITY,
+            700.0,
+            f64::NAN,
+            450.0,
+            800.0,
+        ];
+        let upper = vec![
+            450.0,
+            450.0,
+            1000.0,
+            625.0,
+            410.0,
+            700.0,
+            900.0,
+            f64::NAN,
+            f64::INFINITY,
+        ];
+        let lookup = WindowLookup::new(&id, &lower, &upper);
+        let mut m = 350.0;
+        while m < 1200.0 {
+            let mut want: Vec<u32> = (0..id.len())
+                .filter(|&w| lower[w] <= m && m < upper[w])
+                .map(|w| id[w])
+                .collect();
+            let mut got: Vec<u32> = Vec::new();
+            lookup.containing(m, |w| {
+                got.push(w);
+                false
+            });
+            want.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(got, want, "m = {m}");
+            m += 2.5;
+        }
+        for m in [f64::NAN, 450.0, 425.0, 700.0] {
+            let mut got: Vec<u32> = Vec::new();
+            lookup.containing(m, |w| {
+                got.push(w);
+                false
+            });
+            let mut want: Vec<u32> = (0..id.len())
+                .filter(|&w| lower[w] <= m && m < upper[w])
+                .map(|w| id[w])
+                .collect();
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(got, want, "m = {m}");
+        }
     }
 
     #[test]

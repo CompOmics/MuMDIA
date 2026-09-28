@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use mumdia_core::config::{DecoyStrategy, DigestConfig, Enzyme};
 use mumdia_core::constants::is_standard_residue;
 use mumdia_core::schema::artifact;
-use mumdia_io::report::ArtifactReport;
+use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{write_table, Col};
 use serde_json::json;
 use tracing::{info, warn};
@@ -203,6 +203,12 @@ pub struct DigestParams<'a> {
 }
 
 pub fn run(p: DigestParams) -> Result<u64> {
+    run_hashed(p).map(|w| w.rows)
+}
+
+/// [`run`], returning the output's row count and the content hash its report records, so
+/// an orchestrator can record the artifact without reading and hashing it again.
+pub fn run_hashed(p: DigestParams) -> Result<Written> {
     let t0 = Instant::now();
     let proteins = read_fasta(p.fasta)?;
     info!(proteins = proteins.len(), "digest: read fasta");
@@ -330,7 +336,7 @@ pub fn run(p: DigestParams) -> Result<u64> {
         "dropped_target_decoy_pairs".to_string(),
         json!(dropped_pairs),
     );
-    ArtifactReport {
+    let report = ArtifactReport {
         logical_name: artifact::PEPTIDES.0.to_string(),
         schema_name: artifact::PEPTIDES.0.to_string(),
         schema_version: artifact::PEPTIDES.1,
@@ -348,8 +354,8 @@ pub fn run(p: DigestParams) -> Result<u64> {
         stats,
         model_identity: None,
         elapsed_ms: elapsed,
-    }
-    .write_for(p.out)?;
+    };
+    report.write_for(p.out)?;
 
     info!(
         targets = n_targets,
@@ -358,7 +364,7 @@ pub fn run(p: DigestParams) -> Result<u64> {
         elapsed_ms = elapsed,
         "digest: done"
     );
-    Ok(rows)
+    Ok(report.written())
 }
 
 #[cfg(test)]

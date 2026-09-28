@@ -95,6 +95,8 @@ pub fn run(p: RefitParams) -> Result<RefitOut> {
                 p.cfg.rt_im_train.q_train,
                 p.cfg.rt_im_train.window_holdout_frac,
                 rayon::current_num_threads(),
+                p.cfg.rt_im_train.deeplc_predict_shards,
+                p.cfg.rt_im_train.deeplc_projection_cache.as_deref(),
             )?;
             fold_libs.push(out);
         }
@@ -107,6 +109,7 @@ pub fn run(p: RefitParams) -> Result<RefitOut> {
 
     let refit_windows = d("run_windows_refit.parquet");
     rt_im_train::run(rt_im_train::RtImTrainParams {
+        precursor_span: None,
         anchor_irt_from_seed: false,
         seed_psms: &seed,
         library_precursors: &lib,

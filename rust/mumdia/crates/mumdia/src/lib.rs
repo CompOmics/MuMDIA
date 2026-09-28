@@ -3,18 +3,23 @@
 //! lets integration tests drive stages directly (docs/01_overview_and_dataflow.md).
 
 pub mod calibrate;
+pub mod chromatograms;
+pub mod colread;
 pub mod fdr;
 pub mod groups;
 pub mod index;
+pub mod library_cache;
 pub mod masscal;
 pub mod matchers;
 pub mod memlog;
 pub mod peaks;
 pub mod predict;
+pub mod prestage;
 pub mod python;
 pub mod quant_lfq;
 pub mod raw;
 pub mod rescoring;
+pub mod sched;
 pub mod sidecar;
 pub mod solve;
 pub mod spectra;
