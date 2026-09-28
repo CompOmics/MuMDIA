@@ -992,6 +992,69 @@ peptides, 1,721 protein groups, decoy fraction 0.99%, the prototype's numbers ex
 Wall 17:23 against 14:19 with the key off (+21%), peak RSS 8.9 against 8.7 GB. The
 fixture smoke passes, and the refit paths of `run` and `run-experiment` complete on it.
 
+**L1d on HYE diaPASEF: the multi-head refit is unstable (2026-09-27).** One six-run
+`mumdia run` (dispatched to `run-experiment`) of the best arm with `rt_im_train.refit`: the
+ProteoBench HYE diaPASEF config with m/z valley 0.5 / 8 ppm, mobility valley 0.5 / 8 scans
+and `search_seed.unique_fragment_matches`. Wall 8:10:32, peak RSS 92.4 GB. Outputs in
+`/public/local/ProteoBench/HYE_diaPASEF_mumdia/l1d`; ProteoBench inputs
+`proteobench_pass1/custom_input.tsv` (pass 1, per-run quant gated on the pooled `q_value`) and
+`proteobench_pass2/custom_input.tsv`. The pass-2 file is not a valid L1d measurement.
+
+| run | target PSMs at `run_psm_q` 1%, pass 1 | pass 2 | in-sample LOESS residual, pass 1 / pass 2 |
+|---|---|---|---|
+| A01 | 63,307 | 66,535 | 7.5 / 4.4 s |
+| A02 | 63,632 | 57,731 | 7.7 / 9.1 s |
+| A03 | 64,522 | 66,089 | 7.5 / 6.9 s |
+| B01 | 63,670 | 64,638 | 7.4 / 8.5 s |
+| B02 | 64,331 | 68,320 | 7.5 / 3.9 s |
+| B03 | 64,362 | 28,334 | 7.7 / 50.9 s |
+
+Cause (notebook `refit_instability/refit_instability.ipynb` in the output directory, on the
+real tables):
+- The cross-fitted 80-head refit gives some library rows absurd iRTs (-1.9e5 to 3.8e5 s on a
+  3,500 s gradient). The two fold fits disagree by more than 300 s on 733,710 of 14,731,188 HYE
+  rows (5.0%), against 1,023 of 1,333,950 on E. coli (0.08%).
+- The absurd values come from the per-head spline in DeepLC's `MultiHeadRidgeCalibration`
+  (`SplineTransformerCalibration`, degree 4, `n / 500 + 5` evenly spaced knots, no penalty).
+  At 29,419 anchors (63 knots) one head's spline reaches 2e5 s at the sparse top end of its
+  anchor range; at 11,357 anchors (27 knots) it stays inside the gradient.
+- The ridge that combines the heads selects its penalty by leave-one-out and chose 0.001, the
+  smallest value on its grid, for the 29,419-anchor fold fit (pass-1 fit on 11,357 seed
+  anchors: 1e5). Over subsets of the fold anchors the choice is erratic (2,000: 1e5; 5,000:
+  1e2; 11,357: 1e-3; 20,000: 1e3), and the share of a 10,000-peptidoform library sample outside
+  0-7,200 s rises from 0 to 2.8%.
+- In rt-im-train, 11 of 64,362 B03 anchors carry such values. The LOESS grid spans the anchor
+  iRT range evenly, so the gradient falls into one or two grid cells, and the curve is offset by
+  a median 51 s against a 38.7 s median half-width.
+
+Fix 1, `rt_im_train.robust_calibration` (default false; docs/08 section 8): outlying anchors are
+removed before the fit. Standalone rt-im-train on the six pass-2 pseudo-seeds: in-sample
+residuals 3.7 to 4.0 s in every run, 362 to 489 anchors removed (0.6-0.8%), linear slope about
+1.00 (0.03 to 0.13 without it); key off identical to the run's windows.
+The absurd library iRTs themselves remain, for 1.95% of target and 1.97% of decoy rows of the
+cross-fitted library (pass 1: 0.001%), so the loss is symmetric and does not bias the decoy
+estimate; only 11 of 64,362 B03 pass-1 identifications are among them. A change in the DeepLC
+calibration (fix 2) would remove them; not started.
+
+Pass 2 with fix 1 (2026-09-28): the pass-2 chain rerun from the pass-1 artifacts of the same
+experiment, with the robust rt-im-train refit, the new centres and the pass-1 half-widths, then
+extract, features (original seed), compete, one pooled rescore, split by `source` and per-run
+quant gated on the pooled `q_value`. Scripts and outputs in `l1d/pass2_robust`; ProteoBench input
+`l1d/pass2_robust/proteobench/custom_input.tsv`. Here the robust fit applies to the pass-2 refit
+only; an engine run with the key on also applies it to the pass-1 fit, whose anchors were clean
+(7.5 s residual). One `nn_torch` seed, experiment-wide q columns at 1%:
+
+| arm | precursors (`precursor_q`) | peptides (`peptide_q_value`) | PGs (`pg_q_value`) | decoy fraction | target PSMs per run at `run_psm_q` 1% |
+|---|---|---|---|---|---|
+| m/z valley only (earlier) | 74,775 | 67,768 | 9,814 | 0.99% | 57,717-59,041 |
+| pass 1: m/z and mobility valley, seed key | 81,265 | 73,169 (+8.0%) | 10,303 | 0.99% | 63,307-64,522 |
+| **pass 2 with fix 1** | **86,048** | **77,734 (+6.2% over pass 1, +14.7% over m/z valley)** | **10,657** | 0.99% | 67,573-69,288 |
+
+Per-run ions in the ProteoBench input: 67,556 to 69,164 (pass 1: 63,349 to 64,634), even over
+the six runs. Wall of the pass-2 chain: extract 8-9 min, features 4-5 min, compete 1.6 min per
+run, pooled rescore 56 min. On E. coli L1d gave +3.8% in peptides (3 seeds), here +6.2% (one
+seed, no entrapment on this set).
+
 ## 3. Levers, ranked by the population they address
 
 Each lever is:

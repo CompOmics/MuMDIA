@@ -874,6 +874,15 @@ pub struct RtImTrainConfig {
     /// again. Pass-1 artifacts go to `<out>/pass1/`. Single-run and ungrouped
     /// `run-experiment` only. Default false: nothing changes. Benchmark-gated.
     pub refit: bool,
+    /// Drop outlying RT anchors before the calibration fit: a first LOESS on the anchors
+    /// inside the central 99% of predicted iRT, then every anchor whose residual lies more
+    /// than 6 robust SDs from the median is removed, and the curve, the window sizing and
+    /// the reported residuals use the rest (`cal.json` `n_rt_outliers_removed`). A few
+    /// anchors with an absurd predicted iRT otherwise stretch the LOESS grid until the
+    /// gradient sits in one or two cells: on one HYE run of the `refit` pass, 11 of 58k
+    /// anchors moved the curve by 51 s (TIMS roadmap part 2). Default false: unchanged.
+    /// Benchmark-gated.
+    pub robust_calibration: bool,
 }
 
 /// Source of `predicted_irt` for an imported library; see `RtImTrainConfig::library_irt`.
@@ -965,7 +974,8 @@ impl Default for RtImTrainConfig {
             im_window_multiplier: 1.0,
             im_window_min: 0.005,
             im_window_holdout_frac: 0.3,
-            refit: false, // off; benchmark-gated
+            refit: false,              // off; benchmark-gated
+            robust_calibration: false, // off; benchmark-gated
         }
     }
 }

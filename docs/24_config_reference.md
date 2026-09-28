@@ -59,7 +59,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`peptidoforms`](#peptidoforms) | `PeptidoformsConfig` | 7 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`predict_frag`](#predict_frag) | `PredictFragConfig` | 15 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
 | [`search_seed`](#search_seed) | `SearchSeedConfig` | 12 | [docs/07_search_seed.md](07_search_seed.md) |
-| [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 23 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
+| [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 24 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
 | [`extract`](#extract) | `ExtractConfig` | 37 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
 | [`features`](#features) | `FeaturesConfig` | 12 | [docs/10_features.md](10_features.md) |
@@ -73,7 +73,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 
 ## (top level)
 
-`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:2125). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
+`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:2135). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -237,10 +237,11 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 | `im_window_min` | `f64` | `0.005` |  | Lower clamp for the IM half-window, V s cm^-2. |
 | `im_window_holdout_frac` | `f64` | `0.3` |  | Fraction of anchor peptides held out to size `w_im` (the `window_holdout_frac` rule, keyed on `base_peptide_id`). IM is sized held-out from the start: in-sample residuals are optimistic and can rank models backwards (docs/08 section 4). Must lie in (0, 0.9]. |
 | `refit` | `bool` | `false` | benchmark-gated | Second pass on the pass-1 identifications (TIMS roadmap part 2, L1d). After pass 1 is rescored, its accepted targets (PSM `q_value` at most `q_train`) become a pseudo-seed; under multi-head calibration the 80-head fit is refitted on it, cross-fitted over two folds of base peptides (each candidate takes the fold it was not fitted on); rt-im-train is refitted on it, and its new RT and IM centres are used with the pass-1 half-widths (the refit widths are truncated by selection and lost 4%). Extract, features (with the original seed), compete and rescore then run again. Pass-1 artifacts go to `<out>/pass1/`. Single-run and ungrouped `run-experiment` only. Default false: nothing changes. Benchmark-gated. |
+| `robust_calibration` | `bool` | `false` | benchmark-gated | Drop outlying RT anchors before the calibration fit: a first LOESS on the anchors inside the central 99% of predicted iRT, then every anchor whose residual lies more than 6 robust SDs from the median is removed, and the curve, the window sizing and the reported residuals use the rest (`cal.json` `n_rt_outliers_removed`). A few anchors with an absurd predicted iRT otherwise stretch the LOESS grid until the gradient sits in one or two cells: on one HYE run of the `refit` pass, 11 of 58k anchors moved the curve by 51 s (TIMS roadmap part 2). Default false: unchanged. Benchmark-gated. |
 
 ## extract
 
-`ExtractConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:975). stage document: [docs/09_extract.md](09_extract.md).
+`ExtractConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:985). stage document: [docs/09_extract.md](09_extract.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -300,7 +301,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## features
 
-`FeaturesConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1298). stage document: [docs/10_features.md](10_features.md).
+`FeaturesConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1308). stage document: [docs/10_features.md](10_features.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -319,7 +320,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## compete
 
-`CompeteConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1386). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
+`CompeteConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1396). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -332,7 +333,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## rescore
 
-`RescoreConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1751). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
+`RescoreConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1761). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -361,7 +362,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## quant
 
-`QuantConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1565). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
+`QuantConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1575). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -385,7 +386,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## mbr
 
-`MbrConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1704). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
+`MbrConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1714). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -401,7 +402,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## experiment
 
-`ExperimentConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:2023). stage document: [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md).
+`ExperimentConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:2033). stage document: [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md).
 
 Options for the experiment-wide orchestrator (`mumdia run-experiment`).
 
@@ -412,7 +413,7 @@ Options for the experiment-wide orchestrator (`mumdia run-experiment`).
 
 ## groups
 
-`GroupsConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:2093).
+`GroupsConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:2103).
 
 Searching a run one isolation-window group at a time. A group of isolation windows can only select precursors whose m/z lies in the group's band, so its seed, calibration, extract, features and compete need only that band of the library (`Library::load_with_fragment_offset`): the library, the hit accumulator and the accepted rows are all one band's worth instead of the whole run's, which is what bounds the memory of a search against a library of 10^8 precursors. Only rescore, quant and report see everything, after the group artifacts are pooled with library-wide ids. The groups run one after another in this process; `docs/33_window_groups.md` has the layout and the measurements.
 
@@ -475,7 +476,7 @@ Reader for timsTOF `.d` input (`convert.bruker_reader`).
 
 ### `CompeteGroupBy`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1453)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1463)
 
 | Value | Default | Description |
 |---|---|---|
@@ -485,7 +486,7 @@ Reader for timsTOF `.d` input (`convert.bruker_reader`).
 
 ### `CompetitionMode`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1432)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1442)
 
 Within-group competition resolution (spec 04 §6). Only `WinnerTakeAll` removes candidates unconditionally; the others preserve candidates the rescorer can still discriminate, which is the sensitivity program's central principle ("preserve candidate evidence until the workflow can make a calibrated decision"). Target/decoy labels remain part of the competition key in every mode, so a target never competes against its own decoy (the null is preserved).
 
@@ -510,7 +511,7 @@ Within-group competition resolution (spec 04 §6). Only `WinnerTakeAll` removes 
 
 ### `DecoyTransfer`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1695)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1705)
 
 Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence` transfers reverse/scramble decoys at the same expected RT; `PermutedRt` transfers real precursors to a decoupled (wrong) expected RT; `Both` combines them. The prototype's shuffled-RT null gave a ~0.6% in-window false rate vs 66.6% true (113x separation), so the transfer q-value is well-calibrated.
 
@@ -531,7 +532,7 @@ Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence` trans
 
 ### `FeaturePreset`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1887)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1897)
 
 Named feature list for `RescoreConfig::feature_preset`.
 
@@ -562,7 +563,7 @@ Named feature list for `RescoreConfig::feature_preset`.
 
 ### `FragmentSelection`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1630)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1640)
 
 Fragment ranking for the quant top-N sum. See `QuantConfig::fragment_selection`.
 
@@ -573,7 +574,7 @@ Fragment ranking for the quant top-N sum. See `QuantConfig::fragment_selection`.
 
 ### `GateMode`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1271)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1281)
 
 Spectral-agreement score the extraction acceptance gate (`gate_min_score`) thresholds. All are computed at the gate from data already in hand.
 
@@ -587,7 +588,7 @@ Spectral-agreement score the extraction acceptance gate (`gate_min_score`) thres
 
 ### `GroupCalibration`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:2069)
+(rust/mumdia/crates/mumdia-core/src/config.rs:2079)
 
 Which anchors the retention-time calibration of a window group is fitted on.
 
@@ -598,7 +599,7 @@ Which anchors the retention-time calibration of a window group is fitted on.
 
 ### `Handoff`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1993)
+(rust/mumdia/crates/mumdia-core/src/config.rs:2003)
 
 How the feature matrix crosses the Rust -> Python boundary for a sidecar rescorer.
 
@@ -609,7 +610,7 @@ How the feature matrix crosses the Rust -> Python boundary for a sidecar rescore
 
 ### `ImGate`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1178)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1188)
 
 Extraction IM gate mode; see `ExtractConfig::im_gate`.
 
@@ -632,7 +633,7 @@ Source of the library's `predicted_im` (1/K0) in FASTA mode.
 
 ### `LibraryIrt`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:882)
+(rust/mumdia/crates/mumdia-core/src/config.rs:891)
 
 Source of `predicted_irt` for an imported library; see `RtImTrainConfig::library_irt`.
 
@@ -655,7 +656,7 @@ Fragment-matcher backend for search-seed and extract (docs/06_predict_frag_index
 
 ### `MbrStrategy`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1676)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1686)
 
 Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.md). Default `None` reproduces the current chain byte-for-byte. ONLY `None` VS NOT-`None` IS IMPLEMENTED. The three non-`None` variants are described below as the intended staging, but no code distinguishes them: every test in the tree is `strategy != None`, so selecting `RtTransfer` or `Full` today behaves exactly like `EmpiricalLibrary`. They are kept as the recorded design ladder rather than deleted because the MBR tier is planned and benchmark-gated (CLAUDE.md); `validate()` warns when a non-`None` variant is selected so a config cannot quietly expect more than it gets. Intended staging: `EmpiricalLibrary` builds the consensus anchor library only; `RtTransfer` adds cross-run expected-RT transfer extraction; `Full` adds requantification. All require >= 2 runs and a decoy-transfer FDR (see the plan).
 
@@ -668,7 +669,7 @@ Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.
 
 ### `NegSelect`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1898)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1908)
 
 Which decoys survive the training-set negative cap.
 
@@ -698,7 +699,7 @@ Fragment-peak apportionment when one observed MS2 peak matches the fragments of 
 
 ### `PeakWindowMode`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1489)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1499)
 
 How the elution-peak integration window is chosen per candidate in quant.
 
@@ -709,7 +710,7 @@ How the elution-peak integration window is chosen per candidate in quant.
 
 ### `QuantQColumn`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1544)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1554)
 
 Which q-value column quant filters candidates on. Peptide- or precursor-level q is appropriate for a single-run rescore. Under experiment-wide rescoring, those grouped q-values are pooled and carried only on the best PSM across all runs, so filtering per-run slices on them creates disjoint quant sets. `RunPsmQ` is the run-local FDR gate for that cross-run workflow; `PsmQ` keeps the pooled per-PSM gate available when that is explicitly intended.
 
@@ -734,7 +735,7 @@ Which q-value column quant filters candidates on. Peptide- or precursor-level q 
 
 ### `RollupMethod`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1478)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1488)
 
 | Value | Default | Description |
 |---|---|---|
@@ -743,7 +744,7 @@ Which q-value column quant filters candidates on. Peptide- or precursor-level q 
 
 ### `RtLibraryScope`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1956)
+(rust/mumdia/crates/mumdia-core/src/config.rs:1966)
 
 How many DeepLC fine-tunes an experiment pays for.
 
@@ -959,6 +960,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-19 structs and 217 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 29 enumerations, 1 named profile(s), 69 environment variables read and 19 set.
+19 structs and 218 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 29 enumerations, 1 named profile(s), 69 environment variables read and 19 set.
 
-30 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+31 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

@@ -17,7 +17,7 @@ use mumdia_io::table::{write_table, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::calibrate::{linear_fit, percentile, Loess};
+use crate::calibrate::{linear_fit, percentile, robust_inliers, Loess};
 
 pub struct RtImTrainParams<'a> {
     pub seed_psms: &'a str,
@@ -216,6 +216,34 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         }
     }
     let (anchor_ids, train_irt, train_rt) = sorted_anchor_vectors(best_per_pep);
+    // `robust_calibration`: drop anchors far off a first fit before anything below uses
+    // them (the curve, the window sizing and the reported residuals).
+    let mut n_rt_outliers: Option<usize> = None;
+    let (anchor_ids, train_irt, train_rt) =
+        if p.cfg.robust_calibration && train_irt.len() >= p.cfg.min_seed_for_calibration.max(4) {
+            let keep = robust_inliers(&train_irt, &train_rt, p.cfg.loess_span, 200);
+            let pick = |v: &[f64]| -> Vec<f64> {
+                v.iter()
+                    .zip(&keep)
+                    .filter(|(_, k)| **k)
+                    .map(|(x, _)| *x)
+                    .collect()
+            };
+            let ids: Vec<u32> = anchor_ids
+                .iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(x, _)| *x)
+                .collect();
+            n_rt_outliers = Some(keep.iter().filter(|k| !**k).count());
+            info!(
+                removed = n_rt_outliers,
+                "rt-im-train: robust calibration dropped outlying RT anchors"
+            );
+            (ids, pick(&train_irt), pick(&train_rt))
+        } else {
+            (anchor_ids, train_irt, train_rt)
+        };
 
     // IM anchors: the same confident targets, one per candidate (the seed table already
     // holds one row per candidate), because 1/K0 depends on charge where RT does not.
@@ -543,9 +571,7 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
         };
 
     // cal.json
-    mumdia_io::json::write_json(
-        p.out_cal,
-        &json!({
+    let mut cal_json = json!({
             "method": method,
             "slope": slope_report,
             "intercept": intercept_report,
@@ -589,8 +615,12 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
             "im_holdout_resid_abs_median": im_cal.as_ref().and_then(|c| c.holdout_abs_median),
             "im_holdout_resid_p_im": im_cal.as_ref().and_then(|c| c.holdout_p_im),
             "im_in_sample_resid_abs_median": im_cal.as_ref().map(|c| c.in_sample_abs_median),
-        }),
-    )?;
+    });
+    // Only when on, so a default cal.json is unchanged.
+    if let Some(n) = n_rt_outliers {
+        cal_json["n_rt_outliers_removed"] = json!(n);
+    }
+    mumdia_io::json::write_json(p.out_cal, &cal_json)?;
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
