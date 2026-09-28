@@ -119,9 +119,21 @@ fn root_with(env: &dyn Fn(&str) -> Option<String>, os: Os) -> Root {
     }
 }
 
-/// The cache root of this process's environment.
+/// The cache root of this process's environment. Every variable is read by its literal
+/// name, so the generated configuration reference (docs/24) lists each one.
 pub fn root() -> Root {
-    root_with(&|k| std::env::var(k).ok(), Os::current())
+    let vars = [
+        ("MUMDIA_CACHE_DIR", std::env::var("MUMDIA_CACHE_DIR").ok()),
+        ("XDG_CACHE_HOME", std::env::var("XDG_CACHE_HOME").ok()),
+        ("HOME", std::env::var("HOME").ok()),
+        ("LOCALAPPDATA", std::env::var("LOCALAPPDATA").ok()),
+    ];
+    let lookup = |k: &str| {
+        vars.iter()
+            .find(|(name, _)| *name == k)
+            .and_then(|(_, v)| v.clone())
+    };
+    root_with(&lookup, Os::current())
 }
 
 /// A cache directory a setting resolved to.
@@ -204,7 +216,12 @@ fn budget_with(env: &dyn Fn(&str) -> Option<String>) -> Option<u64> {
 
 /// The byte budget of this process's environment.
 pub fn budget() -> Option<u64> {
-    budget_with(&|k| std::env::var(k).ok())
+    let max_gb = std::env::var("MUMDIA_CACHE_MAX_GB").ok();
+    budget_with(&|k| {
+        (k == "MUMDIA_CACHE_MAX_GB")
+            .then(|| max_gb.clone())
+            .flatten()
+    })
 }
 
 /// The key of an engine cache entry's directory name: 24 (library) or 40 (projection)

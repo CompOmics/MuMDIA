@@ -1127,6 +1127,25 @@ PY_ENV_FN = re.compile(
 # Keep an entry in step with that function; a name that no longer appears among the reads
 # is an error, so a removed variable cannot leave a stale row behind.
 COMPUTED_ENV_DEFAULTS: dict[str, str] = {
+    "HOME": (
+        "set by the operating system; on Unix and macOS the per-user cache directory "
+        "under it holds the engine's caches when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`)"
+    ),
+    "LOCALAPPDATA": (
+        "set by Windows; `%LOCALAPPDATA%\\mumdia\\cache` holds the engine's caches when "
+        "MUMDIA_CACHE_DIR is unset (`cache.rs` `root`)"
+    ),
+    "MUMDIA_CACHE_DIR": (
+        "the per-user cache directory: `$XDG_CACHE_HOME/mumdia` or `~/.cache/mumdia` "
+        "(Linux and other Unix), `~/Library/Caches/mumdia` (macOS), "
+        "`%LOCALAPPDATA%\\mumdia\\cache` (Windows). A path moves the `\"auto\"` caches "
+        "there; `off` / `0` / `false` / `none` turns them off (`cache.rs` `root`)"
+    ),
+    "MUMDIA_CACHE_MAX_GB": (
+        "100 (GiB): the library and DeepLC projection caches together, least recently "
+        "used entries removed first, none used within the last hour. `0` or `unlimited` "
+        "is no bound (`cache.rs` `budget`)"
+    ),
     "MUMDIA_PARQUET_COMPRESSION": (
         "snappy. `zstd`, or `uncompressed` / `none`, changes the codec (`table.rs` `codec`)"
     ),
@@ -1158,6 +1177,11 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "work directory has less room than a PIN or raw handoff cannot be smaller than, "
         "and warned about below the files' usual size). `0` / `off` / `false` / `no` "
         "skips the check (`stages/rescore.rs` `check_sidecar_space`)"
+    ),
+    "XDG_CACHE_HOME": (
+        "set by the desktop environment, often unset; an absolute value puts the engine's "
+        "caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset "
+        "(`cache.rs` `root`)"
     ),
     "MUMDIA_WIDE_SCAN": (
         "`plain`: the plain reader with its parallel decode for rescore's feature "
