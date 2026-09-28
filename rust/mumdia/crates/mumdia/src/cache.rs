@@ -309,7 +309,7 @@ struct Entry {
 }
 
 /// What a cache directory holds.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Usage {
     pub entries: usize,
     pub bytes: u64,
@@ -391,7 +391,7 @@ fn remove_stale_leftovers(dir: &Path, now: SystemTime) -> u64 {
 }
 
 /// What [`enforce_budget`] did.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Enforced {
     /// Entries and bytes left in the caches.
     pub kept: Usage,
@@ -469,6 +469,122 @@ fn enforce_at(dirs: &[PathBuf], budget: Option<u64>, now: SystemTime) -> Enforce
 /// are removed first.
 pub fn enforce_budget(dirs: &[PathBuf], budget: Option<u64>) -> Enforced {
     enforce_at(dirs, budget, SystemTime::now())
+}
+
+/// What [`clear`] removed.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Cleared {
+    pub removed: Usage,
+    /// Entries that could not be removed (in use on Windows, or not this user's), with why.
+    pub failed: Vec<String>,
+}
+
+/// Remove every entry of `dirs` and every leftover temporary directory, whatever its
+/// last use: `mumdia cache clear`. Only names the engine writes are touched, and an entry
+/// is renamed aside before it is deleted, as eviction does, so a run that opens one
+/// afterwards sees a miss and rebuilds.
+pub fn clear(dirs: &[PathBuf]) -> Cleared {
+    let mut out = Cleared::default();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        if seen.contains(d) {
+            continue;
+        }
+        seen.push(d.clone());
+        let Ok(rd) = std::fs::read_dir(d) else {
+            continue;
+        };
+        let mut names: Vec<(String, PathBuf)> = rd
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+            .filter(|(n, _)| entry_key(n).is_some() || is_leftover(n))
+            .collect();
+        names.sort();
+        for (name, path) in names {
+            let bytes = dir_bytes(&path);
+            let target = if entry_key(&name).is_some() {
+                let aside = path.with_file_name(format!(
+                    "{name}.evicted-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|t| t.as_nanos())
+                        .unwrap_or(0)
+                ));
+                if let Err(e) = std::fs::rename(&path, &aside) {
+                    out.failed.push(format!("{}: {e}", path.display()));
+                    continue;
+                }
+                aside
+            } else {
+                path.clone()
+            };
+            match std::fs::remove_dir_all(&target) {
+                Ok(()) => {
+                    if entry_key(&name).is_some() {
+                        out.removed.entries += 1;
+                    }
+                    out.removed.bytes += bytes;
+                }
+                Err(e) => out.failed.push(format!("{}: {e}", target.display())),
+            }
+        }
+    }
+    out
+}
+
+/// Free space in bytes on the file system that holds `dir` (or its nearest existing
+/// ancestor), or `None` when it cannot be determined.
+///
+/// The standard library has no free-space call and the workspace forbids `unsafe`, so
+/// this asks the platform's own tool: POSIX `df -Pk` on Unix and macOS, .NET
+/// `DriveInfo` through Windows PowerShell on Windows, the path passed in the child's
+/// environment so no quoting can go wrong. A network share or a tool that is missing
+/// gives `None`, and a caller then proceeds as it would without the check.
+pub fn free_space(dir: &Path) -> Option<u64> {
+    let mut probe = dir.to_path_buf();
+    while !probe.exists() {
+        probe = probe.parent()?.to_path_buf();
+    }
+    let out = if cfg!(windows) {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot(\
+                 [System.IO.Path]::GetFullPath($env:MUMDIA_FREE_SPACE_PATH))).AvailableFreeSpace",
+            ])
+            .env("MUMDIA_FREE_SPACE_PATH", &probe)
+            .output()
+            .ok()?
+    } else {
+        std::process::Command::new("df")
+            .arg("-Pk")
+            .arg("--")
+            .arg(&probe)
+            .output()
+            .ok()?
+    };
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    if cfg!(windows) {
+        return text.trim().parse().ok();
+    }
+    parse_df_available(&text)
+}
+
+/// The available bytes of `df -Pk` output: the field before the capacity percentage on
+/// the last line, so a file-system or mount name with spaces in it cannot shift it.
+fn parse_df_available(text: &str) -> Option<u64> {
+    let line = text.lines().rev().find(|l| !l.trim().is_empty())?;
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let pct = fields.iter().rposition(|f| f.ends_with('%'))?;
+    let kib: u64 = fields.get(pct.checked_sub(1)?)?.parse().ok()?;
+    Some(kib * 1024)
 }
 
 /// The cache directories this configuration uses in this environment.
@@ -796,6 +912,56 @@ mod tests {
         assert!(!stale.exists());
         assert!(fresh.exists());
         assert_eq!(r.leftovers_freed, 100);
+    }
+
+    #[test]
+    fn clearing_removes_every_engine_entry_and_nothing_else() {
+        let libs = tmp("clear_libs");
+        let proj = tmp("clear_proj");
+        let now = SystemTime::now();
+        let a = entry(&libs, &"1".repeat(24), 100, now);
+        let b = entry(
+            &proj,
+            &"2".repeat(40),
+            50,
+            now - Duration::from_secs(9 * 3600),
+        );
+        let left = libs.join(format!("{}.partial-1-2", "3".repeat(24)));
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join("x"), vec![0u8; 7]).unwrap();
+        std::fs::create_dir_all(libs.join("mine")).unwrap();
+        std::fs::write(libs.join("notes.txt"), b"keep").unwrap();
+        let r = clear(&[libs.clone(), proj.clone(), libs.clone()]);
+        assert!(!a.exists() && !b.exists() && !left.exists());
+        assert!(libs.join("mine").exists() && libs.join("notes.txt").exists());
+        assert_eq!(
+            r.removed.entries, 2,
+            "a recent entry is cleared too: it was asked for"
+        );
+        assert_eq!(r.removed.bytes, 100 + 50 + 7 + 2 * LAST_USED_BYTES);
+        assert!(r.failed.is_empty(), "{:?}", r.failed);
+    }
+
+    #[test]
+    fn the_df_available_column_is_found_by_the_capacity_field() {
+        let out = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n\
+                   /dev/sdb1       15000000000 1300000000 13000000 10% /public/local\n";
+        assert_eq!(parse_df_available(out), Some(13_000_000 * 1024));
+        // A mount point with a space in it does not move the column.
+        let spaced = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                      my disk 100 40 60 40% /Volumes/My Disk\n";
+        assert_eq!(parse_df_available(spaced), Some(60 * 1024));
+        assert_eq!(parse_df_available("garbage"), None);
+    }
+
+    #[test]
+    fn free_space_answers_for_the_temporary_directory() {
+        // Every platform the engine ships on has the tool; a missing one is `None`, which
+        // callers treat as "no check".
+        let t = std::env::temp_dir().join("mumdia-free-space-probe-does-not-exist/x");
+        if let Some(free) = free_space(&t) {
+            assert!(free > 0);
+        }
     }
 
     #[test]

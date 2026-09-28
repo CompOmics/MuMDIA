@@ -145,8 +145,19 @@ than a number. Both are recorded in every run's `manifest.json`.
   directly with no fragment table of its own. The script stays for existing recipes, with a
   note pointing at the command.
 
+### Added
+
+- **`mumdia cache` shows, trims and clears the engine's caches.** `mumdia cache` prints
+  the root, the bound and each cache's directory, entries and size (`--json` for a
+  program); `prune` applies `MUMDIA_CACHE_MAX_GB` now; `clear` removes every entry. The
+  desktop application lists the caches on its Setup screen as "Search caches" and clears
+  them through it.
+
 ### Changed
 
+- **A library-cache store no longer fills the disk:** it is skipped with a warning when it
+  would leave less than 10 GiB free on the cache's disk, measured with `df -Pk` on Unix and
+  macOS and .NET `DriveInfo` on Windows (no measurement, no check).
 - **The library cache and the DeepLC projection cache are on by default, in one bounded
   cache root.** `predict_frag.library_cache` and `rt_im_train.deeplc_projection_cache`
   default to `"auto"`: `libraries/` and `deeplc_projections/` under `MUMDIA_CACHE_DIR`, or,

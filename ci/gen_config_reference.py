@@ -1141,6 +1141,11 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "`%LOCALAPPDATA%\\mumdia\\cache` (Windows). A path moves the `\"auto\"` caches "
         "there; `off` / `0` / `false` / `none` turns them off (`cache.rs` `root`)"
     ),
+    "MUMDIA_CACHE_MIN_FREE_GB": (
+        "10 (GiB): the free space a library-cache store must leave on the cache's disk, "
+        "measured before the copy; `0` is no margin (`library_cache.rs` "
+        "`min_free_after_store`)"
+    ),
     "MUMDIA_CACHE_MAX_GB": (
         "100 (GiB): the library and DeepLC projection caches together, least recently "
         "used entries removed first, none used within the last hour. `0` or `unlimited` "

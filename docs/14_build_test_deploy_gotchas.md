@@ -505,6 +505,22 @@ home quotas, point `MUMDIA_CACHE_DIR` at a scratch disk. Several runs may share 
 directory: every entry is published by an atomic rename, and a library hit is checked
 against the sizes and hashes recorded when it was stored.
 
+`mumdia cache` shows the same report as `doctor`'s cache section (`--json` for a
+program), `mumdia cache prune` applies the bound now, and `mumdia cache clear` removes
+every entry however recently used, renaming each aside first as eviction does; `--config`
+resolves settings that name directories. The desktop application's Setup screen lists the
+caches as "Search caches" with their size and clears them through `mumdia cache clear`, so
+a desktop user can see and free the space without knowing where the directory is.
+
+A library store leaves room on the cache's disk: it is skipped, with a warning, when it
+would leave less than 10 GiB free (`MUMDIA_CACHE_MIN_FREE_GB`, `0` for no margin), because
+the rest of the run writes its own tables to disk, often the same one. The standard library has no
+free-space call and the workspace forbids `unsafe`, so `cache::free_space` asks the
+platform's tool (`df -Pk` on Unix and macOS, .NET `DriveInfo` through PowerShell on
+Windows); when neither answers (a network share), the store goes ahead as before. The
+projection cache has its own check in the worker (the projection plus 1 GB), made before the
+file exists because a memory-mapped write that runs out of disk kills the process.
+
 The two conda envs both pin `python=3.11` on purpose: mokapot and MS2PIP pull
 `pandas<2`, which has no cp312 wheel and would force a fragile source build
 (`docker-rescore.yml:8-9`), and DeepLC 4.4.0 itself requires Python >= 3.11

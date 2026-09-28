@@ -788,6 +788,7 @@ moves to another function.
 | `MUMDIA_BREW_ITERS` | sidecar | `"20"` | `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_CACHE_DIR` | engine | computed: the per-user cache directory: `$XDG_CACHE_HOME/mumdia` or `~/.cache/mumdia` (Linux and other Unix), `~/Library/Caches/mumdia` (macOS), `%LOCALAPPDATA%\mumdia\cache` (Windows). A path moves the `"auto"` caches there; `off` / `0` / `false` / `none` turns them off (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 | `MUMDIA_CACHE_MAX_GB` | engine | computed: 100 (GiB): the library and DeepLC projection caches together, least recently used entries removed first, none used within the last hour. `0` or `unlimited` is no bound (`cache.rs` `budget`) | `rust/mumdia/crates/mumdia/src/cache.rs::budget` |
+| `MUMDIA_CACHE_MIN_FREE_GB` | engine | computed: 10 (GiB): the free space a library-cache store must leave on the cache's disk, measured before the copy; `0` is no margin (`library_cache.rs` `min_free_after_store`) | `rust/mumdia/crates/mumdia/src/library_cache.rs::min_free_after_store` |
 | `MUMDIA_CHROM_ROW_GROUP_ROWS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/chromatograms.rs::row_group_rows` |
 | `MUMDIA_CONVERT_THREADS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/convert.rs::convert_threads` |
 | `MUMDIA_DEEPLC_RAW_OUTPUT` | sidecar | `""` | `scripts/deeplc_finetune.py::quiet_deeplc_progress`, `scripts/deeplc_worker.py::quiet_deeplc_progress` |
@@ -877,7 +878,7 @@ moves to another function.
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `XDG_CACHE_HOME` | engine | computed: set by the desktop environment, often unset; an absolute value puts the engine's caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 
-95 variables are read: 34 engine-side, 65 sidecar-side, 4 on both sides.
+96 variables are read: 35 engine-side, 65 sidecar-side, 4 on both sides.
 
 ### Variables the code sets
 
@@ -890,6 +891,7 @@ one exception noted in its own help text: it sets `MUMDIA_NN_THREADS` and
 |---|---|---|---|
 | `KMP_DUPLICATE_LIB_OK` | sidecar | `"TRUE"` | `scripts/deeplc_finetune.py::<module>` |
 | `MKL_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py::<module>` |
+| `MUMDIA_FREE_SPACE_PATH` | engine | `&probe` | `rust/mumdia/crates/mumdia/src/cache.rs::free_space` |
 | `MUMDIA_NN_FOLDS` | engine | `p.cfg.folds.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
 | `MUMDIA_NN_FOLD_KEYS` | engine | `foldkeys` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
 | `MUMDIA_NN_ITERS` | engine | `p.cfg.num_iter.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
@@ -930,6 +932,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-19 structs and 206 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 27 enumerations, 1 named profile(s), 95 environment variables read and 19 set.
+19 structs and 206 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 27 enumerations, 1 named profile(s), 96 environment variables read and 20 set.
 
 20 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
