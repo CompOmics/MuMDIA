@@ -854,9 +854,11 @@ pub struct RtImTrainConfig {
     /// and evaluate only the heads they need: `rt_library_scope = per_run`, every rerun of
     /// an experiment, and the bands of `groups.rt_adaptation = once_per_run` across runs.
     /// A miss computes the projection in the prediction's own shard plan
-    /// (`deeplc_predict_shards`), each shard filling its rows of the entry's file, so it costs
-    /// what a plain prediction of the library costs; in one process on the whole budget it
-    /// took twice as long once sharding was the default (an entrapment run 3:15 -> 6:28).
+    /// (`deeplc_predict_shards`), each shard filling its rows of the entry's file, and the
+    /// heads are evaluated from the projection in the same plan on a miss and a hit alike.
+    /// Measured on doxy (128 threads, whole runs, DeepLC 4.5.0): an Orbitrap AIF entrapment
+    /// run 3:15 without the cache, 3:16 on a miss, 0:56 on a hit; an Astral run on the HYE
+    /// library 5:14, 5:42 and 2:33. In one process the miss had taken 6:28 and 11:29.
     /// Base model only: a fine-tune has no factored head and ignores it.
     ///
     /// Needs DeepLC 4.5.0 or newer, which added the factored prediction matrix it reads, and

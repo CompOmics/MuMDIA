@@ -862,7 +862,9 @@ def main():
         values, cache_record, timers = predict_from_projections(
             uniq, base_model, calibration, chunk, args.projection_cache,
             default_dir=args.projection_cache_default, shards=n_shards,
-            shard_threads=shard_threads)
+            shard_threads=shard_threads,
+            scratch_base=os.path.dirname(os.path.abspath(
+                args.lib_out if band_pairs is None else band_pairs[0][1])))
         if values is not None:
             n_shards = max(1, cache_record.get("shards") or 1)
             shard_record["used"] = n_shards
@@ -1276,8 +1278,107 @@ def project_sharded(uniq, shards, threads, chunk, proj_path, work):
     return per_shard
 
 
+def evaluate_projections(proj, start, rows, head, calibration, default_head, chunk):
+    """The prediction for rows `start:start + rows` of the projection `proj`: the multi-head
+    calibration's transform, or the base model's default head.
+
+    Evaluated in `chunk`-sized blocks from `start`. Each row's value depends on that row
+    alone, and a shard's slice starts at a multiple of `chunk`, so K shards reproduce the
+    one-process evaluation bit for bit. `head` is `(embedding, scale, shift)`.
+    """
+    from deeplc._factored import FactoredPredictionMatrix
+
+    emb, scale, shift = head
+    values = np.empty(rows, dtype=np.float64)
+    for s in range(0, rows, chunk):
+        block = np.ascontiguousarray(proj[start + s:start + min(s + chunk, rows)])
+        source = FactoredPredictionMatrix(block, emb, scale, shift)
+        if calibration is not None:
+            p = agg(calibration.transform(source))
+        else:
+            p = np.asarray(source[:, default_head], dtype=np.float64)
+        if len(p) != len(block):
+            raise SystemExit(f"the cached projection gave {len(p)} values for {len(block)} "
+                             f"sequences")
+        values[s:s + len(block)] = p
+    return values
+
+
+def evaluate_sharded(proj_path, n, shards, threads, chunk, head, calibration, default_head,
+                     scratch_base):
+    """`evaluate_projections` over the `n` rows of `proj_path` in `shards` child processes.
+
+    The head evaluation of a hit, and of a miss once its projection is written, is numpy
+    work on one BLAS thread (the worker pins them), 34 s on 2.9M sequences and 79 s on
+    4.9M in one process, which a hit was otherwise mostly made of. The children read
+    their slices of the entry's file and write their values; the calibration is pickled
+    and the head parameters saved once, beside the library being written, in a scratch
+    directory that is removed on every exit Python sees. Returns `(values, per_shard)`.
+    """
+    bounds = shard_bounds(n, shards, chunk)
+    token = f"tmp-{os.getpid()}"
+    procs, specs = [], []
+    with exit_on_termination_signals():
+        work = tempfile.mkdtemp(prefix=f"projection-evaluate.{token}.", dir=scratch_base)
+        try:
+            head_path = os.path.join(work, f"head.{token}.npz")
+            np.savez(head_path, embedding=head[0], scale=head[1], shift=head[2])
+            cal_path = None
+            if calibration is not None:
+                cal_path = os.path.join(work, f"calibration.{token}.pkl")
+                with open(cal_path, "wb") as fh:
+                    pickle.dump(calibration, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            for j, (a, b) in enumerate(bounds):
+                stem = os.path.join(work, f"evaluate_{j:03d}.{token}")
+                spec = {
+                    "mode": "evaluate",
+                    "shard": j,
+                    "label": f"evaluation shard {j + 1}/{len(bounds)}",
+                    "proj": proj_path,
+                    "start": a,
+                    "rows": b - a,
+                    "head": head_path,
+                    "calibration": cal_path,
+                    "default_head": default_head,
+                    "values": stem + ".values.npy",
+                    "timings": stem + ".timings.json",
+                    "spec": stem + ".spec.json",
+                    "threads": threads,
+                    "chunk": chunk,
+                    "watch_parent": True,
+                }
+                with open(spec["spec"], "w", encoding="utf-8") as fh:
+                    json.dump(spec, fh)
+                specs.append(spec)
+            script = os.path.abspath(__file__)
+            for spec in specs:
+                procs.append(subprocess.Popen(
+                    [sys.executable, script, "--shard-worker", spec["spec"]],
+                    stdin=subprocess.PIPE))
+            _wait_for_shards(procs)
+            parts, per_shard = [], []
+            for spec in specs:
+                v = np.load(spec["values"])
+                if v.shape != (spec["rows"],):
+                    raise SystemExit(f"{spec['label']} returned {v.shape[0]} values for "
+                                     f"{spec['rows']} sequences")
+                parts.append(v)
+                with open(spec["timings"], encoding="utf-8") as fh:
+                    per_shard.append(json.load(fh))
+            values = np.concatenate(parts) if parts else np.empty(0, dtype=np.float64)
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            shutil.rmtree(work, ignore_errors=True)
+    return values, per_shard
+
+
 def predict_from_projections(uniq, model, calibration, chunk, cache_dir, default_dir=False,
-                             shards=1, shard_threads=None):
+                             shards=1, shard_threads=None, scratch_base=None):
     """Predict `uniq` from the base model's cached trunk projection, computing it once.
 
     Calibrated RT is `ridge(spline_h(head_h(proj(trunk(x)))))` over the selected heads, and
@@ -1405,18 +1506,15 @@ def predict_from_projections(uniq, model, calibration, chunk, cache_dir, default
         return unusable("%s holds %s, expected (%d, %d)" % (path, shape, len(uniq), rank))
     t2 = time.perf_counter()
     default_head = None if calibration is not None else int(_default_task_idx(model))
-    values = np.empty(len(uniq), dtype=np.float64)
-    for s in range(0, len(uniq), chunk):
-        block = np.ascontiguousarray(proj[s:s + chunk])
-        source = FactoredPredictionMatrix(block, emb, scale, shift)
-        if calibration is not None:
-            p = agg(calibration.transform(source))
-        else:
-            p = np.asarray(source[:, default_head], dtype=np.float64)
-        if len(p) != len(block):
-            raise SystemExit(f"the cached projection gave {len(p)} values for {len(block)} "
-                             f"sequences")
-        values[s:s + len(block)] = p
+    per_eval = None
+    if shards > 1:
+        del proj
+        values, per_eval = evaluate_sharded(
+            path, len(uniq), shards, shard_threads, chunk, (emb, scale, shift), calibration,
+            default_head, scratch_base or tempfile.gettempdir())
+    else:
+        values = evaluate_projections(proj, 0, len(uniq), (emb, scale, shift), calibration,
+                                      default_head, chunk)
     t_eval = time.perf_counter() - t2
     record = {
         "used": True,
@@ -1430,6 +1528,9 @@ def predict_from_projections(uniq, model, calibration, chunk, cache_dir, default
         # The processes a miss computed the projection in (0 on a hit), and their timings.
         "shards": 0 if hit else (shards if per_shard else 1),
         "per_shard": per_shard,
+        # The processes the heads were evaluated in, and their timings.
+        "evaluate_shards": shards if per_eval else 1,
+        "per_evaluate_shard": per_eval,
     }
     print(f"projection cache {'hit' if hit else 'written'}: {path} "
           f"({len(uniq)} sequences; evaluate {t_eval:.1f}s)", flush=True)
@@ -1677,6 +1778,24 @@ def shard_main(spec_path):
                        "threads": torch.get_num_threads(), "model_load": round(t_load, 3),
                        "project": round(time.perf_counter() - t1, 3),
                        "featurisation": featurisation, "forward": forward}, fh)
+        return
+    if spec.get("mode") == "evaluate":
+        # The heads over this shard's rows of the entry's projection; no model is loaded.
+        h = np.load(spec["head"])
+        calibration = None
+        if spec.get("calibration"):
+            with open(spec["calibration"], "rb") as fh:
+                calibration = pickle.load(fh)
+        proj = np.load(spec["proj"], mmap_mode="r")
+        values = evaluate_projections(
+            proj, int(spec["start"]), int(spec["rows"]),
+            (h["embedding"], h["scale"], h["shift"]), calibration, spec.get("default_head"),
+            int(spec["chunk"]))
+        del proj
+        np.save(spec["values"], values)
+        with open(spec["timings"], "w", encoding="utf-8") as fh:
+            json.dump({"shard": spec["shard"], "rows": int(spec["rows"]),
+                       "evaluate": round(time.perf_counter() - t0, 3)}, fh)
         return
     if spec.get("model"):
         # A module saved whole by the parent from its own fine-tune; shards run only
