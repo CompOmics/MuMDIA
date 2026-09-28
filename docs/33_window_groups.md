@@ -32,9 +32,9 @@ on.
 | `window_groups` | `1` | Number of groups. `1` is the ordinary single-library search. Clamped to the number of distinct isolation windows; groups whose band selects no precursor are merged into a neighbour, so the number actually searched can be smaller (the log and `groups/plan.json` say how many). |
 | `calibration` | `global` | Whose seed anchors calibrate each group's retention time and mass: `global` pools every group's seeds first (section 4); `per_group` uses the group's own. |
 | `parallel` | `1` | Bands in flight at a time, through a bounded queue that starts the most expensive band first (section 8, "Scheduling the bands"). Clamped below the thread count. |
-| `rt_adaptation` | `per_band` | `once_per_run` adapts the library's retention times in one DeepLC worker per run over the union of the bands, under `global` calibration (section 4b). Float-equivalent, opt-in. |
+| `rt_adaptation` | `once_per_run` | Adapts the library's retention times in one DeepLC worker per run over the union of the bands, under `global` calibration (section 4b); `per_band` runs one per band. Float-equivalent; default since 2026-09-27. |
 | `balance` | `precursors` | `cost` balances the cuts on precursors times MS2 peaks per window instead (section 2). Output-changing, opt-in. |
-| `delete_band_intermediates` | `false` | Delete each band's `psms_extracted` and `features` tables once the pool is written (section 6). Disk only. |
+| `delete_band_intermediates` | `true` | Delete each band's `psms_extracted` and `features` tables once the pool is written (section 6). Disk only; default since 2026-09-27. |
 | `pool_competed` | `false` | `false` leaves the competed rows per band and has rescore read the band tables with a table-to-source map, where that cannot change a result (section 5). `psms_scored.parquet` is byte-identical; the pooled competed table is not written. `true` writes it. Default since 2026-09-26. |
 | `pool_chromatograms` | `false` | `false` leaves the chromatograms per band and has quant read the band tables with the overlap losers the pool persists to `groups/overlap_losers.parquet` (section 5). The quant tables are byte-identical; the pooled chromatogram table is not written, and the band directories become the run's only chromatograms (section 6). `true` writes it. Default since 2026-09-26. |
 
@@ -385,8 +385,8 @@ predicts the sequence again: the 10.9M HYE precursor rows are 4.91M unique seque
 unbanded. Measured on HYE Astral (2026-09-24), the multi-head step took about 13 min
 unbanded and 19-24 min at 2-16 bands.
 
-`groups.rt_adaptation = once_per_run` (default `per_band`, the behaviour before the setting
-existed) runs one worker per run under `calibration = global`:
+`groups.rt_adaptation = once_per_run` (the default since 2026-09-27; `per_band` is the
+behaviour before the setting existed) runs one worker per run under `calibration = global`:
 `deeplc_finetune.py - <seed> - --bands <tsv>`, where `groups/rt_bands.tsv` lists every
 band's table and output. The worker fits the multi-head calibration once, predicts the union
 of the bands' unique sequences once, in the order the bands list them, and rewrites each band
@@ -418,6 +418,13 @@ batch. Measured on the smoke fixture with DeepLC 4.5.0 on CPU (3,820 precursors,
 | `run-experiment`, 2 runs of 2 bands, multi-head off: wall | 39 s | 9 s |
 | same, bands re-predicted | 4 | 0 |
 | same, largest change of a band value against the experiment-level one | 6.1e-5 s | 0 |
+
+At scale, before the default changed (EPYC 9354, 128 threads): a six-run Astral experiment
+at 16 bands went from 36:06 to 25:39 and an eight-band entrapment run from 5:44 to 3:45; 0.8%
+of the band rows moved, by at most 0.07 s (0.6%, at most 2.9 s, on the entrapment library),
+with the same heads; and the peptides at 1% moved +0.35% (3 seeds) and +0.24% (10 seeds, the
+entrapment FDP +0.022 pp against two standard errors of 0.027). That is why it is the
+default.
 
 On a synthetic library one `--bands` call over contiguous bands writes exactly the
 whole-library column band by band, under both the multi-head calibration and the base model
@@ -627,7 +634,8 @@ chromatograms: the band chromatogram tables and `groups/overlap_losers.parquet` 
 quant read, and deleting them loses re-quantification and re-pooling. Under
 `groups.pool_chromatograms = true` and `pool_competed = true` the band directories are
 diagnostics and reproducibility material, not inputs to any later stage; delete them once
-the run is accepted if space matters. `groups.delete_band_intermediates` (default `false`)
+the run is accepted if space matters. `groups.delete_band_intermediates` (default `true`
+since 2026-09-27; `false` keeps the tables, for re-featuring a band)
 does part of that automatically: once the pool is written, each band's
 `psms_extracted.parquet` and `features.parquet` (with their reports, schema companions and
 any `run.pin`) are deleted, which on the immunopeptidomics experiment was most of the band

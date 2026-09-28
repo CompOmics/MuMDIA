@@ -1041,8 +1041,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // share, and a chain starts when a slot frees rather than at a chunk boundary. The
     // explicit count keeps the chunk loops below exactly as they were.
     let threads_budget = rayon::current_num_threads();
+    // `resolve_for_host`: an automatic plan with no memory reading to bound it (any
+    // platform but Linux) runs one chain at a time.
     let mut plan =
-        crate::sched::RunConcurrency::resolve(cfg.experiment.parallel_runs, n_runs, threads_budget);
+        crate::sched::resolve_for_host(cfg.experiment.parallel_runs, n_runs, threads_budget);
     let par = plan.par;
     if plan.is_auto() {
         info!(
@@ -1095,8 +1097,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // `experiment.overlap_front_threads`: under first_run_only, the converts and seeds of
     // runs 2..N run beside run 1's RT adaptation instead of before it (the branch below).
     let grouped_runs = cfg.groups.window_groups > 1;
-    let overlap = cfg.experiment.overlap_front_threads;
-    if overlap > 0 && (grouped_runs || !share_ft) {
+    // `"auto"` (the default): the threads the DeepLC thread cap leaves idle, so run 1's
+    // adaptation keeps its thread count and the adapted library its bits.
+    let overlap = match cfg.experiment.overlap_front_threads {
+        Some(n) => n,
+        None => crate::sched::auto_overlap_threads(threads_budget),
+    };
+    if overlap > 0 && (grouped_runs || !share_ft) && cfg.experiment.overlap_front_threads.is_some()
+    {
         info!(
             overlap_front_threads = overlap,
             "run-experiment: experiment.overlap_front_threads applies to ungrouped runs whose \
@@ -1105,6 +1113,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         );
     }
     let overlapped = share_ft && overlap > 0 && !grouped_runs;
+    if overlapped && cfg.experiment.overlap_front_threads.is_none() {
+        info!(
+            overlap_front_threads = overlap,
+            threads = threads_budget,
+            "run-experiment: overlap_front_threads = auto, the threads beyond the physical \
+             cores, which run 1's DeepLC thread cap leaves idle"
+        );
+    }
     // Ungrouped runs seed against ONE library: every run's seed searches the base library
     // at the seed tolerance, so the library and its fragment index are the same arrays for
     // every run, and each seed used to load and build them again. So the chain runs in

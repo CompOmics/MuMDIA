@@ -147,6 +147,59 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **The NN rescorer trains its folds in parallel by default** (`MUMDIA_NN_PARALLEL=auto`;
+  `0` restores the serial loop and its scores). The (seed, fold) tasks run in child
+  processes, as many as the tasks and cores allow at the worker's torch thread count (the
+  performance cores on a hybrid CPU, one process on a GPU), bounded so that each child's
+  training rows fit in the available memory beside the shared matrix. The epoch shuffle is
+  then keyed per (seed, fold, iteration, epoch), so the scores do not depend on the
+  process count and move once, as a seed change would. Measured before the default changed
+  (EPYC 9354, one rescore at a time): a six-run Astral pool 11:51 -> 6:15 and a five-run
+  Orbitrap AIF pool 10:20 -> 7:31. Over 10 seeds a pool the peptides at 1% moved +0.02% on
+  the Astral pool (t +0.17), -0.21% on the Orbitrap pool (t -2.23) and -0.22% on the
+  entrapment pool (t -1.99, FDP 0.988 -> 0.963%): a small, consistent loss on two of three
+  pools, accepted for the wall time. The engine's disk-space check before a rescore now
+  counts the worker's matrix memmap unless `MUMDIA_NN_PARALLEL=0`.
+- **Sharded DeepLC prediction and one retention-time adaptation per banded run are
+  defaults:** `rt_im_train.deeplc_predict_shards = 0` (one process per 8 threads of the
+  prediction budget) and `groups.rt_adaptation = "once_per_run"`. Both are
+  float-equivalent rather than bit-identical, so they were gated on seeds before the
+  default moved (EPYC 9354, 128 threads). Sharded prediction, 8 processes of 8 threads
+  against one: a six-run Astral experiment 26:00 -> 18:02, a five-run Orbitrap AIF
+  experiment 29:47 -> 21:04, an entrapment run 6:27 -> 3:32; the adapted library moved in
+  at most 414 of 10,881,402 rows (at most 0.42 s) with the same 80 heads, and the peptides
+  at 1% moved -0.09%, -0.04% and -0.05% over 10 NN seeds each, every one inside the seed
+  spread, at an unchanged entrapment FDP (0.988 -> 0.984%). A budget of 8 or fewer threads
+  (a desktop under the DeepLC thread cap) is still one process. One adaptation per banded
+  run: a six-run Astral experiment at 16 bands 36:06 -> 25:39 and an eight-band entrapment
+  run 5:44 -> 3:45, with 0.8% of the band rows moving by at most 0.07 s and the peptides
+  at 1% +0.35% (3 seeds) and +0.24% (10 seeds; entrapment FDP +0.022 pp against two
+  standard errors of 0.027). `deeplc_predict_shards = 1` and `rt_adaptation = "per_band"`
+  restore the previous behaviour.
+- **Five opt-ins that change no result are defaults:** `extract.chromatogram_schema = 2`,
+  `experiment.parallel_runs = "auto"`, `experiment.overlap_front_threads = "auto"`,
+  `predict_frag.defer_deeplc_to_multihead = true` and `groups.delete_band_intermediates =
+  true`. Each changes the artifact set or the schedule, and each was checked byte for byte
+  at scale before the default moved (EPYC 9354, 128 threads). The chromatogram layout,
+  parallel runs and the overlap together, on a six-run Astral experiment and a five-run
+  Orbitrap AIF experiment (imported HYE library, multi-head calibration, `nn_torch`): 24
+  and 21 final tables identical to the sequential v1 run's, the experiments 32:49 -> 26:00
+  and 44:37 -> 29:47, the chromatogram tables 4.75 -> 3.95 GB and 21.7 -> 15.4 GB. The
+  deferred library DeepLC pass, on a FASTA search of the E. coli AIF file: the scored
+  table, the three quant tables and both TSVs identical, 14:56 -> 12:29. Deleting the band
+  intermediates, on an eight-band entrapment run: the same six tables identical. What to
+  set for the old behaviour: `chromatogram_schema = 1` for a reader outside the engine
+  that reads the `rt`/`intensity` lists of `chromatograms.parquet`;
+  `defer_deeplc_to_multihead = false` for a FASTA build meant to be reused as
+  `--lib-precursors` (its iRT is otherwise the native placeholder, and its model identity
+  says so); `delete_band_intermediates = false` to re-feature a band later; `parallel_runs
+  = 1` and `overlap_front_threads = 0` for the strictly sequential experiment. `"auto"`
+  for `parallel_runs` now runs one chain at a time where there is no memory reading to
+  bound it (any platform but Linux) instead of sizing from the threads alone, and
+  `overlap_front_threads` takes `"auto"` (or `null`) beside a count: the threads beyond
+  the physical cores, which the DeepLC thread cap leaves idle, so run 1's DeepLC keeps its
+  thread count and the adapted library its bits (`0` where the cores cannot be read, on
+  anything but Linux, or when `MUMDIA_DEEPLC_THREAD_CAP` is set).
 - **`groups.pool_competed` and `groups.pool_chromatograms` default to `false`.** A grouped
   run no longer writes the pooled `psms_competed.parquet` and `chromatograms.parquet`:
   rescore reads the bands' competed tables and quant reads the bands' chromatogram tables

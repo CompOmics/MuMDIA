@@ -285,7 +285,8 @@ grid are available.
 `rt`/`intensity` use `LargeList` (64-bit offsets) because the total list-value
 count can exceed the 32-bit `ListArray` offset ceiling on large candidate sets.
 
-The table above is schema version 1, the default. Version 2 is the layout below.
+The table above is schema version 1, the default before 2026-09-27. Version 2, the
+default since, is the layout below.
 
 #### Layout v2 (`extract.chromatogram_schema = 2`)
 

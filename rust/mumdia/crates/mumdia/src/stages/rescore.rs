@@ -3147,9 +3147,10 @@ fn handoff_space(rows: u64, nf: u64, format: HandoffFormat, memmap: u64) -> Spac
 /// set, and otherwise above a threshold sized from free memory that is never below 4 GiB,
 /// which is taken here as the size above which it may stream; any other value never
 /// streams. It compares the decoded matrix for parquet and raw and the file size for a PIN,
-/// which is `handoff_bytes` here. `MUMDIA_NN_PARALLEL > 0` maps the matrix from a memmap on
-/// either backend. `var` reads the environment the worker inherits (a parameter for the
-/// tests).
+/// which is `handoff_bytes` here. Keyed parallel training maps the matrix from a memmap on
+/// either backend: `MUMDIA_NN_PARALLEL` unset or `auto` (the worker's default since
+/// 2026-09-27) or a count above 0; only `0`, the serial loop, holds it in memory. `var`
+/// reads the environment the worker inherits (a parameter for the tests).
 fn nn_memmap_bytes(
     nn: bool,
     rows: u64,
@@ -3162,9 +3163,14 @@ fn nn_memmap_bytes(
         return 0;
     }
     let matrix = rows.saturating_mul(nf).saturating_mul(4);
-    let parallel = var("MUMDIA_NN_PARALLEL")
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .is_some_and(|k| k > 0);
+    // As the worker parses it: unset, empty or `auto` is the keyed default; a number is a
+    // process count, `0` the serial loop. A value the worker refuses fails it before any
+    // memmap, so it needs no space here.
+    let parallel = match var("MUMDIA_NN_PARALLEL").map(|v| v.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(v) if v.is_empty() || v == "auto" => true,
+        Some(v) => v.parse::<f64>().is_ok_and(|k| k >= 1.0),
+    };
     let stream_env = var("MUMDIA_NN_STREAM")
         .unwrap_or_else(|| "auto".to_string())
         .to_lowercase();
@@ -6292,40 +6298,62 @@ b
         };
         let gib = 1u64 << 30;
         // 1M rows x 100 features: a 400 MB matrix, under the 4 GiB the auto threshold
-        // never goes below, so the default in-memory backend writes no memmap.
+        // never goes below.
         let (small, nf) = (1_000_000u64, 100u64);
         let pq = HandoffFormat::Parquet;
-        assert_eq!(nn_memmap_bytes(true, small, nf, pq, 0, env(&[])), 0);
+        // The worker's default (MUMDIA_NN_PARALLEL unset, empty or `auto`) and an explicit
+        // count train keyed tasks in child processes, which map the matrix from a memmap
+        // with `y` and `fold` beside it, whatever its size.
+        let keyed = small * nf * 4 + small * 12;
+        for pairs in [
+            &[][..],
+            &[("MUMDIA_NN_PARALLEL", "")][..],
+            &[("MUMDIA_NN_PARALLEL", "AUTO")][..],
+            &[("MUMDIA_NN_PARALLEL", "2")][..],
+            &[("MUMDIA_NN_PARALLEL", "3"), ("MUMDIA_NN_STREAM", "0")][..],
+        ] {
+            let pairs: &'static [(&'static str, &'static str)] = pairs;
+            assert_eq!(
+                nn_memmap_bytes(true, small, nf, pq, 0, env(pairs)),
+                keyed,
+                "{pairs:?}"
+            );
+        }
         // Not the NN worker: nothing, whatever the environment.
         assert_eq!(
             nn_memmap_bytes(false, small, nf, pq, 0, env(&[("MUMDIA_NN_STREAM", "1")])),
             0
         );
-        // Forced streaming, or the parallel trainer, map the matrix.
+        // The serial loop (`0`) holds the matrix in memory unless the worker streams.
+        const SERIAL: (&str, &str) = ("MUMDIA_NN_PARALLEL", "0");
+        assert_eq!(nn_memmap_bytes(true, small, nf, pq, 0, env(&[SERIAL])), 0);
         for forced in [
-            &[("MUMDIA_NN_STREAM", "1")][..],
-            &[("MUMDIA_NN_STREAM", "ON")][..],
-            &[("MUMDIA_NN_PARALLEL", "2")][..],
+            &[SERIAL, ("MUMDIA_NN_STREAM", "1")][..],
+            &[SERIAL, ("MUMDIA_NN_STREAM", "ON")][..],
         ] {
             let pairs: &'static [(&'static str, &'static str)] = forced;
-            let want = small * nf * 4
-                + if pairs[0].0 == "MUMDIA_NN_PARALLEL" {
-                    small * 12
-                } else {
-                    0
-                };
-            assert_eq!(nn_memmap_bytes(true, small, nf, pq, 0, env(pairs)), want);
+            assert_eq!(
+                nn_memmap_bytes(true, small, nf, pq, 0, env(pairs)),
+                small * nf * 4
+            );
         }
         // A 12 GB matrix may stream under auto; an explicit threshold decides it; `0`
         // never streams.
         let big = 30_000_000u64;
         assert!(big * nf * 4 > 4 * gib);
         assert_eq!(
-            nn_memmap_bytes(true, big, nf, pq, 0, env(&[])),
+            nn_memmap_bytes(true, big, nf, pq, 0, env(&[SERIAL])),
             big * nf * 4
         );
         assert_eq!(
-            nn_memmap_bytes(true, big, nf, pq, 0, env(&[("MUMDIA_NN_STREAM_GB", "64")])),
+            nn_memmap_bytes(
+                true,
+                big,
+                nf,
+                pq,
+                0,
+                env(&[SERIAL, ("MUMDIA_NN_STREAM_GB", "64")])
+            ),
             0
         );
         assert_eq!(
@@ -6335,19 +6363,29 @@ b
                 nf,
                 pq,
                 0,
-                env(&[("MUMDIA_NN_STREAM_GB", "0.1")])
+                env(&[SERIAL, ("MUMDIA_NN_STREAM_GB", "0.1")])
             ),
             small * nf * 4
         );
         assert_eq!(
-            nn_memmap_bytes(true, big, nf, pq, 0, env(&[("MUMDIA_NN_STREAM", "0")])),
+            nn_memmap_bytes(
+                true,
+                big,
+                nf,
+                pq,
+                0,
+                env(&[SERIAL, ("MUMDIA_NN_STREAM", "0")])
+            ),
             0
         );
         // For a PIN the worker compares the file size, not the decoded matrix.
         let pin = HandoffFormat::Pin;
-        assert_eq!(nn_memmap_bytes(true, small, nf, pin, gib, env(&[])), 0);
         assert_eq!(
-            nn_memmap_bytes(true, small, nf, pin, 5 * gib, env(&[])),
+            nn_memmap_bytes(true, small, nf, pin, gib, env(&[SERIAL])),
+            0
+        );
+        assert_eq!(
+            nn_memmap_bytes(true, small, nf, pin, 5 * gib, env(&[SERIAL])),
             small * nf * 4
         );
     }

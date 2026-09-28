@@ -181,6 +181,116 @@ impl RunConcurrency {
     }
 }
 
+/// [`RunConcurrency::resolve`] for this host.
+///
+/// An automatic plan is bounded by memory: the conversions, the seeds and the chains each
+/// run their first item alone and size the rest from its peak ([`run_first_alone`]).
+/// Without a memory reading (any platform but Linux) the thread-sized count would be no
+/// bound at all, and two chains of a large library on a desktop can exhaust its memory, so
+/// the plan runs one chain at a time and says so. An explicit count is returned as it is.
+pub fn resolve_for_host(setting: usize, runs: usize, threads: usize) -> RunConcurrency {
+    resolve_with_reading(setting, runs, threads, memory_reading().is_some())
+}
+
+/// [`resolve_for_host`] with the reading's presence passed in, so the fallback is testable
+/// on every platform.
+fn resolve_with_reading(
+    setting: usize,
+    runs: usize,
+    threads: usize,
+    readable: bool,
+) -> RunConcurrency {
+    let plan = RunConcurrency::resolve(setting, runs, threads);
+    if plan.is_auto() && !readable && plan.par > 1 {
+        info!(
+            runs,
+            threads,
+            "parallel_runs = auto: no memory reading on this platform, so one run at a time; \
+             give experiment.parallel_runs a number to run runs concurrently"
+        );
+        return plan.bounded(1, threads);
+    }
+    plan
+}
+
+/// The threads `experiment.overlap_front_threads = "auto"` gives the fronts of runs 2..N:
+/// the budget beyond the physical cores the process may run on, which the DeepLC worker's
+/// default thread cap leaves idle.
+///
+/// Run 1's DeepLC then asks for `threads - fronts` = the physical cores and is capped at
+/// the same number it gets without the overlap (`min(threads, cores)`), so the adapted
+/// library does not move. `0` wherever that cannot be guaranteed: the physical cores
+/// cannot be read ([`physical_cores`], Linux only), the budget does not exceed them, or
+/// `MUMDIA_DEEPLC_THREAD_CAP` sets the worker's cap by hand.
+pub fn auto_overlap_threads(threads: usize) -> usize {
+    let manual_cap = std::env::var("MUMDIA_DEEPLC_THREAD_CAP")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "auto"))
+        .unwrap_or(false);
+    if manual_cap {
+        return 0;
+    }
+    match physical_cores() {
+        Some(cores) if threads > cores => threads - cores,
+        _ => 0,
+    }
+}
+
+/// The physical cores this process may run on: Linux only, the distinct cores behind the
+/// CPUs it is allowed (`Cpus_allowed_list` in `/proc/self/status`, so a container's or a
+/// `taskset` mask is respected). `None` elsewhere, or when a CPU has no topology.
+///
+/// The count the DeepLC worker caps its torch threads at on Linux
+/// (`deeplc_finetune.py::physical_cores`), read the same way, so [`auto_overlap_threads`]
+/// leaves DeepLC exactly the threads it takes anyway.
+pub fn physical_cores() -> Option<usize> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let allowed = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))?;
+    let cpus = parse_cpu_list(allowed.trim())?;
+    physical_cores_in(&cpus, Path::new("/sys/devices/system/cpu"))
+}
+
+/// The distinct physical cores behind `cpus` under a sysfs CPU directory: each CPU's
+/// `topology/core_cpus_list` (`thread_siblings_list` before Linux 5.5) names the logical
+/// CPUs that share its core, so the hyperthreads of one core count once, with the
+/// `(physical_package_id, core_id)` pair as the fallback, as in the DeepLC worker.
+fn physical_cores_in(cpus: &[usize], sysfs: &Path) -> Option<usize> {
+    let mut cores = std::collections::BTreeSet::new();
+    for cpu in cpus {
+        let topo = sysfs.join(format!("cpu{cpu}")).join("topology");
+        let read = |name: &str| std::fs::read_to_string(topo.join(name)).ok();
+        let key = match read("core_cpus_list").or_else(|| read("thread_siblings_list")) {
+            Some(list) => format!("cpus {}", list.trim()),
+            None => format!(
+                "pair {}/{}",
+                read("physical_package_id")?.trim(),
+                read("core_id")?.trim()
+            ),
+        };
+        cores.insert(key);
+    }
+    (!cores.is_empty()).then_some(cores.len())
+}
+
+/// A kernel CPU list (`0-3,8,10-11`) as the CPUs it names; `None` when it is malformed.
+fn parse_cpu_list(text: &str) -> Option<Vec<usize>> {
+    let mut out = Vec::new();
+    for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b): (usize, usize) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+                if b < a {
+                    return None;
+                }
+                out.extend(a..=b);
+            }
+            None => out.push(part.parse().ok()?),
+        }
+    }
+    Some(out)
+}
+
 /// What the process can count on, read where the platform exposes it without a system
 /// call the workspace would need `unsafe` for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -646,6 +756,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn an_automatic_plan_without_a_memory_reading_runs_one_chain_at_a_time() {
+        // With a reading the thread-sized plan stands (it is bounded later, from the first
+        // item's peak); without one it is one chain on the whole budget; an explicit count
+        // is never touched.
+        let readable = resolve_with_reading(0, 6, 128, true);
+        assert_eq!((readable.par, readable.pool_threads), (6, Some(21)));
+        let blind = resolve_with_reading(0, 6, 128, false);
+        assert_eq!((blind.par, blind.pool_threads), (1, Some(128)));
+        assert!(blind.is_auto());
+        let explicit = resolve_with_reading(3, 6, 128, false);
+        assert_eq!((explicit.par, explicit.pool_threads), (3, None));
+        let one = resolve_with_reading(0, 1, 128, false);
+        assert_eq!(one.par, 1);
+    }
+
+    #[test]
+    fn cpu_lists_parse_as_the_kernel_writes_them() {
+        assert_eq!(
+            parse_cpu_list("0-3,8,10-11"),
+            Some(vec![0, 1, 2, 3, 8, 10, 11])
+        );
+        assert_eq!(parse_cpu_list("5"), Some(vec![5]));
+        assert_eq!(parse_cpu_list("0-127").map(|v| v.len()), Some(128));
+        assert_eq!(parse_cpu_list("3-1"), None);
+        assert_eq!(parse_cpu_list("0-x"), None);
+    }
+
+    #[test]
+    fn physical_cores_count_each_sibling_set_once_as_the_deeplc_worker_does() {
+        // Four logical CPUs, two per core, and a fifth CPU with only the
+        // (package, core) fallback: three physical cores.
+        let root = scratch("topo");
+        for (cpu, list) in [(0, "0,2"), (1, "1,3"), (2, "0,2"), (3, "1,3")] {
+            write(
+                &root.join(format!("cpu{cpu}")).join("topology"),
+                &[("core_cpus_list", list)],
+            );
+        }
+        write(
+            &root.join("cpu4").join("topology"),
+            &[("physical_package_id", "0\n"), ("core_id", "7\n")],
+        );
+        assert_eq!(physical_cores_in(&[0, 1, 2, 3, 4], &root), Some(3));
+        // An affinity mask of one hyperthread per core counts both cores.
+        assert_eq!(physical_cores_in(&[0, 1], &root), Some(2));
+        // The pre-5.5 file name is read too.
+        write(
+            &root.join("cpu5").join("topology"),
+            &[("thread_siblings_list", "5\n")],
+        );
+        assert_eq!(physical_cores_in(&[5], &root), Some(1));
+        // A CPU with no topology at all leaves the count unknown.
+        assert_eq!(physical_cores_in(&[0, 9], &root), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn write(dir: &Path, files: &[(&str, &str)]) {

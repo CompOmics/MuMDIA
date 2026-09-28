@@ -861,9 +861,10 @@ changes nothing. With `strategy = none` the chain is byte-identical to no MBR.
 
 ### `ExperimentConfig` (config.rs:1247-1272)
 
-Options for `mumdia run-experiment` only. `parallel_runs` (default 1) is how many
-per-run search chains execute concurrently; 1 is the historical strictly
-sequential behavior. Runs are independent so raising it scales nearly linearly in
+Options for `mumdia run-experiment` only. `parallel_runs` (default `"auto"` since
+2026-09-27, previously 1) is how many per-run search chains execute concurrently; 1 is
+the historical strictly sequential behavior. Without a memory reading (any platform but
+Linux) `"auto"` runs one chain at a time (`sched::resolve_for_host`). Runs are independent so raising it scales nearly linearly in
 wall time, but each concurrent run holds its own extraction working set, so the
 practical ceiling is memory rather than cores. Results are unaffected: chunks are
 processed in index order and completion order never reaches the output.
