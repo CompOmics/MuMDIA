@@ -779,6 +779,35 @@ def test_the_projection_cache_reproduces_the_prediction_and_is_read_back(tmp_pat
     assert (entries[0] / "last_used").read_text("utf-8").strip().isdigit()
 
 
+def test_a_sharded_projection_miss_writes_the_one_process_projection(tmp_path):
+    """A miss under a K-shard plan computes the projection in K children that fill the
+    entry's file in place. At the same threads per process it must be the file a
+    one-process miss writes, byte for byte, and the prediction the same values."""
+    _deeplc_or_skip(PROJECTION_CACHE_DEEPLC)
+    _write_shard_fixture(tmp_path)
+    lib = tmp_path / "lib.parquet"
+    env = {"MUMDIA_DEEPLC_THREAD_CAP": "0", "CUDA_VISIBLE_DEVICES": "-1"}
+    plans = {"one": ["--predict-threads", "1"], "two": ["--predict-threads", "2", "--shards", "2"]}
+    outs = {}
+    for name, plan in plans.items():
+        cache = tmp_path / ("cache_" + name)
+        out = tmp_path / (name + ".parquet")
+        stdout, _ = run_worker_ok("deeplc_finetune.py", str(lib), "-", str(out), "--no-finetune",
+                                  "--threads", "1", "--predict-chunk", "64", *plan,
+                                  "--projection-cache", str(cache), env=env, timeout=1800)
+        (entry,) = [p for p in cache.iterdir()]
+        outs[name] = (out, stdout, entry)
+    assert "in 2 processes of 1 torch threads" in outs["two"][1], outs["two"][1]
+    one, two = (outs[n][2] / "projections.npy" for n in ("one", "two"))
+    assert one.read_bytes() == two.read_bytes(), "the sharded miss wrote a different projection"
+    assert (_predicted_irt(outs["one"][0]) == _predicted_irt(outs["two"][0])).all()
+    meta = json.loads((outs["two"][2] / "meta.json").read_text("utf-8"))
+    assert meta["shards"] == 2 and len(meta["per_shard"]) == 2, meta
+    # Only the entry's own files are published: no shard spec, sequence or timing file.
+    assert sorted(p.name for p in outs["two"][2].iterdir()) == [
+        "last_used", "meta.json", "projections.npy"]
+
+
 def test_a_damaged_projection_cache_entry_falls_back_and_is_set_aside(tmp_path):
     """The projection cache is on by default, so a damaged entry must cost a plain
     prediction, not the run: a truncated `projections.npy` is set aside
@@ -846,10 +875,11 @@ def test_the_projection_cache_falls_back_to_a_plain_prediction_before_deeplc_4_5
     assert not cache.exists() or not any(cache.iterdir()), list(cache.iterdir())
 
 
-def test_a_projection_cache_miss_uses_the_whole_predict_thread_budget(tmp_path):
-    """A miss computes the projection in this one process, so it gets `--predict-threads`,
-    not the budget of one of the `--shards` it replaces (2 threads here, where a 2-shard plan
-    gives each shard 1)."""
+def test_a_projection_cache_miss_follows_the_shard_plan(tmp_path):
+    """A miss computes the projection in the prediction's own shard plan: two processes of
+    one thread here (`--predict-threads 2 --shards 2`), recorded in the summary and in the
+    entry's `meta.json`. Until 2026-09-28 it ran in one process on the whole budget, which
+    took twice as long as the sharded prediction it replaced."""
     _deeplc_or_skip(PROJECTION_CACHE_DEEPLC)
     _write_shard_fixture(tmp_path)
     lib = tmp_path / "lib.parquet"
@@ -862,10 +892,12 @@ def test_a_projection_cache_miss_uses_the_whole_predict_thread_budget(tmp_path):
                   env=env, timeout=1800)
     summary = json.loads((tmp_path / "out.parquet.summary.json").read_text("utf-8"))
     assert summary["projection_cache"]["used"] and not summary["projection_cache"]["hit"]
-    assert summary["shards"]["used"] == 1 and summary["shards"]["plan"] == "projection cache"
+    assert summary["projection_cache"]["shards"] == 2, summary["projection_cache"]
+    assert summary["shards"]["used"] == 2, summary["shards"]
+    assert summary["shards"]["plan"] == "projection cache miss in 2 process(es)"
     (entry,) = [p for p in cache.iterdir()]
     meta = json.loads((entry / "meta.json").read_text("utf-8"))
-    assert meta["torch_threads"] == 2, meta
+    assert meta["shards"] == 2 and meta["torch_threads"] == 1, meta
 
 
 # ------------------------------------------------ shard clean-up (no DeepLC needed)
