@@ -621,6 +621,9 @@ struct DoctorReport {
     /// ProteoWizard `msconvert`, which covers every vendor format except Thermo and
     /// is the Thermo fallback. Also never a failure.
     msconvert: ConverterReport,
+    /// The on-disk caches (`mumdia::cache`): where they are, how large, and the bound.
+    /// Never a failure: a run without a cache builds what it would have reused.
+    caches: mumdia::cache::CachesReport,
 }
 
 /// Availability of one external converter.
@@ -954,6 +957,7 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
         roles,
         thermo,
         msconvert,
+        caches: mumdia::cache::report(&cfg),
     }
 }
 
@@ -1056,6 +1060,45 @@ fn print_doctor(rep: &DoctorReport) {
                     );
                 }
             }
+        }
+    }
+
+    println!("caches");
+    let gib = |b: u64| format!("{:.2} GiB", b as f64 / (1024.0 * 1024.0 * 1024.0));
+    match &rep.caches.root {
+        Some(root) => println!(
+            "  [ ok ] root: {root} (from {}; MUMDIA_CACHE_DIR moves it)",
+            rep.caches.root_source
+        ),
+        None => println!(
+            "  [note] root: none ({}), so the \"auto\" caches are off",
+            rep.caches.root_source
+        ),
+    }
+    println!(
+        "  [ ok ] limit: {} for the caches together (MUMDIA_CACHE_MAX_GB)",
+        rep.caches.max_bytes.map_or("unlimited".to_string(), gib)
+    );
+    for c in &rep.caches.caches {
+        match &c.dir {
+            Some(dir) => println!(
+                "  [ ok ] {}: {dir}{}, {} entries, {}",
+                c.field,
+                if c.auto { " (auto)" } else { "" },
+                c.entries,
+                gib(c.bytes)
+            ),
+            None => match c.setting.as_deref() {
+                Some(v) if v.trim().eq_ignore_ascii_case(mumdia::cache::AUTO) => println!(
+                    "  [skip] {}: off (\"auto\", and there is no cache root)",
+                    c.field
+                ),
+                v => println!(
+                    "  [skip] {}: off (setting {})",
+                    c.field,
+                    v.unwrap_or("null")
+                ),
+            },
         }
     }
 

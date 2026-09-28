@@ -125,6 +125,16 @@ Key semantics:
   Without it the search database structurally misses those peptides; old configs
   still parse because the field defaults on. `augment_library.py` reuses this
   same digest to fill an imported library's missing tryptic peptides.
+- The engine keeps two caches by default (`mumdia::cache`, docs/14 "The engine's
+  caches"): FASTA-built libraries (`predict_frag.library_cache`, byte-identical on a hit)
+  and DeepLC's trunk projection (`rt_im_train.deeplc_projection_cache`, DeepLC >= 4.5.0,
+  float-equivalent). Both default to `"auto"`, a sub-directory of `MUMDIA_CACHE_DIR` or the
+  per-user cache directory (`~/.cache/mumdia`, `~/Library/Caches/mumdia`,
+  `%LOCALAPPDATA%\mumdia\cache`), and together they are bounded by `MUMDIA_CACHE_MAX_GB`
+  (default 100 GiB, least recently used first, nothing used within the hour).
+  `MUMDIA_CACHE_DIR=off` turns them off; benchmarks that time the library build or the
+  multi-head step, or compare arms, should set it, or a fresh `MUMDIA_CACHE_DIR` per arm,
+  so that no arm reuses another's work.
 - Imported-library mode skips digest, peptidoform expansion, and initial
   prediction. Under the default `rt_im_train.library_irt = auto` the imported
   iRT is re-predicted with the DeepLC base model when a DeepLC interpreter is

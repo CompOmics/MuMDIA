@@ -407,7 +407,9 @@ and `bands` (`count`, `index`, `union_unique`). A fine-tune is refused in this m
 applies to the union prediction as it does to one table. The engine side is
 `sidecar::run_deeplc_bands`; `docs/33_window_groups.md` section 4b has the measurements.
 
-**Projection cache** (`rt_im_train.deeplc_projection_cache`, `--projection-cache DIR`).
+**Projection cache** (`rt_im_train.deeplc_projection_cache`, `--projection-cache DIR`; on by
+default since 2026-09-28 as `deeplc_projections/` under the engine's cache root, docs/14,
+"The engine's caches").
 Calibrated RT is `ridge(spline_h(head_h(proj(trunk(x)))))` over the selected heads, and only
 the head selection, the splines and the ridge depend on a run; `proj(trunk(x))`, 64 float32
 per sequence, depends on the sequence and the model alone. With a cache directory the worker
@@ -419,7 +421,15 @@ the multi-head calibration's `transform` on a `FactoredPredictionMatrix` of each
 block, or the default head for the base-model re-prediction. The key is a BLAKE2b digest of
 the DeepLC version, the model file's bytes and the exact sequence list in order
 (`projection_cache_key`, `_sequence_digest`). The entry is written into a `.tmp-<pid>`
-directory and renamed into place, so a reader never sees a partial one. A miss computes the
+directory and renamed into place, so a reader never sees a partial one. A store writes the
+entry's `last_used` file and a hit rewrites it (`mark_used`), which is what the engine's
+cache bound orders entries by. The cache is an optimisation, so every way it can fail
+falls back to a plain prediction instead of failing the run: a directory that cannot be
+created or written, less free space than the projection plus 1 GB (checked before the
+file exists, because a memory-mapped write that runs out of disk kills the process
+instead of raising), a write error, and a damaged entry, which is renamed aside as
+`<key>.broken-<pid>-<ns>` for the bound to remove
+(`test_a_damaged_projection_cache_entry_falls_back_and_is_set_aside`). A miss computes the
 projection in one process with the whole `--predict-threads` budget (after the cap), the
 threads a one-process prediction gets: `--shards` does not split it, and until 2026-09-25 a
 miss under a K-shard plan ran on one shard's `budget / K` threads, slower than either the
@@ -434,10 +444,12 @@ multi-head calibration the spline edges amplify them
 (`test_the_projection_cache_reproduces_the_prediction_and_is_read_back`).
 It needs DeepLC 4.5.0 or newer. The factored matrix (`deeplc._factored`,
 `FactoredPredictionMatrix._projections`) and `_model_ops.supports_factored` are private
-DeepLC API added in 4.5.0; 4.4.x, the engine's floor, has neither. There the worker prints a
-warning, records `projection_cache: {"used": false, "why": ...}` naming the version, writes
-no cache entry and predicts exactly as without the flag, so setting it is harmless but does
-nothing. A later release that moves these names falls back the same way. CI pins 4.4.0, so
+DeepLC API added in 4.5.0; 4.4.x, the engine's floor, has neither. There the worker records
+`projection_cache: {"used": false, "why": ...}` naming the version, writes no cache entry and
+predicts exactly as without the flag, so setting it is harmless but does nothing. It prints
+a warning when the configuration named the directory, and a plain line when the engine
+passed its default (`--projection-cache-default`, sent for `"auto"`), which asks for the
+cache only where DeepLC can serve it. A later release that moves these names falls back the same way. CI pins 4.4.0, so
 it tests that fallback (`test_the_projection_cache_falls_back_to_a_plain_prediction_before_deeplc_4_5`);
 the cache tests themselves skip below 4.5.0.
 

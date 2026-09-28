@@ -597,6 +597,14 @@ def render_default(
         return type_default(target, enums, structs)
     if e == "None":
         return "null"
+    # `Some(x)` of an `Option<T>` field is the value `x` itself: a config sets the value,
+    # never the Option (`library_cache: Some("auto".to_string())` is `"auto"`).
+    m = re.fullmatch(r"Some\((.*)\)", e, re.S)
+    if m:
+        inner_type = rtype.strip()
+        if inner_type.startswith("Option<") and inner_type.endswith(">"):
+            inner_type = inner_type[len("Option<") : -1]
+        return render_default(m.group(1), inner_type, enums, structs)
     if e in ("Vec::new()", "vec![]", "Vec::default()"):
         return "[]"
     if e in ("true", "false"):

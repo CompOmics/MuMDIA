@@ -147,6 +147,28 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **The library cache and the DeepLC projection cache are on by default, in one bounded
+  cache root.** `predict_frag.library_cache` and `rt_im_train.deeplc_projection_cache`
+  default to `"auto"`: `libraries/` and `deeplc_projections/` under `MUMDIA_CACHE_DIR`, or,
+  when that is unset, under the per-user cache directory (`$XDG_CACHE_HOME/mumdia` or
+  `~/.cache/mumdia` on Linux, `~/Library/Caches/mumdia` on macOS,
+  `%LOCALAPPDATA%\mumdia\cache` on Windows). A path in the configuration is used as given,
+  and `null` (or `"off"`) turns a cache off; `MUMDIA_CACHE_DIR=off` turns both `"auto"`
+  caches off. Together they are bounded by `MUMDIA_CACHE_MAX_GB` (default 100, GiB): after a
+  library store and at the end of every `run` and `run-experiment` the least recently used
+  entries are removed, never one used within the last hour, and a run that leaves the caches
+  over the bound says so. A library hit is byte-identical to a rebuild (an E. coli FASTA
+  search 14:56 -> 3:24 on a hit). The projection cache is float-equivalent to a plain
+  prediction and needs DeepLC 4.5.0 or newer; on 4.4.x it does nothing and, under the
+  default, says so in a plain line rather than a warning. It was gated on 10 NN seeds a run
+  before becoming the default (DeepLC 4.5.0, multi-head calibration): an Orbitrap AIF
+  entrapment run gave the same peptides at 1% seed for seed (FDP 0.984% either way), an
+  Astral run -0.016% (Welch t -0.18), and hits took them from 8:04 to 1:40 and from 12:46 to
+  5:12.
+  `mumdia doctor` reports the root, the bound and each cache's size. The Docker image sets
+  `MUMDIA_CACHE_DIR=/cache` (mount a named volume to keep it). A projection cache that
+  cannot be written, lacks room or holds a damaged entry now falls back to a plain
+  prediction instead of failing the run.
 - **`rescore.handoff` defaults to `raw`** (was `parquet`). The `nn_torch` worker is given
   a row-major f32 `.npy` matrix, a metadata parquet and a `.raw.json` description, so
   neither side runs the parquet codec. The scores are byte-identical to `parquet`: the
