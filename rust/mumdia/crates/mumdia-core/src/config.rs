@@ -583,9 +583,13 @@ pub struct PredictFragConfig {
     /// `psms_scored.parquet`, the three quant tables and both TSVs byte-identical to a run
     /// with `false`, and the run 14:56 -> 12:29.
     pub defer_deeplc_to_multihead: bool,
-    /// A directory in which `run` and `run-experiment` keep the library they build from a
-    /// FASTA, and reuse it on a later run. Unset (default): every FASTA run builds its
-    /// library, as before.
+    /// Where `run` and `run-experiment` keep the library they build from a FASTA, to reuse
+    /// it on a later run. `"auto"` (the default since 2026-09-28): `libraries/` under the
+    /// engine's cache root, which is `MUMDIA_CACHE_DIR` when it is set and otherwise the
+    /// per-user cache directory (`$XDG_CACHE_HOME/mumdia` or `~/.cache/mumdia` on Linux,
+    /// `~/Library/Caches/mumdia` on macOS, `%LOCALAPPDATA%\mumdia\cache` on Windows;
+    /// `MUMDIA_CACHE_DIR=off` turns `"auto"` off). A path: that directory, as given. `null`
+    /// or `"off"`: every FASTA run builds its library, the behaviour before 2026-09-28.
     ///
     /// A FASTA-mode run digests, expands peptidoforms and predicts the library on every
     /// invocation, and one `run` per file is the way to search files separately, so each
@@ -608,8 +612,13 @@ pub struct PredictFragConfig {
     /// build's are removed). Validate by running one FASTA search twice with the same cache
     /// directory and comparing `peptides.tsv` and `proteins.tsv` (the smoke test does this).
     /// A stored entry whose files changed is rebuilt and replaced, and temporary
-    /// directories left by a killed store are removed after an hour; entries themselves are
-    /// never deleted by the engine, so remove the directory to reclaim the space.
+    /// directories left by a killed store are removed after an hour. The cache is bounded:
+    /// after a run stores into it, the least recently used entries of this cache and of
+    /// `rt_im_train.deeplc_projection_cache` are removed until the two together are within
+    /// `MUMDIA_CACHE_MAX_GB` (default 100 GiB; an entry used within the last hour is kept).
+    /// The key covers the running executable, so every engine build stores its own entries
+    /// and the bound is what removes the old ones. `mumdia doctor` reports the directory
+    /// and its size.
     pub library_cache: Option<String>,
 }
 impl Default for PredictFragConfig {
@@ -629,7 +638,7 @@ impl Default for PredictFragConfig {
             deeplc_python: None,
             sidecar_script_dir: "scripts".to_string(),
             defer_deeplc_to_multihead: true,
-            library_cache: None,
+            library_cache: Some("auto".to_string()),
         }
     }
 }
@@ -827,7 +836,12 @@ pub struct RtImTrainConfig {
     /// process-tree peak.
     pub deeplc_predict_shards: usize,
     /// Directory for DeepLC's run-independent trunk projection (`deeplc_finetune.py
-    /// --projection-cache`). `null` (the default) is off.
+    /// --projection-cache`). `"auto"` (the default since 2026-09-28): `deeplc_projections/`
+    /// under the engine's cache root (`MUMDIA_CACHE_DIR`, else the per-user cache
+    /// directory, as for `predict_frag.library_cache`). A path: that directory. `null` or
+    /// `"off"`: off, the behaviour before 2026-09-28. The two caches share the
+    /// `MUMDIA_CACHE_MAX_GB` bound (default 100 GiB, least recently used entries removed
+    /// first).
     ///
     /// Calibrated RT is `ridge(spline_h(head_h(proj(trunk(x)))))` over the selected heads,
     /// and only the head selection, the splines and the ridge depend on a run. The
@@ -844,8 +858,9 @@ pub struct RtImTrainConfig {
     /// it). Base model only: a fine-tune has no factored head and ignores it.
     ///
     /// Needs DeepLC 4.5.0 or newer, which added the factored prediction matrix it reads.
-    /// On DeepLC 4.4.x (the engine's floor) the worker warns, records why in the summary,
-    /// writes nothing and predicts exactly as without it.
+    /// On DeepLC 4.4.x (the engine's floor) the worker records why in the summary, writes
+    /// nothing and predicts exactly as without it; it warns only when the directory was
+    /// named explicitly, since `"auto"` asks for the cache wherever it is available.
     ///
     /// Float-equivalent, not bit-identical: the heads are evaluated in numpy from the cached
     /// factors instead of in torch. Measured with DeepLC 4.5.0 on CPU: the base-model
@@ -857,7 +872,12 @@ pub struct RtImTrainConfig {
     /// edge amplification a thread-count change shows too (docs/13). A hit took 0.12 s
     /// against 7.0 s for the prediction. Validate at scale as a DeepLC version change:
     /// per-row max |delta predicted_irt|, the selected heads, and peptides at 1% inside the
-    /// seed spread on two acquisitions.
+    /// seed spread on two acquisitions. That gate ran before it became the default (DeepLC
+    /// 4.5.0, multi-head calibration, 10 NN seeds a run): an Orbitrap AIF entrapment run gave
+    /// the same peptides at 1% seed for seed with and without the cache (mean 10,131.5, FDP
+    /// 0.984% either way), and an Astral run -0.016% (81,167.0 -> 81,154.0, Welch t -0.18).
+    /// Hits there took the entrapment run from 8:04 to 1:40 and the Astral run from 12:46
+    /// to 5:12.
     pub deeplc_projection_cache: Option<String>,
 }
 
@@ -946,7 +966,7 @@ impl Default for RtImTrainConfig {
             window_holdout_frac: 0.0,
             library_irt: LibraryIrt::Auto,
             deeplc_predict_shards: 0,
-            deeplc_projection_cache: None,
+            deeplc_projection_cache: Some("auto".to_string()),
         }
     }
 }
@@ -1786,7 +1806,7 @@ pub struct RescoreConfig {
     /// compatibility.
     pub strict: bool,
     /// How the feature matrix reaches a sidecar rescorer. See [`Handoff`]. Defaults to
-    /// `parquet`, which applies to nn_torch only; mokapot and entrapment sidecars always
+    /// `raw`, which applies to nn_torch only; mokapot and entrapment sidecars always
     /// receive the tab-separated PIN.
     #[serde(default)]
     pub handoff: Handoff,
@@ -1907,7 +1927,7 @@ impl Default for RescoreConfig {
             entrapment_contaminant_markers: Vec::new(),
             entrapment_ratio: 1.0,
             strict: true,
-            handoff: Handoff::Parquet,
+            handoff: Handoff::Raw,
             features: None,
             features_file: None,
             // The training recipe of docs/28 section 15, default since 2026-09-05: measured
@@ -1977,7 +1997,8 @@ pub enum Handoff {
     /// Tab-separated PIN. Percolator's format, and what `mokapot.read_pin` requires, so it
     /// is what a mokapot or entrapment sidecar receives whatever this is set to.
     Tsv,
-    /// Parquet feature table with f32 features, and the default since 2026-09-05.
+    /// Parquet feature table with f32 features: the default from 2026-09-05 until `Raw`
+    /// replaced it on 2026-09-28, with identical scores.
     ///
     /// The TSV path makes the worker parse every column into a float64 pandas frame before
     /// it builds its float32 matrix, so the text file, the frame and the matrix are alive
@@ -1996,12 +2017,15 @@ pub enum Handoff {
     ///
     /// nn_torch only: `mokapot_worker.py` calls `mokapot.read_pin()` and cannot read
     /// Parquet, so a mokapot run falls back to `Tsv` with a warning instead of failing.
-    #[default]
+    ///
+    /// Choose it over `Raw` where the sidecar directory is short of room: a parquet file
+    /// has no size floor, so the space check only warns for it, while a raw matrix is
+    /// exactly 4 bytes a value and is refused below that.
     Parquet,
-    /// Opt-in: the features as one row-major little-endian f32 `.npy` matrix, beside a
-    /// small parquet of the metadata columns and a `<name>.raw.json` description (feature
-    /// names, per-feature min/max, the parquet handoff's row-group size) that the worker is
-    /// given.
+    /// The default since 2026-09-28: the features as one row-major little-endian f32
+    /// `.npy` matrix, beside a small parquet of the metadata columns and a
+    /// `<name>.raw.json` description (feature names, per-feature min/max, the parquet
+    /// handoff's row-group size) that the worker is given.
     ///
     /// The engine streams each decoded batch straight into the file with no transpose and
     /// no parquet encode, and the worker copies the matrix into its own with no decode and
@@ -2010,8 +2034,9 @@ pub enum Handoff {
     /// strided fill of every column. The file is the raw size, 4 bytes a value, about 11%
     /// more than the snappy parquet there, so it pays where the codec, not the disk, is the
     /// limit (a RAM-backed `MUMDIA_SIDECAR_DIR`, an SSD). Features that compress well make
-    /// the gap much larger: docs/13 has a table where the raw write was the slower one, so
-    /// measure on the data first.
+    /// the file gap much larger, and docs/13 records a small table where the raw write was
+    /// the slower one; on the benchmark pools of the 2026-09-27 campaign the two walls were
+    /// within a minute of each other, with byte-identical scored tables.
     ///
     /// Scores are byte-identical to `Parquet`: the worker fills the same matrix and sums
     /// the float64 moments over the same partition (the description carries the row-group
@@ -2019,6 +2044,11 @@ pub enum Handoff {
     /// pool with each handoff, same seed and threads, and comparing `psms_scored.parquet`
     /// byte for byte (`tests/python/test_nn_rescore_worker.py` does it on a fixture).
     /// nn_torch only; a mokapot run falls back to `Tsv` with a warning.
+    ///
+    /// The sidecar space check refuses the run when the work directory cannot hold the
+    /// matrix (exactly 4 bytes a value, docs/13); set `Parquet` where the room is short, or
+    /// point `MUMDIA_SIDECAR_DIR` elsewhere.
+    #[default]
     Raw,
 }
 

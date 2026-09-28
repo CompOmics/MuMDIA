@@ -17,6 +17,11 @@
 #   docker run --rm ghcr.io/compomics/mumdia \
 #       doctor --config /opt/mumdia/config.dia.json
 #
+# The engine keeps FASTA-built libraries and DeepLC's trunk projection in /cache
+# (MUMDIA_CACHE_DIR, docs/14), so a second search of the same FASTA skips the library
+# build. Add a named volume to keep it between containers, e.g.
+# `-v mumdia-cache:/cache`; without one the cache lasts as long as the container.
+#
 # The baked /opt/mumdia/config.dia.json wires the FASTA workflow to the in-image
 # conda envs. /opt/mumdia/config.diann-lib.json selects imported-library
 # fine-tuning plus the torch rescorer.
@@ -74,6 +79,11 @@ COPY LICENSE THIRD_PARTY_LICENSES.md sbom.cdx.json /opt/mumdia/
 # mokapot logistic-regression is the recommended default rescorer.
 ENV MUMDIA_RESCORE_MODEL=logreg
 
+# The engine's caches (`mumdia::cache`): world-writable with the sticky bit, like /tmp,
+# because the container runs as the caller's uid (see --user above).
+ENV MUMDIA_CACHE_DIR=/cache
+RUN mkdir -p /cache && chmod 1777 /cache
+
 # Standard OCI metadata, so the published image says what it is and links back to
 # the source. The version label is filled from the tag by the build workflow.
 LABEL org.opencontainers.image.title="MuMDIA" \
@@ -91,8 +101,8 @@ WORKDIR /data
 # The container user's uid is assigned by the base image and will not match your
 # host uid, so pass `--user "$(id -u):$(id -g)"` (as the usage example above does)
 # whenever you bind-mount a directory the engine has to write to. Everything
-# MuMDIA writes lands under --out-dir inside that mount, so no path in the image
-# needs to be writable at run time.
+# MuMDIA writes lands under --out-dir inside that mount, except its caches, which go
+# to the world-writable /cache.
 USER $MAMBA_USER
 ENTRYPOINT ["mumdia"]
 CMD ["--help"]

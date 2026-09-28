@@ -680,6 +680,11 @@ def main():
                          "values are float-equivalent to a plain prediction, not "
                          "bit-identical (the heads are evaluated in numpy from the cached "
                          "factors instead of in torch).")
+    ap.add_argument("--projection-cache-default", action="store_true",
+                    help="--projection-cache is the engine's default location (\"auto\"), not "
+                         "a directory the configuration names: a DeepLC without the factored "
+                         "prediction matrix (before 4.5.0) is then reported in a plain line "
+                         "rather than a warning, and the prediction is the same either way.")
     ap.add_argument("--predict-chunk", type=int, default=PREDICT_CHUNK, metavar="N",
                     help="unique peptidoforms per prediction call (default %d). Shards are "
                          "cut at multiples of it. Changing it changes how DeepLC batches the "
@@ -853,7 +858,8 @@ def main():
         if predict_threads != torch.get_num_threads():
             torch.set_num_threads(predict_threads)
         values, cache_record, timers = predict_from_projections(
-            uniq, base_model, calibration, chunk, args.projection_cache)
+            uniq, base_model, calibration, chunk, args.projection_cache,
+            default_dir=args.projection_cache_default)
         if values is not None:
             n_shards = 1
             shard_record["used"] = 1
@@ -1158,7 +1164,19 @@ def projection_cache_key(uniq, model_path):
     return h.hexdigest()
 
 
-def predict_from_projections(uniq, model, calibration, chunk, cache_dir):
+def mark_used(entry_dir):
+    """Record that the cache entry at `entry_dir` was used now: its `last_used` file, whose
+    modification time the engine's cache bound orders entries by (`mumdia::cache`), so the
+    least recently used ones are removed first and one read within the last hour never is.
+    A cache that cannot be written still serves the read."""
+    try:
+        with open(os.path.join(entry_dir, "last_used"), "w", encoding="utf-8") as fh:
+            fh.write("%d\n" % int(time.time()))
+    except OSError:
+        pass
+
+
+def predict_from_projections(uniq, model, calibration, chunk, cache_dir, default_dir=False):
     """Predict `uniq` from the base model's cached trunk projection, computing it once.
 
     Calibrated RT is `ridge(spline_h(head_h(proj(trunk(x)))))` over the selected heads, and
@@ -1174,10 +1192,13 @@ def predict_from_projections(uniq, model, calibration, chunk, cache_dir):
     factored head, in which case the caller predicts as usual. Private DeepLC API:
     `deeplc._factored.FactoredPredictionMatrix._projections` and
     `_model_ops.supports_factored` were added in DeepLC 4.5.0 (`core._default_task_idx` is
-    older). DeepLC 4.4.x, the engine's floor, has neither, so there the cache warns, records
-    why, and the caller predicts as usual; a later release that moves them falls back the
-    same way.
+    older). DeepLC 4.4.x, the engine's floor, has neither, so there the cache records why and
+    the caller predicts as usual; a later release that moves them falls back the same way.
+    That is a warning when the configuration named the directory, and a plain line when it
+    is the engine's default (`default_dir`), which asks for the cache only where it works.
     """
+    notice = "projection cache (the engine's default, rt_im_train.deeplc_projection_cache = " \
+             "\"auto\")" if default_dir else "WARNING: projection cache"
     try:
         from deeplc import _model_ops
         from deeplc._factored import FactoredPredictionMatrix
@@ -1185,12 +1206,11 @@ def predict_from_projections(uniq, model, calibration, chunk, cache_dir):
     except ImportError as exc:
         why = ("DeepLC %s has no factored prediction matrix (deeplc._factored, added in "
                "4.5.0): %s" % (getattr(deeplc, "__version__", "?"), exc))
-        print("WARNING: projection cache unavailable: %s; predicting as usual" % why,
-              flush=True)
+        print("%s unavailable: %s; predicting as usual" % (notice, why), flush=True)
         return None, {"used": False, "why": why}, None
     if model is None or not _model_ops.supports_factored(model):
-        print("WARNING: projection cache: this model has no factored head; predicting as "
-              "usual", flush=True)
+        print("%s: this model has no factored head; predicting as usual" % notice,
+              flush=True)
         return None, {"used": False, "why": "no factored head"}, None
     t0 = time.perf_counter()
     key = projection_cache_key(uniq, DEFAULT_MODEL)
@@ -1205,9 +1225,27 @@ def predict_from_projections(uniq, model, calibration, chunk, cache_dir):
     timers = PredictTimers()
     hit = os.path.exists(path)
     t1 = time.perf_counter()
+    def unusable(why):
+        # The cache is an optimisation: whatever is wrong with it, predict as usual.
+        print("%s: %s; predicting as usual" % (notice, why), flush=True)
+        return None, {"used": False, "why": why}, None
+
     if not hit:
-        os.makedirs(cache_dir, exist_ok=True)
-        work = tempfile.mkdtemp(prefix=f"{key}.tmp-{os.getpid()}.", dir=cache_dir)
+        need = len(uniq) * rank * 4 + 4096
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            free = shutil.disk_usage(cache_dir).free
+        except OSError as exc:
+            return unusable("cannot use the directory %s (%s)" % (cache_dir, exc))
+        # Checked before the file exists: a memory-mapped write that runs out of disk
+        # kills the process (SIGBUS) instead of raising, so it must not be attempted.
+        if free < need + (1 << 30):
+            return unusable("%s has %.2f GB free and the projection needs %.2f GB plus 1 GB "
+                            "of headroom" % (cache_dir, free / 1e9, need / 1e9))
+        try:
+            work = tempfile.mkdtemp(prefix=f"{key}.tmp-{os.getpid()}.", dir=cache_dir)
+        except OSError as exc:
+            return unusable("cannot write to %s (%s)" % (cache_dir, exc))
         try:
             proj = np.lib.format.open_memmap(os.path.join(work, "projections.npy"), mode="w+",
                                              dtype=np.float32, shape=(len(uniq), rank))
@@ -1231,22 +1269,36 @@ def predict_from_projections(uniq, model, calibration, chunk, cache_dir):
                            "deeplc": getattr(deeplc, "__version__", ""),
                            "model": str(DEFAULT_MODEL), "chunk": chunk,
                            "torch_threads": torch.get_num_threads()}, fh, indent=2)
+            mark_used(work)
             try:
                 os.replace(work, final)
             except OSError:
                 # Another call wrote the same key first; its projections are the same.
                 shutil.rmtree(work, ignore_errors=True)
-        except (TypeError, AttributeError) as exc:
+        except (TypeError, AttributeError, OSError) as exc:
             shutil.rmtree(work, ignore_errors=True)
-            print("WARNING: projection cache: %s; predicting as usual" % exc, flush=True)
-            return None, {"used": False, "why": str(exc)}, None
+            return unusable(str(exc))
         except BaseException:
             shutil.rmtree(work, ignore_errors=True)
             raise
     t_proj = time.perf_counter() - t1
-    proj = np.load(path, mmap_mode="r")
-    if proj.shape != (len(uniq), rank):
-        raise SystemExit(f"{path} holds {proj.shape}, expected ({len(uniq)}, {rank})")
+    if hit:
+        mark_used(final)
+    try:
+        proj = np.load(path, mmap_mode="r")
+        shape = proj.shape
+    except (OSError, ValueError) as exc:
+        proj, shape = None, "unreadable (%s)" % exc
+    if proj is None or shape != (len(uniq), rank):
+        # The key covers the exact sequence list, so this is a damaged entry. Set it aside
+        # (a later store rewrites the key; the engine's cache bound removes the leftover)
+        # and predict as usual rather than failing the run.
+        del proj
+        try:
+            os.replace(final, "%s.broken-%d-%d" % (final, os.getpid(), time.time_ns()))
+        except OSError:
+            pass
+        return unusable("%s holds %s, expected (%d, %d)" % (path, shape, len(uniq), rank))
     t2 = time.perf_counter()
     default_head = None if calibration is not None else int(_default_task_idx(model))
     values = np.empty(len(uniq), dtype=np.float64)

@@ -678,7 +678,7 @@ so the struct holds exactly these fields and unknown keys are rejected):
 | `ms2pip_python` | `None` | interpreter for the MS2PIP sidecar; required when `predictor=ms2pip`, else the stage errors |
 | `deeplc_python` | `None` | interpreter for the DeepLC sidecar; required when `rt_predictor=deeplc`, else the stage errors |
 | `sidecar_script_dir` | `"scripts"` | directory searched by `resolve_script` for the worker scripts |
-| `library_cache` | `None` | directory in which `run` and `run-experiment` store a FASTA-built library and reuse it on a later run with the same key (see "Reusing a FASTA-built library" below) |
+| `library_cache` | `"auto"` | where `run` and `run-experiment` store a FASTA-built library and reuse it on a later run with the same key: `"auto"` is `libraries/` under the engine's cache root (docs/14, "The engine's caches"), a path is that directory, `null` is off (see "Reusing a FASTA-built library" below) |
 
 ### Reusing a FASTA-built library
 
@@ -699,8 +699,10 @@ same and nothing is re-predicted. The manifest of such a run records the library
 imported. A library whose iRT is a deferred DeepLC placeholder
 (`defer_deeplc_to_multihead`) is never offered this way.
 
-With `predict_frag.library_cache` set to a directory, the run stays in FASTA mode and
-reuses the library by itself (`library_cache::LibraryCache`). The key is a hash of the
+With `predict_frag.library_cache` on (`"auto"`, the default since 2026-09-28, or a
+directory), the run stays in FASTA mode and reuses the library by itself
+(`library_cache::LibraryCache`). `"auto"` resolves to `libraries/` under the engine's cache
+root (`cache::library_dir`; docs/14, "The engine's caches"). The key is a hash of the
 FASTA's content, the `digest`, `peptidoforms` and `predict_frag` sections (all but the
 cache directory), `rng_seed`, whether the iRT is a deferred placeholder, the installed
 MS2PIP, AlphaPeptDeep and DeepLC versions the build uses, the content of the worker
@@ -720,7 +722,13 @@ another run. A stored file whose size or content changed is a miss: the run rebu
 and its store moves the unusable entry aside and replaces it, so the next run hits again.
 A store also removes temporary directories a killed store left behind once they have
 gone unwritten for an hour. When a predictor version cannot be read the run builds as
-usual and stores nothing. The engine never deletes a usable entry.
+usual and stores nothing. A restore and a store write the entry's `last_used` file, which
+is not one of the listed files; the cache bound (`cache::enforce_budget`, after a store
+and at the end of every `run` and `run-experiment`) removes the least recently used
+entries of this cache and the DeepLC projection cache until the two are within
+`MUMDIA_CACHE_MAX_GB` (default 100 GiB), never one used within the last hour. The key
+covers the running executable, so every engine build stores new entries and the bound is
+what retires the old ones.
 
 A hit is byte-identical to a rebuild when the build is deterministic, which the native
 predictors are; the smoke test runs one FASTA search twice with a cache (store, then

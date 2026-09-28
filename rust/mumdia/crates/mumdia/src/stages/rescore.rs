@@ -5683,63 +5683,111 @@ b
         // the competed parquet straight into the handoff, and no `FeatureMatrix` is
         // allocated. Driven with an interpreter that cannot be spawned, so the run fails at
         // the child rather than needing a Python environment -- but only AFTER the handoff
-        // has been written from the streamed features, which is what is asserted.
-        let competed = scratch("run_competed.parquet");
-        crafted_competed_table(&competed, 24);
-        let work = scratch("run_work");
-        let out = scratch("run_scored.parquet");
-        let cfg = RescoreConfig {
-            classifier: RescorerKind::NnTorch,
-            strict: true,
-            python: Some("mumdia-no-such-interpreter-for-this-test".to_string()),
-            ..Default::default()
-        };
-        let err = run(RescoreParams {
-            competed: &[competed],
-            sources: None,
-            out: &out,
-            work_dir: &work,
-            script_dir: "scripts",
-            cfg: &cfg,
-            config_hash: "test",
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("NnTorch sidecar failed") && err.contains("strict"),
-            "{err}"
-        );
-        // The handoff is a parquet (the default `handoff`), named per invocation, and holds
-        // every row exactly once in flat order with the PIN column contract.
-        let handoffs = handoffs_in(&work, &out);
-        assert_eq!(handoffs.len(), 1, "{handoffs:?}");
-        let t = mumdia_io::table::Table::read(&handoffs[0]).unwrap();
-        assert_eq!(t.nrows, 24);
-        assert_eq!(t.i32("ScanNr").unwrap(), (0..24).collect::<Vec<i32>>());
+        // has been written from the streamed features, which is what is asserted. Both
+        // handoffs: the default `raw` and `parquet`.
+        use mumdia_core::config::Handoff;
         assert_eq!(
-            t.i32("Label").unwrap(),
-            (0..24)
-                .map(|i| if i % 2 == 0 { 1 } else { -1 })
-                .collect::<Vec<i32>>()
+            RescoreConfig::default().handoff,
+            Handoff::Raw,
+            "the default handoff"
         );
-        assert_eq!(
-            t.f32("feat_a").unwrap(),
-            (0..24)
+        for handoff in [Handoff::Raw, Handoff::Parquet] {
+            let tag = format!("{handoff:?}").to_lowercase();
+            let competed = scratch(&format!("run_{tag}_competed.parquet"));
+            crafted_competed_table(&competed, 24);
+            let work = scratch(&format!("run_{tag}_work"));
+            let out = scratch(&format!("run_{tag}_scored.parquet"));
+            let cfg = RescoreConfig {
+                classifier: RescorerKind::NnTorch,
+                strict: true,
+                python: Some("mumdia-no-such-interpreter-for-this-test".to_string()),
+                handoff,
+                ..Default::default()
+            };
+            let err = run(RescoreParams {
+                competed: &[competed],
+                sources: None,
+                out: &out,
+                work_dir: &work,
+                script_dir: "scripts",
+                cfg: &cfg,
+                config_hash: "test",
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("NnTorch sidecar failed") && err.contains("strict"),
+                "{tag}: {err}"
+            );
+            // The handoff is named per invocation and holds every row exactly once in flat
+            // order with the PIN column contract.
+            let handoffs = handoffs_in(&work, &out);
+            assert_eq!(handoffs.len(), 1, "{tag}: {handoffs:?}");
+            let labels: Vec<i32> = (0..24).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
+            let feat_a: Vec<f32> = (0..24)
                 .map(|i| if i % 2 == 0 { 3.0f32 } else { 0.5 })
-                .collect::<Vec<f32>>()
-        );
+                .collect();
+            let (meta, got_a) = match handoff {
+                Handoff::Parquet => {
+                    assert!(handoffs[0].ends_with(".features.parquet"), "{handoffs:?}");
+                    let t = mumdia_io::table::Table::read(&handoffs[0]).unwrap();
+                    let a = t.f32("feat_a").unwrap();
+                    (t, a)
+                }
+                _ => {
+                    // The description, then the matrix and the metadata it names.
+                    assert!(handoffs[0].ends_with(".features.raw.json"), "{handoffs:?}");
+                    let desc: serde_json::Value = mumdia_io::json::read_json(&handoffs[0]).unwrap();
+                    assert_eq!(desc["rows"], 24);
+                    let names: Vec<String> =
+                        serde_json::from_value(desc["features"].clone()).unwrap();
+                    let dir = std::path::Path::new(&handoffs[0]).parent().unwrap();
+                    let file = |key: &str| {
+                        dir.join(desc[key].as_str().unwrap())
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    let (rows, cols, values) = read_npy_f32(&file("features_file"));
+                    assert_eq!((rows, cols), (24, names.len()));
+                    let k = names.iter().position(|n| n == "feat_a").unwrap();
+                    let a: Vec<f32> = (0..rows).map(|r| values[r * cols + k]).collect();
+                    (
+                        mumdia_io::table::Table::read(&file("metadata_file")).unwrap(),
+                        a,
+                    )
+                }
+            };
+            assert_eq!(meta.nrows, 24, "{tag}");
+            assert_eq!(
+                meta.i32("ScanNr").unwrap(),
+                (0..24).collect::<Vec<i32>>(),
+                "{tag}"
+            );
+            assert_eq!(meta.i32("Label").unwrap(), labels, "{tag}");
+            assert_eq!(got_a, feat_a, "{tag}");
+        }
     }
 
     /// Drive `run` down the streamed-handoff path (strict + a sidecar classifier + an
     /// interpreter that cannot be spawned) and return the error, the handoff path the
     /// invocation used, and its work directory.
     fn run_streamed(competed: &str, name: &str) -> (String, String, String) {
+        run_streamed_with(competed, name, RescoreConfig::default().handoff)
+    }
+
+    /// [`run_streamed`] with the handoff named.
+    fn run_streamed_with(
+        competed: &str,
+        name: &str,
+        handoff: mumdia_core::config::Handoff,
+    ) -> (String, String, String) {
         let work = scratch(&format!("{name}_work"));
         let out = scratch(&format!("{name}_scored.parquet"));
         let cfg = RescoreConfig {
             classifier: RescorerKind::NnTorch,
             strict: true,
             python: Some("mumdia-no-such-interpreter-for-this-test".to_string()),
+            handoff,
             ..Default::default()
         };
         let err = run(RescoreParams {
@@ -5767,8 +5815,23 @@ b
         (err, handoff, work)
     }
 
-    /// The parquet handoffs in `work` named after `out` by this process
-    /// (`rescore_<out stem>_<PID>_<nonce>.features.parquet`).
+    /// Whether a file name is a handoff's: the parquet table, the raw description, matrix or
+    /// metadata, or the PIN.
+    fn is_handoff_file(name: &str) -> bool {
+        [
+            ".features.parquet",
+            ".features.raw.json",
+            ".features.f32.npy",
+            ".features.meta.parquet",
+            ".pin",
+        ]
+        .iter()
+        .any(|ext| name.ends_with(ext))
+    }
+
+    /// The handoffs in `work` named after `out` by this process: the parquet table or the
+    /// raw description (`rescore_<out stem>_<PID>_<nonce>.features.parquet` or
+    /// `.features.raw.json`), one per invocation.
     fn handoffs_in(work: &str, out: &str) -> Vec<String> {
         let prefix = format!(
             "rescore_{}_{}_",
@@ -5783,7 +5846,11 @@ b
             .map(|d| {
                 d.filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().to_string())
-                    .filter(|n| n.starts_with(&prefix) && n.ends_with(".features.parquet"))
+                    .filter(|n| {
+                        n.starts_with(&prefix)
+                            && (n.ends_with(".features.parquet")
+                                || n.ends_with(".features.raw.json"))
+                    })
                     .map(|n| format!("{work}/{n}"))
                     .collect()
             })
@@ -5798,7 +5865,7 @@ b
             .map(|d| {
                 d.filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().to_string())
-                    .filter(|n| n.contains(".features.parquet") || n.ends_with(".pin"))
+                    .filter(|n| is_handoff_file(n))
                     .collect()
             })
             .unwrap_or_default();
@@ -5813,18 +5880,22 @@ b
         // reported it after `finish()`: the full handoff -- hundreds of GB at experiment
         // scale -- was written and published for a run that was always going to abort.
         // The row and column named must not change, and the file must not be there.
-        let competed = scratch("nanfeat_competed.parquet");
-        crafted_competed_table_planting(&competed, 24, Some(3), None);
-        let (err, handoff, work) = run_streamed(&competed, "nanfeat");
-        assert_eq!(
-            err, "rescore input contains non-finite feature 'feat_b' at flat row 3: NaN",
-            "the message must name the same row and column the serial scan named"
-        );
-        assert!(
-            !std::path::Path::new(&handoff).exists(),
-            "the handoff must not survive a stream that aborted: {handoff}"
-        );
-        no_handoff_rubble(&work);
+        use mumdia_core::config::Handoff;
+        for handoff in [Handoff::Raw, Handoff::Parquet] {
+            let tag = format!("nanfeat_{handoff:?}").to_lowercase();
+            let competed = scratch(&format!("{tag}_competed.parquet"));
+            crafted_competed_table_planting(&competed, 24, Some(3), None);
+            let (err, handoff, work) = run_streamed_with(&competed, &tag, handoff);
+            assert_eq!(
+                err, "rescore input contains non-finite feature 'feat_b' at flat row 3: NaN",
+                "the message must name the same row and column the serial scan named"
+            );
+            assert!(
+                !std::path::Path::new(&handoff).exists(),
+                "the handoff must not survive a stream that aborted: {handoff}"
+            );
+            no_handoff_rubble(&work);
+        }
     }
 
     #[test]
@@ -5832,15 +5903,19 @@ b
         // The scalar scan runs before the stream, so its row is already known; the stream
         // still has to reach that row before the message is decided (an earlier bad feature
         // would win), and must stop there rather than write the remaining rows.
-        let competed = scratch("nanmz_competed.parquet");
-        crafted_competed_table_planting(&competed, 24, None, Some(2));
-        let (err, handoff, work) = run_streamed(&competed, "nanmz");
-        assert_eq!(
-            err,
-            "rescore input contains non-finite prelim_score/precursor_mz at flat row 2"
-        );
-        assert!(!std::path::Path::new(&handoff).exists(), "{handoff}");
-        no_handoff_rubble(&work);
+        use mumdia_core::config::Handoff;
+        for handoff in [Handoff::Raw, Handoff::Parquet] {
+            let tag = format!("nanmz_{handoff:?}").to_lowercase();
+            let competed = scratch(&format!("{tag}_competed.parquet"));
+            crafted_competed_table_planting(&competed, 24, None, Some(2));
+            let (err, handoff, work) = run_streamed_with(&competed, &tag, handoff);
+            assert_eq!(
+                err,
+                "rescore input contains non-finite prelim_score/precursor_mz at flat row 2"
+            );
+            assert!(!std::path::Path::new(&handoff).exists(), "{handoff}");
+            no_handoff_rubble(&work);
+        }
     }
 
     #[test]

@@ -125,6 +125,16 @@ Key semantics:
   Without it the search database structurally misses those peptides; old configs
   still parse because the field defaults on. `augment_library.py` reuses this
   same digest to fill an imported library's missing tryptic peptides.
+- The engine keeps two caches by default (`mumdia::cache`, docs/14 "The engine's
+  caches"): FASTA-built libraries (`predict_frag.library_cache`, byte-identical on a hit)
+  and DeepLC's trunk projection (`rt_im_train.deeplc_projection_cache`, DeepLC >= 4.5.0,
+  float-equivalent). Both default to `"auto"`, a sub-directory of `MUMDIA_CACHE_DIR` or the
+  per-user cache directory (`~/.cache/mumdia`, `~/Library/Caches/mumdia`,
+  `%LOCALAPPDATA%\mumdia\cache`), and together they are bounded by `MUMDIA_CACHE_MAX_GB`
+  (default 100 GiB, least recently used first, nothing used within the hour).
+  `MUMDIA_CACHE_DIR=off` turns them off; benchmarks that time the library build or the
+  multi-head step, or compare arms, should set it, or a fresh `MUMDIA_CACHE_DIR` per arm,
+  so that no arm reuses another's work.
 - Imported-library mode skips digest, peptidoform expansion, and initial
   prediction. Under the default `rt_im_train.library_irt = auto` the imported
   iRT is re-predicted with the DeepLC base model when a DeepLC interpreter is
@@ -419,10 +429,14 @@ fine-tuning also is not guaranteed deterministic.
 Measured 2026-09-05 on the HYE competed table (2,603,894 PSMs x 387 features), docs/28
 sections 10-16:
 
-- `rescore.handoff` defaults to `parquet` since 2026-09-05. The TSV path made the worker
-  parse every column into a float64 pandas frame before building its float32 matrix; parquet
-  took the rescore peak from 29.96 to 8.95 GB and the wall from 8:35 to 6:33 at identical
-  identifications. mokapot and entrapment sidecars still receive the tab-separated PIN
+- `rescore.handoff` defaults to `raw` since 2026-09-28 (`parquet` from 2026-09-05). The TSV
+  path made the worker parse every column into a float64 pandas frame before building its
+  float32 matrix; parquet took the rescore peak from 29.96 to 8.95 GB and the wall from 8:35
+  to 6:33 at identical identifications. `raw` hands the worker a row-major f32 `.npy`
+  matrix with no parquet encode or decode and scores byte-identically to `parquet` (checked
+  at scale on the six-run Astral and five-run AIF pools); it is 4 bytes a value on disk, so
+  the sidecar space check refuses a work directory that cannot hold that, where `parquet`
+  only warned. mokapot and entrapment sidecars still receive the tab-separated PIN
   (`mokapot.read_pin` cannot read parquet), automatically and with a warning.
 - The rescore process tree is about half as tall since 2026-09-16, at identical
   identifications. Under `rescore.strict` (the production setting) with a sidecar classifier

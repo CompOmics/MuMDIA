@@ -660,7 +660,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             mode,
             rayon::current_num_threads(),
             cfg.rt_im_train.deeplc_predict_shards,
-            cfg.rt_im_train.deeplc_projection_cache.as_deref(),
+            crate::cache::projection_dir(cfg).as_ref(),
         )?;
         for (b, (_, out)) in bands.iter_mut().zip(pairs) {
             if g.irt_placeholder && g.mh_heads > 0 {
@@ -706,7 +706,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 cfg.rt_im_train.window_holdout_frac,
                 rayon::current_num_threads(),
                 cfg.rt_im_train.deeplc_predict_shards,
-                cfg.rt_im_train.deeplc_projection_cache.as_deref(),
+                crate::cache::projection_dir(cfg).as_ref(),
             )?;
             if g.irt_placeholder {
                 crate::sidecar::require_every_row_repredicted(&out)?;
@@ -741,7 +741,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 &out,
                 rayon::current_num_threads(),
                 cfg.rt_im_train.deeplc_predict_shards,
-                cfg.rt_im_train.deeplc_projection_cache.as_deref(),
+                crate::cache::projection_dir(cfg).as_ref(),
             )?;
             Some(out)
         } else {

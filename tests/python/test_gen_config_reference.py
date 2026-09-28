@@ -425,6 +425,14 @@ def test_repeated_unresolved_reads_are_counted_not_merged():
     assert "- `src/x.rs::dynamic: env read of `name`` (2 reads)\n" in two
 
 
+def test_a_some_default_renders_as_the_value_it_holds():
+    """An `Option<T>` field defaulting to `Some(x)` is set in a config as `x`, so the
+    reference and the schema must show `x`, not an unresolved expression."""
+    assert gen.render_default('Some("auto".to_string())', "Option<String>", {}, {}) == '"auto"'
+    assert gen.render_default("Some(3)", "Option<usize>", {}, {}) == "3"
+    assert gen.render_default("None", "Option<String>", {}, {}) == "null"
+
+
 def test_python_reads_are_cited_by_enclosing_def():
     """Each sidecar read is cited by its qualified `def`, or `<module>`.
 

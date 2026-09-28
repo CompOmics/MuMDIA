@@ -407,7 +407,9 @@ and `bands` (`count`, `index`, `union_unique`). A fine-tune is refused in this m
 applies to the union prediction as it does to one table. The engine side is
 `sidecar::run_deeplc_bands`; `docs/33_window_groups.md` section 4b has the measurements.
 
-**Projection cache** (`rt_im_train.deeplc_projection_cache`, `--projection-cache DIR`).
+**Projection cache** (`rt_im_train.deeplc_projection_cache`, `--projection-cache DIR`; on by
+default since 2026-09-28 as `deeplc_projections/` under the engine's cache root, docs/14,
+"The engine's caches").
 Calibrated RT is `ridge(spline_h(head_h(proj(trunk(x)))))` over the selected heads, and only
 the head selection, the splines and the ridge depend on a run; `proj(trunk(x))`, 64 float32
 per sequence, depends on the sequence and the model alone. With a cache directory the worker
@@ -419,7 +421,15 @@ the multi-head calibration's `transform` on a `FactoredPredictionMatrix` of each
 block, or the default head for the base-model re-prediction. The key is a BLAKE2b digest of
 the DeepLC version, the model file's bytes and the exact sequence list in order
 (`projection_cache_key`, `_sequence_digest`). The entry is written into a `.tmp-<pid>`
-directory and renamed into place, so a reader never sees a partial one. A miss computes the
+directory and renamed into place, so a reader never sees a partial one. A store writes the
+entry's `last_used` file and a hit rewrites it (`mark_used`), which is what the engine's
+cache bound orders entries by. The cache is an optimisation, so every way it can fail
+falls back to a plain prediction instead of failing the run: a directory that cannot be
+created or written, less free space than the projection plus 1 GB (checked before the
+file exists, because a memory-mapped write that runs out of disk kills the process
+instead of raising), a write error, and a damaged entry, which is renamed aside as
+`<key>.broken-<pid>-<ns>` for the bound to remove
+(`test_a_damaged_projection_cache_entry_falls_back_and_is_set_aside`). A miss computes the
 projection in one process with the whole `--predict-threads` budget (after the cap), the
 threads a one-process prediction gets: `--shards` does not split it, and until 2026-09-25 a
 miss under a K-shard plan ran on one shard's `budget / K` threads, slower than either the
@@ -434,10 +444,12 @@ multi-head calibration the spline edges amplify them
 (`test_the_projection_cache_reproduces_the_prediction_and_is_read_back`).
 It needs DeepLC 4.5.0 or newer. The factored matrix (`deeplc._factored`,
 `FactoredPredictionMatrix._projections`) and `_model_ops.supports_factored` are private
-DeepLC API added in 4.5.0; 4.4.x, the engine's floor, has neither. There the worker prints a
-warning, records `projection_cache: {"used": false, "why": ...}` naming the version, writes
-no cache entry and predicts exactly as without the flag, so setting it is harmless but does
-nothing. A later release that moves these names falls back the same way. CI pins 4.4.0, so
+DeepLC API added in 4.5.0; 4.4.x, the engine's floor, has neither. There the worker records
+`projection_cache: {"used": false, "why": ...}` naming the version, writes no cache entry and
+predicts exactly as without the flag, so setting it is harmless but does nothing. It prints
+a warning when the configuration named the directory, and a plain line when the engine
+passed its default (`--projection-cache-default`, sent for `"auto"`), which asks for the
+cache only where DeepLC can serve it. A later release that moves these names falls back the same way. CI pins 4.4.0, so
 it tests that fallback (`test_the_projection_cache_falls_back_to_a_plain_prediction_before_deeplc_4_5`);
 the cache tests themselves skip below 4.5.0.
 
@@ -542,7 +554,8 @@ none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
   full read needs (`nn_rescore_worker.py:292-298`). The streaming backend is what
   makes an experiment-wide multi-run rescore tractable: the full matrix never
   lives in RAM.
-  The raw handoff (`rescore.handoff = raw`, opt-in) is read by `read_raw_handoff`:
+  The raw handoff (`rescore.handoff = raw`, the default since 2026-09-28) is read by
+  `read_raw_handoff`:
   the `.raw.json` description must carry format `mumdia-raw-f32` and version 1 or the
   worker refuses it, and its `.npy` matrix is memory-mapped and copied into the
   worker's matrix (`fill_raw_matrix`) group by group, each group of `row_group_rows`
@@ -559,7 +572,11 @@ none). `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` (set from `--threads`) and
   features compress: on a 522,237 x 387 competed table from the page cache of a
   Windows desktop, the raw matrix was 808 MB against a far smaller parquet, the
   engine's encode took 0.75-0.78 s against 0.60-0.62 s, and the worker's load 0.5 s
-  against 0.9 s, so measure on the data before switching. Validation:
+  against 0.9 s. At scale the difference is small either way: the worker's load
+  phase (`pin_read_standardise`) took 4.1 s with either handoff on the six-run Astral
+  pool (4,987,557 PSMs) and 30.0 s against 5.2 s on the five-run Orbitrap AIF pool
+  (9,218,534 PSMs), with byte-identical scored tables, and the stage walls on those
+  pools moved with the NN training time, not with the handoff. Validation:
   `test_the_raw_handoff_scores_as_the_parquet_handoff` compares score bytes against
   the parquet handoff for both backends, with and without a feature subset; on that
   machine a real AIF competed table (41,910 PSMs) and the 522,237-PSM table (four
@@ -943,7 +960,9 @@ MLP. Set it explicitly for the logreg path.
   than, which counts uncompressed bytes alone: 9 bytes a value plus 32 a row for the
   PIN, exactly 4 bytes a value for the raw matrix. A parquet file has no such floor
   (snappy and dictionary encoding shrink a constant column to almost nothing), so
-  the default parquet handoff is never refused, only warned about. It warns when the
+  a parquet handoff is never refused, only warned about. The default raw handoff is
+  refused below its floor: set `rescore.handoff = parquet` where the work directory
+  is short of room, or move it with `MUMDIA_SIDECAR_DIR`. It warns when the
   space is below the usual size: the raw f32 size for the parquet handoff (it
   measured 0.72-0.87 of it), 11 bytes a value for the PIN, plus the fold keys, the
   output and, for `nn_torch`, the worker's float32 memmap of `rows x features x 4`
