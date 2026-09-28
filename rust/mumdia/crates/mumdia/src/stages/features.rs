@@ -213,8 +213,8 @@ pub const RICH_EXTRA: &[&str] = &[
 ];
 
 /// The ordered active feature list for the configured set. `im_features` appends the
-/// ion-mobility block ([`im::NAMES`]) and `im_shape` the peak-shape block
-/// ([`im::SHAPE_NAMES`]) after it, so with both off the list is unchanged.
+/// ion-mobility block (`im::NAMES`) and `im_shape` the peak-shape block
+/// (`im::SHAPE_NAMES`) after it, so with both off the list is unchanged.
 pub fn active_features(set: FeatureSet, im_features: bool, im_shape: bool) -> Vec<String> {
     let mut v: Vec<String> = MINIMAL_FEATURES.iter().map(|s| s.to_string()).collect();
     if matches!(set, FeatureSet::Rich | FeatureSet::Extended) {
