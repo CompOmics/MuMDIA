@@ -438,7 +438,22 @@ threads per process the file is byte-identical to a one-process miss
 (`test_a_sharded_projection_miss_writes_the_one_process_projection`). Until 2026-09-28 a miss
 ran in one process on the whole budget, which took twice as long as the sharded prediction
 once sharding was the default (an entrapment run 3:15 -> 6:28), so the first search of every
-library paid for the cache. `meta.json` records `shards`, the threads per process as
+library paid for the cache. The heads are evaluated from the projection in the same plan,
+on a miss once the file is written and on a hit (`evaluate_sharded`, `shard_main` in
+`"mode": "evaluate"`): each child reads its slice of the file and writes its values, which
+are bit-identical to one process because a row's value depends on that row alone and every
+slice starts on a chunk boundary. In one process that evaluation was numpy on one BLAS thread
+and most of a hit: 34 s on 2.9M sequences, 79 s on 4.9M. Measured on doxy (128 threads,
+DeepLC 4.5.0, whole runs):
+
+| run | no cache | miss, one process | miss, sharded | hit, sharded |
+|---|---|---|---|---|
+| Orbitrap AIF entrapment (2.9M sequences) | 3:15 | 6:28 | 3:16 | 0:56 |
+| Astral REP1, HYE library (4.9M sequences) | 5:14 | 11:29 | 5:42 | 2:33 |
+
+The calibrated iRT of the cached runs is identical to the uncached run's on 99.99% of the
+rows, and within 1.4 s (entrapment) and 0.04 s (Astral) on the rest. `meta.json` records
+`shards`, the threads per process as
 `torch_threads` and the per-shard timings, and the summary's shard record says `projection
 cache miss in K process(es)` or `projection cache hit`
 (`test_a_projection_cache_miss_follows_the_shard_plan`). A fine-tuned model has

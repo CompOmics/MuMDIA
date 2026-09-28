@@ -806,6 +806,17 @@ def test_a_sharded_projection_miss_writes_the_one_process_projection(tmp_path):
     # Only the entry's own files are published: no shard spec, sequence or timing file.
     assert sorted(p.name for p in outs["two"][2].iterdir()) == [
         "last_used", "meta.json", "projections.npy"]
+    # A hit under the same plan evaluates the heads in two children too, with the values
+    # of the one-process evaluation, and leaves no scratch directory behind.
+    hit = tmp_path / "two_hit.parquet"
+    run_worker_ok("deeplc_finetune.py", str(lib), "-", str(hit), "--no-finetune", "--threads",
+                  "1", "--predict-chunk", "64", *plans["two"], "--projection-cache",
+                  str(tmp_path / "cache_two"), env=env, timeout=1800)
+    summary = json.loads((tmp_path / "two_hit.parquet.summary.json").read_text("utf-8"))
+    record = summary["projection_cache"]
+    assert record["hit"] and record["evaluate_shards"] == 2, record
+    assert (_predicted_irt(hit) == _predicted_irt(outs["one"][0])).all()
+    assert not [p for p in tmp_path.iterdir() if "projection-evaluate" in p.name]
 
 
 def test_a_damaged_projection_cache_entry_falls_back_and_is_set_aside(tmp_path):
