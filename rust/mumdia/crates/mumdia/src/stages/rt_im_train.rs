@@ -2006,11 +2006,16 @@ mod tests {
             calibration_method: CalibrationMethod::Linear,
             ..Default::default()
         };
+        let robust = RtImTrainConfig {
+            robust_calibration: true,
+            ..Default::default()
+        };
         for (tag, cfg, n) in [
             ("default", RtImTrainConfig::default(), 400usize),
             ("holdout", holdout, 400),
             ("adaptive", adaptive, 400),
             ("linear", linear, 400),
+            ("robust", robust, 400),
             ("few", RtImTrainConfig::default(), 20),
             ("one", RtImTrainConfig::default(), 1),
         ] {
@@ -2058,6 +2063,102 @@ mod tests {
                 "{tag}: the decoy and the unconfident row are not anchors"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `robust_calibration` drops anchors with an absurd predicted iRT before the fit, the
+    /// window sizing and the residuals use them, so the windows are those of the clean
+    /// anchors alone and cal.json records how many it dropped. Off, every anchor is fitted
+    /// and cal.json has no such key. A grouped run's shared fit is filtered the same way.
+    #[test]
+    fn robust_calibration_fits_the_clean_anchors_and_records_the_count() {
+        let dir = std::env::temp_dir().join(format!("mumdia_rt_robust_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        // A curved 2000-3500 s gradient (a straight line survives any grid) plus three
+        // anchors whose predicted iRT is absurd, as the multi-head refit produced on HYE.
+        let n = 400usize;
+        let f = |x: f64| 2000.0 + (x - 2000.0).powi(2) / 1500.0;
+        let mut irt: Vec<f32> = (0..n).map(|i| 2000.0 + 3.75 * i as f32).collect();
+        let mut rt: Vec<f64> = irt
+            .iter()
+            .enumerate()
+            .map(|(i, x)| f(*x as f64) + ((i * 7919) % 11) as f64 - 5.0)
+            .collect();
+        irt.extend([-170_000.0, 375_000.0, 90_000.0]);
+        rt.extend([2500.0, 3400.0, 3000.0]);
+        let seed = |name: &str, m: usize| {
+            let p = path(name);
+            write_table(
+                &p,
+                vec![
+                    Col::U32("candidate_id".into(), (0..m as u32).collect()),
+                    Col::U32("base_peptide_id".into(), (0..m as u32).collect()),
+                    Col::F64("spectrum_q".into(), vec![0.001; m]),
+                    Col::F64("score".into(), (0..m).map(|i| 10.0 + i as f64).collect()),
+                    Col::F64("observed_rt".into(), rt[..m].to_vec()),
+                    Col::Str("label".into(), vec!["target".to_string(); m]),
+                    Col::F32("predicted_irt".into(), irt[..m].to_vec()),
+                ],
+            )
+            .unwrap();
+            p
+        };
+        let dirty = seed("dirty.parquet", n + 3);
+        let clean = seed("clean.parquet", n);
+        let lib = path("lib.parquet");
+        write_table(
+            &lib,
+            vec![
+                Col::U32("candidate_id".into(), (0..600u32).collect()),
+                Col::F32(
+                    "predicted_irt".into(),
+                    (0..600).map(|i| 1900.0 + 3.0 * i as f32).collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        let robust = RtImTrainConfig {
+            robust_calibration: true,
+            ..Default::default()
+        };
+        let stage = |seed: &str, cfg: &RtImTrainConfig, tag: &str| {
+            let (windows, cal) = (
+                path(&format!("w_{tag}.parquet")),
+                path(&format!("cal_{tag}.json")),
+            );
+            run(RtImTrainParams {
+                precursor_span: None,
+                seed_psms: seed,
+                library_precursors: &lib,
+                out_windows: &windows,
+                out_cal: &cal,
+                cfg,
+                config_hash: "h",
+                anchor_irt_from_seed: true,
+            })
+            .unwrap();
+            let cal: serde_json::Value = mumdia_io::json::read_json(&cal).unwrap();
+            (std::fs::read(&windows).unwrap(), cal)
+        };
+        let (w_clean, cal_clean) = stage(&clean, &RtImTrainConfig::default(), "clean");
+        let (w_plain, cal_plain) = stage(&dirty, &RtImTrainConfig::default(), "plain");
+        let (w_robust, cal_robust) = stage(&dirty, &robust, "robust");
+        assert_eq!(cal_plain["n_train"], n + 3);
+        assert!(cal_plain.get("n_rt_outliers_removed").is_none());
+        assert!(cal_clean.get("n_rt_outliers_removed").is_none());
+        assert_ne!(w_plain, w_clean, "the absurd anchors distort the plain fit");
+        assert_eq!(cal_robust["n_rt_outliers_removed"], 3);
+        assert_eq!(cal_robust["n_train"], n);
+        assert_eq!(cal_robust["w_rt"], cal_clean["w_rt"]);
+        assert_eq!(
+            w_robust, w_clean,
+            "the robust fit is the fit on the clean anchors"
+        );
+        let fit = fit_from_seed(&dirty, None, &robust).unwrap();
+        assert_eq!(fit.n_train(), n);
+        assert_eq!(fit.n_rt_outliers, Some(3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
