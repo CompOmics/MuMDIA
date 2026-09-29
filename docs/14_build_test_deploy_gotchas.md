@@ -28,7 +28,7 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `rust/mumdia/.cargo/config.toml.example` | Committed template of the above; a fresh clone with no local copy builds into `./target` |
 | `rust/mumdia/crates/mumdia/Cargo.toml` | The bin+lib crate `mumdia`; `[[bin]]` name `mumdia` -> `src/main.rs`; all deps come from `workspace.dependencies` |
 | `rust/mumdia/crates/mumdia-core/Cargo.toml` | Core crate; depends only on `serde`/`serde_json`/`thiserror` (no arrow/parquet, so no I/O layer) |
-| `rust/mumdia/crates/mumdia-io/Cargo.toml` | I/O crate; adds `arrow`/`parquet`/`blake3` over `mumdia-core` |
+| `rust/mumdia/crates/mumdia-io/Cargo.toml` | I/O crate; adds `arrow`/`parquet`/`blake3` over `mumdia-core`, plus `rayon` for the dedicated parquet codec pool (`codec.rs`) and `bytes` for the `SpanCache` `ChunkReader` (`span_cache.rs`) |
 | `rust/mumdia/crates/mumdia/tests/pipeline.rs` | The only integration test file: extract -> features -> compete -> rescore on crafted Parquet |
 | `rust/mumdia/crates/mumdia-core/build.rs` | Stamps the git commit and build date into the crate so `manifest.json` can record them |
 | `.github/workflows/ci.yml` | Eight jobs: `lint` (fmt + clippy `-D warnings` + rustdoc), `audit` (`cargo audit` on both lockfiles, engine and desktop), `build-test` matrix on ubuntu/macos/windows, `smoke` (end-to-end `run` and `run-experiment` on a generated fixture, ubuntu + windows), `sidecar-imports` (a real conda env per sidecar, matrixed, plus `pip-audit`), `smoke-cross-platform` (asserts the two platforms produced byte-identical `peptides.tsv` and `proteins.tsv`), `desktop` (the console's own workspace: fmt, clippy, unit tests, and a frontend/backend consistency check), `sidecars` (compileall + JSON/YAML parse + doc-reference check + generated-document freshness); on push-to-`main`, every PR, weekly, and on demand |
@@ -121,8 +121,10 @@ resolver (`resolver = "2"`, `Cargo.toml:2`) and lists three members
 (`Cargo.toml:3`). Each crate declares only the subset it needs: `mumdia-core`
 depends on `serde`/`serde_json`/`thiserror` only (no arrow/parquet, so the core
 types stay I/O-free); `mumdia-io` adds `arrow`/`parquet`/`blake3` over
-`mumdia-core`; the `mumdia` bin+lib crate pulls the full set including `clap`,
-`rayon`, `mzdata`, and `tracing`. The engine needs **no cmake and no system C libraries**, which is what the feature
+`mumdia-core`, plus `rayon` for its own parquet codec pool (parallel column
+encode and decode, `codec.rs`) and `bytes` for the coalescing `ChunkReader`
+(`span_cache.rs`); the `mumdia` bin+lib crate pulls the full set including
+`clap`, `rayon`, `mzdata`, and `tracing`. The engine needs **no cmake and no system C libraries**, which is what the feature
 selection buys: `parquet` uses `default-features = false, features =
 ["arrow","snap"]` to drop the C zlib-ng backend that needs cmake and to use the
 pure-Rust SNAPPY codec (`Cargo.toml:36-37`); `mzdata` uses `["mzml",
@@ -443,7 +445,8 @@ installed: DeepLC is pinned to a PyPI version rather than a repository commit, s
 nothing in the build clones anything. It copies the binary to
 `/usr/local/bin/mumdia`, `scripts/` to `/opt/mumdia/scripts`, and both Docker
 configs to `/opt/mumdia/config.dia.json` and `/opt/mumdia/config.diann-lib.json`
-(`Dockerfile:51-54`), sets `MUMDIA_RESCORE_MODEL=logreg` (`Dockerfile:57`),
+(`Dockerfile:51-54`), sets `MUMDIA_RESCORE_MODEL=logreg` (`Dockerfile:57`) and
+`MUMDIA_CACHE_DIR=/cache` with a world-writable `/cache`,
 declares the standard OCI labels (title, description, source, licenses, vendor;
 `Dockerfile:61-65`), sets the working directory to `/data` (`Dockerfile:67`, which
 is the bind-mount point in the usage example), drops back to the base image's
@@ -454,9 +457,53 @@ Running unprivileged is deliberate and has a documented consequence: the contain
 user's uid does not match the host user's, so a bind mount the engine must write
 to needs the host uid and gid passed with docker's `--user` flag. Without it even
 the mount point fails with `mkdir: cannot create directory '/data': Permission
-denied` (`Dockerfile:12-15`, measured 2026-08-27). Nothing inside the image needs
-to be writable at run time, because everything MuMDIA writes lands under
-`--out-dir`.
+denied` (`Dockerfile:12-15`, measured 2026-08-27). Everything MuMDIA writes lands
+under `--out-dir`, except its caches: the image sets `MUMDIA_CACHE_DIR=/cache` and makes
+`/cache` world-writable with the sticky bit, like `/tmp`, so the caller's uid can write it.
+Mount a named volume there (`-v mumdia-cache:/cache`) to keep the caches between
+containers; without one they last as long as the container ("The engine's caches" below).
+
+### The engine's caches
+
+Two caches are on by default since 2026-09-28 (`mumdia::cache`):
+
+| cache | setting | default directory | entry |
+|---|---|---|---|
+| FASTA-built libraries | `predict_frag.library_cache` | `<root>/libraries` | `<24 hex>/` with the two tables, their reports, `entry.json` (docs/06, "Reusing a FASTA-built library") |
+| DeepLC trunk projection | `rt_im_train.deeplc_projection_cache` | `<root>/deeplc_projections` | `<40 hex>/projections.npy` and `meta.json` (docs/13, "Projection cache"; DeepLC 4.5.0 or newer) |
+
+Both settings default to `"auto"`. The root is `MUMDIA_CACHE_DIR` when it is set, and
+otherwise the per-user cache directory: `$XDG_CACHE_HOME/mumdia` (an absolute
+`XDG_CACHE_HOME` only) or `~/.cache/mumdia` on Linux and other Unix systems,
+`~/Library/Caches/mumdia` on macOS, and `%LOCALAPPDATA%\mumdia\cache` on Windows, inside
+the desktop application's data directory. It is an environment variable, like
+`MUMDIA_SIDECAR_DIR`, so a configuration and its hash never name one machine's paths.
+`MUMDIA_CACHE_DIR=off` (or `0`, `false`, `none`) turns every `"auto"` cache off; a path in
+the configuration is used whatever `MUMDIA_CACHE_DIR` says; `null` or `"off"` turns one
+cache off. `mumdia doctor` prints the root, where it came from, the bound, and each
+cache's directory, entry count and size.
+
+The caches are bounded. After a library store and at the end of every `run` and
+`run-experiment` (`cache::enforce_for`), the least recently used entries of the two caches
+together are removed until their total is within `MUMDIA_CACHE_MAX_GB`: 100 by default, in
+GiB like the other `_GB` variables, `0` or `unlimited` for no bound. An entry's last use is
+the modification time of its `last_used` file, which every store writes and every hit
+rewrites (the library cache before it copies, the projection cache before it reads). An
+entry used within the last hour is never removed, so a run reading one keeps it even when
+the caches are over the bound, and the run then warns instead. Removal renames the entry
+aside first (`<key>.evicted-<pid>-<ns>`), so a reader finds a whole entry or none, and
+temporary or set-aside directories (`.partial-`, `.tmp-`, `.broken-`, `.evicted-`) left for
+an hour are removed. Nothing else in a cache directory is touched: only names that are a
+24- or 40-character lowercase hex key, or one of those derived from it, count as the
+engine's. The library key covers the running executable, so every engine build stores new
+entries; the bound is what retires the old ones.
+
+Sizes to plan the bound with: a library entry is a byte copy of the two library tables
+(0.27 GB for the E. coli FASTA library of 1.33M precursors); a projection entry is 256 bytes
+a sequence (1.26 GB for the 4.91M sequences of the HYE library). On shared servers with small
+home quotas, point `MUMDIA_CACHE_DIR` at a scratch disk. Several runs may share one cache
+directory: every entry is published by an atomic rename, and a library hit is checked
+against the sizes and hashes recorded when it was stored.
 
 The two conda envs both pin `python=3.11` on purpose: mokapot and MS2PIP pull
 `pandas<2`, which has no cp312 wheel and would force a fragile source build
@@ -810,11 +857,14 @@ the only thing that exercises it is a FASTA-mode library build.
 and the smoke job exercise native paths only. Inside `cargo test` there is still
 no stage-level test for `convert`, `search-seed`, `predict-frag`, the `run`
 orchestrator, `manifest.json`, `inspect`, or the library-input path; `ci/smoke.sh`
-now covers all of those except the library-input path, but it runs outside
-`cargo test`, so a green `cargo test --workspace` alone still proves none of them.
-The real sidecar strategies (MS2PIP, DeepLC, DeepLC fine-tune, mokapot, the
+now covers all of those, the library-input path only in its stub-DeepLC arm (5b), but it
+runs outside `cargo test`, so a green `cargo test --workspace` alone still proves none of
+them. The real sidecar strategies (MS2PIP, DeepLC, DeepLC fine-tune, mokapot, the
 PyTorch NN, entrapment, MBR) never run in the test suite or in CI; only the native
-fallbacks are covered. (Percolator is not a gap but a rejection: `validate`
+fallbacks are covered. Arm 5b replaces `deeplc_finetune.py` with a stub that copies
+each library table and logs its call, so what CI checks there is which DeepLC calls the
+orchestrators make and where the tables go (`groups.rt_adaptation`, band-slice reuse, the
+deferred-DeepLC refusal, `experiment.overlap_front_threads`), not any retention time. (Percolator is not a gap but a rejection: `validate`
 refuses it, `config.rs:1512`.) This gap has already shipped one real defect: a
 module-level import reordering in `scripts/deeplc_worker.py` made every
 FASTA-mode DeepLC prediction abort on Windows, and a green workspace suite plus a

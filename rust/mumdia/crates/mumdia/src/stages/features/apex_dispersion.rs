@@ -266,6 +266,7 @@ mod tests {
             ref_profile,
             // No full window in this fixture, so no full-window reference profile.
             ref_profile_full: vec![],
+            pair_stats: None,
             apex_rt: 0.0,
             rt_pred_cal: 0.0,
             rt_err: 0.0,

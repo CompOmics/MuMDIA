@@ -22,11 +22,9 @@ pub fn score_scan_count_dot(
 ) -> Vec<(u32, u32, f64)> {
     let mut out = Vec::new();
     for c in cand_lo..cand_hi {
-        let cand = &lib.cands[c as usize];
         let mut count = 0u32;
         let mut dot = 0.0f64;
-        for k in 0..cand.n_frag {
-            let gi = cand.frag_start + k;
+        for gi in lib.frag_range(c) {
             let fmz = lib.frag_mz[gi] as f64; // library stores f32, as FragIndex matches on
             let fint = lib.frag_int[gi];
             for &(pmz, pint) in peaks {

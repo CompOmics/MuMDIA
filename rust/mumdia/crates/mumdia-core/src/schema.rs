@@ -43,15 +43,47 @@ pub mod artifact {
     // `apex_im_overlap`, `ms1_im_width`, `ms1_frag_overlap` (null without spectra v3
     // widths).
     pub const PSMS_EXTRACTED: (&str, u32) = ("psms_extracted", 5);
-    // v2: on 4D data a per-point 1/K0 list `im`, parallel to `intensity`; a 3D run writes
-    // exactly the v1 columns.
-    pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 2);
-    pub const FEATURES: (&str, u32) = ("features", 1);
-    pub const PSMS_COMPETED: (&str, u32) = ("psms_competed", 3);
+    /// v1: every row stores its whole `rt` axis and its whole `intensity` trace.
+    pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 1);
+    /// v2, the default (`extract.chromatogram_schema = 2`): the axis once per candidate
+    /// per row group (`rt_axis`), each trace trimmed to its nonzero run (`intensity_trimmed`),
+    /// and `trace_offset` / `trace_len` to rebuild it (`mumdia::chromatograms`). Every reader
+    /// in the engine accepts both; the renamed lists make a v1-only reader fail on v2.
+    pub const CHROMATOGRAMS_V2: (&str, u32) = ("chromatograms", 2);
+    /// v3: v1 with, on 4D data, a per-point 1/K0 list `im` parallel to `intensity` (0.0
+    /// where the trace has no peak). A 3D run writes v1.
+    pub const CHROMATOGRAMS_V3: (&str, u32) = ("chromatograms", 3);
+    /// v4: v2 with, on 4D data, `im_trimmed`: each row's per-point 1/K0 cut to the run that
+    /// `intensity_trimmed` keeps (the same `trace_offset`, the same length). A 3D run
+    /// writes v2.
+    pub const CHROMATOGRAMS_V4: (&str, u32) = ("chromatograms", 4);
+    /// v2: the feature columns are Float32 except the few `F64_FEATURE_COLUMNS` of
+    /// `stages/features.rs`; v1 stored every feature as Float64. Every reader accepts both.
+    pub const FEATURES: (&str, u32) = ("features", 2);
+    /// v4: the feature columns are stored as in `features` v2; v3 stored every feature as
+    /// Float64. Every reader accepts both, and compete given a v1 features table writes v4.
+    pub const PSMS_COMPETED: (&str, u32) = ("psms_competed", 4);
     pub const PSMS_SCORED: (&str, u32) = ("psms_scored", 4);
     pub const PEPTIDE_QUANT: (&str, u32) = ("peptide_quant", 2);
     pub const PROTEIN_GROUP_QUANT: (&str, u32) = ("protein_group_quant", 2);
     pub const FRAGMENT_QUANT: (&str, u32) = ("fragment_quant", 1);
     /// Cross-run MaxLFQ table, written only by `run-experiment` and `quant-lfq`.
     pub const LFQ_MAXLFQ: (&str, u32) = ("lfq_maxlfq", 1);
+    /// The candidates a grouped run's pool dropped from each band (`band`,
+    /// `candidate_id`), written by a grouped run under `groups.pool_chromatograms = false`,
+    /// the default.
+    pub const OVERLAP_LOSERS: (&str, u32) = ("overlap_losers", 1);
+
+    /// The chromatogram schema a table records: its layout (`extract.chromatogram_schema`,
+    /// 1 or 2, which config validation enforces) and whether it carries per-point ion
+    /// mobility (4D data): [`CHROMATOGRAMS`], [`CHROMATOGRAMS_V2`], [`CHROMATOGRAMS_V3`] or
+    /// [`CHROMATOGRAMS_V4`].
+    pub fn chromatograms(schema: u32, has_im: bool) -> (&'static str, u32) {
+        match (schema == CHROMATOGRAMS_V2.1, has_im) {
+            (false, false) => CHROMATOGRAMS,
+            (true, false) => CHROMATOGRAMS_V2,
+            (false, true) => CHROMATOGRAMS_V3,
+            (true, true) => CHROMATOGRAMS_V4,
+        }
+    }
 }

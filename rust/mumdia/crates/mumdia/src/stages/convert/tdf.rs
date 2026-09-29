@@ -31,13 +31,13 @@ pub struct TdfParams {
     pub mz_ppm: f64,
     pub im_gap_scans: u32,
     pub min_points: u32,
-    /// Also compute each centroid's mobility width ([`Centroids::width`]).
+    /// Also compute each centroid's mobility width (`Centroids::width`).
     pub im_width: bool,
-    /// Valley depth that splits a cluster along m/z (0 = off; [`valley_cuts`]).
+    /// Valley depth that splits a cluster along m/z (0 = off; `valley_cuts`).
     pub mz_valley: f64,
     /// Half-width in ppm of the m/z profile smoothing used by the valley split.
     pub mz_smooth_ppm: f64,
-    /// Valley depth that splits a cluster along mobility (0 = off; [`valley_cuts`]).
+    /// Valley depth that splits a cluster along mobility (0 = off; `valley_cuts`).
     pub im_valley: f64,
     /// Half-width in TIMS scans of the mobility profile smoothing.
     pub im_smooth_scans: f64,

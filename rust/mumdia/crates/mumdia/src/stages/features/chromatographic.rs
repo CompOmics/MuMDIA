@@ -478,17 +478,13 @@ fn weighted_std(vals: &[f64], w: &[f64]) -> f64 {
     }
 }
 
+/// Median by selection (`super::median_select`), bit-identical to the sorted copy it
+/// replaced; 0 for an empty `v`.
 fn median(mut v: Vec<f64>) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
-    v.sort_by(|a, b| a.total_cmp(b));
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        0.5 * (v[n / 2 - 1] + v[n / 2])
-    }
+    super::median_select(&mut v)
 }
 
 fn trapz(x: &[f64], y: &[f64]) -> f64 {
@@ -708,7 +704,10 @@ fn peak_snr(a_peak: f64, axis_full: &[f64], r_full: &[f64], lo: f64, hi: f64) ->
     if out.len() < 2 {
         return 0.0;
     }
-    let med = median(out.clone());
+    // No clone: selecting the median permutes `out`, and the absolute deviations below do
+    // not depend on its order.
+    let mut out = out;
+    let med = super::median_select(&mut out);
     let mad = median(out.iter().map(|v| (v - med).abs()).collect());
     let noise = 1.4826 * mad;
     let denom = if noise > EPS { noise } else { 1.0 };
@@ -1005,6 +1004,7 @@ mod tests {
             apex_idx: tp / 2,
             ref_profile: vec![],
             ref_profile_full,
+            pair_stats: None,
             apex_rt: 0.0,
             rt_pred_cal: 0.0,
             rt_err: 0.0,
