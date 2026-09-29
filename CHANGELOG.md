@@ -20,7 +20,16 @@ content hashes where their values do not (float32 feature columns, chromatogram 
 the page and encoding layout of capped writers, byte-spliced tables), and `features` and
 `psms_competed` are now schema versions 2 and 4. New are the isolation-window-group search
 (`groups.window_groups`) for libraries too large to search at once, `mumdia sub-library`,
-`mumdia pool` and `mumdia cache`.
+`mumdia pool` and `mumdia cache`. Measured against 0.4.0 on one host per comparison, with
+one DeepLC 4.5.0 environment for both versions: a six-file Astral experiment on the HYE
+library took 12:04 instead of 51:33 for the same identifications (113,907 against 113,948
+peptides at 1%, the mean of 3 NN seeds), at a 23.8 against 11.4 GiB peak, because the files
+are now searched in parallel within the memory Linux reports free
+(`experiment.parallel_runs = 1` searches them one at a time). Single runs took 5:15 instead
+of 27:48 (Astral REP1 on the HYE library, +0.28% peptides over 5 seeds, a 6.3 against
+11.2 GiB peak) and 3:29 instead of 14:02 (an Orbitrap AIF entrapment run, -0.29% peptides
+at an entrapment FDP of 0.989% against 1.025%), and a repeat of either on its warm
+projection cache took 2:35 and 0:55 and wrote byte-identical results.
 
 `0.4.0` is a minor rather than a patch release: it changes results. Multi-head
 retention-time calibration is on by default, which on a six-file Astral experiment
