@@ -138,6 +138,15 @@ exact paths and takes two clicks to remove. The items are `primary`, `ms2pip`,
 constant exported by the module that writes there, so a rename cannot leave
 something behind that nothing offers to remove.
 
+One more row, `engine_caches` ("Search caches"), is not the application's own: it is
+the engine's cache of FASTA-built libraries and DeepLC projections (docs/14, "The
+engine's caches"), which the engine keeps within `MUMDIA_CACHE_MAX_GB` (100 GB by
+default). On Windows it lives in `%LOCALAPPDATA%\MuMDIA\cache`, inside the data
+directory; on Linux and macOS in `~/.cache/mumdia` or `~/Library/Caches/mumdia`, outside
+it. Only the engine knows which names in that directory are its own, so the row is listed
+through `mumdia cache --json` and removed through `mumdia cache clear --json`, not through
+`remove_in`; an engine without the command offers no row.
+
 Two properties matter and are tested. `remove_in` resolves the real parent directory
 and refuses anything outside the data directory, and refuses a symbolic link
 outright, because this is a recursive delete driven by a string from the frontend.
@@ -149,10 +158,12 @@ By hand, the same thing:
 ```powershell
 Remove-Item -Recurse -Force "$env:LOCALAPPDATA\MuMDIA"           # everything
 Remove-Item -Recurse -Force "$env:LOCALAPPDATA\MuMDIA\python"    # just the environment
+mumdia cache clear                                               # just the search caches
 ```
 
 ```bash
 rm -rf ~/.local/share/MuMDIA
+mumdia cache clear      # the search caches, in ~/.cache/mumdia
 ```
 
 ### Two environments, not one (historical)

@@ -20,7 +20,12 @@ pub const PROTON: f64 = 1.007_276_466_812;
 /// `deeplc.calibration.MultiHeadRidgeCalibration` and the lazy head source
 /// `predict_and_calibrate` uses to avoid materialising all 6,543 head columns. 4.1.1 has
 /// neither: its `calibrate` picks a single best-correlating head.
-pub const MIN_DEEPLC_VERSION: (u32, u32, u32) = (4, 4, 0);
+///
+/// Raised from 4.4.0 to 4.5.0 on 2026-09-28 for `rt_im_train.deeplc_projection_cache`, on
+/// by default since then, which reads the factored prediction matrix (`deeplc._factored`)
+/// that 4.5.0 added; on 4.4.x the default cache did nothing. Measured before the floor
+/// moved in docs/08 section 4e.
+pub const MIN_DEEPLC_VERSION: (u32, u32, u32) = (4, 5, 0);
 
 /// Parse a PEP 440-ish version string's leading numeric components. Pre-release suffixes
 /// ("4.0.0a2") are dropped, so "4.1.1rc1" compares as 4.1.1; anything unparsable is None.
@@ -215,7 +220,8 @@ mod version_tests {
         assert!(parse_version3("4.0.0a2").unwrap() < MIN_DEEPLC_VERSION);
         assert!(parse_version3("4.1.1").unwrap() < MIN_DEEPLC_VERSION);
         assert!(parse_version3("4.3.0").unwrap() < MIN_DEEPLC_VERSION);
-        assert!(parse_version3("4.4.0").unwrap() >= MIN_DEEPLC_VERSION);
+        assert!(parse_version3("4.4.0").unwrap() < MIN_DEEPLC_VERSION);
         assert!(parse_version3("4.5.0").unwrap() >= MIN_DEEPLC_VERSION);
+        assert!(parse_version3("4.5.1").unwrap() >= MIN_DEEPLC_VERSION);
     }
 }

@@ -73,6 +73,9 @@ mkdir -p "$work"
 # developer's own searches, into the next. Every arm searches from scratch; arm 4a and the
 # stub arm `seq` set a root of their own.
 export MUMDIA_CACHE_DIR=off
+# A library store leaves 10 GiB free on the cache's disk by default; a CI runner's
+# temporary disk can have less, and the arm that stores must store.
+export MUMDIA_CACHE_MIN_FREE_GB=0
 
 # The engine must be able to say the configuration is runnable before we run it.
 echo "=== smoke: doctor"
@@ -162,6 +165,18 @@ ls "$work"/libcache/*/entry.json > /dev/null 2>&1 \
 MUMDIA_CACHE_DIR="$work/cache_root" "$BIN" doctor --config "$cfg" > "$work/doctor_cache.log" 2>&1
 grep -q "predict_frag.library_cache: .*libraries (auto), 1 entries" "$work/doctor_cache.log" \
     || { cat "$work/doctor_cache.log"; echo "doctor did not report the default library cache"; exit 1; }
+# `mumdia cache clear` (what the desktop's Search caches row calls) removes the entry.
+MUMDIA_CACHE_DIR="$work/cache_root" "$BIN" cache clear --json > "$work/cache_clear.json" \
+    || { cat "$work/cache_clear.json"; echo "mumdia cache clear failed"; exit 1; }
+"$PY" - "$work/cache_clear.json" <<'PYEOF'
+import json, sys
+r = json.load(open(sys.argv[1]))
+if r["removed"]["entries"] != 1 or r["failed"]:
+    sys.exit("mumdia cache clear: %r" % r)
+PYEOF
+if ls "$work"/cache_root/libraries/*/entry.json > /dev/null 2>&1; then
+    echo "mumdia cache clear left a library entry"; exit 1
+fi
 echo "    ok: stored under MUMDIA_CACHE_DIR/libraries, reused (digest skipped), kept over a bound while in use, a named directory used, all byte-identical to the plain run"
 
 # 4b. A malformed retention time must not abort the run.

@@ -58,6 +58,12 @@ pub struct Status {
     pub error: Option<String>,
     /// Whether a bundled `uv` was found, without which nothing can be installed.
     pub uv: Option<String>,
+    /// Packages this application pins exactly whose installed version differs, as
+    /// `name installed -> pinned`. Non-empty means the environment is not `complete`:
+    /// the engine refuses a DeepLC below its floor (4.5.0 since 2026-09-28), so an
+    /// environment installed by an older release would import cleanly and then fail
+    /// every search that needs DeepLC. Installing again upgrades it in place.
+    pub outdated: Vec<String>,
 }
 
 /// Every module the primary environment must provide.
@@ -292,15 +298,46 @@ pub fn find_uv() -> Option<PathBuf> {
 const REQUIREMENTS_PRIMARY: &str = include_str!("../../../env/console-requirements.txt");
 const REQUIREMENTS_MS2PIP: &str = include_str!("../../../env/console-ms2pip-requirements.txt");
 
+/// The compiled-in requirements of `env`.
+fn requirements_text(env: Env) -> &'static str {
+    match env {
+        Env::Primary => REQUIREMENTS_PRIMARY,
+        Env::Ms2pip => REQUIREMENTS_MS2PIP,
+    }
+}
+
+/// The exactly pinned packages (`name==version` lines) of `requirements` whose installed
+/// version in `versions` differs, as `name installed -> pinned`. A package that is not
+/// among the reported versions, or pinned with anything but `==`, is not compared.
+fn outdated_pins(
+    requirements: &str,
+    versions: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in requirements.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some((name, pinned)) = line.split_once("==") else {
+            continue;
+        };
+        let (name, pinned) = (name.trim().to_ascii_lowercase(), pinned.trim());
+        if name.is_empty() || name.contains(|c: char| " ;[<>!~".contains(c)) {
+            continue;
+        }
+        if let Some(installed) = versions.get(&name) {
+            if installed != pinned {
+                out.push(format!("{name} {installed} -> {pinned}"));
+            }
+        }
+    }
+    out
+}
+
 /// Write the requirements for `env` where `uv` can read them, and return the path.
 ///
 /// Into the managed data directory rather than a temporary file, so that when an
 /// installation fails the exact input is still on disk to look at.
 pub fn requirements(env: Env) -> Result<PathBuf, String> {
-    let text = match env {
-        Env::Primary => REQUIREMENTS_PRIMARY,
-        Env::Ms2pip => REQUIREMENTS_MS2PIP,
-    };
+    let text = requirements_text(env);
     let dir = data_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let path = dir.join(env.requirements_name());
@@ -376,6 +413,8 @@ pub fn status_of(env: Env) -> Status {
                 // `sklearn` is imported as `sklearn` but distributed as
                 // `scikit-learn`, so ask metadata for the name pip knows.
                 s.versions = versions(&py, REPORT_VERSIONS);
+                s.outdated = outdated_pins(requirements_text(env), &s.versions);
+                s.complete = s.outdated.is_empty();
             }
         }
         Err(e) => {
@@ -835,9 +874,16 @@ fn remove_in(root: &Path, id: &str) -> Result<u64, String> {
     Ok(freed)
 }
 
-/// What this application has created under [`data_dir`], as removable items.
+/// What this application has created under [`data_dir`], as removable items, and the
+/// engine's own caches when they hold anything.
 pub fn removable() -> Vec<Removable> {
-    inventory(&data_dir())
+    let mut items = inventory(&data_dir());
+    items.extend(
+        engine_cache_json(&["cache", "--json"])
+            .ok()
+            .and_then(|v| engine_caches_item(&v)),
+    );
+    items
 }
 
 /// Delete one removable item, returning the bytes freed.
@@ -845,7 +891,98 @@ pub fn removable() -> Vec<Removable> {
 /// Callers must first establish that nothing is using the files: an installation
 /// writing into an environment, or a search reading from one.
 pub fn remove(id: &str) -> Result<u64, String> {
+    if id == ENGINE_CACHES_ID {
+        return clear_engine_caches();
+    }
     remove_in(&data_dir(), id)
+}
+
+/// The `id` of the engine's caches among the [`removable`] items.
+pub const ENGINE_CACHES_ID: &str = "engine_caches";
+
+/// Run the engine with `args` (a `mumdia cache ... --json` call) and parse its JSON.
+///
+/// The engine's caches are not this module's files. On Linux and macOS they live in the
+/// per-user cache directory, outside [`data_dir`], and on Windows in `cache\` inside it;
+/// either way only the engine knows which names in them are its own (a key-named entry,
+/// or a temporary directory derived from one), so the listing and the removal both ask
+/// it rather than walking the directory here. An engine too old to have the command
+/// prints no JSON, and the item is simply not offered.
+fn engine_cache_json(args: &[&str]) -> Result<serde_json::Value, String> {
+    let (exe, _) = crate::engine::resolve()?;
+    let mut cmd = crate::engine::command(&exe);
+    stamp_env(&mut cmd);
+    let out = cmd
+        .args(args)
+        .output()
+        .map_err(|e| format!("could not run the engine: {e}"))?;
+    serde_json::from_slice(&out.stdout).map_err(|_| {
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("the engine did not report its caches")
+            .trim()
+            .to_string()
+    })
+}
+
+/// The removable item for `mumdia cache --json` output, or `None` when the caches hold
+/// nothing (or the output is not that report).
+fn engine_caches_item(v: &serde_json::Value) -> Option<Removable> {
+    let caches = v.get("caches")?.as_array()?;
+    let bytes: u64 = caches.iter().filter_map(|c| c.get("bytes")?.as_u64()).sum();
+    let paths: Vec<String> = caches
+        .iter()
+        .filter(|c| c.get("entries").and_then(|e| e.as_u64()).unwrap_or(0) > 0)
+        .filter_map(|c| c.get("dir")?.as_str().map(str::to_string))
+        .collect();
+    if bytes == 0 || paths.is_empty() {
+        return None;
+    }
+    let limit = match v.get("max_bytes").and_then(|m| m.as_u64()) {
+        Some(b) => format!("{:.0} GB", b as f64 / (1u64 << 30) as f64),
+        None => "no limit".to_string(),
+    };
+    Some(Removable {
+        id: ENGINE_CACHES_ID.into(),
+        label: "Search caches".into(),
+        detail: format!(
+            "Libraries the engine built from FASTA files and the retention-time projections \
+             DeepLC computed, kept so that a repeated search skips that work. The engine keeps \
+             them within {limit} (MUMDIA_CACHE_MAX_GB), removing the least recently used first; \
+             clearing them costs the next search the time to build them again."
+        ),
+        paths,
+        bytes,
+        costly: true,
+    })
+}
+
+/// `mumdia cache clear`: every entry of the engine's caches, returning the bytes freed.
+fn clear_engine_caches() -> Result<u64, String> {
+    let v = engine_cache_json(&["cache", "clear", "--json"])?;
+    let failed: Vec<String> = v
+        .get("failed")
+        .and_then(|f| f.as_array())
+        .map(|f| {
+            f.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !failed.is_empty() {
+        return Err(format!(
+            "the engine could not remove {} cache entries ({}). Close whatever is holding \
+             them open and try again.",
+            failed.len(),
+            failed.join("; ")
+        ));
+    }
+    Ok(v.get("removed")
+        .and_then(|r| r.get("bytes"))
+        .and_then(|b| b.as_u64())
+        .unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -867,6 +1004,38 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(p, vec![b'x'; bytes]).unwrap();
+    }
+
+    #[test]
+    fn the_engine_caches_are_offered_only_when_they_hold_something() {
+        let report = |lib: (u64, u64), proj: (u64, u64)| {
+            serde_json::json!({
+                "root": "/home/u/.cache/mumdia",
+                "root_source": "HOME",
+                "max_bytes": 107374182400u64,
+                "caches": [
+                    {"field": "predict_frag.library_cache", "setting": "auto",
+                     "dir": "/home/u/.cache/mumdia/libraries", "auto": true,
+                     "entries": lib.0, "bytes": lib.1},
+                    {"field": "rt_im_train.deeplc_projection_cache", "setting": "auto",
+                     "dir": "/home/u/.cache/mumdia/deeplc_projections", "auto": true,
+                     "entries": proj.0, "bytes": proj.1},
+                ]
+            })
+        };
+        assert!(engine_caches_item(&report((0, 0), (0, 0))).is_none());
+        let item = engine_caches_item(&report((2, 3000), (0, 0))).expect("a non-empty cache");
+        assert_eq!(item.id, ENGINE_CACHES_ID);
+        assert_eq!(item.bytes, 3000);
+        assert_eq!(
+            item.paths,
+            vec!["/home/u/.cache/mumdia/libraries".to_string()]
+        );
+        assert!(item.detail.contains("100 GB"), "{}", item.detail);
+        let both = engine_caches_item(&report((1, 10), (1, 20))).unwrap();
+        assert_eq!((both.bytes, both.paths.len()), (30, 2));
+        // Anything that is not the report (an older engine's usage text) offers nothing.
+        assert!(engine_caches_item(&serde_json::json!({"error": "x"})).is_none());
     }
 
     #[test]
@@ -1062,6 +1231,43 @@ mod tests {
                 "the environment must not live beside the exe"
             );
         }
+    }
+
+    #[test]
+    fn an_environment_behind_the_pins_is_outdated() {
+        let reqs = "--extra-index-url https://download.pytorch.org/whl/cpu\n\
+                    # comment\n\
+                    deeplc==4.5.0\n\
+                    torch==2.14.0+cpu\n\
+                    mokapot==0.10.0  # a trailing comment\n\
+                    numpy\n\
+                    setuptools>=83\n";
+        let v = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let current = v(&[
+            ("deeplc", "4.5.0"),
+            ("torch", "2.14.0+cpu"),
+            ("mokapot", "0.10.0"),
+            ("numpy", "2.4.6"),
+        ]);
+        assert!(outdated_pins(reqs, &current).is_empty());
+        let old = v(&[
+            ("deeplc", "4.4.0"),
+            ("torch", "2.14.0+cpu"),
+            ("numpy", "1.26.4"),
+        ]);
+        assert_eq!(
+            outdated_pins(reqs, &old),
+            vec!["deeplc 4.4.0 -> 4.5.0".to_string()]
+        );
+        // The shipped requirements pin DeepLC exactly, which is what makes this work.
+        assert!(REQUIREMENTS_PRIMARY
+            .lines()
+            .any(|l| l.trim_start().starts_with("deeplc==")));
     }
 
     #[test]
