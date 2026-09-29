@@ -861,10 +861,11 @@ pub struct RtImTrainConfig {
     /// library 5:14, 5:42 and 2:33. In one process the miss had taken 6:28 and 11:29.
     /// Base model only: a fine-tune has no factored head and ignores it.
     ///
-    /// Needs DeepLC 4.5.0 or newer, which added the factored prediction matrix it reads.
-    /// On DeepLC 4.4.x (the engine's floor) the worker records why in the summary, writes
-    /// nothing and predicts exactly as without it; it warns only when the directory was
-    /// named explicitly, since `"auto"` asks for the cache wherever it is available.
+    /// Needs DeepLC 4.5.0 or newer, which added the factored prediction matrix it reads, and
+    /// 4.5.0 is the engine's floor since 2026-09-28. A later release that moves that private
+    /// API makes the worker record why in the summary, write nothing and predict exactly as
+    /// without it; it warns only when the directory was named explicitly, since `"auto"`
+    /// asks for the cache wherever it is available.
     ///
     /// Float-equivalent, not bit-identical: the heads are evaluated in numpy from the cached
     /// factors instead of in torch. Measured with DeepLC 4.5.0 on CPU: the base-model

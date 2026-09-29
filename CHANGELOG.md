@@ -145,8 +145,30 @@ than a number. Both are recorded in every run's `manifest.json`.
   directly with no fragment table of its own. The script stays for existing recipes, with a
   note pointing at the command.
 
+### Added
+
+- **`mumdia cache` shows, trims and clears the engine's caches.** `mumdia cache` prints
+  the root, the bound and each cache's directory, entries and size (`--json` for a
+  program); `prune` applies `MUMDIA_CACHE_MAX_GB` now; `clear` removes every entry. The
+  desktop application lists the caches on its Setup screen as "Search caches" and clears
+  them through it.
+
 ### Changed
 
+- **DeepLC 4.5.0 is the floor** (was 4.4.0): `mumdia doctor` fails below it, the engine
+  refuses to launch a DeepLC worker with an older one, and both workers repeat the check
+  (they still checked 4.1.1). Every environment pins `deeplc==4.5.0` (`env/docker-deeplc.yml`,
+  `env/mumdia-deeplc.yml`, the desktop application's `env/console-requirements.txt`), which
+  makes the projection cache, on by default, work everywhere. Measured before the floor
+  moved (docs/08 section 4e; one host, environments identical but for DeepLC, 10 NN seeds
+  per arm): an Orbitrap AIF entrapment run -0.062% peptides at 1% (Welch t -0.54, FDP
+  0.984% -> 0.994%, +0.009 pp against 2 SE of 0.025) and an Astral run +0.099% (t +0.91),
+  the same 80 heads selected on both. Rebuild an environment that has DeepLC 4.4.x; the
+  desktop application shows its analysis environment as "update needed" and upgrades it
+  in place.
+- **A library-cache store no longer fills the disk:** it is skipped with a warning when it
+  would leave less than 10 GiB free on the cache's disk, measured with `df -Pk` on Unix and
+  macOS and .NET `DriveInfo` on Windows (no measurement, no check).
 - **The library cache and the DeepLC projection cache are on by default, in one bounded
   cache root.** `predict_frag.library_cache` and `rt_im_train.deeplc_projection_cache`
   default to `"auto"`: `libraries/` and `deeplc_projections/` under `MUMDIA_CACHE_DIR`, or,

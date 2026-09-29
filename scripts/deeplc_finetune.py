@@ -67,11 +67,12 @@ import time
 import deeplc                                    # import before numpy (OpenMP load order)
 import sys
 
-# The engine's default retention-time workflow calibrates DeepLC's base-model predictions
-# per run without a fine-tune. That is only sound from 4.1.1 on (4.0.0a2 memorised anchors:
-# in-sample 15.9 s against held-out 195 s residuals), so an older DeepLC is refused here as
-# well as by `mumdia doctor`, which cannot see a version that changes under its feet.
-_MIN_DEEPLC = (4, 1, 1)
+# The engine's floor (`mumdia_core::constants::MIN_DEEPLC_VERSION`), repeated here because
+# `mumdia doctor` cannot see a version that changes under its feet. The base-model
+# calibration is only sound from 4.1.1 on (4.0.0a2 memorised anchors: in-sample 15.9 s
+# against held-out 195 s residuals), the multi-head calibration needs 4.4.0, and the
+# projection cache, on by default, the factored prediction matrix of 4.5.0.
+_MIN_DEEPLC = (4, 5, 0)
 
 
 def _check_deeplc_version():
@@ -95,8 +96,8 @@ def _check_deeplc_version():
         parts.append(0)
     if tuple(parts) < _MIN_DEEPLC:
         sys.exit(
-            "deeplc %s is older than the required %d.%d.%d (pip install 'deeplc>=4.4.0')"
-            % (raw, *_MIN_DEEPLC)
+            "deeplc %s is older than the required %d.%d.%d (pip install 'deeplc>=%d.%d.%d')"
+            % (raw, *_MIN_DEEPLC, *_MIN_DEEPLC)
         )
 
 
@@ -636,7 +637,7 @@ def main():
     ap.add_argument("--multihead", type=int, default=0, metavar="N",
                     help="instead of fine-tuning, calibrate the base model against the run's "
                          "confident seed PSMs with MultiHeadRidgeCalibration over its N "
-                         "best-correlating LC-setup heads (DeepLC >= 4.4.0). 0 (default) is "
+                         "best-correlating LC-setup heads (DeepLC >= 4.5.0). 0 (default) is "
                          "off. The engine's LOESS cannot reorder peptides, so a single head "
                          "fixes the gradient but keeps that setup's elution order; this "
                          "assembles the order from the setups that resemble the run.")
@@ -1393,8 +1394,8 @@ def predict_from_projections(uniq, model, calibration, chunk, cache_dir, default
     factored head, in which case the caller predicts as usual. Private DeepLC API:
     `deeplc._factored.FactoredPredictionMatrix._projections` and
     `_model_ops.supports_factored` were added in DeepLC 4.5.0 (`core._default_task_idx` is
-    older). DeepLC 4.4.x, the engine's floor, has neither, so there the cache records why and
-    the caller predicts as usual; a later release that moves them falls back the same way.
+    older). DeepLC 4.4.x has neither; 4.5.0 is the engine's floor, so that is only a release
+    that moves them, and there the cache records why and the caller predicts as usual.
     That is a warning when the configuration named the directory, and a plain line when it
     is the engine's default (`default_dir`), which asks for the cache only where it works.
     """

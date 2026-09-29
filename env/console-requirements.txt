@@ -23,10 +23,11 @@
 # together; `ci/check_console_envs.py` checks that they stay together.
 --extra-index-url https://download.pytorch.org/whl/cpu
 
-# Retention-time prediction and per-run fine-tuning. 4.4.0 is a floor, not a
-# preference: the 4.0.0a2 preview overfits fine-tuning badly enough to invert
-# retention-time model rankings (docs/08_rt_im_train.md).
-deeplc==4.4.0
+# Retention-time prediction, the multi-head calibration and the projection cache.
+# 4.5.0 is the engine's floor, not a preference: the 4.0.0a2 preview overfits
+# fine-tuning badly enough to invert retention-time model rankings, the multi-head
+# calibration needs 4.4.0 and the projection cache 4.5.0 (docs/08_rt_im_train.md).
+deeplc==4.5.0
 torch==2.14.0+cpu
 psm-utils
 # >= 83 closes PYSEC-2026-3447 (CVE-2026-59890). torch 2.12.1 declared setuptools<82

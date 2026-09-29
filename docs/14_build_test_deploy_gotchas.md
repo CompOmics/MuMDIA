@@ -49,9 +49,9 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `docker/config.dia.json` | Baked FASTA-digest config (MS2PIP + DeepLC + strict mokapot wired to in-image envs) |
 | `docker/config.diann-lib.json` | Baked library-input config (per-run RT calibration of the library iRT, no fine-tune; strict NnTorch through the torch-capable DeepLC env) |
 | `env/docker-rescore.yml` | Conda spec for the in-image `rescore` env (`python=3.11`, `mokapot==0.10.0` + `ms2pip==4.0.0.dev9`) |
-| `env/docker-deeplc.yml` | Conda spec for the in-image `deeplc` env (`python=3.11`, `torch==2.14.0+cpu` + `deeplc==4.1.1` from PyPI) |
+| `env/docker-deeplc.yml` | Conda spec for the in-image `deeplc` env (`python=3.11`, `torch==2.14.0+cpu` + `deeplc==4.5.0` from PyPI) |
 | `env/mumdia-rescore.yml` | Minimal host env for the default mokapot rescorer only (`python=3.12`, no torch/DeepLC/MS2PIP) |
-| `env/mumdia-deeplc.yml` | Host env for the DeepLC, MS2PIP and nn_torch sidecars (`python=3.11`, `torch==2.14.0+cpu`, `deeplc==4.1.1`, `ms2pip==4.2.0`, `psm-utils`, `pyarrow`) |
+| `env/mumdia-deeplc.yml` | Host env for the DeepLC, MS2PIP and nn_torch sidecars (`python=3.11`, `torch==2.14.0+cpu`, `deeplc==4.5.0`, `ms2pip==4.2.0`, `psm-utils`, `pyarrow`) |
 | `configs/examples/*.json` | Portable example configs (`native`, `fasta-sidecars`, `diann-library`), all using `"auto"` interpreters |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | Sidecar subprocess clients + `resolve_script` path resolution |
 | `rust/mumdia/crates/mumdia/src/main.rs` | Thin CLI + global flags (`--threads`, `--log-level`, `-v`, `-q`); `doctor` reports whether the config can run (`main.rs:438`) |
@@ -413,7 +413,7 @@ things in order.
    line states the provenance (configured, which environment variable, the
    activated environment, or `PATH`).
 3. The versions of the packages whose version changes results (`deeplc`, `torch`,
-   `mokapot`, `ms2pip`, `numpy`), and a warning when DeepLC is below the 4.4.0
+   `mokapot`, `ms2pip`, `numpy`), and a failure when DeepLC is below the 4.5.0
    floor (`main.rs:566`, `version_below` at `main.rs:611`, which reads a
    pre-release such as `4.0.0a2` as 4.0.0 so it stays below the floor).
 4. A verdict. `doctor` exits non-zero if any required role is unusable
@@ -505,15 +505,31 @@ home quotas, point `MUMDIA_CACHE_DIR` at a scratch disk. Several runs may share 
 directory: every entry is published by an atomic rename, and a library hit is checked
 against the sizes and hashes recorded when it was stored.
 
+`mumdia cache` shows the same report as `doctor`'s cache section (`--json` for a
+program), `mumdia cache prune` applies the bound now, and `mumdia cache clear` removes
+every entry however recently used, renaming each aside first as eviction does; `--config`
+resolves settings that name directories. The desktop application's Setup screen lists the
+caches as "Search caches" with their size and clears them through `mumdia cache clear`, so
+a desktop user can see and free the space without knowing where the directory is.
+
+A library store leaves room on the cache's disk: it is skipped, with a warning, when it
+would leave less than 10 GiB free (`MUMDIA_CACHE_MIN_FREE_GB`, `0` for no margin), because
+the rest of the run writes its own tables to disk, often the same one. The standard library has no
+free-space call and the workspace forbids `unsafe`, so `cache::free_space` asks the
+platform's tool (`df -Pk` on Unix and macOS, .NET `DriveInfo` through PowerShell on
+Windows); when neither answers (a network share), the store goes ahead as before. The
+projection cache has its own check in the worker (the projection plus 1 GB), made before the
+file exists because a memory-mapped write that runs out of disk kills the process.
+
 The two conda envs both pin `python=3.11` on purpose: mokapot and MS2PIP pull
 `pandas<2`, which has no cp312 wheel and would force a fragile source build
-(`docker-rescore.yml:8-9`), and DeepLC 4.4.0 itself requires Python >= 3.11
+(`docker-rescore.yml:8-9`), and DeepLC 4.5.0 itself requires Python >= 3.11
 (`docker-deeplc.yml:11`). The `rescore` env anchors only the two tools
 (`mokapot==0.10.0`, `ms2pip==4.2.0`) plus `numpy<2`/`pyarrow`/`scikit-learn`,
 leaving their scientific-Python graph to pip (`docker-rescore.yml:16-21`). The
 `deeplc` env installs `torch==2.14.0+cpu` from the PyTorch CPU index-url plus
-`deeplc==4.4.0` and `pyarrow` (`docker-deeplc.yml:18-22`); it no longer caps
-`numpy<2`, which 4.4.0 does not require, and the multitask model weight ships
+`deeplc==4.5.0` and `pyarrow` (`docker-deeplc.yml:18-22`); it no longer caps
+`numpy<2`, which 4.5.0 does not require, and the multitask model weight ships
 inside the DeepLC package, so nothing is downloaded at run time.
 
 **CI workflow.** `ci.yml` triggers on push to `main` and on every pull request
@@ -788,9 +804,9 @@ do not reintroduce removed knobs. The fields relevant here:
   Python. `configs/README.md` documents the resolution order for users.
 - The pip pins in the two in-image envs are exact and reproducibility-load-bearing:
   `rescore` = `mokapot==0.10.0` + `ms2pip==4.2.0` + `numpy<2` (rest via pip,
-  `docker-rescore.yml:16-21`); `deeplc` = `torch==2.14.0+cpu` + `deeplc==4.4.0`
+  `docker-rescore.yml:16-21`); `deeplc` = `torch==2.14.0+cpu` + `deeplc==4.5.0`
   from PyPI + `pyarrow` (`docker-deeplc.yml:18-22`), with no `numpy<2` cap, which
-  4.4.0 does not require. The two host envs differ:
+  4.5.0 does not require. The two host envs differ:
   `env/mumdia-deeplc.yml` mirrors the image's DeepLC pins and adds `psm-utils`
   explicitly because `deeplc_finetune.py` imports it directly, while
   `env/mumdia-rescore.yml` is a deliberately different, minimal pin set
