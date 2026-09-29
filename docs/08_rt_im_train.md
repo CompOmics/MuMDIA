@@ -736,6 +736,19 @@ docs/TIMS_ROADMAP_bis.md, "L1d".
 The rt-im-train LOESS on top is fitted in-sample on the pass-1 targets. Refused with
 `groups.window_groups > 1`. Benchmark-gated.
 
+`rt_im_train.robust_calibration` (default false) drops outlying RT anchors before the fit
+(`calibrate::robust_inliers`): a first LOESS on the anchors inside the central 99% of
+predicted iRT, then every anchor whose residual lies more than 6 robust SDs (1.4826 x MAD)
+from the median is removed, and the curve, the window sizing and the reported residuals
+use the rest (`cal.json` `n_rt_outliers_removed`). The first fit leaves out the iRT
+extremes because a local fit at an isolated extreme iRT passes through that point. The
+LOESS grid is 200 points spaced evenly between the smallest and the largest anchor iRT, so a
+few anchors with an absurd iRT stretch it until the gradient falls into one or two cells.
+Measured on the six-run HYE diaPASEF refit, where the multi-head refit gave some library rows
+iRTs of order 1e5 s: 11 such anchors in one run moved the curve by a median of 51 s; with the
+key on, all six runs have in-sample residuals of 3.7 to 4.0 s and lose 0.6 to 0.8% of their
+anchors. With the key off the windows are identical (TIMS roadmap part 2).
+
 ### DeepLC multitask fine-tune (orchestrator pre-step, default off)
 
 This is not part of `rt_im_train::run`; it runs in the `run` orchestrator between

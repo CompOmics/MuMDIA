@@ -1227,6 +1227,21 @@
       "source_struct": "RtImTrainConfig"
     },
     {
+      "path": "rt_im_train.robust_calibration",
+      "name": "robust_calibration",
+      "section": "rt_im_train",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Drop outlying RT anchors before the calibration fit: a first LOESS on the anchors inside the central 99% of predicted iRT, then every anchor whose residual lies more than 6 robust SDs from the median is removed, and the curve, the window sizing and the reported residuals use the rest (`cal.json` `n_rt_outliers_removed`). A few anchors with an absurd predicted iRT otherwise stretch the LOESS grid until the gradient sits in one or two cells: on one HYE run of the `refit` pass, 11 of 58k anchors moved the curve by 51 s (TIMS roadmap part 2). Default false: unchanged. Benchmark-gated.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
       "path": "rt_im_train.deeplc_predict_shards",
       "name": "deeplc_predict_shards",
       "section": "rt_im_train",

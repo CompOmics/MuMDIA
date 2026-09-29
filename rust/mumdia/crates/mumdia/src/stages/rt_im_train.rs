@@ -17,7 +17,7 @@ use mumdia_io::table::{write_table_chunked_hashed, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::calibrate::{linear_fit, percentile, Loess};
+use crate::calibrate::{linear_fit, percentile, robust_inliers, Loess};
 
 pub struct RtImTrainParams<'a> {
     pub seed_psms: &'a str,
@@ -185,6 +185,9 @@ pub struct RtFit {
     /// `observed_im`), so `cal.json` records the IM calibration or why there is none. A 3D
     /// run records none of it, and its `cal.json` is what it was before IM calibration.
     im_reported: bool,
+    /// Anchors `robust_calibration` dropped before the fit; `None` when it did not run (off,
+    /// or too few anchors), so a default `cal.json` does not carry `n_rt_outliers_removed`.
+    n_rt_outliers: Option<usize>,
 }
 
 /// The fitted windows, handed from `rt-im-train` to `extract` in memory by the
@@ -642,6 +645,34 @@ fn fit_anchors(
         }
     }
     let (anchor_ids, train_irt, train_rt) = sorted_anchor_vectors(best_per_pep);
+    // `robust_calibration`: drop anchors far off a first fit before anything below uses
+    // them (the curve, the window sizing and the reported residuals).
+    let mut n_rt_outliers: Option<usize> = None;
+    let (anchor_ids, train_irt, train_rt) =
+        if cfg.robust_calibration && train_irt.len() >= cfg.min_seed_for_calibration.max(4) {
+            let keep = robust_inliers(&train_irt, &train_rt, cfg.loess_span, 200);
+            let pick = |v: &[f64]| -> Vec<f64> {
+                v.iter()
+                    .zip(&keep)
+                    .filter(|(_, k)| **k)
+                    .map(|(x, _)| *x)
+                    .collect()
+            };
+            let ids: Vec<u32> = anchor_ids
+                .iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(x, _)| *x)
+                .collect();
+            n_rt_outliers = Some(keep.iter().filter(|k| !**k).count());
+            info!(
+                removed = n_rt_outliers,
+                "rt-im-train: robust calibration dropped outlying RT anchors"
+            );
+            (ids, pick(&train_irt), pick(&train_rt))
+        } else {
+            (anchor_ids, train_irt, train_rt)
+        };
 
     // IM anchors: the same confident targets, one per candidate (the seed table already
     // holds one row per candidate), because 1/K0 depends on charge where RT does not.
@@ -685,6 +716,7 @@ fn fit_anchors(
         residuals: (f64::NAN, f64::NAN, f64::NAN),
         im: im_cal,
         im_reported,
+        n_rt_outliers,
     };
 
     // Residuals and RT window. Require enough anchors before trusting the
@@ -1158,6 +1190,10 @@ fn write_windows(
         if let (Some(obj), Some(im)) = (cal_json.as_object_mut(), im_fields.as_object()) {
             obj.extend(im.clone());
         }
+    }
+    // Only when on, so a default cal.json is unchanged.
+    if let Some(n) = fit.n_rt_outliers {
+        cal_json["n_rt_outliers_removed"] = json!(n);
     }
     mumdia_io::json::write_json(p.out_cal, &cal_json)?;
 
