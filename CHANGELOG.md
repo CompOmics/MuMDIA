@@ -7,6 +7,30 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.5.0` is a minor rather than a patch release: it changes what a run needs, what it
+writes and, within seed noise, what it finds. DeepLC 4.5.0 is the floor, so every DeepLC
+environment must be rebuilt before upgrading (the desktop application offers Update). The
+library cache and the DeepLC projection cache are on by default and together keep up to
+100 GiB under the per-user cache directory (`MUMDIA_CACHE_DIR` moves them,
+`MUMDIA_CACHE_MAX_GB` bounds them, `MUMDIA_CACHE_DIR=off` turns them off). Each default
+that changes results was gated on NN seeds on at least two acquisitions and moved peptides
+at 1% by at most 0.35% either way; the largest losses, -0.21% and -0.22%, come from
+training the NN folds in parallel, accepted for its wall time. Artifacts change bytes and
+content hashes where their values do not (float32 feature columns, chromatogram layout 2,
+the page and encoding layout of capped writers, byte-spliced tables), and `features` and
+`psms_competed` are now schema versions 2 and 4. New are the isolation-window-group search
+(`groups.window_groups`) for libraries too large to search at once, `mumdia sub-library`,
+`mumdia pool` and `mumdia cache`. Measured against 0.4.0 on one host per comparison, with
+one DeepLC 4.5.0 environment for both versions: a six-file Astral experiment on the HYE
+library took 12:04 instead of 51:33 for the same identifications (113,907 against 113,948
+peptides at 1%, the mean of 3 NN seeds), at a 23.8 against 11.4 GiB peak, because the files
+are now searched in parallel within the memory Linux reports free
+(`experiment.parallel_runs = 1` searches them one at a time). Single runs took 5:15 instead
+of 27:48 (Astral REP1 on the HYE library, +0.28% peptides over 5 seeds, a 6.3 against
+11.2 GiB peak) and 3:29 instead of 14:02 (an Orbitrap AIF entrapment run, -0.29% peptides
+at an entrapment FDP of 0.989% against 1.025%), and a repeat of either on its warm
+projection cache took 2:35 and 0:55 and wrote byte-identical results.
+
 `0.4.0` is a minor rather than a patch release: it changes results. Multi-head
 retention-time calibration is on by default, which on a six-file Astral experiment
 moved precursors from 113,961 to 131,646 and cost 1.4x to 1.7x wall clock; the
@@ -41,22 +65,115 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-29
+
 ### Added
 
-- **`predict_frag.library_cache` reuses a FASTA-built library across runs.** Set to a
-  directory, `run` and `run-experiment` look the library up under a key of the FASTA's
-  content hash, the `digest`, `peptidoforms` and `predict_frag` settings, `rng_seed`, the
-  installed predictor versions, the worker scripts and the engine binary, copy a hit to
-  the paths a build writes and skip digest, peptidoforms and predict-frag; a miss is
-  built and stored. Entries are byte copies with a blake3 per file, checked on every hit,
-  so the cache never shares a file with a run directory; a changed entry is rebuilt and
-  replaced, and a killed store's temporary directory is removed after an hour. The run
-  stays in FASTA mode. Default unset: every FASTA run builds
-  its library as before, and now logs the `--lib-precursors` / `--lib-fragments`
-  arguments, with the `rt_im_train.library_irt` value that keeps its retention-time
-  handling, that would reuse it. A hit is byte-identical to a rebuild for the native
+- **`groups.window_groups` searches a run one isolation-window group at a time.** The
+  run's windows are cut, in ascending m/z, into contiguous groups whose library bands hold
+  about the same number of precursors (planned from the precursor table's row-group
+  statistics, no table read). Each group's band is written as a precursor table of its own
+  and searched as a library of its own: seed, RT calibration windows, extract, features and
+  compete see one band's precursors, fragments (by id range from the shared fragment table)
+  and accepted rows, so the search's memory is one band's worth rather than the library's.
+  A `seed-pool` stage then puts the bands' seeds on one q scale with library-wide ids and
+  combines their mass calibrations by calibrant count; under `groups.calibration = global`
+  (the default) every band's RT model and windows are fitted on the pooled anchors, under
+  `per_group` on its own. A `pool` stage rewrites the band tables with library-wide ids,
+  keeps one row per candidate where overlapping windows searched it twice (the higher
+  `prelim_score`), and writes the standard `psms_extracted`, `chromatograms`, `features`
+  and `psms_competed`, so rescore, quant and report run unchanged and the manifest, the
+  run-level `cal.json` and the per-artifact reports keep their shape (band artifacts are
+  recorded as `name[gNN]`, under `groups/gNN/`). Measured on the CI fixture with three and
+  five groups against the ungrouped run: 151 against 150 stripped peptides, 149 shared,
+  every smoke assertion passing and the grouped run byte-identical on repetition.
+  At real scale (AT10234AUH against the 142.7M-precursor 8-12-mer immunopeptidomics
+  library, eight groups, measured with a zero-code harness) the grouped extraction with the
+  run-wide calibration reproduced the monolithic extraction row for row (22,850,003
+  candidates, identical apex retention times) at 22-96 GB per group against 173 GB, and the
+  pooled rescore gave the same 11,271 precursors at 1% (10,346 peptides against 10,213,
+  within seed spread) in 107 min against 329 min for the same stages. Per-group calibration
+  failed on the same file: three of seven groups had no confident seed on their own q scale
+  and ran unbounded, one aborting at 664 GB.
+  `docs/33_window_groups.md` has the layout, the semantics of the two calibration modes,
+  and what a band cannot see. Groups run one after another in one process; child-process
+  parallelism and `run-experiment` support are the next steps. A grouped run refuses
+  `rt_im_train.finetune_deeplc`, which would train a different model per group. A sweep of
+  the group count on the same file (48, 64, 96 and 192 asked for, one per host) accepted
+  22,850,003 PSMs in every arm, the monolithic count exactly; it also showed that a band
+  cannot be smaller than one isolation window (114 here, so 192 became 94 bands), that the
+  largest band falls only from 44 to 23 GB as bands shrink, because each pays a fixed cost,
+  and that CPU roughly doubles past about 64 bands.
+- **`mumdia pool` pools a grouped run's band artifacts from the command line.** `run` does
+  this itself at the end of a grouped search; standalone it is for the case where the
+  search finished and the run did not, which now costs a pool rather than a re-search.
+- **`Library::load_range_with` loads one precursor m/z band of a library.** The precursor
+  table is m/z-sorted with row-aligned ids, so a band is a row span: it is found from the
+  parquet row-group statistics plus one decode of `precursor_mz` over the boundary groups,
+  and `TableFile::open_rows` then reads only the row groups that cover it, trimmed by a row
+  selection. Fragments come the same way when their table is sorted by `candidate_id` at
+  row-group granularity; an unsorted table still loads through a filtered scan, with a
+  warning. The slice carries local ids `0..n` and `Library::global_offset`, the file row of
+  local id 0. This is the load an isolation-window-group search needs: a group of windows
+  can only select precursors in its band, so a run searched group by group never holds the
+  rest of the library. `TableFile::row_group_stats` exposes the footer statistics for
+  planning such reads.
+- **`mumdia sub-library` subsets a library to a set of candidates.** A second pass searches
+  the survivors of a first pass (or of `prescan`) as a library of their own, which means
+  keeping those precursors, renumbering them to the contiguous `0..n` the fragment index
+  requires, and remapping their fragment rows. `scripts/assemble_survivors.py` did that by
+  holding the whole precursor table plus a Python string per label: 44 GB and several
+  minutes per call on the 142.7M-precursor 8-12-mer immunopeptidomics library. The engine
+  streams both tables one batch at a time and keeps two `u32` per library precursor, about
+  1.6 GB on that library. The keep decision is unioned over `peptidoform_id`
+  (`--no-pair-link` opts out), so a target and its decoy are kept or dropped together and
+  exchangeability is what it was in the full library, which is the semantics the script had.
+  Not to be confused with an m/z band of a library, which is a row range the engine reads
+  directly with no fragment table of its own. The script stays for existing recipes, with a
+  note pointing at the command.
+- **Helpers for very large predicted libraries** and `docs/32_large_libraries.md`, from the
+  immunopeptidomics case study (59M and 203M precursors on one Astral run):
+  `scripts/mz_range_survivors.py` (candidates inside the run's isolation range),
+  `scripts/assemble_survivors.py` (survivors -> renumbered library, target/decoy pair kept
+  together on `peptidoform_id`), `scripts/shard_parquet.py` (row-group-aligned split and
+  concatenate) and `scripts/mh_shard_predict.py` (deduplicated, sharded multi-head DeepLC
+  calibration: 125.9M unique sequences in 42 minutes over 12 CPU shards instead of 6 hours in
+  one process). Measured yields and costs are in the document, including the seven-file
+  orchestrated first pass and the second pass from the union of first-pass identifications
+  (17,829 peptides pooled at 1%, 94-100% of DIA-NN's empirical-library second pass per file)
+  and a measurement of what the sequence-tag screen can and cannot prune on DIA
+  immunopeptidomics data, including the negative result for predicted-intensity-weighted
+  tags.
+- **`prescan.anchor_all` screens every candidate on every trimer.** The sequence-tag
+  prescan (docs/21) screened a modification-bearing candidate on the trimers that cover
+  its modified residue, which makes it a modform pruner (41.4M -> 4.9M candidates on a
+  prenylation library, target:decoy survival 1.0000). With `anchor_all: true` every
+  candidate is screened on every trimer of its sequence, so the prescan also prunes, per
+  run, a library that is large on its own, such as a predicted immunopeptidomics library.
+  It stays label-blind: both orientations of every trimer are emitted, a reverse decoy's
+  tags are its target's, and both labels pass the same screen, so it reduces compute and
+  never discriminates. `anchor_mods` may be empty under the switch. Default off;
+  `docs/32_large_libraries.md` has what the screen can and cannot prune on DIA
+  immunopeptidomics data.
+- **`predict_frag.library_cache` reuses a FASTA-built library across runs.** `run` and
+  `run-experiment` look the library up under a key of the FASTA's content hash, the
+  `digest`, `peptidoforms` and `predict_frag` settings, `rng_seed`, the installed
+  predictor versions, the worker scripts and the engine binary, copy a hit to the paths a
+  build writes and skip digest, peptidoforms and predict-frag; a miss is built and stored.
+  Entries are byte copies with a blake3 per file, checked on every hit, so the cache never
+  shares a file with a run directory; a changed entry is rebuilt and replaced, and a killed
+  store's temporary directory is removed after an hour. The run stays in FASTA mode. On by
+  default (`"auto"`, see Changed). With the cache off, a FASTA run whose library can be
+  searched as a library logs the `--lib-precursors` / `--lib-fragments` arguments, with the
+  `rt_im_train.library_irt` value that keeps its retention-time handling, that would reuse
+  it. A hit is byte-identical to a rebuild for the native
   predictors (checked in `ci/smoke.sh`); validate a sidecar configuration by searching
   one file twice with the same cache and comparing `peptides.tsv` and `proteins.tsv`.
+- **`mumdia cache` shows, trims and clears the engine's caches.** `mumdia cache` prints
+  the root, the bound and each cache's directory, entries and size (`--json` for a
+  program); `prune` applies `MUMDIA_CACHE_MAX_GB` now; `clear` removes every entry. The
+  desktop application lists the caches on its Setup screen as "Search caches" and clears
+  them through it.
 - **`experiment.parallel_runs = "auto"` sizes the per-run concurrency from the thread
   budget.** One run per 16 threads of `--threads` at most, never more than the runs, and
   each concurrent chain runs in a rayon pool of its own `threads / runs` threads, so
@@ -65,19 +182,17 @@ than a number. Both are recorded in every run's `manifest.json`.
   chunk-mates' slots idle. On Linux the first conversion, the first seed and the first
   chain each run alone from a reset high-water mark and bound how many of the rest run
   at once (`VmHWM` against `MemAvailable`, lowered to the memory cgroup's headroom inside
-  a container or a batch job); elsewhere the sizing uses threads only and the log says
-  so. `VmHWM` does not count child processes, so chains that each run their own DeepLC
-  adaptation (`rt_library_scope = per_run`) run one at a time under `"auto"`. The reset
-  means `/usr/bin/time -v` no longer reports the lifetime peak of an `"auto"` experiment;
-  use a sampling profiler. `0` means the same as `"auto"`. An explicit number keeps the
-  chunked scheduler on the engine's one pool, and the default stays 1. Opt-in because a
-  narrower pool can lay out intermediate files differently. The smoke test checks that
-  every parquet and TSV of a three-run fixture experiment is byte-identical to the
-  sequential run with two chains at once; validate on real data by running one
-  experiment at `1` and at `"auto"` and comparing `peptides.tsv` and `proteins.tsv`. Not
-  measured at scale.
-- **`extract.chromatogram_schema = 2`, an opt-in chromatogram layout (schema version 2)
-  with identical downstream tables.** Each candidate's retention-time axis is stored once
+  a container or a batch job); any other platform has no memory reading to bound them, so
+  `"auto"` runs one chain at a time there. `VmHWM` does not count child processes, so
+  chains that each run their own DeepLC adaptation (`rt_library_scope = per_run`) run one
+  at a time under `"auto"`. The reset means `/usr/bin/time -v` no longer reports the
+  lifetime peak of an `"auto"` experiment; use a sampling profiler. `0` means the same as
+  `"auto"`, and an explicit number keeps the chunked scheduler on the engine's one pool.
+  The smoke test checks that every parquet and TSV of a three-run fixture experiment is
+  byte-identical to the sequential run with two chains at once. `"auto"` is the default
+  (see Changed, which has the check at scale); `1` is the sequential experiment.
+- **`extract.chromatogram_schema = 2`, a chromatogram layout (schema version 2) with
+  identical downstream tables.** Each candidate's retention-time axis is stored once
   per parquet row group instead of on every row, each intensity trace from its first to
   its last nonzero value, and two `u32` columns (`trace_offset`, `trace_len`) rebuild the
   full trace. The two list columns are named `rt_axis` and `intensity_trimmed` in v2, so a
@@ -90,11 +205,10 @@ than a number. Both are recorded in every run's `manifest.json`.
   table, by `ci/smoke.sh` (ungrouped, grouped pooled and per band, and with a seam at every
   row through the test knob `MUMDIA_CHROM_ROW_GROUP_ROWS`), and on three real runs. The
   table was 28.7% smaller on an AIF run, 50.3% on an AIF entrapment run and 15.5% on an
-  Astral run (docs/15, "Layout v2"). The default stays 1, because readers outside the
-  engine and older engine binaries read only v1; `mumdia::chromatograms::rewrite` converts
-  between the layouts. Validate on a new dataset by running once with each setting and
-  comparing those tables with `cmp`.
-- **`rescore.handoff = raw`, an opt-in handoff with no parquet codec on either side.** The
+  Astral run (docs/15, "Layout v2"). It is the default (see Changed). Readers outside the
+  engine and older engine binaries read only v1, so set `chromatogram_schema = 1` for
+  them; `mumdia::chromatograms::rewrite` converts between the layouts.
+- **`rescore.handoff = raw`, a handoff with no parquet codec on either side.** The
   `nn_torch` worker is given a `.raw.json` description naming a row-major little-endian
   f32 `.npy` matrix and a small parquet of the metadata columns. The engine writes each
   decoded batch straight into the matrix, and the worker copies it into its own with no
@@ -102,8 +216,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   handoff's 131,072-row groups, so the scores are byte-identical to `parquet` (checked on
   a fixture for both worker backends and on a 41,910-PSM and a 522,237-PSM competed
   table). The file is 4 bytes a value, so it pays where the codec, not the disk, is the
-  limit. Validate a new host by rescoring one pool with each handoff and comparing
-  `psms_scored.parquet` byte for byte.
+  limit. It is the default (see Changed); validate a new host by rescoring one pool with
+  each handoff and comparing `psms_scored.parquet` byte for byte.
+- **Concurrent fold training for `nn_torch` (`MUMDIA_NN_PARALLEL=K`).** The (seed, fold)
+  tasks train in K spawned processes at a fixed per-process thread count
+  (`MUMDIA_NN_PARALLEL_THREADS`), sharing the matrix through a read-only memmap. The
+  epoch shuffle is then keyed per (seed, fold, iteration, epoch), which changes the scores
+  once, like a seed change; they do not depend on K. `auto` is the default (see Changed),
+  and `0` is the serial loop with its scores.
 - **`groups.pool_chromatograms = false` has quant read a grouped run's band chromatogram
   tables directly.** The pool writes the overlap losers it finds anyway to
   `groups/overlap_losers.parquet` (`band`, `candidate_id`), and quant reads the bands'
@@ -130,28 +250,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   (see Changed). `psms_scored.parquet`
   is byte-identical either way (a smoke arm compares it); the manifest then has no pooled
   competed record, and `mumdia pool --groups-dir` rebuilds the table from the bands.
-
-- **`mumdia sub-library` subsets a library to a set of candidates.** A second pass searches
-  the survivors of a first pass (or of `prescan`) as a library of their own, which means
-  keeping those precursors, renumbering them to the contiguous `0..n` the fragment index
-  requires, and remapping their fragment rows. `scripts/assemble_survivors.py` did that by
-  holding the whole precursor table plus a Python string per label: 44 GB and several
-  minutes per call on the 142.7M-precursor 8-12-mer immunopeptidomics library. The engine
-  streams both tables one batch at a time and keeps two `u32` per library precursor, about
-  1.6 GB on that library. The keep decision is unioned over `peptidoform_id`
-  (`--no-pair-link` opts out), so a target and its decoy are kept or dropped together and
-  exchangeability is what it was in the full library, which is the semantics the script had.
-  Not to be confused with an m/z band of a library, which is a row range the engine reads
-  directly with no fragment table of its own. The script stays for existing recipes, with a
-  note pointing at the command.
-
-### Added
-
-- **`mumdia cache` shows, trims and clears the engine's caches.** `mumdia cache` prints
-  the root, the bound and each cache's directory, entries and size (`--json` for a
-  program); `prune` applies `MUMDIA_CACHE_MAX_GB` now; `clear` removes every entry. The
-  desktop application lists the caches on its Setup screen as "Search caches" and clears
-  them through it.
+- **`psms_scored.parquet.report.json` records the NN worker's inherited environment.**
+  When `nn_torch` ran, `params.nn_env` lists every `MUMDIA_NN_*` variable the worker
+  inherited beyond the ones the engine sets. `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` and
+  `MUMDIA_NN_PARALLEL` change the scores and reach the worker only this way, so two runs
+  of one configuration that differ in them are now told apart by the report.
 
 ### Changed
 
@@ -166,9 +269,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   the same 80 heads selected on both. Rebuild an environment that has DeepLC 4.4.x; the
   desktop application shows its analysis environment as "update needed" and upgrades it
   in place.
-- **A library-cache store no longer fills the disk:** it is skipped with a warning when it
-  would leave less than 10 GiB free on the cache's disk, measured with `df -Pk` on Unix and
-  macOS and .NET `DriveInfo` on Windows (no measurement, no check).
 - **The library cache and the DeepLC projection cache are on by default, in one bounded
   cache root.** `predict_frag.library_cache` and `rt_im_train.deeplc_projection_cache`
   default to `"auto"`: `libraries/` and `deeplc_projections/` under `MUMDIA_CACHE_DIR`, or,
@@ -181,16 +281,22 @@ than a number. Both are recorded in every run's `manifest.json`.
   entries are removed, never one used within the last hour, and a run that leaves the caches
   over the bound says so. A library hit is byte-identical to a rebuild (an E. coli FASTA
   search 14:56 -> 3:24 on a hit). The projection cache is float-equivalent to a plain
-  prediction and needs DeepLC 4.5.0 or newer; on 4.4.x it does nothing and, under the
-  default, says so in a plain line rather than a warning. It was gated on 10 NN seeds a run
-  before becoming the default (DeepLC 4.5.0, multi-head calibration): an Orbitrap AIF
-  entrapment run gave the same peptides at 1% seed for seed (FDP 0.984% either way), an
-  Astral run -0.016% (Welch t -0.18), and hits took them from 8:04 to 1:40 and from 12:46 to
-  5:12.
+  prediction and reads the factored prediction matrix DeepLC 4.5.0 added, which is why
+  4.5.0 is the floor (above). It was gated on 10 NN seeds a run before becoming the default
+  (DeepLC 4.5.0, multi-head calibration): an Orbitrap AIF entrapment run gave the same
+  peptides at 1% seed for seed (FDP 0.984% either way) and an Astral run -0.016% (Welch t
+  -0.18). A miss computes the projection, and every call evaluates the heads, in the
+  prediction's own shard plan, so a miss costs what a plain prediction costs: whole runs on
+  128 threads took 3:15 without the cache, 3:16 on a miss and 0:56 on a hit (the
+  entrapment run), and 5:14, 5:42 and 2:33 (the Astral run).
   `mumdia doctor` reports the root, the bound and each cache's size. The Docker image sets
   `MUMDIA_CACHE_DIR=/cache` (mount a named volume to keep it). A projection cache that
   cannot be written, lacks room or holds a damaged entry now falls back to a plain
   prediction instead of failing the run.
+- **A library-cache store no longer fills the disk:** it is skipped with a warning when it
+  would leave less than `MUMDIA_CACHE_MIN_FREE_GB` (default 10 GiB) free on the cache's
+  disk, measured with `df -Pk` on Unix and macOS and .NET `DriveInfo` on Windows (no
+  measurement, no check).
 - **`rescore.handoff` defaults to `raw`** (was `parquet`). The `nn_torch` worker is given
   a row-major f32 `.npy` matrix, a metadata parquet and a `.raw.json` description, so
   neither side runs the parquet codec. The scores are byte-identical to `parquet`: the
@@ -272,21 +378,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   writes the pooled tables as before. The competed table is still pooled wherever it must
   be (overlapping bands, the candidate audit, match-between-runs). Ungrouped runs
   (`window_groups = 1`) are unaffected.
-- **Quant reads less of its two inputs.** The scored table's identity columns
-  (`peptidoform`, `protein_group`, `charge`, `base_peptide_id`) are read at the accepted
-  rows only, and the identification-apex map holds only the candidates whose
-  chromatograms are loaded; the report's `candidates_with_scored_apex` still counts the
-  whole table. The chromatogram table is opened with its offset index: a row group whose
-  `candidate_id` statistics hold no accepted id is not opened, and in an opened group each
-  column skips, unread, every data page that holds no kept row. Rows are never skipped
-  inside a page, because parquet-rs steps over a long list row slower than it decodes it.
-  Every quant table and report is byte-identical (checked against the previous binary on
-  a per-run split of the six-file Astral experiment and on the AIF benchmark, in both the
-  old single-row-group and the current chromatogram layouts). On those tables every list
-  page holds an accepted row, so no page is skipped and the read time does not move; the
-  gain is on tables whose accepted candidates cluster more coarsely than their pages,
-  which `selective_read_on_a_real_artifact` measures from a real footer.
-  `MUMDIA_QUANT_SELECTIVE_READ=0` turns the page selection off for an A/B.
 - **`features.parquet` and `psms_competed.parquet` store the feature columns as float32.**
   Every classifier narrows every feature to f32 before it sees it, so the features stage
   now stores `v as f32` and the classifier inputs, the scores and every scored output are
@@ -303,6 +394,28 @@ than a number. Both are recorded in every run's `manifest.json`.
   columns. Band tables from before and after the change cannot be pooled into one table;
   re-run the bands with one binary. The PIN (`features.emit_pin`) is written from the f64
   values and does not change.
+- **`mumdia doctor` and the interpreter resolver say what a missing DeepLC costs.** The
+  multi-head retention-time calibration is the default whenever a DeepLC interpreter is
+  configured or discovered (`predict_frag.deeplc_python` absent or `"auto"`: `MUMDIA_PYTHON_DEEPLC`,
+  `CONDA_PREFIX`, `VIRTUAL_ENV`, then `python3`/`python` on `PATH`), and a machine without one
+  runs on the imported iRT. The note printed in that case now names the calibration and its
+  measured value (+4.8% peptides on AIF, +14.3% on Astral) instead of only "keeps the imported
+  iRT", so the loss is visible where the decision is made.
+- **Quant reads less of its two inputs.** The scored table's identity columns
+  (`peptidoform`, `protein_group`, `charge`, `base_peptide_id`) are read at the accepted
+  rows only, and the identification-apex map holds only the candidates whose
+  chromatograms are loaded; the report's `candidates_with_scored_apex` still counts the
+  whole table. The chromatogram table is opened with its offset index: a row group whose
+  `candidate_id` statistics hold no accepted id is not opened, and in an opened group each
+  column skips, unread, every data page that holds no kept row. Rows are never skipped
+  inside a page, because parquet-rs steps over a long list row slower than it decodes it.
+  Every quant table and report is byte-identical (checked against the previous binary on
+  a per-run split of the six-file Astral experiment and on the AIF benchmark, in both the
+  old single-row-group and the current chromatogram layouts). On those tables every list
+  page holds an accepted row, so no page is skipped and the read time does not move; the
+  gain is on tables whose accepted candidates cluster more coarsely than their pages,
+  which `selective_read_on_a_real_artifact` measures from a real footer.
+  `MUMDIA_QUANT_SELECTIVE_READ=0` turns the page selection off for an A/B.
 - **Rescore removes its sidecar files once the scores are read back.** The handoff, the
   fold keys and the worker's output were named after the output and the PID and never
   removed, so they piled up: 7.7 GB per HYE rescore, 359 GB per immunopeptidomics pool.
@@ -325,7 +438,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   bytes and the `scored[<run>]` hashes in `experiment_manifest.json` change: a spliced
   group keeps the scored table's 1,048,576-row layout. A nullable `source` (the MBR
   worker's output) is re-encoded as before.
-
 - **The engine holds far fewer heap blocks, because that, not memory, is what a banded
   search runs out of.** A grouped search of a 203M-precursor library died at about 290 GB
   resident with 1.7 TB free, reporting a failed 3 KB allocation. Sampled on the live
@@ -449,7 +561,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   `MUMDIA_PARQUET_DECODE_THREADS=1` keeps every scan of a process on one reader. A full scan of the AIF features table went from 1.18 to 0.51 s, the competed
   table from 1.22 to 0.45 s, the chromatograms from 5.1 to 3.3 s (docs/03 "Parallel
   decode").
-
 - **Library writers emit fragment tables sorted by `candidate_id`.** `import_diann_lib.py`,
   `make_reverse_decoys.py` and `make_shift_decoys.py` finish with a streaming bucket sort
   (`_lib_io.sort_fragments_by_candidate`: partition by candidate-id range into temporary
@@ -499,6 +610,31 @@ than a number. Both are recorded in every run's `manifest.json`.
   orchestrator logs one `pre-stage time` line when its first stage starts, splitting the
   time since its entry into interpreter discovery, preflight, provenance and setup, and
   giving the time since process start.
+- **`convert` decodes the mzML in parallel.** The file's offset index cuts it into about
+  1 MiB chunks that several readers decode, and one thread folds the spectra in index
+  order, so every artifact is byte-identical to the sequential path (two 1.5 GB AIF files,
+  unit tests and `ci/smoke.sh`): one 1.54 GB, 236,042-spectrum AIF file went from 14.5 to
+  1.4 s at 8 threads. It runs only when the file agrees with its own index and is
+  sequential otherwise; `MUMDIA_CONVERT_THREADS` sets the readers, `0` or `1` the
+  sequential path. The zlib backend is now zlib-rs, and `msconvert` is asked for
+  `--mz64 --inten32` instead of `--64`.
+- **Extract and features keep every thread busy when a batch is small.** Extract
+  parallelised across the windows in flight, so `extract.windows_in_flight: 4` held it to
+  four working threads, and an isolation-window group has few windows. Each window is now
+  also split across its candidate range; a candidate belongs to one sub-range, so the hits
+  and their per-candidate order are unchanged and `windows_in_flight` only bounds memory.
+  Features decodes the next chromatogram chunk on its own thread while it computes on the
+  current one, with at most two chunks resident. `psms_extracted`, `chromatograms` and
+  `features` are byte-identical (the fixture, and one 16.5M-precursor band of an
+  immunopeptidomics run: 12.8 against 39.6 minutes on a host whose load differed between
+  the two runs, so indicative). The two-pass co-elution path of the `peak_claim` modes
+  still parallelises across windows only.
+- **A grouped run decodes its spectra once per phase instead of once per band.** For m
+  bands that is 2 MS2 and 1 MS1 decodes instead of 2m and m, lent to every band as a
+  read-only buffer. On the six-file HYE Astral benchmark banded into 100 groups the
+  per-band decodes had cost 215 CPU-minutes of seeding against 1.8 unbanded, and a
+  182 GB peak against 11.8. Every non-JSON artifact is byte-identical, grouped under
+  `calibration = global` and `per_group` and ungrouped.
 - **Rescore's feature stream and its post-classifier tail do less.** The feature stream
   and compete's pass-through copy can read each row group's projected column chunks in
   one sequential read (the span cache, `MUMDIA_WIDE_SCAN=coalesced`), and the feature
@@ -525,7 +661,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   row: an estimated 100 GB of worker memory and 4-6 minutes on the pooled
   immunopeptidomics experiment with MBR on. Every output is byte-identical to the worker
   before the change, which the tests run from git history.
-
 - **The `nn_torch` worker spends less time outside training, with byte-identical
   scores.** The parquet load decodes the next row group on a reader thread
   (`pre_buffer=True`) while up to 8 threads write the current one straight into the
@@ -543,99 +678,38 @@ than a number. Both are recorded in every run's `manifest.json`.
   back and against the worker before the change (extracted from git history), for the
   in-memory, streaming and TSV paths. The worker also prints read, fill, standardise
   and selection sub-timers, and removes its memmap after a failed run as well.
-
-### Added
-
-- **Opt-in concurrent fold training for `nn_torch` (`MUMDIA_NN_PARALLEL=K`).** The
-  (seed, fold) tasks train in K spawned processes at a fixed per-process thread count
-  (`MUMDIA_NN_PARALLEL_THREADS`), sharing the matrix through a read-only memmap. The
-  epoch shuffle is then keyed per (seed, fold, iteration, epoch), which changes the scores
-  once, like a seed change; they do not depend on K. Off by default; validate it as a seed
-  change (three seeds, two pools, entrapment) before relying on it.
-
-- **`psms_scored.parquet.report.json` records the NN worker's inherited environment.**
-  When `nn_torch` ran, `params.nn_env` lists every `MUMDIA_NN_*` variable the worker
-  inherited beyond the ones the engine sets. `MUMDIA_NN_SEED`, `MUMDIA_NN_THREADS` and
-  `MUMDIA_NN_PARALLEL` change the scores and reach the worker only this way, so two runs
-  of one configuration that differ in them are now told apart by the report.
-
-- **`mumdia pool` pools a grouped run's band artifacts from the command line.** `run` does
-  this itself at the end of a grouped search; standalone it is for the case where the
-  search finished and the run did not, which now costs a pool rather than a re-search.
-- **`groups.window_groups` searches a run one isolation-window group at a time.** The
-  run's windows are cut, in ascending m/z, into contiguous groups whose library bands hold
-  about the same number of precursors (planned from the precursor table's row-group
-  statistics, no table read). Each group's band is written as a precursor table of its own
-  and searched as a library of its own: seed, RT calibration windows, extract, features and
-  compete see one band's precursors, fragments (by id range from the shared fragment table)
-  and accepted rows, so the search's memory is one band's worth rather than the library's.
-  A `seed-pool` stage then puts the bands' seeds on one q scale with library-wide ids and
-  combines their mass calibrations by calibrant count; under `groups.calibration = global`
-  (the default) every band's RT model and windows are fitted on the pooled anchors, under
-  `per_group` on its own. A `pool` stage rewrites the band tables with library-wide ids,
-  keeps one row per candidate where overlapping windows searched it twice (the higher
-  `prelim_score`), and writes the standard `psms_extracted`, `chromatograms`, `features`
-  and `psms_competed`, so rescore, quant and report run unchanged and the manifest, the
-  run-level `cal.json` and the per-artifact reports keep their shape (band artifacts are
-  recorded as `name[gNN]`, under `groups/gNN/`). Measured on the CI fixture with three and
-  five groups against the ungrouped run: 151 against 150 stripped peptides, 149 shared,
-  every smoke assertion passing and the grouped run byte-identical on repetition.
-  At real scale (AT10234AUH against the 142.7M-precursor 8-12-mer immunopeptidomics
-  library, eight groups, measured with a zero-code harness) the grouped extraction with the
-  run-wide calibration reproduced the monolithic extraction row for row (22,850,003
-  candidates, identical apex retention times) at 22-96 GB per group against 173 GB, and the
-  pooled rescore gave the same 11,271 precursors at 1% (10,346 peptides against 10,213,
-  within seed spread) in 107 min against 329 min for the same stages. Per-group calibration
-  failed on the same file: three of seven groups had no confident seed on their own q scale
-  and ran unbounded, one aborting at 664 GB.
-  `docs/33_window_groups.md` has the layout, the semantics of the two calibration modes,
-  and what a band cannot see. Groups run one after another in one process; child-process
-  parallelism and `run-experiment` support are the next steps. A grouped run refuses
-  `rt_im_train.finetune_deeplc`, which would train a different model per group. A sweep of
-  the group count on the same file (48, 64, 96 and 192 asked for, one per host) accepted
-  22,850,003 PSMs in every arm, the monolithic count exactly; it also showed that a band
-  cannot be smaller than one isolation window (114 here, so 192 became 94 bands), that the
-  largest band falls only from 44 to 23 GB as bands shrink, because each pays a fixed cost,
-  and that CPU roughly doubles past about 64 bands.
-- **`Library::load_range_with` loads one precursor m/z band of a library.** The precursor
-  table is m/z-sorted with row-aligned ids, so a band is a row span: it is found from the
-  parquet row-group statistics plus one decode of `precursor_mz` over the boundary groups,
-  and `TableFile::open_rows` then reads only the row groups that cover it, trimmed by a row
-  selection. Fragments come the same way when their table is sorted by `candidate_id` at
-  row-group granularity; an unsorted table still loads through a filtered scan, with a
-  warning. The slice carries local ids `0..n` and `Library::global_offset`, the file row of
-  local id 0. This is the load an isolation-window-group search needs: a group of windows
-  can only select precursors in its band, so a run searched group by group never holds the
-  rest of the library. `TableFile::row_group_stats` exposes the footer statistics for
-  planning such reads.
-### Changed
-
-- **`mumdia doctor` and the interpreter resolver say what a missing DeepLC costs.** The
-  multi-head retention-time calibration is the default whenever a DeepLC interpreter is
-  configured or discovered (`predict_frag.deeplc_python` absent or `"auto"`: `MUMDIA_PYTHON_DEEPLC`,
-  `CONDA_PREFIX`, `VIRTUAL_ENV`, then `python3`/`python` on `PATH`), and a machine without one
-  runs on the imported iRT. The note printed in that case now names the calibration and its
-  measured value (+4.8% peptides on AIF, +14.3% on Astral) instead of only "keeps the imported
-  iRT", so the loss is visible where the decision is made.
-### Added
-
-- **Helpers for very large predicted libraries** and `docs/32_large_libraries.md`, from the
-  immunopeptidomics case study (59M and 203M precursors on one Astral run):
-  `scripts/mz_range_survivors.py` (candidates inside the run's isolation range),
-  `scripts/assemble_survivors.py` (survivors -> renumbered library, target/decoy pair kept
-  together on `peptidoform_id`), `scripts/shard_parquet.py` (row-group-aligned split and
-  concatenate) and `scripts/mh_shard_predict.py` (deduplicated, sharded multi-head DeepLC
-  calibration: 125.9M unique sequences in 42 minutes over 12 CPU shards instead of 6 hours in
-  one process). Measured yields and costs are in the document, including the seven-file
-  orchestrated first pass and the second pass from the union of first-pass identifications
-  (17,829 peptides pooled at 1%, 94-100% of DIA-NN's empirical-library second pass per file)
-  and a measurement of what the sequence-tag screen can and cannot prune on DIA
-  immunopeptidomics data, including the negative result for predicted-intensity-weighted
-  tags.
-
+- **`scripts/import_diann_lib.py` streams the DIA-NN library** instead of reading the
+  whole fragment-level parquet into pandas. Two passes over the row groups: the first
+  collects the precursor table, the fragment counts and the fragment m/z cardinality, the
+  second writes the fragment table one row group at a time. Output contract unchanged
+  (same candidate ids, same columns, same types; the 11 contract tests pass), fragments are
+  no longer globally sorted by `candidate_id`, which the engine never required. Measured on
+  a 29.5M-precursor, 354M-row immunopeptidomics library: 19:54 at a 15.0 GB peak against
+  21:18 at 202.6 GB before, output identical column for column (cardinality included); the 142.7M-precursor, 1.69-billion-row 8-12-mer library of the
+  same set could not be imported at all before (about a terabyte in pandas).
+- **`scripts/make_reverse_decoys.py` streams the fragment table** and computes the decoy
+  fragment m/z from per-decoy cumulative residue masses with array lookups instead of a
+  Python loop over every fragment row. Same decoys (same reversal, same seeded scramble, same
+  collision rules, same mass model; the 18 decoy-builder tests pass). Measured on the same 29.5M-precursor library: 18:20 at a 59.6 GB peak against 59:00 at 321.4 GB before, identical decoy statistics (26,438 collisions, 22,242 resolved by scramble, 4,196 pairs dropped, 58,996,242 precursors, 707,582,432 fragment rows).
 
 ### Fixed
 
+- **A grouped run fits `features.bound_from_confident` on the pooled anchors.** The
+  20-anchor floor applies to the run, but a band holds a slice of its anchors (0 or 1 per
+  band against 735 in the pooled seed on one immunopeptidomics run), so every band fell
+  back to per-candidate boundary detection where the same run unbanded fits one elution
+  window. The bands' per-anchor half-widths are now pooled and fitted once, as the mass
+  calibration already was. The defect cost 11.5% of peptides, 10.0% of precursors and
+  6.1% of protein groups on one banded run against the unbanded search, rescored with the
+  same recipe. Ungrouped runs do not change.
+- **Runs that reuse run 1's bands search run 1's band plan.** Under
+  `experiment.rt_library_scope = first_run_only`, runs 2..N of a grouped `run-experiment`
+  reuse the band libraries run 1 adapted but planned their own bands, and under
+  `groups.balance = cost` two runs can cut differently: on six HYE Astral files at 16 bands
+  the experiment extracted 10,180,553 candidates instead of 4,986,153 and quant failed
+  (`candidate_id ... has chromatogram rows in ... and in ...`). Runs 2..N now read run 1's
+  `plan.json`, and a plan that does not fit their isolation windows is refused. The same
+  experiment then gave 114,018 peptides at 1% instead of 96,505.
 - **A grouped run no longer quantifies an overlap candidate from two bands.** The pool
   found its overlap duplicates in the bands' competed tables only, but a band's
   chromatogram (and extracted) table holds every candidate extract accepted, including
@@ -670,6 +744,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   loosened in steps to `MUMDIA_NN_INIT_FDR_MAX` (default 0.05; 0 restores the hard error).
   Later iterations re-select at the training FDR on the model's own scores as before, so a
   pool where the init already works is unchanged.
+- **Rescore no longer panics with `offset overflow` while it writes a very large scored
+  table.** `psms_scored.parquet` was built as one arrow batch, and a `Utf8` column holds at
+  most 2 GiB of text, which `peptidoform` and `protein` pass at a few hundred million
+  PSMs: a seven-run immunopeptidomics rescore of 258,753,296 PSMs failed at its last step,
+  after 6.7 hours. The table is written in 65,536-row batches; the file is unchanged.
+- **`convert` no longer refuses a valid mzML whose last spectrum has a non-finite
+  retention time.** That spectrum was not counted, so the count came out one short of the
+  header's and the file was rejected as truncated or corrupt.
 - **`scripts/_lib_io.py` writes precursor tables of any size.** `Table.from_pandas` converts
   a column as one arrow array, and a `string` array holds at most 2 GiB of characters, so on
   a 285M-row precursor table (the 8-12-mer immunopeptidomics library with reverse decoys;
@@ -685,24 +767,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   precursor's bins are carried into the next row group; measured identical `cardinality` on
   the 29.5M-precursor 9-mer library.
 
-
-### Performance
-
-- **`scripts/import_diann_lib.py` streams the DIA-NN library** instead of reading the
-  whole fragment-level parquet into pandas. Two passes over the row groups: the first
-  collects the precursor table, the fragment counts and the fragment m/z cardinality, the
-  second writes the fragment table one row group at a time. Output contract unchanged
-  (same candidate ids, same columns, same types; the 11 contract tests pass), fragments are
-  no longer globally sorted by `candidate_id`, which the engine never required. Measured on
-  a 29.5M-precursor, 354M-row immunopeptidomics library: 19:54 at a 15.0 GB peak against
-  21:18 at 202.6 GB before, output identical column for column (cardinality included); the 142.7M-precursor, 1.69-billion-row 8-12-mer library of the
-  same set could not be imported at all before (about a terabyte in pandas).
-- **`scripts/make_reverse_decoys.py` streams the fragment table** and computes the decoy
-  fragment m/z from per-decoy cumulative residue masses with array lookups instead of a
-  Python loop over every fragment row. Same decoys (same reversal, same seeded scramble, same
-  collision rules, same mass model; the 18 decoy-builder tests pass). Measured on the same 29.5M-precursor library: 18:20 at a 59.6 GB peak against 59:00 at 321.4 GB before, identical decoy statistics (26,438 collisions, 22,242 resolved by scramble, 4,196 pairs dropped, 58,996,242 precursors, 707,582,432 fragment rows).
-
-
+## [0.4.0] - 2026-09-17
 
 ### Added
 
