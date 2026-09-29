@@ -68,6 +68,11 @@ echo "=== smoke: binary $BIN"
 "$BIN" --version
 rm -rf "$work"
 mkdir -p "$work"
+# The default caches (`"auto"`, `mumdia::cache`) live in the user's cache directory, where
+# they would carry a library or a DeepLC projection from one smoke run, or from a
+# developer's own searches, into the next. Every arm searches from scratch; arm 4a and the
+# stub arm `seq` set a root of their own.
+export MUMDIA_CACHE_DIR=off
 
 # The engine must be able to say the configuration is runnable before we run it.
 echo "=== smoke: doctor"
@@ -111,6 +116,8 @@ echo "=== smoke: run again for determinism"
 # 4a. `predict_frag.library_cache`: the first FASTA run builds the library and stores it,
 #     the second finds it and skips digest, peptidoforms and predict-frag. Both must give
 #     the plain run's TSVs byte for byte, and a plain FASTA run names the --lib-* reuse.
+#     The two runs use the default setting (`"auto"`) under a root of their own; a third
+#     names a directory in the configuration, which works whatever MUMDIA_CACHE_DIR says.
 echo "=== smoke: FASTA library reused through predict_frag.library_cache"
 grep -q "to search another file against this library without building it again" "$work/run2.log" \
     || { echo "a FASTA run did not print the --lib-* reuse hint"; exit 1; }
@@ -120,9 +127,16 @@ c = json.load(open(sys.argv[1]))
 c.setdefault("predict_frag", {})["library_cache"] = sys.argv[3]
 json.dump(c, open(sys.argv[2], "w"), indent=2)
 PYEOF
-for arm in cache_store cache_hit; do
-    "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
-        --out-dir "$work/out_$arm" --config "$work/libcache.json" --threads 2 \
+# The hit runs under a bound of about one byte: the entry it just used is kept (an entry
+# used within the hour is never evicted) and the run says the cache is over the bound.
+for arm in cache_store cache_hit cache_explicit; do
+    case "$arm" in
+        cache_store) env_set=(MUMDIA_CACHE_DIR="$work/cache_root"); arm_cfg="$cfg" ;;
+        cache_hit) env_set=(MUMDIA_CACHE_DIR="$work/cache_root" MUMDIA_CACHE_MAX_GB=1e-9); arm_cfg="$cfg" ;;
+        cache_explicit) env_set=(MUMDIA_CACHE_DIR=off); arm_cfg="$work/libcache.json" ;;
+    esac
+    env "${env_set[@]}" "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+        --out-dir "$work/out_$arm" --config "$arm_cfg" --threads 2 \
         > "$work/$arm.log" 2>&1 || { tail -20 "$work/$arm.log"; echo "library-cache arm $arm failed"; exit 1; }
     for f in peptides.tsv proteins.tsv; do
         cmp -s "$work/out/$f" "$work/out_$arm/$f" \
@@ -135,7 +149,20 @@ grep -q "library cache: reusing the stored library" "$work/cache_hit.log" \
     || { echo "the second cached run did not reuse the stored library"; exit 1; }
 [ ! -e "$work/out_cache_hit/peptides.parquet" ] \
     || { echo "the cache hit ran the digest anyway"; exit 1; }
-echo "    ok: stored, reused (digest skipped), both byte-identical to the plain run"
+ls "$work"/cache_root/libraries/*/entry.json > /dev/null 2>&1 \
+    || { echo "the default library cache is not under MUMDIA_CACHE_DIR/libraries"; exit 1; }
+ls "$work"/cache_root/libraries/*/last_used > /dev/null 2>&1 \
+    || { echo "the stored library records no last use"; exit 1; }
+grep -q "cache: above MUMDIA_CACHE_MAX_GB" "$work/cache_hit.log" \
+    || { echo "a cache over MUMDIA_CACHE_MAX_GB was not reported"; exit 1; }
+grep -q "library cache: stored this library" "$work/cache_explicit.log" \
+    || { echo "a library_cache directory named in the configuration was not used"; exit 1; }
+ls "$work"/libcache/*/entry.json > /dev/null 2>&1 \
+    || { echo "the named library cache directory holds no entry"; exit 1; }
+MUMDIA_CACHE_DIR="$work/cache_root" "$BIN" doctor --config "$cfg" > "$work/doctor_cache.log" 2>&1
+grep -q "predict_frag.library_cache: .*libraries (auto), 1 entries" "$work/doctor_cache.log" \
+    || { cat "$work/doctor_cache.log"; echo "doctor did not report the default library cache"; exit 1; }
+echo "    ok: stored under MUMDIA_CACHE_DIR/libraries, reused (digest skipped), kept over a bound while in use, a named directory used, all byte-identical to the plain run"
 
 # 4b. A malformed retention time must not abort the run.
 #
@@ -621,7 +648,9 @@ mode = ("multihead" if "--multihead" in opts else
         "repredict" if "--no-finetune" in opts else "finetune")
 with open(os.environ["MUMDIA_STUB_DEEPLC_LOG"], "a", encoding="utf-8") as fh:
     fh.write(json.dumps({"mode": mode, "bands": "--bands" in opts, "seed": seed,
-                         "pairs": pairs}) + "\n")
+                         "pairs": pairs,
+                         "projection_cache": opts.get("--projection-cache"),
+                         "projection_default": "--projection-cache-default" in opts}) + "\n")
 if os.environ.get("MUMDIA_STUB_DEEPLC_FAIL"):
     sys.exit("stub DeepLC worker: failing as asked (MUMDIA_STUB_DEEPLC_FAIL)")
 retain = int(os.environ.get("MUMDIA_STUB_DEEPLC_RETAIN", "0"))
@@ -687,7 +716,9 @@ for a in union keep perband; do
     stub_experiment "$a" "$a" \
         || { tail -30 "$stub/$a.log"; echo "stub arm $a failed"; exit 1; }
 done
-stub_experiment seq seq || { tail -30 "$stub/seq.log"; echo "stub arm seq failed"; exit 1; }
+# Under a cache root the multi-head call is given the default projection cache.
+MUMDIA_CACHE_DIR="$stub/cache_root" stub_experiment seq seq \
+    || { tail -30 "$stub/seq.log"; echo "stub arm seq failed"; exit 1; }
 stub_experiment overlap overlap \
     || { tail -30 "$stub/overlap.log"; echo "stub arm overlap failed"; exit 1; }
 # A failing adaptation under the overlap: the run fails, and with the worker's error.
@@ -781,6 +812,19 @@ for name in ("seq", "overlap"):
         fail("%s: expected one multi-head call, got %r" % (name, c))
     if not same(c[0]["seed"], stub / name / "a/seed_psms.parquet"):
         fail("%s: calibrated against %r" % (name, c[0]["seed"]))
+# The projection cache: the default directory under MUMDIA_CACHE_DIR, flagged as the
+# default, and nothing at all where MUMDIA_CACHE_DIR=off leaves the default cache off.
+c = calls("seq")[0]
+if not c["projection_cache"] or not same(c["projection_cache"],
+                                         stub / "cache_root" / "deeplc_projections"):
+    fail("seq: the multi-head call got projection cache %r" % c["projection_cache"])
+if not c["projection_default"]:
+    fail("seq: the default projection cache was not flagged as the default")
+for name in ("union", "keep", "perband", "overlap"):
+    for x in calls(name):
+        if x["projection_cache"] is not None:
+            fail("%s: a projection cache %r under MUMDIA_CACHE_DIR=off"
+                 % (name, x["projection_cache"]))
 a = pq.read_table(stub / "seq/scored_combined.parquet")
 b = pq.read_table(stub / "overlap/scored_combined.parquet")
 if not a.equals(b):

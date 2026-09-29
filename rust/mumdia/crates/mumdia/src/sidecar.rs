@@ -525,7 +525,7 @@ pub fn run_deeplc_multihead(
     window_holdout_frac: f64,
     threads: usize,
     shards: usize,
-    projection_cache: Option<&str>,
+    projection_cache: Option<&crate::cache::CacheDir>,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     info!(
@@ -581,7 +581,7 @@ pub fn run_deeplc_repredict(
     lib_out: &str,
     threads: usize,
     shards: usize,
-    projection_cache: Option<&str>,
+    projection_cache: Option<&crate::cache::CacheDir>,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     info!(
@@ -638,7 +638,7 @@ pub fn run_deeplc_bands(
     mode: BandAdaptation,
     threads: usize,
     shards: usize,
-    projection_cache: Option<&str>,
+    projection_cache: Option<&crate::cache::CacheDir>,
 ) -> Result<()> {
     require_deeplc_version(python)?;
     if pairs.is_empty() {
@@ -716,12 +716,26 @@ pub fn run_deeplc_bands(
     Ok(())
 }
 
-/// Append `--projection-cache <dir>` (`rt_im_train.deeplc_projection_cache`). Nothing when
-/// it is off, so the default argument list is the one an older worker accepts.
-fn push_projection_cache<'a>(args: &mut Vec<&'a str>, dir: Option<&'a str>) {
-    if let Some(dir) = dir {
-        args.push("--projection-cache");
-        args.push(dir);
+/// Append `--projection-cache <dir>` (`rt_im_train.deeplc_projection_cache`), and
+/// `--projection-cache-default` when the directory is the engine's default (`"auto"`,
+/// `crate::cache`): the worker then reports in a plain line, not a warning, that a DeepLC
+/// older than 4.5.0 cannot use it, since the default asks for the cache only where it is
+/// available. Nothing when the cache is off.
+fn push_projection_cache<'a>(args: &mut Vec<&'a str>, dir: Option<&'a crate::cache::CacheDir>) {
+    let Some(dir) = dir else {
+        return;
+    };
+    let Some(path) = dir.path.to_str() else {
+        warn!(
+            dir = %dir.path.display(),
+            "rt_im_train.deeplc_projection_cache: the directory is not valid UTF-8; predicting              without the projection cache"
+        );
+        return;
+    };
+    args.push("--projection-cache");
+    args.push(path);
+    if dir.auto {
+        args.push("--projection-cache-default");
     }
 }
 

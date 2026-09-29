@@ -774,6 +774,39 @@ def test_the_projection_cache_reproduces_the_prediction_and_is_read_back(tmp_pat
     entries = [p for p in cache.iterdir()]
     assert len(entries) == 1 and (entries[0] / "projections.npy").exists(), entries
     assert not [p for p in cache.iterdir() if ".tmp-" in p.name]
+    # The engine's cache bound orders entries by their `last_used` file: the store writes
+    # it and the hit rewrites it.
+    assert (entries[0] / "last_used").read_text("utf-8").strip().isdigit()
+
+
+def test_a_damaged_projection_cache_entry_falls_back_and_is_set_aside(tmp_path):
+    """The projection cache is on by default, so a damaged entry must cost a plain
+    prediction, not the run: a truncated `projections.npy` is set aside
+    (`<key>.broken-...`, which the engine's cache bound removes later) and the values are
+    exactly the plain prediction's; the next call rewrites the key."""
+    _deeplc_or_skip(PROJECTION_CACHE_DEEPLC)
+    _write_shard_fixture(tmp_path)
+    lib = tmp_path / "lib.parquet"
+    env = {"MUMDIA_DEEPLC_THREAD_CAP": "0", "CUDA_VISIBLE_DEVICES": "-1"}
+    common = ["--no-finetune", "--threads", "1", "--predict-threads", "1", "--predict-chunk", "64"]
+    cache = tmp_path / "cache"
+    cached = ["--projection-cache", str(cache), "--projection-cache-default"]
+    run_worker_ok("deeplc_finetune.py", str(lib), "-", str(tmp_path / "miss.parquet"), *common,
+                  *cached, env=env, timeout=1800)
+    (entry,) = [p for p in cache.iterdir()]
+    npy = entry / "projections.npy"
+    npy.write_bytes(npy.read_bytes()[:200])
+    stdout, _ = run_worker_ok("deeplc_finetune.py", str(lib), "-", str(tmp_path / "bad.parquet"),
+                              *common, *cached, env=env, timeout=1800)
+    run_worker_ok("deeplc_finetune.py", str(lib), "-", str(tmp_path / "plain.parquet"), *common,
+                  env=env, timeout=1800)
+    bad, plain = (_predicted_irt(tmp_path / f) for f in ("bad.parquet", "plain.parquet"))
+    assert (bad == plain).all(), "a damaged entry must fall back to the plain prediction"
+    assert "predicting as usual" in stdout, stdout
+    assert not entry.exists(), "the damaged entry is still in place"
+    assert [p for p in cache.iterdir() if ".broken-" in p.name], list(cache.iterdir())
+    summary = json.loads((tmp_path / "bad.parquet.summary.json").read_text("utf-8"))
+    assert summary["projection_cache"]["used"] is False, summary["projection_cache"]
 
 
 def test_the_projection_cache_falls_back_to_a_plain_prediction_before_deeplc_4_5(tmp_path):
@@ -791,18 +824,25 @@ def test_the_projection_cache_falls_back_to_a_plain_prediction_before_deeplc_4_5
     common = ["--no-finetune", "--threads", "1", "--predict-threads", "1", "--predict-chunk", "64"]
     cache = tmp_path / "cache"
     outs = {}
-    for arm, extra in [("plain", []), ("cached", ["--projection-cache", str(cache)])]:
+    for arm, extra in [("plain", []), ("cached", ["--projection-cache", str(cache)]),
+                       ("default", ["--projection-cache", str(cache),
+                                    "--projection-cache-default"])]:
         out = tmp_path / "{}.parquet".format(arm)
         stdout, _ = run_worker_ok("deeplc_finetune.py", str(lib), "-", str(out), *common,
                                   *extra, env=env, timeout=1800)
         outs[arm] = (out, stdout)
-    plain, cached = (_predicted_irt(outs[a][0]) for a in ("plain", "cached"))
+    plain, cached, default = (_predicted_irt(outs[a][0]) for a in ("plain", "cached", "default"))
     assert (plain == cached).all(), "the fallback must predict exactly as without the cache"
+    assert (plain == default).all(), "the default location falls back the same way"
+    # Under the engine's default location (`"auto"`) the fallback is a plain line: the
+    # default asks for the cache only where DeepLC can serve it.
+    assert "WARNING: projection cache" not in outs["default"][1], outs["default"][1]
+    assert "the engine's default" in outs["default"][1], outs["default"][1]
     summary = json.loads((tmp_path / "cached.parquet.summary.json").read_text("utf-8"))
     record = summary["projection_cache"]
     assert record["used"] is False, record
     assert "4.5.0" in record["why"], record
-    assert "projection cache" in outs["cached"][1], "the fallback must warn"
+    assert "WARNING: projection cache" in outs["cached"][1], "a named directory's fallback warns"
     assert not cache.exists() or not any(cache.iterdir()), list(cache.iterdir())
 
 

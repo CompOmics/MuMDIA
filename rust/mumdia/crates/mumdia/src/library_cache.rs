@@ -4,9 +4,13 @@
 //! intensities and retention times on every invocation, and one `run` per file is the
 //! documented way to search files separately, so each file paid the whole library build
 //! again: about an hour of predict-frag on the 9.8M-peptidoform HYE library (perf survey
-//! critic item 3). With `predict_frag.library_cache` set to a directory, the orchestrator
-//! looks the library up there under a key of everything that determines it, publishes a
-//! hit at the paths a build would have written, and stores a miss after building it.
+//! critic item 3). With `predict_frag.library_cache` on (`"auto"`, the default:
+//! `libraries/` under the engine's cache root, [`crate::cache`]; or a directory), the
+//! orchestrator looks the library up there under a key of everything that determines it,
+//! publishes a hit at the paths a build would have written, and stores a miss after
+//! building it. The cache is bounded by `MUMDIA_CACHE_MAX_GB` together with the DeepLC
+//! projection cache ([`crate::cache::enforce_for`]); a restore and a store record the
+//! entry's last use.
 //!
 //! The key ([`LibraryCache::for_config`]) covers the FASTA's content hash, the `digest`,
 //! `peptidoforms` and `predict_frag` sections (all but the cache directory itself), the
@@ -177,16 +181,13 @@ impl LibraryCache {
         rt_placeholder: bool,
         engine: (&str, &str),
     ) -> Option<Self> {
-        let dir = cfg.predict_frag.library_cache.as_deref()?;
+        // `"auto"` is `libraries/` under the engine's cache root (`crate::cache`).
+        let dir = crate::cache::library_dir(cfg)?.path;
         match key_material(cfg, fasta, rt_placeholder, engine) {
             Ok(material) => {
                 let text = serde_json::to_string(&material).expect("key material serializes");
                 let key = mumdia_io::hash::blake3_str(&text)[..24].to_string();
-                Some(Self {
-                    dir: PathBuf::from(dir),
-                    key,
-                    material,
-                })
+                Some(Self { dir, key, material })
             }
             Err(e) => {
                 warn!(
@@ -266,6 +267,9 @@ impl LibraryCache {
             );
             return None;
         }
+        // Marked before the copy, so the cache's eviction (`crate::cache`), which keeps an
+        // entry used within the last hour, cannot remove it from under this read.
+        crate::cache::mark_used(&entry_dir);
         match self.try_restore(&entry_dir, lib_p, lib_f) {
             Ok(w) => {
                 info!(
@@ -430,6 +434,9 @@ impl LibraryCache {
                 files,
             };
             mumdia_io::json::write_json(&tmp.join("entry.json").to_string_lossy(), &entry)?;
+            // The entry's last use, which the cache's eviction orders entries by; not one of
+            // the stored files, so `entry.json` does not list it.
+            crate::cache::mark_used(&tmp);
             match std::fs::rename(&tmp, &final_dir) {
                 Ok(()) => Ok(true),
                 // Another run renamed its copy into place between the check and here.

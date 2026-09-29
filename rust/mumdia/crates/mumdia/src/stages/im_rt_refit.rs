@@ -96,7 +96,7 @@ pub fn run(p: RefitParams) -> Result<RefitOut> {
                 p.cfg.rt_im_train.window_holdout_frac,
                 rayon::current_num_threads(),
                 p.cfg.rt_im_train.deeplc_predict_shards,
-                p.cfg.rt_im_train.deeplc_projection_cache.as_deref(),
+                crate::cache::projection_dir(p.cfg).as_ref(),
             )?;
             fold_libs.push(out);
         }

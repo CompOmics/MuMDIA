@@ -387,7 +387,7 @@ fn adapt_rt_library(
             cfg.rt_im_train.window_holdout_frac,
             threads,
             cfg.rt_im_train.deeplc_predict_shards,
-            cfg.rt_im_train.deeplc_projection_cache.as_deref(),
+            crate::cache::projection_dir(cfg).as_ref(),
         )?;
         if irt_placeholder {
             crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
@@ -971,15 +971,19 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     config_hash: &ch,
                 })?;
                 match &cache {
-                    Some(c) => c.store(&lib_p, &lib_f),
+                    Some(c) => {
+                        c.store(&lib_p, &lib_f);
+                        crate::cache::enforce_for(cfg);
+                    }
                     None => {
                         if let Some(hint) =
                             crate::library_cache::reuse_hint(cfg, &lib_p, &lib_f, irt_placeholder)
                         {
                             info!(
                                 "run-experiment: to search other files against this library \
-                                 without building it again, pass {hint}, or set \
-                                 predict_frag.library_cache to a directory and keep --fasta"
+                                 without building it again, pass {hint}, or turn \
+                                 predict_frag.library_cache on (\"auto\" or a directory) and \
+                                 keep --fasta"
                             );
                         }
                     }
@@ -1025,7 +1029,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             &out,
             rayon::current_num_threads(),
             cfg.rt_im_train.deeplc_predict_shards,
-            cfg.rt_im_train.deeplc_projection_cache.as_deref(),
+            crate::cache::projection_dir(cfg).as_ref(),
         )?;
         out
     } else {
@@ -2069,6 +2073,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         report_protein_groups = n_rep_prot,
         "run-experiment: complete"
     );
+    // The DeepLC projection cache may have grown during the experiment.
+    crate::cache::enforce_for(cfg);
     Ok(())
 }
 

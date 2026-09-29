@@ -432,7 +432,7 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 | `MbrStrategy` | config.rs:1058-1068 | **`none`**, `empirical_library`, `rt_transfer`, `full` | only `none` vs not-`none` is distinguished in code; the three non-`none` variants behave identically and `validate()` warns |
 | `DecoyTransfer` | config.rs:1077-1082 | **`permuted_rt`**, `reverse_sequence`, `both` | MBR false-transfer null; **not read by any stage** (`validate()` warns if changed) |
 | `RtLibraryScope` | config.rs | **`first_run_only`**, `per_run` | `run-experiment` only: how many DeepLC fine-tunes an experiment pays for |
-| `Handoff` | config.rs:1230-1244 | **`tsv`**, `parquet` | how the feature matrix crosses into a sidecar rescorer; `parquet` is nn_torch only (mokapot falls back to `tsv` with a warning) |
+| `Handoff` | config.rs | `tsv`, `parquet`, **`raw`** | how the feature matrix crosses into a sidecar rescorer; `parquet` and `raw` are nn_torch only (mokapot falls back to `tsv` with a warning) |
 
 #### Variant semantics (behaviorally-rich enums)
 
@@ -839,7 +839,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `entrapment_contaminant_markers` | `[]` | substrings that keep a spike-in hit as a real target |
 | `entrapment_ratio` | 1.0 | N_real_lib / N_entrap_lib scaling |
 | `strict` | `true` | fail on a rescorer sidecar failure or unsupported classifier; set false only for explicit compatibility fallback |
-| `handoff` | `parquet` | how the feature matrix reaches a sidecar rescorer (`Handoff`); mokapot/entrapment fall back to TSV automatically (docs/28 section 11) |
+| `handoff` | `raw` | how the feature matrix reaches a sidecar rescorer (`Handoff`): a row-major f32 `.npy` matrix, byte-identical in scores to `parquet`; mokapot/entrapment fall back to TSV automatically (docs/28 section 11, docs/13) |
 | `features` / `features_file` | `None` | explicit feature projection by name (inline list or one-name-per-line file); strict: a missing name is an error |
 | `feature_preset` | `all` | named list used when no explicit list is set: `all` every column, `compact` the embedded 114-feature list of docs/28 section 12 (3.4x smaller rescore matrix; the option for pooled rescoring on small machines, -1.2% on the held-out HYE B01 pool). Preset names the table lacks are skipped with a log line |
 | `train_neg_ratio` | 3.0 | cap on decoys per positive in each training fold (0 = every decoy) |

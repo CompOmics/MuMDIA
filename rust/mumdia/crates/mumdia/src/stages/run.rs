@@ -320,15 +320,21 @@ pub fn run(p: RunParams) -> Result<()> {
                     &ch,
                 ));
                 match &cache {
-                    Some(c) => c.store(&lib_p, &lib_f),
+                    Some(c) => {
+                        c.store(&lib_p, &lib_f);
+                        // A stored library can be several GB: bring the caches back within
+                        // MUMDIA_CACHE_MAX_GB now rather than only at the end of the run.
+                        crate::cache::enforce_for(cfg);
+                    }
                     None => {
                         if let Some(hint) =
                             crate::library_cache::reuse_hint(cfg, &lib_p, &lib_f, rt_placeholder)
                         {
                             info!(
                                 "run: to search another file against this library without \
-                                 building it again, pass {hint}, or set \
-                                 predict_frag.library_cache to a directory and keep --fasta"
+                                 building it again, pass {hint}, or turn \
+                                 predict_frag.library_cache on (\"auto\" or a directory) and \
+                                 keep --fasta"
                             );
                         }
                     }
@@ -525,7 +531,7 @@ pub fn run(p: RunParams) -> Result<()> {
                     cfg.rt_im_train.window_holdout_frac,
                     rayon::current_num_threads(),
                     cfg.rt_im_train.deeplc_predict_shards,
-                    cfg.rt_im_train.deeplc_projection_cache.as_deref(),
+                    crate::cache::projection_dir(cfg).as_ref(),
                 )?;
                 if rt_placeholder {
                     crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
@@ -610,7 +616,7 @@ pub fn run(p: RunParams) -> Result<()> {
                     &lib_p_dl,
                     rayon::current_num_threads(),
                     cfg.rt_im_train.deeplc_predict_shards,
-                    cfg.rt_im_train.deeplc_projection_cache.as_deref(),
+                    crate::cache::projection_dir(cfg).as_ref(),
                 )?;
                 let n_dl = mumdia_io::table::nrows(&lib_p_dl)?;
                 man.record(record_artifact(
@@ -1010,6 +1016,8 @@ pub fn run(p: RunParams) -> Result<()> {
         manifest = manifest_path,
         "run: pipeline complete"
     );
+    // The DeepLC projection cache may have grown during the run.
+    crate::cache::enforce_for(cfg);
     Ok(())
 }
 
