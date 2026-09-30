@@ -174,6 +174,14 @@ Key semantics:
   both default off, bit-identical when off. -0.9% peptides over 3 seeds, no gain: MS1
   centroids merge neighbouring ions at the 30-scan gap (MS1 width 1.6x the fragment
   width), so centroid splitting must come before any profile feature.
+  `retrace.enabled` (default off, diaPASEF only; docs/09 section 6c) rebuilds the fragment and
+  MS1 traces after extract from the raw `.d` events, in `apex_im +/- 0.015`, on convert's m/z
+  and 1/K0 scale and extract's mass calibration. Extract's traces go to
+  `chromatograms.centroid.parquet`; off is bit-identical. Measured (docs/TIMS_ROADMAP_bis.md
+  section 6): full E. coli `run` +5.9% peptides over 3 seeds (13,678, 0.89x DIA-NN), entrapment
+  at an unchanged FDP; HYE diaPASEF +15.0% peptides (seed 0) with better ProteoBench epsilon
+  and CV. Costs 160 s and 36 GB per HYE run (the held raw frames). Benchmark-gated; refused
+  with `groups.window_groups > 1`.
 - Two keys, both default 1. `extract.retain_top_peaks > 1` writes only the unscored
   diagnostic `<psms>.peaks.parquet`. `extract.promote_top_peaks > 1` writes the
   alternative peaks as additional `psms_extracted` rows with `peak_rank >= 1`;

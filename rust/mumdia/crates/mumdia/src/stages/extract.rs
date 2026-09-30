@@ -748,7 +748,7 @@ impl FragSet {
 }
 
 /// Index of the value in ascending `rts` nearest to `t` (binary search).
-fn nearest_index(rts: &[f64], t: f64) -> usize {
+pub(crate) fn nearest_index(rts: &[f64], t: f64) -> usize {
     if rts.is_empty() {
         return 0;
     }
@@ -1302,14 +1302,14 @@ fn coelution_gate_score(
 /// matching. Either a single scalar ppm offset (`grid_*` empty, the default) or an
 /// m/z-dependent grid (sorted ascending) that is linearly interpolated and clamped
 /// at the ends. `factor_at(mz)` returns the divisor `1 + ppm(mz) * 1e-6`.
-struct MassOffset {
+pub(crate) struct MassOffset {
     scalar_ppm: f64,
     grid_mz: Vec<f64>,
     grid_ppm: Vec<f64>,
 }
 impl MassOffset {
     #[inline]
-    fn factor_at(&self, mz: f64) -> f64 {
+    pub(crate) fn factor_at(&self, mz: f64) -> f64 {
         let ppm = if self.grid_mz.len() >= 2 {
             match self.grid_mz.binary_search_by(|g| g.total_cmp(&mz)) {
                 Ok(i) => self.grid_ppm[i],
@@ -1326,6 +1326,47 @@ impl MassOffset {
         };
         1.0 + ppm * 1e-6
     }
+}
+
+/// `(mass offset, fragment tolerance ppm)` from a search-seed `masscal.json`, or no offset
+/// and `fallback_tol_ppm` without one (a missing file included). The m/z grid is used only
+/// when both arrays agree in length and have >= 2 points. Shared by extract and retrace, so
+/// the raw traces sit on exactly the calibration the centroid traces were matched with.
+pub(crate) fn read_mass_cal(
+    path: Option<&str>,
+    fallback_tol_ppm: f64,
+) -> Result<(MassOffset, f64)> {
+    let Some(path) = path.filter(|m| std::path::Path::new(m).exists()) else {
+        return Ok((
+            MassOffset {
+                scalar_ppm: 0.0,
+                grid_mz: Vec::new(),
+                grid_ppm: Vec::new(),
+            },
+            fallback_tol_ppm,
+        ));
+    };
+    let v: serde_json::Value = mumdia_io::json::read_json(path)?;
+    let num = |key: &str| v.get(key).and_then(|x| x.as_f64());
+    let grid = |key: &str| -> Vec<f64> {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|e| e.as_f64()).collect())
+            .unwrap_or_default()
+    };
+    let (mut gmz, mut gpp) = (grid("mz_cal_grid_mz"), grid("mz_cal_grid_ppm"));
+    if !(gmz.len() >= 2 && gmz.len() == gpp.len()) {
+        gmz.clear();
+        gpp.clear();
+    }
+    Ok((
+        MassOffset {
+            scalar_ppm: num("frag_ppm_offset").unwrap_or(0.0),
+            grid_mz: gmz,
+            grid_ppm: gpp,
+        },
+        num("frag_tol_ppm").unwrap_or(fallback_tol_ppm),
+    ))
 }
 
 /// One isolation window and the scans acquired in it, with the candidate range that
@@ -2439,66 +2480,32 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             .map(|w| w.1 - w.0)
             .fold(0.0f64, |a, b| if b > a { b } else { a });
 
-    // Per-run mass recalibration (optional). Reads the scalar offset + learned
-    // tolerance, plus an optional m/z-dependent correction grid (mass_cal_loess).
-    let read_grid = |v: &serde_json::Value, key: &str| -> Vec<f64> {
-        v.get(key)
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|e| e.as_f64()).collect())
-            .unwrap_or_default()
-    };
-    let (frag_offset, frag_tol, grid_mz, grid_ppm) = match p.mass_cal {
-        Some(path) if std::path::Path::new(path).exists() => {
-            let v: serde_json::Value = mumdia_io::json::read_json(path)?;
-            let off = v
-                .get("frag_ppm_offset")
-                .and_then(|x| x.as_f64())
-                .unwrap_or(0.0);
-            let tol = v
-                .get("frag_tol_ppm")
-                .and_then(|x| x.as_f64())
-                .unwrap_or(p.cfg.frag_tol_ppm);
-            let gmz = read_grid(&v, "mz_cal_grid_mz");
-            let gpp = read_grid(&v, "mz_cal_grid_ppm");
-            info!(
-                frag_ppm_offset = off,
-                frag_tol_ppm = tol,
-                mz_cal_grid = gmz.len(),
-                "extract: using mass recalibration"
+    // Per-run mass recalibration (optional): the scalar offset + learned tolerance, plus
+    // an optional m/z-dependent correction grid (mass_cal_loess).
+    let (mass_off, frag_tol) = read_mass_cal(p.mass_cal, p.cfg.frag_tol_ppm)?;
+    if let Some(path) = p.mass_cal.filter(|m| std::path::Path::new(m).exists()) {
+        info!(
+            frag_ppm_offset = mass_off.scalar_ppm,
+            frag_tol_ppm = frag_tol,
+            mz_cal_grid = mass_off.grid_mz.len(),
+            "extract: using mass recalibration"
+        );
+        // `extract.frag_tol_ppm` is a FALLBACK, not a setting, in any orchestrated
+        // run: search-seed always writes `frag_tol_ppm` into masscal.json --
+        // including in its calibration-failure branch, where it writes
+        // `search_seed.fragment_tol_ppm` -- and both orchestrators always pass
+        // `--mass-cal`. So a config carrying `extract.frag_tol_ppm = 40` extracted at
+        // the learned value with nothing said about it. Say it, because a config key
+        // that is read and then ignored is worse than one that is absent.
+        if (frag_tol - p.cfg.frag_tol_ppm).abs() > 1e-9 {
+            warn!(
+                configured_frag_tol_ppm = p.cfg.frag_tol_ppm,
+                learned_frag_tol_ppm = frag_tol,
+                mass_cal = path,
+                "extract: extract.frag_tol_ppm is overridden by the learned tolerance                      from mass calibration. It applies only when no --mass-cal is passed;                      to widen the search tolerance, set search_seed.fragment_tol_ppm"
             );
-            // `extract.frag_tol_ppm` is a FALLBACK, not a setting, in any orchestrated
-            // run: search-seed always writes `frag_tol_ppm` into masscal.json --
-            // including in its calibration-failure branch, where it writes
-            // `search_seed.fragment_tol_ppm` -- and both orchestrators always pass
-            // `--mass-cal`. So a config carrying `extract.frag_tol_ppm = 40` extracted at
-            // the learned value with nothing said about it. Say it, because a config key
-            // that is read and then ignored is worse than one that is absent.
-            if (tol - p.cfg.frag_tol_ppm).abs() > 1e-9 {
-                warn!(
-                    configured_frag_tol_ppm = p.cfg.frag_tol_ppm,
-                    learned_frag_tol_ppm = tol,
-                    mass_cal = path,
-                    "extract: extract.frag_tol_ppm is overridden by the learned tolerance                      from mass calibration. It applies only when no --mass-cal is passed;                      to widen the search tolerance, set search_seed.fragment_tol_ppm"
-                );
-            }
-            (off, tol, gmz, gpp)
         }
-        _ => (0.0, p.cfg.frag_tol_ppm, Vec::new(), Vec::new()),
-    };
-    // The grid is used only if both arrays agree in length and have >= 2 points.
-    let mass_off = if grid_mz.len() >= 2 && grid_mz.len() == grid_ppm.len() {
-        MassOffset {
-            scalar_ppm: frag_offset,
-            grid_mz,
-            grid_ppm,
-        }
-    } else {
-        MassOffset {
-            scalar_ppm: frag_offset,
-            grid_mz: Vec::new(),
-            grid_ppm: Vec::new(),
-        }
-    };
+    }
 
     // fragindex backend, built once at the learned fragment tolerance when selected
     // (`MatcherKind::Fragindex`); otherwise the bucketed `Library::page_search` path
@@ -4062,7 +4069,7 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
             params: json!({
                 "frag_tol_ppm": p.cfg.frag_tol_ppm,
                 "effective_frag_tol_ppm": frag_tol,
-                "frag_ppm_offset": frag_offset,
+                "frag_ppm_offset": mass_off.scalar_ppm,
                 "presence_min_fragments": p.cfg.presence_min_fragments,
                 "presence_min_coelution": p.cfg.presence_min_coelution,
                 "gate_min_score": p.cfg.gate_min_score,

@@ -16,6 +16,7 @@ pub mod prescan;
 pub mod quant;
 pub mod report;
 pub mod rescore;
+pub mod retrace;
 pub mod rt_im_train;
 pub mod run;
 pub mod run_experiment;

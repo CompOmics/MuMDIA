@@ -296,6 +296,29 @@ enum Cmd {
         #[arg(long)]
         psms: bool,
     },
+    /// Rebuild extract's chromatogram traces from the raw diaPASEF events (`retrace`
+    /// config section) -> a chromatograms.parquet with the same rows and schema.
+    Retrace {
+        /// The `.d`. Default: the one `--spectra-ms2` was converted from.
+        #[arg(long)]
+        raw: Option<String>,
+        #[arg(long)]
+        spectra_ms2: Option<String>,
+        #[arg(long)]
+        chromatograms: String,
+        #[arg(long)]
+        psms_extracted: String,
+        #[arg(long)]
+        run_windows: String,
+        #[arg(long)]
+        lib_precursors: String,
+        #[arg(long)]
+        mass_cal: Option<String>,
+        #[arg(long)]
+        out: String,
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Keep the best candidate per competition group -> psms_competed.parquet.
     Compete {
         #[arg(long)]
@@ -1369,6 +1392,44 @@ fn real_main() -> Result<()> {
                 run_windows: &run_windows,
                 out: &out,
                 cfg: &cfg.prescan,
+                config_hash: &ch,
+            })?;
+        }
+        Cmd::Retrace {
+            raw,
+            spectra_ms2,
+            chromatograms,
+            psms_extracted,
+            run_windows,
+            lib_precursors,
+            mass_cal,
+            out,
+            config,
+        } => {
+            let cfg = load_config(&config)?;
+            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            let raw = match (raw, spectra_ms2) {
+                (Some(r), _) => r,
+                (None, Some(s)) => {
+                    stages::retrace::raw_path_from_spectra(&s)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{s}: not converted from a .d by the native reader; pass --raw"
+                        )
+                    })?
+                }
+                (None, None) => anyhow::bail!("retrace: pass --raw or --spectra-ms2"),
+            };
+            stages::retrace::run(stages::retrace::RetraceParams {
+                raw: &raw,
+                chromatograms: &chromatograms,
+                psms_extracted: &psms_extracted,
+                run_windows: &run_windows,
+                library_precursors: &lib_precursors,
+                mass_cal: mass_cal.as_deref(),
+                frag_tol_fallback_ppm: cfg.extract.frag_tol_ppm,
+                prec_tol_ppm: cfg.extract.prec_tol_ppm,
+                out: &out,
+                cfg: &cfg.retrace,
                 config_hash: &ch,
             })?;
         }

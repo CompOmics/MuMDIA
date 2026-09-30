@@ -2130,6 +2130,38 @@ impl Default for GroupsConfig {
     }
 }
 
+/// Chromatogram traces rebuilt from the raw timsTOF events (`retrace` stage, after
+/// extract). Each fragment trace point is the sum of every raw event in the grid point's
+/// frame and quad slots covering the precursor, within the learned fragment tolerance and
+/// inside `apex_im +/- im_half_width`, instead of one centroid. The MS1 isotope traces are
+/// rebuilt the same way from the MS1 frame nearest each grid point. diaPASEF only.
+/// Default off, which leaves every artifact bit-identical (the stage does not run).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetraceConfig {
+    pub enabled: bool,
+    /// Fragment band half-width in 1/K0 around the candidate's `apex_im` (`im_pred_cal`
+    /// when null). Measured flat from 0.012 to 0.020 on one diaPASEF run.
+    pub im_half_width: f64,
+    /// Also rebuild `ms1_mono` / `ms1_iso1` / `ms1_iso2`.
+    pub ms1: bool,
+    /// MS1 band half-width in 1/K0, same centre (0.025 measured equal).
+    pub ms1_im_half_width: f64,
+    /// Raw events a grid point needs to count (else 0). 2 and 3 lost identifications.
+    pub min_events: u32,
+}
+impl Default for RetraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            im_half_width: 0.015,
+            ms1: true,
+            ms1_im_half_width: 0.015,
+            min_events: 1,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -2152,6 +2184,8 @@ pub struct Config {
     pub experiment: ExperimentConfig,
     #[serde(default)]
     pub groups: GroupsConfig,
+    #[serde(default)]
+    pub retrace: RetraceConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -2172,6 +2206,7 @@ impl Default for Config {
             mbr: t(),
             experiment: t(),
             groups: t(),
+            retrace: t(),
         }
     }
 }
@@ -2222,6 +2257,25 @@ impl Config {
                 "rt_im_train.calibration_method=none is not valid (it silently falls \
                  through to the linear fit). Use \"linear\" or \"loess\"."
                     .into(),
+            ));
+        }
+        let rt = &self.retrace;
+        if !(rt.im_half_width > 0.0
+            && rt.im_half_width.is_finite()
+            && rt.ms1_im_half_width > 0.0
+            && rt.ms1_im_half_width.is_finite())
+        {
+            return Err(Invalid(
+                "retrace.im_half_width and retrace.ms1_im_half_width must be finite and > 0 \
+                 (1/K0 units; 0.015 is the measured default)."
+                    .into(),
+            ));
+        }
+        // ponytail: retrace runs in the single-library chain only; wire run_groups when a
+        // window-group TIMS search needs it.
+        if rt.enabled && self.groups.window_groups > 1 {
+            return Err(Invalid(
+                "retrace.enabled is not implemented with groups.window_groups > 1.".into(),
             ));
         }
         if self.extract.retain_top_peaks == 0 {

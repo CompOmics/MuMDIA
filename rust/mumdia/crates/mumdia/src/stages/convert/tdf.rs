@@ -431,6 +431,44 @@ impl Ctx {
     }
 }
 
+/// A diaPASEF `.d` opened for raw access: the frame reader with the same TOF -> m/z and
+/// scan -> 1/K0 calibration that convert centroids with, so raw events and the spectra
+/// artifact share one m/z and one 1/K0 scale. `retrace` reads the raw events through it.
+pub(crate) struct RawTdf {
+    pub(crate) reader: FrameReader,
+    mz: Tof2MzConverter,
+    im: ImCal,
+}
+
+impl RawTdf {
+    pub(crate) fn open(path: &str) -> Result<Self> {
+        let meta = MetadataReader::new(path).map_err(|e| anyhow!("{path}: {e}"))?;
+        let reader = FrameReader::new(path).map_err(|e| anyhow!("{path}: {e}"))?;
+        match reader.get_acquisition() {
+            AcquisitionType::DIAPASEF => {}
+            other => bail!(
+                "{path}: acquisition type {other:?}. The native timsTOF reader handles \
+                 diaPASEF only; set convert.bruker_reader = \"msconvert\" for this file"
+            ),
+        }
+        Ok(Self {
+            im: ImCal::read(path, meta.im_converter)?,
+            mz: meta.mz_converter,
+            reader,
+        })
+    }
+
+    /// TOF index (fractional) of an m/z: the inverse of the converter convert uses.
+    pub(crate) fn tof_of(&self, mz: f64) -> f64 {
+        self.mz.invert(mz)
+    }
+
+    /// 1/K0 of a TIMS scan index.
+    pub(crate) fn im_of_scan(&self, scan: f64) -> f64 {
+        self.im.im(scan)
+    }
+}
+
 /// Decode `path` frame by frame and hand every spectrum to `sink` with its scan index
 /// (the emission ordinal). `max_frames > 0` reads only the first frames of the run.
 /// Returns the number of spectra emitted.
@@ -442,18 +480,10 @@ pub(super) fn drive(
     top_ms2: usize,
     mut sink: impl FnMut(u32, Decoded) -> Result<()>,
 ) -> Result<usize> {
-    let meta = MetadataReader::new(path).map_err(|e| anyhow!("{path}: {e}"))?;
-    let reader = FrameReader::new(path).map_err(|e| anyhow!("{path}: {e}"))?;
-    match reader.get_acquisition() {
-        AcquisitionType::DIAPASEF => {}
-        other => bail!(
-            "{path}: acquisition type {other:?}. The native timsTOF reader handles \
-             diaPASEF only; set convert.bruker_reader = \"msconvert\" for this file"
-        ),
-    }
+    let RawTdf { reader, mz, im } = RawTdf::open(path)?;
     let ctx = Ctx {
-        mz: meta.mz_converter,
-        im: ImCal::read(path, meta.im_converter)?,
+        mz,
+        im,
         p: *p,
         top_ms1,
         top_ms2,

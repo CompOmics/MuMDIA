@@ -51,7 +51,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 
 | Section | Struct | Fields | Stage document |
 |---|---|---|---|
-| [(top level)](#top-level) | `Config` | 16 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
+| [(top level)](#top-level) | `Config` | 17 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
 | [`convert`](#convert) | `ConvertConfig` | 13 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
 | [`digest`](#digest) | `DigestConfig` | 6 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
@@ -69,11 +69,12 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`mbr`](#mbr) | `MbrConfig` | 9 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 2 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
 | [`groups`](#groups) | `GroupsConfig` | 3 |  |
+| [`retrace`](#retrace) | `RetraceConfig` | 5 | [docs/09_extract.md](09_extract.md) |
 | [`peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]`](#peptidoformsfixed_mods--peptidoformsvariable_mods) | `ResidueMod` | 2 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 
 ## (top level)
 
-`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:2135). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
+`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:2167). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -93,6 +94,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | `mbr` | `MbrConfig` | the `MbrConfig` section's own defaults |  |  |
 | `experiment` | `ExperimentConfig` | the `ExperimentConfig` section's own defaults |  |  |
 | `groups` | `GroupsConfig` | the `GroupsConfig` section's own defaults |  |  |
+| `retrace` | `RetraceConfig` | the `RetraceConfig` section's own defaults |  |  |
 
 ## convert
 
@@ -422,6 +424,20 @@ Searching a run one isolation-window group at a time. A group of isolation windo
 | `window_groups` | `usize` | `1` |  | Number of window groups. `1` (the default) is the ordinary single-library search. Groups are contiguous bands of isolation windows balanced by the number of library precursors they select, read from the precursor table's row-group statistics. |
 | `calibration` | `GroupCalibration` | `global` |  | Anchors for the RT calibration of each group; see `GroupCalibration`. |
 | `parallel` | `usize` | `1` |  | Bands searched at the same time inside one run. `1` (the default) is one band at a time, which is what bounds the memory: each band in flight holds its own extraction working set, so the peak is this many bands' worth. Raise it to fill a large machine, after checking one band's peak RSS: on a 203M-precursor library at 63 bands the largest band took 39 GB and the median far less. Results do not depend on it; bands are independent and their artifacts are pooled in band order either way. It must stay below the thread count: a band in flight parks one worker on its accumulation channel, so as many bands as there are threads leaves nothing to do the probing and the run deadlocks. A larger value is clamped to `threads - 1` with a warning rather than hanging. |
+
+## retrace
+
+`RetraceConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:2141). stage document: [docs/09_extract.md](09_extract.md).
+
+Chromatogram traces rebuilt from the raw timsTOF events (`retrace` stage, after extract). Each fragment trace point is the sum of every raw event in the grid point's frame and quad slots covering the precursor, within the learned fragment tolerance and inside `apex_im +/- im_half_width`, instead of one centroid. The MS1 isotope traces are rebuilt the same way from the MS1 frame nearest each grid point. diaPASEF only. Default off, which leaves every artifact bit-identical (the stage does not run).
+
+| Field | Type | Default | Gated | Description |
+|---|---|---|---|---|
+| `enabled` | `bool` | `false` |  |  |
+| `im_half_width` | `f64` | `0.015` |  | Fragment band half-width in 1/K0 around the candidate's `apex_im` (`im_pred_cal` when null). Measured flat from 0.012 to 0.020 on one diaPASEF run. |
+| `ms1` | `bool` | `true` |  | Also rebuild `ms1_mono` / `ms1_iso1` / `ms1_iso2`. |
+| `ms1_im_half_width` | `f64` | `0.015` |  | MS1 band half-width in 1/K0, same centre (0.025 measured equal). |
+| `min_events` | `u32` | `1` |  | Raw events a grid point needs to count (else 0). 2 and 3 lost identifications. |
 
 ## peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]
 
@@ -810,7 +826,7 @@ listed with the file it is in.
 | `CONDA_PREFIX` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:265` |
 | `DEEPLC_FT_THREADS` | sidecar | `"8"` | `scripts/deeplc_finetune.py:27` |
 | `MUMDIA_BREW_ITERS` | sidecar | `"20"` | `scripts/mokapot_worker.py:38` |
-| `MUMDIA_CONVERT_THREADS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/convert.rs:591` |
+| `MUMDIA_CONVERT_THREADS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/convert.rs:592` |
 | `MUMDIA_DEEPLC_RAW_OUTPUT` | sidecar | `""` | `scripts/deeplc_finetune.py:146`, `scripts/deeplc_worker.py:124` |
 | `MUMDIA_ENTRAPMENT_MODEL` | sidecar | `"gbm"` | `scripts/entrapment_worker.py:39` |
 | `MUMDIA_LR_C` | sidecar | `"1.0"` | `scripts/mokapot_worker.py:48` |
@@ -920,12 +936,12 @@ Every field whose struct has an `impl Default` resolved from the source.
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
-7 environment read(s) whose name is not a literal:
+8 environment read(s) whose name is not a literal:
 
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:1671: env read via closure of `chunk``
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:3729: env read via closure of `&mut chunk``
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:3765: env read via closure of `&mut chunk``
-- `rust/mumdia/crates/mumdia/src/stages/run.rs:845: env read via closure of `record_artifact(
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:1712: env read via closure of `chunk``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:3736: env read via closure of `&mut chunk``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs:3772: env read via closure of `&mut chunk``
+- `rust/mumdia/crates/mumdia/src/stages/run.rs:863: env read via closure of `record_artifact(
         artifact::PSMS_EXTRACTED.0,
         artifact::PSMS_EXTRACTED,
         &psms,
@@ -933,15 +949,23 @@ Every field whose struct has an `impl Default` resolved from the source.
         "extract",
         ch,
     )?``
-- `rust/mumdia/crates/mumdia/src/stages/run.rs:853: env read via closure of `record_artifact(
+- `rust/mumdia/crates/mumdia/src/stages/run.rs:871: env read via closure of `record_artifact(
         artifact::CHROMATOGRAMS.0,
         artifact::CHROMATOGRAMS,
-        &chrom,
+        &chrom_extract,
         nchr,
         "extract",
         ch,
     )?``
-- `rust/mumdia/crates/mumdia/src/stages/run.rs:873: env read via closure of `record_artifact(
+- `rust/mumdia/crates/mumdia/src/stages/run.rs:894: env read via closure of `record_artifact(
+            artifact::CHROMATOGRAMS.0,
+            artifact::CHROMATOGRAMS,
+            &chrom,
+            n,
+            "retrace",
+            ch,
+        )?``
+- `rust/mumdia/crates/mumdia/src/stages/run.rs:915: env read via closure of `record_artifact(
         artifact::FEATURES.0,
         artifact::FEATURES,
         &feats,
@@ -949,7 +973,7 @@ Every field whose struct has an `impl Default` resolved from the source.
         "features",
         ch,
     )?``
-- `rust/mumdia/crates/mumdia/src/stages/run.rs:890: env read via closure of `record_artifact(
+- `rust/mumdia/crates/mumdia/src/stages/run.rs:932: env read via closure of `record_artifact(
         artifact::PSMS_COMPETED.0,
         artifact::PSMS_COMPETED,
         &competed,
@@ -960,6 +984,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-19 structs and 218 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 29 enumerations, 1 named profile(s), 69 environment variables read and 19 set.
+20 structs and 224 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 29 enumerations, 1 named profile(s), 69 environment variables read and 19 set.
 
-31 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+31 field(s) carry a gating marker in their doc comment. 50 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

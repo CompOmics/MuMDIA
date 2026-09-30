@@ -67,6 +67,7 @@ STAGE_DOC = {
     "rt_im_train": "docs/08_rt_im_train.md",
     "extract": "docs/09_extract.md",
     "extract.claim_cues": "docs/09_extract.md",
+    "retrace": "docs/09_extract.md",
     "features": "docs/10_features.md",
     "compete": "docs/11_compete_rescore_fdr.md",
     "rescore": "docs/11_compete_rescore_fdr.md",

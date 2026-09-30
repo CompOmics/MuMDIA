@@ -558,6 +558,57 @@ same post-pass writes the five v5 peak-shape columns from the same fragment and 
 (`features::im::apex_shape`); otherwise they are null. None of this changes a score: the features stage reads these columns only
 under `features.im_features` (docs/10_features.md, "Ion-mobility features").
 
+### 6c. Raw-trace rebuild (`retrace` stage, diaPASEF, default off)
+
+`retrace.enabled` adds a stage between extract and features (`stages/retrace.rs`). It
+rewrites `chromatograms.parquet` from the raw timsTOF events of the `.d`, with the same
+rows in the same order and the same schema (chromatograms v2), so features, quant and
+pooling read it unchanged. Off, the stage does not run and every artifact is bit-identical.
+
+Why: an extract trace point is the intensity of one convert centroid, and convert's
+centroiding loses weak signal (single-linkage m/z chaining, `tdf_min_points`, the 30-scan
+mobility gap). The MS1 isotope traces are also ungated in 1/K0 unless
+`extract.im_gate = fragments_ms1`, so about two thirds of their signal on the E. coli
+diaPASEF run came from other ions at the same m/z.
+
+What a rebuilt point is, per chromatogram row:
+
+- fragment rows (`predicted_intensity > 0`): the sum of every raw event in the grid point's
+  frame, in the quad slots whose isolation window holds the precursor m/z, with TOF inside
+  the learned fragment tolerance of the calibrated fragment m/z (`masscal.json`, the same
+  `read_mass_cal` and `MassOffset::factor_at` extract matches with) and 1/K0 inside
+  `apex_im +/- retrace.im_half_width` (`im_pred_cal` when `apex_im` is null). The point's
+  `im` is the intensity-weighted 1/K0 of those events, or the old value when there are none;
+- MS1 rows (`ms1_mono` / `ms1_iso1` / `ms1_iso2`, when `retrace.ms1`): the same sum over the
+  MS1 frame nearest the grid RT (extract's `nearest_index`), within `extract.prec_tol_ppm`
+  and `apex_im +/- retrace.ms1_im_half_width`, uncalibrated as extract's `sum_near` is;
+- every other row, and every other column (`frag_obs_mz` included), is copied.
+
+A point needs `retrace.min_events` raw events (default 1, no noise floor). The rule reads no
+label. The TOF -> m/z converter and the model-2 1/K0 calibration are convert's
+(`convert::RawTdf`), so raw events, centroids and `apex_im` share one scale.
+
+Where it runs: `run::extract_to_compete`, so both passes of `rt_im_train.refit` and every
+run of `run-experiment`. Extract then writes `chromatograms.centroid.parquet` and retrace
+writes `chromatograms.parquet`. The `.d` path comes from `spectra_ms2.parquet.report.json`
+(`params.mzml` with `reader = timsrust`); a run not converted by the native reader is
+refused. `groups.window_groups > 1` is refused at config validation (not wired). The
+standalone `mumdia retrace` takes the same inputs by path (docs/23).
+
+How it runs: every frame inside the extracted candidates' RT windows is decoded once and
+held, its events sorted by TOF and packed into one `u64` each, so a TOF window is one binary
+search per frame. The chromatograms are then streamed by row group: 8 reader threads, the
+parallel sum, and a writer that encodes 16 row groups at once
+(`mumdia_io::table::ParallelTableWriter`, byte-identical to `TableWriter`). The writer
+publishes only after the last row group, so an error leaves no partial table. Peak memory is
+the held frames: 21 GB on the E. coli diaPASEF run, 36 GB on one HYE diaPASEF run. The
+stage takes 12 s on E. coli (0.25e9 trace points) and 160 s on one HYE run (7.4e9 points),
+where the event sums are about 1.1 us per summed point. The report's `stats` carry the
+rebuilt and copied row counts, the frames decoded, the raw events summed, the grid points
+without a frame, and the time of each phase.
+
+Measured effect: docs/TIMS_ROADMAP_bis.md, "Raw traces (retrace)".
+
 ### 7. Top-K peak enumeration (`retain_top_peaks`)
 
 Two independent knobs consume the enumerator, and they must not be confused:
@@ -703,6 +754,7 @@ here for one index.
 |---|---|---|
 | `extract.im_gate` (default `off`) | none; `apex_im` is filled on 4D data whatever the gate | benchmark-gated (docs/TIMS_ROADMAP.md P4); see section 6b |
 | `search_seed.im_gate` / `im_window` (default `off`) | none | benchmark-gated; see docs/07 "Ion-mobility gate" |
+| `retrace.enabled` (default `false`) | none; rewrites the chromatogram values from the raw `.d`, centroid table kept as `chromatograms.centroid.parquet` | +5.9% peptides E. coli (3 seeds), entrapment passed, HYE +15.0% (seed 0); not a default yet, see section 6c |
 | `extract.retain_top_peaks` (`config.rs:635`, default 1) | `<out_psms>.peaks.parquet` sidecar, unscored, written only when K>1 (`extract.rs:2544`); no PSM columns | ID loop not closed (sidecar peaks are unscored); gate pending |
 | `extract.promote_top_peaks` (`config.rs:645`, default 1) | extra `psms_extracted` rows with `peak_rank >= 1` (`extract.rs:2297`); no new columns | **not schema-neutral in rows**: changes the scored population and therefore FDR; gate pending |
 | `extract.emit_candidate_audit` (`config.rs:658`) | none in `extract.rs` (unused there); in `run` it gates the `audit` stage -> `candidate_audit.parquet` (`run.rs:428`) | diagnostic; no ID effect |

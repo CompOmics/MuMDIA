@@ -825,6 +825,24 @@ pub(crate) fn extract_to_compete(
     };
     let psms = d("psms_extracted.parquet");
     let chrom = d("chromatograms.parquet");
+    // `retrace.enabled`: extract's centroid traces go aside and `chromatograms.parquet` is
+    // the raw rebuild of them, so every later stage reads the usual path.
+    let raw = if cfg.retrace.enabled {
+        Some(retrace::raw_path_from_spectra(&co.ms2)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "retrace.enabled needs a diaPASEF .d converted by the native reader \
+                 (convert.bruker_reader = native); {} was not",
+                co.ms2
+            )
+        })?)
+    } else {
+        None
+    };
+    let chrom_extract = if raw.is_some() {
+        d("chromatograms.centroid.parquet")
+    } else {
+        chrom.clone()
+    };
     info!(stage = %"extract", "run: stage start");
     let (npsm, nchr) = extract::run(extract::ExtractParams {
         fragment_offset: None,
@@ -837,7 +855,7 @@ pub(crate) fn extract_to_compete(
         ms1: Some(&co.ms1),
         mass_cal: Some(&format!("{seed}.masscal.json")),
         out_psms: &psms,
-        out_chrom: &chrom,
+        out_chrom: &chrom_extract,
         restrict_candidates: None,
         cfg: &cfg.extract,
         config_hash: ch,
@@ -853,11 +871,35 @@ pub(crate) fn extract_to_compete(
     rec(record_artifact(
         artifact::CHROMATOGRAMS.0,
         artifact::CHROMATOGRAMS,
-        &chrom,
+        &chrom_extract,
         nchr,
         "extract",
         ch,
     )?);
+    if let Some(raw) = &raw {
+        info!(stage = %"retrace", "run: stage start");
+        let n = retrace::run(retrace::RetraceParams {
+            raw,
+            chromatograms: &chrom_extract,
+            psms_extracted: &psms,
+            run_windows: windows,
+            library_precursors: lib_p,
+            mass_cal: Some(&format!("{seed}.masscal.json")),
+            frag_tol_fallback_ppm: cfg.extract.frag_tol_ppm,
+            prec_tol_ppm: cfg.extract.prec_tol_ppm,
+            out: &chrom,
+            cfg: &cfg.retrace,
+            config_hash: ch,
+        })?;
+        rec(record_artifact(
+            artifact::CHROMATOGRAMS.0,
+            artifact::CHROMATOGRAMS,
+            &chrom,
+            n,
+            "retrace",
+            ch,
+        )?);
+    }
 
     let feats = d("features.parquet");
     info!(stage = %"features", "run: stage start");

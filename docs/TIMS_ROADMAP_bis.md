@@ -1,6 +1,6 @@
 # TIMS roadmap, part 2: where diaPASEF identifications are lost, and what to try next
 
-Status: proposed, 2026-09-25. Nothing in this document is implemented yet. Branch `IM`.
+Status: proposed 2026-09-25; sections 3 and 6 record what was measured and implemented since. Branch `IM`.
 It continues [TIMS_ROADMAP.md](TIMS_ROADMAP.md), whose phases P0-P7 are done. The objective
 order and the governance rules are the same:
 - identification sensitivity at 1% first, then FDR validity, quantification and runtime;
@@ -1471,8 +1471,116 @@ For every arm:
 
 ## 5. Housekeeping (noted, not planned here)
 
-- The P2-P7 work is uncommitted on branch `IM` (last commit `76d57b6`).
 - CLAUDE.md names the top-K lever `retain_top_peaks > 1`. The scored key is
   `promote_top_peaks`.
 - `extract.emit_candidate_audit` is documented as writing a per-candidate extract table,
   but nothing writes it (`audit.rs` treats it as future work).
+
+## 6. After L1d (2026-09-28 to 2026-09-30)
+
+Base: L1d in the engine (`rt_im_train.refit`), E. coli file, 12,919 stripped peptides at
+`peptide_q_value` 1% over 3 `nn_torch` seeds (0.84x DIA-NN's 15,404). Prototypes ran outside
+the engine (side scripts and patched copies of workers) until a lever held over seeds,
+entrapment and HYE. Scripts and results are in `/public/local/MuMDIA_raw` (`RESULTS_ms1.txt`
+has every number below with its directory).
+
+### Closed on the L1d base (2026-09-28)
+
+| lever | result | status |
+|---|---|---|
+| L2 top-3 peaks, trained on rank 0 only | +1.3% peptides | dropped: too small for the code it adds |
+| P7 apex shape features on valley-split spectra | -0.1% | closed |
+| `top_n_fragments` 8 / 10 / 16 / 20 / 24, 200 m/z floor | lose or tie against 12 | closed |
+| AlphaPeptDeep MS2 fine-tune on pass-1 IDs, cross-fitted | held-out PCC 0.887 -> 0.902, but -1.5% peptides and -5% seed anchors | closed |
+| shared-Gaussian co-elution fit on the chromatograms | univariate AUC 0.57-0.59 against `xcorr_shape` 0.594; +0.010 CV AUC on a supervised model | closed without a rescore |
+
+### Raw fragment traces, prototype (2026-09-28)
+
+`rebuild_traces.py` (alphatims 1.0.9) rebuilt every top-12 fragment trace on extract's grid
+from the raw TIMS events: the sum of the events in the grid point's frame and quad slots
+holding the precursor, within the learned fragment tolerance, with 1/K0 in
+`apex_im +/- 0.015` and no noise floor. Features, compete and rescore were unchanged.
+
+- E. coli, 3 seeds: 13,405 / 13,437 / 13,526, mean 13,456 (+4.2%, 0.87x DIA-NN). The width is
+  flat from +/-0.012 to 0.020; noise floors of 2 and 3 events lose, and so does the whole
+  calibrated IM window as the band.
+- Entrapment (the L1d pass-2 inputs): real peptides 12,636 / 12,743 / 12,732 against 11,985
+  (+6.0%), FDP 0.42-0.46% against 0.41%.
+- HYE diaPASEF (six runs, seed 0, from the `l1d/pass2_robust` inputs): 97,407 precursors /
+  87,502 peptides / 11,578 PGs against 86,048 / 77,734 / 10,657. ProteoBench at k = 3 with
+  quant on the new traces: 76,370 ions, median |epsilon| 0.170, CV 0.107, against 69,856 /
+  0.185 / 0.118. Quant on the old traces is worse.
+
+### Raw MS1 traces (2026-09-29)
+
+On the same base, `ms1_mono` / `iso1` / `iso2` rebuilt from the raw MS1 frame nearest each
+grid point (as extract samples them), 20 ppm, 1/K0 in `apex_im +/- 0.0XX`. The old MS1 traces
+are ungated in 1/K0 (`extract.im_gate = fragments`); +/-0.015 keeps 31% of their signal. On
+accepted targets the MS1 1/K0 centre agrees with the fragment `apex_im` (median |difference|
+0.004).
+
+| arm (E. coli, peptides at 1%) | seeds 0 / 1 / 2 | mean |
+|---|---|---|
+| raw fragment traces | 13,405 / 13,437 / 13,526 | 13,456 |
+| + raw MS1, +/-0.015 | 13,651 / 13,739 / 13,629 | 13,673 (+1.6%) |
+| + raw MS1, +/-0.025 | 13,626 / 13,659 / 13,704 | 13,663 (+1.5%) |
+
+Entrapment (+/-0.015): real peptides 12,939 against 12,704 (+1.85%), FDP 0.44-0.46% against
+0.42-0.46%. Decoy fraction 0.99% in every arm.
+
+### Apex re-pick on the raw traces (2026-09-29)
+
+Of the 6,004 DIA-NN 1% precursors extracted as a target but not accepted, 1,819 already have
+the apex within 3 s of DIA-NN's RT (a scoring loss), 1,178 have DIA-NN's RT inside the trace
+window with the wrong peak picked (what a re-pick can fix), and 3,021 lie outside the pass-2
+RT window of +/-16.9 s, with the calibrated predicted RT off by a median 90 s (an RT loss).
+The best offline rule (cosine to the prediction x square root of the predicted-weighted
+signal x a Gaussian RT prior with sigma 8 s, moving only when the new score is more than
+twice the score at extract's apex) gave 13,823 peptides (+1.1%, 3 seeds), entrapment +0.4%.
+`extract.apex_rt_prior_s: 8` (the default 120 is flat over the +/-17 s window) gives the same,
+13,803 (+0.95%), entrapment +0.5% at an unchanged FDP, with no code. No re-pick code; the prior
+is a config setting, not yet measured on HYE.
+
+### Raw traces (retrace)
+
+The engine stage, `retrace.enabled` (docs/09 section 6c): fragment and MS1 traces as in the
+two prototypes, on convert's own m/z and 1/K0 scale and extract's mass calibration, in both
+passes of `rt_im_train.refit`.
+
+Parity with the prototype on the `run_on` inputs: fragment intensity sum 1.013x, r 0.974;
+MS1 1.001x, r 0.986; the row-level log2 ratio has median 0.000 and an interquartile range of
++/-0.15, the edge events of two +/-10 ppm windows on m/z scales about 3 ppm apart. Fast loop:
+13,578 (3 seeds; prototype 13,673). Entrapment: real peptides 12,922 against the prototype's
+12,939, FDP 0.40-0.44%.
+
+Full `mumdia run` on the E. coli file, one binary, 3 seeds:
+
+| | peptides | precursors | PGs | decoy fraction |
+|---|---|---|---|---|
+| retrace off | 12,927 / 12,950 / 12,874 (12,917) | 15,679 | 1,720 | 0.99% |
+| **retrace on** | **13,619 / 13,679 / 13,735 (13,678, +5.9%)** | **16,737 (+6.7%)** | **1,820 (+5.8%)** | 0.99% |
+
+13,678 is 0.89x DIA-NN.
+
+HYE diaPASEF, six runs, seed 0, the stage on the `l1d/pass2_robust` inputs, then features and
+compete per run, one pooled rescore and per-run quant (`eng_retrace2`; ProteoBench input
+`eng_retrace2/proteobench/custom_input.tsv`):
+
+| arm | precursors | peptides | PGs | PB ions (k = 3) | median abs epsilon | CV |
+|---|---|---|---|---|---|---|
+| L1d pass 2 (control) | 86,048 | 77,734 | 10,657 | 69,856 | 0.185 | 0.118 |
+| prototype, fragments only | 97,407 | 87,502 | 11,578 | 76,370 | 0.170 | 0.107 |
+| **engine, fragments + MS1** | **99,634** | **89,424 (+15.0%)** | **11,719** | **77,627** | 0.171 | 0.108 |
+
+Decoy fraction 0.010. The precursor, peptide and PG counts are experiment-wide at 1% on
+`precursor_q`, `peptide_q_value` and `pg_q_value`; the ProteoBench ions come from the per-run
+quant tables (per-run PSM q) and count ions quantified in at least 3 of the 6 runs, so the two
+are not comparable with each other.
+
+Cost: 12 s and 21 GB on the E. coli file; 160 s and 36 GB on one HYE run (7.4e9 trace points),
+after the speed work (the first working version took 20 min per HYE run and a version holding
+every point reached 240 GB before it was stopped). Every speed step was checked byte-identical
+on E. coli and HYE r0.
+
+Not a default yet: HYE has one seed, the stage is diaPASEF only, and `apex_rt_prior_s: 8` on top
+is untested on HYE.

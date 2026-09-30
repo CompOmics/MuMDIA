@@ -889,6 +889,135 @@ impl BatchWriter {
     }
 }
 
+/// Chunked writer like [`TableWriter`] that encodes several row groups at once: each chunk
+/// passed to [`ParallelTableWriter::write_row_groups`] becomes exactly one row group, the
+/// chunks of one call are encoded on their own threads, and the row groups are appended in
+/// call order. Same properties as [`TableWriter`] (opened through the same `ArrowWriter`),
+/// so a file written with chunks of `row_group_rows` rows matches [`TableWriter`]'s.
+/// For tables whose parquet encode is the bottleneck (a HYE run's chromatograms are 7e9
+/// list values).
+pub struct ParallelTableWriter {
+    path: String,
+    row_group_rows: usize,
+    writer: Option<(
+        parquet::file::writer::SerializedFileWriter<std::fs::File>,
+        parquet::arrow::arrow_writer::ArrowRowGroupWriterFactory,
+        Arc<Schema>,
+    )>,
+    target: Option<AtomicPath>,
+    rows: u64,
+    row_groups: usize,
+}
+
+impl ParallelTableWriter {
+    pub fn new(path: &str, row_group_rows: usize) -> ParallelTableWriter {
+        ParallelTableWriter {
+            path: path.to_string(),
+            row_group_rows: row_group_rows.max(1),
+            writer: None,
+            target: None,
+            rows: 0,
+            row_groups: 0,
+        }
+    }
+
+    /// Encode `chunks` in parallel, one row group each (at most `row_group_rows` rows),
+    /// and append them in order. Every chunk must have the first chunk's schema.
+    pub fn write_row_groups(&mut self, chunks: Vec<Vec<Col>>) -> Result<()> {
+        use parquet::arrow::arrow_writer::compute_leaves;
+        let mut batches = Vec::with_capacity(chunks.len());
+        for cols in chunks {
+            let (schema, batch) = cols_to_batch(&self.path, cols)?;
+            if batch.num_rows() > self.row_group_rows {
+                return Err(anyhow!(
+                    "ParallelTableWriter: a chunk of {} rows exceeds the row group size {}",
+                    batch.num_rows(),
+                    self.row_group_rows
+                ));
+            }
+            if self.writer.is_none() {
+                let target = AtomicPath::new(&self.path)?;
+                let file = std::fs::File::create(target.tmp())
+                    .with_context(|| format!("creating {}", target.tmp().display()))?;
+                let props = writer_props(&schema, Some(self.row_group_rows));
+                let (w, f) = ArrowWriter::try_new(file, schema.clone(), Some(props))?
+                    .into_serialized_writer()?;
+                self.writer = Some((w, f, schema.clone()));
+                self.target = Some(target);
+            }
+            let first = &self.writer.as_ref().expect("opened above").2;
+            if first.as_ref() != schema.as_ref() {
+                return Err(anyhow!(
+                    "ParallelTableWriter: chunk schema for {} differs from the first chunk",
+                    self.path
+                ));
+            }
+            batches.push(batch);
+        }
+        let (writer, factory, schema) = self.writer.as_mut().expect("opened above");
+        let mut jobs = Vec::with_capacity(batches.len());
+        for (i, batch) in batches.iter().enumerate() {
+            jobs.push((factory.create_column_writers(self.row_groups + i)?, batch));
+        }
+        let encoded: Vec<Result<Vec<parquet::arrow::arrow_writer::ArrowColumnChunk>>> =
+            std::thread::scope(|sc| {
+                let handles: Vec<_> = jobs
+                    .into_iter()
+                    .map(|(cols, batch)| {
+                        let schema = schema.clone();
+                        sc.spawn(move || -> Result<_> {
+                            let mut cols = cols.into_iter();
+                            let mut out = Vec::new();
+                            for (arr, field) in batch.columns().iter().zip(schema.fields()) {
+                                for leaf in compute_leaves(field, arr)? {
+                                    let mut c = cols.next().ok_or_else(|| {
+                                        anyhow!(
+                                            "ParallelTableWriter: fewer column writers than leaves"
+                                        )
+                                    })?;
+                                    c.write(&leaf)?;
+                                    out.push(c.close()?);
+                                }
+                            }
+                            Ok(out)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .map_err(|_| anyhow!("ParallelTableWriter: an encoder panicked"))?
+                    })
+                    .collect()
+            });
+        for (chunks, batch) in encoded.into_iter().zip(&batches) {
+            let mut rg = writer.next_row_group()?;
+            for c in chunks? {
+                c.append_to_row_group(&mut rg)?;
+            }
+            rg.close()?;
+            self.rows += batch.num_rows() as u64;
+            self.row_groups += 1;
+        }
+        Ok(())
+    }
+
+    /// Write the footer, publish the file and return the row count. A writer that never
+    /// received a chunk has no schema, and is an error, as for [`TableWriter`].
+    pub fn close(mut self) -> Result<u64> {
+        let (w, _, _) = self
+            .writer
+            .take()
+            .ok_or_else(|| anyhow!("ParallelTableWriter: {} closed with no chunk", self.path))?;
+        w.close().context("closing parquet writer")?;
+        if let Some(t) = self.target.take() {
+            t.publish()?;
+        }
+        Ok(self.rows)
+    }
+}
+
 pub fn write_batches(path: &str, schema: Arc<Schema>, batches: &[RecordBatch]) -> Result<u64> {
     let target = AtomicPath::new(path)?;
     let file = std::fs::File::create(target.tmp())
@@ -1977,6 +2106,45 @@ impl TableFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_writer_matches_table_writer_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("mumdia_par_writer_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let chunk = |a: u32, n: u32| {
+            vec![
+                Col::U32("id".into(), (a..a + n).collect()),
+                Col::Str("name".into(), (a..a + n).map(|i| format!("y{i}")).collect()),
+                Col::LargeListF32(
+                    "trace".into(),
+                    (a..a + n)
+                        .map(|i| (0..(i % 7)).map(|k| (i * 10 + k) as f32 * 0.37).collect())
+                        .collect(),
+                ),
+            ]
+        };
+        // row groups of 4 rows: 4, 4, 4, 2 -- split over two calls
+        let seq = dir.join("seq.parquet").to_str().unwrap().to_string();
+        let mut w = TableWriter::new(&seq).with_row_group_rows(4);
+        for a in [0, 4, 8, 12] {
+            w.write_cols(chunk(a, if a == 12 { 2 } else { 4 })).unwrap();
+        }
+        w.close().unwrap();
+        let par = dir.join("par.parquet").to_str().unwrap().to_string();
+        let mut p = ParallelTableWriter::new(&par, 4);
+        p.write_row_groups(vec![chunk(0, 4), chunk(4, 4), chunk(8, 4)])
+            .unwrap();
+        p.write_row_groups(vec![chunk(12, 2)]).unwrap();
+        assert_eq!(p.close().unwrap(), 14);
+        assert_eq!(std::fs::read(&seq).unwrap(), std::fs::read(&par).unwrap());
+        // a chunk larger than a row group is refused, and nothing is published
+        let big = dir.join("big.parquet").to_str().unwrap().to_string();
+        let mut b = ParallelTableWriter::new(&big, 4);
+        assert!(b.write_row_groups(vec![chunk(0, 5)]).is_err());
+        drop(b);
+        assert!(!std::path::Path::new(&big).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn open_rows_reads_exactly_the_span_and_stats_describe_the_groups() {

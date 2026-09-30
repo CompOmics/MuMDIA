@@ -4,6 +4,7 @@
 //! local-maxima) so downstream matching sees discrete peaks.
 
 mod tdf;
+pub(crate) use tdf::RawTdf;
 pub use tdf::TdfParams;
 
 use std::io::SeekFrom;
