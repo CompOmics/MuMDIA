@@ -1530,10 +1530,11 @@ Entrapment (+/-0.015): real peptides 12,939 against 12,704 (+1.85%), FDP 0.44-0.
 
 ### Apex re-pick on the raw traces (2026-09-29)
 
-Of the 6,004 DIA-NN 1% precursors extracted as a target but not accepted, 1,819 already have
-the apex within 3 s of DIA-NN's RT (a scoring loss), 1,178 have DIA-NN's RT inside the trace
-window with the wrong peak picked (what a re-pick can fix), and 3,021 lie outside the pass-2
-RT window of +/-16.9 s, with the calibrated predicted RT off by a median 90 s (an RT loss).
+A first split, pairing each DIA-NN 1% precursor with every extracted candidate of its
+sequence, counted 3,021 of 6,004 unaccepted pairs outside the RT window. That unit double
+counts (other modforms, candidates removed in compete); the D1 sorter below pairs each
+precursor with its best-scoring row and finds far fewer (section "Loss split on the retrace
+baseline").
 The best offline rule (cosine to the prediction x square root of the predicted-weighted
 signal x a Gaussian RT prior with sigma 8 s, moving only when the new score is more than
 twice the score at extract's apex) gave 13,823 peptides (+1.1%, 3 seeds), entrapment +0.4%.
@@ -1584,3 +1585,29 @@ on E. coli and HYE r0.
 
 Not a default yet: HYE has one seed, the stage is diaPASEF only, and `apex_rt_prior_s: 8` on top
 is untested on HYE.
+
+### Loss split on the retrace baseline, and wider RT windows (2026-09-30)
+
+`bench/tims_loss.py` (D1) on the full E. coli runs (`/public/local/MuMDIA_retrace`), 17,591
+DIA-NN 1% precursors (I/L-merged stripped sequence + charge), accepted on the best row's pooled
+PSM `q_value` at 1%, right peak within 5 s:
+
+| category | retrace off | retrace on | on, `rt_window_multiplier` 1.5 |
+|---|---|---|---|
+| accepted | 13,652 (77.6%) | 14,220 (80.8%) | 14,047 |
+| right peak, low score | 2,484 | 1,882 (10.7%) | 1,792 |
+| wrong peak, DIA-NN RT inside the window | 829 | 847 (4.8%) | 1,220 |
+| wrong peak, DIA-NN RT outside the window | 415 | 433 (2.5%) | 355 |
+| not extracted (RT out / IM out / in window) | 35 / 53 / 123 | 32 / 54 / 123 | 14 / 51 / 112 |
+
+Accepted share per DIA-NN intensity quintile with retrace on: 0.50 / 0.75 / 0.87 / 0.94 / 0.98
+(faintest first; off: 0.42 / 0.70 / 0.85 / 0.93 / 0.98). Retrace moved about 600 precursors
+from "right peak, low score" to accepted. 57% of the 433 outside-window rows are not on
+DIA-NN's exact peptidoform.
+
+Wider RT windows (`rt_im_train.rt_window_multiplier`, default 1.0, full runs with retrace on,
+3 seeds): 1.5 gives 13,429 peptides (-1.8%), 2.0 gives 13,282 (-2.9%), decoy fraction 0.99%.
+At 1.5 about 100 precursors come back inside the window and 373 more lose to a wrong peak
+inside it. Closed: the RT-window loss is small and a wider window costs more than it recovers.
+The largest remaining group is "right peak, low score", dominated by the faintest quintile.
+
