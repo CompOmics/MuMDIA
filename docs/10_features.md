@@ -585,6 +585,18 @@ the block separates accepted targets moderately (best `im_frag_overlap`, AUC 0.7
 no leakage in the low-score null (0.496-0.509), and does not raise identifications
 (docs/TIMS_ROADMAP.md, "P7 result").
 
+### Retrace apex (`features.retrace_apex`, default off)
+
+Needs `retrace.enabled` (refused otherwise in `run`), and refused with
+`extract.promote_top_peaks > 1`. Features reads `<chromatograms>.apex.parquet` (docs/09
+section 6c). It replaces `apex_intensity`, `n_matched_fragments` and `ms1_mono` / `ms1_iso1`
+/ `ms1_iso2` with their raw-trace values. An MS1 value stays null only when extract had none
+and the raw trace has no signal. The replacement feeds every feature built on those
+scalars, and `prelim_score` too. It also appends one column, `imc_ref_w`, after every other
+column. A row without a sidecar record keeps extract's values and gets 0, with a warning.
+With the key off, the feature list, the schema id and the values are unchanged (checked
+equal on the E. coli run). Measured: docs/TIMS_ROADMAP_bis.md section 7.
+
 ## The Percolator PIN (`write_pin`, `features.rs:1537`)
 
 Streamed row-by-row through a `BufWriter` (not materialized as one String).
@@ -668,6 +680,7 @@ variant no longer exists).
 | `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
 | `im_features` | false | append the ion-mobility block (see "Ion-mobility features"); benchmark-gated |
 | `im_shape_features` | false | append the IM peak-shape block after it (needs `convert.tdf_im_width`); benchmark-gated |
+| `retrace_apex` | false | apex scalars from the raw traces plus `imc_ref_w`, last (needs `retrace.enabled`); benchmark-gated |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded
 `FRAG_TOL_PPM = 20.0` (`mass_accuracy.rs:44`), not `prec_tol_ppm`; Evidence does

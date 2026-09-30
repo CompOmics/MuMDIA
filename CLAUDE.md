@@ -182,6 +182,12 @@ Key semantics:
   at an unchanged FDP; HYE diaPASEF +15.0% peptides (seed 0) with better ProteoBench epsilon
   and CV. Costs 160 s and 36 GB per HYE run (the held raw frames). Benchmark-gated; refused
   with `groups.window_groups > 1`.
+  `features.retrace_apex` (default off, needs retrace) swaps the centroid apex scalars for
+  raw-trace values and appends `imc_ref_w`, the agreement of the fragments' raw 1/K0 profiles
+  at the apex (docs/09 section 6c, docs/10). Measured (docs/TIMS_ROADMAP_bis.md section 7):
+  E. coli +1.8% peptides on top of retrace over 3 seeds, entrapment +2.2% real peptides at
+  an FDP of 0.43-0.51% (control 0.40-0.44%), HYE diaPASEF +3.9% peptides (seed 0) with
+  ProteoBench epsilon and CV about unchanged. Benchmark-gated.
 - Two keys, both default 1. `extract.retain_top_peaks > 1` writes only the unscored
   diagnostic `<psms>.peaks.parquet`. `extract.promote_top_peaks > 1` writes the
   alternative peaks as additional `psms_extracted` rows with `peak_rank >= 1`;

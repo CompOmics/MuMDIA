@@ -243,6 +243,24 @@ pub fn active_features(set: FeatureSet, im_features: bool, im_shape: bool) -> Ve
     v
 }
 
+/// [`active_features`] for a configuration, with the `features.retrace_apex` column last.
+pub fn active_features_for(cfg: &FeaturesConfig) -> Vec<String> {
+    let mut v = active_features(cfg.set, cfg.im_features, cfg.im_shape_features);
+    if cfg.retrace_apex {
+        v.push(RETRACE_APEX_FEATURE.to_string());
+    }
+    v
+}
+
+/// The feature `features.retrace_apex` appends (retrace.rs, `Apex::imc`).
+pub const RETRACE_APEX_FEATURE: &str = "imc_ref_w";
+
+/// The per-candidate sidecar retrace writes next to its chromatograms under
+/// `features.retrace_apex`.
+pub fn retrace_apex_path(chromatograms: &str) -> String {
+    format!("{chromatograms}.apex.parquet")
+}
+
 pub fn feature_schema_id(cols: &[String]) -> String {
     mumdia_io::hash::blake3_str(&cols.join(","))
 }
@@ -2012,8 +2030,8 @@ fn run_chunked(
         .f32("shadow_kept_frac")
         .unwrap_or_else(|_| vec![0.0; ps.nrows]);
     let apex_rt = ps.f64("apex_rt")?;
-    let apex_int = ps.f32("apex_intensity")?;
-    let n_matched = ps.i32("n_matched_fragments")?;
+    let mut apex_int = ps.f32("apex_intensity")?;
+    let mut n_matched = ps.i32("n_matched_fragments")?;
     let n_pred = ps
         .i32("n_predicted_fragments")
         .unwrap_or_else(|_| vec![6; ps.nrows]);
@@ -2039,15 +2057,63 @@ fn run_chunked(
     let ms1_m1 = ps
         .opt_f64("ms1_isom1")
         .unwrap_or_else(|_| vec![None; ps.nrows]);
-    let ms1_mono = ps
+    let mut ms1_mono = ps
         .opt_f64("ms1_mono")
         .unwrap_or_else(|_| vec![None; ps.nrows]);
-    let ms1_i1 = ps
+    let mut ms1_i1 = ps
         .opt_f64("ms1_iso1")
         .unwrap_or_else(|_| vec![None; ps.nrows]);
-    let ms1_i2 = ps
+    let mut ms1_i2 = ps
         .opt_f64("ms1_iso2")
         .unwrap_or_else(|_| vec![None; ps.nrows]);
+    // `features.retrace_apex`: the centroid apex scalars give way to the raw-trace values
+    // retrace wrote, and `imc_ref_w` is read for the appended column.
+    let imc: Vec<f64> = if p.cfg.retrace_apex {
+        if peak_rank.iter().any(|&r| r != 0) {
+            anyhow::bail!(
+                "features.retrace_apex scores the rank-0 apex only; it cannot be combined \
+                 with extract.promote_top_peaks > 1"
+            );
+        }
+        let path = retrace_apex_path(p.chromatograms);
+        let a = TableFile::open(&path)
+            .with_context(|| format!("features.retrace_apex needs retrace's sidecar {path}"))?;
+        let a_cid = a.u32("candidate_id")?;
+        let row_of: HashMap<u32, usize> = a_cid.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+        let (a_int, a_n) = (a.f32("apex_intensity")?, a.i32("n_matched_fragments")?);
+        let a_ms1 = [a.f64("ms1_mono")?, a.f64("ms1_iso1")?, a.f64("ms1_iso2")?];
+        let a_imc = a.f64(RETRACE_APEX_FEATURE)?;
+        let mut v = vec![0.0; ps.nrows];
+        let mut missing = 0usize;
+        for i in 0..ps.nrows {
+            let Some(&j) = row_of.get(&cid[i]) else {
+                missing += 1;
+                continue;
+            };
+            apex_int[i] = a_int[j];
+            n_matched[i] = a_n[j];
+            // null stays null only when extract had none and the raw trace has none either
+            for (col, raw) in [&mut ms1_mono, &mut ms1_i1, &mut ms1_i2]
+                .into_iter()
+                .zip(&a_ms1)
+            {
+                let x = if raw[j].is_nan() { 0.0 } else { raw[j] };
+                if col[i].is_some() || x > 0.0 {
+                    col[i] = Some(x);
+                }
+            }
+            v[i] = a_imc[j];
+        }
+        if missing > 0 {
+            warn!(
+                missing,
+                path, "features: rows without a retrace apex record keep extract's values"
+            );
+        }
+        v
+    } else {
+        Vec::new()
+    };
     // Ion-mobility block (psms_extracted v4), read only when it is on. A missing column
     // reads as all-null, which the block turns into zeros.
     let im_on = p.cfg.im_features;
@@ -2195,7 +2261,7 @@ fn run_chunked(
     };
 
     let gradient = apex_rt.iter().cloned().fold(0.0f64, f64::max).max(1.0);
-    let cols_active = active_features(p.cfg.set, p.cfg.im_features, p.cfg.im_shape_features);
+    let cols_active = active_features_for(p.cfg);
     let n = ps.nrows;
 
     // --- Cross-candidate charge-state corroboration (Extended set) ---
@@ -2265,6 +2331,7 @@ fn run_chunked(
         .iter()
         .map(|n| cols_active.iter().position(|c| c == n))
         .collect();
+    let imc_ix = cols_active.iter().position(|c| c == RETRACE_APEX_FEATURE);
 
     let writer = TableWriter::new(p.out).with_row_group_rows(FEATURE_ROW_GROUP_ROWS);
     let mut pin = if p.cfg.emit_pin {
@@ -2579,6 +2646,10 @@ fn run_chunked(
                     for (c, v) in shape_ix.iter().zip(im::shape(&a)) {
                         m.set(*c, r, if v.is_finite() { v } else { 0.0 });
                     }
+                }
+
+                if imc_ix.is_some() {
+                    m.set(imc_ix, r, imc[i]);
                 }
 
                 prelim[r] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))

@@ -777,11 +777,7 @@ pub fn run(p: RunParams) -> Result<()> {
         .insert("rescorer".into(), actual_rescorer_model);
     man.model_identities.insert(
         "feature_schema_id".into(),
-        features::feature_schema_id(&features::active_features(
-            cfg.features.set,
-            cfg.features.im_features,
-            cfg.features.im_shape_features,
-        )),
+        features::feature_schema_id(&features::active_features_for(&cfg.features)),
     );
 
     let manifest_path = d("manifest.json");
@@ -838,6 +834,9 @@ pub(crate) fn extract_to_compete(
     } else {
         None
     };
+    if cfg.features.retrace_apex && raw.is_none() {
+        anyhow::bail!("features.retrace_apex needs retrace.enabled");
+    }
     let chrom_extract = if raw.is_some() {
         d("chromatograms.centroid.parquet")
     } else {
@@ -888,6 +887,11 @@ pub(crate) fn extract_to_compete(
             frag_tol_fallback_ppm: cfg.extract.frag_tol_ppm,
             prec_tol_ppm: cfg.extract.prec_tol_ppm,
             out: &chrom,
+            apex_out: cfg
+                .features
+                .retrace_apex
+                .then(|| features::retrace_apex_path(&chrom))
+                .as_deref(),
             cfg: &cfg.retrace,
             config_hash: ch,
         })?;

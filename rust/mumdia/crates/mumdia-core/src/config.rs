@@ -1366,6 +1366,14 @@ pub struct FeaturesConfig {
     /// false: off, the feature list, schema id and PIN column order are unchanged.
     /// Benchmark-gated.
     pub im_shape_features: bool,
+    /// Apex evidence from the raw diaPASEF events (docs/TIMS_ROADMAP_bis.md section 7).
+    /// Needs `retrace.enabled`: retrace then also writes `<chromatograms>.apex.parquet`,
+    /// and features replaces the centroid `apex_intensity`, `n_matched_fragments` and
+    /// `ms1_mono` / `ms1_iso1` / `ms1_iso2` with their raw-trace values and appends
+    /// `imc_ref_w`, the agreement of the fragments' raw 1/K0 profiles at the apex, after
+    /// every other column. Refused with `extract.promote_top_peaks > 1`. Default false:
+    /// off, the feature list, schema id and values are unchanged. Benchmark-gated.
+    pub retrace_apex: bool,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -1387,6 +1395,7 @@ impl Default for FeaturesConfig {
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
             im_features: false,  // opt-in; TIMS P5, benchmark-gated
             im_shape_features: false, // opt-in; TIMS P7, benchmark-gated
+            retrace_apex: false, // opt-in; needs retrace, benchmark-gated
         }
     }
 }

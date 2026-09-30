@@ -60,6 +60,8 @@ pub struct RetraceParams<'a> {
     /// `extract.prec_tol_ppm`, the MS1 tolerance extract's traces used.
     pub prec_tol_ppm: f64,
     pub out: &'a str,
+    /// `features.retrace_apex`: also write the per-candidate apex sidecar here.
+    pub apex_out: Option<&'a str>,
     pub cfg: &'a RetraceConfig,
     pub config_hash: &'a str,
 }
@@ -189,6 +191,28 @@ impl TofFrame {
     }
 }
 
+/// Call `g(scan, intensity)` for every raw event of `f` with TOF index in `[t_lo, t_hi]`
+/// whose scan lies in one of `scans` (half-open ranges) and below `n_scans`.
+fn visit_events(
+    f: &TofFrame,
+    scans: &[(usize, usize)],
+    t_lo: u32,
+    t_hi: u32,
+    n_scans: usize,
+    mut g: impl FnMut(usize, f64),
+) {
+    let i0 = f.ev.partition_point(|&e| e < (t_lo as u64) << TOF_SHIFT);
+    for &e in &f.ev[i0..] {
+        if (e >> TOF_SHIFT) as u32 > t_hi {
+            break;
+        }
+        let sc = ((e >> SCAN_SHIFT) & ((1 << (TOF_SHIFT - SCAN_SHIFT)) - 1)) as usize;
+        if sc < n_scans && scans.iter().any(|&(a, b)| (a..b).contains(&sc)) {
+            g(sc, (e & 0xffff_ffff) as f64);
+        }
+    }
+}
+
 /// Sum the raw events of `f` with TOF index in `[t_lo, t_hi]` whose scan lies in one of
 /// `scans` (half-open ranges).
 fn sum_events(
@@ -199,20 +223,115 @@ fn sum_events(
     scan_im: &[f64],
 ) -> Sum {
     let mut s = Sum::default();
-    let i0 = f.ev.partition_point(|&e| e < (t_lo as u64) << TOF_SHIFT);
-    for &e in &f.ev[i0..] {
-        if (e >> TOF_SHIFT) as u32 > t_hi {
-            break;
+    visit_events(f, scans, t_lo, t_hi, scan_im.len(), |sc, w| {
+        s.inten += w;
+        s.imw += w * scan_im[sc];
+        s.n += 1;
+    });
+    s
+}
+
+// `features.retrace_apex` (docs/TIMS_ROADMAP_bis.md section 7): the apex mobility
+// agreement is scored on each fragment's raw 1/K0 profile over `apex_im +/- APEX_IM_HW`,
+// in APEX_BINS bins, summed over the MS2 frames within APEX_RT_HW_S of the apex.
+const APEX_IM_HW: f64 = 0.04;
+const APEX_BINS: usize = 40;
+const APEX_IM_BIN: f64 = 2.0 * APEX_IM_HW / APEX_BINS as f64;
+const APEX_RT_HW_S: f64 = 1.5;
+
+/// Apex evidence of one candidate from its rebuilt rows, written to the
+/// `<chromatograms>.apex.parquet` sidecar. A candidate can straddle two input spans, so
+/// the two partial records are merged before [`Apex::imc`] is taken.
+struct Apex {
+    cid: u32,
+    /// Sum over fragment rows of the trace point nearest the apex (extract's
+    /// `apex_intensity`, from the raw traces).
+    inten: f64,
+    /// Fragment rows with any signal in the trace (extract's `n_matched_fragments`).
+    n_matched: i32,
+    /// `ms1_mono` / `ms1_iso1` / `ms1_iso2` at the point nearest the apex; NaN: no row.
+    ms1: [f64; 3],
+    /// (predicted intensity, raw 1/K0 profile) per rebuilt fragment row.
+    prof: Vec<(f64, [f64; APEX_BINS])>,
+}
+
+/// A finished candidate: id, apex intensity, fragments matched, MS1 apex values,
+/// `imc_ref_w`. The profiles are dropped here, so only these stay resident (a HYE run has
+/// ~7M candidates; their profiles are ~28 GB).
+type ApexRow = (u32, f32, i32, [f64; 3], f64);
+
+impl Apex {
+    fn finish(self) -> ApexRow {
+        let imc = self.imc();
+        (self.cid, self.inten as f32, self.n_matched, self.ms1, imc)
+    }
+
+    fn merge(&mut self, o: Apex) {
+        self.inten += o.inten;
+        self.n_matched += o.n_matched;
+        for (a, b) in self.ms1.iter_mut().zip(o.ms1) {
+            if a.is_nan() {
+                *a = b;
+            }
         }
-        let sc = ((e >> SCAN_SHIFT) & ((1 << (TOF_SHIFT - SCAN_SHIFT)) - 1)) as usize;
-        if sc < scan_im.len() && scans.iter().any(|&(a, b)| (a..b).contains(&sc)) {
-            let w = (e & 0xffff_ffff) as f64;
-            s.inten += w;
-            s.imw += w * scan_im[sc];
-            s.n += 1;
+        self.prof.extend(o.prof);
+    }
+
+    /// `imc_ref_w`: over the fragments with signal, the predicted-intensity-weighted mean
+    /// Pearson of each 1/K0 profile against the weighted sum of the others. 0 when none.
+    fn imc(&self) -> f64 {
+        let mut tot = [0.0f64; APEX_BINS];
+        for (w, p) in &self.prof {
+            for (t, v) in tot.iter_mut().zip(p) {
+                *t += w * v;
+            }
+        }
+        let (mut num, mut den) = (0.0, 0.0);
+        for (w, p) in &self.prof {
+            if p.iter().sum::<f64>() > 0.0 {
+                let other: Vec<f64> = tot.iter().zip(p).map(|(t, v)| t - w * v).collect();
+                num += w * crate::stats::pearson(p, &other);
+                den += w;
+            }
+        }
+        if den > 0.0 {
+            num / den
+        } else {
+            0.0
         }
     }
-    s
+}
+
+/// The sidecar `features.retrace_apex` reads: one row per candidate, NaN MS1 for no row.
+fn write_apex(path: &str, a: &[ApexRow]) -> Result<u64> {
+    let ms1 = |k: usize| a.iter().map(|x| x.3[k]).collect();
+    mumdia_io::table::write_table(
+        path,
+        vec![
+            Col::U32("candidate_id".into(), a.iter().map(|x| x.0).collect()),
+            Col::F32("apex_intensity".into(), a.iter().map(|x| x.1).collect()),
+            Col::I32(
+                "n_matched_fragments".into(),
+                a.iter().map(|x| x.2).collect(),
+            ),
+            Col::F64("ms1_mono".into(), ms1(0)),
+            Col::F64("ms1_iso1".into(), ms1(1)),
+            Col::F64("ms1_iso2".into(), ms1(2)),
+            Col::F64("imc_ref_w".into(), a.iter().map(|x| x.4).collect()),
+        ],
+    )
+}
+
+/// The value of the trace point nearest `t` (the first on a tie), 0 for an empty trace.
+fn nearest_point(rt: &[f32], int: &[f32], t: f64) -> f64 {
+    let mut best = (f64::MAX, 0.0);
+    for (&r, &v) in rt.iter().zip(int) {
+        let d = (r as f64 - t).abs();
+        if d < best.0 {
+            best = (d, v as f64);
+        }
+    }
+    best.1
 }
 
 /// The scan ranges of the quad slots whose isolation window holds `pmz`, clipped to the
@@ -331,13 +450,21 @@ pub fn run(p: RetraceParams) -> Result<u64> {
         n_cand,
     );
     let ex = TableFile::open(p.psms_extracted)?;
-    let (ex_cid, ex_rank, ex_im) = (
+    let (ex_cid, ex_rank, ex_im, ex_rt) = (
         ex.u32("candidate_id")?,
         ex.i32("peak_rank")?,
         ex.opt_f64("apex_im")?,
+        ex.f64("apex_rt")?,
     );
+    let mut apex_rt = vec![f64::NAN; n_cand];
     for i in 0..ex.nrows {
-        if let (0, Some(v)) = (ex_rank[i], ex_im[i]) {
+        if ex_rank[i] != 0 {
+            continue;
+        }
+        if let Some(slot) = apex_rt.get_mut(ex_cid[i] as usize) {
+            *slot = ex_rt[i];
+        }
+        if let Some(v) = ex_im[i] {
             if v.is_finite() {
                 if let Some(slot) = centre.get_mut(ex_cid[i] as usize) {
                     *slot = v;
@@ -399,6 +526,8 @@ pub fn run(p: RetraceParams) -> Result<u64> {
     let nrows = ch.nrows;
     let (mut n_frag, mut n_ms1, mut unmatched, mut events) = (0u64, 0u64, 0u64, 0u64);
     let mut t_sum = 0u128;
+    let want_apex = p.apex_out.is_some();
+    let (mut pending, mut apex_done): (Option<Apex>, Vec<ApexRow>) = (None, Vec::new());
     let t_decoded = t0.elapsed().as_millis();
     // Three stages over row groups, joined by bounded channels so read, sum and write
     // overlap: a reader thread, the parallel sum here, a writer thread. Rows keep the
@@ -506,11 +635,40 @@ pub fn run(p: RetraceParams) -> Result<u64> {
                     })
                     .collect()
             };
-            let rows: Vec<RowOut> = groups
+            let done: Vec<(Vec<RowOut>, Option<Apex>)> = groups
                 .par_iter()
                 .map(|&(g0, g1)| {
                     let mut cache: [Option<(&[f32], Vec<Point>)>; 2] = [None, None];
-                    (g0..g1)
+                    let c0 = cid[g0] as usize;
+                    let t_apex = apex_rt.get(c0).copied().unwrap_or(f64::NAN);
+                    let mut apex = (want_apex && t_apex.is_finite()).then(|| Apex {
+                        cid: cid[g0],
+                        inten: 0.0,
+                        n_matched: 0,
+                        ms1: [f64::NAN; 3],
+                        prof: Vec::new(),
+                    });
+                    // MS2 frames within APEX_RT_HW_S of the apex and their quad-slot scans
+                    // in the wider profile band, planned once per candidate.
+                    let apex_frames: Vec<(&TofFrame, Vec<(usize, usize)>)> = match &apex {
+                        Some(_) if pmz[c0].is_finite() && centre[c0].is_finite() => {
+                            let band = scan_band(
+                                &scan_im,
+                                centre[c0] - APEX_IM_HW,
+                                centre[c0] + APEX_IM_HW,
+                            );
+                            let a = ms2_rt.partition_point(|&t| t < t_apex - APEX_RT_HW_S);
+                            let b = ms2_rt.partition_point(|&t| t <= t_apex + APEX_RT_HW_S);
+                            (a..b)
+                                .filter_map(|j| frames[ms2_fi[j]].as_ref())
+                                .map(|f| (f, slot_scans(&f.quad, pmz[c0], band)))
+                                .filter(|(_, s)| !s.is_empty())
+                                .collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let im_lo = centre.get(c0).copied().unwrap_or(f64::NAN) - APEX_IM_HW;
+                    let out = (g0..g1)
                         .map(|r| {
                             let pts = &rt[rt_off[r]..rt_off[r + 1]];
                             let old_int = &int[int_off[r]..int_off[r + 1]];
@@ -569,23 +727,74 @@ pub fn run(p: RetraceParams) -> Result<u64> {
                             if !frag {
                                 ims = old_im.to_vec();
                             }
+                            if let Some(a) = apex.as_mut() {
+                                if frag {
+                                    let mut pr = [0.0f64; APEX_BINS];
+                                    for (f, scans) in &apex_frames {
+                                        visit_events(
+                                            f,
+                                            scans,
+                                            t_lo,
+                                            t_hi,
+                                            scan_im.len(),
+                                            |sc, w| {
+                                                let b =
+                                                    ((scan_im[sc] - im_lo) / APEX_IM_BIN) as isize;
+                                                pr[b.clamp(0, APEX_BINS as isize - 1) as usize] +=
+                                                    w;
+                                            },
+                                        );
+                                    }
+                                    a.prof.push((pint[r] as f64, pr));
+                                }
+                            }
                             (kind, ints, ims, ev, miss)
                         })
-                        .collect::<Vec<RowOut>>()
+                        .collect::<Vec<RowOut>>();
+                    // The scalars read the final rows, rebuilt or copied, as the prototype
+                    // read the retraced table.
+                    if let Some(a) = apex.as_mut() {
+                        for (r, (_, i, _, _, _)) in (g0..g1).zip(&out) {
+                            let pts = &rt[rt_off[r]..rt_off[r + 1]];
+                            let v = nearest_point(pts, i, t_apex);
+                            match name(r) {
+                                "ms1_mono" => a.ms1[0] = v,
+                                "ms1_iso1" => a.ms1[1] = v,
+                                "ms1_iso2" => a.ms1[2] = v,
+                                nm if nm.starts_with("ms1") => {}
+                                _ => {
+                                    a.inten += v;
+                                    a.n_matched += i.iter().any(|&x| x > 0.0) as i32;
+                                }
+                            }
+                        }
+                    }
+                    (out, apex)
                 })
-                .flatten_iter()
                 .collect();
             let (mut ints, mut ims) = (Vec::with_capacity(n), Vec::with_capacity(n));
-            for (kind, i, m, ev, miss) in rows {
-                match kind {
-                    Kind::Frag => n_frag += 1,
-                    Kind::Ms1 => n_ms1 += 1,
-                    Kind::Copy => {}
+            for (rows, a) in done {
+                for (kind, i, m, ev, miss) in rows {
+                    match kind {
+                        Kind::Frag => n_frag += 1,
+                        Kind::Ms1 => n_ms1 += 1,
+                        Kind::Copy => {}
+                    }
+                    events += ev;
+                    unmatched += miss;
+                    ints.push(i);
+                    ims.push(m);
                 }
-                events += ev;
-                unmatched += miss;
-                ints.push(i);
-                ims.push(m);
+                if let Some(a) = a {
+                    match pending.as_mut() {
+                        Some(pa) if pa.cid == a.cid => pa.merge(a),
+                        _ => {
+                            if let Some(pa) = pending.replace(a) {
+                                apex_done.push(pa.finish());
+                            }
+                        }
+                    }
+                }
             }
             t_sum += tp.elapsed().as_millis();
             let cols = vec![
@@ -626,6 +835,14 @@ pub fn run(p: RetraceParams) -> Result<u64> {
             _ => bail!("retrace: the writer stopped before the end; nothing published"),
         }
     })?;
+    apex_done.extend(pending.map(Apex::finish));
+    if let Some(path) = p.apex_out {
+        write_apex(path, &apex_done)?;
+        info!(
+            candidates = apex_done.len(),
+            path, "retrace: apex sidecar written"
+        );
+    }
     if unmatched > 0 {
         warn!(
             points = unmatched,
@@ -748,6 +965,51 @@ mod tests {
             slot_scans(&f.quadrupole_settings, 502.0, (0, 8)),
             vec![(0, 6)]
         );
+    }
+
+    #[test]
+    fn apex_imc_scores_profile_agreement_and_survives_a_span_split() {
+        let bump = |c: usize| {
+            let mut p = [0.0; APEX_BINS];
+            for (k, v) in p.iter_mut().enumerate() {
+                *v = (-((k as f64 - c as f64).powi(2)) / 8.0).exp();
+            }
+            p
+        };
+        let rec = |prof| Apex {
+            cid: 7,
+            inten: 1.0,
+            n_matched: 1,
+            ms1: [f64::NAN, 2.0, f64::NAN],
+            prof,
+        };
+        // three fragments on one mobility peak agree fully; an empty one is ignored
+        let same = rec(vec![
+            (1.0, bump(20)),
+            (2.0, bump(20)),
+            (0.5, bump(20)),
+            (3.0, [0.0; APEX_BINS]),
+        ]);
+        assert!((same.imc() - 1.0).abs() < 1e-12);
+        // one fragment on another ion's peak pulls the score down
+        let off = rec(vec![(1.0, bump(20)), (1.0, bump(20)), (1.0, bump(5))]);
+        assert!(off.imc() < 0.7);
+        assert_eq!(rec(vec![]).imc(), 0.0);
+        // a candidate split over two spans scores as the whole
+        let mut a = rec(vec![(1.0, bump(20)), (1.0, bump(20))]);
+        let mut b = rec(vec![(1.0, bump(5))]);
+        b.ms1 = [3.0, 9.0, f64::NAN];
+        a.merge(b);
+        assert_eq!(a.imc(), off.imc());
+        assert_eq!((a.inten, a.n_matched), (2.0, 2));
+        assert_eq!(a.ms1[..2], [3.0, 2.0]);
+        assert!(a.ms1[2].is_nan());
+    }
+
+    #[test]
+    fn nearest_point_takes_the_first_of_a_tie_and_zero_when_empty() {
+        assert_eq!(nearest_point(&[1.0, 2.0, 3.0], &[5.0, 6.0, 7.0], 2.5), 6.0);
+        assert_eq!(nearest_point(&[], &[], 2.5), 0.0);
     }
 
     #[test]

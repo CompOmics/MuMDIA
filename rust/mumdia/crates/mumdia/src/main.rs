@@ -1429,6 +1429,11 @@ fn real_main() -> Result<()> {
                 frag_tol_fallback_ppm: cfg.extract.frag_tol_ppm,
                 prec_tol_ppm: cfg.extract.prec_tol_ppm,
                 out: &out,
+                apex_out: cfg
+                    .features
+                    .retrace_apex
+                    .then(|| stages::features::retrace_apex_path(&out))
+                    .as_deref(),
                 cfg: &cfg.retrace,
                 config_hash: &ch,
             })?;

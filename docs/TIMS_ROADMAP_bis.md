@@ -1611,3 +1611,103 @@ At 1.5 about 100 precursors come back inside the window and 373 more lose to a w
 inside it. Closed: the RT-window loss is small and a wider window costs more than it recovers.
 The largest remaining group is "right peak, low score", dominated by the faintest quintile.
 
+
+## 7. "Right peak, low score" on the retrace baseline (2026-09-30)
+
+The target was the 1,882 D1 rejects on the correct peak (section 6, last table). All
+counts are stripped peptides at `peptide_q_value` 1%, over 3 `nn_torch` seeds, against the
+retrace baseline of 13,678. The decoy fraction was 0.98-0.99% in every arm. Scripts and
+outputs are in `/public/local/MuMDIA_raw/d2r`, and every number is in `RESULTS_ms1.txt`.
+
+**Diagnosis (D2 and D2b rerun).**
+- On the raw traces, the rejects still match their score-matched decoys on library
+  agreement, fragment co-elution, MS1 co-elution and mobility agreement (AUC R vs Dm
+  0.45-0.55). They are above those decoys on signal, coverage and RT (0.61-0.67).
+- Because R and Dm are matched on the classifier score, an AUC near 0.5 on the model's
+  main features is partly built in. The useful question is whether new evidence separates
+  them.
+- Retrace removed the off-mobility points (`off_frac` 0 in every group). Inside the
+  ±0.015 band, R's per-point 1/K0 still jitters at decoy level.
+
+**Stale centroid scalars.**
+- `apex_intensity`, `n_matched_fragments` and `ms1_mono` / `iso1` / `iso2` were
+  recomputed from the raw traces in a patched `psms_extracted`.
+- The fragment count changed in only 3% of rows.
+- Result: 13,759 (+0.6%). The fast-loop control reproduced the baseline exactly.
+
+**Mobility agreement on raw events (`imc_ref_w`).**
+- At the apex, each fragment's 1/K0 profile is built from the raw events and correlated
+  with the weighted sum of the other fragments' profiles (definition in docs/09 section 6c).
+- AUC R vs Dm is 0.71. The best of the 396 existing features reaches 0.665.
+- AUC A vs D is 0.986.
+- It holds within every stratum of observed fragment count (0.67-0.78).
+- An RT × 1/K0 version carries the same information (Spearman 0.98).
+
+| arm | peptides (seeds 0 / 1 / 2) | mean | precursors |
+|---|---|---|---|
+| baseline (fast-loop control) | 13,619 / 13,679 / 13,735 | 13,678 | 16,737 |
+| stale scalars refreshed | 13,752 / 13,800 / 13,726 | 13,759 (+0.6%) | |
+| + `imc_ref_w` only | 13,845 / 13,807 / 13,905 | 13,852 (+1.3%) | 17,008 |
+| both, prototype | 13,972 / 13,843 / 13,960 | 13,925 (+1.8%) | 17,123 |
+| **both, engine (`features.retrace_apex`)** | **13,866 / 13,946 / 13,947** | **13,920 (+1.8%)** | 17,098 |
+
+With `imc_ref_w`, 13% of R are accepted, and 0.5% of the previously accepted are lost.
+
+**Entrapment** (retrace-binary control on `entrap_in`, 3 seeds):
+- real peptides: 12,922 for the control, 13,210 for both levers (+2.2%);
+- FDP: 0.40-0.44% for the control, 0.43-0.51% for both levers.
+
+The added peptides bring spike-ins at a higher rate than the base set: about 14 more per
+288 more real peptides, which is an FDP of about 2.7% on the added peptides alone.
+
+**Engine parity.**
+- The four refreshed scalars match the prototype exactly.
+- `imc_ref_w` correlates at r = 0.93 with the prototype and separates equally well (AUC R
+  vs Dm 0.708 against 0.712). The two m/z scales are about 3 ppm apart, and the Pearson
+  over few events reacts to the edge events.
+- With the key off, the features are identical to the control, and the chromatograms are
+  byte-identical with the key on or off.
+- The stage took 11.7 s on E. coli.
+
+**Closed on the same baseline.** More library fragments with retrace on (full runs):
+- 16 fragments: 13,225 (−3.3%);
+- 24 fragments: 12,585 (−8.0%).
+
+Raw traces do not change the centroid result of section 6.
+
+**HYE diaPASEF** (`eng_apex`: six runs, seed 0, from the `l1d/pass2_robust` inputs; no
+paired control, against `eng_retrace2`, which used an older chain binary):
+
+| | `eng_retrace2` | `eng_apex` |
+|---|---|---|
+| precursors | 99,634 | 103,641 (+4.0%) |
+| peptides | 89,424 | 92,951 (+3.9%) |
+| PGs | 11,719 | 11,887 (+1.4%) |
+| ProteoBench ions (k = 3) | 77,627 | 80,359 (+3.5%) |
+| median abs epsilon / CV | 0.171 / 0.108 | 0.176 / 0.110 |
+
+The decoy fraction is 0.010 in both. The units are those of section 6.
+
+Cost:
+- The first binary held every candidate's 1/K0 profiles until the end of the stage, so
+  retrace reached 70-73 GB per HYE run (three runs at once, 466-731 s).
+- Each candidate is now scored when it is complete and its profiles are dropped. The
+  sidecar is byte-identical, and the E. coli peak fell from 21.2 to 18.7 GB.
+
+Not a default yet: HYE has one seed.
+
+**Closed on the `retrace_apex` base (2026-09-30), E. coli, 3 seeds.**
+
+`extract.apex_rt_prior_s: 8` (full runs; control 13,883):
+- E. coli: 14,109 (+1.6%).
+- Entrapment (full runs on the E. coli + 1:1 human FASTA): real peptides 13,258 for the
+  control and 13,349 for the prior (+0.7%).
+- FDP: 0.45-0.47% for the control, 0.49-0.50% for the prior.
+- About 9 more spike-ins came with 91 more real peptides, so about 6% of the added
+  peptides are false. The gain is paid for in false identifications, so it is closed.
+
+L1e (rescore only, against 13,920):
+- `rescore.seeds: 3`: 13,986 (+0.5%).
+- The sensitivity recipe (`seeds: 3`, `folds: 5`, `train_margin_frac: 0.75`): 13,998
+  (+0.6%).
+- Both take about 3x the training time. They remain the option for a final pass.

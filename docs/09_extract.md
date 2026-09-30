@@ -609,6 +609,22 @@ without a frame, and the time of each phase.
 
 Measured effect: docs/TIMS_ROADMAP_bis.md, "Raw traces (retrace)".
 
+Apex sidecar (`features.retrace_apex`, default off). Retrace does not touch
+`psms_extracted`, so its apex scalars stay centroid values. With the key on, retrace also
+writes `<chromatograms>.apex.parquet`, one row per candidate at its rank-0 `apex_rt`:
+- `apex_intensity`: the sum over the fragment rows of the trace point nearest the apex;
+- `n_matched_fragments`: the fragment rows with any signal in the trace;
+- `ms1_mono` / `ms1_iso1` / `ms1_iso2`: the MS1 trace point nearest the apex (NaN: no row);
+- `imc_ref_w`: per rebuilt fragment row, a 1/K0 profile of the raw events in
+  `apex_im +/- 0.04` (40 bins), summed over the MS2 frames within 1.5 s of the apex, in the
+  quad slots holding the precursor and the fragment's TOF window. The score is the
+  predicted-intensity-weighted mean Pearson of each profile with signal against the weighted
+  sum of the others (0 when no fragment has signal).
+
+The scalars read the final rows, rebuilt or copied. A candidate that straddles two input
+spans is merged before it is scored. Features reads the sidecar (docs/10). The chromatograms
+are byte-identical with the key on or off.
+
 ### 7. Top-K peak enumeration (`retain_top_peaks`)
 
 Two independent knobs consume the enumerator, and they must not be confused:
