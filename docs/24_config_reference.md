@@ -52,29 +52,29 @@ undocumented on purpose; those fields are counted under "Coverage".
 | Section | Struct | Fields | Stage document |
 |---|---|---|---|
 | [(top level)](#top-level) | `Config` | 17 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
-| [`convert`](#convert) | `ConvertConfig` | 13 |  |
+| [`convert`](#convert) | `ConvertConfig` | 14 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
 | [`digest`](#digest) | `DigestConfig` | 6 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`digest.decoy`](#digestdecoy) | `DecoyConfig` | 1 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`peptidoforms`](#peptidoforms) | `PeptidoformsConfig` | 7 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
-| [`predict_frag`](#predict_frag) | `PredictFragConfig` | 15 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
+| [`predict_frag`](#predict_frag) | `PredictFragConfig` | 17 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
 | [`search_seed`](#search_seed) | `SearchSeedConfig` | 12 | [docs/07_search_seed.md](07_search_seed.md) |
-| [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 24 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
-| [`extract`](#extract) | `ExtractConfig` | 37 | [docs/09_extract.md](09_extract.md) |
+| [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 26 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
+| [`extract`](#extract) | `ExtractConfig` | 38 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
-| [`features`](#features) | `FeaturesConfig` | 12 | [docs/10_features.md](10_features.md) |
+| [`features`](#features) | `FeaturesConfig` | 14 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`rescore`](#rescore) | `RescoreConfig` | 22 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
-| [`quant`](#quant) | `QuantConfig` | 17 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
+| [`quant`](#quant) | `QuantConfig` | 19 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`mbr`](#mbr) | `MbrConfig` | 9 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
-| [`experiment`](#experiment) | `ExperimentConfig` | 2 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
-| [`groups`](#groups) | `GroupsConfig` | 3 |  |
-| [`retrace`](#retrace) | `RetraceConfig` | 5 | [docs/09_extract.md](09_extract.md) |
+| [`experiment`](#experiment) | `ExperimentConfig` | 3 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
+| [`groups`](#groups) | `GroupsConfig` | 8 |  |
+| [`retrace`](#retrace) | `RetraceConfig` | 6 | [docs/09_extract.md](09_extract.md) |
 | [`peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]`](#peptidoformsfixed_mods--peptidoformsvariable_mods) | `ResidueMod` | 2 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 
 ## (top level)
 
-`Config` (rust/mumdia/crates/mumdia-core/src/config.rs:2167). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
+`Config` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/02_config_and_data_model.md](02_config_and_data_model.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -98,7 +98,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 
 ## convert
 
-`ConvertConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:308).
+`ConvertConfig` (rust/mumdia/crates/mumdia-core/src/config.rs).
 
 Vendor-format conversion, read by every subcommand that takes a spectra path (`raw.rs`; docs/04_convert.md, "Vendor formats"). The engine itself reads mzML only, deliberately: `mzdata` is pinned to its pure-Rust `mzml` + `miniz_oxide` features so the build needs no C or .NET toolchain, and its vendor readers would reintroduce both. A vendor file is therefore converted to mzML first by an external converter run as a child process, in the same way the Python sidecars are: ThermoRawFileParser for Thermo `.raw`, ProteoWizard `msconvert` for everything else and as the Thermo fallback.
 
@@ -117,10 +117,11 @@ Vendor-format conversion, read by every subcommand that takes a spectra path (`r
 | `tdf_mz_smooth_ppm` | `f64` | `4.0` |  | Native TDF: half-width in ppm of the triangular smoothing applied to the m/z profile before `tdf_mz_valley` looks for valleys; 0 is no smoothing. Unused while `tdf_mz_valley` is 0. |
 | `tdf_im_valley` | `f64` | `0.0` | benchmark-gated | Native TDF: split each cluster (after the m/z valley split, when that is on) at valleys of its mobility profile: summed intensity per TIMS scan, triangular smoothing of half-width `tdf_im_smooth_scans`, cut at a local minimum below this fraction of the smaller hump beside it. Separates ions of one m/z whose mobility profiles touch without a `tdf_im_gap_scans` gap. Must be in [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated. |
 | `tdf_im_smooth_scans` | `f64` | `4.0` |  | Native TDF: half-width in TIMS scans of the mobility profile smoothing used by `tdf_im_valley`; 0 is no smoothing. Unused while `tdf_im_valley` is 0. |
+| `parallel_conversions` | `usize` | `4` |  | How many vendor files `run` and `run-experiment` convert to mzML at once. Default 4. Every vendor input is converted before the first run starts, and the conversions used to run one after another, so an experiment of N `.raw` files paid N converter runs of several minutes each on the critical path. Each conversion is a separate child process writing its own destination under its own lock, and its output does not depend on what else runs beside it, so running them concurrently changes the wall time only. The bound is there because a converter reads a multi-GB file and writes a larger one: more at once than the disk can feed is slower, not faster. `1` converts one at a time, as before. Only the first conversion of an input pays this at all; `reuse_converted` skips the rest. Not measured at scale. |
 
 ## prescan
 
-`PrescanConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:431). stage document: [docs/21_prescan.md](21_prescan.md).
+`PrescanConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/21_prescan.md](21_prescan.md).
 
 Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates that have no anchored tag support in a given run, before the per-run library is assembled. The screen is deliberately blind to target/decoy label: tags are emitted in both orientations and a reverse decoy preserves composition and precursor m/z, so a decoy survives exactly when its target does. That keeps exchangeability, and therefore downstream FDR, intact.
 
@@ -136,7 +137,7 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 
 ## digest
 
-`DigestConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:478). stage document: [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md).
+`DigestConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -149,7 +150,7 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 
 ## digest.decoy
 
-`DecoyConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:288). stage document: [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md).
+`DecoyConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -157,7 +158,7 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 
 ## peptidoforms
 
-`PeptidoformsConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:506). stage document: [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md).
+`PeptidoformsConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -171,7 +172,7 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 
 ## predict_frag
 
-`PredictFragConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:565). stage document: [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md).
+`PredictFragConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -190,10 +191,12 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 | `im_predictor` | `ImPredictorKind` | `none` |  | Ion-mobility predictor for `predicted_im`. Default `none` (the column is null); `im2deep` requires `im2deep_python`. Only rt-im-train reads the column so far. |
 | `im2deep_python` | `Option<String>` | `null` |  | Python executable for the IM2Deep sidecar (env with im2deep + psm_utils + pyarrow). |
 | `sidecar_script_dir` | `String` | `"scripts"` |  | Directory holding the sidecar worker scripts. |
+| `defer_deeplc_to_multihead` | `bool` | `true` |  | Skip DeepLC in a FASTA library build (`rt_predictor = deeplc`) when the multi-head calibration will re-predict every row anyway. Default `true` since 2026-09-27 (previously `false`). With `rt_predictor = deeplc` the automatic multi-head calibration runs, and it rewrites the `predicted_irt` of every standard-residue row against the run's anchors (the only rows it keeps are non-standard ones, and a FASTA digest emits none), so the library's own DeepLC pass is work whose only output is overwritten: about 19 minutes on the 9.8M-peptidoform HYE FASTA library. Nothing reads the library's iRT before the calibration: the seed is iRT-independent and only passes the column through. Set, the orchestrators (`run`, `run-experiment`, and their grouped path) write the native model's iRT as a placeholder, the library's model identity says so, and the run fails if the calibration's summary reports any row it did not re-predict (`retained_imported > 0`), because such a row would keep the placeholder. Ignored where the multi-head calibration does not run, and by the standalone `predict-frag`. Final outputs are then byte-identical to a run with `false`; the intermediate library table, the seed's pass-through iRT column and the predict-frag report differ. The library table is then not a DeepLC library, which matters to anyone who reuses it as `--lib-precursors` elsewhere: set `false` for a build meant to be reused that way. Measured before the default changed, on the E. coli entries of the ProteoBench HYE FASTA against `LFQ_Orbitrap_AIF_Ecoli_01` (MS2PIP `HCDch2`, DeepLC 4.4.0, CPU): `psms_scored.parquet`, the three quant tables and both TSVs byte-identical to a run with `false`, and the run 14:56 -> 12:29. |
+| `library_cache` | `Option<String>` | `"auto"` |  | Where `run` and `run-experiment` keep the library they build from a FASTA, to reuse it on a later run. `"auto"` (the default since 2026-09-28): `libraries/` under the engine's cache root, which is `MUMDIA_CACHE_DIR` when it is set and otherwise the per-user cache directory (`$XDG_CACHE_HOME/mumdia` or `~/.cache/mumdia` on Linux, `~/Library/Caches/mumdia` on macOS, `%LOCALAPPDATA%\mumdia\cache` on Windows; `MUMDIA_CACHE_DIR=off` turns `"auto"` off). A path: that directory, as given. `null` or `"off"`: every FASTA run builds its library, the behaviour before 2026-09-28. A FASTA-mode run digests, expands peptidoforms and predicts the library on every invocation, and one `run` per file is the way to search files separately, so each file paid the whole build again (about an hour of predict-frag on the 9.8M-peptidoform HYE library). Set, the orchestrator looks the library up under a key of everything that determines it: the FASTA's content hash, the `digest`, `peptidoforms` and `predict_frag` sections (all but this field), `rng_seed`, whether the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep, DeepLC or IM2Deep version the build uses, the worker scripts' content and the running executable's content. A hit is copied to the paths a build writes (a byte copy, never a hard link, and checked against the blake3 recorded when it was stored) and digest, peptidoforms and predict-frag are skipped; a miss is built and then stored. When a predictor version cannot be read, nothing is looked up or stored. The run stays in FASTA mode, so every other decision is the one a rebuild makes. A hit is byte-identical to a rebuild when the build is deterministic, which the native predictors are; with a sidecar predictor it reuses the stored prediction. The manifest records the two library tables with the stage `library-cache`, and the run directory then holds no `peptides.parquet` or `peptidoforms.parquet` (an earlier build's are removed). Validate by running one FASTA search twice with the same cache directory and comparing `peptides.tsv` and `proteins.tsv` (the smoke test does this). A stored entry whose files changed is rebuilt and replaced, and temporary directories left by a killed store are removed after an hour. The cache is bounded: after a run stores into it, the least recently used entries of this cache and of `rt_im_train.deeplc_projection_cache` are removed until the two together are within `MUMDIA_CACHE_MAX_GB` (default 100 GiB; an entry used within the last hour is kept). The key covers the running executable, so every engine build stores its own entries and the bound is what removes the old ones. `mumdia doctor` reports the directory and its size. |
 
 ## search_seed
 
-`SearchSeedConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:654). stage document: [docs/07_search_seed.md](07_search_seed.md).
+`SearchSeedConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/07_search_seed.md](07_search_seed.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -212,7 +215,7 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 
 ## rt_im_train
 
-`RtImTrainConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:750). stage document: [docs/08_rt_im_train.md](08_rt_im_train.md).
+`RtImTrainConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/08_rt_im_train.md](08_rt_im_train.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -240,10 +243,12 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 | `im_window_holdout_frac` | `f64` | `0.3` |  | Fraction of anchor peptides held out to size `w_im` (the `window_holdout_frac` rule, keyed on `base_peptide_id`). IM is sized held-out from the start: in-sample residuals are optimistic and can rank models backwards (docs/08 section 4). Must lie in (0, 0.9]. |
 | `refit` | `bool` | `false` | benchmark-gated | Second pass on the pass-1 identifications (TIMS roadmap part 2, L1d). After pass 1 is rescored, its accepted targets (PSM `q_value` at most `q_train`) become a pseudo-seed; under multi-head calibration the 80-head fit is refitted on it, cross-fitted over two folds of base peptides (each candidate takes the fold it was not fitted on); rt-im-train is refitted on it, and its new RT and IM centres are used with the pass-1 half-widths (the refit widths are truncated by selection and lost 4%). Extract, features (with the original seed), compete and rescore then run again. Pass-1 artifacts go to `<out>/pass1/`. Single-run and ungrouped `run-experiment` only. Default false: nothing changes. Benchmark-gated. |
 | `robust_calibration` | `bool` | `false` | benchmark-gated | Drop outlying RT anchors before the calibration fit: a first LOESS on the anchors inside the central 99% of predicted iRT, then every anchor whose residual lies more than 6 robust SDs from the median is removed, and the curve, the window sizing and the reported residuals use the rest (`cal.json` `n_rt_outliers_removed`). A few anchors with an absurd predicted iRT otherwise stretch the LOESS grid until the gradient sits in one or two cells: on one HYE run of the `refit` pass, 11 of 58k anchors moved the curve by 51 s (TIMS roadmap part 2). Default false: unchanged. Benchmark-gated. |
+| `deeplc_predict_shards` | `usize` | `0` |  | Worker processes for the whole-library DeepLC prediction: the multi-head calibration, the base-model re-prediction under `library_irt`, and the prediction after `finetune_deeplc` (`deeplc_finetune.py --shards`). The calibration or the fine-tuned model is fitted once and handed to every process, and each process predicts a contiguous slice of the unique sequences cut at a multiple of the 100,000-sequence prediction call, so it makes the calls one process would have made. The thread budget (the engine's thread count after the DeepLC thread cap) is divided evenly, so `K` processes get `budget / K` torch threads each. `0`, the default since 2026-09-27, is automatic: one process per 8 threads of the budget, so a budget of 8 or fewer threads (a desktop under the DeepLC thread cap) is one process, as before. `1`, the previous default, is always one process. A GPU always gets one process. Measured before the default changed (EPYC 9354, 128 threads, a budget of 64 capped threads, so 8 processes of 8): a six-run Astral experiment 26:00 -> 18:02, a five-run Orbitrap AIF experiment 29:47 -> 21:04 and an entrapment run 6:27 -> 3:32. The adapted library moved in 413 and 414 of 10,881,402 rows by at most 0.05 and 0.42 s (298 of 5,828,348 by at most 1.8 s on the entrapment library), with the same 80 heads, and the peptides at 1% moved by -0.09%, -0.04% and -0.05% over 10 seeds each, inside the seed spread, at an unchanged entrapment FDP (0.988 -> 0.984%). On the one desktop measured before (an i9, docs/08, "Sharded whole-library prediction") the forward pass dominated at 8 threads or fewer and scaled with threads inside one process, so four processes of two threads were no faster than one of eight: there the automatic count is one process. With `K` processes at the same threads each as one process the `predicted_irt` column is bit-identical (`tests/python/test_deeplc_predict.py`). At the same engine thread count the fit is the same, but each process predicts on `budget / K` threads instead of `budget`, and torch's CPU kernels round differently at a different thread count: most rows move in the last bits, and under the multi-head calibration a few sequences at the edge of the reference range move by up to about two minutes (129 s measured, docs/13, "DeepLC thread cap"). A sharded run is therefore float-equivalent to an unsharded one, not bit-identical. Each process is its own Python process with torch and DeepLC loaded (0.57 GB resident after the model load on the desktop measured, of which the model is about 35 MB), and this step can hold the process-tree peak. |
+| `deeplc_projection_cache` | `Option<String>` | `"auto"` |  | Directory for DeepLC's run-independent trunk projection (`deeplc_finetune.py --projection-cache`). `"auto"` (the default since 2026-09-28): `deeplc_projections/` under the engine's cache root (`MUMDIA_CACHE_DIR`, else the per-user cache directory, as for `predict_frag.library_cache`). A path: that directory. `null` or `"off"`: off, the behaviour before 2026-09-28. The two caches share the `MUMDIA_CACHE_MAX_GB` bound (default 100 GiB, least recently used entries removed first). Calibrated RT is `ridge(spline_h(head_h(proj(trunk(x)))))` over the selected heads, and only the head selection, the splines and the ridge depend on a run. The projection, 64 float32 per sequence, depends on the sequence and the model alone, yet every multi-head calibration and base-model re-prediction recomputed it, which is essentially the whole of the step (10:41 of the HYE multi-head step at 96 threads). Set, the first call over a sequence list writes `<dir>/<key>/projections.npy` (the key covers the DeepLC version, the model file and the exact list; 256 B per sequence, about 1.26 GB for HYE's 4.91M) and later calls over the same list read it and evaluate only the heads they need: `rt_library_scope = per_run`, every rerun of an experiment, and the bands of `groups.rt_adaptation = once_per_run` across runs. A miss computes the projection in one process on the whole prediction-thread budget, the threads a one-process prediction gets (`deeplc_predict_shards` does not split it). Base model only: a fine-tune has no factored head and ignores it. Needs DeepLC 4.5.0 or newer, which added the factored prediction matrix it reads. On DeepLC 4.4.x (the engine's floor) the worker records why in the summary, writes nothing and predicts exactly as without it; it warns only when the directory was named explicitly, since `"auto"` asks for the cache wherever it is available. Float-equivalent, not bit-identical: the heads are evaluated in numpy from the cached factors instead of in torch. Measured with DeepLC 4.5.0 on CPU: the base-model re-prediction bit-identical on every row of the smoke library (3,820 rows) but not in general (on the 572-row test fixture 109 rows moved, by at most 1.5e-5 s); the multi-head calibration bit-identical on 3,782 of those rows and within 7.6e-6 s on the rest, and on a synthetic 572-row library with sequences outside the anchors' range 402 rows identical and 7 above 1e-3 s, the largest 3.7 s, which is the spline edge amplification a thread-count change shows too (docs/13). A hit took 0.12 s against 7.0 s for the prediction. Validate at scale as a DeepLC version change: per-row max \|delta predicted_irt\|, the selected heads, and peptides at 1% inside the seed spread on two acquisitions. That gate ran before it became the default (DeepLC 4.5.0, multi-head calibration, 10 NN seeds a run): an Orbitrap AIF entrapment run gave the same peptides at 1% seed for seed with and without the cache (mean 10,131.5, FDP 0.984% either way), and an Astral run -0.016% (81,167.0 -> 81,154.0, Welch t -0.18). Hits there took the entrapment run from 8:04 to 1:40 and the Astral run from 12:46 to 5:12. |
 
 ## extract
 
-`ExtractConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:985). stage document: [docs/09_extract.md](09_extract.md).
+`ExtractConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/09_extract.md](09_extract.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -262,6 +267,7 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 | `apex_count_window` | `usize` | `1` |  | Rolling-window width (in scan groups, centered, odd) for the distinct- fragment count that drives apex selection. Low-intensity fragments flicker in and out scan-to-scan; a single-scan count then spikes at noise scans and misplaces the apex. This sums the per-scan distinct-fragment count over a centered window so the apex lands in the region of *sustained* fragment presence, not an isolated flicker. A sum (not a mean) is used deliberately: edge truncation makes interior positions accumulate more, center-weighting the apex toward the RT-window centre (~= predicted RT) as a mild RT-prior; measured to beat a mean by ~+300 IDs on AIF. 1 = no smoothing (per-scan). |
 | `apex_gaussian_sigma_scans` | `f64` | `0.0` | benchmark-gated | Gaussian matched-filter smoothing of the per-scan fragment-count series before apex selection, as a sigma in scan units. 0.0 (default) keeps the `apex_count_window` rolling-sum smoother unchanged. When > 0, the count series is convolved with a Gaussian kernel (radius = 3*sigma) instead, which localizes the apex more robustly than a uniform window against scan-to-scan flicker. Opt-in and benchmark-gated: it changes apex selection and therefore identifications. |
 | `emit_window_grid` | `bool` | `true` |  | Emit per-fragment chromatograms on the FULL isolation-window scan grid with 0.0 where a fragment is absent (aggregating scans of the same isolation window), so the elution profile drops to zero between peaks and the features-stage boundary calling is not misled by interpolated gaps. |
+| `chromatogram_schema` | `u32` | `2` |  | On-disk layout of `chromatograms.parquet` (docs/15_data_dictionary.md). `2`, the default since 2026-09-27, stores the axis once per candidate per parquet row group (`rt_axis`) and each trace from its first to its last nonzero value (`intensity_trimmed`), with two extra columns (`trace_offset`, `trace_len`) that rebuild it. `1`, the previous default, stores every row's retention-time axis and its whole trace, zero-filled over the candidate's window in window-grid mode. Every reader (features, quant, the pool) accepts both layouts and rebuilds the same rows bit for bit, so every table downstream of extract is byte-identical; only the chromatogram table changes (smaller, with a different content hash). A reader outside the engine, or an engine binary from before v2, reads only `rt` and `intensity` and stops at their absence from a v2 table: set `1` for such a reader, or convert a table with `mumdia::chromatograms::rewrite`. The pool splices band tables of one layout only, so all bands of a grouped run share it. Measured before the default changed: on a six-run Astral experiment and a five-run Orbitrap AIF experiment (imported HYE library, multi-head calibration, `nn_torch`) every output after extract was byte-identical to v1, and the chromatogram tables went from 4.75 to 3.95 GB and from 21.7 to 15.4 GB. |
 | `bucket_size` | `usize` | `8192` |  | m/z bucket size (power of two). |
 | `peak_claim` | `PeakClaim` | `none` |  | How a shared observed peak's intensity is apportioned among co-isolated, co-eluting candidates that all match it (see `PeakClaim`). |
 | `claim_cues` | `ClaimCues` | the `ClaimCues` section's own defaults |  | Composable claim-weight cues for `PeakClaim::CoelutionMultiCue` (modular fragment-competition framework). All default off (weight 1.0). |
@@ -287,7 +293,7 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 
 ## extract.claim_cues
 
-`ClaimCues` (rust/mumdia/crates/mumdia-core/src/config.rs:217). stage document: [docs/09_extract.md](09_extract.md).
+`ClaimCues` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/09_extract.md](09_extract.md).
 
 Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modular fragment-competition framework). Each cue is label-blind (reads only observed/predicted m/z + intensity, RT, MS1) so target/decoy exchangeability is preserved, and each defaults OFF (weight 1.0) so the composite weight reduces to the plain elution-profile height. Enable cues incrementally and validate as non-destructive features before any destructive/default use.
 
@@ -303,7 +309,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## features
 
-`FeaturesConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1308). stage document: [docs/10_features.md](10_features.md).
+`FeaturesConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/10_features.md](10_features.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -317,12 +323,14 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `bound_from_confident` | `bool` | `true` |  | Elution-peak boundary source. When true (default) a single set of left/right half-widths (seconds) is learned once from the confident seed PSMs (`spectrum_q <= 0.01`, target-only, the same set that anchors RT calibration / DeepLC fine-tune) and applied to EVERY candidate around its own apex. This removes per-candidate boundary manipulation so a decoy is scored over a real- peptide-width window centred on its apex. When false, each candidate detects its own peak boundary from its top-3-predicted-fragment profile (per-candidate, but noisy/manipulable for chimeric decoys; the legacy behaviour). If the seed yields < 20 confident anchors the stage logs a warning and falls back to per-candidate detection for that run. |
 | `bound_confident_pct` | `f64` | `50.0` |  | Percentile (0-100) of the confident-set half-widths taken as the global left/ right elution half-width when `bound_from_confident` is true. 50 = median (typical real peak width); higher percentiles widen the shared window. |
 | `ms1_precursor_features` | `bool` | `false` | benchmark-gated | Emit the MS1 apex-isotope precursor feature `ms1_isotope_height_corr` (Pearson of the observed apex isotope heights `[i0,i1,i2]` against the Poisson-averagine model). Default false (the feature is present in the battery but returns 0.0, so the vector length is unchanged in effect). It overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and benchmark-gated rather than default-on (AlphaDIA-plan item 12). |
-| `im_features` | `bool` | `false` | benchmark-gated | Append the ion-mobility feature block (docs/10_features.md, "Ion-mobility features"; TIMS roadmap P5) after every other column: IM error against the calibrated prediction, fragment IM dispersion at the apex, MS1 IM agreement and the IM spread over the elution peak. Needs 4D data (psms_extracted v4, chromatograms v2); on 3D data the columns are constant zeros. Default false: off, the feature list, schema id and PIN column order are unchanged. Benchmark-gated. |
+| `im_features` | `bool` | `false` | benchmark-gated | Append the ion-mobility feature block (docs/10_features.md, "Ion-mobility features"; TIMS roadmap P5) after every other column: IM error against the calibrated prediction, fragment IM dispersion at the apex, MS1 IM agreement and the IM spread over the elution peak. Needs 4D data (psms_extracted v4 or later, chromatograms v3 or v4); on 3D data the columns are constant zeros. Default false: off, the feature list, schema id and PIN column order are unchanged. Benchmark-gated. |
 | `im_shape_features` | `bool` | `false` | benchmark-gated | Append the ion-mobility peak-shape block (docs/10_features.md, "Ion-mobility features"; TIMS roadmap P7) after every other column, including the `im_features` block: fragment mobility width and its spread at the apex, the Gaussian overlap of each fragment's mobility peak with the fragment consensus, and the MS1 precursor's width and overlap. Needs `convert.tdf_im_width` (spectra v3, psms_extracted v5); without it the columns are constant zeros. Default false: off, the feature list, schema id and PIN column order are unchanged. Benchmark-gated. |
+| `retrace_apex` | `bool` | `false` | benchmark-gated | Apex evidence from the raw diaPASEF events (docs/TIMS_ROADMAP_bis.md section 7). Needs `retrace.enabled`: retrace then also writes `<chromatograms>.apex.parquet`, and features replaces the centroid `apex_intensity`, `n_matched_fragments` and `ms1_mono` / `ms1_iso1` / `ms1_iso2` with their raw-trace values and appends `imc_ref_w`, the agreement of the fragments' raw 1/K0 profiles at the apex, after every other column. Refused with `extract.promote_top_peaks > 1`. Default false: off, the feature list, schema id and values are unchanged. Benchmark-gated. |
+| `chrom_loaders` | `usize` | `3` |  | Chromatogram decode threads in the main feature pass. The pass decodes the chromatogram table one chunk at a time while the features of the chunk before are computed; with one loader the whole decode ran on a single core, which bound the stage whenever decoding a chunk took longer than computing one (measured on an 8-12-mer immunopeptidomics run before the decode overlapped the computation: 3.7 of a 4-minute stage were the load). Each loader reads its own chunk from that chunk's row span, and the computation takes the chunks in table order, so the chunks, every feature value and the features table bytes are the same at every setting; only the time and the memory move. The pass holds up to `chrom_loaders + 1` decoded chunks (0.92 GiB of traces each at the HYE benchmark shape, docs/27 section 3.4), where one loader held two. The value is an upper bound: a pass never runs more loaders than `--threads` (the engine's thread pool) or than it has chunks, so `--threads 1` decodes on one loader as before. Loaders beyond each pass's first come from a process-wide pool of four, so concurrent bands or runs (`groups.parallel`, `experiment.parallel_runs`) share that pool instead of multiplying it. Default 3; `1` restores the single loader and `0` is read as `1`. A memory knob and a speed knob, not a sensitivity knob. |
 
 ## compete
 
-`CompeteConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1396). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
+`CompeteConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -335,7 +343,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## rescore
 
-`RescoreConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1761). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
+`RescoreConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -343,7 +351,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `folds` | `usize` | `3` |  |  |
 | `train_fdr` | `f64` | `0.01` |  |  |
 | `num_iter` | `usize` | `10` |  | number of semi-supervised iterations for the native rescorer. |
-| `max_feature_matrix_gib` | `f64` | `0.0` |  | Refuse a rescore whose in-memory feature matrix would exceed this many GiB. 0 (default) means no ceiling, which is the previous behaviour. The matrix is `Vec<Vec<f64>>`: eight bytes per value, plus a heap allocation and a 24-byte spine entry per PSM. Nothing in the workspace estimates or checks available memory (there is deliberately no `sysinfo` dependency), so an experiment-wide rescore over enough runs was simply killed by the OS after however long it took to get there. `native_tda` additionally runs all folds in parallel, each holding an owned standardised copy of its training slice, so the true peak is roughly `(1 + folds) x` this figure. Setting a ceiling converts that into an error at startup, naming the estimate and the two ways out. It is not a batching implementation: sub-batching changes which PSMs share a pooled `q_value`, so it is the operator's decision, not a silent one. |
+| `max_feature_matrix_gib` | `f64` | `0.0` |  | Refuse a rescore whose in-memory feature matrix would exceed this many GiB. 0 (default) means no ceiling, which is the previous behaviour. The matrix is a flat f32 `FeatureMatrix`: four bytes per value. Nothing in the workspace estimates or checks available memory (there is deliberately no `sysinfo` dependency), so an experiment-wide rescore over enough runs was simply killed by the OS after however long it took to get there. `native_tda` fits its folds one at a time and holds one standardised training copy, `(folds - 1) / folds` of the matrix, so its peak is `1 + (folds - 1) / folds` times this figure: 1.67x at the default 3 folds, 1.80x at 5, approaching 2x and never above it. It does not grow with `folds`. Setting a ceiling converts that into an error at startup, naming the estimate and the two ways out. It is not a batching implementation: sub-batching changes which PSMs share a pooled `q_value`, so it is the operator's decision, not a silent one. |
 | `python` | `Option<String>` | `null` |  |  |
 | `percolator_bin` | `Option<String>` | `null` |  | Path to an external `percolator` executable. Parsed and never read: no stage launches percolator, and `RescorerKind` has no variant that would. It is the only silently inert config field in the tree, since the three MBR ones warn (see `validate`). Kept rather than deleted because the external-percolator path is still intended; `validate` now warns when it is set. |
 | `entrapment_marker` | `Option<String>` | `null` |  | Protein-accession substring marking spike-in (entrapment) negatives, e.g. "_HUMAN". Required when `classifier = entrapment`; PSMs whose protein contains it are the empirical false population. |
@@ -351,7 +359,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `entrapment_contaminant_markers` | `Vec<String>` | `[]` |  | Protein substrings marking genuine contaminants inside the spike-in proteome (e.g. "KRT", "ALBU", keratin/albumin entry-name tokens). A PSM matching `entrapment_marker` but also one of these is treated as a REAL target, not an entrapment negative: such peptides are truly present (handling contaminants) so using them as negatives mislabels real signal and inflates the estimated FDR. Empty = every spike-in hit is a negative. |
 | `entrapment_ratio` | `f64` | `1.0` |  | N_real_lib / N_entrap_lib. Scales the entrapment FDR estimate so it is unbiased when the spike-in library differs in size from the real one. |
 | `strict` | `bool` | `true` |  | When true, any sidecar/classifier failure or misconfiguration (Mokapot or entrapment sidecar error, unwired percolator, entrapment mode with no entrapment PSMs) is a hard error instead of a silent fall back to the native rescorer. Default true so a named scientific workflow cannot silently execute a different model; set false only for explicit legacy compatibility. |
-| `handoff` | `Handoff` | `parquet` |  | How the feature matrix reaches a sidecar rescorer. See `Handoff`. Defaults to `parquet`, which applies to nn_torch only; mokapot and entrapment sidecars always receive the tab-separated PIN. |
+| `handoff` | `Handoff` | `raw` |  | How the feature matrix reaches a sidecar rescorer. See `Handoff`. Defaults to `raw`, which applies to nn_torch only; mokapot and entrapment sidecars always receive the tab-separated PIN. |
 | `features` | `Option<Vec<String>>` | `null` |  | Restrict the classifier's input to these feature columns, by name. Absent (the default) falls through to `feature_preset`. The restriction is a projection, not a reordering: the columns keep the order of the feature schema, only those named are read out of the competed table, and the matrix, the sidecar handoff and the training all shrink with the list. Feature selection is a memory and I/O lever, not a speed one (docs/28 section 7), and any list must clear the sensitivity gate before it becomes a default. Mutually exclusive with `RescoreConfig::features_file`. Every name must exist in the competed table's schema; a missing one is an error, never a silent drop. |
 | `features_file` | `Option<String>` | `null` |  | The same restriction, read from a file with one feature name per line (blank lines and `#` comments ignored), which is how a 100+ name list stays readable. |
 | `feature_preset` | `FeaturePreset` | `all` |  | Named feature list used when neither `features` nor `features_file` is set. `all` is every feature the competed table carries. `compact` is the 114-name list of docs/28 section 12 (`bench/feature_selection/fs_union75_dedup.txt`, embedded in the binary), which with the hard-negative training recipe reproduced the full Extended set within seed noise on three pools (HYE A01 +1.2%, AIF -0.2%, entrapment +4.9%, spike-in FDP unchanged) at 3.4x less rescore memory. Preset names the table lacks are skipped with a log line rather than an error, so a preset tolerates a smaller `features.set`; the intersection must not be empty. Explicit lists stay strict. Default `all`: the projection is a memory lever (3.4x smaller rescore matrix), not a sensitivity one, and it cost 1.2% on the held-out HYE B01 pool under the default training (+0.2% / -0.1% / +1.5% on A01 / AIF / entrapment), so it is the option for pooled rescoring on small machines (docs/28 section 21), not the default. |
@@ -364,7 +372,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## quant
 
-`QuantConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1575). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
+`QuantConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -385,10 +393,12 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `baseline_flank_scans` | `usize` | `12` |  | Flank length (samples per side) used to estimate the background. |
 | `baseline_quantile` | `f64` | `0.25` |  | Quantile of the flank intensities taken as the background level. |
 | `fixed_window_s` | `f64` | `0.0` |  | When > 0, integrate each fragment over the samples within `fixed_window_s` seconds of the identification apex (instrument-independent alternative to `fixed_scan_halfwidth`, which it overrides). 0 (default) = off. |
+| `cross_run_weights` | `bool` | `false` |  | Cross-run fragment weighting (run-experiment only; docs/TIMS_QUANT_ROADMAP.md section 4b). Per-run quant runs twice: the first pass exports each fragment's area and its apex correlation with the candidate's other fragments; one weight per (candidate, fragment) is then fitted over all runs, `1 / (dev + 0.1) * max(corr, 0)`, where `dev` is the median absolute deviation of the fragment's log-share of the candidate total from its cross-run median and `corr` the median correlation; the second pass sums `weight * area` over every fragment, with the same weights in every run. Uses no condition labels. A candidate whose weights are all zero takes equal weights; a run where the weighted sum is not positive keeps the `top_n_fragments` rule. Needs a fixed window (the correlation is taken over it). Off by default; on in the diaPASEF preset (`QuantConfig::diapasef`). |
+| `cross_run_background` | `bool` | `false` |  | Cross-run background (run-experiment only; docs/TIMS_QUANT_ROADMAP.md section 4f). In the same two-pass step, one background level per (candidate, fragment) is the mean over all runs of the raw flank mean (`baseline_flank_scans` samples either side of the fixed window); the second pass subtracts it from every window sample, clipped at zero, in place of the per-run `baseline_subtract` level. Label-blind. Needs a fixed window. Off by default; on in the diaPASEF preset. |
 
 ## mbr
 
-`MbrConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:1714). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
+`MbrConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
@@ -404,18 +414,19 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 ## experiment
 
-`ExperimentConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:2033). stage document: [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md).
+`ExperimentConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md).
 
 Options for the experiment-wide orchestrator (`mumdia run-experiment`).
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
-| `parallel_runs` | `usize` | `1` |  | How many per-run search chains to execute concurrently. 1 (default) is strictly sequential, i.e. the historical behaviour. Runs are independent, so raising this scales nearly linearly in wall time, but EACH concurrent run holds its own extraction working set (tens of GB on a large library), so the practical ceiling is memory, not cores. Raise it deliberately after checking peak RSS for a single run; 2-4 is a reasonable start on a large-memory machine. Results are unaffected: chunks are processed in index order and completion order never reaches the output. |
+| `parallel_runs` | `usize` | `0` |  | How many per-run search chains to execute concurrently, or `"auto"`. `"auto"` (also written `0`) is the default since 2026-09-27; `1`, the previous default, is strictly sequential. Runs are independent, so concurrency scales nearly linearly in wall time, but EACH concurrent run holds its own extraction working set (tens of GB on a large library), so the practical ceiling is memory, not cores, and `"auto"` measures it. Results are unaffected: chunks are processed in index order and completion order never reaches the output. An explicit number runs the chains in chunks of that size on the engine's one thread pool, as it always has. `"auto"` sizes the concurrency from the thread budget: at most one run per 16 threads of `--threads`, and never more than the runs left. Each concurrent chain then runs in a thread pool of its own, `threads / runs` wide, so extract's fan-out and the feature loaders are sized to that run's share instead of each to the whole pool, and a run starts as soon as a slot is free rather than at a chunk boundary. On Linux the conversions, the seeds and the chains are each bounded by memory: the first of them runs alone, from a reset high-water mark (`/proc/self/clear_refs`), and the rest run at most `0.7 x (available + resident) / peak` at once, where the peak is the process's `VmHWM` after that step and `available` is `MemAvailable`, lowered to the headroom of the process's memory cgroup (a container's or a batch job's limit) when that is smaller. The peak counts this process only, not its child processes, so chains that each run their own DeepLC adaptation (`rt_library_scope = per_run`) run one at a time under `"auto"`; give a number to run such chains concurrently. Elsewhere (any platform but Linux) there is no memory reading, so `"auto"` runs the chains one at a time and the log says why; give a number to run them concurrently there. Because of the reset, a lifetime peak read from the process's resource usage (`/usr/bin/time -v`) covers only the time since the last measured step; measure an `"auto"` experiment's memory with a sampling profiler (`bench/mem_profile.py`). The rows are the same as at `1`; a stage inside a narrower pool can lay out its intermediate files differently, as a different `--threads` does. Measured before the default changed, together with `extract.chromatogram_schema = 2` and `overlap_front_threads = "auto"`: on a six-run Astral experiment and a five-run Orbitrap AIF experiment (EPYC 9354, 128 threads) every final output was byte-identical to the sequential run's (24 and 21 tables), and the experiments went from 32:49 to 26:00 and from 44:37 to 29:47. |
 | `rt_library_scope` | `RtLibraryScope` | `first_run_only` |  | How often the library's retention times are adapted to a run: once on the first run and reused (`first_run_only`, the default) or separately for every run (`per_run`). Governs whichever adaptation is active -- `rt_im_train.finetune_deeplc` or `rt_im_train.multihead_calibration` -- because they are the same shape of work: one full re-prediction of the library against that run's confident seed PSMs, which on a 9.4M-row library is the most expensive step in the experiment. Each run then fits its own LOESS on top of whichever library it was given, and that per-run fit is what absorbs chromatographic drift. Accepts the old name `finetune_scope`, which is what it was called when only the fine-tune could be shared. `first_run_only` assumes the runs share an elution ORDER, which replicate injections on one LC method do. A per-run LOESS can stretch and bend the axis but cannot reorder two peptides, so a batch that genuinely reorders -- different gradients, different columns, a method change part-way -- wants `per_run`, and so does a long batch where drift accumulates (see the measured cost above). |
+| `overlap_front_threads` | `Option<usize>` | `null` |  | Threads given to converting and seeding runs 2..N while run 1 adapts the library's retention times, under `rt_library_scope = first_run_only`, or `"auto"` (also written `null`), the default since 2026-09-27. `0`, the previous default, runs them after run 1. `"auto"` gives the fronts the threads of the budget beyond the physical cores the process may run on, which is what the DeepLC thread cap leaves idle: run 1's DeepLC then gets exactly the physical cores, the thread count it would have had without the overlap, so the adapted library is bit-identical. Where the physical cores cannot be read (any platform but Linux), where the budget does not exceed them, or where `MUMDIA_DEEPLC_THREAD_CAP` sets the cap by hand, `"auto"` is `0`. Runs 2..N convert their spectra and seed on the base library (the seed is iRT-independent), so nothing of theirs waits for run 1's adapted library until rt-im-train. Set to `N`, those fronts run on a pool of `N` threads while run 1's DeepLC sidecar gets the remaining `threads - N` (disjoint budgets), and every run's rest follows once run 1 has finished. On the six-file HYE Astral experiment a front is convert 1.9-2.5 min plus seed 0.4 min per file, against a first-run multi-head step of 11.7 min, so up to about 12 minutes of fronts fit behind it. Ungrouped runs only: a grouped run seeds per band inside its band loop, and its adaptation sits between those band seeds and its extract. The fronts' outputs are byte-identical; run 1's DeepLC predicts on `threads - N` torch threads instead of `threads`, which moves the adapted library in the last bits unless the DeepLC thread cap binds both counts to the same number (on an SMT host with `N` below the logical-minus-physical core count it does, and `"auto"` chooses exactly that). An explicit count beyond it is float-equivalent, not bit-identical. The fronts keep the ungrouped experiment's phase order: every conversion first, then one seed library and fragment index for all of their seeds (run 1 seeds on its own load before the overlap starts). That library is held beside the DeepLC worker while the fronts seed, which is where the experiment's peak can sit. Measured with `parallel_runs`: see there. |
 
 ## groups
 
-`GroupsConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:2103).
+`GroupsConfig` (rust/mumdia/crates/mumdia-core/src/config.rs).
 
 Searching a run one isolation-window group at a time. A group of isolation windows can only select precursors whose m/z lies in the group's band, so its seed, calibration, extract, features and compete need only that band of the library (`Library::load_with_fragment_offset`): the library, the hit accumulator and the accepted rows are all one band's worth instead of the whole run's, which is what bounds the memory of a search against a library of 10^8 precursors. Only rescore, quant and report see everything, after the group artifacts are pooled with library-wide ids. The groups run one after another in this process; `docs/33_window_groups.md` has the layout and the measurements.
 
@@ -423,11 +434,16 @@ Searching a run one isolation-window group at a time. A group of isolation windo
 |---|---|---|---|---|
 | `window_groups` | `usize` | `1` |  | Number of window groups. `1` (the default) is the ordinary single-library search. Groups are contiguous bands of isolation windows balanced by the number of library precursors they select, read from the precursor table's row-group statistics. |
 | `calibration` | `GroupCalibration` | `global` |  | Anchors for the RT calibration of each group; see `GroupCalibration`. |
-| `parallel` | `usize` | `1` |  | Bands searched at the same time inside one run. `1` (the default) is one band at a time, which is what bounds the memory: each band in flight holds its own extraction working set, so the peak is this many bands' worth. Raise it to fill a large machine, after checking one band's peak RSS: on a 203M-precursor library at 63 bands the largest band took 39 GB and the median far less. Results do not depend on it; bands are independent and their artifacts are pooled in band order either way. It must stay below the thread count: a band in flight parks one worker on its accumulation channel, so as many bands as there are threads leaves nothing to do the probing and the run deadlocks. A larger value is clamped to `threads - 1` with a warning rather than hanging. |
+| `parallel` | `usize` | `1` |  | Bands searched at the same time inside one run. `1` (the default) is one band at a time, which is what bounds the memory: each band in flight holds its own extraction working set, so the peak is this many bands' worth. Raise it to fill a large machine, after checking one band's peak RSS: on a 203M-precursor library at 63 bands the largest band took 39 GB and the median far less. Results do not depend on it; bands are independent and their artifacts are pooled in band order either way. The bands go through a bounded queue: this many workers each take the next band as soon as their current one is done, most expensive first (estimated precursors times MS2 peaks of the band's windows for the seed and extract, accepted rows for features and compete), rather than in fixed chunks that waited for their slowest band. It must stay below the thread count: a band in flight parks one worker on its accumulation channel, so as many bands as there are threads leaves nothing to do the probing and the run deadlocks. A larger value is clamped to `threads - 1` with a warning rather than hanging. |
+| `rt_adaptation` | `GroupRtAdaptation` | `once_per_run` |  | How often the library's retention times are adapted under `calibration = global`: `once_per_run` (the default since 2026-09-27) runs one DeepLC sidecar per run over the union of the bands, `per_band` (the previous default) one per band. `per_group` calibration always adapts per band. Each per-band sidecar starts an interpreter, imports torch and DeepLC, reads the pooled seed, refits the same heads on the same anchors (head 2503 in every band of the HYE sweep) and predicts every sequence of its band, so a sequence whose charge states fall in two bands is predicted twice (10.9M HYE rows are 4.91M unique sequences). On HYE Astral the multi-head step took about 13 min unbanded and 19-24 min at 2-16 bands. `once_per_run` fits once, predicts the union once and writes each band's table under the name a per-band run gives it (`groups/gNN/lib_precursors_multihead.parquet` or `lib_precursors_deeplc.parquet`), so the shared-band reuse of later runs and the seed refresh are unchanged. Under `run-experiment` with the multi-head calibration off, the library is re-predicted once for the experiment, and the bands then keep those values instead of each band of each run re-predicting them. Float-equivalent, not bit-identical: a sequence is predicted in different company, and torch's CPU kernels round by batch. On a synthetic library, one call over contiguous bands writes exactly the whole-library column band by band (`tests/python/test_deeplc_predict.py`). Measured before the default changed (EPYC 9354, 128 threads): a six-run Astral experiment at 16 bands 36:06 -> 25:39 and an eight-band entrapment run 5:44 -> 3:45; 0.8% of the band rows moved, by at most 0.07 s (0.6%, at most 2.9 s, on the entrapment library), with the same heads; and the peptides at 1% +0.35% (3 seeds) and +0.24% (10 seeds, the entrapment FDP +0.022 pp against two standard errors of 0.027). |
+| `balance` | `GroupBalance` | `precursors` |  | What the band plan balances: `precursors` (the default), the estimated library precursors per band, or `cost`, per window the precursors it selects times the MS2 peaks of its scans. Band cost follows spectral density more than precursor count: on the immunopeptidomics search two bands of 2.98M and 3.03M precursors took 42 s and 460 s, and at 81-94 bands the slowest windows (418-460 s) set the floor of the run. The queue already starts the most expensive bands first whatever this says; `cost` also moves the cuts, so that no band is several times the work of the others. Output-changing, hence opt-in: the cuts decide which candidates sit at a band edge, which the overlap deduplication and the edge candidates' neighbours depend on, and the pooled row order the classifier sees. Validate like a band-count change (docs/33 section 8): peptides at 1% inside the seed spread against `precursors`, and the per-band wall times, on two acquisitions. Note that the MS2 is decoded before the plan under either setting. |
+| `delete_band_intermediates` | `bool` | `true` |  | Delete each band's `psms_extracted.parquet` and `features.parquet` (with their reports and schema companions, and `run.pin` where one was written) once the pool is written. Default `true` since 2026-09-27 (previously `false`). Disk only: no stage reads them after pooling. The features are carried by the competed table and the extracted table's one reader, the candidate audit, reads the pooled copy. On the immunopeptidomics runs the band features alone were 55 GB per run, in an experiment that wrote about 2.7 TB of artifacts. The manifest keeps their records, and the band directories can no longer be re-featured (set `false` to keep them for that); the chromatograms and competed tables that quant, rescore and `mumdia pool --groups-dir` read are kept. Measured before the default changed, on an eight-band entrapment run: `psms_scored.parquet`, the three quant tables and both TSVs byte-identical. |
+| `pool_competed` | `bool` | `false` |  | Write the run's pooled `psms_competed.parquet`. Default `false` since 2026-09-26 (previously `true`). With `false`, rescore reads the bands' own competed tables in band order, each with the run's `source`, and the pooled copy is not written: one full write and read of the run's widest artifact less (17.5 GB on one immunopeptidomics run of 63 bands, about 83 GB per run before the feature columns were narrowed to f32). This happens only where it cannot change a result: the bands' library row spans must be disjoint, so no candidate was searched in two bands and there is no overlap duplicate to drop, and neither the candidate audit (`extract.emit_candidate_audit`) nor match-between-runs (`mbr.strategy`), which read the pooled table, may be on. Otherwise the table is pooled as with `true`, and the log says why. `psms_scored.parquet` is byte-identical either way; what changes is the artifact set. The run's manifest then has no pooled `psms_competed` record, the scored table's report lists the band tables under `competed_inputs` with their `competed_sources`, and a later standalone `mumdia rescore` or audit needs the table rebuilt first with `mumdia pool --groups-dir`, which the band tables allow. `true` writes the pooled table as before. The default changed on the byte-identity, measured with `pool_chromatograms` off alongside (`docs/33_window_groups.md` section 5): on one immunopeptidomics run of 63 bands, `psms_scored.parquet`, the three quant tables and both TSVs were identical to the pooled run's, the run directory went from 152 to 80 GB, and the pool stage from 66 s (30 min on a disk that sustained 22 MB/s) to nothing; on a six-run HYE experiment of 16 bands a run, all 36 outputs the two arms share were identical. |
+| `pool_chromatograms` | `bool` | `false` |  | Write the run's pooled `chromatograms.parquet`. Default `false` since 2026-09-26 (previously `true`; see `pool_competed` for the measurement). With `false`, quant reads the bands' own chromatogram tables in band order, dropping from each the candidates the pool's overlap dedup gave to another band, and the pooled copy is not written: one full splice write, hash and read of the run's largest artifact less (59.5 GB on the immunopeptidomics run above). The pool writes those loser sets to `groups/overlap_losers.parquet` (`band`, `candidate_id`, with the band tables it belongs to named in its footer), so a later `mumdia quant --chromatograms <band tables> --overlap-losers <that file>` reads the same rows, and refuses band tables that are not the named ones in their order. Unlike `pool_competed` this holds for overlapping bands as well, including an overlap candidate compete deleted in one band (the losers are found in the chromatogram tables themselves), and nothing but quant reads the pooled table (the candidate audit and match-between-runs do not). The quant tables are byte-identical either way; what changes is the artifact set. There is no pooled `chromatograms.parquet` (one an earlier run left in the directory is removed) and no manifest record for it, `overlap_losers.parquet` is written and recorded instead, and the quant report's `chromatograms` lists the band tables with `chromatogram_dropped_candidates`. The band chromatogram tables are then the run's only chromatograms, so the band directories are no longer disposable once the run is accepted: deleting them loses re-quantification. `mumdia pool --groups-dir` rebuilds the pooled table from them. `true` writes the pooled table as before. |
 
 ## retrace
 
-`RetraceConfig` (rust/mumdia/crates/mumdia-core/src/config.rs:2141). stage document: [docs/09_extract.md](09_extract.md).
+`RetraceConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/09_extract.md](09_extract.md).
 
 Chromatogram traces rebuilt from the raw timsTOF events (`retrace` stage, after extract). Each fragment trace point is the sum of every raw event in the grid point's frame and quad slots covering the precursor, within the learned fragment tolerance and inside `apex_im +/- im_half_width`, instead of one centroid. The MS1 isotope traces are rebuilt the same way from the MS1 frame nearest each grid point. diaPASEF only. Default off, which leaves every artifact bit-identical (the stage does not run).
 
@@ -438,10 +454,11 @@ Chromatogram traces rebuilt from the raw timsTOF events (`retrace` stage, after 
 | `ms1` | `bool` | `true` |  | Also rebuild `ms1_mono` / `ms1_iso1` / `ms1_iso2`. |
 | `ms1_im_half_width` | `f64` | `0.015` |  | MS1 band half-width in 1/K0, same centre (0.025 measured equal). |
 | `min_events` | `u32` | `1` |  | Raw events a grid point needs to count (else 0). 2 and 3 lost identifications. |
+| `repick` | `bool` | `false` | benchmark-gated | Re-choose each candidate's apex RT and 1/K0 centre on the raw events before the traces are rebuilt (docs/09 section 6c; docs/TIMS_ROADMAP_bis.md section 8). Over extract's apex and the `extract.retain_top_peaks` sidecar peaks, the peak whose best 1/K0 band agrees best with the library wins; retrace then writes `psms_extracted.repick.parquet` with `apex_rt` and `apex_im` replaced, which `run` feeds to the later stages. Needs `retain_top_peaks >= 2` and `promote_top_peaks = 1`. Default false. Benchmark-gated. |
 
 ## peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]
 
-`ResidueMod` (rust/mumdia/crates/mumdia-core/src/config.rs:548). stage document: [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md).
+`ResidueMod` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md).
 
 Element type of `peptidoforms.fixed_mods` and `peptidoforms.variable_mods`. Each element is a JSON object with these keys; the list default is on the owning field.
 
@@ -471,7 +488,7 @@ config file must use. The default variant is marked. Sorted by type name.
 
 ### `BrukerReader`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:417)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Reader for timsTOF `.d` input (`convert.bruker_reader`).
 
@@ -482,7 +499,7 @@ Reader for timsTOF `.d` input (`convert.bruker_reader`).
 
 ### `CalibrationMethod`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:57)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 | Value | Default | Description |
 |---|---|---|
@@ -492,7 +509,7 @@ Reader for timsTOF `.d` input (`convert.bruker_reader`).
 
 ### `CompeteGroupBy`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1463)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 | Value | Default | Description |
 |---|---|---|
@@ -502,7 +519,7 @@ Reader for timsTOF `.d` input (`convert.bruker_reader`).
 
 ### `CompetitionMode`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1442)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Within-group competition resolution (spec 04 §6). Only `WinnerTakeAll` removes candidates unconditionally; the others preserve candidates the rescorer can still discriminate, which is the sensitivity program's central principle ("preserve candidate evidence until the workflow can make a calibrated decision"). Target/decoy labels remain part of the competition key in every mode, so a target never competes against its own decoy (the null is preserved).
 
@@ -516,7 +533,7 @@ Within-group competition resolution (spec 04 §6). Only `WinnerTakeAll` removes 
 
 ### `DecoyStrategy`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:17)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 | Value | Default | Description |
 |---|---|---|
@@ -527,7 +544,7 @@ Within-group competition resolution (spec 04 §6). Only `WinnerTakeAll` removes 
 
 ### `DecoyTransfer`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1705)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence` transfers reverse/scramble decoys at the same expected RT; `PermutedRt` transfers real precursors to a decoupled (wrong) expected RT; `Both` combines them. The prototype's shuffled-RT null gave a ~0.6% in-window false rate vs 66.6% true (113x separation), so the transfer q-value is well-calibrated.
 
@@ -539,7 +556,7 @@ Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence` trans
 
 ### `Enzyme`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:47)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 | Value | Default | Description |
 |---|---|---|
@@ -548,7 +565,7 @@ Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence` trans
 
 ### `FeaturePreset`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1897)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Named feature list for `RescoreConfig::feature_preset`.
 
@@ -559,7 +576,7 @@ Named feature list for `RescoreConfig::feature_preset`.
 
 ### `FeatureSet`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:66)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 | Value | Default | Description |
 |---|---|---|
@@ -569,7 +586,7 @@ Named feature list for `RescoreConfig::feature_preset`.
 
 ### `FragPredictorKind`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:103)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 | Value | Default | Description |
 |---|---|---|
@@ -579,7 +596,7 @@ Named feature list for `RescoreConfig::feature_preset`.
 
 ### `FragmentSelection`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1640)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Fragment ranking for the quant top-N sum. See `QuantConfig::fragment_selection`.
 
@@ -590,7 +607,7 @@ Fragment ranking for the quant top-N sum. See `QuantConfig::fragment_selection`.
 
 ### `GateMode`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1281)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Spectral-agreement score the extraction acceptance gate (`gate_min_score`) thresholds. All are computed at the gate from data already in hand.
 
@@ -602,9 +619,20 @@ Spectral-agreement score the extraction acceptance gate (`gate_min_score`) thres
 | `coelution` |  | Predicted-intensity-weighted mean CO-ELUTION correlation of each matched fragment's XIC to the signature reference over the elution peak (temporal agreement, orthogonal to intensity agreement). |
 | `combined` |  | Require BOTH: peak-integrated spectral Pearson >= `gate_min_score` AND the co-elution score >= `gate_coelution_min`. More specific (an interferent passing one axis is still rejected), for a cleaner FDR pool. |
 
+### `GroupBalance`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+What a grouped run's band plan balances.
+
+| Value | Default | Description |
+|---|---|---|
+| `precursors` | yes | The estimated library precursors each band selects. The behaviour before this setting existed. |
+| `cost` |  | The estimated search cost: per window, the precursors it selects times the MS2 peaks its scans carry. |
+
 ### `GroupCalibration`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:2079)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Which anchors the retention-time calibration of a window group is fitted on.
 
@@ -613,20 +641,32 @@ Which anchors the retention-time calibration of a window group is fitted on.
 | `global` | yes | The confident seed PSMs of every group, pooled (q re-estimated on the union), so each group's LOESS and multi-head fit see the whole run's anchors. The default: a group holds a fraction of the anchors, and the fit quality is what sets the RT window that the extract of every group then pays for. |
 | `per_group` |  | Each group calibrates on its own seeds only. Cheaper by one pooling pass and fully independent per group; kept for the comparison, not as a recommendation. |
 
+### `GroupRtAdaptation`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+How often a grouped run adapts the library's retention times (the multi-head calibration or the base-model re-prediction) under `groups.calibration = global`.
+
+| Value | Default | Description |
+|---|---|---|
+| `per_band` |  | One DeepLC sidecar per band, each fitting the pooled anchors and predicting its own band. The behaviour before this setting existed, and the default until 2026-09-27. |
+| `once_per_run` | yes | One sidecar per run over the union of the bands: the calibration is fitted once, each unique sequence is predicted once, and every band's table is written under the name a per-band run gives it. A library the caller already re-predicted with the base model (`run-experiment` with the multi-head calibration off) is not re-predicted per band again. The default since 2026-09-27. |
+
 ### `Handoff`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:2003)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 How the feature matrix crosses the Rust -> Python boundary for a sidecar rescorer.
 
 | Value | Default | Description |
 |---|---|---|
 | `tsv` |  | Tab-separated PIN. Percolator's format, and what `mokapot.read_pin` requires, so it is what a mokapot or entrapment sidecar receives whatever this is set to. |
-| `parquet` | yes | Parquet feature table with f32 features, and the default since 2026-09-05. The TSV path makes the worker parse every column into a float64 pandas frame before it builds its float32 matrix, so the text file, the frame and the matrix are alive together. Measured on the HYE competed table (2,603,894 PSMs x 387 features, one self-training iteration, 32 threads), parquet against tsv: rescore peak 29.96 -> 8.95 GB, wall 8:35 -> 6:33, sidecar file 9.53 -> 3.28 GB, the worker's read and standardise phase 111.7 -> 16.9 s, and 47,752 against 47,762 peptides at 1% with the decoy fraction 1.00% either way (docs/28 section 11). An earlier 8,858,206-PSM experiment-wide rescore went from 671.6 min to 12 min, because there the 30.18 GB TSV crossed the worker's streaming threshold and every iteration re-read a 12.77 GB memmap. Features are f32 because the TSV was already lossy (`{:.6}`) and the worker casts to f32 regardless; the two paths therefore feed marginally different values into a chaotic self-training loop, which is where that 10-peptide difference comes from. nn_torch only: `mokapot_worker.py` calls `mokapot.read_pin()` and cannot read Parquet, so a mokapot run falls back to `Tsv` with a warning instead of failing. |
+| `parquet` |  | Parquet feature table with f32 features: the default from 2026-09-05 until `Raw` replaced it on 2026-09-28, with identical scores. The TSV path makes the worker parse every column into a float64 pandas frame before it builds its float32 matrix, so the text file, the frame and the matrix are alive together. Measured on the HYE competed table (2,603,894 PSMs x 387 features, one self-training iteration, 32 threads), parquet against tsv: rescore peak 29.96 -> 8.95 GB, wall 8:35 -> 6:33, sidecar file 9.53 -> 3.28 GB, the worker's read and standardise phase 111.7 -> 16.9 s, and 47,752 against 47,762 peptides at 1% with the decoy fraction 1.00% either way (docs/28 section 11). An earlier 8,858,206-PSM experiment-wide rescore went from 671.6 min to 12 min, because there the 30.18 GB TSV crossed the worker's streaming threshold and every iteration re-read a 12.77 GB memmap. Features are f32 because the TSV was already lossy (`{:.6}`) and the worker casts to f32 regardless; the two paths therefore feed marginally different values into a chaotic self-training loop, which is where that 10-peptide difference comes from. nn_torch only: `mokapot_worker.py` calls `mokapot.read_pin()` and cannot read Parquet, so a mokapot run falls back to `Tsv` with a warning instead of failing. Choose it over `Raw` where the sidecar directory is short of room: a parquet file has no size floor, so the space check only warns for it, while a raw matrix is exactly 4 bytes a value and is refused below that. |
+| `raw` | yes | The default since 2026-09-28: the features as one row-major little-endian f32 `.npy` matrix, beside a small parquet of the metadata columns and a `<name>.raw.json` description (feature names, per-feature min/max, the parquet handoff's row-group size) that the worker is given. The engine streams each decoded batch straight into the file with no transpose and no parquet encode, and the worker copies the matrix into its own with no decode and no column-to-row transpose: on the 258.75M-row immunopeptidomics pool the parquet path spent an estimated 26 min of serial engine CPU encoding and the worker a strided fill of every column. The file is the raw size, 4 bytes a value, about 11% more than the snappy parquet there, so it pays where the codec, not the disk, is the limit (a RAM-backed `MUMDIA_SIDECAR_DIR`, an SSD). Features that compress well make the file gap much larger, and docs/13 records a small table where the raw write was the slower one; on the benchmark pools of the 2026-09-27 campaign the two walls were within a minute of each other, with byte-identical scored tables. Scores are byte-identical to `Parquet`: the worker fills the same matrix and sums the float64 moments over the same partition (the description carries the row-group size), and drops the same constant columns. Validate a new host by rescoring one pool with each handoff, same seed and threads, and comparing `psms_scored.parquet` byte for byte (`tests/python/test_nn_rescore_worker.py` does it on a fixture). nn_torch only; a mokapot run falls back to `Tsv` with a warning. The sidecar space check refuses the run when the work directory cannot hold the matrix (exactly 4 bytes a value, docs/13); set `Parquet` where the room is short, or point `MUMDIA_SIDECAR_DIR` elsewhere. |
 
 ### `ImGate`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1188)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Extraction IM gate mode; see `ExtractConfig::im_gate`.
 
@@ -638,7 +678,7 @@ Extraction IM gate mode; see `ExtractConfig::im_gate`.
 
 ### `ImPredictorKind`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:92)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Source of the library's `predicted_im` (1/K0) in FASTA mode.
 
@@ -649,7 +689,7 @@ Source of the library's `predicted_im` (1/K0) in FASTA mode.
 
 ### `LibraryIrt`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:891)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Source of `predicted_irt` for an imported library; see `RtImTrainConfig::library_irt`.
 
@@ -661,7 +701,7 @@ Source of `predicted_irt` for an imported library; see `RtImTrainConfig::library
 
 ### `MatcherKind`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:39)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Fragment-matcher backend for search-seed and extract (docs/06_predict_frag_index_matchers.md). Default `Fragindex` (log-bin CSR matcher): on narrow-window DIA it is ~1.95x faster in search-seed and ~1.26x in extract with essentially unchanged IDs (HYE B_01: peptides -0.1%); `Bucketed` is the previous `Library::page_search` path (retained for A/B and for the AIF full-range-window case, where the predicate difference shifts IDs more).
 
@@ -672,7 +712,7 @@ Fragment-matcher backend for search-seed and extract (docs/06_predict_frag_index
 
 ### `MbrStrategy`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1686)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.md). Default `None` reproduces the current chain byte-for-byte. ONLY `None` VS NOT-`None` IS IMPLEMENTED. The three non-`None` variants are described below as the intended staging, but no code distinguishes them: every test in the tree is `strategy != None`, so selecting `RtTransfer` or `Full` today behaves exactly like `EmpiricalLibrary`. They are kept as the recorded design ladder rather than deleted because the MBR tier is planned and benchmark-gated (CLAUDE.md); `validate()` warns when a non-`None` variant is selected so a config cannot quietly expect more than it gets. Intended staging: `EmpiricalLibrary` builds the consensus anchor library only; `RtTransfer` adds cross-run expected-RT transfer extraction; `Full` adds requantification. All require >= 2 runs and a decoy-transfer FDR (see the plan).
 
@@ -685,7 +725,7 @@ Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.
 
 ### `NegSelect`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1908)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Which decoys survive the training-set negative cap.
 
@@ -697,7 +737,7 @@ Which decoys survive the training-set negative cap.
 
 ### `PeakClaim`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:157)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Fragment-peak apportionment when one observed MS2 peak matches the fragments of several co-isolated, co-eluting candidates (near-universal in wide-window DIA: ~98% of fragment m/z collide within tolerance). Decides how the peak's intensity is shared, to stop a chimeric candidate borrowing a real peptide's peak wholesale.
 
@@ -715,7 +755,7 @@ Fragment-peak apportionment when one observed MS2 peak matches the fragments of 
 
 ### `PeakWindowMode`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1499)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 How the elution-peak integration window is chosen per candidate in quant.
 
@@ -726,7 +766,7 @@ How the elution-peak integration window is chosen per candidate in quant.
 
 ### `QuantQColumn`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1554)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Which q-value column quant filters candidates on. Peptide- or precursor-level q is appropriate for a single-run rescore. Under experiment-wide rescoring, those grouped q-values are pooled and carried only on the best PSM across all runs, so filtering per-run slices on them creates disjoint quant sets. `RunPsmQ` is the run-local FDR gate for that cross-run workflow; `PsmQ` keeps the pooled per-PSM gate available when that is explicitly intended.
 
@@ -739,7 +779,7 @@ Which q-value column quant filters candidates on. Peptide- or precursor-level q 
 
 ### `RescorerKind`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:125)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 | Value | Default | Description |
 |---|---|---|
@@ -751,7 +791,7 @@ Which q-value column quant filters candidates on. Peptide- or precursor-level q 
 
 ### `RollupMethod`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1488)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 | Value | Default | Description |
 |---|---|---|
@@ -760,7 +800,7 @@ Which q-value column quant filters candidates on. Peptide- or precursor-level q 
 
 ### `RtLibraryScope`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:1966)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 How many DeepLC fine-tunes an experiment pays for.
 
@@ -771,7 +811,7 @@ How many DeepLC fine-tunes an experiment pays for.
 
 ### `RtPredictorKind`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:80)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 | Value | Default | Description |
 |---|---|---|
@@ -780,7 +820,7 @@ How many DeepLC fine-tunes an experiment pays for.
 
 ### `SeedImGate`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:712)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 Seed IM gate mode; see `SearchSeedConfig::im_gate`.
 
@@ -792,7 +832,7 @@ Seed IM gate mode; see `SearchSeedConfig::im_gate`.
 
 ### `UnknownModPolicy`
 
-(rust/mumdia/crates/mumdia-core/src/config.rs:557)
+(rust/mumdia/crates/mumdia-core/src/config.rs)
 
 | Value | Default | Description |
 |---|---|---|
@@ -817,83 +857,119 @@ both sides is marked **both**.
 
 `Default in code` is the fallback the reading code supplies when the variable
 is unset. Two workers can disagree, in which case every distinct fallback is
-listed with the file it is in.
+listed with the file it is in. A default marked `computed:` has no literal
+fallback in the code: the reading function works out the behaviour, and the
+text describes it (`COMPUTED_ENV_DEFAULTS` in `ci/gen_config_reference.py`).
+
+`Read at` and `Site` name the file and the enclosing function as
+`path::function`: `Type::method` for a Rust method, `Trait::method` for a
+default trait method, inline modules and nested Rust functions joined with
+`::`, `Class.method` in Python, `<module>` outside any
+function. No line number is cited, so the tables change only when a read
+moves to another function.
 
 13 of these are also SET by the engine before the worker starts, so the worker's own fallback applies only when the engine did not set it: `MUMDIA_NN_FOLDS`, `MUMDIA_NN_FOLD_KEYS`, `MUMDIA_NN_ITERS`, `MUMDIA_NN_MARGIN_FRAC`, `MUMDIA_NN_NEG_RATIO`, `MUMDIA_NN_NEG_SELECT`, `MUMDIA_NN_SEEDS`, `MUMDIA_NN_THREADS`, `MUMDIA_NN_TRAIN_FDR`, `MUMDIA_NN_TRAIN_SUB`, `MUMDIA_NN_WARM_EPOCHS`, `MUMDIA_NN_WARM_START`, `OMP_NUM_THREADS`. See the next table.
 
 | Variable | Side | Default in code | Read at |
 |---|---|---|---|
-| `CONDA_PREFIX` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:265` |
-| `DEEPLC_FT_THREADS` | sidecar | `"8"` | `scripts/deeplc_finetune.py:27` |
-| `MUMDIA_BREW_ITERS` | sidecar | `"20"` | `scripts/mokapot_worker.py:38` |
-| `MUMDIA_CONVERT_THREADS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/convert.rs:592` |
-| `MUMDIA_DEEPLC_RAW_OUTPUT` | sidecar | `""` | `scripts/deeplc_finetune.py:146`, `scripts/deeplc_worker.py:124` |
-| `MUMDIA_ENTRAPMENT_MODEL` | sidecar | `"gbm"` | `scripts/entrapment_worker.py:39` |
-| `MUMDIA_LR_C` | sidecar | `"1.0"` | `scripts/mokapot_worker.py:48` |
-| `MUMDIA_LR_MAX_ITER` | sidecar | `"1000"` | `scripts/mokapot_worker.py:49` |
-| `MUMDIA_MOKAPOT_WORKERS` | sidecar | `"3"` | `scripts/mokapot_worker.py:120` |
-| `MUMDIA_MSCONVERT` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:206` |
-| `MUMDIA_NN_ALPHA` | sidecar | `"1e-4"` | `scripts/mokapot_worker.py:90` |
-| `MUMDIA_NN_BATCH` | sidecar | `4096` | `scripts/nn_rescore_worker.py:636` |
-| `MUMDIA_NN_CHUNK` | sidecar | `250000` | `scripts/nn_rescore_worker.py:641` |
-| `MUMDIA_NN_CLAMP_TINY` | sidecar | `1e-20` | `scripts/nn_rescore_worker.py:645` |
-| `MUMDIA_NN_DEBUG_DENORMALS` | sidecar | `0` | `scripts/nn_rescore_worker.py:715` |
-| `MUMDIA_NN_DEVICE` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:650` |
-| `MUMDIA_NN_DROPOUT` | sidecar | `0.3` | `scripts/nn_rescore_worker.py:633` |
-| `MUMDIA_NN_DROP_CONSTANT` | sidecar | `1` | `scripts/nn_rescore_worker.py:804` |
-| `MUMDIA_NN_EARLY_STOP` | sidecar | `1` | `scripts/nn_rescore_worker.py:642` |
-| `MUMDIA_NN_EARLY_STOP_TOL` | sidecar | `0.01` | `scripts/nn_rescore_worker.py:643` |
-| `MUMDIA_NN_EPOCHS` | sidecar | `25` | `scripts/nn_rescore_worker.py:631` |
-| `MUMDIA_NN_FEATURES` | sidecar | `""` | `scripts/nn_rescore_worker.py:775` |
-| `MUMDIA_NN_FLUSH_DENORMAL` | sidecar | `1` | `scripts/nn_rescore_worker.py:707` |
-| `MUMDIA_NN_FOLDS` | sidecar | `3` | `scripts/nn_rescore_worker.py:619` |
-| `MUMDIA_NN_FOLD_KEYS` | sidecar | `""` | `scripts/nn_rescore_worker.py:831` |
-| `MUMDIA_NN_HIDDEN` | sidecar | `"128,64"` in nn_rescore_worker.py; `"128,64,64,32"` in mokapot_worker.py | `scripts/mokapot_worker.py:83`, `scripts/nn_rescore_worker.py:632` |
-| `MUMDIA_NN_INIT_FDR_MAX` | sidecar | `0.05` | `scripts/nn_rescore_worker.py:638` |
-| `MUMDIA_NN_INIT_SAMPLE` | sidecar | `300000` | `scripts/nn_rescore_worker.py:995` |
-| `MUMDIA_NN_INIT_TOPK` | sidecar | `0` | `scripts/nn_rescore_worker.py:1116` |
-| `MUMDIA_NN_ITERS` | sidecar | `5` | `scripts/nn_rescore_worker.py:630` |
-| `MUMDIA_NN_LR` | sidecar | `1e-3` | `scripts/nn_rescore_worker.py:634` |
-| `MUMDIA_NN_MARGIN_FRAC` | sidecar | `0.5` | `scripts/nn_rescore_worker.py:629` |
-| `MUMDIA_NN_MAX_ITER` | sidecar | `"200"` | `scripts/mokapot_worker.py:91` |
-| `MUMDIA_NN_NEG_RATIO` | sidecar | `0.0` | `scripts/nn_rescore_worker.py:623` |
-| `MUMDIA_NN_NEG_SELECT` | sidecar | `"random"` | `scripts/nn_rescore_worker.py:624` |
-| `MUMDIA_NN_PREGATHER_GB` | sidecar | `8` | `scripts/nn_rescore_worker.py:644` |
-| `MUMDIA_NN_SEED` | sidecar | `0` | `scripts/nn_rescore_worker.py:640` |
-| `MUMDIA_NN_SEEDS` | sidecar | `1` | `scripts/nn_rescore_worker.py:639` |
-| `MUMDIA_NN_SOLVER` | sidecar | `"adam"` | `scripts/mokapot_worker.py:89` |
-| `MUMDIA_NN_STREAM` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:717` |
-| `MUMDIA_NN_STREAM_GB` | sidecar | `4` | `scripts/nn_rescore_worker.py:731`, `scripts/nn_rescore_worker.py:732` |
-| `MUMDIA_NN_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker.py:671`, `scripts/nn_rescore_worker.py:672` |
-| `MUMDIA_NN_THREAD_CAP` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py:301` |
-| `MUMDIA_NN_TRAIN_FDR` | sidecar | `0.01` | `scripts/nn_rescore_worker.py:637` |
-| `MUMDIA_NN_TRAIN_SUB` | sidecar | `0.0` | `scripts/nn_rescore_worker.py:620` |
-| `MUMDIA_NN_WARM_EPOCHS` | sidecar | `0` | `scripts/nn_rescore_worker.py:622` |
-| `MUMDIA_NN_WARM_START` | sidecar | `0` | `scripts/nn_rescore_worker.py:621` |
-| `MUMDIA_NN_WD` | sidecar | `1e-4` | `scripts/nn_rescore_worker.py:635` |
-| `MUMDIA_PARQUET_COMPRESSION` | engine | none (unset means off) | `rust/mumdia/crates/mumdia-io/src/table.rs:59` |
-| `MUMDIA_PEPTDEEP_DEVICE` | sidecar | `"auto"` | `scripts/peptdeep_worker.py:214` |
-| `MUMDIA_PYTHON` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:256` |
-| `MUMDIA_PYTHON_DEEPLC` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:255` |
-| `MUMDIA_PYTHON_IM2DEEP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:255` |
-| `MUMDIA_PYTHON_MBR` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:255` |
-| `MUMDIA_PYTHON_MS2PIP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:255` |
-| `MUMDIA_PYTHON_PEPTDEEP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:255` |
-| `MUMDIA_PYTHON_RESCORE` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:255` |
-| `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:644`, `scripts/mokapot_worker.py:181`, `scripts/mokapot_worker.py:37` |
-| `MUMDIA_SCRIPTS` | sidecar | `os.path.dirname(os.path.abspath(__file__` | `scripts/mh_shard_predict.py:23` |
-| `MUMDIA_THERMO_PARSER` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:184` |
-| `MUMDIA_XGB_DEPTH` | sidecar | `"6"` | `scripts/mokapot_worker.py:63` |
-| `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker.py:68` |
-| `MUMDIA_XGB_LR` | sidecar | `"0.1"` | `scripts/mokapot_worker.py:64` |
-| `MUMDIA_XGB_TREES` | sidecar | `"200"` | `scripts/mokapot_worker.py:62` |
-| `OMP_NUM_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs:93`, `scripts/nn_rescore_worker.py:674`, `scripts/nn_rescore_worker.py:675` |
-| `PATH` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:306` |
-| `ProgramFiles` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:214` |
-| `ProgramFiles(x86)` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs:215` |
-| `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs:265` |
+| `CONDA_PREFIX` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
+| `DEEPLC_FT_THREADS` | sidecar | `"8"` | `scripts/deeplc_finetune.py::<module>` |
+| `HOME` | engine | computed: set by the operating system; on Unix and macOS the per-user cache directory under it holds the engine's caches when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
+| `LOCALAPPDATA` | engine | computed: set by Windows; `%LOCALAPPDATA%\mumdia\cache` holds the engine's caches when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
+| `MUMDIA_BREW_ITERS` | sidecar | `"20"` | `scripts/mokapot_worker.py::make_model` |
+| `MUMDIA_CACHE_DIR` | engine | computed: the per-user cache directory: `$XDG_CACHE_HOME/mumdia` or `~/.cache/mumdia` (Linux and other Unix), `~/Library/Caches/mumdia` (macOS), `%LOCALAPPDATA%\mumdia\cache` (Windows). A path moves the `"auto"` caches there; `off` / `0` / `false` / `none` turns them off (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
+| `MUMDIA_CACHE_MAX_GB` | engine | computed: 100 (GiB): the library and DeepLC projection caches together, least recently used entries removed first, none used within the last hour. `0` or `unlimited` is no bound (`cache.rs` `budget`) | `rust/mumdia/crates/mumdia/src/cache.rs::budget` |
+| `MUMDIA_CHROM_ROW_GROUP_ROWS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/chromatograms.rs::row_group_rows` |
+| `MUMDIA_CONVERT_THREADS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/convert.rs::convert_threads` |
+| `MUMDIA_DEEPLC_RAW_OUTPUT` | sidecar | `""` | `scripts/deeplc_finetune.py::quiet_deeplc_progress`, `scripts/deeplc_worker.py::quiet_deeplc_progress` |
+| `MUMDIA_DEEPLC_THREAD_CAP` | both | `"auto"` | `rust/mumdia/crates/mumdia/src/sched.rs::auto_overlap_threads`, `scripts/deeplc_finetune.py::deeplc_thread_cap`, `scripts/deeplc_worker.py::deeplc_thread_cap` |
+| `MUMDIA_ENTRAPMENT_MODEL` | sidecar | `"gbm"` | `scripts/entrapment_worker.py::_new_model` |
+| `MUMDIA_KEEP_HANDOFF` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::keep_handoff` |
+| `MUMDIA_LR_C` | sidecar | `"1.0"` | `scripts/mokapot_worker.py::make_model` |
+| `MUMDIA_LR_MAX_ITER` | sidecar | `"1000"` | `scripts/mokapot_worker.py::make_model` |
+| `MUMDIA_MOKAPOT_WORKERS` | sidecar | `"3"` | `scripts/mokapot_worker.py::main` |
+| `MUMDIA_MSCONVERT` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate_msconvert` |
+| `MUMDIA_NN_ALPHA` | sidecar | `"1e-4"` | `scripts/mokapot_worker.py::make_model` |
+| `MUMDIA_NN_BATCH` | sidecar | `4096` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_CHUNK` | sidecar | `250000` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_CLAMP_TINY` | sidecar | `1e-20` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_DEBUG_DENORMALS` | sidecar | `0` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_DEVICE` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_DROPOUT` | sidecar | `0.3` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_DROP_CONSTANT` | sidecar | `1` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_EARLY_STOP` | sidecar | `1` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_EARLY_STOP_TOL` | sidecar | `0.01` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_EPOCHS` | sidecar | `25` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_FEATURES` | sidecar | `""` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_FINAL_POOL_SCORE` | sidecar | `0` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_FLUSH_DENORMAL` | sidecar | `1` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_FOLDS` | sidecar | `3` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_FOLD_KEYS` | sidecar | `""` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_GATHER` | sidecar | `"torch"` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_HIDDEN` | sidecar | `"128,64"` in nn_rescore_worker.py; `"128,64,64,32"` in mokapot_worker.py | `scripts/mokapot_worker.py::make_model`, `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_INIT_FDR_MAX` | sidecar | `0.05` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_INIT_SAMPLE` | sidecar | `300000` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_INIT_TOPK` | sidecar | `0` | `scripts/nn_rescore_worker.py::_build_trainer.run_fold` |
+| `MUMDIA_NN_ITERS` | sidecar | `5` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_LOAD_THREADS` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_LR` | sidecar | `1e-3` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_MARGIN_FRAC` | sidecar | `0.5` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_MAX_ITER` | sidecar | `"200"` | `scripts/mokapot_worker.py::make_model` |
+| `MUMDIA_NN_NEG_RATIO` | sidecar | `0.0` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_NEG_SELECT` | sidecar | `"random"` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_PARALLEL` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_PARALLEL_THREADS` | sidecar | `""` | `scripts/nn_rescore_worker.py::_train_in_processes` |
+| `MUMDIA_NN_PREGATHER_GB` | sidecar | `8` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_PRE_BUFFER` | sidecar | `1` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_READ_AHEAD` | sidecar | `1` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_SCAN_MEM_GB` | sidecar | `1.0` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_SCAN_ROWS_PER_THREAD` | sidecar | `20000` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_SCAN_THREADS` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_SEED` | sidecar | `0` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_SEEDS` | sidecar | `1` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_SELECT` | sidecar | `"window"` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_SOLVER` | sidecar | `"adam"` | `scripts/mokapot_worker.py::make_model` |
+| `MUMDIA_NN_STREAM` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_STREAM_GB` | sidecar | `4` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs::apply_threads`, `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_THREAD_CAP` | sidecar | `"auto"` | `scripts/nn_rescore_worker.py::torch_thread_cap` |
+| `MUMDIA_NN_TRAIN_FDR` | sidecar | `0.01` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_TRAIN_SUB` | sidecar | `0.0` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_WARM_EPOCHS` | sidecar | `0` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_WARM_START` | sidecar | `0` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_NN_WD` | sidecar | `1e-4` | `scripts/nn_rescore_worker.py::main` |
+| `MUMDIA_PARQUET_COMPRESSION` | engine | computed: snappy. `zstd`, or `uncompressed` / `none`, changes the codec (`table.rs` `codec`) | `rust/mumdia/crates/mumdia-io/src/table.rs::codec` |
+| `MUMDIA_PARQUET_DECODE_THREADS` | engine | computed: automatic column groups, up to the codec pool's threads; one reader for a coalesced scan or inside a rayon pool. `k` asks for k groups, `1` is one reader (`table.rs` `automatic_decode_groups`) | `rust/mumdia/crates/mumdia-io/src/table.rs::TableFile::scan_spec` |
+| `MUMDIA_PARQUET_PLAN` | engine | computed: on (capped writers plan their float encodings). `0` / `off` / `false` / `no` restores the unplanned layout (`table.rs` `plan_enabled`) | `rust/mumdia/crates/mumdia-io/src/table.rs::plan_enabled` |
+| `MUMDIA_PARQUET_THREADS` | engine | computed: min(`--threads`, 8), or min(cores, 8) without `--threads`. `0` or `1` is serial (`codec.rs` `codec_threads`) | `rust/mumdia/crates/mumdia-io/src/codec.rs::codec_threads` |
+| `MUMDIA_PEPTDEEP_DEVICE` | sidecar | `"auto"` | `scripts/peptdeep_worker.py::main` |
+| `MUMDIA_PREDICT_FRAG_CONCURRENT` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/predict_frag.rs::assign_predictions` |
+| `MUMDIA_PYTHON` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
+| `MUMDIA_PYTHON_DEEPLC` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
+| `MUMDIA_PYTHON_IM2DEEP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
+| `MUMDIA_PYTHON_MBR` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
+| `MUMDIA_PYTHON_MS2PIP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
+| `MUMDIA_PYTHON_PEPTDEEP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
+| `MUMDIA_PYTHON_RESCORE` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
+| `MUMDIA_QUANT_SELECTIVE_READ` | engine | computed: on (quant skips, unread, the chromatogram data pages that hold no kept row). `0` reads every page of every row group it opens; the outputs are the same (`stages/quant.rs` `selective_read_enabled`) | `rust/mumdia/crates/mumdia/src/stages/quant.rs::selective_read_enabled` |
+| `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_hashed`, `scripts/mokapot_worker.py::main`, `scripts/mokapot_worker.py::make_model` |
+| `MUMDIA_SCRIPTS` | sidecar | `os.path.dirname(os.path.abspath(__file__` | `scripts/mh_shard_predict.py::<module>` |
+| `MUMDIA_SIDECAR_DIR` | engine | computed: `<out-dir>/sidecar_work` under `run` and `run-experiment`; `sidecar_work` in the current directory, or `--work-dir`, for `mumdia rescore`. A path moves the rescore sidecar files there (`stages/rescore.rs` `sidecar_work_dir`) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::sidecar_work_dir` |
+| `MUMDIA_SIDECAR_SPACE_CHECK` | engine | computed: on (before the handoff is written, a rescore sidecar run is refused when its work directory has less room than a PIN or raw handoff cannot be smaller than, and warned about below the files' usual size). `0` / `off` / `false` / `no` skips the check (`stages/rescore.rs` `check_sidecar_space`) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::check_sidecar_space` |
+| `MUMDIA_THERMO_PARSER` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate_parser` |
+| `MUMDIA_WIDE_SCAN` | engine | computed: `plain`: the plain reader with its parallel decode for rescore's feature stream and compete's pass-through copy. `rowgroup` decodes the feature stream one row group a batch; `coalesced` reads each row group's projected column chunks in one sequential read (`stages/mod.rs` `WideScan`) | `rust/mumdia/crates/mumdia/src/stages/mod.rs::WideScan::from_env` |
+| `MUMDIA_XGB_DEPTH` | sidecar | `"6"` | `scripts/mokapot_worker.py::make_model` |
+| `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker.py::make_model` |
+| `MUMDIA_XGB_LR` | sidecar | `"0.1"` | `scripts/mokapot_worker.py::make_model` |
+| `MUMDIA_XGB_TREES` | sidecar | `"200"` | `scripts/mokapot_worker.py::make_model` |
+| `OMP_NUM_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs::apply_threads`, `scripts/nn_rescore_worker.py::main` |
+| `PATH` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate` |
+| `ProgramFiles` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate_msconvert` |
+| `ProgramFiles(x86)` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate_msconvert` |
+| `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
+| `XDG_CACHE_HOME` | engine | computed: set by the desktop environment, often unset; an absolute value puts the engine's caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 
-69 variables are read: 19 engine-side, 53 sidecar-side, 3 on both sides.
+96 variables are read: 35 engine-side, 65 sidecar-side, 4 on both sides.
 
 ### Variables the code sets
 
@@ -904,25 +980,25 @@ one exception noted in its own help text: it sets `MUMDIA_NN_THREADS` and
 
 | Variable | Set by | Value | Site |
 |---|---|---|---|
-| `KMP_DUPLICATE_LIB_OK` | sidecar | `"TRUE"` | `scripts/deeplc_finetune.py:28` |
-| `MKL_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:31` |
-| `MUMDIA_NN_FOLDS` | engine | `p.cfg.folds.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2236` |
-| `MUMDIA_NN_FOLD_KEYS` | engine | `foldkeys` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2263` |
-| `MUMDIA_NN_ITERS` | engine | `p.cfg.num_iter.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2237` |
-| `MUMDIA_NN_MARGIN_FRAC` | engine | `p.cfg.train_margin_frac.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2261` |
-| `MUMDIA_NN_NEG_RATIO` | engine | `p.cfg.train_neg_ratio.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2242` |
-| `MUMDIA_NN_NEG_SELECT` | engine | `match p.cfg.train_neg_select { mumdia_core::config::NegSelect::Random => "random", mumdia_core::config::NegSelect::Margin => "margin", mumdia_core::config::NegSelect::Hybrid => "hybrid", }` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2243` |
-| `MUMDIA_NN_SEEDS` | engine | `p.cfg.seeds.max(1).to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2262` |
-| `MUMDIA_NN_THREADS` | engine | `n.to_string()` | `rust/mumdia/crates/mumdia/src/main.rs:94` |
-| `MUMDIA_NN_TRAIN_FDR` | engine | `p.cfg.train_fdr.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2238` |
-| `MUMDIA_NN_TRAIN_SUB` | engine | `p.cfg.train_subsample.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2251` |
-| `MUMDIA_NN_WARM_EPOCHS` | engine | `p.cfg.train_warm_epochs.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2260` |
-| `MUMDIA_NN_WARM_START` | engine | `if p.cfg.train_warm_epochs > 0 { "1" } else { "0" }` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2252` |
-| `NUMEXPR_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:32` |
-| `OMP_NUM_THREADS` | both | `"1"` in deeplc_finetune.py; `n.to_string()` in main.rs | `rust/mumdia/crates/mumdia/src/main.rs:94`, `scripts/deeplc_finetune.py:29` |
-| `OPENBLAS_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py:30` |
-| `PYTHONIOENCODING` | engine | `"utf-8"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:618` |
-| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/sidecar.rs:618`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:1619`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs:2230` |
+| `KMP_DUPLICATE_LIB_OK` | sidecar | `"TRUE"` | `scripts/deeplc_finetune.py::<module>` |
+| `MKL_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py::<module>` |
+| `MUMDIA_NN_FOLDS` | engine | `p.cfg.folds.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
+| `MUMDIA_NN_FOLD_KEYS` | engine | `foldkeys` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
+| `MUMDIA_NN_ITERS` | engine | `p.cfg.num_iter.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
+| `MUMDIA_NN_MARGIN_FRAC` | engine | `p.cfg.train_margin_frac.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
+| `MUMDIA_NN_NEG_RATIO` | engine | `p.cfg.train_neg_ratio.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
+| `MUMDIA_NN_NEG_SELECT` | engine | `match p.cfg.train_neg_select { mumdia_core::config::NegSelect::Random => "random", mumdia_core::config::NegSelect::Margin => "margin", mumdia_core::config::NegSelect::Hybrid => "hybrid", }` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
+| `MUMDIA_NN_SEEDS` | engine | `p.cfg.seeds.max(1).to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
+| `MUMDIA_NN_THREADS` | engine | `n.to_string()` | `rust/mumdia/crates/mumdia/src/main.rs::apply_threads` |
+| `MUMDIA_NN_TRAIN_FDR` | engine | `p.cfg.train_fdr.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
+| `MUMDIA_NN_TRAIN_SUB` | engine | `p.cfg.train_subsample.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
+| `MUMDIA_NN_WARM_EPOCHS` | engine | `p.cfg.train_warm_epochs.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
+| `MUMDIA_NN_WARM_START` | engine | `if p.cfg.train_warm_epochs > 0 { "1" } else { "0" }` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
+| `NUMEXPR_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py::<module>` |
+| `OMP_NUM_THREADS` | both | `"1"` in deeplc_finetune.py; `n.to_string()` in main.rs | `rust/mumdia/crates/mumdia/src/main.rs::apply_threads`, `scripts/deeplc_finetune.py::<module>` |
+| `OPENBLAS_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py::<module>` |
+| `PYTHONIOENCODING` | engine | `"utf-8"` | `rust/mumdia/crates/mumdia/src/sidecar.rs::run_worker` |
+| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/sidecar.rs::run_worker`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs::free_bytes`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_entrapment_gbm` |
 
 ## Unresolved by the generator
 
@@ -936,54 +1012,16 @@ Every field whose struct has an `impl Default` resolved from the source.
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
-8 environment read(s) whose name is not a literal:
+13 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
 
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:1712: env read via closure of `chunk``
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:3736: env read via closure of `&mut chunk``
-- `rust/mumdia/crates/mumdia/src/stages/extract.rs:3772: env read via closure of `&mut chunk``
-- `rust/mumdia/crates/mumdia/src/stages/run.rs:863: env read via closure of `record_artifact(
-        artifact::PSMS_EXTRACTED.0,
-        artifact::PSMS_EXTRACTED,
-        &psms,
-        npsm,
-        "extract",
-        ch,
-    )?``
-- `rust/mumdia/crates/mumdia/src/stages/run.rs:871: env read via closure of `record_artifact(
-        artifact::CHROMATOGRAMS.0,
-        artifact::CHROMATOGRAMS,
-        &chrom_extract,
-        nchr,
-        "extract",
-        ch,
-    )?``
-- `rust/mumdia/crates/mumdia/src/stages/run.rs:894: env read via closure of `record_artifact(
-            artifact::CHROMATOGRAMS.0,
-            artifact::CHROMATOGRAMS,
-            &chrom,
-            n,
-            "retrace",
-            ch,
-        )?``
-- `rust/mumdia/crates/mumdia/src/stages/run.rs:915: env read via closure of `record_artifact(
-        artifact::FEATURES.0,
-        artifact::FEATURES,
-        &feats,
-        n,
-        "features",
-        ch,
-    )?``
-- `rust/mumdia/crates/mumdia/src/stages/run.rs:932: env read via closure of `record_artifact(
-        artifact::PSMS_COMPETED.0,
-        artifact::PSMS_COMPETED,
-        &competed,
-        n,
-        "compete",
-        ch,
-    )?``
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmRows::push: env read via closure of `&mut self`` (3 reads)
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmStream::push: env read via closure of `&mut self`` (3 reads)
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `chunk.slices_mut()`` (3 reads)
+- `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `runs[r].span_mut(m)`` (3 reads)
+- `rust/mumdia/crates/mumdia/src/stages/rescore.rs::check_sidecar_space: env read of `k``
 
 ## Coverage
 
-20 structs and 224 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 29 enumerations, 1 named profile(s), 69 environment variables read and 19 set.
+20 structs and 241 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 31 enumerations, 1 named profile(s), 96 environment variables read and 19 set.
 
-31 field(s) carry a gating marker in their doc comment. 50 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+33 field(s) carry a gating marker in their doc comment. 50 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

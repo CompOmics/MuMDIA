@@ -5,7 +5,7 @@
 
 --pops is the (pop, candidate_id, peak_rank) table of tims_loss_features.py --save-pops
 (R right-peak rejects, A accepted, Aq abundance-matched accepted, Dm score-matched decoys).
-Per candidate, over its fragment traces (chromatograms v2, per-point `im`) inside the
+Per candidate, over its fragment traces (chromatograms v3, per-point `im`) inside the
 scored peak bounds [elution_lo, elution_hi], and per trace with >= 1 non-zero point:
   n_grid      scan-grid points inside the bounds (peak width)
   n_pts       non-zero points in the peak (sparsity)
@@ -15,6 +15,10 @@ scored peak bounds [elution_lo, elution_hi], and per trace with >= 1 non-zero po
               the candidate's apex 1/K0 (psms_extracted `apex_im`, or --ref im_pred_cal)
 Candidate value = median over its observed traces; the table prints each population's median
 and the AUC of R against Aq and Dm.
+
+Reads the full chromatogram layout only (`extract.chromatogram_schema = 1`, which writes v3
+on 4D data). The default trimmed layout (v4: `rt_axis`, `intensity_trimmed`, `im_trimmed`)
+is refused with that instruction rather than misread.
 """
 import argparse
 import sys
@@ -60,7 +64,12 @@ def main() -> None:
     ex = pd.read_parquet(f"{r}/psms_extracted.parquet", columns=["candidate_id", "peak_rank", a.ref])
     meta = sc[sc.candidate_id.isin(cids)].merge(ex[ex.peak_rank == 0], on="candidate_id") \
         .set_index("candidate_id")
-    ch = pq.read_table(f"{r}/chromatograms.parquet", columns=["candidate_id", "frag_name", "rt", "intensity", "im"],
+    chrom = f"{r}/chromatograms.parquet"
+    names = pq.ParquetFile(chrom).schema_arrow.names
+    if "rt" not in names or "im" not in names:
+        sys.exit(f"{chrom}: not a full-layout 4D table (columns {names}); rerun extract with "
+                 "extract.chromatogram_schema = 1 (chromatograms v3)")
+    ch = pq.read_table(chrom, columns=["candidate_id", "frag_name", "rt", "intensity", "im"],
                        filters=[("candidate_id", "in", cids.tolist())])
     ch = ch.filter(pc.invert(pc.starts_with(ch["frag_name"], "ms1")))
     rows = []

@@ -210,46 +210,26 @@ pub fn run(p: SubLibraryParams) -> Result<SubLibraryStats> {
 
     // Pass 3: the fragment rows of those candidates, ids remapped. Row order is preserved,
     // so a table sorted by `candidate_id` stays sorted.
+    //
+    // Selective when few rows are kept, which is the case this stage exists for (a second
+    // pass keeps 42,684 of 203.5M precursors on the immunopeptidomics library): the
+    // `candidate_id` column is read first, and every other column is decoded only for the
+    // kept rows, through a row selection with the offset index, so the pages that hold no
+    // kept row are skipped rather than decompressed, decoded and filtered away. The kept
+    // rows are then written in exactly the batches the full pass wrote -- one per input
+    // batch of `BATCH_ROWS` rows that kept anything, of the same length -- so the output
+    // file is the same bytes. A table that keeps many rows, or whose kept rows are
+    // scattered into too many runs (an unsorted table), takes the full pass.
     let ft = TableFile::open(p.fragments)?;
-    let mut frag_rows = 0u64;
-    {
-        let reader = ft.batches(None, BATCH_ROWS)?;
-        let schema = reader.schema();
-        let cid_ix = column_index(&schema, "candidate_id", p.fragments)?;
-        let mut w =
-            BatchWriter::with_row_group_rows(p.out_fragments, schema.clone(), ROW_GROUP_ROWS)?;
-        for b in reader {
-            let b = b?;
-            let cid = ids_of(&b, cid_ix, p.fragments)?;
-            let mut mask = Vec::with_capacity(b.num_rows());
-            let mut mapped = Vec::with_capacity(b.num_rows());
-            for i in 0..b.num_rows() {
-                let c = cid.value(i) as usize;
-                if c >= n {
-                    bail!(
-                        "{}: fragment row references candidate_id {c}, outside the library's 0..{n}",
-                        p.fragments
-                    );
-                }
-                let m = new_id[c];
-                mask.push(m != DROPPED);
-                if m != DROPPED {
-                    mapped.push(m);
-                }
-            }
-            if mapped.is_empty() {
-                continue;
-            }
-            let kept = filter_record_batch(&b, &BooleanArray::from(mask))?;
-            let mut cols = kept.columns().to_vec();
-            cols[cid_ix] = Arc::new(UInt32Array::from(mapped));
-            let out = RecordBatch::try_new(schema.clone(), cols)
-                .with_context(|| format!("rebuilding a batch of {}", p.fragments))?;
-            frag_rows += out.num_rows() as u64;
-            w.write(&out)?;
-        }
-        w.close()?;
-    }
+    let selective_plan = if (n_keep as usize).saturating_mul(4) <= n {
+        plan_kept_rows(&ft, p.fragments, &new_id, n)?
+    } else {
+        None
+    };
+    let frag_rows = match selective_plan {
+        Some(plan) => write_selected_fragments(&ft, p.fragments, p.out_fragments, &new_id, &plan)?,
+        None => write_all_fragments(&ft, p.fragments, p.out_fragments, &new_id, n)?,
+    };
     if frag_rows == 0 {
         warn!(
             fragments = %p.fragments,
@@ -277,6 +257,164 @@ pub fn run(p: SubLibraryParams) -> Result<SubLibraryStats> {
         "sub-library: done"
     );
     Ok(stats)
+}
+
+/// Which fragment rows pass 3 keeps, planned from `candidate_id` alone: `(rows, keep)` runs
+/// over the whole table, and the kept-row count of every `BATCH_ROWS`-row input batch,
+/// which is the length of each batch the full pass writes.
+struct KeptRows {
+    runs: Vec<(usize, bool)>,
+    per_batch: Vec<usize>,
+}
+
+/// Plan the selective pass 3 from the `candidate_id` column, with the full pass's checks
+/// and messages in its order. `None` when the kept rows fall into so many runs that the
+/// selection would cost more than it saves (more than one run per 64 rows), which is an
+/// unsorted table; the caller then takes the full pass, which repeats the checks.
+fn plan_kept_rows(
+    ft: &TableFile,
+    fragments: &str,
+    new_id: &[u32],
+    n: usize,
+) -> Result<Option<KeptRows>> {
+    let limit = (ft.nrows / 64).max(64);
+    let mut runs: Vec<(usize, bool)> = Vec::new();
+    let mut per_batch: Vec<usize> = Vec::with_capacity(ft.nrows / BATCH_ROWS + 1);
+    let reader = ft.batches(Some(&["candidate_id"]), BATCH_ROWS)?;
+    let cid_ix = column_index(&reader.schema(), "candidate_id", fragments)?;
+    for b in reader {
+        let b = b?;
+        let cid = ids_of(&b, cid_ix, fragments)?;
+        let mut kept = 0usize;
+        for i in 0..b.num_rows() {
+            let c = cid.value(i) as usize;
+            if c >= n {
+                bail!(
+                    "{fragments}: fragment row references candidate_id {c}, outside the library's 0..{n}"
+                );
+            }
+            let keep = new_id[c] != DROPPED;
+            kept += usize::from(keep);
+            match runs.last_mut() {
+                Some(last) if last.1 == keep => last.0 += 1,
+                _ => runs.push((1, keep)),
+            }
+        }
+        per_batch.push(kept);
+        if runs.len() > limit {
+            return Ok(None);
+        }
+    }
+    Ok(Some(KeptRows { runs, per_batch }))
+}
+
+/// Pass 3 over the kept rows only ([`plan_kept_rows`]); returns the fragment rows written.
+fn write_selected_fragments(
+    ft: &TableFile,
+    fragments: &str,
+    out: &str,
+    new_id: &[u32],
+    plan: &KeptRows,
+) -> Result<u64> {
+    let mut reader = ft.batches_selected(None, BATCH_ROWS, &plan.runs)?;
+    let schema = reader.schema();
+    let cid_ix = column_index(&schema, "candidate_id", fragments)?;
+    let mut w = BatchWriter::with_row_group_rows(out, schema.clone(), ROW_GROUP_ROWS)?;
+    let mut frag_rows = 0u64;
+    let changed = || anyhow!("{fragments} changed while it was being read");
+    let mut cur: Option<RecordBatch> = None;
+    let mut off = 0usize;
+    for &k in &plan.per_batch {
+        if k == 0 {
+            continue;
+        }
+        // The next `k` kept rows, across decoded batches if they straddle one.
+        let mut parts: Vec<RecordBatch> = Vec::new();
+        let mut need = k;
+        while need > 0 {
+            let avail = cur.as_ref().map_or(0, |b| b.num_rows() - off);
+            if avail == 0 {
+                cur = Some(reader.next().ok_or_else(changed)??);
+                off = 0;
+                continue;
+            }
+            let take = need.min(avail);
+            parts.push(cur.as_ref().expect("a batch is current").slice(off, take));
+            off += take;
+            need -= take;
+        }
+        let chunk = if parts.len() == 1 {
+            parts.pop().expect("one part")
+        } else {
+            arrow::compute::concat_batches(&schema, &parts)?
+        };
+        let cid = ids_of(&chunk, cid_ix, fragments)?;
+        let mapped: Vec<u32> = (0..chunk.num_rows())
+            .map(|i| new_id[cid.value(i) as usize])
+            .collect();
+        if mapped.contains(&DROPPED) {
+            return Err(changed());
+        }
+        let mut cols = chunk.columns().to_vec();
+        cols[cid_ix] = Arc::new(UInt32Array::from(mapped));
+        let batch = RecordBatch::try_new(schema.clone(), cols)
+            .with_context(|| format!("rebuilding a batch of {fragments}"))?;
+        frag_rows += batch.num_rows() as u64;
+        w.write(&batch)?;
+    }
+    let leftover = cur.as_ref().map_or(0, |b| b.num_rows() - off);
+    if leftover > 0 || reader.next().is_some() {
+        return Err(changed());
+    }
+    w.close()?;
+    Ok(frag_rows)
+}
+
+/// Pass 3 over every row: each input batch decoded whole and filtered to its kept rows;
+/// returns the fragment rows written.
+fn write_all_fragments(
+    ft: &TableFile,
+    fragments: &str,
+    out: &str,
+    new_id: &[u32],
+    n: usize,
+) -> Result<u64> {
+    let mut frag_rows = 0u64;
+    let reader = ft.batches(None, BATCH_ROWS)?;
+    let schema = reader.schema();
+    let cid_ix = column_index(&schema, "candidate_id", fragments)?;
+    let mut w = BatchWriter::with_row_group_rows(out, schema.clone(), ROW_GROUP_ROWS)?;
+    for b in reader {
+        let b = b?;
+        let cid = ids_of(&b, cid_ix, fragments)?;
+        let mut mask = Vec::with_capacity(b.num_rows());
+        let mut mapped = Vec::with_capacity(b.num_rows());
+        for i in 0..b.num_rows() {
+            let c = cid.value(i) as usize;
+            if c >= n {
+                bail!(
+                    "{fragments}: fragment row references candidate_id {c}, outside the library's 0..{n}"
+                );
+            }
+            let m = new_id[c];
+            mask.push(m != DROPPED);
+            if m != DROPPED {
+                mapped.push(m);
+            }
+        }
+        if mapped.is_empty() {
+            continue;
+        }
+        let kept = filter_record_batch(&b, &BooleanArray::from(mask))?;
+        let mut cols = kept.columns().to_vec();
+        cols[cid_ix] = Arc::new(UInt32Array::from(mapped));
+        let batch = RecordBatch::try_new(schema.clone(), cols)
+            .with_context(|| format!("rebuilding a batch of {fragments}"))?;
+        frag_rows += batch.num_rows() as u64;
+        w.write(&batch)?;
+    }
+    w.close()?;
+    Ok(frag_rows)
 }
 
 #[cfg(test)]
@@ -398,6 +536,112 @@ mod tests {
             TableFile::open(&of2).unwrap().u32("candidate_id").unwrap(),
             vec![0, 0, 1, 1]
         );
+    }
+
+    /// A fragment table of `n_rows` rows over `n_cand` candidates (ascending, or shuffled
+    /// in blocks), written in `row_group`-row groups that do not line up with the pass's
+    /// `BATCH_ROWS` batches, with a string column so the rebuilt batches carry offsets.
+    fn big_fragments(path: &str, n_cand: u32, n_rows: usize, row_group: usize, shuffled: bool) {
+        let mut cid: Vec<u32> = (0..n_rows)
+            .map(|i| (i as u64 * n_cand as u64 / n_rows as u64) as u32)
+            .collect();
+        if shuffled {
+            let mut state = 0x2545_f491_u64;
+            for i in (1..cid.len()).rev() {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                cid.swap(i, (state >> 33) as usize % (i + 1));
+            }
+        }
+        let mut w = mumdia_io::table::TableWriter::new(path).with_row_group_rows(row_group);
+        w.write_cols(vec![
+            Col::U32("candidate_id".into(), cid),
+            Col::F32(
+                "frag_mz".into(),
+                (0..n_rows)
+                    .map(|i| 100.0 + (i % 997) as f32 * 0.5)
+                    .collect(),
+            ),
+            Col::F32(
+                "predicted_intensity".into(),
+                (0..n_rows).map(|i| (i % 13) as f32).collect(),
+            ),
+            Col::Str(
+                "frag_name".into(),
+                (0..n_rows).map(|i| format!("y{}", i % 17)).collect(),
+            ),
+        ])
+        .unwrap();
+        w.close().unwrap();
+    }
+
+    /// The selective pass 3 (read `candidate_id`, decode the rest only where a row is kept,
+    /// rewrite in the full pass's batches) writes the full pass's file, byte for byte, on a
+    /// multi-row-group table whose groups straddle the input batches; an unsorted table
+    /// falls back; a broken id is refused with the full pass's message.
+    #[test]
+    fn the_selective_fragment_pass_writes_the_full_pass_bytes() {
+        let dir = std::env::temp_dir().join(format!("mumdia_sublib_sel_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |t: &str| dir.join(t).to_str().unwrap().to_string();
+        let n = 40_000usize;
+        let f = path("frag_big.parquet");
+        big_fragments(&f, n as u32, 300_000, 50_000, false);
+        // Keep a scattered 3% of the candidates, in runs of one and of several.
+        let mut new_id = vec![DROPPED; n];
+        let mut next = 0u32;
+        for (c, id) in new_id.iter_mut().enumerate() {
+            if c % 37 == 0 || (c % 1_000) < 3 {
+                *id = next;
+                next += 1;
+            }
+        }
+        let ft = TableFile::open(&f).unwrap();
+        let plan = plan_kept_rows(&ft, &f, &new_id, n)
+            .unwrap()
+            .expect("a sorted table plans");
+        assert!(
+            plan.per_batch.len() > 3,
+            "the fixture must span several input batches"
+        );
+        let (a, b) = (path("sel.parquet"), path("all.parquet"));
+        let ra = write_selected_fragments(&ft, &f, &a, &new_id, &plan).unwrap();
+        let rb = write_all_fragments(&ft, &f, &b, &new_id, n).unwrap();
+        assert_eq!(ra, rb);
+        assert!(ra > 0);
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            std::fs::read(&b).unwrap(),
+            "the selective pass wrote other bytes than the full pass"
+        );
+
+        // An unsorted table's kept rows are scattered into too many runs: no plan.
+        let g = path("frag_shuffled.parquet");
+        big_fragments(&g, n as u32, 300_000, 50_000, true);
+        let gt = TableFile::open(&g).unwrap();
+        assert!(plan_kept_rows(&gt, &g, &new_id, n).unwrap().is_none());
+
+        // A broken id: the plan refuses it with the full pass's message.
+        let e = path("frag_bad.parquet");
+        write_table(
+            &e,
+            vec![
+                Col::U32("candidate_id".into(), vec![0, 1, 99]),
+                Col::F32("frag_mz".into(), vec![1.0, 2.0, 3.0]),
+            ],
+        )
+        .unwrap();
+        let et = TableFile::open(&e).unwrap();
+        let small = vec![0u32, DROPPED];
+        let e1 = plan_kept_rows(&et, &e, &small, 2)
+            .err()
+            .unwrap()
+            .to_string();
+        let e2 = write_all_fragments(&et, &e, &path("bad_out.parquet"), &small, 2)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(e1, e2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

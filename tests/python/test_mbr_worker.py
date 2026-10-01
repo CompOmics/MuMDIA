@@ -28,12 +28,17 @@ Dataset layout (built once per session):
 
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
+
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from conftest import (
+    SCRIPTS,
     read_columns,
     run_worker,
     run_worker_ok,
@@ -703,3 +708,151 @@ def test_the_transfer_is_measured_on_the_rescore_selected_peak(tmp_path):
     accepted = {int(c): float(rt) for c, rt in zip(t["candidate_id"], t["observed_rt"])}
     assert 0 in accepted, "the selected concordant peak must carry the transfer"
     assert abs(accepted[0] - concordant(0)) < 1e-6, accepted[0]
+
+
+# ---------------------------------------------------------------------------
+# the worker against the one before the memory and loop changes (Q4)
+# ---------------------------------------------------------------------------
+
+# The worker before the 2026-09-25 survey's Q4: whole-table apex maps, the eager
+# `selected` dict, the per-run label and q test, and the Python loop that flagged the
+# transfers. When a later change moves the outputs on purpose, point this at it.
+MBR_REFERENCE_COMMIT = "6887c41b7ed04ace7eb1d744d750e83bb2c93e9e"
+
+
+def _reference_mbr_worker(tmp_path):
+    """Write the worker at MBR_REFERENCE_COMMIT to tmp_path, or skip without git."""
+    import shutil
+
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is not available to extract the reference worker")
+    root = Path(__file__).resolve().parents[2]
+    proc = subprocess.run(
+        [git, "-C", str(root), "show", MBR_REFERENCE_COMMIT + ":scripts/mbr_worker.py"],
+        capture_output=True,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        pytest.skip("reference commit %s is not in this clone (a shallow checkout?)"
+                    % MBR_REFERENCE_COMMIT[:7])
+    path = tmp_path / "mbr_worker_reference.py"
+    path.write_bytes(proc.stdout)
+    return path
+
+
+def _random_mbr_dataset(d, top_k):
+    """Five runs of 1,500 candidates: targets and decoys, confident in a varying subset of
+    runs, candidates no run is confident in, candidates some runs did not extract, RT
+    offsets between runs and RT-discordant rescuable rows. With `top_k`, runs 0 and 2
+    retain a second peak for some candidates, including ones outside every confident set,
+    and rescore's selected rank is recorded for part of them."""
+    rng = np.random.default_rng(11)
+    n_runs, n = 5, 1500
+    offset = [0.0, 30.0, -20.0, 55.0, 10.0]
+    base = 300.0 + 3.0 * np.arange(n)
+    cols = {k: [] for k in ("candidate_id", "source", "label", "q_value",
+                            "peptidoform", "charge", "protein_group")}
+    run_q, exp_q, sel = [], [], []
+    psms = []
+    for src in range(n_runs):
+        extracted = rng.random(n) > 0.08
+        ids = np.nonzero(extracted)[0]
+        rt = base[ids] + offset[src] + rng.normal(0.0, 1.5, ids.size)
+        discordant = rng.random(ids.size) < 0.1
+        rt[discordant] += rng.choice([-400.0, 400.0], discordant.sum())
+        extra = {"peak_rank": [0] * ids.size, "prelim_score": list(rng.random(ids.size))}
+        ids_l, rt_l = list(ids), list(rt)
+        if top_k and src in (0, 2):
+            second = ids[rng.random(ids.size) < 0.2]
+            for c in second:
+                ids_l.append(int(c))
+                rt_l.append(float(base[c] + offset[src] + rng.normal(0.0, 60.0)))
+                extra["peak_rank"].append(1)
+                extra["prelim_score"].append(float(rng.random()))
+        psms.append(write_psms_table(d / f"psms_{src}.parquet", ids_l, rt_l,
+                                     extra_cols=extra if top_k else None))
+        for c in range(n):
+            cols["candidate_id"].append(c)
+            cols["source"].append(src)
+            cols["label"].append("decoy" if c % 9 == 0 else "target")
+            # Some candidates are never confident; others are confident in a random
+            # subset of the runs.
+            if c % 13 == 0:
+                q = 0.5
+            else:
+                q = 0.001 if rng.random() < 0.6 else float(rng.choice([0.02, 0.2, 0.9]))
+            cols["q_value"].append(q)
+            cols["peptidoform"].append("PEP{}K".format(c % 1400))
+            cols["charge"].append(2 + (c % 3))
+            cols["protein_group"].append("PG{}".format(c % 97))
+            run_q.append(q * 1.5)
+            exp_q.append(q * 0.5)
+            sel.append(int(rng.random() < 0.5) if top_k else 0)
+    extra_int = {"selected_peak_rank": sel} if top_k else None
+    scored = write_scored_table(d / "scored_combined.parquet", cols,
+                                extra_q={"run_psm_q": run_q, "experiment_psm_q": exp_q},
+                                extra_int=extra_int)
+    return scored, ",".join(str(x) for x in psms)
+
+
+@pytest.mark.parametrize("top_k", [False, True])
+def test_the_worker_writes_the_reference_workers_bytes(tmp_path, top_k):
+    """Every output of the current worker is the reference worker's, byte for byte:
+    the transfer table, the augmented scored table, the log lines, and the per-run
+    re-extraction targets. The permuted-RT null depends on the iteration order of the
+    confident-candidate set, so this is also the check that the order survived."""
+    reference = _reference_mbr_worker(tmp_path)
+    scored, psms_csv = _random_mbr_dataset(tmp_path, top_k)
+    env = {"PYTHONPATH": str(SCRIPTS)}
+    common = ["--q-anchor", 0.01, "--min-anchor-runs", 2, "--q-transfer", 0.05, "--seed", 3]
+    outs = {}
+    for tag, worker in (("ref", str(reference)), ("new", "mbr_worker.py")):
+        o = tmp_path / tag
+        o.mkdir()
+        stdout, _ = run_worker_ok(worker, scored, psms_csv, o / "transferred.parquet",
+                                  *common, "--out-scored", o / "scored.parquet", env=env)
+        run_worker_ok(worker, scored, psms_csv, o / "unused.parquet", *common,
+                      "--emit-transfer-targets", o / "targets", env=env)
+        # The log names the output files; compare it with the directory taken out.
+        outs[tag] = (o, stdout.replace(str(o), "<out>"))
+    (ref_dir, ref_out), (new_dir, new_out) = outs["ref"], outs["new"]
+    assert new_out == ref_out
+    n_acc = pq.read_table(ref_dir / "transferred.parquet").num_rows
+    assert n_acc > 0, "the dataset must accept transfers for the comparison to mean much"
+    for name in ("transferred.parquet", "scored.parquet"):
+        assert (new_dir / name).read_bytes() == (ref_dir / name).read_bytes(), name
+    ref_targets = sorted(p.name for p in (ref_dir / "targets").iterdir())
+    assert ref_targets == sorted(p.name for p in (new_dir / "targets").iterdir())
+    assert ref_targets, "the re-extraction tier wrote no target file"
+    for name in ref_targets:
+        assert (new_dir / "targets" / name).read_bytes() == (ref_dir / "targets" / name).read_bytes(), name
+
+
+def test_the_vectorised_flagging_is_the_dict_lookup():
+    """`flag_transfers` flags exactly the rows whose (candidate_id, source) was accepted,
+    with that transfer's q, the later one where a pair was accepted twice, and handles
+    ids at the top of the u32 range."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("mbr_worker_mod", SCRIPTS / "mbr_worker.py")
+    sys.path.insert(0, str(SCRIPTS))
+    try:
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.remove(str(SCRIPTS))
+    rng = np.random.default_rng(5)
+    row_cid = rng.integers(0, 50, 2000).astype(np.uint32)
+    row_src = rng.integers(0, 4, 2000).astype(np.uint32)
+    row_cid[:3] = np.uint32(2**32 - 1)
+    acc_cid = np.concatenate([rng.integers(0, 50, 40), [2**32 - 1, 7, 7]]).astype(np.uint32)
+    acc_src = np.concatenate([rng.integers(0, 4, 40), [row_src[0], 1, 1]]).astype(np.uint32)
+    acc_q = rng.random(len(acc_cid))
+    is_tr, tq = mod.flag_transfers(row_cid, row_src, acc_cid, acc_src, acc_q)
+    acc = {(int(c), int(s)): float(q) for c, s, q in zip(acc_cid, acc_src, acc_q)}
+    want_tr = np.array([(int(c), int(s)) in acc for c, s in zip(row_cid, row_src)])
+    want_q = np.array([acc.get((int(c), int(s)), np.inf) for c, s in zip(row_cid, row_src)])
+    assert np.array_equal(is_tr, want_tr)
+    assert np.array_equal(tq, want_q)
+    e_tr, e_q = mod.flag_transfers(row_cid, row_src, acc_cid[:0], acc_src[:0], acc_q[:0])
+    assert not e_tr.any() and np.isinf(e_q).all()

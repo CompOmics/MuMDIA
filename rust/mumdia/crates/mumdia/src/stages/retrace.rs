@@ -607,6 +607,13 @@ pub fn run(p: RetraceParams) -> Result<u64> {
     // margin, for the nearest-MS1-frame lookup) and hold them: about the raw size of that
     // part of the run, whatever the number of trace points (HYE has 30x E. coli's).
     let ch = TableFile::open(p.chromatograms)?;
+    if !ch.has_column("rt") {
+        bail!(
+            "{}: chromatograms v2 layout; retrace reads v1, so extract with \
+             extract.chromatogram_schema = 1 (run and run-experiment do this under retrace)",
+            p.chromatograms
+        );
+    }
     if !ch.has_column("im") {
         bail!(
             "{}: no per-point `im` column; retrace needs a 4D (diaPASEF) run",

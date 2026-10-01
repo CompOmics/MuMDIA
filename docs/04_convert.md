@@ -319,7 +319,7 @@ acquisition does not inflate them.
 | `artifact::SPECTRA_MS1/_MS2/ISOLATION_WINDOWS/MS2_TO_MS1` | `schema.rs:7-10` | Frozen `(name, version)` schema identifiers, all v1. |
 | `Col` / `write_table` | `table.rs:23` / `table.rs:166` | Typed columns and the SNAPPY Parquet writer; rejects duplicate names (`table.rs:172-180`) and unequal column lengths (`table.rs:181-191`). |
 | `ArtifactReport` | `report.rs:11` | The report struct written next to each artifact. |
-| `load_ms2` / `load_ms1` | `spectra.rs:101` / `spectra.rs:175` | Read-back into `Ms2Scan` / `Ms1Scan`, RT-sorted; m/z is kept at the artifact's f32 width in both and widened by the consumers at the comparison. Per-scan peak count is `mf.len().min(iff.len())` (`spectra.rs:133`), tolerant of an m/z vs intensity length mismatch. Neither loader reads the `id` column. |
+| `load_ms2` / `load_ms1` | `spectra.rs` | Read-back into `Ms2Scan` / `Ms1Scan`, RT-sorted; m/z is kept at the artifact's f32 width in both and widened by the consumers at the comparison. Per-scan peak count is `mf.len().min(iff.len())`, tolerant of an m/z vs intensity length mismatch, and a null list is an empty scan. Neither loader reads the `id` column. Decoded in parallel: the table is cut into row-contiguous parts (`TableFile::row_parts`, which splits even the one row group `convert` writes, because `convert` writes an offset index and a part's reader then skips the pages before its range), at most 8 of them (`DECODE_PARTS_MAX`: each concurrent decoder costs about 14 MB of working set), and the parts are concatenated in file order before the stable RT sort, so the scans are the serial decode's bit for bit. The peak lists are read through the borrowed `ListF32` view instead of one `ArrayRef` per row. AIF MS2 (465,806 scans, 39.6M peaks) at 16 threads: 600-690 ms to 156-179 ms. Each decode logs `spectra: decoded MS2` or `spectra: decoded MS1` with its scan, peak and part counts and `elapsed_ms`. |
 | `Ms1Scan` / `Ms2Scan` | `spectra.rs:23` / `types.rs:78` | Read-back structs. `Ms1Scan` (scan_index, rt_seconds, mz, intensity) is defined in `spectra.rs`, not `types.rs`; `Ms2Scan` (adds `window`, `peaks`) is in `types.rs`. |
 
 ## Configuration
@@ -690,6 +690,21 @@ discarded as "exited successfully but wrote no file" (doxy, 2026-09-06).
 For a directory input the newest mtime *inside* the directory is used, one level
 deep, because a `.d` directory's own mtime does not necessarily change when a
 contained acquisition file is rewritten.
+
+`run` and `run-experiment` convert every vendor input before the first run starts.
+They used to do so one file after another, so an experiment of N `.raw` files paid N
+converter runs of several minutes each before any search began. `raw::ensure_mzml_all`
+now converts up to `convert.parallel_conversions` files at once (default 4; `1` is the
+old serial loop). Each conversion is its own child process writing its own
+destination under its own lock, so the returned paths and the files behind them are
+the ones the serial loop produced; only the wall time changes. The paths keep the
+input order, a failure is reported for the first failing input in that order, and no
+conversion starts after one has failed. The bound exists because a converter reads a
+multi-GB file and writes a larger one, and more concurrent conversions than the disk
+can feed are slower, not faster. A reused mzML costs no slot worth mentioning, so the
+setting only matters on the first conversion of an input. Not measured at scale: to
+size it on a new host, time the conversion phase of one experiment at `1` and at the
+default.
 
 ### Peak picking
 

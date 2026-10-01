@@ -9,8 +9,8 @@ use anyhow::Result;
 use mumdia_core::config::Config;
 use mumdia_core::manifest::Manifest;
 use mumdia_core::schema::artifact;
-use mumdia_io::record_artifact;
 use mumdia_io::report::ArtifactReport;
+use mumdia_io::{record_artifact, record_artifact_with_hash};
 use tracing::{info, warn};
 
 use crate::stages::*;
@@ -35,6 +35,16 @@ pub struct RunParams<'a> {
     pub lib_fragments: Option<&'a str>,
     pub max_spectra: usize,
     pub top_peaks_ms2: usize,
+}
+
+/// A library-input artifact record waiting for its input hash (see `run`).
+struct LibraryInputRecord {
+    /// The artifact schema; its name is also the manifest's logical name.
+    schema: (&'static str, u32),
+    path: String,
+    rows: u64,
+    /// The manifest input role whose hash is this file's content hash.
+    input_role: &'static str,
 }
 
 /// Validate inputs and sidecar configuration before any multi-minute compute,
@@ -129,6 +139,8 @@ fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
 
 pub fn run(p: RunParams) -> Result<()> {
     let t0 = Instant::now();
+    // The time from here to the first stage, by step (`prestage::PreStageTimer`).
+    let mut pre = crate::prestage::PreStageTimer::start("run");
     // Fill in the sidecar interpreters and the worker directory before anything is
     // validated or hashed, so every stage sees a concrete path and the manifest
     // records the interpreter that actually ran rather than the word "auto".
@@ -137,37 +149,51 @@ pub fn run(p: RunParams) -> Result<()> {
         crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
     crate::python::resolve(&mut resolved)?;
     crate::stages::quant::apply_diapasef_quant(&mut resolved.quant, &[p.mzml]);
+    pre.step("resolve_interpreters");
     let cfg = &resolved;
     preflight(&p, cfg)?;
+    pre.step("preflight");
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
     std::fs::create_dir_all(p.out_dir).ok();
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
 
     let mut man = Manifest::new(cfg.canonical_json(), ch.clone());
     info!(provenance = %man.provenance(), "run: build provenance");
-    // Hash the inputs before any of them is read for compute. This is what lets a
-    // result be tied back to the exact bytes it came from; recording only the path
-    // does not, because a path is reused. Cost is one sequential read per input at
-    // blake3 speed, and the file is about to be read again anyway, so it comes off
-    // a warm cache.
-    for (role, path) in [
-        ("mzml", Some(p.mzml)),
-        ("fasta", p.fasta),
-        ("lib_precursors", p.lib_precursors),
-        ("lib_fragments", p.lib_fragments),
-    ] {
-        let Some(path) = path else { continue };
-        match (
-            std::fs::metadata(path).map(|m| m.len()),
-            mumdia_io::hash::blake3_file(path),
-        ) {
-            (Ok(bytes), Ok(hash)) => man.record_input(role, path, bytes, hash),
-            // A missing or unreadable input is already a preflight error; if it
-            // somehow becomes unreadable here, an incomplete manifest is a worse
-            // outcome than a warning.
-            _ => warn!(role, path, "run: could not hash input for the manifest"),
-        }
-    }
+    // Hash the inputs, starting now, before any stage reads them. This is what ties a
+    // result to the exact bytes it came from; recording only the path does not, because a
+    // path is reused. The hash is the FIRST read of each input, so it is the cold one: on
+    // a large library it is minutes of sequential I/O, and it used to sit on the critical
+    // path before the first stage, one input after another. It runs on a background thread
+    // instead, in the order the stages below read the files, and is joined only when the
+    // manifest is written, so the manifest records exactly what the serial loop recorded
+    // (`prestage::InputHashes`). A missing input is a preflight error; one that becomes
+    // unreadable since then is left out of the manifest with a warning, as before.
+    let input_hashes = crate::prestage::InputHashes::spawn(
+        "run",
+        [
+            ("mzml", Some(p.mzml)),
+            ("fasta", p.fasta),
+            ("lib_precursors", p.lib_precursors),
+            ("lib_fragments", p.lib_fragments),
+        ]
+        .into_iter()
+        .filter_map(|(role, path)| path.map(|x| (role.to_string(), x.to_string())))
+        .collect(),
+    );
+    // The two library-input records, completed once the input hashes are joined: they are
+    // the same files, so their content hash IS the input hash, and hashing them here as
+    // well read a multi-GB library a second time before the first stage. A later stage
+    // that records an adapted precursor table under the same logical name wins, exactly as
+    // it did when this record was inserted first and then overwritten (end of `run`).
+    let mut library_input_records: Vec<LibraryInputRecord> = Vec::new();
+    pre.step("provenance");
+
+    // A FASTA build may leave DeepLC to the multi-head calibration, which re-predicts every
+    // row before anything reads the iRT (`predict_frag.defer_deeplc_to_multihead`).
+    let rt_placeholder = cfg.defers_library_deeplc(
+        p.lib_precursors.is_some(),
+        cfg.predict_frag.deeplc_python.is_some(),
+    );
 
     // --- experiment-wide artifacts: the spectral library ---
     // Either digest the FASTA (default) or consume a prebuilt library
@@ -183,87 +209,138 @@ pub fn run(p: RunParams) -> Result<()> {
             );
             let np = mumdia_io::table::nrows(lp)?;
             let nf = mumdia_io::table::nrows(lf)?;
-            man.record(record_artifact(
-                artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                artifact::FRAGMENT_LIBRARY_PRECURSORS,
-                lp,
-                np,
-                "library-input",
-                &ch,
-            )?);
-            man.record(record_artifact(
-                artifact::FRAGMENT_LIBRARY_FRAGMENTS.0,
-                artifact::FRAGMENT_LIBRARY_FRAGMENTS,
-                lf,
-                nf,
-                "library-input",
-                &ch,
-            )?);
+            library_input_records.push(LibraryInputRecord {
+                schema: artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                path: lp.to_string(),
+                rows: np,
+                input_role: "lib_precursors",
+            });
+            library_input_records.push(LibraryInputRecord {
+                schema: artifact::FRAGMENT_LIBRARY_FRAGMENTS,
+                path: lf.to_string(),
+                rows: nf,
+                input_role: "lib_fragments",
+            });
             (lp.to_string(), lf.to_string())
         }
         _ => {
             // Build the library from the FASTA digest. preflight guarantees the
             // FASTA is present in this branch.
             let fasta = p.fasta.expect("preflight guarantees --fasta in build mode");
-            let dig = d("peptides.parquet");
-            let n = digest::run(digest::DigestParams {
-                fasta,
-                out: &dig,
-                cfg: &cfg.digest,
-                rng_seed: cfg.rng_seed,
-                config_hash: &ch,
-            })?;
-            man.record(record_artifact(
-                artifact::PEPTIDES.0,
-                artifact::PEPTIDES,
-                &dig,
-                n,
-                "digest",
-                &ch,
-            )?);
-
-            let pf = d("peptidoforms.parquet");
-            let n = peptidoforms::run(peptidoforms::PeptidoformsParams {
-                peptides: &dig,
-                out: &pf,
-                cfg: &cfg.peptidoforms,
-                config_hash: &ch,
-            })?;
-            man.record(record_artifact(
-                artifact::PEPTIDOFORMS.0,
-                artifact::PEPTIDOFORMS,
-                &pf,
-                n,
-                "peptidoforms",
-                &ch,
-            )?);
-
             let lib_p = d("fragment_library_precursors.parquet");
             let lib_f = d("fragment_library_fragments.parquet");
-            let (np, nf) = predict_frag::run(predict_frag::PredictFragParams {
-                peptidoforms: &pf,
-                out_precursors: &lib_p,
-                out_fragments: &lib_f,
-                work_dir: &d("sidecar_work"),
-                cfg: &cfg.predict_frag,
-                config_hash: &ch,
-            })?;
-            man.record(record_artifact(
-                artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                artifact::FRAGMENT_LIBRARY_PRECURSORS,
-                &lib_p,
-                np,
-                "predict-frag",
-                &ch,
-            )?);
-            man.record(record_artifact(
-                artifact::FRAGMENT_LIBRARY_FRAGMENTS.0,
-                artifact::FRAGMENT_LIBRARY_FRAGMENTS,
-                &lib_f,
-                nf,
-                "predict-frag",
-                &ch,
-            )?);
+            // `predict_frag.library_cache`: a library stored by an earlier run with the same
+            // FASTA, build settings, predictor versions and engine is published here instead
+            // of being built (`library_cache`).
+            let cache = crate::library_cache::LibraryCache::for_config(
+                cfg,
+                fasta,
+                rt_placeholder,
+                (&man.mumdia_version, &man.git_sha),
+            );
+            if let Some((wp, wf)) = cache.as_ref().and_then(|c| c.restore(&lib_p, &lib_f)) {
+                pre.first_stage("library-cache");
+                // A reused output directory may still hold an earlier build's digest and
+                // peptidoforms, which did not produce this library.
+                crate::library_cache::remove_build_intermediates(p.out_dir);
+                man.record(wp.record(
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    &lib_p,
+                    "library-cache",
+                    &ch,
+                ));
+                man.record(wf.record(
+                    artifact::FRAGMENT_LIBRARY_FRAGMENTS.0,
+                    artifact::FRAGMENT_LIBRARY_FRAGMENTS,
+                    &lib_f,
+                    "library-cache",
+                    &ch,
+                ));
+            } else {
+                let dig = d("peptides.parquet");
+                pre.first_stage("digest");
+                let w = digest::run_hashed(digest::DigestParams {
+                    fasta,
+                    out: &dig,
+                    cfg: &cfg.digest,
+                    rng_seed: cfg.rng_seed,
+                    config_hash: &ch,
+                })?;
+                man.record(w.record(
+                    artifact::PEPTIDES.0,
+                    artifact::PEPTIDES,
+                    &dig,
+                    "digest",
+                    &ch,
+                ));
+
+                let pf = d("peptidoforms.parquet");
+                let w = peptidoforms::run_hashed(peptidoforms::PeptidoformsParams {
+                    peptides: &dig,
+                    out: &pf,
+                    cfg: &cfg.peptidoforms,
+                    config_hash: &ch,
+                })?;
+                man.record(w.record(
+                    artifact::PEPTIDOFORMS.0,
+                    artifact::PEPTIDOFORMS,
+                    &pf,
+                    "peptidoforms",
+                    &ch,
+                ));
+
+                if cfg.predict_frag.defer_deeplc_to_multihead && !rt_placeholder {
+                    info!(
+                        "run: predict_frag.defer_deeplc_to_multihead is set, but no multi-head \
+                         calibration re-predicts this library (it needs rt_predictor = deeplc \
+                         and a DeepLC interpreter); predicting it with DeepLC as usual"
+                    );
+                }
+                let (wp, wf) = predict_frag::run_hashed(predict_frag::PredictFragParams {
+                    rt_placeholder,
+                    peptidoforms: &pf,
+                    out_precursors: &lib_p,
+                    out_fragments: &lib_f,
+                    work_dir: &d("sidecar_work"),
+                    cfg: &cfg.predict_frag,
+                    config_hash: &ch,
+                })?;
+                man.record(wp.record(
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    &lib_p,
+                    "predict-frag",
+                    &ch,
+                ));
+                man.record(wf.record(
+                    artifact::FRAGMENT_LIBRARY_FRAGMENTS.0,
+                    artifact::FRAGMENT_LIBRARY_FRAGMENTS,
+                    &lib_f,
+                    "predict-frag",
+                    &ch,
+                ));
+                match &cache {
+                    Some(c) => {
+                        c.store(&lib_p, &lib_f);
+                        // A stored library can be several GB: bring the caches back within
+                        // MUMDIA_CACHE_MAX_GB now rather than only at the end of the run.
+                        crate::cache::enforce_for(cfg);
+                    }
+                    None => {
+                        if let Some(hint) =
+                            crate::library_cache::reuse_hint(cfg, &lib_p, &lib_f, rt_placeholder)
+                        {
+                            info!(
+                                "run: to search another file against this library without \
+                                 building it again, pass {hint}, or turn \
+                                 predict_frag.library_cache on (\"auto\" or a directory) and \
+                                 keep --fasta"
+                            );
+                        }
+                    }
+                }
+            }
             (lib_p, lib_f)
         }
     };
@@ -282,6 +359,7 @@ pub fn run(p: RunParams) -> Result<()> {
         p.top_peaks_ms2,
         0
     ));
+    pre.first_stage("convert");
     info!(stage = %"convert", "run: stage start");
     let co = convert::run(convert::ConvertParams {
         mzml: p.mzml,
@@ -292,29 +370,47 @@ pub fn run(p: RunParams) -> Result<()> {
         config_hash: &convert_hash,
         tdf: convert::TdfParams::from_config(&cfg.convert),
     })?;
-    for (name, schema, path) in [
-        ("spectra_ms1", artifact::SPECTRA_MS1, &co.ms1),
-        ("spectra_ms2", artifact::SPECTRA_MS2, &co.ms2),
+    for (name, schema, path, hash) in [
+        (
+            "spectra_ms1",
+            artifact::SPECTRA_MS1,
+            &co.ms1,
+            &co.hashes.ms1,
+        ),
+        (
+            "spectra_ms2",
+            artifact::SPECTRA_MS2,
+            &co.ms2,
+            &co.hashes.ms2,
+        ),
         (
             "isolation_windows",
             artifact::ISOLATION_WINDOWS,
             &co.isolation_windows,
+            &co.hashes.isolation_windows,
         ),
-        ("ms2_to_ms1", artifact::MS2_TO_MS1, &co.ms2_to_ms1),
+        (
+            "ms2_to_ms1",
+            artifact::MS2_TO_MS1,
+            &co.ms2_to_ms1,
+            &co.hashes.ms2_to_ms1,
+        ),
     ] {
         let rows = mumdia_io::table::nrows(path)?;
         // `convert_hash`, not the bare config hash: the manifest is the provenance record,
         // so it must carry the same cap-folded key the artifact's own report does. Stamping
         // `ch` here made two runs differing only in `--top-peaks-ms2` record identical
         // provenance for their spectra, and disagreed with the report written beside them.
-        man.record(record_artifact(
+        // The content hash is the one convert computed for that report.
+        man.record(record_artifact_with_hash(
             name,
             schema,
             path,
             rows,
             "convert",
             &convert_hash,
-        )?);
+            hash.clone(),
+        ));
     }
 
     // The RT model is decided here for both paths: it names the manifest identity, and the
@@ -340,6 +436,10 @@ pub fn run(p: RunParams) -> Result<()> {
                 shared_bands: None,
                 mh_heads,
                 library_input: p.lib_precursors.is_some(),
+                // A single run re-predicts nothing before banding.
+                library_irt_repredicted: false,
+                slices_from: None,
+                irt_placeholder: rt_placeholder,
             })?;
             (
                 pooled.seed,
@@ -352,15 +452,27 @@ pub fn run(p: RunParams) -> Result<()> {
             )
         } else {
             let seed = d("seed_psms.parquet");
+            // Ungrouped: the seed and the extract below are the only readers of the
+            // spectra. Whether the seed's MS2 decode is lent on to extract depends on what
+            // runs between them. A DeepLC step (multi-head calibration, fine-tune or
+            // re-prediction) is where the tallest sidecar of a single run sits, and holding
+            // the scans (~1 GB) across it would add them to the process-tree peak, so then
+            // each stage decodes its own and drops it. Without one, only rt-im-train runs in
+            // between, which holds far less than extract does with the scans resident
+            // anyway, so the decode is kept and lent: one MS2 decode per run instead of two.
+            let rt_sidecar = mh_heads > 0
+                || cfg.rt_im_train.finetune_deeplc
+                || cfg.rt_im_train.repredicts_library_irt(
+                    p.lib_precursors.is_some(),
+                    cfg.predict_frag.deeplc_python.is_some(),
+                );
             info!(stage = %"search-seed", "run: stage start");
-            let n = search_seed::run(search_seed::SearchSeedParams {
+            let (w, seed_ms2) = search_seed::run_returning_scans(search_seed::SearchSeedParams {
+                precursor_span: None,
                 fragment_offset: None,
-                // Ungrouped: the seed and the extract below are the only readers of the
-                // spectra and they run minutes apart, so each decodes its own and drops
-                // it. Sharing here would hold ~1 GB across the retention-time model,
-                // which in a single run is where the tallest sidecar sits.
                 ms2_scans: None,
                 emit_calibrants: false,
+                library: None,
                 ms2: &co.ms2,
                 library_precursors: &lib_p,
                 library_fragments: &lib_f,
@@ -369,14 +481,24 @@ pub fn run(p: RunParams) -> Result<()> {
                 bucket_size: cfg.extract.bucket_size,
                 config_hash: &ch,
             })?;
-            man.record(record_artifact(
+            man.record(w.record(
                 artifact::SEED_PSMS.0,
                 artifact::SEED_PSMS,
                 &seed,
-                n,
                 "search-seed",
                 &ch,
-            )?);
+            ));
+            // Consumed here either way: kept for extract, or freed now, before any sidecar.
+            // (A conditional move would leave the scans alive to the end of this block.)
+            // Only on extract's fragindex matcher: the bucketed one builds a sorted copy of
+            // every library fragment in its load, and extract keeps its decode out of that
+            // transient for the same reason, so scans held from the seed would put it back.
+            let lend = !rt_sidecar
+                && matches!(
+                    cfg.extract.matcher,
+                    mumdia_core::config::MatcherKind::Fragindex
+                );
+            let lent_ms2: Option<Vec<mumdia_core::types::Ms2Scan>> = seed_ms2.filter(|_| lend);
 
             // Optional DeepLC multitask fine-tune: adapt the RT model to this run's
             // confident seed PSMs and rewrite the library's predicted_irt before RT
@@ -409,7 +531,12 @@ pub fn run(p: RunParams) -> Result<()> {
                     cfg.rt_im_train.q_train,
                     cfg.rt_im_train.window_holdout_frac,
                     rayon::current_num_threads(),
+                    cfg.rt_im_train.deeplc_predict_shards,
+                    crate::cache::projection_dir(cfg).as_ref(),
                 )?;
+                if rt_placeholder {
+                    crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
+                }
                 let n_mh = mumdia_io::table::nrows(&lib_p_mh)?;
                 man.record(record_artifact(
                     artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
@@ -448,6 +575,8 @@ pub fn run(p: RunParams) -> Result<()> {
                     // residuals and the window shrinks back toward in-sample optimism.
                     cfg.rt_im_train.window_holdout_frac,
                     cfg.rng_seed,
+                    rayon::current_num_threads(),
+                    cfg.rt_im_train.deeplc_predict_shards,
                 )?;
                 // The fine-tuned precursor table is the artifact actually consumed by
                 // RT calibration and extraction. Replace the base-library manifest entry
@@ -487,6 +616,8 @@ pub fn run(p: RunParams) -> Result<()> {
                     &lib_p,
                     &lib_p_dl,
                     rayon::current_num_threads(),
+                    cfg.rt_im_train.deeplc_predict_shards,
+                    crate::cache::projection_dir(cfg).as_ref(),
                 )?;
                 let n_dl = mumdia_io::table::nrows(&lib_p_dl)?;
                 man.record(record_artifact(
@@ -518,9 +649,9 @@ pub fn run(p: RunParams) -> Result<()> {
                 );
                     } else {
                         tracing::info!(
-                    "run: the multi-head calibration re-predicts the library iRT against this \
+                        "run: the multi-head calibration re-predicts the library iRT against this \
                      run's anchors; skipping the base-model re-prediction it would overwrite"
-                );
+                    );
                     }
                 }
                 lib_p
@@ -538,7 +669,11 @@ pub fn run(p: RunParams) -> Result<()> {
             let windows = d1("run_windows.parquet");
             let cal = d1("cal.json");
             info!(stage = %"rt-im-train", "run: stage start");
-            let n = rt_im_train::run(rt_im_train::RtImTrainParams {
+            // In memory as well as on disk: extract reads the same library, so it takes the
+            // fitted windows as they are instead of decoding the table written here
+            // (`rt_im_train::RtWindows`). The file stays the artifact.
+            let (w, fitted_windows) = rt_im_train::run_in_memory(rt_im_train::RtImTrainParams {
+                precursor_span: None,
                 anchor_irt_from_seed: false,
                 seed_psms: &seed,
                 library_precursors: &lib_p,
@@ -549,35 +684,50 @@ pub fn run(p: RunParams) -> Result<()> {
             })?;
             let refit = cfg.rt_im_train.refit;
             if !refit {
-                man.record(record_artifact(
+                man.record(w.record(
                     artifact::RUN_WINDOWS.0,
                     artifact::RUN_WINDOWS,
                     &windows,
-                    n,
                     "rt-im-train",
                     &ch,
-                )?);
+                ));
             }
+            // Pass 1 is recorded only when it is the run; under the refit, pass 2 is.
             let c1 = extract_to_compete(
                 cfg,
                 &ch,
-                &co,
+                &co.ms2,
+                &co.ms1,
                 &seed,
                 &lib_p,
                 &lib_f,
                 &windows,
+                fitted_windows,
+                lent_ms2,
                 &dir1,
                 (!refit).then_some(&mut man),
             )?;
             if !refit {
-                (seed, lib_p, c1.psms, c1.chrom, c1.feats, c1.competed, None)
+                let chrom = vec![quant::ChromTable::whole(&c1.chrom)];
+                (
+                    seed,
+                    lib_p,
+                    c1.psms,
+                    chrom,
+                    c1.feats,
+                    vec![c1.competed],
+                    None,
+                )
             } else {
+                // Sequential, as the rest of a single run: the pass-1 rescore, the refit on
+                // its accepted targets, then pass 2 into the canonical names.
                 let scored1 = d1("psms_scored.parquet");
                 info!(stage = %"rescore", pass = 1, "run: stage start");
                 rescore::run(rescore::RescoreParams {
                     competed: std::slice::from_ref(&c1.competed),
+                    sources: None,
                     out: &scored1,
-                    work_dir: &d("sidecar_work"),
+                    work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
                     script_dir: &cfg.predict_frag.sidecar_script_dir,
                     cfg: &cfg.rescore,
                     config_hash: &ch,
@@ -616,18 +766,32 @@ pub fn run(p: RunParams) -> Result<()> {
                     "im-rt-refit",
                     &ch,
                 )?);
+                // The pass-2 windows are a new table, so extract reads them from the file,
+                // and decodes the spectra itself.
                 let c2 = extract_to_compete(
                     cfg,
                     &ch,
-                    &co,
+                    &co.ms2,
+                    &co.ms1,
                     &seed,
                     &r.lib,
                     &lib_f,
                     &r.windows,
+                    None,
+                    None,
                     p.out_dir,
                     Some(&mut man),
                 )?;
-                (seed, r.lib, c2.psms, c2.chrom, c2.feats, c2.competed, None)
+                let chrom = vec![quant::ChromTable::whole(&c2.chrom)];
+                (
+                    seed,
+                    r.lib,
+                    c2.psms,
+                    chrom,
+                    c2.feats,
+                    vec![c2.competed],
+                    None,
+                )
             }
         };
     let _ = &feats;
@@ -635,22 +799,25 @@ pub fn run(p: RunParams) -> Result<()> {
 
     let scored = d("psms_scored.parquet");
     info!(stage = %"rescore", "run: stage start");
-    let n = rescore::run(rescore::RescoreParams {
-        competed: std::slice::from_ref(&competed),
+    // One table, or a grouped run's band tables (`groups.pool_competed = false`), which are
+    // all this run's rows: source 0 for every one.
+    let sources = vec![0u32; competed.len()];
+    let w = rescore::run_hashed(rescore::RescoreParams {
+        competed: &competed,
+        sources: (competed.len() > 1).then_some(sources.as_slice()),
         out: &scored,
-        work_dir: &d("sidecar_work"),
+        work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
         script_dir: &cfg.predict_frag.sidecar_script_dir,
         cfg: &cfg.rescore,
         config_hash: &ch,
     })?;
-    man.record(record_artifact(
+    man.record(w.record(
         artifact::PSMS_SCORED.0,
         artifact::PSMS_SCORED,
         &scored,
-        n,
         "rescore",
         &ch,
-    )?);
+    ));
     // Use the rescore artifact report as the source of truth. The configured
     // sidecar may differ from the model that actually ran in compatibility mode,
     // and the report records that distinction.
@@ -672,11 +839,18 @@ pub fn run(p: RunParams) -> Result<()> {
     // default (gated on extract.emit_candidate_audit); adds one cheap join pass.
     if cfg.extract.emit_candidate_audit {
         let audit_out = d("candidate_audit.parquet");
+        if competed.len() != 1 {
+            anyhow::bail!(
+                "the candidate audit reads one competed table, and this run has {}",
+                competed.len()
+            );
+        }
         info!(stage = %"audit", "run: stage start");
         audit::run(audit::AuditParams {
             library_precursors: &lib_p,
             psms: &psms,
-            competed: &competed,
+            // The audit keeps the grouped run's competed table pooled (`run_groups`).
+            competed: &competed[0],
             scored: &scored,
             out: &audit_out,
             q_threshold: 0.01,
@@ -689,7 +863,7 @@ pub fn run(p: RunParams) -> Result<()> {
     let pg_q = d("protein_group_quant.parquet");
     let frag_q = d("fragment_quant.parquet");
     info!(stage = %"quant", "run: stage start");
-    let (nq1, nq2) = quant::run(quant::QuantParams {
+    let wq = quant::run_hashed(quant::QuantParams {
         psms_scored: &scored,
         chromatograms: &chrom,
         out_peptide: &pep_q,
@@ -700,31 +874,42 @@ pub fn run(p: RunParams) -> Result<()> {
         config_hash: &ch,
         cross_run: None,
     })?;
-    man.record(record_artifact(
+    man.record(wq.peptide.record(
         artifact::PEPTIDE_QUANT.0,
         artifact::PEPTIDE_QUANT,
         &pep_q,
-        nq1,
         "quant",
         &ch,
-    )?);
-    man.record(record_artifact(
+    ));
+    man.record(wq.protein.record(
         artifact::PROTEIN_GROUP_QUANT.0,
         artifact::PROTEIN_GROUP_QUANT,
         &pg_q,
-        nq2,
         "quant",
         &ch,
-    )?);
+    ));
+    // The row count from the footer, as before; the hash from quant's own report. Quant
+    // writes the fragment table whenever `out_fragment` is set, which it is here.
     let n_frag_quant = mumdia_io::table::nrows(&frag_q)?;
-    man.record(record_artifact(
-        artifact::FRAGMENT_QUANT.0,
-        artifact::FRAGMENT_QUANT,
-        &frag_q,
-        n_frag_quant,
-        "quant",
-        &ch,
-    )?);
+    man.record(match wq.fragment {
+        Some(wfq) => record_artifact_with_hash(
+            artifact::FRAGMENT_QUANT.0,
+            artifact::FRAGMENT_QUANT,
+            &frag_q,
+            n_frag_quant,
+            "quant",
+            &ch,
+            wfq.content_hash,
+        ),
+        None => record_artifact(
+            artifact::FRAGMENT_QUANT.0,
+            artifact::FRAGMENT_QUANT,
+            &frag_q,
+            n_frag_quant,
+            "quant",
+            &ch,
+        )?,
+    });
 
     // Human-readable report (peptides.tsv + proteins.tsv) + stdout summary.
     let pep_tsv = d("peptides.tsv");
@@ -782,6 +967,45 @@ pub fn run(p: RunParams) -> Result<()> {
         features::feature_schema_id(&features::active_features_for(&cfg.features)),
     );
 
+    // The input hashes, taken on the background thread started at the top, and the
+    // library-input records that share them. A record is inserted only where no later
+    // stage recorded that logical name, which is the map the old order produced: the
+    // library-input record first, then any adapted precursor table overwriting it.
+    let hashes = input_hashes.record(&mut man);
+    for r in library_input_records {
+        let logical = r.schema.0;
+        if man.artifacts.contains_key(logical) {
+            continue;
+        }
+        let rec = match hashes.get(r.input_role) {
+            Some(h) => Ok(record_artifact_with_hash(
+                logical,
+                r.schema,
+                &r.path,
+                r.rows,
+                "library-input",
+                &ch,
+                h.clone(),
+            )),
+            // The input could not be hashed on the thread: try once more here. Every stage
+            // has read the library by now, so a file that is still unreadable became so
+            // during the run, and failing on it would end a finished run without its
+            // manifest. It is left out with a warning instead, as `InputHashes::record`
+            // leaves out the input itself.
+            None => record_artifact(logical, r.schema, &r.path, r.rows, "library-input", &ch),
+        };
+        match rec {
+            Ok(rec) => man.record(rec),
+            Err(e) => warn!(
+                artifact = logical,
+                path = %r.path,
+                error = %format!("{e:#}"),
+                "run: the library input could not be hashed; its artifact record is left out \
+                 of the manifest"
+            ),
+        }
+    }
+
     let manifest_path = d("manifest.json");
     mumdia_io::json::write_json(&manifest_path, &man)?;
 
@@ -790,6 +1014,8 @@ pub fn run(p: RunParams) -> Result<()> {
         manifest = manifest_path,
         "run: pipeline complete"
     );
+    // The DeepLC projection cache may have grown during the run.
+    crate::cache::enforce_for(cfg);
     Ok(())
 }
 
@@ -803,24 +1029,26 @@ pub(crate) struct Chain {
 /// Extract, features and compete into `dir`, recording into `man` when given. Shared by
 /// the single-run orchestrator and `run-experiment`, and by both passes of
 /// `rt_im_train.refit`, which reruns it with the refit windows and library.
+///
+/// `rt_windows` are the windows `rt-im-train` handed over in memory for `windows`
+/// (`rt_im_train::RtWindows`); `lent_ms2` is a seed's MS2 decode lent on to extract, freed
+/// as soon as extract returns, before features. `None` for either reads or decodes it here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_to_compete(
     cfg: &Config,
     ch: &str,
-    co: &convert::ConvertOutputs,
+    ms2: &str,
+    ms1: &str,
     seed: &str,
     lib_p: &str,
     lib_f: &str,
     windows: &str,
+    rt_windows: Option<rt_im_train::RtWindows>,
+    lent_ms2: Option<Vec<mumdia_core::types::Ms2Scan>>,
     dir: &str,
     mut man: Option<&mut Manifest>,
 ) -> Result<Chain> {
     let d = |name: &str| format!("{dir}/{name}");
-    let mut rec = |r: mumdia_core::manifest::ArtifactRecord| {
-        if let Some(m) = man.as_deref_mut() {
-            m.record(r);
-        }
-    };
     let psms_extract = d("psms_extracted.parquet");
     // `retrace.repick` writes the re-picked table beside extract's; the later stages read it.
     let psms_repick = d("psms_extracted.repick.parquet");
@@ -833,11 +1061,11 @@ pub(crate) fn extract_to_compete(
     // `retrace.enabled`: extract's centroid traces go aside and `chromatograms.parquet` is
     // the raw rebuild of them, so every later stage reads the usual path.
     let raw = if cfg.retrace.enabled {
-        Some(retrace::raw_path_from_spectra(&co.ms2)?.ok_or_else(|| {
+        Some(retrace::raw_path_from_spectra(ms2)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "retrace.enabled needs a diaPASEF .d converted by the native reader \
                  (convert.bruker_reader = native); {} was not",
-                co.ms2
+                ms2
             )
         })?)
     } else {
@@ -851,39 +1079,55 @@ pub(crate) fn extract_to_compete(
     } else {
         chrom.clone()
     };
+    // ponytail: retrace reads the v1 chromatogram layout, so extract writes v1 under it;
+    // port retrace's reader to v2 if the centroid table's size matters.
+    let mut ex_cfg = cfg.extract.clone();
+    if raw.is_some() {
+        ex_cfg.chromatogram_schema = 1;
+    }
     info!(stage = %"extract", "run: stage start");
-    let (npsm, nchr) = extract::run(extract::ExtractParams {
+    // The MS2 only (`SharedScans::ms1 = None`): extract decodes the MS1 itself,
+    // concurrently with its library load and after the library's errors, as it does
+    // with nothing lent.
+    let (wpsm, wchr) = extract::run_hashed(extract::ExtractParams {
+        precursor_span: None,
         fragment_offset: None,
         sibling_bands: 1,
-        scans: None,
-        ms2: &co.ms2,
+        rt_windows,
+        scans: lent_ms2
+            .as_deref()
+            .map(|ms2| extract::SharedScans { ms2, ms1: None }),
+        ms2,
         library_precursors: lib_p,
         library_fragments: lib_f,
         run_windows: windows,
-        ms1: Some(&co.ms1),
+        ms1: Some(ms1),
         mass_cal: Some(&format!("{seed}.masscal.json")),
         out_psms: &psms_extract,
         out_chrom: &chrom_extract,
         restrict_candidates: None,
-        cfg: &cfg.extract,
+        cfg: &ex_cfg,
         config_hash: ch,
     })?;
-    rec(record_artifact(
-        artifact::PSMS_EXTRACTED.0,
-        artifact::PSMS_EXTRACTED,
-        &psms_extract,
-        npsm,
-        "extract",
-        ch,
-    )?);
-    rec(record_artifact(
-        artifact::CHROMATOGRAMS.0,
-        artifact::CHROMATOGRAMS,
-        &chrom_extract,
-        nchr,
-        "extract",
-        ch,
-    )?);
+    drop(lent_ms2);
+    if let Some(m) = man.as_deref_mut() {
+        m.record(wpsm.record(
+            artifact::PSMS_EXTRACTED.0,
+            artifact::PSMS_EXTRACTED,
+            &psms_extract,
+            "extract",
+            ch,
+        ));
+        // The version is the written table's: its layout, and whether it carries the
+        // per-point mobility of a 4D run.
+        m.record(wchr.record(
+            artifact::CHROMATOGRAMS.0,
+            crate::chromatograms::recorded_schema(&chrom_extract)?,
+            &chrom_extract,
+            "extract",
+            ch,
+        ));
+    }
     if let Some(raw) = &raw {
         info!(stage = %"retrace", "run: stage start");
         let n = retrace::run(retrace::RetraceParams {
@@ -905,19 +1149,21 @@ pub(crate) fn extract_to_compete(
             cfg: &cfg.retrace,
             config_hash: ch,
         })?;
-        rec(record_artifact(
-            artifact::CHROMATOGRAMS.0,
-            artifact::CHROMATOGRAMS,
-            &chrom,
-            n,
-            "retrace",
-            ch,
-        )?);
+        if let Some(m) = man.as_deref_mut() {
+            m.record(record_artifact(
+                artifact::CHROMATOGRAMS.0,
+                crate::chromatograms::recorded_schema(&chrom)?,
+                &chrom,
+                n,
+                "retrace",
+                ch,
+            )?);
+        }
     }
 
     let feats = d("features.parquet");
     info!(stage = %"features", "run: stage start");
-    let n = features::run(features::FeaturesParams {
+    let wf = features::run_hashed(features::FeaturesParams {
         psms: &psms,
         chromatograms: &chrom,
         seed: Some(seed),
@@ -926,31 +1172,34 @@ pub(crate) fn extract_to_compete(
         cfg: &cfg.features,
         config_hash: ch,
     })?;
-    rec(record_artifact(
-        artifact::FEATURES.0,
-        artifact::FEATURES,
-        &feats,
-        n,
-        "features",
-        ch,
-    )?);
+    if let Some(m) = man.as_deref_mut() {
+        m.record(wf.record(
+            artifact::FEATURES.0,
+            artifact::FEATURES,
+            &feats,
+            "features",
+            ch,
+        ));
+    }
 
     let competed = d("psms_competed.parquet");
     info!(stage = %"compete", "run: stage start");
-    let n = compete::run(compete::CompeteParams {
+    let w = compete::run_hashed(compete::CompeteParams {
         features: &feats,
         out: &competed,
         cfg: &cfg.compete,
         config_hash: ch,
+        features_hash: Some(&wf.content_hash),
     })?;
-    rec(record_artifact(
-        artifact::PSMS_COMPETED.0,
-        artifact::PSMS_COMPETED,
-        &competed,
-        n,
-        "compete",
-        ch,
-    )?);
+    if let Some(m) = man {
+        m.record(w.record(
+            artifact::PSMS_COMPETED.0,
+            artifact::PSMS_COMPETED,
+            &competed,
+            "compete",
+            ch,
+        ));
+    }
     Ok(Chain {
         psms,
         chrom,

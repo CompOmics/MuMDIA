@@ -3,10 +3,10 @@
 //! Extended, and this block must leave the default feature vector untouched.
 //!
 //! Two groups. The scalars come from psms_extracted v4 (`apex_im`, `apex_im_mad`,
-//! `ms1_apex_im`, `im_pred_cal`); the elution group from the per-point 1/K0 of
-//! chromatograms v2, inside the elution peak the other features use. A missing input
-//! gives 0.0, so a 3D run yields constant columns. Targets and decoys go through the same
-//! code; nothing here sees a label.
+//! `ms1_apex_im`, `im_pred_cal`); the elution group from the per-point 1/K0 of the 4D
+//! chromatograms (`im` in v3, `im_trimmed` in v4), inside the elution peak the other
+//! features use. A missing input gives 0.0, so a 3D run yields constant columns. Targets
+//! and decoys go through the same code; nothing here sees a label.
 //!
 //! A third, separately keyed group (`features.im_shape_features`, P7) scores the
 //! mobility peak shape at the apex from psms_extracted v5, which extract fills from the
