@@ -1579,7 +1579,7 @@ pub enum QuantQColumn {
     RunPsmQ,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuantConfig {
     /// Peptide-level q-value cutoff for inclusion.
@@ -1641,6 +1641,18 @@ pub struct QuantConfig {
     /// seconds of the identification apex (instrument-independent alternative to
     /// `fixed_scan_halfwidth`, which it overrides). 0 (default) = off.
     pub fixed_window_s: f64,
+    /// Cross-run fragment weighting (run-experiment only; docs/TIMS_QUANT_ROADMAP.md
+    /// section 4b). Per-run quant runs twice: the first pass exports each fragment's
+    /// area and its apex correlation with the candidate's other fragments; one weight
+    /// per (candidate, fragment) is then fitted over all runs, `1 / (dev + 0.1) *
+    /// max(corr, 0)`, where `dev` is the median absolute deviation of the fragment's
+    /// log-share of the candidate total from its cross-run median and `corr` the median
+    /// correlation; the second pass sums `weight * area` over every fragment, with the
+    /// same weights in every run. Uses no condition labels. A candidate whose weights are
+    /// all zero takes equal weights; a run where the weighted sum is not positive keeps
+    /// the `top_n_fragments` rule. Needs a fixed window (the correlation is taken over
+    /// it). Off by default; on in the diaPASEF preset ([`QuantConfig::diapasef`]).
+    pub cross_run_weights: bool,
 }
 
 /// Fragment ranking for the quant top-N sum. See [`QuantConfig::fragment_selection`].
@@ -1673,6 +1685,25 @@ impl Default for QuantConfig {
             baseline_flank_scans: 12,
             baseline_quantile: 0.25,
             fixed_window_s: 0.0,
+            cross_run_weights: false,
+        }
+    }
+}
+
+impl QuantConfig {
+    /// Quant settings applied to timsTOF (`.d`) input when the `quant` block is left at
+    /// its defaults (docs/TIMS_QUANT_ROADMAP.md sections 4 and 4b). Measured on HYE
+    /// diaPASEF (ProteoBench `quant_lfq_DIA_ion_diaPASEF`, three ID sets) only, so it is
+    /// scoped to that input; every field is an ordinary key another acquisition can set.
+    pub fn diapasef() -> Self {
+        Self {
+            fragment_selection: FragmentSelection::Predicted,
+            interference_envelope: true,
+            fixed_scan_halfwidth: 4,
+            baseline_subtract: true,
+            baseline_quantile: 0.6,
+            cross_run_weights: true,
+            ..Self::default()
         }
     }
 }
@@ -2515,6 +2546,16 @@ impl Config {
                 fixed_scan_halfwidth = self.quant.fixed_scan_halfwidth,
                 "quant: both fixed-window forms are set; the seconds form wins and \
                  fixed_scan_halfwidth is ignored"
+            );
+        }
+        if self.quant.cross_run_weights
+            && self.quant.fixed_scan_halfwidth == 0
+            && self.quant.fixed_window_s == 0.0
+        {
+            tracing::warn!(
+                "quant.cross_run_weights needs a fixed window (quant.fixed_scan_halfwidth or \
+                 quant.fixed_window_s): every fragment correlation is undefined, so every \
+                 candidate falls back to equal weights"
             );
         }
         if self.quant.baseline_subtract

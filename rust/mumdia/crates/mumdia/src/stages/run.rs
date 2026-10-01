@@ -136,6 +136,7 @@ pub fn run(p: RunParams) -> Result<()> {
     resolved.predict_frag.sidecar_script_dir =
         crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
     crate::python::resolve(&mut resolved)?;
+    crate::stages::quant::apply_diapasef_quant(&mut resolved.quant, &[p.mzml]);
     let cfg = &resolved;
     preflight(&p, cfg)?;
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
@@ -697,6 +698,7 @@ pub fn run(p: RunParams) -> Result<()> {
         out_peak_bounds: None,
         cfg: &cfg.quant,
         config_hash: &ch,
+        fragment_weights: None,
     })?;
     man.record(record_artifact(
         artifact::PEPTIDE_QUANT.0,

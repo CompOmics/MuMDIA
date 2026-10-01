@@ -496,6 +496,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     resolved.predict_frag.sidecar_script_dir =
         crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
     crate::python::resolve(&mut resolved)?;
+    crate::stages::quant::apply_diapasef_quant(&mut resolved.quant, p.mzmls);
     let p = RunExperimentParams {
         config: &resolved,
         ..p
@@ -962,6 +963,42 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     qcfg.q_filter = QuantQColumn::PsmQ;
     let mut peptide_quants: Vec<String> = Vec::with_capacity(n_runs);
     let mut protein_quants: Vec<String> = Vec::with_capacity(n_runs);
+    // `quant.cross_run_weights`: a first pass exports every run's fragment areas and apex
+    // correlations, the weights are fitted over all runs, and the second pass below writes
+    // the quantities with them. ponytail: two full passes; cache the areas if quant time matters.
+    let mut frag_tables: Vec<String> = Vec::new();
+    if qcfg.cross_run_weights {
+        for i in 0..n_runs {
+            let ft = d(&format!("{}/fragment_quant.parquet", names[i]));
+            let tmp = |n: &str| d(&format!("{}/{n}.pass1.parquet", names[i]));
+            quant::run(quant::QuantParams {
+                psms_scored: &split_paths[i],
+                chromatograms: &chroms[i],
+                out_peptide: &tmp("peptide_quant"),
+                out_protein: &tmp("protein_group_quant"),
+                out_fragment: Some(&ft),
+                out_peak_bounds: None,
+                cfg: &qcfg,
+                config_hash: &ch,
+                fragment_weights: None,
+            })?;
+            for n in ["peptide_quant", "protein_group_quant"] {
+                let _ = std::fs::remove_file(tmp(n));
+                let _ = std::fs::remove_file(format!("{}.report.json", tmp(n)));
+            }
+            frag_tables.push(ft);
+        }
+    }
+    let weights = if qcfg.cross_run_weights {
+        let w = quant::fit_fragment_weights(&frag_tables)?;
+        info!(
+            candidates = w.len(),
+            "run-experiment: cross-run fragment weights fitted"
+        );
+        Some(w)
+    } else {
+        None
+    };
     for i in 0..n_runs {
         let pq = d(&format!("{}/peptide_quant.parquet", names[i]));
         let gq = d(&format!("{}/protein_group_quant.parquet", names[i]));
@@ -974,6 +1011,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             out_peak_bounds: None,
             cfg: &qcfg,
             config_hash: &ch,
+            fragment_weights: weights.as_ref(),
         })?;
         peptide_quants.push(pq);
         protein_quants.push(gq);

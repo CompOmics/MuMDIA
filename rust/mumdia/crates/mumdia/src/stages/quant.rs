@@ -34,7 +34,13 @@ pub struct QuantParams<'a> {
     pub out_peak_bounds: Option<&'a str>,
     pub cfg: &'a QuantConfig,
     pub config_hash: &'a str,
+    /// Cross-run fragment weights from [`fit_fragment_weights`] (`quant.cross_run_weights`,
+    /// second pass). `None` keeps the per-run `top_n_fragments` rule.
+    pub fragment_weights: Option<&'a FragmentWeights>,
 }
+
+/// One weight per (candidate, fragment name), fitted over every run of an experiment.
+pub type FragmentWeights = HashMap<u32, BTreeMap<String, f64>>;
 
 /// Interned fragment names. A chromatogram table has tens of millions of rows and only a
 /// few dozen distinct fragment names (`y1`..`y30`, `b1`..), so a row carries a name id and
@@ -799,9 +805,57 @@ fn trapezoid_fixed_opts(
     trapezoid_fixed_at(rt, inten, lo, hi, envelope, baseline)
 }
 
+/// Samples `[lo, hi)` after the optional flank-baseline subtraction, clipped at zero, before
+/// any envelope: what [`trapezoid_fixed_at`] integrates and what the cross-run weights
+/// correlate.
+fn baseline_window(
+    inten: &[f32],
+    lo: usize,
+    hi: usize,
+    baseline: Option<(usize, f64)>,
+) -> Vec<f32> {
+    let mut w: Vec<f32> = inten[lo..hi].to_vec();
+    if let Some((flank, quantile)) = baseline {
+        let b = flank_baseline(inten, lo, hi, flank, quantile);
+        for x in w.iter_mut() {
+            *x = (*x - b).max(0.0);
+        }
+    }
+    w
+}
+
+/// Apex correlation of each fragment with the sum of the candidate's other fragments, over
+/// the fixed-window samples (positionally aligned from each window's first sample; shorter
+/// windows are zero-padded). NaN where a fragment has no window. Population Pearson
+/// ([`crate::stats::pearson`]), so a flat window correlates 0.
+fn window_correlations(windows: &[Option<Vec<f32>>]) -> Vec<f64> {
+    let n = windows.iter().flatten().map(|w| w.len()).max().unwrap_or(0);
+    let mut x = vec![vec![0.0f64; n]; windows.len()];
+    for (row, w) in x.iter_mut().zip(windows) {
+        if let Some(w) = w {
+            for (d, &v) in row.iter_mut().zip(w) {
+                *d = v as f64;
+            }
+        }
+    }
+    let total: Vec<f64> = (0..n).map(|k| x.iter().map(|r| r[k]).sum()).collect();
+    windows
+        .iter()
+        .zip(&x)
+        .map(|(w, row)| {
+            if w.is_none() {
+                return f64::NAN;
+            }
+            let rest: Vec<f64> = total.iter().zip(row).map(|(t, v)| t - v).collect();
+            crate::stats::pearson(row, &rest)
+        })
+        .collect()
+}
+
 /// Fixed-window integration over the sample range `[lo, hi)` already chosen by
 /// [`fixed_window_indices`], with optional apex-outward envelope and optional
 /// flank-baseline subtraction (`baseline = Some((flank, quantile))`).
+#[cfg(test)]
 fn trapezoid_fixed_at(
     rt: &[f32],
     inten: &[f32],
@@ -810,17 +864,18 @@ fn trapezoid_fixed_at(
     envelope: bool,
     baseline: Option<(usize, f64)>,
 ) -> f64 {
-    let mut w: Vec<f32> = inten[lo..hi].to_vec();
-    if let Some((flank, quantile)) = baseline {
-        let b = flank_baseline(inten, lo, hi, flank, quantile);
-        for x in w.iter_mut() {
-            *x = (*x - b).max(0.0);
-        }
-    }
+    integrate_window(
+        &rt[lo..hi],
+        baseline_window(inten, lo, hi, baseline),
+        envelope,
+    )
+}
+
+fn integrate_window(rt: &[f32], mut w: Vec<f32>, envelope: bool) -> f64 {
     if envelope {
         w = center_envelope_1d(&w);
     }
-    trapezoid(&rt[lo..hi], &w)
+    trapezoid(rt, &w)
 }
 
 /// Top-N sum with the fragment ranking chosen by `selection`. `observed_area`
@@ -1757,20 +1812,25 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         None
     };
     let mut area_by_slot: Vec<f64> = vec![0.0; index.rows.len()];
-    let mut slices: Vec<&mut [f64]> = Vec::with_capacity(index.len());
+    // Apex correlation per slot, for the cross-run weights (NaN outside a fixed window).
+    let mut corr_by_slot: Vec<f64> = vec![f64::NAN; index.rows.len()];
+    let mut slices: Vec<(&mut [f64], &mut [f64])> = Vec::with_capacity(index.len());
     {
         let mut rest: &mut [f64] = &mut area_by_slot;
+        let mut crest: &mut [f64] = &mut corr_by_slot;
         for ci in 0..index.len() {
             let n = index.cand_off[ci + 1] - index.cand_off[ci];
             let (head, tail) = rest.split_at_mut(n);
-            slices.push(head);
+            let (chead, ctail) = crest.split_at_mut(n);
+            slices.push((head, chead));
             rest = tail;
+            crest = ctail;
         }
     }
     let applied_win: Vec<(f64, f64, f64)> = slices
         .par_iter_mut()
         .enumerate()
-        .map(|(ci, out)| {
+        .map(|(ci, (out, cout))| {
             let c = index.cids[ci];
             let rows = index.rows_of(ci);
             let (lo_rt, hi_rt, integration_apex) = if !p.cfg.bound_peak {
@@ -1812,6 +1872,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
             // to recompute the identical indices in a second pass over the same rows.
             let mut flo = f64::INFINITY;
             let mut fhi = f64::NEG_INFINITY;
+            let mut windows: Vec<Option<Vec<f32>>> = Vec::new();
             for (slot, &i) in rows.iter().enumerate() {
                 let rt = store.rt(i);
                 let it = store.inten(i);
@@ -1826,22 +1887,28 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
                         Some((lo, hi)) => {
                             flo = flo.min(rt[lo] as f64);
                             fhi = fhi.max(rt[hi - 1] as f64);
-                            trapezoid_fixed_at(
-                                rt,
-                                it,
-                                lo,
-                                hi,
+                            let w = baseline_window(it, lo, hi, baseline);
+                            let area = integrate_window(
+                                &rt[lo..hi],
+                                w.clone(),
                                 p.cfg.interference_envelope,
-                                baseline,
-                            )
+                            );
+                            windows.push(Some(w));
+                            area
                         }
-                        None => 0.0,
+                        None => {
+                            windows.push(None);
+                            0.0
+                        }
                     }
                 } else if p.cfg.bound_peak {
                     trapezoid_window(rt, it, lo_rt, hi_rt, p.cfg.interference_envelope)
                 } else {
                     trapezoid(rt, it)
                 };
+            }
+            if fixed {
+                cout.copy_from_slice(&window_correlations(&windows));
             }
             let (lo_rt, hi_rt) = if fixed && flo.is_finite() && fhi.is_finite() {
                 (flo, fhi)
@@ -1853,6 +1920,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         .collect();
     drop(slices);
     let area_by_slot = area_by_slot;
+    let corr_by_slot = corr_by_slot;
     if emit_bounds {
         for (ci, &(lo_rt, hi_rt, _)) in applied_win.iter().enumerate() {
             if lo_rt.is_finite() && hi_rt.is_finite() {
@@ -1909,6 +1977,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     // candidate rather than once per scored row: it collects and SORTS the candidate's
     // areas, and every extra row mapping to the same candidate repeated that.
     let mut selected: HashMap<usize, usize> = HashMap::new();
+    let mut n_weighted = 0u64;
     let mut selections: Vec<(Option<f64>, usize, &'static str)> = Vec::new();
     for i in 0..ps.nrows {
         if !passes_quant_filter(is_decoy[i], pep_q[i], p.cfg.q_threshold, is_transferred[i]) {
@@ -1920,11 +1989,26 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
             Some(ci) => {
                 let slot = *selected.entry(ci).or_insert_with(|| {
                     let r = index.slots(ci);
-                    selections.push(select_fragment_areas(
-                        Some((&area_by_slot[r.clone()], &index.slot_pred[r])),
-                        p.cfg.top_n_fragments,
-                        p.cfg.fragment_selection,
-                    ));
+                    let weighted =
+                        p.fragment_weights
+                            .and_then(|fw| fw.get(&cid[i]))
+                            .and_then(|w| {
+                                weighted_quantity(
+                                    &area_by_slot[r.clone()],
+                                    r.clone().map(|s| store.name(index.rows[s])),
+                                    w,
+                                )
+                            });
+                    if weighted.is_some() {
+                        n_weighted += 1;
+                    }
+                    selections.push(weighted.unwrap_or_else(|| {
+                        select_fragment_areas(
+                            Some((&area_by_slot[r.clone()], &index.slot_pred[r])),
+                            p.cfg.top_n_fragments,
+                            p.cfg.fragment_selection,
+                        )
+                    }));
                     selections.len() - 1
                 });
                 selections[slot]
@@ -1997,7 +2081,8 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
     // Optional per-fragment area export for ion-level directLFQ across runs.
     let mut fragment_output: Option<(&str, u64)> = None;
     if let Some(fpath) = p.out_fragment {
-        let (mut f_cid, mut f_pf, mut f_z, mut f_pg, mut f_name, mut f_area) = (
+        let (mut f_cid, mut f_pf, mut f_z, mut f_pg, mut f_name, mut f_area, mut f_corr) = (
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2024,6 +2109,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
                     f_pg.push(pg.get(i).to_string());
                     f_name.push(store.name(index.rows[slot]).to_string());
                     f_area.push(a);
+                    f_corr.push(corr_by_slot[slot]);
                 }
             }
         }
@@ -2036,6 +2122,7 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
                 Col::Str("protein_group".into(), f_pg),
                 Col::Str("fragment_name".into(), f_name),
                 Col::F64("quantity".into(), f_area),
+                Col::F64("apex_corr".into(), f_corr),
             ],
         )?;
         fragment_output = Some((fpath, fragment_rows));
@@ -2081,6 +2168,8 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         // identification apex, `redetected` rows fell back to quant's own peak pick.
         "apex_rt_column_present": apex_column_present,
         "candidates_with_scored_apex": apex_by_cid.len(),
+        "cross_run_weights": p.cfg.cross_run_weights,
+        "candidates_weighted": n_weighted,
     });
     for (path, schema, rows) in [
         (p.out_peptide, artifact::PEPTIDE_QUANT, n_pep),
@@ -2125,6 +2214,104 @@ pub fn run(p: QuantParams) -> Result<(u64, u64)> {
         "quant: done"
     );
     Ok((n_pep, n_pg))
+}
+
+/// The diaPASEF quant preset ([`QuantConfig::diapasef`]) replaces a `quant` block left at
+/// its defaults when every input is a timsTOF `.d`. A block with any key set is kept as
+/// written. Under single-run `run` the cross-run weights have nothing to fit and are not
+/// applied (`candidates_weighted` 0 in the report).
+pub fn apply_diapasef_quant<S: AsRef<str>>(quant: &mut QuantConfig, inputs: &[S]) {
+    if *quant == QuantConfig::default()
+        && !inputs.is_empty()
+        && inputs.iter().all(|m| crate::raw::is_tims_tdf(m.as_ref()))
+    {
+        *quant = QuantConfig::diapasef();
+        info!("quant: timsTOF input and default quant settings; using the diaPASEF quant preset (fixed 9-scan window, flank baseline q 0.6, cross-run fragment weights)");
+    }
+}
+
+/// Weighted quantity of one candidate: `sum(weight * area)` over its fragments with a
+/// positive area. `None` (the caller keeps the per-run top-N rule) when no weighted
+/// fragment has a positive area in this run.
+fn weighted_quantity<'a>(
+    areas: &[f64],
+    names: impl Iterator<Item = &'a str>,
+    weights: &BTreeMap<String, f64>,
+) -> Option<(Option<f64>, usize, &'static str)> {
+    let (mut q, mut used) = (0.0f64, 0usize);
+    for (&a, name) in areas.iter().zip(names) {
+        if let Some(&w) = weights.get(name) {
+            if a.is_finite() && a > 0.0 && w > 0.0 {
+                q += w * a;
+                used += 1;
+            }
+        }
+    }
+    (q.is_finite() && q > 0.0).then_some((Some(q), used, "quantified"))
+}
+
+/// Median with the even-count rule `(lower + upper) / 2`; `None` for no values.
+fn median_of(mut v: Vec<f64>) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let n = v.len();
+    Some(if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    })
+}
+
+/// Fit the cross-run fragment weights (`quant.cross_run_weights`) from the first-pass
+/// `fragment_quant` tables of every run (positive areas plus `apex_corr`). Per candidate
+/// and fragment: `dev` = median over runs of |log-share - its cross-run median|, where the
+/// log-share is ln(area / candidate total in that run); `corr` = median over runs of
+/// `apex_corr`, ignoring NaN; weight = `1 / (dev + 0.1) * max(corr, 0)`. A candidate whose
+/// weights are all zero gets weight 1 on every fragment. Deterministic: ordered maps only.
+pub fn fit_fragment_weights(fragment_tables: &[String]) -> Result<FragmentWeights> {
+    // (candidate, fragment) -> per-run (log-share, corr)
+    let mut obs: BTreeMap<u32, BTreeMap<String, Vec<(f64, f64)>>> = BTreeMap::new();
+    for path in fragment_tables {
+        let t = TableFile::open(path)?;
+        let cid = t.u32("candidate_id")?;
+        let name = t.str("fragment_name")?;
+        let area = t.f64("quantity")?;
+        let corr = t.f64("apex_corr")?;
+        let mut total: BTreeMap<u32, f64> = BTreeMap::new();
+        for i in 0..t.nrows {
+            *total.entry(cid[i]).or_default() += area[i];
+        }
+        for i in 0..t.nrows {
+            let ls = (area[i] / total[&cid[i]]).ln();
+            if ls.is_finite() {
+                obs.entry(cid[i])
+                    .or_default()
+                    .entry(name[i].clone())
+                    .or_default()
+                    .push((ls, corr[i]));
+            }
+        }
+    }
+    let mut out: FragmentWeights = HashMap::with_capacity(obs.len());
+    for (c, frags) in obs {
+        let mut w: BTreeMap<String, f64> = frags
+            .into_iter()
+            .map(|(f, v)| {
+                let med = median_of(v.iter().map(|x| x.0).collect()).unwrap_or(0.0);
+                let dev = median_of(v.iter().map(|x| (x.0 - med).abs()).collect()).unwrap_or(0.0);
+                let corr = median_of(v.iter().map(|x| x.1).filter(|x| x.is_finite()).collect());
+                let wt = corr.map_or(0.0, |r| r.max(0.0) / (dev + 0.1));
+                (f, wt)
+            })
+            .collect();
+        if w.values().all(|&x| x <= 0.0) {
+            w.values_mut().for_each(|x| *x = 1.0);
+        }
+        out.insert(c, w);
+    }
+    Ok(out)
 }
 
 /// Combine several per-run quant tables into a protein-by-run abundance matrix
@@ -2812,6 +2999,7 @@ mod tests {
             out_peak_bounds: Some(&bounds),
             cfg: &cfg,
             config_hash: "test",
+            fragment_weights: None,
         })
         .unwrap();
         assert_eq!(rows, (4, 3));
@@ -3077,6 +3265,7 @@ mod tests {
             out_peak_bounds: None,
             cfg: &cfg,
             config_hash: "test",
+            fragment_weights: None,
         })
         .unwrap();
         assert_eq!(rows, (1, 1));
@@ -3111,6 +3300,7 @@ mod tests {
                 out_peak_bounds: None,
                 cfg: &cfg,
                 config_hash: "test",
+                fragment_weights: None,
             })
             .unwrap();
             let pq = Table::read(&peptide).unwrap();
@@ -3177,6 +3367,7 @@ mod tests {
             out_peak_bounds: None,
             cfg: &cfg,
             config_hash: "test",
+            fragment_weights: None,
         })
         .unwrap();
         assert_eq!(rows.0, 2, "both identifications must be reported");
@@ -3214,6 +3405,7 @@ mod tests {
             out_peak_bounds: None,
             cfg: &cfg,
             config_hash: "test",
+            fragment_weights: None,
         })
         .unwrap_err()
         .to_string();
@@ -3617,6 +3809,7 @@ mod tests {
             out_peak_bounds: Some(&bounds),
             cfg: &cfg,
             config_hash: "test",
+            fragment_weights: None,
         })
         .unwrap();
         assert_eq!(rows, (3, 2));
@@ -4128,6 +4321,7 @@ mod tests {
                 out_peak_bounds: None,
                 cfg: &cfg,
                 config_hash: "test",
+                fragment_weights: None,
             })
             .unwrap();
             // The quantities as well, so a failure says which column moved rather than
@@ -4372,5 +4566,54 @@ mod source_guard_tests {
         );
         let t = TableFile::open(&p).unwrap();
         assert!(pooled_source_count(&t, &p).is_err());
+    }
+
+    #[test]
+    fn cross_run_weights_downweight_an_interfered_fragment() {
+        // Candidate 7: fragments a, b, c over four runs; c's share jumps in runs 2 and 3
+        // (interference in half the runs, as in a low-abundance condition) and c does not
+        // co-elute there. One interfered run of three would be ignored by the medians. Candidate 9: every apex_corr
+        // is negative, so every weight is 0 and the equal-weight fallback applies.
+        let rows: [[(f64, f64); 3]; 4] = [
+            [(100.0, 0.9), (50.0, 0.8), (25.0, 0.9)],
+            [(200.0, 0.9), (100.0, 0.8), (50.0, 0.9)],
+            [(100.0, 0.9), (50.0, 0.8), (400.0, 0.1)],
+            [(100.0, 0.9), (50.0, 0.8), (400.0, 0.1)],
+        ];
+        let tables: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .map(|(r, run)| {
+                let mut cid = vec![7u32; 3];
+                let mut name: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+                let mut area: Vec<f64> = run.iter().map(|x| x.0).collect();
+                let mut corr: Vec<f64> = run.iter().map(|x| x.1).collect();
+                cid.extend([9, 9]);
+                name.extend(["a".to_string(), "b".to_string()]);
+                area.extend([10.0, 20.0]);
+                corr.extend([-0.5, -0.2]);
+                table(
+                    &format!("crw_frag{r}"),
+                    vec![
+                        Col::U32("candidate_id".into(), cid),
+                        Col::Str("fragment_name".into(), name),
+                        Col::F64("quantity".into(), area),
+                        Col::F64("apex_corr".into(), corr),
+                    ],
+                )
+            })
+            .collect();
+        let w = fit_fragment_weights(&tables).unwrap();
+        let w7 = &w[&7];
+        assert!(w7["c"] < w7["a"] / 2.0, "{w7:?}");
+        assert!(w7["a"] > 0.0 && w7["b"] > 0.0);
+        assert_eq!(w[&9].values().copied().collect::<Vec<_>>(), vec![1.0, 1.0]);
+        // Same weights in every run: the weighted quantity of a clean scaled run scales
+        // with it, and a run with no positive weighted area defers to the top-N rule.
+        let names = ["a", "b", "c"];
+        let q0 = weighted_quantity(&[100.0, 50.0, 25.0], names.iter().copied(), w7).unwrap();
+        let q1 = weighted_quantity(&[200.0, 100.0, 50.0], names.iter().copied(), w7).unwrap();
+        assert!((q1.0.unwrap() / q0.0.unwrap() - 2.0).abs() < 1e-12);
+        assert!(weighted_quantity(&[0.0, 0.0, 0.0], names.iter().copied(), w7).is_none());
     }
 }

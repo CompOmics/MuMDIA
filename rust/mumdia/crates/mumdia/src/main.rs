@@ -357,6 +357,10 @@ enum Cmd {
         /// Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt, width_s).
         #[arg(long)]
         out_peak_bounds: Option<String>,
+        /// Cross-run fragment weights (`quant.cross_run_weights`, second pass): the
+        /// first-pass `--out-fragment` tables of every run of the experiment.
+        #[arg(long, num_args = 1..)]
+        weights_from: Vec<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -1667,10 +1671,16 @@ fn real_main() -> Result<()> {
             out_protein,
             out_fragment,
             out_peak_bounds,
+            weights_from,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            let weights = if weights_from.is_empty() {
+                None
+            } else {
+                Some(stages::quant::fit_fragment_weights(&weights_from)?)
+            };
             stages::quant::run(stages::quant::QuantParams {
                 psms_scored: &psms_scored,
                 chromatograms: &chromatograms,
@@ -1680,6 +1690,7 @@ fn real_main() -> Result<()> {
                 out_peak_bounds: out_peak_bounds.as_deref(),
                 cfg: &cfg.quant,
                 config_hash: &ch,
+                fragment_weights: weights.as_ref(),
             })?;
         }
         Cmd::QuantLfq {

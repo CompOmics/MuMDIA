@@ -1,0 +1,440 @@
+# TIMS quant roadmap: diaPASEF quantification at DIA-NN level
+
+Goal: on ProteoBench `quant_lfq_DIA_ion_diaPASEF` (HYE, 3 + 3 runs, MBR off), reach DIA-NN's
+ratio accuracy and precision without losing the identifications gained in `TIMS_ROADMAP.md`
+and `TIMS_ROADMAP_bis.md`. The policy is that of
+`docs/20_sensitivity_and_quantification_playbook.md` ("Quantification accuracy"). Report every
+result on the fixed common ion set and on all ions.
+
+## 1. Constraints
+
+- **No loss of sensitivity.** Identification counts are not allowed to drop. Neither is the
+  number of ProteoBench ions at `min_obs` 3. A quant change that improves epsilon by not
+  reporting difficult ions does not count as a gain. A quality flag on an ion is allowed. A
+  filter that removes the ion from the submission is not.
+- **Quant changes do not change IDs.** Most levers below are requant-only. They run on the
+  fixed `eng_repick` identifications, so they cost no sensitivity by construction and need no
+  seed or entrapment arm. A lever that changes extraction, retrace or rescore still needs the
+  usual seeds, entrapment and second-dataset gates.
+- **Scope: HYE diaPASEF only, for now.** Every lever is measured and gated on the HYE diaPASEF
+  set. A quant default that comes out of this roadmap applies to diaPASEF (TDF) input only.
+  Making it general (Astral HYE, PYE diaPASEF, AIF) is a later step with its own measurement,
+  so keep each lever a config key that other acquisitions can switch on, not a TDF-only code
+  path.
+- **Targets.** The priority targets are DIA-NN's ProteoBench global median |epsilon| (0.118)
+  and species-equalised median |epsilon| (0.169), both at `min_obs` 3. CV (DIA-NN 0.076) is
+  secondary. When a lever trades the two, accuracy wins. A CV gain that compresses the ratios
+  is not accepted.
+- **Clean room.** DIA-NN is a reference for the result only. Published method descriptions
+  (for example the QuantUMS preprint) can guide the design. Code and constants cannot.
+
+## 2. Starting point (2026-10-01)
+
+Inputs:
+- DIA-NN: `bench/diann_compare/input_file.tsv`, scored with `bench/pb_eval.py --format DIA-NN`.
+  ProteoBench reads `Precursor.Normalised`.
+- MuMDIA: `bench/proteobench_input/eng_repick/custom_input.tsv`. This is the `eng_repick` arm
+  of `TIMS_ROADMAP_bis.md` section 8 (seed 0). Quant is
+  `fragment_selection: predicted` + `interference_envelope`, top-3 fragments, per-candidate
+  descent-walk bounds, `q_filter: psm_q`, on the retraced raw traces.
+
+ProteoBench at `min_obs` 3 (expected log2 A/B: E. coli -2, yeast +1, human 0). Median
+|epsilon| is global. "eq" is species-equalised. CV is ProteoBench's `CV_median`.
+
+| arm | ions | median abs eps | eq | CV | E. coli | yeast | human |
+|---|---|---|---|---|---|---|---|
+| DIA-NN (`Precursor.Normalised`) | 88,924 | **0.118** | **0.169** | **0.076** | -1.84 | +0.81 | -0.03 |
+| DIA-NN (`Precursor.Quantity`, no normalisation) | 88,924 | 0.120 | 0.172 | 0.080 | -1.79 | +0.86 | +0.02 |
+| MuMDIA `eng_repick` | **92,540** | 0.172 | 0.358 | 0.107 | -1.43 | +0.66 | +0.03 |
+
+MuMDIA reports 4% more ions than DIA-NN, but its epsilon is 46% higher and its E. coli
+ratio is compressed by 0.4 log2.
+
+## 3. Diagnosis (Q0, done 2026-10-01)
+
+Scripts and results are in `/public/local/ProteoBench/HYE_diaPASEF_mumdia/quant_diag/`.
+Ions are keyed on I/L-merged stripped sequence + charge.
+
+**Q0.1 The gap is in quantification, not in the identification set.** At `min_obs` 3 there
+are 77,148 shared ions, 15,235 MuMDIA-only ions and 11,753 DIA-NN-only ions. On the shared
+ions:
+
+| | median abs eps | CV | E. coli | yeast | human |
+|---|---|---|---|---|---|
+| DIA-NN | 0.111 | 0.079 | -1.85 | +0.82 | -0.03 |
+| MuMDIA `eng_repick` | 0.161 | 0.114 | -1.46 | +0.70 | +0.03 |
+
+CV in this table and in the later shared-ion tables is the median of (CV_A + CV_B) / 2. It is
+close to, but not identical to, ProteoBench's `CV_median`.
+
+**Q0.2 The apex is not the cause.** Over 431,666 run-level rows shared with DIA-NN, MuMDIA's
+integration apex is within 5 s of DIA-NN's `RT` in 99.5% of rows in every species and
+condition. The median offset is 0.96 s, one cycle. Excluding the 0.5% off-apex rows does not
+change the ratios.
+
+**Q0.3 The compression is additive and sits in the low condition.** The median
+log2(MuMDIA / DIA-NN) is -1.66 / -1.67 for human (A / B). For E. coli, which is 4x lower in
+A, it is -1.50 in A and -1.66 in B. MuMDIA's quantity carries a floor that matters only
+where the signal is low.
+
+**Q0.4 The floor comes from wide integration windows.** The descent walk (`peak_fraction`
+1/6, `peak_grace` 1) runs on raw retrace traces, which have no noise floor. On a weak peak it
+often never drops below 1/6 of the apex. The median integration width is 6.8 s (DIA-NN
+`RT.Stop - RT.Start` 8.7 s). The p90 is 44 s against DIA-NN's 11.6 s, and 27% of rows
+integrate over more than 15 s. The tail is larger in the low condition: 35% of E. coli rows in
+A against 29% in B. Shared E. coli ions binned by the wider of their two condition widths:
+
+| width (s) | ions | MuMDIA log2 A/B | DIA-NN log2 A/B |
+|---|---|---|---|
+| <= 5 | 513 | -1.74 | -1.82 |
+| 5-8 | 492 | -1.73 | -1.85 |
+| 8-12 | 261 | -1.64 | -1.86 |
+| 12-20 | 242 | -1.52 | -1.81 |
+| > 20 | 608 | -1.11 | -1.78 |
+
+Ions with a DIA-NN-like width are close to DIA-NN's ratio. The wide tail causes most of the
+compression.
+
+**Q0.5 Normalisation is a small share.** Without DIA-NN's normalisation, DIA-NN still reaches
+0.120 / CV 0.080 / E. coli -1.79. DIA-NN's normalisation factors are 0.97 (A) and 1.01 (B) on
+median.
+
+**Q0.6 DIA-NN's quantity is not a top-N fragment sum.** The median `Precursor.Quantity` is
+1.5x the sum of all 12 `Fragment.Quant.Raw` values, and 2.7x the top-3 by area. This fits a
+model-based estimate across fragments (and possibly MS1), as described for QuantUMS in DIA-NN
+2.x. It is not a fixed top-N rule.
+
+**Q0.7 The MuMDIA-only ions are faint and quantify worst.** They are about 0.6 log2 below the
+shared ions (median max-condition log intensity 13.85 against 14.44), with |epsilon| 0.255,
+CV 0.15 and E. coli at -1.0. About half are DIA-NN identifications that DIA-NN quantified in
+fewer than 3 runs. Their cross-run apex spread is no worse than for the shared ions (global RT
+offset per run, 30% against 24% above 10 s), so a cross-run apex inconsistency does not explain
+them. A proper LOESS-aligned check is still open (Q4).
+
+## 4. First lever measured: a fixed integration window (Q1)
+
+Requant only, on the `eng_repick` identifications (`quant_diag/requant_repick.sh <name>
+'<edit of q>'`), with the base quant config otherwise unchanged. All arms have 92,540 ions,
+because the IDs are fixed.
+
+| arm | median abs eps | eq | CV | E. coli | yeast | human |
+|---|---|---|---|---|---|---|
+| `eng_repick` (descent walk) | 0.172 | 0.358 | 0.107 | -1.43 | +0.66 | +0.03 |
+| `peak_window_mode: consensus` | 0.153 | 0.242 | 0.108 | -1.66 | +0.80 | +0.02 |
+| `fixed_window_s: 3` | 0.142 | 0.232 | 0.098 | -1.67 | +0.79 | +0.01 |
+| **`fixed_window_s: 4`** | **0.136** | **0.230** | **0.089** | **-1.68** | **+0.79** | +0.01 |
+| `fixed_window_s: 5` | 0.135 | 0.232 | 0.086 | -1.67 | +0.79 | +0.02 |
+| `fixed_window_s: 4` + `baseline_subtract` | 0.138 | **0.217** | 0.092 | **-1.71** | +0.81 | +0.01 |
+| `fixed_window_s: 4` + `top_n_fragments: 6` | **0.129** | 0.256 | **0.080** | -1.60 | +0.76 | +0.02 |
+| `fixed_window_s: 4`, `interference_envelope` off | 0.131 | 0.260 | 0.082 | -1.60 | +0.75 | +0.02 |
+| DIA-NN | 0.118 | 0.169 | 0.076 | -1.84 | +0.81 | -0.03 |
+
+The same arms, split into shared and MuMDIA-only ions:
+
+| arm | shared eps / CV / E. coli | MuMDIA-only eps / CV / E. coli |
+|---|---|---|
+| `eng_repick` | 0.161 / 0.114 / -1.46 | 0.255 / 0.149 / -1.02 |
+| `fixed_window_s: 4` | 0.129 / 0.091 / -1.69 | 0.194 / 0.121 / -1.44 |
+| + `baseline_subtract` | 0.130 / 0.095 / -1.72 | 0.202 / 0.129 / -1.47 |
+| + `top_n_fragments: 6` | 0.122 / 0.082 / -1.60 | 0.180 / 0.108 / -1.33 |
+| DIA-NN | 0.111 / 0.079 / -1.85 | |
+
+Reading:
+- One existing key closes about two thirds of the epsilon gap and 60% of the CV gap at the same
+  ion count. 4 s and 5 s are equal. 3 s loses precision. Consensus widths fix the ratio but
+  not the CV.
+- On the shared ions, yeast is now at DIA-NN's value (+0.81 against +0.82). E. coli is still
+  0.16 log2 short, and the CV is 0.091 against 0.079.
+- **More fragments buy precision and cost accuracy.** Top-6, or switching the envelope off,
+  gives DIA-NN-level CV (0.080 to 0.082) and compresses E. coli back to -1.60. Some of the
+  added fragments are interfered. A fixed count cannot get both, so the next lever is
+  fragment choice (Q2). Under the targets of section 1, top-6 is rejected: its global epsilon
+  improves (0.129), but its species-equalised epsilon gets worse (0.256 against 0.230).
+- Baseline subtraction removes part of the remaining floor (E. coli -1.71, eq 0.217) at a
+  small CV cost. It gives the best species-equalised epsilon of all arms, and its global
+  epsilon is within 0.002 of the best fixed window. It is therefore the working base for Q2
+  and Q3. Remaining gap to DIA-NN: global 0.138 against 0.118, eq 0.217 against 0.169.
+- The MuMDIA-only ions are still the worst group (0.194). They are 16% of the ions and
+  carry a disproportionate share of the global epsilon.
+
+### Q1 sweep: window unit and baseline (2026-10-01, seed 0)
+
+Requants on the `eng_repick` IDs (92,540 ions in every arm). "Shared" is the 77,282 ions also
+quantified by DIA-NN at `min_obs` 3, "only" the 15,258 MuMDIA-only ions (`quant_diag/shared.py`;
+the shared count differs slightly from Q0.1 because the scripts differ). Shared and only columns are
+eps / CV / E. coli.
+
+| arm | global | eq | CV | E. coli | shared | only |
+|---|---|---|---|---|---|---|
+| `fixed_window_s: 4` + baseline (12, 0.25) | 0.138 | 0.217 | 0.092 | -1.71 | 0.130 / 0.092 / -1.72 | 0.202 / 0.128 / -1.47 |
+| `fixed_scan_halfwidth: 4` | 0.136 | 0.230 | 0.089 | -1.68 | 0.129 / 0.089 / -1.69 | 0.194 / 0.121 / -1.44 |
+| `fixed_scan_halfwidth: 4` + baseline (12, 0.25) | 0.138 | 0.217 | 0.092 | -1.71 | 0.130 / 0.092 / -1.72 | 0.202 / 0.128 / -1.47 |
+| + `baseline_flank_scans: 6` | 0.140 | 0.215 | 0.095 | -1.72 | 0.131 / 0.094 / -1.73 | 0.207 / 0.134 / -1.47 |
+| + `baseline_flank_scans: 24` | 0.138 | 0.218 | 0.091 | -1.70 | 0.129 / 0.091 / -1.71 | 0.198 / 0.125 / -1.46 |
+| + `baseline_quantile: 0.1` | 0.137 | 0.226 | 0.090 | -1.69 | 0.129 / 0.090 / -1.70 | 0.196 / 0.123 / -1.45 |
+| + `baseline_quantile: 0.4` | 0.139 | 0.207 | 0.095 | -1.74 | 0.130 / 0.094 / -1.75 | 0.206 / 0.132 / -1.47 |
+| + `baseline_quantile: 0.5` | 0.142 | 0.198 | 0.098 | -1.77 | 0.133 / 0.098 / -1.78 | 0.216 / 0.140 / -1.52 |
+| + `baseline_quantile: 0.6` | 0.145 | 0.195 | 0.101 | -1.81 | 0.135 / 0.101 / -1.82 | 0.224 / 0.145 / -1.58 |
+| + `baseline_quantile: 0.75` | 0.153 | 0.196 | 0.109 | -1.87 | 0.142 / 0.108 / -1.88 | 0.239 / 0.159 / -1.61 |
+
+The `fixed_window_s` arms with flank or quantile changes were run as `fixed_window_s: 4`; the
+scan and seconds forms are identical on this data, so the rows are comparable.
+
+Reading:
+- `fixed_scan_halfwidth: 4` and `fixed_window_s: 4` give identical results, with and without the
+  baseline. The scan form is preferred, as planned.
+- The flank length (6, 12, 24) does not matter (within 0.002 in both epsilons).
+- The baseline quantile is a monotone trade: a higher quantile removes more of the floor (E. coli
+  -1.69 at 0.1 to -1.87 at 0.75), lowers eq down to 0.6 and raises global epsilon and CV. At 0.75 the
+  ratios overshoot (E. coli -1.87, yeast +0.89), so the flank estimate there includes more than
+  background. Without Q2, no quantile improves both epsilons.
+
+## 4b. Fragment weighting by cross-run consistency (Q2 prototype, 2026-10-01, seed 0)
+
+Offline Python on `chromatograms.parquet` (`quant_diag/q2_frag_areas.py`, `q2_combine.py`).
+`q2_frag_areas.py` replicates quant's fixed window (`fixed_scan_halfwidth: 4`), flank baseline
+and interference envelope per fragment; it reproduces the engine quantity on 99.92% of run 0
+candidates, and its top-3 rule reproduces the engine arms exactly (0.138 / 0.217 / 0.092 at
+quantile 0.25, 0.142 / 0.198 / 0.098 at 0.5). No variant uses condition or species labels.
+
+**Correction: the prototype includes MS1.** `chromatograms.parquet` also holds the three MS1
+traces of each candidate (`ms1_mono`, `ms1_iso1`, `ms1_iso2`, predicted intensity 0). Quant
+never reads them, but the prototype did, so every `cons` and `wsum` row in this section treats them
+as three more channels: these arms are fragments plus MS1, weighted. The top-3 and `fixed` rules
+rank by predicted intensity and are unaffected. The fragment-only weighting, as implemented in the
+engine, is in section 4c.
+
+Variants, all one fragment set or one weight vector per precursor, used in every run:
+- `fixed k`: top-k by predicted intensity among fragments with a positive area in at least half
+  of the runs.
+- `cons k`: fragments with a median apex correlation >= 0.5, ranked by the cross-run deviation of
+  their log-share of the precursor total (low first), up to k. Correlation is the Pearson
+  correlation of the fragment's 9 windowed samples with the sum of the other fragments, per run.
+- `wsum`: every fragment, weight 1 / (median |log-share deviation| + 0.1) x max(median
+  correlation, 0).
+- Ion-preserving fallbacks: a precursor with no passing fragment keeps the `fixed` set (`cons`) or
+  an unweighted sum (`wsum`); a run where the consistent quantity is zero takes the engine top-3
+  rule for that run (7 of about 540,000 run-level rows for `wsum` at 0.5). The `cons` rows below
+  predate the second fallback and lose 68 to 1,407 ions.
+
+| arm | ions | global | eq | CV | E. coli | shared | only |
+|---|---|---|---|---|---|---|---|
+| baseline q 0.25, `fixed 6` | 92,540 | 0.131 | 0.234 | 0.083 | -1.65 | 0.123 / 0.083 / -1.67 | 0.188 / 0.116 / -1.37 |
+| baseline q 0.25, `cons 6` | 91,158 | 0.121 | 0.238 | 0.071 | -1.65 | 0.112 / 0.071 / -1.67 | 0.190 / 0.102 / -1.38 |
+| baseline q 0.25, `wsum` | 92,527 | 0.118 | 0.248 | 0.068 | -1.62 | 0.110 / 0.067 / -1.64 | 0.183 / 0.096 / -1.35 |
+| baseline q 0.4, `wsum` | 92,540 | 0.121 | 0.223 | 0.071 | -1.69 | 0.112 / 0.070 / -1.70 | 0.187 / 0.102 / -1.42 |
+| baseline q 0.5, `fixed 6` | 92,540 | 0.134 | 0.205 | 0.089 | -1.74 | 0.125 / 0.089 / -1.75 | 0.201 / 0.126 / -1.42 |
+| baseline q 0.5, `cons 3` | 92,441 | 0.132 | 0.209 | 0.084 | -1.77 | 0.121 / 0.083 / -1.79 | 0.213 / 0.124 / -1.54 |
+| baseline q 0.5, `cons 6` | 92,472 | 0.126 | 0.203 | 0.079 | -1.78 | 0.116 / 0.077 / -1.79 | 0.207 / 0.117 / -1.52 |
+| **baseline q 0.5, `wsum`** | **92,540** | **0.123** | 0.203 | **0.074** | -1.76 | 0.114 / 0.074 / -1.77 | 0.197 / 0.109 / -1.50 |
+| baseline q 0.6, `wsum` | 92,540 | 0.126 | **0.197** | 0.078 | -1.81 | 0.116 / 0.077 / -1.82 | 0.205 / 0.115 / -1.55 |
+| `eng_repick` as shipped | 92,540 | 0.172 | 0.358 | 0.107 | -1.43 | 0.161 / 0.110 / -1.46 | 0.255 / 0.151 / -1.02 |
+| DIA-NN | 88,924 | 0.118 | 0.169 | 0.076 | -1.84 | 0.111 / 0.079 / -1.85 | |
+
+Reading:
+- Consistency weighting buys precision and global epsilon. On the shared ions `wsum` reaches
+  DIA-NN's epsilon and beats its CV (0.110 / 0.067 against 0.111 / 0.079 at quantile 0.25).
+  Weighting matters: `fixed 6` gets a third of the gain, so it is not the fragment count alone.
+- Alone it compresses the ratios (E. coli -1.62 at quantile 0.25), so eq gets worse. A stronger
+  baseline removes that compression, and the two levers combine: `wsum` at quantile 0.5 is better
+  than the Q1 base in both epsilons (0.123 / 0.203 against 0.138 / 0.217) and in CV (0.074 against
+  0.092), at the same ion count. It meets both Q2 targets (eq < 0.217, global < 0.129).
+- Quantile 0.5 and 0.6 are an even trade on seed 0 (global -0.003 / eq +0.006). The seed
+  replicates decide.
+- The MuMDIA-only ions remain the worst group (0.197), now Q4's target.
+
+**Replication on two more ID sets (2026-10-01).** `eng_repick_s1` and `eng_repick_s2` re-run only
+the pooled `nn_torch` rescore of `eng_repick` with `MUMDIA_NN_SEED` 1 and 2
+(`quant_diag/seed_ids.sh`, `seed_eval.sh`). Peptides at 1%: 100,790 / 100,064 / 100,800 (seeds
+0 / 1 / 2).
+
+| seed | arm | ions | global | eq | CV | E. coli | shared | only |
+|---|---|---|---|---|---|---|---|---|
+| 0 | shipped | 92,540 | 0.172 | 0.358 | 0.107 | -1.43 | 0.161 / 0.110 / -1.46 | 0.255 / 0.151 / -1.02 |
+| 0 | Q1 base | 92,540 | 0.138 | 0.217 | 0.092 | -1.71 | 0.130 / 0.092 / -1.72 | 0.202 / 0.128 / -1.47 |
+| 0 | `wsum` q 0.5 | 92,540 | 0.123 | 0.203 | 0.074 | -1.76 | 0.114 / 0.074 / -1.77 | 0.197 / 0.109 / -1.50 |
+| 0 | `wsum` q 0.6 | 92,540 | 0.126 | 0.197 | 0.078 | -1.81 | 0.116 / 0.077 / -1.82 | 0.205 / 0.115 / -1.55 |
+| 1 | shipped | 92,141 | 0.172 | 0.354 | 0.107 | -1.44 | 0.161 / 0.110 / -1.47 | 0.255 / 0.152 / -1.03 |
+| 1 | Q1 base | 92,141 | 0.138 | 0.217 | 0.092 | -1.71 | 0.130 / 0.092 / -1.72 | 0.201 / 0.128 / -1.47 |
+| 1 | `wsum` q 0.5 | 92,141 | 0.122 | 0.202 | 0.074 | -1.76 | 0.114 / 0.074 / -1.77 | 0.194 / 0.108 / -1.51 |
+| 1 | `wsum` q 0.6 | 92,141 | 0.125 | 0.197 | 0.078 | -1.81 | 0.116 / 0.077 / -1.82 | 0.199 / 0.114 / -1.55 |
+| 2 | shipped | 92,475 | 0.172 | 0.357 | 0.107 | -1.43 | 0.161 / 0.110 / -1.46 | 0.252 / 0.151 / -1.02 |
+| 2 | Q1 base | 92,475 | 0.138 | 0.218 | 0.092 | -1.71 | 0.130 / 0.092 / -1.72 | 0.203 / 0.129 / -1.49 |
+| 2 | `wsum` q 0.5 | 92,475 | 0.123 | 0.203 | 0.075 | -1.76 | 0.114 / 0.074 / -1.77 | 0.197 / 0.108 / -1.49 |
+| 2 | `wsum` q 0.6 | 92,475 | 0.126 | 0.198 | 0.078 | -1.81 | 0.116 / 0.077 / -1.82 | 0.203 / 0.115 / -1.55 |
+
+Q1 base is `fixed_scan_halfwidth: 4` + `baseline_subtract` (12, 0.25). Shared ions: 77,282 /
+77,129 / 77,257.
+
+- Every arm reproduces within 0.004 across the three ID sets, and every gain has the same size on
+  each: `wsum` q 0.5 against the Q1 base is -0.015 to -0.016 global, -0.015 eq, -0.017 to -0.018 CV.
+  `wsum` keeps every ion of its ID set. The Q1 and Q2 gates on HYE diaPASEF are met.
+- Quantile 0.6 against 0.5 is the same trade on every seed: eq -0.005 to -0.006, global +0.003,
+  CV +0.003 to +0.004, and E. coli 0.05 closer. 0.6 was chosen on these numbers, which include
+  MS1 (see the correction above); section 4c revisits it for the fragment-only engine lever.
+- Submission: `bench/proteobench_input/q05_wsum/custom_input.tsv` (baseline q 0.5, `wsum`).
+- Gap closed from `eng_repick` to DIA-NN: about 90% in global epsilon, 82% in eq.
+
+## 4c. Engine lever: `quant.cross_run_weights` (2026-10-01)
+
+Implemented as `quant.cross_run_weights` (`QuantConfig`, quant.rs `fit_fragment_weights`). Per-run
+quant runs twice: pass 1 writes `fragment_quant` (v2, new `apex_corr` column: correlation of the
+fragment's fixed-window samples with the sum of the candidate's other fragments); the weights are
+fitted over all runs as in the prototype; pass 2 sums `weight * area`. A candidate with all-zero
+weights takes equal weights; a run with no positive weighted area keeps the `top_n_fragments`
+rule, so no ion is lost. `run-experiment` does both passes; standalone, `mumdia quant
+--weights-from <pass-1 fragment tables>` (harness: `quant_diag/requant_crw.sh`). Fragments only:
+the MS1 traces are not quant channels.
+
+Parity: on seed 0 at quantile 0.6 the engine equals the prototype run without the MS1 rows
+(0.130 / 0.190 / 0.087 all ions, 0.122 / 0.086 / -1.79 shared, in both).
+
+All arms `fixed_scan_halfwidth: 4`, `baseline_subtract` (flank 12), predicted selection, envelope,
+`cross_run_weights: true`; binary `~/bin/mumdia-crw/mumdia`.
+
+| seed | baseline q | ions | global | eq | CV | E. coli | yeast | shared | only |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 0.5 | 92,540 | 0.129 | 0.200 | 0.084 | -1.74 | +0.82 | 0.120 / 0.083 / -1.75 | 0.200 / 0.121 / -1.47 |
+| 0 | **0.6** | 92,540 | 0.130 | **0.190** | 0.087 | -1.78 | +0.84 | 0.122 / 0.086 / -1.79 | 0.206 / 0.126 / -1.51 |
+| 1 | 0.5 | 92,141 | 0.129 | 0.200 | 0.084 | -1.74 | +0.82 | 0.120 / 0.083 / -1.75 | 0.198 / 0.121 / -1.47 |
+| 1 | **0.6** | 92,141 | 0.130 | **0.190** | 0.086 | -1.78 | +0.84 | 0.122 / 0.086 / -1.79 | 0.205 / 0.125 / -1.51 |
+| 2 | 0.5 | 92,475 | 0.129 | 0.201 | 0.084 | -1.74 | +0.82 | 0.120 / 0.083 / -1.75 | 0.201 / 0.121 / -1.47 |
+| 2 | **0.6** | 92,475 | 0.131 | **0.191** | 0.087 | -1.78 | +0.84 | 0.122 / 0.086 / -1.79 | 0.209 / 0.126 / -1.52 |
+
+Against the Q1 base on the same IDs (0.138 / 0.217 / 0.092): -0.008 global, -0.027 eq, -0.005 CV at
+quantile 0.6, on every seed. Without MS1, quantile 0.6 is the better setting: eq -0.010 for
+global +0.001 against 0.5. It is the quantile in the diaPASEF preset.
+
+The diaPASEF preset (`QuantConfig::diapasef`): predicted selection, envelope,
+`fixed_scan_halfwidth: 4`, `baseline_subtract` with quantile 0.6, `cross_run_weights`. It replaces
+a `quant` block left at its defaults when every input is a timsTOF `.d`; any explicitly set quant
+key keeps the block as written. Under single-run `run` the weights are not applied (nothing to fit).
+
+Submissions: `bench/proteobench_input/crw_q06/` is the engine lever (seed 0). The earlier
+`bench/proteobench_input/q05_wsum/` is the prototype with MS1 and quantile 0.5, not an engine result.
+
+MS1 as weighted channels (the prototype, quantile 0.6, seed 0: 0.126 / 0.197 / 0.078) is a Q5 lever:
+against the fragment-only engine it is -0.004 global and -0.009 CV for +0.007 eq.
+
+## 5. Plan
+
+Ordered by expected gain per unit of work. Each phase states its target and its gate. Quant
+levers are prototyped as requants and offline Python on `chromatograms.parquet` first. A lever
+goes into the engine only when it holds on HYE diaPASEF over at least two ID sets. Gains of about
+1% that need new engine code are skipped.
+
+### Q1: Bounded integration window (measured, section 4)
+
+Result: `fixed_scan_halfwidth: 4` (equal to `fixed_window_s: 4`) + `baseline_subtract`, flank 12;
+the quantile is set together with Q2 (0.5 or 0.6). Holds on three ID sets.
+
+
+- Working base: `fixed_window_s: 4` + `baseline_subtract` (global 0.138, eq 0.217).
+- Confirm it on more HYE diaPASEF identifications than seed 0 of `eng_repick` (for example
+  seeds 1 and 2 of the same pipeline). Quant is deterministic given the IDs, but the IDs are
+  not.
+- Sweep `baseline_flank_scans` and `baseline_quantile` on the fixed window. The defaults (12,
+  0.25) were never tuned on diaPASEF.
+- Decide the unit. `fixed_window_s` integrates a variable number of samples depending on where
+  the apex falls on the grid (docs/12). On diaPASEF the cycle is 0.968 s, so 4 s covers 8 or 9
+  samples. Compare with `fixed_scan_halfwidth: 4` (always 9 samples). Prefer the scan form if
+  the two are equal, because it generalises across cycle times.
+- An alternative with no new code path: cap the descent walk at a width learned from confident
+  peptides, so wide windows are cut and narrow ones stay. Try it only if a fixed window turns
+  out worse when generalising.
+- Gate: global and species-equalised epsilon on HYE diaPASEF, over at least two ID sets. IDs
+  are unchanged by construction. Then make it the diaPASEF quant default.
+
+### Q2: Fragment choice by interference, consistent across runs
+
+Result (section 4b): the `wsum` prototype meets the target on three ID sets. Next: an engine
+implementation as a cross-run step on the per-fragment areas, behind a config key.
+
+Target: species-equalised epsilon below the Q1 base (0.217) and global epsilon below 0.129
+(the top-6 value), with no loss of ions. The CV of top-6 (0.080) would be a bonus.
+
+- Per precursor, over every run in which it is quantified, take the per-fragment areas
+  in the fixed window. A fragment that is clean has the same share of the precursor's total in
+  every run. An interfered fragment has an inflated share in the runs where it is interfered,
+  and most in the low-abundance condition.
+- Prototype offline: for each of the 12 fragments, compute its log-share deviation from the
+  cross-run median, and its apex correlation with the other fragments in each run (retrace
+  traces). Choose the fragments with low deviation and high correlation, up to 6, as one set
+  per precursor, used in every run. Compare with a weighted sum (weight inversely proportional
+  to the deviation) over all 12.
+- This uses no condition labels, so it is not tuned to the benchmark design. It does use
+  every run of the experiment, so it is a cross-run step: run it after per-run quant, on the
+  per-fragment areas (quant already supports the fragment export, `quant.rs:531`).
+- Gate: shared-ion and all-ion global and species-equalised epsilon on HYE diaPASEF, then CV.
+  Missingness must not rise. Report the number of fragments used per precursor.
+
+### Q3: Additive background on the raw events
+
+Target: remove the residual E. coli floor (-1.71 against -1.85 on all ions with
+`baseline_subtract`).
+
+- The RT-flank baseline (`baseline_subtract`) helps the ratio and costs CV. It estimates the
+  background from neighbouring scans, which on a crowded gradient also contain other peptides.
+- On diaPASEF the background can be estimated in the mobility dimension instead: the same
+  fragment m/z and the same frames, in a 1/K0 band next to the precursor's band. Retrace
+  already reads those events. Prototype this offline before touching retrace.
+- Also try a narrower quant band than retrace's `apex_im +/- 0.015`. It is tuned for
+  identification. A narrower band removes more co-mobile interference but also cuts into the
+  ion's own signal, so measure the trade-off against CV.
+- Gate: as Q2. This lever is diaPASEF-specific by nature, which fits the current scope.
+
+### Q4: The faint and MuMDIA-only ions
+
+Target: the 15,235 extra ions, now at |epsilon| 0.194 and E. coli -1.44 under Q1.
+
+- First measure, then choose. The question is whether their error is a weak true signal (a
+  floor problem: Q1 to Q3 apply to them, and they already gain the most from Q1) or a wrong
+  peak in the low-abundance runs. Check with LOESS-aligned apex RT across the six runs, and with
+  the per-run `run_psm_q` of each ion in condition A against condition B.
+- If wrong peaks dominate: in a run where the ion is weak, integrate at the RT predicted from
+  the runs where it is strong (aligned consensus apex). The ion is identified in that run
+  anyway, so this changes the quantity, not the identification. MBR stays out of scope.
+- Add a per-ion quantity quality value (like DIA-NN's `Quantity.Quality`) from the Q2
+  consistency statistic. Report it. Do not filter the ProteoBench submission on it.
+- A residual E. coli ratio near -1 can also mean that some extra ions are false. Entrapment on
+  the E. coli file covers that question. It is not a quant lever, but it bounds what Q4 can
+  recover.
+
+### Q5: MS1 in the quantity
+
+- Retrace writes raw MS1 traces (`ms1_mono`, `iso1`, `iso2`) gated in 1/K0. Quant excludes them
+  today. Score MS1 alone as the quantity, then a combination with the fragment quantity (for
+  example the fragment estimate, with MS1 used only when the fragments disagree across runs).
+- The expected gain is on the faint ions, where few fragments are clean. Lower priority than Q2,
+  because Q0.6 does not separate DIA-NN's MS1 and fragment contributions.
+
+### Q6: Run normalisation (small, cheap)
+
+- Q0.5 bounds the gain at about 0.002 in epsilon and 0.004 in CV. Apply median-ratio
+  normalisation over the ions shared by all runs, with no species information, in the
+  submission step or in quant-lfq. This is done last so that it does not hide Q1 to Q4 effects.
+
+### Out of scope here
+
+- MBR and transfer requant (benchmark is MBR off).
+- Protein-level quant and MaxLFQ (ProteoBench scores precursor ions).
+- Anything that changes the identification population. If a quant lever needs a rescore
+  change, it moves to the identification roadmap with its gates.
+
+## 6. Harness
+
+- `quant_diag/requant_repick.sh <name> '<python edit of q>'`: six per-run quants on the
+  `eng_repick` IDs into `q_rp_<name>`, then `score.sh`. About 3 min per arm.
+- `quant_diag/shared_ions.py`: shared and unique ion split against the DIA-NN intermediate.
+- `quant_diag/per_run_join.py`: run-level join with DIA-NN (apex RT, widths, per-condition
+  intensity ratios).
+- Every result is recorded with the binary, the quant config hash (in
+  `peptide_quant.parquet.report.json`) and both the all-ion and shared-ion numbers.
+
+## 7. Decisions (2026-10-01)
+
+- Dataset: HYE diaPASEF only for now. Other known-ratio sets come in when the levers are
+  generalised.
+- Scope: diaPASEF defaults for now. Keep levers as generic config keys, because they may be
+  generalised later.
+- Targets: global and species-equalised median |epsilon| first, CV second.

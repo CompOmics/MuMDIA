@@ -282,6 +282,27 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    all-zero/non-finite areas, or `top_n_fragments=0` produce a null quantity plus
    an explicit `quant_status`; they are not converted to biological zero.
 
+   **Cross-run fragment weights** (`cross_run_weights`, `fragment_weights` in
+   `QuantParams`). When weights are passed, a candidate's quantity is instead
+   `sum(weight * area)` over its fragments with a positive area (`weighted_quantity`),
+   and the top-N rule above applies only where that sum is not positive in this run.
+   The weights come from `fit_fragment_weights` over the first-pass `fragment_quant`
+   tables of every run: per (candidate, fragment), `dev` is the median over runs of the
+   absolute deviation of ln(area / candidate total) from its cross-run median, `corr`
+   the median `apex_corr`, and the weight `max(corr, 0) / (dev + 0.1)`; a candidate whose
+   weights are all zero gets 1 on every fragment. `apex_corr` is the population Pearson
+   correlation of the fragment's fixed-window samples (after the baseline, before the
+   envelope) with the sum of the candidate's other fragments, so it needs a fixed
+   window. `run-experiment` runs quant twice per run when the key is on; standalone,
+   pass the pass-1 `--out-fragment` tables to `quant --weights-from`. The MS1 traces are
+   not channels. Measured on HYE diaPASEF only (docs/TIMS_QUANT_ROADMAP.md section 4c).
+
+   **diaPASEF preset.** `apply_diapasef_quant` replaces a `quant` block left at its
+   defaults with `QuantConfig::diapasef()` (predicted selection, envelope,
+   `fixed_scan_halfwidth: 4`, `baseline_subtract` at quantile 0.6, cross-run weights)
+   when every `run` / `run-experiment` input is a timsTOF `.d`, and logs it. Any
+   explicitly set quant key keeps the block as written.
+
    `passes_quant_filter` also admits a row flagged `is_transferred` by
    `mbr_worker.py`, whatever `q_filter` selects: MBR lowers only the PSM-level q
    columns, so a transfer would otherwise fail the default `peptide_q` filter and
@@ -297,7 +318,8 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    then sums the top `top_n_peptides` unique base peptides under `TopNSum`; `Sum` uses
    all unique bases. A group with no quantifiable base peptide has null quantity
    and `quant_status=no_quantifiable_peptide`.
-8. Optional fragment export (`quant.rs:531`) and peak-bounds diagnostic
+8. Optional fragment export (`fragment_quant` v2: positive areas plus `apex_corr`, NaN
+   outside a fixed window) and peak-bounds diagnostic
    (`quant.rs:419`). `ArtifactReport` records params + stats for each table
    (`quant.rs:603`).
 
