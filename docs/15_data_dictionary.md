@@ -782,6 +782,12 @@ Written only when `out_fragment` is set (ion-level directLFQ input).
 | `protein_group` | Utf8 | no | - | protein-accession-set string |
 | `fragment_name` | Utf8 | no | - | fragment name |
 | `quantity` | Float64 | no | intensity x s | per-fragment trapezoid area over the peak window |
+| `apex_corr` | Float64 | no (NaN) | - | correlation of the fixed-window samples with the sum of the candidate's other fragments (v2) |
+| `flank_mean` | Float64 | no (NaN) | intensity | mean raw sample in the `baseline_flank_scans` either side of the fixed window (v3) |
+| `flank_mean_h3`..`flank_mean_h7` | Float64 | no (NaN) | intensity | the same flank beyond a halfwidth of 3 to 7 scans; first pass under `quant.cross_run_width` only (v4) |
+| `peak_hwhm` | Float64 | no (NaN) | scans | the candidate's half width at half maximum in this run, on every row of the candidate; first pass under `quant.cross_run_width` only (v4) |
+
+Schema v4. NaN outside a fixed window. Under `quant.cross_run_background` zero areas are exported too.
 
 ### peak-bounds diagnostic (optional, `quant.rs:421-429`)
 

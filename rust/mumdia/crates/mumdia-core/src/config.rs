@@ -1857,6 +1857,15 @@ pub struct QuantConfig {
     /// place of the per-run `baseline_subtract` level. Label-blind. Needs a fixed window. Off
     /// by default; on in the diaPASEF preset.
     pub cross_run_background: bool,
+    /// Cross-run integration width (run-experiment only; docs/TIMS_QUANT_ROADMAP.md section
+    /// 4h). When > 0, each candidate is integrated over its own scan halfwidth `h = clamp(
+    /// round(cross_run_width * HWHM), 3, 7)` in every run, in place of `fixed_scan_halfwidth`.
+    /// HWHM is the half width at half maximum, in scans, of the candidate's summed fragment
+    /// trace (flank mean subtracted) in its brightest run, measured in the first pass of the
+    /// cross-run step. The flank (and so the cross-run background) is taken beyond the chosen
+    /// window. Label-blind. Needs `fixed_scan_halfwidth` (the first-pass window). 0 (default)
+    /// = off; 2.5 in the diaPASEF preset.
+    pub cross_run_width: f64,
 }
 
 /// Fragment ranking for the quant top-N sum. See [`QuantConfig::fragment_selection`].
@@ -1891,6 +1900,7 @@ impl Default for QuantConfig {
             fixed_window_s: 0.0,
             cross_run_weights: false,
             cross_run_background: false,
+            cross_run_width: 0.0,
         }
     }
 }
@@ -1909,6 +1919,7 @@ impl QuantConfig {
             baseline_quantile: 0.6,
             cross_run_weights: true,
             cross_run_background: true,
+            cross_run_width: 2.5,
             ..Self::default()
         }
     }
@@ -3072,6 +3083,22 @@ impl Config {
                  fragment correlation or flank, so the weights fall back to equal and no \
                  background is subtracted"
             );
+        }
+        if !self.quant.cross_run_width.is_finite() || self.quant.cross_run_width < 0.0 {
+            return Err(Invalid(format!(
+                "quant.cross_run_width must be finite and >= 0 (got {}); 0 is off",
+                self.quant.cross_run_width
+            )));
+        }
+        if self.quant.cross_run_width > 0.0
+            && (self.quant.fixed_scan_halfwidth == 0 || self.quant.fixed_window_s > 0.0)
+        {
+            return Err(Invalid(
+                "quant.cross_run_width needs the scan form of the fixed window \
+                 (quant.fixed_scan_halfwidth > 0 and quant.fixed_window_s = 0): the halfwidth \
+                 it chooses is a number of scans"
+                    .into(),
+            ));
         }
         if self.quant.baseline_subtract
             && self.quant.fixed_scan_halfwidth == 0

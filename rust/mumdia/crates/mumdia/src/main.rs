@@ -1768,6 +1768,7 @@ fn real_main() -> Result<()> {
                     &weights_from,
                     cfg.quant.cross_run_weights,
                     cfg.quant.cross_run_background,
+                    cfg.quant.cross_run_width,
                 )?)
             };
             let losers = match &overlap_losers {

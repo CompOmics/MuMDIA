@@ -364,10 +364,20 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    floor is sparse counts (half the flank samples are 0), which a quantile underestimates
    and a single run's mean estimates noisily (docs/TIMS_QUANT_ROADMAP.md section 4f).
 
+   **Cross-run width** (`cross_run_width`, `cross_run.halfwidth`). When > 0, pass 1 also
+   exports, per fragment, the flank mean beyond each halfwidth 3 to 7 scans
+   (`flank_mean_h3`..`flank_mean_h7`) and, per candidate, `peak_hwhm`: the half width at half
+   maximum, in scans, of the summed fragment trace around the apex with each fragment's flank
+   mean subtracted (`peak_hwhm`). `fit_cross_run` takes the HWHM of the candidate's brightest
+   run (largest summed pass-1 area) and sets `h = clamp(round(cross_run_width * HWHM), 3, 7)`;
+   the cross-run background then pools `flank_mean_h<h>`, and pass 2 integrates `2h+1` scans
+   in every run. The weights stay fitted on the pass-1 areas. Needs the scan form of the fixed
+   window. Measured on HYE diaPASEF only (docs/TIMS_QUANT_ROADMAP.md section 4h).
+
    **diaPASEF preset.** `apply_diapasef_quant` replaces a `quant` block left at its
    defaults with `QuantConfig::diapasef()` (predicted selection, envelope,
    `fixed_scan_halfwidth: 4`, `baseline_subtract` at quantile 0.6, cross-run weights and
-   background)
+   background, `cross_run_width: 2.5`)
    when every `run` / `run-experiment` input is a timsTOF `.d`, and logs it. Any
    explicitly set quant key keeps the block as written.
 
@@ -386,8 +396,9 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    then sums the top `top_n_peptides` unique base peptides under `TopNSum`; `Sum` uses
    all unique bases. A group with no quantifiable base peptide has null quantity
    and `quant_status=no_quantifiable_peptide`.
-8. Optional fragment export (`fragment_quant` v3: positive areas, plus zero areas under
-   `cross_run_background`; `apex_corr` and `flank_mean`, NaN outside a fixed window) and peak-bounds diagnostic
+8. Optional fragment export (`fragment_quant` v4: positive areas, plus zero areas under
+   `cross_run_background`; `apex_corr` and `flank_mean`, NaN outside a fixed window; in the
+   first pass under `cross_run_width` also `flank_mean_h3`..`flank_mean_h7` and `peak_hwhm`) and peak-bounds diagnostic
    (`quant.rs:419`). `ArtifactReport` records params + stats for each table
    (`quant.rs:603`).
 

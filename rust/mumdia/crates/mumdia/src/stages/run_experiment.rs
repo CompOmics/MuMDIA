@@ -1844,7 +1844,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // correlations, the weights are fitted over all runs, and the second pass below writes
     // the quantities with them. ponytail: two full passes; cache the areas if quant time matters.
     let mut frag_tables: Vec<String> = Vec::new();
-    let cross_run_on = qcfg.cross_run_weights || qcfg.cross_run_background;
+    let cross_run_on =
+        qcfg.cross_run_weights || qcfg.cross_run_background || qcfg.cross_run_width > 0.0;
     if cross_run_on {
         for i in 0..n_runs {
             let ft = d(&format!("{}/fragment_quant.parquet", names[i]));
@@ -1872,6 +1873,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             &frag_tables,
             qcfg.cross_run_weights,
             qcfg.cross_run_background,
+            qcfg.cross_run_width,
         )?;
         info!(
             weights = fit.weights.as_ref().map_or(0, |w| w.len()),

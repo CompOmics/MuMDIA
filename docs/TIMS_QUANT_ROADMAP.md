@@ -21,10 +21,11 @@ result on the fixed common ion set and on all ions.
   Making it general (Astral HYE, PYE diaPASEF, AIF) is a later step with its own measurement,
   so keep each lever a config key that other acquisitions can switch on, not a TDF-only code
   path.
-- **Targets.** The priority targets are DIA-NN's ProteoBench global median |epsilon| (0.118)
-  and species-equalised median |epsilon| (0.169), both at `min_obs` 3. CV (DIA-NN 0.076) is
-  secondary. When a lever trades the two, accuracy wins. A CV gain that compresses the ratios
-  is not accepted.
+- **Targets.** Since 2026-10-01 the targets are the two DIA-NN submissions of section 2b, one
+  with MBR off and one with MBR on, in sensitivity (ProteoBench ions at `min_obs` 3) and in
+  quantification (global, then species-equalised median |epsilon|, then CV). The earlier
+  reference of section 2 (0.118 / 0.169 / 0.076) is superseded. When a lever trades accuracy
+  against CV, accuracy wins. A CV gain that compresses the ratios is not accepted.
 - **Clean room.** DIA-NN is a reference for the result only. Published method descriptions
   (for example the QuantUMS preprint) can guide the design. Code and constants cannot.
 
@@ -49,6 +50,51 @@ ProteoBench at `min_obs` 3 (expected log2 A/B: E. coli -2, yeast +1, human 0). M
 
 MuMDIA reports 4% more ions than DIA-NN, but its epsilon is 46% higher and its E. coli
 ratio is compressed by 0.4 log2.
+
+This DIA-NN reference is superseded by section 2b. Sections 3 to 4g still compare against it.
+
+## 2b. Targets (2026-10-01): DIA-NN 2.5.0 MBR off, DIA-NN 2.2.0 MBR on
+
+Inputs are in `bench/diann_compare/`: `input_file.parquet` (ProteoBench's input),
+`result_performance.csv` (the per-ion intermediate) and `param_0..txt` (the DIA-NN log).
+
+| target | DIA-NN | MBR | FASTA | missed cleavages | charge | length | precursor m/z | variable mods |
+|---|---|---|---|---|---|---|---|---|
+| `250_noMBR` | 2.5.0 | off | `ProteoBenchFASTA_MixedSpecies_HYE.fasta` | 2 | 2-4 | 7-30 | 400-1200 | Met ox |
+| `220_MBR` | 2.2.0 | `--reanalyse` | `ProteoBenchFASTA_DDAQuantification.fasta` | 1 | 1-5 | 6-30 | 400-1000 | Met ox, N-term acetyl, `--met-excision` |
+| MuMDIA `eng_repick` | | | HYE FASTA | 1 | 2-4 | 7-30 | no cap | Met ox, Met excision |
+
+The diaPASEF windows cover precursor m/z 400-1000 only (24 windows of 25 Th), so the m/z caps do
+not differ in practice. Section 4h measures what the other differences cost.
+
+Scored with `bench/pb_eval.py --format DIA-NN --module quant_lfq_DIA_ion_diaPASEF`; both
+reproduce `result_performance.csv`. `min_obs` 3. "CV" is the median over ions of (CV_A + CV_B) / 2,
+as in `shared.py`. "PB CV" is ProteoBench's `CV_median`, which equals (median CV_A + median CV_B) / 2
+on all five arms here. (The CV values in the 2026-10-01 brief, 0.097 / 0.094 / 0.117 / 0.101, match
+neither definition and are not used.) MuMDIA arms are seed 0 `eng_repick` IDs with the diaPASEF quant
+preset (section 4g, `crwbg`); "+ MBR" adds the rescuable tier (section 4i).
+
+| arm | ions | global | eq | CV | PB CV | E. coli / human / yeast abs eps | E. coli log2 |
+|---|---|---|---|---|---|---|---|
+| DIA-NN 2.5.0, MBR off | **98,694** | **0.125** | 0.180 | 0.093 | 0.089 | 0.237 / 0.113 / 0.189 | -1.79 |
+| MuMDIA `crwbg`, MBR off | 92,540 | 0.134 | 0.180 | **0.090** | **0.087** | 0.231 / 0.123 / 0.185 | -1.84 |
+| DIA-NN 2.2.0, MBR on | **118,326** | 0.143 | **0.207** | 0.114 | 0.107 | 0.282 / 0.125 / 0.215 | -1.77 |
+| MuMDIA `crwbg` + MBR | 100,340 | 0.143 | 0.220 | **0.098** | **0.094** | 0.325 / 0.128 / 0.207 | -1.77 |
+
+On the ions shared with each target (`quant_diag/shared.py`, now reading `result_performance.csv`;
+`DIANN=250` or `220`), eps / CV / E. coli log2:
+
+| arm | shared | MuMDIA | DIA-NN on the same ions | MuMDIA-only |
+|---|---|---|---|---|
+| `crwbg` s0 against 2.5.0 | 81,778 | 0.127 / 0.088 / -1.84 | 0.115 / 0.088 / -1.80 | 10,762: 0.216 / 0.126 / -1.64 |
+| `crwbg` s1 against 2.5.0 | 81,506 | 0.127 / 0.088 / -1.84 | 0.115 / 0.088 / -1.80 | 10,635: 0.213 / 0.126 / -1.57 |
+| `crwbg` s2 against 2.5.0 | 81,755 | 0.127 / 0.088 / -1.84 | 0.115 / 0.088 / -1.80 | 10,720: 0.217 / 0.127 / -1.61 |
+| `crwbg` + MBR s0 against 2.2.0 | 91,379 | 0.138 / 0.095 / -1.79 | 0.127 / 0.104 / -1.80 | 8,961: 0.237 / 0.141 / -1.09 |
+
+- MBR off: eq and CV are at DIA-NN 2.5.0. Global epsilon is +0.009 on all ions and +0.012 on the
+  shared ions, so it is a per-ion precision gap, not an effect of the extra ions. Ions: -6.2%.
+- MBR on: CV is better than DIA-NN's (0.098 against 0.114), global epsilon is equal on all ions (+0.011 on shared), eq
+  is +0.013 (E. coli). Ions: -15.2%.
 
 ## 3. Diagnosis (Q0, done 2026-10-01)
 
@@ -494,6 +540,295 @@ Remaining gap to DIA-NN (0.118 / 0.169 / 0.076): global +0.016, eq +0.011, CV +0
 precision on faint ions is now the largest share of the global gap (human |eps| 0.123 against
 0.103).
 
+## 4h. The MBR-off ion gap is per-run identification depth (2026-10-01, seed 0)
+
+Scripts `quant_diag/gap.py`, `runrows.py` and `wrongpeak.py`; the scored DIA-NN intermediates and
+the per-ion class tables are in `quant_diag/pb_targets/`. Key: I/L-merged precursor ion. "Identified" in a run means target with
+pooled `q_value` <= 0.01, the gate quant uses.
+
+**Ion level.** Of the 98,694 DIA-NN 2.5.0 ions at `min_obs` 3, 81,665 are ours too. The 17,029
+DIA-NN-only ions:
+
+| class | ions | E. coli / human / yeast |
+|---|---|---|
+| outside our library: 2 missed cleavages | 475 | 26 / 380 / 69 |
+| in the library, never extracted | 683 | 20 / 556 / 107 |
+| extracted, identified in no run | 5,837 | 284 / 4,470 / 1,083 |
+| identified in 1 run | 4,570 | 319 / 3,305 / 946 |
+| identified in 2 runs | 5,460 | 588 / 3,555 / 1,317 |
+| identified in >= 3 runs, quantified in < 3 | 4 | |
+
+DIA-NN observes the median DIA-NN-only ion in 4 of 6 runs. Our 10,754 MuMDIA-only ions are the
+mirror image: DIA-NN reports 4,918 in no run, 2,618 in one and 3,218 in two.
+
+- The search space costs 0.5% of DIA-NN's ions (2 missed cleavages). The other differences
+  (Met excision on our side, no m/z cap) cost nothing, since the windows end at 1000.
+- 59% of the gap is completeness (identified in 1 or 2 runs), 34% is never identified, 4% never
+  extracted. Quant loses no identified ion.
+- Per run, DIA-NN quantifies 93,217 to 96,773 ions, we quantify 87,998 to 89,540 (7% fewer), and
+  about 75,000 are shared. The gap is per-run identification depth.
+
+**Run level.** 580,023 DIA-NN rows (`Q.Value` <= 0.01). We accept 79.4%; 11,802 are not extracted.
+The 107,504 extracted but not accepted rows, by our `q_value` and by our apex against DIA-NN's
+(`right` = RT within 5 s and 1/K0 within 0.015):
+
+| our q | right peak | RT right, 1/K0 off | wrong RT peak | all |
+|---|---|---|---|---|
+| 0.01-0.02 | 9,195 | 133 | 398 | 9,726 |
+| 0.02-0.05 | 10,762 | 212 | 722 | 11,696 |
+| 0.05-0.1 | 6,967 | 213 | 736 | 7,916 |
+| 0.1-0.5 | 12,719 | 819 | 5,323 | 18,861 |
+| > 0.5 | 6,008 | 3,647 | 49,650 | 59,305 |
+| all | 45,651 | 5,024 | 56,829 | 107,504 |
+
+On the rows we accept, the apex agrees with DIA-NN's in 98.8%. The missed rows are 0.4 log10
+fainter (DIA-NN `Precursor.Normalised` median 10^4.33 against 10^4.73).
+
+- Right peak, low score: 45,651 rows, 20,000 of them at q 0.01-0.05. This is the
+  `TIMS_ROADMAP_bis.md` section 7 population.
+- Wrong RT peak: 56,829 rows, almost all at q > 0.1. Run 0 (9,246 rows): DIA-NN's RT is inside
+  our RT window in 91%; DIA-NN's peak is among extract's top-5 peaks in 54% (rank 0: 1,704, i.e.
+  the repick moved away from extract's correct apex; ranks 1-4: 3,318); it is absent from the
+  top 5 in 46%. Median offset 23 s, median window half-width 37 s.
+- Both are identification levers (`TIMS_ROADMAP_bis.md` gates: seeds, entrapment, second
+  dataset). No quant lever can recover these ions.
+
+**The q unit is not the cause.** DIA-NN's report is filtered on run-level `Q.Value` <= 0.01 and
+run-level `PG.Q.Value` <= 0.01, with no global filter (1.9% of its rows have `Global.Q.Value` >
+0.01). Our closest unit is `run_psm_q`. Per run it accepts the same targets as the pooled `q_value`
+that quant gates on to within 0.8% (543,248 against 543,082 over six runs), with the same decoy
+counts. The completeness class is per-run depth, not a q-unit effect.
+
+**The human epsilon gap: noise against bias.** `quant_diag/bias_split.py` on
+the 43,223 complete human ions shared by DIA-NN 2.5.0 and both engine arms (seed 0). Per ion, e =
+mean log2 A - mean log2 B (centred), noise sd = sqrt(sd_A^2 / 3 + sd_B^2 / 3), bias sd = sqrt(var(e)
+- mean noise var). Intensity quartiles on DIA-NN's level.
+
+| arm | abs e | noise sd | bias sd | bias sd, quartiles faint to bright |
+|---|---|---|---|---|
+| DIA-NN 2.5.0 | 0.086 | 0.098 | 0.097 | 0.089 / 0.100 / 0.088 / 0.104 |
+| per-run background (`q_rp_crw_s0`, section 4c) | 0.093 | 0.099 | 0.106 | 0.114 / 0.113 / 0.088 / 0.102 |
+| pooled background (`q_rp_crwbg_s0`, section 4g) | 0.094 | 0.099 | 0.119 | 0.123 / 0.124 / 0.099 / 0.124 |
+
+- Within-condition noise is equal to DIA-NN's in the three fainter quartiles. In the brightest it
+  is higher (0.070 against 0.061), and there abs e is too (0.072 against 0.061).
+- Across all ions the error is larger than the noise predicts: median |z| 0.95 against DIA-NN's
+  0.90, at equal noise sd.
+- The bias sd is a variance estimate and is sensitive to outliers. The prototype pooled arm below
+  matches the engine pooled arm in ions, global, eq and CV, but gives bias sd 0.111 against 0.119.
+  The difference between the two engine arms (0.106 against 0.119) is therefore not evidence that
+  the pooled background causes the bias. Median |z| moves only from 0.947 to 0.954.
+
+**Background shrinkage: no gain** (`quant_diag/shrink_eval.sh`, `q2_combine.py POOL_SHRINK=w`;
+background = (1 - w) x the run's own flank mean + w x the six-run pool, the same rule for every
+run; cross-run weights, fragments only, seed 0). The w = 1 control reproduces the pooled arm.
+
+| w | global | eq | CV | E. coli | shared | only | human median abs z | human bias sd |
+|---|---|---|---|---|---|---|---|---|
+| 0 (own flank mean) | 0.134 | 0.184 | 0.090 | -1.81 | 0.128 / 0.090 / -1.82 | 0.221 / 0.129 / -1.58 | 0.943 | 0.113 |
+| 0.25 | 0.134 | 0.183 | 0.089 | -1.82 | 0.127 / 0.089 / -1.83 | 0.219 / 0.128 / -1.59 | 0.947 | 0.109 |
+| 0.5 | 0.133 | 0.182 | 0.088 | -1.83 | 0.127 / 0.089 / -1.83 | 0.216 / 0.127 / -1.60 | 0.949 | 0.109 |
+| 0.75 | 0.133 | 0.181 | 0.088 | -1.83 | 0.127 / 0.088 / -1.84 | 0.215 / 0.126 / -1.61 | 0.954 | 0.111 |
+| 1 (pool, preset) | 0.134 | 0.180 | 0.087 | -1.84 | 0.127 / 0.088 / -1.84 | 0.215 / 0.125 / -1.63 | 0.954 | 0.111 |
+| DIA-NN 2.5.0 | 0.125 | 0.180 | | -1.79 | 0.115 / 0.088 / -1.80 | | 0.897 | 0.097 |
+
+- Global epsilon does not move (0.133 to 0.134), and neither does the human excess over noise.
+  w = 1 is the best eq and CV. The preset stays.
+- The human gap does not come from how the background level is estimated. The remaining clue is
+  the brightest quartile, where our noise is higher than DIA-NN's and a background plays no part.
+
+**The window is too narrow for bright peaks.** The same split on the Q1 window arms (top-3, no
+baseline; section 4) shows that in the brightest human quartile the noise falls with the width:
+0.096 / 0.071 / 0.061 at `fixed_window_s` 3 / 4 / 5 (DIA-NN 0.061), and abs e falls from 0.090 to
+0.065 (DIA-NN 0.061). The faint quartile does not change (abs e 0.136 to 0.137). The preset's 9
+scans equal `fixed_window_s: 4`.
+
+Engine requant of the full diaPASEF preset with only `fixed_scan_halfwidth` changed
+(`requant_crw.sh`, new `FSH` variable, default 4):
+
+| seed | halfwidth | ions | global | eq | CV | E. coli / human / yeast abs eps | shared | only |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 4 (preset) | 92,540 | 0.134 | **0.180** | 0.087 | 0.231 / 0.123 / 0.185 | 0.127 / 0.088 / -1.84 | 0.216 / 0.126 / -1.64 |
+| 0 | **5** | 92,540 | 0.131 | 0.181 | 0.083 | 0.237 / 0.120 / 0.185 | 0.125 / 0.084 / -1.83 | 0.209 / 0.121 / -1.63 |
+| 0 | 6 | 92,540 | **0.130** | 0.186 | **0.082** | 0.246 / 0.120 / 0.191 | 0.124 / 0.082 / -1.82 | 0.211 / 0.120 / -1.62 |
+| 1 | 4 (preset) | 92,141 | 0.133 | 0.180 | 0.087 | 0.232 / 0.123 / 0.186 | 0.127 / 0.088 / -1.84 | 0.213 / 0.126 / -1.57 |
+| 1 | 5 | 92,141 | 0.130 | 0.181 | 0.083 | 0.238 / 0.120 / 0.186 | 0.124 / 0.084 / -1.83 | 0.207 / 0.121 / -1.59 |
+| 2 | 4 (preset) | 92,475 | 0.134 | 0.181 | 0.087 | 0.233 / 0.123 / 0.186 | 0.127 / 0.088 / -1.84 | 0.217 / 0.127 / -1.61 |
+| 2 | 5 | 92,475 | 0.131 | 0.183 | 0.083 | 0.241 / 0.120 / 0.186 | 0.125 / 0.084 / -1.83 | 0.210 / 0.121 / -1.60 |
+| | DIA-NN 2.5.0 | 98,694 | 0.125 | 0.180 | 0.089 | 0.237 / 0.113 / 0.189 | 0.115 / 0.088 / -1.80 | |
+
+(CV here is ProteoBench's `CV_median`; the shared and only columns use the `shared.py` CV.)
+
+- Halfwidth 5 against 4, the same on all three ID sets: global -0.003, CV -0.004, human abs eps
+  -0.003, shared-ion eps -0.002 to -0.003, eq +0.001 to +0.002 (E. coli abs eps +0.006 to +0.008).
+  It closes about a third of the global gap to DIA-NN 2.5.0, and our CV moves below DIA-NN's.
+- Halfwidth 6 continues the trade: global -0.001 and CV -0.001 more, eq +0.005 (E. coli). The wider
+  window helps bright ions and adds floor to faint E. coli ions in condition A.
+- Under section 1 (accuracy first; eq is not to get worse), 5 is a near-even trade on eq and a
+  gain on global and CV. Promoting it to `QuantConfig::diapasef` is a one-value change. It is not
+  done yet: the eq cost needs a decision.
+- The width that is right depends on the peak. The next lever is a window that follows the peak
+  width: for example a width per precursor, learned across runs from its brightest runs and used
+  in every run (label-blind, part of the cross-run step). Prototype it offline first.
+
+**A halfwidth per precursor from its peak width (prototype, 2026-10-01).** `quant_diag/wwin.py`
+(`wwin.sh <seed> <rule ...>`). `extract` keeps each fragment's raw samples at +-19 scans around
+quant's apex; `combine` recomputes the diaPASEF preset (pooled flank-mean background, envelope,
+cross-run weights, fragments only) at any halfwidth h per precursor, the same h in every run.
+Rules, all label-blind:
+- `fixed:h`: h for every precursor (controls).
+- `width:c[:floor]`: h = clamp(round(c x HWHM), floor (default 3), 7). HWHM is the half width at
+  half maximum, in scans, of the summed background-subtracted fragment trace in the precursor's
+  brightest run (largest quantity at h 4). HWHM quartiles: 1.27 / 1.83 / 2.36 scans.
+- `bright:q`: h = 5 above the q quantile of the brightest-run quantity, else 4.
+
+Controls: `fixed:4` gives 0.134 / 0.180 / 0.087 (engine preset 0.134 / 0.180 / 0.087), `fixed:5`
+0.130 / 0.181 / 0.083 (engine 0.131 / 0.181 / 0.083). Seed 0, 92,540 ions in every arm:
+
+| rule | h = 3 / 4 / 5 / 6 / 7 (precursors) | global | eq | CV | E. coli / human / yeast abs eps | shared | only |
+|---|---|---|---|---|---|---|---|
+| `fixed:4` (preset) | all 4 | 0.134 | 0.180 | 0.087 | 0.232 / 0.124 / 0.185 | 0.127 / 0.088 / -1.84 | 0.215 / 0.125 / -1.63 |
+| `fixed:5` | all 5 | 0.130 | 0.181 | 0.083 | 0.236 / 0.120 / 0.187 | 0.124 / 0.084 / -1.83 | 0.211 / 0.121 / -1.61 |
+| `width:1` | 115k / 5.6k / 3.1k / 1.0k / 0.5k | 0.142 | 0.186 | 0.097 | 0.235 / 0.133 / 0.189 | 0.136 / 0.098 / -1.86 | 0.223 / 0.132 / -1.65 |
+| `width:1.5` | 93k / 17k / 6.6k / 3.4k / 5.6k | 0.139 | 0.182 | 0.094 | 0.231 / 0.130 / 0.186 | 0.133 / 0.095 / -1.86 | 0.219 / 0.128 / -1.65 |
+| `width:2` | 56k / 33k / 16k / 7.5k / 13k | 0.132 | **0.178** | 0.086 | **0.228** / 0.123 / **0.182** | 0.127 / 0.087 / -1.85 | 0.211 / 0.122 / -1.62 |
+| **`width:2.5`** | 36k / 24k / 26k / 15k / 24k | 0.130 | **0.178** | 0.083 | 0.231 / 0.120 / 0.184 | 0.123 / 0.083 / -1.84 | 0.210 / 0.120 / -1.62 |
+| `width:3` | 27k / 14k / 22k / 22k / 40k | **0.129** | 0.181 | **0.082** | 0.237 / **0.119** / 0.187 | 0.123 / 0.082 / -1.83 | 0.206 / 0.119 / -1.60 |
+| `width:3.5` | 20k / 12k / 12k / 20k / 60k | 0.130 | 0.184 | **0.082** | 0.244 / 0.119 / 0.189 | 0.124 / 0.082 / -1.82 | 0.207 / 0.119 / -1.55 |
+| `width:2.5:4` | 0 / 60k / 26k / 15k / 24k | 0.130 | 0.180 | **0.082** | 0.235 / 0.119 / 0.185 | 0.123 / 0.083 / -1.84 | 0.207 / 0.120 / -1.61 |
+| `width:3:4` | 0 / 40k / 22k / 22k / 40k | 0.130 | 0.182 | **0.082** | 0.238 / 0.119 / 0.188 | 0.123 / 0.082 / -1.83 | 0.206 / 0.120 / -1.59 |
+| `bright:0.5` | 0 / 62k / 62k / 0 / 0 | 0.131 | 0.181 | 0.084 | 0.236 / 0.121 / 0.186 | 0.125 / 0.084 / -1.83 | 0.210 / 0.122 / -1.62 |
+| `bright:0.75` | 0 / 94k / 31k / 0 / 0 | 0.131 | 0.179 | 0.084 | 0.232 / 0.121 / 0.184 | 0.125 / 0.085 / -1.84 | 0.212 / 0.124 / -1.62 |
+
+Precursor counts include those quantified in fewer than 3 runs.
+
+Replication of `width:2.5` against the preset on the same IDs:
+
+| seed | arm | ions | global | eq | CV | E. coli / human / yeast abs eps | shared | only |
+|---|---|---|---|---|---|---|---|---|
+| 0 | preset | 92,540 | 0.134 | 0.180 | 0.087 | 0.231 / 0.123 / 0.185 | 0.127 / 0.088 / -1.84 | 0.216 / 0.126 / -1.64 |
+| 0 | `width:2.5` | 92,540 | 0.130 | 0.178 | 0.083 | 0.231 / 0.120 / 0.184 | 0.123 / 0.083 / -1.84 | 0.210 / 0.120 / -1.62 |
+| 1 | preset | 92,141 | 0.133 | 0.180 | 0.087 | 0.232 / 0.123 / 0.186 | 0.127 / 0.088 / -1.84 | 0.213 / 0.126 / -1.57 |
+| 1 | `width:2.5` | 92,141 | 0.129 | 0.178 | 0.083 | 0.232 / 0.119 / 0.182 | 0.123 / 0.083 / -1.84 | 0.206 / 0.119 / -1.57 |
+| 2 | preset | 92,475 | 0.134 | 0.181 | 0.087 | 0.233 / 0.123 / 0.186 | 0.127 / 0.088 / -1.84 | 0.217 / 0.127 / -1.61 |
+| 2 | `width:2.5` | 92,475 | 0.130 | 0.180 | 0.083 | 0.236 / 0.119 / 0.184 | 0.123 / 0.083 / -1.84 | 0.210 / 0.121 / -1.58 |
+| | DIA-NN 2.5.0 | 98,694 | 0.125 | 0.180 | 0.089 | 0.237 / 0.113 / 0.189 | 0.115 / 0.088 / -1.80 | |
+
+- On all three ID sets: global -0.004, eq -0.001 to -0.002, CV -0.004, shared-ion eps -0.004, same
+  ion count. Unlike `fixed:5`, it costs no eq: narrow peaks keep a narrow window, so faint E. coli
+  ions in condition A collect no more floor.
+- Global gap to DIA-NN 2.5.0: 0.009 to 0.005 (about 45% closed). eq is at DIA-NN's value, CV 0.006
+  below it.
+- Human split (seed 0): in the brightest quartile the noise is now 0.056 (DIA-NN 0.061, preset
+  0.069) and abs e 0.062 (DIA-NN 0.061). The faint quartile does not change (abs e 0.130 against
+  DIA-NN 0.118). The remaining global gap is on faint ions.
+- Submission (seed 0): `bench/proteobench_input/ww_width2.5/`.
+- The background must come from the flank beyond the chosen window. With the flank fixed beyond
+  +-7 scans for every precursor (`FLANK_AT=7`), `width:2.5` gives 0.130 / 0.180 / 0.083: the eq
+  gain is lost, because a narrow peak then takes its background from too far away.
+
+**Engine: `quant.cross_run_width` (2026-10-01).** In the two-pass cross-run step. Pass 1 exports
+per fragment the flank mean beyond each halfwidth 3 to 7 (`flank_mean_h3`..`h7`) and per candidate
+`peak_hwhm` (fragment flank mean subtracted, per run); `fit_cross_run` takes the HWHM of the
+candidate's brightest run (largest summed pass-1 area), h = clamp(round(2.5 x HWHM), 3, 7), and
+pools `flank_mean_h<h>`; pass 2 integrates 2h+1 scans. The weights stay fitted on the pass-1 areas.
+`fragment_quant` v4. Part of `QuantConfig::diapasef()` (2.5). Binary `~/bin/mumdia-ww/mumdia`,
+harness `requant_crw.sh` with `WIDTH=2.5`.
+
+| seed | ions | global | eq | CV | E. coli / human / yeast abs eps | shared | only |
+|---|---|---|---|---|---|---|---|
+| 0 | 92,540 | 0.130 | 0.177 | 0.083 | 0.228 / 0.120 / 0.182 | 0.123 / 0.083 / -1.84 | 0.211 / 0.121 / -1.59 |
+| 1 | 92,141 | 0.129 | 0.177 | 0.083 | 0.230 / 0.119 / 0.182 | 0.123 / 0.083 / -1.84 | 0.210 / 0.121 / -1.59 |
+| 2 | 92,475 | 0.130 | 0.178 | 0.083 | 0.231 / 0.120 / 0.183 | 0.123 / 0.083 / -1.84 | 0.212 / 0.122 / -1.59 |
+| DIA-NN 2.5.0 | 98,694 | 0.125 | 0.180 | 0.089 | 0.237 / 0.113 / 0.189 | 0.115 / 0.088 / -1.80 | |
+
+Against the preset of section 4g on the same IDs: global -0.004, eq -0.003, CV -0.004 on every ID
+set; the engine matches the prototype (seed 0 prototype 0.130 / 0.178 / 0.083). MBR off, eq and CV
+are now better than DIA-NN 2.5.0; global epsilon is +0.005 (human faint ions) and ions -6.2%.
+
+## 4i. MBR on: transferred values are the right peak with a weak signal (2026-10-01, seed 0)
+
+`quant_diag/mbrdiag.py` on `mbr_s0` (39,071 transfers, RT window 1.7 s) and its quant
+`q_rp_mbr_crwbg_s0`. Per row, `d` = log2(value) - median log2 of the confident values of the
+other condition - the expected log2 ratio (0 for an accurate value; species labels are used for
+this diagnosis only). Controls (C) are the confident rows, scored leave-one-out. Cosine: pass-1
+fragment areas against the L1-normalised mean of the other confident runs.
+
+| species, cond | group | rows | d median | abs d | 1/K0 off > 0.015 | cosine median | cos < 0.8 | in 2.2.0 | RT within 5 s of 2.2.0 | in 2.5.0 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| E. coli A (low) | C | 8,666 | +0.15 | 0.24 | 0.3% | 0.971 | 4.7% | 93% | 99.6% | 81% |
+| | T | 3,997 | +0.52 | 0.63 | 5.9% | 0.874 | 26.9% | 56% | 99.2% | 20% |
+| E. coli B (high) | C | 21,470 | -0.17 | 0.25 | 0.3% | 0.973 | 9.6% | 88% | 99.6% | 84% |
+| | T | 556 | -1.87 | 1.87 | 2.2% | 0.945 | 7.6% | 65% | 98.6% | 48% |
+| human A | T | 13,439 | -0.09 | 0.30 | 3.6% | 0.939 | 10.5% | 64% | 98.9% | 41% |
+| human B | T | 11,996 | -0.09 | 0.30 | 3.8% | 0.940 | 10.3% | 63% | 98.6% | 43% |
+| yeast A (high) | T | 1,685 | -0.60 | 0.65 | 3.6% | 0.940 | 11.8% | 63% | 98.5% | 49% |
+| yeast B (low) | C | 32,319 | +0.11 | 0.20 | 0.2% | 0.978 | 3.5% | 92% | 99.3% | 83% |
+| | T | 7,147 | +0.24 | 0.39 | 3.5% | 0.914 | 16.3% | 66% | 99.5% | 32% |
+
+Human controls: d +0.02 / -0.02, abs d 0.15, cosine 0.98.
+
+- **Right peak.** Where DIA-NN 2.2.0 reports the ion in the same run, our transfer apex is within
+  5 s of its RT in 98.5-99.5% of rows, as for confident rows. 1/K0 is off by more than 0.015 in
+  2-6% of transfers (0.3% of controls).
+- **Weak signal.** Transfers are 2.4 log2 fainter than confident rows. In the low condition they
+  are overestimated (E. coli A +0.52, yeast B +0.24); in the high condition they are
+  underestimated (selection: a run where the ion failed to identify is a run where its signal
+  came out low). Matched on the expected value, transfers are still worse than confident rows
+  (low condition, expected log2 13.5-14.5: abs d 0.40 against 0.29).
+- **DIA-NN has the same error on the same rows.** On the (ion, run) rows both report, DIA-NN's own
+  d: E. coli A transfers +0.28 (ours +0.38), abs 0.38 (ours 0.52); human transfers abs 0.24-0.25
+  (ours 0.29). DIA-NN's confident rows: E. coli A +0.16, as ours (+0.15).
+- **Guards do not separate the error.** On the low-condition transfers, d by cosine bin is +0.39 /
+  +0.26 / +0.27 / +0.30 / +0.40 (cosine <= 0.6 to > 0.95); by 1/K0 offset +0.28 (<= 0.005, 81% of
+  rows), +0.38, +0.56, +0.91 (> 0.015, 485 rows). A 1/K0 guard at 0.015 would act on 4% of
+  transfers; a cosine guard removes rows that are no worse than the rest. Both are dropped as
+  quant levers. A 1/K0 check is still sound FDR hygiene, but it is about a 1% effect.
+- The quant gap on transfers is the faint-ion floor of sections 4d to 4g, made larger by the
+  selection. It is not a wrong-signal problem, so a separate quant path for transfers has no
+  measured basis yet.
+
+**MBR-on ion gap.** Of the 27,045 DIA-NN 2.2.0-only ions: outside our search space 2,173
+(N-term acetyl 1,069, charge 1 or 5 576, length 6 528; the DDA FASTA adds none), never extracted
+1,117, never identified 13,038, identified in 1 run 8,015, in 2 runs 2,699. Per run DIA-NN
+quantifies 110,702 to 112,703 ions, we quantify 94,221 to 95,710.
+
+`quant_diag/mbrgap.py`. The 109,717 (ion, run) rows DIA-NN reports and our MBR submission does not, by anchors (runs where
+we are confident without transfer) and by our extracted apex against DIA-NN's RT:
+
+| case | rows |
+|---|---|
+| no anchor run | 68,158 |
+| 1 anchor, right peak | 15,501 |
+| 1 anchor, wrong peak | 15,406 |
+| >= 2 anchors, wrong peak | 6,577 |
+| >= 1 anchor, not extracted | 2,633 |
+| >= 2 anchors, right peak | 1,442 |
+
+Upper bounds on DIA-NN-only ions that reach 3 runs (24,872 in our search space), before any FDR
+test: right peak with >= 2 anchors 883; + right peak with 1 anchor 5,329; + integration at the
+predicted RT where our peak is wrong or not extracted 10,706. 62% of the rows belong to ions we
+never identify in any run; MBR cannot reach them, and the remaining MBR-on gap is mostly the
+per-run depth of section 4h.
+
+**`mbr.min_anchor_runs: 1`** (worker flag, no engine change; `mbr_a1_s0`, quant
+`q_rp_mbr_a1_crwbg_s0`). Control: the worker at the default reproduces `mbr_s0` exactly.
+
+| arm | transfers | RT window | ions | global | eq | CV | PB CV | E. coli / human / yeast abs eps | shared against 2.2.0 | MuMDIA-only |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `min_anchor_runs` 2 | 39,071 | 1.7 s | 100,340 | 0.143 | 0.220 | 0.098 | 0.094 | 0.325 / 0.128 / 0.207 | 91,379: 0.138 / 0.095 / -1.79 | 8,961: 0.237 / 0.141 / -1.09 |
+| `min_anchor_runs` 1 | 48,808 | 1.0 s | 105,092 | 0.148 | 0.229 | 0.096 | 0.093 | 0.333 / 0.132 / 0.221 | 92,913: 0.139 / 0.093 / -1.79 | 12,179: 0.270 / 0.137 / -0.63 |
+
++4,752 ions, but only 1,534 of them are DIA-NN ions. The other 3,218 move our-only E. coli from
+-1.09 to -0.63, which fits false or mostly-noise transfers. One pooled transfer test also
+tightens the window for the 2-anchor tier (1.7 s to 1.0 s). Rejected in this form. If revisited:
+a separate transfer q per anchor tier.
+
+**Next MBR lever, by size:** integration at the predicted RT for a precursor that is confident
+elsewhere but whose extracted apex is elsewhere or missing (the re-extraction tier; up to about
+5,400 ions beyond the 1-anchor tier). It needs Rust plumbing and an FDR null for the integrated
+value, so it comes after a prototype on the chromatograms.
+
 ## 5. Plan
 
 Ordered by expected gain per unit of work. Each phase states its target and its gate. Quant
@@ -598,7 +933,8 @@ Target: the 15,235 extra ions, now at |epsilon| 0.194 and E. coli -1.44 under Q1
 
 ### Out of scope here
 
-- MBR and transfer requant (benchmark is MBR off).
+- MBR and transfer requant were out of scope while the target was MBR off. Since 2026-10-01 the
+  MBR-on target is in scope (sections 2b and 4i).
 - Protein-level quant and MaxLFQ (ProteoBench scores precursor ions).
 - Anything that changes the identification population. If a quant lever needs a rescore
   change, it moves to the identification roadmap with its gates.
