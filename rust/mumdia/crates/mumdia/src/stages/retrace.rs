@@ -706,7 +706,9 @@ pub fn run(p: RetraceParams) -> Result<u64> {
         // 0 = extract's apex then the sidecar ranks, apex RT, score). Off by default; the
         // pick is the same either way (docs/TIMS_ROADMAP_bis.md section 9).
         let dump = std::env::var("MUMDIA_REPICK_DUMP").ok();
-        let scored: Vec<(Option<(u32, f64, f64)>, Vec<(u32, u32, f64, f64)>)> = (0..ex.nrows)
+        // (pick: candidate, apex RT, 1/K0 centre; dumped rows: candidate, order, apex RT, score)
+        type Scored = (Option<(u32, f64, f64)>, Vec<(u32, u32, f64, f64)>);
+        let scored: Vec<Scored> = (0..ex.nrows)
             .into_par_iter()
             .map(|i| {
                 let (c, ci) = (ex_cid[i], ex_cid[i] as usize);

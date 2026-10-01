@@ -1842,3 +1842,37 @@ wins. Sigma in seconds, or as a multiple of the candidate's RT-window half-width
 - The rule reads no label and generalises with the window (it scales with `rt_im_train`'s window).
 - Next: an engine key (`retrace.repick_rt_prior`, multiple of the window half-width, 0 = off), then
   the identification gates: E. coli full run over 3 seeds, entrapment, HYE six runs.
+
+**Gates: `retrace.repick_rt_prior: 1` (2026-10-02).** Engine key for this measurement (sigma =
+1 x the RT-window half-width, 0 = off), removed again after the gates. On HYE run 0 the engine picks equal the offline counterfactual on all
+7,086,111 candidates. Binary `~/bin/mumdia-rtprior/mumdia`; full runs in
+`/public/local/MuMDIA_repick/prior1`, HYE in `eng_prior1` (seed 0, quant with the diaPASEF preset
+including `cross_run_width`).
+
+| gate | without the prior | with the prior |
+|---|---|---|
+| E. coli peptides, 3 seeds | 14,869 / 14,911 / 14,953 (14,911) | 14,873 / 14,951 / 15,021 (14,948, +0.25%) |
+| entrapment real peptides, 3 seeds | 13,906 / 13,948 / 14,071 (13,975) | 13,927 / 13,865 / 13,864 (13,885, -0.6%) |
+| entrapment FDP | 0.47 / 0.37 / 0.43% | 0.42 / 0.41 / 0.42% |
+| HYE precursors / peptides / PGs (seed 0) | 112,800 / 100,790 / 12,331 | 112,872 / 100,823 / 12,318 |
+| HYE target rows at pooled q 1%, six runs | 543,082 | 545,769 (+0.5%) |
+| HYE ProteoBench ions (k = 3) | 92,540 | 93,142 (+0.65%) |
+| HYE global / eq / CV | 0.130 / 0.177 / 0.083 | 0.130 / 0.178 / 0.084 |
+
+HYE run 0, by what the prior did to the candidates DIA-NN reports:
+
+| candidates | n | accepted before | accepted after |
+|---|---|---|---|
+| moved onto DIA-NN's peak | 3,064 | 3.4% | 37.6% |
+| moved off DIA-NN's peak | 807 | 42.6% | 12.3% |
+| right before and after | 82,770 | 90.6% | 90.2% |
+| wrong before and after | 6,666 | 5.7% | 5.3% |
+
+- The prior repairs the peak choice as predicted, but 62% of the candidates it moves onto the
+  right peak still fail scoring (median q 0.048, half at q <= 0.05). On these faint precursors the
+  score is the bottleneck, not the peak.
+- Net: +0.25% / -0.6% / +0.5% (E. coli / entrapment / HYE rows), inside seed noise. Not promoted;
+  the key is not kept (the change is 10 lines in `retrace.rs` `repick`, multiplying the score).
+- Next: the "right peak, low score" population (docs/TIMS_QUANT_ROADMAP.md section 4h: 45,651
+  run-level HYE rows, 20,000 at q 0.01-0.05), now including these repaired candidates.
+- The pooled HYE rescore took 2,093 s at a 134 GB peak (eng_repick: 3,751 s, 69 GB).
