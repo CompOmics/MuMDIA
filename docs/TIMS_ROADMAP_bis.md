@@ -1711,3 +1711,82 @@ L1e (rescore only, against 13,920):
 - The sensitivity recipe (`seeds: 3`, `folds: 5`, `train_margin_frac: 0.75`): 13,998
   (+0.6%).
 - Both take about 3x the training time. They remain the option for a final pass.
+
+## 8. Where DIA-NN still finds more, and the apex re-pick (2026-09-30 to 2026-10-01)
+
+The counts are stripped peptides at `peptide_q_value` 1%, over 3 `nn_torch` seeds, on the
+E. coli diaPASEF file. The baseline is the full run with retrace and `retrace_apex` (13,883).
+Everything is recorded in `/public/local/MuMDIA_raw/RESULTS_ms1.txt`.
+
+**What the gap is not.**
+- **FDR calibration.** DIA-NN, run on the entrapment FASTA with the reference settings,
+  reports 14,761 real peptides at an FDP of 0.41%. MuMDIA reports 13,258 at 0.45%. So the
+  gap holds at the same empirical FDP.
+- **Library.** On the same 594,756 keys with the same decoy script, DIA-NN's fragments with
+  IM2Deep 1/K0 give 13,483 peptides, against 13,970 for ours (−3.5%). D3's result on the P6
+  base has reversed.
+- **Tolerance.** A retrace fragment tolerance of 7 or 5 ppm loses 1.0% or 2.3% (DIA-NN chose
+  8 ppm).
+- **Sampling.** Every window is revisited every 0.968 s, and the trace grid holds every
+  sample.
+- **Marginal calls.** DIA-NN's median q for the precursors we miss is 5×10⁻⁴.
+
+**What the gap is.** Extract's apex, in RT and in 1/K0, was compared with DIA-NN's observed
+values (more than 0.015 in 1/K0, or more than 5 s in RT, counts as off):
+
+| population | `apex_im` off | `im_pred_cal` off | wrong RT peak |
+|---|---|---|---|
+| accepted | 2% | 33% | 2.5% |
+| right peak, low score | 42% | 36% | 0% (by definition) |
+| wrong peak, in window | 47% | 38% | 100% (by definition) |
+
+**Levers, E. coli.**
+
+| lever | result |
+|---|---|
+| 1/K0 band only (rule D: best band by library cosine × √I), prototype | 14,145 (+1.9%) |
+| joint RT peak and band (extract's apex + 5 sidecar peaks), prototype | 14,769 (+6.4%) |
+| joint choice, engine (`retrace.repick`), fast loop | 14,832 |
+| **`retrace.repick`, full run** | **14,869 / 14,911 / 14,953 (14,911, +7.4%)**, 18,544 precursors |
+
+- The full-run result is 0.97x DIA-NN's peptides and 0.99x its precursors.
+- Offline, against DIA-NN's RT, the joint choice puts 73% of the wrong-peak keys on the right
+  peak, keeps 87% of the right-peak rejects there, and leaves accepted precursors unchanged.
+
+**Entrapment** (full runs):
+- `retrace.repick`: 13,906 / 13,948 / 14,071 real peptides (13,975, +5.4%), FDP 0.37-0.47%.
+- Control: 13,258 real peptides at an FDP of 0.45-0.47%.
+- 13,975 is 0.95x DIA-NN at a lower FDP.
+- The fast-loop prototype had added 644 real peptides and 2 spike-ins.
+
+**HYE diaPASEF** (`eng_repick`: six runs, seed 0, against `eng_apex`, which is the same
+pipeline without the re-pick):
+- The extract rerun with `retain_top_peaks: 5` gave a `psms_extracted` identical to
+  `pass2_robust` in all six runs.
+
+| | `eng_apex` | `eng_repick` |
+|---|---|---|
+| precursors | 103,641 | 112,800 (+8.8%) |
+| peptides | 92,951 | 100,790 (+8.4%) |
+| PGs | 11,887 | 12,331 (+3.7%) |
+| ProteoBench ions (k = 3) | 80,359 | 92,540 (+15.2%) |
+| median abs epsilon / CV | 0.176 / 0.110 | 0.172 / 0.107 |
+
+The decoy fraction is 0.010 in both.
+
+**Tuning** (fast loop, control 14,832), all within seed noise:
+
+| arm | peptides |
+|---|---|
+| `retain_top_peaks` 3 | 14,805 |
+| `retain_top_peaks` 8 | 14,783 |
+| seed rows used only within 3 s of the chosen apex | 14,817 |
+
+`retain_top_peaks` stays at 5.
+
+**Engine notes.**
+- The band centre is the prediction-weighted 1/K0 centroid of the raw profile inside the
+  winning band. The first maximum of the band score sits at the low-1/K0 edge of a plateau,
+  because an ion is narrower than the band; using that edge gave 14,782.
+- Retrace including the repick takes 15 s and 20.8 GB on E. coli, and 6-7.5 min and 36-39 GB
+  per HYE run (three runs at once).

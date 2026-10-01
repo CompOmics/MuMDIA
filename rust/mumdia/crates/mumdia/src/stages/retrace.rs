@@ -62,6 +62,8 @@ pub struct RetraceParams<'a> {
     pub out: &'a str,
     /// `features.retrace_apex`: also write the per-candidate apex sidecar here.
     pub apex_out: Option<&'a str>,
+    /// `retrace.repick`: the re-picked `psms_extracted` is written here.
+    pub psms_out: Option<&'a str>,
     pub cfg: &'a RetraceConfig,
     pub config_hash: &'a str,
 }
@@ -302,6 +304,131 @@ impl Apex {
     }
 }
 
+// `retrace.repick` (docs/TIMS_ROADMAP_bis.md section 8, prototype joint_peak.py): the 1/K0
+// profile of each candidate peak is binned at REPICK_BIN over the run_windows 1/K0 window
+// and scored in bands of 2 * REPICK_BAND_BINS + 1 bins (+/- 0.015), over the MS2 frames
+// within REPICK_RT_HW_S of the peak's apex.
+const REPICK_BIN: f64 = 0.002;
+const REPICK_BAND_BINS: usize = 7;
+const REPICK_RT_HW_S: f64 = 1.5;
+
+/// One candidate peak on the raw events: over the 1/K0 bands of `[a, b]`, the band with the
+/// best `cos x sqrt(I / I_max)`, where `cos` is the cosine of the square-rooted band sums of
+/// the fragments against the square-rooted predictions and `I` the prediction-weighted
+/// band intensity. Returns that band's `cos x ln(1 + I)` and its centre; (0, NaN) without
+/// signal. `wins` holds each fragment's TOF window, `pred` its predicted intensity.
+fn joint_score(
+    fl: &[(&TofFrame, Vec<(usize, usize)>)],
+    wins: &[(u32, u32)],
+    pred: &[f64],
+    scan_im: &[f64],
+    a: f64,
+    b: f64,
+) -> (f64, f64) {
+    let nb = ((b - a) / REPICK_BIN).ceil().max(1.0) as usize;
+    let nf = wins.len();
+    let mut prof = vec![0.0f64; nf * nb];
+    for (f, &(t_lo, t_hi)) in wins.iter().enumerate() {
+        let row = &mut prof[f * nb..(f + 1) * nb];
+        for (fr, scans) in fl {
+            visit_events(fr, scans, t_lo, t_hi, scan_im.len(), |sc, w| {
+                let k = ((scan_im[sc] - a) / REPICK_BIN) as isize;
+                row[k.clamp(0, nb as isize - 1) as usize] += w;
+            });
+        }
+    }
+    // band sums, fragment-major
+    let k = REPICK_BAND_BINS;
+    let mut band = vec![0.0f64; nf * nb];
+    for f in 0..nf {
+        let row = &prof[f * nb..(f + 1) * nb];
+        for i in 0..nb {
+            band[f * nb + i] = row[i.saturating_sub(k)..(i + k + 1).min(nb)].iter().sum();
+        }
+    }
+    let inten: Vec<f64> = (0..nb)
+        .map(|i| (0..nf).map(|f| pred[f] * band[f * nb + i]).sum())
+        .collect();
+    let mx = inten.iter().cloned().fold(0.0, f64::max);
+    if mx <= 0.0 {
+        return (0.0, f64::NAN);
+    }
+    let norm_p = pred.iter().sum::<f64>().sqrt();
+    let cos = |i: usize| {
+        let (mut dot, mut n2) = (0.0, 0.0);
+        for f in 0..nf {
+            let w = band[f * nb + i];
+            dot += pred[f].sqrt() * w.sqrt();
+            n2 += w;
+        }
+        dot / (norm_p * n2.sqrt() + 1e-12)
+    };
+    let (mut bi, mut bkey, mut bcos) = (0usize, f64::NEG_INFINITY, 0.0);
+    for (i, &v) in inten.iter().enumerate() {
+        let c = cos(i);
+        let key = c * (v / mx).sqrt();
+        if key > bkey {
+            (bi, bkey, bcos) = (i, key, c);
+        }
+    }
+    // An ion is narrower than the band, so the score is flat wherever the band holds all of
+    // it and the first maximum sits at that plateau's low-1/K0 end. The centre is therefore
+    // the prediction-weighted 1/K0 centroid of the profile inside the winning band.
+    let (j0, j1) = (bi.saturating_sub(k), (bi + k + 1).min(nb));
+    let (mut sw, mut sx) = (0.0, 0.0);
+    for j in j0..j1 {
+        let v: f64 = (0..nf).map(|f| pred[f] * prof[f * nb + j]).sum();
+        sw += v;
+        sx += v * (a + (j as f64 + 0.5) * REPICK_BIN);
+    }
+    (bcos * inten[bi].ln_1p(), sx / sw)
+}
+
+/// `psms_extracted` again with `apex_rt` and `apex_im` replaced for the re-picked
+/// candidates (`picked`, by candidate id); every other value and the row order are kept.
+fn write_repicked_psms(ex: &TableFile, out: &str, picked: &[Option<(f64, f64)>]) -> Result<u64> {
+    use arrow::array::{Array, Float64Array, UInt32Array};
+    let mut reader = ex.batches(None, 1 << 16)?;
+    let schema = reader.schema();
+    let (i_cid, i_rt, i_im) = (
+        schema.index_of("candidate_id")?,
+        schema.index_of("apex_rt")?,
+        schema.index_of("apex_im")?,
+    );
+    let mut w = mumdia_io::table::BatchWriter::new(out, schema.clone())?;
+    for batch in &mut reader {
+        let batch = batch?;
+        let col = |i: usize| batch.column(i).as_any();
+        let cid = col(i_cid)
+            .downcast_ref::<UInt32Array>()
+            .context("psms_extracted.candidate_id is not u32")?;
+        let rt = col(i_rt)
+            .downcast_ref::<Float64Array>()
+            .context("psms_extracted.apex_rt is not f64")?;
+        let im = col(i_im)
+            .downcast_ref::<Float64Array>()
+            .context("psms_extracted.apex_im is not f64")?;
+        let get = |r: usize| picked.get(cid.value(r) as usize).copied().flatten();
+        let new_rt: Float64Array = (0..batch.num_rows())
+            .map(|r| Some(get(r).map_or(rt.value(r), |x| x.0)))
+            .collect();
+        let new_im: Float64Array = (0..batch.num_rows())
+            .map(|r| match get(r) {
+                Some(x) => Some(x.1),
+                None => im.is_valid(r).then(|| im.value(r)),
+            })
+            .collect();
+        let mut cols = batch.columns().to_vec();
+        cols[i_rt] = std::sync::Arc::new(new_rt);
+        cols[i_im] = std::sync::Arc::new(new_im);
+        w.write(&arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            cols,
+        )?)?;
+    }
+    w.close()
+}
+
 /// The sidecar `features.retrace_apex` reads: one row per candidate, NaN MS1 for no row.
 fn write_apex(path: &str, a: &[ApexRow]) -> Result<u64> {
     let ms1 = |k: usize| a.iter().map(|x| x.3[k]).collect();
@@ -380,6 +507,9 @@ pub fn run(p: RetraceParams) -> Result<u64> {
             ("--psms-extracted", p.psms_extracted),
         ],
     )?;
+    if let Some(o) = p.psms_out {
+        mumdia_io::refuse_output_over_input(o, &[("--psms-extracted", p.psms_extracted)])?;
+    }
     let raw = RawTdf::open(p.raw)?;
     let (mass_off, frag_tol) = read_mass_cal(p.mass_cal, p.frag_tol_fallback_ppm)?;
 
@@ -520,6 +650,104 @@ pub fn run(p: RetraceParams) -> Result<u64> {
     drop(heads);
     let decoded = frames.iter().filter(|f| f.is_some()).count();
     info!(frames = decoded, rt_min, rt_max, "retrace: frames decoded");
+
+    // `retrace.repick`: each candidate's apex RT and 1/K0 centre are chosen again on the raw
+    // events, among extract's apex and the top-K sidecar peaks, before any trace is built.
+    let mut n_moved = 0u64;
+    if p.cfg.repick {
+        let out = p
+            .psms_out
+            .context("retrace.repick needs an output path for the re-picked psms_extracted")?;
+        let pk_path = format!("{}.peaks.parquet", p.psms_extracted);
+        let pk = TableFile::open(&pk_path).with_context(|| {
+            format!("retrace.repick needs extract's top-K peak sidecar {pk_path} (extract.retain_top_peaks >= 2)")
+        })?;
+        let mut alt: Vec<(u32, i32, f64)> = pk
+            .u32("candidate_id")?
+            .into_iter()
+            .zip(pk.i32("peak_rank")?)
+            .zip(pk.f64("apex_rt")?)
+            .map(|((c, r), t)| (c, r, t))
+            .collect();
+        alt.sort_by_key(|x| (x.0, x.1));
+        // Fragment rows (predicted, not MS1) by candidate, calibrated m/z and prediction.
+        let (name_off, names) = ch.str_flat("frag_name")?;
+        let (f_cid, f_mz, f_pi) = (
+            ch.u32("candidate_id")?,
+            ch.f64("frag_mz")?,
+            ch.f32("predicted_intensity")?,
+        );
+        let mut fr: Vec<(u32, f64, f64)> = (0..ch.nrows)
+            .filter(|&r| f_pi[r] > 0.0 && !names[name_off[r]..name_off[r + 1]].starts_with("ms1"))
+            .map(|r| {
+                (
+                    f_cid[r],
+                    f_mz[r] * mass_off.factor_at(f_mz[r]),
+                    f_pi[r] as f64,
+                )
+            })
+            .collect();
+        drop((name_off, names, f_cid, f_mz, f_pi));
+        fr.sort_by_key(|x| x.0);
+        let (im_lo_c, im_hi_c) = (rw_col("im_lo")?, rw_col("im_hi")?);
+        let range = |v: &[(u32, i32, f64)], c: u32| {
+            v.partition_point(|x| x.0 < c)..v.partition_point(|x| x.0 <= c)
+        };
+        let frange = |c: u32| fr.partition_point(|x| x.0 < c)..fr.partition_point(|x| x.0 <= c);
+        let tol = frag_tol * 1e-6;
+        let picks: Vec<Option<(u32, f64, f64)>> = (0..ex.nrows)
+            .into_par_iter()
+            .map(|i| {
+                let (c, ci) = (ex_cid[i], ex_cid[i] as usize);
+                if ex_rank[i] != 0 || ci >= n_cand {
+                    return None;
+                }
+                let (a, b) = (im_lo_c[ci], im_hi_c[ci]);
+                let fs = &fr[frange(c)];
+                if !(a.is_finite() && b > a && pmz[ci].is_finite()) || fs.is_empty() {
+                    return None;
+                }
+                let wins: Vec<(u32, u32)> = fs
+                    .iter()
+                    .map(|&(_, m, _)| tof_window(&raw, m * (1.0 - tol), m * (1.0 + tol)))
+                    .collect();
+                let pred: Vec<f64> = fs.iter().map(|x| x.2).collect();
+                let band = scan_band(&scan_im, a, b);
+                let peaks =
+                    std::iter::once(apex_rt[ci]).chain(alt[range(&alt, c)].iter().map(|x| x.2));
+                // First maximum wins, so ties go to extract's apex, then to the lower rank.
+                let mut best = (0.0f64, f64::NAN, f64::NAN);
+                for t0 in peaks.filter(|t| t.is_finite()) {
+                    let lo = ms2_rt.partition_point(|&t| t < t0 - REPICK_RT_HW_S);
+                    let hi = ms2_rt.partition_point(|&t| t < t0 + REPICK_RT_HW_S);
+                    let fl: Vec<(&TofFrame, Vec<(usize, usize)>)> = (lo..hi)
+                        .filter_map(|j| frames[ms2_fi[j]].as_ref())
+                        .map(|f| (f, slot_scans(&f.quad, pmz[ci], band)))
+                        .filter(|(_, s)| !s.is_empty())
+                        .collect();
+                    let (s, cen) = joint_score(&fl, &wins, &pred, &scan_im, a, b);
+                    if s > best.0 {
+                        best = (s, t0, cen);
+                    }
+                }
+                (best.0 > 0.0).then_some((c, best.1, best.2))
+            })
+            .collect();
+        let mut picked: Vec<Option<(f64, f64)>> = vec![None; n_cand];
+        for (c, t, im) in picks.into_iter().flatten() {
+            n_moved += (t != apex_rt[c as usize]) as u64;
+            apex_rt[c as usize] = t;
+            centre[c as usize] = im;
+            picked[c as usize] = Some((t, im));
+        }
+        let rows = write_repicked_psms(&ex, out, &picked)?;
+        info!(
+            rows,
+            moved = n_moved,
+            path = out,
+            "retrace: apex re-picked on the raw events"
+        );
+    }
 
     let (ms1_rt, ms1_fi, ms2_rt, ms2_fi) = (&ms1_rt, &ms1_fi, &ms2_rt, &ms2_fi);
     let (hw, hw1) = (p.cfg.im_half_width, p.cfg.ms1_im_half_width);
@@ -1004,6 +1232,41 @@ mod tests {
         assert_eq!((a.inten, a.n_matched), (2.0, 2));
         assert_eq!(a.ms1[..2], [3.0, 2.0]);
         assert!(a.ms1[2].is_nan());
+    }
+
+    #[test]
+    fn joint_score_finds_the_band_that_matches_the_library() {
+        // 60 scans at 1/K0 1.30 - 0.002 s (strictly decreasing); window [1.18, 1.30].
+        let im: Vec<f64> = (0..60).map(|s| 1.30 - 0.002 * s as f64).collect();
+        // Two fragments (TOF 100 and 200), predicted 4:1. Scans 10-12 (1/K0 ~1.278) carry
+        // them 4:1; scans 40-42 (1/K0 ~1.218) carry a brighter 1:4 ion.
+        let mut f = Frame::default();
+        let mut off = vec![0usize];
+        for s in 0..60u32 {
+            let (a, b) = match s {
+                10..=12 => (400, 100),
+                40..=42 => (200, 800),
+                _ => (0, 0),
+            };
+            for (t, i) in [(100u32, a), (200, b)] {
+                if i > 0 {
+                    f.tof_indices.push(t);
+                    f.intensities.push(i);
+                }
+            }
+            off.push(f.tof_indices.len());
+        }
+        f.scan_offsets = off;
+        f.quadrupole_settings = Arc::new(QuadrupoleSettings::default());
+        let fr = TofFrame::new(f).unwrap();
+        let fl = vec![(&fr, vec![(0usize, 60usize)])];
+        let (s, c) = joint_score(&fl, &[(100, 100), (200, 200)], &[4.0, 1.0], &im, 1.18, 1.30);
+        assert!(s > 0.0);
+        assert!((c - 1.278).abs() < 0.004, "centre {c}");
+        // no signal: no score, no centre
+        let (s0, c0) = joint_score(&fl, &[(900, 900)], &[1.0], &im, 1.18, 1.30);
+        assert_eq!(s0, 0.0);
+        assert!(c0.is_nan());
     }
 
     #[test]

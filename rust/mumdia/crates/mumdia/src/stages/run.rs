@@ -819,7 +819,14 @@ pub(crate) fn extract_to_compete(
             m.record(r);
         }
     };
-    let psms = d("psms_extracted.parquet");
+    let psms_extract = d("psms_extracted.parquet");
+    // `retrace.repick` writes the re-picked table beside extract's; the later stages read it.
+    let psms_repick = d("psms_extracted.repick.parquet");
+    let psms = if cfg.retrace.enabled && cfg.retrace.repick {
+        psms_repick.clone()
+    } else {
+        psms_extract.clone()
+    };
     let chrom = d("chromatograms.parquet");
     // `retrace.enabled`: extract's centroid traces go aside and `chromatograms.parquet` is
     // the raw rebuild of them, so every later stage reads the usual path.
@@ -853,7 +860,7 @@ pub(crate) fn extract_to_compete(
         run_windows: windows,
         ms1: Some(&co.ms1),
         mass_cal: Some(&format!("{seed}.masscal.json")),
-        out_psms: &psms,
+        out_psms: &psms_extract,
         out_chrom: &chrom_extract,
         restrict_candidates: None,
         cfg: &cfg.extract,
@@ -862,7 +869,7 @@ pub(crate) fn extract_to_compete(
     rec(record_artifact(
         artifact::PSMS_EXTRACTED.0,
         artifact::PSMS_EXTRACTED,
-        &psms,
+        &psms_extract,
         npsm,
         "extract",
         ch,
@@ -880,7 +887,7 @@ pub(crate) fn extract_to_compete(
         let n = retrace::run(retrace::RetraceParams {
             raw,
             chromatograms: &chrom_extract,
-            psms_extracted: &psms,
+            psms_extracted: &psms_extract,
             run_windows: windows,
             library_precursors: lib_p,
             mass_cal: Some(&format!("{seed}.masscal.json")),
@@ -892,6 +899,7 @@ pub(crate) fn extract_to_compete(
                 .retrace_apex
                 .then(|| features::retrace_apex_path(&chrom))
                 .as_deref(),
+            psms_out: cfg.retrace.repick.then_some(psms_repick.as_str()),
             cfg: &cfg.retrace,
             config_hash: ch,
         })?;

@@ -2158,6 +2158,14 @@ pub struct RetraceConfig {
     pub ms1_im_half_width: f64,
     /// Raw events a grid point needs to count (else 0). 2 and 3 lost identifications.
     pub min_events: u32,
+    /// Re-choose each candidate's apex RT and 1/K0 centre on the raw events before the
+    /// traces are rebuilt (docs/09 section 6c; docs/TIMS_ROADMAP_bis.md section 8). Over
+    /// extract's apex and the `extract.retain_top_peaks` sidecar peaks, the peak whose best
+    /// 1/K0 band agrees best with the library wins; retrace then writes
+    /// `psms_extracted.repick.parquet` with `apex_rt` and `apex_im` replaced, which `run`
+    /// feeds to the later stages. Needs `retain_top_peaks >= 2` and `promote_top_peaks = 1`.
+    /// Default false. Benchmark-gated.
+    pub repick: bool,
 }
 impl Default for RetraceConfig {
     fn default() -> Self {
@@ -2167,6 +2175,7 @@ impl Default for RetraceConfig {
             ms1: true,
             ms1_im_half_width: 0.015,
             min_events: 1,
+            repick: false,
         }
     }
 }
@@ -2285,6 +2294,13 @@ impl Config {
         if rt.enabled && self.groups.window_groups > 1 {
             return Err(Invalid(
                 "retrace.enabled is not implemented with groups.window_groups > 1.".into(),
+            ));
+        }
+        if rt.repick && (self.extract.retain_top_peaks < 2 || self.extract.promote_top_peaks != 1) {
+            return Err(Invalid(
+                "retrace.repick chooses among extract's candidate peaks: it needs \
+                 extract.retain_top_peaks >= 2 (5 measured) and extract.promote_top_peaks = 1."
+                    .into(),
             ));
         }
         if self.extract.retain_top_peaks == 0 {

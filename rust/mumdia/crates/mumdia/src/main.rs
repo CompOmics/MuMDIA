@@ -316,6 +316,9 @@ enum Cmd {
         mass_cal: Option<String>,
         #[arg(long)]
         out: String,
+        /// `retrace.repick`: where the re-picked psms_extracted is written.
+        #[arg(long)]
+        out_psms: Option<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -1404,10 +1407,14 @@ fn real_main() -> Result<()> {
             lib_precursors,
             mass_cal,
             out,
+            out_psms,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            if cfg.retrace.repick && out_psms.is_none() {
+                anyhow::bail!("retrace.repick: pass --out-psms for the re-picked psms_extracted");
+            }
             let raw = match (raw, spectra_ms2) {
                 (Some(r), _) => r,
                 (None, Some(s)) => {
@@ -1434,6 +1441,7 @@ fn real_main() -> Result<()> {
                     .retrace_apex
                     .then(|| stages::features::retrace_apex_path(&out))
                     .as_deref(),
+                psms_out: out_psms.as_deref(),
                 cfg: &cfg.retrace,
                 config_hash: &ch,
             })?;

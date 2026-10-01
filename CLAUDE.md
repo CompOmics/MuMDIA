@@ -188,6 +188,12 @@ Key semantics:
   E. coli +1.8% peptides on top of retrace over 3 seeds, entrapment +2.2% real peptides at
   an FDP of 0.43-0.51% (control 0.40-0.44%), HYE diaPASEF +3.9% peptides (seed 0) with
   ProteoBench epsilon and CV about unchanged. Benchmark-gated.
+  `retrace.repick` (default off; needs `extract.retain_top_peaks >= 2`) re-chooses each
+  candidate's apex RT and 1/K0 centre on the raw events, among extract's apex and the top-K
+  sidecar peaks, and writes `psms_extracted.repick.parquet` for the later stages (docs/09
+  section 6c). Measured (docs/TIMS_ROADMAP_bis.md section 8): full E. coli run +7.4% peptides
+  (14,911, 0.97x DIA-NN), entrapment +5.4% real peptides at an FDP of 0.37-0.47%, HYE
+  diaPASEF +8.4% peptides and +15.2% ProteoBench ions (seed 0) with better epsilon and CV.
 - Two keys, both default 1. `extract.retain_top_peaks > 1` writes only the unscored
   diagnostic `<psms>.peaks.parquet`. `extract.promote_top_peaks > 1` writes the
   alternative peaks as additional `psms_extracted` rows with `peak_rank >= 1`;

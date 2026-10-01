@@ -621,6 +621,29 @@ writes `<chromatograms>.apex.parquet`, one row per candidate at its rank-0 `apex
   predicted-intensity-weighted mean Pearson of each profile with signal against the weighted
   sum of the others (0 when no fragment has signal).
 
+Apex re-pick (`retrace.repick`, default off). Extract chooses each candidate's apex RT and
+1/K0 centre from centroids. On the E. coli diaPASEF run, its 1/K0 centre was more than 0.015
+from DIA-NN's observed 1/K0 for 42% of the right-peak rejects (2% of accepted precursors).
+Its peak choice put the wrong RT peak on 830 DIA-NN precursors whose right peak was in the
+window (docs/TIMS_ROADMAP_bis.md section 8).
+
+With the key on, before any trace is built, retrace scores extract's apex and every
+`<psms_extracted>.peaks.parquet` peak of the candidate (`extract.retain_top_peaks`, 5
+measured) on the raw events. For each peak it takes the MS2 frames within 1.5 s of that
+peak's apex and bins each fragment's events at 0.002 over the `run_windows` 1/K0 window. For
+each ±0.015 band (15 bins) it computes:
+- the cosine of the square-rooted band sums against the square-rooted predictions;
+- the prediction-weighted band intensity `I`.
+
+The band with the best `cos x sqrt(I / I_max)` scores the peak `cos x ln(1 + I)`, and the
+peak with the highest score wins. Ties go to extract's apex, then to the lower rank. A
+candidate without signal keeps extract's values. The winner's apex RT and its band centre
+(the prediction-weighted 1/K0 centroid of the raw profile inside the band) replace `apex_rt`
+and `apex_im`. Retrace uses them for the traces and the apex sidecar, and writes
+`psms_extracted.repick.parquet`, which `run` passes to the later stages. The rule reads no
+label. It needs `retain_top_peaks >= 2` and `promote_top_peaks = 1`. The standalone stage
+takes `--out-psms`.
+
 The scalars read the final rows, rebuilt or copied. A candidate that straddles two input
 spans is merged before it is scored. Features reads the sidecar (docs/10). The chromatograms
 are byte-identical with the key on or off.
