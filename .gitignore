@@ -90,3 +90,4 @@ deploy_local/
 # Local data and a separate checkout, never tracked (TIMS roadmap work).
 /mzcore/
 /bench/proteobench_input/
+/bench/diann_compare/
