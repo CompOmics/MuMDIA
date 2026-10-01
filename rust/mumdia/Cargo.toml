@@ -58,7 +58,7 @@ mzdata = { version = "0.66", default-features = false, features = ["mzml", "mini
 # libz-sys, and flate2 ranks the C backend ABOVE zlib-rs, so that spelling quietly
 # reintroduces a C build and selects the opposite codec. Verified with `cargo tree`: this
 # spelling adds zlib-rs 0.6.8 and no libz-sys.
-mzdata-bindata = { version = "0.66", default-features = false, features = ["zlib-rs"] }
+mzdata-bindata = { version = "0.67", default-features = false, features = ["zlib-rs"] }
 # Per-thread-arena allocator. The extraction accumulation is allocation-heavy and only
 # scaled ~1.07x across cores under the Windows system allocator's shared heap lock;
 # mimalloc is pure Rust (no cmake) and removes that serialisation. No behaviour change.

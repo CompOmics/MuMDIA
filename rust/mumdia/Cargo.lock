@@ -1029,7 +1029,7 @@ dependencies = [
  "mumdia-core",
  "mumdia-io",
  "mzdata",
- "mzdata-bindata",
+ "mzdata-bindata 0.67.2",
  "parquet",
  "rayon",
  "serde",
@@ -1084,9 +1084,9 @@ dependencies = [
  "indexmap",
  "log",
  "memchr",
- "mzdata-bindata",
+ "mzdata-bindata 0.66.7",
  "mzdata-meta",
- "mzdata-param",
+ "mzdata-param 0.66.7",
  "mzdata-spectrum",
  "mzpeaks",
  "num-traits",
@@ -1098,15 +1098,32 @@ dependencies = [
 
 [[package]]
 name = "mzdata-bindata"
-version = "0.66.6"
+version = "0.66.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2f97e0e1115dcb4086854a27ecc775a51e0e989878eb435a7b704386f997ed6"
+checksum = "c7f3e858d234280e585f86d47ef78baaf06b6951b0a47308e1da8897bd05a178"
 dependencies = [
  "base64-simd",
  "bytemuck",
  "flate2",
  "log",
- "mzdata-param",
+ "mzdata-param 0.66.7",
+ "mzpeaks",
+ "num-traits",
+ "thiserror",
+]
+
+[[package]]
+name = "mzdata-bindata"
+version = "0.67.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84dfca42849efd06776f7f15980813d5b8ae6ed4b51b796873ff7a7aa5a3e1bb"
+dependencies = [
+ "base64-simd",
+ "bytemuck",
+ "flate2",
+ "identity-hash",
+ "log",
+ "mzdata-param 0.67.2",
  "mzpeaks",
  "num-traits",
  "thiserror",
@@ -1121,8 +1138,8 @@ dependencies = [
  "bitflags",
  "chrono",
  "log",
- "mzdata-bindata",
- "mzdata-param",
+ "mzdata-bindata 0.66.7",
+ "mzdata-param 0.66.7",
  "num-traits",
  "regex",
  "thiserror",
@@ -1130,9 +1147,19 @@ dependencies = [
 
 [[package]]
 name = "mzdata-param"
-version = "0.66.6"
+version = "0.66.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d46b2841ef1341c2c6094108f7d3d979cec5662e1dca1f96110583a437cec095"
+checksum = "66b8b79ed2562d4c65ec25472e3c4e086f867ce136097f9138079ce6743034d4"
+dependencies = [
+ "log",
+ "thiserror",
+]
+
+[[package]]
+name = "mzdata-param"
+version = "0.67.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5c379224625b3ca3d7759d9b4687d42d2dfda24aee64593bcaecc7bdba456a1"
 dependencies = [
  "log",
  "thiserror",
@@ -1146,9 +1173,9 @@ checksum = "39daaf3737140dc22e4c12b84ab1fd117ee05bfc12c3883af6e9535d8b0d7660"
 dependencies = [
  "identity-hash",
  "log",
- "mzdata-bindata",
+ "mzdata-bindata 0.66.7",
  "mzdata-meta",
- "mzdata-param",
+ "mzdata-param 0.66.7",
  "mzpeaks",
  "num-traits",
  "thiserror",
