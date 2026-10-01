@@ -40,7 +40,7 @@ arrow = { version = "59", features = ["prettyprint"] }
 parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
 # Pure-Rust zlib backend instead of zlib-ng-compat (needs cmake). `miniz_oxide` stays
 # so this line still selects a pure-Rust codec on its own.
-mzdata = { version = "0.66", default-features = false, features = ["mzml", "miniz_oxide"] }
+mzdata = { version = "0.67", default-features = false, features = ["mzml", "miniz_oxide"] }
 # NOT unused, and not to be deleted as such. mzdata-bindata is already in the graph as a
 # transitive dependency of mzdata; naming it here only turns on `zlib-rs`, which through
 # feature unification gives flate2 `any_zlib` and so selects the zlib-rs inflater instead
