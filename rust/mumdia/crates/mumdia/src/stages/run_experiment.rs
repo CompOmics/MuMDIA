@@ -963,11 +963,12 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     qcfg.q_filter = QuantQColumn::PsmQ;
     let mut peptide_quants: Vec<String> = Vec::with_capacity(n_runs);
     let mut protein_quants: Vec<String> = Vec::with_capacity(n_runs);
-    // `quant.cross_run_weights`: a first pass exports every run's fragment areas and apex
+    // `quant.cross_run_weights` / `quant.cross_run_background`: a first pass exports every run's fragment areas and apex
     // correlations, the weights are fitted over all runs, and the second pass below writes
     // the quantities with them. ponytail: two full passes; cache the areas if quant time matters.
     let mut frag_tables: Vec<String> = Vec::new();
-    if qcfg.cross_run_weights {
+    let cross_run_on = qcfg.cross_run_weights || qcfg.cross_run_background;
+    if cross_run_on {
         for i in 0..n_runs {
             let ft = d(&format!("{}/fragment_quant.parquet", names[i]));
             let tmp = |n: &str| d(&format!("{}/{n}.pass1.parquet", names[i]));
@@ -980,7 +981,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 out_peak_bounds: None,
                 cfg: &qcfg,
                 config_hash: &ch,
-                fragment_weights: None,
+                cross_run: None,
             })?;
             for n in ["peptide_quant", "protein_group_quant"] {
                 let _ = std::fs::remove_file(tmp(n));
@@ -989,13 +990,18 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             frag_tables.push(ft);
         }
     }
-    let weights = if qcfg.cross_run_weights {
-        let w = quant::fit_fragment_weights(&frag_tables)?;
+    let cross_run = if cross_run_on {
+        let fit = quant::fit_cross_run(
+            &frag_tables,
+            qcfg.cross_run_weights,
+            qcfg.cross_run_background,
+        )?;
         info!(
-            candidates = w.len(),
-            "run-experiment: cross-run fragment weights fitted"
+            weights = fit.weights.as_ref().map_or(0, |w| w.len()),
+            background = fit.background.as_ref().map_or(0, |b| b.len()),
+            "run-experiment: cross-run quant fit (candidates)"
         );
-        Some(w)
+        Some(fit)
     } else {
         None
     };
@@ -1011,7 +1017,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             out_peak_bounds: None,
             cfg: &qcfg,
             config_hash: &ch,
-            fragment_weights: weights.as_ref(),
+            cross_run: cross_run.as_ref(),
         })?;
         peptide_quants.push(pq);
         protein_quants.push(gq);

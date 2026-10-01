@@ -316,6 +316,184 @@ Submissions: `bench/proteobench_input/crw_q06/` is the engine lever (seed 0). Th
 MS1 as weighted channels (the prototype, quantile 0.6, seed 0: 0.126 / 0.197 / 0.078) is a Q5 lever:
 against the fragment-only engine it is -0.004 global and -0.009 CV for +0.007 eq.
 
+## 4d. Q4 measured: the MuMDIA-only ions are faint, not mis-peaked (2026-10-01)
+
+`quant_diag/q4_diag.py` on the engine lever (section 4c, quantile 0.6, seed 0; 15,258 MuMDIA-only
+and 77,282 shared ions). Each run's apex RT is mapped onto the cross-run median by a binned-median
+fit on confident shared ions (`run_psm_q` < 0.001); spread is the largest |run - median| per ion.
+
+| group | apex spread | ions | abs eps | E. coli ions | E. coli log2 |
+|---|---|---|---|---|---|
+| only | <= 2 s | 11,326 | 0.200 | 927 | -1.41 |
+| only | 2-5 s | 3,094 | 0.195 | 214 | -1.77 |
+| only | 5-10 s | 476 | 0.282 | 25 | -1.77 |
+| only | > 10 s | 362 | 0.541 | 16 | -1.26 |
+| shared | <= 2 s | 58,751 | 0.120 | 3,668 | -1.79 |
+| shared | > 10 s | 412 | 0.529 | 14 | -0.65 |
+
+- Wrong peaks are rare: 5.4% of the MuMDIA-only ions (838) have a spread above 5 s. Re-integrating
+  them at a consensus apex cannot move the median, so the consensus-apex lever of Q4 is dropped.
+- The error follows intensity and completeness. By max-condition intensity quintile the
+  MuMDIA-only ions go from 0.245 (E. coli -1.00) to 0.130 (-1.79); the shared ions from 0.189 to
+  0.088. MuMDIA-only ions observed in all six runs quantify at 0.142 (E. coli -1.81, 4,233 ions);
+  those observed in one or two runs of a condition at 0.19 to 0.32. 28% of the MuMDIA-only ions are
+  complete, against 73% of the shared ions.
+- Within-run confidence does not separate them: of the complete ions, all but 14 pass `run_psm_q`
+  < 0.01 in every A run.
+- Completeness is not a MuMDIA deficit. Over all ions at `min_obs` 3:
+
+| | complete (3A + 3B) | abs eps complete | abs eps partial | global |
+|---|---|---|---|---|
+| DIA-NN | 57,882 (65.1%) | 0.096 | 0.196 | 0.118 |
+| MuMDIA, section 4c | 60,285 (65.1%) | 0.107 | 0.214 | 0.131 |
+
+The remaining gap is a per-ion gap on weak signal, present in both strata (+0.011 complete, +0.018
+partial). That is Q3's and Q5's target, not Q4's. Q4 is closed; a per-ion quality value is still
+possible as a report column and is not a priority.
+
+## 4e. Q3 measured: neither a narrower band nor a mobility background helps (2026-10-01)
+
+Requant only, on the seed 0 `eng_repick` IDs, against the engine lever of section 4c (fixed 9-scan
+window, flank baseline q 0.6, cross-run weights).
+
+**Fragment 1/K0 band.** `quant_diag/retrace_band.sh` rebuilds the traces with
+`retrace.im_half_width` changed, centred on the repicked apices (`repick` off, the repick PSM table
+as input, extract's centroid traces from `l1d/pass2_robust`). At 0.015 it reproduces the shipped
+traces exactly (run 0: 89,853 of 89,853 quantities equal). Then the engine quant
+(`requant_crw.sh`).
+
+| band (1/K0) | global | eq | CV | E. coli | shared | only |
+|---|---|---|---|---|---|---|
+| +/- 0.0075 | 0.142 | 0.190 | 0.098 | -1.80 | 0.132 / 0.098 / -1.81 | 0.220 / 0.144 / -1.61 |
+| +/- 0.010 | 0.134 | 0.186 | 0.091 | -1.80 | 0.125 / 0.090 / -1.81 | 0.210 / 0.133 / -1.59 |
+| **+/- 0.015 (shipped)** | **0.130** | 0.190 | **0.087** | -1.78 | 0.122 / 0.086 / -1.79 | 0.206 / 0.126 / -1.51 |
+| +/- 0.020 | 0.133 | 0.197 | 0.088 | -1.77 | 0.124 / 0.086 / -1.78 | 0.211 / 0.126 / -1.45 |
+
+A narrower band removes a little interference (E. coli -1.80) and cuts more of the ion's own signal
+(global and CV up); a wider one is worse on both epsilons. The best trade (0.010: eq -0.004, global
++0.004) is below the bar. The quant band stays the identification band.
+
+**Mobility background.** `quant_diag/retrace_side.sh` builds the same traces with every apex_im
+shifted by +0.05 and -0.05 1/K0 (same fragment m/z, same frames, a band next to the precursor's).
+`q2_frag_areas.py` (`SIDE=`) subtracts the mean side-band trace per sample before the window; the
+combiner is fragments only, as the engine. The control arm reproduces the engine (0.130 / 0.190 /
+0.087).
+
+| background | global | eq | CV | E. coli | shared | only |
+|---|---|---|---|---|---|---|
+| RT flank, q 0.6 (engine, control) | **0.130** | **0.190** | 0.087 | -1.78 | 0.122 / 0.086 / -1.79 | 0.206 / 0.126 / -1.51 |
+| mobility side band only | **0.130** | 0.230 | **0.081** | -1.67 | 0.122 / 0.080 / -1.68 | 0.192 / 0.114 / -1.42 |
+| mobility side band + RT flank | 0.134 | 0.189 | 0.090 | -1.80 | 0.125 / 0.088 / -1.81 | 0.212 / 0.131 / -1.58 |
+
+- The side band removes much less of the floor than the RT flank (E. coli -1.67 against -1.78), so
+  the floor is not co-mobile background in the next band. It sits at the ion's own mobility, which
+  fits co-eluting signal in the same 1/K0 band (interference or the ion's own tail) rather than a
+  diffuse background.
+- On top of the RT flank it adds removal (E. coli -1.80) at a precision cost (global +0.004, CV
+  +0.003). No gain on the targets.
+- Q3 is closed with no lever. The narrow-band and side-band traces are in
+  `/public/local/ProteoBench/HYE_diaPASEF_mumdia/q3_band/` and `q3_side/` (645 GB).
+
+## 4f. Where eq is lost, and a cross-run pooled background (2026-10-01, seed 0)
+
+**Eq is an E. coli problem.** Eq is the mean of the three species' median |epsilon|. Engine lever
+(section 4c) against DIA-NN: E. coli 0.254 / 0.198, human 0.119 / 0.103, yeast 0.198 / 0.205. On
+the complete shared ions both tools differ by a near-uniform offset (MuMDIA log2 A/B - DIA-NN:
+human +0.045, yeast +0.040, E. coli +0.065), and on those ions E. coli sits at -1.82 against
+DIA-NN's -1.88 and yeast at about +0.90 against +0.85. Both of our non-human species are compressed,
+so a run-scale shift helps one and hurts the other.
+
+**Rejected on the way** (prototype, fragments only, engine control 0.130 / 0.190 / 0.087):
+- Per-run robust scaling of the cross-run fragment profile (weighted percentile of
+  area / reference share): p50 0.136 / 0.190 / 0.094, p35 0.148 / 0.191 / 0.104 (E. coli -1.88). The
+  floor is not interference on single fragments in single runs.
+- Sharper cross-run weights, `(dev + d0)^-p`: every arm E. coli -1.78 and worse precision (best
+  d0 0.03: 0.132 / 0.192 / 0.088).
+- Trimmed flank mean instead of the flank quantile: full mean 0.134 / 0.184 / 0.090, 90% 0.130 /
+  0.192 / 0.085, 75% 0.127 / 0.211 / 0.081. The same trade curve as the quantile.
+- Label-free median run normalisation (Q6), one factor per run from the ions quantified in all six
+  runs: engine 0.133 / 0.191 / 0.086, pooled arm below 0.134 / 0.180 / 0.087. It centres the mixture,
+  not human (human -0.03, as DIA-NN's normalisation does), and moves nothing. Q6 is closed.
+
+**The floor is sparse noise.** In run 0, half of all flank samples of quantified fragments are 0, and
+the flank median is 0 for 48% of fragments. Per sample (median over about 1,500 precursors per
+species): flank q 0.6 76, flank mean 88, window mean 237 (E. coli). A quantile of a sparse flank
+underestimates the mean noise the window collects; the flank mean estimates it, but from 24 samples
+of one run it is noisy, and subtracting a noisy level costs precision.
+
+**Cross-run pooled background.** The fragment's background is in the same m/z and 1/K0 band at the
+same aligned RT in every run, so one level per (candidate, fragment) is taken as the mean over the
+six runs of the per-run flank means and subtracted per sample before the envelope; the cross-run
+weights are then fitted as usual (`q2_frag_areas.py POOLRAW=1`, `q2_combine.py POOL=mean
+POOL_SCALE=`). Label-blind.
+
+| background | global | eq | CV | E. coli | yeast | E. coli / human / yeast abs eps | shared | only |
+|---|---|---|---|---|---|---|---|---|
+| per run, q 0.6 (engine) | **0.130** | 0.190 | 0.087 | -1.78 | +0.84 | 0.254 / **0.119** / 0.198 | 0.122 / 0.086 / -1.79 | 0.206 / 0.126 / -1.51 |
+| per run, flank mean | 0.134 | 0.184 | 0.090 | -1.81 | +0.87 | 0.239 / 0.124 / 0.191 | 0.125 / 0.089 / -1.82 | 0.215 / 0.132 / -1.54 |
+| pooled mean x 0.6 | **0.130** | 0.196 | **0.083** | -1.76 | +0.84 | 0.272 / 0.118 / 0.199 | 0.121 / 0.082 / -1.77 | 0.199 / 0.119 / -1.51 |
+| pooled mean x 0.8 | 0.132 | 0.187 | 0.085 | -1.80 | +0.86 | 0.250 / 0.121 / 0.190 | 0.123 / 0.084 / -1.81 | 0.205 / 0.123 / -1.55 |
+| pooled mean x 1.0 | 0.134 | **0.180** | 0.087 | **-1.84** | +0.89 | **0.232** / 0.124 / **0.185** | 0.125 / 0.086 / -1.84 | 0.211 / 0.127 / -1.58 |
+| pooled median x 1.0 | 0.133 | 0.181 | 0.087 | -1.83 | +0.88 | 0.233 / 0.123 / 0.185 | 0.124 / 0.086 / -1.84 | 0.211 / 0.127 / -1.59 |
+| DIA-NN | 0.118 | 0.169 | 0.076 | -1.84 | +0.81 | 0.198 / 0.103 / 0.205 | 0.111 / 0.079 / -1.85 | |
+
+- Pooling removes the precision cost of a mean background: at full scale CV is unchanged (0.087)
+  where the per-run mean costs +0.003, and eq falls to 0.180, with E. coli at DIA-NN's -1.84 and
+  yeast nearer +1 than DIA-NN.
+- It is still a trade with global epsilon: human |eps| rises (0.119 to 0.124), because subtracting
+  the floor leaves faint human ions with less signal and the same noise. At equal global epsilon
+  (x 0.6) it buys CV, not eq. No point is better than the engine on both epsilons.
+- Open decision: whether eq -0.010 for global +0.004 (x 1.0) is worth taking.
+
+**Replication and the MS1 combination** (`quant_diag/pool_eval.sh`; pooled mean x 1.0 with cross-run
+weights; "+ MS1" also uses the three MS1 traces as weighted channels, with the same pooled background).
+
+| seed | arm | ions | global | eq | CV | E. coli | E. coli / human / yeast abs eps | shared | only |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | engine (section 4c) | 92,540 | 0.130 | 0.190 | 0.087 | -1.78 | 0.254 / 0.119 / 0.198 | 0.122 / 0.086 / -1.79 | 0.206 / 0.126 / -1.51 |
+| 0 | pooled | 92,540 | 0.134 | 0.180 | 0.087 | -1.84 | 0.232 / 0.124 / 0.185 | 0.125 / 0.086 / -1.84 | 0.211 / 0.127 / -1.58 |
+| 0 | pooled + MS1 | 92,540 | 0.127 | 0.198 | 0.076 | -1.88 | 0.281 / 0.115 / 0.196 | 0.118 / 0.075 / -1.90 | 0.209 / 0.113 / -1.64 |
+| 1 | engine | 92,141 | 0.130 | 0.190 | 0.086 | -1.78 | 0.254 / 0.118 / 0.198 | 0.122 / 0.086 / -1.79 | 0.205 / 0.125 / -1.51 |
+| 1 | pooled | 92,141 | 0.133 | 0.180 | 0.087 | -1.84 | 0.232 / 0.123 / 0.185 | 0.124 / 0.086 / -1.84 | 0.210 / 0.127 / -1.58 |
+| 1 | pooled + MS1 | 92,141 | 0.126 | 0.197 | 0.076 | -1.88 | 0.280 / 0.115 / 0.195 | 0.117 / 0.075 / -1.89 | 0.207 / 0.112 / -1.64 |
+| 2 | engine | 92,475 | 0.131 | 0.191 | 0.087 | -1.78 | 0.256 / 0.119 / 0.199 | 0.122 / 0.086 / -1.79 | 0.209 / 0.126 / -1.52 |
+| 2 | pooled | 92,475 | 0.134 | 0.180 | 0.087 | -1.84 | 0.232 / 0.124 / 0.185 | 0.124 / 0.086 / -1.85 | 0.213 / 0.128 / -1.59 |
+| 2 | pooled + MS1 | 92,475 | 0.127 | 0.198 | 0.076 | -1.88 | 0.282 / 0.115 / 0.196 | 0.117 / 0.075 / -1.89 | 0.210 / 0.113 / -1.64 |
+
+- The pooled background replicates exactly on three ID sets: eq -0.010 to -0.011, global +0.003 to
+  +0.004, CV +0.000 to +0.001 against the engine.
+- MS1 channels on top buy global epsilon and CV (0.127 / 0.076, DIA-NN's CV) but widen E. coli: its
+  median moves closer to -2 (-1.88) while its median |eps| rises to 0.28. The MS1 traces of faint
+  E. coli ions in condition A are not clean enough. Against the engine the combination is global
+  -0.003, CV -0.011, eq +0.008: a trade the other way, not a gain on both.
+
+## 4g. Engine lever: `quant.cross_run_background` (2026-10-01)
+
+Decision: take the pooled background, fragments only (eq first); keep MS1 out (Q5 stays open with
+the section 4f result). Implemented as `quant.cross_run_background` in the two-pass step of
+`cross_run_weights` (`fit_cross_run`): pass 1 also exports each fragment's `flank_mean` (and,
+with this key, zero-area fragments; `fragment_quant` v3); the fit averages it over all runs per
+(candidate, fragment); pass 2 subtracts that level from every window sample in place of the per-run
+quantile. The weights stay fitted on pass 1 (per-run baseline) areas: the prototype with weights
+from the pooled-background areas (three passes) gives the same result (0.134 / 0.180 / 0.087, shared
+0.125 / 0.086 / -1.84 against 0.124 / 0.086 / -1.85 for two passes). Part of the diaPASEF preset.
+
+Engine (`quant_diag/requant_crw.sh`, `BG=1`), quantile 0.6 is still used in pass 1:
+
+| seed | ions | global | eq | CV | E. coli | yeast | E. coli / human / yeast abs eps | shared | only |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 92,540 | 0.134 | 0.180 | 0.087 | -1.84 | +0.89 | 0.231 / 0.123 / 0.185 | 0.124 / 0.086 / -1.85 | 0.211 / 0.128 / -1.60 |
+| 1 | 92,141 | 0.133 | 0.180 | 0.087 | -1.84 | +0.89 | 0.232 / 0.123 / 0.186 | 0.124 / 0.086 / -1.85 | 0.209 / 0.128 / -1.60 |
+| 2 | 92,475 | 0.134 | 0.181 | 0.087 | -1.84 | +0.89 | 0.233 / 0.123 / 0.186 | 0.124 / 0.086 / -1.85 | 0.212 / 0.129 / -1.60 |
+
+Against section 4c on the same IDs: eq -0.010, global +0.003 to +0.004, CV unchanged, E. coli at
+DIA-NN's -1.84, same ion count. From the start of this roadmap (0.172 / 0.358 / 0.107): eq closed by
+about 94% of the gap to DIA-NN, global by about 70%. Submission: `bench/proteobench_input/crwbg/`.
+
+Remaining gap to DIA-NN (0.118 / 0.169 / 0.076): global +0.016, eq +0.011, CV +0.011. Human
+precision on faint ions is now the largest share of the global gap (human |eps| 0.123 against
+0.103).
+
 ## 5. Plan
 
 Ordered by expected gain per unit of work. Each phase states its target and its gate. Quant
@@ -370,6 +548,8 @@ Target: species-equalised epsilon below the Q1 base (0.217) and global epsilon b
 
 ### Q3: Additive background on the raw events
 
+Result (section 4e): measured and closed. Neither a narrower band nor a side-band background gains.
+
 Target: remove the residual E. coli floor (-1.71 against -1.85 on all ions with
 `baseline_subtract`).
 
@@ -384,6 +564,8 @@ Target: remove the residual E. coli floor (-1.71 against -1.85 on all ions with
 - Gate: as Q2. This lever is diaPASEF-specific by nature, which fits the current scope.
 
 ### Q4: The faint and MuMDIA-only ions
+
+Result (section 4d): measured and closed. Not wrong peaks; faint and partial ions, like DIA-NN's.
 
 Target: the 15,235 extra ions, now at |epsilon| 0.194 and E. coli -1.44 under Q1.
 

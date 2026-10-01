@@ -282,11 +282,11 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    all-zero/non-finite areas, or `top_n_fragments=0` produce a null quantity plus
    an explicit `quant_status`; they are not converted to biological zero.
 
-   **Cross-run fragment weights** (`cross_run_weights`, `fragment_weights` in
+   **Cross-run fragment weights** (`cross_run_weights`, `cross_run.weights` in
    `QuantParams`). When weights are passed, a candidate's quantity is instead
    `sum(weight * area)` over its fragments with a positive area (`weighted_quantity`),
    and the top-N rule above applies only where that sum is not positive in this run.
-   The weights come from `fit_fragment_weights` over the first-pass `fragment_quant`
+   The weights come from `fit_cross_run` over the first-pass `fragment_quant`
    tables of every run: per (candidate, fragment), `dev` is the median over runs of the
    absolute deviation of ln(area / candidate total) from its cross-run median, `corr`
    the median `apex_corr`, and the weight `max(corr, 0) / (dev + 0.1)`; a candidate whose
@@ -297,9 +297,19 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    pass the pass-1 `--out-fragment` tables to `quant --weights-from`. The MS1 traces are
    not channels. Measured on HYE diaPASEF only (docs/TIMS_QUANT_ROADMAP.md section 4c).
 
+   **Cross-run background** (`cross_run_background`, `cross_run.background`). In the
+   same two-pass step, pass 1 also exports each fragment's `flank_mean` (the mean of the
+   `baseline_flank_scans` raw samples either side of the fixed window), and with this key
+   zero-area fragments as well. `fit_cross_run` averages it over all runs per (candidate,
+   fragment), and pass 2 subtracts that one level from every window sample, clipped at
+   zero, instead of the per-run `baseline_subtract` quantile. On raw diaPASEF traces the
+   floor is sparse counts (half the flank samples are 0), which a quantile underestimates
+   and a single run's mean estimates noisily (docs/TIMS_QUANT_ROADMAP.md section 4f).
+
    **diaPASEF preset.** `apply_diapasef_quant` replaces a `quant` block left at its
    defaults with `QuantConfig::diapasef()` (predicted selection, envelope,
-   `fixed_scan_halfwidth: 4`, `baseline_subtract` at quantile 0.6, cross-run weights)
+   `fixed_scan_halfwidth: 4`, `baseline_subtract` at quantile 0.6, cross-run weights and
+   background)
    when every `run` / `run-experiment` input is a timsTOF `.d`, and logs it. Any
    explicitly set quant key keeps the block as written.
 
@@ -318,8 +328,8 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    then sums the top `top_n_peptides` unique base peptides under `TopNSum`; `Sum` uses
    all unique bases. A group with no quantifiable base peptide has null quantity
    and `quant_status=no_quantifiable_peptide`.
-8. Optional fragment export (`fragment_quant` v2: positive areas plus `apex_corr`, NaN
-   outside a fixed window) and peak-bounds diagnostic
+8. Optional fragment export (`fragment_quant` v3: positive areas, plus zero areas under
+   `cross_run_background`; `apex_corr` and `flank_mean`, NaN outside a fixed window) and peak-bounds diagnostic
    (`quant.rs:419`). `ArtifactReport` records params + stats for each table
    (`quant.rs:603`).
 

@@ -51,7 +51,7 @@ pub mod artifact {
     pub const PSMS_SCORED: (&str, u32) = ("psms_scored", 4);
     pub const PEPTIDE_QUANT: (&str, u32) = ("peptide_quant", 2);
     pub const PROTEIN_GROUP_QUANT: (&str, u32) = ("protein_group_quant", 2);
-    pub const FRAGMENT_QUANT: (&str, u32) = ("fragment_quant", 2);
+    pub const FRAGMENT_QUANT: (&str, u32) = ("fragment_quant", 3);
     /// Cross-run MaxLFQ table, written only by `run-experiment` and `quant-lfq`.
     pub const LFQ_MAXLFQ: (&str, u32) = ("lfq_maxlfq", 1);
 }

@@ -1653,6 +1653,13 @@ pub struct QuantConfig {
     /// the `top_n_fragments` rule. Needs a fixed window (the correlation is taken over
     /// it). Off by default; on in the diaPASEF preset ([`QuantConfig::diapasef`]).
     pub cross_run_weights: bool,
+    /// Cross-run background (run-experiment only; docs/TIMS_QUANT_ROADMAP.md section 4f). In
+    /// the same two-pass step, one background level per (candidate, fragment) is the mean over
+    /// all runs of the raw flank mean (`baseline_flank_scans` samples either side of the fixed
+    /// window); the second pass subtracts it from every window sample, clipped at zero, in
+    /// place of the per-run `baseline_subtract` level. Label-blind. Needs a fixed window. Off
+    /// by default; on in the diaPASEF preset.
+    pub cross_run_background: bool,
 }
 
 /// Fragment ranking for the quant top-N sum. See [`QuantConfig::fragment_selection`].
@@ -1686,6 +1693,7 @@ impl Default for QuantConfig {
             baseline_quantile: 0.25,
             fixed_window_s: 0.0,
             cross_run_weights: false,
+            cross_run_background: false,
         }
     }
 }
@@ -1703,6 +1711,7 @@ impl QuantConfig {
             baseline_subtract: true,
             baseline_quantile: 0.6,
             cross_run_weights: true,
+            cross_run_background: true,
             ..Self::default()
         }
     }
@@ -2548,14 +2557,15 @@ impl Config {
                  fixed_scan_halfwidth is ignored"
             );
         }
-        if self.quant.cross_run_weights
+        if (self.quant.cross_run_weights || self.quant.cross_run_background)
             && self.quant.fixed_scan_halfwidth == 0
             && self.quant.fixed_window_s == 0.0
         {
             tracing::warn!(
-                "quant.cross_run_weights needs a fixed window (quant.fixed_scan_halfwidth or \
-                 quant.fixed_window_s): every fragment correlation is undefined, so every \
-                 candidate falls back to equal weights"
+                "quant.cross_run_weights / quant.cross_run_background need a fixed window \
+                 (quant.fixed_scan_halfwidth or quant.fixed_window_s): without one there is no \
+                 fragment correlation or flank, so the weights fall back to equal and no \
+                 background is subtracted"
             );
         }
         if self.quant.baseline_subtract
