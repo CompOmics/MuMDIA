@@ -35,9 +35,9 @@ blake3 = "1"
 bytes = "1"
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
-arrow = { version = "59", features = ["prettyprint"] }
+arrow = { version = "60", features = ["prettyprint"] }
 # Pure-Rust build: drop C zlib-ng (needs cmake); SNAPPY codec is pure Rust.
-parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
+parquet = { version = "60", default-features = false, features = ["arrow", "snap", "zstd"] }
 # Pure-Rust zlib backend instead of zlib-ng-compat (needs cmake). `miniz_oxide` stays
 # so this line still selects a pure-Rust codec on its own.
 mzdata = { version = "0.66", default-features = false, features = ["mzml", "miniz_oxide"] }
