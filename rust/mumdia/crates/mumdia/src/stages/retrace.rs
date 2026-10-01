@@ -23,7 +23,7 @@ use anyhow::{bail, Context, Result};
 use mumdia_core::config::RetraceConfig;
 use mumdia_core::schema::artifact;
 use mumdia_io::report::ArtifactReport;
-use mumdia_io::table::{Col, ParallelTableWriter, TableFile};
+use mumdia_io::table::{write_table, Col, ParallelTableWriter, TableFile};
 use rayon::prelude::*;
 use serde_json::json;
 use std::sync::Arc;
@@ -702,17 +702,22 @@ pub fn run(p: RetraceParams) -> Result<u64> {
         };
         let frange = |c: u32| fr.partition_point(|x| x.0 < c)..fr.partition_point(|x| x.0 <= c);
         let tol = frag_tol * 1e-6;
-        let picks: Vec<Option<(u32, f64, f64)>> = (0..ex.nrows)
+        // Diagnostic: MUMDIA_REPICK_DUMP=<path> writes every scored peak (candidate, order
+        // 0 = extract's apex then the sidecar ranks, apex RT, score). Off by default; the
+        // pick is the same either way (docs/TIMS_ROADMAP_bis.md section 9).
+        let dump = std::env::var("MUMDIA_REPICK_DUMP").ok();
+        let scored: Vec<(Option<(u32, f64, f64)>, Vec<(u32, u32, f64, f64)>)> = (0..ex.nrows)
             .into_par_iter()
             .map(|i| {
                 let (c, ci) = (ex_cid[i], ex_cid[i] as usize);
+                let mut rows: Vec<(u32, u32, f64, f64)> = Vec::new();
                 if ex_rank[i] != 0 || ci >= n_cand {
-                    return None;
+                    return (None, rows);
                 }
                 let (a, b) = (im_lo_c[ci], im_hi_c[ci]);
                 let fs = &fr[frange(c)];
                 if !(a.is_finite() && b > a && pmz[ci].is_finite()) || fs.is_empty() {
-                    return None;
+                    return (None, rows);
                 }
                 let wins: Vec<(u32, u32)> = fs
                     .iter()
@@ -724,7 +729,7 @@ pub fn run(p: RetraceParams) -> Result<u64> {
                     std::iter::once(apex_rt[ci]).chain(alt[range(&alt, c)].iter().map(|x| x.2));
                 // First maximum wins, so ties go to extract's apex, then to the lower rank.
                 let mut best = (0.0f64, f64::NAN, f64::NAN);
-                for t0 in peaks.filter(|t| t.is_finite()) {
+                for (order, t0) in peaks.enumerate().filter(|(_, t)| t.is_finite()) {
                     let lo = ms2_rt.partition_point(|&t| t < t0 - REPICK_RT_HW_S);
                     let hi = ms2_rt.partition_point(|&t| t < t0 + REPICK_RT_HW_S);
                     let fl: Vec<(&TofFrame, Vec<(usize, usize)>)> = (lo..hi)
@@ -733,13 +738,30 @@ pub fn run(p: RetraceParams) -> Result<u64> {
                         .filter(|(_, s)| !s.is_empty())
                         .collect();
                     let (s, cen) = joint_score(&fl, &wins, &pred, &scan_im, a, b);
+                    if dump.is_some() {
+                        rows.push((c, order as u32, t0, s));
+                    }
                     if s > best.0 {
                         best = (s, t0, cen);
                     }
                 }
-                (best.0 > 0.0).then_some((c, best.1, best.2))
+                ((best.0 > 0.0).then_some((c, best.1, best.2)), rows)
             })
             .collect();
+        if let Some(path) = &dump {
+            let r: Vec<&(u32, u32, f64, f64)> = scored.iter().flat_map(|x| &x.1).collect();
+            write_table(
+                path,
+                vec![
+                    Col::U32("candidate_id".into(), r.iter().map(|x| x.0).collect()),
+                    Col::U32("order".into(), r.iter().map(|x| x.1).collect()),
+                    Col::F64("apex_rt".into(), r.iter().map(|x| x.2).collect()),
+                    Col::F64("score".into(), r.iter().map(|x| x.3).collect()),
+                ],
+            )?;
+            info!(rows = r.len(), path, "retrace: re-pick scores dumped");
+        }
+        let picks: Vec<Option<(u32, f64, f64)>> = scored.into_iter().map(|x| x.0).collect();
         let mut picked: Vec<Option<(f64, f64)>> = vec![None; n_cand];
         for (c, t, im) in picks.into_iter().flatten() {
             n_moved += (t != apex_rt[c as usize]) as u64;

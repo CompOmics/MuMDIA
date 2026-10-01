@@ -1790,3 +1790,55 @@ The decoy fraction is 0.010 in both.
   because an ion is narrower than the band; using that edge gave 14,782.
 - Retrace including the repick takes 15 s and 20.8 GB on E. coli, and 6-7.5 min and 36-39 GB
   per HYE run (three runs at once).
+
+## 9. The re-pick has no RT prior (2026-10-01, HYE diaPASEF run 0)
+
+Diagnosis for the MBR-off ion gap against DIA-NN 2.5.0 (docs/TIMS_QUANT_ROADMAP.md sections 2b
+and 4h): per run we identify about 7% fewer ions, and 53% of the DIA-NN rows we extract but do not
+accept have our apex on another RT peak. Scripts in
+`/public/local/ProteoBench/HYE_diaPASEF_mumdia/quant_diag/`: `repick_diag.py`, `repick_prior.py`.
+
+**Who chooses the wrong peak.** The 93,307 candidates of run 0 that DIA-NN reports (`Q.Value` <=
+0.01) and we extract, with extract's apex (E) and the re-pick (P) against DIA-NN's RT (right =
+within 5 s). "From pred" is the median |apex - `rt_pred_cal`|.
+
+| class | candidates | accepted (q <= 0.01) | chosen from pred | right peak from pred |
+|---|---|---|---|---|
+| E right, P right | 74,563 | 92.8% | 3.8 s | 4.1 s |
+| E right, P wrong (re-pick broke it) | 2,464 | 5.0% | 20.9 s | 4.4 s |
+| E wrong, P right (re-pick fixed it) | 9,014 | 68.5% | 4.7 s | 4.8 s |
+| both wrong, right peak in top 5 | 3,009 | 5.1% | 20.9 s | 5.0 s |
+| right peak not in top 5 | 4,257 | 4.9% | 20.9 s | |
+
+- The re-pick score (`cos x ln(1 + I)` on the best 1/K0 band, section 8) reads no RT. Extract's
+  apex does (`extract.apex_rt_prior_s`, 120 s in this config).
+- Where the re-pick breaks a right apex, the peak it leaves is closer to the predicted RT in 82%
+  of cases; in the "both wrong" class, 85%. Where it fixes one, the new peak is closer in 83%.
+
+**Counterfactual RT prior.** `MUMDIA_REPICK_DUMP=<path>` (diagnostic, off by default) makes
+retrace write every scored peak (candidate, order, apex RT, score). On run 0 the re-run reproduces
+the shipped `psms_extracted.repick.parquet` exactly (333 s, 38.5 GB). Offline, each score is
+multiplied by exp(-0.5 (d / sigma)^2), d = |peak apex - `rt_pred_cal`|, and the first maximum
+wins. Sigma in seconds, or as a multiple of the candidate's RT-window half-width (median 37.4 s).
+
+| sigma | on DIA-NN's peak | E right, P right kept | broken repaired | fixed kept | both-wrong rescued |
+|---|---|---|---|---|---|
+| none (shipped) | 83,577 | 100% | 0% | 100% | 0% |
+| 10 s | 78,188 | 90.1% | 75.2% | 79.4% | 67.3% |
+| 20 s | 84,236 | 97.1% | 73.8% | 90.2% | 63.7% |
+| 30 s | 85,598 | 98.8% | 68.7% | 94.6% | 55.9% |
+| 40 s | 85,815 | 99.5% | 61.6% | 96.5% | 47.3% |
+| 60 s | 85,360 | 99.8% | 44.2% | 98.2% | 32.2% |
+| 0.5 x half-width | 83,869 | 96.6% | 74.5% | 89.2% | 64.5% |
+| 0.75 x half-width | 85,450 | 98.6% | 70.0% | 94.1% | 57.2% |
+| **1 x half-width** | **85,834** | 99.4% | 63.6% | 96.2% | 49.8% |
+| 1.25 x half-width | 85,714 | 99.7% | 56.0% | 97.3% | 41.3% |
+| 2 x half-width | 85,019 | 99.9% | 36.0% | 98.9% | 24.1% |
+
+- At sigma = 1 x half-width, 2,257 more of DIA-NN's candidates (2.4%) sit on DIA-NN's peak in this
+  run. It is a peak-choice count, not an identification count: the repaired and rescued candidates
+  are faint (5% accepted today), and the prior also moves decoys toward their predicted RT (45% of
+  decoy picks change against 45% of target picks), which shifts the RT features the rescorer sees.
+- The rule reads no label and generalises with the window (it scales with `rt_im_train`'s window).
+- Next: an engine key (`retrace.repick_rt_prior`, multiple of the window half-width, 0 = off), then
+  the identification gates: E. coli full run over 3 seeds, entrapment, HYE six runs.
