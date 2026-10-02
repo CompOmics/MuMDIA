@@ -2123,6 +2123,12 @@ Reading:
 - Not yet validated: one rescore seed, one dataset, and no entrapment. The model is trained on the
   same runs it scores. Decoys get the same model, so the target-decoy symmetry holds, but the FDR gate
   is the E. coli entrapment run with its own fine-tune, then seeds and a second acquisition.
+- An earlier test points the other way: on 2026-09-28 a cross-fitted AlphaPeptDeep MS2 fine-tune on
+  the E. coli pass-1 IDs (centroid traces, before retrace and the re-pick; `/public/local/MuMDIA_ft`)
+  raised held-out PCC from 0.887 to 0.902 but lost 1.5% of peptides and 5% of seed anchors. Here the
+  model is trained on all six runs' IDs and scores those runs, so part of the +3.4% may be the model
+  favouring precursors it was trained on. The deciding test is a cross-fitted fine-tune (train on one
+  half of the precursors, predict the other) on HYE, and the E. coli entrapment run.
 - Open design points if pursued: the fragment set was frozen (re-choosing the top 12 with the new model
   is a second effect), the 0 targets for unobserved positions bias the model toward sparsity, and the
   training set uses six runs' IDs (a per-run or first-run-only fine-tune, as `rt_library_scope`, is the
