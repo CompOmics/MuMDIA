@@ -1876,3 +1876,254 @@ HYE run 0, by what the prior did to the candidates DIA-NN reports:
 - Next: the "right peak, low score" population (docs/TIMS_QUANT_ROADMAP.md section 4h: 45,651
   run-level HYE rows, 20,000 at q 0.01-0.05), now including these repaired candidates.
 - The pooled HYE rescore took 2,093 s at a 134 GB peak (eng_repick: 3,751 s, 69 GB).
+
+## 10. "Right peak, low score" on the re-pick base (2026-10-02, HYE diaPASEF run 0)
+
+Scripts in `/public/local/ProteoBench/HYE_diaPASEF_mumdia/quant_diag/`: `rplow_features.py`
+(D2 method on `eng_repick`), `rplow_local.py`. Populations, one competed row per candidate:
+- R: DIA-NN 2.5.0 reports it, our re-picked apex within 5 s of DIA-NN's RT, our q > 0.01 (8,219;
+  3,307 at q 0.01-0.05);
+- A: the same, accepted (75,358); Aq: A resampled to R's DIA-NN `Precursor.Normalised`;
+- Dm: decoys resampled to R's rescore score; D: 300,000 decoys.
+
+**Every evidence family is at decoy level.** Against Aq (same DIA-NN abundance), the largest gaps,
+with R at Dm level on all of them (AUC R vs Dm 0.44-0.56):
+
+| family | feature | AUC R vs Aq | median R / Aq / Dm |
+|---|---|---|---|
+| peak contrast in the RT window | `peak_to_full_area_ratio_frag_mean` | 0.167 | 0.097 / 0.186 / 0.107 |
+| | `n_competing_peaks_in_window` | 0.764 | 8 / 2 / 7 |
+| library intensity agreement | `scribe_score_area` | 0.183 | 2.65 / 3.66 / 2.76 |
+| fragment co-elution | `frag_ref_corr_mean_full` | 0.188 | 0.254 / 0.388 / 0.281 |
+| 1/K0 agreement | `imc_ref_w` | 0.236 | 0.309 / 0.501 / 0.303 |
+| MS1 | `ms1_isotope_cosine_apex` | 0.275 | 0.956 / 0.989 / 0.944 |
+| | `ms1_ms2_time_corr` | 0.375 | 0.53 / 0.79 / 0.51 |
+| signal | `sum_y_intensity` | 0.328 | 2,521 / 3,952 / 2,536 |
+
+- The RT window is the same for R and Aq (37.4 s half-width), `contested_frac` is 0 in both, and
+  R sits at lower precursor m/z (582 against 667, AUC 0.36).
+- A local contrast from the raw traces (+-4 scans over +-10 to +-40 scans) behaves the same: at
+  +-10 scans R's summed trace has 3 maxima above half the apex, Aq 1, Dm 3 (AUC R vs Dm
+  0.47-0.57). It is not new evidence.
+- R's apex is less precise: |apex - DIA-NN RT| median 0.97 s against 0 (p90 2.9 against 0.97 s),
+  |apex 1/K0 - DIA-NN IM| > 0.015 in 9.8% against 1.3%. DIA-NN's peak is wider for R (8.7 against
+  7.7 s).
+
+**Oracle apex (diagnostic only).** `rpdump/r0_oracle`: the DIA-NN-reported targets get DIA-NN's RT
+and IM as `apex_rt` / `apex_im` (93,307 rows), then retrace (re-pick off) and features; same
+populations. R moves part of the way: over the 82 features with |AUC(R, Aq) - 0.5| >= 0.2, the
+median gap falls from 0.257 to 0.188, and R's separation from Dm doubles (median |AUC - 0.5| 0.032
+to 0.066). Library and 1/K0 agreement gain most (`scribe_score_area` AUC 0.18 to 0.28, `imc_ref_w`
+0.24 to 0.33, `ms1_isotope_cosine_apex` 0.28 to 0.35); co-elution and contrast hardly move
+(`frag_ref_corr_mean_full` 0.19 to 0.22). At the oracle apex R's `sum_y_intensity` is still 30%
+below Aq's (2,844 against 4,052).
+
+Reading:
+- A perfect apex would recover about a quarter of R's evidence gap. It is an upper bound, and the
+  RT part was already tried (section 9).
+- The rest is the signal itself: at the same DIA-NN abundance our traces hold about 30% less of
+  R's fragment signal, and what they hold is crowded (several peaks of similar height within
+  +-10 s). Either we capture less of these ions (tolerance, 1/K0 band, fragment choice), or DIA-NN's
+  abundance estimate for them leans on evidence we do not use.
+
+**Signal capture is not the loss** (`rplow_capture.py`, traces rebuilt at the oracle apex of run 0
+with the re-pick off). Median gain of the +-4-scan summed fragment area over the current settings
+(1/K0 band +-0.015, 16.5 ppm from the mass calibration), with the local co-elution (median Pearson
+of each fragment with the sum of the others over +-10 scans):
+
+| arm | area gain R / Aq / Dm / D | co-elution R / Aq / Dm | co-elution AUC R vs Dm |
+|---|---|---|---|
+| base | 1 / 1 / 1 / 1 | 0.257 / 0.540 / 0.145 | 0.655 |
+| 1/K0 band +-0.025 | 1.38 / 1.26 / 1.39 / 1.44 | 0.200 / 0.460 / 0.132 | 0.602 |
+| 25 ppm | 1.35 / 1.28 / 1.43 / 1.44 | 0.253 / 0.523 / 0.159 | 0.625 |
+
+R gains what the decoys gain, and contrast and co-elution get worse for every population: the
+extra signal is background, not R's ion. The trace build does not lose these ions; the current
+band and tolerance are right.
+
+**Local co-elution is weak new evidence.** At our own apex (`rplow_coel_sweep.py`, median over
+fragments of the Pearson with the sum of the others over +-L scans):
+
+| L (scans) | 4 | 6 | 10 | 15 | 20 | 30 |
+|---|---|---|---|---|---|---|
+| AUC R vs Dm | 0.570 | **0.591** | 0.590 | 0.563 | 0.534 | 0.494 |
+| AUC Aq vs D | 0.922 | 0.932 | 0.929 | 0.918 | 0.907 | 0.883 |
+
+On every existing co-elution feature R is at or below its score-matched decoys (AUC 0.42-0.52;
+the features use the whole window or the peak). The +-6-scan version is the only co-elution
+measure above them. For scale, `imc_ref_w` separated at 0.71 on E. coli and gave +1.3% (section 7).
+
+Reading: the right-peak rejects of HYE are signal-limited. A perfect apex recovers about a quarter
+of the evidence gap, widening the trace build adds only background, and the one new measure found
+here is weak.
+
+## 11. DIA-NN's peak not among extract's top 5 (2026-10-02, HYE diaPASEF run 0)
+
+The 4,257 candidates of run 0 (section 9 classes) whose DIA-NN peak is neither extract's apex nor
+one of the five sidecar peaks (`quant_diag/nottop5.py`). Extract enumerates its peaks on the
+per-scan count of distinct matched fragments (`peaks::enumerate_peaks`, bound 1/3, prominence
+0.1, ranked by the summed count), from centroid matches over the run-window 1/K0 range (median
+0.079). The rebuild from `l1d/pass2_robust` reproduces the shipped sidecar for 3,000 of 3,000
+candidates (count window 1; the sidecar uses the unsmoothed count). Rank of DIA-NN's peak (a peak
+apex within 5 s of DIA-NN's RT) in that profile, and in the same profile rebuilt from raw traces
+at DIA-NN's 1/K0 (+-0.015, `rpdump/r0_oracle`):
+
+| profile | population | rank 0-4 | 5-9 | 10-19 | no peak |
+|---|---|---|---|---|---|
+| centroid, run-window 1/K0 (extract) | not in top 5 (4,257) | 0 | 69.0% | 11.0% | 19.7% |
+| | in top 5 (4,000 sampled) | 100% | 0 | 0 | 0 |
+| raw, DIA-NN's 1/K0 +-0.015 | not in top 5 | 62.4% | 14.6% | 3.5% | 19.3% |
+| | in top 5 | 96.3% | 3.5% | 0.1% | 0.1% |
+
+Fragment count at DIA-NN's RT against the top peak's (medians): 6 against 7 in the centroid
+profile, 9 against 9 in the raw one. Each profile has about 21 peaks.
+
+- 905 of the 4,257 (21%) are outside our RT window: DIA-NN's RT is a median 55 s from
+  `rt_pred_cal` (p25-p75 46-78 s) against a 37.4 s half-width, and 28% are beyond twice the
+  half-width. Over all 93,307 DIA-NN candidates of the run, 1,014 (1.1%) are outside the window.
+  This is RT prediction, not peak detection (wider windows: section 6).
+- The rest are near misses of the count ranking: in extract's profile DIA-NN's peak is rank 5-9 for
+  69%. Counted in a narrow band at the right 1/K0 it would be in the top five for 62%. The wide
+  1/K0 range lets random matches build peaks of the same height.
+- The narrow-band figure uses DIA-NN's 1/K0, so it is an upper bound: extract's `im_pred_cal` is
+  more than 0.015 from DIA-NN's IM for a third of candidates (section 8).
+- Size: 3,350 candidates per run (3.6% of DIA-NN's). Section 9 showed that a candidate moved onto
+  the right peak converts at about 38%, so the reachable gain is of the order of 1,000 run-level
+  rows per run (about 1%).
+
+## 12. Where the per-run gap sits, and zero-intensity library fragments (2026-10-02, HYE diaPASEF)
+
+`quant_diag/gap_strata.py` on run 0: DIA-NN 2.5.0 rows (`Q.Value` <= 0.01, 94,872) against our
+accepted rows (pooled q <= 0.01, 89,674); net gap 5,198 (5.5%). Net gap = DIA-NN rows - DIA-NN rows
+we accept - our rows DIA-NN does not report.
+
+| stratum | share of DIA-NN rows | share of the net gap | our acceptance of DIA-NN's rows |
+|---|---|---|---|
+| precursor charge 2 | 79.6% | 97.4% | 0.805 |
+| precursor charge 3 | 19.3% | 1.5% | 0.777 |
+| length 7-9 | 24.7% | 47.7% | 0.749 |
+| length 10-12 | 33.7% | 36.8% | 0.820 |
+| length 13-16 | 29.0% | 15.8% | 0.828 |
+| precursor m/z <= 500 | 19.2% | 30.3% | 0.744 |
+| precursor m/z 500-600 | 26.9% | 36.0% | 0.794 |
+| RT 15-25 min | 2.2% | 13.9% | 0.518 |
+| 2 missed cleavages (not in our library) | 0.4% | 8.1% | 0 |
+
+The gap is short, doubly charged, low-m/z precursors. Charge 3 is net even.
+
+**Library slots.** The fragment library keeps the top 12 fragments by predicted intensity, so a
+precursor with fewer than 12 positive predictions keeps fragments predicted at 0. 21% of all
+176.8M library fragments are predicted 0. Per precursor (means of 1,500 sampled per stratum):
+
+| precursor | slots predicted 0 | fragment charge 2 (predicted 0) | m/z < 200 | useful (> 0, m/z >= 200) |
+|---|---|---|---|---|
+| charge 2, 7-9 aa | 3.97 | 3.33 (2.46) | 1.74 | 7.96 |
+| charge 2, 10-12 aa | 2.05 | 2.05 (1.09) | 0.70 | 9.93 |
+| charge 2, 13-16 aa | 1.99 | 2.08 (1.09) | 0.56 | 10.01 |
+| charge 3, 13-16 aa | 1.42 | 3.30 (0.69) | 0.52 | 10.58 |
+
+**Test: drop the fragments predicted 0** (`eng_libnz`; `lib_nz/fragments_nz.parquet`, 79.1% of
+the fragments; the 11,821 candidates without a positive fragment keep theirs). Same binary and
+inputs as `eng_repick` (paired), seed 0. A filter to m/z >= 200 on top removes only 0.3% more,
+because almost every fragment below 200 is already predicted 0, so it was not run.
+
+| | `eng_repick` | zero-intensity fragments dropped |
+|---|---|---|
+| extracted candidates, run 2 (targets / decoys) | 3,572,711 / 3,567,127 | 3,384,767 / 3,379,196 (-5.3%) |
+| DIA-NN candidates extracted, run 0 | 93,008 | 92,912 |
+| precursors / peptides / PGs | 112,800 / 100,790 / 12,331 | 112,559 / 100,706 / 12,300 |
+| target rows at pooled q 1%, six runs | 543,082 | 543,286 |
+| decoy rows at pooled q 1% | 5,429 | 5,431 |
+| run 0: DIA-NN 7-9 aa rows accepted | 0.749 | 0.752 |
+| ProteoBench ions (k = 3) / global / eq / CV (quant with `cross_run_width`) | 92,540 / 0.130 / 0.177 / 0.083 | 92,531 / 0.129 / 0.177 / 0.083 |
+
+- No effect on identification, also not on the short peptides. The zero-predicted slots collect
+  noise matches, but the rescorer already discounts them. They are not why short peptides lose.
+- The extract population shrinks by 5.3% without losing DIA-NN's candidates, so the filter is a
+  cost lever (smaller extract, features and rescore), not a sensitivity one.
+- The short-peptide deficit is then the small number of informative fragments itself (about 8 for
+  a 7-9-mer at charge 2), consistent with sections 10 and 11: faint, crowded precursors with
+  little evidence.
+
+## 13. Systemic causes checked for the 6% per-run gap (2026-10-02, HYE diaPASEF)
+
+Precursors at 1% against DIA-NN 2.5.0 (MBR off): mean per run 90,514 against 96,692 (-6.4%; run-level
+q in both), union over runs 124,738 against 131,475 (-5.1%), experiment-wide 112,800 against 121,542
+(-7.2%; our `precursor_q`, DIA-NN run and global q). The per-row levers of sections 9-12 sum to about
+2%, so the search turned to factors every precursor shares. Scripts in `quant_diag/`.
+
+| hypothesis | test | result |
+|---|---|---|
+| reverse decoys shadow their targets (same composition) | `shadow.py`: decoys above the 1% cut whose paired target is accepted with an apex within 5 s and 0.015 1/K0 | 1.2-2.4% of them; predicted RT of target and decoy differ by a median 38.7 s. Not it |
+| plain target-decoy q is conservative | `picked.py`: picked competition per (base peptide, charge, Met-ox count) | +0.5% rows per run on HYE; entrapment precursor FDP 0.35-0.41% plain, 0.37-0.47% picked. Small |
+| prior predictions (RT, 1/K0) worse than DIA-NN's | residuals on the 75,842 precursors both identify in run 0 | RT: ours median 3.8 s, DIA-NN `Predicted.RT` 18.7 s; 1/K0: ours 0.0099, DIA-NN 0.0082 (p95 equal). Not it |
+| MS1 signal missing for our rejects | DIA-NN's own values for the right-peak rejects (R) against abundance-matched accepted (Aq) | `Ms1.Area` equal (25k against 23k); DIA-NN's evidence is lower for R too (`Evidence` 3.4 against 4.0, `Ms1.Profile.Corr` 0.66 against 0.82), but DIA-NN still accepts them (median q 9e-4, PEP 0.009) |
+| fragment-intensity model not adapted to the data | `frag_headroom.py`: cosine (square-rooted areas) of prediction against run 0, and run 1 against run 0, 77,448 precursors accepted in both | prediction 0.967, run-to-run 0.986; run-to-run better in 81%; by quintile 0.952 / 0.960 (faint) to 0.984 / 0.998 (bright) |
+
+Short peptides are over-represented among high-scoring decoys: 38% of the 856 decoys above the 1% cut
+of run 0 are 7-9 aa, against about 23% of our accepted targets.
+
+Reading: the per-run gap is a discrimination gap. DIA-NN's evidence for the precursors we reject is
+weaker than for the rest, as ours is, but its targets stay separated from its decoys and ours do not.
+Of the shared causes tested, only the fragment model shows real headroom: RT and 1/K0 are already
+adapted to the data (multi-head refit, per-charge CCS calibration), the fragment intensities are
+peptdeep's generic timsTOF model. Fine-tuning it on the dataset's confident identifications (the
+transfer learning of AlphaPeptDeep and AlphaDIA) is the untested lever. It helps real precursors, whose
+spectra exist, and cannot help reversed decoys, whose spectra do not.
+
+## 14. Fine-tuning the fragment model on the dataset's own IDs (2026-10-02, HYE diaPASEF)
+
+Prototype outside the engine, to find the cause, not a lever to implement as is. Scripts:
+`bench/ms2_finetune/ms2_finetune.py` (fine-tune and held-out check) and `ms2_repredict.py` (library
+re-prediction); both carry the HYE paths of this run and run in the `mumdia-peptdeep` env. Model in
+`ms2ft/`, library in `lib_ft/`, arm `eng_ms2ft` (under `/public/local/ProteoBench/HYE_diaPASEF_mumdia`).
+
+**Fine-tune.** peptdeep `generic` MS2 model (timsTOF, NCE 35, as the library build), trained 10
+epochs at lr 1e-4 (34 min, CPU) on 79,937 precursors accepted at pooled q <= 0.001 in any of the six
+`eng_repick` runs. Target pattern: mean over the confident runs of the max-normalised pass-1
+fixed-window areas of the 12 library fragments; every other b/y position set to 0. Split by stripped
+sequence (80 / 20). Held-out (12,479 precursors accepted in runs 0 and 1), cosine of square-rooted
+areas over the fragments seen in both runs:
+
+| | prediction vs run 0 | run-to-run better than prediction |
+|---|---|---|
+| generic model | 0.9720 | 82% |
+| fine-tuned | **0.9834** | 65% |
+| ceiling: run 1 vs run 0 | 0.9881 | |
+
+**Library.** Every candidate, target and decoy, re-predicted with the fine-tuned model (14.7M
+precursors, 57 min, CPU, 48 processes; the spawned workers keep the weights, checked). Only
+`predicted_intensity` is replaced: the 12 fragments per candidate, their m/z and cardinality, and the
+precursor table (RT, 1/K0) are unchanged. Median change 0.042 in normalised intensity.
+
+**HYE, six runs, seed 0**, same binary and inputs as `eng_repick` (paired):
+
+| | `eng_repick` | fine-tuned fragment model | change |
+|---|---|---|---|
+| target rows at pooled q 1%, mean per run | 90,514 | 93,604 | +3.4% (+3.1 to +3.6% per run) |
+| decoy rows at pooled q 1%, six runs | 5,429 | 5,615 | |
+| precursors / peptides / PGs | 112,800 / 100,790 / 12,331 | 116,095 / 103,324 / 12,655 | +2.9 / +2.5 / +2.6% |
+| ProteoBench ions (k = 3) | 92,540 | 95,772 | +3.5% |
+| global / eq / CV | 0.130 / 0.177 / 0.083 | 0.132 / 0.181 / 0.085 | |
+| E. coli / human / yeast abs eps | 0.228 / 0.120 / 0.182 | 0.236 / 0.122 / 0.184 | |
+| ions shared with DIA-NN 2.5.0 | 81,778 | 83,345 | |
+
+Against DIA-NN 2.5.0 (96,692 rows per run, 98,694 ions): from -6.4% to -3.2% per run, from -6.2% to
+-3.0% in ions.
+
+Run 0, the right-peak rejects (R, section 10) on the new competed table, against score-matched decoys
+(Dm; populations from the old q): library agreement now separates them (`scribe_score_area` AUC 0.459
+to 0.547, `spectral_entropy_similarity_area` 0.497 to 0.589, `kl_obs_pred` 0.556 to 0.464), because R's
+agreement rose (median scribe 2.65 to 2.76) while the decoys' fell (2.76 to 2.62). Co-elution and
+contrast are unchanged, as they do not use the predictions.
+
+Reading:
+- The fragment-intensity model is a cause of the per-run gap, worth about half of it on this dataset.
+  RT and 1/K0 were already adapted to the data; the fragment intensities were not.
+- Not yet validated: one rescore seed, one dataset, and no entrapment. The model is trained on the
+  same runs it scores. Decoys get the same model, so the target-decoy symmetry holds, but the FDR gate
+  is the E. coli entrapment run with its own fine-tune, then seeds and a second acquisition.
+- Open design points if pursued: the fragment set was frozen (re-choosing the top 12 with the new model
+  is a second effect), the 0 targets for unobserved positions bias the model toward sparsity, and the
+  training set uses six runs' IDs (a per-run or first-run-only fine-tune, as `rt_library_scope`, is the
+  engine-shaped variant).
