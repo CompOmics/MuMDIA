@@ -1406,6 +1406,21 @@
       "source_struct": "ExtractConfig"
     },
     {
+      "path": "extract.apex_refine_intensity",
+      "name": "apex_refine_intensity",
+      "section": "extract",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Choose the apex by intensity INSIDE the region the fragment count selects. The qualifying scans (rolling distinct-fragment count within `apex_count_tol` of its maximum) are widened by the rolling half-width (`apex_count_window / 2`), and the apex is the scan in that region with the largest observed intensity of the top-K predicted fragments (`apex_top_fragments`, 3 by default), times the RT prior when it is on. The count still decides WHERE the peptide elutes, so a bright interferent outside the sustained-evidence region cannot take the apex; inside it, intensity decides WHICH scan. Without it the count also picks the scan, and on a tailing peak the rolling count is largest after the intensity maximum: measured on Astral REP1 (`apex_count_window` 5), the summed fragment intensity peaked one scan BEFORE the chosen apex for 41% of the accepted precursors and one scan after for 6%; recomputed with this rule, 85% at the apex, 6% and 5% either side. Default false; benchmark-gated.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ExtractConfig"
+    },
+    {
       "path": "extract.emit_gate_diagnostics",
       "name": "emit_gate_diagnostics",
       "section": "extract",
