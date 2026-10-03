@@ -542,6 +542,133 @@ struct PerRun {
 /// path remains for a table the splice cannot take: one whose `source` is nullable or has
 /// no statistics (the MBR worker's pyarrow output), or whose re-encoded boundary rows the
 /// splice refuses.
+/// The MBR re-extraction tier (`mbr.reextract`): the worker writes each run's targets from
+/// the MBR-off `scored` table (`mbr_reextract.py prep`), retrace rebuilds their traces at the
+/// expected apex, and the worker tests them, adds the `rescuable` table's transfers for the
+/// rows it did not accept, and writes the augmented scored table to `scored_out`
+/// (`mbr_reextract.py score`). Every run's retrace inputs come from its own retrace report.
+///
+/// Returns, per run, the transfers with new traces (ascending) and, when the run was retraced,
+/// the other targets: quant reads the former from the new traces and
+/// every other candidate from the run's own (see [`ChromTable`]).
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn reextract(
+    cfg: &Config,
+    ch: &str,
+    chroms: &[Vec<ChromTable>],
+    scored: &str,
+    rescuable: Option<&str>,
+    frag_tables: &[String],
+    rx: &str,
+    scored_out: &str,
+) -> Result<Vec<(Vec<u32>, Option<Vec<u32>>)>> {
+    if chroms.iter().any(|t| t.len() != 1 || !t[0].drop.is_empty()) {
+        anyhow::bail!("mbr.reextract reads one chromatogram table per run");
+    }
+    let python = cfg.mbr.python.as_deref().expect("preflight");
+    let script =
+        crate::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "mbr_reextract.py");
+    let params: Vec<serde_json::Value> = chroms
+        .iter()
+        .map(|t| {
+            let rep = format!("{}.report.json", t[0].path);
+            let v: serde_json::Value = mumdia_io::json::read_json(&rep)?;
+            if v["stage"] != "retrace" || !v["params"]["run_windows"].is_string() {
+                anyhow::bail!(
+                    "mbr.reextract: {rep} is not the report of a retrace that records its inputs \
+                     (retrace.enabled, and a binary from 2026-10-02 or later)"
+                );
+            }
+            Ok(v["params"].clone())
+        })
+        .collect::<Result<_>>()?;
+    let s = |v: &serde_json::Value, k: &str| v[k].as_str().map(str::to_string);
+    // The psms the run's later stages read: the re-picked table under `retrace.repick`.
+    let psms: Vec<String> = params
+        .iter()
+        .map(|v| {
+            s(v, "psms_out")
+                .or_else(|| s(v, "psms_extracted"))
+                .unwrap_or_default()
+        })
+        .collect();
+    let cent: Vec<String> = params
+        .iter()
+        .map(|v| s(v, "centroid_chromatograms").unwrap_or_default())
+        .collect();
+    let run_worker = |mode: &str, inputs: &[String], rest: &[&str]| {
+        crate::sidecar::run_mbr_reextract(
+            python,
+            &script,
+            mode,
+            scored,
+            inputs,
+            rest,
+            cfg.mbr.q_anchor,
+            cfg.mbr.min_anchor_runs,
+            cfg.mbr.q_transfer,
+            cfg.rng_seed,
+        )
+    };
+    run_worker("prep", &psms, &[&cent.join(","), rx])?;
+    let mut rcfg = cfg.retrace.clone();
+    rcfg.repick = false;
+    let mut retraced = Vec::with_capacity(chroms.len());
+    for (i, v) in params.iter().enumerate() {
+        let o = format!("{rx}/r{i}");
+        let n = mumdia_io::table::nrows(&format!("{o}/psms.parquet"))?;
+        retraced.push(n > 0);
+        if n == 0 {
+            // No traces for the worker to read, not a previous run's.
+            let _ = std::fs::remove_file(format!("{o}/chromatograms.parquet"));
+            continue;
+        }
+        info!(
+            run = i,
+            targets = n,
+            "run-experiment: MBR re-extraction retrace"
+        );
+        retrace::run(retrace::RetraceParams {
+            raw: &s(v, "raw").unwrap_or_default(),
+            chromatograms: &format!("{o}/chromatograms.centroid.parquet"),
+            psms_extracted: &format!("{o}/psms.parquet"),
+            run_windows: &s(v, "run_windows").unwrap_or_default(),
+            library_precursors: &s(v, "library_precursors").unwrap_or_default(),
+            mass_cal: s(v, "mass_cal").as_deref(),
+            frag_tol_fallback_ppm: v["frag_tol_fallback_ppm"]
+                .as_f64()
+                .unwrap_or(cfg.extract.frag_tol_ppm),
+            prec_tol_ppm: cfg.extract.prec_tol_ppm,
+            out: &format!("{o}/chromatograms.parquet"),
+            apex_out: None,
+            psms_out: None,
+            cfg: &rcfg,
+            config_hash: ch,
+        })?;
+    }
+    let mut rest = vec![rx, scored_out];
+    if let Some(r) = rescuable {
+        rest.extend_from_slice(&["--rescuable", r]);
+    }
+    run_worker("score", frag_tables, &rest)?;
+    let ids = |p: String| -> Result<Vec<u32>> {
+        let mut v = mumdia_io::table::TableFile::open(&p)?.u32("candidate_id")?;
+        v.sort_unstable();
+        Ok(v)
+    };
+    (0..chroms.len())
+        .map(|i| {
+            let acc = ids(format!("{rx}/r{i}/accepted.parquet"))?;
+            if !retraced[i] {
+                return Ok((acc, None));
+            }
+            let mut untaken = ids(format!("{rx}/r{i}/targets.parquet"))?;
+            untaken.retain(|c| acc.binary_search(c).is_err());
+            Ok((acc, Some(untaken)))
+        })
+        .collect()
+}
+
 fn split_by_source(scored: &str, out_paths: &[String]) -> Result<Vec<Written>> {
     let t = mumdia_io::table::TableFile::open(scored)?;
     let src_idx = t
@@ -1746,8 +1873,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .clone()
         .unwrap_or_else(|| actual_rescorer.clone());
 
-    // --- optional rescuable-tier MBR transfer ---
-    let scored_for_quant = if cfg.mbr.strategy != mumdia_core::config::MbrStrategy::None {
+    // --- optional rescuable-tier MBR transfer (off under mbr.reextract with mbr.rescuable false) ---
+    let mut scored_for_quant = if cfg.mbr.strategy != mumdia_core::config::MbrStrategy::None
+        && cfg.mbr.rescuable
+    {
         let python = cfg.mbr.python.as_deref().expect("preflight");
         let script =
             crate::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "mbr_worker.py");
@@ -1816,7 +1945,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let split_paths: Vec<String> = (0..n_runs)
         .map(|i| d(&format!("{}/scored.parquet", names[i])))
         .collect();
-    let split_written = split_by_source(&scored_for_quant, &split_paths)?;
+    let mut split_written = split_by_source(&scored_for_quant, &split_paths)?;
 
     let mut qcfg = cfg.quant.clone();
     // Per-run quant gates on the pooled `q_value`, not on whatever `quant.q_filter` says. The
@@ -1843,10 +1972,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // `quant.cross_run_weights` / `quant.cross_run_background`: a first pass exports every run's fragment areas and apex
     // correlations, the weights are fitted over all runs, and the second pass below writes
     // the quantities with them. ponytail: two full passes; cache the areas if quant time matters.
-    let mut frag_tables: Vec<String> = Vec::new();
     let cross_run_on =
         qcfg.cross_run_weights || qcfg.cross_run_background || qcfg.cross_run_width > 0.0;
-    if cross_run_on {
+    let pass1 = |chroms: &[Vec<ChromTable>]| -> Result<Vec<String>> {
+        let mut frag_tables = Vec::with_capacity(n_runs);
         for i in 0..n_runs {
             let ft = d(&format!("{}/fragment_quant.parquet", names[i]));
             let tmp = |n: &str| d(&format!("{}/{n}.pass1.parquet", names[i]));
@@ -1867,6 +1996,59 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             }
             frag_tables.push(ft);
         }
+        Ok(frag_tables)
+    };
+    let mut frag_tables: Vec<String> = if cross_run_on {
+        pass1(&chroms)?
+    } else {
+        Vec::new()
+    };
+    // --- optional MBR re-extraction tier (mbr.reextract, docs/TIMS_QUANT_ROADMAP.md 4k) ---
+    // Each run's tier-2 targets are retraced at their expected RT and 1/K0, tested against
+    // a same-trace RT-shift null, and the accepted ones are quantified from the new traces.
+    let mut chroms_q = chroms.clone();
+    if cfg.mbr.reextract {
+        if !cross_run_on {
+            anyhow::bail!(
+                "mbr.reextract reads the anchor runs' first-pass fragment areas, so it needs \
+                 quant.cross_run_weights, cross_run_background or cross_run_width (the \
+                 diaPASEF quant preset sets them)"
+            );
+        }
+        let rx = d("mbr_reextract");
+        let scored_rx = d("scored_mbr_reextract.parquet");
+        // Re-extraction runs on the MBR-off table, so it also takes the rows the rescuable
+        // tier would; the rescuable tier's own table, when it accepted any, then fills the rest.
+        let rescuable = (scored_for_quant != scored_combined).then_some(scored_for_quant.as_str());
+        let accepted = reextract(
+            cfg,
+            &ch,
+            &chroms,
+            &scored_combined,
+            rescuable,
+            &frag_tables,
+            &rx,
+            &scored_rx,
+        )?;
+        scored_for_quant = scored_rx;
+        split_written = split_by_source(&scored_for_quant, &split_paths)?;
+        for (i, (acc, untaken)) in accepted.into_iter().enumerate() {
+            if let Some(untaken) = untaken {
+                chroms_q[i] = vec![
+                    ChromTable {
+                        path: chroms[i][0].path.clone(),
+                        drop: acc,
+                    },
+                    ChromTable {
+                        path: format!("{rx}/r{i}/chromatograms.parquet"),
+                        drop: untaken,
+                    },
+                ];
+            }
+        }
+        // ponytail: a third quant pass (pass 1 again with the transfers); one pass 1 after
+        // re-extraction would do if the worker read the anchor areas from the traces.
+        frag_tables = pass1(&chroms_q)?;
     }
     let cross_run = if cross_run_on {
         let fit = quant::fit_cross_run(
@@ -1892,7 +2074,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         let gq = d(&format!("{}/protein_group_quant.parquet", names[i]));
         let written = quant::run_hashed(quant::QuantParams {
             psms_scored: &split_paths[i],
-            chromatograms: &chroms[i],
+            chromatograms: &chroms_q[i],
             out_peptide: &pq,
             out_protein: &gq,
             out_fragment: None,

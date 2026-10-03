@@ -36,6 +36,7 @@ stages that operate across multiple runs.
 | `rust/mumdia/crates/mumdia-core/src/rejection.rs` | `RejectionReason` enum + ladder ordering |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `QuantConfig`, `MbrConfig`, `RtImTrainConfig`, and the strategy enums |
 | `scripts/mbr_worker.py` | MBR transfer sidecar (rescuable + re-extraction tiers) |
+| `scripts/mbr_reextract.py` | `mbr.reextract`: targets for retrace at the expected apex, RT-shift null, transfer q |
 | `rust/mumdia/crates/mumdia/src/main.rs` | CLI definitions + handlers for all six subcommands |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | `run_mbr` (builds argv for `mbr_worker.py`) |
 
@@ -530,6 +531,39 @@ The worker (`scripts/mbr_worker.py`) implements two tiers:
   predicted-RT window plus a permuted-RT decoy target file (`transfer_decoys_<i>.parquet`),
   to feed `extract --restrict-candidates --run-windows`. This tier is fully implemented
   in the worker but has no Rust CLI plumbing, so it is unreachable from `mumdia mbr`.
+  The wired re-extraction tier is a different one (`mbr.reextract`, below).
+
+### mbr.reextract (run-experiment, diaPASEF)
+
+`mbr.reextract` (default false; needs `mbr.strategy != none`, `retrace.enabled`, and one of
+the cross-run quant keys, which the diaPASEF quant preset sets) adds a transfer tier in
+`run_experiment::reextract`. It runs first, on the MBR-off `scored_combined`, and the
+rescuable tier (`mbr.rescuable`, default true) then adds its transfers for the rows it did not
+accept; `mbr.rescuable: false` is re-extraction only. Measured in docs/TIMS_QUANT_ROADMAP.md
+sections 4j to 4l; benchmark-gated.
+
+- Population: target, confident (`q <= q_anchor`) in `>= min_anchor_runs` OTHER runs, not
+  confident in this run, extracted here, including the rows the rescuable tier would take:
+  their re-extracted values quantify better than the rescuable tier's.
+- `mbr_reextract.py prep`: per run, `targets.parquet` (expected RT as in `mbr_worker.py`;
+  expected 1/K0 = median of the anchor runs' `apex_im`, moved onto this run's scale by a
+  per-run median offset), a four-column `psms.parquet` (`candidate_id`, `peak_rank` 0,
+  `apex_rt`, `apex_im` = the expected values) and the targets' centroid traces.
+- Retrace (repick off) rebuilds those traces at the expected apex. Every input comes from
+  the run's own retrace report, which records them since 2026-10-02 (`psms_extracted`,
+  `psms_out`, `run_windows`, `library_precursors`, `mass_cal`, `frag_tol_fallback_ppm`).
+- `mbr_reextract.py score`: evidence at the expected RT (sqrt-area cosine against the anchor
+  runs' pass-1 fragment shares, +-4 scans; median fragment co-elution, +-6 scans; log10
+  area), the same three values at 10 random positions >= 15 s away in the same traces (the
+  null), a logistic score of target against null cross-fitted in 2 folds by candidate, and
+  q = `(null >= s + 1) / 10 / (targets >= s)`, running minimum. It prints the accepted rows
+  and the null draws at or above the threshold. Accepted rows get `apex_rt` = the expected
+  RT, the PSM q columns lowered to the transfer q, `is_transferred` and `transfer_q`, in
+  `scored_mbr_reextract.parquet`; `r<i>/accepted.parquet` lists them.
+- Quant: each run reads every transfer with re-extracted traces (accepted, or a rescuable
+  transfer it did not accept, which keeps its own apex) from `mbr_reextract/r<i>/chromatograms.parquet`
+  and every other candidate from its own traces (two `ChromTable`s with `drop` lists); pass 1
+  runs again so the cross-run fit sees the transfers.
 
 The M5 augmented scored output (`--out-scored`, `mbr_worker.py:272`) requires the
 scored table to have a `source` column and matches transfers on `(candidate_id,

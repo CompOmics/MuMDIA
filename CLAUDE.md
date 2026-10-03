@@ -31,8 +31,8 @@ policy for tuning and validation.
   - `mumdia-core`: typed config, schemas, manifest, masses/constants.
   - `mumdia-io`: Arrow/Parquet table layer, hashes, JSON, artifact reports.
   - `mumdia`: CLI/library, fragment index, FDR/rescoring, and stages.
-- `scripts/`: nine engine-invoked Python workers plus four imported-library
-  helpers (thirteen scripts), and `_lib_io.py`, the shared writer the helpers use so
+- `scripts/`: ten engine-invoked Python workers plus four imported-library
+  helpers (fourteen scripts), and `_lib_io.py`, the shared writer the helpers use so
   they cannot emit a parquet the engine rejects. Includes `augment_library.py`, which adds the
   tryptic FASTA peptides an imported library is missing. Sidecars use positional
   file contracts.
@@ -838,7 +838,7 @@ Do not enable these by default from a single AIF count:
   has the mechanism and numbers;
 - alternative hard/soft extraction gates or peak apportionment;
 - margin competition or unique-evidence competition;
-- MBR transfer/re-extraction;
+- MBR transfer/re-extraction (`mbr.reextract`, default off: docs/TIMS_QUANT_ROADMAP.md 4k);
 - acquisition-specific fragment/peak caps. The shipped default stays uncapped;
   see the peak-cap subsection above.
 

@@ -79,7 +79,8 @@ preset (section 4g, `crwbg`); "+ MBR" adds the rescuable tier (section 4i).
 | DIA-NN 2.5.0, MBR off | **98,694** | **0.125** | 0.180 | 0.093 | 0.089 | 0.237 / 0.113 / 0.189 | -1.79 |
 | MuMDIA `crwbg`, MBR off | 92,540 | 0.134 | 0.180 | **0.090** | **0.087** | 0.231 / 0.123 / 0.185 | -1.84 |
 | DIA-NN 2.2.0, MBR on | **118,326** | 0.143 | **0.207** | 0.114 | 0.107 | 0.282 / 0.125 / 0.215 | -1.77 |
-| MuMDIA `crwbg` + MBR | 100,340 | 0.143 | 0.220 | **0.098** | **0.094** | 0.325 / 0.128 / 0.207 | -1.77 |
+| MuMDIA `crwbg` + MBR | 100,340 | 0.143 | 0.220 | 0.098 | 0.094 | 0.325 / 0.128 / 0.207 | -1.77 |
+| MuMDIA preset with `cross_run_width` 2.5 + MBR | 100,340 | **0.140** | 0.218 | **0.093** | **0.089** | 0.326 / 0.124 / 0.204 | -1.76 |
 
 On the ions shared with each target (`quant_diag/shared.py`, now reading `result_performance.csv`;
 `DIANN=250` or `220`), eps / CV / E. coli log2:
@@ -90,6 +91,13 @@ On the ions shared with each target (`quant_diag/shared.py`, now reading `result
 | `crwbg` s1 against 2.5.0 | 81,506 | 0.127 / 0.088 / -1.84 | 0.115 / 0.088 / -1.80 | 10,635: 0.213 / 0.126 / -1.57 |
 | `crwbg` s2 against 2.5.0 | 81,755 | 0.127 / 0.088 / -1.84 | 0.115 / 0.088 / -1.80 | 10,720: 0.217 / 0.127 / -1.61 |
 | `crwbg` + MBR s0 against 2.2.0 | 91,379 | 0.138 / 0.095 / -1.79 | 0.127 / 0.104 / -1.80 | 8,961: 0.237 / 0.141 / -1.09 |
+| preset (`cross_run_width` 2.5) + MBR s0 against 2.2.0 | 91,379 | 0.134 / 0.091 / -1.78 | 0.127 / 0.104 / -1.80 | 8,961: 0.231 / 0.136 / -1.03 |
+
+The last rows (2026-10-02) are the current diaPASEF preset on the `mbr_s0` IDs: binary
+`~/bin/mumdia-ww/mumdia`, `requant_crw.sh mbr_ww_s0 mbr_s0` with `WIDTH=2.5`, scored with
+`MBR=true score.sh` (the flag sets `enable_match_between_runs` in `user_input.json` and changes no
+number). Against `crwbg` + MBR: global -0.003, eq -0.002, CV -0.005, the same gain as MBR off
+(section 4h). Against DIA-NN 2.2.0: global -0.003, eq +0.011 (E. coli), CV -0.021, ions -15.2%.
 
 - MBR off: eq and CV are at DIA-NN 2.5.0. Global epsilon is +0.009 on all ions and +0.012 on the
   shared ions, so it is a per-ion precision gap, not an effect of the extra ions. Ions: -6.2%.
@@ -828,6 +836,301 @@ a separate transfer q per anchor tier.
 elsewhere but whose extracted apex is elsewhere or missing (the re-extraction tier; up to about
 5,400 ions beyond the 1-anchor tier). It needs Rust plumbing and an FDR null for the integrated
 value, so it comes after a prototype on the chromatograms.
+
+## 4j. MBR at the predicted RT, the 1-anchor tier, and transfer quant (2026-10-02, seeds 0-2)
+
+Prototype outside the engine, on the current preset (`cross_run_width` 2.5, binary `~/bin/mumdia-ww/mumdia`).
+Scripts in `quant_diag/`: `mbr_prt.py` (evidence and null), `mbr_prt_eval.py` (transfer q, arms), `prt_quant.py`
+(per-row quant against DIA-NN 2.2.0), `robust_tr.py` (transfer quant), `seed_mbr.sh <seed>` (the whole chain on
+`eng_repick_s<seed>`; the worker reads the shared `eng_repick` competed tables). Arms `mbr_prt2_s*`,
+`mbr_prt12_s*`, quants `q_rp_mbr_*_s*` and `q_rp_rob1_*_s*`, all scored with `MBR=true score.sh`.
+
+**Population.** (candidate, run), target, confident (q <= 0.01, not transferred) in at least one other run,
+neither confident nor transferred in this run (so the rescuable tier rejected it, its apex being outside the
+1.5-1.7 s window), extracted here. Expected RT as in `mbr_worker.py` (binned-median maps through run 0, median over the anchor
+runs). Seed 0: 66,783 rows with >= 2 anchors (tier 2), 89,902 with 1 anchor (tier 1); for 1.4% the expected RT
+is outside the candidate's trace, so those rows are not tested. Rows that were never extracted (2,633 in section
+4i) need retrace at the expected RT and are not covered.
+
+**Evidence and null.** At the expected RT, in this run's raw retrace traces: the cosine of square-rooted
+fragment areas (+-4 scans) against the anchor runs' L1-normalised pass-1 areas, the median co-elution of each
+fragment with the sum of the others (+-6 scans), and the log summed area. The null takes the same three values
+in the same traces at K = 10 random positions at least 15 s from the expected RT: same candidate, same run, same
+fragments, and no ion at that position. The score is a logistic regression of target against null on the three
+values. It is cross-fitted in 2 folds by candidate, so no row is scored by a model that saw it. Transfer
+q = (null >= s + 1) / K / (targets >= s), running minimum, as in the worker. **Each tier has its own pool and its
+own q**, so tier 1 cannot move tier 2's threshold.
+
+Separation (seed 0, AUC target against null): cosine 0.85-0.87, co-elution 0.65, area 0.61-0.63. Cosine alone
+accepts 7,894 tier-2 rows at 1%, the combined score 12,883; co-elution alone accepts none.
+
+| seed | tier | rows tested | accepted at q 0.01 | null draws (at or above the threshold) | expected false | DIA-NN 2.2.0 reports the row | expected RT within 5 s of DIA-NN's |
+|---|---|---|---|---|---|---|---|
+| 0 | 2 | 65,822 | 12,883 | 658,220 (1,287) | 129 | 81.4% | 99.0% |
+| 0 | 1 | 88,506 | 15,006 | 885,060 (1,499) | 150 | 42.0% | 97.8% |
+| 1 | 2 | 66,559 | 13,091 | 665,590 (1,307) | 131 | 81.3% | 98.9% |
+| 1 | 1 | 87,687 | 15,128 | 876,870 (1,511) | 151 | 41.8% | 98.1% |
+| 2 | 2 | 69,158 | 14,690 | 691,580 (1,468) | 147 | 80.0% | 98.9% |
+| 2 | 1 | 86,879 | 15,404 | 868,790 (1,539) | 154 | 42.0% | 98.0% |
+
+For comparison, DIA-NN reports 68.3% (tier 2) and 35.6% (tier 1) of all tested rows. The rescuable tier on seeds
+1 and 2 (worker, unchanged): 37,434 and 35,106 transfers, 373 and 350 null draws inside a 1.6 s and 1.5 s window.
+
+**Arms.** An accepted row gets `apex_rt` = the expected RT, its PSM q columns lowered to the transfer q and
+`is_transferred` set; the engine quant then integrates there (two passes, preset). "Rescuable" is the worker tier
+alone (the base of section 2b). "drop1" is the transfer quant below. CV is the median of (CV_A + CV_B) / 2,
+PB CV ProteoBench's.
+
+| seed | arm | ions | global | eq | CV | PB CV | E. coli / human / yeast abs eps | E. coli log2 |
+|---|---|---|---|---|---|---|---|---|
+| 0 | rescuable | 100,340 | 0.140 | 0.218 | 0.093 | 0.089 | 0.326 / 0.124 / 0.204 | -1.76 |
+| 0 | rescuable, drop1 | 100,340 | 0.140 | **0.212** | 0.094 | 0.090 | 0.308 / 0.125 / 0.202 | -1.80 |
+| 0 | + predicted RT, tier 2 | 101,268 | 0.141 | 0.221 | 0.096 | 0.091 | 0.333 / 0.125 / 0.206 | -1.76 |
+| 0 | + predicted RT, tier 2, drop1 | 101,268 | 0.142 | 0.214 | 0.098 | 0.093 | 0.314 / 0.126 / 0.204 | -1.80 |
+| 0 | + predicted RT, tiers 1 and 2 | 105,040 | 0.144 | 0.230 | 0.097 | 0.092 | 0.347 / 0.127 / 0.215 | -1.74 |
+| 1 | rescuable | 99,775 | 0.139 | 0.217 | 0.093 | 0.089 | 0.323 / 0.124 / 0.203 | -1.77 |
+| 1 | rescuable, drop1 | 99,775 | 0.140 | **0.210** | 0.094 | 0.090 | 0.304 / 0.125 / 0.201 | -1.80 |
+| 1 | + predicted RT, tier 2 | 100,718 | 0.140 | 0.219 | 0.095 | 0.091 | 0.328 / 0.125 / 0.205 | -1.76 |
+| 1 | + predicted RT, tier 2, drop1 | 100,718 | 0.141 | 0.213 | 0.097 | 0.092 | 0.310 / 0.126 / 0.203 | -1.80 |
+| 1 | + predicted RT, tiers 1 and 2 | 104,539 | 0.143 | 0.228 | 0.096 | 0.091 | 0.344 / 0.127 / 0.214 | -1.74 |
+| 2 | rescuable | 99,846 | 0.139 | 0.216 | 0.093 | 0.088 | 0.320 / 0.124 / 0.204 | -1.77 |
+| 2 | rescuable, drop1 | 99,846 | 0.140 | **0.210** | 0.093 | 0.089 | 0.304 / 0.125 / 0.202 | -1.80 |
+| 2 | + predicted RT, tier 2 | 100,929 | 0.140 | 0.220 | 0.095 | 0.091 | 0.328 / 0.125 / 0.206 | -1.76 |
+| 2 | + predicted RT, tier 2, drop1 | 100,929 | 0.141 | 0.213 | 0.097 | 0.092 | 0.309 / 0.126 / 0.205 | -1.80 |
+| 2 | + predicted RT, tiers 1 and 2 | 104,831 | 0.143 | 0.229 | 0.096 | 0.092 | 0.343 / 0.127 / 0.217 | -1.74 |
+| | DIA-NN 2.2.0 | 118,326 | 0.143 | 0.207 | 0.114 | 0.107 | 0.282 / 0.125 / 0.215 | -1.77 |
+
+Shared with DIA-NN 2.2.0 (`DIANN=220 shared.py`), eps / CV / E. coli log2:
+
+| seed | arm | shared | MuMDIA | DIA-NN on the same ions | MuMDIA-only |
+|---|---|---|---|---|---|
+| 0 | rescuable | 91,379 | 0.134 / 0.091 / -1.78 | 0.127 / 0.104 / -1.80 | 8,961: 0.231 / 0.136 / -1.03 |
+| 0 | rescuable, drop1 | 91,379 | 0.135 / 0.092 / -1.82 | 0.127 / 0.104 / -1.80 | 8,961: 0.236 / 0.141 / -1.19 |
+| 0 | + tier 2 | 92,118 | 0.135 / 0.093 / -1.78 | 0.128 / 0.104 / -1.80 | 9,150: 0.233 / 0.139 / -1.00 |
+| 0 | + tier 2, drop1 | 92,118 | 0.136 / 0.095 / -1.82 | 0.128 / 0.104 / -1.80 | 9,150: 0.237 / 0.144 / -1.14 |
+| 0 | + tiers 1 and 2 | 93,894 | 0.137 / 0.094 / -1.78 | 0.129 / 0.105 / -1.80 | 11,146: 0.243 / 0.135 / -0.70 |
+| 1 | rescuable | 90,896 | 0.134 / 0.090 / -1.79 | 0.127 / 0.104 / -1.80 | 8,879: 0.231 / 0.136 / -1.00 |
+| 1 | rescuable, drop1 | 90,896 | 0.134 / 0.091 / -1.82 | 0.127 / 0.104 / -1.80 | 8,879: 0.237 / 0.141 / -1.10 |
+| 1 | + tier 2 | 91,641 | 0.135 / 0.093 / -1.78 | 0.127 / 0.104 / -1.80 | 9,077: 0.234 / 0.139 / -0.95 |
+| 1 | + tier 2, drop1 | 91,641 | 0.135 / 0.094 / -1.82 | 0.127 / 0.104 / -1.80 | 9,077: 0.240 / 0.144 / -1.06 |
+| 1 | + tiers 1 and 2 | 93,402 | 0.136 / 0.093 / -1.78 | 0.129 / 0.105 / -1.80 | 11,137: 0.245 / 0.133 / -0.60 |
+| 2 | rescuable | 91,024 | 0.134 / 0.090 / -1.79 | 0.127 / 0.104 / -1.80 | 8,822: 0.234 / 0.135 / -1.02 |
+| 2 | rescuable, drop1 | 91,024 | 0.134 / 0.091 / -1.82 | 0.127 / 0.104 / -1.80 | 8,822: 0.239 / 0.140 / -1.14 |
+| 2 | + tier 2 | 91,866 | 0.135 / 0.093 / -1.78 | 0.127 / 0.104 / -1.80 | 9,063: 0.237 / 0.139 / -0.97 |
+| 2 | + tier 2, drop1 | 91,866 | 0.135 / 0.094 / -1.82 | 0.127 / 0.104 / -1.80 | 9,063: 0.240 / 0.145 / -1.09 |
+| 2 | + tiers 1 and 2 | 93,687 | 0.136 / 0.093 / -1.78 | 0.129 / 0.105 / -1.80 | 11,144: 0.247 / 0.135 / -0.63 |
+
+**Tier 2 (step 2).** 12,883-14,690 rows per seed pass, and 80-81% of them are rows DIA-NN reports, on DIA-NN's peak
+in 99%. Most of them fill runs of ions that are already at `min_obs` 3: +928 / +943 / +1,083 ions, of which
++739 / +745 / +842 are DIA-NN's. Quant cost: global +0.001, eq +0.002 to +0.004, PB CV +0.002 to +0.003.
+
+**Tier 1 (step 3).** With its own q the 1-anchor tier no longer tightens the 2-anchor window. It still adds
+ions whose E. coli ratio is near 0 (our-only -1.00 to -0.60 across the three seeds). The cause is not the anchor: over the
+3,749 new 1-anchor ions of seed 0, the E. coli log2 is -0.04 to -0.16 in every anchor-q bin from <= 1e-4 to
+0.01, and the new ions DIA-NN also reports quantify badly too. On the new ions DIA-NN shares, its own E. coli log2 is
+-1.38 (tier 1) and -1.49 (tier 2) against ours -0.32 and -0.45 (128 and 92 ions; human and yeast closer:
+yeast 0.35 / 0.66 against DIA-NN 0.68 / 0.76). The identifications are DIA-NN's; their quantities are wrong.
+Tier 1 is rejected in this form on quant (eq +0.012), not on its FDR.
+
+**What is wrong with the transferred values.** `prt_quant.py`: d per row (section 4i), split by the signal over
+the pooled floor (summed pass-1 area / 9 x the summed flank mean). In the low condition the error rises with the
+signal, which a floor cannot cause. On the rows DIA-NN also reports, transfers (both tiers):
+
+| SNR | E. coli A rows | ours d | DIA-NN d | yeast B rows | ours d | DIA-NN d |
+|---|---|---|---|---|---|---|
+| <= 0.5 | 728 | +0.19 | +0.32 | 1,311 | +0.08 | +0.20 |
+| 0.5-1 | 921 | +0.42 | +0.29 | 2,070 | +0.21 | +0.19 |
+| 1-2 | 651 | +0.60 | +0.25 | 1,566 | +0.28 | +0.17 |
+| 2-5 | 246 | +0.70 | +0.19 | 674 | +0.35 | +0.13 |
+| > 5 | 30 | +0.66 | +0.24 | 141 | +0.74 | +0.10 |
+
+On faint transfers we are closer to the truth than DIA-NN. On bright transfers in the low condition, where the ion failed
+to identify, our value carries signal that is not the ion's and DIA-NN's does not. One weight vector per precursor
+(section 4c) cannot remove interference that is present in one run only.
+
+**Transfer quant: drop1** (`robust_tr.py`, `DROP1=1`, transferred rows only). Per (candidate, run), from the pass-1
+fragment areas A_f and the mean over the candidate's confident runs ref_f: c = (sum of A_f / sum of ref_f without the
+fragment with the largest A_f / ref_f) / (sum of A_f / sum of ref_f), with at least 3 fragments; quantity x c. Interference on one
+fragment in one run then does not raise the value. It reads no condition or species. The median of A_f / ref_f
+instead of drop1 gives eq 0.216 and global 0.144 on seed 0 (noisier). Applied to every row, it gives global 0.158 and CV
+0.115, so confident rows do not need it.
+
+- On the rescuable tier alone, drop1 is the same on all three seeds: eq -0.006 to -0.007, global +0.000 to
+  +0.001, PB CV +0.001, E. coli -1.76 / -1.77 to -1.80, same ions. Shared ions: eps +0.000 to +0.001, CV +0.001.
+  Against DIA-NN 2.2.0: global -0.003, eq +0.003 to +0.005, CV 0.020 lower.
+- With tier 2 and drop1 against the rescuable tier without it: +928 to +1,083 ions, eq -0.003 to -0.004,
+  global +0.002, PB CV +0.003 to +0.004.
+- Engine form, if taken: in `fit_cross_run`, a per-(candidate, run) factor for transferred rows from the pass-1
+  table (the reference profile from the non-transferred runs), applied in pass 2. Small, but it needs the
+  transferred flag in the pass-1 fragment table.
+
+**Open.**
+- Tier 2 in the engine is the re-extraction tier: retrace at the expected RT and the anchor runs' 1/K0, then this test.
+  The prototype reads traces built in the band of this run's (wrong) apex 1/K0, so it measures a lower bound.
+- Tier 1 waits for transfer quant that holds faint, partly interfered values to the right ratio. drop1 alone is not
+  enough (E. coli on the new ions is still near 0).
+- No entrapment check yet: the null is the FDR instrument here, and DIA-NN agreement (80-81% of accepted tier-2 rows,
+  99% on its peak) is the only external check.
+
+## 4k. The re-extraction tier: retrace at the expected RT and the anchors' 1/K0 (2026-10-02, seeds 0-2)
+
+The section 4j test read traces built in the 1/K0 band of this run's own apex, which for these rows is on another
+peak. Here the same rows get new traces from the existing stage, with no engine change:
+- `reext_prep.py <seed> <dir>`: per run, the tested rows of section 4j (tiers 1 and 2), their re-pick rows with
+  `apex_rt` = the expected RT and `apex_im` = the median over the anchor runs of their re-picked `apex_im`, each
+  moved onto this run's scale by a per-run median offset (-0.002 to +0.0002 against run 0), plus extract's
+  centroid traces of those candidates only. The 1/K0 centre moves by a median 0.0072-0.0077, half the band.
+- `reext_retrace.sh <dir>`: `mumdia retrace` with `repick` off on those inputs (7-19 s per run, 28-30 GB,
+  about 400,000 trace rows).
+- `mbr_prt.py` (`CH=<dir>`) and `mbr_prt_eval.py`: the same evidence, null and cross-fitted transfer q as 4j.
+- `reext_quant.sh`: the preset quant in two parts per run, the existing traces for every other row and the new
+  traces for the new transfers, with all twelve pass-1 fragment tables in one cross-run fit. Control: with the
+  existing traces in both parts it reproduces the one-part quant exactly (101,268 / 0.141 / 0.221 / 0.091).
+- `reext_seed.sh <seed>`: the whole chain.
+
+| seed | tier 2 accepted | null draws (at or above) | expected false | DIA-NN 2.2.0 reports the row | its RT within 5 s |
+|---|---|---|---|---|---|
+| 0 | 35,233 (4j: 12,883) | 658,220 (3,522) | 352 | 79.5% | 99.1% |
+| 1 | 36,114 (4j: 13,091) | 665,590 (3,610) | 361 | 79.4% | 99.0% |
+| 2 | 37,092 (4j: 14,690) | 691,580 (3,708) | 371 | 79.0% | 99.1% |
+
+| seed | arm | ions | global | eq | CV | PB CV | E. coli / human / yeast abs eps | E. coli log2 |
+|---|---|---|---|---|---|---|---|---|
+| 0 | rescuable (4j) | 100,340 | 0.140 | 0.218 | 0.093 | 0.089 | 0.326 / 0.124 / 0.204 | -1.76 |
+| 0 | + re-extraction, tier 2 | 102,640 | **0.139** | 0.223 | 0.098 | 0.093 | 0.339 / 0.123 / 0.206 | -1.75 |
+| 0 | + re-extraction, tier 2, drop1 | 102,640 | 0.140 | **0.214** | 0.100 | 0.095 | 0.315 / 0.125 / 0.204 | -1.80 |
+| 0 | + re-extraction, tiers 1 and 2 | 109,483 | 0.144 | 0.236 | 0.099 | 0.094 | 0.361 / 0.126 / 0.220 | -1.72 |
+| 0 | + re-extraction, tiers 1 and 2, drop1 | 109,483 | 0.145 | 0.228 | 0.102 | 0.096 | 0.338 / 0.128 / 0.217 | -1.77 |
+| 1 | rescuable (4j) | 99,775 | 0.139 | 0.217 | 0.093 | 0.089 | 0.323 / 0.124 / 0.203 | -1.77 |
+| 1 | + re-extraction, tier 2 | 102,150 | 0.139 | 0.222 | 0.098 | 0.093 | 0.337 / 0.123 / 0.205 | -1.75 |
+| 1 | + re-extraction, tier 2, drop1 | 102,150 | 0.140 | 0.214 | 0.100 | 0.095 | 0.315 / 0.125 / 0.203 | -1.80 |
+| 2 | rescuable (4j) | 99,846 | 0.139 | 0.216 | 0.093 | 0.088 | 0.320 / 0.124 / 0.204 | -1.77 |
+| 2 | + re-extraction, tier 2 | 102,362 | 0.139 | 0.221 | 0.098 | 0.093 | 0.335 / 0.123 / 0.206 | -1.75 |
+| 2 | + re-extraction, tier 2, drop1 | 102,362 | 0.140 | 0.213 | 0.100 | 0.094 | 0.311 / 0.125 / 0.204 | -1.80 |
+
+Shared with DIA-NN 2.2.0, eps / CV / E. coli log2:
+
+| seed | arm | shared | MuMDIA | DIA-NN on the same ions | MuMDIA-only |
+|---|---|---|---|---|---|
+| 0 | + tier 2 | 93,181 | 0.134 / 0.095 / -1.78 | 0.128 / 0.104 / -1.80 | 9,459: 0.229 / 0.139 / -0.97 |
+| 0 | + tier 2, drop1 | 93,181 | 0.134 / 0.097 / -1.82 | 0.128 / 0.104 / -1.80 | 9,459: 0.234 / 0.146 / -1.12 |
+| 0 | + tiers 1 and 2 | 96,629 | 0.136 / 0.096 / -1.77 | 0.131 / 0.106 / -1.79 | 12,854: 0.244 / 0.133 / -0.58 |
+| 0 | + tiers 1 and 2, drop1 | 96,629 | 0.137 / 0.098 / -1.81 | 0.131 / 0.106 / -1.79 | 12,854: 0.249 / 0.140 / -0.67 |
+| 1 | + tier 2 | 92,753 | 0.133 / 0.095 / -1.78 | 0.128 / 0.104 / -1.80 | 9,397: 0.230 / 0.140 / -0.92 |
+| 1 | + tier 2, drop1 | 92,753 | 0.134 / 0.097 / -1.82 | 0.128 / 0.104 / -1.80 | 9,397: 0.234 / 0.147 / -1.01 |
+| 2 | + tier 2 | 92,963 | 0.133 / 0.095 / -1.78 | 0.128 / 0.104 / -1.80 | 9,399: 0.230 / 0.140 / -0.92 |
+| 2 | + tier 2, drop1 | 92,963 | 0.134 / 0.097 / -1.82 | 0.128 / 0.104 / -1.80 | 9,399: 0.235 / 0.148 / -1.02 |
+
+Quant of the re-extracted transfers on the rows DIA-NN also reports (`prt_quant.py rx2 0`), median d / abs d:
+
+| species, cond | rows | ours | DIA-NN on the same rows | rescuable transfers, ours |
+|---|---|---|---|---|
+| E. coli A (low) | 1,898 | +0.30 / 0.44 | +0.27 / 0.37 | +0.42 / 0.53 |
+| human A | 13,768 | -0.07 / 0.22 | -0.07 / 0.21 | -0.07 / 0.28 |
+| human B | 12,406 | -0.04 / 0.22 | -0.00 / 0.20 | -0.08 / 0.29 |
+| yeast B (low) | 4,255 | +0.18 / 0.30 | +0.20 / 0.27 | +0.23 / 0.37 |
+
+Reading:
+- The 1/K0 band is what the old-trace test missed: 2.7x the accepted rows at the same null, the same DIA-NN
+  agreement (79-80% reported, 99% on its peak), and +2,300 to +2,516 ions against the rescuable tier
+  (+1,802 / +1,857 / +1,939 of them DIA-NN's).
+- The re-extracted values quantify like DIA-NN's on the same rows (human abs d 0.22 against 0.20-0.21), and better
+  than the rescuable transfers, whose traces are still in the band of their own apex. So the rescuable tier's
+  quant gap (section 4i) is partly its 1/K0 band.
+- Tier 2 alone: global -0.000 to -0.001, eq +0.005, PB CV +0.004 to +0.005 against the rescuable tier. With drop1:
+  eq -0.003 to -0.004, global +0.000 to +0.001, PB CV +0.006. Both replicate on three ID sets.
+- Tiers 1 and 2 re-extracted: +9,143 ions on seed 0, but our-only E. coli -0.58 and eq +0.018. Tier 1 stays out.
+- Against DIA-NN 2.2.0 (118,326 / 0.143 / 0.207 / PB CV 0.107), tier 2 + drop1 on seed 0: ions -13.3% (was
+  -15.2%), global -0.003, eq +0.007, PB CV -0.012.
+
+**Engine: `mbr.reextract` (2026-10-02).** `run-experiment`, default off, needs `retrace.enabled`
+(docs/12, "mbr.reextract"). The worker is `scripts/mbr_reextract.py` (`prep`, `score`), NumPy only. Retrace runs
+in-process on each run's targets, with its inputs read from the run's retrace report. Quant reads the accepted
+transfers from the new traces through a second `ChromTable` with `drop` lists, so quant itself is unchanged.
+Worker parity on the seed 0 inputs (`wk_s0`: the prototype's population, same retrace, same harness quant):
+35,432 accepted rows against the prototype's 35,233 (NumPy logistic regression instead of sklearn), 3,542 null
+draws at or above the threshold (expected false 354); 102,651 ions, 0.139 / 0.223 / PB CV 0.093, shared
+93,189: 0.134 / 0.095 / -1.77 (prototype 102,640, 0.139 / 0.223 / 0.093). Prep 79 s, retrace 7-19 s per
+run, score 122 s at 34 GB and 22 GB peak.
+
+## 4l. Re-extraction first: order of the two tiers (2026-10-02/03, seeds 0-2)
+
+**End to end, rescuable then re-extraction.** `mumdia run` with the six `.d` (`run-experiment`), binary
+`~/bin/mumdia-rx/mumdia`, `eng_repick`'s config plus `retrace.enabled`, the quant preset written out
+(`fixed_scan_halfwidth` 4, quantile 0.6, `cross_run_weights`, `cross_run_background`, `cross_run_width` 2.5),
+`library_irt: library`, `multihead_calibration: 80`, MBR `rt_transfer` + `reextract`, and the `l1d` FASTA
+library tables (`e2e_rx/`). 2:48:58 wall, 134 GB peak, exit 0. Rescore: 550,484 target PSMs at 1% over six
+runs, 100,634 peptides (`eng_repick`: 543,082). Rescuable tier: window 2.5 s (`eng_repick` 1.7 s), 55,048
+transfers, 549 null draws inside. Re-extraction: 44,111 targets tested, 17,710 accepted, 1,770 null draws at
+or above the threshold (expected false 177). Paired against the rescuable tier alone requanted from the same
+run (`e2e_resc`, `requant_crw.sh` with `q_filter: psm_q`):
+
+| arm | ions | global | eq | PB CV | shared with 2.2.0 | MuMDIA-only |
+|---|---|---|---|---|---|---|
+| rescuable only | 102,617 | 0.143 | 0.227 | 0.093 | 93,273: 0.137 / 0.095 / -1.78 | 9,344: 0.247 / 0.147 / -0.87 |
+| rescuable + re-extraction (engine) | 103,530 | 0.143 | 0.230 | 0.095 | 93,999: 0.137 / 0.097 / -1.77 | 9,531: 0.245 / 0.149 / -0.93 |
+
+The engine runs (worker, retrace from the reports, two-table quant). The gain is +913 ions, not the +2,300 of
+section 4k, because the rescuable tier here takes 55,048 rows at a 2.5 s window, and those rows keep traces in
+the 1/K0 band of their own apex. Re-extracted values quantify better than rescuable ones (section 4k: human abs d
+0.22 against 0.29), so the order of the tiers matters.
+
+**Re-extraction only and the union** (harness, `quant_diag/wk_only.sh`, `wk_union.sh`). Re-extraction only:
+`mbr_reextract.py` on the MBR-off scored table, so every precursor confident in >= 2 other runs and not confident
+here is a target, also those the rescuable tier would take. Union: re-extraction first, then the rescuable
+transfers of `mbr_s<seed>` for the rows re-extraction did not accept (16,056 on seed 0), every transfer
+quantified on the re-extracted traces.
+
+| seed | arm | transfers (null at or above; expected false) | ions | global | eq | CV | PB CV | E. coli / human / yeast abs eps | E. coli log2 |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | rescuable only | 39,071 | 100,340 | 0.140 | 0.218 | 0.093 | 0.089 | 0.326 / 0.124 / 0.204 | -1.76 |
+| 0 | re-extraction only | 61,384 (6,137; 614) | 100,799 | **0.135** | **0.204** | 0.095 | 0.090 | 0.295 / 0.121 / 0.198 | -1.78 |
+| 0 | union | 61,384 + 16,056 | **102,772** | 0.139 | 0.216 | 0.098 | 0.093 | 0.323 / 0.123 / 0.202 | -1.77 |
+| 1 | rescuable only | 37,434 | 99,775 | 0.139 | 0.217 | 0.093 | 0.089 | 0.323 / 0.124 / 0.203 | -1.77 |
+| 1 | re-extraction only | 60,806 (6,078; 608) | 100,371 | 0.135 | 0.204 | 0.095 | 0.090 | 0.295 / 0.121 / 0.197 | -1.78 |
+| 1 | union | | 102,248 | 0.138 | 0.215 | 0.098 | 0.093 | 0.321 / 0.123 / 0.202 | -1.77 |
+| 2 | rescuable only | 35,106 | 99,846 | 0.139 | 0.216 | 0.093 | 0.088 | 0.320 / 0.124 / 0.204 | -1.77 |
+| 2 | re-extraction only | 60,670 (6,066; 607) | 100,607 | 0.135 | 0.205 | 0.095 | 0.090 | 0.295 / 0.121 / 0.198 | -1.78 |
+| 2 | union | | 102,494 | 0.139 | 0.215 | 0.098 | 0.093 | 0.321 / 0.123 / 0.202 | -1.77 |
+| | DIA-NN 2.2.0 | | 118,326 | 0.143 | 0.207 | 0.114 | 0.107 | 0.282 / 0.125 / 0.215 | -1.77 |
+
+Shared with DIA-NN 2.2.0 (eps / CV / E. coli log2; DIA-NN on the same ions 0.127-0.128 / 0.104 / -1.80):
+
+| seed | rescuable only | re-extraction only | union |
+|---|---|---|---|
+| 0 | 91,379: 0.134 / 0.091 / -1.78; only 8,961: 0.231 / 0.136 / -1.03 | 92,067: 0.130 / 0.093 / -1.80; only 8,732: 0.215 / 0.129 / -0.91 | 93,277: 0.133 / 0.096 / -1.79; only 9,495: 0.223 / 0.138 / -1.06 |
+| 1 | 90,896: 0.134 / 0.090 / -1.79; only 8,879: 0.231 / 0.136 / -1.00 | 91,715: 0.130 / 0.092 / -1.80; only 8,656: 0.215 / 0.129 / -0.85 | 92,825: 0.133 / 0.095 / -1.79; only 9,423: 0.224 / 0.139 / -1.02 |
+| 2 | 91,024: 0.134 / 0.090 / -1.79; only 8,822: 0.234 / 0.135 / -1.02 | 91,920: 0.130 / 0.093 / -1.80; only 8,687: 0.213 / 0.131 / -0.89 | 93,055: 0.133 / 0.095 / -1.79; only 9,439: 0.225 / 0.139 / -1.03 |
+
+Against the rescuable tier alone, the same on all three seeds:
+- Re-extraction only: +459 / +596 / +761 ions, global -0.004 to -0.005, eq -0.011 to -0.014, PB CV +0.001 to
+  +0.002. Global and eq are better than DIA-NN 2.2.0's (0.135 / 0.204 against 0.143 / 0.207), at -15% ions.
+- Union: +2,432 / +2,473 / +2,648 ions, global 0.000 to -0.001, eq -0.001 to -0.002, PB CV +0.004 to +0.005.
+  Better than rescuable + re-extraction (section 4k) on every metric.
+- FDR: each tier is tested at transfer q 0.01 against its own null. The union holds two tested sets, so its
+  expected false count is at most the sum of the two (about 614 + 390 on seed 0, 1.3% of 77,440 transfers).
+
+Engine consequence: re-extraction runs first, on the MBR-off scored table; `mbr.rescuable` (default true) then
+adds the rescuable transfers for the rows it did not accept. `mbr.rescuable: false` is re-extraction only.
+Worker check on seed 0 (`mbr_reextract.py score --rescuable`): 61,384 + 16,056 = 77,440 transfers, the harness
+union exactly.
+
+**End to end, re-extraction first** (`e2e_rx2/`, same binary path rebuilt with the new order, same config,
+default `mbr.rescuable`). 3:29:14 wall, 135 GB peak, exit 0. The rescore is identical to `e2e_rx` (550,484 target
+PSMs, 100,634 peptides), so `e2e_resc` is the paired base. Re-extraction: 97,837 targets tested, 52,554 accepted,
+5,254 null draws at or above the threshold (expected false 525); 25,481 rescuable transfers added.
+
+| arm (same IDs) | ions | global | eq | CV | PB CV | E. coli / human / yeast abs eps | E. coli log2 |
+|---|---|---|---|---|---|---|---|
+| rescuable only | 102,617 | 0.143 | 0.227 | 0.098 | 0.093 | 0.343 / 0.126 / 0.213 | -1.75 |
+| rescuable, then re-extraction | 103,530 | 0.143 | 0.230 | 0.101 | 0.095 | 0.351 / 0.126 / 0.213 | -1.74 |
+| re-extraction, then rescuable | **103,714** | **0.141** | **0.222** | 0.101 | 0.095 | 0.332 / 0.125 / 0.208 | -1.76 |
+
+Shared with DIA-NN 2.2.0: 94,139 ions, 0.135 / 0.098 / -1.79 (DIA-NN 0.130 / 0.105 / -1.80); MuMDIA-only 9,575:
+0.240 / 0.148 / -1.03. Against the paired base: +1,097 ions (+866 DIA-NN's), global -0.002, eq -0.005, PB CV
++0.002. The ion gain is smaller than in the harness (+2,432) because this run's rescuable window is 2.5 s, not
+1.7 s. This run's base also quantifies worse than `eng_repick`'s (0.143 / 0.227 against 0.140 / 0.218 for the
+rescuable tier alone); that is the end-to-end identification base, not MBR.
 
 ## 5. Plan
 

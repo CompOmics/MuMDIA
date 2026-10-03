@@ -1993,6 +1993,19 @@ pub struct MbrConfig {
     /// matrix), not only transferred ones, under `strategy = Full`. No code reads this
     /// field yet; `validate()` warns if it is changed.
     pub requant_all: bool,
+    /// The re-extraction tier (`run-experiment`, diaPASEF under `retrace.enabled`): a
+    /// precursor confident in >= 2 other runs whose apex here missed the rescuable tier's
+    /// window is retraced at its cross-run expected RT and the anchor runs' 1/K0, and
+    /// accepted when its evidence there beats a same-trace RT-shift null at
+    /// `q_transfer` (docs/TIMS_QUANT_ROADMAP.md section 4k). Default false. Benchmark-gated.
+    /// It runs on the MBR-off scored table, so it also takes the rows the rescuable tier
+    /// would, with traces in the anchors' 1/K0 band (section 4l).
+    pub reextract: bool,
+    /// The rescuable tier (`mbr_worker.py`). Under `reextract` it adds its transfers for the
+    /// rows re-extraction did not accept; `false` there is re-extraction only, which measured
+    /// better epsilon and fewer ions (docs/TIMS_QUANT_ROADMAP.md section 4l). Default true;
+    /// `false` needs `reextract`.
+    pub rescuable: bool,
     /// Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy;
     /// e.g. the `py312_mumdia` env). Required when `strategy != None`.
     pub python: Option<String>,
@@ -2008,6 +2021,8 @@ impl Default for MbrConfig {
             decoy_transfer: DecoyTransfer::PermutedRt,
             consensus_corr_min: 0.0,
             requant_all: false,
+            reextract: false,
+            rescuable: true,
             python: None,
         }
     }
@@ -3019,6 +3034,19 @@ impl Config {
                     .into(),
             ));
         }
+        if !self.mbr.rescuable && !self.mbr.reextract {
+            return Err(Invalid(
+                "mbr.rescuable = false leaves MBR without a tier unless mbr.reextract is on."
+                    .into(),
+            ));
+        }
+        if self.mbr.reextract && (self.mbr.strategy == MbrStrategy::None || !self.retrace.enabled) {
+            return Err(Invalid(
+                "mbr.reextract retraces transfer targets from the raw .d, so it needs \
+                 mbr.strategy != none and retrace.enabled (diaPASEF)."
+                    .into(),
+            ));
+        }
         // MBR fields that are accepted and documented but not yet read by any stage. Setting
         // them has NO effect, which is worse than rejecting them: the run looks configured.
         // Warn rather than error so existing configs keep parsing (serde uses
@@ -3535,6 +3563,19 @@ mod tests {
         assert!(Config::from_json(r#"{"quant":{"baseline_quantile":-0.5}}"#).is_err());
         // Unknown enum variants must fail rather than fall back to the default ranking.
         assert!(Config::from_json(r#"{"quant":{"fragment_selection":"library"}}"#).is_err());
+    }
+
+    #[test]
+    fn mbr_reextract_needs_mbr_and_retrace() {
+        assert!(!Config::default().mbr.reextract);
+        let mbr = r#""mbr":{"strategy":"rt_transfer","python":"python","reextract":true}"#;
+        assert!(Config::from_json(&format!("{{{mbr}}}")).is_err());
+        assert!(
+            Config::from_json(r#"{"retrace":{"enabled":true},"mbr":{"reextract":true}}"#).is_err()
+        );
+        assert!(Config::from_json(&format!(r#"{{"retrace":{{"enabled":true}},{mbr}}}"#)).is_ok());
+        assert!(Config::default().mbr.rescuable);
+        assert!(Config::from_json(r#"{"mbr":{"rescuable":false}}"#).is_err());
     }
 
     #[test]

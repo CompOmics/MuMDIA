@@ -1133,6 +1133,14 @@ pub fn run(p: RetraceParams) -> Result<u64> {
             "trace_source": "raw_tdf",
             "raw": p.raw,
             "centroid_chromatograms": p.chromatograms,
+            // The remaining inputs, so a later stage can retrace a subset of this run
+            // again (`mbr.reextract`) from this report alone.
+            "psms_extracted": p.psms_extracted,
+            "psms_out": p.psms_out,
+            "run_windows": p.run_windows,
+            "library_precursors": p.library_precursors,
+            "mass_cal": p.mass_cal,
+            "frag_tol_fallback_ppm": p.frag_tol_fallback_ppm,
             "im_half_width": hw,
             "ms1": p.cfg.ms1,
             "ms1_im_half_width": hw1,

@@ -807,6 +807,51 @@ pub fn run_mbr(
     run_worker(python, script, &args, false).context("MBR transfer worker failed")
 }
 
+/// MBR re-extraction tier (`mbr.reextract`): `mbr_reextract.py <mode> <scored> <inputs_csv>
+/// <rest...>`. `prep` takes the per-run psms (anchor 1/K0) and writes the targets; `score`
+/// takes the per-run pass-1 fragment tables and writes the augmented scored table.
+#[allow(clippy::too_many_arguments)]
+pub fn run_mbr_reextract(
+    python: &str,
+    script: &str,
+    mode: &str,
+    scored: &str,
+    inputs: &[String],
+    rest: &[&str],
+    q_anchor: f64,
+    min_anchor_runs: usize,
+    q_transfer: f64,
+    seed: u64,
+) -> Result<()> {
+    info!(
+        mode,
+        scored,
+        runs = inputs.len(),
+        "sidecar: MBR re-extraction"
+    );
+    let csv = inputs.join(",");
+    let (qa, mar, qt, sd) = (
+        q_anchor.to_string(),
+        min_anchor_runs.to_string(),
+        q_transfer.to_string(),
+        seed.to_string(),
+    );
+    let mut args: Vec<&str> = vec![mode, scored, &csv];
+    args.extend_from_slice(rest);
+    args.extend_from_slice(&[
+        "--q-anchor",
+        &qa,
+        "--min-anchor-runs",
+        &mar,
+        "--q-transfer",
+        &qt,
+        "--seed",
+        &sd,
+    ]);
+    run_worker(python, script, &args, false)
+        .with_context(|| format!("MBR re-extraction worker ({mode}) failed"))
+}
+
 /// Invoke a Python worker: `python script arg...`. `utf8` forces UTF-8 I/O
 /// (DeepLC/Keras crash on the Windows cp1252 console otherwise).
 fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<()> {
