@@ -3718,7 +3718,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
         // qualifying scans widened by the rolling half-width form the region; its scan
         // with the largest signature intensity (x prior) is the apex. On a tailing peak
         // the rolling count peaks after the intensity maximum, so the count alone puts
-        // the apex a scan late (docs/09, "Apex").
+        // the apex a scan late (docs/09, section 4 "Apex selection").
         if p.cfg.apex_refine_intensity {
             let reach = r as isize;
             let qualifies = |i: usize| counts[i] > 0 && smoothed[i] >= thresh;
