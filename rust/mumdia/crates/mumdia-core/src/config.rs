@@ -1176,6 +1176,20 @@ pub struct ExtractConfig {
     /// The rolling distinct-fragment count (`apex_count_window`) still gates which scans
     /// qualify in both modes.
     pub apex_evidence_rank: bool,
+    /// Choose the apex by intensity INSIDE the region the fragment count selects. The
+    /// qualifying scans (rolling distinct-fragment count within `apex_count_tol` of its
+    /// maximum) are widened by the rolling half-width (`apex_count_window / 2`), and the
+    /// apex is the scan in that region with the largest observed intensity of the top-K
+    /// predicted fragments (`apex_top_fragments`, 3 by default), times the RT prior when
+    /// it is on. The count still decides WHERE the peptide elutes, so a bright
+    /// interferent outside the sustained-evidence region cannot take the apex; inside it,
+    /// intensity decides WHICH scan. Without it the count also picks the scan, and on a
+    /// tailing peak the rolling count is largest after the intensity maximum: measured on
+    /// Astral REP1 (`apex_count_window` 5), the summed fragment intensity peaked one scan
+    /// BEFORE the chosen apex for 41% of the accepted precursors and one scan after for
+    /// 6%; recomputed with this rule, 85% at the apex, 6% and 5% either side. Default
+    /// false; benchmark-gated.
+    pub apex_refine_intensity: bool,
     /// Emit the four gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`,
     /// `gate_coelution`, `gate_spectral_entropy`) as extra `psms.parquet` columns,
     /// for the offline gate-metric comparison. Default `false` (diagnostic sidecar,
@@ -1264,9 +1278,10 @@ impl Default for ExtractConfig {
             // (which decides the pre-FDR competition winner), `rt_error_abs`,
             // `log_apex_intensity`, and quant's integration centre.
             apex_evidence_rank: true,
-            emit_gate_diagnostics: false, // diagnostic gate-score columns; off in production
+            apex_refine_intensity: false,     // benchmark-gated
+            emit_gate_diagnostics: false,     // diagnostic gate-score columns; off in production
             gate_mode: GateMode::ApexPearson, // legacy single-scan intensity Pearson
-            gate_coelution_min: 0.5,      // used only by GateMode::Combined
+            gate_coelution_min: 0.5,          // used only by GateMode::Combined
         }
     }
 }
