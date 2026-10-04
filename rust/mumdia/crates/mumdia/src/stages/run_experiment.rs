@@ -449,7 +449,8 @@ fn finish_run(
         cfg: &cfg.rt_im_train,
         config_hash: ch,
     })?;
-    let survivors = prescreen::run_if_enabled(cfg, ch, &co.ms2, lib_p, &windows, out)?;
+    let survivors =
+        prescreen::run_if_enabled(cfg, ch, &co.ms2, Some(&co.ms1), lib_p, &windows, out)?;
     let psms = d("psms_extracted.parquet");
     let chrom = d("chromatograms.parquet");
     extract::run(extract::ExtractParams {

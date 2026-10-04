@@ -32,11 +32,20 @@
 //! Provenance: a port of the `tagbench` prototype's `advanced_candidates.scores` (the
 //! `lowmz_half` column) and `advanced_filter.export` (docs/37_prescreen.md).
 
-use std::collections::BTreeMap;
+mod evidence;
+mod ext;
+pub mod masses;
+pub mod retrieval;
+pub mod tags;
+pub mod traces;
+
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use anyhow::Result;
-use mumdia_core::config::{PrescreenConfig, PrescreenScope, PrescreenScopeMatch};
+use mumdia_core::config::{
+    Config, PrescreenConfig, PrescreenLocalization, PrescreenScope, PrescreenScopeMatch,
+};
 use mumdia_core::constants::{residue_mass, PROTON, WATER};
 use mumdia_core::mass::{parse_peptidoform, unimod_mass};
 use mumdia_core::schema::artifact;
@@ -54,8 +63,11 @@ pub struct PrescreenParams<'a> {
     /// Per-candidate RT bounds (`candidate_id, rt_lo, rt_hi`). `None` screens every candidate
     /// over the whole gradient.
     pub run_windows: Option<&'a str>,
+    /// `spectra_ms1` for this run; needed only by `prescreen.mass_hypotheses.ms1`.
+    pub ms1: Option<&'a str>,
     pub out: &'a str,
-    pub cfg: &'a PrescreenConfig,
+    /// The whole configuration: the tag alphabet comes from its chemistry block.
+    pub config: &'a Config,
     pub config_hash: &'a str,
 }
 
@@ -278,12 +290,14 @@ struct Spectra {
     mz: Vec<f32>,
     /// Peak intensity > 0. A zero-intensity nearest peak is not a match, as in the prototype.
     positive: Vec<bool>,
+    /// Peak intensities, kept only when the trace component needs them.
+    intensity: Vec<f32>,
     groups: Vec<WindowGroup>,
     nbin: usize,
 }
 
 impl Spectra {
-    fn load(path: &str, top_peaks: usize) -> Result<Spectra> {
+    fn load(path: &str, top_peaks: usize, keep_intensity: bool) -> Result<Spectra> {
         let t = TableFile::open(path)?;
         let rt = t.f64("rt_seconds")?;
         let lo = t.f64("window_lower")?;
@@ -330,12 +344,16 @@ impl Spectra {
         let mut offsets = Vec::with_capacity(order.len() + 1);
         let mut mz = Vec::with_capacity(total);
         let mut positive = Vec::with_capacity(total);
+        let mut intensity = Vec::with_capacity(if keep_intensity { total } else { 0 });
         let mut max_mz = 0.0f64;
         offsets.push(0);
         for p in &per {
             for &(m, i) in p {
                 mz.push(m);
                 positive.push(i > 0.0);
+                if keep_intensity {
+                    intensity.push(i);
+                }
                 max_mz = max_mz.max(m as f64);
             }
             offsets.push(mz.len());
@@ -359,6 +377,7 @@ impl Spectra {
             offsets,
             mz,
             positive,
+            intensity,
             groups,
             nbin: (max_mz * 100.0).ceil() as usize + 2,
         })
@@ -460,14 +479,8 @@ fn spectrum_score(
     total
 }
 
-/// Score every candidate. `Ok(scores)`, NaN for a candidate whose peptidoform cannot be parsed.
-fn score_all(
-    sp: &Spectra,
-    cands: &[Option<Candidate>],
-    pmz: &[f64],
-    cfg: &PrescreenConfig,
-) -> Vec<f64> {
-    // Candidate lists per window group: the groups holding the precursor m/z.
+/// Candidate lists per window group: the groups whose bounds hold the precursor m/z.
+fn group_members(sp: &Spectra, cands: &[Option<Candidate>], pmz: &[f64]) -> Vec<Vec<u32>> {
     let mut by_lower: Vec<(f64, f64, usize)> = sp
         .groups
         .iter()
@@ -488,6 +501,16 @@ fn score_all(
             }
         }
     }
+    members
+}
+
+/// Score every candidate: NaN for a candidate whose peptidoform cannot be parsed.
+fn score_all(
+    sp: &Spectra,
+    cands: &[Option<Candidate>],
+    members: &[Vec<u32>],
+    cfg: &PrescreenConfig,
+) -> Vec<f64> {
     let mut score: Vec<f64> = cands
         .iter()
         .map(|c| if c.is_some() { 0.0 } else { f64::NAN })
@@ -527,6 +550,7 @@ pub fn run_if_enabled(
     cfg: &mumdia_core::config::Config,
     config_hash: &str,
     ms2: &str,
+    ms1: Option<&str>,
     lib_p: &str,
     windows: &str,
     out_dir: &str,
@@ -540,8 +564,9 @@ pub fn run_if_enabled(
         ms2,
         library_precursors: lib_p,
         run_windows: Some(windows),
+        ms1,
         out: &out,
-        cfg: &cfg.prescreen,
+        config: cfg,
         config_hash,
     })?;
     Ok(Some(out))
@@ -554,11 +579,11 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
         inputs.push(("--run-windows", rw));
     }
     mumdia_io::refuse_output_over_input(p.out, &inputs)?;
-    let cfg = p.cfg;
+    let cfg = &p.config.prescreen;
     let target = cfg.effective_target();
     let scope_mods = resolve_scope(&cfg.scope_mods)?;
 
-    let sp = Spectra::load(p.ms2, cfg.top_peaks)?;
+    let sp = Spectra::load(p.ms2, cfg.top_peaks, cfg.trace.enabled)?;
     info!(
         spectra = sp.rt.len(),
         peaks = sp.mz.len(),
@@ -639,9 +664,8 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     }
 
     let t1 = Instant::now();
-    let score = score_all(&sp, &cands, &pmz, cfg);
-    drop(cands);
-    drop(sp);
+    let members = group_members(&sp, &cands, &pmz);
+    let base_score = score_all(&sp, &cands, &members, cfg);
     let scoring_ms = t1.elapsed().as_millis() as u64;
     info!(
         candidates = n,
@@ -649,11 +673,43 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
         "prescreen: scored candidates"
     );
 
+    // ---- optional components (nothing runs under the defaults) ----
+    let t2 = Instant::now();
+    let pforms: Vec<&str> = (0..n).map(pform).collect();
+    let ext_out = if ext::needs_tags(p.config) {
+        let alpha = tags::Alphabet::from_config(p.config)?;
+        let view = ext::tag_view(&pforms, &charge, &alpha, p.config);
+        let ms1 = match (
+            cfg.mass_hypotheses.enabled && cfg.mass_hypotheses.ms1,
+            p.ms1,
+        ) {
+            (true, Some(path)) => Some(load_ms1(path)?),
+            (true, None) => {
+                anyhow::bail!("prescreen.mass_hypotheses.ms1 needs the run's MS1 spectra (--ms1)")
+            }
+            _ => None,
+        };
+        Some(ext::run(
+            &sp,
+            &cands,
+            &members,
+            &view,
+            &alpha,
+            p.config,
+            ms1.as_deref(),
+        ))
+    } else {
+        None
+    };
+    let ext_ms = t2.elapsed().as_millis() as u64;
+    drop(cands);
+    drop(sp);
+
     // Scope: unparsed candidates are out of scope and pass through.
     let scoped: Vec<bool> = (0..n)
         .into_par_iter()
         .map(|i| {
-            !score[i].is_nan()
+            !base_score[i].is_nan()
                 && match cfg.scope {
                     PrescreenScope::All => true,
                     PrescreenScope::Modified => {
@@ -665,9 +721,101 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     let calib: Vec<bool> = (0..n)
         .map(|i| scoped[i] && is_calibration(cfg.seed, cid[i]))
         .collect();
+    let n_cal = calib.iter().filter(|&&c| c).count();
+    let enough = n_cal >= cfg.min_calibration.max(1);
+
+    // Combined score: `base / q95(base) + sum_k w_k c_k / q95(c_k)` over the calibration half,
+    // the prototype's scaling, when any component weight is positive.
+    let weights = [
+        cfg.tag_bonus,
+        cfg.fasta_bonus,
+        cfg.complement_bonus,
+        cfg.flank_bonus,
+        cfg.trace.bonus,
+        cfg.mass_hypotheses.bonus,
+    ];
+    let mut score = base_score.clone();
+    let mut scales: Option<(f64, Vec<f64>)> = None;
+    if let Some(e) = &ext_out {
+        if enough && weights.iter().any(|&w| w > 0.0) {
+            let q95 = |f: &dyn Fn(usize) -> f64| {
+                let mut v: Vec<f64> = (0..n).filter(|&i| calib[i]).map(f).collect();
+                v.sort_by(f64::total_cmp);
+                quantile_linear(&v, 0.95).max(1e-12)
+            };
+            let bs = q95(&|i| base_score[i]);
+            let cs: Vec<f64> = (0..ext::N_EXT)
+                .map(|k| q95(&|i| e.components[i][k]))
+                .collect();
+            for i in 0..n {
+                if score[i].is_nan() {
+                    continue;
+                }
+                let mut s = base_score[i] / bs;
+                for k in 0..ext::N_EXT {
+                    if weights[k] > 0.0 {
+                        s += weights[k] * e.components[i][k] / cs[k];
+                    }
+                }
+                score[i] = s;
+            }
+            scales = Some((bs, cs));
+        }
+    }
+
+    // Retrieval: without the rescue route an unretrieved candidate is dropped; its score
+    // before that is kept to count retrieval losses separately from scoring losses.
+    let retrieved: Option<Vec<bool>> = ext_out.as_ref().and_then(|e| e.retrieved.clone());
+    let pre_retrieval = score.clone();
+    if let Some(r) = &retrieved {
+        if !cfg.rescue {
+            for i in 0..n {
+                if !r[i] && !score[i].is_nan() {
+                    score[i] = f64::NEG_INFINITY;
+                }
+            }
+        }
+    }
+
+    // Localization policy over modification siblings.
+    let mut sibling_stats = (0usize, 0usize);
+    if cfg.localization != PrescreenLocalization::Own {
+        let keys: Vec<Option<String>> = (0..n)
+            .into_par_iter()
+            .map(|i| sibling_key(pform(i), charge[i], label_id[i]))
+            .collect();
+        let mut best: HashMap<&str, (f64, usize)> = HashMap::new();
+        for i in 0..n {
+            if let (Some(k), false) = (&keys[i], score[i].is_nan()) {
+                let e = best.entry(k.as_str()).or_insert((f64::NEG_INFINITY, 0));
+                e.0 = e.0.max(score[i]);
+                e.1 += 1;
+            }
+        }
+        sibling_stats.0 = best.values().filter(|v| v.1 > 1).count();
+        for i in 0..n {
+            let (Some(k), false) = (&keys[i], score[i].is_nan()) else {
+                continue;
+            };
+            let (top, size) = best[k.as_str()];
+            if size > 1 && score[i] == top {
+                sibling_stats.1 += 1;
+            }
+            match cfg.localization {
+                PrescreenLocalization::FamilySupport => score[i] = top,
+                PrescreenLocalization::BestSite => {
+                    if score[i] < top {
+                        score[i] = f64::NEG_INFINITY;
+                    }
+                }
+                PrescreenLocalization::Own => {}
+            }
+        }
+    }
+
     let mut cal_scores: Vec<f64> = (0..n).filter(|&i| calib[i]).map(|i| score[i]).collect();
     cal_scores.sort_by(f64::total_cmp);
-    let (cutoff, bypass) = if cal_scores.len() < cfg.min_calibration.max(1) {
+    let (cutoff, bypass) = if !enough {
         (
             None,
             Some(format!(
@@ -770,7 +918,26 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
                     idx.iter().map(|&i| calib[i]).collect(),
                 ),
                 Col::Bool("kept".into(), idx.iter().map(|&i| keep[i]).collect()),
-            ],
+                Col::F64(
+                    "base_score".into(),
+                    idx.iter().map(|&i| base_score[i]).collect(),
+                ),
+            ]
+            .into_iter()
+            .chain(
+                retrieved
+                    .iter()
+                    .map(|r| Col::Bool("retrieved".into(), idx.iter().map(|&i| r[i]).collect())),
+            )
+            .chain(ext_out.iter().flat_map(|e| {
+                (0..ext::N_EXT).map(|k| {
+                    Col::F64(
+                        format!("component_{}", ext::NAMES[k]),
+                        idx.iter().map(|&i| e.components[i][k]).collect(),
+                    )
+                })
+            }))
+            .collect(),
         )?;
         ArtifactReport {
             logical_name: artifact::PRESCREEN_SCORES.0.to_string(),
@@ -815,6 +982,72 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     stats.insert("target_retention".into(), json!(frac(t_kept, t_tot)));
     stats.insert("decoy_retention".into(), json!(frac(d_kept, d_tot)));
     stats.insert("scoring_ms".into(), json!(scoring_ms));
+    stats.insert("extension_ms".into(), json!(ext_ms));
+    if let Some((bs, cs)) = &scales {
+        stats.insert("base_scale_q95".into(), json!(bs));
+        stats.insert("component_scales_q95".into(), json!(cs));
+    }
+    if let Some(r) = &retrieved {
+        let cut = cutoff.unwrap_or(f64::NEG_INFINITY);
+        let unret: Vec<usize> = (0..n).filter(|&i| scoped[i] && !r[i]).collect();
+        stats.insert("retrieved".into(), json!((0..n).filter(|&i| r[i]).count()));
+        stats.insert("not_retrieved".into(), json!(unret.len()));
+        // Candidates the score would keep but retrieval missed: rescued when the rescue route
+        // is on, lost otherwise. Kept apart from candidates the score itself rejected.
+        let would_keep = unret.iter().filter(|&&i| pre_retrieval[i] > cut).count();
+        if cfg.rescue {
+            stats.insert("rescued_by_score".into(), json!(would_keep));
+            stats.insert("retrieval_losses".into(), json!(0));
+        } else {
+            stats.insert("rescued_by_score".into(), json!(0));
+            stats.insert("retrieval_losses".into(), json!(would_keep));
+        }
+        stats.insert(
+            "scoring_losses".into(),
+            json!((0..n).filter(|&i| scoped[i] && r[i] && !keep[i]).count()),
+        );
+    }
+    if cfg.localization != PrescreenLocalization::Own {
+        stats.insert("sibling_families".into(), json!(sibling_stats.0));
+        stats.insert(
+            "sibling_forms_at_family_best".into(),
+            json!(sibling_stats.1),
+        );
+    }
+    if let Some(e) = &ext_out {
+        for (k, v) in &e.stats {
+            stats.insert(k.clone(), v.clone());
+        }
+        if cfg.mass_hypotheses.enabled {
+            let path = format!(
+                "{}.mass_hypotheses.parquet",
+                p.out.trim_end_matches(".parquet")
+            );
+            let h = &e.hypotheses;
+            write_table(
+                &path,
+                vec![
+                    Col::U32("spectrum".into(), h.iter().map(|x| x.0).collect()),
+                    Col::F64("rt_seconds".into(), h.iter().map(|x| x.1).collect()),
+                    Col::F64(
+                        "neutral_mass".into(),
+                        h.iter().map(|x| x.2.neutral).collect(),
+                    ),
+                    Col::I32(
+                        "complements".into(),
+                        h.iter().map(|x| x.2.complements as i32).collect(),
+                    ),
+                    Col::F64("fit".into(), h.iter().map(|x| x.2.quality).collect()),
+                    Col::U32("tag_key".into(), h.iter().map(|x| x.2.key).collect()),
+                    Col::I32(
+                        "precursor_charge".into(),
+                        h.iter().map(|x| x.2.precursor_charge).collect(),
+                    ),
+                    Col::I32("ms1_link".into(), h.iter().map(|x| x.3 as i32).collect()),
+                ],
+            )?;
+        }
+    }
     ArtifactReport {
         logical_name: "prescreen_survivors".to_string(),
         schema_name: artifact::PRESCAN_SURVIVORS.0.to_string(),
@@ -849,6 +1082,57 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     })
 }
 
+/// numpy's default (linear) quantile on a sorted slice.
+pub(crate) fn quantile_linear(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let pos = (sorted.len() - 1) as f64 * q;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo as f64)
+}
+
+/// Modification siblings: same residues, charge, label and modification composition (the
+/// sorted deltas, terminal ones included), so they differ only in localization.
+fn sibling_key(pf: &str, charge: i32, label: u32) -> Option<String> {
+    let p = parse_peptidoform(pf).ok()?;
+    let mut d: Vec<i64> = p
+        .mods
+        .iter()
+        .chain([&p.n_term_mod, &p.c_term_mod])
+        .filter(|&&x| x != 0.0)
+        .map(|&x| (x * 1e4).round() as i64)
+        .collect();
+    d.sort_unstable();
+    Some(format!(
+        "{}/{charge}/{label}/{d:?}",
+        String::from_utf8_lossy(&p.residues)
+    ))
+}
+
+/// MS1 scans as `(rt, mz ascending, intensity)`, ascending RT.
+fn load_ms1(path: &str) -> Result<Vec<masses::Ms1Scan>> {
+    let t = TableFile::open(path)?;
+    let rt = t.f64("rt_seconds")?;
+    let mz = t.list_f32("mz")?;
+    let it = t.list_f32("intensity")?;
+    let mut v: Vec<masses::Ms1Scan> = (0..rt.len())
+        .map(|s| {
+            let n = mz[s].len().min(it[s].len());
+            let mut p: Vec<(f64, f32)> = (0..n).map(|k| (mz[s][k] as f64, it[s][k])).collect();
+            p.sort_by(|a, b| a.0.total_cmp(&b.0));
+            (
+                rt[s],
+                p.iter().map(|x| x.0).collect(),
+                p.iter().map(|x| x.1).collect(),
+            )
+        })
+        .collect();
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,6 +1146,13 @@ mod tests {
 
     fn cfg() -> PrescreenConfig {
         PrescreenConfig::default()
+    }
+
+    fn conf(c: PrescreenConfig) -> Config {
+        Config {
+            prescreen: c,
+            ..Config::default()
+        }
     }
 
     /// Fragment m/z of one orientation, as the scorer builds them.
@@ -879,6 +1170,7 @@ mod tests {
             offsets: vec![0],
             mz: Vec::new(),
             positive: Vec::new(),
+            intensity: Vec::new(),
             groups: Vec::new(),
             nbin: 0,
         };
@@ -1197,8 +1489,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let unc = Spectra::load(&ms2, 0).unwrap();
-        let cap = Spectra::load(&ms2, 300).unwrap();
+        let unc = Spectra::load(&ms2, 0, false).unwrap();
+        let cap = Spectra::load(&ms2, 300, false).unwrap();
         assert_eq!(unc.mz.len(), 400 + 28 + 2);
         assert_eq!(cap.mz.len(), 300 + 2);
         let c = cfg();
@@ -1377,7 +1669,8 @@ mod tests {
             library_precursors: &lib,
             run_windows: Some(&rw),
             out: &out,
-            cfg: &c,
+            ms1: None,
+            config: &conf(c.clone()),
             config_hash: "test",
         })
         .unwrap();
@@ -1411,7 +1704,8 @@ mod tests {
             library_precursors: &lib,
             run_windows: Some(&rw),
             out: &out2,
-            cfg: &cfg(),
+            ms1: None,
+            config: &conf(cfg()),
             config_hash: "test",
         })
         .unwrap();
@@ -1430,7 +1724,8 @@ mod tests {
             library_precursors: &lib,
             run_windows: Some(&rw),
             out: &out,
-            cfg: &cfg(),
+            ms1: None,
+            config: &conf(cfg()),
             config_hash: "test",
         })
         .unwrap();
@@ -1447,12 +1742,232 @@ mod tests {
             library_precursors: &lib,
             run_windows: Some(&rw),
             out: &out,
-            cfg: &c,
+            ms1: None,
+            config: &conf(c.clone()),
             config_hash: "test",
         })
         .unwrap();
         assert!(sum.bypass_reason.is_some());
         assert_eq!(survivors(&out).len(), 120);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scores_table(out: &str) -> TableFile {
+        TableFile::open(&format!(
+            "{}.scores.parquet",
+            out.trim_end_matches(".parquet")
+        ))
+        .unwrap()
+    }
+
+    /// Library of explicit peptidoforms, one spectrum per entry holding `planted[i]`.
+    fn explicit_run(dir: &str, pfs: &[&str], planted: &[Vec<f64>]) -> (String, String, String) {
+        let n = pfs.len();
+        let mut s = 0xBEEFu64;
+        let mut next = |m: u64| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 33) % m
+        };
+        let mut mzs = Vec::new();
+        for p in planted {
+            let mut mz: Vec<f32> = (0..150)
+                .map(|_| (150.0 + next(1_350_000) as f64 / 1000.0) as f32)
+                .collect();
+            mz.extend(p.iter().map(|&m| m as f32));
+            mz.sort_by(f32::total_cmp);
+            mzs.push(mz);
+        }
+        let ints: Vec<Vec<f32>> = mzs.iter().map(|m| vec![10.0; m.len()]).collect();
+        let rts: Vec<f64> = (0..n).map(|i| 10.0 * i as f64).collect();
+        let ms2 = format!("{dir}/ms2.parquet");
+        write_table(
+            &ms2,
+            vec![
+                Col::F64("rt_seconds".into(), rts.clone()),
+                Col::F64("window_lower".into(), vec![0.0; n]),
+                Col::F64("window_upper".into(), vec![5000.0; n]),
+                Col::ListF32("mz".into(), mzs),
+                Col::ListF32("intensity".into(), ints),
+            ],
+        )
+        .unwrap();
+        let lib = format!("{dir}/lib.parquet");
+        write_table(
+            &lib,
+            vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::Str(
+                    "peptidoform".into(),
+                    pfs.iter().map(|s| s.to_string()).collect(),
+                ),
+                Col::I32("charge".into(), vec![2; n]),
+                Col::F64(
+                    "precursor_mz".into(),
+                    pfs.iter()
+                        .map(|p| parse_peptidoform(p).unwrap().precursor_mz(2))
+                        .collect(),
+                ),
+                Col::Str(
+                    "label".into(),
+                    (0..n)
+                        .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                        .collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        let rw = format!("{dir}/rw.parquet");
+        write_table(
+            &rw,
+            vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                // Every candidate may use every spectrum, so siblings see the same evidence.
+                Col::F64("rt_lo".into(), vec![-1.0; n]),
+                Col::F64("rt_hi".into(), vec![1e9; n]),
+            ],
+        )
+        .unwrap();
+        (ms2, lib, rw)
+    }
+
+    /// Family support gives every localization sibling the family's best score; best-site keeps
+    /// only the best and preserves ties; `own` leaves each form its own score.
+    #[test]
+    fn localization_policies_preserve_ties_and_keep_support_separate() {
+        let dir = scratch("loc");
+        // A and B: siblings, only A's full ladder is planted. C and D: siblings whose planted
+        // fragments do not distinguish the sites (a tie). Labels alternate, so siblings are
+        // placed on equal labels by repeating them.
+        let pfs = [
+            "GAM[Oxidation]STMDEK",
+            "PLAINPEPTIDEK",
+            "GAMSTM[Oxidation]DEK",
+            "PLAINPEPTIDEKK",
+            "WM[Oxidation]MWHLLLLR",
+            "PLAINPEPTIDEKKK",
+            "WMM[Oxidation]WHLLLLR",
+        ];
+        let tie_frags: Vec<f64> = frags("WM[Oxidation]MWHLLLLR", 1, false)
+            .into_iter()
+            .zip(frags("WMM[Oxidation]WHLLLLR", 1, false))
+            .filter(|(x, y)| (x - y).abs() < 1e-9)
+            .map(|(x, _)| x)
+            .collect();
+        assert!(!tie_frags.is_empty());
+        let planted = vec![
+            frags("GAM[Oxidation]STMDEK", 2, false),
+            vec![],
+            vec![],
+            vec![],
+            tie_frags,
+            vec![],
+            vec![],
+        ];
+        let (ms2, lib, rw) = explicit_run(&dir, &pfs, &planted);
+        let out = format!("{dir}/s.parquet");
+        let score_of = |pol: PrescreenLocalization| {
+            let mut c = cfg();
+            c.min_calibration = 1;
+            c.write_scores = true;
+            c.localization = pol;
+            run(PrescreenParams {
+                ms2: &ms2,
+                library_precursors: &lib,
+                run_windows: Some(&rw),
+                ms1: None,
+                out: &out,
+                config: &conf(c),
+                config_hash: "t",
+            })
+            .unwrap();
+            let t = scores_table(&out);
+            (t.f64("score").unwrap(), t.f64("base_score").unwrap())
+        };
+        let (own, base) = score_of(PrescreenLocalization::Own);
+        assert_eq!(own, base);
+        assert!(base[0] > base[2] && base[2] >= 0.0);
+        assert_eq!(base[4], base[6], "the tie");
+        let (fam, _) = score_of(PrescreenLocalization::FamilySupport);
+        assert_eq!(fam[2], base[0], "B carries its family's support");
+        assert_eq!(fam[0], base[0]);
+        let (best, _) = score_of(PrescreenLocalization::BestSite);
+        assert_eq!(best[0], base[0]);
+        assert_eq!(best[2], f64::NEG_INFINITY, "B is not the best site");
+        assert_eq!(best[4], base[4]);
+        assert_eq!(best[6], base[6], "ties are kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tag retrieval: the planted candidates are retrieved; without the rescue route the
+    /// unretrieved ones are dropped and the losses are reported apart from scoring losses; with
+    /// it, the survivors equal those of `retrieval = "all"`. Every optional component runs.
+    #[test]
+    fn tag_retrieval_rescue_and_optional_components() {
+        let dir = scratch("ret");
+        let (ms2, lib, rw) = synthetic_run(&dir, 300, 80, false);
+        let out = format!("{dir}/s.parquet");
+        let go = |c: PrescreenConfig| {
+            let sum = run(PrescreenParams {
+                ms2: &ms2,
+                library_precursors: &lib,
+                run_windows: Some(&rw),
+                ms1: None,
+                out: &out,
+                config: &conf(c),
+                config_hash: "t",
+            })
+            .unwrap();
+            let rep: serde_json::Value =
+                mumdia_io::json::read_json(&format!("{out}.report.json")).unwrap();
+            (sum, survivors(&out), rep["stats"].clone())
+        };
+        let (_, all, _) = go(cfg());
+        let mut c = cfg();
+        c.retrieval = mumdia_core::config::PrescreenRetrieval::Tags;
+        c.write_scores = true;
+        let (_, rescued, st) = go(c.clone());
+        assert_eq!(rescued, all, "the rescue route scores every candidate");
+        let ret = scores_table(&out).u32("candidate_id").unwrap();
+        assert_eq!(ret.len(), 300);
+        assert!(st["retrieved"].as_u64().unwrap() >= 80);
+        assert!(st["tag_paths"].as_u64().unwrap() > 0);
+        c.rescue = false;
+        let (_, strict, st) = go(c.clone());
+        assert!(strict.iter().all(|x| rescued.contains(x)));
+        assert!(
+            (0..80u32).all(|i| strict.contains(&i)),
+            "planted candidates are retrieved"
+        );
+        assert!(st.get("retrieval_losses").is_some() && st.get("scoring_losses").is_some());
+        c.delayed_modforms = true;
+        let (_, delayed, st) = go(c);
+        assert_eq!(
+            delayed, strict,
+            "delayed enumeration retrieves the same set"
+        );
+        assert!(st["retrieval_forms_examined"].as_u64().is_some());
+
+        let mut e = cfg();
+        e.complement_bonus = 0.25;
+        e.tag_bonus = 0.1;
+        e.fasta_bonus = 0.1;
+        e.flank_bonus = 0.1;
+        e.trace.enabled = true;
+        e.trace.bonus = 0.1;
+        e.mass_hypotheses.enabled = true;
+        e.mass_hypotheses.sample_spectra = 5;
+        e.write_scores = true;
+        let (sum, kept, st) = go(e);
+        assert!(sum.cutoff.is_some() && !kept.is_empty());
+        assert!(st["component_scales_q95"].is_array());
+        let t = scores_table(&out);
+        for name in ext::NAMES {
+            let v = t.f64(&format!("component_{name}")).unwrap();
+            assert!(v.iter().all(|x| x.is_finite() && *x >= 0.0), "{name}");
+        }
+        assert!(t.f64("component_tag").unwrap().iter().any(|&x| x > 0.0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

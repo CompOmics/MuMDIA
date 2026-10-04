@@ -470,6 +470,154 @@ pub enum PrescreenScopeMatch {
     All,
 }
 
+/// Which candidates the prescreen scores (`prescreen.retrieval`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenRetrieval {
+    /// Score every candidate (the measured recommended mode).
+    #[default]
+    All,
+    /// Retrieve candidates through database-free tags first: a candidate is retrieved when
+    /// one of its trimers, in its own residue states, was observed in an eligible spectrum.
+    /// Candidates without such evidence take the rescue route when `rescue` is on.
+    Tags,
+}
+
+/// How modification siblings share evidence (`prescreen.localization`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenLocalization {
+    /// Every form keeps its own score.
+    #[default]
+    Own,
+    /// Family support: every form of one backbone with the same modification composition,
+    /// charge and label takes the family's best score, so compatible localizations and ties
+    /// pass or fail together. Support is kept separate from localization; no site is chosen.
+    FamilySupport,
+    /// Keep only forms whose own score equals the family best (ties kept). Measured to lose
+    /// modified references in the prototype; available for comparison only.
+    BestSite,
+}
+
+/// Fragment-trace pooling mode (`prescreen.trace.pooling`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenPooling {
+    /// Bounded mass clusters over the pooled scans (max - min <= `cluster_da`), kept when seen
+    /// in at least `min_detections` scans.
+    #[default]
+    Merged,
+    /// Every pooled peak as its own feature, for comparison with merging.
+    Unmerged,
+}
+
+/// Which trace evidence the trace component scores (`prescreen.trace.score`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenTraceScore {
+    /// Tag coherence: for each candidate trimer, the best (minimum pairwise trace cosine of the
+    /// four path features x whole-path fit) in a pool; summed over distinct trimers.
+    #[default]
+    TagCoherence,
+    /// Disconnected ladders: candidate fragments matched to pooled features, counted when their
+    /// trace is compatible (cosine >= `min_quality`) with the most intense matched feature.
+    CoherentFragments,
+}
+
+/// Database-free tag discovery used by retrieval and the optional evidence components.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrescreenTagsConfig {
+    /// Neutral residue-mass tolerance of a tag edge (Da); `edge_tol_da / z` in m/z.
+    pub edge_tol_da: f64,
+    /// Highest fragment charge of a tag edge.
+    pub max_charge: i32,
+    /// Also allow two-residue gap steps; every compatible residue pair is kept as an
+    /// alternative and gapped three-peak ladders are keyed separately from four-peak ones.
+    pub gap_edges: bool,
+    /// Sigma of the whole-path soft weight `exp(-0.5 (rms / sigma)^2)` (Da).
+    pub rms_sigma_da: f64,
+    /// Variable states added to the chemistry configuration's alphabet, `RESIDUE:Name`.
+    pub extra_mods: Vec<String>,
+}
+impl Default for PrescreenTagsConfig {
+    fn default() -> Self {
+        Self {
+            edge_tol_da: 0.005,
+            max_charge: 2,
+            gap_edges: false,
+            rms_sigma_da: 0.003,
+            extra_mods: Vec::new(),
+        }
+    }
+}
+
+/// Blind neutral-mass hypotheses from tag paths and complementary peaks, with optional MS1.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrescreenMassConfig {
+    /// Infer hypotheses and write `<out>.mass_hypotheses.parquet`.
+    pub enabled: bool,
+    /// Spectra sampled for inference (seeded); 0 = every spectrum (expensive).
+    pub sample_spectra: usize,
+    /// Look for the monoisotopic and +1 isotope peaks in MS1 scans within `ms1_rt_s`.
+    pub ms1: bool,
+    pub ms1_rt_s: f64,
+    /// MS1 tolerance: max(0.005 Da, this many ppm).
+    pub ms1_ppm: f64,
+    /// Drop hypotheses without an MS1 link. A hard gate; off by default.
+    pub require_ms1: bool,
+    /// Weight of the candidate mass-support component in the combined score; 0 = report only.
+    pub bonus: f64,
+}
+impl Default for PrescreenMassConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_spectra: 512,
+            ms1: false,
+            ms1_rt_s: 2.0,
+            ms1_ppm: 10.0,
+            require_ms1: false,
+            bonus: 0.0,
+        }
+    }
+}
+
+/// Fragment traces over consecutive same-window scans.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrescreenTraceConfig {
+    /// Compute the trace component (reported in the scores table).
+    pub enabled: bool,
+    /// Consecutive same-window scans per pool.
+    pub scans: usize,
+    /// Maximum m/z range (max - min) of one merged cluster.
+    pub cluster_da: f64,
+    /// Scans a merged cluster must be detected in.
+    pub min_detections: usize,
+    pub pooling: PrescreenPooling,
+    pub score: PrescreenTraceScore,
+    /// Trace cosine counted as compatible by `coherent_fragments`.
+    pub min_quality: f64,
+    /// Weight of the trace component in the combined score; 0 = report only.
+    pub bonus: f64,
+}
+impl Default for PrescreenTraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scans: 7,
+            cluster_da: 0.01,
+            min_detections: 2,
+            pooling: PrescreenPooling::Merged,
+            score: PrescreenTraceScore::TagCoherence,
+            min_quality: 0.6,
+            bonus: 0.0,
+        }
+    }
+}
+
 /// Fragment-rarity candidate prescreen (`mumdia prescreen`, and `run`/`run-experiment` when
 /// `enabled`). Each candidate is scored on the spectra of its own isolation window inside its
 /// calibrated RT bounds: its b/y fragments at charges `1..=min(max_frag_charge, z)`, in both the
@@ -518,6 +666,29 @@ pub struct PrescreenConfig {
     pub rt_slack_s: f64,
     /// Write the per-candidate scores beside the survivors (`<out>.scores.parquet`).
     pub write_scores: bool,
+    /// Candidate retrieval before scoring. `all` (default) scores every candidate.
+    pub retrieval: PrescreenRetrieval,
+    /// With `retrieval = "tags"`, score candidates without tag evidence anyway (the permissive
+    /// rescue route) instead of dropping them. Default true.
+    pub rescue: bool,
+    /// With `retrieval = "tags"`, retrieve backbone families first and examine forms only in
+    /// retrieved families (delayed modification enumeration). Same retrieved set.
+    pub delayed_modforms: bool,
+    pub tags: PrescreenTagsConfig,
+    /// Weight of the complementary-ion component (prototype 0.25 measured); 0 = off.
+    pub complement_bonus: f64,
+    /// Weight of the tag-evidence component (spectrum rarity x path fit, each distinct trimer
+    /// once); 0 = off.
+    pub tag_bonus: f64,
+    /// Weight of the FASTA/library-side tag information, kept separate from the spectrum
+    /// side; 0 = off.
+    pub fasta_bonus: f64,
+    /// Weight of positioned flank support (an observed tag whose ladder endpoints sit at the
+    /// candidate's b/y masses); 0 = off.
+    pub flank_bonus: f64,
+    pub mass_hypotheses: PrescreenMassConfig,
+    pub trace: PrescreenTraceConfig,
+    pub localization: PrescreenLocalization,
 }
 impl Default for PrescreenConfig {
     fn default() -> Self {
@@ -538,6 +709,17 @@ impl Default for PrescreenConfig {
             both_orientations: true,
             rt_slack_s: 0.0,
             write_scores: false,
+            retrieval: PrescreenRetrieval::All,
+            rescue: true,
+            delayed_modforms: false,
+            tags: t(),
+            complement_bonus: 0.0,
+            tag_bonus: 0.0,
+            fasta_bonus: 0.0,
+            flank_bonus: 0.0,
+            mass_hypotheses: t(),
+            trace: t(),
+            localization: PrescreenLocalization::Own,
         }
     }
 }
@@ -3198,6 +3380,51 @@ impl Config {
                     "prescreen.enabled is not supported with groups.window_groups > 1 yet; run \
                      `mumdia prescreen` per band or disable one of the two"
                         .into(),
+                ));
+            }
+            for (name, value) in [
+                ("prescreen.complement_bonus", p.complement_bonus),
+                ("prescreen.tag_bonus", p.tag_bonus),
+                ("prescreen.fasta_bonus", p.fasta_bonus),
+                ("prescreen.flank_bonus", p.flank_bonus),
+                ("prescreen.mass_hypotheses.bonus", p.mass_hypotheses.bonus),
+                ("prescreen.trace.bonus", p.trace.bonus),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(Invalid(format!(
+                        "{name} must be finite and >= 0 (got {value})"
+                    )));
+                }
+            }
+            for (name, value) in [
+                ("prescreen.tags.edge_tol_da", p.tags.edge_tol_da),
+                ("prescreen.tags.rms_sigma_da", p.tags.rms_sigma_da),
+                ("prescreen.trace.cluster_da", p.trace.cluster_da),
+                (
+                    "prescreen.mass_hypotheses.ms1_ppm",
+                    p.mass_hypotheses.ms1_ppm,
+                ),
+                (
+                    "prescreen.mass_hypotheses.ms1_rt_s",
+                    p.mass_hypotheses.ms1_rt_s,
+                ),
+            ] {
+                if !value.is_finite() || value <= 0.0 {
+                    return Err(Invalid(format!(
+                        "{name} must be finite and > 0 (got {value})"
+                    )));
+                }
+            }
+            if p.tags.max_charge < 1 || p.trace.scans < 1 || p.trace.min_detections < 1 {
+                return Err(Invalid(
+                    "prescreen.tags.max_charge, prescreen.trace.scans and \
+                     prescreen.trace.min_detections must be >= 1"
+                        .into(),
+                ));
+            }
+            if p.delayed_modforms && p.retrieval != PrescreenRetrieval::Tags {
+                return Err(Invalid(
+                    "prescreen.delayed_modforms needs prescreen.retrieval = \"tags\"".into(),
                 ));
             }
             if p.max_frag_charge < 1 {

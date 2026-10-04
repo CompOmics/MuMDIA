@@ -197,6 +197,9 @@ enum Cmd {
         /// Per-candidate RT bounds (candidate_id, rt_lo, rt_hi). Omitted: whole gradient.
         #[arg(long)]
         run_windows: Option<String>,
+        /// MS1 spectra, for `prescreen.mass_hypotheses.ms1` only.
+        #[arg(long)]
+        ms1: Option<String>,
         #[arg(long)]
         out: String,
         #[arg(long)]
@@ -1497,6 +1500,7 @@ fn real_main() -> Result<()> {
             ms2,
             lib_precursors,
             run_windows,
+            ms1,
             out,
             config,
             preset,
@@ -1523,8 +1527,9 @@ fn real_main() -> Result<()> {
                 ms2: &ms2,
                 library_precursors: &lib_precursors,
                 run_windows: run_windows.as_deref(),
+                ms1: ms1.as_deref(),
                 out: &out,
-                cfg: &cfg.prescreen,
+                config: &cfg,
                 config_hash: &ch,
             })?;
         }
