@@ -19,7 +19,8 @@
     "quant",
     "mbr",
     "experiment",
-    "groups"
+    "groups",
+    "retrace"
   ],
   "fields": [
     {
@@ -84,6 +85,133 @@
       "default": true,
       "default_text": "true",
       "help": "Reuse an mzML that already sits beside the `.raw` and is newer than it. On by default: conversion is minutes per file and its output is deterministic given the same converter, so re-running a search should not pay for it twice. Turn it off when the neighbouring mzML may have come from a different converter or a different `.raw` of the same name.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.bruker_reader",
+      "name": "bruker_reader",
+      "section": "convert",
+      "rust_type": "BrukerReader",
+      "kind": "enum",
+      "optional": false,
+      "default": "native",
+      "default_text": "`native`",
+      "help": "How a timsTOF `.d` (one holding `analysis.tdf`) is read. `native` reads frames directly (timsrust) and keeps ion mobility: one MS2 spectrum per (frame, diaPASEF window slot), with a per-peak 1/K0 after m/z x mobility centroiding (docs/TIMS_ROADMAP.md, P1). `msconvert` is the previous route, which collapses mobility; it stays as a fallback. Non-TIMS Bruker (`analysis.baf`) always goes to msconvert.",
+      "gates": [],
+      "source_struct": "ConvertConfig",
+      "choices": [
+        "native",
+        "msconvert"
+      ]
+    },
+    {
+      "path": "convert.tdf_mz_ppm",
+      "name": "tdf_mz_ppm",
+      "section": "convert",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 10.0,
+      "default_text": "10.0",
+      "help": "Native TDF centroiding: m/z merge tolerance in ppm between neighbouring TOF points (single linkage).",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_im_gap_scans",
+      "name": "tdf_im_gap_scans",
+      "section": "convert",
+      "rust_type": "u32",
+      "kind": "integer",
+      "optional": false,
+      "default": 30,
+      "default_text": "30",
+      "help": "Native TDF centroiding: a gap of more than this many TIMS scans without signal splits one m/z trace into separate peaks.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_min_points",
+      "name": "tdf_min_points",
+      "section": "convert",
+      "rust_type": "u32",
+      "kind": "integer",
+      "optional": false,
+      "default": 2,
+      "default_text": "2",
+      "help": "Native TDF noise floor: a centroid built from fewer raw TOF x scan points than this is dropped.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_im_width",
+      "name": "tdf_im_width",
+      "section": "convert",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Native TDF: also write each centroid's mobility width (`im_width`, spectra v3): the intensity-weighted SD of its TIMS scans, plus the 1/12-scan quantisation term, in 1/K0 units (TIMS roadmap P7). Adds 4 B per MS1 and MS2 peak to the artifacts and to resident memory. Default false: no `im_width` column, the other columns unchanged. Read by extract's apex IM-shape columns (psms_extracted v5) and `features.im_shape_features`. Benchmark-gated.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_mz_valley",
+      "name": "tdf_mz_valley",
+      "section": "convert",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "Native TDF: split each m/z x mobility cluster at valleys of its m/z profile (TIMS roadmap part 2, D5 follow-up). A local minimum of the smoothed profile is a cut when it is below this fraction of the smaller of the two humps beside it, so one ion stays one centroid and two neighbouring ions become two. Must be in [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_mz_smooth_ppm",
+      "name": "tdf_mz_smooth_ppm",
+      "section": "convert",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 4.0,
+      "default_text": "4.0",
+      "help": "Native TDF: half-width in ppm of the triangular smoothing applied to the m/z profile before `tdf_mz_valley` looks for valleys; 0 is no smoothing. Unused while `tdf_mz_valley` is 0.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_im_valley",
+      "name": "tdf_im_valley",
+      "section": "convert",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "Native TDF: split each cluster (after the m/z valley split, when that is on) at valleys of its mobility profile: summed intensity per TIMS scan, triangular smoothing of half-width `tdf_im_smooth_scans`, cut at a local minimum below this fraction of the smaller hump beside it. Separates ions of one m/z whose mobility profiles touch without a `tdf_im_gap_scans` gap. Must be in [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_im_smooth_scans",
+      "name": "tdf_im_smooth_scans",
+      "section": "convert",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 4.0,
+      "default_text": "4.0",
+      "help": "Native TDF: half-width in TIMS scans of the mobility profile smoothing used by `tdf_im_valley`; 0 is no smoothing. Unused while `tdf_im_valley` is 0.",
       "gates": [],
       "source_struct": "ConvertConfig"
     },
@@ -544,6 +672,36 @@
       "source_struct": "PredictFragConfig"
     },
     {
+      "path": "predict_frag.im_predictor",
+      "name": "im_predictor",
+      "section": "predict_frag",
+      "rust_type": "ImPredictorKind",
+      "kind": "enum",
+      "optional": false,
+      "default": "none",
+      "default_text": "`none`",
+      "help": "Ion-mobility predictor for `predicted_im`. Default `none` (the column is null); `im2deep` requires `im2deep_python`. Only rt-im-train reads the column so far.",
+      "gates": [],
+      "source_struct": "PredictFragConfig",
+      "choices": [
+        "none",
+        "im2deep"
+      ]
+    },
+    {
+      "path": "predict_frag.im2deep_python",
+      "name": "im2deep_python",
+      "section": "predict_frag",
+      "rust_type": "Option<String>",
+      "kind": "other",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Python executable for the IM2Deep sidecar (env with im2deep + psm_utils + pyarrow).",
+      "gates": [],
+      "source_struct": "PredictFragConfig"
+    },
+    {
       "path": "predict_frag.sidecar_script_dir",
       "name": "sidecar_script_dir",
       "section": "predict_frag",
@@ -578,7 +736,7 @@
       "optional": true,
       "default": "\"auto\"",
       "default_text": "\"auto\"",
-      "help": "Where `run` and `run-experiment` keep the library they build from a FASTA, to reuse it on a later run. `\"auto\"` (the default since 2026-09-28): `libraries/` under the engine's cache root, which is `MUMDIA_CACHE_DIR` when it is set and otherwise the per-user cache directory (`$XDG_CACHE_HOME/mumdia` or `~/.cache/mumdia` on Linux, `~/Library/Caches/mumdia` on macOS, `%LOCALAPPDATA%\\mumdia\\cache` on Windows; `MUMDIA_CACHE_DIR=off` turns `\"auto\"` off). A path: that directory, as given. `null` or `\"off\"`: every FASTA run builds its library, the behaviour before 2026-09-28. A FASTA-mode run digests, expands peptidoforms and predicts the library on every invocation, and one `run` per file is the way to search files separately, so each file paid the whole build again (about an hour of predict-frag on the 9.8M-peptidoform HYE library). Set, the orchestrator looks the library up under a key of everything that determines it: the FASTA's content hash, the `digest`, `peptidoforms` and `predict_frag` sections (all but this field), `rng_seed`, whether the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep or DeepLC version the build uses, the worker scripts' content and the running executable's content. A hit is copied to the paths a build writes (a byte copy, never a hard link, and checked against the blake3 recorded when it was stored) and digest, peptidoforms and predict-frag are skipped; a miss is built and then stored. When a predictor version cannot be read, nothing is looked up or stored. The run stays in FASTA mode, so every other decision is the one a rebuild makes. A hit is byte-identical to a rebuild when the build is deterministic, which the native predictors are; with a sidecar predictor it reuses the stored prediction. The manifest records the two library tables with the stage `library-cache`, and the run directory then holds no `peptides.parquet` or `peptidoforms.parquet` (an earlier build's are removed). Validate by running one FASTA search twice with the same cache directory and comparing `peptides.tsv` and `proteins.tsv` (the smoke test does this). A stored entry whose files changed is rebuilt and replaced, and temporary directories left by a killed store are removed after an hour. The cache is bounded: after a run stores into it, the least recently used entries of this cache and of `rt_im_train.deeplc_projection_cache` are removed until the two together are within `MUMDIA_CACHE_MAX_GB` (default 100 GiB; an entry used within the last hour is kept). The key covers the running executable, so every engine build stores its own entries and the bound is what removes the old ones. `mumdia doctor` reports the directory and its size.",
+      "help": "Where `run` and `run-experiment` keep the library they build from a FASTA, to reuse it on a later run. `\"auto\"` (the default since 2026-09-28): `libraries/` under the engine's cache root, which is `MUMDIA_CACHE_DIR` when it is set and otherwise the per-user cache directory (`$XDG_CACHE_HOME/mumdia` or `~/.cache/mumdia` on Linux, `~/Library/Caches/mumdia` on macOS, `%LOCALAPPDATA%\\mumdia\\cache` on Windows; `MUMDIA_CACHE_DIR=off` turns `\"auto\"` off). A path: that directory, as given. `null` or `\"off\"`: every FASTA run builds its library, the behaviour before 2026-09-28. A FASTA-mode run digests, expands peptidoforms and predicts the library on every invocation, and one `run` per file is the way to search files separately, so each file paid the whole build again (about an hour of predict-frag on the 9.8M-peptidoform HYE library). Set, the orchestrator looks the library up under a key of everything that determines it: the FASTA's content hash, the `digest`, `peptidoforms` and `predict_frag` sections (all but this field), `rng_seed`, whether the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep, DeepLC or IM2Deep version the build uses, the worker scripts' content and the running executable's content. A hit is copied to the paths a build writes (a byte copy, never a hard link, and checked against the blake3 recorded when it was stored) and digest, peptidoforms and predict-frag are skipped; a miss is built and then stored. When a predictor version cannot be read, nothing is looked up or stored. The run stays in FASTA mode, so every other decision is the one a rebuild makes. A hit is byte-identical to a rebuild when the build is deterministic, which the native predictors are; with a sidecar predictor it reuses the stored prediction. The manifest records the two library tables with the stage `library-cache`, and the run directory then holds no `peptides.parquet` or `peptidoforms.parquet` (an earlier build's are removed). Validate by running one FASTA search twice with the same cache directory and comparing `peptides.tsv` and `proteins.tsv` (the smoke test does this). A stored entry whose files changed is rebuilt and replaced, and temporary directories left by a killed store are removed after an hour. The cache is bounded: after a run stores into it, the least recently used entries of this cache and of `rt_im_train.deeplc_projection_cache` are removed until the two together are within `MUMDIA_CACHE_MAX_GB` (default 100 GiB; an entry used within the last hour is kept). The key covers the running executable, so every engine build stores its own entries and the bound is what removes the old ones. `mumdia doctor` reports the directory and its size.",
       "gates": [],
       "source_struct": "PredictFragConfig"
     },
@@ -687,6 +845,69 @@
       "default": false,
       "default_text": "false",
       "help": "m/z-dependent fragment mass calibration. When true, fit a LOESS of the calibrant ppm deviation versus fragment m/z and emit a sampled correction grid to `<seed>.masscal.json`; extract then applies an m/z-interpolated offset per peak instead of the single scalar `frag_ppm_offset`. This removes any m/z-correlated curvature the flat offset leaves. Default false (scalar offset unchanged), opt-in and benchmark-gated.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "SearchSeedConfig"
+    },
+    {
+      "path": "search_seed.frag_tol_mad_k",
+      "name": "frag_tol_mad_k",
+      "section": "search_seed",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "Fragment tolerance estimator. 0 (default) keeps `1.5 * p95(|dev - median|)`. When > 0 the tolerance is `k * 1.4826 * MAD(dev - median)`, floored at 5 ppm: a multiple of the robust sigma of the calibrant deviations. On diaPASEF the p95 is set by a 6-20 ppm shoulder of the deviation distribution and lands at the search tolerance (~20 ppm), while the MAD tracks the core (TIMS roadmap, \"P6 result\"). Benchmark-gated; no default is claimed.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "SearchSeedConfig"
+    },
+    {
+      "path": "search_seed.im_gate",
+      "name": "im_gate",
+      "section": "search_seed",
+      "rust_type": "SeedImGate",
+      "kind": "enum",
+      "optional": false,
+      "default": "off",
+      "default_text": "`off`",
+      "help": "Ion-mobility gate on the seed probe (diaPASEF, docs/07_search_seed.md): a matched peak counts only when its 1/K0 lies within `im_window` of the candidate's library `predicted_im`. The seed runs before any IM calibration, so `fixed` gates on the raw prediction, and `two_pass` first runs ungated, maps the prediction onto the run with a CCS fit on that pass's confident anchors, and reruns gated. Candidates without `predicted_im`, and 3D scans, are never gated. Default `off`.",
+      "gates": [
+        "gated"
+      ],
+      "source_struct": "SearchSeedConfig",
+      "choices": [
+        "off",
+        "fixed",
+        "two_pass"
+      ]
+    },
+    {
+      "path": "search_seed.im_window",
+      "name": "im_window",
+      "section": "search_seed",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.1,
+      "default_text": "0.10",
+      "help": "Half-width of the seed IM gate, in V s cm^-2. Default 0.10, wide enough for uncalibrated IM2Deep on the benchmark (p95 |error| 0.07).",
+      "gates": [],
+      "source_struct": "SearchSeedConfig"
+    },
+    {
+      "path": "search_seed.unique_fragment_matches",
+      "name": "unique_fragment_matches",
+      "section": "search_seed",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Count each predicted fragment of a candidate at most once per spectrum, with the intensity of its most intense matching peak, instead of once per matching peak. On diaPASEF slot spectra the mobility pieces of one fragment ion sit at one m/z and otherwise count as several fragments in the hyperscore's `ln(matched!)` (TIMS roadmap part 2, mobility valley split). Fragindex matcher only. Default false: the seed is unchanged. Benchmark-gated.",
       "gates": [
         "benchmark-gated"
       ],
@@ -925,6 +1146,101 @@
         "library",
         "deeplc"
       ]
+    },
+    {
+      "path": "rt_im_train.im_min_anchors_per_charge",
+      "name": "im_min_anchors_per_charge",
+      "section": "rt_im_train",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 50,
+      "default_text": "50",
+      "help": "Ion-mobility calibration (docs/08, \"IM calibration\"). Runs when the library carries `predicted_im` and the seed carries `observed_im`; otherwise the IM columns of `run_windows` stay null. The fit is per-charge linear in CCS space, `obs_ccs = a_z + b_z * pred_ccs`, over confident target seed anchors (best per candidate). A charge with fewer anchors than this uses the global fit.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
+      "path": "rt_im_train.p_im",
+      "name": "p_im",
+      "section": "rt_im_train",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.95,
+      "default_text": "0.95",
+      "help": "Percentile of held-out |observed - calibrated| 1/K0 residuals for `w_im`.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
+      "path": "rt_im_train.im_window_multiplier",
+      "name": "im_window_multiplier",
+      "section": "rt_im_train",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 1.0,
+      "default_text": "1.0",
+      "help": "Multiplier on that percentile.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
+      "path": "rt_im_train.im_window_min",
+      "name": "im_window_min",
+      "section": "rt_im_train",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.005,
+      "default_text": "0.005",
+      "help": "Lower clamp for the IM half-window, V s cm^-2.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
+      "path": "rt_im_train.im_window_holdout_frac",
+      "name": "im_window_holdout_frac",
+      "section": "rt_im_train",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.3,
+      "default_text": "0.3",
+      "help": "Fraction of anchor peptides held out to size `w_im` (the `window_holdout_frac` rule, keyed on `base_peptide_id`). IM is sized held-out from the start: in-sample residuals are optimistic and can rank models backwards (docs/08 section 4). Must lie in (0, 0.9].",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
+      "path": "rt_im_train.refit",
+      "name": "refit",
+      "section": "rt_im_train",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Second pass on the pass-1 identifications (TIMS roadmap part 2, L1d). After pass 1 is rescored, its accepted targets (PSM `q_value` at most `q_train`) become a pseudo-seed; under multi-head calibration the 80-head fit is refitted on it, cross-fitted over two folds of base peptides (each candidate takes the fold it was not fitted on); rt-im-train is refitted on it, and its new RT and IM centres are used with the pass-1 half-widths (the refit widths are truncated by selection and lost 4%). Extract, features (with the original seed), compete and rescore then run again. Pass-1 artifacts go to `<out>/pass1/`. Single-run and ungrouped `run-experiment` only. Default false: nothing changes. Benchmark-gated.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
+      "path": "rt_im_train.robust_calibration",
+      "name": "robust_calibration",
+      "section": "rt_im_train",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Drop outlying RT anchors before the calibration fit: a first LOESS on the anchors inside the central 99% of predicted iRT, then every anchor whose residual lies more than 6 robust SDs from the median is removed, and the curve, the window sizing and the reported residuals use the rest (`cal.json` `n_rt_outliers_removed`). A few anchors with an absurd predicted iRT otherwise stretch the LOESS grid until the gradient sits in one or two cells: on one HYE run of the `refit` pass, 11 of 58k anchors moved the curve by 51 s (TIMS roadmap part 2). Default false: unchanged. Benchmark-gated.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "RtImTrainConfig"
     },
     {
       "path": "rt_im_train.deeplc_predict_shards",
@@ -1469,6 +1785,26 @@
       "source_struct": "ExtractConfig"
     },
     {
+      "path": "extract.im_gate",
+      "name": "im_gate",
+      "section": "extract",
+      "rust_type": "ImGate",
+      "kind": "enum",
+      "optional": false,
+      "default": "off",
+      "default_text": "`off`",
+      "help": "Ion-mobility gate (diaPASEF, docs/09_extract.md): a peak contributes to a candidate only when its 1/K0 lies inside the candidate's calibrated `run_windows` [`im_lo`, `im_hi`]. A candidate with a null IM window, and a 3D scan, are not gated. Default `off`, which leaves extraction bit-identical.",
+      "gates": [
+        "gated"
+      ],
+      "source_struct": "ExtractConfig",
+      "choices": [
+        "off",
+        "fragments",
+        "fragments_ms1"
+      ]
+    },
+    {
       "path": "extract.claim_cues.mz_close",
       "name": "mz_close",
       "section": "extract.claim_cues",
@@ -1695,6 +2031,51 @@
       "default": false,
       "default_text": "false",
       "help": "Emit the MS1 apex-isotope precursor feature `ms1_isotope_height_corr` (Pearson of the observed apex isotope heights `[i0,i1,i2]` against the Poisson-averagine model). Default false (the feature is present in the battery but returns 0.0, so the vector length is unchanged in effect). It overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and benchmark-gated rather than default-on (AlphaDIA-plan item 12).",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "FeaturesConfig"
+    },
+    {
+      "path": "features.im_features",
+      "name": "im_features",
+      "section": "features",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Append the ion-mobility feature block (docs/10_features.md, \"Ion-mobility features\"; TIMS roadmap P5) after every other column: IM error against the calibrated prediction, fragment IM dispersion at the apex, MS1 IM agreement and the IM spread over the elution peak. Needs 4D data (psms_extracted v4 or later, chromatograms v3 or v4); on 3D data the columns are constant zeros. Default false: off, the feature list, schema id and PIN column order are unchanged. Benchmark-gated.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "FeaturesConfig"
+    },
+    {
+      "path": "features.im_shape_features",
+      "name": "im_shape_features",
+      "section": "features",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Append the ion-mobility peak-shape block (docs/10_features.md, \"Ion-mobility features\"; TIMS roadmap P7) after every other column, including the `im_features` block: fragment mobility width and its spread at the apex, the Gaussian overlap of each fragment's mobility peak with the fragment consensus, and the MS1 precursor's width and overlap. Needs `convert.tdf_im_width` (spectra v3, psms_extracted v5); without it the columns are constant zeros. Default false: off, the feature list, schema id and PIN column order are unchanged. Benchmark-gated.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "FeaturesConfig"
+    },
+    {
+      "path": "features.retrace_apex",
+      "name": "retrace_apex",
+      "section": "features",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Apex evidence from the raw diaPASEF events (docs/TIMS_ROADMAP_bis.md section 7). Needs `retrace.enabled`: retrace then also writes `<chromatograms>.apex.parquet`, and features replaces the centroid `apex_intensity`, `n_matched_fragments` and `ms1_mono` / `ms1_iso1` / `ms1_iso2` with their raw-trace values and appends `imc_ref_w`, the agreement of the fragments' raw 1/K0 profiles at the apex, after every other column. Refused with `extract.promote_top_peaks > 1`. Default false: off, the feature list, schema id and values are unchanged. Benchmark-gated.",
       "gates": [
         "benchmark-gated"
       ],
@@ -2360,6 +2741,45 @@
       "source_struct": "QuantConfig"
     },
     {
+      "path": "quant.cross_run_weights",
+      "name": "cross_run_weights",
+      "section": "quant",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Cross-run fragment weighting (run-experiment only; docs/TIMS_QUANT_ROADMAP.md section 4b). Per-run quant runs twice: the first pass exports each fragment's area and its apex correlation with the candidate's other fragments; one weight per (candidate, fragment) is then fitted over all runs, `1 / (dev + 0.1) * max(corr, 0)`, where `dev` is the median absolute deviation of the fragment's log-share of the candidate total from its cross-run median and `corr` the median correlation; the second pass sums `weight * area` over every fragment, with the same weights in every run. Uses no condition labels. A candidate whose weights are all zero takes equal weights; a run where the weighted sum is not positive keeps the `top_n_fragments` rule. Needs a fixed window (the correlation is taken over it). Off by default; on in the diaPASEF preset (`QuantConfig::diapasef`).",
+      "gates": [],
+      "source_struct": "QuantConfig"
+    },
+    {
+      "path": "quant.cross_run_background",
+      "name": "cross_run_background",
+      "section": "quant",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Cross-run background (run-experiment only; docs/TIMS_QUANT_ROADMAP.md section 4f). In the same two-pass step, one background level per (candidate, fragment) is the mean over all runs of the raw flank mean (`baseline_flank_scans` samples either side of the fixed window); the second pass subtracts it from every window sample, clipped at zero, in place of the per-run `baseline_subtract` level. Label-blind. Needs a fixed window. Off by default; on in the diaPASEF preset.",
+      "gates": [],
+      "source_struct": "QuantConfig"
+    },
+    {
+      "path": "quant.cross_run_width",
+      "name": "cross_run_width",
+      "section": "quant",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "Cross-run integration width (run-experiment only; docs/TIMS_QUANT_ROADMAP.md section 4h). When > 0, each candidate is integrated over its own scan halfwidth `h = clamp( round(cross_run_width * HWHM), 3, 7)` in every run, in place of `fixed_scan_halfwidth`. HWHM is the half width at half maximum, in scans, of the candidate's summed fragment trace (flank mean subtracted) in its brightest run, measured in the first pass of the cross-run step. The flank (and so the cross-run background) is taken beyond the chosen window. Label-blind. Needs `fixed_scan_halfwidth` (the first-pass window). 0 (default) = off; 2.5 in the diaPASEF preset.",
+      "gates": [],
+      "source_struct": "QuantConfig"
+    },
+    {
       "path": "mbr.strategy",
       "name": "strategy",
       "section": "mbr",
@@ -2479,6 +2899,34 @@
       "gates": [
         "not yet wired"
       ],
+      "source_struct": "MbrConfig"
+    },
+    {
+      "path": "mbr.reextract",
+      "name": "reextract",
+      "section": "mbr",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "The re-extraction tier (`run-experiment`, diaPASEF under `retrace.enabled`): a precursor confident in >= 2 other runs whose apex here missed the rescuable tier's window is retraced at its cross-run expected RT and the anchor runs' 1/K0, and accepted when its evidence there beats a same-trace RT-shift null at `q_transfer` (docs/TIMS_QUANT_ROADMAP.md section 4k). Default false. Benchmark-gated. It runs on the MBR-off scored table, so it also takes the rows the rescuable tier would, with traces in the anchors' 1/K0 band (section 4l).",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "MbrConfig"
+    },
+    {
+      "path": "mbr.rescuable",
+      "name": "rescuable",
+      "section": "mbr",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": true,
+      "default_text": "true",
+      "help": "The rescuable tier (`mbr_worker.py`). Under `reextract` it adds its transfers for the rows re-extraction did not accept; `false` there is re-extraction only, which measured better epsilon and fewer ions (docs/TIMS_QUANT_ROADMAP.md section 4l). Default true; `false` needs `reextract`.",
+      "gates": [],
       "source_struct": "MbrConfig"
     },
     {
@@ -2652,6 +3100,86 @@
       "help": "Write the run's pooled `chromatograms.parquet`. Default `false` since 2026-09-26 (previously `true`; see `pool_competed` for the measurement). With `false`, quant reads the bands' own chromatogram tables in band order, dropping from each the candidates the pool's overlap dedup gave to another band, and the pooled copy is not written: one full splice write, hash and read of the run's largest artifact less (59.5 GB on the immunopeptidomics run above). The pool writes those loser sets to `groups/overlap_losers.parquet` (`band`, `candidate_id`, with the band tables it belongs to named in its footer), so a later `mumdia quant --chromatograms <band tables> --overlap-losers <that file>` reads the same rows, and refuses band tables that are not the named ones in their order. Unlike `pool_competed` this holds for overlapping bands as well, including an overlap candidate compete deleted in one band (the losers are found in the chromatogram tables themselves), and nothing but quant reads the pooled table (the candidate audit and match-between-runs do not). The quant tables are byte-identical either way; what changes is the artifact set. There is no pooled `chromatograms.parquet` (one an earlier run left in the directory is removed) and no manifest record for it, `overlap_losers.parquet` is written and recorded instead, and the quant report's `chromatograms` lists the band tables with `chromatogram_dropped_candidates`. The band chromatogram tables are then the run's only chromatograms, so the band directories are no longer disposable once the run is accepted: deleting them loses re-quantification. `mumdia pool --groups-dir` rebuilds the pooled table from them. `true` writes the pooled table as before.",
       "gates": [],
       "source_struct": "GroupsConfig"
+    },
+    {
+      "path": "retrace.enabled",
+      "name": "enabled",
+      "section": "retrace",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "",
+      "gates": [],
+      "source_struct": "RetraceConfig"
+    },
+    {
+      "path": "retrace.im_half_width",
+      "name": "im_half_width",
+      "section": "retrace",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.015,
+      "default_text": "0.015",
+      "help": "Fragment band half-width in 1/K0 around the candidate's `apex_im` (`im_pred_cal` when null). Measured flat from 0.012 to 0.020 on one diaPASEF run.",
+      "gates": [],
+      "source_struct": "RetraceConfig"
+    },
+    {
+      "path": "retrace.ms1",
+      "name": "ms1",
+      "section": "retrace",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": true,
+      "default_text": "true",
+      "help": "Also rebuild `ms1_mono` / `ms1_iso1` / `ms1_iso2`.",
+      "gates": [],
+      "source_struct": "RetraceConfig"
+    },
+    {
+      "path": "retrace.ms1_im_half_width",
+      "name": "ms1_im_half_width",
+      "section": "retrace",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.015,
+      "default_text": "0.015",
+      "help": "MS1 band half-width in 1/K0, same centre (0.025 measured equal).",
+      "gates": [],
+      "source_struct": "RetraceConfig"
+    },
+    {
+      "path": "retrace.min_events",
+      "name": "min_events",
+      "section": "retrace",
+      "rust_type": "u32",
+      "kind": "integer",
+      "optional": false,
+      "default": 1,
+      "default_text": "1",
+      "help": "Raw events a grid point needs to count (else 0). 2 and 3 lost identifications.",
+      "gates": [],
+      "source_struct": "RetraceConfig"
+    },
+    {
+      "path": "retrace.repick",
+      "name": "repick",
+      "section": "retrace",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Re-choose each candidate's apex RT and 1/K0 centre on the raw events before the traces are rebuilt (docs/09 section 6c; docs/TIMS_ROADMAP_bis.md section 8). Over extract's apex and the `extract.retain_top_peaks` sidecar peaks, the peak whose best 1/K0 band agrees best with the library wins; retrace then writes `psms_extracted.repick.parquet` with `apex_rt` and `apex_im` replaced, which `run` feeds to the later stages. Needs `retain_top_peaks >= 2` and `promote_top_peaks = 1`. Default false. Benchmark-gated.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "RetraceConfig"
     }
   ],
   "list_sections": [

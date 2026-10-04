@@ -50,6 +50,15 @@
 //! [`Decoder::row`] turns every v2 row back into its v1 row: the same axis values and the
 //! same full trace, bit for bit. Every stage downstream of extract builds its in-memory
 //! store from those rows, so it writes the same bytes from either layout.
+//!
+//! **Ion mobility** (4D data, docs/TIMS_ROADMAP.md P5). A table of a run whose spectra carry
+//! a per-peak 1/K0 has one more list column: each row's per-point 1/K0, `+0.0` where the
+//! trace has no peak. In v1 it is `im`, parallel to `intensity` (schema v3); in v2 it is
+//! `im_trimmed`, cut to the run `intensity_trimmed` keeps, with the same `trace_offset` and
+//! the same length (schema v4), and [`Decoder::row_im`] rebuilds it with `+0.0` margins as
+//! it rebuilds the trace. A 3D run writes neither, so its table is the v1 or v2 table it
+//! always was. The mobility of a point outside the stored run is `+0.0` in both layouts,
+//! because extract writes `+0.0` wherever the trace is `+0.0` there.
 
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::array::{Array, ArrayRef, Float32Array, Float64Array, StringArray, UInt32Array};
@@ -70,6 +79,11 @@ pub const INTENSITY_TRIMMED: &str = "intensity_trimmed";
 pub const TRACE_OFFSET: &str = "trace_offset";
 /// The v2 column holding the length of a row's full trace (0: never observed).
 pub const TRACE_LEN: &str = "trace_len";
+/// The v1 list column holding a row's per-point 1/K0 on 4D data (schema v3).
+pub const IM: &str = "im";
+/// The v2 list column holding a row's per-point 1/K0 on 4D data, cut like
+/// `intensity_trimmed` (schema v4).
+pub const IM_TRIMMED: &str = "im_trimmed";
 
 /// Rows per parquet row group of a chromatogram table written by extract: about 64k rows of
 /// two ~60-point traces, ~30 MB uncompressed in v1, which bounds the encoder's in-progress
@@ -163,6 +177,14 @@ impl Layout {
         }
     }
 
+    /// The list column holding a row's per-point 1/K0, on a 4D table.
+    pub fn im_column(self) -> &'static str {
+        match self {
+            Layout::V1 => IM,
+            Layout::V2 => IM_TRIMMED,
+        }
+    }
+
     /// Every column that holds a row's traces, which a reader projects beside
     /// `candidate_id` and the per-fragment columns: the two list columns, then in v2 the
     /// two trace columns.
@@ -242,6 +264,8 @@ pub struct EncodedRow {
     pub intensity: Vec<f32>,
     pub trace_offset: u32,
     pub trace_len: u32,
+    /// The row's per-point 1/K0 cut like `intensity` (`im_trimmed`); empty on 3D data.
+    pub im: Vec<f32>,
 }
 
 /// Encodes a table's rows, in table order, into the v2 layout. It counts the rows it is
@@ -273,6 +297,28 @@ impl Encoder {
 
     /// Encode the next row: candidate `cid`, with its v1 axis and trace.
     pub fn encode(&mut self, cid: u32, rt: Vec<f32>, intensity: Vec<f32>) -> Result<EncodedRow> {
+        self.encode_im(cid, rt, intensity, None)
+    }
+
+    /// [`Encoder::encode`] with the row's per-point 1/K0 (4D data), which is cut to the run
+    /// the trace keeps. It must be as long as the trace.
+    pub fn encode_im(
+        &mut self,
+        cid: u32,
+        rt: Vec<f32>,
+        intensity: Vec<f32>,
+        im: Option<Vec<f32>>,
+    ) -> Result<EncodedRow> {
+        if let Some(im) = &im {
+            if im.len() != intensity.len() {
+                bail!(
+                    "chromatogram row for candidate_id {cid} has {} mobility values for {} \
+                     intensity points",
+                    im.len(),
+                    intensity.len()
+                );
+            }
+        }
         if self.row.is_multiple_of(self.row_group_rows) {
             // A new row group: nothing written before it may be referred to.
             self.open = None;
@@ -296,6 +342,7 @@ impl Encoder {
                 intensity,
                 trace_offset: 0,
                 trace_len: 0,
+                im: Vec::new(),
             });
         }
         let rt = if self.open == Some(cid) && same_bits(&self.axis, &rt) {
@@ -312,12 +359,18 @@ impl Encoder {
         } else {
             intensity[lo..hi].to_vec()
         };
+        let im = match im {
+            Some(im) if lo == 0 && hi == n => im,
+            Some(im) => im[lo..hi].to_vec(),
+            None => Vec::new(),
+        };
         Ok(EncodedRow {
             rt,
             intensity,
             // `lo < n`, which fits: `n` did.
             trace_offset: lo as u32,
             trace_len,
+            im,
         })
     }
 }
@@ -332,6 +385,8 @@ pub struct Decoder {
     axis: Vec<f32>,
     /// The last trace rebuilt with its zero margins.
     dense: Vec<f32>,
+    /// The last per-point 1/K0 rebuilt with its zero margins.
+    dense_im: Vec<f32>,
 }
 
 impl Decoder {
@@ -428,6 +483,52 @@ impl Decoder {
         Ok((rt, dense))
     }
 
+    /// [`Decoder::row`] with the row's stored per-point 1/K0 (`im_trimmed`), rebuilt to
+    /// the full trace with `+0.0` outside the stored run. The mobility list must be as long
+    /// as the stored intensities.
+    pub fn row_im<'a>(
+        &'a mut self,
+        cid: u32,
+        rt: &'a [f32],
+        intensity: &'a [f32],
+        im: &'a [f32],
+        trace_offset: u32,
+        trace_len: u32,
+    ) -> Result<(&'a [f32], &'a [f32], &'a [f32])> {
+        if im.len() != intensity.len() {
+            bail!(
+                "chromatogram row for candidate_id {cid} stores {} mobility values beside {} \
+                 intensity values",
+                im.len(),
+                intensity.len()
+            );
+        }
+        self.resolve(cid, rt, intensity, trace_offset, trace_len)?;
+        let n = trace_len as usize;
+        if n == 0 {
+            return Ok((&[], &[], &[]));
+        }
+        let Decoder {
+            axis,
+            dense,
+            dense_im,
+            ..
+        } = self;
+        let axis: &'a Vec<f32> = axis;
+        let rt: &'a [f32] = if rt.is_empty() { axis } else { rt };
+        let o = trace_offset as usize;
+        if o == 0 && intensity.len() == n {
+            return Ok((rt, intensity, im));
+        }
+        dense.clear();
+        dense.resize(n, 0.0);
+        dense[o..o + intensity.len()].copy_from_slice(intensity);
+        dense_im.clear();
+        dense_im.resize(n, 0.0);
+        dense_im[o..o + im.len()].copy_from_slice(im);
+        Ok((rt, dense, dense_im))
+    }
+
     /// Check one stored row and follow its axis, without rebuilding its trace: for a row
     /// the caller does not keep, and for the rows before a read that starts inside a
     /// candidate.
@@ -448,21 +549,36 @@ impl Decoder {
 pub struct Optional {
     pub frag_mz: bool,
     pub frag_obs_mz: bool,
+    /// The per-point 1/K0 list of a 4D table (`im` in v1, `im_trimmed` in v2).
+    pub im: bool,
 }
 
 impl Optional {
-    /// Every column: what extract writes.
+    /// Every column of a 3D table: what extract writes on 3D data.
     pub const ALL: Optional = Optional {
         frag_mz: true,
         frag_obs_mz: true,
+        im: false,
     };
 
     pub fn of(tf: &TableFile) -> Optional {
         Optional {
             frag_mz: tf.has_column("frag_mz"),
             frag_obs_mz: tf.has_column("frag_obs_mz"),
+            im: tf.has_column(IM) || tf.has_column(IM_TRIMMED),
         }
     }
+}
+
+/// The (name, version) a chromatogram table records: its layout and whether it carries
+/// per-point ion mobility ([`mumdia_core::schema::artifact::chromatograms`]).
+pub fn recorded_schema(path: &str) -> Result<(&'static str, u32)> {
+    let tf = TableFile::open(path)?;
+    let layout = Layout::of(&tf)?;
+    Ok(mumdia_core::schema::artifact::chromatograms(
+        layout.version(),
+        Optional::of(&tf).im,
+    ))
 }
 
 /// Chromatogram rows gathered into one chunk of columns, in either layout. Extract fills it
@@ -479,12 +595,16 @@ pub struct Rows {
     /// v2 only.
     pub trace_offset: Vec<u32>,
     pub trace_len: Vec<u32>,
+    /// Per-point 1/K0, one list per row, only on a 4D table (`Optional::im`).
+    pub im: Vec<Vec<f32>>,
 }
 
 impl Rows {
     /// The chunk's traces in bytes, for the writer's memory report.
     pub fn trace_bytes(&self) -> usize {
-        crate::memlog::bytes_of_nested(&self.rt) + crate::memlog::bytes_of_nested(&self.intensity)
+        crate::memlog::bytes_of_nested(&self.rt)
+            + crate::memlog::bytes_of_nested(&self.intensity)
+            + crate::memlog::bytes_of_nested(&self.im)
     }
 
     /// The columns of a table in `layout`, with the optional ones `opt` names: every table
@@ -513,6 +633,9 @@ impl Rows {
         if layout == Layout::V2 {
             cols.push(Col::U32(TRACE_OFFSET.into(), self.trace_offset));
             cols.push(Col::U32(TRACE_LEN.into(), self.trace_len));
+        }
+        if opt.im {
+            cols.push(Col::LargeListF32(layout.im_column().into(), self.im));
         }
         cols
     }
@@ -543,6 +666,8 @@ pub struct DenseRow<'a> {
     pub predicted_intensity: f32,
     pub rt: &'a [f32],
     pub intensity: &'a [f32],
+    /// Per-point 1/K0 of a 4D table, as long as `intensity`; `None` on a 3D table.
+    pub im: Option<&'a [f32]>,
 }
 
 /// Call `f` with every row of `tf`, in table order and in its v1 form, whichever layout the
@@ -559,7 +684,14 @@ pub fn for_each_row(tf: &TableFile, mut f: impl FnMut(&DenseRow) -> Result<()>) 
         cols.push("frag_obs_mz");
     }
     cols.extend_from_slice(layout.trace_columns());
-    let (rt_col, int_col) = (layout.rt_column(), layout.intensity_column());
+    if opt.im {
+        cols.push(layout.im_column());
+    }
+    let (rt_col, int_col, im_col) = (
+        layout.rt_column(),
+        layout.intensity_column(),
+        layout.im_column(),
+    );
     let mut dec = Decoder::new();
     for b in tf.batches(Some(&cols), 1 << 12)? {
         let b = b?;
@@ -604,6 +736,11 @@ pub fn for_each_row(tf: &TableFile, mut f: impl FnMut(&DenseRow) -> Result<()>) 
             .ok_or_else(|| anyhow!("chromatograms column 'predicted_intensity' is not f32"))?;
         let rt = ListF32::of(col(rt_col)?, rt_col)?;
         let int = ListF32::of(col(int_col)?, int_col)?;
+        let im = if opt.im {
+            Some(ListF32::of(col(im_col)?, im_col)?)
+        } else {
+            None
+        };
         let trace = match layout {
             Layout::V1 => None,
             Layout::V2 => Some(TraceCols::of(&b)?),
@@ -612,9 +749,20 @@ pub fn for_each_row(tf: &TableFile, mut f: impl FnMut(&DenseRow) -> Result<()>) 
             let c = cid.value(k);
             let rt_k = rt.row_slice(k, rt_col)?;
             let int_k = int.row_slice(k, int_col)?;
-            let (rt_k, int_k) = match &trace {
-                None => (rt_k, int_k),
-                Some(t) => dec.row(c, rt_k, int_k, t.offset(k), t.len(k))?,
+            let im_k = match &im {
+                Some(a) => Some(a.row_slice(k, im_col)?),
+                None => None,
+            };
+            let (rt_k, int_k, im_k) = match (&trace, im_k) {
+                (None, im_k) => (rt_k, int_k, im_k),
+                (Some(t), None) => {
+                    let (r, i) = dec.row(c, rt_k, int_k, t.offset(k), t.len(k))?;
+                    (r, i, None)
+                }
+                (Some(t), Some(m)) => {
+                    let (r, i, m) = dec.row_im(c, rt_k, int_k, m, t.offset(k), t.len(k))?;
+                    (r, i, Some(m))
+                }
             };
             f(&DenseRow {
                 cid: c,
@@ -624,6 +772,7 @@ pub fn for_each_row(tf: &TableFile, mut f: impl FnMut(&DenseRow) -> Result<()>) 
                 predicted_intensity: pint.value(k),
                 rt: rt_k,
                 intensity: int_k,
+                im: im_k,
             })?;
         }
     }
@@ -671,13 +820,20 @@ fn rewrite_into(
             Layout::V1 => {
                 rows.rt.push(r.rt.to_vec());
                 rows.intensity.push(r.intensity.to_vec());
+                if opt.im {
+                    rows.im.push(r.im.unwrap_or(&[]).to_vec());
+                }
             }
             Layout::V2 => {
-                let e = enc.encode(r.cid, r.rt.to_vec(), r.intensity.to_vec())?;
+                let im = opt.im.then(|| r.im.unwrap_or(&[]).to_vec());
+                let e = enc.encode_im(r.cid, r.rt.to_vec(), r.intensity.to_vec(), im)?;
                 rows.rt.push(e.rt);
                 rows.intensity.push(e.intensity);
                 rows.trace_offset.push(e.trace_offset);
                 rows.trace_len.push(e.trace_len);
+                if opt.im {
+                    rows.im.push(e.im);
+                }
             }
         }
         if rows.cid.len() >= chunk {
@@ -1175,6 +1331,7 @@ mod tests {
                 out_peak_bounds: None,
                 cfg: &mumdia_core::config::QuantConfig::default(),
                 config_hash: "test",
+                cross_run: None,
             })
             .unwrap();
             println!(

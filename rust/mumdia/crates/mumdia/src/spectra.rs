@@ -42,6 +42,11 @@ pub struct Ms1Scan {
     /// `Vec<f64>` copy held, at two-thirds of the footprint.
     pub mz: Vec<f32>,
     pub intensity: Vec<f32>,
+    /// Per-peak 1/K0 (V s cm^-2), parallel to `mz`. Empty for a 3D run.
+    pub im: Vec<f32>,
+    /// Per-peak mobility width (1/K0), parallel to `mz`. Empty without spectra v3
+    /// `im_width`.
+    pub im_width: Vec<f32>,
 }
 
 /// The named peak-list column of one batch as a borrowed view ([`ListF32`]), whichever
@@ -75,6 +80,31 @@ fn list_col<'a>(b: &'a RecordBatch, name: &str) -> Result<ListF32<'a>> {
     ListF32::of(col, name)
 }
 
+/// Row `k` of an optional per-peak list column (`im`, `im_width`), truncated to `n`
+/// peaks; empty when the column is absent or the row is null. A non-null row with fewer
+/// values than peaks is an error.
+fn opt_peak_list(
+    a: &Option<ListF32>,
+    k: usize,
+    n: usize,
+    name: &str,
+    scan: u32,
+) -> Result<Vec<f32>> {
+    match a {
+        Some(a) if !a.is_null(k) => {
+            let v = a.row_slice(k, name)?;
+            if v.len() < n {
+                return Err(anyhow!(
+                    "scan {scan}: '{name}' has {} values for {n} peaks",
+                    v.len()
+                ));
+            }
+            Ok(v[..n].to_vec())
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 /// Load MS2 scans (spectra_ms2.parquet) into memory, RT-sorted.
 ///
 /// Decoded in parallel: the table is cut into row-contiguous parts
@@ -102,6 +132,18 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
         "ms2 scans",
         &[
             ("peaks", peak_bytes),
+            (
+                "peak_im",
+                out.iter()
+                    .map(|s| std::mem::size_of_val(s.im.as_slice()))
+                    .sum(),
+            ),
+            (
+                "peak_im_width",
+                out.iter()
+                    .map(|s| std::mem::size_of_val(s.im_width.as_slice()))
+                    .sum(),
+            ),
             ("scan_spine", std::mem::size_of_val(out.as_slice())),
         ],
     );
@@ -126,6 +168,26 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
     let wlo = t.f64("window_lower")?;
     let whi = t.f64("window_upper")?;
     let wtarget = t.f64("window_target")?;
+    // Ion mobility (schema v2). Absent in a v1 artifact and null for a 3D source, which
+    // both read as "no mobility".
+    let opt_im = |name: &str| -> Result<Vec<Option<f32>>> {
+        if t.has_column(name) {
+            t.opt_f32(name)
+        } else {
+            Ok(vec![None; t.nrows])
+        }
+    };
+    let wim_lo = opt_im("window_im_lower")?;
+    let wim_hi = opt_im("window_im_upper")?;
+    let has_im = t.has_column("im");
+    let has_width = t.has_column("im_width");
+    let mut peak_cols = vec!["mz", "intensity"];
+    if has_im {
+        peak_cols.push("im");
+    }
+    if has_width {
+        peak_cols.push("im_width");
+    }
     // The "id" column is NOT read. It stays in the artifact, where an external consumer can
     // find the mzML native id of any scan by `scan_index`, but decoding it here built one
     // String per scan (~72 B of header plus payload each, ~17 MB and 233 k allocations on
@@ -139,9 +201,19 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
     // getters used, so it stays aligned.
     let mut out = Vec::with_capacity(t.nrows);
     let mut i = 0usize;
-    t.for_each_batch(Some(&["mz", "intensity"]), SCAN_BATCH_ROWS, |b| {
+    t.for_each_batch(Some(&peak_cols), SCAN_BATCH_ROWS, |b| {
         let mza = list_col(b, "mz")?;
         let ina = list_col(b, "intensity")?;
+        let ima = if has_im {
+            Some(list_col(b, "im")?)
+        } else {
+            None
+        };
+        let iwa = if has_width {
+            Some(list_col(b, "im_width")?)
+        } else {
+            None
+        };
         for k in 0..mza.len() {
             // A null list is an empty slice, so a scan with either list null is empty.
             let (mf, iff) = (mza.row_slice(k, "mz")?, ina.row_slice(k, "intensity")?);
@@ -151,6 +223,8 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
                 .zip(&iff[..n])
                 .map(|(&mz, &intensity)| Peak { mz, intensity })
                 .collect();
+            let im = opt_peak_list(&ima, k, peaks.len(), "im", scan_index[i])?;
+            let im_width = opt_peak_list(&iwa, k, peaks.len(), "im_width", scan_index[i])?;
             out.push(Ms2Scan {
                 scan_index: scan_index[i],
                 rt_seconds: rt[i],
@@ -158,10 +232,12 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
                     target_mz: wtarget[i],
                     lower_mz: wlo[i],
                     upper_mz: whi[i],
-                    im_lower: None,
-                    im_upper: None,
+                    im_lower: wim_lo[i],
+                    im_upper: wim_hi[i],
                 },
                 peaks,
+                im,
+                im_width,
             });
             i += 1;
         }
@@ -190,11 +266,22 @@ pub fn load_ms1(path: &str) -> Result<Vec<Ms1Scan>> {
         .iter()
         .map(|s| std::mem::size_of_val(s.intensity.as_slice()))
         .sum();
+    let im_bytes: usize = out
+        .iter()
+        .map(|s| std::mem::size_of_val(s.im.as_slice()))
+        .sum();
     crate::memlog::report(
         "ms1 scans",
         &[
             ("mz", mz_bytes),
             ("intensity", int_bytes),
+            ("im", im_bytes),
+            (
+                "im_width",
+                out.iter()
+                    .map(|s| std::mem::size_of_val(s.im_width.as_slice()))
+                    .sum(),
+            ),
             ("scan_spine", std::mem::size_of_val(out.as_slice())),
         ],
     );
@@ -215,11 +302,31 @@ fn decode_ms1(t: &TableFile) -> Result<Vec<Ms1Scan>> {
     let rt = t.f64("rt_seconds")?;
     // mz and intensity are copied straight out of each row's slice of the batch's values
     // (no widening, no intermediate Vec<Vec<f32>>).
+    // Ion mobility (spectra v2 `im`, v3 `im_width`): absent for a 3D source.
+    let has_im = t.has_column("im");
+    let has_width = t.has_column("im_width");
+    let mut peak_cols = vec!["mz", "intensity"];
+    if has_im {
+        peak_cols.push("im");
+    }
+    if has_width {
+        peak_cols.push("im_width");
+    }
     let mut out = Vec::with_capacity(t.nrows);
     let mut i = 0usize;
-    t.for_each_batch(Some(&["mz", "intensity"]), SCAN_BATCH_ROWS, |b| {
+    t.for_each_batch(Some(&peak_cols), SCAN_BATCH_ROWS, |b| {
         let mza = list_col(b, "mz")?;
         let ina = list_col(b, "intensity")?;
+        let ima = if has_im {
+            Some(list_col(b, "im")?)
+        } else {
+            None
+        };
+        let iwa = if has_width {
+            Some(list_col(b, "im_width")?)
+        } else {
+            None
+        };
         for k in 0..mza.len() {
             // Truncate to the shorter list, as `load_ms2` does. The two list columns are
             // decoded independently and either can be null, so a spectra artifact whose
@@ -233,11 +340,15 @@ fn decode_ms1(t: &TableFile) -> Result<Vec<Ms1Scan>> {
             // per column that are freed immediately.
             let (mf, iff) = (mza.row_slice(k, "mz")?, ina.row_slice(k, "intensity")?);
             let n = mf.len().min(iff.len());
+            let im = opt_peak_list(&ima, k, n, "im", scan_index[i])?;
+            let im_width = opt_peak_list(&iwa, k, n, "im_width", scan_index[i])?;
             out.push(Ms1Scan {
                 scan_index: scan_index[i],
                 rt_seconds: rt[i],
                 mz: mf[..n].to_vec(),
                 intensity: iff[..n].to_vec(),
+                im,
+                im_width,
             });
             i += 1;
         }
@@ -338,6 +449,9 @@ mod serial {
                         im_upper: None,
                     },
                     peaks,
+                    // The reference decoder reads the 3D columns only.
+                    im: Vec::new(),
+                    im_width: Vec::new(),
                 });
                 i += 1;
             }
@@ -370,6 +484,8 @@ mod serial {
                     rt_seconds: rt[i],
                     mz: mf.map(|m| m.values()[..n].to_vec()).unwrap_or_default(),
                     intensity: iff.map(|x| x.values()[..n].to_vec()).unwrap_or_default(),
+                    im: Vec::new(),
+                    im_width: Vec::new(),
                 });
                 i += 1;
             }
@@ -593,6 +709,32 @@ mod tests {
         assert_eq!(scans[0].intensity, vec![3.0], "truncated to the m/z count");
         assert_eq!(scans[1].mz, vec![100.0, 200.0]);
         assert_eq!(scans[1].intensity, vec![1.0, 2.0]);
+    }
+
+    /// spectra v3: `im_width` loads parallel to the peaks; an artifact without it loads
+    /// with no widths.
+    #[test]
+    fn im_width_loads_parallel_to_the_peaks_when_present() {
+        let dir = std::env::temp_dir().join(format!("mumdia_imw_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ms1.parquet").to_str().unwrap().to_string();
+        let base = || {
+            vec![
+                Col::U32("scan_index".into(), vec![0]),
+                Col::F64("rt_seconds".into(), vec![1.0]),
+                Col::ListF32("mz".into(), vec![vec![100.0, 200.0]]),
+                Col::ListF32("intensity".into(), vec![vec![1.0, 2.0]]),
+                Col::ListF32("im".into(), vec![vec![0.9, 1.0]]),
+            ]
+        };
+        let mut cols = base();
+        cols.push(Col::ListF32("im_width".into(), vec![vec![0.01, 0.02]]));
+        write_table(&path, cols).unwrap();
+        assert_eq!(load_ms1(&path).unwrap()[0].im_width, vec![0.01, 0.02]);
+        write_table(&path, base()).unwrap();
+        let s = load_ms1(&path).unwrap();
+        assert!(s[0].im_width.is_empty());
+        assert_eq!(s[0].im, vec![0.9, 1.0]);
     }
 
     /// The MS2 loader hands each peak m/z on at the artifact's own f32 width, and a

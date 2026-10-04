@@ -47,6 +47,7 @@ Commands:
   extract         Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
   features        Compute the minimal feature set -> features.parquet + PIN
   pool            Pool a grouped run's band artifacts into the run-level tables
+  retrace         Rebuild extract's chromatogram traces from the raw diaPASEF events (`retrace` config section) -> a chromatograms.parquet with the same rows and schema
   compete         Keep the best candidate per competition group -> psms_competed.parquet
   rescore         Rescore + native target-decoy q-values -> psms_scored.parquet
   quant           Quantify identified peptides + roll up to protein groups
@@ -142,6 +143,7 @@ first sentence of the description, with the full text in the section below.
 | [`extract`](#extract) | yes | Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms |
 | [`features`](#features) | yes | Compute the minimal feature set -> features.parquet + PIN |
 | [`pool`](#pool) | no | Pool a grouped run's band artifacts into the run-level tables |
+| [`retrace`](#retrace) | yes | Rebuild extract's chromatogram traces from the raw diaPASEF events (`retrace` config section) -> a chromatograms.parquet with the same rows and schema |
 | [`compete`](#compete) | yes | Keep the best candidate per competition group -> psms_competed.parquet |
 | [`rescore`](#rescore) | yes | Rescore + native target-decoy q-values -> psms_scored.parquet |
 | [`quant`](#quant) | yes | Quantify identified peptides + roll up to protein groups |
@@ -158,8 +160,8 @@ first sentence of the description, with the full text in the section below.
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-21 of the 25 documented subcommands accept `--config`:
- `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
+22 of the 26 documented subcommands accept `--config`:
+ `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 4 do not, so every setting they use comes from their own flags:
  `audit`, `inspect`, `pool`, `quant-lfq`.
@@ -434,6 +436,39 @@ Options:
 
 Plus the 5 repeated flags removed above: see "Global flags".
 
+## retrace
+
+```text
+Rebuild extract's chromatogram traces from the raw diaPASEF events (`retrace` config section) -> a chromatograms.parquet with the same rows and schema
+
+Usage: mumdia retrace [OPTIONS] --chromatograms <CHROMATOGRAMS> --psms-extracted <PSMS_EXTRACTED> --run-windows <RUN_WINDOWS> --lib-precursors <LIB_PRECURSORS> --out <OUT>
+
+Options:
+      --raw <RAW>
+          The `.d`. Default: the one `--spectra-ms2` was converted from
+
+      --spectra-ms2 <SPECTRA_MS2>
+
+      --chromatograms <CHROMATOGRAMS>
+
+      --psms-extracted <PSMS_EXTRACTED>
+
+      --run-windows <RUN_WINDOWS>
+
+      --lib-precursors <LIB_PRECURSORS>
+
+      --mass-cal <MASS_CAL>
+
+      --out <OUT>
+
+      --out-psms <OUT_PSMS>
+          `retrace.repick`: where the re-picked psms_extracted is written
+
+      --config <CONFIG>
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
+
 ## compete
 
 ```text
@@ -497,6 +532,9 @@ Options:
 
       --out-peak-bounds <OUT_PEAK_BOUNDS>
           Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt, width_s)
+
+      --weights-from <WEIGHTS_FROM>...
+          Cross-run quant (`quant.cross_run_weights` / `quant.cross_run_background`, second pass): the first-pass `--out-fragment` tables of every run of the experiment
 
       --config <CONFIG>
 ```

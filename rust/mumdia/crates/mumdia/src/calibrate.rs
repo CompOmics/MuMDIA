@@ -27,6 +27,41 @@ pub fn linear_fit(xs: &[f64], ys: &[f64]) -> (f64, f64) {
     (slope, intercept)
 }
 
+/// Anchors to keep under `rt_im_train.robust_calibration`: a first LOESS is fitted on
+/// the anchors whose x lies inside the central 99% of x, and an anchor is dropped when
+/// its residual against that fit lies more than 6 robust SDs (1.4826 x MAD) from the
+/// median residual. The first fit leaves out the x extremes because a LOESS local fit at
+/// an isolated extreme x passes through that point, so its own residual would look
+/// small; and a few extreme x also stretch the 200-point grid until the whole gradient
+/// sits in one or two cells (measured: a 51 s offset on a 58k-anchor run with 11 anchors
+/// at |iRT| up to 3.7e5 s). A zero MAD keeps every anchor.
+pub fn robust_inliers(xs: &[f64], ys: &[f64], span: f64, grid_n: usize) -> Vec<bool> {
+    let n = xs.len();
+    if n < 4 {
+        return vec![true; n];
+    }
+    let (lo, hi) = (percentile(xs, 0.005), percentile(xs, 0.995));
+    let (cx, cy): (Vec<f64>, Vec<f64>) = xs
+        .iter()
+        .zip(ys)
+        .filter(|(x, _)| (lo..=hi).contains(*x))
+        .map(|(x, y)| (*x, *y))
+        .unzip();
+    let first = Loess::fit(&cx, &cy, span, grid_n);
+    let r: Vec<f64> = xs
+        .iter()
+        .zip(ys)
+        .map(|(x, y)| y - first.predict(*x))
+        .collect();
+    let med = percentile(&r, 0.5);
+    let dev: Vec<f64> = r.iter().map(|v| (v - med).abs()).collect();
+    let cut = 6.0 * 1.4826 * percentile(&dev, 0.5);
+    if cut <= 0.0 {
+        return vec![true; n];
+    }
+    dev.iter().map(|d| *d <= cut).collect()
+}
+
 /// A LOESS smoother evaluated on a precomputed grid for fast bulk application.
 ///
 /// Outside the training range the smoother continues the local fit at the nearest
@@ -260,6 +295,43 @@ pub fn percentile(values: &[f64], p: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn robust_inliers_drop_extreme_x_anchors_that_break_the_grid() {
+        // 2000 anchors on a curved 2000-3500 s gradient (a straight line survives any
+        // grid), plus 3 anchors whose predicted iRT is absurd, as in the HYE refit.
+        let f = |x: f64| 2000.0 + (x - 2000.0).powi(2) / 1500.0;
+        let mut xs: Vec<f64> = (0..2000).map(|i| 2000.0 + 0.75 * i as f64).collect();
+        let mut ys: Vec<f64> = xs
+            .iter()
+            .enumerate()
+            .map(|(i, x)| f(*x) + ((i * 7919) % 11) as f64 - 5.0)
+            .collect();
+        xs.extend([-170_000.0, 375_000.0, 90_000.0]);
+        ys.extend([2500.0, 3400.0, 3000.0]);
+        // The plain fit is distorted inside the gradient by the grid stretch.
+        let plain = Loess::fit(&xs, &ys, 0.3, 200);
+        assert!((plain.predict(2750.0) - f(2750.0)).abs() > 20.0);
+        let keep = robust_inliers(&xs, &ys, 0.3, 200);
+        assert_eq!(keep.iter().filter(|k| !**k).count(), 3);
+        assert!(keep[..2000].iter().all(|k| *k));
+        let (kx, ky): (Vec<f64>, Vec<f64>) = xs
+            .iter()
+            .zip(&ys)
+            .zip(&keep)
+            .filter(|(_, k)| **k)
+            .map(|((x, y), _)| (*x, *y))
+            .unzip();
+        let robust = Loess::fit(&kx, &ky, 0.3, 200);
+        // The robust fit is the fit on the clean anchors, and much closer than the plain one.
+        let clean = Loess::fit(&xs[..2000], &ys[..2000], 0.3, 200);
+        assert_eq!(robust.predict(2750.0), clean.predict(2750.0));
+        assert!((robust.predict(2750.0) - f(2750.0)).abs() < 15.0);
+        // Clean data keeps every anchor.
+        assert!(robust_inliers(&xs[..2000], &ys[..2000], 0.3, 200)
+            .iter()
+            .all(|k| *k));
+    }
 
     #[test]
     fn linear_recovers_line() {

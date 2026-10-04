@@ -36,6 +36,7 @@ stages that operate across multiple runs.
 | `rust/mumdia/crates/mumdia-core/src/rejection.rs` | `RejectionReason` enum + ladder ordering |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `QuantConfig`, `MbrConfig`, `RtImTrainConfig`, and the strategy enums |
 | `scripts/mbr_worker.py` | MBR transfer sidecar (rescuable + re-extraction tiers) |
+| `scripts/mbr_reextract.py` | `mbr.reextract`: targets for retrace at the expected apex, RT-shift null, transfer q |
 | `rust/mumdia/crates/mumdia/src/main.rs` | CLI definitions + handlers for all six subcommands |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | `run_mbr` (builds argv for `mbr_worker.py`) |
 
@@ -344,6 +345,47 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    all-zero/non-finite areas, or `top_n_fragments=0` produce a null quantity plus
    an explicit `quant_status`; they are not converted to biological zero.
 
+   **Cross-run fragment weights** (`cross_run_weights`, `cross_run.weights` in
+   `QuantParams`). When weights are passed, a candidate's quantity is instead
+   `sum(weight * area)` over its fragments with a positive area (`weighted_quantity`),
+   and the top-N rule above applies only where that sum is not positive in this run.
+   The weights come from `fit_cross_run` over the first-pass `fragment_quant`
+   tables of every run: per (candidate, fragment), `dev` is the median over runs of the
+   absolute deviation of ln(area / candidate total) from its cross-run median, `corr`
+   the median `apex_corr`, and the weight `max(corr, 0) / (dev + 0.1)`; a candidate whose
+   weights are all zero gets 1 on every fragment. `apex_corr` is the population Pearson
+   correlation of the fragment's fixed-window samples (after the baseline, before the
+   envelope) with the sum of the candidate's other fragments, so it needs a fixed
+   window. `run-experiment` runs quant twice per run when the key is on; standalone,
+   pass the pass-1 `--out-fragment` tables to `quant --weights-from`. The MS1 traces are
+   not channels. Measured on HYE diaPASEF only (docs/TIMS_QUANT_ROADMAP.md section 4c).
+
+   **Cross-run background** (`cross_run_background`, `cross_run.background`). In the
+   same two-pass step, pass 1 also exports each fragment's `flank_mean` (the mean of the
+   `baseline_flank_scans` raw samples either side of the fixed window), and with this key
+   zero-area fragments as well. `fit_cross_run` averages it over all runs per (candidate,
+   fragment), and pass 2 subtracts that one level from every window sample, clipped at
+   zero, instead of the per-run `baseline_subtract` quantile. On raw diaPASEF traces the
+   floor is sparse counts (half the flank samples are 0), which a quantile underestimates
+   and a single run's mean estimates noisily (docs/TIMS_QUANT_ROADMAP.md section 4f).
+
+   **Cross-run width** (`cross_run_width`, `cross_run.halfwidth`). When > 0, pass 1 also
+   exports, per fragment, the flank mean beyond each halfwidth 3 to 7 scans
+   (`flank_mean_h3`..`flank_mean_h7`) and, per candidate, `peak_hwhm`: the half width at half
+   maximum, in scans, of the summed fragment trace around the apex with each fragment's flank
+   mean subtracted (`peak_hwhm`). `fit_cross_run` takes the HWHM of the candidate's brightest
+   run (largest summed pass-1 area) and sets `h = clamp(round(cross_run_width * HWHM), 3, 7)`;
+   the cross-run background then pools `flank_mean_h<h>`, and pass 2 integrates `2h+1` scans
+   in every run. The weights stay fitted on the pass-1 areas. Needs the scan form of the fixed
+   window. Measured on HYE diaPASEF only (docs/TIMS_QUANT_ROADMAP.md section 4h).
+
+   **diaPASEF preset.** `apply_diapasef_quant` replaces a `quant` block left at its
+   defaults with `QuantConfig::diapasef()` (predicted selection, envelope,
+   `fixed_scan_halfwidth: 4`, `baseline_subtract` at quantile 0.6, cross-run weights and
+   background, `cross_run_width: 2.5`)
+   when every `run` / `run-experiment` input is a timsTOF `.d`, and logs it. Any
+   explicitly set quant key keeps the block as written.
+
    `passes_quant_filter` also admits a row flagged `is_transferred` by
    `mbr_worker.py`, whatever `q_filter` selects: MBR lowers only the PSM-level q
    columns, so a transfer would otherwise fail the default `peptide_q` filter and
@@ -359,7 +401,9 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    then sums the top `top_n_peptides` unique base peptides under `TopNSum`; `Sum` uses
    all unique bases. A group with no quantifiable base peptide has null quantity
    and `quant_status=no_quantifiable_peptide`.
-8. Optional fragment export (`quant.rs:531`) and peak-bounds diagnostic
+8. Optional fragment export (`fragment_quant` v4: positive areas, plus zero areas under
+   `cross_run_background`; `apex_corr` and `flank_mean`, NaN outside a fixed window; in the
+   first pass under `cross_run_width` also `flank_mean_h3`..`flank_mean_h7` and `peak_hwhm`) and peak-bounds diagnostic
    (`quant.rs:419`). `ArtifactReport` records params + stats for each table
    (`quant.rs:603`).
 
@@ -491,6 +535,39 @@ The worker (`scripts/mbr_worker.py`) implements two tiers:
   predicted-RT window plus a permuted-RT decoy target file (`transfer_decoys_<i>.parquet`),
   to feed `extract --restrict-candidates --run-windows`. This tier is fully implemented
   in the worker but has no Rust CLI plumbing, so it is unreachable from `mumdia mbr`.
+  The wired re-extraction tier is a different one (`mbr.reextract`, below).
+
+### mbr.reextract (run-experiment, diaPASEF)
+
+`mbr.reextract` (default false; needs `mbr.strategy != none`, `retrace.enabled`, and one of
+the cross-run quant keys, which the diaPASEF quant preset sets) adds a transfer tier in
+`run_experiment::reextract`. It runs first, on the MBR-off `scored_combined`, and the
+rescuable tier (`mbr.rescuable`, default true) then adds its transfers for the rows it did not
+accept; `mbr.rescuable: false` is re-extraction only. Measured in docs/TIMS_QUANT_ROADMAP.md
+sections 4j to 4l; benchmark-gated.
+
+- Population: target, confident (`q <= q_anchor`) in `>= min_anchor_runs` OTHER runs, not
+  confident in this run, extracted here, including the rows the rescuable tier would take:
+  their re-extracted values quantify better than the rescuable tier's.
+- `mbr_reextract.py prep`: per run, `targets.parquet` (expected RT as in `mbr_worker.py`;
+  expected 1/K0 = median of the anchor runs' `apex_im`, moved onto this run's scale by a
+  per-run median offset), a four-column `psms.parquet` (`candidate_id`, `peak_rank` 0,
+  `apex_rt`, `apex_im` = the expected values) and the targets' centroid traces.
+- Retrace (repick off) rebuilds those traces at the expected apex. Every input comes from
+  the run's own retrace report, which records them since 2026-10-02 (`psms_extracted`,
+  `psms_out`, `run_windows`, `library_precursors`, `mass_cal`, `frag_tol_fallback_ppm`).
+- `mbr_reextract.py score`: evidence at the expected RT (sqrt-area cosine against the anchor
+  runs' pass-1 fragment shares, +-4 scans; median fragment co-elution, +-6 scans; log10
+  area), the same three values at 10 random positions >= 15 s away in the same traces (the
+  null), a logistic score of target against null cross-fitted in 2 folds by candidate, and
+  q = `(null >= s + 1) / 10 / (targets >= s)`, running minimum. It prints the accepted rows
+  and the null draws at or above the threshold. Accepted rows get `apex_rt` = the expected
+  RT, the PSM q columns lowered to the transfer q, `is_transferred` and `transfer_q`, in
+  `scored_mbr_reextract.parquet`; `r<i>/accepted.parquet` lists them.
+- Quant: each run reads every transfer with re-extracted traces (accepted, or a rescuable
+  transfer it did not accept, which keeps its own apex) from `mbr_reextract/r<i>/chromatograms.parquet`
+  and every other candidate from its own traces (two `ChromTable`s with `drop` lists); pass 1
+  runs again so the cross-run fit sees the transfers.
 
 The M5 augmented scored output (`--out-scored`, `mbr_worker.py:272`) requires the
 scored table to have a `source` column and matches transfers on `(candidate_id,

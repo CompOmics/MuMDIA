@@ -78,6 +78,7 @@ DeepLC.
 | `label` | str |
 | `protein` | str |
 | `n_fragments` | i32 (kept fragment count after top-N) |
+| `predicted_im` | f64, nullable (schema v2): predicted 1/K0 in V s cm^-2 from IM2Deep (`predict_frag.im_predictor = "im2deep"`) or from an imported library's `IM`/`IonMobility`; null otherwise. v1 libraries lack the column and still load, because every reader selects columns by name |
 
 **fragment_library_fragments** (schema `("fragment_library_fragments", 1)`,
 `schema.rs:14`), written at `predict_frag.rs:254-266`:
@@ -179,7 +180,19 @@ precursor charge 2) 78.6% of the kept fragments were charge-2 heuristics tied at
 1.0, and the seed search found 0 confident PSMs at 1% on a real run, 41.6% decoys
 among the top 1,000 seed scores. `HCDch2` with 12 fragments gave 19,308 confident
 seeds on the same run (DIA-NN library: 21,856; `HCD2021`, 12 fragments, charge-2
-only from charge 3: 14,412). A candidate MS2PIP returns nothing for (absent from
+only from charge 3: 14,412).
+
+**diaPASEF: `timsTOF2024` with charge-1 fragments only** (TIMS roadmap, "P6 result").
+MS2PIP's `timsTOF2024` is a single-charge model, so under the default
+`charge2_from_precursor_charge` 2 it would land in the second regime above. Set
+`charge2_from_precursor_charge: 99` with it: no charge-2 fragment is requested, the
+heuristic path is never reached, and every kept fragment is a prediction. That is also
+what DIA-NN's library holds on the benchmark diaPASEF run (charge-1 fragments only, for z2
+to z4). Measured there (3 `nn_torch` seeds, 12 fragments): +2.7% peptides against `HCDch2`
+with charge-2 fragments, while `HCDch2` with charge-1 fragments only lost 8.0% (seed 0).
+It is a setting for timsTOF configs; the engine default stays `HCDch2`.
+
+A candidate MS2PIP returns nothing for (absent from
 the map, or an empty per-candidate map) is dropped with its pair, exactly like a
 DeepLC miss, rather than receiving the native heuristic under an MS2PIP model identity
 (docs/29 #17); a fragment at `0.0` can still be dropped by top-N. MS2PIP requires `ms2pip_python` and errors
@@ -651,14 +664,14 @@ m/z (`Library::local_frag_index`, `index.rs:325`).
 | `deconvolve` | `index.rs:1665` | z-charged peak m/z -> neutral m/z, in f64 |
 | `colread::for_each_zipped` / `first_err` | `colread.rs:27` / `:83` | one reader per column, the next batch of every column decoded while the caller processes the current one (`rayon::join` only); the first error of a parallel collect in part order, which is the first bad row in file order |
 | `LogBins` / `LogBins::bin` | `binning.rs:11` / `binning.rs:49` | log-space bin geometry and mapping |
-| `FragIndex::build` / `build_mz_only` / `has_payload` | `fragindex.rs:78` / `:99` / `:105` | CSR build at a fixed tolerance, in parallel and bit-identical to the serial counting sort; derives the m/z range from the library. `build_mz_only` omits the intensity and ordinal postings, and `has_payload` says which kind an index is |
+| `FragIndex::build` / `build_mz_only` / `build_mz_only_with_ordinals` / `has_payload` / `has_ordinals` | `fragindex.rs` | CSR build at a fixed tolerance, in parallel and bit-identical to the serial counting sort; derives the m/z range from the library. `build_mz_only` omits the intensity and ordinal postings, `build_mz_only_with_ordinals` keeps the ordinals only (the seed under `unique_fragment_matches`), and `has_payload` / `has_ordinals` say which kind an index is |
 | `FragIndex::probe_peak` / `probe_peak_cand` | `fragindex.rs:396` / `:425` | +/-1 bin probe + `within_ppm` verify, candidate-window narrowed; `probe_peak` calls back `(cid, mz, int, frag)` and needs the payload, `probe_peak_cand` calls back `(cid)` in the same order and serves an m/z-only index |
 | `FragIndex::probe_peak_win` / `window_narrow` / `WindowNarrow` | `fragindex.rs:470` / `:579` / `:612` | same probe with the per-window bin-narrowing cache amortized |
 | `LocalIndex` / `BinnedProbe` / `NarrowedProbe` / `FragIndex::geometry` | `fragindex.rs` | task-local compact index over one candidate sub-range, whole-library geometry; the probe trait both it and the narrowed global index implement |
 | `FragIndex::probe_peak_win_binned` / `bin_of` | `fragindex.rs:489` / `:461` | same probe again with the bin handed in, for a caller that computes the per-peak setup in a pass of its own; `bin_of` is the bin it expects |
 | `FragIndex::candidate_range` / `n_cand` / `tol_ppm` | `fragindex.rs:381` / `:369` / `:373` | index-side isolation-window narrowing + accessors |
 | `SeedScratch` / `SeedScratch::with_min_count` | `fragindex.rs:632` / `:667` | epoch-stamped, window-relative `(count, obs_sum)` accumulator, one 16-byte slot per candidate; `with_min_count` sets the count at which a candidate enters `qualified` |
-| `SeedScratch::accumulate` / `touched` / `qualified` | `fragindex.rs:691` / `:733` / `:741` | accumulate one scan; the touched candidates in first-touch order; those that reached the minimum count, in the order they reached it |
+| `SeedScratch::accumulate` / `accumulate_gated` / `touched` / `qualified` | `fragindex.rs` | accumulate one scan (`accumulate_gated` under the seed's ion-mobility gate, `ImGateView`; under `SeedScratch::unique` either counts each (candidate, fragment) once, through `probe_peak_cand_frag`); the touched candidates in first-touch order; those that reached the minimum count, in the order they reached it |
 | `score_scan_count_dot` (fragindex / naive) | `fragindex.rs:764` / `naive.rs:16` | equivalence-gate scorers, `dot = predicted*observed`, under an identical predicate |
 | `within_ppm` / `ppm_bounds` | `constants.rs:130` / `constants.rs:109` | min-relative vs query-relative tolerance predicates |
 
@@ -674,7 +687,7 @@ so the struct holds exactly these fields and unknown keys are rejected):
 | `charge2_from_precursor_charge` | `2` | precursor charge at/above which charge-2 fragments are added (was 3; lowered to keep the ~16% of charge-2 precursors' doubly-charged transitions) |
 | `charge_by_basic_residues` | `false` | composition cap: keep a fragment at charge z only if `z <= 1 + (#R+#H+#K in that fragment)` and `z <= precursor charge`. Supersedes `charge2_from_precursor_charge`. Benchmark-gated, it changes the scored transition set. Pairs with `peptidoforms.charge_by_basic_residues` (`config.rs:318`) |
 | `top_n_fragments` | `6` | fragments kept per candidate after intensity ranking; the FASTA + sidecar configurations set 12, the count the DIA-NN library ships and the one the HCDch2 measurement used |
-| `ms2pip_model` | `"HCDch2"` | MS2PIP model name passed as argv; `*ch2` models predict the doubly charged series too |
+| `ms2pip_model` | `"HCDch2"` | MS2PIP model name passed as argv; `*ch2` models predict the doubly charged series too. diaPASEF: `timsTOF2024` with `charge2_from_precursor_charge: 99` (see above) |
 | `ms2pip_python` | `None` | interpreter for the MS2PIP sidecar; required when `predictor=ms2pip`, else the stage errors |
 | `deeplc_python` | `None` | interpreter for the DeepLC sidecar; required when `rt_predictor=deeplc`, else the stage errors |
 | `sidecar_script_dir` | `"scripts"` | directory searched by `resolve_script` for the worker scripts |
@@ -705,7 +718,7 @@ directory), the run stays in FASTA mode and reuses the library by itself
 root (`cache::library_dir`; docs/14, "The engine's caches"). The key is a hash of the
 FASTA's content, the `digest`, `peptidoforms` and `predict_frag` sections (all but the
 cache directory), `rng_seed`, whether the iRT is a deferred placeholder, the installed
-MS2PIP, AlphaPeptDeep and DeepLC versions the build uses, the content of the worker
+MS2PIP, AlphaPeptDeep, DeepLC and IM2Deep versions the build uses, the content of the worker
 scripts it runs and the content of the running executable. An entry is a directory
 `<key>` holding byte copies of the two tables and their `.report.json` files, and an
 `entry.json` with the key material and every file's size and blake3. It is written to a

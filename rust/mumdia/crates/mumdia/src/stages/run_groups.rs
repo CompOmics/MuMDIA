@@ -197,7 +197,12 @@ fn scan_fingerprint(ms2: &[Ms2Scan], ms1: &[Ms1Scan]) -> u64 {
         h = mix(h, s.rt_seconds.to_bits());
         h = mix(h, s.window.lower_mz.to_bits());
         h = mix(h, s.window.upper_mz.to_bits());
+        h = mix(h, s.window.key().2 as u64);
+        h = mix(h, s.window.key().3 as u64);
         h = mix(h, s.peaks.len() as u64);
+        for v in &s.im {
+            h = mix(h, v.to_bits() as u64);
+        }
         for p in &s.peaks {
             h = mix(h, p.mz.to_bits() as u64);
             h = mix(h, p.intensity.to_bits() as u64);
@@ -786,7 +791,9 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     let shared_rt_fit = if global {
         let anchors = anchors_for_windows.as_deref().unwrap_or(&pooled_seed);
         info!(stage = %"rt-fit", anchors = %anchors, "run: stage start");
-        let fit = rt_im_train::fit_from_seed(anchors, &cfg.rt_im_train)?;
+        // The pooled seed carries whole-library candidate ids, so its ion-mobility anchors
+        // join `predicted_im` from the whole library, not from a band.
+        let fit = rt_im_train::fit_from_seed(anchors, Some(g.lib_precursors), &cfg.rt_im_train)?;
         info!(
             n_train = fit.n_train(),
             bands = bands.len(),
@@ -918,7 +925,9 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 ));
                 recs.push(chrom_written.record(
                     &format!("{}[g{:02}]", artifact::CHROMATOGRAMS.0, b.index),
-                    artifact::chromatograms(cfg.extract.chromatogram_schema),
+                    // The layout is the configured one, and a 4D band adds the mobility
+                    // list: the version is the written table's.
+                    crate::chromatograms::recorded_schema(&chrom)?,
                     &chrom,
                     "extract",
                     ch,
@@ -1185,6 +1194,11 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             })
             .collect()
     };
+    let pooled_chrom_schema = if stats.chromatograms_hash.is_some() {
+        crate::chromatograms::recorded_schema(&pooled_chrom_path)?
+    } else {
+        artifact::CHROMATOGRAMS
+    };
     let pooled_artifacts = stats
         .psms_hash
         .clone()
@@ -1202,8 +1216,9 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         .chain(stats.chromatograms_hash.clone().map(|h| {
             (
                 artifact::CHROMATOGRAMS.0,
-                // Spliced from the bands' tables, which share the configured layout.
-                artifact::chromatograms(cfg.extract.chromatogram_schema),
+                // Spliced from the bands' tables, which share the configured layout and,
+                // on 4D data, the mobility list.
+                pooled_chrom_schema,
                 &pooled_chrom_path,
                 stats.chromatograms,
                 h,

@@ -31,8 +31,8 @@ policy for tuning and validation.
   - `mumdia-core`: typed config, schemas, manifest, masses/constants.
   - `mumdia-io`: Arrow/Parquet table layer, hashes, JSON, artifact reports.
   - `mumdia`: CLI/library, fragment index, FDR/rescoring, and stages.
-- `scripts/`: eight engine-invoked Python workers plus four imported-library
-  helpers (twelve scripts), and `_lib_io.py`, the shared writer the helpers use so
+- `scripts/`: ten engine-invoked Python workers plus four imported-library
+  helpers (fourteen scripts), and `_lib_io.py`, the shared writer the helpers use so
   they cannot emit a parquet the engine rejects. Includes `augment_library.py`, which adds the
   tryptic FASTA peptides an imported library is missing. Sidecars use positional
   file contracts.
@@ -153,12 +153,75 @@ Key semantics:
   eliminate a target against its decoy. Peptide-level q estimation subsequently
   performs picked target-decoy competition through the shared
   `base_peptide_id`; keep that pairing intact.
-- `extract.retain_top_peaks > 1` (default 1) writes the alternative peaks as
-  additional `psms_extracted` rows with `peak_rank >= 1` (plus a diagnostic
-  `.peaks.parquet`), `features` carries `peak_rank`, `compete` keys on it, and
-  `rescore` keeps one row per candidate and records `selected_peak_rank`. The
-  plumbing exists; what the default still lacks is entrapment validation on two
-  acquisitions.
+- Ion mobility (diaPASEF, `docs/TIMS_ROADMAP.md`): `fragment_library_precursors`
+  v2 carries a nullable `predicted_im` (1/K0), from IM2Deep
+  (`predict_frag.im_predictor = im2deep`, default `none`) or from an imported
+  library's `IM`. The seed reports `observed_im` for confident targets, and
+  rt-im-train fits a per-charge linear CCS calibration on those anchors with a
+  held-out `w_im` (`docs/08` section 7), filling `run_windows.im_*`.
+  `extract.im_gate` (default `off`) gates fragment (and optionally MS1) peaks on those
+  windows, and `search_seed.im_gate` gates the seed on the library IM; with both off the
+  output is bit-identical to the ungated engine. Measured on one diaPASEF run: +6.0%
+  peptides at the calibrated width and an unchanged decoy fraction
+  (`docs/TIMS_ROADMAP.md` "P4 result"); benchmark-gated. On 4D data extract also
+  writes IM evidence (psms_extracted v4: `apex_im_mad`, `ms1_apex_im`, `im_pred_cal`;
+  a per-point mobility list in the chromatograms: `im` beside the full traces, schema v3,
+  +38% artifact size measured on that layout, or `im_trimmed`, cut like the trimmed
+  traces of the default layout, schema v4), and
+  `features.im_features` (default `off`) appends nine IM features after every other
+  column; off leaves the feature list, schema id and scores bit-identical. Measured on
+  the same run with 3 `nn_torch` seeds: +1.8% peptides on top of the gate, +1.5%
+  ungated, decoy fraction unchanged, no leakage in a low-score null (`"P5 result"`);
+  benchmark-gated. The compact `feature_preset` excludes the IM block.
+  P6 (`docs/TIMS_ROADMAP.md` "P6 result"; one file, 3 seeds, nothing
+  promoted) took the same run from 7,753 to 9,507 peptides (0.50x to 0.62x DIA-NN) with
+  three settings. (1) MS2PIP `timsTOF2024` with `predict_frag.charge2_from_precursor_charge:
+  99` (+2.7%): the model is single-charge, so charge-2 fragments must not be requested, or
+  the heuristic fill crowds the top-N (see the `ms2pip_model` note below). (2)
+  `search_seed.frag_tol_mad_k: 4` (new, default 0; +5.7% on top). On this run the p95 rule
+  learned ~21 ppm from a 6-20 ppm shoulder of weak-peak centroid error, not from random
+  matches, and the MAD rule learns 12.5 ppm. (3) `extract.gate_min_score: 0` (+11.7% on
+  top, 3.2x the candidates): on a 15-min, 50 ng diaPASEF run the spectral gate is the
+  binding extraction loss. The HYE-derived 0.2 optimum does not transfer. Entrapment on
+  the combined P6 config (E. coli + 1:1 human, 3 seeds): empirical FDP 0.36-0.38% at 1%,
+  53-56 spike-ins. On ProteoBench HYE diaPASEF the default quant compresses ratios, and
+  quant `fragment_selection: predicted` + `interference_envelope` recovers most of it
+  (roadmap, "ProteoBench HYE diaPASEF").
+  P7 (`"P7 result"`) keeps a per-peak mobility width (`convert.tdf_im_width`, spectra v3)
+  and scores apex peak-shape agreement (`features.im_shape_features`, psms_extracted v5);
+  both default off, bit-identical when off. -0.9% peptides over 3 seeds, no gain: MS1
+  centroids merge neighbouring ions at the 30-scan gap (MS1 width 1.6x the fragment
+  width), so centroid splitting must come before any profile feature.
+  `retrace.enabled` (default off, diaPASEF only; docs/09 section 6c) rebuilds the fragment and
+  MS1 traces after extract from the raw `.d` events, in `apex_im +/- 0.015`, on convert's m/z
+  and 1/K0 scale and extract's mass calibration. Extract's traces go to
+  `chromatograms.centroid.parquet`; off is bit-identical. Measured (docs/TIMS_ROADMAP_bis.md
+  section 6): full E. coli `run` +5.9% peptides over 3 seeds (13,678, 0.89x DIA-NN), entrapment
+  at an unchanged FDP; HYE diaPASEF +15.0% peptides (seed 0) with better ProteoBench epsilon
+  and CV. Costs 160 s and 36 GB per HYE run (the held raw frames). Benchmark-gated; refused
+  with `groups.window_groups > 1`.
+  `features.retrace_apex` (default off, needs retrace) swaps the centroid apex scalars for
+  raw-trace values and appends `imc_ref_w`, the agreement of the fragments' raw 1/K0 profiles
+  at the apex (docs/09 section 6c, docs/10). Measured (docs/TIMS_ROADMAP_bis.md section 7):
+  E. coli +1.8% peptides on top of retrace over 3 seeds, entrapment +2.2% real peptides at
+  an FDP of 0.43-0.51% (control 0.40-0.44%), HYE diaPASEF +3.9% peptides (seed 0) with
+  ProteoBench epsilon and CV about unchanged. Benchmark-gated.
+  `retrace.repick` (default off; needs `extract.retain_top_peaks >= 2`) re-chooses each
+  candidate's apex RT and 1/K0 centre on the raw events, among extract's apex and the top-K
+  sidecar peaks, and writes `psms_extracted.repick.parquet` for the later stages (docs/09
+  section 6c). Measured (docs/TIMS_ROADMAP_bis.md section 8): full E. coli run +7.4% peptides
+  (14,911, 0.97x DIA-NN), entrapment +5.4% real peptides at an FDP of 0.37-0.47%, HYE
+  diaPASEF +8.4% peptides and +15.2% ProteoBench ions (seed 0) with better epsilon and CV.
+- Two keys, both default 1. `extract.retain_top_peaks > 1` writes only the unscored
+  diagnostic `<psms>.peaks.parquet`. `extract.promote_top_peaks > 1` writes the
+  alternative peaks as additional `psms_extracted` rows with `peak_rank >= 1`;
+  `features` carries `peak_rank`, `compete` keys on it, and `rescore` keeps the
+  best-scoring row per candidate and records `selected_peak_rank`. Measured on the
+  diaPASEF E. coli run (docs/TIMS_ROADMAP_bis.md "L2 result"), K = 2 and 3 LOSE 5.7-5.9%
+  peptides. The rescorer barely tells a candidate's peaks apart (a wrong alternate beats
+  the right rank-0 peak in 40% of confirmed pairs), because about 40 features, the seed
+  features among them, are copied from rank 0 onto every alternate. The plumbing exists;
+  per-peak features come before any further measurement.
 
 ## Validated sensitivity workflow
 
@@ -765,8 +828,8 @@ sensitivity result for it.
 
 Do not enable these by default from a single AIF count:
 
-- model-visible top-K peaks (`extract.retain_top_peaks > 1`; implemented through
-  features, compete and rescore, default 1);
+- model-visible top-K peaks (`extract.promote_top_peaks > 1`; implemented through
+  features, compete and rescore, default 1; measured as a loss on diaPASEF, see above);
 - adaptive RT windows;
 - held-out RT window sizing (`rt_im_train.window_holdout_frac`). Implemented and
   measured on the AIF benchmark: +1.1% peptides with DeepLC 4.1.0 at unchanged
@@ -776,7 +839,7 @@ Do not enable these by default from a single AIF count:
   has the mechanism and numbers;
 - alternative hard/soft extraction gates or peak apportionment;
 - margin competition or unique-evidence competition;
-- MBR transfer/re-extraction;
+- MBR transfer/re-extraction (`mbr.reextract`, default off: docs/TIMS_QUANT_ROADMAP.md 4k);
 - acquisition-specific fragment/peak caps. The shipped default stays uncapped;
   see the peak-cap subsection above.
 

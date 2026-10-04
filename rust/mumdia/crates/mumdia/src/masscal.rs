@@ -67,17 +67,23 @@ pub const MIN_LOESS_CALIBRANTS: usize = 50;
 // `served scans x report_psms x fragments per candidate` deviations whatever its precursor
 // count; [`Calibrants::bytes`] is what `search-seed` reports in its artifact stats.
 
-/// Median offset and `1.5 * p95(|dev - median|)` tolerance, floored at 5 ppm.
+/// Median offset and tolerance, floored at 5 ppm. The tolerance is
+/// `1.5 * p95(|dev - median|)` when `mad_k` is 0, else `mad_k * 1.4826 * MAD` (the robust
+/// sigma of the deviations; `search_seed.frag_tol_mad_k`).
 ///
 /// Panics on an empty slice; every caller goes through [`MassCal::fit_from`], which
 /// guards on [`MIN_CALIBRANTS`].
-pub fn fit(devs: &[f64]) -> (f64, f64) {
+pub fn fit(devs: &[f64], mad_k: f64) -> (f64, f64) {
     let mut sorted = devs.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let offset = sorted[sorted.len() / 2];
     let centered: Vec<f64> = devs.iter().map(|x| (x - offset).abs()).collect();
-    let tol = (crate::calibrate::percentile(&centered, 0.95) * 1.5).max(5.0);
-    (offset, tol)
+    let width = if mad_k > 0.0 {
+        crate::calibrate::percentile(&centered, 0.5) * 1.4826 * mad_k
+    } else {
+        crate::calibrate::percentile(&centered, 0.95) * 1.5
+    };
+    (offset, width.max(5.0))
 }
 
 /// One fragment mass calibration: what `<seed>.masscal.json` carries and what `extract`
@@ -113,7 +119,7 @@ impl MassCal {
     pub fn fit_from(devs: &[f64], dev_mz: &[f64], cfg: &SearchSeedConfig) -> MassCal {
         debug_assert_eq!(devs.len(), dev_mz.len());
         let (frag_ppm_offset, frag_tol_ppm, cal_passes) = if devs.len() >= MIN_CALIBRANTS {
-            let (o1, t1) = fit(devs);
+            let (o1, t1) = fit(devs, cfg.frag_tol_mad_k);
             if cfg.two_pass_mass_cal {
                 // Second pass: keep only deviations inside the first-pass window, so
                 // random-match outliers cannot bias the offset, then re-fit.
@@ -123,7 +129,7 @@ impl MassCal {
                     .filter(|d| (d - o1).abs() <= t1)
                     .collect();
                 if inl.len() >= MIN_CALIBRANTS {
-                    let (o2, t2) = fit(&inl);
+                    let (o2, t2) = fit(&inl, cfg.frag_tol_mad_k);
                     (o2, t2, 2)
                 } else {
                     (o1, t1, 1)
@@ -309,13 +315,13 @@ mod tests {
         let union: Vec<f64> = bands.iter().flatten().cloned().collect();
         let (mut w, mut wt) = (0.0f64, 0.0f64);
         for b in &bands {
-            let (_, t) = fit(b);
+            let (_, t) = fit(b, 0.0);
             assert!(t > 5.0, "not floored, or the comparison is vacuous");
             w += b.len() as f64;
             wt += b.len() as f64 * t;
         }
         let averaged = wt / w;
-        let (_, pooled_tol) = fit(&union);
+        let (_, pooled_tol) = fit(&union, 0.0);
         assert!(
             averaged > 2.0 * pooled_tol,
             "averaging per-band p95s ({averaged}) is far wider than the union's \
@@ -381,6 +387,30 @@ mod tests {
             two.to_json()["frag_ppm_sigma"],
             two.to_json()["frag_tol_ppm"]
         );
+    }
+
+    #[test]
+    fn the_mad_estimator_ignores_a_shoulder_that_sets_the_p95() {
+        // A narrow core (|dev| <= 2) plus a 10% shoulder at 12-16 ppm: the shoulder is the
+        // p95, so the default tolerance is ~1.5 x 15; the MAD estimator follows the core.
+        let mut devs: Vec<f64> = (0..900).map(|i| ((i % 9) as f64 - 4.0) * 0.5).collect();
+        devs.extend((0..100).map(|i| -12.0 - (i % 5) as f64));
+        let mz = vec![500.0; devs.len()];
+        let p95 = MassCal::fit_from(&devs, &mz, &cfg());
+        let mut c = cfg();
+        c.frag_tol_mad_k = 4.0;
+        let mad = MassCal::fit_from(&devs, &mz, &c);
+        assert!(
+            p95.frag_tol_ppm > 15.0,
+            "p95 tolerance {}",
+            p95.frag_tol_ppm
+        );
+        assert!(
+            (5.0..10.0).contains(&mad.frag_tol_ppm),
+            "MAD tolerance {}",
+            mad.frag_tol_ppm
+        );
+        assert_eq!(mad.frag_ppm_offset, p95.frag_ppm_offset);
     }
 
     #[test]

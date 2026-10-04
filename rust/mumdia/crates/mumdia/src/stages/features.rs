@@ -37,6 +37,7 @@ mod chromatographic;
 mod coelution;
 mod demix;
 pub(crate) mod entropy;
+pub(crate) mod im;
 mod interference;
 mod ion_series;
 mod mass_accuracy;
@@ -211,8 +212,10 @@ pub const RICH_EXTRA: &[&str] = &[
     "shadow_frac",
 ];
 
-/// The ordered active feature list for the configured set.
-pub fn active_features(set: FeatureSet) -> Vec<String> {
+/// The ordered active feature list for the configured set. `im_features` appends the
+/// ion-mobility block (`im::NAMES`) and `im_shape` the peak-shape block
+/// (`im::SHAPE_NAMES`) after it, so with both off the list is unchanged.
+pub fn active_features(set: FeatureSet, im_features: bool, im_shape: bool) -> Vec<String> {
     let mut v: Vec<String> = MINIMAL_FEATURES.iter().map(|s| s.to_string()).collect();
     if matches!(set, FeatureSet::Rich | FeatureSet::Extended) {
         v.extend(RICH_EXTRA.iter().map(|s| s.to_string()));
@@ -232,7 +235,31 @@ pub fn active_features(set: FeatureSet) -> Vec<String> {
         v.push("charge_multi_flag".to_string());
         v.push("cross_charge_intensity_log".to_string());
     }
+    if im_features {
+        v.extend(im::NAMES.iter().map(|s| s.to_string()));
+    }
+    if im_shape {
+        v.extend(im::SHAPE_NAMES.iter().map(|s| s.to_string()));
+    }
     v
+}
+
+/// [`active_features`] for a configuration, with the `features.retrace_apex` column last.
+pub fn active_features_for(cfg: &FeaturesConfig) -> Vec<String> {
+    let mut v = active_features(cfg.set, cfg.im_features, cfg.im_shape_features);
+    if cfg.retrace_apex {
+        v.push(RETRACE_APEX_FEATURE.to_string());
+    }
+    v
+}
+
+/// The feature `features.retrace_apex` appends (retrace.rs, `Apex::imc`).
+pub const RETRACE_APEX_FEATURE: &str = "imc_ref_w";
+
+/// The per-candidate sidecar retrace writes next to its chromatograms under
+/// `features.retrace_apex`.
+pub fn retrace_apex_path(chromatograms: &str) -> String {
+    format!("{chromatograms}.apex.parquet")
 }
 
 pub fn feature_schema_id(cols: &[String]) -> String {
@@ -418,6 +445,9 @@ struct ChromRow<'a> {
     pred_int: f32,
     rt: &'a [f32],
     inten: &'a [f32],
+    /// Per-point 1/K0 parallel to `inten` (a 4D chromatogram table, schema v3 or v4, read
+    /// under `features.im_features`), empty when not read.
+    im: &'a [f32],
 }
 
 /// One PSM's fragment traces on a single union RT axis: `axis_full` ascending and
@@ -1162,6 +1192,8 @@ struct RowSet {
     /// Row `r`'s intensities are `int_vals[int_off[r]..int_off[r + 1]]`.
     int_off: Vec<usize>,
     int_vals: Vec<f32>,
+    /// Per-point 1/K0 on the same offsets as `int_vals`, or empty when not read.
+    im_vals: Vec<f32>,
     /// Candidate `c`'s rows are `cand_off[c]..cand_off[c + 1]`.
     cand_off: Vec<usize>,
 }
@@ -1187,6 +1219,7 @@ impl RowSet {
             + crate::memlog::bytes_of(&self.axis_id)
             + crate::memlog::bytes_of(&self.int_off)
             + crate::memlog::bytes_of(&self.int_vals)
+            + crate::memlog::bytes_of(&self.im_vals)
             + crate::memlog::bytes_of(&self.cand_off)
     }
 }
@@ -1257,6 +1290,7 @@ impl ChromChunk {
         pred_int: f32,
         rt: &[f32],
         inten: &[f32],
+        im: Option<&[f32]>,
     ) {
         let axis_id = self.axis_for(rt);
         let set = if is_ms1 {
@@ -1270,6 +1304,12 @@ impl ChromChunk {
         set.pred_int.push(pred_int);
         set.axis_id.push(axis_id);
         set.int_vals.extend_from_slice(inten);
+        if let Some(im) = im {
+            // An absent fragment has an empty `im` beside its empty trace; anything else
+            // is parallel to the intensities, so the two share `int_off`.
+            set.im_vals.extend_from_slice(im);
+            set.im_vals.resize(set.int_vals.len(), 0.0);
+        }
         set.int_off.push(set.int_vals.len());
     }
 
@@ -1291,6 +1331,10 @@ impl ChromChunk {
                 pred_int: set.pred_int[r],
                 rt: self.axis(set.axis_id[r]),
                 inten: &set.int_vals[set.int_off[r]..set.int_off[r + 1]],
+                im: set
+                    .im_vals
+                    .get(set.int_off[r]..set.int_off[r + 1])
+                    .unwrap_or(&[]),
             })
             .collect()
     }
@@ -1312,25 +1356,36 @@ impl ChromChunk {
 /// follows the rows in order, so a stream must start at a row group or at a candidate's
 /// first row, or be opened with [`ChromStream::open_at`], which reads its way in from the
 /// start of the row group.
+///
+/// Opened with `want_im` on a 4D table, the stream also reads each row's per-point 1/K0
+/// (`features.im_features`), which the decoder rebuilds with the trace's `+0.0` margins
+/// ([`Decoder::row_im`]). Otherwise it projects and stores exactly what it did without it.
 struct ChromStream {
     inner: mumdia_io::table::BatchReader,
     pending: Option<RecordBatch>,
     has_obs_mz: bool,
+    /// Read each row's per-point 1/K0 list (asked for and present): `im` in v1,
+    /// `im_trimmed` in v2 ([`Layout::im_column`]).
+    has_im: bool,
     layout: Layout,
     dec: Decoder,
 }
 
 impl ChromStream {
     /// `ch` may be a whole-file handle or a [`TableFile::span`] of one; a span carries the
-    /// whole file's schema, so the optional column is decided from the handle either way.
+    /// whole file's schema, so the optional columns are decided from the handle either way.
     ///
     /// This used to call `mumdia_io::table::column_names(path)`, which opens the file and
     /// parses its footer a SECOND time for a question the handle can already answer. The
     /// confident-bounds pass opens one stream per span, so that was two full footer parses
     /// per span on a table whose footer is not small.
-    fn open(ch: &TableFile) -> Result<ChromStream> {
+    ///
+    /// `want_im` also projects the per-point 1/K0 list where the table has one; without it,
+    /// or on a 3D table, the projection is the one the stream always read.
+    fn open(ch: &TableFile, want_im: bool) -> Result<ChromStream> {
         let has_obs_mz = ch.has_column("frag_obs_mz");
         let layout = Layout::of(ch)?;
+        let has_im = want_im && ch.has_column(layout.im_column());
         let mut cols = vec![
             "candidate_id",
             "frag_name",
@@ -1342,10 +1397,14 @@ impl ChromStream {
         }
         // `rt` and `intensity` in v1; the v2 lists and trace columns in v2.
         cols.extend_from_slice(layout.trace_columns());
+        if has_im {
+            cols.push(layout.im_column());
+        }
         Ok(ChromStream {
             inner: ch.batches(Some(&cols), CHROM_BATCH_ROWS)?,
             pending: None,
             has_obs_mz,
+            has_im,
             layout,
             dec: Decoder::new(),
         })
@@ -1360,9 +1419,12 @@ impl ChromStream {
     /// decoder ([`Decoder::skip`]) without keeping them, so the first row it hands out has
     /// the axis it would have had in a read from the row group. A v1 table, and a `first`
     /// on a row-group boundary, open as [`TableFile::span`] would.
+    ///
+    /// It reads no per-point 1/K0: its one caller, the confident-bounds pass, bounds peaks
+    /// on the traces alone.
     fn open_at(ch: &TableFile, first: usize, n_rows: usize) -> Result<ChromStream> {
         if Layout::of(ch)? == Layout::V1 || n_rows == 0 {
-            return ChromStream::open(&ch.span(first, n_rows)?);
+            return ChromStream::open(&ch.span(first, n_rows)?, false);
         }
         let mut group_start = 0usize;
         for rows in ch.row_group_rows() {
@@ -1372,7 +1434,7 @@ impl ChromStream {
             group_start += rows;
         }
         let lead = first - group_start;
-        let mut stream = ChromStream::open(&ch.span(group_start, lead + n_rows)?)?;
+        let mut stream = ChromStream::open(&ch.span(group_start, lead + n_rows)?, false)?;
         stream.follow(lead)?;
         Ok(stream)
     }
@@ -1492,6 +1554,12 @@ impl ChromStream {
             let (rc, ic) = (self.layout.rt_column(), self.layout.intensity_column());
             let rt = ListF32::of(col(rc)?, rc)?;
             let inten = ListF32::of(col(ic)?, ic)?;
+            let mc = self.layout.im_column();
+            let im = if self.has_im {
+                Some(ListF32::of(col(mc)?, mc)?)
+            } else {
+                None
+            };
             let trace = match self.layout {
                 Layout::V1 => None,
                 Layout::V2 => Some(TraceCols::of(&b)?),
@@ -1520,9 +1588,24 @@ impl ChromStream {
                 }
                 let rt_row = rt.row_slice(k, rc)?;
                 let int_row = inten.row_slice(k, ic)?;
-                let (rt_row, int_row) = match &trace {
-                    None => (rt_row, int_row),
-                    Some(t) => self.dec.row(c, rt_row, int_row, t.offset(k), t.len(k))?,
+                let im_row = match &im {
+                    Some(a) => Some(a.row_slice(k, mc)?),
+                    None => None,
+                };
+                // A v1 mobility list is parallel to its trace as stored; a v2 one is rebuilt
+                // with the trace, `+0.0` outside the stored run.
+                let (rt_row, int_row, im_row) = match (&trace, im_row) {
+                    (None, im_row) => (rt_row, int_row, im_row),
+                    (Some(t), None) => {
+                        let (r, i) = self.dec.row(c, rt_row, int_row, t.offset(k), t.len(k))?;
+                        (r, i, None)
+                    }
+                    (Some(t), Some(m)) => {
+                        let (r, i, m) =
+                            self.dec
+                                .row_im(c, rt_row, int_row, m, t.offset(k), t.len(k))?;
+                        (r, i, Some(m))
+                    }
                 };
                 let nm = name.value(k);
                 let id = names.intern(nm);
@@ -1534,6 +1617,7 @@ impl ChromStream {
                     pint.value(k),
                     rt_row,
                     int_row,
+                    im_row,
                 );
             }
             taken += n;
@@ -2095,7 +2179,8 @@ fn subchunk_half_widths(
     // `open_at`, not a span: a sub-chunk starts on the absolute `chunk_rows` grid, which is
     // inside a row group and inside a candidate whenever the row groups do not divide the
     // grid (a pooled table's band seams, or a small grid), and a v2 row there may need the
-    // axis an earlier row of its candidate carried.
+    // axis an earlier row of its candidate carried. It reads no per-point 1/K0, which the
+    // peak bounds do not use.
     let mut stream = ChromStream::open_at(ch, first, n_rows)?;
     // Chunk reading already groups rows by candidate, so this reuses it and keeps only
     // the confident candidates' rows long enough to bound their peak.
@@ -2217,7 +2302,7 @@ fn confident_half_widths_serial(
     let keep: std::collections::HashSet<u32> = confident_rows.keys().copied().collect();
     for &(first, n_rows) in spans {
         let span = ch.span(first, n_rows)?;
-        let mut stream = ChromStream::open(&span)?;
+        let mut stream = ChromStream::open(&span, false)?;
         let (mut abs, end) = (first, first + n_rows);
         while abs < end {
             let want = (chunk_rows - abs % chunk_rows).min(end - abs);
@@ -2591,13 +2676,21 @@ struct LoadFault {
 /// A span decodes whole row groups, so a chunk that starts or ends inside one decodes
 /// and discards the rest of it: at most one 65,536-row group at each end of a ~1M-row
 /// chunk, against the single sequential stream that decoded every row once.
-fn load_chunk(ch: &TableFile, first: usize, n_rows: usize) -> Result<(ChromChunk, NameTab)> {
+///
+/// `want_im` also reads each row's per-point 1/K0 where the table has it
+/// (`features.im_features`, [`ChromStream::open`]).
+fn load_chunk(
+    ch: &TableFile,
+    first: usize,
+    n_rows: usize,
+    want_im: bool,
+) -> Result<(ChromChunk, NameTab)> {
     let mut names = NameTab::default();
     if n_rows == 0 {
         return Ok((ChromChunk::new(), names));
     }
     let span = ch.span(first, n_rows)?;
-    let mut stream = ChromStream::open(&span)?;
+    let mut stream = ChromStream::open(&span, want_im)?;
     let chunk = stream.read_chunk(n_rows, &mut names)?;
     Ok((chunk, names))
 }
@@ -2622,6 +2715,8 @@ struct ChunkLoader<'a> {
     first: &'a [usize],
     rows: &'a [usize],
     loaders: usize,
+    /// Read the per-point 1/K0 as well ([`load_chunk`]).
+    want_im: bool,
     state: std::sync::Mutex<LoadState>,
     cv: std::sync::Condvar,
     #[cfg(test)]
@@ -2649,12 +2744,14 @@ impl<'a> ChunkLoader<'a> {
         first: &'a [usize],
         rows: &'a [usize],
         loaders: usize,
+        want_im: bool,
     ) -> ChunkLoader<'a> {
         ChunkLoader {
             ch,
             first,
             rows,
             loaders: loaders.max(1),
+            want_im,
             state: std::sync::Mutex::new(LoadState {
                 next: 0,
                 taken: 0,
@@ -2774,7 +2871,7 @@ impl<'a> ChunkLoader<'a> {
             #[cfg(test)]
             self.inject_before(j);
             let busy = Instant::now();
-            let r = load_chunk(self.ch, self.first[j], self.rows[j]);
+            let r = load_chunk(self.ch, self.first[j], self.rows[j], self.want_im);
             #[cfg(test)]
             let r = self.inject_after(j, r);
             timers.add(&timers.loader_busy_ns, busy);
@@ -2933,8 +3030,8 @@ fn run_chunked(
         .f32("shadow_kept_frac")
         .unwrap_or_else(|_| vec![0.0; ps.nrows]);
     let apex_rt = ps.f64("apex_rt")?;
-    let apex_int = ps.f32("apex_intensity")?;
-    let n_matched = ps.i32("n_matched_fragments")?;
+    let mut apex_int = ps.f32("apex_intensity")?;
+    let mut n_matched = ps.i32("n_matched_fragments")?;
     let n_pred = ps
         .i32("n_predicted_fragments")
         .unwrap_or_else(|_| vec![6; ps.nrows]);
@@ -2960,15 +3057,114 @@ fn run_chunked(
     let ms1_m1 = ps
         .opt_f64("ms1_isom1")
         .unwrap_or_else(|_| vec![None; ps.nrows]);
-    let ms1_mono = ps
+    let mut ms1_mono = ps
         .opt_f64("ms1_mono")
         .unwrap_or_else(|_| vec![None; ps.nrows]);
-    let ms1_i1 = ps
+    let mut ms1_i1 = ps
         .opt_f64("ms1_iso1")
         .unwrap_or_else(|_| vec![None; ps.nrows]);
-    let ms1_i2 = ps
+    let mut ms1_i2 = ps
         .opt_f64("ms1_iso2")
         .unwrap_or_else(|_| vec![None; ps.nrows]);
+    // `features.retrace_apex`: the centroid apex scalars give way to the raw-trace values
+    // retrace wrote, and `imc_ref_w` is read for the appended column.
+    let imc: Vec<f64> = if p.cfg.retrace_apex {
+        if peak_rank.iter().any(|&r| r != 0) {
+            anyhow::bail!(
+                "features.retrace_apex scores the rank-0 apex only; it cannot be combined \
+                 with extract.promote_top_peaks > 1"
+            );
+        }
+        let path = retrace_apex_path(p.chromatograms);
+        let a = TableFile::open(&path)
+            .with_context(|| format!("features.retrace_apex needs retrace's sidecar {path}"))?;
+        let a_cid = a.u32("candidate_id")?;
+        let row_of: HashMap<u32, usize> = a_cid.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+        let (a_int, a_n) = (a.f32("apex_intensity")?, a.i32("n_matched_fragments")?);
+        let a_ms1 = [a.f64("ms1_mono")?, a.f64("ms1_iso1")?, a.f64("ms1_iso2")?];
+        let a_imc = a.f64(RETRACE_APEX_FEATURE)?;
+        let mut v = vec![0.0; ps.nrows];
+        let mut missing = 0usize;
+        for i in 0..ps.nrows {
+            let Some(&j) = row_of.get(&cid[i]) else {
+                missing += 1;
+                continue;
+            };
+            apex_int[i] = a_int[j];
+            n_matched[i] = a_n[j];
+            // null stays null only when extract had none and the raw trace has none either
+            for (col, raw) in [&mut ms1_mono, &mut ms1_i1, &mut ms1_i2]
+                .into_iter()
+                .zip(&a_ms1)
+            {
+                let x = if raw[j].is_nan() { 0.0 } else { raw[j] };
+                if col[i].is_some() || x > 0.0 {
+                    col[i] = Some(x);
+                }
+            }
+            v[i] = a_imc[j];
+        }
+        if missing > 0 {
+            warn!(
+                missing,
+                path, "features: rows without a retrace apex record keep extract's values"
+            );
+        }
+        v
+    } else {
+        Vec::new()
+    };
+    // Ion-mobility block (psms_extracted v4), read only when it is on. A missing column
+    // reads as all-null, which the block turns into zeros.
+    let im_on = p.cfg.im_features;
+    let im_col = |name: &str| -> Vec<Option<f64>> {
+        if im_on {
+            ps.opt_f64(name).unwrap_or_else(|_| vec![None; ps.nrows])
+        } else {
+            Vec::new()
+        }
+    };
+    let (apex_im, apex_im_mad, ms1_apex_im, im_cal) = (
+        im_col("apex_im"),
+        im_col("apex_im_mad"),
+        im_col("ms1_apex_im"),
+        im_col("im_pred_cal"),
+    );
+    // Peak-shape block (psms_extracted v5), read only when it is on.
+    let shape_on = p.cfg.im_shape_features;
+    let shape_cols: Vec<Vec<Option<f64>>> = if shape_on {
+        [
+            "apex_im_width",
+            "apex_im_width_mad",
+            "apex_im_overlap",
+            "ms1_im_width",
+            "ms1_frag_overlap",
+        ]
+        .iter()
+        .map(|n| ps.opt_f64(n).unwrap_or_else(|_| vec![None; ps.nrows]))
+        .collect()
+    } else {
+        Vec::new()
+    };
+    if shape_on && !shape_cols[0].iter().any(Option::is_some) {
+        warn!(
+            psms = p.psms,
+            "features: im_shape_features is on, but no row has apex_im_width (spectra              without per-peak widths: set convert.tdf_im_width, or psms_extracted older              than v5); the IM shape features are zero"
+        );
+    }
+    if im_on
+        && !apex_im
+            .iter()
+            .zip(&im_cal)
+            .any(|(a, c)| a.is_some() && c.is_some())
+    {
+        warn!(
+            psms = p.psms,
+            "features: im_features is on, but no row has both apex_im and im_pred_cal \
+             (3D data, no IM calibration, or psms_extracted older than v4); the IM \
+             features are zero"
+        );
+    }
 
     // The chromatogram table is the largest artifact of the run: 62.7 GiB of traces at
     // 2.6M candidates on the HYE benchmark, where the whole store used to be materialised
@@ -3070,7 +3266,7 @@ fn run_chunked(
     };
 
     let gradient = apex_rt.iter().cloned().fold(0.0f64, f64::max).max(1.0);
-    let cols_active = active_features(p.cfg.set);
+    let cols_active = active_features_for(p.cfg);
     let n = ps.nrows;
 
     // --- Cross-candidate charge-state corroboration (Extended set) ---
@@ -3132,6 +3328,15 @@ fn run_chunked(
     let n_ext = if extended { ext_names.len() } else { 0 };
     // The feature -> column permutation, taken once instead of once per value per row.
     let ix = ColIx::new(&cols_active, &ext_names);
+    let im_ix: Vec<Option<usize>> = im::NAMES
+        .iter()
+        .map(|n| cols_active.iter().position(|c| c == n))
+        .collect();
+    let shape_ix: Vec<Option<usize>> = im::SHAPE_NAMES
+        .iter()
+        .map(|n| cols_active.iter().position(|c| c == n))
+        .collect();
+    let imc_ix = cols_active.iter().position(|c| c == RETRACE_APEX_FEATURE);
 
     // Hashed as it is written, so the report's content hash needs no read-back of the table
     // (docs/03_io_layer.md, "Hash on write").
@@ -3189,7 +3394,9 @@ fn run_chunked(
         #[cfg(test)]
         LoaderSource::Exact { loaders, .. } => (None, loaders.max(1).min(chunks.len().max(1))),
     };
-    let loader = ChunkLoader::new(&ch, &chunk_first, &chunk_rows, n_loaders);
+    // The per-point 1/K0 is decoded only for the IM elution features; without them the
+    // loaders project exactly the columns they did before.
+    let loader = ChunkLoader::new(&ch, &chunk_first, &chunk_rows, n_loaders, im_on);
     #[cfg(test)]
     let loader = loader.with_fault(match loaders {
         LoaderSource::Exact { fault, .. } => fault,
@@ -3291,8 +3498,23 @@ fn run_chunked(
                 // rebuilt inside each of them.
                 let al = align_traces(&rows);
                 let obs = apex_intensities(&rows, apex_rt[i]);
+                // The IM elution block (`im::NAMES[im::N_SCALAR..]`), from the fragments'
+                // per-point 1/K0 inside the elution peak `fragment_features` bounded, on
+                // both paths below. Under `features.im_features = false` it stays zero and
+                // is never written.
+                let with_im_elution = |mut ff: FragFeatures| -> FragFeatures {
+                    if im_on {
+                        ff.im_elution = im::elution(
+                            rows.iter().map(|r| (r.rt, r.inten, r.im)),
+                            ff.elution_lo,
+                            ff.elution_hi,
+                            im_cal[i],
+                        );
+                    }
+                    ff
+                };
                 if ext.is_empty() {
-                    return fragment_features(
+                    return with_im_elution(fragment_features(
                         &rows,
                         &al,
                         &obs,
@@ -3303,7 +3525,7 @@ fn run_chunked(
                         p.cfg.bound_peak_fraction,
                         p.cfg.bound_peak_grace,
                         global_bounds,
-                    );
+                    ));
                 }
                 // The Extended set: the peak window, its traces, the reference profiles
                 // and the pair statistics once. `fragment_features` shares them when
@@ -3320,7 +3542,7 @@ fn run_chunked(
                     global_bounds,
                 );
                 let peak = PeakTraces::new(&al, &pred, win);
-                let ff = fragment_features(
+                let ff = with_im_elution(fragment_features(
                     &rows,
                     &al,
                     &obs,
@@ -3331,7 +3553,7 @@ fn run_chunked(
                     p.cfg.bound_peak_fraction,
                     p.cfg.bound_peak_grace,
                     global_bounds,
-                );
+                ));
                 {
                     let ms1_rows = ci
                         .map(|c| store.rows(&store.ms1, c, &names))
@@ -3476,6 +3698,29 @@ fn run_chunked(
                 m.set(ix.n_charge_states, r, f_n_charge[i]);
                 m.set(ix.charge_multi_flag, r, f_charge_multi[i]);
                 m.set(ix.cross_charge_intensity_log, r, f_cross_charge_int[i]);
+
+                if im_on {
+                    let sc = im::scalars(apex_im[i], im_cal[i], apex_im_mad[i], ms1_apex_im[i]);
+                    for (c, v) in im_ix.iter().zip(sc.iter().chain(&ff.im_elution)) {
+                        m.set(*c, r, if v.is_finite() { *v } else { 0.0 });
+                    }
+                }
+                if shape_on {
+                    let a = im::ApexShape {
+                        frag_width: shape_cols[0][i],
+                        frag_width_mad: shape_cols[1][i],
+                        frag_overlap: shape_cols[2][i],
+                        ms1_width: shape_cols[3][i],
+                        ms1_overlap: shape_cols[4][i],
+                    };
+                    for (c, v) in shape_ix.iter().zip(im::shape(&a)) {
+                        m.set(*c, r, if v.is_finite() { v } else { 0.0 });
+                    }
+                }
+
+                if imc_ix.is_some() {
+                    m.set(imc_ix, r, imc[i]);
+                }
 
                 prelim[r] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
                     + ff.coelution_mean.max(0.0)
@@ -3685,6 +3930,8 @@ struct FragFeatures {
     // above; emitted so downstream (and plotting) read them rather than re-derive.
     elution_lo: f64,
     elution_hi: f64,
+    /// `im::NAMES[im::N_SCALAR..]`, filled only under `features.im_features`.
+    im_elution: [f64; im::N_ELUTION],
 }
 
 /// Fragment-intensity agreement, co-elution, ion-series, and mass-accuracy
@@ -4476,10 +4723,13 @@ mod tests {
 
     #[test]
     fn feature_sets_sized() {
-        assert_eq!(active_features(FeatureSet::Minimal).len(), 14);
-        assert_eq!(active_features(FeatureSet::Rich).len(), 14 + 30);
+        assert_eq!(active_features(FeatureSet::Minimal, false, false).len(), 14);
+        assert_eq!(
+            active_features(FeatureSet::Rich, false, false).len(),
+            14 + 30
+        );
         // Extended = minimal + rich + the family battery, and its names are unique.
-        let ext = active_features(FeatureSet::Extended);
+        let ext = active_features(FeatureSet::Extended, false, false);
         // +6 psms-derived extras: 3 co-elution peak-contest metrics
         // (peak_contested_frac + peak_contested_count_frac + peak_apportioned_frac)
         // + 3 charge-corroboration features.
@@ -4490,6 +4740,25 @@ mod tests {
             ext.len(),
             "duplicate feature name in Extended set"
         );
+        // The IM block is appended last and only when asked for, so with it off every
+        // set, and therefore every schema id and PIN order, is unchanged.
+        for set in [FeatureSet::Minimal, FeatureSet::Rich, FeatureSet::Extended] {
+            let off = active_features(set, false, false);
+            let on = active_features(set, true, false);
+            assert_eq!(on.len(), off.len() + im::NAMES.len());
+            assert_eq!(on[..off.len()], off[..]);
+            let uniq: std::collections::HashSet<&String> = on.iter().collect();
+            assert_eq!(uniq.len(), on.len(), "an IM name shadows another feature");
+            let shape = active_features(set, true, true);
+            assert_eq!(shape.len(), on.len() + im::SHAPE_NAMES.len());
+            assert_eq!(shape[..on.len()], on[..]);
+            let uniq: std::collections::HashSet<&String> = shape.iter().collect();
+            assert_eq!(
+                uniq.len(),
+                shape.len(),
+                "an IM shape name shadows another feature"
+            );
+        }
     }
 
     #[test]
@@ -4517,6 +4786,7 @@ mod tests {
             pred_int: pred,
             rt,
             inten,
+            im: &[],
         }
     }
 
@@ -4923,6 +5193,7 @@ mod tests {
                         pred_int: preds[f],
                         rt,
                         inten: &traces[f],
+                        im: &[],
                     }
                 })
                 .collect();
@@ -5095,7 +5366,7 @@ mod tests {
     #[test]
     fn colix_covers_every_active_column() {
         for set in [FeatureSet::Minimal, FeatureSet::Rich, FeatureSet::Extended] {
-            let cols = active_features(set);
+            let cols = active_features(set, false, false);
             let ext = extended_name_refs();
             let ix = ColIx::new(&cols, &ext);
             // Every column the assembly resolves must agree with the name lookup it
@@ -5128,7 +5399,7 @@ mod tests {
         // what the string literal it replaced did, taking the names from the field list via
         // `stringify!` rather than repeating them.
         for set in [FeatureSet::Minimal, FeatureSet::Rich, FeatureSet::Extended] {
-            let cols = active_features(set);
+            let cols = active_features(set, false, false);
             let ext = extended_name_refs();
             let ix = ColIx::new(&cols, &ext);
             for (name, got) in ix.named_pairs() {
@@ -5173,7 +5444,7 @@ mod tests {
         // also the one place this change adds heap blocks rather than removing them. The
         // arithmetic that makes it acceptable: one block per column, at most two matrices in
         // flight, against the 1,048,576 mappings a process gets.
-        let cols = active_features(FeatureSet::Extended).len();
+        let cols = active_features(FeatureSet::Extended, false, false).len();
         let m = ValueMatrix::new(cols, 4096);
         assert_eq!(m.cols.len(), cols);
         assert!(
@@ -5190,7 +5461,10 @@ mod tests {
         // previous chunk's columns are still held while this chunk's matrix AND its extended
         // buffer are live, so the overlap is wider than 2x. The report measures the three;
         // this pins the arithmetic that makes the old constant wrong.
-        let (rows, n_cols) = (4096usize, active_features(FeatureSet::Extended).len());
+        let (rows, n_cols) = (
+            4096usize,
+            active_features(FeatureSet::Extended, false, false).len(),
+        );
         let n_ext = extended_name_refs().len();
         let matrix = n_cols * rows * std::mem::size_of::<f64>();
         let ext = n_ext * rows * std::mem::size_of::<f64>();
@@ -5729,6 +6003,7 @@ mod tests {
                 pred_int: preds[i],
                 rt: &axis,
                 inten: &traces[i],
+                im: &[],
             })
             .collect();
         let al = align_traces(&rows);
@@ -5828,6 +6103,7 @@ mod tests {
                     pred_int: preds[i],
                     rt: &axis,
                     inten: &traces[i],
+                    im: &[],
                 })
                 .collect();
             let al = align_traces(&rows);
@@ -7106,7 +7382,8 @@ mod tests {
         assert_eq!(a.column_names(), b.column_names());
         assert_eq!(
             a.column_names().len(),
-            active_features(FeatureSet::Extended).len() + NON_FEATURE_COLUMNS.len() - 3,
+            active_features(FeatureSet::Extended, false, false).len() + NON_FEATURE_COLUMNS.len()
+                - 3,
             "metadata columns plus every active feature"
         );
         // Every f64 column bit for bit, so a feature that differs in the last ulp fails.
@@ -7470,7 +7747,7 @@ mod tests {
             .find(|&i| cids[i] == cids[i - 1] && i % 12 != 0)
             .unwrap();
         let mut names = NameTab::default();
-        let err = ChromStream::open(&t2.span(first, 5).unwrap())
+        let err = ChromStream::open(&t2.span(first, 5).unwrap(), false)
             .and_then(|mut s| s.read_chunk(5, &mut names))
             .err()
             .expect("a read from inside a candidate must fail");
@@ -7528,7 +7805,7 @@ mod tests {
         assert!(rows.len() > FAULT_AT + 1, "{} chunks", rows.len());
         let ch = TableFile::open(&chrom).unwrap();
         let seq: Vec<Took> = (0..FAULT_AT)
-            .map(|j| Took::of(&load_chunk(&ch, first[j], rows[j]).unwrap().0))
+            .map(|j| Took::of(&load_chunk(&ch, first[j], rows[j], false).unwrap().0))
             .collect();
         for panic in [false, true] {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -7540,7 +7817,7 @@ mod tests {
                     panic,
                     hold_prev: true,
                 };
-                let loader = ChunkLoader::new(&ch, &first, &rows, 3).with_fault(Some(fault));
+                let loader = ChunkLoader::new(&ch, &first, &rows, 3, false).with_fault(Some(fault));
                 let timers = PassTimers::default();
                 let got = std::thread::scope(|sc| {
                     let release = loader.release_on_drop();
@@ -7897,7 +8174,7 @@ mod tests {
             } else {
                 ch.span(offset, 8).unwrap()
             };
-            let mut stream = ChromStream::open(&handle).unwrap();
+            let mut stream = ChromStream::open(&handle, false).unwrap();
             let mut names = NameTab::default();
             let chunk = stream.read_chunk(handle.nrows, &mut names).unwrap();
             assert_eq!(chunk.cids.len(), handle.nrows / 2);
@@ -7911,6 +8188,126 @@ mod tests {
                     "frag_obs_mz must fall back to frag_mz where it does not"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_chrom_stream_reads_the_mobility_list_of_either_layout() {
+        // `features.im_features` reads each row's per-point 1/K0 beside its trace: `im` in a
+        // v1 table, and `im_trimmed` in a v2 one, which the decoder rebuilds with the
+        // trace's `+0.0` margins. Both layouts must hand the chunk the same 1/K0, bit for
+        // bit, and a stream opened without it reads none and the same traces.
+        use crate::chromatograms::{rewrite, writer, Optional, Rows};
+        let dir = std::env::temp_dir().join("mumdia_features_stream_im");
+        std::fs::create_dir_all(&dir).unwrap();
+        let v1 = dir
+            .join("chrom_im_v1.parquet")
+            .to_string_lossy()
+            .to_string();
+        let v2 = dir
+            .join("chrom_im_v2.parquet")
+            .to_string_lossy()
+            .to_string();
+        // An absent fragment, zero margins on both sides, a run with no left margin, an MS1
+        // row and a second candidate. Every 1/K0 is `+0.0` where its trace is, outside the
+        // trace's nonzero run, as extract writes it.
+        let keys = [
+            (1u32, "y3"),
+            (1, "y4"),
+            (1, "b2"),
+            (1, "ms1_mono"),
+            (2, "y5"),
+        ];
+        let inten: [&[f32]; 5] = [
+            &[0.0, 2.0, 5.0, 1.0, 0.0],
+            &[],
+            &[1.0, 0.0, 3.0, 0.0, 0.0],
+            &[0.0, 0.0, 9.0, 0.0, 0.0],
+            &[0.0, 0.0, 0.0, 4.0, 4.0],
+        ];
+        let mob: [&[f32]; 5] = [
+            &[0.0, 0.91, 0.92, 0.93, 0.0],
+            &[],
+            &[0.9, 0.0, 0.94, 0.0, 0.0],
+            &[0.0, 0.0, 0.95, 0.0, 0.0],
+            &[0.0, 0.0, 0.0, 1.01, 1.02],
+        ];
+        let grid: [f32; 5] = [10.0, 11.0, 12.0, 13.0, 14.0];
+        let mut r = Rows::default();
+        for (k, &(c, name)) in keys.iter().enumerate() {
+            r.cid.push(c);
+            r.name.push(name.to_string());
+            r.frag_mz.push(500.0 + k as f64);
+            r.frag_obs_mz.push(500.0 + k as f64);
+            r.predicted_intensity.push(1.0);
+            // The grid for an observed row, no axis for the absent one.
+            r.rt.push(grid[..inten[k].len()].to_vec());
+            r.intensity.push(inten[k].to_vec());
+            r.im.push(mob[k].to_vec());
+        }
+        let opt = Optional {
+            im: true,
+            ..Optional::ALL
+        };
+        // Two rows per row group, so the v2 table has a seam inside candidate 1.
+        let mut w = writer(&v1, 2, Layout::V1);
+        w.write_cols(r.into_cols(Layout::V1, opt)).unwrap();
+        w.close().unwrap();
+        rewrite(&v1, &v2, Layout::V2, 2).unwrap();
+        let t2 = TableFile::open(&v2).unwrap();
+        assert_eq!(Layout::of(&t2).unwrap(), Layout::V2);
+        assert!(t2.has_column(Layout::V2.im_column()));
+
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        // Every row of the chunk as (candidate, fragment, rt, intensity, 1/K0), a
+        // candidate's fragment rows before its MS1 rows.
+        type Seen = Vec<(u32, String, Vec<u32>, Vec<u32>, Vec<u32>)>;
+        let read = |path: &str, want_im: bool| -> Seen {
+            let tf = TableFile::open(path).unwrap();
+            let mut names = NameTab::default();
+            let chunk = ChromStream::open(&tf, want_im)
+                .unwrap()
+                .read_chunk(tf.nrows, &mut names)
+                .unwrap();
+            let mut out = Vec::new();
+            for (ci, &c) in chunk.cids.iter().enumerate() {
+                for set in [&chunk.frag, &chunk.ms1] {
+                    for row in chunk.rows(set, ci, &names) {
+                        out.push((
+                            c,
+                            row.frag_name.to_string(),
+                            bits(row.rt),
+                            bits(row.inten),
+                            bits(row.im),
+                        ));
+                    }
+                }
+            }
+            out
+        };
+        let one = read(&v1, true);
+        assert_eq!(one.len(), keys.len());
+        assert_eq!(
+            read(&v2, true),
+            one,
+            "v2 must give the rows v1 gives, 1/K0 included"
+        );
+        for (c, name, _, it, m) in &one {
+            let k = keys
+                .iter()
+                .position(|&(kc, kn)| kc == *c && kn == name.as_str())
+                .unwrap();
+            assert_eq!(it, &bits(inten[k]), "{c} {name}: the trace as written");
+            assert_eq!(m, &bits(mob[k]), "{c} {name}: the 1/K0 as written");
+        }
+        // Without `want_im` no 1/K0 is read, and the traces are the same.
+        let traces = |s: &Seen| -> Vec<(u32, Vec<u32>, Vec<u32>)> {
+            s.iter().map(|r| (r.0, r.2.clone(), r.3.clone())).collect()
+        };
+        for path in [&v1, &v2] {
+            let without = read(path, false);
+            assert!(without.iter().all(|r| r.4.is_empty()), "{path} read a 1/K0");
+            assert_eq!(traces(&without), traces(&one), "{path}: the traces moved");
         }
     }
 

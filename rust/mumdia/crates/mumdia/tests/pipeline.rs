@@ -457,6 +457,7 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         out_peak_bounds: None,
         cfg: &cfg.quant,
         config_hash: "test",
+        cross_run: None,
     })
     .unwrap();
     assert_written(&wq.peptide, &qpep);
@@ -512,6 +513,7 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
         out_peak_bounds: None,
         cfg: &cfg.quant,
         config_hash: "test",
+        cross_run: None,
     })
     .unwrap();
     [feats, competed, scored, qpep, qprot, qfrag]
@@ -866,6 +868,7 @@ fn assert_scans_identical(after: &[Ms2Scan], fresh: &[Ms2Scan]) {
         assert_eq!(a.rt_seconds.to_bits(), b.rt_seconds.to_bits());
         assert_eq!(a.window, b.window);
         assert_eq!(a.peaks, b.peaks, "peaks of scan {} changed", a.scan_index);
+        assert_eq!(a.im, b.im, "ion mobility of scan {} changed", a.scan_index);
     }
 }
 

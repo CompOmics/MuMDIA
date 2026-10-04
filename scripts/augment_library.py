@@ -22,6 +22,10 @@ The RT axis of the predicted entries need not match the imported DIA-NN iRT axis
 the per-run DeepLC fine-tune (`rt_im_train.finetune_deeplc`) re-predicts iRT for
 the whole library, putting every entry on one axis before extraction.
 
+Ion mobility: the added entries carry whatever `predicted_im` this predict-frag call
+produced (null unless `predict_frag.im_predictor` is set), while the imported rows keep
+the library's own 1/K0, so an augmented library with IM has a mixed IM source.
+
 Usage:
   python augment_library.py \
     --fasta fasta/ecoli.fasta \

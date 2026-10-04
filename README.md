@@ -573,9 +573,10 @@ Hard limits of this release:
   MuMDIA locates but does not install). `mumdia doctor` reports both converters.
   Only Thermo is exercised end to end; the other four are wired and unverified
   (`docs/04_convert.md`, "Vendor formats").
-- **No ion mobility.** The pipeline is 3D; the ion-mobility columns exist in the
-  artifacts and are always null. Bruker diaPASEF input is accepted but loses the
-  mobility separation the acquisition exists to produce.
+- **Ion mobility is read but not yet used.** A timsTOF `.d` is read natively with
+  per-peak 1/K0 and per-window 1/K0 bounds (`convert.bruker_reader = native`), but no
+  scoring stage uses mobility yet (`docs/TIMS_ROADMAP.md`, P2-P5), so diaPASEF still
+  searches with the interference of the whole window slot.
 - **No wildcard or terminal variable modifications.** Both are rejected at
   peptidoform expansion.
 - **Several files are one experiment by default.** `run` with several `--mzml`, like

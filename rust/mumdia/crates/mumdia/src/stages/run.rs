@@ -148,6 +148,7 @@ pub fn run(p: RunParams) -> Result<()> {
     resolved.predict_frag.sidecar_script_dir =
         crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
     crate::python::resolve(&mut resolved)?;
+    crate::stages::quant::apply_diapasef_quant(&mut resolved.quant, &[p.mzml]);
     pre.step("resolve_interpreters");
     let cfg = &resolved;
     preflight(&p, cfg)?;
@@ -367,6 +368,7 @@ pub fn run(p: RunParams) -> Result<()> {
         top_peaks_ms2: p.top_peaks_ms2,
         top_peaks_ms1: 0,
         config_hash: &convert_hash,
+        tdf: convert::TdfParams::from_config(&cfg.convert),
     })?;
     for (name, schema, path, hash) in [
         (
@@ -503,6 +505,7 @@ pub fn run(p: RunParams) -> Result<()> {
             // calibration. The seed is iRT-independent, so it was computed above on the
             // base library and is reused here. rt-im-train and extract then read the
             // fine-tuned library.
+            let lib_p_base = lib_p.clone();
             let lib_p = if mh_heads > 0 {
                 // Multi-head calibration occupies the fine-tune's slot: it needs this run's
                 // confident seed PSMs, which exist only now, and it rewrites the same library the
@@ -654,8 +657,17 @@ pub fn run(p: RunParams) -> Result<()> {
                 lib_p
             };
 
-            let windows = d("run_windows.parquet");
-            let cal = d("cal.json");
+            // `rt_im_train.refit`: pass 1 goes to `pass1/`, pass 2 to the canonical names.
+            // Off, pass 1 IS the run and writes where it always did.
+            let dir1 = if cfg.rt_im_train.refit {
+                d("pass1")
+            } else {
+                p.out_dir.to_string()
+            };
+            std::fs::create_dir_all(&dir1).ok();
+            let d1 = |name: &str| format!("{dir1}/{name}");
+            let windows = d1("run_windows.parquet");
+            let cal = d1("cal.json");
             info!(stage = %"rt-im-train", "run: stage start");
             // In memory as well as on disk: extract reads the same library, so it takes the
             // fitted windows as they are instead of decoding the table written here
@@ -670,94 +682,117 @@ pub fn run(p: RunParams) -> Result<()> {
                 cfg: &cfg.rt_im_train,
                 config_hash: &ch,
             })?;
-            man.record(w.record(
-                artifact::RUN_WINDOWS.0,
-                artifact::RUN_WINDOWS,
+            let refit = cfg.rt_im_train.refit;
+            if !refit {
+                man.record(w.record(
+                    artifact::RUN_WINDOWS.0,
+                    artifact::RUN_WINDOWS,
+                    &windows,
+                    "rt-im-train",
+                    &ch,
+                ));
+            }
+            // Pass 1 is recorded only when it is the run; under the refit, pass 2 is.
+            let c1 = extract_to_compete(
+                cfg,
+                &ch,
+                &co.ms2,
+                &co.ms1,
+                &seed,
+                &lib_p,
+                &lib_f,
                 &windows,
-                "rt-im-train",
-                &ch,
-            ));
-
-            let psms = d("psms_extracted.parquet");
-            let chrom = d("chromatograms.parquet");
-            info!(stage = %"extract", "run: stage start");
-            // The MS2 only (`SharedScans::ms1 = None`): extract decodes the MS1 itself,
-            // concurrently with its library load and after the library's errors, as it does
-            // with nothing lent.
-            let (wpsm, wchr) = extract::run_hashed(extract::ExtractParams {
-                precursor_span: None,
-                fragment_offset: None,
-                sibling_bands: 1,
-                rt_windows: fitted_windows,
-                scans: lent_ms2
-                    .as_deref()
-                    .map(|ms2| extract::SharedScans { ms2, ms1: None }),
-                ms2: &co.ms2,
-                library_precursors: &lib_p,
-                library_fragments: &lib_f,
-                run_windows: &windows,
-                ms1: Some(&co.ms1),
-                mass_cal: Some(&format!("{seed}.masscal.json")),
-                out_psms: &psms,
-                out_chrom: &chrom,
-                restrict_candidates: None,
-                cfg: &cfg.extract,
-                config_hash: &ch,
-            })?;
-            drop(lent_ms2);
-            man.record(wpsm.record(
-                artifact::PSMS_EXTRACTED.0,
-                artifact::PSMS_EXTRACTED,
-                &psms,
-                "extract",
-                &ch,
-            ));
-            man.record(wchr.record(
-                artifact::CHROMATOGRAMS.0,
-                artifact::chromatograms(cfg.extract.chromatogram_schema),
-                &chrom,
-                "extract",
-                &ch,
-            ));
-
-            let feats = d("features.parquet");
-            let pin = d("run.pin");
-            info!(stage = %"features", "run: stage start");
-            let wf = features::run_hashed(features::FeaturesParams {
-                psms: &psms,
-                chromatograms: &chrom,
-                seed: Some(&seed),
-                out: &feats,
-                out_pin: &pin,
-                cfg: &cfg.features,
-                config_hash: &ch,
-            })?;
-            man.record(wf.record(
-                artifact::FEATURES.0,
-                artifact::FEATURES,
-                &feats,
-                "features",
-                &ch,
-            ));
-
-            let competed = d("psms_competed.parquet");
-            info!(stage = %"compete", "run: stage start");
-            let w = compete::run_hashed(compete::CompeteParams {
-                features: &feats,
-                out: &competed,
-                cfg: &cfg.compete,
-                config_hash: &ch,
-                features_hash: Some(&wf.content_hash),
-            })?;
-            man.record(w.record(
-                artifact::PSMS_COMPETED.0,
-                artifact::PSMS_COMPETED,
-                &competed,
-                "compete",
-                &ch,
-            ));
-            let chrom = vec![quant::ChromTable::whole(&chrom)];
-            (seed, lib_p, psms, chrom, feats, vec![competed], None)
+                fitted_windows,
+                lent_ms2,
+                &dir1,
+                (!refit).then_some(&mut man),
+            )?;
+            if !refit {
+                let chrom = vec![quant::ChromTable::whole(&c1.chrom)];
+                (
+                    seed,
+                    lib_p,
+                    c1.psms,
+                    chrom,
+                    c1.feats,
+                    vec![c1.competed],
+                    None,
+                )
+            } else {
+                // Sequential, as the rest of a single run: the pass-1 rescore, the refit on
+                // its accepted targets, then pass 2 into the canonical names.
+                let scored1 = d1("psms_scored.parquet");
+                info!(stage = %"rescore", pass = 1, "run: stage start");
+                rescore::run(rescore::RescoreParams {
+                    competed: std::slice::from_ref(&c1.competed),
+                    sources: None,
+                    out: &scored1,
+                    work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
+                    script_dir: &cfg.predict_frag.sidecar_script_dir,
+                    cfg: &cfg.rescore,
+                    config_hash: &ch,
+                })?;
+                info!(stage = %"im-rt-refit", "run: stage start");
+                let r = im_rt_refit::run(im_rt_refit::RefitParams {
+                    cfg,
+                    config_hash: &ch,
+                    scored: &scored1,
+                    q_column: "q_value",
+                    extracted: &c1.psms,
+                    lib_pass1: &lib_p,
+                    lib_base: &lib_p_base,
+                    windows_pass1: &windows,
+                    out_dir: p.out_dir,
+                    mh_heads,
+                    shared_lib: None,
+                })?;
+                if r.lib != lib_p {
+                    let n = mumdia_io::table::nrows(&r.lib)?;
+                    man.record(record_artifact(
+                        artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+                        artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                        &r.lib,
+                        n,
+                        "im-rt-refit",
+                        &ch,
+                    )?);
+                }
+                let n = mumdia_io::table::nrows(&r.windows)?;
+                man.record(record_artifact(
+                    artifact::RUN_WINDOWS.0,
+                    artifact::RUN_WINDOWS,
+                    &r.windows,
+                    n,
+                    "im-rt-refit",
+                    &ch,
+                )?);
+                // The pass-2 windows are a new table, so extract reads them from the file,
+                // and decodes the spectra itself.
+                let c2 = extract_to_compete(
+                    cfg,
+                    &ch,
+                    &co.ms2,
+                    &co.ms1,
+                    &seed,
+                    &r.lib,
+                    &lib_f,
+                    &r.windows,
+                    None,
+                    None,
+                    p.out_dir,
+                    Some(&mut man),
+                )?;
+                let chrom = vec![quant::ChromTable::whole(&c2.chrom)];
+                (
+                    seed,
+                    r.lib,
+                    c2.psms,
+                    chrom,
+                    c2.feats,
+                    vec![c2.competed],
+                    None,
+                )
+            }
         };
     let _ = &feats;
     let _ = &seed;
@@ -837,6 +872,7 @@ pub fn run(p: RunParams) -> Result<()> {
         out_peak_bounds: None,
         cfg: &cfg.quant,
         config_hash: &ch,
+        cross_run: None,
     })?;
     man.record(wq.peptide.record(
         artifact::PEPTIDE_QUANT.0,
@@ -928,7 +964,7 @@ pub fn run(p: RunParams) -> Result<()> {
         .insert("rescorer".into(), actual_rescorer_model);
     man.model_identities.insert(
         "feature_schema_id".into(),
-        features::feature_schema_id(&features::active_features(cfg.features.set)),
+        features::feature_schema_id(&features::active_features_for(&cfg.features)),
     );
 
     // The input hashes, taken on the background thread started at the top, and the
@@ -981,4 +1017,193 @@ pub fn run(p: RunParams) -> Result<()> {
     // The DeepLC projection cache may have grown during the run.
     crate::cache::enforce_for(cfg);
     Ok(())
+}
+
+pub(crate) struct Chain {
+    pub psms: String,
+    pub chrom: String,
+    pub feats: String,
+    pub competed: String,
+}
+
+/// Extract, features and compete into `dir`, recording into `man` when given. Shared by
+/// the single-run orchestrator and `run-experiment`, and by both passes of
+/// `rt_im_train.refit`, which reruns it with the refit windows and library.
+///
+/// `rt_windows` are the windows `rt-im-train` handed over in memory for `windows`
+/// (`rt_im_train::RtWindows`); `lent_ms2` is a seed's MS2 decode lent on to extract, freed
+/// as soon as extract returns, before features. `None` for either reads or decodes it here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn extract_to_compete(
+    cfg: &Config,
+    ch: &str,
+    ms2: &str,
+    ms1: &str,
+    seed: &str,
+    lib_p: &str,
+    lib_f: &str,
+    windows: &str,
+    rt_windows: Option<rt_im_train::RtWindows>,
+    lent_ms2: Option<Vec<mumdia_core::types::Ms2Scan>>,
+    dir: &str,
+    mut man: Option<&mut Manifest>,
+) -> Result<Chain> {
+    let d = |name: &str| format!("{dir}/{name}");
+    let psms_extract = d("psms_extracted.parquet");
+    // `retrace.repick` writes the re-picked table beside extract's; the later stages read it.
+    let psms_repick = d("psms_extracted.repick.parquet");
+    let psms = if cfg.retrace.enabled && cfg.retrace.repick {
+        psms_repick.clone()
+    } else {
+        psms_extract.clone()
+    };
+    let chrom = d("chromatograms.parquet");
+    // `retrace.enabled`: extract's centroid traces go aside and `chromatograms.parquet` is
+    // the raw rebuild of them, so every later stage reads the usual path.
+    let raw = if cfg.retrace.enabled {
+        Some(retrace::raw_path_from_spectra(ms2)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "retrace.enabled needs a diaPASEF .d converted by the native reader \
+                 (convert.bruker_reader = native); {} was not",
+                ms2
+            )
+        })?)
+    } else {
+        None
+    };
+    if cfg.features.retrace_apex && raw.is_none() {
+        anyhow::bail!("features.retrace_apex needs retrace.enabled");
+    }
+    let chrom_extract = if raw.is_some() {
+        d("chromatograms.centroid.parquet")
+    } else {
+        chrom.clone()
+    };
+    // ponytail: retrace reads the v1 chromatogram layout, so extract writes v1 under it;
+    // port retrace's reader to v2 if the centroid table's size matters.
+    let mut ex_cfg = cfg.extract.clone();
+    if raw.is_some() {
+        ex_cfg.chromatogram_schema = 1;
+    }
+    info!(stage = %"extract", "run: stage start");
+    // The MS2 only (`SharedScans::ms1 = None`): extract decodes the MS1 itself,
+    // concurrently with its library load and after the library's errors, as it does
+    // with nothing lent.
+    let (wpsm, wchr) = extract::run_hashed(extract::ExtractParams {
+        precursor_span: None,
+        fragment_offset: None,
+        sibling_bands: 1,
+        rt_windows,
+        scans: lent_ms2
+            .as_deref()
+            .map(|ms2| extract::SharedScans { ms2, ms1: None }),
+        ms2,
+        library_precursors: lib_p,
+        library_fragments: lib_f,
+        run_windows: windows,
+        ms1: Some(ms1),
+        mass_cal: Some(&format!("{seed}.masscal.json")),
+        out_psms: &psms_extract,
+        out_chrom: &chrom_extract,
+        restrict_candidates: None,
+        cfg: &ex_cfg,
+        config_hash: ch,
+    })?;
+    drop(lent_ms2);
+    if let Some(m) = man.as_deref_mut() {
+        m.record(wpsm.record(
+            artifact::PSMS_EXTRACTED.0,
+            artifact::PSMS_EXTRACTED,
+            &psms_extract,
+            "extract",
+            ch,
+        ));
+        // The version is the written table's: its layout, and whether it carries the
+        // per-point mobility of a 4D run.
+        m.record(wchr.record(
+            artifact::CHROMATOGRAMS.0,
+            crate::chromatograms::recorded_schema(&chrom_extract)?,
+            &chrom_extract,
+            "extract",
+            ch,
+        ));
+    }
+    if let Some(raw) = &raw {
+        info!(stage = %"retrace", "run: stage start");
+        let n = retrace::run(retrace::RetraceParams {
+            raw,
+            chromatograms: &chrom_extract,
+            psms_extracted: &psms_extract,
+            run_windows: windows,
+            library_precursors: lib_p,
+            mass_cal: Some(&format!("{seed}.masscal.json")),
+            frag_tol_fallback_ppm: cfg.extract.frag_tol_ppm,
+            prec_tol_ppm: cfg.extract.prec_tol_ppm,
+            out: &chrom,
+            apex_out: cfg
+                .features
+                .retrace_apex
+                .then(|| features::retrace_apex_path(&chrom))
+                .as_deref(),
+            psms_out: cfg.retrace.repick.then_some(psms_repick.as_str()),
+            cfg: &cfg.retrace,
+            config_hash: ch,
+        })?;
+        if let Some(m) = man.as_deref_mut() {
+            m.record(record_artifact(
+                artifact::CHROMATOGRAMS.0,
+                crate::chromatograms::recorded_schema(&chrom)?,
+                &chrom,
+                n,
+                "retrace",
+                ch,
+            )?);
+        }
+    }
+
+    let feats = d("features.parquet");
+    info!(stage = %"features", "run: stage start");
+    let wf = features::run_hashed(features::FeaturesParams {
+        psms: &psms,
+        chromatograms: &chrom,
+        seed: Some(seed),
+        out: &feats,
+        out_pin: &d("run.pin"),
+        cfg: &cfg.features,
+        config_hash: ch,
+    })?;
+    if let Some(m) = man.as_deref_mut() {
+        m.record(wf.record(
+            artifact::FEATURES.0,
+            artifact::FEATURES,
+            &feats,
+            "features",
+            ch,
+        ));
+    }
+
+    let competed = d("psms_competed.parquet");
+    info!(stage = %"compete", "run: stage start");
+    let w = compete::run_hashed(compete::CompeteParams {
+        features: &feats,
+        out: &competed,
+        cfg: &cfg.compete,
+        config_hash: ch,
+        features_hash: Some(&wf.content_hash),
+    })?;
+    if let Some(m) = man {
+        m.record(w.record(
+            artifact::PSMS_COMPETED.0,
+            artifact::PSMS_COMPETED,
+            &competed,
+            "compete",
+            ch,
+        ));
+    }
+    Ok(Chain {
+        psms,
+        chrom,
+        feats,
+        competed,
+    })
 }

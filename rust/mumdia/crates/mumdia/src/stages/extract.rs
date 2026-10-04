@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use anyhow::Result;
-use mumdia_core::config::{ExtractConfig, GateMode, PeakClaim};
+use mumdia_core::config::{ExtractConfig, GateMode, ImGate, PeakClaim};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{
@@ -35,7 +35,7 @@ use crate::matchers::fragindex::{BinnedProbe, FragIndex, LocalIndex, WindowNarro
 use crate::spectra::{load_ms1, load_ms2, Ms1Scan};
 use crate::stages::rt_im_train::RtWindows;
 use mumdia_core::config::MatcherKind;
-use mumdia_core::types::Ms2Scan;
+use mumdia_core::types::{Ms2Scan, WindowKey};
 use rayon::prelude::*;
 
 /// The matcher backend plus the values that never change across a probe: which
@@ -193,6 +193,10 @@ pub struct SharedScans<'a> {
 /// and groups hits on the looked-up RT, and the two-pass elution profile keys on the RT's
 /// bits, exactly as before. Scans are RT-sorted by the loaders, but a sort on the index
 /// would still differ from one on the RT wherever two scans share an RT.
+///
+/// The peak's ion mobility (`im`, 4D data) is not recoverable from the scan index, because
+/// the hit does not record which peak of the scan it came from. It fills the two bytes of
+/// padding the other fields leave, so the hit stays 16 bytes on 3D and 4D data alike.
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Hit {
@@ -201,6 +205,8 @@ struct Hit {
     frag: u16,
     inten: f32,
     obs_mz: f32,
+    /// The peak's 1/K0 x 1e4 ([`hit_im`]), 0 on 3D data. A u16 keeps `Hit` at 16 bytes.
+    im: u16,
 }
 
 const _: () = assert!(std::mem::size_of::<Hit>() == 16);
@@ -209,6 +215,131 @@ const _: () = assert!(std::mem::size_of::<Hit>() == 16);
 #[inline]
 fn hit_rt(scans: &[Ms2Scan], h: &Hit) -> f64 {
     scans[h.scan as usize].rt_seconds
+}
+
+/// Peak `j`'s 1/K0 as a [`Hit`] carries it: x 1e4, rounded (the cast saturates); 0 on a
+/// 3D scan. 1e-4 V s cm^-2 is 40x finer than the calibrated IM error.
+#[inline]
+fn hit_im(scan: &Ms2Scan, j: usize) -> u16 {
+    scan.im.get(j).map_or(0, |&v| (v * 1e4).round() as u16)
+}
+
+/// Per-candidate 1/K0 window of `extract.im_gate`, from `run_windows.im_lo/im_hi`. A
+/// candidate without an IM window holds -inf/+inf and is never gated, as an unbounded RT
+/// window is not.
+pub(crate) struct ImWin {
+    lo: Vec<f32>,
+    hi: Vec<f32>,
+    /// `im_gate = fragments_ms1`: the MS1 precursor lookups are gated too.
+    ms1: bool,
+}
+
+impl ImWin {
+    /// This scan's gate: `None` when the gate is off or the scan carries no IM (3D).
+    #[inline]
+    fn for_scan<'a>(w: Option<&'a ImWin>, scan: &Ms2Scan) -> Option<&'a ImWin> {
+        w.filter(|_| !scan.im.is_empty())
+    }
+
+    /// Candidate `c`'s window for the MS1 lookups, when those are gated.
+    #[inline]
+    fn ms1_bounds(w: Option<&ImWin>, c: usize) -> Option<(f32, f32)> {
+        w.filter(|w| w.ms1).map(|w| (w.lo[c], w.hi[c]))
+    }
+
+    /// Whether a peak at 1/K0 `pim` lies outside candidate `c`'s window.
+    #[inline]
+    fn rejects(w: Option<&ImWin>, c: usize, pim: f32) -> bool {
+        w.is_some_and(|w| pim < w.lo[c] || pim > w.hi[c])
+    }
+}
+
+/// The IM gate's windows, or `None` when `extract.im_gate = off` or `run_windows` has no
+/// IM window at all (a 3D run, or no IM calibration), which runs ungated with a warning.
+fn load_im_win(
+    rw: &TableFile,
+    rw_cid: &[u32],
+    ncand: usize,
+    gate: ImGate,
+    path: &str,
+) -> Result<Option<ImWin>> {
+    if gate == ImGate::Off {
+        return Ok(None);
+    }
+    let (lo, hi) = if rw.has_column("im_lo") && rw.has_column("im_hi") {
+        (rw.opt_f64("im_lo")?, rw.opt_f64("im_hi")?)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mut w = ImWin {
+        lo: vec![f32::NEG_INFINITY; ncand],
+        hi: vec![f32::INFINITY; ncand],
+        ms1: gate == ImGate::FragmentsMs1,
+    };
+    let mut n = 0usize;
+    for (i, (l, h)) in lo.iter().zip(&hi).enumerate() {
+        let c = rw_cid[i] as usize;
+        if let (Some(l), Some(h), true) = (l, h, c < ncand) {
+            // A NaN bound would accept every peak, as in the RT guard.
+            if l.is_nan() || h.is_nan() {
+                anyhow::bail!(
+                    "run_windows row {i} (candidate_id {c}) has a NaN IM bound in {path}"
+                );
+            }
+            w.lo[c] = *l as f32;
+            w.hi[c] = *h as f32;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        warn!(
+            run_windows = path,
+            "extract: im_gate is on but run_windows has no IM window (3D run or no IM \
+             calibration); extracting without the IM gate"
+        );
+        return Ok(None);
+    }
+    info!(gated_candidates = n, ?gate, "extract: IM gate on");
+    Ok(Some(w))
+}
+
+/// The ion-mobility columns of `run_windows` that extract uses, scattered per candidate as
+/// the RT ones are: the `extract.im_gate` windows (`im_lo`, `im_hi`, [`load_im_win`]) and
+/// the calibrated 1/K0 (`im_pred_cal`, psms_extracted v4).
+///
+/// `RtWindows` carries no IM, so these are read from the file even when an orchestrator
+/// handed the RT windows over in memory, and only when something uses them: the gate when
+/// `im_gate` is on, the calibrated 1/K0 on 4D data (`has_im`). A 3D run with the gate off,
+/// the default, opens nothing here and gets `(None, [])`. `im_pred_cal` is left empty on 3D
+/// data, where rt-im-train writes it null for every candidate (no IM anchors), so every
+/// row's `im_pred_cal` is null there either way.
+fn read_im_windows(
+    path: &str,
+    ncand: usize,
+    gate: ImGate,
+    has_im: bool,
+) -> Result<(Option<ImWin>, Vec<Option<f64>>)> {
+    if gate == ImGate::Off && !has_im {
+        return Ok((None, Vec::new()));
+    }
+    let rw = TableFile::open(path)?;
+    let rw_cid = rw.u32("candidate_id")?;
+    let im_win = load_im_win(&rw, &rw_cid, ncand, gate, path)?;
+    // Calibrated 1/K0 per candidate (psms_extracted v4 `im_pred_cal`), null without IM
+    // calibration.
+    let im_cal: Vec<Option<f64>> = if has_im && rw.has_column("im_pred_cal") {
+        let mut cal = vec![None; ncand];
+        for (i, v) in rw.opt_f64("im_pred_cal")?.into_iter().enumerate() {
+            let c = rw_cid[i] as usize;
+            if c < ncand {
+                cal[c] = v;
+            }
+        }
+        cal
+    } else {
+        Vec::new()
+    };
+    Ok((im_win, im_cal))
 }
 
 /// Hits for many candidates in one flat buffer with per-candidate offsets (CSR).
@@ -643,7 +774,7 @@ impl HitAcc {
     }
 }
 
-type ChromOutputRow = (u32, String, f64, f64, f32, Vec<f32>, Vec<f32>);
+type ChromOutputRow = (u32, String, f64, f64, f32, Vec<f32>, Vec<f32>, Vec<f32>);
 
 /// Candidates per parallel chunk of the per-candidate pass: large enough to keep every
 /// core busy within a chunk, small enough that a chunk's chromatogram rows are tens of MB.
@@ -665,21 +796,26 @@ struct ChromChunk {
 impl ChromChunk {
     /// `offset` is the library row of this band's local id 0 (`Library::global_offset`),
     /// so the table carries library-wide ids even when the stage searched one band.
-    fn cols(mut self, offset: u32, layout: crate::chromatograms::Layout) -> Vec<Col> {
+    /// `has_im` adds the per-point 1/K0 list of a 4D table (`im` in v1, `im_trimmed` in
+    /// v2); a 3D run writes exactly the columns of its layout.
+    fn cols(mut self, offset: u32, layout: crate::chromatograms::Layout, has_im: bool) -> Vec<Col> {
         if offset != 0 {
             for c in &mut self.rows.cid {
                 *c += offset;
             }
         }
-        self.rows
-            .into_cols(layout, crate::chromatograms::Optional::ALL)
+        let opt = crate::chromatograms::Optional {
+            im: has_im,
+            ..crate::chromatograms::Optional::ALL
+        };
+        self.rows.into_cols(layout, opt)
     }
 }
 
 /// One observed peak for the per-scan demix: (observed intensity, observed m/z at the
 /// artifact's f32 width, claimants as (candidate_id, fragment_ordinal,
-/// predicted_intensity)).
-type DemixRow = (f32, f32, Vec<(u32, u16, f32)>);
+/// predicted_intensity), the peak's 1/K0 as a [`Hit`] carries it).
+type DemixRow = (f32, f32, Vec<(u32, u16, f32)>, u16);
 
 /// Per-candidate contested-peak statistics from the co-elution arbitration
 /// (two-pass path). `won`/`lost` are the summed observed intensity of shared peaks
@@ -993,7 +1129,7 @@ impl ScanGroups {
 }
 
 /// Index of the value in ascending `rts` nearest to `t` (binary search).
-fn nearest_index(rts: &[f64], t: f64) -> usize {
+pub(crate) fn nearest_index(rts: &[f64], t: f64) -> usize {
     if rts.is_empty() {
         return 0;
     }
@@ -1027,6 +1163,7 @@ fn claim_cue_multiplier(
     rt_cal: &[f64],
     ms1_scans: &[Ms1Scan],
     ms1_rts: &[f64],
+    im: Option<&ImWin>,
 ) -> f32 {
     let mut w = 1.0f32;
     if cfg.claim_cues.mz_close {
@@ -1060,11 +1197,12 @@ fn claim_cue_multiplier(
         let z = (cand.charge.max(1)) as f64;
         let sp = ISOTOPE_SPACING / z;
         let tol = cfg.prec_tol_ppm;
-        let mono = sum_near(&s.mz, &s.intensity, cand.precursor_mz, tol);
+        let wim = ImWin::ms1_bounds(im, cid as usize);
+        let mono = sum_near(s, cand.precursor_mz, tol, wim);
         if mono <= 0.0 {
             w *= 0.5;
         } else {
-            let i1 = sum_near(&s.mz, &s.intensity, cand.precursor_mz + sp, tol);
+            let i1 = sum_near(s, cand.precursor_mz + sp, tol, wim);
             let ratio = i1 / mono;
             if !(0.05..=2.0).contains(&ratio) {
                 w *= 0.75;
@@ -1142,6 +1280,7 @@ fn demix_solve_scan(
     apex_rt: f64,
     rt_lo: &[f64],
     rt_hi: &[f64],
+    im: Option<&ImWin>,
     cfg: &ExtractConfig,
 ) -> Option<DemixScan> {
     let pr = Prober {
@@ -1154,7 +1293,9 @@ fn demix_solve_scan(
     let mut col_of: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
     let mut rows: Vec<(f64, Vec<(u32, f32)>)> = Vec::new();
     let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
-    for peak in &scan.peaks {
+    let g = ImWin::for_scan(im, scan);
+    for (j, peak) in scan.peaks.iter().enumerate() {
+        let pim = g.map_or(0.0, |_| scan.im[j]);
         // Peaks are stored at the artifact's f32 width; widen once per peak. Exact, so
         // `mz` is the value the peak used to carry in an f64 field.
         let mz = peak.mz as f64;
@@ -1163,7 +1304,7 @@ fn demix_solve_scan(
         {
             let mut push = |c: u32, frag: u16, pi: f32| {
                 let cc = c as usize;
-                if apex_rt < rt_lo[cc] || apex_rt > rt_hi[cc] {
+                if apex_rt < rt_lo[cc] || apex_rt > rt_hi[cc] || ImWin::rejects(g, cc, pim) {
                     return;
                 }
                 claimants.push((c, frag, pi));
@@ -1352,21 +1493,71 @@ fn demix_features_for(d: &DemixScan, cid: u32) -> DemixFeatures {
 }
 
 /// Sum intensities of peaks within `tol_ppm` of `target` (m/z-sorted arrays).
-fn sum_near(mz: &[f32], inten: &[f32], target: f64, tol_ppm: f64) -> f32 {
+fn sum_near(scan: &Ms1Scan, target: f64, tol_ppm: f64, im: Option<(f32, f32)>) -> f32 {
+    let (mz, inten) = (&scan.mz, &scan.intensity);
     if mz.is_empty() {
         return 0.0;
     }
     let (lo, hi) = ppm_bounds(target, tol_ppm);
+    // `im_gate = fragments_ms1`: only peaks inside the candidate's 1/K0 window count. A
+    // 3D scan (no `im`) is not gated.
+    let im = im.filter(|_| !scan.im.is_empty());
     // MS1 m/z is stored as f32 (the artifact's precision); widening at the comparison
     // yields exactly the values the previous `Vec<f64>` copy held.
     let s = mz.partition_point(|&m| (m as f64) < lo);
     let mut acc = 0.0f32;
     let mut i = s;
     while i < mz.len() && (mz[i] as f64) <= hi {
-        acc += inten[i];
+        if im.is_none_or(|(a, b)| scan.im[i] >= a && scan.im[i] <= b) {
+            acc += inten[i];
+        }
         i += 1;
     }
     acc
+}
+
+/// 1/K0 of the MS1 peak within `tol_ppm` of `target` (and inside `win`, when given) that
+/// lies nearest `near`, or the most intense such peak when `near` is `None`. `None` on a
+/// 3D scan or without an in-tolerance peak. Ties keep the lower index.
+#[cfg(test)]
+fn ms1_im_near(
+    scan: &Ms1Scan,
+    target: f64,
+    tol_ppm: f64,
+    win: Option<(f32, f32)>,
+    near: Option<f64>,
+) -> Option<f64> {
+    ms1_peak_near(scan, target, tol_ppm, win, near).map(|i| scan.im[i] as f64)
+}
+
+/// Index of the peak [`ms1_im_near`] selects.
+fn ms1_peak_near(
+    scan: &Ms1Scan,
+    target: f64,
+    tol_ppm: f64,
+    win: Option<(f32, f32)>,
+    near: Option<f64>,
+) -> Option<usize> {
+    if scan.im.is_empty() {
+        return None;
+    }
+    let (lo, hi) = ppm_bounds(target, tol_ppm);
+    let mut i = scan.mz.partition_point(|&m| (m as f64) < lo);
+    let mut best: Option<(f64, usize)> = None; // (cost, peak index)
+    while i < scan.mz.len() && (scan.mz[i] as f64) <= hi {
+        let im = scan.im[i];
+        if win.is_none_or(|(a, b)| im >= a && im <= b) {
+            let cost = match near {
+                Some(n) => (im as f64 - n).abs(),
+                None => -(scan.intensity[i] as f64),
+            };
+            if best.is_none_or(|(bc, _)| cost < bc) {
+                best = Some((cost, i));
+            }
+        }
+        i += 1;
+    }
+    best.map(|b| b.1)
 }
 
 /// Co-elution acceptance score (sensitivity program): predicted-intensity-weighted
@@ -1475,14 +1666,14 @@ fn coelution_gate_score(groups: &ScanGroups, distinct: &[u16], sig: &[u16], fint
 /// matching. Either a single scalar ppm offset (`grid_*` empty, the default) or an
 /// m/z-dependent grid (sorted ascending) that is linearly interpolated and clamped
 /// at the ends. `factor_at(mz)` returns the divisor `1 + ppm(mz) * 1e-6`.
-struct MassOffset {
+pub(crate) struct MassOffset {
     scalar_ppm: f64,
     grid_mz: Vec<f64>,
     grid_ppm: Vec<f64>,
 }
 impl MassOffset {
     #[inline]
-    fn factor_at(&self, mz: f64) -> f64 {
+    pub(crate) fn factor_at(&self, mz: f64) -> f64 {
         let ppm = if self.grid_mz.len() >= 2 {
             match self.grid_mz.binary_search_by(|g| g.total_cmp(&mz)) {
                 Ok(i) => self.grid_ppm[i],
@@ -1501,6 +1692,47 @@ impl MassOffset {
     }
 }
 
+/// `(mass offset, fragment tolerance ppm)` from a search-seed `masscal.json`, or no offset
+/// and `fallback_tol_ppm` without one (a missing file included). The m/z grid is used only
+/// when both arrays agree in length and have >= 2 points. Shared by extract and retrace, so
+/// the raw traces sit on exactly the calibration the centroid traces were matched with.
+pub(crate) fn read_mass_cal(
+    path: Option<&str>,
+    fallback_tol_ppm: f64,
+) -> Result<(MassOffset, f64)> {
+    let Some(path) = path.filter(|m| std::path::Path::new(m).exists()) else {
+        return Ok((
+            MassOffset {
+                scalar_ppm: 0.0,
+                grid_mz: Vec::new(),
+                grid_ppm: Vec::new(),
+            },
+            fallback_tol_ppm,
+        ));
+    };
+    let v: serde_json::Value = mumdia_io::json::read_json(path)?;
+    let num = |key: &str| v.get(key).and_then(|x| x.as_f64());
+    let grid = |key: &str| -> Vec<f64> {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|e| e.as_f64()).collect())
+            .unwrap_or_default()
+    };
+    let (mut gmz, mut gpp) = (grid("mz_cal_grid_mz"), grid("mz_cal_grid_ppm"));
+    if !(gmz.len() >= 2 && gmz.len() == gpp.len()) {
+        gmz.clear();
+        gpp.clear();
+    }
+    Ok((
+        MassOffset {
+            scalar_ppm: num("frag_ppm_offset").unwrap_or(0.0),
+            grid_mz: gmz,
+            grid_ppm: gpp,
+        },
+        num("frag_tol_ppm").unwrap_or(fallback_tol_ppm),
+    ))
+}
+
 /// One isolation window and the scans acquired in it, with the candidate range that
 /// window can match. Ascending by window m/z, which (precursors being sorted by m/z)
 /// makes the candidate ranges ascending too: that is what lets the driver decide a
@@ -1514,15 +1746,9 @@ struct WinGroup {
 /// Group the run's scans by isolation window, ascending.
 fn window_groups(lib: &Library, scans: &[Ms2Scan]) -> Vec<WinGroup> {
     use std::collections::BTreeMap;
-    let mut groups: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
+    let mut groups: BTreeMap<WindowKey, Vec<usize>> = BTreeMap::new();
     for (si, scan) in scans.iter().enumerate() {
-        groups
-            .entry((
-                scan.window.lower_mz.to_bits(),
-                scan.window.upper_mz.to_bits(),
-            ))
-            .or_default()
-            .push(si);
+        groups.entry(scan.window.key()).or_default().push(si);
     }
     groups
         .into_values()
@@ -1546,6 +1772,8 @@ struct ProbeTask<'a> {
     scans: &'a [Ms2Scan],
     rt_lo: &'a [f64],
     rt_hi: &'a [f64],
+    /// The `extract.im_gate` windows; `None` when the gate is off.
+    im: Option<&'a ImWin>,
     mass_off: &'a MassOffset,
     cfg: &'a ExtractConfig,
     restrict: Option<&'a CandMask>,
@@ -1566,6 +1794,7 @@ impl ProbeTask<'_> {
             scans,
             rt_lo,
             rt_hi,
+            im,
             mass_off,
             cfg,
             restrict,
@@ -1604,6 +1833,9 @@ impl ProbeTask<'_> {
         let mut setup: Vec<(f64, u32)> = Vec::new();
         for &si in ids {
             let scan = &scans[si];
+            // The IM gate of this scan: `None` when the gate is off or the scan is 3D, and
+            // then `ImWin::rejects` is false and the RT test below is the whole test.
+            let g = ImWin::for_scan(im, scan);
             let rt = scan.rt_seconds;
             let hs = si as u32;
             setup.clear();
@@ -1612,13 +1844,15 @@ impl ProbeTask<'_> {
                 let q = mz / mass_off.factor_at(mz);
                 (q, bins.bin(q) as u32)
             }));
-            for (peak, &(q_mz, bin)) in scan.peaks.iter().zip(&setup) {
+            for (j, (peak, &(q_mz, bin))) in scan.peaks.iter().zip(&setup).enumerate() {
+                let pim = g.map_or(0.0, |_| scan.im[j]);
+                let him = hit_im(scan, j);
                 let inten = peak.intensity;
                 let obs_mz = peak.mz;
                 claimants.clear();
                 ix.probe_binned(q_mz, bin, |cid, _pmz, pint, frag| {
                     let c = cid as usize;
-                    if rt < rt_lo[c] || rt > rt_hi[c] {
+                    if rt < rt_lo[c] || rt > rt_hi[c] || ImWin::rejects(g, c, pim) {
                         return;
                     }
                     // The allowlist is applied here, before the claim, exactly where the
@@ -1651,6 +1885,7 @@ impl ProbeTask<'_> {
                             frag,
                             inten,
                             obs_mz,
+                            im: him,
                         });
                     }
                     PeakClaim::Proportional => {
@@ -1667,6 +1902,7 @@ impl ProbeTask<'_> {
                                 frag,
                                 inten: share,
                                 obs_mz,
+                                im: him,
                             });
                         }
                     }
@@ -1678,6 +1914,7 @@ impl ProbeTask<'_> {
                                 frag,
                                 inten,
                                 obs_mz,
+                                im: him,
                             });
                         }
                     }
@@ -1777,6 +2014,7 @@ fn accumulate_groups(
     scans: &[Ms2Scan],
     rt_lo: &[f64],
     rt_hi: &[f64],
+    im: Option<&ImWin>,
     mass_off: &MassOffset,
     cfg: &ExtractConfig,
     restrict: Option<&CandMask>,
@@ -1883,6 +2121,7 @@ fn accumulate_groups(
                 scans,
                 rt_lo,
                 rt_hi,
+                im,
                 mass_off,
                 cfg,
                 restrict,
@@ -2000,6 +2239,7 @@ fn extract_twopass_windows(
     scans: &[Ms2Scan],
     rt_lo: &[f64],
     rt_hi: &[f64],
+    im: Option<&ImWin>,
     rt_cal: &[f64],
     ms1_scans: &[Ms1Scan],
     ms1_rts: &[f64],
@@ -2011,15 +2251,9 @@ fn extract_twopass_windows(
     claim_margin: f32,
 ) -> (HashMap<u32, Vec<Hit>>, HashMap<u32, Contested>) {
     use std::collections::BTreeMap;
-    let mut groups: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
+    let mut groups: BTreeMap<WindowKey, Vec<usize>> = BTreeMap::new();
     for (si, scan) in scans.iter().enumerate() {
-        groups
-            .entry((
-                scan.window.lower_mz.to_bits(),
-                scan.window.upper_mz.to_bits(),
-            ))
-            .or_default()
-            .push(si);
+        groups.entry(scan.window.key()).or_default().push(si);
     }
     let group_vec: Vec<Vec<usize>> = groups.into_values().collect();
     let pr = Prober {
@@ -2048,9 +2282,12 @@ fn extract_twopass_windows(
             let mut acc1: HashMap<u32, Vec<Hit>> = HashMap::new();
             for &si in ids {
                 let scan = &scans[si];
+                let g = ImWin::for_scan(im, scan);
                 let rt = scan.rt_seconds;
                 let hs = si as u32;
-                for peak in &scan.peaks {
+                for (j, peak) in scan.peaks.iter().enumerate() {
+                    let pim = g.map_or(0.0, |_| scan.im[j]);
+                    let him = hit_im(scan, j);
                     let inten = peak.intensity;
                     let obs_mz = peak.mz;
                     let q_mz = obs_mz as f64 / mass_off.factor_at(obs_mz as f64);
@@ -2058,7 +2295,7 @@ fn extract_twopass_windows(
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
                             let c = cid as usize;
-                            if rt < rt_lo[c] || rt > rt_hi[c] {
+                            if rt < rt_lo[c] || rt > rt_hi[c] || ImWin::rejects(g, c, pim) {
                                 return;
                             }
                             if let Some(s) = restrict {
@@ -2076,6 +2313,7 @@ fn extract_twopass_windows(
                             frag,
                             inten,
                             obs_mz,
+                            im: him,
                         });
                     }
                 }
@@ -2102,9 +2340,11 @@ fn extract_twopass_windows(
                 let mut next: HashMap<u32, HashMap<u64, f32>> = HashMap::new();
                 for &si in ids {
                     let scan = &scans[si];
+                    let g = ImWin::for_scan(im, scan);
                     let rt = scan.rt_seconds;
                     let rtb = rt.to_bits();
-                    for peak in &scan.peaks {
+                    for (j, peak) in scan.peaks.iter().enumerate() {
+                        let pim = g.map_or(0.0, |_| scan.im[j]);
                         let inten = peak.intensity;
                         let obs_mz = peak.mz as f64;
                         let q_mz = obs_mz / mass_off.factor_at(obs_mz);
@@ -2112,7 +2352,7 @@ fn extract_twopass_windows(
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
                                 let c = cid as usize;
-                                if rt < rt_lo[c] || rt > rt_hi[c] {
+                                if rt < rt_lo[c] || rt > rt_hi[c] || ImWin::rejects(g, c, pim) {
                                     return;
                                 }
                                 if let Some(s) = restrict {
@@ -2137,7 +2377,8 @@ fn extract_twopass_windows(
                                     .unwrap_or(0.0);
                                 if h > 0.0 {
                                     h * claim_cue_multiplier(
-                                        cfg, lib, cid, frag, obs_mz, rt, rt_cal, ms1_scans, ms1_rts,
+                                        cfg, lib, cid, frag, obs_mz, rt, rt_cal, ms1_scans,
+                                        ms1_rts, im,
                                     )
                                 } else {
                                     h
@@ -2167,6 +2408,7 @@ fn extract_twopass_windows(
             let mut demix_ctr = 0usize;
             for &si in ids {
                 let scan = &scans[si];
+                let g = ImWin::for_scan(im, scan);
                 let rt = scan.rt_seconds;
                 let rtb = rt.to_bits();
                 let hs = si as u32;
@@ -2178,14 +2420,16 @@ fn extract_twopass_windows(
                     let mut cand: std::collections::BTreeSet<u32> =
                         std::collections::BTreeSet::new();
                     let mut prows: Vec<DemixRow> = Vec::new();
-                    for peak in &scan.peaks {
+                    for (j, peak) in scan.peaks.iter().enumerate() {
+                        let pim = g.map_or(0.0, |_| scan.im[j]);
+                        let him = hit_im(scan, j);
                         let obs_mz = peak.mz as f64;
                         let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
                                 let c = cid as usize;
-                                if rt < rt_lo[c] || rt > rt_hi[c] {
+                                if rt < rt_lo[c] || rt > rt_hi[c] || ImWin::rejects(g, c, pim) {
                                     return;
                                 }
                                 if let Some(s) = restrict {
@@ -2203,7 +2447,7 @@ fn extract_twopass_windows(
                         for &(cid, _, _) in &claimants {
                             cand.insert(cid);
                         }
-                        prows.push((peak.intensity, peak.mz, claimants.clone()));
+                        prows.push((peak.intensity, peak.mz, claimants.clone(), him));
                     }
                     if prows.is_empty() {
                         continue;
@@ -2222,7 +2466,7 @@ fn extract_twopass_windows(
                         let m = prows.len();
                         let mut amat = vec![0.0f64; m * n];
                         let mut yv = vec![0.0f64; m];
-                        for (r, (obs, _, cl)) in prows.iter().enumerate() {
+                        for (r, (obs, _, cl, _)) in prows.iter().enumerate() {
                             yv[r] = *obs as f64;
                             for &(cid, _, pi) in cl {
                                 let cell = &mut amat[r * n + col_of[&cid]];
@@ -2246,7 +2490,7 @@ fn extract_twopass_windows(
                     }
                     demix_ctr += 1;
                     // Apportion each peak by abundance_c * predicted_c (the joint split).
-                    for (obs, obs_mz, cl) in &prows {
+                    for (obs, obs_mz, cl, him) in &prows {
                         let mut denom = 0.0f64;
                         let mut winner = cl[0].0;
                         let mut best_bd = f64::NEG_INFINITY;
@@ -2279,6 +2523,7 @@ fn extract_twopass_windows(
                                 frag,
                                 inten: share as f32,
                                 obs_mz: *obs_mz,
+                                im: *him,
                             });
                         }
                     }
@@ -2290,14 +2535,16 @@ fn extract_twopass_windows(
                     // claimants' estimated contributions. No solve; several real co-eluters can
                     // both keep signal at a shared peak.
                     let mut prows: Vec<DemixRow> = Vec::new();
-                    for peak in &scan.peaks {
+                    for (j, peak) in scan.peaks.iter().enumerate() {
+                        let pim = g.map_or(0.0, |_| scan.im[j]);
+                        let him = hit_im(scan, j);
                         let obs_mz = peak.mz as f64;
                         let q_mz = obs_mz / mass_off.factor_at(obs_mz);
                         claimants.clear();
                         {
                             let mut push = |cid: u32, frag: u16, pi: f32| {
                                 let c = cid as usize;
-                                if rt < rt_lo[c] || rt > rt_hi[c] {
+                                if rt < rt_lo[c] || rt > rt_hi[c] || ImWin::rejects(g, c, pim) {
                                     return;
                                 }
                                 if let Some(s) = restrict {
@@ -2312,7 +2559,7 @@ fn extract_twopass_windows(
                         if claimants.is_empty() {
                             continue;
                         }
-                        prows.push((peak.intensity, peak.mz, claimants.clone()));
+                        prows.push((peak.intensity, peak.mz, claimants.clone(), him));
                     }
                     if prows.is_empty() {
                         continue;
@@ -2320,7 +2567,7 @@ fn extract_twopass_windows(
                     // Per-candidate abundance from unique (single-claimant) channels, median of
                     // observed/predicted. Deterministic (sorted cid, median of sorted ratios).
                     let mut uniq: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
-                    for (obs, _, cl) in &prows {
+                    for (obs, _, cl, _) in &prows {
                         if cl.len() == 1 {
                             let (cid, _, pi) = cl[0];
                             if pi > 0.0 {
@@ -2333,7 +2580,7 @@ fn extract_twopass_windows(
                         v.sort_by(|x, z| x.total_cmp(z));
                         a_p.insert(cid, v[v.len() / 2]);
                     }
-                    for (obs, obs_mz, cl) in &prows {
+                    for (obs, obs_mz, cl, him) in &prows {
                         for &(cid, frag, _) in cl {
                             let mut sub = 0.0f64;
                             for &(pj, _, pij) in cl {
@@ -2356,12 +2603,15 @@ fn extract_twopass_windows(
                                 frag,
                                 inten: cleaned as f32,
                                 obs_mz: *obs_mz,
+                                im: *him,
                             });
                         }
                     }
                     continue;
                 }
-                for peak in &scan.peaks {
+                for (j, peak) in scan.peaks.iter().enumerate() {
+                    let pim = g.map_or(0.0, |_| scan.im[j]);
+                    let him = hit_im(scan, j);
                     let inten = peak.intensity;
                     let obs_mz = peak.mz as f64;
                     let hit_mz = peak.mz;
@@ -2370,7 +2620,7 @@ fn extract_twopass_windows(
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
                             let c = cid as usize;
-                            if rt < rt_lo[c] || rt > rt_hi[c] {
+                            if rt < rt_lo[c] || rt > rt_hi[c] || ImWin::rejects(g, c, pim) {
                                 return;
                             }
                             if let Some(s) = restrict {
@@ -2404,7 +2654,7 @@ fn extract_twopass_windows(
                             let h = ph(cid);
                             if multicue && h > 0.0 {
                                 h * claim_cue_multiplier(
-                                    cfg, lib, cid, frag, obs_mz, rt, rt_cal, ms1_scans, ms1_rts,
+                                    cfg, lib, cid, frag, obs_mz, rt, rt_cal, ms1_scans, ms1_rts, im,
                                 )
                             } else {
                                 h
@@ -2461,6 +2711,7 @@ fn extract_twopass_windows(
                                             frag,
                                             inten,
                                             obs_mz: hit_mz,
+                                            im: him,
                                         });
                                     }
                                 }
@@ -2470,6 +2721,7 @@ fn extract_twopass_windows(
                                         frag,
                                         inten: share,
                                         obs_mz: hit_mz,
+                                        im: him,
                                     });
                                 }
                                 PeakClaim::CoelutionWinnerMargin if !dominant || cid == win => {
@@ -2478,6 +2730,7 @@ fn extract_twopass_windows(
                                         frag,
                                         inten,
                                         obs_mz: hit_mz,
+                                        im: him,
                                     });
                                 }
                                 _ => {}
@@ -2512,52 +2765,16 @@ fn extract_twopass_windows(
     (acc, contested)
 }
 
-/// The mass calibration extract applies, as read from `ExtractParams::mass_cal`.
-struct MassCalRead {
-    frag_offset: f64,
-    frag_tol: f64,
-    grid_mz: Vec<f64>,
-    grid_ppm: Vec<f64>,
-    /// The file it came from; `None` when no file was passed or it does not exist, and the
-    /// values are the configured fallback (no offset, `extract.frag_tol_ppm`).
-    from_file: Option<String>,
-}
-
-/// Read the per-run mass recalibration: the scalar offset + learned tolerance, plus an
-/// optional m/z-dependent correction grid (mass_cal_loess). No logging here; the caller
+/// The mass calibration extract applies ([`read_mass_cal`]), and the file it came from:
+/// `None` when no file was passed or it does not exist. No logging here; the caller
 /// reports it once the spectra are in, where the stage always reported it.
-fn read_mass_cal(p: &ExtractParams) -> Result<MassCalRead> {
-    let read_grid = |v: &serde_json::Value, key: &str| -> Vec<f64> {
-        v.get(key)
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|e| e.as_f64()).collect())
-            .unwrap_or_default()
-    };
-    match p.mass_cal {
-        Some(path) if std::path::Path::new(path).exists() => {
-            let v: serde_json::Value = mumdia_io::json::read_json(path)?;
-            Ok(MassCalRead {
-                frag_offset: v
-                    .get("frag_ppm_offset")
-                    .and_then(|x| x.as_f64())
-                    .unwrap_or(0.0),
-                frag_tol: v
-                    .get("frag_tol_ppm")
-                    .and_then(|x| x.as_f64())
-                    .unwrap_or(p.cfg.frag_tol_ppm),
-                grid_mz: read_grid(&v, "mz_cal_grid_mz"),
-                grid_ppm: read_grid(&v, "mz_cal_grid_ppm"),
-                from_file: Some(path.to_string()),
-            })
-        }
-        _ => Ok(MassCalRead {
-            frag_offset: 0.0,
-            frag_tol: p.cfg.frag_tol_ppm,
-            grid_mz: Vec::new(),
-            grid_ppm: Vec::new(),
-            from_file: None,
-        }),
-    }
+fn mass_cal_for(p: &ExtractParams) -> Result<(MassOffset, f64, Option<String>)> {
+    let (off, tol) = read_mass_cal(p.mass_cal, p.cfg.frag_tol_ppm)?;
+    let from_file = p
+        .mass_cal
+        .filter(|m| std::path::Path::new(m).exists())
+        .map(String::from);
+    Ok((off, tol, from_file))
 }
 
 /// Decode the spectra the caller did not lend: `(ms2, ms1)`, each `None` when the lent
@@ -2678,6 +2895,104 @@ pub(crate) fn read_run_windows(path: &str, ncand: usize) -> Result<RtWindows> {
     })
 }
 
+/// The ion-mobility columns of one `psms_extracted` row (v3-v5), every one `None` on 3D
+/// data. Computed per row at the row's own apex ([`apex_im_stats`]), so a promoted
+/// alternative peak carries the values of its own apex.
+#[derive(Clone, Copy, Default)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+struct ApexIm {
+    /// `apex_im` (v3): the intensity-weighted median 1/K0 of the candidate's fragment
+    /// peaks in its apex scan.
+    apex_im: Option<f64>,
+    /// `apex_im_mad` (v4): their intensity-weighted mean absolute deviation from `apex_im`.
+    apex_im_mad: Option<f64>,
+    /// `ms1_apex_im` (v4).
+    ms1_apex_im: Option<f64>,
+    /// The v5 peak-shape columns (`features::im::apex_shape`).
+    shape: super::features::im::ApexShape,
+    /// `im_pred_cal` (v4): the candidate's calibrated 1/K0 from `run_windows`.
+    im_pred_cal: Option<f64>,
+}
+
+/// The apex IM columns of a row of candidate `cid` whose apex is at `apex_rt`, on 4D data.
+///
+/// `apex_im` (psms_extracted v3) is the intensity-weighted median 1/K0 of the candidate's
+/// fragment peaks in its apex scan, the seed's `observed_im` definition at the extraction
+/// apex, inside the IM window when `im_gate` is on. v4 adds, from the same peaks,
+/// `apex_im_mad` (their intensity-weighted mean absolute deviation from `apex_im`), and
+/// `ms1_apex_im`: in the MS1 scan nearest the apex, the 1/K0 of the peak within
+/// `prec_tol_ppm` of the monoisotopic m/z that lies nearest `apex_im` (inside the IM window
+/// under `fragments_ms1`). Nearest rather than most intense, because at low load the most
+/// intense in-tolerance MS1 peak is often another ion in another mobility band
+/// (docs/TIMS_ROADMAP.md, P2 result). v5 adds the IM peak shape at the same peaks
+/// (`features::im::apex_shape`), filled only when the spectra carry per-peak widths (v3,
+/// `convert.tdf_im_width`). The apex scan is the one the demix resolves
+/// ([`demix_apex_scan`]). `im_pred_cal` is the caller's.
+#[allow(clippy::too_many_arguments)]
+fn apex_im_stats(
+    lib: &Library,
+    scans: &[Ms2Scan],
+    rt_scan: &HashMap<u64, Vec<u32>>,
+    ms1_scans: &[Ms1Scan],
+    ms1_rts: &[f64],
+    im_win: Option<&ImWin>,
+    mass_off: &MassOffset,
+    frag_tol: f64,
+    prec_tol_ppm: f64,
+    cid: u32,
+    apex_rt: f64,
+    prec_mz: f64,
+) -> ApexIm {
+    let c = cid as usize;
+    let (med, mad, frags) = demix_apex_scan(scans, rt_scan, apex_rt, prec_mz)
+        .map(|si| {
+            let scan = &scans[si];
+            let win = im_win.map(|w| (w.lo[c], w.hi[c]));
+            let targets = lib.cand_frag_mz(cid).iter().map(|&f| {
+                let f = f as f64;
+                f * mass_off.factor_at(f)
+            });
+            let idx = super::search_seed::frag_peak_indices(scan, targets, frag_tol, win);
+            let mut pts: Vec<(f64, f64)> = idx
+                .iter()
+                .map(|&j| (scan.im[j] as f64, scan.peaks[j].intensity as f64))
+                .collect();
+            // (1/K0, intensity, width) of the same peaks, in the same order.
+            let frags: Vec<(f64, f64, f64)> = if scan.im_width.is_empty() {
+                Vec::new()
+            } else {
+                idx.iter()
+                    .zip(&pts)
+                    .map(|(&j, &(m, w))| (m, w, scan.im_width[j] as f64))
+                    .collect()
+            };
+            let med = super::search_seed::weighted_median(&mut pts);
+            let mad = med.and_then(|m| super::search_seed::weighted_mad(&pts, m));
+            (med, mad, frags)
+        })
+        .unwrap_or((None, None, Vec::new()));
+    let ms1 = if ms1_scans.is_empty() {
+        None
+    } else {
+        let s1 = &ms1_scans[nearest_index(ms1_rts, apex_rt)];
+        ms1_peak_near(s1, prec_mz, prec_tol_ppm, ImWin::ms1_bounds(im_win, c), med)
+            .map(|k| (s1.im[k] as f64, s1.im_width.get(k).map(|&w| w as f64)))
+    };
+    let shape = match med {
+        Some(m) if !frags.is_empty() => {
+            super::features::im::apex_shape(&frags, m, ms1.and_then(|(im, w)| w.map(|w| (im, w))))
+        }
+        _ => Default::default(),
+    };
+    ApexIm {
+        apex_im: med,
+        apex_im_mad: mad,
+        ms1_apex_im: ms1.map(|m| m.0),
+        shape,
+        im_pred_cal: None,
+    }
+}
+
 /// One accepted candidate peak of `extract::run`: its `psms_extracted` row, its
 /// chromatogram rows and its retained alternative peaks.
 struct CandOut {
@@ -2721,7 +3036,10 @@ struct CandOut {
     deconv_share: f32,
     deconv_collin: f32,
     deconv_shadow: f32,
-    /// (cid, frag_name, frag_mz, frag_obs_mz, predicted_intensity, rt, intensity)
+    /// The ion-mobility columns (psms_extracted v3-v5); all `None` on 3D data.
+    im: ApexIm,
+    /// (cid, frag_name, frag_mz, frag_obs_mz, predicted_intensity, rt, intensity, im):
+    /// `im` is the per-point 1/K0 of a 4D run, as long as `intensity`, and empty on 3D.
     chrom: Vec<ChromOutputRow>,
     /// Top-K retained peak groups (sensitivity_plan P1.1/P1.2), populated only
     /// when `retain_top_peaks > 1`. Each: (rank, apex_rt, start_rt, end_rt,
@@ -2741,8 +3059,15 @@ struct CandOut {
 /// states why the chunk sequence is what matters). Only the demix features need the
 /// whole table, because they are patched in after the loop; with
 /// `emit_demix_features` the rows are kept and written at the end as before.
+///
+/// The ion-mobility columns (psms_extracted v3-v5) are always written, and they are
+/// stored per row only when `has_im` (4D data). On 3D data every one of them is null, and
+/// `take_cols` writes the nulls without a row of them having been kept.
 #[derive(Default)]
 struct PsmRows {
+    /// The spectra carry ion mobility: `im` holds one [`ApexIm`] per row.
+    has_im: bool,
+    im: Vec<ApexIm>,
     cid: Vec<u32>,
     peak_rank: Vec<i32>,
     apex_rt: Vec<f64>,
@@ -2783,6 +3108,9 @@ impl PsmRows {
 
     /// Append one row; its chromatogram rows are the caller's.
     fn push(&mut self, r: CandOut, cfg: &ExtractConfig) {
+        if self.has_im {
+            self.im.push(r.im);
+        }
         self.cid.push(r.cid);
         self.peak_rank.push(r.peak_rank as i32);
         self.apex_rt.push(r.apex_rt);
@@ -2827,6 +3155,17 @@ impl PsmRows {
     fn take_cols(&mut self, offset: u32, cfg: &ExtractConfig) -> Vec<Col> {
         use std::mem::take;
         let n = self.len();
+        // One ion-mobility column: read off the stored rows on 4D data, all null on 3D.
+        let has_im = self.has_im;
+        let im = take(&mut self.im);
+        debug_assert!(!has_im || im.len() == n, "one ApexIm per row on 4D data");
+        let im_col = |f: fn(&ApexIm) -> Option<f64>| -> Vec<Option<f64>> {
+            if has_im {
+                im.iter().map(f).collect()
+            } else {
+                vec![None; n]
+            }
+        };
         let mut cols = vec![
             Col::U32(
                 "candidate_id".into(),
@@ -2834,7 +3173,18 @@ impl PsmRows {
             ),
             Col::I32("peak_rank".into(), take(&mut self.peak_rank)),
             Col::F64("apex_rt".into(), take(&mut self.apex_rt)),
-            Col::OptF64("apex_im".into(), vec![None; n]),
+            Col::OptF64("apex_im".into(), im_col(|a| a.apex_im)),
+            Col::OptF64("apex_im_mad".into(), im_col(|a| a.apex_im_mad)),
+            Col::OptF64("ms1_apex_im".into(), im_col(|a| a.ms1_apex_im)),
+            Col::OptF64("apex_im_width".into(), im_col(|a| a.shape.frag_width)),
+            Col::OptF64(
+                "apex_im_width_mad".into(),
+                im_col(|a| a.shape.frag_width_mad),
+            ),
+            Col::OptF64("apex_im_overlap".into(), im_col(|a| a.shape.frag_overlap)),
+            Col::OptF64("ms1_im_width".into(), im_col(|a| a.shape.ms1_width)),
+            Col::OptF64("ms1_frag_overlap".into(), im_col(|a| a.shape.ms1_overlap)),
+            Col::OptF64("im_pred_cal".into(), im_col(|a| a.im_pred_cal)),
             Col::F32("apex_intensity".into(), take(&mut self.apex_int)),
             Col::I32("n_matched_fragments".into(), take(&mut self.n_match)),
             Col::I32("n_predicted_fragments".into(), take(&mut self.npred)),
@@ -2926,9 +3276,14 @@ struct PsmStream {
 }
 
 impl PsmStream {
-    fn new(path: &str, streamed: bool, offset: u32) -> PsmStream {
+    /// `has_im`: the spectra carry ion mobility, so the rows keep their IM columns
+    /// ([`PsmRows`]).
+    fn new(path: &str, streamed: bool, offset: u32, has_im: bool) -> PsmStream {
         PsmStream {
-            rows: PsmRows::default(),
+            rows: PsmRows {
+                has_im,
+                ..PsmRows::default()
+            },
             writer: streamed.then(|| TableWriter::new(path).with_content_hash()),
             path: path.to_string(),
             offset,
@@ -3036,7 +3391,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
     // tolerance is what the fragment index is built at, so building the index while the
     // spectra decode needs it up front. Its errors and its log lines stay where they were,
     // after the spectra (`mass?` below).
-    let mass = read_mass_cal(&p);
+    let mass = mass_cal_for(&p);
     let load_indexed = || -> Result<(Library, Option<FragIndex>, Option<LogBins>)> {
         let lib = Library::load_for_stage(
             p.library_precursors,
@@ -3053,11 +3408,11 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
         // way it is `FragIndex::geometry` at the learned tolerance.
         let (fidx, bins) = match (&mass, fragindex, global_index) {
             (Ok(m), true, true) => {
-                let f = FragIndex::build(&lib, m.frag_tol);
+                let f = FragIndex::build(&lib, m.1);
                 let b = f.bins().clone();
                 (Some(f), Some(b))
             }
-            (Ok(m), true, false) => (None, Some(FragIndex::geometry(&lib, m.frag_tol))),
+            (Ok(m), true, false) => (None, Some(FragIndex::geometry(&lib, m.1))),
             _ => (None, None),
         };
         Ok((lib, fidx, bins))
@@ -3147,6 +3502,13 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
             .unwrap_or_else(|| p.scans.and_then(|s| s.ms1).unwrap_or(&[])),
     );
     let ms1_rts: Vec<f64> = ms1_scans.iter().map(|s| s.rt_seconds).collect();
+    // 4D data: the fragment traces carry a per-point 1/K0 (chromatograms v3/v4 `im`), and
+    // psms_extracted its apex IM columns. Every IM path below is gated on this or on
+    // `extract.im_gate`, so a 3D run takes main's path unchanged.
+    let has_im = scans.iter().any(|s| !s.im.is_empty());
+    // The `extract.im_gate` windows and the calibrated 1/K0 per candidate; `(None, [])`,
+    // and nothing read, on a 3D run with the gate off.
+    let (im_win, im_cal) = read_im_windows(p.run_windows, ncand, p.cfg.im_gate, has_im)?;
     info!(
         candidates = ncand,
         scans = scans.len(),
@@ -3156,15 +3518,15 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
 
     // Isolation-window -> sorted scan RTs, for zero-filled chromatogram grids.
     let windows: Vec<(f64, f64, Vec<f64>)> = if p.cfg.emit_window_grid {
-        let mut tmp: HashMap<(u64, u64), Vec<f64>> = HashMap::new();
+        // Ordered, so windows sharing a lower bound (diaPASEF slots) keep a fixed order
+        // through the stable sort below.
+        let mut tmp: std::collections::BTreeMap<WindowKey, Vec<f64>> = Default::default();
         for s in scans {
-            tmp.entry((s.window.lower_mz.to_bits(), s.window.upper_mz.to_bits()))
-                .or_default()
-                .push(s.rt_seconds);
+            tmp.entry(s.window.key()).or_default().push(s.rt_seconds);
         }
         let mut w: Vec<(f64, f64, Vec<f64>)> = tmp
             .into_iter()
-            .map(|((lb, ub), mut v)| {
+            .map(|((lb, ub, _, _), mut v)| {
                 v.sort_by(|a, b| a.total_cmp(b));
                 (f64::from_bits(lb), f64::from_bits(ub), v)
             })
@@ -3186,19 +3548,13 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
 
     // Per-run mass recalibration (optional): the scalar offset + learned tolerance, plus
     // an optional m/z-dependent correction grid (mass_cal_loess), read at the top of the
-    // stage (`read_mass_cal`) and reported here, where it always was.
-    let MassCalRead {
-        frag_offset,
-        frag_tol,
-        grid_mz,
-        grid_ppm,
-        from_file,
-    } = mass?;
+    // stage (`mass_cal_for`) and reported here, where it always was.
+    let (mass_off, frag_tol, from_file) = mass?;
     if let Some(path) = from_file.as_deref() {
         info!(
-            frag_ppm_offset = frag_offset,
+            frag_ppm_offset = mass_off.scalar_ppm,
             frag_tol_ppm = frag_tol,
-            mz_cal_grid = grid_mz.len(),
+            mz_cal_grid = mass_off.grid_mz.len(),
             "extract: using mass recalibration"
         );
         // `extract.frag_tol_ppm` is a FALLBACK, not a setting, in any orchestrated
@@ -3217,20 +3573,6 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
             );
         }
     }
-    // The grid is used only if both arrays agree in length and have >= 2 points.
-    let mass_off = if grid_mz.len() >= 2 && grid_mz.len() == grid_ppm.len() {
-        MassOffset {
-            scalar_ppm: frag_offset,
-            grid_mz,
-            grid_ppm,
-        }
-    } else {
-        MassOffset {
-            scalar_ppm: frag_offset,
-            grid_mz: Vec::new(),
-            grid_ppm: Vec::new(),
-        }
-    };
 
     // The fragment index, built with the library above at this same learned tolerance,
     // when a path needs the global one; and the geometry the streamed path's task-local
@@ -3283,13 +3625,16 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                 frag_tol,
             };
             for (si, scan) in scans.iter().enumerate() {
+                let g = ImWin::for_scan(im_win.as_ref(), scan);
                 let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
                 if hi <= lo {
                     continue;
                 }
                 let rt = scan.rt_seconds;
                 let hs = si as u32;
-                for peak in &scan.peaks {
+                for (j, peak) in scan.peaks.iter().enumerate() {
+                    let pim = g.map_or(0.0, |_| scan.im[j]);
+                    let him = hit_im(scan, j);
                     let inten = peak.intensity;
                     let obs_mz = peak.mz;
                     let q_mz = obs_mz as f64 / mass_off.factor_at(obs_mz as f64);
@@ -3300,7 +3645,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
                             let c = cid as usize;
-                            if rt < rt_lo[c] || rt > rt_hi[c] {
+                            if rt < rt_lo[c] || rt > rt_hi[c] || ImWin::rejects(g, c, pim) {
                                 return;
                             }
                             if let Some(s) = &restrict {
@@ -3331,6 +3676,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                                 frag,
                                 inten,
                                 obs_mz,
+                                im: him,
                             });
                         }
                         PeakClaim::Proportional => {
@@ -3346,6 +3692,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                                     frag,
                                     inten: share,
                                     obs_mz,
+                                    im: him,
                                 });
                             }
                         }
@@ -3357,6 +3704,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                                     frag,
                                     inten,
                                     obs_mz,
+                                    im: him,
                                 });
                             }
                         }
@@ -3387,6 +3735,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
             scans,
             &rt_lo,
             &rt_hi,
+            im_win.as_ref(),
             &rt_cal,
             ms1_scans,
             &ms1_rts,
@@ -3485,12 +3834,13 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
     // stops it; the error is kept here and returned once the chromatogram writer has been
     // stopped without publishing (`close_chromatograms`).
     let stream_psms = !p.cfg.emit_demix_features;
-    let mut psms = PsmStream::new(p.out_psms, stream_psms, lib.global_offset);
+    let mut psms = PsmStream::new(p.out_psms, stream_psms, lib.global_offset, has_im);
     let mut psms_err: Option<anyhow::Error> = None;
 
-    // Apex-scan lookup for spectrum-centric demixing (D2): rt_bits -> scan indices.
-    // Built only when demixing is requested, so the default path pays nothing.
-    let rt_scan: HashMap<u64, Vec<u32>> = if p.cfg.emit_demix_features {
+    // Apex-scan lookup for spectrum-centric demixing (D2) and, on 4D data, for the apex IM
+    // columns (`apex_im_stats`): rt_bits -> scan indices. Built only when one of them needs
+    // it, so the default 3D path pays nothing.
+    let rt_scan: HashMap<u64, Vec<u32>> = if p.cfg.emit_demix_features || has_im {
         let mut m: HashMap<u64, Vec<u32>> = HashMap::new();
         for (si, s) in scans.iter().enumerate() {
             m.entry(s.rt_seconds.to_bits()).or_default().push(si as u32);
@@ -3529,17 +3879,32 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
         // deterministic and unchanged.
         let width = hits.iter().map(|h| h.frag as usize + 1).max().unwrap_or(0);
         let mut groups = ScanGroups::new(width);
+        // On 4D data, the 1/K0 (`Hit::im`, x 1e4) of the hit each (scan group, fragment)
+        // intensity came from: `groups x width`, laid out as the group values and moved with
+        // them, 0 where no hit set it (chromatograms `im`). Empty on 3D data, where nothing
+        // below touches it.
+        let mut group_im: Vec<u16> = Vec::new();
         for h in hits.iter() {
             let h_rt = hit_rt(scans, h);
             match groups.rt.last() {
                 Some(&rt) if (rt - h_rt).abs() < 1e-9 => {
                     let i = groups.len() - 1;
+                    // The mobility follows the kept intensity: it is replaced exactly when
+                    // `merge_max` replaces the value, which for a fragment first seen in
+                    // this group means against 0.0.
+                    if has_im && h.inten > groups.or_zero(i, h.frag) {
+                        group_im[i * width + h.frag as usize] = h.im;
+                    }
                     groups.merge_max(i, h.frag, h.inten);
                 }
                 _ => {
                     groups.push_group(h_rt);
                     let i = groups.len() - 1;
                     groups.insert(i, h.frag, h.inten);
+                    if has_im {
+                        group_im.resize(group_im.len() + width, 0);
+                        group_im[i * width + h.frag as usize] = h.im;
+                    }
                 }
             }
         }
@@ -3561,6 +3926,10 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
             // span is unchanged, so the same windows contribute in the same order.
             let s = windows.partition_point(|w| w.0 < pm - window_max_width);
             let e = windows.partition_point(|w| w.0 <= pm);
+            // ponytail: m/z-only coverage, also under `im_gate`. Exact while diaPASEF slots
+            // have disjoint m/z (both benchmark schemes). A scheme that tiles one m/z range
+            // over several IM slots needs the slot IM bounds here, or the grid gains the
+            // RTs of slots that cannot hold the candidate.
             let mut g: Vec<f64> = Vec::new();
             let mut covering = 0usize;
             for (wl, wu, rts) in &windows[s..e] {
@@ -3588,6 +3957,12 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
             // were built from rt-sorted hits), so this is a merge rather than a per-
             // candidate `HashMap` of the grid. The match is still on the exact bit
             // pattern, so a group whose RT is not a grid RT is dropped exactly as before.
+            // On 4D data the mobilities move with their group, a whole row at a time.
+            let mut aligned_im: Vec<u16> = if has_im {
+                vec![0; grid.len() * width]
+            } else {
+                Vec::new()
+            };
             let mut j = 0usize;
             for i in 0..groups.len() {
                 let rt = groups.rt(i);
@@ -3596,10 +3971,15 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                 }
                 if j < grid.len() && grid[j].to_bits() == rt.to_bits() {
                     aligned.copy_group(j, &groups, i);
+                    if has_im {
+                        aligned_im[j * width..(j + 1) * width]
+                            .copy_from_slice(&group_im[i * width..(i + 1) * width]);
+                    }
                     j += 1;
                 }
             }
             groups = aligned;
+            group_im = aligned_im;
         }
 
         // Apex: the scan group with the most distinct matched fragments, allowing
@@ -3787,11 +4167,12 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
             let z = c.charge as f64;
             let sp = ISOTOPE_SPACING / z;
             let tol = p.cfg.prec_tol_ppm;
+            let wim = ImWin::ms1_bounds(im_win.as_ref(), cid as usize);
             (
-                Some(sum_near(&s.mz, &s.intensity, c.precursor_mz - sp, tol) as f64),
-                Some(sum_near(&s.mz, &s.intensity, c.precursor_mz, tol) as f64),
-                Some(sum_near(&s.mz, &s.intensity, c.precursor_mz + sp, tol) as f64),
-                Some(sum_near(&s.mz, &s.intensity, c.precursor_mz + 2.0 * sp, tol) as f64),
+                Some(sum_near(s, c.precursor_mz - sp, tol, wim) as f64),
+                Some(sum_near(s, c.precursor_mz, tol, wim) as f64),
+                Some(sum_near(s, c.precursor_mz + sp, tol, wim) as f64),
+                Some(sum_near(s, c.precursor_mz + 2.0 * sp, tol, wim) as f64),
             )
         };
         let (o_ms1_m1, o_ms1_mono, o_ms1_i1, o_ms1_i2) = ms1_at(apex_rt);
@@ -3982,6 +4363,32 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                 }
                 (rts, ints)
             };
+            // Per-point 1/K0 on 4D data, parallel to `ints` and read in the same group
+            // order in both modes: the mobility of the hit each intensity came from, and
+            // +0.0 wherever the trace is +0.0 (an absent fragment in grid mode, or a hit of
+            // zero intensity), so the v2 trim of the trace loses no mobility and both
+            // layouts decode to the same list. Empty for a never-observed fragment, as its
+            // trace is, and empty on 3D data.
+            let ims: Vec<f32> = if !has_im || !observed.contains(frag) {
+                Vec::new()
+            } else {
+                let im_of = |gi: usize, v: f32| -> f32 {
+                    if v.to_bits() == 0 {
+                        0.0
+                    } else {
+                        group_im[gi * width + fi] as f32 * 1e-4
+                    }
+                };
+                if !grid.is_empty() {
+                    (0..groups.len())
+                        .map(|gi| im_of(gi, groups.or_zero(gi, frag)))
+                        .collect()
+                } else {
+                    (0..groups.len())
+                        .filter_map(|gi| groups.get(gi, frag).map(|v| im_of(gi, v)))
+                        .collect()
+                }
+            };
             chrom_rows.push((
                 cid,
                 // Fragment names are interned in the library (a u16 dictionary id per
@@ -3993,6 +4400,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                 fints[fi],
                 rts,
                 ints,
+                ims,
             ));
         }
 
@@ -4003,6 +4411,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
         if !ms1_scans.is_empty() && !grid.is_empty() {
             let sp = ISOTOPE_SPACING / c.charge as f64;
             let tol = p.cfg.prec_tol_ppm;
+            let wim = ImWin::ms1_bounds(im_win.as_ref(), cid as usize);
             for (nm, dmz) in [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)] {
                 let mz = c.precursor_mz + dmz;
                 let ints: Vec<f32> = grid
@@ -4016,10 +4425,18 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                         // this tree with clippy 1.96.0, silent before and an error after,
                         // though which of the lint's heuristics distinguishes `Vec`
                         // indexing from slice indexing was not established.
-                        sum_near(&ms1_scans[j].mz, &ms1_scans[j].intensity, mz, tol)
+                        sum_near(&ms1_scans[j], mz, tol, wim)
                     })
                     .collect();
-                chrom_rows.push((cid, nm.to_string(), mz, mz, 0.0, grid_rt.clone(), ints));
+                // The MS1 XICs carry no per-point mobility. On a 4D table every row's list
+                // is as long as its trace (`Encoder::encode_im`, `Decoder::row_im`), so these
+                // rows hold +0.0, "no 1/K0", at every point; on 3D data nothing.
+                let ims: Vec<f32> = if has_im {
+                    vec![0.0; ints.len()]
+                } else {
+                    Vec::new()
+                };
+                chrom_rows.push((cid, nm.to_string(), mz, mz, 0.0, grid_rt.clone(), ints, ims));
             }
         }
 
@@ -4058,6 +4475,35 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
         let (deconv_explained, deconv_active, deconv_share, deconv_collin, deconv_shadow) =
             (0.0, 0.0, 0.0, 0.0, 0.0);
 
+        // The apex IM columns (psms_extracted v3-v5) of a row with its apex at `rt`, the
+        // selected apex and every promoted alternative alike. They depend only on the
+        // candidate, the row's apex RT and the precursor m/z, so they are computed here, per
+        // accepted row, rather than in a pass over the finished table: psms_extracted is
+        // streamed out in chunks and is not held until the end. All null on 3D data.
+        let im_pred_cal = im_cal.get(cid as usize).copied().flatten();
+        let im_at = |rt: f64| -> ApexIm {
+            if !has_im {
+                return ApexIm::default();
+            }
+            ApexIm {
+                im_pred_cal,
+                ..apex_im_stats(
+                    &lib,
+                    scans,
+                    &rt_scan,
+                    ms1_scans,
+                    &ms1_rts,
+                    im_win.as_ref(),
+                    &mass_off,
+                    frag_tol,
+                    p.cfg.prec_tol_ppm,
+                    cid,
+                    rt,
+                    c.precursor_mz,
+                )
+            }
+        };
+
         let rank0 = CandOut {
             cid,
             peak_rank: 0, // selected apex; ranks >= 1 added when promote_top_peaks > 1
@@ -4090,6 +4536,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
             deconv_share: deconv_share as f32,
             deconv_collin: deconv_collin as f32,
             deconv_shadow: deconv_shadow as f32,
+            im: im_at(apex_rt),
             chrom: chrom_rows,
             peaks,
         };
@@ -4178,6 +4625,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                 deconv_share: 0.0,
                 deconv_collin: 0.0,
                 deconv_shadow: 0.0,
+                im: im_at(alt_apex_rt),
                 chrom: Vec::new(), // shared per-candidate via the rank-0 row
                 peaks: Vec::new(),
             });
@@ -4260,7 +4708,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                         return false;
                     }
                     let rows = &mut ch.rows;
-                    for (cc, nm, fmz, omz, pint, rt, it) in chrom {
+                    for (cc, nm, fmz, omz, pint, rt, it, im) in chrom {
                         rows.cid.push(cc);
                         rows.name.push(nm);
                         rows.frag_mz.push(fmz);
@@ -4268,13 +4716,19 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                         rows.predicted_intensity.push(pint);
                         if chrom_layout == crate::chromatograms::Layout::V2 {
                             // The band-local id: the offset is added to every row alike,
-                            // so it cannot change which rows share a candidate.
-                            match chrom_encoder.encode(cc, rt, it) {
+                            // so it cannot change which rows share a candidate. On 4D data
+                            // the row's per-point 1/K0 is cut to the run its trace keeps;
+                            // on 3D data `encode_im(.., None)` is `encode`.
+                            let im = if has_im { Some(im) } else { None };
+                            match chrom_encoder.encode_im(cc, rt, it, im) {
                                 Ok(e) => {
                                     rows.rt.push(e.rt);
                                     rows.intensity.push(e.intensity);
                                     rows.trace_offset.push(e.trace_offset);
                                     rows.trace_len.push(e.trace_len);
+                                    if has_im {
+                                        rows.im.push(e.im);
+                                    }
                                 }
                                 // A row the encoder refuses stops the loop like a failed
                                 // psms write, and the table is abandoned the same way.
@@ -4286,6 +4740,9 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                         } else {
                             rows.rt.push(rt);
                             rows.intensity.push(it);
+                            if has_im {
+                                rows.im.push(im);
+                            }
                         }
                     }
                 }
@@ -4304,7 +4761,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                 // the writer failed; its error surfaces at the join below. The columns are
                 // built before the clock starts, so the timer holds only the wait for a
                 // free channel slot.
-                let cols = ch.cols(chrom_offset, chrom_layout);
+                let cols = ch.cols(chrom_offset, chrom_layout, has_im);
                 let t_send = Instant::now();
                 let sent = tx.send(cols);
                 chrom_send_blocked += t_send.elapsed();
@@ -4355,6 +4812,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                     scans,
                     &rt_lo,
                     &rt_hi,
+                    im_win.as_ref(),
                     &mass_off,
                     p.cfg,
                     restrict.as_ref(),
@@ -4431,7 +4889,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
         // A final empty chunk fixes the schema when no candidate was accepted at all. Not
         // after a failed psms_extracted write, whose table is abandoned below.
         if psms_err.is_none() {
-            let _ = tx.send(ChromChunk::default().cols(0, chrom_layout));
+            let _ = tx.send(ChromChunk::default().cols(0, chrom_layout, has_im));
         }
         drop(tx);
         let (w, mut writer_busy) = writer
@@ -4498,6 +4956,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                     scan.rt_seconds,
                     &rt_lo,
                     &rt_hi,
+                    im_win.as_ref(),
                     p.cfg,
                 ) {
                     Some(d) => cids
@@ -4574,7 +5033,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
         (p.out_psms, artifact::PSMS_EXTRACTED, psms_written),
         (
             p.out_chrom,
-            artifact::chromatograms(chrom_layout.version()),
+            artifact::chromatograms(chrom_layout.version(), has_im),
             chrom_written,
         ),
     ] {
@@ -4589,7 +5048,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
             params: json!({
                 "frag_tol_ppm": p.cfg.frag_tol_ppm,
                 "effective_frag_tol_ppm": frag_tol,
-                "frag_ppm_offset": frag_offset,
+                "frag_ppm_offset": mass_off.scalar_ppm,
                 "presence_min_fragments": p.cfg.presence_min_fragments,
                 "presence_min_coelution": p.cfg.presence_min_coelution,
                 "gate_min_score": p.cfg.gate_min_score,
@@ -5084,8 +5543,176 @@ mod accumulate_tests {
                         intensity: 10.0 + (si + k) as f32,
                     })
                     .collect(),
+
+                im: Vec::new(),
+                im_width: Vec::new(),
             })
             .collect()
+    }
+
+    /// The IM gate removes exactly the hits whose peak 1/K0 lies outside the candidate's
+    /// window, leaves every other candidate's hits untouched, and is inert on 3D scans, on
+    /// the task-local index the streamed path probes and on the global reference alike. The
+    /// hits carry their peak's 1/K0 (0 on 3D scans).
+    #[test]
+    fn im_gate_drops_out_of_window_peaks_only() {
+        let n = 50;
+        let lib = lib(n);
+        let idx = FragIndex::build(&lib, 20.0);
+        let bins = FragIndex::geometry(&lib, 20.0);
+        let stats = LocalIndexStats::default();
+        let local = TaskProbe::Local {
+            lib: &lib,
+            bins: &bins,
+            tol_ppm: 20.0,
+            stats: &stats,
+        };
+        let global = TaskProbe::Global(&idx);
+        let w = IsolationWindow {
+            target_mz: 400.0,
+            lower_mz: 400.0 - 1e-9,
+            upper_mz: 400.0 + (n - 1) as f64 * 1e-3 + 1e-9,
+            im_lower: None,
+            im_upper: None,
+        };
+        let plain = scans(3, w, 0);
+        let mut mob = plain.clone();
+        for s in &mut mob {
+            s.im = vec![1.0; s.peaks.len()];
+        }
+        let (lo, hi) = idx.candidate_range(w.lower_mz, w.upper_mz);
+        let groups = vec![WinGroup {
+            lo_cid: lo,
+            hi_cid: hi,
+            scans: vec![0, 1, 2],
+        }];
+        let mut gate = ImWin {
+            lo: vec![f32::NEG_INFINITY; n],
+            hi: vec![f32::INFINITY; n],
+            ms1: false,
+        };
+        (gate.lo[0], gate.hi[0]) = (0.5, 0.9);
+        let mass_off = MassOffset {
+            scalar_ppm: 0.0,
+            grid_mz: Vec::new(),
+            grid_ppm: Vec::new(),
+        };
+        let cfg = ExtractConfig::default();
+        let (rt_lo, rt_hi) = (vec![0.0; n], vec![1e9; n]);
+        let run = |probe: TaskProbe<'_>, sc: &[Ms2Scan], im: Option<&ImWin>| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            let mut acc = HitAcc::default();
+            let mut chunk = HitStore::default();
+            pool.install(|| {
+                // `bound = 0` flushes nothing, so the comparison is over the accumulator.
+                let mut sink = |_: Vec<(u32, &mut [Hit])>| -> bool { true };
+                accumulate_groups(
+                    probe, 1, &groups, sc, &rt_lo, &rt_hi, im, &mass_off, &cfg, None, 0, &mut acc,
+                    &mut chunk, &mut sink,
+                );
+            });
+            materialize(acc)
+        };
+        for (probe, what) in [(local, "local"), (global, "global")] {
+            let ungated = run(probe, &mob, None);
+            assert!(
+                ungated.contains_key(&0),
+                "{what}: candidate 0 must match ungated"
+            );
+            assert!(
+                ungated.values().flatten().all(|h| h.im == 10_000),
+                "{what}: a hit carries its peak's 1/K0 x 1e4"
+            );
+            let gated = run(probe, &mob, Some(&gate));
+            assert!(
+                !gated.contains_key(&0),
+                "{what}: candidate 0's window excludes every peak"
+            );
+            let mut rest = ungated.clone();
+            rest.remove(&0);
+            assert_eq!(gated, rest, "{what}: other candidates keep their hits");
+            let flat = run(probe, &plain, None);
+            assert!(
+                flat.values().flatten().all(|h| h.im == 0),
+                "{what}: 3D hits carry no 1/K0"
+            );
+            assert_eq!(
+                run(probe, &plain, Some(&gate)),
+                flat,
+                "{what}: 3D scans are not gated"
+            );
+        }
+    }
+
+    #[test]
+    fn sum_near_im_filter_counts_only_in_window_peaks() {
+        let s = Ms1Scan {
+            scan_index: 0,
+            rt_seconds: 0.0,
+            mz: vec![500.0, 500.0005, 500.001],
+            intensity: vec![1.0, 2.0, 4.0],
+            im: vec![0.8, 1.0, 1.2],
+            im_width: Vec::new(),
+        };
+        assert_eq!(sum_near(&s, 500.0005, 10.0, None), 7.0);
+        assert_eq!(sum_near(&s, 500.0005, 10.0, Some((0.9, 1.1))), 2.0);
+        let flat = Ms1Scan {
+            im: Vec::new(),
+            ..s
+        };
+        assert_eq!(sum_near(&flat, 500.0005, 10.0, Some((0.9, 1.1))), 7.0);
+    }
+
+    /// `ms1_apex_im`: the in-tolerance peak nearest the fragment 1/K0, the most intense
+    /// without one, only in-window peaks under the MS1 gate, and nothing on 3D data.
+    #[test]
+    fn ms1_im_near_picks_the_peak_nearest_the_fragment_mobility() {
+        let s = Ms1Scan {
+            scan_index: 0,
+            rt_seconds: 0.0,
+            mz: vec![500.0, 500.0005, 500.001, 600.0],
+            intensity: vec![1.0, 2.0, 4.0, 9.0],
+            im: vec![0.8, 1.0, 1.2, 0.95],
+            im_width: Vec::new(),
+        };
+        let near = |w, n| ms1_im_near(&s, 500.0005, 10.0, w, n).map(|v| (v * 1e3).round());
+        assert_eq!(near(None, Some(0.97)), Some(1000.0));
+        assert_eq!(near(None, None), Some(1200.0));
+        assert_eq!(near(Some((0.7, 0.9)), Some(0.97)), Some(800.0));
+        assert_eq!(near(Some((1.3, 1.4)), None), None);
+        let flat = Ms1Scan {
+            im: Vec::new(),
+            ..s
+        };
+        assert_eq!(ms1_im_near(&flat, 500.0005, 10.0, None, None), None);
+    }
+
+    /// The per-point 1/K0 rides in the padding: `Hit` must stay 16 bytes, since the hit
+    /// accumulator is extract's largest transient buffer.
+    #[test]
+    fn hit_carries_its_mobility_at_no_size_cost() {
+        assert_eq!(std::mem::size_of::<Hit>(), 16);
+        let mut scan = Ms2Scan {
+            scan_index: 0,
+            rt_seconds: 0.0,
+            window: IsolationWindow {
+                target_mz: 500.0,
+                lower_mz: 490.0,
+                upper_mz: 510.0,
+                im_lower: None,
+                im_upper: None,
+            },
+            peaks: Vec::new(),
+            im: vec![0.91234, 7.0],
+            im_width: Vec::new(),
+        };
+        assert_eq!(hit_im(&scan, 0), 9123);
+        assert_eq!(hit_im(&scan, 1), u16::MAX); // saturates, never wraps
+        scan.im.clear();
+        assert_eq!(hit_im(&scan, 0), 0);
     }
 
     /// The candidate-range split inside a window is a partition, so the accumulator it
@@ -5217,7 +5844,7 @@ mod accumulate_tests {
                     };
                     accumulate_groups(
                         // One band in this test, so the probing fan-out is the whole pool.
-                        probe, 1, &groups, &sc, &rt_lo, &rt_hi, &mass_off, &cfg, None, bound,
+                        probe, 1, &groups, &sc, &rt_lo, &rt_hi, None, &mass_off, &cfg, None, bound,
                         &mut acc, &mut chunk, &mut sink,
                     );
                 });
@@ -5340,6 +5967,7 @@ mod accumulate_tests {
                 frag: (i % 6) as u16,
                 inten: 1.0 + i as f32,
                 obs_mz: 300.0 + i as f32 * 0.01,
+                im: 0,
             };
             cid.push(c);
             hits.push(h);
@@ -5368,6 +5996,7 @@ mod accumulate_tests {
             frag: 0,
             inten: 1.0,
             obs_mz: 300.0,
+            im: 0,
         };
         let mut a = HitStore::default();
         a.push_segment(4, &[h(1), h(2)]);
@@ -5399,6 +6028,7 @@ mod accumulate_tests {
             frag: 0,
             inten: 1.0,
             obs_mz: 300.0,
+            im: 0,
         };
         let mut a = HitStore::default();
         for c in [2u32, 5, 8, 11] {
@@ -5468,6 +6098,7 @@ mod accumulate_tests {
                                                 frag: (scan % 7) as u16,
                                                 inten: scan as f32,
                                                 obs_mz: 300.0,
+                                                im: (scan % 5) as u16,
                                             }
                                         })
                                         .collect();
@@ -5527,6 +6158,7 @@ mod accumulate_tests {
             frag: 0,
             inten: 1.0,
             obs_mz: 300.0,
+            im: 0,
         };
         let mut a = HitStore::default();
         for c in 0..50u32 {
@@ -5605,6 +6237,19 @@ mod psms_stream_tests {
             deconv_share: 0.5,
             deconv_collin: 0.125,
             deconv_shadow: 0.0,
+            im: ApexIm {
+                apex_im: i.is_multiple_of(4).then_some(0.8 + f * 1e-4),
+                apex_im_mad: (i % 3 == 1).then_some(f * 1e-5),
+                ms1_apex_im: (!i.is_multiple_of(6)).then_some(0.9 - f * 1e-5),
+                shape: crate::stages::features::im::ApexShape {
+                    frag_width: i.is_multiple_of(2).then_some(0.01 + f * 1e-6),
+                    frag_width_mad: (i % 5 == 2).then_some(f * 1e-7),
+                    frag_overlap: (i % 7 != 3).then_some(0.5),
+                    ms1_width: i.is_multiple_of(9).then_some(0.02),
+                    ms1_overlap: (i % 11 == 4).then_some(0.25),
+                },
+                im_pred_cal: (!i.is_multiple_of(13)).then_some(1.0 + f * 1e-6),
+            },
             chrom: Vec::new(),
             peaks: Vec::new(),
         }
@@ -5614,7 +6259,9 @@ mod psms_stream_tests {
     /// row, exactly one chunk (whose last chunk `push` wrote, so `finish` writes no tail),
     /// one past it, and two chunks plus a short tail. The unstreamed arm is `write_table`
     /// over the whole table, which is how the table was written before it was streamed.
-    /// Every optional column group is covered by the second configuration.
+    /// Every optional column group is covered by the second configuration, and the
+    /// ion-mobility columns by the 4D cases (`has_im`), which store them per row; on 3D
+    /// they are null whatever the rows carry.
     #[test]
     fn the_streamed_psms_table_is_the_write_table_file() {
         let c = WRITE_TABLE_CHUNK_ROWS;
@@ -5624,21 +6271,23 @@ mod psms_stream_tests {
             emit_demix_features: true,
             ..ExtractConfig::default()
         };
-        let cases: [(&str, &ExtractConfig, usize); 7] = [
-            ("default", &ExtractConfig::default(), 0),
-            ("default", &ExtractConfig::default(), 1),
-            ("default", &ExtractConfig::default(), c),
-            ("default", &ExtractConfig::default(), c + 1),
-            ("default", &ExtractConfig::default(), 2 * c + 3),
-            ("wide", &wide, 0),
-            ("wide", &wide, c + 1),
+        let cases: [(&str, &ExtractConfig, usize, bool); 9] = [
+            ("default", &ExtractConfig::default(), 0, false),
+            ("default", &ExtractConfig::default(), 1, false),
+            ("default", &ExtractConfig::default(), c, false),
+            ("default", &ExtractConfig::default(), c + 1, false),
+            ("default", &ExtractConfig::default(), 2 * c + 3, false),
+            ("wide", &wide, 0, false),
+            ("wide", &wide, c + 1, false),
+            ("im", &ExtractConfig::default(), 2 * c + 3, true),
+            ("wide_im", &wide, c + 1, true),
         ];
-        for (tag, cfg, n) in cases {
+        for (tag, cfg, n, has_im) in cases {
             let streamed = scratch(&format!("streamed_{tag}_{n}.parquet"));
             let whole = scratch(&format!("whole_{tag}_{n}.parquet"));
             let (mut s, mut w) = (
-                PsmStream::new(&streamed, true, 7),
-                PsmStream::new(&whole, false, 7),
+                PsmStream::new(&streamed, true, 7, has_im),
+                PsmStream::new(&whole, false, 7, has_im),
             );
             for i in 0..n {
                 s.push(row(i), cfg).unwrap();
@@ -5669,6 +6318,28 @@ mod psms_stream_tests {
                 // The global offset is applied to every chunk, not only the first.
                 assert_eq!(t.u32("candidate_id").unwrap()[n - 1], (n - 1) as u32 + 7);
             }
+            // The IM columns read back row for row on 4D data, and null on 3D.
+            let ims: Vec<ApexIm> = (0..n).map(|i| row(i).im).collect();
+            let expect = |f: fn(&ApexIm) -> Option<f64>| -> Vec<Option<f64>> {
+                ims.iter()
+                    .map(|a| if has_im { f(a) } else { None })
+                    .collect()
+            };
+            assert_eq!(
+                t.opt_f64("apex_im").unwrap(),
+                expect(|a| a.apex_im),
+                "{tag} {n}"
+            );
+            assert_eq!(
+                t.opt_f64("ms1_frag_overlap").unwrap(),
+                expect(|a| a.shape.ms1_overlap),
+                "{tag} {n}"
+            );
+            assert_eq!(
+                t.opt_f64("im_pred_cal").unwrap(),
+                expect(|a| a.im_pred_cal),
+                "{tag} {n}"
+            );
         }
     }
 
@@ -5681,7 +6352,7 @@ mod psms_stream_tests {
         std::fs::write(&parent, b"a file").unwrap();
         let out = format!("{parent}/psms_extracted.parquet");
         let cfg = ExtractConfig::default();
-        let mut s = PsmStream::new(&out, true, 0);
+        let mut s = PsmStream::new(&out, true, 0, false);
         for i in 0..WRITE_TABLE_CHUNK_ROWS - 1 {
             s.push(row(i), &cfg).unwrap();
         }

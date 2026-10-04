@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use mumdia_core::config::{MatcherKind, SearchSeedConfig};
+use mumdia_core::config::{MatcherKind, SearchSeedConfig, SeedImGate};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{write_table_hashed, Col};
@@ -19,9 +19,9 @@ use tracing::{info, warn};
 
 use crate::fdr::{count_targets_at_q, ln_factorial, target_decoy_q};
 use crate::index::Library;
-use crate::matchers::fragindex::{FragIndex, SeedScratch};
+use crate::matchers::fragindex::{FragIndex, ImGateView, SeedScratch};
 use crate::spectra::load_ms2;
-use mumdia_core::types::Ms2Scan;
+use mumdia_core::types::{Ms2Scan, WindowKey};
 use rayon::prelude::*;
 
 pub struct SearchSeedParams<'a> {
@@ -110,6 +110,9 @@ struct SeedLibraryKey {
     fragment_offset: Option<u32>,
     precursor_span: Option<(usize, usize)>,
     fragindex: bool,
+    /// The index carries each posting's fragment ordinal, which
+    /// `search_seed.unique_fragment_matches` reads ([`FragIndex::build_mz_only_with_ordinals`]).
+    fragment_ordinals: bool,
     tol_bits: u64,
     bucket_size: usize,
 }
@@ -126,6 +129,11 @@ impl SeedLibrary {
     /// DeepLC step. The bucketed matcher keeps the full load, because `page_search` serves
     /// `idx_int` out of arrays built from the intensities.
     ///
+    /// Under `search_seed.unique_fragment_matches` the fragindex index also carries each
+    /// posting's fragment ordinal ([`FragIndex::build_mz_only_with_ordinals`], 2 bytes per
+    /// posting), which the once-per-spectrum fragment key reads. With the key off it is the
+    /// plain m/z-only index.
+    ///
     /// `fragment_offset` and `precursor_span` select the rows exactly as for
     /// [`Library::load_for_stage`]: the whole table, a band file, or a row span of the
     /// whole table.
@@ -138,12 +146,14 @@ impl SeedLibrary {
         bucket_size: usize,
     ) -> Result<SeedLibrary> {
         let fragindex = matches!(cfg.matcher, MatcherKind::Fragindex);
+        let fragment_ordinals = fragindex && cfg.unique_fragment_matches;
         let key = SeedLibraryKey {
             precursors: precursors.to_string(),
             fragments: fragments.to_string(),
             fragment_offset,
             precursor_span,
             fragindex,
+            fragment_ordinals,
             tol_bits: cfg.fragment_tol_ppm.to_bits(),
             bucket_size,
         };
@@ -154,7 +164,11 @@ impl SeedLibrary {
                 fragment_offset,
                 precursor_span,
             )?;
-            let fidx = FragIndex::build_mz_only(&lib, cfg.fragment_tol_ppm);
+            let fidx = if fragment_ordinals {
+                FragIndex::build_mz_only_with_ordinals(&lib, cfg.fragment_tol_ppm)
+            } else {
+                FragIndex::build_mz_only(&lib, cfg.fragment_tol_ppm)
+            };
             return Ok(SeedLibrary {
                 lib,
                 fidx: Some(fidx),
@@ -234,6 +248,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             fragment_offset: p.fragment_offset,
             precursor_span: p.precursor_span,
             fragindex,
+            fragment_ordinals: fragindex && p.cfg.unique_fragment_matches,
             tol_bits: p.cfg.fragment_tol_ppm.to_bits(),
             bucket_size: p.bucket_size,
         };
@@ -312,9 +327,38 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
     // groups (each scan belongs to exactly one window, so groups are independent) and
     // is bit-identical to the serial path via a deterministic per-candidate merge; the
     // bucketed path stays serial.
-    let best: HashMap<u32, Best> = if let Some(idx) = fidx {
-        seed_fragindex_windows(idx, scans, p.cfg)
+    //
+    // The seed IM gate (`search_seed.im_gate`, diaPASEF) reads the library's predicted
+    // 1/K0 by candidate id; with the gate off nothing is read and no scan is gated.
+    let mut im_stats = serde_json::Map::new();
+    let pred_im = if p.cfg.im_gate != SeedImGate::Off {
+        let v = read_predicted_im(p.library_precursors, p.precursor_span, lib.n_candidates())?;
+        if v.is_none() {
+            warn!(
+                "search-seed: im_gate is on but the library has no predicted_im; searching ungated"
+            );
+        }
+        v
     } else {
+        None
+    };
+    let mut im_win: Option<ImWindow> = None;
+    let best: HashMap<u32, Best> = if let Some(idx) = fidx {
+        match &pred_im {
+            Some(pred) => {
+                let (b, w) = seed_im_gated(idx, lib, scans, p.cfg, pred, &mut im_stats);
+                im_win = w;
+                b
+            }
+            None => seed_fragindex_windows(idx, scans, p.cfg, None),
+        }
+    } else {
+        if p.cfg.unique_fragment_matches {
+            warn!(
+                "search-seed: search_seed.unique_fragment_matches needs the fragindex matcher; \
+                 the bucketed matcher counts every matching peak"
+            );
+        }
         let mut best: HashMap<u32, Best> = HashMap::new();
         for scan in scans {
             let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
@@ -422,6 +466,13 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
     // The same deviations keyed by library-wide candidate id and scan, written beside the
     // masscal for a grouped run to pool. Stays empty otherwise.
     let mut calibrants = crate::masscal::Calibrants::default();
+    // Observed 1/K0 per confident target (schema v2): the intensity-weighted median IM of
+    // its matched fragment peaks in the best scan, the anchor rt-im-train calibrates the
+    // library's predicted IM against. Fragments inherit the precursor's mobility in
+    // diaPASEF, because the TIMS separation precedes fragmentation. Only peaks within the
+    // search tolerance count, not the wider calibrant collection window, so random
+    // matches stay out. Null for every other row and on 3D data.
+    let mut obs_im_c: Vec<Option<f64>> = vec![None; n_rows];
     for (i, (cid, b)) in rows.iter().enumerate() {
         if is_dec[i] {
             continue;
@@ -451,6 +502,8 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             // the learned tolerance came out too tight. The 50 ppm floor is kept for the
             // narrow-tolerance case, where a wider window would just admit noise.
             let collect_ppm = 50.0_f64.max(p.cfg.fragment_tol_ppm);
+            let cand_win = im_win.as_ref().map(|w| w.get(*cid));
+            let mut im_pts: Vec<(f64, f64)> = Vec::new();
             for &fmz in mzs {
                 // library m/z is stored f32; widen once, the value is unchanged
                 let fmz = fmz as f64;
@@ -459,14 +512,23 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
                 // partition point, the walk bound and the ppm deviation are all computed
                 // on the same doubles a widened-at-load peak carried.
                 let s = scan.peaks.partition_point(|pk| (pk.mz as f64) < lo);
-                let (mut bestd, mut bestppm) = (f64::MAX, None);
+                let (mut bestd, mut bestppm, mut bestj) = (f64::MAX, None, 0usize);
                 let mut j = s;
                 while j < scan.peaks.len() && (scan.peaks[j].mz as f64) <= hi {
+                    // Under the seed IM gate, a peak outside the candidate's window is
+                    // neither a calibrant nor an IM anchor.
+                    if let Some((a, b)) = cand_win {
+                        if !scan.im.is_empty() && (scan.im[j] < a || scan.im[j] > b) {
+                            j += 1;
+                            continue;
+                        }
+                    }
                     let pmz = scan.peaks[j].mz as f64;
                     let d = (pmz - fmz).abs();
                     if d < bestd {
                         bestd = d;
                         bestppm = Some(mumdia_core::constants::ppm_diff(pmz, fmz));
+                        bestj = j;
                     }
                     j += 1;
                 }
@@ -474,6 +536,10 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
                     if confident {
                         devs.push(pp);
                         dev_mz.push(fmz);
+                        if !scan.im.is_empty() && pp.abs() <= p.cfg.fragment_tol_ppm {
+                            im_pts
+                                .push((scan.im[bestj] as f64, scan.peaks[bestj].intensity as f64));
+                        }
                     }
                     if p.emit_calibrants {
                         calibrants.candidate_id.push(gid);
@@ -486,6 +552,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
                     }
                 }
             }
+            obs_im_c[i] = weighted_median(&mut im_pts);
         }
     }
     // Median offset + 95th-percentile-of-centered tolerance, with the optional robust
@@ -518,6 +585,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
         "search-seed: mass recalibration"
     );
 
+    let n_obs_im = obs_im_c.iter().filter(|v| v.is_some()).count();
     let seed_written = write_table_hashed(
         p.out,
         vec![
@@ -538,6 +606,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             Col::F32("predicted_irt".into(), irt_c),
             Col::I32("matched_peaks".into(), matched_c),
             Col::U32("scan_index".into(), scan_c),
+            Col::OptF64("observed_im".into(), obs_im_c),
         ],
     )?;
     let n = seed_written.rows;
@@ -546,6 +615,13 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("psms".to_string(), json!(n));
     stats.insert(format!("targets_at_q{}", p.cfg.fdr_seed), json!(n_at_1pct));
+    stats.insert("with_observed_im".to_string(), json!(n_obs_im));
+    if p.cfg.im_gate != SeedImGate::Off {
+        stats.insert("im_gate".to_string(), json!(p.cfg.im_gate));
+        stats.insert("im_window".to_string(), json!(p.cfg.im_window));
+        stats.insert("im_gate_applied".to_string(), json!(im_win.is_some()));
+        stats.extend(im_stats);
+    }
     if let Some((n_cal, bytes, n_targets)) = calibrant_stats {
         stats.insert("calibrant_deviations".to_string(), json!(n_cal));
         stats.insert("calibrant_bytes".to_string(), json!(bytes));
@@ -559,13 +635,20 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
         rows: n,
         // Computed while the table was written.
         content_hash: seed_written.content_hash,
-        params: json!({
-            "fragment_tol_ppm": p.cfg.fragment_tol_ppm,
-            "report_psms": p.cfg.report_psms,
-            "min_matched_peaks": p.cfg.min_matched_peaks,
-            "top_n_peaks": p.cfg.top_n_peaks,
-            "fdr_seed": p.cfg.fdr_seed,
-        }),
+        params: {
+            let mut v = json!({
+                "fragment_tol_ppm": p.cfg.fragment_tol_ppm,
+                "report_psms": p.cfg.report_psms,
+                "min_matched_peaks": p.cfg.min_matched_peaks,
+                "top_n_peaks": p.cfg.top_n_peaks,
+                "fdr_seed": p.cfg.fdr_seed,
+            });
+            // Only when on, so a default report is unchanged.
+            if p.cfg.unique_fragment_matches {
+                v["unique_fragment_matches"] = json!(true);
+            }
+            v
+        },
         stats,
         model_identity: Some("native-seed-hyperscore-v1".to_string()),
         elapsed_ms: elapsed,
@@ -580,6 +663,98 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
     );
     drop(owned_library);
     Ok((report.written(), owned_scans))
+}
+
+/// Intensity-weighted median 1/K0 of the peaks nearest each target fragment m/z in one
+/// scan, within `tol_ppm` and, when given, inside the 1/K0 window. `None` on a 3D scan or
+/// with no matched peak. Shared by the two-pass seed gate and extract's `apex_im`.
+pub(crate) fn frag_im(
+    scan: &Ms2Scan,
+    targets: impl Iterator<Item = f64>,
+    tol_ppm: f64,
+    win: Option<(f32, f32)>,
+) -> Option<f64> {
+    weighted_median(&mut frag_im_points(scan, targets, tol_ppm, win))
+}
+
+/// The `(1/K0, intensity)` of the peak nearest each target fragment m/z, as [`frag_im`]
+/// selects them. Empty on a 3D scan.
+pub(crate) fn frag_im_points(
+    scan: &Ms2Scan,
+    targets: impl Iterator<Item = f64>,
+    tol_ppm: f64,
+    win: Option<(f32, f32)>,
+) -> Vec<(f64, f64)> {
+    frag_peak_indices(scan, targets, tol_ppm, win)
+        .into_iter()
+        .map(|j| (scan.im[j] as f64, scan.peaks[j].intensity as f64))
+        .collect()
+}
+
+/// Index of the peak nearest each target fragment m/z within `tol_ppm` and, when given,
+/// inside the 1/K0 window; targets without such a peak are skipped. Empty on a 3D scan.
+pub(crate) fn frag_peak_indices(
+    scan: &Ms2Scan,
+    targets: impl Iterator<Item = f64>,
+    tol_ppm: f64,
+    win: Option<(f32, f32)>,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    if scan.im.is_empty() {
+        return out;
+    }
+    for target in targets {
+        let (lo, hi) = mumdia_core::constants::ppm_bounds(target, tol_ppm);
+        let mut j = scan.peaks.partition_point(|pk| (pk.mz as f64) < lo);
+        let mut best: Option<(f64, usize)> = None;
+        while j < scan.peaks.len() && (scan.peaks[j].mz as f64) <= hi {
+            let im = scan.im[j];
+            if win.is_none_or(|(a, b)| im >= a && im <= b) {
+                let d = (scan.peaks[j].mz as f64 - target).abs();
+                if best.is_none_or(|(bd, _)| d < bd) {
+                    best = Some((d, j));
+                }
+            }
+            j += 1;
+        }
+        if let Some((_, j)) = best {
+            out.push(j);
+        }
+    }
+    out
+}
+
+/// Intensity-weighted mean absolute deviation of `pts` from `center`. `None` when
+/// weightless.
+pub(crate) fn weighted_mad(pts: &[(f64, f64)], center: f64) -> Option<f64> {
+    let total: f64 = pts.iter().map(|p| p.1).sum();
+    if total.is_nan() || total <= 0.0 {
+        return None;
+    }
+    Some(
+        pts.iter()
+            .map(|&(v, w)| w * (v - center).abs())
+            .sum::<f64>()
+            / total,
+    )
+}
+
+/// Weighted median of `(value, weight)` pairs: the smallest value whose cumulative weight
+/// reaches half the total. `None` when empty or weightless. Sorts `pts` in place.
+pub(crate) fn weighted_median(pts: &mut [(f64, f64)]) -> Option<f64> {
+    let total: f64 = pts.iter().map(|p| p.1).sum();
+    if pts.is_empty() || total.is_nan() || total <= 0.0 {
+        return None;
+    }
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut acc = 0.0;
+    for &(v, w) in pts.iter() {
+        acc += w;
+        if acc >= 0.5 * total {
+            return Some(v);
+        }
+    }
+    pts.last().map(|p| p.0)
 }
 
 /// Peak indices to probe for a scan: the `top_n` most intense (index-ascending
@@ -717,15 +892,20 @@ fn initial_scratch_width(survey: &WindowSurvey) -> usize {
 /// best-per-candidate: within a group scans run RT-ascending with strictly-greater
 /// update (earliest-RT max), and the cross-group merge keeps `max hyperscore, tie ->
 /// earliest RT, tie -> min scan_index`, which equals the serial global earliest-RT max.
+///
+/// `im` is the seed IM gate's per-candidate 1/K0 window (`search_seed.im_gate`); `None`
+/// searches ungated, and a 3D scan is never gated.
 fn seed_fragindex_windows(
     idx: &FragIndex,
     scans: &[Ms2Scan],
     cfg: &SearchSeedConfig,
+    im: Option<&ImWindow>,
 ) -> HashMap<u32, Best> {
     seed_fragindex_windows_chunked(
         idx,
         scans,
         cfg,
+        im,
         rayon::current_num_threads(),
         SEED_MIN_CHUNK_SCANS,
     )
@@ -783,21 +963,16 @@ fn seed_fragindex_windows_chunked(
     idx: &FragIndex,
     scans: &[Ms2Scan],
     cfg: &SearchSeedConfig,
+    im: Option<&ImWindow>,
     threads: usize,
     min_chunk: usize,
 ) -> HashMap<u32, Best> {
     use std::collections::BTreeMap;
     // Group scan indices by window; BTreeMap keys give a deterministic group order
     // (the merge is order-independent anyway, being a total-order max).
-    let mut groups: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
+    let mut groups: BTreeMap<WindowKey, Vec<usize>> = BTreeMap::new();
     for (si, scan) in scans.iter().enumerate() {
-        groups
-            .entry((
-                scan.window.lower_mz.to_bits(),
-                scan.window.upper_mz.to_bits(),
-            ))
-            .or_default()
-            .push(si);
+        groups.entry(scan.window.key()).or_default().push(si);
     }
     let group_vec: Vec<Vec<usize>> = groups.into_values().collect();
     let group_windows: Vec<(f64, f64)> = group_vec
@@ -861,7 +1036,10 @@ fn seed_fragindex_windows_chunked(
     let chunk_partials: Vec<(usize, HashMap<u32, Best>)> = tasks
         .par_iter()
         .map_init(
-            || SeedScratch::with_min_count(scratch_width, cfg.min_matched_peaks),
+            || {
+                SeedScratch::with_min_count(scratch_width, cfg.min_matched_peaks)
+                    .unique(cfg.unique_fragment_matches)
+            },
             |scratch, &(g, a, b)| {
                 let ids = &group_vec[g][a..b];
                 let (lo, hi) = ranges[g];
@@ -873,7 +1051,29 @@ fn seed_fragindex_windows_chunked(
                         .iter()
                         .map(|&pi| (scan.peaks[pi].mz as f64, scan.peaks[pi].intensity))
                         .collect();
-                    scratch.accumulate(idx, &peaks, lo, hi);
+                    // Under the seed IM gate a scan with per-peak 1/K0 is gated, with the
+                    // selected peaks' 1/K0 in parallel to `peaks`; an ungated search and a
+                    // 3D scan take the plain accumulation.
+                    let peak_im: Vec<f32> = match im {
+                        Some(_) if !scan.im.is_empty() => {
+                            peak_idx.iter().map(|&pi| scan.im[pi]).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    match im.filter(|_| !peak_im.is_empty()) {
+                        Some(w) => scratch.accumulate_gated(
+                            idx,
+                            &peaks,
+                            lo,
+                            hi,
+                            ImGateView {
+                                peak_im: &peak_im,
+                                lo: &w.lo,
+                                hi: &w.hi,
+                            },
+                        ),
+                        None => scratch.accumulate(idx, &peaks, lo, hi),
+                    }
                     // The candidates that reached `min_matched_peaks`, which the scratch
                     // collected as they reached it (`SeedScratch::qualified`) instead of
                     // this loop filtering every candidate the scan touched. They come in a
@@ -962,6 +1162,154 @@ fn seed_fragindex_windows_chunked(
         }
     }
     best
+}
+
+/// Per-candidate 1/K0 bounds of the seed IM gate, indexed by candidate id; -inf/+inf for a
+/// candidate without a predicted IM.
+struct ImWindow {
+    lo: Vec<f32>,
+    hi: Vec<f32>,
+}
+
+impl ImWindow {
+    fn around(center: &[f64], half: f64) -> ImWindow {
+        let b = |d: f64, inf: f32| -> Vec<f32> {
+            center
+                .iter()
+                .map(|&c| if c.is_finite() { (c + d) as f32 } else { inf })
+                .collect()
+        };
+        ImWindow {
+            lo: b(-half, f32::NEG_INFINITY),
+            hi: b(half, f32::INFINITY),
+        }
+    }
+
+    fn get(&self, cid: u32) -> (f32, f32) {
+        (self.lo[cid as usize], self.hi[cid as usize])
+    }
+}
+
+/// Library `predicted_im` by candidate id (row-aligned, `index.rs`), NaN where null.
+/// `None` when the column is absent or entirely null.
+///
+/// `span` is the seed's `precursor_span`: the library was loaded as the rows
+/// `[first, first + n)` of the whole table, so only those rows are read and they line up
+/// with its local ids. A band file (`fragment_offset` alone) and the whole library are read
+/// whole.
+fn read_predicted_im(
+    path: &str,
+    span: Option<(usize, usize)>,
+    ncand: usize,
+) -> Result<Option<Vec<f64>>> {
+    let t = match span {
+        Some((first, n)) => mumdia_io::table::TableFile::open_rows(path, first, n)?,
+        None => mumdia_io::table::TableFile::open(path)?,
+    };
+    if !t.has_column("predicted_im") {
+        return Ok(None);
+    }
+    let v: Vec<f64> = t
+        .opt_f64("predicted_im")?
+        .into_iter()
+        .map(|x| x.unwrap_or(f64::NAN))
+        .collect();
+    if v.len() != ncand {
+        anyhow::bail!(
+            "search-seed: {path} has {} predicted_im rows for {ncand} candidates",
+            v.len()
+        );
+    }
+    Ok(v.iter().any(|x| x.is_finite()).then_some(v))
+}
+
+/// Best-per-candidate seed PSMs under `search_seed.im_gate`, and the window used (for the
+/// calibrant lookup). `fixed` gates on the raw prediction. `two_pass` searches ungated,
+/// fits a CCS map on that pass's confident targets (`rt_im_train::fit_im_coefs`), and
+/// searches again gated around the mapped prediction; too few anchors keep pass 1.
+fn seed_im_gated(
+    idx: &FragIndex,
+    lib: &Library,
+    scans: &[Ms2Scan],
+    cfg: &SearchSeedConfig,
+    pred: &[f64],
+    stats: &mut serde_json::Map<String, serde_json::Value>,
+) -> (HashMap<u32, Best>, Option<ImWindow>) {
+    use super::rt_im_train::{fit_im_coefs, im_predict, ImAnchor};
+    // ponytail: fixed anchor floor and per-charge minimum; the seed has no rt_im_train
+    // config. Wire them to it if the two-pass mode is promoted.
+    const MIN_ANCHORS: usize = 20;
+    const MIN_PER_CHARGE: usize = 50;
+    if cfg.im_gate == SeedImGate::Fixed {
+        let w = ImWindow::around(pred, cfg.im_window);
+        return (seed_fragindex_windows(idx, scans, cfg, Some(&w)), Some(w));
+    }
+    let best1 = seed_fragindex_windows(idx, scans, cfg, None);
+    let mut rows: Vec<(u32, &Best)> = best1.iter().map(|(k, v)| (*k, v)).collect();
+    rows.sort_by_key(|(cid, _)| *cid);
+    let sd: Vec<(f64, bool)> = rows
+        .iter()
+        .map(|(cid, b)| (b.score, lib.is_decoy[*cid as usize]))
+        .collect();
+    let q = target_decoy_q(&sd);
+    let by_index: HashMap<u32, &Ms2Scan> = scans.iter().map(|s| (s.scan_index, s)).collect();
+    let mut anchors: Vec<ImAnchor> = Vec::new();
+    for (i, (cid, b)) in rows.iter().enumerate() {
+        let c = lib.cand(*cid);
+        if c.is_decoy || q[i] > cfg.fdr_seed || !pred[*cid as usize].is_finite() {
+            continue;
+        }
+        let Some(scan) = by_index.get(&b.scan_index) else {
+            continue;
+        };
+        let targets = lib.cand_frag_mz(*cid).iter().map(|&f| f as f64);
+        if let Some(obs) = frag_im(scan, targets, cfg.fragment_tol_ppm, None) {
+            anchors.push(ImAnchor {
+                cid: *cid,
+                base_peptide_id: c.base_peptide_id,
+                charge: c.charge,
+                mz: c.precursor_mz,
+                pred_im: pred[*cid as usize],
+                obs_im: obs,
+            });
+        }
+    }
+    stats.insert(
+        "im_gate_pass1_confident".into(),
+        json!(count_targets_at_q(
+            &q,
+            &sd.iter().map(|x| x.1).collect::<Vec<_>>(),
+            cfg.fdr_seed
+        )),
+    );
+    stats.insert("im_gate_anchors".into(), json!(anchors.len()));
+    if anchors.len() < MIN_ANCHORS {
+        warn!(
+            anchors = anchors.len(),
+            "search-seed: too few pass-1 IM anchors for the two-pass IM gate; keeping the \
+             ungated pass"
+        );
+        return (best1, None);
+    }
+    let refs: Vec<&ImAnchor> = anchors.iter().collect();
+    let coefs = fit_im_coefs(&refs, MIN_PER_CHARGE);
+    stats.insert(
+        "im_gate_ccs_global".into(),
+        json!({"a": coefs.0 .0, "b": coefs.0 .1}),
+    );
+    let center: Vec<f64> = pred
+        .iter()
+        .enumerate()
+        .map(|(c, &p)| {
+            if p.is_finite() {
+                im_predict(&coefs, p, lib.prec_mz[c], lib.charge[c])
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    let w = ImWindow::around(&center, cfg.im_window);
+    (seed_fragindex_windows(idx, scans, cfg, Some(&w)), Some(w))
 }
 
 /// Sage-style hyperscore: ln(matched!) + ln(1 + summed matched intensity).
@@ -1119,7 +1467,22 @@ mod peak_selection_tests {
                     intensity: i as f32,
                 })
                 .collect(),
+            im: Vec::new(),
+            im_width: Vec::new(),
         }
+    }
+
+    #[test]
+    fn weighted_median_follows_the_intensity() {
+        use super::weighted_median;
+        assert_eq!(weighted_median(&mut []), None);
+        assert_eq!(weighted_median(&mut [(0.9, 0.0)]), None);
+        // One intense peak outweighs two faint interferers on either side.
+        assert_eq!(
+            weighted_median(&mut [(1.10, 1.0), (0.85, 10.0), (0.70, 1.0)]),
+            Some(0.85)
+        );
+        assert_eq!(weighted_median(&mut [(0.8, 1.0), (0.9, 1.0)]), Some(0.8));
     }
 
     #[test]
@@ -1265,16 +1628,18 @@ mod chunk_tests {
                 rt_seconds: (s / 3) as f64 * 2.0,
                 window: window(in_a),
                 peaks,
+                im: Vec::new(),
+                im_width: Vec::new(),
             });
         }
         let cfg = SearchSeedConfig {
             min_matched_peaks: 3,
             ..Default::default()
         };
-        let whole = seed_fragindex_windows_chunked(&idx, &scans, &cfg, 1, usize::MAX);
+        let whole = seed_fragindex_windows_chunked(&idx, &scans, &cfg, None, 1, usize::MAX);
         assert!(!whole.is_empty(), "the fixture must produce seed PSMs");
         for (threads, min) in [(64usize, 1usize), (8, 5), (3, 32)] {
-            let chunked = seed_fragindex_windows_chunked(&idx, &scans, &cfg, threads, min);
+            let chunked = seed_fragindex_windows_chunked(&idx, &scans, &cfg, None, threads, min);
             assert_eq!(
                 bits(&chunked),
                 bits(&whole),
@@ -1285,8 +1650,8 @@ mod chunk_tests {
         // task, and the result is the B half of the whole-library one.
         let lib_b = lib_from(&cands[60..]);
         let idx_b = FragIndex::build(&lib_b, 20.0);
-        let a = seed_fragindex_windows_chunked(&idx_b, &scans, &cfg, 1, usize::MAX);
-        let b = seed_fragindex_windows_chunked(&idx_b, &scans, &cfg, 64, 1);
+        let a = seed_fragindex_windows_chunked(&idx_b, &scans, &cfg, None, 1, usize::MAX);
+        let b = seed_fragindex_windows_chunked(&idx_b, &scans, &cfg, None, 64, 1);
         assert_eq!(bits(&a), bits(&b));
     }
 }

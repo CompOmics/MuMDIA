@@ -218,19 +218,89 @@ pub fn module_version(python: &str, module: &str) -> Option<String> {
 /// 4.0.0a2 did (docs/08 section 4b). Both worker scripts repeat the check, but
 /// failing here is cheaper than failing after the input table has been written.
 pub fn require_deeplc_version(python: &str) -> Result<String> {
-    use mumdia_core::constants::{parse_version3, MIN_DEEPLC_VERSION};
-    let (ma, mi, pa) = MIN_DEEPLC_VERSION;
-    let v = module_version(python, "deeplc").ok_or_else(|| {
+    require_version(python, "deeplc", mumdia_core::constants::MIN_DEEPLC_VERSION)
+}
+
+/// The installed version of `module` through `python`, or an error when it is below
+/// `floor` or cannot be determined.
+pub fn require_version(python: &str, module: &str, floor: (u32, u32, u32)) -> Result<String> {
+    use mumdia_core::constants::parse_version3;
+    let (ma, mi, pa) = floor;
+    let v = module_version(python, module).ok_or_else(|| {
         anyhow::anyhow!(
-            "cannot determine the deeplc version through {python} (is DeepLC >= {ma}.{mi}.{pa} installed there?)"
+            "cannot determine the {module} version through {python} (is {module} >= {ma}.{mi}.{pa} installed there?)"
         )
     })?;
     match parse_version3(&v) {
-        Some(t) if t >= MIN_DEEPLC_VERSION => Ok(v),
+        Some(t) if t >= floor => Ok(v),
         _ => bail!(
-            "deeplc {v} at {python} is older than the required {ma}.{mi}.{pa};              upgrade with `pip install 'deeplc>={ma}.{mi}.{pa}'`"
+            "{module} {v} at {python} is older than the required {ma}.{mi}.{pa}; \
+             upgrade with `pip install '{module}>={ma}.{mi}.{pa}'`"
         ),
     }
+}
+
+/// IM2Deep: predict one CCS per (peptidoform, charge) and convert it to 1/K0 at the given
+/// precursor m/z. Returns `id -> predicted 1/K0` (V s cm^-2). Positional contract:
+/// `im2deep_worker.py <in.parquet> <out.parquet> <threads>`.
+pub fn run_im2deep(
+    python: &str,
+    script: &str,
+    workdir: &str,
+    ids: &[u32],
+    peptidoforms: &[String],
+    charges: &[i32],
+    precursor_mz: &[f64],
+) -> Result<HashMap<u32, f64>> {
+    require_version(
+        python,
+        "im2deep",
+        mumdia_core::constants::MIN_IM2DEEP_VERSION,
+    )?;
+    std::fs::create_dir_all(workdir).ok();
+    // Per-invocation names; see `fragment_request`.
+    let pid = std::process::id();
+    let inp = format!("{workdir}/im2deep_in_{pid}.parquet");
+    let outp = format!("{workdir}/im2deep_out_{pid}.parquet");
+    write_table(
+        &inp,
+        vec![
+            Col::U32("id".into(), ids.to_vec()),
+            Col::Str("peptidoform".into(), peptidoforms.to_vec()),
+            Col::I32("charge".into(), charges.to_vec()),
+            Col::F64("precursor_mz".into(), precursor_mz.to_vec()),
+        ],
+    )?;
+    let threads = rayon::current_num_threads().max(1).to_string();
+    info!(n = ids.len(), threads = %threads, "sidecar: running IM2Deep");
+    run_worker(python, script, &[&inp, &outp, &threads], true).context("IM2Deep worker failed")?;
+    read_im2deep_output(&outp, ids)
+}
+
+/// Read the worker's `id, predicted_im` table. Returned ids must be requested ones, each
+/// once, with a finite positive 1/K0; coverage is the caller's to check.
+fn read_im2deep_output(path: &str, ids: &[u32]) -> Result<HashMap<u32, f64>> {
+    let t = TableFile::open(path)?;
+    let oid = t.u32("id")?;
+    let im = t.f64("predicted_im")?;
+    let requested: std::collections::HashSet<u32> = ids.iter().copied().collect();
+    let mut map: HashMap<u32, f64> = HashMap::with_capacity(oid.len());
+    for (id, v) in oid.into_iter().zip(im) {
+        if !requested.contains(&id) {
+            bail!(
+                "IM2Deep worker returned id {id}, which was not among the {} precursors \
+                 requested",
+                ids.len()
+            );
+        }
+        if !(v.is_finite() && v > 0.0) {
+            bail!("IM2Deep worker returned a non-finite or non-positive 1/K0 ({v}) for id {id}");
+        }
+        if map.insert(id, v).is_some() {
+            bail!("IM2Deep worker returned id {id} more than once");
+        }
+    }
+    Ok(map)
 }
 
 /// `deeplc-<version>-<suffix>` when the interpreter answers, `deeplc-<suffix>` when there
@@ -737,6 +807,51 @@ pub fn run_mbr(
     run_worker(python, script, &args, false).context("MBR transfer worker failed")
 }
 
+/// MBR re-extraction tier (`mbr.reextract`): `mbr_reextract.py <mode> <scored> <inputs_csv>
+/// <rest...>`. `prep` takes the per-run psms (anchor 1/K0) and writes the targets; `score`
+/// takes the per-run pass-1 fragment tables and writes the augmented scored table.
+#[allow(clippy::too_many_arguments)]
+pub fn run_mbr_reextract(
+    python: &str,
+    script: &str,
+    mode: &str,
+    scored: &str,
+    inputs: &[String],
+    rest: &[&str],
+    q_anchor: f64,
+    min_anchor_runs: usize,
+    q_transfer: f64,
+    seed: u64,
+) -> Result<()> {
+    info!(
+        mode,
+        scored,
+        runs = inputs.len(),
+        "sidecar: MBR re-extraction"
+    );
+    let csv = inputs.join(",");
+    let (qa, mar, qt, sd) = (
+        q_anchor.to_string(),
+        min_anchor_runs.to_string(),
+        q_transfer.to_string(),
+        seed.to_string(),
+    );
+    let mut args: Vec<&str> = vec![mode, scored, &csv];
+    args.extend_from_slice(rest);
+    args.extend_from_slice(&[
+        "--q-anchor",
+        &qa,
+        "--min-anchor-runs",
+        &mar,
+        "--q-transfer",
+        &qt,
+        "--seed",
+        &sd,
+    ]);
+    run_worker(python, script, &args, false)
+        .with_context(|| format!("MBR re-extraction worker ({mode}) failed"))
+}
+
 /// Invoke a Python worker: `python script arg...`. `utf8` forces UTF-8 I/O
 /// (DeepLC/Keras crash on the Windows cp1252 console otherwise).
 fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<()> {
@@ -897,5 +1012,46 @@ mod resolve_tests {
             "scripts/deeplc_worker.py"
         );
         let _ = std::fs::remove_dir_all(&exe);
+    }
+}
+
+#[cfg(test)]
+mod im2deep_tests {
+    use super::read_im2deep_output;
+    use mumdia_io::table::{write_table, Col};
+
+    fn table(name: &str, ids: Vec<u32>, im: Vec<f64>) -> String {
+        let p = std::env::temp_dir()
+            .join(format!(
+                "mumdia_im2deep_{}_{name}.parquet",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        write_table(
+            &p,
+            vec![
+                Col::U32("id".into(), ids),
+                Col::F64("predicted_im".into(), im),
+            ],
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn readback_rejects_unrequested_repeated_and_non_finite_rows() {
+        let ok = table("ok", vec![0, 2], vec![0.8, 1.1]);
+        let m = read_im2deep_output(&ok, &[0, 1, 2]).unwrap();
+        assert_eq!((m[&0], m[&2], m.len()), (0.8, 1.1, 2));
+        let stray = table("stray", vec![0, 9], vec![0.8, 1.1]);
+        assert!(read_im2deep_output(&stray, &[0, 1]).is_err());
+        let dup = table("dup", vec![0, 0], vec![0.8, 0.9]);
+        assert!(read_im2deep_output(&dup, &[0]).is_err());
+        let nan = table("nan", vec![0], vec![f64::NAN]);
+        assert!(read_im2deep_output(&nan, &[0]).is_err());
+        for p in [ok, stray, dup, nan] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }

@@ -34,17 +34,17 @@ import pyarrow.parquet as pq
 # without a deliberate decision means an on-disk format changed silently, which is
 # the thing artifact versioning exists to prevent.
 EXPECTED_SCHEMA_VERSIONS = {
-    "spectra_ms1": 1,
-    "spectra_ms2": 1,
-    "isolation_windows": 1,
+    "spectra_ms1": 3,
+    "spectra_ms2": 3,
+    "isolation_windows": 2,
     "ms2_to_ms1": 1,
     "peptides": 1,
     "peptidoforms": 1,
-    "fragment_library_precursors": 1,
+    "fragment_library_precursors": 2,
     "fragment_library_fragments": 1,
-    "seed_psms": 1,
+    "seed_psms": 2,
     "run_windows": 1,
-    "psms_extracted": 2,
+    "psms_extracted": 5,
     # 2 under the default `extract.chromatogram_schema = 2` (CHROMATOGRAMS_V2, the default
     # since 2026-09-27); 1 only under an explicit schema 1, which smoke arm 4e runs and
     # checks itself. Every run this script reads writes the default.
@@ -58,7 +58,7 @@ EXPECTED_SCHEMA_VERSIONS = {
     # single-run manifest. Listed because this dict is the frozen record of
     # schema.rs, and the loop below only checks the schemas it actually sees.
     "lfq_maxlfq": 1,
-    # Written only by a grouped run under `groups.pool_chromatograms = false`.
+    # Written by a grouped run under `groups.pool_chromatograms = false`, the default.
     "overlap_losers": 1,
 }
 

@@ -86,6 +86,18 @@ pub enum RtPredictorKind {
     Deeplc,
 }
 
+/// Source of the library's `predicted_im` (1/K0) in FASTA mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImPredictorKind {
+    /// No ion-mobility prediction: `predicted_im` is written null.
+    #[default]
+    None,
+    /// IM2Deep Python sidecar (`im2deep_worker.py`, docs/13_sidecars.md): the
+    /// single-conformer model, uncalibrated; rt-im-train calibrates it per run.
+    Im2deep,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FragPredictorKind {
@@ -332,6 +344,50 @@ pub struct ConvertConfig {
     /// pay for it twice. Turn it off when the neighbouring mzML may have come from
     /// a different converter or a different `.raw` of the same name.
     pub reuse_converted: bool,
+    /// How a timsTOF `.d` (one holding `analysis.tdf`) is read.
+    ///
+    /// `native` reads frames directly (timsrust) and keeps ion mobility: one MS2
+    /// spectrum per (frame, diaPASEF window slot), with a per-peak 1/K0 after m/z x
+    /// mobility centroiding (docs/TIMS_ROADMAP.md, P1). `msconvert` is the previous
+    /// route, which collapses mobility; it stays as a fallback. Non-TIMS Bruker
+    /// (`analysis.baf`) always goes to msconvert.
+    pub bruker_reader: BrukerReader,
+    /// Native TDF centroiding: m/z merge tolerance in ppm between neighbouring TOF
+    /// points (single linkage).
+    pub tdf_mz_ppm: f64,
+    /// Native TDF centroiding: a gap of more than this many TIMS scans without signal
+    /// splits one m/z trace into separate peaks.
+    pub tdf_im_gap_scans: u32,
+    /// Native TDF noise floor: a centroid built from fewer raw TOF x scan points than
+    /// this is dropped.
+    pub tdf_min_points: u32,
+    /// Native TDF: also write each centroid's mobility width (`im_width`, spectra v3):
+    /// the intensity-weighted SD of its TIMS scans, plus the 1/12-scan quantisation
+    /// term, in 1/K0 units (TIMS roadmap P7). Adds 4 B per MS1 and MS2 peak to the
+    /// artifacts and to resident memory. Default false: no `im_width` column, the other
+    /// columns unchanged. Read by extract's apex IM-shape columns (psms_extracted v5)
+    /// and `features.im_shape_features`. Benchmark-gated.
+    pub tdf_im_width: bool,
+    /// Native TDF: split each m/z x mobility cluster at valleys of its m/z profile
+    /// (TIMS roadmap part 2, D5 follow-up). A local minimum of the smoothed profile is a
+    /// cut when it is below this fraction of the smaller of the two humps beside it, so
+    /// one ion stays one centroid and two neighbouring ions become two. Must be in
+    /// [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated.
+    pub tdf_mz_valley: f64,
+    /// Native TDF: half-width in ppm of the triangular smoothing applied to the m/z
+    /// profile before `tdf_mz_valley` looks for valleys; 0 is no smoothing. Unused while
+    /// `tdf_mz_valley` is 0.
+    pub tdf_mz_smooth_ppm: f64,
+    /// Native TDF: split each cluster (after the m/z valley split, when that is on) at
+    /// valleys of its mobility profile: summed intensity per TIMS scan, triangular
+    /// smoothing of half-width `tdf_im_smooth_scans`, cut at a local minimum below this
+    /// fraction of the smaller hump beside it. Separates ions of one m/z whose mobility
+    /// profiles touch without a `tdf_im_gap_scans` gap. Must be in [0, 1); 0 (default) is
+    /// off and leaves the centroids unchanged. Benchmark-gated.
+    pub tdf_im_valley: f64,
+    /// Native TDF: half-width in TIMS scans of the mobility profile smoothing used by
+    /// `tdf_im_valley`; 0 is no smoothing. Unused while `tdf_im_valley` is 0.
+    pub tdf_im_smooth_scans: f64,
     /// How many vendor files `run` and `run-experiment` convert to mzML at once. Default 4.
     ///
     /// Every vendor input is converted before the first run starts, and the conversions
@@ -352,9 +408,29 @@ impl Default for ConvertConfig {
             msconvert: "auto".to_string(),
             msconvert_args: Vec::new(),
             reuse_converted: true,
+            bruker_reader: BrukerReader::Native,
+            // Provisional values from a peak census on one diaPASEF run
+            // (docs/TIMS_ROADMAP.md, P1), not an optimum.
+            tdf_mz_ppm: 10.0,
+            tdf_im_gap_scans: 30,
+            tdf_min_points: 2,
+            tdf_im_width: false, // opt-in; TIMS P7, benchmark-gated
+            tdf_mz_valley: 0.0,  // off; benchmark-gated
+            tdf_mz_smooth_ppm: 4.0,
+            tdf_im_valley: 0.0, // off; benchmark-gated
+            tdf_im_smooth_scans: 4.0,
             parallel_conversions: 4,
         }
     }
+}
+
+/// Reader for timsTOF `.d` input (`convert.bruker_reader`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrukerReader {
+    #[default]
+    Native,
+    Msconvert,
 }
 
 /// Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates that have no
@@ -556,6 +632,11 @@ pub struct PredictFragConfig {
     pub peptdeep_python: Option<String>,
     /// Python executable for the DeepLC sidecar (env with deeplc + pyarrow).
     pub deeplc_python: Option<String>,
+    /// Ion-mobility predictor for `predicted_im`. Default `none` (the column is null);
+    /// `im2deep` requires `im2deep_python`. Only rt-im-train reads the column so far.
+    pub im_predictor: ImPredictorKind,
+    /// Python executable for the IM2Deep sidecar (env with im2deep + psm_utils + pyarrow).
+    pub im2deep_python: Option<String>,
     /// Directory holding the sidecar worker scripts.
     pub sidecar_script_dir: String,
     /// Skip DeepLC in a FASTA library build (`rt_predictor = deeplc`) when the multi-head
@@ -597,8 +678,8 @@ pub struct PredictFragConfig {
     /// 9.8M-peptidoform HYE library). Set, the orchestrator looks the library up under a key
     /// of everything that determines it: the FASTA's content hash, the `digest`,
     /// `peptidoforms` and `predict_frag` sections (all but this field), `rng_seed`, whether
-    /// the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep or
-    /// DeepLC version the build uses, the worker scripts' content and the running
+    /// the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep,
+    /// DeepLC or IM2Deep version the build uses, the worker scripts' content and the running
     /// executable's content. A hit is copied to the paths a build writes (a byte copy, never
     /// a hard link, and checked against the blake3 recorded when it was stored) and digest,
     /// peptidoforms and predict-frag are skipped; a miss is built and then stored. When a
@@ -636,6 +717,8 @@ impl Default for PredictFragConfig {
             peptdeep_instrument: "Lumos".to_string(),
             peptdeep_python: None,
             deeplc_python: None,
+            im_predictor: ImPredictorKind::None,
+            im2deep_python: None,
             sidecar_script_dir: "scripts".to_string(),
             defer_deeplc_to_multihead: true,
             library_cache: Some("auto".to_string()),
@@ -674,6 +757,43 @@ pub struct SearchSeedConfig {
     /// removes any m/z-correlated curvature the flat offset leaves. Default false
     /// (scalar offset unchanged), opt-in and benchmark-gated.
     pub mass_cal_loess: bool,
+    /// Fragment tolerance estimator. 0 (default) keeps `1.5 * p95(|dev - median|)`.
+    /// When > 0 the tolerance is `k * 1.4826 * MAD(dev - median)`, floored at 5 ppm: a
+    /// multiple of the robust sigma of the calibrant deviations. On diaPASEF the p95 is
+    /// set by a 6-20 ppm shoulder of the deviation distribution and lands at the search
+    /// tolerance (~20 ppm), while the MAD tracks the core (TIMS roadmap, "P6 result").
+    /// Benchmark-gated; no default is claimed.
+    pub frag_tol_mad_k: f64,
+    /// Ion-mobility gate on the seed probe (diaPASEF, docs/07_search_seed.md): a matched
+    /// peak counts only when its 1/K0 lies within `im_window` of the candidate's library
+    /// `predicted_im`. The seed runs before any IM calibration, so `fixed` gates on the raw
+    /// prediction, and `two_pass` first runs ungated, maps the prediction onto the run
+    /// with a CCS fit on that pass's confident anchors, and reruns gated. Candidates
+    /// without `predicted_im`, and 3D scans, are never gated. Default `off`.
+    pub im_gate: SeedImGate,
+    /// Half-width of the seed IM gate, in V s cm^-2. Default 0.10, wide enough for
+    /// uncalibrated IM2Deep on the benchmark (p95 |error| 0.07).
+    pub im_window: f64,
+    /// Count each predicted fragment of a candidate at most once per spectrum, with the
+    /// intensity of its most intense matching peak, instead of once per matching peak.
+    /// On diaPASEF slot spectra the mobility pieces of one fragment ion sit at one m/z
+    /// and otherwise count as several fragments in the hyperscore's `ln(matched!)`
+    /// (TIMS roadmap part 2, mobility valley split). Fragindex matcher only. Default
+    /// false: the seed is unchanged. Benchmark-gated.
+    pub unique_fragment_matches: bool,
+}
+
+/// Seed IM gate mode; see [`SearchSeedConfig::im_gate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedImGate {
+    #[default]
+    Off,
+    /// Gate on the uncalibrated library `predicted_im` +/- `im_window`.
+    Fixed,
+    /// Ungated pass, a global CCS calibration on its confident anchors, then a gated
+    /// pass at +/- `im_window` around the calibrated prediction.
+    TwoPass,
 }
 impl Default for SearchSeedConfig {
     fn default() -> Self {
@@ -686,6 +806,10 @@ impl Default for SearchSeedConfig {
             matcher: MatcherKind::Fragindex,
             two_pass_mass_cal: false,
             mass_cal_loess: false,
+            frag_tol_mad_k: 0.0,
+            unique_fragment_matches: false, // off; benchmark-gated
+            im_gate: SeedImGate::Off,
+            im_window: 0.10,
         }
     }
 }
@@ -800,6 +924,42 @@ pub struct RtImTrainConfig {
     /// DIA-NN library iRT and 10,181 from a per-run fine-tune, with `w_rt` 343 s against
     /// 632 s and 472 s (docs/08 section 4c). `run-experiment` predicts once per experiment.
     pub library_irt: LibraryIrt,
+    /// Ion-mobility calibration (docs/08, "IM calibration"). Runs when the library carries
+    /// `predicted_im` and the seed carries `observed_im`; otherwise the IM columns of
+    /// `run_windows` stay null. The fit is per-charge linear in CCS space,
+    /// `obs_ccs = a_z + b_z * pred_ccs`, over confident target seed anchors (best per
+    /// candidate). A charge with fewer anchors than this uses the global fit.
+    pub im_min_anchors_per_charge: usize,
+    /// Percentile of held-out |observed - calibrated| 1/K0 residuals for `w_im`.
+    pub p_im: f64,
+    /// Multiplier on that percentile.
+    pub im_window_multiplier: f64,
+    /// Lower clamp for the IM half-window, V s cm^-2.
+    pub im_window_min: f64,
+    /// Fraction of anchor peptides held out to size `w_im` (the `window_holdout_frac`
+    /// rule, keyed on `base_peptide_id`). IM is sized held-out from the start: in-sample
+    /// residuals are optimistic and can rank models backwards (docs/08 section 4). Must
+    /// lie in (0, 0.9].
+    pub im_window_holdout_frac: f64,
+    /// Second pass on the pass-1 identifications (TIMS roadmap part 2, L1d). After pass 1
+    /// is rescored, its accepted targets (PSM `q_value` at most `q_train`) become a
+    /// pseudo-seed; under multi-head calibration the 80-head fit is refitted on it,
+    /// cross-fitted over two folds of base peptides (each candidate takes the fold it was
+    /// not fitted on); rt-im-train is refitted on it, and its new RT and IM centres are
+    /// used with the pass-1 half-widths (the refit widths are truncated by selection and
+    /// lost 4%). Extract, features (with the original seed), compete and rescore then run
+    /// again. Pass-1 artifacts go to `<out>/pass1/`. Single-run and ungrouped
+    /// `run-experiment` only. Default false: nothing changes. Benchmark-gated.
+    pub refit: bool,
+    /// Drop outlying RT anchors before the calibration fit: a first LOESS on the anchors
+    /// inside the central 99% of predicted iRT, then every anchor whose residual lies more
+    /// than 6 robust SDs from the median is removed, and the curve, the window sizing and
+    /// the reported residuals use the rest (`cal.json` `n_rt_outliers_removed`). A few
+    /// anchors with an absurd predicted iRT otherwise stretch the LOESS grid until the
+    /// gradient sits in one or two cells: on one HYE run of the `refit` pass, 11 of 58k
+    /// anchors moved the curve by 51 s (TIMS roadmap part 2). Default false: unchanged.
+    /// Benchmark-gated.
+    pub robust_calibration: bool,
     /// Worker processes for the whole-library DeepLC prediction: the multi-head
     /// calibration, the base-model re-prediction under `library_irt`, and the prediction
     /// after `finetune_deeplc` (`deeplc_finetune.py --shards`). The calibration or the
@@ -970,6 +1130,13 @@ impl Default for RtImTrainConfig {
             rt_window_min_s: 1.0,
             window_holdout_frac: 0.0,
             library_irt: LibraryIrt::Auto,
+            im_min_anchors_per_charge: 50,
+            p_im: 0.95,
+            im_window_multiplier: 1.0,
+            im_window_min: 0.005,
+            im_window_holdout_frac: 0.3,
+            refit: false,              // off; benchmark-gated
+            robust_calibration: false, // off; benchmark-gated
             deeplc_predict_shards: 0,
             deeplc_projection_cache: Some("auto".to_string()),
         }
@@ -1204,6 +1371,24 @@ pub struct ExtractConfig {
     /// this while the peak-integrated spectral score exceeds `gate_min_score`.
     /// Requiring BOTH is more specific (rejects interferents that pass one axis).
     pub gate_coelution_min: f64,
+    /// Ion-mobility gate (diaPASEF, docs/09_extract.md): a peak contributes to a
+    /// candidate only when its 1/K0 lies inside the candidate's calibrated
+    /// `run_windows` [`im_lo`, `im_hi`]. A candidate with a null IM window, and a 3D scan,
+    /// are not gated. Default `off`, which leaves extraction bit-identical.
+    pub im_gate: ImGate,
+}
+
+/// Extraction IM gate mode; see [`ExtractConfig::im_gate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImGate {
+    #[default]
+    Off,
+    /// Gate the fragment peaks of every MS2 trace.
+    Fragments,
+    /// Gate the fragment peaks and the MS1 precursor lookups (XICs, isotope features,
+    /// the MS1 claim cue) on the same window.
+    FragmentsMs1,
 }
 impl Default for ExtractConfig {
     fn default() -> Self {
@@ -1282,6 +1467,7 @@ impl Default for ExtractConfig {
             emit_gate_diagnostics: false,     // diagnostic gate-score columns; off in production
             gate_mode: GateMode::ApexPearson, // legacy single-scan intensity Pearson
             gate_coelution_min: 0.5,          // used only by GateMode::Combined
+            im_gate: ImGate::Off,
         }
     }
 }
@@ -1363,6 +1549,30 @@ pub struct FeaturesConfig {
     /// overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and
     /// benchmark-gated rather than default-on (AlphaDIA-plan item 12).
     pub ms1_precursor_features: bool,
+    /// Append the ion-mobility feature block (docs/10_features.md, "Ion-mobility
+    /// features"; TIMS roadmap P5) after every other column: IM error against the
+    /// calibrated prediction, fragment IM dispersion at the apex, MS1 IM agreement and
+    /// the IM spread over the elution peak. Needs 4D data (psms_extracted v4 or later,
+    /// chromatograms v3 or v4); on 3D data the columns are constant zeros. Default false: off,
+    /// the feature list, schema id and PIN column order are unchanged. Benchmark-gated.
+    pub im_features: bool,
+    /// Append the ion-mobility peak-shape block (docs/10_features.md, "Ion-mobility
+    /// features"; TIMS roadmap P7) after every other column, including the
+    /// `im_features` block: fragment mobility width and its spread at the apex, the
+    /// Gaussian overlap of each fragment's mobility peak with the fragment consensus,
+    /// and the MS1 precursor's width and overlap. Needs `convert.tdf_im_width` (spectra
+    /// v3, psms_extracted v5); without it the columns are constant zeros. Default
+    /// false: off, the feature list, schema id and PIN column order are unchanged.
+    /// Benchmark-gated.
+    pub im_shape_features: bool,
+    /// Apex evidence from the raw diaPASEF events (docs/TIMS_ROADMAP_bis.md section 7).
+    /// Needs `retrace.enabled`: retrace then also writes `<chromatograms>.apex.parquet`,
+    /// and features replaces the centroid `apex_intensity`, `n_matched_fragments` and
+    /// `ms1_mono` / `ms1_iso1` / `ms1_iso2` with their raw-trace values and appends
+    /// `imc_ref_w`, the agreement of the fragments' raw 1/K0 profiles at the apex, after
+    /// every other column. Refused with `extract.promote_top_peaks > 1`. Default false:
+    /// off, the feature list, schema id and values are unchanged. Benchmark-gated.
+    pub retrace_apex: bool,
     /// Chromatogram decode threads in the main feature pass. The pass decodes the
     /// chromatogram table one chunk at a time while the features of the chunk before are
     /// computed; with one loader the whole decode ran on a single core, which bound the
@@ -1400,6 +1610,9 @@ impl Default for FeaturesConfig {
             bound_from_confident: false, // per-candidate elution bounds (2026-10-04)
             bound_confident_pct: 50.0, // median confident half-width
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
+            im_features: false,  // opt-in; TIMS P5, benchmark-gated
+            im_shape_features: false, // opt-in; TIMS P7, benchmark-gated
+            retrace_apex: false, // opt-in; needs retrace, benchmark-gated
             chrom_loaders: 3,
         }
     }
@@ -1584,7 +1797,7 @@ pub enum QuantQColumn {
     RunPsmQ,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuantConfig {
     /// Peptide-level q-value cutoff for inclusion.
@@ -1652,6 +1865,34 @@ pub struct QuantConfig {
     /// seconds of the identification apex (instrument-independent alternative to
     /// `fixed_scan_halfwidth`, which it overrides). 0 (default) = off.
     pub fixed_window_s: f64,
+    /// Cross-run fragment weighting (run-experiment only; docs/TIMS_QUANT_ROADMAP.md
+    /// section 4b). Per-run quant runs twice: the first pass exports each fragment's
+    /// area and its apex correlation with the candidate's other fragments; one weight
+    /// per (candidate, fragment) is then fitted over all runs, `1 / (dev + 0.1) *
+    /// max(corr, 0)`, where `dev` is the median absolute deviation of the fragment's
+    /// log-share of the candidate total from its cross-run median and `corr` the median
+    /// correlation; the second pass sums `weight * area` over every fragment, with the
+    /// same weights in every run. Uses no condition labels. A candidate whose weights are
+    /// all zero takes equal weights; a run where the weighted sum is not positive keeps
+    /// the `top_n_fragments` rule. Needs a fixed window (the correlation is taken over
+    /// it). Off by default; on in the diaPASEF preset ([`QuantConfig::diapasef`]).
+    pub cross_run_weights: bool,
+    /// Cross-run background (run-experiment only; docs/TIMS_QUANT_ROADMAP.md section 4f). In
+    /// the same two-pass step, one background level per (candidate, fragment) is the mean over
+    /// all runs of the raw flank mean (`baseline_flank_scans` samples either side of the fixed
+    /// window); the second pass subtracts it from every window sample, clipped at zero, in
+    /// place of the per-run `baseline_subtract` level. Label-blind. Needs a fixed window. Off
+    /// by default; on in the diaPASEF preset.
+    pub cross_run_background: bool,
+    /// Cross-run integration width (run-experiment only; docs/TIMS_QUANT_ROADMAP.md section
+    /// 4h). When > 0, each candidate is integrated over its own scan halfwidth `h = clamp(
+    /// round(cross_run_width * HWHM), 3, 7)` in every run, in place of `fixed_scan_halfwidth`.
+    /// HWHM is the half width at half maximum, in scans, of the candidate's summed fragment
+    /// trace (flank mean subtracted) in its brightest run, measured in the first pass of the
+    /// cross-run step. The flank (and so the cross-run background) is taken beyond the chosen
+    /// window. Label-blind. Needs `fixed_scan_halfwidth` (the first-pass window). 0 (default)
+    /// = off; 2.5 in the diaPASEF preset.
+    pub cross_run_width: f64,
 }
 
 /// Fragment ranking for the quant top-N sum. See [`QuantConfig::fragment_selection`].
@@ -1684,6 +1925,29 @@ impl Default for QuantConfig {
             baseline_flank_scans: 12,
             baseline_quantile: 0.25,
             fixed_window_s: 0.0,
+            cross_run_weights: false,
+            cross_run_background: false,
+            cross_run_width: 0.0,
+        }
+    }
+}
+
+impl QuantConfig {
+    /// Quant settings applied to timsTOF (`.d`) input when the `quant` block is left at
+    /// its defaults (docs/TIMS_QUANT_ROADMAP.md sections 4 and 4b). Measured on HYE
+    /// diaPASEF (ProteoBench `quant_lfq_DIA_ion_diaPASEF`, three ID sets) only, so it is
+    /// scoped to that input; every field is an ordinary key another acquisition can set.
+    pub fn diapasef() -> Self {
+        Self {
+            fragment_selection: FragmentSelection::Predicted,
+            interference_envelope: true,
+            fixed_scan_halfwidth: 4,
+            baseline_subtract: true,
+            baseline_quantile: 0.6,
+            cross_run_weights: true,
+            cross_run_background: true,
+            cross_run_width: 2.5,
+            ..Self::default()
         }
     }
 }
@@ -1756,6 +2020,19 @@ pub struct MbrConfig {
     /// matrix), not only transferred ones, under `strategy = Full`. No code reads this
     /// field yet; `validate()` warns if it is changed.
     pub requant_all: bool,
+    /// The re-extraction tier (`run-experiment`, diaPASEF under `retrace.enabled`): a
+    /// precursor confident in >= 2 other runs whose apex here missed the rescuable tier's
+    /// window is retraced at its cross-run expected RT and the anchor runs' 1/K0, and
+    /// accepted when its evidence there beats a same-trace RT-shift null at
+    /// `q_transfer` (docs/TIMS_QUANT_ROADMAP.md section 4k). Default false. Benchmark-gated.
+    /// It runs on the MBR-off scored table, so it also takes the rows the rescuable tier
+    /// would, with traces in the anchors' 1/K0 band (section 4l).
+    pub reextract: bool,
+    /// The rescuable tier (`mbr_worker.py`). Under `reextract` it adds its transfers for the
+    /// rows re-extraction did not accept; `false` there is re-extraction only, which measured
+    /// better epsilon and fewer ions (docs/TIMS_QUANT_ROADMAP.md section 4l). Default true;
+    /// `false` needs `reextract`.
+    pub rescuable: bool,
     /// Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy;
     /// e.g. the `py312_mumdia` env). Required when `strategy != None`.
     pub python: Option<String>,
@@ -1771,6 +2048,8 @@ impl Default for MbrConfig {
             decoy_transfer: DecoyTransfer::PermutedRt,
             consensus_corr_min: 0.0,
             requant_all: false,
+            reextract: false,
+            rescuable: true,
             python: None,
         }
     }
@@ -2438,6 +2717,47 @@ impl Default for GroupsConfig {
     }
 }
 
+/// Chromatogram traces rebuilt from the raw timsTOF events (`retrace` stage, after
+/// extract). Each fragment trace point is the sum of every raw event in the grid point's
+/// frame and quad slots covering the precursor, within the learned fragment tolerance and
+/// inside `apex_im +/- im_half_width`, instead of one centroid. The MS1 isotope traces are
+/// rebuilt the same way from the MS1 frame nearest each grid point. diaPASEF only.
+/// Default off, which leaves every artifact bit-identical (the stage does not run).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetraceConfig {
+    pub enabled: bool,
+    /// Fragment band half-width in 1/K0 around the candidate's `apex_im` (`im_pred_cal`
+    /// when null). Measured flat from 0.012 to 0.020 on one diaPASEF run.
+    pub im_half_width: f64,
+    /// Also rebuild `ms1_mono` / `ms1_iso1` / `ms1_iso2`.
+    pub ms1: bool,
+    /// MS1 band half-width in 1/K0, same centre (0.025 measured equal).
+    pub ms1_im_half_width: f64,
+    /// Raw events a grid point needs to count (else 0). 2 and 3 lost identifications.
+    pub min_events: u32,
+    /// Re-choose each candidate's apex RT and 1/K0 centre on the raw events before the
+    /// traces are rebuilt (docs/09 section 6c; docs/TIMS_ROADMAP_bis.md section 8). Over
+    /// extract's apex and the `extract.retain_top_peaks` sidecar peaks, the peak whose best
+    /// 1/K0 band agrees best with the library wins; retrace then writes
+    /// `psms_extracted.repick.parquet` with `apex_rt` and `apex_im` replaced, which `run`
+    /// feeds to the later stages. Needs `retain_top_peaks >= 2` and `promote_top_peaks = 1`.
+    /// Default false. Benchmark-gated.
+    pub repick: bool,
+}
+impl Default for RetraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            im_half_width: 0.015,
+            ms1: true,
+            ms1_im_half_width: 0.015,
+            min_events: 1,
+            repick: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -2460,6 +2780,8 @@ pub struct Config {
     pub experiment: ExperimentConfig,
     #[serde(default)]
     pub groups: GroupsConfig,
+    #[serde(default)]
+    pub retrace: RetraceConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -2480,6 +2802,7 @@ impl Default for Config {
             mbr: t(),
             experiment: t(),
             groups: t(),
+            retrace: t(),
         }
     }
 }
@@ -2545,6 +2868,32 @@ impl Config {
                     .into(),
             ));
         }
+        let rt = &self.retrace;
+        if !(rt.im_half_width > 0.0
+            && rt.im_half_width.is_finite()
+            && rt.ms1_im_half_width > 0.0
+            && rt.ms1_im_half_width.is_finite())
+        {
+            return Err(Invalid(
+                "retrace.im_half_width and retrace.ms1_im_half_width must be finite and > 0 \
+                 (1/K0 units; 0.015 is the measured default)."
+                    .into(),
+            ));
+        }
+        // ponytail: retrace runs in the single-library chain only; wire run_groups when a
+        // window-group TIMS search needs it.
+        if rt.enabled && self.groups.window_groups > 1 {
+            return Err(Invalid(
+                "retrace.enabled is not implemented with groups.window_groups > 1.".into(),
+            ));
+        }
+        if rt.repick && (self.extract.retain_top_peaks < 2 || self.extract.promote_top_peaks != 1) {
+            return Err(Invalid(
+                "retrace.repick chooses among extract's candidate peaks: it needs \
+                 extract.retain_top_peaks >= 2 (5 measured) and extract.promote_top_peaks = 1."
+                    .into(),
+            ));
+        }
         if self.extract.retain_top_peaks == 0 {
             return Err(Invalid(
                 "extract.retain_top_peaks must be >= 1 (1 = legacy single-apex \
@@ -2565,6 +2914,21 @@ impl Config {
             return Err(Invalid(
                 "extract.gate_min_score must be finite and in [0, 1] (0 disables \
                 the gate)."
+                    .into(),
+            ));
+        }
+        let cv = &self.convert;
+        let frac = |v: f64| (0.0..1.0).contains(&v);
+        let width = |v: f64| v >= 0.0 && v.is_finite();
+        if !(frac(cv.tdf_mz_valley)
+            && frac(cv.tdf_im_valley)
+            && width(cv.tdf_mz_smooth_ppm)
+            && width(cv.tdf_im_smooth_scans))
+        {
+            return Err(Invalid(
+                "convert.tdf_mz_valley and convert.tdf_im_valley must be in [0, 1) (0 disables \
+                 the valley split), convert.tdf_mz_smooth_ppm and convert.tdf_im_smooth_scans \
+                 finite and >= 0."
                     .into(),
             ));
         }
@@ -2621,6 +2985,8 @@ impl Config {
                 "search_seed.fragment_tol_ppm",
                 self.search_seed.fragment_tol_ppm,
             ),
+            // Seed IM gate half-width; zero or negative admits no peak.
+            ("search_seed.im_window", self.search_seed.im_window),
             ("extract.frag_tol_ppm", self.extract.frag_tol_ppm),
             ("extract.prec_tol_ppm", self.extract.prec_tol_ppm),
         ] {
@@ -2633,6 +2999,13 @@ impl Config {
             }
         }
 
+        if !self.search_seed.frag_tol_mad_k.is_finite() || self.search_seed.frag_tol_mad_k < 0.0 {
+            return Err(Invalid(format!(
+                "search_seed.frag_tol_mad_k must be finite and >= 0 (got {}); 0 keeps the \
+                 p95 tolerance estimator",
+                self.search_seed.frag_tol_mad_k
+            )));
+        }
         if !self.rescore.entrapment_ratio.is_finite() || self.rescore.entrapment_ratio <= 0.0 {
             return Err(Invalid(
                 "rescore.entrapment_ratio must be finite and > 0. It is \
@@ -2685,6 +3058,19 @@ impl Config {
             return Err(Invalid(
                 "rescore.classifier=entrapment requires \
                  rescore.entrapment_marker."
+                    .into(),
+            ));
+        }
+        if !self.mbr.rescuable && !self.mbr.reextract {
+            return Err(Invalid(
+                "mbr.rescuable = false leaves MBR without a tier unless mbr.reextract is on."
+                    .into(),
+            ));
+        }
+        if self.mbr.reextract && (self.mbr.strategy == MbrStrategy::None || !self.retrace.enabled) {
+            return Err(Invalid(
+                "mbr.reextract retraces transfer targets from the raw .d, so it needs \
+                 mbr.strategy != none and retrace.enabled (diaPASEF)."
                     .into(),
             ));
         }
@@ -2741,6 +3127,33 @@ impl Config {
                 "quant: both fixed-window forms are set; the seconds form wins and \
                  fixed_scan_halfwidth is ignored"
             );
+        }
+        if (self.quant.cross_run_weights || self.quant.cross_run_background)
+            && self.quant.fixed_scan_halfwidth == 0
+            && self.quant.fixed_window_s == 0.0
+        {
+            tracing::warn!(
+                "quant.cross_run_weights / quant.cross_run_background need a fixed window \
+                 (quant.fixed_scan_halfwidth or quant.fixed_window_s): without one there is no \
+                 fragment correlation or flank, so the weights fall back to equal and no \
+                 background is subtracted"
+            );
+        }
+        if !self.quant.cross_run_width.is_finite() || self.quant.cross_run_width < 0.0 {
+            return Err(Invalid(format!(
+                "quant.cross_run_width must be finite and >= 0 (got {}); 0 is off",
+                self.quant.cross_run_width
+            )));
+        }
+        if self.quant.cross_run_width > 0.0
+            && (self.quant.fixed_scan_halfwidth == 0 || self.quant.fixed_window_s > 0.0)
+        {
+            return Err(Invalid(
+                "quant.cross_run_width needs the scan form of the fixed window \
+                 (quant.fixed_scan_halfwidth > 0 and quant.fixed_window_s = 0): the halfwidth \
+                 it chooses is a number of scans"
+                    .into(),
+            ));
         }
         if self.quant.baseline_subtract
             && self.quant.fixed_scan_halfwidth == 0
@@ -2926,12 +3339,28 @@ impl Config {
             ));
         }
 
+        if self.rt_im_train.refit && self.groups.window_groups > 1 {
+            return Err(Invalid(
+                "rt_im_train.refit is not implemented for grouped runs (groups.window_groups > 1)"
+                    .into(),
+            ));
+        }
+
         // `finetune_batch = 0` is the documented automatic batch size (see the field), so
         // only the epoch count has a lower bound. Rejecting the zero batch made simply
         // enabling the fine-tune invalid with its own defaults (docs/30 R1).
         if self.rt_im_train.finetune_deeplc && self.rt_im_train.finetune_epochs == 0 {
             return Err(Invalid(
                 "rt_im_train.finetune_epochs must be >= 1 when finetune_deeplc is on".into(),
+            ));
+        }
+
+        // The seed IM gate lives in the fragindex accumulator only.
+        if self.search_seed.im_gate != SeedImGate::Off
+            && self.search_seed.matcher != MatcherKind::Fragindex
+        {
+            return Err(Invalid(
+                "search_seed.im_gate needs search_seed.matcher = fragindex".into(),
             ));
         }
 
@@ -3161,6 +3590,39 @@ mod tests {
         assert!(Config::from_json(r#"{"quant":{"baseline_quantile":-0.5}}"#).is_err());
         // Unknown enum variants must fail rather than fall back to the default ranking.
         assert!(Config::from_json(r#"{"quant":{"fragment_selection":"library"}}"#).is_err());
+    }
+
+    #[test]
+    fn mbr_reextract_needs_mbr_and_retrace() {
+        assert!(!Config::default().mbr.reextract);
+        let mbr = r#""mbr":{"strategy":"rt_transfer","python":"python","reextract":true}"#;
+        assert!(Config::from_json(&format!("{{{mbr}}}")).is_err());
+        assert!(
+            Config::from_json(r#"{"retrace":{"enabled":true},"mbr":{"reextract":true}}"#).is_err()
+        );
+        assert!(Config::from_json(&format!(r#"{{"retrace":{{"enabled":true}},{mbr}}}"#)).is_ok());
+        assert!(Config::default().mbr.rescuable);
+        assert!(Config::from_json(r#"{"mbr":{"rescuable":false}}"#).is_err());
+    }
+
+    #[test]
+    fn im_gates_default_off_parse_and_are_validated() {
+        let d = Config::default();
+        assert_eq!(d.extract.im_gate, ImGate::Off);
+        assert_eq!(d.search_seed.im_gate, SeedImGate::Off);
+        let c = Config::from_json(
+            r#"{"extract":{"im_gate":"fragments_ms1"},
+                 "search_seed":{"im_gate":"two_pass","im_window":0.06}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.extract.im_gate, ImGate::FragmentsMs1);
+        assert_eq!(c.search_seed.im_gate, SeedImGate::TwoPass);
+        assert_eq!(c.search_seed.im_window, 0.06);
+        assert!(Config::from_json(r#"{"search_seed":{"im_window":0.0}}"#).is_err());
+        assert!(
+            Config::from_json(r#"{"search_seed":{"im_gate":"fixed","matcher":"bucketed"}}"#)
+                .is_err()
+        );
     }
 
     #[test]

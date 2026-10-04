@@ -1,8 +1,10 @@
 //! Stage B `mumdia rt-im-train`: per-run RT calibration and windows
 //! (docs/08_rt_im_train.md). Calibrates the run-independent predicted iRT to
 //! observed RT from confident seed PSMs, then sets a per-candidate RT window from
-//! the residuals. MVP is 3D, so IM columns are null. The sidecars are not re-run
-//! here.
+//! the residuals. When the library carries `predicted_im` and the seed carries
+//! `observed_im` (diaPASEF), the same anchors calibrate ion mobility: a per-charge
+//! linear map in CCS space and a held-out residual window (`fit_im`). Otherwise the IM
+//! columns are null. The sidecars are not re-run here.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -15,7 +17,7 @@ use mumdia_io::table::{write_table_chunked_hashed, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::calibrate::{linear_fit, percentile, Loess};
+use crate::calibrate::{linear_fit, percentile, robust_inliers, Loess};
 
 pub struct RtImTrainParams<'a> {
     pub seed_psms: &'a str,
@@ -158,6 +160,11 @@ fn candidate_window(calibrated_rt: Option<f64>, width: Option<f64>) -> (f64, f64
 /// fits once per run ([`fit_from_seed`]) and applies the one fit to every band, which is
 /// what each band computed for itself before: one seed decode and one fit per band
 /// (docs/33 section 4).
+///
+/// The ion-mobility calibration (`fit_im`) is part of the fit when the seed carries an
+/// observed 1/K0 and the library a `predicted_im` joined by candidate id. A fit whose
+/// anchors take their iRT from the seed joins the library [`fit_from_seed`] is given (a
+/// grouped run's whole library), or carries none.
 pub struct RtFit {
     n_train: usize,
     calibration_available: bool,
@@ -172,6 +179,15 @@ pub struct RtFit {
     adaptive: Option<(f64, f64, Vec<f64>)>,
     /// Signed median, absolute median and MAD of the in-sample residuals (seconds).
     residuals: (f64, f64, f64),
+    /// The ion-mobility calibration, `None` without one.
+    im: Option<ImCal>,
+    /// The run carries ion mobility on both sides (a library `predicted_im` and a seed
+    /// `observed_im`), so `cal.json` records the IM calibration or why there is none. A 3D
+    /// run records none of it, and its `cal.json` is what it was before IM calibration.
+    im_reported: bool,
+    /// Anchors `robust_calibration` dropped before the fit; `None` when it did not run (off,
+    /// or too few anchors), so a default `cal.json` does not carry `n_rt_outliers_removed`.
+    n_rt_outliers: Option<usize>,
 }
 
 /// The fitted windows, handed from `rt-im-train` to `extract` in memory by the
@@ -191,6 +207,10 @@ pub struct RtFit {
 /// windows fitted on a different library of the same size (a re-predicted or fine-tuned
 /// precursor table, another band), which the file-based contract cannot do, because
 /// `extract` reads the `run_windows` path it is given.
+///
+/// Retention time only. Windows fitted with an ion-mobility calibration are not handed
+/// over at all: their IM columns exist only in the file, so `extract` reads it, IM
+/// windows and all, as it reads any file-based window table.
 pub struct RtWindows {
     pub(crate) rt_cal: Vec<f64>,
     pub(crate) rt_lo: Vec<f64>,
@@ -318,6 +338,13 @@ pub struct ApplyParams<'a> {
 }
 
 fn check_cfg(cfg: &RtImTrainConfig) -> Result<()> {
+    let im_holdout_frac = cfg.im_window_holdout_frac;
+    if !(im_holdout_frac > 0.0 && im_holdout_frac <= 0.9) {
+        anyhow::bail!(
+            "rt_im_train.im_window_holdout_frac must be in (0.0, 0.9], got {im_holdout_frac}; \
+             the IM window is always sized on held-out anchors"
+        );
+    }
     let holdout_frac = cfg.window_holdout_frac;
     if !(0.0..=0.9).contains(&holdout_frac) {
         anyhow::bail!(
@@ -347,7 +374,8 @@ pub fn run_hashed(p: RtImTrainParams) -> Result<Written> {
 
 /// [`run_hashed`], also returning the fitted windows in the form `extract` consumes, so an
 /// orchestrator can hand them over instead of having `extract` decode the table it just
-/// wrote. `None` only when the table holds a NaN bound (see [`RtWindows`]).
+/// wrote. `None` when the table holds a NaN bound or ion-mobility windows (see
+/// [`RtWindows`]).
 pub fn run_in_memory(p: RtImTrainParams) -> Result<(Written, Option<RtWindows>)> {
     run_impl(p, true)
 }
@@ -378,7 +406,17 @@ fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(Written, Option<R
     } else {
         IrtJoin::new(&lib_cid, &lib_irt)
     };
-    let fit = fit_anchors(p.seed_psms, p.cfg, &irt_join)?;
+    // The same rows' `predicted_im`, for the ion-mobility anchors. It is decoded only when
+    // the seed has an observed 1/K0 to calibrate it against (`im_from_seed`), so a 3D run
+    // reads none of it. Anchors whose iRT comes from the seed carry ids of another table
+    // (a grouped run's pooled seed), so they join no library here; [`fit_from_seed`] joins
+    // them to the whole library instead.
+    let im_library = (!p.anchor_irt_from_seed).then_some(ImLibrary {
+        path: p.library_precursors,
+        span: p.precursor_span,
+        cid: Some(&lib_cid),
+    });
+    let (fit, lib_im) = fit_anchors(p.seed_psms, p.cfg, &irt_join, im_library.as_ref())?;
     // The join borrows `lib_irt`, which the application pass below takes by value; its
     // hash-map form has drop glue, so end it here explicitly.
     drop(irt_join);
@@ -394,6 +432,7 @@ fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(Written, Option<R
         },
         lib_cid,
         lib_irt,
+        lib_im,
         t0,
         keep_windows,
     )
@@ -430,12 +469,91 @@ fn library_irt(path: &str, span: Option<(usize, usize)>) -> Result<(Vec<u32>, Ve
     }
 }
 
+/// The rows of a library table that [`library_irt`] reads, opened the same way: the whole
+/// table, or its rows `[first, first + n)`.
+fn library_rows(path: &str, span: Option<(usize, usize)>) -> Result<TableFile> {
+    match span {
+        None => TableFile::open(path),
+        Some((first, n)) => TableFile::open_rows(path, first, n),
+    }
+}
+
+/// Where the ion-mobility anchors take their `predicted_im` from: the library table and
+/// rows [`library_irt`] read, with their candidate ids as it returned them (local to the
+/// span). `cid: None` is a whole table joined by row, which the library invariant makes
+/// the same join (`candidate_id` is the row-aligned range), without decoding the ids.
+struct ImLibrary<'a> {
+    path: &'a str,
+    span: Option<(usize, usize)>,
+    cid: Option<&'a [u32]>,
+}
+
+impl ImLibrary<'_> {
+    /// The `predicted_im` column of those rows; `None` when the table has none (v1
+    /// libraries and imported ones without ion mobility carry no `predicted_im`).
+    fn predicted_im(&self) -> Result<Option<Vec<Option<f64>>>> {
+        let lib = library_rows(self.path, self.span)?;
+        if !lib.has_column("predicted_im") {
+            return Ok(None);
+        }
+        Ok(Some(lib.opt_f64("predicted_im")?))
+    }
+}
+
+/// The anchors' `candidate_id -> predicted_im` join, the ion-mobility [`IrtJoin`]: an index
+/// into the column when the ids are the row-aligned range, else a hash table holding every
+/// row with a prediction, the last such row winning.
+enum ImJoin<'a> {
+    Dense(&'a [Option<f64>]),
+    Map(HashMap<u32, f64>),
+}
+
+impl<'a> ImJoin<'a> {
+    fn new(cid: &[u32], im: &'a [Option<f64>]) -> ImJoin<'a> {
+        if cid.len() == im.len() && cid.iter().enumerate().all(|(i, &c)| c as usize == i) {
+            return ImJoin::Dense(im);
+        }
+        ImJoin::Map(
+            cid.iter()
+                .zip(im)
+                .filter_map(|(c, v)| v.map(|v| (*c, v)))
+                .collect(),
+        )
+    }
+
+    /// The library `predicted_im` of candidate `c`; `None` when the library has no such
+    /// candidate or no prediction for it.
+    #[inline]
+    fn get(&self, c: u32) -> Option<f64> {
+        match self {
+            ImJoin::Dense(im) => im.get(c as usize).copied().flatten(),
+            ImJoin::Map(m) => m.get(&c).copied(),
+        }
+    }
+}
+
 /// Fit the calibration on a seed table whose own `predicted_irt` column carries the anchors'
 /// iRT (`RtImTrainParams::anchor_irt_from_seed`): the fit a grouped run's bands share under
-/// `groups.calibration = global`. No library is read.
-pub fn fit_from_seed(seed_psms: &str, cfg: &RtImTrainConfig) -> Result<RtFit> {
+/// `groups.calibration = global`.
+///
+/// `whole_library` is the precursor table whose candidate ids the seed's anchors carry: a
+/// grouped run's whole library, whose bands are row spans of it, so the pooled seed's ids
+/// (band-local id plus the band's first row) are its row numbers. The ion-mobility anchors
+/// join their `predicted_im` from it, decoded only when the seed carries an observed 1/K0,
+/// and each band then applies the one IM calibration to its own rows. `None` fits no
+/// ion-mobility calibration (a warning says so when the seed carries an observed 1/K0).
+pub fn fit_from_seed(
+    seed_psms: &str,
+    whole_library: Option<&str>,
+    cfg: &RtImTrainConfig,
+) -> Result<RtFit> {
     check_cfg(cfg)?;
-    fit_anchors(seed_psms, cfg, &IrtJoin::Unused)
+    let im_library = whole_library.map(|path| ImLibrary {
+        path,
+        span: None,
+        cid: None,
+    });
+    fit_anchors(seed_psms, cfg, &IrtJoin::Unused, im_library.as_ref()).map(|(fit, _)| fit)
 }
 
 /// Write the windows of `p.library_precursors` and its `cal.json` from a fit made by
@@ -461,12 +579,20 @@ fn apply_impl(
         mumdia_io::refuse_output_over_input(out, &[("--lib-precursors", p.library_precursors)])?;
     }
     let (lib_cid, lib_irt) = library_irt(p.library_precursors, p.precursor_span)?;
-    write_windows(fit, p, lib_cid, lib_irt, t0, keep_windows)
+    write_windows(fit, p, lib_cid, lib_irt, None, t0, keep_windows)
 }
 
 /// The anchors and the fit. `irt_join` joins each anchor's iRT from the library;
-/// [`IrtJoin::Unused`] reads it from the seed's own `predicted_irt` column.
-fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Result<RtFit> {
+/// [`IrtJoin::Unused`] reads it from the seed's own `predicted_irt` column. `im_library` is
+/// where the ion-mobility anchors join their `predicted_im` (`None`: no IM calibration).
+/// Also returns the library's `predicted_im` when it was decoded for the IM anchors, so the
+/// application pass does not decode it again.
+fn fit_anchors(
+    seed_psms: &str,
+    cfg: &RtImTrainConfig,
+    irt_join: &IrtJoin,
+    im_library: Option<&ImLibrary>,
+) -> Result<(RtFit, Option<Vec<Option<f64>>>)> {
     let holdout_frac = cfg.window_holdout_frac;
     // Training rows: confident seed PSMs, one apex (best score) per peptide;
     // predicted iRT is joined from the library by candidate_id.
@@ -519,6 +645,42 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
         }
     }
     let (anchor_ids, train_irt, train_rt) = sorted_anchor_vectors(best_per_pep);
+    // `robust_calibration`: drop anchors far off a first fit before anything below uses
+    // them (the curve, the window sizing and the reported residuals).
+    let mut n_rt_outliers: Option<usize> = None;
+    let (anchor_ids, train_irt, train_rt) =
+        if cfg.robust_calibration && train_irt.len() >= cfg.min_seed_for_calibration.max(4) {
+            let keep = robust_inliers(&train_irt, &train_rt, cfg.loess_span, 200);
+            let pick = |v: &[f64]| -> Vec<f64> {
+                v.iter()
+                    .zip(&keep)
+                    .filter(|(_, k)| **k)
+                    .map(|(x, _)| *x)
+                    .collect()
+            };
+            let ids: Vec<u32> = anchor_ids
+                .iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(x, _)| *x)
+                .collect();
+            n_rt_outliers = Some(keep.iter().filter(|k| !**k).count());
+            info!(
+                removed = n_rt_outliers,
+                "rt-im-train: robust calibration dropped outlying RT anchors"
+            );
+            (ids, pick(&train_irt), pick(&train_rt))
+        } else {
+            (anchor_ids, train_irt, train_rt)
+        };
+
+    // IM anchors: the same confident targets, one per candidate (the seed table already
+    // holds one row per candidate), because 1/K0 depends on charge where RT does not.
+    let ImFit {
+        cal: im_cal,
+        reported: im_reported,
+        lib_im,
+    } = im_from_seed(&seed, &s_cid, &s_base, &s_q, &s_label, cfg, im_library)?;
     let n_train = train_irt.len();
     info!(n_train, "rt-im-train: training points");
 
@@ -552,6 +714,9 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
         holdout_sizing: None,
         adaptive: None,
         residuals: (f64::NAN, f64::NAN, f64::NAN),
+        im: im_cal,
+        im_reported,
+        n_rt_outliers,
     };
 
     // Residuals and RT window. Require enough anchors before trusting the
@@ -726,17 +891,136 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
     fit.holdout_sizing = holdout_sizing;
     fit.adaptive = adaptive;
     fit.residuals = residuals;
-    Ok(fit)
+    Ok((fit, lib_im))
+}
+
+/// What [`im_from_seed`] found.
+struct ImFit {
+    /// The ion-mobility calibration, `None` without one.
+    cal: Option<ImCal>,
+    /// Both sides carry ion mobility, so `cal.json` records the IM calibration.
+    reported: bool,
+    /// The library's `predicted_im`, when it was decoded and the calibration exists, for the
+    /// application pass.
+    lib_im: Option<Vec<Option<f64>>>,
+}
+
+/// The ion-mobility calibration from the confident target seed rows (`s_*` are the seed's
+/// columns `fit_anchors` decoded): each anchor's observed 1/K0 from the seed, its
+/// `predicted_im` joined from `library` by candidate id.
+///
+/// The library column is decoded only when the seed has an observed 1/K0 to calibrate it
+/// against, so a 3D run reads none of it; a seed without the column at all (a v1 seed) reads
+/// it only to warn that it cannot be calibrated.
+fn im_from_seed(
+    seed: &TableFile,
+    s_cid: &[u32],
+    s_base: &[u32],
+    s_q: &[f64],
+    s_label: &[String],
+    cfg: &RtImTrainConfig,
+    library: Option<&ImLibrary>,
+) -> Result<ImFit> {
+    let none = ImFit {
+        cal: None,
+        reported: false,
+        lib_im: None,
+    };
+    if !seed.has_column("observed_im") {
+        if let Some(lib) = library {
+            if lib
+                .predicted_im()?
+                .is_some_and(|v| v.iter().any(|x| x.is_some()))
+            {
+                warn!(
+                    "rt-im-train: the library has predicted_im but the seed table has no \
+                     observed_im (a v1 seed); IM calibration unavailable, IM windows null"
+                );
+            }
+        }
+        return Ok(none);
+    }
+    let s_obs_im = seed.opt_f64("observed_im")?;
+    // A 3D run carries the column all-null: nothing to calibrate.
+    if !s_obs_im.iter().any(|v| v.is_some()) {
+        return Ok(none);
+    }
+    let Some(lib) = library else {
+        warn!(
+            "rt-im-train: the anchors take their iRT from the seed and no library was given \
+             to join their predicted_im, so ion mobility is not calibrated; IM windows null"
+        );
+        return Ok(none);
+    };
+    // v1 libraries and imported ones without IM carry no `predicted_im`.
+    let Some(lib_im) = lib.predicted_im()? else {
+        return Ok(none);
+    };
+    let s_mz = seed.f64("precursor_mz")?;
+    let s_z = seed.i32("charge")?;
+    let join = match lib.cid {
+        Some(cid) => ImJoin::new(cid, &lib_im),
+        None => ImJoin::Dense(&lib_im),
+    };
+    let mut anchors: Vec<ImAnchor> = Vec::new();
+    for i in 0..seed.nrows {
+        if !s_q[i].is_finite() || s_q[i] >= cfg.q_train || s_label[i] != "target" {
+            continue;
+        }
+        let (Some(obs), Some(pred)) = (s_obs_im[i], join.get(s_cid[i])) else {
+            continue;
+        };
+        if obs.is_finite() && obs > 0.0 && pred.is_finite() && pred > 0.0 {
+            anchors.push(ImAnchor {
+                cid: s_cid[i],
+                base_peptide_id: s_base[i],
+                charge: s_z[i],
+                mz: s_mz[i],
+                pred_im: pred,
+                obs_im: obs,
+            });
+        }
+    }
+    anchors.sort_by_key(|a| a.cid);
+    let fit = fit_im(&anchors, cfg);
+    // Only a run with IM on both sides and too few anchors is worth a warning.
+    let has_im = lib_im.iter().any(|v| v.is_some());
+    if fit.is_none() && has_im {
+        warn!(
+            n_anchors = anchors.len(),
+            min_anchors = cfg.min_seed_for_calibration,
+            "rt-im-train: too few IM anchors; IM calibration unavailable, IM windows null"
+        );
+    }
+    drop(join);
+    Ok(ImFit {
+        reported: has_im,
+        lib_im: fit.is_some().then_some(lib_im),
+        cal: fit,
+    })
+}
+
+/// The three ion-mobility columns of one `k`-row chunk: empty, to be filled row by row, when
+/// the fit has an IM calibration, else `k` nulls each, which is what they always were on a
+/// 3D run.
+fn im_buffers(k: usize, calibrated: bool) -> [Vec<Option<f64>>; 3] {
+    if calibrated {
+        std::array::from_fn(|_| Vec::with_capacity(k))
+    } else {
+        std::array::from_fn(|_| vec![None; k])
+    }
 }
 
 /// Apply `fit` to every row of one library table and write the windows, the `cal.json` and
-/// the windows' report. With `keep_windows`, also return the windows in the form `extract`
-/// consumes (see [`RtWindows`]; `None` when the table holds a NaN bound).
+/// the windows' report. `lib_im` is the table's `predicted_im` when the caller has already
+/// decoded it. With `keep_windows`, also return the windows in the form `extract` consumes
+/// (see [`RtWindows`]; `None` when the table holds a NaN bound or IM windows).
 fn write_windows(
     fit: &RtFit,
     p: &ApplyParams,
     lib_cid: Vec<u32>,
     lib_irt: Vec<f32>,
+    lib_im: Option<Vec<Option<f64>>>,
     t0: Instant,
     keep_windows: bool,
 ) -> Result<(Written, Option<RtWindows>)> {
@@ -749,8 +1033,36 @@ fn write_windows(
     let cid = lib_cid;
     let irt = lib_irt;
     let n = cid.len();
+    // The ion-mobility columns: the fit's IM calibration applied to each row's
+    // `predicted_im`, with the row's m/z and charge for the CCS conversion. Without a
+    // calibration nothing more is read and the columns are null, as on every 3D run.
+    let im_rows = match (&fit.im, lib_im) {
+        (None, _) => None,
+        (Some(im_cal), lib_im) => {
+            let lib = library_rows(p.library_precursors, p.precursor_span)?;
+            let im = match lib_im {
+                Some(v) => v,
+                None if lib.has_column("predicted_im") => lib.opt_f64("predicted_im")?,
+                None => vec![None; n],
+            };
+            let (mz, z) = (lib.f64("precursor_mz")?, lib.i32("charge")?);
+            if im.len() != n || mz.len() != n || z.len() != n {
+                anyhow::bail!(
+                    "{}: {} predicted_im, {} precursor_mz and {} charge values for {n} \
+                     windows",
+                    p.library_precursors,
+                    im.len(),
+                    mz.len(),
+                    z.len()
+                );
+            }
+            Some((im_cal, im, mz, z))
+        }
+    };
     let mut n_nonfinite_irt = 0u64;
-    let mut kept = keep_windows.then(|| RtWindowsBuilder::new(n));
+    // Windows with IM columns are not kept in memory: the in-memory form carries retention
+    // time only, so extract reads the file (see `RtWindows`).
+    let mut kept = (keep_windows && im_rows.is_none()).then(|| RtWindowsBuilder::new(n));
     let windows = write_table_chunked_hashed(p.out_windows, n, |r| {
         let k = r.len();
         let (mut cid_c, mut cal_c, mut lo_c, mut hi_c) = (
@@ -759,6 +1071,7 @@ fn write_windows(
             Vec::with_capacity(k),
             Vec::with_capacity(k),
         );
+        let [mut im_c, mut imlo_c, mut imhi_c] = im_buffers(k, im_rows.is_some());
         for i in r {
             // A row whose library iRT is not finite has no calibrated RT, which is the
             // documented "search the whole gradient" sentinel rather than an arithmetic
@@ -788,15 +1101,21 @@ fn write_windows(
             cal_c.push(cal);
             lo_c.push(lo);
             hi_c.push(hi);
+            if let Some((im_cal, im, mz, z)) = &im_rows {
+                let im_pred = im[i].map(|pred| im_cal.predict(pred, mz[i], z[i]));
+                im_c.push(im_pred);
+                imlo_c.push(im_pred.map(|v| v - im_cal.w_im));
+                imhi_c.push(im_pred.map(|v| v + im_cal.w_im));
+            }
         }
         Ok(vec![
             Col::U32("candidate_id".into(), cid_c),
             Col::F64("rt_pred_cal".into(), cal_c),
             Col::F64("rt_lo".into(), lo_c),
             Col::F64("rt_hi".into(), hi_c),
-            Col::OptF64("im_pred_cal".into(), vec![None; k]),
-            Col::OptF64("im_lo".into(), vec![None; k]),
-            Col::OptF64("im_hi".into(), vec![None; k]),
+            Col::OptF64("im_pred_cal".into(), im_c),
+            Col::OptF64("im_lo".into(), imlo_c),
+            Col::OptF64("im_hi".into(), imhi_c),
         ])
     })?;
     let rows = windows.rows;
@@ -818,43 +1137,75 @@ fn write_windows(
     let n_train = fit.n_train;
 
     // cal.json
-    mumdia_io::json::write_json(
-        p.out_cal,
-        &json!({
-            "method": method,
-            "slope": slope_report,
-            "intercept": intercept_report,
-            "w_rt": w_rt,
-            "p_rt": p.cfg.p_rt,
-            "multiplier": p.cfg.rt_window_multiplier,
-            "n_train": n_train,
-            "calibration_status": status,
-            // Window sizing provenance. "holdout" means w_rt came from held-out
-            // residuals; "holdout_fallback_in_sample" means it was requested but
-            // an anchor-count guard fell back; "in_sample" is the historical
-            // behavior. The holdout_* fields are null unless sizing ran held-out.
-            "w_rt_sizing": match (holdout_sizing, holdout_frac > 0.0) {
-                (Some(_), _) => "holdout",
-                (None, true) => "holdout_fallback_in_sample",
-                (None, false) => "in_sample",
-            },
-            "window_holdout_frac": holdout_frac,
-            "n_sizing_train": holdout_sizing.as_ref().map(|h| h.n_sizing_train),
-            "n_holdout": holdout_sizing.as_ref().map(|h| h.n_holdout),
-            "holdout_resid_p_rt_s": holdout_sizing.as_ref().map(|h| h.resid_p_rt_s),
-            "holdout_resid_abs_median_s": holdout_sizing.as_ref().map(|h| h.resid_abs_median_s),
-            // Calibration-quality diagnostics (post-fit RT residuals, seconds).
-            "rt_residual_median_s": rt_residual_median_s,
-            "rt_residual_abs_median_s": rt_residual_abs_median_s,
-            "rt_residual_mad_s": rt_residual_mad_s,
-        }),
-    )?;
+    let mut cal_json = json!({
+        "method": method,
+        "slope": slope_report,
+        "intercept": intercept_report,
+        "w_rt": w_rt,
+        "p_rt": p.cfg.p_rt,
+        "multiplier": p.cfg.rt_window_multiplier,
+        "n_train": n_train,
+        "calibration_status": status,
+        // Window sizing provenance. "holdout" means w_rt came from held-out
+        // residuals; "holdout_fallback_in_sample" means it was requested but
+        // an anchor-count guard fell back; "in_sample" is the historical
+        // behavior. The holdout_* fields are null unless sizing ran held-out.
+        "w_rt_sizing": match (holdout_sizing, holdout_frac > 0.0) {
+            (Some(_), _) => "holdout",
+            (None, true) => "holdout_fallback_in_sample",
+            (None, false) => "in_sample",
+        },
+        "window_holdout_frac": holdout_frac,
+        "n_sizing_train": holdout_sizing.as_ref().map(|h| h.n_sizing_train),
+        "n_holdout": holdout_sizing.as_ref().map(|h| h.n_holdout),
+        "holdout_resid_p_rt_s": holdout_sizing.as_ref().map(|h| h.resid_p_rt_s),
+        "holdout_resid_abs_median_s": holdout_sizing.as_ref().map(|h| h.resid_abs_median_s),
+        // Calibration-quality diagnostics (post-fit RT residuals, seconds).
+        "rt_residual_median_s": rt_residual_median_s,
+        "rt_residual_abs_median_s": rt_residual_abs_median_s,
+        "rt_residual_mad_s": rt_residual_mad_s,
+    });
+    // Ion-mobility calibration, recorded when the run carries ion mobility on both sides
+    // (null fields when it could not be fitted). `w_im` is always sized on held-out anchors
+    // unless `w_im_sizing` says otherwise; the in-sample residual is a fit diagnostic only
+    // (docs/08 section 4). A 3D run records none of it, so its cal.json is unchanged.
+    let im_cal = fit.im.as_ref();
+    if fit.im_reported {
+        let im_fields = json!({
+            "im_method": if im_cal.is_some() { "per_charge_linear_ccs" } else { "unavailable" },
+            "im_n_train": im_cal.map(|c| c.n_train),
+            "im_global": im_cal.map(|c| json!({"a": c.coefs.0 .0, "b": c.coefs.0 .1})),
+            "im_per_charge": im_cal.map(|c| c.coefs.1.iter()
+                .map(|(z, (a, b, n))| (z.to_string(), json!({"a": a, "b": b, "n": n})))
+                .collect::<serde_json::Map<_, _>>()),
+            "w_im": im_cal.map(|c| c.w_im),
+            "w_im_sizing": im_cal.map(|c| c.sizing),
+            "p_im": p.cfg.p_im,
+            "im_window_holdout_frac": p.cfg.im_window_holdout_frac,
+            "im_n_holdout": im_cal.map(|c| c.n_holdout),
+            "im_holdout_resid_abs_median": im_cal.and_then(|c| c.holdout_abs_median),
+            "im_holdout_resid_p_im": im_cal.and_then(|c| c.holdout_p_im),
+            "im_in_sample_resid_abs_median": im_cal.map(|c| c.in_sample_abs_median),
+        });
+        if let (Some(obj), Some(im)) = (cal_json.as_object_mut(), im_fields.as_object()) {
+            obj.extend(im.clone());
+        }
+    }
+    // Only when on, so a default cal.json is unchanged.
+    if let Some(n) = fit.n_rt_outliers {
+        cal_json["n_rt_outliers_removed"] = json!(n);
+    }
+    mumdia_io::json::write_json(p.out_cal, &cal_json)?;
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("n_train".to_string(), json!(n_train));
     stats.insert("w_rt".to_string(), json!(w_rt));
     stats.insert("calibration_status".to_string(), json!(status));
+    if fit.im_reported {
+        stats.insert("im_n_train".to_string(), json!(im_cal.map(|c| c.n_train)));
+        stats.insert("w_im".to_string(), json!(im_cal.map(|c| c.w_im)));
+    }
     stats.insert(
         "candidates_without_finite_irt".to_string(),
         json!(n_nonfinite_irt),
@@ -897,10 +1248,402 @@ fn write_windows(
     ))
 }
 
+/// One ion-mobility calibration anchor: a confident target seed PSM with an observed and
+/// a library-predicted 1/K0.
+#[derive(Clone, Debug)]
+pub(crate) struct ImAnchor {
+    pub(crate) cid: u32,
+    pub(crate) base_peptide_id: u32,
+    pub(crate) charge: i32,
+    pub(crate) mz: f64,
+    pub(crate) pred_im: f64,
+    pub(crate) obs_im: f64,
+}
+
+/// A fitted per-run IM calibration: `obs_ccs = a + b * pred_ccs`, per charge where that
+/// charge has `im_min_anchors_per_charge` anchors, else the global fit.
+struct ImCal {
+    coefs: ImCoefs,
+    w_im: f64,
+    sizing: &'static str,
+    n_train: usize,
+    n_holdout: usize,
+    holdout_abs_median: Option<f64>,
+    holdout_p_im: Option<f64>,
+    in_sample_abs_median: f64,
+}
+
+pub(crate) type ImCoefs = (
+    (f64, f64),
+    std::collections::BTreeMap<i32, (f64, f64, usize)>,
+);
+
+impl ImCal {
+    fn predict(&self, pred_im: f64, mz: f64, charge: i32) -> f64 {
+        im_predict(&self.coefs, pred_im, mz, charge)
+    }
+}
+
+pub(crate) fn im_predict(coefs: &ImCoefs, pred_im: f64, mz: f64, charge: i32) -> f64 {
+    use mumdia_core::constants::{ccs_to_im, im_to_ccs};
+    let (a, b) = coefs.1.get(&charge).map(|c| (c.0, c.1)).unwrap_or(coefs.0);
+    ccs_to_im(a + b * im_to_ccs(pred_im, mz, charge), mz, charge)
+}
+
+/// Least-squares `obs_ccs = a + b * pred_ccs`, globally and per charge. Anchors are in a
+/// fixed order (sorted by candidate id), and the per-charge map is ordered, so the fit is
+/// deterministic.
+pub(crate) fn fit_im_coefs(anchors: &[&ImAnchor], min_per_charge: usize) -> ImCoefs {
+    use mumdia_core::constants::im_to_ccs;
+    let ccs = |a: &ImAnchor| {
+        (
+            im_to_ccs(a.pred_im, a.mz, a.charge),
+            im_to_ccs(a.obs_im, a.mz, a.charge),
+        )
+    };
+    let (x, y): (Vec<f64>, Vec<f64>) = anchors.iter().map(|a| ccs(a)).unzip();
+    let (b, a) = linear_fit(&x, &y);
+    let mut by_z: std::collections::BTreeMap<i32, (Vec<f64>, Vec<f64>)> = Default::default();
+    for an in anchors {
+        let (px, py) = ccs(an);
+        let e = by_z.entry(an.charge).or_default();
+        e.0.push(px);
+        e.1.push(py);
+    }
+    let per_charge = by_z
+        .into_iter()
+        .filter(|(_, (xs, _))| xs.len() >= min_per_charge.max(2))
+        .map(|(z, (xs, ys))| {
+            let (bz, az) = linear_fit(&xs, &ys);
+            (z, (az, bz, xs.len()))
+        })
+        .collect();
+    ((a, b), per_charge)
+}
+
+/// Fit the IM calibration on every anchor and size `w_im` from anchors held out of a
+/// refit (split by base peptide, as the RT holdout). `None` below
+/// `min_seed_for_calibration` anchors: no IM window is safer than one from a handful of
+/// points, and a null window means "do not gate".
+fn fit_im(anchors: &[ImAnchor], cfg: &RtImTrainConfig) -> Option<ImCal> {
+    if anchors.len() < cfg.min_seed_for_calibration.max(2) {
+        return None;
+    }
+    let all: Vec<&ImAnchor> = anchors.iter().collect();
+    let coefs = fit_im_coefs(&all, cfg.im_min_anchors_per_charge);
+    let resid = |c: &ImCoefs, set: &[&ImAnchor]| -> Vec<f64> {
+        set.iter()
+            .map(|a| (a.obs_im - im_predict(c, a.pred_im, a.mz, a.charge)).abs())
+            .collect()
+    };
+    let in_sample = resid(&coefs, &all);
+    let (train, held): (Vec<&ImAnchor>, Vec<&ImAnchor>) = all
+        .iter()
+        .partition(|a| !is_holdout(a.base_peptide_id, cfg.im_window_holdout_frac));
+    let (p_resid, sizing, holdout) = if held.len() >= MIN_HOLDOUT_ANCHORS
+        && train.len() >= cfg.min_seed_for_calibration.max(2)
+    {
+        let r = resid(&fit_im_coefs(&train, cfg.im_min_anchors_per_charge), &held);
+        let pr = percentile(&r, cfg.p_im);
+        (pr, "holdout", Some((percentile(&r, 0.5), pr)))
+    } else {
+        warn!(
+            n_holdout = held.len(),
+            n_sizing_train = train.len(),
+            "rt-im-train: too few IM anchors on one side of the holdout split; sizing w_im \
+             in-sample"
+        );
+        (
+            percentile(&in_sample, cfg.p_im),
+            "holdout_fallback_in_sample",
+            None,
+        )
+    };
+    Some(ImCal {
+        coefs,
+        w_im: (p_resid * cfg.im_window_multiplier).max(cfg.im_window_min),
+        sizing,
+        n_train: anchors.len(),
+        n_holdout: held.len(),
+        holdout_abs_median: holdout.map(|h| h.0),
+        holdout_p_im: holdout.map(|h| h.1),
+        in_sample_abs_median: percentile(&in_sample, 0.5),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mumdia_io::table::write_table;
+
+    #[test]
+    fn im_calibration_recovers_a_per_charge_ccs_map_and_sizes_w_im_held_out() {
+        use mumdia_core::constants::{ccs_to_im, im_to_ccs};
+        // Charge 2: obs_ccs = 10 + 1.02 * pred_ccs; charge 3: obs_ccs = -5 + 0.98 * pred.
+        // A deterministic +/-0.004 1/K0 jitter gives a known residual scale.
+        let mut anchors = Vec::new();
+        for i in 0..600u32 {
+            let z = if i % 3 == 0 { 3 } else { 2 };
+            let mz = 400.0 + (i as f64) * 0.9;
+            let pred = 0.7 + (i as f64) * 0.0008;
+            let (a, b) = if z == 2 { (10.0, 1.02) } else { (-5.0, 0.98) };
+            let jitter = if i % 2 == 0 { 0.004 } else { -0.004 };
+            let obs = ccs_to_im(a + b * im_to_ccs(pred, mz, z), mz, z) + jitter;
+            anchors.push(ImAnchor {
+                cid: i,
+                base_peptide_id: i,
+                charge: z,
+                mz,
+                pred_im: pred,
+                obs_im: obs,
+            });
+        }
+        let cfg = RtImTrainConfig::default();
+        let cal = fit_im(&anchors, &cfg).expect("600 anchors calibrate");
+        assert_eq!(cal.sizing, "holdout");
+        assert_eq!(cal.n_holdout, 300, "ids 0..300 satisfy id % 1000 < 300");
+        let (a2, b2, _) = cal.coefs.1[&2];
+        assert!(
+            (b2 - 1.02).abs() < 0.01 && (a2 - 10.0).abs() < 5.0,
+            "{a2} {b2}"
+        );
+        let (_, b3, _) = cal.coefs.1[&3];
+        assert!((b3 - 0.98).abs() < 0.01, "{b3}");
+        // The residuals are the jitter, so the held-out p95 is ~0.004.
+        let p = cal.holdout_p_im.unwrap();
+        assert!((p - 0.004).abs() < 0.001, "{p}");
+        assert_eq!(cal.w_im, p.max(cfg.im_window_min));
+        // Too few anchors: no calibration rather than a window from a handful of points.
+        assert!(fit_im(&anchors[..10], &cfg).is_none());
+    }
+
+    /// A library with `predicted_im` and a seed with `observed_im`: the streamed windows carry
+    /// the fit's IM calibration applied to every row, `cal.json` records it, and the windows
+    /// are not handed over in memory, so extract reads the IM columns from the file. The same
+    /// inputs without ion mobility write null IM columns and a `cal.json` without IM keys, and
+    /// are handed over.
+    #[test]
+    fn im_windows_are_the_calibration_applied_to_every_row() {
+        use mumdia_core::constants::{ccs_to_im, im_to_ccs};
+        let n = 600usize;
+        let z: Vec<i32> = (0..n).map(|i| if i % 3 == 0 { 3 } else { 2 }).collect();
+        let mz: Vec<f64> = (0..n).map(|i| 400.0 + i as f64 * 0.9).collect();
+        let pred: Vec<f64> = (0..n).map(|i| 0.7 + i as f64 * 0.0008).collect();
+        let obs: Vec<f64> = (0..n)
+            .map(|i| {
+                let (a, b) = if z[i] == 2 {
+                    (10.0, 1.02)
+                } else {
+                    (-5.0, 0.98)
+                };
+                let jitter = if i % 2 == 0 { 0.004 } else { -0.004 };
+                ccs_to_im(a + b * im_to_ccs(pred[i], mz[i], z[i]), mz[i], z[i]) + jitter
+            })
+            .collect();
+        let irt: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
+        let cfg = RtImTrainConfig::default();
+        for with_im in [true, false] {
+            let tag = if with_im { "im" } else { "3d" };
+            let prec = scratch(&format!("im_prec_{tag}.parquet"));
+            let seed = scratch(&format!("im_seed_{tag}.parquet"));
+            let mut lib_cols = vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::F32("predicted_irt".into(), irt.clone()),
+                Col::F64("precursor_mz".into(), mz.clone()),
+                Col::I32("charge".into(), z.clone()),
+            ];
+            let mut seed_cols = vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::U32("base_peptide_id".into(), (0..n as u32).collect()),
+                Col::F64("spectrum_q".into(), vec![0.001; n]),
+                Col::F64("score".into(), (0..n).map(|i| 1.0 + i as f64).collect()),
+                Col::F64(
+                    "observed_rt".into(),
+                    irt.iter().map(|&x| 60.0 + 30.0 * x as f64).collect(),
+                ),
+                Col::Str("label".into(), vec!["target".to_string(); n]),
+                Col::F64("precursor_mz".into(), mz.clone()),
+                Col::I32("charge".into(), z.clone()),
+            ];
+            if with_im {
+                lib_cols.push(Col::OptF64(
+                    "predicted_im".into(),
+                    pred.iter().map(|&v| Some(v)).collect(),
+                ));
+                seed_cols.push(Col::OptF64(
+                    "observed_im".into(),
+                    obs.iter().map(|&v| Some(v)).collect(),
+                ));
+            }
+            write_table(&prec, lib_cols).unwrap();
+            write_table(&seed, seed_cols).unwrap();
+            let windows = scratch(&format!("im_windows_{tag}.parquet"));
+            let cal = scratch(&format!("im_cal_{tag}.json"));
+            let (written, kept) = run_in_memory(RtImTrainParams {
+                precursor_span: None,
+                seed_psms: &seed,
+                library_precursors: &prec,
+                out_windows: &windows,
+                out_cal: &cal,
+                cfg: &cfg,
+                config_hash: "test",
+                anchor_irt_from_seed: false,
+            })
+            .unwrap();
+            assert_eq!(written.rows, n as u64);
+            let cal_json: serde_json::Value = mumdia_io::json::read_json(&cal).unwrap();
+            let w = TableFile::open(&windows).unwrap();
+            let (im_c, im_lo, im_hi) = (
+                w.opt_f64("im_pred_cal").unwrap(),
+                w.opt_f64("im_lo").unwrap(),
+                w.opt_f64("im_hi").unwrap(),
+            );
+            if !with_im {
+                assert!(kept.is_some(), "3D windows are handed over in memory");
+                assert!(
+                    cal_json.get("im_method").is_none(),
+                    "a 3D cal.json has no IM keys"
+                );
+                assert!(im_c.iter().chain(&im_lo).chain(&im_hi).all(|v| v.is_none()));
+                continue;
+            }
+            assert!(kept.is_none(), "IM windows are read from the file");
+            assert_eq!(cal_json["im_method"], "per_charge_linear_ccs");
+            // The anchors `im_from_seed` builds here: every row, in candidate order.
+            let anchors: Vec<ImAnchor> = (0..n)
+                .map(|i| ImAnchor {
+                    cid: i as u32,
+                    base_peptide_id: i as u32,
+                    charge: z[i],
+                    mz: mz[i],
+                    pred_im: pred[i],
+                    obs_im: obs[i],
+                })
+                .collect();
+            let want = fit_im(&anchors, &cfg).expect("600 anchors calibrate");
+            assert_eq!(cal_json["w_im"].as_f64(), Some(want.w_im));
+            for i in 0..n {
+                let c = want.predict(pred[i], mz[i], z[i]);
+                assert_eq!(im_c[i].map(f64::to_bits), Some(c.to_bits()), "row {i}");
+                assert_eq!(
+                    im_lo[i].map(f64::to_bits),
+                    Some((c - want.w_im).to_bits()),
+                    "row {i}"
+                );
+                assert_eq!(
+                    im_hi[i].map(f64::to_bits),
+                    Some((c + want.w_im).to_bits()),
+                    "row {i}"
+                );
+            }
+        }
+    }
+
+    /// A grouped run under `groups.calibration = global`: one fit from the pooled seed, whose
+    /// ids are the whole library's, applied to one band (a row span). With the whole library
+    /// the ion-mobility anchors join its `predicted_im`, and the band's IM windows are that
+    /// calibration applied to the band's own rows; without it there is no IM calibration.
+    #[test]
+    fn a_shared_fit_calibrates_ion_mobility_from_the_whole_library() {
+        use mumdia_core::constants::{ccs_to_im, im_to_ccs};
+        let n = 600usize;
+        let z: Vec<i32> = (0..n).map(|i| if i % 3 == 0 { 3 } else { 2 }).collect();
+        let mz: Vec<f64> = (0..n).map(|i| 400.0 + i as f64 * 0.9).collect();
+        let pred: Vec<f64> = (0..n).map(|i| 0.7 + i as f64 * 0.0008).collect();
+        let obs: Vec<f64> = (0..n)
+            .map(|i| {
+                let jitter = if i % 2 == 0 { 0.003 } else { -0.003 };
+                ccs_to_im(8.0 + 1.01 * im_to_ccs(pred[i], mz[i], z[i]), mz[i], z[i]) + jitter
+            })
+            .collect();
+        let irt: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
+        let cfg = RtImTrainConfig::default();
+        let lib = scratch("shared_im_lib.parquet");
+        write_table(
+            &lib,
+            vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::F32("predicted_irt".into(), irt.clone()),
+                Col::F64("precursor_mz".into(), mz.clone()),
+                Col::I32("charge".into(), z.clone()),
+                Col::OptF64(
+                    "predicted_im".into(),
+                    pred.iter().map(|&v| Some(v)).collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        // The pooled seed: whole-library ids, its own iRT, an observed 1/K0 per row.
+        let seed = scratch("shared_im_seed.parquet");
+        write_table(
+            &seed,
+            vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::U32("base_peptide_id".into(), (0..n as u32).collect()),
+                Col::F64("spectrum_q".into(), vec![0.001; n]),
+                Col::F64("score".into(), (0..n).map(|i| 1.0 + i as f64).collect()),
+                Col::F64(
+                    "observed_rt".into(),
+                    irt.iter().map(|&x| 60.0 + 30.0 * x as f64).collect(),
+                ),
+                Col::F32("predicted_irt".into(), irt.clone()),
+                Col::Str("label".into(), vec!["target".to_string(); n]),
+                Col::F64("precursor_mz".into(), mz.clone()),
+                Col::I32("charge".into(), z.clone()),
+                Col::OptF64("observed_im".into(), obs.iter().map(|&v| Some(v)).collect()),
+            ],
+        )
+        .unwrap();
+        let anchors: Vec<ImAnchor> = (0..n)
+            .map(|i| ImAnchor {
+                cid: i as u32,
+                base_peptide_id: i as u32,
+                charge: z[i],
+                mz: mz[i],
+                pred_im: pred[i],
+                obs_im: obs[i],
+            })
+            .collect();
+        let want = fit_im(&anchors, &cfg).expect("600 anchors calibrate");
+        let (first, rows) = (200usize, 150usize);
+        for whole in [true, false] {
+            let fit = fit_from_seed(&seed, whole.then_some(lib.as_str()), &cfg).unwrap();
+            let tag = if whole { "whole" } else { "none" };
+            let windows = scratch(&format!("shared_im_windows_{tag}.parquet"));
+            let cal = scratch(&format!("shared_im_cal_{tag}.json"));
+            apply(
+                &fit,
+                &ApplyParams {
+                    precursor_span: Some((first, rows)),
+                    library_precursors: &lib,
+                    out_windows: &windows,
+                    out_cal: &cal,
+                    cfg: &cfg,
+                    config_hash: "test",
+                },
+            )
+            .unwrap();
+            let w = TableFile::open(&windows).unwrap();
+            assert_eq!(w.nrows, rows);
+            let im_c = w.opt_f64("im_pred_cal").unwrap();
+            let cal_json: serde_json::Value = mumdia_io::json::read_json(&cal).unwrap();
+            if !whole {
+                assert!(
+                    im_c.iter().all(|v| v.is_none()),
+                    "no library, no IM windows"
+                );
+                assert!(cal_json.get("im_method").is_none());
+                continue;
+            }
+            assert_eq!(cal_json["im_method"], "per_charge_linear_ccs");
+            assert_eq!(cal_json["w_im"].as_f64(), Some(want.w_im));
+            for (k, v) in im_c.iter().enumerate() {
+                let i = first + k;
+                let c = want.predict(pred[i], mz[i], z[i]);
+                assert_eq!(v.map(f64::to_bits), Some(c.to_bits()), "band row {k}");
+            }
+        }
+    }
 
     #[test]
     fn anchor_vectors_are_sorted_by_base_peptide_id() {
@@ -1263,11 +2006,16 @@ mod tests {
             calibration_method: CalibrationMethod::Linear,
             ..Default::default()
         };
+        let robust = RtImTrainConfig {
+            robust_calibration: true,
+            ..Default::default()
+        };
         for (tag, cfg, n) in [
             ("default", RtImTrainConfig::default(), 400usize),
             ("holdout", holdout, 400),
             ("adaptive", adaptive, 400),
             ("linear", linear, 400),
+            ("robust", robust, 400),
             ("few", RtImTrainConfig::default(), 20),
             ("one", RtImTrainConfig::default(), 1),
         ] {
@@ -1286,7 +2034,7 @@ mod tests {
                 anchor_irt_from_seed: true,
             })
             .unwrap();
-            let fit = fit_from_seed(&seed, &cfg).unwrap();
+            let fit = fit_from_seed(&seed, None, &cfg).unwrap();
             apply(
                 &fit,
                 &ApplyParams {
@@ -1315,6 +2063,102 @@ mod tests {
                 "{tag}: the decoy and the unconfident row are not anchors"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `robust_calibration` drops anchors with an absurd predicted iRT before the fit, the
+    /// window sizing and the residuals use them, so the windows are those of the clean
+    /// anchors alone and cal.json records how many it dropped. Off, every anchor is fitted
+    /// and cal.json has no such key. A grouped run's shared fit is filtered the same way.
+    #[test]
+    fn robust_calibration_fits_the_clean_anchors_and_records_the_count() {
+        let dir = std::env::temp_dir().join(format!("mumdia_rt_robust_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        // A curved 2000-3500 s gradient (a straight line survives any grid) plus three
+        // anchors whose predicted iRT is absurd, as the multi-head refit produced on HYE.
+        let n = 400usize;
+        let f = |x: f64| 2000.0 + (x - 2000.0).powi(2) / 1500.0;
+        let mut irt: Vec<f32> = (0..n).map(|i| 2000.0 + 3.75 * i as f32).collect();
+        let mut rt: Vec<f64> = irt
+            .iter()
+            .enumerate()
+            .map(|(i, x)| f(*x as f64) + ((i * 7919) % 11) as f64 - 5.0)
+            .collect();
+        irt.extend([-170_000.0, 375_000.0, 90_000.0]);
+        rt.extend([2500.0, 3400.0, 3000.0]);
+        let seed = |name: &str, m: usize| {
+            let p = path(name);
+            write_table(
+                &p,
+                vec![
+                    Col::U32("candidate_id".into(), (0..m as u32).collect()),
+                    Col::U32("base_peptide_id".into(), (0..m as u32).collect()),
+                    Col::F64("spectrum_q".into(), vec![0.001; m]),
+                    Col::F64("score".into(), (0..m).map(|i| 10.0 + i as f64).collect()),
+                    Col::F64("observed_rt".into(), rt[..m].to_vec()),
+                    Col::Str("label".into(), vec!["target".to_string(); m]),
+                    Col::F32("predicted_irt".into(), irt[..m].to_vec()),
+                ],
+            )
+            .unwrap();
+            p
+        };
+        let dirty = seed("dirty.parquet", n + 3);
+        let clean = seed("clean.parquet", n);
+        let lib = path("lib.parquet");
+        write_table(
+            &lib,
+            vec![
+                Col::U32("candidate_id".into(), (0..600u32).collect()),
+                Col::F32(
+                    "predicted_irt".into(),
+                    (0..600).map(|i| 1900.0 + 3.0 * i as f32).collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        let robust = RtImTrainConfig {
+            robust_calibration: true,
+            ..Default::default()
+        };
+        let stage = |seed: &str, cfg: &RtImTrainConfig, tag: &str| {
+            let (windows, cal) = (
+                path(&format!("w_{tag}.parquet")),
+                path(&format!("cal_{tag}.json")),
+            );
+            run(RtImTrainParams {
+                precursor_span: None,
+                seed_psms: seed,
+                library_precursors: &lib,
+                out_windows: &windows,
+                out_cal: &cal,
+                cfg,
+                config_hash: "h",
+                anchor_irt_from_seed: true,
+            })
+            .unwrap();
+            let cal: serde_json::Value = mumdia_io::json::read_json(&cal).unwrap();
+            (std::fs::read(&windows).unwrap(), cal)
+        };
+        let (w_clean, cal_clean) = stage(&clean, &RtImTrainConfig::default(), "clean");
+        let (w_plain, cal_plain) = stage(&dirty, &RtImTrainConfig::default(), "plain");
+        let (w_robust, cal_robust) = stage(&dirty, &robust, "robust");
+        assert_eq!(cal_plain["n_train"], n + 3);
+        assert!(cal_plain.get("n_rt_outliers_removed").is_none());
+        assert!(cal_clean.get("n_rt_outliers_removed").is_none());
+        assert_ne!(w_plain, w_clean, "the absurd anchors distort the plain fit");
+        assert_eq!(cal_robust["n_rt_outliers_removed"], 3);
+        assert_eq!(cal_robust["n_train"], n);
+        assert_eq!(cal_robust["w_rt"], cal_clean["w_rt"]);
+        assert_eq!(
+            w_robust, w_clean,
+            "the robust fit is the fit on the clean anchors"
+        );
+        let fit = fit_from_seed(&dirty, None, &robust).unwrap();
+        assert_eq!(fit.n_train(), n);
+        assert_eq!(fit.n_rt_outliers, Some(3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

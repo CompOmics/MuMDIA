@@ -55,7 +55,7 @@ builds the nullable inner `item` field, `table.rs:98` the nullable list column),
 but convert writes neither as null. An empty scan is a non-null empty list
 (`ListBuilder::append(true)` at `table.rs:131`).
 
-### `spectra_ms1.parquet` (`SPECTRA_MS1`, schema v1; written at `convert.rs:171`)
+### `spectra_ms1.parquet` (`SPECTRA_MS1`, schema v3; written at `convert.rs:171`)
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -63,31 +63,40 @@ but convert writes neither as null. An empty scan is a non-null empty list
 | `rt_seconds` | `f64` | Retention time in seconds (mzdata minutes x 60). |
 | `mz` | `List<f32>` | Centroided, m/z-ascending peak m/z (widened to f64 on read). |
 | `intensity` | `List<f32>` | Peak intensities, aligned to `mz`. |
+| `im` | `List<f32>` | Per-peak 1/K0 (V s cm^-2), aligned to `mz`. Present only for a mobility source (native timsTOF reader); readers treat its absence as no mobility. |
+| `im_width` | `List<f32>` | Per-peak mobility width (1/K0), aligned to `mz` (v3): the intensity-weighted SD of the centroid's TIMS scans plus the 1/12-scan quantisation term. Present only under `convert.tdf_im_width` on the native reader; readers treat its absence as no width. |
 
-### `spectra_ms2.parquet` (`SPECTRA_MS2`, schema v1; written at `convert.rs:198`)
+### `spectra_ms2.parquet` (`SPECTRA_MS2`, schema v3; written at `convert.rs:198`)
 
 | Column | Type | Meaning |
 |---|---|---|
 | `scan_index` | `u32` | Global monotonic index (shares the same counter as MS1). |
 | `id` | `Utf8` | Native mzML spectrum id string (`spec.id()`), kept for traceability/USI. |
 | `rt_seconds` | `f64` | Retention time in seconds. |
-| `window_id` | `u32` | Index into `isolation_windows.parquet`, dedup by (lower, upper). |
+| `window_id` | `u32` | Index into `isolation_windows.parquet`, dedup by (lower, upper, im_lower, im_upper). |
 | `window_target` | `f64` | Isolation window center m/z (0.0 for AIF/all-ion). |
 | `window_lower` | `f64` | Isolation window lower bound m/z. |
 | `window_upper` | `f64` | Isolation window upper bound m/z (1.0e6 for AIF/all-ion). |
 | `precursor_mz` | `f64?` (nullable) | Selected precursor m/z, or null when absent. |
 | `precursor_charge` | `i32?` (nullable) | Precursor charge, or null when absent. |
+| `window_im_lower` / `window_im_upper` | `f32?` (nullable) | The window's 1/K0 bounds (a diaPASEF slot); null for 3D input. |
 | `mz` | `List<f32>` | Centroided, m/z-ascending fragment m/z. |
 | `intensity` | `List<f32>` | Fragment intensities, aligned to `mz`. |
+| `im` | `List<f32>` | Per-peak 1/K0 (V s cm^-2), aligned to `mz`. Present only for a mobility source (native timsTOF reader); readers treat its absence as no mobility. |
+| `im_width` | `List<f32>` | Per-peak mobility width (1/K0), aligned to `mz` (v3): the intensity-weighted SD of the centroid's TIMS scans plus the 1/12-scan quantisation term. Present only under `convert.tdf_im_width` on the native reader; readers treat its absence as no width. |
 
-### `isolation_windows.parquet` (`ISOLATION_WINDOWS`, schema v1; written at `convert.rs:215`)
+### `isolation_windows.parquet` (`ISOLATION_WINDOWS`, schema v2; written at `convert.rs:215`)
 
 | Column | Type | Meaning |
 |---|---|---|
-| `window_id` | `u32` | First-seen id (0-based) of a distinct (lower, upper) window. |
+| `window_id` | `u32` | First-seen id (0-based) of a distinct (lower, upper, im_lower, im_upper) window. |
 | `target` | `f64` | Window center m/z. |
 | `lower` | `f64` | Window lower bound m/z. |
 | `upper` | `f64` | Window upper bound m/z. |
+| `im_lower` / `im_upper` | `f32?` (nullable) | Window 1/K0 bounds; null for 3D input. |
+
+Schema v2 added only the mobility columns. v1 artifacts still load: `spectra.rs`
+reads each mobility column only when it is present (`TableFile::has_column`).
 
 ### `ms2_to_ms1.parquet` (`MS2_TO_MS1`, schema v1; written at `convert.rs:228`)
 
@@ -517,7 +526,8 @@ nothing downstream of `convert` knows a vendor file was involved.
 |---|---|---|
 | mzML | none | supported |
 | Thermo `.raw` (file) | ThermoRawFileParser, or msconvert | **exercised end to end** (doxy, 2026-09-06: a 3.7 GB Astral `.raw` through `mumdia convert --mzml x.raw`, ThermoRawFileParser 2.0.0 found by `auto`, 6:40 and 4.4 GB for the converter, 3.4 GB mzML renamed into place beside the input, reused by the next run in 1.3 s; `peak-census` on the same `.raw` likewise) |
-| Bruker `.d` (dir) | msconvert | wired, unverified; **ion mobility is discarded** |
+| Bruker timsTOF `.d` (dir, `analysis.tdf`) | native (timsrust), default | **exercised end to end** on diaPASEF (docs/TIMS_ROADMAP.md, P1); ion mobility kept. DDA-PASEF is refused with a pointer to msconvert |
+| Bruker `.d` via msconvert (`convert.bruker_reader = msconvert`, or `analysis.baf`) | msconvert | exercised end to end on diaPASEF (TIMS roadmap baseline); **ion mobility is discarded** |
 | SCIEX `.wiff` / `.wiff2` | msconvert | wired, unverified; a `.wiff` needs its `.wiff.scan` companion beside it, and the engine names that file when msconvert fails without it |
 | Agilent `.d` (dir) | msconvert | wired, unverified |
 | Waters `.raw` (dir) | msconvert | wired, unverified |
@@ -538,9 +548,11 @@ left no partial mzML behind and reused nothing on the rerun.
 rather than capability. Those readers need the vendors' own libraries and, for
 Thermo and SCIEX, a .NET runtime, while the workspace pins `mzdata` to
 `default-features = false, features = ["mzml", "miniz_oxide"]` precisely so that
-building MuMDIA needs no C, C++ or .NET toolchain (`CLAUDE.md`, "Build gotchas: do
-not fix these back"). Linking a vendor reader imposes that on every build on every
-platform, including the ones that never see a vendor file.
+building MuMDIA needs no vendor SDK, C++ or .NET toolchain. Linking a vendor reader
+imposes that on every build on every platform, including the ones that never see a
+vendor file. timsTOF is the exception (next section): TDF is an SQLite index plus
+zstd frames with no vendor library, and the bundled SQLite that timsrust compiles is C,
+like the zstd-sys that parquet already required.
 
 ### Two converters, and the licence difference between them
 
@@ -557,13 +569,53 @@ converting with a program the configuration did not name would change the spectr
 search sees, and vendor conversion is not reproducible across converters or across
 converter versions.
 
-### Bruker and ion mobility
+### Native timsTOF reader
 
-**MuMDIA's pipeline is 3D and discards ion mobility** (README, "No ion mobility").
-For diaPASEF this removes the mobility separation that makes the acquisition
+A `.d` holding `analysis.tdf` is read directly by `stages/convert/tdf.rs` (timsrust
+0.4) when `convert.bruker_reader = native`, the default; `ensure_mzml` passes it
+through untouched. Each diaPASEF MS2 frame becomes one spectrum per window slot, with
+the slot's m/z bounds and 1/K0 bounds (`window_im_lower/upper`). Each MS1 frame becomes
+one spectrum. Within a spectrum the raw TOF x scan points are centroided in m/z x
+mobility: TOF-ordered points join one m/z trace within `convert.tdf_mz_ppm` (10), a
+trace splits where consecutive scans are more than `convert.tdf_im_gap_scans` (30)
+apart, and a cluster with fewer than `convert.tdf_min_points` (2) raw points is
+dropped. Every peak carries its intensity-weighted 1/K0 in the `im` column.
+Under `convert.tdf_im_width` (default false; TIMS roadmap P7) each peak also carries its
+mobility width in `im_width`: the intensity-weighted SD of its scans, with 1/12 scan^2
+added for quantisation, converted to 1/K0 with the local calibration slope. It adds
+4 B per peak (+450 MB, +37%, on the benchmark run's 1.2 GB of spectra; convert 45 s
+against 38 s) and leaves every other column unchanged. On that run the median width is
+9.4 scans (0.0081 V s cm^-2) for MS2 peaks and 13.2 scans for MS1, whose p95 of 54 scans
+shows MS1 centroids merging several ions at the 30-scan gap.
+Under `convert.tdf_mz_valley` (default 0, off; TIMS roadmap part 2, D5 follow-up) each
+cluster is also cut along m/z after the mobility split. Its m/z profile (summed
+intensity per TOF index, smoothed with a triangular kernel of half-width
+`convert.tdf_mz_smooth_ppm`, 4) is cut at every local minimum that lies below
+`tdf_mz_valley` times the smaller hump beside it. Each piece is then a cluster of its own,
+subject to the same point floor. The aim is one centroid per ion at a 10 ppm linkage:
+10 ppm alone chains neighbouring ions together, and 5 ppm cuts single ions into pieces.
+With the key at 0 the centroids are unchanged.
+
+- m/z uses timsrust's TOF conversion. It agrees with msconvert's vendor-calibrated
+  m/z to a median of 0.02 ppm (p5/p95 -3.5/+3.7 ppm) on the TIMS benchmark run.
+- 1/K0 uses Bruker's `TimsCalibration` model 2 read from `analysis.tdf`, because
+  timsrust's linear interpolation between the acquisition bounds is off by up to
+  0.030 V s cm^-2 there.
+- Intensities are raw detector counts summed over the cluster.
+- `--max-spectra` counts frames on this path. `peak-census` counts centroided peaks.
+- The three `tdf_*` values are provisional, taken from a peak census on one run;
+  see docs/TIMS_ROADMAP.md, P1, for the measurement.
+
+Downstream, mobility is used by the opt-in IM gates, IM calibration and IM features
+(docs/TIMS_ROADMAP.md, P3-P7), and windows are keyed on (m/z, 1/K0)
+(`IsolationWindow::key`).
+
+### Bruker through msconvert and ion mobility
+
+**The msconvert route discards ion mobility.** For diaPASEF this removes the mobility separation that makes the acquisition
 selective, so a Bruker `.d` will search with substantially more interference and
 fewer identifications than a 4D engine on the same file. The engine warns about this
-on every Bruker input, and the desktop application says it under the file picker.
+on every Bruker input that goes to msconvert, and the desktop application says it under the file picker.
 
 It is a warning and not a refusal, for a specific reason: the loss is sensitivity,
 not FDR validity. Targets and decoys see the same added interference, so the

@@ -305,6 +305,32 @@ enum Cmd {
         #[arg(long)]
         psms: bool,
     },
+    /// Rebuild extract's chromatogram traces from the raw diaPASEF events (`retrace`
+    /// config section) -> a chromatograms.parquet with the same rows and schema.
+    Retrace {
+        /// The `.d`. Default: the one `--spectra-ms2` was converted from.
+        #[arg(long)]
+        raw: Option<String>,
+        #[arg(long)]
+        spectra_ms2: Option<String>,
+        #[arg(long)]
+        chromatograms: String,
+        #[arg(long)]
+        psms_extracted: String,
+        #[arg(long)]
+        run_windows: String,
+        #[arg(long)]
+        lib_precursors: String,
+        #[arg(long)]
+        mass_cal: Option<String>,
+        #[arg(long)]
+        out: String,
+        /// `retrace.repick`: where the re-picked psms_extracted is written.
+        #[arg(long)]
+        out_psms: Option<String>,
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Keep the best candidate per competition group -> psms_competed.parquet.
     Compete {
         #[arg(long)]
@@ -354,6 +380,10 @@ enum Cmd {
         /// Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt, width_s).
         #[arg(long)]
         out_peak_bounds: Option<String>,
+        /// Cross-run quant (`quant.cross_run_weights` / `quant.cross_run_background`, second
+        /// pass): the first-pass `--out-fragment` tables of every run of the experiment.
+        #[arg(long, num_args = 1..)]
+        weights_from: Vec<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -674,15 +704,28 @@ struct ConverterReport {
 ///
 /// Reads peaks and counts them; it does not centroid, so a profile-mode file reports
 /// raw sample counts and says so.
-fn peak_census(mzml: &str, max_spectra: usize) -> Result<serde_json::Value> {
+fn peak_census(
+    mzml: &str,
+    max_spectra: usize,
+    tdf: &stages::convert::TdfParams,
+) -> Result<serde_json::Value> {
     use mzdata::prelude::*;
-
-    // The same reader  uses, so this sees exactly the spectra a run would.
-    let reader = mzdata::MZReader::open_path(mzml).with_context(|| format!("opening {mzml}"))?;
 
     let mut counts: Vec<usize> = Vec::new();
     let mut profile = 0usize;
     let mut ms1 = 0usize;
+    // A timsTOF `.d` is counted after native centroiding, which is what `convert`
+    // writes; `max_spectra` then counts frames.
+    let tims = mumdia::raw::is_tims_tdf(mzml);
+    if tims {
+        (counts, ms1) = stages::convert::tdf_peak_counts(mzml, max_spectra, tdf)?;
+    }
+    // The same reader `convert` uses, so this sees exactly the spectra a run would.
+    let reader: Box<dyn Iterator<Item = mzdata::spectrum::MultiLayerSpectrum>> = if tims {
+        Box::new(std::iter::empty())
+    } else {
+        Box::new(mzdata::MZReader::open_path(mzml).with_context(|| format!("opening {mzml}"))?)
+    };
     for (i, spec) in reader.enumerate() {
         if max_spectra > 0 && i >= max_spectra {
             break;
@@ -826,6 +869,7 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
             Role::Ms2pip => cfg.predict_frag.ms2pip_python.clone(),
             Role::Peptdeep => cfg.predict_frag.peptdeep_python.clone(),
             Role::Mbr => cfg.mbr.python.clone(),
+            Role::Im2deep => cfg.predict_frag.im2deep_python.clone(),
         };
         let required = role.required_by(&cfg);
         let wanted = role.wanted_by(&cfg);
@@ -888,7 +932,9 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
                     Ok(missing) if missing.is_empty() => {
                         // Every package whose VERSION changes results, so `doctor`
                         // prints it rather than only asserting it imports.
-                        for m in ["deeplc", "torch", "mokapot", "ms2pip", "peptdeep", "numpy"] {
+                        for m in [
+                            "deeplc", "im2deep", "torch", "mokapot", "ms2pip", "peptdeep", "numpy",
+                        ] {
                             if module_refs.contains(&m) {
                                 if let Some(v) = python::module_version(interp, m) {
                                     r.versions.insert(m.to_string(), v);
@@ -901,12 +947,13 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
                         // predictions, and the 4.0.0a2 multitask preview memorised its
                         // anchors badly enough to invert RT-model rankings
                         // (docs/08_rt_im_train.md). The engine refuses to launch a DeepLC
-                        // worker below `MIN_DEEPLC_VERSION`, so doctor fails here too
+                        // (or IM2Deep) worker below its floor, so doctor fails here too
                         // rather than warning about a run that cannot start.
-                        if role == Role::DeepLc && (required || wanted) {
-                            let floor = mumdia_core::constants::MIN_DEEPLC_VERSION;
+                        if let Some((pkg, floor)) =
+                            role.version_floor().filter(|_| required || wanted)
+                        {
                             let (ma, mi, pa) = floor;
-                            match r.versions.get("deeplc") {
+                            match r.versions.get(pkg) {
                                 Some(v)
                                     if mumdia_core::constants::parse_version3(v)
                                         .is_some_and(|t| t >= floor) => {}
@@ -914,16 +961,16 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
                                     ok = false;
                                     r.status = "fail".into();
                                     r.warnings.push(format!(
-                                        "DeepLC {v} is older than the required {ma}.{mi}.{pa}; \
-                                         the engine refuses to launch the DeepLC workers with it \
-                                         (pip install 'deeplc>={ma}.{mi}.{pa}')"
+                                        "{pkg} {v} is older than the required {ma}.{mi}.{pa}; \
+                                         the engine refuses to launch its workers with it \
+                                         (pip install '{pkg}>={ma}.{mi}.{pa}')"
                                     ));
                                 }
                                 None => {
                                     ok = false;
                                     r.status = "fail".into();
                                     r.warnings.push(format!(
-                                        "cannot determine the deeplc version; {ma}.{mi}.{pa} or \
+                                        "cannot determine the {pkg} version; {ma}.{mi}.{pa} or \
                                          newer is required"
                                     ));
                                 }
@@ -1249,6 +1296,7 @@ fn real_main() -> Result<()> {
                 top_peaks_ms2,
                 top_peaks_ms1,
                 config_hash: &config_hash,
+                tdf: stages::convert::TdfParams::from_config(&cfg.convert),
             })?;
         }
         Cmd::Digest { fasta, out, config } => {
@@ -1462,6 +1510,54 @@ fn real_main() -> Result<()> {
                 run_windows: &run_windows,
                 out: &out,
                 cfg: &cfg.prescan,
+                config_hash: &ch,
+            })?;
+        }
+        Cmd::Retrace {
+            raw,
+            spectra_ms2,
+            chromatograms,
+            psms_extracted,
+            run_windows,
+            lib_precursors,
+            mass_cal,
+            out,
+            out_psms,
+            config,
+        } => {
+            let cfg = load_config(&config)?;
+            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            if cfg.retrace.repick && out_psms.is_none() {
+                anyhow::bail!("retrace.repick: pass --out-psms for the re-picked psms_extracted");
+            }
+            let raw = match (raw, spectra_ms2) {
+                (Some(r), _) => r,
+                (None, Some(s)) => {
+                    stages::retrace::raw_path_from_spectra(&s)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{s}: not converted from a .d by the native reader; pass --raw"
+                        )
+                    })?
+                }
+                (None, None) => anyhow::bail!("retrace: pass --raw or --spectra-ms2"),
+            };
+            stages::retrace::run(stages::retrace::RetraceParams {
+                raw: &raw,
+                chromatograms: &chromatograms,
+                psms_extracted: &psms_extracted,
+                run_windows: &run_windows,
+                library_precursors: &lib_precursors,
+                mass_cal: mass_cal.as_deref(),
+                frag_tol_fallback_ppm: cfg.extract.frag_tol_ppm,
+                prec_tol_ppm: cfg.extract.prec_tol_ppm,
+                out: &out,
+                apex_out: cfg
+                    .features
+                    .retrace_apex
+                    .then(|| stages::features::retrace_apex_path(&out))
+                    .as_deref(),
+                psms_out: out_psms.as_deref(),
+                cfg: &cfg.retrace,
                 config_hash: &ch,
             })?;
         }
@@ -1694,10 +1790,21 @@ fn real_main() -> Result<()> {
             out_protein,
             out_fragment,
             out_peak_bounds,
+            weights_from,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            let weights = if weights_from.is_empty() {
+                None
+            } else {
+                Some(stages::quant::fit_cross_run(
+                    &weights_from,
+                    cfg.quant.cross_run_weights,
+                    cfg.quant.cross_run_background,
+                    cfg.quant.cross_run_width,
+                )?)
+            };
             let losers = match &overlap_losers {
                 Some(path) => stages::pool::read_losers(path, &chromatograms)?,
                 None => vec![Vec::new(); chromatograms.len()],
@@ -1719,6 +1826,7 @@ fn real_main() -> Result<()> {
                 out_peak_bounds: out_peak_bounds.as_deref(),
                 cfg: &cfg.quant,
                 config_hash: &ch,
+                cross_run: weights.as_ref(),
             })?;
         }
         Cmd::QuantLfq {
@@ -1814,7 +1922,11 @@ fn real_main() -> Result<()> {
             let mzml = mumdia::raw::ensure_mzml(&mzml, &cfg.convert, None)?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&peak_census(&mzml, max_spectra)?)?
+                serde_json::to_string_pretty(&peak_census(
+                    &mzml,
+                    max_spectra,
+                    &stages::convert::TdfParams::from_config(&cfg.convert),
+                )?)?
             );
         }
         Cmd::Report {

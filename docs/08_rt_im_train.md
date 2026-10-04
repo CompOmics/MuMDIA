@@ -39,7 +39,7 @@ written null; there is no IM calibration or IM window.
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Orchestrator. Runs the optional DeepLC fine-tune between `search-seed` and this stage, then calls `rt_im_train::run` (see `run.rs:265-314`). |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | `run_deeplc_finetune` (sidecar.rs:110-155): the file-contract client that invokes the fine-tune worker. |
 | `scripts/deeplc_finetune.py` | The fine-tune worker: transfer-learns DeepLC (4.5.0 or newer; older versions are refused) on the seed and writes a new library parquet with replaced `predicted_irt`. |
-| `rust/mumdia/crates/mumdia-core/src/config.rs` | `RtImTrainConfig` (config.rs:447-512), `CalibrationMethod` enum (config.rs:56-61), and the load-time validation that rejects `calibration_method=none` (config.rs:1336-1342). |
+| `rust/mumdia/crates/mumdia-core/src/config.rs` | `RtImTrainConfig` (config.rs:626), `CalibrationMethod` enum (config.rs:56-61), and the load-time validation that rejects `calibration_method=none` (config.rs:1336-1342). |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | `artifact::RUN_WINDOWS = ("run_windows", 1)` (schema.rs:16). |
 
 ## Inputs and outputs
@@ -82,9 +82,9 @@ library candidate. Columns (rt_im_train.rs:266-277):
 | `rt_pred_cal` | f64 | calibrated predicted RT (seconds); `NaN` when calibration is unavailable (fewer than two anchors) |
 | `rt_lo` | f64 | `rt_pred_cal - width` (window lower bound, seconds); negative infinity when calibration is unavailable |
 | `rt_hi` | f64 | `rt_pred_cal + width` (window upper bound, seconds); positive infinity when calibration is unavailable |
-| `im_pred_cal` | f64, nullable | always `None` (3D MVP) |
-| `im_lo` | f64, nullable | always `None` |
-| `im_hi` | f64, nullable | always `None` |
+| `im_pred_cal` | f64, nullable | calibrated 1/K0 (V s cm^-2); `None` unless IM calibration ran and the candidate has a `predicted_im` (section 7) |
+| `im_lo` | f64, nullable | `im_pred_cal - w_im`; `None` as above |
+| `im_hi` | f64, nullable | `im_pred_cal + w_im`; `None` as above |
 
 The unbounded row `(NaN, -inf, +inf)` is materialized by `candidate_window`
 (rt_im_train.rs:65-70) whenever no calibrated RT or window width is available; the
@@ -677,7 +677,7 @@ calibration_available.then(|| predict(irt))` (rt_im_train.rs:247), the width is
 either the adaptive per-bin value or the global `w_rt` (rt_im_train.rs:248-255), and
 `candidate_window(calibrated_rt, width)` (rt_im_train.rs:256) produces the row
 `(cal, cal - width, cal + width)`, or the unbounded `(NaN, -inf, +inf)` when either
-value is absent. The three IM columns are pushed as `None` (rt_im_train.rs:261-263).
+value is absent. The three IM columns carry the section-7 calibration, or `None`.
 The table is written as it is computed: `write_table_chunked_hashed` asks for one
 65,536-row chunk at a time, the rows of that chunk are computed and encoded, and the
 next chunk follows. The chunk sequence is the one `write_table` uses, so
@@ -685,6 +685,94 @@ next chunk follows. The chunk sequence is the one `write_table` uses, so
 and those columns (76 bytes per candidate, 15 GB at 203M rows) are never resident.
 The file is hashed as it is written, so the report's content hash needs no read-back.
 Then `cal.json` is written and the artifact report is emitted.
+
+### 7. Ion-mobility calibration (2026-09-23)
+
+The IM analogue of the DeepLC iRT calibration: the library holds uncalibrated
+predictions (`predicted_im`, IM2Deep or imported), and this stage maps them onto the
+run with the run's own confident seed anchors. It runs only when the library has
+`predicted_im` and the seed has `observed_im` (docs/07); otherwise the IM columns stay
+null, which is the 3D behaviour. `extract.im_gate` reads them (P4 in docs/TIMS_ROADMAP.md).
+
+- **Anchors.** Confident target seed rows (`spectrum_q < q_train`) with a finite
+  `observed_im` and a library `predicted_im`, one per candidate. RT keys its anchors on
+  the base peptide; IM keys on the candidate, because 1/K0 depends on charge. Anchors
+  are sorted by candidate id before any fit.
+- **Fit (`fit_im`).** Per-charge linear in CCS space, `obs_ccs = a_z + b_z * pred_ccs`,
+  with both 1/K0 values converted by `mumdia_core::constants::im_to_ccs` (IM2Deep's
+  Mason-Schamp in N2). A charge with fewer than `im_min_anchors_per_charge` anchors (50)
+  uses the global fit. This is IM2Deep's own `LinearCCSCalibration` principle, a
+  per-charge CCS correction, with a slope added and fitted against this run's anchors
+  rather than against IM2Deep's bundled reference set. Fewer than
+  `min_seed_for_calibration` anchors in total gives no IM calibration: a null window
+  means "do not gate", which is safer than a window fitted through a handful of points.
+- **Width.** Always held-out. Anchors are split with the RT holdout rule
+  (`base_peptide_id % 1000 < round(im_window_holdout_frac * 1000)`, default 0.3), the fit
+  is repeated on the training side, and `w_im = max(p_im percentile of the held-out
+  |residual| * im_window_multiplier, im_window_min)` (0.95, 1.0, 0.005). Below 20
+  held-out anchors it falls back to in-sample sizing with a warning, recorded as
+  `w_im_sizing = "holdout_fallback_in_sample"`. The section-4 lesson applies here from the
+  start: in-sample residuals are optimistic and can rank two models backwards.
+- **Grouped runs.** `seed-pool` carries `observed_im` into the pooled seed, so a grouped run
+  is calibrated too. Under `groups.calibration = global` the one shared fit
+  (`rt_im_train::fit_from_seed`) joins the pooled anchors' `predicted_im` from the whole
+  library, because the pooled seed carries whole-library candidate ids (band-local id plus
+  the band's first row), and every band applies that calibration to its own rows; under
+  `per_group` each band fits its own. A library with `predicted_im` and a seed without
+  `observed_im` (a v1 seed) warns and leaves the IM windows null.
+- **Consumers.** `extract.im_gate` gates on `im_lo`/`im_hi` (docs/09 section 6b); the
+  multiplier sweep of that gate is a sweep of `im_window_multiplier`.
+- **cal.json** gains, only when the library has `predicted_im` values and the seed
+  `observed_im` values (so a 3D run's `cal.json` is unchanged), `im_method`
+  (`per_charge_linear_ccs` or `unavailable`),
+  `im_n_train`, `im_global {a, b}`, `im_per_charge {z: {a, b, n}}`, `w_im`,
+  `w_im_sizing`, `p_im`, `im_window_holdout_frac`, `im_n_holdout`,
+  `im_holdout_resid_abs_median`, `im_holdout_resid_p_im` and
+  `im_in_sample_resid_abs_median` (a fit diagnostic only).
+
+Measured accuracy on the E. coli diaPASEF benchmark is in docs/TIMS_ROADMAP.md, "P2
+result".
+
+### 8. Refit on pass-1 identifications (`refit`, default off, 2026-09-27)
+
+`rt_im_train.refit = true` makes `run` and ungrouped `run-experiment` search twice
+(`stages/im_rt_refit.rs`). The measurements behind each rule are in
+docs/TIMS_ROADMAP_bis.md, "L1d".
+
+1. Pass 1 is the normal chain, written to `<out>/pass1/` (`<run>/pass1/` under
+   `run-experiment`, where the pooled pass-1 rescore is `<out>/pass1/scored_combined.parquet`).
+2. Pseudo-seed `pass1_seed.parquet` (seed v2 schema): the pass-1 targets with PSM
+   `q_value` (`run_psm_q` per run under `run-experiment`) at most `q_train`, `apex_rt` as
+   `observed_rt`, extract's `apex_im` at `selected_peak_rank` as `observed_im`.
+3. Under multi-head calibration only: the 80-head fit runs twice, once per fold
+   (`pass1_seed_f0/f1.parquet`). The fold of a base peptide is the parity of its rank
+   among the library's distinct `base_peptide_id` values, so target/decoy pairs share a
+   fold. Every library row takes the prediction of the fit on the OTHER fold
+   (`fragment_library_precursors_refit.parquet`). Under `rt_library_scope =
+   first_run_only` only the first run refits; the others reuse its table.
+4. rt-im-train on the pseudo-seed (`run_windows_refit.parquet`, `cal_refit.json`). The
+   pass-2 `run_windows.parquet` takes the refit `rt_pred_cal`/`im_pred_cal` and the
+   pass-1 half-widths: the refit widths are truncated by selection, because pass-1
+   identifications can only lie inside the pass-1 windows.
+5. Extract (seed mass calibration), features (the ORIGINAL seed, so no pass-1 score
+   enters a feature), compete and rescore write the canonical names; quant and report
+   read pass 2.
+
+The rt-im-train LOESS on top is fitted in-sample on the pass-1 targets. Refused with
+`groups.window_groups > 1`. Benchmark-gated.
+
+`rt_im_train.robust_calibration` (default false) drops outlying RT anchors before the fit
+(`calibrate::robust_inliers`): a first LOESS on the anchors inside the central 99% of
+predicted iRT, then every anchor whose residual lies more than 6 robust SDs (1.4826 x MAD)
+from the median is removed, and the curve, the window sizing and the reported residuals
+use the rest (`cal.json` `n_rt_outliers_removed`). The first fit leaves out the iRT
+extremes because a local fit at an isolated extreme iRT passes through that point. The
+LOESS grid is 200 points spaced evenly between the smallest and the largest anchor iRT, so a
+few anchors with an absurd iRT stretch it until the gradient falls into one or two cells.
+Measured on the six-run HYE diaPASEF refit, where the multi-head refit gave some library rows
+iRTs of order 1e5 s: 11 such anchors in one run moved the curve by a median of 51 s; with the
+key on, all six runs have in-sample residuals of 3.7 to 4.0 s and lose 0.6 to 0.8% of their
+anchors. With the key off the windows are identical (TIMS roadmap part 2).
 
 ### DeepLC multitask fine-tune (orchestrator pre-step, default off)
 
@@ -877,13 +965,13 @@ is unbounded by construction (docs/31 F7). Measured on HYE B01 with the imported
 | `local_linear` | calibrate.rs:107-153 | Tricubic-weighted local least squares at one point. |
 | `percentile` | calibrate.rs:156-164 | Nearest-rank percentile: sorts a copy, `rank = round(p.clamp(0,1)*(len-1))`. Not interpolated. Empty input returns 0.0. |
 | `CalibrationMethod` | config.rs:56-61 | Enum `{ Loess, Linear, None }`; default `Loess`. `None` is rejected at load. |
-| `RtImTrainConfig` | config.rs:447-512 | All Stage B config fields (below). |
+| `RtImTrainConfig` | config.rs:626 | All Stage B config fields (below). |
 | `run_deeplc_finetune` | sidecar.rs:110-155 | Sidecar client: `deeplc_finetune.py <lib_in> <seed> <lib_out> [flags]`. |
 
 ## Configuration
 
 All fields live under `rt_im_train` in the config (`RtImTrainConfig`,
-config.rs:447-512). The struct is `#[serde(default, deny_unknown_fields)]`, so any
+config.rs:626). The struct is `#[serde(default, deny_unknown_fields)]`, so any
 unknown key is a hard load error and every field has the default below. The config
 surface was pruned: there are no IM calibration fields (IM is a stub), and
 `CalibrationMethod::None` is a foot-gun rejected at load (config.rs:1336-1342) even
@@ -912,7 +1000,7 @@ though the enum variant still exists.
 ## Invariants, determinism, gotchas
 
 - **IM is a stub.** `im_pred_cal`, `im_lo`, `im_hi` are always `None`
-  (rt_im_train.rs:261-263). There is no IM calibration, no IM window, and no IM
+  (rt_im_train.rs:421-423). There is no IM calibration, no IM window, and no IM
   config field. Any 4D/diaPASEF work must add both the model and the columns.
 - **Only targets anchor the fit.** Decoy seed PSMs are excluded
   (rt_im_train.rs:106); admitting them would inject random iRT/RT pairs. Keep this
@@ -1017,7 +1105,7 @@ though the enum variant still exists.
 ## How to extend / modify
 
 - **Add IM (4D).** Populate `im_pred_cal`/`im_lo`/`im_hi` (currently `None` at
-  rt_im_train.rs:261-263) from an IM calibration analogous to the RT path (an
+  rt_im_train.rs:421-423) from an IM calibration analogous to the RT path (an
   IM2Deep-style model), and add IM config fields to `RtImTrainConfig`. The output
   columns already exist and are nullable, so downstream reads survive the
   transition. `extract` and the IM feature families must then consume them.

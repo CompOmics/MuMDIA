@@ -49,6 +49,7 @@ their own sections at the end.
 | `rt_seconds` | Float64 | no | s | scan start time, converted from mzdata minutes |
 | `mz` | List\<Float32\> | yes | m/z | centroided, m/z-sorted peak m/z values |
 | `intensity` | List\<Float32\> | yes | counts | peak intensities aligned to `mz` |
+| `im` | LargeList\<Float32\> | yes | V s cm^-2 | per-peak 1/K0 aligned to `mz`; column present only for a mobility source (native timsTOF reader, schema v2) |
 
 ### spectra_ms2 (`convert.rs:198-213`)
 
@@ -57,14 +58,17 @@ their own sections at the end.
 | `scan_index` | UInt32 | no | - | monotonic scan index (shared axis with MS1) |
 | `id` | Utf8 | no | - | vendor spectrum id string |
 | `rt_seconds` | Float64 | no | s | scan start time |
-| `window_id` | UInt32 | no | - | dense id of the distinct isolation window (`(lower,upper)` bits), matches `isolation_windows.window_id` |
+| `window_id` | UInt32 | no | - | dense id of the distinct isolation window (bits of `(lower, upper, im_lower, im_upper)`), matches `isolation_windows.window_id` |
 | `window_target` | Float64 | no | m/z | isolation-window target m/z (0.0 for AIF/all-ion) |
 | `window_lower` | Float64 | no | m/z | isolation-window lower bound (0.0 for AIF full-range fallback) |
 | `window_upper` | Float64 | no | m/z | isolation-window upper bound (1.0e6 for AIF full-range fallback) |
 | `precursor_mz` | Float64 | yes | m/z | selected precursor m/z, null when absent |
 | `precursor_charge` | Int32 | yes | - | precursor charge, null when absent |
+| `window_im_lower` | Float32 | yes | V s cm^-2 | window 1/K0 lower bound (diaPASEF slot); null for 3D input (schema v2) |
+| `window_im_upper` | Float32 | yes | V s cm^-2 | window 1/K0 upper bound; null for 3D input (schema v2) |
 | `mz` | List\<Float32\> | yes | m/z | centroided fragment m/z values |
 | `intensity` | List\<Float32\> | yes | counts | fragment intensities aligned to `mz` |
+| `im` | LargeList\<Float32\> | yes | V s cm^-2 | per-peak 1/K0 aligned to `mz`; column present only for a mobility source (native timsTOF reader, schema v2) |
 
 ### isolation_windows (`convert.rs:215-226`)
 
@@ -76,6 +80,8 @@ The distinct-window column is `window_id` (verified: `convert.rs:218`).
 | `target` | Float64 | no | m/z | window target m/z |
 | `lower` | Float64 | no | m/z | window lower bound |
 | `upper` | Float64 | no | m/z | window upper bound |
+| `im_lower` | Float32 | yes | V s cm^-2 | window 1/K0 lower bound; null for 3D input (schema v2) |
+| `im_upper` | Float32 | yes | V s cm^-2 | window 1/K0 upper bound; null for 3D input (schema v2) |
 
 ### ms2_to_ms1 (`convert.rs:228-234`)
 
@@ -200,7 +206,7 @@ Per-run fragment mass recalibration sidecar consumed by `extract`.
 | `im_lo` | Float64 | yes | 1/K0 | IM window lower bound; always null |
 | `im_hi` | Float64 | yes | 1/K0 | IM window upper bound; always null |
 
-### `<run_windows>` cal.json (`rt_im_train.rs:290-302`)
+### `<run_windows>` cal.json (`rt_im_train.rs:469-499`)
 
 RT-calibration sidecar (written to `out_cal`, not part of the Parquet contract).
 
@@ -348,6 +354,23 @@ the AIF run and 3.2% and 0.3% smaller on the other two, so the axis column (`rt`
 `rt_axis`) stays PLAIN in both layouts. These sizes were measured with the v2 lists
 still named `rt` and `intensity`; the rename changes two names in the footer and no
 page.
+
+#### Ion mobility (schema v3 and v4, 4D data)
+
+A run whose spectra carry a per-peak 1/K0 (the native timsTOF reader, spectra v2)
+writes one more list column, each row's per-point 1/K0 in V s cm^-2, `+0.0` where the
+trace has no peak and at every point of the MS1 isotope rows. In the v1 layout it is `im`, parallel to `intensity`, and the table
+records schema version 3; in the v2 layout it is `im_trimmed`, cut to the run
+`intensity_trimmed` keeps (the same `trace_offset`, the same length), and the table
+records schema version 4 (`mumdia_core::schema::artifact::chromatograms`). Readers
+rebuild `im_trimmed` to the full trace with `+0.0` margins, as they rebuild the trace
+(`chromatograms::Decoder::row_im`). A 3D run writes neither column, so its table is the
+v1 or v2 table it always was, byte for byte. Only `features.im_features` reads the list.
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `im` (v3) | LargeList\<Float32\> | yes | V s cm^-2 | per-point 1/K0 of the full trace |
+| `im_trimmed` (v4) | LargeList\<Float32\> | yes | V s cm^-2 | per-point 1/K0 over the stored run of `intensity_trimmed` |
 
 ### `<psms>.peaks.parquet`, top-K peak retention (`extract.rs:1532-1543`)
 
@@ -759,6 +782,12 @@ Written only when `out_fragment` is set (ion-level directLFQ input).
 | `protein_group` | Utf8 | no | - | protein-accession-set string |
 | `fragment_name` | Utf8 | no | - | fragment name |
 | `quantity` | Float64 | no | intensity x s | per-fragment trapezoid area over the peak window |
+| `apex_corr` | Float64 | no (NaN) | - | correlation of the fixed-window samples with the sum of the candidate's other fragments (v2) |
+| `flank_mean` | Float64 | no (NaN) | intensity | mean raw sample in the `baseline_flank_scans` either side of the fixed window (v3) |
+| `flank_mean_h3`..`flank_mean_h7` | Float64 | no (NaN) | intensity | the same flank beyond a halfwidth of 3 to 7 scans; first pass under `quant.cross_run_width` only (v4) |
+| `peak_hwhm` | Float64 | no (NaN) | scans | the candidate's half width at half maximum in this run, on every row of the candidate; first pass under `quant.cross_run_width` only (v4) |
+
+Schema v4. NaN outside a fixed window. Under `quant.cross_run_background` zero areas are exported too.
 
 ### peak-bounds diagnostic (optional, `quant.rs:421-429`)
 

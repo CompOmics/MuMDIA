@@ -24,7 +24,8 @@ use std::process::Command;
 
 use anyhow::{bail, Result};
 use mumdia_core::config::{
-    Config, FragPredictorKind, LibraryIrt, MbrStrategy, RescorerKind, RtPredictorKind,
+    Config, FragPredictorKind, ImPredictorKind, LibraryIrt, MbrStrategy, RescorerKind,
+    RtPredictorKind,
 };
 use tracing::{info, warn};
 
@@ -46,6 +47,8 @@ pub enum Role {
     Peptdeep,
     /// `mbr.python`: `mbr_worker.py`.
     Mbr,
+    /// `predict_frag.im2deep_python`: `im2deep_worker.py`.
+    Im2deep,
 }
 
 impl Role {
@@ -56,6 +59,7 @@ impl Role {
             Role::Ms2pip => "predict_frag.ms2pip_python",
             Role::Peptdeep => "predict_frag.peptdeep_python",
             Role::Mbr => "mbr.python",
+            Role::Im2deep => "predict_frag.im2deep_python",
         }
     }
 
@@ -67,6 +71,7 @@ impl Role {
             Role::Ms2pip => "MUMDIA_PYTHON_MS2PIP",
             Role::Peptdeep => "MUMDIA_PYTHON_PEPTDEEP",
             Role::Mbr => "MUMDIA_PYTHON_MBR",
+            Role::Im2deep => "MUMDIA_PYTHON_IM2DEEP",
         }
     }
 
@@ -98,6 +103,7 @@ impl Role {
                 "pyarrow",
             ],
             Role::Mbr => &["numpy", "pyarrow"],
+            Role::Im2deep => &["im2deep", "psm_utils", "torch", "numpy", "pyarrow"],
         }
     }
 
@@ -113,6 +119,7 @@ impl Role {
             Role::Ms2pip => &["ms2pip_worker.py"],
             Role::Peptdeep => &["peptdeep_worker.py"],
             Role::Mbr => &["mbr_worker.py"],
+            Role::Im2deep => &["im2deep_worker.py"],
         }
     }
 
@@ -123,6 +130,7 @@ impl Role {
             Role::Ms2pip => cfg.predict_frag.ms2pip_python.as_deref(),
             Role::Peptdeep => cfg.predict_frag.peptdeep_python.as_deref(),
             Role::Mbr => cfg.mbr.python.as_deref(),
+            Role::Im2deep => cfg.predict_frag.im2deep_python.as_deref(),
         }
     }
 
@@ -133,6 +141,7 @@ impl Role {
             Role::Ms2pip => cfg.predict_frag.ms2pip_python = Some(value),
             Role::Peptdeep => cfg.predict_frag.peptdeep_python = Some(value),
             Role::Mbr => cfg.mbr.python = Some(value),
+            Role::Im2deep => cfg.predict_frag.im2deep_python = Some(value),
         }
     }
 
@@ -149,6 +158,7 @@ impl Role {
             Role::Ms2pip => cfg.predict_frag.ms2pip_python = None,
             Role::Peptdeep => cfg.predict_frag.peptdeep_python = None,
             Role::Mbr => cfg.mbr.python = None,
+            Role::Im2deep => cfg.predict_frag.im2deep_python = None,
         }
     }
 
@@ -172,6 +182,18 @@ impl Role {
             Role::Ms2pip => cfg.predict_frag.predictor == FragPredictorKind::Ms2pip,
             Role::Peptdeep => cfg.predict_frag.predictor == FragPredictorKind::Peptdeep,
             Role::Mbr => cfg.mbr.strategy != MbrStrategy::None,
+            Role::Im2deep => cfg.predict_frag.im_predictor == ImPredictorKind::Im2deep,
+        }
+    }
+
+    /// The package whose version this role must meet, and the floor, for the roles whose
+    /// results change with the version. Discovery skips an interpreter below it and
+    /// `doctor` fails on one, because the sidecar launch refuses it.
+    pub fn version_floor(self) -> Option<(&'static str, (u32, u32, u32))> {
+        match self {
+            Role::DeepLc => Some(("deeplc", mumdia_core::constants::MIN_DEEPLC_VERSION)),
+            Role::Im2deep => Some(("im2deep", mumdia_core::constants::MIN_IM2DEEP_VERSION)),
+            _ => None,
         }
     }
 
@@ -199,12 +221,13 @@ impl Role {
     }
 }
 
-pub const ALL_ROLES: [Role; 5] = [
+pub const ALL_ROLES: [Role; 6] = [
     Role::Rescore,
     Role::DeepLc,
     Role::Ms2pip,
     Role::Peptdeep,
     Role::Mbr,
+    Role::Im2deep,
 ];
 
 /// How a role's interpreter was determined, for logging and for `doctor`.
@@ -321,25 +344,24 @@ pub fn discover(role: Role, cfg: &Config) -> Option<(String, &'static str)> {
                 // Presence is not enough for DeepLC: the default RT workflow calibrates
                 // base-model predictions without a fine-tune, which is only sound from
                 // `MIN_DEEPLC_VERSION` on, and the sidecar launch refuses anything older.
-                // Rejecting it here keeps discovery from handing back an interpreter the
-                // run cannot use.
-                if role == Role::DeepLc {
-                    let floor = mumdia_core::constants::MIN_DEEPLC_VERSION;
+                // The same holds for IM2Deep's API floor. Rejecting it here keeps
+                // discovery from handing back an interpreter the run cannot use.
+                if let Some((pkg, floor)) = role.version_floor() {
                     let (ma, mi, pa) = floor;
-                    match module_version(&path, "deeplc") {
+                    match module_version(&path, pkg) {
                         Some(v)
                             if mumdia_core::constants::parse_version3(&v)
                                 .is_some_and(|t| t >= floor) => {}
                         Some(v) => {
                             tried.push(format!(
-                                "{} (deeplc {v} is older than the required {ma}.{mi}.{pa})",
+                                "{} ({pkg} {v} is older than the required {ma}.{mi}.{pa})",
                                 path.display()
                             ));
                             continue;
                         }
                         None => {
                             tried.push(format!(
-                                "{} (deeplc version unknown; {ma}.{mi}.{pa} or newer is required)",
+                                "{} ({pkg} version unknown; {ma}.{mi}.{pa} or newer is required)",
                                 path.display()
                             ));
                             continue;

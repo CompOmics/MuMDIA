@@ -66,6 +66,58 @@ pub struct QuantParams<'a> {
     pub out_peak_bounds: Option<&'a str>,
     pub cfg: &'a QuantConfig,
     pub config_hash: &'a str,
+    /// Cross-run fit from [`fit_cross_run`] (`quant.cross_run_weights` /
+    /// `quant.cross_run_background`, second pass). `None` is the per-run quant.
+    pub cross_run: Option<&'a CrossRunFit>,
+}
+
+/// One value per (candidate, fragment name), fitted over every run of an experiment.
+pub type FragmentLevels = HashMap<u32, BTreeMap<String, f64>>;
+
+/// The cross-run fit applied in quant's second pass.
+#[derive(Default)]
+pub struct CrossRunFit {
+    /// `quant.cross_run_weights`: the quantity is `sum(weight * area)`.
+    pub weights: Option<FragmentLevels>,
+    /// `quant.cross_run_background`: subtracted from every fixed-window sample instead of the
+    /// per-run flank baseline.
+    pub background: Option<FragmentLevels>,
+    /// `quant.cross_run_width`: the candidate's fixed-window scan halfwidth, in place of
+    /// `fixed_scan_halfwidth`.
+    pub halfwidth: Option<HashMap<u32, usize>>,
+}
+
+/// Halfwidths `quant.cross_run_width` chooses from, in scans (docs/TIMS_QUANT_ROADMAP.md 4h).
+/// The first pass exports the flank mean at each of them, so the fit can pool the flank of
+/// whichever it chooses. The upper bound is the range the prototype measured.
+const WIDTH_HALF_MIN: usize = 3;
+const WIDTH_HALF_MAX: usize = 7;
+const WIDTH_N: usize = WIDTH_HALF_MAX - WIDTH_HALF_MIN + 1;
+
+/// Half width at half maximum, in scans, of a trace sampled at the scans `-WIDTH_HALF_MAX..=
+/// WIDTH_HALF_MAX` around the apex (`s[WIDTH_HALF_MAX]` is the apex sample). Each side runs
+/// from the apex to the first sample below half the apex value, interpolated linearly; a side
+/// that never falls below counts its full length plus one. The mean of the two sides.
+fn peak_hwhm(s: &[f64; 2 * WIDTH_HALF_MAX + 1]) -> f64 {
+    let half = s[WIDTH_HALF_MAX] / 2.0;
+    let side = |m: &[f64]| -> f64 {
+        match m.iter().position(|&v| v < half) {
+            None => m.len() as f64,
+            Some(k) => {
+                let kk = k.clamp(1, m.len() - 1);
+                let (y0, y1) = (m[kk - 1], m[kk]);
+                let frac = if y0 > y1 {
+                    (y0 - half) / (y0 - y1).max(1e-12)
+                } else {
+                    0.0
+                };
+                k as f64 - 1.0 + frac
+            }
+        }
+    };
+    let right: Vec<f64> = s[WIDTH_HALF_MAX..].to_vec();
+    let left: Vec<f64> = s[..=WIDTH_HALF_MAX].iter().rev().copied().collect();
+    (side(&right) + side(&left)) / 2.0
 }
 
 /// Interned fragment names. A chromatogram table has tens of millions of rows and only a
@@ -949,9 +1001,68 @@ fn trapezoid_fixed_opts(
     trapezoid_fixed_at(rt, inten, lo, hi, envelope, baseline)
 }
 
+/// Samples `[lo, hi)` after the optional flank-baseline subtraction, clipped at zero, before
+/// any envelope: what [`trapezoid_fixed_at`] integrates and what the cross-run weights
+/// correlate.
+fn baseline_window(
+    inten: &[f32],
+    lo: usize,
+    hi: usize,
+    baseline: Option<(usize, f64)>,
+) -> Vec<f32> {
+    let mut w: Vec<f32> = inten[lo..hi].to_vec();
+    if let Some((flank, quantile)) = baseline {
+        let b = flank_baseline(inten, lo, hi, flank, quantile);
+        for x in w.iter_mut() {
+            *x = (*x - b).max(0.0);
+        }
+    }
+    w
+}
+
+/// Mean of the raw samples in the `flank` samples either side of `[lo, hi)`; NaN without any.
+fn flank_mean(inten: &[f32], lo: usize, hi: usize, flank: usize) -> f64 {
+    let left = &inten[lo.saturating_sub(flank)..lo];
+    let right = &inten[hi..(hi + flank).min(inten.len())];
+    let n = left.len() + right.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    left.iter().chain(right).map(|&x| x as f64).sum::<f64>() / n as f64
+}
+
+/// Apex correlation of each fragment with the sum of the candidate's other fragments, over
+/// the fixed-window samples (positionally aligned from each window's first sample; shorter
+/// windows are zero-padded). NaN where a fragment has no window. Population Pearson
+/// ([`crate::stats::pearson`]), so a flat window correlates 0.
+fn window_correlations(windows: &[Option<Vec<f32>>]) -> Vec<f64> {
+    let n = windows.iter().flatten().map(|w| w.len()).max().unwrap_or(0);
+    let mut x = vec![vec![0.0f64; n]; windows.len()];
+    for (row, w) in x.iter_mut().zip(windows) {
+        if let Some(w) = w {
+            for (d, &v) in row.iter_mut().zip(w) {
+                *d = v as f64;
+            }
+        }
+    }
+    let total: Vec<f64> = (0..n).map(|k| x.iter().map(|r| r[k]).sum()).collect();
+    windows
+        .iter()
+        .zip(&x)
+        .map(|(w, row)| {
+            if w.is_none() {
+                return f64::NAN;
+            }
+            let rest: Vec<f64> = total.iter().zip(row).map(|(t, v)| t - v).collect();
+            crate::stats::pearson(row, &rest)
+        })
+        .collect()
+}
+
 /// Fixed-window integration over the sample range `[lo, hi)` already chosen by
 /// [`fixed_window_indices`], with optional apex-outward envelope and optional
 /// flank-baseline subtraction (`baseline = Some((flank, quantile))`).
+#[cfg(test)]
 fn trapezoid_fixed_at(
     rt: &[f32],
     inten: &[f32],
@@ -960,17 +1071,18 @@ fn trapezoid_fixed_at(
     envelope: bool,
     baseline: Option<(usize, f64)>,
 ) -> f64 {
-    let mut w: Vec<f32> = inten[lo..hi].to_vec();
-    if let Some((flank, quantile)) = baseline {
-        let b = flank_baseline(inten, lo, hi, flank, quantile);
-        for x in w.iter_mut() {
-            *x = (*x - b).max(0.0);
-        }
-    }
+    integrate_window(
+        &rt[lo..hi],
+        baseline_window(inten, lo, hi, baseline),
+        envelope,
+    )
+}
+
+fn integrate_window(rt: &[f32], mut w: Vec<f32>, envelope: bool) -> f64 {
     if envelope {
         w = center_envelope_1d(&w);
     }
-    trapezoid(&rt[lo..hi], &w)
+    trapezoid(rt, &w)
 }
 
 /// Top-N sum with the fragment ranking chosen by `selection`. `observed_area`
@@ -2541,20 +2653,48 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         None
     };
     let mut area_by_slot: Vec<f64> = vec![0.0; index.rows.len()];
-    let mut slices: Vec<&mut [f64]> = Vec::with_capacity(index.len());
+    // Apex correlation per slot, for the cross-run weights (NaN outside a fixed window).
+    let mut corr_by_slot: Vec<f64> = vec![f64::NAN; index.rows.len()];
+    // Flank mean per slot (the `baseline_flank_scans` raw samples either side of the fixed
+    // window), for the cross-run background. NaN outside a fixed window.
+    let mut flank_by_slot: Vec<f64> = vec![f64::NAN; index.rows.len()];
+    // First pass of `quant.cross_run_width`: the flank mean at every candidate halfwidth, per
+    // slot, and the candidate's peak HWHM in this run, for `fit_cross_run`.
+    let export_width =
+        p.cfg.cross_run_width > 0.0 && p.cross_run.is_none() && p.out_fragment.is_some();
+    let mut flank_h_by_slot: Vec<[f64; WIDTH_N]> =
+        vec![[f64::NAN; WIDTH_N]; if export_width { index.rows.len() } else { 0 }];
+    type Slice<'s> = (
+        &'s mut [f64],
+        &'s mut [f64],
+        &'s mut [f64],
+        &'s mut [[f64; WIDTH_N]],
+    );
+    let mut slices: Vec<Slice> = Vec::with_capacity(index.len());
     {
         let mut rest: &mut [f64] = &mut area_by_slot;
+        let mut crest: &mut [f64] = &mut corr_by_slot;
+        let mut frest: &mut [f64] = &mut flank_by_slot;
+        let mut hrest: &mut [[f64; WIDTH_N]] = &mut flank_h_by_slot;
         for ci in 0..index.len() {
             let n = index.cand_off[ci + 1] - index.cand_off[ci];
             let (head, tail) = rest.split_at_mut(n);
-            slices.push(head);
+            let (chead, ctail) = crest.split_at_mut(n);
+            let (fhead, ftail) = frest.split_at_mut(n);
+            let (hhead, htail) = hrest.split_at_mut(if export_width { n } else { 0 });
+            slices.push((head, chead, fhead, hhead));
             rest = tail;
+            crest = ctail;
+            frest = ftail;
+            hrest = htail;
         }
     }
-    let applied_win: Vec<(f64, f64, f64)> = slices
+    let width_fit = p.cross_run.and_then(|x| x.halfwidth.as_ref());
+    let pooled_bg = p.cross_run.and_then(|x| x.background.as_ref());
+    let applied: Vec<(f64, f64, f64, f64)> = slices
         .par_iter_mut()
         .enumerate()
-        .map(|(ci, out)| {
+        .map(|(ci, (out, cout, fout, hout))| {
             let c = index.cids[ci];
             let rows = index.rows_of(ci);
             let (lo_rt, hi_rt, integration_apex) = if !p.cfg.bound_peak {
@@ -2596,6 +2736,12 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             // to recompute the identical indices in a second pass over the same rows.
             let mut flo = f64::INFINITY;
             let mut fhi = f64::NEG_INFINITY;
+            let mut windows: Vec<Option<Vec<f32>>> = Vec::new();
+            let half = width_fit
+                .and_then(|m| m.get(&c))
+                .copied()
+                .unwrap_or(p.cfg.fixed_scan_halfwidth);
+            let mut summed = [0.0f64; 2 * WIDTH_HALF_MAX + 1];
             for (slot, &i) in rows.iter().enumerate() {
                 let rt = store.rt(i);
                 let it = store.inten(i);
@@ -2603,23 +2749,65 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                     match fixed_window_indices(
                         rt,
                         integration_apex,
-                        p.cfg.fixed_scan_halfwidth,
+                        half,
                         p.cfg.fixed_window_s,
                         store.rt_sorted,
                     ) {
                         Some((lo, hi)) => {
                             flo = flo.min(rt[lo] as f64);
                             fhi = fhi.max(rt[hi - 1] as f64);
-                            trapezoid_fixed_at(
-                                rt,
-                                it,
-                                lo,
-                                hi,
+                            fout[slot] = flank_mean(it, lo, hi, p.cfg.baseline_flank_scans);
+                            if export_width {
+                                for (j, h) in (WIDTH_HALF_MIN..=WIDTH_HALF_MAX).enumerate() {
+                                    hout[slot][j] = fixed_window_indices(
+                                        rt,
+                                        integration_apex,
+                                        h,
+                                        0.0,
+                                        store.rt_sorted,
+                                    )
+                                    .map_or(f64::NAN, |(l, u)| {
+                                        flank_mean(it, l, u, p.cfg.baseline_flank_scans)
+                                    });
+                                }
+                                // This run's summed trace around the apex, minus each
+                                // fragment's flank mean, for the peak HWHM.
+                                let k = nearest_index(rt, integration_apex, store.rt_sorted);
+                                let b = if fout[slot].is_finite() {
+                                    fout[slot]
+                                } else {
+                                    0.0
+                                };
+                                for (d, acc) in summed.iter_mut().enumerate() {
+                                    if let Some(idx) = (k + d).checked_sub(WIDTH_HALF_MAX) {
+                                        if let Some(&x) = it.get(idx) {
+                                            *acc += (x as f64 - b).max(0.0);
+                                        }
+                                    }
+                                }
+                            }
+                            let bg = pooled_bg
+                                .and_then(|m| m.get(&c))
+                                .and_then(|f| f.get(store.name(i)));
+                            let w = match bg {
+                                Some(&b) => it[lo..hi]
+                                    .iter()
+                                    .map(|&x| (x - b as f32).max(0.0))
+                                    .collect(),
+                                None => baseline_window(it, lo, hi, baseline),
+                            };
+                            let area = integrate_window(
+                                &rt[lo..hi],
+                                w.clone(),
                                 p.cfg.interference_envelope,
-                                baseline,
-                            )
+                            );
+                            windows.push(Some(w));
+                            area
                         }
-                        None => 0.0,
+                        None => {
+                            windows.push(None);
+                            0.0
+                        }
                     }
                 } else if p.cfg.bound_peak {
                     trapezoid_window(rt, it, lo_rt, hi_rt, p.cfg.interference_envelope)
@@ -2627,16 +2815,28 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                     trapezoid(rt, it)
                 };
             }
+            if fixed {
+                cout.copy_from_slice(&window_correlations(&windows));
+            }
             let (lo_rt, hi_rt) = if fixed && flo.is_finite() && fhi.is_finite() {
                 (flo, fhi)
             } else {
                 (lo_rt, hi_rt)
             };
-            (lo_rt, hi_rt, integration_apex)
+            let hwhm = if export_width && fixed {
+                peak_hwhm(&summed)
+            } else {
+                f64::NAN
+            };
+            (lo_rt, hi_rt, integration_apex, hwhm)
         })
         .collect();
     drop(slices);
+    let applied_win: Vec<(f64, f64, f64)> = applied.iter().map(|&(l, h, a, _)| (l, h, a)).collect();
+    let flank_h_by_slot = flank_h_by_slot;
     let area_by_slot = area_by_slot;
+    let corr_by_slot = corr_by_slot;
+    let flank_by_slot = flank_by_slot;
     if emit_bounds {
         for (ci, &(lo_rt, hi_rt, _)) in applied_win.iter().enumerate() {
             if lo_rt.is_finite() && hi_rt.is_finite() {
@@ -2693,6 +2893,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     // candidate rather than once per scored row: it collects and SORTS the candidate's
     // areas, and every extra row mapping to the same candidate repeated that.
     let mut selected: HashMap<usize, usize> = HashMap::new();
+    let mut n_weighted = 0u64;
     let mut selections: Vec<(Option<f64>, usize, &'static str)> = Vec::new();
     // One pass over the accepted rows, in table order, which is the order the filter over
     // every row visited them in.
@@ -2703,11 +2904,27 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             Some(ci) => {
                 let slot = *selected.entry(ci).or_insert_with(|| {
                     let r = index.slots(ci);
-                    selections.push(select_fragment_areas(
-                        Some((&area_by_slot[r.clone()], &index.slot_pred[r])),
-                        p.cfg.top_n_fragments,
-                        p.cfg.fragment_selection,
-                    ));
+                    let weighted = p
+                        .cross_run
+                        .and_then(|x| x.weights.as_ref())
+                        .and_then(|fw| fw.get(&c))
+                        .and_then(|w| {
+                            weighted_quantity(
+                                &area_by_slot[r.clone()],
+                                r.clone().map(|s| store.name(index.rows[s])),
+                                w,
+                            )
+                        });
+                    if weighted.is_some() {
+                        n_weighted += 1;
+                    }
+                    selections.push(weighted.unwrap_or_else(|| {
+                        select_fragment_areas(
+                            Some((&area_by_slot[r.clone()], &index.slot_pred[r])),
+                            p.cfg.top_n_fragments,
+                            p.cfg.fragment_selection,
+                        )
+                    }));
                     selections.len() - 1
                 });
                 selections[slot]
@@ -2780,7 +2997,11 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     // Optional per-fragment area export for ion-level directLFQ across runs.
     let mut fragment_output: Option<(&str, u64)> = None;
     if let Some(fpath) = p.out_fragment {
-        let (mut f_cid, mut f_pf, mut f_z, mut f_pg, mut f_name, mut f_area) = (
+        let mut f_flank: Vec<f64> = Vec::new();
+        let mut f_flank_h: Vec<Vec<f64>> = vec![Vec::new(); WIDTH_N];
+        let mut f_hwhm: Vec<f64> = Vec::new();
+        let (mut f_cid, mut f_pf, mut f_z, mut f_pg, mut f_name, mut f_area, mut f_corr) = (
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2794,8 +3015,10 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             // same rows in the same order.
             if let Some(ci) = index.find(c) {
                 for slot in index.slots(ci) {
+                    // Under `cross_run_background` zero areas are exported too (the background
+                    // averages the flank over every run); directLFQ and the weight fit skip them.
                     let a = area_by_slot[slot];
-                    if !a.is_finite() || a <= 0.0 {
+                    if !a.is_finite() || a < 0.0 || (a == 0.0 && !p.cfg.cross_run_background) {
                         continue;
                     }
                     f_cid.push(c);
@@ -2804,20 +3027,36 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                     f_pg.push(pg.get(k).to_string());
                     f_name.push(store.name(index.rows[slot]).to_string());
                     f_area.push(a);
+                    f_corr.push(corr_by_slot[slot]);
+                    f_flank.push(flank_by_slot[slot]);
+                    if export_width {
+                        for (j, col) in f_flank_h.iter_mut().enumerate() {
+                            col.push(flank_h_by_slot[slot][j]);
+                        }
+                        f_hwhm.push(applied[ci].3);
+                    }
                 }
             }
         }
-        let fragment_rows = write_table(
-            fpath,
-            vec![
-                Col::U32("candidate_id".into(), f_cid),
-                Col::Str("peptidoform".into(), f_pf),
-                Col::I32("charge".into(), f_z),
-                Col::Str("protein_group".into(), f_pg),
-                Col::Str("fragment_name".into(), f_name),
-                Col::F64("quantity".into(), f_area),
-            ],
-        )?;
+        let mut width_cols = Vec::new();
+        if export_width {
+            for (j, col) in f_flank_h.into_iter().enumerate() {
+                width_cols.push(Col::F64(format!("flank_mean_h{}", WIDTH_HALF_MIN + j), col));
+            }
+            width_cols.push(Col::F64("peak_hwhm".into(), f_hwhm));
+        }
+        let mut cols = vec![
+            Col::U32("candidate_id".into(), f_cid),
+            Col::Str("peptidoform".into(), f_pf),
+            Col::I32("charge".into(), f_z),
+            Col::Str("protein_group".into(), f_pg),
+            Col::Str("fragment_name".into(), f_name),
+            Col::F64("quantity".into(), f_area),
+            Col::F64("apex_corr".into(), f_corr),
+            Col::F64("flank_mean".into(), f_flank),
+        ];
+        cols.extend(width_cols);
+        let fragment_rows = write_table(fpath, cols)?;
         fragment_output = Some((fpath, fragment_rows));
     }
 
@@ -2873,6 +3112,9 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         // identification apex, `redetected` rows fell back to quant's own peak pick.
         "apex_rt_column_present": apex_column_present,
         "candidates_with_scored_apex": candidates_with_scored_apex,
+        "cross_run_weights": p.cfg.cross_run_weights,
+        "cross_run_width": p.cfg.cross_run_width,
+        "candidates_weighted": n_weighted,
     });
     if !whole_table {
         if let Some(params) = report_params.as_object_mut() {
@@ -2938,6 +3180,211 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         peptide,
         protein,
         fragment: fragment_written,
+    })
+}
+
+/// The diaPASEF quant preset ([`QuantConfig::diapasef`]) replaces a `quant` block left at
+/// its defaults when every input is a timsTOF `.d`. A block with any key set is kept as
+/// written. Under single-run `run` the cross-run weights have nothing to fit and are not
+/// applied (`candidates_weighted` 0 in the report).
+pub fn apply_diapasef_quant<S: AsRef<str>>(quant: &mut QuantConfig, inputs: &[S]) {
+    if *quant == QuantConfig::default()
+        && !inputs.is_empty()
+        && inputs.iter().all(|m| crate::raw::is_tims_tdf(m.as_ref()))
+    {
+        *quant = QuantConfig::diapasef();
+        info!("quant: timsTOF input and default quant settings; using the diaPASEF quant preset (fixed window, cross-run fragment weights, background and integration width)");
+    }
+}
+
+/// Weighted quantity of one candidate: `sum(weight * area)` over its fragments with a
+/// positive area. `None` (the caller keeps the per-run top-N rule) when no weighted
+/// fragment has a positive area in this run.
+fn weighted_quantity<'a>(
+    areas: &[f64],
+    names: impl Iterator<Item = &'a str>,
+    weights: &BTreeMap<String, f64>,
+) -> Option<(Option<f64>, usize, &'static str)> {
+    let (mut q, mut used) = (0.0f64, 0usize);
+    for (&a, name) in areas.iter().zip(names) {
+        if let Some(&w) = weights.get(name) {
+            if a.is_finite() && a > 0.0 && w > 0.0 {
+                q += w * a;
+                used += 1;
+            }
+        }
+    }
+    (q.is_finite() && q > 0.0).then_some((Some(q), used, "quantified"))
+}
+
+/// Median with the even-count rule `(lower + upper) / 2`; `None` for no values.
+fn median_of(mut v: Vec<f64>) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let n = v.len();
+    Some(if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    })
+}
+
+/// Fit the cross-run step from the first-pass `fragment_quant` tables of every run.
+///
+/// Weights (`weights`, `quant.cross_run_weights`), from the positive areas and `apex_corr`. Per candidate
+/// and fragment: `dev` = median over runs of |log-share - its cross-run median|, where the
+/// log-share is ln(area / candidate total in that run); `corr` = median over runs of
+/// `apex_corr`, ignoring NaN; weight = `1 / (dev + 0.1) * max(corr, 0)`. A candidate whose
+/// weights are all zero gets weight 1 on every fragment.
+///
+/// Background (`background`, `quant.cross_run_background`): per candidate and fragment, the
+/// mean over runs of the per-run `flank_mean` (every exported row, zero areas included). The
+/// floor on the raw diaPASEF traces is sparse counts (half the flank samples are 0), so a
+/// flank quantile underestimates it; one run's flank mean is noisy, and the six-run mean is
+/// not (docs/TIMS_QUANT_ROADMAP.md section 4f). Deterministic: ordered maps only.
+///
+/// Halfwidth (`halfwidth`, `quant.cross_run_width` = `width` > 0): per candidate, the
+/// `peak_hwhm` of the run with the largest summed first-pass area (the first such run on a
+/// tie) gives `h = clamp(round(width * hwhm), 3, 7)`; the background then pools the
+/// `flank_mean_h<h>` column, the flank beyond that window (docs/TIMS_QUANT_ROADMAP.md 4h).
+pub fn fit_cross_run(
+    fragment_tables: &[String],
+    weights: bool,
+    background: bool,
+    width: f64,
+) -> Result<CrossRunFit> {
+    let use_width = width > 0.0;
+    // candidate -> (largest summed area over runs, that run's peak HWHM)
+    let mut brightest: BTreeMap<u32, (f64, f64)> = BTreeMap::new();
+    // (candidate, fragment) -> per-halfwidth (sum of flank means, runs)
+    let mut flank_h: BTreeMap<u32, BTreeMap<String, [(f64, u32); WIDTH_N]>> = BTreeMap::new();
+    // (candidate, fragment) -> per-run (log-share, corr)
+    let mut obs: BTreeMap<u32, BTreeMap<String, Vec<(f64, f64)>>> = BTreeMap::new();
+    // (candidate, fragment) -> (sum of flank means, runs)
+    let mut flank: BTreeMap<u32, BTreeMap<String, (f64, u32)>> = BTreeMap::new();
+    for path in fragment_tables {
+        let t = TableFile::open(path)?;
+        let cid = t.u32("candidate_id")?;
+        let name = t.str("fragment_name")?;
+        let area = t.f64("quantity")?;
+        let corr = t.f64("apex_corr")?;
+        let fm = if background {
+            t.f64("flank_mean")?
+        } else {
+            Vec::new()
+        };
+        for i in 0..fm.len() {
+            if fm[i].is_finite() {
+                let e = flank
+                    .entry(cid[i])
+                    .or_default()
+                    .entry(name[i].clone())
+                    .or_default();
+                e.0 += fm[i];
+                e.1 += 1;
+            }
+        }
+        let mut total: BTreeMap<u32, f64> = BTreeMap::new();
+        for i in 0..t.nrows {
+            *total.entry(cid[i]).or_default() += area[i];
+        }
+        if use_width {
+            let hw = t.f64("peak_hwhm").context(
+                "quant.cross_run_width needs first-pass fragment tables written with it on \
+                 (fragment_quant v4, columns peak_hwhm and flank_mean_h3..h7)",
+            )?;
+            let cols: Vec<Vec<f64>> = (WIDTH_HALF_MIN..=WIDTH_HALF_MAX)
+                .map(|h| t.f64(&format!("flank_mean_h{h}")))
+                .collect::<Result<_>>()?;
+            let mut run_hw: BTreeMap<u32, f64> = BTreeMap::new();
+            for i in 0..t.nrows {
+                run_hw.entry(cid[i]).or_insert(hw[i]);
+                let e = flank_h
+                    .entry(cid[i])
+                    .or_default()
+                    .entry(name[i].clone())
+                    .or_insert([(0.0, 0); WIDTH_N]);
+                for (j, col) in cols.iter().enumerate() {
+                    if col[i].is_finite() {
+                        e[j].0 += col[i];
+                        e[j].1 += 1;
+                    }
+                }
+            }
+            for (&c, &tot) in &total {
+                let hwv = run_hw[&c];
+                if !hwv.is_finite() {
+                    continue;
+                }
+                let e = brightest.entry(c).or_insert((f64::NEG_INFINITY, f64::NAN));
+                if tot > e.0 {
+                    *e = (tot, hwv);
+                }
+            }
+        }
+        for i in 0..t.nrows {
+            let ls = (area[i] / total[&cid[i]]).ln();
+            if ls.is_finite() {
+                obs.entry(cid[i])
+                    .or_default()
+                    .entry(name[i].clone())
+                    .or_default()
+                    .push((ls, corr[i]));
+            }
+        }
+    }
+    let mut out: FragmentLevels = HashMap::with_capacity(obs.len());
+    for (c, frags) in obs {
+        let mut w: BTreeMap<String, f64> = frags
+            .into_iter()
+            .map(|(f, v)| {
+                let med = median_of(v.iter().map(|x| x.0).collect()).unwrap_or(0.0);
+                let dev = median_of(v.iter().map(|x| (x.0 - med).abs()).collect()).unwrap_or(0.0);
+                let corr = median_of(v.iter().map(|x| x.1).filter(|x| x.is_finite()).collect());
+                let wt = corr.map_or(0.0, |r| r.max(0.0) / (dev + 0.1));
+                (f, wt)
+            })
+            .collect();
+        if w.values().all(|&x| x <= 0.0) {
+            w.values_mut().for_each(|x| *x = 1.0);
+        }
+        out.insert(c, w);
+    }
+    let half: HashMap<u32, usize> = brightest
+        .into_iter()
+        .map(|(c, (_, hw))| {
+            let h = (width * hw)
+                .round()
+                .clamp(WIDTH_HALF_MIN as f64, WIDTH_HALF_MAX as f64);
+            (c, h as usize)
+        })
+        .collect();
+    let mut bg: FragmentLevels = flank
+        .into_iter()
+        .map(|(c, f)| {
+            (
+                c,
+                f.into_iter().map(|(n, (s, k))| (n, s / k as f64)).collect(),
+            )
+        })
+        .collect();
+    // Under the width the background is the flank beyond the chosen window.
+    for (c, frags) in flank_h {
+        let Some(&h) = half.get(&c) else { continue };
+        let lv = bg.entry(c).or_default();
+        for (n, per) in frags {
+            let (sum, k) = per[h - WIDTH_HALF_MIN];
+            if k > 0 {
+                lv.insert(n, sum / k as f64);
+            }
+        }
+    }
+    Ok(CrossRunFit {
+        weights: weights.then_some(out),
+        background: background.then_some(bg),
+        halfwidth: use_width.then_some(half),
     })
 }
 
@@ -3630,6 +4077,7 @@ mod tests {
             out_peak_bounds: Some(&bounds),
             cfg: &cfg,
             config_hash: "test",
+            cross_run: None,
         })
         .unwrap();
         assert_eq!(rows, (4, 3));
@@ -3895,6 +4343,7 @@ mod tests {
             out_peak_bounds: None,
             cfg: &cfg,
             config_hash: "test",
+            cross_run: None,
         })
         .unwrap();
         assert_eq!(rows, (1, 1));
@@ -3929,6 +4378,7 @@ mod tests {
                 out_peak_bounds: None,
                 cfg: &cfg,
                 config_hash: "test",
+                cross_run: None,
             })
             .unwrap();
             let pq = Table::read(&peptide).unwrap();
@@ -3995,6 +4445,7 @@ mod tests {
             out_peak_bounds: None,
             cfg: &cfg,
             config_hash: "test",
+            cross_run: None,
         })
         .unwrap();
         assert_eq!(rows.0, 2, "both identifications must be reported");
@@ -4032,6 +4483,7 @@ mod tests {
             out_peak_bounds: None,
             cfg: &cfg,
             config_hash: "test",
+            cross_run: None,
         })
         .unwrap_err()
         .to_string();
@@ -4469,6 +4921,7 @@ mod tests {
             out_peak_bounds: Some(&bounds),
             cfg: &cfg,
             config_hash: "test",
+            cross_run: None,
         })
         .unwrap();
         assert_eq!(rows, (3, 2));
@@ -4596,6 +5049,7 @@ mod tests {
                 out_peak_bounds: bounds.as_deref(),
                 cfg: &cfg,
                 config_hash: "test",
+                cross_run: None,
             })
             .unwrap();
             let pq = Table::read(&peptide).unwrap();
@@ -5472,6 +5926,7 @@ mod tests {
             out_peak_bounds: None,
             cfg: &QuantConfig::default(),
             config_hash: "test",
+            cross_run: None,
         })
     }
 
@@ -5674,6 +6129,7 @@ mod tests {
                 out_peak_bounds: bounds.then_some(pb.as_str()),
                 cfg: &cfg,
                 config_hash: "test",
+                cross_run: None,
             })?;
             let mut report: serde_json::Value =
                 mumdia_io::json::read_json(&format!("{pep}.report.json")).unwrap();
@@ -5797,6 +6253,7 @@ mod tests {
                 out_peak_bounds: Some(&pb),
                 cfg: &QuantConfig::default(),
                 config_hash: "test",
+                cross_run: None,
             })
             .unwrap();
             [pep, prot, frag, pb]
@@ -5933,6 +6390,7 @@ mod tests {
                     out_peak_bounds: None,
                     cfg: &QuantConfig::default(),
                     config_hash: "test",
+                    cross_run: None,
                 })
                 .unwrap();
                 files.extend([pep, prot, frag].iter().map(|p| std::fs::read(p).unwrap()));
@@ -6126,6 +6584,7 @@ mod tests {
                 out_peak_bounds: None,
                 cfg: &cfg,
                 config_hash: "test",
+                cross_run: None,
             })
             .unwrap();
             // The quantities as well, so a failure says which column moved rather than
@@ -6658,5 +7117,118 @@ mod source_guard_tests {
         );
         let t = TableFile::open(&p).unwrap();
         assert!(pooled_source_count(&t, &p).is_err());
+    }
+
+    #[test]
+    fn cross_run_weights_downweight_an_interfered_fragment() {
+        // Candidate 7: fragments a, b, c over four runs; c's share jumps in runs 2 and 3
+        // (interference in half the runs, as in a low-abundance condition) and c does not
+        // co-elute there. One interfered run of three would be ignored by the medians. Candidate 9: every apex_corr
+        // is negative, so every weight is 0 and the equal-weight fallback applies.
+        let rows: [[(f64, f64); 3]; 4] = [
+            [(100.0, 0.9), (50.0, 0.8), (25.0, 0.9)],
+            [(200.0, 0.9), (100.0, 0.8), (50.0, 0.9)],
+            [(100.0, 0.9), (50.0, 0.8), (400.0, 0.1)],
+            [(100.0, 0.9), (50.0, 0.8), (400.0, 0.1)],
+        ];
+        let tables: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .map(|(r, run)| {
+                let mut cid = vec![7u32; 3];
+                let mut name: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+                let mut area: Vec<f64> = run.iter().map(|x| x.0).collect();
+                let mut corr: Vec<f64> = run.iter().map(|x| x.1).collect();
+                cid.extend([9, 9]);
+                name.extend(["a".to_string(), "b".to_string()]);
+                area.extend([10.0, 20.0]);
+                corr.extend([-0.5, -0.2]);
+                table(
+                    &format!("crw_frag{r}"),
+                    vec![
+                        Col::U32("candidate_id".into(), cid),
+                        Col::Str("fragment_name".into(), name),
+                        Col::F64("quantity".into(), area),
+                        Col::F64("apex_corr".into(), corr),
+                        Col::F64("flank_mean".into(), vec![r as f64; 5]),
+                    ],
+                )
+            })
+            .collect();
+        let fit = fit_cross_run(&tables, true, true, 0.0).unwrap();
+        // flank_mean is the run index, so the pooled background is the mean over runs
+        assert_eq!(fit.background.as_ref().unwrap()[&7]["a"], 1.5);
+        let w = fit.weights.unwrap();
+        let w7 = &w[&7];
+        assert!(w7["c"] < w7["a"] / 2.0, "{w7:?}");
+        assert!(w7["a"] > 0.0 && w7["b"] > 0.0);
+        assert_eq!(w[&9].values().copied().collect::<Vec<_>>(), vec![1.0, 1.0]);
+        // Same weights in every run: the weighted quantity of a clean scaled run scales
+        // with it, and a run with no positive weighted area defers to the top-N rule.
+        let names = ["a", "b", "c"];
+        let q0 = weighted_quantity(&[100.0, 50.0, 25.0], names.iter().copied(), w7).unwrap();
+        let q1 = weighted_quantity(&[200.0, 100.0, 50.0], names.iter().copied(), w7).unwrap();
+        assert!((q1.0.unwrap() / q0.0.unwrap() - 2.0).abs() < 1e-12);
+        assert!(weighted_quantity(&[0.0, 0.0, 0.0], names.iter().copied(), w7).is_none());
+    }
+
+    #[test]
+    fn peak_hwhm_measures_scans_to_half_the_apex() {
+        // Triangle 8, 6, 4, 2, 0 either side of the apex: half (4) is reached at 2 scans.
+        let mut s = [0.0f64; 2 * WIDTH_HALF_MAX + 1];
+        for d in 0..=4usize {
+            let v = 8.0 - 2.0 * d as f64;
+            s[WIDTH_HALF_MAX + d] = v;
+            s[WIDTH_HALF_MAX - d] = v;
+        }
+        assert_eq!(peak_hwhm(&s), 2.0);
+        // Interpolated: 8, 5, 2 falls below 4 between scans 1 and 2 (1 + 1/3).
+        let mut t = [0.0f64; 2 * WIDTH_HALF_MAX + 1];
+        t[WIDTH_HALF_MAX] = 8.0;
+        for (d, v) in [(1, 5.0), (2, 2.0)] {
+            t[WIDTH_HALF_MAX + d] = v;
+            t[WIDTH_HALF_MAX - d] = v;
+        }
+        assert!((peak_hwhm(&t) - 4.0 / 3.0).abs() < 1e-12);
+        // A flat trace never falls below half: the full side length.
+        assert_eq!(peak_hwhm(&[1.0; 2 * WIDTH_HALF_MAX + 1]), 8.0);
+    }
+
+    #[test]
+    fn cross_run_width_takes_the_brightest_runs_hwhm_and_its_flank() {
+        // Candidate 7 over two runs; run 1 is brighter, so its HWHM (2.0) sets h =
+        // round(2.5 * 2.0) = 5, and the background pools flank_mean_h5. Candidate 9's HWHM
+        // (10) clamps to 7.
+        let tables: Vec<String> = (0..2)
+            .map(|r| {
+                let rf = r as f64;
+                let mut cols = vec![
+                    Col::U32("candidate_id".into(), vec![7, 7, 9]),
+                    Col::Str(
+                        "fragment_name".into(),
+                        ["a", "b", "a"].map(String::from).to_vec(),
+                    ),
+                    Col::F64("quantity".into(), vec![10.0 + 90.0 * rf, 5.0, 1.0]),
+                    Col::F64("apex_corr".into(), vec![0.9; 3]),
+                    Col::F64("flank_mean".into(), vec![100.0; 3]),
+                    Col::F64("peak_hwhm".into(), vec![1.0 + rf, 1.0 + rf, 10.0]),
+                ];
+                for h in WIDTH_HALF_MIN..=WIDTH_HALF_MAX {
+                    cols.push(Col::F64(format!("flank_mean_h{h}"), vec![h as f64 + rf; 3]));
+                }
+                table(&format!("crw_width{r}"), cols)
+            })
+            .collect();
+        let fit = fit_cross_run(&tables, false, true, 2.5).unwrap();
+        let half = fit.halfwidth.unwrap();
+        assert_eq!((half[&7], half[&9]), (5, 7));
+        let bg = fit.background.unwrap();
+        // mean over the two runs of flank_mean_h5 (5 and 6), not of flank_mean (100)
+        assert_eq!(bg[&7]["a"], 5.5);
+        assert_eq!(bg[&9]["a"], 7.5);
+        // off: no halfwidths, the flank_mean background as before
+        let off = fit_cross_run(&tables, false, true, 0.0).unwrap();
+        assert!(off.halfwidth.is_none());
+        assert_eq!(off.background.unwrap()[&7]["a"], 100.0);
     }
 }

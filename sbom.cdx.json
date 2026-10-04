@@ -1163,6 +1163,25 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/displaydoc@0.1.7",
+      "name": "displaydoc",
+      "version": "0.1.7",
+      "purl": "pkg:cargo/displaydoc@0.1.7",
+      "description": "A derive macro for implementing the display Trait via a doc comment and string interpolation",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/yaahc/displaydoc"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/either@1.16.0",
       "name": "either",
       "version": "1.16.0",
@@ -1219,6 +1238,44 @@
         {
           "type": "vcs",
           "url": "https://github.com/indexmap-rs/equivalent"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/fallible-iterator@0.3.0",
+      "name": "fallible-iterator",
+      "version": "0.3.0",
+      "purl": "pkg:cargo/fallible-iterator@0.3.0",
+      "description": "Fallible iterator traits",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/sfackler/rust-fallible-iterator"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/fallible-streaming-iterator@0.1.9",
+      "name": "fallible-streaming-iterator",
+      "version": "0.1.9",
+      "purl": "pkg:cargo/fallible-streaming-iterator@0.1.9",
+      "description": "Fallible streaming iteration",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/sfackler/fallible-streaming-iterator"
         }
       ]
     },
@@ -1430,6 +1487,25 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/hashbrown@0.14.5",
+      "name": "hashbrown",
+      "version": "0.14.5",
+      "purl": "pkg:cargo/hashbrown@0.14.5",
+      "description": "A Rust port of Google's SwissTable hash map",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/hashbrown"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/hashbrown@0.17.1",
       "name": "hashbrown",
       "version": "0.17.1",
@@ -1444,6 +1520,25 @@
         {
           "type": "vcs",
           "url": "https://github.com/rust-lang/hashbrown"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/hashlink@0.9.1",
+      "name": "hashlink",
+      "version": "0.9.1",
+      "purl": "pkg:cargo/hashlink@0.9.1",
+      "description": "HashMap-like containers that hold their key-value pairs in a user controllable order",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/kyren/hashlink"
         }
       ]
     },
@@ -1852,6 +1947,44 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/libsqlite3-sys@0.30.1",
+      "name": "libsqlite3-sys",
+      "version": "0.30.1",
+      "purl": "pkg:cargo/libsqlite3-sys@0.30.1",
+      "description": "Native bindings to the libsqlite3 library",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusqlite/rusqlite"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/linreg@0.2.0",
+      "name": "linreg",
+      "version": "0.2.0",
+      "purl": "pkg:cargo/linreg@0.2.0",
+      "description": "Calculates linear regresssions of two-dimensional data. Does not use stdlib, only depends on numeric traits.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/49nord/linreg-rs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/log@0.4.33",
       "name": "log",
       "version": "0.4.33",
@@ -1904,6 +2037,25 @@
         {
           "type": "vcs",
           "url": "https://github.com/BurntSushi/memchr"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/memmap2@0.9.11",
+      "name": "memmap2",
+      "version": "0.9.11",
+      "purl": "pkg:cargo/memmap2@0.9.11",
+      "description": "Cross-platform Rust API for memory-mapped file IO",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RazrFalcon/memmap2-rs"
         }
       ]
     },
@@ -2514,6 +2666,25 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/rusqlite@0.32.1",
+      "name": "rusqlite",
+      "version": "0.32.1",
+      "purl": "pkg:cargo/rusqlite@0.32.1",
+      "description": "Ergonomic wrapper for SQLite",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusqlite/rusqlite"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/rustc_version@0.4.1",
       "name": "rustc_version",
       "version": "0.4.1",
@@ -2868,6 +3039,25 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/syn@1.0.109",
+      "name": "syn",
+      "version": "1.0.109",
+      "purl": "pkg:cargo/syn@1.0.109",
+      "description": "Parser for Rust source code",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/syn"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/syn@2.0.118",
       "name": "syn",
       "version": "2.0.118",
@@ -2906,11 +3096,49 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/thiserror@1.0.69",
+      "name": "thiserror",
+      "version": "1.0.69",
+      "purl": "pkg:cargo/thiserror@1.0.69",
+      "description": "derive(Error)",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/thiserror"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/thiserror@2.0.20",
       "name": "thiserror",
       "version": "2.0.20",
       "purl": "pkg:cargo/thiserror@2.0.20",
       "description": "derive(Error)",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/thiserror"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/thiserror-impl@1.0.69",
+      "name": "thiserror-impl",
+      "version": "1.0.69",
+      "purl": "pkg:cargo/thiserror-impl@1.0.69",
+      "description": "Implementation detail of the `thiserror` crate",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
@@ -2958,6 +3186,25 @@
         {
           "type": "vcs",
           "url": "https://github.com/Amanieu/thread_local-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/timsrust@0.4.2",
+      "name": "timsrust",
+      "version": "0.4.2",
+      "purl": "pkg:cargo/timsrust@0.4.2",
+      "description": "A crate to read Bruker timsTOF data",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mannlabs/timsrust"
         }
       ]
     },
@@ -3225,6 +3472,25 @@
         {
           "type": "vcs",
           "url": "https://github.com/tokio-rs/valuable"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/vcpkg@0.2.15",
+      "name": "vcpkg",
+      "version": "0.2.15",
+      "purl": "pkg:cargo/vcpkg@0.2.15",
+      "description": "A library to find native dependencies in a vcpkg tree at build time in order to be used in Cargo build scripts.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mcgoo/vcpkg-rs"
         }
       ]
     },
@@ -4135,6 +4401,14 @@
       ]
     },
     {
+      "ref": "pkg:cargo/displaydoc@0.1.7",
+      "dependsOn": [
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/syn@1.0.109"
+      ]
+    },
+    {
       "ref": "pkg:cargo/either@1.16.0",
       "dependsOn": []
     },
@@ -4146,6 +4420,14 @@
     },
     {
       "ref": "pkg:cargo/equivalent@1.0.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/fallible-iterator@0.3.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/fallible-streaming-iterator@0.1.9",
       "dependsOn": []
     },
     {
@@ -4219,8 +4501,20 @@
       ]
     },
     {
+      "ref": "pkg:cargo/hashbrown@0.14.5",
+      "dependsOn": [
+        "pkg:cargo/ahash@0.8.12"
+      ]
+    },
+    {
       "ref": "pkg:cargo/hashbrown@0.17.1",
       "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/hashlink@0.9.1",
+      "dependsOn": [
+        "pkg:cargo/hashbrown@0.14.5"
+      ]
     },
     {
       "ref": "pkg:cargo/heck@0.5.0",
@@ -4349,6 +4643,21 @@
       ]
     },
     {
+      "ref": "pkg:cargo/libsqlite3-sys@0.30.1",
+      "dependsOn": [
+        "pkg:cargo/cc@1.2.65",
+        "pkg:cargo/pkg-config@0.3.34",
+        "pkg:cargo/vcpkg@0.2.15"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/linreg@0.2.0",
+      "dependsOn": [
+        "pkg:cargo/displaydoc@0.1.7",
+        "pkg:cargo/num-traits@0.2.19"
+      ]
+    },
+    {
       "ref": "pkg:cargo/log@0.4.33",
       "dependsOn": []
     },
@@ -4361,6 +4670,12 @@
     {
       "ref": "pkg:cargo/memchr@2.8.2",
       "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/memmap2@0.9.11",
+      "dependsOn": [
+        "pkg:cargo/libc@0.2.186"
+      ]
     },
     {
       "ref": "pkg:cargo/mimalloc@0.1.52",
@@ -4415,9 +4730,11 @@
         "pkg:cargo/mzdata@0.66.6",
         "pkg:cargo/parquet@59.3.0",
         "pkg:cargo/rayon@1.12.0",
+        "pkg:cargo/rusqlite@0.32.1",
         "pkg:cargo/serde@1.0.228",
         "pkg:cargo/serde_json@1.0.151",
         "pkg:cargo/thiserror@2.0.20",
+        "pkg:cargo/timsrust@0.4.2",
         "pkg:cargo/tracing-subscriber@0.3.23",
         "pkg:cargo/tracing@0.1.44"
       ]
@@ -4639,6 +4956,17 @@
       ]
     },
     {
+      "ref": "pkg:cargo/rusqlite@0.32.1",
+      "dependsOn": [
+        "pkg:cargo/bitflags@2.13.0",
+        "pkg:cargo/fallible-iterator@0.3.0",
+        "pkg:cargo/fallible-streaming-iterator@0.1.9",
+        "pkg:cargo/hashlink@0.9.1",
+        "pkg:cargo/libsqlite3-sys@0.30.1",
+        "pkg:cargo/smallvec@1.15.2"
+      ]
+    },
+    {
       "ref": "pkg:cargo/rustc_version@0.4.1",
       "dependsOn": [
         "pkg:cargo/semver@1.0.28"
@@ -4734,6 +5062,14 @@
       "dependsOn": []
     },
     {
+      "ref": "pkg:cargo/syn@1.0.109",
+      "dependsOn": [
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/unicode-ident@1.0.24"
+      ]
+    },
+    {
       "ref": "pkg:cargo/syn@2.0.118",
       "dependsOn": [
         "pkg:cargo/proc-macro2@1.0.106",
@@ -4750,11 +5086,25 @@
       ]
     },
     {
+      "ref": "pkg:cargo/thiserror-impl@1.0.69",
+      "dependsOn": [
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/syn@2.0.118"
+      ]
+    },
+    {
       "ref": "pkg:cargo/thiserror-impl@2.0.20",
       "dependsOn": [
         "pkg:cargo/proc-macro2@1.0.106",
         "pkg:cargo/quote@1.0.46",
         "pkg:cargo/syn@3.0.5"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/thiserror@1.0.69",
+      "dependsOn": [
+        "pkg:cargo/thiserror-impl@1.0.69"
       ]
     },
     {
@@ -4767,6 +5117,18 @@
       "ref": "pkg:cargo/thread_local@1.1.9",
       "dependsOn": [
         "pkg:cargo/cfg-if@1.0.4"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/timsrust@0.4.2",
+      "dependsOn": [
+        "pkg:cargo/bytemuck@1.25.0",
+        "pkg:cargo/linreg@0.2.0",
+        "pkg:cargo/memmap2@0.9.11",
+        "pkg:cargo/rayon@1.12.0",
+        "pkg:cargo/rusqlite@0.32.1",
+        "pkg:cargo/thiserror@1.0.69",
+        "pkg:cargo/zstd@0.13.3"
       ]
     },
     {
@@ -4847,6 +5209,10 @@
     },
     {
       "ref": "pkg:cargo/valuable@0.1.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/vcpkg@0.2.15",
       "dependsOn": []
     },
     {

@@ -1,7 +1,11 @@
-//! Stage 0 `mumdia convert`: read an mzML run into the normalized spectra
-//! artifact set (docs/04_convert.md). MVP is mzML-only and 3D, so ion-mobility
-//! columns are absent. Profile spectra are centroided (simple local-maxima)
-//! so downstream matching sees discrete peaks.
+//! Stage 0 `mumdia convert`: read an mzML run, or a timsTOF `.d` natively (`tdf`),
+//! into the normalized spectra artifact set (docs/04_convert.md). mzML input is 3D:
+//! the ion-mobility columns are null or absent. Profile spectra are centroided (simple
+//! local-maxima) so downstream matching sees discrete peaks.
+
+mod tdf;
+pub(crate) use tdf::RawTdf;
+pub use tdf::TdfParams;
 
 use std::io::SeekFrom;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -123,6 +127,8 @@ pub struct ConvertParams<'a> {
     pub top_peaks_ms2: usize,
     pub top_peaks_ms1: usize,
     pub config_hash: &'a str,
+    /// Native timsTOF reading (`convert.tdf_*`); unused for mzML input.
+    pub tdf: TdfParams,
 }
 
 /// Result paths for chaining.
@@ -162,16 +168,30 @@ struct Ms1Chunk {
     rt: Vec<f64>,
     mz: Vec<Vec<f32>>,
     inten: Vec<Vec<f32>>,
+    im: Vec<Vec<f32>>,
+    im_width: Vec<Vec<f32>>,
 }
 
 impl Ms1Chunk {
-    fn cols(&mut self) -> Vec<Col> {
-        vec![
+    /// `has_im` and `has_width` are fixed per run, so every row group has the same
+    /// columns.
+    fn cols(&mut self, has_im: bool, has_width: bool) -> Vec<Col> {
+        let mut c = vec![
             Col::U32("scan_index".into(), std::mem::take(&mut self.idx)),
             Col::F64("rt_seconds".into(), std::mem::take(&mut self.rt)),
             Col::LargeListF32("mz".into(), std::mem::take(&mut self.mz)),
             Col::LargeListF32("intensity".into(), std::mem::take(&mut self.inten)),
-        ]
+        ];
+        if has_im {
+            c.push(Col::LargeListF32("im".into(), std::mem::take(&mut self.im)));
+        }
+        if has_width {
+            c.push(Col::LargeListF32(
+                "im_width".into(),
+                std::mem::take(&mut self.im_width),
+            ));
+        }
+        c
     }
 }
 
@@ -187,13 +207,17 @@ struct Ms2Chunk {
     wu: Vec<f64>,
     pmz: Vec<Option<f64>>,
     pz: Vec<Option<i32>>,
+    im_lo: Vec<Option<f32>>,
+    im_hi: Vec<Option<f32>>,
     mz: Vec<Vec<f32>>,
     inten: Vec<Vec<f32>>,
+    im: Vec<Vec<f32>>,
+    im_width: Vec<Vec<f32>>,
 }
 
 impl Ms2Chunk {
-    fn cols(&mut self) -> Vec<Col> {
-        vec![
+    fn cols(&mut self, has_im: bool, has_width: bool) -> Vec<Col> {
+        let mut c = vec![
             Col::U32("scan_index".into(), std::mem::take(&mut self.idx)),
             Col::Str("id".into(), std::mem::take(&mut self.id)),
             Col::F64("rt_seconds".into(), std::mem::take(&mut self.rt)),
@@ -203,9 +227,21 @@ impl Ms2Chunk {
             Col::F64("window_upper".into(), std::mem::take(&mut self.wu)),
             Col::OptF64("precursor_mz".into(), std::mem::take(&mut self.pmz)),
             Col::OptI32("precursor_charge".into(), std::mem::take(&mut self.pz)),
+            Col::OptF32("window_im_lower".into(), std::mem::take(&mut self.im_lo)),
+            Col::OptF32("window_im_upper".into(), std::mem::take(&mut self.im_hi)),
             Col::LargeListF32("mz".into(), std::mem::take(&mut self.mz)),
             Col::LargeListF32("intensity".into(), std::mem::take(&mut self.inten)),
-        ]
+        ];
+        if has_im {
+            c.push(Col::LargeListF32("im".into(), std::mem::take(&mut self.im)));
+        }
+        if has_width {
+            c.push(Col::LargeListF32(
+                "im_width".into(),
+                std::mem::take(&mut self.im_width),
+            ));
+        }
+        c
     }
 }
 
@@ -255,6 +291,10 @@ enum Decoded {
         rt_s: f64,
         mz: Vec<f32>,
         inten: Vec<f32>,
+        /// Per-peak 1/K0; `None` for a 3D source.
+        im: Option<Vec<f32>>,
+        /// Per-peak mobility width (`convert.tdf_im_width`); `None` otherwise.
+        im_width: Option<Vec<f32>>,
         nonfinite_peaks: usize,
     },
     Ms2(Box<Ms2Row>),
@@ -274,6 +314,12 @@ struct Ms2Row {
     wu: f64,
     pmz: Option<f64>,
     pz: Option<i32>,
+    /// Per-peak 1/K0 and the window's 1/K0 bounds; `None` for a 3D source.
+    im: Option<Vec<f32>>,
+    /// Per-peak mobility width (`convert.tdf_im_width`); `None` otherwise.
+    im_width: Option<Vec<f32>>,
+    im_lo: Option<f32>,
+    im_hi: Option<f32>,
 }
 
 fn decode_one<S: SpectrumLike>(spec: &S, top_ms1: usize, top_ms2: usize) -> Decoded {
@@ -291,6 +337,8 @@ fn decode_one<S: SpectrumLike>(spec: &S, top_ms1: usize, top_ms2: usize) -> Deco
                 rt_s,
                 mz,
                 inten,
+                im: None,
+                im_width: None,
                 nonfinite_peaks,
             }
         }
@@ -320,10 +368,24 @@ fn decode_one<S: SpectrumLike>(spec: &S, top_ms1: usize, top_ms2: usize) -> Deco
                 wu,
                 pmz,
                 pz,
+                im: None,
+                im_width: None,
+                im_lo: None,
+                im_hi: None,
             }))
         }
         _ => Decoded::Other,
     }
+}
+
+/// One distinct isolation window, as written to `isolation_windows.parquet`.
+struct IsoWindow {
+    id: u32,
+    target: f64,
+    lower: f64,
+    upper: f64,
+    im_lower: Option<f32>,
+    im_upper: Option<f32>,
 }
 
 /// The order-dependent half of the conversion: the accumulators, the parquet
@@ -333,10 +395,15 @@ struct Fold {
     ms2_w: TableWriter,
     ms1: Ms1Chunk,
     ms2: Ms2Chunk,
-    /// Distinct isolation windows (id, target, lower, upper); ids by first
-    /// appearance in scan order.
-    uniq: Vec<(u64, f64, f64, f64)>,
-    seen: std::collections::HashMap<(u64, u64), u32>,
+    /// Whether the source carries ion mobility; fixes the column set of every chunk.
+    has_im: bool,
+    /// Whether the source carries per-peak mobility widths (spectra v3 `im_width`).
+    has_width: bool,
+    /// Distinct isolation windows (id, target, lower, upper, im_lower, im_upper); ids by
+    /// first appearance in scan order.
+    uniq: Vec<IsoWindow>,
+    /// Keyed on (m/z, 1/K0) bounds: diaPASEF slots can share an m/z range.
+    seen: std::collections::HashMap<(u64, u64, Option<u32>, Option<u32>), u32>,
     /// MS2 -> preceding MS1 scan map (two ints per MS2 scan; kept whole).
     map_ms2: Vec<u32>,
     map_ms1: Vec<i32>,
@@ -347,8 +414,10 @@ struct Fold {
 }
 
 impl Fold {
-    fn new(ms1_path: &str, ms2_path: &str) -> Self {
+    fn new(ms1_path: &str, ms2_path: &str, has_im: bool, has_width: bool) -> Self {
         Self {
+            has_im,
+            has_width,
             // Hashed as they are written, so the reports need no read-back of the spectra
             // (docs/03_io_layer.md, "Hash on write").
             ms1_w: TableWriter::new(ms1_path)
@@ -382,6 +451,8 @@ impl Fold {
                 rt_s,
                 mz,
                 inten,
+                im,
+                im_width,
                 nonfinite_peaks,
             } => {
                 self.nonfinite_peaks += nonfinite_peaks;
@@ -389,9 +460,16 @@ impl Fold {
                 self.ms1.rt.push(rt_s);
                 self.ms1.mz.push(mz);
                 self.ms1.inten.push(inten);
+                if self.has_im {
+                    self.ms1.im.push(im.unwrap_or_default());
+                }
+                if self.has_width {
+                    self.ms1.im_width.push(im_width.unwrap_or_default());
+                }
                 self.last_ms1_index = Some(scan_index);
                 if self.ms1.idx.len() >= SPECTRA_CHUNK {
-                    self.ms1_w.write_cols(self.ms1.cols())?;
+                    self.ms1_w
+                        .write_cols(self.ms1.cols(self.has_im, self.has_width))?;
                 }
             }
             Decoded::Ms2(r) => {
@@ -406,17 +484,31 @@ impl Fold {
                     wu,
                     pmz,
                     pz,
+                    im,
+                    im_width,
+                    im_lo,
+                    im_hi,
                 } = *r;
                 self.nonfinite_peaks += nonfinite_peaks;
                 let uniq = &mut self.uniq;
-                let win_id = *self
-                    .seen
-                    .entry((wl.to_bits(), wu.to_bits()))
-                    .or_insert_with(|| {
-                        let id = uniq.len() as u32;
-                        uniq.push((id as u64, wt, wl, wu));
-                        id
+                let key = (
+                    wl.to_bits(),
+                    wu.to_bits(),
+                    im_lo.map(f32::to_bits),
+                    im_hi.map(f32::to_bits),
+                );
+                let win_id = *self.seen.entry(key).or_insert_with(|| {
+                    let id = uniq.len() as u32;
+                    uniq.push(IsoWindow {
+                        id,
+                        target: wt,
+                        lower: wl,
+                        upper: wu,
+                        im_lower: im_lo,
+                        im_upper: im_hi,
                     });
+                    id
+                });
                 self.ms2.idx.push(scan_index);
                 self.ms2.id.push(id);
                 self.ms2.rt.push(rt_s);
@@ -426,13 +518,22 @@ impl Fold {
                 self.ms2.wu.push(wu);
                 self.ms2.pmz.push(pmz);
                 self.ms2.pz.push(pz);
+                self.ms2.im_lo.push(im_lo);
+                self.ms2.im_hi.push(im_hi);
                 self.ms2.mz.push(mz);
                 self.ms2.inten.push(inten);
+                if self.has_im {
+                    self.ms2.im.push(im.unwrap_or_default());
+                }
+                if self.has_width {
+                    self.ms2.im_width.push(im_width.unwrap_or_default());
+                }
                 self.map_ms2.push(scan_index);
                 self.map_ms1
                     .push(self.last_ms1_index.map(|x| x as i32).unwrap_or(-1));
                 if self.ms2.idx.len() >= SPECTRA_CHUNK {
-                    self.ms2_w.write_cols(self.ms2.cols())?;
+                    self.ms2_w
+                        .write_cols(self.ms2.cols(self.has_im, self.has_width))?;
                 }
             }
             Decoded::Other => {}
@@ -772,9 +873,13 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
 /// `force_threads` exists so a test can run the same input down both decode paths
 /// and diff the artifacts, without an environment variable that every other test
 /// in the process would see.
-fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOutputs> {
-    let t0 = Instant::now();
-    std::fs::create_dir_all(p.out_dir).ok();
+/// The mzML decode: parallel from the file's offset index when that is safe,
+/// sequential otherwise. Returns (spectra read, spectra the header declares).
+fn drive_mzml(
+    p: &ConvertParams,
+    force_threads: Option<usize>,
+    fold: &mut Fold,
+) -> Result<(usize, usize)> {
     info!(mzml = p.mzml, "convert: opening mzML");
     let reader = mzdata::MZReader::open_path(p.mzml).with_context(|| format!("open {}", p.mzml))?;
     // The number of spectra the file SAYS it has, read from its own header.
@@ -790,11 +895,6 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     // guard is for makes it read 0. `spectrumList count` is in the header, a few hundred
     // KiB in at most, so it survives any truncation long enough to be worth checking.
     let declared = declared_spectrum_count(p.mzml).unwrap_or(0);
-
-    let ms1_path = format!("{}/spectra_ms1.parquet", p.out_dir);
-    let ms2_path = format!("{}/spectra_ms2.parquet", p.out_dir);
-    let iw_path = format!("{}/isolation_windows.parquet", p.out_dir);
-    let map_path = format!("{}/ms2_to_ms1.parquet", p.out_dir);
 
     // Spectra stream to parquet in SPECTRA_CHUNK-scan row groups as they are decoded, so
     // the run is never resident as a whole: the previous single `write_table` per MS level
@@ -817,7 +917,6 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     // not a reason to refuse a run, and a spectrum with no retention time cannot be placed
     // in a chromatogram. The "no MS2 spectra" bail below is the backstop for a file whose
     // retention times are ALL unusable.
-    let mut fold = Fold::new(&ms1_path, &ms2_path);
 
     // Decode on several threads when the file's own offset index makes it safe.
     //
@@ -846,7 +945,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         None
     };
     // And the index has to survive a two-spectrum probe before any row is produced.
-    let offsets = offsets.filter(|o| offsets_are_trustworthy(p.mzml, o, &p));
+    let offsets = offsets.filter(|o| offsets_are_trustworthy(p.mzml, o, p));
 
     note_decode_path(offsets.is_some());
     let read = match offsets {
@@ -862,12 +961,40 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
                 "convert: decoding the mzML in parallel from its offset index"
             );
             drop(reader);
-            drive_parallel(p.mzml, &offsets, n_total, threads, &mut fold, &p)?
+            drive_parallel(p.mzml, &offsets, n_total, threads, fold, p)?
         }
         None => {
             debug!(threads, "convert: decoding the mzML sequentially");
-            drive_sequential(reader, &mut fold, &p)?
+            drive_sequential(reader, fold, p)?
         }
+    };
+    Ok((read, declared))
+}
+
+fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOutputs> {
+    let t0 = Instant::now();
+    std::fs::create_dir_all(p.out_dir).ok();
+    let ms1_path = format!("{}/spectra_ms1.parquet", p.out_dir);
+    let ms2_path = format!("{}/spectra_ms2.parquet", p.out_dir);
+    let iw_path = format!("{}/isolation_windows.parquet", p.out_dir);
+    let map_path = format!("{}/ms2_to_ms1.parquet", p.out_dir);
+    let is_tdf = crate::raw::is_tims_tdf(p.mzml);
+    let mut fold = Fold::new(&ms1_path, &ms2_path, is_tdf, is_tdf && p.tdf.im_width);
+    // `declared` is the spectrum count the source promises, for the truncation check;
+    // 0 skips it (a TDF's frame table is read whole by the reader, not streamed).
+    let (read, declared) = if is_tdf {
+        info!(path = p.mzml, "convert: reading timsTOF .d natively");
+        let read = tdf::drive(
+            p.mzml,
+            p.max_spectra,
+            &p.tdf,
+            p.top_peaks_ms1,
+            p.top_peaks_ms2,
+            |i, d| fold.absorb(i, d),
+        )?;
+        (read, 0)
+    } else {
+        drive_mzml(&p, force_threads, &mut fold)?
     };
 
     // Final chunks (possibly empty: they fix the schema for a level with no scans). The
@@ -885,10 +1012,11 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         nonfinite_peaks,
         nonfinite_rt,
         first_bad_rt,
+        has_width,
         ..
     } = fold;
-    ms1_w.write_cols(ms1.cols())?;
-    ms2_w.write_cols(ms2.cols())?;
+    ms1_w.write_cols(ms1.cols(is_tdf, has_width))?;
+    ms2_w.write_cols(ms2.cols(is_tdf, has_width))?;
 
     // A short read means the file ended before the index said it would. `--max-spectra`
     // truncates deliberately, so it is excluded.
@@ -953,13 +1081,12 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     let iw_written = write_table_hashed(
         &iw_path,
         vec![
-            Col::U32(
-                "window_id".into(),
-                uniq.iter().map(|w| w.0 as u32).collect(),
-            ),
-            Col::F64("target".into(), uniq.iter().map(|w| w.1).collect()),
-            Col::F64("lower".into(), uniq.iter().map(|w| w.2).collect()),
-            Col::F64("upper".into(), uniq.iter().map(|w| w.3).collect()),
+            Col::U32("window_id".into(), uniq.iter().map(|w| w.id).collect()),
+            Col::F64("target".into(), uniq.iter().map(|w| w.target).collect()),
+            Col::F64("lower".into(), uniq.iter().map(|w| w.lower).collect()),
+            Col::F64("upper".into(), uniq.iter().map(|w| w.upper).collect()),
+            Col::OptF32("im_lower".into(), uniq.iter().map(|w| w.im_lower).collect()),
+            Col::OptF32("im_upper".into(), uniq.iter().map(|w| w.im_upper).collect()),
         ],
     )?;
 
@@ -987,6 +1114,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
             "top_peaks_ms2": p.top_peaks_ms2,
             "top_peaks_ms1": p.top_peaks_ms1,
             "config_hash": p.config_hash,
+            "reader": if is_tdf { "timsrust" } else { "mzml" },
         }),
     )?;
 
@@ -1014,6 +1142,24 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
             ms2_to_ms1: map_hash,
         },
     })
+}
+/// Peaks per MS2 spectrum, and the MS1 spectrum count, of a timsTOF `.d` after native
+/// centroiding: what `convert` would write uncapped (`mumdia peak-census`).
+pub fn tdf_peak_counts(
+    path: &str,
+    max_frames: usize,
+    p: &TdfParams,
+) -> Result<(Vec<usize>, usize)> {
+    let (mut ms2, mut ms1) = (Vec::new(), 0usize);
+    tdf::drive(path, max_frames, p, 0, 0, |_, d| {
+        match d {
+            Decoded::Ms1 { .. } => ms1 += 1,
+            Decoded::Ms2(r) => ms2.push(r.mz.len()),
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok((ms2, ms1))
 }
 
 /// Write one report per artifact and return the content hashes they record, in `items`
@@ -1046,6 +1192,58 @@ fn write_reports(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// diaPASEF slots with one m/z range but different 1/K0 ranges are distinct windows,
+    /// and per-peak mobility plus the window bounds survive the v2 artifact round trip.
+    #[test]
+    fn mobility_slots_are_separate_windows_and_round_trip_through_the_artifact() {
+        let d = std::env::temp_dir().join(format!("mumdia_conv_im_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (m1, m2) = (d.join("ms1.parquet"), d.join("ms2.parquet"));
+        let (m1, m2) = (m1.to_str().unwrap(), m2.to_str().unwrap());
+        let mut fold = Fold::new(m1, m2, true, false);
+        for (k, (lo, hi)) in [(0.6f32, 0.8f32), (0.8, 1.0)].into_iter().enumerate() {
+            let row = Ms2Row {
+                rt_s: 10.0,
+                id: format!("frame=2 slot={k}"),
+                mz: vec![300.0, 400.0],
+                inten: vec![1.0, 2.0],
+                nonfinite_peaks: 0,
+                wt: 512.5,
+                wl: 500.0,
+                wu: 525.0,
+                pmz: Some(512.5),
+                pz: None,
+                im: Some(vec![lo, hi]),
+                im_width: None,
+                im_lo: Some(lo),
+                im_hi: Some(hi),
+            };
+            fold.absorb(k as u32, Decoded::Ms2(Box::new(row))).unwrap();
+        }
+        assert_eq!(
+            fold.uniq.len(),
+            2,
+            "one m/z range at two mobilities is two windows"
+        );
+        let Fold {
+            mut ms1_w,
+            mut ms2_w,
+            mut ms1,
+            mut ms2,
+            ..
+        } = fold;
+        ms1_w.write_cols(ms1.cols(true, false)).unwrap();
+        ms2_w.write_cols(ms2.cols(true, false)).unwrap();
+        ms1_w.close().unwrap();
+        ms2_w.close().unwrap();
+        let scans = crate::spectra::load_ms2(m2).unwrap();
+        assert_eq!(scans.len(), 2);
+        assert_eq!(scans[1].im, vec![0.8, 1.0]);
+        assert_eq!(scans[1].window.im_lower, Some(0.8));
+        assert_eq!(scans[1].window.im_upper, Some(1.0));
+        assert_ne!(scans[0].window.key(), scans[1].window.key());
+    }
     use std::path::PathBuf;
 
     /// Base64, written out rather than pulled in as a dependency: the tests need
@@ -1352,6 +1550,7 @@ mod tests {
                     top_peaks_ms2: 0,
                     top_peaks_ms1: 0,
                     config_hash: "test",
+                    tdf: TdfParams::default(),
                 },
                 Some(4),
             )
@@ -1403,6 +1602,7 @@ mod tests {
                     top_peaks_ms2: 0,
                     top_peaks_ms1: 0,
                     config_hash: "bench",
+                    tdf: TdfParams::default(),
                 },
                 Some(threads),
             )
@@ -1457,6 +1657,7 @@ mod tests {
             top_peaks_ms2: 0,
             top_peaks_ms1: 0,
             config_hash: "test",
+            tdf: TdfParams::default(),
         })
         .expect("a zlib-compressed mzML must convert");
 
@@ -1499,6 +1700,7 @@ mod tests {
                     top_peaks_ms2: 0,
                     top_peaks_ms1: 0,
                     config_hash: "test",
+                    tdf: TdfParams::default(),
                 },
                 Some(threads),
             )
@@ -1559,6 +1761,7 @@ mod tests {
                     top_peaks_ms2: 0,
                     top_peaks_ms1: 0,
                     config_hash: "test",
+                    tdf: TdfParams::default(),
                 },
                 Some(threads),
             )
@@ -1601,6 +1804,7 @@ mod tests {
                 top_peaks_ms2: 0,
                 top_peaks_ms1: 0,
                 config_hash: "test",
+                tdf: TdfParams::default(),
             },
             Some(4),
         )
@@ -1636,6 +1840,7 @@ mod tests {
             top_peaks_ms2: 0,
             top_peaks_ms1: 0,
             config_hash: "test",
+            tdf: TdfParams::default(),
         })
         .expect("a whole file with one unusable retention time must convert");
 
@@ -1667,6 +1872,7 @@ mod tests {
             top_peaks_ms2: 0,
             top_peaks_ms1: 0,
             config_hash: "test",
+            tdf: TdfParams::default(),
         })
         .unwrap();
         for (path, hash) in [
@@ -1703,6 +1909,7 @@ mod tests {
             top_peaks_ms2: 0,
             top_peaks_ms1: 0,
             config_hash: "test",
+            tdf: TdfParams::default(),
         })
         .expect("a mid-file bad retention time was never a truncation");
         assert_eq!(rows_in_report(&out.ms1), 2);
@@ -1729,6 +1936,7 @@ mod tests {
             top_peaks_ms2: 0,
             top_peaks_ms1: 0,
             config_hash: "test",
+            tdf: TdfParams::default(),
         });
         let Err(err) = res else {
             panic!("a file shorter than its own header must be refused");
@@ -1758,6 +1966,7 @@ mod tests {
             top_peaks_ms2: 0,
             top_peaks_ms1: 0,
             config_hash: "test",
+            tdf: TdfParams::default(),
         })
         .expect("--max-spectra is a deliberate short read");
         assert_eq!(rows_in_report(&out.ms1), 1);

@@ -6,11 +6,17 @@
 //! `mzdata` can read several vendor formats directly, and that was rejected on
 //! build grounds rather than capability. Those readers need the vendors' own
 //! libraries and, for Thermo and SCIEX, a .NET runtime, while the workspace pins
-//! `mzdata` to `default-features = false, features = ["mzml", "miniz_oxide"]`
-//! precisely so that building MuMDIA needs no C, C++ or .NET toolchain
-//! (`CLAUDE.md`, "Build gotchas: do not fix these back"). Linking a vendor reader
-//! imposes that on every build on every platform, including the ones that never see
-//! a vendor file.
+//! `mzdata` to `default-features = false, features = ["mzml", "miniz_oxide"]` so
+//! that building MuMDIA needs no vendor SDK, C++ or .NET toolchain. Linking a vendor
+//! reader imposes that on every build on every platform, including the ones that
+//! never see a vendor file.
+//!
+//! The exception is timsTOF (`.d` holding `analysis.tdf`), read natively by
+//! `stages::convert` through timsrust (`convert.bruker_reader = native`, the
+//! default): the format is an SQLite index plus zstd frames, so no vendor library is
+//! involved, and msconvert would collapse the ion mobility the acquisition exists for.
+//! Its bundled SQLite is C, as is the zstd-sys that parquet already compiled; a C
+//! compiler was already required.
 //!
 //! # Two converters, and why
 //!
@@ -31,16 +37,16 @@
 //! converted by this code. See `docs/04_convert.md`, "Vendor formats", which says
 //! the same thing in the place a user looks.
 //!
-//! Bruker carries a further caveat that is not about this module: MuMDIA's pipeline
-//! is 3D and discards ion mobility, so diaPASEF loses the separation that makes it
-//! selective. `warn_about_ion_mobility` says so at the point of use.
+//! A Bruker file routed through msconvert (`convert.bruker_reader = msconvert`, or
+//! non-TIMS `analysis.baf`) loses ion mobility; `warn_about_ion_mobility` says so at
+//! the point of use.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
-use mumdia_core::config::ConvertConfig;
+use mumdia_core::config::{BrukerReader, ConvertConfig};
 use tracing::{info, warn};
 
 /// Executable names ThermoRawFileParser ships under.
@@ -140,6 +146,13 @@ pub fn detect(path: &str) -> Vendor {
         "wiff" | "wiff2" => Vendor::Sciex,
         _ => Vendor::MzMl,
     }
+}
+
+/// Is this a timsTOF `.d` directory (`analysis.tdf` plus `analysis.tdf_bin`), which
+/// `convert` reads natively?
+pub fn is_tims_tdf(path: &str) -> bool {
+    let p = Path::new(path);
+    p.join("analysis.tdf").is_file() && p.join("analysis.tdf_bin").is_file()
 }
 
 /// Is this path a Thermo `.raw` file?
@@ -396,7 +409,8 @@ fn warn_about_ion_mobility(vendor: Vendor) {
         return;
     }
     warn!(
-        "convert: MuMDIA's pipeline is 3D and discards ion mobility. For diaPASEF \
+        "convert: this Bruker file goes through msconvert, which discards ion \
+         mobility (convert.bruker_reader = \"native\" keeps it for timsTOF .d). For diaPASEF \
          this removes the mobility separation that makes the acquisition selective, \
          so expect substantially more interference and fewer identifications than a \
          4D engine on the same file. The q values stay calibrated (targets and \
@@ -809,6 +823,9 @@ pub fn ensure_mzml(
 ) -> Result<String> {
     let vendor = detect(input);
     if !vendor.needs_conversion() {
+        return Ok(input.to_string());
+    }
+    if cfg.bruker_reader == BrukerReader::Native && is_tims_tdf(input) {
         return Ok(input.to_string());
     }
     let src = Path::new(input);
@@ -1349,7 +1366,7 @@ mod tests {
             msconvert: "/definitely/not/here".to_string(),
             msconvert_args: Vec::new(),
             reuse_converted: true,
-            parallel_conversions: 4,
+            ..Default::default()
         };
         assert_eq!(ensure_mzml("run.mzML", &cfg, None).unwrap(), "run.mzML");
     }
@@ -1554,7 +1571,7 @@ mod tests {
             msconvert: "auto".to_string(),
             msconvert_args: Vec::new(),
             reuse_converted: false,
-            parallel_conversions: 4,
+            ..Default::default()
         };
         let err = ensure_mzml(raw.to_str().unwrap(), &cfg, Some(&d)).unwrap_err();
         let msg = err.to_string();
@@ -1644,6 +1661,7 @@ mod tests {
             msconvert_args: Vec::new(),
             reuse_converted: true,
             parallel_conversions: 3,
+            ..ConvertConfig::default()
         };
         let serial: Vec<String> = inputs
             .iter()
