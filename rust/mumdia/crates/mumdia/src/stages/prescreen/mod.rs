@@ -137,6 +137,53 @@ impl Histogram {
     }
 }
 
+/// A window's peak-occupancy bitmap: one bit per 0.01 Da bin (`bin_of`) per spectrum, set when the
+/// spectrum has any peak there. A peak within `tol` of `x` lies in the bins `bin_of(x - tol)` to
+/// `bin_of(x + tol)`; the range is widened by one bin on each side so that rounding can never drop
+/// a real match. A fragment whose range is empty in a spectrum cannot match it, so the binary
+/// search is skipped: scores are identical, and most searches in dense data are skipped.
+struct Occupancy {
+    words: usize,
+    bits: Vec<u64>,
+}
+
+impl Occupancy {
+    fn build(sp: &Spectra, g: &WindowGroup) -> Occupancy {
+        let words = sp.nbin / 64 + 2;
+        let mut bits = vec![0u64; g.count * words];
+        bits.par_chunks_mut(words).enumerate().for_each(|(t, row)| {
+            for &m in sp.peaks(g.first + t) {
+                let b = bin_of(m as f64);
+                if b >= 0 && (b as usize) < words * 64 {
+                    row[b as usize / 64] |= 1u64 << (b as usize % 64);
+                }
+            }
+        });
+        Occupancy { words, bits }
+    }
+
+    fn row(&self, t: usize) -> &[u64] {
+        &self.bits[t * self.words..(t + 1) * self.words]
+    }
+}
+
+/// One spectrum's occupancy bits and the fragments' bin ranges.
+type OccupancyRow<'a> = (&'a [u64], &'a [(i64, i64)]);
+
+/// Any bit set in `row` over the inclusive bin range.
+#[inline]
+fn any_bit(row: &[u64], lo: i64, hi: i64) -> bool {
+    let lo = lo.max(0) as usize;
+    let hi = (hi.max(0) as usize).min(row.len() * 64 - 1);
+    (lo..=hi).any(|b| row[b / 64] >> (b % 64) & 1 == 1)
+}
+
+/// The widened bin range a fragment's matches can lie in.
+#[inline]
+fn fragment_bins(x: f64, tol: f64) -> (i64, i64) {
+    (bin_of(x - tol) - 1, bin_of(x + tol) + 1)
+}
+
 /// Index of the peak nearest `x` within `tol` in ascending `mz`, the first on a tie; the
 /// prototype's `nearest_index`. Comparisons are in f64 on the widened f32 values.
 #[inline]
@@ -419,6 +466,7 @@ fn score_in_group(
     masses: &[f64],
     sp: &Spectra,
     g: &WindowGroup,
+    occ: Option<&Occupancy>,
     neglnp: &[f64],
     cfg: &PrescreenConfig,
     frag: &mut Vec<f64>,
@@ -451,6 +499,10 @@ fn score_in_group(
     };
     for &rev in orientations {
         fragment_mz(masses, rev, c.nz, frag);
+        let fbins: Vec<(i64, i64)> = frag
+            .iter()
+            .map(|&x| fragment_bins(x, cfg.frag_tol_da))
+            .collect();
         let nf = frag.len();
         let ne = b - a;
         if repeat {
@@ -473,6 +525,7 @@ fn score_in_group(
                 cfg,
                 hits,
                 row,
+                occ.map(|o| (o.row(s - g.first), fbins.as_slice())),
             );
             if cfg.crowding_exponent > 0.0 {
                 let ratio = ((hi - lo) as f64 / mean_peaks.max(1e-12)).clamp(0.25, 4.0);
@@ -520,11 +573,20 @@ fn spectrum_score(
     cfg: &PrescreenConfig,
     hits: &mut Vec<usize>,
     owners: Option<&mut [f64]>,
+    occupancy: Option<OccupancyRow>,
 ) -> f64 {
     hits.clear();
+    // Skip the search for a fragment with no peak anywhere in its bin range (exact).
+    let present = |f: usize| match occupancy {
+        Some((row, bins)) => any_bit(row, bins[f].0, bins[f].1),
+        None => true,
+    };
     if let Some(row) = owners {
         // The first fragment matching a peak owns it; its weight is the peak's rarity weight.
         for (f, &x) in frag.iter().enumerate() {
+            if !present(f) {
+                continue;
+            }
             if let Some(p) = nearest_index(mz, x, cfg.frag_tol_da) {
                 if positive[p] && !hits.contains(&p) {
                     hits.push(p);
@@ -539,7 +601,10 @@ fn spectrum_score(
         }
         hits.clear();
     }
-    for &x in frag {
+    for (f, &x) in frag.iter().enumerate() {
+        if !present(f) {
+            continue;
+        }
         if let Some(p) = nearest_index(mz, x, cfg.frag_tol_da) {
             if positive[p] {
                 hits.push(p);
@@ -606,6 +671,7 @@ fn score_all(
         let hist = Histogram::build((g.first..g.first + g.count).map(|s| sp.peaks(s)), sp.nbin);
         let base = sp.offsets[g.first];
         let end = sp.offsets[g.first + g.count];
+        let occ = Occupancy::build(sp, g);
         let neglnp: Vec<f64> = sp.mz[base..end]
             .par_iter()
             .map(|&m| -hist.probability(m as f64).ln())
@@ -617,7 +683,7 @@ fn score_all(
                 |(frag, hits, trace), &i| {
                     let c = cands[i as usize].as_ref().expect("member is parseable");
                     let m = masses_of(i as usize);
-                    score_in_group(c, &m, sp, g, &neglnp, cfg, frag, hits, trace)
+                    score_in_group(c, &m, sp, g, Some(&occ), &neglnp, cfg, frag, hits, trace)
                 },
             )
             .collect();
@@ -1511,6 +1577,7 @@ mod tests {
             &m,
             sp,
             g,
+            None,
             &neglnp,
             c,
             &mut Vec::new(),
@@ -1675,7 +1742,17 @@ mod tests {
         let pos = vec![true, true];
         let neg = vec![2.0, 3.0];
         let c = cfg();
-        let one = spectrum_score(&[600.001], &mz, &pos, &neg, 1.0, &c, &mut Vec::new(), None);
+        let one = spectrum_score(
+            &[600.001],
+            &mz,
+            &pos,
+            &neg,
+            1.0,
+            &c,
+            &mut Vec::new(),
+            None,
+            None,
+        );
         let twice = spectrum_score(
             &[600.001, 599.998, 600.0],
             &mz,
@@ -1684,6 +1761,7 @@ mod tests {
             1.0,
             &c,
             &mut Vec::new(),
+            None,
             None,
         );
         assert_eq!(one, 3.0);
@@ -1696,6 +1774,7 @@ mod tests {
             2.0,
             &c,
             &mut Vec::new(),
+            None,
             None,
         );
         assert_eq!(both, 3.0 / 2.0 + 2.0 / 2.0);
@@ -1715,6 +1794,7 @@ mod tests {
             2.0,
             &c,
             &mut Vec::new(),
+            None,
             None,
         );
         assert_eq!(s, 2.0 / 2.0 * 0.5 + 3.0 / 2.0);
@@ -1736,6 +1816,7 @@ mod tests {
             &c,
             &mut Vec::new(),
             None,
+            None,
         );
         assert_eq!(s, 0.0);
         let s = spectrum_score(
@@ -1746,6 +1827,7 @@ mod tests {
             1.0,
             &c,
             &mut Vec::new(),
+            None,
             None,
         );
         assert_eq!(s, 1.0);
@@ -2409,6 +2491,7 @@ mod tests {
             &m,
             sp,
             g,
+            None,
             &neglnp,
             c,
             &mut Vec::new(),
@@ -2453,5 +2536,83 @@ mod tests {
         );
         c.repeat_bonus = 0.0;
         assert_eq!(both_scores(&twice, "PEPTIDEK", &c).1, 0.0, "off by default");
+    }
+
+    /// The occupancy bitmap only skips searches that cannot match: scores with and without it
+    /// are identical, including peaks placed on the tolerance and bin edges.
+    #[test]
+    fn the_occupancy_bitmap_never_changes_a_score() {
+        let mut st = 0x5EEDu64;
+        let mut next = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (st >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let peps = [
+            "PEPTIDEK",
+            "LGEYGFQNALIVR",
+            "GASPVTLK",
+            "M[Oxidation]CNDEFK",
+        ];
+        for round in 0..20 {
+            let mut spectra = Vec::new();
+            for t in 0..12 {
+                let mut p: Vec<(f32, f32)> = (0..150)
+                    .map(|_| ((150.0 + next() * 1500.0) as f32, 1.0))
+                    .collect();
+                for pf in &peps {
+                    for x in frags(pf, 2, false) {
+                        let r = next();
+                        // On the tolerance edge, on a bin edge, or near the fragment.
+                        let m = if r < 0.2 {
+                            x + 0.005 * if next() < 0.5 { 1.0 } else { -1.0 }
+                        } else if r < 0.4 {
+                            ((x * 100.0).floor() + 0.5) / 100.0
+                        } else if r < 0.6 {
+                            x + (next() - 0.5) * 0.009
+                        } else {
+                            continue;
+                        };
+                        p.push((m as f32, if next() < 0.1 { 0.0 } else { 3.0 }));
+                    }
+                }
+                spectra.push((t as f64 * 5.0, p));
+            }
+            let sp = one_window(spectra);
+            let g = &sp.groups[0];
+            let occ = Occupancy::build(&sp, g);
+            let hist = Histogram::build((0..sp.rt.len()).map(|s| sp.peaks(s)), sp.nbin);
+            let neglnp: Vec<f64> = sp
+                .mz
+                .iter()
+                .map(|&m| -hist.probability(m as f64).ln())
+                .collect();
+            let mut c = cfg();
+            if round % 2 == 1 {
+                c.frag_tol_da = 0.012;
+                c.repeat_bonus = 0.1;
+                c.crowding_exponent = 0.25;
+            }
+            for pf in &peps {
+                let cand = Candidate { nz: 2, rt: None };
+                let m = residue_masses(pf).unwrap();
+                let run = |o: Option<&Occupancy>| {
+                    score_in_group(
+                        &cand,
+                        &m,
+                        &sp,
+                        g,
+                        o,
+                        &neglnp,
+                        &c,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                    )
+                };
+                assert_eq!(run(None), run(Some(&occ)), "{pf} round {round}");
+            }
+        }
     }
 }
