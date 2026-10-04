@@ -309,7 +309,7 @@ pub fn discover(
 ) -> SpectrumTags {
     let mut best: HashMap<u32, f64> = HashMap::new();
     let mut paths = 0u64;
-    let mut put = |key: u32, rms: f64| {
+    let mut keep_min = |key: u32, rms: f64| {
         let e = best.entry(key).or_insert(f64::INFINITY);
         if rms < *e {
             *e = rms;
@@ -334,7 +334,7 @@ pub fn discover(
                                 let cum = [m(la), m(la) + m(lb), m(la) + m(lb) + m(lc)];
                                 let rms = path_rms(mz, &[i, j, k, l], &cum, z);
                                 paths += 1;
-                                put(alpha.key(alpha.canonical(a, b, c), z, false), rms);
+                                keep_min(alpha.key(alpha.canonical(a, b, c), z, false), rms);
                             }
                         }
                         // A gap step and a single step: a three-peak ladder of three residues.
@@ -344,7 +344,7 @@ pub fn discover(
                             let cum = [p.0, p.0 + m(lb)];
                             let rms = path_rms(mz, &[i, j, k], &cum, z);
                             paths += 1;
-                            put(
+                            keep_min(
                                 alpha.key(alpha.canonical(p.1, p.2, lb as u16), z, true),
                                 rms,
                             );
@@ -355,7 +355,7 @@ pub fn discover(
                             let cum = [m(la), m(la) + p.0];
                             let rms = path_rms(mz, &[i, j, k], &cum, z);
                             paths += 1;
-                            put(
+                            keep_min(
                                 alpha.key(alpha.canonical(la as u16, p.1, p.2), z, true),
                                 rms,
                             );
