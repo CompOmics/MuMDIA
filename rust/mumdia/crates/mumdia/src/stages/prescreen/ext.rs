@@ -136,6 +136,7 @@ pub fn run(
     alpha: &Alphabet,
     cfg: &Config,
     ms1: Option<&[masses::Ms1Scan]>,
+    masses_of: &(dyn Fn(usize) -> Vec<f64> + Sync),
 ) -> Extended {
     let p = &cfg.prescreen;
     let n = cands.len();
@@ -258,9 +259,10 @@ pub fn run(
                     else {
                         return [0.0; N_COMPONENTS];
                     };
+                    let cm = masses_of(i);
                     let ct = CandidateTags {
                         states,
-                        masses: &c.masses,
+                        masses: &cm,
                         zmax: p.tags.max_charge.min(c.nz),
                     };
                     let (a, b) = span(c);
@@ -363,7 +365,8 @@ pub fn run(
                             }
                         }
                         PrescreenTraceScore::CoherentFragments => {
-                            let sqrt_l = (c.masses.len() as f64).sqrt();
+                            let cm = masses_of(i);
+                            let sqrt_l = (cm.len() as f64).sqrt();
                             let weight = |m: f64| {
                                 -hist.probability(m).ln()
                                     * if m < p.low_mz_threshold {
@@ -373,7 +376,7 @@ pub fn run(
                                     }
                             };
                             for rev in [false, true] {
-                                fragment_mz(&c.masses, rev, c.nz, frag);
+                                fragment_mz(&cm, rev, c.nz, frag);
                                 for pool in &pools[a..b] {
                                     best = best.max(traces::coherent_fragments(
                                         frag,
@@ -438,8 +441,8 @@ pub fn run(
                         let Some(c) = cands[i as usize].as_ref() else {
                             return 0.0;
                         };
-                        let neutral: f64 =
-                            c.masses.iter().sum::<f64>() + mumdia_core::constants::WATER;
+                        let neutral: f64 = masses_of(i as usize).iter().sum::<f64>()
+                            + mumdia_core::constants::WATER;
                         let (a, b) = span(c);
                         (a..b)
                             .filter_map(|t| by_spectrum.get(&t))

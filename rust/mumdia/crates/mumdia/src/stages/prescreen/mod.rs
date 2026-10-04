@@ -394,17 +394,20 @@ impl Spectra {
     }
 }
 
-/// Candidate inputs shared by every window.
+/// Candidate inputs shared by every window. The residue masses are not stored: they follow
+/// from the peptidoform and are computed when the candidate is scored, which keeps a
+/// 200M-candidate library from holding 200M small heap vectors.
 struct Candidate {
-    masses: Vec<f64>,
     nz: i32,
     /// Inclusive RT bounds, or `None` for the whole gradient.
     rt: Option<(f64, f64)>,
 }
 
 /// Score one candidate against the eligible spectra of one window group.
+#[allow(clippy::too_many_arguments)]
 fn score_in_group(
     c: &Candidate,
+    masses: &[f64],
     sp: &Spectra,
     g: &WindowGroup,
     neglnp: &[f64],
@@ -423,7 +426,7 @@ fn score_in_group(
     if a >= b {
         return 0.0;
     }
-    let sqrt_l = (c.masses.len() as f64).sqrt();
+    let sqrt_l = (masses.len() as f64).sqrt();
     let base = sp.offsets[g.first];
     let mut best = 0.0f64;
     let orientations: &[bool] = if cfg.both_orientations {
@@ -432,7 +435,7 @@ fn score_in_group(
         &[false]
     };
     for &rev in orientations {
-        fragment_mz(&c.masses, rev, c.nz, frag);
+        fragment_mz(masses, rev, c.nz, frag);
         for s in g.first + a..g.first + b {
             let (lo, hi) = (sp.offsets[s], sp.offsets[s + 1]);
             let total = spectrum_score(
@@ -516,6 +519,7 @@ fn score_all(
     cands: &[Option<Candidate>],
     members: &[Vec<u32>],
     cfg: &PrescreenConfig,
+    masses_of: &(dyn Fn(usize) -> Vec<f64> + Sync),
 ) -> Vec<f64> {
     let mut score: Vec<f64> = cands
         .iter()
@@ -538,7 +542,8 @@ fn score_all(
                 || (Vec::new(), Vec::new()),
                 |(frag, hits), &i| {
                     let c = cands[i as usize].as_ref().expect("member is parseable");
-                    score_in_group(c, sp, g, &neglnp, cfg, frag, hits)
+                    let m = masses_of(i as usize);
+                    score_in_group(c, &m, sp, g, &neglnp, cfg, frag, hits)
                 },
             )
             .collect();
@@ -748,8 +753,7 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     let cands: Vec<Option<Candidate>> = (0..n)
         .into_par_iter()
         .map(|i| {
-            let masses = residue_masses(pform(i))?;
-            if masses.len() < 2 {
+            if residue_masses(pform(i))?.len() < 2 {
                 return None;
             }
             let c = cid[i] as usize;
@@ -757,7 +761,6 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
             // An unbounded or missing window is "search the whole gradient" (docs/31 F1).
             let rt = (lo.is_finite() && hi.is_finite()).then_some((lo - slack, hi + slack));
             Some(Candidate {
-                masses,
                 nz: cfg.max_frag_charge.min(charge[i]).max(1),
                 rt,
             })
@@ -787,7 +790,8 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
 
     let t1 = Instant::now();
     let members = group_members(&sp, &cands, &pmz);
-    let base_score = score_all(&sp, &cands, &members, cfg);
+    let masses_of = |i: usize| residue_masses(pform(i)).unwrap_or_default();
+    let base_score = score_all(&sp, &cands, &members, cfg, &masses_of);
     let scoring_ms = t1.elapsed().as_millis() as u64;
     info!(
         candidates = n,
@@ -797,8 +801,8 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
 
     // ---- optional components (nothing runs under the defaults) ----
     let t2 = Instant::now();
-    let pforms: Vec<&str> = (0..n).map(pform).collect();
     let ext_out = if ext::needs_tags(p.config) {
+        let pforms: Vec<&str> = (0..n).map(pform).collect();
         let alpha = tags::Alphabet::from_config(p.config)?;
         let view = ext::tag_view(&pforms, &charge, &alpha, p.config);
         let ms1 = match (
@@ -819,6 +823,7 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
             &alpha,
             p.config,
             ms1.as_deref(),
+            &masses_of,
         ))
     } else {
         None
@@ -1353,11 +1358,20 @@ mod tests {
             .map(|&m| -hist.probability(m as f64).ln())
             .collect();
         let cand = Candidate {
-            masses: residue_masses(pf).unwrap(),
             nz: c.max_frag_charge.min(z).max(1),
             rt,
         };
-        score_in_group(&cand, sp, g, &neglnp, c, &mut Vec::new(), &mut Vec::new())
+        let m = residue_masses(pf).unwrap();
+        score_in_group(
+            &cand,
+            &m,
+            sp,
+            g,
+            &neglnp,
+            c,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
     }
 
     fn planted(pf: &str, nz: i32) -> Vec<(f32, f32)> {
