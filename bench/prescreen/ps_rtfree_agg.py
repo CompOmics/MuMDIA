@@ -93,22 +93,24 @@ for arm in ["OFF", "PRE"]:
                 "sublibrary": (int(sub.group(2)), int(sub.group(1))) if sub else None}
 
 ref = set().union(*[s["accepted"] for s in res["OFF"]["seeds"]])
-# Retention per target from the PRE screen's scores (same rule as the stage).
 inp = pq.read_table(INPUT, columns=[c for c in ["candidate_id", "id", "peptidoform", "charge"]
                                     if c in pq.read_schema(INPUT).names]).to_pandas()
 idc = "candidate_id" if "candidate_id" in inp else "id"
 key = dict(zip(inp[idc].astype(int), zip(inp.peptidoform.str.removeprefix("DECOY_"), inp.charge.astype(int))))
-sc = pq.read_table(f"{ROOT}/PRE/prescreen_survivors.scores.parquet",
-                   columns=["candidate_id", "score", "in_scope", "calibration"]).to_pandas()
-cal = np.sort(sc.score[sc.calibration].to_numpy())
-ref_rows = sc[sc.candidate_id.map(lambda c: key.get(int(c)) in ref)]
 retention = {}
-for q in [0.52, 0.54, 0.75, 0.90]:
-    cut = cal[min(len(cal) - 1, math.ceil((len(cal) - 1) * q))]
-    retention[q] = {"cutoff": float(cut), "removed": float((sc.score <= cut).mean()),
-                    "reference_kept": float((ref_rows.score > cut).mean()) if len(ref_rows) else None}
+scores_path = f"{ROOT}/PRE/prescreen_survivors.scores.parquet"
+if os.path.exists(scores_path):
+    # Retention per target from the PRE screen's scores (same rule as the stage).
+    sc = pq.read_table(f"{ROOT}/PRE/prescreen_survivors.scores.parquet",
+                       columns=["candidate_id", "score", "in_scope", "calibration"]).to_pandas()
+    cal = np.sort(sc.score[sc.calibration].to_numpy())
+    ref_rows = sc[sc.candidate_id.map(lambda c: key.get(int(c)) in ref)]
+    for q in [0.52, 0.54, 0.75, 0.90]:
+        cut = cal[min(len(cal) - 1, math.ceil((len(cal) - 1) * q))]
+        retention[q] = {"cutoff": float(cut), "removed": float((sc.score <= cut).mean()),
+                        "reference_kept": float((ref_rows.score > cut).mean()) if len(ref_rows) else None}
 
-lines = [f"{ROOT}: OFF accepted precursors (seed union) {len(ref)}, matched in the screened table {len(ref_rows)}"]
+lines = [f"{ROOT}: OFF accepted precursors (seed union) {len(ref)}"]
 off_pep = mean_sd([s["peptides"] for s in res["OFF"]["seeds"]])[0]
 for arm, r in res.items():
     pep = mean_sd([s["peptides"] for s in r["seeds"]])
@@ -123,6 +125,12 @@ for arm, r in res.items():
         + (f"; predicted {r['predicted'][0]} of {r['predicted'][1]} peptidoforms" if r["predicted"] else "")
         + (f"; sub-library {r['sublibrary'][0]} of {r['sublibrary'][1]}" if r["sublibrary"] else "")
         + f"\n    stages (min): {top}")
+tp = f"{ROOT}/PRE/tag_prefilter_survivors.parquet"
+if os.path.exists(tp):
+    kept_ids = set(pq.read_table(tp, columns=["candidate_id"]).column(0).to_pylist())
+    kept = {k for c, k in key.items() if c in kept_ids}
+    lines.append(f"  tag prefilter: kept {len(kept_ids)} of {len(key)} ({100 * (1 - len(kept_ids) / len(key)):.2f}% removed), "
+                 f"OFF precursors kept {100 * len(ref & kept) / max(1, len(ref & set(key.values()))):.3f}%")
 for q, v in retention.items():
     lines.append(f"  target {q:.2f}: removed {100 * v['removed']:.2f}%, OFF precursors kept "
                  f"{100 * v['reference_kept']:.2f}%  (cutoff {v['cutoff']:.4f})")

@@ -29,14 +29,43 @@ pub struct Extended {
     pub hypotheses: Vec<(u32, f64, Hypothesis, u8)>,
 }
 
-/// Per candidate: residue states, keys and family, when the tag machinery is needed.
-pub struct TagView {
-    pub states: Vec<Option<Vec<Option<u16>>>>,
-    pub keys: Vec<Vec<u32>>,
-    pub norm_keys: Vec<Vec<u32>>,
+/// The tag view of the candidates. Residue states and tag keys are derived from the
+/// peptidoform when a candidate is examined, not stored: on a 200M-candidate library the stored
+/// per-candidate vectors were most of an 87 GB peak. Families (one backbone, every
+/// modification form) are built only when delayed enumeration or the library-side information
+/// needs them.
+pub struct TagView<'a> {
+    pforms: &'a [&'a str],
+    charge: &'a [i32],
+    alpha: &'a Alphabet,
+    zcap: i32,
+    gapped: bool,
     pub family: Vec<u32>,
     pub families: Vec<Vec<u16>>,
-    pub unsupported: usize,
+}
+
+impl TagView<'_> {
+    pub fn states(&self, i: usize) -> Option<Vec<Option<u16>>> {
+        self.alpha.tokenise(self.pforms[i])
+    }
+
+    fn zmax(&self, i: usize) -> i32 {
+        self.zcap.min(self.charge[i]).max(1)
+    }
+
+    pub fn keys(&self, i: usize) -> Vec<u32> {
+        match self.states(i) {
+            Some(s) => retrieval::candidate_keys(&s, self.zmax(i), self.gapped, self.alpha),
+            None => Vec::new(),
+        }
+    }
+
+    pub fn norm_keys(&self, i: usize) -> Vec<u32> {
+        match self.states(i) {
+            Some(s) => retrieval::backbone_keys(&s, self.zmax(i), self.gapped, self.alpha),
+            None => Vec::new(),
+        }
+    }
 }
 
 pub fn needs_tags(cfg: &Config) -> bool {
@@ -50,60 +79,54 @@ pub fn needs_tags(cfg: &Config) -> bool {
         || p.mass_hypotheses.enabled
 }
 
-pub fn tag_view(pforms: &[&str], charge: &[i32], alpha: &Alphabet, cfg: &Config) -> TagView {
+pub fn tag_view<'a>(
+    pforms: &'a [&'a str],
+    charge: &'a [i32],
+    alpha: &'a Alphabet,
+    cfg: &Config,
+) -> TagView<'a> {
     let p = &cfg.prescreen;
-    let gapped = p.tags.gap_edges;
-    let states: Vec<Option<Vec<Option<u16>>>> =
-        pforms.par_iter().map(|pf| alpha.tokenise(pf)).collect();
-    let zmax = |i: usize| {
-        p.tags
-            .max_charge
-            .min(p.max_frag_charge)
-            .min(charge[i])
-            .max(1)
+    let mut view = TagView {
+        pforms,
+        charge,
+        alpha,
+        zcap: p.tags.max_charge.min(p.max_frag_charge),
+        gapped: p.tags.gap_edges,
+        family: Vec::new(),
+        families: Vec::new(),
     };
-    let keys: Vec<Vec<u32>> = (0..states.len())
-        .into_par_iter()
-        .map(|i| match &states[i] {
-            Some(s) => retrieval::candidate_keys(s, zmax(i), gapped, alpha),
-            None => Vec::new(),
-        })
-        .collect();
-    let norm_keys: Vec<Vec<u32>> = (0..states.len())
-        .into_par_iter()
-        .map(|i| match &states[i] {
-            Some(s) => retrieval::backbone_keys(s, zmax(i), gapped, alpha),
-            None => Vec::new(),
-        })
-        .collect();
-    let mut fam_of: HashMap<Vec<u16>, u32> = HashMap::new();
-    let mut families: Vec<Vec<u16>> = Vec::new();
-    let family = states
-        .iter()
-        .map(|s| {
-            let b: Vec<u16> = s
-                .as_ref()
-                .map(|v| {
-                    v.iter()
-                        .map(|x| x.map(|y| alpha.normal[y as usize]).unwrap_or(u16::MAX))
-                        .collect()
-                })
-                .unwrap_or_default();
-            *fam_of.entry(b.clone()).or_insert_with(|| {
-                families.push(b);
-                (families.len() - 1) as u32
+    let need_families =
+        (p.retrieval == PrescreenRetrieval::Tags && p.delayed_modforms) || p.fasta_bonus > 0.0;
+    if need_families {
+        let backbones: Vec<Vec<u16>> = (0..pforms.len())
+            .into_par_iter()
+            .map(|i| {
+                view.states(i)
+                    .map(|v| {
+                        v.iter()
+                            .map(|x| x.map(|y| alpha.normal[y as usize]).unwrap_or(u16::MAX))
+                            .collect()
+                    })
+                    .unwrap_or_default()
             })
-        })
-        .collect();
-    let unsupported = keys.iter().filter(|k| k.is_empty()).count();
-    TagView {
-        states,
-        keys,
-        norm_keys,
-        family,
-        families,
-        unsupported,
+            .collect();
+        let mut fam_of: HashMap<Vec<u16>, u32> = HashMap::new();
+        let mut families: Vec<Vec<u16>> = Vec::new();
+        view.family = backbones
+            .into_iter()
+            .map(|b| {
+                if let Some(&f) = fam_of.get(&b) {
+                    return f;
+                }
+                families.push(b.clone());
+                let f = (families.len() - 1) as u32;
+                fam_of.insert(b, f);
+                f
+            })
+            .collect();
+        view.families = families;
     }
+    view
 }
 
 /// Seeded sample of spectra for mass hypotheses (`sample_spectra = 0`: all).
@@ -132,7 +155,7 @@ pub fn run(
     sp: &Spectra,
     cands: &[Option<Candidate>],
     members: &[Vec<u32>],
-    view: &TagView,
+    view: &TagView<'_>,
     alpha: &Alphabet,
     cfg: &Config,
     ms1: Option<&[masses::Ms1Scan]>,
@@ -162,6 +185,7 @@ pub fn run(
     let mut examined = 0u64;
     let mut skipped_by_family = 0u64;
     let mut index_keys = 0u64;
+    let mut unsupported = 0u64;
     let sample = sampled(
         sp.rt.len(),
         p.mass_hypotheses.sample_spectra,
@@ -213,32 +237,40 @@ pub fn run(
             let fam_hit: Option<std::collections::HashSet<u32>> = p.delayed_modforms.then(|| {
                 let norm = ObservedIndex::build(&spec_tags, rts, Some(alpha));
                 members[gi]
-                    .iter()
+                    .par_iter()
                     .filter_map(|&i| {
                         let c = cands[i as usize].as_ref()?;
-                        norm.any(&view.norm_keys[i as usize], c.rt)
+                        norm.any(&view.norm_keys(i as usize), c.rt)
                             .then_some(view.family[i as usize])
                     })
                     .collect()
             });
-            for &i in &members[gi] {
-                let i = i as usize;
-                let Some(c) = cands[i].as_ref() else { continue };
-                if view.keys[i].is_empty() {
-                    // No trimer the alphabet can express: retrieval cannot judge it.
-                    retrieved[i] = true;
-                    continue;
-                }
-                if let Some(h) = &fam_hit {
-                    if !h.contains(&view.family[i]) {
-                        skipped_by_family += 1;
-                        continue;
+            // Per member: (retrieved, examined, skipped by family, not expressible).
+            let got: Vec<(bool, bool, bool, bool)> = members[gi]
+                .par_iter()
+                .map(|&i| {
+                    let i = i as usize;
+                    let Some(c) = cands[i].as_ref() else {
+                        return (false, false, false, false);
+                    };
+                    let keys = view.keys(i);
+                    if keys.is_empty() {
+                        // No trimer the alphabet can express: retrieval cannot judge it.
+                        return (true, false, false, true);
                     }
-                }
-                examined += 1;
-                if obs.any(&view.keys[i], c.rt) {
-                    retrieved[i] = true;
-                }
+                    if let Some(h) = &fam_hit {
+                        if !h.contains(&view.family[i]) {
+                            return (false, false, true, false);
+                        }
+                    }
+                    (obs.any(&keys, c.rt), true, false, false)
+                })
+                .collect();
+            for (&i, (r, e, sk, un)) in members[gi].iter().zip(got) {
+                retrieved[i as usize] |= r;
+                examined += e as u64;
+                skipped_by_family += sk as u64;
+                unsupported += un as u64;
             }
         }
 
@@ -255,13 +287,12 @@ pub fn run(
                 .par_iter()
                 .map(|&i| {
                     let i = i as usize;
-                    let (Some(c), Some(states)) = (cands[i].as_ref(), view.states[i].as_ref())
-                    else {
+                    let (Some(c), Some(states)) = (cands[i].as_ref(), view.states(i)) else {
                         return [0.0; N_COMPONENTS];
                     };
                     let cm = masses_of(i);
                     let ct = CandidateTags {
-                        states,
+                        states: &states,
                         masses: &cm,
                         zmax: p.tags.max_charge.min(c.nz),
                     };
@@ -340,7 +371,7 @@ pub fn run(
                     let mut best = 0.0f64;
                     match p.trace.score {
                         PrescreenTraceScore::TagCoherence => {
-                            let Some(states) = view.states[i].as_ref() else {
+                            let Some(states) = view.states(i) else {
                                 return 0.0;
                             };
                             let mut by_code: Vec<Vec<u32>> = Vec::new();
@@ -466,7 +497,7 @@ pub fn run(
             tag_records.load(Ordering::Relaxed).into(),
         );
         stats.insert("tag_alphabet".into(), serde_json::json!(alpha.names));
-        stats.insert("tag_unsupported_candidates".into(), view.unsupported.into());
+        stats.insert("tag_unsupported_candidates".into(), unsupported.into());
     }
     if tag_retrieval {
         stats.insert("retrieval_index_keys".into(), index_keys.into());
