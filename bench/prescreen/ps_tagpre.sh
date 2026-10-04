@@ -8,10 +8,11 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 PY=${PY:-/public/local/robbin/fs/venv/bin/python}
 export MUMDIA_CACHE_DIR=off
 mkdir -p "$O"
-echo '{}' > "$O/cfg_default.json"
+DEFCFG="{}"
+echo "${CFGJSON:-$DEFCFG}" > "$O/cfg_$NAME.json"
 /usr/bin/time -v -o "$O/time_$NAME.txt" "$BIN" --threads "$TH" prescreen --tags-only \
   --ms2 "$MS2" --lib-precursors "$IN" --out "$O/$NAME.survivors.parquet" \
-  --config "$O/cfg_default.json" > "$O/$NAME.log" 2>&1
+  --config "$O/cfg_$NAME.json" > "$O/$NAME.log" 2>&1
 echo "$(date +%T) $NAME screen exit $?" >> "$O/progress.log"
 "$PY" "$HERE/ps_tagpre_eval.py" "$NAME" "$O/$NAME.survivors.parquet" "$IN" "$O/time_$NAME.txt" "$@" \
   >> "$O/results.jsonl" 2>> "$O/$NAME.eval.err"

@@ -318,6 +318,15 @@ pub fn positioned_key(alpha: &Alphabet, s: [u16; 3], z: i32, bin: u64) -> u64 {
     (((code << 1) | (z as u64 - 1)) << 24) | (bin & 0xFF_FFFF)
 }
 
+/// Positioned two-residue key: a three-peak ladder (two residue steps), the fragment charge and
+/// the start bin; bit 63 keeps it apart from the three-residue keys.
+#[inline]
+pub fn positioned_key2(alpha: &Alphabet, s: [u16; 2], z: i32, bin: u64) -> u64 {
+    let n = alpha.n() as u64;
+    let code = s[0] as u64 * n + s[1] as u64;
+    (1u64 << 63) | (((code << 1) | (z as u64 - 1)) << 24) | (bin & 0xFF_FFFF)
+}
+
 /// Every tag path of one spectrum at fragment charges `1..=max_charge`.
 pub fn discover(
     mz: &[f64],
@@ -346,6 +355,15 @@ pub fn discover(
                     let (k, lb) = (g.target[f] as usize, g.label[f]);
                     match (la & GAP_FLAG != 0, lb & GAP_FLAG != 0) {
                         (false, false) => {
+                            if positioned {
+                                let start = z as f64 * (mz[i] - PROTON);
+                                pos.push(positioned_key2(
+                                    alpha,
+                                    [la as u16, lb as u16],
+                                    z,
+                                    start_bin(start),
+                                ));
+                            }
                             for h in g.edges(k) {
                                 let (l, lc) = (g.target[h] as usize, g.label[h]);
                                 if lc & GAP_FLAG != 0 {

@@ -60,9 +60,9 @@ impl TagView<'_> {
         }
     }
 
-    pub fn positioned_keys(&self, i: usize, both: bool) -> Vec<u64> {
+    pub fn positioned_keys(&self, i: usize, both: bool, residues: usize) -> Vec<u64> {
         match self.states(i) {
-            Some(s) => retrieval::positioned_keys(&s, self.zmax(i), both, self.alpha),
+            Some(s) => retrieval::positioned_keys_n(&s, self.zmax(i), both, self.alpha, residues),
             None => Vec::new(),
         }
     }
@@ -286,7 +286,11 @@ pub fn run(
                         // too short for one (fewer than five residues) falls back to the plain
                         // trimer test.
                         Some(px) => {
-                            let pk = view.positioned_keys(i, p.both_orientations);
+                            let pk = view.positioned_keys(
+                                i,
+                                p.both_orientations,
+                                p.tags.positioned_residues,
+                            );
                             if pk.is_empty() {
                                 obs.any(&keys, c.rt)
                             } else {

@@ -623,6 +623,19 @@
       "source_struct": "PrescreenTagsConfig"
     },
     {
+      "path": "prescreen.tags.positioned_residues",
+      "name": "positioned_residues",
+      "section": "prescreen.tags",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 3,
+      "default_text": "3",
+      "help": "Residue steps of a positioned ladder: 3 (four consecutive fragments, the default) or 2 (three consecutive fragments, more permissive).",
+      "gates": [],
+      "source_struct": "PrescreenTagsConfig"
+    },
+    {
       "path": "prescreen.mass_hypotheses.enabled",
       "name": "enabled",
       "section": "prescreen.mass_hypotheses",

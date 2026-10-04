@@ -80,11 +80,24 @@ pub fn positioned_keys(
     both_orientations: bool,
     alpha: &Alphabet,
 ) -> Vec<u64> {
-    use super::tags::{positioned_key, start_bin};
+    positioned_keys_n(states, zmax, both_orientations, alpha, 3)
+}
+
+/// `positioned_keys` for ladders of `residues` steps: 3 (four peaks) or 2 (three peaks).
+#[allow(clippy::needless_range_loop)]
+pub fn positioned_keys_n(
+    states: &[Option<u16>],
+    zmax: i32,
+    both_orientations: bool,
+    alpha: &Alphabet,
+    residues: usize,
+) -> Vec<u64> {
+    use super::tags::{positioned_key, positioned_key2, start_bin};
+    let w = residues;
     use mumdia_core::constants::WATER;
     let l = states.len();
     let mut out = Vec::new();
-    if l < 5 {
+    if l < w + 2 {
         return out;
     }
     let orientations: &[bool] = if both_orientations {
@@ -104,25 +117,24 @@ pub fn positioned_keys(
         for r in 0..l {
             suffix[r + 1] = suffix[r].zip(m(l - 1 - r)).map(|(p, x)| p + x);
         }
-        for q in 1..=l - 4 {
-            if let (Some(start), Some(a), Some(b), Some(c)) =
-                (prefix[q], st(q), st(q + 1), st(q + 2))
-            {
-                for z in 1..=zmax {
-                    let bin = start_bin(start);
-                    for bb in bin.saturating_sub(1)..=bin + 1 {
-                        out.push(positioned_key(alpha, [a, b, c], z, bb));
-                    }
-                }
+        // A ladder of `w` residue steps starting at b_q (prefix of q residues) or at y_r
+        // (suffix of r residues plus water); its end fragment must still be a fragment.
+        let key = |s: &[Option<u16>], z: i32, bin: u64| -> Option<u64> {
+            if w == 2 {
+                Some(positioned_key2(alpha, [s[0]?, s[1]?], z, bin))
+            } else {
+                Some(positioned_key(alpha, [s[0]?, s[1]?, s[2]?], z, bin))
             }
-            let r = q;
-            if let (Some(start), Some(a), Some(b), Some(c)) =
-                (suffix[r], st(l - 1 - r), st(l - 2 - r), st(l - 3 - r))
-            {
+        };
+        for q in 1..=l - w - 1 {
+            let b_steps: Vec<Option<u16>> = (0..w).map(|k| st(q + k)).collect();
+            let y_steps: Vec<Option<u16>> = (0..w).map(|k| st(l - 1 - q - k)).collect();
+            for (start, steps) in [(prefix[q], &b_steps), (suffix[q], &y_steps)] {
+                let Some(start) = start else { continue };
+                let bin = start_bin(start);
                 for z in 1..=zmax {
-                    let bin = start_bin(start);
                     for bb in bin.saturating_sub(1)..=bin + 1 {
-                        out.push(positioned_key(alpha, [a, b, c], z, bb));
+                        out.extend(key(steps, z, bb));
                     }
                 }
             }
@@ -643,5 +655,11 @@ mod tests {
             positioned_keys(&rev, 2, true, &a)
         );
         assert!(positioned_keys(&a.tokenise("GASP").unwrap(), 2, true, &a).is_empty());
+        // Two-residue ladders: three peaks b2..b4 suffice.
+        let three: Vec<f64> = mz[..3].to_vec();
+        let t3 = discover(&three, &a, 0.005, 1, None, true);
+        let k2 = positioned_keys_n(&st, 1, false, &a, 2);
+        assert!(t3.positioned.iter().any(|k| k2.binary_search(k).is_ok()));
+        assert!(!t3.positioned.iter().any(|k| keys.binary_search(k).is_ok()));
     }
 }

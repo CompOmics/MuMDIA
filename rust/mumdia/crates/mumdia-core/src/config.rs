@@ -543,6 +543,9 @@ pub struct PrescreenTagsConfig {
     /// of its own b or y fragment masses (+/- 0.01 Da), not by the same trimer anywhere in the
     /// spectrum. Much more specific in dense spectra.
     pub positioned: bool,
+    /// Residue steps of a positioned ladder: 3 (four consecutive fragments, the default) or 2
+    /// (three consecutive fragments, more permissive).
+    pub positioned_residues: usize,
 }
 impl Default for PrescreenTagsConfig {
     fn default() -> Self {
@@ -553,6 +556,7 @@ impl Default for PrescreenTagsConfig {
             rms_sigma_da: 0.003,
             extra_mods: Vec::new(),
             positioned: false,
+            positioned_residues: 3,
         }
     }
 }
@@ -3430,6 +3434,12 @@ impl Config {
                         "{name} must be finite and > 0 (got {value})"
                     )));
                 }
+            }
+            if !(2..=3).contains(&p.tags.positioned_residues) {
+                return Err(Invalid(format!(
+                    "prescreen.tags.positioned_residues must be 2 or 3 (got {})",
+                    p.tags.positioned_residues
+                )));
             }
             if p.tags.max_charge < 1 || p.trace.scans < 1 || p.trace.min_detections < 1 {
                 return Err(Invalid(
