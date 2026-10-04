@@ -51,9 +51,10 @@ undocumented on purpose; those fields are counted under "Coverage".
 
 | Section | Struct | Fields | Stage document |
 |---|---|---|---|
-| [(top level)](#top-level) | `Config` | 16 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
+| [(top level)](#top-level) | `Config` | 17 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
 | [`convert`](#convert) | `ConvertConfig` | 5 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
+| [`prescreen`](#prescreen) | `PrescreenConfig` | 16 |  |
 | [`digest`](#digest) | `DigestConfig` | 6 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`digest.decoy`](#digestdecoy) | `DecoyConfig` | 1 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`peptidoforms`](#peptidoforms) | `PeptidoformsConfig` | 7 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
@@ -79,6 +80,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 |---|---|---|---|---|
 | `convert` | `ConvertConfig` | the `ConvertConfig` section's own defaults |  |  |
 | `prescan` | `PrescanConfig` | the `PrescanConfig` section's own defaults |  |  |
+| `prescreen` | `PrescreenConfig` | the `PrescreenConfig` section's own defaults |  |  |
 | `rng_seed` | `u64` | `0` |  |  |
 | `digest` | `DigestConfig` | the `DigestConfig` section's own defaults |  |  |
 | `peptidoforms` | `PeptidoformsConfig` | the `PeptidoformsConfig` section's own defaults |  |  |
@@ -123,6 +125,31 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 | `mods` | `Vec<String>` | `["C:Carbamidomethyl", "M:Oxidation"]` |  | Residue:UniModName entries that may appear in a screened peptidoform, e.g. `C:Carbamidomethyl`. A peptidoform carrying anything outside this set plus `anchor_mods` is dropped rather than screened on a partially understood sequence. |
 | `anchor_mods` | `Vec<String>` | `[]` |  | Residue:UniModName entries the screen anchors ON. Only trimers covering one of these positions count as evidence, so backbone signal cannot keep a modified hypothesis alive. |
 | `anchor_all` | `bool` | `false` |  | Screen EVERY candidate on every trimer of its sequence, modified or not, instead of only the modification-bearing candidates on their anchored trimers. This turns the prescan from a modform pruner into a per-run library pruner for a search space that is large on its own, such as a predicted immunopeptidomics library of 10^8 precursors, where a run supports only a small fraction of the enumeration. The screen stays label-blind (both orientations of every trimer; a reverse decoy's tag set is its target's), so it remains a compute reduction and never a discriminator. `anchor_mods` may be empty when this is set. Default off: the anchored screen is the measured one. |
+
+## prescreen
+
+`PrescreenConfig` (rust/mumdia/crates/mumdia-core/src/config.rs).
+
+Fragment-rarity candidate prescreen (`mumdia prescreen`, and `run`/`run-experiment` when `enabled`). Each candidate is scored on the spectra of its own isolation window inside its calibrated RT bounds: its b/y fragments at charges `1..=min(max_frag_charge, z)`, in both the forward and the fully reversed sequence, are matched to the observed peaks within `frag_tol_da`; each matched peak counts once, weighted by `-ln p`, where `p` is the share of that window's spectra with a peak within +/-0.01 Da of it (0.01 Da bins, spectrum-only, no identifications), and by `low_mz_weight` below `low_mz_threshold`; the sum is divided by the square root of the peptide length; the candidate's score is the maximum over its eligible spectra. A cutoff is the `target` quantile ("higher" method) of the scores of a seeded calibration half of the in-scope candidates, labels never used; a candidate is kept when its score exceeds it. Targets and decoys are scored by the identical rule, each on its own sequence, m/z and RT window. Default off.
+
+| Field | Type | Default | Gated | Description |
+|---|---|---|---|---|
+| `enabled` | `bool` | `false` |  | Run the prescreen inside `run` / `run-experiment`, between rt-im-train and extract, and extract only its survivors. Default false. |
+| `preset` | `PrescreenPreset` | `balanced` |  | Calibration preset; `custom` takes `target`. |
+| `target` | `f64` | `0.54` |  | Calibration rejection target in (0, 1) when `preset = "custom"`. |
+| `seed` | `u64` | `20261003` |  | Seed of the calibration/reporting split. |
+| `min_calibration` | `usize` | `100` |  | Fewer in-scope calibration candidates than this bypasses the filter (everything kept), with the reason in the report. |
+| `scope` | `PrescreenScope` | `all` |  |  |
+| `scope_mods` | `Vec<String>` | `[]` |  | `RESIDUE:UniModName` entries defining `scope = "modified"`, e.g. `M:Oxidation`. |
+| `scope_match` | `PrescreenScopeMatch` | `any` |  |  |
+| `top_peaks` | `usize` | `0` |  | Most intense peaks per MS2 used for both the rarity histogram and the matching; 0 (the default) uses every positive peak. 300 is the capped comparison setting. |
+| `frag_tol_da` | `f64` | `0.005` |  | Candidate fragment matching tolerance, absolute m/z (Da). |
+| `max_frag_charge` | `i32` | `2` |  | Highest fragment charge; each candidate uses `1..=min(this, precursor charge)`. |
+| `low_mz_threshold` | `f64` | `300.0` |  | Matched peaks below this m/z are weighted by `low_mz_weight`. |
+| `low_mz_weight` | `f64` | `0.5` |  |  |
+| `both_orientations` | `bool` | `true` |  | Also score the fully reversed sequence and keep the larger score, as the measured prototype did. The same rule applies to targets and decoys. |
+| `rt_slack_s` | `f64` | `0.0` |  | Widen each candidate's calibrated RT bounds by this many seconds on both sides. |
+| `write_scores` | `bool` | `false` |  | Write the per-candidate scores beside the survivors (`<out>.scores.parquet`). |
 
 ## digest
 
@@ -686,6 +713,42 @@ How the elution-peak integration window is chosen per candidate in quant.
 | `per_candidate` | yes | Each candidate's window comes from its own summed-XIC descent walk. Exact per peak but sensitive to interference (stretched) and sparse peaks (collapsed). |
 | `consensus` |  | Consensus window: the median left and right half-widths of confident peptides (a near-constant instrument/gradient property) applied around each candidate's apex. Robust to a single window being distorted. The widths are estimated per quant invocation, not shared automatically across runs. |
 
+### `PrescreenPreset`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+Calibration presets of the fragment-rarity prescreen (`prescreen.preset`). Each names a calibration rejection target, the share of the calibration half's scores at or below the cutoff. Measured on six Astral HYE runs (exploratory screening on sampled candidates, tagbench PHASE10): reduction / reference retention / weak-reference retention 50.29% / 99.70% / 99.24% (sensitive), 52.28% / 99.66% / 99.20% (balanced), 74.62% / 96.94% / 94.22% (stringent), 90.30% / 90.58% / 82.67% (aggressive). A target does not guarantee the same reduction on another run or library; the report records the measured one.
+
+| Value | Default | Description |
+|---|---|---|
+| `sensitive` |  | Target 0.52. |
+| `balanced` | yes | Target 0.54. |
+| `stringent` |  | Target 0.75. |
+| `aggressive` |  | Target 0.90. |
+| `custom` |  | Use `prescreen.target`. |
+
+### `PrescreenScope`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+Which candidates the prescreen filters (`prescreen.scope`). Candidates outside the scope pass through unscored, and the cutoff is calibrated within the scope only.
+
+| Value | Default | Description |
+|---|---|---|
+| `all` | yes | Every candidate form. |
+| `modified` |  | Only forms carrying the modifications in `prescreen.scope_mods` (`scope_match` says whether any or all of them). |
+
+### `PrescreenScopeMatch`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+How several `prescreen.scope_mods` combine.
+
+| Value | Default | Description |
+|---|---|---|
+| `any` | yes | A form is in scope when it carries at least one of the listed modifications. |
+| `all` |  | A form is in scope only when it carries every listed modification. |
+
 ### `QuantQColumn`
 
 (rust/mumdia/crates/mumdia-core/src/config.rs)
@@ -933,6 +996,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-19 structs and 207 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 27 enumerations, 1 named profile(s), 96 environment variables read and 20 set.
+20 structs and 224 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 30 enumerations, 1 named profile(s), 96 environment variables read and 20 set.
 
-21 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+21 field(s) carry a gating marker in their doc comment. 52 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

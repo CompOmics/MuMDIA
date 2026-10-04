@@ -410,6 +410,145 @@ impl Default for PrescanConfig {
     }
 }
 
+/// Calibration presets of the fragment-rarity prescreen (`prescreen.preset`). Each names a
+/// calibration rejection target, the share of the calibration half's scores at or below the
+/// cutoff. Measured on six Astral HYE runs (exploratory screening on sampled candidates,
+/// tagbench PHASE10): reduction / reference retention / weak-reference retention 50.29% /
+/// 99.70% / 99.24% (sensitive), 52.28% / 99.66% / 99.20% (balanced), 74.62% / 96.94% /
+/// 94.22% (stringent), 90.30% / 90.58% / 82.67% (aggressive). A target does not guarantee the
+/// same reduction on another run or library; the report records the measured one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenPreset {
+    /// Target 0.52.
+    Sensitive,
+    /// Target 0.54.
+    #[default]
+    Balanced,
+    /// Target 0.75.
+    Stringent,
+    /// Target 0.90.
+    Aggressive,
+    /// Use `prescreen.target`.
+    Custom,
+}
+
+impl PrescreenPreset {
+    /// The calibration rejection target this preset names; `None` for `Custom`.
+    pub fn target(self) -> Option<f64> {
+        match self {
+            PrescreenPreset::Sensitive => Some(0.52),
+            PrescreenPreset::Balanced => Some(0.54),
+            PrescreenPreset::Stringent => Some(0.75),
+            PrescreenPreset::Aggressive => Some(0.90),
+            PrescreenPreset::Custom => None,
+        }
+    }
+}
+
+/// Which candidates the prescreen filters (`prescreen.scope`). Candidates outside the scope
+/// pass through unscored, and the cutoff is calibrated within the scope only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenScope {
+    /// Every candidate form.
+    #[default]
+    All,
+    /// Only forms carrying the modifications in `prescreen.scope_mods` (`scope_match` says
+    /// whether any or all of them).
+    Modified,
+}
+
+/// How several `prescreen.scope_mods` combine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenScopeMatch {
+    /// A form is in scope when it carries at least one of the listed modifications.
+    #[default]
+    Any,
+    /// A form is in scope only when it carries every listed modification.
+    All,
+}
+
+/// Fragment-rarity candidate prescreen (`mumdia prescreen`, and `run`/`run-experiment` when
+/// `enabled`). Each candidate is scored on the spectra of its own isolation window inside its
+/// calibrated RT bounds: its b/y fragments at charges `1..=min(max_frag_charge, z)`, in both the
+/// forward and the fully reversed sequence, are matched to the observed peaks within
+/// `frag_tol_da`; each matched peak counts once, weighted by `-ln p`, where `p` is the share of
+/// that window's spectra with a peak within +/-0.01 Da of it (0.01 Da bins, spectrum-only,
+/// no identifications), and by `low_mz_weight` below `low_mz_threshold`; the sum is divided by
+/// the square root of the peptide length; the candidate's score is the maximum over its
+/// eligible spectra. A cutoff is the `target` quantile ("higher" method) of the scores of a
+/// seeded calibration half of the in-scope candidates, labels never used; a candidate is kept
+/// when its score exceeds it. Targets and decoys are scored by the identical rule, each on its
+/// own sequence, m/z and RT window. Default off.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrescreenConfig {
+    /// Run the prescreen inside `run` / `run-experiment`, between rt-im-train and extract, and
+    /// extract only its survivors. Default false.
+    pub enabled: bool,
+    /// Calibration preset; `custom` takes `target`.
+    pub preset: PrescreenPreset,
+    /// Calibration rejection target in (0, 1) when `preset = "custom"`.
+    pub target: f64,
+    /// Seed of the calibration/reporting split.
+    pub seed: u64,
+    /// Fewer in-scope calibration candidates than this bypasses the filter (everything kept),
+    /// with the reason in the report.
+    pub min_calibration: usize,
+    pub scope: PrescreenScope,
+    /// `RESIDUE:UniModName` entries defining `scope = "modified"`, e.g. `M:Oxidation`.
+    pub scope_mods: Vec<String>,
+    pub scope_match: PrescreenScopeMatch,
+    /// Most intense peaks per MS2 used for both the rarity histogram and the matching; 0 (the
+    /// default) uses every positive peak. 300 is the capped comparison setting.
+    pub top_peaks: usize,
+    /// Candidate fragment matching tolerance, absolute m/z (Da).
+    pub frag_tol_da: f64,
+    /// Highest fragment charge; each candidate uses `1..=min(this, precursor charge)`.
+    pub max_frag_charge: i32,
+    /// Matched peaks below this m/z are weighted by `low_mz_weight`.
+    pub low_mz_threshold: f64,
+    pub low_mz_weight: f64,
+    /// Also score the fully reversed sequence and keep the larger score, as the measured
+    /// prototype did. The same rule applies to targets and decoys.
+    pub both_orientations: bool,
+    /// Widen each candidate's calibrated RT bounds by this many seconds on both sides.
+    pub rt_slack_s: f64,
+    /// Write the per-candidate scores beside the survivors (`<out>.scores.parquet`).
+    pub write_scores: bool,
+}
+impl Default for PrescreenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            preset: PrescreenPreset::Balanced,
+            target: 0.54,
+            seed: 20261003,
+            min_calibration: 100,
+            scope: PrescreenScope::All,
+            scope_mods: Vec::new(),
+            scope_match: PrescreenScopeMatch::Any,
+            top_peaks: 0,
+            frag_tol_da: 0.005,
+            max_frag_charge: 2,
+            low_mz_threshold: 300.0,
+            low_mz_weight: 0.5,
+            both_orientations: true,
+            rt_slack_s: 0.0,
+            write_scores: false,
+        }
+    }
+}
+
+impl PrescreenConfig {
+    /// The calibration rejection target in force: the preset's, or `target` for `custom`.
+    pub fn effective_target(&self) -> f64 {
+        self.preset.target().unwrap_or(self.target)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DigestConfig {
@@ -2443,6 +2582,7 @@ impl Default for GroupsConfig {
 pub struct Config {
     pub convert: ConvertConfig,
     pub prescan: PrescanConfig,
+    pub prescreen: PrescreenConfig,
     pub rng_seed: u64,
     pub digest: DigestConfig,
     pub peptidoforms: PeptidoformsConfig,
@@ -2467,6 +2607,7 @@ impl Default for Config {
             rng_seed: 0,
             convert: t(),
             prescan: t(),
+            prescreen: t(),
             digest: t(),
             peptidoforms: t(),
             predict_frag: t(),
@@ -3021,6 +3162,73 @@ impl Config {
                 return Err(Invalid(format!(
                     "{name} must be finite and > 0 (got {value})"
                 )));
+            }
+        }
+        {
+            let p = &self.prescreen;
+            let target = p.effective_target();
+            if !target.is_finite() || target <= 0.0 || target >= 1.0 {
+                return Err(Invalid(format!(
+                    "prescreen.target must be in (0, 1) (got {target}); it is the share of the \
+                     calibration scores rejected"
+                )));
+            }
+            for (name, value) in [
+                ("prescreen.frag_tol_da", p.frag_tol_da),
+                ("prescreen.low_mz_weight", p.low_mz_weight),
+            ] {
+                if !value.is_finite() || value <= 0.0 {
+                    return Err(Invalid(format!(
+                        "{name} must be finite and > 0 (got {value})"
+                    )));
+                }
+            }
+            for (name, value) in [
+                ("prescreen.low_mz_threshold", p.low_mz_threshold),
+                ("prescreen.rt_slack_s", p.rt_slack_s),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(Invalid(format!(
+                        "{name} must be finite and >= 0 (got {value})"
+                    )));
+                }
+            }
+            if p.enabled && self.groups.window_groups > 1 {
+                return Err(Invalid(
+                    "prescreen.enabled is not supported with groups.window_groups > 1 yet; run \
+                     `mumdia prescreen` per band or disable one of the two"
+                        .into(),
+                ));
+            }
+            if p.max_frag_charge < 1 {
+                return Err(Invalid(format!(
+                    "prescreen.max_frag_charge must be >= 1 (got {})",
+                    p.max_frag_charge
+                )));
+            }
+            if p.scope == PrescreenScope::Modified && p.scope_mods.is_empty() {
+                return Err(Invalid(
+                    "prescreen.scope = \"modified\" needs prescreen.scope_mods (e.g. \
+                     [\"M:Oxidation\"])"
+                        .into(),
+                ));
+            }
+            for m in &p.scope_mods {
+                let ok = m
+                    .split_once(':')
+                    .map(|(r, n)| {
+                        !n.is_empty()
+                            && (r == "n"
+                                || r == "c"
+                                || (r.len() == 1 && r.as_bytes()[0].is_ascii_uppercase()))
+                    })
+                    .unwrap_or(false);
+                if !ok {
+                    return Err(Invalid(format!(
+                        "prescreen.scope_mods entry {m:?} must be RESIDUE:UniModName, e.g. \
+                         M:Oxidation (n/c for the termini)"
+                    )));
+                }
             }
         }
         for (name, value) in [

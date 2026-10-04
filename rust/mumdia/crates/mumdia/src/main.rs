@@ -186,6 +186,34 @@ enum Cmd {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Fragment-rarity prescreen: score every candidate on its own window's spectra and keep
+    /// those above a label-blind calibration quantile -> survivors in the prescan_survivors
+    /// contract, for `extract --restrict-candidates` (docs/37_prescreen.md).
+    Prescreen {
+        #[arg(long)]
+        ms2: String,
+        #[arg(long)]
+        lib_precursors: String,
+        /// Per-candidate RT bounds (candidate_id, rt_lo, rt_hi). Omitted: whole gradient.
+        #[arg(long)]
+        run_windows: Option<String>,
+        #[arg(long)]
+        out: String,
+        #[arg(long)]
+        config: Option<String>,
+        /// Override `prescreen.preset` (sensitive, balanced, stringent, aggressive, custom).
+        #[arg(long)]
+        preset: Option<String>,
+        /// Override `prescreen.target` (implies preset custom).
+        #[arg(long)]
+        target: Option<f64>,
+        /// Override `prescreen.top_peaks` (0 = uncapped).
+        #[arg(long)]
+        top_peaks: Option<usize>,
+        /// Also write `<out>.scores.parquet`.
+        #[arg(long)]
+        write_scores: bool,
+    },
     /// Native broad DIA seed search over the fragment index -> seed_psms.parquet.
     SearchSeed {
         #[arg(long)]
@@ -1462,6 +1490,41 @@ fn real_main() -> Result<()> {
                 run_windows: &run_windows,
                 out: &out,
                 cfg: &cfg.prescan,
+                config_hash: &ch,
+            })?;
+        }
+        Cmd::Prescreen {
+            ms2,
+            lib_precursors,
+            run_windows,
+            out,
+            config,
+            preset,
+            target,
+            top_peaks,
+            write_scores,
+        } => {
+            let mut cfg = load_config(&config)?;
+            if let Some(p) = preset {
+                cfg.prescreen.preset = serde_json::from_value(serde_json::Value::String(p.clone()))
+                    .map_err(|_| anyhow::anyhow!("--preset '{p}' is not a prescreen preset"))?;
+            }
+            if let Some(t) = target {
+                cfg.prescreen.preset = mumdia_core::config::PrescreenPreset::Custom;
+                cfg.prescreen.target = t;
+            }
+            if let Some(n) = top_peaks {
+                cfg.prescreen.top_peaks = n;
+            }
+            cfg.prescreen.write_scores |= write_scores;
+            cfg.validate()?;
+            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            stages::prescreen::run(stages::prescreen::PrescreenParams {
+                ms2: &ms2,
+                library_precursors: &lib_precursors,
+                run_windows: run_windows.as_deref(),
+                out: &out,
+                cfg: &cfg.prescreen,
                 config_hash: &ch,
             })?;
         }
