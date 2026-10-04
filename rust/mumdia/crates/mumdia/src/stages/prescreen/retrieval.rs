@@ -73,6 +73,7 @@ pub fn normalise_key(key: u32, alpha: &Alphabet) -> u32 {
 /// charges `1..=zmax`, the start bin and its two neighbours (the observed start carries the
 /// peak's mass error). With `both_orientations` the fully reversed residue array adds its own
 /// keys, so a reversed decoy carries exactly its target's keys, as the fragment score does.
+#[allow(clippy::needless_range_loop)]
 pub fn positioned_keys(
     states: &[Option<u16>],
     zmax: i32,
