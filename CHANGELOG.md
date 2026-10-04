@@ -65,6 +65,24 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- **Per-candidate elution bounds are the default** (`features.bound_from_confident = false`,
+  was true). The shared left/right half-width learned from the confident seed set cut every
+  peptide whose peak is wider than the median short (visDIA showed identifications missing
+  their last scan). Measured 2026-10-03 on doxy, 5 NN seeds per arm: Astral REP1 on the HYE
+  library +2.20% peptides at 1% (Welch t +15.7), the Orbitrap AIF entrapment run +0.17%
+  (t +0.9) at an unchanged entrapment FDP (0.989% -> 1.000%, 2 SE 0.039); the share of IDs
+  whose above-half-maximum peak extends past their bounds fell from 20% / 26% (left / right) to
+  2% / 6% on Astral. `true` restores the shared width.
+- **Quantification integrates a fixed +/-3-sample window around the identification apex**
+  (`quant.fixed_scan_halfwidth = 3`, was 0, the walked window). On the six-file Astral HYE
+  experiment (one seed, 63,141 precursors quantified in at least two runs per condition) the
+  median |log2 ratio error| went from 0.266 to 0.163, the species-equal error from 0.322 to
+  0.201 and the median CV from 0.19 to 0.10, with the same identifications. The window is in
+  samples of the precursor's isolation window, so it scales with the cycle time. `0` restores
+  the walked window.
+
 ## [0.5.0] - 2026-09-29
 
 ### Added
