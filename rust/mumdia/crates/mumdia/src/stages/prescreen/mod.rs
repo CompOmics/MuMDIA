@@ -997,6 +997,12 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     stats.insert("reporting_n".into(), json!(rep_n));
     stats.insert("target".into(), json!(target));
     stats.insert("cutoff".into(), json!(cutoff));
+    if cutoff == Some(f64::NEG_INFINITY) {
+        stats.insert(
+            "cutoff_note".into(),
+            json!("-inf: retrieval alone removed more than the target share"),
+        );
+    }
     stats.insert("bypass_reason".into(), json!(bypass));
     stats.insert(
         "calibration_reduction".into(),
@@ -1018,7 +1024,20 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
         stats.insert("component_scales_q95".into(), json!(cs));
     }
     if let Some(r) = &retrieved {
-        let cut = cutoff.unwrap_or(f64::NEG_INFINITY);
+        // Losses are judged against the cutoff the score alone would set: without the rescue
+        // route an unretrieved candidate scores -inf, and when retrieval removes more than the
+        // target share the calibrated cutoff itself becomes -inf.
+        let cut = if enough {
+            let mut v: Vec<f64> = (0..n)
+                .filter(|&i| calib[i])
+                .map(|i| pre_retrieval[i])
+                .collect();
+            v.sort_by(f64::total_cmp);
+            quantile_higher(&v, target)
+        } else {
+            f64::NEG_INFINITY
+        };
+        stats.insert("score_only_cutoff".into(), json!(cut));
         let unret: Vec<usize> = (0..n).filter(|&i| scoped[i] && !r[i]).collect();
         stats.insert("retrieved".into(), json!((0..n).filter(|&i| r[i]).count()));
         stats.insert("not_retrieved".into(), json!(unret.len()));

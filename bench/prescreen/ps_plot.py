@@ -1,4 +1,4 @@
-"""Reduction-versus-retention figures from ps_agg.py summaries.
+"""Reduction-versus-retention figures from ps_agg.py summaries, one row per dataset.
 
 usage: ps_plot.py OUT.png NAME=summary.json [NAME=summary.json ...]
 """
@@ -12,41 +12,48 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 out = sys.argv[1]
 runs = [a.split("=", 1) for a in sys.argv[2:]]
-LABEL = {"OFF": "off", "PRESCAN": "prescan (anchor_all)", "CAP300": "capped 300 (0.54)",
-         "SEN": "sensitive 0.52", "BAL": "balanced 0.54", "STR": "stringent 0.75",
-         "AGG": "aggressive 0.90", "X_FAM": "family support 0.54", "X_BEST": "best site 0.54",
-         "X_OX53": "oxidation scope 0.53", "X_RET": "tag retrieval, no rescue"}
-fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-marks = "osD^v<>p*hX"
-for (name, path), mk in zip(runs, marks):
+PRESETS = ["OFF", "SEN", "BAL", "STR", "AGG"]
+OTHER = {"PRESCAN": ("existing prescan (anchor_all)", "s", "tab:orange"),
+         "CAP300": ("capped 300, target 0.54", "v", "tab:red"),
+         "X_FAM": ("family support, 0.54", "P", "tab:green"),
+         "X_BEST": ("best site, 0.54", "X", "tab:olive"),
+         "X_OX53": ("oxidation scope, 0.53", "D", "tab:purple"),
+         "X_RET": ("tag retrieval, no rescue", "^", "tab:brown")}
+fig, axes = plt.subplots(len(runs), 3, figsize=(16, 4.6 * len(runs)), squeeze=False)
+for row, (name, path) in enumerate(runs):
     s = json.load(open(path))["arms"]
-    arms = [a for a in s if a in LABEL]
-    red = [100 * (s[a]["reduction"] or 0) for a in arms]
-    for ax, key, ylab in [(axes[0], "reference_retention", "accepted precursors of OFF kept (%)"),
-                          (axes[1], "weak_retention", "weakest quartile of OFF kept (%)")]:
-        ys = [100 * s[a][key] if s[a].get(key) is not None else None for a in arms]
-        for x, y, a in zip(red, ys, arms):
-            if y is None:
-                continue
-            ax.scatter(x, y, marker=mk, label=f"{name}" if a == arms[0] else None)
-            ax.annotate(LABEL[a], (x, y), fontsize=7, xytext=(3, 3), textcoords="offset points")
-        ax.set_xlabel("candidates removed before extract (%)")
+    off = s["OFF"]["peptides_mean"]
+
+    def pts(arm, key):
+        r = s[arm]
+        x = 100 * (r.get("reduction") or 0)
+        if key == "pep":
+            if r.get("peptides_delta_pct") is None:
+                return None
+            return x, r["peptides_delta_pct"], 100 * (r.get("peptides_sd") or 0) / off
+        v = r.get(key)
+        return None if v is None else (x, 100 * v, 0)
+
+    for col, (key, ylab) in enumerate([("reference_retention", "OFF-accepted precursors kept (%)"),
+                                       ("weak_retention", "weakest-quartile OFF precursors kept (%)"),
+                                       ("pep", "peptides at 1% vs OFF (%, NN seed mean +/- sd)")]):
+        ax = axes[row][col]
+        p = [pts(a, key) for a in PRESETS if a in s]
+        p = [q for q in p if q]
+        ax.errorbar([q[0] for q in p], [q[1] for q in p], yerr=[q[2] for q in p], marker="o",
+                    color="tab:blue", label="uncapped presets 0.52 / 0.54 / 0.75 / 0.90")
+        for a, (lab, mk, colr) in OTHER.items():
+            if a in s and (q := pts(a, key)):
+                ax.errorbar([q[0]], [q[1]], yerr=[q[2]], marker=mk, color=colr, linestyle="none",
+                            markersize=8, label=lab)
+        if key == "pep":
+            ax.axhline(0, color="k", lw=0.5)
+        ax.set_xlabel("library candidates removed before extract (%)")
         ax.set_ylabel(ylab)
+        ax.set_title(name, fontsize=10)
         ax.grid(alpha=0.3)
-    ys = [s[a].get("peptides_delta_pct") for a in arms]
-    for x, y, a in zip(red, ys, arms):
-        if y is None:
-            continue
-        axes[2].errorbar(x, y, yerr=100 * (s[a].get("peptides_sd") or 0) / (s["OFF"]["peptides_mean"] or 1),
-                         marker=mk, linestyle="none", label=name if a == arms[0] else None)
-        axes[2].annotate(LABEL[a], (x, y), fontsize=7, xytext=(3, 3), textcoords="offset points")
-    axes[2].axhline(0, color="k", lw=0.5)
-    axes[2].set_xlabel("candidates removed before extract (%)")
-    axes[2].set_ylabel("peptides at 1% vs off (%, mean of NN seeds)")
-    axes[2].grid(alpha=0.3)
-for ax in axes:
-    ax.legend(fontsize=8)
-fig.suptitle("Prescreen: reduction versus retention and identifications")
+axes[0][0].legend(fontsize=8, loc="lower left")
+fig.suptitle("Fragment-rarity prescreen: reduction versus retention and identifications")
 fig.tight_layout()
-fig.savefig(out, dpi=130)
+fig.savefig(out, dpi=120)
 print(out)
