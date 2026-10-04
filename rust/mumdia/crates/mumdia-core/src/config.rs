@@ -3614,6 +3614,9 @@ mod tests {
             "configs/examples/native.json",
             "configs/examples/fasta-sidecars.json",
             "configs/examples/diann-library.json",
+            "configs/examples/prescreen-balanced.json",
+            "configs/examples/prescreen-oxidation.json",
+            "configs/examples/prescreen-components.json",
             "docker/config.dia.json",
             "docker/config.diann-lib.json",
         ] {
@@ -3621,8 +3624,10 @@ mod tests {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue; // absent in some checkout layouts
             };
-            Config::from_json(&text)
+            let c = Config::from_json(&text)
                 .unwrap_or_else(|e| panic!("shipped config {name} does not parse: {e}"));
+            c.validate()
+                .unwrap_or_else(|e| panic!("shipped config {name} does not validate: {e}"));
         }
     }
 

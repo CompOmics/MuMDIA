@@ -30,7 +30,7 @@
 //! so `extract --restrict-candidates` consumes either stage's table.
 //!
 //! Provenance: a port of the `tagbench` prototype's `advanced_candidates.scores` (the
-//! `lowmz_half` column) and `advanced_filter.export` (docs/37_prescreen.md).
+//! `lowmz_half` column) and `advanced_filter.export` (docs/34_prescreen.md).
 
 mod evidence;
 mod ext;

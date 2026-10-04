@@ -188,7 +188,7 @@ enum Cmd {
     },
     /// Fragment-rarity prescreen: score every candidate on its own window's spectra and keep
     /// those above a label-blind calibration quantile -> survivors in the prescan_survivors
-    /// contract, for `extract --restrict-candidates` (docs/37_prescreen.md).
+    /// contract, for `extract --restrict-candidates` (docs/34_prescreen.md).
     Prescreen {
         #[arg(long)]
         ms2: String,
