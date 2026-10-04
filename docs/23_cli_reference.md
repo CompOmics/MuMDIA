@@ -41,6 +41,7 @@ Commands:
   peptidoforms    Fixed+variable modification and charge enumeration -> peptidoforms.parquet
   predict-frag    Spectral library: b/y m/z + predicted intensity + iRT -> fragment_library
   prescan         Sequence-tag prescan: keep only modification-bearing candidates whose anchored trimers are observed in this run -> prescan_survivors.parquet. Label-blind by construction, so it prunes search space without touching target-decoy exchangeability
+  prescreen       Fragment-rarity prescreen: score every candidate on its own window's spectra and keep those above a label-blind calibration quantile -> survivors in the prescan_survivors contract, for `extract --restrict-candidates` (docs/34_prescreen.md)
   search-seed     Native broad DIA seed search over the fragment index -> seed_psms.parquet
   rt-im-train     Per-run RT calibration + windows -> run_windows.parquet, cal.json
   sub-library     Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires
@@ -136,6 +137,7 @@ first sentence of the description, with the full text in the section below.
 | [`peptidoforms`](#peptidoforms) | yes | Fixed+variable modification and charge enumeration -> peptidoforms.parquet |
 | [`predict-frag`](#predict-frag) | yes | Spectral library: b/y m/z + predicted intensity + iRT -> fragment_library |
 | [`prescan`](#prescan) | yes | Sequence-tag prescan: keep only modification-bearing candidates whose anchored trimers are observed in this run -> prescan_survivors.parquet. |
+| [`prescreen`](#prescreen) | yes | Fragment-rarity prescreen: score every candidate on its own window's spectra and keep those above a label-blind calibration quantile -> survivors in the prescan_survivors contract, for `extract --restrict-candidates` (docs/34_prescreen.md) |
 | [`search-seed`](#search-seed) | yes | Native broad DIA seed search over the fragment index -> seed_psms.parquet |
 | [`rt-im-train`](#rt-im-train) | yes | Per-run RT calibration + windows -> run_windows.parquet, cal.json |
 | [`sub-library`](#sub-library) | yes | Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires |
@@ -158,8 +160,8 @@ first sentence of the description, with the full text in the section below.
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-21 of the 25 documented subcommands accept `--config`:
- `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
+22 of the 26 documented subcommands accept `--config`:
+ `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 4 do not, so every setting they use comes from their own flags:
  `audit`, `inspect`, `pool`, `quant-lfq`.
@@ -278,6 +280,48 @@ Options:
       --out <OUT>
 
       --config <CONFIG>
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
+
+## prescreen
+
+```text
+Fragment-rarity prescreen: score every candidate on its own window's spectra and keep those above a label-blind calibration quantile -> survivors in the prescan_survivors contract, for `extract --restrict-candidates` (docs/34_prescreen.md)
+
+Usage: mumdia prescreen [OPTIONS] --ms2 <MS2> --lib-precursors <LIB_PRECURSORS> --out <OUT>
+
+Options:
+      --ms2 <MS2>
+
+      --lib-precursors <LIB_PRECURSORS>
+
+      --run-windows <RUN_WINDOWS>
+          Per-candidate RT bounds (candidate_id, rt_lo, rt_hi). Omitted: whole gradient
+
+      --ms1 <MS1>
+          MS1 spectra, for `prescreen.mass_hypotheses.ms1` only
+
+      --out <OUT>
+
+      --config <CONFIG>
+
+      --preset <PRESET>
+          Override `prescreen.preset` (sensitive, balanced, stringent, aggressive, custom)
+
+      --target <TARGET>
+          Override `prescreen.target` (implies preset custom)
+
+      --top-peaks <TOP_PEAKS>
+          Override `prescreen.top_peaks` (0 = uncapped)
+
+      --write-scores
+          Also write `<out>.scores.parquet`
+
+      --sample-candidates <SAMPLE_CANDIDATES>
+          Evaluation only: score a seeded sample of about N candidates (survivors then cover the sample only and are not an extract allowlist)
+
+          [default: 0]
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".
