@@ -1340,16 +1340,17 @@ pub struct FeaturesConfig {
     /// scan below `bound_peak_fraction` (brittle on jagged/gappy profiles); 1 bridges
     /// a single-scan dip (DIA sampling gap / noise), giving steadier boundaries.
     pub bound_peak_grace: usize,
-    /// Elution-peak boundary source. When true (default) a single set of left/right
-    /// half-widths (seconds) is learned once from the confident seed PSMs
-    /// (`spectrum_q <= 0.01`, target-only, the same set that anchors RT calibration /
-    /// DeepLC fine-tune) and applied to EVERY candidate around its own apex. This
-    /// removes per-candidate boundary manipulation so a decoy is scored over a real-
-    /// peptide-width window centred on its apex. When false, each candidate detects its
-    /// own peak boundary from its top-3-predicted-fragment profile (per-candidate,
-    /// but noisy/manipulable for chimeric decoys; the legacy behaviour). If the seed
-    /// yields < 20 confident anchors the stage logs a warning and falls back to
-    /// per-candidate detection for that run.
+    /// Elution-peak boundary source. When false (default since 2026-10-04) each
+    /// candidate detects its own peak boundary from its top-3-predicted-fragment
+    /// profile. When true, a single set of left/right half-widths (seconds) is learned
+    /// once from the confident seed PSMs (`spectrum_q <= 0.01`, target-only, the set
+    /// that anchors RT calibration) and applied to EVERY candidate around its own apex,
+    /// so a peptide whose peak is wider than the median is cut short. The shared width
+    /// was introduced to stop a chimeric decoy from fitting its own boundaries; the
+    /// entrapment measurement below shows no FDR cost from per-candidate bounds.
+    /// Measured 2026-10-03 (doxy, 5 NN seeds per arm, benchmark config): per-candidate bounds gave Astral REP1 on the HYE library +2.20% peptides at 1% (Welch t +15.7) and the Orbitrap AIF entrapment run +0.17% (t +0.9) at an unchanged entrapment FDP (0.989% -> 1.000%, 2 SE 0.039); the share of IDs whose above-half-maximum peak extends past the bounds fell from 20% / 26% (left / right) to 2% / 6% on Astral. If the seed yields < 20 confident
+    /// anchors when true, the stage logs a warning and falls back to per-candidate
+    /// detection for that run.
     pub bound_from_confident: bool,
     /// Percentile (0-100) of the confident-set half-widths taken as the global left/
     /// right elution half-width when `bound_from_confident` is true. 50 = median
@@ -1396,7 +1397,7 @@ impl Default for FeaturesConfig {
             bound_features: true,
             bound_peak_fraction: 1.0 / 3.0,
             bound_peak_grace: 0, // stop at first sub-threshold scan (legacy)
-            bound_from_confident: true, // fixed feature window from confident-seed norm
+            bound_from_confident: false, // per-candidate elution bounds (2026-10-04)
             bound_confident_pct: 50.0, // median confident half-width
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
             chrom_loaders: 3,
@@ -1628,7 +1629,13 @@ pub struct QuantConfig {
     /// identification apex instead of the descent-walk window (`bound_peak`
     /// window ignored; falls back to it when the apex is unknown). A fixed narrow
     /// window is far less sensitive to interference in the peak wings than the
-    /// walked bounds. 0 (default) = off.
+    /// walked bounds. Default 3 (seven samples) since 2026-10-04; 0 restores the walked
+    /// window. Measured on the six-file Astral HYE experiment (one seed, 63,141
+    /// precursors quantified in at least 2 runs per condition): median |log2 ratio
+    /// error| 0.266 -> 0.163, species-equal 0.322 -> 0.201, median CV 0.19 -> 0.10, the
+    /// identifications unchanged. The width is in samples of the precursor's window, so
+    /// it scales with the cycle time; check it on an acquisition with much wider or
+    /// narrower peaks.
     pub fixed_scan_halfwidth: usize,
     /// Subtract a per-fragment local background before integrating (fixed-scan
     /// window only). The background is the `baseline_quantile` quantile of the
@@ -1672,7 +1679,7 @@ impl Default for QuantConfig {
             q_filter: QuantQColumn::PeptideQ,
             interference_envelope: false, // apex-outward interference envelope off by default
             fragment_selection: FragmentSelection::ObservedArea,
-            fixed_scan_halfwidth: 0,
+            fixed_scan_halfwidth: 3, // fixed +/-3-sample window (2026-10-04)
             baseline_subtract: false,
             baseline_flank_scans: 12,
             baseline_quantile: 0.25,
@@ -3136,12 +3143,12 @@ mod tests {
         assert_eq!(c.quant.baseline_flank_scans, 8);
         assert_eq!(c.quant.baseline_quantile, 0.5);
 
-        // The defaults must reproduce the pre-2026-08 integration exactly: neither fixed
-        // form on, ranking by observed area, no baseline. A config written before these
-        // fields existed therefore quantifies as it did before.
+        // Defaults: the fixed +/-3-sample window since 2026-10-04 (seconds form off),
+        // ranking by observed area, no baseline. `fixed_scan_halfwidth: 0` restores the
+        // walked window a config written before 2026-10-04 quantified with.
         let d = QuantConfig::default();
         assert_eq!(d.fragment_selection, FragmentSelection::ObservedArea);
-        assert_eq!(d.fixed_scan_halfwidth, 0);
+        assert_eq!(d.fixed_scan_halfwidth, 3);
         assert_eq!(d.fixed_window_s, 0.0);
         assert!(!d.baseline_subtract);
         assert_eq!(
