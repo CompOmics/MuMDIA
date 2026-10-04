@@ -84,7 +84,7 @@ fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
     {
         anyhow::bail!(
             "rt_im_train.multihead_calibration requires predict_frag.deeplc_python (a Python \
-             interpreter with DeepLC >= 4.4.0, or \"auto\" to discover one); it calibrates \
+             interpreter with DeepLC >= 4.5.0, or \"auto\" to discover one); it calibrates \
              the DeepLC base model against this run's confident seed PSMs"
         );
     }
@@ -115,7 +115,7 @@ fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
     {
         anyhow::bail!(
             "rt_im_train.library_irt = deeplc requires predict_frag.deeplc_python (a Python \
-             interpreter with DeepLC >= 4.4.0, or \"auto\" to discover one); set \
+             interpreter with DeepLC >= 4.5.0, or \"auto\" to discover one); set \
              library_irt = library to keep the imported iRT"
         );
     }

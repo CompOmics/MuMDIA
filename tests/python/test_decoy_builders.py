@@ -46,7 +46,8 @@ DELTA_CH2 = 14.015650
 # (peptidoform, charge). PEPTIDEK appears twice so the builders see two charge
 # rows of one base sequence, which may legitimately share a decoy sequence.
 # AKAK reverses onto itself, and AGWK/WGAK reverse onto each other, so all three
-# force the collision-resolution path.
+# force the collision-resolution path. IEVNVELR reverses onto LEVNVEIR, which differs
+# from it only by the isobaric I/L, so it collides too (found on an Astral HYE run).
 TARGETS = [
     ("PEPTIDEK", 2),
     ("PEPTIDEK", 3),
@@ -55,8 +56,9 @@ TARGETS = [
     ("AGWK", 2),
     ("WGAK", 2),
     ("SC[Carbamidomethyl]ENICK", 2),
+    ("IEVNVELR", 2),
 ]
-COLLIDING = {"AKAK", "AGWK", "WGAK"}
+COLLIDING = {"AKAK", "AGWK", "WGAK", "IEVNVELR"}
 FRAGMENTS = (("y", 2, 1), ("b", 2, 1), ("y", 3, 2))
 
 
@@ -349,8 +351,10 @@ def test_reverse_decoys_never_overlap_a_real_target_sequence(reverse_library):
     """
     prec, _, idx_t, idx_d = _split_by_label(reverse_library["prec"],
                                             reverse_library["frag"])
-    tgt = {stripped(parse_proforma(prec["peptidoform"][i])) for i in idx_t}
-    dec = {stripped(parse_proforma(prec["peptidoform"][j])) for j in idx_d}
+    # I and L are isobaric: a decoy equal to a target up to I/L is that target.
+    il = lambda pf: stripped(parse_proforma(pf)).replace("I", "L")
+    tgt = {il(prec["peptidoform"][i]) for i in idx_t}
+    dec = {il(prec["peptidoform"][j]) for j in idx_d}
     assert tgt & dec == set()
     for j in idx_d:
         assert prec["peptidoform"][j].startswith("DECOY_"), (

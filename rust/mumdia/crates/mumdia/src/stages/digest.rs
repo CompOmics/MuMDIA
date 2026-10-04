@@ -149,8 +149,16 @@ fn make_decoy(pep: &str, strategy: DecoyStrategy, seed: u64) -> Option<String> {
     }
 }
 
+/// A sequence as the instrument sees it. I and L are isobaric (same residue mass, so
+/// the same precursor and fragment m/z), so two sequences that differ only by I/L are
+/// one peptide: the reversal of IEVNVELR, LEVNVEIR, is that target to the instrument.
+fn il_key(sequence: &str) -> String {
+    sequence.replace('I', "L")
+}
+
 /// Construct a deterministic decoy that is different from its paired target,
-/// does not collide with any target peptide, and is unique among emitted decoys.
+/// does not collide with any target peptide, and is unique among emitted decoys,
+/// all compared up to I/L ([`il_key`]). `targets` and `used_decoys` hold I/L keys.
 ///
 /// The configured transform is tried first. A collision is retried with
 /// independently seeded interior scrambles while preserving the C terminus.
@@ -170,7 +178,8 @@ fn collision_safe_decoy(
             DecoyStrategy::Scramble
         };
         let decoy = make_decoy(pep, transform, attempt_seed)?;
-        if decoy != pep && !targets.contains(&decoy) && !used_decoys.contains(&decoy) {
+        let key = il_key(&decoy);
+        if key != il_key(pep) && !targets.contains(&key) && !used_decoys.contains(&key) {
             return Some((decoy, attempt));
         }
     }
@@ -239,7 +248,7 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut label_c, mut target_c, mut strat_c) = (Vec::new(), Vec::new(), Vec::new());
 
-    let target_sequences: HashSet<String> = order.iter().cloned().collect();
+    let target_sequences: HashSet<String> = order.iter().map(|s| il_key(s)).collect();
     let mut used_decoys: HashSet<String> = HashSet::new();
     let mut decoy_collision_retries = 0usize;
     let mut dropped_pairs = 0usize;
@@ -261,7 +270,7 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
             ) {
                 Some((decoy, retries)) => {
                     decoy_collision_retries += retries;
-                    used_decoys.insert(decoy.clone());
+                    used_decoys.insert(il_key(&decoy));
                     Some(decoy)
                 }
                 None => {
@@ -494,26 +503,63 @@ mod tests {
     fn collision_safe_decoy_avoids_targets_and_other_decoys() {
         // The direct reverse of PEPTIDEK is EDITPEPK, which is deliberately
         // present as another target. Construction must retry with a scramble.
-        let targets = HashSet::from(["PEPTIDEK".to_string(), "EDITPEPK".to_string()]);
+        let targets = HashSet::from([il_key("PEPTIDEK"), il_key("EDITPEPK")]);
         let used = HashSet::new();
         let (decoy, retries) =
             collision_safe_decoy("PEPTIDEK", DecoyStrategy::Reverse, 42, &targets, &used)
                 .expect("a collision-free scramble exists");
         assert!(retries > 0);
-        assert!(!targets.contains(&decoy));
+        assert!(!targets.contains(&il_key(&decoy)));
         assert_ne!(decoy, "PEPTIDEK");
 
-        let used = HashSet::from([decoy]);
+        let used = HashSet::from([il_key(&decoy)]);
         let (second, _) =
             collision_safe_decoy("EDITPEPK", DecoyStrategy::Reverse, 42, &targets, &used)
                 .expect("a distinct collision-free scramble exists");
-        assert!(!targets.contains(&second));
-        assert!(!used.contains(&second));
+        assert!(!targets.contains(&il_key(&second)));
+        assert!(!used.contains(&il_key(&second)));
+    }
+
+    /// The reversal of IEVNVELR is LEVNVEIR, which differs from it only by I/L and is
+    /// therefore the same peptide to the instrument (found as a high-scoring "decoy" on
+    /// an Astral HYE run). It must be rejected like an exact palindrome, and so must a
+    /// decoy that equals ANOTHER target up to I/L.
+    #[test]
+    fn a_decoy_equal_to_a_target_up_to_i_l_is_a_collision() {
+        assert_eq!(
+            make_decoy("IEVNVELR", DecoyStrategy::Reverse, 0).unwrap(),
+            "LEVNVEIR"
+        );
+        let targets = HashSet::from([il_key("IEVNVELR")]);
+        let (decoy, retries) = collision_safe_decoy(
+            "IEVNVELR",
+            DecoyStrategy::Reverse,
+            42,
+            &targets,
+            &HashSet::new(),
+        )
+        .expect("a collision-free scramble exists");
+        assert!(retries > 0, "the plain reversal must be refused");
+        assert_ne!(il_key(&decoy), il_key("IEVNVELR"));
+
+        // The reversal of PEPTLDEK is EDLTPEPK, which equals ANOTHER target, EDITPEPK,
+        // up to I/L.
+        let targets = HashSet::from([il_key("PEPTLDEK"), il_key("EDITPEPK")]);
+        let (decoy, retries) = collision_safe_decoy(
+            "PEPTLDEK",
+            DecoyStrategy::Reverse,
+            42,
+            &targets,
+            &HashSet::new(),
+        )
+        .expect("a collision-free scramble exists");
+        assert!(retries > 0);
+        assert!(!targets.contains(&il_key(&decoy)));
     }
 
     #[test]
     fn impossible_low_complexity_decoy_drops_pair() {
-        let targets = HashSet::from(["AAAAAK".to_string()]);
+        let targets = HashSet::from([il_key("AAAAAK")]);
         assert!(collision_safe_decoy(
             "AAAAAK",
             DecoyStrategy::Reverse,

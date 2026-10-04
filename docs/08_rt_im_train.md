@@ -38,7 +38,7 @@ written null; there is no IM calibration or IM window.
 | `rust/mumdia/crates/mumdia/src/calibrate.rs` | Calibration math: `linear_fit`, the `Loess` local-linear smoother, and `percentile`. Shared, no external deps. |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Orchestrator. Runs the optional DeepLC fine-tune between `search-seed` and this stage, then calls `rt_im_train::run` (see `run.rs:265-314`). |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | `run_deeplc_finetune` (sidecar.rs:110-155): the file-contract client that invokes the fine-tune worker. |
-| `scripts/deeplc_finetune.py` | The fine-tune worker: transfer-learns DeepLC (4.4.0 or newer; older versions are refused) on the seed and writes a new library parquet with replaced `predicted_irt`. |
+| `scripts/deeplc_finetune.py` | The fine-tune worker: transfer-learns DeepLC (4.5.0 or newer; older versions are refused) on the seed and writes a new library parquet with replaced `predicted_irt`. |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `RtImTrainConfig` (config.rs:626), `CalibrationMethod` enum (config.rs:56-61), and the load-time validation that rejects `calibration_method=none` (config.rs:1336-1342). |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | `artifact::RUN_WINDOWS = ("run_windows", 1)` (schema.rs:16). |
 
@@ -623,6 +623,31 @@ default.
 as well as two acquisitions, and an unchanged decoy fraction is not the same test: it says
 the target-decoy ratio held, not that the FDR estimate is honest under a known-false
 population. The option therefore stays off by default until an entrapment arm runs.
+
+### 4e. DeepLC 4.5.0 as the floor (2026-09-28)
+
+`MIN_DEEPLC_VERSION` moved from 4.4.0 to 4.5.0 so that the projection cache
+(`rt_im_train.deeplc_projection_cache`, on by default since the same day) works on every
+supported DeepLC: it reads the factored prediction matrix 4.5.0 added, and on 4.4.x the
+default cache did nothing. A DeepLC version change changes predictions, so it was measured
+before the floor moved: one binary (the cache-root branch), one host (doxy, 128 threads),
+two environments identical but for DeepLC (same Python 3.12.7, torch 2.14.0+cpu, numpy
+2.5.3, pyarrow 25.0.1), imported libraries with the default multi-head calibration, and 10
+NN seeds per arm (standalone `mumdia rescore` of each arm's competed table).
+
+| arm | ENT: Orbitrap AIF entrapment run | AST: Astral REP1, HYE library (10.9M precursors) |
+|---|---|---|
+| DeepLC 4.4.0, no cache | 10,161.1 peptides (sd 29.8), FDP 0.984% | 81,055.9 (sd 170.0) |
+| DeepLC 4.5.0, no cache | 10,154.8 (sd 21.9), FDP 0.994%: -0.062%, Welch t -0.54 | 81,136.3 (sd 221.9): +0.099%, t +0.91 |
+| DeepLC 4.5.0, projection cache | 10,131.5 (sd 47.9), FDP 0.984%: -0.291% against 4.4.0, t -1.66 | 81,154.0 (sd 172.7): +0.121%, t +1.28 |
+
+Peptides at 1% (`peptide_q_value`); the entrapment FDP is `(0.560632 * spike + 1) / real`,
+and 4.4.0 -> 4.5.0 moved it by +0.009 pp against two standard errors of 0.025. Both versions
+selected the same 80 heads on both runs. The predictions themselves moved: the calibrated
+library iRT of 4.5.0 against 4.4.0 differs by a median of 6.6 s (99th percentile 302 s) on
+the entrapment library and 0.14 s (17 s) on the HYE library, and neither moved the
+identifications outside the seed spread. The cache arm here used the one-process miss;
+docs/13, "Projection cache", has why the miss is now sharded and what that costs.
 
 ### 5. Optional adaptive per-region window (default off)
 

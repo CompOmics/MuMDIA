@@ -162,11 +162,12 @@ conda env create -f env/mumdia-rescore.yml
 conda env create -f env/mumdia-deeplc.yml
 ```
 
-`env/mumdia-deeplc.yml` pins `deeplc==4.4.0`, `ms2pip==4.2.0` and
-`torch==2.14.0+cpu`. DeepLC 4.4.0 is a floor rather than merely the current
+`env/mumdia-deeplc.yml` pins `deeplc==4.5.0`, `ms2pip==4.2.0` and
+`torch==2.14.0+cpu`. DeepLC 4.5.0 is a floor rather than merely the current
 release: the 4.0.0a2 multitask preview overfits per-run fine-tuning badly enough to
-invert retention-time model rankings, so an older version changes results and not
-only speed. MS2PIP 4.2.0 is the version the FASTA-mode measurements were made with
+invert retention-time model rankings, the multi-head calibration needs 4.4.0 and the
+default projection cache 4.5.0, so an older version changes results and not only
+speed. MS2PIP 4.2.0 is the version the FASTA-mode measurements were made with
 (`docs/28_feature_selection_analysis.md`, section 22), and the first that resolves
 next to DeepLC in one environment. With that environment activated,
 `configs/examples/fasta-sidecars.json` runs unchanged (its interpreters are `auto`).
@@ -296,7 +297,7 @@ fragment prediction, and uses the imported library's fragment intensities. For
 retention time the default (`rt_im_train.library_irt = auto`) re-predicts the
 imported iRT once with the DeepLC base model when a DeepLC interpreter is
 configured, then calibrates it per run; without an interpreter the imported values
-are kept and a warning says so. DeepLC 4.4.0 or newer is required (`mumdia doctor`
+are kept and a warning says so. DeepLC 4.5.0 or newer is required (`mumdia doctor`
 and the workers refuse older versions). Measured at 1%: AIF 10,416 peptides against
 10,015 from the imported iRT and 10,181 from a per-run fine-tune; HYE B01 (NN seeds
 1-3) 58,842 against 56,556, and 60,278 with a library fine-tuned once. The optional
@@ -559,7 +560,7 @@ are listed so the documentation cannot imply a capability that is not there.
 | held-out RT window sizing | `rt_im_train.window_holdout_frac`, default off. Gained 1.1% of peptides with DeepLC 4.1.0 at an unchanged 0.98% decoy fraction, but lost 1.5% with the overfitting 4.0.0a2 model, so it interacts with retention-time model quality |
 | `compete.group_by = base_peptide` | the previous default, kept as an explicit peptide-level population. Never for a PTM or modification search: under it the modified form is deleted whenever an unmodified or alkylated sibling scores higher, which is usually (880,464 of 1,890,239 extracted candidates, 46.6%, on a modification-rich library; `peptidoform_charge`, the default since 2026-09-06, removed none) |
 | MBR tiers | `mbr.strategy` distinguishes only none from not-none. `mbr.rt_window_s`, `mbr.decoy_transfer`, and `mbr.requant_all` are accepted by the config but not wired; setting them changes nothing, and the engine warns that it did nothing |
-| fixed-window and library-ranked quantification | `quant.fragment_selection`, `fixed_scan_halfwidth`, `fixed_window_s`, and `baseline_subtract` all default to off pending entrapment validation |
+| library-ranked quantification and background subtraction | `quant.fragment_selection` and `baseline_subtract` default to off; the fixed window (`fixed_scan_halfwidth`, 3) is the default since 2026-10-04, and `fixed_window_s` stays off |
 | acquisition-specific peak caps | the shipped default is uncapped at both conversion entry points. A cap must come from a sweep on the acquisition it will be used on |
 | percolator rescoring | declared in the config enum and rejected by validation |
 

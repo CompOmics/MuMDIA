@@ -488,6 +488,14 @@ async function refreshComponents() {
     pill.className = "pill ok";
     btn.disabled = true;
     btn.textContent = "Installed";
+  } else if ((p.outdated || []).length) {
+    // Installed by an older release: it imports, but a pinned package is behind what
+    // this release needs (the engine refuses a DeepLC below its floor). Installing again
+    // upgrades the environment in place.
+    pill.textContent = "update needed";
+    pill.className = "pill warn";
+    btn.disabled = !c.primary.uv;
+    btn.textContent = "Update";
   } else {
     pill.textContent = "not installed";
     pill.className = "pill bad";
@@ -503,6 +511,12 @@ async function refreshComponents() {
     );
   } else if (p.error) {
     banner($("setup-error"), p.error);
+  } else if ((p.outdated || []).length) {
+    banner(
+      $("setup-error"),
+      `The analysis environment needs an update: ${p.outdated.join(", ")}. ` +
+        "Press Update; it upgrades the installed packages in place."
+    );
   } else {
     banner($("setup-error"), "");
   }

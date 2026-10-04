@@ -101,9 +101,9 @@ For the mapping from each conda environment to the config field that points at i
 | `rust/mumdia/crates/mumdia/src/stages/rescore.rs` | Call sites for mokapot/nn_torch (PIN) + entrapment (Parquet) sidecars |
 | `rust/mumdia/crates/mumdia/src/main.rs` | Call site for MBR (`Cmd::Mbr`) + `doctor` env probe |
 | `env/docker-rescore.yml` | Docker env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9 (py3.11) |
-| `env/docker-deeplc.yml` | Docker env `deeplc`: `deeplc==4.4.0` (PyPI; the engine's floor) + CPU torch (py3.11) |
+| `env/docker-deeplc.yml` | Docker env `deeplc`: `deeplc==4.5.0` (PyPI; the engine's floor) + CPU torch (py3.11) |
 | `env/mumdia-rescore.yml` | Minimal portable env for the mokapot logreg rescore path (py3.12) |
-| `env/mumdia-deeplc.yml` | Portable local env for the DeepLC sidecars: DeepLC 4.4.0 + CPU torch (py3.11) |
+| `env/mumdia-deeplc.yml` | Portable local env for the DeepLC sidecars: DeepLC 4.5.0 + CPU torch (py3.11) |
 | `env/mumdia-peptdeep.yml` | Portable local env for the AlphaPeptDeep sidecar: peptdeep 1.5.1 (py3.11), separate because it pins the alphabase stack |
 
 ## Inputs and outputs
@@ -446,11 +446,33 @@ file exists, because a memory-mapped write that runs out of disk kills the proce
 instead of raising), a write error, and a damaged entry, which is renamed aside as
 `<key>.broken-<pid>-<ns>` for the bound to remove
 (`test_a_damaged_projection_cache_entry_falls_back_and_is_set_aside`). A miss computes the
-projection in one process with the whole `--predict-threads` budget (after the cap), the
-threads a one-process prediction gets: `--shards` does not split it, and until 2026-09-25 a
-miss under a K-shard plan ran on one shard's `budget / K` threads, slower than either the
-sharded or the one-process prediction. `meta.json` records the count as `torch_threads`
-(`test_a_projection_cache_miss_uses_the_whole_predict_thread_budget`). A fine-tuned model has
+projection in the prediction's own shard plan (`--shards`, `shard_plan`): the entry's
+`projections.npy` is created at its full size and each of the K children (`project_sharded`,
+`shard_main` in `"mode": "projections"`) opens it for writing and fills its own row range,
+whole chunks as the prediction shards take them, so nothing is copied afterwards. At the same
+threads per process the file is byte-identical to a one-process miss
+(`test_a_sharded_projection_miss_writes_the_one_process_projection`). Until 2026-09-28 a miss
+ran in one process on the whole budget, which took twice as long as the sharded prediction
+once sharding was the default (an entrapment run 3:15 -> 6:28), so the first search of every
+library paid for the cache. The heads are evaluated from the projection in the same plan,
+on a miss once the file is written and on a hit (`evaluate_sharded`, `shard_main` in
+`"mode": "evaluate"`): each child reads its slice of the file and writes its values, which
+are bit-identical to one process because a row's value depends on that row alone and every
+slice starts on a chunk boundary. In one process that evaluation was numpy on one BLAS thread
+and most of a hit: 34 s on 2.9M sequences, 79 s on 4.9M. Measured on doxy (128 threads,
+DeepLC 4.5.0, whole runs):
+
+| run | no cache | miss, one process | miss, sharded | hit, sharded |
+|---|---|---|---|---|
+| Orbitrap AIF entrapment (2.9M sequences) | 3:15 | 6:28 | 3:16 | 0:56 |
+| Astral REP1, HYE library (4.9M sequences) | 5:14 | 11:29 | 5:42 | 2:33 |
+
+The calibrated iRT of the cached runs is identical to the uncached run's on 99.99% of the
+rows, and within 1.4 s (entrapment) and 0.04 s (Astral) on the rest. `meta.json` records
+`shards`, the threads per process as
+`torch_threads` and the per-shard timings, and the summary's shard record says `projection
+cache miss in K process(es)` or `projection cache hit`
+(`test_a_projection_cache_miss_follows_the_shard_plan`). A fine-tuned model has
 no factored head and predicts as usual. The summary records `projection_cache` (`hit`, `key`,
 `path`, timings). The values are float-equivalent to a plain prediction, because the cached path
 evaluates the heads in numpy where the plain path runs them in torch. For the base model that
@@ -460,14 +482,16 @@ multi-head calibration the spline edges amplify them
 (`test_the_projection_cache_reproduces_the_prediction_and_is_read_back`).
 It needs DeepLC 4.5.0 or newer. The factored matrix (`deeplc._factored`,
 `FactoredPredictionMatrix._projections`) and `_model_ops.supports_factored` are private
-DeepLC API added in 4.5.0; 4.4.x, the engine's floor, has neither. There the worker records
+DeepLC API added in 4.5.0, which is the engine's floor since 2026-09-28; 4.4.x has neither,
+and a later release that moves them would not either. There the worker records
 `projection_cache: {"used": false, "why": ...}` naming the version, writes no cache entry and
 predicts exactly as without the flag, so setting it is harmless but does nothing. It prints
 a warning when the configuration named the directory, and a plain line when the engine
 passed its default (`--projection-cache-default`, sent for `"auto"`), which asks for the
-cache only where DeepLC can serve it. A later release that moves these names falls back the same way. CI pins 4.4.0, so
-it tests that fallback (`test_the_projection_cache_falls_back_to_a_plain_prediction_before_deeplc_4_5`);
-the cache tests themselves skip below 4.5.0.
+cache only where DeepLC can serve it. CI pins 4.5.0 since the floor moved, so the cache tests
+run there and the fallback test
+(`test_the_projection_cache_falls_back_to_a_plain_prediction_before_deeplc_4_5`) runs only
+with an older DeepLC.
 
 **DeepLC thread cap.** Every DeepLC call site asks for the engine's rayon thread count
 (the fine-tune's training pool keeps its own bound), and both workers cap what they
@@ -1278,16 +1302,17 @@ MLP. Set it explicitly for the logreg path.
   change so `mumdia doctor` stays truthful.
 - **Conda envs.** The committed reproducible specs are `env/docker-rescore.yml`
   (env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9, py3.11) and
-  `env/docker-deeplc.yml` (env `deeplc`: DeepLC 4.4.0 + CPU torch, py3.11); the
+  `env/docker-deeplc.yml` (env `deeplc`: DeepLC 4.5.0 + CPU torch, py3.11); the
   Docker configs point interpreters at `/opt/conda/envs/{rescore,deeplc}/bin/python`
   (`docker/config.dia.json`, `docker/config.diann-lib.json`). For a native install
   the portable equivalents are `env/mumdia-rescore.yml` (mokapot logreg path, no
   torch/DeepLC/MS2PIP) and `env/mumdia-deeplc.yml` (the DeepLC sidecars).
-  **DeepLC 4.4.0 is a floor, not merely the current release**: the 4.0.0a2
+  **DeepLC 4.5.0 is a floor, not merely the current release**: the 4.0.0a2
   multitask preview overfits per-run fine-tuning badly enough to invert RT-model
-  rankings (`docs/08_rt_im_train.md` section 4b), so an older DeepLC changes
-  results and not only performance. The engine enforces it: `mumdia doctor` fails
-  below 4.4.0 and `sidecar::require_deeplc_version` refuses to launch a DeepLC worker
+  rankings (`docs/08_rt_im_train.md` section 4b), the multi-head calibration needs
+  4.4.0 and the default projection cache 4.5.0, so an older DeepLC changes results
+  and not only performance. The engine enforces it: `mumdia doctor` fails below
+  4.5.0 and `sidecar::require_deeplc_version` refuses to launch a DeepLC worker
   (one constant, `mumdia_core::constants::MIN_DEEPLC_VERSION`). Anchor the tool version and let pip resolve
   its scientific-Python graph; do not re-add an exact `pandas < 2` style pin,
   which has no cp312 wheel. A developer machine may also have older local envs

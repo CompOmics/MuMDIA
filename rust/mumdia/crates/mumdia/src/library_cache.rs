@@ -44,6 +44,23 @@ const TABLES: [&str; 2] = [
     "fragment_library_fragments.parquet",
 ];
 
+/// Free space a library store must leave on the cache's disk, in GiB, when
+/// `MUMDIA_CACHE_MIN_FREE_GB` is unset.
+const MIN_FREE_AFTER_STORE_GB: f64 = 10.0;
+const GIB: f64 = (1u64 << 30) as f64;
+
+/// The free space a library store must leave: `MUMDIA_CACHE_MIN_FREE_GB` (GiB, `0` for no
+/// margin), else 10 GiB.
+fn min_free_after_store() -> u64 {
+    match std::env::var("MUMDIA_CACHE_MIN_FREE_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
+        Some(g) if g.is_finite() && g >= 0.0 => (g * GIB) as u64,
+        _ => (MIN_FREE_AFTER_STORE_GB * GIB) as u64,
+    }
+}
+
 /// How long a temporary store directory may go unwritten before the run that was
 /// writing it counts as gone and the directory is removed. A live store writes its files
 /// continuously, and a byte copy of the largest library takes minutes, not an hour.
@@ -403,6 +420,28 @@ impl LibraryCache {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating {}", self.dir.display()))?;
         self.sweep_leftovers();
+        // The cache must not take the space the rest of this run, or anything else on the
+        // disk, needs: extract alone writes tens of GB on a large library. Unknown free
+        // space (a network share, no `df`) does not block the store.
+        let need: u64 = TABLES
+            .iter()
+            .zip([lib_p, lib_f])
+            .flat_map(|(_, src)| [src.to_string(), format!("{src}.report.json")])
+            .filter_map(|f| std::fs::metadata(&f).ok().map(|m| m.len()))
+            .sum();
+        let margin = min_free_after_store();
+        if let Some(free) = crate::cache::free_space(&self.dir) {
+            anyhow::ensure!(
+                free >= need.saturating_add(margin),
+                "{} has {:.2} GiB free; storing this {:.2} GiB library would leave less than \
+                 {:.2} GiB (MUMDIA_CACHE_MIN_FREE_GB), so it is not stored; MUMDIA_CACHE_DIR \
+                 moves the cache",
+                self.dir.display(),
+                free as f64 / GIB,
+                need as f64 / GIB,
+                margin as f64 / GIB
+            );
+        }
         let final_dir = self.entry_dir();
         if final_dir.exists() {
             // The run that reaches here built its library for an hour, so checking every

@@ -60,6 +60,7 @@ Commands:
   peak-census     Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard
   audit           Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute
   report          Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory
+  cache           Show, trim or clear the engine's caches: FASTA-built libraries and DeepLC's trunk projection (docs/14, "The engine's caches")
   doctor          Check that the configured Python sidecar environments are usable
   help            Print this message or the help of the given subcommand(s)
 
@@ -155,11 +156,12 @@ first sentence of the description, with the full text in the section below.
 | [`peak-census`](#peak-census) | yes | Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard |
 | [`audit`](#audit) | no | Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). |
 | [`report`](#report) | yes | Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory |
+| [`cache`](#cache) | yes | Show, trim or clear the engine's caches: FASTA-built libraries and DeepLC's trunk projection (docs/14, "The engine's caches") |
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-21 of the 25 documented subcommands accept `--config`:
- `align`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
+22 of the 26 documented subcommands accept `--config`:
+ `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `quant`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 4 do not, so every setting they use comes from their own flags:
  `audit`, `inspect`, `pool`, `quant-lfq`.
@@ -788,6 +790,30 @@ Options:
           Read `quant.q_threshold` from this config, so a standalone report uses the same threshold as the `run` that produced the table.
 
           Without it, a config setting `quant.q_threshold = 0.05` yielded 0.05 from `run` and 0.01 from `report` on the same scored table, silently.
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
+
+## cache
+
+```text
+Show, trim or clear the engine's caches: FASTA-built libraries and DeepLC's trunk projection (docs/14, "The engine's caches")
+
+Usage: mumdia cache [OPTIONS] [ACTION]
+
+Arguments:
+  [ACTION]
+          `show` lists the cache root, the bound (MUMDIA_CACHE_MAX_GB) and each cache's directory, entries and size; `prune` applies the bound now, as the end of a run does; `clear` removes every entry, however recently used
+
+          [default: show]
+          [possible values: show, prune, clear]
+
+Options:
+      --config <CONFIG>
+          Resolve the two cache settings from this configuration (default: the engine defaults, `"auto"` for both)
+
+      --json
+          Emit the result as JSON on stdout. The desktop application lists and clears the caches through it
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".

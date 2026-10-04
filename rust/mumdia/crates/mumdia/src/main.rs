@@ -579,6 +579,23 @@ enum Cmd {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Show, trim or clear the engine's caches: FASTA-built libraries and DeepLC's trunk
+    /// projection (docs/14, "The engine's caches").
+    Cache {
+        /// `show` lists the cache root, the bound (MUMDIA_CACHE_MAX_GB) and each cache's
+        /// directory, entries and size; `prune` applies the bound now, as the end of a run
+        /// does; `clear` removes every entry, however recently used.
+        #[arg(value_enum, default_value_t = CacheAction::Show)]
+        action: CacheAction,
+        /// Resolve the two cache settings from this configuration (default: the engine
+        /// defaults, `"auto"` for both).
+        #[arg(long)]
+        config: Option<String>,
+        /// Emit the result as JSON on stdout. The desktop application lists and clears
+        /// the caches through it.
+        #[arg(long)]
+        json: bool,
+    },
     /// Check that the configured Python sidecar environments are usable.
     Doctor {
         #[arg(long)]
@@ -654,6 +671,14 @@ struct DoctorReport {
     /// The on-disk caches (`mumdia::cache`): where they are, how large, and the bound.
     /// Never a failure: a run without a cache builds what it would have reused.
     caches: mumdia::cache::CachesReport,
+}
+
+/// What `mumdia cache` does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum CacheAction {
+    Show,
+    Prune,
+    Clear,
 }
 
 /// Availability of one external converter.
@@ -1110,23 +1135,36 @@ fn print_doctor(rep: &DoctorReport) {
         }
     }
 
+    print_caches(&rep.caches);
+
+    if rep.ok {
+        println!("mumdia doctor: configuration is runnable");
+    }
+}
+
+/// Bytes as GiB, two decimals.
+fn gib(b: u64) -> String {
+    format!("{:.2} GiB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+/// The cache section of `doctor`, and the whole of `mumdia cache`.
+fn print_caches(caches: &mumdia::cache::CachesReport) {
     println!("caches");
-    let gib = |b: u64| format!("{:.2} GiB", b as f64 / (1024.0 * 1024.0 * 1024.0));
-    match &rep.caches.root {
+    match &caches.root {
         Some(root) => println!(
             "  [ ok ] root: {root} (from {}; MUMDIA_CACHE_DIR moves it)",
-            rep.caches.root_source
+            caches.root_source
         ),
         None => println!(
             "  [note] root: none ({}), so the \"auto\" caches are off",
-            rep.caches.root_source
+            caches.root_source
         ),
     }
     println!(
         "  [ ok ] limit: {} for the caches together (MUMDIA_CACHE_MAX_GB)",
-        rep.caches.max_bytes.map_or("unlimited".to_string(), gib)
+        caches.max_bytes.map_or("unlimited".to_string(), gib)
     );
-    for c in &rep.caches.caches {
+    for c in &caches.caches {
         match &c.dir {
             Some(dir) => println!(
                 "  [ ok ] {}: {dir}{}, {} entries, {}",
@@ -1147,10 +1185,6 @@ fn print_doctor(rep: &DoctorReport) {
                 ),
             },
         }
-    }
-
-    if rep.ok {
-        println!("mumdia doctor: configuration is runnable");
     }
 }
 
@@ -1981,6 +2015,68 @@ fn real_main() -> Result<()> {
                 println!(
                     "MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {q}\n  {pep}\n  {prot}"
                 );
+            }
+        }
+        Cmd::Cache {
+            action,
+            config,
+            json,
+        } => {
+            // The raw loader, as `doctor`: the cache settings do not need interpreters.
+            let cfg = load_config_raw(&config)?;
+            let dirs = mumdia::cache::dirs_of(&cfg);
+            match action {
+                CacheAction::Show => {
+                    let rep = mumdia::cache::report(&cfg);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&rep)?);
+                    } else {
+                        print_caches(&rep);
+                    }
+                }
+                CacheAction::Prune => {
+                    let r = mumdia::cache::enforce_budget(&dirs, mumdia::cache::budget());
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&r)?);
+                    } else {
+                        println!(
+                            "removed {} entries ({}) and {} of leftovers; {} entries ({}) kept{}",
+                            r.evicted.entries,
+                            gib(r.evicted.bytes),
+                            gib(r.leftovers_freed),
+                            r.kept.entries,
+                            gib(r.kept.bytes),
+                            if r.over_budget {
+                                "; still above the bound, because the rest was used within \
+                                 the last hour"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                }
+                CacheAction::Clear => {
+                    let r = mumdia::cache::clear(&dirs);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&r)?);
+                    } else {
+                        println!(
+                            "removed {} entries, {} in all",
+                            r.removed.entries,
+                            gib(r.removed.bytes)
+                        );
+                        for f in &r.failed {
+                            println!("  could not remove {f}");
+                        }
+                    }
+                    if !r.failed.is_empty() {
+                        anyhow::bail!(
+                            "{} cache entries could not be removed; close the runs using them \
+                             and try again",
+                            r.failed.len()
+                        );
+                    }
+                }
             }
         }
         Cmd::Doctor { config, json } => {

@@ -86,7 +86,7 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
     {
         anyhow::bail!(
             "rt_im_train.multihead_calibration requires predict_frag.deeplc_python (DeepLC \
-             >= 4.4.0): it calibrates the base model against each run's confident seed PSMs"
+             >= 4.5.0): it calibrates the base model against each run's confident seed PSMs"
         );
     }
     if cfg.rt_im_train.multihead_calibration.is_none()

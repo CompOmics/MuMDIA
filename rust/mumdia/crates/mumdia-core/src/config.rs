@@ -1013,14 +1013,19 @@ pub struct RtImTrainConfig {
     /// sequence, about 1.26 GB for HYE's 4.91M) and later calls over the same list read it
     /// and evaluate only the heads they need: `rt_library_scope = per_run`, every rerun of
     /// an experiment, and the bands of `groups.rt_adaptation = once_per_run` across runs.
-    /// A miss computes the projection in one process on the whole prediction-thread budget,
-    /// the threads a one-process prediction gets (`deeplc_predict_shards` does not split
-    /// it). Base model only: a fine-tune has no factored head and ignores it.
+    /// A miss computes the projection in the prediction's own shard plan
+    /// (`deeplc_predict_shards`), each shard filling its rows of the entry's file, and the
+    /// heads are evaluated from the projection in the same plan on a miss and a hit alike.
+    /// Measured on doxy (128 threads, whole runs, DeepLC 4.5.0): an Orbitrap AIF entrapment
+    /// run 3:15 without the cache, 3:16 on a miss, 0:56 on a hit; an Astral run on the HYE
+    /// library 5:14, 5:42 and 2:33. In one process the miss had taken 6:28 and 11:29.
+    /// Base model only: a fine-tune has no factored head and ignores it.
     ///
-    /// Needs DeepLC 4.5.0 or newer, which added the factored prediction matrix it reads.
-    /// On DeepLC 4.4.x (the engine's floor) the worker records why in the summary, writes
-    /// nothing and predicts exactly as without it; it warns only when the directory was
-    /// named explicitly, since `"auto"` asks for the cache wherever it is available.
+    /// Needs DeepLC 4.5.0 or newer, which added the factored prediction matrix it reads, and
+    /// 4.5.0 is the engine's floor since 2026-09-28. A later release that moves that private
+    /// API makes the worker record why in the summary, write nothing and predict exactly as
+    /// without it; it warns only when the directory was named explicitly, since `"auto"`
+    /// asks for the cache wherever it is available.
     ///
     /// Float-equivalent, not bit-identical: the heads are evaluated in numpy from the cached
     /// factors instead of in torch. Measured with DeepLC 4.5.0 on CPU: the base-model
@@ -1338,6 +1343,20 @@ pub struct ExtractConfig {
     /// The rolling distinct-fragment count (`apex_count_window`) still gates which scans
     /// qualify in both modes.
     pub apex_evidence_rank: bool,
+    /// Choose the apex by intensity INSIDE the region the fragment count selects. The
+    /// qualifying scans (rolling distinct-fragment count within `apex_count_tol` of its
+    /// maximum) are widened by the rolling half-width (`apex_count_window / 2`), and the
+    /// apex is the scan in that region with the largest observed intensity of the top-K
+    /// predicted fragments (`apex_top_fragments`, 3 by default), times the RT prior when
+    /// it is on. The count still decides WHERE the peptide elutes, so a bright
+    /// interferent outside the sustained-evidence region cannot take the apex; inside it,
+    /// intensity decides WHICH scan. Without it the count also picks the scan, and on a
+    /// tailing peak the rolling count is largest after the intensity maximum: measured on
+    /// Astral REP1 (`apex_count_window` 5), the summed fragment intensity peaked one scan
+    /// BEFORE the chosen apex for 41% of the accepted precursors and one scan after for
+    /// 6%; recomputed with this rule, 85% at the apex, 6% and 5% either side. Default
+    /// false; benchmark-gated.
+    pub apex_refine_intensity: bool,
     /// Emit the four gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`,
     /// `gate_coelution`, `gate_spectral_entropy`) as extra `psms.parquet` columns,
     /// for the offline gate-metric comparison. Default `false` (diagnostic sidecar,
@@ -1444,9 +1463,10 @@ impl Default for ExtractConfig {
             // (which decides the pre-FDR competition winner), `rt_error_abs`,
             // `log_apex_intensity`, and quant's integration centre.
             apex_evidence_rank: true,
-            emit_gate_diagnostics: false, // diagnostic gate-score columns; off in production
+            apex_refine_intensity: false,     // benchmark-gated
+            emit_gate_diagnostics: false,     // diagnostic gate-score columns; off in production
             gate_mode: GateMode::ApexPearson, // legacy single-scan intensity Pearson
-            gate_coelution_min: 0.5,      // used only by GateMode::Combined
+            gate_coelution_min: 0.5,          // used only by GateMode::Combined
             im_gate: ImGate::Off,
         }
     }
@@ -1506,16 +1526,17 @@ pub struct FeaturesConfig {
     /// scan below `bound_peak_fraction` (brittle on jagged/gappy profiles); 1 bridges
     /// a single-scan dip (DIA sampling gap / noise), giving steadier boundaries.
     pub bound_peak_grace: usize,
-    /// Elution-peak boundary source. When true (default) a single set of left/right
-    /// half-widths (seconds) is learned once from the confident seed PSMs
-    /// (`spectrum_q <= 0.01`, target-only, the same set that anchors RT calibration /
-    /// DeepLC fine-tune) and applied to EVERY candidate around its own apex. This
-    /// removes per-candidate boundary manipulation so a decoy is scored over a real-
-    /// peptide-width window centred on its apex. When false, each candidate detects its
-    /// own peak boundary from its top-3-predicted-fragment profile (per-candidate,
-    /// but noisy/manipulable for chimeric decoys; the legacy behaviour). If the seed
-    /// yields < 20 confident anchors the stage logs a warning and falls back to
-    /// per-candidate detection for that run.
+    /// Elution-peak boundary source. When false (default since 2026-10-04) each
+    /// candidate detects its own peak boundary from its top-3-predicted-fragment
+    /// profile. When true, a single set of left/right half-widths (seconds) is learned
+    /// once from the confident seed PSMs (`spectrum_q <= 0.01`, target-only, the set
+    /// that anchors RT calibration) and applied to EVERY candidate around its own apex,
+    /// so a peptide whose peak is wider than the median is cut short. The shared width
+    /// was introduced to stop a chimeric decoy from fitting its own boundaries; the
+    /// entrapment measurement below shows no FDR cost from per-candidate bounds.
+    /// Measured 2026-10-03 (doxy, 5 NN seeds per arm, benchmark config): per-candidate bounds gave Astral REP1 on the HYE library +2.20% peptides at 1% (Welch t +15.7) and the Orbitrap AIF entrapment run +0.17% (t +0.9) at an unchanged entrapment FDP (0.989% -> 1.000%, 2 SE 0.039); the share of IDs whose above-half-maximum peak extends past the bounds fell from 20% / 26% (left / right) to 2% / 6% on Astral. If the seed yields < 20 confident
+    /// anchors when true, the stage logs a warning and falls back to per-candidate
+    /// detection for that run.
     pub bound_from_confident: bool,
     /// Percentile (0-100) of the confident-set half-widths taken as the global left/
     /// right elution half-width when `bound_from_confident` is true. 50 = median
@@ -1586,7 +1607,7 @@ impl Default for FeaturesConfig {
             bound_features: true,
             bound_peak_fraction: 1.0 / 3.0,
             bound_peak_grace: 0, // stop at first sub-threshold scan (legacy)
-            bound_from_confident: true, // fixed feature window from confident-seed norm
+            bound_from_confident: false, // per-candidate elution bounds (2026-10-04)
             bound_confident_pct: 50.0, // median confident half-width
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
             im_features: false,  // opt-in; TIMS P5, benchmark-gated
@@ -1821,7 +1842,13 @@ pub struct QuantConfig {
     /// identification apex instead of the descent-walk window (`bound_peak`
     /// window ignored; falls back to it when the apex is unknown). A fixed narrow
     /// window is far less sensitive to interference in the peak wings than the
-    /// walked bounds. 0 (default) = off.
+    /// walked bounds. Default 3 (seven samples) since 2026-10-04; 0 restores the walked
+    /// window. Measured on the six-file Astral HYE experiment (one seed, 63,141
+    /// precursors quantified in at least 2 runs per condition): median |log2 ratio
+    /// error| 0.266 -> 0.163, species-equal 0.322 -> 0.201, median CV 0.19 -> 0.10, the
+    /// identifications unchanged. The width is in samples of the precursor's window, so
+    /// it scales with the cycle time; check it on an acquisition with much wider or
+    /// narrower peaks.
     pub fixed_scan_halfwidth: usize,
     /// Subtract a per-fragment local background before integrating (fixed-scan
     /// window only). The background is the `baseline_quantile` quantile of the
@@ -1893,7 +1920,7 @@ impl Default for QuantConfig {
             q_filter: QuantQColumn::PeptideQ,
             interference_envelope: false, // apex-outward interference envelope off by default
             fragment_selection: FragmentSelection::ObservedArea,
-            fixed_scan_halfwidth: 0,
+            fixed_scan_halfwidth: 3, // fixed +/-3-sample window (2026-10-04)
             baseline_subtract: false,
             baseline_flank_scans: 12,
             baseline_quantile: 0.25,
@@ -3545,12 +3572,12 @@ mod tests {
         assert_eq!(c.quant.baseline_flank_scans, 8);
         assert_eq!(c.quant.baseline_quantile, 0.5);
 
-        // The defaults must reproduce the pre-2026-08 integration exactly: neither fixed
-        // form on, ranking by observed area, no baseline. A config written before these
-        // fields existed therefore quantifies as it did before.
+        // Defaults: the fixed +/-3-sample window since 2026-10-04 (seconds form off),
+        // ranking by observed area, no baseline. `fixed_scan_halfwidth: 0` restores the
+        // walked window a config written before 2026-10-04 quantified with.
         let d = QuantConfig::default();
         assert_eq!(d.fragment_selection, FragmentSelection::ObservedArea);
-        assert_eq!(d.fixed_scan_halfwidth, 0);
+        assert_eq!(d.fixed_scan_halfwidth, 3);
         assert_eq!(d.fixed_window_s, 0.0);
         assert!(!d.baseline_subtract);
         assert_eq!(

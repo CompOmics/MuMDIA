@@ -4063,7 +4063,11 @@ mod tests {
         )
         .unwrap();
 
-        let cfg = QuantConfig::default();
+        // The walked-window contract: pin the window off, which is no longer the default.
+        let cfg = QuantConfig {
+            fixed_scan_halfwidth: 0,
+            ..QuantConfig::default()
+        };
         let rows = run(QuantParams {
             psms_scored: &scored,
             chromatograms: &[ChromTable::whole(&chrom)],
@@ -4903,7 +4907,11 @@ mod tests {
         )
         .unwrap();
 
-        let cfg = QuantConfig::default();
+        // The walked-window contract: pin the window off, which is no longer the default.
+        let cfg = QuantConfig {
+            fixed_scan_halfwidth: 0,
+            ..QuantConfig::default()
+        };
         let rows = run(QuantParams {
             psms_scored: &scored,
             chromatograms: &[ChromTable::whole(&chrom)],

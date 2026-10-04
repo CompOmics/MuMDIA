@@ -4094,6 +4094,39 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                 apex_sum = groups.sum(i); // report full apex intensity
             }
         }
+        // `apex_refine_intensity`: the count picks the region, intensity the scan. The
+        // qualifying scans widened by the rolling half-width form the region; its scan
+        // with the largest signature intensity (x prior) is the apex. On a tailing peak
+        // the rolling count peaks after the intensity maximum, so the count alone puts
+        // the apex a scan late (docs/09, section 4 "Apex selection").
+        if p.cfg.apex_refine_intensity {
+            let reach = r as isize;
+            let qualifies = |i: usize| counts[i] > 0 && smoothed[i] >= thresh;
+            let mut best = f32::NEG_INFINITY;
+            for i in 0..counts.len() {
+                if counts[i] == 0 {
+                    continue;
+                }
+                let lo = (i as isize - reach).max(0) as usize;
+                let hi = ((i as isize + reach) as usize).min(counts.len() - 1);
+                if !(lo..=hi).any(qualifies) {
+                    continue;
+                }
+                let rt = groups.rt(i);
+                let sig_sum: f32 = sig.iter().map(|&o| groups.or_zero(i, o)).sum();
+                let prior = if use_prior {
+                    (-0.5 * ((rt - rt_cal_c) / rt_prior_sigma).powi(2)).exp() as f32
+                } else {
+                    1.0
+                };
+                let score = sig_sum * prior;
+                if score > best {
+                    best = score;
+                    apex_rt = rt;
+                    apex_sum = groups.sum(i);
+                }
+            }
+        }
 
         // Co-elution run: max consecutive scan groups with >= min_coelution frags.
         let mut best_run = 0usize;
