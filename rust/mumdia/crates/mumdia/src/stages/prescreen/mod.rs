@@ -44,7 +44,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 use mumdia_core::config::{
-    Config, PrescreenConfig, PrescreenLocalization, PrescreenScope, PrescreenScopeMatch,
+    Config, PrescreenConfig, PrescreenLocalization, PrescreenPlacement, PrescreenScope,
+    PrescreenScopeMatch,
 };
 use mumdia_core::constants::{residue_mass, PROTON, WATER};
 use mumdia_core::mass::{parse_peptidoform, unimod_mass};
@@ -560,7 +561,7 @@ pub fn run_if_enabled(
     windows: &str,
     out_dir: &str,
 ) -> Result<Option<String>> {
-    if !cfg.prescreen.enabled {
+    if !cfg.prescreen.enabled || cfg.prescreen.placement != PrescreenPlacement::AfterCalibration {
         return Ok(None);
     }
     let out = format!("{out_dir}/prescreen_survivors.parquet");
@@ -576,6 +577,78 @@ pub fn run_if_enabled(
         sample_candidates: 0,
     })?;
     Ok(Some(out))
+}
+
+/// The orchestrator's hook before prediction: when `prescreen.enabled` with
+/// `placement = "before_prediction"`, screen `table` (the peptidoform table, or an imported
+/// library's precursors) on this run's MS2 over the whole gradient, without retention times.
+/// Returns the survivors table.
+pub fn run_before_prediction(
+    cfg: &Config,
+    config_hash: &str,
+    ms2: &str,
+    ms1: Option<&str>,
+    table: &str,
+    out_dir: &str,
+) -> Result<Option<String>> {
+    if !cfg.prescreen.enabled || cfg.prescreen.placement != PrescreenPlacement::BeforePrediction {
+        return Ok(None);
+    }
+    let out = format!("{out_dir}/prescreen_survivors.parquet");
+    info!(stage = %"prescreen", placement = %"before_prediction", "run: stage start");
+    run(PrescreenParams {
+        ms2,
+        library_precursors: table,
+        run_windows: None,
+        ms1,
+        out: &out,
+        config: cfg,
+        config_hash,
+        sample_candidates: 0,
+    })?;
+    Ok(Some(out))
+}
+
+/// Copy the rows of `input` whose `id_col` is among the survivors' `candidate_id`s to `out`,
+/// streaming, in input order and with the input schema. Returns the rows written.
+pub fn filter_rows(input: &str, id_col: &str, survivors: &str, out: &str) -> Result<u64> {
+    use arrow::array::{Array, BooleanArray, UInt32Array};
+    use arrow::compute::filter_record_batch;
+    use mumdia_io::table::BatchWriter;
+    mumdia_io::refuse_output_over_input(out, &[("input", input), ("survivors", survivors)])?;
+    let ids = TableFile::open(survivors)?.u32("candidate_id")?;
+    let max = ids.iter().copied().max().unwrap_or(0) as usize;
+    let mut keep = vec![false; max + 1];
+    for &i in &ids {
+        keep[i as usize] = true;
+    }
+    drop(ids);
+    let t = TableFile::open(input)?;
+    let reader = t.batches(None, 1 << 16)?;
+    let schema = reader.schema();
+    let ix = schema
+        .index_of(id_col)
+        .map_err(|_| anyhow::anyhow!("{input}: no column '{id_col}'"))?;
+    let mut w = BatchWriter::with_row_group_rows(out, schema.clone(), 1 << 17)?;
+    let mut rows = 0u64;
+    for b in reader {
+        let b = b?;
+        let col = b
+            .column(ix)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| anyhow::anyhow!("{input}: '{id_col}' is not u32"))?;
+        let mask: BooleanArray = (0..col.len())
+            .map(|i| Some(keep.get(col.value(i) as usize).copied().unwrap_or(false)))
+            .collect();
+        let kept = filter_record_batch(&b, &mask)?;
+        if kept.num_rows() > 0 {
+            rows += kept.num_rows() as u64;
+            w.write(&kept)?;
+        }
+    }
+    w.close()?;
+    Ok(rows)
 }
 
 pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
@@ -599,10 +672,30 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     );
 
     let lib = TableFile::open(p.library_precursors)?;
-    let mut cid = lib.u32("candidate_id")?;
+    // A library carries `candidate_id` and `precursor_mz`. The peptidoform table written
+    // before prediction carries neither: its row key is `id` and the precursor m/z follows
+    // from the sequence and charge, so the screen can run before any predictor does.
+    let id_col = if lib.has_column("candidate_id") {
+        "candidate_id"
+    } else {
+        "id"
+    };
+    let mut cid = lib.u32(id_col)?;
     let (pform_off, pform_data) = lib.str_flat("peptidoform")?;
-    let mut pmz = lib.f64("precursor_mz")?;
     let mut charge = lib.i32("charge")?;
+    let mut pmz = if lib.has_column("precursor_mz") {
+        lib.f64("precursor_mz")?
+    } else {
+        (0..lib.nrows)
+            .into_par_iter()
+            .map(|i| {
+                let s = &pform_data[pform_off[i]..pform_off[i + 1]];
+                parse_peptidoform(s.strip_prefix("DECOY_").unwrap_or(s))
+                    .map(|q| q.precursor_mz(charge[i]))
+                    .unwrap_or(f64::NAN)
+            })
+            .collect()
+    };
     let (mut label_id, label_dict) = lib.str_interned("label")?;
     let mut rows: Vec<usize> = (0..lib.nrows).collect();
     drop(lib);
@@ -2023,6 +2116,58 @@ mod tests {
             assert!(v.iter().all(|x| x.is_finite() && *x >= 0.0), "{name}");
         }
         assert!(t.f64("component_tag").unwrap().iter().any(|&x| x > 0.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Before prediction: the peptidoform table (row key `id`, no `precursor_mz`) screened
+    /// without RT windows keeps exactly what the library-shaped table keeps over the whole
+    /// gradient.
+    #[test]
+    fn the_peptidoform_table_screens_without_predictions() {
+        let dir = scratch("prepred");
+        let (ms2, lib, _) = synthetic_run(&dir, 300, 90, false);
+        let t = TableFile::open(&lib).unwrap();
+        let pf = format!("{dir}/peptidoforms.parquet");
+        write_table(
+            &pf,
+            vec![
+                Col::U32("id".into(), t.u32("candidate_id").unwrap()),
+                Col::Str("peptidoform".into(), {
+                    let (o, d) = t.str_flat("peptidoform").unwrap();
+                    (0..t.nrows)
+                        .map(|i| d[o[i]..o[i + 1]].to_string())
+                        .collect()
+                }),
+                Col::I32("charge".into(), t.i32("charge").unwrap()),
+                Col::Str("label".into(), {
+                    let (id, dict) = t.str_interned("label").unwrap();
+                    id.iter().map(|&k| dict[k as usize].clone()).collect()
+                }),
+            ],
+        )
+        .unwrap();
+        let go = |lib: &str, out: &str| {
+            run(PrescreenParams {
+                ms2: &ms2,
+                library_precursors: lib,
+                run_windows: None,
+                ms1: None,
+                out,
+                config: &conf(cfg()),
+                config_hash: "t",
+                sample_candidates: 0,
+            })
+            .unwrap();
+            survivors(out)
+        };
+        let a = go(&lib, &format!("{dir}/a.parquet"));
+        let b = go(&pf, &format!("{dir}/b.parquet"));
+        assert_eq!(a, b);
+        assert!(!a.is_empty() && a.len() < 300);
+        assert!(
+            (0..90u32).all(|i| a.contains(&i)),
+            "planted candidates kept without RT"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

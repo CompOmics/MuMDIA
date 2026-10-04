@@ -209,9 +209,26 @@ prescreen stays off by default.
 
 ## 6. Use
 
-Inside a run: `"prescreen": {"enabled": true}` (`configs/examples/prescreen-balanced.json`). The
-stage runs after `rt-im-train`, on the library extract will read, and extract searches only its
-survivors. Not yet supported with `groups.window_groups > 1` (validation rejects the combination).
+Inside a run: `"prescreen": {"enabled": true}` (`configs/examples/prescreen-balanced.json`).
+`prescreen.placement` decides where it runs:
+
+- `after_calibration` (default): after `rt-im-train`, inside each candidate's calibrated RT
+  window, on the library extract will read; extract searches only the survivors. Every
+  prediction and the calibration have been paid for by then.
+- `before_prediction`: no retention time is used; each candidate is scored over the whole
+  gradient of its isolation window. In FASTA mode the spectra are converted first, the
+  peptidoform table is screened (its precursor m/z is computed from sequence and charge), and
+  only the surviving peptidoforms go to MS2PIP and DeepLC
+  (`peptidoforms_prescreened.parquet`); the library cache is not used, because the library
+  then depends on the run. With an imported library the screen runs after convert and the
+  survivors become a sub-library (`library_prescreened_*.parquet`, not pair-linked: the screen
+  is label-blind) before the seed search and the multi-head DeepLC calibration. Single-file
+  `run` only; `run-experiment` refuses it, because one library serves every run and the
+  survivors would first have to be united over runs. On the CI fixture (160 planted peptides)
+  it predicted 1,761 of 3,820 peptidoforms and identified 114 planted peptides against 116
+  without the screen.
+
+Not yet supported with `groups.window_groups > 1` (validation rejects the combination).
 
 Standalone, for a run directory written by `mumdia run`:
 

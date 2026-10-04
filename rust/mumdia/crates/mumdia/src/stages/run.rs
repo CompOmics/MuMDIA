@@ -194,6 +194,14 @@ pub fn run(p: RunParams) -> Result<()> {
         cfg.predict_frag.deeplc_python.is_some(),
     );
 
+    // `prescreen.placement = "before_prediction"`: the spectra are converted first so the
+    // screen can run on the peptidoforms (FASTA mode) or the imported library before any
+    // prediction or calibration, without retention times.
+    let before_prediction = cfg.prescreen.enabled
+        && cfg.prescreen.placement == mumdia_core::config::PrescreenPlacement::BeforePrediction;
+    let spectra_dir = d("spectra");
+    let mut early_co: Option<convert::ConvertOutputs> = None;
+
     // --- experiment-wide artifacts: the spectral library ---
     // Either digest the FASTA (default) or consume a prebuilt library
     // (library-input mode), then feed the same lib_p/lib_f downstream.
@@ -231,12 +239,18 @@ pub fn run(p: RunParams) -> Result<()> {
             // `predict_frag.library_cache`: a library stored by an earlier run with the same
             // FASTA, build settings, predictor versions and engine is published here instead
             // of being built (`library_cache`).
-            let cache = crate::library_cache::LibraryCache::for_config(
-                cfg,
-                fasta,
-                rt_placeholder,
-                (&man.mumdia_version, &man.git_sha),
-            );
+            // A prescreened library depends on this run's spectra, so it is neither restored
+            // from nor stored in the library cache.
+            let cache = if before_prediction {
+                None
+            } else {
+                crate::library_cache::LibraryCache::for_config(
+                    cfg,
+                    fasta,
+                    rt_placeholder,
+                    (&man.mumdia_version, &man.git_sha),
+                )
+            };
             if let Some((wp, wf)) = cache.as_ref().and_then(|c| c.restore(&lib_p, &lib_f)) {
                 pre.first_stage("library-cache");
                 // A reused output directory may still hold an earlier build's digest and
@@ -288,6 +302,50 @@ pub fn run(p: RunParams) -> Result<()> {
                     "peptidoforms",
                     &ch,
                 ));
+
+                // Before prediction: only the peptidoforms the screen keeps reach MS2PIP and
+                // DeepLC.
+                let pf = if before_prediction {
+                    pre.first_stage("convert");
+                    info!(stage = %"convert", "run: stage start");
+                    let co = convert_and_record(&p, cfg, &spectra_dir, &mut man)?;
+                    let surv = prescreen::run_before_prediction(
+                        cfg,
+                        &ch,
+                        &co.ms2,
+                        Some(&co.ms1),
+                        &pf,
+                        p.out_dir,
+                    )?
+                    .expect("before_prediction implies an enabled prescreen");
+                    man.record(record_artifact(
+                        "prescreen_survivors",
+                        artifact::PRESCAN_SURVIVORS,
+                        &surv,
+                        mumdia_io::table::nrows(&surv)?,
+                        "prescreen",
+                        &ch,
+                    )?);
+                    let kept = d("peptidoforms_prescreened.parquet");
+                    let n = prescreen::filter_rows(&pf, "id", &surv, &kept)?;
+                    info!(
+                        kept = n,
+                        of = mumdia_io::table::nrows(&pf)?,
+                        "run: peptidoforms passed to prediction after the prescreen"
+                    );
+                    man.record(record_artifact(
+                        artifact::PEPTIDOFORMS.0,
+                        artifact::PEPTIDOFORMS,
+                        &kept,
+                        n,
+                        "prescreen",
+                        &ch,
+                    )?);
+                    early_co = Some(co);
+                    kept
+                } else {
+                    pf
+                };
 
                 if cfg.predict_frag.defer_deeplc_to_multihead && !rt_placeholder {
                     info!(
@@ -345,71 +403,77 @@ pub fn run(p: RunParams) -> Result<()> {
     };
 
     // --- per-run artifacts ---
-    let spectra_dir = d("spectra");
-    // Fold the conversion caps into the convert artifacts' provenance key, exactly as the
-    // standalone `convert` subcommand does. They change the spectra output but are not part
-    // of the config, so passing the bare config hash here made two runs with different caps
-    // record an identical config_hash for their convert artifacts -- provenance that
-    // disagreed with the standalone entry point for the same inputs.
-    let convert_hash = mumdia_io::hash::blake3_str(&format!(
-        "{}\u{1f}max_spectra={}\u{1f}top_peaks_ms2={}\u{1f}top_peaks_ms1={}",
-        cfg.canonical_json(),
-        p.max_spectra,
-        p.top_peaks_ms2,
-        0
-    ));
-    pre.first_stage("convert");
-    info!(stage = %"convert", "run: stage start");
-    let co = convert::run(convert::ConvertParams {
-        mzml: p.mzml,
-        out_dir: &spectra_dir,
-        max_spectra: p.max_spectra,
-        top_peaks_ms2: p.top_peaks_ms2,
-        top_peaks_ms1: 0,
-        config_hash: &convert_hash,
-    })?;
-    for (name, schema, path, hash) in [
-        (
-            "spectra_ms1",
-            artifact::SPECTRA_MS1,
-            &co.ms1,
-            &co.hashes.ms1,
-        ),
-        (
-            "spectra_ms2",
-            artifact::SPECTRA_MS2,
-            &co.ms2,
-            &co.hashes.ms2,
-        ),
-        (
-            "isolation_windows",
-            artifact::ISOLATION_WINDOWS,
-            &co.isolation_windows,
-            &co.hashes.isolation_windows,
-        ),
-        (
-            "ms2_to_ms1",
-            artifact::MS2_TO_MS1,
-            &co.ms2_to_ms1,
-            &co.hashes.ms2_to_ms1,
-        ),
-    ] {
-        let rows = mumdia_io::table::nrows(path)?;
-        // `convert_hash`, not the bare config hash: the manifest is the provenance record,
-        // so it must carry the same cap-folded key the artifact's own report does. Stamping
-        // `ch` here made two runs differing only in `--top-peaks-ms2` record identical
-        // provenance for their spectra, and disagreed with the report written beside them.
-        // The content hash is the one convert computed for that report.
-        man.record(record_artifact_with_hash(
-            name,
-            schema,
-            path,
-            rows,
-            "convert",
-            &convert_hash,
-            hash.clone(),
-        ));
-    }
+    let co = match early_co {
+        Some(co) => co,
+        None => {
+            pre.first_stage("convert");
+            info!(stage = %"convert", "run: stage start");
+            convert_and_record(&p, cfg, &spectra_dir, &mut man)?
+        }
+    };
+
+    // Imported library with the prescreen before prediction: the screen runs here, after
+    // convert and before the seed search and the multi-head calibration, and its survivors
+    // become the library every later stage reads.
+    let (lib_p, lib_f) = match (before_prediction, p.lib_precursors.is_some()) {
+        (true, true) => {
+            let surv = prescreen::run_before_prediction(
+                cfg,
+                &ch,
+                &co.ms2,
+                Some(&co.ms1),
+                &lib_p,
+                p.out_dir,
+            )?
+            .expect("before_prediction implies an enabled prescreen");
+            man.record(record_artifact(
+                "prescreen_survivors",
+                artifact::PRESCAN_SURVIVORS,
+                &surv,
+                mumdia_io::table::nrows(&surv)?,
+                "prescreen",
+                &ch,
+            )?);
+            let sp = d("library_prescreened_precursors.parquet");
+            let sf = d("library_prescreened_fragments.parquet");
+            info!(stage = %"sub-library", "run: stage start");
+            // Not pair-linked: the screen is label-blind and decides each candidate on its own
+            // evidence, as extract's allowlist does after calibration.
+            let st = sub_library::run(sub_library::SubLibraryParams {
+                precursors: &lib_p,
+                fragments: &lib_f,
+                survivors: &surv,
+                out_precursors: &sp,
+                out_fragments: &sf,
+                pair_linked: false,
+            })?;
+            info!(
+                library = st.library_precursors,
+                kept = st.precursors,
+                targets = st.targets,
+                decoys = st.decoys,
+                "run: the prescreened library replaces the imported one"
+            );
+            man.record(record_artifact(
+                artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+                artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                &sp,
+                st.precursors,
+                "prescreen",
+                &ch,
+            )?);
+            man.record(record_artifact(
+                artifact::FRAGMENT_LIBRARY_FRAGMENTS.0,
+                artifact::FRAGMENT_LIBRARY_FRAGMENTS,
+                &sf,
+                st.fragments,
+                "prescreen",
+                &ch,
+            )?);
+            (sp, sf)
+        }
+        _ => (lib_p, lib_f),
+    };
 
     // The RT model is decided here for both paths: it names the manifest identity, and the
     // grouped path runs it per band.
@@ -1001,4 +1065,77 @@ pub fn run(p: RunParams) -> Result<()> {
     // The DeepLC projection cache may have grown during the run.
     crate::cache::enforce_for(cfg);
     Ok(())
+}
+
+/// Convert the run's spectra and record the four artifacts in the manifest.
+fn convert_and_record(
+    p: &RunParams,
+    cfg: &Config,
+    spectra_dir: &str,
+    man: &mut Manifest,
+) -> Result<convert::ConvertOutputs> {
+    // Fold the conversion caps into the convert artifacts' provenance key, exactly as the
+    // standalone `convert` subcommand does. They change the spectra output but are not part
+    // of the config, so passing the bare config hash here made two runs with different caps
+    // record an identical config_hash for their convert artifacts -- provenance that
+    // disagreed with the standalone entry point for the same inputs.
+    let convert_hash = mumdia_io::hash::blake3_str(&format!(
+        "{}\u{1f}max_spectra={}\u{1f}top_peaks_ms2={}\u{1f}top_peaks_ms1={}",
+        cfg.canonical_json(),
+        p.max_spectra,
+        p.top_peaks_ms2,
+        0
+    ));
+    let co = convert::run(convert::ConvertParams {
+        mzml: p.mzml,
+        out_dir: spectra_dir,
+        max_spectra: p.max_spectra,
+        top_peaks_ms2: p.top_peaks_ms2,
+        top_peaks_ms1: 0,
+        config_hash: &convert_hash,
+    })?;
+    for (name, schema, path, hash) in [
+        (
+            "spectra_ms1",
+            artifact::SPECTRA_MS1,
+            &co.ms1,
+            &co.hashes.ms1,
+        ),
+        (
+            "spectra_ms2",
+            artifact::SPECTRA_MS2,
+            &co.ms2,
+            &co.hashes.ms2,
+        ),
+        (
+            "isolation_windows",
+            artifact::ISOLATION_WINDOWS,
+            &co.isolation_windows,
+            &co.hashes.isolation_windows,
+        ),
+        (
+            "ms2_to_ms1",
+            artifact::MS2_TO_MS1,
+            &co.ms2_to_ms1,
+            &co.hashes.ms2_to_ms1,
+        ),
+    ] {
+        let rows = mumdia_io::table::nrows(path)?;
+        // `convert_hash`, not the bare config hash: the manifest is the provenance record,
+        // so it must carry the same cap-folded key the artifact's own report does. Stamping
+        // `ch` here made two runs differing only in `--top-peaks-ms2` record identical
+        // provenance for their spectra, and disagreed with the report written beside them.
+        // The content hash is the one convert computed for that report.
+        man.record(record_artifact_with_hash(
+            name,
+            schema,
+            path,
+            rows,
+            "convert",
+            &convert_hash,
+            hash.clone(),
+        ));
+    }
+
+    Ok(co)
 }

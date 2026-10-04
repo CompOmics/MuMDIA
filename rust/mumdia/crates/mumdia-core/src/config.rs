@@ -470,6 +470,21 @@ pub enum PrescreenScopeMatch {
     All,
 }
 
+/// Where the prescreen runs inside `run` (`prescreen.placement`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenPlacement {
+    /// After retention-time calibration, inside each candidate's calibrated RT window; extract
+    /// searches the survivors.
+    #[default]
+    AfterCalibration,
+    /// Before any prediction, over the whole gradient of each candidate's isolation window (no
+    /// retention time is used). In FASTA mode only the surviving peptidoforms go to MS2PIP and
+    /// DeepLC; with an imported library the survivors become a sub-library before the seed
+    /// search and the multi-head calibration. Single-run `run` only for now.
+    BeforePrediction,
+}
+
 /// Which candidates the prescreen scores (`prescreen.retrieval`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -689,6 +704,7 @@ pub struct PrescreenConfig {
     pub mass_hypotheses: PrescreenMassConfig,
     pub trace: PrescreenTraceConfig,
     pub localization: PrescreenLocalization,
+    pub placement: PrescreenPlacement,
 }
 impl Default for PrescreenConfig {
     fn default() -> Self {
@@ -720,6 +736,7 @@ impl Default for PrescreenConfig {
             mass_hypotheses: t(),
             trace: t(),
             localization: PrescreenLocalization::Own,
+            placement: PrescreenPlacement::AfterCalibration,
         }
     }
 }

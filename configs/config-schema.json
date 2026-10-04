@@ -532,6 +532,23 @@
       ]
     },
     {
+      "path": "prescreen.placement",
+      "name": "placement",
+      "section": "prescreen",
+      "rust_type": "PrescreenPlacement",
+      "kind": "enum",
+      "optional": false,
+      "default": "after_calibration",
+      "default_text": "`after_calibration`",
+      "help": "",
+      "gates": [],
+      "source_struct": "PrescreenConfig",
+      "choices": [
+        "after_calibration",
+        "before_prediction"
+      ]
+    },
+    {
       "path": "prescreen.tags.edge_tol_da",
       "name": "edge_tol_da",
       "section": "prescreen.tags",
