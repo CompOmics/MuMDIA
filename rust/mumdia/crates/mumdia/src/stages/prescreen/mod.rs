@@ -126,7 +126,11 @@ impl Histogram {
 
     /// `min(0.99999, (sum of bins b-1..=b+1 + 0.5) / (n + 1))`.
     fn probability(&self, mz: f64) -> f64 {
-        let b = bin_of(mz);
+        self.probability_bin(bin_of(mz))
+    }
+
+    /// `probability` of any m/z in bin `b`: the weight depends on the bin alone.
+    fn probability_bin(&self, b: i64) -> f64 {
         let mut c = 0u64;
         for k in b - 1..=b + 1 {
             if k >= 0 && (k as usize) < self.counts.len() {
@@ -145,21 +149,77 @@ impl Histogram {
 struct Occupancy {
     words: usize,
     bits: Vec<u64>,
+    /// Inverted index: the window's spectra (local index, ascending) holding a peak in bin `b`
+    /// are `post[post_off[b]..post_off[b + 1]]`.
+    post_off: Vec<u32>,
+    post: Vec<u32>,
+    /// `-ln p` of bin `b`, the rarity weight every peak in that bin carries.
+    wbin: Vec<f64>,
 }
 
 impl Occupancy {
-    fn build(sp: &Spectra, g: &WindowGroup) -> Occupancy {
+    fn build(sp: &Spectra, g: &WindowGroup, hist: &Histogram) -> Occupancy {
         let words = sp.nbin / 64 + 2;
+        let nbits = words * 64;
         let mut bits = vec![0u64; g.count * words];
         bits.par_chunks_mut(words).enumerate().for_each(|(t, row)| {
             for &m in sp.peaks(g.first + t) {
                 let b = bin_of(m as f64);
-                if b >= 0 && (b as usize) < words * 64 {
+                if b >= 0 && (b as usize) < nbits {
                     row[b as usize / 64] |= 1u64 << (b as usize % 64);
                 }
             }
         });
-        Occupancy { words, bits }
+        // The inverted index from the bitmap rows, spectra ascending within each bin.
+        let mut counts = vec![0u32; nbits + 1];
+        for row in bits.chunks(words) {
+            for (w, &word) in row.iter().enumerate() {
+                let mut x = word;
+                while x != 0 {
+                    counts[w * 64 + x.trailing_zeros() as usize] += 1;
+                    x &= x - 1;
+                }
+            }
+        }
+        let mut post_off = vec![0u32; nbits + 1];
+        for b in 0..nbits {
+            post_off[b + 1] = post_off[b] + counts[b];
+        }
+        let mut fill = post_off.clone();
+        let mut post = vec![0u32; post_off[nbits] as usize];
+        for (t, row) in bits.chunks(words).enumerate() {
+            for (w, &word) in row.iter().enumerate() {
+                let mut x = word;
+                while x != 0 {
+                    let b = w * 64 + x.trailing_zeros() as usize;
+                    post[fill[b] as usize] = t as u32;
+                    fill[b] += 1;
+                    x &= x - 1;
+                }
+            }
+        }
+        let wbin = (0..nbits as i64)
+            .map(|b| -hist.probability_bin(b).ln())
+            .collect();
+        Occupancy {
+            words,
+            bits,
+            post_off,
+            post,
+            wbin,
+        }
+    }
+
+    /// The window spectra (local index) with a peak in bin `b`, restricted to `lo..hi`.
+    fn spectra_in(&self, b: i64, lo: usize, hi: usize) -> &[u32] {
+        if b < 0 || b as usize + 1 >= self.post_off.len() {
+            return &[];
+        }
+        let all =
+            &self.post[self.post_off[b as usize] as usize..self.post_off[b as usize + 1] as usize];
+        let a = all.partition_point(|&t| (t as usize) < lo);
+        let z = all.partition_point(|&t| (t as usize) < hi);
+        &all[a..z]
     }
 
     fn row(&self, t: usize) -> &[u64] {
@@ -497,6 +557,75 @@ fn score_in_group(
     } else {
         &[false]
     };
+    // Pruned exact path (no repeat bonus): an upper bound per spectrum from the inverted index,
+    // then exact scores in descending bound order until no remaining bound can beat the best.
+    if let (Some(o), false) = (occ, repeat) {
+        let ne = b - a;
+        let mut ub = vec![0.0f64; ne];
+        let mut touched: Vec<usize> = Vec::new();
+        for &rev in orientations {
+            fragment_mz(masses, rev, c.nz, frag);
+            let fbins: Vec<(i64, i64)> = frag
+                .iter()
+                .map(|&x| fragment_bins(x, cfg.frag_tol_da))
+                .collect();
+            for &(lo, hi) in &fbins {
+                for bin in lo..=hi {
+                    let w = match o.wbin.get(bin.max(0) as usize) {
+                        Some(&w) if bin >= 0 => w,
+                        _ => continue,
+                    };
+                    for &t in o.spectra_in(bin, a, b) {
+                        let k = t as usize - a;
+                        if ub[k] == 0.0 {
+                            touched.push(k);
+                        }
+                        ub[k] += w;
+                    }
+                }
+            }
+            let crowd = |s: usize| {
+                if cfg.crowding_exponent > 0.0 {
+                    let n = (sp.offsets[s + 1] - sp.offsets[s]) as f64;
+                    (n / mean_peaks.max(1e-12))
+                        .clamp(0.25, 4.0)
+                        .powf(cfg.crowding_exponent)
+                } else {
+                    1.0
+                }
+            };
+            let mut order: Vec<(f64, usize)> = touched
+                .iter()
+                .map(|&k| (ub[k] / sqrt_l / crowd(g.first + a + k), k))
+                .collect();
+            order.sort_unstable_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)));
+            for &(bound, k) in &order {
+                // A 1e-9 relative margin keeps rounding from pruning the true maximum.
+                if bound * (1.0 + 1e-9) <= best {
+                    break;
+                }
+                let s = g.first + a + k;
+                let (lo, hi) = (sp.offsets[s], sp.offsets[s + 1]);
+                let total = spectrum_score(
+                    frag,
+                    &sp.mz[lo..hi],
+                    &sp.positive[lo..hi],
+                    &neglnp[lo - base..hi - base],
+                    sqrt_l,
+                    cfg,
+                    hits,
+                    None,
+                    Some((o.row(s - g.first), fbins.as_slice())),
+                ) / crowd(s);
+                best = best.max(total);
+            }
+            for &k in &touched {
+                ub[k] = 0.0;
+            }
+            touched.clear();
+        }
+        return (best, 0.0);
+    }
     for &rev in orientations {
         fragment_mz(masses, rev, c.nz, frag);
         let fbins: Vec<(i64, i64)> = frag
@@ -671,7 +800,7 @@ fn score_all(
         let hist = Histogram::build((g.first..g.first + g.count).map(|s| sp.peaks(s)), sp.nbin);
         let base = sp.offsets[g.first];
         let end = sp.offsets[g.first + g.count];
-        let occ = Occupancy::build(sp, g);
+        let occ = Occupancy::build(sp, g, &hist);
         let neglnp: Vec<f64> = sp.mz[base..end]
             .par_iter()
             .map(|&m| -hist.probability(m as f64).ln())
@@ -2581,8 +2710,8 @@ mod tests {
             }
             let sp = one_window(spectra);
             let g = &sp.groups[0];
-            let occ = Occupancy::build(&sp, g);
             let hist = Histogram::build((0..sp.rt.len()).map(|s| sp.peaks(s)), sp.nbin);
+            let occ = Occupancy::build(&sp, g, &hist);
             let neglnp: Vec<f64> = sp
                 .mz
                 .iter()
