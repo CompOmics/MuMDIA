@@ -69,6 +69,11 @@ pub struct PrescreenParams<'a> {
     /// The whole configuration: the tag alphabet comes from its chemistry block.
     pub config: &'a Config,
     pub config_hash: &'a str,
+    /// Evaluation only: score a seeded, label-blind sample of about this many candidates and
+    /// nothing else (0 = every candidate). The survivors table then covers the sample only and
+    /// must not be handed to extract; it exists to measure expensive components the way the
+    /// prototype did, on sampled candidates.
+    pub sample_candidates: usize,
 }
 
 /// What the stage kept, for the orchestrator's log and manifest.
@@ -568,6 +573,7 @@ pub fn run_if_enabled(
         out: &out,
         config: cfg,
         config_hash,
+        sample_candidates: 0,
     })?;
     Ok(Some(out))
 }
@@ -593,17 +599,40 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     );
 
     let lib = TableFile::open(p.library_precursors)?;
-    let cid = lib.u32("candidate_id")?;
+    let mut cid = lib.u32("candidate_id")?;
     let (pform_off, pform_data) = lib.str_flat("peptidoform")?;
+    let mut pmz = lib.f64("precursor_mz")?;
+    let mut charge = lib.i32("charge")?;
+    let (mut label_id, label_dict) = lib.str_interned("label")?;
+    let mut rows: Vec<usize> = (0..lib.nrows).collect();
+    drop(lib);
+    if p.sample_candidates > 0 && p.sample_candidates < rows.len() {
+        // Keep a candidate when a seeded hash of its id falls below the sampling fraction:
+        // independent of label and row order.
+        let frac = p.sample_candidates as f64 / rows.len() as f64;
+        let salt = cfg.seed ^ 0x5A4D_504C_455F_5345;
+        rows.retain(|&i| {
+            let mut z = salt ^ (cid[i] as u64);
+            z = (z ^ (z >> 33)).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+            z = (z ^ (z >> 33)).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+            z ^= z >> 33;
+            ((z >> 11) as f64 / (1u64 << 53) as f64) < frac
+        });
+        cid = rows.iter().map(|&i| cid[i]).collect();
+        pmz = rows.iter().map(|&i| pmz[i]).collect();
+        charge = rows.iter().map(|&i| charge[i]).collect();
+        label_id = rows.iter().map(|&i| label_id[i]).collect();
+        warn!(
+            sampled = rows.len(),
+            "prescreen: evaluation sample; the survivors cover the sample only"
+        );
+    }
     let pform = |i: usize| {
-        let s = &pform_data[pform_off[i]..pform_off[i + 1]];
+        let r = rows[i];
+        let s = &pform_data[pform_off[r]..pform_off[r + 1]];
         s.strip_prefix("DECOY_").unwrap_or(s)
     };
-    let pmz = lib.f64("precursor_mz")?;
-    let charge = lib.i32("charge")?;
-    let (label_id, label_dict) = lib.str_interned("label")?;
-    let n = lib.nrows;
-    drop(lib);
+    let n = rows.len();
 
     // Per-candidate RT bounds, joined by candidate_id through a dense lookup.
     let maxc = cid.iter().copied().max().unwrap_or(0) as usize;
@@ -983,6 +1012,7 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     stats.insert("decoy_retention".into(), json!(frac(d_kept, d_tot)));
     stats.insert("scoring_ms".into(), json!(scoring_ms));
     stats.insert("extension_ms".into(), json!(ext_ms));
+    stats.insert("sample_candidates".into(), json!(p.sample_candidates));
     if let Some((bs, cs)) = &scales {
         stats.insert("base_scale_q95".into(), json!(bs));
         stats.insert("component_scales_q95".into(), json!(cs));
@@ -1672,6 +1702,7 @@ mod tests {
             ms1: None,
             config: &conf(c.clone()),
             config_hash: "test",
+            sample_candidates: 0,
         })
         .unwrap();
         assert!(sum.bypass_reason.is_none());
@@ -1707,6 +1738,7 @@ mod tests {
             ms1: None,
             config: &conf(cfg()),
             config_hash: "test",
+            sample_candidates: 0,
         })
         .unwrap();
         assert_eq!(survivors(&out2), kept);
@@ -1727,6 +1759,7 @@ mod tests {
             ms1: None,
             config: &conf(cfg()),
             config_hash: "test",
+            sample_candidates: 0,
         })
         .unwrap();
         assert!(sum.bypass_reason.unwrap().contains("min_calibration"));
@@ -1745,6 +1778,7 @@ mod tests {
             ms1: None,
             config: &conf(c.clone()),
             config_hash: "test",
+            sample_candidates: 0,
         })
         .unwrap();
         assert!(sum.bypass_reason.is_some());
@@ -1880,6 +1914,7 @@ mod tests {
                 out: &out,
                 config: &conf(c),
                 config_hash: "t",
+                sample_candidates: 0,
             })
             .unwrap();
             let t = scores_table(&out);
@@ -1917,6 +1952,7 @@ mod tests {
                 out: &out,
                 config: &conf(c),
                 config_hash: "t",
+                sample_candidates: 0,
             })
             .unwrap();
             let rep: serde_json::Value =

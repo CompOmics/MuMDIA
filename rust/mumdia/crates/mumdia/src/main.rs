@@ -216,6 +216,10 @@ enum Cmd {
         /// Also write `<out>.scores.parquet`.
         #[arg(long)]
         write_scores: bool,
+        /// Evaluation only: score a seeded sample of about N candidates (survivors then cover
+        /// the sample only and are not an extract allowlist).
+        #[arg(long, default_value_t = 0)]
+        sample_candidates: usize,
     },
     /// Native broad DIA seed search over the fragment index -> seed_psms.parquet.
     SearchSeed {
@@ -1507,6 +1511,7 @@ fn real_main() -> Result<()> {
             target,
             top_peaks,
             write_scores,
+            sample_candidates,
         } => {
             let mut cfg = load_config(&config)?;
             if let Some(p) = preset {
@@ -1531,6 +1536,7 @@ fn real_main() -> Result<()> {
                 out: &out,
                 config: &cfg,
                 config_hash: &ch,
+                sample_candidates,
             })?;
         }
         Cmd::Compete {
