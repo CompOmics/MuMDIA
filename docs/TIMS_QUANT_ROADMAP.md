@@ -1132,6 +1132,602 @@ Shared with DIA-NN 2.2.0: 94,139 ions, 0.135 / 0.098 / -1.79 (DIA-NN 0.130 / 0.1
 1.7 s. This run's base also quantifies worse than `eng_repick`'s (0.143 / 0.227 against 0.140 / 0.218 for the
 rescuable tier alone); that is the end-to-end identification base, not MBR.
 
+## 4m. Plan: a second-pass search as a third MBR strategy (2026-10-03, not measured)
+
+The current MBR is called "transfer" below: the rescuable tier plus the re-extraction tier of sections
+4i to 4l. This section plans a second strategy, a second-pass search with an empirical library. One
+switch selects between them. Nothing here is measured yet. The numbers to beat are at the end.
+
+### What DIA-NN does, and what is assumed
+
+Sources: Demichev et al. 2020 (Nat Methods 17:41), Demichev et al. 2022 (Nat Commun 13:3944,
+dia-PASEF), and the DIA-NN documentation of `--reanalyse`. These sources describe the following:
+- MBR is a two-step analysis. The first pass searches every run. Its identifications form an empirical
+  spectral library, with observed fragment intensities, retention time and, on dia-PASEF, ion mobility.
+  The second pass searches every run again with that library.
+- DIA-NN generates decoys for whatever library it searches, so the second-pass decoys come from the
+  empirical library.
+- The second pass is the reported result.
+
+The following points are assumptions. The publications do not specify them, and nothing here copies
+DIA-NN code or constants:
+- the q unit and threshold for library inclusion;
+- how intensities are combined over runs;
+- the second-pass RT and 1/K0 window widths;
+- whether a run's own data enter its library.
+
+### SP1. The switch
+
+`mbr.strategy` becomes `none | transfer | second_pass`.
+- `transfer` is the behaviour of today's `rt_transfer`, without change. `mbr.reextract` and
+  `mbr.rescuable` remain its sub-keys, with their current defaults and validation.
+- `rt_transfer`, `empirical_library` and `full` remain enum variants, so old configs still parse
+  under `deny_unknown_fields`. `validate()` maps them to `transfer` and logs a warning that names the
+  replacement. Their meaning does not change, because today all three run the transfer tiers.
+  `empirical_library` is not made an alias of `second_pass`: that would silently change what an old
+  config does. The warning exists because the name now suggests the other strategy.
+- The current "only none versus not-none is read" warning is removed. The inert fields
+  (`rt_window_s`, `decoy_transfer`, `requant_all`) keep their own warning. They are out of scope here.
+- New sub-table `mbr.second_pass` (serde-typed, `deny_unknown_fields`):
+  - `lib_q` (0.01): the library cut;
+  - `lib_min_runs` (1): the minimum number of runs that support the precursor;
+  - `leave_run_out` (false = DIA-NN-like, the default; true is the later test arm of SP2);
+  - `rt_halfwidth_s` and `im_halfwidth` (0 = sized from held-out cross-run residuals, SP2);
+  - `shrink_runs` (2, SP2).
+- Validation:
+  - `second_pass` together with `reextract: true` is an error;
+  - `leave_run_out: true` needs at least 2 runs (the default also works on one run, as DIA-NN does);
+  - the two strategies are not combined in this plan.
+
+### SP2. The empirical library
+
+**Inclusion: unit, value and minimum runs.** Counts on the targets of `e2e_rx2/run/scored_combined`.
+"Runs" means runs with pooled PSM `q_value` <= 0.01.
+
+| cut | precursors | in 1 run | in 2 | in 3-5 | in 6 |
+|---|---|---|---|---|---|
+| `precursor_q` <= 0.01 | 112,463 | 8,566 | 9,122 | 30,922 | 63,853 |
+| `precursor_q` <= 0.02 | 119,806 | 13,666 | 10,689 | 31,586 | 63,865 |
+| `precursor_q` <= 0.05 | 130,822 | 18,408 (+5,780 in 0) | 11,125 | 31,644 | 63,865 |
+| >= 1 run at pooled `q_value` <= 0.01 | 125,042 | 18,408 | 11,125 | 31,644 | 63,865 |
+| >= 2 runs at pooled `q_value` <= 0.01 | 106,634 | 0 | 11,125 | 31,644 | 63,865 |
+
+- **Unit: precursor-level q, not a per-row PSM q.** The library is a set of precursors, so its false
+  fraction is controlled by a precursor-level q. A union of per-run PSM acceptances at 1% does not have
+  that property. The pooled PSM cut of 1% admits about 5,500 false rows over six runs. A false row rarely
+  repeats in another run, so most of those false rows become false precursors. They concentrate among
+  the 18,408 single-run precursors. `precursor_q` <= 0.01 keeps 8,566 of those 18,408.
+- **Value: 0.01, with min runs 1 (DIA-NN-like, the default).** One library from the experiment-wide
+  `precursor_q` of the pooled pass-1 rescore (112,463 precursors on e2e_rx2), searched in every run.
+  A looser cut reaches more ions: at 0.05, +18,359 precursors, of which 5,780 have no confident run.
+  It also admits more false precursors, and in the default a false entry is searched in its anchor run
+  with a spectrum and apex taken from that run (circularity, below). 0.02 and 0.05 are therefore
+  prototype arms only, and the default stays 0.01 until entrapment says otherwise.
+- **Where the 1-anchor rows are.** The 30,907 1-anchor rows of section 4i belong to the 18,408
+  single-run precursors, of which the 0.01 cut admits 8,566. The first prototype step counts how many
+  of the 30,907 rows, and how many of the 68,158 no-anchor rows, each cut reaches (`mbrgap.py` on the
+  library lists).
+- **Pass-1 rows outside the library.** 9,842 single-run precursors have a row at pooled `q_value`
+  <= 0.01 but `precursor_q` > 0.01. They are not searched in pass 2, and as in DIA-NN only the second
+  pass is reported, so their rows are dropped. Most cannot reach `min_obs` 3 in any case. The count per
+  run is reported and is part of the sensitivity gate (SP7).
+
+**Circularity, the known weakness of the default.** In the default, three things in an anchor run j were
+selected on run j's own data: a false precursor's pass-1 match there, its empirical spectrum and its
+apex. The target can then be favoured over its decoy in exactly its anchor runs, which makes q
+optimistic. The size of this effect is bounded by the false library entries, about 1% of the library
+at a 0.01 cut. The single-run E. coli entrapment of SP7 measures this case directly, because a
+single-run second pass is all self-library.
+
+**Later test: leave-run-out (`leave_run_out: true`).** The library that searches run j is built from
+runs other than j only: inclusion (`q_-j`, the engine's `precursor_q` rule over the best row per
+precursor and label in runs other than j), intensities, RT and 1/K0. Inclusion and library values are
+then independent of run j, so a false entry costs sensitivity rather than FDR. That would also make
+looser cuts safer. Consequence: a precursor supported in run j only is not in library j. It keeps its
+pass-1 row in run j (a disjoint union, so the report stays at 1%), and it is searched in every other
+run. It needs per-run fragment tables. This arm runs after the default holds, and its acceptance in
+anchor runs, compared with the default on the same precursors, measures the circularity.
+
+**Fragment intensities.** These are the pass-1 fixed-window fragment areas (`fragment_quant.parquet`
+of the pass-1 quant, the input of `fit_cross_run`). They are taken over the precursor's confident runs
+(run-level `run_psm_q` <= 0.01; if there is none, the best-scoring run). Under leave-run-out, run j is
+excluded from this set.
+- Each run's areas are max-normalised. The library value is the median over runs (3 or more runs) or
+  the mean (1 or 2 runs). The median is robust to one interfered run (section 4j, drop1).
+- With fewer than `shrink_runs` supporting runs, the library value is the mean of the empirical and the
+  predicted pattern. Section 13 measured the run-to-run cosine at 0.986 and the prediction at 0.967. One
+  run is noisier than that.
+- Fragments: only the 12 library fragments, because pass 1 measures no others. A fragment with area 0
+  in every supporting run gets intensity 0 and stays in the library. Section 12 found such slots
+  harmless for identification. Choosing a new top 12 from all b/y ions needs a retrace with an expanded
+  fragment list. That is a later step, and so is the fine-tuned model of section 14.
+
+**RT and 1/K0, per run.**
+- Expected RT in run j: the binned-median cross-run maps of `mbr_worker.py`, through run 0, as the
+  median over the supporting runs (other than j under leave-run-out). In the default, a run where the
+  precursor is confident contributes its own apex to that median.
+- Expected 1/K0: the median of the supporting runs' re-picked `apex_im`, moved by run j's median offset.
+  This is the `mbr_reextract.py prep` rule, reused.
+- Half-widths: the p99 of the held-out residual (|observed - expected| on confident rows, each predicted
+  without its own run), per run. This is not the in-sample residual (CLAUDE.md, RT rules). For scale,
+  the rescuable windows were 1.5-2.5 s and pass 1 used about 14 s after the refit.
+- These values go straight into per-run `run_windows` tables (`rt_pred_cal`, `rt_lo`, `rt_hi`,
+  `im_pred_cal`, `im_lo`, `im_hi`). `rt-im-train` does not run in pass 2.
+
+**Table layout.**
+- One library (precursors and fragments) with contiguous `candidate_id` sorted by `precursor_mz`,
+  written with `_lib_io.write_engine_parquet`, and one id space for the pooled rescore and
+  `precursor_q`.
+- Per run: its `run_windows`. Under leave-run-out, also its own fragment table and a
+  `--restrict-candidates` list holding library j and its decoys, against a master library that holds
+  the union.
+- An old-to-new id map, used to carry the seed rows across.
+
+### SP3. Decoys for the second pass
+
+This is the central FDR risk. Targets with empirical values against decoys with predicted values let
+the classifier learn the source. The construction below makes the two members of each pair identical in
+everything except fragment m/z.
+- **Sequence:** the target's native paired decoy from the search library: the same `base_peptide_id`,
+  charge and modform, reversed with the C terminus fixed, already collision-checked against all 14.7M
+  targets (`digest.rs` `collision_safe_decoy`). The decoy therefore never equals a real peptide of the
+  search space. Its seed row (pass 1) can be carried over through the id map.
+- **Fragments:** the target's 12 ion names (type, ordinal, charge), with m/z recomputed on the decoy
+  sequence. Intensities are copied ion for ion. This is `make_reverse_decoys.py`, whose m/z calculator
+  is checked against the library's target m/z before it writes.
+- **Precursor m/z, RT centre and width, 1/K0 centre and width:** the target's. Reversal keeps the
+  composition, so the precursor m/z is equal.
+- **Per run:** the decoy copies the target's window for that run (and, under leave-run-out, its
+  intensities for that run).
+
+Exchangeability tests, in this order:
+1. **Construction invariant, asserted by the writer.** Within each pair, precursor m/z, the window
+   columns and the sorted intensity vector are equal. A classifier trained only on library-side
+   columns (window width, centre, intensity statistics, number of nonzero fragments) must give
+   AUC = 0.5. The test also lists which features read fragment m/z, such as the fraction of fragments
+   above the precursor m/z. Those features are the only channel through which the source can leak.
+2. **Low-score null,** as in TIMS_ROADMAP P5: per-feature AUC of target against decoy below the median
+   pass-2 score. Report the largest deviations, and compare them with the same table for pass 1.
+3. **Known-false library entries (entrapment, SP7).** Entrapment precursors that enter the library are
+   false in every run. Their pass-2 score distribution must match the decoys' distribution (AUC of
+   entrapment target against decoy about 0.5, KS test). This is the direct test that decoys represent
+   false library entries. A single E. coli run gives only about 50-60 such entries at a 1% cut. That
+   test therefore also forces entrapment precursors in at a loose cut (pass-1 q <= 0.2) to get hundreds.
+4. **Circularity** (with the later leave-run-out arm): in the anchor runs, pass-2 acceptance of the
+   default minus that of the leave-run-out arm, on the same precursors. A large excess means self-fit.
+   Until that arm runs, compare instead the pass-2 decoy fraction and score distribution in anchor runs
+   against those in non-anchor runs of the same precursors.
+
+### SP4. The pipeline
+
+```text
+pass 1 (unchanged): per run convert, seed, rt-im-train, extract, retrace(+repick), features, compete
+    -> pooled rescore -> [rt_im_train.refit: second extract..compete, pooled rescore]
+    -> pass-1 quant (fragment areas only needed)
+second pass: mbr_second_pass.py build (library, decoys, per-run windows, restrict lists, id map)
+    -> per run: extract (empirical library, run-j windows)
+                retrace (+repick), features (seed rows remapped), compete
+    -> pooled rescore (same classifier and recipe), per-run run_psm_q and pooled q_value
+    -> merge, quant (diaPASEF preset, cross-run fit on pass-2 fragment tables), report, manifest
+```
+
+- **Refit.** `rt_im_train.refit` stays inside pass 1 and is unchanged. The second pass starts from its
+  rescore. Pass 2 does not run `rt-im-train` again, because its windows come from the empirical values.
+  `experiment.rt_library_scope` and the multi-head calibration play no part in pass 2 (no DeepLC call).
+- **Repick.** `retrace.repick` stays on. The narrow window bounds the re-pick to peaks near the
+  expected RT, which is the RT prior that section 9 found missing, now with a few-second window.
+- **Seed features.** Seed rows are remapped by the id map. A decoy without a seed row gets the
+  missing-seed values, as in pass 1. In the default, a library target's seed score in its anchor run
+  contributed to its inclusion, while its decoy's did not. This is part of the circularity, and
+  SP3 tests 2 and 4 check it. If it shows, the fix is to project the seed features out of the pass-2
+  classifier (`rescore.features`), not a new code path.
+- **q.** Pass 2 computes per-run `run_psm_q`, pooled `q_value` and the grouped q columns over pass-2
+  rows only. Scores from two classifiers never meet in one target-decoy competition.
+- **Report: the second pass only (default, as in DIA-NN).** Pass-1 rows that pass 2 does not
+  reproduce are dropped, both for library precursors and for the precursors outside the library.
+  Keeping both would put two overlapping 1% sets in one report, which can approach 2%. The number
+  dropped is reported per run, and it is a gate (SP7). Under leave-run-out the report is the disjoint
+  union of SP2 instead.
+- **Flags.** Rows accepted in pass 2 but not in pass 1 for that run get `is_transferred = true` (no new
+  column, no schema bump). Report and ProteoBench handle them as today (`MBR=true score.sh`).
+  `transfer_q` stays NaN.
+- **Quant.** Quant is unchanged. It reads pass-2 chromatograms only, so the second `ChromTable` of the
+  re-extraction path is not needed. `fragment_selection: predicted` now selects on empirical
+  intensities. The `cross_run_*` keys fit on the pass-2 fragment tables. drop1 (section 4j) is a cheap
+  requant arm for the new rows.
+- **Manifest.** A `second_pass` block records the library and per-run table hashes, the cut and unit,
+  target and decoy counts per run, the dropped pass-1 rows, and the pass-2 classifier identity from
+  `psms_scored.parquet.report.json`. Pass-2 artifacts go to `<out>/second_pass/`, and pass-1 artifacts
+  stay where they are.
+
+### SP5. Cost
+
+Estimate from the e2e_rx2 stage timings, 64 threads. The library has about 112k targets plus their
+decoys, 225k candidates (1.5% of 14.7M).
+
+| step | e2e_rx2 reference | second pass, estimate |
+|---|---|---|
+| pass 1 plus refit, through the pooled rescore | 3:00 | 3:00 (unchanged) |
+| transfer MBR, re-extraction, quant, report | 29 min | not run |
+| pass-1 quant (fragment areas) | 4-9 min of the 29 | 5-9 min |
+| library build (Python) | | 2-5 min |
+| per-run extract | 291-338 s at 14.7M candidates | about 1 min (mostly spectra decode and library load) |
+| per-run retrace with repick | 234-287 s at 102M rows | 1-3 min (the re-extraction retrace took 29-89 s at 250k rows) |
+| per-run features, compete | 100-110 s | under 20 s |
+| pooled rescore | 22.8 min at 40.9M PSMs | 12-17 min at about 1.35M PSMs |
+| quant, report | about 5 min | about 5 min |
+
+- The rescore does not shrink with the PSM count. Training reads the targets at 1% plus up to 2 decoys
+  per positive (`train_neg_ratio: 2`). In pass 1 that was about 550k plus 1.1M rows. In pass 2 it is
+  about 600k plus all about 675k decoys.
+- Total: second pass about 35-50 min, replacing the 29 min of the transfer path, so about 3:40-3:50 end
+  to end against 3:29.
+- The peak stays in pass 1 (135 GB). Pass-2 retrace holds the raw frames, 28-36 GB per run, so the
+  per-run chains run three at a time.
+
+### SP6. Prototype first, engine later
+
+Offline on the harness, with no engine change. The stages are path-addressed, and the binary is
+`~/bin/mumdia-rx/mumdia`. Scripts go in `quant_diag/`, arms in `sp_<idset>_<arm>/`.
+1. **P0, populations** (minutes): the library lists for the `precursor_q` cuts 0.01 / 0.02 / 0.05.
+   Run `mbrgap.py` coverage on them: how many of the 30,907 1-anchor and 68,158 no-anchor rows each cut
+   reaches, and how many pass-1 rows per run fall outside each library.
+2. **P1, `sp_lib.py`:** writes the library, the decoys, the per-run windows and the id map, plus the
+   per-run fragment tables and restrict lists when `--leave-run-out` is given. It imports the m/z code
+   of `make_reverse_decoys.py`, the RT and 1/K0 rules of `mbr_reextract.py` / `mbr_worker.py`, and
+   `_lib_io`. It asserts the SP3 invariant.
+3. **P2, `sp_chain.sh <idset> <arm>`:** per run, `mumdia extract` (`--lib-precursors`,
+   `--lib-fragments`, `--run-windows`, and `--restrict-candidates` for leave-run-out), `retrace`
+   (repick), `features` (remapped `--seed-psms`) and `compete`. Then pooled
+   `mumdia rescore --competed r0..r5` with seeds 0-2.
+4. **P3, `sp_eval.sh`:** report rows (SP4), then quant with the preset (as in `requant_crw.sh`), then
+   `MBR=true score.sh`, `DIANN=220 shared.py` and `mbrgap.py`. It also runs exchangeability tests 1, 2
+   and 4.
+5. **Arms on `eng_repick` s0:**
+   - SP-A (DIA-NN-like default, 0.01);
+   - SP-A at 0.02 and 0.05;
+   - SP-A with drop1 on the new rows;
+   - SP-A with the seed features projected out (only if test 2 or 4 shows a seed effect).
+
+   The best arm then runs on 3 rescore seeds, on `eng_repick_s1`, and on the e2e_rx2 pass-1 IDs.
+6. **Entrapment (SP7) before any engine work.**
+7. **Later:** SP-L (leave-run-out, 0.01, then looser cuts), against SP-A on the same ID sets.
+
+Engine plumbing, only after the arm holds on at least two ID sets and passes entrapment:
+- `config.rs`: the enum mapping and the `mbr.second_pass` sub-table of SP1, with validation and tests
+  that old configs parse to `transfer`.
+- `scripts/mbr_second_pass.py build` and `merge`, from `sp_lib.py` (NumPy, pyarrow), launched like
+  `mbr_reextract.py`.
+- `run_experiment.rs`: after the final pooled rescore, branch on the strategy. Reuse the refit pass's
+  per-run chain call with other library, window and restrict paths. Reuse the pooled rescore and the
+  per-source quant split.
+- docs/12 ("mbr") and CLAUDE.md, after measurement.
+
+### SP7. Validation and gates
+
+Numbers to beat (ions at `min_obs` 3 / global / eq / PB CV):
+
+| reference | ions | global | eq | PB CV |
+|---|---|---|---|---|
+| DIA-NN 2.2.0, MBR on (target) | 118,326 | 0.143 | 0.207 | 0.107 |
+| e2e transfer, re-extraction then rescuable | 103,714 | 0.141 | 0.222 | 0.095 |
+| e2e, same IDs, rescuable only | 102,617 | 0.143 | 0.227 | 0.093 |
+| harness s0, rescuable | 100,340 | 0.140 | 0.218 | 0.089 |
+| harness s0, union | 102,772 | 0.139 | 0.216 | 0.093 |
+| harness s0, re-extraction only | 100,799 | 0.135 | 0.204 | 0.090 |
+
+Gates (harness arms compare with the harness rows, the e2e arm with the e2e rows):
+- **FDR.**
+  - Entrapment on the E. coli diaPASEF setup of TIMS_ROADMAP_bis section 8: empirical FDP of the
+    pass-2 rows at q 0.01 at or below pass 1's (0.37-0.47%), over 3 seeds, plus SP3 test 3.
+  - That setup is one run, so its second pass is all self-library. That is the default's worst case of
+    circularity, which makes it the right first test for the default. It cannot test cross-run
+    propagation of a false entry (see R1).
+- **Sensitivity.**
+  - More ions than the transfer reference of the same ID set: harness above 102,772, e2e above 103,714.
+  - Per-run rows at least pass 1's in every run (no net loss from the dropped pass-1 rows).
+  - DIA-NN-shared ions up.
+- **Accuracy before CV.** Global and eq at or below the transfer union of the same ID set, on all ions
+  and on DIA-NN-shared ions (`shared.py`). PB CV is reported. MuMDIA-only E. coli log2 is checked
+  against the tier-1 failure of section 4j (near 0 means faint false or wrong rows).
+- **Gap decomposition** (`mbrgap.py`) for the new arm: the change in the 1-anchor (30,907),
+  no-anchor (68,158) and remaining (10,652) rows.
+- **Replication:** 3 rescore seeds on `eng_repick`, plus a second ID set.
+- **Promotion** to a diaPASEF default also needs a second acquisition, per project policy.
+
+### SP8. Risks and open decisions, ranked
+
+1. **Circularity in the default, and no multi-run entrapment.** The default searches each anchor run
+   with a spectrum and apex taken from that run. The E. coli entrapment measures that self-library case,
+   but it is one run. A false entry that propagates to the other runs needs an entrapment experiment
+   with several runs: the HYE runs searched with a library that adds a foreign proteome (for example
+   1:1 by peptide count), through pass 1 and pass 2. That costs a library build and an e2e run (about
+   5-7 h). Decision needed: build it, or gate on the E. coli entrapment plus SP3 tests 1, 2 and 4.
+   **Drop if:** entrapment FDP of pass 2 exceeds 1% at q 0.01, or entrapment targets in the library
+   score above decoys (SP3 test 3), and neither projecting out the seed features nor leave-run-out
+   fixes it.
+2. **Quant of the new rows.** Section 4j rejected the 1-anchor tier on quant, not on FDR: its new ions
+   had E. coli log2 near 0 even where DIA-NN reports them. Pass 2 reaches the same population. A better
+   library and window may not change a faint, partly interfered signal. **Drop or park if:** the ion
+   gain comes with eq above the transfer union on two ID sets, and drop1 does not recover it.
+3. **Pass 2 loses pass-1 rows.** A library of mostly true targets changes the classifier's training
+   population. The 9,842 single-run precursors outside the 0.01 library are lost by construction. The
+   dropped pass-1 rows could outnumber the new ones in some runs. **Drop if:** net per-run rows fall
+   below pass 1 beyond seed noise, or ProteoBench ions fall.
+4. **Noisy empirical patterns for 1- and 2-run precursors.** These are exactly the precursors pass 2
+   is for. The fallback is shrinkage toward the prediction (`shrink_runs`). If shrinkage is not enough,
+   the alternative is the fine-tuned fragment model of section 14 in place of raw empirical patterns.
+5. **Too small a gain.** The project rule is to skip about 1% gains that need engine code. **Drop if:**
+   the best arm adds under about 1,000 ions over the transfer union with no accuracy gain.
+6. **Cost:** +10-20 min over transfer. Acceptable if it gains. Not a reason to drop.
+
+Open decisions for review:
+- **a.** Multi-run entrapment (R1).
+- **b.** Reporting policy: the second pass only (recommended, DIA-NN-like, FDR-safe), or keep the
+  unreproduced pass-1 rows with a flag (up to about 2% FDR on those rows).
+- **c.** Later: combine `second_pass` with the re-extraction tier for library precursors that pass 2
+  does not accept. Excluded from this plan.
+
+## 4n. Second pass measured: more ions, worse eq (2026-10-03/04, eng_repick s0 and s1)
+
+Offline prototype of section 4m (SP6 P0 to P3), no engine change. Binary `~/bin/mumdia-rx/mumdia`. Search
+library and seeds: the `l1d/run` tables that `eng_repick` searched. Pass-1 fragment areas: `q_rp_crwbg_w25_s<seed>`
+(the preset, MBR off). Scripts in `quant_diag/`:
+- `sp_p0.py`: library populations (P0).
+- `sp_lib.py`: library, decoys, per-run windows, id map, remapped seeds, and the SP3 test 1 invariant (P1).
+- `sp_chain.sh <idset> <arm> [seeds]`: the per-run chain and the pooled rescore (P2).
+- `sp_eval.py` / `sp_eval.sh`: report rows, SP3 tests 1, 2 and 4, then quant, `MBR=true score.sh`,
+  `DIANN=220 shared.py` and `mbrgap.py` (P3). `mbrgap.py` now takes `Q=<arm>`.
+- `sp_arms.sh`: library, chain and evaluation for several arms in turn.
+
+Arms are in `sp_<idset>_<arm>/`. Library inclusion is `precursor_q` <= cut only (rule (a) of the P0 review).
+
+**P0, library populations.** Precursor = `candidate_id`. Its `precursor_q` is the minimum over its rows. Runs are
+counted at pooled `q_value` <= 0.01. The gap rows are those of `mbrgap.py` on `mbr_s0`.
+
+| ID set | cut | precursors | 0 runs | 1 | 2 | 3-5 | 6 | 1-anchor rows reached (ions) | no-anchor rows reached (ions) | pass-1 rows outside |
+|---|---|---|---|---|---|---|---|---|---|---|
+| eng_repick | 0.01 | 112,800 | 0 | 9,360 | 9,728 | 32,046 | 61,666 | 18,878 of 30,907 (4,750) | 28 of 68,158 (6) | 15,171 |
+| eng_repick | 0.02 | 119,855 | 0 | 14,411 | 11,187 | 32,588 | 61,669 | 25,965 (6,533) | 42 (9) | 5,380 |
+| eng_repick | 0.05 | 130,807 | 6,069 | 18,853 | 11,579 | 32,637 | 61,669 | 30,907 (7,760) | 6,550 (1,324) | 0 |
+| e2e_rx2 | 0.01 | 112,463 | 0 | 8,566 | 9,122 | 30,922 | 63,853 | 18,106 (4,495) | 8,195 (1,599) | 16,292 |
+| e2e_rx2 | 0.02 | 119,806 | 0 | 13,666 | 10,689 | 31,586 | 63,865 | 22,583 (5,633) | 11,582 (2,287) | 5,794 |
+| e2e_rx2 | 0.05 | 130,822 | 5,780 | 18,408 | 11,125 | 31,644 | 63,865 | 26,556 (6,647) | 17,490 (3,499) | 0 |
+
+- A library made from the same ID set cannot reach the no-anchor rows. Those rows belong to precursors that no
+  run accepts. The e2e_rx2 rows are a different ID set and are not comparable on this point.
+- The pass-1 rows outside the 0.01 library are 15,171 on `eng_repick`, not the 9,842 of section 4m SP2. Multi-run
+  precursors with `precursor_q` > 0.01 add the rest. About 594 of these precursors have 3 or more confident runs.
+
+**Library and windows (P1, eng_repick s0, cut 0.01).**
+- 112,800 targets and 112,800 native decoys. 112,751 decoys are paired through the reversed modform, and 49 are
+  paired through equal mass, because their native decoy was scrambled.
+- Decoy fragment m/z match the native decoy's own fragments to 0.000 ppm on 963,110 shared ions.
+- 88,746 of 1,353,600 target fragments have intensity 0 in every supporting run and are kept.
+- Held-out half-widths per run, p99: 7.6-8.8 s in RT and 0.008-0.010 in 1/K0. The held-out RT median is
+  0.55-0.78 s.
+- Build time 131 s, peak 7.2 GB.
+
+**Deviation from SP4: two trace sets.** Extract and retrace build each trace only inside its RT window. Quant
+integrates up to 2h+1 = 15 scans plus flank samples, which is about +-15 s at 0.97 s per scan. The p99 window
+(about +-8 s) cannot hold that.
+- The ID chain (extract, retrace with repick, features, compete) uses the p99 windows.
+- A second extract, plus retrace with repick off, builds the quant traces (`chromatograms_q`). It uses the same
+  centres and the pass-1 median half-widths (36.6-40.2 s and 0.040), with the 1/K0 centre at pass 2's re-picked
+  `apex_im`.
+- Quant reads only those traces. This is the arrangement of the re-extraction tier (section 4k).
+
+**Cost per run.** Extract 86-92 s at 8 GB. Retrace 8-37 s at 27 GB. Features and compete under 3 s. The
+quant-trace extract and retrace together take 25 s at 31 GB. Pooled rescore 146 s at 3.8 GB, over 936,930 PSMs.
+Evaluation with quant 262 s. The whole arm takes about 20 minutes.
+
+**First run: the 1/K0 window was too narrow** (`sp_eng_repick_A01`, 1/K0 half-width = the p99, 0.008-0.010).
+`extract.im_gate: fragments` applies the window to each fragment peak, not only to the apex.
+- Of the pass-1 accepted library rows, pass 2 did not reproduce 37,326, and extract did not extract 33,755 of
+  them.
+- On r0, 4,362 of 87,218 pass-1 accepted library rows were not extracted. With the pass-1 1/K0 width and the
+  same RT window, the count was 564.
+- Result: 99,711 ions / 0.135 / 0.221 / PB CV 0.089. All later arms use a 1/K0 half-width floor of 0.04
+  (`--min-im-hw 0.04`).
+
+**Arms** (eng_repick s0, pass-2 rescore seed 0; eng_repick_s1, pass-2 rescore seed 1). Ions at `min_obs` 3. drop1 is
+`robust_tr.py` on the rows that pass 2 accepts and pass 1 did not (`is_transferred`).
+
+| ID set | arm | ions | global | eq | PB CV | E. coli log2 |
+|---|---|---|---|---|---|---|
+| s0 | transfer union (4l) | 102,772 | 0.139 | **0.216** | 0.093 | -1.77 |
+| s0 | re-extraction only (4l) | 100,799 | **0.135** | **0.204** | 0.090 | -1.78 |
+| s0 | SP-A 0.01 | 105,801 | 0.139 | 0.235 | 0.093 | -1.72 |
+| s0 | SP-A 0.01, drop1 | 105,801 | 0.141 | 0.226 | 0.095 | -1.78 |
+| s0 | SP-A 0.02 | 111,354 | 0.143 | 0.247 | 0.094 | -1.70 |
+| s0 | SP-A 0.02, drop1 | 111,354 | 0.145 | 0.237 | 0.097 | -1.76 |
+| s0 | SP-A 0.05 | **118,146** | 0.148 | 0.262 | 0.096 | -1.67 |
+| s0 | SP-A 0.05, drop1 | 118,146 | 0.150 | 0.252 | 0.098 | -1.74 |
+| s1 | transfer union (4l) | 102,248 | 0.138 | **0.215** | 0.093 | -1.77 |
+| s1 | SP-A 0.01 | 104,933 | 0.139 | 0.233 | 0.092 | -1.72 |
+| s1 | SP-A 0.01, drop1 | 104,933 | 0.140 | 0.224 | 0.094 | -1.78 |
+| | DIA-NN 2.2.0 | 118,326 | 0.143 | 0.207 | 0.107 | -1.77 |
+
+Shared with DIA-NN 2.2.0 (eps / CV / E. coli log2):
+
+| ID set | arm | shared: MuMDIA | DIA-NN on the same ions | MuMDIA-only |
+|---|---|---|---|---|
+| s0 | transfer union | 93,277: 0.133 / 0.096 / -1.79 | 0.127-0.128 / 0.104 / -1.80 | 9,495: 0.223 / 0.138 / -1.06 |
+| s0 | SP-A 0.01 | 94,826: 0.132 / 0.095 / -1.76 | 0.130 / 0.105 / -1.79 | 10,975: 0.227 / 0.135 / -0.86 |
+| s0 | SP-A 0.01, drop1 | 94,826: 0.134 / 0.097 / -1.81 | 0.130 / 0.105 / -1.79 | 10,975: 0.234 / 0.145 / -0.98 |
+| s0 | SP-A 0.02 | 97,272: 0.134 / 0.095 / -1.75 | 0.132 / 0.106 / -1.79 | 14,082: 0.239 / 0.137 / -0.67 |
+| s0 | SP-A 0.05 | 99,319: 0.136 / 0.096 / -1.75 | 0.133 / 0.107 / -1.79 | 18,827: 0.258 / 0.136 / -0.44 |
+| s1 | transfer union | 92,825: 0.133 / 0.095 / -1.79 | 0.127-0.128 / 0.104 / -1.80 | 9,423: 0.224 / 0.139 / -1.02 |
+| s1 | SP-A 0.01 | 94,222: 0.132 / 0.094 / -1.76 | 0.130 / 0.105 / -1.79 | 10,711: 0.223 / 0.134 / -0.84 |
+| s1 | SP-A 0.01, drop1 | 94,222: 0.134 / 0.097 / -1.80 | 0.130 / 0.105 / -1.79 | 10,711: 0.229 / 0.143 / -0.98 |
+
+**Per-run rows, against pass 1** (target rows at pooled `q_value` <= 0.01).
+
+| ID set | cut | pass 1 | pass 2 | new | dropped, in library | dropped, outside | net per run |
+|---|---|---|---|---|---|---|---|
+| s0 | 0.01 | 543,082 | 621,490 | 106,093 | 12,514 | 15,171 | +12,453 to +14,040 |
+| s0 | 0.02 | 543,082 | 651,273 | 127,221 | 13,650 | 5,380 | +17,526 to +19,112 |
+| s0 | 0.05 | 543,082 | 687,050 | 158,729 | 14,761 | 0 | +23,343 to +25,261 |
+| s1 | 0.01 | 540,862 | 616,911 | 103,987 | 12,593 | 15,345 | +11,987 to +13,743 |
+
+**Gap decomposition** (`mbrgap.py`, s0). These are the (ion, run) rows that DIA-NN reports and the arm does not
+quantify. The anchors are those of `mbr_s0`.
+
+| case | transfer (4i) | SP-A 0.01 | SP-A 0.02 | SP-A 0.05 |
+|---|---|---|---|---|
+| no anchor run | 68,158 | 68,141 | 68,126 | 63,914 |
+| 1 anchor, right peak | 15,501 | 11,928 | 7,189 | 3,921 |
+| 1 anchor, wrong peak | 15,406 | 7,736 | 5,429 | 3,994 |
+| >= 2 anchors, wrong peak | 6,577 | 1,605 | 1,353 | 1,332 |
+| not extracted | 2,633 | 2,108 | 2,054 | 2,043 |
+| >= 2 anchors, right peak | 1,442 | 1,246 | 908 | 861 |
+| total | 109,717 | 92,764 | 85,059 | 76,065 |
+
+**Where eq is lost** (s0, ions at `min_obs` 3, split by whether any of the ion's runs is a pass-2 new row; eq is the
+mean of the per-species median abs epsilon).
+
+| arm | ions, pass-1 rows only | eq | E. coli log2 | ions with new rows | eq | E. coli abs eps | E. coli log2 |
+|---|---|---|---|---|---|---|---|
+| SP-A 0.01 | 62,386 | 0.143 | -1.86 | 43,415 | 0.367 | 0.594 | -1.47 |
+| SP-A 0.01, drop1 | 62,386 | 0.143 | -1.86 | 43,415 | 0.341 | 0.521 | -1.61 |
+| SP-A 0.05 | 62,594 | 0.143 | -1.87 | 55,552 | 0.416 | 0.681 | -1.37 |
+| SP-A 0.05, drop1 | 62,594 | 0.143 | -1.87 | 55,552 | 0.386 | 0.601 | -1.50 |
+
+The two groups also differ in abundance, so this split locates the loss but does not prove its cause.
+
+**Exchangeability (SP3).**
+- **Test 1.** Every library-side column gives AUC 0.500, target against decoy: predicted RT and 1/K0, precursor
+  m/z, intensity sum and spread, nonzero fragments, window width and centre.
+- **Test 2** is not a null in pass 2. The pass-2 population is mostly true targets, so the targets below the
+  median score are faint true peptides. Spectral-similarity features reach AUC 0.92 there, against 0.50 in pass 1.
+  - Seed features: at most 0.515-0.520 (`seed_score`) in every arm. This is too small to require the arm that
+    projects them out.
+  - Fragment-m/z features: at most 0.594-0.608 (`mass_log_evidence`) in the 0.04 arms, against 0.719 in the narrow
+    first run. This test cannot separate leakage from the mass accuracy of true matches.
+  - A valid version needs another null region, for example targets with no pass-1 support in any run.
+- **Test 4.** Fraction of decoys above the pass-2 acceptance threshold, relative to accepted targets:
+
+  | arm | anchor runs | non-anchor runs |
+  |---|---|---|
+  | 0.01 (s0) | 0.85% | 1.71% |
+  | 0.02 (s0) | 0.82% | 1.74% |
+  | 0.05 (s0) | 0.76% | 1.80% |
+  | 0.01 (s1) | 0.86% | 1.69% |
+
+  The pooled 1% therefore puts about 2x the nominal FDR on the rows in runs where pass 1 did not accept the target,
+  which is where most new rows are. Decoy scores are slightly lower in anchor runs (AUC 0.455-0.468, KS D
+  0.045-0.077). The test shows no target excess in anchor runs, but it cannot measure circularity on its own.
+
+**Reading.**
+- Pass 2 gains ions and passes the per-run sensitivity gate: every run has 12,000-14,000 more accepted rows than
+  pass 1 at the 0.01 cut.
+  - SP-A 0.01 against the transfer union: +3,029 ions (s0) and +2,685 ions (s1).
+  - DIA-NN-shared ions: +1,549 and +1,397.
+  - Global epsilon is equal (0.139 against 0.139 and 0.138), and PB CV is equal.
+  - SP-A 0.05 reaches the ion count of DIA-NN 2.2.0 (118,146 against 118,326).
+- It fails the accuracy gate on both ID sets.
+  - eq is +0.019 (s0) and +0.018 (s1) above the union, and +0.009 with drop1 on both.
+  - eq rises with the cut: 0.235, 0.247, 0.262.
+  - The ions with pass-2 new rows carry the loss: their E. coli ratio is compressed to -1.47, against -1.86 for
+    the ions with pass-1 rows only. This is the failure of the 1-anchor tier in section 4j, now at larger scale.
+  - The elevated decoy fraction on those rows (test 4) is a plausible contributor, because false rows compress
+    ratios. It is not measured separately here.
+- By SP8 R2 (eq above the union on two ID sets, not recovered by drop1), SP-A is parked in this form. The DIA-NN-like
+  arms below replace it.
+- Not done: SP-A at 0.02 and 0.05 on s1, rescore seeds 1-2 on s0, the projected-seed arm (not triggered), SP-L,
+  entrapment.
+- What it would need: an FDR control specific to the new rows (test 4), or transfer quant that holds faint, partly
+  interfered values to the right ratio (the open item of section 4j).
+
+**DIA-NN-like arms (2026-10-04).** Three differences from DIA-NN 2.2.0 come from its log of the 220_MBR run
+(`bench/diann_compare/220_MBR/param_0..txt`) and its documentation:
+- the empirical library is cut at global precursor q 0.05 (`--out-lib-qvalue` default; 125,271 target precursors),
+  and the report keeps `Lib.Q.Value` <= 0.01 together with the run-specific `Q.Value` <= 0.01 (every row of its
+  ProteoBench input);
+- under `--rt-profiling` ("IDs, RT & IM profiling", the default) the library keeps the predicted fragment intensities
+  and takes RT and 1/K0 from the data;
+- it generates new decoys for the empirical library, by shuffling or by mutating one residue, with the termini kept.
+
+Pass-2 windows in that log: RT 0.94 (minutes; pass 1 2.4-2.7) and IM 0.01 (pass 1 0.042). The log does not say whether
+these are half-widths. The arms below add the three differences one at a time (cumulative). All use the 0.05 library
+and the windows of SP-A (RT p99, 1/K0 0.04).
+- B: `sp_eng_repick_A05i`, report limited to pass-1 `precursor_q` <= 0.01 (`LIBQ=0.01 TAG=_libq01 sp_eval.sh`). The
+  other library targets are searched and compete, and their rows get q 1.0.
+- C: B plus predicted intensities (`sp_lib.py --intensity predicted`), arm `A05p`.
+- D: C plus new decoys (`--decoys reverse_nc`), arm `A05pd`.
+  - Each library target gets a new decoy: the residues between the first and the last are reversed, and both
+    termini stay.
+  - A decoy equal (I = L) to any of the 7.4M search-library targets, or to the decoy of another target, is
+    re-scrambled in its interior.
+  - s0: 130,611 reversed, 193 scrambled, and 3 dropped with their targets.
+  - The native decoy still provides the pair's ids and its pass-1 seed row, so the seed features of the new decoys
+    are decoy values.
+
+| ID set, rescore seed | arm | ions | global | eq | PB CV | E. coli abs eps | E. coli log2 |
+|---|---|---|---|---|---|---|---|
+| s0, 0 | transfer union (4l) | 102,772 | 0.139 | 0.216 | 0.093 | 0.323 | -1.77 |
+| s0, 0 | B | 105,501 | 0.139 | 0.231 | 0.092 | 0.359 | -1.73 |
+| s0, 0 | C | 105,827 | 0.138 | 0.212 | 0.093 | 0.308 | -1.78 |
+| s0, 0 | D | 105,078 | 0.137 | 0.209 | 0.092 | 0.299 | -1.79 |
+| s0, 1 | D | 104,953 | 0.136 | 0.208 | 0.092 | | -1.79 |
+| s0, 2 | D | 104,926 | 0.136 | 0.209 | 0.092 | | -1.79 |
+| s1, 1 | transfer union (4l) | 102,248 | 0.138 | 0.215 | 0.093 | 0.321 | -1.77 |
+| s1, 1 | D | 104,368 | 0.136 | 0.208 | 0.092 | | -1.78 |
+| | DIA-NN 2.2.0 | 118,326 | 0.143 | 0.207 | 0.107 | 0.282 | -1.77 |
+
+Shared with DIA-NN 2.2.0 (eps / CV / E. coli log2):
+
+| ID set, rescore seed | arm | shared: MuMDIA | DIA-NN on the same ions | MuMDIA-only |
+|---|---|---|---|---|
+| s0, 0 | transfer union | 93,277: 0.133 / 0.096 / -1.79 | 0.127-0.128 / 0.104 / -1.80 | 9,495: 0.223 / 0.138 / -1.06 |
+| s0, 0 | B | 94,629: 0.132 / 0.094 / -1.76 | 0.130 / 0.105 / -1.79 | 10,872: 0.225 / 0.133 / -0.88 |
+| s0, 0 | C | 95,147: 0.131 / 0.095 / -1.80 | 0.130 / 0.105 / -1.79 | 10,680: 0.225 / 0.136 / -1.12 |
+| s0, 0 | D | 94,776: 0.131 / 0.094 / -1.80 | 0.130 / 0.105 / -1.79 | 10,302: 0.220 / 0.133 / -1.22 |
+| s0, 1 | D | 94,705: 0.131 / 0.094 / -1.80 | 0.130 / 0.105 / -1.79 | 10,248: 0.219 / 0.131 / -1.21 |
+| s0, 2 | D | 94,713: 0.131 / 0.093 / -1.80 | 0.130 / 0.105 / -1.79 | 10,213: 0.220 / 0.130 / -1.21 |
+| s1, 1 | transfer union | 92,825: 0.133 / 0.095 / -1.79 | 0.127-0.128 / 0.104 / -1.80 | 9,423: 0.224 / 0.139 / -1.02 |
+| s1, 1 | D | 94,286: 0.131 / 0.094 / -1.80 | 0.130 / 0.105 / -1.79 | 10,082: 0.219 / 0.132 / -1.20 |
+
+Per-run rows against pass 1, and test 4 (decoy fraction above the threshold relative to accepted targets, anchor
+runs / non-anchor runs). The test 4 counts include the unreported library targets with pass-1 `precursor_q` in
+(0.01, 0.05].
+
+| ID set, rescore seed | arm | pass 2 accepted | new | dropped, in library | dropped, outside | net per run | test 4 |
+|---|---|---|---|---|---|---|---|
+| s0, 0 | B | 618,821 | 104,218 | 13,308 | 15,171 | | 0.76% / 1.80% |
+| s0, 0 | C | 617,038 | 98,135 | 9,008 | 15,171 | +11,607 to +13,182 | 0.77% / 1.81% |
+| s0, 0 | D | 609,416 | 91,781 | 10,266 | 15,181 | +10,314 to +11,951 | 0.77% / 1.89% |
+| s0, 1 | D | 608,759 | 91,125 | 10,267 | 15,181 | +10,169 to +11,848 | 0.78% / 1.88% |
+| s0, 2 | D | 608,499 | 91,044 | 10,446 | 15,181 | +10,036 to +11,867 | 0.79% / 1.84% |
+| s1, 1 | D | 605,736 | 90,600 | 10,365 | 15,361 | +10,090 to +11,753 | 0.77% / 1.89% |
+
+Eq split (s0, seed 0; ions at `min_obs` 3 with and without a pass-2 new row):
+
+| arm | pass-1 rows only: ions / eq / E. coli log2 | with new rows: ions / eq / E. coli abs eps / E. coli log2 |
+|---|---|---|
+| B | 62,582 / 0.143 / -1.87 | 42,919 / 0.361 / 0.581 / -1.49 |
+| C | 63,404 / 0.143 / -1.86 | 42,423 / 0.319 / 0.471 / -1.60 |
+| D | 64,120 / 0.144 / -1.86 | 40,958 / 0.314 / 0.460 / -1.62 |
+
+Reading:
+- The report filter (B) changes little: eq -0.004 against SP-A 0.01, at 300 fewer ions.
+- Predicted intensities (C) carry the gain: eq -0.019 against B. The empirical patterns of 1- and 2-run precursors
+  (SP8 R4) were the cause of the SP-A quant failure.
+- The new decoys (D) add eq -0.003 and global -0.001 at about 750 fewer ions. The MuMDIA-only E. coli log2 moves from
+  -1.12 to -1.22, which fits fewer false rows.
+- D against the transfer union, on both ID sets:
+  - s0 (3 seeds): +2,154 to +2,306 ions, of which +1,428 to +1,499 are DIA-NN-shared; global -0.002 to -0.003; eq
+    -0.007 to -0.008; PB CV -0.001.
+  - s1: +2,120 ions (+1,461 shared), global -0.002, eq -0.007, PB CV -0.001.
+  - Every run has 10,000-11,900 more accepted rows than pass 1.
+  - D passes the sensitivity and accuracy gates of SP7 on two ID sets.
+  - Against DIA-NN 2.2.0: eq 0.208-0.209 against 0.207, global 0.136-0.137 against 0.143, PB CV 0.092 against 0.107,
+    ions -11%.
+- Test 4 is unchanged in D (1.84-1.89% in non-anchor runs against 0.77-0.79% in anchor runs). This is the open FDR
+  point, and SP7 entrapment is the gate before engine work.
+- The +2,100 to +2,300 ions are about 2% over the union. That is above the SP8 R5 floor of about 1,000 ions, and it
+  comes with an accuracy gain.
+
 ## 5. Plan
 
 Ordered by expected gain per unit of work. Each phase states its target and its gate. Quant
@@ -1238,6 +1834,8 @@ Target: the 15,235 extra ions, now at |epsilon| 0.194 and E. coli -1.44 under Q1
 
 - MBR and transfer requant were out of scope while the target was MBR off. Since 2026-10-01 the
   MBR-on target is in scope (sections 2b and 4i).
+- A second-pass MBR strategy (empirical library, second search) is planned in section 4m, not
+  measured.
 - Protein-level quant and MaxLFQ (ProteoBench scores precursor ions).
 - Anything that changes the identification population. If a quant lever needs a rescore
   change, it moves to the identification roadmap with its gates.
