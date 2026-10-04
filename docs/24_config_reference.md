@@ -54,7 +54,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [(top level)](#top-level) | `Config` | 17 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
 | [`convert`](#convert) | `ConvertConfig` | 5 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
-| [`prescreen`](#prescreen) | `PrescreenConfig` | 28 |  |
+| [`prescreen`](#prescreen) | `PrescreenConfig` | 30 |  |
 | [`prescreen.tags`](#prescreentags) | `PrescreenTagsConfig` | 7 |  |
 | [`prescreen.mass_hypotheses`](#prescreenmass_hypotheses) | `PrescreenMassConfig` | 7 |  |
 | [`prescreen.trace`](#prescreentrace) | `PrescreenTraceConfig` | 8 |  |
@@ -152,6 +152,8 @@ Fragment-rarity candidate prescreen (`mumdia prescreen`, and `run`/`run-experime
 | `low_mz_weight` | `f64` | `0.5` |  |  |
 | `both_orientations` | `bool` | `true` |  | Also score the fully reversed sequence and keep the larger score, as the measured prototype did. The same rule applies to targets and decoys. |
 | `rt_slack_s` | `f64` | `0.0` |  | Widen each candidate's calibrated RT bounds by this many seconds on both sides. |
+| `crowding_exponent` | `f64` | `0.0` |  | Crowding adjustment: divide each spectrum's score by (its peak count / the window's mean peak count)^exponent, the ratio clamped to [0.25, 4]; 0 (default) = off, 0.25 = the prototype's phase-11 setting. |
+| `repeat_bonus` | `f64` | `0.0` |  | Repeat bonus: `score / q95 + w * repeat / q95`, where `repeat` counts each matched fragment as strongly as its weaker appearance in a neighbouring scan (two eligible scans, 8 s); 0 (default) = off, 0.1 = the prototype's phase-11 setting. |
 | `write_scores` | `bool` | `false` |  | Write the per-candidate scores beside the survivors (`<out>.scores.parquet`). |
 | `retrieval` | `PrescreenRetrieval` | `all` |  | Candidate retrieval before scoring. `all` (default) scores every candidate. |
 | `rescue` | `bool` | `true` |  | With `retrieval = "tags"`, score candidates without tag evidence anyway (the permissive rescue route) instead of dropping them. Default true. |
@@ -1108,6 +1110,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-23 structs and 258 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 34 enumerations, 1 named profile(s), 96 environment variables read and 20 set.
+23 structs and 260 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 34 enumerations, 1 named profile(s), 96 environment variables read and 20 set.
 
 21 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

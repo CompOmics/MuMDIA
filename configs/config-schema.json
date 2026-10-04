@@ -406,6 +406,32 @@
       "source_struct": "PrescreenConfig"
     },
     {
+      "path": "prescreen.crowding_exponent",
+      "name": "crowding_exponent",
+      "section": "prescreen",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "Crowding adjustment: divide each spectrum's score by (its peak count / the window's mean peak count)^exponent, the ratio clamped to [0.25, 4]; 0 (default) = off, 0.25 = the prototype's phase-11 setting.",
+      "gates": [],
+      "source_struct": "PrescreenConfig"
+    },
+    {
+      "path": "prescreen.repeat_bonus",
+      "name": "repeat_bonus",
+      "section": "prescreen",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "Repeat bonus: `score / q95 + w * repeat / q95`, where `repeat` counts each matched fragment as strongly as its weaker appearance in a neighbouring scan (two eligible scans, 8 s); 0 (default) = off, 0.1 = the prototype's phase-11 setting.",
+      "gates": [],
+      "source_struct": "PrescreenConfig"
+    },
+    {
       "path": "prescreen.write_scores",
       "name": "write_scores",
       "section": "prescreen",

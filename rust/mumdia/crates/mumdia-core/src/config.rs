@@ -673,6 +673,14 @@ pub struct PrescreenConfig {
     pub both_orientations: bool,
     /// Widen each candidate's calibrated RT bounds by this many seconds on both sides.
     pub rt_slack_s: f64,
+    /// Crowding adjustment: divide each spectrum's score by (its peak count / the window's mean
+    /// peak count)^exponent, the ratio clamped to [0.25, 4]; 0 (default) = off, 0.25 = the
+    /// prototype's phase-11 setting.
+    pub crowding_exponent: f64,
+    /// Repeat bonus: `score / q95 + w * repeat / q95`, where `repeat` counts each matched
+    /// fragment as strongly as its weaker appearance in a neighbouring scan (two eligible scans,
+    /// 8 s); 0 (default) = off, 0.1 = the prototype's phase-11 setting.
+    pub repeat_bonus: f64,
     /// Write the per-candidate scores beside the survivors (`<out>.scores.parquet`).
     pub write_scores: bool,
     /// Candidate retrieval before scoring. `all` (default) scores every candidate.
@@ -727,6 +735,8 @@ impl Default for PrescreenConfig {
             low_mz_weight: 0.5,
             both_orientations: true,
             rt_slack_s: 0.0,
+            crowding_exponent: 0.0,
+            repeat_bonus: 0.0,
             write_scores: false,
             retrieval: PrescreenRetrieval::All,
             rescue: true,
@@ -3404,6 +3414,8 @@ impl Config {
             }
             for (name, value) in [
                 ("prescreen.complement_bonus", p.complement_bonus),
+                ("prescreen.crowding_exponent", p.crowding_exponent),
+                ("prescreen.repeat_bonus", p.repeat_bonus),
                 ("prescreen.tag_bonus", p.tag_bonus),
                 ("prescreen.fasta_bonus", p.fasta_bonus),
                 ("prescreen.flank_bonus", p.flank_bonus),

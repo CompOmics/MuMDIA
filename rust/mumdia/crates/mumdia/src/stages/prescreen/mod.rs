@@ -160,6 +160,8 @@ fn nearest_index(mz: &[f32], x: f64, tol: f64) -> Option<usize> {
 /// Theoretical b and y m/z values for one orientation of a residue-mass array, `k = 1..L-1`,
 /// charges `1..=nz`.
 fn fragment_mz(masses: &[f64], reversed: bool, nz: i32, out: &mut Vec<f64>) {
+    // The prototype's order: b at charge 1 (k = 1..L-1), y at charge 1, then charge 2. The
+    // score sums distinct peaks, so only the repeat bonus's fragment ownership sees the order.
     out.clear();
     let l = masses.len();
     let at = |i: usize| {
@@ -169,16 +171,20 @@ fn fragment_mz(masses: &[f64], reversed: bool, nz: i32, out: &mut Vec<f64>) {
             masses[i]
         }
     };
-    let mut bm = 0.0;
-    let mut ym = 0.0;
-    for k in 0..l.saturating_sub(1) {
-        bm += at(k);
-        ym += at(l - 1 - k);
-        for z in 1..=nz {
-            let zf = z as f64;
-            out.push(bm / zf + PROTON);
-            out.push((ym + WATER) / zf + PROTON);
-        }
+    let nc = l.saturating_sub(1);
+    let mut bm = vec![0.0f64; nc];
+    let mut ym = vec![0.0f64; nc];
+    let (mut b, mut y) = (0.0, 0.0);
+    for k in 0..nc {
+        b += at(k);
+        y += at(l - 1 - k);
+        bm[k] = b;
+        ym[k] = y;
+    }
+    for z in 1..=nz {
+        let zf = z as f64;
+        out.extend(bm.iter().map(|&m| m / zf + PROTON));
+        out.extend(ym.iter().map(|&m| (m + WATER) / zf + PROTON));
     }
 }
 
@@ -417,7 +423,8 @@ fn score_in_group(
     cfg: &PrescreenConfig,
     frag: &mut Vec<f64>,
     hits: &mut Vec<usize>,
-) -> f64 {
+    trace: &mut Vec<f64>,
+) -> (f64, f64) {
     let rts = &sp.rt[g.first..g.first + g.count];
     let (a, b) = match c.rt {
         Some((lo, hi)) => (
@@ -427,11 +434,16 @@ fn score_in_group(
         None => (0, rts.len()),
     };
     if a >= b {
-        return 0.0;
+        return (0.0, 0.0);
     }
     let sqrt_l = (masses.len() as f64).sqrt();
     let base = sp.offsets[g.first];
     let mut best = 0.0f64;
+    let mut best_repeat = 0.0f64;
+    let repeat = cfg.repeat_bonus > 0.0;
+    // Crowding: a spectrum's score divided by (its peaks / the window's mean)^exponent, the
+    // ratio clamped to [0.25, 4] (phase 11 of the prototype).
+    let mean_peaks = (sp.offsets[g.first + g.count] - base) as f64 / (g.count as f64).max(1.0);
     let orientations: &[bool] = if cfg.both_orientations {
         &[false, true]
     } else {
@@ -439,9 +451,20 @@ fn score_in_group(
     };
     for &rev in orientations {
         fragment_mz(masses, rev, c.nz, frag);
-        for s in g.first + a..g.first + b {
+        let nf = frag.len();
+        let ne = b - a;
+        if repeat {
+            trace.clear();
+            trace.resize(ne * nf, 0.0);
+        }
+        for (t, s) in (g.first + a..g.first + b).enumerate() {
             let (lo, hi) = (sp.offsets[s], sp.offsets[s + 1]);
-            let total = spectrum_score(
+            let row = if repeat {
+                Some(&mut trace[t * nf..(t + 1) * nf])
+            } else {
+                None
+            };
+            let mut total = spectrum_score(
                 frag,
                 &sp.mz[lo..hi],
                 &sp.positive[lo..hi],
@@ -449,16 +472,45 @@ fn score_in_group(
                 sqrt_l,
                 cfg,
                 hits,
+                row,
             );
+            if cfg.crowding_exponent > 0.0 {
+                let ratio = ((hi - lo) as f64 / mean_peaks.max(1e-12)).clamp(0.25, 4.0);
+                total /= ratio.powf(cfg.crowding_exponent);
+            }
             best = best.max(total);
         }
+        // Repeat support: each fragment counts as strongly as its weaker appearance between this
+        // scan and its best neighbour within two eligible scans and 8 s (phase 11).
+        if repeat {
+            let rt_of = |t: usize| rts[a + t];
+            for t in 0..ne {
+                let mut sum = 0.0;
+                for f in 0..nf {
+                    let w = trace[t * nf + f];
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let mut nb = 0.0f64;
+                    for v in t.saturating_sub(2)..(t + 3).min(ne) {
+                        if v != t && (rt_of(v) - rt_of(t)).abs() <= 8.0 {
+                            nb = nb.max(trace[v * nf + f]);
+                        }
+                    }
+                    sum += w.min(nb);
+                }
+                best_repeat = best_repeat.max(sum / sqrt_l);
+            }
+        }
     }
-    best
+    (best, best_repeat)
 }
 
 /// One spectrum's score for one fragment list: every peak that is the nearest positive-intensity
 /// peak of at least one fragment counts once, in ascending peak order, as
-/// `-ln p / sqrt(L)` times the low-m/z weight.
+/// `-ln p / sqrt(L)` times the low-m/z weight. With `owners`, the first fragment matching each
+/// peak also records that peak's weight in its slot (the repeat bonus's per-fragment trace).
+#[allow(clippy::too_many_arguments)]
 fn spectrum_score(
     frag: &[f64],
     mz: &[f32],
@@ -467,8 +519,26 @@ fn spectrum_score(
     sqrt_l: f64,
     cfg: &PrescreenConfig,
     hits: &mut Vec<usize>,
+    owners: Option<&mut [f64]>,
 ) -> f64 {
     hits.clear();
+    if let Some(row) = owners {
+        // The first fragment matching a peak owns it; its weight is the peak's rarity weight.
+        for (f, &x) in frag.iter().enumerate() {
+            if let Some(p) = nearest_index(mz, x, cfg.frag_tol_da) {
+                if positive[p] && !hits.contains(&p) {
+                    hits.push(p);
+                    let low = if (mz[p] as f64) < cfg.low_mz_threshold {
+                        cfg.low_mz_weight
+                    } else {
+                        1.0
+                    };
+                    row[f] = neglnp[p] * low;
+                }
+            }
+        }
+        hits.clear();
+    }
     for &x in frag {
         if let Some(p) = nearest_index(mz, x, cfg.frag_tol_da) {
             if positive[p] {
@@ -523,7 +593,8 @@ fn score_all(
     members: &[Vec<u32>],
     cfg: &PrescreenConfig,
     masses_of: &(dyn Fn(usize) -> Vec<f64> + Sync),
-) -> Vec<f64> {
+) -> (Vec<f64>, Vec<f64>) {
+    let mut repeat = vec![0.0f64; cands.len()];
     let mut score: Vec<f64> = cands
         .iter()
         .map(|c| if c.is_some() { 0.0 } else { f64::NAN })
@@ -539,23 +610,25 @@ fn score_all(
             .par_iter()
             .map(|&m| -hist.probability(m as f64).ln())
             .collect();
-        let got: Vec<f64> = members[gi]
+        let got: Vec<(f64, f64)> = members[gi]
             .par_iter()
             .map_init(
-                || (Vec::new(), Vec::new()),
-                |(frag, hits), &i| {
+                || (Vec::new(), Vec::new(), Vec::new()),
+                |(frag, hits, trace), &i| {
                     let c = cands[i as usize].as_ref().expect("member is parseable");
                     let m = masses_of(i as usize);
-                    score_in_group(c, &m, sp, g, &neglnp, cfg, frag, hits)
+                    score_in_group(c, &m, sp, g, &neglnp, cfg, frag, hits, trace)
                 },
             )
             .collect();
-        for (&i, v) in members[gi].iter().zip(got) {
+        for (&i, (v, r)) in members[gi].iter().zip(got) {
             let s = &mut score[i as usize];
             *s = s.max(v);
+            let q = &mut repeat[i as usize];
+            *q = q.max(r);
         }
     }
-    score
+    (score, repeat)
 }
 
 /// The orchestrators' hook: when `prescreen.enabled`, screen `lib_p` on this run's MS2 inside
@@ -813,11 +886,14 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     let t1 = Instant::now();
     let members = group_members(&sp, &cands, &pmz);
     let masses_of = |i: usize| residue_masses(pform(i)).unwrap_or_default();
-    let base_score = if p.tags_only {
-        cands
-            .iter()
-            .map(|c| if c.is_some() { 0.0 } else { f64::NAN })
-            .collect()
+    let (base_score, repeat_score) = if p.tags_only {
+        (
+            cands
+                .iter()
+                .map(|c| if c.is_some() { 0.0 } else { f64::NAN })
+                .collect(),
+            Vec::new(),
+        )
     } else {
         score_all(&sp, &cands, &members, cfg, &masses_of)
     };
@@ -890,6 +966,29 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
         cfg.trace.bonus,
         cfg.mass_hypotheses.bonus,
     ];
+    // Repeat bonus (phase 11): `D / q95(D) + w R / q95(R)` over the calibration half, before any
+    // optional component, so the score below is the base every later combination scales.
+    let mut repeat_scales: Option<(f64, f64)> = None;
+    let base_score: Vec<f64> = if cfg.repeat_bonus > 0.0 && enough && !p.tags_only {
+        let q95 = |v: &[f64]| {
+            let mut c: Vec<f64> = (0..n).filter(|&i| calib[i]).map(|i| v[i]).collect();
+            c.sort_by(f64::total_cmp);
+            quantile_linear(&c, 0.95).max(1e-12)
+        };
+        let (sd, sr) = (q95(&base_score), q95(&repeat_score));
+        repeat_scales = Some((sd, sr));
+        (0..n)
+            .map(|i| {
+                if base_score[i].is_nan() {
+                    f64::NAN
+                } else {
+                    base_score[i] / sd + cfg.repeat_bonus * repeat_score[i] / sr
+                }
+            })
+            .collect()
+    } else {
+        base_score
+    };
     let mut score = base_score.clone();
     let mut scales: Option<(f64, Vec<f64>)> = None;
     if let Some(e) = &ext_out {
@@ -1159,6 +1258,9 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     stats.insert("extension_ms".into(), json!(ext_ms));
     stats.insert("sample_candidates".into(), json!(p.sample_candidates));
     stats.insert("tags_only".into(), json!(p.tags_only));
+    if let Some((sd, sr)) = repeat_scales {
+        stats.insert("repeat_scales_q95".into(), json!([sd, sr]));
+    }
     if let Some((bs, cs)) = &scales {
         stats.insert("base_scale_q95".into(), json!(bs));
         stats.insert("component_scales_q95".into(), json!(cs));
@@ -1413,7 +1515,9 @@ mod tests {
             c,
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut Vec::new(),
         )
+        .0
     }
 
     fn planted(pf: &str, nz: i32) -> Vec<(f32, f32)> {
@@ -1532,17 +1636,19 @@ mod tests {
         assert_eq!(f.len(), 7 * 2 * 2);
         let p = residue_mass(b'P').unwrap();
         let k = residue_mass(b'K').unwrap();
+        // The prototype's order: b z1 (7), y z1 (7), b z2 (7), y z2 (7).
         assert!((f[0] - (p + PROTON)).abs() < 1e-9, "b1 z1");
-        assert!((f[1] - (k + WATER + PROTON)).abs() < 1e-9, "y1 z1");
-        assert!((f[2] - (p / 2.0 + PROTON)).abs() < 1e-9, "b1 z2");
+        assert!((f[7] - (k + WATER + PROTON)).abs() < 1e-9, "y1 z1");
+        assert!((f[14] - (p / 2.0 + PROTON)).abs() < 1e-9, "b1 z2");
     }
 
     #[test]
     fn fragment_charges_follow_the_precursor_charge() {
         // Only the charge-2 fragments are present.
         let z2: Vec<(f32, f32)> = frags("PEPTIDEK", 2, false)
-            .chunks(4)
-            .flat_map(|c| [(c[2] as f32, 50.0), (c[3] as f32, 50.0)])
+            .into_iter()
+            .skip(14)
+            .map(|m| (m as f32, 50.0))
             .collect();
         let sp = with_background(vec![(100.0, z2)]);
         let c = cfg();
@@ -1569,7 +1675,7 @@ mod tests {
         let pos = vec![true, true];
         let neg = vec![2.0, 3.0];
         let c = cfg();
-        let one = spectrum_score(&[600.001], &mz, &pos, &neg, 1.0, &c, &mut Vec::new());
+        let one = spectrum_score(&[600.001], &mz, &pos, &neg, 1.0, &c, &mut Vec::new(), None);
         let twice = spectrum_score(
             &[600.001, 599.998, 600.0],
             &mz,
@@ -1578,10 +1684,20 @@ mod tests {
             1.0,
             &c,
             &mut Vec::new(),
+            None,
         );
         assert_eq!(one, 3.0);
         assert_eq!(twice, one);
-        let both = spectrum_score(&[600.0, 400.0], &mz, &pos, &neg, 2.0, &c, &mut Vec::new());
+        let both = spectrum_score(
+            &[600.0, 400.0],
+            &mz,
+            &pos,
+            &neg,
+            2.0,
+            &c,
+            &mut Vec::new(),
+            None,
+        );
         assert_eq!(both, 3.0 / 2.0 + 2.0 / 2.0);
     }
 
@@ -1591,7 +1707,16 @@ mod tests {
         let pos = vec![true, true];
         let neg = vec![2.0, 3.0];
         let c = cfg();
-        let s = spectrum_score(&[250.0, 600.0], &mz, &pos, &neg, 2.0, &c, &mut Vec::new());
+        let s = spectrum_score(
+            &[250.0, 600.0],
+            &mz,
+            &pos,
+            &neg,
+            2.0,
+            &c,
+            &mut Vec::new(),
+            None,
+        );
         assert_eq!(s, 2.0 / 2.0 * 0.5 + 3.0 / 2.0);
     }
 
@@ -1610,6 +1735,7 @@ mod tests {
             1.0,
             &c,
             &mut Vec::new(),
+            None,
         );
         assert_eq!(s, 0.0);
         let s = spectrum_score(
@@ -1620,6 +1746,7 @@ mod tests {
             1.0,
             &c,
             &mut Vec::new(),
+            None,
         );
         assert_eq!(s, 1.0);
     }
@@ -2265,5 +2392,66 @@ mod tests {
         assert_eq!(rep["stats"]["tags_only"], true);
         assert!(rep["stats"]["retrieved"].as_u64().unwrap() >= 60);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn both_scores(sp: &Spectra, pf: &str, c: &PrescreenConfig) -> (f64, f64) {
+        let g = &sp.groups[0];
+        let hist = Histogram::build((0..sp.rt.len()).map(|s| sp.peaks(s)), sp.nbin);
+        let neglnp: Vec<f64> = sp
+            .mz
+            .iter()
+            .map(|&m| -hist.probability(m as f64).ln())
+            .collect();
+        let cand = Candidate { nz: 2, rt: None };
+        let m = residue_masses(pf).unwrap();
+        score_in_group(
+            &cand,
+            &m,
+            sp,
+            g,
+            &neglnp,
+            c,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+    }
+
+    /// Crowding divides a spectrum's score by (peaks / window mean)^exponent, so the same matched
+    /// fragments score lower in a crowded spectrum; exponent 0 leaves the score unchanged.
+    #[test]
+    fn crowding_lowers_scores_from_crowded_spectra() {
+        let frag = planted("PEPTIDEK", 2);
+        let mut crowded = frag.clone();
+        crowded.extend((0..400).map(|i| (1500.0 + i as f32 * 0.37, 5.0)));
+        let sparse = with_background(vec![(100.0, frag.clone()), (200.0, crowded.clone())]);
+        let only_crowded = with_background(vec![(200.0, crowded)]);
+        let mut c = cfg();
+        let plain = both_scores(&only_crowded, "PEPTIDEK", &c).0;
+        c.crowding_exponent = 0.25;
+        let adjusted = both_scores(&only_crowded, "PEPTIDEK", &c).0;
+        assert!(adjusted < plain, "{adjusted} {plain}");
+        // With a sparse copy present, the best spectrum is the sparse one.
+        assert!(both_scores(&sparse, "PEPTIDEK", &c).0 > adjusted);
+    }
+
+    /// The repeat bonus needs the same fragments in a neighbouring scan within 8 s.
+    #[test]
+    fn repeat_support_needs_a_neighbouring_scan() {
+        let frag = planted("PEPTIDEK", 2);
+        let mut c = cfg();
+        c.repeat_bonus = 0.1;
+        let twice = with_background(vec![(100.0, frag.clone()), (104.0, frag.clone())]);
+        let once = with_background(vec![(100.0, frag.clone())]);
+        let far = with_background(vec![(100.0, frag.clone()), (120.0, frag)]);
+        assert!(both_scores(&twice, "PEPTIDEK", &c).1 > 0.0);
+        assert_eq!(both_scores(&once, "PEPTIDEK", &c).1, 0.0);
+        assert_eq!(
+            both_scores(&far, "PEPTIDEK", &c).1,
+            0.0,
+            "20 s apart is not a repeat"
+        );
+        c.repeat_bonus = 0.0;
+        assert_eq!(both_scores(&twice, "PEPTIDEK", &c).1, 0.0, "off by default");
     }
 }
