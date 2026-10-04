@@ -116,25 +116,27 @@ echo "=== smoke: run again for determinism"
     --out-dir "$work/out2" --config "$cfg" --threads 2 > "$work/run2.log" 2>&1 \
     || { tail -20 "$work/run2.log"; exit 1; }
 
-# 4p. `prescreen.placement = "before_prediction"`: the fragment-rarity screen runs on the
-#     peptidoforms before prediction, without retention times, and only its survivors are
-#     predicted; the same run must still identify most planted peptides.
-echo "=== smoke: prescreen before prediction"
+# 4p. `prescreen.tag_prefilter`: the database-free tag prefilter runs on the peptidoforms
+#     before prediction, without retention times, and only its survivors are predicted; the
+#     same run must still identify most planted peptides.
+echo "=== smoke: tag prefilter before prediction"
 "$PY" - "$cfg" "$work/prescreen.json" <<'PYEOF'
 import json, sys
 c = json.load(open(sys.argv[1]))
-c["prescreen"] = {"enabled": True, "placement": "before_prediction"}
+c["prescreen"] = {"tag_prefilter": True}
 json.dump(c, open(sys.argv[2], "w"), indent=2)
 PYEOF
-"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML"     --out-dir "$work/out_prescreen" --config "$work/prescreen.json" --threads 2     > "$work/prescreen.log" 2>&1 || { tail -20 "$work/prescreen.log"; exit 1; }
-grep -q "peptidoforms passed to prediction after the prescreen" "$work/prescreen.log"     || { echo "the prescreen did not run before prediction"; exit 1; }
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_prescreen" --config "$work/prescreen.json" --threads 2 \
+    > "$work/prescreen.log" 2>&1 || { tail -20 "$work/prescreen.log"; exit 1; }
+grep -q "peptidoforms passed to prediction after the tag prefilter" "$work/prescreen.log" \
+    || { echo "the tag prefilter did not run before prediction"; exit 1; }
 "$PY" - "$work/out_prescreen/peptides.tsv" "$work/planted.json" <<'PYEOF'
 import csv, json, sys
-got = {r["precursor"] for r in csv.DictReader(open(sys.argv[1]), delimiter="	")}
+got = {r["precursor"] for r in csv.DictReader(open(sys.argv[1]), delimiter="\t")}
 want = {p["peptidoform"] for p in json.load(open(sys.argv[2]))["planted"]}
 n = len(got & want)
-print(f"prescreen before prediction: {n}/{len(want)} planted peptides identified")
-# Measured 114/160 against 116/160 without the screen (2026-10-04).
+print(f"tag prefilter: {n}/{len(want)} planted peptides identified")
 assert n >= 100, n
 PYEOF
 

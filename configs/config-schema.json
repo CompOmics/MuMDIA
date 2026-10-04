@@ -532,21 +532,17 @@
       ]
     },
     {
-      "path": "prescreen.placement",
-      "name": "placement",
+      "path": "prescreen.tag_prefilter",
+      "name": "tag_prefilter",
       "section": "prescreen",
-      "rust_type": "PrescreenPlacement",
-      "kind": "enum",
+      "rust_type": "bool",
+      "kind": "bool",
       "optional": false,
-      "default": "after_calibration",
-      "default_text": "`after_calibration`",
-      "help": "",
+      "default": false,
+      "default_text": "false",
+      "help": "Database-free tag prefilter before any prediction, without retention times. Tags are discovered from the spectra alone (`prescreen.tags`); a candidate is kept when one of its trimers, in its own residue states and at a fragment charge it can carry, was observed in its isolation window anywhere in the run, or when no trimer of it can be expressed in the tag alphabet. No fragment score is computed. In FASTA mode only the kept peptidoforms go to MS2PIP and DeepLC; with an imported library the kept candidates become a sub-library before the seed search and the multi-head calibration. Everything after it uses the predicted retention times as usual, including the fragment-rarity score when `enabled`. Single-file `run` only for now. Default false.",
       "gates": [],
-      "source_struct": "PrescreenConfig",
-      "choices": [
-        "after_calibration",
-        "before_prediction"
-      ]
+      "source_struct": "PrescreenConfig"
     },
     {
       "path": "prescreen.tags.edge_tol_da",

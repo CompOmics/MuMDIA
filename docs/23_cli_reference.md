@@ -322,6 +322,9 @@ Options:
           Evaluation only: score a seeded sample of about N candidates (survivors then cover the sample only and are not an extract allowlist)
 
           [default: 0]
+
+      --tags-only
+          The database-free tag prefilter only: keep the candidates with an observed trimer in their isolation window (no fragment score; pass no --run-windows for the retention-time-free prefilter)
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".

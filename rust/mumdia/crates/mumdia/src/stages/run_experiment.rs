@@ -812,11 +812,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         ..p
     };
     let cfg = p.config;
-    if cfg.prescreen.enabled
-        && cfg.prescreen.placement == mumdia_core::config::PrescreenPlacement::BeforePrediction
-    {
+    if cfg.prescreen.tag_prefilter {
         anyhow::bail!(
-            "prescreen.placement = \"before_prediction\" is supported by a single-file `run`              only: an experiment shares one library across its runs, so the survivors of              every run would have to be united first. Search the files one per `run`, or use              placement \"after_calibration\""
+            "{}",
+            concat!(
+                "prescreen.tag_prefilter is supported by a single-file `run` only: an experiment ",
+                "shares one library across its runs, so the survivors of every run would have to ",
+                "be united first. Search the files one per `run`."
+            )
         );
     }
     preflight(&p)?;

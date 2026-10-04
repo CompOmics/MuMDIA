@@ -164,7 +164,7 @@ Fragment-rarity candidate prescreen (`mumdia prescreen`, and `run`/`run-experime
 | `mass_hypotheses` | `PrescreenMassConfig` | the `PrescreenMassConfig` section's own defaults |  |  |
 | `trace` | `PrescreenTraceConfig` | the `PrescreenTraceConfig` section's own defaults |  |  |
 | `localization` | `PrescreenLocalization` | `own` |  |  |
-| `placement` | `PrescreenPlacement` | `after_calibration` |  |  |
+| `tag_prefilter` | `bool` | `false` |  | Database-free tag prefilter before any prediction, without retention times. Tags are discovered from the spectra alone (`prescreen.tags`); a candidate is kept when one of its trimers, in its own residue states and at a fragment charge it can carry, was observed in its isolation window anywhere in the run, or when no trimer of it can be expressed in the tag alphabet. No fragment score is computed. In FASTA mode only the kept peptidoforms go to MS2PIP and DeepLC; with an imported library the kept candidates become a sub-library before the seed search and the multi-head calibration. Everything after it uses the predicted retention times as usual, including the fragment-rarity score when `enabled`. Single-file `run` only for now. Default false. |
 
 ## prescreen.tags
 
@@ -787,17 +787,6 @@ How modification siblings share evidence (`prescreen.localization`).
 | `family_support` |  | Family support: every form of one backbone with the same modification composition, charge and label takes the family's best score, so compatible localizations and ties pass or fail together. Support is kept separate from localization; no site is chosen. |
 | `best_site` |  | Keep only forms whose own score equals the family best (ties kept). Measured to lose modified references in the prototype; available for comparison only. |
 
-### `PrescreenPlacement`
-
-(rust/mumdia/crates/mumdia-core/src/config.rs)
-
-Where the prescreen runs inside `run` (`prescreen.placement`).
-
-| Value | Default | Description |
-|---|---|---|
-| `after_calibration` | yes | After retention-time calibration, inside each candidate's calibrated RT window; extract searches the survivors. |
-| `before_prediction` |  | Before any prediction, over the whole gradient of each candidate's isolation window (no retention time is used). In FASTA mode only the surviving peptidoforms go to MS2PIP and DeepLC; with an imported library the survivors become a sub-library before the seed search and the multi-head calibration. Single-run `run` only for now. |
-
 ### `PrescreenPooling`
 
 (rust/mumdia/crates/mumdia-core/src/config.rs)
@@ -1117,6 +1106,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-23 structs and 256 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 35 enumerations, 1 named profile(s), 96 environment variables read and 20 set.
+23 structs and 256 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 34 enumerations, 1 named profile(s), 96 environment variables read and 20 set.
 
-21 field(s) carry a gating marker in their doc comment. 60 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+21 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

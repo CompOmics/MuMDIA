@@ -209,24 +209,28 @@ prescreen stays off by default.
 
 ## 6. Use
 
-Inside a run: `"prescreen": {"enabled": true}` (`configs/examples/prescreen-balanced.json`).
-`prescreen.placement` decides where it runs:
+Inside a run there are two independent switches:
 
-- `after_calibration` (default): after `rt-im-train`, inside each candidate's calibrated RT
-  window, on the library extract will read; extract searches only the survivors. Every
-  prediction and the calibration have been paid for by then.
-- `before_prediction`: no retention time is used; each candidate is scored over the whole
-  gradient of its isolation window. In FASTA mode the spectra are converted first, the
-  peptidoform table is screened (its precursor m/z is computed from sequence and charge), and
-  only the surviving peptidoforms go to MS2PIP and DeepLC
-  (`peptidoforms_prescreened.parquet`); the library cache is not used, because the library
-  then depends on the run. With an imported library the screen runs after convert and the
-  survivors become a sub-library (`library_prescreened_*.parquet`, not pair-linked: the screen
-  is label-blind) before the seed search and the multi-head DeepLC calibration. Single-file
+- `prescreen.enabled`: the fragment-rarity score of sections 1-2, after `rt-im-train`, inside
+  each candidate's calibrated (predicted) RT window, on the library extract will read; extract
+  searches only its survivors (`configs/examples/prescreen-balanced.json`).
+- `prescreen.tag_prefilter`: the database-free tag prefilter, before any prediction and
+  without retention times. Tags are discovered from the spectra alone (section 4, `tags.*`); a
+  candidate is kept when one of its trimers, in its own residue states and at a fragment charge
+  it can carry, was observed in its isolation window anywhere in the run, or when no trimer of it
+  can be expressed in the tag alphabet. No fragment score is computed. In FASTA mode the spectra
+  are converted first, the peptidoform table is filtered (its precursor m/z is computed from
+  sequence and charge) and only the kept peptidoforms go to MS2PIP and DeepLC
+  (`peptidoforms_tag_prefiltered.parquet`); the library cache is not used, because the library
+  then depends on the run. With an imported library the kept candidates become a sub-library
+  (`library_tag_prefiltered_*.parquet`, not pair-linked: the prefilter is label-blind) before the
+  seed search and the multi-head DeepLC calibration. Every later stage uses the predicted
+  retention times as usual, including the fragment-rarity score when `enabled`. Single-file
   `run` only; `run-experiment` refuses it, because one library serves every run and the
-  survivors would first have to be united over runs. On the CI fixture (160 planted peptides)
-  it predicted 1,761 of 3,820 peptidoforms and identified 114 planted peptides against 116
-  without the screen.
+  survivors would first have to be united over runs. On the CI fixture it removed 26% of the
+  peptidoforms before prediction and the run identified the same 116 of 160 planted peptides.
+
+Standalone, `mumdia prescreen --tags-only` without `--run-windows` is the same prefilter.
 
 Not yet supported with `groups.window_groups > 1` (validation rejects the combination).
 

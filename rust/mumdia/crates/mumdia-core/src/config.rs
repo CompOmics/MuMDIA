@@ -470,21 +470,6 @@ pub enum PrescreenScopeMatch {
     All,
 }
 
-/// Where the prescreen runs inside `run` (`prescreen.placement`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrescreenPlacement {
-    /// After retention-time calibration, inside each candidate's calibrated RT window; extract
-    /// searches the survivors.
-    #[default]
-    AfterCalibration,
-    /// Before any prediction, over the whole gradient of each candidate's isolation window (no
-    /// retention time is used). In FASTA mode only the surviving peptidoforms go to MS2PIP and
-    /// DeepLC; with an imported library the survivors become a sub-library before the seed
-    /// search and the multi-head calibration. Single-run `run` only for now.
-    BeforePrediction,
-}
-
 /// Which candidates the prescreen scores (`prescreen.retrieval`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -704,7 +689,16 @@ pub struct PrescreenConfig {
     pub mass_hypotheses: PrescreenMassConfig,
     pub trace: PrescreenTraceConfig,
     pub localization: PrescreenLocalization,
-    pub placement: PrescreenPlacement,
+    /// Database-free tag prefilter before any prediction, without retention times. Tags are
+    /// discovered from the spectra alone (`prescreen.tags`); a candidate is kept when one of its
+    /// trimers, in its own residue states and at a fragment charge it can carry, was observed in
+    /// its isolation window anywhere in the run, or when no trimer of it can be expressed in the
+    /// tag alphabet. No fragment score is computed. In FASTA mode only the kept peptidoforms go
+    /// to MS2PIP and DeepLC; with an imported library the kept candidates become a sub-library
+    /// before the seed search and the multi-head calibration. Everything after it uses the
+    /// predicted retention times as usual, including the fragment-rarity score when `enabled`.
+    /// Single-file `run` only for now. Default false.
+    pub tag_prefilter: bool,
 }
 impl Default for PrescreenConfig {
     fn default() -> Self {
@@ -736,7 +730,7 @@ impl Default for PrescreenConfig {
             mass_hypotheses: t(),
             trace: t(),
             localization: PrescreenLocalization::Own,
-            placement: PrescreenPlacement::AfterCalibration,
+            tag_prefilter: false,
         }
     }
 }

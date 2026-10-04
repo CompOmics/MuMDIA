@@ -194,11 +194,10 @@ pub fn run(p: RunParams) -> Result<()> {
         cfg.predict_frag.deeplc_python.is_some(),
     );
 
-    // `prescreen.placement = "before_prediction"`: the spectra are converted first so the
-    // screen can run on the peptidoforms (FASTA mode) or the imported library before any
-    // prediction or calibration, without retention times.
-    let before_prediction = cfg.prescreen.enabled
-        && cfg.prescreen.placement == mumdia_core::config::PrescreenPlacement::BeforePrediction;
+    // `prescreen.tag_prefilter`: the spectra are converted first so the database-free tag
+    // prefilter can run on the peptidoforms (FASTA mode) or the imported library before any
+    // prediction or calibration. It uses no retention time; every later stage does.
+    let before_prediction = cfg.prescreen.tag_prefilter;
     let spectra_dir = d("spectra");
     let mut early_co: Option<convert::ConvertOutputs> = None;
 
@@ -239,8 +238,8 @@ pub fn run(p: RunParams) -> Result<()> {
             // `predict_frag.library_cache`: a library stored by an earlier run with the same
             // FASTA, build settings, predictor versions and engine is published here instead
             // of being built (`library_cache`).
-            // A prescreened library depends on this run's spectra, so it is neither restored
-            // from nor stored in the library cache.
+            // A tag-prefiltered library depends on this run's spectra, so it is neither
+            // restored from nor stored in the library cache.
             let cache = if before_prediction {
                 None
             } else {
@@ -303,35 +302,27 @@ pub fn run(p: RunParams) -> Result<()> {
                     &ch,
                 ));
 
-                // Before prediction: only the peptidoforms the screen keeps reach MS2PIP and
-                // DeepLC.
+                // Tag prefilter: only the peptidoforms it keeps reach MS2PIP and DeepLC.
                 let pf = if before_prediction {
                     pre.first_stage("convert");
                     info!(stage = %"convert", "run: stage start");
                     let co = convert_and_record(&p, cfg, &spectra_dir, &mut man)?;
-                    let surv = prescreen::run_before_prediction(
-                        cfg,
-                        &ch,
-                        &co.ms2,
-                        Some(&co.ms1),
-                        &pf,
-                        p.out_dir,
-                    )?
-                    .expect("before_prediction implies an enabled prescreen");
+                    let surv = prescreen::run_tag_prefilter(cfg, &ch, &co.ms2, &pf, p.out_dir)?
+                        .expect("tag_prefilter is set");
                     man.record(record_artifact(
-                        "prescreen_survivors",
+                        "tag_prefilter_survivors",
                         artifact::PRESCAN_SURVIVORS,
                         &surv,
                         mumdia_io::table::nrows(&surv)?,
                         "prescreen",
                         &ch,
                     )?);
-                    let kept = d("peptidoforms_prescreened.parquet");
+                    let kept = d("peptidoforms_tag_prefiltered.parquet");
                     let n = prescreen::filter_rows(&pf, "id", &surv, &kept)?;
                     info!(
                         kept = n,
                         of = mumdia_io::table::nrows(&pf)?,
-                        "run: peptidoforms passed to prediction after the prescreen"
+                        "run: peptidoforms passed to prediction after the tag prefilter"
                     );
                     man.record(record_artifact(
                         artifact::PEPTIDOFORMS.0,
@@ -412,33 +403,26 @@ pub fn run(p: RunParams) -> Result<()> {
         }
     };
 
-    // Imported library with the prescreen before prediction: the screen runs here, after
-    // convert and before the seed search and the multi-head calibration, and its survivors
-    // become the library every later stage reads.
+    // Imported library with the tag prefilter: it runs here, after convert and before the seed
+    // search and the multi-head calibration, and its survivors become the library every later
+    // stage reads (including the fragment-rarity prescreen after calibration, when enabled).
     let (lib_p, lib_f) = match (before_prediction, p.lib_precursors.is_some()) {
         (true, true) => {
-            let surv = prescreen::run_before_prediction(
-                cfg,
-                &ch,
-                &co.ms2,
-                Some(&co.ms1),
-                &lib_p,
-                p.out_dir,
-            )?
-            .expect("before_prediction implies an enabled prescreen");
+            let surv = prescreen::run_tag_prefilter(cfg, &ch, &co.ms2, &lib_p, p.out_dir)?
+                .expect("tag_prefilter is set");
             man.record(record_artifact(
-                "prescreen_survivors",
+                "tag_prefilter_survivors",
                 artifact::PRESCAN_SURVIVORS,
                 &surv,
                 mumdia_io::table::nrows(&surv)?,
                 "prescreen",
                 &ch,
             )?);
-            let sp = d("library_prescreened_precursors.parquet");
-            let sf = d("library_prescreened_fragments.parquet");
+            let sp = d("library_tag_prefiltered_precursors.parquet");
+            let sf = d("library_tag_prefiltered_fragments.parquet");
             info!(stage = %"sub-library", "run: stage start");
-            // Not pair-linked: the screen is label-blind and decides each candidate on its own
-            // evidence, as extract's allowlist does after calibration.
+            // Not pair-linked: the prefilter is label-blind and decides each candidate on its own
+            // evidence.
             let st = sub_library::run(sub_library::SubLibraryParams {
                 precursors: &lib_p,
                 fragments: &lib_f,
@@ -452,7 +436,7 @@ pub fn run(p: RunParams) -> Result<()> {
                 kept = st.precursors,
                 targets = st.targets,
                 decoys = st.decoys,
-                "run: the prescreened library replaces the imported one"
+                "run: the tag-prefiltered library replaces the imported one"
             );
             man.record(record_artifact(
                 artifact::FRAGMENT_LIBRARY_PRECURSORS.0,

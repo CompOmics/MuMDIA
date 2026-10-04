@@ -44,7 +44,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use mumdia_core::config::{
-    Config, PrescreenConfig, PrescreenLocalization, PrescreenPlacement, PrescreenScope,
+    Config, PrescreenConfig, PrescreenLocalization, PrescreenRetrieval, PrescreenScope,
     PrescreenScopeMatch,
 };
 use mumdia_core::constants::{residue_mass, PROTON, WATER};
@@ -75,6 +75,9 @@ pub struct PrescreenParams<'a> {
     /// must not be handed to extract; it exists to measure expensive components the way the
     /// prototype did, on sampled candidates.
     pub sample_candidates: usize,
+    /// Tag prefilter: keep the candidates the database-free tags retrieve and compute no
+    /// fragment score; the calibration, presets and optional components do not apply.
+    pub tags_only: bool,
 }
 
 /// What the stage kept, for the orchestrator's log and manifest.
@@ -566,7 +569,7 @@ pub fn run_if_enabled(
     windows: &str,
     out_dir: &str,
 ) -> Result<Option<String>> {
-    if !cfg.prescreen.enabled || cfg.prescreen.placement != PrescreenPlacement::AfterCalibration {
+    if !cfg.prescreen.enabled {
         return Ok(None);
     }
     let out = format!("{out_dir}/prescreen_survivors.parquet");
@@ -580,36 +583,37 @@ pub fn run_if_enabled(
         config: cfg,
         config_hash,
         sample_candidates: 0,
+        tags_only: false,
     })?;
     Ok(Some(out))
 }
 
-/// The orchestrator's hook before prediction: when `prescreen.enabled` with
-/// `placement = "before_prediction"`, screen `table` (the peptidoform table, or an imported
-/// library's precursors) on this run's MS2 over the whole gradient, without retention times.
-/// Returns the survivors table.
-pub fn run_before_prediction(
+/// The orchestrator's hook before prediction: when `prescreen.tag_prefilter`, keep the
+/// candidates of `table` (the peptidoform table, or an imported library's precursors) with an
+/// observed trimer in their isolation window anywhere in this run. No retention time and no
+/// fragment score. Returns the survivors table.
+pub fn run_tag_prefilter(
     cfg: &Config,
     config_hash: &str,
     ms2: &str,
-    ms1: Option<&str>,
     table: &str,
     out_dir: &str,
 ) -> Result<Option<String>> {
-    if !cfg.prescreen.enabled || cfg.prescreen.placement != PrescreenPlacement::BeforePrediction {
+    if !cfg.prescreen.tag_prefilter {
         return Ok(None);
     }
-    let out = format!("{out_dir}/prescreen_survivors.parquet");
-    info!(stage = %"prescreen", placement = %"before_prediction", "run: stage start");
+    let out = format!("{out_dir}/tag_prefilter_survivors.parquet");
+    info!(stage = %"tag-prefilter", "run: stage start");
     run(PrescreenParams {
         ms2,
         library_precursors: table,
         run_windows: None,
-        ms1,
+        ms1: None,
         out: &out,
         config: cfg,
         config_hash,
         sample_candidates: 0,
+        tags_only: true,
     })?;
     Ok(Some(out))
 }
@@ -663,7 +667,25 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
         inputs.push(("--run-windows", rw));
     }
     mumdia_io::refuse_output_over_input(p.out, &inputs)?;
-    let cfg = &p.config.prescreen;
+    // The tag prefilter is tag retrieval without the rescue route and without a score.
+    let forced;
+    let config = if p.tags_only {
+        let mut c = p.config.clone();
+        c.prescreen.retrieval = PrescreenRetrieval::Tags;
+        c.prescreen.rescue = false;
+        c.prescreen.complement_bonus = 0.0;
+        c.prescreen.tag_bonus = 0.0;
+        c.prescreen.fasta_bonus = 0.0;
+        c.prescreen.flank_bonus = 0.0;
+        c.prescreen.trace.enabled = false;
+        c.prescreen.mass_hypotheses.enabled = false;
+        c.prescreen.localization = PrescreenLocalization::Own;
+        forced = c;
+        &forced
+    } else {
+        p.config
+    };
+    let cfg = &config.prescreen;
     let target = cfg.effective_target();
     let scope_mods = resolve_scope(&cfg.scope_mods)?;
 
@@ -791,7 +813,14 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     let t1 = Instant::now();
     let members = group_members(&sp, &cands, &pmz);
     let masses_of = |i: usize| residue_masses(pform(i)).unwrap_or_default();
-    let base_score = score_all(&sp, &cands, &members, cfg, &masses_of);
+    let base_score = if p.tags_only {
+        cands
+            .iter()
+            .map(|c| if c.is_some() { 0.0 } else { f64::NAN })
+            .collect()
+    } else {
+        score_all(&sp, &cands, &members, cfg, &masses_of)
+    };
     let scoring_ms = t1.elapsed().as_millis() as u64;
     info!(
         candidates = n,
@@ -801,10 +830,10 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
 
     // ---- optional components (nothing runs under the defaults) ----
     let t2 = Instant::now();
-    let ext_out = if ext::needs_tags(p.config) {
+    let ext_out = if ext::needs_tags(config) {
         let pforms: Vec<&str> = (0..n).map(pform).collect();
-        let alpha = tags::Alphabet::from_config(p.config)?;
-        let view = ext::tag_view(&pforms, &charge, &alpha, p.config);
+        let alpha = tags::Alphabet::from_config(config)?;
+        let view = ext::tag_view(&pforms, &charge, &alpha, config);
         let ms1 = match (
             cfg.mass_hypotheses.enabled && cfg.mass_hypotheses.ms1,
             p.ms1,
@@ -821,7 +850,7 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
             &members,
             &view,
             &alpha,
-            p.config,
+            config,
             ms1.as_deref(),
             &masses_of,
         ))
@@ -942,7 +971,9 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
 
     let mut cal_scores: Vec<f64> = (0..n).filter(|&i| calib[i]).map(|i| score[i]).collect();
     cal_scores.sort_by(f64::total_cmp);
-    let (cutoff, bypass) = if !enough {
+    let (cutoff, bypass) = if p.tags_only {
+        (None, None)
+    } else if !enough {
         (
             None,
             Some(format!(
@@ -958,9 +989,19 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     if let Some(r) = &bypass {
         warn!("prescreen: bypassed: {r}");
     }
-    let keep: Vec<bool> = (0..n)
-        .map(|i| !scoped[i] || cutoff.is_none_or(|c| score[i] > c))
-        .collect();
+    let keep: Vec<bool> = if p.tags_only {
+        // Retrieved, or not judgeable by tags (an unparsed peptidoform, or no expressible
+        // trimer, which retrieval already marks retrieved).
+        let r = ext_out
+            .as_ref()
+            .and_then(|e| e.retrieved.as_ref())
+            .expect("tags_only forces tag retrieval");
+        (0..n).map(|i| !scoped[i] || r[i]).collect()
+    } else {
+        (0..n)
+            .map(|i| !scoped[i] || cutoff.is_none_or(|c| score[i] > c))
+            .collect()
+    };
 
     let label = |i: usize| label_dict[label_id[i] as usize].as_str();
     let mut surv: Vec<(u32, &str)> = (0..n)
@@ -1117,6 +1158,7 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     stats.insert("scoring_ms".into(), json!(scoring_ms));
     stats.insert("extension_ms".into(), json!(ext_ms));
     stats.insert("sample_candidates".into(), json!(p.sample_candidates));
+    stats.insert("tags_only".into(), json!(p.tags_only));
     if let Some((bs, cs)) = &scales {
         stats.insert("base_scale_q95".into(), json!(bs));
         stats.insert("component_scales_q95".into(), json!(cs));
@@ -1207,7 +1249,7 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
             "library_precursors": p.library_precursors,
             "run_windows": p.run_windows,
             "prescreen": cfg,
-            "effective_target": target,
+            "effective_target": if p.tags_only { None } else { Some(target) },
             "config_hash": p.config_hash,
         }),
         stats,
@@ -1829,6 +1871,7 @@ mod tests {
             config: &conf(c.clone()),
             config_hash: "test",
             sample_candidates: 0,
+            tags_only: false,
         })
         .unwrap();
         assert!(sum.bypass_reason.is_none());
@@ -1865,6 +1908,7 @@ mod tests {
             config: &conf(cfg()),
             config_hash: "test",
             sample_candidates: 0,
+            tags_only: false,
         })
         .unwrap();
         assert_eq!(survivors(&out2), kept);
@@ -1886,6 +1930,7 @@ mod tests {
             config: &conf(cfg()),
             config_hash: "test",
             sample_candidates: 0,
+            tags_only: false,
         })
         .unwrap();
         assert!(sum.bypass_reason.unwrap().contains("min_calibration"));
@@ -1905,6 +1950,7 @@ mod tests {
             config: &conf(c.clone()),
             config_hash: "test",
             sample_candidates: 0,
+            tags_only: false,
         })
         .unwrap();
         assert!(sum.bypass_reason.is_some());
@@ -2041,6 +2087,7 @@ mod tests {
                 config: &conf(c),
                 config_hash: "t",
                 sample_candidates: 0,
+                tags_only: false,
             })
             .unwrap();
             let t = scores_table(&out);
@@ -2079,6 +2126,7 @@ mod tests {
                 config: &conf(c),
                 config_hash: "t",
                 sample_candidates: 0,
+                tags_only: false,
             })
             .unwrap();
             let rep: serde_json::Value =
@@ -2170,6 +2218,7 @@ mod tests {
                 config: &conf(cfg()),
                 config_hash: "t",
                 sample_candidates: 0,
+                tags_only: false,
             })
             .unwrap();
             survivors(out)
@@ -2182,6 +2231,39 @@ mod tests {
             (0..90u32).all(|i| a.contains(&i)),
             "planted candidates kept without RT"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tag prefilter keeps every candidate with an observed trimer, scores nothing, and
+    /// keeps the planted candidates without any retention time.
+    #[test]
+    fn the_tag_prefilter_keeps_tag_supported_candidates_without_rt() {
+        let dir = scratch("tagpre");
+        let (ms2, lib, _) = synthetic_run(&dir, 200, 60, false);
+        let out = format!("{dir}/s.parquet");
+        let sum = run(PrescreenParams {
+            ms2: &ms2,
+            library_precursors: &lib,
+            run_windows: None,
+            ms1: None,
+            out: &out,
+            config: &conf(cfg()),
+            config_hash: "t",
+            sample_candidates: 0,
+            tags_only: true,
+        })
+        .unwrap();
+        assert!(sum.cutoff.is_none() && sum.bypass_reason.is_none());
+        let kept = survivors(&out);
+        assert!(
+            (0..60u32).all(|i| kept.contains(&i)),
+            "planted ladders carry tags"
+        );
+        assert!(kept.len() < 200, "{}", kept.len());
+        let rep: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{out}.report.json")).unwrap();
+        assert_eq!(rep["stats"]["tags_only"], true);
+        assert!(rep["stats"]["retrieved"].as_u64().unwrap() >= 60);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

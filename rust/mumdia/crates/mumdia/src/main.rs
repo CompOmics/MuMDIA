@@ -220,6 +220,11 @@ enum Cmd {
         /// the sample only and are not an extract allowlist).
         #[arg(long, default_value_t = 0)]
         sample_candidates: usize,
+        /// The database-free tag prefilter only: keep the candidates with an observed trimer
+        /// in their isolation window (no fragment score; pass no --run-windows for the
+        /// retention-time-free prefilter).
+        #[arg(long)]
+        tags_only: bool,
     },
     /// Native broad DIA seed search over the fragment index -> seed_psms.parquet.
     SearchSeed {
@@ -1512,6 +1517,7 @@ fn real_main() -> Result<()> {
             top_peaks,
             write_scores,
             sample_candidates,
+            tags_only,
         } => {
             let mut cfg = load_config(&config)?;
             if let Some(p) = preset {
@@ -1537,6 +1543,7 @@ fn real_main() -> Result<()> {
                 config: &cfg,
                 config_hash: &ch,
                 sample_candidates,
+                tags_only,
             })?;
         }
         Cmd::Compete {
