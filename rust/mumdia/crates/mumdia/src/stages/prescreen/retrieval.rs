@@ -68,6 +68,108 @@ pub fn normalise_key(key: u32, alpha: &Alphabet) -> u32 {
     alpha.key(alpha.backbone(code), z, gapped)
 }
 
+/// A candidate's positioned keys: for every trimer whose ladder is a run of four of its own
+/// fragments, b-ladders starting at b1..b(L-4) and y-ladders starting at y1..y(L-4), at fragment
+/// charges `1..=zmax`, the start bin and its two neighbours (the observed start carries the
+/// peak's mass error). With `both_orientations` the fully reversed residue array adds its own
+/// keys, so a reversed decoy carries exactly its target's keys, as the fragment score does.
+pub fn positioned_keys(
+    states: &[Option<u16>],
+    zmax: i32,
+    both_orientations: bool,
+    alpha: &Alphabet,
+) -> Vec<u64> {
+    use super::tags::{positioned_key, start_bin};
+    use mumdia_core::constants::WATER;
+    let l = states.len();
+    let mut out = Vec::new();
+    if l < 5 {
+        return out;
+    }
+    let orientations: &[bool] = if both_orientations {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for &rev in orientations {
+        let st = |i: usize| states[if rev { l - 1 - i } else { i }];
+        let m = |i: usize| st(i).map(|x| alpha.masses[x as usize]);
+        // Prefix sums; None once a position cannot be expressed.
+        let mut prefix = vec![Some(0.0f64); l + 1];
+        for i in 0..l {
+            prefix[i + 1] = prefix[i].zip(m(i)).map(|(p, x)| p + x);
+        }
+        let mut suffix = vec![Some(WATER); l + 1];
+        for r in 0..l {
+            suffix[r + 1] = suffix[r].zip(m(l - 1 - r)).map(|(p, x)| p + x);
+        }
+        for q in 1..=l - 4 {
+            if let (Some(start), Some(a), Some(b), Some(c)) =
+                (prefix[q], st(q), st(q + 1), st(q + 2))
+            {
+                for z in 1..=zmax {
+                    let bin = start_bin(start);
+                    for bb in bin.saturating_sub(1)..=bin + 1 {
+                        out.push(positioned_key(alpha, [a, b, c], z, bb));
+                    }
+                }
+            }
+            let r = q;
+            if let (Some(start), Some(a), Some(b), Some(c)) =
+                (suffix[r], st(l - 1 - r), st(l - 2 - r), st(l - 3 - r))
+            {
+                for z in 1..=zmax {
+                    let bin = start_bin(start);
+                    for bb in bin.saturating_sub(1)..=bin + 1 {
+                        out.push(positioned_key(alpha, [a, b, c], z, bb));
+                    }
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// One window's positioned tags inverted into key -> ascending retention times.
+pub struct PositionedIndex {
+    map: HashMap<u64, Vec<f64>>,
+}
+
+impl PositionedIndex {
+    pub fn build(tags: &[SpectrumTags], rt: &[f64]) -> PositionedIndex {
+        let mut map: HashMap<u64, Vec<f64>> = HashMap::new();
+        for (t, &r) in tags.iter().zip(rt) {
+            for &k in &t.positioned {
+                map.entry(k).or_default().push(r);
+            }
+        }
+        PositionedIndex { map }
+    }
+
+    /// Any key observed at a retention time inside `rt` (inclusive; `None` = anywhere).
+    pub fn any(&self, keys: &[u64], rt: Option<(f64, f64)>) -> bool {
+        keys.iter().any(|k| {
+            self.map.get(k).is_some_and(|r| match rt {
+                None => !r.is_empty(),
+                Some((lo, hi)) => {
+                    let i = r.partition_point(|&x| x < lo);
+                    i < r.len() && r[i] <= hi
+                }
+            })
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
 /// Eager retrieval: any key in any spectrum of `tags` (already the eligible range).
 pub fn eager(keys: &[u32], tags: &[SpectrumTags]) -> bool {
     tags.iter()
@@ -358,7 +460,7 @@ mod tests {
                 mz.push(m);
             }
             mz.sort_by(f64::total_cmp);
-            tags.push(discover(&mz, a, 0.005, 2, None));
+            tags.push(discover(&mz, a, 0.005, 2, None, false));
             rts.push(k as f64 * 10.0);
         }
         (peps, tags, rts)
@@ -428,7 +530,7 @@ mod tests {
             let last = *mz.last().unwrap();
             mz.push(last + a.masses[*s as usize]);
         }
-        let t = discover(&mz, &a, 0.005, 1, None);
+        let t = discover(&mz, &a, 0.005, 1, None, false);
         let keys = candidate_keys(&plain, 1, false, &a);
         assert!(eager(&keys, std::slice::from_ref(&t)));
     }
@@ -512,5 +614,33 @@ mod tests {
         // A tag state the chemistry does not allow yields nothing.
         let bogus = [st(b'A', 0.0), st(b'A', 0.0), st(b'A', 0.0)];
         assert!(forms_with_tag(&backbone, &var, 3, 0, bogus).is_empty());
+    }
+
+    /// Positioned keys: a b-ladder planted at the candidate's own prefix mass is found; the same
+    /// trimer at a different start mass is not; a full reversal carries the same keys with both
+    /// orientations.
+    #[test]
+    fn positioned_tags_require_the_candidates_own_ladder_position() {
+        let a = alpha();
+        let st = a.tokenise("GASPVTLEK").unwrap();
+        let m = |i: usize| a.masses[st[i].unwrap() as usize];
+        // b2..b5 ladder: prefix(2) then S, P, V.
+        let start = m(0) + m(1);
+        let mz: Vec<f64> = (0..4)
+            .map(|k| start + (2..2 + k).map(m).sum::<f64>() + mumdia_core::constants::PROTON)
+            .collect();
+        let t = discover(&mz, &a, 0.005, 1, None, true);
+        let keys = positioned_keys(&st, 1, false, &a);
+        assert!(t.positioned.iter().any(|k| keys.binary_search(k).is_ok()));
+        let shifted: Vec<f64> = mz.iter().map(|x| x + 0.5).collect();
+        let t2 = discover(&shifted, &a, 0.005, 1, None, true);
+        assert!(!t2.keys.is_empty(), "the trimer itself is still there");
+        assert!(!t2.positioned.iter().any(|k| keys.binary_search(k).is_ok()));
+        let rev = a.tokenise("KELTVPSAG").unwrap();
+        assert_eq!(
+            positioned_keys(&st, 2, true, &a),
+            positioned_keys(&rev, 2, true, &a)
+        );
+        assert!(positioned_keys(&a.tokenise("GASP").unwrap(), 2, true, &a).is_empty());
     }
 }

@@ -610,6 +610,19 @@
       "source_struct": "PrescreenTagsConfig"
     },
     {
+      "path": "prescreen.tags.positioned",
+      "name": "positioned",
+      "section": "prescreen.tags",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Positioned retrieval: a candidate is retrieved only by a tag whose ladder starts at one of its own b or y fragment masses (+/- 0.01 Da), not by the same trimer anywhere in the spectrum. Much more specific in dense spectra.",
+      "gates": [],
+      "source_struct": "PrescreenTagsConfig"
+    },
+    {
       "path": "prescreen.mass_hypotheses.enabled",
       "name": "enabled",
       "section": "prescreen.mass_hypotheses",

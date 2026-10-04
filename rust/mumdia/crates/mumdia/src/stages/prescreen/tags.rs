@@ -291,12 +291,31 @@ pub struct SpectrumTags {
     pub keys: Vec<u32>,
     pub rms: Vec<f32>,
     pub paths: u64,
+    /// Positioned tags (`discover` with `positioned`): `positioned_key` of every four-peak
+    /// path, sorted and without repeats.
+    pub positioned: Vec<u64>,
 }
 
 impl SpectrumTags {
     pub fn get(&self, key: u32) -> Option<f32> {
         self.keys.binary_search(&key).ok().map(|i| self.rms[i])
     }
+}
+
+/// Bin of a ladder's start: the neutral mass of its first fragment, 0.01 Da bins, ties to even.
+#[inline]
+pub fn start_bin(neutral: f64) -> u64 {
+    (neutral * 100.0).round_ties_even().max(0.0) as u64
+}
+
+/// Positioned tag key: the three residue states in ladder order (low to high m/z, NOT
+/// reversal-canonical, because the position fixes the direction), the fragment charge and the
+/// start bin.
+#[inline]
+pub fn positioned_key(alpha: &Alphabet, s: [u16; 3], z: i32, bin: u64) -> u64 {
+    let n = alpha.n() as u64;
+    let code = (s[0] as u64 * n + s[1] as u64) * n + s[2] as u64;
+    (((code << 1) | (z as u64 - 1)) << 24) | (bin & 0xFF_FFFF)
 }
 
 /// Every tag path of one spectrum at fragment charges `1..=max_charge`.
@@ -306,8 +325,10 @@ pub fn discover(
     tol: f64,
     max_charge: i32,
     pairs: Option<&[(f64, u16, u16)]>,
+    positioned: bool,
 ) -> SpectrumTags {
     let mut best: HashMap<u32, f64> = HashMap::new();
+    let mut pos: Vec<u64> = Vec::new();
     let mut paths = 0u64;
     let mut keep_min = |key: u32, rms: f64| {
         let e = best.entry(key).or_insert(f64::INFINITY);
@@ -331,6 +352,10 @@ pub fn discover(
                                     continue;
                                 }
                                 let (a, b, c) = (la as u16, lb as u16, lc as u16);
+                                if positioned {
+                                    let start = z as f64 * (mz[i] - PROTON);
+                                    pos.push(positioned_key(alpha, [a, b, c], z, start_bin(start)));
+                                }
                                 let cum = [m(la), m(la) + m(lb), m(la) + m(lb) + m(lc)];
                                 let rms = path_rms(mz, &[i, j, k, l], &cum, z);
                                 paths += 1;
@@ -368,10 +393,13 @@ pub fn discover(
     }
     let mut v: Vec<(u32, f64)> = best.into_iter().collect();
     v.sort_unstable_by_key(|x| x.0);
+    pos.sort_unstable();
+    pos.dedup();
     SpectrumTags {
         keys: v.iter().map(|x| x.0).collect(),
         rms: v.iter().map(|x| x.1 as f32).collect(),
         paths,
+        positioned: pos,
     }
 }
 
@@ -571,7 +599,7 @@ mod tests {
             .filter(|&e| gr.label[e] == st(&a, b'G') as u32)
             .count();
         assert_eq!(from0, 100, "no degree cap");
-        let t = discover(&mz, &a, 0.005, 1, None);
+        let t = discover(&mz, &a, 0.005, 1, None, false);
         assert!(t.paths >= 100, "every alternative path walked: {}", t.paths);
         let key = a.key(
             a.canonical(st(&a, b'G'), st(&a, b'A'), st(&a, b'S')),
@@ -630,7 +658,7 @@ mod tests {
         assert!((gap - (m(b'G') + m(b'L'))).abs() < 0.005);
         let mz = vec![300.0, 300.0 + gap, 300.0 + gap + m(b'S')];
         let pairs = pair_steps(&a);
-        let t = discover(&mz, &a, 0.005, 1, Some(&pairs));
+        let t = discover(&mz, &a, 0.005, 1, Some(&pairs), false);
         for (x, y) in [(b'A', b'V'), (b'V', b'A'), (b'G', b'L'), (b'L', b'G')] {
             let code = a.canonical(st(&a, x), st(&a, y), st(&a, b'S'));
             assert!(
@@ -644,7 +672,7 @@ mod tests {
                 "not a four-peak ladder"
             );
         }
-        let without = discover(&mz, &a, 0.005, 1, None);
+        let without = discover(&mz, &a, 0.005, 1, None, false);
         assert!(without.keys.is_empty(), "two steps are not a trimer");
     }
 
@@ -663,12 +691,14 @@ mod tests {
         );
         let mut all: Vec<f64> = peaks.iter().map(|p| p.0).collect();
         all.sort_by(f64::total_cmp);
-        assert!(discover(&all, &a, 0.005, 1, None).get(key).is_some());
+        assert!(discover(&all, &a, 0.005, 1, None, false).get(key).is_some());
         let mut top = peaks.clone();
         top.sort_by(|x, y| y.1.total_cmp(&x.1));
         let mut capped: Vec<f64> = top[..300].iter().map(|p| p.0).collect();
         capped.sort_by(f64::total_cmp);
-        assert!(discover(&capped, &a, 0.005, 1, None).get(key).is_none());
+        assert!(discover(&capped, &a, 0.005, 1, None, false)
+            .get(key)
+            .is_none());
     }
 
     /// A complement counts only on a distinct peak off the path: when the candidate mass makes

@@ -9,7 +9,7 @@ use rayon::prelude::*;
 
 use super::evidence::{self, CandidateTags, WindowFreq, N_COMPONENTS};
 use super::masses::{self, Hypothesis};
-use super::retrieval::{self, BackboneIndex, ObservedIndex};
+use super::retrieval::{self, BackboneIndex, ObservedIndex, PositionedIndex};
 use super::tags::{self, Alphabet, SpectrumTags};
 use super::traces;
 use super::{fragment_mz, Candidate, Histogram, Spectra};
@@ -56,6 +56,13 @@ impl TagView<'_> {
     pub fn keys(&self, i: usize) -> Vec<u32> {
         match self.states(i) {
             Some(s) => retrieval::candidate_keys(&s, self.zmax(i), self.gapped, self.alpha),
+            None => Vec::new(),
+        }
+    }
+
+    pub fn positioned_keys(&self, i: usize, both: bool) -> Vec<u64> {
+        match self.states(i) {
+            Some(s) => retrieval::positioned_keys(&s, self.zmax(i), both, self.alpha),
             None => Vec::new(),
         }
     }
@@ -213,7 +220,14 @@ pub fn run(
         let spec_tags: Vec<SpectrumTags> = if need_spectrum_tags {
             pos.par_iter()
                 .map(|mz| {
-                    let t = tags::discover(mz, alpha, tol, p.tags.max_charge, pairs.as_deref());
+                    let t = tags::discover(
+                        mz,
+                        alpha,
+                        tol,
+                        p.tags.max_charge,
+                        pairs.as_deref(),
+                        p.tags.positioned,
+                    );
                     paths.fetch_add(t.paths, Ordering::Relaxed);
                     tag_records.fetch_add(t.keys.len() as u64, Ordering::Relaxed);
                     t
@@ -234,6 +248,10 @@ pub fn run(
         if tag_retrieval {
             let obs = ObservedIndex::build(&spec_tags, rts, None);
             index_keys += obs.len() as u64;
+            let posix = p
+                .tags
+                .positioned
+                .then(|| PositionedIndex::build(&spec_tags, rts));
             let fam_hit: Option<std::collections::HashSet<u32>> = p.delayed_modforms.then(|| {
                 let norm = ObservedIndex::build(&spec_tags, rts, Some(alpha));
                 members[gi]
@@ -263,7 +281,21 @@ pub fn run(
                             return (false, false, true, false);
                         }
                     }
-                    (obs.any(&keys, c.rt), true, false, false)
+                    let hit = match &posix {
+                        // Positioned: a ladder of this candidate's own fragments. A candidate
+                        // too short for one (fewer than five residues) falls back to the plain
+                        // trimer test.
+                        Some(px) => {
+                            let pk = view.positioned_keys(i, p.both_orientations);
+                            if pk.is_empty() {
+                                obs.any(&keys, c.rt)
+                            } else {
+                                px.any(&pk, c.rt)
+                            }
+                        }
+                        None => obs.any(&keys, c.rt),
+                    };
+                    (hit, true, false, false)
                 })
                 .collect();
             for (&i, (r, e, sk, un)) in members[gi].iter().zip(got) {

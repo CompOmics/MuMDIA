@@ -55,7 +55,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`convert`](#convert) | `ConvertConfig` | 5 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
 | [`prescreen`](#prescreen) | `PrescreenConfig` | 28 |  |
-| [`prescreen.tags`](#prescreentags) | `PrescreenTagsConfig` | 5 |  |
+| [`prescreen.tags`](#prescreentags) | `PrescreenTagsConfig` | 6 |  |
 | [`prescreen.mass_hypotheses`](#prescreenmass_hypotheses) | `PrescreenMassConfig` | 7 |  |
 | [`prescreen.trace`](#prescreentrace) | `PrescreenTraceConfig` | 8 |  |
 | [`digest`](#digest) | `DigestConfig` | 6 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
@@ -179,6 +179,7 @@ Database-free tag discovery used by retrieval and the optional evidence componen
 | `gap_edges` | `bool` | `false` |  | Also allow two-residue gap steps; every compatible residue pair is kept as an alternative and gapped three-peak ladders are keyed separately from four-peak ones. |
 | `rms_sigma_da` | `f64` | `0.003` |  | Sigma of the whole-path soft weight `exp(-0.5 (rms / sigma)^2)` (Da). |
 | `extra_mods` | `Vec<String>` | `[]` |  | Variable states added to the chemistry configuration's alphabet, `RESIDUE:Name`. |
+| `positioned` | `bool` | `false` |  | Positioned retrieval: a candidate is retrieved only by a tag whose ladder starts at one of its own b or y fragment masses (+/- 0.01 Da), not by the same trimer anywhere in the spectrum. Much more specific in dense spectra. |
 
 ## prescreen.mass_hypotheses
 
@@ -1106,6 +1107,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-23 structs and 256 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 34 enumerations, 1 named profile(s), 96 environment variables read and 20 set.
+23 structs and 257 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 34 enumerations, 1 named profile(s), 96 environment variables read and 20 set.
 
 21 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

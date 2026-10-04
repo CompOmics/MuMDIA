@@ -539,6 +539,10 @@ pub struct PrescreenTagsConfig {
     pub rms_sigma_da: f64,
     /// Variable states added to the chemistry configuration's alphabet, `RESIDUE:Name`.
     pub extra_mods: Vec<String>,
+    /// Positioned retrieval: a candidate is retrieved only by a tag whose ladder starts at one
+    /// of its own b or y fragment masses (+/- 0.01 Da), not by the same trimer anywhere in the
+    /// spectrum. Much more specific in dense spectra.
+    pub positioned: bool,
 }
 impl Default for PrescreenTagsConfig {
     fn default() -> Self {
@@ -548,6 +552,7 @@ impl Default for PrescreenTagsConfig {
             gap_edges: false,
             rms_sigma_da: 0.003,
             extra_mods: Vec::new(),
+            positioned: false,
         }
     }
 }
