@@ -11,7 +11,10 @@ real target stripped sequence (palindrome, or reverse == another target) is
 re-scrambled with a stable per-peptide-seeded Fisher-Yates on the interior; if
 still colliding after MAX_TRIES, its target/decoy precursor pair is dropped
 together. A final assertion enforces
-decoy_stripped ∩ target_stripped == {}. The decoy peptidoform is the reversed
+decoy_stripped ∩ target_stripped == {}. Sequences are compared with I and L
+treated as one residue (`il_key`): they are isobaric and give the same fragments, so
+the reversal of IEVNVELR, LEVNVEIR, IS that target to the instrument, and a decoy
+that equals any target up to I/L collects the target's real signal. The decoy peptidoform is the reversed
 sequence itself (label matches its fragments), not DECOY_<target>.
 
 The m/z calculator is validated against the library's own target fragment m/z
@@ -116,6 +119,12 @@ def unknown_mods(toks):
             out.append(m)
     return out
 def stripped(toks): return ''.join(r for r,_ in toks)
+
+
+def il_key(sequence):
+    """The sequence as the instrument sees it: I and L are isobaric (same residue mass,
+    same fragment m/z), so two sequences that differ only by I/L are the same peptide."""
+    return sequence.replace('I', 'L')
 def to_pform(toks): return ''.join(r + (f'[{m}]' if m else '') for r,m in toks)
 def reverse_keep_cterm(t): return t[:-1][::-1] + t[-1:] if len(t) >= 2 else t[:]
 
@@ -184,7 +193,7 @@ def main():
     tprec = prec[prec.label == 'target'].copy().reset_index(drop=True)
     tids = tprec.candidate_id.to_numpy().astype(np.int64)
     tgt_toks = {cid: parse(pf) for cid, pf in zip(tprec.candidate_id, tprec.peptidoform)}
-    target_stripped = {stripped(t) for t in tgt_toks.values()}
+    target_stripped = {il_key(stripped(t)) for t in tgt_toks.values()}
 
     # Name the modifications this script cannot model, before anything is written.
     # `valid()` excludes these precursors below, so they get no decoy; without the
@@ -237,8 +246,9 @@ def main():
         gen = splitmix(stable_seed(source) ^ 0xD1CE)
         cand = reverse_keep_cterm(t); tries = 0
         def conflicts(sequence):
-            owner = decoy_owner.get(sequence)
-            return sequence in target_stripped or (owner is not None and owner != source)
+            key = il_key(sequence)
+            owner = decoy_owner.get(key)
+            return key in target_stripped or (owner is not None and owner != source)
         while conflicts(stripped(cand)) and tries < MAX_TRIES:
             if tries == 0: palin += 1
             cand = scramble(t, gen); tries += 1
@@ -247,7 +257,7 @@ def main():
         else:
             if tries > 0: scr += 1
             rev[cid] = cand
-            decoy_owner.setdefault(stripped(cand), source)
+            decoy_owner.setdefault(il_key(stripped(cand)), source)
     print(f"reverse: target-collisions={palin} resolved-by-scramble={scr} dropped={drop} skipped-nonstd={invalid}", flush=True)
 
     off = int(tprec.candidate_id.max()) + 1
@@ -281,11 +291,11 @@ def main():
     row_of = np.full(off, -1, dtype=np.int64)
     row_of[np.array(keep, dtype=np.int64)] = np.arange(len(keep), dtype=np.int64)
 
-    dstr = {stripped(parse(s)) for s in allp[allp.label == 'decoy'].peptidoform}
+    dstr = {il_key(stripped(parse(s))) for s in allp[allp.label == 'decoy'].peptidoform}
     ov = dstr & target_stripped
     print(f"FINAL overlap decoy-vs-target stripped = {len(ov)} (must be 0)", flush=True)
     assert len(ov) == 0, f"overlap invariant violated: {len(ov)}"
-    paired = {stripped(tgt_toks[cid]): stripped(rev[cid]) for cid in keep}
+    paired = {stripped(tgt_toks[cid]): il_key(stripped(rev[cid])) for cid in keep}
     assert len(set(paired.values())) == len(paired), "distinct targets share a decoy sequence"
 
     write_engine_parquet(allp, outp)
