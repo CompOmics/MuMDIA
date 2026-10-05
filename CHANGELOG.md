@@ -102,6 +102,22 @@ than a number. Both are recorded in every run's `manifest.json`.
   -> 1:11, immunopeptidomics with retention times 18:53 -> 6:42, scores identical over the whole
   10.9M and 203M libraries.
 
+- **Desktop Search screen: prescreen, bands and modifications.** The prescreen (off, before
+  prediction without retention times, after the RT calibration, or the tag prefilter, with a
+  strength), the window-group bands (automatic for this machine, off or custom) and the
+  modifications are set on the Search screen and merged onto the preset through
+  `derive_config`. The automatic band plan comes from the machine's physical memory and the
+  size of the search space (read from the library footer, or estimated from the FASTA: 1,925,388
+  against the engine's 1,922,388 precursors on E. coli) through a memory model fitted to the
+  docs/33 peaks, and bands only when the unbanded search would not fit. Combinations the engine
+  refuses are refused before anything is built or started.
+- **Modification catalogue** (`mumdia-core/src/modifications.json`): 34 residue modifications by
+  UniMod name, accession and monoisotopic delta, read by the engine's mass table and listed by
+  the desktop, so a name the Search screen offers is always one the engine accepts. The eleven
+  names of the previous table keep their masses exactly; the additions include alkylation
+  alternatives, oxidation products, acylations, methylations, `GlyGly`, `HexNAc`, `Hex`,
+  `Sulfo`, `Palmitoyl` and `Biotin`, each checked against its elemental composition by a test.
+
 ### Changed
 
 - **Per-candidate elution bounds are the default** (`features.bound_from_confident = false`,
