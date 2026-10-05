@@ -371,6 +371,59 @@ def test_peptdeep_worker_translates_proforma_to_alphabase():
     )
 
 
+def _fragment_rows_reference(module, precursor_df, intensity_df):
+    """The per-precursor loop `fragment_rows` replaced, kept as the definition of its
+    output order: precursor, then the four series, then position."""
+    np = pytest.importorskip("numpy")
+    ids, ions, ords, chgs, ints = [], [], [], [], []
+    vals = {c: intensity_df[c].to_numpy(dtype=np.float32) for c in module.FRAG_TYPES}
+    for rid, n_aa, start, stop in zip(
+        precursor_df["mumdia_id"], precursor_df["nAA"],
+        precursor_df["frag_start_idx"], precursor_df["frag_stop_idx"],
+    ):
+        width = int(stop) - int(start)
+        if width <= 0:
+            continue
+        pos = np.arange(width, dtype=np.int32)
+        for col, code, charge in module.SERIES:
+            ids.append(np.full(width, rid, dtype=np.uint32))
+            ions.append(np.full(width, code, dtype=np.int8))
+            ords.append(pos + 1 if code == 0 else np.int32(n_aa) - 1 - pos)
+            chgs.append(np.full(width, charge, dtype=np.int32))
+            ints.append(vals[col][int(start):int(stop)])
+    return tuple(np.concatenate(x) for x in (ids, ions, ords, chgs, ints))
+
+
+def test_peptdeep_fragment_rows_matches_the_per_precursor_loop():
+    """The vectorised flattening writes exactly the rows, order and dtypes of the loop,
+    on shuffled slices and precursors without fragments."""
+    np = pytest.importorskip("numpy")
+    pd = pytest.importorskip("pandas")
+    module = _load_peptdeep_worker()
+    rng = np.random.default_rng(7)
+    n = 3000
+    n_aa = rng.integers(5, 30, n)
+    width = n_aa - 1
+    width[rng.random(n) < 0.02] = 0
+    start = np.zeros(n, dtype=np.int64)
+    cur = 0
+    for i in rng.permutation(n):
+        start[i] = cur
+        cur += width[i]
+    pre = pd.DataFrame({
+        "mumdia_id": rng.permutation(n).astype(np.uint32),
+        "nAA": n_aa,
+        "frag_start_idx": start,
+        "frag_stop_idx": start + width,
+    })
+    inten = pd.DataFrame({c: rng.random(cur).astype(np.float32) for c in module.FRAG_TYPES})
+    got = module.fragment_rows(pre, inten)
+    want = _fragment_rows_reference(module, pre, inten)
+    for g, w in zip(got, want):
+        assert g.dtype == w.dtype
+        np.testing.assert_array_equal(g, w)
+
+
 def test_peptdeep_worker_refuses_a_mass_delta_rather_than_guessing():
     """A bare delta names no modification, and the nearest UniMod is not necessarily
     the right one, so it is left unpredicted instead of silently substituted.

@@ -275,20 +275,34 @@
             <input type="number" id="d-maxz" value="3" min="1" max="10" />
           </div>
         </div>
-        <label class="check">
-          <input type="checkbox" id="d-cam" checked />
-          Carbamidomethyl on cysteine (fixed)
-        </label>
-        <label class="check">
-          <input type="checkbox" id="d-ox" checked />
-          Oxidation of methionine (variable)
-        </label>
         <p class="hint">
           These decide the search space whichever way the library is built. With the
           built-in predictors they are written into the run's configuration on top of
           the preset; with DIA-NN they are part of the library's identity, so changing
-          one builds and caches a different library. MuMDIA imports only these two
-          modifications from a DIA-NN library; precursors carrying others are dropped.
+          one builds and caches a different library.
+        </p>
+
+        <div class="rule"></div>
+        <div class="card-title">Modifications</div>
+        <div class="grid2">
+          <div class="row">
+            <label for="mod-set">Add a set</label>
+            <select id="mod-set"><option value="">Choose a set…</option></select>
+          </div>
+          <div class="row">
+            <label for="d-maxvar">Max variable</label>
+            <input type="number" id="d-maxvar" value="1" min="0" max="5" />
+          </div>
+        </div>
+        <input type="search" id="mod-filter" placeholder="Filter by name, residue or group" />
+        <div class="modlist" id="mod-list"></div>
+        <p class="hint" id="mod-summary"></p>
+        <p class="hint">
+          Click a residue once for a variable modification, twice for a fixed one, and a
+          third time to remove it. Each extra variable site multiplies the peptidoforms to
+          predict and search, so a large selection is where a prescreen before prediction
+          and bands (Settings, below) pay off. DIA-NN builds predict the same selection
+          (one library per selection, cached). Terminal modifications are not supported.
         </p>
 
         <div class="rule"></div>
@@ -359,6 +373,62 @@
         <input id="threads" type="number" min="1" step="1" placeholder="all cores">
         <span class="hint inline" id="cores"></span>
       </div>
+
+      <div class="rule"></div>
+      <div class="card-title">Prescreen <span class="pill mute">experimental</span></div>
+      <div class="grid2">
+        <div class="row">
+          <label for="prescreen">When</label>
+          <select id="prescreen">
+            <option value="off">Off</option>
+            <option value="before">Before prediction (no RT)</option>
+            <option value="after">After RT calibration</option>
+            <option value="tags">Tag prefilter (no RT)</option>
+          </select>
+        </div>
+        <div class="row" id="prescreen-strength-row" hidden>
+          <label for="prescreen-strength">Strength</label>
+          <select id="prescreen-strength">
+            <option value="light">Light: removes about 25%</option>
+            <option value="balanced" selected>Balanced: removes about 54%</option>
+            <option value="stringent">Stringent: removes about 75%</option>
+          </select>
+        </div>
+      </div>
+      <p class="hint" id="prescreen-note">
+        Removes candidates the spectra give no support for, before the expensive stages.
+        Off by default.
+      </p>
+
+      <div class="rule"></div>
+      <div class="card-title">Bands</div>
+      <div class="grid2">
+        <div class="row">
+          <label for="bands">Split the search</label>
+          <select id="bands">
+            <option value="auto" selected>Automatic for this machine</option>
+            <option value="off">Off: search everything at once</option>
+            <option value="custom">Custom</option>
+          </select>
+        </div>
+      </div>
+      <div class="grid2" id="bands-custom" hidden>
+        <div class="row">
+          <label for="bands-n">Bands</label>
+          <input type="number" id="bands-n" value="8" min="1" max="200" />
+        </div>
+        <div class="row">
+          <label for="bands-parallel">Bands at a time</label>
+          <input type="number" id="bands-parallel" value="1" min="1" max="64" />
+        </div>
+      </div>
+      <p class="hint" id="bands-note"></p>
+      <p class="hint">
+        A band is a group of isolation windows searched with only the part of the library
+        those windows can select, so the memory peak is one band's rather than the whole
+        library's. Identifications do not depend on it; each band repeats some fixed work,
+        so a library that fits is not split. The pooled rescore is not banded.
+      </p>
     </div>
 
     <div id="start-error" class="banner bad" hidden></div>
