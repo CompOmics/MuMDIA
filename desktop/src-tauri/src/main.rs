@@ -450,10 +450,8 @@ fn derive_config(
 /// engine's own catalogue file, so the list offered is the list the engine accepts.
 #[tauri::command]
 fn modifications() -> Result<serde_json::Value, String> {
-    serde_json::from_str(include_str!(
-        "../../../rust/mumdia/crates/mumdia-core/src/modifications.json"
-    ))
-    .map_err(|e| format!("the modification catalogue does not parse: {e}"))
+    serde_json::from_str(mumdia_console::mods::CATALOGUE_JSON)
+        .map_err(|e| format!("the modification catalogue does not parse: {e}"))
 }
 
 /// The size of the chosen search space and the band plan this machine would use for it.

@@ -7,6 +7,7 @@
 pub mod components;
 pub mod diann;
 pub mod engine;
+pub mod mods;
 pub mod preflight;
 pub mod run;
 pub mod settings;

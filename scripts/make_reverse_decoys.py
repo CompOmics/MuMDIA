@@ -37,6 +37,7 @@ import pyarrow.parquet as pq
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
 from _lib_io import narrow_table, sort_fragments_by_candidate, write_engine_parquet
+from _unimod import MASS_BY_NAME
 
 RES = {
     'G':57.021463735,'A':71.037113805,'S':87.032028435,'P':97.052763875,'V':99.068413945,
@@ -44,9 +45,9 @@ RES = {
     'D':115.026943065,'Q':128.058577540,'K':128.094963050,'E':129.042593135,'M':131.040484645,
     'H':137.058911875,'F':147.068413945,'R':156.101111050,'Y':163.063328575,'W':186.079312980,
 }
-UNIMOD = {'Carbamidomethyl':57.021463735,'Oxidation':15.994914620,'Acetyl':42.010564684,
-          'Phospho':79.966331090,'Deamidated':0.984016106,'Methyl':14.015650064,
-          'Dimethyl':28.031300128,'Carbamyl':43.005813726}
+# Every modification in the catalogue (`_unimod.py`, the engine's `modifications.json`),
+# so a name the engine accepts always has a mass here.
+UNIMOD = dict(MASS_BY_NAME)
 WATER=18.010564684; PROTON=1.007276466812
 TOK=re.compile(r'([A-Z])(\[[^\]]*\])?')
 MAX_TRIES=30
@@ -64,7 +65,7 @@ def mod_mass(name):
     """Monoisotopic delta for a modification token, or raise.
 
     Raising rather than returning 0.0 is the whole point. The previous behaviour was
-    `except: d = 0.0`, so any modification outside the eight names in UNIMOD, and any
+    `except: d = 0.0`, so any modification outside the names in UNIMOD, and any
     bracket content that is not a bare number, silently became a MASSLESS modification.
     The decoy's fragment m/z were then computed for the wrong molecule, so those decoys
     could not match anything, and a decoy that cannot match does not compete: the

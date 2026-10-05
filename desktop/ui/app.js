@@ -1238,6 +1238,11 @@ function libraryParams(fasta) {
     threads: n("d-threads", 8),
     carbamidomethyl: state.mods.get(modKey("Carbamidomethyl", "C")) === "fix",
     oxidation: state.mods.get(modKey("Oxidation", "M")) === "var",
+    // The full choice, for a DIA-NN build: `--fixed-mod` / `--var-mod` per modification.
+    // The two flags above stay for the standard selection's cache key.
+    fixed_mods: state.catalogue ? selectedMods().fixed : [],
+    variable_mods: state.catalogue ? selectedMods().variable : [],
+    max_variable_mods: maxVariableMods(),
   };
 }
 
@@ -1708,21 +1713,6 @@ function searchProblems() {
   const out = [];
   if (state.mode === "fasta") {
     out.push(...modProblems());
-    if (state.libSrc === "diann") {
-      const { fixed, variable } = selectedMods();
-      const other = [...fixed, ...variable].filter(
-        (m) =>
-          !(m.name === "Carbamidomethyl" && m.residue === "C") &&
-          !(m.name === "Oxidation" && m.residue === "M")
-      );
-      if (other.length) {
-        out.push(
-          `DIA-NN builds use only carbamidomethyl on C and oxidation on M, and this ` +
-            `selection also has ${describeMods(other)}. Choose the built-in predictors, ` +
-            "or remove those modifications."
-        );
-      }
-    }
   }
   const pre = $("prescreen").value;
   if ((pre === "before" || pre === "tags") && experimentWithSeveral()) {
