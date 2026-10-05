@@ -197,7 +197,7 @@ pub fn run(p: RunParams) -> Result<()> {
     // `prescreen.tag_prefilter`: the spectra are converted first so the database-free tag
     // prefilter can run on the peptidoforms (FASTA mode) or the imported library before any
     // prediction or calibration. It uses no retention time; every later stage does.
-    let before_prediction = cfg.prescreen.tag_prefilter;
+    let before_prediction = cfg.prescreen.tag_prefilter || cfg.prescreen.score_before_prediction;
     let spectra_dir = d("spectra");
     let mut early_co: Option<convert::ConvertOutputs> = None;
 
@@ -307,10 +307,10 @@ pub fn run(p: RunParams) -> Result<()> {
                     pre.first_stage("convert");
                     info!(stage = %"convert", "run: stage start");
                     let co = convert_and_record(&p, cfg, &spectra_dir, &mut man)?;
-                    let surv = prescreen::run_tag_prefilter(cfg, &ch, &co.ms2, &pf, p.out_dir)?
-                        .expect("tag_prefilter is set");
+                    let surv = prescreen::run_before_prediction(cfg, &ch, &co.ms2, &pf, p.out_dir)?
+                        .expect("a prediction prefilter is set");
                     man.record(record_artifact(
-                        "tag_prefilter_survivors",
+                        "prediction_prefilter_survivors",
                         artifact::PRESCAN_SURVIVORS,
                         &surv,
                         mumdia_io::table::nrows(&surv)?,
@@ -322,7 +322,7 @@ pub fn run(p: RunParams) -> Result<()> {
                     info!(
                         kept = n,
                         of = mumdia_io::table::nrows(&pf)?,
-                        "run: peptidoforms passed to prediction after the tag prefilter"
+                        "run: peptidoforms passed to prediction after the prediction prefilter"
                     );
                     man.record(record_artifact(
                         artifact::PEPTIDOFORMS.0,
@@ -408,10 +408,10 @@ pub fn run(p: RunParams) -> Result<()> {
     // stage reads (including the fragment-rarity prescreen after calibration, when enabled).
     let (lib_p, lib_f) = match (before_prediction, p.lib_precursors.is_some()) {
         (true, true) => {
-            let surv = prescreen::run_tag_prefilter(cfg, &ch, &co.ms2, &lib_p, p.out_dir)?
-                .expect("tag_prefilter is set");
+            let surv = prescreen::run_before_prediction(cfg, &ch, &co.ms2, &lib_p, p.out_dir)?
+                .expect("a prediction prefilter is set");
             man.record(record_artifact(
-                "tag_prefilter_survivors",
+                "prediction_prefilter_survivors",
                 artifact::PRESCAN_SURVIVORS,
                 &surv,
                 mumdia_io::table::nrows(&surv)?,
@@ -436,7 +436,7 @@ pub fn run(p: RunParams) -> Result<()> {
                 kept = st.precursors,
                 targets = st.targets,
                 decoys = st.decoys,
-                "run: the tag-prefiltered library replaces the imported one"
+                "run: the prefiltered library replaces the imported one"
             );
             man.record(record_artifact(
                 artifact::FRAGMENT_LIBRARY_PRECURSORS.0,

@@ -812,11 +812,12 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         ..p
     };
     let cfg = p.config;
-    if cfg.prescreen.tag_prefilter {
+    if cfg.prescreen.tag_prefilter || cfg.prescreen.score_before_prediction {
         anyhow::bail!(
             "{}",
             concat!(
-                "prescreen.tag_prefilter is supported by a single-file `run` only: an experiment ",
+                "prescreen.tag_prefilter and score_before_prediction are supported by a single-file ",
+                "`run` only: an experiment ",
                 "shares one library across its runs, so the survivors of every run would have to ",
                 "be united first. Search the files one per `run`."
             )

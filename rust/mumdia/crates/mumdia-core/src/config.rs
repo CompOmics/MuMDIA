@@ -716,6 +716,16 @@ pub struct PrescreenConfig {
     /// predicted retention times as usual, including the fragment-rarity score when `enabled`.
     /// Single-file `run` only for now. Default false.
     pub tag_prefilter: bool,
+    /// The fragment-rarity score before any prediction and without retention times: every
+    /// candidate is scored over the whole gradient of its isolation window, with the preset /
+    /// target and `crowding_exponent` of this block, and only the candidates kept go to
+    /// prediction (FASTA mode) or into the sub-library (imported library), as for
+    /// `tag_prefilter`; with both set a candidate must pass both. Uses no predicted fragment
+    /// intensity and no retention time. Measured on the 8-12-mer immunopeptidomics library
+    /// with `crowding_exponent = 0.25`: 54% removed, 99.0% of an unfiltered search's accepted
+    /// precursors kept (Astral HYE: 52% removed, 95.2% kept, so data-dependent). Single-file
+    /// `run` only. Default false.
+    pub score_before_prediction: bool,
 }
 impl Default for PrescreenConfig {
     fn default() -> Self {
@@ -750,6 +760,7 @@ impl Default for PrescreenConfig {
             trace: t(),
             localization: PrescreenLocalization::Own,
             tag_prefilter: false,
+            score_before_prediction: false,
         }
     }
 }

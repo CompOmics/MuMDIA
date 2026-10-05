@@ -571,6 +571,19 @@
       "source_struct": "PrescreenConfig"
     },
     {
+      "path": "prescreen.score_before_prediction",
+      "name": "score_before_prediction",
+      "section": "prescreen",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "The fragment-rarity score before any prediction and without retention times: every candidate is scored over the whole gradient of its isolation window, with the preset / target and `crowding_exponent` of this block, and only the candidates kept go to prediction (FASTA mode) or into the sub-library (imported library), as for `tag_prefilter`; with both set a candidate must pass both. Uses no predicted fragment intensity and no retention time. Measured on the 8-12-mer immunopeptidomics library with `crowding_exponent = 0.25`: 54% removed, 99.0% of an unfiltered search's accepted precursors kept (Astral HYE: 52% removed, 95.2% kept, so data-dependent). Single-file `run` only. Default false.",
+      "gates": [],
+      "source_struct": "PrescreenConfig"
+    },
+    {
       "path": "prescreen.tags.edge_tol_da",
       "name": "edge_tol_da",
       "section": "prescreen.tags",

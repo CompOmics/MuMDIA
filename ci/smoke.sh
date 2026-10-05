@@ -129,7 +129,7 @@ PYEOF
 "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
     --out-dir "$work/out_prescreen" --config "$work/prescreen.json" --threads 2 \
     > "$work/prescreen.log" 2>&1 || { tail -20 "$work/prescreen.log"; exit 1; }
-grep -q "peptidoforms passed to prediction after the tag prefilter" "$work/prescreen.log" \
+grep -q "peptidoforms passed to prediction after the prediction prefilter" "$work/prescreen.log" \
     || { echo "the tag prefilter did not run before prediction"; exit 1; }
 "$PY" - "$work/out_prescreen/peptides.tsv" "$work/planted.json" <<'PYEOF'
 import csv, json, sys

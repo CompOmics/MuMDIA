@@ -8,7 +8,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 PY=${PY:-/public/local/robbin/fs/venv/bin/python}
 export MUMDIA_CACHE_DIR=off
 mkdir -p "$O"
-for arm in plain crowd crowd_repeat; do
+for arm in ${ARMS:-plain crowd crowd_repeat}; do
   case $arm in
     plain) J='{"prescreen":{}}' ;;
     crowd) J='{"prescreen":{"crowding_exponent":0.25}}' ;;

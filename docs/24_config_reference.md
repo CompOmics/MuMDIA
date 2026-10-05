@@ -54,7 +54,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [(top level)](#top-level) | `Config` | 17 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
 | [`convert`](#convert) | `ConvertConfig` | 5 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
-| [`prescreen`](#prescreen) | `PrescreenConfig` | 30 |  |
+| [`prescreen`](#prescreen) | `PrescreenConfig` | 31 |  |
 | [`prescreen.tags`](#prescreentags) | `PrescreenTagsConfig` | 7 |  |
 | [`prescreen.mass_hypotheses`](#prescreenmass_hypotheses) | `PrescreenMassConfig` | 7 |  |
 | [`prescreen.trace`](#prescreentrace) | `PrescreenTraceConfig` | 8 |  |
@@ -167,6 +167,7 @@ Fragment-rarity candidate prescreen (`mumdia prescreen`, and `run`/`run-experime
 | `trace` | `PrescreenTraceConfig` | the `PrescreenTraceConfig` section's own defaults |  |  |
 | `localization` | `PrescreenLocalization` | `own` |  |  |
 | `tag_prefilter` | `bool` | `false` |  | Database-free tag prefilter before any prediction, without retention times. Tags are discovered from the spectra alone (`prescreen.tags`); a candidate is kept when one of its trimers, in its own residue states and at a fragment charge it can carry, was observed in its isolation window anywhere in the run, or when no trimer of it can be expressed in the tag alphabet. No fragment score is computed. In FASTA mode only the kept peptidoforms go to MS2PIP and DeepLC; with an imported library the kept candidates become a sub-library before the seed search and the multi-head calibration. Everything after it uses the predicted retention times as usual, including the fragment-rarity score when `enabled`. Single-file `run` only for now. Default false. |
+| `score_before_prediction` | `bool` | `false` |  | The fragment-rarity score before any prediction and without retention times: every candidate is scored over the whole gradient of its isolation window, with the preset / target and `crowding_exponent` of this block, and only the candidates kept go to prediction (FASTA mode) or into the sub-library (imported library), as for `tag_prefilter`; with both set a candidate must pass both. Uses no predicted fragment intensity and no retention time. Measured on the 8-12-mer immunopeptidomics library with `crowding_exponent = 0.25`: 54% removed, 99.0% of an unfiltered search's accepted precursors kept (Astral HYE: 52% removed, 95.2% kept, so data-dependent). Single-file `run` only. Default false. |
 
 ## prescreen.tags
 
@@ -1110,6 +1111,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-23 structs and 260 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 34 enumerations, 1 named profile(s), 96 environment variables read and 20 set.
+23 structs and 261 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 34 enumerations, 1 named profile(s), 96 environment variables read and 20 set.
 
 21 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

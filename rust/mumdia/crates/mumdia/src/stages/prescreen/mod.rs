@@ -856,33 +856,83 @@ pub fn run_if_enabled(
     Ok(Some(out))
 }
 
-/// The orchestrator's hook before prediction: when `prescreen.tag_prefilter`, keep the
-/// candidates of `table` (the peptidoform table, or an imported library's precursors) with an
-/// observed trimer in their isolation window anywhere in this run. No retention time and no
-/// fragment score. Returns the survivors table.
-pub fn run_tag_prefilter(
+/// The orchestrator's hook before prediction, without any retention time: the database-free
+/// tag prefilter (`prescreen.tag_prefilter`), the fragment-rarity score over the whole gradient
+/// of each candidate's isolation window (`prescreen.score_before_prediction`, with the preset,
+/// target and crowding settings of `prescreen`), or both, a candidate then having to pass both.
+/// `table` is the peptidoform table or an imported library's precursors. Returns the survivors
+/// table, or `None` when neither is set.
+pub fn run_before_prediction(
     cfg: &Config,
     config_hash: &str,
     ms2: &str,
     table: &str,
     out_dir: &str,
 ) -> Result<Option<String>> {
-    if !cfg.prescreen.tag_prefilter {
+    let p = &cfg.prescreen;
+    if !p.tag_prefilter && !p.score_before_prediction {
         return Ok(None);
     }
-    let out = format!("{out_dir}/tag_prefilter_survivors.parquet");
-    info!(stage = %"tag-prefilter", "run: stage start");
-    run(PrescreenParams {
-        ms2,
-        library_precursors: table,
-        run_windows: None,
-        ms1: None,
-        out: &out,
-        config: cfg,
-        config_hash,
-        sample_candidates: 0,
-        tags_only: true,
-    })?;
+    let mut parts: Vec<String> = Vec::new();
+    if p.tag_prefilter {
+        let out = format!("{out_dir}/tag_prefilter_survivors.parquet");
+        info!(stage = %"tag-prefilter", "run: stage start");
+        run(PrescreenParams {
+            ms2,
+            library_precursors: table,
+            run_windows: None,
+            ms1: None,
+            out: &out,
+            config: cfg,
+            config_hash,
+            sample_candidates: 0,
+            tags_only: true,
+        })?;
+        parts.push(out);
+    }
+    if p.score_before_prediction {
+        let out = format!("{out_dir}/score_prefilter_survivors.parquet");
+        info!(stage = %"score-prefilter", "run: stage start");
+        run(PrescreenParams {
+            ms2,
+            library_precursors: table,
+            run_windows: None,
+            ms1: None,
+            out: &out,
+            config: cfg,
+            config_hash,
+            sample_candidates: 0,
+            tags_only: false,
+        })?;
+        parts.push(out);
+    }
+    if parts.len() == 1 {
+        return Ok(parts.pop());
+    }
+    // Both: a candidate must pass both.
+    let a = TableFile::open(&parts[0])?;
+    let a_ids = a.u32("candidate_id")?;
+    let b_ids: std::collections::HashSet<u32> = TableFile::open(&parts[1])?
+        .u32("candidate_id")?
+        .into_iter()
+        .collect();
+    let (lab, dict) = a.str_interned("label")?;
+    let mut keep: Vec<(u32, String)> = a_ids
+        .iter()
+        .zip(&lab)
+        .filter(|(c, _)| b_ids.contains(c))
+        .map(|(&c, &l)| (c, dict[l as usize].clone()))
+        .collect();
+    keep.sort_unstable();
+    let out = format!("{out_dir}/prediction_prefilter_survivors.parquet");
+    write_table(
+        &out,
+        vec![
+            Col::U32("candidate_id".into(), keep.iter().map(|k| k.0).collect()),
+            Col::Str("label".into(), keep.into_iter().map(|k| k.1).collect()),
+        ],
+    )?;
+    info!(out = %out, "prescreen: tag prefilter and score prefilter intersected");
     Ok(Some(out))
 }
 
@@ -2743,5 +2793,35 @@ mod tests {
                 assert_eq!(run(None), run(Some(&occ)), "{pf} round {round}");
             }
         }
+    }
+
+    /// Before prediction with both filters on, the survivors are the intersection of the tag
+    /// prefilter's and the no-RT score's.
+    #[test]
+    fn both_prediction_prefilters_intersect() {
+        let dir = scratch("bothpre");
+        let (ms2, lib, _) = synthetic_run(&dir, 300, 90, false);
+        let mut c = cfg();
+        c.tag_prefilter = true;
+        c.score_before_prediction = true;
+        c.crowding_exponent = 0.25;
+        let config = conf(c.clone());
+        let both = run_before_prediction(&config, "t", &ms2, &lib, &dir)
+            .unwrap()
+            .unwrap();
+        let tags = survivors(&format!("{dir}/tag_prefilter_survivors.parquet"));
+        let score = survivors(&format!("{dir}/score_prefilter_survivors.parquet"));
+        let want: Vec<u32> = tags.iter().copied().filter(|x| score.contains(x)).collect();
+        assert_eq!(survivors(&both), want);
+        assert!(
+            (0..90u32).all(|i| want.contains(&i)),
+            "planted candidates pass both"
+        );
+        c.tag_prefilter = false;
+        c.score_before_prediction = false;
+        assert!(run_before_prediction(&conf(c), "t", &ms2, &lib, &dir)
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
