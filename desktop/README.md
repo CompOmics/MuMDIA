@@ -409,7 +409,29 @@ derived configuration run end to end on the smoke fixture: the prescreen before
 prediction and two bands each identify the planted peptides as the plain run does
 (110 and 115 of 160 against 116). The fixture cannot judge a large modification set:
 with about 150 true peptides the `(d + 1) / t` floor puts one extra decoy peptide above
-1%, so that measurement is a real FASTA search (docs/34).
+1%, so that measurement is a real FASTA search.
+
+On the Orbitrap AIF E. coli file (`bench/prescreen/ps_mods.sh`, MS2PIP + DeepLC, `nn_torch`,
+stripped peptides at 1%, mean of 3 NN seeds, EPYC 9354, 64 threads):
+
+| arm | peptidoforms predicted | peptides at 1% | wall | peak RSS |
+|---|---|---|---|---|
+| carbamidomethyl C, oxidation M | 1,922,388 | 10,632 | 8:39 | 26.7 GB |
+| + Phospho STY, Acetyl K, Deamidated NQ | 8,750,640 | 9,987 | 38:37 | 89.6 GB |
+| the same + prescreen before prediction | 3,217,290 | 9,945 | 12:15 | 26.4 GB |
+
+The larger search space costs 6.1% of the peptides, which is the FDR price of 4.6x the
+candidates on a sample without enriched modifications. The prescreen before prediction
+then removes 63% of the peptidoforms before MS2PIP and DeepLC, for -0.4% peptides (seed
+spreads of 40-90), 3.2x less wall time and 3.4x less memory.
+
+DIA-NN builds take the same selection (`ModPlan` in `diann.rs`): carbamidomethyl C is
+`--unimod4`, every other modification `--fixed-mod` / `--var-mod UniMod:<id>,<mass>,<residues>`
+under `--var-mods <max>`, plus `--no-cut-after-mod UniMod:121` for GlyGly K. The standard
+selection keeps its arguments and cache key, so existing cached libraries are reused, and
+the importer is told which accessions to keep (`--keep-unimod`). Checked with DIA-NN 2.2.0
+on 60 E. coli proteins with Phospho STY, GlyGly K and Oxidation M: all 33,885 target
+precursors imported, and the decoy builder's mass check at 0.02 ppm median.
 
 ## Vendor formats
 
