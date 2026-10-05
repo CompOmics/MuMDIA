@@ -2,7 +2,7 @@
 // builds keep it, because that is where the developer's own `println!` goes.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use mumdia_console::{components, diann, engine, preflight as pf, run, settings, thermo};
+use mumdia_console::{components, diann, engine, preflight as pf, run, settings, sizing, thermo};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -446,6 +446,30 @@ fn derive_config(
     Ok(path)
 }
 
+/// The modifications the engine knows by name, with the Search tab's quick sets: the
+/// engine's own catalogue file, so the list offered is the list the engine accepts.
+#[tauri::command]
+fn modifications() -> Result<serde_json::Value, String> {
+    serde_json::from_str(include_str!(
+        "../../../rust/mumdia/crates/mumdia-core/src/modifications.json"
+    ))
+    .map_err(|e| format!("the modification catalogue does not parse: {e}"))
+}
+
+/// The size of the chosen search space and the band plan this machine would use for it.
+///
+/// Reading a whole proteome takes a moment, so it runs off the interface thread.
+#[tauri::command]
+async fn search_space(req: sizing::SpaceRequest) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let engine = engine::resolve().ok().map(|(p, _)| p);
+        sizing::estimate(&req, engine.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|s| serde_json::to_value(s).map_err(|e| e.to_string()))
+}
+
 /// The override set a preset file amounts to, so the settings editor can start from
 /// the preset selected on the Search screen instead of from the engine defaults.
 #[tauri::command]
@@ -673,6 +697,8 @@ fn main() {
             config_schema,
             save_settings,
             derive_config,
+            modifications,
+            search_space,
             config_overrides,
             peak_census,
             history,

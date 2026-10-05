@@ -10,4 +10,5 @@ pub mod engine;
 pub mod preflight;
 pub mod run;
 pub mod settings;
+pub mod sizing;
 pub mod thermo;

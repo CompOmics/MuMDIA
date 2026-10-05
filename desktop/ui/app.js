@@ -69,6 +69,15 @@ const state = {
   schema: null,
   overrides: {},
   savedConfig: null,
+  // The Search tab's modification choice: "name|residue" -> "var" or "fix", and the
+  // engine's catalogue it is chosen from.
+  mods: new Map(),
+  catalogue: null,
+  // The last search-space size and band plan, and the request counter that drops a
+  // stale answer when the inputs changed while it was being computed.
+  space: null,
+  spaceSeq: 0,
+  spaceTimer: null,
   // Output folders this application has used. The only thing it remembers; what
   // each one contains is read back from the folder.
   known: JSON.parse(localStorage.getItem("mumdia.folders") || "[]"),
@@ -179,6 +188,8 @@ async function init() {
   for (const t of document.querySelectorAll(".tab")) {
     t.addEventListener("click", () => setMode(t.dataset.mode));
   }
+  await initMods();
+  initSearchOptions();
   for (const r of document.querySelectorAll('input[name="runmode"]')) {
     r.addEventListener("change", () => (state.runMode = r.value));
   }
@@ -995,6 +1006,7 @@ function setMode(mode) {
   for (const t of document.querySelectorAll(".tab")) t.classList.toggle("on", t.dataset.mode === mode);
   show($("mode-fasta"), mode === "fasta");
   show($("mode-library"), mode === "library");
+  scheduleSpace();
 }
 
 // ── file pickers ────────────────────────────────────────────────────────────
@@ -1121,6 +1133,7 @@ async function pick(what) {
     }
     await renderMzmlList();
     updateRawNote();
+    refreshPrescreenNote();
     // The peak census reads one file, and only an mzML: with several selected there
     // is no single answer to show, and for a vendor path it would convert first.
     if (state.picks.mzml.length === 1 && !isVendor(state.picks.mzml[0])) {
@@ -1135,6 +1148,7 @@ async function pick(what) {
   const path = Array.isArray(chosen) ? chosen[0] : chosen;
   state.picks[what] = path;
   if (what === "fasta") refreshLibSrcNote();
+  if (what === "fasta" || what === "lib_precursors") scheduleSpace();
   const el = $(LABEL[what]);
   // Shown right-to-left so the filename stays visible on a long path; the full
   // path is the tooltip.
@@ -1213,10 +1227,6 @@ function libraryParams(fasta) {
     const v = parseInt(el.value, 10);
     return Number.isFinite(v) ? v : dflt;
   };
-  const cb = (id, dflt) => {
-    const el = $(id);
-    return el ? el.checked : dflt;
-  };
   return {
     fasta,
     out_dir: "",
@@ -1226,8 +1236,8 @@ function libraryParams(fasta) {
     min_charge: n("d-minz", 2),
     max_charge: n("d-maxz", 4),
     threads: n("d-threads", 8),
-    carbamidomethyl: cb("d-cam", true),
-    oxidation: cb("d-ox", true),
+    carbamidomethyl: state.mods.get(modKey("Carbamidomethyl", "C")) === "fix",
+    oxidation: state.mods.get(modKey("Oxidation", "M")) === "var",
   };
 }
 
@@ -1246,11 +1256,488 @@ function digestOverrides() {
     "digest.max_len": d.max_pep_len,
     "peptidoforms.charge_min": d.min_charge,
     "peptidoforms.charge_max": d.max_charge,
-    "peptidoforms.fixed_mods": d.carbamidomethyl
-      ? [{ residue: "C", name: "Carbamidomethyl" }]
-      : [],
-    "peptidoforms.variable_mods": d.oxidation ? [{ residue: "M", name: "Oxidation" }] : [],
+    "peptidoforms.fixed_mods": selectedMods().fixed,
+    "peptidoforms.variable_mods": selectedMods().variable,
+    "peptidoforms.max_variable_mods": maxVariableMods(),
   };
+}
+
+// ── modifications ───────────────────────────────────────────────────────────
+// The list is the engine's own catalogue (`modifications.json` in mumdia-core, through
+// the `modifications` command), so every name offered is one the engine accepts. Each
+// residue chip cycles not searched -> variable -> fixed.
+const MOD_DEFAULTS = [
+  ["Carbamidomethyl", "C", "fix"],
+  ["Oxidation", "M", "var"],
+];
+const FALLBACK_CATALOGUE = {
+  modifications: [
+    { name: "Carbamidomethyl", unimod: 4, mass: 57.021463735, residues: "C", group: "Alkylation" },
+    { name: "Oxidation", unimod: 35, mass: 15.99491462, residues: "M", group: "Oxidation and artefacts" },
+  ],
+  sets: [],
+};
+
+function modKey(name, residue) {
+  return `${name}|${residue}`;
+}
+
+function maxVariableMods() {
+  const v = parseInt($("d-maxvar").value, 10);
+  return Number.isFinite(v) && v >= 0 ? v : 1;
+}
+
+// The choice as engine configuration, in catalogue order then residue order, so the
+// same choice always derives the same configuration.
+function selectedMods() {
+  const fixed = [];
+  const variable = [];
+  for (const m of state.catalogue?.modifications || []) {
+    const picked = [...state.mods.entries()]
+      .filter(([k]) => k.split("|")[0] === m.name)
+      .map(([k, kind]) => [k.split("|")[1], kind])
+      .sort((a, b) => a[0].localeCompare(b[0]));
+    for (const [residue, kind] of picked) {
+      (kind === "fix" ? fixed : variable).push({ residue, name: m.name });
+    }
+  }
+  return { fixed, variable };
+}
+
+// What the engine would refuse, said before the search starts rather than by the
+// peptidoform stage.
+function modProblems() {
+  const { fixed, variable } = selectedMods();
+  const out = [];
+  const byResidue = (list) => {
+    const m = new Map();
+    for (const x of list) m.set(x.residue, [...(m.get(x.residue) || []), x.name]);
+    return m;
+  };
+  const fx = byResidue(fixed);
+  const vr = byResidue(variable);
+  for (const [r, names] of fx) {
+    if (names.length > 1) {
+      out.push(`${r} has two fixed modifications (${names.join(", ")}); a residue can carry one.`);
+    }
+    if (vr.has(r)) {
+      out.push(
+        `${r} is fixed (${names.join(", ")}) and also variable (${vr.get(r).join(", ")}); ` +
+          "the engine refuses both on one residue. Make the fixed one variable, or remove one."
+      );
+    }
+  }
+  return out;
+}
+
+function saveMods() {
+  try {
+    localStorage.setItem("mumdia.mods", JSON.stringify([...state.mods]));
+    localStorage.setItem("mumdia.maxvar", String(maxVariableMods()));
+  } catch {
+    // A convenience only: the defaults come back next time.
+  }
+}
+
+function loadMods() {
+  state.mods = new Map();
+  let saved = null;
+  try {
+    saved = JSON.parse(localStorage.getItem("mumdia.mods") || "null");
+    const mv = localStorage.getItem("mumdia.maxvar");
+    if (mv !== null && Number.isFinite(parseInt(mv, 10))) $("d-maxvar").value = mv;
+  } catch {
+    saved = null;
+  }
+  const known = new Set(state.catalogue.modifications.map((m) => m.name));
+  const entries = Array.isArray(saved)
+    ? saved
+    : MOD_DEFAULTS.map(([n, r, k]) => [modKey(n, r), k]);
+  for (const e of entries) {
+    if (!Array.isArray(e) || e.length !== 2) continue;
+    const [key, kind] = e;
+    const [name, residue] = String(key).split("|");
+    if (known.has(name) && /^[A-Z]$/.test(residue || "") && (kind === "var" || kind === "fix")) {
+      state.mods.set(key, kind);
+    }
+  }
+}
+
+async function initMods() {
+  try {
+    state.catalogue = await invoke("modifications");
+  } catch {
+    state.catalogue = FALLBACK_CATALOGUE;
+  }
+  loadMods();
+  const sel = $("mod-set");
+  (state.catalogue.sets || []).forEach((set, i) => {
+    const o = document.createElement("option");
+    o.value = String(i);
+    o.textContent = set.name;
+    sel.appendChild(o);
+  });
+  sel.addEventListener("change", () => {
+    const set = (state.catalogue.sets || [])[parseInt(sel.value, 10)];
+    sel.value = "";
+    if (!set) return;
+    if (set.replace) state.mods.clear();
+    for (const [n, r] of set.fixed || []) state.mods.set(modKey(n, r), "fix");
+    for (const [n, r] of set.variable || []) state.mods.set(modKey(n, r), "var");
+    modsChanged();
+  });
+  $("mod-filter").addEventListener("input", renderMods);
+  $("d-maxvar").addEventListener("change", modsChanged);
+  renderMods();
+  summariseMods();
+}
+
+function modsChanged() {
+  saveMods();
+  renderMods();
+  summariseMods();
+  if (state.libSrc === "diann") refreshLibSrcNote();
+  scheduleSpace();
+}
+
+function renderMods() {
+  const list = $("mod-list");
+  const scroll = list.scrollTop;
+  const words = $("mod-filter").value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  list.textContent = "";
+  let group = null;
+  for (const m of state.catalogue.modifications) {
+    // The catalogue's residues, plus any a saved or set choice put elsewhere, so a
+    // selected site is never invisible.
+    const extra = [...state.mods.keys()]
+      .filter((k) => k.split("|")[0] === m.name)
+      .map((k) => k.split("|")[1]);
+    const residues = [...new Set([...m.residues, ...extra])];
+    const hay = `${m.name} ${m.group} ${residues.join(" ")} unimod:${m.unimod}`.toLowerCase();
+    if (words.length && !words.every((w) => hay.includes(w))) continue;
+    if (m.group !== group) {
+      group = m.group;
+      const h = document.createElement("div");
+      h.className = "modgroup";
+      h.textContent = group;
+      list.appendChild(h);
+    }
+    const row = document.createElement("div");
+    row.className = "modrow";
+    const label = document.createElement("div");
+    const name = document.createElement("span");
+    name.className = "mname";
+    name.textContent = m.name;
+    const mass = document.createElement("span");
+    mass.className = "mmass";
+    mass.textContent = `${m.mass >= 0 ? "+" : ""}${m.mass.toFixed(4)} Da · UniMod:${m.unimod}`;
+    label.append(name, mass);
+    const chips = document.createElement("div");
+    chips.className = "chips";
+    let on = false;
+    for (const r of residues) {
+      const key = modKey(m.name, r);
+      const kind = state.mods.get(key);
+      if (kind) on = true;
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "chip" + (kind === "var" ? " var" : kind === "fix" ? " fix" : "");
+      b.textContent = r;
+      b.title = `${m.name} on ${r}: ${
+        kind === "var" ? "variable" : kind === "fix" ? "fixed" : "not searched"
+      }`;
+      b.addEventListener("click", () => {
+        const cur = state.mods.get(key);
+        if (!cur) state.mods.set(key, "var");
+        else if (cur === "var") state.mods.set(key, "fix");
+        else state.mods.delete(key);
+        modsChanged();
+      });
+      chips.appendChild(b);
+    }
+    row.classList.toggle("on", on);
+    row.append(label, chips);
+    list.appendChild(row);
+  }
+  if (!list.childElementCount) {
+    const none = document.createElement("div");
+    none.className = "modrow";
+    none.textContent = "No modification matches the filter.";
+    list.appendChild(none);
+  }
+  list.scrollTop = scroll;
+}
+
+function describeMods(list) {
+  const by = new Map();
+  for (const x of list) by.set(x.name, [...(by.get(x.name) || []), x.residue]);
+  return [...by].map(([n, rs]) => `${n} (${rs.join(", ")})`).join(", ");
+}
+
+function summariseMods() {
+  const { fixed, variable } = selectedMods();
+  const parts = [];
+  parts.push(fixed.length ? `Fixed: ${describeMods(fixed)}.` : "No fixed modification.");
+  parts.push(
+    variable.length
+      ? `Variable: ${describeMods(variable)}, at most ${maxVariableMods()} per peptide.`
+      : "No variable modification."
+  );
+  const problems = modProblems();
+  if (problems.length) parts.push(problems.join(" "));
+  const space = spaceLine(state.space);
+  if (state.mode === "fasta" && space) parts.push(space);
+  $("mod-summary").textContent = parts.join(" ");
+}
+
+// ── prescreen and bands ─────────────────────────────────────────────────────
+// Measured numbers are from docs/34_prescreen.md: the fraction of candidates removed,
+// and the fraction of an unfiltered search's accepted precursors still accepted.
+const PRESCREEN_NOTES = {
+  off:
+    "Removes candidates the spectra give no support for, before the expensive stages. " +
+    "Off by default.",
+  before:
+    "Scores every candidate against the spectra of its isolation window before DeepLC and " +
+    "MS2PIP run, without retention times or predicted intensities, so predictions are made " +
+    "only for the candidates kept; everything after it uses predicted retention times as " +
+    "usual. Measured at balanced: 54% removed with 99.0% of an unfiltered search's accepted " +
+    "precursors kept on immunopeptidomics Astral data, 56% with 100% on Orbitrap AIF, and " +
+    "52% with 95.2% on HYE Astral, where light kept 99.6%. One file at a time.",
+  after:
+    "Scores every candidate inside its retention-time window after the calibration. " +
+    "Predictions are still made for the whole library; the saving is in extraction, " +
+    "features and rescoring. Measured at balanced: 54% removed with 99.4% kept on HYE " +
+    "Astral, 54% with 98.9% on immunopeptidomics. Cannot be combined with bands yet.",
+  tags:
+    "Keeps a candidate only when one of its three-residue sequence tags was read from a " +
+    "spectrum of its isolation window; database-free, before prediction and without " +
+    "retention times. Measured: 56-58% removed with 100% kept on Orbitrap AIF and on a " +
+    "FASTA E. coli search, 17% on HYE Astral, nothing on immunopeptidomics. One file at a " +
+    "time.",
+};
+// The fraction of the library each choice is expected to keep, for the band plan.
+const PRESCREEN_KEEP = { light: 0.75, balanced: 0.46, stringent: 0.25 };
+
+function initSearchOptions() {
+  $("prescreen").addEventListener("change", () => {
+    refreshPrescreenNote();
+    scheduleSpace();
+  });
+  $("prescreen-strength").addEventListener("change", scheduleSpace);
+  $("bands").addEventListener("change", () => {
+    show($("bands-custom"), $("bands").value === "custom");
+    renderSpace();
+  });
+  for (const id of ["bands-n", "bands-parallel"]) $(id).addEventListener("input", renderSpace);
+  for (const id of ["d-missed", "d-minlen", "d-maxlen", "d-minz", "d-maxz", "threads"]) {
+    $(id).addEventListener("change", scheduleSpace);
+  }
+  for (const r of document.querySelectorAll('input[name="runmode"]')) {
+    r.addEventListener("change", refreshPrescreenNote);
+  }
+  refreshPrescreenNote();
+  scheduleSpace();
+}
+
+function refreshPrescreenNote() {
+  const mode = $("prescreen").value;
+  show($("prescreen-strength-row"), mode === "before" || mode === "after");
+  let note = PRESCREEN_NOTES[mode] || "";
+  if ((mode === "before" || mode === "tags") && experimentWithSeveral()) {
+    note += " With several files searched as one experiment it is refused; choose \"Search each separately\".";
+  }
+  $("prescreen-note").textContent = note;
+}
+
+function experimentWithSeveral() {
+  return state.picks.mzml.length > 1 && currentRunMode() === "experiment";
+}
+
+function prescreenOverrides() {
+  const mode = $("prescreen").value;
+  const strength = $("prescreen-strength").value;
+  const preset =
+    strength === "light"
+      ? { "prescreen.preset": "custom", "prescreen.target": 0.25 }
+      : { "prescreen.preset": strength };
+  if (mode === "before") {
+    // Crowding 0.25: the no-retention-time score of docs/34, measured with it.
+    return {
+      "prescreen.score_before_prediction": true,
+      "prescreen.crowding_exponent": 0.25,
+      ...preset,
+    };
+  }
+  if (mode === "after") return { "prescreen.enabled": true, ...preset };
+  if (mode === "tags") return { "prescreen.tag_prefilter": true };
+  return {};
+}
+
+function prescreenKeep() {
+  return $("prescreen").value === "before"
+    ? PRESCREEN_KEEP[$("prescreen-strength").value] ?? 1
+    : 1;
+}
+
+function spaceRequest(libPrecursors) {
+  const d = libraryParams("");
+  const threads = parseInt($("threads").value, 10);
+  const library = libPrecursors || (state.mode === "library" ? state.picks.lib_precursors : "");
+  return {
+    mode: library ? "library" : "fasta",
+    fasta: state.picks.fasta || null,
+    lib_precursors: library || null,
+    missed_cleavages: d.missed_cleavages,
+    min_len: d.min_pep_len,
+    max_len: d.max_pep_len,
+    min_charge: d.min_charge,
+    max_charge: d.max_charge,
+    variable: selectedMods().variable,
+    max_variable_mods: maxVariableMods(),
+    keep_fraction: prescreenKeep(),
+    threads: Number.isFinite(threads) && threads > 0 ? threads : null,
+  };
+}
+
+function scheduleSpace() {
+  clearTimeout(state.spaceTimer);
+  state.spaceTimer = setTimeout(refreshSpace, 400);
+}
+
+async function refreshSpace() {
+  const seq = ++state.spaceSeq;
+  let s = null;
+  try {
+    s = await invoke("search_space", { req: spaceRequest() });
+  } catch (e) {
+    s = { reason: `Could not size the search: ${e}`, plan: null, machine: null };
+  }
+  if (seq !== state.spaceSeq) return;
+  state.space = s;
+  renderSpace();
+  summariseMods();
+}
+
+function fmtCount(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e4) return `${Math.round(n / 1e3)}k`;
+  return String(n);
+}
+
+function spaceLine(s) {
+  if (!s) return "";
+  if (s.precursors == null) return s.reason || "";
+  let line = s.exact
+    ? `The library has ${fmtCount(s.precursors)} precursors.`
+    : `About ${fmtCount(s.peptides)} peptides and ${fmtCount(s.precursors)} library precursors ` +
+      "with their decoys, estimated from the FASTA.";
+  if (s.searched_precursors != null && s.searched_precursors < s.precursors) {
+    line += ` About ${fmtCount(s.searched_precursors)} after the prescreen.`;
+  }
+  return line;
+}
+
+function customBands() {
+  const n = parseInt($("bands-n").value, 10);
+  const p = parseInt($("bands-parallel").value, 10);
+  const bands = Number.isFinite(n) && n > 0 ? n : 1;
+  return { bands, parallel: Math.min(Number.isFinite(p) && p > 0 ? p : 1, bands) };
+}
+
+function renderSpace() {
+  const s = state.space;
+  const plan = s?.plan;
+  const mode = $("bands").value;
+  const parts = [];
+  if (state.mode === "library") {
+    const line = spaceLine(s);
+    if (line) parts.push(line);
+  }
+  if (mode === "auto") {
+    parts.push(plan ? plan.note : "Choose the search space to size it.");
+  } else if (mode === "off") {
+    parts.push(
+      plan?.unbanded_gb != null
+        ? `Everything at once: about ${plan.unbanded_gb.toFixed(0)} GB estimated, on a ` +
+            `machine that can give a search about ${plan.budget_gb.toFixed(0)} GB.`
+        : "Everything at once."
+    );
+  } else {
+    const c = customBands();
+    let line = `${c.bands} band${c.bands === 1 ? "" : "s"}, ${c.parallel} at a time.`;
+    if (plan?.unbanded_gb != null) {
+      const per = 4 + (plan.unbanded_gb - 4) / c.bands;
+      line += ` About ${(per * c.parallel).toFixed(0)} GB in flight against a budget of ${plan.budget_gb.toFixed(0)} GB.`;
+    }
+    parts.push(line);
+  }
+  const m = s?.machine;
+  if (m?.total_memory_bytes) {
+    parts.push(`This machine: ${(m.total_memory_bytes / 1e9).toFixed(0)} GB of memory, ${m.threads} threads.`);
+  }
+  $("bands-note").textContent = parts.join(" ");
+}
+
+// The band count this search uses. Automatic sizes the inputs being started now, so a
+// stale plan from before the last change cannot decide it.
+async function resolveBands(libPrecursors) {
+  const mode = $("bands").value;
+  if (mode === "off") return { bands: 1, parallel: 1, explicit: true };
+  if (mode === "custom") return { ...customBands(), explicit: true };
+  try {
+    const s = await invoke("search_space", { req: spaceRequest(libPrecursors) });
+    state.space = s;
+    renderSpace();
+    return { bands: s.plan.bands, parallel: s.plan.parallel, explicit: false };
+  } catch {
+    return { bands: 1, parallel: 1, explicit: false };
+  }
+}
+
+function bandOverrides(b) {
+  // Automatic with one band leaves whatever the preset says; Off and Custom are explicit.
+  if (b.bands > 1 || b.explicit) {
+    return { "groups.window_groups": b.bands, "groups.parallel": b.parallel };
+  }
+  return {};
+}
+
+// Choices the engine would refuse, found before anything is built or started.
+function searchProblems() {
+  const out = [];
+  if (state.mode === "fasta") {
+    out.push(...modProblems());
+    if (state.libSrc === "diann") {
+      const { fixed, variable } = selectedMods();
+      const other = [...fixed, ...variable].filter(
+        (m) =>
+          !(m.name === "Carbamidomethyl" && m.residue === "C") &&
+          !(m.name === "Oxidation" && m.residue === "M")
+      );
+      if (other.length) {
+        out.push(
+          `DIA-NN builds use only carbamidomethyl on C and oxidation on M, and this ` +
+            `selection also has ${describeMods(other)}. Choose the built-in predictors, ` +
+            "or remove those modifications."
+        );
+      }
+    }
+  }
+  const pre = $("prescreen").value;
+  if ((pre === "before" || pre === "tags") && experimentWithSeveral()) {
+    out.push(
+      "The prescreen before prediction searches one file at a time. Choose \"Search each " +
+        "separately\" for these files, or the prescreen after retention-time calibration."
+    );
+  }
+  if (pre === "after" && $("bands").value === "custom" && customBands().bands > 1) {
+    out.push(
+      "The prescreen after retention-time calibration cannot be combined with bands yet. " +
+        "Set Bands to Off, or choose the prescreen before prediction."
+    );
+  }
+  return out;
 }
 
 // Say, on the search screen, whether choosing DIA-NN means waiting.
@@ -1527,6 +2014,12 @@ async function startSearch() {
     return;
   }
 
+  const problems = searchProblems();
+  if (problems.length) {
+    banner($("start-error"), problems.join("\n\n"));
+    return;
+  }
+
   // FASTA mode with DIA-NN: the search is a library-mode search whose library is
   // produced first. Everything after this point is the ordinary library path, which
   // is also the tested one. Built ONCE for the whole selection, not per file: the
@@ -1541,13 +2034,32 @@ async function startSearch() {
     if (!built) return;
   }
 
-  // Built-in predictors: the digest fields on this screen become part of the run's
-  // configuration, on top of the chosen preset. Derived once for the whole selection
-  // and validated by the engine before anything starts.
+  // The Search tab's choices become part of the run's configuration, on top of the
+  // chosen preset: the digest and modification fields for the built-in predictors, and
+  // the prescreen and band plan in every mode. Derived once for the whole selection and
+  // validated by the engine before anything starts. With nothing chosen the preset is
+  // passed unchanged, as before.
   let config = $("preset").value || null;
-  if (state.mode === "fasta" && !built) {
+  const bands = await resolveBands(built ? built[0] : null);
+  if ($("prescreen").value === "after" && bands.bands > 1) {
+    banner(
+      $("start-error"),
+      `This search would be split into ${bands.bands} bands to fit the memory of this ` +
+        "machine, and the prescreen after retention-time calibration cannot be combined " +
+        "with bands yet. Choose the prescreen before prediction, or set Bands to Off if " +
+        "the machine has the memory."
+    );
+    screen("input");
+    return;
+  }
+  const overrides = {
+    ...(state.mode === "fasta" && !built ? digestOverrides() : {}),
+    ...prescreenOverrides(),
+    ...bandOverrides(bands),
+  };
+  if (Object.keys(overrides).length) {
     try {
-      config = await invoke("derive_config", { base: config, overrides: digestOverrides() });
+      config = await invoke("derive_config", { base: config, overrides });
     } catch (e) {
       banner($("start-error"), String(e));
       screen("input");
