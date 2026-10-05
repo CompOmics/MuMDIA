@@ -290,7 +290,7 @@
             <select id="mod-set"><option value="">Choose a set…</option></select>
           </div>
           <div class="row">
-            <label for="d-maxvar">Variable per peptide</label>
+            <label for="d-maxvar">Max variable</label>
             <input type="number" id="d-maxvar" value="1" min="0" max="5" />
           </div>
         </div>
@@ -382,9 +382,9 @@
           <label for="prescreen">When</label>
           <select id="prescreen">
             <option value="off">Off</option>
-            <option value="before">Before prediction, without retention times</option>
-            <option value="after">After retention-time calibration</option>
-            <option value="tags">Tag prefilter before prediction</option>
+            <option value="before">Before prediction (no RT)</option>
+            <option value="after">After RT calibration</option>
+            <option value="tags">Tag prefilter (no RT)</option>
           </select>
         </div>
         <div class="row" id="prescreen-strength-row" hidden>

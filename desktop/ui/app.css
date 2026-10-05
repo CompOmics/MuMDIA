@@ -25,6 +25,8 @@
 }
 
 * { box-sizing: border-box; }
+/* `hidden` must win over a class that sets display (.row is flex, .grid2 is grid). */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0;
