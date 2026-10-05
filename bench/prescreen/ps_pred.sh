@@ -8,14 +8,16 @@ set -u
 ROOT=$1; BIN=$2; MZ=$3; FASTA=$4; DP=$5; DF=$6; CFG=$7; THREADS=$8
 ARMS=${ARMS:-"MS2PIP PEPTDEEP DIANN"}
 PEPTDEEP_PY=${PEPTDEEP_PY:-/public/local/robbin/fs/venv_peptdeep/bin/python}
+# Precursor charge range of the FASTA arms; match the DIA-NN library being compared.
+CHARGE_MAX=${CHARGE_MAX:-3}
 export MUMDIA_CACHE_DIR=off
 mkdir -p "$ROOT"
 log() { echo "$(date +%T) $*" >> "$ROOT/progress.log"; }
-python3 - "$CFG" "$ROOT" "$PEPTDEEP_PY" <<'EOF'
+python3 - "$CFG" "$ROOT" "$PEPTDEEP_PY" "$CHARGE_MAX" <<'EOF'
 import json, sys
 base = json.load(open(sys.argv[1]))
 base.setdefault("digest", {}).update({"missed_cleavages": 1, "min_len": 7, "max_len": 30})
-base.setdefault("peptidoforms", {}).update({"charge_min": 2, "charge_max": 3})
+base.setdefault("peptidoforms", {}).update({"charge_min": 2, "charge_max": int(sys.argv[4])})
 for arm in ("MS2PIP", "PEPTDEEP", "DIANN"):
     c = json.loads(json.dumps(base))
     if arm == "PEPTDEEP":
