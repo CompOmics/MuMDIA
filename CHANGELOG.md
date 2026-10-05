@@ -65,6 +65,43 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- **Fragment-rarity candidate prescreen** (`mumdia prescreen`, `prescreen.enabled`, off by
+  default; docs/34). A port of the tagbench prototype: each candidate is scored on the spectra
+  of its own isolation window inside its calibrated RT bounds (unique matched peaks weighted by
+  their per-window spectrum rarity, half weight below m/z 300, divided by sqrt(length), maximum
+  over spectra and both orientations), and kept above a label-blind calibration quantile
+  (presets 0.52 / 0.54 / 0.75 / 0.90). Equal to the prototype rule on 1,500 sampled candidates.
+  Uncapped by default; 300 peaks is a comparison setting. Modification scope with any/all
+  semantics and a recorded bypass below 100 calibration candidates. Selectable, off-by-default
+  components: database-free tag discovery and retrieval with a rescue route, delayed
+  modification enumeration, complementary-ion and blind mass-hypothesis evidence with optional
+  MS1, whole-path RMS weights with gap edges, fragment-trace pooling, backbone/position index
+  evidence, and family support for localization siblings. Measured on Astral REP1 (HYE library)
+  the balanced preset removes 54.0% of the candidates, keeps 99.39% of the precursors accepted
+  without it and costs 0.62% of the peptides at 1% (3 NN seeds); on the AIF entrapment run it
+  removes 56.5% with identical extraction output and entrapment FDP. It does not shorten
+  extract, whose cost follows the spectra rather than the candidate count, so it stays off.
+- **Prefilters before prediction, without retention times** (`prescreen.tag_prefilter`,
+  `prescreen.score_before_prediction`, off by default; docs/34 sections 5b and 6). Both run on
+  the peptidoform table (FASTA mode) or the imported library before MS2PIP, DeepLC and the seed
+  search, so predictions are made only for the survivors; every later stage uses predicted
+  retention times as usual. The tag prefilter keeps a candidate when one of its trimers was
+  observed in its isolation window: 56-58% removed with 100% kept on Orbitrap AIF data (E. coli
+  FASTA run 11.1 -> 4.5 min, 25.4 -> 14.7 GB), 16.5% on Astral, nothing on immunopeptidomics.
+  The score before prediction is the fragment-rarity score over the whole gradient with the new
+  `crowding_exponent` (0.25): on the 203M-candidate immunopeptidomics library it removed 54%,
+  kept 97.0% of the accepted precursors end to end and cost 3.5% of the peptides for 25% less
+  wall time and half the memory (3 NN seeds); on a FASTA search with Phospho STY, Acetyl K and
+  Deamidated NQ it removed 63% of the peptidoforms for -0.4% peptides, 3.2x less wall and 3.4x
+  less memory. Single-file `run` only. Also `prescreen.repeat_bonus` and positioned tags
+  (`tags.positioned`, `tags.positioned_residues`), both measured and off.
+- **Prescreen speed-ups with bit-identical scores**: a per-spectrum bin-occupancy bitmap and
+  upper-bound pruning over a per-window inverted bin index. Astral without retention times 4:40
+  -> 1:11, immunopeptidomics with retention times 18:53 -> 6:42, scores identical over the whole
+  10.9M and 203M libraries.
+
 ### Changed
 
 - **Per-candidate elution bounds are the default** (`features.bound_from_confident = false`,

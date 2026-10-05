@@ -51,9 +51,13 @@ undocumented on purpose; those fields are counted under "Coverage".
 
 | Section | Struct | Fields | Stage document |
 |---|---|---|---|
-| [(top level)](#top-level) | `Config` | 16 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
+| [(top level)](#top-level) | `Config` | 17 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
 | [`convert`](#convert) | `ConvertConfig` | 5 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
+| [`prescreen`](#prescreen) | `PrescreenConfig` | 31 |  |
+| [`prescreen.tags`](#prescreentags) | `PrescreenTagsConfig` | 7 |  |
+| [`prescreen.mass_hypotheses`](#prescreenmass_hypotheses) | `PrescreenMassConfig` | 7 |  |
+| [`prescreen.trace`](#prescreentrace) | `PrescreenTraceConfig` | 8 |  |
 | [`digest`](#digest) | `DigestConfig` | 6 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`digest.decoy`](#digestdecoy) | `DecoyConfig` | 1 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`peptidoforms`](#peptidoforms) | `PeptidoformsConfig` | 7 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
@@ -79,6 +83,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 |---|---|---|---|---|
 | `convert` | `ConvertConfig` | the `ConvertConfig` section's own defaults |  |  |
 | `prescan` | `PrescanConfig` | the `PrescanConfig` section's own defaults |  |  |
+| `prescreen` | `PrescreenConfig` | the `PrescreenConfig` section's own defaults |  |  |
 | `rng_seed` | `u64` | `0` |  |  |
 | `digest` | `DigestConfig` | the `DigestConfig` section's own defaults |  |  |
 | `peptidoforms` | `PeptidoformsConfig` | the `PeptidoformsConfig` section's own defaults |  |  |
@@ -123,6 +128,95 @@ Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates 
 | `mods` | `Vec<String>` | `["C:Carbamidomethyl", "M:Oxidation"]` |  | Residue:UniModName entries that may appear in a screened peptidoform, e.g. `C:Carbamidomethyl`. A peptidoform carrying anything outside this set plus `anchor_mods` is dropped rather than screened on a partially understood sequence. |
 | `anchor_mods` | `Vec<String>` | `[]` |  | Residue:UniModName entries the screen anchors ON. Only trimers covering one of these positions count as evidence, so backbone signal cannot keep a modified hypothesis alive. |
 | `anchor_all` | `bool` | `false` |  | Screen EVERY candidate on every trimer of its sequence, modified or not, instead of only the modification-bearing candidates on their anchored trimers. This turns the prescan from a modform pruner into a per-run library pruner for a search space that is large on its own, such as a predicted immunopeptidomics library of 10^8 precursors, where a run supports only a small fraction of the enumeration. The screen stays label-blind (both orientations of every trimer; a reverse decoy's tag set is its target's), so it remains a compute reduction and never a discriminator. `anchor_mods` may be empty when this is set. Default off: the anchored screen is the measured one. |
+
+## prescreen
+
+`PrescreenConfig` (rust/mumdia/crates/mumdia-core/src/config.rs).
+
+Fragment-rarity candidate prescreen (`mumdia prescreen`, and `run`/`run-experiment` when `enabled`). Each candidate is scored on the spectra of its own isolation window inside its calibrated RT bounds: its b/y fragments at charges `1..=min(max_frag_charge, z)`, in both the forward and the fully reversed sequence, are matched to the observed peaks within `frag_tol_da`; each matched peak counts once, weighted by `-ln p`, where `p` is the share of that window's spectra with a peak within +/-0.01 Da of it (0.01 Da bins, spectrum-only, no identifications), and by `low_mz_weight` below `low_mz_threshold`; the sum is divided by the square root of the peptide length; the candidate's score is the maximum over its eligible spectra. A cutoff is the `target` quantile ("higher" method) of the scores of a seeded calibration half of the in-scope candidates, labels never used; a candidate is kept when its score exceeds it. Targets and decoys are scored by the identical rule, each on its own sequence, m/z and RT window. Default off.
+
+| Field | Type | Default | Gated | Description |
+|---|---|---|---|---|
+| `enabled` | `bool` | `false` |  | Run the prescreen inside `run` / `run-experiment`, between rt-im-train and extract, and extract only its survivors. Default false. |
+| `preset` | `PrescreenPreset` | `balanced` |  | Calibration preset; `custom` takes `target`. |
+| `target` | `f64` | `0.54` |  | Calibration rejection target in (0, 1) when `preset = "custom"`. |
+| `seed` | `u64` | `20261003` |  | Seed of the calibration/reporting split. |
+| `min_calibration` | `usize` | `100` |  | Fewer in-scope calibration candidates than this bypasses the filter (everything kept), with the reason in the report. |
+| `scope` | `PrescreenScope` | `all` |  |  |
+| `scope_mods` | `Vec<String>` | `[]` |  | `RESIDUE:UniModName` entries defining `scope = "modified"`, e.g. `M:Oxidation`. |
+| `scope_match` | `PrescreenScopeMatch` | `any` |  |  |
+| `top_peaks` | `usize` | `0` |  | Most intense peaks per MS2 used for both the rarity histogram and the matching; 0 (the default) uses every positive peak. 300 is the capped comparison setting. |
+| `frag_tol_da` | `f64` | `0.005` |  | Candidate fragment matching tolerance, absolute m/z (Da). |
+| `max_frag_charge` | `i32` | `2` |  | Highest fragment charge; each candidate uses `1..=min(this, precursor charge)`. |
+| `low_mz_threshold` | `f64` | `300.0` |  | Matched peaks below this m/z are weighted by `low_mz_weight`. |
+| `low_mz_weight` | `f64` | `0.5` |  |  |
+| `both_orientations` | `bool` | `true` |  | Also score the fully reversed sequence and keep the larger score, as the measured prototype did. The same rule applies to targets and decoys. |
+| `rt_slack_s` | `f64` | `0.0` |  | Widen each candidate's calibrated RT bounds by this many seconds on both sides. |
+| `crowding_exponent` | `f64` | `0.0` |  | Crowding adjustment: divide each spectrum's score by (its peak count / the window's mean peak count)^exponent, the ratio clamped to [0.25, 4]; 0 (default) = off, 0.25 = the prototype's phase-11 setting. |
+| `repeat_bonus` | `f64` | `0.0` |  | Repeat bonus: `score / q95 + w * repeat / q95`, where `repeat` counts each matched fragment as strongly as its weaker appearance in a neighbouring scan (two eligible scans, 8 s); 0 (default) = off, 0.1 = the prototype's phase-11 setting. |
+| `write_scores` | `bool` | `false` |  | Write the per-candidate scores beside the survivors (`<out>.scores.parquet`). |
+| `retrieval` | `PrescreenRetrieval` | `all` |  | Candidate retrieval before scoring. `all` (default) scores every candidate. |
+| `rescue` | `bool` | `true` |  | With `retrieval = "tags"`, score candidates without tag evidence anyway (the permissive rescue route) instead of dropping them. Default true. |
+| `delayed_modforms` | `bool` | `false` |  | With `retrieval = "tags"`, retrieve backbone families first and examine forms only in retrieved families (delayed modification enumeration). Same retrieved set. |
+| `tags` | `PrescreenTagsConfig` | the `PrescreenTagsConfig` section's own defaults |  |  |
+| `complement_bonus` | `f64` | `0.0` |  | Weight of the complementary-ion component (prototype 0.25 measured); 0 = off. |
+| `tag_bonus` | `f64` | `0.0` |  | Weight of the tag-evidence component (spectrum rarity x path fit, each distinct trimer once); 0 = off. |
+| `fasta_bonus` | `f64` | `0.0` |  | Weight of the FASTA/library-side tag information, kept separate from the spectrum side; 0 = off. |
+| `flank_bonus` | `f64` | `0.0` |  | Weight of positioned flank support (an observed tag whose ladder endpoints sit at the candidate's b/y masses); 0 = off. |
+| `mass_hypotheses` | `PrescreenMassConfig` | the `PrescreenMassConfig` section's own defaults |  |  |
+| `trace` | `PrescreenTraceConfig` | the `PrescreenTraceConfig` section's own defaults |  |  |
+| `localization` | `PrescreenLocalization` | `own` |  |  |
+| `tag_prefilter` | `bool` | `false` |  | Database-free tag prefilter before any prediction, without retention times. Tags are discovered from the spectra alone (`prescreen.tags`); a candidate is kept when one of its trimers, in its own residue states and at a fragment charge it can carry, was observed in its isolation window anywhere in the run, or when no trimer of it can be expressed in the tag alphabet. No fragment score is computed. In FASTA mode only the kept peptidoforms go to MS2PIP and DeepLC; with an imported library the kept candidates become a sub-library before the seed search and the multi-head calibration. Everything after it uses the predicted retention times as usual, including the fragment-rarity score when `enabled`. Single-file `run` only for now. Default false. |
+| `score_before_prediction` | `bool` | `false` |  | The fragment-rarity score before any prediction and without retention times: every candidate is scored over the whole gradient of its isolation window, with the preset / target and `crowding_exponent` of this block, and only the candidates kept go to prediction (FASTA mode) or into the sub-library (imported library), as for `tag_prefilter`; with both set a candidate must pass both. Uses no predicted fragment intensity and no retention time. Measured on the 8-12-mer immunopeptidomics library with `crowding_exponent = 0.25`: 54% removed, 99.0% of an unfiltered search's accepted precursors kept (Astral HYE: 52% removed, 95.2% kept, so data-dependent). Single-file `run` only. Default false. |
+
+## prescreen.tags
+
+`PrescreenTagsConfig` (rust/mumdia/crates/mumdia-core/src/config.rs).
+
+Database-free tag discovery used by retrieval and the optional evidence components.
+
+| Field | Type | Default | Gated | Description |
+|---|---|---|---|---|
+| `edge_tol_da` | `f64` | `0.005` |  | Neutral residue-mass tolerance of a tag edge (Da); `edge_tol_da / z` in m/z. |
+| `max_charge` | `i32` | `2` |  | Highest fragment charge of a tag edge. |
+| `gap_edges` | `bool` | `false` |  | Also allow two-residue gap steps; every compatible residue pair is kept as an alternative and gapped three-peak ladders are keyed separately from four-peak ones. |
+| `rms_sigma_da` | `f64` | `0.003` |  | Sigma of the whole-path soft weight `exp(-0.5 (rms / sigma)^2)` (Da). |
+| `extra_mods` | `Vec<String>` | `[]` |  | Variable states added to the chemistry configuration's alphabet, `RESIDUE:Name`. |
+| `positioned` | `bool` | `false` |  | Positioned retrieval: a candidate is retrieved only by a tag whose ladder starts at one of its own b or y fragment masses (+/- 0.01 Da), not by the same trimer anywhere in the spectrum. Much more specific in dense spectra. |
+| `positioned_residues` | `usize` | `3` |  | Residue steps of a positioned ladder: 3 (four consecutive fragments, the default) or 2 (three consecutive fragments, more permissive). |
+
+## prescreen.mass_hypotheses
+
+`PrescreenMassConfig` (rust/mumdia/crates/mumdia-core/src/config.rs).
+
+Blind neutral-mass hypotheses from tag paths and complementary peaks, with optional MS1.
+
+| Field | Type | Default | Gated | Description |
+|---|---|---|---|---|
+| `enabled` | `bool` | `false` |  | Infer hypotheses and write `<out>.mass_hypotheses.parquet`. |
+| `sample_spectra` | `usize` | `512` |  | Spectra sampled for inference (seeded); 0 = every spectrum (expensive). |
+| `ms1` | `bool` | `false` |  | Look for the monoisotopic and +1 isotope peaks in MS1 scans within `ms1_rt_s`. |
+| `ms1_rt_s` | `f64` | `2.0` |  |  |
+| `ms1_ppm` | `f64` | `10.0` |  | MS1 tolerance: max(0.005 Da, this many ppm). |
+| `require_ms1` | `bool` | `false` |  | Drop hypotheses without an MS1 link. A hard gate; off by default. |
+| `bonus` | `f64` | `0.0` |  | Weight of the candidate mass-support component in the combined score; 0 = report only. |
+
+## prescreen.trace
+
+`PrescreenTraceConfig` (rust/mumdia/crates/mumdia-core/src/config.rs).
+
+Fragment traces over consecutive same-window scans.
+
+| Field | Type | Default | Gated | Description |
+|---|---|---|---|---|
+| `enabled` | `bool` | `false` |  | Compute the trace component (reported in the scores table). |
+| `scans` | `usize` | `7` |  | Consecutive same-window scans per pool. |
+| `cluster_da` | `f64` | `0.01` |  | Maximum m/z range (max - min) of one merged cluster. |
+| `min_detections` | `usize` | `2` |  | Scans a merged cluster must be detected in. |
+| `pooling` | `PrescreenPooling` | `merged` |  |  |
+| `score` | `PrescreenTraceScore` | `tag_coherence` |  |  |
+| `min_quality` | `f64` | `0.6` |  | Trace cosine counted as compatible by `coherent_fragments`. |
+| `bonus` | `f64` | `0.0` |  | Weight of the trace component in the combined score; 0 = report only. |
 
 ## digest
 
@@ -686,6 +780,87 @@ How the elution-peak integration window is chosen per candidate in quant.
 | `per_candidate` | yes | Each candidate's window comes from its own summed-XIC descent walk. Exact per peak but sensitive to interference (stretched) and sparse peaks (collapsed). |
 | `consensus` |  | Consensus window: the median left and right half-widths of confident peptides (a near-constant instrument/gradient property) applied around each candidate's apex. Robust to a single window being distorted. The widths are estimated per quant invocation, not shared automatically across runs. |
 
+### `PrescreenLocalization`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+How modification siblings share evidence (`prescreen.localization`).
+
+| Value | Default | Description |
+|---|---|---|
+| `own` | yes | Every form keeps its own score. |
+| `family_support` |  | Family support: every form of one backbone with the same modification composition, charge and label takes the family's best score, so compatible localizations and ties pass or fail together. Support is kept separate from localization; no site is chosen. |
+| `best_site` |  | Keep only forms whose own score equals the family best (ties kept). Measured to lose modified references in the prototype; available for comparison only. |
+
+### `PrescreenPooling`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+Fragment-trace pooling mode (`prescreen.trace.pooling`).
+
+| Value | Default | Description |
+|---|---|---|
+| `merged` | yes | Bounded mass clusters over the pooled scans (max - min <= `cluster_da`), kept when seen in at least `min_detections` scans. |
+| `unmerged` |  | Every pooled peak as its own feature, for comparison with merging. |
+
+### `PrescreenPreset`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+Calibration presets of the fragment-rarity prescreen (`prescreen.preset`). Each names a calibration rejection target, the share of the calibration half's scores at or below the cutoff. Measured on six Astral HYE runs (exploratory screening on sampled candidates, tagbench PHASE10): reduction / reference retention / weak-reference retention 50.29% / 99.70% / 99.24% (sensitive), 52.28% / 99.66% / 99.20% (balanced), 74.62% / 96.94% / 94.22% (stringent), 90.30% / 90.58% / 82.67% (aggressive). A target does not guarantee the same reduction on another run or library; the report records the measured one.
+
+| Value | Default | Description |
+|---|---|---|
+| `sensitive` |  | Target 0.52. |
+| `balanced` | yes | Target 0.54. |
+| `stringent` |  | Target 0.75. |
+| `aggressive` |  | Target 0.90. |
+| `custom` |  | Use `prescreen.target`. |
+
+### `PrescreenRetrieval`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+Which candidates the prescreen scores (`prescreen.retrieval`).
+
+| Value | Default | Description |
+|---|---|---|
+| `all` | yes | Score every candidate (the measured recommended mode). |
+| `tags` |  | Retrieve candidates through database-free tags first: a candidate is retrieved when one of its trimers, in its own residue states, was observed in an eligible spectrum. Candidates without such evidence take the rescue route when `rescue` is on. |
+
+### `PrescreenScope`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+Which candidates the prescreen filters (`prescreen.scope`). Candidates outside the scope pass through unscored, and the cutoff is calibrated within the scope only.
+
+| Value | Default | Description |
+|---|---|---|
+| `all` | yes | Every candidate form. |
+| `modified` |  | Only forms carrying the modifications in `prescreen.scope_mods` (`scope_match` says whether any or all of them). |
+
+### `PrescreenScopeMatch`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+How several `prescreen.scope_mods` combine.
+
+| Value | Default | Description |
+|---|---|---|
+| `any` | yes | A form is in scope when it carries at least one of the listed modifications. |
+| `all` |  | A form is in scope only when it carries every listed modification. |
+
+### `PrescreenTraceScore`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+Which trace evidence the trace component scores (`prescreen.trace.score`).
+
+| Value | Default | Description |
+|---|---|---|
+| `tag_coherence` | yes | Tag coherence: for each candidate trimer, the best (minimum pairwise trace cosine of the four path features x whole-path fit) in a pool; summed over distinct trimers. |
+| `coherent_fragments` |  | Disconnected ladders: candidate fragments matched to pooled features, counted when their trace is compatible (cosine >= `min_quality`) with the most intense matched feature. |
+
 ### `QuantQColumn`
 
 (rust/mumdia/crates/mumdia-core/src/config.rs)
@@ -923,16 +1098,19 @@ Every field whose struct has an `impl Default` resolved from the source.
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
-5 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
+8 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
 
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmRows::push: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmStream::push: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `chunk.slices_mut()``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `runs[r].span_mut(m)``
+- `rust/mumdia/crates/mumdia/src/stages/prescreen/tags.rs::discover: env read via closure of `alpha.key(alpha.canonical(a, b, c), z, false)``
+- `rust/mumdia/crates/mumdia/src/stages/prescreen/tags.rs::discover: env read via closure of `alpha.key(alpha.canonical(la as u16, p.1, p.2), z, true)``
+- `rust/mumdia/crates/mumdia/src/stages/prescreen/tags.rs::discover: env read via closure of `alpha.key(alpha.canonical(p.1, p.2, lb as u16), z, true)``
 - `rust/mumdia/crates/mumdia/src/stages/rescore.rs::check_sidecar_space: env read of `k``
 
 ## Coverage
 
-19 structs and 207 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 27 enumerations, 1 named profile(s), 96 environment variables read and 20 set.
+23 structs and 261 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 34 enumerations, 1 named profile(s), 96 environment variables read and 20 set.
 
-21 field(s) carry a gating marker in their doc comment. 48 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+21 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
