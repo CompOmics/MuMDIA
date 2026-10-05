@@ -6,6 +6,11 @@ score exceeds a label-blind calibration quantile. Its purpose is a compute reduc
 of the candidates removed before extraction while nearly every identifiable candidate is kept.
 It is off by default (`prescreen.enabled = false`).
 
+The same score also runs before any prediction and without retention times
+(`prescreen.score_before_prediction`, section 6), together with a database-free tag prefilter
+(`prescreen.tag_prefilter`). Those two remove candidates before MS2PIP and DeepLC, so the
+predictions are only made for the survivors; section 5b has their measurements.
+
 It is a port of the `tagbench` prototype (`advanced_candidates.scores`, column `lowmz_half`, and
 `advanced_filter.export`). The Rust score equals a line-by-line NumPy port of the prototype rule
 exactly (maximum absolute difference 0.0 on 1,500 sampled candidates of the AIF entrapment run,
@@ -91,6 +96,9 @@ section 1 near 50% reduction, so they are for experiments.
 | `mass_hypotheses.*` | Blind neutral-mass hypotheses from tag paths and two or more complementary peaks, per 0.01 Da bin, from a seeded sample of spectra, written to `<out>.mass_hypotheses.parquet` before any candidate is consulted; optional MS1 mono/+1 isotope links within 2 s and max(0.005 Da, 10 ppm); `require_ms1` is a hard gate and off. |
 | `trace.*` | Seven-scan same-window pools, bounded 0.01 Da clusters (max - min), intensity-weighted centroids, summed intensity, detection counts and unit per-scan profiles; `merged` (two or more detections) or `unmerged`; `tag_coherence` (minimum pairwise trace cosine of the four path features times fit) or `coherent_fragments` (matched fragments whose trace is compatible with the most intense matched feature, so ladders need not be connected). The single-scan score is unaffected. |
 | `localization` | `own` (default), `family_support` (every localization sibling, same residues, charge, label and modification composition, takes the family best; ties and alternatives pass together) or `best_site` (keeps only the best site, ties kept; measured to lose modified references in the prototype). |
+| `crowding_exponent` | Divides each spectrum's score by `(n_peaks / mean n_peaks of the window) ^ exponent`, the ratio clamped to [0.25, 4]. It uses the observed peak counts only, no predicted intensity, and corrects the advantage a dense spectrum gives every candidate when there is no retention-time window to restrict the spectra. `0.25` is the value measured in section 5b; default `0`. |
+| `repeat_bonus` | Adds `w * R / q95(R)` to `D / q95(D)`, where `R` is, per matched peak, the smaller of its weight and the best weight of the same fragment within two eligible scans and 8 s. Rewards fragments seen in neighbouring scans. Default `0`. |
+| `tags.positioned`, `tags.positioned_residues` | For the tag prefilter: a candidate's trimer must sit at the candidate's own b or y position (a ladder anchored at its own fragment masses) rather than anywhere in the spectrum; `positioned_residues` 2 or 3 sets the ladder length. Stricter and measured to lose identifications (section 5b). |
 
 With any component weight positive, the combined score is `base / q95(base) + sum_k w_k c_k /
 q95(c_k)` over the calibration half, the prototype's scaling, and the cutoff is calibrated on it.
@@ -188,6 +196,16 @@ None improves on the plain score near 50% reduction, which is the prototype's co
 the AIF sample every variant equals the plain score because its cutoff is 0. Gap edges multiply
 the paths sixteenfold (5.8 billion on Astral) for no retention change.
 
+**Exact speed-ups.** Two changes leave every score bit-identical and only skip work: a
+per-spectrum 0.01 Da bin-occupancy bitmap, which answers "is any peak within tolerance" without
+searching the peak list, and upper-bound pruning over a per-window inverted bin index, which
+skips a spectrum once the bins a candidate could still match cannot beat its best spectrum so
+far (all peaks in one bin share one weight, with a 1e-9 margin). Over whole libraries the scores
+were identical to the unpruned ones (10,881,402 Astral and 203,443,548 immunopeptidomics
+candidates, maximum absolute difference 0). Astral without retention times: 4:40 -> 3:21
+(bitmap) -> 1:11 (pruning); immunopeptidomics with retention times: 18:53 -> 6:42 (scoring
+1,021 s -> 338 s).
+
 **Run time and memory: no saving at this scale.** Clean sequential timing, two repeats, nothing
 else running:
 
@@ -202,10 +220,75 @@ library candidates, so removing 54% of the candidates did not shorten it, and th
 own pass is added on top. What shrinks downstream is the extracted PSM count, by 10% on Astral
 (680,218 to 611,852; none on AIF), which reduces features, compete and rescore proportionally.
 A net gain is therefore plausible only where per-candidate cost dominates (much larger
-libraries, as in docs/32, or a candidate-major extract), and it is not measured here. The
+libraries, as in docs/32, or a candidate-major extract). That case is measured in section 5b on a
+203M-candidate immunopeptidomics library, where extract, features and rescore roughly halve. The
 prescreen stays off by default.
 
 ![Reduction versus retention](figures/prescreen_validation.png)
+
+## 5b. Before prediction, without retention times
+
+Measured 2026-10-04 and 2026-10-05 (`bench/prescreen/ps_rtfree.sh`, `ps_crowd.sh`,
+`ps_tagpre.sh`, `ps_mods.sh`). "Kept" is again the share of an unfiltered search's accepted
+precursors whose candidate survives; "removed" is the share of the library or peptidoform table.
+
+**Tag prefilter** (`tag_prefilter`, plain trimers, end to end):
+
+| Data | Removed | Kept | Run wall | Peptides vs OFF |
+|---|---:|---:|---|---:|
+| Orbitrap AIF entrapment library | 55.6% | 100% | 3.0 -> 2.1 min | +0.33%, FDP 1.001% -> 1.028% |
+| Orbitrap AIF, E. coli FASTA (MS2PIP + DeepLC) | 58.2% | 100% | 11.1 -> 4.5 min, 25.4 -> 14.7 GB | -0.31% |
+| Astral REP1, HYE library | 16.5% | 100% | 5.0 -> 5.5 min | -0.20% |
+| Astral immunopeptidomics, 203M library | 0% | 100% | | |
+
+It works where spectra are sparse relative to the library and does nothing on dense
+immunopeptidomics spectra, where almost every trimer occurs somewhere in each window. Positioned
+tags (standalone) remove more and lose identifications: three residues AIF 85% / 85% kept, Astral
+31.8% / 95.9%, immunopeptidomics 16.1% / 99.1%; two residues AIF 63.8% / 98.9%, Astral 17.1% /
+99.96%, immunopeptidomics 0.5%.
+
+**Fragment-rarity score without retention times** (`score_before_prediction`; standalone
+reduction / kept):
+
+| Data | Variant | 25% | 40% | 52% | 54% | 75% |
+|---|---|---:|---:|---:|---:|---:|
+| Astral REP1 | plain | 99.19% | 96.29% | 92.89% | | |
+| Astral REP1 | crowding 0.25 | 99.62% | 97.76% | 95.24% | | |
+| Astral REP1 | crowding 0.25 + repeat 0.1 | 99.71% | 98.09% | 95.76% | | |
+| immunopeptidomics | plain | | | | 96.03% | |
+| immunopeptidomics | crowding 0.25 | 99.90% | 99.60% | 99.12% | 99.04% | 96.91% |
+
+Without a retention-time window a dense spectrum anywhere in the gradient favours every
+candidate, which crowding corrects; on immunopeptidomics data the crowding-adjusted score keeps
+as much as the score with calibrated retention times (98.91% at 54%). On the AIF entrapment run
+it removes 56% at 100% kept. The plain no-RT score at 52% cost 6.5% of the Astral peptides end to
+end.
+
+**End to end, immunopeptidomics** (AT10265RJB against the uncalibrated 203,443,548-candidate
+library with in-run multi-head DeepLC, 128 threads, `nn_torch`, 3 NN seeds; balanced, crowding
+0.25):
+
+| | OFF | Before prediction |
+|---|---:|---:|
+| library searched | 203.4M | 93.6M |
+| peptides at 1% | 13,781 (sd 135) | 13,295 (sd 121), -3.5% |
+| wall | 3:04 | 2:19 |
+| peak resident | 105 GB | 52.7 GB |
+| screen + sub-library | | 44.8 + 6.4 min |
+| deeplc-multihead / extract / features / rescore | 36.8 / 85.8 / 37.2 / 15.5 min | 20.8 / 38.7 / 17.4 / 8.3 min |
+
+The screen kept 96.99% of the 14,627 precursors accepted in any OFF seed; the 440 it removed
+are the net loss, the rest is seed-to-seed exchange (615 lost and 679 gained among survivors).
+The standalone 99.04% above was measured against a search of the calibrated library, which
+accepts a different set. With calibrated retention times instead (`enabled`, after the
+calibration) the same library lost 1.19% of the peptides (not significant; standard deviation
+of OFF 275) at 54% and 1.61% at 75%, and extract went from 39.4 to 25.6 / 16.2 min, features from
+11.2 to 7.3 / 4.3, rescore from about 15 to 7 / 4.4.
+
+**End to end, a large modification search** (Orbitrap AIF, E. coli FASTA, MS2PIP + DeepLC, Phospho
+STY, Acetyl K, Deamidated NQ and Oxidation M, 3 NN seeds): the prescreen before prediction sent
+3,217,290 of 8,750,640 peptidoforms to prediction (63% removed); peptides 9,987 -> 9,945
+(-0.4%, within the seed spread), wall 38:37 -> 12:15, peak 89.6 -> 26.4 GB.
 
 ## 6. Use
 
@@ -232,7 +315,18 @@ Inside a run there are two independent switches:
 
 Standalone, `mumdia prescreen --tags-only` without `--run-windows` is the same prefilter.
 
-Not yet supported with `groups.window_groups > 1` (validation rejects the combination).
+- `prescreen.score_before_prediction`: the fragment-rarity score of sections 1-2 at the same
+  place as the tag prefilter, before prediction and without retention times: every candidate is
+  scored over the whole gradient of its isolation window, with the preset or target and
+  `crowding_exponent` of the `prescreen` block (0.25 is the measured setting). With both set a
+  candidate must pass both (`prediction_prefilter_survivors.parquet`). Single-file `run` only,
+  for the reason above. Section 5b has the measurements; on dense data it costs identifications
+  (-3.5% on the immunopeptidomics run at balanced), so the strength is a trade between run time
+  and memory and sensitivity.
+
+`prescreen.enabled` is not yet supported with `groups.window_groups > 1` (validation rejects the
+combination). The two prefilters before prediction work with window groups: they run before the
+band plan, which then splits the reduced library.
 
 Standalone, for a run directory written by `mumdia run`:
 
