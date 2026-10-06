@@ -48,6 +48,7 @@ mod order_consistency;
 mod peak_scans;
 mod rt;
 mod similarity;
+mod window;
 
 type FamilyFn = fn(&Evidence) -> Vec<f64>;
 
@@ -72,6 +73,21 @@ const FAMILIES: &[(&[&str], FamilyFn)] = &[
     (demix::NAMES, demix::values),
 ];
 
+/// Experimental: the fixed-window integrated family ([`window`]), appended after the
+/// registry when `MUMDIA_WINDOW_FEATURES=1`. Off by default, so the default schema and
+/// every pinned feature digest are unchanged.
+fn families() -> &'static [(&'static [&'static str], FamilyFn)] {
+    static F: std::sync::OnceLock<Vec<(&'static [&'static str], FamilyFn)>> =
+        std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        let mut v = FAMILIES.to_vec();
+        if std::env::var("MUMDIA_WINDOW_FEATURES").is_ok_and(|x| x == "1") {
+            v.push((window::NAMES, window::values));
+        }
+        v
+    })
+}
+
 /// Names already used by the Minimal/Rich sets, which the extended battery must
 /// not shadow (a colliding extended feature is dropped, keeping the legacy one).
 fn reserved_names() -> std::collections::HashSet<&'static str> {
@@ -90,7 +106,7 @@ fn extended_name_refs() -> Vec<&'static str> {
     let reserved = reserved_names();
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for (names, _) in FAMILIES {
+    for (names, _) in families() {
         for &n in *names {
             if reserved.contains(n) {
                 continue;
@@ -119,8 +135,8 @@ fn extended_value_plan() -> &'static Vec<Vec<usize>> {
     PLAN.get_or_init(|| {
         let reserved = reserved_names();
         let mut seen = std::collections::HashSet::new();
-        let mut plan = Vec::with_capacity(FAMILIES.len());
-        for (names, _) in FAMILIES {
+        let mut plan = Vec::with_capacity(families().len());
+        for (names, _) in families() {
             let mut keep = Vec::new();
             for (i, &n) in names.iter().enumerate() {
                 if reserved.contains(n) {
@@ -143,7 +159,7 @@ fn extended_value_plan() -> &'static Vec<Vec<usize>> {
 fn extended_values(e: &Evidence) -> Vec<f64> {
     let plan = extended_value_plan();
     let mut out = Vec::with_capacity(plan.iter().map(|keep| keep.len()).sum());
-    for ((names, f), keep) in FAMILIES.iter().zip(plan) {
+    for ((names, f), keep) in families().iter().zip(plan) {
         let vals = f(e);
         debug_assert_eq!(
             vals.len(),
