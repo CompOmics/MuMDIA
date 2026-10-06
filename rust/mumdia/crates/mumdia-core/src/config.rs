@@ -1509,6 +1509,12 @@ pub struct ExtractConfig {
     /// it only with target-decoy/entrapment FDR validation. MS1 evidence is now
     /// computed before the gate so this can take effect.
     pub ms1_rescue: bool,
+    /// MS1 scans either side of the nearest one read for a precursor isotope: the apex
+    /// isotope intensities and every point of the MS1 grid traces take the maximum over
+    /// the nearest MS1 scan +- this many. 0 (default) reads the nearest scan only. At low
+    /// ion counts a mono peak present in both neighbouring MS1 scans is often missing from
+    /// the one nearest the apex, which then reads as no MS1 signal at all.
+    pub ms1_scan_halfwidth: usize,
     /// Number of chromatographic peak hypotheses to enumerate per candidate.
     /// `K>1` writes up to K local maxima to the diagnostic
     /// `<out-psms>.peaks.parquet` sidecar. The primary PSM still contains only the
@@ -1635,11 +1641,12 @@ impl Default for ExtractConfig {
             matcher: MatcherKind::Fragindex,
             min_coelution_run: 0, // disabled; scan_window floor still applies
             ms1_rescue: false,    // opt-in; relaxes acceptance, validate FDR first
-            retain_top_peaks: 1,  // legacy single-apex behaviour (K=1)
-            promote_top_peaks: 1, // top-K promotion off (only the selected apex is a row)
-            alt_peak_min_area_frac: 0.10, // alternate peak >= 10% of rank-0 area
+            ms1_scan_halfwidth: 0,
+            retain_top_peaks: 1,            // legacy single-apex behaviour (K=1)
+            promote_top_peaks: 1,           // top-K promotion off (only the selected apex is a row)
+            alt_peak_min_area_frac: 0.10,   // alternate peak >= 10% of rank-0 area
             alt_peak_min_separation_s: 5.0, // alternate apex >= 5 s from rank-0 apex
-            emit_candidate_audit: false, // diagnostic; off in production
+            emit_candidate_audit: false,    // diagnostic; off in production
             // On. The legacy signature-intensity apex scores a scan group by the summed
             // OBSERVED intensity of only the top-K PREDICTED fragments, so when none of
             // those K is observed at any qualifying scan the score is 0.0 everywhere, the

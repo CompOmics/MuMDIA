@@ -1352,6 +1352,16 @@ fn demix_features_for(d: &DemixScan, cid: u32) -> DemixFeatures {
 }
 
 /// Sum intensities of peaks within `tol_ppm` of `target` (m/z-sorted arrays).
+/// [`sum_near`] in the MS1 scan nearest `j` and its `half` neighbours either side: the
+/// maximum over those scans (`extract.ms1_scan_halfwidth`; 0 reads scan `j` only).
+fn ms1_near(scans: &[Ms1Scan], j: usize, half: usize, target: f64, tol_ppm: f64) -> f32 {
+    let lo = j.saturating_sub(half);
+    let hi = (j + half).min(scans.len().saturating_sub(1));
+    (lo..=hi)
+        .map(|k| sum_near(&scans[k].mz, &scans[k].intensity, target, tol_ppm))
+        .fold(0.0f32, f32::max)
+}
+
 fn sum_near(mz: &[f32], inten: &[f32], target: f64, tol_ppm: f64) -> f32 {
     if mz.is_empty() {
         return 0.0;
@@ -3783,15 +3793,16 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                 return (None, None, None, None);
             }
             let j = nearest_index(&ms1_rts, rt);
-            let s = &ms1_scans[j];
+            let h = p.cfg.ms1_scan_halfwidth;
             let z = c.charge as f64;
             let sp = ISOTOPE_SPACING / z;
             let tol = p.cfg.prec_tol_ppm;
+            let at = |mz: f64| Some(ms1_near(ms1_scans, j, h, mz, tol) as f64);
             (
-                Some(sum_near(&s.mz, &s.intensity, c.precursor_mz - sp, tol) as f64),
-                Some(sum_near(&s.mz, &s.intensity, c.precursor_mz, tol) as f64),
-                Some(sum_near(&s.mz, &s.intensity, c.precursor_mz + sp, tol) as f64),
-                Some(sum_near(&s.mz, &s.intensity, c.precursor_mz + 2.0 * sp, tol) as f64),
+                at(c.precursor_mz - sp),
+                at(c.precursor_mz),
+                at(c.precursor_mz + sp),
+                at(c.precursor_mz + 2.0 * sp),
             )
         };
         let (o_ms1_m1, o_ms1_mono, o_ms1_i1, o_ms1_i2) = ms1_at(apex_rt);
@@ -4016,7 +4027,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                         // this tree with clippy 1.96.0, silent before and an error after,
                         // though which of the lint's heuristics distinguishes `Vec`
                         // indexing from slice indexing was not established.
-                        sum_near(&ms1_scans[j].mz, &ms1_scans[j].intensity, mz, tol)
+                        ms1_near(ms1_scans, j, p.cfg.ms1_scan_halfwidth, mz, tol)
                     })
                     .collect();
                 chrom_rows.push((cid, nm.to_string(), mz, mz, 0.0, grid_rt.clone(), ints));
@@ -5740,5 +5751,31 @@ mod psms_stream_tests {
             vec![9]
         );
         assert!(leftovers(&path).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ms1_near_tests {
+    use super::ms1_near;
+    use crate::spectra::Ms1Scan;
+
+    #[test]
+    fn a_mono_missing_from_the_nearest_scan_is_read_from_its_neighbours() {
+        let scan = |i: u32, ints: f32| Ms1Scan {
+            scan_index: i,
+            rt_seconds: i as f64,
+            mz: vec![500.0, 600.001],
+            intensity: vec![10.0, ints],
+        };
+        // mono at 600.0 present in scans 0 and 2 (within 5 ppm), absent in scan 1
+        let mut s1 = scan(1, 0.0);
+        s1.mz = vec![500.0];
+        s1.intensity = vec![10.0];
+        let scans = vec![scan(0, 300.0), s1, scan(2, 700.0)];
+        assert_eq!(ms1_near(&scans, 1, 0, 600.0, 5.0), 0.0);
+        assert_eq!(ms1_near(&scans, 1, 1, 600.0, 5.0), 700.0);
+        // the window is clipped at both ends
+        assert_eq!(ms1_near(&scans, 0, 1, 600.0, 5.0), 300.0);
+        assert_eq!(ms1_near(&scans, 2, 5, 600.0, 5.0), 700.0);
     }
 }
