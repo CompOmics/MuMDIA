@@ -1036,6 +1036,11 @@ pub struct SearchSeedConfig {
     /// removes any m/z-correlated curvature the flat offset leaves. Default false
     /// (scalar offset unchanged), opt-in and benchmark-gated.
     pub mass_cal_loess: bool,
+    /// Floor (ppm) on the fragment tolerance learned from the seed's calibrants, which
+    /// `extract` then searches with. Default 5, the value that was hard-coded. The learned
+    /// tolerance is `1.5 x p95(|deviation - median|)`; on an instrument whose fragment mass
+    /// error is well under a ppm (Astral) the floor, not the data, sets it.
+    pub frag_tol_floor_ppm: f64,
 }
 impl Default for SearchSeedConfig {
     fn default() -> Self {
@@ -1048,6 +1053,7 @@ impl Default for SearchSeedConfig {
             matcher: MatcherKind::Fragindex,
             two_pass_mass_cal: false,
             mass_cal_loess: false,
+            frag_tol_floor_ppm: 5.0,
         }
     }
 }
