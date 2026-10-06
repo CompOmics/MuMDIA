@@ -819,6 +819,8 @@ enum EncoderState {
         plain: Vec<String>,
         /// [`WriteOptions::metadata`].
         metadata: Vec<(String, String)>,
+        /// [`WriteOptions::row_groups_in_flight`].
+        in_flight: usize,
     },
     Writing(Box<ColumnEncoder<Sink>>),
     /// Only while a transition is in flight, or after one failed.
@@ -839,6 +841,7 @@ impl Encoder {
         }
         let plain = opts.plain.clone();
         let metadata = opts.metadata.clone();
+        let in_flight = opts.row_groups_in_flight;
         let row_group_rows = opts.row_group_rows;
         let state = match row_group_rows {
             Some(cap) if plan_enabled() && !float_leaves(&schema).is_empty() => {
@@ -850,6 +853,7 @@ impl Encoder {
                     rows: 0,
                     plain,
                     metadata,
+                    in_flight,
                 }
             }
             _ => {
@@ -857,12 +861,10 @@ impl Encoder {
                     writer_props(&schema, row_group_rows, None, &plain),
                     &metadata,
                 );
-                EncoderState::Writing(Box::new(ColumnEncoder::try_new(
-                    sink,
-                    schema,
-                    props,
-                    codec_pool(),
-                )?))
+                EncoderState::Writing(Box::new(
+                    ColumnEncoder::try_new(sink, schema, props, codec_pool())?
+                        .with_row_groups_in_flight(in_flight),
+                ))
             }
         };
         Ok(Encoder { state })
@@ -903,6 +905,7 @@ impl Encoder {
             pending,
             plain,
             metadata,
+            in_flight,
             ..
         } = std::mem::replace(&mut self.state, EncoderState::Poisoned)
         else {
@@ -913,7 +916,8 @@ impl Encoder {
             writer_props(&schema, Some(row_group_rows), Some(&plan), &plain),
             &metadata,
         );
-        let mut w = ColumnEncoder::try_new(*sink, schema, props, codec_pool())?;
+        let mut w = ColumnEncoder::try_new(*sink, schema, props, codec_pool())?
+            .with_row_groups_in_flight(in_flight);
         for b in &pending {
             w.write(b)?;
         }
@@ -937,6 +941,8 @@ impl Encoder {
 pub struct WriteOptions {
     row_group_rows: Option<usize>,
     content_hash: bool,
+    /// [`WriteOptions::row_groups_in_flight`]; 0 and 1 both mean off.
+    row_groups_in_flight: usize,
     plain: Vec<String>,
     metadata: Vec<(String, String)>,
 }
@@ -966,6 +972,15 @@ impl WriteOptions {
     /// Cap the rows per row group (see [`TableWriter::with_row_group_rows`]).
     pub fn row_group_rows(mut self, rows: usize) -> WriteOptions {
         self.row_group_rows = Some(rows.max(1));
+        self
+    }
+
+    /// Encode up to `n` full row groups at once, each on its own thread, and append them in
+    /// order. The file is the same bytes (`codec::ColumnEncoder::with_row_groups_in_flight`).
+    /// Needs [`WriteOptions::row_group_rows`]. For a writer whose row-group encode is the
+    /// bottleneck and whose few columns leave the codec pool idle: extract's chromatograms.
+    pub fn row_groups_in_flight(mut self, n: usize) -> WriteOptions {
+        self.row_groups_in_flight = n;
         self
     }
 
@@ -1416,6 +1431,12 @@ impl TableWriter {
     /// [`TableWriter::close_hashed`] to get the digest.
     pub fn with_content_hash(mut self) -> TableWriter {
         self.opts = self.opts.content_hash();
+        self
+    }
+
+    /// Encode several row groups at once ([`WriteOptions::row_groups_in_flight`]).
+    pub fn with_row_groups_in_flight(mut self, n: usize) -> TableWriter {
+        self.opts = self.opts.row_groups_in_flight(n);
         self
     }
 

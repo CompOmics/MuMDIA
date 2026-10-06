@@ -785,6 +785,9 @@ const CAND_CHUNK: usize = 8192;
 /// boundaries; the writer takes [`crate::chromatograms::row_group_rows`], which is this
 /// unless the test knob moves it.
 const CHROM_ROW_GROUP_ROWS: usize = crate::chromatograms::ROW_GROUP_ROWS;
+/// Chromatogram row groups encoded at once (`TableWriter::with_row_groups_in_flight`), as
+/// retrace's writer does. Each holds its 65,536 rows until encoded: tens of MB per group.
+const CHROM_ROW_GROUPS_IN_FLIGHT: usize = 16;
 
 /// One chunk of chromatogram rows, drained into the column set of the configured layout
 /// (`extract.chromatogram_schema`, [`crate::chromatograms::Layout`]).
@@ -3808,8 +3811,12 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
             crate::chromatograms::ROW_GROUP_ROWS_ENV
         );
     }
-    let chrom_writer =
-        crate::chromatograms::writer(p.out_chrom, chrom_rg_rows, chrom_layout).with_content_hash();
+    // Row groups are encoded CHROM_ROW_GROUPS_IN_FLIGHT at a time on threads of their own:
+    // the one writer thread was the whole of a HYE diaPASEF extract after its first 20 s
+    // (writer busy 251 of 277 s, TIMS_SPEED_ROADMAP section 3.5). Same bytes.
+    let chrom_writer = crate::chromatograms::writer(p.out_chrom, chrom_rg_rows, chrom_layout)
+        .with_content_hash()
+        .with_row_groups_in_flight(CHROM_ROW_GROUPS_IN_FLIGHT);
     let mut chrom_encoder = crate::chromatograms::Encoder::new(chrom_rg_rows);
 
     // Deterministic output order (a HashMap's iteration order is randomized,

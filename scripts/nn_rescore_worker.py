@@ -209,6 +209,9 @@ Env knobs (all optional):
                                      checked (Windows x86-64, torch 2.6, CPU and CUDA; the
                                      tests repeat it on the host that runs them). The
                                      streaming backend always uses the numpy path.
+    MUMDIA_NN_STORE       = f32      f32|f16: the standardised matrix's storage; f16 halves the
+                                     rescore's largest allocation (raw handoff, in-memory
+                                     backend), rows are widened to float32 as they are read
     MUMDIA_NN_PARALLEL    = auto     trains the (seed, fold) tasks in spawned processes, the
                                      default since 2026-09-27. The matrix is shared through
                                      a read-only memmap next to the output (the in-memory
@@ -918,6 +921,43 @@ def fill_raw_matrix(matrix, col_idx, n, chunk, out, group_rows, threads=1, initi
     return s1, s2
 
 
+def fill_raw_matrix_f16(matrix, col_idx, n, chunk, out, group_rows, threads=1, initializer=None):
+    """`fill_raw_matrix` then `standardise_matrix`, for a float16 `out` (MUMDIA_NN_STORE=f16).
+
+    Raw feature values overflow float16, so the matrix is never held raw: a first pass takes
+    the moments exactly as `fill_raw_matrix` does (same groups, same sub-blocks, same order,
+    so mean and std are the float32 path's bit for bit), and a second pass fills each group
+    into a float32 scratch block, standardises and clips it there with the same elementwise
+    operations, and rounds it into `out`. Every stored value is the float32 path's value
+    rounded to float16 (at most 2^-8 relative, 0.004 absolute at the clip of 8). Returns
+    (s1, s2).
+    """
+    nf = out.shape[1]
+    s1 = np.zeros(nf, np.float64)
+    s2 = np.zeros(nf, np.float64)
+    scratch = np.empty((min(group_rows, n), nf), np.float32)
+    for g0 in range(0, n, group_rows):
+        tf = time.time()
+        rows = min(group_rows, n - g0)
+        for a, b in moment_blocks(rows, chunk):
+            p1, p2 = _fill_raw_block(matrix[g0 + a:g0 + b], col_idx, scratch[a:b])
+            s1 += p1
+            s2 += p2
+        _detail("load: fill + moments", time.time() - tf)
+    vars(_TLS).pop("moments", None)
+    mean, std = moments_to_mean_std(s1, s2, n)
+    for g0 in range(0, n, group_rows):
+        tf = time.time()
+        rows = min(group_rows, n - g0)
+        blk = scratch[:rows]
+        _fill_raw_block(matrix[g0:g0 + rows], col_idx, blk)
+        standardise_matrix(blk, mean, std, chunk, threads=threads, initializer=initializer)
+        out[g0:g0 + rows] = blk
+        _detail("load: standardise", time.time() - tf)
+    vars(_TLS).pop("moments", None)
+    return s1, s2
+
+
 def _standardise_rows(X, mean, std, i0, i1):
     view = X[i0:i1]
     np.subtract(view, mean, out=view)
@@ -1223,7 +1263,7 @@ def n_targets_at_many(X, is_target, fdr, topk=0, workers=1, initializer=None):
     tgt = np.asarray(is_target).astype(bool)
 
     def both_signs(j):
-        col = np.ascontiguousarray(X[:, j])
+        col = np.ascontiguousarray(X[:, j], dtype=np.float32)
         return (n_targets_at_col(col, tgt, fdr, topk=topk),
                 n_targets_at_col(-col, tgt, fdr, topk=topk))
 
@@ -1397,6 +1437,11 @@ def _build_trainer(torch, cfg, X, stream, y, fold, feat_cols, keyed_shuffle=Fals
     if stream:
         get = lambda idx: np.ascontiguousarray(X[idx])
         get_col = lambda idx, j: np.asarray(X[idx, j])
+    elif X.dtype == np.float16:
+        # MUMDIA_NN_STORE=f16: rows are widened to float32 as they are read, so the model
+        # and every score see float32 inputs.
+        get = lambda idx: X[idx].astype(np.float32)
+        get_col = lambda idx, j: np.asarray(X[idx, j], dtype=np.float32)
     else:
         get = lambda idx: X[idx]
         get_col = lambda idx, j: np.asarray(X[idx, j])
@@ -1513,11 +1558,13 @@ def _build_trainer(torch, cfg, X, stream, y, fold, feat_cols, keyed_shuffle=Fals
         idx_t = torch.from_numpy(np.ascontiguousarray(idx, dtype=np.int64))
         buf = _score_buf[0]
         if buf is None:
-            buf = _score_buf[0] = torch.from_numpy(np.empty((step, nf), np.float32))
+            buf = _score_buf[0] = torch.from_numpy(np.empty((step, nf), X.dtype))
         for i in range(0, len(idx), step):
             k = min(step, len(idx) - i)
             xb = buf[:k]
             torch.index_select(X_t, 0, idx_t[i:i + k], out=xb)
+            if xb.dtype != torch.float32:
+                xb = xb.to(torch.float32)
             out[i:i + k] = m(xb.to(DEVICE)).cpu().numpy()
         return out
 
@@ -1819,7 +1866,7 @@ def _parallel_child_init(spec):
         torch.set_flush_denormal(True)
     # Read-only and shared: every child maps the same file, so the page cache holds one copy
     # of the matrix however many children read it.
-    X = np.memmap(spec["mm_path"], dtype=np.float32, mode="r",
+    X = np.memmap(spec["mm_path"], dtype=np.dtype(spec.get("dtype", "float32")), mode="r",
                   shape=(int(spec["n"]), int(spec["nf"])))
     y = np.load(spec["y_path"])
     fold = np.load(spec["fold_path"])
@@ -1914,8 +1961,13 @@ def _train_in_processes(cfg, X, mm_path, out_path, stream, y, fold, feat_cols, s
     """MUMDIA_NN_PARALLEL: write the per-row arrays next to the memmap and run the tasks."""
     if not isinstance(X, np.memmap) or not mm_path:
         raise RuntimeError("MUMDIA_NN_PARALLEL needs the matrix in a memmap file")
-    X.flush()
+    # No X.flush(): the children map the same file, and a shared mapping is the page cache,
+    # so they read what this process wrote without it. The flush wrote the whole matrix back
+    # to disk before any child started: 60 GB and 5.5 min of idle CPU per HYE diaPASEF
+    # rescore on an HDD (TIMS_SPEED_ROADMAP L4). The kernel writes it back in the
+    # background instead, while the folds train.
     n_rows, n_cols = int(X.shape[0]), int(X.shape[1])
+    X_dtype = X.dtype
     del X
     base = os.path.abspath(out_path)
     y_path, fold_path = base + ".par.y.npy", base + ".par.fold.npy"
@@ -1948,7 +2000,7 @@ def _train_in_processes(cfg, X, mm_path, out_path, stream, y, fold, feat_cols, s
             flush=True,
         )
     spec = {
-        "cfg": cfg, "mm_path": mm_path, "n": n_rows, "nf": n_cols,
+        "cfg": cfg, "mm_path": mm_path, "n": n_rows, "nf": n_cols, "dtype": str(X_dtype),
         "stream": bool(stream), "y_path": y_path, "fold_path": fold_path,
         "feat_cols": list(feat_cols), "threads": threads, "flush": bool(flush),
     }
@@ -2001,6 +2053,12 @@ def main():
         except ValueError:
             raise ValueError(
                 "MUMDIA_NN_PARALLEL must be auto, 0 or a process count (got %r)" % _par)
+    # MUMDIA_NN_STORE=f16 keeps the standardised matrix as float16 (half the memory), widened
+    # to float32 as rows are read. Raw handoff and in-memory backend only; elsewhere float32.
+    _store = os.environ.get("MUMDIA_NN_STORE", "f32").strip().lower()
+    if _store not in ("f32", "f16"):
+        raise ValueError("MUMDIA_NN_STORE must be f32 or f16 (got %r)" % _store)
+    STORE16 = _store == "f16"
     SELECT = os.environ.get("MUMDIA_NN_SELECT", "window").strip().lower()
     if SELECT not in ("window", "full"):
         raise ValueError("MUMDIA_NN_SELECT must be window or full (got %r)" % SELECT)
@@ -2278,14 +2336,24 @@ def main():
             else:
                 fold = _folds(_tb.column("Peptide").to_pylist())
             del _tb
+            store = np.float16 if (STORE16 and IS_RAW) else np.float32
+            if STORE16:
+                print("nn_rescore_worker: MUMDIA_NN_STORE=f16: matrix stored as %s%s"
+                      % (np.dtype(store).name, "" if IS_RAW else " (needs the raw handoff)"),
+                      flush=True)
             if PARALLEL != 0:
                 # The children map this file read-only instead of each copying the matrix.
                 mm_path = os.path.abspath(out_path + ".feat.mm")
                 _LEFTOVERS.append(mm_path)
-                Xs = np.memmap(mm_path, dtype=np.float32, mode="w+", shape=(n, nf))
+                Xs = np.memmap(mm_path, dtype=store, mode="w+", shape=(n, nf))
             else:
-                Xs = np.empty((n, nf), np.float32)
-            if IS_RAW:
+                Xs = np.empty((n, nf), store)
+            if store == np.float16:
+                s1, s2 = fill_raw_matrix_f16(
+                    RAW["matrix"], raw_idx, n, CHUNK, Xs, int(RAW["row_group_rows"]),
+                    threads=LOAD_THREADS, initializer=_fp_thread_init,
+                )
+            elif IS_RAW:
                 s1, s2 = fill_raw_matrix(
                     RAW["matrix"], raw_idx, n, CHUNK, Xs, int(RAW["row_group_rows"]),
                     threads=LOAD_THREADS, initializer=_fp_thread_init,
@@ -2304,11 +2372,12 @@ def main():
             # The decoded Arrow buffers are garbage now; hand them back before training
             # starts, or they stay in RSS for the whole run.
             _release_allocator_slack()
-            _ts = time.time()
-            mean, std = moments_to_mean_std(s1, s2, n)
-            standardise_matrix(Xs, mean, std, CHUNK, threads=LOAD_THREADS,
-                               initializer=_fp_thread_init)
-            _detail("load: standardise", time.time() - _ts)
+            if store != np.float16:  # the float16 fill standardised as it wrote
+                _ts = time.time()
+                mean, std = moments_to_mean_std(s1, s2, n)
+                standardise_matrix(Xs, mean, std, CHUNK, threads=LOAD_THREADS,
+                                   initializer=_fp_thread_init)
+                _detail("load: standardise", time.time() - _ts)
         else:
             pin = pd.read_csv(pin_path, sep=chr(9))
         if not (IS_PQ or IS_RAW):
@@ -2344,6 +2413,9 @@ def main():
                 del _mm
     else:
         # ---- streaming memmap backend (mean/std, one text pass) ----
+        if STORE16:
+            print("nn_rescore_worker: MUMDIA_NN_STORE=f16 ignored by the streaming backend; "
+                  "float32", flush=True)
         if IS_RAW:
             n = int(RAW["rows"])
         elif IS_PQ:

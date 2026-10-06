@@ -764,7 +764,7 @@ variant no longer exists).
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge before stopping (0 = stop at first miss; 1 bridges a single-scan dip) |
 | `bound_from_confident` | false | true = learn one global left/right half-width from the confident seed set and apply it to every candidate; false (default since 2026-10-04) = per-candidate detection |
 | `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
-| `chrom_loaders` | 3 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
+| `chrom_loaders` | 5 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
 | `im_features` | false | append the ion-mobility block (see "Ion-mobility features"); benchmark-gated |
 | `im_shape_features` | false | append the IM peak-shape block after it (needs `convert.tdf_im_width`); benchmark-gated |
 | `retrace_apex` | false | apex scalars from the raw traces plus `imc_ref_w`, last (needs `retrace.enabled`); benchmark-gated |
@@ -780,7 +780,7 @@ not carry the configured fragment tolerance.
 chromatogram rows or `CHUNK_PSM_ROWS` PSM rows and never cuts a candidate). Each
 chunk passes three stages on their own threads:
 
-1. **Loaders.** `features.chrom_loaders` threads (default 3) each claim the next
+1. **Loaders.** `features.chrom_loaders` threads (default 5) each claim the next
    unclaimed chunk, open that chunk's row span of the chromatogram table
    (`TableFile::span`) and decode it into a `ChromChunk` with a fragment-name
    table of its own (`load_chunk`). A loader may claim chunk `j` only while
@@ -832,6 +832,8 @@ runs carry noise):
 | same | 3 | 8.2-8.5 s | writer | no gain: the encoder binds |
 | HYE-shaped fixture (`write_kernel_bench_fixture`, 400,000 PSMs, 150-240-point traces, 7 chunks) | 1 | 25.0-26.2 s | loader | loader busy 24 s |
 | same | 3 | 13.3-13.6 s | compute / writer | peak working set 1.83 -> 3.23 GiB |
+| HYE diaPASEF run (6.8M PSMs, 102M chromatogram rows, 105 chunks, 64 threads; TIMS_SPEED_ROADMAP L5) | 3 | 1:30, 1:30 | loader | 6.0-6.2 GB |
+| same | 5 | 1:12, 1:00 | loader / compute | 7.0-7.1 GB; the default since 2026-10-06 |
 
 So the loaders pay where traces are long (a 2 h gradient, the immunopeptidomics
 windows). Where the encoder binds they buy nothing and cost memory plus some

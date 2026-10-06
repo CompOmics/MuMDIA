@@ -173,10 +173,16 @@ pub(crate) fn codec_pool() -> Option<Arc<CodecPool>> {
 }
 
 /// One row group being encoded: the column writers of each root field, in schema order.
+/// With row groups in flight ([`ColumnEncoder::with_row_groups_in_flight`]) the writers are
+/// fed only when the group is full, on its own thread, from the (split) batches held here.
 struct RowGroup {
     roots: Vec<Vec<ArrowColumnWriter>>,
     rows: usize,
+    batches: Vec<RecordBatch>,
 }
+
+/// A full row group encoded on its own thread: its column chunks in schema order.
+type InFlight = std::thread::JoinHandle<Result<Vec<ArrowColumnChunk>>>;
 
 /// A parquet writer that encodes a row group's columns concurrently and writes the file the
 /// serial [`ArrowWriter`] writes, byte for byte (module docs).
@@ -193,6 +199,13 @@ pub(crate) struct ColumnEncoder<W: Write + Send> {
     max_rows: Option<usize>,
     in_progress: Option<RowGroup>,
     pool: Option<Arc<CodecPool>>,
+    /// Row groups encoded at once on their own threads; 1 (the default) encodes each batch
+    /// as it arrives, on the codec pool.
+    in_flight: usize,
+    /// The in-flight row groups, oldest first; appended to the file in this order.
+    pending: std::collections::VecDeque<InFlight>,
+    /// Index of the next row group to open (flushed plus in flight).
+    next_index: usize,
 }
 
 impl<W: Write + Send> ColumnEncoder<W> {
@@ -232,7 +245,22 @@ impl<W: Write + Send> ColumnEncoder<W> {
             max_rows,
             in_progress: None,
             pool,
+            in_flight: 1,
+            pending: std::collections::VecDeque::new(),
+            next_index: 0,
         })
+    }
+
+    /// Encode up to `n` full row groups at once, each on its own thread, and append them in
+    /// order. Every column writer still receives exactly the leaf slices, in the order, the
+    /// serial writer would give it, so the file is the same bytes; only when the encoding
+    /// happens changes. For a writer fed from one thread whose row groups are the whole
+    /// cost (extract's chromatograms: a few large list columns, so encoding the columns of
+    /// one group in parallel does not help). Needs a row-group cap; without one the setting
+    /// is ignored. `n` <= 1 keeps the default behaviour.
+    pub(crate) fn with_row_groups_in_flight(mut self, n: usize) -> ColumnEncoder<W> {
+        self.in_flight = if self.max_rows.is_some() { n.max(1) } else { 1 };
+        self
     }
 
     /// Encode `batch`, splitting it at the row-group cap exactly where
@@ -249,14 +277,19 @@ impl<W: Write + Send> ColumnEncoder<W> {
             ));
         }
         if self.in_progress.is_none() {
-            let index = self.file.flushed_row_groups().len();
+            let index = self.next_index;
+            self.next_index += 1;
             let mut flat = self.factory.create_column_writers(index)?.into_iter();
             let roots = self
                 .leaves_per_root
                 .iter()
                 .map(|&n| flat.by_ref().take(n).collect())
                 .collect();
-            self.in_progress = Some(RowGroup { roots, rows: 0 });
+            self.in_progress = Some(RowGroup {
+                roots,
+                rows: 0,
+                batches: Vec::new(),
+            });
         }
         let buffered = self.in_progress.as_ref().map_or(0, |rg| rg.rows);
         if let Some(max) = self.max_rows {
@@ -268,6 +301,14 @@ impl<W: Write + Send> ColumnEncoder<W> {
         }
         let rg = self.in_progress.as_mut().expect("row group opened above");
         rg.rows += batch.num_rows();
+        if self.in_flight > 1 {
+            // Held until the group is full, then encoded on its own thread (`submit`).
+            rg.batches.push(batch.clone());
+            if self.max_rows.is_some_and(|max| rg.rows >= max) {
+                self.submit()?;
+            }
+            return Ok(());
+        }
         let fields = self.schema.fields();
         let columns = batch.columns();
         let encode = |(i, writers): (usize, &mut Vec<ArrowColumnWriter>)| -> Result<()> {
@@ -305,8 +346,73 @@ impl<W: Write + Send> ColumnEncoder<W> {
         Ok(())
     }
 
+    /// Start encoding the in-progress row group on its own thread, and append the oldest
+    /// in-flight groups while more than `in_flight` are running.
+    fn submit(&mut self) -> Result<()> {
+        let Some(rg) = self.in_progress.take() else {
+            return Ok(());
+        };
+        let schema = self.schema.clone();
+        self.pending.push_back(std::thread::spawn(move || {
+            let RowGroup {
+                mut roots, batches, ..
+            } = rg;
+            // Per root, each (split) batch in arrival order: the writes the serial path
+            // makes, one column writer at a time.
+            for (i, writers) in roots.iter_mut().enumerate() {
+                let field = schema.field(i);
+                for batch in &batches {
+                    let leaves = compute_leaves(field, batch.column(i))?;
+                    if leaves.len() != writers.len() {
+                        return Err(anyhow!(
+                            "column '{}' has {} parquet leaves, the writer {}",
+                            field.name(),
+                            leaves.len(),
+                            writers.len()
+                        ));
+                    }
+                    for (w, leaf) in writers.iter_mut().zip(&leaves) {
+                        w.write(leaf)?;
+                    }
+                }
+            }
+            roots
+                .into_iter()
+                .flatten()
+                .map(|w| w.close().map_err(anyhow::Error::from))
+                .collect()
+        }));
+        while self.pending.len() > self.in_flight {
+            self.append_oldest()?;
+        }
+        Ok(())
+    }
+
+    /// Wait for the oldest in-flight row group and append it.
+    fn append_oldest(&mut self) -> Result<()> {
+        let Some(h) = self.pending.pop_front() else {
+            return Ok(());
+        };
+        let chunks = h
+            .join()
+            .map_err(|_| anyhow!("parquet row-group encoder thread panicked"))??;
+        let mut out = self.file.next_row_group()?;
+        for chunk in chunks {
+            chunk.append_to_row_group(&mut out)?;
+        }
+        out.close()?;
+        Ok(())
+    }
+
     /// Close the in-progress row group and append its column chunks in schema order.
     fn flush(&mut self) -> Result<()> {
+        if self.in_flight > 1 {
+            self.submit()?;
+            while !self.pending.is_empty() {
+                self.append_oldest()?;
+            }
+            return Ok(());
+        }
         let Some(rg) = self.in_progress.take() else {
             return Ok(());
         };
@@ -441,8 +547,19 @@ mod tests {
         props: WriterProperties,
         pool: Option<Arc<CodecPool>>,
     ) -> Vec<u8> {
+        in_flight(batches, props, pool, 1)
+    }
+
+    fn in_flight(
+        batches: &[RecordBatch],
+        props: WriterProperties,
+        pool: Option<Arc<CodecPool>>,
+        n: usize,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut w = ColumnEncoder::try_new(&mut out, batches[0].schema(), props, pool).unwrap();
+        let mut w = ColumnEncoder::try_new(&mut out, batches[0].schema(), props, pool)
+            .unwrap()
+            .with_row_groups_in_flight(n);
         for b in batches {
             w.write(b).unwrap();
         }
@@ -493,6 +610,17 @@ mod tests {
                     "sizes {sizes:?} cap {cap:?} planned {planned} threads {:?}: {} bytes \
                      against the serial writer's {}",
                     pool.as_ref().map(|p| p.threads()),
+                    got.len(),
+                    want.len()
+                );
+            }
+            // Row groups encoded on threads of their own write the same bytes.
+            for n in [2, 16] {
+                let got = in_flight(&batches, props(cap, planned), None, n);
+                assert!(
+                    got == want,
+                    "sizes {sizes:?} cap {cap:?} planned {planned} in flight {n}: {} bytes \
+                     against the serial writer's {}",
                     got.len(),
                     want.len()
                 );

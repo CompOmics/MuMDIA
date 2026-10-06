@@ -150,6 +150,19 @@ impl RunConcurrency {
         }
     }
 
+    /// Spread `items` chains over rounds of equal size: at most this plan's slots at once,
+    /// but no more rounds than those slots need. Six chains on four slots run as two rounds
+    /// of three (pools of `threads / 3`) instead of four and then two, which left the last
+    /// chains on a quarter of the threads with the rest idle (TIMS_SPEED_ROADMAP L10). An
+    /// explicit plan is never changed.
+    pub fn even_rounds(self, items: usize, threads: usize) -> Self {
+        if !self.is_auto() || items == 0 || self.par <= 1 {
+            return self;
+        }
+        let rounds = items.div_ceil(self.par);
+        self.bounded(items.div_ceil(rounds), threads)
+    }
+
     /// Run `f` for every item under this plan and return the results in item order, or
     /// the first failure in item order.
     ///
@@ -445,6 +458,32 @@ pub fn chains_that_fit(peak: u64, resident: u64, available: u64) -> usize {
     ((room / peak as f64).floor() as usize).max(1)
 }
 
+/// `experiment.memory_budget_gb` in bytes; 0 means none.
+static MEMORY_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the memory the automatic plans may size their chains for (`experiment.memory_budget_gb`,
+/// in GB; 0 or less means no budget). Call it before the first measured step.
+pub fn set_memory_budget(gb: f64) {
+    let bytes = if gb > 0.0 { (gb * 1e9) as u64 } else { 0 };
+    MEMORY_BUDGET.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The budget set by [`set_memory_budget`], if any.
+pub fn memory_budget() -> Option<u64> {
+    match MEMORY_BUDGET.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        b => Some(b),
+    }
+}
+
+/// How many chains of `peak` bytes fit in `budget` bytes: never below one.
+pub fn chains_in_budget(peak: u64, budget: u64) -> usize {
+    if peak == 0 {
+        return usize::MAX;
+    }
+    ((budget / peak) as usize).max(1)
+}
+
 /// The start of a step whose peak memory sizes what runs after it.
 ///
 /// On Linux, opening a window resets the process's resident high-water mark to what it
@@ -491,7 +530,9 @@ pub fn bound_by_measured_peak(
     }
     match memory_reading() {
         Some(m) => {
-            let fit = chains_that_fit(m.peak, m.resident, m.available);
+            let budget = memory_budget();
+            let fit = chains_that_fit(m.peak, m.resident, m.available)
+                .min(budget.map_or(usize::MAX, |b| chains_in_budget(m.peak, b)));
             let bounded = plan.bounded(fit, threads);
             let note = if window.reset {
                 ""
@@ -504,6 +545,7 @@ pub fn bound_by_measured_peak(
                 resident_bytes = m.resident,
                 available_bytes = m.available,
                 cgroup_limited = m.cgroup_limited,
+                memory_budget_bytes = budget.unwrap_or(0),
                 peak_reset = window.reset,
                 chains_that_fit = fit,
                 parallel_runs = bounded.par,
@@ -600,6 +642,31 @@ pub fn one_at_a_time_for_sidecars(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn even_rounds_spread_the_chains_over_as_few_equal_rounds() {
+        let auto = RunConcurrency::resolve(0, 6, 64); // 4 slots of 16 threads
+        assert_eq!(auto.par, 4);
+        // 5 chains: two rounds either way, so three slots of 21 threads, not 4 + 1.
+        let e = auto.even_rounds(5, 64);
+        assert_eq!((e.par, e.pool_threads), (3, Some(21)));
+        // 4 chains fill one round; 8 fill two.
+        assert_eq!(auto.even_rounds(4, 64), auto);
+        assert_eq!(auto.even_rounds(8, 64), auto);
+        // An explicit plan and a single slot are left alone.
+        let explicit = RunConcurrency::resolve(4, 6, 64);
+        assert_eq!(explicit.even_rounds(5, 64), explicit);
+        assert_eq!(auto.bounded(1, 64).even_rounds(5, 64).par, 1);
+    }
+
+    #[test]
+    fn a_budget_admits_whole_chains_and_never_fewer_than_one() {
+        let gb = 1_000_000_000u64;
+        assert_eq!(chains_in_budget(35 * gb, 64 * gb), 1);
+        assert_eq!(chains_in_budget(20 * gb, 64 * gb), 3);
+        assert_eq!(chains_in_budget(80 * gb, 64 * gb), 1);
+        assert_eq!(chains_in_budget(0, 64 * gb), usize::MAX);
+    }
 
     #[test]
     fn bounded_map_keeps_item_order_and_the_concurrency_bound() {

@@ -1728,6 +1728,62 @@ Reading:
 - The +2,100 to +2,300 ions are about 2% over the union. That is above the SP8 R5 floor of about 1,000 ions, and it
   comes with an accuracy gain.
 
+**Entrapment, arm D (2026-10-04).** Setup: the single-run E. coli diaPASEF entrapment of TIMS_ROADMAP_bis section 8
+(`LFQ_Ultra2_diaPASEF_15min_50ng_Ecoli_01.d` against E. coli + 1:1 human, `entrapment_ratio` 0.563430, peptide level).
+- Pass 1 is the existing `retrace.repick` full run (`/public/local/Robbe/MuMDIA/MuMDIA_repick/full/entrap`, binary
+  `~/bin/mumdia-repick2/mumdia`).
+- The second pass is arm D, built on pass-1 seed 0 and run with binary `~/bin/mumdia-rx/mumdia`, then rescored with
+  seeds 0-2.
+  - Driver `quant_diag/sp_entrap.sh`; test 3 in `quant_diag/sp_entrap_t3.py`.
+  - Outputs in `/public/local/Robbe/MuMDIA/MuMDIA_sp_entrap/`.
+  - Library: 19,847 targets at `precursor_q` <= 0.05, of which 656 are entrapment. New decoys: 19,835 reversed, 12
+    scrambled.
+  - One run has no held-out residual, so the RT half-width is fixed at 8.8 s. That is the HYE p99, at the same
+    0.968 s cycle. The 1/K0 half-width is 0.04.
+- The whole second pass takes under 2 minutes on this run.
+
+| | pass 1, seeds 0 / 1 / 2 | pass 2 (D), rescore seeds 0 / 1 / 2 |
+|---|---|---|
+| real peptides at 1% | 13,906 / 13,948 / 14,071 | 13,852 / 13,850 / 13,831 |
+| spike-in peptides | 115 / 89 / 106 | 118 / 118 / 119 |
+| empirical FDP | 0.473% / 0.367% / 0.432% | 0.487% / 0.487% / 0.492% |
+| PSM decoy fraction | 0.99% | 1.11% |
+
+The pass-2 decoy fraction is above 1% because the report filter sets the unreported targets to q 1.0 after q is
+computed, while every decoy stays counted.
+
+SP3 test 3 (pass-2 scores of the library's entrapment precursors, all false):
+
+| library targets | in library | accepted at q <= 0.01 | AUC against decoys | beats its own decoy |
+|---|---|---|---|---|
+| entrapment, all | 656 | 534-536 | 0.977-0.978 | 98.2-98.5% |
+| entrapment, reportable (pass-1 `precursor_q` <= 0.01) | 125 | 113-114 | 0.985-0.986 | 98.2-99.1% |
+| real, reportable | 17,267 | 17,128-17,137 | 0.999 | 99.9% |
+
+Reading:
+- **Pass-2 target-decoy competition cannot reject a false library entry.** Pass 1 matched the false precursor to a
+  real signal of another peptide, and the library takes its RT and 1/K0 from that match. Pass 2 finds the same signal
+  again, while the decoy, with other fragment m/z, does not.
+- This is a property of the two-pass design, not of this implementation. DIA-NN's MBR has the same structure. That
+  is why DIA-NN reports `Lib.Q.Value` (the first-pass global q) and why its ProteoBench rows all pass
+  `Lib.Q.Value` <= 0.01 as well as `Q.Value` <= 0.01.
+- **The FDR of a second-pass report is set by the library q filter, not by the pass-2 q.** D reports only
+  precursors with pass-1 `precursor_q` <= 0.01. The FDP stays near pass 1's because about 113 of the 125 reportable
+  false entries come through again.
+  - Against its own source library (pass-1 seed 0): 0.473% to 0.487%, below 1% but not at or below the pass-1
+    range.
+  - Real peptides: -0.4% against pass-1 seed 0. One run gains nothing from a second pass.
+- **The SP-A arms at 0.02 and 0.05 above report every library precursor.** Their FDR is near their library cut, so
+  their extra ions are not FDR-valid. B, C and D apply the library q filter.
+- **Open, and tabled on 2026-10-04:**
+  - A false precursor that enters the library can come back in every run where the same interfering signal elutes.
+    A single run cannot measure this (SP8 R1, decision a).
+  - What would measure it: the multi-run entrapment (six HYE runs against a library with a foreign proteome),
+    through D and through DIA-NN `--reanalyse`.
+  - A DIA-NN `--reanalyse` run on this single entrapment file would give DIA-NN's own MBR FDP for comparison. The
+    existing DIA-NN entrapment run (`MuMDIA_diann_entrap`) is without MBR, at an FDP of 0.41%.
+  - Test 4 (decoy fraction 1.84-1.89% in non-anchor runs) is also unresolved.
+
 ## 5. Plan
 
 Ordered by expected gain per unit of work. Each phase states its target and its gate. Quant

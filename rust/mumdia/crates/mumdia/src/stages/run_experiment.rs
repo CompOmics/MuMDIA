@@ -494,6 +494,214 @@ fn finish_run(
     Ok((competed, chrom, pass1))
 }
 
+/// `mbr.strategy = second_pass` (docs/TIMS_QUANT_ROADMAP.md 4m, 4n, arm D): the pooled pass-1
+/// identifications become an empirical library (`mbr_second_pass.py build`), every run is
+/// searched again with it (extract, retrace with repick, features, compete on the narrow
+/// windows, and a second extract and retrace on the pass-1 widths for the quant traces), the
+/// second-pass tables are rescored together, and `mbr_second_pass.py report` applies the
+/// library q filter. Returns the reported scored table and each run's quant traces.
+#[allow(clippy::too_many_arguments)]
+fn second_pass(
+    cfg: &Config,
+    ch: &str,
+    scored1: &str,
+    chroms: &[Vec<ChromTable>],
+    names: &[String],
+    lib_f: &str,
+    threads_budget: usize,
+    d: &(dyn Fn(&str) -> String + Sync),
+) -> Result<(String, Vec<Vec<ChromTable>>)> {
+    if chroms.iter().any(|t| t.len() != 1 || !t[0].drop.is_empty()) {
+        anyhow::bail!("mbr.strategy = second_pass reads one chromatogram table per run");
+    }
+    let python = cfg.mbr.python.as_deref().expect("preflight");
+    let script =
+        crate::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "mbr_second_pass.py");
+    let sp = d("second_pass");
+    std::fs::create_dir_all(&sp).ok();
+    // Each run's pass-1 inputs, as its retrace recorded them.
+    let params: Vec<serde_json::Value> = chroms
+        .iter()
+        .map(|t| {
+            let rep = format!("{}.report.json", t[0].path);
+            let v: serde_json::Value = mumdia_io::json::read_json(&rep)?;
+            if v["stage"] != "retrace" || !v["params"]["run_windows"].is_string() {
+                anyhow::bail!(
+                    "mbr.strategy = second_pass: {rep} is not a retrace report with its inputs"
+                );
+            }
+            Ok(v["params"].clone())
+        })
+        .collect::<Result<_>>()?;
+    let p = |i: usize, k: &str| params[i][k].as_str().unwrap_or_default().to_string();
+    let seed = |i: usize| {
+        p(i, "mass_cal")
+            .trim_end_matches(".masscal.json")
+            .to_string()
+    };
+    let lib = format!("{sp}/lib");
+    let spc = &cfg.mbr.second_pass;
+    let build = serde_json::json!({
+        "scored": scored1,
+        "lib_precursors": p(0, "library_precursors"),
+        "lib_fragments": lib_f,
+        "runs": (0..names.len()).map(|i| serde_json::json!({
+            "repick": p(i, "psms_out"), "seed": seed(i), "windows": p(i, "run_windows"),
+        })).collect::<Vec<_>>(),
+        "out": lib,
+        "lib_q": spc.lib_q,
+        "min_rt_hw": spc.min_rt_halfwidth_s,
+        "min_im_hw": spc.min_im_halfwidth,
+        "intensity": "predicted",
+        "decoys": "reverse_nc",
+    });
+    let build_spec = format!("{sp}/build.json");
+    mumdia_io::json::write_json(&build_spec, &build)?;
+    crate::sidecar::run_second_pass(python, &script, "build", &build_spec)?;
+
+    // The quant traces: retrace's own window and the ID chain's re-picked apex and 1/K0.
+    let mut qret = cfg.retrace.clone();
+    qret.repick = false;
+    let mut q_ex = cfg.extract.clone();
+    q_ex.chromatogram_schema = 1; // retrace reads the v1 layout
+    let chain = |&i: &usize| -> Result<(String, String)> {
+        let dir = format!("{sp}/r{i}");
+        let spectra = d(&format!("{}/spectra", names[i]));
+        let (ms2, ms1) = (
+            format!("{spectra}/spectra_ms2.parquet"),
+            format!("{spectra}/spectra_ms1.parquet"),
+        );
+        let (seed2, lib_p) = (
+            format!("{lib}/r{i}/seed_psms.parquet"),
+            format!("{lib}/lib_precursors.parquet"),
+        );
+        let lib_f2 = format!("{lib}/lib_fragments.parquet");
+        info!(run = %names[i], "run-experiment: second-pass chain");
+        let c = crate::stages::run::extract_to_compete(
+            cfg,
+            ch,
+            &ms2,
+            &ms1,
+            &seed2,
+            &lib_p,
+            &lib_f2,
+            &format!("{lib}/r{i}/run_windows.parquet"),
+            None,
+            None,
+            &dir,
+            None,
+        )?;
+        let qdir = format!("{dir}/quant");
+        std::fs::create_dir_all(&qdir).ok();
+        let (qpsms, qcent) = (
+            format!("{qdir}/psms_extracted.parquet"),
+            format!("{qdir}/chromatograms.centroid.parquet"),
+        );
+        let qwin = format!("{lib}/r{i}/run_windows_quant.parquet");
+        let mass_cal = format!("{seed2}.masscal.json");
+        extract::run_hashed(extract::ExtractParams {
+            precursor_span: None,
+            fragment_offset: None,
+            sibling_bands: 1,
+            rt_windows: None,
+            scans: None,
+            ms2: &ms2,
+            library_precursors: &lib_p,
+            library_fragments: &lib_f2,
+            run_windows: &qwin,
+            ms1: Some(&ms1),
+            mass_cal: Some(&mass_cal),
+            out_psms: &qpsms,
+            out_chrom: &qcent,
+            restrict_candidates: None,
+            cfg: &q_ex,
+            config_hash: ch,
+        })?;
+        let chrom_q = format!("{dir}/chromatograms_q.parquet");
+        retrace::run(retrace::RetraceParams {
+            raw: &p(i, "raw"),
+            chromatograms: &qcent,
+            psms_extracted: &c.psms,
+            run_windows: &qwin,
+            library_precursors: &lib_p,
+            mass_cal: Some(&mass_cal),
+            frag_tol_fallback_ppm: cfg.extract.frag_tol_ppm,
+            prec_tol_ppm: cfg.extract.prec_tol_ppm,
+            out: &chrom_q,
+            apex_out: None,
+            psms_out: None,
+            cfg: &qret,
+            config_hash: ch,
+        })?;
+        drop_intermediate(&[&qcent, &qpsms, &format!("{qpsms}.peaks.parquet")]);
+        Ok((c.competed, chrom_q))
+    };
+    let idx: Vec<usize> = (0..names.len()).collect();
+    let plan =
+        crate::sched::resolve_for_host(cfg.experiment.parallel_runs, idx.len(), threads_budget);
+    let done = crate::sched::run_first_alone(
+        plan,
+        threads_budget,
+        "run-experiment",
+        "the first second-pass chain",
+        &idx,
+        |i| chain(i),
+        |plan, items| {
+            plan.even_rounds(items.len(), threads_budget)
+                .map_pooled(items, chain)
+        },
+    )?;
+    let (competed, chroms_q): (Vec<String>, Vec<String>) = done.into_iter().unzip();
+
+    let scored2 = format!("{sp}/scored_combined.parquet");
+    rescore::run(rescore::RescoreParams {
+        competed: &competed,
+        sources: None,
+        out: &scored2,
+        work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
+        script_dir: &cfg.predict_frag.sidecar_script_dir,
+        cfg: &cfg.rescore,
+        config_hash: ch,
+    })?;
+    let reported = format!("{sp}/scored.parquet");
+    let report_spec = format!("{sp}/report.json");
+    mumdia_io::json::write_json(
+        &report_spec,
+        &serde_json::json!({
+            "scored2": scored2, "scored1": scored1, "id_map": format!("{lib}/id_map.parquet"),
+            "report_q": spc.report_q, "out": reported,
+        }),
+    )?;
+    crate::sidecar::run_second_pass(python, &script, "report", &report_spec)?;
+    Ok((
+        reported,
+        chroms_q
+            .iter()
+            .map(|c| vec![ChromTable::whole(c)])
+            .collect(),
+    ))
+}
+
+/// Remove intermediate tables that no later stage reads, unless `MUMDIA_KEEP_INTERMEDIATE=1`.
+/// Their `.report.json` stays, so the provenance of what was written remains.
+fn drop_intermediate(paths: &[&str]) {
+    if std::env::var("MUMDIA_KEEP_INTERMEDIATE").is_ok_and(|v| v.trim() == "1") {
+        return;
+    }
+    for p in paths {
+        if let Ok(m) = std::fs::metadata(p) {
+            match std::fs::remove_file(p) {
+                Ok(()) => {
+                    info!(path = %p, bytes = m.len(), "run-experiment: removed an intermediate table no later stage reads (MUMDIA_KEEP_INTERMEDIATE=1 keeps it)")
+                }
+                Err(e) => {
+                    warn!(path = %p, error = %e, "run-experiment: could not remove an intermediate table")
+                }
+            }
+        }
+    }
+}
+
 /// What pass 2 of `rt_im_train.refit` needs from a run's pass 1.
 struct Pass1 {
     /// The run's converted spectra.
@@ -1203,6 +1411,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // share, and a chain starts when a slot frees rather than at a chunk boundary. The
     // explicit count keeps the chunk loops below exactly as they were.
     let threads_budget = rayon::current_num_threads();
+    crate::sched::set_memory_budget(cfg.experiment.memory_budget_gb);
     // `resolve_for_host`: an automatic plan with no memory reading to bound it (any
     // platform but Linux) runs one chain at a time.
     let mut plan =
@@ -1696,6 +1905,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             );
             queue = &rest[1..];
         }
+        plan = plan.even_rounds(queue.len(), threads_budget);
         info!(
             parallel_runs = plan.par,
             pool_threads = plan.pool_threads.unwrap_or(0),
@@ -1797,17 +2007,36 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         let mh_heads = cfg
             .rt_im_train
             .multihead_heads(has_deeplc_for_scope, deeplc_rt_source_for_scope);
-        let mut shared: Option<String> = None;
         competed.clear();
         chroms.clear();
-        for (i, p1) in pass1s.into_iter().enumerate() {
-            let p1 = p1.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "run-experiment: run {} has no pass 1 to refit; rt_im_train.refit is not \
-                     implemented for grouped runs (groups.window_groups > 1)",
-                    names[i]
-                )
-            })?;
+        let pass1s: Vec<Pass1> = pass1s
+            .into_iter()
+            .enumerate()
+            .map(|(i, p1)| {
+                p1.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "run-experiment: run {} has no pass 1 to refit; rt_im_train.refit is \
+                         not implemented for grouped runs (groups.window_groups > 1)",
+                        names[i]
+                    )
+                })
+            })
+            .collect::<Result<_>>()?;
+        // Pass 1's traces are read by its own features only (TIMS_SPEED_ROADMAP L11, ~30 GB a
+        // diaPASEF run): pass 2 extracts and retraces again, and quant reads pass 2's.
+        for p1 in &pass1s {
+            drop_intermediate(&[
+                &format!("{}/pass1/chromatograms.parquet", p1.out),
+                &format!("{}/pass1/chromatograms.parquet.apex.parquet", p1.out),
+                &format!("{}/pass1/chromatograms.centroid.parquet", p1.out),
+            ]);
+        }
+        // One run's refit and pass-2 chain. The first run's refit produces the library the
+        // others reuse under `share_ft`, so it runs alone; the rest are independent.
+        let refit_one = |i: usize,
+                         shared: Option<&str>|
+         -> Result<(Option<String>, crate::stages::run::Chain)> {
+            let p1 = &pass1s[i];
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: refit and pass 2");
             let r = im_rt_refit::run(im_rt_refit::RefitParams {
                 cfg,
@@ -1820,17 +2049,70 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 windows_pass1: &p1.windows,
                 out_dir: &p1.out,
                 mh_heads,
-                shared_lib: if share_ft { shared.as_deref() } else { None },
+                shared_lib: if share_ft { shared } else { None },
             })?;
-            if share_ft && shared.is_none() {
-                shared = r.produced_lib.clone();
-            }
             // The pass-2 windows are a new table, so extract reads them from the file, and
             // decodes the spectra itself.
             let c = crate::stages::run::extract_to_compete(
                 cfg, &ch, &p1.ms2, &p1.ms1, &p1.seed, &r.lib, &lib_f, &r.windows, None, None,
                 &p1.out, None,
             )?;
+            // Extract's traces are retrace's input; only the MBR re-extraction reads them later.
+            if !cfg.mbr.reextract {
+                drop_intermediate(&[&format!("{}/chromatograms.centroid.parquet", p1.out)]);
+            }
+            Ok((r.produced_lib, c))
+        };
+        let mut pass2: Vec<crate::stages::run::Chain> = Vec::with_capacity(n_runs);
+        // Measured alone, from a reset high-water mark, so its peak sizes the rest.
+        let window = crate::sched::PeakWindow::open();
+        let (produced, c0) = refit_one(0, None)?;
+        pass2.push(c0);
+        let shared = if share_ft { produced } else { None };
+        let rest: Vec<usize> = (1..n_runs).collect();
+        if !rest.is_empty() {
+            let mut plan2 = crate::sched::resolve_for_host(
+                cfg.experiment.parallel_runs,
+                rest.len(),
+                threads_budget,
+            );
+            // A refit without a library to reuse runs its own DeepLC calibration in a child
+            // process, which no memory reading of this process counts (`one_at_a_time_for_sidecars`).
+            plan2 = if shared.is_none() && mh_heads > 0 {
+                crate::sched::one_at_a_time_for_sidecars(plan2, threads_budget, "run-experiment")
+            } else {
+                crate::sched::bound_by_measured_peak(
+                    plan2,
+                    threads_budget,
+                    "run-experiment",
+                    "the first run's refit and pass-2 chain",
+                    window,
+                )
+            };
+            plan2 = plan2.even_rounds(rest.len(), threads_budget);
+            info!(
+                parallel_runs = plan2.par,
+                pool_threads = plan2.pool_threads.unwrap_or(0),
+                n = n_runs,
+                "run-experiment: refit and pass-2 chains of the remaining runs"
+            );
+            let done = if plan2.is_auto() {
+                plan2.map_pooled(&rest, |&i| refit_one(i, shared.as_deref()).map(|(_, c)| c))?
+            } else {
+                // An explicit count: chunks of that size on the engine's pool, as pass 1.
+                let mut out = Vec::with_capacity(rest.len());
+                for chunk in rest.chunks(plan2.par.max(1)) {
+                    let part: Vec<crate::stages::run::Chain> = chunk
+                        .par_iter()
+                        .map(|&i| refit_one(i, shared.as_deref()).map(|(_, c)| c))
+                        .collect::<Result<_>>()?;
+                    out.extend(part);
+                }
+                out
+            };
+            pass2.extend(done);
+        }
+        for c in pass2 {
             competed.push(vec![c.competed]);
             chroms.push(vec![ChromTable::whole(&c.chrom)]);
         }
@@ -1873,9 +2155,31 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .clone()
         .unwrap_or_else(|| actual_rescorer.clone());
 
+    // --- mbr.strategy = second_pass: the reported result is a second search (no transfer tiers) ---
+    let second = if cfg.mbr.strategy == mumdia_core::config::MbrStrategy::SecondPass {
+        let (scored2, chroms2) = second_pass(
+            cfg,
+            &ch,
+            &scored_combined,
+            &chroms,
+            &names,
+            &lib_f,
+            threads_budget,
+            &d,
+        )?;
+        chroms = chroms2;
+        Some(scored2)
+    } else {
+        None
+    };
+
     // --- optional rescuable-tier MBR transfer (off under mbr.reextract with mbr.rescuable false) ---
-    let mut scored_for_quant = if cfg.mbr.strategy != mumdia_core::config::MbrStrategy::None
-        && cfg.mbr.rescuable
+    let mut scored_for_quant = if let Some(s) = second {
+        s
+    } else if !matches!(
+        cfg.mbr.strategy,
+        mumdia_core::config::MbrStrategy::None | mumdia_core::config::MbrStrategy::SecondPass
+    ) && cfg.mbr.rescuable
     {
         let python = cfg.mbr.python.as_deref().expect("preflight");
         let script =
@@ -1974,9 +2278,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // the quantities with them. ponytail: two full passes; cache the areas if quant time matters.
     let cross_run_on =
         qcfg.cross_run_weights || qcfg.cross_run_background || qcfg.cross_run_width > 0.0;
+    // The runs' quant calls are independent and small (0.3-0.5 GB each), so every run's
+    // runs at once (TIMS_SPEED_ROADMAP L8: 6 serial calls were 5.5 min at 2-3 cores).
+    let run_idx: Vec<usize> = (0..n_runs).collect();
     let pass1 = |chroms: &[Vec<ChromTable>]| -> Result<Vec<String>> {
-        let mut frag_tables = Vec::with_capacity(n_runs);
-        for i in 0..n_runs {
+        crate::sched::map_bounded(&run_idx, n_runs, |&i| {
             let ft = d(&format!("{}/fragment_quant.parquet", names[i]));
             let tmp = |n: &str| d(&format!("{}/{n}.pass1.parquet", names[i]));
             quant::run(quant::QuantParams {
@@ -1994,9 +2300,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 let _ = std::fs::remove_file(tmp(n));
                 let _ = std::fs::remove_file(format!("{}.report.json", tmp(n)));
             }
-            frag_tables.push(ft);
-        }
-        Ok(frag_tables)
+            Ok(ft)
+        })
     };
     let mut frag_tables: Vec<String> = if cross_run_on {
         pass1(&chroms)?
@@ -2069,7 +2374,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // Each run's quant hashes its two tables for their reports; the manifest below reuses
     // those hashes instead of reading the tables again.
     let mut quant_written: Vec<quant::QuantWritten> = Vec::with_capacity(n_runs);
-    for i in 0..n_runs {
+    let finals = crate::sched::map_bounded(&run_idx, n_runs, |&i| {
         let pq = d(&format!("{}/peptide_quant.parquet", names[i]));
         let gq = d(&format!("{}/protein_group_quant.parquet", names[i]));
         let written = quant::run_hashed(quant::QuantParams {
@@ -2083,6 +2388,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             config_hash: &ch,
             cross_run: cross_run.as_ref(),
         })?;
+        Ok((pq, gq, written))
+    })?;
+    for (pq, gq, written) in finals {
         peptide_quants.push(pq);
         protein_quants.push(gq);
         quant_written.push(written);

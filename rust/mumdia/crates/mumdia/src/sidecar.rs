@@ -852,6 +852,14 @@ pub fn run_mbr_reextract(
         .with_context(|| format!("MBR re-extraction worker ({mode}) failed"))
 }
 
+/// `mbr_second_pass.py <mode> <spec.json>` (`mbr.strategy = second_pass`): `build` writes the
+/// empirical library, `report` the reported second-pass table.
+pub fn run_second_pass(python: &str, script: &str, mode: &str, spec: &str) -> Result<()> {
+    info!(mode, spec, "sidecar: second pass");
+    run_worker(python, script, &[mode, spec], false)
+        .with_context(|| format!("second-pass worker ({mode}) failed"))
+}
+
 /// Invoke a Python worker: `python script arg...`. `utf8` forces UTF-8 I/O
 /// (DeepLC/Keras crash on the Windows cp1252 console otherwise).
 fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<()> {

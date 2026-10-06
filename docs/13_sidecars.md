@@ -901,6 +901,11 @@ cores); `MUMDIA_MOKAPOT_WORKERS` (3, thread-based CV-fold parallelism).
 repeated on 4x the rows up to the whole fold), `MUMDIA_NN_INIT_FDR_MAX` (0.05; ceiling
 of the first-iteration bootstrap ladder 0.02/0.05/0.1 used only when the init feature
 selects no positive at the training FDR over the whole fold, 0 = hard error as before),
+`MUMDIA_NN_STORE` (`f32`; `f16` keeps the standardised matrix as float16 with the float32
+path's means and standard deviations, and widens rows to float32 as they are read: half the
+rescore's largest allocation, raw handoff and in-memory backend only, opt-in. Gated on two HYE
+ID sets with seeds and the E. coli entrapment; a 64 GB node needs it for a six-run diaPASEF
+pool, TIMS_SPEED_ROADMAP 7.4),
 `MUMDIA_NN_PARALLEL` (`auto`, the default since 2026-09-27; keyed fold training in child
 processes, see "Invariants" below) and
 `MUMDIA_NN_PARALLEL_THREADS`, the two caps on the init-scan threads

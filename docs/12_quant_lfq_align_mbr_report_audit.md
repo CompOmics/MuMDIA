@@ -569,6 +569,37 @@ sections 4j to 4l; benchmark-gated.
   and every other candidate from its own traces (two `ChromTable`s with `drop` lists); pass 1
   runs again so the cross-run fit sees the transfers.
 
+### mbr.strategy = second_pass (run-experiment, diaPASEF)
+
+`mbr.strategy: second_pass` (needs `retrace.enabled`; refuses `mbr.reextract`) replaces the
+transfer tiers with a second search, as DIA-NN's MBR does (docs/TIMS_QUANT_ROADMAP.md 4m, 4n;
+the engine form of arm D, `run_experiment::second_pass`). The second pass is the reported
+result. Benchmark-gated.
+
+- Library (`mbr_second_pass.py build`, from the pooled pass-1 `scored_combined`): every target with
+  experiment-wide `precursor_q <= mbr.second_pass.lib_q` (0.05). Fragment intensities are the
+  library's predictions. RT and 1/K0 come from the pass-1 data: expected RT through `mbr_worker.py`'s
+  binned-median maps onto run 0 (median over the support runs, which are the runs with
+  `run_psm_q <= 0.01`), expected 1/K0 = median of the support runs' re-picked `apex_im` moved by
+  per-run median offsets.
+- Windows per run: RT half-width = p99 of the held-out cross-run residual (floor
+  `min_rt_halfwidth_s`, 0), 1/K0 half-width = its p99 floored at `min_im_halfwidth` (0.04), and a
+  second window set with the same centres and pass 1's median half-widths for the quant traces.
+- Decoys: one new decoy per target, interior reversed with both termini kept, re-scrambled if it
+  equals (I = L) any search-library target or another new decoy. It takes the target's ion names,
+  intensities and windows, and its ids and seed row from the target's native paired decoy. The
+  worker asserts that every library-side value is equal within a pair.
+- Per run: extract, retrace with repick, features and compete on the ID windows (inputs from the run's
+  own retrace report and spectra), then an extract on the quant windows and a retrace (repick
+  off) at the ID chain's re-picked apex and 1/K0 into `second_pass/r<i>/chromatograms_q.parquet`,
+  the traces quant reads. The chains run under the `parallel_runs` plan (first alone, measured).
+- One pooled rescore of the second-pass tables (`second_pass/scored_combined.parquet`), then
+  `mbr_second_pass.py report`: every target whose pass-1 `precursor_q` exceeds `report_q` (0.01) gets
+  q 1.0 in every q column (DIA-NN's `Lib.Q.Value` filter, which is what bounds the report's FDR:
+  the second pass cannot reject a false library entry, section 4n), and `is_transferred` marks
+  rows accepted in the second pass but not in pass 1 for that run. Quant and the report then run on
+  `second_pass/scored.parquet` as usual.
+
 The M5 augmented scored output (`--out-scored`, `mbr_worker.py:272`) requires the
 scored table to have a `source` column and matches transfers on `(candidate_id,
 source)`, taking `min(q, transfer_q)` on the PSM q columns and setting `is_transferred`

@@ -1587,7 +1587,9 @@ pub struct FeaturesConfig {
     /// `--threads` (the engine's thread pool) or than it has chunks, so `--threads 1` decodes
     /// on one loader as before. Loaders beyond each pass's first come from a process-wide
     /// pool of four, so concurrent bands or runs (`groups.parallel`,
-    /// `experiment.parallel_runs`) share that pool instead of multiplying it. Default 3; `1`
+    /// `experiment.parallel_runs`) share that pool instead of multiplying it. Default 5 (was 3:
+    /// a HYE diaPASEF run's features took 1:00-1:12 at 5 against 1:30 at 3, byte-identical,
+    /// about 1 GB more, TIMS_SPEED_ROADMAP L5); `1`
     /// restores the single loader and `0` is read as `1`. A memory knob and a speed knob,
     /// not a sensitivity knob.
     pub chrom_loaders: usize,
@@ -1613,7 +1615,7 @@ impl Default for FeaturesConfig {
             im_features: false,  // opt-in; TIMS P5, benchmark-gated
             im_shape_features: false, // opt-in; TIMS P7, benchmark-gated
             retrace_apex: false, // opt-in; needs retrace, benchmark-gated
-            chrom_loaders: 3,
+            chrom_loaders: 5,
         }
     }
 }
@@ -1977,6 +1979,42 @@ pub enum MbrStrategy {
     RtTransfer,
     /// RtTransfer + requantification of accepted transfers (M5).
     Full,
+    /// A second search with an empirical library made from the pass-1 identifications
+    /// (`mbr.second_pass`, docs/TIMS_QUANT_ROADMAP.md 4m and 4n, arm D): every run is searched
+    /// again with that library and new decoys, the second pass is the reported result, and
+    /// the transfer tiers do not run. `run-experiment` under `retrace.enabled` (diaPASEF).
+    /// Benchmark-gated.
+    SecondPass,
+}
+
+/// `mbr.second_pass` (`mbr.strategy = second_pass`). The library keeps the predicted fragment
+/// intensities, takes RT and 1/K0 from the pass-1 data, and gets a new decoy per target
+/// (interior reversed, both termini kept), as arm D of docs/TIMS_QUANT_ROADMAP.md 4n.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecondPassConfig {
+    /// Library inclusion: experiment-wide pass-1 `precursor_q` at or below this.
+    pub lib_q: f64,
+    /// Report only targets whose pass-1 `precursor_q` is at or below this; the other
+    /// library targets are searched and compete, and their rows get q 1.0 (DIA-NN's
+    /// `Lib.Q.Value` filter, which also sets the report's FDR: section 4n, entrapment).
+    pub report_q: f64,
+    /// Floor of the per-run RT half-width, which is otherwise the p99 of the held-out
+    /// cross-run residual, in seconds.
+    pub min_rt_halfwidth_s: f64,
+    /// Floor of the per-run 1/K0 half-width (the p99 alone lost 8% of the reproducible
+    /// rows to `extract.im_gate`, section 4n).
+    pub min_im_halfwidth: f64,
+}
+impl Default for SecondPassConfig {
+    fn default() -> Self {
+        Self {
+            lib_q: 0.05,
+            report_q: 0.01,
+            min_rt_halfwidth_s: 0.0,
+            min_im_halfwidth: 0.04,
+        }
+    }
 }
 
 /// Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence`
@@ -2033,6 +2071,8 @@ pub struct MbrConfig {
     /// better epsilon and fewer ions (docs/TIMS_QUANT_ROADMAP.md section 4l). Default true;
     /// `false` needs `reextract`.
     pub rescuable: bool,
+    /// `mbr.strategy = second_pass`: the library and window settings.
+    pub second_pass: SecondPassConfig,
     /// Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy;
     /// e.g. the `py312_mumdia` env). Required when `strategy != None`.
     pub python: Option<String>,
@@ -2050,6 +2090,7 @@ impl Default for MbrConfig {
             requant_all: false,
             reextract: false,
             rescuable: true,
+            second_pass: SecondPassConfig::default(),
             python: None,
         }
     }
@@ -2478,6 +2519,15 @@ pub struct ExperimentConfig {
     /// where the experiment's peak can sit. Measured with `parallel_runs`: see there.
     #[serde(deserialize_with = "de_overlap_front_threads")]
     pub overlap_front_threads: Option<usize>,
+    /// Memory, in GB, that the automatic plans (`parallel_runs = "auto"`) may fill with
+    /// concurrent conversions, seeds and per-run chains; `0` (the default) means none, and
+    /// the plans are sized from the machine's available memory alone. With a budget, the
+    /// number of concurrent items is also at most `budget / measured peak` of the first item,
+    /// which runs alone (at least one). It bounds concurrency, not a single stage: a chain
+    /// whose own peak exceeds the budget still runs, alone. An explicit `parallel_runs` is
+    /// not changed. For running a large experiment on a smaller node (TIMS_SPEED_ROADMAP,
+    /// 64 GB).
+    pub memory_budget_gb: f64,
 }
 
 /// `experiment.overlap_front_threads`: a thread count, or `"auto"` / `null`, which is
@@ -2509,6 +2559,7 @@ impl Default for ExperimentConfig {
             parallel_runs: 0,
             rt_library_scope: RtLibraryScope::FirstRunOnly,
             overlap_front_threads: None,
+            memory_budget_gb: 0.0,
         }
     }
 }
@@ -3067,6 +3118,26 @@ impl Config {
                     .into(),
             ));
         }
+        if self.mbr.strategy == MbrStrategy::SecondPass {
+            if self.mbr.reextract || !self.retrace.enabled {
+                return Err(Invalid(
+                    "mbr.strategy = second_pass replaces the transfer tiers (mbr.reextract must be \
+                     false) and retraces from the raw .d (retrace.enabled, diaPASEF)."
+                        .into(),
+                ));
+            }
+            let sp = &self.mbr.second_pass;
+            if !(sp.lib_q > 0.0 && sp.lib_q <= 1.0 && sp.report_q > 0.0 && sp.report_q <= sp.lib_q)
+                || sp.min_rt_halfwidth_s < 0.0
+                || sp.min_im_halfwidth < 0.0
+            {
+                return Err(Invalid(
+                    "mbr.second_pass: lib_q in (0, 1], report_q in (0, lib_q], and non-negative \
+                     half-width floors."
+                        .into(),
+                ));
+            }
+        }
         if self.mbr.reextract && (self.mbr.strategy == MbrStrategy::None || !self.retrace.enabled) {
             return Err(Invalid(
                 "mbr.reextract retraces transfer targets from the raw .d, so it needs \
@@ -3110,9 +3181,12 @@ impl Config {
             );
         }
         {
-            // Only `strategy == None` vs `!= None` is ever tested, so the non-None variants
-            // are indistinguishable in behaviour.
-            if self.mbr.strategy != MbrStrategy::None {
+            // Only `strategy == None` vs `!= None` is tested for the transfer variants, so
+            // they are indistinguishable in behaviour; `second_pass` is its own path.
+            if !matches!(
+                self.mbr.strategy,
+                MbrStrategy::None | MbrStrategy::SecondPass
+            ) {
                 tracing::warn!(
                     strategy = ?self.mbr.strategy,
                     "mbr.strategy currently only distinguishes none vs not-none; the \
@@ -3603,6 +3677,34 @@ mod tests {
         assert!(Config::from_json(&format!(r#"{{"retrace":{{"enabled":true}},{mbr}}}"#)).is_ok());
         assert!(Config::default().mbr.rescuable);
         assert!(Config::from_json(r#"{"mbr":{"rescuable":false}}"#).is_err());
+    }
+
+    #[test]
+    fn second_pass_parses_with_arm_d_defaults_and_refuses_reextract() {
+        let ok =
+            r#"{"retrace":{"enabled":true},"mbr":{"strategy":"second_pass","python":"python"}}"#;
+        let c = Config::from_json(ok).unwrap();
+        assert_eq!(c.mbr.strategy, MbrStrategy::SecondPass);
+        assert_eq!(
+            (c.mbr.second_pass.lib_q, c.mbr.second_pass.report_q),
+            (0.05, 0.01)
+        );
+        assert_eq!(c.mbr.second_pass.min_im_halfwidth, 0.04);
+        // without retrace, with the re-extraction tier, or with a report cut above the
+        // library cut
+        assert!(Config::from_json(r#"{"mbr":{"strategy":"second_pass","python":"p"}}"#).is_err());
+        assert!(Config::from_json(
+            r#"{"retrace":{"enabled":true},"mbr":{"strategy":"second_pass","python":"p","reextract":true}}"#
+        )
+        .is_err());
+        assert!(Config::from_json(
+            r#"{"retrace":{"enabled":true},"mbr":{"strategy":"second_pass","python":"p","second_pass":{"report_q":0.1}}}"#
+        )
+        .is_err());
+        assert!(Config::from_json(
+            r#"{"retrace":{"enabled":true},"mbr":{"strategy":"second_pass","python":"p","second_pass":{"lib_qq":0.1}}}"#
+        )
+        .is_err());
     }
 
     #[test]
