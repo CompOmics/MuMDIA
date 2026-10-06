@@ -1075,6 +1075,12 @@ pub struct RtImTrainConfig {
     pub p_rt: f64,
     pub rt_window_multiplier: f64,
     pub min_seed_for_calibration: usize,
+    /// Relaxed `spectrum_q` cuts tried, in order, when fewer than
+    /// `min_seed_for_calibration` target anchors pass `q_train`. Rungs at or below
+    /// `q_train` are ignored; empty keeps the strict cut. When even the last rung is short,
+    /// the multi-head calibration is skipped (the library keeps base-model retention times)
+    /// instead of failing on an empty reference.
+    pub anchor_q_ladder: Vec<f64>,
     /// LOESS span (fraction of points in each local fit).
     pub loess_span: f64,
     /// Fallback fixed RT window in seconds when calibration cannot be fit.
@@ -1326,6 +1332,7 @@ impl Default for RtImTrainConfig {
             p_rt: 0.95,
             rt_window_multiplier: 1.0,
             min_seed_for_calibration: 50,
+            anchor_q_ladder: vec![0.02, 0.05],
             loess_span: 0.3,
             fallback_rt_window_s: 120.0,
             finetune_deeplc: false,
@@ -3271,6 +3278,16 @@ impl Config {
         if self.predict_frag.charge2_from_precursor_charge < 1 {
             return Err(Invalid(
                 "predict_frag.charge2_from_precursor_charge must be >= 1".into(),
+            ));
+        }
+        if self
+            .rt_im_train
+            .anchor_q_ladder
+            .iter()
+            .any(|q| !(q.is_finite() && *q > 0.0 && *q <= 1.0))
+        {
+            return Err(Invalid(
+                "rt_im_train.anchor_q_ladder entries must lie in (0, 1]".into(),
             ));
         }
         if self.rt_im_train.min_seed_for_calibration < 2 {

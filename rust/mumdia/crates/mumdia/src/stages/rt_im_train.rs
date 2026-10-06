@@ -430,6 +430,97 @@ fn library_irt(path: &str, span: Option<(usize, usize)>) -> Result<(Vec<u32>, Ve
     }
 }
 
+/// The anchor cut a run actually calibrates with, from [`plan_anchors`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnchorPlan {
+    /// The `spectrum_q` cut used for the anchors: `q_train`, or the first rung of
+    /// `anchor_q_ladder` that reaches `min_seed_for_calibration` anchors.
+    pub q_train: f64,
+    /// Distinct target base peptides at that cut.
+    pub n_anchors: usize,
+    /// Whether `n_anchors` reaches `min_seed_for_calibration`. When false, `q_train` is the
+    /// last rung tried, and a calibration that needs anchors (multi-head) must be skipped.
+    pub sufficient: bool,
+}
+
+/// Choose the anchor cut for a run. A seed search on a hard run (few peptides, a dominant
+/// contaminant, a library whose decoys score high) can leave fewer than
+/// `min_seed_for_calibration` target anchors at `q_train`, and then the multi-head
+/// calibration has nothing to fit and the per-run LOESS falls back to a fixed window. The
+/// cut is relaxed through `anchor_q_ladder` until enough anchors exist; anchors are only
+/// an RT reference, and a few percent of false ones move a robust curve far less than no
+/// curve at all. Counted as [`fit_anchors`] counts: finite target rows, one per base
+/// peptide.
+pub fn plan_anchors(seed_psms: &str, cfg: &RtImTrainConfig) -> Result<AnchorPlan> {
+    let seed = TableFile::open(seed_psms)?;
+    let s_base = seed.u32("base_peptide_id")?;
+    let s_q = seed.f64("spectrum_q")?;
+    let s_score = seed.f64("score")?;
+    let s_rt = seed.f64("observed_rt")?;
+    let s_label = seed.str("label")?;
+    // Best (lowest) q per target base peptide; the count at a cut is then one comparison.
+    let mut best_q: HashMap<u32, f64> = HashMap::new();
+    for i in 0..seed.nrows {
+        if !s_q[i].is_finite() || !s_score[i].is_finite() || !s_rt[i].is_finite() {
+            continue;
+        }
+        if s_label[i] != "target" {
+            continue;
+        }
+        let e = best_q.entry(s_base[i]).or_insert(f64::INFINITY);
+        if s_q[i] < *e {
+            *e = s_q[i];
+        }
+    }
+    let count = |q: f64| best_q.values().filter(|&&v| v < q).count();
+    let need = cfg.min_seed_for_calibration.max(2);
+    let mut plan = AnchorPlan {
+        q_train: cfg.q_train,
+        n_anchors: count(cfg.q_train),
+        sufficient: false,
+    };
+    plan.sufficient = plan.n_anchors >= need;
+    if plan.sufficient {
+        return Ok(plan);
+    }
+    for &q in cfg.anchor_q_ladder.iter().filter(|&&q| q > cfg.q_train) {
+        plan = AnchorPlan {
+            q_train: q,
+            n_anchors: count(q),
+            sufficient: false,
+        };
+        plan.sufficient = plan.n_anchors >= need;
+        if plan.sufficient {
+            break;
+        }
+    }
+    if plan.sufficient {
+        warn!(
+            q_train = cfg.q_train,
+            relaxed_q = plan.q_train,
+            n_anchors = plan.n_anchors,
+            need,
+            "rt-im-train: too few confident seed anchors at q_train; relaxed the anchor cut"
+        );
+    } else {
+        warn!(
+            q_train = cfg.q_train,
+            last_q = plan.q_train,
+            n_anchors = plan.n_anchors,
+            need,
+            "rt-im-train: too few seed anchors even at the most relaxed cut; retention-time              calibration that needs anchors is skipped"
+        );
+    }
+    Ok(plan)
+}
+
+/// `cfg` with the anchor cut of `plan`.
+pub fn with_anchor_cut(cfg: &RtImTrainConfig, plan: &AnchorPlan) -> RtImTrainConfig {
+    let mut c = cfg.clone();
+    c.q_train = plan.q_train;
+    c
+}
+
 /// Fit the calibration on a seed table whose own `predicted_irt` column carries the anchors'
 /// iRT (`RtImTrainParams::anchor_irt_from_seed`): the fit a grouped run's bands share under
 /// `groups.calibration = global`. No library is read.
@@ -1240,6 +1331,63 @@ mod tests {
         )
         .unwrap();
         (seed, lib)
+    }
+
+    #[test]
+    fn a_seed_short_of_anchors_relaxes_the_cut_and_then_reports_short() {
+        // 60 target base peptides: 10 at q 0.005, 25 more at 0.015, 25 more at 0.04, plus
+        // decoys at every cut, which never count. Duplicate rows of one peptide count once.
+        let seed = scratch("plan_anchors_seed.parquet");
+        let mut base = Vec::new();
+        let mut q = Vec::new();
+        let mut label = Vec::new();
+        for i in 0..60u32 {
+            let qi = if i < 10 {
+                0.005
+            } else if i < 35 {
+                0.015
+            } else {
+                0.04
+            };
+            for (l, b) in [("target", i), ("target", i), ("decoy", 1000 + i)] {
+                base.push(b);
+                q.push(qi);
+                label.push(l.to_string());
+            }
+        }
+        let n = base.len();
+        write_table(
+            &seed,
+            vec![
+                Col::U32("base_peptide_id".into(), base),
+                Col::F64("spectrum_q".into(), q),
+                Col::F64("score".into(), vec![1.0; n]),
+                Col::F64("observed_rt".into(), vec![100.0; n]),
+                Col::Str("label".into(), label),
+            ],
+        )
+        .unwrap();
+        let plan = |need: usize, ladder: Vec<f64>| {
+            let cfg = RtImTrainConfig {
+                min_seed_for_calibration: need,
+                anchor_q_ladder: ladder,
+                ..Default::default()
+            };
+            plan_anchors(&seed, &cfg).unwrap()
+        };
+        let p = plan(10, vec![0.02, 0.05]);
+        assert_eq!((p.q_train, p.n_anchors, p.sufficient), (0.01, 10, true));
+        let p = plan(30, vec![0.02, 0.05]);
+        assert_eq!((p.q_train, p.n_anchors, p.sufficient), (0.02, 35, true));
+        let p = plan(50, vec![0.02, 0.05]);
+        assert_eq!((p.q_train, p.n_anchors, p.sufficient), (0.05, 60, true));
+        let p = plan(61, vec![0.02, 0.05]);
+        assert_eq!((p.q_train, p.n_anchors, p.sufficient), (0.05, 60, false));
+        // An empty ladder keeps the strict cut; a rung below q_train is ignored.
+        let p = plan(30, vec![]);
+        assert_eq!((p.q_train, p.n_anchors, p.sufficient), (0.01, 10, false));
+        let p = plan(30, vec![0.005, 0.02]);
+        assert_eq!((p.q_train, p.n_anchors, p.sufficient), (0.02, 35, true));
     }
 
     #[test]
