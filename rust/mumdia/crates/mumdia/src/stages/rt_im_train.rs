@@ -149,6 +149,93 @@ fn candidate_window(calibrated_rt: Option<f64>, width: Option<f64>) -> (f64, f64
     }
 }
 
+/// Early (`left`) and late (`right`) half-widths of the widen-only local RT window on an
+/// ascending grid of calibrated RT; linear in between, the end values beyond the grid.
+#[derive(Clone, Debug)]
+struct LocalWindow {
+    grid: Vec<f64>,
+    left: Vec<f64>,
+    right: Vec<f64>,
+}
+
+impl LocalWindow {
+    fn at(&self, cal: f64) -> (f64, f64) {
+        let g = &self.grid;
+        let last = g.len() - 1;
+        if cal <= g[0] {
+            return (self.left[0], self.right[0]);
+        }
+        if cal >= g[last] {
+            return (self.left[last], self.right[last]);
+        }
+        let j = g.partition_point(|&x| x < cal);
+        let t = (cal - g[j - 1]) / (g[j] - g[j - 1]).max(1e-12);
+        (
+            self.left[j - 1] + t * (self.left[j] - self.left[j - 1]),
+            self.right[j - 1] + t * (self.right[j] - self.right[j - 1]),
+        )
+    }
+
+    /// Fit from the anchors' calibrated RT and signed residuals (observed - calibrated):
+    /// on a grid over the anchors' calibrated range, the `k` anchors nearest each point give
+    /// the `(1 - p_rt) / 2` and `(1 + p_rt) / 2` residual quantiles, times `mult`, floored at
+    /// the global `w_rt` and capped at `cap`.
+    fn fit(
+        cal: &[f64],
+        resid: &[f64],
+        k: usize,
+        p_rt: f64,
+        mult: f64,
+        w_rt: f64,
+        cap: f64,
+    ) -> Option<Self> {
+        const GRID: usize = 200;
+        let n = cal.len();
+        if n < 2 {
+            return None;
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| cal[a].total_cmp(&cal[b]).then(a.cmp(&b)));
+        let c: Vec<f64> = order.iter().map(|&i| cal[i]).collect();
+        let r: Vec<f64> = order.iter().map(|&i| resid[i]).collect();
+        let (lo, hi) = (c[0], c[n - 1]);
+        if hi <= lo {
+            return None;
+        }
+        let k = k.clamp(2, n);
+        let (q_lo, q_hi) = ((1.0 - p_rt) / 2.0, (1.0 + p_rt) / 2.0);
+        let cap = cap.max(w_rt);
+        let mut grid = Vec::with_capacity(GRID);
+        let mut left = Vec::with_capacity(GRID);
+        let mut right = Vec::with_capacity(GRID);
+        for gi in 0..GRID {
+            let x = lo + (hi - lo) * gi as f64 / (GRID - 1) as f64;
+            // The k anchors nearest x: grow [a, b) outward from the insertion point.
+            let mut a = c.partition_point(|&v| v < x);
+            let mut b = a;
+            while b - a < k {
+                let take_left = if a == 0 {
+                    false
+                } else if b == n {
+                    true
+                } else {
+                    (x - c[a - 1]) <= (c[b] - x)
+                };
+                if take_left {
+                    a -= 1;
+                } else {
+                    b += 1;
+                }
+            }
+            let near = &r[a..b];
+            grid.push(x);
+            left.push((-percentile(near, q_lo) * mult).max(w_rt).min(cap));
+            right.push((percentile(near, q_hi) * mult).max(w_rt).min(cap));
+        }
+        Some(LocalWindow { grid, left, right })
+    }
+}
+
 /// A fitted retention-time calibration: everything the anchors determine, which
 /// [`apply`] then maps over a library table.
 ///
@@ -170,6 +257,9 @@ pub struct RtFit {
     holdout_frac: f64,
     holdout_sizing: Option<HoldoutSizing>,
     adaptive: Option<(f64, f64, Vec<f64>)>,
+    /// Widen-only local window (`local_window_anchors`): the early and late half-widths on a
+    /// grid of calibrated RT.
+    local: Option<LocalWindow>,
     /// Signed median, absolute median and MAD of the in-sample residuals (seconds).
     residuals: (f64, f64, f64),
 }
@@ -323,6 +413,18 @@ fn check_cfg(cfg: &RtImTrainConfig) -> Result<()> {
         anyhow::bail!(
             "rt_im_train.window_holdout_frac must be in [0.0, 0.9], got {holdout_frac}; \
              0.0 disables held-out window sizing"
+        );
+    }
+    if cfg.local_window_anchors > 0 && cfg.adaptive_rt_window {
+        anyhow::bail!(
+            "rt_im_train.local_window_anchors and rt_im_train.adaptive_rt_window are mutually \
+             exclusive: both size the window per calibrated RT; enable one of them"
+        );
+    }
+    if !(cfg.local_window_multiplier.is_finite() && cfg.local_window_multiplier > 0.0) {
+        anyhow::bail!(
+            "rt_im_train.local_window_multiplier must be a positive number, got {}",
+            cfg.local_window_multiplier
         );
     }
     if holdout_frac > 0.0 && cfg.adaptive_rt_window {
@@ -642,6 +744,7 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
         holdout_frac,
         holdout_sizing: None,
         adaptive: None,
+        local: None,
         residuals: (f64::NAN, f64::NAN, f64::NAN),
     };
 
@@ -815,7 +918,33 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
     fit.w_rt = w_rt;
     fit.status = status;
     fit.holdout_sizing = holdout_sizing;
+    let local = match (w_rt, &plan) {
+        (Some(w), WindowPlan::Calibrated) if cfg.local_window_anchors > 0 => {
+            let cals: Vec<f64> = train_irt.iter().map(|x| fit.predict(*x)).collect();
+            let signed: Vec<f64> = cals.iter().zip(&train_rt).map(|(c, y)| y - c).collect();
+            LocalWindow::fit(
+                &cals,
+                &signed,
+                cfg.local_window_anchors,
+                cfg.p_rt,
+                cfg.local_window_multiplier,
+                w,
+                cfg.fallback_rt_window_s,
+            )
+        }
+        _ => None,
+    };
+    if let Some(lw) = &local {
+        let max_l = lw.left.iter().cloned().fold(0.0, f64::max);
+        let max_r = lw.right.iter().cloned().fold(0.0, f64::max);
+        info!(
+            max_left_s = max_l,
+            max_right_s = max_r,
+            "rt-im-train: widen-only local RT window"
+        );
+    }
     fit.adaptive = adaptive;
+    fit.local = local;
     fit.residuals = residuals;
     Ok(fit)
 }
@@ -871,7 +1000,13 @@ fn write_windows(
                     .w_rt
                     .expect("available RT calibration requires a bounded window"),
             });
-            let (cal, lo, hi) = candidate_window(calibrated_rt, width);
+            let (cal, lo, hi) = match (&fit.local, calibrated_rt) {
+                (Some(lw), Some(c)) => {
+                    let (l, r) = lw.at(c);
+                    (c, c - l, c + r)
+                }
+                _ => candidate_window(calibrated_rt, width),
+            };
             if let Some(b) = kept.as_mut() {
                 b.row(cid[i], cal, lo, hi);
             }
@@ -938,6 +1073,15 @@ fn write_windows(
             "rt_residual_median_s": rt_residual_median_s,
             "rt_residual_abs_median_s": rt_residual_abs_median_s,
             "rt_residual_mad_s": rt_residual_mad_s,
+            "local_window_anchors": p.cfg.local_window_anchors,
+            "local_window": fit.local.as_ref().map(|lw| json!({
+                "multiplier": p.cfg.local_window_multiplier,
+                "max_left_s": lw.left.iter().cloned().fold(0.0, f64::max),
+                "max_right_s": lw.right.iter().cloned().fold(0.0, f64::max),
+                "grid_rt": lw.grid,
+                "left_s": lw.left,
+                "right_s": lw.right,
+            })),
         }),
     )?;
 
@@ -1334,6 +1478,37 @@ mod tests {
     }
 
     #[test]
+    fn the_local_window_widens_only_the_side_and_region_whose_anchors_need_it() {
+        // 400 anchors over calibrated RT 0..400 with symmetric +-3 s residuals, except the
+        // last 50 (RT > 350), which elute 10-30 s late: the order-losing gradient end.
+        let n = 400;
+        let cal: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let resid: Vec<f64> = (0..n)
+            .map(|i| {
+                if i >= 350 {
+                    10.0 + ((i * 7) % 21) as f64
+                } else {
+                    ((i * 13) % 7) as f64 - 3.0
+                }
+            })
+            .collect();
+        let w_rt = 4.5;
+        let lw = LocalWindow::fit(&cal, &resid, 40, 0.9, 1.0, w_rt, 120.0).unwrap();
+        // mid-gradient: both sides stay the global width (widen-only floor)
+        let (l, r) = lw.at(150.0);
+        assert_eq!((l, r), (w_rt, w_rt));
+        // gradient end: the late side widens to the anchors' upper quantile, the early side not
+        let (l, r) = lw.at(399.0);
+        assert_eq!(l, w_rt);
+        assert!(r > 20.0, "late side {r}");
+        // beyond the grid the end values are held
+        assert_eq!(lw.at(1e6), lw.at(399.0));
+        // the cap binds
+        let capped = LocalWindow::fit(&cal, &resid, 40, 0.9, 1.0, w_rt, 12.0).unwrap();
+        assert_eq!(capped.at(399.0).1, 12.0);
+    }
+
+    #[test]
     fn a_seed_short_of_anchors_relaxes_the_cut_and_then_reports_short() {
         // 60 target base peptides: 10 at q 0.005, 25 more at 0.015, 25 more at 0.04, plus
         // decoys at every cut, which never count. Duplicate rows of one peptide count once.
@@ -1411,10 +1586,15 @@ mod tests {
             calibration_method: CalibrationMethod::Linear,
             ..Default::default()
         };
+        let local = RtImTrainConfig {
+            local_window_anchors: 60,
+            ..Default::default()
+        };
         for (tag, cfg, n) in [
             ("default", RtImTrainConfig::default(), 400usize),
             ("holdout", holdout, 400),
             ("adaptive", adaptive, 400),
+            ("local", local, 400),
             ("linear", linear, 400),
             ("few", RtImTrainConfig::default(), 20),
             ("one", RtImTrainConfig::default(), 1),

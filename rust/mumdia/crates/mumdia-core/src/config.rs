@@ -1148,6 +1148,17 @@ pub struct RtImTrainConfig {
     pub adaptive_rt_window: bool,
     /// Number of equal-width calibrated-RT bins for the adaptive window.
     pub adaptive_rt_bins: usize,
+    /// Widen-only local RT window: for every calibrated RT, the `local_window_anchors`
+    /// anchors nearest in calibrated RT give a signed-residual quantile on each side
+    /// (`(1 - p_rt) / 2` early, `(1 + p_rt) / 2` late) times `local_window_multiplier`, and
+    /// each side of the window becomes the larger of that and the global `w_rt`, capped at
+    /// `fallback_rt_window_s`. Where the predicted retention time loses the elution order
+    /// (typically the gradient ends) the anchors' residuals are one-sided and large, and the
+    /// window widens on that side only; elsewhere it stays the global window. 0 (default)
+    /// is off. Mutually exclusive with `adaptive_rt_window`.
+    pub local_window_anchors: usize,
+    /// Multiplier on the local one-sided quantiles of `local_window_anchors`.
+    pub local_window_multiplier: f64,
     /// Lower clamp (seconds) for any RT half-window (the existing 1 s floor).
     pub rt_window_min_s: f64,
     /// Size `w_rt` from HELD-OUT residuals instead of in-sample ones. A fraction of
@@ -1342,6 +1353,8 @@ impl Default for RtImTrainConfig {
             finetune_batch: 0,     // 0 = auto-scale to seed size
             adaptive_rt_window: false,
             adaptive_rt_bins: 12,
+            local_window_anchors: 0,
+            local_window_multiplier: 1.0,
             rt_window_min_s: 1.0,
             window_holdout_frac: 0.0,
             library_irt: LibraryIrt::Auto,
