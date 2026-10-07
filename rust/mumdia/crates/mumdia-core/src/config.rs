@@ -1538,6 +1538,12 @@ pub struct ExtractConfig {
     /// features stage can scale the RT error by the window it was searched in (the
     /// `rtw_*` family). Off by default: the table's schema stays byte-identical.
     pub emit_rt_window: bool,
+    /// Learn the MS1 precursor mass offset from the confident seed anchors before extract
+    /// and centre every MS1 isotope read on it (`stages::ms1cal`). Off by default.
+    pub ms1_calibrate: bool,
+    /// MS1 precursor mass offset in ppm (observed - theoretical) applied to every MS1
+    /// isotope read. Set by `ms1_calibrate` in `run` / `run-experiment`; 0 by default.
+    pub ms1_ppm_offset: f64,
     /// Number of chromatographic peak hypotheses to enumerate per candidate.
     /// `K>1` writes up to K local maxima to the diagnostic
     /// `<out-psms>.peaks.parquet` sidecar. The primary PSM still contains only the
@@ -1666,6 +1672,8 @@ impl Default for ExtractConfig {
             ms1_rescue: false,    // opt-in; relaxes acceptance, validate FDR first
             ms1_scan_halfwidth: 0,
             emit_rt_window: false,
+            ms1_calibrate: false,
+            ms1_ppm_offset: 0.0,
             retain_top_peaks: 1,            // legacy single-apex behaviour (K=1)
             promote_top_peaks: 1,           // top-K promotion off (only the selected apex is a row)
             alt_peak_min_area_frac: 0.10,   // alternate peak >= 10% of rank-0 area

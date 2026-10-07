@@ -480,6 +480,8 @@ fn finish_run(
         prescreen::run_if_enabled(cfg, ch, &co.ms2, Some(&co.ms1), lib_p, &windows, out)?;
     let psms = d("psms_extracted.parquet");
     let chrom = d("chromatograms.parquet");
+    let ext_cfg =
+        crate::stages::ms1cal::extract_cfg(&cfg.extract, seed, &co.ms1, cfg.rt_im_train.q_train)?;
     extract::run(extract::ExtractParams {
         precursor_span: None,
         fragment_offset: None,
@@ -495,7 +497,7 @@ fn finish_run(
         out_psms: &psms,
         out_chrom: &chrom,
         restrict_candidates: survivors.as_deref(),
-        cfg: &cfg.extract,
+        cfg: &ext_cfg,
         config_hash: ch,
     })?;
     let feats = d("features.parquet");

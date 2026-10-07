@@ -3809,7 +3809,8 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
             let z = c.charge as f64;
             let sp = ISOTOPE_SPACING / z;
             let tol = p.cfg.prec_tol_ppm;
-            let at = |mz: f64| Some(ms1_near(ms1_scans, j, h, mz, tol) as f64);
+            let shift = 1.0 + p.cfg.ms1_ppm_offset * 1e-6;
+            let at = |mz: f64| Some(ms1_near(ms1_scans, j, h, mz * shift, tol) as f64);
             (
                 at(c.precursor_mz - sp),
                 at(c.precursor_mz),
@@ -4026,8 +4027,9 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
         if !ms1_scans.is_empty() && !grid.is_empty() {
             let sp = ISOTOPE_SPACING / c.charge as f64;
             let tol = p.cfg.prec_tol_ppm;
+            let shift = 1.0 + p.cfg.ms1_ppm_offset * 1e-6;
             for (nm, dmz) in [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)] {
-                let mz = c.precursor_mz + dmz;
+                let mz = (c.precursor_mz + dmz) * shift;
                 let ints: Vec<f32> = grid
                     .iter()
                     .map(|&r| {

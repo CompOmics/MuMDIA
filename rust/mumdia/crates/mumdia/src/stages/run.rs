@@ -773,6 +773,12 @@ pub fn run(p: RunParams) -> Result<()> {
         // The MS2 only (`SharedScans::ms1 = None`): extract decodes the MS1 itself,
         // concurrently with its library load and after the library's errors, as it does
         // with nothing lent.
+        let ext_cfg = crate::stages::ms1cal::extract_cfg(
+            &cfg.extract,
+            &seed,
+            &co.ms1,
+            cfg.rt_im_train.q_train,
+        )?;
         let (wpsm, wchr) = extract::run_hashed(extract::ExtractParams {
             precursor_span: None,
             fragment_offset: None,
@@ -790,7 +796,7 @@ pub fn run(p: RunParams) -> Result<()> {
             out_psms: &psms,
             out_chrom: &chrom,
             restrict_candidates: survivors.as_deref(),
-            cfg: &cfg.extract,
+            cfg: &ext_cfg,
             config_hash: &ch,
         })?;
         drop(lent_ms2);
