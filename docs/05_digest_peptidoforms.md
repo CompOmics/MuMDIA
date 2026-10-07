@@ -210,10 +210,12 @@ strategies keep the C-terminal residue fixed and rewrite the interior `b[..n-1]`
    - a residue carrying both a fixed and a variable mod is rejected
      (fixed-variable stacking, peptidoforms.rs:167-172).
 
-   The `unimod_mass` allowlist (mass.rs:14-24) currently recognizes exactly eight
-   names: `Carbamidomethyl`, `Oxidation`, `Acetyl`, `Phospho`, `Deamidated`,
-   `Methyl`, `Dimethyl`, `Carbamyl`. Extending the set is a `mass.rs` edit (see
-   "How to extend").
+   The `unimod_mass` allowlist is the modification catalogue
+   `crates/mumdia-core/src/modifications.json` (34 UniMod residue modifications,
+   embedded at build time by `mass.rs`). The desktop Search tab offers exactly that
+   list, so a modification chosen there is always one the engine accepts. Extending the
+   set is one catalogue entry plus its composition in the
+   `every_catalogue_mass_matches_its_elemental_composition` test (see "How to extend").
 2. **Read** the digest table (peptidoforms.rs:189-194): columns `id`, `peptide`,
    `protein`, `label`, `target_id`.
 3. **Per digest row** (peptidoforms.rs:201): compute `base_peptide_id` as
@@ -417,10 +419,12 @@ types elsewhere, not here). `DecoyConfig` (config.rs:172) carries only
   should be attempted at all. Realizing `DiannShift` means removing the `validate`
   rejection (config.rs:1021) and implementing a fragment-m/z shift at predict-frag,
   not a sequence rewrite here.
-- **New modification.** Add the UniMod name and monoisotopic delta to
-  `unimod_mass` (mass.rs:13); it is the single allowlist both the Stage A2
-  validation (`known_mods`, peptidoforms.rs:99) and the mass model consult. Then
-  reference it by name in `fixed_mods`/`variable_mods`.
+- **New modification.** Add the UniMod name, accession, monoisotopic delta, offered
+  residues and group to `crates/mumdia-core/src/modifications.json`, and its elemental
+  composition to `every_catalogue_mass_matches_its_elemental_composition` in `mass.rs`.
+  The catalogue is the single allowlist the Stage A2 validation (`known_mods`), the mass
+  model and the desktop Search tab consult. Then reference it by name in
+  `fixed_mods`/`variable_mods`.
 - **Support a second mod per position or terminal mods.** Change `proforma`
   (peptidoforms.rs:19) to emit all mods at a position (e.g. concatenate multiple
   `[...]` groups) instead of `find`-ing the first, relax the stacking/overlap and
