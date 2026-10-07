@@ -410,6 +410,368 @@ impl Default for PrescanConfig {
     }
 }
 
+/// Calibration presets of the fragment-rarity prescreen (`prescreen.preset`). Each names a
+/// calibration rejection target, the share of the calibration half's scores at or below the
+/// cutoff. Measured on six Astral HYE runs (exploratory screening on sampled candidates,
+/// tagbench PHASE10): reduction / reference retention / weak-reference retention 50.29% /
+/// 99.70% / 99.24% (sensitive), 52.28% / 99.66% / 99.20% (balanced), 74.62% / 96.94% /
+/// 94.22% (stringent), 90.30% / 90.58% / 82.67% (aggressive). A target does not guarantee the
+/// same reduction on another run or library; the report records the measured one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenPreset {
+    /// Target 0.52.
+    Sensitive,
+    /// Target 0.54.
+    #[default]
+    Balanced,
+    /// Target 0.75.
+    Stringent,
+    /// Target 0.90.
+    Aggressive,
+    /// Use `prescreen.target`.
+    Custom,
+}
+
+impl PrescreenPreset {
+    /// The calibration rejection target this preset names; `None` for `Custom`.
+    pub fn target(self) -> Option<f64> {
+        match self {
+            PrescreenPreset::Sensitive => Some(0.52),
+            PrescreenPreset::Balanced => Some(0.54),
+            PrescreenPreset::Stringent => Some(0.75),
+            PrescreenPreset::Aggressive => Some(0.90),
+            PrescreenPreset::Custom => None,
+        }
+    }
+}
+
+/// Which candidates the prescreen filters (`prescreen.scope`). Candidates outside the scope
+/// pass through unscored, and the cutoff is calibrated within the scope only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenScope {
+    /// Every candidate form.
+    #[default]
+    All,
+    /// Only forms carrying the modifications in `prescreen.scope_mods` (`scope_match` says
+    /// whether any or all of them).
+    Modified,
+}
+
+/// How several `prescreen.scope_mods` combine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenScopeMatch {
+    /// A form is in scope when it carries at least one of the listed modifications.
+    #[default]
+    Any,
+    /// A form is in scope only when it carries every listed modification.
+    All,
+}
+
+/// Which candidates the prescreen scores (`prescreen.retrieval`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenRetrieval {
+    /// Score every candidate (the measured recommended mode).
+    #[default]
+    All,
+    /// Retrieve candidates through database-free tags first: a candidate is retrieved when
+    /// one of its trimers, in its own residue states, was observed in an eligible spectrum.
+    /// Candidates without such evidence take the rescue route when `rescue` is on.
+    Tags,
+}
+
+/// How modification siblings share evidence (`prescreen.localization`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenLocalization {
+    /// Every form keeps its own score.
+    #[default]
+    Own,
+    /// Family support: every form of one backbone with the same modification composition,
+    /// charge and label takes the family's best score, so compatible localizations and ties
+    /// pass or fail together. Support is kept separate from localization; no site is chosen.
+    FamilySupport,
+    /// Keep only forms whose own score equals the family best (ties kept). Measured to lose
+    /// modified references in the prototype; available for comparison only.
+    BestSite,
+}
+
+/// Fragment-trace pooling mode (`prescreen.trace.pooling`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenPooling {
+    /// Bounded mass clusters over the pooled scans (max - min <= `cluster_da`), kept when seen
+    /// in at least `min_detections` scans.
+    #[default]
+    Merged,
+    /// Every pooled peak as its own feature, for comparison with merging.
+    Unmerged,
+}
+
+/// Which trace evidence the trace component scores (`prescreen.trace.score`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescreenTraceScore {
+    /// Tag coherence: for each candidate trimer, the best (minimum pairwise trace cosine of the
+    /// four path features x whole-path fit) in a pool; summed over distinct trimers.
+    #[default]
+    TagCoherence,
+    /// Disconnected ladders: candidate fragments matched to pooled features, counted when their
+    /// trace is compatible (cosine >= `min_quality`) with the most intense matched feature.
+    CoherentFragments,
+}
+
+/// Database-free tag discovery used by retrieval and the optional evidence components.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrescreenTagsConfig {
+    /// Neutral residue-mass tolerance of a tag edge (Da); `edge_tol_da / z` in m/z.
+    pub edge_tol_da: f64,
+    /// Highest fragment charge of a tag edge.
+    pub max_charge: i32,
+    /// Also allow two-residue gap steps; every compatible residue pair is kept as an
+    /// alternative and gapped three-peak ladders are keyed separately from four-peak ones.
+    pub gap_edges: bool,
+    /// Sigma of the whole-path soft weight `exp(-0.5 (rms / sigma)^2)` (Da).
+    pub rms_sigma_da: f64,
+    /// Variable states added to the chemistry configuration's alphabet, `RESIDUE:Name`.
+    pub extra_mods: Vec<String>,
+    /// Positioned retrieval: a candidate is retrieved only by a tag whose ladder starts at one
+    /// of its own b or y fragment masses (+/- 0.01 Da), not by the same trimer anywhere in the
+    /// spectrum. Much more specific in dense spectra.
+    pub positioned: bool,
+    /// Residue steps of a positioned ladder: 3 (four consecutive fragments, the default) or 2
+    /// (three consecutive fragments, more permissive).
+    pub positioned_residues: usize,
+}
+impl Default for PrescreenTagsConfig {
+    fn default() -> Self {
+        Self {
+            edge_tol_da: 0.005,
+            max_charge: 2,
+            gap_edges: false,
+            rms_sigma_da: 0.003,
+            extra_mods: Vec::new(),
+            positioned: false,
+            positioned_residues: 3,
+        }
+    }
+}
+
+/// Blind neutral-mass hypotheses from tag paths and complementary peaks, with optional MS1.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrescreenMassConfig {
+    /// Infer hypotheses and write `<out>.mass_hypotheses.parquet`.
+    pub enabled: bool,
+    /// Spectra sampled for inference (seeded); 0 = every spectrum (expensive).
+    pub sample_spectra: usize,
+    /// Look for the monoisotopic and +1 isotope peaks in MS1 scans within `ms1_rt_s`.
+    pub ms1: bool,
+    pub ms1_rt_s: f64,
+    /// MS1 tolerance: max(0.005 Da, this many ppm).
+    pub ms1_ppm: f64,
+    /// Drop hypotheses without an MS1 link. A hard gate; off by default.
+    pub require_ms1: bool,
+    /// Weight of the candidate mass-support component in the combined score; 0 = report only.
+    pub bonus: f64,
+}
+impl Default for PrescreenMassConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_spectra: 512,
+            ms1: false,
+            ms1_rt_s: 2.0,
+            ms1_ppm: 10.0,
+            require_ms1: false,
+            bonus: 0.0,
+        }
+    }
+}
+
+/// Fragment traces over consecutive same-window scans.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrescreenTraceConfig {
+    /// Compute the trace component (reported in the scores table).
+    pub enabled: bool,
+    /// Consecutive same-window scans per pool.
+    pub scans: usize,
+    /// Maximum m/z range (max - min) of one merged cluster.
+    pub cluster_da: f64,
+    /// Scans a merged cluster must be detected in.
+    pub min_detections: usize,
+    pub pooling: PrescreenPooling,
+    pub score: PrescreenTraceScore,
+    /// Trace cosine counted as compatible by `coherent_fragments`.
+    pub min_quality: f64,
+    /// Weight of the trace component in the combined score; 0 = report only.
+    pub bonus: f64,
+}
+impl Default for PrescreenTraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scans: 7,
+            cluster_da: 0.01,
+            min_detections: 2,
+            pooling: PrescreenPooling::Merged,
+            score: PrescreenTraceScore::TagCoherence,
+            min_quality: 0.6,
+            bonus: 0.0,
+        }
+    }
+}
+
+/// Fragment-rarity candidate prescreen (`mumdia prescreen`, and `run`/`run-experiment` when
+/// `enabled`). Each candidate is scored on the spectra of its own isolation window inside its
+/// calibrated RT bounds: its b/y fragments at charges `1..=min(max_frag_charge, z)`, in both the
+/// forward and the fully reversed sequence, are matched to the observed peaks within
+/// `frag_tol_da`; each matched peak counts once, weighted by `-ln p`, where `p` is the share of
+/// that window's spectra with a peak within +/-0.01 Da of it (0.01 Da bins, spectrum-only,
+/// no identifications), and by `low_mz_weight` below `low_mz_threshold`; the sum is divided by
+/// the square root of the peptide length; the candidate's score is the maximum over its
+/// eligible spectra. A cutoff is the `target` quantile ("higher" method) of the scores of a
+/// seeded calibration half of the in-scope candidates, labels never used; a candidate is kept
+/// when its score exceeds it. Targets and decoys are scored by the identical rule, each on its
+/// own sequence, m/z and RT window. Default off.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrescreenConfig {
+    /// Run the prescreen inside `run` / `run-experiment`, between rt-im-train and extract, and
+    /// extract only its survivors. Default false.
+    pub enabled: bool,
+    /// Calibration preset; `custom` takes `target`.
+    pub preset: PrescreenPreset,
+    /// Calibration rejection target in (0, 1) when `preset = "custom"`.
+    pub target: f64,
+    /// Seed of the calibration/reporting split.
+    pub seed: u64,
+    /// Fewer in-scope calibration candidates than this bypasses the filter (everything kept),
+    /// with the reason in the report.
+    pub min_calibration: usize,
+    pub scope: PrescreenScope,
+    /// `RESIDUE:UniModName` entries defining `scope = "modified"`, e.g. `M:Oxidation`.
+    pub scope_mods: Vec<String>,
+    pub scope_match: PrescreenScopeMatch,
+    /// Most intense peaks per MS2 used for both the rarity histogram and the matching; 0 (the
+    /// default) uses every positive peak. 300 is the capped comparison setting.
+    pub top_peaks: usize,
+    /// Candidate fragment matching tolerance, absolute m/z (Da).
+    pub frag_tol_da: f64,
+    /// Highest fragment charge; each candidate uses `1..=min(this, precursor charge)`.
+    pub max_frag_charge: i32,
+    /// Matched peaks below this m/z are weighted by `low_mz_weight`.
+    pub low_mz_threshold: f64,
+    pub low_mz_weight: f64,
+    /// Also score the fully reversed sequence and keep the larger score, as the measured
+    /// prototype did. The same rule applies to targets and decoys.
+    pub both_orientations: bool,
+    /// Widen each candidate's calibrated RT bounds by this many seconds on both sides.
+    pub rt_slack_s: f64,
+    /// Crowding adjustment: divide each spectrum's score by (its peak count / the window's mean
+    /// peak count)^exponent, the ratio clamped to [0.25, 4]; 0 (default) = off, 0.25 = the
+    /// prototype's phase-11 setting.
+    pub crowding_exponent: f64,
+    /// Repeat bonus: `score / q95 + w * repeat / q95`, where `repeat` counts each matched
+    /// fragment as strongly as its weaker appearance in a neighbouring scan (two eligible scans,
+    /// 8 s); 0 (default) = off, 0.1 = the prototype's phase-11 setting.
+    pub repeat_bonus: f64,
+    /// Write the per-candidate scores beside the survivors (`<out>.scores.parquet`).
+    pub write_scores: bool,
+    /// Candidate retrieval before scoring. `all` (default) scores every candidate.
+    pub retrieval: PrescreenRetrieval,
+    /// With `retrieval = "tags"`, score candidates without tag evidence anyway (the permissive
+    /// rescue route) instead of dropping them. Default true.
+    pub rescue: bool,
+    /// With `retrieval = "tags"`, retrieve backbone families first and examine forms only in
+    /// retrieved families (delayed modification enumeration). Same retrieved set.
+    pub delayed_modforms: bool,
+    pub tags: PrescreenTagsConfig,
+    /// Weight of the complementary-ion component (prototype 0.25 measured); 0 = off.
+    pub complement_bonus: f64,
+    /// Weight of the tag-evidence component (spectrum rarity x path fit, each distinct trimer
+    /// once); 0 = off.
+    pub tag_bonus: f64,
+    /// Weight of the FASTA/library-side tag information, kept separate from the spectrum
+    /// side; 0 = off.
+    pub fasta_bonus: f64,
+    /// Weight of positioned flank support (an observed tag whose ladder endpoints sit at the
+    /// candidate's b/y masses); 0 = off.
+    pub flank_bonus: f64,
+    pub mass_hypotheses: PrescreenMassConfig,
+    pub trace: PrescreenTraceConfig,
+    pub localization: PrescreenLocalization,
+    /// Database-free tag prefilter before any prediction, without retention times. Tags are
+    /// discovered from the spectra alone (`prescreen.tags`); a candidate is kept when one of its
+    /// trimers, in its own residue states and at a fragment charge it can carry, was observed in
+    /// its isolation window anywhere in the run, or when no trimer of it can be expressed in the
+    /// tag alphabet. No fragment score is computed. In FASTA mode only the kept peptidoforms go
+    /// to MS2PIP and DeepLC; with an imported library the kept candidates become a sub-library
+    /// before the seed search and the multi-head calibration. Everything after it uses the
+    /// predicted retention times as usual, including the fragment-rarity score when `enabled`.
+    /// Single-file `run` only for now. Default false.
+    pub tag_prefilter: bool,
+    /// The fragment-rarity score before any prediction and without retention times: every
+    /// candidate is scored over the whole gradient of its isolation window, with the preset /
+    /// target and `crowding_exponent` of this block, and only the candidates kept go to
+    /// prediction (FASTA mode) or into the sub-library (imported library), as for
+    /// `tag_prefilter`; with both set a candidate must pass both. Uses no predicted fragment
+    /// intensity and no retention time. Measured on the 8-12-mer immunopeptidomics library
+    /// with `crowding_exponent = 0.25`: 54% removed, 99.0% of an unfiltered search's accepted
+    /// precursors kept (Astral HYE: 52% removed, 95.2% kept, so data-dependent). Single-file
+    /// `run` only. Default false.
+    pub score_before_prediction: bool,
+}
+impl Default for PrescreenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            preset: PrescreenPreset::Balanced,
+            target: 0.54,
+            seed: 20261003,
+            min_calibration: 100,
+            scope: PrescreenScope::All,
+            scope_mods: Vec::new(),
+            scope_match: PrescreenScopeMatch::Any,
+            top_peaks: 0,
+            frag_tol_da: 0.005,
+            max_frag_charge: 2,
+            low_mz_threshold: 300.0,
+            low_mz_weight: 0.5,
+            both_orientations: true,
+            rt_slack_s: 0.0,
+            crowding_exponent: 0.0,
+            repeat_bonus: 0.0,
+            write_scores: false,
+            retrieval: PrescreenRetrieval::All,
+            rescue: true,
+            delayed_modforms: false,
+            tags: t(),
+            complement_bonus: 0.0,
+            tag_bonus: 0.0,
+            fasta_bonus: 0.0,
+            flank_bonus: 0.0,
+            mass_hypotheses: t(),
+            trace: t(),
+            localization: PrescreenLocalization::Own,
+            tag_prefilter: false,
+            score_before_prediction: false,
+        }
+    }
+}
+
+impl PrescreenConfig {
+    /// The calibration rejection target in force: the preset's, or `target` for `custom`.
+    pub fn effective_target(&self) -> f64 {
+        self.preset.target().unwrap_or(self.target)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DigestConfig {
@@ -1176,6 +1538,20 @@ pub struct ExtractConfig {
     /// The rolling distinct-fragment count (`apex_count_window`) still gates which scans
     /// qualify in both modes.
     pub apex_evidence_rank: bool,
+    /// Choose the apex by intensity INSIDE the region the fragment count selects. The
+    /// qualifying scans (rolling distinct-fragment count within `apex_count_tol` of its
+    /// maximum) are widened by the rolling half-width (`apex_count_window / 2`), and the
+    /// apex is the scan in that region with the largest observed intensity of the top-K
+    /// predicted fragments (`apex_top_fragments`, 3 by default), times the RT prior when
+    /// it is on. The count still decides WHERE the peptide elutes, so a bright
+    /// interferent outside the sustained-evidence region cannot take the apex; inside it,
+    /// intensity decides WHICH scan. Without it the count also picks the scan, and on a
+    /// tailing peak the rolling count is largest after the intensity maximum: measured on
+    /// Astral REP1 (`apex_count_window` 5), the summed fragment intensity peaked one scan
+    /// BEFORE the chosen apex for 41% of the accepted precursors and one scan after for
+    /// 6%; recomputed with this rule, 85% at the apex, 6% and 5% either side. Default
+    /// false; benchmark-gated.
+    pub apex_refine_intensity: bool,
     /// Emit the four gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`,
     /// `gate_coelution`, `gate_spectral_entropy`) as extra `psms.parquet` columns,
     /// for the offline gate-metric comparison. Default `false` (diagnostic sidecar,
@@ -1264,9 +1640,10 @@ impl Default for ExtractConfig {
             // (which decides the pre-FDR competition winner), `rt_error_abs`,
             // `log_apex_intensity`, and quant's integration centre.
             apex_evidence_rank: true,
-            emit_gate_diagnostics: false, // diagnostic gate-score columns; off in production
+            apex_refine_intensity: false,     // benchmark-gated
+            emit_gate_diagnostics: false,     // diagnostic gate-score columns; off in production
             gate_mode: GateMode::ApexPearson, // legacy single-scan intensity Pearson
-            gate_coelution_min: 0.5,      // used only by GateMode::Combined
+            gate_coelution_min: 0.5,          // used only by GateMode::Combined
         }
     }
 }
@@ -1325,16 +1702,17 @@ pub struct FeaturesConfig {
     /// scan below `bound_peak_fraction` (brittle on jagged/gappy profiles); 1 bridges
     /// a single-scan dip (DIA sampling gap / noise), giving steadier boundaries.
     pub bound_peak_grace: usize,
-    /// Elution-peak boundary source. When true (default) a single set of left/right
-    /// half-widths (seconds) is learned once from the confident seed PSMs
-    /// (`spectrum_q <= 0.01`, target-only, the same set that anchors RT calibration /
-    /// DeepLC fine-tune) and applied to EVERY candidate around its own apex. This
-    /// removes per-candidate boundary manipulation so a decoy is scored over a real-
-    /// peptide-width window centred on its apex. When false, each candidate detects its
-    /// own peak boundary from its top-3-predicted-fragment profile (per-candidate,
-    /// but noisy/manipulable for chimeric decoys; the legacy behaviour). If the seed
-    /// yields < 20 confident anchors the stage logs a warning and falls back to
-    /// per-candidate detection for that run.
+    /// Elution-peak boundary source. When false (default since 2026-10-04) each
+    /// candidate detects its own peak boundary from its top-3-predicted-fragment
+    /// profile. When true, a single set of left/right half-widths (seconds) is learned
+    /// once from the confident seed PSMs (`spectrum_q <= 0.01`, target-only, the set
+    /// that anchors RT calibration) and applied to EVERY candidate around its own apex,
+    /// so a peptide whose peak is wider than the median is cut short. The shared width
+    /// was introduced to stop a chimeric decoy from fitting its own boundaries; the
+    /// entrapment measurement below shows no FDR cost from per-candidate bounds.
+    /// Measured 2026-10-03 (doxy, 5 NN seeds per arm, benchmark config): per-candidate bounds gave Astral REP1 on the HYE library +2.20% peptides at 1% (Welch t +15.7) and the Orbitrap AIF entrapment run +0.17% (t +0.9) at an unchanged entrapment FDP (0.989% -> 1.000%, 2 SE 0.039); the share of IDs whose above-half-maximum peak extends past the bounds fell from 20% / 26% (left / right) to 2% / 6% on Astral. If the seed yields < 20 confident
+    /// anchors when true, the stage logs a warning and falls back to per-candidate
+    /// detection for that run.
     pub bound_from_confident: bool,
     /// Percentile (0-100) of the confident-set half-widths taken as the global left/
     /// right elution half-width when `bound_from_confident` is true. 50 = median
@@ -1381,7 +1759,7 @@ impl Default for FeaturesConfig {
             bound_features: true,
             bound_peak_fraction: 1.0 / 3.0,
             bound_peak_grace: 0, // stop at first sub-threshold scan (legacy)
-            bound_from_confident: true, // fixed feature window from confident-seed norm
+            bound_from_confident: false, // per-candidate elution bounds (2026-10-04)
             bound_confident_pct: 50.0, // median confident half-width
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
             chrom_loaders: 3,
@@ -1613,7 +1991,13 @@ pub struct QuantConfig {
     /// identification apex instead of the descent-walk window (`bound_peak`
     /// window ignored; falls back to it when the apex is unknown). A fixed narrow
     /// window is far less sensitive to interference in the peak wings than the
-    /// walked bounds. 0 (default) = off.
+    /// walked bounds. Default 3 (seven samples) since 2026-10-04; 0 restores the walked
+    /// window. Measured on the six-file Astral HYE experiment (one seed, 63,141
+    /// precursors quantified in at least 2 runs per condition): median |log2 ratio
+    /// error| 0.266 -> 0.163, species-equal 0.322 -> 0.201, median CV 0.19 -> 0.10, the
+    /// identifications unchanged. The width is in samples of the precursor's window, so
+    /// it scales with the cycle time; check it on an acquisition with much wider or
+    /// narrower peaks.
     pub fixed_scan_halfwidth: usize,
     /// Subtract a per-fragment local background before integrating (fixed-scan
     /// window only). The background is the `baseline_quantile` quantile of the
@@ -1657,7 +2041,7 @@ impl Default for QuantConfig {
             q_filter: QuantQColumn::PeptideQ,
             interference_envelope: false, // apex-outward interference envelope off by default
             fragment_selection: FragmentSelection::ObservedArea,
-            fixed_scan_halfwidth: 0,
+            fixed_scan_halfwidth: 3, // fixed +/-3-sample window (2026-10-04)
             baseline_subtract: false,
             baseline_flank_scans: 12,
             baseline_quantile: 0.25,
@@ -2421,6 +2805,7 @@ impl Default for GroupsConfig {
 pub struct Config {
     pub convert: ConvertConfig,
     pub prescan: PrescanConfig,
+    pub prescreen: PrescreenConfig,
     pub rng_seed: u64,
     pub digest: DigestConfig,
     pub peptidoforms: PeptidoformsConfig,
@@ -2445,6 +2830,7 @@ impl Default for Config {
             rng_seed: 0,
             convert: t(),
             prescan: t(),
+            prescreen: t(),
             digest: t(),
             peptidoforms: t(),
             predict_frag: t(),
@@ -3001,6 +3387,126 @@ impl Config {
                 )));
             }
         }
+        {
+            let p = &self.prescreen;
+            let target = p.effective_target();
+            if !target.is_finite() || target <= 0.0 || target >= 1.0 {
+                return Err(Invalid(format!(
+                    "prescreen.target must be in (0, 1) (got {target}); it is the share of the \
+                     calibration scores rejected"
+                )));
+            }
+            for (name, value) in [
+                ("prescreen.frag_tol_da", p.frag_tol_da),
+                ("prescreen.low_mz_weight", p.low_mz_weight),
+            ] {
+                if !value.is_finite() || value <= 0.0 {
+                    return Err(Invalid(format!(
+                        "{name} must be finite and > 0 (got {value})"
+                    )));
+                }
+            }
+            for (name, value) in [
+                ("prescreen.low_mz_threshold", p.low_mz_threshold),
+                ("prescreen.rt_slack_s", p.rt_slack_s),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(Invalid(format!(
+                        "{name} must be finite and >= 0 (got {value})"
+                    )));
+                }
+            }
+            if p.enabled && self.groups.window_groups > 1 {
+                return Err(Invalid(
+                    "prescreen.enabled is not supported with groups.window_groups > 1 yet; run \
+                     `mumdia prescreen` per band or disable one of the two"
+                        .into(),
+                ));
+            }
+            for (name, value) in [
+                ("prescreen.complement_bonus", p.complement_bonus),
+                ("prescreen.crowding_exponent", p.crowding_exponent),
+                ("prescreen.repeat_bonus", p.repeat_bonus),
+                ("prescreen.tag_bonus", p.tag_bonus),
+                ("prescreen.fasta_bonus", p.fasta_bonus),
+                ("prescreen.flank_bonus", p.flank_bonus),
+                ("prescreen.mass_hypotheses.bonus", p.mass_hypotheses.bonus),
+                ("prescreen.trace.bonus", p.trace.bonus),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(Invalid(format!(
+                        "{name} must be finite and >= 0 (got {value})"
+                    )));
+                }
+            }
+            for (name, value) in [
+                ("prescreen.tags.edge_tol_da", p.tags.edge_tol_da),
+                ("prescreen.tags.rms_sigma_da", p.tags.rms_sigma_da),
+                ("prescreen.trace.cluster_da", p.trace.cluster_da),
+                (
+                    "prescreen.mass_hypotheses.ms1_ppm",
+                    p.mass_hypotheses.ms1_ppm,
+                ),
+                (
+                    "prescreen.mass_hypotheses.ms1_rt_s",
+                    p.mass_hypotheses.ms1_rt_s,
+                ),
+            ] {
+                if !value.is_finite() || value <= 0.0 {
+                    return Err(Invalid(format!(
+                        "{name} must be finite and > 0 (got {value})"
+                    )));
+                }
+            }
+            if !(2..=3).contains(&p.tags.positioned_residues) {
+                return Err(Invalid(format!(
+                    "prescreen.tags.positioned_residues must be 2 or 3 (got {})",
+                    p.tags.positioned_residues
+                )));
+            }
+            if p.tags.max_charge < 1 || p.trace.scans < 1 || p.trace.min_detections < 1 {
+                return Err(Invalid(
+                    "prescreen.tags.max_charge, prescreen.trace.scans and \
+                     prescreen.trace.min_detections must be >= 1"
+                        .into(),
+                ));
+            }
+            if p.delayed_modforms && p.retrieval != PrescreenRetrieval::Tags {
+                return Err(Invalid(
+                    "prescreen.delayed_modforms needs prescreen.retrieval = \"tags\"".into(),
+                ));
+            }
+            if p.max_frag_charge < 1 {
+                return Err(Invalid(format!(
+                    "prescreen.max_frag_charge must be >= 1 (got {})",
+                    p.max_frag_charge
+                )));
+            }
+            if p.scope == PrescreenScope::Modified && p.scope_mods.is_empty() {
+                return Err(Invalid(
+                    "prescreen.scope = \"modified\" needs prescreen.scope_mods (e.g. \
+                     [\"M:Oxidation\"])"
+                        .into(),
+                ));
+            }
+            for m in &p.scope_mods {
+                let ok = m
+                    .split_once(':')
+                    .map(|(r, n)| {
+                        !n.is_empty()
+                            && (r == "n"
+                                || r == "c"
+                                || (r.len() == 1 && r.as_bytes()[0].is_ascii_uppercase()))
+                    })
+                    .unwrap_or(false);
+                if !ok {
+                    return Err(Invalid(format!(
+                        "prescreen.scope_mods entry {m:?} must be RESIDUE:UniModName, e.g. \
+                         M:Oxidation (n/c for the termini)"
+                    )));
+                }
+            }
+        }
         for (name, value) in [
             ("prescan.rt_slack_s", self.prescan.rt_slack_s),
             ("extract.demix_lambda", self.extract.demix_lambda),
@@ -3121,12 +3627,12 @@ mod tests {
         assert_eq!(c.quant.baseline_flank_scans, 8);
         assert_eq!(c.quant.baseline_quantile, 0.5);
 
-        // The defaults must reproduce the pre-2026-08 integration exactly: neither fixed
-        // form on, ranking by observed area, no baseline. A config written before these
-        // fields existed therefore quantifies as it did before.
+        // Defaults: the fixed +/-3-sample window since 2026-10-04 (seconds form off),
+        // ranking by observed area, no baseline. `fixed_scan_halfwidth: 0` restores the
+        // walked window a config written before 2026-10-04 quantified with.
         let d = QuantConfig::default();
         assert_eq!(d.fragment_selection, FragmentSelection::ObservedArea);
-        assert_eq!(d.fixed_scan_halfwidth, 0);
+        assert_eq!(d.fixed_scan_halfwidth, 3);
         assert_eq!(d.fixed_window_s, 0.0);
         assert!(!d.baseline_subtract);
         assert_eq!(
@@ -3157,6 +3663,9 @@ mod tests {
             "configs/examples/native.json",
             "configs/examples/fasta-sidecars.json",
             "configs/examples/diann-library.json",
+            "configs/examples/prescreen-balanced.json",
+            "configs/examples/prescreen-oxidation.json",
+            "configs/examples/prescreen-components.json",
             "docker/config.dia.json",
             "docker/config.diann-lib.json",
         ] {
@@ -3164,8 +3673,10 @@ mod tests {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue; // absent in some checkout layouts
             };
-            Config::from_json(&text)
+            let c = Config::from_json(&text)
                 .unwrap_or_else(|e| panic!("shipped config {name} does not parse: {e}"));
+            c.validate()
+                .unwrap_or_else(|e| panic!("shipped config {name} does not validate: {e}"));
         }
     }
 

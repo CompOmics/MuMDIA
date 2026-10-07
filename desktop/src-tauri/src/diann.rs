@@ -891,6 +891,135 @@ pub struct BuildRequest {
     /// Variable Oxidation of methionine.
     #[serde(default = "d_true")]
     pub oxidation: bool,
+    /// The Search screen's full modification choice. When both lists are empty the two
+    /// flags above decide, which is how every earlier request (and cache entry) reads.
+    #[serde(default)]
+    pub fixed_mods: Vec<ModSite>,
+    #[serde(default)]
+    pub variable_mods: Vec<ModSite>,
+    /// Variable modifications per peptide (DIA-NN `--var-mods`).
+    #[serde(default = "d_max_var")]
+    pub max_variable_mods: u32,
+}
+
+/// One modification on one residue, by catalogue name.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ModSite {
+    pub name: String,
+    pub residue: char,
+}
+
+/// The modifications a request asks for, normalised: catalogue order is irrelevant, the
+/// two legacy flags become sites, and duplicates go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModPlan {
+    pub fixed: Vec<ModSite>,
+    pub variable: Vec<ModSite>,
+    pub max_variable: u32,
+}
+
+fn site(name: &str, residue: char) -> ModSite {
+    ModSite {
+        name: name.into(),
+        residue,
+    }
+}
+
+impl ModPlan {
+    pub fn of(req: &BuildRequest) -> Result<Self, String> {
+        let (mut fixed, mut variable) = if req.fixed_mods.is_empty() && req.variable_mods.is_empty()
+        {
+            (
+                if req.carbamidomethyl {
+                    vec![site("Carbamidomethyl", 'C')]
+                } else {
+                    vec![]
+                },
+                if req.oxidation {
+                    vec![site("Oxidation", 'M')]
+                } else {
+                    vec![]
+                },
+            )
+        } else {
+            (req.fixed_mods.clone(), req.variable_mods.clone())
+        };
+        for m in fixed.iter().chain(&variable) {
+            if crate::mods::lookup(&m.name).is_none() {
+                return Err(format!(
+                    "{} is not a modification MuMDIA knows by name",
+                    m.name
+                ));
+            }
+            if !m.residue.is_ascii_uppercase() {
+                return Err(format!("{} on '{}': not a residue", m.name, m.residue));
+            }
+        }
+        fixed.sort();
+        fixed.dedup();
+        variable.sort();
+        variable.dedup();
+        Ok(Self {
+            fixed,
+            variable,
+            max_variable: req.max_variable_mods,
+        })
+    }
+
+    /// The selection every library before the full choice was built with: carbamidomethyl
+    /// on C fixed and oxidation on M variable, each optional, one variable per peptide. Its
+    /// cache key, arguments and import are exactly the earlier ones.
+    pub fn is_legacy(&self) -> bool {
+        self.fixed
+            .iter()
+            .all(|m| *m == site("Carbamidomethyl", 'C'))
+            && self.variable.iter().all(|m| *m == site("Oxidation", 'M'))
+            && (self.variable.is_empty() || self.max_variable == 1)
+    }
+
+    /// Canonical text for the cache key.
+    fn key(&self) -> String {
+        let list = |v: &[ModSite]| {
+            v.iter()
+                .map(|m| format!("{}@{}", m.name, m.residue))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "fixed={};var={};max={}",
+            list(&self.fixed),
+            list(&self.variable),
+            self.max_variable
+        )
+    }
+
+    /// `name -> residues` in name order, for one DIA-NN argument per modification.
+    fn grouped(v: &[ModSite]) -> Vec<(&'static crate::mods::Modification, String)> {
+        let mut by: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
+        for m in v {
+            by.entry(m.name.as_str()).or_default().push(m.residue);
+        }
+        by.into_iter()
+            .filter_map(|(n, r)| crate::mods::lookup(n).map(|m| (m, r)))
+            .collect()
+    }
+
+    /// The UniMod accessions the import must keep.
+    pub fn unimod_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self
+            .fixed
+            .iter()
+            .chain(&self.variable)
+            .filter_map(|m| crate::mods::lookup(&m.name).map(|c| c.unimod))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+}
+
+fn d_max_var() -> u32 {
+    1
 }
 
 fn d_missed() -> u32 {
@@ -942,9 +1071,17 @@ const RECIPE_VERSION: u32 = 2;
 
 pub fn library_cache_dir(req: &BuildRequest, diann_version: &str) -> Result<PathBuf, String> {
     use sha2::{Digest, Sha256};
+    let plan = ModPlan::of(req)?;
     let fasta = std::fs::read(&req.fasta).map_err(|e| format!("cannot read {}: {e}", req.fasta))?;
     let mut h = Sha256::new();
     h.update(&fasta);
+    // The standard selection keeps the key it always had, so libraries built before the
+    // full modification choice existed are still found; any other selection adds itself.
+    let (cam, ox) = if plan.is_legacy() {
+        (!plan.fixed.is_empty(), !plan.variable.is_empty())
+    } else {
+        (req.carbamidomethyl, req.oxidation)
+    };
     h.update(
         format!(
             "|recipe={}|mc={}|len={}-{}|z={}-{}|cam={}|ox={}|diann={}",
@@ -954,12 +1091,15 @@ pub fn library_cache_dir(req: &BuildRequest, diann_version: &str) -> Result<Path
             req.max_pep_len,
             req.min_charge,
             req.max_charge,
-            req.carbamidomethyl,
-            req.oxidation,
+            cam,
+            ox,
             diann_version,
         )
         .as_bytes(),
     );
+    if !plan.is_legacy() {
+        h.update(format!("|mods={}", plan.key()).as_bytes());
+    }
     let key = crate::components::hex(h.finalize());
     Ok(crate::components::data_dir()
         .join(LIBRARY_CACHE_NAME)
@@ -1008,6 +1148,7 @@ fn mark_cache_complete(dir: &Path, req: &BuildRequest, version: &str) {
         "charge": [req.min_charge, req.max_charge],
         "carbamidomethyl": req.carbamidomethyl,
         "oxidation": req.oxidation,
+        "modifications": ModPlan::of(req).ok().map(|p| p.key()),
     });
     if let Ok(text) = serde_json::to_string_pretty(&body) {
         let _ = std::fs::write(dir.join(CACHE_MARKER), text);
@@ -1295,7 +1436,7 @@ fn find_predicted_speclib(dir: &Path, stem: &str) -> Option<PathBuf> {
 /// missing here for the whole of this feature's life and nothing caught it, because
 /// the arguments were built inline and the only statement that they were right was a
 /// comment.
-fn predict_args(req: &BuildRequest, out_lib: &Path) -> Vec<String> {
+fn predict_args(req: &BuildRequest, plan: &ModPlan, out_lib: &Path) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--fasta".into(),
         req.fasta.clone(),
@@ -1328,14 +1469,36 @@ fn predict_args(req: &BuildRequest, out_lib: &Path) -> Vec<String> {
         "--max-pr-charge".into(),
         req.max_charge.to_string(),
     ];
-    if req.carbamidomethyl {
-        args.push("--unimod4".into());
+    // Fixed carbamidomethyl on C is DIA-NN's `--unimod4`; every other fixed modification is
+    // `--fixed-mod UniMod:<id>,<mass>,<residues>`, and each variable one `--var-mod` in the
+    // same form, under one `--var-mods <max per peptide>`. The standard selection produces
+    // exactly the arguments it always did.
+    for (m, residues) in ModPlan::grouped(&plan.fixed) {
+        if m.name == "Carbamidomethyl" && residues == "C" {
+            args.push("--unimod4".into());
+        } else {
+            args.push("--fixed-mod".into());
+            args.push(format!("UniMod:{},{:.6},{}", m.unimod, m.mass, residues));
+        }
     }
-    if req.oxidation {
+    if !plan.variable.is_empty() {
         args.push("--var-mods".into());
-        args.push("1".into());
-        args.push("--var-mod".into());
-        args.push("UniMod:35,15.994915,M".into());
+        args.push(plan.max_variable.to_string());
+        for (m, residues) in ModPlan::grouped(&plan.variable) {
+            args.push("--var-mod".into());
+            args.push(format!("UniMod:{},{:.6},{}", m.unimod, m.mass, residues));
+        }
+    }
+    // Trypsin does not cleave after a GlyGly-modified lysine, so its peptides carry the
+    // remnant on an internal K; DIA-NN documents this flag for that search.
+    if plan
+        .fixed
+        .iter()
+        .chain(&plan.variable)
+        .any(|m| m.name == "GlyGly" && m.residue == 'K')
+    {
+        args.push("--no-cut-after-mod".into());
+        args.push("UniMod:121".into());
     }
     args.push("--out-lib".into());
     args.push(out_lib.display().to_string());
@@ -1412,7 +1575,14 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
 
         // The command line recorded in README.md, so this reproduces what a user
         // following the written instructions would have run.
-        let args = predict_args(&req, &out_lib);
+        let plan = match ModPlan::of(&req) {
+            Ok(p) => p,
+            Err(e) => {
+                builder.fail(e);
+                return;
+            }
+        };
+        let args = predict_args(&req, &plan, &out_lib);
 
         let version_for_cache = status.version.clone();
         builder.log(format!("== DIA-NN: {}", status.version.unwrap_or_default()));
@@ -1499,15 +1669,28 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
         let frag = out_dir.join("lib_fragments.parquet");
 
         let steps: Vec<(&str, Vec<String>)> = vec![
-            (
-                "converting to the MuMDIA schema",
-                vec![
+            ("converting to the MuMDIA schema", {
+                let mut a = vec![
                     scripts.join("import_diann_lib.py").display().to_string(),
                     predicted.display().to_string(),
                     tgt_prec.display().to_string(),
                     tgt_frag.display().to_string(),
-                ],
-            ),
+                ];
+                // The importer keeps the standard accessions by default; any other
+                // selection names what DIA-NN was asked to place, or the precursors
+                // carrying it would be dropped as unmapped.
+                if !plan.is_legacy() {
+                    a.push("--keep-unimod".into());
+                    a.push(
+                        plan.unimod_ids()
+                            .iter()
+                            .map(|i| i.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    );
+                }
+                a
+            }),
             (
                 "adding the decoy population",
                 vec![
@@ -1601,6 +1784,9 @@ mod tests {
                 threads: 1,
                 carbamidomethyl: true,
                 oxidation: true,
+                fixed_mods: vec![],
+                variable_mods: vec![],
+                max_variable_mods: 1,
             },
         )
         .unwrap_err();
@@ -1969,6 +2155,9 @@ mod tests {
             threads: 8,
             carbamidomethyl: true,
             oxidation: true,
+            fixed_mods: vec![],
+            variable_mods: vec![],
+            max_variable_mods: 1,
         }
     }
 
@@ -2111,7 +2300,7 @@ mod tests {
         // it structurally misses those peptides -- 209 of DIA-NN's own 1% peptides on
         // the AIF benchmark, every one of them this form.
         let req = a_request("x.fasta");
-        let args = predict_args(&req, Path::new("out/lib"));
+        let args = predict_args(&req, &ModPlan::of(&req).unwrap(), Path::new("out/lib"));
         assert!(
             args.iter().any(|a| a == "--met-excision"),
             "the recipe must emit Met-excised peptides: {args:?}"
@@ -2127,6 +2316,94 @@ mod tests {
                 .map(|i| &args[i + 1]),
             Some(&"out/lib".to_string())
         );
+    }
+
+    #[test]
+    fn the_standard_selection_keeps_its_arguments_key_and_import() {
+        // The two flags and the same choice spelled as lists are one library: same
+        // arguments, same cache key, and the importer's default kept set.
+        let dir = std::env::temp_dir().join(format!("mumdia-diann-mods-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("a.fasta");
+        std::fs::write(
+            &fa,
+            b">sp|P1|X
+PEPTIDEK
+",
+        )
+        .unwrap();
+        let flags = a_request(fa.to_str().unwrap());
+        let mut lists = flags.clone();
+        lists.fixed_mods = vec![site("Carbamidomethyl", 'C')];
+        lists.variable_mods = vec![site("Oxidation", 'M')];
+        let (pf, pl) = (ModPlan::of(&flags).unwrap(), ModPlan::of(&lists).unwrap());
+        assert!(pf.is_legacy() && pl.is_legacy());
+        let out = Path::new("out/lib");
+        assert_eq!(
+            predict_args(&flags, &pf, out),
+            predict_args(&lists, &pl, out)
+        );
+        assert_eq!(
+            library_cache_dir(&flags, "DIA-NN 2.0").unwrap(),
+            library_cache_dir(&lists, "DIA-NN 2.0").unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wider_selection_becomes_dia_nn_modifications_and_a_new_key() {
+        let dir = std::env::temp_dir().join(format!("mumdia-diann-mods2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("a.fasta");
+        std::fs::write(
+            &fa,
+            b">sp|P1|X
+PEPTIDEK
+",
+        )
+        .unwrap();
+        let base = a_request(fa.to_str().unwrap());
+        let mut r = base.clone();
+        r.fixed_mods = vec![site("Carbamidomethyl", 'C')];
+        r.variable_mods = vec![
+            site("Phospho", 'T'),
+            site("Oxidation", 'M'),
+            site("Phospho", 'S'),
+            site("Phospho", 'Y'),
+            site("GlyGly", 'K'),
+        ];
+        r.max_variable_mods = 2;
+        let plan = ModPlan::of(&r).unwrap();
+        assert!(!plan.is_legacy());
+        let args = predict_args(&r, &plan, Path::new("out/lib"));
+        let after = |flag: &str| -> Vec<String> {
+            args.iter()
+                .enumerate()
+                .filter(|(_, a)| *a == flag)
+                .map(|(i, _)| args[i + 1].clone())
+                .collect()
+        };
+        assert!(args.iter().any(|a| a == "--unimod4"));
+        assert_eq!(after("--var-mods"), vec!["2".to_string()]);
+        assert_eq!(
+            after("--var-mod"),
+            vec![
+                "UniMod:121,114.042927,K".to_string(),
+                "UniMod:35,15.994915,M".to_string(),
+                "UniMod:21,79.966331,STY".to_string(),
+            ]
+        );
+        assert_eq!(plan.unimod_ids(), vec![4, 21, 35, 121]);
+        assert_eq!(after("--no-cut-after-mod"), vec!["UniMod:121".to_string()]);
+        assert_ne!(
+            library_cache_dir(&r, "DIA-NN 2.0").unwrap(),
+            library_cache_dir(&base, "DIA-NN 2.0").unwrap()
+        );
+        // A name outside the catalogue is refused before DIA-NN runs.
+        let mut bad = base.clone();
+        bad.variable_mods = vec![site("NotAModification", 'K')];
+        assert!(ModPlan::of(&bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

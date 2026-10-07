@@ -297,13 +297,17 @@ and by the smaller mass (`within_ppm`) respectively, so they disagree at the
 tolerance edge. Index probing must use `within_ppm`; do not substitute a
 `ppm_bounds` window there.
 
-**UniMod subset** (`mass.rs:13-32`), eleven names: `Carbamidomethyl`
-57.021463735, `Oxidation` 15.994914620, `Acetyl` 42.010564684, `Phospho`
-79.966331090, `Deamidated` 0.984016106, `Methyl` 14.015650064, `Dimethyl`
-28.031300128, `Carbamyl` 43.005813726, plus the three cysteine prenylation
-deltas (UniMod 44/48/376) `Farnesyl` 204.1878011, `GeranylGeranyl` 272.2504012,
-`Hydroxyfarnesyl` 220.1827157. An unknown name is
-`MassError::UnknownModification` (`mass.rs:265`), never a silent zero.
+**UniMod catalogue** (`crates/mumdia-core/src/modifications.json`, read by
+`mass::unimod_mass`): 34 residue modifications by UniMod PSI-MS name, accession and
+monoisotopic delta, among them `Carbamidomethyl` 57.021463735, `Oxidation` 15.994914620,
+`Acetyl` 42.010564684, `Phospho` 79.966331090, `Deamidated` 0.984016106, `Methyl`
+14.015650064, `Dimethyl` 28.031300128, `Carbamyl` 43.005813726 and the cysteine prenylation
+deltas `Farnesyl` 204.1878011, `GeranylGeranyl` 272.2504012, `Hydroxyfarnesyl` 220.1827157
+(the eleven names of the earlier table, at unchanged values), plus alkylation alternatives,
+oxidation products, acylations, methylations, `GlyGly`, `HexNAc`, `Hex`, `Sulfo`,
+`Palmitoyl` and `Biotin`. A unit test recomputes every delta from its elemental
+composition. The desktop Search tab lists the same file. Terminal modifications are not
+implemented. An unknown name is `MassError::UnknownModification`, never a silent zero.
 
 **ProForma-lite parse** (`parse_peptidoform`, `mass.rs:187-249`): optional
 N-terminal `[Mod]-`, residues each optionally followed by `[Mod]`, optional
@@ -792,7 +796,7 @@ requiring entrapment/target-decoy FDR validation before use.
 | `bound_features` | `true` | restrict trace features to the elution peak |
 | `bound_peak_fraction` | 1/3 | peak-boundary descent fraction of apex height |
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge |
-| `bound_from_confident` | `true` | learn one global peak width from confident seed PSMs |
+| `bound_from_confident` | `false` | `true` learns one global peak width from confident seed PSMs; per-candidate bounds are the default since 2026-10-04 (docs/10) |
 | `bound_confident_pct` | 50.0 | percentile of confident half-widths as the shared width |
 | `ms1_precursor_features` | `false` | **default-off** MS1 apex-isotope feature `ms1_isotope_height_corr`; it overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in. The name stays in the battery either way and returns 0.0 when off, so the vector length does not change |
 | `chrom_loaders` | 3 | chromatogram decode threads in the main feature pass, capped by `--threads` and by the chunk count. Changes time and memory only, never a value or a byte of the features table. The pass holds up to `chrom_loaders + 1` decoded chunks (about 0.92 GiB of traces each at the HYE shape, docs/27 section 3.4); `1` restores the previous single loader and its two resident chunks |
