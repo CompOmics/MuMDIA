@@ -116,6 +116,30 @@ echo "=== smoke: run again for determinism"
     --out-dir "$work/out2" --config "$cfg" --threads 2 > "$work/run2.log" 2>&1 \
     || { tail -20 "$work/run2.log"; exit 1; }
 
+# 4p. `prescreen.tag_prefilter`: the database-free tag prefilter runs on the peptidoforms
+#     before prediction, without retention times, and only its survivors are predicted; the
+#     same run must still identify most planted peptides.
+echo "=== smoke: tag prefilter before prediction"
+"$PY" - "$cfg" "$work/prescreen.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c["prescreen"] = {"tag_prefilter": True}
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_prescreen" --config "$work/prescreen.json" --threads 2 \
+    > "$work/prescreen.log" 2>&1 || { tail -20 "$work/prescreen.log"; exit 1; }
+grep -q "peptidoforms passed to prediction after the prediction prefilter" "$work/prescreen.log" \
+    || { echo "the tag prefilter did not run before prediction"; exit 1; }
+"$PY" - "$work/out_prescreen/peptides.tsv" "$work/planted.json" <<'PYEOF'
+import csv, json, sys
+got = {r["precursor"] for r in csv.DictReader(open(sys.argv[1]), delimiter="\t")}
+want = {p["peptidoform"] for p in json.load(open(sys.argv[2]))["planted"]}
+n = len(got & want)
+print(f"tag prefilter: {n}/{len(want)} planted peptides identified")
+assert n >= 100, n
+PYEOF
+
 # 4a. `predict_frag.library_cache`: the first FASTA run builds the library and stores it,
 #     the second finds it and skips digest, peptidoforms and predict-frag. Both must give
 #     the plain run's TSVs byte for byte, and a plain FASTA run names the --lib-* reuse.
