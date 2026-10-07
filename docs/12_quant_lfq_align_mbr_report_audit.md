@@ -309,7 +309,11 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    - **fixed window**, when `fixed_scan_halfwidth > 0` or `fixed_window_s > 0` and a
      finite apex is available: `trapezoid_fixed_opts` integrates a window centred on
      the apex, ignoring the walked bounds entirely. This is the mode the recorded
-     ProteoBench Astral submission used. The apex comes from `psms_scored`'s `apex_rt`
+     ProteoBench Astral submission used, and the default since 2026-10-04
+     (`fixed_scan_halfwidth = 3`): on the six-file Astral HYE experiment it took the
+     median |log2 ratio error| from 0.266 to 0.163, the species-equal error from 0.322
+     to 0.201 and the median CV from 0.19 to 0.10 at the same identifications. Set 0 for
+     the walked window. The apex comes from `psms_scored`'s `apex_rt`
      (the identification apex) and, when `bound_peak` is off, is taken directly from
      it rather than from the peak walk. Two forms, and they are **not** interchangeable:
      `fixed_scan_halfwidth = h` always integrates `2h+1` samples, while

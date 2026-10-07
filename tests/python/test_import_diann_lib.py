@@ -39,6 +39,9 @@ PRECURSORS = [
     ("K(UniMod:44)ITTENR", 2, 460.3, 25.0, "PRE1_HUMAN", 0, "noloss", ("y", "b", "y")),
     # dropped: UniMod:21 is not in the mapped set, so its ProForma name is unknown
     ("DROPME(UniMod:21)K", 2, 600.0, 40.0, "XXX_HUMAN", 0, "noloss", ("y", "b", "y")),
+    # dropped: a modification before the first residue is N-terminal, which the engine
+    # does not implement, even when its accession is kept
+    ("(UniMod:4)NTERMCK", 2, 610.0, 41.0, "NTM_HUMAN", 0, "noloss", ("y", "b", "y")),
     # dropped: DIA-NN's own decoy half
     ("DIANNDECOYK", 2, 700.0, 50.0, "YYY_HUMAN", 1, "noloss", ("y", "b", "y")),
     # dropped: every fragment carries a neutral loss
@@ -324,3 +327,32 @@ def test_imported_library_feeds_the_documented_decoy_builder_step(imported, tmp_
         "the importer's cardinality column did not survive the decoy builder"
     )
     assert set(read_columns(prec)["label"]) == {"target", "decoy"}
+
+
+def test_keep_unimod_names_the_kept_accessions(diann_lib, tmp_path):
+    """`--keep-unimod` keeps the named catalogue accessions with their ProForma names (the
+    desktop passes the modifications the user selected), and the N-terminal row stays
+    dropped."""
+    prec = tmp_path / "p.parquet"
+    frag = tmp_path / "f.parquet"
+    run_worker_ok("import_diann_lib.py", diann_lib, prec, frag, "--keep-unimod", "4,35,44,21")
+    assert_library_load_invariants(prec, frag, require_both_labels=False)
+    got = set(read_columns(prec)["peptidoform"])
+    assert "DROPME[Phospho]K" in got
+    assert not any("NTERM" in g for g in got)
+    assert not any("UniMod" in g for g in got)
+
+
+def test_keep_unimod_refuses_an_accession_outside_the_catalogue(diann_lib, tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "import_diann_lib.py"
+    r = subprocess.run(
+        [sys.executable, str(script), str(diann_lib), str(tmp_path / "p.parquet"),
+         str(tmp_path / "f.parquet"), "--keep-unimod", "4,99999"],
+        capture_output=True, text=True,
+    )
+    assert r.returncode != 0
+    assert "not in the modification catalogue" in (r.stderr + r.stdout)

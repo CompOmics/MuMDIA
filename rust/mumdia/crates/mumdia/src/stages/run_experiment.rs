@@ -449,6 +449,8 @@ fn finish_run(
         cfg: &cfg.rt_im_train,
         config_hash: ch,
     })?;
+    let survivors =
+        prescreen::run_if_enabled(cfg, ch, &co.ms2, Some(&co.ms1), lib_p, &windows, out)?;
     let psms = d("psms_extracted.parquet");
     let chrom = d("chromatograms.parquet");
     extract::run(extract::ExtractParams {
@@ -465,7 +467,7 @@ fn finish_run(
         mass_cal: Some(&format!("{seed}.masscal.json")),
         out_psms: &psms,
         out_chrom: &chrom,
-        restrict_candidates: None,
+        restrict_candidates: survivors.as_deref(),
         cfg: &cfg.extract,
         config_hash: ch,
     })?;
@@ -810,6 +812,17 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         ..p
     };
     let cfg = p.config;
+    if cfg.prescreen.tag_prefilter || cfg.prescreen.score_before_prediction {
+        anyhow::bail!(
+            "{}",
+            concat!(
+                "prescreen.tag_prefilter and score_before_prediction are supported by a single-file ",
+                "`run` only: an experiment ",
+                "shares one library across its runs, so the survivors of every run would have to ",
+                "be united first. Search the files one per `run`."
+            )
+        );
+    }
     preflight(&p)?;
     pre.step("preflight");
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());

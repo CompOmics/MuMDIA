@@ -12,6 +12,7 @@ pub mod peptidoforms;
 pub mod pool;
 pub mod predict_frag;
 pub mod prescan;
+pub mod prescreen;
 pub mod quant;
 pub mod report;
 pub mod rescore;
