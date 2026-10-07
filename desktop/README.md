@@ -348,6 +348,91 @@ The backend refuses two things rather than guessing: a pooled experiment with fe
 than two files, and the same path selected twice (which would search one file twice
 and pool the result with itself, inflating the evidence for those peptides).
 
+## Prescreen, bands and modifications on the Search screen
+
+Three engine settings that change how large a search is are on the Search screen, so
+that turning them on does not need a settings file. Each becomes a configuration path
+merged on top of the chosen preset through `derive_config`, the same route the digest
+fields take, and the engine validates the result before anything starts. With all three
+at their defaults (prescreen off, automatic bands that resolve to one band, the standard
+modifications) the preset reaches the engine unchanged in library mode.
+
+**Prescreen** (`prescreen.*`, docs/34). Off; before prediction without retention times
+(`score_before_prediction` with `crowding_exponent = 0.25`, the no-RT score docs/34
+measured); after the retention-time calibration (`enabled`); or the database-free tag
+prefilter (`tag_prefilter`). Light, balanced and stringent map to a target of 0.25 and
+to the `balanced` and `stringent` presets. The two modes before prediction are
+single-file only (`run-experiment` refuses them), and the mode after calibration cannot
+be combined with bands (config validation refuses it), so the screen refuses both
+combinations before a library is built or a run starts, and says which choice to change.
+
+**Bands** (`groups.window_groups`, `groups.parallel`, docs/33). Automatic, off, or a
+custom count. The automatic plan (`sizing::band_plan`) takes the machine's physical
+memory (`GlobalMemoryStatusEx` on Windows, `/proc/meminfo` and the cgroup v2 limit on
+Linux, `sysctl hw.memsize` on macOS), a budget of 60% of it and never more than all but
+6 GB, and a memory model fitted to the docs/33 peaks: about 4 GB per band plus about 2
+GB per million library precursors in the band (the 44.6M-precursor band of the 203M
+immunopeptidomics library peaked at 96 GB; the unbanded 10.9M HYE library at 16.5 GiB,
+so the model is conservative on tryptic data). It bands only when the unbanded estimate
+exceeds the budget, because bands repeat fixed work and do not change identifications,
+uses the fewest bands that fit, at most 64, and runs as many at once as the budget
+holds, below the thread count with at least four threads each. Automatic re-sizes the
+inputs at Start, so a plan computed before the last change cannot decide the run.
+"Automatic" that resolves to one band leaves the preset's own `groups` block alone;
+"Off" and "Custom" write it.
+
+The size comes from the library footer in library mode (`mumdia inspect`, rows only)
+and from the FASTA otherwise (`sizing::fasta_space`): a Trypsin/P digest with the
+screen's missed cleavages and lengths, N-terminal Met excision, every charge in range,
+one paired decoy per target, and each distinct peptide's modified forms counted exactly
+as the elementary symmetric sums of its sites' alternatives up to the variable maximum.
+On the E. coli FASTA with the engine defaults it gives 1,925,388 precursors against the
+engine's 1,922,388, in 0.23 s for a debug build. A prescreen before prediction scales
+the planned size by the fraction its strength is expected to keep.
+
+**Modifications** (`peptidoforms.fixed_mods`, `variable_mods`, `max_variable_mods`).
+The list is the engine's catalogue, `rust/mumdia/crates/mumdia-core/src/modifications.json`,
+embedded in both the engine's mass table and this application (`modifications`
+command), so every name offered is one the engine accepts and a new entry appears in
+both at once. Each residue chip cycles variable, fixed, not searched; the quick sets come
+from the same file; a filter narrows the list by name, residue, group or accession. Two
+fixed modifications on one residue, or a fixed and a variable one, are reported as the
+selection is made and refused at Start, because the peptidoform stage would refuse them
+mid-run. A DIA-NN build carries only carbamidomethyl on C and oxidation on M, which are
+what `BuildRequest` and the importer support, so any other selected modification with
+DIA-NN chosen is refused with the reason rather than dropped. The selection is
+remembered between sessions in browser storage, as a convenience only.
+
+Validated 2026-10-05: the Search screen driven in headless Edge with a mocked command
+bridge (catalogue, sets, filter, conflicts, the derived overrides at Start), and the
+derived configuration run end to end on the smoke fixture: the prescreen before
+prediction and two bands each identify the planted peptides as the plain run does
+(110 and 115 of 160 against 116). The fixture cannot judge a large modification set:
+with about 150 true peptides the `(d + 1) / t` floor puts one extra decoy peptide above
+1%, so that measurement is a real FASTA search.
+
+On the Orbitrap AIF E. coli file (`bench/prescreen/ps_mods.sh`, MS2PIP + DeepLC, `nn_torch`,
+stripped peptides at 1%, mean of 3 NN seeds, EPYC 9354, 64 threads):
+
+| arm | peptidoforms predicted | peptides at 1% | wall | peak RSS |
+|---|---|---|---|---|
+| carbamidomethyl C, oxidation M | 1,922,388 | 10,632 | 8:39 | 26.7 GB |
+| + Phospho STY, Acetyl K, Deamidated NQ | 8,750,640 | 9,987 | 38:37 | 89.6 GB |
+| the same + prescreen before prediction | 3,217,290 | 9,945 | 12:15 | 26.4 GB |
+
+The larger search space costs 6.1% of the peptides, which is the FDR price of 4.6x the
+candidates on a sample without enriched modifications. The prescreen before prediction
+then removes 63% of the peptidoforms before MS2PIP and DeepLC, for -0.4% peptides (seed
+spreads of 40-90), 3.2x less wall time and 3.4x less memory.
+
+DIA-NN builds take the same selection (`ModPlan` in `diann.rs`): carbamidomethyl C is
+`--unimod4`, every other modification `--fixed-mod` / `--var-mod UniMod:<id>,<mass>,<residues>`
+under `--var-mods <max>`, plus `--no-cut-after-mod UniMod:121` for GlyGly K. The standard
+selection keeps its arguments and cache key, so existing cached libraries are reused, and
+the importer is told which accessions to keep (`--keep-unimod`). Checked with DIA-NN 2.2.0
+on 60 E. coli proteins with Phospho STY, GlyGly K and Oxidation M: all 33,885 target
+precursors imported, and the decoy builder's mass check at 0.02 ppm median.
+
 ## Vendor formats
 
 The Search screen accepts vendor formats as well as mzML, because a user who has no

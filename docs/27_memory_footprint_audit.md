@@ -418,7 +418,7 @@ group per chunk. Three parts:
   `HashMap<&str, Vec<f64>>`, and the PIN is written row by row as chunks are
   computed.
 
-Cost: `bound_from_confident` (default on) needs the global elution half-widths
+Cost: `bound_from_confident` (when on; off by default since 2026-10-04) needs the global elution half-widths
 before the first feature, so it takes one extra streaming pass, which decodes but
 never copies the rows of non-confident candidates.
 

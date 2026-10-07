@@ -560,7 +560,7 @@ are listed so the documentation cannot imply a capability that is not there.
 | held-out RT window sizing | `rt_im_train.window_holdout_frac`, default off. Gained 1.1% of peptides with DeepLC 4.1.0 at an unchanged 0.98% decoy fraction, but lost 1.5% with the overfitting 4.0.0a2 model, so it interacts with retention-time model quality |
 | `compete.group_by = base_peptide` | the previous default, kept as an explicit peptide-level population. Never for a PTM or modification search: under it the modified form is deleted whenever an unmodified or alkylated sibling scores higher, which is usually (880,464 of 1,890,239 extracted candidates, 46.6%, on a modification-rich library; `peptidoform_charge`, the default since 2026-09-06, removed none) |
 | MBR tiers | `mbr.strategy` distinguishes only none from not-none. `mbr.rt_window_s`, `mbr.decoy_transfer`, and `mbr.requant_all` are accepted by the config but not wired; setting them changes nothing, and the engine warns that it did nothing |
-| fixed-window and library-ranked quantification | `quant.fragment_selection`, `fixed_scan_halfwidth`, `fixed_window_s`, and `baseline_subtract` all default to off pending entrapment validation |
+| library-ranked quantification and background subtraction | `quant.fragment_selection` and `baseline_subtract` default to off; the fixed window (`fixed_scan_halfwidth`, 3) is the default since 2026-10-04, and `fixed_window_s` stays off |
 | acquisition-specific peak caps | the shipped default is uncapped at both conversion entry points. A cap must come from a sweep on the acquisition it will be used on |
 | percolator rescoring | declared in the config enum and rejected by validation |
 

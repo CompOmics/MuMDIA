@@ -599,7 +599,10 @@ prior positions stable.
 
 ## bound_from_confident (elution-boundary calibration, `features.rs:658`)
 
-When `bound_from_confident` is true (the default), the stage learns one pair of
+`bound_from_confident` defaults to false since 2026-10-04: every candidate detects
+its own bounds with `elution_peak_rt_bounds`. Measured 2026-10-03 (doxy, 5 NN seeds per arm, benchmark config): per-candidate bounds gave Astral REP1 on the HYE library +2.20% peptides at 1% (Welch t +15.7) and the Orbitrap AIF entrapment run +0.17% (t +0.9) at an unchanged entrapment FDP (0.989% -> 1.000%, 2 SE 0.039); the share of IDs whose above-half-maximum peak extends past the bounds fell from 20% / 26% (left / right) to 2% / 6% on Astral.
+
+When `bound_from_confident` is true, the stage learns one pair of
 elution half-widths `(L, R)` in seconds from the confident-target seed set
 (`spectrum_q <= 0.01`, `label == "target"`; the same anchor set used for RT
 calibration and DeepLC fine-tune). For each confident candidate it detects the
@@ -684,7 +687,7 @@ variant no longer exists).
 | `bound_features` | true | restrict trace-based features to the elution peak instead of the whole extracted window; **gates only the Minimal/Rich `fragment_features` path** (the Extended Evidence always peak-bounds, see gotchas) |
 | `bound_peak_fraction` | 1/3 | peak-boundary threshold as a fraction of apex height (DIA-NN-style; matched DIA-NN RT bounds best) |
 | `bound_peak_grace` | 0 | consecutive sub-threshold scans to bridge before stopping (0 = stop at first miss; 1 bridges a single-scan dip) |
-| `bound_from_confident` | true | learn one global left/right half-width from the confident seed set and apply it to every candidate; false = per-candidate detection |
+| `bound_from_confident` | false | true = learn one global left/right half-width from the confident seed set and apply it to every candidate; false (default since 2026-10-04) = per-candidate detection |
 | `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
 | `chrom_loaders` | 3 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
 

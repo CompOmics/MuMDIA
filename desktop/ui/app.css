@@ -25,6 +25,8 @@
 }
 
 * { box-sizing: border-box; }
+/* `hidden` must win over a class that sets display (.row is flex, .grid2 is grid). */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0;
@@ -308,3 +310,20 @@ input[type="search"] {
 .filelist .fbad { color: var(--danger); font-size: 11.5px; flex: none; }
 
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* ── modification picker ──────────────────────────────────────────────── */
+#mod-filter { width: 100%; margin: 4px 0 8px; }
+.modlist { max-height: 300px; overflow-y: auto; border: 1px solid var(--rule); border-radius: var(--radius); }
+.modgroup { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--ink-faint); padding: 8px 10px 2px; position: sticky; top: 0; background: var(--panel); }
+.modrow { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 12px;
+  padding: 4px 10px; border-top: 1px solid var(--rule); }
+.modrow.on .mname { color: var(--accent); font-weight: 600; }
+.mname { font-size: 12.5px; }
+.mmass { font-size: 11.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums; margin-left: 6px; }
+.chips { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.chip { min-width: 26px; padding: 2px 6px; font: 600 12px ui-monospace, "Cascadia Mono", monospace;
+  border: 1px solid var(--rule-strong); border-radius: 5px; background: transparent; color: var(--ink-soft); cursor: pointer; }
+.chip:hover { border-color: var(--accent); }
+.chip.var { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.chip.fix { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }

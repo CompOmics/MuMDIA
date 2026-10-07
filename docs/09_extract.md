@@ -578,9 +578,25 @@ qualifies, then by a per-scan score:
   is `n_frag + sig_sum/(sig_sum+1)` times the prior, so the number of distinct
   co-eluting predicted fragments dominates and observed signature intensity only
   breaks sub-integer ties. This is interference-resistant in wide-window DIA
-  because intensity is chimeric. When false (default), the legacy
+  because intensity is chimeric. It is the default; when false, the legacy
   `sig_sum * prior` is used (`extract.rs:1902`), bit-identical to the pre-feature
-  behaviour.
+  behaviour. In practice the tie-break carries no intensity information:
+  `sig_sum` is an observed intensity in the thousands, so `sig_sum/(sig_sum+1)` is
+  about 0.9999 at every scan, and among scans of equal count the RT prior decides.
+- **Intensity inside the count region** (`apex_refine_intensity`, default false,
+  benchmark-gated): the qualifying scans, widened by the rolling half-width
+  (`apex_count_window / 2`), form the region where the peptide elutes; the apex is
+  the scan in that region with the largest signature intensity times the prior. The
+  count still decides where the peak is, intensity which scan is its top. Without
+  it the count also picks the scan, and on a tailing peak the rolling count is
+  largest after the intensity maximum. Measured on Astral REP1 with
+  `apex_count_window` 5 (88,092 accepted precursors, `bench/apex/apex_offset.py`): the summed fragment intensity
+  peaked one scan BEFORE the chosen apex for 41.1%, at it for 40.7% and one scan after
+  for 5.6%. A replica of the rule (`bench/apex/apex_replica.py`, reproducing the engine's apex
+  for 88,089 of 88,092) showed that neither the tie-break nor the prior causes it
+  (removing either moves the 41% to 40%), and that this rule puts 85% at the
+  intensity maximum with the rest symmetric (5.8% before, 5.1% after). Window 1 (the
+  engine default) has a smaller, opposite-signed spread (15% before, 11% after).
 
 `apex_intensity` reported is the full summed intensity of the winning scan group
 (`extract.rs:1907`), not the signature-only score.

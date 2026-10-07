@@ -9,27 +9,50 @@
 use crate::constants::{mass_to_mz, residue_mass, PROTON, WATER};
 use crate::error::MassError;
 
-/// A modification MuMDIA understands by name. MVP subset; names must be
+/// The modification catalogue, `modifications.json`: the one list both this mass table and
+/// the desktop Search tab read, so a name the app offers is always a name the engine accepts.
+pub const MODIFICATIONS_JSON: &str = include_str!("modifications.json");
+
+/// One catalogue entry: a UniMod PSI-MS name, its accession, its monoisotopic delta, and the
+/// residues the Search tab offers it on (the engine accepts the name on any residue).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct Modification {
+    pub name: String,
+    pub unimod: u32,
+    pub mass: f64,
+    pub residues: String,
+    pub group: String,
+}
+
+#[derive(serde::Deserialize)]
+struct Catalogue {
+    modifications: Vec<Modification>,
+}
+
+/// Every modification MuMDIA knows by name, in catalogue order.
+pub fn modifications() -> &'static [Modification] {
+    static CATALOGUE: std::sync::OnceLock<Vec<Modification>> = std::sync::OnceLock::new();
+    CATALOGUE.get_or_init(|| {
+        serde_json::from_str::<Catalogue>(MODIFICATIONS_JSON)
+            .expect("modifications.json is embedded at build time and checked by a unit test")
+            .modifications
+    })
+}
+
+/// A modification MuMDIA understands by name, from the catalogue above. Names must be
 /// UniMod/PSI-MS so the sidecar adapters map them (docs/05_digest_peptidoforms.md).
 pub fn unimod_mass(name: &str) -> Option<f64> {
-    let m = match name {
-        "Carbamidomethyl" => 57.021_463_735,
-        "Oxidation" => 15.994_914_620,
-        "Acetyl" => 42.010_564_684,
-        "Phospho" => 79.966_331_090,
-        "Deamidated" => 0.984_016_106,
-        "Methyl" => 14.015_650_064,
-        "Dimethyl" => 28.031_300_128,
-        "Carbamyl" => 43.005_813_726,
-        // Cysteine prenylation (UniMod 44/48/376). Deltas are the monoisotopic
-        // composition masses: Farnesyl C15H24, GeranylGeranyl C20H32,
-        // Hydroxyfarnesyl C15H24O. Enables a FASTA/imported prenylation search.
-        "Farnesyl" => 204.187_801_1,
-        "GeranylGeranyl" => 272.250_401_2,
-        "Hydroxyfarnesyl" => 220.182_715_7,
-        _ => return None,
-    };
-    Some(m)
+    static BY_NAME: std::sync::OnceLock<std::collections::BTreeMap<&'static str, f64>> =
+        std::sync::OnceLock::new();
+    BY_NAME
+        .get_or_init(|| {
+            modifications()
+                .iter()
+                .map(|m| (m.name.as_str(), m.mass))
+                .collect()
+        })
+        .get(name)
+        .copied()
 }
 
 /// Ion series MuMDIA scores in the MVP (b and y, docs/18_findings_and_decisions.md).
@@ -577,5 +600,106 @@ mod tests {
             "oxidation delta = {}",
             ox - plain_m
         );
+    }
+
+    #[test]
+    fn the_catalogue_keeps_the_masses_of_the_original_table() {
+        // The eleven names of the table this catalogue replaced, at the values it had, so
+        // moving the table into JSON changed no mass a search uses.
+        for (name, mass) in [
+            ("Carbamidomethyl", 57.021_463_735),
+            ("Oxidation", 15.994_914_620),
+            ("Acetyl", 42.010_564_684),
+            ("Phospho", 79.966_331_090),
+            ("Deamidated", 0.984_016_106),
+            ("Methyl", 14.015_650_064),
+            ("Dimethyl", 28.031_300_128),
+            ("Carbamyl", 43.005_813_726),
+            ("Farnesyl", 204.187_801_1),
+            ("GeranylGeranyl", 272.250_401_2),
+            ("Hydroxyfarnesyl", 220.182_715_7),
+        ] {
+            assert_eq!(unimod_mass(name), Some(mass), "{name}");
+        }
+        assert_eq!(unimod_mass("NotAModification"), None);
+    }
+
+    #[test]
+    fn every_catalogue_mass_matches_its_elemental_composition() {
+        // UniMod deltas recomputed from their compositions, to 1e-5 Da,
+        // so a typed mass that is off by a digit fails here rather than in a search.
+        const C: f64 = 12.0;
+        const H: f64 = 1.007_825_035;
+        const N: f64 = 14.003_074;
+        const O: f64 = 15.994_914_63;
+        const S: f64 = 31.972_070_7;
+        const P: f64 = 30.973_762;
+        let comp = |c: f64, h: f64, n: f64, o: f64, s: f64, p: f64| {
+            c * C + h * H + n * N + o * O + s * S + p * P
+        };
+        let expected = [
+            ("Carbamidomethyl", comp(2., 3., 1., 1., 0., 0.)),
+            ("Propionamide", comp(3., 5., 1., 1., 0., 0.)),
+            ("Carboxymethyl", comp(2., 2., 0., 2., 0., 0.)),
+            ("Nethylmaleimide", comp(6., 7., 1., 2., 0., 0.)),
+            ("Methylthio", comp(1., 2., 0., 0., 1., 0.)),
+            ("Oxidation", comp(0., 0., 0., 1., 0., 0.)),
+            ("Dioxidation", comp(0., 0., 0., 2., 0., 0.)),
+            ("Trioxidation", comp(0., 0., 0., 3., 0., 0.)),
+            ("Kynurenine", comp(-1., 0., 0., 1., 0., 0.)),
+            ("Deamidated", comp(0., -1., -1., 1., 0., 0.)),
+            ("Carbamyl", comp(1., 1., 1., 1., 0., 0.)),
+            ("Nitro", comp(0., -1., 1., 2., 0., 0.)),
+            ("Cysteinyl", comp(3., 5., 1., 2., 1., 0.)),
+            ("Glutathione", comp(10., 15., 3., 6., 1., 0.)),
+            ("Phospho", comp(0., 1., 0., 3., 0., 1.)),
+            ("Sulfo", comp(0., 0., 0., 3., 1., 0.)),
+            ("Acetyl", comp(2., 2., 0., 1., 0., 0.)),
+            ("Formyl", comp(1., 0., 0., 1., 0., 0.)),
+            ("Propionyl", comp(3., 4., 0., 1., 0., 0.)),
+            ("Butyryl", comp(4., 6., 0., 1., 0., 0.)),
+            ("Crotonyl", comp(4., 4., 0., 1., 0., 0.)),
+            ("Malonyl", comp(3., 2., 0., 3., 0., 0.)),
+            ("Succinyl", comp(4., 4., 0., 3., 0., 0.)),
+            ("Methyl", comp(1., 2., 0., 0., 0., 0.)),
+            ("Dimethyl", comp(2., 4., 0., 0., 0., 0.)),
+            ("Trimethyl", comp(3., 6., 0., 0., 0., 0.)),
+            ("GlyGly", comp(4., 6., 2., 2., 0., 0.)),
+            ("HexNAc", comp(8., 13., 1., 5., 0., 0.)),
+            ("Hex", comp(6., 10., 0., 5., 0., 0.)),
+            ("Palmitoyl", comp(16., 30., 0., 1., 0., 0.)),
+            ("Farnesyl", comp(15., 24., 0., 0., 0., 0.)),
+            ("GeranylGeranyl", comp(20., 32., 0., 0., 0., 0.)),
+            ("Hydroxyfarnesyl", comp(15., 24., 0., 1., 0., 0.)),
+            ("Biotin", comp(10., 14., 2., 2., 1., 0.)),
+        ];
+        let cat = modifications();
+        assert_eq!(
+            cat.len(),
+            expected.len(),
+            "every catalogue entry has a composition here"
+        );
+        for (name, mass) in expected {
+            let m = unimod_mass(name).unwrap_or_else(|| panic!("{name} missing"));
+            assert!(
+                (m - mass).abs() < 1e-5,
+                "{name}: catalogue {m}, composition {mass}"
+            );
+        }
+        let mut names: Vec<&str> = cat.iter().map(|m| m.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), cat.len(), "names are unique");
+        for m in cat {
+            assert!(!m.residues.is_empty(), "{} offers no residue", m.name);
+            for r in m.residues.bytes() {
+                assert!(
+                    crate::constants::residue_mass(r).is_some(),
+                    "{} lists unknown residue {}",
+                    m.name,
+                    r as char
+                );
+            }
+        }
     }
 }
