@@ -4,12 +4,16 @@ real species-flagged protein identifiers (e.g. ALBU_HUMAN, ..._YEAST, ..._ECOLI)
 needed for the ProteoBench species-ratio metric. Emits lib_precursors +
 lib_fragments; run make_shift_decoys.py afterwards to add the decoy population.
 
-Mapped modifications: Carbamidomethyl (UniMod:4), Oxidation (35), and the three
-cysteine prenylations Farnesyl (44), GeranylGeranyl (48), Hydroxyfarnesyl (376).
-Precursors carrying any other UniMod are dropped (their names are unmapped).
+Kept modifications, by default: Carbamidomethyl (UniMod:4), Oxidation (35), and the
+three cysteine prenylations Farnesyl (44), GeranylGeranyl (48), Hydroxyfarnesyl (376).
+`--keep-unimod 4,35,21,...` names the kept accessions instead; each must be in the
+modification catalogue (`_unimod.py`, the engine's `modifications.json`), which also
+gives the ProForma name. Precursors carrying any other UniMod are dropped, and so are
+precursors with a modification before their first residue, because the engine does not
+implement terminal modifications.
 
 Usage: python import_diann_lib.py <diann_lib.parquet> <out_precursors.parquet> <out_fragments.parquet>
-              [--charge-by-basic-residues]
+              [--charge-by-basic-residues] [--keep-unimod <id,id,...>]
 
 The library is read one parquet row group at a time, twice: a first pass collects the
 precursor table (one row per peptidoform/charge), the fragment counts and the fragment
@@ -35,22 +39,17 @@ import pyarrow.parquet as pq
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
 from _lib_io import narrow_table, sort_fragments_by_candidate, write_engine_parquet
+from _unimod import NAME_BY_UNIMOD
 
 
-# DIA-NN UniMod accession -> MuMDIA ProForma name. Carbamidomethyl/Oxidation are
-# the standard pair; the three cysteine prenylations (Farnesyl 44, GeranylGeranyl
-# 48, Hydroxyfarnesyl 376) enable a prenylation search. Each name must also exist
-# in the Rust `unimod_mass` table. Replacement is substring-exact including the
-# closing ")", so "(UniMod:4)" never matches inside "(UniMod:44)".
-_UNIMOD_TO_PROFORMA = {
-    "(UniMod:4)": "[Carbamidomethyl]",
-    "(UniMod:35)": "[Oxidation]",
-    "(UniMod:44)": "[Farnesyl]",
-    "(UniMod:48)": "[GeranylGeranyl]",
-    "(UniMod:376)": "[Hydroxyfarnesyl]",
-}
-# UniMod ids kept at import; any precursor carrying a mod outside this set is dropped.
-_KEPT_UNIMOD_IDS = ("4", "35", "44", "48", "376")
+# DIA-NN UniMod accession -> MuMDIA ProForma name, for every catalogue entry, so each
+# name exists in the engine's mass table by construction. Replacement is substring-exact
+# including the closing ")", so "(UniMod:4)" never matches inside "(UniMod:44)".
+_UNIMOD_TO_PROFORMA = {f"(UniMod:{i})": f"[{name}]" for i, name in NAME_BY_UNIMOD.items()}
+# UniMod ids kept at import unless `--keep-unimod` names others: the standard pair and the
+# three cysteine prenylations. Any precursor carrying a mod outside the kept set is dropped.
+_DEFAULT_KEPT_UNIMOD_IDS = ("4", "35", "44", "48", "376")
+_KEPT_UNIMOD_IDS = _DEFAULT_KEPT_UNIMOD_IDS
 
 
 def to_proforma(modseq):
@@ -58,6 +57,19 @@ def to_proforma(modseq):
     for unimod, name in _UNIMOD_TO_PROFORMA.items():
         s = s.replace(unimod, name)
     return s
+
+
+def parse_kept_ids(value):
+    """`--keep-unimod 4,35,21` -> ("4", "35", "21"), refusing an accession the catalogue
+    does not name: a kept id without a ProForma name would reach the engine as
+    `(UniMod:N)` text, which it cannot parse."""
+    ids = tuple(x.strip() for x in str(value).split(",") if x.strip())
+    if not ids:
+        raise SystemExit("--keep-unimod needs at least one UniMod accession")
+    unknown = [i for i in ids if not i.isdigit() or int(i) not in NAME_BY_UNIMOD]
+    if unknown:
+        raise SystemExit(f"--keep-unimod: not in the modification catalogue: {unknown}")
+    return ids
 
 
 def _fragment_basic_sites(seq_s, typ_s, k_s):
@@ -113,6 +125,9 @@ def _filter_rows(df, charge_by_basic):
     _kept_alt = "|".join(f"{i}\\)" for i in _KEPT_UNIMOD_IDS)
     df = df[~df["Modified.Sequence"].astype(str).str.contains(
         rf"\(UniMod:(?!{_kept_alt})", regex=True)]
+    # A modification before the first residue is N-terminal; the engine has no terminal
+    # modifications, and the ProForma written here would put it on no residue.
+    df = df[~df["Modified.Sequence"].astype(str).str.startswith("(")]
     dropped = (0, 0)
     # Composition-based charge restriction (opt-in). Done before candidate_id
     # assignment so dropped rows never receive an id and n_fragments stays exact.
@@ -149,8 +164,15 @@ def _mz_bins(mz):
 
 
 def main():
+    global _KEPT_UNIMOD_IDS
     args = sys.argv[1:]
     charge_by_basic = "--charge-by-basic-residues" in args
+    if "--keep-unimod" in args:
+        i = args.index("--keep-unimod")
+        if i + 1 >= len(args):
+            raise SystemExit("--keep-unimod needs a value, e.g. --keep-unimod 4,35,21")
+        _KEPT_UNIMOD_IDS = parse_kept_ids(args[i + 1])
+        del args[i:i + 2]
     args = [a for a in args if not a.startswith("--")]
     inp, outp, outf = args[0:3]
 

@@ -894,7 +894,7 @@ bands on 128 threads), which is why this was not visible before.
 
 ## 9. The confident elution bounds are pooled too
 
-`features.bound_from_confident` (default on) fits one pair of elution half-widths from the
+`features.bound_from_confident` (when on; off by default since 2026-10-04) fits one pair of elution half-widths from the
 run's confident seed anchors and gives every candidate the window `[apex - L, apex + R]`.
 It needs at least 20 anchors with a resolvable peak; below that it warns and falls back to
 per-candidate boundary detection.

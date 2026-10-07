@@ -1,0 +1,77 @@
+{
+  "_comment": "The modifications MuMDIA knows by name: the engine's mass table (mumdia_core::mass::unimod_mass) and the desktop Search tab both read this file, so a name the app offers is always one the engine accepts. Names are UniMod PSI-MS names, which the MS2PIP and DeepLC sidecars resolve through psm_utils; masses are UniMod monoisotopic deltas. 'residues' are the sites the Search tab offers for the modification; the engine accepts the name on any residue. Terminal modifications are not implemented (peptidoforms.rs refuses '*'), so none is listed. 'sets' are the Search tab's quick selections.",
+  "modifications": [
+    { "name": "Carbamidomethyl", "unimod": 4, "mass": 57.021463735, "residues": "C", "group": "Alkylation" },
+    { "name": "Propionamide", "unimod": 24, "mass": 71.037114, "residues": "C", "group": "Alkylation" },
+    { "name": "Carboxymethyl", "unimod": 6, "mass": 58.005479, "residues": "C", "group": "Alkylation" },
+    { "name": "Nethylmaleimide", "unimod": 108, "mass": 125.047679, "residues": "C", "group": "Alkylation" },
+    { "name": "Methylthio", "unimod": 39, "mass": 45.987721, "residues": "C", "group": "Alkylation" },
+    { "name": "Oxidation", "unimod": 35, "mass": 15.99491462, "residues": "MWPHC", "group": "Oxidation and artefacts" },
+    { "name": "Dioxidation", "unimod": 425, "mass": 31.989829, "residues": "MWC", "group": "Oxidation and artefacts" },
+    { "name": "Trioxidation", "unimod": 345, "mass": 47.984744, "residues": "C", "group": "Oxidation and artefacts" },
+    { "name": "Kynurenine", "unimod": 351, "mass": 3.994915, "residues": "W", "group": "Oxidation and artefacts" },
+    { "name": "Deamidated", "unimod": 7, "mass": 0.984016106, "residues": "NQR", "group": "Oxidation and artefacts" },
+    { "name": "Carbamyl", "unimod": 5, "mass": 43.005813726, "residues": "KRC", "group": "Oxidation and artefacts" },
+    { "name": "Nitro", "unimod": 354, "mass": 44.985078, "residues": "YW", "group": "Oxidation and artefacts" },
+    { "name": "Cysteinyl", "unimod": 312, "mass": 119.004099, "residues": "C", "group": "Oxidation and artefacts" },
+    { "name": "Glutathione", "unimod": 55, "mass": 305.068156, "residues": "C", "group": "Oxidation and artefacts" },
+    { "name": "Phospho", "unimod": 21, "mass": 79.96633109, "residues": "STYH", "group": "Phosphorylation and sulfation" },
+    { "name": "Sulfo", "unimod": 40, "mass": 79.956815, "residues": "YST", "group": "Phosphorylation and sulfation" },
+    { "name": "Acetyl", "unimod": 1, "mass": 42.010564684, "residues": "KSTY", "group": "Acylation" },
+    { "name": "Formyl", "unimod": 122, "mass": 27.994915, "residues": "KST", "group": "Acylation" },
+    { "name": "Propionyl", "unimod": 58, "mass": 56.026215, "residues": "K", "group": "Acylation" },
+    { "name": "Butyryl", "unimod": 1289, "mass": 70.041865, "residues": "K", "group": "Acylation" },
+    { "name": "Crotonyl", "unimod": 1363, "mass": 68.026215, "residues": "K", "group": "Acylation" },
+    { "name": "Malonyl", "unimod": 747, "mass": 86.000394, "residues": "K", "group": "Acylation" },
+    { "name": "Succinyl", "unimod": 64, "mass": 100.016044, "residues": "K", "group": "Acylation" },
+    { "name": "Methyl", "unimod": 34, "mass": 14.015650064, "residues": "KREDHC", "group": "Methylation" },
+    { "name": "Dimethyl", "unimod": 36, "mass": 28.031300128, "residues": "KR", "group": "Methylation" },
+    { "name": "Trimethyl", "unimod": 37, "mass": 42.04695, "residues": "K", "group": "Methylation" },
+    { "name": "GlyGly", "unimod": 121, "mass": 114.042927, "residues": "KSTC", "group": "Ubiquitination" },
+    { "name": "HexNAc", "unimod": 43, "mass": 203.079373, "residues": "STN", "group": "Glycosylation and glycation" },
+    { "name": "Hex", "unimod": 41, "mass": 162.052824, "residues": "KN", "group": "Glycosylation and glycation" },
+    { "name": "Palmitoyl", "unimod": 47, "mass": 238.229666, "residues": "CKST", "group": "Lipidation" },
+    { "name": "Farnesyl", "unimod": 44, "mass": 204.1878011, "residues": "C", "group": "Lipidation" },
+    { "name": "GeranylGeranyl", "unimod": 48, "mass": 272.2504012, "residues": "C", "group": "Lipidation" },
+    { "name": "Hydroxyfarnesyl", "unimod": 376, "mass": 220.1827157, "residues": "C", "group": "Lipidation" },
+    { "name": "Biotin", "unimod": 3, "mass": 226.077598, "residues": "K", "group": "Labels" }
+  ],
+  "sets": [
+    {
+      "name": "Standard (carbamidomethyl C fixed, oxidation M)",
+      "replace": true,
+      "fixed": [["Carbamidomethyl", "C"]],
+      "variable": [["Oxidation", "M"]]
+    },
+    {
+      "name": "Phosphorylation (S, T, Y)",
+      "variable": [["Phospho", "S"], ["Phospho", "T"], ["Phospho", "Y"]]
+    },
+    {
+      "name": "Sample-handling artefacts",
+      "variable": [["Deamidated", "N"], ["Deamidated", "Q"], ["Carbamyl", "K"], ["Oxidation", "W"], ["Dioxidation", "M"]]
+    },
+    {
+      "name": "Lysine acylation",
+      "variable": [["Acetyl", "K"], ["Propionyl", "K"], ["Butyryl", "K"], ["Crotonyl", "K"], ["Malonyl", "K"], ["Succinyl", "K"]]
+    },
+    {
+      "name": "Methylation (K, R)",
+      "variable": [["Methyl", "K"], ["Methyl", "R"], ["Dimethyl", "K"], ["Dimethyl", "R"], ["Trimethyl", "K"]]
+    },
+    {
+      "name": "Ubiquitination remnant (GlyGly K)",
+      "variable": [["GlyGly", "K"]]
+    },
+    {
+      "name": "Cysteine prenylation",
+      "variable": [["Farnesyl", "C"], ["GeranylGeranyl", "C"], ["Hydroxyfarnesyl", "C"]]
+    },
+    {
+      "name": "Clear all",
+      "replace": true,
+      "fixed": [],
+      "variable": []
+    }
+  ]
+}

@@ -226,9 +226,11 @@ def main():
     # Sequence-level target/decoy overlap is only a defect for sequence-rewrite
     # decoys (reverse/scramble). Shift decoys deliberately keep the target
     # sequence and separate the null in fragment-m/z space, so overlap is expected.
+    # I and L are isobaric, so a decoy equal to a target up to I/L is that target.
     if args.decoy_strategy == "reverse":
-        tset = set(op[op.label == "target"].peptidoform.map(stripped))
-        dset = set(op[op.label == "decoy"].peptidoform.map(stripped))
+        il = lambda s: stripped(s).replace("I", "L")
+        tset = set(op[op.label == "target"].peptidoform.map(il))
+        dset = set(op[op.label == "decoy"].peptidoform.map(il))
         assert not (tset & dset), f"reverse decoys overlap targets on {len(tset & dset)} sequences"
     print(f"DONE -> {args.out_precursors} / {args.out_fragments}")
 

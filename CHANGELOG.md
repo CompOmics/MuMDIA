@@ -65,6 +65,77 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- **Fragment-rarity candidate prescreen** (`mumdia prescreen`, `prescreen.enabled`, off by
+  default; docs/34). A port of the tagbench prototype: each candidate is scored on the spectra
+  of its own isolation window inside its calibrated RT bounds (unique matched peaks weighted by
+  their per-window spectrum rarity, half weight below m/z 300, divided by sqrt(length), maximum
+  over spectra and both orientations), and kept above a label-blind calibration quantile
+  (presets 0.52 / 0.54 / 0.75 / 0.90). Equal to the prototype rule on 1,500 sampled candidates.
+  Uncapped by default; 300 peaks is a comparison setting. Modification scope with any/all
+  semantics and a recorded bypass below 100 calibration candidates. Selectable, off-by-default
+  components: database-free tag discovery and retrieval with a rescue route, delayed
+  modification enumeration, complementary-ion and blind mass-hypothesis evidence with optional
+  MS1, whole-path RMS weights with gap edges, fragment-trace pooling, backbone/position index
+  evidence, and family support for localization siblings. Measured on Astral REP1 (HYE library)
+  the balanced preset removes 54.0% of the candidates, keeps 99.39% of the precursors accepted
+  without it and costs 0.62% of the peptides at 1% (3 NN seeds); on the AIF entrapment run it
+  removes 56.5% with identical extraction output and entrapment FDP. It does not shorten
+  extract, whose cost follows the spectra rather than the candidate count, so it stays off.
+- **Prefilters before prediction, without retention times** (`prescreen.tag_prefilter`,
+  `prescreen.score_before_prediction`, off by default; docs/34 sections 5b and 6). Both run on
+  the peptidoform table (FASTA mode) or the imported library before MS2PIP, DeepLC and the seed
+  search, so predictions are made only for the survivors; every later stage uses predicted
+  retention times as usual. The tag prefilter keeps a candidate when one of its trimers was
+  observed in its isolation window: 56-58% removed with 100% kept on Orbitrap AIF data (E. coli
+  FASTA run 11.1 -> 4.5 min, 25.4 -> 14.7 GB), 16.5% on Astral, nothing on immunopeptidomics.
+  The score before prediction is the fragment-rarity score over the whole gradient with the new
+  `crowding_exponent` (0.25): on the 203M-candidate immunopeptidomics library it removed 54%,
+  kept 97.0% of the accepted precursors end to end and cost 3.5% of the peptides for 25% less
+  wall time and half the memory (3 NN seeds); on a FASTA search with Phospho STY, Acetyl K and
+  Deamidated NQ it removed 63% of the peptidoforms for -0.4% peptides, 3.2x less wall and 3.4x
+  less memory. Single-file `run` only. Also `prescreen.repeat_bonus` and positioned tags
+  (`tags.positioned`, `tags.positioned_residues`), both measured and off.
+- **Prescreen speed-ups with bit-identical scores**: a per-spectrum bin-occupancy bitmap and
+  upper-bound pruning over a per-window inverted bin index. Astral without retention times 4:40
+  -> 1:11, immunopeptidomics with retention times 18:53 -> 6:42, scores identical over the whole
+  10.9M and 203M libraries.
+
+- **Desktop Search screen: prescreen, bands and modifications.** The prescreen (off, before
+  prediction without retention times, after the RT calibration, or the tag prefilter, with a
+  strength), the window-group bands (automatic for this machine, off or custom) and the
+  modifications are set on the Search screen and merged onto the preset through
+  `derive_config`. The automatic band plan comes from the machine's physical memory and the
+  size of the search space (read from the library footer, or estimated from the FASTA: 1,925,388
+  against the engine's 1,922,388 precursors on E. coli) through a memory model fitted to the
+  docs/33 peaks, and bands only when the unbanded search would not fit. Combinations the engine
+  refuses are refused before anything is built or started.
+- **Modification catalogue** (`mumdia-core/src/modifications.json`): 34 residue modifications by
+  UniMod name, accession and monoisotopic delta, read by the engine's mass table and listed by
+  the desktop, so a name the Search screen offers is always one the engine accepts. The eleven
+  names of the previous table keep their masses exactly; the additions include alkylation
+  alternatives, oxidation products, acylations, methylations, `GlyGly`, `HexNAc`, `Hex`,
+  `Sulfo`, `Palmitoyl` and `Biotin`, each checked against its elemental composition by a test.
+
+### Changed
+
+- **Per-candidate elution bounds are the default** (`features.bound_from_confident = false`,
+  was true). The shared left/right half-width learned from the confident seed set cut every
+  peptide whose peak is wider than the median short (visDIA showed identifications missing
+  their last scan). Measured 2026-10-03 on doxy, 5 NN seeds per arm: Astral REP1 on the HYE
+  library +2.20% peptides at 1% (Welch t +15.7), the Orbitrap AIF entrapment run +0.17%
+  (t +0.9) at an unchanged entrapment FDP (0.989% -> 1.000%, 2 SE 0.039); the share of IDs
+  whose above-half-maximum peak extends past their bounds fell from 20% / 26% (left / right) to
+  2% / 6% on Astral. `true` restores the shared width.
+- **Quantification integrates a fixed +/-3-sample window around the identification apex**
+  (`quant.fixed_scan_halfwidth = 3`, was 0, the walked window). On the six-file Astral HYE
+  experiment (one seed, 63,141 precursors quantified in at least two runs per condition) the
+  median |log2 ratio error| went from 0.266 to 0.163, the species-equal error from 0.322 to
+  0.201 and the median CV from 0.19 to 0.10, with the same identifications. The window is in
+  samples of the precursor's isolation window, so it scales with the cycle time. `0` restores
+  the walked window.
+
 ## [0.5.0] - 2026-09-29
 
 ### Added
