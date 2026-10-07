@@ -727,7 +727,13 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
         && matches!(cfg.calibration_method, CalibrationMethod::Loess)
         && n_train >= cfg.min_seed_for_calibration;
     let loess = if use_loess {
-        Some(Loess::fit(&train_irt, &train_rt, cfg.loess_span, 200))
+        Some(Loess::fit_robust(
+            &train_irt,
+            &train_rt,
+            cfg.loess_span,
+            200,
+            cfg.loess_robust_iters,
+        ))
     } else {
         None
     };
@@ -791,7 +797,9 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
                 None
             } else {
                 // Same method selection as the main fit, refit on the sizing subset.
-                let sizing_loess = use_loess.then(|| Loess::fit(&tr_x, &tr_y, cfg.loess_span, 200));
+                let sizing_loess = use_loess.then(|| {
+                    Loess::fit_robust(&tr_x, &tr_y, cfg.loess_span, 200, cfg.loess_robust_iters)
+                });
                 let (s_slope, s_intercept) = if sizing_loess.is_none() {
                     linear_fit(&tr_x, &tr_y)
                 } else {

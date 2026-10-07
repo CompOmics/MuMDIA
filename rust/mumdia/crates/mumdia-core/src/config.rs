@@ -1083,6 +1083,11 @@ pub struct RtImTrainConfig {
     pub anchor_q_ladder: Vec<f64>,
     /// LOESS span (fraction of points in each local fit).
     pub loess_span: f64,
+    /// Robustness iterations of the RT LOESS (bisquare reweighting on six median absolute
+    /// residuals). 0 (default) is the plain fit; 2 keeps a handful of false seed anchors
+    /// from pulling the curve (single-cell runs: residuals of +14 to +82 s moved the
+    /// calibration 2-3 s across the mid-gradient).
+    pub loess_robust_iters: usize,
     /// Fallback fixed RT window in seconds when calibration cannot be fit.
     pub fallback_rt_window_s: f64,
     /// Fine-tune the DeepLC multitask model on this run's confident seed PSMs
@@ -1345,6 +1350,7 @@ impl Default for RtImTrainConfig {
             min_seed_for_calibration: 50,
             anchor_q_ladder: vec![0.02, 0.05],
             loess_span: 0.3,
+            loess_robust_iters: 0,
             fallback_rt_window_s: 120.0,
             finetune_deeplc: false,
             multihead_calibration: None,
