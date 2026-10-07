@@ -1528,6 +1528,10 @@ pub struct ExtractConfig {
     /// ion counts a mono peak present in both neighbouring MS1 scans is often missing from
     /// the one nearest the apex, which then reads as no MS1 signal at all.
     pub ms1_scan_halfwidth: usize,
+    /// Write each candidate's RT window (`rt_lo`, `rt_hi`) into `psms_extracted`, so the
+    /// features stage can scale the RT error by the window it was searched in (the
+    /// `rtw_*` family). Off by default: the table's schema stays byte-identical.
+    pub emit_rt_window: bool,
     /// Number of chromatographic peak hypotheses to enumerate per candidate.
     /// `K>1` writes up to K local maxima to the diagnostic
     /// `<out-psms>.peaks.parquet` sidecar. The primary PSM still contains only the
@@ -1655,6 +1659,7 @@ impl Default for ExtractConfig {
             min_coelution_run: 0, // disabled; scan_window floor still applies
             ms1_rescue: false,    // opt-in; relaxes acceptance, validate FDR first
             ms1_scan_halfwidth: 0,
+            emit_rt_window: false,
             retain_top_peaks: 1,            // legacy single-apex behaviour (K=1)
             promote_top_peaks: 1,           // top-K promotion off (only the selected apex is a row)
             alt_peak_min_area_frac: 0.10,   // alternate peak >= 10% of rank-0 area

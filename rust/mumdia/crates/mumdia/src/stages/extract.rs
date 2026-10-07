@@ -2700,6 +2700,8 @@ struct CandOut {
     corun: i32,
     npred: i32,
     calrt: f64,
+    win_lo: f64,
+    win_hi: f64,
     mz: f64,
     contested: f64,
     contested_count_frac: f64,
@@ -2761,6 +2763,8 @@ struct PsmRows {
     npred: Vec<i32>,
     corun: Vec<i32>,
     calrt: Vec<f64>,
+    win_lo: Vec<f64>,
+    win_hi: Vec<f64>,
     mz: Vec<f64>,
     z: Vec<i32>,
     label: Vec<String>,
@@ -2801,6 +2805,10 @@ impl PsmRows {
         self.corun.push(r.corun);
         self.npred.push(r.npred);
         self.calrt.push(r.calrt);
+        if cfg.emit_rt_window {
+            self.win_lo.push(r.win_lo);
+            self.win_hi.push(r.win_hi);
+        }
         self.mz.push(r.mz);
         self.contested.push(r.contested);
         if cfg.emit_contested_features {
@@ -2889,6 +2897,10 @@ impl PsmRows {
                 "gate_spectral_entropy".into(),
                 take(&mut self.gate_se),
             ));
+        }
+        if cfg.emit_rt_window {
+            cols.push(Col::F64("rt_lo".into(), take(&mut self.win_lo)));
+            cols.push(Col::F64("rt_hi".into(), take(&mut self.win_hi)));
         }
         if cfg.emit_demix_features {
             cols.push(Col::F32(
@@ -4078,6 +4090,8 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
             corun: best_run as i32,
             npred: fmzs0.len() as i32,
             calrt: rt_cal[cid as usize],
+            win_lo: rt_lo[cid as usize],
+            win_hi: rt_hi[cid as usize],
             mz: c.precursor_mz,
             contested: contested_val,
             contested_count_frac,
@@ -4165,6 +4179,8 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                 corun: best_run as i32,
                 npred: fmzs0.len() as i32,
                 calrt: rt_cal[cid as usize],
+                win_lo: rt_lo[cid as usize],
+                win_hi: rt_hi[cid as usize],
                 mz: c.precursor_mz,
                 contested: contested_val,
                 contested_count_frac,
@@ -5588,6 +5604,8 @@ mod psms_stream_tests {
             } else {
                 f * 0.5
             },
+            win_lo: 0.0,
+            win_hi: 0.0,
             mz: 400.0 + (i % 1000) as f64 * 0.01,
             contested: (i % 4) as f64 * 0.25,
             contested_count_frac: (i % 3) as f64 / 3.0,
