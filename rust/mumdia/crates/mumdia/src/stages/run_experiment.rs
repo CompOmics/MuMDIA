@@ -1649,6 +1649,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .collect();
     let one_table_per_run = competed.iter().all(|tables| tables.len() == 1);
     let scored_combined = d("scored_combined.parquet");
+    let shadow_windows: Vec<String> = names
+        .iter()
+        .map(|nm| format!("{}/spectra/isolation_windows.parquet", d(nm)))
+        .collect();
     let scored_written = rescore::run_hashed(rescore::RescoreParams {
         competed: &rescore_inputs,
         sources: (!one_table_per_run).then_some(rescore_sources.as_slice()),
@@ -1657,6 +1661,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         script_dir: &cfg.predict_frag.sidecar_script_dir,
         cfg: &cfg.rescore,
         config_hash: &ch,
+        shadow: Some(crate::stages::shadow::ShadowInputs::new(
+            &lib_f,
+            &shadow_windows,
+        )),
     })?;
     // The classifier that actually ran, from the rescore artifact report: the source of
     // truth, since the configured enum can differ from it under a compatibility path.

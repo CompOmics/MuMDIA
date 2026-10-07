@@ -217,6 +217,9 @@ pub struct RescoreParams<'a> {
     pub script_dir: &'a str,
     pub cfg: &'a RescoreConfig,
     pub config_hash: &'a str,
+    /// The library fragments and the runs' isolation windows for shadow demotion
+    /// (`rescore.shadow_min_shared`); `None` when the caller has none.
+    pub shadow: Option<super::shadow::ShadowInputs<'a>>,
 }
 
 /// Wall time of each phase of [`run`], logged once at the end as `rescore: phase timings`
@@ -974,6 +977,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                 apex_rt,
                 elution_lo,
                 elution_hi,
+                mz,
                 source,
                 scores,
                 peak_rank,
@@ -986,6 +990,81 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         }
     }
     timings.collapse_ms = t_collapse.elapsed().as_millis();
+
+    // Shadow demotion (`rescore.shadow_min_shared`): a first-pass precursor q selects the
+    // lenders, then every shadow of either label drops below all other scores before the
+    // q-values below are computed (`stages::shadow`).
+    if p.cfg.shadow_min_shared > 0 {
+        let Some(inputs) = p.shadow.as_ref() else {
+            anyhow::bail!(
+                "rescore.shadow_min_shared is set but this rescore has no library fragments \
+                 or isolation windows (pass --lib-fragments and --isolation-windows)"
+            );
+        };
+        let t_sh = Instant::now();
+        let pid: Vec<u32> = {
+            let mut interner: HashMap<(&str, i32), u32> = HashMap::new();
+            let mut ids = Vec::with_capacity(pform.len());
+            for (pf, &z) in pform.iter().zip(charge.iter()) {
+                let next = interner.len() as u32;
+                ids.push(*interner.entry((pf, z)).or_insert(next));
+            }
+            ids
+        };
+        let pq1 = grouped_q(
+            &pid,
+            &scores,
+            &is_decoy,
+            &is_entrapment,
+            &is_real_target,
+            qmode,
+            p.cfg.entrapment_ratio,
+        );
+        let accepted: Vec<bool> = (0..n).map(|i| !is_decoy[i] && pq1[i] <= 0.01).collect();
+        let demote = super::shadow::flag(
+            &super::shadow::ShadowRows {
+                source: &source,
+                cid: &cid,
+                base: &base,
+                apex_rt: &apex_rt,
+                precursor_mz: &mz,
+                score: &scores,
+                is_decoy: &is_decoy,
+                accepted: &accepted,
+            },
+            inputs,
+            super::shadow::ShadowParams {
+                min_shared: p.cfg.shadow_min_shared,
+                ppm: p.cfg.shadow_ppm,
+                rt_s: p.cfg.shadow_rt_s,
+                region: p.cfg.shadow_region,
+            },
+        )?;
+        let floor = scores
+            .iter()
+            .copied()
+            .filter(|s| s.is_finite())
+            .fold(f64::INFINITY, f64::min)
+            - 1.0;
+        let (mut dt, mut dd) = (0usize, 0usize);
+        for i in 0..n {
+            if demote[i] {
+                scores[i] = floor;
+                if is_decoy[i] {
+                    dd += 1;
+                } else {
+                    dt += 1;
+                }
+            }
+        }
+        info!(
+            demoted_targets = dt,
+            demoted_decoys = dd,
+            first_pass_accepted = accepted.iter().filter(|&&a| a).count(),
+            ms = t_sh.elapsed().as_millis() as u64,
+            "rescore: shadow demotion"
+        );
+    }
     let t_q = Instant::now();
 
     // PSM-level q-values against the selected null. The split form reads the two columns
@@ -5615,6 +5694,7 @@ b
                 script_dir: "scripts",
                 cfg: &cfg,
                 config_hash: "test",
+                shadow: None,
             })
             .unwrap();
             let report: serde_json::Value = serde_json::from_str(
@@ -5659,6 +5739,7 @@ b
             script_dir: "scripts",
             cfg: &RescoreConfig::default(),
             config_hash: "test",
+            shadow: None,
         })
         .unwrap_err()
         .to_string();
@@ -5671,6 +5752,7 @@ b
             script_dir: "scripts",
             cfg: &RescoreConfig::default(),
             config_hash: "test",
+            shadow: None,
         })
         .unwrap_err()
         .to_string();
@@ -5712,6 +5794,7 @@ b
                 script_dir: "scripts",
                 cfg: &cfg,
                 config_hash: "test",
+                shadow: None,
             })
             .unwrap_err()
             .to_string();
@@ -5798,6 +5881,7 @@ b
             script_dir: "scripts",
             cfg: &cfg,
             config_hash: "test",
+            shadow: None,
         })
         .unwrap_err()
         .to_string();

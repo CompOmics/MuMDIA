@@ -856,6 +856,7 @@ pub fn run(p: RunParams) -> Result<()> {
     // One table, or a grouped run's band tables (`groups.pool_competed = false`), which are
     // all this run's rows: source 0 for every one.
     let sources = vec![0u32; competed.len()];
+    let shadow_windows = vec![d("spectra/isolation_windows.parquet")];
     let w = rescore::run_hashed(rescore::RescoreParams {
         competed: &competed,
         sources: (competed.len() > 1).then_some(sources.as_slice()),
@@ -864,6 +865,10 @@ pub fn run(p: RunParams) -> Result<()> {
         script_dir: &cfg.predict_frag.sidecar_script_dir,
         cfg: &cfg.rescore,
         config_hash: &ch,
+        shadow: Some(crate::stages::shadow::ShadowInputs::new(
+            &lib_f,
+            &shadow_windows,
+        )),
     })?;
     man.record(w.record(
         artifact::PSMS_SCORED.0,

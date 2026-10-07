@@ -7021,6 +7021,7 @@ mod tests {
                 script_dir: "scripts",
                 cfg: &rcfg,
                 config_hash: "test",
+                shadow: None,
             })
             .unwrap();
             std::fs::read(out).unwrap()

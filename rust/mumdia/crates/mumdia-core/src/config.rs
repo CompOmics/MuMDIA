@@ -2301,6 +2301,21 @@ pub struct RescoreConfig {
     /// sweep (docs/28 section 17), at three times the training cost.
     #[serde(default = "default_seeds")]
     pub seeds: usize,
+    /// Shadow demotion: demote (below every other score) a candidate of either label when at
+    /// least this many of its library fragments lie within `shadow_ppm` of a fragment of a
+    /// higher-scoring, first-pass-accepted target in the same run and isolation window with
+    /// its apex within `shadow_rt_s`; the candidate's own base peptide never lends. 0
+    /// (default) is off. Needs the library fragments and the runs' isolation windows, which
+    /// `run` and `run-experiment` pass and `rescore` takes as `--lib-fragments` and
+    /// `--isolation-windows`.
+    pub shadow_min_shared: usize,
+    /// Fragment m/z tolerance (ppm) of the shadow test.
+    pub shadow_ppm: f64,
+    /// Apex RT distance (seconds) within which a lender counts.
+    pub shadow_rt_s: f64,
+    /// Candidates examined per run: the top `shadow_region x accepted` rows by first-pass
+    /// score.
+    pub shadow_region: usize,
 }
 
 fn default_margin_frac() -> f64 {
@@ -2342,6 +2357,10 @@ pub enum NegSelect {
 impl Default for RescoreConfig {
     fn default() -> Self {
         Self {
+            shadow_min_shared: 0,
+            shadow_ppm: 10.0,
+            shadow_rt_s: 3.0,
+            shadow_region: 8,
             classifier: t(),
             folds: 3,
             train_fdr: 0.01,
