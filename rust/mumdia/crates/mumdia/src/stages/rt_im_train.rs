@@ -149,6 +149,110 @@ fn candidate_window(calibrated_rt: Option<f64>, width: Option<f64>) -> (f64, f64
     }
 }
 
+/// Composition features of a peptidoform and charge for the RT correction: intercept,
+/// charge 3, charge >= 4, length, internal K/R, His, Met-ox. Modifications are written in
+/// square brackets (MuMDIA) or round brackets (UniMod); only residues count toward length.
+pub(crate) fn composition_features(peptidoform: &str, charge: i32) -> [f64; 7] {
+    let mut seq: Vec<u8> = Vec::with_capacity(peptidoform.len());
+    let mut depth = 0i32;
+    for &b in peptidoform.as_bytes() {
+        match b {
+            b'[' | b'(' => depth += 1,
+            b']' | b')' => depth -= 1,
+            _ if depth == 0 && b.is_ascii_uppercase() => seq.push(b),
+            _ => {}
+        }
+    }
+    let n = seq.len();
+    let internal_kr = seq
+        .iter()
+        .take(n.saturating_sub(1))
+        .filter(|&&c| c == b'K' || c == b'R')
+        .count();
+    let his = seq.iter().filter(|&&c| c == b'H').count();
+    let mox = peptidoform.matches("Oxidation").count() + peptidoform.matches("UniMod:35").count();
+    [
+        1.0,
+        f64::from(u8::from(charge == 3)),
+        f64::from(u8::from(charge >= 4)),
+        n as f64,
+        internal_kr as f64,
+        his as f64,
+        mox as f64,
+    ]
+}
+
+/// Huber regression (k = 1.345 on a MAD scale, iteratively reweighted least squares) of
+/// `y` on the rows of `x`. `None` when the normal equations are singular.
+fn huber_fit(x: &[[f64; 7]], y: &[f64]) -> Option<Vec<f64>> {
+    const P: usize = 7;
+    let n = y.len();
+    if n < 3 * P {
+        return None;
+    }
+    let mut w = vec![1.0f64; n];
+    let mut beta = vec![0.0f64; P];
+    for _ in 0..30 {
+        // weighted normal equations with a tiny ridge for unused columns (e.g. no charge 4)
+        let mut a = [[0.0f64; P]; P];
+        let mut b = [0.0f64; P];
+        for i in 0..n {
+            for r in 0..P {
+                b[r] += w[i] * x[i][r] * y[i];
+                for c in 0..P {
+                    a[r][c] += w[i] * x[i][r] * x[i][c];
+                }
+            }
+        }
+        for (r, row) in a.iter_mut().enumerate() {
+            row[r] += 1e-6;
+        }
+        let sol = solve(a, b)?;
+        let resid: Vec<f64> = (0..n)
+            .map(|i| y[i] - (0..P).map(|c| x[i][c] * sol[c]).sum::<f64>())
+            .collect();
+        let abs: Vec<f64> = resid.iter().map(|r| r.abs()).collect();
+        let s = 1.4826 * percentile(&abs, 0.5);
+        let done = sol.iter().zip(&beta).all(|(a, b)| (a - b).abs() < 1e-6);
+        beta = sol;
+        if !(s.is_finite() && s > 0.0) || done {
+            break;
+        }
+        for (wi, r) in w.iter_mut().zip(&resid) {
+            let k = 1.345 * s;
+            *wi = if r.abs() <= k { 1.0 } else { k / r.abs() };
+        }
+    }
+    Some(beta)
+}
+
+/// Gaussian elimination with partial pivoting.
+fn solve(mut a: [[f64; 7]; 7], mut b: [f64; 7]) -> Option<Vec<f64>> {
+    const P: usize = 7;
+    for col in 0..P {
+        let piv = (col..P).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))?;
+        if a[piv][col].abs() < 1e-12 {
+            return None;
+        }
+        a.swap(col, piv);
+        b.swap(col, piv);
+        for r in col + 1..P {
+            let f = a[r][col] / a[col][col];
+            let pivot_row = a[col];
+            for (c, v) in a[r].iter_mut().enumerate().skip(col) {
+                *v -= f * pivot_row[c];
+            }
+            b[r] -= f * b[col];
+        }
+    }
+    let mut x = vec![0.0f64; P];
+    for r in (0..P).rev() {
+        let s: f64 = (r + 1..P).map(|c| a[r][c] * x[c]).sum();
+        x[r] = (b[r] - s) / a[r][r];
+    }
+    Some(x)
+}
+
 /// Early (`left`) and late (`right`) half-widths of the widen-only local RT window on an
 /// ascending grid of calibrated RT; linear in between, the end values beyond the grid.
 #[derive(Clone, Debug)]
@@ -260,6 +364,9 @@ pub struct RtFit {
     /// Widen-only local window (`local_window_anchors`): the early and late half-widths on a
     /// grid of calibrated RT.
     local: Option<LocalWindow>,
+    /// Composition correction coefficients (`composition_correction`), over
+    /// [`composition_features`].
+    composition: Option<Vec<f64>>,
     /// Signed median, absolute median and MAD of the in-sample residuals (seconds).
     residuals: (f64, f64, f64),
 }
@@ -677,6 +784,7 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
     };
 
     let mut best_per_pep: HashMap<u32, (f64, f64, f64)> = HashMap::new(); // base -> (score, irt, rt)
+    let mut best_row: HashMap<u32, usize> = HashMap::new(); // base -> seed row of that apex
     for i in 0..seed.nrows {
         if !s_q[i].is_finite()
             || !s_score[i].is_finite()
@@ -709,6 +817,7 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
             .or_insert((f64::NEG_INFINITY, 0.0, 0.0));
         if s_score[i] > e.0 {
             *e = (s_score[i], irt, s_rt[i]);
+            best_row.insert(s_base[i], i);
         }
     }
     let (anchor_ids, train_irt, train_rt) = sorted_anchor_vectors(best_per_pep);
@@ -751,6 +860,7 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
         holdout_sizing: None,
         adaptive: None,
         local: None,
+        composition: None,
         residuals: (f64::NAN, f64::NAN, f64::NAN),
     };
 
@@ -951,8 +1061,41 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
             "rt-im-train: widen-only local RT window"
         );
     }
+    let composition = if cfg.composition_correction && calibration_available && n_train >= 50 {
+        let pform = seed.str("peptidoform")?;
+        let charge = seed.i32("charge")?;
+        let x: Vec<[f64; 7]> = anchor_ids
+            .iter()
+            .map(|b| {
+                let i = best_row[b];
+                composition_features(&pform[i], charge[i])
+            })
+            .collect();
+        let y: Vec<f64> = train_irt
+            .iter()
+            .zip(&train_rt)
+            .map(|(xi, yi)| yi - fit.predict(*xi))
+            .collect();
+        let beta = huber_fit(&x, &y);
+        if let Some(b) = &beta {
+            info!(
+                intercept = b[0],
+                charge3 = b[1],
+                charge4plus = b[2],
+                per_residue = b[3],
+                internal_kr = b[4],
+                his = b[5],
+                met_ox = b[6],
+                "rt-im-train: composition RT correction (s)"
+            );
+        }
+        beta
+    } else {
+        None
+    };
     fit.adaptive = adaptive;
     fit.local = local;
+    fit.composition = composition;
     fit.residuals = residuals;
     Ok(fit)
 }
@@ -977,6 +1120,26 @@ fn write_windows(
     let cid = lib_cid;
     let irt = lib_irt;
     let n = cid.len();
+    // Composition shift per library row, read only when the fit carries a correction.
+    let shift: Option<Vec<f64>> = match &fit.composition {
+        Some(beta) => {
+            let lib = match p.precursor_span {
+                None => TableFile::open(p.library_precursors)?,
+                Some((first, k)) => TableFile::open_rows(p.library_precursors, first, k)?,
+            };
+            let pform = lib.str("peptidoform")?;
+            let charge = lib.i32("charge")?;
+            Some(
+                (0..n)
+                    .map(|i| {
+                        let f = composition_features(&pform[i], charge[i]);
+                        (0..7).map(|c| f[c] * beta[c]).sum()
+                    })
+                    .collect(),
+            )
+        }
+        None => None,
+    };
     let mut n_nonfinite_irt = 0u64;
     let mut kept = keep_windows.then(|| RtWindowsBuilder::new(n));
     let windows = write_table_chunked_hashed(p.out_windows, n, |r| {
@@ -996,8 +1159,8 @@ fn write_windows(
             if !usable_irt {
                 n_nonfinite_irt += 1;
             }
-            let calibrated_rt =
-                (fit.calibration_available && usable_irt).then(|| fit.predict(irt[i] as f64));
+            let calibrated_rt = (fit.calibration_available && usable_irt)
+                .then(|| fit.predict(irt[i] as f64) + shift.as_ref().map_or(0.0, |s| s[i]));
             let width = calibrated_rt.map(|cal| match &fit.adaptive {
                 Some((rt_min, span, widths)) => {
                     let nb = widths.len();
@@ -1483,6 +1646,41 @@ mod tests {
         )
         .unwrap();
         (seed, lib)
+    }
+
+    #[test]
+    fn composition_features_and_huber_fit() {
+        let f = composition_features("AAGLATM[Oxidation]ISTHKR", 3);
+        assert_eq!(f, [1.0, 1.0, 0.0, 13.0, 1.0, 1.0, 1.0]);
+        let g = composition_features("C(UniMod:4)PEPTIDEK", 4);
+        assert_eq!(g, [1.0, 0.0, 1.0, 9.0, 0.0, 0.0, 0.0]);
+        // y = -3 * charge3 - 6 * charge4 + 0.2 * length, with two gross outliers
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..90usize {
+            let z = 2 + (i % 3) as i32;
+            let len = 7 + (i % 13);
+            let row = [
+                1.0,
+                f64::from(u8::from(z == 3)),
+                f64::from(u8::from(z >= 4)),
+                len as f64,
+                (i % 2) as f64,
+                ((i / 2) % 2) as f64,
+                ((i / 4) % 2) as f64,
+            ];
+            let mut v = -3.0 * row[1] - 6.0 * row[2] + 0.2 * row[3];
+            if i == 10 || i == 50 {
+                v += 60.0;
+            }
+            x.push(row);
+            y.push(v);
+        }
+        let b = huber_fit(&x, &y).unwrap();
+        assert!(
+            (b[1] + 3.0).abs() < 0.1 && (b[2] + 6.0).abs() < 0.1 && (b[3] - 0.2).abs() < 0.02,
+            "{b:?}"
+        );
     }
 
     #[test]

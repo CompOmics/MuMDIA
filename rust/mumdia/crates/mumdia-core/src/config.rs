@@ -1088,6 +1088,14 @@ pub struct RtImTrainConfig {
     /// from pulling the curve (single-cell runs: residuals of +14 to +82 s moved the
     /// calibration 2-3 s across the mid-gradient).
     pub loess_robust_iters: usize,
+    /// Correct each candidate's calibrated RT for the composition-dependent residual that
+    /// the predicted RT leaves (a per-run Huber regression of the anchors' residuals on
+    /// charge 3, charge >= 4, length, internal K/R, His and Met-ox): on the single-cell
+    /// Astral runs found charge-4 precursors elute 4.6-8.1 s before their calibrated
+    /// prediction and 8-14% of them fell outside the window. The window width is unchanged;
+    /// only its centre moves. Decoys share their target's composition, so their windows move
+    /// with it. Off by default.
+    pub composition_correction: bool,
     /// Fallback fixed RT window in seconds when calibration cannot be fit.
     pub fallback_rt_window_s: f64,
     /// Fine-tune the DeepLC multitask model on this run's confident seed PSMs
@@ -1351,6 +1359,7 @@ impl Default for RtImTrainConfig {
             anchor_q_ladder: vec![0.02, 0.05],
             loess_span: 0.3,
             loess_robust_iters: 0,
+            composition_correction: false,
             fallback_rt_window_s: 120.0,
             finetune_deeplc: false,
             multihead_calibration: None,
