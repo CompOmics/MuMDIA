@@ -182,6 +182,23 @@ pub(crate) fn composition_features(peptidoform: &str, charge: i32) -> [f64; 7] {
     ]
 }
 
+/// Fewest anchors that must carry a composition term (nonzero feature) for it to be fitted.
+const MIN_ANCHORS_PER_TERM: usize = 20;
+
+/// Zero every non-intercept column that fewer than `min` rows carry, so its coefficient
+/// stays at 0 under the ridge in [`huber_fit`].
+fn drop_sparse_columns(mut x: Vec<[f64; 7]>, min: usize) -> Vec<[f64; 7]> {
+    for c in 1..7 {
+        let n = x.iter().filter(|r| r[c] != 0.0).count();
+        if n < min {
+            for r in x.iter_mut() {
+                r[c] = 0.0;
+            }
+        }
+    }
+    x
+}
+
 /// Huber regression (k = 1.345 on a MAD scale, iteratively reweighted least squares) of
 /// `y` on the rows of `x`. `None` when the normal equations are singular.
 fn huber_fit(x: &[[f64; 7]], y: &[f64]) -> Option<Vec<f64>> {
@@ -1076,6 +1093,9 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
             .zip(&train_rt)
             .map(|(xi, yi)| yi - fit.predict(*xi))
             .collect();
+        // A composition term only enters when enough anchors carry it: with a handful of
+        // charge-4 anchors (HeLa) the charge-4 coefficient came out at -65 to -74 s.
+        let x = drop_sparse_columns(x, MIN_ANCHORS_PER_TERM);
         let beta = huber_fit(&x, &y);
         if let Some(b) = &beta {
             info!(
@@ -1133,7 +1153,10 @@ fn write_windows(
                 (0..n)
                     .map(|i| {
                         let f = composition_features(&pform[i], charge[i]);
-                        (0..7).map(|c| f[c] * beta[c]).sum()
+                        let v: f64 = (0..7).map(|c| f[c] * beta[c]).sum();
+                        // bounded: a shift beyond three window half-widths is a fit artefact
+                        let cap = 3.0 * fit.w_rt.unwrap_or(f64::INFINITY);
+                        v.clamp(-cap, cap)
                     })
                     .collect(),
             )
@@ -1677,6 +1700,13 @@ mod tests {
             y.push(v);
         }
         let b = huber_fit(&x, &y).unwrap();
+        // a column carried by too few anchors is not fitted
+        let mut xs = x.clone();
+        for (i, r) in xs.iter_mut().enumerate() {
+            r[2] = f64::from(u8::from(i < 3)); // only 3 "charge 4" anchors
+        }
+        let bs = huber_fit(&drop_sparse_columns(xs, MIN_ANCHORS_PER_TERM), &y).unwrap();
+        assert!(bs[2].abs() < 1e-3, "{bs:?}");
         assert!(
             (b[1] + 3.0).abs() < 0.1 && (b[2] + 6.0).abs() < 0.1 && (b[3] - 0.2).abs() < 0.02,
             "{b:?}"
