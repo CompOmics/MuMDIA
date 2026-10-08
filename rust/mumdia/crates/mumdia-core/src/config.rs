@@ -2359,6 +2359,13 @@ pub struct RescoreConfig {
     /// Candidates examined per run: the top `shadow_region x accepted` rows by first-pass
     /// score.
     pub shadow_region: usize,
+    /// Fewest decoys the classifier is trained with. Below this the learned classifier
+    /// is not trained (a handful of decoys lets it overfit, one decoy then outranks every
+    /// target and nothing passes 1%): the candidates are ranked by their untrained
+    /// `prelim_score` and q-values come from plain target-decoy competition, with a
+    /// warning and `classifier = "prelim_score_few_decoys"` in the scored table's report.
+    /// A strict gate on a very small or very clean run can leave this few. 0 disables it.
+    pub min_train_decoys: usize,
 }
 
 fn default_margin_frac() -> f64 {
@@ -2400,6 +2407,7 @@ pub enum NegSelect {
 impl Default for RescoreConfig {
     fn default() -> Self {
         Self {
+            min_train_decoys: 100,
             shadow_min_shared: 0,
             shadow_ppm: 10.0,
             shadow_rt_s: 3.0,

@@ -2998,6 +2998,19 @@
       "source_struct": "RescoreConfig"
     },
     {
+      "path": "rescore.min_train_decoys",
+      "name": "min_train_decoys",
+      "section": "rescore",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 100,
+      "default_text": "100",
+      "help": "Fewest decoys the classifier is trained with. Below this the learned classifier is not trained (a handful of decoys lets it overfit, one decoy then outranks every target and nothing passes 1%): the candidates are ranked by their untrained `prelim_score` and q-values come from plain target-decoy competition, with a warning and `classifier = \"prelim_score_few_decoys\"` in the scored table's report. A strict gate on a very small or very clean run can leave this few. 0 disables it.",
+      "gates": [],
+      "source_struct": "RescoreConfig"
+    },
+    {
       "path": "quant.q_threshold",
       "name": "q_threshold",
       "section": "quant",

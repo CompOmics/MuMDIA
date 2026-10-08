@@ -762,10 +762,20 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     // The `MUMDIA_NN_*` knobs the NN worker inherited, when it ran (see `inherited_nn_env`).
     let mut nn_env: Option<std::collections::BTreeMap<String, String>> = None;
 
+    let n_train_decoys = is_decoy.iter().filter(|&&d| d).count();
     let mut scores = if n == 0 {
         classifier_used = "not_run_empty";
         model_identity = "none-empty-input".to_string();
         Vec::new()
+    } else if p.cfg.min_train_decoys > 0 && n_train_decoys < p.cfg.min_train_decoys {
+        tracing::warn!(
+            decoys = n_train_decoys,
+            min_train_decoys = p.cfg.min_train_decoys,
+            "rescore: too few decoys to train a classifier; ranking by the untrained              prelim_score with plain target-decoy competition"
+        );
+        classifier_used = "prelim_score_few_decoys";
+        model_identity = "prelim-score".to_string();
+        prelim.clone()
     } else {
         match p.cfg.classifier {
             RescorerKind::Mokapot => match run_pin_sidecar(
@@ -5760,6 +5770,40 @@ b
     }
 
     #[test]
+    fn too_few_decoys_rank_by_prelim_score_instead_of_training() {
+        // 24 rows, 12 decoys, under the default min_train_decoys (100): the requested
+        // sidecar is never needed (its interpreter does not exist), the rows are ranked by
+        // prelim_score, and the report records that substitution
+        let competed = scratch("fewdec_competed.parquet");
+        crafted_competed_table(&competed, 24);
+        let work = scratch("fewdec_work");
+        let out = scratch("fewdec_scored.parquet");
+        let cfg = RescoreConfig {
+            classifier: RescorerKind::NnTorch,
+            strict: true,
+            python: Some("mumdia-no-such-interpreter-for-this-test".to_string()),
+            ..Default::default()
+        };
+        run(RescoreParams {
+            competed: &[competed],
+            sources: None,
+            out: &out,
+            work_dir: &work,
+            script_dir: "scripts",
+            cfg: &cfg,
+            config_hash: "test",
+            shadow: None,
+        })
+        .unwrap();
+        let rep: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{out}.report.json")).unwrap();
+        assert_eq!(
+            rep["params"]["classifier"],
+            json!("prelim_score_few_decoys")
+        );
+    }
+
+    #[test]
     fn strict_sidecar_streams_the_handoff_without_building_a_matrix() {
         // End-to-end through `run`: under strict with a PIN sidecar the features go from
         // the competed parquet straight into the handoff, and no `FeatureMatrix` is
@@ -5784,6 +5828,9 @@ b
                 strict: true,
                 python: Some("mumdia-no-such-interpreter-for-this-test".to_string()),
                 handoff,
+                // 12 decoys: this test is about the sidecar path, so the few-decoy
+                // fallback (`min_train_decoys`) is off
+                min_train_decoys: 0,
                 ..Default::default()
             };
             let err = run(RescoreParams {

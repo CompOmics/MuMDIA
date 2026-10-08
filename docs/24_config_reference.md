@@ -68,7 +68,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
 | [`features`](#features) | `FeaturesConfig` | 11 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
-| [`rescore`](#rescore) | `RescoreConfig` | 26 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
+| [`rescore`](#rescore) | `RescoreConfig` | 27 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`quant`](#quant) | `QuantConfig` | 17 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`mbr`](#mbr) | `MbrConfig` | 9 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 3 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
@@ -451,6 +451,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `shadow_ppm` | `f64` | `10.0` |  | Fragment m/z tolerance (ppm) of the shadow test. |
 | `shadow_rt_s` | `f64` | `3.0` |  | Apex RT distance (seconds) within which a lender counts. |
 | `shadow_region` | `usize` | `8` |  | Candidates examined per run: the top `shadow_region x accepted` rows by first-pass score. |
+| `min_train_decoys` | `usize` | `100` |  | Fewest decoys the classifier is trained with. Below this the learned classifier is not trained (a handful of decoys lets it overfit, one decoy then outranks every target and nothing passes 1%): the candidates are ranked by their untrained `prelim_score` and q-values come from plain target-decoy competition, with a warning and `classifier = "prelim_score_few_decoys"` in the scored table's report. A strict gate on a very small or very clean run can leave this few. 0 disables it. |
 
 ## quant
 
@@ -1130,6 +1131,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-23 structs and 276 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 34 enumerations, 1 named profile(s), 98 environment variables read and 20 set.
+23 structs and 277 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 34 enumerations, 1 named profile(s), 98 environment variables read and 20 set.
 
 21 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
