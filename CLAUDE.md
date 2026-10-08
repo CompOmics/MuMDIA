@@ -249,12 +249,33 @@ is the decision record.
 
 ### Extraction gate and retention time
 
-`extract.gate_min_score` is named historically. Under the default
-`gate_mode = apex_pearson`, it thresholds observed-versus-predicted fragment
-intensities at one apex; it is not a chromatographic co-elution correlation.
-**The default is 0.2, and loose is now better for both rescorers.** Measured
-2026-08-28 on the AIF file under the current defaults, at an unchanged empirical
-decoy fraction of 0.0097-0.0098:
+**Since 2026-10-08 the default gate is `extract.gate_mode = window_mean` at
+`gate_min_score = 0.6`.** It scores the spectrum summed over the apex +-2 scans of the
+isolation window's acquisition grid: the mean of the sqrt entropy similarity, the
+observed share of predicted intensity and the sqrt cosine, minus
+`extract.gate_rt_weight` (0.2) times the apex RT error over the window half-width on
+its side. At near-single-ion intensities a fragment is present in one scan and absent
+in the next, so any single-scan score is noise; summed over five scans it is not.
+Measured with the other PR #166 options on (single seed), against the previous
+`apex_pearson` 0.2 gate and the ungated (gate 0) search:
+
+| search | `apex_pearson` 0.2 | gate 0 | `window_mean` 0.6 |
+|---|---|---|---|
+| Astral HYE, 6 runs: peptides / wall / peak | 124,623 / 20:41 / 18.0 GB | 127,861 / 33:25 / 50.0 GB | 127,849 / 14:41 / 15.5 GB |
+| Q Exactive AIF HYE, 6 runs | 87,559 / 24:34 / 22.8 GB | 88,524 / 49:23 / 64.9 GB | 88,526 / 16:16 / 18.4 GB |
+| Q Exactive AIF entrapment, real precursors at measured FDP 1% | 11,629 | 12,010 | 12,056 (FDP at q 1%: 1.00%) |
+
+It keeps every identification of the ungated search with a fifth to an eighth of its
+candidates (so the pooled rescore matrix stays small), and the reported 1% is calibrated
+on the entrapment pool. 0.65 is equal on HYE and -1.8% on entrapment. Still owed before
+anyone claims more: seeds, and an Astral entrapment. The 0.6 here is a window-mean score
+and has nothing to do with the apex-Pearson 0.6 rejected below.
+
+The history of the previous default, kept because its lesson holds: under
+`gate_mode = apex_pearson`, `gate_min_score` thresholds observed-versus-predicted
+fragment intensities at one apex; it is not a chromatographic co-elution correlation.
+Loose was better for both rescorers. Measured 2026-08-28 on the AIF file, at an
+unchanged empirical decoy fraction of 0.0097-0.0098:
 
 | gate | `native_tda` | `nn_torch` |
 |---|---|---|
@@ -579,9 +600,9 @@ sections 10-16:
   and every departure that helps one pool costs another. Do not retune them from a single
   benchmark. The only knob positive on every pool is `MUMDIA_NN_SEEDS=3` (+0.1 to +0.3 pp at
   3x training).
-- The extraction and RT defaults (`gate_min_score` 0.2, `rt_window_multiplier` 1.5,
-  `apex_count_window` 5) are likewise a measured local optimum on HYE end to end (docs/28
-  section 18); `window_holdout_frac` is neutral there with a pre-fine-tuned library.
+- The extraction and RT defaults (then `gate_min_score` 0.2 under `apex_pearson`, since
+  2026-10-08 `window_mean` 0.6; `rt_window_multiplier` 1.5, `apex_count_window` 5) were
+  likewise a measured local optimum on HYE end to end (docs/28 section 18); `window_holdout_frac` is neutral there with a pre-fine-tuned library.
 - Reference point, 2026-09-16: the six Astral files end to end (`mumdia run` with six
   `--mzml`, imported HYE library, multi-head calibration on the first run and reuse, pooled
   `nn_torch` rescore) take 52.5 min at a 13.25 GB process-tree peak on an EPYC 9354 with 32
@@ -726,8 +747,10 @@ sensitivity result for it.
   returns 1.0% FEWER peptides from them, costing an hour of pooled rescore. That is
   the fallback showing up as measured cost. Still one acquisition and no entrapment,
   so the promotion stays a correctness result rather than a sensitivity one.
-- `extract.gate_min_score` stays `0.2`. It was briefly changed to `0.6`, the
-  documented optimum for the default `native_tda` rescorer, and then measured: 0.6
+- `extract.gate_min_score` stayed `0.2` under `apex_pearson` until the window-mean gate
+  replaced it (2026-10-08, see "Extraction gate and retention time"; that change rests on
+  a measurement, not on this history). It was briefly changed to an apex-Pearson `0.6`,
+  the documented optimum for the default `native_tda` rescorer, and then measured: 0.6
   costs 4.4% of peptides for `native_tda` and 4.7% for `nn_torch` at an unchanged
   decoy fraction, because the gate sweep in `docs/18` was taken on the raw library
   before the current defaults and its optimum has since moved to the loose end for

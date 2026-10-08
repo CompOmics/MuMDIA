@@ -1705,11 +1705,11 @@ impl Default for ExtractConfig {
             // (which decides the pre-FDR competition winner), `rt_error_abs`,
             // `log_apex_intensity`, and quant's integration centre.
             apex_evidence_rank: true,
-            apex_refine_intensity: false,     // benchmark-gated
-            emit_gate_diagnostics: false,     // diagnostic gate-score columns; off in production
-            gate_mode: GateMode::ApexPearson, // legacy single-scan intensity Pearson
-            gate_coelution_min: 0.5,          // used only by GateMode::Combined
-            gate_rt_weight: 0.2,              // used only by GateMode::WindowMean
+            apex_refine_intensity: false,    // benchmark-gated
+            emit_gate_diagnostics: false,    // diagnostic gate-score columns; off in production
+            gate_mode: GateMode::WindowMean, // window-summed agreement minus RT term (since 2026-10-08)
+            gate_coelution_min: 0.5,         // used only by GateMode::Combined
+            gate_rt_weight: 0.2,             // used only by GateMode::WindowMean
         }
     }
 }
@@ -3720,6 +3720,20 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_extraction_gate_is_window_mean_at_0_6() {
+        // Both the field default and the enum default: ExtractConfig::default() used to
+        // set the mode explicitly, so changing only the enum's #[default] left the engine
+        // on apex_pearson.
+        let e = ExtractConfig::default();
+        assert_eq!(e.gate_mode, GateMode::WindowMean);
+        assert_eq!(e.gate_min_score, 0.6);
+        assert_eq!(e.gate_rt_weight, 0.2);
+        assert_eq!(GateMode::default(), GateMode::WindowMean);
+        let parsed: ExtractConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.gate_mode, GateMode::WindowMean);
+    }
 
     #[test]
     fn quant_fixed_window_fields_round_trip_and_are_validated() {

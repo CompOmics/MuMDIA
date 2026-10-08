@@ -298,7 +298,8 @@ peptides (`docs/04_convert.md`).
 Library-input mode plus the local sidecar config. `run` skips
 digest/peptidoforms/predict-frag and consumes the prebuilt library
 (`main.rs:208-215`). The config `configs/examples/diann-library.json` turns on:
-Extended features, `gate_min_score = 0.2`, rolling-window apex (5) and RT prior
+Extended features, the window-mean extraction gate at `gate_min_score = 0.6` (the
+default since 2026-10-08), rolling-window apex (5) and RT prior
 (120 s), the per-run DeepLC fine-tune, the `nn_torch` rescorer with
 `rescore.strict = true`, an RT-window multiplier of 1.5, and
 `quant.q_filter = run_psm_q`. Both interpreters are `"auto"`, so they are
