@@ -1,6 +1,7 @@
 # TIMS speed roadmap: wall time and memory of the best diaPASEF pipeline
 
-Status, 2026-10-06: M0 reviewed; plan approved; steps 1-8 carried out (section 7); summary in section 8.
+Status, 2026-10-07: M0 reviewed; plan approved; steps 1-8 carried out (section 7); summary in section 8.
+Profile of the diaPASEF-specific steps and levers R1-R6 in section 10; R1 taken (10.8, 10.9: 1:49:37 to 1:41:23, byte-identical), R2, R3 and R4 dropped (10.10), R5 and R6 dropped by decision (2026-10-08).
 
 ## 1. Scope
 
@@ -745,3 +746,302 @@ The 800 s quoted for six HYE files was not reproduced here. The closest arm is A
 which 3.6 min is the multi-head calibration). More threads or a warm projection cache could bring an
 A0-like setting near 800 s, but that was not measured. The figure does not apply to the target
 pipeline, which does about 8x the extraction work per run and two rescores.
+
+## 10. The diaPASEF-specific steps: where the time goes (2026-10-07)
+
+Status: profiling done (goal 1); levers ranked below; no engine code written. Waiting for review.
+
+### 10.1 Method
+
+- **Inputs:** v_sp4b's r0 pass-2 inputs (refit library, `run_windows.parquet`, mass calibration),
+  64 threads, warm inputs. Extract and retrace reproduce v_sp4b's `psms_extracted`,
+  `chromatograms.parquet` and `psms_extracted.repick.parquet` byte for byte.
+  - A first attempt read `run_windows_refit.parquet`, which pass 2 does not use (extract reads
+    `run_windows.parquet`, written 3 s later). Its outputs differed and it is kept as
+    `sp5_prof_wrongwin/`.
+- **Profiles** (`sp5_prof/`, harness `quant_diag/m0/sp5_prof.sh`): a symbolised build of HEAD
+  (`~/.cache/mumdia-symtgt/release/mumdia`), gdb stack samples every 3 s
+  (`m0_gdbprof.sh`), folded by phase with `quant_diag/m0/sp5_fold.py`. gdb stops all threads per
+  sample, so walls under the profiler are 1.5-2x longer. Walls and per-phase times below come from
+  the engine's own timers and logs in v_sp4b (quiet host, 64 GB budget) and from unprofiled probes;
+  the profiles give the shares inside a phase.
+- **Probes** (`sp5_probe/`, `sp5_probe.sh`): extract alone with the codec pool at 8 and 32, two runs
+  each, alternating, `mumdia-sp4`; all four byte-identical.
+- **Prototype outside the engine** (scratchpad crate `census`): a raw-event census of the r0 `.d`
+  and a benchmark of retrace's TOF-window lookup on the decoded r0 frames.
+- **dnoise** 0.5.0 (commit 9beeb3d), built from source, defaults, on r0.
+
+### 10.2 Retrace
+
+Per call (v_sp4b, r0 pass 1, 153 s inside the engine; pass-2 calls 164-194 s):
+
+| part | wall | kind |
+|---|---|---|
+| frame index and decode, warm `.d` | 2.6 s | decode (23-61 s when the `.d` is cold, section 7.3) |
+| repick | 33 s | compute |
+| trace phase: read, sum, write in a pipeline | 118 s | compute-bound: sum 101 s; writer busy 72 s; readers 176 thread-s over 8 readers |
+| apex sidecar and report | 6 s | write |
+
+What the compute is (profile, busy thread-samples):
+- **Trace phase:** 69.5% in the binary search that finds the first event of each TOF window in a
+  frame (`partition_point`, `retrace.rs:206`, called from `sum_events`). The linear walk over the
+  events in the window (`retrace.rs:207-214`) is about 7%. Parquet list decode of the input
+  (`table.rs:1862`) is 6.8%, allocation about 5%.
+- **Repick:** the same binary search, from `joint_score`.
+- Over the whole call, 80% of the busy samples after the decode have `select_unpredictable` (the
+  binary search) as the top frame.
+- In about a third of the trace-phase samples the sum stage is idle, waiting on the writer.
+
+Reading: retrace costs one binary search per (row, grid point), over a frame that holds 28,300
+events on average (MS2; MS1 frames hold 425,700). That is a cache-miss-bound random walk, which also
+explains why concurrent retraces were memory-bound (section 3.5) and why the scan-block index of
+L14 did not help (it added searches). The number of events matters little; the number of queries
+matters.
+
+**Prototype of the fix** (scratchpad `census/src/bin/lut.rs`): a per-frame table of the first event
+of each TOF bucket, then the binary search inside that bucket. On all 34,780 MS2 frames of r0 and
+500M random window starts:
+
+| bucket | table size (r0, MS2) | binary search | table + search | speed-up | same index |
+|---|---|---|---|---|---|
+| 64 TOF indices | 864 MB | 5.4-5.6 s | 1.32 s | 4.1-4.3x | all 500M |
+| 256 TOF indices | 216 MB | 5.3-5.9 s | 1.63-1.80 s | 3.3x | all 500M |
+
+### 10.3 Extract
+
+Per call: 82 s (pass 1, and every unprofiled probe: 1:22.2, 1:22.9, 1:23.1, 1:25.4); pass-2 calls in
+v_sp4b 110-126 s.
+
+| part | wall | kind |
+|---|---|---|
+| load spectra and library | 3-4 s warm; **25-43 s in pass 2** | I/O: the pooled rescore's 120 GB of file pages evict them from the page cache; HDD |
+| probe all windows | about 20 s at 45-64 threads | compute (fragment index probe) |
+| traces and chromatogram write | about 55 s | writer-bound: writer busy 57.6 s, producers blocked 20-22 s |
+| top-K peak table, `psms_extracted` | 3-4 s | write |
+
+- After the probe phase, most samples show 5-7 busy threads: 31% column encoding (`codec.rs:375`),
+  12% `madvise`, 13% realloc and dealloc, 8% `group_hits_by_candidate`. Short bursts at 70 threads
+  are the per-window trace sums, where the MS1 `sum_near` binary search (`extract.rs:1510`) is the
+  largest item.
+- **A larger codec pool does not help:** `MUMDIA_PARQUET_THREADS=32` 1:22.9 and 1:25.4 against
+  1:22.2 and 1:23.1 at 8; writer busy 57.7 s against 57.6 s; byte-identical. The writer's bound is
+  its serial part (array assembly and allocation), not encoding.
+
+### 10.4 Features
+
+Per call 63-71 s (v_sp4b). The standalone call did not reproduce v_sp4b's `features.parquet` with
+either seed table (`seed_psms.parquet`, `pass1_seed.parquet`), so one input of the pipeline's pass-2
+call is not yet identified; the code path is the same, so the profile stands. Engine timers
+(profiled run): wall 79 s, five loaders busy 343 s in total,
+compute 27 s, assemble 49 s, writer 30 s. The pass is bound by the parquet decode of the 17 GB
+chromatogram table (`table.rs:2764`), as section 7.5 found. Five loaders is the most one pass can
+lease (`MAIN_LOADER_EXTRAS = 4`).
+
+### 10.5 The three diaPASEF-specific steps
+
+**Gate 0 (candidate volume, A0 to A1).** It adds per run 51 s to extract and 33 s to features, and
+294 s to the pooled rescore worker. Under retrace it also sets the number of retrace queries (6.9M
+candidates, 104M rows per run). The extra time is the same work on 3x the rows; no step is
+specifically slow on the extra candidates.
+
+**A cheap pre-filter before retrace does not exist in the extract columns** (r0 pass 1, 6.94M
+candidates, 84,155 targets accepted on `run_psm_q` <= 0.01):
+
+| filter | candidates kept | accepted lost |
+|---|---|---|
+| `n_matched_fragments` >= 6 | 98.8% | 0.05% |
+| `coelution_run` >= 4 | 95.3% | 1.50% |
+| `apex_intensity` above its 10th percentile | 90.0% | 1.68% |
+| `prelim_score` above its 20th percentile (needs features) | 80.0% | 0.44% |
+
+The extract-level columns barely separate accepted from rejected candidates (extract already
+requires 3 matched fragments and a run of 3). A filter would need a learned score, the full seed
+and entrapment gate, and would save at most about 20% of the volume. Not pursued.
+
+**Retrace.** Section 10.2: compute-bound in one binary search, not in decode, I/O or event volume.
+
+**The refit's pass 2** (v_sp4b, about 35 min): per run refit 9 s, extract 110-126 s, retrace
+168-194 s, features 67-71 s, compete 5 s; two multi-head calibrations on r0 (67 and 70 s); pooled
+rescore 700 s (handoff 142 s, worker 461 s, q and write 97 s).
+- **Reuse of pass 1 is not possible at the artifact level.** Pass 2 extracts 97% of pass 1's
+  candidates, but every RT window moved (none is nested in its pass-1 window), and only 55% keep the
+  same extract apex and 51% the same repicked apex. The traces are on different grids and bands.
+- What pass 2 could reuse is the decode, which costs 2.6 s on a warm `.d`. Decoding once per run is
+  therefore not a lever on a host whose page cache holds the `.d`; section 7.3 covers the cold case.
+
+### 10.6 Raw-event filtering and dnoise
+
+**Census of r0** (scratchpad `census`, every frame; neighbourhood: same scan or scan +-1 and
+|dTOF| <= 3):
+
+| | events | intensity floor | isolated events (no neighbour) | their intensity | events in a 1/K0 streak of >= 5 scans | their intensity |
+|---|---|---|---|---|---|---|
+| MS1 (4,348 frames) | 1,851M | all >= 5 | 72.3% | 52.6% | 11.8% | 35.1% |
+| MS2 (34,780 frames) | 985M | all >= 5 | 79.2% | 67.4% | 7.3% | 19.5% |
+
+The instrument already removed every event below intensity 5, so an intensity floor has nothing
+cheap to remove. Most of the intensity on this low-load timsTOF SCP data sits in isolated events
+and short streaks: a streak or isolation filter removes signal, not only noise.
+
+**dnoise** (defaults; dry run and written outputs in `sp5_dnoise/`):
+
+| mode | MS1 events kept | MS1 intensity kept | MS2 events kept | MS2 intensity kept | `.d` size |
+|---|---|---|---|---|---|
+| MS1 only (default) | 8.6% | 22.3% | 100% | 100% | 3.3 GB (from 7.0) |
+| MS1 + MS/MS (`--denoise-msms`) | 8.6% | 22.3% | 32.7% | 43.3% | 1.5 GB |
+
+- Part of the MS1 removal is the out-of-window gate (precursors never fragmented), which the
+  engine never reads anyway.
+- **Speed and memory** (`quant_diag/m0/sp5_dn.sh`, `sp5_dnoise/`; r0, `mumdia-sp4`, 64 threads, warm
+  `.d`, 1-minute load 2-3 at each start). Retrace reads the same extract output (from the original
+  `.d`) in all three arms, so the queries are the same and only the raw events differ.
+
+  | | original | dnoise MS1 | dnoise MS1 + MS/MS |
+  |---|---|---|---|
+  | convert | 20.6 s | 6.4 s | 4.5 s |
+  | retrace wall | 2:38 | 2:30 (-5%) | 1:54 (-28%) |
+  | retrace sum / write (engine timers) | 102 / 71 s | 94 / 68 s | 68 / 65 s |
+  | retrace peak RSS | 38.8 GB | 23.3 GB | 16.1 GB |
+  | raw events summed | 13.5G | 10.3G | 8.8G |
+
+  - The retrace speed-up with MS/MS filtering (-34% in the sum) is larger than the query count
+    predicts. Smaller frames make each binary search cheaper in cache, so after R1 most of this
+    speed gain is expected to go.
+  - The memory gain does not depend on R1: the held frames shrink from 39 to 16-23 GB. Under the
+    64 GB budget that would let two chains run at once.
+  - Convert saves 14-16 s per run.
+- **Signal:** keeping 22% of the MS1 intensity and 43% of the MS2 intensity is a large change of the
+  raw signal; it needs the full ID, quant and entrapment gate.
+- **Decision (2026-10-07): MS/MS denoising is a no-go.** It removes 57% of the MS2 intensity, and
+  its speed gain mostly overlaps R1. MS1-only denoising (not decided) buys 5% of retrace and 15 GB
+  of retrace memory and removes 78% of the MS1 intensity; it is not recommended for speed.
+
+### 10.7 Levers, ranked by saved wall over code
+
+Savings for the target pipeline (v_sp4b, 1:49:37, chains one at a time under the 64 GB budget; 12
+extract, retrace and features calls).
+
+| # | lever | evidence | saving, estimate | code | level |
+|---|---|---|---|---|---|
+| R1 | retrace: per-frame TOF bucket table before the binary search (`retrace.rs:206`), for the sums and the repick | 70-80% of retrace's busy samples; prototype 4.1x, identical indices | per call: repick 33 to about 12 s, sum 101 to about 40 s, then the writer (72 s busy) binds; about 150 to 95 s. **About 11 min** over 12 calls | about 30 lines, one file; +0.2-0.9 GB per retrace | B |
+| R2 | retrace writer, once R1 makes it the bound: codec pool and row groups in flight | writer busy 72 s of the 118-s phase; L6 was noise while the sum was the bound | up to about 20 s per call, **about 4 min** | none to test (`MUMDIA_PARQUET_THREADS`); then a constant | B |
+| R3 | features: more chromatogram loaders per pass (`MAIN_LOADER_EXTRAS` 4 to 8) | loader-bound: 343 loader-s, compute 27 s | 63-71 to about 45 s per call, **about 4 min** | one constant; a probe build to measure | B |
+| R4 | pass-2 extract: read the spectra and the library ahead while the refit's DeepLC calibration runs (no I/O then, unlike L9) | 25-43 s cold loads per pass-2 extract on this HDD | **about 3 min**; zero on a node whose page cache or SSD holds them | small | B |
+| R5 | extract writer: the serial array assembly and allocation (`into_array`, realloc, `madvise`) | writer busy 57.6 s whatever the codec pool; producers blocked 21 s | up to about 20 s per call, about 4 min | medium; needs a finer profile of the writer thread first | B |
+| R6 | extract to retrace without the 12 GB centroid table (retrace takes extract's rows in memory) | removes extract's trace write (part of R5) and retrace's reads | overlaps R2 and R5; about 2-4 min more | high | B |
+
+Not recommended, with the measurement:
+- **Raw-event filters and dnoise:** retrace -5% (MS1) or -28% (MS1 + MS/MS) before R1, mostly the
+  same gain as R1; retrace memory 39 to 16-23 GB; but 57-78% of the intensity removed (section
+  10.6). Needs the full gate before any use.
+- **Pre-filter of the candidates before retrace:** no cheap score keeps the gain (section 10.5).
+- **Decode the `.d` once per run:** warm decode is 2.6 s per call.
+- **Reuse pass 1 in the refit's pass 2:** windows and apexes moved (section 10.5).
+- **Larger extract codec pool:** measured, no change (section 10.3).
+
+R1 to R4 together: about 20 min of the 110, all byte-identical, mostly small code. After R1 the
+retrace writer and the extract writer are the next bounds of the per-run chains.
+
+### 10.8 R1 taken; R2 dropped (2026-10-07)
+
+**R1:** `TofFrame` keeps a table of the first event of each 64-index TOF bucket, and
+`visit_events` searches only that bucket (`TofFrame::first_at`). The unit test
+`first_at_equals_the_whole_frame_search` pins it to the whole-frame `partition_point`, including
+empty buckets, a bucket edge and an empty frame.
+
+Retrace r0 on v_sp4b's pass-2 inputs (`quant_diag/m0/sp5_r1.sh`, `sp5_r1/`), 64 threads, warm `.d`,
+quiet host (1-minute load 1.7-2.2 at each start), alternating, two repeats. `~/bin/mumdia-sp5` is
+HEAD plus R1 (patch next to the binary).
+
+| | sp4 (before) | sp5 (R1) | sp5, codec pool 32 (R2) |
+|---|---|---|---|
+| wall | 2:37.4, 2:37.1 | **1:47.0, 1:44.3** | 1:45.6, 1:44.9 |
+| frame decode + repick | 32 s | 19 s | 19 s |
+| trace phase | 117 s | 77-79 s | 78-79 s |
+| `ms_sum` / `ms_write` | 101 / 69 s | 59-61 / 67-68 s | 60 / 68 s |
+| peak RSS | 38.7-38.8 GB | 39.6-39.8 GB | 39.5-39.6 GB |
+| chromatograms and repick table | byte-identical to v_sp4b | byte-identical | byte-identical |
+
+- **R1: -51 s per retrace (-33%), level B.** 12 retraces in the target pipeline: about 10 min.
+  Memory +0.9 GB per retrace, as the prototype predicted.
+- **R2 dropped.** After R1 the trace phase is not bound by the codec pool: 32 threads give the same
+  wall. Sum (60 s) and writer (68 s) are now close, and neither alone bounds the 78-s phase.
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` and
+  `cargo test --workspace` clean.
+- Not yet measured: R1 in a full e2e run (the per-run chains, pass 1 and pass 2).
+
+**R3 dropped** (`quant_diag/m0/sp5_r3.sh`, `sp5_r3/`). Probe build with `MAIN_LOADER_EXTRAS` 8;
+features r0 on the retrace output of section 10.1, 64 threads, warm input, quiet host, alternating,
+two repeats:
+
+| `chrom_loaders` | wall | peak RSS | binding |
+|---|---|---|---|
+| 5 (default) | 46.7, 45.8 s | 7.2-7.3 GB | compute |
+| 7 | 46.2, 43.6 s | 8.3-8.4 GB | compute |
+| 9 | 46.2, 46.4 s | 9.7 GB | compute |
+
+All six outputs are byte-identical. With a warm input the pass is bound by compute and assembly on
+the main thread (about 40 s), not by the loaders, so more loaders change nothing. The 63-71 s per
+call inside v_sp4b, and the loader-bound timers of section 10.4, come from reading the 17 GB table
+that retrace has just written while its pages are still being written back to the HDD. That is
+the disk, not the decode. The constant stays 4.
+
+### 10.9 R1 in the target pipeline (`v_sp5`, 2026-10-07)
+
+`quant_diag/m0/v_sp5.sh`: v_sp4b's config, 64 GB budget, quiet host (1-minute load 0.6 at the start;
+the maximum during the run, 64.8, is its own 64 threads), fresh cache. The binary
+`~/bin/mumdia-sp5e` is v_sp4b's source (3f8516c plus the speed changes, version 0.4.0, rebuilt in a
+scratch worktree) plus R1, so R1 is the only difference (`source.patch` beside the binary).
+
+| | v_sp4b | v_sp5 (R1) |
+|---|---|---|
+| wall | 1:49:37 | **1:41:23** |
+| tables against v_sp4 | 246 byte-identical | **246 byte-identical** |
+| retrace per call | 160-194 s | 101-119 s |
+| pass-1 chains | 1,661 s | 1,313 s |
+| refit and pass 2 | 2,410 s | 1,918 s |
+| convert | 128 s | **602 s** |
+| everything else (seed, multi-head, rescores) | within 70 s | |
+
+- **R1 saves about 14 min of the target pipeline (840 s of retrace), level B.**
+- Convert took 474 s longer because the six `.d` were cold on the HDD (the same effect as in section
+  7.4). Convert is unchanged and its output identical. Without it the run would take about
+  1:33-1:35.
+- Largest process 130.6 GB, as before (the rescore worker's mapped matrices).
+
+Where the per-run chain time goes now, per call: extract 82-126 s (writer-bound; pass 2 adds 25-43 s of
+cold input reads on this HDD), retrace 101-119 s, features 63-71 s (46 s with a warm input). The next
+levers by size are R4 (pass-2 read-ahead, about 3 min on this host) and R5/R6 (the extract writer).
+
+### 10.10 R4 prototyped and dropped (2026-10-08)
+
+Prototype without engine code (`quant_diag/m0/v_sp5r4.sh`, `v_sp5r4/`): the v_sp5 run (same binary,
+config and harness) plus a watcher on the log that reads the pass-2 extract inputs ahead with `cat`.
+When r0's refit starts (its DeepLC calibrations use no disk), it reads the l1d fragments and r0's
+spectra; when run rK's refit starts, it reads rK+1's spectra. Quiet host (1-minute load 1.3 at the
+start).
+
+| | v_sp5 | v_sp5r4 (read-ahead) |
+|---|---|---|
+| wall | 1:41:23 | 1:36:54 |
+| tables against v_sp4 | 246 byte-identical | 246 byte-identical |
+| pass-2 extract input loads | 3-4 s, except r0 36 s and r3 26 s | 3-4 s in all six |
+| pass-2 extracts | 600 s | 574 s (-26 s) |
+| refit and pass 2 | 1,918 s | 1,911 s (-7 s) |
+| convert | 602 s (cold `.d`) | 134 s (warm `.d`) |
+| pass-1 chains / rescore worker | 1,313 / 1,059 s | 1,443 / 1,156 s |
+
+- The read-ahead removes the cold loads, but in v_sp5 only two of six were cold, and the
+  refit-and-pass-2 phase moves by 7 s. The 4.5 min between the two walls is convert (warm `.d` this
+  time), partly offset by +130 s in the pass-1 chains and +97 s in the rescore worker, which R4 does
+  not touch: run-to-run variance.
+- Whether the pass-2 inputs are cold depends on what else the page cache held (all six in v_sp4b,
+  two in v_sp5). On this host R4 saves 0.5-3 min at best. Dropped under the rule to skip small wins;
+  no engine code written.
+- Run-to-run variance of a whole run on this host is several minutes (convert alone 134-602 s with
+  cold or warm `.d`). Single-run wall comparisons below about 5 min are not meaningful here; levers
+  are judged on their phases.
+
+**R5 and R6 dropped (decision, 2026-10-08).** The extract writer (busy about 58 s per call) would
+save a few minutes at most, for medium to high effort and a finer profile first. Section 10 ends
+with R1 as the one lever taken.

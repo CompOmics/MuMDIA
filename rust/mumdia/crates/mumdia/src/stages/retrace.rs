@@ -155,13 +155,19 @@ fn scan_band(scan_im: &[f64], lo: f64, hi: f64) -> (usize, usize) {
 /// A held frame: its quad settings and its raw events sorted by TOF, each packed as
 /// `tof << 44 | scan << 32 | intensity`, so a TOF window is one binary search over the whole
 /// frame instead of two per TIMS scan in the band. 8 bytes per event, as the decoded frame.
+/// `lut[k]` is the index of the first event with TOF index >= `k << LUT_SHIFT`, so that search
+/// covers one bucket: the whole-frame binary search was most of retrace's time, as cache misses
+/// (docs/TIMS_SPEED_ROADMAP.md section 10.2).
 struct TofFrame {
     quad: Arc<QuadrupoleSettings>,
     ev: Vec<u64>,
+    lut: Vec<u32>,
 }
 
 const TOF_SHIFT: u32 = 44;
 const SCAN_SHIFT: u32 = 32;
+/// 64 TOF indices per bucket: about 6,000 entries (25 KB) per frame, 0.9 GB for a HYE run.
+const LUT_SHIFT: u32 = 6;
 
 impl TofFrame {
     fn new(f: Frame) -> Result<TofFrame> {
@@ -186,10 +192,37 @@ impl TofFrame {
             }
         }
         ev.sort_unstable();
+        let n_buckets = ev
+            .last()
+            .map_or(0, |&e| (e >> TOF_SHIFT >> LUT_SHIFT) as usize + 1);
+        let mut lut = Vec::with_capacity(n_buckets + 1);
+        let mut i = 0usize;
+        for k in 0..=n_buckets as u64 {
+            while i < ev.len() && ev[i] >> TOF_SHIFT >> LUT_SHIFT < k {
+                i += 1;
+            }
+            lut.push(i as u32);
+        }
         Ok(TofFrame {
             quad: f.quadrupole_settings,
             ev,
+            lut,
         })
+    }
+
+    /// Index of the first event with TOF index >= `t`; the same as a whole-frame
+    /// `partition_point`.
+    fn first_at(&self, t: u32) -> usize {
+        let k = (t >> LUT_SHIFT) as usize;
+        match (self.lut.get(k), self.lut.get(k + 1)) {
+            (Some(&a), Some(&b)) => {
+                let (a, b) = (a as usize, b as usize);
+                a + self.ev[a..b].partition_point(|&e| e < (t as u64) << TOF_SHIFT)
+            }
+            // the closing entry, `ev.len()`: `t` lies past every event
+            (Some(&a), None) => a as usize,
+            _ => self.ev.len(),
+        }
     }
 }
 
@@ -203,8 +236,7 @@ fn visit_events(
     n_scans: usize,
     mut g: impl FnMut(usize, f64),
 ) {
-    let i0 = f.ev.partition_point(|&e| e < (t_lo as u64) << TOF_SHIFT);
-    for &e in &f.ev[i0..] {
+    for &e in &f.ev[f.first_at(t_lo)..] {
         if (e >> TOF_SHIFT) as u32 > t_hi {
             break;
         }
@@ -1191,6 +1223,26 @@ mod tests {
             collision_energy: vec![0.0, 0.0],
         });
         f
+    }
+
+    #[test]
+    fn first_at_equals_the_whole_frame_search() {
+        let mut f = frame();
+        // events across several buckets, one on a bucket edge, and an empty bucket between
+        f.tof_indices[0] = 64;
+        f.tof_indices[1] = 1000;
+        let fr = TofFrame::new(f).unwrap();
+        for t in 0..1200u32 {
+            let want = fr.ev.partition_point(|&e| e < (t as u64) << TOF_SHIFT);
+            assert_eq!(fr.first_at(t), want, "t = {t}");
+        }
+        let empty = TofFrame::new(Frame {
+            scan_offsets: vec![0],
+            ..Frame::default()
+        })
+        .unwrap();
+        assert_eq!(empty.first_at(0), 0);
+        assert_eq!(empty.first_at(500), 0);
     }
 
     #[test]
