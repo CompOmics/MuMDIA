@@ -354,6 +354,29 @@ fn adapt_rt_library(
     // drift is then absorbed by `rt_im_train`'s per-run calibration below, which is fitted
     // separately for every run regardless.
     let mut produced_rt_lib: Option<String> = None;
+    // The anchor cut (`rt_im_train::plan_anchors`): relaxed on a seed short of anchors, and
+    // when still short the multi-head calibration is skipped for this run, which then keeps
+    // `lib_p_base` and adapts nothing for the runs after it to reuse.
+    let anchor_plan =
+        if shared_rt_lib.is_none() && (mh_heads > 0 || cfg.rt_im_train.finetune_deeplc) {
+            Some(rt_im_train::plan_anchors(seed, &cfg.rt_im_train)?)
+        } else {
+            None
+        };
+    let anchor_q = anchor_plan.map_or(cfg.rt_im_train.q_train, |a| a.q_train);
+    let mh_heads = match anchor_plan {
+        Some(a) if mh_heads > 0 && !a.sufficient => {
+            if irt_placeholder {
+                anyhow::bail!(
+                    "the library carries placeholder retention times for the multi-head                      calibration to replace, but the seed search of {out} found only {} target                      anchors even at q {}; re-run without predict_frag.defer_deeplc_to_multihead",
+                    a.n_anchors,
+                    a.q_train
+                );
+            }
+            0
+        }
+        _ => mh_heads,
+    };
     let lib_p = if let Some(shared) = shared_rt_lib {
         // A previous run already adapted the library and `experiment.rt_library_scope`
         // says to reuse it. Which mechanism produced it does not matter here: the
@@ -378,7 +401,7 @@ fn adapt_rt_library(
             seed,
             &lib_p_mh,
             mh_heads,
-            cfg.rt_im_train.q_train,
+            anchor_q,
             cfg.rt_im_train.window_holdout_frac,
             threads,
             cfg.rt_im_train.deeplc_predict_shards,
@@ -408,7 +431,7 @@ fn adapt_rt_library(
             &lib_p_ft,
             cfg.rt_im_train.finetune_epochs,
             cfg.rt_im_train.finetune_patience,
-            cfg.rt_im_train.q_train,
+            anchor_q,
             cfg.rt_im_train.finetune_batch,
             // Keep the fine-tune exclusion aligned with rt-im-train's holdout
             // split (see run.rs); 0.0 (default) changes nothing.
@@ -438,6 +461,10 @@ fn finish_run(
 ) -> Result<(String, String)> {
     let d = |name: &str| format!("{out}/{name}");
     let windows = d("run_windows.parquet");
+    let rt_cfg = rt_im_train::with_anchor_cut(
+        &cfg.rt_im_train,
+        &rt_im_train::plan_anchors(seed, &cfg.rt_im_train)?,
+    );
     // Handed to extract in memory; see `rt_im_train::RtWindows`.
     let (_, fitted_windows) = rt_im_train::run_in_memory(rt_im_train::RtImTrainParams {
         precursor_span: None,
@@ -446,13 +473,15 @@ fn finish_run(
         library_precursors: lib_p,
         out_windows: &windows,
         out_cal: &d("cal.json"),
-        cfg: &cfg.rt_im_train,
+        cfg: &rt_cfg,
         config_hash: ch,
     })?;
     let survivors =
         prescreen::run_if_enabled(cfg, ch, &co.ms2, Some(&co.ms1), lib_p, &windows, out)?;
     let psms = d("psms_extracted.parquet");
     let chrom = d("chromatograms.parquet");
+    let ext_cfg =
+        crate::stages::ms1cal::extract_cfg(&cfg.extract, seed, &co.ms1, cfg.rt_im_train.q_train)?;
     extract::run(extract::ExtractParams {
         precursor_span: None,
         fragment_offset: None,
@@ -468,7 +497,7 @@ fn finish_run(
         out_psms: &psms,
         out_chrom: &chrom,
         restrict_candidates: survivors.as_deref(),
-        cfg: &cfg.extract,
+        cfg: &ext_cfg,
         config_hash: ch,
     })?;
     let feats = d("features.parquet");
@@ -1622,6 +1651,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .collect();
     let one_table_per_run = competed.iter().all(|tables| tables.len() == 1);
     let scored_combined = d("scored_combined.parquet");
+    let shadow_windows: Vec<String> = names
+        .iter()
+        .map(|nm| format!("{}/spectra/isolation_windows.parquet", d(nm)))
+        .collect();
     let scored_written = rescore::run_hashed(rescore::RescoreParams {
         competed: &rescore_inputs,
         sources: (!one_table_per_run).then_some(rescore_sources.as_slice()),
@@ -1630,6 +1663,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         script_dir: &cfg.predict_frag.sidecar_script_dir,
         cfg: &cfg.rescore,
         config_hash: &ch,
+        shadow: Some(crate::stages::shadow::ShadowInputs::new(
+            &lib_f,
+            &shadow_windows,
+        )),
     })?;
     // The classifier that actually ran, from the rescore artifact report: the source of
     // truth, since the configured enum can differ from it under a compatibility path.

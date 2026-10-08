@@ -114,6 +114,61 @@ impl Loess {
         }
     }
 
+    /// [`Loess::fit`] with `iters` robustness iterations (Cleveland 1979): after each fit
+    /// every anchor is reweighted by the bisquare of its residual over six median absolute
+    /// residuals, so a few gross outliers (false anchors) cannot pull the curve. 0 is
+    /// exactly [`Loess::fit`].
+    pub fn fit_robust(xs: &[f64], ys: &[f64], span: f64, grid_n: usize, iters: usize) -> Loess {
+        if iters == 0 || xs.len() < 4 {
+            return Loess::fit(xs, ys, span, grid_n);
+        }
+        let (slope, intercept) = linear_fit(xs, ys);
+        let mut idx: Vec<usize> = (0..xs.len()).collect();
+        idx.sort_by(|&a, &b| xs[a].total_cmp(&xs[b]));
+        let sx: Vec<f64> = idx.iter().map(|&i| xs[i]).collect();
+        let sy: Vec<f64> = idx.iter().map(|&i| ys[i]).collect();
+        let n = sx.len();
+        let k = ((span * n as f64).ceil() as usize).clamp(3, n);
+        let mut rw = vec![1.0f64; n];
+        for _ in 0..iters {
+            let resid: Vec<f64> = (0..n)
+                .map(|i| sy[i] - local_linear_w(&sx, &sy, Some(&rw), sx[i], k, slope, intercept).0)
+                .collect();
+            let abs: Vec<f64> = resid.iter().map(|r| r.abs()).collect();
+            let s = percentile(&abs, 0.5);
+            if !(s.is_finite() && s > 0.0) {
+                break;
+            }
+            for (w, r) in rw.iter_mut().zip(&resid) {
+                let u = r / (6.0 * s);
+                *w = if u.abs() < 1.0 {
+                    (1.0 - u * u).powi(2)
+                } else {
+                    0.0
+                };
+            }
+        }
+        let (lo, hi) = (sx[0], sx[n - 1]);
+        let gn = grid_n.max(2);
+        let mut grid_x = Vec::with_capacity(gn);
+        let mut grid_y = Vec::with_capacity(gn);
+        for g in 0..gn {
+            let x = lo + (hi - lo) * g as f64 / (gn - 1) as f64;
+            let (y, _) = local_linear_w(&sx, &sy, Some(&rw), x, k, slope, intercept);
+            grid_x.push(x);
+            grid_y.push(y);
+        }
+        let (lo_slope, hi_slope) = boundary_slopes(&grid_x, &grid_y, slope);
+        Loess {
+            grid_x,
+            grid_y,
+            slope,
+            intercept,
+            lo_slope,
+            hi_slope,
+        }
+    }
+
     /// Predict at x by linear interpolation over the grid. Outside the training range
     /// the local fit at the nearest boundary is continued (its value there and its
     /// slope), so the prediction is continuous across the boundary; see the type's
@@ -199,6 +254,20 @@ fn local_linear(
     slope: f64,
     intercept: f64,
 ) -> (f64, f64) {
+    local_linear_w(sx, sy, None, x0, k, slope, intercept)
+}
+
+/// [`local_linear`] with an optional per-point robustness weight multiplying the tricubic
+/// one (`None` is exactly the unweighted fit).
+fn local_linear_w(
+    sx: &[f64],
+    sy: &[f64],
+    rw: Option<&[f64]>,
+    x0: f64,
+    k: usize,
+    slope: f64,
+    intercept: f64,
+) -> (f64, f64) {
     let n = sx.len();
     // find window of k nearest by walking from the insertion point
     let mut lo = sx.partition_point(|&x| x < x0);
@@ -230,6 +299,10 @@ fn local_linear(
             t * t * t
         } else {
             0.0
+        };
+        let w = match rw {
+            Some(r) => w * r[i],
+            None => w,
         };
         sw += w;
         swx += w * sx[i];
@@ -369,5 +442,28 @@ mod tests {
     fn percentile_basic() {
         let v: Vec<f64> = (0..=100).map(|i| i as f64).collect();
         assert!((percentile(&v, 0.95) - 95.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn robust_loess_ignores_a_few_gross_outliers() {
+        // y = 2x + noise in [-1, 1] on 200 points, with five points 80 above the line in
+        // the middle (noise-free data would give a zero median residual, which stops the
+        // reweighting by design)
+        let xs: Vec<f64> = (0..200).map(|i| i as f64).collect();
+        let mut ys: Vec<f64> = xs
+            .iter()
+            .enumerate()
+            .map(|(i, x)| 2.0 * x + ((i * 37 % 21) as f64 - 10.0) / 10.0)
+            .collect();
+        for i in [95, 97, 99, 101, 103] {
+            ys[i] += 80.0;
+        }
+        let plain = Loess::fit(&xs, &ys, 0.3, 200);
+        let robust = Loess::fit_robust(&xs, &ys, 0.3, 200, 2);
+        assert!((plain.predict(100.0) - 200.0).abs() > 3.0);
+        assert!((robust.predict(100.0) - 200.0).abs() < 0.5);
+        // zero iterations is the plain fit, bit for bit
+        let zero = Loess::fit_robust(&xs, &ys, 0.3, 200, 0);
+        assert_eq!(zero.predict(57.3).to_bits(), plain.predict(57.3).to_bits());
     }
 }

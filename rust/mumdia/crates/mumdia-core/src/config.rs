@@ -1036,6 +1036,11 @@ pub struct SearchSeedConfig {
     /// removes any m/z-correlated curvature the flat offset leaves. Default false
     /// (scalar offset unchanged), opt-in and benchmark-gated.
     pub mass_cal_loess: bool,
+    /// Floor (ppm) on the fragment tolerance learned from the seed's calibrants, which
+    /// `extract` then searches with. Default 5, the value that was hard-coded. The learned
+    /// tolerance is `1.5 x p95(|deviation - median|)`; on an instrument whose fragment mass
+    /// error is well under a ppm (Astral) the floor, not the data, sets it.
+    pub frag_tol_floor_ppm: f64,
 }
 impl Default for SearchSeedConfig {
     fn default() -> Self {
@@ -1048,6 +1053,7 @@ impl Default for SearchSeedConfig {
             matcher: MatcherKind::Fragindex,
             two_pass_mass_cal: false,
             mass_cal_loess: false,
+            frag_tol_floor_ppm: 5.0,
         }
     }
 }
@@ -1069,8 +1075,27 @@ pub struct RtImTrainConfig {
     pub p_rt: f64,
     pub rt_window_multiplier: f64,
     pub min_seed_for_calibration: usize,
+    /// Relaxed `spectrum_q` cuts tried, in order, when fewer than
+    /// `min_seed_for_calibration` target anchors pass `q_train`. Rungs at or below
+    /// `q_train` are ignored; empty keeps the strict cut. When even the last rung is short,
+    /// the multi-head calibration is skipped (the library keeps base-model retention times)
+    /// instead of failing on an empty reference.
+    pub anchor_q_ladder: Vec<f64>,
     /// LOESS span (fraction of points in each local fit).
     pub loess_span: f64,
+    /// Robustness iterations of the RT LOESS (bisquare reweighting on six median absolute
+    /// residuals). 0 (default) is the plain fit; 2 keeps a handful of false seed anchors
+    /// from pulling the curve (single-cell runs: residuals of +14 to +82 s moved the
+    /// calibration 2-3 s across the mid-gradient).
+    pub loess_robust_iters: usize,
+    /// Correct each candidate's calibrated RT for the composition-dependent residual that
+    /// the predicted RT leaves (a per-run Huber regression of the anchors' residuals on
+    /// charge 3, charge >= 4, length, internal K/R, His and Met-ox): on the single-cell
+    /// Astral runs found charge-4 precursors elute 4.6-8.1 s before their calibrated
+    /// prediction and 8-14% of them fell outside the window. The window width is unchanged;
+    /// only its centre moves. Decoys share their target's composition, so their windows move
+    /// with it. Off by default.
+    pub composition_correction: bool,
     /// Fallback fixed RT window in seconds when calibration cannot be fit.
     pub fallback_rt_window_s: f64,
     /// Fine-tune the DeepLC multitask model on this run's confident seed PSMs
@@ -1136,6 +1161,17 @@ pub struct RtImTrainConfig {
     pub adaptive_rt_window: bool,
     /// Number of equal-width calibrated-RT bins for the adaptive window.
     pub adaptive_rt_bins: usize,
+    /// Widen-only local RT window: for every calibrated RT, the `local_window_anchors`
+    /// anchors nearest in calibrated RT give a signed-residual quantile on each side
+    /// (`(1 - p_rt) / 2` early, `(1 + p_rt) / 2` late) times `local_window_multiplier`, and
+    /// each side of the window becomes the larger of that and the global `w_rt`, capped at
+    /// `fallback_rt_window_s`. Where the predicted retention time loses the elution order
+    /// (typically the gradient ends) the anchors' residuals are one-sided and large, and the
+    /// window widens on that side only; elsewhere it stays the global window. 0 (default)
+    /// is off. Mutually exclusive with `adaptive_rt_window`.
+    pub local_window_anchors: usize,
+    /// Multiplier on the local one-sided quantiles of `local_window_anchors`.
+    pub local_window_multiplier: f64,
     /// Lower clamp (seconds) for any RT half-window (the existing 1 s floor).
     pub rt_window_min_s: f64,
     /// Size `w_rt` from HELD-OUT residuals instead of in-sample ones. A fraction of
@@ -1320,7 +1356,10 @@ impl Default for RtImTrainConfig {
             p_rt: 0.95,
             rt_window_multiplier: 1.0,
             min_seed_for_calibration: 50,
+            anchor_q_ladder: vec![0.02, 0.05],
             loess_span: 0.3,
+            loess_robust_iters: 0,
+            composition_correction: false,
             fallback_rt_window_s: 120.0,
             finetune_deeplc: false,
             multihead_calibration: None,
@@ -1329,6 +1368,8 @@ impl Default for RtImTrainConfig {
             finetune_batch: 0,     // 0 = auto-scale to seed size
             adaptive_rt_window: false,
             adaptive_rt_bins: 12,
+            local_window_anchors: 0,
+            local_window_multiplier: 1.0,
             rt_window_min_s: 1.0,
             window_holdout_frac: 0.0,
             library_irt: LibraryIrt::Auto,
@@ -1496,6 +1537,22 @@ pub struct ExtractConfig {
     /// it only with target-decoy/entrapment FDR validation. MS1 evidence is now
     /// computed before the gate so this can take effect.
     pub ms1_rescue: bool,
+    /// MS1 scans either side of the nearest one read for a precursor isotope: the apex
+    /// isotope intensities and every point of the MS1 grid traces take the maximum over
+    /// the nearest MS1 scan +- this many. 0 (default) reads the nearest scan only. At low
+    /// ion counts a mono peak present in both neighbouring MS1 scans is often missing from
+    /// the one nearest the apex, which then reads as no MS1 signal at all.
+    pub ms1_scan_halfwidth: usize,
+    /// Write each candidate's RT window (`rt_lo`, `rt_hi`) into `psms_extracted`, so the
+    /// features stage can scale the RT error by the window it was searched in (the
+    /// `rtw_*` family). Off by default: the table's schema stays byte-identical.
+    pub emit_rt_window: bool,
+    /// Learn the MS1 precursor mass offset from the confident seed anchors before extract
+    /// and centre every MS1 isotope read on it (`stages::ms1cal`). Off by default.
+    pub ms1_calibrate: bool,
+    /// MS1 precursor mass offset in ppm (observed - theoretical) applied to every MS1
+    /// isotope read. Set by `ms1_calibrate` in `run` / `run-experiment`; 0 by default.
+    pub ms1_ppm_offset: f64,
     /// Number of chromatographic peak hypotheses to enumerate per candidate.
     /// `K>1` writes up to K local maxima to the diagnostic
     /// `<out-psms>.peaks.parquet` sidecar. The primary PSM still contains only the
@@ -1566,6 +1623,10 @@ pub struct ExtractConfig {
     /// this while the peak-integrated spectral score exceeds `gate_min_score`.
     /// Requiring BOTH is more specific (rejects interferents that pass one axis).
     pub gate_coelution_min: f64,
+    /// Weight of the RT error in `GateMode::WindowMean`: the score is the mean of the
+    /// summed-window entropy, coverage and cosine minus this times the apex RT error over
+    /// the candidate's own window half-width on that side (clipped to 1).
+    pub gate_rt_weight: f64,
 }
 impl Default for ExtractConfig {
     fn default() -> Self {
@@ -1600,7 +1661,7 @@ impl Default for ExtractConfig {
             // flattened from below -- its count rose from 9,503 to 10,847 and the optimum
             // moved to the loose end -- so the sweep that motivated 0.6 no longer
             // describes this configuration, and loose is now better for BOTH rescorers.
-            gate_min_score: 0.2,
+            gate_min_score: 0.6, // with GateMode::WindowMean (default since 2026-10-08)
             min_matched_fraction: 0.0,
             apex_top_fragments: 0, // superseded by apex_count_tol; kept for compat
             apex_rt_prior_s: 0.0,  // RT prior off by default
@@ -1622,11 +1683,15 @@ impl Default for ExtractConfig {
             matcher: MatcherKind::Fragindex,
             min_coelution_run: 0, // disabled; scan_window floor still applies
             ms1_rescue: false,    // opt-in; relaxes acceptance, validate FDR first
-            retain_top_peaks: 1,  // legacy single-apex behaviour (K=1)
-            promote_top_peaks: 1, // top-K promotion off (only the selected apex is a row)
-            alt_peak_min_area_frac: 0.10, // alternate peak >= 10% of rank-0 area
+            ms1_scan_halfwidth: 0,
+            emit_rt_window: false,
+            ms1_calibrate: false,
+            ms1_ppm_offset: 0.0,
+            retain_top_peaks: 1,            // legacy single-apex behaviour (K=1)
+            promote_top_peaks: 1,           // top-K promotion off (only the selected apex is a row)
+            alt_peak_min_area_frac: 0.10,   // alternate peak >= 10% of rank-0 area
             alt_peak_min_separation_s: 5.0, // alternate apex >= 5 s from rank-0 apex
-            emit_candidate_audit: false, // diagnostic; off in production
+            emit_candidate_audit: false,    // diagnostic; off in production
             // On. The legacy signature-intensity apex scores a scan group by the summed
             // OBSERVED intensity of only the top-K PREDICTED fragments, so when none of
             // those K is observed at any qualifying scan the score is 0.0 everywhere, the
@@ -1640,10 +1705,11 @@ impl Default for ExtractConfig {
             // (which decides the pre-FDR competition winner), `rt_error_abs`,
             // `log_apex_intensity`, and quant's integration centre.
             apex_evidence_rank: true,
-            apex_refine_intensity: false,     // benchmark-gated
-            emit_gate_diagnostics: false,     // diagnostic gate-score columns; off in production
-            gate_mode: GateMode::ApexPearson, // legacy single-scan intensity Pearson
-            gate_coelution_min: 0.5,          // used only by GateMode::Combined
+            apex_refine_intensity: false,    // benchmark-gated
+            emit_gate_diagnostics: false,    // diagnostic gate-score columns; off in production
+            gate_mode: GateMode::WindowMean, // window-summed agreement minus RT term (since 2026-10-08)
+            gate_coelution_min: 0.5,         // used only by GateMode::Combined
+            gate_rt_weight: 0.2,             // used only by GateMode::WindowMean
         }
     }
 }
@@ -1655,7 +1721,6 @@ impl Default for ExtractConfig {
 pub enum GateMode {
     /// Legacy: Pearson of observed-vs-predicted fragment intensities at the single
     /// apex scan. One chimeric scan can dominate it.
-    #[default]
     ApexPearson,
     /// Pearson of the PEAK-INTEGRATED observed spectrum (each fragment summed over
     /// the elution-peak scans) vs predicted intensities. Averages out a single
@@ -1675,6 +1740,22 @@ pub enum GateMode {
     /// co-elution score >= `gate_coelution_min`. More specific (an interferent
     /// passing one axis is still rejected), for a cleaner FDR pool.
     Combined,
+    /// Spectral-entropy similarity (sqrt) of the spectrum summed over the apex +-2 scans of
+    /// the isolation window's acquisition grid, against the library. At near-single-ion
+    /// intensities a fragment is present in one scan and absent in the next, so any
+    /// single-scan score is noise; summed over five scans it is not. On the Astral HYE and
+    /// Q Exactive AIF HYE runs a threshold of 0.6 kept 42% / 35% of the candidates with
+    /// 99.99% / 99.90% of the gate-0 identifications, where the apex Pearson at 0.2 kept 32%
+    /// and lost about 10%.
+    WindowEntropy,
+    /// Mean of three agreement scores of the spectrum summed over the apex +-2 scans of
+    /// the acquisition grid (sqrt entropy similarity, the share of predicted intensity
+    /// observed, sqrt cosine), minus `gate_rt_weight` times the apex RT error over the
+    /// window half-width on its side. On the Astral and Q Exactive HYE runs the top 10% of
+    /// candidates by this score held 99.4% / 99.6% of the gate-0 identifications, and the
+    /// top 15% held 99.9%. The default since 2026-10-08, with `gate_min_score` 0.6.
+    #[default]
+    WindowMean,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2263,6 +2344,28 @@ pub struct RescoreConfig {
     /// sweep (docs/28 section 17), at three times the training cost.
     #[serde(default = "default_seeds")]
     pub seeds: usize,
+    /// Shadow demotion: demote (below every other score) a candidate of either label when at
+    /// least this many of its library fragments lie within `shadow_ppm` of a fragment of a
+    /// higher-scoring, first-pass-accepted target in the same run and isolation window with
+    /// its apex within `shadow_rt_s`; the candidate's own base peptide never lends. 0
+    /// (default) is off. Needs the library fragments and the runs' isolation windows, which
+    /// `run` and `run-experiment` pass and `rescore` takes as `--lib-fragments` and
+    /// `--isolation-windows`.
+    pub shadow_min_shared: usize,
+    /// Fragment m/z tolerance (ppm) of the shadow test.
+    pub shadow_ppm: f64,
+    /// Apex RT distance (seconds) within which a lender counts.
+    pub shadow_rt_s: f64,
+    /// Candidates examined per run: the top `shadow_region x accepted` rows by first-pass
+    /// score.
+    pub shadow_region: usize,
+    /// Fewest decoys the classifier is trained with. Below this the learned classifier
+    /// is not trained (a handful of decoys lets it overfit, one decoy then outranks every
+    /// target and nothing passes 1%): the candidates are ranked by their untrained
+    /// `prelim_score` and q-values come from plain target-decoy competition, with a
+    /// warning and `classifier = "prelim_score_few_decoys"` in the scored table's report.
+    /// A strict gate on a very small or very clean run can leave this few. 0 disables it.
+    pub min_train_decoys: usize,
 }
 
 fn default_margin_frac() -> f64 {
@@ -2304,6 +2407,11 @@ pub enum NegSelect {
 impl Default for RescoreConfig {
     fn default() -> Self {
         Self {
+            min_train_decoys: 100,
+            shadow_min_shared: 0,
+            shadow_ppm: 10.0,
+            shadow_rt_s: 3.0,
+            shadow_region: 8,
             classifier: t(),
             folds: 3,
             train_fdr: 0.01,
@@ -3267,6 +3375,16 @@ impl Config {
                 "predict_frag.charge2_from_precursor_charge must be >= 1".into(),
             ));
         }
+        if self
+            .rt_im_train
+            .anchor_q_ladder
+            .iter()
+            .any(|q| !(q.is_finite() && *q > 0.0 && *q <= 1.0))
+        {
+            return Err(Invalid(
+                "rt_im_train.anchor_q_ladder entries must lie in (0, 1]".into(),
+            ));
+        }
         if self.rt_im_train.min_seed_for_calibration < 2 {
             return Err(Invalid(
                 "rt_im_train.min_seed_for_calibration must be >= 2; a calibration needs at \
@@ -3610,6 +3728,20 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_extraction_gate_is_window_mean_at_0_6() {
+        // Both the field default and the enum default: ExtractConfig::default() used to
+        // set the mode explicitly, so changing only the enum's #[default] left the engine
+        // on apex_pearson.
+        let e = ExtractConfig::default();
+        assert_eq!(e.gate_mode, GateMode::WindowMean);
+        assert_eq!(e.gate_min_score, 0.6);
+        assert_eq!(e.gate_rt_weight, 0.2);
+        assert_eq!(GateMode::default(), GateMode::WindowMean);
+        let parsed: ExtractConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.gate_mode, GateMode::WindowMean);
+    }
 
     #[test]
     fn quant_fixed_window_fields_round_trip_and_are_validated() {

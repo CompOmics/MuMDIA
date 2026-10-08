@@ -149,6 +149,214 @@ fn candidate_window(calibrated_rt: Option<f64>, width: Option<f64>) -> (f64, f64
     }
 }
 
+/// Composition features of a peptidoform and charge for the RT correction: intercept,
+/// charge 3, charge >= 4, length, internal K/R, His, Met-ox. Modifications are written in
+/// square brackets (MuMDIA) or round brackets (UniMod); only residues count toward length.
+pub(crate) fn composition_features(peptidoform: &str, charge: i32) -> [f64; 7] {
+    let mut seq: Vec<u8> = Vec::with_capacity(peptidoform.len());
+    let mut depth = 0i32;
+    for &b in peptidoform.as_bytes() {
+        match b {
+            b'[' | b'(' => depth += 1,
+            b']' | b')' => depth -= 1,
+            _ if depth == 0 && b.is_ascii_uppercase() => seq.push(b),
+            _ => {}
+        }
+    }
+    let n = seq.len();
+    let internal_kr = seq
+        .iter()
+        .take(n.saturating_sub(1))
+        .filter(|&&c| c == b'K' || c == b'R')
+        .count();
+    let his = seq.iter().filter(|&&c| c == b'H').count();
+    let mox = peptidoform.matches("Oxidation").count() + peptidoform.matches("UniMod:35").count();
+    [
+        1.0,
+        f64::from(u8::from(charge == 3)),
+        f64::from(u8::from(charge >= 4)),
+        n as f64,
+        internal_kr as f64,
+        his as f64,
+        mox as f64,
+    ]
+}
+
+/// Fewest anchors that must carry a composition term (nonzero feature) for it to be fitted.
+const MIN_ANCHORS_PER_TERM: usize = 20;
+
+/// Zero every non-intercept column that fewer than `min` rows carry, so its coefficient
+/// stays at 0 under the ridge in [`huber_fit`].
+fn drop_sparse_columns(mut x: Vec<[f64; 7]>, min: usize) -> Vec<[f64; 7]> {
+    for c in 1..7 {
+        let n = x.iter().filter(|r| r[c] != 0.0).count();
+        if n < min {
+            for r in x.iter_mut() {
+                r[c] = 0.0;
+            }
+        }
+    }
+    x
+}
+
+/// Huber regression (k = 1.345 on a MAD scale, iteratively reweighted least squares) of
+/// `y` on the rows of `x`. `None` when the normal equations are singular.
+fn huber_fit(x: &[[f64; 7]], y: &[f64]) -> Option<Vec<f64>> {
+    const P: usize = 7;
+    let n = y.len();
+    if n < 3 * P {
+        return None;
+    }
+    let mut w = vec![1.0f64; n];
+    let mut beta = vec![0.0f64; P];
+    for _ in 0..30 {
+        // weighted normal equations with a tiny ridge for unused columns (e.g. no charge 4)
+        let mut a = [[0.0f64; P]; P];
+        let mut b = [0.0f64; P];
+        for i in 0..n {
+            for r in 0..P {
+                b[r] += w[i] * x[i][r] * y[i];
+                for c in 0..P {
+                    a[r][c] += w[i] * x[i][r] * x[i][c];
+                }
+            }
+        }
+        for (r, row) in a.iter_mut().enumerate() {
+            row[r] += 1e-6;
+        }
+        let sol = solve(a, b)?;
+        let resid: Vec<f64> = (0..n)
+            .map(|i| y[i] - (0..P).map(|c| x[i][c] * sol[c]).sum::<f64>())
+            .collect();
+        let abs: Vec<f64> = resid.iter().map(|r| r.abs()).collect();
+        let s = 1.4826 * percentile(&abs, 0.5);
+        let done = sol.iter().zip(&beta).all(|(a, b)| (a - b).abs() < 1e-6);
+        beta = sol;
+        if !(s.is_finite() && s > 0.0) || done {
+            break;
+        }
+        for (wi, r) in w.iter_mut().zip(&resid) {
+            let k = 1.345 * s;
+            *wi = if r.abs() <= k { 1.0 } else { k / r.abs() };
+        }
+    }
+    Some(beta)
+}
+
+/// Gaussian elimination with partial pivoting.
+fn solve(mut a: [[f64; 7]; 7], mut b: [f64; 7]) -> Option<Vec<f64>> {
+    const P: usize = 7;
+    for col in 0..P {
+        let piv = (col..P).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))?;
+        if a[piv][col].abs() < 1e-12 {
+            return None;
+        }
+        a.swap(col, piv);
+        b.swap(col, piv);
+        for r in col + 1..P {
+            let f = a[r][col] / a[col][col];
+            let pivot_row = a[col];
+            for (c, v) in a[r].iter_mut().enumerate().skip(col) {
+                *v -= f * pivot_row[c];
+            }
+            b[r] -= f * b[col];
+        }
+    }
+    let mut x = vec![0.0f64; P];
+    for r in (0..P).rev() {
+        let s: f64 = (r + 1..P).map(|c| a[r][c] * x[c]).sum();
+        x[r] = (b[r] - s) / a[r][r];
+    }
+    Some(x)
+}
+
+/// Early (`left`) and late (`right`) half-widths of the widen-only local RT window on an
+/// ascending grid of calibrated RT; linear in between, the end values beyond the grid.
+#[derive(Clone, Debug)]
+struct LocalWindow {
+    grid: Vec<f64>,
+    left: Vec<f64>,
+    right: Vec<f64>,
+}
+
+impl LocalWindow {
+    fn at(&self, cal: f64) -> (f64, f64) {
+        let g = &self.grid;
+        let last = g.len() - 1;
+        if cal <= g[0] {
+            return (self.left[0], self.right[0]);
+        }
+        if cal >= g[last] {
+            return (self.left[last], self.right[last]);
+        }
+        let j = g.partition_point(|&x| x < cal);
+        let t = (cal - g[j - 1]) / (g[j] - g[j - 1]).max(1e-12);
+        (
+            self.left[j - 1] + t * (self.left[j] - self.left[j - 1]),
+            self.right[j - 1] + t * (self.right[j] - self.right[j - 1]),
+        )
+    }
+
+    /// Fit from the anchors' calibrated RT and signed residuals (observed - calibrated):
+    /// on a grid over the anchors' calibrated range, the `k` anchors nearest each point give
+    /// the `(1 - p_rt) / 2` and `(1 + p_rt) / 2` residual quantiles, times `mult`, floored at
+    /// the global `w_rt` and capped at `cap`.
+    fn fit(
+        cal: &[f64],
+        resid: &[f64],
+        k: usize,
+        p_rt: f64,
+        mult: f64,
+        w_rt: f64,
+        cap: f64,
+    ) -> Option<Self> {
+        const GRID: usize = 200;
+        let n = cal.len();
+        if n < 2 {
+            return None;
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| cal[a].total_cmp(&cal[b]).then(a.cmp(&b)));
+        let c: Vec<f64> = order.iter().map(|&i| cal[i]).collect();
+        let r: Vec<f64> = order.iter().map(|&i| resid[i]).collect();
+        let (lo, hi) = (c[0], c[n - 1]);
+        if hi <= lo {
+            return None;
+        }
+        let k = k.clamp(2, n);
+        let (q_lo, q_hi) = ((1.0 - p_rt) / 2.0, (1.0 + p_rt) / 2.0);
+        let cap = cap.max(w_rt);
+        let mut grid = Vec::with_capacity(GRID);
+        let mut left = Vec::with_capacity(GRID);
+        let mut right = Vec::with_capacity(GRID);
+        for gi in 0..GRID {
+            let x = lo + (hi - lo) * gi as f64 / (GRID - 1) as f64;
+            // The k anchors nearest x: grow [a, b) outward from the insertion point.
+            let mut a = c.partition_point(|&v| v < x);
+            let mut b = a;
+            while b - a < k {
+                let take_left = if a == 0 {
+                    false
+                } else if b == n {
+                    true
+                } else {
+                    (x - c[a - 1]) <= (c[b] - x)
+                };
+                if take_left {
+                    a -= 1;
+                } else {
+                    b += 1;
+                }
+            }
+            let near = &r[a..b];
+            grid.push(x);
+            left.push((-percentile(near, q_lo) * mult).max(w_rt).min(cap));
+            right.push((percentile(near, q_hi) * mult).max(w_rt).min(cap));
+        }
+        Some(LocalWindow { grid, left, right })
+    }
+}
+
 /// A fitted retention-time calibration: everything the anchors determine, which
 /// [`apply`] then maps over a library table.
 ///
@@ -170,6 +378,12 @@ pub struct RtFit {
     holdout_frac: f64,
     holdout_sizing: Option<HoldoutSizing>,
     adaptive: Option<(f64, f64, Vec<f64>)>,
+    /// Widen-only local window (`local_window_anchors`): the early and late half-widths on a
+    /// grid of calibrated RT.
+    local: Option<LocalWindow>,
+    /// Composition correction coefficients (`composition_correction`), over
+    /// [`composition_features`].
+    composition: Option<Vec<f64>>,
     /// Signed median, absolute median and MAD of the in-sample residuals (seconds).
     residuals: (f64, f64, f64),
 }
@@ -325,6 +539,18 @@ fn check_cfg(cfg: &RtImTrainConfig) -> Result<()> {
              0.0 disables held-out window sizing"
         );
     }
+    if cfg.local_window_anchors > 0 && cfg.adaptive_rt_window {
+        anyhow::bail!(
+            "rt_im_train.local_window_anchors and rt_im_train.adaptive_rt_window are mutually \
+             exclusive: both size the window per calibrated RT; enable one of them"
+        );
+    }
+    if !(cfg.local_window_multiplier.is_finite() && cfg.local_window_multiplier > 0.0) {
+        anyhow::bail!(
+            "rt_im_train.local_window_multiplier must be a positive number, got {}",
+            cfg.local_window_multiplier
+        );
+    }
     if holdout_frac > 0.0 && cfg.adaptive_rt_window {
         anyhow::bail!(
             "rt_im_train.window_holdout_frac and rt_im_train.adaptive_rt_window are mutually \
@@ -430,6 +656,97 @@ fn library_irt(path: &str, span: Option<(usize, usize)>) -> Result<(Vec<u32>, Ve
     }
 }
 
+/// The anchor cut a run actually calibrates with, from [`plan_anchors`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnchorPlan {
+    /// The `spectrum_q` cut used for the anchors: `q_train`, or the first rung of
+    /// `anchor_q_ladder` that reaches `min_seed_for_calibration` anchors.
+    pub q_train: f64,
+    /// Distinct target base peptides at that cut.
+    pub n_anchors: usize,
+    /// Whether `n_anchors` reaches `min_seed_for_calibration`. When false, `q_train` is the
+    /// last rung tried, and a calibration that needs anchors (multi-head) must be skipped.
+    pub sufficient: bool,
+}
+
+/// Choose the anchor cut for a run. A seed search on a hard run (few peptides, a dominant
+/// contaminant, a library whose decoys score high) can leave fewer than
+/// `min_seed_for_calibration` target anchors at `q_train`, and then the multi-head
+/// calibration has nothing to fit and the per-run LOESS falls back to a fixed window. The
+/// cut is relaxed through `anchor_q_ladder` until enough anchors exist; anchors are only
+/// an RT reference, and a few percent of false ones move a robust curve far less than no
+/// curve at all. Counted as `fit_anchors` counts: finite target rows, one per base
+/// peptide.
+pub fn plan_anchors(seed_psms: &str, cfg: &RtImTrainConfig) -> Result<AnchorPlan> {
+    let seed = TableFile::open(seed_psms)?;
+    let s_base = seed.u32("base_peptide_id")?;
+    let s_q = seed.f64("spectrum_q")?;
+    let s_score = seed.f64("score")?;
+    let s_rt = seed.f64("observed_rt")?;
+    let s_label = seed.str("label")?;
+    // Best (lowest) q per target base peptide; the count at a cut is then one comparison.
+    let mut best_q: HashMap<u32, f64> = HashMap::new();
+    for i in 0..seed.nrows {
+        if !s_q[i].is_finite() || !s_score[i].is_finite() || !s_rt[i].is_finite() {
+            continue;
+        }
+        if s_label[i] != "target" {
+            continue;
+        }
+        let e = best_q.entry(s_base[i]).or_insert(f64::INFINITY);
+        if s_q[i] < *e {
+            *e = s_q[i];
+        }
+    }
+    let count = |q: f64| best_q.values().filter(|&&v| v < q).count();
+    let need = cfg.min_seed_for_calibration.max(2);
+    let mut plan = AnchorPlan {
+        q_train: cfg.q_train,
+        n_anchors: count(cfg.q_train),
+        sufficient: false,
+    };
+    plan.sufficient = plan.n_anchors >= need;
+    if plan.sufficient {
+        return Ok(plan);
+    }
+    for &q in cfg.anchor_q_ladder.iter().filter(|&&q| q > cfg.q_train) {
+        plan = AnchorPlan {
+            q_train: q,
+            n_anchors: count(q),
+            sufficient: false,
+        };
+        plan.sufficient = plan.n_anchors >= need;
+        if plan.sufficient {
+            break;
+        }
+    }
+    if plan.sufficient {
+        warn!(
+            q_train = cfg.q_train,
+            relaxed_q = plan.q_train,
+            n_anchors = plan.n_anchors,
+            need,
+            "rt-im-train: too few confident seed anchors at q_train; relaxed the anchor cut"
+        );
+    } else {
+        warn!(
+            q_train = cfg.q_train,
+            last_q = plan.q_train,
+            n_anchors = plan.n_anchors,
+            need,
+            "rt-im-train: too few seed anchors even at the most relaxed cut; retention-time              calibration that needs anchors is skipped"
+        );
+    }
+    Ok(plan)
+}
+
+/// `cfg` with the anchor cut of `plan`.
+pub fn with_anchor_cut(cfg: &RtImTrainConfig, plan: &AnchorPlan) -> RtImTrainConfig {
+    let mut c = cfg.clone();
+    c.q_train = plan.q_train;
+    c
+}
+
 /// Fit the calibration on a seed table whose own `predicted_irt` column carries the anchors'
 /// iRT (`RtImTrainParams::anchor_irt_from_seed`): the fit a grouped run's bands share under
 /// `groups.calibration = global`. No library is read.
@@ -484,6 +801,7 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
     };
 
     let mut best_per_pep: HashMap<u32, (f64, f64, f64)> = HashMap::new(); // base -> (score, irt, rt)
+    let mut best_row: HashMap<u32, usize> = HashMap::new(); // base -> seed row of that apex
     for i in 0..seed.nrows {
         if !s_q[i].is_finite()
             || !s_score[i].is_finite()
@@ -516,6 +834,7 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
             .or_insert((f64::NEG_INFINITY, 0.0, 0.0));
         if s_score[i] > e.0 {
             *e = (s_score[i], irt, s_rt[i]);
+            best_row.insert(s_base[i], i);
         }
     }
     let (anchor_ids, train_irt, train_rt) = sorted_anchor_vectors(best_per_pep);
@@ -534,7 +853,13 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
         && matches!(cfg.calibration_method, CalibrationMethod::Loess)
         && n_train >= cfg.min_seed_for_calibration;
     let loess = if use_loess {
-        Some(Loess::fit(&train_irt, &train_rt, cfg.loess_span, 200))
+        Some(Loess::fit_robust(
+            &train_irt,
+            &train_rt,
+            cfg.loess_span,
+            200,
+            cfg.loess_robust_iters,
+        ))
     } else {
         None
     };
@@ -551,6 +876,8 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
         holdout_frac,
         holdout_sizing: None,
         adaptive: None,
+        local: None,
+        composition: None,
         residuals: (f64::NAN, f64::NAN, f64::NAN),
     };
 
@@ -597,7 +924,9 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
                 None
             } else {
                 // Same method selection as the main fit, refit on the sizing subset.
-                let sizing_loess = use_loess.then(|| Loess::fit(&tr_x, &tr_y, cfg.loess_span, 200));
+                let sizing_loess = use_loess.then(|| {
+                    Loess::fit_robust(&tr_x, &tr_y, cfg.loess_span, 200, cfg.loess_robust_iters)
+                });
                 let (s_slope, s_intercept) = if sizing_loess.is_none() {
                     linear_fit(&tr_x, &tr_y)
                 } else {
@@ -724,7 +1053,69 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
     fit.w_rt = w_rt;
     fit.status = status;
     fit.holdout_sizing = holdout_sizing;
+    let local = match (w_rt, &plan) {
+        (Some(w), WindowPlan::Calibrated) if cfg.local_window_anchors > 0 => {
+            let cals: Vec<f64> = train_irt.iter().map(|x| fit.predict(*x)).collect();
+            let signed: Vec<f64> = cals.iter().zip(&train_rt).map(|(c, y)| y - c).collect();
+            LocalWindow::fit(
+                &cals,
+                &signed,
+                cfg.local_window_anchors,
+                cfg.p_rt,
+                cfg.local_window_multiplier,
+                w,
+                cfg.fallback_rt_window_s,
+            )
+        }
+        _ => None,
+    };
+    if let Some(lw) = &local {
+        let max_l = lw.left.iter().cloned().fold(0.0, f64::max);
+        let max_r = lw.right.iter().cloned().fold(0.0, f64::max);
+        info!(
+            max_left_s = max_l,
+            max_right_s = max_r,
+            "rt-im-train: widen-only local RT window"
+        );
+    }
+    let composition = if cfg.composition_correction && calibration_available && n_train >= 50 {
+        let pform = seed.str("peptidoform")?;
+        let charge = seed.i32("charge")?;
+        let x: Vec<[f64; 7]> = anchor_ids
+            .iter()
+            .map(|b| {
+                let i = best_row[b];
+                composition_features(&pform[i], charge[i])
+            })
+            .collect();
+        let y: Vec<f64> = train_irt
+            .iter()
+            .zip(&train_rt)
+            .map(|(xi, yi)| yi - fit.predict(*xi))
+            .collect();
+        // A composition term only enters when enough anchors carry it: with a handful of
+        // charge-4 anchors (HeLa) the charge-4 coefficient came out at -65 to -74 s.
+        let x = drop_sparse_columns(x, MIN_ANCHORS_PER_TERM);
+        let beta = huber_fit(&x, &y);
+        if let Some(b) = &beta {
+            info!(
+                intercept = b[0],
+                charge3 = b[1],
+                charge4plus = b[2],
+                per_residue = b[3],
+                internal_kr = b[4],
+                his = b[5],
+                met_ox = b[6],
+                "rt-im-train: composition RT correction (s)"
+            );
+        }
+        beta
+    } else {
+        None
+    };
     fit.adaptive = adaptive;
+    fit.local = local;
+    fit.composition = composition;
     fit.residuals = residuals;
     Ok(fit)
 }
@@ -749,6 +1140,29 @@ fn write_windows(
     let cid = lib_cid;
     let irt = lib_irt;
     let n = cid.len();
+    // Composition shift per library row, read only when the fit carries a correction.
+    let shift: Option<Vec<f64>> = match &fit.composition {
+        Some(beta) => {
+            let lib = match p.precursor_span {
+                None => TableFile::open(p.library_precursors)?,
+                Some((first, k)) => TableFile::open_rows(p.library_precursors, first, k)?,
+            };
+            let pform = lib.str("peptidoform")?;
+            let charge = lib.i32("charge")?;
+            Some(
+                (0..n)
+                    .map(|i| {
+                        let f = composition_features(&pform[i], charge[i]);
+                        let v: f64 = (0..7).map(|c| f[c] * beta[c]).sum();
+                        // bounded: a shift beyond three window half-widths is a fit artefact
+                        let cap = 3.0 * fit.w_rt.unwrap_or(f64::INFINITY);
+                        v.clamp(-cap, cap)
+                    })
+                    .collect(),
+            )
+        }
+        None => None,
+    };
     let mut n_nonfinite_irt = 0u64;
     let mut kept = keep_windows.then(|| RtWindowsBuilder::new(n));
     let windows = write_table_chunked_hashed(p.out_windows, n, |r| {
@@ -768,8 +1182,8 @@ fn write_windows(
             if !usable_irt {
                 n_nonfinite_irt += 1;
             }
-            let calibrated_rt =
-                (fit.calibration_available && usable_irt).then(|| fit.predict(irt[i] as f64));
+            let calibrated_rt = (fit.calibration_available && usable_irt)
+                .then(|| fit.predict(irt[i] as f64) + shift.as_ref().map_or(0.0, |s| s[i]));
             let width = calibrated_rt.map(|cal| match &fit.adaptive {
                 Some((rt_min, span, widths)) => {
                     let nb = widths.len();
@@ -780,7 +1194,13 @@ fn write_windows(
                     .w_rt
                     .expect("available RT calibration requires a bounded window"),
             });
-            let (cal, lo, hi) = candidate_window(calibrated_rt, width);
+            let (cal, lo, hi) = match (&fit.local, calibrated_rt) {
+                (Some(lw), Some(c)) => {
+                    let (l, r) = lw.at(c);
+                    (c, c - l, c + r)
+                }
+                _ => candidate_window(calibrated_rt, width),
+            };
             if let Some(b) = kept.as_mut() {
                 b.row(cid[i], cal, lo, hi);
             }
@@ -847,6 +1267,15 @@ fn write_windows(
             "rt_residual_median_s": rt_residual_median_s,
             "rt_residual_abs_median_s": rt_residual_abs_median_s,
             "rt_residual_mad_s": rt_residual_mad_s,
+            "local_window_anchors": p.cfg.local_window_anchors,
+            "local_window": fit.local.as_ref().map(|lw| json!({
+                "multiplier": p.cfg.local_window_multiplier,
+                "max_left_s": lw.left.iter().cloned().fold(0.0, f64::max),
+                "max_right_s": lw.right.iter().cloned().fold(0.0, f64::max),
+                "grid_rt": lw.grid,
+                "left_s": lw.left,
+                "right_s": lw.right,
+            })),
         }),
     )?;
 
@@ -1243,6 +1672,136 @@ mod tests {
     }
 
     #[test]
+    fn composition_features_and_huber_fit() {
+        let f = composition_features("AAGLATM[Oxidation]ISTHKR", 3);
+        assert_eq!(f, [1.0, 1.0, 0.0, 13.0, 1.0, 1.0, 1.0]);
+        let g = composition_features("C(UniMod:4)PEPTIDEK", 4);
+        assert_eq!(g, [1.0, 0.0, 1.0, 9.0, 0.0, 0.0, 0.0]);
+        // y = -3 * charge3 - 6 * charge4 + 0.2 * length, with two gross outliers
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..90usize {
+            let z = 2 + (i % 3) as i32;
+            let len = 7 + (i % 13);
+            let row = [
+                1.0,
+                f64::from(u8::from(z == 3)),
+                f64::from(u8::from(z >= 4)),
+                len as f64,
+                (i % 2) as f64,
+                ((i / 2) % 2) as f64,
+                ((i / 4) % 2) as f64,
+            ];
+            let mut v = -3.0 * row[1] - 6.0 * row[2] + 0.2 * row[3];
+            if i == 10 || i == 50 {
+                v += 60.0;
+            }
+            x.push(row);
+            y.push(v);
+        }
+        let b = huber_fit(&x, &y).unwrap();
+        // a column carried by too few anchors is not fitted
+        let mut xs = x.clone();
+        for (i, r) in xs.iter_mut().enumerate() {
+            r[2] = f64::from(u8::from(i < 3)); // only 3 "charge 4" anchors
+        }
+        let bs = huber_fit(&drop_sparse_columns(xs, MIN_ANCHORS_PER_TERM), &y).unwrap();
+        assert!(bs[2].abs() < 1e-3, "{bs:?}");
+        assert!(
+            (b[1] + 3.0).abs() < 0.1 && (b[2] + 6.0).abs() < 0.1 && (b[3] - 0.2).abs() < 0.02,
+            "{b:?}"
+        );
+    }
+
+    #[test]
+    fn the_local_window_widens_only_the_side_and_region_whose_anchors_need_it() {
+        // 400 anchors over calibrated RT 0..400 with symmetric +-3 s residuals, except the
+        // last 50 (RT > 350), which elute 10-30 s late: the order-losing gradient end.
+        let n = 400;
+        let cal: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let resid: Vec<f64> = (0..n)
+            .map(|i| {
+                if i >= 350 {
+                    10.0 + ((i * 7) % 21) as f64
+                } else {
+                    ((i * 13) % 7) as f64 - 3.0
+                }
+            })
+            .collect();
+        let w_rt = 4.5;
+        let lw = LocalWindow::fit(&cal, &resid, 40, 0.9, 1.0, w_rt, 120.0).unwrap();
+        // mid-gradient: both sides stay the global width (widen-only floor)
+        let (l, r) = lw.at(150.0);
+        assert_eq!((l, r), (w_rt, w_rt));
+        // gradient end: the late side widens to the anchors' upper quantile, the early side not
+        let (l, r) = lw.at(399.0);
+        assert_eq!(l, w_rt);
+        assert!(r > 20.0, "late side {r}");
+        // beyond the grid the end values are held
+        assert_eq!(lw.at(1e6), lw.at(399.0));
+        // the cap binds
+        let capped = LocalWindow::fit(&cal, &resid, 40, 0.9, 1.0, w_rt, 12.0).unwrap();
+        assert_eq!(capped.at(399.0).1, 12.0);
+    }
+
+    #[test]
+    fn a_seed_short_of_anchors_relaxes_the_cut_and_then_reports_short() {
+        // 60 target base peptides: 10 at q 0.005, 25 more at 0.015, 25 more at 0.04, plus
+        // decoys at every cut, which never count. Duplicate rows of one peptide count once.
+        let seed = scratch("plan_anchors_seed.parquet");
+        let mut base = Vec::new();
+        let mut q = Vec::new();
+        let mut label = Vec::new();
+        for i in 0..60u32 {
+            let qi = if i < 10 {
+                0.005
+            } else if i < 35 {
+                0.015
+            } else {
+                0.04
+            };
+            for (l, b) in [("target", i), ("target", i), ("decoy", 1000 + i)] {
+                base.push(b);
+                q.push(qi);
+                label.push(l.to_string());
+            }
+        }
+        let n = base.len();
+        write_table(
+            &seed,
+            vec![
+                Col::U32("base_peptide_id".into(), base),
+                Col::F64("spectrum_q".into(), q),
+                Col::F64("score".into(), vec![1.0; n]),
+                Col::F64("observed_rt".into(), vec![100.0; n]),
+                Col::Str("label".into(), label),
+            ],
+        )
+        .unwrap();
+        let plan = |need: usize, ladder: Vec<f64>| {
+            let cfg = RtImTrainConfig {
+                min_seed_for_calibration: need,
+                anchor_q_ladder: ladder,
+                ..Default::default()
+            };
+            plan_anchors(&seed, &cfg).unwrap()
+        };
+        let p = plan(10, vec![0.02, 0.05]);
+        assert_eq!((p.q_train, p.n_anchors, p.sufficient), (0.01, 10, true));
+        let p = plan(30, vec![0.02, 0.05]);
+        assert_eq!((p.q_train, p.n_anchors, p.sufficient), (0.02, 35, true));
+        let p = plan(50, vec![0.02, 0.05]);
+        assert_eq!((p.q_train, p.n_anchors, p.sufficient), (0.05, 60, true));
+        let p = plan(61, vec![0.02, 0.05]);
+        assert_eq!((p.q_train, p.n_anchors, p.sufficient), (0.05, 60, false));
+        // An empty ladder keeps the strict cut; a rung below q_train is ignored.
+        let p = plan(30, vec![]);
+        assert_eq!((p.q_train, p.n_anchors, p.sufficient), (0.01, 10, false));
+        let p = plan(30, vec![0.005, 0.02]);
+        assert_eq!((p.q_train, p.n_anchors, p.sufficient), (0.02, 35, true));
+    }
+
+    #[test]
     fn one_fit_applied_writes_what_the_whole_stage_writes() {
         // The grouped path fits once per run and applies the fit to every band; each band
         // used to run the whole stage. Same windows bytes and the same cal.json, under the
@@ -1263,10 +1822,15 @@ mod tests {
             calibration_method: CalibrationMethod::Linear,
             ..Default::default()
         };
+        let local = RtImTrainConfig {
+            local_window_anchors: 60,
+            ..Default::default()
+        };
         for (tag, cfg, n) in [
             ("default", RtImTrainConfig::default(), 400usize),
             ("holdout", holdout, 400),
             ("adaptive", adaptive, 400),
+            ("local", local, 400),
             ("linear", linear, 400),
             ("few", RtImTrainConfig::default(), 20),
             ("one", RtImTrainConfig::default(), 1),

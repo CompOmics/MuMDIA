@@ -8,6 +8,7 @@ pub mod convert;
 pub mod digest;
 pub mod extract;
 pub mod features;
+pub mod ms1cal;
 pub mod peptidoforms;
 pub mod pool;
 pub mod predict_frag;
@@ -22,6 +23,7 @@ pub mod run_experiment;
 pub mod run_groups;
 pub mod search_seed;
 pub mod seed_pool;
+pub mod shadow;
 pub mod sub_library;
 
 /// How the full scans of the widest artifacts are read: rescore's feature stream

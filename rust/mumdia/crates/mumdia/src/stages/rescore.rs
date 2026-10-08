@@ -217,6 +217,9 @@ pub struct RescoreParams<'a> {
     pub script_dir: &'a str,
     pub cfg: &'a RescoreConfig,
     pub config_hash: &'a str,
+    /// The library fragments and the runs' isolation windows for shadow demotion
+    /// (`rescore.shadow_min_shared`); `None` when the caller has none.
+    pub shadow: Option<super::shadow::ShadowInputs<'a>>,
 }
 
 /// Wall time of each phase of [`run`], logged once at the end as `rescore: phase timings`
@@ -759,10 +762,20 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     // The `MUMDIA_NN_*` knobs the NN worker inherited, when it ran (see `inherited_nn_env`).
     let mut nn_env: Option<std::collections::BTreeMap<String, String>> = None;
 
+    let n_train_decoys = is_decoy.iter().filter(|&&d| d).count();
     let mut scores = if n == 0 {
         classifier_used = "not_run_empty";
         model_identity = "none-empty-input".to_string();
         Vec::new()
+    } else if p.cfg.min_train_decoys > 0 && n_train_decoys < p.cfg.min_train_decoys {
+        tracing::warn!(
+            decoys = n_train_decoys,
+            min_train_decoys = p.cfg.min_train_decoys,
+            "rescore: too few decoys to train a classifier; ranking by the untrained              prelim_score with plain target-decoy competition"
+        );
+        classifier_used = "prelim_score_few_decoys";
+        model_identity = "prelim-score".to_string();
+        prelim.clone()
     } else {
         match p.cfg.classifier {
             RescorerKind::Mokapot => match run_pin_sidecar(
@@ -974,6 +987,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                 apex_rt,
                 elution_lo,
                 elution_hi,
+                mz,
                 source,
                 scores,
                 peak_rank,
@@ -986,6 +1000,81 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         }
     }
     timings.collapse_ms = t_collapse.elapsed().as_millis();
+
+    // Shadow demotion (`rescore.shadow_min_shared`): a first-pass precursor q selects the
+    // lenders, then every shadow of either label drops below all other scores before the
+    // q-values below are computed (`stages::shadow`).
+    if p.cfg.shadow_min_shared > 0 {
+        let Some(inputs) = p.shadow.as_ref() else {
+            anyhow::bail!(
+                "rescore.shadow_min_shared is set but this rescore has no library fragments \
+                 or isolation windows (pass --lib-fragments and --isolation-windows)"
+            );
+        };
+        let t_sh = Instant::now();
+        let pid: Vec<u32> = {
+            let mut interner: HashMap<(&str, i32), u32> = HashMap::new();
+            let mut ids = Vec::with_capacity(pform.len());
+            for (pf, &z) in pform.iter().zip(charge.iter()) {
+                let next = interner.len() as u32;
+                ids.push(*interner.entry((pf, z)).or_insert(next));
+            }
+            ids
+        };
+        let pq1 = grouped_q(
+            &pid,
+            &scores,
+            &is_decoy,
+            &is_entrapment,
+            &is_real_target,
+            qmode,
+            p.cfg.entrapment_ratio,
+        );
+        let accepted: Vec<bool> = (0..n).map(|i| !is_decoy[i] && pq1[i] <= 0.01).collect();
+        let demote = super::shadow::flag(
+            &super::shadow::ShadowRows {
+                source: &source,
+                cid: &cid,
+                base: &base,
+                apex_rt: &apex_rt,
+                precursor_mz: &mz,
+                score: &scores,
+                is_decoy: &is_decoy,
+                accepted: &accepted,
+            },
+            inputs,
+            super::shadow::ShadowParams {
+                min_shared: p.cfg.shadow_min_shared,
+                ppm: p.cfg.shadow_ppm,
+                rt_s: p.cfg.shadow_rt_s,
+                region: p.cfg.shadow_region,
+            },
+        )?;
+        let floor = scores
+            .iter()
+            .copied()
+            .filter(|s| s.is_finite())
+            .fold(f64::INFINITY, f64::min)
+            - 1.0;
+        let (mut dt, mut dd) = (0usize, 0usize);
+        for i in 0..n {
+            if demote[i] {
+                scores[i] = floor;
+                if is_decoy[i] {
+                    dd += 1;
+                } else {
+                    dt += 1;
+                }
+            }
+        }
+        info!(
+            demoted_targets = dt,
+            demoted_decoys = dd,
+            first_pass_accepted = accepted.iter().filter(|&&a| a).count(),
+            ms = t_sh.elapsed().as_millis() as u64,
+            "rescore: shadow demotion"
+        );
+    }
     let t_q = Instant::now();
 
     // PSM-level q-values against the selected null. The split form reads the two columns
@@ -5615,6 +5704,7 @@ b
                 script_dir: "scripts",
                 cfg: &cfg,
                 config_hash: "test",
+                shadow: None,
             })
             .unwrap();
             let report: serde_json::Value = serde_json::from_str(
@@ -5659,6 +5749,7 @@ b
             script_dir: "scripts",
             cfg: &RescoreConfig::default(),
             config_hash: "test",
+            shadow: None,
         })
         .unwrap_err()
         .to_string();
@@ -5671,10 +5762,45 @@ b
             script_dir: "scripts",
             cfg: &RescoreConfig::default(),
             config_hash: "test",
+            shadow: None,
         })
         .unwrap_err()
         .to_string();
         assert!(e.contains("non-decreasing"), "{e}");
+    }
+
+    #[test]
+    fn too_few_decoys_rank_by_prelim_score_instead_of_training() {
+        // 24 rows, 12 decoys, under the default min_train_decoys (100): the requested
+        // sidecar is never needed (its interpreter does not exist), the rows are ranked by
+        // prelim_score, and the report records that substitution
+        let competed = scratch("fewdec_competed.parquet");
+        crafted_competed_table(&competed, 24);
+        let work = scratch("fewdec_work");
+        let out = scratch("fewdec_scored.parquet");
+        let cfg = RescoreConfig {
+            classifier: RescorerKind::NnTorch,
+            strict: true,
+            python: Some("mumdia-no-such-interpreter-for-this-test".to_string()),
+            ..Default::default()
+        };
+        run(RescoreParams {
+            competed: &[competed],
+            sources: None,
+            out: &out,
+            work_dir: &work,
+            script_dir: "scripts",
+            cfg: &cfg,
+            config_hash: "test",
+            shadow: None,
+        })
+        .unwrap();
+        let rep: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{out}.report.json")).unwrap();
+        assert_eq!(
+            rep["params"]["classifier"],
+            json!("prelim_score_few_decoys")
+        );
     }
 
     #[test]
@@ -5702,6 +5828,9 @@ b
                 strict: true,
                 python: Some("mumdia-no-such-interpreter-for-this-test".to_string()),
                 handoff,
+                // 12 decoys: this test is about the sidecar path, so the few-decoy
+                // fallback (`min_train_decoys`) is off
+                min_train_decoys: 0,
                 ..Default::default()
             };
             let err = run(RescoreParams {
@@ -5712,6 +5841,7 @@ b
                 script_dir: "scripts",
                 cfg: &cfg,
                 config_hash: "test",
+                shadow: None,
             })
             .unwrap_err()
             .to_string();
@@ -5798,6 +5928,7 @@ b
             script_dir: "scripts",
             cfg: &cfg,
             config_hash: "test",
+            shadow: None,
         })
         .unwrap_err()
         .to_string();

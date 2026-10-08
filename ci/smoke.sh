@@ -68,6 +68,19 @@ echo "=== smoke: binary $BIN"
 "$BIN" --version
 rm -rf "$work"
 mkdir -p "$work"
+# The fixture plants targets into otherwise empty spectra, so a decoy can match only by
+# coincidence and has almost no window-summed evidence. At the default window-mean 0.6 no
+# fixture decoy passes and rescore refuses a decoy-free pool (real runs pass tens of
+# thousands). At 0.5 three pass: the smoke then runs the default gate mode AND the
+# few-decoy path of rescore (`rescore.min_train_decoys`: ranked by prelim_score, plain
+# target-decoy competition), which a real very small or very clean run can also reach.
+"$PY" - "$cfg" "$work/smoke_native.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("extract", {}).update({"gate_mode": "window_mean", "gate_min_score": 0.5})
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+cfg="$work/smoke_native.json"
 # The default caches (`"auto"`, `mumdia::cache`) live in the user's cache directory, where
 # they would carry a library or a DeepLC projection from one smoke run, or from a
 # developer's own searches, into the next. Every arm searches from scratch; arm 4a and the
