@@ -3862,6 +3862,40 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
             None => 1.0,
         };
         let peak_spec = || peak_spectral_score(&groups, &sig, fints0);
+        // Entropy similarity of the spectrum summed over the apex +-2 scans of the
+        // acquisition grid (empty scans included in the count), from the hit groups.
+        let window_entropy = || {
+            let (lo_rt, hi_rt) = if grid.is_empty() {
+                (apex_rt, apex_rt)
+            } else {
+                let j = grid.partition_point(|&r| r < apex_rt).min(grid.len() - 1);
+                let ia = if j > 0 && (apex_rt - grid[j - 1]).abs() < (grid[j] - apex_rt).abs() {
+                    j - 1
+                } else {
+                    j
+                };
+                (
+                    grid[ia.saturating_sub(2)],
+                    grid[(ia + 2).min(grid.len() - 1)],
+                )
+            };
+            let mut summed = vec![0.0f64; fints0.len()];
+            for i in 0..groups.len() {
+                let rt = groups.rt(i);
+                if rt >= lo_rt - 1e-9 && rt <= hi_rt + 1e-9 {
+                    for (k, s) in summed.iter_mut().enumerate() {
+                        *s += groups.or_zero(i, k as u16) as f64;
+                    }
+                }
+            }
+            if summed.iter().all(|&v| v <= 0.0) {
+                0.0
+            } else {
+                crate::stages::features::entropy::spectral_entropy_similarity_sqrt(
+                    &summed, &pred_f64,
+                )
+            }
+        };
         // `to_vec` only where the co-elution score is actually asked for (a non-default
         // gate mode, or the diagnostics), so the default chain never materialises it.
         let coel = || coelution_gate_score(&groups, &distinct.to_vec(), &sig, fints0);
@@ -3877,6 +3911,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                 GateMode::PeakSpectral => peak_spec() < p.cfg.gate_min_score,
                 GateMode::SpectralEntropy => apex_entropy() < p.cfg.gate_min_score,
                 GateMode::Coelution => coel() < p.cfg.gate_min_score,
+                GateMode::WindowEntropy => window_entropy() < p.cfg.gate_min_score,
                 GateMode::Combined => {
                     peak_spec() < p.cfg.gate_min_score || coel() < p.cfg.gate_coelution_min
                 }

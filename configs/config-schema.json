@@ -2268,7 +2268,8 @@
         "peak_spectral",
         "spectral_entropy",
         "coelution",
-        "combined"
+        "combined",
+        "window_entropy"
       ]
     },
     {

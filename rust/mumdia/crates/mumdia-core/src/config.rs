@@ -1736,6 +1736,14 @@ pub enum GateMode {
     /// co-elution score >= `gate_coelution_min`. More specific (an interferent
     /// passing one axis is still rejected), for a cleaner FDR pool.
     Combined,
+    /// Spectral-entropy similarity (sqrt) of the spectrum summed over the apex +-2 scans of
+    /// the isolation window's acquisition grid, against the library. At near-single-ion
+    /// intensities a fragment is present in one scan and absent in the next, so any
+    /// single-scan score is noise; summed over five scans it is not. On the Astral HYE and
+    /// Q Exactive AIF HYE runs a threshold of 0.6 kept 42% / 35% of the candidates with
+    /// 99.99% / 99.90% of the gate-0 identifications, where the apex Pearson at 0.2 kept 32%
+    /// and lost about 10%.
+    WindowEntropy,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

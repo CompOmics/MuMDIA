@@ -671,6 +671,7 @@ Spectral-agreement score the extraction acceptance gate (`gate_min_score`) thres
 | `spectral_entropy` |  | Li spectral-entropy similarity of the sqrt-transformed apex-scan observed vs predicted intensities (`spectral_entropy_similarity_sqrt`). The full-feature gate search (all ~379 features, target-vs-decoy) found this the single best gate discriminator: AUC 0.826 / matched-pool recall 69.8%, versus apex Pearson's 0.781 / 64.5%. Same inputs as `ApexPearson`, better separation. |
 | `coelution` |  | Predicted-intensity-weighted mean CO-ELUTION correlation of each matched fragment's XIC to the signature reference over the elution peak (temporal agreement, orthogonal to intensity agreement). |
 | `combined` |  | Require BOTH: peak-integrated spectral Pearson >= `gate_min_score` AND the co-elution score >= `gate_coelution_min`. More specific (an interferent passing one axis is still rejected), for a cleaner FDR pool. |
+| `window_entropy` |  | Spectral-entropy similarity (sqrt) of the spectrum summed over the apex +-2 scans of the isolation window's acquisition grid, against the library. At near-single-ion intensities a fragment is present in one scan and absent in the next, so any single-scan score is noise; summed over five scans it is not. On the Astral HYE and Q Exactive AIF HYE runs a threshold of 0.6 kept 42% / 35% of the candidates with 99.99% / 99.90% of the gate-0 identifications, where the apex Pearson at 0.2 kept 32% and lost about 10%. |
 
 ### `GroupBalance`
 
