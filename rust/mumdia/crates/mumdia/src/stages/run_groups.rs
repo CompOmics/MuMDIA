@@ -528,6 +528,14 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         ch,
     )?;
     let global = cfg.groups.calibration == GroupCalibration::Global;
+    // The MS1 offset is one per run, so it is learned once from the pooled seed rather than
+    // per band (a band holds too few anchors for a stable median).
+    let ext_cfg = crate::stages::ms1cal::extract_cfg(
+        &cfg.extract,
+        &pooled_seed,
+        &g.converted.ms1,
+        cfg.rt_im_train.q_train,
+    )?;
 
     // --- RT model per band, against the pooled or the band's own anchors
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
@@ -896,7 +904,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 out_psms: &psms,
                 out_chrom: &chrom,
                 restrict_candidates: None,
-                cfg: &cfg.extract,
+                cfg: &ext_cfg,
                 config_hash: ch,
                 // A band file carries local ids with its fragments at the band's offset; a
                 // span implies it.

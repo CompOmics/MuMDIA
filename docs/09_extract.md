@@ -743,9 +743,9 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 
 | Field | Default | Effect |
 |---|---|---|
-| `fixed_scan_window` | 3 | Minimum co-elution run length (`scan_window` floor); `.max(1)` at `extract.rs:1591` |
+| `fixed_scan_window` | 2 (3 before 2026-10-08) | Minimum co-elution run length (`scan_window` floor); `.max(1)` at `extract.rs:1591` |
 | `frag_tol_ppm` | 20.0 | Fragment match tolerance (overridden by `mass_cal`) |
-| `prec_tol_ppm` | 20.0 | MS1 isotope integration tolerance |
+| `prec_tol_ppm` | 3.0 (20.0 before 2026-10-08) | MS1 isotope integration tolerance, centred on the offset `ms1_calibrate` learns from the seed |
 | `presence_min_matched` | 3 | Tier-b: minimum distinct matched fragments (`extract.rs:1727`) |
 | `presence_min_fragments` | 3 | Acceptance: minimum distinct fragments (`extract.rs:1926`) |
 | `presence_min_coelution` | 2 | Min simultaneously-present fragments to extend a run (`extract.rs:1915`) |

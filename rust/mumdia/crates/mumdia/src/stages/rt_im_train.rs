@@ -539,11 +539,10 @@ fn check_cfg(cfg: &RtImTrainConfig) -> Result<()> {
              0.0 disables held-out window sizing"
         );
     }
+    // Both size the window per calibrated RT. The local window is on by default, so an
+    // explicit `adaptive_rt_window` takes the slot instead of failing the run.
     if cfg.local_window_anchors > 0 && cfg.adaptive_rt_window {
-        anyhow::bail!(
-            "rt_im_train.local_window_anchors and rt_im_train.adaptive_rt_window are mutually \
-             exclusive: both size the window per calibrated RT; enable one of them"
-        );
+        info!("rt-im-train: adaptive_rt_window is set, so the local RT window is not used");
     }
     if !(cfg.local_window_multiplier.is_finite() && cfg.local_window_multiplier > 0.0) {
         anyhow::bail!(
@@ -1054,7 +1053,9 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
     fit.status = status;
     fit.holdout_sizing = holdout_sizing;
     let local = match (w_rt, &plan) {
-        (Some(w), WindowPlan::Calibrated) if cfg.local_window_anchors > 0 => {
+        (Some(w), WindowPlan::Calibrated)
+            if cfg.local_window_anchors > 0 && !cfg.adaptive_rt_window =>
+        {
             let cals: Vec<f64> = train_irt.iter().map(|x| fit.predict(*x)).collect();
             let signed: Vec<f64> = cals.iter().zip(&train_rt).map(|(c, y)| y - c).collect();
             LocalWindow::fit(
@@ -1078,7 +1079,14 @@ fn fit_anchors(seed_psms: &str, cfg: &RtImTrainConfig, irt_join: &IrtJoin) -> Re
             "rt-im-train: widen-only local RT window"
         );
     }
-    let composition = if cfg.composition_correction && calibration_available && n_train >= 50 {
+    // A seed table without the sequence or charge (older or hand-built anchors) skips the
+    // correction rather than failing the stage.
+    let composition = if cfg.composition_correction
+        && calibration_available
+        && n_train >= 50
+        && seed.has_column("peptidoform")
+        && seed.has_column("charge")
+    {
         let pform = seed.str("peptidoform")?;
         let charge = seed.i32("charge")?;
         let x: Vec<[f64; 7]> = anchor_ids
