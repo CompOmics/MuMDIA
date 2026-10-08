@@ -64,7 +64,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`predict_frag`](#predict_frag) | `PredictFragConfig` | 15 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
 | [`search_seed`](#search_seed) | `SearchSeedConfig` | 9 | [docs/07_search_seed.md](07_search_seed.md) |
 | [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 24 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
-| [`extract`](#extract) | `ExtractConfig` | 42 | [docs/09_extract.md](09_extract.md) |
+| [`extract`](#extract) | `ExtractConfig` | 43 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
 | [`features`](#features) | `FeaturesConfig` | 11 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
@@ -370,6 +370,7 @@ Fragment traces over consecutive same-window scans.
 | `emit_gate_diagnostics` | `bool` | `false` | diagnostic | Emit the four gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy`) as extra `psms.parquet` columns, for the offline gate-metric comparison. Default `false` (diagnostic sidecar, like `emit_candidate_audit`): when off, neither the columns nor the extra per-candidate score computation happen, so the default chain is byte-identical. |
 | `gate_mode` | `GateMode` | `apex_pearson` |  | Which spectral-agreement score the `gate_min_score` gate thresholds (sensitivity program). The legacy gate uses a single apex-scan intensity Pearson, which one chimeric scan can dominate. See `GateMode`. |
 | `gate_coelution_min` | `f64` | `0.5` |  | Second threshold for `GateMode::Combined`: the co-elution score must exceed this while the peak-integrated spectral score exceeds `gate_min_score`. Requiring BOTH is more specific (rejects interferents that pass one axis). |
+| `gate_rt_weight` | `f64` | `0.2` |  | Weight of the RT error in `GateMode::WindowMean`: the score is the mean of the summed-window entropy, coverage and cosine minus this times the apex RT error over the candidate's own window half-width on that side (clipped to 1). |
 
 ## extract.claim_cues
 
@@ -672,6 +673,7 @@ Spectral-agreement score the extraction acceptance gate (`gate_min_score`) thres
 | `coelution` |  | Predicted-intensity-weighted mean CO-ELUTION correlation of each matched fragment's XIC to the signature reference over the elution peak (temporal agreement, orthogonal to intensity agreement). |
 | `combined` |  | Require BOTH: peak-integrated spectral Pearson >= `gate_min_score` AND the co-elution score >= `gate_coelution_min`. More specific (an interferent passing one axis is still rejected), for a cleaner FDR pool. |
 | `window_entropy` |  | Spectral-entropy similarity (sqrt) of the spectrum summed over the apex +-2 scans of the isolation window's acquisition grid, against the library. At near-single-ion intensities a fragment is present in one scan and absent in the next, so any single-scan score is noise; summed over five scans it is not. On the Astral HYE and Q Exactive AIF HYE runs a threshold of 0.6 kept 42% / 35% of the candidates with 99.99% / 99.90% of the gate-0 identifications, where the apex Pearson at 0.2 kept 32% and lost about 10%. |
+| `window_mean` |  | Mean of three agreement scores of the spectrum summed over the apex +-2 scans of the acquisition grid (sqrt entropy similarity, the share of predicted intensity observed, sqrt cosine), minus `gate_rt_weight` times the apex RT error over the window half-width on its side. On the Astral and Q Exactive HYE runs the top 10% of candidates by this score held 99.4% / 99.6% of the gate-0 identifications, and the top 15% held 99.9%. |
 
 ### `GroupBalance`
 
@@ -1128,6 +1130,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-23 structs and 275 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 34 enumerations, 1 named profile(s), 98 environment variables read and 20 set.
+23 structs and 276 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 34 enumerations, 1 named profile(s), 98 environment variables read and 20 set.
 
 21 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

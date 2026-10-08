@@ -1362,6 +1362,15 @@ fn ms1_near(scans: &[Ms1Scan], j: usize, half: usize, target: f64, tol_ppm: f64)
         .fold(0.0f32, f32::max)
 }
 
+/// `x` when finite, else 0.
+fn fin0(x: f64) -> f64 {
+    if x.is_finite() {
+        x
+    } else {
+        0.0
+    }
+}
+
 fn sum_near(mz: &[f32], inten: &[f32], target: f64, tol_ppm: f64) -> f32 {
     if mz.is_empty() {
         return 0.0;
@@ -3864,7 +3873,9 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
         let peak_spec = || peak_spectral_score(&groups, &sig, fints0);
         // Entropy similarity of the spectrum summed over the apex +-2 scans of the
         // acquisition grid (empty scans included in the count), from the hit groups.
-        let window_entropy = || {
+        // The spectrum summed over the apex +-2 scans of the acquisition grid (empty scans
+        // included in the count), from the hit groups: the window gates read it.
+        let window_summed = || {
             let (lo_rt, hi_rt) = if grid.is_empty() {
                 (apex_rt, apex_rt)
             } else {
@@ -3888,6 +3899,10 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                     }
                 }
             }
+            summed
+        };
+        let window_entropy = || {
+            let summed = window_summed();
             if summed.iter().all(|&v| v <= 0.0) {
                 0.0
             } else {
@@ -3895,6 +3910,48 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                     &summed, &pred_f64,
                 )
             }
+        };
+        let window_mean = || {
+            let summed = window_summed();
+            if summed.iter().all(|&v| v <= 0.0) {
+                return 0.0;
+            }
+            let ent = crate::stages::features::entropy::spectral_entropy_similarity_sqrt(
+                &summed, &pred_f64,
+            );
+            let psum: f64 = pred_f64.iter().map(|x| x.max(0.0)).sum();
+            let cov = if psum > 0.0 {
+                summed
+                    .iter()
+                    .zip(&pred_f64)
+                    .filter(|(o, _)| **o > 0.0)
+                    .map(|(_, p)| p.max(0.0))
+                    .sum::<f64>()
+                    / psum
+            } else {
+                0.0
+            };
+            let so: Vec<f64> = summed.iter().map(|x| x.max(0.0).sqrt()).collect();
+            let sp: Vec<f64> = pred_f64.iter().map(|x| x.max(0.0).sqrt()).collect();
+            let cos = crate::stats::cosine(&so, &sp);
+            let mean = (fin0(ent) + fin0(cov) + fin0(cos)) / 3.0;
+            let (cal, lo, hi) = (
+                rt_cal[cid as usize],
+                rt_lo[cid as usize],
+                rt_hi[cid as usize],
+            );
+            let rtw = if cal.is_finite() && lo.is_finite() && hi.is_finite() {
+                let err = apex_rt - cal;
+                let side = if err < 0.0 { cal - lo } else { hi - cal };
+                if side > 0.0 {
+                    (err.abs() / side).min(1.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            mean - p.cfg.gate_rt_weight * rtw
         };
         // `to_vec` only where the co-elution score is actually asked for (a non-default
         // gate mode, or the diagnostics), so the default chain never materialises it.
@@ -3912,6 +3969,7 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                 GateMode::SpectralEntropy => apex_entropy() < p.cfg.gate_min_score,
                 GateMode::Coelution => coel() < p.cfg.gate_min_score,
                 GateMode::WindowEntropy => window_entropy() < p.cfg.gate_min_score,
+                GateMode::WindowMean => window_mean() < p.cfg.gate_min_score,
                 GateMode::Combined => {
                     peak_spec() < p.cfg.gate_min_score || coel() < p.cfg.gate_coelution_min
                 }

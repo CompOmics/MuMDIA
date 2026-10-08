@@ -1623,6 +1623,10 @@ pub struct ExtractConfig {
     /// this while the peak-integrated spectral score exceeds `gate_min_score`.
     /// Requiring BOTH is more specific (rejects interferents that pass one axis).
     pub gate_coelution_min: f64,
+    /// Weight of the RT error in `GateMode::WindowMean`: the score is the mean of the
+    /// summed-window entropy, coverage and cosine minus this times the apex RT error over
+    /// the candidate's own window half-width on that side (clipped to 1).
+    pub gate_rt_weight: f64,
 }
 impl Default for ExtractConfig {
     fn default() -> Self {
@@ -1705,6 +1709,7 @@ impl Default for ExtractConfig {
             emit_gate_diagnostics: false,     // diagnostic gate-score columns; off in production
             gate_mode: GateMode::ApexPearson, // legacy single-scan intensity Pearson
             gate_coelution_min: 0.5,          // used only by GateMode::Combined
+            gate_rt_weight: 0.2,              // used only by GateMode::WindowMean
         }
     }
 }
@@ -1744,6 +1749,13 @@ pub enum GateMode {
     /// 99.99% / 99.90% of the gate-0 identifications, where the apex Pearson at 0.2 kept 32%
     /// and lost about 10%.
     WindowEntropy,
+    /// Mean of three agreement scores of the spectrum summed over the apex +-2 scans of
+    /// the acquisition grid (sqrt entropy similarity, the share of predicted intensity
+    /// observed, sqrt cosine), minus `gate_rt_weight` times the apex RT error over the
+    /// window half-width on its side. On the Astral and Q Exactive HYE runs the top 10% of
+    /// candidates by this score held 99.4% / 99.6% of the gate-0 identifications, and the
+    /// top 15% held 99.9%.
+    WindowMean,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

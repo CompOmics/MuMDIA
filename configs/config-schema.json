@@ -2269,7 +2269,8 @@
         "spectral_entropy",
         "coelution",
         "combined",
-        "window_entropy"
+        "window_entropy",
+        "window_mean"
       ]
     },
     {
@@ -2282,6 +2283,19 @@
       "default": 0.5,
       "default_text": "0.5",
       "help": "Second threshold for `GateMode::Combined`: the co-elution score must exceed this while the peak-integrated spectral score exceeds `gate_min_score`. Requiring BOTH is more specific (rejects interferents that pass one axis).",
+      "gates": [],
+      "source_struct": "ExtractConfig"
+    },
+    {
+      "path": "extract.gate_rt_weight",
+      "name": "gate_rt_weight",
+      "section": "extract",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.2,
+      "default_text": "0.2",
+      "help": "Weight of the RT error in `GateMode::WindowMean`: the score is the mean of the summed-window entropy, coverage and cosine minus this times the apex RT error over the candidate's own window half-width on that side (clipped to 1).",
       "gates": [],
       "source_struct": "ExtractConfig"
     },
