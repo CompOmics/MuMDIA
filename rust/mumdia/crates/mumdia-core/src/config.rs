@@ -1661,7 +1661,7 @@ impl Default for ExtractConfig {
             // flattened from below -- its count rose from 9,503 to 10,847 and the optimum
             // moved to the loose end -- so the sweep that motivated 0.6 no longer
             // describes this configuration, and loose is now better for BOTH rescorers.
-            gate_min_score: 0.2,
+            gate_min_score: 0.6, // with GateMode::WindowMean (default since 2026-10-08)
             min_matched_fraction: 0.0,
             apex_top_fragments: 0, // superseded by apex_count_tol; kept for compat
             apex_rt_prior_s: 0.0,  // RT prior off by default
@@ -1721,7 +1721,6 @@ impl Default for ExtractConfig {
 pub enum GateMode {
     /// Legacy: Pearson of observed-vs-predicted fragment intensities at the single
     /// apex scan. One chimeric scan can dominate it.
-    #[default]
     ApexPearson,
     /// Pearson of the PEAK-INTEGRATED observed spectrum (each fragment summed over
     /// the elution-peak scans) vs predicted intensities. Averages out a single
@@ -1754,7 +1753,8 @@ pub enum GateMode {
     /// observed, sqrt cosine), minus `gate_rt_weight` times the apex RT error over the
     /// window half-width on its side. On the Astral and Q Exactive HYE runs the top 10% of
     /// candidates by this score held 99.4% / 99.6% of the gate-0 identifications, and the
-    /// top 15% held 99.9%.
+    /// top 15% held 99.9%. The default since 2026-10-08, with `gate_min_score` 0.6.
+    #[default]
     WindowMean,
 }
 
