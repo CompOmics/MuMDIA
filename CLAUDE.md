@@ -718,6 +718,38 @@ Cross-run consensus ions, interference-aware ion selection, minimum clean-ion
 rules, connected-component LFQ diagnostics, and coherent MBR requantification
 remain open high-priority work.
 
+## Sensitivity options default since 2026-10-08
+
+PR #166 made eight settings and two feature families the default together, after they
+were measured as one set ("all options") with the `window_mean` 0.6 gate:
+
+- `extract.ms1_calibrate = true` (MS1 offset learned from the seed, `stages::ms1cal`;
+  in the banded path once from the pooled seed), `extract.prec_tol_ppm = 3.0` (was 20),
+  `extract.ms1_scan_halfwidth = 1`, `extract.emit_rt_window = true`,
+  `extract.fixed_scan_window = 2` (was 3);
+- `rt_im_train.local_window_anchors = 100` (widen-only local window; an explicit
+  `adaptive_rt_window` takes precedence) and `rt_im_train.composition_correction = true`;
+- `rescore.shadow_min_shared = 3` (shadow demotion; a standalone `rescore` without
+  `--lib-fragments` / `--isolation-windows` skips it with a warning);
+- the fixed-window (`wf*`) and window-scaled RT error (`rtw_*`) feature families, appended
+  after the registry: 39 more columns. `MUMDIA_WINDOW_FEATURES=0` /
+  `MUMDIA_RTW_FEATURES=0` leave them out.
+
+Measured single seed, against the previous defaults with the same gate where available:
+
+| search | before | all options |
+|---|---|---|
+| Astral HYE, 6 runs, peptides | 116,683 | 127,849 |
+| Q Exactive AIF HYE, 6 runs, peptides | 85,090 | 88,526 |
+| QE AIF entrapment, real precursors at measured FDP 1% | 11,282 | 12,056 |
+| Astral HeLa entrapment (single-cell study), human precursors at measured FDP 1% | 14,392 (5 seeds) | 15,975 (DIA-NN 2.7: 15,440) |
+| single cells Cell_A / Cell_B, precursors | 5,655 / 4,862 (5 seeds) | 6,439 / 5,254 |
+| immuno AT10273AUH (63 bands), peptides | 10,336 | 12,664 |
+
+Open: seeds; the measured FDP at a reported q of 1% is still 1.25-1.39% on the Astral
+HeLa entrapment pool (DIA-NN 0.48%), so compare at a measured FDP; the immuno gain has
+no entrapment check; 3 ppm MS1 is unmeasured on timsTOF.
+
 ## Defaults promoted on correctness grounds, not on a count
 
 Four defaults changed because the previous value was wrong on its own terms, not

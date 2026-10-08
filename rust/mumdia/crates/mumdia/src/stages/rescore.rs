@@ -1004,13 +1004,16 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     // Shadow demotion (`rescore.shadow_min_shared`): a first-pass precursor q selects the
     // lenders, then every shadow of either label drops below all other scores before the
     // q-values below are computed (`stages::shadow`).
-    if p.cfg.shadow_min_shared > 0 {
-        let Some(inputs) = p.shadow.as_ref() else {
-            anyhow::bail!(
-                "rescore.shadow_min_shared is set but this rescore has no library fragments \
-                 or isolation windows (pass --lib-fragments and --isolation-windows)"
-            );
-        };
+    // Default-on since 2026-10-08, so a standalone rescore without the library fragments
+    // skips it with a warning rather than failing.
+    if p.cfg.shadow_min_shared > 0 && p.shadow.is_none() {
+        tracing::warn!(
+            "rescore: shadow demotion skipped: this rescore has no library fragments or \
+             isolation windows (pass --lib-fragments and --isolation-windows, or set \
+             rescore.shadow_min_shared = 0)"
+        );
+    }
+    if let (true, Some(inputs)) = (p.cfg.shadow_min_shared > 0, p.shadow.as_ref()) {
         let t_sh = Instant::now();
         let pid: Vec<u32> = {
             let mut interner: HashMap<(&str, i32), u32> = HashMap::new();

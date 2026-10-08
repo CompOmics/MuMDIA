@@ -74,18 +74,19 @@ const FAMILIES: &[(&[&str], FamilyFn)] = &[
     (demix::NAMES, demix::values),
 ];
 
-/// Experimental: the fixed-window integrated family ([`window`]), appended after the
-/// registry when `MUMDIA_WINDOW_FEATURES=1`. Off by default, so the default schema and
-/// every pinned feature digest are unchanged.
+/// The fixed-window integrated family ([`window`]) and the window-scaled RT error family
+/// ([`rt_window`]), appended after the registry. On by default since 2026-10-08;
+/// `MUMDIA_WINDOW_FEATURES=0` / `MUMDIA_RTW_FEATURES=0` leave a family out, which restores
+/// the previous schema.
 fn families() -> &'static [(&'static [&'static str], FamilyFn)] {
     static F: std::sync::OnceLock<Vec<(&'static [&'static str], FamilyFn)>> =
         std::sync::OnceLock::new();
     F.get_or_init(|| {
         let mut v = FAMILIES.to_vec();
-        if std::env::var("MUMDIA_WINDOW_FEATURES").is_ok_and(|x| x == "1") {
+        if std::env::var("MUMDIA_WINDOW_FEATURES").map_or(true, |x| x != "0") {
             v.push((window::NAMES, window::values));
         }
-        if std::env::var("MUMDIA_RTW_FEATURES").is_ok_and(|x| x == "1") {
+        if std::env::var("MUMDIA_RTW_FEATURES").map_or(true, |x| x != "0") {
             v.push((rt_window::NAMES, rt_window::values));
         }
         v
@@ -6330,9 +6331,44 @@ mod tests {
         digest_as(v1_path, true)
     }
 
+    /// BLAKE3 of a PIN with the window and RT-window family columns removed: the golden PIN
+    /// hashes describe builds without those default-on families.
+    fn pin_hash_without_appended(path: &str) -> String {
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut lines = text.split('\n');
+        let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
+        let keep: Vec<bool> = header
+            .iter()
+            .map(|n| !window::NAMES.contains(n) && !rt_window::NAMES.contains(n))
+            .collect();
+        let strip = |line: &str| -> String {
+            line.split('\t')
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(f, _)| f)
+                .collect::<Vec<_>>()
+                .join("\t")
+        };
+        let mut out = vec![strip(&header.join("\t"))];
+        out.extend(lines.map(strip));
+        let stripped = out.join("\n");
+        if stripped == text {
+            return mumdia_io::hash::blake3_file(path).unwrap();
+        }
+        mumdia_io::hash::blake3_str(&stripped)
+    }
+
     fn digest_as(path: &str, narrow_to_v2: bool) -> (usize, usize, u64) {
         let t = mumdia_io::table::Table::read(path).unwrap();
-        let names = t.column_names();
+        // The window and RT-window families (default-on since 2026-10-08) are appended
+        // after the registry and are not part of the builds the golden digests describe.
+        let names: Vec<String> = t
+            .column_names()
+            .into_iter()
+            .filter(|n| {
+                !window::NAMES.contains(&n.as_str()) && !rt_window::NAMES.contains(&n.as_str())
+            })
+            .collect();
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         for name in &names {
             fnv(&mut h, name.as_bytes());
@@ -6516,7 +6552,7 @@ mod tests {
                 ),
             }
             assert_eq!(
-                mumdia_io::hash::blake3_file(&pin1).unwrap(),
+                pin_hash_without_appended(&pin1),
                 GOLDEN_PIN,
                 "chunk {tag}: the PIN bytes differ from the name-keyed assembly"
             );
@@ -6534,7 +6570,7 @@ mod tests {
                 "chunk {tag}: the v2 table is not the v1 table with its f32 columns narrowed"
             );
             assert_eq!(
-                mumdia_io::hash::blake3_file(&pin2).unwrap(),
+                pin_hash_without_appended(&pin2),
                 GOLDEN_PIN,
                 "chunk {tag}: the v2 layout moved the PIN bytes"
             );

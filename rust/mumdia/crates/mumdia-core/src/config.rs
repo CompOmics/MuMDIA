@@ -1094,7 +1094,7 @@ pub struct RtImTrainConfig {
     /// Astral runs found charge-4 precursors elute 4.6-8.1 s before their calibrated
     /// prediction and 8-14% of them fell outside the window. The window width is unchanged;
     /// only its centre moves. Decoys share their target's composition, so their windows move
-    /// with it. Off by default.
+    /// with it. On by default since 2026-10-08.
     pub composition_correction: bool,
     /// Fallback fixed RT window in seconds when calibration cannot be fit.
     pub fallback_rt_window_s: f64,
@@ -1167,8 +1167,8 @@ pub struct RtImTrainConfig {
     /// each side of the window becomes the larger of that and the global `w_rt`, capped at
     /// `fallback_rt_window_s`. Where the predicted retention time loses the elution order
     /// (typically the gradient ends) the anchors' residuals are one-sided and large, and the
-    /// window widens on that side only; elsewhere it stays the global window. 0 (default)
-    /// is off. Mutually exclusive with `adaptive_rt_window`.
+    /// window widens on that side only; elsewhere it stays the global window. Default 100
+    /// since 2026-10-08; 0 is off. Mutually exclusive with `adaptive_rt_window`.
     pub local_window_anchors: usize,
     /// Multiplier on the local one-sided quantiles of `local_window_anchors`.
     pub local_window_multiplier: f64,
@@ -1359,7 +1359,7 @@ impl Default for RtImTrainConfig {
             anchor_q_ladder: vec![0.02, 0.05],
             loess_span: 0.3,
             loess_robust_iters: 0,
-            composition_correction: false,
+            composition_correction: true,
             fallback_rt_window_s: 120.0,
             finetune_deeplc: false,
             multihead_calibration: None,
@@ -1368,7 +1368,7 @@ impl Default for RtImTrainConfig {
             finetune_batch: 0,     // 0 = auto-scale to seed size
             adaptive_rt_window: false,
             adaptive_rt_bins: 12,
-            local_window_anchors: 0,
+            local_window_anchors: 100,
             local_window_multiplier: 1.0,
             rt_window_min_s: 1.0,
             window_holdout_frac: 0.0,
@@ -1539,16 +1539,16 @@ pub struct ExtractConfig {
     pub ms1_rescue: bool,
     /// MS1 scans either side of the nearest one read for a precursor isotope: the apex
     /// isotope intensities and every point of the MS1 grid traces take the maximum over
-    /// the nearest MS1 scan +- this many. 0 (default) reads the nearest scan only. At low
+    /// the nearest MS1 scan +- this many (default 1 since 2026-10-08). 0 reads the nearest scan only. At low
     /// ion counts a mono peak present in both neighbouring MS1 scans is often missing from
     /// the one nearest the apex, which then reads as no MS1 signal at all.
     pub ms1_scan_halfwidth: usize,
     /// Write each candidate's RT window (`rt_lo`, `rt_hi`) into `psms_extracted`, so the
     /// features stage can scale the RT error by the window it was searched in (the
-    /// `rtw_*` family). Off by default: the table's schema stays byte-identical.
+    /// `rtw_*` family). On by default since 2026-10-08; false keeps the previous schema.
     pub emit_rt_window: bool,
     /// Learn the MS1 precursor mass offset from the confident seed anchors before extract
-    /// and centre every MS1 isotope read on it (`stages::ms1cal`). Off by default.
+    /// and centre every MS1 isotope read on it (`stages::ms1cal`). On by default since 2026-10-08.
     pub ms1_calibrate: bool,
     /// MS1 precursor mass offset in ppm (observed - theoretical) applied to every MS1
     /// isotope read. Set by `ms1_calibrate` in `run` / `run-experiment`; 0 by default.
@@ -1632,9 +1632,9 @@ impl Default for ExtractConfig {
     fn default() -> Self {
         Self {
             windows_in_flight: None,
-            fixed_scan_window: 3,
+            fixed_scan_window: 2,
             frag_tol_ppm: 20.0,
-            prec_tol_ppm: 20.0,
+            prec_tol_ppm: 3.0,
             presence_min_matched: 3,
             presence_min_fragments: 3,
             presence_min_coelution: 2,
@@ -1683,9 +1683,9 @@ impl Default for ExtractConfig {
             matcher: MatcherKind::Fragindex,
             min_coelution_run: 0, // disabled; scan_window floor still applies
             ms1_rescue: false,    // opt-in; relaxes acceptance, validate FDR first
-            ms1_scan_halfwidth: 0,
-            emit_rt_window: false,
-            ms1_calibrate: false,
+            ms1_scan_halfwidth: 1,
+            emit_rt_window: true,
+            ms1_calibrate: true,
             ms1_ppm_offset: 0.0,
             retain_top_peaks: 1,            // legacy single-apex behaviour (K=1)
             promote_top_peaks: 1,           // top-K promotion off (only the selected apex is a row)
@@ -2347,8 +2347,8 @@ pub struct RescoreConfig {
     /// Shadow demotion: demote (below every other score) a candidate of either label when at
     /// least this many of its library fragments lie within `shadow_ppm` of a fragment of a
     /// higher-scoring, first-pass-accepted target in the same run and isolation window with
-    /// its apex within `shadow_rt_s`; the candidate's own base peptide never lends. 0
-    /// (default) is off. Needs the library fragments and the runs' isolation windows, which
+    /// its apex within `shadow_rt_s`; the candidate's own base peptide never lends. Default 3
+    /// since 2026-10-08; 0 is off. Without the inputs below it is skipped with a warning. Needs the library fragments and the runs' isolation windows, which
     /// `run` and `run-experiment` pass and `rescore` takes as `--lib-fragments` and
     /// `--isolation-windows`.
     pub shadow_min_shared: usize,
@@ -2408,7 +2408,7 @@ impl Default for RescoreConfig {
     fn default() -> Self {
         Self {
             min_train_decoys: 100,
-            shadow_min_shared: 0,
+            shadow_min_shared: 3,
             shadow_ppm: 10.0,
             shadow_rt_s: 3.0,
             shadow_region: 8,
@@ -3741,6 +3741,24 @@ mod tests {
         assert_eq!(GateMode::default(), GateMode::WindowMean);
         let parsed: ExtractConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed.gate_mode, GateMode::WindowMean);
+    }
+
+    #[test]
+    fn the_sensitivity_options_are_on_by_default() {
+        // Promoted together on 2026-10-08 (PR #166): HYE Astral + QE, the QE and Astral
+        // HeLa entrapment pools, the single cells and the immuno run.
+        let c = Config::default();
+        assert!(c.extract.ms1_calibrate);
+        assert_eq!(c.extract.prec_tol_ppm, 3.0);
+        assert!(c.extract.emit_rt_window);
+        assert_eq!(c.extract.fixed_scan_window, 2);
+        assert_eq!(c.extract.ms1_scan_halfwidth, 1);
+        assert_eq!(c.rt_im_train.local_window_anchors, 100);
+        assert!(c.rt_im_train.composition_correction);
+        assert_eq!(c.rescore.shadow_min_shared, 3);
+        let parsed: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.extract.prec_tol_ppm, 3.0);
+        assert_eq!(parsed.rescore.shadow_min_shared, 3);
     }
 
     #[test]
