@@ -69,13 +69,15 @@ echo "=== smoke: binary $BIN"
 rm -rf "$work"
 mkdir -p "$work"
 # The fixture plants targets into otherwise empty spectra, so a decoy can match only by
-# coincidence. The default window-mean gate at 0.6 rejects every decoy there (rescore then
-# refuses a decoy-free pool), while real runs pass tens of thousands. The smoke keeps the
-# default gate MODE, so its code path runs, at a threshold the fixture's few decoys clear.
+# coincidence and has almost no window-summed evidence. Under the default window-mean
+# gate (0.6, and any threshold from 0.1 to 0.5) at most 3-4 decoys reach rescore, too few
+# for a classifier (at 0.6 none, and rescore refuses a decoy-free pool), while real runs
+# pass tens of thousands. The smoke checks pipeline mechanics, so it runs on the previous
+# apex-Pearson 0.2 gate, which lets enough fixture decoys through.
 "$PY" - "$cfg" "$work/smoke_native.json" <<'PYEOF'
 import json, sys
 c = json.load(open(sys.argv[1]))
-c.setdefault("extract", {})["gate_min_score"] = 0.3
+c.setdefault("extract", {}).update({"gate_mode": "apex_pearson", "gate_min_score": 0.2})
 json.dump(c, open(sys.argv[2], "w"), indent=2)
 PYEOF
 cfg="$work/smoke_native.json"
