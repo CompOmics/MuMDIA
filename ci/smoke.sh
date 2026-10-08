@@ -68,6 +68,17 @@ echo "=== smoke: binary $BIN"
 "$BIN" --version
 rm -rf "$work"
 mkdir -p "$work"
+# The fixture plants targets into otherwise empty spectra, so a decoy can match only by
+# coincidence. The default window-mean gate at 0.6 rejects every decoy there (rescore then
+# refuses a decoy-free pool), while real runs pass tens of thousands. The smoke keeps the
+# default gate MODE, so its code path runs, at a threshold the fixture's few decoys clear.
+"$PY" - "$cfg" "$work/smoke_native.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("extract", {})["gate_min_score"] = 0.3
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+cfg="$work/smoke_native.json"
 # The default caches (`"auto"`, `mumdia::cache`) live in the user's cache directory, where
 # they would carry a library or a DeepLC projection from one smoke run, or from a
 # developer's own searches, into the next. Every arm searches from scratch; arm 4a and the
