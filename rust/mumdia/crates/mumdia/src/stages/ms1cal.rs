@@ -15,7 +15,7 @@ use crate::spectra::load_ms1;
 /// Fewest anchors that still give a usable median.
 const MIN_ANCHORS: usize = 30;
 
-/// `(offset_ppm, anchors used)`, or `None` with fewer than [`MIN_ANCHORS`] anchors.
+/// `(offset_ppm, anchors used)`, or `None` with fewer than `MIN_ANCHORS` anchors.
 pub fn estimate(
     seed_psms: &str,
     ms1_path: &str,

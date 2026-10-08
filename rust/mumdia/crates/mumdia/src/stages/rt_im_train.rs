@@ -675,7 +675,7 @@ pub struct AnchorPlan {
 /// calibration has nothing to fit and the per-run LOESS falls back to a fixed window. The
 /// cut is relaxed through `anchor_q_ladder` until enough anchors exist; anchors are only
 /// an RT reference, and a few percent of false ones move a robust curve far less than no
-/// curve at all. Counted as [`fit_anchors`] counts: finite target rows, one per base
+/// curve at all. Counted as `fit_anchors` counts: finite target rows, one per base
 /// peptide.
 pub fn plan_anchors(seed_psms: &str, cfg: &RtImTrainConfig) -> Result<AnchorPlan> {
     let seed = TableFile::open(seed_psms)?;
