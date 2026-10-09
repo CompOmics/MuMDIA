@@ -1066,8 +1066,10 @@ fn d_true() -> bool {
 /// The cache key must move with the recipe, not just with the parameters: a library
 /// built by an older recipe is a different library. Raised to 2 when `--met-excision`
 /// was added, because every entry written before that lacks the initiator-Met-excised
-/// peptides and reusing one would silently reinstate the defect the flag fixes.
-const RECIPE_VERSION: u32 = 2;
+/// peptides and reusing one would silently reinstate the defect the flag fixes. Raised to 3
+/// when the decoys' spectra became DIA-NN predictions (`predict_decoys.py`): an entry
+/// written before carries copied-intensity decoys, which made the reported FDR optimistic.
+const RECIPE_VERSION: u32 = 3;
 
 pub fn library_cache_dir(req: &BuildRequest, diann_version: &str) -> Result<PathBuf, String> {
     use sha2::{Digest, Sha256};
@@ -1509,10 +1511,12 @@ fn predict_args(req: &BuildRequest, plan: &ModPlan, out_lib: &Path) -> Vec<Strin
 
 /// Predict a library with the user's DIA-NN, then convert it to MuMDIA's schema.
 ///
-/// Three steps, all of which must succeed: DIA-NN predicts, `import_diann_lib.py`
-/// maps it into the target schema, and `make_reverse_decoys.py` adds the decoy
-/// population -- the last of which also sorts by precursor m/z and re-indexes
-/// `candidate_id`, both of which the fragment index rejects a library for lacking.
+/// Four steps, all of which must succeed: DIA-NN predicts, `import_diann_lib.py`
+/// maps it into the target schema, `make_reverse_decoys.py` adds the reversed decoy
+/// population, and `predict_decoys.py` replaces the decoys' copied intensities with
+/// DIA-NN's prediction for their sequences -- the last of which also sorts by precursor
+/// m/z and re-indexes `candidate_id`, both of which the fragment index rejects a library
+/// for lacking.
 pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
     let status = detect();
     if !status.licence_acknowledged {
@@ -1665,6 +1669,8 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
 
         let tgt_prec = out_dir.join("lib_precursors_targets.parquet");
         let tgt_frag = out_dir.join("lib_fragments_targets.parquet");
+        let rev_prec = out_dir.join("lib_precursors_copied_decoys.parquet");
+        let rev_frag = out_dir.join("lib_fragments_copied_decoys.parquet");
         let prec = out_dir.join("lib_precursors.parquet");
         let frag = out_dir.join("lib_fragments.parquet");
 
@@ -1697,10 +1703,41 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
                     scripts.join("make_reverse_decoys.py").display().to_string(),
                     tgt_prec.display().to_string(),
                     tgt_frag.display().to_string(),
-                    prec.display().to_string(),
-                    frag.display().to_string(),
+                    rev_prec.display().to_string(),
+                    rev_frag.display().to_string(),
                 ],
             ),
+            // The reversed decoys above carry their targets' intensities, copied ion for
+            // ion; DIA-NN now predicts their spectra instead. Copied decoys made the
+            // reported FDR optimistic: paired entrapment FDP 1.68% at a reported 1% on the
+            // ProteoBench Astral entrapment module, against 0.85% with predicted decoys.
+            ("predicting the decoy spectra with DIA-NN", {
+                let mut a = vec![
+                    scripts.join("predict_decoys.py").display().to_string(),
+                    "build".into(),
+                    rev_prec.display().to_string(),
+                    rev_frag.display().to_string(),
+                    prec.display().to_string(),
+                    frag.display().to_string(),
+                    "--diann".into(),
+                    exe.display().to_string(),
+                    "--threads".into(),
+                    req.threads.to_string(),
+                    "--work".into(),
+                    out_dir.join("decoy_prediction").display().to_string(),
+                ];
+                if !plan.is_legacy() {
+                    a.push("--keep-unimod".into());
+                    a.push(
+                        plan.unimod_ids()
+                            .iter()
+                            .map(|i| i.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    );
+                }
+                a
+            }),
         ];
 
         for (title, args) in steps {
