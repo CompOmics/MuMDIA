@@ -226,8 +226,14 @@ def build(a):
         if not speclib:
             sys.exit(f"DIA-NN wrote neither a Parquet nor a .speclib library in {work}")
         parquet = os.path.join(work, f"{stem}.parquet")
-        run([a.diann, "--lib", speclib[0], "--gen-spec-lib", "--out-lib", parquet,
-             "--threads", str(a.threads)])
+        reexport = [a.diann, "--lib", speclib[0], "--gen-spec-lib", "--out-lib", parquet]
+        try:
+            run(reexport + ["--threads", str(a.threads)])
+        except subprocess.CalledProcessError as e:
+            # Seen once on a 5.4M-decoy library: DIA-NN 2.7 died with an access violation
+            # right after "Initialising library", and the same command succeeded on retry.
+            print(f"re-export failed ({e.returncode}); retrying once with fewer threads", flush=True)
+            run(reexport + ["--threads", str(max(1, min(8, a.threads)))])
         if not os.path.isfile(parquet):
             sys.exit(f"the re-export produced no {parquet}; DIA-NN 2.x is needed")
     pp, pfr = os.path.join(work, "pred_precursors.parquet"), os.path.join(work, "pred_fragments.parquet")
