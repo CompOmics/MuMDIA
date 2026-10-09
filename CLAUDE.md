@@ -31,8 +31,8 @@ policy for tuning and validation.
   - `mumdia-core`: typed config, schemas, manifest, masses/constants.
   - `mumdia-io`: Arrow/Parquet table layer, hashes, JSON, artifact reports.
   - `mumdia`: CLI/library, fragment index, FDR/rescoring, and stages.
-- `scripts/`: eight engine-invoked Python workers plus four imported-library
-  helpers (twelve scripts), and `_lib_io.py`, the shared writer the helpers use so
+- `scripts/`: eight engine-invoked Python workers plus five imported-library
+  helpers (thirteen scripts), and `_lib_io.py`, the shared writer the helpers use so
   they cannot emit a parquet the engine rejects. Includes `augment_library.py`, which adds the
   tryptic FASTA peptides an imported library is missing. Sidecars use positional
   file contracts.
@@ -373,6 +373,15 @@ fine-tuning also is not guaranteed deterministic.
 - A search library must contain valid `target` and `decoy` labels. Native digest
   decoys are collision-checked; imported-library helpers must preserve paired
   populations.
+- Decoy spectra must be predicted, not copied (since 2026-10-09). FASTA-built libraries
+  always predicted them; an imported DIA-NN library now runs `make_reverse_decoys.py`
+  and then `predict_decoys.py`, which has DIA-NN predict the decoy sequences (the desktop
+  build does both). On the ProteoBench Astral entrapment module the copied-intensity
+  decoys gave a paired entrapment FDP of 1.68% at a reported precursor q of 1%
+  (95,087 precursors, "inconclusive"); predicted decoys gave 0.85% (89,334, "valid" at
+  every q cut) and more precursors at a matched FDP (about 87,400 copied). Every
+  imported-library count measured before that date rests on copied decoys, so its
+  reported 1% is optimistic; compare such counts at a measured FDP.
 - Production and benchmark configs use `rescore.strict = true`. An explicitly
   requested external classifier must not silently become `native_tda`.
 - The source of truth for the classifier actually used is

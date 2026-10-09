@@ -334,16 +334,32 @@ environment has both; in Docker use `/opt/conda/envs/rescore/bin/python`).
        lib.parquet lib_precursors_targets.parquet lib_fragments_targets.parquet
    ```
 
-3. **Add the decoy population.** This also sorts by precursor m/z and re-indexes
-   `candidate_id`, both of which the fragment index requires:
+3. **Add the decoy population**, reversed sequences paired with their targets:
 
    ```bash
    python scripts/make_reverse_decoys.py \
        lib_precursors_targets.parquet lib_fragments_targets.parquet \
-       lib_precursors.parquet lib_fragments.parquet
+       lib_precursors_copied.parquet lib_fragments_copied.parquet
    ```
 
-4. **Run MuMDIA in library-input mode** (no `--fasta`), as in the quickstart
+4. **Let DIA-NN predict the decoys' spectra.** `make_reverse_decoys.py` copies each
+   target's intensities onto its reversed sequence; this step replaces them with
+   DIA-NN's prediction for the decoy sequences, and also sorts by precursor m/z and
+   re-indexes `candidate_id`, both of which the fragment index requires:
+
+   ```bash
+   python scripts/predict_decoys.py build \
+       lib_precursors_copied.parquet lib_fragments_copied.parquet \
+       lib_precursors.parquet lib_fragments.parquet --diann diann --threads 8
+   ```
+
+   Copied-intensity decoys make the reported FDR optimistic. On the ProteoBench Astral
+   entrapment module (three HeLa runs, FDRBench paired entrapment) they gave a paired
+   entrapment FDP of 1.68% at a reported precursor q of 1%; the same decoys with
+   predicted spectra gave 0.85%, valid at every q cut, with more precursors at a matched
+   FDP. The step costs one extra DIA-NN prediction run.
+
+5. **Run MuMDIA in library-input mode** (no `--fasta`), as in the quickstart
    above. Everything downstream is unchanged. No fragment prediction sidecar is
    required in this mode; a DeepLC interpreter is needed for the default
    retention-time re-prediction, and without one the imported iRT is used.
@@ -354,7 +370,9 @@ digest produces: on the AIF benchmark it lacked 209 of DIA-NN's own 1% peptides,
 all of that form. `scripts/augment_library.py` adds the tryptic FASTA peptides an
 imported library lacks, reusing the engine's own digest and fragment prediction so
 the added entries carry byte-identical peptidoform strings, then hands off to
-`make_shift_decoys.py` or `make_reverse_decoys.py` for the paired decoys. The
+`make_shift_decoys.py` or `make_reverse_decoys.py` for the paired decoys (use
+`--decoy-strategy reverse` and then `predict_decoys.py`: shift decoys carry their
+target's sequence and cannot be predicted). The
 augmented tables added 18,903 tryptic base peptides and recovered about 80 of the
 209 at an unchanged 0.98% empirical decoy fraction, with identification parity
 elsewhere. The remaining peptides enter the search space but stay below
@@ -372,15 +390,15 @@ substantially less sensitive than the imported library; see the benchmark.
 
 ### The Python sidecars
 
-`scripts/` holds eleven Python programs. Seven are engine-invoked workers, called
+`scripts/` holds twelve Python programs. Seven are engine-invoked workers, called
 by the relevant stage over a positional file contract (input Parquet in, output
 Parquet out): MS2PIP (`ms2pip_worker.py`), DeepLC (`deeplc_worker.py`), the
 DeepLC fine-tune (`deeplc_finetune.py`), mokapot (`mokapot_worker.py`), the
 PyTorch rescorer (`nn_rescore_worker.py`), the entrapment rescorer
 (`entrapment_worker.py`), and match-between-runs (`mbr_worker.py`). The other
-four are run by hand for the imported-library recipe above:
-`import_diann_lib.py`, `make_reverse_decoys.py`, `make_shift_decoys.py`, and
-`augment_library.py`.
+five are run by hand for the imported-library recipe above:
+`import_diann_lib.py`, `make_reverse_decoys.py`, `predict_decoys.py`,
+`make_shift_decoys.py`, and `augment_library.py`.
 
 Neither the DeepLC fine-tune nor the PyTorch rescorer is bit-reproducible. The
 rescorer seeds NumPy and PyTorch but its training kernels are not guaranteed

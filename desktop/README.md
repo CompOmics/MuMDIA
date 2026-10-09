@@ -301,7 +301,8 @@ in the code that actually spawns searches.
 
 The three steps documented in the top-level `README.md`, in order: DIA-NN predicts,
 `import_diann_lib.py` maps the result into the MuMDIA schema, and
-`make_reverse_decoys.py` adds the decoy population. The last also sorts by precursor
+`make_reverse_decoys.py` adds the decoy population, `predict_decoys.py` has DIA-NN predict
+the decoys' spectra in place of the copied target intensities. The last also sorts by precursor
 m/z and re-indexes `candidate_id`, both of which the fragment index rejects a
 library for lacking. On success the two tables are selected on the search screen
 automatically, because the alternative is retyping two long paths.
