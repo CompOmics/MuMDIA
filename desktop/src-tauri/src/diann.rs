@@ -80,7 +80,24 @@ pub const LIBRARY_CACHE_NAME: &str = "libraries";
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 struct Saved {
     path: Option<String>,
-    licence_acknowledged: bool,
+    /// The user's own answer to the licence notice: `None` until they tick or untick
+    /// it. An older state file stored a plain boolean, which reads as `Some`.
+    #[serde(default)]
+    licence_acknowledged: Option<bool>,
+}
+
+/// Whether the licence counts as acknowledged, and whether that was assumed.
+///
+/// An explicit answer always wins. Without one, a DIA-NN that is installed and runs
+/// is taken as acknowledged: someone who installed DIA-NN has accepted its licence
+/// from the vendor, and asking again before the first library build only adds a step.
+/// The download offered here (`install`) never relies on the assumption, because
+/// nothing is installed at that point.
+fn effective_licence(saved: Option<bool>, runs: bool) -> (bool, bool) {
+    match saved {
+        Some(answer) => (answer, false),
+        None => (runs, runs),
+    }
 }
 
 fn load() -> Saved {
@@ -111,6 +128,9 @@ pub struct Status {
     /// cannot run (wrong architecture, missing licence file) must not read as ready.
     pub runs: bool,
     pub licence_acknowledged: bool,
+    /// True when `licence_acknowledged` was assumed from a working installation
+    /// rather than answered by the user, so the interface can say so.
+    pub licence_assumed: bool,
     /// False for DIA-NN 1.8.x, which cannot write the Parquet spectral library the
     /// library build needs. Reported so the interface can say so before a
     /// whole-proteome prediction rather than after it.
@@ -404,12 +424,18 @@ pub fn probe(exe: &Path) -> (bool, Option<String>, Option<String>) {
 /// Find DIA-NN, if it is there.
 pub fn detect() -> Status {
     let saved = load();
-    let mut status = Status {
-        licence_acknowledged: saved.licence_acknowledged,
-        ..Default::default()
-    };
+    let mut status = detect_unacknowledged(&saved);
+    let (ack, assumed) = effective_licence(saved.licence_acknowledged, status.runs);
+    status.licence_acknowledged = ack;
+    status.licence_assumed = assumed;
+    status
+}
 
-    let cands = candidates(&saved);
+/// `detect` before the licence answer is applied to it.
+fn detect_unacknowledged(saved: &Saved) -> Status {
+    let mut status = Status::default();
+
+    let cands = candidates(saved);
     if cands.is_empty() {
         return status;
     }
@@ -503,7 +529,7 @@ pub fn set_path(path: Option<&str>) -> Result<Status, String> {
 /// Record that the licence notice was shown and accepted.
 pub fn acknowledge_licence(accepted: bool) -> Result<Status, String> {
     let mut saved = load();
-    saved.licence_acknowledged = accepted;
+    saved.licence_acknowledged = Some(accepted);
     store(&saved)?;
     Ok(detect())
 }
@@ -737,7 +763,8 @@ fn download_verified(installer: &Arc<Installer>, a: &Asset, dest: &Path) -> Resu
 /// Refuses until the licence notice has been acknowledged, in the backend, for the
 /// same reason `build` does: a disabled button is not an enforcement point.
 pub fn install(installer: Arc<Installer>) -> Result<(), String> {
-    if !load().licence_acknowledged {
+    // Only an explicit answer: with nothing installed there is nothing to assume from.
+    if load().licence_acknowledged != Some(true) {
         return Err("the DIA-NN licence notice has not been acknowledged".into());
     }
     let Some(a) = asset() else {
@@ -1203,6 +1230,9 @@ pub struct BuildState {
     /// Which of the three steps is running, for a caption above the log.
     pub step: String,
     pub log: Vec<String>,
+    /// Every command this build has started, in order, the running one last, so the
+    /// progress screen can show what is being run as it does for a search.
+    pub commands: Vec<String>,
     /// The two tables a search consumes, once they exist.
     pub precursors: Option<String>,
     pub fragments: Option<String>,
@@ -1292,6 +1322,21 @@ fn installer_reset(b: &Arc<Builder>) {
     }
 }
 
+/// A command as a person would type it: arguments with spaces quoted.
+fn command_line(exe: &Path, args: &[String]) -> String {
+    let quote = |a: &str| {
+        if a.is_empty() || a.contains(char::is_whitespace) {
+            format!("\"{a}\"")
+        } else {
+            a.to_string()
+        }
+    };
+    std::iter::once(quote(&exe.display().to_string()))
+        .chain(args.iter().map(|a| quote(a)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Run one child, streaming both of its streams into the log.
 fn run_step(
     builder: &Arc<Builder>,
@@ -1316,6 +1361,9 @@ fn run_step(
     // would be followed by the import and decoy steps running anyway.
     if builder.is_cancelled() {
         return Err("cancelled".into());
+    }
+    if let Ok(mut s) = builder.state.lock() {
+        s.commands.push(command_line(exe, args));
     }
     let mut child = cmd
         .spawn()
@@ -1802,10 +1850,10 @@ mod tests {
         // The acknowledgement is a precondition inside `build`, not only a disabled
         // button in the interface, so that it cannot be bypassed by calling the
         // command directly.
-        let saved = load();
-        if saved.licence_acknowledged {
-            // The developer machine has already acknowledged; this assertion is
-            // about the refusal path, so skip rather than clobber their state.
+        if detect().licence_acknowledged {
+            // The developer machine has already acknowledged, or has a DIA-NN from
+            // which acknowledgement is assumed; this assertion is about the refusal
+            // path, so skip rather than clobber their state.
             return;
         }
         let err = build(
@@ -1834,6 +1882,40 @@ mod tests {
     }
 
     #[test]
+    fn an_installed_diann_counts_as_acknowledged_until_the_user_says_otherwise() {
+        // Nothing answered and nothing that runs: not acknowledged.
+        assert_eq!(effective_licence(None, false), (false, false));
+        // Nothing answered and a DIA-NN that runs: assumed, and reported as assumed.
+        assert_eq!(effective_licence(None, true), (true, true));
+        // An explicit answer always wins, in both directions.
+        assert_eq!(effective_licence(Some(false), true), (false, false));
+        assert_eq!(effective_licence(Some(true), false), (true, false));
+        // An older state file stored a plain boolean; it still reads as an answer.
+        let old: Saved =
+            serde_json::from_str(r#"{"path":null,"licence_acknowledged":false}"#).unwrap();
+        assert_eq!(old.licence_acknowledged, Some(false));
+        let fresh: Saved = serde_json::from_str(r#"{"path":null}"#).unwrap();
+        assert_eq!(fresh.licence_acknowledged, None);
+    }
+
+    #[test]
+    fn a_build_step_is_shown_as_a_command_a_person_could_type() {
+        let line = command_line(
+            Path::new("C:/DIA-NN/2.7.0/diann.exe"),
+            &[
+                "--lib".into(),
+                "my lib.tsv".into(),
+                "--cut".into(),
+                "".into(),
+            ],
+        );
+        assert_eq!(
+            line,
+            r#"C:/DIA-NN/2.7.0/diann.exe --lib "my lib.tsv" --cut """#
+        );
+    }
+
+    #[test]
     fn a_missing_binary_is_reported_rather_than_reported_as_ready() {
         // A path that is not there must never read as usable: the failure would
         // otherwise appear only when DIA-NN was supposed to run.
@@ -1850,7 +1932,7 @@ mod tests {
         // the library.
         let saved = Saved {
             path: Some("/somewhere/diann".into()),
-            licence_acknowledged: true,
+            licence_acknowledged: Some(true),
         };
         let c = candidates(&saved);
         assert_eq!(c.first().map(|(s, _)| s.as_str()), Some("configured"));
@@ -1921,7 +2003,7 @@ mod tests {
     fn an_install_is_refused_until_the_licence_is_acknowledged() {
         // Same enforcement point as `build`: the interface disables the button, but
         // the button is not the thing that must hold.
-        if load().licence_acknowledged {
+        if load().licence_acknowledged == Some(true) {
             return;
         }
         let err = install(Arc::new(Installer::default())).unwrap_err();

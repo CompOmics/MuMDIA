@@ -32,6 +32,7 @@ COMPONENTS = ROOT / "desktop" / "src-tauri" / "src" / "components.rs"
 ENVS = [
     ("env/console-requirements.txt", "3.11"),
     ("env/console-ms2pip-requirements.txt", "3.11"),
+    ("env/console-visdia-requirements.txt", "3.11"),
 ]
 STRATEGY = "unsafe-best-match"
 

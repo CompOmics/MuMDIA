@@ -13,6 +13,9 @@ const dialog = window.__TAURI__.dialog;
 
 const $ = (id) => document.getElementById(id);
 
+// The preset selected when the application starts.
+const DEFAULT_PRESET = "diann-library";
+
 // ── pipeline order ──────────────────────────────────────────────────────────
 // The engine reports the stage that produced each artifact, but not what is still
 // to come, so the expected sequence lives here. Library-input mode skips the three
@@ -46,8 +49,15 @@ const state = {
   thermoTimer: null,
   thermoReady: false,
   msconvert: null,
-  libSrc: "builtin",
+  // DIA-NN by default: it is far more sensitive than the built-in predictors. Falls
+  // back to "builtin" while DIA-NN is unavailable, unless the user chose one.
+  libSrc: "diann",
+  libSrcChosen: false,
   buildingLibrary: false,
+  // Whether the in-depth settings were opened, so a re-render keeps them open.
+  advancedOpen: false,
+  // The visDIA environment is installed, so "Open in visDIA" can work.
+  visdiaReady: false,
   // "separate" = one search per file; "experiment" = one pooled run-experiment.
   runMode: "experiment",
   // Batch progress: which file of how many, and what each one produced.
@@ -145,7 +155,13 @@ function screen(name) {
 // ── startup ─────────────────────────────────────────────────────────────────
 async function init() {
   const cores = navigator.hardwareConcurrency;
-  if (cores) $("cores").textContent = `${cores} cores available`;
+  if (cores) {
+    $("cores").textContent = `${cores} cores available`;
+    // All but two, so the machine stays usable while DIA-NN predicts.
+    $("d-threads").value = String(Math.max(1, cores - 2));
+    $("d-threads").max = String(cores);
+    $("d-threads-note").textContent = `of ${cores}; two are left free by default`;
+  }
 
   try {
     const info = await invoke("engine_info");
@@ -167,6 +183,9 @@ async function init() {
       o.textContent = p.name;
       sel.appendChild(o);
     }
+    // The preset the published benchmarks use, and the one a DIA-NN library needs.
+    const preferred = [...sel.options].find((o) => o.textContent === DEFAULT_PRESET);
+    if (preferred) sel.value = preferred.value;
   } catch {
     /* Presets are a convenience; engine defaults remain available without them. */
   }
@@ -195,6 +214,7 @@ async function init() {
   }
   for (const r of document.querySelectorAll('input[name="libsrc"]')) {
     r.addEventListener("change", () => {
+      state.libSrcChosen = true;
       selectLibSrc(r.value);
       if (r.value === "diann") refreshLibSrcNote();
     });
@@ -205,6 +225,10 @@ async function init() {
   $("start").addEventListener("click", start);
   $("install-primary").addEventListener("click", () => installComponents("primary"));
   $("install-ms2pip").addEventListener("click", () => installComponents("ms2pip"));
+  $("install-visdia").addEventListener("click", () => installComponents("visdia"));
+  $("open-visdia").addEventListener("click", (e) =>
+    openVisdia(state.outDir, e.currentTarget, $("visdia-error"), state.picks.fasta)
+  );
   $("install-thermo").addEventListener("click", installThermo);
   $("msconvert-get").addEventListener("click", () =>
     invoke("open_url", { url: "https://proteowizard.sourceforge.io/" }).catch((e) =>
@@ -229,6 +253,8 @@ async function init() {
   refreshComponents();
   refreshDiann();
   refreshThermo();
+  // Setup is the first screen, so its managed-data card is filled from the start.
+  refreshManaged();
   $("stop").addEventListener("click", stop);
   $("another").addEventListener("click", () => screen("input"));
   $("open-folder").addEventListener("click", () => invoke("reveal", { path: state.outDir }));
@@ -245,6 +271,25 @@ async function init() {
 // documentation generator emits from config.rs. Nothing about a setting -- its
 // name, type, default or help text -- is written here, so this cannot describe a
 // parameter the engine does not have.
+//
+// The one exception is which settings count as common: the handful a search may
+// reasonably change, shown first under a plain name. Everything else stays in the
+// in-depth section. A path listed here that the schema does not have is skipped, so a
+// renamed setting drops out of the list rather than breaking the screen.
+const COMMON_SETTINGS = [
+  ["rescore.classifier", "Rescoring model"],
+  ["quant.q_threshold", "FDR threshold of the reports"],
+  ["extract.prec_tol_ppm", "Precursor (MS1) tolerance, ppm"],
+  ["search_seed.fragment_tol_ppm", "Fragment tolerance of the first pass, ppm"],
+  ["rt_im_train.rt_window_multiplier", "Retention-time window width"],
+  ["rt_im_train.library_irt", "Where the library's retention times come from"],
+  ["rt_im_train.multihead_calibration", "DeepLC multi-head calibration"],
+  ["experiment.rt_library_scope", "Adapt library retention times once or per run"],
+  ["extract.gate_min_score", "Extraction gate threshold"],
+  ["compete.group_by", "Competition unit"],
+  ["mbr.strategy", "Match-between-runs"],
+  ["rescore.seeds", "Rescoring seeds"],
+];
 
 async function loadSettings() {
   if (state.schema) return;
@@ -258,6 +303,12 @@ async function loadSettings() {
   $("settings-search").addEventListener("input", renderSettings);
   $("only-changed").addEventListener("change", renderSettings);
   $("save-settings").addEventListener("click", saveSettings);
+  $("settings-advanced").addEventListener("toggle", (e) => {
+    // Remember only a choice made by hand; a search opens it without changing that.
+    if (!$("settings-search").value.trim() && !$("only-changed").checked) {
+      state.advancedOpen = e.target.open;
+    }
+  });
   // A preset chosen on the Search screen is the new starting point here. Edits made
   // before the switch are dropped, and the banner says so.
   $("preset").addEventListener("change", async () => {
@@ -317,85 +368,114 @@ function currentValue(f) {
   return f.path in state.overrides ? state.overrides[f.path] : f.default;
 }
 
+const escHtml = (t) =>
+  String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+           .replace(/"/g, "&quot;");
+
+/// One setting as a row: its control, its markers and the engine's help text. `label`
+/// is the plain name the common section puts above the path; the in-depth section
+/// shows the path alone.
+function settingRow(f, label) {
+  const esc = escHtml;
+  const changed = f.path in state.overrides;
+  const v = currentValue(f);
+  let control;
+  if (f.kind === "bool") {
+    control =
+      `<select data-path="${esc(f.path)}">` +
+      `<option value="true"${v === true ? " selected" : ""}>true</option>` +
+      `<option value="false"${v === false ? " selected" : ""}>false</option></select>`;
+  } else if (f.kind === "enum" && f.choices) {
+    control =
+      `<select data-path="${esc(f.path)}">` +
+      f.choices
+        .map((c) => `<option value="${esc(c)}"${c === v ? " selected" : ""}>${esc(c)}</option>`)
+        .join("") +
+      `</select>`;
+  } else {
+    control = `<input type="text" data-path="${esc(f.path)}" value="${esc(displayValue(v))}">`;
+  }
+  // A field the engine accepts but does not act on yet is shown as exactly that,
+  // and cannot be edited: a value typed there would be saved, validated and then
+  // ignored by the run, which is the one outcome worse than not offering it.
+  // A gated parameter is one the project documents as not to be changed from a
+  // single benchmark count. Saying so where the decision is made is the whole
+  // reason the schema carries the marker.
+  const unwired = f.gates.some((g) => g.includes("wired"));
+  if (unwired) control = control.replace(/^<(select|input)/, "<$1 disabled");
+  const gate = unwired
+    ? `<span class="pill warn" title="${esc(f.gates.join(", "))}">not wired yet</span>`
+    : f.gates.length
+      ? `<span class="pill warn" title="${esc(f.gates.join(", "))}">gated</span>`
+      : "";
+  const badge = changed ? `<span class="pill info">changed</span>` : "";
+  const name = label
+    ? `<b>${esc(label)}</b> <span class="spath">${esc(f.path)}</span>`
+    : esc(f.path);
+  return (
+    `<div class="setting${changed ? " changed" : ""}">` +
+    `<div class="sname">${name} ${gate} ${badge}</div>` +
+    `<div class="shelp">${esc(f.help || "No description in the engine source.")}` +
+    (f.default !== null && f.default !== undefined ? ` <em>Default: ${esc(f.default)}</em>` : "") +
+    `</div><div class="sctl">${control}</div></div>`
+  );
+}
+
 function renderSettings() {
   const q = $("settings-search").value.trim().toLowerCase();
   const onlyChanged = $("only-changed").checked;
-  const bySection = new Map();
+  const matches = (f) =>
+    (!onlyChanged || f.path in state.overrides) &&
+    (!q || f.path.toLowerCase().includes(q) || (f.help || "").toLowerCase().includes(q));
 
+  // Common: the curated list, in its own order, under plain names.
+  const byPath = new Map(state.schema.fields.map((f) => [f.path, f]));
+  const commonPaths = new Set();
+  const commonRows = [];
+  for (const [path, label] of COMMON_SETTINGS) {
+    const f = byPath.get(path);
+    if (!f) continue;
+    commonPaths.add(path);
+    if (matches(f) || (q && label.toLowerCase().includes(q))) commonRows.push(settingRow(f, label));
+  }
+
+  // In-depth: everything else, grouped by section as the schema orders it.
+  const bySection = new Map();
   for (const f of state.schema.fields) {
-    const changed = f.path in state.overrides;
-    if (onlyChanged && !changed) continue;
-    if (q && !(f.path.toLowerCase().includes(q) || f.help.toLowerCase().includes(q))) continue;
+    if (commonPaths.has(f.path) || !matches(f)) continue;
     const sec = f.section || "(top level)";
     if (!bySection.has(sec)) bySection.set(sec, []);
     bySection.get(sec).push(f);
   }
-
-  const esc = (t) =>
-    String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-             .replace(/"/g, "&quot;");
-
   const parts = [];
   for (const [sec, fields] of bySection) {
-    parts.push(`<div class="sec-title">${esc(sec)}</div><div class="card">`);
-    for (const f of fields) {
-      const changed = f.path in state.overrides;
-      const v = currentValue(f);
-      let control;
-      if (f.kind === "bool") {
-        control =
-          `<select data-path="${esc(f.path)}">` +
-          `<option value="true"${v === true ? " selected" : ""}>true</option>` +
-          `<option value="false"${v === false ? " selected" : ""}>false</option></select>`;
-      } else if (f.kind === "enum" && f.choices) {
-        control =
-          `<select data-path="${esc(f.path)}">` +
-          f.choices
-            .map((c) => `<option value="${esc(c)}"${c === v ? " selected" : ""}>${esc(c)}</option>`)
-            .join("") +
-          `</select>`;
-      } else {
-        control = `<input type="text" data-path="${esc(f.path)}" value="${esc(displayValue(v))}">`;
-      }
-      // A field the engine accepts but does not act on yet is shown as exactly that,
-      // and cannot be edited: a value typed there would be saved, validated and then
-      // ignored by the run, which is the one outcome worse than not offering it.
-      // A gated parameter is one the project documents as not to be changed from a
-      // single benchmark count. Saying so where the decision is made is the whole
-      // reason the schema carries the marker.
-      const unwired = f.gates.some((g) => g.includes("wired"));
-      if (unwired) control = control.replace(/^<(select|input)/, "<$1 disabled");
-      const gate = unwired
-        ? `<span class="pill warn" title="${esc(f.gates.join(", "))}">not wired yet</span>`
-        : f.gates.length
-          ? `<span class="pill warn" title="${esc(f.gates.join(", "))}">gated</span>`
-          : "";
-      const badge = changed ? `<span class="pill info">changed</span>` : "";
-      parts.push(
-        `<div class="setting${changed ? " changed" : ""}">` +
-          `<div class="sname">${esc(f.path)} ${gate} ${badge}</div>` +
-          `<div class="shelp">${esc(f.help || "No description in the engine source.")}` +
-          (f.default !== null && f.default !== undefined
-            ? ` <em>Default: ${esc(f.default)}</em>`
-            : "") +
-          `</div><div class="sctl">${control}</div></div>`
-      );
-    }
+    parts.push(`<div class="sec-title">${escHtml(sec)}</div><div class="card">`);
+    for (const f of fields) parts.push(settingRow(f));
     parts.push(`</div>`);
   }
 
+  const common = $("settings-common");
+  common.innerHTML = commonRows.length
+    ? `<div class="card">${commonRows.join("")}</div>`
+    : `<p class="hint">${q || onlyChanged ? "None of the common settings match." : ""}</p>`;
   const list = $("settings-list");
-  list.innerHTML =
-    parts.join("") || `<p class="hint">Nothing matches that search.</p>`;
+  list.innerHTML = parts.join("") || `<p class="hint">Nothing else matches.</p>`;
 
-  for (const el of list.querySelectorAll("[data-path]")) {
-    el.addEventListener("change", () => onSettingChanged(el));
+  // A search or "only changed" looks through everything, so the in-depth section opens
+  // for it; otherwise it stays as the user left it.
+  $("settings-advanced").open = state.advancedOpen || !!q || onlyChanged;
+
+  for (const host of [common, list]) {
+    for (const el of host.querySelectorAll("[data-path]")) {
+      el.addEventListener("change", () => onSettingChanged(el));
+    }
   }
 
   const n = Object.keys(state.overrides).length;
   const presetName = $("preset").selectedOptions[0]?.textContent || "Engine defaults";
   $("settings-sub").textContent =
-    `${state.schema.fields.length} settings, starting from "${presetName}". ` +
+    `${state.schema.fields.length} settings, starting from "${presetName}" (chosen on the ` +
+    `Search screen). ` +
     (n
       ? `${n} differ from the engine defaults (the preset's own values included); those are what is saved.`
       : "None differ from the engine defaults.");
@@ -550,8 +630,30 @@ async function refreshComponents() {
     mbtn.disabled = false;
   }
 
+  const v = c.visdia || {};
+  state.visdiaReady = !!v.complete;
+  const vpill = $("visdia-pill");
+  const vbtn = $("install-visdia");
+  if (v.install_status === "installing") {
+    vpill.textContent = "installing…";
+    vpill.className = "pill warn";
+    vbtn.disabled = true;
+  } else if (v.complete) {
+    vpill.textContent = "installed";
+    vpill.className = "pill ok";
+    vbtn.disabled = true;
+    vbtn.textContent = "Installed";
+  } else {
+    vpill.textContent = "optional";
+    vpill.className = "pill mute";
+    vbtn.disabled = !c.primary.uv;
+    vbtn.textContent = "Install";
+  }
+  refreshVisdiaButtons();
+
   // One log pane, showing whichever installation is talking.
-  const active = m.install_status === "installing" ? m : p;
+  const active =
+    m.install_status === "installing" ? m : v.install_status === "installing" ? v : p;
   const logEl = $("install-log");
   const text = (active.install_log || []).join("\n");
   if (logEl.textContent !== text) {
@@ -566,7 +668,8 @@ async function refreshComponents() {
 
   // The DIA-NN card's build button depends on `componentsReady`, which is only
   // known here.
-  const busy = installing || m.install_status === "installing";
+  const busy =
+    installing || m.install_status === "installing" || v.install_status === "installing";
   if (busy && !state.setupTimer) {
     state.setupTimer = setInterval(refreshComponents, 900);
   } else if (!busy && state.setupTimer) {
@@ -716,6 +819,7 @@ async function refreshDiann() {
   const d = r.status;
   $("diann-notice-body").textContent = r.notice;
   $("diann-ack").checked = !!d.licence_acknowledged;
+  show($("diann-ack-note"), !!d.licence_assumed);
 
   const pill = $("diann-pill");
   if (d.runs) {
@@ -745,9 +849,11 @@ async function refreshDiann() {
   }
 
   // Building a library happens on the Search screen now; Setup only decides whether
-  // DIA-NN is available and licensed.
+  // DIA-NN is available and licensed. What it decides changes what the Search screen
+  // can offer, so that is refreshed too.
 
   refreshDiannOffer(d);
+  refreshLibSrcNote();
 }
 
 async function refreshDiannOffer(d) {
@@ -1500,26 +1606,28 @@ function summariseMods() {
 // and the fraction of an unfiltered search's accepted precursors still accepted.
 const PRESCREEN_NOTES = {
   off:
-    "Removes candidates the spectra give no support for, before the expensive stages. " +
-    "Off by default.",
+    "Off: every library candidate is searched, which keeps every identification within " +
+    "reach. The default.",
   before:
     "Scores every candidate against the spectra of its isolation window before DeepLC and " +
     "MS2PIP run, without retention times or predicted intensities, so predictions are made " +
     "only for the candidates kept; everything after it uses predicted retention times as " +
     "usual. Measured at balanced: 54% removed with 99.0% of an unfiltered search's accepted " +
     "precursors kept on immunopeptidomics Astral data, 56% with 100% on Orbitrap AIF, and " +
-    "52% with 95.2% on HYE Astral, where light kept 99.6%. One file at a time.",
+    "52% with 95.2% on HYE Astral, where light kept 99.6%. What it removes cannot be " +
+    "identified, so the kept fraction is the cost in identifications. One file at a time.",
   after:
     "Scores every candidate inside its retention-time window after the calibration. " +
     "Predictions are still made for the whole library; the saving is in extraction, " +
     "features and rescoring. Measured at balanced: 54% removed with 99.4% kept on HYE " +
-    "Astral, 54% with 98.9% on immunopeptidomics. Cannot be combined with bands yet.",
+    "Astral, 54% with 98.9% on immunopeptidomics. What it removes cannot be identified. " +
+    "Cannot be combined with bands yet.",
   tags:
     "Keeps a candidate only when one of its three-residue sequence tags was read from a " +
     "spectrum of its isolation window; database-free, before prediction and without " +
     "retention times. Measured: 56-58% removed with 100% kept on Orbitrap AIF and on a " +
-    "FASTA E. coli search, 17% on HYE Astral, nothing on immunopeptidomics. One file at a " +
-    "time.",
+    "FASTA E. coli search, 17% on HYE Astral, nothing on immunopeptidomics. A peptide " +
+    "whose tags were all missed cannot be identified. One file at a time.",
 };
 // The fraction of the library each choice is expected to keep, for the band plan.
 const PRESCREEN_KEEP = { light: 0.75, balanced: 0.46, stringent: 0.25 };
@@ -1731,27 +1839,48 @@ function searchProblems() {
 }
 
 // Say, on the search screen, whether choosing DIA-NN means waiting.
+//
+// DIA-NN is the default source. While it cannot be used (not installed, or its licence
+// not acknowledged) the built-in predictors are selected instead, and DIA-NN comes back
+// by itself once it can be used, unless the user picked one of the two explicitly.
 async function refreshLibSrcNote() {
   const note = $("libsrc-diann-note");
   const radio = $("libsrc-diann");
   if (!note || !radio) return;
+  const unavailable = (why) => {
+    radio.disabled = true;
+    note.textContent = why;
+    if (state.libSrc === "diann") selectLibSrc("builtin");
+  };
+  const available = () => {
+    radio.disabled = false;
+    if (!state.libSrcChosen && state.libSrc !== "diann") selectLibSrc("diann");
+  };
+
   const fasta = state.picks.fasta;
   if (!fasta) {
-    radio.disabled = true;
-    note.textContent = "Choose a FASTA first.";
+    let d;
+    try {
+      d = (await invoke("diann_status")).status;
+    } catch (e) {
+      return unavailable(`Unavailable: ${e}`);
+    }
+    if (!d.runs) return unavailable("No working DIA-NN was found; see Setup.");
+    if (!d.licence_acknowledged) {
+      return unavailable("Acknowledge the DIA-NN licence on the Setup screen first.");
+    }
+    available();
+    note.textContent = "Choose a FASTA and DIA-NN predicts the library from it before the search.";
     return;
   }
   let plan;
   try {
     plan = await invoke("diann_library_plan", { req: libraryParams(fasta) });
   } catch (e) {
-    radio.disabled = true;
     // The reason is the backend's: no DIA-NN, or the licence not acknowledged.
-    note.textContent = `Unavailable: ${e}`;
-    if (state.libSrc === "diann") selectLibSrc("builtin");
-    return;
+    return unavailable(`Unavailable: ${e}`);
   }
-  radio.disabled = false;
+  available();
   note.textContent = plan.ready
     ? `Already built for this FASTA — the search will start immediately (${plan.diann_version}).`
     : `Not built yet: DIA-NN will predict it first, which takes a while on a whole proteome (${plan.diann_version}).`;
@@ -1790,10 +1919,18 @@ async function ensureLibrary(fasta) {
   // those live inside #screen-setup and would not be visible from here.
   screen("progress");
   state.buildingLibrary = true;
+  // Reachable from the menu for the whole build: it used to be enabled only once the
+  // search started, so leaving this screen during a prediction left no way back.
+  $("nav-progress").disabled = false;
+  $("nav-results").disabled = true;
+  $("stop").disabled = false;
+  $("stop").textContent = "Stop";
+  banner($("run-error"), "");
   $("stages").innerHTML = "";
   $("prog-title").textContent = "Predicting the library";
   $("prog-sub").textContent = "DIA-NN is predicting the spectral library";
   $("log").textContent = "";
+  $("cmd").textContent = "";
   try {
     await invoke("diann_build", { req });
   } catch (e) {
@@ -1818,6 +1955,10 @@ async function ensureLibrary(fasta) {
       logEl.textContent = text;
       logEl.scrollTop = logEl.scrollHeight;
     }
+    // Every command the build has run, the current one last: DIA-NN's prediction,
+    // its re-export, and the conversion and decoy steps after it.
+    const cmds = (b.commands || []).join("\n\n");
+    if ($("cmd").textContent !== cmds) $("cmd").textContent = cmds;
     $("prog-sub").textContent = b.step || "working";
     if (b.status === "failed") {
       banner($("start-error"), b.error || "The library build failed.");
@@ -1897,7 +2038,7 @@ async function runBatch(p, built, threads, config) {
 
     // Wait for this one before starting the next.
     const outcome = await awaitRun();
-    state.batch.results.push({ file, ...outcome });
+    state.batch.results.push({ file, out_dir: req.out_dir, ...outcome });
     if (outcome.error) state.batch.failed += 1;
   }
 
@@ -1951,8 +2092,18 @@ function renderBatchSummary() {
     row.textContent = r.error
       ? `${baseName(r.file)} — failed: ${r.error}`
       : `${baseName(r.file)} — ${n ?? "?"} peptides at 1%`;
+    // Each file of a separate-files batch is its own result, in its own folder.
+    if (!r.error && r.out_dir) {
+      const open = node("button", "btn quiet small", "Open in visDIA");
+      open.dataset.visdia = r.out_dir;
+      open.addEventListener("click", () =>
+        openVisdia(r.out_dir, open, $("visdia-error"), state.picks.fasta)
+      );
+      row.append(" ", open);
+    }
     host.appendChild(row);
   }
+  refreshVisdiaButtons();
 }
 
 // Start is asynchronous with several awaits before the run exists (library build,
@@ -2181,6 +2332,34 @@ async function poll() {
   }
 }
 
+// ── visDIA ──────────────────────────────────────────────────────────────────
+// The results viewer runs as its own local server (`viewer.rs`). Opening a folder
+// starts one, or shows the one already serving that folder; the browser opens on it.
+
+/// The hint every "Open in visDIA" button carries, which says what a click will do.
+function refreshVisdiaButtons() {
+  const title = state.visdiaReady
+    ? "Show these results in visDIA, in your browser"
+    : "visDIA is not installed yet: install it on the Setup screen";
+  for (const b of document.querySelectorAll("#open-visdia, [data-visdia]")) b.title = title;
+}
+
+async function openVisdia(dir, btn, errEl, fasta) {
+  if (!dir) return;
+  banner(errEl, "");
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Opening visDIA…";
+  try {
+    await invoke("visdia_open", { dir, fasta: fasta || null });
+  } catch (e) {
+    banner(errEl, String(e));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+}
+
 // ── history ─────────────────────────────────────────────────────────────────
 async function loadHistory() {
   const list = $("history-list");
@@ -2213,14 +2392,22 @@ async function loadHistory() {
         `<div class="card-sub">${counts}<br>${esc(when)} · ${esc(e.out_dir)}` +
         (e.engine_version ? ` · ${esc(e.engine_version)}` : "") +
         `</div></div>` +
+        `<div class="row">` +
+        (r
+          ? `<button class="btn quiet" data-visdia="${escHtml(e.out_dir)}">Open in visDIA</button>`
+          : "") +
         `<button class="btn quiet" data-open="${esc(e.out_dir)}">Open folder</button>` +
-        `</div></div>`
+        `</div></div></div>`
       );
     })
     .join("");
   for (const b of list.querySelectorAll("[data-open]")) {
     b.addEventListener("click", () => invoke("reveal", { path: b.dataset.open }));
   }
+  for (const b of list.querySelectorAll("[data-visdia]")) {
+    b.addEventListener("click", () => openVisdia(b.dataset.visdia, b, $("history-error")));
+  }
+  refreshVisdiaButtons();
 }
 
 // ── rendering ───────────────────────────────────────────────────────────────

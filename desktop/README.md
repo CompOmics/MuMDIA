@@ -183,6 +183,33 @@ was measured with it (`docs/28`, section 22). The application still installs it 
 the separate optional component; folding it into the primary environment and
 removing the second `Env` is a follow-up, not a requirement.
 
+### visDIA, the results viewer
+
+A third, optional environment (`Env::Visdia`, `python-visdia`) holds
+[visDIA](https://github.com/CompOmics/visDIA) (`mumdia-viewer`), the interactive viewer
+for MuMDIA results. Its own environment because its Dash and DuckDB stack has nothing to
+do with the analysis packages, and neither should constrain the other.
+`env/console-visdia-requirements.txt` pins one visDIA commit through GitHub's source
+archive, so no git is needed and everyone on a release gets the same viewer; that commit
+was checked against this release's outputs (experiment and single run: counts,
+identification table, precursor detail, mirror spectrum). About 350 MB on Windows.
+
+"Open in visDIA" sits on the Results screen, on each History entry with a scored table,
+and on each file of a separate-files batch. `viewer::open` starts
+`python -m mumdia_viewer <dir> --no-browser` from that environment, reads the
+`serving ... at http://127.0.0.1:<port>/<token>/` line (with `PYTHONUNBUFFERED`, or a
+piped stdout holds it back), and opens only such a loopback address. One viewer per
+folder: opening the same folder again shows the running one. A viewer that exits before
+it serves is reported with its own last lines, which name the actual problem. Viewers
+have no window of their own, so all of them are stopped when the application closes,
+and removing the environment is refused while one runs. For the search just finished,
+the FASTA chosen on the Search screen is passed with `--fasta`, so a library DIA-NN
+built from it still gets sequence coverage.
+
+`viewer::tests::a_results_folder_is_served_and_stopped` (ignored by default; set
+`MUMDIA_TEST_VISDIA_DIR` to a results folder, with the environment installed) starts
+the real viewer, fetches its page, checks the reuse, and stops it.
+
 ## DIA-NN
 
 The interface can predict a spectral library from a FASTA using DIA-NN, which is
@@ -218,7 +245,11 @@ in the interface:
 - `diann::build` and `diann::install` both refuse until the licence notice is
   acknowledged, so calling either command directly does not bypass it. The Academia
   edition is non-profit-only, and that is a restriction a commercial user can
-  breach without ever noticing it exists.
+  breach without ever noticing it exists. Since 2026-10-10 a DIA-NN that is installed
+  and runs counts as acknowledged until the user answers (`effective_licence`):
+  installing it meant accepting its licence from the vendor. The box is shown ticked
+  with a note saying why, an explicit untick is stored and respected, and the download
+  of 1.8.1 still needs an explicit tick, because nothing is installed at that point.
 - The URL and SHA-256 are pinned per platform, and the digest is verified while
   streaming. A mismatch deletes the file: these bytes are executed or handed to the
   operating system's installer, and a failed verification must not leave something
@@ -275,7 +306,15 @@ FASTA mode offers two ways to get a library: the engine's built-in predictors, o
 DIA-NN predicting one first. The second is the sensitive path -- the ~1,213 against
 ~10,300 figure is largely this difference -- so a user starting from a FASTA should be
 able to take it without first understanding that a library is a separate artifact
-built on another screen.
+built on another screen. It is the selected option whenever DIA-NN can be used (found,
+runs, licence acknowledged); otherwise the built-in predictors are selected and DIA-NN
+comes back by itself once it can be used, unless the user picked one explicitly. DIA-NN
+runs on all cores but two by default, so the machine stays usable during a prediction.
+
+While DIA-NN builds the library the Progress screen is reachable from the menu, shows
+the build log, and its "Command being run" panel lists every command the build has
+started (prediction, re-export, conversion, decoys, decoy prediction), from
+`BuildState::commands`.
 
 **A predicted library is cached, content-addressed.** It depends on the FASTA's bytes
 and the digest parameters and on nothing else: not the mzML, not the thread count. So
@@ -358,7 +397,10 @@ fields take, and the engine validates the result before anything starts. With al
 at their defaults (prescreen off, automatic bands that resolve to one band, the standard
 modifications) the preset reaches the engine unchanged in library mode.
 
-**Prescreen** (`prescreen.*`, docs/34). Off; before prediction without retention times
+**Prescreen** (`prescreen.*`, docs/34). The screen says what it is for and what it
+costs: a candidate it removes can never be identified, so it trades identifications for
+time and memory (immunopeptidomics end to end: -3.5% peptides, -25% wall time, half the
+memory). Off; before prediction without retention times
 (`score_before_prediction` with `crowding_exponent = 0.25`, the no-RT score docs/34
 measured); after the retention-time calibration (`enabled`); or the database-free tag
 prefilter (`tag_prefilter`). Light, balanced and stringent map to a target of 0.25 and
@@ -522,6 +564,16 @@ Saving writes only the difference from the defaults. `Config` is
 means a later release that improves a default still reaches someone who saved
 settings today. Every save is validated by the engine before it is offered for use.
 
+The Settings screen shows a short list of common settings first, under plain names
+(`COMMON_SETTINGS` in `app.js`: rescoring model, FDR threshold, tolerances, retention-time
+window and calibration, gate, competition unit, match-between-runs, rescoring seeds), and
+every other parameter in a collapsed "In-depth settings" section that a search or "only
+changed" opens. Both are generated from the schema; only the choice of the common few is
+written by hand, and a path the schema lacks is skipped.
+
+The application opens on the Setup screen, and the Search screen's preset is
+`diann-library` when that preset is available.
+
 The editor starts from the preset selected on the Search screen, not from the engine
 defaults: `config_overrides` flattens the preset file into the same dotted paths the
 form uses (`settings::flatten`, the inverse of `nest`), so the saved file is the
@@ -571,7 +623,7 @@ bundle it built (`msiexec /a` on Windows, `--appimage-extract` on Linux) to asse
 the console, the engine, `uv` and the workers are inside and the engine runs.
 
 Everything else the application needs from the repository is compiled in with
-`include_str!`: the settings schema, and the two requirement sets. That is both
+`include_str!`: the settings schema, and the three requirement sets. That is both
 simpler and more robust than shipping them as files, and it costs nothing in
 freshness, because all three are generated from sources that require a rebuild
 anyway. It also avoids two Tauri packaging traps found while building the first
