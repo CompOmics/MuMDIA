@@ -836,6 +836,17 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                     nn_env = Some(env);
                     s
                 }
+                Err(e) if e.downcast_ref::<NoTrainingSignal>().is_some() => {
+                    warn!(
+                        "rescore: {e}. Ranking by the untrained prelim_score with plain \
+                         target-decoy competition instead; expect few identifications. This \
+                         usually means very low input or search settings far from the \
+                         acquisition (the seed search's confident targets are a quick check)."
+                    );
+                    classifier_used = "prelim_score_no_training_signal";
+                    model_identity = "prelim-score".to_string();
+                    prelim.clone()
+                }
                 Err(e) => {
                     if p.cfg.strict {
                         anyhow::bail!(
@@ -3560,6 +3571,36 @@ fn sidecar_paths(p: &RescoreParams, script_name: &str) -> SidecarPaths {
     paths
 }
 
+/// The exit code `nn_rescore_worker.py` uses when it cannot select a single training
+/// positive: no feature separates targets from decoys at the training FDR.
+const NO_TRAINING_SIGNAL_EXIT: i32 = 3;
+
+/// A rescoring sidecar found nothing to train on (see [`NO_TRAINING_SIGNAL_EXIT`]).
+///
+/// Not a malfunction of the classifier but a property of the data: very low input (a
+/// single cell, a short gradient) or a search configured far from the acquisition. The
+/// run is not failed for it, even under `rescore.strict`; it is ranked by `prelim_score`
+/// and the report says so, as with too few decoys. `strict` exists so that a requested
+/// classifier is never silently replaced by another learned model; this is neither silent
+/// nor another model.
+#[derive(Debug)]
+pub struct NoTrainingSignal {
+    script: String,
+}
+
+impl std::fmt::Display for NoTrainingSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} found no training signal: no feature separates targets from decoys at the \
+             training FDR",
+            self.script
+        )
+    }
+}
+
+impl std::error::Error for NoTrainingSignal {}
+
 /// Run a PIN-contract Python rescorer sidecar (`mokapot_worker.py` or
 /// `nn_rescore_worker.py`) over a PIN written from the competed set; return scores
 /// aligned to the input candidate order (the file contract in
@@ -3731,6 +3772,11 @@ fn run_pin_sidecar(
     let t_worker = Instant::now();
     let mut guard = ChildGuard(Some(child));
     let status = guard.wait()?;
+    if status.code() == Some(NO_TRAINING_SIGNAL_EXIT) {
+        return Err(anyhow::Error::new(NoTrainingSignal {
+            script: script_name.to_string(),
+        }));
+    }
     if !status.success() {
         anyhow::bail!("{script_name} exited with {status}");
     }
@@ -6998,5 +7044,30 @@ mod matrix_ceiling_tests {
         // 0 disables the ceiling; an overflowing product is refused rather than wrapped.
         assert_eq!(matrix_ceiling_exceeded(bytes, 0.0), None);
         assert_eq!(feature_matrix_bytes(usize::MAX, 2), None);
+    }
+}
+
+#[cfg(test)]
+mod no_training_signal_tests {
+    use super::*;
+
+    #[test]
+    fn no_training_signal_is_recognisable_after_travelling_as_anyhow() {
+        // The NnTorch arm matches on the type, not on text: a worker message rephrased
+        // later must not turn a fallback back into a failed run.
+        let e: anyhow::Error = anyhow::Error::new(NoTrainingSignal {
+            script: "nn_rescore_worker.py".into(),
+        });
+        assert!(e.downcast_ref::<NoTrainingSignal>().is_some());
+        let msg = e.to_string();
+        assert!(
+            msg.starts_with("nn_rescore_worker.py found no training signal"),
+            "{msg}"
+        );
+        // The worker's side of the contract.
+        let worker = include_str!("../../../../../../scripts/nn_rescore_worker.py");
+        assert!(worker.contains(&format!(
+            "NO_TRAINING_SIGNAL_EXIT = {NO_TRAINING_SIGNAL_EXIT}"
+        )));
     }
 }
