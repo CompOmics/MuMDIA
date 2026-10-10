@@ -218,7 +218,11 @@ in the interface:
 - `diann::build` and `diann::install` both refuse until the licence notice is
   acknowledged, so calling either command directly does not bypass it. The Academia
   edition is non-profit-only, and that is a restriction a commercial user can
-  breach without ever noticing it exists.
+  breach without ever noticing it exists. Since 2026-10-10 a DIA-NN that is installed
+  and runs counts as acknowledged until the user answers (`effective_licence`):
+  installing it meant accepting its licence from the vendor. The box is shown ticked
+  with a note saying why, an explicit untick is stored and respected, and the download
+  of 1.8.1 still needs an explicit tick, because nothing is installed at that point.
 - The URL and SHA-256 are pinned per platform, and the digest is verified while
   streaming. A mismatch deletes the file: these bytes are executed or handed to the
   operating system's installer, and a failed verification must not leave something
@@ -275,7 +279,15 @@ FASTA mode offers two ways to get a library: the engine's built-in predictors, o
 DIA-NN predicting one first. The second is the sensitive path -- the ~1,213 against
 ~10,300 figure is largely this difference -- so a user starting from a FASTA should be
 able to take it without first understanding that a library is a separate artifact
-built on another screen.
+built on another screen. It is the selected option whenever DIA-NN can be used (found,
+runs, licence acknowledged); otherwise the built-in predictors are selected and DIA-NN
+comes back by itself once it can be used, unless the user picked one explicitly. DIA-NN
+runs on all cores but two by default, so the machine stays usable during a prediction.
+
+While DIA-NN builds the library the Progress screen is reachable from the menu, shows
+the build log, and its "Command being run" panel lists every command the build has
+started (prediction, re-export, conversion, decoys, decoy prediction), from
+`BuildState::commands`.
 
 **A predicted library is cached, content-addressed.** It depends on the FASTA's bytes
 and the digest parameters and on nothing else: not the mzML, not the thread count. So
@@ -358,7 +370,10 @@ fields take, and the engine validates the result before anything starts. With al
 at their defaults (prescreen off, automatic bands that resolve to one band, the standard
 modifications) the preset reaches the engine unchanged in library mode.
 
-**Prescreen** (`prescreen.*`, docs/34). Off; before prediction without retention times
+**Prescreen** (`prescreen.*`, docs/34). The screen says what it is for and what it
+costs: a candidate it removes can never be identified, so it trades identifications for
+time and memory (immunopeptidomics end to end: -3.5% peptides, -25% wall time, half the
+memory). Off; before prediction without retention times
 (`score_before_prediction` with `crowding_exponent = 0.25`, the no-RT score docs/34
 measured); after the retention-time calibration (`enabled`); or the database-free tag
 prefilter (`tag_prefilter`). Light, balanced and stringent map to a target of 0.25 and
@@ -521,6 +536,16 @@ Saving writes only the difference from the defaults. `Config` is
 `deny_unknown_fields` with serde defaults, so that is a valid configuration, and it
 means a later release that improves a default still reaches someone who saved
 settings today. Every save is validated by the engine before it is offered for use.
+
+The Settings screen shows a short list of common settings first, under plain names
+(`COMMON_SETTINGS` in `app.js`: rescoring model, FDR threshold, tolerances, retention-time
+window and calibration, gate, competition unit, match-between-runs, rescoring seeds), and
+every other parameter in a collapsed "In-depth settings" section that a search or "only
+changed" opens. Both are generated from the schema; only the choice of the common few is
+written by hand, and a path the schema lacks is skipped.
+
+The application opens on the Setup screen, and the Search screen's preset is
+`diann-library` when that preset is available.
 
 The editor starts from the preset selected on the Search screen, not from the engine
 defaults: `config_overrides` flattens the preset file into the same dotted paths the

@@ -11,8 +11,8 @@
 <aside class="rail">
   <div class="brand">MuMDIA</div>
   <nav>
-    <button class="nav" data-screen="setup">Setup</button>
-    <button class="nav on" data-screen="input">Search</button>
+    <button class="nav on" data-screen="setup">Setup</button>
+    <button class="nav" data-screen="input">Search</button>
     <button class="nav" data-screen="settings">Settings</button>
     <button class="nav" data-screen="progress" id="nav-progress" disabled>Progress</button>
     <button class="nav" data-screen="results" id="nav-results" disabled>Results</button>
@@ -26,7 +26,7 @@
 <main>
 
   <!-- ─────────────────────────────── Setup ──────────────────────────────── -->
-  <section class="screen" id="screen-setup">
+  <section class="screen on" id="screen-setup">
     <h1>Analysis components</h1>
     <p class="sub">
       MuMDIA needs a small Python environment for retention-time modelling and
@@ -140,6 +140,11 @@
           <input type="checkbox" id="diann-ack" />
           I have read this and my use of DIA-NN complies with its licence.
         </label>
+        <p class="hint" id="diann-ack-note" hidden>
+          Ticked for you because a working DIA-NN is installed on this machine: installing
+          it means its licence was accepted from the vendor. Untick it if that is not the
+          case, and MuMDIA will not use DIA-NN.
+        </p>
       </div>
 
       <p class="hint" id="diann-where"></p>
@@ -191,7 +196,7 @@
   </section>
 
   <!-- ─────────────────────────────── Search ─────────────────────────────── -->
-  <section class="screen on" id="screen-input">
+  <section class="screen" id="screen-input">
     <h1>New search</h1>
     <p class="sub">Select the data, choose where results go, and start.</p>
 
@@ -308,24 +313,25 @@
         <div class="rule"></div>
         <div class="card-title">How to build the library from it</div>
         <label class="check">
-          <input type="radio" name="libsrc" id="libsrc-diann" value="diann" />
+          <input type="radio" name="libsrc" id="libsrc-diann" value="diann" checked />
           <span>
             <b>Predict it with DIA-NN</b> — far more sensitive, and done for you before
             the search starts. Built once per FASTA and reused afterwards.
             <span class="hint inline" id="libsrc-diann-note"></span>
           </span>
         </label>
-        <div id="libsrc-params" hidden>
+        <div id="libsrc-params">
           <div class="grid2">
             <div class="row">
               <label for="d-threads">DIA-NN threads</label>
               <input type="number" id="d-threads" value="8" min="1" max="256" />
+              <span class="hint inline" id="d-threads-note"></span>
             </div>
           </div>
         </div>
 
         <label class="check">
-          <input type="radio" name="libsrc" id="libsrc-builtin" value="builtin" checked />
+          <input type="radio" name="libsrc" id="libsrc-builtin" value="builtin" />
           <span>
             <b>Built-in predictors</b> — the engine digests the FASTA itself and predicts with
             MS2PIP and DeepLC when the preset asks for them (the fasta-sidecars preset
@@ -375,7 +381,17 @@
       </div>
 
       <div class="rule"></div>
-      <div class="card-title">Prescreen <span class="pill mute">experimental</span></div>
+      <div class="card-title">Prescreen</div>
+      <p class="hint">
+        A quick first look at the spectra that drops library candidates with no support in
+        them, so the slow stages (prediction, chromatogram extraction, rescoring) handle
+        fewer. It pays off on a large search space: many variable modifications,
+        non-specific digests such as immunopeptides, or a big library on a machine with
+        little memory. <b>A dropped candidate can never be identified</b>, so the prescreen
+        trades some identifications for speed and memory: on an immunopeptidomics run it
+        cost 3.5% of the peptides for 25% less time and half the memory. Leave it off when
+        the search already fits comfortably.
+      </p>
       <div class="grid2">
         <div class="row">
           <label for="prescreen">When</label>
@@ -449,7 +465,7 @@
   <section class="screen" id="screen-settings">
     <div class="head-row">
       <div>
-        <h1>All settings</h1>
+        <h1>Settings</h1>
         <p class="sub" id="settings-sub">
           Every engine parameter, with its default and the explanation from the source.
           Values start from the preset selected on the Search screen.
@@ -469,7 +485,17 @@
       </label>
     </div>
 
-    <div id="settings-list"></div>
+    <div class="sec-title">Common settings</div>
+    <p class="hint">The settings most searches change, if any. Everything else is below.</p>
+    <div id="settings-common"></div>
+
+    <details class="advanced" id="settings-advanced">
+      <summary>
+        In-depth settings
+        <span class="hint inline">rarely needed; the defaults are measured and documented</span>
+      </summary>
+      <div id="settings-list"></div>
+    </details>
   </section>
 
   <!-- ────────────────────────────── Progress ────────────────────────────── -->
