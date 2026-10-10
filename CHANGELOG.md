@@ -7,6 +7,29 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.6.0` is a minor rather than a patch release: it changes what a search finds and how
+far its reported FDR can be trusted. The extraction gate is now the window-mean gate at 0.6
+(`extract.gate_mode = window_mean`) instead of the apex-Pearson gate at 0.2, and eight
+sensitivity options are on by default: the MS1 offset learned from the seed with a 3 ppm
+precursor tolerance (was 20), MS1 isotopes read over the nearest scan +-1, a widen-only local
+RT window, a composition correction of the calibrated RT, shadow demotion in rescoring, and two
+new feature families (39 columns). Measured with one engine build against the 0.5.0 defaults
+(single seed): a six-file Astral HYE experiment 116,683 -> 127,849 peptides at 1% in 14:41
+against 20:41 for the apex-Pearson gate, a six-file Orbitrap AIF HYE experiment 85,090 ->
+88,526, and the AIF entrapment run 11,282 -> 12,056 real precursors at a measured FDP of 1%,
+with a measured FDP of 1.00% at the reported 1%. Imported DIA-NN libraries now get decoys with
+DIA-NN-predicted spectra (`scripts/predict_decoys.py`, and the desktop build): the decoys
+`make_reverse_decoys.py` builds copy their targets' intensities, and on the ProteoBench Astral
+entrapment module (FDRBench paired entrapment) that left a paired FDP of 1.68% at a reported
+precursor q of 1%, against 0.85% with predicted decoys, valid at every q cut, and 89,334
+precursors at 1%. A search on a library rebuilt this way reports fewer identifications at 1%
+than the same library with copied decoys (HYE -2.4%, single cells -2% to -14%,
+immunopeptidomics -17%) at unchanged sensitivity where an entrapment measures it: those counts
+were optimistic. No artifact schema version changed; `psms_extracted` gains `rt_lo`/`rt_hi`
+and `features` the `wf*` and `rtw_*` columns, so `classifier_feature_schema_id` changes. The
+desktop application starts on Setup, defaults to building the library with DIA-NN, and can
+install visDIA and open results in it.
+
 `0.5.0` is a minor rather than a patch release: it changes what a run needs, what it
 writes and, within seed noise, what it finds. DeepLC 4.5.0 is the floor, so every DeepLC
 environment must be rebuilt before upgrading (the desktop application offers Update). The
@@ -65,7 +88,43 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-10
+
 ### Added
+
+- **Decoys with DIA-NN-predicted spectra for imported libraries** (`scripts/predict_decoys.py`,
+  #168, #169). `build` takes `make_reverse_decoys.py` output, has DIA-NN predict the decoy
+  sequences, re-exports and imports the prediction, and merges it: each decoy keeps its
+  sequence, pairing, precursor m/z and iRT, and its fragments become the prediction. Shift
+  decoys are refused (they carry the target's sequence); a decoy DIA-NN does not predict is
+  dropped with its target; the merge streams by row group (a 203M-precursor library merged in
+  49 min at 52 GB). The README recipe and the desktop DIA-NN build run it. ProteoBench Astral
+  entrapment: paired FDP 1.68% -> 0.85% at a reported precursor q of 1%.
+- **Window-mean extraction gate** (`extract.gate_mode = window_mean`, `extract.gate_rt_weight`)
+  and the window-entropy gate it was compared with. The window-mean score is the mean of the
+  square-root entropy similarity, the predicted-weighted fragment coverage and the square-root
+  cosine of the spectrum summed over the apex +-2 scans, minus 0.2 times the RT error over the
+  window half-width on its side.
+- **Sensitivity options from the single-cell study** (#166): `extract.ms1_calibrate` and
+  `extract.ms1_ppm_offset` (the MS1 offset from the seed; also in the banded path since #167),
+  `extract.ms1_scan_halfwidth`, `extract.emit_rt_window` with the `rtw_*` feature family, the
+  fixed-window `wf*` feature family, `rt_im_train.local_window_anchors` /
+  `local_window_multiplier` (widen-only local RT window), `rt_im_train.composition_correction`
+  (Huber regression of the anchors' residuals on charge, length, internal K/R, His and Met-ox,
+  sparse terms ignored and the shift bounded), `rescore.shadow_min_shared` / `shadow_ppm` /
+  `shadow_rt_s` (shadow demotion), and, opt-in, `rt_im_train.loess_robust_iters` and
+  `search_seed.frag_tol_floor_ppm` (default 5, the previous fixed floor).
+- **`rescore.min_train_decoys`** (default 100): with fewer decoys in the training population
+  the classifier is not trained and candidates are ranked by `prelim_score` with plain
+  target-decoy competition (`prelim_score_few_decoys` in the report). Very small or very clean
+  runs previously over-fitted or failed.
+- **`extract.apex_refine_intensity`** (opt-in, #161): picks the brightest signature scan inside
+  the count-qualified region. On a tailing peak the rolling distinct-fragment count puts the
+  apex a scan late (41% of accepted precursors on Astral REP1); this put 85% on the intensity
+  maximum.
+- **Desktop: visDIA** (#170). An optional third environment installs visDIA (`mumdia-viewer`,
+  pinned to commit 13b3a9c), and "Open in visDIA" on the Results and History screens starts it
+  on a results folder and opens it in the browser; viewers stop when the application closes.
 
 - **Fragment-rarity candidate prescreen** (`mumdia prescreen`, `prescreen.enabled`, off by
   default; docs/34). A port of the tagbench prototype: each candidate is scored on the spectra
@@ -120,7 +179,35 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
-- **Per-candidate elution bounds are the default** (`features.bound_from_confident = false`,
+- **The extraction gate is the window-mean gate at 0.6** (#166). At near-single-ion intensity
+  a fragment is present in one scan and absent in the next, so any single-scan score is noise;
+  summed over five scans it is not. Against the apex-Pearson gate at 0.2 and the ungated
+  search (single seed, the other options on): Astral HYE 124,623 / 127,861 / 127,849 peptides
+  at 20:41 / 33:25 / 14:41 and 18.0 / 50.0 / 15.5 GB; Orbitrap AIF HYE 87,559 / 88,524 / 88,526;
+  AIF entrapment 11,629 / 12,010 / 12,056 real precursors at a measured FDP of 1%. It keeps
+  every identification of the ungated search with a fifth to an eighth of its candidates.
+- **The sensitivity options above are on by default** (#167): `extract.ms1_calibrate`,
+  `extract.prec_tol_ppm = 3` (was 20), `extract.ms1_scan_halfwidth = 1`,
+  `extract.emit_rt_window`, `extract.fixed_scan_window = 2` (was 3),
+  `rt_im_train.local_window_anchors = 100`, `rt_im_train.composition_correction`,
+  `rescore.shadow_min_shared = 3`, and the `wf*` and `rtw_*` feature families
+  (`MUMDIA_WINDOW_FEATURES=0` / `MUMDIA_RTW_FEATURES=0` leave them out). So that none of them
+  can fail a run: a standalone `rescore` without library fragments skips shadow demotion with
+  a warning, an explicit `adaptive_rt_window` takes precedence over the local window, and a
+  seed without peptidoform or charge skips the composition correction. A 3 ppm precursor
+  tolerance is not measured on timsTOF data.
+- **A seed short of RT anchors relaxes its cut, then skips multi-head calibration**
+  (`rt_im_train.anchor_q_ladder`, default 0.02 then 0.05) instead of failing; seen on a single
+  cell whose seed had no anchor at 1%.
+- **Desktop** (#170): opens on Setup; a DIA-NN that is installed and runs counts as
+  licence-acknowledged until the user answers (an untick is stored; the 1.8.1 download still
+  needs an explicit tick); FASTA libraries default to "Predict it with DIA-NN" whenever it can
+  be used, with all cores but two; the preset defaults to `diann-library`; Settings shows twelve
+  common settings first and the rest under "In-depth settings"; the Progress tab stays
+  reachable during a library build and lists every command the build runs; the prescreen
+  explains that a removed candidate can never be identified. The library cache recipe is
+  version 3, so libraries cached with copied-intensity decoys are rebuilt.
+- **Per-candidate elution bounds are the default** (#162) (`features.bound_from_confident = false`,
   was true). The shared left/right half-width learned from the confident seed set cut every
   peptide whose peak is wider than the median short (visDIA showed identifications missing
   their last scan). Measured 2026-10-03 on doxy, 5 NN seeds per arm: Astral REP1 on the HYE
@@ -135,6 +222,19 @@ than a number. Both are recorded in every run's `manifest.json`.
   0.201 and the median CV from 0.19 to 0.10, with the same identifications. The window is in
   samples of the precursor's isolation window, so it scales with the cycle time. `0` restores
   the walked window.
+
+### Fixed
+
+- **Decoy collisions up to I/L** (#160): the engine digest, `make_reverse_decoys.py` and
+  `augment_library.py` compared exact sequences, so a decoy that differs from a target only by
+  I/L (the reversal of IEVNVELR is LEVNVEIR) passed, and collected that target's signal. 1,722
+  decoy sequences of the imported HYE library and 6,198 of the AIF entrapment library were such
+  collisions; all three checks now compare with I and L as one residue.
+- **`extract.ms1_calibrate` in the banded path** (#167): `groups.window_groups > 1` passed the
+  configured extract settings straight through, so the MS1 offset was never applied there; it
+  is now learned once from the pooled seed.
+- **Desktop**: leaving the Progress screen during a DIA-NN library build left no way back to
+  it, and its command panel stayed empty during the build (#170).
 
 ## [0.5.0] - 2026-09-29
 
