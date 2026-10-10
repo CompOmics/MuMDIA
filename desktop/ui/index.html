@@ -73,6 +73,24 @@
       <div class="card-head">
         <div>
           <div class="card-title">
+            visDIA results viewer <span class="pill mute" id="visdia-pill">optional</span>
+          </div>
+          <div class="card-sub">
+            An interactive viewer for MuMDIA results (visDIA, from CompOmics): the
+            identifications with the evidence behind each one (chromatograms, spectra,
+            decoy competition), the calibrations, quantification and run QC, in your
+            browser. Once installed, "Open in visDIA" appears on the Results and History
+            screens. Its own environment, about 350 MB; it only reads your results.
+          </div>
+        </div>
+        <button class="btn quiet" id="install-visdia">Install</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">
             Thermo .raw <span class="pill mute" id="thermo-pill">optional</span>
           </div>
           <div class="card-sub">
@@ -533,9 +551,13 @@
         <h1 id="res-title">Results</h1>
         <p class="sub" id="res-sub"></p>
       </div>
-      <button class="btn" id="open-folder">Open folder</button>
+      <div class="row">
+        <button class="btn quiet" id="open-visdia">Open in visDIA</button>
+        <button class="btn" id="open-folder">Open folder</button>
+      </div>
     </div>
 
+    <div id="visdia-error" class="banner bad" hidden></div>
     <div id="res-warn" class="banner warn" hidden></div>
 
     <div class="kpis" id="kpis"></div>
@@ -567,6 +589,7 @@
       Read back from the folders themselves, so a search moved or deleted on disk
       simply stops appearing.
     </p>
+    <div id="history-error" class="banner bad" hidden></div>
     <div id="history-list"></div>
   </section>
 

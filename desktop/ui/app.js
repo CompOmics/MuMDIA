@@ -56,6 +56,8 @@ const state = {
   buildingLibrary: false,
   // Whether the in-depth settings were opened, so a re-render keeps them open.
   advancedOpen: false,
+  // The visDIA environment is installed, so "Open in visDIA" can work.
+  visdiaReady: false,
   // "separate" = one search per file; "experiment" = one pooled run-experiment.
   runMode: "experiment",
   // Batch progress: which file of how many, and what each one produced.
@@ -223,6 +225,10 @@ async function init() {
   $("start").addEventListener("click", start);
   $("install-primary").addEventListener("click", () => installComponents("primary"));
   $("install-ms2pip").addEventListener("click", () => installComponents("ms2pip"));
+  $("install-visdia").addEventListener("click", () => installComponents("visdia"));
+  $("open-visdia").addEventListener("click", (e) =>
+    openVisdia(state.outDir, e.currentTarget, $("visdia-error"), state.picks.fasta)
+  );
   $("install-thermo").addEventListener("click", installThermo);
   $("msconvert-get").addEventListener("click", () =>
     invoke("open_url", { url: "https://proteowizard.sourceforge.io/" }).catch((e) =>
@@ -624,8 +630,30 @@ async function refreshComponents() {
     mbtn.disabled = false;
   }
 
+  const v = c.visdia || {};
+  state.visdiaReady = !!v.complete;
+  const vpill = $("visdia-pill");
+  const vbtn = $("install-visdia");
+  if (v.install_status === "installing") {
+    vpill.textContent = "installing…";
+    vpill.className = "pill warn";
+    vbtn.disabled = true;
+  } else if (v.complete) {
+    vpill.textContent = "installed";
+    vpill.className = "pill ok";
+    vbtn.disabled = true;
+    vbtn.textContent = "Installed";
+  } else {
+    vpill.textContent = "optional";
+    vpill.className = "pill mute";
+    vbtn.disabled = !c.primary.uv;
+    vbtn.textContent = "Install";
+  }
+  refreshVisdiaButtons();
+
   // One log pane, showing whichever installation is talking.
-  const active = m.install_status === "installing" ? m : p;
+  const active =
+    m.install_status === "installing" ? m : v.install_status === "installing" ? v : p;
   const logEl = $("install-log");
   const text = (active.install_log || []).join("\n");
   if (logEl.textContent !== text) {
@@ -640,7 +668,8 @@ async function refreshComponents() {
 
   // The DIA-NN card's build button depends on `componentsReady`, which is only
   // known here.
-  const busy = installing || m.install_status === "installing";
+  const busy =
+    installing || m.install_status === "installing" || v.install_status === "installing";
   if (busy && !state.setupTimer) {
     state.setupTimer = setInterval(refreshComponents, 900);
   } else if (!busy && state.setupTimer) {
@@ -2009,7 +2038,7 @@ async function runBatch(p, built, threads, config) {
 
     // Wait for this one before starting the next.
     const outcome = await awaitRun();
-    state.batch.results.push({ file, ...outcome });
+    state.batch.results.push({ file, out_dir: req.out_dir, ...outcome });
     if (outcome.error) state.batch.failed += 1;
   }
 
@@ -2063,8 +2092,18 @@ function renderBatchSummary() {
     row.textContent = r.error
       ? `${baseName(r.file)} — failed: ${r.error}`
       : `${baseName(r.file)} — ${n ?? "?"} peptides at 1%`;
+    // Each file of a separate-files batch is its own result, in its own folder.
+    if (!r.error && r.out_dir) {
+      const open = node("button", "btn quiet small", "Open in visDIA");
+      open.dataset.visdia = r.out_dir;
+      open.addEventListener("click", () =>
+        openVisdia(r.out_dir, open, $("visdia-error"), state.picks.fasta)
+      );
+      row.append(" ", open);
+    }
     host.appendChild(row);
   }
+  refreshVisdiaButtons();
 }
 
 // Start is asynchronous with several awaits before the run exists (library build,
@@ -2293,6 +2332,34 @@ async function poll() {
   }
 }
 
+// ── visDIA ──────────────────────────────────────────────────────────────────
+// The results viewer runs as its own local server (`viewer.rs`). Opening a folder
+// starts one, or shows the one already serving that folder; the browser opens on it.
+
+/// The hint every "Open in visDIA" button carries, which says what a click will do.
+function refreshVisdiaButtons() {
+  const title = state.visdiaReady
+    ? "Show these results in visDIA, in your browser"
+    : "visDIA is not installed yet: install it on the Setup screen";
+  for (const b of document.querySelectorAll("#open-visdia, [data-visdia]")) b.title = title;
+}
+
+async function openVisdia(dir, btn, errEl, fasta) {
+  if (!dir) return;
+  banner(errEl, "");
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Opening visDIA…";
+  try {
+    await invoke("visdia_open", { dir, fasta: fasta || null });
+  } catch (e) {
+    banner(errEl, String(e));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+}
+
 // ── history ─────────────────────────────────────────────────────────────────
 async function loadHistory() {
   const list = $("history-list");
@@ -2325,14 +2392,22 @@ async function loadHistory() {
         `<div class="card-sub">${counts}<br>${esc(when)} · ${esc(e.out_dir)}` +
         (e.engine_version ? ` · ${esc(e.engine_version)}` : "") +
         `</div></div>` +
+        `<div class="row">` +
+        (r
+          ? `<button class="btn quiet" data-visdia="${escHtml(e.out_dir)}">Open in visDIA</button>`
+          : "") +
         `<button class="btn quiet" data-open="${esc(e.out_dir)}">Open folder</button>` +
-        `</div></div>`
+        `</div></div></div>`
       );
     })
     .join("");
   for (const b of list.querySelectorAll("[data-open]")) {
     b.addEventListener("click", () => invoke("reveal", { path: b.dataset.open }));
   }
+  for (const b of list.querySelectorAll("[data-visdia]")) {
+    b.addEventListener("click", () => openVisdia(b.dataset.visdia, b, $("history-error")));
+  }
+  refreshVisdiaButtons();
 }
 
 // ── rendering ───────────────────────────────────────────────────────────────

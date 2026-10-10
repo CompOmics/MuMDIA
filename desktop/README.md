@@ -183,6 +183,33 @@ was measured with it (`docs/28`, section 22). The application still installs it 
 the separate optional component; folding it into the primary environment and
 removing the second `Env` is a follow-up, not a requirement.
 
+### visDIA, the results viewer
+
+A third, optional environment (`Env::Visdia`, `python-visdia`) holds
+[visDIA](https://github.com/CompOmics/visDIA) (`mumdia-viewer`), the interactive viewer
+for MuMDIA results. Its own environment because its Dash and DuckDB stack has nothing to
+do with the analysis packages, and neither should constrain the other.
+`env/console-visdia-requirements.txt` pins one visDIA commit through GitHub's source
+archive, so no git is needed and everyone on a release gets the same viewer; that commit
+was checked against this release's outputs (experiment and single run: counts,
+identification table, precursor detail, mirror spectrum). About 350 MB on Windows.
+
+"Open in visDIA" sits on the Results screen, on each History entry with a scored table,
+and on each file of a separate-files batch. `viewer::open` starts
+`python -m mumdia_viewer <dir> --no-browser` from that environment, reads the
+`serving ... at http://127.0.0.1:<port>/<token>/` line (with `PYTHONUNBUFFERED`, or a
+piped stdout holds it back), and opens only such a loopback address. One viewer per
+folder: opening the same folder again shows the running one. A viewer that exits before
+it serves is reported with its own last lines, which name the actual problem. Viewers
+have no window of their own, so all of them are stopped when the application closes,
+and removing the environment is refused while one runs. For the search just finished,
+the FASTA chosen on the Search screen is passed with `--fasta`, so a library DIA-NN
+built from it still gets sequence coverage.
+
+`viewer::tests::a_results_folder_is_served_and_stopped` (ignored by default; set
+`MUMDIA_TEST_VISDIA_DIR` to a results folder, with the environment installed) starts
+the real viewer, fetches its page, checks the reuse, and stops it.
+
 ## DIA-NN
 
 The interface can predict a spectral library from a FASTA using DIA-NN, which is
@@ -596,7 +623,7 @@ bundle it built (`msiexec /a` on Windows, `--appimage-extract` on Linux) to asse
 the console, the engine, `uv` and the workers are inside and the engine runs.
 
 Everything else the application needs from the repository is compiled in with
-`include_str!`: the settings schema, and the two requirement sets. That is both
+`include_str!`: the settings schema, and the three requirement sets. That is both
 simpler and more robust than shipping them as files, and it costs nothing in
 freshness, because all three are generated from sources that require a rebuild
 anyway. It also avoids two Tauri packaging traps found while building the first

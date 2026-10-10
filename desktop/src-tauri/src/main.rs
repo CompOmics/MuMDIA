@@ -2,7 +2,9 @@
 // builds keep it, because that is where the developer's own `println!` goes.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use mumdia_console::{components, diann, engine, preflight as pf, run, settings, sizing, thermo};
+use mumdia_console::{
+    components, diann, engine, preflight as pf, run, settings, sizing, thermo, viewer,
+};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,6 +21,22 @@ struct AppState {
     diann: Arc<diann::Builder>,
     diann_installer: Arc<diann::Installer>,
     thermo: Arc<thermo::Installer>,
+    viewers: Arc<viewer::Viewers>,
+}
+
+/// Show a results folder in visDIA, starting the viewer if needed, and return its
+/// address. Blocking work (the viewer indexes the results before it serves), so it runs
+/// off the main thread.
+#[tauri::command]
+async fn visdia_open(
+    state: tauri::State<'_, AppState>,
+    dir: String,
+    fasta: Option<String>,
+) -> Result<String, String> {
+    let viewers = Arc::clone(&state.viewers);
+    tauri::async_runtime::spawn_blocking(move || viewer::open(&viewers, &dir, fasta.as_deref()))
+        .await
+        .map_err(|e| format!("the viewer task failed: {e}"))?
 }
 
 /// Whether a DIA-NN the user installed is present, and whether it runs.
@@ -178,6 +196,8 @@ fn components_status(state: tauri::State<'_, AppState>) -> serde_json::Value {
         // Reported separately because it is optional and cannot share the primary
         // environment: MS2PIP and DeepLC pin incompatible sqlalchemy majors.
         "ms2pip": state.installer.refresh(components::Env::Ms2pip),
+        // Optional, for "Open in visDIA" on the Results and History screens.
+        "visdia": state.installer.refresh(components::Env::Visdia),
     })
 }
 
@@ -215,6 +235,12 @@ fn managed_work_in_progress(state: &AppState) -> Option<String> {
     }
     if state.installer.busy(components::Env::Ms2pip) {
         return Some("MS2PIP is being installed".into());
+    }
+    if state.installer.busy(components::Env::Visdia) {
+        return Some("visDIA is being installed".into());
+    }
+    if state.viewers.any_running() {
+        return Some("visDIA is showing results (close the application to stop it)".into());
     }
     if state.thermo.busy() {
         return Some("the Thermo converter is being installed".into());
@@ -261,6 +287,7 @@ fn components_remove(
     match id.as_str() {
         "primary" => state.installer.forget(components::Env::Primary),
         "ms2pip" => state.installer.forget(components::Env::Ms2pip),
+        "visdia" => state.installer.forget(components::Env::Visdia),
         "thermo" => state.thermo.forget(),
         "diann" => state.diann_installer.forget(),
         "libraries" => state.diann.forget(),
@@ -720,7 +747,8 @@ fn main() {
             vendor_of,
             msconvert_status,
             diann_library_plan,
-            diann_cancel
+            diann_cancel,
+            visdia_open
         ])
         .on_window_event(|window, event| {
             // Closing the window must not leave an engine, or a Python worker, running
@@ -737,6 +765,8 @@ fn main() {
                             h.cancel();
                         }
                     }
+                    // A viewer has no window of its own; nothing else would stop it.
+                    state.viewers.stop_all();
                 }
             }
         })
