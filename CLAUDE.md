@@ -383,7 +383,11 @@ fine-tuning also is not guaranteed deterministic.
   imported-library count measured before that date rests on copied decoys, so its
   reported 1% is optimistic; compare such counts at a measured FDP.
 - Production and benchmark configs use `rescore.strict = true`. An explicitly
-  requested external classifier must not silently become `native_tda`.
+  requested external classifier must not silently become `native_tda`. Two data
+  conditions are not classifier failures and rank by `prelim_score` instead, loudly and
+  recorded in the report: too few decoys (`prelim_score_few_decoys`,
+  `rescore.min_train_decoys`) and no training signal (`prelim_score_no_training_signal`,
+  the NN worker's exit code 3).
 - The source of truth for the classifier actually used is
   `psms_scored.parquet.report.json`, not the configured enum or an old stdout
   line. The orchestrated manifest is expected to carry that actual identity.

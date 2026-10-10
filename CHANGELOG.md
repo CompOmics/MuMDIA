@@ -88,6 +88,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A search with no training signal finishes instead of failing.** When `nn_torch` cannot
+  select a single training positive (no feature separates targets from decoys at the training
+  FDR, even on the loosened first selection), the worker exits with code 3 and the engine
+  ranks by the untrained `prelim_score` with plain target-decoy competition, also under
+  `rescore.strict`, with a warning and `classifier = "prelim_score_no_training_signal"` in the
+  scored table's report. Found on a 2 uL single-cell Astral run searched with the desktop
+  defaults, which stopped in rescoring with no results; DIA-NN 2.7 found 2,901 precursors in
+  it, and MuMDIA with the single-cell settings 1,440.
+- **The desktop application writes each search's log to `mumdia-console.log`** in its results
+  folder. The interface kept the log only in memory, so a failed run could not be diagnosed
+  once the window closed.
+
 ## [0.6.0] - 2026-10-10
 
 ### Added
