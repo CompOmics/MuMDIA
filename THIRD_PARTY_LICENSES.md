@@ -195,8 +195,8 @@ Licence identifiers by crate count:
 | `strsim` | 0.11.1 | MIT | - | [https://github.com/rapidfuzz/strsim-rs](https://github.com/rapidfuzz/strsim-rs) |
 | `syn` | 2.0.118 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
 | `syn` | 3.0.5 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
-| `thiserror` | 2.0.20 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
-| `thiserror-impl` | 2.0.20 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
+| `thiserror` | 2.0.21 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
+| `thiserror-impl` | 2.0.21 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
 | `thread_local` | 1.1.9 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/Amanieu/thread_local-rs](https://github.com/Amanieu/thread_local-rs) |
 | `tiny-keccak` | 2.0.2 | CC0-1.0 | - | - |
 | `tracing` | 0.1.44 | MIT | - | [https://github.com/tokio-rs/tracing](https://github.com/tokio-rs/tracing) |
