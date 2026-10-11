@@ -430,6 +430,8 @@ mod tests {
     fn seed_cfg(fdr_seed: f64) -> SearchSeedConfig {
         SearchSeedConfig {
             fdr_seed,
+            // Single pass, as these tests are written; the second pass is tested on its own.
+            two_pass_mass_cal: false,
             ..Default::default()
         }
     }

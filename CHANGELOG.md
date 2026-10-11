@@ -88,8 +88,37 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- **The instrument is read from the mzML header** (`instrument.rs`). `convert` records the
+  model (`MS:1003378` "Orbitrap Astral", `MS:1002877` "Q Exactive HF-X", ...) and whether an
+  Astral analyzer is listed in every spectra report (`params.instrument`) and in the log.
+
 ### Changed
 
+- **`extract.apex_count_window` defaults to `"auto"`**: 1 on an Orbitrap Astral, 5 on every
+  other instrument and on spectra converted before the instrument record existed. A number
+  is used as given. The example and Docker configurations no longer set 5. Window 1 against 5
+  on the 0.6.0 defaults, mean of three NN seeds: Astral HYE +1.3% peptides (125,561 ->
+  127,197), the ProteoBench Astral entrapment module +1.0% precursors (paired FDP 0.86% ->
+  0.84%), an Astral single cell +2.4% precursors, an Astral HeLa entrapment run +3.6% human
+  precursors at a measured FDP of 1% (FDP at the reported 1%: 0.89% -> 0.71%). On the
+  Orbitrap (one seed) AIF HYE -0.9% and the AIF entrapment run -0.8%, hence per instrument.
+  On every benchmark above, the new engine resolving "auto" was byte-identical to the
+  previous engine given the window explicitly.
+- **`search_seed.two_pass_mass_cal` defaults to `true`.** Mean of three NN seeds against the
+  0.6.0 defaults: Astral HYE +1.8% peptides, ProteoBench Astral entrapment +1.1% precursors,
+  Astral HeLa entrapment +2.0% human precursors at a measured FDP of 1%, Orbitrap AIF HYE
+  +0.5%. Two costs come with it. An Astral single cell loses 2.9% of its precursors, and the
+  measured FDP at a reported 1% rises a little in every entrapment test: AIF entrapment
+  0.99% -> 1.02% (real precursors at a measured 1%: -0.2%), ProteoBench paired 0.86% -> 0.88%,
+  HeLa 0.89% -> 0.97%. Set it to `false` for single-cell input or where that margin matters.
+  With both changes on Astral: HYE +3.5% peptides (130,000), ProteoBench +2.1% precursors at
+  a paired FDP of 0.89%, HeLa +3.4% at a measured FDP of 1%, the single cell -0.7%.
+- Of the other single-cell settings, `extract.presence_min_coelution = 1` raised the AIF
+  entrapment FDP at a reported 1% to 1.06%, `extract.apex_refine_intensity` cost 2.9% on the
+  Astral HeLa entrapment run and `rt_im_train.p_rt = 0.9` lost on both entrapment searches
+  (one seed each), so they keep their defaults.
 - **Dependencies**: arrow and parquet 59 -> 60, mzdata and mzdata-bindata 0.66 -> 0.67.4
   (together; Dependabot proposed them separately, which left two mzdata-bindata versions in
   the lockfile), bytes 1.12.1, clap 4.6.7, serde 1.0.229. parquet 60 serves the page index
@@ -116,6 +145,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   folder. The interface kept the log only in memory, so a failed run could not be diagnosed
   once the window closed.
 
+||||||| parent of 06452ae (docs, configs, tests: apex_count_window "auto" and two-pass mass calibration defaults)
 ## [0.6.0] - 2026-10-10
 
 ### Added

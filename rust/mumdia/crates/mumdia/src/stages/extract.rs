@@ -3030,8 +3030,27 @@ pub fn run(p: ExtractParams) -> Result<(u64, u64)> {
 /// [`run`], returning each output's row count and the content hash its report records
 /// (`psms_extracted`, then `chromatograms`), so an orchestrator can record both artifacts
 /// without reading and hashing them again.
-pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
+pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     let t0 = Instant::now();
+    // Settings left to the engine are resolved here, from the instrument `convert` recorded
+    // beside the spectra, so every orchestrator and a standalone `extract` agree.
+    let instrument = crate::instrument::recorded(p.ms2);
+    let astral = instrument.as_ref().is_some_and(|i| i.is_astral());
+    let apex_count_window = p.cfg.apex_count_window_for(astral);
+    let resolved_cfg;
+    let mut p = p;
+    if p.cfg.apex_count_window != apex_count_window {
+        info!(
+            instrument = %instrument.as_ref().map_or("unknown".to_string(), |i| i.describe()),
+            apex_count_window,
+            "extract: apex_count_window \"auto\" resolved for this instrument"
+        );
+        resolved_cfg = ExtractConfig {
+            apex_count_window,
+            ..p.cfg.clone()
+        };
+        p.cfg = &resolved_cfg;
+    }
     // Taken out before the closures below borrow `p`; consumed where the file is read.
     let handed_windows = p.rt_windows.take();
     // Neither output may be one of the inputs (docs/31 F6).
@@ -4718,6 +4737,8 @@ pub fn run_hashed(mut p: ExtractParams) -> Result<(Written, Written)> {
                 "gate_mode": p.cfg.gate_mode,
                 "gate_coelution_min": p.cfg.gate_coelution_min,
                 "scan_window": scan_window,
+                "apex_count_window": p.cfg.apex_count_window,
+                "instrument": instrument,
             }),
             stats: stats.clone(),
             model_identity: None,

@@ -614,8 +614,9 @@ sections 10-16:
   benchmark. The only knob positive on every pool is `MUMDIA_NN_SEEDS=3` (+0.1 to +0.3 pp at
   3x training).
 - The extraction and RT defaults (then `gate_min_score` 0.2 under `apex_pearson`, since
-  2026-10-08 `window_mean` 0.6; `rt_window_multiplier` 1.5, `apex_count_window` 5) were
-  likewise a measured local optimum on HYE end to end (docs/28 section 18); `window_holdout_frac` is neutral there with a pre-fine-tuned library.
+  2026-10-08 `window_mean` 0.6; `rt_window_multiplier` 1.5, `apex_count_window` 5, which
+  since 2026-10-11 is `"auto"`: 1 on an Orbitrap Astral and 5 elsewhere, from the instrument
+  `convert` reads in the mzML header) were likewise a measured local optimum on HYE end to end (docs/28 section 18); `window_holdout_frac` is neutral there with a pre-fine-tuned library.
 - Reference point, 2026-09-16: the six Astral files end to end (`mumdia run` with six
   `--mzml`, imported HYE library, multi-head calibration on the first run and reuse, pooled
   `nn_torch` rescore) take 52.5 min at a 13.25 GB process-tree peak on an EPYC 9354 with 32

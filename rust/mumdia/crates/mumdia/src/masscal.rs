@@ -292,8 +292,13 @@ pub fn read_calibrants(path: &str) -> Result<Calibrants> {
 mod tests {
     use super::*;
 
+    /// The single-pass fit these tests are written against; the default is two passes
+    /// since 2026-10-11, and the tests that need it set it themselves.
     fn cfg() -> SearchSeedConfig {
-        SearchSeedConfig::default()
+        SearchSeedConfig {
+            two_pass_mass_cal: false,
+            ..Default::default()
+        }
     }
 
     #[test]
