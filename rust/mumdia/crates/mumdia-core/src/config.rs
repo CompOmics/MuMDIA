@@ -1027,7 +1027,11 @@ pub struct SearchSeedConfig {
     /// first median-offset + tolerance fit, re-fit on only the deviations inside the
     /// first-pass tolerance window (rejecting outliers), giving a tighter, more
     /// robust offset + local uncertainty. Falls back to the single-pass result when
-    /// too few in-window calibrants remain. Default false (single pass unchanged).
+    /// too few in-window calibrants remain. Default true since 2026-10-11: one setting at a
+    /// time against the 0.6.0 defaults (single seed, then seeds 1 and 2), Astral HYE +2.5%
+    /// peptides, the ProteoBench Astral entrapment module +1.0% precursors at a paired FDP
+    /// of 0.84% (0.83% before), Orbitrap AIF HYE +0.1%, and the AIF entrapment run -0.2%
+    /// real precursors at a measured FDP of 1.00% (0.98% before).
     pub two_pass_mass_cal: bool,
     /// m/z-dependent fragment mass calibration. When true, fit a LOESS of the
     /// calibrant ppm deviation versus fragment m/z and emit a sampled correction
@@ -1051,7 +1055,7 @@ impl Default for SearchSeedConfig {
             min_matched_peaks: 4,
             top_n_peaks: 300,
             matcher: MatcherKind::Fragindex,
-            two_pass_mass_cal: false,
+            two_pass_mass_cal: true,
             mass_cal_loess: false,
             frag_tol_floor_ppm: 5.0,
         }
@@ -1451,6 +1455,18 @@ pub struct ExtractConfig {
     /// edge truncation makes interior positions accumulate more, center-weighting
     /// the apex toward the RT-window centre (~= predicted RT) as a mild RT-prior;
     /// measured to beat a mean by ~+300 IDs on AIF. 1 = no smoothing (per-scan).
+    ///
+    /// `"auto"` (also written `0`, the default since 2026-10-11) chooses by the instrument
+    /// `convert` recorded for the run (`crate::instrument` in the engine): 1 on an Orbitrap
+    /// Astral, 5 on every other instrument and when none is recorded. Measured one setting
+    /// at a time against the 0.6.0 defaults, window 1 against 5: Astral HYE +1.7% peptides,
+    /// the ProteoBench Astral entrapment module +1.5% precursors (paired FDP 0.84% against
+    /// 0.83%), an Astral single cell +6.1% precursors and an Astral HeLa entrapment run
+    /// +2.2% human precursors at a measured FDP of 1% (FDP at the reported 1%: 0.63%
+    /// against 0.79%); on the Orbitrap, AIF HYE -0.9% and the AIF entrapment run -0.8%.
+    /// Astral scans are fast enough that a fragment rarely flickers out, so smoothing over
+    /// five of them blurs the apex instead of steadying it. A number is used as given.
+    #[serde(deserialize_with = "de_apex_count_window")]
     pub apex_count_window: usize,
     /// Gaussian matched-filter smoothing of the per-scan fragment-count series
     /// before apex selection, as a sigma in scan units. 0.0 (default) keeps the
@@ -1667,8 +1683,9 @@ impl Default for ExtractConfig {
             apex_rt_prior_s: 0.0,  // RT prior off by default
             apex_count_tol: 1,     // fragment-count apex with 1-fragment slack
             apex_gaussian_sigma_scans: 0.0, // Gaussian apex smoother off by default (opt-in)
-            apex_count_window: 1,  // no rolling smoothing by default (opt-in; window 5
-            // cuts AIF apex misassignment, median |dRT| 131s->9s)
+            // "auto": 1 on an Orbitrap Astral, 5 elsewhere (window 5 cuts AIF apex
+            // misassignment, median |dRT| 131s->9s). Resolved per run in extract.
+            apex_count_window: APEX_COUNT_WINDOW_AUTO,
             emit_window_grid: true, // zero-filled window-grid chromatograms
             chromatogram_schema: 2, // axis once per candidate and row group, trimmed traces
             bucket_size: 8192,
@@ -2549,6 +2566,46 @@ pub enum Handoff {
     Raw,
 }
 
+/// `extract.apex_count_window = "auto"`, as stored: chosen per run from the instrument.
+pub const APEX_COUNT_WINDOW_AUTO: usize = 0;
+/// The window `"auto"` chooses on an Orbitrap Astral.
+pub const APEX_COUNT_WINDOW_ASTRAL: usize = 1;
+/// The window `"auto"` chooses on any other instrument, and when none is recorded.
+pub const APEX_COUNT_WINDOW_OTHER: usize = 5;
+
+impl ExtractConfig {
+    /// The rolling apex window this run uses: the configured number, or under `"auto"` the
+    /// one for its instrument (`astral`: the run was acquired on an Orbitrap Astral).
+    pub fn apex_count_window_for(&self, astral: bool) -> usize {
+        match self.apex_count_window {
+            APEX_COUNT_WINDOW_AUTO if astral => APEX_COUNT_WINDOW_ASTRAL,
+            APEX_COUNT_WINDOW_AUTO => APEX_COUNT_WINDOW_OTHER,
+            n => n,
+        }
+    }
+}
+
+/// `extract.apex_count_window`: a window in scans, or `"auto"`, which is stored as `0`
+/// (as `experiment.parallel_runs` is, so the canonical configuration stays numeric).
+fn de_apex_count_window<'de, D>(d: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Window {
+        Scans(usize),
+        Word(String),
+    }
+    match Window::deserialize(d)? {
+        Window::Scans(n) => Ok(n),
+        Window::Word(w) if w.trim().eq_ignore_ascii_case("auto") => Ok(APEX_COUNT_WINDOW_AUTO),
+        Window::Word(w) => Err(serde::de::Error::custom(format!(
+            "extract.apex_count_window must be a number of scans or \"auto\" (got \"{w}\")"
+        ))),
+    }
+}
+
 /// `experiment.parallel_runs`: a count, or `"auto"`, which is stored as `0`.
 ///
 /// Stored as a plain `usize` so the canonical configuration (and with it the config hash)
@@ -3353,7 +3410,6 @@ impl Config {
                 self.search_seed.min_matched_peaks,
             ),
             ("search_seed.report_psms", self.search_seed.report_psms),
-            ("extract.apex_count_window", self.extract.apex_count_window),
             (
                 "extract.presence_min_fragments",
                 self.extract.presence_min_fragments,
@@ -3706,7 +3762,9 @@ impl Config {
         match name {
             "dia" => {
                 self.features.set = FeatureSet::Extended;
-                self.extract.apex_count_window = 5;
+                // Chosen per run from the instrument: 5, as this profile always set,
+                // except on an Orbitrap Astral.
+                self.extract.apex_count_window = APEX_COUNT_WINDOW_AUTO;
                 self.extract.apex_rt_prior_s = 120.0;
             }
             other => {
@@ -3741,6 +3799,29 @@ mod tests {
         assert_eq!(GateMode::default(), GateMode::WindowMean);
         let parsed: ExtractConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed.gate_mode, GateMode::WindowMean);
+    }
+
+    #[test]
+    fn the_apex_window_is_chosen_by_instrument_unless_given() {
+        let c = Config::default();
+        assert_eq!(c.extract.apex_count_window, APEX_COUNT_WINDOW_AUTO);
+        assert_eq!(c.extract.apex_count_window_for(true), 1);
+        assert_eq!(c.extract.apex_count_window_for(false), 5);
+        assert!(c.search_seed.two_pass_mass_cal);
+        let auto: ExtractConfig = serde_json::from_str(r#"{"apex_count_window": "auto"}"#).unwrap();
+        assert_eq!(auto.apex_count_window, APEX_COUNT_WINDOW_AUTO);
+        let zero: ExtractConfig = serde_json::from_str(r#"{"apex_count_window": 0}"#).unwrap();
+        assert_eq!(zero.apex_count_window_for(true), 1);
+        // A number is used as given, on any instrument.
+        let three: ExtractConfig = serde_json::from_str(r#"{"apex_count_window": 3}"#).unwrap();
+        assert_eq!(three.apex_count_window_for(true), 3);
+        assert_eq!(three.apex_count_window_for(false), 3);
+        let bad = serde_json::from_str::<ExtractConfig>(r#"{"apex_count_window": "wide"}"#);
+        assert!(bad.unwrap_err().to_string().contains("apex_count_window"));
+        // The canonical form stays numeric, so existing config hashes are unchanged.
+        let json = serde_json::to_value(&auto).unwrap();
+        assert_eq!(json["apex_count_window"], 0);
+        Config::default().validate().unwrap();
     }
 
     #[test]

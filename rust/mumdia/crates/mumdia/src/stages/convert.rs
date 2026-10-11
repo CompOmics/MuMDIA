@@ -790,6 +790,17 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     // guard is for makes it read 0. `spectrumList count` is in the header, a few hundred
     // KiB in at most, so it survives any truncation long enough to be worth checking.
     let declared = declared_spectrum_count(p.mzml).unwrap_or(0);
+    // The instrument, for the settings chosen per instrument (`extract.apex_count_window
+    // = "auto"`). Recorded in every spectra report; `null` when the header names none.
+    let instrument = crate::instrument::from_mzml(p.mzml);
+    match &instrument {
+        Some(i) => info!(
+            instrument = %i.describe(),
+            astral = i.is_astral(),
+            "convert: instrument from the mzML header"
+        ),
+        None => info!("convert: the mzML header names no instrument model"),
+    }
 
     let ms1_path = format!("{}/spectra_ms1.parquet", p.out_dir);
     let ms2_path = format!("{}/spectra_ms2.parquet", p.out_dir);
@@ -987,6 +998,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
             "top_peaks_ms2": p.top_peaks_ms2,
             "top_peaks_ms1": p.top_peaks_ms1,
             "config_hash": p.config_hash,
+            "instrument": instrument,
         }),
     )?;
 

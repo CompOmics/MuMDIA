@@ -9,6 +9,7 @@ pub mod colread;
 pub mod fdr;
 pub mod groups;
 pub mod index;
+pub mod instrument;
 pub mod library_cache;
 pub mod masscal;
 pub mod matchers;
