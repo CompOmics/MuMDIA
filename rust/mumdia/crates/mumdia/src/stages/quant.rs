@@ -5035,7 +5035,11 @@ mod tests {
             let rt_leaf = (0..leaves.num_columns())
                 .find(|&c| leaves.column(c).path().string().starts_with("rt"))
                 .unwrap();
-            for (g, rg) in md.offset_index().unwrap().iter().enumerate() {
+            for (g, rg) in mumdia_io::table::offset_index_table(md)
+                .unwrap()
+                .iter()
+                .enumerate()
+            {
                 let pages = rg[rt_leaf].page_locations().len();
                 assert!(pages >= 2, "row group {g}: the rt leaf is {pages} page(s)");
             }
@@ -6435,7 +6439,7 @@ mod tests {
             let n_keep = keep.iter().filter(|&&k| k).count();
             kept_rows += n_keep;
             opened_groups += usize::from(n_keep > 0);
-            let Some(oi) = md.offset_index() else {
+            let Some(oi) = mumdia_io::table::offset_index_table(md) else {
                 println!("{chrom} has no offset index");
                 return;
             };
