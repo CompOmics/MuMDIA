@@ -231,7 +231,8 @@ is a plain `serde_json::to_string`.
 ### `apply_profile` (`config.rs:1446-1460`)
 
 Only `dia` is defined. It sets `features.set = Extended`,
-`extract.apex_count_window = 5`, `extract.apex_rt_prior_s = 120.0`. Any other name
+`extract.apex_count_window = "auto"` (5, except 1 on an Orbitrap Astral),
+`extract.apex_rt_prior_s = 120.0`. Any other name
 is an `Invalid` error. All other extraction defaults stay at their conservative
 baselines; the profile is a convenience shortcut, not a full preset file.
 
@@ -692,7 +693,7 @@ every other section), so both keys are required inside a `ResidueMod` entry.
 | `min_matched_peaks` | 4 | min matched fragments per seed PSM |
 | `top_n_peaks` | 300 | probe only the N most intense MS2 peaks (0 = all) |
 | `matcher` | `fragindex` | matcher backend |
-| `two_pass_mass_cal` | `false` | **default-off** robust two-pass mass calibration (P3.1) |
+| `two_pass_mass_cal` | `true` | robust two-pass mass calibration (P3.1); default since 2026-10-11 |
 | `mass_cal_loess` | `false` | **default-off** m/z-dependent fragment mass calibration: fit a LOESS of calibrant ppm deviation against fragment m/z, write a sampled grid to `<seed>.masscal.json`, and let extract interpolate a per-peak offset instead of the scalar `frag_ppm_offset` |
 
 `search_seed.top_n_peaks` bounds only the seed stage's per-peak index probing. It
@@ -755,7 +756,7 @@ selection dominate.
 | `apex_top_fragments` | 0 | signature-fragment apex: sums the observed intensity of the top-K predicted fragments per scan; `0` falls back to a default of 3 (`extract.rs:1857-1861`), not all-matched |
 | `apex_rt_prior_s` | 0.0 | Gaussian RT prior sigma on apex (0 = off) |
 | `apex_count_tol` | 1 | fragment-count apex slack |
-| `apex_count_window` | 1 | rolling distinct-fragment count width (1 = none; profile `dia` sets 5) |
+| `apex_count_window` | `"auto"` (0) | rolling distinct-fragment count width (1 = none); `"auto"` is 1 on an Orbitrap Astral and 5 elsewhere, from the instrument `convert` recorded |
 | `apex_gaussian_sigma_scans` | 0.0 | Gaussian apex smoother sigma in scans (0 = rolling-sum unchanged; opt-in, benchmark-gated) |
 | `emit_window_grid` | `true` | zero-filled window-grid chromatograms |
 | `bucket_size` | 8192 | m/z bucket size (power of two) |

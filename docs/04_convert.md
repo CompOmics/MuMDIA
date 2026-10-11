@@ -364,6 +364,21 @@ fields. `Config` contains no convert-stage field at all and no centroiding
 strategy enum. Any change to centroiding or window synthesis is a code change
 here, not a config toggle.
 
+### The instrument record
+
+`convert` reads the instrument model from the mzML header (`instrument.rs`): the first
+cvParam of the `referenceableParamGroupList` or of an `instrumentConfiguration` outside its
+`componentList`, other than the serial number, and whether any configuration lists the
+Astral analyzer (`MS:1003379`). Every spectra report carries it as `params.instrument`
+(`{accession, name, astral_analyzer}`, or `null` when the header names no model), and the
+log says what was found. Settings left to the engine are resolved from this record, so a
+standalone `extract` on converted spectra and every orchestrator agree. One setting uses it
+today: `extract.apex_count_window = "auto"`, 1 on an Orbitrap Astral (`MS:1003378`, a model
+name containing "Astral", or the Astral analyzer) and 5 elsewhere. Spectra converted
+before the record existed resolve as "not an Astral". Measured headers: ThermoRawFileParser
+1.4.5 writes `MS:1003378` "Orbitrap Astral" and `MS:1002877` "Q Exactive HF-X"; Bruker
+timsTOF mzML names only `MS:1000122` "Bruker Daltonics instrument model".
+
 ### Choosing `--top-peaks-ms2`
 
 The default (`0`, uncapped) is the only portable setting. Any non-zero value

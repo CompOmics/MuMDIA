@@ -194,7 +194,11 @@ fn craft_windows() -> String {
 }
 
 fn run_extract(prec: &str, frag: &str, ms2: &str, win: &str, tag: &str) -> (String, String) {
-    let cfg = Config::default();
+    let mut cfg = Config::default();
+    // The per-scan apex these crafted runs are written against. The default `"auto"` is 5
+    // for spectra without an instrument record, and a centred rolling sum over this
+    // five-scan peak moves the apex to its middle.
+    cfg.extract.apex_count_window = 1;
     let psms = tmp(&format!("psms_{tag}.parquet"));
     let chrom = tmp(&format!("chrom_{tag}.parquet"));
     stages::extract::run(stages::extract::ExtractParams {

@@ -761,9 +761,9 @@ do not reintroduce removed knobs. The fields relevant here:
   distinguished; `quant.fixed_window_s` and `quant.fixed_scan_halfwidth` both set,
   where the seconds form wins; and `quant.baseline_subtract` without a fixed
   window to subtract inside.
-- `apply_profile("dia")` (`config.rs:1587`) sets `features.set = Extended`,
-  `extract.apex_count_window = 5`, `extract.apex_rt_prior_s = 120.0`. Any other
-  name is an error.
+- `apply_profile("dia")` sets `features.set = Extended`,
+  `extract.apex_count_window = "auto"` (0), `extract.apex_rt_prior_s = 120.0`. Any
+  other name is an error.
 - Deserialization uses `#[serde(deny_unknown_fields)]` throughout `config.rs` (20
   occurrences), so an unknown or misspelled key is a hard load error rather than a
   silently-ignored no-op (tested at `config.rs:1722`). This is also what makes
@@ -780,8 +780,9 @@ do not reintroduce removed knobs. The fields relevant here:
   `MUMDIA_RESCORE_MODEL=logreg` baked at `Dockerfile:57`; the NN worker also reads
   `MUMDIA_NN_SEEDS` (`scripts/nn_rescore_worker.py:42`).
 - Both `docker/*.json` configs open with the same DIA preset written out
-  explicitly (`features.set = extended`, `extract.apex_count_window = 5`,
-  `extract.apex_rt_prior_s = 120.0`), matching `apply_profile("dia")`.
+  explicitly (`features.set = extended`, `extract.apex_rt_prior_s = 120.0`), matching
+  `apply_profile("dia")`. They leave `extract.apex_count_window` at its `"auto"`
+  default, so an Orbitrap Astral run gets window 1 and any other instrument 5.
 - `docker/config.dia.json` (FASTA-digest path) sets
   `predict_frag.predictor = ms2pip` and `predict_frag.rt_predictor = deeplc`, and
   points sidecars at fixed in-image interpreters:

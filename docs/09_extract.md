@@ -564,7 +564,16 @@ qualifies, then by a per-scan score:
   the per-scan distinct-fragment count (`extract.rs:1809`). It is deliberately a
   sum, not a mean: edge truncation makes interior positions accumulate more,
   center-weighting the apex toward the RT-window centre (a mild RT prior). Window
-  1 reproduces exact per-scan counts. Only scans with smoothed count `>= maxc -
+  1 reproduces exact per-scan counts. The default `"auto"` (stored as 0) is resolved
+  at the start of the stage from the instrument `convert` recorded in
+  `<spectra_ms2>.report.json` (`params.instrument`, `instrument.rs`): 1 on an Orbitrap
+  Astral, 5 on any other instrument and on spectra converted before the field existed.
+  The resolved window and the instrument are in the `psms_extracted` report. Measured one
+  setting at a time against the 0.6.0 defaults (2026-10-10), window 1 against 5: Astral
+  HYE +1.7% peptides, the ProteoBench Astral entrapment module +1.5% precursors at an
+  unchanged paired FDP (0.84%), an Astral single cell +6.1%, an Astral HeLa entrapment
+  run +2.2% human precursors at a measured FDP of 1%; Orbitrap AIF HYE -0.9% and the AIF
+  entrapment run -0.8%. Only scans with smoothed count `>= maxc -
   apex_count_tol` qualify (`extract.rs:1848`). An opt-in Gaussian smoother over
   the same profile is available via `apex_gaussian_sigma_scans` (default 0.0 =
   off, `extract.rs:1813`).
@@ -754,7 +763,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `apex_top_fragments` | 0 | Signature-ion count for apex; 0 -> default 3 (`extract.rs:1860`). Config marks it superseded by `apex_count_tol`, kept for compat (`config.rs:545`) |
 | `apex_rt_prior_s` | 0.0 | Gaussian RT-prior sigma on apex tiebreak; 0 = off |
 | `apex_count_tol` | 1 | Count slack for qualifying apex scans |
-| `apex_count_window` | 1 | Rolling-sum width for the count profile; 1 = no smoothing. Window 5 cut AIF apex misassignment (median \|dRT\| 131s -> 9s) |
+| `apex_count_window` | `"auto"` | Rolling-sum width for the count profile; 1 = no smoothing. `"auto"`: 1 on an Orbitrap Astral, 5 elsewhere. Window 5 cut AIF apex misassignment (median \|dRT\| 131s -> 9s) |
 | `apex_gaussian_sigma_scans` | 0.0 | Opt-in Gaussian apex smoother; 0 = off (`config.rs:572`) |
 | `apex_evidence_rank` | **true** | Breadth-of-evidence apex. The legacy signature-intensity apex silently falls back to the lowest-RT qualifying scan when none of the top-K predicted fragments is observed |
 | `emit_window_grid` | true | Zero-filled full-window-grid chromatograms |
@@ -801,7 +810,7 @@ here for one index.
 | `extract.emit_gate_diagnostics` (`config.rs:673`) | 4 F32 cols `gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy` (`extract.rs:2511`) | diagnostic; no ID effect |
 | `extract.apex_evidence_rank` (`config.rs:667`) | none; changes the apex-selection score (`extract.rs:1890`) | **now the default**, promoted on correctness grounds rather than a count (docs/25 section 2): the legacy score cannot distinguish "no signature fragment observed anywhere" from "the earliest qualifying scan is the apex" |
 | `extract.apex_gaussian_sigma_scans` (`config.rs:572`) | none; smooths the apex count profile | not measured; gate pending |
-| `search_seed.two_pass_mass_cal` (`config.rs:423`) | none; refits the `<seed>.masscal.json` offset + tolerance | not measured; gate pending |
+| `search_seed.two_pass_mass_cal` | none; refits the `<seed>.masscal.json` offset + tolerance | **default since 2026-10-11**: Astral HYE +2.5%, ProteoBench Astral entrapment +1.0% at a paired FDP of 0.84%, AIF HYE +0.1%, AIF entrapment -0.2% at a measured FDP of 1.00% |
 | `rt_im_train.adaptive_rt_window` (`config.rs:487`) | none; per-region RT half-window widths in `run_windows` | not measured; gate pending |
 | `extract.emit_contested_features` (`config.rs:611`) | 2 F64 cols `contested_count_frac`, `apportioned_frac` (`extract.rs:2505`); forces the two-pass path (`extract.rs:1443`) | not measured; gate pending |
 | `extract.emit_demix_features` (`config.rs:592`) | 5 F32 cols `deconv_explained_frac`, `deconv_active`, `deconv_share`, `deconv_max_collinearity`, `shadow_kept_frac` (`extract.rs:2517`) | not measured; gate pending |

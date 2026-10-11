@@ -64,7 +64,7 @@ The effective reference settings are:
 | `features.set` | `extended` |
 | `extract.gate_mode` | `apex_pearson` |
 | `extract.gate_min_score` | `0.6` with `gate_mode = window_mean` (the default since 2026-10-08) |
-| `extract.apex_count_window` | `5` |
+| `extract.apex_count_window` | `5` (`"auto"` resolves to 5 on this Q Exactive run) |
 | `extract.apex_rt_prior_s` | `120` seconds |
 | `rt_im_train.finetune_deeplc` | `true` |
 | `rt_im_train.rt_window_multiplier` | `1.5` |

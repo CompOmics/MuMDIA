@@ -1357,9 +1357,9 @@
       "rust_type": "bool",
       "kind": "bool",
       "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Robust two-pass fragment mass calibration (sensitivity_plan P3.1). After the first median-offset + tolerance fit, re-fit on only the deviations inside the first-pass tolerance window (rejecting outliers), giving a tighter, more robust offset + local uncertainty. Falls back to the single-pass result when too few in-window calibrants remain. Default false (single pass unchanged).",
+      "default": true,
+      "default_text": "true",
+      "help": "Robust two-pass fragment mass calibration (sensitivity_plan P3.1). After the first median-offset + tolerance fit, re-fit on only the deviations inside the first-pass tolerance window (rejecting outliers), giving a tighter, more robust offset + local uncertainty. Falls back to the single-pass result when too few in-window calibrants remain. Default true since 2026-10-11: one setting at a time against the 0.6.0 defaults (single seed, then seeds 1 and 2), Astral HYE +2.5% peptides, the ProteoBench Astral entrapment module +1.0% precursors at a paired FDP of 0.84% (0.83% before), Orbitrap AIF HYE +0.1%, and the AIF entrapment run -0.2% real precursors at a measured FDP of 1.00% (0.98% before).",
       "gates": [],
       "source_struct": "SearchSeedConfig"
     },
@@ -1879,9 +1879,9 @@
       "rust_type": "usize",
       "kind": "integer",
       "optional": false,
-      "default": 1,
-      "default_text": "1",
-      "help": "Rolling-window width (in scan groups, centered, odd) for the distinct- fragment count that drives apex selection. Low-intensity fragments flicker in and out scan-to-scan; a single-scan count then spikes at noise scans and misplaces the apex. This sums the per-scan distinct-fragment count over a centered window so the apex lands in the region of *sustained* fragment presence, not an isolated flicker. A sum (not a mean) is used deliberately: edge truncation makes interior positions accumulate more, center-weighting the apex toward the RT-window centre (~= predicted RT) as a mild RT-prior; measured to beat a mean by ~+300 IDs on AIF. 1 = no smoothing (per-scan).",
+      "default": 0,
+      "default_text": "0",
+      "help": "Rolling-window width (in scan groups, centered, odd) for the distinct- fragment count that drives apex selection. Low-intensity fragments flicker in and out scan-to-scan; a single-scan count then spikes at noise scans and misplaces the apex. This sums the per-scan distinct-fragment count over a centered window so the apex lands in the region of *sustained* fragment presence, not an isolated flicker. A sum (not a mean) is used deliberately: edge truncation makes interior positions accumulate more, center-weighting the apex toward the RT-window centre (~= predicted RT) as a mild RT-prior; measured to beat a mean by ~+300 IDs on AIF. 1 = no smoothing (per-scan). `\"auto\"` (also written `0`, the default since 2026-10-11) chooses by the instrument `convert` recorded for the run (`crate::instrument` in the engine): 1 on an Orbitrap Astral, 5 on every other instrument and when none is recorded. Measured one setting at a time against the 0.6.0 defaults, window 1 against 5: Astral HYE +1.7% peptides, the ProteoBench Astral entrapment module +1.5% precursors (paired FDP 0.84% against 0.83%), an Astral single cell +6.1% precursors and an Astral HeLa entrapment run +2.2% human precursors at a measured FDP of 1% (FDP at the reported 1%: 0.63% against 0.79%); on the Orbitrap, AIF HYE -0.9% and the AIF entrapment run -0.8%. Astral scans are fast enough that a fragment rarely flickers out, so smoothing over five of them blurs the apex instead of steadying it. A number is used as given.",
       "gates": [],
       "source_struct": "ExtractConfig"
     },
@@ -3595,7 +3595,7 @@
       },
       {
         "path": "extract.apex_count_window",
-        "value": "5"
+        "value": "0"
       },
       {
         "path": "extract.apex_rt_prior_s",

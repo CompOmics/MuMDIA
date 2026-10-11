@@ -1685,7 +1685,7 @@ impl Default for ExtractConfig {
             apex_gaussian_sigma_scans: 0.0, // Gaussian apex smoother off by default (opt-in)
             // "auto": 1 on an Orbitrap Astral, 5 elsewhere (window 5 cuts AIF apex
             // misassignment, median |dRT| 131s->9s). Resolved per run in extract.
-            apex_count_window: APEX_COUNT_WINDOW_AUTO,
+            apex_count_window: 0, // APEX_COUNT_WINDOW_AUTO; a literal for the config reference
             emit_window_grid: true, // zero-filled window-grid chromatograms
             chromatogram_schema: 2, // axis once per candidate and row group, trimmed traces
             bucket_size: 8192,
@@ -3764,7 +3764,7 @@ impl Config {
                 self.features.set = FeatureSet::Extended;
                 // Chosen per run from the instrument: 5, as this profile always set,
                 // except on an Orbitrap Astral.
-                self.extract.apex_count_window = APEX_COUNT_WINDOW_AUTO;
+                self.extract.apex_count_window = 0; // APEX_COUNT_WINDOW_AUTO
                 self.extract.apex_rt_prior_s = 120.0;
             }
             other => {
