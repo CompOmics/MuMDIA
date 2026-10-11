@@ -926,12 +926,15 @@ mod tests {
                 if i > 4 {
                     // Item 4 is taken before any later item, so this cannot wait forever.
                     // Holding the later items until well after the panic makes the check
-                    // below independent of how fast the machine is.
+                    // below independent of how fast the machine is. `panicking` is set
+                    // before the panic hook runs, the queue's stop flag only when the unwind
+                    // reaches the worker, so the hold must outlast the hook: 30 ms did not
+                    // on a Windows CI runner, where all 60 items ran.
                     let t0 = std::time::Instant::now();
                     while !panicking.load(Ordering::SeqCst) && t0.elapsed().as_secs() < 10 {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    std::thread::sleep(std::time::Duration::from_millis(2000));
                 }
                 Ok(i)
             })
@@ -945,15 +948,27 @@ mod tests {
 
     #[test]
     fn a_failing_band_stops_the_queue_and_reports_the_lowest_failed_band() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let items: Vec<usize> = (0..50).collect();
         let order: Vec<usize> = (0..50).collect();
         let ran = AtomicUsize::new(0);
+        let failing = AtomicBool::new(false);
         let err = run_bounded(&items, 4, &order, |&i| {
             ran.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(2));
             if i == 5 || i == 7 {
+                failing.store(true, Ordering::SeqCst);
                 anyhow::bail!("band {i} failed")
+            }
+            if i > 7 {
+                // Item 5 is taken before any later item, so this cannot wait forever. Without
+                // the hold, a worker descheduled while holding item 5 let the other three run
+                // all 50 items before the failure was stored (seen on a loaded Windows host).
+                let t0 = std::time::Instant::now();
+                while !failing.load(Ordering::SeqCst) && t0.elapsed().as_secs() < 10 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
             }
             Ok(i)
         })
