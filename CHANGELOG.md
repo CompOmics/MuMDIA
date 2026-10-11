@@ -96,6 +96,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   per row group (`ParquetMetaData::page_index_for_row_group`) instead of as nested vectors;
   the band splice and the partial-read planner use it. Smoke outputs are byte-identical to
   0.6.0.
+- **The CI check of `THIRD_PARTY_LICENSES.md` and `sbom.cdx.json` tolerates crate versions**
+  (`ci/_lockfile_versions.py`). Dependabot does not run the generators, so every one of its
+  pull requests failed CI on a version string. The check still fails when a crate, a second
+  version of a crate, a licence or a notice changes; `--check --strict`, which the release
+  gate runs, compares exactly.
 
 ### Fixed
 

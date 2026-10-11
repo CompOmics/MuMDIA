@@ -511,7 +511,9 @@ jobs:
       # The release binary is statically linked, so it carries 173 third-party crates
       # whose Apache-2.0 and MIT terms require their notices to ship with it. Generated
       # from Cargo.lock, so a dependency change that alters the licence inventory has to
-      # land with the regenerated notice file.
+      # land with the regenerated notice file. A change of crate versions alone passes
+      # here with a note (Dependabot does not run the generators); the release gate in
+      # release.yml compares exactly (ci/_lockfile_versions.py).
       # Both generators below read the local cargo registry, and this job never
       # compiles anything, so on a fresh runner the registry is empty. Without this
       # step the licence generator recovered zero per-crate notices and `--check`

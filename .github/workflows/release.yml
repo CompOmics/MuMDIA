@@ -104,6 +104,18 @@ jobs:
                echo "Push the commit to a PR, let CI pass, merge to main, then tag."
                exit 1 ;;
           esac
+
+      # CI tolerates a THIRD_PARTY_LICENSES.md or sbom.cdx.json that differs from the
+      # lockfile in crate versions only, because Dependabot does not run the generators
+      # (ci/_lockfile_versions.py). A release must name the exact versions inside the
+      # binary it ships, so the gate compares exactly. The generators read the crate
+      # sources from the registry, hence the fetch.
+      - name: The licence notices and the SBOM name the exact versions
+        run: |
+          set -euo pipefail
+          cargo fetch --locked --manifest-path rust/mumdia/Cargo.toml
+          python3 ci/gen_third_party_licenses.py --check --strict
+          python3 ci/gen_sbom.py --check --strict
   release:
     name: ${{ matrix.target }}
     needs: [validate-tag]
