@@ -38,6 +38,34 @@ const POLL: Duration = Duration::from_millis(700);
 /// Log lines kept in memory. The pane shows the tail; the full log is on disk.
 const LOG_TAIL: usize = 4000;
 
+/// The engine's whole output for a search, written into its results folder.
+///
+/// The interface keeps only the last `LOG_TAIL` lines, and only while the application is
+/// open, so a run that failed left nothing to diagnose it from once the window closed: a
+/// single-cell search on 2026-10-10 stopped in rescoring and the reason (the classifier
+/// found no training signal) was readable only by reproducing the run.
+pub const RUN_LOG_NAME: &str = "mumdia-console.log";
+
+/// Open the run log for appending and write its header. `None` when the folder cannot
+/// take it, which must not stop the search.
+fn open_run_log(out_dir: &Path, command: &str) -> Option<Arc<Mutex<std::fs::File>>> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_dir.join(RUN_LOG_NAME))
+        .ok()?;
+    let started = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(
+        f,
+        "==== MuMDIA console run, started at unix time {started}\n==== {command}"
+    );
+    Some(Arc::new(Mutex::new(f)))
+}
+
 /// The results folders of the runs in flight, by canonical path, each with the id of
 /// the run that owns it.
 ///
@@ -692,6 +720,7 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
         args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
     );
 
+    let run_log = open_run_log(Path::new(&req.out_dir), &display);
     let run = new_run(&id, &req, display, Some(reservation));
 
     let mut cmd = engine::command(&exe);
@@ -744,10 +773,17 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
     ] {
         let Some(stream) = stream else { continue };
         let run = Arc::clone(&run);
+        let run_log = run_log.clone();
         let _ = tag;
         std::thread::spawn(move || {
             let reader = BufReader::new(stream);
             for line in reader.lines().map_while(Result::ok) {
+                if let Some(f) = &run_log {
+                    use std::io::Write;
+                    if let Ok(mut f) = f.lock() {
+                        let _ = writeln!(f, "{line}");
+                    }
+                }
                 run.set(|s| {
                     s.log.push(line);
                     if s.log.len() > LOG_TAIL {

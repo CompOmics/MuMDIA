@@ -13,3 +13,4 @@ pub mod run;
 pub mod settings;
 pub mod sizing;
 pub mod thermo;
+pub mod viewer;

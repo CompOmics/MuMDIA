@@ -5,16 +5,16 @@
   "metadata": {
     "component": {
       "type": "application",
-      "bom-ref": "pkg:cargo/mumdia@0.5.0",
+      "bom-ref": "pkg:cargo/mumdia@0.6.0",
       "name": "mumdia",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "description": "Clean-room Rust DIA proteomics search engine",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/mumdia@0.5.0"
+      "purl": "pkg:cargo/mumdia@0.6.0"
     },
     "tools": [
       {
@@ -235,10 +235,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow@59.3.0",
+      "bom-ref": "pkg:cargo/arrow@60.0.0",
       "name": "arrow",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow@60.0.0",
       "description": "Rust implementation of Apache Arrow",
       "licenses": [
         {
@@ -254,10 +254,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-arith@59.3.0",
+      "bom-ref": "pkg:cargo/arrow-arith@60.0.0",
       "name": "arrow-arith",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow-arith@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-arith@60.0.0",
       "description": "Arrow arithmetic kernels",
       "licenses": [
         {
@@ -273,10 +273,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-array@59.3.0",
+      "bom-ref": "pkg:cargo/arrow-array@60.0.0",
       "name": "arrow-array",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow-array@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-array@60.0.0",
       "description": "Array abstractions for Apache Arrow",
       "licenses": [
         {
@@ -292,10 +292,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-buffer@59.3.0",
+      "bom-ref": "pkg:cargo/arrow-buffer@60.0.0",
       "name": "arrow-buffer",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow-buffer@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-buffer@60.0.0",
       "description": "Buffer abstractions for Apache Arrow",
       "licenses": [
         {
@@ -311,10 +311,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-cast@59.3.0",
+      "bom-ref": "pkg:cargo/arrow-cast@60.0.0",
       "name": "arrow-cast",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow-cast@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-cast@60.0.0",
       "description": "Cast kernel and utilities for Apache Arrow",
       "licenses": [
         {
@@ -330,10 +330,29 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-csv@59.3.0",
+      "bom-ref": "pkg:cargo/arrow-cmp@60.0.0",
+      "name": "arrow-cmp",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-cmp@60.0.0",
+      "description": "Basic comparator/ordering building blocks for Apache Arrow, shared by crates that need slot-wise comparison without pulling in the full arrow-ord kernels",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/arrow-csv@60.0.0",
       "name": "arrow-csv",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow-csv@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-csv@60.0.0",
       "description": "Support for parsing CSV format to and from the Arrow format",
       "licenses": [
         {
@@ -349,10 +368,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-data@59.3.0",
+      "bom-ref": "pkg:cargo/arrow-data@60.0.0",
       "name": "arrow-data",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow-data@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-data@60.0.0",
       "description": "Array data abstractions for Apache Arrow",
       "licenses": [
         {
@@ -368,10 +387,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-ipc@59.3.0",
+      "bom-ref": "pkg:cargo/arrow-ipc@60.0.0",
       "name": "arrow-ipc",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow-ipc@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-ipc@60.0.0",
       "description": "Support for the Arrow IPC format",
       "licenses": [
         {
@@ -387,10 +406,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-json@59.3.0",
+      "bom-ref": "pkg:cargo/arrow-json@60.0.0",
       "name": "arrow-json",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow-json@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-json@60.0.0",
       "description": "Support for parsing JSON format to and from the Arrow format",
       "licenses": [
         {
@@ -406,10 +425,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-ord@59.3.0",
+      "bom-ref": "pkg:cargo/arrow-ord@60.0.0",
       "name": "arrow-ord",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow-ord@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-ord@60.0.0",
       "description": "Ordering kernels for arrow arrays",
       "licenses": [
         {
@@ -425,10 +444,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-row@59.3.0",
+      "bom-ref": "pkg:cargo/arrow-row@60.0.0",
       "name": "arrow-row",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow-row@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-row@60.0.0",
       "description": "Arrow row format",
       "licenses": [
         {
@@ -444,10 +463,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-schema@59.3.0",
+      "bom-ref": "pkg:cargo/arrow-schema@60.0.0",
       "name": "arrow-schema",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow-schema@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-schema@60.0.0",
       "description": "Defines the logical types for arrow arrays",
       "licenses": [
         {
@@ -463,10 +482,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-select@59.3.0",
+      "bom-ref": "pkg:cargo/arrow-select@60.0.0",
       "name": "arrow-select",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow-select@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-select@60.0.0",
       "description": "Selection kernels for arrow arrays",
       "licenses": [
         {
@@ -482,10 +501,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/arrow-string@59.3.0",
+      "bom-ref": "pkg:cargo/arrow-string@60.0.0",
       "name": "arrow-string",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/arrow-string@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/arrow-string@60.0.0",
       "description": "String kernels for arrow arrays",
       "licenses": [
         {
@@ -501,10 +520,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/atoi@2.0.0",
+      "bom-ref": "pkg:cargo/atoi@3.1.0",
       "name": "atoi",
-      "version": "2.0.0",
-      "purl": "pkg:cargo/atoi@2.0.0",
+      "version": "3.1.0",
+      "purl": "pkg:cargo/atoi@3.1.0",
       "description": "Parse integers directly from `[u8]` slices in safe code",
       "licenses": [
         {
@@ -672,10 +691,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/bytes@1.12.0",
+      "bom-ref": "pkg:cargo/bytes@1.12.1",
       "name": "bytes",
-      "version": "1.12.0",
-      "purl": "pkg:cargo/bytes@1.12.0",
+      "version": "1.12.1",
+      "purl": "pkg:cargo/bytes@1.12.1",
       "description": "Types and traits for working with bytes",
       "licenses": [
         {
@@ -748,10 +767,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/clap@4.6.6",
+      "bom-ref": "pkg:cargo/clap@4.6.7",
       "name": "clap",
-      "version": "4.6.6",
-      "purl": "pkg:cargo/clap@4.6.6",
+      "version": "4.6.7",
+      "purl": "pkg:cargo/clap@4.6.7",
       "description": "A simple to use, efficient, and full-featured Command Line Argument Parser",
       "licenses": [
         {
@@ -767,10 +786,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/clap_builder@4.6.6",
+      "bom-ref": "pkg:cargo/clap_builder@4.6.7",
       "name": "clap_builder",
-      "version": "4.6.6",
-      "purl": "pkg:cargo/clap_builder@4.6.6",
+      "version": "4.6.7",
+      "purl": "pkg:cargo/clap_builder@4.6.7",
       "description": "A simple to use, efficient, and full-featured Command Line Argument Parser",
       "licenses": [
         {
@@ -786,10 +805,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/clap_derive@4.6.4",
+      "bom-ref": "pkg:cargo/clap_derive@4.6.7",
       "name": "clap_derive",
-      "version": "4.6.4",
-      "purl": "pkg:cargo/clap_derive@4.6.4",
+      "version": "4.6.7",
+      "purl": "pkg:cargo/clap_derive@4.6.7",
       "description": "Parse command line argument by defining a struct, derive crate.",
       "licenses": [
         {
@@ -843,10 +862,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/comfy-table@7.2.2",
+      "bom-ref": "pkg:cargo/comfy-table@8.0.1",
       "name": "comfy-table",
-      "version": "7.2.2",
-      "purl": "pkg:cargo/comfy-table@7.2.2",
+      "version": "8.0.1",
+      "purl": "pkg:cargo/comfy-table@8.0.1",
       "description": "An easy to use library for building beautiful tables with automatic content wrapping",
       "licenses": [
         {
@@ -1219,6 +1238,25 @@
         {
           "type": "vcs",
           "url": "https://github.com/indexmap-rs/equivalent"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/fastrand@2.5.0",
+      "name": "fastrand",
+      "version": "2.5.0",
+      "purl": "pkg:cargo/fastrand@2.5.0",
+      "description": "A simple and fast random number generator",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/smol-rs/fastrand"
         }
       ]
     },
@@ -1947,10 +1985,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/mumdia-core@0.5.0",
+      "bom-ref": "pkg:cargo/mumdia-core@0.6.0",
       "name": "mumdia-core",
-      "version": "0.5.0",
-      "purl": "pkg:cargo/mumdia-core@0.5.0",
+      "version": "0.6.0",
+      "purl": "pkg:cargo/mumdia-core@0.6.0",
       "description": "Typed configuration, mass model, artifact schemas, and run manifest for MuMDIA",
       "licenses": [
         {
@@ -1966,10 +2004,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/mumdia-io@0.5.0",
+      "bom-ref": "pkg:cargo/mumdia-io@0.6.0",
       "name": "mumdia-io",
-      "version": "0.5.0",
-      "purl": "pkg:cargo/mumdia-io@0.5.0",
+      "version": "0.6.0",
+      "purl": "pkg:cargo/mumdia-io@0.6.0",
       "description": "Parquet/JSON artifact layer, content hashing, and logging for MuMDIA",
       "licenses": [
         {
@@ -1985,10 +2023,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/mzdata@0.66.6",
+      "bom-ref": "pkg:cargo/mzdata@0.67.4",
       "name": "mzdata",
-      "version": "0.66.6",
-      "purl": "pkg:cargo/mzdata@0.66.6",
+      "version": "0.67.4",
+      "purl": "pkg:cargo/mzdata@0.67.4",
       "description": "A library to read mass spectrometry data formats and a data model for mass spectra",
       "licenses": [
         {
@@ -2004,10 +2042,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/mzdata-bindata@0.66.6",
+      "bom-ref": "pkg:cargo/mzdata-bindata@0.67.4",
       "name": "mzdata-bindata",
-      "version": "0.66.6",
-      "purl": "pkg:cargo/mzdata-bindata@0.66.6",
+      "version": "0.67.4",
+      "purl": "pkg:cargo/mzdata-bindata@0.67.4",
       "description": "A library to read mass spectrometry data formats and a data model for mass spectra",
       "licenses": [
         {
@@ -2023,10 +2061,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/mzdata-meta@0.66.6",
+      "bom-ref": "pkg:cargo/mzdata-meta@0.67.4",
       "name": "mzdata-meta",
-      "version": "0.66.6",
-      "purl": "pkg:cargo/mzdata-meta@0.66.6",
+      "version": "0.67.4",
+      "purl": "pkg:cargo/mzdata-meta@0.67.4",
       "description": "A library to read mass spectrometry data formats and a data model for mass spectra",
       "licenses": [
         {
@@ -2042,10 +2080,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/mzdata-param@0.66.6",
+      "bom-ref": "pkg:cargo/mzdata-param@0.67.4",
       "name": "mzdata-param",
-      "version": "0.66.6",
-      "purl": "pkg:cargo/mzdata-param@0.66.6",
+      "version": "0.67.4",
+      "purl": "pkg:cargo/mzdata-param@0.67.4",
       "description": "A library to read mass spectrometry data formats and a data model for mass spectra",
       "licenses": [
         {
@@ -2061,10 +2099,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/mzdata-spectrum@0.66.6",
+      "bom-ref": "pkg:cargo/mzdata-spectrum@0.67.4",
       "name": "mzdata-spectrum",
-      "version": "0.66.6",
-      "purl": "pkg:cargo/mzdata-spectrum@0.66.6",
+      "version": "0.67.4",
+      "purl": "pkg:cargo/mzdata-spectrum@0.67.4",
       "description": "A library to read mass spectrometry data formats and a data model for mass spectra",
       "licenses": [
         {
@@ -2251,10 +2289,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/parquet@59.3.0",
+      "bom-ref": "pkg:cargo/parquet@60.0.0",
       "name": "parquet",
-      "version": "59.3.0",
-      "purl": "pkg:cargo/parquet@59.3.0",
+      "version": "60.0.0",
+      "purl": "pkg:cargo/parquet@60.0.0",
       "description": "Apache Parquet implementation in Rust",
       "licenses": [
         {
@@ -2265,6 +2303,82 @@
         {
           "type": "vcs",
           "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/phf@0.14.0",
+      "name": "phf",
+      "version": "0.14.0",
+      "purl": "pkg:cargo/phf@0.14.0",
+      "description": "Runtime support for perfect hash function data structures",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-phf/rust-phf"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/phf_generator@0.14.0",
+      "name": "phf_generator",
+      "version": "0.14.0",
+      "purl": "pkg:cargo/phf_generator@0.14.0",
+      "description": "PHF generation logic",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-phf/rust-phf"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/phf_macros@0.14.0",
+      "name": "phf_macros",
+      "version": "0.14.0",
+      "purl": "pkg:cargo/phf_macros@0.14.0",
+      "description": "Macros to generate types in the phf crate",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-phf/rust-phf"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/phf_shared@0.14.0",
+      "name": "phf_shared",
+      "version": "0.14.0",
+      "purl": "pkg:cargo/phf_shared@0.14.0",
+      "description": "Support code shared by PHF libraries",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-phf/rust-phf"
         }
       ]
     },
@@ -2609,10 +2723,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/serde@1.0.228",
+      "bom-ref": "pkg:cargo/serde@1.0.229",
       "name": "serde",
-      "version": "1.0.228",
-      "purl": "pkg:cargo/serde@1.0.228",
+      "version": "1.0.229",
+      "purl": "pkg:cargo/serde@1.0.229",
       "description": "A generic serialization/deserialization framework",
       "licenses": [
         {
@@ -2632,10 +2746,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/serde_core@1.0.228",
+      "bom-ref": "pkg:cargo/serde_core@1.0.229",
       "name": "serde_core",
-      "version": "1.0.228",
-      "purl": "pkg:cargo/serde_core@1.0.228",
+      "version": "1.0.229",
+      "purl": "pkg:cargo/serde_core@1.0.229",
       "description": "Serde traits only, with no support for derive -- use the `serde` crate instead",
       "licenses": [
         {
@@ -2655,10 +2769,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/serde_derive@1.0.228",
+      "bom-ref": "pkg:cargo/serde_derive@1.0.229",
       "name": "serde_derive",
-      "version": "1.0.228",
-      "purl": "pkg:cargo/serde_derive@1.0.228",
+      "version": "1.0.229",
+      "purl": "pkg:cargo/serde_derive@1.0.229",
       "description": "Macros 1.1 implementation of #[derive(Serialize, Deserialize)]",
       "licenses": [
         {
@@ -2787,6 +2901,29 @@
         {
           "type": "vcs",
           "url": "https://github.com/rusticstuff/simdutf8"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/siphasher@1.0.4",
+      "name": "siphasher",
+      "version": "1.0.4",
+      "purl": "pkg:cargo/siphasher@1.0.4",
+      "description": "SipHash-2-4 and SipHash-1-3 keyed hash functions in pure Rust, with 64-bit and 128-bit output and no_std support",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jedisct1/rust-siphash"
+        },
+        {
+          "type": "website",
+          "url": "https://docs.rs/siphasher"
         }
       ]
     },
@@ -3626,14 +3763,14 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/zstd@0.13.3",
+      "bom-ref": "pkg:cargo/zstd@0.14.2",
       "name": "zstd",
-      "version": "0.13.3",
-      "purl": "pkg:cargo/zstd@0.13.3",
+      "version": "0.14.2",
+      "purl": "pkg:cargo/zstd@0.14.2",
       "description": "Binding for the zstd compression library.",
       "licenses": [
         {
-          "expression": "MIT"
+          "expression": "BSD-3-Clause"
         }
       ],
       "externalReferences": [
@@ -3645,14 +3782,14 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/zstd-safe@7.2.4",
+      "bom-ref": "pkg:cargo/zstd-safe@8.1.0",
       "name": "zstd-safe",
-      "version": "7.2.4",
-      "purl": "pkg:cargo/zstd-safe@7.2.4",
+      "version": "8.1.0",
+      "purl": "pkg:cargo/zstd-safe@8.1.0",
       "description": "Safe low-level bindings for the zstd compression library.",
       "licenses": [
         {
-          "expression": "MIT OR Apache-2.0"
+          "expression": "BSD-3-Clause"
         }
       ],
       "externalReferences": [
@@ -3664,14 +3801,14 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/zstd-sys@2.0.16+zstd.1.5.7",
+      "bom-ref": "pkg:cargo/zstd-sys@2.1.1+zstd.1.5.7",
       "name": "zstd-sys",
-      "version": "2.0.16+zstd.1.5.7",
-      "purl": "pkg:cargo/zstd-sys@2.0.16+zstd.1.5.7",
+      "version": "2.1.1+zstd.1.5.7",
+      "purl": "pkg:cargo/zstd-sys@2.1.1+zstd.1.5.7",
       "description": "Low-level bindings for the zstd compression library.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "BSD-3-Clause"
         }
       ],
       "externalReferences": [
@@ -3755,23 +3892,23 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/arrow-arith@59.3.0",
+      "ref": "pkg:cargo/arrow-arith@60.0.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.3.0",
-        "pkg:cargo/arrow-buffer@59.3.0",
-        "pkg:cargo/arrow-data@59.3.0",
-        "pkg:cargo/arrow-schema@59.3.0",
+        "pkg:cargo/arrow-array@60.0.0",
+        "pkg:cargo/arrow-buffer@60.0.0",
+        "pkg:cargo/arrow-data@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0",
         "pkg:cargo/chrono@0.4.45",
         "pkg:cargo/num-traits@0.2.19"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-array@59.3.0",
+      "ref": "pkg:cargo/arrow-array@60.0.0",
       "dependsOn": [
         "pkg:cargo/ahash@0.8.12",
-        "pkg:cargo/arrow-buffer@59.3.0",
-        "pkg:cargo/arrow-data@59.3.0",
-        "pkg:cargo/arrow-schema@59.3.0",
+        "pkg:cargo/arrow-buffer@60.0.0",
+        "pkg:cargo/arrow-data@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0",
         "pkg:cargo/chrono@0.4.45",
         "pkg:cargo/half@2.7.1",
         "pkg:cargo/hashbrown@0.17.1",
@@ -3781,27 +3918,27 @@
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-buffer@59.3.0",
+      "ref": "pkg:cargo/arrow-buffer@60.0.0",
       "dependsOn": [
-        "pkg:cargo/bytes@1.12.0",
+        "pkg:cargo/bytes@1.12.1",
         "pkg:cargo/half@2.7.1",
         "pkg:cargo/num-bigint@0.5.1",
         "pkg:cargo/num-traits@0.2.19"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-cast@59.3.0",
+      "ref": "pkg:cargo/arrow-cast@60.0.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.3.0",
-        "pkg:cargo/arrow-buffer@59.3.0",
-        "pkg:cargo/arrow-data@59.3.0",
-        "pkg:cargo/arrow-ord@59.3.0",
-        "pkg:cargo/arrow-schema@59.3.0",
-        "pkg:cargo/arrow-select@59.3.0",
-        "pkg:cargo/atoi@2.0.0",
+        "pkg:cargo/arrow-array@60.0.0",
+        "pkg:cargo/arrow-buffer@60.0.0",
+        "pkg:cargo/arrow-data@60.0.0",
+        "pkg:cargo/arrow-ord@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0",
+        "pkg:cargo/arrow-select@60.0.0",
+        "pkg:cargo/atoi@3.1.0",
         "pkg:cargo/base64@0.23.1",
         "pkg:cargo/chrono@0.4.45",
-        "pkg:cargo/comfy-table@7.2.2",
+        "pkg:cargo/comfy-table@8.0.1",
         "pkg:cargo/half@2.7.1",
         "pkg:cargo/lexical-core@1.0.6",
         "pkg:cargo/num-traits@0.2.19",
@@ -3809,11 +3946,19 @@
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-csv@59.3.0",
+      "ref": "pkg:cargo/arrow-cmp@60.0.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.3.0",
-        "pkg:cargo/arrow-cast@59.3.0",
-        "pkg:cargo/arrow-schema@59.3.0",
+        "pkg:cargo/arrow-array@60.0.0",
+        "pkg:cargo/arrow-buffer@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/arrow-csv@60.0.0",
+      "dependsOn": [
+        "pkg:cargo/arrow-array@60.0.0",
+        "pkg:cargo/arrow-cast@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0",
         "pkg:cargo/chrono@0.4.45",
         "pkg:cargo/csv-core@0.1.13",
         "pkg:cargo/csv@1.4.0",
@@ -3821,35 +3966,35 @@
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-data@59.3.0",
+      "ref": "pkg:cargo/arrow-data@60.0.0",
       "dependsOn": [
-        "pkg:cargo/arrow-buffer@59.3.0",
-        "pkg:cargo/arrow-schema@59.3.0",
+        "pkg:cargo/arrow-buffer@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0",
         "pkg:cargo/half@2.7.1",
         "pkg:cargo/num-integer@0.1.46",
         "pkg:cargo/num-traits@0.2.19"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-ipc@59.3.0",
+      "ref": "pkg:cargo/arrow-ipc@60.0.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.3.0",
-        "pkg:cargo/arrow-buffer@59.3.0",
-        "pkg:cargo/arrow-data@59.3.0",
-        "pkg:cargo/arrow-schema@59.3.0",
-        "pkg:cargo/arrow-select@59.3.0",
+        "pkg:cargo/arrow-array@60.0.0",
+        "pkg:cargo/arrow-buffer@60.0.0",
+        "pkg:cargo/arrow-data@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0",
+        "pkg:cargo/arrow-select@60.0.0",
         "pkg:cargo/flatbuffers@25.12.19"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-json@59.3.0",
+      "ref": "pkg:cargo/arrow-json@60.0.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.3.0",
-        "pkg:cargo/arrow-buffer@59.3.0",
-        "pkg:cargo/arrow-cast@59.3.0",
-        "pkg:cargo/arrow-ord@59.3.0",
-        "pkg:cargo/arrow-schema@59.3.0",
-        "pkg:cargo/arrow-select@59.3.0",
+        "pkg:cargo/arrow-array@60.0.0",
+        "pkg:cargo/arrow-buffer@60.0.0",
+        "pkg:cargo/arrow-cast@60.0.0",
+        "pkg:cargo/arrow-ord@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0",
+        "pkg:cargo/arrow-select@60.0.0",
         "pkg:cargo/chrono@0.4.45",
         "pkg:cargo/half@2.7.1",
         "pkg:cargo/indexmap@2.14.0",
@@ -3858,54 +4003,56 @@
         "pkg:cargo/memchr@2.8.2",
         "pkg:cargo/num-traits@0.2.19",
         "pkg:cargo/ryu@1.0.23",
-        "pkg:cargo/serde_core@1.0.228",
+        "pkg:cargo/serde_core@1.0.229",
         "pkg:cargo/serde_json@1.0.151",
         "pkg:cargo/simdutf8@0.1.5"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-ord@59.3.0",
+      "ref": "pkg:cargo/arrow-ord@60.0.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.3.0",
-        "pkg:cargo/arrow-buffer@59.3.0",
-        "pkg:cargo/arrow-data@59.3.0",
-        "pkg:cargo/arrow-schema@59.3.0",
-        "pkg:cargo/arrow-select@59.3.0"
+        "pkg:cargo/arrow-array@60.0.0",
+        "pkg:cargo/arrow-buffer@60.0.0",
+        "pkg:cargo/arrow-cmp@60.0.0",
+        "pkg:cargo/arrow-data@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0",
+        "pkg:cargo/arrow-select@60.0.0"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-row@59.3.0",
+      "ref": "pkg:cargo/arrow-row@60.0.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.3.0",
-        "pkg:cargo/arrow-buffer@59.3.0",
-        "pkg:cargo/arrow-data@59.3.0",
-        "pkg:cargo/arrow-schema@59.3.0",
+        "pkg:cargo/arrow-array@60.0.0",
+        "pkg:cargo/arrow-buffer@60.0.0",
+        "pkg:cargo/arrow-data@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0",
         "pkg:cargo/half@2.7.1"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-schema@59.3.0",
+      "ref": "pkg:cargo/arrow-schema@60.0.0",
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/arrow-select@59.3.0",
+      "ref": "pkg:cargo/arrow-select@60.0.0",
       "dependsOn": [
         "pkg:cargo/ahash@0.8.12",
-        "pkg:cargo/arrow-array@59.3.0",
-        "pkg:cargo/arrow-buffer@59.3.0",
-        "pkg:cargo/arrow-data@59.3.0",
-        "pkg:cargo/arrow-schema@59.3.0",
+        "pkg:cargo/arrow-array@60.0.0",
+        "pkg:cargo/arrow-buffer@60.0.0",
+        "pkg:cargo/arrow-cmp@60.0.0",
+        "pkg:cargo/arrow-data@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0",
         "pkg:cargo/num-traits@0.2.19"
       ]
     },
     {
-      "ref": "pkg:cargo/arrow-string@59.3.0",
+      "ref": "pkg:cargo/arrow-string@60.0.0",
       "dependsOn": [
-        "pkg:cargo/arrow-array@59.3.0",
-        "pkg:cargo/arrow-buffer@59.3.0",
-        "pkg:cargo/arrow-data@59.3.0",
-        "pkg:cargo/arrow-schema@59.3.0",
-        "pkg:cargo/arrow-select@59.3.0",
+        "pkg:cargo/arrow-array@60.0.0",
+        "pkg:cargo/arrow-buffer@60.0.0",
+        "pkg:cargo/arrow-data@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0",
+        "pkg:cargo/arrow-select@60.0.0",
         "pkg:cargo/memchr@2.8.2",
         "pkg:cargo/num-traits@0.2.19",
         "pkg:cargo/regex-syntax@0.8.11",
@@ -3913,25 +4060,25 @@
       ]
     },
     {
-      "ref": "pkg:cargo/arrow@59.3.0",
+      "ref": "pkg:cargo/arrow@60.0.0",
       "dependsOn": [
-        "pkg:cargo/arrow-arith@59.3.0",
-        "pkg:cargo/arrow-array@59.3.0",
-        "pkg:cargo/arrow-buffer@59.3.0",
-        "pkg:cargo/arrow-cast@59.3.0",
-        "pkg:cargo/arrow-csv@59.3.0",
-        "pkg:cargo/arrow-data@59.3.0",
-        "pkg:cargo/arrow-ipc@59.3.0",
-        "pkg:cargo/arrow-json@59.3.0",
-        "pkg:cargo/arrow-ord@59.3.0",
-        "pkg:cargo/arrow-row@59.3.0",
-        "pkg:cargo/arrow-schema@59.3.0",
-        "pkg:cargo/arrow-select@59.3.0",
-        "pkg:cargo/arrow-string@59.3.0"
+        "pkg:cargo/arrow-arith@60.0.0",
+        "pkg:cargo/arrow-array@60.0.0",
+        "pkg:cargo/arrow-buffer@60.0.0",
+        "pkg:cargo/arrow-cast@60.0.0",
+        "pkg:cargo/arrow-csv@60.0.0",
+        "pkg:cargo/arrow-data@60.0.0",
+        "pkg:cargo/arrow-ipc@60.0.0",
+        "pkg:cargo/arrow-json@60.0.0",
+        "pkg:cargo/arrow-ord@60.0.0",
+        "pkg:cargo/arrow-row@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0",
+        "pkg:cargo/arrow-select@60.0.0",
+        "pkg:cargo/arrow-string@60.0.0"
       ]
     },
     {
-      "ref": "pkg:cargo/atoi@2.0.0",
+      "ref": "pkg:cargo/atoi@3.1.0",
       "dependsOn": [
         "pkg:cargo/num-traits@0.2.19"
       ]
@@ -3980,7 +4127,7 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/bytes@1.12.0",
+      "ref": "pkg:cargo/bytes@1.12.1",
       "dependsOn": []
     },
     {
@@ -4007,14 +4154,14 @@
       ]
     },
     {
-      "ref": "pkg:cargo/clap@4.6.6",
+      "ref": "pkg:cargo/clap@4.6.7",
       "dependsOn": [
-        "pkg:cargo/clap_builder@4.6.6",
-        "pkg:cargo/clap_derive@4.6.4"
+        "pkg:cargo/clap_builder@4.6.7",
+        "pkg:cargo/clap_derive@4.6.7"
       ]
     },
     {
-      "ref": "pkg:cargo/clap_builder@4.6.6",
+      "ref": "pkg:cargo/clap_builder@4.6.7",
       "dependsOn": [
         "pkg:cargo/anstream@1.0.0",
         "pkg:cargo/anstyle@1.0.14",
@@ -4023,7 +4170,7 @@
       ]
     },
     {
-      "ref": "pkg:cargo/clap_derive@4.6.4",
+      "ref": "pkg:cargo/clap_derive@4.6.7",
       "dependsOn": [
         "pkg:cargo/heck@0.5.0",
         "pkg:cargo/proc-macro2@1.0.106",
@@ -4040,7 +4187,7 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/comfy-table@7.2.2",
+      "ref": "pkg:cargo/comfy-table@8.0.1",
       "dependsOn": [
         "pkg:cargo/unicode-segmentation@1.13.3",
         "pkg:cargo/unicode-width@0.2.2"
@@ -4123,7 +4270,7 @@
         "pkg:cargo/csv-core@0.1.13",
         "pkg:cargo/itoa@1.0.18",
         "pkg:cargo/ryu@1.0.23",
-        "pkg:cargo/serde_core@1.0.228"
+        "pkg:cargo/serde_core@1.0.229"
       ]
     },
     {
@@ -4146,6 +4293,10 @@
     },
     {
       "ref": "pkg:cargo/equivalent@1.0.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/fastrand@2.5.0",
       "dependsOn": []
     },
     {
@@ -4263,8 +4414,8 @@
       "dependsOn": [
         "pkg:cargo/equivalent@1.0.2",
         "pkg:cargo/hashbrown@0.17.1",
-        "pkg:cargo/serde@1.0.228",
-        "pkg:cargo/serde_core@1.0.228"
+        "pkg:cargo/serde@1.0.229",
+        "pkg:cargo/serde_core@1.0.229"
       ]
     },
     {
@@ -4376,25 +4527,25 @@
       ]
     },
     {
-      "ref": "pkg:cargo/mumdia-core@0.5.0",
+      "ref": "pkg:cargo/mumdia-core@0.6.0",
       "dependsOn": [
-        "pkg:cargo/serde@1.0.228",
+        "pkg:cargo/serde@1.0.229",
         "pkg:cargo/serde_json@1.0.151",
         "pkg:cargo/thiserror@2.0.20",
         "pkg:cargo/tracing@0.1.44"
       ]
     },
     {
-      "ref": "pkg:cargo/mumdia-io@0.5.0",
+      "ref": "pkg:cargo/mumdia-io@0.6.0",
       "dependsOn": [
         "pkg:cargo/anyhow@1.0.104",
-        "pkg:cargo/arrow@59.3.0",
+        "pkg:cargo/arrow@60.0.0",
         "pkg:cargo/blake3@1.8.7",
-        "pkg:cargo/bytes@1.12.0",
-        "pkg:cargo/mumdia-core@0.5.0",
-        "pkg:cargo/parquet@59.3.0",
+        "pkg:cargo/bytes@1.12.1",
+        "pkg:cargo/mumdia-core@0.6.0",
+        "pkg:cargo/parquet@60.0.0",
         "pkg:cargo/rayon@1.12.0",
-        "pkg:cargo/serde@1.0.228",
+        "pkg:cargo/serde@1.0.229",
         "pkg:cargo/serde_json@1.0.151",
         "pkg:cargo/thiserror@2.0.20",
         "pkg:cargo/tracing-subscriber@0.3.23",
@@ -4402,20 +4553,20 @@
       ]
     },
     {
-      "ref": "pkg:cargo/mumdia@0.5.0",
+      "ref": "pkg:cargo/mumdia@0.6.0",
       "dependsOn": [
         "pkg:cargo/anyhow@1.0.104",
-        "pkg:cargo/arrow@59.3.0",
+        "pkg:cargo/arrow@60.0.0",
         "pkg:cargo/blake3@1.8.7",
-        "pkg:cargo/clap@4.6.6",
+        "pkg:cargo/clap@4.6.7",
         "pkg:cargo/mimalloc@0.1.52",
-        "pkg:cargo/mumdia-core@0.5.0",
-        "pkg:cargo/mumdia-io@0.5.0",
-        "pkg:cargo/mzdata-bindata@0.66.6",
-        "pkg:cargo/mzdata@0.66.6",
-        "pkg:cargo/parquet@59.3.0",
+        "pkg:cargo/mumdia-core@0.6.0",
+        "pkg:cargo/mumdia-io@0.6.0",
+        "pkg:cargo/mzdata-bindata@0.67.4",
+        "pkg:cargo/mzdata@0.67.4",
+        "pkg:cargo/parquet@60.0.0",
         "pkg:cargo/rayon@1.12.0",
-        "pkg:cargo/serde@1.0.228",
+        "pkg:cargo/serde@1.0.229",
         "pkg:cargo/serde_json@1.0.151",
         "pkg:cargo/thiserror@2.0.20",
         "pkg:cargo/tracing-subscriber@0.3.23",
@@ -4423,53 +4574,54 @@
       ]
     },
     {
-      "ref": "pkg:cargo/mzdata-bindata@0.66.6",
+      "ref": "pkg:cargo/mzdata-bindata@0.67.4",
       "dependsOn": [
         "pkg:cargo/base64-simd@0.8.0",
         "pkg:cargo/bytemuck@1.25.0",
         "pkg:cargo/flate2@1.1.9",
+        "pkg:cargo/identity-hash@0.1.0",
         "pkg:cargo/log@0.4.33",
-        "pkg:cargo/mzdata-param@0.66.6",
+        "pkg:cargo/mzdata-param@0.67.4",
         "pkg:cargo/mzpeaks@1.0.9",
         "pkg:cargo/num-traits@0.2.19",
         "pkg:cargo/thiserror@2.0.20"
       ]
     },
     {
-      "ref": "pkg:cargo/mzdata-meta@0.66.6",
+      "ref": "pkg:cargo/mzdata-meta@0.67.4",
       "dependsOn": [
         "pkg:cargo/bitflags@2.13.0",
         "pkg:cargo/chrono@0.4.45",
         "pkg:cargo/log@0.4.33",
-        "pkg:cargo/mzdata-bindata@0.66.6",
-        "pkg:cargo/mzdata-param@0.66.6",
+        "pkg:cargo/mzdata-bindata@0.67.4",
+        "pkg:cargo/mzdata-param@0.67.4",
         "pkg:cargo/num-traits@0.2.19",
         "pkg:cargo/regex@1.12.4",
         "pkg:cargo/thiserror@2.0.20"
       ]
     },
     {
-      "ref": "pkg:cargo/mzdata-param@0.66.6",
+      "ref": "pkg:cargo/mzdata-param@0.67.4",
       "dependsOn": [
         "pkg:cargo/log@0.4.33",
         "pkg:cargo/thiserror@2.0.20"
       ]
     },
     {
-      "ref": "pkg:cargo/mzdata-spectrum@0.66.6",
+      "ref": "pkg:cargo/mzdata-spectrum@0.67.4",
       "dependsOn": [
         "pkg:cargo/identity-hash@0.1.0",
         "pkg:cargo/log@0.4.33",
-        "pkg:cargo/mzdata-bindata@0.66.6",
-        "pkg:cargo/mzdata-meta@0.66.6",
-        "pkg:cargo/mzdata-param@0.66.6",
+        "pkg:cargo/mzdata-bindata@0.67.4",
+        "pkg:cargo/mzdata-meta@0.67.4",
+        "pkg:cargo/mzdata-param@0.67.4",
         "pkg:cargo/mzpeaks@1.0.9",
         "pkg:cargo/num-traits@0.2.19",
         "pkg:cargo/thiserror@2.0.20"
       ]
     },
     {
-      "ref": "pkg:cargo/mzdata@0.66.6",
+      "ref": "pkg:cargo/mzdata@0.67.4",
       "dependsOn": [
         "pkg:cargo/base64-simd@0.8.0",
         "pkg:cargo/bitflags@2.13.0",
@@ -4481,13 +4633,13 @@
         "pkg:cargo/identity-hash@0.1.0",
         "pkg:cargo/indexmap@2.14.0",
         "pkg:cargo/log@0.4.33",
-        "pkg:cargo/memchr@2.8.2",
-        "pkg:cargo/mzdata-bindata@0.66.6",
-        "pkg:cargo/mzdata-meta@0.66.6",
-        "pkg:cargo/mzdata-param@0.66.6",
-        "pkg:cargo/mzdata-spectrum@0.66.6",
+        "pkg:cargo/mzdata-bindata@0.67.4",
+        "pkg:cargo/mzdata-meta@0.67.4",
+        "pkg:cargo/mzdata-param@0.67.4",
+        "pkg:cargo/mzdata-spectrum@0.67.4",
         "pkg:cargo/mzpeaks@1.0.9",
         "pkg:cargo/num-traits@0.2.19",
+        "pkg:cargo/phf@0.14.0",
         "pkg:cargo/quick-xml@0.41.0",
         "pkg:cargo/regex@1.12.4",
         "pkg:cargo/sha1@0.11.0",
@@ -4545,17 +4697,17 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/parquet@59.3.0",
+      "ref": "pkg:cargo/parquet@60.0.0",
       "dependsOn": [
         "pkg:cargo/ahash@0.8.12",
-        "pkg:cargo/arrow-array@59.3.0",
-        "pkg:cargo/arrow-buffer@59.3.0",
-        "pkg:cargo/arrow-data@59.3.0",
-        "pkg:cargo/arrow-ipc@59.3.0",
-        "pkg:cargo/arrow-schema@59.3.0",
-        "pkg:cargo/arrow-select@59.3.0",
+        "pkg:cargo/arrow-array@60.0.0",
+        "pkg:cargo/arrow-buffer@60.0.0",
+        "pkg:cargo/arrow-data@60.0.0",
+        "pkg:cargo/arrow-ipc@60.0.0",
+        "pkg:cargo/arrow-schema@60.0.0",
+        "pkg:cargo/arrow-select@60.0.0",
         "pkg:cargo/base64@0.23.1",
-        "pkg:cargo/bytes@1.12.0",
+        "pkg:cargo/bytes@1.12.1",
         "pkg:cargo/chrono@0.4.45",
         "pkg:cargo/half@2.7.1",
         "pkg:cargo/hashbrown@0.17.1",
@@ -4565,7 +4717,38 @@
         "pkg:cargo/seq-macro@0.3.6",
         "pkg:cargo/snap@1.1.1",
         "pkg:cargo/twox-hash@2.1.2",
-        "pkg:cargo/zstd@0.13.3"
+        "pkg:cargo/zstd@0.14.2"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/phf@0.14.0",
+      "dependsOn": [
+        "pkg:cargo/phf_macros@0.14.0",
+        "pkg:cargo/phf_shared@0.14.0",
+        "pkg:cargo/serde@1.0.229"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/phf_generator@0.14.0",
+      "dependsOn": [
+        "pkg:cargo/fastrand@2.5.0",
+        "pkg:cargo/phf_shared@0.14.0"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/phf_macros@0.14.0",
+      "dependsOn": [
+        "pkg:cargo/phf_generator@0.14.0",
+        "pkg:cargo/phf_shared@0.14.0",
+        "pkg:cargo/proc-macro2@1.0.106",
+        "pkg:cargo/quote@1.0.46",
+        "pkg:cargo/syn@2.0.118"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/phf_shared@0.14.0",
+      "dependsOn": [
+        "pkg:cargo/siphasher@1.0.4"
       ]
     },
     {
@@ -4585,8 +4768,7 @@
     {
       "ref": "pkg:cargo/quick-xml@0.41.0",
       "dependsOn": [
-        "pkg:cargo/memchr@2.8.2",
-        "pkg:cargo/serde@1.0.228"
+        "pkg:cargo/memchr@2.8.2"
       ]
     },
     {
@@ -4661,24 +4843,24 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/serde@1.0.228",
+      "ref": "pkg:cargo/serde@1.0.229",
       "dependsOn": [
-        "pkg:cargo/serde_core@1.0.228",
-        "pkg:cargo/serde_derive@1.0.228"
+        "pkg:cargo/serde_core@1.0.229",
+        "pkg:cargo/serde_derive@1.0.229"
       ]
     },
     {
-      "ref": "pkg:cargo/serde_core@1.0.228",
+      "ref": "pkg:cargo/serde_core@1.0.229",
       "dependsOn": [
-        "pkg:cargo/serde_derive@1.0.228"
+        "pkg:cargo/serde_derive@1.0.229"
       ]
     },
     {
-      "ref": "pkg:cargo/serde_derive@1.0.228",
+      "ref": "pkg:cargo/serde_derive@1.0.229",
       "dependsOn": [
         "pkg:cargo/proc-macro2@1.0.106",
         "pkg:cargo/quote@1.0.46",
-        "pkg:cargo/syn@2.0.118"
+        "pkg:cargo/syn@3.0.5"
       ]
     },
     {
@@ -4686,8 +4868,8 @@
       "dependsOn": [
         "pkg:cargo/itoa@1.0.18",
         "pkg:cargo/memchr@2.8.2",
-        "pkg:cargo/serde@1.0.228",
-        "pkg:cargo/serde_core@1.0.228",
+        "pkg:cargo/serde@1.0.229",
+        "pkg:cargo/serde_core@1.0.229",
         "pkg:cargo/zmij@1.0.21"
       ]
     },
@@ -4715,6 +4897,10 @@
     },
     {
       "ref": "pkg:cargo/simdutf8@0.1.5",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:cargo/siphasher@1.0.4",
       "dependsOn": []
     },
     {
@@ -4975,22 +5161,22 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:cargo/zstd-safe@7.2.4",
+      "ref": "pkg:cargo/zstd-safe@8.1.0",
       "dependsOn": [
-        "pkg:cargo/zstd-sys@2.0.16+zstd.1.5.7"
+        "pkg:cargo/zstd-sys@2.1.1+zstd.1.5.7"
       ]
     },
     {
-      "ref": "pkg:cargo/zstd-sys@2.0.16+zstd.1.5.7",
+      "ref": "pkg:cargo/zstd-sys@2.1.1+zstd.1.5.7",
       "dependsOn": [
         "pkg:cargo/cc@1.2.65",
         "pkg:cargo/pkg-config@0.3.34"
       ]
     },
     {
-      "ref": "pkg:cargo/zstd@0.13.3",
+      "ref": "pkg:cargo/zstd@0.14.2",
       "dependsOn": [
-        "pkg:cargo/zstd-safe@7.2.4"
+        "pkg:cargo/zstd-safe@8.1.0"
       ]
     }
   ]

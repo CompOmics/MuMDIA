@@ -91,6 +91,9 @@ const REQUIRED_MODULES: &[&str] = &[
 /// The optional MS2PIP environment's modules.
 const MS2PIP_MODULES: &[&str] = &["ms2pip", "numpy", "pandas"];
 
+/// The optional visDIA environment's modules: the viewer and the stack it serves with.
+const VISDIA_MODULES: &[&str] = &["mumdia_viewer", "dash", "duckdb", "pyarrow"];
+
 /// Which managed environment a call is about.
 ///
 /// Two exist because they must: MS2PIP and DeepLC cannot share one. Everything else
@@ -102,6 +105,9 @@ pub enum Env {
     Primary,
     /// MS2PIP, for FASTA-mode library building with predicted intensities.
     Ms2pip,
+    /// visDIA, the results viewer behind "Open in visDIA". Separate so its Dash and
+    /// DuckDB pins never meet the analysis packages.
+    Visdia,
 }
 
 impl Env {
@@ -109,6 +115,7 @@ impl Env {
         match self {
             Env::Primary => "python",
             Env::Ms2pip => "python-ms2pip",
+            Env::Visdia => "python-visdia",
         }
     }
 
@@ -116,6 +123,7 @@ impl Env {
         match self {
             Env::Primary => "console-requirements.txt",
             Env::Ms2pip => "console-ms2pip-requirements.txt",
+            Env::Visdia => "console-visdia-requirements.txt",
         }
     }
 
@@ -123,18 +131,27 @@ impl Env {
         match self {
             Env::Primary => REQUIRED_MODULES,
             Env::Ms2pip => MS2PIP_MODULES,
+            Env::Visdia => VISDIA_MODULES,
         }
     }
 
     /// Python version for this environment. MS2PIP pulls `pandas<2`, which has no
-    /// cp312 wheel, which is why both stay on 3.11.
+    /// cp312 wheel, which is why both stay on 3.11; visDIA needs 3.11 or newer and takes
+    /// the same.
     fn python_version(self) -> &'static str {
         "3.11"
     }
 }
 
 /// Packages whose version is worth reporting, because it changes results.
-const REPORT_VERSIONS: &[&str] = &["deeplc", "torch", "mokapot", "ms2pip", "numpy"];
+const REPORT_VERSIONS: &[&str] = &[
+    "deeplc",
+    "torch",
+    "mokapot",
+    "ms2pip",
+    "numpy",
+    "mumdia-viewer",
+];
 
 /// Lowercase hex of a digest.
 ///
@@ -297,12 +314,14 @@ pub fn find_uv() -> Option<PathBuf> {
 /// change only when the application itself is rebuilt.
 const REQUIREMENTS_PRIMARY: &str = include_str!("../../../env/console-requirements.txt");
 const REQUIREMENTS_MS2PIP: &str = include_str!("../../../env/console-ms2pip-requirements.txt");
+const REQUIREMENTS_VISDIA: &str = include_str!("../../../env/console-visdia-requirements.txt");
 
 /// The compiled-in requirements of `env`.
 fn requirements_text(env: Env) -> &'static str {
     match env {
         Env::Primary => REQUIREMENTS_PRIMARY,
         Env::Ms2pip => REQUIREMENTS_MS2PIP,
+        Env::Visdia => REQUIREMENTS_VISDIA,
     }
 }
 
@@ -435,6 +454,7 @@ pub fn status() -> Status {
 pub struct Installer {
     primary: Mutex<Status>,
     ms2pip: Mutex<Status>,
+    visdia: Mutex<Status>,
 }
 
 impl Installer {
@@ -442,6 +462,7 @@ impl Installer {
         match env {
             Env::Primary => &self.primary,
             Env::Ms2pip => &self.ms2pip,
+            Env::Visdia => &self.visdia,
         }
     }
 
@@ -757,6 +778,17 @@ fn inventory(root: &Path) -> Vec<Removable> {
             vec![
                 root.join(Env::Ms2pip.dir_name()),
                 root.join(Env::Ms2pip.requirements_name()),
+            ],
+        ),
+        (
+            "visdia",
+            "visDIA results viewer",
+            "The optional Python environment behind \"Open in visDIA\". Your results are \
+             not affected; the viewer only reads them.",
+            false,
+            vec![
+                root.join(Env::Visdia.dir_name()),
+                root.join(Env::Visdia.requirements_name()),
             ],
         ),
         (

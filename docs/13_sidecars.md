@@ -86,6 +86,7 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/mbr_worker.py` | MBR (Stage D3): cross-run RT transfer + permuted-RT decoy-transfer FDR |
 | `scripts/import_diann_lib.py` | Recipe: DIA-NN fragment-level parquet -> MuMDIA target `lib_precursors`+`lib_fragments`; streams the input row group by row group (two passes), so peak memory is the precursor table, not the fragment table |
 | `scripts/make_reverse_decoys.py` | Recipe: reverse-sequence decoys with no-target-overlap invariant |
+| `scripts/predict_decoys.py` | Recipe (default since 2026-10-09): replace the reverse decoys' copied intensities with DIA-NN's prediction for their sequences |
 | `scripts/make_shift_decoys.py` | Recipe: fragment-shift (CH2) decoys, DIA-NN-style terminal shift |
 | `scripts/augment_library.py` | Recipe: augment an imported library with its missing tryptic FASTA peptides, then hand off to a decoy builder |
 | `scripts/sort_fragments.py` | Recipe: rewrite a fragment table in `candidate_id` order (streaming bucket sort, in place); the writers above do this themselves since the range load, this is for tables written before |
@@ -208,6 +209,20 @@ code.
   peptidoform, charge, precursor_mz, predicted_irt, label(="target"), protein,
   n_fragments`. `<out_fragments>`: `candidate_id, mz, predicted_intensity, name,
   ion_type, ordinal, frag_charge` (`import_diann_lib.py:59-83`).
+
+**predict_decoys** (offline; the desktop DIA-NN build calls it)
+
+`predict_decoys.py build <in_prec> <in_frag> <out_prec> <out_frag> --diann <exe>` takes
+`make_reverse_decoys.py` output, writes the decoys as a DIA-NN library TSV (one placeholder
+fragment each), runs `diann --lib decoys.tsv --predictor --gen-spec-lib`, re-exports the
+`.speclib` as Parquet, imports it with `import_diann_lib.py`, and merges: target rows and
+fragments are kept, each decoy keeps its sequence, pairing, precursor m/z and iRT, and its
+fragments become DIA-NN's prediction. A decoy DIA-NN does not predict is dropped with its
+target (pair key `(peptidoform_id, charge)`). Shift decoys are refused, because they carry
+the target's own sequence. The merge streams both fragment tables by row group and ends with
+`sort_fragments_by_candidate`; on the 17.1M-precursor ProteoBench entrapment library it
+reproduced the bench prototype's output exactly (202,012,453 fragment rows). `tsv` and
+`merge` are exposed for a DIA-NN run made by hand.
 
 **make_reverse_decoys** / **make_shift_decoys** (offline; no Rust caller)
 - IN/OUT the same precursor+fragment schema as `import_diann_lib`, reading a

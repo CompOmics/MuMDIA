@@ -1,0 +1,12 @@
+# visDIA, the MuMDIA results viewer (github.com/CompOmics/visDIA), installed by the
+# desktop application for its "Open in visDIA" button.
+#
+# Its own environment, like MS2PIP's, so the viewer's Dash/DuckDB stack can never
+# constrain the analysis environment and the reverse.
+#
+# Pinned to one commit and fetched as GitHub's source archive: no git is needed on the
+# user's machine, and everyone who installs this release gets the same viewer. That
+# commit was checked against this release's outputs on 2026-10-10 (an experiment and a
+# single run: overview counts, identification table, precursor detail, mirror spectrum).
+# Move the pin together with a check of that kind.
+mumdia-viewer @ https://github.com/CompOmics/visDIA/archive/13b3a9c255885df93970fc070869928cd810fadf.zip

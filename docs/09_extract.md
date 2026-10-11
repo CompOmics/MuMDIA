@@ -743,13 +743,13 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 
 | Field | Default | Effect |
 |---|---|---|
-| `fixed_scan_window` | 3 | Minimum co-elution run length (`scan_window` floor); `.max(1)` at `extract.rs:1591` |
+| `fixed_scan_window` | 2 (3 before 2026-10-08) | Minimum co-elution run length (`scan_window` floor); `.max(1)` at `extract.rs:1591` |
 | `frag_tol_ppm` | 20.0 | Fragment match tolerance (overridden by `mass_cal`) |
-| `prec_tol_ppm` | 20.0 | MS1 isotope integration tolerance |
+| `prec_tol_ppm` | 3.0 (20.0 before 2026-10-08) | MS1 isotope integration tolerance, centred on the offset `ms1_calibrate` learns from the seed |
 | `presence_min_matched` | 3 | Tier-b: minimum distinct matched fragments (`extract.rs:1727`) |
 | `presence_min_fragments` | 3 | Acceptance: minimum distinct fragments (`extract.rs:1926`) |
 | `presence_min_coelution` | 2 | Min simultaneously-present fragments to extend a run (`extract.rs:1915`) |
-| `gate_min_score` | **0.2** | Pearson/gate threshold; 0 disables the gate. Measured better than 0.6 for both rescorers under the current defaults; see docs/18. Renamed from `min_frag_corr`, which is not a correlation under any `gate_mode` except by coincidence |
+| `gate_min_score` | **0.6** | Threshold of the active `gate_mode`; 0 disables the gate. Default since 2026-10-08 with `gate_mode = window_mean` (window-summed agreement minus an RT term; see CLAUDE.md, "Extraction gate and retention time"). Under the previous `apex_pearson` default it was 0.2, measured better than an apex-Pearson 0.6 (docs/18). Renamed from `min_frag_corr` |
 | `min_matched_fraction` | 0.0 | Acceptance: min matched/predicted fraction (default off) |
 | `apex_top_fragments` | 0 | Signature-ion count for apex; 0 -> default 3 (`extract.rs:1860`). Config marks it superseded by `apex_count_tol`, kept for compat (`config.rs:545`) |
 | `apex_rt_prior_s` | 0.0 | Gaussian RT-prior sigma on apex tiebreak; 0 = off |

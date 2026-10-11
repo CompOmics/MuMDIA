@@ -425,7 +425,7 @@ mod tests {
             .find(|f| f.path == "extract.gate_min_score")
             .expect("a known setting should be present");
         assert_eq!(gate.kind, "float");
-        assert_eq!(gate.default, json!(0.2));
+        assert_eq!(gate.default, json!(0.6));
         assert!(
             !gate.help.is_empty(),
             "help text should come from the doc comment"

@@ -496,7 +496,7 @@ jobs:
           if (-not $app) { Write-Error "the bundle lacks mumdia-console.exe"; exit 1 }
           $workers = @("deeplc_worker.py", "deeplc_finetune.py", "nn_rescore_worker.py",
                        "mokapot_worker.py", "ms2pip_worker.py", "mbr_worker.py",
-                       "import_diann_lib.py", "make_reverse_decoys.py", "_lib_io.py", "_unimod.py")
+                       "import_diann_lib.py", "make_reverse_decoys.py", "predict_decoys.py", "_lib_io.py", "_unimod.py")
           $required = @("binaries\mumdia.exe", "binaries\uv.exe") +
                       ($workers | ForEach-Object { "binaries\scripts\$_" })
           foreach ($r in $required) {
@@ -521,7 +521,7 @@ jobs:
           [ -n "$lib" ] || { echo "::error::the bundle lacks the engine"; exit 1; }
           [ -f "$lib/uv" ] || { echo "::error::the bundle lacks uv"; exit 1; }
           for f in deeplc_worker.py deeplc_finetune.py nn_rescore_worker.py mokapot_worker.py \
-                   ms2pip_worker.py mbr_worker.py import_diann_lib.py make_reverse_decoys.py _lib_io.py _unimod.py; do
+                   ms2pip_worker.py mbr_worker.py import_diann_lib.py make_reverse_decoys.py predict_decoys.py _lib_io.py _unimod.py; do
             [ -f "$lib/scripts/$f" ] || { echo "::error::the bundle lacks binaries/scripts/$f"; exit 1; }
           done
           "$lib/mumdia" --version

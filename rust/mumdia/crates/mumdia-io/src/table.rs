@@ -1133,15 +1133,12 @@ impl SpliceWriter {
                  one configuration"
             ));
         }
-        let column_indexes = meta.column_index();
-        let offset_indexes = meta.offset_index();
         let mut rows = 0u64;
         for (i, rg) in meta.row_groups().iter().enumerate() {
             if !keep(i) {
                 continue;
             }
-            let rg_column = column_indexes.and_then(|ci| ci.get(i));
-            let rg_offset = offset_indexes.and_then(|oi| oi.get(i));
+            let rg_index = meta.page_index_for_row_group(i);
             let mut out = w.next_row_group()?;
             for (j, col) in rg.columns().iter().enumerate() {
                 out.append_column(
@@ -1153,8 +1150,8 @@ impl SpliceWriter {
                         // The engine writes no bloom filters; the page index is carried
                         // through when the source has one.
                         bloom_filter: None,
-                        column_index: rg_column.and_then(|r| r.get(j)).cloned(),
-                        offset_index: rg_offset.and_then(|r| r.get(j)).cloned(),
+                        column_index: rg_index.column_index(j).cloned(),
+                        offset_index: rg_index.offset_index(j).cloned(),
                     },
                 )?;
             }
@@ -2932,11 +2929,30 @@ struct RowSpan {
 /// Whether row group `g` of `meta` carries an offset index (page locations) for every
 /// column, which is what lets a reader skip the pages before a row range.
 fn has_offset_index(meta: &ParquetMetaData, g: usize) -> bool {
-    meta.offset_index().is_some_and(|oi| {
-        oi.get(g).is_some_and(|cols| {
-            !cols.is_empty() && cols.iter().all(|c| !c.page_locations().is_empty())
-        })
-    })
+    let n_cols = meta.row_group(g).num_columns();
+    let index = meta.page_index_for_row_group(g);
+    n_cols > 0 && (0..n_cols).all(|c| index.page_locations(c).is_some_and(|l| !l.is_empty()))
+}
+
+/// The offset index of every row group and column, in the nested shape parquet 59 returned
+/// from `ParquetMetaData::offset_index` (parquet 60 serves it per row group). `None` when the
+/// footer's offset index was not loaded. Used by tests that walk all of it.
+pub fn offset_index_table(
+    meta: &ParquetMetaData,
+) -> Option<Vec<Vec<parquet::file::page_index::offset_index::OffsetIndexMetaData>>> {
+    if !meta.page_index().is_some_and(|p| p.has_offset_indexes()) {
+        return None;
+    }
+    Some(
+        (0..meta.num_row_groups())
+            .map(|g| {
+                let index = meta.page_index_for_row_group(g);
+                (0..meta.row_group(g).num_columns())
+                    .filter_map(|c| index.offset_index(c).cloned())
+                    .collect()
+            })
+            .collect(),
+    )
 }
 
 /// Per-row-group facts a caller can plan a partial read from without decoding anything:
@@ -3047,9 +3063,9 @@ impl TableFile {
             .projection_roots(Some(&[column]))?
             .expect("a projection")[0];
         let meta = self.meta.metadata();
-        let Some(oi) = meta.offset_index() else {
+        if !meta.page_index().is_some_and(|p| p.has_offset_indexes()) {
             return Ok(None);
-        };
+        }
         let descr = meta.file_metadata().schema_descr();
         let leaves: Vec<usize> = (0..descr.num_columns())
             .filter(|&c| descr.get_column_root_idx(c) == root)
@@ -3065,7 +3081,8 @@ impl TableFile {
                 // The starts inside the covered rows that every leaf shares.
                 let mut shared: Option<Vec<usize>> = None;
                 for &leaf in &leaves {
-                    let Some(locs) = oi.get(g).and_then(|cols| cols.get(leaf)) else {
+                    let index = meta.page_index_for_row_group(g);
+                    let Some(locs) = index.offset_index(leaf) else {
                         return Ok(None);
                     };
                     let locs = locs.page_locations();
@@ -6161,9 +6178,8 @@ mod encoding_tests {
         };
         let pages = |path: &str| -> Vec<usize> {
             let (_, meta) = splice_meta(path).unwrap();
-            let oi = meta
-                .offset_index()
-                .expect("the writers write an offset index");
+            let oi =
+                crate::table::offset_index_table(&meta).expect("the writers write an offset index");
             oi.iter()
                 .flat_map(|rg| rg.iter().map(|c| c.page_locations().len()))
                 .collect()
@@ -6845,9 +6861,8 @@ mod selection_tests {
         w.close().unwrap();
 
         let (_, meta) = splice_meta(&path).unwrap();
-        let oi = meta
-            .offset_index()
-            .expect("the writer writes an offset index");
+        let oi =
+            crate::table::offset_index_table(&meta).expect("the writer writes an offset index");
         assert!(meta.num_row_groups() >= 5);
         for rg in oi.iter() {
             let trace_pages = rg[2].page_locations().len();
@@ -7022,7 +7037,7 @@ mod selection_tests {
         w.close().unwrap();
 
         let (_, meta) = splice_meta(&path).unwrap();
-        let oi = meta.offset_index().expect("an offset index");
+        let oi = crate::table::offset_index_table(&meta).expect("an offset index");
         // Per leaf (1 = pair.x, 2 = pair.w), every page start as a file row.
         let mut leaf_starts: Vec<Vec<usize>> = vec![Vec::new(); 3];
         let mut group_starts: Vec<usize> = Vec::new();
@@ -7398,8 +7413,7 @@ mod writer_bench {
         // The data pages of a rewritten file, from its offset index, and one full read.
         let pages_and_read = |path: &str| -> (usize, f64) {
             let (_, meta) = splice_meta(path).unwrap();
-            let pages = meta
-                .offset_index()
+            let pages = crate::table::offset_index_table(&meta)
                 .map(|oi| {
                     oi.iter()
                         .flat_map(|rg| rg.iter().map(|c| c.page_locations().len()))

@@ -120,7 +120,7 @@ q-values. This is distinct from the seed search, whose only purpose is calibrati
 
 **gate (`gate_min_score`) and GateMode**. The extraction acceptance gate: a
 candidate is rejected when its observed-vs-predicted fragment agreement falls below
-`extract.gate_min_score` (default 0.2; 0 disables,
+`extract.gate_min_score` (default 0.6 with `gate_mode = window_mean` since 2026-10-08, previously 0.2 under `apex_pearson`; 0 disables,
 `rust/mumdia/crates/mumdia-core/src/config.rs:406`,
 `rust/mumdia/crates/mumdia-core/src/config.rs:522`). `GateMode` selects which
 agreement score is thresholded: `ApexPearson` (single-apex-scan intensity Pearson,

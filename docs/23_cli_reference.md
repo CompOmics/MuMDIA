@@ -515,6 +515,12 @@ Options:
           Directory for a sidecar classifier's files: the feature handoff, the fold keys, the worker's output and its streaming memmap. Default: `MUMDIA_SIDECAR_DIR` when set, else `sidecar_work` in the current directory. The files are removed once the scores are read back, unless `MUMDIA_KEEP_HANDOFF=1`
 
       --config <CONFIG>
+
+      --lib-fragments <LIB_FRAGMENTS>
+          Library fragments for shadow demotion (`rescore.shadow_min_shared`)
+
+      --isolation-windows <ISOLATION_WINDOWS>...
+          `isolation_windows.parquet` of each input run, in source order, for shadow demotion
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".

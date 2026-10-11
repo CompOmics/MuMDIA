@@ -72,11 +72,19 @@ pub const MIN_LOESS_CALIBRANTS: usize = 50;
 /// Panics on an empty slice; every caller goes through [`MassCal::fit_from`], which
 /// guards on [`MIN_CALIBRANTS`].
 pub fn fit(devs: &[f64]) -> (f64, f64) {
+    fit_floored(devs, DEFAULT_TOL_FLOOR_PPM)
+}
+
+/// The tolerance floor `fit` applies, and the default of `search_seed.frag_tol_floor_ppm`.
+pub const DEFAULT_TOL_FLOOR_PPM: f64 = 5.0;
+
+/// [`fit`] with the tolerance floored at `floor` ppm instead of 5.
+pub fn fit_floored(devs: &[f64], floor: f64) -> (f64, f64) {
     let mut sorted = devs.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let offset = sorted[sorted.len() / 2];
     let centered: Vec<f64> = devs.iter().map(|x| (x - offset).abs()).collect();
-    let tol = (crate::calibrate::percentile(&centered, 0.95) * 1.5).max(5.0);
+    let tol = (crate::calibrate::percentile(&centered, 0.95) * 1.5).max(floor);
     (offset, tol)
 }
 
@@ -113,7 +121,7 @@ impl MassCal {
     pub fn fit_from(devs: &[f64], dev_mz: &[f64], cfg: &SearchSeedConfig) -> MassCal {
         debug_assert_eq!(devs.len(), dev_mz.len());
         let (frag_ppm_offset, frag_tol_ppm, cal_passes) = if devs.len() >= MIN_CALIBRANTS {
-            let (o1, t1) = fit(devs);
+            let (o1, t1) = fit_floored(devs, cfg.frag_tol_floor_ppm);
             if cfg.two_pass_mass_cal {
                 // Second pass: keep only deviations inside the first-pass window, so
                 // random-match outliers cannot bias the offset, then re-fit.
@@ -123,7 +131,7 @@ impl MassCal {
                     .filter(|d| (d - o1).abs() <= t1)
                     .collect();
                 if inl.len() >= MIN_CALIBRANTS {
-                    let (o2, t2) = fit(&inl);
+                    let (o2, t2) = fit_floored(&inl, cfg.frag_tol_floor_ppm);
                     (o2, t2, 2)
                 } else {
                     (o1, t1, 1)

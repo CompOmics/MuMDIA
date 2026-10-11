@@ -369,6 +369,13 @@ enum Cmd {
         work_dir: Option<String>,
         #[arg(long)]
         config: Option<String>,
+        /// Library fragments for shadow demotion (`rescore.shadow_min_shared`).
+        #[arg(long)]
+        lib_fragments: Option<String>,
+        /// `isolation_windows.parquet` of each input run, in source order, for shadow
+        /// demotion.
+        #[arg(long, num_args = 1..)]
+        isolation_windows: Vec<String>,
     },
     /// Quantify identified peptides + roll up to protein groups.
     Quant {
@@ -1654,6 +1661,8 @@ fn real_main() -> Result<()> {
             out,
             work_dir,
             config,
+            lib_fragments,
+            isolation_windows,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
@@ -1667,6 +1676,12 @@ fn real_main() -> Result<()> {
                 script_dir: &cfg.predict_frag.sidecar_script_dir,
                 cfg: &cfg.rescore,
                 config_hash: &ch,
+                shadow: lib_fragments
+                    .as_deref()
+                    .map(|lf| stages::shadow::ShadowInputs {
+                        lib_fragments: lf,
+                        isolation_windows: &isolation_windows,
+                    }),
             })?;
         }
         Cmd::Run {

@@ -221,6 +221,14 @@ input[type="search"] {
   background: var(--panel); color: var(--ink); min-width: 130px;
 }
 .setting.changed .sname { color: var(--accent); }
+/* A plain name over the path, in the common section. */
+.setting .sname b { font-family: system-ui, sans-serif; font-weight: 600; }
+.setting .sname .spath { font-size: 11px; color: var(--ink-faint); font-weight: 400; margin-left: 6px; }
+/* The in-depth settings: closed by default, one click away. */
+details.advanced { margin-top: 22px; }
+details.advanced > summary { font-size: 13px; font-weight: 600; cursor: pointer;
+                             padding: 8px 0; border-top: 1px solid var(--rule); }
+details.advanced > summary .hint { font-weight: 400; margin-left: 8px; }
 .banner.ok { background: var(--ok-soft); border-color: var(--ok); color: var(--ink); }
 
 .files { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; }

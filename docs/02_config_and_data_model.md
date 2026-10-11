@@ -744,13 +744,13 @@ selection dominate.
 
 | Field | Default | Effect |
 |---|---|---|
-| `fixed_scan_window` | 3 | scan-window floor around the apex |
+| `fixed_scan_window` | 2 | scan-window floor around the apex (3 before 2026-10-08) |
 | `frag_tol_ppm` | 20.0 | fragment tolerance |
-| `prec_tol_ppm` | 20.0 | precursor tolerance |
+| `prec_tol_ppm` | 3.0 | precursor tolerance, centred on the learned MS1 offset when `ms1_calibrate` is on (20.0 before 2026-10-08) |
 | `presence_min_matched` | 3 | tier-(b) min matched fragment count |
 | `presence_min_fragments` | 3 | min distinct fragments for acceptance |
 | `presence_min_coelution` | 2 | min simultaneously-present fragments over the run |
-| `gate_min_score` | 0.2 | tier-(d) spectral-agreement gate (0 disables; must be in [0,1]). Renamed from `min_frag_corr` |
+| `gate_min_score` | 0.6 | tier-(d) gate threshold of the active `gate_mode` (default `window_mean` since 2026-10-08; 0 disables; must be in [0,1]). Renamed from `min_frag_corr` |
 | `min_matched_fraction` | 0.0 | tier-(c) min fraction of predicted fragments observed |
 | `apex_top_fragments` | 0 | signature-fragment apex: sums the observed intensity of the top-K predicted fragments per scan; `0` falls back to a default of 3 (`extract.rs:1857-1861`), not all-matched |
 | `apex_rt_prior_s` | 0.0 | Gaussian RT prior sigma on apex (0 = off) |

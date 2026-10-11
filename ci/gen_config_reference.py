@@ -1127,6 +1127,12 @@ PY_ENV_FN = re.compile(
 # Keep an entry in step with that function; a name that no longer appears among the reads
 # is an error, so a removed variable cannot leave a stale row behind.
 COMPUTED_ENV_DEFAULTS: dict[str, str] = {
+    "MUMDIA_WINDOW_FEATURES": (
+        "on when unset; `0` leaves the fixed-window feature family out (`features.rs` `families`)"
+    ),
+    "MUMDIA_RTW_FEATURES": (
+        "on when unset; `0` leaves the window-scaled RT error family out (`features.rs` `families`)"
+    ),
     "HOME": (
         "set by the operating system; on Unix and macOS the per-user cache directory "
         "under it holds the engine's caches when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`)"

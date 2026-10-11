@@ -47,7 +47,9 @@ mod novel;
 mod order_consistency;
 mod peak_scans;
 mod rt;
+mod rt_window;
 mod similarity;
+mod window;
 
 type FamilyFn = fn(&Evidence) -> Vec<f64>;
 
@@ -72,6 +74,25 @@ const FAMILIES: &[(&[&str], FamilyFn)] = &[
     (demix::NAMES, demix::values),
 ];
 
+/// The fixed-window integrated family ([`window`]) and the window-scaled RT error family
+/// ([`rt_window`]), appended after the registry. On by default since 2026-10-08;
+/// `MUMDIA_WINDOW_FEATURES=0` / `MUMDIA_RTW_FEATURES=0` leave a family out, which restores
+/// the previous schema.
+fn families() -> &'static [(&'static [&'static str], FamilyFn)] {
+    static F: std::sync::OnceLock<Vec<(&'static [&'static str], FamilyFn)>> =
+        std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        let mut v = FAMILIES.to_vec();
+        if std::env::var("MUMDIA_WINDOW_FEATURES").map_or(true, |x| x != "0") {
+            v.push((window::NAMES, window::values));
+        }
+        if std::env::var("MUMDIA_RTW_FEATURES").map_or(true, |x| x != "0") {
+            v.push((rt_window::NAMES, rt_window::values));
+        }
+        v
+    })
+}
+
 /// Names already used by the Minimal/Rich sets, which the extended battery must
 /// not shadow (a colliding extended feature is dropped, keeping the legacy one).
 fn reserved_names() -> std::collections::HashSet<&'static str> {
@@ -90,7 +111,7 @@ fn extended_name_refs() -> Vec<&'static str> {
     let reserved = reserved_names();
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for (names, _) in FAMILIES {
+    for (names, _) in families() {
         for &n in *names {
             if reserved.contains(n) {
                 continue;
@@ -119,8 +140,8 @@ fn extended_value_plan() -> &'static Vec<Vec<usize>> {
     PLAN.get_or_init(|| {
         let reserved = reserved_names();
         let mut seen = std::collections::HashSet::new();
-        let mut plan = Vec::with_capacity(FAMILIES.len());
-        for (names, _) in FAMILIES {
+        let mut plan = Vec::with_capacity(families().len());
+        for (names, _) in families() {
             let mut keep = Vec::new();
             for (i, &n) in names.iter().enumerate() {
                 if reserved.contains(n) {
@@ -143,7 +164,7 @@ fn extended_value_plan() -> &'static Vec<Vec<usize>> {
 fn extended_values(e: &Evidence) -> Vec<f64> {
     let plan = extended_value_plan();
     let mut out = Vec::with_capacity(plan.iter().map(|keep| keep.len()).sum());
-    for ((names, f), keep) in FAMILIES.iter().zip(plan) {
+    for ((names, f), keep) in families().iter().zip(plan) {
         let vals = f(e);
         debug_assert_eq!(
             vals.len(),
@@ -593,6 +614,11 @@ pub struct Evidence {
     // --- scalars (filled by the caller after build) ---
     pub apex_rt: f64,
     pub rt_pred_cal: f64,
+    /// The candidate's RT window (`extract.emit_rt_window`) and the run's global half-width
+    /// (the smallest half-width over all candidates); NaN when the table lacks them.
+    pub rt_lo: f64,
+    pub rt_hi: f64,
+    pub rt_w_global: f64,
     pub rt_err: f64,
     pub gradient: f64,
     pub precursor_mz: f64,
@@ -1040,6 +1066,9 @@ fn evidence_from(
         pair_stats: Some(stats),
         apex_rt,
         rt_pred_cal: 0.0,
+        rt_lo: f64::NAN,
+        rt_hi: f64::NAN,
+        rt_w_global: f64::NAN,
         rt_err: 0.0,
         gradient: 1.0,
         precursor_mz: 0.0,
@@ -2940,6 +2969,23 @@ fn run_chunked(
         .unwrap_or_else(|_| vec![6; ps.nrows]);
     let corun = ps.i32("coelution_run")?;
     let rt_cal = ps.f64("rt_pred_cal")?;
+    // The candidates' RT windows, when extract wrote them (`extract.emit_rt_window`). The
+    // windows only ever widen from the global one, so the smallest half-width over all
+    // rows is the run's global `w_rt`.
+    let (win_lo, win_hi) = if ps.has_column("rt_lo") && ps.has_column("rt_hi") {
+        (ps.f64("rt_lo")?, ps.f64("rt_hi")?)
+    } else {
+        (vec![f64::NAN; ps.nrows], vec![f64::NAN; ps.nrows])
+    };
+    let w_global = (0..ps.nrows)
+        .map(|i| (rt_cal[i] - win_lo[i]).min(win_hi[i] - rt_cal[i]))
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    let w_global = if w_global.is_finite() {
+        w_global
+    } else {
+        f64::NAN
+    };
     let charge = ps.i32("charge")?;
     let label = ps.str("label")?;
     let base = ps.u32("base_peptide_id")?;
@@ -3338,6 +3384,9 @@ fn run_chunked(
                         .unwrap_or_default();
                     let mut ev = evidence_from(&rows, al, obs, pred, peak, &ms1_rows, apex_rt[i]);
                     ev.rt_pred_cal = rt_cal[i];
+                    ev.rt_lo = win_lo[i];
+                    ev.rt_hi = win_hi[i];
+                    ev.rt_w_global = w_global;
                     ev.rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
                     ev.gradient = gradient;
                     ev.precursor_mz = mz[i];
@@ -6282,9 +6331,44 @@ mod tests {
         digest_as(v1_path, true)
     }
 
+    /// BLAKE3 of a PIN with the window and RT-window family columns removed: the golden PIN
+    /// hashes describe builds without those default-on families.
+    fn pin_hash_without_appended(path: &str) -> String {
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut lines = text.split('\n');
+        let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
+        let keep: Vec<bool> = header
+            .iter()
+            .map(|n| !window::NAMES.contains(n) && !rt_window::NAMES.contains(n))
+            .collect();
+        let strip = |line: &str| -> String {
+            line.split('\t')
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(f, _)| f)
+                .collect::<Vec<_>>()
+                .join("\t")
+        };
+        let mut out = vec![strip(&header.join("\t"))];
+        out.extend(lines.map(strip));
+        let stripped = out.join("\n");
+        if stripped == text {
+            return mumdia_io::hash::blake3_file(path).unwrap();
+        }
+        mumdia_io::hash::blake3_str(&stripped)
+    }
+
     fn digest_as(path: &str, narrow_to_v2: bool) -> (usize, usize, u64) {
         let t = mumdia_io::table::Table::read(path).unwrap();
-        let names = t.column_names();
+        // The window and RT-window families (default-on since 2026-10-08) are appended
+        // after the registry and are not part of the builds the golden digests describe.
+        let names: Vec<String> = t
+            .column_names()
+            .into_iter()
+            .filter(|n| {
+                !window::NAMES.contains(&n.as_str()) && !rt_window::NAMES.contains(&n.as_str())
+            })
+            .collect();
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         for name in &names {
             fnv(&mut h, name.as_bytes());
@@ -6468,7 +6552,7 @@ mod tests {
                 ),
             }
             assert_eq!(
-                mumdia_io::hash::blake3_file(&pin1).unwrap(),
+                pin_hash_without_appended(&pin1),
                 GOLDEN_PIN,
                 "chunk {tag}: the PIN bytes differ from the name-keyed assembly"
             );
@@ -6486,7 +6570,7 @@ mod tests {
                 "chunk {tag}: the v2 table is not the v1 table with its f32 columns narrowed"
             );
             assert_eq!(
-                mumdia_io::hash::blake3_file(&pin2).unwrap(),
+                pin_hash_without_appended(&pin2),
                 GOLDEN_PIN,
                 "chunk {tag}: the v2 layout moved the PIN bytes"
             );
@@ -6973,6 +7057,7 @@ mod tests {
                 script_dir: "scripts",
                 cfg: &rcfg,
                 config_hash: "test",
+                shadow: None,
             })
             .unwrap();
             std::fs::read(out).unwrap()

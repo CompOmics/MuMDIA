@@ -2474,6 +2474,19 @@ def main():
           f"OOF at {FOLDS} folds, backend={'stream' if stream else 'in-memory'}", flush=True)
 
 
+# Exit code for "nothing to train on": no feature, not even the loosened first selection,
+# yields a single target at the training FDR. The engine reads this code and ranks by its
+# prelim_score instead of failing the run (`rescore::NoTrainingSignal`).
+NO_TRAINING_SIGNAL_EXIT = 3
+NO_TRAINING_SIGNAL_TEXT = "selected no positive targets"
+
+
+def _first_line_with(text, needle):
+    """The line of `text` that contains `needle`, stripped; `text`'s last line otherwise."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return next((ln for ln in lines if needle in ln), lines[-1] if lines else "")
+
+
 def _entry():
     """Run `main`, then remove this run's files even when it failed.
 
@@ -2488,11 +2501,27 @@ def _entry():
         main()
     except SystemExit as exc:
         code = exc.code
-    except BaseException:  # noqa: BLE001 - reported below, then the worker exits nonzero
-        import traceback
+    except BaseException as exc:  # noqa: BLE001 - reported below, then the worker exits nonzero
+        if NO_TRAINING_SIGNAL_TEXT in str(exc):
+            # Not a crash: the data give the classifier nothing to learn from. Said in one
+            # line, without a traceback, and with the code the engine acts on.
+            print(
+                "nn_rescore_worker: no training signal: no feature separates targets from "
+                "decoys at the training FDR, so no classifier can be trained "
+                f"({_first_line_with(str(exc), NO_TRAINING_SIGNAL_TEXT)})",
+                file=sys.stderr,
+                flush=True,
+            )
+            # The full message as well (no traceback frames): for a parallel fold it carries
+            # the child's own log, the rescans and the init feature, which say how close the
+            # data came.
+            print(str(exc), file=sys.stderr, flush=True)
+            code = NO_TRAINING_SIGNAL_EXIT
+        else:
+            import traceback
 
-        traceback.print_exc()
-        code = 1
+            traceback.print_exc()
+            code = 1
     _remove_leftovers()
     if code is not None:
         sys.exit(code)

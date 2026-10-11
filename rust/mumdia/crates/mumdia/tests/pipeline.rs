@@ -296,6 +296,7 @@ fn features_compete_rescore_run_on_crafted_input() {
         script_dir: "scripts",
         cfg: &cfg.rescore,
         config_hash: "test",
+        shadow: None,
     })
     .unwrap();
     let t = Table::read(&scored).unwrap();
@@ -441,6 +442,7 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         script_dir: "scripts",
         cfg: &cfg.rescore,
         config_hash: "test",
+        shadow: None,
     })
     .unwrap();
     assert_written(&wscored, &scored);
@@ -496,6 +498,7 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
         script_dir: "scripts",
         cfg: &cfg.rescore,
         config_hash: "test",
+        shadow: None,
     })
     .unwrap();
     let (qpep, qprot, qfrag) = (

@@ -19,7 +19,11 @@ dependencies:
   - setuptools>=83
   - pip:
       - "numpy<2"
-      - pyarrow
+      # pyarrow 26.0.0 (released after 0.5.0) requires NumPy 2 at import without
+      # declaring it, so pip paired it with the numpy<2 above and the image's smoke test
+      # failed on `import ms2pip` ("pyarrow requires NumPy 2.0 or newer, found 1.26.4").
+      # 25.x is what the 0.5.0 image shipped.
+      - "pyarrow<26"
       - scikit-learn
       - mokapot==0.10.0
       # 4.2.0 is the version the FASTA-mode measurements were made with (docs/28
