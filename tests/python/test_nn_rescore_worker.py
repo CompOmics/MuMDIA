@@ -1080,12 +1080,18 @@ def test_failed_run_removes_its_memmap(torch_available, tmp_path):
                MUMDIA_NN_TRAIN_FDR="0.0000001", MUMDIA_NN_INIT_FDR_MAX="0")
     out = tmp_path / "failing.parquet"
     rc, _, err = run_worker("nn_rescore_worker.py", features, out, env=env)
-    assert rc != 0
+    # Nothing to train on is its own exit code, which the engine turns into a prelim_score
+    # ranking rather than a failed run (rescore::NoTrainingSignal).
+    assert rc == 3, err
+    assert "no training signal" in err
     assert "selected no positive targets" in err
     assert not (tmp_path / "failing.parquet.feat.mm").exists()
     rc, _, err = run_worker("nn_rescore_worker.py", features, out,
                             env=dict(env, MUMDIA_NN_STREAM="0", MUMDIA_NN_PARALLEL="2"))
-    assert rc != 0
+    # Nothing to train on is its own exit code, which the engine turns into a prelim_score
+    # ranking rather than a failed run (rescore::NoTrainingSignal).
+    assert rc == 3, err
+    assert "no training signal" in err
     assert "selected no positive targets" in err
     # A child's log reaches the parent only inside the exception, and it is what explains
     # the failure: the rescans and the init feature the fold started from.
