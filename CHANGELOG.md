@@ -7,8 +7,8 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
-`0.6.0` is a minor rather than a patch release: it changes what a search finds and how
-far its reported FDR can be trusted. The extraction gate is now the window-mean gate at 0.6
+`0.6.0` is a minor rather than a patch release: it changes what a search finds and how far its
+reported FDR can be trusted. The extraction gate is now the window-mean gate at 0.6
 (`extract.gate_mode = window_mean`) instead of the apex-Pearson gate at 0.2, and eight
 sensitivity options are on by default: the MS1 offset learned from the seed with a 3 ppm
 precursor tolerance (was 20), MS1 isotopes read over the nearest scan +-1, a widen-only local
@@ -17,16 +17,21 @@ new feature families (39 columns). Measured with one engine build against the 0.
 (single seed): a six-file Astral HYE experiment 116,683 -> 127,849 peptides at 1% in 14:41
 against 20:41 for the apex-Pearson gate, a six-file Orbitrap AIF HYE experiment 85,090 ->
 88,526, and the AIF entrapment run 11,282 -> 12,056 real precursors at a measured FDP of 1%,
-with a measured FDP of 1.00% at the reported 1%. Imported DIA-NN libraries now get decoys with
-DIA-NN-predicted spectra (`scripts/predict_decoys.py`, and the desktop build): the decoys
+with a measured FDP of 1.00% at the reported 1%. Two further defaults depend on the instrument
+the mzML header names: on an Orbitrap Astral the apex is counted on single scans
+(`extract.apex_count_window = "auto"`), and the seed's mass calibration takes two passes on
+every instrument (`search_seed.two_pass_mass_cal`). Together, as the mean of three NN seeds on
+Astral, they add 3.5% peptides on HYE and 2.1% precursors on the ProteoBench entrapment module
+at a paired FDP of 0.89%, and cost a single cell 0.7%. Imported DIA-NN libraries now get decoys
+with DIA-NN-predicted spectra (`scripts/predict_decoys.py`, and the desktop build): the decoys
 `make_reverse_decoys.py` builds copy their targets' intensities, and on the ProteoBench Astral
 entrapment module (FDRBench paired entrapment) that left a paired FDP of 1.68% at a reported
 precursor q of 1%, against 0.85% with predicted decoys, valid at every q cut, and 89,334
 precursors at 1%. A search on a library rebuilt this way reports fewer identifications at 1%
 than the same library with copied decoys (HYE -2.4%, single cells -2% to -14%,
 immunopeptidomics -17%) at unchanged sensitivity where an entrapment measures it: those counts
-were optimistic. No artifact schema version changed; `psms_extracted` gains `rt_lo`/`rt_hi`
-and `features` the `wf*` and `rtw_*` columns, so `classifier_feature_schema_id` changes. The
+were optimistic. No artifact schema version changed; `psms_extracted` gains `rt_lo`/`rt_hi` and
+`features` the `wf*` and `rtw_*` columns, so `classifier_feature_schema_id` changes. The
 desktop application starts on Setup, defaults to building the library with DIA-NN, and can
 install visDIA and open results in it.
 
@@ -86,70 +91,13 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
-## [Unreleased]
+## [0.6.0] - 2026-10-11
 
 ### Added
 
 - **The instrument is read from the mzML header** (`instrument.rs`). `convert` records the
   model (`MS:1003378` "Orbitrap Astral", `MS:1002877` "Q Exactive HF-X", ...) and whether an
   Astral analyzer is listed in every spectra report (`params.instrument`) and in the log.
-
-### Changed
-
-- **`extract.apex_count_window` defaults to `"auto"`**: 1 on an Orbitrap Astral, 5 on every
-  other instrument and on spectra converted before the instrument record existed. A number
-  is used as given. The example and Docker configurations no longer set 5. Window 1 against 5
-  on the 0.6.0 defaults, mean of three NN seeds: Astral HYE +1.3% peptides (125,561 ->
-  127,197), the ProteoBench Astral entrapment module +1.0% precursors (paired FDP 0.86% ->
-  0.84%), an Astral single cell +2.4% precursors, an Astral HeLa entrapment run +3.6% human
-  precursors at a measured FDP of 1% (FDP at the reported 1%: 0.89% -> 0.71%). On the
-  Orbitrap (one seed) AIF HYE -0.9% and the AIF entrapment run -0.8%, hence per instrument.
-  On every benchmark above, the new engine resolving "auto" was byte-identical to the
-  previous engine given the window explicitly.
-- **`search_seed.two_pass_mass_cal` defaults to `true`.** Mean of three NN seeds against the
-  0.6.0 defaults: Astral HYE +1.8% peptides, ProteoBench Astral entrapment +1.1% precursors,
-  Astral HeLa entrapment +2.0% human precursors at a measured FDP of 1%, Orbitrap AIF HYE
-  +0.5%. Two costs come with it. An Astral single cell loses 2.9% of its precursors, and the
-  measured FDP at a reported 1% rises a little in every entrapment test: AIF entrapment
-  0.99% -> 1.02% (real precursors at a measured 1%: -0.2%), ProteoBench paired 0.86% -> 0.88%,
-  HeLa 0.89% -> 0.97%. Set it to `false` for single-cell input or where that margin matters.
-  With both changes on Astral: HYE +3.5% peptides (130,000), ProteoBench +2.1% precursors at
-  a paired FDP of 0.89%, HeLa +3.4% at a measured FDP of 1%, the single cell -0.7%.
-- Of the other single-cell settings, `extract.presence_min_coelution = 1` raised the AIF
-  entrapment FDP at a reported 1% to 1.06%, `extract.apex_refine_intensity` cost 2.9% on the
-  Astral HeLa entrapment run and `rt_im_train.p_rt = 0.9` lost on both entrapment searches
-  (one seed each), so they keep their defaults.
-- **Dependencies**: arrow and parquet 59 -> 60, mzdata and mzdata-bindata 0.66 -> 0.67.4
-  (together; Dependabot proposed them separately, which left two mzdata-bindata versions in
-  the lockfile), bytes 1.12.1, clap 4.6.7, serde 1.0.229. parquet 60 serves the page index
-  per row group (`ParquetMetaData::page_index_for_row_group`) instead of as nested vectors;
-  the band splice and the partial-read planner use it. Smoke outputs are byte-identical to
-  0.6.0.
-- **The CI check of `THIRD_PARTY_LICENSES.md` and `sbom.cdx.json` tolerates crate versions**
-  (`ci/_lockfile_versions.py`). Dependabot does not run the generators, so every one of its
-  pull requests failed CI on a version string. The check still fails when a crate, a second
-  version of a crate, a licence or a notice changes; `--check --strict`, which the release
-  gate runs, compares exactly.
-
-### Fixed
-
-- **A search with no training signal finishes instead of failing.** When `nn_torch` cannot
-  select a single training positive (no feature separates targets from decoys at the training
-  FDR, even on the loosened first selection), the worker exits with code 3 and the engine
-  ranks by the untrained `prelim_score` with plain target-decoy competition, also under
-  `rescore.strict`, with a warning and `classifier = "prelim_score_no_training_signal"` in the
-  scored table's report. Found on a 2 uL single-cell Astral run searched with the desktop
-  defaults, which stopped in rescoring with no results; DIA-NN 2.7 found 2,901 precursors in
-  it, and MuMDIA with the single-cell settings 1,440.
-- **The desktop application writes each search's log to `mumdia-console.log`** in its results
-  folder. The interface kept the log only in memory, so a failed run could not be diagnosed
-  once the window closed.
-
-||||||| parent of 06452ae (docs, configs, tests: apex_count_window "auto" and two-pass mass calibration defaults)
-## [0.6.0] - 2026-10-10
-
-### Added
-
 - **Decoys with DIA-NN-predicted spectra for imported libraries** (`scripts/predict_decoys.py`,
   #168, #169). `build` takes `make_reverse_decoys.py` output, has DIA-NN predict the decoy
   sequences, re-exports and imports the prediction, and merges it: each decoy keeps its
@@ -237,6 +185,42 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **`extract.apex_count_window` defaults to `"auto"`**: 1 on an Orbitrap Astral, 5 on every
+  other instrument and on spectra converted before the instrument record existed. A number
+  is used as given. The example and Docker configurations no longer set 5. Window 1 against 5
+  with the other 0.6.0 defaults, mean of three NN seeds: Astral HYE +1.3% peptides (125,561 ->
+  127,197), the ProteoBench Astral entrapment module +1.0% precursors (paired FDP 0.86% ->
+  0.84%), an Astral single cell +2.4% precursors, an Astral HeLa entrapment run +3.6% human
+  precursors at a measured FDP of 1% (FDP at the reported 1%: 0.89% -> 0.71%). On the
+  Orbitrap (one seed) AIF HYE -0.9% and the AIF entrapment run -0.8%, hence per instrument.
+  On every benchmark above, the new engine resolving "auto" was byte-identical to the
+  previous engine given the window explicitly.
+- **`search_seed.two_pass_mass_cal` defaults to `true`.** Mean of three NN seeds against the
+  other 0.6.0 defaults: Astral HYE +1.8% peptides, ProteoBench Astral entrapment +1.1% precursors,
+  Astral HeLa entrapment +2.0% human precursors at a measured FDP of 1%, Orbitrap AIF HYE
+  +0.5%. Two costs come with it. An Astral single cell loses 2.9% of its precursors, and the
+  measured FDP at a reported 1% rises a little in every entrapment test: AIF entrapment
+  0.99% -> 1.02% (real precursors at a measured 1%: -0.2%), ProteoBench paired 0.86% -> 0.88%,
+  HeLa 0.89% -> 0.97%. Set it to `false` for single-cell input or where that margin matters.
+  With both changes on Astral: HYE +3.5% peptides (130,000), ProteoBench +2.1% precursors at
+  a paired FDP of 0.89%, HeLa +3.4% at a measured FDP of 1%, the single cell -0.7%.
+- Of the other single-cell settings, `extract.presence_min_coelution = 1` raised the AIF
+  entrapment FDP at a reported 1% to 1.06%, `extract.apex_refine_intensity` cost 2.9% on the
+  Astral HeLa entrapment run and `rt_im_train.p_rt = 0.9` lost on both entrapment searches
+  (one seed each), so they keep their defaults.
+- **Dependencies**: arrow and parquet 59 -> 60, mzdata and mzdata-bindata 0.66 -> 0.67.4
+  (together; Dependabot proposed them separately, which left two mzdata-bindata versions in
+  the lockfile), bytes 1.12.1, clap 4.6.7, serde 1.0.229. parquet 60 serves the page index
+  per row group (`ParquetMetaData::page_index_for_row_group`) instead of as nested vectors;
+  the band splice and the partial-read planner use it. Smoke outputs are byte-identical to
+  those before the update.
+- **The CI check of `THIRD_PARTY_LICENSES.md` and `sbom.cdx.json` tolerates crate versions**
+  (`ci/_lockfile_versions.py`). Dependabot does not run the generators, so every one of its
+  pull requests failed CI on a version string. The check still fails when a crate, a second
+  version of a crate, a licence or a notice changes; `--check --strict`, which the release
+  gate runs, compares exactly.
+- **Build**: the Docker image builds on `rust:1.99-bookworm`; desktop crates and CI actions
+  take their minor and patch updates.
 - **The extraction gate is the window-mean gate at 0.6** (#166). At near-single-ion intensity
   a fragment is present in one scan and absent in the next, so any single-scan score is noise;
   summed over five scans it is not. Against the apex-Pearson gate at 0.2 and the ungated
@@ -283,6 +267,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **A search with no training signal finishes instead of failing.** When `nn_torch` cannot
+  select a single training positive (no feature separates targets from decoys at the training
+  FDR, even on the loosened first selection), the worker exits with code 3 and the engine
+  ranks by the untrained `prelim_score` with plain target-decoy competition, also under
+  `rescore.strict`, with a warning and `classifier = "prelim_score_no_training_signal"` in the
+  scored table's report. Found on a 2 uL single-cell Astral run searched with the desktop
+  defaults, which stopped in rescoring with no results; DIA-NN 2.7 found 2,901 precursors in
+  it, and MuMDIA with the single-cell settings 1,440.
+- **The desktop application writes each search's log to `mumdia-console.log`** in its results
+  folder. The interface kept the log only in memory, so a failed run could not be diagnosed
+  once the window closed.
+- **The Docker image's rescore environment pins `pyarrow<26`.** pyarrow 26.0.0 needs
+  numpy 2 at import without declaring it, and the environment keeps numpy below 2 for
+  mokapot 0.10.0, so the image built but its sidecars failed to import pyarrow.
 - **Decoy collisions up to I/L** (#160): the engine digest, `make_reverse_decoys.py` and
   `augment_library.py` compared exact sequences, so a decoy that differs from a target only by
   I/L (the reversal of IEVNVELR is LEVNVEIR) passed, and collected that target's signal. 1,722
