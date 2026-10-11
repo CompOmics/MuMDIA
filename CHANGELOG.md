@@ -88,6 +88,15 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependencies**: arrow and parquet 59 -> 60, mzdata and mzdata-bindata 0.66 -> 0.67.4
+  (together; Dependabot proposed them separately, which left two mzdata-bindata versions in
+  the lockfile), bytes 1.12.1, clap 4.6.7, serde 1.0.229. parquet 60 serves the page index
+  per row group (`ParquetMetaData::page_index_for_row_group`) instead of as nested vectors;
+  the band splice and the partial-read planner use it. Smoke outputs are byte-identical to
+  0.6.0.
+
 ### Fixed
 
 - **A search with no training signal finishes instead of failing.** When `nn_torch` cannot

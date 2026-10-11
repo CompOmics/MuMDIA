@@ -9,7 +9,7 @@ accompanies it in every release archive and in the container image.
 
 ## Obligations
 
-185 third-party crates. Every one declares an SPDX expression; none is
+192 third-party crates. Every one declares an SPDX expression; none is
 unspecified.
 
 The following copyleft identifiers appear, in each case as one arm of a
@@ -24,14 +24,14 @@ Licence identifiers by crate count:
 
 | SPDX identifier | crates |
 |---|---|
-| `MIT` | 158 |
-| `Apache-2.0` | 152 |
+| `MIT` | 161 |
+| `Apache-2.0` | 153 |
+| `BSD-3-Clause` | 5 |
 | `Apache-2.0 WITH LLVM-exception` | 4 |
 | `Unlicense` | 4 |
 | `CC0-1.0` | 3 |
 | `Zlib` | 3 |
 | `BSD-2-Clause` | 2 |
-| `BSD-3-Clause` | 2 |
 | `LGPL-2.1-or-later` | 2 |
 | `0BSD` | 1 |
 | `BSL-1.0` | 1 |
@@ -53,21 +53,22 @@ Licence identifiers by crate count:
 | `anstyle-wincon` | 3.0.11 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
 | `anyhow` | 1.0.104 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/anyhow](https://github.com/dtolnay/anyhow) |
 | `arrayvec` | 0.7.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/bluss/arrayvec](https://github.com/bluss/arrayvec) |
-| `arrow` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-arith` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-array` | 59.3.0 | Apache-2.0 AND MIT | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-buffer` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-cast` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-csv` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-data` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-ipc` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-json` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-ord` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-row` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-schema` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-select` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-string` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `atoi` | 2.0.0 | MIT | - | [https://github.com/pacman82/atoi-rs](https://github.com/pacman82/atoi-rs) |
+| `arrow` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-arith` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-array` | 60.0.0 | Apache-2.0 AND MIT | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-buffer` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-cast` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-cmp` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-csv` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-data` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-ipc` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-json` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-ord` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-row` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-schema` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-select` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-string` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `atoi` | 3.1.0 | MIT | - | [https://github.com/pacman82/atoi-rs](https://github.com/pacman82/atoi-rs) |
 | `autocfg` | 1.5.1 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/cuviper/autocfg](https://github.com/cuviper/autocfg) |
 | `base64` | 0.23.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/marshallpierce/rust-base64](https://github.com/marshallpierce/rust-base64) |
 | `base64-simd` | 0.8.0 | MIT | - | [https://github.com/Nugine/simd](https://github.com/Nugine/simd) |
@@ -76,16 +77,16 @@ Licence identifiers by crate count:
 | `block-buffer` | 0.12.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
 | `bumpalo` | 3.20.3 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/fitzgen/bumpalo](https://github.com/fitzgen/bumpalo) |
 | `bytemuck` | 1.25.0 | Zlib OR Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/Lokathor/bytemuck](https://github.com/Lokathor/bytemuck) |
-| `bytes` | 1.12.0 | MIT | - | [https://github.com/tokio-rs/bytes](https://github.com/tokio-rs/bytes) |
+| `bytes` | 1.12.1 | MIT | - | [https://github.com/tokio-rs/bytes](https://github.com/tokio-rs/bytes) |
 | `cc` | 1.2.65 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/cc-rs](https://github.com/rust-lang/cc-rs) |
 | `cfg-if` | 1.0.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/cfg-if](https://github.com/rust-lang/cfg-if) |
 | `chrono` | 0.4.45 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/chronotope/chrono](https://github.com/chronotope/chrono) |
-| `clap` | 4.6.6 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
-| `clap_builder` | 4.6.6 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
-| `clap_derive` | 4.6.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
+| `clap` | 4.6.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
+| `clap_builder` | 4.6.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
+| `clap_derive` | 4.6.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
 | `clap_lex` | 1.1.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
 | `colorchoice` | 1.0.5 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
-| `comfy-table` | 7.2.2 | MIT | - | [https://github.com/nukesor/comfy-table](https://github.com/nukesor/comfy-table) |
+| `comfy-table` | 8.0.1 | MIT | - | [https://github.com/nukesor/comfy-table](https://github.com/nukesor/comfy-table) |
 | `const-oid` | 0.10.2 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/RustCrypto/formats](https://github.com/RustCrypto/formats) |
 | `const-random` | 0.1.18 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/tkaitchuck/constrandom](https://github.com/tkaitchuck/constrandom) |
 | `const-random-macro` | 0.1.16 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/tkaitchuck/constrandom](https://github.com/tkaitchuck/constrandom) |
@@ -104,6 +105,7 @@ Licence identifiers by crate count:
 | `either` | 1.16.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rayon-rs/either](https://github.com/rayon-rs/either) |
 | `encoding_rs` | 0.8.35 | (Apache-2.0 OR MIT) AND BSD-3-Clause | `Apache-2.0` | [https://github.com/hsivonen/encoding_rs](https://github.com/hsivonen/encoding_rs) |
 | `equivalent` | 1.0.2 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/indexmap-rs/equivalent](https://github.com/indexmap-rs/equivalent) |
+| `fastrand` | 2.5.0 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/smol-rs/fastrand](https://github.com/smol-rs/fastrand) |
 | `find-msvc-tools` | 0.1.9 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/cc-rs](https://github.com/rust-lang/cc-rs) |
 | `flatbuffers` | 25.12.19 | Apache-2.0 | - | [https://github.com/google/flatbuffers](https://github.com/google/flatbuffers) |
 | `flate2` | 1.1.9 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/flate2-rs](https://github.com/rust-lang/flate2-rs) |
@@ -141,11 +143,11 @@ Licence identifiers by crate count:
 | `memchr` | 2.8.2 | Unlicense OR MIT | `MIT` | [https://github.com/BurntSushi/memchr](https://github.com/BurntSushi/memchr) |
 | `mimalloc` | 0.1.52 | MIT | - | [https://github.com/purpleprotocol/mimalloc_rust](https://github.com/purpleprotocol/mimalloc_rust) |
 | `miniz_oxide` | 0.8.9 | MIT OR Zlib OR Apache-2.0 | `Apache-2.0` | [https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide) |
-| `mzdata` | 0.66.6 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
-| `mzdata-bindata` | 0.66.6 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
-| `mzdata-meta` | 0.66.6 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
-| `mzdata-param` | 0.66.6 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
-| `mzdata-spectrum` | 0.66.6 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata` | 0.67.4 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata-bindata` | 0.67.4 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata-meta` | 0.67.4 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata-param` | 0.67.4 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata-spectrum` | 0.67.4 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
 | `mzpeaks` | 1.0.9 | Apache-2.0 | - | [https://github.com/mobiusklein/mzpeaks](https://github.com/mobiusklein/mzpeaks) |
 | `nu-ansi-term` | 0.50.3 | MIT | - | [https://github.com/nushell/nu-ansi-term](https://github.com/nushell/nu-ansi-term) |
 | `num-bigint` | 0.5.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-num/num-bigint](https://github.com/rust-num/num-bigint) |
@@ -155,7 +157,11 @@ Licence identifiers by crate count:
 | `once_cell` | 1.21.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/matklad/once_cell](https://github.com/matklad/once_cell) |
 | `once_cell_polyfill` | 1.70.2 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/polyfill-rs/once_cell_polyfill](https://github.com/polyfill-rs/once_cell_polyfill) |
 | `outref` | 0.5.2 | MIT | - | [https://github.com/Nugine/outref](https://github.com/Nugine/outref) |
-| `parquet` | 59.3.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `parquet` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `phf` | 0.14.0 | MIT | - | [https://github.com/rust-phf/rust-phf](https://github.com/rust-phf/rust-phf) |
+| `phf_generator` | 0.14.0 | MIT | - | [https://github.com/rust-phf/rust-phf](https://github.com/rust-phf/rust-phf) |
+| `phf_macros` | 0.14.0 | MIT | - | [https://github.com/rust-phf/rust-phf](https://github.com/rust-phf/rust-phf) |
+| `phf_shared` | 0.14.0 | MIT | - | [https://github.com/rust-phf/rust-phf](https://github.com/rust-phf/rust-phf) |
 | `pin-project-lite` | 0.2.17 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/taiki-e/pin-project-lite](https://github.com/taiki-e/pin-project-lite) |
 | `pkg-config` | 0.3.34 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/pkg-config-rs](https://github.com/rust-lang/pkg-config-rs) |
 | `proc-macro2` | 1.0.106 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/proc-macro2](https://github.com/dtolnay/proc-macro2) |
@@ -173,15 +179,16 @@ Licence identifiers by crate count:
 | `ryu` | 1.0.23 | Apache-2.0 OR BSL-1.0 | `Apache-2.0` | [https://github.com/dtolnay/ryu](https://github.com/dtolnay/ryu) |
 | `semver` | 1.0.28 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/semver](https://github.com/dtolnay/semver) |
 | `seq-macro` | 0.3.6 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/seq-macro](https://github.com/dtolnay/seq-macro) |
-| `serde` | 1.0.228 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
-| `serde_core` | 1.0.228 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
-| `serde_derive` | 1.0.228 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
+| `serde` | 1.0.229 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
+| `serde_core` | 1.0.229 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
+| `serde_derive` | 1.0.229 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
 | `serde_json` | 1.0.151 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/json](https://github.com/serde-rs/json) |
 | `sha1` | 0.11.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
 | `sharded-slab` | 0.1.7 | MIT | - | [https://github.com/hawkw/sharded-slab](https://github.com/hawkw/sharded-slab) |
 | `shlex` | 2.0.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/comex/rust-shlex](https://github.com/comex/rust-shlex) |
 | `simd-adler32` | 0.3.9 | MIT | - | [https://github.com/mcountryman/simd-adler32](https://github.com/mcountryman/simd-adler32) |
 | `simdutf8` | 0.1.5 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rusticstuff/simdutf8](https://github.com/rusticstuff/simdutf8) |
+| `siphasher` | 1.0.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/jedisct1/rust-siphash](https://github.com/jedisct1/rust-siphash) |
 | `slab` | 0.4.12 | MIT | - | [https://github.com/tokio-rs/slab](https://github.com/tokio-rs/slab) |
 | `smallvec` | 1.15.2 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/servo/rust-smallvec](https://github.com/servo/rust-smallvec) |
 | `snap` | 1.1.1 | BSD-3-Clause | - | [https://github.com/BurntSushi/rust-snappy](https://github.com/BurntSushi/rust-snappy) |
@@ -224,9 +231,9 @@ Licence identifiers by crate count:
 | `zerocopy-derive` | 0.8.52 | BSD-2-Clause OR Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/google/zerocopy](https://github.com/google/zerocopy) |
 | `zlib-rs` | 0.6.8 | Zlib | - | [https://github.com/trifectatechfoundation/zlib-rs](https://github.com/trifectatechfoundation/zlib-rs) |
 | `zmij` | 1.0.21 | MIT | - | [https://github.com/dtolnay/zmij](https://github.com/dtolnay/zmij) |
-| `zstd` | 0.13.3 | MIT | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
-| `zstd-safe` | 7.2.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
-| `zstd-sys` | 2.0.16+zstd.1.5.7 | MIT/Apache-2.0 | `Apache-2.0` | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
+| `zstd` | 0.14.2 | BSD-3-Clause | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
+| `zstd-safe` | 8.1.0 | BSD-3-Clause | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
+| `zstd-sys` | 2.1.1+zstd.1.5.7 | BSD-3-Clause | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
 
 ## Licence texts
 
@@ -338,7 +345,7 @@ licence text alone does not discharge the obligation: MIT requires the copyright
 notice in all copies, BSD requires it retained, and Apache-2.0 section 4(d)
 requires the contents of a NOTICE file to be propagated.
 
-Notices recovered for 133 of 185 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
+Notices recovered for 138 of 192 crates (the remainder ship no copyright line in a licence file; see their repositories, linked above).
 
 **adler2 2.0.1**
 
@@ -381,11 +388,11 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 
 - Copyright (c) Ulrik Sverdrup "bluss" 2015-2023
 
-**arrow-array 59.3.0**
+**arrow-array 60.0.0**
 
 - Copyright (c) 2020-2022 Oliver Margetts
 
-**atoi 2.0.0**
+**atoi 3.1.0**
 
 - Copyright (c) 2017
 
@@ -417,7 +424,7 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2019 Daniel "Lokathor" Gee.
 
-**bytes 1.12.0**
+**bytes 1.12.1**
 
 - Copyright (c) 2018 Carl Lerche
 
@@ -433,15 +440,15 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2014, Kang Seonghoon.
 
-**clap 4.6.6**
+**clap 4.6.7**
 
 - Copyright (c) Individual contributors
 
-**clap_builder 4.6.6**
+**clap_builder 4.6.7**
 
 - Copyright (c) Individual contributors
 
-**clap_derive 4.6.4**
+**clap_derive 4.6.7**
 
 - Copyright (c) Individual contributors
 
@@ -453,7 +460,7 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 
 - Copyright (c) Individual contributors
 
-**comfy-table 7.2.2**
+**comfy-table 8.0.1**
 
 - Copyright (c) 2019 Arne Beer
 
@@ -718,6 +725,22 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2022 Nugine
 
+**phf 0.14.0**
+
+- Copyright (c) 2014-2022 Steven Fackler, Yuki Okushi
+
+**phf_generator 0.14.0**
+
+- Copyright (c) 2014-2022 Steven Fackler, Yuki Okushi
+
+**phf_macros 0.14.0**
+
+- Copyright (c) 2014-2022 Steven Fackler, Yuki Okushi
+
+**phf_shared 0.14.0**
+
+- Copyright (c) 2014-2022 Steven Fackler, Yuki Okushi
+
 **pkg-config 0.3.34**
 
 - Copyright (c) 2014 Alex Crichton
@@ -781,6 +804,11 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 **simd-adler32 0.3.9**
 
 - Copyright (c) [2021] [Marvin Countryman]
+
+**siphasher 1.0.4**
+
+- Copyright 2012-2016 The Rust Project Developers.
+- Copyright 2016-2026 Frank Denis.
 
 **slab 0.4.12**
 
@@ -907,26 +935,26 @@ Notices recovered for 133 of 185 crates (the remainder ship no copyright line in
 - Copyright 2023 The Fuchsia Authors
 - Copyright 2019 The Fuchsia Authors.
 
-**zstd 0.13.3**
+**zstd 0.14.2**
 
-- Copyright (c) 2016 Alexandre Bury
+- Copyright (c) 2026, Alexandre Bury
 
-**zstd-safe 7.2.4**
+**zstd-safe 8.1.0**
 
-- Copyright (c) 2016 Alexandre Bury
+- Copyright (c) 2026, Alexandre Bury
 
-**zstd-sys 2.0.16+zstd.1.5.7**
+**zstd-sys 2.1.1+zstd.1.5.7**
 
-- Copyright (c) 2016-present, Facebook, Inc. All rights reserved.
-- Copyright (c) 2016 Alexandre Bury
+- Copyright (c) 2026, Alexandre Bury
+- Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
 
 ### NOTICE files, verbatim
 
 Apache-2.0 section 4(d) requires these to travel with the distribution.
 
-#### arrow 59.3.0, and 14 more
+#### arrow 60.0.0, and 15 more
 
-Shared by: `arrow 59.3.0`, `arrow-arith 59.3.0`, `arrow-array 59.3.0`, `arrow-buffer 59.3.0`, `arrow-cast 59.3.0`, `arrow-csv 59.3.0`, `arrow-data 59.3.0`, `arrow-ipc 59.3.0`, `arrow-json 59.3.0`, `arrow-ord 59.3.0`, `arrow-row 59.3.0`, `arrow-schema 59.3.0`, `arrow-select 59.3.0`, `arrow-string 59.3.0`, `parquet 59.3.0`.
+Shared by: `arrow 60.0.0`, `arrow-arith 60.0.0`, `arrow-array 60.0.0`, `arrow-buffer 60.0.0`, `arrow-cast 60.0.0`, `arrow-cmp 60.0.0`, `arrow-csv 60.0.0`, `arrow-data 60.0.0`, `arrow-ipc 60.0.0`, `arrow-json 60.0.0`, `arrow-ord 60.0.0`, `arrow-row 60.0.0`, `arrow-schema 60.0.0`, `arrow-select 60.0.0`, `arrow-string 60.0.0`, `parquet 60.0.0`.
 
 ```text
 Apache Arrow
