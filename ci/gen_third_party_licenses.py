@@ -53,6 +53,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from _lockfile_versions import check
+
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "rust" / "mumdia" / "Cargo.toml"
 OUT = ROOT / "THIRD_PARTY_LICENSES.md"
@@ -542,14 +544,18 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true",
                     help="fail if THIRD_PARTY_LICENSES.md is stale")
+    ap.add_argument("--strict", action="store_true",
+                    help="with --check, also fail when only crate versions differ "
+                         "(the release gate; see ci/_lockfile_versions.py)")
     args = ap.parse_args()
 
     text = render(collect())
     if args.check:
         current = OUT.read_text(encoding="utf-8") if OUT.exists() else ""
-        if current.replace("\r\n", "\n") != text:
-            return report_stale(OUT, current.replace("\r\n", "\n"), text,
-                                "python ci/gen_third_party_licenses.py")
+        code = check(OUT, current.replace("\r\n", "\n"), text,
+                     "python ci/gen_third_party_licenses.py", args.strict, report_stale)
+        if code >= 0:
+            return code
         print(f"{OUT} is up to date ({len(text.splitlines())} lines).")
         return 0
 
