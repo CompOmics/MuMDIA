@@ -3575,7 +3575,7 @@ fn sidecar_paths(p: &RescoreParams, script_name: &str) -> SidecarPaths {
 /// positive: no feature separates targets from decoys at the training FDR.
 const NO_TRAINING_SIGNAL_EXIT: i32 = 3;
 
-/// A rescoring sidecar found nothing to train on (see [`NO_TRAINING_SIGNAL_EXIT`]).
+/// A rescoring sidecar found nothing to train on (exit code 3 of the worker, `NO_TRAINING_SIGNAL_EXIT`).
 ///
 /// Not a malfunction of the classifier but a property of the data: very low input (a
 /// single cell, a short gradient) or a search configured far from the acquisition. The
