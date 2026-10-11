@@ -3043,10 +3043,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/thiserror@2.0.20",
+      "bom-ref": "pkg:cargo/thiserror@2.0.21",
       "name": "thiserror",
-      "version": "2.0.20",
-      "purl": "pkg:cargo/thiserror@2.0.20",
+      "version": "2.0.21",
+      "purl": "pkg:cargo/thiserror@2.0.21",
       "description": "derive(Error)",
       "licenses": [
         {
@@ -3062,10 +3062,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/thiserror-impl@2.0.20",
+      "bom-ref": "pkg:cargo/thiserror-impl@2.0.21",
       "name": "thiserror-impl",
-      "version": "2.0.20",
-      "purl": "pkg:cargo/thiserror-impl@2.0.20",
+      "version": "2.0.21",
+      "purl": "pkg:cargo/thiserror-impl@2.0.21",
       "description": "Implementation detail of the `thiserror` crate",
       "licenses": [
         {
@@ -4531,7 +4531,7 @@
       "dependsOn": [
         "pkg:cargo/serde@1.0.229",
         "pkg:cargo/serde_json@1.0.151",
-        "pkg:cargo/thiserror@2.0.20",
+        "pkg:cargo/thiserror@2.0.21",
         "pkg:cargo/tracing@0.1.44"
       ]
     },
@@ -4547,7 +4547,7 @@
         "pkg:cargo/rayon@1.12.0",
         "pkg:cargo/serde@1.0.229",
         "pkg:cargo/serde_json@1.0.151",
-        "pkg:cargo/thiserror@2.0.20",
+        "pkg:cargo/thiserror@2.0.21",
         "pkg:cargo/tracing-subscriber@0.3.23",
         "pkg:cargo/tracing@0.1.44"
       ]
@@ -4568,7 +4568,7 @@
         "pkg:cargo/rayon@1.12.0",
         "pkg:cargo/serde@1.0.229",
         "pkg:cargo/serde_json@1.0.151",
-        "pkg:cargo/thiserror@2.0.20",
+        "pkg:cargo/thiserror@2.0.21",
         "pkg:cargo/tracing-subscriber@0.3.23",
         "pkg:cargo/tracing@0.1.44"
       ]
@@ -4584,7 +4584,7 @@
         "pkg:cargo/mzdata-param@0.67.4",
         "pkg:cargo/mzpeaks@1.0.9",
         "pkg:cargo/num-traits@0.2.19",
-        "pkg:cargo/thiserror@2.0.20"
+        "pkg:cargo/thiserror@2.0.21"
       ]
     },
     {
@@ -4597,14 +4597,14 @@
         "pkg:cargo/mzdata-param@0.67.4",
         "pkg:cargo/num-traits@0.2.19",
         "pkg:cargo/regex@1.12.4",
-        "pkg:cargo/thiserror@2.0.20"
+        "pkg:cargo/thiserror@2.0.21"
       ]
     },
     {
       "ref": "pkg:cargo/mzdata-param@0.67.4",
       "dependsOn": [
         "pkg:cargo/log@0.4.33",
-        "pkg:cargo/thiserror@2.0.20"
+        "pkg:cargo/thiserror@2.0.21"
       ]
     },
     {
@@ -4617,7 +4617,7 @@
         "pkg:cargo/mzdata-param@0.67.4",
         "pkg:cargo/mzpeaks@1.0.9",
         "pkg:cargo/num-traits@0.2.19",
-        "pkg:cargo/thiserror@2.0.20"
+        "pkg:cargo/thiserror@2.0.21"
       ]
     },
     {
@@ -4643,7 +4643,7 @@
         "pkg:cargo/quick-xml@0.41.0",
         "pkg:cargo/regex@1.12.4",
         "pkg:cargo/sha1@0.11.0",
-        "pkg:cargo/thiserror@2.0.20"
+        "pkg:cargo/thiserror@2.0.21"
       ]
     },
     {
@@ -4936,7 +4936,7 @@
       ]
     },
     {
-      "ref": "pkg:cargo/thiserror-impl@2.0.20",
+      "ref": "pkg:cargo/thiserror-impl@2.0.21",
       "dependsOn": [
         "pkg:cargo/proc-macro2@1.0.106",
         "pkg:cargo/quote@1.0.46",
@@ -4944,9 +4944,9 @@
       ]
     },
     {
-      "ref": "pkg:cargo/thiserror@2.0.20",
+      "ref": "pkg:cargo/thiserror@2.0.21",
       "dependsOn": [
-        "pkg:cargo/thiserror-impl@2.0.20"
+        "pkg:cargo/thiserror-impl@2.0.21"
       ]
     },
     {
