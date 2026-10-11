@@ -1027,11 +1027,13 @@ pub struct SearchSeedConfig {
     /// first median-offset + tolerance fit, re-fit on only the deviations inside the
     /// first-pass tolerance window (rejecting outliers), giving a tighter, more
     /// robust offset + local uncertainty. Falls back to the single-pass result when
-    /// too few in-window calibrants remain. Default true since 2026-10-11: one setting at a
-    /// time against the 0.6.0 defaults (single seed, then seeds 1 and 2), Astral HYE +2.5%
-    /// peptides, the ProteoBench Astral entrapment module +1.0% precursors at a paired FDP
-    /// of 0.84% (0.83% before), Orbitrap AIF HYE +0.1%, and the AIF entrapment run -0.2%
-    /// real precursors at a measured FDP of 1.00% (0.98% before).
+    /// too few in-window calibrants remain. Default true since 2026-10-11. Against the 0.6.0
+    /// defaults, mean of three NN seeds: Astral HYE +1.8% peptides, the ProteoBench Astral
+    /// entrapment module +1.1% precursors, an Astral HeLa entrapment run +2.0% human
+    /// precursors at a measured FDP of 1%, Orbitrap AIF HYE +0.5%. It costs an Astral single
+    /// cell 2.9% of its precursors, and the measured FDP at a reported 1% rises slightly in
+    /// every entrapment test (AIF 0.99% -> 1.02%, ProteoBench paired 0.86% -> 0.88%, HeLa
+    /// 0.89% -> 0.97%). Set false for single-cell input or where that margin matters.
     pub two_pass_mass_cal: bool,
     /// m/z-dependent fragment mass calibration. When true, fit a LOESS of the
     /// calibrant ppm deviation versus fragment m/z and emit a sampled correction
@@ -1459,11 +1461,12 @@ pub struct ExtractConfig {
     /// `"auto"` (also written `0`, the default since 2026-10-11) chooses by the instrument
     /// `convert` recorded for the run (`crate::instrument` in the engine): 1 on an Orbitrap
     /// Astral, 5 on every other instrument and when none is recorded. Measured one setting
-    /// at a time against the 0.6.0 defaults, window 1 against 5: Astral HYE +1.7% peptides,
-    /// the ProteoBench Astral entrapment module +1.5% precursors (paired FDP 0.84% against
-    /// 0.83%), an Astral single cell +6.1% precursors and an Astral HeLa entrapment run
-    /// +2.2% human precursors at a measured FDP of 1% (FDP at the reported 1%: 0.63%
-    /// against 0.79%); on the Orbitrap, AIF HYE -0.9% and the AIF entrapment run -0.8%.
+    /// at a time against the 0.6.0 defaults, window 1 against 5, mean of three NN seeds:
+    /// Astral HYE +1.3% peptides, the ProteoBench Astral entrapment module +1.0% precursors
+    /// (paired FDP 0.84% against 0.86%), an Astral single cell +2.4% precursors and an
+    /// Astral HeLa entrapment run +3.6% human precursors at a measured FDP of 1% (FDP at the
+    /// reported 1%: 0.71% against 0.89%); on the Orbitrap (one seed), AIF HYE -0.9% and the
+    /// AIF entrapment run -0.8%.
     /// Astral scans are fast enough that a fragment rarely flickers out, so smoothing over
     /// five of them blurs the apex instead of steadying it. A number is used as given.
     #[serde(deserialize_with = "de_apex_count_window")]
