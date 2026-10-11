@@ -41,6 +41,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from _lockfile_versions import check
+
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "rust" / "mumdia" / "Cargo.toml"
 OUT = ROOT / "sbom.cdx.json"
@@ -201,14 +203,18 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true",
                     help="fail if sbom.cdx.json is stale")
+    ap.add_argument("--strict", action="store_true",
+                    help="with --check, also fail when only crate versions differ "
+                         "(the release gate; see ci/_lockfile_versions.py)")
     args = ap.parse_args()
 
     text = render(cargo_metadata())
     if args.check:
         current = OUT.read_text(encoding="utf-8") if OUT.exists() else ""
-        if current.replace("\r\n", "\n") != text:
-            return report_stale(OUT, current.replace("\r\n", "\n"), text,
-                                "python ci/gen_sbom.py")
+        code = check(OUT, current.replace("\r\n", "\n"), text,
+                     "python ci/gen_sbom.py", args.strict, report_stale)
+        if code >= 0:
+            return code
         n = len(json.loads(text)["components"])
         print(f"{OUT} is up to date ({n} components).")
         return 0
