@@ -19,7 +19,7 @@ def stale(*_args):
 
 
 def run(current, text, strict=False):
-    return check("doc.md", current, text, "regen", strict, stale)
+    return check("generated-file", current, text, "regen", strict, stale)
 
 
 def test_identical_is_up_to_date():
