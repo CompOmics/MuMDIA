@@ -42,8 +42,8 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `ci/make_fixture_mzml.py` | Generates the fixture mzML from `test_data/fixture.fasta` and the library the engine builds from it, so the planted peaks cannot disagree with the mass model |
 | `ci/check_smoke.py` | Asserts the smoke run's artifacts, manifest completeness, and schema versions |
 | `ci/gen_cli_reference.py`, `ci/gen_config_reference.py` | Generate the CLI and config reference documents from `--help` and the `config.rs` doc comments |
-| `ci/gen_third_party_licenses.py` | Generates `THIRD_PARTY_LICENSES.md` from `Cargo.lock` plus the crates' own notice files; `--check` fails when stale |
-| `ci/gen_sbom.py` | Generates `sbom.cdx.json` (CycloneDX 1.5) from `cargo metadata --locked`, components plus dependency graph; `--check` fails when stale |
+| `ci/gen_third_party_licenses.py` | Generates `THIRD_PARTY_LICENSES.md` from `Cargo.lock` plus the crates' own notice files; `--check` fails when stale except for crate versions alone, `--check --strict` (the release gate) on any difference |
+| `ci/gen_sbom.py` | Generates `sbom.cdx.json` (CycloneDX 1.5) from `cargo metadata --locked`, components plus dependency graph; `--check` fails when stale except for crate versions alone, `--check --strict` (the release gate) on any difference |
 | `test_data/fixture.fasta` | The only committed input datum: a few proteins the fixture generator digests. No mzML or Parquet is committed |
 | `Dockerfile` | Two-stage image: Rust build stage + micromamba runtime with two sidecar envs |
 | `docker/config.dia.json` | Baked FASTA-digest config (MS2PIP + DeepLC + strict mokapot wired to in-image envs) |
