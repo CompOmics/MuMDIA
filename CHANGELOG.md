@@ -91,6 +91,31 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Added
+
+- **Search-anchored multi-head calibration** (`rt_im_train.multihead_anchors = "search"`,
+  default `"seed"`, benchmark-gated). The run that adapts the library (a single `run`, the
+  first run of `run-experiment` under `rt_library_scope = first_run_only`, or every run under
+  `per_run`) is searched once on the seed-anchored library, in `<run>/rt_bootstrap/`
+  (rt-im-train, extract, features, compete and a single-run rescore). Its targets at
+  `precursor_q <= q_train`, with observed RT = `apex_rt`, are written as
+  `rt_bootstrap/search_anchors.parquet` (new artifact `rt_bootstrap_anchors`, v1), the
+  multi-head calibration is refitted on them, and the run continues on the refitted library
+  under the usual file names. Too few search anchors (`min_seed_for_calibration` distinct
+  base peptides) or a failure in the bootstrap pass keeps the seed-anchored library with a
+  warning. The library's `.summary.json` records `anchor_source`, and a single run's manifest
+  names the RT model `...-multihead-<N>-search-anchors`. Refused with `finetune_deeplc`,
+  `multihead_calibration = 0` and `groups.window_groups > 1`; it turns off
+  `experiment.overlap_front_threads` for the first run. Measured outside the engine on 24
+  single-cell Astral runs: held-out RT error p95 5.35 s -> 3.5 s in 24 of 24 runs, and +7.3%
+  / +4.0% precursors at an unchanged decoy fraction. It costs one extra extract-to-rescore
+  pass and one extra library prediction per adapting run, and it still needs an entrapment
+  arm and a second acquisition before it can be a default (`docs/08_rt_im_train.md`
+  section 4f). The default is omitted from the canonical configuration, so existing config
+  hashes and every default output are unchanged.
+
 ## [0.6.0] - 2026-10-11
 
 ### Added

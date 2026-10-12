@@ -847,7 +847,16 @@ Do not enable these by default from a single AIF count:
 - margin competition or unique-evidence competition;
 - MBR transfer/re-extraction;
 - acquisition-specific fragment/peak caps. The shipped default stays uncapped;
-  see the peak-cap subsection above.
+  see the peak-cap subsection above;
+- search-anchored multi-head calibration (`rt_im_train.multihead_anchors =
+  "search"`, default `"seed"`). The adapting run is searched once on the
+  seed-anchored library (`<run>/rt_bootstrap/`), and the multi-head calibration is
+  refitted on that search's targets at `precursor_q <= q_train` (observed RT =
+  `apex_rt`). Measured outside the engine on 24 single-cell Astral runs: held-out RT
+  p95 5.35 s -> 3.5 s in 24/24 runs, +7.3% / +4.0% precursors at an unchanged decoy
+  fraction. One acquisition, no entrapment arm yet. It costs one extra
+  extract-to-rescore pass and one extra library prediction on each adapting run, and
+  it is refused for grouped runs. `docs/08_rt_im_train.md` section 4f.
 
 `compete.group_by = peptidoform_charge` is the default (2026-09-06) and is
 required, not optional, for a PTM or modification search. Under `base_peptide`

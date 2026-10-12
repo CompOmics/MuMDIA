@@ -17,6 +17,7 @@ pub mod prescreen;
 pub mod quant;
 pub mod report;
 pub mod rescore;
+pub mod rt_bootstrap;
 pub mod rt_im_train;
 pub mod run;
 pub mod run_experiment;

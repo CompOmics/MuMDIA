@@ -37,6 +37,7 @@ written null; there is no IM calibration or IM window.
 | `rust/mumdia/crates/mumdia/src/stages/rt_im_train.rs` | The stage. Joins iRT to seed PSMs, fits calibration, computes windows, writes `run_windows.parquet` + `cal.json`. |
 | `rust/mumdia/crates/mumdia/src/calibrate.rs` | Calibration math: `linear_fit`, the `Loess` local-linear smoother, and `percentile`. Shared, no external deps. |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Orchestrator. Runs the optional DeepLC fine-tune between `search-seed` and this stage, then calls `rt_im_train::run` (see `run.rs:265-314`). |
+| `rust/mumdia/crates/mumdia/src/stages/rt_bootstrap.rs` | `rt_im_train.multihead_anchors = search` (section 4f): the bootstrap search of the adapting run, the search-anchor table writer, and the refit of the multi-head calibration with its fallback. |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | `run_deeplc_finetune` (sidecar.rs:110-155): the file-contract client that invokes the fine-tune worker. |
 | `scripts/deeplc_finetune.py` | The fine-tune worker: transfer-learns DeepLC (4.5.0 or newer; older versions are refused) on the seed and writes a new library parquet with replaced `predicted_irt`. |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `RtImTrainConfig` (config.rs:447-512), `CalibrationMethod` enum (config.rs:56-61), and the load-time validation that rejects `calibration_method=none` (config.rs:1336-1342). |
@@ -649,6 +650,92 @@ the entrapment library and 0.14 s (17 s) on the HYE library, and neither moved t
 identifications outside the seed spread. The cache arm here used the one-process miss;
 docs/13, "Projection cache", has why the miss is now sharded and what that costs.
 
+### 4f. Search anchors for the multi-head calibration: `multihead_anchors` (default `seed`, benchmark-gated)
+
+The multi-head calibration of section 4d is fitted on the run's confident seed PSMs
+(`spectrum_q <= q_train`): typically 100 to 600 anchors from a broad, RT-free search.
+`rt_im_train.multihead_anchors = "search"` refits it on the confident identifications of a
+full search of the same run instead.
+
+**Mechanism** (`stages/rt_bootstrap.rs`). On the run that adapts the library (a single
+`run`; under `run-experiment` the first run when `experiment.rt_library_scope =
+first_run_only`, every run under `per_run`):
+
+1. convert, search-seed, the seed-anchored multi-head calibration and its library
+   re-prediction run as before, except that the seed-anchored library is written to
+   `<run>/rt_bootstrap/fragment_library_precursors_multihead.parquet`;
+2. a bootstrap pass searches the run on that library: rt-im-train, extract, features,
+   compete and a single-run rescore, all inside `<run>/rt_bootstrap/`
+   (`run_experiment::finish_run` plus `rescore::run_hashed`, the same calls as the final
+   pass);
+3. the targets at `precursor_q <= q_train` of the bootstrap's scored table, one row per
+   candidate (the best-scoring when several), with observed RT = `apex_rt`, are written to
+   `<run>/rt_bootstrap/search_anchors.parquet` in the seed's column shape (`candidate_id`,
+   `peptidoform`, `charge`, `base_peptide_id`, `label`, `score`, `spectrum_q` = the
+   `precursor_q`, `observed_rt`), sorted by `candidate_id`. `deeplc_finetune.py` reads it as
+   it reads `seed_psms.parquet`, so `build_reference` and the held-out rule of
+   `window_holdout_frac` (`base_peptide_id % 1000`) apply unchanged;
+4. the multi-head calibration is refitted on that table, with the same worker, head count,
+   holdout fraction and shard plan, and re-predicts the base library into
+   `<run>/fragment_library_precursors_multihead.parquet`, the usual name;
+5. the run continues exactly as without the option: rt-im-train (its LOESS still fits on
+   the seed anchors, now against the refitted iRT), extract, features and compete, then
+   the single-run rescore of `run` or the pooled rescore of `run-experiment`. Convert and
+   search-seed outputs are reused, not recomputed. Under `first_run_only` every later run
+   reuses the refitted library.
+
+The final pass writes every artifact under its usual name. The bootstrap pass keeps its
+`run_windows.parquet`, `cal.json`, `psms_scored.parquet` and the anchor table in
+`rt_bootstrap/`, and deletes its extracted, chromatogram, feature and competed tables once
+the rescore has read them.
+
+**Fallback.** If the bootstrap pass fails anywhere (extract, rescore, the refit's DeepLC
+worker) or yields fewer distinct target base peptides than `min_seed_for_calibration` (the
+minimum the seed anchors must reach for the calibration to run, `rt_im_train::plan_anchors`),
+the run warns and keeps the seed-anchored library, moved to the usual name. The run never
+fails for it.
+
+**Provenance.** `<run>/fragment_library_precursors_multihead.parquet.summary.json` gains
+`anchor_source` (`search` or `seed`) and either `search_anchors` (table, rows, distinct base
+peptides, `q_train`, the seed anchor count, the seed-anchored library) or
+`search_anchors_fallback` (the reason). A single `run` records the anchor table in
+`manifest.json` as `rt_bootstrap_anchors` (schema v1) and names the RT model
+`deeplc-<version>-multihead-<N>-search-anchors` when the refit happened. The experiment
+manifest names the requested model the same way; whether each adapting run refitted or fell
+back is in its summary. One INFO line per refit gives the anchor counts:
+`rt-bootstrap: refitting the multi-head calibration on N search anchors ... instead of M seed
+anchors`.
+
+**Interplay.** Refused at load with `finetune_deeplc`, with `multihead_calibration = 0` and
+with `groups.window_groups > 1` (a grouped run calibrates per band and has no single-run
+search to take anchors from). Where no multi-head calibration runs under the automatic head
+count (no DeepLC interpreter, or a native retention-time source), the option is inert and the
+run warns. Under `run-experiment` it turns off `experiment.overlap_front_threads` for the
+first run, because the first run's adaptation is then a whole search rather than one DeepLC
+worker, and it would compete with the overlapped fronts for the same threads. The default,
+`seed`, is omitted from the canonical configuration, so the config hash of every existing
+configuration is unchanged.
+
+**Measured** (24 single-cell Astral runs, 2026-10, outside the engine with the same worker).
+Refitting the first run's calibration on its full-search identifications (targets at
+`precursor_q <= 0.01`, about 7,000 anchors) instead of its seeds cut the out-of-sample RT
+error p95 from 5.35 s to 3.5 s in 24 of 24 runs, with no memorisation on held-out peptides,
+and the gain transferred to the runs that reuse the library. A search with that library gave
++7.3% and +4.0% precursors at an unchanged decoy fraction, with a narrower RT window. Adding
+noisier seed anchors (q 5-10%) made the fit worse, so the point is clean anchors, not more of
+them.
+
+**Cost.** One extra extract-to-rescore pass and one extra whole-library DeepLC prediction on
+each adapting run: once per experiment under `first_run_only`, once per run under `per_run`.
+With the projection cache on (`deeplc_projection_cache`, the default) the second prediction
+reads the projection the first one wrote, because both re-predict the same base library.
+
+**Status.** Benchmark-gated, default off. The single-cell numbers are one acquisition and a
+decoy fraction, not an entrapment FDP. Before it can become a default it needs an entrapment
+arm and a second acquisition (CLAUDE.md). The Rust unit tests and the stub arm of
+`ci/smoke.sh` (section 5c) exercise the orchestration and the anchor table; the real DeepLC
+refit is not exercised by either.
+
 ### 5. Optional adaptive per-region window (default off)
 
 When `adaptive_rt_window` is set (and `n_train >= min_anchors`, which guarantees the
@@ -899,6 +986,7 @@ though the enum variant still exists.
 | `loess_span` | `0.3` | LOESS local-fit fraction; passed as `span` to `Loess::fit` (rt_im_train.rs:137). Fraction of anchors in each local window. |
 | `fallback_rt_window_s` | `120.0` | Fixed half-window (seconds) when anchors are too few (`WindowPlan::Fixed`, rt_im_train.rs:168-175); also the upper clamp for adaptive bin widths (rt_im_train.rs:211). |
 | `finetune_deeplc` | `false` | Enable the DeepLC multitask fine-tune pre-step in `run` (run.rs:265). Requires `predict_frag.deeplc_python` (preflight, run.rs:62-67). On one measured run it was not needed per file once the library iRT had been fine-tuned once: the per-run LOESS reached the same residuals for much less wall clock (see the fine-tune section for the scope of that measurement). |
+| `multihead_anchors` | `seed` | Anchors of the multi-head calibration on the run that adapts the library. `search` refits it on the confident targets (`precursor_q <= q_train`, observed RT = `apex_rt`) of a bootstrap search of that run in `<run>/rt_bootstrap/`, and falls back to the seed-anchored library with a warning when that is not possible. Refused with `finetune_deeplc`, `multihead_calibration = 0` and `groups.window_groups > 1`. Benchmark-gated (section 4f). |
 | `finetune_epochs` | `25` | Fine-tune epoch cap (`--epochs`); early stopping usually halts sooner. Used only when `finetune_deeplc`. |
 | `finetune_patience` | `10` | Early-stopping patience (`--patience`): epochs without val-loss improvement before stopping. |
 | `finetune_batch` | `0` | Fine-tune batch size (`--batch`). `0` auto-scales to the seed size so each epoch has ~30+ steps (config.rs:473-477); a fixed large batch underfits small seeds. |

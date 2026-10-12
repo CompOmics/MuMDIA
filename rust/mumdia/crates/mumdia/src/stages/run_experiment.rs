@@ -324,6 +324,7 @@ fn chain_after_seed(
         shared_rt_lib,
         irt_placeholder,
         rayon::current_num_threads(),
+        BootInputs { ch, lib_f, co },
     )?;
     let (competed, chrom) = finish_run(cfg, ch, &lib_p, lib_f, co, seed, out)?;
     Ok((
@@ -333,9 +334,21 @@ fn chain_after_seed(
     ))
 }
 
+/// What a run's search-anchored refit needs beyond the adaptation's own arguments
+/// (`rt_im_train.multihead_anchors = search`, `rt_bootstrap`): the bootstrap pass searches
+/// the run once on the seed-anchored library.
+#[derive(Clone, Copy)]
+struct BootInputs<'a> {
+    ch: &'a str,
+    lib_f: &'a str,
+    co: &'a convert::ConvertOutputs,
+}
+
 /// Choose the precursor table the rest of an ungrouped run reads: a previous run's adapted
 /// library, this run's multi-head calibration or fine-tune of the base library (`threads`
 /// torch threads), or the base library. Returns `(table, the table this run produced)`.
+/// Under `rt_im_train.multihead_anchors = search` the multi-head calibration is refitted on
+/// the confident targets of a bootstrap search of this run (`rt_bootstrap::refit`).
 #[allow(clippy::too_many_arguments)]
 fn adapt_rt_library(
     cfg: &Config,
@@ -346,6 +359,7 @@ fn adapt_rt_library(
     shared_rt_lib: Option<&str>,
     irt_placeholder: bool,
     threads: usize,
+    boot: BootInputs,
 ) -> Result<(String, Option<String>)> {
     let d = |name: &str| format!("{out}/{name}");
     // DeepLC fine-tune. Under `RtLibraryScope::FirstRunOnly` the caller hands every run
@@ -393,7 +407,9 @@ fn adapt_rt_library(
             &cfg.predict_frag.sidecar_script_dir,
             "deeplc_finetune.py",
         );
-        let lib_p_mh = d("fragment_library_precursors_multihead.parquet");
+        // Under `multihead_anchors = search` the seed-anchored fit goes to `rt_bootstrap/`
+        // and the refitted library takes the usual name; otherwise this is the usual name.
+        let lib_p_mh = rt_bootstrap::seed_library_path(cfg, mh_heads, out);
         crate::sidecar::run_deeplc_multihead(
             python,
             &script,
@@ -410,6 +426,25 @@ fn adapt_rt_library(
         if irt_placeholder {
             crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
         }
+        let lib_p_mh = if rt_bootstrap::active(cfg, mh_heads) {
+            rt_bootstrap::refit(&rt_bootstrap::Refit {
+                cfg,
+                config_hash: boot.ch,
+                converted: boot.co,
+                lib_p_base,
+                lib_f: boot.lib_f,
+                seed,
+                out,
+                seed_library: &lib_p_mh,
+                mh_heads,
+                threads,
+                irt_placeholder,
+                seed_anchors: anchor_plan.map_or(0, |a| a.n_anchors),
+            })?
+            .library
+        } else {
+            lib_p_mh
+        };
         produced_rt_lib = Some(lib_p_mh.clone());
         lib_p_mh
     } else if cfg.rt_im_train.finetune_deeplc {
@@ -450,7 +485,7 @@ fn adapt_rt_library(
 
 /// Retention-time windows, extract, features and compete of one ungrouped run on `lib_p`.
 /// Returns `(competed, chromatograms)`.
-fn finish_run(
+pub(crate) fn finish_run(
     cfg: &Config,
     ch: &str,
     lib_p: &str,
@@ -1158,7 +1193,22 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
              running the runs one after the other"
         );
     }
-    let overlapped = share_ft && overlap > 0 && !grouped_runs;
+    // `rt_im_train.multihead_anchors = search` makes run 1's adaptation a whole search
+    // (extract to rescore) rather than one DeepLC worker, which would compete with the fronts
+    // for the same threads, so the first run then adapts alone, as without the overlap.
+    let mh_heads_for_scope = cfg
+        .rt_im_train
+        .multihead_heads(has_deeplc_for_scope, deeplc_rt_source_for_scope);
+    let search_anchors = rt_bootstrap::active(cfg, mh_heads_for_scope);
+    rt_bootstrap::warn_if_inert(cfg, mh_heads_for_scope, "run-experiment");
+    if share_ft && overlap > 0 && !grouped_runs && search_anchors {
+        info!(
+            "run-experiment: rt_im_train.multihead_anchors = search; the first run adapts the \
+             library alone (no experiment.overlap_front_threads), because its bootstrap search \
+             would share the threads of the overlapped fronts"
+        );
+    }
+    let overlapped = share_ft && overlap > 0 && !grouped_runs && !search_anchors;
     if overlapped && cfg.experiment.overlap_front_threads.is_none() {
         info!(
             overlap_front_threads = overlap,
@@ -1418,6 +1468,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 None,
                 irt_placeholder,
                 adapt_threads,
+                BootInputs {
+                    ch: &ch,
+                    lib_f: &lib_f,
+                    co: &co0,
+                },
             );
             if adapted.is_err() {
                 cancel.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1453,6 +1508,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 produced.as_deref(),
                 irt_placeholder,
                 rayon::current_num_threads(),
+                BootInputs {
+                    ch: &ch,
+                    lib_f: &lib_f,
+                    co,
+                },
             )?;
             finish_run(cfg, &ch, &lib_p, &lib_f, co, seed, &out)
         };
@@ -1875,7 +1935,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         deeplc_py.is_some(),
         cfg.deeplc_rt_source(library_input, deeplc_py.is_some()),
     );
-    let rt_identity = if mh_heads > 0 {
+    let rt_identity = if rt_bootstrap::active(cfg, mh_heads) {
+        // Requested; whether a run refitted or fell back is in its adapted library's
+        // `.summary.json` (`anchor_source`).
+        crate::sidecar::deeplc_identity(deeplc_py, &format!("multihead-{mh_heads}-search-anchors"))
+    } else if mh_heads > 0 {
         crate::sidecar::deeplc_identity(deeplc_py, &format!("multihead-{mh_heads}"))
     } else if cfg.rt_im_train.finetune_deeplc {
         if matches!(

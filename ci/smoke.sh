@@ -705,6 +705,9 @@ with open(os.environ["MUMDIA_STUB_DEEPLC_LOG"], "a", encoding="utf-8") as fh:
                          "projection_default": "--projection-cache-default" in opts}) + "\n")
 if os.environ.get("MUMDIA_STUB_DEEPLC_FAIL"):
     sys.exit("stub DeepLC worker: failing as asked (MUMDIA_STUB_DEEPLC_FAIL)")
+fail_on = os.environ.get("MUMDIA_STUB_DEEPLC_FAIL_ON_SEED")
+if fail_on and fail_on in seed:
+    sys.exit("stub DeepLC worker: failing on this seed as asked (MUMDIA_STUB_DEEPLC_FAIL_ON_SEED)")
 retain = int(os.environ.get("MUMDIA_STUB_DEEPLC_RETAIN", "0"))
 for src, dst in pairs:
     shutil.copyfile(src, dst)
@@ -745,6 +748,10 @@ arm("seq", rt_im_train={"multihead_calibration": 2},
     experiment={"parallel_runs": 1, "overlap_front_threads": 0})
 arm("overlap", rt_im_train={"multihead_calibration": 2},
     experiment={"overlap_front_threads": 1})
+# Search-anchored multi-head: the overlap is asked for, and refused, because the first run's
+# adaptation is then a whole bootstrap search.
+arm("boot", rt_im_train={"multihead_calibration": 2, "multihead_anchors": "search"},
+    experiment={"parallel_runs": 1, "overlap_front_threads": 1})
 # No trailing newline: on Windows it would arrive as CR LF, and $( ) strips the LF only.
 sys.stdout.write(os.path.join(root, "site"))
 PYEOF
@@ -779,6 +786,29 @@ if MUMDIA_STUB_DEEPLC_FAIL=1 stub_experiment overlap_fail overlap; then
 fi
 grep -q "DeepLC multi-head calibration failed" "$stub/overlap_fail.log" \
     || { tail -20 "$stub/overlap_fail.log"; echo "the overlap arm did not report the worker's failure"; exit 1; }
+# `rt_im_train.multihead_anchors = search`: the adapting run is searched once on the
+# seed-anchored library (rt_bootstrap/) and the calibration refitted on that search's
+# confident targets; a failing refit keeps the seed-anchored library and the run finishes.
+stub_experiment boot boot \
+    || { tail -30 "$stub/boot.log"; echo "stub arm boot failed"; exit 1; }
+stub_run boot_run "$BIN" run \
+    --lib-precursors "$work/lib_prec.parquet" --lib-fragments "$work/lib_frag.parquet" \
+    --mzml "$work/fixture.mzML" --out-dir "$stub/boot_run" --config "$stub/boot.json" \
+    --threads 2 \
+    || { tail -30 "$stub/boot_run.log"; echo "stub arm boot_run failed"; exit 1; }
+MUMDIA_STUB_DEEPLC_FAIL_ON_SEED=search_anchors stub_run boot_fallback "$BIN" run \
+    --lib-precursors "$work/lib_prec.parquet" --lib-fragments "$work/lib_frag.parquet" \
+    --mzml "$work/fixture.mzML" --out-dir "$stub/boot_fallback" --config "$stub/boot.json" \
+    --threads 2 \
+    || { tail -30 "$stub/boot_fallback.log"; echo "a failing search-anchor refit failed the run"; exit 1; }
+for a in boot boot_run; do
+    grep -q "rt-bootstrap: refitting the multi-head calibration on" "$stub/$a.log" \
+        || { echo "the $a arm did not log its search anchors"; exit 1; }
+done
+grep -q "the first run adapts the library alone" "$stub/boot.log" \
+    || { echo "the boot arm did not refuse the overlap"; exit 1; }
+grep -q "keeping the seed-anchored multi-head library" "$stub/boot_fallback.log" \
+    || { tail -20 "$stub/boot_fallback.log"; echo "the fallback arm did not say it kept the seed library"; exit 1; }
 # The deferred FASTA build: refused when the calibration keeps a row's placeholder iRT,
 # accepted when it re-predicts every row.
 stub_run defer_fast "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
@@ -885,15 +915,80 @@ for run in ("a", "b"):
     if not (stub / "overlap" / run / "seed_psms.parquet").exists():
         fail("overlap: run %s has no seed table" % run)
 
+# Search anchors: two multi-head calls on the adapting run, the first on the seed into
+# rt_bootstrap/, the second on the bootstrap's anchors into the usual name, both over the
+# base library; run b of the experiment reuses run a's library and calls nothing.
+LIB = "fragment_library_precursors_multihead.parquet"
+ANCHOR_COLUMNS = ["candidate_id", "peptidoform", "charge", "base_peptide_id", "label",
+                  "score", "spectrum_q", "observed_rt"]
+for name, out in (("boot", stub / "boot/a"), ("boot_run", stub / "boot_run"),
+                  ("boot_fallback", stub / "boot_fallback")):
+    c = calls(name)
+    if len(c) != 2 or any(x["mode"] != "multihead" or x["bands"] for x in c):
+        fail("%s: expected two single-table multi-head calls, got %r" % (name, c))
+    if not same(c[0]["seed"], out / "seed_psms.parquet"):
+        fail("%s: the first fit read %r, not the seed" % (name, c[0]["seed"]))
+    if not same(c[0]["pairs"][0][1], out / "rt_bootstrap" / LIB):
+        fail("%s: the seed-anchored fit wrote %r" % (name, c[0]["pairs"][0][1]))
+    if not same(c[1]["seed"], out / "rt_bootstrap/search_anchors.parquet"):
+        fail("%s: the refit read %r, not the search anchors" % (name, c[1]["seed"]))
+    if not same(c[1]["pairs"][0][0], c[0]["pairs"][0][0]):
+        fail("%s: the refit re-predicted %r, not the base library" % (name, c[1]["pairs"][0][0]))
+    if not same(c[1]["pairs"][0][1], out / LIB):
+        fail("%s: the refit wrote %r" % (name, c[1]["pairs"][0][1]))
+    summary = json.loads((out / (LIB + ".summary.json")).read_text("utf-8"))
+    a = pq.read_table(out / "rt_bootstrap/search_anchors.parquet")
+    if a.column_names != ANCHOR_COLUMNS:
+        fail("%s: anchor columns %r" % (name, a.column_names))
+    if set(a.column("label").to_pylist()) != {"target"} or max(a.column("spectrum_q").to_pylist()) > 0.01:
+        fail("%s: the anchors are not confident targets" % name)
+    ids = a.column("candidate_id").to_pylist()
+    if ids != sorted(set(ids)):
+        fail("%s: the anchors are not one row per candidate in candidate order" % name)
+    for f in ("psms_scored.parquet", "run_windows.parquet", "cal.json"):
+        if not (out / "rt_bootstrap" / f).exists():
+            fail("%s: the bootstrap pass left no %s" % (name, f))
+    for f in ("chromatograms.parquet", "features.parquet", "psms_extracted.parquet"):
+        if (out / "rt_bootstrap" / f).exists():
+            fail("%s: the bootstrap pass kept its %s" % (name, f))
+    if name == "boot_fallback":
+        if summary.get("anchor_source") != "seed" or "search_anchors_fallback" not in summary:
+            fail("boot_fallback: the summary does not record the fallback: %r" % summary)
+        if (out / "rt_bootstrap" / LIB).exists():
+            fail("boot_fallback: the seed-anchored library was not moved to the usual name")
+    else:
+        if summary.get("anchor_source") != "search" or summary["search_anchors"]["rows"] != a.num_rows:
+            fail("%s: the summary does not record the search anchors: %r" % (name, summary))
+for name in ("boot_run", "boot_fallback"):
+    if not (stub / name / "peptides.tsv").exists():
+        fail("%s: the run did not finish" % name)
+m = json.loads((stub / "boot_run/manifest.json").read_text("utf-8"))
+if "search-anchors" not in m["model_identities"]["rt_predictor"]:
+    fail("boot_run: rt_predictor %r" % m["model_identities"]["rt_predictor"])
+if m["artifacts"].get("rt_bootstrap_anchors", {}).get("schema_version") != 1:
+    fail("boot_run: the manifest does not record the anchor table")
+if not same(m["artifacts"]["fragment_library_precursors"]["path"], stub / "boot_run" / LIB):
+    fail("boot_run: the manifest records %r as the library"
+         % m["artifacts"]["fragment_library_precursors"]["path"])
+m = json.loads((stub / "boot_fallback/manifest.json").read_text("utf-8"))
+if "search-anchors" in m["model_identities"]["rt_predictor"] or "rt_bootstrap_anchors" in m["artifacts"]:
+    fail("boot_fallback: the manifest claims a refit that did not happen")
+if (stub / "boot/b/rt_bootstrap").exists() or list((stub / "boot/b").glob("fragment_library*")):
+    fail("boot: run b adapted the library instead of reusing run a's")
+if not (stub / "boot/scored_combined.parquet").exists():
+    fail("boot: the experiment did not finish")
+
 # The deferred build: one --bands multi-head call per run, over the two bands.
 for name in ("defer_fast", "defer_kept"):
     c = calls(name)
     if len(c) != 1 or c[0]["mode"] != "multihead" or len(c[0]["pairs"]) != 2:
         fail("%s: expected one two-band multi-head call, got %r" % (name, c))
 print("    ok: once_per_run union, kept re-prediction, per-band slices reused, deferred "
-      "library refused and accepted, overlap equal to sequential (%d stub calls)"
+      "library refused and accepted, overlap equal to sequential, search anchors refit and "
+      "fall back (%d stub calls)"
       % sum(len(calls(n)) for n in ("union", "keep", "perband", "seq", "overlap",
-                                     "overlap_fail", "defer_fast", "defer_kept")))
+                                     "overlap_fail", "defer_fast", "defer_kept", "boot",
+                                     "boot_run", "boot_fallback")))
 PYEOF
 
 # 6. Assertions.
