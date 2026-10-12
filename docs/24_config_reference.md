@@ -63,7 +63,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`peptidoforms`](#peptidoforms) | `PeptidoformsConfig` | 7 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`predict_frag`](#predict_frag) | `PredictFragConfig` | 15 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
 | [`search_seed`](#search_seed) | `SearchSeedConfig` | 9 | [docs/07_search_seed.md](07_search_seed.md) |
-| [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 24 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
+| [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 25 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
 | [`extract`](#extract) | `ExtractConfig` | 43 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
 | [`features`](#features) | `FeaturesConfig` | 11 | [docs/10_features.md](10_features.md) |
@@ -309,6 +309,7 @@ Fragment traces over consecutive same-window scans.
 | `fallback_rt_window_s` | `f64` | `120.0` |  | Fallback fixed RT window in seconds when calibration cannot be fit. |
 | `finetune_deeplc` | `bool` | `false` |  | Fine-tune the DeepLC multitask model on this run's confident seed PSMs and rewrite the library's `predicted_irt` before RT calibration. Requires `predict_frag.deeplc_python` (the DeepLC interpreter). Off by default; the main use is library-input mode, where the base iRT comes from the imported library rather than a DeepLC prediction. |
 | `multihead_calibration` | `Option<usize>` | `null` |  | Calibrate the DeepLC base model against this run's confident seed PSMs across this many of its best-correlating LC-setup heads, instead of fine-tuning. `null` (the default) is AUTOMATIC: `DEFAULT_MULTIHEAD_HEADS` heads when a DeepLC interpreter is available and `finetune_deeplc` is off, and nothing otherwise. `0` turns it off explicitly; any other number asks for exactly that many heads and is then a hard requirement, so a run without a `predict_frag.deeplc_python` fails rather than quietly doing without. Automatic rather than a plain number because a default that a native, Python-free run cannot satisfy would turn "no interpreter" from a supported configuration into a startup error, and because `finetune_deeplc` occupies the same slot: a configuration that asks for the fine-tune keeps it instead of being refused for a conflict it never wrote. `deeplc.predict` returns ONE of the model's 6,543 heads, the setup named by its `DEFAULT_TASK_NAME`, on that setup's gradient. The per-run LOESS then maps that column onto observed RT, and a smooth increasing curve can stretch and bend the axis but cannot reorder two peptides: whatever elution order that one setup produces survives into the calibrated result. Different chromatography reorders peptides, which is what the multitask model exists to represent, so the ordering is the part the curve cannot repair. `MultiHeadRidgeCalibration` ranks every head against this run's anchors, spline-calibrates the best ones and ridge-combines them. It never fits more head weights than half the reference, so a small anchor set degrades to fewer heads rather than overfitting. Measured on two acquisitions, six pooled runs each, at an unchanged empirical decoy fraction of 0.0100 in every arm (`docs/08_rt_im_train.md` section 4d): AIF +4.8% peptides, Astral +14.3%, protein groups +2.4% and +7.1%. The mechanism is ordering, not thresholds -- fewer candidates reach rescore and more of them are real -- and the cost is 1.4x to 1.7x wall clock, because the calibration is fitted against each run's own anchors and so cannot be shared across an experiment. |
+| `multihead_anchors` | `MultiheadAnchors` | `seed` | benchmark-gated | Which anchors the multi-head calibration of the run that adapts the library is fitted on. `seed` (the default) is the run's confident seed PSMs at `q_train`, as before. `search` adds a bootstrap pass on that run: the seed-anchored library is searched (rt-im-train, extract, features, compete and a single-run rescore, in `<run>/rt_bootstrap/`), the targets at `precursor_q <= q_train` of that search become the anchors (observed RT = `apex_rt`), the multi-head calibration is refitted on them, and the run is searched again on the refitted library. Under `run-experiment` with `experiment.rt_library_scope = first_run_only` only the first run pays for it and every later run reuses its library; under `per_run` every run does. The per-run LOESS still fits on the seed anchors. Measured on 24 single-cell Astral runs (2026-10): out-of-sample RT error p95 5.35 s with seed anchors (about 100-600) against 3.5 s with the first run's search anchors (about 7,000), better in 24 of 24 runs, with no memorisation on held-out peptides; a search with that library gave +7.3% and +4.0% precursors at an unchanged decoy fraction. Extra seed anchors at q 5-10% made the fit worse, so the clean search identifications are the point, not the count. It costs one extra extract-to-rescore pass and one extra whole-library DeepLC prediction on each adapting run. Fewer search anchors than `min_seed_for_calibration` (distinct target base peptides) or a failure anywhere in the bootstrap pass keeps the seed-anchored library, with a warning. Inert, with a warning, where no multi-head calibration runs (no DeepLC interpreter, or a native retention-time source under the automatic head count). Refused with `finetune_deeplc`, with `multihead_calibration = 0` and with `groups.window_groups > 1`. Benchmark-gated: it still needs an entrapment arm and a second acquisition before it can be a default (`docs/08_rt_im_train.md` section 4f). |
 | `finetune_epochs` | `usize` | `25` |  | DeepLC fine-tune training epochs (passed to `deeplc_finetune.py --epochs`). Early stopping with `finetune_patience` usually halts before this cap, so it is an upper bound rather than a fixed count. Only used when `finetune_deeplc`. |
 | `finetune_patience` | `usize` | `10` |  | DeepLC fine-tune early-stopping patience (`--patience`): epochs without validation-loss improvement before stopping. Only used when `finetune_deeplc`. |
 | `finetune_batch` | `usize` | `0` |  | DeepLC fine-tune batch size (`--batch`). 0 (default) auto-scales to the confident seed size so each epoch has >= ~30 gradient steps; a fixed large batch underfits small seeds (a ~4k-peptide reference at batch 512 is ~8 steps/epoch and never converges). Only used when `finetune_deeplc`. |
@@ -757,6 +758,17 @@ Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.
 | `rt_transfer` |  | EmpiricalLibrary + cross-run expected-RT transfer extraction (M2/M3). |
 | `full` |  | RtTransfer + requantification of accepted transfers (M5). |
 
+### `MultiheadAnchors`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+Anchors of the multi-head calibration; see `RtImTrainConfig::multihead_anchors`.
+
+| Value | Default | Description |
+|---|---|---|
+| `seed` | yes | The run's confident seed PSMs (`spectrum_q <= q_train`). |
+| `search` |  | The confident targets of a bootstrap search of the run on the seed-anchored library (`precursor_q <= q_train`, observed RT = `apex_rt`). |
+
 ### `NegSelect`
 
 (rust/mumdia/crates/mumdia-core/src/config.rs)
@@ -1131,6 +1143,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-23 structs and 277 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 34 enumerations, 1 named profile(s), 98 environment variables read and 20 set.
+23 structs and 278 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 35 enumerations, 1 named profile(s), 98 environment variables read and 20 set.
 
-21 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+22 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
