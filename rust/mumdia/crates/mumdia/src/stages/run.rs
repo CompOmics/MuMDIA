@@ -587,9 +587,11 @@ pub fn run(p: RunParams) -> Result<()> {
                 &cfg.predict_frag.sidecar_script_dir,
                 "deeplc_finetune.py",
             );
-            // Under `multihead_anchors = search` this seed-anchored fit goes to
-            // `rt_bootstrap/` and the refit below takes the usual name.
-            let lib_p_mh = rt_bootstrap::seed_library_path(cfg, mh_heads, p.out_dir);
+            // Under `multihead_anchors = search`, or `auto` on a seed short of anchors,
+            // this seed-anchored fit goes to `rt_bootstrap/` and the refit below takes the
+            // usual name.
+            let search = rt_bootstrap::decide(cfg, mh_heads, &anchor_plan, p.out_dir);
+            let lib_p_mh = rt_bootstrap::seed_library_path(search, p.out_dir);
             info!(stage = %"deeplc-multihead", "run: stage start");
             crate::sidecar::run_deeplc_multihead(
                 python,
@@ -607,7 +609,7 @@ pub fn run(p: RunParams) -> Result<()> {
             if rt_placeholder {
                 crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
             }
-            let lib_p_mh = if rt_bootstrap::active(cfg, mh_heads) {
+            let lib_p_mh = if search {
                 info!(stage = %"rt-bootstrap", "run: stage start");
                 let o = rt_bootstrap::refit(&rt_bootstrap::Refit {
                     cfg,
@@ -638,6 +640,7 @@ pub fn run(p: RunParams) -> Result<()> {
             } else {
                 lib_p_mh
             };
+            rt_bootstrap::record_auto(cfg, &anchor_plan, search, &lib_p_mh);
             let n_mh = mumdia_io::table::nrows(&lib_p_mh)?;
             man.record(record_artifact(
                 artifact::FRAGMENT_LIBRARY_PRECURSORS.0,

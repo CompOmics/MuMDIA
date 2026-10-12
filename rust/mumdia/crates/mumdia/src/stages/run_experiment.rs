@@ -19,7 +19,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
-use mumdia_core::config::{Config, QuantQColumn, RtLibraryScope};
+use mumdia_core::config::{Config, MultiheadAnchors, QuantQColumn, RtLibraryScope};
 use mumdia_core::manifest::Manifest;
 use mumdia_core::schema::artifact;
 use mumdia_io::table::Written;
@@ -347,8 +347,9 @@ struct BootInputs<'a> {
 /// Choose the precursor table the rest of an ungrouped run reads: a previous run's adapted
 /// library, this run's multi-head calibration or fine-tune of the base library (`threads`
 /// torch threads), or the base library. Returns `(table, the table this run produced)`.
-/// Under `rt_im_train.multihead_anchors = search` the multi-head calibration is refitted on
-/// the confident targets of a bootstrap search of this run (`rt_bootstrap::refit`).
+/// Under `rt_im_train.multihead_anchors = search`, or `auto` on a seed short of anchors, the
+/// multi-head calibration is refitted on the confident targets of a bootstrap search of this
+/// run (`rt_bootstrap::refit`).
 #[allow(clippy::too_many_arguments)]
 fn adapt_rt_library(
     cfg: &Config,
@@ -407,9 +408,14 @@ fn adapt_rt_library(
             &cfg.predict_frag.sidecar_script_dir,
             "deeplc_finetune.py",
         );
-        // Under `multihead_anchors = search` the seed-anchored fit goes to `rt_bootstrap/`
-        // and the refitted library takes the usual name; otherwise this is the usual name.
-        let lib_p_mh = rt_bootstrap::seed_library_path(cfg, mh_heads, out);
+        // Planned above whenever a multi-head calibration runs on a run with no shared
+        // library, which is this branch.
+        let plan = anchor_plan.expect("the anchor cut is planned for a multi-head calibration");
+        // Under `multihead_anchors = search`, or `auto` on a seed short of anchors, the
+        // seed-anchored fit goes to `rt_bootstrap/` and the refitted library takes the usual
+        // name; otherwise this is the usual name.
+        let search = rt_bootstrap::decide(cfg, mh_heads, &plan, out);
+        let lib_p_mh = rt_bootstrap::seed_library_path(search, out);
         crate::sidecar::run_deeplc_multihead(
             python,
             &script,
@@ -426,7 +432,7 @@ fn adapt_rt_library(
         if irt_placeholder {
             crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
         }
-        let lib_p_mh = if rt_bootstrap::active(cfg, mh_heads) {
+        let lib_p_mh = if search {
             rt_bootstrap::refit(&rt_bootstrap::Refit {
                 cfg,
                 config_hash: boot.ch,
@@ -439,12 +445,13 @@ fn adapt_rt_library(
                 mh_heads,
                 threads,
                 irt_placeholder,
-                seed_anchors: anchor_plan.map_or(0, |a| a.n_anchors),
+                seed_anchors: plan.n_anchors,
             })?
             .library
         } else {
             lib_p_mh
         };
+        rt_bootstrap::record_auto(cfg, &plan, search, &lib_p_mh);
         produced_rt_lib = Some(lib_p_mh.clone());
         lib_p_mh
     } else if cfg.rt_im_train.finetune_deeplc {
@@ -1196,10 +1203,13 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // `rt_im_train.multihead_anchors = search` makes run 1's adaptation a whole search
     // (extract to rescore) rather than one DeepLC worker, which would compete with the fronts
     // for the same threads, so the first run then adapts alone, as without the overlap.
+    // `auto` decides only after run 1's seed, so it keeps the overlap: when it chooses the
+    // bootstrap, that pass runs on the adaptation's thread share beside the fronts. It
+    // chooses it on runs short of seed anchors, which are the small ones.
     let mh_heads_for_scope = cfg
         .rt_im_train
         .multihead_heads(has_deeplc_for_scope, deeplc_rt_source_for_scope);
-    let search_anchors = rt_bootstrap::active(cfg, mh_heads_for_scope);
+    let search_anchors = rt_bootstrap::always(cfg, mh_heads_for_scope);
     rt_bootstrap::warn_if_inert(cfg, mh_heads_for_scope, "run-experiment");
     if share_ft && overlap > 0 && !grouped_runs && search_anchors {
         info!(
@@ -1935,10 +1945,36 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         deeplc_py.is_some(),
         cfg.deeplc_rt_source(library_input, deeplc_py.is_some()),
     );
-    let rt_identity = if rt_bootstrap::active(cfg, mh_heads) {
-        // Requested; whether a run refitted or fell back is in its adapted library's
-        // `.summary.json` (`anchor_source`).
+    // `auto` decides per adapting run. Under `first_run_only` that is run 1, whose library
+    // records the choice; under `per_run` the runs may differ, and each library says which.
+    let auto_search = mh_heads > 0
+        && cfg.rt_im_train.multihead_anchors == MultiheadAnchors::Auto
+        && cfg.groups.window_groups <= 1
+        && match cfg.experiment.rt_library_scope {
+            RtLibraryScope::FirstRunOnly => {
+                rt_bootstrap::anchor_source(&format!(
+                    "{}/{}",
+                    d(&names[0]),
+                    rt_bootstrap::MULTIHEAD_LIBRARY
+                ))
+                .as_deref()
+                    == Some("search")
+            }
+            _ => false,
+        };
+    let rt_identity = if rt_bootstrap::always(cfg, mh_heads) || auto_search {
+        // Requested (`search`) or chosen for run 1 (`auto`); whether a run refitted or fell
+        // back is in its adapted library's `.summary.json` (`anchor_source`).
         crate::sidecar::deeplc_identity(deeplc_py, &format!("multihead-{mh_heads}-search-anchors"))
+    } else if mh_heads > 0
+        && cfg.rt_im_train.multihead_anchors == MultiheadAnchors::Auto
+        && cfg.groups.window_groups <= 1
+        && !matches!(
+            cfg.experiment.rt_library_scope,
+            RtLibraryScope::FirstRunOnly
+        )
+    {
+        crate::sidecar::deeplc_identity(deeplc_py, &format!("multihead-{mh_heads}-auto-anchors"))
     } else if mh_heads > 0 {
         crate::sidecar::deeplc_identity(deeplc_py, &format!("multihead-{mh_heads}"))
     } else if cfg.rt_im_train.finetune_deeplc {
