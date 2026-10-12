@@ -115,8 +115,12 @@ than a number. Both are recorded in every run's `manifest.json`.
   ProteoBench Astral entrapment +0.6% at paired FDP 0.88% in both arms, Orbitrap AIF E. coli
   entrapment +0.9% at an unchanged FDP, single-cell HeLa on a human/yeast/E. coli library
   +6.3% with FDP 0.96% -> 0.77%; a 22-run single-cell HYE mixture quantified 7.2% more
-  proteins at an unchanged ratio error. It costs one extra extract-to-rescore pass and one
-  extra library prediction per adapting run (`docs/08_rt_im_train.md` section 4f). The default is omitted from the canonical configuration, so existing config
+  proteins at an unchanged ratio error; the 216-cell plate on one bootstrapped library gave
+  +7.8% / +5.5% precursors at decoy fraction 0.0097 in both arms. It costs one extra
+  extract-to-rescore pass and one extra library prediction per adapting run, once per
+  experiment under `first_run_only`: +63 s on one single-cell run with the DeepLC projection
+  cache on, about 2x that run with it off (`docs/08_rt_im_train.md` section 4f). The default
+  is omitted from the canonical configuration, so existing config
   hashes and every default output are unchanged.
 
 ## [0.6.0] - 2026-10-11

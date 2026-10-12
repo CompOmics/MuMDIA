@@ -743,12 +743,23 @@ two runs per condition) at an unchanged ratio error (median |epsilon| 0.238 agai
 a median CV 0.01 higher. The engine path itself, `search` on six single-cell runs as single
 `run`s, reproduced the emulation: +3.6% against +4.0% emulated on the same runs, decoy fraction
 0.0098 in both, a narrower `w_rt` in all six, 6,672-8,964 search anchors against 97-264 seed
-anchors.
+anchors. On the whole single-cell plate (216 cells, each searched alone on the library one
+cell had bootstrapped, as `first_run_only` hands it on), precursors at `run_psm_q <= 0.01` rose
+from 470,482 to 506,950 (+7.8%, 98 of 104 cells up) for one cell type and from 531,915 to
+561,017 (+5.5%, 98 of 108) for the other, at a decoy fraction of 0.0097 in both arms; the four
+cells that failed in both arms are empty wells.
 
 **Cost.** One extra extract-to-rescore pass and one extra whole-library DeepLC prediction on
 each adapting run: once per experiment under `first_run_only`, once per run under `per_run`.
 With the projection cache on (`deeplc_projection_cache`, the default) the second prediction
 reads the projection the first one wrote, because both re-predict the same base library.
+Measured on one single-cell run (6.4M-row library, 4.17M unique peptidoforms, 32 threads):
+254 s with `seed` against 317 s with `search` (+63 s: bootstrap search 28 s, refit 27 s of
+which 16 s evaluates the cached projection). With the cache off (`MUMDIA_CACHE_DIR=off`) the
+refit predicts the library again, and the adapting run took about 21 min against about 10.5
+(six runs sharing one host). Under `run-experiment` the lost `overlap_front_threads` overlap
+(see Interplay) is a further cost on the first run that was not measured on bulk data, where
+convert is minutes per file.
 
 **Status.** Default off. The entrapment arms above cover two acquisitions (Astral, Orbitrap
 AIF) with seeds and show no FDP increase; they ran the bootstrap outside the engine, and the
