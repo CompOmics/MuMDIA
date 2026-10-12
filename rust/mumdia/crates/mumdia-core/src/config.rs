@@ -1143,6 +1143,35 @@ pub struct RtImTrainConfig {
     /// the cost is 1.4x to 1.7x wall clock, because the calibration is fitted against each
     /// run's own anchors and so cannot be shared across an experiment.
     pub multihead_calibration: Option<usize>,
+    /// Which anchors the multi-head calibration of the run that adapts the library is
+    /// fitted on. `seed` (the default) is the run's confident seed PSMs at `q_train`, as
+    /// before. `search` adds a bootstrap pass on that run: the seed-anchored library is
+    /// searched (rt-im-train, extract, features, compete and a single-run rescore, in
+    /// `<run>/rt_bootstrap/`), the targets at `precursor_q <= q_train` of that search
+    /// become the anchors (observed RT = `apex_rt`), the multi-head calibration is refitted
+    /// on them, and the run is searched again on the refitted library. Under
+    /// `run-experiment` with `experiment.rt_library_scope = first_run_only` only the first
+    /// run pays for it and every later run reuses its library; under `per_run` every run
+    /// does. The per-run LOESS still fits on the seed anchors.
+    ///
+    /// Measured on 24 single-cell Astral runs (2026-10): out-of-sample RT error p95 5.35 s
+    /// with seed anchors (about 100-600) against 3.5 s with the first run's search anchors
+    /// (about 7,000), better in 24 of 24 runs, with no memorisation on held-out peptides;
+    /// a search with that library gave +7.3% and +4.0% precursors at an unchanged decoy
+    /// fraction. Extra seed anchors at q 5-10% made the fit worse, so the clean search
+    /// identifications are the point, not the count.
+    ///
+    /// It costs one extra extract-to-rescore pass and one extra whole-library DeepLC
+    /// prediction on each adapting run. Fewer search anchors than
+    /// `min_seed_for_calibration` (distinct target base peptides) or a failure anywhere in
+    /// the bootstrap pass keeps the seed-anchored library, with a warning. Inert, with a
+    /// warning, where no multi-head calibration runs (no DeepLC interpreter, or a native
+    /// retention-time source under the automatic head count). Refused with
+    /// `finetune_deeplc`, with `multihead_calibration = 0` and with
+    /// `groups.window_groups > 1`. Benchmark-gated: it still needs an entrapment arm and a
+    /// second acquisition before it can be a default (`docs/08_rt_im_train.md` section 4f).
+    #[serde(skip_serializing_if = "MultiheadAnchors::is_seed")]
+    pub multihead_anchors: MultiheadAnchors,
     /// DeepLC fine-tune training epochs (passed to `deeplc_finetune.py --epochs`).
     /// Early stopping with `finetune_patience` usually halts before this cap, so it
     /// is an upper bound rather than a fixed count. Only used when `finetune_deeplc`.
@@ -1300,6 +1329,26 @@ pub enum LibraryIrt {
     Deeplc,
 }
 
+/// Anchors of the multi-head calibration; see `RtImTrainConfig::multihead_anchors`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MultiheadAnchors {
+    /// The run's confident seed PSMs (`spectrum_q <= q_train`).
+    #[default]
+    Seed,
+    /// The confident targets of a bootstrap search of the run on the seed-anchored library
+    /// (`precursor_q <= q_train`, observed RT = `apex_rt`).
+    Search,
+}
+
+impl MultiheadAnchors {
+    /// The default. Omitted from the canonical configuration, so adding the field left the
+    /// config hash of every existing configuration unchanged.
+    pub fn is_seed(&self) -> bool {
+        matches!(self, MultiheadAnchors::Seed)
+    }
+}
+
 impl RtImTrainConfig {
     /// How many LC-setup heads this run should calibrate over: 0 when it should not.
     ///
@@ -1369,6 +1418,7 @@ impl Default for RtImTrainConfig {
             fallback_rt_window_s: 120.0,
             finetune_deeplc: false,
             multihead_calibration: None,
+            multihead_anchors: MultiheadAnchors::Seed,
             finetune_epochs: 25,   // deeplc_finetune.py default
             finetune_patience: 10, // deeplc_finetune.py default
             finetune_batch: 0,     // 0 = auto-scale to seed size
@@ -3466,6 +3516,36 @@ impl Config {
                     .into(),
             ));
         }
+        // `multihead_anchors = search` refits the multi-head calibration, so it needs one
+        // that can run. The automatic case without an interpreter is a warning at run time,
+        // like the multi-head default itself; these three are contradictions in the file.
+        if self.rt_im_train.multihead_anchors == MultiheadAnchors::Search {
+            if self.rt_im_train.finetune_deeplc {
+                return Err(Invalid(
+                    "rt_im_train.multihead_anchors = search refits the multi-head calibration \
+                     on a bootstrap search, and rt_im_train.finetune_deeplc replaces that \
+                     calibration with a fine-tune. Choose one."
+                        .into(),
+                ));
+            }
+            if self.rt_im_train.multihead_calibration == Some(0) {
+                return Err(Invalid(
+                    "rt_im_train.multihead_anchors = search refits the multi-head calibration, \
+                     and rt_im_train.multihead_calibration = 0 turns it off. Leave \
+                     multihead_calibration unset (automatic) or give a head count."
+                        .into(),
+                ));
+            }
+            if self.groups.window_groups > 1 {
+                return Err(Invalid(
+                    "rt_im_train.multihead_anchors = search is not supported with \
+                     groups.window_groups > 1: a grouped run calibrates per band and has no \
+                     single-run search to take anchors from. Use multihead_anchors = seed \
+                     or window_groups = 1."
+                        .into(),
+                ));
+            }
+        }
 
         // `finetune_batch = 0` is the documented automatic batch size (see the field), so
         // only the epoch count has a lower bound. Rejecting the zero batch made simply
@@ -4229,6 +4309,80 @@ mod tests {
                 !msg.contains('\r') && !msg.contains('\n') && !msg.contains("  "),
                 "{msg:?}"
             );
+        }
+    }
+
+    #[test]
+    fn multihead_anchors_default_to_the_seed_and_leave_the_config_hash_alone() {
+        let d = Config::default();
+        assert_eq!(d.rt_im_train.multihead_anchors, MultiheadAnchors::Seed);
+        assert_eq!(MultiheadAnchors::default(), MultiheadAnchors::Seed);
+        // The default is omitted from the canonical form, so every existing configuration
+        // keeps the config hash it had before the field existed.
+        assert!(
+            !d.canonical_json().contains("multihead_anchors"),
+            "the default must not change the canonical configuration"
+        );
+        let explicit_seed =
+            Config::from_json(r#"{"rt_im_train":{"multihead_anchors":"seed"}}"#).unwrap();
+        assert_eq!(explicit_seed.canonical_json(), d.canonical_json());
+
+        let search =
+            Config::from_json(r#"{"rt_im_train":{"multihead_anchors":"search"}}"#).unwrap();
+        assert_eq!(
+            search.rt_im_train.multihead_anchors,
+            MultiheadAnchors::Search
+        );
+        assert!(search
+            .canonical_json()
+            .contains(r#""multihead_anchors":"search""#));
+        // And it round-trips through its own canonical form.
+        let again = Config::from_json(&search.canonical_json()).unwrap();
+        assert_eq!(
+            again.rt_im_train.multihead_anchors,
+            MultiheadAnchors::Search
+        );
+        // An explicit head count is compatible.
+        let n = Config::from_json(
+            r#"{"rt_im_train":{"multihead_anchors":"search","multihead_calibration":40}}"#,
+        )
+        .unwrap();
+        assert_eq!(n.rt_im_train.multihead_heads(true, true), 40);
+
+        let unknown = Config::from_json(r#"{"rt_im_train":{"multihead_anchors":"psms"}}"#);
+        assert!(unknown.is_err(), "an unknown anchor source is refused");
+    }
+
+    #[test]
+    fn search_anchors_are_refused_where_no_single_multihead_fit_can_take_them() {
+        for (json, needle) in [
+            (
+                r#"{"rt_im_train":{"multihead_anchors":"search","finetune_deeplc":true}}"#,
+                "finetune_deeplc",
+            ),
+            (
+                r#"{"rt_im_train":{"multihead_anchors":"search","multihead_calibration":0}}"#,
+                "multihead_calibration = 0",
+            ),
+            (
+                r#"{"rt_im_train":{"multihead_anchors":"search"},"groups":{"window_groups":2}}"#,
+                "groups.window_groups",
+            ),
+        ] {
+            let msg = Config::from_json(json)
+                .expect_err("must be refused")
+                .to_string();
+            assert!(msg.contains("multihead_anchors"), "{json}: {msg}");
+            assert!(msg.contains(needle), "{json}: {msg}");
+            assert!(!msg.contains("  ") && !msg.contains('\n'), "{msg:?}");
+        }
+        // The seed default stays compatible with all three.
+        for json in [
+            r#"{"rt_im_train":{"finetune_deeplc":true}}"#,
+            r#"{"rt_im_train":{"multihead_calibration":0}}"#,
+            r#"{"groups":{"window_groups":2}}"#,
+        ] {
+            assert!(Config::from_json(json).is_ok(), "{json}");
         }
     }
 

@@ -91,6 +91,38 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Added
+
+- **Search-anchored multi-head calibration** (`rt_im_train.multihead_anchors = "search"`,
+  default `"seed"`, benchmark-gated). The run that adapts the library (a single `run`, the
+  first run of `run-experiment` under `rt_library_scope = first_run_only`, or every run under
+  `per_run`) is searched once on the seed-anchored library, in `<run>/rt_bootstrap/`
+  (rt-im-train, extract, features, compete and a single-run rescore). Its targets at
+  `precursor_q <= q_train`, with observed RT = `apex_rt`, are written as
+  `rt_bootstrap/search_anchors.parquet` (new artifact `rt_bootstrap_anchors`, v1), the
+  multi-head calibration is refitted on them, and the run continues on the refitted library
+  under the usual file names. Too few search anchors (`min_seed_for_calibration` distinct
+  base peptides) or a failure in the bootstrap pass keeps the seed-anchored library with a
+  warning. The library's `.summary.json` records `anchor_source`, and a single run's manifest
+  names the RT model `...-multihead-<N>-search-anchors`. Refused with `finetune_deeplc`,
+  `multihead_calibration = 0` and `groups.window_groups > 1`; it turns off
+  `experiment.overlap_front_threads` for the first run. Measured outside the engine on 24
+  single-cell Astral runs: held-out RT error p95 5.35 s -> 3.5 s in 24 of 24 runs, and +7.3%
+  / +4.0% precursors at an unchanged decoy fraction. Entrapment with three seeds per arm
+  (bootstrap emulated outside the engine, engine path checked against it on six runs):
+  ProteoBench Astral entrapment +0.6% at paired FDP 0.88% in both arms, Orbitrap AIF E. coli
+  entrapment +0.9% at an unchanged FDP, single-cell HeLa on a human/yeast/E. coli library
+  +6.3% with FDP 0.96% -> 0.77%; a 22-run single-cell HYE mixture quantified 7.2% more
+  proteins at an unchanged ratio error; the 216-cell plate on one bootstrapped library gave
+  +7.8% / +5.5% precursors at decoy fraction 0.0097 in both arms. It costs one extra
+  extract-to-rescore pass and one extra library prediction per adapting run, once per
+  experiment under `first_run_only`: +63 s on one single-cell run with the DeepLC projection
+  cache on, about 2x that run with it off (`docs/08_rt_im_train.md` section 4f). The default
+  is omitted from the canonical configuration, so existing config
+  hashes and every default output are unchanged.
+
 ## [0.6.0] - 2026-10-11
 
 ### Added

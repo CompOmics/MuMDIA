@@ -24,6 +24,10 @@ pub mod artifact {
     pub const PRESCAN_SURVIVORS: (&str, u32) = ("prescan_survivors", 1);
     pub const PRESCREEN_SCORES: (&str, u32) = ("prescreen_scores", 1);
     pub const SEED_PSMS: (&str, u32) = ("seed_psms", 1);
+    /// The confident targets of a bootstrap search, in the seed's column shape, that the
+    /// multi-head calibration is refitted on under `rt_im_train.multihead_anchors = search`
+    /// (`<run>/rt_bootstrap/search_anchors.parquet`, `stages::rt_bootstrap`).
+    pub const RT_BOOTSTRAP_ANCHORS: (&str, u32) = ("rt_bootstrap_anchors", 1);
     pub const RUN_WINDOWS: (&str, u32) = ("run_windows", 1);
     pub const PSMS_EXTRACTED: (&str, u32) = ("psms_extracted", 2);
     /// v1: every row stores its whole `rt` axis and its whole `intensity` trace.

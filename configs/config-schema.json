@@ -1553,6 +1553,25 @@
       "source_struct": "RtImTrainConfig"
     },
     {
+      "path": "rt_im_train.multihead_anchors",
+      "name": "multihead_anchors",
+      "section": "rt_im_train",
+      "rust_type": "MultiheadAnchors",
+      "kind": "enum",
+      "optional": false,
+      "default": "seed",
+      "default_text": "`seed`",
+      "help": "Which anchors the multi-head calibration of the run that adapts the library is fitted on. `seed` (the default) is the run's confident seed PSMs at `q_train`, as before. `search` adds a bootstrap pass on that run: the seed-anchored library is searched (rt-im-train, extract, features, compete and a single-run rescore, in `<run>/rt_bootstrap/`), the targets at `precursor_q <= q_train` of that search become the anchors (observed RT = `apex_rt`), the multi-head calibration is refitted on them, and the run is searched again on the refitted library. Under `run-experiment` with `experiment.rt_library_scope = first_run_only` only the first run pays for it and every later run reuses its library; under `per_run` every run does. The per-run LOESS still fits on the seed anchors. Measured on 24 single-cell Astral runs (2026-10): out-of-sample RT error p95 5.35 s with seed anchors (about 100-600) against 3.5 s with the first run's search anchors (about 7,000), better in 24 of 24 runs, with no memorisation on held-out peptides; a search with that library gave +7.3% and +4.0% precursors at an unchanged decoy fraction. Extra seed anchors at q 5-10% made the fit worse, so the clean search identifications are the point, not the count. It costs one extra extract-to-rescore pass and one extra whole-library DeepLC prediction on each adapting run. Fewer search anchors than `min_seed_for_calibration` (distinct target base peptides) or a failure anywhere in the bootstrap pass keeps the seed-anchored library, with a warning. Inert, with a warning, where no multi-head calibration runs (no DeepLC interpreter, or a native retention-time source under the automatic head count). Refused with `finetune_deeplc`, with `multihead_calibration = 0` and with `groups.window_groups > 1`. Benchmark-gated: it still needs an entrapment arm and a second acquisition before it can be a default (`docs/08_rt_im_train.md` section 4f).",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "RtImTrainConfig",
+      "choices": [
+        "seed",
+        "search"
+      ]
+    },
+    {
       "path": "rt_im_train.finetune_epochs",
       "name": "finetune_epochs",
       "section": "rt_im_train",

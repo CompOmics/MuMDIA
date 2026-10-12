@@ -847,7 +847,22 @@ Do not enable these by default from a single AIF count:
 - margin competition or unique-evidence competition;
 - MBR transfer/re-extraction;
 - acquisition-specific fragment/peak caps. The shipped default stays uncapped;
-  see the peak-cap subsection above.
+  see the peak-cap subsection above;
+- search-anchored multi-head calibration (`rt_im_train.multihead_anchors =
+  "search"`, default `"seed"`). The adapting run is searched once on the
+  seed-anchored library (`<run>/rt_bootstrap/`), and the multi-head calibration is
+  refitted on that search's targets at `precursor_q <= q_train` (observed RT =
+  `apex_rt`). Measured outside the engine on 24 single-cell Astral runs: held-out RT
+  p95 5.35 s -> 3.5 s in 24/24 runs, +7.3% / +4.0% precursors at an unchanged decoy
+  fraction. Entrapment with three seeds (emulated outside the engine): ProteoBench
+  Astral +0.6% at paired FDP 0.88% -> 0.88%, Orbitrap AIF +0.9% at an unchanged FDP,
+  single-cell HeLa on a HYE library +6.3% with FDP 0.96% -> 0.77%; the engine path
+  reproduced the emulation on six runs (+3.6% against +4.0%), and the 216-cell plate on
+  one bootstrapped library gave +7.8% / +5.5% precursors at decoy fraction 0.0097 in
+  both arms. It costs one extra extract-to-rescore pass and one extra library
+  prediction on each adapting run (once per experiment under `first_run_only`): +63 s
+  on one single-cell run with the projection cache on (254 s -> 317 s), about 2x that
+  run with it off. It is refused for grouped runs. `docs/08_rt_im_train.md` section 4f.
 
 `compete.group_by = peptidoform_charge` is the default (2026-09-06) and is
 required, not optional, for a PTM or modification search. Under `base_peptide`

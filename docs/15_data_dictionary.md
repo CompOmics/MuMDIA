@@ -184,6 +184,25 @@ Per-run fragment mass recalibration sidecar consumed by `extract`.
 | `n_dev` | integer | - | number of matched-fragment ppm deviations collected |
 | `cal_passes` | integer | - | calibration passes run (0 = fallback, 1 = single, 2 = robust two-pass) |
 
+### rt_bootstrap_anchors (`rt_bootstrap.rs`, `write_search_anchors`)
+
+Written only under `rt_im_train.multihead_anchors = search`, to
+`<run>/rt_bootstrap/search_anchors.parquet`: the confident targets of the bootstrap
+search that the multi-head calibration is refitted on (docs/08 section 4f). Seed-shaped,
+so `deeplc_finetune.py` reads it as it reads `seed_psms`. One row per candidate, ascending
+`candidate_id`.
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `candidate_id` | UInt32 | no | - | library candidate id |
+| `peptidoform` | Utf8 | no | - | ProForma-lite peptidoform |
+| `charge` | Int32 | no | - | precursor charge |
+| `base_peptide_id` | UInt32 | no | - | grouping key (also the `window_holdout_frac` split key) |
+| `label` | Utf8 | no | - | always `target` |
+| `score` | Float64 | no | - | the bootstrap rescorer's score of the kept row |
+| `spectrum_q` | Float64 | no | - | the bootstrap's `precursor_q` (`<= rt_im_train.q_train`) |
+| `observed_rt` | Float64 | no | s | the bootstrap's `apex_rt` |
+
 ---
 
 ## Stage B: `rt-im-train` (`stages/rt_im_train.rs`)

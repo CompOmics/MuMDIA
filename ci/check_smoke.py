@@ -43,6 +43,8 @@ EXPECTED_SCHEMA_VERSIONS = {
     "fragment_library_precursors": 1,
     "fragment_library_fragments": 1,
     "seed_psms": 1,
+    # Written only under `rt_im_train.multihead_anchors = search` (smoke arm 5c checks it).
+    "rt_bootstrap_anchors": 1,
     "run_windows": 1,
     "psms_extracted": 2,
     # 2 under the default `extract.chromatogram_schema = 2` (CHROMATOGRAMS_V2, the default

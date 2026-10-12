@@ -466,6 +466,10 @@ pub fn run(p: RunParams) -> Result<()> {
         has_deeplc,
         cfg.deeplc_rt_source(p.lib_precursors.is_some(), has_deeplc),
     );
+    rt_bootstrap::warn_if_inert(cfg, mh_heads, "run");
+    // Set when `rt_im_train.multihead_anchors = search` refitted the library on the
+    // anchors of a bootstrap search (`rt_bootstrap`), for the manifest's RT identity.
+    let mut search_refit = false;
     // Grouped: everything from the seed to the competed table happens one isolation-window
     // group at a time, and the pooled artifacts come back under the same names the
     // ungrouped path writes, so rescore, quant and report below are shared.
@@ -583,7 +587,9 @@ pub fn run(p: RunParams) -> Result<()> {
                 &cfg.predict_frag.sidecar_script_dir,
                 "deeplc_finetune.py",
             );
-            let lib_p_mh = d("fragment_library_precursors_multihead.parquet");
+            // Under `multihead_anchors = search` this seed-anchored fit goes to
+            // `rt_bootstrap/` and the refit below takes the usual name.
+            let lib_p_mh = rt_bootstrap::seed_library_path(cfg, mh_heads, p.out_dir);
             info!(stage = %"deeplc-multihead", "run: stage start");
             crate::sidecar::run_deeplc_multihead(
                 python,
@@ -601,6 +607,37 @@ pub fn run(p: RunParams) -> Result<()> {
             if rt_placeholder {
                 crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
             }
+            let lib_p_mh = if rt_bootstrap::active(cfg, mh_heads) {
+                info!(stage = %"rt-bootstrap", "run: stage start");
+                let o = rt_bootstrap::refit(&rt_bootstrap::Refit {
+                    cfg,
+                    config_hash: &ch,
+                    converted: &co,
+                    lib_p_base: &lib_p,
+                    lib_f: &lib_f,
+                    seed: &seed,
+                    out: p.out_dir,
+                    seed_library: &lib_p_mh,
+                    mh_heads,
+                    threads: rayon::current_num_threads(),
+                    irt_placeholder: rt_placeholder,
+                    seed_anchors: anchor_plan.n_anchors,
+                })?;
+                if let (Some(t), Some(path)) = (o.anchors, o.anchors_path.as_deref()) {
+                    search_refit = true;
+                    man.record(record_artifact(
+                        artifact::RT_BOOTSTRAP_ANCHORS.0,
+                        artifact::RT_BOOTSTRAP_ANCHORS,
+                        path,
+                        t.rows as u64,
+                        "rt-bootstrap",
+                        &ch,
+                    )?);
+                }
+                o.library
+            } else {
+                lib_p_mh
+            };
             let n_mh = mumdia_io::table::nrows(&lib_p_mh)?;
             man.record(record_artifact(
                 artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
@@ -1001,6 +1038,8 @@ pub fn run(p: RunParams) -> Result<()> {
             "library" => "imported-library".to_string(),
             m => crate::sidecar::deeplc_identity(deeplc_py, &format!("{m} (per window group)")),
         }
+    } else if search_refit {
+        crate::sidecar::deeplc_identity(deeplc_py, &format!("multihead-{mh_heads}-search-anchors"))
     } else if mh_heads > 0 {
         crate::sidecar::deeplc_identity(deeplc_py, &format!("multihead-{mh_heads}"))
     } else if cfg.rt_im_train.finetune_deeplc {
