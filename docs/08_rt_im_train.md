@@ -723,18 +723,38 @@ error p95 from 5.35 s to 3.5 s in 24 of 24 runs, with no memorisation on held-ou
 and the gain transferred to the runs that reuse the library. A search with that library gave
 +7.3% and +4.0% precursors at an unchanged decoy fraction, with a narrower RT window. Adding
 noisier seed anchors (q 5-10%) made the fit worse, so the point is clean anchors, not more of
-them.
+them. A second iteration (refitting on the bootstrapped search's own IDs) added at most 1%,
+inside rerun noise, and anchors pooled from six runs (14,269, mapped onto one RT scale) gave
+less (+5.6% / +3.3%), so one bootstrap of one run is the design.
+
+Entrapment, three NN seeds per arm, bootstrap emulated outside the engine with the same worker
+(2026-10-12):
+
+| Set | Baseline | `search` | FDP baseline -> `search` |
+|---|---|---|---|
+| ProteoBench Astral entrapment, 3 runs pooled | 91,501 precursors | 92,028 (+0.6%) | paired 0.88% -> 0.88% |
+| Orbitrap AIF E. coli entrapment (lib2) | 12,050 real at FDP 1% | 12,154 (+0.9%) | 1.00-1.03% -> 0.99-1.03% at q 1% |
+| Single-cell plate HeLa QC on a human/yeast/E. coli library | 15,847 real at FDP 1% | 16,847 (+6.3%) | 0.89-1.06% -> 0.74-0.82% at q 1% |
+
+The gain is largest where the seed search finds few anchors (single cells, about 100-250) and
+small where it already finds thousands. On a 22-run single-cell HYE mixture under
+`run-experiment` the bootstrapped library quantified 7.2% more proteins (4,366 against 4,073 at
+two runs per condition) at an unchanged ratio error (median |epsilon| 0.238 against 0.243) and
+a median CV 0.01 higher. The engine path itself, `search` on six single-cell runs as single
+`run`s, reproduced the emulation: +3.6% against +4.0% emulated on the same runs, decoy fraction
+0.0098 in both, a narrower `w_rt` in all six, 6,672-8,964 search anchors against 97-264 seed
+anchors.
 
 **Cost.** One extra extract-to-rescore pass and one extra whole-library DeepLC prediction on
 each adapting run: once per experiment under `first_run_only`, once per run under `per_run`.
 With the projection cache on (`deeplc_projection_cache`, the default) the second prediction
 reads the projection the first one wrote, because both re-predict the same base library.
 
-**Status.** Benchmark-gated, default off. The single-cell numbers are one acquisition and a
-decoy fraction, not an entrapment FDP. Before it can become a default it needs an entrapment
-arm and a second acquisition (CLAUDE.md). The Rust unit tests and the stub arm of
-`ci/smoke.sh` (section 5c) exercise the orchestration and the anchor table; the real DeepLC
-refit is not exercised by either.
+**Status.** Default off. The entrapment arms above cover two acquisitions (Astral, Orbitrap
+AIF) with seeds and show no FDP increase; they ran the bootstrap outside the engine, and the
+engine path was checked against that emulation on six runs. The Rust unit tests and the stub
+arm of `ci/smoke.sh` (section 5c) exercise the orchestration and the anchor table; the real
+DeepLC refit is exercised only by the runs above.
 
 ### 5. Optional adaptive per-region window (default off)
 

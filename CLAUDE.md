@@ -854,7 +854,10 @@ Do not enable these by default from a single AIF count:
   refitted on that search's targets at `precursor_q <= q_train` (observed RT =
   `apex_rt`). Measured outside the engine on 24 single-cell Astral runs: held-out RT
   p95 5.35 s -> 3.5 s in 24/24 runs, +7.3% / +4.0% precursors at an unchanged decoy
-  fraction. One acquisition, no entrapment arm yet. It costs one extra
+  fraction. Entrapment with three seeds (emulated outside the engine): ProteoBench
+  Astral +0.6% at paired FDP 0.88% -> 0.88%, Orbitrap AIF +0.9% at an unchanged FDP,
+  single-cell HeLa on a HYE library +6.3% with FDP 0.96% -> 0.77%; the engine path
+  reproduced the emulation on six runs (+3.6% against +4.0%). It costs one extra
   extract-to-rescore pass and one extra library prediction on each adapting run, and
   it is refused for grouped runs. `docs/08_rt_im_train.md` section 4f.
 

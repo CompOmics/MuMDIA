@@ -110,10 +110,13 @@ than a number. Both are recorded in every run's `manifest.json`.
   `multihead_calibration = 0` and `groups.window_groups > 1`; it turns off
   `experiment.overlap_front_threads` for the first run. Measured outside the engine on 24
   single-cell Astral runs: held-out RT error p95 5.35 s -> 3.5 s in 24 of 24 runs, and +7.3%
-  / +4.0% precursors at an unchanged decoy fraction. It costs one extra extract-to-rescore
-  pass and one extra library prediction per adapting run, and it still needs an entrapment
-  arm and a second acquisition before it can be a default (`docs/08_rt_im_train.md`
-  section 4f). The default is omitted from the canonical configuration, so existing config
+  / +4.0% precursors at an unchanged decoy fraction. Entrapment with three seeds per arm
+  (bootstrap emulated outside the engine, engine path checked against it on six runs):
+  ProteoBench Astral entrapment +0.6% at paired FDP 0.88% in both arms, Orbitrap AIF E. coli
+  entrapment +0.9% at an unchanged FDP, single-cell HeLa on a human/yeast/E. coli library
+  +6.3% with FDP 0.96% -> 0.77%; a 22-run single-cell HYE mixture quantified 7.2% more
+  proteins at an unchanged ratio error. It costs one extra extract-to-rescore pass and one
+  extra library prediction per adapting run (`docs/08_rt_im_train.md` section 4f). The default is omitted from the canonical configuration, so existing config
   hashes and every default output are unchanged.
 
 ## [0.6.0] - 2026-10-11
