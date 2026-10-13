@@ -1,9 +1,16 @@
-//! The instrument that acquired a run, read from the mzML header.
+//! The instrument that acquired a run, read from the mzML header or from the metadata of a
+//! timsTOF `.d`, and the provenance `convert` records with the spectra.
 //!
 //! `convert` records it in the spectra artifacts' reports (`params.instrument`), and the
 //! settings that are left to the engine (`extract.apex_count_window = "auto"`) are resolved
 //! from that record, so a standalone `extract` on converted spectra, an ungrouped `run`, a
 //! grouped run and every run of an experiment resolve them the same way.
+//!
+//! The same report says which reader wrote the spectra (`params.reader`, written only for
+//! the native diaPASEF reader; absent means mzML) and from which source (`params.mzml`).
+//! [`provenance`] reads all three. The instrument is provenance only: whether the spectra
+//! carry 1/K0 is the reader's fact ([`Provenance::has_im`]), never the model name's, because
+//! a timsTOF mzML written by msconvert has no 1/K0.
 //!
 //! The header is read as text, as `convert`'s declared spectrum count is: the instrument
 //! description sits in the first few KiB of every mzML, and mzdata does not expose the
@@ -57,6 +64,34 @@ impl Instrument {
     }
 }
 
+/// `params.reader` of spectra the native timsTOF reader wrote (`stages::convert::tdf`).
+pub const READER_TIMSRUST: &str = "timsrust";
+
+/// The instrument a timsTOF `.d` names in `analysis.tdf` (`GlobalMetadata.InstrumentName`),
+/// or `None` when the table or the key is missing. Bruker files carry no PSI-MS model
+/// accession, so only the name is set.
+pub fn from_tdf(dir: &str) -> Option<Instrument> {
+    let db = std::path::Path::new(dir).join("analysis.tdf");
+    if !db.is_file() {
+        return None;
+    }
+    let con = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .ok()?;
+    let name: String = con
+        .query_row(
+            "SELECT Value FROM GlobalMetadata WHERE Key = 'InstrumentName'",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let name = name.trim().to_string();
+    (!name.is_empty()).then_some(Instrument {
+        accession: String::new(),
+        name,
+        astral_analyzer: false,
+    })
+}
+
 /// The instrument the mzML at `path` declares, or `None` when the header cannot be read or
 /// names no instrument.
 pub fn from_mzml(path: &str) -> Option<Instrument> {
@@ -75,17 +110,64 @@ pub fn from_mzml(path: &str) -> Option<Instrument> {
     parse_header(&String::from_utf8_lossy(&head[..n]))
 }
 
+/// Which reader wrote a spectra artifact (`params.reader`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reader {
+    /// mzML through mzdata, including a vendor file converted to mzML first. Also every
+    /// report without the field, which is every report written before it existed.
+    Mzml,
+    /// The native timsTOF diaPASEF reader: the spectra carry per-peak 1/K0.
+    Timsrust,
+}
+
+/// What `convert` recorded about where a spectra artifact came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Provenance {
+    /// `params.instrument`; `None` when the source named none or predates the field.
+    pub instrument: Option<Instrument>,
+    /// `params.reader`; [`Reader::Mzml`] when absent.
+    pub reader: Reader,
+    /// `params.mzml`: the path convert read, an mzML or a `.d`.
+    pub source: Option<String>,
+}
+
+impl Provenance {
+    /// Do the spectra carry per-peak 1/K0? The one predicate for 4D behaviour.
+    pub fn has_im(&self) -> bool {
+        self.reader == Reader::Timsrust
+    }
+}
+
+/// The provenance `convert` recorded for the spectra artifact at `spectra_path`
+/// (`<spectra>.report.json`, `params`). `None` for a missing or unreadable report.
+pub fn provenance(spectra_path: &str) -> Option<Provenance> {
+    let text = std::fs::read_to_string(format!("{spectra_path}.report.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let params = v.get("params")?;
+    let instrument = params
+        .get("instrument")
+        .filter(|i| !i.is_null())
+        .and_then(|i| serde_json::from_value(i.clone()).ok());
+    let reader = match params.get("reader").and_then(|r| r.as_str()) {
+        Some(READER_TIMSRUST) => Reader::Timsrust,
+        _ => Reader::Mzml,
+    };
+    let source = params
+        .get("mzml")
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
+    Some(Provenance {
+        instrument,
+        reader,
+        source,
+    })
+}
+
 /// The instrument `convert` recorded for the spectra artifact at `spectra_path`
 /// (`<spectra>.report.json`, `params.instrument`). `None` for spectra converted before the
 /// field existed, for a missing report and for a file that named no instrument.
 pub fn recorded(spectra_path: &str) -> Option<Instrument> {
-    let text = std::fs::read_to_string(format!("{spectra_path}.report.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let inst = v.get("params")?.get("instrument")?;
-    if inst.is_null() {
-        return None;
-    }
-    serde_json::from_value(inst.clone()).ok()
+    provenance(spectra_path)?.instrument
 }
 
 /// Parse the instrument from the text of an mzML header.
@@ -296,6 +378,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recorded(spectra), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn provenance_reads_the_reader_and_the_source_and_defaults_to_mzml() {
+        let dir = std::env::temp_dir().join(format!("mumdia_prov_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spectra = dir.join("spectra_ms2.parquet");
+        let spectra = spectra.to_str().unwrap();
+        assert_eq!(provenance(spectra), None);
+        // An mzML report: no `reader` field.
+        std::fs::write(
+            format!("{spectra}.report.json"),
+            serde_json::json!({"params": {"mzml": "a.mzML", "instrument": null}}).to_string(),
+        )
+        .unwrap();
+        let p = provenance(spectra).unwrap();
+        assert_eq!(p.reader, Reader::Mzml);
+        assert!(!p.has_im());
+        assert_eq!(p.source.as_deref(), Some("a.mzML"));
+        assert_eq!(p.instrument, None);
+        // A native diaPASEF report.
+        let inst = Instrument {
+            accession: String::new(),
+            name: "timsTOF Ultra 2".into(),
+            astral_analyzer: false,
+        };
+        std::fs::write(
+            format!("{spectra}.report.json"),
+            serde_json::json!({"params": {"mzml": "b.d", "reader": READER_TIMSRUST,
+                "instrument": inst}})
+            .to_string(),
+        )
+        .unwrap();
+        let p = provenance(spectra).unwrap();
+        assert_eq!(p.reader, Reader::Timsrust);
+        assert!(p.has_im());
+        assert_eq!(p.source.as_deref(), Some("b.d"));
+        assert_eq!(recorded(spectra), Some(inst));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_tdf_instrument_name_comes_from_global_metadata() {
+        let dir = std::env::temp_dir().join(format!("mumdia_tdf_inst_{}.d", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        assert_eq!(from_tdf(d), None);
+        {
+            let con = rusqlite::Connection::open(dir.join("analysis.tdf")).unwrap();
+            con.execute_batch(
+                "CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT);
+                 INSERT INTO GlobalMetadata VALUES ('InstrumentName', 'timsTOF Ultra 2');
+                 INSERT INTO GlobalMetadata VALUES ('InstrumentVendor', 'Bruker');",
+            )
+            .unwrap();
+        }
+        let i = from_tdf(d).unwrap();
+        assert_eq!(i.name, "timsTOF Ultra 2");
+        assert!(i.accession.is_empty() && !i.is_astral());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

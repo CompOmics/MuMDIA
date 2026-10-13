@@ -47,6 +47,50 @@ struct LibraryInputRecord {
     input_role: &'static str,
 }
 
+/// Refuse the settings that do not yet support spectra with 1/K0, before any compute.
+///
+/// The input kind is the raw dispatch's: a diaPASEF `.d` (`raw::Vendor::BrukerTdf`) is the
+/// one input that `convert` reads with its ion mobility, and the decision made here is the
+/// one conversion will make. Each refused mechanism keys its work on m/z isolation windows
+/// only, so on diaPASEF slots that share an m/z range it would merge what extraction keeps
+/// apart (docs/35_diapasef.md). `experiment` adds the experiment-only second pass.
+pub(crate) fn refuse_unsupported_on_4d(
+    cfg: &Config,
+    inputs: &[String],
+    experiment: bool,
+) -> Result<()> {
+    let Some(tdf) = inputs
+        .iter()
+        .find(|m| crate::raw::detect(m) == crate::raw::Vendor::BrukerTdf)
+    else {
+        return Ok(());
+    };
+    if cfg.groups.window_groups > 1 {
+        anyhow::bail!(
+            "groups.window_groups = {} is not supported on diaPASEF input yet ({tdf}): the \
+             isolation-window groups are cut in m/z and do not carry the 1/K0 slots of a \
+             diaPASEF run. Set groups.window_groups = 1.",
+            cfg.groups.window_groups
+        );
+    }
+    let p = &cfg.prescreen;
+    if p.enabled || p.tag_prefilter || p.score_before_prediction {
+        anyhow::bail!(
+            "the prescreen (prescreen.enabled, tag_prefilter, score_before_prediction) is \
+             not supported on diaPASEF input yet ({tdf}): it groups spectra by m/z window \
+             only. Turn all three off."
+        );
+    }
+    if experiment && cfg.mbr.strategy == mumdia_core::config::MbrStrategy::SecondPass {
+        anyhow::bail!(
+            "mbr.strategy = second_pass (the default of an experiment) is not supported on \
+             diaPASEF input yet ({tdf}): the second pass has no 1/K0 window for the \
+             transferred precursors. Set mbr.strategy = none."
+        );
+    }
+    Ok(())
+}
+
 /// Validate inputs and sidecar configuration before any multi-minute compute,
 /// so a missing file or a misconfigured rescorer fails immediately with an
 /// actionable message.
@@ -74,6 +118,7 @@ fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
             anyhow::bail!("{flag} not found or unreadable: {path}");
         }
     }
+    refuse_unsupported_on_4d(cfg, &[p.mzml.to_string()], false)?;
     // The interpreter fields were filled in by `python::resolve` before this point,
     // so a field still empty here means the role is unused or discovery failed.
     // The messages name the field and the alternative, which is what a user acts on.
@@ -1043,29 +1088,20 @@ fn convert_and_record(
         top_peaks_ms2: p.top_peaks_ms2,
         top_peaks_ms1: 0,
         config_hash: &convert_hash,
+        tdf: convert::TdfParams::from_config(&cfg.convert),
     })?;
     for (name, schema, path, hash) in [
-        (
-            "spectra_ms1",
-            artifact::SPECTRA_MS1,
-            &co.ms1,
-            &co.hashes.ms1,
-        ),
-        (
-            "spectra_ms2",
-            artifact::SPECTRA_MS2,
-            &co.ms2,
-            &co.hashes.ms2,
-        ),
+        ("spectra_ms1", co.schemas.ms1, &co.ms1, &co.hashes.ms1),
+        ("spectra_ms2", co.schemas.ms2, &co.ms2, &co.hashes.ms2),
         (
             "isolation_windows",
-            artifact::ISOLATION_WINDOWS,
+            co.schemas.isolation_windows,
             &co.isolation_windows,
             &co.hashes.isolation_windows,
         ),
         (
             "ms2_to_ms1",
-            artifact::MS2_TO_MS1,
+            co.schemas.ms2_to_ms1,
             &co.ms2_to_ms1,
             &co.hashes.ms2_to_ms1,
         ),
@@ -1088,4 +1124,55 @@ fn convert_and_record(
     }
 
     Ok(co)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Grouped runs, the prescreen and the experiment second pass are refused on a diaPASEF
+    /// `.d`, each with a message naming the setting to change; an mzML is never refused.
+    #[test]
+    fn diapasef_input_refuses_what_is_keyed_on_mz_windows_only() {
+        let d = std::env::temp_dir().join(format!("mumdia-run-4d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let dia = d.join("dia.d");
+        crate::raw::tdf_fixture(&dia, &[0, 9], "2", true);
+        let dia = vec![dia.to_string_lossy().into_owned()];
+        let mzml = vec!["run.mzML".to_string()];
+        let base = Config::default();
+
+        // The defaults pass on a single run; an experiment defaults to the second pass.
+        assert!(refuse_unsupported_on_4d(&base, &dia, false).is_ok());
+        let e = refuse_unsupported_on_4d(&base, &dia, true)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("mbr.strategy = none"), "{e}");
+        let mut none = base.clone();
+        none.mbr.strategy = mumdia_core::config::MbrStrategy::None;
+        assert!(refuse_unsupported_on_4d(&none, &dia, true).is_ok());
+
+        let mut grouped = none.clone();
+        grouped.groups.window_groups = 4;
+        let e = refuse_unsupported_on_4d(&grouped, &dia, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("groups.window_groups = 1"), "{e}");
+
+        for set in [
+            |c: &mut Config| c.prescreen.enabled = true,
+            |c: &mut Config| c.prescreen.tag_prefilter = true,
+            |c: &mut Config| c.prescreen.score_before_prediction = true,
+        ] {
+            let mut c = none.clone();
+            set(&mut c);
+            let e = refuse_unsupported_on_4d(&c, &dia, false)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("prescreen"), "{e}");
+            assert!(refuse_unsupported_on_4d(&c, &mzml, true).is_ok());
+        }
+        assert!(refuse_unsupported_on_4d(&grouped, &mzml, true).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

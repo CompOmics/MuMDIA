@@ -344,6 +344,47 @@ pub struct ConvertConfig {
     /// `1` converts one at a time, as before. Only the first conversion of an input pays
     /// this at all; `reuse_converted` skips the rest. Not measured at scale.
     pub parallel_conversions: usize,
+    /// Native diaPASEF reader (`stages::convert::tdf`): m/z merge tolerance in ppm between
+    /// neighbouring TOF points of one centroid (single linkage). Default 10.
+    ///
+    /// Read only for a timsTOF `.d` whose frames are diaPASEF, which `convert` reads
+    /// natively; every other input ignores the `tdf_*` keys. Each `tdf_*` key is omitted
+    /// from the canonical configuration at its default, so it changes no config hash.
+    #[serde(skip_serializing_if = "is_default_tdf_mz_ppm")]
+    pub tdf_mz_ppm: f64,
+    /// Native diaPASEF reader: a gap of more than this many TIMS scans without signal
+    /// splits one m/z trace into separate centroids. Default 30. Provisional: it rests on a
+    /// peak census of one run and the seed plateau, not on an end-to-end sweep.
+    #[serde(skip_serializing_if = "is_default_tdf_im_gap_scans")]
+    pub tdf_im_gap_scans: u32,
+    /// Native diaPASEF reader: a centroid built from fewer raw TOF x scan points than this
+    /// is dropped. Default 2. Provisional, as `tdf_im_gap_scans`.
+    #[serde(skip_serializing_if = "is_default_tdf_min_points")]
+    pub tdf_min_points: u32,
+    /// Native diaPASEF reader: split each m/z x mobility cluster at the valleys of its
+    /// m/z profile. A local minimum of the smoothed profile is a cut when it is below this
+    /// fraction of the smaller of the two humps beside it, so one ion stays one centroid and
+    /// two neighbouring ions become two. Must be in [0, 1); 0 (default) is off and leaves
+    /// the centroids unchanged. Benchmark-gated (docs/35_diapasef.md).
+    #[serde(skip_serializing_if = "is_default_tdf_mz_valley")]
+    pub tdf_mz_valley: f64,
+    /// Native diaPASEF reader: half-width in ppm of the triangular smoothing applied to the
+    /// m/z profile before `tdf_mz_valley` looks for valleys; 0 is no smoothing. Default 8.
+    /// Unused while `tdf_mz_valley` is 0.
+    #[serde(skip_serializing_if = "is_default_tdf_mz_smooth_ppm")]
+    pub tdf_mz_smooth_ppm: f64,
+    /// Native diaPASEF reader: split each cluster (after the m/z valley split, when that is
+    /// on) at the valleys of its mobility profile, the summed intensity per TIMS scan after
+    /// a triangular smoothing of half-width `tdf_im_smooth_scans`. Separates ions of one m/z
+    /// whose mobility profiles touch without a `tdf_im_gap_scans` gap. Must be in [0, 1);
+    /// 0 (default) is off and leaves the centroids unchanged. Benchmark-gated.
+    #[serde(skip_serializing_if = "is_default_tdf_im_valley")]
+    pub tdf_im_valley: f64,
+    /// Native diaPASEF reader: half-width in TIMS scans of the mobility profile smoothing
+    /// used by `tdf_im_valley`; 0 is no smoothing. Default 8. Unused while `tdf_im_valley`
+    /// is 0.
+    #[serde(skip_serializing_if = "is_default_tdf_im_smooth_scans")]
+    pub tdf_im_smooth_scans: f64,
 }
 impl Default for ConvertConfig {
     fn default() -> Self {
@@ -353,8 +394,38 @@ impl Default for ConvertConfig {
             msconvert_args: Vec::new(),
             reuse_converted: true,
             parallel_conversions: 4,
+            tdf_mz_ppm: 10.0,
+            tdf_im_gap_scans: 30,
+            tdf_min_points: 2,
+            tdf_mz_valley: 0.0,
+            tdf_mz_smooth_ppm: 8.0,
+            tdf_im_valley: 0.0,
+            tdf_im_smooth_scans: 8.0,
         }
     }
+}
+
+// The `convert.tdf_*` keys at their defaults, which the canonical configuration omits.
+fn is_default_tdf_mz_ppm(v: &f64) -> bool {
+    *v == ConvertConfig::default().tdf_mz_ppm
+}
+fn is_default_tdf_im_gap_scans(v: &u32) -> bool {
+    *v == ConvertConfig::default().tdf_im_gap_scans
+}
+fn is_default_tdf_min_points(v: &u32) -> bool {
+    *v == ConvertConfig::default().tdf_min_points
+}
+fn is_default_tdf_mz_valley(v: &f64) -> bool {
+    *v == ConvertConfig::default().tdf_mz_valley
+}
+fn is_default_tdf_mz_smooth_ppm(v: &f64) -> bool {
+    *v == ConvertConfig::default().tdf_mz_smooth_ppm
+}
+fn is_default_tdf_im_valley(v: &f64) -> bool {
+    *v == ConvertConfig::default().tdf_im_valley
+}
+fn is_default_tdf_im_smooth_scans(v: &f64) -> bool {
+    *v == ConvertConfig::default().tdf_im_smooth_scans
 }
 
 /// Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates that have no
@@ -3539,6 +3610,26 @@ impl Config {
                 "predict_frag.charge2_from_precursor_charge must be >= 1".into(),
             ));
         }
+        let cv = &self.convert;
+        let frac = |v: f64| (0.0..1.0).contains(&v);
+        let width = |v: f64| v.is_finite() && v >= 0.0;
+        if !(cv.tdf_mz_ppm.is_finite() && cv.tdf_mz_ppm > 0.0) || cv.tdf_min_points == 0 {
+            return Err(Invalid(
+                "convert.tdf_mz_ppm must be finite and > 0, and convert.tdf_min_points >= 1".into(),
+            ));
+        }
+        if !(frac(cv.tdf_mz_valley)
+            && frac(cv.tdf_im_valley)
+            && width(cv.tdf_mz_smooth_ppm)
+            && width(cv.tdf_im_smooth_scans))
+        {
+            return Err(Invalid(
+                "convert.tdf_mz_valley and convert.tdf_im_valley must be in [0, 1) (0 disables \
+                 the valley split), and convert.tdf_mz_smooth_ppm and \
+                 convert.tdf_im_smooth_scans finite and >= 0."
+                    .into(),
+            ));
+        }
         if self
             .rt_im_train
             .anchor_q_ladder
@@ -4386,6 +4477,63 @@ mod tests {
         let sp: Config = serde_json::from_str(r#"{"mbr":{"strategy":"second_pass"}}"#).unwrap();
         assert_eq!(sp.mbr.strategy, MbrStrategy::SecondPass);
         assert!(d.validate().is_ok());
+    }
+
+    /// The native diaPASEF reader keys are omitted from the canonical configuration at their
+    /// defaults, so every configuration that does not set them keeps the config hash it had
+    /// before they existed. A non-default value is part of the configuration's identity.
+    #[test]
+    fn tdf_reader_keys_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        let canon = d.canonical_json();
+        assert!(!canon.contains("tdf_"), "{canon}");
+        let explicit = Config::from_json(
+            r#"{"convert":{"tdf_mz_ppm":10.0,"tdf_im_gap_scans":30,"tdf_min_points":2,
+                "tdf_mz_valley":0.0,"tdf_mz_smooth_ppm":8.0,"tdf_im_valley":0.0,
+                "tdf_im_smooth_scans":8.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.canonical_json(), canon);
+        for (json, key) in [
+            (r#"{"convert":{"tdf_mz_ppm":12.0}}"#, r#""tdf_mz_ppm":12.0"#),
+            (
+                r#"{"convert":{"tdf_im_gap_scans":20}}"#,
+                r#""tdf_im_gap_scans":20"#,
+            ),
+            (
+                r#"{"convert":{"tdf_min_points":3}}"#,
+                r#""tdf_min_points":3"#,
+            ),
+            (
+                r#"{"convert":{"tdf_mz_valley":0.7}}"#,
+                r#""tdf_mz_valley":0.7"#,
+            ),
+            (
+                r#"{"convert":{"tdf_mz_smooth_ppm":4.0}}"#,
+                r#""tdf_mz_smooth_ppm":4.0"#,
+            ),
+            (
+                r#"{"convert":{"tdf_im_valley":0.5}}"#,
+                r#""tdf_im_valley":0.5"#,
+            ),
+            (
+                r#"{"convert":{"tdf_im_smooth_scans":4.0}}"#,
+                r#""tdf_im_smooth_scans":4.0"#,
+            ),
+        ] {
+            let c = Config::from_json(json).unwrap();
+            assert!(c.canonical_json().contains(key), "{json}");
+        }
+        for bad in [
+            r#"{"convert":{"tdf_mz_valley":1.0}}"#,
+            r#"{"convert":{"tdf_im_valley":-0.1}}"#,
+            r#"{"convert":{"tdf_mz_smooth_ppm":-1.0}}"#,
+            r#"{"convert":{"tdf_mz_ppm":0.0}}"#,
+            r#"{"convert":{"tdf_min_points":0}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+        }
+        assert!(Config::from_json(r#"{"convert":{"bruker_reader":"native"}}"#).is_err());
     }
 
     #[test]

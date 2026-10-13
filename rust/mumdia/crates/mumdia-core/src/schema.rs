@@ -15,7 +15,18 @@
 pub mod artifact {
     pub const SPECTRA_MS1: (&str, u32) = ("spectra_ms1", 1);
     pub const SPECTRA_MS2: (&str, u32) = ("spectra_ms2", 1);
+    /// v2, written only for a source that carries ion mobility (the native diaPASEF
+    /// reader): a per-peak 1/K0 list `im` parallel to `mz`. A 3D source writes v1.
+    pub const SPECTRA_MS1_V2: (&str, u32) = ("spectra_ms1", 2);
+    /// v2, as [`SPECTRA_MS1_V2`], plus the window's 1/K0 bounds `window_im_lower` and
+    /// `window_im_upper`. A 3D source writes v1. Readers select columns by name, so both
+    /// versions load everywhere.
+    pub const SPECTRA_MS2_V2: (&str, u32) = ("spectra_ms2", 2);
     pub const ISOLATION_WINDOWS: (&str, u32) = ("isolation_windows", 1);
+    /// v2, written only for a source with ion mobility: each window's 1/K0 bounds
+    /// `im_lower` and `im_upper`, so slots sharing an m/z range are separate rows. A 3D
+    /// source writes v1.
+    pub const ISOLATION_WINDOWS_V2: (&str, u32) = ("isolation_windows", 2);
     pub const MS2_TO_MS1: (&str, u32) = ("ms2_to_ms1", 1);
     pub const PEPTIDES: (&str, u32) = ("peptides", 1);
     pub const PEPTIDOFORMS: (&str, u32) = ("peptidoforms", 1);
@@ -54,6 +65,36 @@ pub mod artifact {
     /// the default.
     pub const OVERLAP_LOSERS: (&str, u32) = ("overlap_losers", 1);
 
+    /// The `spectra_ms1` schema a conversion writes: [`SPECTRA_MS1_V2`] when the source
+    /// carries ion mobility, else [`SPECTRA_MS1`].
+    pub fn spectra_ms1(has_im: bool) -> (&'static str, u32) {
+        if has_im {
+            SPECTRA_MS1_V2
+        } else {
+            SPECTRA_MS1
+        }
+    }
+
+    /// The `spectra_ms2` schema a conversion writes: [`SPECTRA_MS2_V2`] when the source
+    /// carries ion mobility, else [`SPECTRA_MS2`].
+    pub fn spectra_ms2(has_im: bool) -> (&'static str, u32) {
+        if has_im {
+            SPECTRA_MS2_V2
+        } else {
+            SPECTRA_MS2
+        }
+    }
+
+    /// The `isolation_windows` schema a conversion writes: [`ISOLATION_WINDOWS_V2`] when
+    /// the source carries ion mobility, else [`ISOLATION_WINDOWS`].
+    pub fn isolation_windows(has_im: bool) -> (&'static str, u32) {
+        if has_im {
+            ISOLATION_WINDOWS_V2
+        } else {
+            ISOLATION_WINDOWS
+        }
+    }
+
     /// The chromatogram schema for `extract.chromatogram_schema`: [`CHROMATOGRAMS_V2`] for 2,
     /// else [`CHROMATOGRAMS`] (config validation admits only 1 and 2).
     pub fn chromatograms(schema: u32) -> (&'static str, u32) {
@@ -62,5 +103,25 @@ pub mod artifact {
         } else {
             CHROMATOGRAMS
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::artifact::*;
+
+    /// A 3D conversion records the versions it always has; only a source with ion
+    /// mobility moves the three selectors, and the name never changes.
+    #[test]
+    fn spectra_selectors_keep_3d_at_v1() {
+        assert_eq!(spectra_ms1(false), ("spectra_ms1", 1));
+        assert_eq!(spectra_ms2(false), ("spectra_ms2", 1));
+        assert_eq!(isolation_windows(false), ("isolation_windows", 1));
+        assert_eq!(spectra_ms1(true), ("spectra_ms1", 2));
+        assert_eq!(spectra_ms2(true), ("spectra_ms2", 2));
+        assert_eq!(isolation_windows(true), ("isolation_windows", 2));
+        assert_eq!(spectra_ms1(false), SPECTRA_MS1);
+        assert_eq!(spectra_ms2(false), SPECTRA_MS2);
+        assert_eq!(isolation_windows(false), ISOLATION_WINDOWS);
     }
 }

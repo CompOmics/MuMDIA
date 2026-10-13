@@ -35,7 +35,7 @@ use crate::matchers::fragindex::{BinnedProbe, FragIndex, LocalIndex, WindowNarro
 use crate::spectra::{load_ms1, load_ms2, Ms1Scan};
 use crate::stages::rt_im_train::RtWindows;
 use mumdia_core::config::MatcherKind;
-use mumdia_core::types::Ms2Scan;
+use mumdia_core::types::{Ms2Scan, WindowKey};
 use rayon::prelude::*;
 
 /// The matcher backend plus the values that never change across a probe: which
@@ -1530,18 +1530,15 @@ struct WinGroup {
     scans: Vec<usize>,
 }
 
-/// Group the run's scans by isolation window, ascending.
+/// Group the run's scans by isolation window ([`IsolationWindow::key`]), ascending in m/z.
+/// diaPASEF slots that share an m/z range are separate groups, adjacent in the order.
+///
+/// [`IsolationWindow::key`]: mumdia_core::types::IsolationWindow::key
 fn window_groups(lib: &Library, scans: &[Ms2Scan]) -> Vec<WinGroup> {
     use std::collections::BTreeMap;
-    let mut groups: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
+    let mut groups: BTreeMap<WindowKey, Vec<usize>> = BTreeMap::new();
     for (si, scan) in scans.iter().enumerate() {
-        groups
-            .entry((
-                scan.window.lower_mz.to_bits(),
-                scan.window.upper_mz.to_bits(),
-            ))
-            .or_default()
-            .push(si);
+        groups.entry(scan.window.key()).or_default().push(si);
     }
     groups
         .into_values()
@@ -2030,15 +2027,9 @@ fn extract_twopass_windows(
     claim_margin: f32,
 ) -> (HashMap<u32, Vec<Hit>>, HashMap<u32, Contested>) {
     use std::collections::BTreeMap;
-    let mut groups: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
+    let mut groups: BTreeMap<WindowKey, Vec<usize>> = BTreeMap::new();
     for (si, scan) in scans.iter().enumerate() {
-        groups
-            .entry((
-                scan.window.lower_mz.to_bits(),
-                scan.window.upper_mz.to_bits(),
-            ))
-            .or_default()
-            .push(si);
+        groups.entry(scan.window.key()).or_default().push(si);
     }
     let group_vec: Vec<Vec<usize>> = groups.into_values().collect();
     let pr = Prober {
@@ -3204,23 +3195,25 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         "extract: loaded; probing peaks"
     );
 
-    // Isolation-window -> sorted scan RTs, for zero-filled chromatogram grids.
+    // Isolation-window -> sorted scan RTs, for zero-filled chromatogram grids. An ordered
+    // map on the window key ([`IsolationWindow::key`]), so the windows come out ascending
+    // by lower then upper m/z (then by 1/K0 bounds for diaPASEF slots) with no hash order
+    // left to break a tie: a 3D grid is the one the previous lower-bound sort produced,
+    // and slots that share an m/z range keep a fixed order. The coverage test below is on
+    // m/z only, so every slot covering a precursor contributes its scan times.
+    //
+    // [`IsolationWindow::key`]: mumdia_core::types::IsolationWindow::key
     let windows: Vec<(f64, f64, Vec<f64>)> = if p.cfg.emit_window_grid {
-        let mut tmp: HashMap<(u64, u64), Vec<f64>> = HashMap::new();
+        let mut tmp: std::collections::BTreeMap<WindowKey, Vec<f64>> = Default::default();
         for s in scans {
-            tmp.entry((s.window.lower_mz.to_bits(), s.window.upper_mz.to_bits()))
-                .or_default()
-                .push(s.rt_seconds);
+            tmp.entry(s.window.key()).or_default().push(s.rt_seconds);
         }
-        let mut w: Vec<(f64, f64, Vec<f64>)> = tmp
-            .into_iter()
-            .map(|((lb, ub), mut v)| {
+        tmp.into_iter()
+            .map(|((lb, ub, _, _), mut v)| {
                 v.sort_by(|a, b| a.total_cmp(b));
                 (f64::from_bits(lb), f64::from_bits(ub), v)
             })
-            .collect();
-        w.sort_by(|a, b| a.0.total_cmp(&b.0));
-        w
+            .collect()
     } else {
         Vec::new()
     };

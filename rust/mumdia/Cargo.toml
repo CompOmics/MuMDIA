@@ -63,6 +63,16 @@ mzdata-bindata = { version = "0.67", default-features = false, features = ["zlib
 # scaled ~1.07x across cores under the Windows system allocator's shared heap lock;
 # mimalloc is pure Rust (no cmake) and removes that serialisation. No behaviour change.
 mimalloc = { version = "0.1", default-features = false }
+# Native Bruker timsTOF reader for diaPASEF `.d` input (`stages::convert::tdf`), so ion
+# mobility survives conversion. 0.4 with only `tdf`, not 0.6: timsrust-core 0.6 depends on
+# `filemanager` with default features, which pulls object_store, tokio and a second
+# arrow/parquet; 0.4 with `tdf` adds rusqlite, zstd 0.13, memmap2 and linreg. Its SQLite is
+# bundled C, like the zstd-sys that parquet already builds, so no new toolchain is needed.
+# `rusqlite` is named to read `TimsCalibration` and the routing probe, which timsrust does
+# not expose. It must stay on timsrust's minor version, so the graph keeps one
+# `libsqlite3-sys` (a `links` crate).
+timsrust = { version = "0.4.2", default-features = false, features = ["tdf"] }
+rusqlite = { version = "0.32", default-features = false }
 
 [profile.release]
 opt-level = 3

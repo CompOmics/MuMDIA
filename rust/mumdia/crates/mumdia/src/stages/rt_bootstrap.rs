@@ -773,6 +773,7 @@ mod tests {
                 isolation_windows: String::new(),
                 ms2_to_ms1: String::new(),
             },
+            schemas: convert::ConvertSchemas::for_source(false),
         };
         let o = refit(&Refit {
             cfg: &cfg,

@@ -58,6 +58,7 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
             anyhow::bail!("--mzml not found: {m}");
         }
     }
+    crate::stages::run::refuse_unsupported_on_4d(p.config, p.mzmls, true)?;
     match (p.lib_precursors, p.lib_fragments) {
         (Some(lp), Some(lf)) => {
             for path in [lp, lf] {
@@ -401,6 +402,7 @@ fn convert_run(
         top_peaks_ms2,
         top_peaks_ms1: 0,
         config_hash: &convert_hash,
+        tdf: convert::TdfParams::from_config(&cfg.convert),
     })
 }
 

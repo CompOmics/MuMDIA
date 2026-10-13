@@ -126,6 +126,17 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
     let wlo = t.f64("window_lower")?;
     let whi = t.f64("window_upper")?;
     let wtarget = t.f64("window_target")?;
+    // The window's 1/K0 bounds (spectra v2, a diaPASEF source), which tell apart slots that
+    // share an m/z range (`IsolationWindow::key`). Absent in a v1 artifact: no mobility.
+    // The per-peak `im` list of v2 is not decoded; no stage reads it yet.
+    let window_im = |name: &str| -> Result<Vec<Option<f32>>> {
+        if t.has_column(name) {
+            t.opt_f32(name)
+        } else {
+            Ok(vec![None; t.nrows])
+        }
+    };
+    let (wim_lo, wim_hi) = (window_im("window_im_lower")?, window_im("window_im_upper")?);
     // The "id" column is NOT read. It stays in the artifact, where an external consumer can
     // find the mzML native id of any scan by `scan_index`, but decoding it here built one
     // String per scan (~72 B of header plus payload each, ~17 MB and 233 k allocations on
@@ -158,8 +169,8 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
                     target_mz: wtarget[i],
                     lower_mz: wlo[i],
                     upper_mz: whi[i],
-                    im_lower: None,
-                    im_upper: None,
+                    im_lower: wim_lo[i],
+                    im_upper: wim_hi[i],
                 },
                 peaks,
             });

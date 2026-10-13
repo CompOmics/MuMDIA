@@ -21,7 +21,7 @@ use crate::fdr::{count_targets_at_q, ln_factorial, target_decoy_q};
 use crate::index::Library;
 use crate::matchers::fragindex::{FragIndex, SeedScratch};
 use crate::spectra::load_ms2;
-use mumdia_core::types::Ms2Scan;
+use mumdia_core::types::{Ms2Scan, WindowKey};
 use rayon::prelude::*;
 
 pub struct SearchSeedParams<'a> {
@@ -789,15 +789,9 @@ fn seed_fragindex_windows_chunked(
     use std::collections::BTreeMap;
     // Group scan indices by window; BTreeMap keys give a deterministic group order
     // (the merge is order-independent anyway, being a total-order max).
-    let mut groups: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
+    let mut groups: BTreeMap<WindowKey, Vec<usize>> = BTreeMap::new();
     for (si, scan) in scans.iter().enumerate() {
-        groups
-            .entry((
-                scan.window.lower_mz.to_bits(),
-                scan.window.upper_mz.to_bits(),
-            ))
-            .or_default()
-            .push(si);
+        groups.entry(scan.window.key()).or_default().push(si);
     }
     let group_vec: Vec<Vec<usize>> = groups.into_values().collect();
     let group_windows: Vec<(f64, f64)> = group_vec

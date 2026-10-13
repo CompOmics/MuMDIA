@@ -515,16 +515,19 @@ enum Cmd {
     },
     /// Print schema, head sample, and row count for any artifact.
     Inspect { artifact: String },
-    /// Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each
-    /// candidate `--top-peaks-ms2` cap would discard.
+    /// Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus
+    /// what each candidate `--top-peaks-ms2` cap would discard.
     ///
     /// The pre-flight for a decision the documentation says must be made per
     /// acquisition. Reading it before setting a cap is the difference between
-    /// bounding peak volume and deleting fragment evidence from most spectra.
+    /// bounding peak volume and deleting fragment evidence from most spectra. A diaPASEF
+    /// `.d` is counted after the native reader's centroiding, which is what `convert`
+    /// writes for it.
     PeakCensus {
         #[arg(long)]
         mzml: String,
-        /// Stop after this many spectra from the head of the file (0 = all).
+        /// Stop after this many spectra from the head of the file (0 = all); for a
+        /// diaPASEF `.d`, this many frames.
         #[arg(long, default_value_t = 0)]
         max_spectra: usize,
         /// Configuration file, read for `convert.*` so a vendor file can be converted
@@ -719,35 +722,46 @@ struct ConverterReport {
 /// advice is to compute the percentiles before setting a cap, and this is that
 /// computation, callable rather than described.
 ///
-/// Reads peaks and counts them; it does not centroid, so a profile-mode file reports
-/// raw sample counts and says so.
-fn peak_census(mzml: &str, max_spectra: usize) -> Result<serde_json::Value> {
+/// Reads peaks and counts them; for an mzML it does not centroid, so a profile-mode file
+/// reports raw sample counts and says so. A diaPASEF `.d` (`raw::Vendor::BrukerTdf`) is
+/// counted after the native reader's centroiding (`tdf`), uncapped, because that is what
+/// `convert` writes for it; `max_spectra` then counts frames.
+fn peak_census(
+    mzml: &str,
+    max_spectra: usize,
+    tdf: &stages::convert::TdfParams,
+) -> Result<serde_json::Value> {
     use mzdata::prelude::*;
 
-    // The same reader  uses, so this sees exactly the spectra a run would.
-    let reader = mzdata::MZReader::open_path(mzml).with_context(|| format!("opening {mzml}"))?;
-
+    let native = mumdia::raw::detect(mzml) == mumdia::raw::Vendor::BrukerTdf;
     let mut counts: Vec<usize> = Vec::new();
     let mut profile = 0usize;
     let mut ms1 = 0usize;
-    for (i, spec) in reader.enumerate() {
-        if max_spectra > 0 && i >= max_spectra {
-            break;
-        }
-        if spec.ms_level() != 2 {
-            if spec.ms_level() == 1 {
-                ms1 += 1;
+    if native {
+        (counts, ms1) = stages::convert::tdf_peak_counts(mzml, max_spectra, tdf)?;
+    } else {
+        // The same reader `convert` uses, so this sees exactly the spectra a run would.
+        let reader =
+            mzdata::MZReader::open_path(mzml).with_context(|| format!("opening {mzml}"))?;
+        for (i, spec) in reader.enumerate() {
+            if max_spectra > 0 && i >= max_spectra {
+                break;
             }
-            continue;
+            if spec.ms_level() != 2 {
+                if spec.ms_level() == 1 {
+                    ms1 += 1;
+                }
+                continue;
+            }
+            if spec.signal_continuity() == mzdata::spectrum::SignalContinuity::Profile {
+                profile += 1;
+            }
+            let n = spec
+                .raw_arrays()
+                .and_then(|a| a.mzs().ok().map(|m| m.len()))
+                .unwrap_or(0);
+            counts.push(n);
         }
-        if spec.signal_continuity() == mzdata::spectrum::SignalContinuity::Profile {
-            profile += 1;
-        }
-        let n = spec
-            .raw_arrays()
-            .and_then(|a| a.mzs().ok().map(|m| m.len()))
-            .unwrap_or(0);
-        counts.push(n);
     }
 
     if counts.is_empty() {
@@ -777,7 +791,7 @@ fn peak_census(mzml: &str, max_spectra: usize) -> Result<serde_json::Value> {
         })
         .collect();
 
-    Ok(serde_json::json!({
+    let mut out = serde_json::json!({
         "mzml": mzml,
         "ms1_spectra": ms1,
         "ms2_spectra": counts.len(),
@@ -793,7 +807,12 @@ fn peak_census(mzml: &str, max_spectra: usize) -> Result<serde_json::Value> {
         },
         // What a cap would actually cost, which is the question being asked.
         "caps": caps,
-    }))
+    });
+    if native {
+        // Which reader counted, so a census of a `.d` is not read as an msconvert one.
+        out["reader"] = serde_json::json!(mumdia::instrument::READER_TIMSRUST);
+    }
+    Ok(out)
 }
 
 /// Report whether this configuration can actually run: which interpreter each
@@ -1300,6 +1319,7 @@ fn real_main() -> Result<()> {
                 top_peaks_ms2,
                 top_peaks_ms1,
                 config_hash: &config_hash,
+                tdf: stages::convert::TdfParams::from_config(&cfg.convert),
             })?;
         }
         Cmd::Digest { fasta, out, config } => {
@@ -1545,6 +1565,12 @@ fn real_main() -> Result<()> {
             }
             cfg.prescreen.write_scores |= write_scores;
             cfg.validate()?;
+            if mumdia::instrument::provenance(&ms2).is_some_and(|p| p.has_im()) {
+                anyhow::bail!(
+                    "{ms2} was converted from a diaPASEF .d and carries 1/K0; the prescreen \
+                     groups spectra by m/z window only and does not support it yet"
+                );
+            }
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::prescreen::run(stages::prescreen::PrescreenParams {
                 ms2: &ms2,
@@ -1915,10 +1941,12 @@ fn real_main() -> Result<()> {
             // file in an unwritable directory is an error rather than a conversion into
             // somewhere arbitrary.
             let cfg = load_config(&config)?;
+            // A diaPASEF `.d` passes through unconverted and is counted natively.
             let mzml = mumdia::raw::ensure_mzml(&mzml, &cfg.convert, None)?;
+            let tdf = stages::convert::TdfParams::from_config(&cfg.convert);
             println!(
                 "{}",
-                serde_json::to_string_pretty(&peak_census(&mzml, max_spectra)?)?
+                serde_json::to_string_pretty(&peak_census(&mzml, max_spectra, &tdf)?)?
             );
         }
         Cmd::Report {

@@ -1,5 +1,5 @@
-//! Vendor-format input: converting a vendor file to mzML before the engine reads
-//! it (docs/04_convert.md).
+//! Vendor-format input: deciding how the engine reads a spectra path, and converting a
+//! vendor file to mzML first where that is needed (docs/04_convert.md).
 //!
 //! # Why conversion is a child process and not a linked reader
 //!
@@ -7,10 +7,23 @@
 //! build grounds rather than capability. Those readers need the vendors' own
 //! libraries and, for Thermo and SCIEX, a .NET runtime, while the workspace pins
 //! `mzdata` to `default-features = false, features = ["mzml", "miniz_oxide"]`
-//! precisely so that building MuMDIA needs no C, C++ or .NET toolchain
-//! (`CLAUDE.md`, "Build gotchas: do not fix these back"). Linking a vendor reader
-//! imposes that on every build on every platform, including the ones that never see
-//! a vendor file.
+//! so that building MuMDIA needs no vendor SDK, C++ or .NET toolchain. Linking a
+//! vendor reader imposes that on every build on every platform, including the ones
+//! that never see a vendor file.
+//!
+//! # The one native reader: timsTOF diaPASEF
+//!
+//! A Bruker `.d` holding diaPASEF frames is read by `stages::convert` itself, through
+//! timsrust ([`Vendor::BrukerTdf`]). The format is an SQLite index plus zstd frames, so no
+//! vendor library is involved, and msconvert would collapse the ion mobility the
+//! acquisition exists for. The decision is made here, from the file's content: the `.d`
+//! must hold `analysis.tdf` and `analysis.tdf_bin`, its `Frames` table must have diaPASEF
+//! frames (`MsMsType` 9) and no ddaPASEF frames (8), which is timsrust's own rule, and its
+//! frames must use the compression timsrust decodes ([`is_native_diapasef`]). Every other
+//! Bruker `.d` (BAF, ddaPASEF, PRM, anything unrecognised) goes to msconvert as before.
+//! There is no automatic msconvert retry after a native decode failure. The bundled
+//! SQLite that timsrust links is C, as is the zstd-sys that parquet already builds, so no
+//! new toolchain is required.
 //!
 //! # Two converters, and why
 //!
@@ -31,9 +44,9 @@
 //! converted by this code. See `docs/04_convert.md`, "Vendor formats", which says
 //! the same thing in the place a user looks.
 //!
-//! Bruker carries a further caveat that is not about this module: MuMDIA's pipeline
-//! is 3D and discards ion mobility, so diaPASEF loses the separation that makes it
-//! selective. `warn_about_ion_mobility` says so at the point of use.
+//! A Bruker file routed through msconvert loses its ion mobility, so a mobility-separated
+//! acquisition loses the separation that makes it selective. `warn_about_ion_mobility`
+//! says so at the point of use.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -63,8 +76,12 @@ pub enum Vendor {
     /// Waters `.raw`, which is a DIRECTORY. Same extension as Thermo, different
     /// thing entirely; see `detect`.
     Waters,
-    /// Bruker `.d` (timsTOF TDF, or the older BAF).
+    /// Bruker `.d` converted by msconvert: the older BAF, or a timsTOF TDF that is not
+    /// diaPASEF (ddaPASEF, PRM) or that timsrust cannot decode.
     Bruker,
+    /// Bruker timsTOF `.d` with diaPASEF frames, read natively by `stages::convert` with
+    /// ion mobility kept ([`is_native_diapasef`]). No conversion.
+    BrukerTdf,
     /// Agilent `.d`, which shares Bruker's extension and is also a directory.
     Agilent,
     /// SCIEX `.wiff` / `.wiff2`.
@@ -79,14 +96,16 @@ impl Vendor {
             Vendor::Thermo => "Thermo .raw",
             Vendor::Waters => "Waters .raw",
             Vendor::Bruker => "Bruker .d",
+            Vendor::BrukerTdf => "Bruker timsTOF diaPASEF .d",
             Vendor::Agilent => "Agilent .d",
             Vendor::Sciex => "SCIEX .wiff",
         }
     }
 
-    /// Does this need converting before the engine can read it?
+    /// Does this need converting before the engine can read it? Not mzML, and not a
+    /// diaPASEF `.d`, which `stages::convert` reads natively.
     pub fn needs_conversion(self) -> bool {
-        self != Vendor::MzMl
+        !matches!(self, Vendor::MzMl | Vendor::BrukerTdf)
     }
 }
 
@@ -105,8 +124,10 @@ impl Vendor {
 ///
 /// Bruker and Agilent both use `.d`, and both are directories. Bruker's contains
 /// `analysis.tdf` (timsTOF) or `analysis.baf` (older); Agilent's contains
-/// `AcqData/`. Both go to msconvert either way, so this distinction exists only so
-/// that the ion-mobility warning fires for Bruker and not for Agilent.
+/// `AcqData/`. A diaPASEF timsTOF `.d` is read natively ([`Vendor::BrukerTdf`]); every
+/// other Bruker `.d` and every Agilent `.d` goes to msconvert, and the distinction between
+/// those two exists only so that the ion-mobility warning fires for Bruker and not for
+/// Agilent.
 pub fn detect(path: &str) -> Vendor {
     let p = Path::new(path);
     let ext = p
@@ -126,7 +147,9 @@ pub fn detect(path: &str) -> Vendor {
             }
         }
         "d" => {
-            if p.join("analysis.tdf").exists() || p.join("analysis.baf").exists() {
+            if is_native_diapasef(p) {
+                Vendor::BrukerTdf
+            } else if p.join("analysis.tdf").exists() || p.join("analysis.baf").exists() {
                 Vendor::Bruker
             } else if p.join("AcqData").exists() {
                 Vendor::Agilent
@@ -140,6 +163,59 @@ pub fn detect(path: &str) -> Vendor {
         "wiff" | "wiff2" => Vendor::Sciex,
         _ => Vendor::MzMl,
     }
+}
+
+/// Does this `.d` hold diaPASEF frames that the native reader decodes?
+///
+/// A cheap read-only probe of `analysis.tdf`, which never touches the frame data: the
+/// `.d` must hold `analysis.tdf` and `analysis.tdf_bin`, its `Frames` table must contain
+/// diaPASEF frames (`MsMsType` 9) and no ddaPASEF frames (8), which is the rule timsrust
+/// itself classifies by, and `GlobalMetadata.TimsCompressionType` must be 2, the only
+/// compression timsrust is built to decode here. Anything that fails the probe, including
+/// a file the probe cannot open, is not native and keeps the msconvert route.
+pub fn is_native_diapasef(dir: &Path) -> bool {
+    let tdf = dir.join("analysis.tdf");
+    if !tdf.is_file() || !dir.join("analysis.tdf_bin").is_file() {
+        return false;
+    }
+    match probe_tdf(&tdf) {
+        Ok(native) => native,
+        Err(e) => {
+            tracing::debug!(
+                tdf = %tdf.display(),
+                error = %e,
+                "convert: the timsTOF metadata could not be probed; not reading it natively"
+            );
+            false
+        }
+    }
+}
+
+/// The SQLite half of [`is_native_diapasef`].
+fn probe_tdf(tdf: &Path) -> rusqlite::Result<bool> {
+    use rusqlite::OptionalExtension;
+    let con = rusqlite::Connection::open_with_flags(
+        tdf,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let has_frames_of = |msms_type: i64| -> rusqlite::Result<bool> {
+        con.query_row(
+            "SELECT EXISTS(SELECT 1 FROM Frames WHERE MsMsType = ?1)",
+            [msms_type],
+            |r| r.get(0),
+        )
+    };
+    if has_frames_of(8)? || !has_frames_of(9)? {
+        return Ok(false);
+    }
+    let compression: Option<String> = con
+        .query_row(
+            "SELECT Value FROM GlobalMetadata WHERE Key = 'TimsCompressionType'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(compression.as_deref().map(str::trim) == Some("2"))
 }
 
 /// Is this path a Thermo `.raw` file?
@@ -385,23 +461,24 @@ fn is_writable(dir: &Path) -> bool {
 
 /// Say, once and loudly, that ion mobility is discarded.
 ///
-/// Not an error. Collapsing the mobility dimension costs sensitivity rather than
-/// FDR validity: targets and decoys see the same added interference, so the
-/// threshold stays calibrated while fewer things pass it. A user with non-PASEF
-/// Bruker DIA is also perfectly well served. But a diaPASEF user who is not told
-/// this will read a low identification count as a MuMDIA result rather than as the
-/// cost of throwing away the separation their acquisition exists to produce.
+/// Only for a Bruker `.d` on the msconvert route: a diaPASEF `.d` that the native reader
+/// takes ([`Vendor::BrukerTdf`]) keeps its mobility and never reaches this. Not an error.
+/// Collapsing the mobility dimension costs sensitivity rather than FDR validity: targets
+/// and decoys see the same added interference, so the threshold stays calibrated while
+/// fewer things pass it. A user with non-PASEF Bruker DIA is also perfectly well served.
+/// But a mobility-separated acquisition that is converted this way loses the separation it
+/// exists to produce, and the user should read a low identification count as that cost.
 fn warn_about_ion_mobility(vendor: Vendor) {
     if vendor != Vendor::Bruker {
         return;
     }
     warn!(
-        "convert: MuMDIA's pipeline is 3D and discards ion mobility. For diaPASEF \
-         this removes the mobility separation that makes the acquisition selective, \
-         so expect substantially more interference and fewer identifications than a \
-         4D engine on the same file. The q values stay calibrated (targets and \
-         decoys see the same interference); the sensitivity does not. See README, \
-         \"No ion mobility\"."
+        "convert: this Bruker .d is converted by msconvert, which discards ion mobility. \
+         Only a timsTOF .d with diaPASEF frames is read natively with its mobility kept \
+         (docs/04_convert.md, \"Vendor formats\"). For a mobility-separated acquisition \
+         this removes the separation that makes it selective, so expect more interference \
+         and fewer identifications. The q values stay calibrated (targets and decoys see \
+         the same interference); the sensitivity does not."
     );
 }
 
@@ -434,7 +511,7 @@ fn msconvert_vendor_args(vendor: Vendor) -> Vec<String> {
     // `--simAsSpectra` is harmless where SIM is absent and avoids silently dropping
     // SIM scans where it is not.
     match vendor {
-        Vendor::Bruker => a.push("--combineIonMobilitySpectra".into()),
+        Vendor::Bruker | Vendor::BrukerTdf => a.push("--combineIonMobilitySpectra".into()),
         Vendor::MzMl | Vendor::Thermo | Vendor::Waters | Vendor::Agilent | Vendor::Sciex => {
             a.push("--filter".into());
             a.push("peakPicking vendor msLevel=1-".into());
@@ -1086,6 +1163,35 @@ msconvert was not usable either: {e}"
     Ok(out.to_string_lossy().into_owned())
 }
 
+/// A minimal timsTOF `.d`: `analysis.tdf` with a `Frames` table holding one frame of
+/// each given `MsMsType`, the compression type in `GlobalMetadata`, and an
+/// `analysis.tdf_bin` when `with_bin`. For the routing tests here and in the orchestrators.
+#[cfg(test)]
+pub(crate) fn tdf_fixture(dir: &Path, msms_types: &[i64], compression: &str, with_bin: bool) {
+    std::fs::create_dir_all(dir).unwrap();
+    let con = rusqlite::Connection::open(dir.join("analysis.tdf")).unwrap();
+    con.execute_batch(
+        "CREATE TABLE Frames (Id INTEGER PRIMARY KEY, MsMsType INTEGER);
+         CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT);",
+    )
+    .unwrap();
+    for (i, t) in msms_types.iter().enumerate() {
+        con.execute(
+            "INSERT INTO Frames (Id, MsMsType) VALUES (?1, ?2)",
+            [i as i64 + 1, *t],
+        )
+        .unwrap();
+    }
+    con.execute(
+        "INSERT INTO GlobalMetadata VALUES ('TimsCompressionType', ?1)",
+        [compression],
+    )
+    .unwrap();
+    if with_bin {
+        std::fs::write(dir.join("analysis.tdf_bin"), b"").unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1334,6 +1440,52 @@ mod tests {
     }
 
     #[test]
+    fn only_a_diapasef_tdf_is_read_natively() {
+        let d = tmp("tdf-routing");
+        let route = |name: &str, types: &[i64], compression: &str, bin: bool| {
+            let p = d.join(name);
+            tdf_fixture(&p, types, compression, bin);
+            detect(p.to_str().unwrap())
+        };
+        // diaPASEF: MS1 frames (0) and diaPASEF frames (9).
+        assert_eq!(route("dia.d", &[0, 9, 9], "2", true), Vendor::BrukerTdf);
+        // ddaPASEF (8) wins over any 9, as in timsrust; MS1-only and PRM (10) are not DIA.
+        assert_eq!(route("dda.d", &[0, 8, 9], "2", true), Vendor::Bruker);
+        assert_eq!(route("ms1.d", &[0, 0], "2", true), Vendor::Bruker);
+        assert_eq!(route("prm.d", &[0, 10], "2", true), Vendor::Bruker);
+        // A compression the native reader does not decode, or no frame data.
+        assert_eq!(route("old.d", &[0, 9], "1", true), Vendor::Bruker);
+        assert_eq!(route("nobin.d", &[0, 9], "2", false), Vendor::Bruker);
+
+        assert!(!Vendor::BrukerTdf.needs_conversion());
+        assert!(Vendor::Bruker.needs_conversion());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_diapasef_d_passes_through_and_any_other_d_goes_to_msconvert() {
+        let d = tmp("tdf-ensure");
+        let cfg = ConvertConfig {
+            msconvert: "/definitely/not/here".to_string(),
+            reuse_converted: false,
+            ..ConvertConfig::default()
+        };
+        // Native: returned as given, without looking for a converter.
+        let dia = d.join("dia.d");
+        tdf_fixture(&dia, &[0, 9], "2", true);
+        let dia = dia.to_str().unwrap();
+        assert_eq!(ensure_mzml(dia, &cfg, Some(&d)).unwrap(), dia);
+        // Not diaPASEF: the msconvert route, which fails here on the configured path.
+        let dda = d.join("dda.d");
+        tdf_fixture(&dda, &[0, 8], "2", true);
+        let err = ensure_mzml(dda.to_str().unwrap(), &cfg, Some(&d))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("convert.msconvert"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn sciex_covers_both_wiff_generations() {
         assert_eq!(detect("a.wiff"), Vendor::Sciex);
         assert_eq!(detect("a.wiff2"), Vendor::Sciex);
@@ -1350,6 +1502,7 @@ mod tests {
             msconvert_args: Vec::new(),
             reuse_converted: true,
             parallel_conversions: 4,
+            ..ConvertConfig::default()
         };
         assert_eq!(ensure_mzml("run.mzML", &cfg, None).unwrap(), "run.mzML");
     }
@@ -1555,6 +1708,7 @@ mod tests {
             msconvert_args: Vec::new(),
             reuse_converted: false,
             parallel_conversions: 4,
+            ..ConvertConfig::default()
         };
         let err = ensure_mzml(raw.to_str().unwrap(), &cfg, Some(&d)).unwrap_err();
         let msg = err.to_string();
@@ -1644,6 +1798,7 @@ mod tests {
             msconvert_args: Vec::new(),
             reuse_converted: true,
             parallel_conversions: 3,
+            ..ConvertConfig::default()
         };
         let serial: Vec<String> = inputs
             .iter()
