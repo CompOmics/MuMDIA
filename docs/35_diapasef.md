@@ -520,7 +520,10 @@ pass is reported until it has run on a TIMS pool.
 
 ## 8. Quantification
 
-Filled by PR 6: the cross-run fragment selection and background for diaPASEF quantification.
+The cross-run quant levers (`quant.fragment_selection = cross_run`, `quant.baseline_source =
+experiment`, `quant.fixed_scan_halfwidth_scale`) are described, with their diaPASEF
+measurements, in docs/12_quant_lfq_align_mbr_report_audit.md, "Cross-run fragment selection
+and background".
 
 ## 9. Recipe, results and open levers
 

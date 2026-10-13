@@ -912,6 +912,20 @@ Written only when `out_fragment` is set (ion-level directLFQ input).
 | `fragment_name` | Utf8 | no | - | fragment name |
 | `quantity` | Float64 | no | intensity x s | per-fragment trapezoid area over the peak window |
 
+Schema v1 holds only these columns and only the positive finite areas. Under the cross-run
+export (`quant --export-cross-run`, or the first pass of the cross-run step of
+`run-experiment`; docs/12_quant_lfq_align_mbr_report_audit.md, "Cross-run fragment selection
+and background") the table is v5: the zero-area fragments are kept, with `quantity` 0, and
+these columns follow. The number is above the IM branch's v2 to v4, whose meanings were not
+documented. Every value is NaN for a candidate integrated without a fixed window.
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `apex_corr` | Float64 | no | - | population Pearson correlation of the fragment's fixed-window samples (after the per-run baseline, before the envelope) with the sum of the candidate's other fragments; 0 for a flat window |
+| `flank_mean` | Float64 | no | counts | mean of the `baseline_flank_scans` raw samples either side of the fixed window; NaN without a flank sample |
+| `flank_mean_h3` .. `flank_mean_h7` | Float64 | no | counts | the same mean beyond a window of +/-3 to +/-7 scans around the apex |
+| `peak_hwhm` | Float64 | no | scans | the candidate's half width at half maximum in this run: of its summed fragment trace within +/-7 scans of the apex, each fragment less its `flank_mean`; one value per candidate, repeated on its rows |
+
 ### peak-bounds diagnostic (optional, `quant.rs:421-429`)
 
 Written only when `out_peak_bounds` is set and `bound_peak` is on.

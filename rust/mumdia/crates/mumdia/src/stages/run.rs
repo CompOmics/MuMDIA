@@ -916,6 +916,8 @@ pub fn run(p: RunParams) -> Result<()> {
         out_peak_bounds: None,
         cfg: &cfg.quant,
         config_hash: &ch,
+        cross_run: None,
+        export_cross_run: false,
     })?;
     man.record(wq.peptide.record(
         artifact::PEPTIDE_QUANT.0,

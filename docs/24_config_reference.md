@@ -69,7 +69,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`features`](#features) | `FeaturesConfig` | 12 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`rescore`](#rescore) | `RescoreConfig` | 28 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
-| [`quant`](#quant) | `QuantConfig` | 17 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
+| [`quant`](#quant) | `QuantConfig` | 19 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`mbr`](#mbr) | `MbrConfig` | 9 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 3 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
 | [`groups`](#groups) | `GroupsConfig` | 8 |  |
@@ -493,12 +493,14 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `reliable_q` | `f64` | `0.001` |  | Peptide q-value cutoff defining the "confident" set that calibrates the consensus half-widths (Consensus mode only). Tighter than `q_threshold`. |
 | `q_filter` | `QuantQColumn` | `peptide_q` |  | Which q-value column to filter candidates on (`peptide_q` default; `precursor_q` is single-run only; use `run_psm_q` for per-run slices of an experiment-wide rescore). See `QuantQColumn`. |
 | `interference_envelope` | `bool` | `false` | benchmark-gated | Apply an apex-outward interference-correction envelope to each fragment trace before integrating its area, stripping co-eluting interference in the peak wings. Off by default (identity on a clean peak). Opt-in and benchmark-gated: it changes reported quantities. |
-| `fragment_selection` | `FragmentSelection` | `observed_area` | benchmark-gated | Which fragments enter the top-N sum. `observed_area` (default, legacy) ranks by the integrated area itself, which preferentially selects interfered fragments (their areas are inflated) and so varies run to run. `predicted` ranks by the library (predicted or empirical) fragment intensity, a per-precursor constant, so every run sums the same fragments. Astral HYE 2026-08-26: CV 0.163 -> 0.112 on 6/6 ions at top-3. Benchmark-gated. |
+| `fragment_selection` | `FragmentSelection` | `observed_area` | benchmark-gated | Which fragments enter the top-N sum. `observed_area` (default, legacy) ranks by the integrated area itself, which preferentially selects interfered fragments (their areas are inflated) and so varies run to run. `predicted` ranks by the library (predicted or empirical) fragment intensity, a per-precursor constant, so every run sums the same fragments. Astral HYE 2026-08-26: CV 0.163 -> 0.112 on 6/6 ions at top-3. Benchmark-gated. `cross_run` weights each fragment by its consistency across the runs of an experiment (`FragmentSelection::CrossRun`); benchmark-gated as well. |
 | `fixed_scan_halfwidth` | `usize` | `3` |  | When > 0, integrate each fragment over the `2k+1` scans centred on the identification apex instead of the descent-walk window (`bound_peak` window ignored; falls back to it when the apex is unknown). A fixed narrow window is far less sensitive to interference in the peak wings than the walked bounds. Default 3 (seven samples) since 2026-10-04; 0 restores the walked window. Measured on the six-file Astral HYE experiment (one seed, 63,141 precursors quantified in at least 2 runs per condition): median \|log2 ratio error\| 0.266 -> 0.163, species-equal 0.322 -> 0.201, median CV 0.19 -> 0.10, the identifications unchanged. The width is in samples of the precursor's window, so it scales with the cycle time; check it on an acquisition with much wider or narrower peaks. |
 | `baseline_subtract` | `bool` | `false` | benchmark-gated | Subtract a per-fragment local background before integrating (fixed-scan window only). The background is the `baseline_quantile` quantile of the intensities in the two flanks (`baseline_flank_scans` samples on each side of the integration window); window intensities are clipped at zero after subtraction. Targets the additive floor that compresses ratios in the low-abundance condition. Off by default; benchmark-gated. |
 | `baseline_flank_scans` | `usize` | `12` |  | Flank length (samples per side) used to estimate the background. |
 | `baseline_quantile` | `f64` | `0.25` |  | Quantile of the flank intensities taken as the background level. |
 | `fixed_window_s` | `f64` | `0.0` |  | When > 0, integrate each fragment over the samples within `fixed_window_s` seconds of the identification apex (instrument-independent alternative to `fixed_scan_halfwidth`, which it overrides). 0 (default) = off. |
+| `baseline_source` | `BaselineSource` | `run` | benchmark-gated | Where the flank background of `baseline_subtract` comes from. `run` (default): the `baseline_quantile` quantile of this run's flanks. `experiment`: one level per (candidate, fragment), the mean over every run of the raw flank mean, which the cross-run step of `run-experiment` fits and subtracts in place of the per-run quantile (docs/12, "Cross-run fragment selection and background"). Needs `baseline_subtract = true`. Without the cross-run step (`run`, or `quant` without `--cross-run-from`) the per-run quantile applies. Benchmark-gated. Omitted from the canonical configuration at its default. |
+| `fixed_scan_halfwidth_scale` | `f64` | `0.0` | benchmark-gated | When > 0, the cross-run step integrates each candidate over its own scan halfwidth `h = clamp(round(fixed_scan_halfwidth_scale x HWHM), 3, 7)` in every run, in place of `fixed_scan_halfwidth`. HWHM is the half width at half maximum, in scans, of the candidate's summed fragment trace in its brightest run, measured in the first pass; the experiment background is then taken beyond that window. Needs the scan form of the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`) and `baseline_source = experiment`. 0 (default) = off. Benchmark-gated. Omitted from the canonical configuration at its default. |
 
 ## mbr
 
@@ -588,6 +590,17 @@ value the config file set for the same field.
 
 Accepted values for every enum-typed field above, with the serde spelling a
 config file must use. The default variant is marked. Sorted by type name.
+
+### `BaselineSource`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+Source of the flank background level. See `QuantConfig::baseline_source`.
+
+| Value | Default | Description |
+|---|---|---|
+| `run` | yes | The `baseline_quantile` quantile of this run's flanks. |
+| `experiment` |  | The mean flank level over every run of the experiment (cross-run step). |
 
 ### `CalibrationMethod`
 
@@ -696,6 +709,7 @@ Fragment ranking for the quant top-N sum. See `QuantConfig::fragment_selection`.
 |---|---|---|
 | `observed_area` | yes | Rank fragments by their own integrated area (legacy). |
 | `predicted` |  | Rank fragments by library intensity (`predicted_intensity` in the chromatogram table). |
+| `cross_run` |  | Weight every fragment by its consistency across the runs of an experiment, fitted by the cross-run step of `run-experiment`: the quantity is `sum(weight x area)` with the same weights in every run (docs/12, "Cross-run fragment selection and background"). Where no weight was fitted (single run, `quant` without `--cross-run-from`, a candidate with no positive weighted area), `predicted` applies, with `top_n_fragments`. |
 
 ### `GateMode`
 
@@ -1220,6 +1234,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-24 structs and 304 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 38 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 306 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 39 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
-31 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+33 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

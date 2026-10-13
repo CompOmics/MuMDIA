@@ -69,7 +69,12 @@ single-run quantity to the base-peptide representative.
 `fragment_quant.parquet` (optional, `--out-fragment`; `quant.rs:558`): one row per
 fragment area, `candidate_id`, `peptidoform`, `charge`, `protein_group`,
 `fragment_name` (str), `quantity` (f64). Only positive finite fragment areas are
-emitted. This is the input for ion-level directLFQ.
+emitted. This is the input for ion-level directLFQ. Under the cross-run export
+(`--export-cross-run`, or the first pass of the cross-run step) the table is v5: the
+zero-area fragments are kept and eight Float64 columns follow (`apex_corr`,
+`flank_mean`, `flank_mean_h3` to `flank_mean_h7`, `peak_hwhm`; see
+[Cross-run fragment selection and background](#cross-run-fragment-selection-and-background)
+and docs/15_data_dictionary.md). Every other quant writes v1.
 
 `<peak_bounds>.parquet` (optional diagnostic, `--out-peak-bounds`, only when
 `bound_peak` is on; `quant.rs:419`): `candidate_id`, `lo_rt`, `hi_rt`, `width_s`
@@ -357,7 +362,10 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    `predicted` ranks by the library's predicted intensity instead, so the same
    fragments are summed across runs regardless of which happened to be brightest,
    with the observed area as tie-break. A non-finite predicted intensity is excluded
-   from the ranking rather than sorted to the front. Missing traces,
+   from the ranking rather than sorted to the front. `cross_run` sums every fragment
+   with a weight fitted across the runs of an experiment (see
+   [Cross-run fragment selection and background](#cross-run-fragment-selection-and-background));
+   where no weight was fitted it ranks as `predicted`. Missing traces,
    all-zero/non-finite areas, or `top_n_fragments=0` produce a null quantity plus
    an explicit `quant_status`; they are not converted to biological zero.
 
@@ -376,19 +384,123 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    then sums the top `top_n_peptides` unique base peptides under `TopNSum`; `Sum` uses
    all unique bases. A group with no quantifiable base peptide has null quantity
    and `quant_status=no_quantifiable_peptide`.
-8. Optional fragment export (`quant.rs:531`) and peak-bounds diagnostic
-   (`quant.rs:419`). `ArtifactReport` records params + stats for each table
-   (`quant.rs:603`).
+8. Optional fragment export (`quant.rs:531`; v5 under the cross-run export) and
+   peak-bounds diagnostic (`quant.rs:419`). `ArtifactReport` records params + stats for
+   each table (`quant.rs:603`).
 
 Trapezoid math: `trapezoid` sums `dt*(y_i+y_{i+1})/2` in f64 over consecutive RT
 samples; a single sample returns its raw intensity (`quant.rs:39`). `trapezoid_window`
 first filters to samples with `lo <= rt <= hi`, then calls `trapezoid` on the subset
 so the single-sample rule is identical; an empty window integrates to 0.
 
+#### Cross-run fragment selection and background
+
+Three keys move quantification from per-run choices to choices fitted across the runs of
+one experiment. Each is off by default and benchmark-gated. Any of them switches on the
+cross-run step (`QuantConfig::needs_cross_run_fit`, the step's only trigger):
+
+| key | what the step fits | applied in pass 2 |
+|---|---|---|
+| `fragment_selection = cross_run` | one weight per (candidate, fragment) | quantity = `sum(weight x area)` |
+| `baseline_source = experiment` | one background level per (candidate, fragment) | subtracted from every fixed-window sample, clipped at zero, in place of the per-run `baseline_quantile` |
+| `fixed_scan_halfwidth_scale` > 0 | one scan halfwidth per candidate | the fixed window is `2h+1` scans in every run, in place of `fixed_scan_halfwidth` |
+
+The step runs in `run-experiment`, after the pooled rescore and after the second pass when
+it ran, on the chromatograms the reported quantities come from (the second pass's own, when
+it ran). Pass 1 quantifies every run with its per-run settings and writes the run's
+`fragment_quant.parquet` as the cross-run export (v5). `fit_cross_run` reads those tables in
+run order. Pass 2 quantifies every run again with the one fit, and writes the reported
+`peptide_quant` and `protein_group_quant`. Pass 1's peptide and protein tables are
+temporary and deleted. Both passes run under the experiment's run plan
+(`RunConcurrency::map_pooled`), with the results in run order; an explicit
+`experiment.parallel_runs` keeps them serial. Standalone, `quant --export-cross-run
+--out-fragment <table>` writes the pass-1 table, and `quant --cross-run-from <pass-1
+tables...>` runs pass 2 with the fit over them.
+
+The fit, per candidate and fragment, keyed on `candidate_id` and fragment name through
+ordered maps:
+
+- **Weight.** `dev` is the median over runs of the absolute deviation of the fragment's
+  log-share ln(area / candidate total) from its cross-run median. `corr` is the median over
+  runs of `apex_corr`, the population Pearson correlation of the fragment's fixed-window
+  samples (after the per-run baseline, before the envelope) with the sum of the candidate's
+  other fragments. The weight is `max(corr, 0) / (dev + 0.1)`. A candidate whose weights are
+  all zero takes equal weights. A run with no positive weighted area keeps the `predicted`
+  top-N rule for that candidate, so no ion is lost. `top_n_fragments` and the `predicted`
+  ranking apply only to these fallbacks.
+- **Background.** The mean over runs of `flank_mean`, the mean of the
+  `baseline_flank_scans` raw samples either side of the fixed window. The zero-area rows of
+  the export count here. Needs `baseline_subtract = true`. On raw diaPASEF traces the floor
+  is sparse counts (half the flank samples are 0), so a flank quantile underestimates it,
+  and one run's flank mean (24 samples) is too noisy to subtract. The mean over runs is not.
+- **Halfwidth.** `peak_hwhm` is the half width at half maximum, in scans, of the candidate's
+  summed fragment trace around the apex, each fragment less its flank mean. The candidate's
+  brightest run (largest summed pass-1 area; the first run on a tie) gives
+  `h = clamp(round(scale x hwhm), CROSS_RUN_HALFWIDTH_MIN, CROSS_RUN_HALFWIDTH_MAX)`, 3 to 7
+  scans. The background is then the mean of `flank_mean_h<h>`, the flank beyond that window.
+  Needs the scan form of the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`)
+  and `baseline_source = experiment`, because the width was never measured with a per-run
+  quantile.
+
+The weights are fitted on the pass-1 areas. Fitting them on the experiment-background areas
+(a third pass) gave the same scores.
+
+Fallback and refusals. Under `run`, or `quant` without `--cross-run-from`, nothing is fitted:
+`cross_run` ranks as `predicted`, the background is the per-run quantile and the window is
+`fixed_scan_halfwidth`. The log says so, and the quant reports record `"cross_run_fit":
+null` and, for `cross_run`, `"fragment_selection_fallback": "Predicted"`. When the step ran,
+the reports record the fit's candidate counts, `candidates_weighted` and the fragments whose
+experiment background was missing and fell back to the per-run quantile. `run-experiment`
+refuses the step under `groups.window_groups > 1` and `experiment.rt_library_scope =
+per_run`, because the fit needs a `candidate_id` that names one precursor in every run. That
+holds for one shared library and for the second pass's empirical library; it has not been
+checked for grouped runs or per-run libraries. directLFQ and the MBR fragment guard skip
+the zero-area rows of an export.
+
+Without the export flag, quant writes `fragment_quant` v1 with exactly its columns and rows,
+and the window correlations and flank means are not computed. A single-run `run` therefore
+stays v1 whatever the keys say.
+
+**Measured.** HYE diaPASEF, ProteoBench `quant_lfq_DIA_ion_diaPASEF` at `min_obs` 3, three
+identification sets (`nn_torch` seeds 0 to 2, fixed identifications, about 92,500 ions in
+every arm). The base is `fixed_scan_halfwidth 4`, `predicted` ranking,
+`interference_envelope` and `baseline_subtract` at quantile 0.25; pass 1 of the step used
+quantile 0.6. Median |log2 ratio error| global / species-equalised / median CV:
+
+| arm | global | species-equalised | CV |
+|---|---|---|---|
+| base | 0.138 | 0.217 | 0.092 |
+| `baseline_quantile 0.6` alone, no cross-run step | 0.145 | 0.195 | 0.101 |
+| `cross_run` + `baseline_source = experiment` | 0.133-0.134 | 0.180-0.181 | 0.087 |
+| + `fixed_scan_halfwidth_scale 2.5` | 0.129-0.130 | 0.177-0.178 | 0.083 |
+
+The quantile 0.6 arm is a trade, not a gain: it takes the species-equalised error down and
+the global error and CV up. Weights alone compress the ratios (offline prototype: E. coli
+log2 A/B -1.62, expected -2), which is why they are paired with the background. With both,
+E. coli moves to -1.84.
+
+Measured and rejected on the same data: per-run robust scaling of the cross-run fragment
+profile; sharper weights `(dev + d0)^-p`; trimmed flank means instead of the quantile (the
+same trade curve); a 1/K0 side-band background; label-free median run normalisation; MS1
+traces as extra channels (better global error and CV, worse species-equalised error); a
+fixed halfwidth of 5 or 6 scans for every precursor (global and CV gain, species-equalised
+loss); and the background of the width arm taken beyond a fixed +/-7 scans (the
+species-equalised gain is lost).
+
+Scope. The fit is label-blind (no condition or species label enters it) and
+instrument-agnostic in its code, but it was measured only on diaPASEF. A recommendation, for
+diaPASEF or any other acquisition, needs a second known-ratio set. Quantification is
+deterministic on fixed identifications, so these keys need no entrapment arm.
+
+Provenance: IM branch (PR #140) commits `7ac12e7` (weights), `1bc59a2` (background) and
+`42ccfe2` (width), measured with its `quant_diag/requant_crw.sh` requant harness. The IM keys
+`quant.cross_run_weights`, `cross_run_background` and `cross_run_width` are the three keys
+above, and its `quant --weights-from` is `--cross-run-from`.
+
 **Remaining limits.** A single positive fragment can still yield a quantity; the
 status and `n_fragments_used` expose that evidence level but do not enforce a
-minimum-clean-ion rule. Peak-window and fragment-selection policies remain
-single-run choices rather than a learned cross-run consensus. Evaluate changes on
+minimum-clean-ion rule. Peak-window and fragment-selection policies are single-run
+choices unless the opt-in cross-run step above runs. Evaluate changes on
 known-ratio data rather than identification count alone.
 
 ### quant-lfq (`quant.rs:657`, `run_lfq_combine`)
@@ -591,7 +703,10 @@ are weak, and quantification integrates those weak signals with their interferen
 the ratios compress. On the HYE mixture the median CV improves (0.255 -> 0.245) but the
 median absolute ratio error rises (0.238 -> 0.252) and E. coli log2 A/B moves from -1.71 to
 -1.48 (expected -2); on the AIF set from -1.58 to -1.40. These are true identifications;
-the limitation is in quantification.
+the limitation is in quantification. The label-blind cross-run levers
+([Cross-run fragment selection and background](#cross-run-fragment-selection-and-background))
+target this compression; they are measured on diaPASEF only and are not yet tested on these
+pools.
 
 ### mbr (rescuable-tier transfer, opt-in)
 
@@ -812,6 +927,12 @@ FDR/reporting).
   winners only (`rescore.rs:721-728`). For experiment-wide rescoring, slice by
   `source` and normally use `RunPsmQ`; `q_filter` alone does not select the run.
   `run-experiment` ignores this field and forces `PsmQ` (`run_experiment.rs:498`).
+- `fragment_selection` (`ObservedArea`): `ObservedArea`, `Predicted` or `CrossRun`.
+- `baseline_source` (`Run`): `Run` or `Experiment` (needs `baseline_subtract`).
+- `fixed_scan_halfwidth_scale` (0, off): the per-candidate width of the cross-run step.
+  The last two are omitted from the canonical configuration at their defaults, and all
+  three cross-run values are described in
+  [Cross-run fragment selection and background](#cross-run-fragment-selection-and-background).
 
 **`quant-lfq`** takes no config struct; `--method` (maxlfq/directlfq) and `--normalize`
 (median_ratio/median/none, parsed by `NormalizeMethod::from_token`, `config.rs:754`)

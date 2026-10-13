@@ -3486,14 +3486,15 @@
       "optional": false,
       "default": "observed_area",
       "default_text": "`observed_area`",
-      "help": "Which fragments enter the top-N sum. `observed_area` (default, legacy) ranks by the integrated area itself, which preferentially selects interfered fragments (their areas are inflated) and so varies run to run. `predicted` ranks by the library (predicted or empirical) fragment intensity, a per-precursor constant, so every run sums the same fragments. Astral HYE 2026-08-26: CV 0.163 -> 0.112 on 6/6 ions at top-3. Benchmark-gated.",
+      "help": "Which fragments enter the top-N sum. `observed_area` (default, legacy) ranks by the integrated area itself, which preferentially selects interfered fragments (their areas are inflated) and so varies run to run. `predicted` ranks by the library (predicted or empirical) fragment intensity, a per-precursor constant, so every run sums the same fragments. Astral HYE 2026-08-26: CV 0.163 -> 0.112 on 6/6 ions at top-3. Benchmark-gated. `cross_run` weights each fragment by its consistency across the runs of an experiment (`FragmentSelection::CrossRun`); benchmark-gated as well.",
       "gates": [
         "benchmark-gated"
       ],
       "source_struct": "QuantConfig",
       "choices": [
         "observed_area",
-        "predicted"
+        "predicted",
+        "cross_run"
       ]
     },
     {
@@ -3561,6 +3562,40 @@
       "default_text": "0.0",
       "help": "When > 0, integrate each fragment over the samples within `fixed_window_s` seconds of the identification apex (instrument-independent alternative to `fixed_scan_halfwidth`, which it overrides). 0 (default) = off.",
       "gates": [],
+      "source_struct": "QuantConfig"
+    },
+    {
+      "path": "quant.baseline_source",
+      "name": "baseline_source",
+      "section": "quant",
+      "rust_type": "BaselineSource",
+      "kind": "enum",
+      "optional": false,
+      "default": "run",
+      "default_text": "`run`",
+      "help": "Where the flank background of `baseline_subtract` comes from. `run` (default): the `baseline_quantile` quantile of this run's flanks. `experiment`: one level per (candidate, fragment), the mean over every run of the raw flank mean, which the cross-run step of `run-experiment` fits and subtracts in place of the per-run quantile (docs/12, \"Cross-run fragment selection and background\"). Needs `baseline_subtract = true`. Without the cross-run step (`run`, or `quant` without `--cross-run-from`) the per-run quantile applies. Benchmark-gated. Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "QuantConfig",
+      "choices": [
+        "run",
+        "experiment"
+      ]
+    },
+    {
+      "path": "quant.fixed_scan_halfwidth_scale",
+      "name": "fixed_scan_halfwidth_scale",
+      "section": "quant",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "When > 0, the cross-run step integrates each candidate over its own scan halfwidth `h = clamp(round(fixed_scan_halfwidth_scale x HWHM), 3, 7)` in every run, in place of `fixed_scan_halfwidth`. HWHM is the half width at half maximum, in scans, of the candidate's summed fragment trace in its brightest run, measured in the first pass; the experiment background is then taken beyond that window. Needs the scan form of the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`) and `baseline_source = experiment`. 0 (default) = off. Benchmark-gated. Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
       "source_struct": "QuantConfig"
     },
     {

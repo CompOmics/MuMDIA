@@ -2471,6 +2471,8 @@ pub struct QuantConfig {
     /// `predicted` ranks by the library (predicted or empirical) fragment intensity,
     /// a per-precursor constant, so every run sums the same fragments. Astral HYE
     /// 2026-08-26: CV 0.163 -> 0.112 on 6/6 ions at top-3. Benchmark-gated.
+    /// `cross_run` weights each fragment by its consistency across the runs of an
+    /// experiment ([`FragmentSelection::CrossRun`]); benchmark-gated as well.
     pub fragment_selection: FragmentSelection,
     /// When > 0, integrate each fragment over the `2k+1` scans centred on the
     /// identification apex instead of the descent-walk window (`bound_peak`
@@ -2499,6 +2501,37 @@ pub struct QuantConfig {
     /// seconds of the identification apex (instrument-independent alternative to
     /// `fixed_scan_halfwidth`, which it overrides). 0 (default) = off.
     pub fixed_window_s: f64,
+    /// Where the flank background of `baseline_subtract` comes from. `run` (default): the
+    /// `baseline_quantile` quantile of this run's flanks. `experiment`: one level per
+    /// (candidate, fragment), the mean over every run of the raw flank mean, which the
+    /// cross-run step of `run-experiment` fits and subtracts in place of the per-run
+    /// quantile (docs/12, "Cross-run fragment selection and background"). Needs
+    /// `baseline_subtract = true`. Without the cross-run step (`run`, or `quant` without
+    /// `--cross-run-from`) the per-run quantile applies. Benchmark-gated. Omitted from the
+    /// canonical configuration at its default.
+    #[serde(skip_serializing_if = "BaselineSource::is_run")]
+    pub baseline_source: BaselineSource,
+    /// When > 0, the cross-run step integrates each candidate over its own scan halfwidth
+    /// `h = clamp(round(fixed_scan_halfwidth_scale x HWHM), 3, 7)` in every run, in place
+    /// of `fixed_scan_halfwidth`. HWHM is the half width at half maximum, in scans, of the
+    /// candidate's summed fragment trace in its brightest run, measured in the first pass;
+    /// the experiment background is then taken beyond that window. Needs the scan form of
+    /// the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`) and
+    /// `baseline_source = experiment`. 0 (default) = off. Benchmark-gated. Omitted from the
+    /// canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub fixed_scan_halfwidth_scale: f64,
+}
+
+impl QuantConfig {
+    /// Whether quantification needs the cross-run step of `run-experiment`: a first quant
+    /// pass over every run, a fit over their fragment tables, and a second pass with it.
+    /// The one trigger of that step.
+    pub fn needs_cross_run_fit(&self) -> bool {
+        self.fragment_selection == FragmentSelection::CrossRun
+            || self.baseline_source == BaselineSource::Experiment
+            || self.fixed_scan_halfwidth_scale > 0.0
+    }
 }
 
 /// Fragment ranking for the quant top-N sum. See [`QuantConfig::fragment_selection`].
@@ -2510,6 +2543,31 @@ pub enum FragmentSelection {
     ObservedArea,
     /// Rank fragments by library intensity (`predicted_intensity` in the chromatogram table).
     Predicted,
+    /// Weight every fragment by its consistency across the runs of an experiment, fitted
+    /// by the cross-run step of `run-experiment`: the quantity is `sum(weight x area)` with
+    /// the same weights in every run (docs/12, "Cross-run fragment selection and
+    /// background"). Where no weight was fitted (single run, `quant` without
+    /// `--cross-run-from`, a candidate with no positive weighted area), `predicted`
+    /// applies, with `top_n_fragments`.
+    CrossRun,
+}
+
+/// Source of the flank background level. See [`QuantConfig::baseline_source`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineSource {
+    /// The `baseline_quantile` quantile of this run's flanks.
+    #[default]
+    Run,
+    /// The mean flank level over every run of the experiment (cross-run step).
+    Experiment,
+}
+
+impl BaselineSource {
+    /// The default, which the canonical configuration omits.
+    pub fn is_run(&self) -> bool {
+        *self == BaselineSource::Run
+    }
 }
 impl Default for QuantConfig {
     fn default() -> Self {
@@ -2531,6 +2589,8 @@ impl Default for QuantConfig {
             baseline_flank_scans: 12,
             baseline_quantile: 0.25,
             fixed_window_s: 0.0,
+            baseline_source: BaselineSource::Run,
+            fixed_scan_halfwidth_scale: 0.0,
         }
     }
 }
@@ -3640,6 +3700,37 @@ impl Config {
                 "quant.baseline_quantile must be finite and in [0, 1].".into(),
             ));
         }
+        if self.quant.baseline_source == BaselineSource::Experiment && !self.quant.baseline_subtract
+        {
+            return Err(Invalid(
+                "quant.baseline_source = experiment replaces the level baseline_subtract \
+                 subtracts, so it needs quant.baseline_subtract = true."
+                    .into(),
+            ));
+        }
+        let scale = self.quant.fixed_scan_halfwidth_scale;
+        if !scale.is_finite() || scale < 0.0 {
+            return Err(Invalid(format!(
+                "quant.fixed_scan_halfwidth_scale must be finite and >= 0 (got {scale}); 0 is off."
+            )));
+        }
+        if scale > 0.0 && (self.quant.fixed_scan_halfwidth == 0 || self.quant.fixed_window_s > 0.0)
+        {
+            return Err(Invalid(
+                "quant.fixed_scan_halfwidth_scale needs the scan form of the fixed window \
+                 (quant.fixed_scan_halfwidth > 0 and quant.fixed_window_s = 0): the halfwidth \
+                 it chooses is a number of scans."
+                    .into(),
+            ));
+        }
+        if scale > 0.0 && self.quant.baseline_source != BaselineSource::Experiment {
+            return Err(Invalid(
+                "quant.fixed_scan_halfwidth_scale needs quant.baseline_source = experiment: \
+                 the width was measured only with the experiment background taken beyond the \
+                 chosen window."
+                    .into(),
+            ));
+        }
         // The entrapment estimate is
         // `(ratio * n_entrap + 1) / max(1, n_real)`, so `ratio` scales the entire
         // numerator. At 0 it collapses to `1/n_real`: with more than 100 real targets
@@ -3818,6 +3909,16 @@ impl Config {
                 "quant.baseline_subtract applies only to the fixed-window integration, \
                  which is off (fixed_scan_halfwidth = 0 and fixed_window_s = 0), so no \
                  baseline is subtracted"
+            );
+        }
+        if self.quant.fragment_selection == FragmentSelection::CrossRun
+            && self.quant.fixed_scan_halfwidth == 0
+            && self.quant.fixed_window_s == 0.0
+        {
+            tracing::warn!(
+                "quant.fragment_selection = cross_run correlates each fragment over the fixed \
+                 window, which is off (fixed_scan_halfwidth = 0 and fixed_window_s = 0), so \
+                 every candidate takes equal weights"
             );
         }
         // ── numeric domains (docs/29 #18) ───────────────────────────────────────
@@ -5004,6 +5105,95 @@ mod tests {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }
         assert!(Config::from_json(r#"{"convert":{"bruker_reader":"native"}}"#).is_err());
+    }
+
+    /// The cross-run quant keys are omitted from the canonical configuration at their
+    /// defaults, so the default config hash is the one it was before they existed; a
+    /// non-default value is part of the configuration's identity.
+    #[test]
+    fn cross_run_quant_keys_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        let canon = d.canonical_json();
+        for key in ["baseline_source", "fixed_scan_halfwidth_scale"] {
+            assert!(!canon.contains(key), "{key} in {canon}");
+        }
+        assert!(!d.quant.needs_cross_run_fit());
+        let explicit = Config::from_json(
+            r#"{"quant":{"baseline_source":"run","fixed_scan_halfwidth_scale":0.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.canonical_json(), canon);
+        let set = Config::from_json(
+            r#"{"quant":{"fragment_selection":"cross_run","baseline_subtract":true,
+                "baseline_source":"experiment","fixed_scan_halfwidth_scale":2.5}}"#,
+        )
+        .unwrap();
+        let c = set.canonical_json();
+        assert!(c.contains(r#""fragment_selection":"cross_run""#), "{c}");
+        assert!(c.contains(r#""baseline_source":"experiment""#), "{c}");
+        assert!(c.contains(r#""fixed_scan_halfwidth_scale":2.5"#), "{c}");
+    }
+
+    /// Each of the three keys alone is the trigger of the cross-run step, and nothing else is.
+    #[test]
+    fn needs_cross_run_fit_is_any_of_the_three_keys() {
+        let mut q = QuantConfig::default();
+        assert!(!q.needs_cross_run_fit());
+        q.fragment_selection = FragmentSelection::Predicted;
+        q.baseline_subtract = true;
+        q.baseline_quantile = 0.6;
+        assert!(!q.needs_cross_run_fit());
+        q.fragment_selection = FragmentSelection::CrossRun;
+        assert!(q.needs_cross_run_fit());
+        let mut q = QuantConfig {
+            baseline_source: BaselineSource::Experiment,
+            ..QuantConfig::default()
+        };
+        assert!(q.needs_cross_run_fit());
+        q.baseline_source = BaselineSource::Run;
+        q.fixed_scan_halfwidth_scale = 2.5;
+        assert!(q.needs_cross_run_fit());
+    }
+
+    /// The dependencies between the cross-run keys are refused at load, each naming the key
+    /// it needs.
+    #[test]
+    fn cross_run_quant_key_dependencies_are_validated() {
+        for (bad, needle) in [
+            (
+                r#"{"quant":{"baseline_source":"experiment"}}"#,
+                "baseline_subtract",
+            ),
+            (
+                r#"{"quant":{"baseline_subtract":true,"fixed_scan_halfwidth_scale":2.5}}"#,
+                "baseline_source = experiment",
+            ),
+            (
+                r#"{"quant":{"baseline_subtract":true,"baseline_source":"experiment",
+                    "fixed_scan_halfwidth_scale":2.5,"fixed_scan_halfwidth":0}}"#,
+                "scan form",
+            ),
+            (
+                r#"{"quant":{"baseline_subtract":true,"baseline_source":"experiment",
+                    "fixed_scan_halfwidth_scale":2.5,"fixed_window_s":4.0}}"#,
+                "scan form",
+            ),
+            (
+                r#"{"quant":{"fixed_scan_halfwidth_scale":-1.0}}"#,
+                "finite and >= 0",
+            ),
+        ] {
+            let err = Config::from_json(bad).unwrap_err().to_string();
+            assert!(err.contains(needle), "{bad}: {err}");
+        }
+        for good in [
+            r#"{"quant":{"fragment_selection":"cross_run"}}"#,
+            r#"{"quant":{"baseline_subtract":true,"baseline_source":"experiment"}}"#,
+            r#"{"quant":{"baseline_subtract":true,"baseline_source":"experiment",
+                "fixed_scan_halfwidth":4,"fixed_scan_halfwidth_scale":2.5}}"#,
+        ] {
+            assert!(Config::from_json(good).is_ok(), "{good}");
+        }
     }
 
     /// The seed and calibration keys of the diaPASEF work are omitted from the canonical

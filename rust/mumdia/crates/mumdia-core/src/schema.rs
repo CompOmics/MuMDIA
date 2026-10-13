@@ -82,6 +82,13 @@ pub mod artifact {
     pub const PEPTIDE_QUANT: (&str, u32) = ("peptide_quant", 2);
     pub const PROTEIN_GROUP_QUANT: (&str, u32) = ("protein_group_quant", 2);
     pub const FRAGMENT_QUANT: (&str, u32) = ("fragment_quant", 1);
+    /// v5, the cross-run export (`quant --export-cross-run`, or the first pass of the
+    /// cross-run step of `run-experiment`): v1 plus the zero-area fragment rows and the
+    /// Float64 columns `apex_corr`, `flank_mean`, `flank_mean_h3` to `flank_mean_h7` and
+    /// `peak_hwhm`. Every other quant writes v1, byte for byte. The number is above the IM
+    /// branch's v2 to v4, whose meanings were never documented, so a table written there is
+    /// never read as this one.
+    pub const FRAGMENT_QUANT_V5: (&str, u32) = ("fragment_quant", 5);
     /// Cross-run MaxLFQ table, written only by `run-experiment` and `quant-lfq`.
     pub const LFQ_MAXLFQ: (&str, u32) = ("lfq_maxlfq", 1);
     /// The candidates a grouped run's pool dropped from each band (`band`,
@@ -129,6 +136,16 @@ pub mod artifact {
             (true, false) => CHROMATOGRAMS_V2,
             (false, true) => CHROMATOGRAMS_V3,
             (true, true) => CHROMATOGRAMS_V4,
+        }
+    }
+
+    /// The `fragment_quant` schema a quant writes: [`FRAGMENT_QUANT_V5`] under the cross-run
+    /// export, else [`FRAGMENT_QUANT`].
+    pub fn fragment_quant(cross_run_export: bool) -> (&'static str, u32) {
+        if cross_run_export {
+            FRAGMENT_QUANT_V5
+        } else {
+            FRAGMENT_QUANT
         }
     }
 
@@ -196,5 +213,13 @@ mod tests {
         assert_eq!(chromatograms(2, false), CHROMATOGRAMS_V2);
         assert_eq!(chromatograms(1, true), ("chromatograms", 3));
         assert_eq!(chromatograms(2, true), ("chromatograms", 4));
+    }
+
+    /// Only the cross-run export moves `fragment_quant`, to v5.
+    #[test]
+    fn fragment_quant_selector_keeps_v1_without_the_export() {
+        assert_eq!(fragment_quant(false), FRAGMENT_QUANT);
+        assert_eq!(fragment_quant(false), ("fragment_quant", 1));
+        assert_eq!(fragment_quant(true), ("fragment_quant", 5));
     }
 }

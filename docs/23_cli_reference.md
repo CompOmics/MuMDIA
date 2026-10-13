@@ -591,6 +591,12 @@ Options:
       --out-peak-bounds <OUT_PEAK_BOUNDS>
           Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt, width_s)
 
+      --export-cross-run
+          Write the cross-run export into `--out-fragment` (fragment_quant v5: the zero-area rows and the columns the cross-run fit reads). The first pass of the cross-run step; `run-experiment` runs it by itself
+
+      --cross-run-from <CROSS_RUN_FROM>...
+          The second pass of the cross-run step: the first-pass `--out-fragment` tables of every run of the experiment, written with `--export-cross-run`, in run order. The fit follows `quant.fragment_selection = cross_run`, `quant.baseline_source = experiment` and `quant.fixed_scan_halfwidth_scale`. Without it those keys fall back to the per-run quant
+
       --config <CONFIG>
 ```
 

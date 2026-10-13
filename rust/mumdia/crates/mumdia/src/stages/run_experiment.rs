@@ -155,6 +155,37 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
             cfg.mbr.strategy
         );
     }
+    refuse_unchecked_cross_run_step(cfg)?;
+    Ok(())
+}
+
+/// Refuse the cross-run quant step ([`QuantConfig::needs_cross_run_fit`]) where its fit is
+/// not yet known to be sound. The fit keys every reduction on `candidate_id` across runs, so
+/// a candidate id must name the same precursor in every run. That holds for one shared
+/// library and for the second pass's empirical library. It has not been checked for a
+/// grouped run, whose bands write their own tables, nor for per-run library adaptation.
+///
+/// [`QuantConfig::needs_cross_run_fit`]: mumdia_core::config::QuantConfig::needs_cross_run_fit
+fn refuse_unchecked_cross_run_step(cfg: &Config) -> Result<()> {
+    if !cfg.quant.needs_cross_run_fit() {
+        return Ok(());
+    }
+    if cfg.groups.window_groups > 1 {
+        anyhow::bail!(
+            "the cross-run quant step (quant.fragment_selection = cross_run, \
+             quant.baseline_source = experiment or quant.fixed_scan_halfwidth_scale > 0) is \
+             not supported with groups.window_groups > 1: candidate_id stability across a \
+             grouped run's bands has not been checked"
+        );
+    }
+    if cfg.experiment.rt_library_scope == RtLibraryScope::PerRun {
+        anyhow::bail!(
+            "the cross-run quant step (quant.fragment_selection = cross_run, \
+             quant.baseline_source = experiment or quant.fixed_scan_halfwidth_scale > 0) is \
+             not supported with experiment.rt_library_scope = per_run: candidate_id \
+             stability across per-run libraries has not been checked. Use first_run_only."
+        );
+    }
     Ok(())
 }
 
@@ -2154,12 +2185,62 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         );
     }
     qcfg.q_filter = QuantQColumn::PsmQ;
-    let mut peptide_quants: Vec<String> = Vec::with_capacity(n_runs);
-    let mut protein_quants: Vec<String> = Vec::with_capacity(n_runs);
+    // Both quant loops run under the experiment's memory-bounded plan, each run in its own
+    // pool share, with the results in run order. An explicit `parallel_runs` keeps quant
+    // serial, as it was. Each loop reads `chroms`, which after a second pass are the second
+    // pass's chromatograms: the ones the reported quantities come from.
+    let run_idx: Vec<usize> = (0..n_runs).collect();
+    let quant_plan = if plan.is_auto() {
+        plan
+    } else {
+        crate::sched::RunConcurrency {
+            par: 1,
+            pool_threads: None,
+        }
+    };
+    // --- the cross-run step (`quant.needs_cross_run_fit`) ---
+    // Pass 1 quantifies every run with its per-run settings and writes its
+    // `fragment_quant.parquet` as the cross-run export; the fit over those tables is applied
+    // by pass 2, below, in every run. Pass 1's peptide and protein tables are temporary.
+    let cross_run = if qcfg.needs_cross_run_fit() {
+        let frag_tables = quant_plan.map_pooled(&run_idx, |&i| {
+            let ft = d(&format!("{}/fragment_quant.parquet", names[i]));
+            let tmp = |n: &str| d(&format!("{}/{n}.pass1.parquet", names[i]));
+            let written = quant::run_hashed(quant::QuantParams {
+                psms_scored: &split_paths[i],
+                chromatograms: &chroms[i],
+                out_peptide: &tmp("peptide_quant"),
+                out_protein: &tmp("protein_group_quant"),
+                out_fragment: Some(&ft),
+                out_peak_bounds: None,
+                cfg: &qcfg,
+                config_hash: &ch,
+                cross_run: None,
+                export_cross_run: true,
+            })?;
+            for n in ["peptide_quant", "protein_group_quant"] {
+                for path in [tmp(n), format!("{}.report.json", tmp(n))] {
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("removing the first-pass table {path}"))?;
+                }
+            }
+            Ok((ft, written.fragment.expect("out_fragment was set")))
+        })?;
+        let paths: Vec<String> = frag_tables.iter().map(|(p, _)| p.clone()).collect();
+        let fit = quant::fit_cross_run(&paths, &qcfg)?;
+        info!(
+            weights = fit.weights.as_ref().map(|w| w.len()),
+            background = fit.background.as_ref().map(|b| b.len()),
+            halfwidth = fit.halfwidth.as_ref().map(|h| h.len()),
+            "run-experiment: cross-run quant fit (candidates)"
+        );
+        Some((fit, frag_tables))
+    } else {
+        None
+    };
     // Each run's quant hashes its two tables for their reports; the manifest below reuses
     // those hashes instead of reading the tables again.
-    let mut quant_written: Vec<quant::QuantWritten> = Vec::with_capacity(n_runs);
-    for i in 0..n_runs {
+    let finals = quant_plan.map_pooled(&run_idx, |&i| {
         let pq = d(&format!("{}/peptide_quant.parquet", names[i]));
         let gq = d(&format!("{}/protein_group_quant.parquet", names[i]));
         let written = quant::run_hashed(quant::QuantParams {
@@ -2171,7 +2252,15 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             out_peak_bounds: None,
             cfg: &qcfg,
             config_hash: &ch,
+            cross_run: cross_run.as_ref().map(|(fit, _)| fit),
+            export_cross_run: false,
         })?;
+        Ok((pq, gq, written))
+    })?;
+    let mut peptide_quants: Vec<String> = Vec::with_capacity(n_runs);
+    let mut protein_quants: Vec<String> = Vec::with_capacity(n_runs);
+    let mut quant_written: Vec<quant::QuantWritten> = Vec::with_capacity(n_runs);
+    for (pq, gq, written) in finals {
         peptide_quants.push(pq);
         protein_quants.push(gq);
         quant_written.push(written);
@@ -2205,7 +2294,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     })?;
 
     // --- experiment manifest ---
-    let manifest = json!({
+    let mut manifest = json!({
         "config_hash": ch,
         "n_runs": n_runs,
         "runs": names,
@@ -2238,6 +2327,16 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "unit": "experiment-wide peptide_q_value / pg_q_value; n_runs on run_psm_q",
         },
     });
+    // The cross-run quant step and its first-pass fragment tables, only when it ran, so
+    // every other manifest keeps its bytes.
+    if let (Some((_, tables)), Some(m)) = (&cross_run, manifest.as_object_mut()) {
+        m.insert(
+            "cross_run_quant".to_string(),
+            json!({
+                "fragment_quants": tables.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            }),
+        );
+    }
     // Provenance parity with the single-run manifest: the identity of the code, of
     // the inputs (hashed at the start of the run, see above), and of every artifact
     // this stage produced.
@@ -2406,6 +2505,16 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "quant",
             Some(quant_written[i].protein.content_hash.clone()),
         ));
+        // The cross-run export of pass 1, written only when the step ran.
+        if let Some((_, tables)) = &cross_run {
+            artifacts.push((
+                format!("fragment_quant[{name}]"),
+                artifact::fragment_quant(true),
+                tables[i].0.clone(),
+                "quant",
+                Some(tables[i].1.content_hash.clone()),
+            ));
+        }
     }
     for (logical, schema, path, stage, known_hash) in artifacts {
         let rows = mumdia_io::table::nrows(&path)
@@ -2461,6 +2570,30 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
 mod tests {
     use super::*;
     use mumdia_io::table::{write_table, Col, Table};
+
+    /// The cross-run quant step is refused where candidate_id stability across runs has not
+    /// been checked, and only when one of its keys asks for it.
+    #[test]
+    fn the_cross_run_step_is_refused_where_candidate_ids_are_unchecked() {
+        let on = r#""quant":{"fragment_selection":"cross_run"}"#;
+        for (json, ok) in [
+            ("{}".to_string(), true),
+            (format!("{{{on}}}"), true),
+            (r#"{"groups":{"window_groups":2}}"#.to_string(), true),
+            (
+                r#"{"experiment":{"rt_library_scope":"per_run"}}"#.to_string(),
+                true,
+            ),
+            (format!(r#"{{{on},"groups":{{"window_groups":2}}}}"#), false),
+            (
+                format!(r#"{{{on},"experiment":{{"rt_library_scope":"per_run"}}}}"#),
+                false,
+            ),
+        ] {
+            let cfg = Config::from_json(&json).unwrap();
+            assert_eq!(refuse_unchecked_cross_run_step(&cfg).is_ok(), ok, "{json}");
+        }
+    }
 
     fn names(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()

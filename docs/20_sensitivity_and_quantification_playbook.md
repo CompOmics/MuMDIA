@@ -456,7 +456,7 @@ IDs so selection effects remain visible.
 | Model-visible top-K peaks | stable `candidate_id + peak_rank`, competition/FDR, and known-ratio quant |
 | `peptidoform_charge` competition as the global default | precursor-level FDR/entrapment plus completeness and ratio accuracy. Not gated for PTM searches or precursor-level counts, where it is required |
 | Adaptive RT windows or tolerance optimization | multiple gradients/instruments with no FDR inflation |
-| Shared consensus peak widths or ion sets | known-ratio bias, CV, and missingness across runs |
+| Shared consensus peak widths or ion sets | known-ratio bias, CV, and missingness across runs. The opt-in cross-run step (docs/12_quant_lfq_align_mbr_report_audit.md, "Cross-run fragment selection and background") fits shared fragment weights, background and widths; it is measured on one diaPASEF known-ratio set only |
 | Minimum clean-ion/interference rules | accuracy gain without unacceptable missingness |
 | MBR transfer/requantification | transfer-decoy FDR and known-ratio validation |
 | Any nonzero MS2 conversion cap | the saturation pre-flight plus an end-to-end cap sweep on that acquisition class; `0` is the default and the safe choice |

@@ -436,6 +436,18 @@ enum Cmd {
         /// Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt, width_s).
         #[arg(long)]
         out_peak_bounds: Option<String>,
+        /// Write the cross-run export into `--out-fragment` (fragment_quant v5: the zero-area
+        /// rows and the columns the cross-run fit reads). The first pass of the cross-run
+        /// step; `run-experiment` runs it by itself.
+        #[arg(long, requires = "out_fragment")]
+        export_cross_run: bool,
+        /// The second pass of the cross-run step: the first-pass `--out-fragment` tables of
+        /// every run of the experiment, written with `--export-cross-run`, in run order. The
+        /// fit follows `quant.fragment_selection = cross_run`, `quant.baseline_source =
+        /// experiment` and `quant.fixed_scan_halfwidth_scale`. Without it those keys fall
+        /// back to the per-run quant.
+        #[arg(long, num_args = 1..)]
+        cross_run_from: Vec<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -1901,10 +1913,25 @@ fn real_main() -> Result<()> {
             out_protein,
             out_fragment,
             out_peak_bounds,
+            export_cross_run,
+            cross_run_from,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            let cross_run = if cross_run_from.is_empty() {
+                None
+            } else {
+                if !cfg.quant.needs_cross_run_fit() {
+                    anyhow::bail!(
+                        "--cross-run-from was given, but the configuration asks for no \
+                         cross-run fit: set quant.fragment_selection = cross_run, \
+                         quant.baseline_source = experiment or \
+                         quant.fixed_scan_halfwidth_scale > 0"
+                    );
+                }
+                Some(stages::quant::fit_cross_run(&cross_run_from, &cfg.quant)?)
+            };
             let losers = match &overlap_losers {
                 Some(path) => stages::pool::read_losers(path, &chromatograms)?,
                 None => vec![Vec::new(); chromatograms.len()],
@@ -1926,6 +1953,8 @@ fn real_main() -> Result<()> {
                 out_peak_bounds: out_peak_bounds.as_deref(),
                 cfg: &cfg.quant,
                 config_hash: &ch,
+                cross_run: cross_run.as_ref(),
+                export_cross_run,
             })?;
         }
         Cmd::QuantLfq {

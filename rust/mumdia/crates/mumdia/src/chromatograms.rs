@@ -1436,6 +1436,8 @@ mod tests {
                 out_peak_bounds: None,
                 cfg: &mumdia_core::config::QuantConfig::default(),
                 config_hash: "test",
+                cross_run: None,
+                export_cross_run: false,
             })
             .unwrap();
             println!(

@@ -294,6 +294,10 @@ def main():
             d = pq.read_table(fp, columns=["candidate_id", "fragment_name", "quantity"]).to_pandas()
             g = {}
             for c, fn, qq in zip(d.candidate_id, d.fragment_name, d.quantity):
+                # A cross-run export (fragment_quant v5) also carries the zero areas;
+                # they are not part of the fragment pattern.
+                if not qq > 0.0:
+                    continue
                 g.setdefault(int(c), {})[fn] = float(qq)
             frag[i] = g
 

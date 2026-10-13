@@ -13,7 +13,8 @@ use anyhow::{anyhow, Context as _, Result};
 use arrow::array::{Array, Float32Array, StringArray, UInt32Array};
 use arrow::record_batch::RecordBatch;
 use mumdia_core::config::{
-    FragmentSelection, NormalizeMethod, PeakWindowMode, QuantConfig, QuantQColumn, RollupMethod,
+    BaselineSource, FragmentSelection, NormalizeMethod, PeakWindowMode, QuantConfig, QuantQColumn,
+    RollupMethod,
 };
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
@@ -66,6 +67,74 @@ pub struct QuantParams<'a> {
     pub out_peak_bounds: Option<&'a str>,
     pub cfg: &'a QuantConfig,
     pub config_hash: &'a str,
+    /// The cross-run fit ([`fit_cross_run`]) that the second pass of the cross-run step
+    /// applies. `None` is the per-run quant.
+    pub cross_run: Option<&'a CrossRunFit>,
+    /// Write the cross-run export into `out_fragment`: `fragment_quant` v5, with the
+    /// zero-area rows and the columns [`fit_cross_run`] reads (`apex_corr`, `flank_mean`,
+    /// `flank_mean_h3`..`flank_mean_h7`, `peak_hwhm`). Set by the first pass of the
+    /// cross-run step, or by `quant --export-cross-run`. Never derived from the
+    /// configuration, so a quant that does not ask for it writes `fragment_quant` v1.
+    pub export_cross_run: bool,
+}
+
+/// One value per (candidate, fragment name), fitted over every run of an experiment.
+pub type FragmentLevels = BTreeMap<u32, BTreeMap<String, f64>>;
+
+/// The cross-run fit applied in the second pass of the cross-run step
+/// ([`QuantConfig::needs_cross_run_fit`]). Each part is `Some` exactly when its key asks
+/// for it.
+#[derive(Debug, Default)]
+pub struct CrossRunFit {
+    /// `fragment_selection = cross_run`: the quantity is `sum(weight x area)`.
+    pub weights: Option<FragmentLevels>,
+    /// `baseline_source = experiment`: subtracted from every fixed-window sample in place
+    /// of the per-run flank quantile.
+    pub background: Option<FragmentLevels>,
+    /// `fixed_scan_halfwidth_scale > 0`: the candidate's fixed-window scan halfwidth, in
+    /// place of `fixed_scan_halfwidth`.
+    pub halfwidth: Option<BTreeMap<u32, usize>>,
+}
+
+/// Smallest scan halfwidth `fixed_scan_halfwidth_scale` chooses. The export carries the
+/// flank mean beyond every halfwidth from this to [`CROSS_RUN_HALFWIDTH_MAX`], so the fit
+/// can pool the flank of whichever it chooses.
+pub const CROSS_RUN_HALFWIDTH_MIN: usize = 3;
+/// Largest scan halfwidth `fixed_scan_halfwidth_scale` chooses: the range the width was
+/// measured over on diaPASEF.
+pub const CROSS_RUN_HALFWIDTH_MAX: usize = 7;
+/// Number of halfwidths in `CROSS_RUN_HALFWIDTH_MIN..=CROSS_RUN_HALFWIDTH_MAX`.
+const CROSS_RUN_HALFWIDTHS: usize = CROSS_RUN_HALFWIDTH_MAX - CROSS_RUN_HALFWIDTH_MIN + 1;
+
+/// Half width at half maximum, in scans, of a trace sampled at the scans
+/// `-CROSS_RUN_HALFWIDTH_MAX..=CROSS_RUN_HALFWIDTH_MAX` around the apex
+/// (`s[CROSS_RUN_HALFWIDTH_MAX]` is the apex sample). Each side runs from the apex to the
+/// first sample below half the apex value, interpolated linearly; a side that never falls
+/// below counts its number of samples, the apex included. The mean of the two sides.
+fn peak_hwhm(s: &[f64; 2 * CROSS_RUN_HALFWIDTH_MAX + 1]) -> f64 {
+    let half = s[CROSS_RUN_HALFWIDTH_MAX] / 2.0;
+    let side = |m: &[f64]| -> f64 {
+        match m.iter().position(|&v| v < half) {
+            None => m.len() as f64,
+            Some(k) => {
+                let kk = k.clamp(1, m.len() - 1);
+                let (y0, y1) = (m[kk - 1], m[kk]);
+                let frac = if y0 > y1 {
+                    (y0 - half) / (y0 - y1).max(1e-12)
+                } else {
+                    0.0
+                };
+                k as f64 - 1.0 + frac
+            }
+        }
+    };
+    let right: Vec<f64> = s[CROSS_RUN_HALFWIDTH_MAX..].to_vec();
+    let left: Vec<f64> = s[..=CROSS_RUN_HALFWIDTH_MAX]
+        .iter()
+        .rev()
+        .copied()
+        .collect();
+    (side(&right) + side(&left)) / 2.0
 }
 
 /// Interned fragment names. A chromatogram table has tens of millions of rows and only a
@@ -952,6 +1021,10 @@ fn trapezoid_fixed_opts(
 /// Fixed-window integration over the sample range `[lo, hi)` already chosen by
 /// [`fixed_window_indices`], with optional apex-outward envelope and optional
 /// flank-baseline subtraction (`baseline = Some((flank, quantile))`).
+///
+/// Test-facing composition of [`baseline_window`] and [`integrate_window`], which [`run`]
+/// calls separately so the cross-run export can keep the window samples.
+#[cfg(test)]
 fn trapezoid_fixed_at(
     rt: &[f32],
     inten: &[f32],
@@ -960,6 +1033,22 @@ fn trapezoid_fixed_at(
     envelope: bool,
     baseline: Option<(usize, f64)>,
 ) -> f64 {
+    integrate_window(
+        &rt[lo..hi],
+        baseline_window(inten, lo, hi, baseline),
+        envelope,
+    )
+}
+
+/// Samples `[lo, hi)` after the optional flank-baseline subtraction
+/// (`baseline = Some((flank, quantile))`), clipped at zero, before any envelope: what
+/// [`integrate_window`] integrates and what [`window_correlations`] correlates.
+fn baseline_window(
+    inten: &[f32],
+    lo: usize,
+    hi: usize,
+    baseline: Option<(usize, f64)>,
+) -> Vec<f32> {
     let mut w: Vec<f32> = inten[lo..hi].to_vec();
     if let Some((flank, quantile)) = baseline {
         let b = flank_baseline(inten, lo, hi, flank, quantile);
@@ -967,10 +1056,57 @@ fn trapezoid_fixed_at(
             *x = (*x - b).max(0.0);
         }
     }
+    w
+}
+
+/// Trapezoidal integral of window samples `w` over their retention times `rt`, after the
+/// optional apex-outward envelope.
+fn integrate_window(rt: &[f32], mut w: Vec<f32>, envelope: bool) -> f64 {
     if envelope {
         w = center_envelope_1d(&w);
     }
-    trapezoid(&rt[lo..hi], &w)
+    trapezoid(rt, &w)
+}
+
+/// Mean of the raw samples in the `flank` samples either side of `[lo, hi)`; NaN without
+/// any. The level the experiment background (`baseline_source = experiment`) averages.
+fn flank_mean(inten: &[f32], lo: usize, hi: usize, flank: usize) -> f64 {
+    let left = &inten[lo.saturating_sub(flank)..lo];
+    let right = &inten[hi..(hi + flank).min(inten.len())];
+    let n = left.len() + right.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    left.iter().chain(right).map(|&x| x as f64).sum::<f64>() / n as f64
+}
+
+/// Correlation of each fragment with the sum of the candidate's other fragments, over the
+/// fixed-window samples (positionally aligned from each window's first sample; shorter
+/// windows are zero-padded). NaN where a fragment has no window. Population Pearson
+/// ([`crate::stats::pearson`]), so a flat window correlates 0. The `apex_corr` of the
+/// cross-run export.
+fn window_correlations(windows: &[Option<Vec<f32>>]) -> Vec<f64> {
+    let n = windows.iter().flatten().map(|w| w.len()).max().unwrap_or(0);
+    let mut x = vec![vec![0.0f64; n]; windows.len()];
+    for (row, w) in x.iter_mut().zip(windows) {
+        if let Some(w) = w {
+            for (d, &v) in row.iter_mut().zip(w) {
+                *d = v as f64;
+            }
+        }
+    }
+    let total: Vec<f64> = (0..n).map(|k| x.iter().map(|r| r[k]).sum()).collect();
+    windows
+        .iter()
+        .zip(&x)
+        .map(|(w, row)| {
+            if w.is_none() {
+                return f64::NAN;
+            }
+            let rest: Vec<f64> = total.iter().zip(row).map(|(t, v)| t - v).collect();
+            crate::stats::pearson(row, &rest)
+        })
+        .collect()
 }
 
 /// Top-N sum with the fragment ranking chosen by `selection`. `observed_area`
@@ -988,7 +1124,9 @@ fn select_fragment_areas(
 ) -> (Option<f64>, usize, &'static str) {
     match selection {
         FragmentSelection::ObservedArea => summarize_fragment_areas(areas.map(|a| a.0), top_n),
-        FragmentSelection::Predicted => {
+        // `cross_run` reaches this ranking only as its fallback, for a candidate without a
+        // fitted weight or without a positive weighted area in this run.
+        FragmentSelection::Predicted | FragmentSelection::CrossRun => {
             let Some((areas, preds)) = areas else {
                 return (None, 0, "no_fragment_traces");
             };
@@ -2378,13 +2516,35 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         }
     }
     let has_pred = has_pred.unwrap_or(false);
-    if !has_pred && p.cfg.fragment_selection == FragmentSelection::Predicted {
+    // `cross_run` ranks by the same column wherever it falls back to `predicted`.
+    if !has_pred
+        && matches!(
+            p.cfg.fragment_selection,
+            FragmentSelection::Predicted | FragmentSelection::CrossRun
+        )
+    {
         anyhow::bail!(
-            "quant.fragment_selection = predicted ranks fragments by the \
+            "quant.fragment_selection = {:?} ranks fragments by the \
              `predicted_intensity` column, which {} does not carry. Re-run `extract` to \
              write a current chromatogram artifact, or set \
              quant.fragment_selection = observed_area.",
+            p.cfg.fragment_selection,
             p.chromatograms[0].path
+        );
+    }
+    // The cross-run export (first pass of the cross-run step, or `--export-cross-run`). It
+    // has somewhere to go only with a fragment table.
+    let export = p.export_cross_run && p.out_fragment.is_some();
+    if export {
+        info!("quant: writing the cross-run export (fragment_quant v5)");
+    } else if p.cfg.needs_cross_run_fit() && p.cross_run.is_none() {
+        info!(
+            fragment_selection = ?p.cfg.fragment_selection,
+            baseline_source = ?p.cfg.baseline_source,
+            "quant: the cross-run step did not run (a single run, or quant without \
+             --cross-run-from): fragment_selection = cross_run falls back to predicted with \
+             top_n_fragments, baseline_source = experiment to the per-run quantile, and \
+             fixed_scan_halfwidth_scale to fixed_scan_halfwidth"
         );
     }
     // The selective read wants the table's offset index, so that the pages holding no
@@ -2541,20 +2701,52 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         None
     };
     let mut area_by_slot: Vec<f64> = vec![0.0; index.rows.len()];
-    let mut slices: Vec<&mut [f64]> = Vec::with_capacity(index.len());
+    // The cross-run export's per-slot values, laid out like `area_by_slot` and empty
+    // without the export, so a quant that does not export allocates and computes none of
+    // them: the window correlation (`apex_corr`), the flank mean beyond the window
+    // (`flank_mean`) and beyond every halfwidth the scale can choose (`flank_mean_h*`).
+    // NaN outside a fixed window.
+    let x_len = if export { index.rows.len() } else { 0 };
+    let mut corr_by_slot: Vec<f64> = vec![f64::NAN; x_len];
+    let mut flank_by_slot: Vec<f64> = vec![f64::NAN; x_len];
+    let mut flank_h_by_slot: Vec<[f64; CROSS_RUN_HALFWIDTHS]> =
+        vec![[f64::NAN; CROSS_RUN_HALFWIDTHS]; x_len];
+    type Slots<'s> = (
+        &'s mut [f64],
+        &'s mut [f64],
+        &'s mut [f64],
+        &'s mut [[f64; CROSS_RUN_HALFWIDTHS]],
+    );
+    let mut slices: Vec<Slots> = Vec::with_capacity(index.len());
     {
         let mut rest: &mut [f64] = &mut area_by_slot;
+        let mut crest: &mut [f64] = &mut corr_by_slot;
+        let mut frest: &mut [f64] = &mut flank_by_slot;
+        let mut hrest: &mut [[f64; CROSS_RUN_HALFWIDTHS]] = &mut flank_h_by_slot;
         for ci in 0..index.len() {
             let n = index.cand_off[ci + 1] - index.cand_off[ci];
+            let nx = if export { n } else { 0 };
             let (head, tail) = rest.split_at_mut(n);
-            slices.push(head);
+            let (chead, ctail) = crest.split_at_mut(nx);
+            let (fhead, ftail) = frest.split_at_mut(nx);
+            let (hhead, htail) = hrest.split_at_mut(nx);
+            slices.push((head, chead, fhead, hhead));
             rest = tail;
+            crest = ctail;
+            frest = ftail;
+            hrest = htail;
         }
     }
-    let applied_win: Vec<(f64, f64, f64)> = slices
+    // The second pass of the cross-run step: the experiment background per (candidate,
+    // fragment) and the halfwidth per candidate.
+    let pooled_bg = p.cross_run.and_then(|x| x.background.as_ref());
+    let halfwidths = p.cross_run.and_then(|x| x.halfwidth.as_ref());
+    // Per candidate: (lo_rt, hi_rt, integration_apex, peak HWHM for the export, fragments
+    // whose experiment background was missing and fell back to the per-run quantile).
+    let applied: Vec<(f64, f64, f64, f64, u32)> = slices
         .par_iter_mut()
         .enumerate()
-        .map(|(ci, out)| {
+        .map(|(ci, (out, cout, fout, hout))| {
             let c = index.cids[ci];
             let rows = index.rows_of(ci);
             let (lo_rt, hi_rt, integration_apex) = if !p.cfg.bound_peak {
@@ -2596,6 +2788,17 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             // to recompute the identical indices in a second pass over the same rows.
             let mut flo = f64::INFINITY;
             let mut fhi = f64::NEG_INFINITY;
+            // The candidate's own halfwidth under `fixed_scan_halfwidth_scale`, which
+            // validation confines to the scan form of the window.
+            let half = halfwidths
+                .and_then(|m| m.get(&c))
+                .copied()
+                .unwrap_or(p.cfg.fixed_scan_halfwidth);
+            // Export only: each fragment's window samples, for the correlations, and the
+            // candidate's summed trace around the apex, for its peak HWHM.
+            let mut windows: Vec<Option<Vec<f32>>> = Vec::new();
+            let mut summed = [0.0f64; 2 * CROSS_RUN_HALFWIDTH_MAX + 1];
+            let mut bg_fallback = 0u32;
             for (slot, &i) in rows.iter().enumerate() {
                 let rt = store.rt(i);
                 let it = store.inten(i);
@@ -2603,23 +2806,70 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                     match fixed_window_indices(
                         rt,
                         integration_apex,
-                        p.cfg.fixed_scan_halfwidth,
+                        half,
                         p.cfg.fixed_window_s,
                         store.rt_sorted,
                     ) {
                         Some((lo, hi)) => {
                             flo = flo.min(rt[lo] as f64);
                             fhi = fhi.max(rt[hi - 1] as f64);
-                            trapezoid_fixed_at(
-                                rt,
-                                it,
-                                lo,
-                                hi,
-                                p.cfg.interference_envelope,
-                                baseline,
-                            )
+                            if export {
+                                let flank = p.cfg.baseline_flank_scans;
+                                fout[slot] = flank_mean(it, lo, hi, flank);
+                                let hs = CROSS_RUN_HALFWIDTH_MIN..=CROSS_RUN_HALFWIDTH_MAX;
+                                for (j, h) in hs.enumerate() {
+                                    hout[slot][j] = fixed_window_indices(
+                                        rt,
+                                        integration_apex,
+                                        h,
+                                        0.0,
+                                        store.rt_sorted,
+                                    )
+                                    .map_or(f64::NAN, |(l, u)| flank_mean(it, l, u, flank));
+                                }
+                                // This run's summed trace around the apex, each fragment
+                                // less its flank mean, clipped at zero.
+                                let k = nearest_index(rt, integration_apex, store.rt_sorted);
+                                let b = if fout[slot].is_finite() {
+                                    fout[slot]
+                                } else {
+                                    0.0
+                                };
+                                for (d, acc) in summed.iter_mut().enumerate() {
+                                    if let Some(idx) = (k + d).checked_sub(CROSS_RUN_HALFWIDTH_MAX)
+                                    {
+                                        if let Some(&x) = it.get(idx) {
+                                            *acc += (x as f64 - b).max(0.0);
+                                        }
+                                    }
+                                }
+                            }
+                            let pooled = pooled_bg
+                                .and_then(|m| m.get(&c))
+                                .and_then(|f| f.get(store.name(i)));
+                            let w = match pooled {
+                                Some(&b) => it[lo..hi]
+                                    .iter()
+                                    .map(|&x| (x - b as f32).max(0.0))
+                                    .collect(),
+                                None => {
+                                    if pooled_bg.is_some() {
+                                        bg_fallback += 1;
+                                    }
+                                    baseline_window(it, lo, hi, baseline)
+                                }
+                            };
+                            if export {
+                                windows.push(Some(w.clone()));
+                            }
+                            integrate_window(&rt[lo..hi], w, p.cfg.interference_envelope)
                         }
-                        None => 0.0,
+                        None => {
+                            if export {
+                                windows.push(None);
+                            }
+                            0.0
+                        }
                     }
                 } else if p.cfg.bound_peak {
                     trapezoid_window(rt, it, lo_rt, hi_rt, p.cfg.interference_envelope)
@@ -2627,16 +2877,38 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                     trapezoid(rt, it)
                 };
             }
+            let hwhm = if export && fixed {
+                cout.copy_from_slice(&window_correlations(&windows));
+                peak_hwhm(&summed)
+            } else {
+                f64::NAN
+            };
             let (lo_rt, hi_rt) = if fixed && flo.is_finite() && fhi.is_finite() {
                 (flo, fhi)
             } else {
                 (lo_rt, hi_rt)
             };
-            (lo_rt, hi_rt, integration_apex)
+            (lo_rt, hi_rt, integration_apex, hwhm, bg_fallback)
         })
         .collect();
     drop(slices);
+    let applied_win: Vec<(f64, f64, f64)> =
+        applied.iter().map(|&(l, h, a, _, _)| (l, h, a)).collect();
     let area_by_slot = area_by_slot;
+    let corr_by_slot = corr_by_slot;
+    let flank_by_slot = flank_by_slot;
+    let flank_h_by_slot = flank_h_by_slot;
+    // Fragments (and their candidates) without an experiment background, which kept the
+    // per-run quantile.
+    let bg_fallback_fragments: u64 = applied.iter().map(|x| x.4 as u64).sum();
+    let bg_fallback_candidates = applied.iter().filter(|x| x.4 > 0).count();
+    if pooled_bg.is_some() && bg_fallback_fragments > 0 {
+        info!(
+            candidates = bg_fallback_candidates,
+            fragments = bg_fallback_fragments,
+            "quant: fragments with no experiment background kept the per-run quantile"
+        );
+    }
     if emit_bounds {
         for (ci, &(lo_rt, hi_rt, _)) in applied_win.iter().enumerate() {
             if lo_rt.is_finite() && hi_rt.is_finite() {
@@ -2694,6 +2966,10 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     // areas, and every extra row mapping to the same candidate repeated that.
     let mut selected: HashMap<usize, usize> = HashMap::new();
     let mut selections: Vec<(Option<f64>, usize, &'static str)> = Vec::new();
+    // `fragment_selection = cross_run` with fitted weights: `sum(weight x area)`, falling
+    // back to the `predicted` top-N rule for a candidate without a positive weighted area.
+    let weights = p.cross_run.and_then(|x| x.weights.as_ref());
+    let mut n_weighted = 0u64;
     // One pass over the accepted rows, in table order, which is the order the filter over
     // every row visited them in.
     for (k, &c) in acc_cid.iter().enumerate() {
@@ -2703,11 +2979,23 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             Some(ci) => {
                 let slot = *selected.entry(ci).or_insert_with(|| {
                     let r = index.slots(ci);
-                    selections.push(select_fragment_areas(
-                        Some((&area_by_slot[r.clone()], &index.slot_pred[r])),
-                        p.cfg.top_n_fragments,
-                        p.cfg.fragment_selection,
-                    ));
+                    let weighted = weights.and_then(|fw| fw.get(&c)).and_then(|w| {
+                        weighted_quantity(
+                            &area_by_slot[r.clone()],
+                            r.clone().map(|s| store.name(index.rows[s])),
+                            w,
+                        )
+                    });
+                    if weighted.is_some() {
+                        n_weighted += 1;
+                    }
+                    selections.push(weighted.unwrap_or_else(|| {
+                        select_fragment_areas(
+                            Some((&area_by_slot[r.clone()], &index.slot_pred[r])),
+                            p.cfg.top_n_fragments,
+                            p.cfg.fragment_selection,
+                        )
+                    }));
                     selections.len() - 1
                 });
                 selections[slot]
@@ -2788,14 +3076,20 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             Vec::new(),
             Vec::new(),
         );
+        // The cross-run export's columns, filled only under the export.
+        let (mut f_corr, mut f_flank, mut f_hwhm) = (Vec::new(), Vec::new(), Vec::new());
+        let mut f_flank_h: Vec<Vec<f64>> = vec![Vec::new(); CROSS_RUN_HALFWIDTHS];
         for (k, &c) in acc_cid.iter().enumerate() {
             // The fragment name comes from the interned table by row rather than from a
             // per-candidate `Vec<(&str, f64)>` built alongside the areas; the rows are the
             // same rows in the same order.
             if let Some(ci) = index.find(c) {
                 for slot in index.slots(ci) {
+                    // The export keeps the zero areas too, because the experiment
+                    // background averages the flank over every run; directLFQ, the weight
+                    // fit and the MBR fragment guard skip them.
                     let a = area_by_slot[slot];
-                    if !a.is_finite() || a <= 0.0 {
+                    if !a.is_finite() || a < 0.0 || (a == 0.0 && !export) {
                         continue;
                     }
                     f_cid.push(c);
@@ -2804,20 +3098,37 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                     f_pg.push(pg.get(k).to_string());
                     f_name.push(store.name(index.rows[slot]).to_string());
                     f_area.push(a);
+                    if export {
+                        f_corr.push(corr_by_slot[slot]);
+                        f_flank.push(flank_by_slot[slot]);
+                        for (j, col) in f_flank_h.iter_mut().enumerate() {
+                            col.push(flank_h_by_slot[slot][j]);
+                        }
+                        f_hwhm.push(applied[ci].3);
+                    }
                 }
             }
         }
-        let fragment_rows = write_table(
-            fpath,
-            vec![
-                Col::U32("candidate_id".into(), f_cid),
-                Col::Str("peptidoform".into(), f_pf),
-                Col::I32("charge".into(), f_z),
-                Col::Str("protein_group".into(), f_pg),
-                Col::Str("fragment_name".into(), f_name),
-                Col::F64("quantity".into(), f_area),
-            ],
-        )?;
+        let mut cols = vec![
+            Col::U32("candidate_id".into(), f_cid),
+            Col::Str("peptidoform".into(), f_pf),
+            Col::I32("charge".into(), f_z),
+            Col::Str("protein_group".into(), f_pg),
+            Col::Str("fragment_name".into(), f_name),
+            Col::F64("quantity".into(), f_area),
+        ];
+        if export {
+            cols.push(Col::F64("apex_corr".into(), f_corr));
+            cols.push(Col::F64("flank_mean".into(), f_flank));
+            for (j, col) in f_flank_h.into_iter().enumerate() {
+                cols.push(Col::F64(
+                    format!("flank_mean_h{}", CROSS_RUN_HALFWIDTH_MIN + j),
+                    col,
+                ));
+            }
+            cols.push(Col::F64("peak_hwhm".into(), f_hwhm));
+        }
+        let fragment_rows = write_table(fpath, cols)?;
         fragment_output = Some((fpath, fragment_rows));
     }
 
@@ -2874,6 +3185,46 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         "apex_rt_column_present": apex_column_present,
         "candidates_with_scored_apex": candidates_with_scored_apex,
     });
+    // The cross-run parameters, only where the cross-run step (or its export) is involved,
+    // so every other report keeps its bytes.
+    if let Some(params) = report_params.as_object_mut() {
+        if let Some(fit) = p.cross_run {
+            params.insert(
+                "cross_run_fit".to_string(),
+                json!({
+                    "weights_candidates": fit.weights.as_ref().map(|w| w.len()),
+                    "background_candidates": fit.background.as_ref().map(|b| b.len()),
+                    "halfwidth_candidates": fit.halfwidth.as_ref().map(|h| h.len()),
+                }),
+            );
+            params.insert(
+                "baseline_source".to_string(),
+                json!(format!("{:?}", p.cfg.baseline_source)),
+            );
+            params.insert(
+                "fixed_scan_halfwidth_scale".to_string(),
+                json!(p.cfg.fixed_scan_halfwidth_scale),
+            );
+            params.insert("candidates_weighted".to_string(), json!(n_weighted));
+            if pooled_bg.is_some() {
+                params.insert(
+                    "cross_run_background_fallback_fragments".to_string(),
+                    json!(bg_fallback_fragments),
+                );
+            }
+        } else if p.cfg.needs_cross_run_fit() {
+            params.insert("cross_run_fit".to_string(), json!(null));
+        }
+        if p.cfg.fragment_selection == FragmentSelection::CrossRun && weights.is_none() {
+            params.insert(
+                "fragment_selection_fallback".to_string(),
+                json!(format!("{:?}", FragmentSelection::Predicted)),
+            );
+        }
+        if export {
+            params.insert("cross_run_export".to_string(), json!(true));
+        }
+    }
     if !whole_table {
         if let Some(params) = report_params.as_object_mut() {
             params.insert(
@@ -2909,9 +3260,9 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     let mut fragment_written: Option<Written> = None;
     if let Some((path, rows)) = fragment_output {
         let report = ArtifactReport {
-            logical_name: artifact::FRAGMENT_QUANT.0.to_string(),
-            schema_name: artifact::FRAGMENT_QUANT.0.to_string(),
-            schema_version: artifact::FRAGMENT_QUANT.1,
+            logical_name: artifact::fragment_quant(export).0.to_string(),
+            schema_name: artifact::fragment_quant(export).0.to_string(),
+            schema_version: artifact::fragment_quant(export).1,
             stage: "quant".to_string(),
             rows,
             content_hash: mumdia_io::hash::blake3_file(path)?,
@@ -2938,6 +3289,206 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         peptide,
         protein,
         fragment: fragment_written,
+    })
+}
+
+/// Weighted quantity of one candidate: `sum(weight x area)` over its fragments with a
+/// positive area. `None` (the caller keeps the `predicted` top-N rule) when no weighted
+/// fragment has a positive area in this run.
+fn weighted_quantity<'a>(
+    areas: &[f64],
+    names: impl Iterator<Item = &'a str>,
+    weights: &BTreeMap<String, f64>,
+) -> Option<(Option<f64>, usize, &'static str)> {
+    let (mut q, mut used) = (0.0f64, 0usize);
+    for (&a, name) in areas.iter().zip(names) {
+        if let Some(&w) = weights.get(name) {
+            if a.is_finite() && a > 0.0 && w > 0.0 {
+                q += w * a;
+                used += 1;
+            }
+        }
+    }
+    (q.is_finite() && q > 0.0).then_some((Some(q), used, "quantified"))
+}
+
+/// Fit the cross-run step from the first-pass `fragment_quant` tables of every run (the
+/// cross-run export, v5), in run order. Each part is fitted only when `cfg` asks for it.
+/// Every reduction is keyed on `candidate_id` and fragment name through ordered maps and
+/// runs over the tables in the order given, so the fit is deterministic. Label-blind.
+///
+/// Weights (`fragment_selection = cross_run`), from the positive areas and `apex_corr`. Per
+/// candidate and fragment: `dev` is the median over runs of |log-share - its cross-run
+/// median|, where the log-share is ln(area / candidate total in that run); `corr` is the
+/// median over runs of the finite `apex_corr`; the weight is `max(corr, 0) / (dev + 0.1)`.
+/// A candidate whose weights are all zero gets weight 1 on every fragment.
+///
+/// Background (`baseline_source = experiment`): per candidate and fragment, the mean over
+/// runs of the finite `flank_mean`, zero-area rows included. The floor on raw diaPASEF
+/// traces is sparse counts (half the flank samples are 0), so a flank quantile
+/// underestimates it, and one run's flank mean is noisy where the mean over runs is not.
+///
+/// Halfwidth (`fixed_scan_halfwidth_scale` > 0): per candidate, the `peak_hwhm` of the run
+/// with the largest summed first-pass area (the first such run on a tie) gives
+/// `h = clamp(round(scale x hwhm), CROSS_RUN_HALFWIDTH_MIN, CROSS_RUN_HALFWIDTH_MAX)`; the
+/// background then pools the `flank_mean_h<h>` column, the flank beyond that window.
+pub fn fit_cross_run(fragment_tables: &[String], cfg: &QuantConfig) -> Result<CrossRunFit> {
+    let want_weights = cfg.fragment_selection == FragmentSelection::CrossRun;
+    let want_background = cfg.baseline_source == BaselineSource::Experiment;
+    let scale = cfg.fixed_scan_halfwidth_scale;
+    let want_width = scale > 0.0;
+    let need = |t: &TableFile, path: &str, col: &str| -> Result<Vec<f64>> {
+        t.f64(col).with_context(|| {
+            format!(
+                "the cross-run fit reads `{col}` from {path}: pass the first-pass tables of \
+                 the cross-run export (fragment_quant v5, quant --export-cross-run)"
+            )
+        })
+    };
+    // candidate -> (largest summed area over runs, that run's peak HWHM)
+    let mut brightest: BTreeMap<u32, (f64, f64)> = BTreeMap::new();
+    // (candidate, fragment) -> per-halfwidth (sum of flank means, runs)
+    type PerHalfwidth = [(f64, u32); CROSS_RUN_HALFWIDTHS];
+    let mut flank_h: BTreeMap<u32, BTreeMap<String, PerHalfwidth>> = BTreeMap::new();
+    // (candidate, fragment) -> per-run (log-share, corr), in run order
+    let mut obs: BTreeMap<u32, BTreeMap<String, Vec<(f64, f64)>>> = BTreeMap::new();
+    // (candidate, fragment) -> (sum of flank means, runs)
+    let mut flank: BTreeMap<u32, BTreeMap<String, (f64, u32)>> = BTreeMap::new();
+    for path in fragment_tables {
+        let t = TableFile::open(path)?;
+        let cid = t.u32("candidate_id")?;
+        let name = t.str("fragment_name")?;
+        let area = t.f64("quantity")?;
+        if want_background {
+            let fm = need(&t, path, "flank_mean")?;
+            for i in 0..t.nrows {
+                if fm[i].is_finite() {
+                    let e = flank
+                        .entry(cid[i])
+                        .or_default()
+                        .entry(name[i].clone())
+                        .or_default();
+                    e.0 += fm[i];
+                    e.1 += 1;
+                }
+            }
+        }
+        let mut total: BTreeMap<u32, f64> = BTreeMap::new();
+        for i in 0..t.nrows {
+            *total.entry(cid[i]).or_default() += area[i];
+        }
+        if want_width {
+            let hw = need(&t, path, "peak_hwhm")?;
+            let cols: Vec<Vec<f64>> = (CROSS_RUN_HALFWIDTH_MIN..=CROSS_RUN_HALFWIDTH_MAX)
+                .map(|h| need(&t, path, &format!("flank_mean_h{h}")))
+                .collect::<Result<_>>()?;
+            let mut run_hw: BTreeMap<u32, f64> = BTreeMap::new();
+            for i in 0..t.nrows {
+                run_hw.entry(cid[i]).or_insert(hw[i]);
+                let e = flank_h
+                    .entry(cid[i])
+                    .or_default()
+                    .entry(name[i].clone())
+                    .or_insert([(0.0, 0); CROSS_RUN_HALFWIDTHS]);
+                for (j, col) in cols.iter().enumerate() {
+                    if col[i].is_finite() {
+                        e[j].0 += col[i];
+                        e[j].1 += 1;
+                    }
+                }
+            }
+            for (&c, &tot) in &total {
+                let hwv = run_hw[&c];
+                if !hwv.is_finite() {
+                    continue;
+                }
+                // Strictly larger: on a tie the first run keeps it.
+                let e = brightest.entry(c).or_insert((f64::NEG_INFINITY, f64::NAN));
+                if tot > e.0 {
+                    *e = (tot, hwv);
+                }
+            }
+        }
+        if want_weights {
+            let corr = need(&t, path, "apex_corr")?;
+            for i in 0..t.nrows {
+                // A zero area (or a zero total) has no finite log-share and is skipped.
+                let ls = (area[i] / total[&cid[i]]).ln();
+                if ls.is_finite() {
+                    obs.entry(cid[i])
+                        .or_default()
+                        .entry(name[i].clone())
+                        .or_default()
+                        .push((ls, corr[i]));
+                }
+            }
+        }
+    }
+    let weights = want_weights.then(|| {
+        let mut out: FragmentLevels = BTreeMap::new();
+        for (c, frags) in obs {
+            let mut w: BTreeMap<String, f64> = frags
+                .into_iter()
+                .map(|(f, v)| {
+                    let mut ls: Vec<f64> = v.iter().map(|x| x.0).collect();
+                    let med = median_sorted(&mut ls);
+                    let mut dev: Vec<f64> = v.iter().map(|x| (x.0 - med).abs()).collect();
+                    let dev = median_sorted(&mut dev);
+                    // No finite correlation is a median of 0, so a weight of 0.
+                    let mut corr: Vec<f64> =
+                        v.iter().map(|x| x.1).filter(|x| x.is_finite()).collect();
+                    let corr = median_sorted(&mut corr);
+                    (f, corr.max(0.0) / (dev + 0.1))
+                })
+                .collect();
+            if w.values().all(|&x| x <= 0.0) {
+                w.values_mut().for_each(|x| *x = 1.0);
+            }
+            out.insert(c, w);
+        }
+        out
+    });
+    let half: Option<BTreeMap<u32, usize>> = want_width.then(|| {
+        brightest
+            .into_iter()
+            .map(|(c, (_, hw))| {
+                let h = (scale * hw).round().clamp(
+                    CROSS_RUN_HALFWIDTH_MIN as f64,
+                    CROSS_RUN_HALFWIDTH_MAX as f64,
+                );
+                (c, h as usize)
+            })
+            .collect()
+    });
+    let background = want_background.then(|| {
+        let mut bg: FragmentLevels = flank
+            .into_iter()
+            .map(|(c, f)| {
+                (
+                    c,
+                    f.into_iter().map(|(n, (s, k))| (n, s / k as f64)).collect(),
+                )
+            })
+            .collect();
+        // Under the width the background is the flank beyond the chosen window.
+        if let Some(half) = &half {
+            for (c, frags) in flank_h {
+                let Some(&h) = half.get(&c) else { continue };
+                let lv = bg.entry(c).or_default();
+                for (n, per) in frags {
+                    let (sum, k) = per[h - CROSS_RUN_HALFWIDTH_MIN];
+                    if k > 0 {
+                        lv.insert(n, sum / k as f64);
+                    }
+                }
+            }
+        }
+        bg
+    });
+    Ok(CrossRunFit {
+        weights,
+        background,
+        halfwidth: half,
     })
 }
 
@@ -3630,6 +4181,8 @@ mod tests {
             out_peak_bounds: Some(&bounds),
             cfg: &cfg,
             config_hash: "test",
+            cross_run: None,
+            export_cross_run: false,
         })
         .unwrap();
         assert_eq!(rows, (4, 3));
@@ -3895,6 +4448,8 @@ mod tests {
             out_peak_bounds: None,
             cfg: &cfg,
             config_hash: "test",
+            cross_run: None,
+            export_cross_run: false,
         })
         .unwrap();
         assert_eq!(rows, (1, 1));
@@ -3929,6 +4484,8 @@ mod tests {
                 out_peak_bounds: None,
                 cfg: &cfg,
                 config_hash: "test",
+                cross_run: None,
+                export_cross_run: false,
             })
             .unwrap();
             let pq = Table::read(&peptide).unwrap();
@@ -3943,6 +4500,247 @@ mod tests {
         }
         assert_eq!(out[0], out[1]);
         assert!(out[0].1[0].is_some(), "the fixture must be quantifiable");
+    }
+
+    /// One run of the cross-run fixture: candidate 1 with apex 20 s on a 1 s grid of 41
+    /// samples, three fragments of one peak shape at relative heights 1, 0.5 and 0.25,
+    /// multiplied by `scale`, a fourth fragment (`y7`) that is zero everywhere, and zero
+    /// flanks.
+    fn cross_run_fixture(tag: &str, scale: f32) -> (String, String) {
+        let scored = quant_test_path(&format!("crx_{tag}_scored.parquet"));
+        let chrom = quant_test_path(&format!("crx_{tag}_chrom.parquet"));
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), vec![1]),
+                Col::U32("base_peptide_id".into(), vec![10]),
+                Col::Str("peptidoform".into(), vec!["PEPTIDE".into()]),
+                Col::I32("charge".into(), vec![2]),
+                Col::Str("label".into(), vec!["target".into()]),
+                Col::Str("protein_group".into(), vec!["PG".into()]),
+                Col::F64("peptide_q_value".into(), vec![0.0]),
+                Col::F64("apex_rt".into(), vec![20.0]),
+            ],
+        )
+        .unwrap();
+        let grid: Vec<f32> = (0..41).map(|rt| rt as f32).collect();
+        let shape = |h: f32| -> Vec<f32> {
+            let mut v = vec![0.0f32; 41];
+            for (d, x) in [(0usize, 100.0f32), (1, 80.0), (2, 40.0), (3, 10.0)] {
+                v[20 + d] = x * h * scale;
+                v[20 - d] = x * h * scale;
+            }
+            v
+        };
+        write_table(
+            &chrom,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 1, 1, 1]),
+                Col::Str(
+                    "frag_name".into(),
+                    ["y3", "y4", "b2", "y7"].map(String::from).to_vec(),
+                ),
+                Col::ListF32("rt".into(), vec![grid.clone(); 4]),
+                Col::ListF32(
+                    "intensity".into(),
+                    vec![shape(1.0), shape(0.5), shape(0.25), vec![0.0; 41]],
+                ),
+                Col::F32("predicted_intensity".into(), vec![1.0, 0.8, 0.5, 0.3]),
+            ],
+        )
+        .unwrap();
+        (scored, chrom)
+    }
+
+    /// The configuration that switches on all three cross-run keys.
+    fn cross_run_cfg() -> QuantConfig {
+        QuantConfig {
+            fragment_selection: FragmentSelection::CrossRun,
+            baseline_subtract: true,
+            baseline_source: BaselineSource::Experiment,
+            fixed_scan_halfwidth_scale: 2.5,
+            ..QuantConfig::default()
+        }
+    }
+
+    /// (peptide, protein, fragment) outputs of one quant of `(scored, chrom)`.
+    fn cross_run_quant(
+        tag: &str,
+        input: &(String, String),
+        cfg: &QuantConfig,
+        fit: Option<&CrossRunFit>,
+        export: bool,
+    ) -> [String; 3] {
+        let out = [
+            quant_test_path(&format!("crx_{tag}_pep.parquet")),
+            quant_test_path(&format!("crx_{tag}_prot.parquet")),
+            quant_test_path(&format!("crx_{tag}_frag.parquet")),
+        ];
+        run(QuantParams {
+            psms_scored: &input.0,
+            chromatograms: &[ChromTable::whole(&input.1)],
+            out_peptide: &out[0],
+            out_protein: &out[1],
+            out_fragment: Some(&out[2]),
+            out_peak_bounds: None,
+            cfg,
+            config_hash: "test",
+            cross_run: fit,
+            export_cross_run: export,
+        })
+        .unwrap();
+        out
+    }
+
+    fn report_of(path: &str) -> serde_json::Value {
+        mumdia_io::json::read_json(&format!("{path}.report.json")).unwrap()
+    }
+
+    /// Without the export flag the fragment table is v1, column for column and byte for
+    /// byte, whatever the cross-run keys say; with it, v5 adds the zero-area row and the
+    /// fit's columns, and the v1 columns keep their values.
+    #[test]
+    fn the_fragment_table_is_v1_without_the_export_flag_and_v5_with_it() {
+        let input = cross_run_fixture("v1v5", 1.0);
+        let plain = QuantConfig {
+            fragment_selection: FragmentSelection::Predicted,
+            ..QuantConfig::default()
+        };
+        let base = cross_run_quant("plain", &input, &plain, None, false);
+        let keyed = cross_run_quant("keyed", &input, &cross_run_cfg(), None, false);
+        let v1 = std::fs::read(&base[2]).unwrap();
+        assert_eq!(v1, std::fs::read(&keyed[2]).unwrap());
+        let t = Table::read(&base[2]).unwrap();
+        assert_eq!(
+            column_names(&base[2]).unwrap(),
+            [
+                "candidate_id",
+                "peptidoform",
+                "charge",
+                "protein_group",
+                "fragment_name",
+                "quantity"
+            ]
+        );
+        assert_eq!(t.str("fragment_name").unwrap(), ["y3", "y4", "b2"]);
+        let rep = report_of(&base[2]);
+        assert_eq!(rep["schema_version"], 1);
+        let params = rep["params"].as_object().unwrap();
+        for key in [
+            "cross_run_fit",
+            "cross_run_export",
+            "candidates_weighted",
+            "fragment_selection_fallback",
+            "baseline_source",
+            "fixed_scan_halfwidth_scale",
+        ] {
+            assert!(!params.contains_key(key), "{key} in a plain report");
+        }
+        // The cross-run keys without the step: the fallback is recorded.
+        let kp = report_of(&keyed[0]);
+        assert_eq!(kp["params"]["fragment_selection_fallback"], "Predicted");
+        assert!(kp["params"]["cross_run_fit"].is_null());
+        assert_eq!(report_of(&keyed[2])["schema_version"], 1);
+
+        let ex = cross_run_quant("export", &input, &cross_run_cfg(), None, true);
+        let rep = report_of(&ex[2]);
+        assert_eq!(rep["schema_version"], 5);
+        assert_eq!(rep["params"]["cross_run_export"], true);
+        let mut want: Vec<String> = [
+            "candidate_id",
+            "peptidoform",
+            "charge",
+            "protein_group",
+            "fragment_name",
+            "quantity",
+            "apex_corr",
+            "flank_mean",
+        ]
+        .map(String::from)
+        .to_vec();
+        want.extend((3..=7).map(|h| format!("flank_mean_h{h}")));
+        want.push("peak_hwhm".into());
+        assert_eq!(column_names(&ex[2]).unwrap(), want);
+        let e = Table::read(&ex[2]).unwrap();
+        assert_eq!(e.str("fragment_name").unwrap(), ["y3", "y4", "b2", "y7"]);
+        let q = e.f64("quantity").unwrap();
+        assert_eq!(&q[..3], &t.f64("quantity").unwrap()[..]);
+        assert_eq!(q[3], 0.0);
+        let corr = e.f64("apex_corr").unwrap();
+        // Proportional fragments correlate 1 with the sum of the others; the flat one 0.
+        for c in &corr[..3] {
+            assert!((c - 1.0).abs() < 1e-12, "{corr:?}");
+        }
+        assert_eq!(corr[3], 0.0);
+        assert_eq!(e.f64("flank_mean").unwrap(), vec![0.0; 4]);
+        // Summed trace 100, 80, 40, 10 (x 1.75) either side: half (50) is crossed between
+        // scans 1 and 2 at 1 + (80 - 50) / (80 - 40).
+        assert_eq!(e.f64("peak_hwhm").unwrap(), vec![1.75; 4]);
+        // directLFQ reads the export as it reads v1: the zero-area row is not a feature.
+        let lfq = quant_test_path("crx_lfq.parquet");
+        run_lfq_combine(&[ex[2].clone()], true, NormalizeMethod::None, &lfq).unwrap();
+        assert_eq!(
+            Table::read(&lfq).unwrap().i32("n_features").unwrap(),
+            vec![3]
+        );
+    }
+
+    /// The whole cross-run step on two runs, one twice the other: the pass-1 exports fit
+    /// equal weights, a zero background and h = round(2.5 x 1.75) = 4; pass 2 integrates
+    /// +/-4 scans with the same weights in both runs, so the ratio is exactly 2. Without the
+    /// fit the same configuration falls back to the predicted top-N at the configured window.
+    #[test]
+    fn the_cross_run_step_applies_one_fit_to_every_run() {
+        let cfg = cross_run_cfg();
+        let runs = [cross_run_fixture("r0", 1.0), cross_run_fixture("r1", 2.0)];
+        let pass1: Vec<String> = runs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| cross_run_quant(&format!("p1_{i}"), r, &cfg, None, true)[2].clone())
+            .collect();
+        let fit = fit_cross_run(&pass1, &cfg).unwrap();
+        assert_eq!(fit.halfwidth.as_ref().unwrap()[&1], 4);
+        let w = &fit.weights.as_ref().unwrap()[&1];
+        assert_eq!(w.keys().collect::<Vec<_>>(), ["b2", "y3", "y4"]);
+        assert!(w.values().all(|&x| (x - 10.0).abs() < 1e-9), "{w:?}");
+        let bg = &fit.background.as_ref().unwrap()[&1];
+        assert_eq!(bg.len(), 4, "the zero-area fragment has a background too");
+        assert!(bg.values().all(|&b| b == 0.0));
+        // Deterministic: the same tables give the same fit.
+        assert_eq!(
+            format!("{fit:?}"),
+            format!("{:?}", fit_cross_run(&pass1, &cfg).unwrap())
+        );
+
+        let q: Vec<f64> = runs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let out = cross_run_quant(&format!("p2_{i}"), r, &cfg, Some(&fit), false);
+                let rep = report_of(&out[0]);
+                assert_eq!(rep["params"]["candidates_weighted"], 1);
+                assert!(rep["params"]["cross_run_fit"].is_object());
+                assert!(!rep["params"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("fragment_selection_fallback"));
+                // Pass 2 writes the plain v1 fragment table.
+                assert_eq!(report_of(&out[2])["schema_version"], 1);
+                let pq = Table::read(&out[0]).unwrap();
+                assert_eq!(pq.opt_f64("integration_lo_rt").unwrap(), vec![Some(16.0)]);
+                assert_eq!(pq.opt_f64("integration_hi_rt").unwrap(), vec![Some(24.0)]);
+                assert_eq!(pq.i32("n_fragments_used").unwrap(), vec![3]);
+                pq.opt_f64("quantity").unwrap()[0].unwrap()
+            })
+            .collect();
+        assert_eq!(q[1] / q[0], 2.0);
+        // Areas at +/-4 scans: 360, 180, 90, each weighted 1 / (0 + 0.1).
+        assert!((q[0] - 6300.0).abs() < 1e-6, "{q:?}");
+
+        let fallback = cross_run_quant("fb", &runs[0], &cfg, None, false);
+        let pq = Table::read(&fallback[0]).unwrap();
+        // +/-3 scans, predicted top 3: 350 + 175 + 87.5.
+        assert_eq!(pq.opt_f64("quantity").unwrap(), vec![Some(612.5)]);
     }
 
     #[test]
@@ -3995,6 +4793,8 @@ mod tests {
             out_peak_bounds: None,
             cfg: &cfg,
             config_hash: "test",
+            cross_run: None,
+            export_cross_run: false,
         })
         .unwrap();
         assert_eq!(rows.0, 2, "both identifications must be reported");
@@ -4032,6 +4832,8 @@ mod tests {
             out_peak_bounds: None,
             cfg: &cfg,
             config_hash: "test",
+            cross_run: None,
+            export_cross_run: false,
         })
         .unwrap_err()
         .to_string();
@@ -4469,6 +5271,8 @@ mod tests {
             out_peak_bounds: Some(&bounds),
             cfg: &cfg,
             config_hash: "test",
+            cross_run: None,
+            export_cross_run: false,
         })
         .unwrap();
         assert_eq!(rows, (3, 2));
@@ -4596,6 +5400,8 @@ mod tests {
                 out_peak_bounds: bounds.as_deref(),
                 cfg: &cfg,
                 config_hash: "test",
+                cross_run: None,
+                export_cross_run: false,
             })
             .unwrap();
             let pq = Table::read(&peptide).unwrap();
@@ -5476,6 +6282,8 @@ mod tests {
             out_peak_bounds: None,
             cfg: &QuantConfig::default(),
             config_hash: "test",
+            cross_run: None,
+            export_cross_run: false,
         })
     }
 
@@ -5678,6 +6486,8 @@ mod tests {
                 out_peak_bounds: bounds.then_some(pb.as_str()),
                 cfg: &cfg,
                 config_hash: "test",
+                cross_run: None,
+                export_cross_run: false,
             })?;
             let mut report: serde_json::Value =
                 mumdia_io::json::read_json(&format!("{pep}.report.json")).unwrap();
@@ -5801,6 +6611,8 @@ mod tests {
                 out_peak_bounds: Some(&pb),
                 cfg: &QuantConfig::default(),
                 config_hash: "test",
+                cross_run: None,
+                export_cross_run: false,
             })
             .unwrap();
             [pep, prot, frag, pb]
@@ -5937,6 +6749,8 @@ mod tests {
                     out_peak_bounds: None,
                     cfg: &QuantConfig::default(),
                     config_hash: "test",
+                    cross_run: None,
+                    export_cross_run: false,
                 })
                 .unwrap();
                 files.extend([pep, prot, frag].iter().map(|p| std::fs::read(p).unwrap()));
@@ -6130,6 +6944,8 @@ mod tests {
                 out_peak_bounds: None,
                 cfg: &cfg,
                 config_hash: "test",
+                cross_run: None,
+                export_cross_run: false,
             })
             .unwrap();
             // The quantities as well, so a failure says which column moved rather than
@@ -6622,6 +7438,170 @@ mod source_guard_tests {
             .to_string();
         write_table(&p, cols).unwrap();
         p
+    }
+
+    #[test]
+    fn cross_run_weights_downweight_an_interfered_fragment() {
+        // Candidate 7: fragments a, b, c over four runs; c's share jumps in runs 2 and 3
+        // (interference in half the runs, as in a low-abundance condition) and c does not
+        // co-elute there. One interfered run of three would be ignored by the medians.
+        // Candidate 9: every apex_corr is negative, so every weight is 0 and the
+        // equal-weight fallback applies.
+        let rows: [[(f64, f64); 3]; 4] = [
+            [(100.0, 0.9), (50.0, 0.8), (25.0, 0.9)],
+            [(200.0, 0.9), (100.0, 0.8), (50.0, 0.9)],
+            [(100.0, 0.9), (50.0, 0.8), (400.0, 0.1)],
+            [(100.0, 0.9), (50.0, 0.8), (400.0, 0.1)],
+        ];
+        let tables: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .map(|(r, run)| {
+                let mut cid = vec![7u32; 3];
+                let mut name: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+                let mut area: Vec<f64> = run.iter().map(|x| x.0).collect();
+                let mut corr: Vec<f64> = run.iter().map(|x| x.1).collect();
+                cid.extend([9, 9]);
+                name.extend(["a".to_string(), "b".to_string()]);
+                area.extend([10.0, 20.0]);
+                corr.extend([-0.5, -0.2]);
+                table(
+                    &format!("crw_frag{r}"),
+                    vec![
+                        Col::U32("candidate_id".into(), cid),
+                        Col::Str("fragment_name".into(), name),
+                        Col::F64("quantity".into(), area),
+                        Col::F64("apex_corr".into(), corr),
+                        Col::F64("flank_mean".into(), vec![r as f64; 5]),
+                    ],
+                )
+            })
+            .collect();
+        let cfg = QuantConfig {
+            fragment_selection: FragmentSelection::CrossRun,
+            baseline_subtract: true,
+            baseline_source: BaselineSource::Experiment,
+            ..QuantConfig::default()
+        };
+        let fit = fit_cross_run(&tables, &cfg).unwrap();
+        assert!(fit.halfwidth.is_none());
+        // flank_mean is the run index, so the experiment background is the mean over runs
+        assert_eq!(fit.background.as_ref().unwrap()[&7]["a"], 1.5);
+        let w = fit.weights.unwrap();
+        let w7 = &w[&7];
+        assert!(w7["c"] < w7["a"] / 2.0, "{w7:?}");
+        assert!(w7["a"] > 0.0 && w7["b"] > 0.0);
+        assert_eq!(w[&9].values().copied().collect::<Vec<_>>(), vec![1.0, 1.0]);
+        // Same weights in every run: the weighted quantity of a clean scaled run scales
+        // with it, and a run with no positive weighted area defers to the top-N rule.
+        let names = ["a", "b", "c"];
+        let q0 = weighted_quantity(&[100.0, 50.0, 25.0], names.iter().copied(), w7).unwrap();
+        let q1 = weighted_quantity(&[200.0, 100.0, 50.0], names.iter().copied(), w7).unwrap();
+        assert!((q1.0.unwrap() / q0.0.unwrap() - 2.0).abs() < 1e-12);
+        assert!(weighted_quantity(&[0.0, 0.0, 0.0], names.iter().copied(), w7).is_none());
+        // Weights alone fit no background, and a key that is off reads no column of its own.
+        let only = QuantConfig {
+            fragment_selection: FragmentSelection::CrossRun,
+            ..QuantConfig::default()
+        };
+        let fit = fit_cross_run(&tables, &only).unwrap();
+        assert!(fit.background.is_none() && fit.halfwidth.is_none());
+        assert!(fit.weights.is_some());
+    }
+
+    #[test]
+    fn the_cross_run_fit_names_the_export_when_a_column_is_missing() {
+        // A v1 fragment table carries no apex_corr: the fit says which tables it needs.
+        let t = table(
+            "crw_v1",
+            vec![
+                Col::U32("candidate_id".into(), vec![1]),
+                Col::Str("fragment_name".into(), vec!["a".into()]),
+                Col::F64("quantity".into(), vec![1.0]),
+            ],
+        );
+        let cfg = QuantConfig {
+            fragment_selection: FragmentSelection::CrossRun,
+            ..QuantConfig::default()
+        };
+        let err = format!("{:#}", fit_cross_run(&[t], &cfg).unwrap_err());
+        assert!(err.contains("apex_corr") && err.contains("export"), "{err}");
+    }
+
+    #[test]
+    fn peak_hwhm_measures_scans_to_half_the_apex() {
+        // Triangle 8, 6, 4, 2, 0 either side of the apex: half (4) is reached at 2 scans.
+        let mut s = [0.0f64; 2 * CROSS_RUN_HALFWIDTH_MAX + 1];
+        for d in 0..=4usize {
+            let v = 8.0 - 2.0 * d as f64;
+            s[CROSS_RUN_HALFWIDTH_MAX + d] = v;
+            s[CROSS_RUN_HALFWIDTH_MAX - d] = v;
+        }
+        assert_eq!(peak_hwhm(&s), 2.0);
+        // Interpolated: 8, 5, 2 falls below 4 between scans 1 and 2 (1 + 1/3).
+        let mut t = [0.0f64; 2 * CROSS_RUN_HALFWIDTH_MAX + 1];
+        t[CROSS_RUN_HALFWIDTH_MAX] = 8.0;
+        for (d, v) in [(1, 5.0), (2, 2.0)] {
+            t[CROSS_RUN_HALFWIDTH_MAX + d] = v;
+            t[CROSS_RUN_HALFWIDTH_MAX - d] = v;
+        }
+        assert!((peak_hwhm(&t) - 4.0 / 3.0).abs() < 1e-12);
+        // A flat trace never falls below half: the full side length.
+        assert_eq!(peak_hwhm(&[1.0; 2 * CROSS_RUN_HALFWIDTH_MAX + 1]), 8.0);
+    }
+
+    #[test]
+    fn the_halfwidth_scale_takes_the_brightest_runs_hwhm_and_its_flank() {
+        // Candidate 7 over two runs; run 1 is brighter, so its HWHM (2.0) sets h =
+        // round(2.5 * 2.0) = 5, and the background pools flank_mean_h5. Candidate 9's HWHM
+        // (10) clamps to 7. Candidate 11 is equally bright in both runs: the first run's
+        // HWHM (1.2, h = 3) wins the tie over the second's (2.0, h = 5).
+        let tables: Vec<String> = (0..2)
+            .map(|r| {
+                let rf = r as f64;
+                let mut cols = vec![
+                    Col::U32("candidate_id".into(), vec![7, 7, 9, 11]),
+                    Col::Str(
+                        "fragment_name".into(),
+                        ["a", "b", "a", "a"].map(String::from).to_vec(),
+                    ),
+                    Col::F64("quantity".into(), vec![10.0 + 90.0 * rf, 5.0, 1.0, 3.0]),
+                    Col::F64("apex_corr".into(), vec![0.9; 4]),
+                    Col::F64("flank_mean".into(), vec![100.0; 4]),
+                    Col::F64(
+                        "peak_hwhm".into(),
+                        vec![1.0 + rf, 1.0 + rf, 10.0, 1.2 + 0.8 * rf],
+                    ),
+                ];
+                for h in CROSS_RUN_HALFWIDTH_MIN..=CROSS_RUN_HALFWIDTH_MAX {
+                    cols.push(Col::F64(format!("flank_mean_h{h}"), vec![h as f64 + rf; 4]));
+                }
+                table(&format!("crw_width{r}"), cols)
+            })
+            .collect();
+        let cfg = QuantConfig {
+            baseline_subtract: true,
+            baseline_source: BaselineSource::Experiment,
+            fixed_scan_halfwidth_scale: 2.5,
+            ..QuantConfig::default()
+        };
+        let fit = fit_cross_run(&tables, &cfg).unwrap();
+        assert!(fit.weights.is_none());
+        let half = fit.halfwidth.unwrap();
+        assert_eq!((half[&7], half[&9], half[&11]), (5, 7, 3));
+        let bg = fit.background.unwrap();
+        // mean over the two runs of flank_mean_h5 (5 and 6), not of flank_mean (100)
+        assert_eq!(bg[&7]["a"], 5.5);
+        assert_eq!(bg[&9]["a"], 7.5);
+        assert_eq!(bg[&11]["a"], 3.5);
+        // off: no halfwidths, the flank_mean background as before
+        let off = QuantConfig {
+            fixed_scan_halfwidth_scale: 0.0,
+            ..cfg
+        };
+        let fit = fit_cross_run(&tables, &off).unwrap();
+        assert!(fit.halfwidth.is_none());
+        assert_eq!(fit.background.unwrap()[&7]["a"], 100.0);
     }
 
     #[test]
