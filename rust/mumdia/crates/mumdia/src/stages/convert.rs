@@ -136,6 +136,37 @@ pub struct ConvertOutputs {
     pub hashes: ConvertHashes,
 }
 
+impl ConvertOutputs {
+    /// The outputs an earlier [`run`] wrote into `out_dir`, with the content hashes their
+    /// reports recorded. For a later pass over the same spectra (the second pass of
+    /// match-between-runs), which must not convert the run again.
+    pub fn existing(out_dir: &str) -> Result<ConvertOutputs> {
+        let path = |name: &str| format!("{out_dir}/{name}");
+        let hash = |p: &str| -> Result<String> {
+            let r: ArtifactReport = mumdia_io::json::read_json(&format!("{p}.report.json"))
+                .with_context(|| format!("reading the conversion report of {p}"))?;
+            Ok(r.content_hash)
+        };
+        let (ms1, ms2) = (path("spectra_ms1.parquet"), path("spectra_ms2.parquet"));
+        let (iw, map) = (
+            path("isolation_windows.parquet"),
+            path("ms2_to_ms1.parquet"),
+        );
+        Ok(ConvertOutputs {
+            hashes: ConvertHashes {
+                ms1: hash(&ms1)?,
+                ms2: hash(&ms2)?,
+                isolation_windows: hash(&iw)?,
+                ms2_to_ms1: hash(&map)?,
+            },
+            ms1,
+            ms2,
+            isolation_windows: iw,
+            ms2_to_ms1: map,
+        })
+    }
+}
+
 /// The report content hash of each convert artifact, field for field with the paths of
 /// [`ConvertOutputs`].
 pub struct ConvertHashes {

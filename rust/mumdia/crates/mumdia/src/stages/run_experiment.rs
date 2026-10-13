@@ -46,7 +46,7 @@ pub struct RunExperimentParams<'a> {
 }
 
 fn preflight(p: &RunExperimentParams) -> Result<()> {
-    use mumdia_core::config::{MbrStrategy, RescorerKind};
+    use mumdia_core::config::RescorerKind;
     if p.mzmls.len() < 2 {
         anyhow::bail!(
             "run-experiment needs >= 2 --mzml files (got {})",
@@ -148,10 +148,150 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
             cfg.rescore.classifier
         );
     }
-    if cfg.mbr.strategy != MbrStrategy::None && cfg.mbr.python.is_none() {
-        anyhow::bail!("mbr.strategy != none requires mbr.python");
+    if cfg.mbr.strategy.transfers() && cfg.mbr.python.is_none() {
+        anyhow::bail!(
+            "mbr.strategy = {:?} (the rescuable-tier transfer) requires mbr.python",
+            cfg.mbr.strategy
+        );
     }
     Ok(())
+}
+
+/// What the second pass of match-between-runs produced: each run's competed table and
+/// chromatograms on the empirical library, in run order, and the library.
+struct SecondPassOut {
+    competed: Vec<String>,
+    chroms: Vec<ChromTable>,
+    library: second_pass::EmpiricalLibrary,
+}
+
+/// The second pass (`mbr.strategy = second_pass`): the empirical library of the first pass's
+/// pooled scored table (`second_pass::build_library`) into `<out>/library`, then every run
+/// searched again on it from the spectra its first pass converted (`run_dirs[i]/spectra`),
+/// into `<out>/<name>`: a seed against the empirical library, which every run shares, its own
+/// retention-time calibration on that seed, extract, features and compete. `None` when the
+/// first pass accepted nothing, so there is nothing to search again.
+///
+/// The fragment-rarity prescreen is off here: the empirical library is already the screened
+/// set, and the second pass must search all of it. Under `parallel_runs = auto` the runs are
+/// pulled from the plan's queue, otherwise they run in chunks of `par` as the first pass did.
+#[allow(clippy::too_many_arguments)]
+fn search_second_pass(
+    cfg: &Config,
+    ch: &str,
+    first_scored: &str,
+    lib_p: &str,
+    lib_f: &str,
+    names: &[String],
+    run_dirs: &[String],
+    out: &str,
+    plan: &crate::sched::RunConcurrency,
+    par: usize,
+) -> Result<Option<SecondPassOut>> {
+    let library = second_pass::build_library(&second_pass::BuildParams {
+        scored: first_scored,
+        lib_precursors: lib_p,
+        lib_fragments: lib_f,
+        out_dir: &format!("{out}/library"),
+        q: cfg.mbr.q_anchor,
+    })?;
+    if library.targets == 0 {
+        return Ok(None);
+    }
+    let mut cfg2 = cfg.clone();
+    cfg2.prescreen.enabled = false;
+    let cfg2 = &cfg2;
+    let t_lib = Instant::now();
+    let seed_lib = search_seed::SeedLibrary::load(
+        &library.precursors,
+        &library.fragments,
+        None,
+        None,
+        &cfg.search_seed,
+        cfg.extract.bucket_size,
+    )?;
+    info!(
+        candidates = seed_lib.n_candidates(),
+        elapsed_ms = t_lib.elapsed().as_millis() as u64,
+        "run-experiment: second pass, one seed library for every run"
+    );
+    let n = names.len();
+    let one = |&i: &usize| -> Result<(String, String)> {
+        info!(run = %names[i], i = i + 1, n, "run-experiment: second pass");
+        let run_out = format!("{out}/{}", names[i]);
+        std::fs::create_dir_all(&run_out).with_context(|| format!("creating {run_out}"))?;
+        let co = convert::ConvertOutputs::existing(&format!("{}/spectra", run_dirs[i]))?;
+        let seed = seed_run(
+            cfg2,
+            ch,
+            &library.precursors,
+            &library.fragments,
+            &co,
+            &run_out,
+            Some(&seed_lib),
+        )?;
+        finish_run(
+            cfg2,
+            ch,
+            &library.precursors,
+            &library.fragments,
+            &co,
+            &seed,
+            &run_out,
+        )
+    };
+    let all: Vec<usize> = (0..n).collect();
+    let done: Vec<(String, String)> = if plan.is_auto() {
+        plan.map_pooled(&all, one)?
+    } else {
+        let mut done = Vec::with_capacity(n);
+        for chunk in all.chunks(par.max(1)) {
+            done.extend(crate::colread::first_err(
+                chunk.par_iter().map(one).collect(),
+            )?);
+        }
+        done
+    };
+    drop(seed_lib);
+    let (competed, chroms): (Vec<String>, Vec<ChromTable>) = done
+        .into_iter()
+        .map(|(c, h)| (c, ChromTable::whole(&h)))
+        .unzip();
+    // The pooled rescore needs decoys to estimate an FDR. Real data always leaves some; a
+    // synthetic or near-empty experiment can extract none in the second pass's narrow windows,
+    // and then the first pass stands.
+    if count_decoys(&competed)? == 0 {
+        warn!(
+            "run-experiment: the second pass extracted no decoy PSM, so it cannot estimate an \
+             FDR of its own"
+        );
+        return Ok(None);
+    }
+    Ok(Some(SecondPassOut {
+        competed,
+        chroms,
+        library,
+    }))
+}
+
+/// Decoy rows over `tables`, from their `label` column.
+fn count_decoys(tables: &[String]) -> Result<u64> {
+    let mut n = 0u64;
+    for t in tables {
+        let f = mumdia_io::table::TableFile::open(t)?;
+        for b in f.batches(Some(&["label"]), 1 << 16)? {
+            let b = b?;
+            let label = arrow::compute::cast(b.column(0), &arrow::datatypes::DataType::Utf8)?;
+            let label = label
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("cast to utf8");
+            n += (0..label.len())
+                .filter(|&i| label.is_valid(i) && label.value(i) == "decoy")
+                .count() as u64;
+        }
+    }
+    Ok(n)
 }
 
 /// The per-run search chain: convert -> seed -> optional fine-tune -> rt-cal ->
@@ -1720,16 +1860,28 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .flat_map(|(i, tables)| std::iter::repeat_n(i as u32, tables.len()))
         .collect();
     let one_table_per_run = competed.iter().all(|tables| tables.len() == 1);
-    let scored_combined = d("scored_combined.parquet");
     let shadow_windows: Vec<String> = names
         .iter()
         .map(|nm| format!("{}/spectra/isolation_windows.parquet", d(nm)))
         .collect();
-    let scored_written = rescore::run_hashed(rescore::RescoreParams {
+    // Under `mbr.strategy = second_pass` (the default) this rescore is the first pass, kept
+    // under `first_pass/`, and the experiment's `scored_combined.parquet` is the second pass's.
+    let second_pass_on = cfg.mbr.strategy == mumdia_core::config::MbrStrategy::SecondPass;
+    let (first_scored, first_work) = if second_pass_on {
+        let dir = d("first_pass");
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {dir}"))?;
+        (
+            format!("{dir}/scored_combined.parquet"),
+            format!("{dir}/sidecar_work"),
+        )
+    } else {
+        (d("scored_combined.parquet"), d("sidecar_work"))
+    };
+    let first_written = rescore::run_hashed(rescore::RescoreParams {
         competed: &rescore_inputs,
         sources: (!one_table_per_run).then_some(rescore_sources.as_slice()),
-        out: &scored_combined,
-        work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
+        out: &first_scored,
+        work_dir: &rescore::sidecar_work_dir(&first_work),
         script_dir: &cfg.predict_frag.sidecar_script_dir,
         cfg: &cfg.rescore,
         config_hash: &ch,
@@ -1738,6 +1890,68 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             &shadow_windows,
         )),
     })?;
+
+    // --- match-between-runs: the second pass ---
+    let second = if second_pass_on {
+        let run_dirs: Vec<String> = names.iter().map(|nm| d(nm)).collect();
+        search_second_pass(
+            cfg,
+            &ch,
+            &first_scored,
+            &lib_p_base,
+            &lib_f,
+            &names,
+            &run_dirs,
+            &d("second_pass"),
+            &plan,
+            par,
+        )?
+    } else {
+        None
+    };
+    if second_pass_on && second.is_none() {
+        warn!(
+            "run-experiment: the second pass was not applied (see above); the first pass is the \
+             result"
+        );
+    }
+    let (scored_combined, scored_written) = match &second {
+        Some(sp) => {
+            let scored = d("scored_combined.parquet");
+            let written = rescore::run_hashed(rescore::RescoreParams {
+                competed: &sp.competed,
+                sources: None,
+                out: &scored,
+                work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
+                script_dir: &cfg.predict_frag.sidecar_script_dir,
+                cfg: &cfg.rescore,
+                config_hash: &ch,
+                shadow: Some(crate::stages::shadow::ShadowInputs::new(
+                    &sp.library.fragments,
+                    &shadow_windows,
+                )),
+            })?;
+            chroms = sp.chroms.iter().map(|c| vec![c.clone()]).collect();
+            (scored, written)
+        }
+        // The experiment's `scored_combined.parquet` is the result either way: the first pass,
+        // copied up from `first_pass/` with its report when the second pass did not apply.
+        None if second_pass_on => {
+            let scored = d("scored_combined.parquet");
+            for (src, dst) in [
+                (first_scored.clone(), scored.clone()),
+                (
+                    format!("{first_scored}.report.json"),
+                    format!("{scored}.report.json"),
+                ),
+            ] {
+                std::fs::copy(&src, &dst)
+                    .with_context(|| format!("copying the first pass {src} to {dst}"))?;
+            }
+            (scored, first_written)
+        }
+        None => (first_scored.clone(), first_written),
+    };
     // The classifier that actually ran, from the rescore artifact report: the source of
     // truth, since the configured enum can differ from it under a compatibility path.
     let rescore_report: mumdia_io::report::ArtifactReport =
@@ -1754,7 +1968,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .unwrap_or_else(|| actual_rescorer.clone());
 
     // --- optional rescuable-tier MBR transfer ---
-    let scored_for_quant = if cfg.mbr.strategy != mumdia_core::config::MbrStrategy::None {
+    let scored_for_quant = if cfg.mbr.strategy.transfers() {
         let python = cfg.mbr.python.as_deref().expect("preflight");
         let script =
             crate::sidecar::resolve_script(&cfg.predict_frag.sidecar_script_dir, "mbr_worker.py");
@@ -1904,6 +2118,13 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         "scored_for_quant": scored_for_quant,
         "rescorer": actual_rescorer,
         "mbr": format!("{:?}", cfg.mbr.strategy),
+        // The second pass of match-between-runs: the empirical library it searched and the
+        // first pass it was built from. `null` when it did not run.
+        "second_pass": second.as_ref().map(|sp| json!({
+            "first_pass_scored": first_scored,
+            "library": sp.library,
+            "runs": names.iter().map(|nm| d(&format!("second_pass/{nm}"))).collect::<Vec<_>>(),
+        })),
         // Per-run quant gates on the pooled q_value whatever the configuration says
         // (see the warning above). The configuration hash is of the configuration as
         // given, so the substitution has to be recorded here or it is recorded nowhere.
@@ -2011,8 +2232,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         "feature_schema_id".into(),
         features::feature_schema_id(&features::active_features(cfg.features.set)),
     );
-    prov.model_identities
-        .insert("mbr".into(), format!("{:?}", cfg.mbr.strategy));
+    prov.model_identities.insert(
+        "mbr".into(),
+        if second_pass_on && second.is_none() {
+            "SecondPass-not-applied".to_string()
+        } else {
+            format!("{:?}", cfg.mbr.strategy)
+        },
+    );
     // Recorded in a fixed order. `Manifest` stores them in a BTreeMap, so the serialised
     // order is by logical name and does not depend on this sequence. The last field is the
     // content hash when the producing stage already computed it (rescore and quant for their
@@ -2027,6 +2254,29 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         "rescore",
         Some(scored_written.content_hash.clone()),
     )];
+    if let Some(sp) = &second {
+        artifacts.push((
+            "scored_first_pass".to_string(),
+            artifact::PSMS_SCORED,
+            first_scored.clone(),
+            "rescore",
+            None,
+        ));
+        artifacts.push((
+            "empirical_library_precursors".to_string(),
+            artifact::FRAGMENT_LIBRARY_PRECURSORS,
+            sp.library.precursors.clone(),
+            "second-pass",
+            None,
+        ));
+        artifacts.push((
+            "empirical_library_fragments".to_string(),
+            artifact::FRAGMENT_LIBRARY_FRAGMENTS,
+            sp.library.fragments.clone(),
+            "second-pass",
+            None,
+        ));
+    }
     // Only when MBR actually produced a different table; otherwise
     // `scored_for_quant` IS `scored_combined` and recording it twice would claim two
     // artifacts where one file exists.

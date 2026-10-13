@@ -95,6 +95,25 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **`run-experiment` matches between runs by default with a second pass**
+  (`mbr.strategy = "second_pass"`, the new default; it was `"none"`). The pooled first pass
+  is kept as `first_pass/scored_combined.parquet`. Every target it accepts experiment-wide
+  (`precursor_q <= mbr.q_anchor`) enters an empirical library with its paired library decoy,
+  both at the precursor's cross-run consensus retention time (`second_pass/library/`), every
+  run is searched again on that library from its converted spectra (`second_pass/<run>/`),
+  and the pooled second pass is the experiment's `scored_combined.parquet`, which the split,
+  quantification and report read. Per-run identifications at 1%: ProteoBench Astral
+  entrapment +8.0% at an entrapment FDP of 0.95% -> 0.70% (three NN seeds); 22 HeLa runs
+  on a human + yeast + E. coli library +16.9% at a species FDP of 1.42% -> 0.80%; 216 single
+  cells +54-57% at an unchanged decoy fraction with no identification in 24 blank wells;
+  6-run Orbitrap AIF +9.4%. The known gap is ratio compression (HYE mixture E. coli log2 A/B
+  -1.71 -> -1.48): the quantities of precursors the second pass adds in runs where they are
+  weak. Falls back to the first pass, with a warning, when it accepts nothing or the second
+  pass extracts no decoy. `"none"` restores the previous behaviour; the config hash of
+  every configuration changes, because the default is serialised. The rescuable-tier
+  transfer (`empirical_library` / `rt_transfer` / `full`) stays opt-in, now warns with its
+  measured 2.3-2.7% transfer FDP, and is the only strategy that needs `mbr.python`
+  (docs/12, "Second pass").
 - **`rt_im_train.multihead_anchors` defaults to `"auto"`**, with the new threshold
   `rt_im_train.multihead_search_below` (default 2,500). The run that adapts the library is
   searched once to refit its multi-head calibration on search anchors when its seed search

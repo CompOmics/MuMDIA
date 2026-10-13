@@ -22,11 +22,15 @@
 //! library subsets in about 1.6 GB: the fixed cost is the three per-precursor vectors, not
 //! the tables.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
-use arrow::array::{Array, BooleanArray, StringArray, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, StringArray, UInt32Array,
+};
 use arrow::compute::filter_record_batch;
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use mumdia_io::table::{BatchWriter, TableFile};
 use std::sync::Arc;
@@ -49,6 +53,10 @@ pub struct SubLibraryParams<'a> {
     /// Off keeps exactly the listed candidates, which breaks pairing; only for a list that
     /// is already pair-complete.
     pub pair_linked: bool,
+    /// New `predicted_irt` values by ORIGINAL `candidate_id`, for the kept rows that have
+    /// one; the others keep the library's. The second pass of match-between-runs writes its
+    /// cross-run consensus retention times this way (`second_pass`).
+    pub predicted_irt: Option<&'a HashMap<u32, f32>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -169,6 +177,10 @@ pub fn run(p: SubLibraryParams) -> Result<SubLibraryStats> {
         let schema = reader.schema();
         let cid_ix = column_index(&schema, "candidate_id", p.precursors)?;
         let label_ix = column_index(&schema, "label", p.precursors)?;
+        let irt_ix = match p.predicted_irt {
+            Some(_) => Some(column_index(&schema, "predicted_irt", p.precursors)?),
+            None => None,
+        };
         let mut w =
             BatchWriter::with_row_group_rows(p.out_precursors, schema.clone(), ROW_GROUP_ROWS)?;
         let mut first_row = 0usize;
@@ -179,6 +191,11 @@ pub fn run(p: SubLibraryParams) -> Result<SubLibraryStats> {
             let mapped: Vec<u32> = (0..rows)
                 .map(|i| new_id[first_row + i])
                 .filter(|&v| v != DROPPED)
+                .collect();
+            // The original ids of the kept rows, in order: the row index is the id.
+            let kept_old: Vec<u32> = (0..rows)
+                .filter(|&i| keep[first_row + i])
+                .map(|i| (first_row + i) as u32)
                 .collect();
             first_row += rows;
             if mapped.is_empty() {
@@ -199,6 +216,9 @@ pub fn run(p: SubLibraryParams) -> Result<SubLibraryStats> {
             }
             let mut cols = kept.columns().to_vec();
             cols[cid_ix] = Arc::new(UInt32Array::from(mapped));
+            if let (Some(map), Some(ix)) = (p.predicted_irt, irt_ix) {
+                cols[ix] = override_irt(&cols[ix], &kept_old, map, p.precursors)?;
+            }
             let out = RecordBatch::try_new(schema.clone(), cols)
                 .with_context(|| format!("rebuilding a batch of {}", p.precursors))?;
             rows_out += out.num_rows() as u64;
@@ -257,6 +277,34 @@ pub fn run(p: SubLibraryParams) -> Result<SubLibraryStats> {
         "sub-library: done"
     );
     Ok(stats)
+}
+
+/// `col` (the kept rows' `predicted_irt`, f32 or f64) with the value of `map` for every row
+/// whose original id it has; `kept_old[i]` is row i's original id.
+fn override_irt(
+    col: &ArrayRef,
+    kept_old: &[u32],
+    map: &HashMap<u32, f32>,
+    path: &str,
+) -> Result<ArrayRef> {
+    let value = |i: usize| map.get(&kept_old[i]).copied();
+    Ok(match col.data_type() {
+        DataType::Float32 => {
+            let a = col.as_any().downcast_ref::<Float32Array>().expect("f32");
+            Arc::new(Float32Array::from_iter(
+                (0..a.len()).map(|i| value(i).or_else(|| a.is_valid(i).then(|| a.value(i)))),
+            ))
+        }
+        DataType::Float64 => {
+            let a = col.as_any().downcast_ref::<Float64Array>().expect("f64");
+            Arc::new(Float64Array::from_iter((0..a.len()).map(|i| {
+                value(i)
+                    .map(f64::from)
+                    .or_else(|| a.is_valid(i).then(|| a.value(i)))
+            })))
+        }
+        other => bail!("{path}: predicted_irt is {other:?}, not a float column"),
+    })
 }
 
 /// Which fragment rows pass 3 keeps, planned from `candidate_id` alone: `(rows, keep)` runs
@@ -477,6 +525,37 @@ mod tests {
     }
 
     #[test]
+    fn predicted_irt_is_overridden_by_original_id_for_the_kept_rows_that_have_a_value() {
+        let dir = std::env::temp_dir().join(format!("mumdia_sublib_irt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, f) = lib(&dir);
+        let s = dir.join("surv.parquet").to_str().unwrap().to_string();
+        write_table(&s, vec![Col::U32("candidate_id".into(), vec![2, 3, 4, 5])]).unwrap();
+        let op = dir.join("out_prec.parquet").to_str().unwrap().to_string();
+        let of = dir.join("out_frag.parquet").to_str().unwrap().to_string();
+        // Original ids 2 and 3 get a new value, 4 and 5 keep the library's 1.0; id 0 is not
+        // kept, so its entry is ignored.
+        let irt: HashMap<u32, f32> = [(2, 250.0), (3, 250.0), (0, 9.0)].into_iter().collect();
+        run(SubLibraryParams {
+            precursors: &p,
+            fragments: &f,
+            survivors: &s,
+            out_precursors: &op,
+            out_fragments: &of,
+            pair_linked: false,
+            predicted_irt: Some(&irt),
+        })
+        .unwrap();
+        let out = TableFile::open(&op).unwrap();
+        assert_eq!(out.u32("candidate_id").unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            out.f32("predicted_irt").unwrap(),
+            vec![250.0, 250.0, 1.0, 1.0]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn the_sub_library_is_renumbered_pair_linked_and_its_fragments_follow() {
         let dir = std::env::temp_dir().join(format!("mumdia_sublib_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -494,6 +573,7 @@ mod tests {
             out_precursors: &op,
             out_fragments: &of,
             pair_linked: true,
+            predicted_irt: None,
         })
         .unwrap();
         assert_eq!(st.precursors, 4, "both members of pairs 0 and 2");
@@ -528,6 +608,7 @@ mod tests {
             out_precursors: &op2,
             out_fragments: &of2,
             pair_linked: false,
+            predicted_irt: None,
         })
         .unwrap();
         assert_eq!(st2.precursors, 2);
@@ -669,6 +750,7 @@ mod tests {
             out_precursors: dir.join("o.parquet").to_str().unwrap(),
             out_fragments: dir.join("of.parquet").to_str().unwrap(),
             pair_linked: true,
+            predicted_irt: None,
         })
         .unwrap_err()
         .to_string();

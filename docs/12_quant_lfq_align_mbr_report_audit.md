@@ -104,6 +104,22 @@ Produces `alignment.parquet` (`align.rs:130`): `run_id` (u32), `source_rt` (f64)
 `reference_rt` (f64), `residual_spread` (f64). The mapping is emitted on a grid of
 `grid_n` points per run (`grid_n = 100`, hardcoded in `main.rs:667`).
 
+### second pass (`run-experiment`, `mbr.strategy = second_pass`)
+Writes, under the experiment directory: `first_pass/scored_combined.parquet` (the pooled
+first pass, schema `psms_scored`, with its `.report.json`); `second_pass/library/` holding
+`lib_precursors.parquet` and `lib_fragments.parquet` (library schemas, ids contiguous from
+0, rows in the first library's order with `predicted_irt` replaced by the consensus),
+`entries.parquet` (`candidate_id` of the first library's rows kept) and
+`empirical_library.json` (`entries`, `targets`, `decoys`, `fragment_rows`,
+`reference_source`, `runs_aligned`, `runs_unaligned`, `entries_from_winner`,
+`entries_without_decoy`, `median_observations`, `q`); and `second_pass/<run>/` with the
+run's `seed_psms`, `run_windows`, `cal.json`, `psms_extracted`, `chromatograms`,
+`features` and `psms_competed` on the empirical library. The experiment's
+`scored_combined.parquet` is the second pass's, and its `candidate_id` refers to the
+empirical library. `experiment_manifest.json` records `experiment.second_pass` (the first
+pass's scored table, the library summary, the per-run directories) and the first-pass
+table and the library as artifacts.
+
 ### mbr
 Consumes an experiment-wide `scored_combined.parquet` (must carry a `source` column)
 and one `psms.parquet` per run in `source` order. Produces `<out>.parquet`, one row
@@ -434,10 +450,109 @@ is no `schema.rs` constant for it). This is an experiment-level stage: with one 
 degenerates to identity, and it is not part of the `run` chain. Real multi-run
 validation needs a multi-file experiment; only crafted two-run unit input exercises it.
 
+### Second pass (`mbr.strategy = second_pass`, the default since 2026-10-13)
+
+`run-experiment` matches between runs by searching every run a second time on an
+empirical library of the first pass. Nothing is transferred: every identification of the
+second pass is a search hit of its own, scored against its own decoys.
+
+1. **First pass.** The per-run chains and the pooled rescore run as before; the pooled
+   scored table goes to `first_pass/scored_combined.parquet`.
+2. **Empirical library** (`second_pass::build_library`, `second_pass/library/`). Entries
+   are the target precursors the first pass accepts experiment-wide
+   (`precursor_q <= mbr.q_anchor`, default 0.01). Each entry keeps its library row and
+   fragments, and takes the library decoy paired with it: within `(base_peptide_id,
+   charge)` the i-th target and the i-th decoy, each ordered by `(peptidoform_id,
+   candidate_id)`. That rank is the native digest's pairing (the decoy has its own
+   `peptidoform_id` and the modforms are enumerated in the same order) and reproduces the
+   imported libraries' shared-`peptidoform_id` pairing exactly (four libraries, 2M
+   targets each: every target paired, every pair the shared-id pair, every pair at the
+   same precursor m/z). Both members get the entry's consensus retention time as
+   `predicted_irt`; nothing else differs from the first pass's library.
+3. **Consensus retention time.** Every run's confident apexes (`run_psm_q <= q_anchor`,
+   target, the row with the lowest `run_psm_q` per run and precursor) are mapped onto the
+   run with the most of them by a monotone binned-median curve: the pairs a run shares with
+   the reference, sorted by the run's apex, cut into 80 equal-count bins, the median of each
+   side per bin, the reference side made non-decreasing, linear in between and linearly
+   extrapolated past the outer bins. A run sharing fewer than 200 precursors with the
+   reference keeps its own scale (`runs_unaligned` in `empirical_library.json`). The
+   consensus is the median of the mapped apexes; an entry accepted experiment-wide but in
+   no single run takes its winning row's apex.
+4. **Second pass per run** (`second_pass/<run>/`). From the run's converted spectra (not
+   converted again): a seed against the empirical library, loaded once for every run; the
+   run's own retention-time calibration on that seed; extract, features and compete. The
+   fragment-rarity prescreen is off: the library is already the screened set. Runs are
+   scheduled as the first pass's are (`experiment.parallel_runs`).
+5. **Pooled rescore** of the second pass into the experiment's `scored_combined.parquet`,
+   with shadow demotion against the empirical library's fragments. The split, the per-run
+   quantification, the cross-run LFQ and the report read it.
+
+Fallbacks, each logged, after which the first pass is copied to the root and is the
+result: the first pass accepted no target; the second pass extracted no decoy (it cannot
+estimate an FDR; the synthetic smoke fixture is this case). The manifest records the
+strategy as `SecondPass-not-applied`, and `experiment.second_pass` is `null`. `mbr.strategy
+= none` runs the first pass only.
+
+**Measured** (2026-10-13; the second pass as a script on the engine's own stages, the
+first pass the merged-main defaults):
+
+| pool | per-run IDs at 1% | null |
+|---|---|---|
+| ProteoBench Astral entrapment, 3 runs, 3 NN seeds | 79.8k -> 86.2k (+8.0%) | combined entrapment FDP 0.91-0.98% -> 0.65-0.76% per run; precursor level 91.4k at 0.95% -> 91.2k at 0.94% |
+| 22 HeLa QC runs on a human + yeast + E. coli library | 350,450 -> 409,507 (+16.9%) | species FDP 1.42% -> 0.80% (I/L-ambiguous entrapment excluded; 1.80% -> 1.18% with it) |
+| 216 single cells + 24 blank wells (one plate) | Cell_A +56.8%, Cell_B +53.5% | decoy fraction 0.97% -> 0.98%; CAM-modified share (no alkylation) 0.089% -> 0.035%; 0 targets and 0 decoys in the 24 blanks |
+| 22-run HYE mixture | proteins in >= 2 runs per condition 4,366 -> 5,298 | see the known gap |
+| 6-run Orbitrap AIF HYE | 82.2k -> 90.0k (+9.4%) | decoy fraction 1.00% in both |
+
+The same two entrapment pools through this implementation (`run-experiment` with the
+defaults of this branch, `mbr.strategy` left at its default, 2026-10-13):
+
+| pool | per-run IDs at 1% | null | wall clock, both passes |
+|---|---|---|---|
+| ProteoBench Astral entrapment, 3 NN seeds | 79.7k -> 85.9k (+7.8%) | entrapment FDP 0.93-1.03% -> 0.67-0.78% per run; precursor level unchanged | 21 min (32 threads) |
+| 22 HeLa QC runs, human + yeast + E. coli | 369,273 -> 422,928 (+14.5%) | species FDP 1.34% -> 0.81% (I/L-ambiguous excluded) | 30 min (48 threads) |
+
+The engine's HeLa first pass is above the script's (350,450) because it includes the
+`multihead_anchors = auto` bootstrap; the second pass's relative gain and FDP agree.
+
+The entrapment and species nulls see the false entries the first pass carries into the
+library and anything the second pass invents. The blank wells see a precursor reported
+where nothing is: 28k target and 27k decoy rows searched, none at 1%. The 438 blank targets
+that score above the cells' 1% threshold (against 8 decoys) sit a median 7.6 s from their
+consensus retention time and are the most widespread precursors (found in a median 211 of
+216 cells): carryover, not target-likeness. Blanks carry no seed anchors and run with the
+fallback window, so they do not test a narrow window around an absent precursor; the
+species entrapment does.
+
+Cost: the second pass searches a library of the experiment's accepted precursors only, so
+it is a fraction of the first: 3 min for the three ProteoBench runs, 2.4 min for the 22
+HeLa runs (first pass 19.5 min), 24 min per file plus a 7 min pooled rescore for the 240
+plate runs (first pass rescore 63 min).
+
+**Known gap: ratio compression.** The second pass reports precursors in runs where they
+are weak, and quantification integrates those weak signals with their interference, so
+the ratios compress. On the HYE mixture the median CV improves (0.255 -> 0.245) but the
+median absolute ratio error rises (0.238 -> 0.252) and E. coli log2 A/B moves from -1.71 to
+-1.48 (expected -2); on the AIF set from -1.58 to -1.40. These are true identifications;
+the limitation is in quantification.
+
+### mbr (rescuable-tier transfer, opt-in)
+
+`mbr.strategy = rt_transfer` (`empirical_library` and `full` behave the same) runs the
+transfer worker below after the pooled rescore instead of the second pass. It accepts an
+already extracted, sub-threshold candidate on retention-time agreement alone, against a
+permuted-RT null. Measured on the same pools on 2026-10-13: ProteoBench +3.6% per run, with
+the transfers themselves at 2.3-2.7% combined entrapment FDP and the per-run FDP rising
+from 0.97% to 1.03%; on the single-cell plate +50% per cell with the CAM-modified share of
+the transfers 4.4x that of the direct identifications. Transfers with low support (the
+precursor confident in 2-5 of 240 runs) carry most of the excess, and on ProteoBench those
+with an own `run_psm_q` above 0.5 (33% FDP). It stays available, warns when selected, and
+is the only strategy that needs `mbr.python`.
+
 ### mbr (partially wired Stage D3)
 
 The Rust side is a gate, not the algorithm. `Cmd::Mbr` (`main.rs:671`): loads config;
-bails if `cfg.mbr.strategy == None` (`main.rs:680`); bails if fewer than 2 psms paths
+bails unless `cfg.mbr.strategy` is one of the transfer variants (`MbrStrategy::transfers`); bails if fewer than 2 psms paths
 (`main.rs:685`); requires `cfg.mbr.python` (`main.rs:688`); resolves `mbr_worker.py`
 relative to the binary; calls `sidecar::run_mbr`. `run_mbr` (`sidecar.rs:162`) joins
 the psms paths into a comma-separated `psms_csv` and forwards a fixed set of flags.

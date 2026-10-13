@@ -454,6 +454,17 @@ fine-tuning also is not guaranteed deterministic.
   the experiment-wide pair at another threshold.
 - `run-experiment` overrides the configured `quant.q_filter` and gates per-run
   quant on the pooled `q_value`. It warns rather than doing so silently.
+- `run-experiment` matches between runs by default (`mbr.strategy = second_pass`, since
+  2026-10-13): the pooled first pass goes to `first_pass/`, its experiment-wide accepted
+  targets and their paired decoys form an empirical library at cross-run consensus
+  retention times, every run is searched again on it, and that pooled second pass is the
+  experiment's `scored_combined.parquet`. Per run +8% (ProteoBench entrapment, FDP 0.95%
+  -> 0.70%), +17% (22 HeLa runs, species FDP 1.42% -> 0.80%), +54-57% (216 single cells,
+  decoy fraction unchanged, 0 IDs in 24 blank wells). The known gap is ratio compression:
+  quantities of precursors the second pass adds in runs where they are weak (HYE mixture
+  E. coli log2 A/B -1.71 -> -1.48). `none` keeps the first pass; the rescuable-tier
+  transfer (`rt_transfer`) stays opt-in because its transfers measured 2.3-2.7%
+  entrapment FDP. docs/12, "Second pass".
 - `rescore --competed` accepts many tables, stamps `source` with the index of
   the input table each PSM came from (`rescore.rs:65-70,108`), and computes a
   per-source `run_psm_q` alongside the pooled `q_value`
@@ -744,8 +755,9 @@ search.
 
 Use Parquet quantities for analysis; TSV values are rounded for presentation.
 Cross-run consensus ions, interference-aware ion selection, minimum clean-ion
-rules, connected-component LFQ diagnostics, and coherent MBR requantification
-remain open high-priority work.
+rules, connected-component LFQ diagnostics, and the ratio compression of the
+second pass's weak identifications (docs/12, "Second pass") remain open high-priority
+work.
 
 ## Sensitivity options default since 2026-10-08
 
@@ -860,7 +872,9 @@ Do not enable these by default from a single AIF count:
   has the mechanism and numbers;
 - alternative hard/soft extraction gates or peak apportionment;
 - margin competition or unique-evidence competition;
-- MBR transfer/re-extraction;
+- the rescuable-tier MBR transfer (`mbr.strategy = rt_transfer`), measured at
+  2.3-2.7% entrapment FDP on its transfers (docs/12); the default second pass is not
+  gated;
 - acquisition-specific fragment/peak caps. The shipped default stays uncapped;
   see the peak-cap subsection above.
 

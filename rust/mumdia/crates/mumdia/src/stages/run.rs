@@ -430,6 +430,7 @@ pub fn run(p: RunParams) -> Result<()> {
                 out_precursors: &sp,
                 out_fragments: &sf,
                 pair_linked: false,
+                predicted_irt: None,
             })?;
             info!(
                 library = st.library_precursors,

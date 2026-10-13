@@ -485,15 +485,15 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
-| `strategy` | `MbrStrategy` | `none` |  |  |
-| `q_anchor` | `f64` | `0.01` |  | q-value for a precursor to become a cross-run anchor (validated at 0.01). |
-| `min_anchor_runs` | `usize` | `2` |  | Minimum number of OTHER runs a precursor must be confident in to transfer. |
-| `q_transfer` | `f64` | `0.01` |  | Accept threshold for a transferred identification's transfer q-value. |
+| `strategy` | `MbrStrategy` | `second_pass` |  |  |
+| `q_anchor` | `f64` | `0.01` |  | The first-pass cut (validated at 0.01). Under `second_pass`, the experiment-wide `precursor_q` at which a target enters the empirical library, and the `run_psm_q` at which one run's apex counts toward its consensus retention time. Under the transfer variants, the q-value for a precursor to become a cross-run anchor. |
+| `min_anchor_runs` | `usize` | `2` |  | Transfer variants only: minimum number of OTHER runs a precursor must be confident in to transfer. |
+| `q_transfer` | `f64` | `0.01` |  | Transfer variants only: accept threshold for a transfer's q-value. |
 | `rt_window_s` | `f64` | `20.0` | benchmark-gated, not yet wired | NOT YET WIRED. Transfer RT half-window (seconds) around the cross-run-predicted RT. The M2 leave-target-out residual was ~17 s at p95, ~15x tighter than the search window, which is where this default comes from -- but no code reads this field yet, so setting it has no effect. Kept as the recorded design value for the MBR transfer tier; `validate()` warns if it is changed from the default. See CLAUDE.md, "MBR transfer/re-extraction remains benchmark-gated". |
 | `decoy_transfer` | `DecoyTransfer` | `permuted_rt` | not yet wired | NOT YET WIRED. Which decoy-transfer null would estimate the false-transfer rate (M4). No code reads this field yet; `validate()` warns if it is changed. |
 | `consensus_corr_min` | `f64` | `0.0` |  | Minimum correlation of the observed fragment pattern to the empirical consensus for a transfer to be accepted (interference guard; 0 disables). |
 | `requant_all` | `bool` | `false` | not yet wired | NOT YET WIRED. Would requantify already-identified precursors too (fill the matrix), not only transferred ones, under `strategy = Full`. No code reads this field yet; `validate()` warns if it is changed. |
-| `python` | `Option<String>` | `null` |  | Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy; e.g. the `py312_mumdia` env). Required when `strategy != None`. |
+| `python` | `Option<String>` | `null` |  | Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy; e.g. the `py312_mumdia` env). Required by the transfer variants only; `second_pass` and `none` run no sidecar. |
 
 ## experiment
 
@@ -750,14 +750,15 @@ Fragment-matcher backend for search-seed and extract (docs/06_predict_frag_index
 
 (rust/mumdia/crates/mumdia-core/src/config.rs)
 
-Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.md). Default `None` reproduces the current chain byte-for-byte. ONLY `None` VS NOT-`None` IS IMPLEMENTED. The three non-`None` variants are described below as the intended staging, but no code distinguishes them: every test in the tree is `strategy != None`, so selecting `RtTransfer` or `Full` today behaves exactly like `EmpiricalLibrary`. They are kept as the recorded design ladder rather than deleted because the MBR tier is planned and benchmark-gated (CLAUDE.md); `validate()` warns when a non-`None` variant is selected so a config cannot quietly expect more than it gets. Intended staging: `EmpiricalLibrary` builds the consensus anchor library only; `RtTransfer` adds cross-run expected-RT transfer extraction; `Full` adds requantification. All require >= 2 runs and a decoy-transfer FDR (see the plan).
+Match-between-runs strategy (docs/12_quant_lfq_align_mbr_report_audit.md, "Second pass"). Read by `run-experiment` only; a single-run `run` has no other run to match. `SecondPass` (the default since 2026-10-13) searches every run a second time on an empirical library: the precursors the pooled first pass accepted experiment-wide (`precursor_q <= mbr.q_anchor`), each with its paired library decoy, both given the precursor's cross-run consensus retention time (`stages::second_pass`). The second pass is an ordinary search of that library, with its own seed, retention-time calibration, extraction and one pooled target-decoy rescore, and it is what the experiment reports. Measured against the first pass on four pools (docs/12): \| pool \| per-run IDs at 1% \| null \| \|---\|---\|---\| \| ProteoBench Astral entrapment, 3 runs x 3 NN seeds \| +8.0% \| entrapment FDP 0.95% -> 0.70% \| \| 22 HeLa runs, human + yeast + E. coli library \| +16.9% \| species FDP 1.42% -> 0.80% \| \| 216 single cells + 24 blank wells \| +54% to +57% \| decoys 0.97% -> 0.98%, 0 IDs in blanks \| \| 22-run HYE mixture \| proteins 4,366 -> 5,298 \| E. coli log2 A/B -1.71 -> -1.48 \| The last row is the known gap: quantities of the precursors the second pass adds in runs where they are weak compress the ratios (CV 0.255 -> 0.245, median \|error\| 0.238 -> 0.252). That is a quantification limitation, not a false identification. `EmpiricalLibrary`, `RtTransfer` and `Full` are the earlier rescuable-tier transfer (`scripts/mbr_worker.py`), which needs `mbr.python`. No code distinguishes the three: each accepts an already extracted, sub-threshold candidate on retention-time agreement alone. On the same pools its transfers measured 2.3-2.7% entrapment FDP (ProteoBench) and about 4x the false-ID rate of the direct identifications (single cells), so it stays opt-in and `validate()` warns when it is selected.
 
 | Value | Default | Description |
 |---|---|---|
-| `none` | yes | No match-between-runs (default). |
-| `empirical_library` |  | Build the cross-run consensus anchor library (M1) only; no transfer. |
-| `rt_transfer` |  | EmpiricalLibrary + cross-run expected-RT transfer extraction (M2/M3). |
-| `full` |  | RtTransfer + requantification of accepted transfers (M5). |
+| `none` |  | No match-between-runs: the first pass is the result. |
+| `second_pass` | yes | Search every run again on the empirical library of the first pass (default). |
+| `empirical_library` |  | Rescuable-tier transfer; behaves as `RtTransfer`. |
+| `rt_transfer` |  | Rescuable-tier transfer on cross-run expected retention time (`mbr_worker.py`). |
+| `full` |  | Rescuable-tier transfer; behaves as `RtTransfer`. |
 
 ### `MultiheadAnchors`
 

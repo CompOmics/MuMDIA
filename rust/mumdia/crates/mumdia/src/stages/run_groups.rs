@@ -1088,8 +1088,9 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     // the pooled table would hold, in its order, and nothing else reads that table: see
     // `groups.pool_competed`.
     let pooled_competed_path = d("psms_competed.parquet");
-    let competed_readers = cfg.extract.emit_candidate_audit
-        || cfg.mbr.strategy != mumdia_core::config::MbrStrategy::None;
+    // The transfer variants of match-between-runs read the pooled competed table; the second
+    // pass reads the scored table and searches again, so it needs none.
+    let competed_readers = cfg.extract.emit_candidate_audit || cfg.mbr.strategy.transfers();
     let pool_competed = cfg.groups.pool_competed || !bands_disjoint || competed_readers;
     if !cfg.groups.pool_competed {
         if pool_competed {
