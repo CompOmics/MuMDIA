@@ -1862,7 +1862,9 @@ fn real_main() -> Result<()> {
             let cfg = load_config(&config)?;
             if !cfg.mbr.strategy.transfers() {
                 anyhow::bail!(
-                    "`mumdia mbr` runs the rescuable-tier transfer, and mbr.strategy is {:?}; set                      rt_transfer to run it. The default second_pass is run by `run-experiment`,                      which searches every run again.",
+                    "`mumdia mbr` runs the rescuable-tier transfer, and mbr.strategy is {:?}; set \
+                     rt_transfer to run it. The default second_pass is run by `run-experiment`, \
+                     which searches every run again.",
                     cfg.mbr.strategy
                 );
             }
