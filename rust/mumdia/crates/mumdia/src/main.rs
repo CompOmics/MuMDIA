@@ -1424,6 +1424,7 @@ fn real_main() -> Result<()> {
                 out_precursors: &out_precursors,
                 out_fragments: &out_fragments,
                 pair_linked: !no_pair_link,
+                predicted_irt: None,
             })?;
             println!(
                 "sub-library: {} precursors ({} targets, {} decoys) and {} fragment rows from                  {} survivors of {}",
@@ -1859,9 +1860,10 @@ fn real_main() -> Result<()> {
             config,
         } => {
             let cfg = load_config(&config)?;
-            if cfg.mbr.strategy == mumdia_core::config::MbrStrategy::None {
+            if !cfg.mbr.strategy.transfers() {
                 anyhow::bail!(
-                    "mbr.strategy is `none`; set empirical_library / rt_transfer / full to run MBR"
+                    "`mumdia mbr` runs the rescuable-tier transfer, and mbr.strategy is {:?}; set                      rt_transfer to run it. The default second_pass is run by `run-experiment`,                      which searches every run again.",
+                    cfg.mbr.strategy
                 );
             }
             if psms_extracted.len() < 2 {

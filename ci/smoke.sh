@@ -528,6 +528,49 @@ PYEOF
 "$BIN" report --experiment-dir "$work/exp" --out-dir "$work/exp_report" --q 0.05 \
     > "$work/exp_report.log" 2>&1 || { tail -20 "$work/exp_report.log"; exit 1; }
 
+# 5a. Match-between-runs, `mbr.strategy = second_pass` (the default): the empirical library
+#     of the pooled first pass, and every run searched again on it. The fixture has almost no
+#     decoy signal (2 decoy PSMs in the first pass), so the second pass extracts no decoy and
+#     the first pass stands: the experiment's scored table must then be the first pass's,
+#     byte for byte, which `mbr.strategy = none` writes directly. Real data, where the second
+#     pass applies, is measured in docs/12.
+echo "=== smoke: second-pass match-between-runs"
+for f in second_pass/library/lib_precursors.parquet second_pass/library/lib_fragments.parquet \
+         second_pass/library/empirical_library.json second_pass/a/psms_competed.parquet \
+         second_pass/b/psms_competed.parquet first_pass/scored_combined.parquet; do
+    test -s "$work/exp/$f" || { echo "second pass: $f missing"; exit 1; }
+done
+grep -q "second pass: empirical library" "$work/exp.log" \
+    || { echo "second pass: no empirical library logged"; exit 1; }
+grep -q "the second pass extracted no decoy PSM" "$work/exp.log" \
+    || { tail -20 "$work/exp.log"; echo "second pass: the fixture's no-decoy fallback was not taken"; exit 1; }
+"$PY" - "$cfg" "$work/exp_none.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("experiment", {}).update(parallel_runs=1, overlap_front_threads=0)
+c["mbr"] = {"strategy": "none"}
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+"$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" \
+    --run-names a --run-names b \
+    --out-dir "$work/exp_none" --config "$work/exp_none.json" > "$work/exp_none.log" 2>&1 \
+    || { tail -30 "$work/exp_none.log"; echo "run-experiment with mbr.strategy = none failed"; exit 1; }
+[ ! -e "$work/exp_none/second_pass" ] || { echo "mbr.strategy = none ran a second pass"; exit 1; }
+cmp -s "$work/exp/scored_combined.parquet" "$work/exp_none/scored_combined.parquet" \
+    || { echo "the second pass's fallback is not the first pass"; exit 1; }
+"$PY" - "$work/exp" <<'PYEOF'
+import json, sys
+m = json.load(open(sys.argv[1] + "/experiment_manifest.json"))
+mbr = m["model_identities"]["mbr"]
+assert mbr == "SecondPass-not-applied", mbr
+assert m["experiment"]["second_pass"] is None, m["experiment"]["second_pass"]
+lib = json.load(open(sys.argv[1] + "/second_pass/library/empirical_library.json"))
+assert lib["entries"] > 100 and lib["targets"] == lib["entries"] and lib["decoys"] == lib["targets"], lib
+print(f"    ok: empirical library {lib['entries']} entries + {lib['decoys']} paired decoys, "
+      f"{lib['runs_aligned']} runs aligned; no decoy extracted, so the first pass stands")
+PYEOF
+
 # 5b. The same experiment with `experiment.parallel_runs = 2`, and one whose second run
 #     cannot be converted.
 #

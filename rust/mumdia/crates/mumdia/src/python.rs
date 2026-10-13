@@ -23,9 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Result};
-use mumdia_core::config::{
-    Config, FragPredictorKind, LibraryIrt, MbrStrategy, RescorerKind, RtPredictorKind,
-};
+use mumdia_core::config::{Config, FragPredictorKind, LibraryIrt, RescorerKind, RtPredictorKind};
 use tracing::{info, warn};
 
 /// The literal a config uses to ask for discovery rather than naming a path.
@@ -171,7 +169,7 @@ impl Role {
             }
             Role::Ms2pip => cfg.predict_frag.predictor == FragPredictorKind::Ms2pip,
             Role::Peptdeep => cfg.predict_frag.predictor == FragPredictorKind::Peptdeep,
-            Role::Mbr => cfg.mbr.strategy != MbrStrategy::None,
+            Role::Mbr => cfg.mbr.strategy.transfers(),
         }
     }
 
@@ -671,7 +669,7 @@ mod tests {
         cfg.rt_im_train.library_irt = LibraryIrt::Auto;
         assert!(!Role::DeepLc.required_by(&cfg) && Role::DeepLc.wanted_by(&cfg));
 
-        cfg.mbr.strategy = MbrStrategy::RtTransfer;
+        cfg.mbr.strategy = mumdia_core::config::MbrStrategy::RtTransfer;
         assert!(Role::Mbr.required_by(&cfg));
     }
 

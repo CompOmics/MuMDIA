@@ -2226,31 +2226,58 @@ impl Default for QuantConfig {
     }
 }
 
-/// Match-between-runs strategy (Stage D3, docs/12_quant_lfq_align_mbr_report_audit.md).
-/// Default `None` reproduces the current chain byte-for-byte.
+/// Match-between-runs strategy (docs/12_quant_lfq_align_mbr_report_audit.md, "Second
+/// pass"). Read by `run-experiment` only; a single-run `run` has no other run to match.
 ///
-/// ONLY `None` VS NOT-`None` IS IMPLEMENTED. The three non-`None` variants are described
-/// below as the intended staging, but no code distinguishes them: every test in the tree is
-/// `strategy != None`, so selecting `RtTransfer` or `Full` today behaves exactly like
-/// `EmpiricalLibrary`. They are kept as the recorded design ladder rather than deleted
-/// because the MBR tier is planned and benchmark-gated (CLAUDE.md); `validate()` warns when
-/// a non-`None` variant is selected so a config cannot quietly expect more than it gets.
+/// `SecondPass` (the default since 2026-10-13) searches every run a second time on an
+/// empirical library: the precursors the pooled first pass accepted experiment-wide
+/// (`precursor_q <= mbr.q_anchor`), each with its paired library decoy, both given the
+/// precursor's cross-run consensus retention time (`stages::second_pass`). The second pass is
+/// an ordinary search of that library, with its own seed, retention-time calibration,
+/// extraction and one pooled target-decoy rescore, and it is what the experiment reports.
+/// Measured against the first pass on four pools (docs/12):
 ///
-/// Intended staging: `EmpiricalLibrary` builds the consensus anchor library only;
-/// `RtTransfer` adds cross-run expected-RT transfer extraction; `Full` adds
-/// requantification. All require >= 2 runs and a decoy-transfer FDR (see the plan).
+/// | pool | per-run IDs at 1% | null |
+/// |---|---|---|
+/// | ProteoBench Astral entrapment, 3 runs x 3 NN seeds | +8.0% | entrapment FDP 0.95% -> 0.70% |
+/// | 22 HeLa runs, human + yeast + E. coli library | +16.9% | species FDP 1.42% -> 0.80% |
+/// | 216 single cells + 24 blank wells | +54% to +57% | decoys 0.97% -> 0.98%, 0 IDs in blanks |
+/// | 22-run HYE mixture | proteins 4,366 -> 5,298 | E. coli log2 A/B -1.71 -> -1.48 |
+///
+/// The last row is the known gap: quantities of the precursors the second pass adds in runs
+/// where they are weak compress the ratios (CV 0.255 -> 0.245, median |error| 0.238 ->
+/// 0.252). That is a quantification limitation, not a false identification.
+///
+/// `EmpiricalLibrary`, `RtTransfer` and `Full` are the earlier rescuable-tier transfer
+/// (`scripts/mbr_worker.py`), which needs `mbr.python`. No code distinguishes the three:
+/// each accepts an already extracted, sub-threshold candidate on retention-time agreement
+/// alone. On the same pools its transfers measured 2.3-2.7% entrapment FDP (ProteoBench) and
+/// about 4x the false-ID rate of the direct identifications (single cells), so it stays
+/// opt-in and `validate()` warns when it is selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MbrStrategy {
-    /// No match-between-runs (default).
-    #[default]
+    /// No match-between-runs: the first pass is the result.
     None,
-    /// Build the cross-run consensus anchor library (M1) only; no transfer.
+    /// Search every run again on the empirical library of the first pass (default).
+    #[default]
+    SecondPass,
+    /// Rescuable-tier transfer; behaves as `RtTransfer`.
     EmpiricalLibrary,
-    /// EmpiricalLibrary + cross-run expected-RT transfer extraction (M2/M3).
+    /// Rescuable-tier transfer on cross-run expected retention time (`mbr_worker.py`).
     RtTransfer,
-    /// RtTransfer + requantification of accepted transfers (M5).
+    /// Rescuable-tier transfer; behaves as `RtTransfer`.
     Full,
+}
+
+impl MbrStrategy {
+    /// One of the rescuable-tier transfer variants, which run the `mbr_worker.py` sidecar.
+    pub fn transfers(self) -> bool {
+        matches!(
+            self,
+            MbrStrategy::EmpiricalLibrary | MbrStrategy::RtTransfer | MbrStrategy::Full
+        )
+    }
 }
 
 /// Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence`
@@ -2271,11 +2298,15 @@ pub enum DecoyTransfer {
 #[serde(default, deny_unknown_fields)]
 pub struct MbrConfig {
     pub strategy: MbrStrategy,
-    /// q-value for a precursor to become a cross-run anchor (validated at 0.01).
+    /// The first-pass cut (validated at 0.01). Under `second_pass`, the experiment-wide
+    /// `precursor_q` at which a target enters the empirical library, and the `run_psm_q` at
+    /// which one run's apex counts toward its consensus retention time. Under the transfer
+    /// variants, the q-value for a precursor to become a cross-run anchor.
     pub q_anchor: f64,
-    /// Minimum number of OTHER runs a precursor must be confident in to transfer.
+    /// Transfer variants only: minimum number of OTHER runs a precursor must be confident
+    /// in to transfer.
     pub min_anchor_runs: usize,
-    /// Accept threshold for a transferred identification's transfer q-value.
+    /// Transfer variants only: accept threshold for a transfer's q-value.
     pub q_transfer: f64,
     /// NOT YET WIRED. Transfer RT half-window (seconds) around the cross-run-predicted
     /// RT. The M2 leave-target-out residual was ~17 s at p95, ~15x tighter than the search
@@ -2295,13 +2326,14 @@ pub struct MbrConfig {
     /// field yet; `validate()` warns if it is changed.
     pub requant_all: bool,
     /// Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy;
-    /// e.g. the `py312_mumdia` env). Required when `strategy != None`.
+    /// e.g. the `py312_mumdia` env). Required by the transfer variants only; `second_pass`
+    /// and `none` run no sidecar.
     pub python: Option<String>,
 }
 impl Default for MbrConfig {
     fn default() -> Self {
         Self {
-            strategy: MbrStrategy::None,
+            strategy: MbrStrategy::SecondPass,
             q_anchor: 0.01,
             min_anchor_runs: 2,
             q_transfer: 0.01,
@@ -3330,16 +3362,14 @@ impl Config {
                  for an external classifier."
             );
         }
-        {
-            // Only `strategy == None` vs `!= None` is ever tested, so the non-None variants
-            // are indistinguishable in behaviour.
-            if self.mbr.strategy != MbrStrategy::None {
-                tracing::warn!(
-                    strategy = ?self.mbr.strategy,
-                    "mbr.strategy currently only distinguishes none vs not-none; the \
-                     individual non-none variants behave identically"
-                );
-            }
+        if self.mbr.strategy.transfers() {
+            tracing::warn!(
+                strategy = ?self.mbr.strategy,
+                "mbr.strategy selects the rescuable-tier transfer (empirical_library, \
+                 rt_transfer and full behave identically): it accepts a transfer on retention-time \
+                 agreement alone, and its transfers measured 2.3-2.7% entrapment FDP at a 1% cut. \
+                 The default second_pass searches every run again instead (docs/12)."
+            );
         }
         if self.quant.fixed_window_s > 0.0 && self.quant.fixed_scan_halfwidth > 0 {
             tracing::warn!(
@@ -4336,6 +4366,26 @@ mod tests {
                 "{msg:?}"
             );
         }
+    }
+
+    #[test]
+    fn mbr_defaults_to_the_second_pass_and_only_the_transfers_need_a_sidecar() {
+        let d = Config::default();
+        assert_eq!(d.mbr.strategy, MbrStrategy::SecondPass);
+        assert!(!d.mbr.strategy.transfers());
+        assert!(!MbrStrategy::None.transfers());
+        for s in [
+            MbrStrategy::EmpiricalLibrary,
+            MbrStrategy::RtTransfer,
+            MbrStrategy::Full,
+        ] {
+            assert!(s.transfers(), "{s:?}");
+        }
+        let none: Config = serde_json::from_str(r#"{"mbr":{"strategy":"none"}}"#).unwrap();
+        assert_eq!(none.mbr.strategy, MbrStrategy::None);
+        let sp: Config = serde_json::from_str(r#"{"mbr":{"strategy":"second_pass"}}"#).unwrap();
+        assert_eq!(sp.mbr.strategy, MbrStrategy::SecondPass);
+        assert!(d.validate().is_ok());
     }
 
     #[test]
