@@ -578,6 +578,36 @@ impl Optional {
     }
 }
 
+/// The report parameter that says how far, in seconds, a table's traces reach beyond each
+/// candidate's RT window (`extract::TracePad`). Absent, every trace lies inside its window.
+pub const TRACE_PAD_PARAM: &str = "trace_pad_s";
+
+/// The trace pad the chromatogram table at `path` records in its report
+/// ([`TRACE_PAD_PARAM`]): 0 for a table without one, or without a readable report.
+pub fn recorded_trace_pad(path: &str) -> f64 {
+    let Ok(text) = std::fs::read_to_string(format!("{path}.report.json")) else {
+        return 0.0;
+    };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("params")?.get(TRACE_PAD_PARAM)?.as_f64())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(0.0)
+}
+
+/// The points of an ascending trace axis `rt` (f32, as the table stores it) inside the RT
+/// window `[lo, hi]`, as an index range. The bounds are compared after the same rounding to
+/// f32 the axis went through, and rounding to nearest is monotone, so every point whose RT
+/// lay inside the window in f64 is kept: on a table without a trace pad the range is the
+/// whole axis. A padded point within half an f32 step of a bound (under 0.5 ms at a 2 h
+/// gradient) is kept as well.
+pub fn window_span(rt: &[f32], lo: f64, hi: f64) -> std::ops::Range<usize> {
+    let (lo, hi) = (lo as f32, hi as f32);
+    let a = rt.partition_point(|&r| r < lo);
+    let b = rt.partition_point(|&r| r <= hi).max(a);
+    a..b
+}
+
 /// The (name, version) a chromatogram table records: its layout and whether it carries
 /// per-point ion mobility ([`mumdia_core::schema::artifact::chromatograms`]).
 pub fn recorded_schema(path: &str) -> Result<(&'static str, u32)> {

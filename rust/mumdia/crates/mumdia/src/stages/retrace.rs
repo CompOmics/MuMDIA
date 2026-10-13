@@ -987,7 +987,14 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
             }
         }
     }
-    let (rt_min, rt_max) = (rt_min - RT_MARGIN_S, rt_max + RT_MARGIN_S);
+    // Traces padded beyond the windows for quantification (`extract::TracePad`, recorded in
+    // the centroid table's report) reach this much further, and their points are rebuilt
+    // like any other.
+    let trace_pad = chromatograms::recorded_trace_pad(p.chromatograms);
+    let (rt_min, rt_max) = (
+        rt_min - RT_MARGIN_S - trace_pad,
+        rt_max + RT_MARGIN_S + trace_pad,
+    );
     // All needed frames are resident, so the peak is about the run's raw size (21 GB on the
     // E. coli diaPASEF run, 36 GB on a HYE run). Past that: decode RT blocks of frames and
     // visit the rows by RT, which needs the rows grouped by RT (an external sort) first.
@@ -1034,6 +1041,9 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
         Vec::new()
     };
     let t_repick = t0.elapsed().as_millis() - t_decoded;
+    // The windows' RT bounds stay only for padded traces, which are counted inside them.
+    let pad_win: Option<(Vec<f64>, Vec<f64>)> =
+        (trace_pad > 0.0).then(|| (win.rt_lo.clone(), win.rt_hi.clone()));
     drop((ex_cid, ex_rank, ex_im, ex_rt, win));
 
     let hw = p.cfg.im_half_width;
@@ -1044,6 +1054,7 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     let (ms1_rt, ms1_fi, ms2_rt, ms2_fi) = (&ms1_rt, &ms1_fi, &ms2_rt, &ms2_fi);
     let (frames, scan_im, raw, mass_off) = (&frames, &scan_im, &raw, &mass_off);
     let (centre, apex_rt, pmz) = (&centre, &apex_rt, &pmz);
+    let pad_win = &pad_win;
 
     // The input's actual row groups: each is read whole, so a v2 table is always read from
     // the start of a row group.
@@ -1292,7 +1303,20 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                                 _ => {
                                     apex.rebuilt += (o.kind == Kind::Frag) as u32;
                                     apex.inten += v;
-                                    apex.n_matched += o.int.iter().any(|&x| x > 0.0) as i32;
+                                    // A fragment counts as matched by its points inside the
+                                    // RT window, as extract counted it, also on padded traces.
+                                    let int: &[f32] = match pad_win {
+                                        Some((lo, hi))
+                                            if o.int.len() == s.rt[r].len() && c0 < lo.len() =>
+                                        {
+                                            let sp = chromatograms::window_span(
+                                                &s.rt[r], lo[c0], hi[c0],
+                                            );
+                                            &o.int[sp]
+                                        }
+                                        _ => &o.int,
+                                    };
+                                    apex.n_matched += int.iter().any(|&x| x > 0.0) as i32;
                                 }
                             }
                         }

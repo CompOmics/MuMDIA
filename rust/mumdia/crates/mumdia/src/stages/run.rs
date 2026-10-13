@@ -53,12 +53,9 @@ struct LibraryInputRecord {
 /// one input that `convert` reads with its ion mobility, and the decision made here is the
 /// one conversion will make. Each refused mechanism keys its work on m/z isolation windows
 /// only, so on diaPASEF slots that share an m/z range it would merge what extraction keeps
-/// apart (docs/35_diapasef.md). `experiment` adds the experiment-only second pass.
-pub(crate) fn refuse_unsupported_on_4d(
-    cfg: &Config,
-    inputs: &[String],
-    experiment: bool,
-) -> Result<()> {
+/// apart (docs/35_diapasef.md). The experiment's second pass is supported: it carries a
+/// consensus 1/K0 and a 1/K0 window floor of its own (docs/12, "Second pass").
+pub(crate) fn refuse_unsupported_on_4d(cfg: &Config, inputs: &[String]) -> Result<()> {
     let Some(tdf) = inputs.iter().find(|m| crate::instrument::input_has_im(m)) else {
         return Ok(());
     };
@@ -76,13 +73,6 @@ pub(crate) fn refuse_unsupported_on_4d(
             "the prescreen (prescreen.enabled, tag_prefilter, score_before_prediction) is \
              not supported on diaPASEF input yet ({tdf}): it groups spectra by m/z window \
              only. Turn all three off."
-        );
-    }
-    if experiment && cfg.mbr.strategy == mumdia_core::config::MbrStrategy::SecondPass {
-        anyhow::bail!(
-            "mbr.strategy = second_pass (the default of an experiment) is not supported on \
-             diaPASEF input yet ({tdf}): the second pass has no 1/K0 window for the \
-             transferred precursors. Set mbr.strategy = none."
         );
     }
     Ok(())
@@ -115,7 +105,7 @@ fn preflight(p: &RunParams, cfg: &Config) -> Result<()> {
             anyhow::bail!("{flag} not found or unreadable: {path}");
         }
     }
-    refuse_unsupported_on_4d(cfg, &[p.mzml.to_string()], false)?;
+    refuse_unsupported_on_4d(cfg, &[p.mzml.to_string()])?;
     // The interpreter fields were filled in by `python::resolve` before this point,
     // so a field still empty here means the role is unused or discovery failed.
     // The messages name the field and the alternative, which is what a user acts on.
@@ -483,7 +473,7 @@ pub fn run(p: RunParams) -> Result<()> {
                 out_precursors: &sp,
                 out_fragments: &sf,
                 pair_linked: false,
-                predicted_irt: None,
+                overrides: None,
             })?;
             info!(
                 library = st.library_precursors,
@@ -828,6 +818,7 @@ pub fn run(p: RunParams) -> Result<()> {
             lent_ms2,
             manifest: Some(&mut man),
             retrace: true,
+            extras: Default::default(),
         })?;
         let chrom = vec![quant::ChromTable::whole(&out.chromatograms)];
         (
@@ -1141,8 +1132,9 @@ fn convert_and_record(
 mod tests {
     use super::*;
 
-    /// Grouped runs, the prescreen and the experiment second pass are refused on a diaPASEF
-    /// `.d`, each with a message naming the setting to change; an mzML is never refused.
+    /// Grouped runs and the prescreen are refused on a diaPASEF `.d`, each with a message
+    /// naming the setting to change; an mzML is never refused. The defaults pass, the
+    /// experiment's second pass included.
     #[test]
     fn diapasef_input_refuses_what_is_keyed_on_mz_windows_only() {
         let d = std::env::temp_dir().join(format!("mumdia-run-4d-{}", std::process::id()));
@@ -1153,19 +1145,17 @@ mod tests {
         let mzml = vec!["run.mzML".to_string()];
         let base = Config::default();
 
-        // The defaults pass on a single run; an experiment defaults to the second pass.
-        assert!(refuse_unsupported_on_4d(&base, &dia, false).is_ok());
-        let e = refuse_unsupported_on_4d(&base, &dia, true)
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("mbr.strategy = none"), "{e}");
-        let mut none = base.clone();
-        none.mbr.strategy = mumdia_core::config::MbrStrategy::None;
-        assert!(refuse_unsupported_on_4d(&none, &dia, true).is_ok());
+        // The defaults pass, `mbr.strategy = second_pass` (an experiment's default) included.
+        assert_eq!(
+            base.mbr.strategy,
+            mumdia_core::config::MbrStrategy::SecondPass
+        );
+        assert!(refuse_unsupported_on_4d(&base, &dia).is_ok());
+        let none = base.clone();
 
         let mut grouped = none.clone();
         grouped.groups.window_groups = 4;
-        let e = refuse_unsupported_on_4d(&grouped, &dia, false)
+        let e = refuse_unsupported_on_4d(&grouped, &dia)
             .unwrap_err()
             .to_string();
         assert!(e.contains("groups.window_groups = 1"), "{e}");
@@ -1177,13 +1167,11 @@ mod tests {
         ] {
             let mut c = none.clone();
             set(&mut c);
-            let e = refuse_unsupported_on_4d(&c, &dia, false)
-                .unwrap_err()
-                .to_string();
+            let e = refuse_unsupported_on_4d(&c, &dia).unwrap_err().to_string();
             assert!(e.contains("prescreen"), "{e}");
-            assert!(refuse_unsupported_on_4d(&c, &mzml, true).is_ok());
+            assert!(refuse_unsupported_on_4d(&c, &mzml).is_ok());
         }
-        assert!(refuse_unsupported_on_4d(&grouped, &mzml, true).is_ok());
+        assert!(refuse_unsupported_on_4d(&grouped, &mzml).is_ok());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

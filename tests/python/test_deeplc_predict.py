@@ -1031,3 +1031,71 @@ def test_sigterm_during_sharding_unwinds_and_restores_the_handler():
     done = subprocess.run([sys.executable, "-c", code, source], capture_output=True, text=True,
                           timeout=60)
     assert done.returncode == 0 and done.stdout.strip() == "OK", (done.stdout, done.stderr)
+
+
+# ------------------------------------------------ the multi-head output-range guard
+
+def _guard_helpers():
+    """`output_range_bounds` and `guard_output_range` of `deeplc_finetune.py`, without DeepLC."""
+    np = pytest.importorskip("numpy")
+    found = _function_sources("deeplc_finetune.py", ["output_range_bounds", "guard_output_range"])
+    namespace = {"np": np}
+    for src in found.values():
+        exec(compile(src, "deeplc_finetune.py", "exec"), namespace)  # noqa: S102
+    return namespace
+
+
+def test_the_output_range_is_one_anchor_span_beyond_the_anchors():
+    h = _guard_helpers()
+    assert h["output_range_bounds"]([600.0, 1800.0, 1200.0, float("nan"), None]) == (-600.0, 3000.0)
+    assert h["output_range_bounds"]([600.0]) is None
+    assert h["output_range_bounds"]([]) is None
+
+
+def test_the_guard_is_a_no_op_when_every_prediction_is_in_range():
+    """Nothing out of range: the very array comes back, so the library is byte-identical."""
+    h = _guard_helpers()
+    np = pytest.importorskip("numpy")
+    values = np.array([0.0, 650.5, 2999.9, float("nan"), -600.0], dtype=np.float64)
+    out, record = h["guard_output_range"](values, (-600.0, 3000.0))
+    assert out is values
+    assert record["n_out_of_range"] == 0 and record["action"] == "none"
+    assert record["fraction"] == 0.0 and record["predicted"] == 5
+    out, record = h["guard_output_range"](values, None)
+    assert out is values and record["bounds"] is None
+
+
+def test_the_guard_clamps_absurd_predictions_and_counts_them():
+    """The values a large-anchor refit produced (up to 3.8e5 s) are clamped to the range;
+    in-range and non-finite values are left alone, and the input is not modified."""
+    h = _guard_helpers()
+    np = pytest.importorskip("numpy")
+    values = np.array([1000.0, 3.8e5, -1.7e5, float("nan"), 2500.0, float("inf")],
+                      dtype=np.float64)
+    before = values.copy()
+    out, record = h["guard_output_range"](values, (-600.0, 3000.0))
+    assert np.array_equal(values, before, equal_nan=True)
+    assert out is not values
+    assert out[0] == 1000.0 and out[4] == 2500.0
+    assert out[1] == 3000.0 and out[2] == -600.0
+    assert np.isnan(out[3]) and np.isinf(out[5])
+    assert record["n_out_of_range"] == 2 and record["action"] == "clamped"
+    assert record["fraction"] == pytest.approx(2 / 6)
+    assert record["bounds"] == [-600.0, 3000.0]
+
+
+def test_every_prediction_path_reaches_the_guard_and_the_summary_records_it():
+    """The guard runs once in `main`, after the one-process, projection-cache and sharded
+    prediction paths have all produced `values`, and before either writer; the recipe guards
+    each shard and `merge` sums the records. Checked on the source, since running it needs
+    DeepLC."""
+    text = (SCRIPTS / "deeplc_finetune.py").read_text(encoding="utf-8")
+    main = text[text.index("def main():"):text.index("def multihead_record(")]
+    guard = main.index("apply_output_range_guard(")
+    for path in ("predict_from_projections(", "predict_values(", "predict_sharded("):
+        assert main.index(path) < guard, path
+    assert guard < main.index("write_bands(") and guard < main.index("rewrite_irt(")
+    assert '"output_range": output_range' in text and '"ridge_alpha"' in text
+    recipe = (SCRIPTS / "mh_shard_predict.py").read_text(encoding="utf-8")
+    assert "apply_output_range_guard(" in recipe and '".range.json"' in recipe
+    assert 'summary["output_range"]' in recipe

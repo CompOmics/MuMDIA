@@ -1471,6 +1471,7 @@ fn real_main() -> Result<()> {
                 out_cal: &out_cal,
                 cfg: &cfg.rt_im_train,
                 config_hash: &ch,
+                im_window_floor: None,
             })?;
         }
         Cmd::SubLibrary {
@@ -1490,7 +1491,7 @@ fn real_main() -> Result<()> {
                 out_precursors: &out_precursors,
                 out_fragments: &out_fragments,
                 pair_linked: !no_pair_link,
-                predicted_irt: None,
+                overrides: None,
             })?;
             println!(
                 "sub-library: {} precursors ({} targets, {} decoys) and {} fragment rows from                  {} survivors of {}",
@@ -1527,6 +1528,7 @@ fn real_main() -> Result<()> {
                 // The per-point 1/K0 of the traces, for the ion-mobility feature family and
                 // for a `mumdia retrace` to follow (`retrace.enabled`), resolved on the
                 // spectra's own record.
+                trace_pad: None,
                 chrom_im: {
                     let has_im = mumdia::instrument::spectra_has_im(&ms2);
                     cfg.features.im_features.on(has_im) || (cfg.retrace.enabled && has_im)

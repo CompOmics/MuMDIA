@@ -546,6 +546,7 @@ fn calibrated_rt_error(apex_rt: f64, rt_pred_cal: f64) -> f64 {
 /// name are borrowed from the chunk store ([`ChromChunk`]), which owns one flat buffer
 /// per array instead of a `Vec` per row, and shares one RT axis across the rows of a
 /// candidate (extract samples every fragment of a candidate on the same window grid).
+#[derive(Clone, Copy)]
 struct ChromRow<'a> {
     frag_name: &'a str,
     frag_mz: f64,
@@ -556,6 +557,34 @@ struct ChromRow<'a> {
     /// Per-point 1/K0 parallel to `inten` (a 4D chromatogram table, schema v3 or v4, read
     /// for the ion-mobility family), empty when not read.
     im: &'a [f32],
+}
+
+/// `rows` cut to the RT window `[lo, hi]` ([`crate::chromatograms::window_span`]): what the
+/// features read from a table whose traces reach beyond the window (a trace pad, recorded in
+/// the table's report). Every feature then sees the points it sees without the pad. A window
+/// with a NaN bound leaves the rows as they are.
+fn clip_rows<'a>(rows: &[ChromRow<'a>], lo: f64, hi: f64) -> Vec<ChromRow<'a>> {
+    if lo.is_nan() || hi.is_nan() {
+        return rows.to_vec();
+    }
+    rows.iter()
+        .map(|r| {
+            let span = crate::chromatograms::window_span(r.rt, lo, hi);
+            let cut = |v: &'a [f32]| -> &'a [f32] {
+                if v.len() == r.rt.len() {
+                    &v[span.clone()]
+                } else {
+                    v
+                }
+            };
+            ChromRow {
+                rt: &r.rt[span.clone()],
+                inten: cut(r.inten),
+                im: cut(r.im),
+                ..*r
+            }
+        })
+        .collect()
 }
 
 /// One PSM's fragment traces on a single union RT axis: `axis_full` ascending and
@@ -2309,6 +2338,7 @@ fn subchunk_half_widths(
     names: &mut NameTab,
     lefts: &mut Vec<f64>,
     rights: &mut Vec<f64>,
+    window: Option<(&[f64], &[f64])>,
 ) -> Result<()> {
     // `open_at`, not a span: a sub-chunk starts on the absolute `chunk_rows` grid, which is
     // inside a row group and inside a candidate whenever the row groups do not divide the
@@ -2327,8 +2357,17 @@ fn subchunk_half_widths(
             continue;
         }
         for &i in psm_rows {
+            // A padded table is cut back to the PSM row's window (`clip_rows`).
+            let clipped;
+            let rows_i: &[ChromRow] = match window {
+                Some((wlo, whi)) => {
+                    clipped = clip_rows(&rows, wlo[i], whi[i]);
+                    &clipped
+                }
+                None => &rows,
+            };
             if let Some((lo, hi)) = elution_peak_rt_bounds(
-                &rows,
+                rows_i,
                 apex_rt[i],
                 cfg.bound_peak_fraction,
                 cfg.bound_peak_grace,
@@ -2362,6 +2401,7 @@ fn subchunk_half_widths(
 /// samples land, which is what
 /// `parallel_confident_bounds_match_the_serial_pass_sample_for_sample` executes at four
 /// pool sizes.
+#[cfg(test)]
 fn confident_half_widths(
     ch: &TableFile,
     spans: &[(usize, usize)],
@@ -2369,6 +2409,21 @@ fn confident_half_widths(
     apex_rt: &[f64],
     cfg: &FeaturesConfig,
     chunk_rows: usize,
+) -> Result<(Vec<f64>, Vec<f64>)> {
+    confident_half_widths_in(ch, spans, confident_rows, apex_rt, cfg, chunk_rows, None)
+}
+
+/// [`confident_half_widths`] on a table whose traces may reach beyond each PSM row's RT
+/// window: with `window` (`rt_lo`, `rt_hi` by PSM row) every candidate's rows are cut back to
+/// it first ([`clip_rows`]). `None` is [`confident_half_widths`].
+fn confident_half_widths_in(
+    ch: &TableFile,
+    spans: &[(usize, usize)],
+    confident_rows: &HashMap<u32, Vec<usize>>,
+    apex_rt: &[f64],
+    cfg: &FeaturesConfig,
+    chunk_rows: usize,
+    window: Option<(&[f64], &[f64])>,
 ) -> Result<(Vec<f64>, Vec<f64>)> {
     let keep: std::collections::HashSet<u32> = confident_rows.keys().copied().collect();
     let subs = confident_subchunks(spans, chunk_rows);
@@ -2402,6 +2457,7 @@ fn confident_half_widths(
                     &mut names,
                     &mut lefts,
                     &mut rights,
+                    window,
                 )?;
             }
             Ok((lefts, rights))
@@ -2483,6 +2539,7 @@ fn confident_half_widths_serial(
 /// Chunk boundaries inside a span stay on the same ABSOLUTE row grid the whole-table pass
 /// used, so a candidate that straddles one is split exactly where it was split before and
 /// the half-width samples, and therefore the percentiles, are unchanged.
+#[cfg(test)]
 fn confident_global_bounds(
     ch: &TableFile,
     spans: &[(usize, usize)],
@@ -2491,8 +2548,21 @@ fn confident_global_bounds(
     cfg: &FeaturesConfig,
     chunk_rows: usize,
 ) -> Result<Option<(f64, f64)>> {
+    confident_global_bounds_in(ch, spans, confident_rows, apex_rt, cfg, chunk_rows, None)
+}
+
+/// [`confident_global_bounds`] with the windows of [`confident_half_widths_in`].
+fn confident_global_bounds_in(
+    ch: &TableFile,
+    spans: &[(usize, usize)],
+    confident_rows: &HashMap<u32, Vec<usize>>,
+    apex_rt: &[f64],
+    cfg: &FeaturesConfig,
+    chunk_rows: usize,
+    window: Option<(&[f64], &[f64])>,
+) -> Result<Option<(f64, f64)>> {
     let (lefts, rights) =
-        confident_half_widths(ch, spans, confident_rows, apex_rt, cfg, chunk_rows)?;
+        confident_half_widths_in(ch, spans, confident_rows, apex_rt, cfg, chunk_rows, window)?;
     Ok(bounds_from_samples(&BoundSamples { lefts, rights }, cfg))
 }
 
@@ -2720,15 +2790,34 @@ pub fn confident_bound_samples(p: &FeaturesParams) -> Result<BoundSamples> {
         .ok()
         .and_then(|st| confident_row_spans(&st, &sorted))
         .unwrap_or_else(|| vec![(0, ch.nrows)]);
-    let (lefts, rights) = confident_half_widths(
+    let window = trace_window(&ps, p.chromatograms)?;
+    let (lefts, rights) = confident_half_widths_in(
         &ch,
         &spans,
         &confident_rows,
         &apex_rt,
         p.cfg,
         CHUNK_CHROM_ROWS,
+        window.as_ref().map(|(l, h)| (&l[..], &h[..])),
     )?;
     Ok(BoundSamples { lefts, rights })
+}
+
+/// The PSM rows' RT windows (`rt_lo`, `rt_hi` of `psms`) when the chromatogram table's traces
+/// reach beyond them (a trace pad in its report, `chromatograms::recorded_trace_pad`);
+/// `None` for a table without a pad, which is every table but a padded second pass's.
+fn trace_window(psms: &TableFile, chromatograms: &str) -> Result<Option<(Vec<f64>, Vec<f64>)>> {
+    let pad = crate::chromatograms::recorded_trace_pad(chromatograms);
+    if pad <= 0.0 {
+        return Ok(None);
+    }
+    if !(psms.has_column("rt_lo") && psms.has_column("rt_hi")) {
+        anyhow::bail!(
+            "{chromatograms}: the traces reach {pad} s beyond the RT windows, and the extracted \
+             rows carry no rt_lo / rt_hi to cut them back to (extract.emit_rt_window)"
+        );
+    }
+    Ok(Some((psms.f64("rt_lo")?, psms.f64("rt_hi")?)))
 }
 
 /// Where a call gets the global elution half-widths from.
@@ -3181,6 +3270,9 @@ fn run_chunked(
     } else {
         (vec![f64::NAN; ps.nrows], vec![f64::NAN; ps.nrows])
     };
+    // A padded chromatogram table is cut back to these windows before any feature reads it.
+    let padded = trace_window(&ps, p.chromatograms)?.is_some();
+    let clip_window: Option<(&[f64], &[f64])> = padded.then_some((&win_lo[..], &win_hi[..]));
     let w_global = (0..ps.nrows)
         .map(|i| (rt_cal[i] - win_lo[i]).min(win_hi[i] - rt_cal[i]))
         .filter(|w| w.is_finite() && *w > 0.0)
@@ -3362,13 +3454,14 @@ fn run_chunked(
                 confident = sorted.len(),
                 "features: confident-bounds pass reads this much of the chromatogram table"
             );
-            confident_global_bounds(
+            confident_global_bounds_in(
                 &ch,
                 &spans,
                 &confident_rows,
                 &apex_rt,
                 p.cfg,
                 chunk_rows.max(1),
+                clip_window,
             )?
         }
         BoundsSource::Learn => None,
@@ -3588,6 +3681,10 @@ fn run_chunked(
                 let rows = ci
                     .map(|c| store.rows(&store.frag, c, &names))
                     .unwrap_or_default();
+                let rows = match clip_window {
+                    Some((lo, hi)) => clip_rows(&rows, lo[i], hi[i]),
+                    None => rows,
+                };
                 if rows.is_empty() {
                     // No chromatogram rows: default features and all-zero extended
                     // values, as before.
@@ -3643,6 +3740,10 @@ fn run_chunked(
                     let ms1_rows = ci
                         .map(|c| store.rows(&store.ms1, c, &names))
                         .unwrap_or_default();
+                    let ms1_rows = match clip_window {
+                        Some((lo, hi)) => clip_rows(&ms1_rows, lo[i], hi[i]),
+                        None => ms1_rows,
+                    };
                     let mut ev = evidence_from(&rows, al, obs, pred, peak, &ms1_rows, apex_rt[i]);
                     ev.rt_pred_cal = rt_cal[i];
                     ev.rt_lo = win_lo[i];

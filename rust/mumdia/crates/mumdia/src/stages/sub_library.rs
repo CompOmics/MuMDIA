@@ -53,10 +53,20 @@ pub struct SubLibraryParams<'a> {
     /// Off keeps exactly the listed candidates, which breaks pairing; only for a list that
     /// is already pair-complete.
     pub pair_linked: bool,
-    /// New `predicted_irt` values by ORIGINAL `candidate_id`, for the kept rows that have
-    /// one; the others keep the library's. The second pass of match-between-runs writes its
-    /// cross-run consensus retention times this way (`second_pass`).
-    pub predicted_irt: Option<&'a HashMap<u32, f32>>,
+    /// New library values by ORIGINAL `candidate_id`, for the kept rows that have one; the
+    /// others keep the library's. The second pass of match-between-runs writes its
+    /// cross-run consensus retention time and, on a run with ion mobility, its consensus
+    /// 1/K0 this way (`second_pass`).
+    pub overrides: Option<&'a HashMap<u32, LibOverride>>,
+}
+
+/// One kept row's new values ([`SubLibraryParams::overrides`]): its `predicted_irt`, and its
+/// `predicted_im` when `im` is `Some` and the library has that column. `im = None` keeps the
+/// library's 1/K0, which is what every 3D entry carries.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LibOverride {
+    pub irt: f32,
+    pub im: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -177,9 +187,28 @@ pub fn run(p: SubLibraryParams) -> Result<SubLibraryStats> {
         let schema = reader.schema();
         let cid_ix = column_index(&schema, "candidate_id", p.precursors)?;
         let label_ix = column_index(&schema, "label", p.precursors)?;
-        let irt_ix = match p.predicted_irt {
+        let irt_ix = match p.overrides {
             Some(_) => Some(column_index(&schema, "predicted_irt", p.precursors)?),
             None => None,
+        };
+        // `predicted_im` is rewritten only when an override carries a 1/K0. A library
+        // without the column keeps its schema: the 1/K0 is then dropped, with a warning,
+        // because adding the column would turn on a 1/K0 window the first pass never had.
+        let wants_im = p
+            .overrides
+            .is_some_and(|m| m.values().any(|o| o.im.is_some()));
+        let im_ix = if wants_im {
+            let ix = schema.index_of("predicted_im").ok();
+            if ix.is_none() {
+                warn!(
+                    precursors = p.precursors,
+                    "sub-library: the overrides carry a 1/K0 but the library has no \
+                     predicted_im column; the 1/K0 is not written"
+                );
+            }
+            ix
+        } else {
+            None
         };
         let mut w =
             BatchWriter::with_row_group_rows(p.out_precursors, schema.clone(), ROW_GROUP_ROWS)?;
@@ -216,8 +245,13 @@ pub fn run(p: SubLibraryParams) -> Result<SubLibraryStats> {
             }
             let mut cols = kept.columns().to_vec();
             cols[cid_ix] = Arc::new(UInt32Array::from(mapped));
-            if let (Some(map), Some(ix)) = (p.predicted_irt, irt_ix) {
-                cols[ix] = override_irt(&cols[ix], &kept_old, map, p.precursors)?;
+            if let (Some(map), Some(ix)) = (p.overrides, irt_ix) {
+                let value = |i: usize| map.get(&kept_old[i]).map(|o| f64::from(o.irt));
+                cols[ix] = override_float(&cols[ix], value, "predicted_irt", p.precursors)?;
+            }
+            if let (Some(map), Some(ix)) = (p.overrides, im_ix) {
+                let value = |i: usize| map.get(&kept_old[i]).and_then(|o| o.im);
+                cols[ix] = override_float(&cols[ix], value, "predicted_im", p.precursors)?;
             }
             let out = RecordBatch::try_new(schema.clone(), cols)
                 .with_context(|| format!("rebuilding a batch of {}", p.precursors))?;
@@ -279,31 +313,31 @@ pub fn run(p: SubLibraryParams) -> Result<SubLibraryStats> {
     Ok(stats)
 }
 
-/// `col` (the kept rows' `predicted_irt`, f32 or f64) with the value of `map` for every row
-/// whose original id it has; `kept_old[i]` is row i's original id.
-fn override_irt(
+/// `col` (one float column of the kept rows, f32 or f64, named `name`) with `value(i)` for
+/// every row i that has one; the others keep their value or null. An f32 column takes the
+/// value narrowed to f32, which is exact for an iRT that was an f32 to begin with.
+fn override_float(
     col: &ArrayRef,
-    kept_old: &[u32],
-    map: &HashMap<u32, f32>,
+    value: impl Fn(usize) -> Option<f64>,
+    name: &str,
     path: &str,
 ) -> Result<ArrayRef> {
-    let value = |i: usize| map.get(&kept_old[i]).copied();
     Ok(match col.data_type() {
         DataType::Float32 => {
             let a = col.as_any().downcast_ref::<Float32Array>().expect("f32");
-            Arc::new(Float32Array::from_iter(
-                (0..a.len()).map(|i| value(i).or_else(|| a.is_valid(i).then(|| a.value(i)))),
-            ))
-        }
-        DataType::Float64 => {
-            let a = col.as_any().downcast_ref::<Float64Array>().expect("f64");
-            Arc::new(Float64Array::from_iter((0..a.len()).map(|i| {
+            Arc::new(Float32Array::from_iter((0..a.len()).map(|i| {
                 value(i)
-                    .map(f64::from)
+                    .map(|v| v as f32)
                     .or_else(|| a.is_valid(i).then(|| a.value(i)))
             })))
         }
-        other => bail!("{path}: predicted_irt is {other:?}, not a float column"),
+        DataType::Float64 => {
+            let a = col.as_any().downcast_ref::<Float64Array>().expect("f64");
+            Arc::new(Float64Array::from_iter(
+                (0..a.len()).map(|i| value(i).or_else(|| a.is_valid(i).then(|| a.value(i)))),
+            ))
+        }
+        other => bail!("{path}: {name} is {other:?}, not a float column"),
     })
 }
 
@@ -535,7 +569,10 @@ mod tests {
         let of = dir.join("out_frag.parquet").to_str().unwrap().to_string();
         // Original ids 2 and 3 get a new value, 4 and 5 keep the library's 1.0; id 0 is not
         // kept, so its entry is ignored.
-        let irt: HashMap<u32, f32> = [(2, 250.0), (3, 250.0), (0, 9.0)].into_iter().collect();
+        let irt: HashMap<u32, LibOverride> = [(2, 250.0), (3, 250.0), (0, 9.0)]
+            .into_iter()
+            .map(|(c, irt)| (c, LibOverride { irt, im: None }))
+            .collect();
         run(SubLibraryParams {
             precursors: &p,
             fragments: &f,
@@ -543,7 +580,7 @@ mod tests {
             out_precursors: &op,
             out_fragments: &of,
             pair_linked: false,
-            predicted_irt: Some(&irt),
+            overrides: Some(&irt),
         })
         .unwrap();
         let out = TableFile::open(&op).unwrap();
@@ -552,6 +589,42 @@ mod tests {
             out.f32("predicted_irt").unwrap(),
             vec![250.0, 250.0, 1.0, 1.0]
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A 1/K0 override on a library without `predicted_im` writes no such column: the table
+    /// keeps its schema and its retention-time overrides.
+    #[test]
+    fn an_im_override_without_the_column_keeps_the_schema() {
+        let dir = std::env::temp_dir().join(format!("mumdia_sublib_im_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, f) = lib(&dir);
+        let s = dir.join("surv.parquet").to_str().unwrap().to_string();
+        write_table(&s, vec![Col::U32("candidate_id".into(), vec![2, 3])]).unwrap();
+        let op = dir.join("out_prec.parquet").to_str().unwrap().to_string();
+        let of = dir.join("out_frag.parquet").to_str().unwrap().to_string();
+        let o = LibOverride {
+            irt: 250.0,
+            im: Some(0.9),
+        };
+        let map: HashMap<u32, LibOverride> = [(2, o), (3, o)].into_iter().collect();
+        run(SubLibraryParams {
+            precursors: &p,
+            fragments: &f,
+            survivors: &s,
+            out_precursors: &op,
+            out_fragments: &of,
+            pair_linked: false,
+            overrides: Some(&map),
+        })
+        .unwrap();
+        let out = TableFile::open(&op).unwrap();
+        assert!(!out.has_column("predicted_im"));
+        assert_eq!(
+            mumdia_io::table::column_names(&op).unwrap(),
+            mumdia_io::table::column_names(&p).unwrap()
+        );
+        assert_eq!(out.f32("predicted_irt").unwrap(), vec![250.0, 250.0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -573,7 +646,7 @@ mod tests {
             out_precursors: &op,
             out_fragments: &of,
             pair_linked: true,
-            predicted_irt: None,
+            overrides: None,
         })
         .unwrap();
         assert_eq!(st.precursors, 4, "both members of pairs 0 and 2");
@@ -608,7 +681,7 @@ mod tests {
             out_precursors: &op2,
             out_fragments: &of2,
             pair_linked: false,
-            predicted_irt: None,
+            overrides: None,
         })
         .unwrap();
         assert_eq!(st2.precursors, 2);
@@ -750,7 +823,7 @@ mod tests {
             out_precursors: dir.join("o.parquet").to_str().unwrap(),
             out_fragments: dir.join("of.parquet").to_str().unwrap(),
             pair_linked: true,
-            predicted_irt: None,
+            overrides: None,
         })
         .unwrap_err()
         .to_string();

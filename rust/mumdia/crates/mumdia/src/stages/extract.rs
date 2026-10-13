@@ -169,6 +169,41 @@ pub struct ExtractParams<'a> {
     /// lands). On spectra that carry 1/K0 the table then has the list (chromatograms v3 or
     /// v4); otherwise, and on every 3D run, it does not, and nothing is computed for it.
     pub chrom_im: bool,
+    /// Record each candidate's traces beyond its RT window, for quantification
+    /// ([`TracePad`]). `None`, everywhere but the second pass of match-between-runs on a
+    /// run with ion mobility, records exactly the window.
+    pub trace_pad: Option<TracePad>,
+}
+
+/// How far beyond `[rt_lo, rt_hi]` extract records a candidate's traces: `scans` samples at
+/// the run's cycle time (the median spacing of one isolation window's scans) plus `seconds`.
+/// Apex choice, the gate, `psms_extracted` and the features all stay inside the window; only
+/// the chromatogram traces cover the pad, so quantification can integrate a fixed window and
+/// its baseline flanks around an apex near the window's edge. The second pass of
+/// match-between-runs sets it from `quant` (`run_experiment::search_second_pass`), because its
+/// windows are narrow around a consensus retention time.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TracePad {
+    pub scans: usize,
+    pub seconds: f64,
+}
+
+impl TracePad {
+    /// The pad quantification needs under `quant`: the largest integration half-width
+    /// (`fixed_window_s` in seconds when set, else `fixed_scan_halfwidth` scans) plus the
+    /// baseline flanks when `baseline_subtract` is on. `None` when that is 0, which is the
+    /// walked integration window without a fixed half-width.
+    pub fn for_quant(q: &mumdia_core::config::QuantConfig) -> Option<TracePad> {
+        let (mut scans, seconds) = if q.fixed_window_s > 0.0 {
+            (0, q.fixed_window_s)
+        } else {
+            (q.fixed_scan_halfwidth, 0.0)
+        };
+        if q.baseline_subtract {
+            scans += q.baseline_flank_scans;
+        }
+        (scans > 0 || seconds > 0.0).then_some(TracePad { scans, seconds })
+    }
 }
 
 /// One run's decoded spectra, lent to a stage instead of being re-decoded by it.
@@ -227,6 +262,31 @@ fn hit_rt(scans: &[Ms2Scan], h: &Hit) -> f64 {
     scans[h.scan as usize].rt_seconds
 }
 
+/// The run's cycle time: the median spacing, in seconds, of consecutive scans of one
+/// isolation window, over every window ([`IsolationWindow::key`]). 0 for fewer than two scans
+/// of any window.
+///
+/// [`IsolationWindow::key`]: mumdia_core::types::IsolationWindow::key
+fn cycle_time(scans: &[Ms2Scan]) -> f64 {
+    let mut by_window: BTreeMap<WindowKey, Vec<f64>> = BTreeMap::new();
+    for s in scans {
+        by_window
+            .entry(s.window.key())
+            .or_default()
+            .push(s.rt_seconds);
+    }
+    let mut gaps: Vec<f64> = Vec::new();
+    for (_, mut rts) in by_window {
+        rts.sort_by(f64::total_cmp);
+        gaps.extend(rts.windows(2).map(|w| w[1] - w[0]).filter(|g| *g > 0.0));
+    }
+    if gaps.is_empty() {
+        return 0.0;
+    }
+    gaps.sort_by(f64::total_cmp);
+    gaps[gaps.len() / 2]
+}
+
 /// A peak's 1/K0 as a [`Hit`] carries it: x 1e4, rounded (the cast saturates). 1e-4
 /// V s cm^-2 is 40x finer than the calibrated 1/K0 window.
 #[inline]
@@ -247,6 +307,8 @@ fn peak_hit_im(sim: Option<&[f32]>, j: usize) -> u16 {
 struct Guard<'a> {
     win: &'a RtWindows,
     im_gate: bool,
+    /// The trace pad in seconds (`ExtractParams::trace_pad`), 0 without one.
+    pad: f64,
 }
 
 impl<'a> Guard<'a> {
@@ -265,6 +327,14 @@ impl<'a> Guard<'a> {
     #[inline]
     fn admits(&self, c: usize, rt: f64, pim: Option<f32>) -> bool {
         self.win.admits(c, rt, pim)
+    }
+
+    /// A peak the window does not admit but the trace pad does: it goes into the candidate's
+    /// traces with its full intensity and takes no part in a peak claim, so the in-window
+    /// hits of every candidate are what they are without the pad. Always false without one.
+    #[inline]
+    fn pads(&self, c: usize, rt: f64, pim: Option<f32>) -> bool {
+        self.pad > 0.0 && self.win.admits_padded(c, rt, pim, self.pad)
     }
 }
 
@@ -1643,6 +1713,8 @@ impl ProbeTask<'_> {
         let mut flat_cid: Vec<u32> = Vec::new();
         let mut flat_hit: Vec<Hit> = Vec::new();
         let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
+        // The peak's candidates in a trace pad only (`Guard::pads`): empty without a pad.
+        let mut trace_only: Vec<(u32, u16)> = Vec::new();
         // One scan's `(q_mz, bin)`, refilled per scan and reused. A few KB at 300-2000
         // peaks a scan, task-local, so it is not the per-window buffer that the comment in
         // `accumulate_groups` records as tried and reverted: nothing
@@ -1684,9 +1756,11 @@ impl ProbeTask<'_> {
                 let inten = peak.intensity;
                 let obs_mz = peak.mz;
                 claimants.clear();
+                trace_only.clear();
                 ix.probe_binned(q_mz, bin, |cid, _pmz, pint, frag| {
                     let c = cid as usize;
-                    if !guard.admits(c, rt, pim) {
+                    let inside = guard.admits(c, rt, pim);
+                    if !inside && !guard.pads(c, rt, pim) {
                         return;
                     }
                     // The allowlist is applied here, before the claim, exactly where the
@@ -1697,8 +1771,23 @@ impl ProbeTask<'_> {
                             return;
                         }
                     }
-                    claimants.push((cid, frag, pint));
+                    if inside {
+                        claimants.push((cid, frag, pint));
+                    } else {
+                        trace_only.push((cid, frag));
+                    }
                 });
+                // Peaks in a trace pad only: full intensity, no claim.
+                for &(cid, frag) in &trace_only {
+                    flat_cid.push(cid);
+                    flat_hit.push(Hit {
+                        scan: hs,
+                        frag,
+                        inten,
+                        obs_mz,
+                        im: him,
+                    });
+                }
                 if claimants.is_empty() {
                     continue;
                 }
@@ -2667,9 +2756,19 @@ pub fn psms_schema(path: &str) -> Result<(&'static str, u32)> {
 /// The apex 1/K0 of every row of a `psms_extracted` table that has one, keyed by
 /// `(candidate_id, peak_rank)`: the key a scored row's `(candidate_id, selected_peak_rank)`
 /// finds its extracted row by. An ordered map, so any walk over it is deterministic. Empty
-/// for a table without `apex_im` values (v2, every 3D run). The shadow demotion's 1/K0 term
-/// reads it, and the second pass's consensus 1/K0 is meant to.
+/// for a table without the 1/K0 evidence (v2, every 3D run). The shadow demotion's 1/K0 term
+/// reads it, and the second pass's consensus 1/K0 reads its filtered form
+/// ([`apex_im_where`]).
 pub(crate) fn apex_im_by_peak(path: &str) -> Result<BTreeMap<(u32, i32), f64>> {
+    apex_im_where(path, |_, _| true)
+}
+
+/// [`apex_im_by_peak`] restricted to the keys `keep` accepts, so a caller that needs a few
+/// rows of a large table holds only those.
+pub(crate) fn apex_im_where(
+    path: &str,
+    keep: impl Fn(u32, i32) -> bool,
+) -> Result<BTreeMap<(u32, i32), f64>> {
     let t = TableFile::open(path)?;
     let mut out = BTreeMap::new();
     if !t.has_column("apex_im") {
@@ -2687,7 +2786,9 @@ pub(crate) fn apex_im_by_peak(path: &str) -> Result<BTreeMap<(u32, i32), f64>> {
     };
     for i in 0..t.nrows {
         if let Some(v) = im[i] {
-            out.insert((cid[i], rank[i]), v);
+            if keep(cid[i], rank[i]) {
+                out.insert((cid[i], rank[i]), v);
+            }
         }
     }
     Ok(out)
@@ -3451,7 +3552,44 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             .map_or(0, |lo| lo.iter().filter(|v| v.is_finite()).count());
         info!(gated_candidates = gated, "extract: 1/K0 gate on");
     }
-    let guard = Guard { win: &win, im_gate };
+    // `ExtractParams::trace_pad` in seconds at this run's cycle time. The two-pass claims
+    // build their elution profiles from the guarded hits, so they take no pad.
+    let trace_pad_s = match p.trace_pad {
+        Some(_) if two_pass => {
+            warn!(
+                "extract: the trace pad is not applied under a two-pass co-elution peak claim; \
+                 the traces cover the RT window only"
+            );
+            0.0
+        }
+        Some(tp) => {
+            let cycle = cycle_time(scans);
+            let v = tp.scans as f64 * cycle + tp.seconds;
+            let v = if v.is_finite() && v > 0.0 { v } else { 0.0 };
+            info!(
+                pad_scans = tp.scans,
+                pad_extra_s = tp.seconds,
+                cycle_s = cycle,
+                pad_s = v,
+                "extract: traces recorded beyond the RT window for quantification"
+            );
+            v
+        }
+        None => 0.0,
+    };
+    // The features stage cuts padded traces back to the window, and reads the window from
+    // `psms_extracted`'s `rt_lo` and `rt_hi`.
+    if trace_pad_s > 0.0 && !p.cfg.emit_rt_window {
+        anyhow::bail!(
+            "extract: a trace pad needs extract.emit_rt_window, which tells the features stage \
+             where each candidate's RT window ends"
+        );
+    }
+    let guard = Guard {
+        win: &win,
+        im_gate,
+        pad: trace_pad_s,
+    };
     // The per-point 1/K0 of the traces is written only on 4D data with a consumer on.
     let chrom_im = has_im && p.chrom_im;
 
@@ -3541,6 +3679,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     let mut stream_groups: Option<Vec<WinGroup>> = None;
     // Reused per-peak buffer of (candidate_id, local_frag_index, predicted_intensity).
     let mut claimants: Vec<(u32, u16, f32)> = Vec::new();
+    // The same peak's candidates in a trace pad only (`Guard::pads`): empty without a pad.
+    let mut trace_only: Vec<(u32, u16)> = Vec::new();
     // Per-candidate contested-peak stats under the co-elution arbitration, for the
     // non-destructive soft competition features. Populated only on the two-pass path.
     let mut contested: HashMap<u32, Contested> = HashMap::new();
@@ -3584,10 +3724,12 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     // peak, then apportion per the claim strategy. In wide DIA one peak
                     // matches many candidates (~98% of fragments collide).
                     claimants.clear();
+                    trace_only.clear();
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
                             let c = cid as usize;
-                            if !guard.admits(c, rt, pim) {
+                            let inside = guard.admits(c, rt, pim);
+                            if !inside && !guard.pads(c, rt, pim) {
                                 return;
                             }
                             if let Some(s) = &restrict {
@@ -3595,9 +3737,23 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                                     return;
                                 }
                             }
-                            claimants.push((cid, frag, pi));
+                            if inside {
+                                claimants.push((cid, frag, pi));
+                            } else {
+                                trace_only.push((cid, frag));
+                            }
                         };
                         pr.probe(None, q_mz, lo, hi, &mut push);
+                    }
+                    // Peaks in a trace pad only: full intensity, no claim.
+                    for &(cid, frag) in &trace_only {
+                        acc.entry(cid).or_default().push(Hit {
+                            scan: hs,
+                            frag,
+                            inten,
+                            obs_mz,
+                            im: him,
+                        });
                     }
                     if claimants.is_empty() {
                         continue;
@@ -3798,7 +3954,148 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         HashMap::new()
     };
 
+    // The scan groups of one candidate's hits, projected onto the covering windows' scan grid
+    // within `[lo, hi]` when there is a grid: `(groups, their per-point 1/K0, grid, width)`.
+    // Called once on the hits inside the candidate's RT window, which every score reads, and
+    // under a trace pad once more on all its hits over the padded range, which only the
+    // chromatogram traces read.
+    let scan_groups =
+        |cid: u32, hits: &mut [Hit], lo: f64, hi: f64| -> (ScanGroups, Vec<u16>, Vec<f64>, usize) {
+            // Group hits into scan groups by RT (dedupe same fragment in a scan by max).
+            // Probing walks a window's scans in ascending index, so the hits of a candidate are
+            // already rt-ascending in the ordinary case; the sort then allocates scratch as large
+            // as the vector itself for nothing. Equal-rt hits collapse to `max` per (rt, frag)
+            // below either way, so skipping a sort that would not move anything is exact.
+            if !hits
+                .windows(2)
+                .all(|w| hit_rt(scans, &w[0]) <= hit_rt(scans, &w[1]))
+            {
+                hits.sort_by(|a, b| hit_rt(scans, a).total_cmp(&hit_rt(scans, b)));
+            }
+            // Scan groups, dense (`ScanGroups`): per group its RT and each fragment's max
+            // observed intensity. The per-group fragment order is the ordinal order, as the
+            // `BTreeMap` per group this replaces fixed it, so the f32 apex sum is
+            // deterministic and unchanged.
+            let width = hits.iter().map(|h| h.frag as usize + 1).max().unwrap_or(0);
+            let mut groups = ScanGroups::new(width);
+            // With the per-point 1/K0 written: the 1/K0 (`Hit::im`, x 1e4) of the hit each
+            // (scan group, fragment) intensity came from, `groups x width`, laid out as the group
+            // values and moved with them, 0 where no hit set it. Empty otherwise, and nothing
+            // below touches it.
+            let mut group_im: Vec<u16> = Vec::new();
+            for h in hits.iter() {
+                let h_rt = hit_rt(scans, h);
+                match groups.rt.last() {
+                    Some(&rt) if (rt - h_rt).abs() < 1e-9 => {
+                        let i = groups.len() - 1;
+                        // The 1/K0 follows the kept intensity: it is replaced exactly when
+                        // `merge_max` replaces the value, which for a fragment first seen in this
+                        // group means against 0.0.
+                        if chrom_im && h.inten > groups.or_zero(i, h.frag) {
+                            group_im[i * width + h.frag as usize] = h.im;
+                        }
+                        groups.merge_max(i, h.frag, h.inten);
+                    }
+                    _ => {
+                        groups.push_group(h_rt);
+                        let i = groups.len() - 1;
+                        groups.insert(i, h.frag, h.inten);
+                        if chrom_im {
+                            group_im.resize(group_im.len() + width, 0);
+                            group_im[i * width + h.frag as usize] = h.im;
+                        }
+                    }
+                }
+            }
+
+            // Acquisition scan grid: the covering isolation-window scans within the
+            // RT window. Project the sparse hit-groups onto it so apex counting and
+            // the co-elution run see MISSING acquisition scans (count 0, and they
+            // break a run) rather than only scans that happened to carry a hit. When
+            // no covering-window grid is available, fall back to the sparse groups.
+            let grid: Vec<f64> = if !windows.is_empty() {
+                let pm = lib.prec_mz[cid as usize];
+                // `windows` is sorted by lower m/z, so a covering window has
+                // `lower_mz <= pm` AND, since its width is at most `window_max_width`,
+                // `lower_mz >= pm - window_max_width`. Binary-search that span instead of
+                // scanning all ~150 windows per candidate; the membership test inside the
+                // span is unchanged, so the same windows contribute in the same order.
+                let s = windows.partition_point(|w| w.0 < pm - window_max_width);
+                let e = windows.partition_point(|w| w.0 <= pm);
+                let mut g: Vec<f64> = Vec::new();
+                let mut covering = 0usize;
+                for (wl, wu, rts) in &windows[s..e] {
+                    if *wl <= pm && pm <= *wu {
+                        let a = rts.partition_point(|&r| r < lo);
+                        let b = rts.partition_point(|&r| r <= hi);
+                        g.extend_from_slice(&rts[a..b]);
+                        covering += 1;
+                    }
+                }
+                // One covering window contributes one already-ascending slice of its own
+                // sorted scan RTs, which is the overwhelmingly common case; only an overlap
+                // of two windows needs the merge sorting.
+                if covering > 1 {
+                    g.sort_by(|a, b| a.total_cmp(b));
+                }
+                g.dedup();
+                g
+            } else {
+                Vec::new()
+            };
+            if !grid.is_empty() {
+                let mut aligned = ScanGroups::empty_on(&grid, width);
+                // The 1/K0 moves with its group, a whole row at a time.
+                let mut aligned_im: Vec<u16> = if chrom_im {
+                    vec![0; grid.len() * width]
+                } else {
+                    Vec::new()
+                };
+                // Both sides are ascending (`grid` is sorted and deduplicated; the scan groups
+                // were built from rt-sorted hits), so this is a merge rather than a per-
+                // candidate `HashMap` of the grid. The match is still on the exact bit
+                // pattern, so a group whose RT is not a grid RT is dropped exactly as before.
+                let mut j = 0usize;
+                for i in 0..groups.len() {
+                    let rt = groups.rt(i);
+                    while j < grid.len() && grid[j] < rt {
+                        j += 1;
+                    }
+                    if j < grid.len() && grid[j].to_bits() == rt.to_bits() {
+                        aligned.copy_group(j, &groups, i);
+                        if chrom_im {
+                            aligned_im[j * width..(j + 1) * width]
+                                .copy_from_slice(&group_im[i * width..(i + 1) * width]);
+                        }
+                        j += 1;
+                    }
+                }
+                groups = aligned;
+                group_im = aligned_im;
+            }
+            (groups, group_im, grid, width)
+        };
+
     let per_candidate = |cid: u32, hits: &mut [Hit]| -> Vec<CandOut> {
+        // Under a trace pad the candidate's hits reach `trace_pad_s` beyond its window. Every
+        // score below reads only the hits inside the window, which are exactly the hits the
+        // unpadded extraction collects (the pad admits no peak to a claim, `Guard::pads`);
+        // all of them are kept for the chromatogram traces.
+        let (lo_c, hi_c) = (rt_lo[cid as usize], rt_hi[cid as usize]);
+        let mut inner: Vec<Hit>;
+        let (hits, padded_hits): (&mut [Hit], Option<&mut [Hit]>) = if trace_pad_s > 0.0 {
+            inner = hits
+                .iter()
+                .filter(|h| {
+                    let t = hit_rt(scans, h);
+                    !(t < lo_c || t > hi_c)
+                })
+                .copied()
+                .collect();
+            (&mut inner[..], Some(hits))
+        } else {
+            (hits, None)
+        };
         // distinct matched fragments (tier b), as a bitmask over the candidate's local
         // fragment ordinals rather than a sorted, deduplicated `u16` per hit.
         let mut distinct = FragSet::default();
@@ -3810,121 +4107,9 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             return Vec::new();
         }
 
-        // Group hits into scan groups by RT (dedupe same fragment in a scan by max).
-        // Probing walks a window's scans in ascending index, so the hits of a candidate are
-        // already rt-ascending in the ordinary case; the sort then allocates scratch as large
-        // as the vector itself for nothing. Equal-rt hits collapse to `max` per (rt, frag)
-        // below either way, so skipping a sort that would not move anything is exact.
-        if !hits
-            .windows(2)
-            .all(|w| hit_rt(scans, &w[0]) <= hit_rt(scans, &w[1]))
-        {
-            hits.sort_by(|a, b| hit_rt(scans, a).total_cmp(&hit_rt(scans, b)));
-        }
-        // Scan groups, dense (`ScanGroups`): per group its RT and each fragment's max
-        // observed intensity. The per-group fragment order is the ordinal order, as the
-        // `BTreeMap` per group this replaces fixed it, so the f32 apex sum is
-        // deterministic and unchanged.
-        let width = hits.iter().map(|h| h.frag as usize + 1).max().unwrap_or(0);
-        let mut groups = ScanGroups::new(width);
-        // With the per-point 1/K0 written: the 1/K0 (`Hit::im`, x 1e4) of the hit each
-        // (scan group, fragment) intensity came from, `groups x width`, laid out as the group
-        // values and moved with them, 0 where no hit set it. Empty otherwise, and nothing
-        // below touches it.
-        let mut group_im: Vec<u16> = Vec::new();
-        for h in hits.iter() {
-            let h_rt = hit_rt(scans, h);
-            match groups.rt.last() {
-                Some(&rt) if (rt - h_rt).abs() < 1e-9 => {
-                    let i = groups.len() - 1;
-                    // The 1/K0 follows the kept intensity: it is replaced exactly when
-                    // `merge_max` replaces the value, which for a fragment first seen in this
-                    // group means against 0.0.
-                    if chrom_im && h.inten > groups.or_zero(i, h.frag) {
-                        group_im[i * width + h.frag as usize] = h.im;
-                    }
-                    groups.merge_max(i, h.frag, h.inten);
-                }
-                _ => {
-                    groups.push_group(h_rt);
-                    let i = groups.len() - 1;
-                    groups.insert(i, h.frag, h.inten);
-                    if chrom_im {
-                        group_im.resize(group_im.len() + width, 0);
-                        group_im[i * width + h.frag as usize] = h.im;
-                    }
-                }
-            }
-        }
+        let (groups, group_im, grid, width) = scan_groups(cid, hits, lo_c, hi_c);
 
         let (fmzs0, fints0, _) = lib.cand_frags(cid);
-
-        // Acquisition scan grid: the covering isolation-window scans within the
-        // RT window. Project the sparse hit-groups onto it so apex counting and
-        // the co-elution run see MISSING acquisition scans (count 0, and they
-        // break a run) rather than only scans that happened to carry a hit. When
-        // no covering-window grid is available, fall back to the sparse groups.
-        let grid: Vec<f64> = if !windows.is_empty() {
-            let pm = lib.prec_mz[cid as usize];
-            let (lo, hi) = (rt_lo[cid as usize], rt_hi[cid as usize]);
-            // `windows` is sorted by lower m/z, so a covering window has
-            // `lower_mz <= pm` AND, since its width is at most `window_max_width`,
-            // `lower_mz >= pm - window_max_width`. Binary-search that span instead of
-            // scanning all ~150 windows per candidate; the membership test inside the
-            // span is unchanged, so the same windows contribute in the same order.
-            let s = windows.partition_point(|w| w.0 < pm - window_max_width);
-            let e = windows.partition_point(|w| w.0 <= pm);
-            let mut g: Vec<f64> = Vec::new();
-            let mut covering = 0usize;
-            for (wl, wu, rts) in &windows[s..e] {
-                if *wl <= pm && pm <= *wu {
-                    let a = rts.partition_point(|&r| r < lo);
-                    let b = rts.partition_point(|&r| r <= hi);
-                    g.extend_from_slice(&rts[a..b]);
-                    covering += 1;
-                }
-            }
-            // One covering window contributes one already-ascending slice of its own
-            // sorted scan RTs, which is the overwhelmingly common case; only an overlap
-            // of two windows needs the merge sorting.
-            if covering > 1 {
-                g.sort_by(|a, b| a.total_cmp(b));
-            }
-            g.dedup();
-            g
-        } else {
-            Vec::new()
-        };
-        if !grid.is_empty() {
-            let mut aligned = ScanGroups::empty_on(&grid, width);
-            // The 1/K0 moves with its group, a whole row at a time.
-            let mut aligned_im: Vec<u16> = if chrom_im {
-                vec![0; grid.len() * width]
-            } else {
-                Vec::new()
-            };
-            // Both sides are ascending (`grid` is sorted and deduplicated; the scan groups
-            // were built from rt-sorted hits), so this is a merge rather than a per-
-            // candidate `HashMap` of the grid. The match is still on the exact bit
-            // pattern, so a group whose RT is not a grid RT is dropped exactly as before.
-            let mut j = 0usize;
-            for i in 0..groups.len() {
-                let rt = groups.rt(i);
-                while j < grid.len() && grid[j] < rt {
-                    j += 1;
-                }
-                if j < grid.len() && grid[j].to_bits() == rt.to_bits() {
-                    aligned.copy_group(j, &groups, i);
-                    if chrom_im {
-                        aligned_im[j * width..(j + 1) * width]
-                            .copy_from_slice(&group_im[i * width..(i + 1) * width]);
-                    }
-                    j += 1;
-                }
-            }
-            groups = aligned;
-            group_im = aligned_im;
-        }
 
         // Apex: the scan group with the most distinct matched fragments, allowing
         // scans within `apex_count_tol` of that maximum (so a slightly-lower-count
@@ -4337,6 +4522,16 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         }
 
         let mut chrom_rows: Vec<ChromOutputRow> = Vec::new();
+        // The traces: from every hit over the padded range under a trace pad, otherwise the
+        // groups every score read. Which fragments carry a trace is decided inside the window
+        // either way (`observed` below), so a fragment seen only in the pad keeps the empty
+        // trace of a never-observed one.
+        let padded =
+            padded_hits.map(|h| scan_groups(cid, h, lo_c - trace_pad_s, hi_c + trace_pad_s));
+        let (t_groups, t_group_im, t_grid, t_width) = match &padded {
+            Some((g, gi, gr, w)) => (g, &gi[..], &gr[..], *w),
+            None => (&groups, &group_im[..], &grid[..], width),
+        };
 
         // Emit chromatograms. When emit_window_grid is set, each fragment is sampled
         // on the full isolation-window scan grid (all scans of the covering window(s)
@@ -4356,7 +4551,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 observed.insert(f);
             }
         }
-        let grid_rt: Vec<f32> = grid.iter().map(|&r| r as f32).collect();
+        let grid_rt: Vec<f32> = t_grid.iter().map(|&r| r as f32).collect();
         // Emit a row for EVERY predicted transition so the feature families see the
         // full predicted set (a missing strong ion is penalized). An OBSERVED
         // fragment carries its grid-sampled (or sorted) trace; a NEVER-OBSERVED one
@@ -4373,10 +4568,12 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             let obs_mz = if sw > 0.0 { sm / sw } else { fmzs[fi] as f64 };
             let (rts, ints): (Vec<f32>, Vec<f32>) = if !observed.contains(frag) {
                 (Vec::new(), Vec::new()) // absent predicted transition
-            } else if !grid.is_empty() {
+            } else if !t_grid.is_empty() {
                 (
                     grid_rt.clone(),
-                    (0..groups.len()).map(|i| groups.or_zero(i, frag)).collect(),
+                    (0..t_groups.len())
+                        .map(|i| t_groups.or_zero(i, frag))
+                        .collect(),
                 )
             } else {
                 // Sparse mode: the groups are already ascending in RT, so the trace is
@@ -4384,9 +4581,9 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 // vector held before its (already-sorted) stable sort.
                 let mut rts: Vec<f32> = Vec::new();
                 let mut ints: Vec<f32> = Vec::new();
-                for i in 0..groups.len() {
-                    if let Some(v) = groups.get(i, frag) {
-                        rts.push(groups.rt(i) as f32);
+                for i in 0..t_groups.len() {
+                    if let Some(v) = t_groups.get(i, frag) {
+                        rts.push(t_groups.rt(i) as f32);
                         ints.push(v);
                     }
                 }
@@ -4404,16 +4601,16 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     if v.to_bits() == 0 {
                         0.0
                     } else {
-                        group_im[gi * width + fi] as f32 * 1e-4
+                        t_group_im[gi * t_width + fi] as f32 * 1e-4
                     }
                 };
-                if !grid.is_empty() {
-                    (0..groups.len())
-                        .map(|gi| im_of(gi, groups.or_zero(gi, frag)))
+                if !t_grid.is_empty() {
+                    (0..t_groups.len())
+                        .map(|gi| im_of(gi, t_groups.or_zero(gi, frag)))
                         .collect()
                 } else {
-                    (0..groups.len())
-                        .filter_map(|gi| groups.get(gi, frag).map(|v| im_of(gi, v)))
+                    (0..t_groups.len())
+                        .filter_map(|gi| t_groups.get(gi, frag).map(|v| im_of(gi, v)))
                         .collect()
                 }
             };
@@ -4436,13 +4633,13 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // fragments, so the features stage can correlate the MS1 precursor
         // envelope against the MS2 fragments over the elution peak (DIA-NN
         // Ms1.Profile.Corr class). Grid mode only; nearest MS1 scan per grid RT.
-        if !ms1_scans.is_empty() && !grid.is_empty() {
+        if !ms1_scans.is_empty() && !t_grid.is_empty() {
             let sp = ISOTOPE_SPACING / c.charge as f64;
             let tol = p.cfg.prec_tol_ppm;
             let shift = 1.0 + p.cfg.ms1_ppm_offset * 1e-6;
             for (nm, dmz) in [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)] {
                 let mz = (c.precursor_mz + dmz) * shift;
-                let ints: Vec<f32> = grid
+                let ints: Vec<f32> = t_grid
                     .iter()
                     .map(|&r| {
                         let j = nearest_index(&ms1_rts, r);
@@ -5089,6 +5286,17 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 obj.insert("im_gate".into(), json!(im_gate));
             }
         }
+        // The traces reach this far beyond each candidate's RT window
+        // (`ExtractParams::trace_pad`); the features stage reads it from the chromatograms'
+        // report and cuts every trace back to the window. Absent without a pad.
+        if trace_pad_s > 0.0 {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert(
+                    crate::chromatograms::TRACE_PAD_PARAM.into(),
+                    json!(trace_pad_s),
+                );
+            }
+        }
         let report = ArtifactReport {
             logical_name: schema.0.to_string(),
             schema_name: schema.0.to_string(),
@@ -5660,7 +5868,11 @@ mod accumulate_tests {
                 .unwrap();
             let mut acc = HitAcc::default();
             let mut chunk = HitStore::default();
-            let guard = Guard { win: &win, im_gate };
+            let guard = Guard {
+                win: &win,
+                im_gate,
+                pad: 0.0,
+            };
             pool.install(|| {
                 // `bound = 0` flushes nothing, so the comparison is over the accumulator.
                 let mut sink = |_: Vec<(u32, &mut [Hit])>| -> bool { true };
@@ -5772,6 +5984,7 @@ mod accumulate_tests {
         let guard = Guard {
             win: &win,
             im_gate: false,
+            pad: 0.0,
         };
         let mass_off = MassOffset {
             scalar_ppm: 0.0,

@@ -1281,6 +1281,16 @@ pub struct RtImTrainConfig {
     /// from pulling the curve (single-cell runs: residuals of +14 to +82 s moved the
     /// calibration 2-3 s across the mid-gradient).
     pub loess_robust_iters: usize,
+    /// Drop the anchors whose predicted iRT lies outside `[Q1 - 3 IQR, Q3 + 3 IQR]` of the
+    /// anchors' predicted iRT before anything is fitted to them: the linear and LOESS fits,
+    /// the window sizing (in-sample, held-out and local) and the composition correction all
+    /// see the same filtered anchors. A few anchors with an absurd predicted iRT stretch the
+    /// LOESS grid over the whole x range, so the gradient falls into one or two grid cells;
+    /// `loess_robust_iters` reweights residuals and does not stop that. `cal.json` records
+    /// `n_rt_outliers_removed` when anchors were removed. Default false: every anchor is
+    /// fitted, as before. Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub anchor_x_filter: bool,
     /// Correct each candidate's calibrated RT for the composition-dependent residual that
     /// the predicted RT leaves (a per-run Huber regression of the anchors' residuals on
     /// charge 3, charge >= 4, length, internal K/R, His and Met-ox): on the single-cell
@@ -1645,6 +1655,7 @@ impl Default for RtImTrainConfig {
             anchor_q_ladder: vec![0.02, 0.05],
             loess_span: 0.3,
             loess_robust_iters: 0,
+            anchor_x_filter: false,
             composition_correction: true,
             fallback_rt_window_s: 120.0,
             finetune_deeplc: false,
@@ -3779,6 +3790,18 @@ impl Config {
                  The default second_pass searches every run again instead (docs/12)."
             );
         }
+        // The second pass's library is cut at `q_anchor`, and that cut is also the report's:
+        // with entrapment, 113-114 of 125 reportable false library entries came back in the
+        // second pass (docs/12, "Second pass").
+        if self.mbr.strategy == MbrStrategy::SecondPass && self.mbr.q_anchor > 0.01 {
+            tracing::warn!(
+                q_anchor = self.mbr.q_anchor,
+                "mbr.q_anchor above 0.01 under mbr.strategy = second_pass: the empirical library \
+                 is cut at q_anchor, and nearly every false entry it admits is reported again by \
+                 the second pass, so this cut sets the reported FDR rather than the 1% cut of \
+                 the final rescore (docs/12, \"Second pass\")"
+            );
+        }
         if self.quant.fixed_window_s > 0.0 && self.quant.fixed_scan_halfwidth > 0 {
             tracing::warn!(
                 fixed_window_s = self.quant.fixed_window_s,
@@ -5038,6 +5061,20 @@ mod tests {
         ] {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }
+    }
+
+    /// `rt_im_train.anchor_x_filter` is omitted from the canonical configuration at its
+    /// default, so the config hash of every configuration that does not set it is unchanged.
+    #[test]
+    fn the_anchor_x_filter_leaves_the_default_config_hash_alone() {
+        let d = Config::default();
+        assert!(!d.rt_im_train.anchor_x_filter);
+        let canon = d.canonical_json();
+        assert!(!canon.contains("anchor_x_filter"), "{canon}");
+        let explicit = Config::from_json(r#"{"rt_im_train":{"anchor_x_filter":false}}"#).unwrap();
+        assert_eq!(explicit.canonical_json(), canon);
+        let on = Config::from_json(r#"{"rt_im_train":{"anchor_x_filter":true}}"#).unwrap();
+        assert!(on.canonical_json().contains(r#""anchor_x_filter":true"#));
     }
 
     /// The `retrace` section is omitted from the canonical configuration while every key is

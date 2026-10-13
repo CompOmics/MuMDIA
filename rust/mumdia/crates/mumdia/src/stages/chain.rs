@@ -38,6 +38,20 @@ pub struct ChainParams<'a> {
     /// only collects anchors and would pay retrace's 100-150 s and 36-39 GB per HYE run for
     /// nothing it uses.
     pub retrace: bool,
+    /// What only the second pass of match-between-runs sets; `Default` everywhere else.
+    pub extras: PassExtras<'a>,
+}
+
+/// The settings the second pass of match-between-runs gives a run's chain, on a run with ion
+/// mobility (`run_experiment::search_second_pass`). The default, which every other caller
+/// passes, changes nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PassExtras<'a> {
+    /// The 1/K0 window floor the caller wrote into `cfg.rt_im_train.im_window_min`, recorded
+    /// in `cal.json`.
+    pub im_window_floor: Option<rt_im_train::ImWindowFloor<'a>>,
+    /// Traces recorded beyond the RT window for quantification.
+    pub trace_pad: Option<extract::TracePad>,
 }
 
 /// The chain's outputs, by path.
@@ -69,6 +83,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         lent_ms2,
         mut manifest,
         retrace: retrace_allowed,
+        extras,
     } = p;
     let d = |name: &str| format!("{out_dir}/{name}");
 
@@ -92,6 +107,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         out_cal: &d("cal.json"),
         cfg: &rt_cfg,
         config_hash: ch,
+        im_window_floor: extras.im_window_floor,
     })?;
     keep(
         &mut manifest,
@@ -166,6 +182,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
                 .features
                 .im_features
                 .on(crate::instrument::spectra_has_im(&co.ms2)),
+        trace_pad: extras.trace_pad,
     })?;
     drop(lent_ms2);
     // The rebuilt chromatograms and the patched psms_extracted, when retrace runs; the

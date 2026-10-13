@@ -205,6 +205,7 @@ fn run_extract(prec: &str, frag: &str, ms2: &str, win: &str, tag: &str) -> (Stri
         precursor_span: None,
         fragment_offset: None,
         rt_windows: None,
+        trace_pad: None,
         chrom_im: false,
         sibling_bands: 1,
         scans: None,
@@ -397,6 +398,7 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         fragment_offset: None,
         sibling_bands: 1,
         rt_windows: None,
+        trace_pad: None,
         chrom_im: false,
         scans: None,
         ms2: &ms2,
@@ -554,6 +556,7 @@ fn chromatograms_v2_leave_every_downstream_table_byte_identical() {
             precursor_span: None,
             fragment_offset: None,
             rt_windows: None,
+            trace_pad: None,
             chrom_im: false,
             sibling_bands: 1,
             scans: None,
@@ -942,6 +945,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
             precursor_span: None,
             fragment_offset: None,
             rt_windows: None,
+            trace_pad: None,
             chrom_im: false,
             sibling_bands: 1,
             scans: shared,
@@ -1029,6 +1033,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         precursor_span: None,
         fragment_offset: None,
         rt_windows: None,
+        trace_pad: None,
         chrom_im: false,
         sibling_bands: 1,
         scans: None,
@@ -1059,6 +1064,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         precursor_span: None,
         fragment_offset: None,
         rt_windows: None,
+        trace_pad: None,
         chrom_im: false,
         sibling_bands: 1,
         scans: None,
@@ -1105,6 +1111,7 @@ fn extract_does_not_believe_an_empty_lent_ms1_over_a_named_one() {
             precursor_span: None,
             fragment_offset: None,
             rt_windows: None,
+            trace_pad: None,
             chrom_im: false,
             sibling_bands: 1,
             scans: shared,
@@ -1496,6 +1503,7 @@ fn extract_im(
         fragment_offset: None,
         rt_windows: None,
         chrom_im,
+        trace_pad: None,
         sibling_bands: 1,
         scans: None,
         ms2,
@@ -2141,6 +2149,7 @@ fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
             precursor_span: None,
             fragment_offset: None,
             rt_windows: None,
+            trace_pad: None,
             chrom_im: false,
             sibling_bands: 1,
             scans: shared,
@@ -2202,6 +2211,7 @@ fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
         precursor_span: None,
         fragment_offset: None,
         rt_windows: None,
+        trace_pad: None,
         chrom_im: false,
         sibling_bands: 1,
         scans: Some(stages::extract::SharedScans {
@@ -2405,6 +2415,7 @@ fn extract_takes_the_handed_rt_windows_only_when_they_are_its_own() {
             out_cal: &format!("{windows}.cal.json"),
             cfg: &cfg.rt_im_train,
             config_hash: "test",
+            im_window_floor: None,
             anchor_irt_from_seed: false,
         })
         .unwrap();
@@ -2420,6 +2431,7 @@ fn extract_takes_the_handed_rt_windows_only_when_they_are_its_own() {
             precursor_span: None,
             fragment_offset: None,
             rt_windows,
+            trace_pad: None,
             chrom_im: false,
             sibling_bands: 1,
             scans: None,
@@ -2572,6 +2584,7 @@ fn the_chain_without_retrace_is_byte_identical_and_refuses_retrace_on_3d_input()
             lent_ms2: None,
             manifest: None,
             retrace: allow,
+            extras: Default::default(),
         });
         (dir, out)
     };
@@ -2624,4 +2637,188 @@ fn the_chain_without_retrace_is_byte_identical_and_refuses_retrace_on_3d_input()
     let (d3, o3) = chain(&on, false, "bootstrap");
     o3.unwrap();
     assert_eq!(bytes(&d3), want, "the bootstrap pass retraced");
+}
+
+/// Under a trace pad (`extract::TracePad`, the second pass's quantification coverage on 4D
+/// data) extract records each candidate's traces beyond its RT window, and nothing else
+/// moves: `psms_extracted` (apex, gate, evidence) is the same file, and the features read
+/// from the padded chromatograms are the features of the unpadded ones, because the stage
+/// cuts every trace back to the window it finds in the table's report and the rows' rt_lo /
+/// rt_hi. Only the traces reach further, which is what quantification reads.
+#[test]
+fn a_trace_pad_widens_the_traces_and_nothing_the_scores_read() {
+    let (prec, frag) = craft_library();
+    let ms2 = craft_ms2();
+    // The window holds the scans at 110, 120 and 130 s of the 100-140 s run.
+    let win = tmp("windows_pad.parquet");
+    write_table(
+        &win,
+        vec![
+            Col::U32("candidate_id".into(), vec![0, 1]),
+            Col::F64("rt_pred_cal".into(), vec![120.0, 120.0]),
+            Col::F64("rt_lo".into(), vec![105.0, 105.0]),
+            Col::F64("rt_hi".into(), vec![135.0, 135.0]),
+            Col::OptF64("im_pred_cal".into(), vec![None, None]),
+            Col::OptF64("im_lo".into(), vec![None, None]),
+            Col::OptF64("im_hi".into(), vec![None, None]),
+        ],
+    )
+    .unwrap();
+    let mut cfg = Config::default();
+    cfg.extract.apex_count_window = 1;
+    cfg.extract.presence_min_coelution = 1;
+    cfg.extract.min_coelution_run = 1;
+    let extract = |tag: &str, pad: Option<stages::extract::TracePad>| {
+        let psms = tmp(&format!("psms_pad_{tag}.parquet"));
+        let chrom = tmp(&format!("chrom_pad_{tag}.parquet"));
+        stages::extract::run(stages::extract::ExtractParams {
+            precursor_span: None,
+            fragment_offset: None,
+            rt_windows: None,
+            trace_pad: pad,
+            chrom_im: false,
+            sibling_bands: 1,
+            scans: None,
+            ms2: &ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            run_windows: &win,
+            ms1: None,
+            mass_cal: None,
+            out_psms: &psms,
+            out_chrom: &chrom,
+            restrict_candidates: None,
+            cfg: &cfg.extract,
+            config_hash: "test",
+        })
+        .unwrap();
+        (psms, chrom)
+    };
+    let (psms0, chrom0) = extract("off", None);
+    let (psms1, chrom1) = extract(
+        "on",
+        Some(stages::extract::TracePad {
+            scans: 1,
+            seconds: 0.0,
+        }),
+    );
+    assert!(
+        Table::read(&psms0).unwrap().nrows >= 1,
+        "the target is extracted"
+    );
+    assert_eq!(
+        std::fs::read(&psms0).unwrap(),
+        std::fs::read(&psms1).unwrap(),
+        "psms_extracted must not move under a trace pad"
+    );
+    // One scan at the 10 s cycle on each side: the traces reach 100 and 140 s.
+    let axis = |chrom: &str| -> Vec<f32> {
+        let mut v: Vec<f32> = Vec::new();
+        mumdia::chromatograms::for_each_row(&TableFile::open(chrom).unwrap(), |r| {
+            if !r.intensity.is_empty() && v.is_empty() {
+                v = r.rt.to_vec();
+            }
+            Ok(())
+        })
+        .unwrap();
+        v
+    };
+    assert_eq!(axis(&chrom0), vec![110.0, 120.0, 130.0]);
+    assert_eq!(axis(&chrom1), vec![100.0, 110.0, 120.0, 130.0, 140.0]);
+    let report = |p: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(format!("{p}.report.json")).unwrap()).unwrap()
+    };
+    assert_eq!(report(&chrom1)["params"]["trace_pad_s"], 10.0);
+    assert!(report(&chrom0)["params"].get("trace_pad_s").is_none());
+    // The features are the unpadded ones, value for value and byte for byte.
+    let features = |psms: &str, chrom: &str, tag: &str| {
+        let out = tmp(&format!("features_pad_{tag}.parquet"));
+        stages::features::run(stages::features::FeaturesParams {
+            psms,
+            chromatograms: chrom,
+            seed: None,
+            out: &out,
+            out_pin: "",
+            cfg: &cfg.features,
+            config_hash: "test",
+            imc_ref_w: false,
+        })
+        .unwrap();
+        std::fs::read(&out).unwrap()
+    };
+    assert_eq!(
+        features(&psms0, &chrom0, "off"),
+        features(&psms1, &chrom1, "on"),
+        "the features read padded traces cut back to the window"
+    );
+    // The cut is load-bearing: the same padded table without its report is read whole, and
+    // its features differ.
+    let bare = tmp("chrom_pad_bare.parquet");
+    std::fs::copy(&chrom1, &bare).unwrap();
+    assert_ne!(
+        features(&psms0, &chrom0, "off2"),
+        features(&psms1, &bare, "bare")
+    );
+    // A pad without the window columns is refused rather than read unclipped.
+    let mut no_window = cfg.clone();
+    no_window.extract.emit_rt_window = false;
+    let err = stages::extract::run(stages::extract::ExtractParams {
+        precursor_span: None,
+        fragment_offset: None,
+        rt_windows: None,
+        trace_pad: Some(stages::extract::TracePad {
+            scans: 1,
+            seconds: 0.0,
+        }),
+        chrom_im: false,
+        sibling_bands: 1,
+        scans: None,
+        ms2: &ms2,
+        library_precursors: &prec,
+        library_fragments: &frag,
+        run_windows: &win,
+        ms1: None,
+        mass_cal: None,
+        out_psms: &tmp("psms_pad_nowin.parquet"),
+        out_chrom: &tmp("chrom_pad_nowin.parquet"),
+        restrict_candidates: None,
+        cfg: &no_window.extract,
+        config_hash: "test",
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("emit_rt_window"), "{err}");
+}
+
+/// The pad quantification needs: the fixed integration half-width (seconds when set, else
+/// scans) plus the baseline flanks when baseline subtraction is on; nothing for the walked
+/// window.
+#[test]
+fn the_trace_pad_follows_the_quant_integration_window() {
+    use stages::extract::TracePad;
+    let mut q = mumdia_core::config::QuantConfig::default();
+    assert_eq!(
+        TracePad::for_quant(&q),
+        Some(TracePad {
+            scans: 3,
+            seconds: 0.0
+        })
+    );
+    q.baseline_subtract = true;
+    assert_eq!(
+        TracePad::for_quant(&q).unwrap().scans,
+        3 + q.baseline_flank_scans
+    );
+    q.fixed_window_s = 4.0;
+    assert_eq!(
+        TracePad::for_quant(&q),
+        Some(TracePad {
+            scans: q.baseline_flank_scans,
+            seconds: 4.0
+        })
+    );
+    q.fixed_window_s = 0.0;
+    q.fixed_scan_halfwidth = 0;
+    q.baseline_subtract = false;
+    assert_eq!(TracePad::for_quant(&q), None);
 }

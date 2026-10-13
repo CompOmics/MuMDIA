@@ -862,6 +862,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                         out_cal: &cal,
                         cfg: &cfg.rt_im_train,
                         config_hash: ch,
+                        im_window_floor: None,
                     },
                 )?,
                 // Per group: this band's own anchors, iRT joined from its own table.
@@ -873,6 +874,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     out_cal: &cal,
                     cfg: &cfg.rt_im_train,
                     config_hash: ch,
+                    im_window_floor: None,
                     anchor_irt_from_seed: false,
                 })?,
             };
@@ -915,6 +917,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     ms2: &ms2_scans,
                     ms1: Some(&ms1_scans),
                 }),
+                trace_pad: None,
                 chrom_im: cfg
                     .features
                     .im_features

@@ -27,6 +27,32 @@ pub fn linear_fit(xs: &[f64], ys: &[f64]) -> (f64, f64) {
     (slope, intercept)
 }
 
+/// Which anchors lie inside the x-domain fences `[Q1 - 3 IQR, Q3 + 3 IQR]` of `xs`, the
+/// anchors' predicted iRT (`rt_im_train.anchor_x_filter`).
+///
+/// A few anchors with an absurd predicted iRT stretch the LOESS grid, which spans the
+/// smallest to the largest x, until the whole gradient sits in one or two grid cells, and
+/// the curve inside the gradient becomes a straight line between them (a multi-head refit
+/// on 58k anchors produced 11 at |iRT| up to 3.7e5 s and moved the curve by 51 s). Robust
+/// reweighting does not help: it reweights residuals, not the grid's x range
+/// ([`Loess::fit_robust`]). The quartile fences break down only when a quarter of the
+/// anchors on one side are outliers, where fixed percentiles such as p0.5 and p99.5 break
+/// down at 0.5% contamination per side. Fewer than four anchors, a non-finite quartile or
+/// an IQR of zero keep every anchor; a non-finite x is never kept.
+pub fn x_domain_inliers(xs: &[f64]) -> Vec<bool> {
+    let n = xs.len();
+    if n < 4 {
+        return vec![true; n];
+    }
+    let (q1, q3) = (percentile(xs, 0.25), percentile(xs, 0.75));
+    let iqr = q3 - q1;
+    if !(q1.is_finite() && q3.is_finite() && iqr > 0.0) {
+        return vec![true; n];
+    }
+    let (lo, hi) = (q1 - 3.0 * iqr, q3 + 3.0 * iqr);
+    xs.iter().map(|x| (lo..=hi).contains(x)).collect()
+}
+
 /// A LOESS smoother evaluated on a precomputed grid for fast bulk application.
 ///
 /// Outside the training range the smoother continues the local fit at the nearest
@@ -465,5 +491,83 @@ mod tests {
         // zero iterations is the plain fit, bit for bit
         let zero = Loess::fit_robust(&xs, &ys, 0.3, 200, 0);
         assert_eq!(zero.predict(57.3).to_bits(), plain.predict(57.3).to_bits());
+    }
+
+    /// 2000 anchors on a curved 2000-3500 s gradient (a straight line survives any grid)
+    /// and three whose predicted iRT is absurd, as a multi-head refit produced on a HYE
+    /// diaPASEF run.
+    fn extreme_x_fixture() -> (Vec<f64>, Vec<f64>) {
+        let mut xs: Vec<f64> = (0..2000).map(|i| 2000.0 + 0.75 * i as f64).collect();
+        let mut ys: Vec<f64> = xs
+            .iter()
+            .enumerate()
+            .map(|(i, x)| curved(*x) + ((i * 7919) % 11) as f64 - 5.0)
+            .collect();
+        xs.extend([-170_000.0, 375_000.0, 90_000.0]);
+        ys.extend([2500.0, 3400.0, 3000.0]);
+        (xs, ys)
+    }
+
+    fn curved(x: f64) -> f64 {
+        2000.0 + (x - 2000.0).powi(2) / 1500.0
+    }
+
+    #[test]
+    fn the_x_domain_fences_drop_extreme_x_anchors_that_break_the_grid() {
+        let (xs, ys) = extreme_x_fixture();
+        // The plain fit is distorted inside the gradient by the grid stretch.
+        let plain = Loess::fit(&xs, &ys, 0.3, 200);
+        assert!((plain.predict(2750.0) - curved(2750.0)).abs() > 20.0);
+        let keep = x_domain_inliers(&xs);
+        assert_eq!(keep.iter().filter(|k| !**k).count(), 3);
+        assert!(keep[..2000].iter().all(|k| *k));
+        let (kx, ky): (Vec<f64>, Vec<f64>) = xs
+            .iter()
+            .zip(&ys)
+            .zip(&keep)
+            .filter(|(_, k)| **k)
+            .map(|((x, y), _)| (*x, *y))
+            .unzip();
+        // The filtered fit is the fit on the clean anchors, and close to the curve.
+        let filtered = Loess::fit(&kx, &ky, 0.3, 200);
+        let clean = Loess::fit(&xs[..2000], &ys[..2000], 0.3, 200);
+        assert_eq!(
+            filtered.predict(2750.0).to_bits(),
+            clean.predict(2750.0).to_bits()
+        );
+        assert!((filtered.predict(2750.0) - curved(2750.0)).abs() < 15.0);
+        // Clean anchors are all kept.
+        assert!(x_domain_inliers(&xs[..2000]).iter().all(|k| *k));
+        // Degenerate inputs keep everything.
+        assert_eq!(x_domain_inliers(&[1.0, 2.0, 1e9]), vec![true; 3]);
+        assert_eq!(x_domain_inliers(&[5.0; 10]), vec![true; 10]);
+    }
+
+    /// Why the filter is not a robustness iteration: bisquare weights act on residuals, and
+    /// the grid still spans the absurd x, so the same fixture fitted with `fit_robust` stays
+    /// as distorted inside the gradient as the plain fit.
+    #[test]
+    fn bisquare_weights_do_not_stop_the_grid_stretch() {
+        let (xs, ys) = extreme_x_fixture();
+        for iters in [1, 2, 4] {
+            let robust = Loess::fit_robust(&xs, &ys, 0.3, 200, iters);
+            assert!(
+                (robust.predict(2750.0) - curved(2750.0)).abs() > 20.0,
+                "{iters} iterations: {}",
+                robust.predict(2750.0)
+            );
+        }
+    }
+
+    /// 5% of the anchors far out on each side, where p0.5 / p99.5 fences have long broken
+    /// down, is still removed; the quartile fences break down only at a quarter per side.
+    #[test]
+    fn the_quartile_fences_tolerate_contamination_that_breaks_fixed_percentiles() {
+        let mut xs: Vec<f64> = (0..1000).map(|i| i as f64).collect();
+        xs.extend((0..50).map(|i| -1e6 - i as f64));
+        xs.extend((0..50).map(|i| 1e6 + i as f64));
+        let keep = x_domain_inliers(&xs);
+        assert!(keep[..1000].iter().all(|k| *k));
+        assert!(keep[1000..].iter().all(|k| !*k));
     }
 }

@@ -308,6 +308,64 @@ def is_std(pf):
     return not (set(b) - STD)
 
 
+def output_range_bounds(anchor_rt):
+    """The plausible range of a calibrated retention time: [min - span, max + span] of the
+    anchors' observed RT, span = max - min. None without two finite anchors.
+
+    A multi-head calibration predicts on the scale of the run it was fitted to, so a value a
+    whole anchor span beyond the first or last anchor is not a late or early peptide but a
+    failed extrapolation: after a large-anchor refit 1.95% of target and 1.97% of decoy rows
+    of one library came out as far as 3.8e5 s, with the ridge alpha moving erratically with
+    the anchor count. Those values sit in the library and misplace windows directly.
+    """
+    rt = np.asarray([v for v in anchor_rt if v is not None], dtype=np.float64)
+    rt = rt[np.isfinite(rt)]
+    if len(rt) < 2:
+        return None
+    lo, hi = float(rt.min()), float(rt.max())
+    span = hi - lo
+    return lo - span, hi + span
+
+
+def guard_output_range(values, bounds):
+    """`values` (float64 predictions) with every finite value outside `bounds` clamped to it,
+    and a record of what was done.
+
+    Clamped rather than set non-finite: the engine refuses a library whose `predicted_irt`
+    is not finite (`index.rs`), and a non-finite prediction would make `rewrite_irt` keep
+    the imported value, on another scale. When nothing is out of range the array is returned
+    as it came, so the written library is byte-identical to one written without the guard.
+    """
+    n = int(len(values))
+    if bounds is None:
+        return values, {"bounds": None, "n_out_of_range": 0, "fraction": 0.0,
+                        "predicted": n, "action": "none"}
+    lo, hi = bounds
+    finite = np.isfinite(values)
+    out = finite & ((values < lo) | (values > hi))
+    n_out = int(out.sum())
+    record = {"bounds": [lo, hi], "n_out_of_range": n_out,
+              "fraction": (n_out / n) if n else 0.0, "predicted": n,
+              "action": "clamped" if n_out else "none"}
+    if not n_out:
+        return values, record
+    guarded = np.array(values, dtype=np.float64, copy=True)
+    guarded[out] = np.clip(guarded[out], lo, hi)
+    return guarded, record
+
+
+def apply_output_range_guard(values, anchor_rt, label=""):
+    """`guard_output_range` with the bounds of `anchor_rt`, saying on stdout what it did."""
+    guarded, record = guard_output_range(values, output_range_bounds(anchor_rt))
+    if record["n_out_of_range"]:
+        prefix = f"[{label}] " if label else ""
+        print(f"{prefix}WARNING: {record['n_out_of_range']} of {record['predicted']} calibrated "
+              f"predictions ({100.0 * record['fraction']:.3f}%) lay outside "
+              f"[{record['bounds'][0]:.1f}, {record['bounds'][1]:.1f}] s, one anchor span "
+              f"beyond the anchors, and were clamped to it", flush=True)
+    return guarded, record
+
+
 def agg(a):
     a = np.asarray(a, dtype=np.float64)
     return a.mean(axis=1) if a.ndim == 2 else a
@@ -785,6 +843,12 @@ def main():
             parts = [p.get(key) for p in per_shard]
             timings[key] = None if any(v is None for v in parts) else round(sum(parts), 3)
     timings["predict"] = round(time.time() - t_pred0, 3)
+    # The multi-head output-range guard: one place after every prediction path (one process,
+    # the projection cache and the shards), before the library is rewritten.
+    range_record = None
+    if calibration is not None:
+        values, range_record = apply_output_range_guard(
+            values, [psm.retention_time for psm in ref_psms])
     print(f"prediction phase: {time.time() - t_pred0:.1f}s total "
           f"(featurisation {_fmt_s(timings['featurisation'])}, "
           f"forward pass {_fmt_s(timings['forward'])}"
@@ -793,7 +857,7 @@ def main():
     if band_pairs is not None:
         write_bands(band_pairs, band_pos, uniq, values, which, thread_record, shard_record,
                     timings,
-                    multihead_record(calibration, args.multihead, len(ref_psms))
+                    multihead_record(calibration, args.multihead, len(ref_psms), range_record)
                     if calibration is not None else None,
                     cache_record)
         return
@@ -816,7 +880,8 @@ def main():
     if cache_record is not None:
         summary["projection_cache"] = cache_record
     if calibration is not None:
-        summary["multihead"] = multihead_record(calibration, args.multihead, len(ref_psms))
+        summary["multihead"] = multihead_record(calibration, args.multihead, len(ref_psms),
+                                                range_record)
     with open(args.lib_out + ".summary.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     print(f"wrote library with re-predicted iRT ({which}): {args.lib_out}")
@@ -831,12 +896,14 @@ def main():
               f"the counts are in {args.lib_out}.summary.json", flush=True)
 
 
-def multihead_record(calibration, requested, anchors):
+def multihead_record(calibration, requested, anchors, output_range=None):
     """What the multi-head fit chose, so two runs can be compared head for head.
 
     A thread-count or version change moves the reference predictions in the last bits, and
-    the survey's validation asks whether the selected heads stayed the same. None of these
-    are read back by the engine.
+    the survey's validation asks whether the selected heads stayed the same. The ridge alpha
+    and the output-range guard's record (`guard_output_range`: how many predictions were
+    clamped and their fraction) show an unstable fit, which the alpha alone does not. None of
+    these are read back by the engine.
     """
     idx = getattr(calibration, "_head_idx", None)
     ridge = getattr(calibration, "_ridge", None)
@@ -848,6 +915,7 @@ def multihead_record(calibration, requested, anchors):
         "heads": None if idx is None else [int(h) for h in idx],
         "best_head": None if best is None else int(best),
         "ridge_alpha": None if alpha is None else float(alpha),
+        "output_range": output_range,
     }
 
 

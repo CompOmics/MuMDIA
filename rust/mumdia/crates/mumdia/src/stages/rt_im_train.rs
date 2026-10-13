@@ -17,7 +17,7 @@ use mumdia_io::table::{write_table_chunked_hashed, Col, TableFile};
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::calibrate::{linear_fit, percentile, Loess};
+use crate::calibrate::{linear_fit, percentile, x_domain_inliers, Loess};
 
 pub struct RtImTrainParams<'a> {
     pub seed_psms: &'a str,
@@ -36,6 +36,20 @@ pub struct RtImTrainParams<'a> {
     /// `[first, first + n)` only, with local ids `0..n`: what the same rows written out as a
     /// band file would give. `None` reads the whole table.
     pub precursor_span: Option<(usize, usize)>,
+    /// The second pass of match-between-runs raised `cfg.im_window_min` to this run's
+    /// first-pass `w_im`; recorded in `cal.json` as `im_window_floor`. `None` everywhere else.
+    pub im_window_floor: Option<ImWindowFloor<'a>>,
+}
+
+/// Where a run's 1/K0 window floor came from, when the second pass raised it
+/// (`run_experiment::search_second_pass`): the configured `im_window_min`, the first pass's
+/// `w_im` and the `cal.json` it was read from. The floor applied is the larger of the two,
+/// and it is what `cfg.im_window_min` already holds.
+#[derive(Clone, Copy, Debug)]
+pub struct ImWindowFloor<'a> {
+    pub configured: f64,
+    pub first_pass_w_im: f64,
+    pub source: &'a str,
 }
 
 const INSUFFICIENT_ANCHORS_STATUS: &str = "insufficient_anchors_unbounded";
@@ -407,6 +421,9 @@ pub struct RtFit {
     /// the IM calibration, or that there is none. A 3D run records none of it, and its
     /// `cal.json` is what it was before IM calibration existed.
     im_reported: bool,
+    /// Anchors `anchor_x_filter` removed before the fit; recorded in `cal.json` only when
+    /// above 0, so a run without removals writes the `cal.json` it always wrote.
+    n_rt_outliers_removed: usize,
 }
 
 /// The fitted windows, handed from `rt-im-train` to `extract` in memory by the
@@ -468,6 +485,18 @@ impl RtWindows {
     #[inline]
     pub(crate) fn admits(&self, c: usize, rt: f64, im: Option<f32>) -> bool {
         if rt < self.rt_lo[c] || rt > self.rt_hi[c] {
+            return false;
+        }
+        match (im, &self.im_lo, &self.im_hi) {
+            (Some(x), Some(lo), Some(hi)) => !(x < lo[c] || x > hi[c]),
+            _ => true,
+        }
+    }
+
+    /// [`RtWindows::admits`] with the RT window widened by `pad` seconds on each side; the
+    /// 1/K0 test is unchanged. Extract's trace pad (`extract::TracePad`) reads it.
+    pub(crate) fn admits_padded(&self, c: usize, rt: f64, im: Option<f32>, pad: f64) -> bool {
+        if rt < self.rt_lo[c] - pad || rt > self.rt_hi[c] + pad {
             return false;
         }
         match (im, &self.im_lo, &self.im_hi) {
@@ -624,6 +653,8 @@ pub struct ApplyParams<'a> {
     pub out_cal: &'a str,
     pub cfg: &'a RtImTrainConfig,
     pub config_hash: &'a str,
+    /// As [`RtImTrainParams::im_window_floor`].
+    pub im_window_floor: Option<ImWindowFloor<'a>>,
 }
 
 fn check_cfg(cfg: &RtImTrainConfig) -> Result<()> {
@@ -713,6 +744,7 @@ fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(Written, Option<R
             cfg: p.cfg,
             config_hash: p.config_hash,
             precursor_span: p.precursor_span,
+            im_window_floor: p.im_window_floor,
         },
         lib,
         t0,
@@ -986,6 +1018,37 @@ fn fit_anchors(
         }
     }
     let (anchor_ids, train_irt, train_rt) = sorted_anchor_vectors(best_per_pep);
+    // `anchor_x_filter`: the anchors outside the x-domain fences of their predicted iRT are
+    // dropped here, before the first fit, so every consumer below (the linear and LOESS
+    // fits, `boundary_slopes`, the held-out, in-sample and local window sizing and the
+    // composition correction) sees the same filtered anchors.
+    let (anchor_ids, train_irt, train_rt, n_rt_outliers_removed) = if cfg.anchor_x_filter {
+        let keep = x_domain_inliers(&train_irt);
+        let pick = |v: &[f64]| -> Vec<f64> {
+            v.iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(x, _)| *x)
+                .collect()
+        };
+        let ids: Vec<u32> = anchor_ids
+            .iter()
+            .zip(&keep)
+            .filter(|(_, k)| **k)
+            .map(|(x, _)| *x)
+            .collect();
+        let removed = keep.iter().filter(|k| !**k).count();
+        if removed > 0 {
+            info!(
+                removed,
+                of = keep.len(),
+                "rt-im-train: dropped anchors outside the x-domain fences of predicted iRT"
+            );
+        }
+        (ids, pick(&train_irt), pick(&train_rt), removed)
+    } else {
+        (anchor_ids, train_irt, train_rt, 0)
+    };
     let n_train = train_irt.len();
     info!(n_train, "rt-im-train: training points");
     // The ion-mobility calibration, on a seed with 1/K0 only.
@@ -1036,6 +1099,7 @@ fn fit_anchors(
         residuals: (f64::NAN, f64::NAN, f64::NAN),
         im,
         im_reported,
+        n_rt_outliers_removed,
     };
 
     // Residuals and RT window. Require enough anchors before trusting the
@@ -1490,6 +1554,9 @@ fn write_windows(
     // it could not be fitted), so a 3D `cal.json` is unchanged. `w_im` is sized on held-out
     // anchors unless `w_im_sizing` says otherwise; the in-sample residual is a fit
     // diagnostic only (docs/08_rt_im_train.md section 4).
+    if fit.n_rt_outliers_removed > 0 {
+        cal_json["n_rt_outliers_removed"] = json!(fit.n_rt_outliers_removed);
+    }
     let im = fit.im.as_ref();
     if fit.im_reported {
         let im_fields = json!({
@@ -1513,6 +1580,15 @@ fn write_windows(
         if let (Some(obj), serde_json::Value::Object(extra)) = (cal_json.as_object_mut(), im_fields)
         {
             obj.extend(extra);
+        }
+        // The second pass's floor on `w_im` and where it came from.
+        if let Some(f) = &p.im_window_floor {
+            cal_json["im_window_floor"] = json!({
+                "floor": p.cfg.im_window_min,
+                "configured": f.configured,
+                "first_pass_w_im": f.first_pass_w_im,
+                "source": f.source,
+            });
         }
     }
     mumdia_io::json::write_json(p.out_cal, &cal_json)?;
@@ -1873,7 +1949,11 @@ mod tests {
             .collect();
         let irt: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
         let cfg = RtImTrainConfig::default();
-        let stage = |tag: &str, lib_im: bool, seed_im: bool, cfg: &RtImTrainConfig| {
+        let stage_with = |tag: &str,
+                          lib_im: bool,
+                          seed_im: bool,
+                          cfg: &RtImTrainConfig,
+                          floor: Option<ImWindowFloor>| {
             let prec = scratch(&format!("im_prec_{tag}.parquet"));
             let seed = scratch(&format!("im_seed_{tag}.parquet"));
             let mut lib_cols = vec![
@@ -1913,6 +1993,7 @@ mod tests {
                 out_cal: &cal,
                 cfg,
                 config_hash: "test",
+                im_window_floor: floor,
                 anchor_irt_from_seed: false,
             })
             .unwrap();
@@ -1932,6 +2013,9 @@ mod tests {
                 w.opt_f64("im_hi").unwrap(),
             );
             (cal_json, cols)
+        };
+        let stage = |tag: &str, lib_im: bool, seed_im: bool, cfg: &RtImTrainConfig| {
+            stage_with(tag, lib_im, seed_im, cfg, None)
         };
         type ImCols = (Vec<Option<f64>>, Vec<Option<f64>>, Vec<Option<f64>>);
         let all_null = |c: &ImCols| c.0.iter().chain(&c.1).chain(&c.2).all(|v| v.is_none());
@@ -1995,6 +2079,32 @@ mod tests {
                 "row {i}"
             );
         }
+        assert!(cal_json.get("im_window_floor").is_none());
+        // The second pass's floor: `im_window_min` raised above the fitted width, and where it
+        // came from recorded beside it.
+        let floored = RtImTrainConfig {
+            im_window_min: 4.0 * want.w_im,
+            ..cfg.clone()
+        };
+        let floor = ImWindowFloor {
+            configured: cfg.im_window_min,
+            first_pass_w_im: 4.0 * want.w_im,
+            source: "first/cal.json",
+        };
+        let (cal_floor, (_, f_lo, f_hi)) =
+            stage_with("im_floor", true, true, &floored, Some(floor));
+        assert_eq!(cal_floor["w_im"].as_f64(), Some(4.0 * want.w_im));
+        assert_eq!(cal_floor["im_window_floor"]["source"], "first/cal.json");
+        assert_eq!(
+            cal_floor["im_window_floor"]["floor"].as_f64(),
+            Some(4.0 * want.w_im)
+        );
+        assert_eq!(
+            cal_floor["im_window_floor"]["configured"].as_f64(),
+            Some(cfg.im_window_min)
+        );
+        let i = (0..n).find(|&i| pred[i].is_some()).unwrap();
+        assert!((f_hi[i].unwrap() - f_lo[i].unwrap() - 8.0 * want.w_im).abs() < 1e-12);
         // Under a relaxed anchor cut (`with_anchor_cut`) the IM anchors are the relaxed set.
         let relaxed = with_anchor_cut(
             &cfg,
@@ -2201,6 +2311,7 @@ mod tests {
                 out_cal: &cal,
                 cfg: &cfg,
                 config_hash: "test",
+                im_window_floor: None,
                 anchor_irt_from_seed: false,
             };
             let (written, kept) = run_in_memory(params()).unwrap();
@@ -2606,12 +2717,17 @@ mod tests {
             local_window_anchors: 60,
             ..Default::default()
         };
+        let x_filter = RtImTrainConfig {
+            anchor_x_filter: true,
+            ..Default::default()
+        };
         for (tag, cfg, n) in [
             ("default", RtImTrainConfig::default(), 400usize),
             ("holdout", holdout, 400),
             ("adaptive", adaptive, 400),
             ("local", local, 400),
             ("linear", linear, 400),
+            ("x_filter", x_filter, 400),
             ("few", RtImTrainConfig::default(), 20),
             ("one", RtImTrainConfig::default(), 1),
         ] {
@@ -2627,6 +2743,7 @@ mod tests {
                 out_cal: &out("cal_run.json"),
                 cfg: &cfg,
                 config_hash: "h",
+                im_window_floor: None,
                 anchor_irt_from_seed: true,
             })
             .unwrap();
@@ -2640,6 +2757,7 @@ mod tests {
                     out_cal: &out("cal_apply.json"),
                     cfg: &cfg,
                     config_hash: "h",
+                    im_window_floor: None,
                 },
             )
             .unwrap();
@@ -2659,6 +2777,106 @@ mod tests {
                 "{tag}: the decoy and the unconfident row are not anchors"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// `anchor_x_filter` drops the anchors with an absurd predicted iRT before the fit, the
+    /// window sizing and the residuals use them, so the windows are those of the clean
+    /// anchors alone and cal.json records how many it dropped. Off, every anchor is fitted
+    /// and cal.json has no such key. A grouped run's shared fit is filtered the same way.
+    #[test]
+    fn the_anchor_x_filter_fits_the_clean_anchors_and_records_the_count() {
+        let dir = std::env::temp_dir().join(format!("mumdia_rt_xfilter_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        // A curved 2000-3500 s gradient (a straight line survives any grid) plus three
+        // anchors whose predicted iRT is absurd, as a multi-head refit produced on HYE.
+        let n = 400usize;
+        let f = |x: f64| 2000.0 + (x - 2000.0).powi(2) / 1500.0;
+        let mut irt: Vec<f32> = (0..n).map(|i| 2000.0 + 3.75 * i as f32).collect();
+        let mut rt: Vec<f64> = irt
+            .iter()
+            .enumerate()
+            .map(|(i, x)| f(*x as f64) + ((i * 7919) % 11) as f64 - 5.0)
+            .collect();
+        irt.extend([-170_000.0, 375_000.0, 90_000.0]);
+        rt.extend([2500.0, 3400.0, 3000.0]);
+        let seed = |name: &str, m: usize| {
+            let p = path(name);
+            write_table(
+                &p,
+                vec![
+                    Col::U32("candidate_id".into(), (0..m as u32).collect()),
+                    Col::U32("base_peptide_id".into(), (0..m as u32).collect()),
+                    Col::F64("spectrum_q".into(), vec![0.001; m]),
+                    Col::F64("score".into(), (0..m).map(|i| 10.0 + i as f64).collect()),
+                    Col::F64("observed_rt".into(), rt[..m].to_vec()),
+                    Col::Str("label".into(), vec!["target".to_string(); m]),
+                    Col::F32("predicted_irt".into(), irt[..m].to_vec()),
+                ],
+            )
+            .unwrap();
+            p
+        };
+        let dirty = seed("dirty.parquet", n + 3);
+        let clean = seed("clean.parquet", n);
+        let lib = path("lib.parquet");
+        write_table(
+            &lib,
+            vec![
+                Col::U32("candidate_id".into(), (0..600u32).collect()),
+                Col::F32(
+                    "predicted_irt".into(),
+                    (0..600).map(|i| 1900.0 + 3.0 * i as f32).collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        let filtered = RtImTrainConfig {
+            anchor_x_filter: true,
+            ..Default::default()
+        };
+        let stage = |seed: &str, cfg: &RtImTrainConfig, tag: &str| {
+            let (windows, cal) = (
+                path(&format!("w_{tag}.parquet")),
+                path(&format!("cal_{tag}.json")),
+            );
+            run(RtImTrainParams {
+                precursor_span: None,
+                seed_psms: seed,
+                library_precursors: &lib,
+                out_windows: &windows,
+                out_cal: &cal,
+                cfg,
+                config_hash: "h",
+                im_window_floor: None,
+                anchor_irt_from_seed: true,
+            })
+            .unwrap();
+            let cal: serde_json::Value = mumdia_io::json::read_json(&cal).unwrap();
+            (std::fs::read(&windows).unwrap(), cal)
+        };
+        let (w_clean, cal_clean) = stage(&clean, &RtImTrainConfig::default(), "clean");
+        let (w_plain, cal_plain) = stage(&dirty, &RtImTrainConfig::default(), "plain");
+        let (w_filtered, cal_filtered) = stage(&dirty, &filtered, "filtered");
+        let (w_clean_on, cal_clean_on) = stage(&clean, &filtered, "clean_on");
+        assert_eq!(cal_plain["n_train"], n + 3);
+        assert!(cal_plain.get("n_rt_outliers_removed").is_none());
+        assert!(cal_clean.get("n_rt_outliers_removed").is_none());
+        assert_ne!(w_plain, w_clean, "the absurd anchors distort the plain fit");
+        assert_eq!(cal_filtered["n_rt_outliers_removed"], 3);
+        assert_eq!(cal_filtered["n_train"], n);
+        assert_eq!(cal_filtered["w_rt"], cal_clean["w_rt"]);
+        assert_eq!(
+            w_filtered, w_clean,
+            "the filtered fit is the fit on the clean anchors"
+        );
+        // On clean anchors the filter removes nothing and changes nothing, cal.json included.
+        assert_eq!(w_clean_on, w_clean);
+        assert_eq!(cal_clean_on, cal_clean);
+        let fit = fit_from_seed(&dirty, &filtered).unwrap();
+        assert_eq!(fit.n_train(), n);
+        assert_eq!(fit.n_rt_outliers_removed, 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

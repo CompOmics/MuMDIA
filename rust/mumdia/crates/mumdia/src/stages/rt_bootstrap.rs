@@ -389,6 +389,7 @@ fn bootstrap_and_refit(p: &Refit, library: &str, anchors_path: &str) -> Result<A
         &bdir,
         // The pass only collects anchors: no retrace (`chain::ChainParams::retrace`).
         false,
+        Default::default(),
     )
     .context("the bootstrap search (rt-im-train to compete) failed")?;
     let scored = format!("{bdir}/psms_scored.parquet");

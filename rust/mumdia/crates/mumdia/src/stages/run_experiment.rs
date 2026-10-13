@@ -58,7 +58,7 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
             anyhow::bail!("--mzml not found: {m}");
         }
     }
-    crate::stages::run::refuse_unsupported_on_4d(p.config, p.mzmls, true)?;
+    crate::stages::run::refuse_unsupported_on_4d(p.config, p.mzmls)?;
     match (p.lib_precursors, p.lib_fragments) {
         (Some(lp), Some(lf)) => {
             for path in [lp, lf] {
@@ -164,6 +164,18 @@ struct SecondPassOut {
     competed: Vec<String>,
     chroms: Vec<ChromTable>,
     library: second_pass::EmpiricalLibrary,
+    /// Every run's `psms_extracted` of the second pass, by run, for the shadow 1/K0 term.
+    psms_extracted: Vec<String>,
+    /// Some run's spectra carry 1/K0, so the diagnostics are written to
+    /// `empirical_library.json` (a 3D experiment's summary is what it always was).
+    has_im: bool,
+}
+
+/// The first pass's `w_im` of a run, from its `cal.json`: `None` for a run without one (every
+/// 3D run) or with a non-finite one.
+fn first_pass_w_im(cal: &str) -> Option<f64> {
+    let v: serde_json::Value = mumdia_io::json::read_json(cal).ok()?;
+    v.get("w_im")?.as_f64().filter(|w| w.is_finite())
 }
 
 /// The second pass (`mbr.strategy = second_pass`): the empirical library of the first pass's
@@ -175,7 +187,21 @@ struct SecondPassOut {
 ///
 /// The fragment-rarity prescreen is off here: the empirical library is already the screened
 /// set, and the second pass must search all of it. Under `parallel_runs = auto` the runs are
-/// pulled from the plan's queue, otherwise they run in chunks of `par` as the first pass did.
+/// pulled from the plan's queue, otherwise they run in chunks of `par` as the first pass did:
+/// the plan made for the first pass is reused as it is.
+///
+/// On a run whose spectra carry 1/K0 the chain gets two settings of its own
+/// (`chain::PassExtras`), and a 3D run neither:
+///
+/// - a 1/K0 window floor: `im_window_min` is raised to the run's first-pass `w_im`, because a
+///   consensus 1/K0 calibrates to a narrower window than the gate's evidence supports
+///   (recorded in `cal.json` as `im_window_floor`);
+/// - a quantification trace pad (`extract::TracePad::for_quant`): the narrow second-pass RT
+///   window would clip the fixed integration window and its baseline flanks of an apex near
+///   its edge. It needs `extract.emit_rt_window`, which tells the features stage where the
+///   window ends; without it there is no pad, with a warning.
+///
+/// Retrace runs here as in the first pass (`finish_run` with `retrace` on).
 #[allow(clippy::too_many_arguments)]
 fn search_second_pass(
     cfg: &Config,
@@ -189,10 +215,16 @@ fn search_second_pass(
     plan: &crate::sched::RunConcurrency,
     par: usize,
 ) -> Result<Option<SecondPassOut>> {
+    // The first pass's extracted rows, by source, for the consensus 1/K0.
+    let first_psms: Vec<String> = run_dirs
+        .iter()
+        .map(|d| format!("{d}/psms_extracted.parquet"))
+        .collect();
     let library = second_pass::build_library(&second_pass::BuildParams {
         scored: first_scored,
         lib_precursors: lib_p,
         lib_fragments: lib_f,
+        psms_extracted: &first_psms,
         out_dir: &format!("{out}/library"),
         q: cfg.mbr.q_anchor,
     })?;
@@ -231,8 +263,41 @@ fn search_second_pass(
             &run_out,
             Some(&seed_lib),
         )?;
+        // The run's own settings on 4D data; on a 3D run `cfg_run` is `cfg2` and the extras
+        // are the default, so its chain is the one it always was.
+        let mut cfg_run = cfg2.clone();
+        let mut extras = crate::stages::chain::PassExtras::default();
+        let first_cal = format!("{}/cal.json", run_dirs[i]);
+        if let Some(w) = first_pass_w_im(&first_cal) {
+            let configured = cfg_run.rt_im_train.im_window_min;
+            cfg_run.rt_im_train.im_window_min = configured.max(w);
+            extras.im_window_floor = Some(crate::stages::rt_im_train::ImWindowFloor {
+                configured,
+                first_pass_w_im: w,
+                source: &first_cal,
+            });
+            info!(
+                run = %names[i],
+                configured,
+                first_pass_w_im = w,
+                floor = cfg_run.rt_im_train.im_window_min,
+                "run-experiment: second pass, 1/K0 window floor from the first pass"
+            );
+        }
+        if crate::instrument::spectra_has_im(&co.ms2) {
+            match extract::TracePad::for_quant(&cfg.quant) {
+                Some(pad) if cfg.extract.emit_rt_window => extras.trace_pad = Some(pad),
+                Some(_) => warn!(
+                    run = %names[i],
+                    "run-experiment: second pass without extract.emit_rt_window, so the \
+                     chromatograms are not padded for quantification and a fixed integration \
+                     window near the RT window's edge is clipped"
+                ),
+                None => {}
+            }
+        }
         finish_run(
-            cfg2,
+            &cfg_run,
             ch,
             &library.precursors,
             &library.fragments,
@@ -240,6 +305,7 @@ fn search_second_pass(
             &seed,
             &run_out,
             true,
+            extras,
         )
     };
     let all: Vec<usize> = (0..n).collect();
@@ -269,10 +335,20 @@ fn search_second_pass(
         );
         return Ok(None);
     }
+    let has_im = run_dirs.iter().any(|d| {
+        convert::ConvertOutputs::existing(&format!("{d}/spectra"))
+            .is_ok_and(|co| crate::instrument::spectra_has_im(&co.ms2))
+    });
+    let psms_extracted = names
+        .iter()
+        .map(|nm| format!("{out}/{nm}/psms_extracted.parquet"))
+        .collect();
     Ok(Some(SecondPassOut {
         competed,
         chroms,
         library,
+        psms_extracted,
+        has_im,
     }))
 }
 
@@ -469,7 +545,17 @@ fn chain_after_seed(
         rayon::current_num_threads(),
         BootInputs { ch, lib_f, co },
     )?;
-    let (competed, chrom) = finish_run(cfg, ch, &lib_p, lib_f, co, seed, out, true)?;
+    let (competed, chrom) = finish_run(
+        cfg,
+        ch,
+        &lib_p,
+        lib_f,
+        co,
+        seed,
+        out,
+        true,
+        Default::default(),
+    )?;
     Ok((
         vec![competed],
         vec![ChromTable::whole(&chrom)],
@@ -647,6 +733,7 @@ pub(crate) fn finish_run(
     seed: &str,
     out: &str,
     retrace: bool,
+    extras: crate::stages::chain::PassExtras,
 ) -> Result<(String, String)> {
     let o = crate::stages::chain::extract_to_compete(crate::stages::chain::ChainParams {
         cfg,
@@ -659,6 +746,7 @@ pub(crate) fn finish_run(
         lent_ms2: None,
         manifest: None,
         retrace,
+        extras,
     })?;
     Ok((o.competed, o.chromatograms))
 }
@@ -1607,7 +1695,17 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         // Under `parallel_runs = auto`, the first run's finish is what every later run
         // repeats after its reused adaptation, so its peak alone sizes them.
         let window = plan.is_auto().then(crate::sched::PeakWindow::open);
-        let (comp0, chrom0) = finish_run(cfg, &ch, &lib0, &lib_f, &co0, &seed0, &out0, true)?;
+        let (comp0, chrom0) = finish_run(
+            cfg,
+            &ch,
+            &lib0,
+            &lib_f,
+            &co0,
+            &seed0,
+            &out0,
+            true,
+            Default::default(),
+        )?;
         competed.push(vec![comp0]);
         chroms.push(vec![ChromTable::whole(&chrom0)]);
         if produced.is_none() {
@@ -1634,7 +1732,17 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     co,
                 },
             )?;
-            finish_run(cfg, &ch, &lib_p, &lib_f, co, seed, &out, true)
+            finish_run(
+                cfg,
+                &ch,
+                &lib_p,
+                &lib_f,
+                co,
+                seed,
+                &out,
+                true,
+                Default::default(),
+            )
         };
         let items: Vec<(usize, &(convert::ConvertOutputs, String))> =
             (1..n_runs).zip(fronts.iter()).collect();
@@ -1868,7 +1976,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     })?;
 
     // --- match-between-runs: the second pass ---
-    let second = if second_pass_on {
+    let mut second = if second_pass_on {
         let run_dirs: Vec<String> = names.iter().map(|nm| d(nm)).collect();
         search_second_pass(
             cfg,
@@ -1891,7 +1999,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
              result"
         );
     }
-    let (scored_combined, scored_written) = match &second {
+    let (scored_combined, scored_written) = match &mut second {
         Some(sp) => {
             let scored = d("scored_combined.parquet");
             let written = rescore::run_hashed(rescore::RescoreParams {
@@ -1902,11 +2010,22 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 script_dir: &cfg.predict_frag.sidecar_script_dir,
                 cfg: &cfg.rescore,
                 config_hash: &ch,
-                shadow: Some(crate::stages::shadow::ShadowInputs::new(
-                    &sp.library.fragments,
-                    &shadow_windows,
-                )),
+                // The second pass's own extracted rows: its candidate ids are the empirical
+                // library's, not the first pass's.
+                shadow: Some(
+                    crate::stages::shadow::ShadowInputs::new(
+                        &sp.library.fragments,
+                        &shadow_windows,
+                    )
+                    .with_psms_extracted(&sp.psms_extracted),
+                ),
             })?;
+            // The second pass against the first: logged always, and written to
+            // `empirical_library.json` on an experiment with ion mobility.
+            let diag = second_pass::diagnose(&sp.library, &scored, names.len())?;
+            if sp.has_im {
+                second_pass::record_diagnostics(&mut sp.library, diag)?;
+            }
             chroms = sp.chroms.iter().map(|c| vec![c.clone()]).collect();
             (scored, written)
         }
