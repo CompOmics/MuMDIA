@@ -828,6 +828,23 @@ One row per (run, grid point).
 
 ---
 
+## Match-between-runs second pass (`stages/second_pass.rs`, `run-experiment`)
+
+The default `mbr.strategy = second_pass` adds these to an experiment directory
+(docs/12, "Second pass"):
+
+| path | content |
+|---|---|
+| `first_pass/scored_combined.parquet` | the pooled first pass, `psms_scored` schema |
+| `second_pass/library/lib_precursors.parquet` | `fragment_library_precursors`: the first library's rows of every experiment-wide accepted target and its paired decoy, ids contiguous from 0, `predicted_irt` = cross-run consensus (s, reference run's scale) |
+| `second_pass/library/lib_fragments.parquet` | `fragment_library_fragments` of those rows, ids remapped |
+| `second_pass/library/entries.parquet` | `candidate_id` (u32) of the first library's rows kept |
+| `second_pass/library/empirical_library.json` | counts and alignment summary (`entries`, `targets`, `decoys`, `reference_source`, `runs_aligned`, `runs_unaligned`, `entries_from_winner`, `entries_without_decoy`, `median_observations`, `q`) |
+| `second_pass/<run>/` | the run's seed, windows, calibration, extraction, features and competed table on the empirical library |
+
+The root `scored_combined.parquet` is then the second pass's, its `candidate_id` in the
+empirical library's numbering.
+
 ## `audit` (`stages/audit.rs`)
 
 ### candidate_audit.parquet (`audit.rs:180-200`)
