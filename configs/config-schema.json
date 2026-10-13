@@ -1533,6 +1533,21 @@
       "source_struct": "SearchSeedConfig"
     },
     {
+      "path": "search_seed.frag_tol_mad_k",
+      "name": "frag_tol_mad_k",
+      "section": "search_seed",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "Size the learned fragment tolerance from the robust spread of the calibrant deviations, `frag_tol_mad_k x 1.4826 x MAD`, instead of `1.5 x p95`, where MAD is the median of `|deviation - median|`. Still floored at `frag_tol_floor_ppm`. Under `two_pass_mass_cal` the second pass refits only the offset on the deviations inside the first-pass window and keeps the first-pass width: a MAD re-estimated on inliers truncated at that width is narrower than the spread it was cut from. A p95 is set by the tail of the deviations, so a 10% shoulder of random matches can widen it several-fold, where the MAD follows the core. Default 0: the p95 estimator, bit-identical to before the key existed. Benchmark-gated (docs/07_search_seed.md). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "SearchSeedConfig"
+    },
+    {
       "path": "rt_im_train.calibration_method",
       "name": "calibration_method",
       "section": "rt_im_train",
@@ -2524,6 +2539,26 @@
       "source_struct": "ExtractConfig"
     },
     {
+      "path": "extract.im_gate",
+      "name": "im_gate",
+      "section": "extract",
+      "rust_type": "ImGate",
+      "kind": "enum",
+      "optional": false,
+      "default": "off",
+      "default_text": "`off`",
+      "help": "The 1/K0 gate of a run whose spectra carry ion mobility (a diaPASEF `.d` read by the native reader): a fragment peak whose 1/K0 lies outside the candidate's calibrated 1/K0 window (`run_windows.im_lo`/`im_hi`, from `rt-im-train`) is not matched to that candidate, as a peak outside its RT window is not. See `ImGate`. Default `off`. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ExtractConfig",
+      "choices": [
+        "off",
+        "fragments",
+        "auto"
+      ]
+    },
+    {
       "path": "extract.claim_cues.mz_close",
       "name": "mz_close",
       "section": "extract.claim_cues",
@@ -2767,6 +2802,26 @@
       "help": "Chromatogram decode threads in the main feature pass. The pass decodes the chromatogram table one chunk at a time while the features of the chunk before are computed; with one loader the whole decode ran on a single core, which bound the stage whenever decoding a chunk took longer than computing one (measured on an 8-12-mer immunopeptidomics run before the decode overlapped the computation: 3.7 of a 4-minute stage were the load). Each loader reads its own chunk from that chunk's row span, and the computation takes the chunks in table order, so the chunks, every feature value and the features table bytes are the same at every setting; only the time and the memory move. The pass holds up to `chrom_loaders + 1` decoded chunks (0.92 GiB of traces each at the HYE benchmark shape, docs/27 section 3.4), where one loader held two. The value is an upper bound: a pass never runs more loaders than `--threads` (the engine's thread pool) or than it has chunks, so `--threads 1` decodes on one loader as before. Loaders beyond each pass's first come from a process-wide pool of four, so concurrent bands or runs (`groups.parallel`, `experiment.parallel_runs`) share that pool instead of multiplying it. Default 3; `1` restores the single loader and `0` is read as `1`. A memory knob and a speed knob, not a sensitivity knob.",
       "gates": [],
       "source_struct": "FeaturesConfig"
+    },
+    {
+      "path": "features.im_features",
+      "name": "im_features",
+      "section": "features",
+      "rust_type": "ImFeatures",
+      "kind": "enum",
+      "optional": false,
+      "default": "off",
+      "default_text": "`off`",
+      "help": "The ion-mobility family (`im.rs`, docs/10_features.md): the apex 1/K0 against the calibrated prediction, the fragment 1/K0 dispersion at the apex, the MS1 precursor 1/K0, and the 1/K0 of the fragment traces over the elution peak. Part of the `extended` set only, appended after the other families. See `ImFeatures`. On a run whose spectra carry 1/K0 it also makes extract write the per-point 1/K0 list of each chromatogram row (chromatograms v3/v4). Default `off`. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "FeaturesConfig",
+      "choices": [
+        "off",
+        "on",
+        "auto"
+      ]
     },
     {
       "path": "compete.group_by",
@@ -3219,6 +3274,21 @@
       "default_text": "8",
       "help": "Candidates examined per run: the top `shadow_region x accepted` rows by first-pass score.",
       "gates": [],
+      "source_struct": "RescoreConfig"
+    },
+    {
+      "path": "rescore.shadow_im_tolerance",
+      "name": "shadow_im_tolerance",
+      "section": "rescore",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "The 1/K0 term of the shadow test on a run whose spectra carry ion mobility: a lender counts only when its apex 1/K0 is within this distance (V s cm^-2) of the candidate's own. Two precursors co-isolated in one diaPASEF slot but separated in mobility do not share fragment peaks, so a shared fragment m/z is not borrowed evidence there. The apex 1/K0 is joined from each run's `psms_extracted` on `(candidate_id, selected_peak_rank)`; a row without one (3D data, or a lender or candidate whose apex 1/K0 is null) keeps the m/z-and-RT test alone. Default 0: off, bit-identical to before the key existed. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
       "source_struct": "RescoreConfig"
     },
     {

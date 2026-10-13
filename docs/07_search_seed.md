@@ -109,7 +109,7 @@ for byte. The orchestrators record the version read from the table's footer
 | key | type | meaning |
 |---|---|---|
 | `frag_ppm_offset` | f64 | median signed ppm of `observed_peak` relative to `predicted_fragment` (`ppm_diff(peak_mz, fmz)`), i.e. the systematic offset |
-| `frag_tol_ppm` | f64 | learned tolerance: `max(5.0, 1.5 * P95(|dev - offset|))` |
+| `frag_tol_ppm` | f64 | learned tolerance: `max(frag_tol_floor_ppm, 1.5 * P95(|dev - offset|))`, or `max(frag_tol_floor_ppm, frag_tol_mad_k * 1.4826 * MAD)` under `search_seed.frag_tol_mad_k` |
 | `frag_ppm_sigma` | f64 | duplicate of `frag_tol_ppm` (the learned tolerance is the local mass-uncertainty estimate) |
 | `n_dev` | usize | number of fragment-to-nearest-peak deviations collected (`devs.len()`) |
 | `cal_passes` | int | 0 (fallback, too few devs), 1 (single pass), or 2 (robust second pass) |
@@ -298,11 +298,12 @@ without a matched peak in tolerance get null. rt-im-train calibrates the library
 The grouped seed pool does not carry the column yet: a grouped run is refused on diaPASEF
 input (docs/35_diapasef.md section 3).
 
-The fit closure (`:187-194`) takes deviations, sorts them, takes the median as the
-offset (`sorted[len/2]`, the upper-middle element for even-length inputs, not the
-two-element average), then sets `tol = max(5.0, 1.5 * P95(|dev - offset|))` using
-`calibrate::percentile(.., 0.95)` (nearest-rank on `round(p*(n-1))`,
-`calibrate.rs:156-164`). Control flow (`:195-216`):
+The one estimator is `masscal::fit_floored(devs, floor, mad_k)`. It takes the median
+of the deviations as the offset (`sorted[len/2]`, the upper-middle element for
+even-length inputs, not the two-element average) and sets the tolerance to
+`max(floor, 1.5 * P95(|dev - offset|))` using `calibrate::percentile(.., 0.95)`
+(nearest-rank on `round(p*(n-1))`). `floor` is `search_seed.frag_tol_floor_ppm` (default
+5) in every pass. Control flow (`MassCal::fit_from`):
 
 - `devs.len() < 20`: fallback, `(0.0, fragment_tol_ppm, cal_passes = 0)` (no
   offset, tolerance unchanged).
@@ -310,6 +311,28 @@ two-element average), then sets `tol = max(5.0, 1.5 * P95(|dev - offset|))` usin
 - if `two_pass_mass_cal`: keep only deviations inside `|dev - o1| <= t1` and, when
   `>= 20` survive, re-fit to `(o2, t2, 2)`; otherwise keep the single-pass result.
   The second pass rejects random-match outliers so they cannot bias the median.
+
+`search_seed.frag_tol_mad_k` (default 0, off) replaces the P95 width with the robust
+sigma of the deviations: `mad_k * 1.4826 * MAD`, MAD being the median of
+`|dev - offset|`, still floored at `frag_tol_floor_ppm`. A P95 is set by the tail of the
+deviations, so a shoulder of random matches (10% of the deviations in
+`the_mad_estimator_ignores_a_shoulder_that_sets_the_p95`) can widen it several-fold,
+where the MAD follows the core. Under `two_pass_mass_cal` its second pass refits the
+offset only, on the deviations inside the first-pass window, and keeps the first-pass
+width: a MAD re-estimated on inliers truncated at that width is narrower than the
+spread they were cut from, so every pass would tighten it for no reason in the data
+(`the_mad_second_pass_refits_the_offset_and_keeps_the_width`). At 0 the result is the
+P95 estimator's, bit for bit. On the IM branch MAD with k = 4 gave +5.7% over the P95
+arm on diaPASEF E. coli (three seeds, single pass); HYE was not isolated, and every IM
+number is single-pass. The key is benchmark-gated (docs/35_diapasef.md, arm T3), and
+whether one estimator can serve every acquisition is open; if one ties or wins
+everywhere, the other is retired.
+
+A negative result, recorded so it is not tried again: do not size the fragment tolerance
+from accepted identifications. The IM branch's variant C re-estimated the tolerance from
+the deviations of the identified precursors and set it to 7.99 ppm, which cost 2.7% of
+the identifications; a fixed 8 ppm cost 3.7%. The accepted set is already filtered by the
+tolerance it would size, so its spread understates the run's.
 
 The estimator is `masscal::MassCal::fit_from` and the JSON body its `to_json`, both in
 `masscal.rs`, because a grouped search fits the very same estimator a second time: each
@@ -390,12 +413,14 @@ on load.
 | `matcher` | `Fragindex` | backend; `MatcherKind::Bucketed` (`config.rs:38`) uses the serial `page_search` path |
 | `two_pass_mass_cal` | `true` | robust second-pass mass fit on the in-window inliers (sensitivity_plan P3.1); default true since 2026-10-11 |
 | `count_fragments_once` | `false` | count each predicted fragment once per spectrum at its most intense matching peak (step 3); fragindex only; omitted from the canonical configuration at the default |
+| `frag_tol_floor_ppm` | `5.0` | floor of the learned tolerance, in both passes |
+| `frag_tol_mad_k` | `0.0` | `> 0`: the learned tolerance is `frag_tol_mad_k * 1.4826 * MAD` instead of `1.5 * P95`, and the second pass refits the offset only (step 6); omitted from the canonical configuration at the default; benchmark-gated |
 
 `bucket_size` for the bucketed Library index is taken from `cfg.extract.bucket_size`,
 not from `SearchSeedConfig` (`run.rs:225`). The 50 ppm mass-calibration search
-window, the `min 5.0 ppm` tolerance floor, the `1.5 * P95` scale, and the `>= 20`
-deviation threshold are hardcoded in `search_seed.rs` (`:167`, `:192`, `:195`),
-not config fields.
+window, the `1.5 * P95` scale, the `1.4826` MAD-to-sigma factor and the `>= 20`
+deviation threshold are constants (`search_seed.rs`, `masscal.rs`), not config fields;
+the floor is `frag_tol_floor_ppm`.
 
 The standalone subcommand `Cmd::SearchSeed` (`main.rs:75-86`, dispatch `:458-476`)
 takes `--ms2`, `--lib-precursors`, `--lib-fragments`, `--out`, and

@@ -92,7 +92,8 @@ table in the manifest (predict-frag, the library cache, an imported or prefilter
 library, the DeepLC rewrites, a band library, the second-pass library) reads the version
 from the table's own footer (`predict_frag::precursors_schema`), so the manifest names the
 version that was written. Readers select columns by name, so both versions load
-everywhere; no stage reads `predicted_im` yet.
+everywhere; rt-im-train reads `predicted_im` for the 1/K0 calibration, and only on a run
+whose seed carries `observed_im` (docs/08 section 7).
 
 **fragment_library_fragments** (schema `("fragment_library_fragments", 1)`,
 `schema.rs:14`), written at `predict_frag.rs:254-266`:

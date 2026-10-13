@@ -119,8 +119,10 @@ row named, as before. The file stays the artifact and the contract of the
 standalone stages: `mumdia extract` always reads it. One memory consequence: the
 24-byte-per-candidate arrays now exist from the end of `rt-im-train` through
 extract's library load, where extract used to allocate them (and a 28-byte decode
-beside them) only after the load. The in-memory form carries retention time only; the IM
-columns of a run with 1/K0 are in the file, and no stage reads them yet (docs/35 section 4).
+beside them) only after the load. On a run with an ion-mobility calibration the in-memory
+form also carries the 1/K0 windows and the calibrated 1/K0, filled as the rows are written,
+which extract reads for its 1/K0 gate (docs/09 section 8, docs/35 section 5); on every other
+run those fields are empty and cost nothing.
 
 **`cal.json`** (side artifact, written with `mumdia_io::json::write_json`,
 rt_im_train.rs:309-325). Fields:

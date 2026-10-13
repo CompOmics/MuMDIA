@@ -1128,10 +1128,10 @@ PY_ENV_FN = re.compile(
 # is an error, so a removed variable cannot leave a stale row behind.
 COMPUTED_ENV_DEFAULTS: dict[str, str] = {
     "MUMDIA_WINDOW_FEATURES": (
-        "on when unset; `0` leaves the fixed-window feature family out (`features.rs` `families`)"
+        "on when unset; `0` leaves the fixed-window feature family out (`features.rs` `env_families`)"
     ),
     "MUMDIA_RTW_FEATURES": (
-        "on when unset; `0` leaves the window-scaled RT error family out (`features.rs` `families`)"
+        "on when unset; `0` leaves the window-scaled RT error family out (`features.rs` `env_families`)"
     ),
     "HOME": (
         "set by the operating system; on Unix and macOS the per-user cache directory "

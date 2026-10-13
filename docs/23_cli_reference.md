@@ -521,6 +521,9 @@ Options:
 
       --isolation-windows <ISOLATION_WINDOWS>...
           `isolation_windows.parquet` of each input run, in source order, for shadow demotion
+
+      --psms-extracted <PSMS_EXTRACTED>...
+          `psms_extracted.parquet` of each input run, in source order, for the 1/K0 term of shadow demotion (`rescore.shadow_im_tolerance`)
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".

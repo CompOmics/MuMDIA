@@ -22,8 +22,10 @@ candidates; the peak-claim strategies decide how that shared intensity is
 apportioned.
 
 RT is applied as a per-candidate window post-filter (the documented Stage D part
-2 fallback), and the MVP is 3D so the ion-mobility (IM) dimension is absent
-(`extract.rs:8`, `apex_im` is always written `None` at `extract.rs:2484`).
+2 fallback). On spectra that carry per-peak 1/K0 (a diaPASEF `.d` read by the native
+reader) the same post-filter can take the candidate's 1/K0 window, and the stage
+writes 1/K0 evidence; section 8 ("Ion mobility") describes both. On a 3D run, `apex_im`
+is written null and every artifact is what it always was.
 
 ## Files
 
@@ -91,7 +93,7 @@ the CLI in `main.rs:535` (`Cmd::Extract`) and from the orchestrator in
 - `restrict_candidates` (optional prior `psms.parquet`): a `candidate_id`
   allowlist (`extract.rs:1316`) for the "gate first, then compete" workflow.
 
-### Output: `psms_extracted` (`out_psms`, schema `psms_extracted` v1)
+### Output: `psms_extracted` (`out_psms`, schema `psms_extracted` v2, v4 on 4D data)
 
 Column order and types from `extract.rs:2480`:
 
@@ -100,7 +102,7 @@ Column order and types from `extract.rs:2480`:
 | `candidate_id` | U32 | Library candidate id (sorted ascending in the file) |
 | `peak_rank` | I32 | Chromatographic peak rank; 0 = selected apex. Ranks >= 1 exist only when `promote_top_peaks > 1` (`extract.rs:2205`) |
 | `apex_rt` | F64 | Selected apex RT (seconds) |
-| `apex_im` | OptF64 | Always null (3D MVP) |
+| `apex_im` | OptF64 | Null on a 3D run (v2). On spectra with 1/K0 (v4): the intensity-weighted median 1/K0 of the candidate's matched fragment peaks in its apex scan |
 | `apex_intensity` | F32 | Full summed intensity of the apex scan group |
 | `n_matched_fragments` | I32 | Distinct matched predicted fragments |
 | `n_predicted_fragments` | I32 | Predicted fragment count for the candidate |
@@ -142,6 +144,15 @@ the chromatograms there would put a truncated table beside an older
 `psms_extracted`. Before the rows were streamed, the psms table was written after
 the chromatograms were complete, so this case could not arise.
 
+On spectra that carry 1/K0 the table is v4 (`artifact::psms_extracted(has_im)`):
+`apex_im` is filled and three nullable Float64 columns follow it, before
+`apex_intensity`: `apex_im_mad` (the fragments' intensity-weighted mean absolute
+deviation from `apex_im`), `ms1_apex_im` (the 1/K0 of the MS1 precursor peak nearest
+`apex_im`) and `im_pred_cal` (the candidate's calibrated 1/K0 from `run_windows`,
+null without an ion-mobility calibration). Section 8 defines them. A 3D table keeps
+v2's exact column set. `extract::psms_schema(path)` reads the version back from the
+table's footer, which is what the orchestrators record in the manifest.
+
 Conditional columns (default-off, added only when the knob is set so the
 production schema stays byte-identical):
 - `emit_contested_features` -> `contested_count_frac` F64, `apportioned_frac` F64 (`extract.rs:2505`).
@@ -165,7 +176,7 @@ the two-pass path did not run):
   of contested intensity the candidate retains under proportional apportionment
   (1 = keeps all; ~0 = a peak-borrower stripped by its co-eluting competitors).
 
-### Output: `chromatograms` (`out_chrom`, schema `chromatograms` v1)
+### Output: `chromatograms` (`out_chrom`, schema `chromatograms` v1 or v2; v3 or v4 with 1/K0)
 
 Column order from `extract.rs:2528`:
 
@@ -215,6 +226,22 @@ before v2, reads `rt` and `intensity`, which a v2 table does not have: set
 `chromatogram_schema = 1` for it. Such a reader stops at the missing column rather than
 misreading the table, and `mumdia::chromatograms::rewrite` converts the table back
 to v1 for it.
+
+On spectra that carry 1/K0, and only while a consumer of the list is on
+(`ExtractParams::chrom_im`: the ion-mobility feature family, `features.im_features`;
+retrace once it lands), every row also carries its per-point 1/K0: `im`, parallel to
+`intensity`, in v1 (schema v3), and `im_trimmed`, cut to the run `intensity_trimmed`
+keeps with the same `trace_offset`, in v2 (schema v4). The value at a point is the 1/K0
+of the peak whose intensity the trace holds there (`Hit::im`, 1e-4 resolution), and
+`+0.0` wherever the trace is `+0.0`, so the v2 trim loses nothing and both layouts
+decode to the same list (`Decoder::row_im`). A never-observed fragment has an empty list
+beside its empty trace; the MS1 rows hold `+0.0` at every point. The numbering keeps
+`chromatogram_schema = 1` working on 4D data. `chromatograms::recorded_schema(path)`
+reads the version back from the table (its layout and whether it has the list), and
+every recording site uses it. The list adds about 38% to the table, so it is written
+only for a consumer. The pooled-band splice copies whatever columns the bands wrote
+and refuses bands whose schemas differ, and `chromatograms::rewrite` carries the list
+in either direction.
 
 To validate v2 on a new dataset, run the same configuration twice, once with
 `extract.chromatogram_schema = 2`, and compare `features.parquet`,
@@ -663,6 +690,14 @@ extraction side waited for a free channel slot, the column build excluded) and
 that approaches the stage's accumulation time says it does, and that a parallel
 column encoder (survey item R2) would pay off here. The line is log output only.
 
+On a 4D run the chromatogram writer encodes whole row groups as jobs on the parquet
+codec pool while the next fills (`TableWriter::with_row_groups_in_flight`, up to
+`chromatograms::ROW_GROUPS_IN_FLIGHT` = 16 and never more than the pool has threads;
+docs/03_io_layer.md, "Parallel column codec"). The bytes are the serial writer's. The
+one writer thread was the whole of a HYE diaPASEF extract after its first 20 s. A 3D
+table is written as before; enabling it there waits for a wall-time and RSS measurement
+on an Astral, an Orbitrap and a banded run.
+
 ### 7. Top-K peak enumeration (`retain_top_peaks`)
 
 Two independent knobs consume the enumerator, and they must not be confused:
@@ -713,6 +748,72 @@ alternates by `alt_peak_min_area_frac` and `alt_peak_min_separation_s` plus the
 `promote_top_peaks - 1` extra `CandOut` rows with `peak_rank >= 1`
 (`extract.rs:2297`). Because these become real scored rows, enabling it changes
 the training/FDR population and needs entrapment validation, not a count check.
+
+### 8. Ion mobility (4D data)
+
+Everything here applies only when the decoded spectra carry per-peak 1/K0
+(`has_im`: the scans' `im` lists, which `load_ms2`/`load_ms1` decode only from spectra
+v2, the native diaPASEF reader's). A 3D run takes none of these paths, and its
+artifacts and reports are byte-identical to before (`extract_writes_the_1k0_evidence_only_for_spectra_with_ion_mobility`
+in `tests/pipeline.rs`, and the smoke fixture).
+
+**One window type and one reader.** `rt_im_train::RtWindows` carries, besides the RT
+arrays, `im_lo`/`im_hi` (f32, `-inf`/`+inf` for a candidate without a window) and
+`im_cal` (`Option<f64>` per candidate), all `None` when no row has a 1/K0 window, which
+is every 3D run. `read_run_windows` is the one reader of `run_windows` and fills them
+from `im_lo`, `im_hi` and `im_pred_cal`, refusing a NaN 1/K0 bound with the row named,
+as it refuses a NaN RT bound. `rt-im-train` fills the same fields while it writes the
+table (`RtWindowsBuilder`, only when the fit has an ion-mobility calibration, and
+withholding the in-memory form on a NaN 1/K0 bound), so the in-memory handover of
+`run`, `run-experiment` and the RT bootstrap is the file, 1/K0 included
+(`im_windows_are_the_calibration_applied_to_every_row`,
+`the_windows_builder_scatters_the_im_columns_as_extract_reads_them`).
+
+**The window test.** Every guard site asks `RtWindows::admits(c, rt, im)`, through a
+`Guard` that knows whether the 1/K0 gate is on: the streamed probe (`ProbeTask`), the
+serial path, both passes and the EM, demix and shadow arms of the two-pass
+arbitration, and the per-scan demix of `emit_demix_features`. With `im` `None` (gate
+off, or a 3D scan) it is `!(rt < rt_lo || rt > rt_hi)`, exactly the test it replaces,
+including the local asymmetric RT windows `rt-im-train` writes.
+
+**The 1/K0 gate** (`extract.im_gate`, default `off`). `fragments`: a fragment peak whose
+1/K0 lies outside the candidate's window `[im_lo, im_hi]` is not matched to it, as a
+peak outside its RT window is not. `auto`: `fragments` when the spectra and the windows
+both carry 1/K0, `off` otherwise. An explicit `fragments` without either runs ungated
+with a warning. The window is the calibration's `w_im` (docs/08 section 7), and the
+gate's optimum follows it: on the IM branch an `im_window_multiplier` of 0.5 lost 11%.
+The MS1 reads are not gated: the IM branch's `fragments_ms1` variant measured -0.6%,
+within noise, and is not ported. `claim_cues.ms1_support` and `ms1_rescue` therefore
+stay ungated on 4D data as well (both off by default). The `window_mean` gate's summed
+spectrum is built from the hit groups, which the 1/K0 gate filters, so it reads gated
+evidence with no further change; its scan grid stays m/z-keyed. The isolated gate
+effect was measured only on E. coli (+5.7%, three seeds); promoting the default to
+`auto` needs a paired gate-on/gate-off entrapment arm and HYE diaPASEF seeds.
+
+**Evidence** (psms_extracted v4), computed per accepted row at the row's own apex, so a
+promoted alternative peak carries its own (`im_at`). The apex scan is the one the demix
+resolves (`demix_apex_scan`), which the `rt_scan` lookup map is built for whenever
+`emit_demix_features` is on or the spectra carry 1/K0 (lookup only, never iterated).
+`apex_im` is the seed's `observed_im` rule at the extraction apex: each library
+fragment takes its nearest peak within the fragment tolerance of its offset-corrected
+m/z (`spectra::nearest_peak`, the rule of the seed's calibrants), a peak outside the
+1/K0 window is skipped under the gate, and `apex_im` is the intensity-weighted median of
+their 1/K0 (`stats::weighted_median`), `apex_im_mad` their weighted mean absolute
+deviation from it (`stats::weighted_mean_abs_dev`). `ms1_apex_im`: in the MS1 scan
+nearest the apex, the peak within `prec_tol_ppm` of the precursor m/z, shifted by the
+learned `ms1_ppm_offset` as every MS1 read is, whose 1/K0 lies nearest `apex_im`, or the
+most intense one without an `apex_im` (`spectra::ms1_peak_near`). Nearest rather than
+most intense, because at low load the most intense in-tolerance MS1 peak is often
+another ion in another mobility band. It is not gated. `im_pred_cal` is copied from the
+windows. Each hit carries its peak's 1/K0 (x 1e4 as a u16 in the two padding bytes of
+`Hit`, which stays 16 bytes), which is what the chromatograms' per-point list is built
+from.
+
+**MS1 mass calibration** (`ms1cal::estimate`). On 3D data the offset is the median ppm
+error of the most intense MS1 peak within 15 ppm of each anchor. On 4D data an anchor
+with an `observed_im` takes, over the same three scans, the in-tolerance peak whose
+1/K0 lies nearest it, by the same `ms1_peak_near` rule; an anchor without one keeps the
+most-intense rule.
 
 ## Key types and functions
 
@@ -789,6 +890,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `emit_gate_diagnostics` | false | Adds the four `gate_*` diagnostic columns |
 | `gate_mode` | `ApexPearson` | Which score `gate_min_score` thresholds (`GateMode`, `config.rs:735`) |
 | `gate_coelution_min` | 0.5 | Second threshold for `GateMode::Combined` |
+| `im_gate` | `off` | The 1/K0 gate on fragment peaks (`off`, `fragments`, `auto`; section 8). Inert on 3D data. Omitted from the canonical configuration at its default |
 
 Note: `emit_candidate_audit` is a declared knob but the candidate-audit write is
 not present in this `extract.rs`; the audit ladder is produced by the separate
@@ -861,7 +963,9 @@ here for one index.
 - **Empty vs zero traces**: a never-observed predicted fragment carries an empty
   trace, not a grid-length zero vector (`extract.rs:2098`). Downstream code must
   treat an empty trace as `obs_apex = 0`.
-- **`apex_im` is always null** (3D MVP); do not assume an IM value.
+- **`apex_im` is null on every 3D run** (v2); only a v4 table, written from spectra
+  with 1/K0, fills it, together with `apex_im_mad`, `ms1_apex_im` and `im_pred_cal`.
+  Read the version (`extract::psms_schema`) or the column, never assume a value.
 - **`restrict_candidates` only forces the serial path in the non-two-pass case.**
   In the non-two-pass branch the parallel window accumulation is used only when a
   fragindex is present **and** there is no `restrict` list (`extract.rs:1455`); a
@@ -894,6 +998,13 @@ tests encode the behavioral invariants that gate tuning must preserve.
   (`extract.rs:2688`) and still recovers a fragment that is momentarily unsampled
   at the apex scan by integrating over the peak (`extract.rs:2705`, the DIA
   scan-gap case the single-scan apex Pearson fails).
+- `the_im_gate_drops_out_of_window_peaks_only`: the 1/K0 gate removes exactly the
+  hits outside a candidate's window, on the task-local and the global index, and is
+  inert on 3D scans and with the gate off; `a_hit_carries_its_mobility_at_no_size_cost`
+  pins `Hit` at 16 bytes. `the_streamed_psms_table_is_the_write_table_file` covers the
+  v4 columns, and `extract_writes_the_1k0_evidence_only_for_spectra_with_ion_mobility`
+  (`tests/pipeline.rs`) the stage end to end: 3D bytes unchanged under every 1/K0
+  setting, v4 evidence values, chromatograms v2/v3/v4, the gate and `auto`.
 - `peaks::tests` (`peaks.rs:154`): empty/all-zero profiles yield no peaks; a
   clean triangular peak resolves apex and 1/3-height boundaries; `k=1` keeps only
   the strongest-area peak; a dominant interference peak with `k=1` discards a
@@ -933,6 +1044,8 @@ tests encode the behavioral invariants that gate tuning must preserve.
   column behind an `emit_*` flag to
   preserve the byte-identical default schema, and bump the schema version in
   `schema.rs` if the default schema changes.
-- **IM / 4D**: `apex_im` and the IM data-model hooks exist but are unfilled; a
-  diaPASEF extension adds an IM window post-filter alongside the RT window and IM
-  apex/feature families. It cannot be validated without diaPASEF data.
+- **IM / 4D**: section 8. A new 1/K0 use goes through `RtWindows::admits` for the
+  window test and through `has_im` (the scans' `im` lists) for anything it writes, so
+  a 3D run keeps its bytes. A new 4D column goes into the v4 branch of
+  `PsmRows::take_cols`; a new chromatogram list needs a new number in
+  `artifact::chromatograms`.

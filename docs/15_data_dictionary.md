@@ -252,8 +252,10 @@ so `deeplc_finetune.py` reads it as it reads `seed_psms`. One row per candidate,
 | `im_hi` | Float64 | yes | 1/K0 | `im_pred_cal + w_im`; null where `im_pred_cal` is |
 
 The table stays version 1 on every run: the three IM columns were always part of it. They are
-filled only when the seed carries `observed_im` and the library `predicted_im`; no stage reads
-them yet (docs/35 section 4).
+filled only when the seed carries `observed_im` and the library `predicted_im`. Extract reads
+them through its one `run_windows` reader (`extract::read_run_windows`) for the 1/K0 gate and
+for `psms_extracted`'s `im_pred_cal` (docs/09 section 8). A NaN `im_lo` or `im_hi` is refused
+with the row named, as a NaN RT bound is.
 
 ### `<run_windows>` cal.json (`rt_im_train.rs:290-302`)
 
@@ -303,7 +305,7 @@ One row per accepted candidate (the selected apex PSM).
 |---|---|---|---|---|
 | `candidate_id` | UInt32 | no | - | library candidate id |
 | `apex_rt` | Float64 | no | s | selected apex retention time |
-| `apex_im` | Float64 | yes | 1/K0 | apex ion mobility; always null in the 3D MVP |
+| `apex_im` | Float64 | yes | 1/K0 (V s cm^-2) | v2: always null. v4: the intensity-weighted median 1/K0 of the candidate's matched fragment peaks in its apex scan (each library fragment's nearest peak within the fragment tolerance, inside the 1/K0 window under `extract.im_gate`); null where the apex scan has none |
 | `apex_intensity` | Float32 | no | counts | summed observed intensity of all matched fragments at the apex scan |
 | `n_matched_fragments` | Int32 | no | - | count of distinct matched predicted fragments |
 | `n_predicted_fragments` | Int32 | no | - | number of predicted fragments in the library |
@@ -321,6 +323,21 @@ One row per accepted candidate (the selected apex PSM).
 | `ms1_mono` | Float64 | yes | counts | MS1 monoisotopic intensity near the apex; null when no MS1 |
 | `ms1_iso1` | Float64 | yes | counts | MS1 +1 isotope intensity; null when no MS1 |
 | `ms1_iso2` | Float64 | yes | counts | MS1 +2 isotope intensity; null when no MS1 |
+
+Version 2 (`artifact::PSMS_EXTRACTED`) is the table above, written by every run whose
+spectra carry no 1/K0. Version 4 (`artifact::psms_extracted(true)`) is written only when the
+extracted spectra carry per-peak 1/K0 (spectra v2, the native diaPASEF reader): `apex_im` is
+filled and three columns follow it, before `apex_intensity`. The number and the meaning are
+the IM branch's v4; its v3 (`apex_im` filled alone) and v5 (1/K0 peak-shape columns) are never
+written. Readers select columns by name; `extract::psms_schema` reads the version from the
+footer. Every row, the selected apex and every promoted alternative, carries the values of its
+own apex.
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `apex_im_mad` | Float64 | yes | 1/K0 | v4 only: the same fragment peaks' intensity-weighted mean absolute deviation from `apex_im` (not a median absolute deviation) |
+| `ms1_apex_im` | Float64 | yes | 1/K0 | v4 only: in the MS1 scan nearest the apex, the 1/K0 of the peak within `extract.prec_tol_ppm` of the offset-corrected precursor m/z that lies nearest `apex_im` (the most intense in-tolerance peak without an `apex_im`); not gated; null without MS1 or without such a peak |
+| `im_pred_cal` | Float64 | yes | 1/K0 | v4 only: the candidate's `run_windows.im_pred_cal`; null without an ion-mobility calibration |
 
 Conditional columns, appended only when `extract.emit_contested_features`
 (`extract.rs:1498-1501`):
@@ -362,7 +379,8 @@ grid are available.
 count can exceed the 32-bit `ListArray` offset ceiling on large candidate sets.
 
 The table above is schema version 1, the default before 2026-09-27. Version 2, the
-default since, is the layout below.
+default since, is the layout below. Versions 3 and 4 add the per-point 1/K0 of a 4D run to
+versions 1 and 2 ("1/K0 lists", below).
 
 #### Layout v2 (`extract.chromatogram_schema = 2`)
 
@@ -424,6 +442,26 @@ the AIF run and 3.2% and 0.3% smaller on the other two, so the axis column (`rt`
 `rt_axis`) stays PLAIN in both layouts. These sizes were measured with the v2 lists
 still named `rt` and `intensity`; the rename changes two names in the footer and no
 page.
+
+#### 1/K0 lists (versions 3 and 4)
+
+On spectra that carry per-peak 1/K0, and only while a consumer of the list is on (the
+ion-mobility feature family, `features.im_features`), each row also carries its per-point
+1/K0. Version 3 is version 1 plus `im`, version 4 is version 2 plus `im_trimmed`
+(`artifact::chromatograms(schema, has_im)`), so `extract.chromatogram_schema = 1` keeps
+working on 4D data. Otherwise the table is version 1 or 2, byte for byte.
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `im` | LargeList\<Float32\> | yes | 1/K0 | v3: one value per `intensity` value: the 1/K0 of the peak the trace holds at that point, `+0.0` where the trace is `+0.0`; empty for a never-observed transition; `+0.0` at every point of an MS1 row |
+| `im_trimmed` | LargeList\<Float32\> | yes | 1/K0 | v4: `im` cut to the run `intensity_trimmed` keeps (the same `trace_offset`, the same length); the decoder rebuilds the full list with `+0.0` margins |
+
+The values have a resolution of 1e-4 V s cm^-2 (the extracted hit stores them as a u16). The
+list adds about 38% to the table. `mumdia::chromatograms::recorded_schema` reads a table's
+version from its columns, `rewrite` carries the list between layouts, and the pool refuses
+bands whose columns differ. The extract report of a 4D run carries `params.reader =
+"timsrust"` and `params.im_gate` (the gate it applied) in both tables' reports, so a stage
+that reads only these artifacts resolves the TIMS predicate from them.
 
 ### `<psms>.peaks.parquet`, top-K peak retention (`extract.rs:1532-1543`)
 
@@ -1069,7 +1107,11 @@ contract files, not engine artifacts.
 `mumdia-core/src/schema.rs` freezes the `(logical name, version)` pairs. As of
 `schema.rs:7-25`: `psms_scored` and `psms_competed` are v4, and `features`,
 `psms_extracted`, `peptide_quant` and `protein_group_quant` v2; every other
-registered artifact is v1. Each artifact stamps its version into its own `report.json`
+registered artifact is v1. Artifacts with a 1/K0 variant take their version from a selector
+(`artifact::X(has_im)`) and record v1 or main's version on every 3D run: `spectra_ms1`,
+`spectra_ms2`, `isolation_windows`, `seed_psms` and, with an ion-mobility source,
+`fragment_library_precursors` are v2 on 4D data, `psms_extracted` v4 and `chromatograms` v3
+or v4 (docs/35_diapasef.md). Each artifact stamps its version into its own `report.json`
 (`mumdia-io/src/report.rs:14`) and into `manifest.json`
 (`mumdia-core/src/manifest.rs:15`), so an artifact on disk states its own version
 rather than inheriting the engine's.

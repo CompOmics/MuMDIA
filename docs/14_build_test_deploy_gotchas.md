@@ -84,7 +84,7 @@ they are built in `tests/pipeline.rs`.
 
 `windows.parquet` (`tests/pipeline.rs:151`): `candidate_id:u32`,
 `rt_pred_cal:f64`, `rt_lo:f64`, `rt_hi:f64`, `im_pred_cal:OptF64`, `im_lo:OptF64`,
-`im_hi:OptF64` (the IM columns are always null in the 3D MVP).
+`im_hi:OptF64` (null in this 3D fixture; `craft_windows_im` writes a 4D one).
 
 The build stage of the Docker image produces `/build/release/mumdia`
 (`Dockerfile:30`, target dir forced by `ENV CARGO_TARGET_DIR=/build` at

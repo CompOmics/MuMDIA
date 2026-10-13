@@ -62,13 +62,13 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`digest.decoy`](#digestdecoy) | `DecoyConfig` | 1 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`peptidoforms`](#peptidoforms) | `PeptidoformsConfig` | 7 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`predict_frag`](#predict_frag) | `PredictFragConfig` | 17 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
-| [`search_seed`](#search_seed) | `SearchSeedConfig` | 10 | [docs/07_search_seed.md](07_search_seed.md) |
+| [`search_seed`](#search_seed) | `SearchSeedConfig` | 11 | [docs/07_search_seed.md](07_search_seed.md) |
 | [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 30 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
-| [`extract`](#extract) | `ExtractConfig` | 43 | [docs/09_extract.md](09_extract.md) |
+| [`extract`](#extract) | `ExtractConfig` | 44 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
-| [`features`](#features) | `FeaturesConfig` | 11 | [docs/10_features.md](10_features.md) |
+| [`features`](#features) | `FeaturesConfig` | 12 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
-| [`rescore`](#rescore) | `RescoreConfig` | 27 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
+| [`rescore`](#rescore) | `RescoreConfig` | 28 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`quant`](#quant) | `QuantConfig` | 17 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`mbr`](#mbr) | `MbrConfig` | 9 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 3 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
@@ -300,6 +300,7 @@ Fragment traces over consecutive same-window scans.
 | `mass_cal_loess` | `bool` | `false` | benchmark-gated | m/z-dependent fragment mass calibration. When true, fit a LOESS of the calibrant ppm deviation versus fragment m/z and emit a sampled correction grid to `<seed>.masscal.json`; extract then applies an m/z-interpolated offset per peak instead of the single scalar `frag_ppm_offset`. This removes any m/z-correlated curvature the flat offset leaves. Default false (scalar offset unchanged), opt-in and benchmark-gated. |
 | `frag_tol_floor_ppm` | `f64` | `5.0` |  | Floor (ppm) on the fragment tolerance learned from the seed's calibrants, which `extract` then searches with. Default 5, the value that was hard-coded. The learned tolerance is `1.5 x p95(\|deviation - median\|)`; on an instrument whose fragment mass error is well under a ppm (Astral) the floor, not the data, sets it. |
 | `count_fragments_once` | `bool` | `false` | benchmark-gated | Count each predicted fragment of a candidate at most once per spectrum, with the intensity of its most intense matching peak, instead of once per matching peak. On diaPASEF slot spectra the mobility pieces of one fragment ion sit at one m/z and would otherwise count as several fragments in the hyperscore's `ln(matched!)` (docs/07_search_seed.md). Needs `matcher = fragindex`, whose seed index then also holds each posting's fragment ordinal (2 bytes per posting). Default false: the seed is unchanged. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its default. |
+| `frag_tol_mad_k` | `f64` | `0.0` | benchmark-gated | Size the learned fragment tolerance from the robust spread of the calibrant deviations, `frag_tol_mad_k x 1.4826 x MAD`, instead of `1.5 x p95`, where MAD is the median of `\|deviation - median\|`. Still floored at `frag_tol_floor_ppm`. Under `two_pass_mass_cal` the second pass refits only the offset on the deviations inside the first-pass window and keeps the first-pass width: a MAD re-estimated on inliers truncated at that width is narrower than the spread it was cut from. A p95 is set by the tail of the deviations, so a 10% shoulder of random matches can widen it several-fold, where the MAD follows the core. Default 0: the p95 estimator, bit-identical to before the key existed. Benchmark-gated (docs/07_search_seed.md). Omitted from the canonical configuration at its default. |
 
 ## rt_im_train
 
@@ -387,6 +388,7 @@ Fragment traces over consecutive same-window scans.
 | `gate_mode` | `GateMode` | `window_mean` |  | Which spectral-agreement score the `gate_min_score` gate thresholds (sensitivity program). The legacy gate uses a single apex-scan intensity Pearson, which one chimeric scan can dominate. See `GateMode`. |
 | `gate_coelution_min` | `f64` | `0.5` |  | Second threshold for `GateMode::Combined`: the co-elution score must exceed this while the peak-integrated spectral score exceeds `gate_min_score`. Requiring BOTH is more specific (rejects interferents that pass one axis). |
 | `gate_rt_weight` | `f64` | `0.2` |  | Weight of the RT error in `GateMode::WindowMean`: the score is the mean of the summed-window entropy, coverage and cosine minus this times the apex RT error over the candidate's own window half-width on that side (clipped to 1). |
+| `im_gate` | `ImGate` | `off` | benchmark-gated | The 1/K0 gate of a run whose spectra carry ion mobility (a diaPASEF `.d` read by the native reader): a fragment peak whose 1/K0 lies outside the candidate's calibrated 1/K0 window (`run_windows.im_lo`/`im_hi`, from `rt-im-train`) is not matched to that candidate, as a peak outside its RT window is not. See `ImGate`. Default `off`. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its default. |
 
 ## extract.claim_cues
 
@@ -421,6 +423,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `bound_confident_pct` | `f64` | `50.0` |  | Percentile (0-100) of the confident-set half-widths taken as the global left/ right elution half-width when `bound_from_confident` is true. 50 = median (typical real peak width); higher percentiles widen the shared window. |
 | `ms1_precursor_features` | `bool` | `false` | benchmark-gated | Emit the MS1 apex-isotope precursor feature `ms1_isotope_height_corr` (Pearson of the observed apex isotope heights `[i0,i1,i2]` against the Poisson-averagine model). Default false (the feature is present in the battery but returns 0.0, so the vector length is unchanged in effect). It overlaps the existing `ms1_isotope_cosine_apex`, so it is opt-in and benchmark-gated rather than default-on (AlphaDIA-plan item 12). |
 | `chrom_loaders` | `usize` | `3` |  | Chromatogram decode threads in the main feature pass. The pass decodes the chromatogram table one chunk at a time while the features of the chunk before are computed; with one loader the whole decode ran on a single core, which bound the stage whenever decoding a chunk took longer than computing one (measured on an 8-12-mer immunopeptidomics run before the decode overlapped the computation: 3.7 of a 4-minute stage were the load). Each loader reads its own chunk from that chunk's row span, and the computation takes the chunks in table order, so the chunks, every feature value and the features table bytes are the same at every setting; only the time and the memory move. The pass holds up to `chrom_loaders + 1` decoded chunks (0.92 GiB of traces each at the HYE benchmark shape, docs/27 section 3.4), where one loader held two. The value is an upper bound: a pass never runs more loaders than `--threads` (the engine's thread pool) or than it has chunks, so `--threads 1` decodes on one loader as before. Loaders beyond each pass's first come from a process-wide pool of four, so concurrent bands or runs (`groups.parallel`, `experiment.parallel_runs`) share that pool instead of multiplying it. Default 3; `1` restores the single loader and `0` is read as `1`. A memory knob and a speed knob, not a sensitivity knob. |
+| `im_features` | `ImFeatures` | `off` | benchmark-gated | The ion-mobility family (`im.rs`, docs/10_features.md): the apex 1/K0 against the calibrated prediction, the fragment 1/K0 dispersion at the apex, the MS1 precursor 1/K0, and the 1/K0 of the fragment traces over the elution peak. Part of the `extended` set only, appended after the other families. See `ImFeatures`. On a run whose spectra carry 1/K0 it also makes extract write the per-point 1/K0 list of each chromatogram row (chromatograms v3/v4). Default `off`. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its default. |
 
 ## compete
 
@@ -467,6 +470,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `shadow_ppm` | `f64` | `10.0` |  | Fragment m/z tolerance (ppm) of the shadow test. |
 | `shadow_rt_s` | `f64` | `3.0` |  | Apex RT distance (seconds) within which a lender counts. |
 | `shadow_region` | `usize` | `8` |  | Candidates examined per run: the top `shadow_region x accepted` rows by first-pass score. |
+| `shadow_im_tolerance` | `f64` | `0.0` | benchmark-gated | The 1/K0 term of the shadow test on a run whose spectra carry ion mobility: a lender counts only when its apex 1/K0 is within this distance (V s cm^-2) of the candidate's own. Two precursors co-isolated in one diaPASEF slot but separated in mobility do not share fragment peaks, so a shared fragment m/z is not borrowed evidence there. The apex 1/K0 is joined from each run's `psms_extracted` on `(candidate_id, selected_peak_rank)`; a row without one (3D data, or a lender or candidate whose apex 1/K0 is null) keeps the m/z-and-RT test alone. Default 0: off, bit-identical to before the key existed. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its default. |
 | `min_train_decoys` | `usize` | `100` |  | Fewest decoys the classifier is trained with. Below this the learned classifier is not trained (a handful of decoys lets it overfit, one decoy then outranks every target and nothing passes 1%): the candidates are ranked by their untrained `prelim_score` and q-values come from plain target-decoy competition, with a warning and `classifier = "prelim_score_few_decoys"` in the scored table's report. A strict gate on a very small or very clean run can leave this few. 0 disables it. |
 
 ## quant
@@ -736,6 +740,30 @@ How the feature matrix crosses the Rust -> Python boundary for a sidecar rescore
 | `tsv` |  | Tab-separated PIN. Percolator's format, and what `mokapot.read_pin` requires, so it is what a mokapot or entrapment sidecar receives whatever this is set to. |
 | `parquet` |  | Parquet feature table with f32 features: the default from 2026-09-05 until `Raw` replaced it on 2026-09-28, with identical scores. The TSV path makes the worker parse every column into a float64 pandas frame before it builds its float32 matrix, so the text file, the frame and the matrix are alive together. Measured on the HYE competed table (2,603,894 PSMs x 387 features, one self-training iteration, 32 threads), parquet against tsv: rescore peak 29.96 -> 8.95 GB, wall 8:35 -> 6:33, sidecar file 9.53 -> 3.28 GB, the worker's read and standardise phase 111.7 -> 16.9 s, and 47,752 against 47,762 peptides at 1% with the decoy fraction 1.00% either way (docs/28 section 11). An earlier 8,858,206-PSM experiment-wide rescore went from 671.6 min to 12 min, because there the 30.18 GB TSV crossed the worker's streaming threshold and every iteration re-read a 12.77 GB memmap. Features are f32 because the TSV was already lossy (`{:.6}`) and the worker casts to f32 regardless; the two paths therefore feed marginally different values into a chaotic self-training loop, which is where that 10-peptide difference comes from. nn_torch only: `mokapot_worker.py` calls `mokapot.read_pin()` and cannot read Parquet, so a mokapot run falls back to `Tsv` with a warning instead of failing. Choose it over `Raw` where the sidecar directory is short of room: a parquet file has no size floor, so the space check only warns for it, while a raw matrix is exactly 4 bytes a value and is refused below that. |
 | `raw` | yes | The default since 2026-09-28: the features as one row-major little-endian f32 `.npy` matrix, beside a small parquet of the metadata columns and a `<name>.raw.json` description (feature names, per-feature min/max, the parquet handoff's row-group size) that the worker is given. The engine streams each decoded batch straight into the file with no transpose and no parquet encode, and the worker copies the matrix into its own with no decode and no column-to-row transpose: on the 258.75M-row immunopeptidomics pool the parquet path spent an estimated 26 min of serial engine CPU encoding and the worker a strided fill of every column. The file is the raw size, 4 bytes a value, about 11% more than the snappy parquet there, so it pays where the codec, not the disk, is the limit (a RAM-backed `MUMDIA_SIDECAR_DIR`, an SSD). Features that compress well make the file gap much larger, and docs/13 records a small table where the raw write was the slower one; on the benchmark pools of the 2026-09-27 campaign the two walls were within a minute of each other, with byte-identical scored tables. Scores are byte-identical to `Parquet`: the worker fills the same matrix and sums the float64 moments over the same partition (the description carries the row-group size), and drops the same constant columns. Validate a new host by rescoring one pool with each handoff, same seed and threads, and comparing `psms_scored.parquet` byte for byte (`tests/python/test_nn_rescore_worker.py` does it on a fixture). nn_torch only; a mokapot run falls back to `Tsv` with a warning. The sidecar space check refuses the run when the work directory cannot hold the matrix (exactly 4 bytes a value, docs/13); set `Parquet` where the room is short, or point `MUMDIA_SIDECAR_DIR` elsewhere. |
+
+### `ImFeatures`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+`features.im_features`: the ion-mobility feature family.
+
+| Value | Default | Description |
+|---|---|---|
+| `off` | yes | No ion-mobility features. The feature schema is the 3D one. |
+| `on` |  | The ion-mobility family is part of the `extended` set. On a run without 1/K0 its columns are 0. |
+| `auto` |  | `on` when the spectra carry 1/K0 (`mumdia::instrument`), `off` otherwise. |
+
+### `ImGate`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+`extract.im_gate`: whether fragment peaks are matched only inside a candidate's 1/K0 window.
+
+| Value | Default | Description |
+|---|---|---|
+| `off` | yes | No 1/K0 gate: every fragment peak inside the RT window is matched, as on 3D data. |
+| `fragments` |  | A fragment peak outside the candidate's 1/K0 window is not matched. The MS1 lookups are not gated. A run without per-peak 1/K0, or whose `run_windows` has no 1/K0 window, is extracted without the gate and says so in the log. |
+| `auto` |  | `fragments` when the run's spectra carry 1/K0 (`mumdia::instrument`) and its `run_windows` carries 1/K0 windows, `off` otherwise. |
 
 ### `ImPredictorKind`
 
@@ -1099,13 +1127,13 @@ moves to another function.
 | `MUMDIA_PYTHON_RESCORE` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `MUMDIA_QUANT_SELECTIVE_READ` | engine | computed: on (quant skips, unread, the chromatogram data pages that hold no kept row). `0` reads every page of every row group it opens; the outputs are the same (`stages/quant.rs` `selective_read_enabled`) | `rust/mumdia/crates/mumdia/src/stages/quant.rs::selective_read_enabled` |
 | `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_hashed`, `scripts/mokapot_worker.py::main`, `scripts/mokapot_worker.py::make_model` |
-| `MUMDIA_RTW_FEATURES` | engine | computed: on when unset; `0` leaves the window-scaled RT error family out (`features.rs` `families`) | `rust/mumdia/crates/mumdia/src/stages/features.rs::families` |
+| `MUMDIA_RTW_FEATURES` | engine | computed: on when unset; `0` leaves the window-scaled RT error family out (`features.rs` `env_families`) | `rust/mumdia/crates/mumdia/src/stages/features.rs::env_families` |
 | `MUMDIA_SCRIPTS` | sidecar | `os.path.dirname(os.path.abspath(__file__` | `scripts/mh_shard_predict.py::<module>` |
 | `MUMDIA_SIDECAR_DIR` | engine | computed: `<out-dir>/sidecar_work` under `run` and `run-experiment`; `sidecar_work` in the current directory, or `--work-dir`, for `mumdia rescore`. A path moves the rescore sidecar files there (`stages/rescore.rs` `sidecar_work_dir`) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::sidecar_work_dir` |
 | `MUMDIA_SIDECAR_SPACE_CHECK` | engine | computed: on (before the handoff is written, a rescore sidecar run is refused when its work directory has less room than a PIN or raw handoff cannot be smaller than, and warned about below the files' usual size). `0` / `off` / `false` / `no` skips the check (`stages/rescore.rs` `check_sidecar_space`) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::check_sidecar_space` |
 | `MUMDIA_THERMO_PARSER` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate_parser` |
 | `MUMDIA_WIDE_SCAN` | engine | computed: `plain`: the plain reader with its parallel decode for rescore's feature stream and compete's pass-through copy. `rowgroup` decodes the feature stream one row group a batch; `coalesced` reads each row group's projected column chunks in one sequential read (`stages/mod.rs` `WideScan`) | `rust/mumdia/crates/mumdia/src/stages/mod.rs::WideScan::from_env` |
-| `MUMDIA_WINDOW_FEATURES` | engine | computed: on when unset; `0` leaves the fixed-window feature family out (`features.rs` `families`) | `rust/mumdia/crates/mumdia/src/stages/features.rs::families` |
+| `MUMDIA_WINDOW_FEATURES` | engine | computed: on when unset; `0` leaves the fixed-window feature family out (`features.rs` `env_families`) | `rust/mumdia/crates/mumdia/src/stages/features.rs::env_families` |
 | `MUMDIA_XGB_DEPTH` | sidecar | `"6"` | `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_XGB_JOBS` | sidecar | `"0"` | `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_XGB_LR` | sidecar | `"0.1"` | `scripts/mokapot_worker.py::make_model` |
@@ -1174,6 +1202,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-23 structs and 293 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 36 enumerations, 1 named profile(s), 100 environment variables read and 20 set.
+23 structs and 297 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 38 enumerations, 1 named profile(s), 100 environment variables read and 20 set.
 
-24 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+28 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
