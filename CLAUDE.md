@@ -334,6 +334,21 @@ is fitted against each run's own anchors. Since 2026-09-14 `experiment.rt_librar
 amortised the fine-tune: the first run adapts the library, the rest reuse it and fit their
 own LOESS on top. Use `per_run` where the runs do not share an elution order.
 
+`rt_im_train.multihead_anchors` (default `auto` since 2026-10-12) chooses what that
+calibration is fitted on. The adapting run's seed PSMs are a few hundred anchors on a single
+cell and over 13,000 on a bulk Astral run. On a run whose seed found fewer than
+`multihead_search_below` (2,500) anchors, or enough only at a relaxed q, `auto` searches the
+run once on the seed-anchored library (`<run>/rt_bootstrap/`) and refits the calibration on
+that search's targets at 1% (observed RT = `apex_rt`); otherwise it keeps the seed anchors.
+Measured through the engine with three NN seeds per arm (`docs/08_rt_im_train.md` section 4f):
+single-cell HeLa (1,249 seed anchors) +5.1% real precursors with entrapment FDP 0.84-1.04% ->
+0.73-0.74%, a 216-cell single-cell plate +5.5% / +7.8%, Orbitrap AIF entrapment (5,025) +0.9%
+at an unchanged FDP, ProteoBench Astral entrapment (13,786) +0.46% at a paired FDP of
+0.84-0.91% -> 0.85-0.88%. The bootstrap costs +63 s on a single-cell run and +5 min (+51%) on
+a three-run bulk experiment with a 17M-row library, which is what the threshold avoids. `seed`
+restores the previous behaviour; `search` forces the bootstrap and is refused with
+`finetune_deeplc`, `multihead_calibration = 0` and window groups, where `auto` is `seed`.
+
 Three RT rules, each measured in `docs/08_rt_im_train.md` and restated from the
 failure side in `docs/17_troubleshooting.md`:
 
@@ -847,22 +862,7 @@ Do not enable these by default from a single AIF count:
 - margin competition or unique-evidence competition;
 - MBR transfer/re-extraction;
 - acquisition-specific fragment/peak caps. The shipped default stays uncapped;
-  see the peak-cap subsection above;
-- search-anchored multi-head calibration (`rt_im_train.multihead_anchors =
-  "search"`, default `"seed"`). The adapting run is searched once on the
-  seed-anchored library (`<run>/rt_bootstrap/`), and the multi-head calibration is
-  refitted on that search's targets at `precursor_q <= q_train` (observed RT =
-  `apex_rt`). Measured outside the engine on 24 single-cell Astral runs: held-out RT
-  p95 5.35 s -> 3.5 s in 24/24 runs, +7.3% / +4.0% precursors at an unchanged decoy
-  fraction. Entrapment with three seeds (emulated outside the engine): ProteoBench
-  Astral +0.6% at paired FDP 0.88% -> 0.88%, Orbitrap AIF +0.9% at an unchanged FDP,
-  single-cell HeLa on a HYE library +6.3% with FDP 0.96% -> 0.77%; the engine path
-  reproduced the emulation on six runs (+3.6% against +4.0%), and the 216-cell plate on
-  one bootstrapped library gave +7.8% / +5.5% precursors at decoy fraction 0.0097 in
-  both arms. It costs one extra extract-to-rescore pass and one extra library
-  prediction on each adapting run (once per experiment under `first_run_only`): +63 s
-  on one single-cell run with the projection cache on (254 s -> 317 s), about 2x that
-  run with it off. It is refused for grouped runs. `docs/08_rt_im_train.md` section 4f.
+  see the peak-cap subsection above.
 
 `compete.group_by = peptidoform_charge` is the default (2026-09-06) and is
 required, not optional, for a PTM or modification search. Under `base_peptide`

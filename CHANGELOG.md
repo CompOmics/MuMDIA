@@ -93,10 +93,29 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- **`rt_im_train.multihead_anchors` defaults to `"auto"`**, with the new threshold
+  `rt_im_train.multihead_search_below` (default 2,500). The run that adapts the library is
+  searched once to refit its multi-head calibration on search anchors when its seed search
+  found fewer than that many anchors (distinct target base peptides at `q_train`), or enough
+  only after relaxing `q_train`; otherwise it keeps the seed anchors, as before. `auto` is
+  `seed` wherever an explicit `search` would be refused or inert, keeps
+  `experiment.overlap_front_threads` (the bootstrap then runs on the adaptation's thread
+  share), and records its choice in the library's `.summary.json` (`anchors_auto`) and one
+  INFO line. Measured through the engine, three NN seeds per arm: single-cell HeLa (1,249 seed
+  anchors) +5.1% real precursors at entrapment FDP 0.84-1.04% -> 0.73-0.74%; Orbitrap AIF
+  entrapment (5,025) +0.9% at an unchanged FDP; ProteoBench Astral entrapment (13,786) +0.46%
+  at a paired FDP of 0.84-0.91% -> 0.85-0.88%, for +51% wall clock on that three-run bulk
+  experiment, which the threshold avoids. A configuration that sets neither field keeps its
+  config hash and, on a run with at least 2,500 seed anchors, its output; on a run with fewer
+  the output changes. `"seed"` restores the previous behaviour (`docs/08_rt_im_train.md`
+  section 4f).
+
 ### Added
 
-- **Search-anchored multi-head calibration** (`rt_im_train.multihead_anchors = "search"`,
-  default `"seed"`, benchmark-gated). The run that adapts the library (a single `run`, the
+- **Search-anchored multi-head calibration** (`rt_im_train.multihead_anchors = "search"`;
+  `"auto"`, the default since the entry above, chooses it on runs short of seed anchors). The run that adapts the library (a single `run`, the
   first run of `run-experiment` under `rt_library_scope = first_run_only`, or every run under
   `per_run`) is searched once on the seed-anchored library, in `<run>/rt_bootstrap/`
   (rt-im-train, extract, features, compete and a single-run rescore). Its targets at

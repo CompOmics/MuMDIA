@@ -744,14 +744,23 @@ arm("perband", groups=dict(banded, rt_adaptation="per_band"),
 arm("defer", groups=dict(banded, rt_adaptation="once_per_run"),
     rt_im_train={"multihead_calibration": 2},
     predict_frag={"rt_predictor": "deeplc", "defer_deeplc_to_multihead": True})
-arm("seq", rt_im_train={"multihead_calibration": 2},
+arm("seq", rt_im_train={"multihead_calibration": 2, "multihead_anchors": "seed"},
     experiment={"parallel_runs": 1, "overlap_front_threads": 0})
-arm("overlap", rt_im_train={"multihead_calibration": 2},
+arm("overlap", rt_im_train={"multihead_calibration": 2, "multihead_anchors": "seed"},
     experiment={"overlap_front_threads": 1})
 # Search-anchored multi-head: the overlap is asked for, and refused, because the first run's
 # adaptation is then a whole bootstrap search.
 arm("boot", rt_im_train={"multihead_calibration": 2, "multihead_anchors": "search"},
     experiment={"parallel_runs": 1, "overlap_front_threads": 1})
+# `auto` (the default): the fixture's seed is far below multihead_search_below, so the first
+# run takes the bootstrap, sequentially and overlapped (auto keeps the overlap and runs the
+# bootstrap on the adaptation's threads); with a threshold of 0 it keeps the seed anchors.
+arm("auto", rt_im_train={"multihead_calibration": 2},
+    experiment={"parallel_runs": 1, "overlap_front_threads": 0})
+arm("auto_overlap", rt_im_train={"multihead_calibration": 2},
+    experiment={"overlap_front_threads": 1})
+arm("auto_seed", rt_im_train={"multihead_calibration": 2, "multihead_search_below": 0},
+    experiment={"parallel_runs": 1, "overlap_front_threads": 0})
 # No trailing newline: on Windows it would arrive as CR LF, and $( ) strips the LF only.
 sys.stdout.write(os.path.join(root, "site"))
 PYEOF
@@ -809,6 +818,21 @@ grep -q "the first run adapts the library alone" "$stub/boot.log" \
     || { echo "the boot arm did not refuse the overlap"; exit 1; }
 grep -q "keeping the seed-anchored multi-head library" "$stub/boot_fallback.log" \
     || { tail -20 "$stub/boot_fallback.log"; echo "the fallback arm did not say it kept the seed library"; exit 1; }
+# `multihead_anchors = auto`, the default: decided on the first run's seed anchors.
+for a in auto auto_overlap auto_seed; do
+    stub_experiment "$a" "$a" \
+        || { tail -30 "$stub/$a.log"; echo "stub arm $a failed"; exit 1; }
+done
+for a in auto auto_overlap; do
+    grep -q "multihead_anchors = auto chose search anchors" "$stub/$a.log" \
+        || { tail -20 "$stub/$a.log"; echo "the $a arm did not choose search anchors"; exit 1; }
+    grep -q "rt-bootstrap: refitting the multi-head calibration on" "$stub/$a.log" \
+        || { echo "the $a arm did not refit on search anchors"; exit 1; }
+done
+grep -q "converting and seeding the other runs while the first adapts" "$stub/auto_overlap.log" \
+    || { echo "the auto_overlap arm did not keep the overlap"; exit 1; }
+grep -q "multihead_anchors = auto kept the seed anchors" "$stub/auto_seed.log" \
+    || { tail -20 "$stub/auto_seed.log"; echo "the auto_seed arm did not keep the seed anchors"; exit 1; }
 # The deferred FASTA build: refused when the calibration keeps a row's placeholder iRT,
 # accepted when it re-predicts every row.
 stub_run defer_fast "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
@@ -977,6 +1001,30 @@ if (stub / "boot/b/rt_bootstrap").exists() or list((stub / "boot/b").glob("fragm
     fail("boot: run b adapted the library instead of reusing run a's")
 if not (stub / "boot/scored_combined.parquet").exists():
     fail("boot: the experiment did not finish")
+
+# `auto`: two multi-head calls on run a (seed, then search anchors) when the seed is short of
+# anchors, one otherwise; the choice is recorded beside the library, the overlapped arm
+# scores exactly as the sequential one, and run b reuses run a's library.
+for name, chose in (("auto", "search"), ("auto_overlap", "search"), ("auto_seed", "seed")):
+    c = calls(name)
+    if len(c) != (2 if chose == "search" else 1):
+        fail("%s: %d multi-head calls for a %s choice" % (name, len(c), chose))
+    summary = json.loads((stub / name / "a" / (LIB + ".summary.json")).read_text("utf-8"))
+    auto = summary.get("anchors_auto") or {}
+    if auto.get("chose") != chose or summary.get("anchor_source") != chose:
+        fail("%s: the summary records %r" % (name, summary))
+    if (stub / name / "b/rt_bootstrap").exists() or list((stub / name / "b").glob("fragment_library*")):
+        fail("%s: run b adapted the library instead of reusing run a's" % name)
+    m = json.loads((stub / name / "experiment_manifest.json").read_text("utf-8"))
+    rt = m["model_identities"]["rt_predictor"]
+    if ("search-anchors" in rt) != (chose == "search"):
+        fail("%s: rt_predictor %r for a %s choice" % (name, rt, chose))
+if auto["multihead_search_below"] != 0:
+    fail("auto_seed: threshold %r" % auto["multihead_search_below"])
+a = pq.read_table(stub / "auto/scored_combined.parquet")
+b = pq.read_table(stub / "auto_overlap/scored_combined.parquet")
+if not a.equals(b):
+    fail("auto: the overlapped experiment scored differently from the sequential one")
 
 # The deferred build: one --bands multi-head call per run, over the two bands.
 for name in ("defer_fast", "defer_kept"):

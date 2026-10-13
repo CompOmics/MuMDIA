@@ -37,7 +37,7 @@ written null; there is no IM calibration or IM window.
 | `rust/mumdia/crates/mumdia/src/stages/rt_im_train.rs` | The stage. Joins iRT to seed PSMs, fits calibration, computes windows, writes `run_windows.parquet` + `cal.json`. |
 | `rust/mumdia/crates/mumdia/src/calibrate.rs` | Calibration math: `linear_fit`, the `Loess` local-linear smoother, and `percentile`. Shared, no external deps. |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Orchestrator. Runs the optional DeepLC fine-tune between `search-seed` and this stage, then calls `rt_im_train::run` (see `run.rs:265-314`). |
-| `rust/mumdia/crates/mumdia/src/stages/rt_bootstrap.rs` | `rt_im_train.multihead_anchors = search` (section 4f): the bootstrap search of the adapting run, the search-anchor table writer, and the refit of the multi-head calibration with its fallback. |
+| `rust/mumdia/crates/mumdia/src/stages/rt_bootstrap.rs` | `rt_im_train.multihead_anchors` (section 4f): the `auto` decision on the seed anchor count, the bootstrap search of the adapting run, the search-anchor table writer, and the refit of the multi-head calibration with its fallback. |
 | `rust/mumdia/crates/mumdia/src/sidecar.rs` | `run_deeplc_finetune` (sidecar.rs:110-155): the file-contract client that invokes the fine-tune worker. |
 | `scripts/deeplc_finetune.py` | The fine-tune worker: transfer-learns DeepLC (4.5.0 or newer; older versions are refused) on the seed and writes a new library parquet with replaced `predicted_irt`. |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `RtImTrainConfig` (config.rs:447-512), `CalibrationMethod` enum (config.rs:56-61), and the load-time validation that rejects `calibration_method=none` (config.rs:1336-1342). |
@@ -650,12 +650,21 @@ the entrapment library and 0.14 s (17 s) on the HYE library, and neither moved t
 identifications outside the seed spread. The cache arm here used the one-process miss;
 docs/13, "Projection cache", has why the miss is now sharded and what that costs.
 
-### 4f. Search anchors for the multi-head calibration: `multihead_anchors` (default `seed`, benchmark-gated)
+### 4f. Search anchors for the multi-head calibration: `multihead_anchors` (default `auto` since 2026-10-12)
 
 The multi-head calibration of section 4d is fitted on the run's confident seed PSMs
-(`spectrum_q <= q_train`): typically 100 to 600 anchors from a broad, RT-free search.
-`rt_im_train.multihead_anchors = "search"` refits it on the confident identifications of a
-full search of the same run instead.
+(`spectrum_q <= q_train`): from about 100 on a single cell to over 13,000 on a bulk Astral
+run, from a broad, RT-free search. `rt_im_train.multihead_anchors = "search"` refits it on the
+confident identifications of a full search of the same run instead. `"seed"` never does.
+
+`"auto"`, the default, decides per adapting run once its seed search is done
+(`rt_bootstrap::decide`): `search` when the seed found fewer than
+`rt_im_train.multihead_search_below` anchors (default 2,500; distinct target base peptides at
+`q_train`, the count `rt_im_train::plan_anchors` makes), or reached `min_seed_for_calibration`
+only after relaxing `q_train` through `anchor_q_ladder`; otherwise `seed`. The gain of the
+bootstrap falls steeply with the seed anchor count (below), so `auto` spends the extra pass
+where it buys several percent and not where it buys half of one. Wherever no multi-head
+calibration runs, and on a grouped run, `auto` is `seed`.
 
 **Mechanism** (`stages/rt_bootstrap.rs`). On the run that adapts the library (a single
 `run`; under `run-experiment` the first run when `experiment.rt_library_scope =
@@ -698,23 +707,33 @@ fails for it.
 **Provenance.** `<run>/fragment_library_precursors_multihead.parquet.summary.json` gains
 `anchor_source` (`search` or `seed`) and either `search_anchors` (table, rows, distinct base
 peptides, `q_train`, the seed anchor count, the seed-anchored library) or
-`search_anchors_fallback` (the reason). A single `run` records the anchor table in
+`search_anchors_fallback` (the reason). Under `auto` it also gains `anchors_auto` (the seed
+anchor count, the anchor cut reached, `multihead_search_below`, and `chose`), and the run logs
+one INFO line with the choice: `rt-bootstrap: multihead_anchors = auto chose search anchors`
+or `... kept the seed anchors`. A single `run` records the anchor table in
 `manifest.json` as `rt_bootstrap_anchors` (schema v1) and names the RT model
 `deeplc-<version>-multihead-<N>-search-anchors` when the refit happened. The experiment
-manifest names the requested model the same way; whether each adapting run refitted or fell
-back is in its summary. One INFO line per refit gives the anchor counts:
+manifest names the model the same way under `search`, and under `auto` when the first run's
+library records `anchor_source = search` (`first_run_only`); under `auto` with `per_run`, where
+runs may choose differently, it names `...-multihead-<N>-auto-anchors`. Whether each adapting
+run refitted or fell back is in its summary. One INFO line per refit gives the anchor counts:
 `rt-bootstrap: refitting the multi-head calibration on N search anchors ... instead of M seed
 anchors`.
 
-**Interplay.** Refused at load with `finetune_deeplc`, with `multihead_calibration = 0` and
-with `groups.window_groups > 1` (a grouped run calibrates per band and has no single-run
-search to take anchors from). Where no multi-head calibration runs under the automatic head
-count (no DeepLC interpreter, or a native retention-time source), the option is inert and the
-run warns. Under `run-experiment` it turns off `experiment.overlap_front_threads` for the
-first run, because the first run's adaptation is then a whole search rather than one DeepLC
-worker, and it would compete with the overlapped fronts for the same threads. The default,
-`seed`, is omitted from the canonical configuration, so the config hash of every existing
-configuration is unchanged.
+**Interplay.** An explicit `search` is refused at load with `finetune_deeplc`, with
+`multihead_calibration = 0` and with `groups.window_groups > 1` (a grouped run calibrates per
+band and has no single-run search to take anchors from); `auto` is `seed` in all three and is
+never refused. Where no multi-head calibration runs under the automatic head count (no DeepLC
+interpreter, or a native retention-time source), an explicit `search` is inert and the run
+warns; `auto` is silently `seed`. Under `run-experiment` an explicit `search` turns off
+`experiment.overlap_front_threads` for the first run, because the first run's adaptation is
+then a whole search rather than one DeepLC worker. `auto` cannot know before run 1's seed, so
+it keeps the overlap; when it chooses the bootstrap, the pass runs in a pool of the
+adaptation's thread share beside the fronts (`rt_bootstrap::refit`), and the smoke test checks
+that the overlapped experiment scores byte-identically to the sequential one. It chooses the
+bootstrap on runs short of seed anchors, which are the small ones. The default, `auto`, and
+the default threshold are omitted from the canonical configuration, so a configuration that
+sets neither keeps its config hash; `seed` is now written when set.
 
 **Measured** (24 single-cell Astral runs, 2026-10, outside the engine with the same worker).
 Refitting the first run's calibration on its full-search identifications (targets at
@@ -757,15 +776,37 @@ Measured on one single-cell run (6.4M-row library, 4.17M unique peptidoforms, 32
 254 s with `seed` against 317 s with `search` (+63 s: bootstrap search 28 s, refit 27 s of
 which 16 s evaluates the cached projection). With the cache off (`MUMDIA_CACHE_DIR=off`) the
 refit predicts the library again, and the adapting run took about 21 min against about 10.5
-(six runs sharing one host). Under `run-experiment` the lost `overlap_front_threads` overlap
-(see Interplay) is a further cost on the first run that was not measured on bulk data, where
-convert is minutes per file.
+(six runs sharing one host). On a bulk experiment (ProteoBench Astral, three runs, a
+17M-row library, one host to itself, default threads, cache on): 10:01 with `seed` against
+15:08 with `search` (+51%): bootstrap pass 2:00, refit 2:13 (72 s evaluating the cached
+projection of 7.5M peptidoforms, then the library rewrite), and the lost overlap of an
+explicit `search` only about 20 s. That bulk cost buys +0.46% (below), which is why `auto`
+does not spend it there.
 
-**Status.** Default off. The entrapment arms above cover two acquisitions (Astral, Orbitrap
-AIF) with seeds and show no FDP increase; they ran the bootstrap outside the engine, and the
-engine path was checked against that emulation on six runs. The Rust unit tests and the stub
-arm of `ci/smoke.sh` (section 5c) exercise the orchestration and the anchor table; the real
-DeepLC refit is exercised only by the runs above.
+**Measured through the engine** (2026-10-12, merged `search` path, three NN seeds per arm,
+32 threads, projection cache on, one host):
+
+| Set | Seed anchors | `seed` | `search` | Entrapment FDP `seed` -> `search` |
+|---|---|---|---|---|
+| Single-cell HeLa on a human/yeast/E. coli library | 1,249 | 15,729 real at FDP 1% | 16,526 (+5.1%) | at q 1%: 0.84-1.04% -> 0.73-0.74% |
+| Orbitrap AIF E. coli entrapment (lib2) | 5,025 | 12,050 | 12,155 (+0.9%) | 1.00-1.03% -> 1.00-1.03% |
+| ProteoBench Astral entrapment, 3 runs pooled | 13,786 | 91,501 precursors | 91,920 (+0.46%) | paired 0.84-0.91% -> 0.85-0.88% |
+
+With the single-cell plate (100-250 seed anchors per cell, +5.5% to +7.8%), the gain is
+monotonic in the seed anchor count: several percent below about 1,500, under 1% above 5,000.
+`multihead_search_below = 2500` sits between the two measured points that bound the change.
+`search` gained on every seed of every set, and the FDP held or fell. One caveat: the
+refitted library depends on which targets the bootstrap search accepts, and that depends on
+the arithmetic of DeepLC and the NN, so it is draw-sensitive like a fine-tune. A bulk run at a
+different thread count (64) doubled one run's `w_rt` (49 to 98 s) and lost 0.35%; at 32
+threads all nine `search` jobs kept `w_rt` within a few seconds of `seed`.
+
+**Status.** `auto` is the default since 2026-10-12: entrapment through the engine on three
+datasets and two acquisition types (Orbitrap Astral, Orbitrap AIF), with seeds, plus the
+single-cell plate and the HYE mixture above. `seed` restores the previous behaviour exactly;
+`search` forces the bootstrap. The Rust unit tests and the stub arms of `ci/smoke.sh` (section
+5c: `boot*`, `auto`, `auto_overlap`, `auto_seed`) exercise the orchestration, the decision and
+the anchor table; the real DeepLC refit is exercised only by the runs above.
 
 ### 5. Optional adaptive per-region window (default off)
 
@@ -1017,7 +1058,8 @@ though the enum variant still exists.
 | `loess_span` | `0.3` | LOESS local-fit fraction; passed as `span` to `Loess::fit` (rt_im_train.rs:137). Fraction of anchors in each local window. |
 | `fallback_rt_window_s` | `120.0` | Fixed half-window (seconds) when anchors are too few (`WindowPlan::Fixed`, rt_im_train.rs:168-175); also the upper clamp for adaptive bin widths (rt_im_train.rs:211). |
 | `finetune_deeplc` | `false` | Enable the DeepLC multitask fine-tune pre-step in `run` (run.rs:265). Requires `predict_frag.deeplc_python` (preflight, run.rs:62-67). On one measured run it was not needed per file once the library iRT had been fine-tuned once: the per-run LOESS reached the same residuals for much less wall clock (see the fine-tune section for the scope of that measurement). |
-| `multihead_anchors` | `seed` | Anchors of the multi-head calibration on the run that adapts the library. `search` refits it on the confident targets (`precursor_q <= q_train`, observed RT = `apex_rt`) of a bootstrap search of that run in `<run>/rt_bootstrap/`, and falls back to the seed-anchored library with a warning when that is not possible. Refused with `finetune_deeplc`, `multihead_calibration = 0` and `groups.window_groups > 1`. Benchmark-gated (section 4f). |
+| `multihead_anchors` | `auto` | Anchors of the multi-head calibration on the run that adapts the library. `search` refits it on the confident targets (`precursor_q <= q_train`, observed RT = `apex_rt`) of a bootstrap search of that run in `<run>/rt_bootstrap/`, and falls back to the seed-anchored library with a warning when that is not possible; refused with `finetune_deeplc`, `multihead_calibration = 0` and `groups.window_groups > 1`. `seed` never does. `auto` is `search` on a run whose seed found fewer than `multihead_search_below` anchors (or only at a relaxed q), else `seed` (section 4f). |
+| `multihead_search_below` | `2500` | `auto`'s threshold on the seed anchor count (distinct target base peptides at `q_train`). |
 | `finetune_epochs` | `25` | Fine-tune epoch cap (`--epochs`); early stopping usually halts sooner. Used only when `finetune_deeplc`. |
 | `finetune_patience` | `10` | Early-stopping patience (`--patience`): epochs without val-loss improvement before stopping. |
 | `finetune_batch` | `0` | Fine-tune batch size (`--batch`). `0` auto-scales to the seed size so each epoch has ~30+ steps (config.rs:473-477); a fixed large batch underfits small seeds. |

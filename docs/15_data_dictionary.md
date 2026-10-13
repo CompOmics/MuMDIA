@@ -186,7 +186,8 @@ Per-run fragment mass recalibration sidecar consumed by `extract`.
 
 ### rt_bootstrap_anchors (`rt_bootstrap.rs`, `write_search_anchors`)
 
-Written only under `rt_im_train.multihead_anchors = search`, to
+Written only when the bootstrap runs (`rt_im_train.multihead_anchors = search`, or the
+default `auto` on a run short of seed anchors), to
 `<run>/rt_bootstrap/search_anchors.parquet`: the confident targets of the bootstrap
 search that the multi-head calibration is refitted on (docs/08 section 4f). Seed-shaped,
 so `deeplc_finetune.py` reads it as it reads `seed_psms`. One row per candidate, ascending
