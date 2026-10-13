@@ -105,6 +105,101 @@
       "source_struct": "ConvertConfig"
     },
     {
+      "path": "convert.tdf_mz_ppm",
+      "name": "tdf_mz_ppm",
+      "section": "convert",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 10.0,
+      "default_text": "10.0",
+      "help": "Native diaPASEF reader (`stages::convert::tdf`): m/z merge tolerance in ppm between neighbouring TOF points of one centroid (single linkage). Default 10. Read only for a timsTOF `.d` whose frames are diaPASEF, which `convert` reads natively; every other input ignores the `tdf_*` keys. Each `tdf_*` key is omitted from the canonical configuration at its default, so it changes no config hash.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_im_gap_scans",
+      "name": "tdf_im_gap_scans",
+      "section": "convert",
+      "rust_type": "u32",
+      "kind": "integer",
+      "optional": false,
+      "default": 30,
+      "default_text": "30",
+      "help": "Native diaPASEF reader: a gap of more than this many TIMS scans without signal splits one m/z trace into separate centroids. Default 30. Provisional: it rests on a peak census of one run and the seed plateau, not on an end-to-end sweep.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_min_points",
+      "name": "tdf_min_points",
+      "section": "convert",
+      "rust_type": "u32",
+      "kind": "integer",
+      "optional": false,
+      "default": 2,
+      "default_text": "2",
+      "help": "Native diaPASEF reader: a centroid built from fewer raw TOF x scan points than this is dropped. Default 2. Provisional, as `tdf_im_gap_scans`.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_mz_valley",
+      "name": "tdf_mz_valley",
+      "section": "convert",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "Native diaPASEF reader: split each m/z x mobility cluster at the valleys of its m/z profile. A local minimum of the smoothed profile is a cut when it is below this fraction of the smaller of the two humps beside it, so one ion stays one centroid and two neighbouring ions become two. Must be in [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated (docs/35_diapasef.md).",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_mz_smooth_ppm",
+      "name": "tdf_mz_smooth_ppm",
+      "section": "convert",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 8.0,
+      "default_text": "8.0",
+      "help": "Native diaPASEF reader: half-width in ppm of the triangular smoothing applied to the m/z profile before `tdf_mz_valley` looks for valleys; 0 is no smoothing. Default 8. Unused while `tdf_mz_valley` is 0.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_im_valley",
+      "name": "tdf_im_valley",
+      "section": "convert",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "Native diaPASEF reader: split each cluster (after the m/z valley split, when that is on) at the valleys of its mobility profile, the summed intensity per TIMS scan after a triangular smoothing of half-width `tdf_im_smooth_scans`. Separates ions of one m/z whose mobility profiles touch without a `tdf_im_gap_scans` gap. Must be in [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ConvertConfig"
+    },
+    {
+      "path": "convert.tdf_im_smooth_scans",
+      "name": "tdf_im_smooth_scans",
+      "section": "convert",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 8.0,
+      "default_text": "8.0",
+      "help": "Native diaPASEF reader: half-width in TIMS scans of the mobility profile smoothing used by `tdf_im_valley`; 0 is no smoothing. Default 8. Unused while `tdf_im_valley` is 0.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
       "path": "prescan.tol_da",
       "name": "tol_da",
       "section": "prescan",

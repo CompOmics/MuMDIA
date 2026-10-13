@@ -57,7 +57,7 @@ Commands:
   align           Cross-run RT alignment (experiment-level) -> alignment.parquet
   mbr             Match-between-runs identification transfer (Stage D3) -> transferred.parquet
   inspect         Print schema, head sample, and row count for any artifact
-  peak-census     Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard
+  peak-census     Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard
   audit           Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute
   report          Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory
   cache           Show, trim or clear the engine's caches: FASTA-built libraries and DeepLC's trunk projection (docs/14, "The engine's caches")
@@ -153,7 +153,7 @@ first sentence of the description, with the full text in the section below.
 | [`align`](#align) | yes | Cross-run RT alignment (experiment-level) -> alignment.parquet |
 | [`mbr`](#mbr) | yes | Match-between-runs identification transfer (Stage D3) -> transferred.parquet |
 | [`inspect`](#inspect) | no | Print schema, head sample, and row count for any artifact |
-| [`peak-census`](#peak-census) | yes | Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard |
+| [`peak-census`](#peak-census) | yes | Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard |
 | [`audit`](#audit) | no | Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). |
 | [`report`](#report) | yes | Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory |
 | [`cache`](#cache) | yes | Show, trim or clear the engine's caches: FASTA-built libraries and DeepLC's trunk projection (docs/14, "The engine's caches") |
@@ -716,9 +716,9 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ## peak-census
 
 ```text
-Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard.
+Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard.
 
-The pre-flight for a decision the documentation says must be made per acquisition. Reading it before setting a cap is the difference between bounding peak volume and deleting fragment evidence from most spectra.
+The pre-flight for a decision the documentation says must be made per acquisition. Reading it before setting a cap is the difference between bounding peak volume and deleting fragment evidence from most spectra. A diaPASEF `.d` is counted after the native reader's centroiding, which is what `convert` writes for it.
 
 Usage: mumdia peak-census [OPTIONS] --mzml <MZML>
 
@@ -726,7 +726,7 @@ Options:
       --mzml <MZML>
 
       --max-spectra <MAX_SPECTRA>
-          Stop after this many spectra from the head of the file (0 = all)
+          Stop after this many spectra from the head of the file (0 = all); for a diaPASEF `.d`, this many frames
 
           [default: 0]
 

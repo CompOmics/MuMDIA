@@ -52,7 +52,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | Section | Struct | Fields | Stage document |
 |---|---|---|---|
 | [(top level)](#top-level) | `Config` | 17 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
-| [`convert`](#convert) | `ConvertConfig` | 5 |  |
+| [`convert`](#convert) | `ConvertConfig` | 12 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
 | [`prescreen`](#prescreen) | `PrescreenConfig` | 31 |  |
 | [`prescreen.tags`](#prescreentags) | `PrescreenTagsConfig` | 7 |  |
@@ -112,6 +112,13 @@ Vendor-format conversion, read by every subcommand that takes a spectra path (`r
 | `msconvert_args` | `Vec<String>` | `[]` |  | Extra arguments appended to every `msconvert` invocation. An escape hatch, not a tuning surface. The per-vendor defaults already request indexed 64-bit zlib mzML, vendor peak picking where it exists, and `--combineIonMobilitySpectra` for Bruker. Use this for something the defaults cannot express, such as an `--filter` that trims an acquisition. Arguments are passed through verbatim and are not validated. |
 | `reuse_converted` | `bool` | `true` |  | Reuse an mzML that already sits beside the `.raw` and is newer than it. On by default: conversion is minutes per file and its output is deterministic given the same converter, so re-running a search should not pay for it twice. Turn it off when the neighbouring mzML may have come from a different converter or a different `.raw` of the same name. |
 | `parallel_conversions` | `usize` | `4` |  | How many vendor files `run` and `run-experiment` convert to mzML at once. Default 4. Every vendor input is converted before the first run starts, and the conversions used to run one after another, so an experiment of N `.raw` files paid N converter runs of several minutes each on the critical path. Each conversion is a separate child process writing its own destination under its own lock, and its output does not depend on what else runs beside it, so running them concurrently changes the wall time only. The bound is there because a converter reads a multi-GB file and writes a larger one: more at once than the disk can feed is slower, not faster. `1` converts one at a time, as before. Only the first conversion of an input pays this at all; `reuse_converted` skips the rest. Not measured at scale. |
+| `tdf_mz_ppm` | `f64` | `10.0` |  | Native diaPASEF reader (`stages::convert::tdf`): m/z merge tolerance in ppm between neighbouring TOF points of one centroid (single linkage). Default 10. Read only for a timsTOF `.d` whose frames are diaPASEF, which `convert` reads natively; every other input ignores the `tdf_*` keys. Each `tdf_*` key is omitted from the canonical configuration at its default, so it changes no config hash. |
+| `tdf_im_gap_scans` | `u32` | `30` |  | Native diaPASEF reader: a gap of more than this many TIMS scans without signal splits one m/z trace into separate centroids. Default 30. Provisional: it rests on a peak census of one run and the seed plateau, not on an end-to-end sweep. |
+| `tdf_min_points` | `u32` | `2` |  | Native diaPASEF reader: a centroid built from fewer raw TOF x scan points than this is dropped. Default 2. Provisional, as `tdf_im_gap_scans`. |
+| `tdf_mz_valley` | `f64` | `0.0` | benchmark-gated | Native diaPASEF reader: split each m/z x mobility cluster at the valleys of its m/z profile. A local minimum of the smoothed profile is a cut when it is below this fraction of the smaller of the two humps beside it, so one ion stays one centroid and two neighbouring ions become two. Must be in [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated (docs/35_diapasef.md). |
+| `tdf_mz_smooth_ppm` | `f64` | `8.0` |  | Native diaPASEF reader: half-width in ppm of the triangular smoothing applied to the m/z profile before `tdf_mz_valley` looks for valleys; 0 is no smoothing. Default 8. Unused while `tdf_mz_valley` is 0. |
+| `tdf_im_valley` | `f64` | `0.0` | benchmark-gated | Native diaPASEF reader: split each cluster (after the m/z valley split, when that is on) at the valleys of its mobility profile, the summed intensity per TIMS scan after a triangular smoothing of half-width `tdf_im_smooth_scans`. Separates ions of one m/z whose mobility profiles touch without a `tdf_im_gap_scans` gap. Must be in [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated. |
+| `tdf_im_smooth_scans` | `f64` | `8.0` |  | Native diaPASEF reader: half-width in TIMS scans of the mobility profile smoothing used by `tdf_im_valley`; 0 is no smoothing. Default 8. Unused while `tdf_im_valley` is 0. |
 
 ## prescan
 
@@ -1146,6 +1153,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-23 structs and 279 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 35 enumerations, 1 named profile(s), 98 environment variables read and 20 set.
+23 structs and 286 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 35 enumerations, 1 named profile(s), 98 environment variables read and 20 set.
 
-21 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+23 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

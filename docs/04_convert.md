@@ -14,21 +14,26 @@ vendor-format dependency is isolated here, and any format quirk (profile vs
 centroid, AIF/all-ion windows, missing precursor) must be resolved at this stage
 because later stages assume the normalized shape.
 
-The MVP is mzML-only and 3D. Ion-mobility columns are therefore absent from the
-artifacts. convert writes no IM columns at all, and the in-memory
-`IsolationWindow` carries `Option` IM bounds that the read side fills with `None`
-(`crates/mumdia-core/src/types.rs:40-41`, `spectra.rs:150-151`).
+An mzML run is 3D: convert writes no ion-mobility column, records schema v1 for
+every artifact, and the in-memory `IsolationWindow` carries `None` 1/K0 bounds. The
+one exception is a Bruker timsTOF `.d` with diaPASEF frames, which convert reads
+natively (`stages/convert/tdf.rs`, section "Vendor formats" below) and writes as v2
+artifacts that add the per-peak 1/K0 and the window 1/K0 bounds. The read side fills
+`IsolationWindow::im_lower/im_upper` from the v2 window columns, so diaPASEF slots
+that share an m/z range stay separate windows; the per-peak 1/K0 is not decoded yet.
+docs/35_diapasef.md is the canonical treatment of the 4D path.
 
 `Peak` carries no IM field. It used to: a per-peak `Option<f32>` written `None` at
 three sites and read at none, costing 8 of the struct's 24 bytes because an `f32`
 has no niche. A 4D run wants a per-scan `Vec<f32>` parallel to `peaks`, the same
-shape `Ms1Scan` already uses for its own arrays, added when 4D is supported.
+shape the v2 spectra artifact stores (`im`), added when a stage reads it.
 
 ## Files
 
 | Path | Role |
 |---|---|
 | `rust/mumdia/crates/mumdia/src/stages/convert.rs` | The whole stage: mzML reading, centroiding, peak capping, window synthesis, artifact writing. |
+| `rust/mumdia/crates/mumdia/src/stages/convert/tdf.rs` | The native diaPASEF reader: timsrust frames, scan-to-1/K0 calibration, m/z x mobility centroiding, valley splits (docs/35_diapasef.md). |
 | `rust/mumdia/crates/mumdia/src/main.rs` (`Cmd::Convert` flags at lines 28-47, dispatch at 430-454) | CLI subcommand; builds the provenance `config_hash` and calls `convert::run`. |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` (lines 201-215) | The `run` orchestrator's call into convert (top_peaks_ms1 hardcoded to 0). |
 | `rust/mumdia/crates/mumdia/src/spectra.rs` | The read-back side: `load_ms1` / `load_ms2` turn the artifacts back into in-memory scans for downstream stages. |
@@ -64,6 +69,9 @@ but convert writes neither as null. An empty scan is a non-null empty list
 | `mz` | `List<f32>` | Centroided, m/z-ascending peak m/z (widened to f64 on read). |
 | `intensity` | `List<f32>` | Peak intensities, aligned to `mz`. |
 
+v2 (`SPECTRA_MS1_V2`, native diaPASEF only) adds `im`, a per-peak 1/K0 list aligned
+to `mz`.
+
 ### `spectra_ms2.parquet` (`SPECTRA_MS2`, schema v1; written at `convert.rs:198`)
 
 | Column | Type | Meaning |
@@ -80,6 +88,10 @@ but convert writes neither as null. An empty scan is a non-null empty list
 | `mz` | `List<f32>` | Centroided, m/z-ascending fragment m/z. |
 | `intensity` | `List<f32>` | Fragment intensities, aligned to `mz`. |
 
+v2 (`SPECTRA_MS2_V2`, native diaPASEF only) adds `window_im_lower` and
+`window_im_upper` (nullable `f32`, before `mz`) and a per-peak `im` list (last). The
+window id then deduplicates on the m/z and the 1/K0 bounds (`IsolationWindow::key`).
+
 ### `isolation_windows.parquet` (`ISOLATION_WINDOWS`, schema v1; written at `convert.rs:215`)
 
 | Column | Type | Meaning |
@@ -88,6 +100,9 @@ but convert writes neither as null. An empty scan is a non-null empty list
 | `target` | `f64` | Window center m/z. |
 | `lower` | `f64` | Window lower bound m/z. |
 | `upper` | `f64` | Window upper bound m/z. |
+
+v2 (`ISOLATION_WINDOWS_V2`, native diaPASEF only) adds `im_lower` and `im_upper`
+(nullable `f32`), one row per diaPASEF slot. Provenance only: no stage reads them.
 
 ### `ms2_to_ms1.parquet` (`MS2_TO_MS1`, schema v1; written at `convert.rs:228`)
 
@@ -315,19 +330,20 @@ acquisition does not inflate them.
 
 ## Configuration
 
-convert reads no `Config` fields, and its subcommand has no `--config` flag
-(`main.rs:28-47`). The stage function signature does not take a `Config`; the
-`config_hash` it receives is only recorded for provenance. The CLI wrapper still
-loads the default config via `load_config(&None)` (`main.rs:437`) purely to seed
-that hash: `config_hash = blake3(cfg.canonical_json() + separators + caps)`
-(`main.rs:442-445`), so the default config's canonical JSON is embedded in the
-hash even though no config field alters the output.
+For an mzML, convert reads no `Config` field: the `config_hash` it receives is only
+recorded for provenance, `config_hash = blake3(cfg.canonical_json() + separators +
+caps)`, so the config's canonical JSON is embedded in the hash even though no field
+alters the output. The native diaPASEF reader reads the seven `convert.tdf_*` keys
+(`TdfParams::from_config`): the centroiding tolerance, gap and floor, and the two valley
+splits with their smoothing (docs/35_diapasef.md, section 2). Each is omitted from the
+canonical configuration at its default, so the config hash of a configuration that
+does not set them is unchanged.
 
 | CLI flag | Default | Effect |
 |---|---|---|
 | `--mzml` | (required) | Input mzML path. |
 | `--out-dir` | (required) | Output directory for the four artifacts. |
-| `--max-spectra` | `0` (all) | Read at most N spectra, for fast iteration. Counts all MS levels. |
+| `--max-spectra` | `0` (all) | Read at most N spectra, for fast iteration. Counts all MS levels. On the native diaPASEF path it counts frames: an MS2 frame yields one spectrum per slot. |
 | `--top-peaks-ms2` | `0` (uncapped) | Keep at most N most-intense MS2 peaks per scan. Irreversible conversion-time cap; acquisition-specific, see below. |
 | `--top-peaks-ms1` | `0` (uncapped) | Keep at most N most-intense MS1 peaks per scan. Irreversible. |
 
@@ -358,11 +374,11 @@ collapse to an identical hash. `run` does the same for its own convert call
 (`run.rs:201-207`). The same values are recorded in the convert report
 `params` (`convert.rs:245-251`).
 
-The centroid noise floor (`1e-4` relative, `convert.rs:25`) and the full-range AIF
-window value (`1.0e6`, `convert.rs:143`) are hardcoded constants, not config
-fields. `Config` contains no convert-stage field at all and no centroiding
-strategy enum. Any change to centroiding or window synthesis is a code change
-here, not a config toggle.
+The mzML centroid noise floor (`1e-4` relative) and the full-range AIF window value
+(`1.0e6`) are hardcoded constants, not config fields, and there is no centroiding
+strategy enum. Any change to mzML centroiding or window synthesis is a code change
+here, not a config toggle. The `convert.tdf_*` keys apply to the native diaPASEF reader
+only.
 
 ### The instrument record
 
@@ -523,16 +539,19 @@ to 2,286,840 (12.2x) and extract wall clock from 57.9 s to 91.9 s.
 
 ## Vendor formats
 
-The engine reads mzML. A vendor file passed to `--mzml` is converted to mzML first
+The engine reads mzML, and one vendor format natively: a Bruker timsTOF `.d` with
+diaPASEF frames. Any other vendor file passed to `--mzml` is converted to mzML first
 by an external converter, and every subcommand that takes a spectra path does this:
-`convert`, `run`, `run-experiment` and `peak-census`. `raw.rs` is the whole of it;
-nothing downstream of `convert` knows a vendor file was involved.
+`convert`, `run`, `run-experiment` and `peak-census`. `raw.rs` makes the decision
+(`raw::detect`) and runs the converters; nothing downstream of `convert` knows a
+vendor file was involved.
 
 | Input | Converter | State |
 |---|---|---|
 | mzML | none | supported |
+| Bruker timsTOF `.d` (dir) with diaPASEF frames | none: native reader (timsrust), ion mobility kept | supported; the 1/K0 columns are written but not yet used by the search (docs/35_diapasef.md) |
 | Thermo `.raw` (file) | ThermoRawFileParser, or msconvert | **exercised end to end** (doxy, 2026-09-06: a 3.7 GB Astral `.raw` through `mumdia convert --mzml x.raw`, ThermoRawFileParser 2.0.0 found by `auto`, 6:40 and 4.4 GB for the converter, 3.4 GB mzML renamed into place beside the input, reused by the next run in 1.3 s; `peak-census` on the same `.raw` likewise) |
-| Bruker `.d` (dir) | msconvert | wired, unverified; **ion mobility is discarded** |
+| Bruker `.d` (dir), any other | msconvert | wired, unverified; **ion mobility is discarded** |
 | SCIEX `.wiff` / `.wiff2` | msconvert | wired, unverified; a `.wiff` needs its `.wiff.scan` companion beside it, and the engine names that file when msconvert fails without it |
 | Agilent `.d` (dir) | msconvert | wired, unverified |
 | Waters `.raw` (dir) | msconvert | wired, unverified |
@@ -552,10 +571,33 @@ left no partial mzML behind and reused nothing on the rerun.
 `mzdata` can read several of these directly, and that was rejected on build grounds
 rather than capability. Those readers need the vendors' own libraries and, for
 Thermo and SCIEX, a .NET runtime, while the workspace pins `mzdata` to
-`default-features = false, features = ["mzml", "miniz_oxide"]` precisely so that
-building MuMDIA needs no C, C++ or .NET toolchain (`CLAUDE.md`, "Build gotchas: do
-not fix these back"). Linking a vendor reader imposes that on every build on every
-platform, including the ones that never see a vendor file.
+`default-features = false, features = ["mzml", "miniz_oxide"]` so that building
+MuMDIA needs no vendor SDK, C++ or .NET toolchain. Linking a vendor reader imposes
+that on every build on every platform, including the ones that never see a vendor
+file.
+
+The native diaPASEF reader is the exception, because it needs none of those: a TDF is
+an SQLite index plus zstd-compressed frames. timsrust 0.4.2 (with only its `tdf`
+feature) brings a bundled SQLite, which is C, like the `zstd-sys` that parquet already
+compiles, so no new toolchain is required. The graph keeps one `zstd-sys` and one
+`libsqlite3-sys` (both are `links` crates); `rusqlite` is pinned to timsrust's minor
+version for that reason.
+
+### The native diaPASEF reader
+
+A `.d` is read natively only when `raw::is_native_diapasef` holds: `analysis.tdf` and
+`analysis.tdf_bin` exist, the `Frames` table has diaPASEF frames (`MsMsType` 9) and no
+ddaPASEF frames (8), and `GlobalMetadata.TimsCompressionType` is 2. The probe is a
+read-only SQLite query of the metadata. Such a `.d` is `Vendor::BrukerTdf`, which needs
+no conversion, so `ensure_mzml` hands the path through and `convert` decodes it
+(`stages/convert/tdf.rs`). Each diaPASEF slot of an MS2 frame becomes one spectrum
+with its m/z and 1/K0 bounds; peaks are centroided in m/z x mobility and carry their
+1/K0. The artifacts are v2, the spectra reports record `params.reader = "timsrust"`
+and the `convert.tdf_*` settings, and `params.instrument` comes from
+`GlobalMetadata.InstrumentName`. There is no automatic msconvert retry after a native
+decode failure. `peak-census` on such a `.d` counts after the native centroiding.
+docs/35_diapasef.md, section 2, has the reader in full, its settings, its measured
+motivation and its scope.
 
 ### Two converters, and the licence difference between them
 
@@ -574,18 +616,18 @@ converter versions.
 
 ### Bruker and ion mobility
 
-**MuMDIA's pipeline is 3D and discards ion mobility** (README, "No ion mobility").
-For diaPASEF this removes the mobility separation that makes the acquisition
-selective, so a Bruker `.d` will search with substantially more interference and
-fewer identifications than a 4D engine on the same file. The engine warns about this
-on every Bruker input, and the desktop application says it under the file picker.
+A Bruker `.d` on the msconvert route loses its ion mobility. For a mobility-separated
+acquisition this removes the separation that makes it selective, so it searches with
+more interference and fewer identifications. The engine warns about this for every
+Bruker input that goes to msconvert (not for a diaPASEF `.d`, which the native reader
+takes), and the desktop application says it under the file picker.
 
 It is a warning and not a refusal, for a specific reason: the loss is sensitivity,
 not FDR validity. Targets and decoys see the same added interference, so the
 threshold stays calibrated while fewer things pass it. A user with non-PASEF Bruker
-DIA is also well served. But a diaPASEF user who is not told this will read a low
-count as a MuMDIA result rather than as the cost of discarding the dimension their
-acquisition exists to produce.
+DIA is also well served. But a user who is not told this will read a low count as a
+MuMDIA result rather than as the cost of discarding the dimension the acquisition
+exists to produce.
 
 msconvert is invoked with `--combineIonMobilitySpectra` for Bruker, which is what
 turns a mobility-resolved frame into the 3D spectra this pipeline reads. Without it
@@ -602,10 +644,11 @@ Both are real and both are handled in `raw::detect`:
   A path that does not exist is treated as Thermo, so the error names the missing
   file rather than the format.
 - **`.d` is Bruker or Agilent**, both directories. Bruker's holds `analysis.tdf`
-  (timsTOF) or `analysis.baf`; Agilent's holds `AcqData/`. Both go to msconvert
-  regardless, so this distinction exists only so the ion-mobility warning fires for
-  Bruker and not for Agilent. Unrecognised contents fall to Bruker, which is the
-  commoner `.d` here and the safer warning to emit.
+  (timsTOF) or `analysis.baf`; Agilent's holds `AcqData/`. A timsTOF `.d` with
+  diaPASEF frames is read natively (above). Every other Bruker `.d` and every Agilent
+  `.d` goes to msconvert, so the Bruker/Agilent distinction there exists only so the
+  ion-mobility warning fires for Bruker and not for Agilent. Unrecognised contents
+  fall to Bruker, which is the commoner `.d` here and the safer warning to emit.
 
 The desktop application needs a folder picker as well as a file picker for exactly
 this reason: three of the five vendor formats are directories.
@@ -698,15 +741,15 @@ the vendor path only, which is why it carries no benchmark number here.
   same per-spectrum interface, and keep the four output schemas byte-compatible so
   no downstream stage changes. Convert must stay the sole vendor-format touch
   point.
-- **Ion mobility / 4D (diaPASEF).** The artifact schemas here are 3D. Adding IM
-  means new nullable columns on `spectra_ms2` (and the isolation-window IM bounds
-  already modeled as `Option` in `types.rs:40`), plus a per-scan IM array on the
-  read side: give `Ms2Scan` a `Vec<f32>` parallel to `peaks`, as `Ms1Scan` already
-  does for its own arrays. Do not put it back on `Peak`: one `Option<f32>` per MS2
-  point is 8 bytes on the engine's largest resident array, 1.28 GiB on a HYE Astral
-  run, and the previous version of that field was written `None` and never read.
-  Bump the affected schema versions in `schema.rs` when columns change, since the
-  version guards downstream model/schema matching.
+- **Ion mobility / 4D (diaPASEF).** The v2 spectra artifacts already carry the
+  per-peak 1/K0 and the window 1/K0 bounds (docs/35_diapasef.md). A stage that needs
+  the per-peak 1/K0 adds a per-scan array on the read side: give `Ms2Scan` a
+  `Vec<f32>` parallel to `peaks`, as `Ms1Scan` does for its own arrays. Do not put
+  it back on `Peak`: one `Option<f32>` per MS2 point is 8 bytes on the engine's
+  largest resident array, 1.28 GiB on a HYE Astral run, and the previous version of
+  that field was written `None` and never read. A new 4D column goes through a
+  selector in `schema.rs` (`artifact::X(has_im)`), so 3D artifacts keep their version
+  and bytes.
 - **Change centroiding.** Edit `centroid` (`convert.rs:19`). If the choice should
   be user-selectable, add a config field and strategy enum in `mumdia-core`
   (per the project convention that every algorithmic choice is a typed config

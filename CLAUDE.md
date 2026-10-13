@@ -105,7 +105,8 @@ Key semantics:
   also shrinks the seed's input; above it the two do not interact, and seed
   output was identical with and without a 300-peak conversion cap.
 - `--max-spectra N` reads the head of the mzML. It does not select a
-  mid-gradient slice.
+  mid-gradient slice. On a natively read diaPASEF `.d` it counts frames, not
+  spectra (an MS2 frame yields one spectrum per slot).
 - A vendor path given as `--mzml` is converted to mzML first by
   `raw::ensure_mzml` (`convert`, `run`, `run-experiment`, `peak-census`): Thermo
   `.raw` by ThermoRawFileParser, Bruker/Agilent `.d`, SCIEX `.wiff` and Waters
@@ -115,6 +116,10 @@ Key semantics:
   `mumdia doctor` reports both converters and never fails for their absence.
   Only Thermo is exercised end to end; `docs/04_convert.md` "Vendor formats" has
   the table, the ion-mobility caveat for Bruker, and the extension collisions.
+  The exception is a timsTOF `.d` with diaPASEF frames (`raw::Vendor::BrukerTdf`,
+  decided by a read-only probe of `analysis.tdf`): `convert` reads it natively and
+  keeps the 1/K0 (`docs/35_diapasef.md`); every other Bruker `.d` goes to
+  msconvert.
 - An imported library row with an empty `protein` is grouped as `UNASSIGNED` at
   load, with a warning that counts the rows (DIA-NN writes the iRT-kit standards
   without a protein); `scripts/import_diann_lib.py` writes the same group at

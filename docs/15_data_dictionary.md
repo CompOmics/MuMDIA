@@ -50,6 +50,12 @@ their own sections at the end.
 | `mz` | List\<Float32\> | yes | m/z | centroided, m/z-sorted peak m/z values |
 | `intensity` | List\<Float32\> | yes | counts | peak intensities aligned to `mz` |
 
+v2 (written only by the native diaPASEF reader, docs/35_diapasef.md) appends:
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `im` | LargeList\<Float32\> | yes | V s cm^-2 | per-peak intensity-weighted 1/K0, aligned to `mz` |
+
 ### spectra_ms2 (`convert.rs:198-213`)
 
 | column | Arrow type | nullable | units | meaning |
@@ -57,7 +63,7 @@ their own sections at the end.
 | `scan_index` | UInt32 | no | - | monotonic scan index (shared axis with MS1) |
 | `id` | Utf8 | no | - | vendor spectrum id string |
 | `rt_seconds` | Float64 | no | s | scan start time |
-| `window_id` | UInt32 | no | - | dense id of the distinct isolation window (`(lower,upper)` bits), matches `isolation_windows.window_id` |
+| `window_id` | UInt32 | no | - | dense id of the distinct isolation window (`IsolationWindow::key`: the m/z bound bits, and on v2 the 1/K0 bound bits), matches `isolation_windows.window_id` |
 | `window_target` | Float64 | no | m/z | isolation-window target m/z (0.0 for AIF/all-ion) |
 | `window_lower` | Float64 | no | m/z | isolation-window lower bound (0.0 for AIF full-range fallback) |
 | `window_upper` | Float64 | no | m/z | isolation-window upper bound (1.0e6 for AIF full-range fallback) |
@@ -65,6 +71,15 @@ their own sections at the end.
 | `precursor_charge` | Int32 | yes | - | precursor charge, null when absent |
 | `mz` | List\<Float32\> | yes | m/z | centroided fragment m/z values |
 | `intensity` | List\<Float32\> | yes | counts | fragment intensities aligned to `mz` |
+
+v2 (native diaPASEF only) adds `window_im_lower` and `window_im_upper` after
+`precursor_charge`, and `im` after `intensity`:
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `window_im_lower` | Float32 | yes | V s cm^-2 | the slot's lower 1/K0 bound |
+| `window_im_upper` | Float32 | yes | V s cm^-2 | the slot's upper 1/K0 bound |
+| `im` | LargeList\<Float32\> | yes | V s cm^-2 | per-peak intensity-weighted 1/K0, aligned to `mz` |
 
 ### isolation_windows (`convert.rs:215-226`)
 
@@ -76,6 +91,9 @@ The distinct-window column is `window_id` (verified: `convert.rs:218`).
 | `target` | Float64 | no | m/z | window target m/z |
 | `lower` | Float64 | no | m/z | window lower bound |
 | `upper` | Float64 | no | m/z | window upper bound |
+
+v2 (native diaPASEF only) adds `im_lower` and `im_upper` (Float32, nullable, V s cm^-2):
+one row per diaPASEF slot. Provenance only; no stage reads them.
 
 ### ms2_to_ms1 (`convert.rs:228-234`)
 
