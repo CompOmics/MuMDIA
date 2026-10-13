@@ -504,6 +504,17 @@ first pass the merged-main defaults):
 | 22-run HYE mixture | proteins in >= 2 runs per condition 4,366 -> 5,298 | see the known gap |
 | 6-run Orbitrap AIF HYE | 82.2k -> 90.0k (+9.4%) | decoy fraction 1.00% in both |
 
+The same two entrapment pools through this implementation (`run-experiment` with the
+defaults of this branch, `mbr.strategy` left at its default, 2026-10-13):
+
+| pool | per-run IDs at 1% | null | wall clock, both passes |
+|---|---|---|---|
+| ProteoBench Astral entrapment, 3 NN seeds | 79.7k -> 85.9k (+7.8%) | entrapment FDP 0.93-1.03% -> 0.67-0.78% per run; precursor level unchanged | 21 min (32 threads) |
+| 22 HeLa QC runs, human + yeast + E. coli | 369,273 -> 422,928 (+14.5%) | species FDP 1.34% -> 0.81% (I/L-ambiguous excluded) | 30 min (48 threads) |
+
+The engine's HeLa first pass is above the script's (350,450) because it includes the
+`multihead_anchors = auto` bootstrap; the second pass's relative gain and FDP agree.
+
 The entrapment and species nulls see the false entries the first pass carries into the
 library and anything the second pass invents. The blank wells see a precursor reported
 where nothing is: 28k target and 27k decoy rows searched, none at 1%. The 438 blank targets
