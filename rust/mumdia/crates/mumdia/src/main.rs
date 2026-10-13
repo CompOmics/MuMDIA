@@ -950,27 +950,31 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
                         // (docs/08_rt_im_train.md). The engine refuses to launch a DeepLC
                         // worker below `MIN_DEEPLC_VERSION`, so doctor fails here too
                         // rather than warning about a run that cannot start.
-                        if role == Role::DeepLc && (required || wanted) {
-                            let floor = mumdia_core::constants::MIN_DEEPLC_VERSION;
-                            let (ma, mi, pa) = floor;
-                            match r.versions.get("deeplc") {
-                                Some(v)
-                                    if mumdia_core::constants::parse_version3(v)
-                                        .is_some_and(|t| t >= floor) => {}
-                                Some(v) => {
+                        if let Some((module, floor)) =
+                            role.version_floor().filter(|_| required || wanted)
+                        {
+                            let want = python::fmt_version(floor);
+                            let probed = r
+                                .versions
+                                .get(module)
+                                .cloned()
+                                .or_else(|| python::module_version(interp, module));
+                            match python::judge_version(probed, floor) {
+                                python::FloorCheck::Met(_) => {}
+                                python::FloorCheck::TooOld(v) => {
                                     ok = false;
                                     r.status = "fail".into();
                                     r.warnings.push(format!(
-                                        "DeepLC {v} is older than the required {ma}.{mi}.{pa}; \
-                                         the engine refuses to launch the DeepLC workers with it \
-                                         (pip install 'deeplc>={ma}.{mi}.{pa}')"
+                                        "{module} {v} is older than the required {want}; \
+                                         the engine refuses to launch the {module} workers with \
+                                         it (pip install '{module}>={want}')"
                                     ));
                                 }
-                                None => {
+                                python::FloorCheck::Unknown => {
                                     ok = false;
                                     r.status = "fail".into();
                                     r.warnings.push(format!(
-                                        "cannot determine the deeplc version; {ma}.{mi}.{pa} or \
+                                        "cannot determine the {module} version; {want} or \
                                          newer is required"
                                     ));
                                 }

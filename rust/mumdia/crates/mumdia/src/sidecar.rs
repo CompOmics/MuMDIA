@@ -218,17 +218,24 @@ pub fn module_version(python: &str, module: &str) -> Option<String> {
 /// 4.0.0a2 did (docs/08 section 4b). Both worker scripts repeat the check, but
 /// failing here is cheaper than failing after the input table has been written.
 pub fn require_deeplc_version(python: &str) -> Result<String> {
-    use mumdia_core::constants::{parse_version3, MIN_DEEPLC_VERSION};
-    let (ma, mi, pa) = MIN_DEEPLC_VERSION;
-    let v = module_version(python, "deeplc").ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot determine the deeplc version through {python} (is DeepLC >= {ma}.{mi}.{pa} installed there?)"
-        )
-    })?;
-    match parse_version3(&v) {
-        Some(t) if t >= MIN_DEEPLC_VERSION => Ok(v),
-        _ => bail!(
-            "deeplc {v} at {python} is older than the required {ma}.{mi}.{pa};              upgrade with `pip install 'deeplc>={ma}.{mi}.{pa}'`"
+    require_version(python, "deeplc", mumdia_core::constants::MIN_DEEPLC_VERSION)
+}
+
+/// Refuse an interpreter whose `module` is older than `floor`, and return the version it
+/// reports. The one check behind every sidecar version floor (`Role::version_floor`):
+/// discovery and `doctor` judge with the same `python::judge_version`.
+pub fn require_version(python: &str, module: &str, floor: (u32, u32, u32)) -> Result<String> {
+    use crate::python::{fmt_version, judge_version, FloorCheck};
+    let want = fmt_version(floor);
+    match judge_version(module_version(python, module), floor) {
+        FloorCheck::Met(v) => Ok(v),
+        FloorCheck::TooOld(v) => bail!(
+            "{module} {v} at {python} is older than the required {want}; \
+             upgrade with `pip install '{module}>={want}'`"
+        ),
+        FloorCheck::Unknown => bail!(
+            "cannot determine the {module} version through {python} \
+             (is {module} >= {want} installed there?)"
         ),
     }
 }

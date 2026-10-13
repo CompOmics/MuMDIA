@@ -57,6 +57,16 @@ impl Role {
         }
     }
 
+    /// The distribution whose version changes this role's results, and the oldest release
+    /// accepted. Discovery skips an interpreter below it, `doctor` fails on it and the
+    /// sidecar launch refuses it (`sidecar::require_version`).
+    pub fn version_floor(self) -> Option<(&'static str, (u32, u32, u32))> {
+        match self {
+            Role::DeepLc => Some(("deeplc", mumdia_core::constants::MIN_DEEPLC_VERSION)),
+            Role::Rescore | Role::Ms2pip | Role::Peptdeep | Role::Mbr => None,
+        }
+    }
+
     /// Environment variable that overrides discovery for this role alone.
     pub fn env_var(self) -> &'static str {
         match self {
@@ -290,6 +300,34 @@ pub fn missing_modules(python: &Path, modules: &[&str]) -> Result<Vec<String>> {
     }
 }
 
+/// What a version probe says about a floor (`Role::version_floor`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloorCheck {
+    /// The reported version, at or above the floor.
+    Met(String),
+    /// The reported version, below the floor or not a parseable release.
+    TooOld(String),
+    /// The interpreter reported no version.
+    Unknown,
+}
+
+/// Judge a probed version against a floor. Discovery, `doctor` and the sidecar launch
+/// (`sidecar::require_version`) all decide through this, so they cannot disagree.
+pub fn judge_version(version: Option<String>, floor: (u32, u32, u32)) -> FloorCheck {
+    match version {
+        Some(v) if mumdia_core::constants::parse_version3(&v).is_some_and(|t| t >= floor) => {
+            FloorCheck::Met(v)
+        }
+        Some(v) => FloorCheck::TooOld(v),
+        None => FloorCheck::Unknown,
+    }
+}
+
+/// `major.minor.patch` of a floor, for messages.
+pub fn fmt_version((ma, mi, pa): (u32, u32, u32)) -> String {
+    format!("{ma}.{mi}.{pa}")
+}
+
 /// Report a package's version, or `None` when the interpreter cannot tell us.
 /// Used by `doctor` to show what a user has, since a present-but-old DeepLC
 /// changes results rather than only failing.
@@ -321,23 +359,20 @@ pub fn discover(role: Role, cfg: &Config) -> Option<(String, &'static str)> {
                 // `MIN_DEEPLC_VERSION` on, and the sidecar launch refuses anything older.
                 // Rejecting it here keeps discovery from handing back an interpreter the
                 // run cannot use.
-                if role == Role::DeepLc {
-                    let floor = mumdia_core::constants::MIN_DEEPLC_VERSION;
-                    let (ma, mi, pa) = floor;
-                    match module_version(&path, "deeplc") {
-                        Some(v)
-                            if mumdia_core::constants::parse_version3(&v)
-                                .is_some_and(|t| t >= floor) => {}
-                        Some(v) => {
+                if let Some((module, floor)) = role.version_floor() {
+                    let want = fmt_version(floor);
+                    match judge_version(module_version(&path, module), floor) {
+                        FloorCheck::Met(_) => {}
+                        FloorCheck::TooOld(v) => {
                             tried.push(format!(
-                                "{} (deeplc {v} is older than the required {ma}.{mi}.{pa})",
+                                "{} ({module} {v} is older than the required {want})",
                                 path.display()
                             ));
                             continue;
                         }
-                        None => {
+                        FloorCheck::Unknown => {
                             tried.push(format!(
-                                "{} (deeplc version unknown; {ma}.{mi}.{pa} or newer is required)",
+                                "{} ({module} version unknown; {want} or newer is required)",
                                 path.display()
                             ));
                             continue;
@@ -594,6 +629,42 @@ pub fn resolve_script_dir(configured: &str, config_path: Option<&str>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_version_floor_is_judged_the_same_way_everywhere() {
+        let floor = (4, 5, 0);
+        assert_eq!(
+            judge_version(Some("4.5.1".into()), floor),
+            FloorCheck::Met("4.5.1".into())
+        );
+        assert_eq!(
+            judge_version(Some("4.5.0".into()), floor),
+            FloorCheck::Met("4.5.0".into())
+        );
+        assert_eq!(
+            judge_version(Some("4.4.0".into()), floor),
+            FloorCheck::TooOld("4.4.0".into())
+        );
+        assert_eq!(
+            judge_version(Some("4.0.0a2".into()), floor),
+            FloorCheck::TooOld("4.0.0a2".into())
+        );
+        assert_eq!(judge_version(None, floor), FloorCheck::Unknown);
+        assert_eq!(fmt_version(floor), "4.5.0");
+        // Only DeepLC has a floor today; every other role reports none.
+        for role in ALL_ROLES {
+            match role.version_floor() {
+                Some((module, f)) => {
+                    assert_eq!(role, Role::DeepLc);
+                    assert_eq!(
+                        (module, f),
+                        ("deeplc", mumdia_core::constants::MIN_DEEPLC_VERSION)
+                    );
+                }
+                None => assert_ne!(role, Role::DeepLc),
+            }
+        }
+    }
 
     #[test]
     fn roles_report_their_config_field_and_env_var() {
