@@ -3,7 +3,7 @@
 //!
 //! The pooled first pass accepts precursors experiment-wide. Each one that it accepts
 //! (`precursor_q <= mbr.q_anchor`, target) enters the empirical library with the library decoy
-//! paired to it (by rank within `base_peptide_id` and `charge`, [`plan_rows`]), and both get
+//! paired to it (by rank within `base_peptide_id` and `charge`, `plan_rows`), and both get
 //! the precursor's cross-run consensus retention time:
 //!
 //! 1. every run's confident apexes (`run_psm_q <= q`, target) are mapped onto one reference
