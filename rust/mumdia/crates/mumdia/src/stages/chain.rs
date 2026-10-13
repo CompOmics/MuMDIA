@@ -44,6 +44,13 @@ pub struct ChainOutputs {
     pub competed: String,
 }
 
+/// Record `r` in the manifest when the caller passed one.
+fn keep(manifest: &mut Option<&mut Manifest>, r: mumdia_core::manifest::ArtifactRecord) {
+    if let Some(m) = manifest.as_deref_mut() {
+        m.record(r);
+    }
+}
+
 /// Run rt-im-train, the optional prescreen, extract, features and compete for one run.
 pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
     let ChainParams {
@@ -58,11 +65,6 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         mut manifest,
     } = p;
     let d = |name: &str| format!("{out_dir}/{name}");
-    let mut record = |r: mumdia_core::manifest::ArtifactRecord| {
-        if let Some(m) = manifest.as_deref_mut() {
-            m.record(r);
-        }
-    };
 
     // The anchor cut every anchor consumer uses: `q_train`, relaxed through
     // `anchor_q_ladder` on a seed short of anchors (`rt_im_train::plan_anchors`).
@@ -85,25 +87,31 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         cfg: &rt_cfg,
         config_hash: ch,
     })?;
-    record(w.record(
-        artifact::RUN_WINDOWS.0,
-        artifact::RUN_WINDOWS,
-        &windows,
-        "rt-im-train",
-        ch,
-    ));
+    keep(
+        &mut manifest,
+        w.record(
+            artifact::RUN_WINDOWS.0,
+            artifact::RUN_WINDOWS,
+            &windows,
+            "rt-im-train",
+            ch,
+        ),
+    );
 
     let survivors =
         prescreen::run_if_enabled(cfg, ch, &co.ms2, Some(&co.ms1), lib_p, &windows, out_dir)?;
     if let Some(s) = &survivors {
-        record(record_artifact(
-            "prescreen_survivors",
-            artifact::PRESCAN_SURVIVORS,
-            s,
-            mumdia_io::table::nrows(s)?,
-            "prescreen",
-            ch,
-        )?);
+        keep(
+            &mut manifest,
+            record_artifact(
+                "prescreen_survivors",
+                artifact::PRESCAN_SURVIVORS,
+                s,
+                mumdia_io::table::nrows(s)?,
+                "prescreen",
+                ch,
+            )?,
+        );
     }
 
     let psms = d("psms_extracted.parquet");
@@ -135,20 +143,26 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         config_hash: ch,
     })?;
     drop(lent_ms2);
-    record(wpsm.record(
-        artifact::PSMS_EXTRACTED.0,
-        artifact::PSMS_EXTRACTED,
-        &psms,
-        "extract",
-        ch,
-    ));
-    record(wchr.record(
-        artifact::CHROMATOGRAMS.0,
-        artifact::chromatograms(cfg.extract.chromatogram_schema),
-        &chrom,
-        "extract",
-        ch,
-    ));
+    keep(
+        &mut manifest,
+        wpsm.record(
+            artifact::PSMS_EXTRACTED.0,
+            artifact::PSMS_EXTRACTED,
+            &psms,
+            "extract",
+            ch,
+        ),
+    );
+    keep(
+        &mut manifest,
+        wchr.record(
+            artifact::CHROMATOGRAMS.0,
+            artifact::chromatograms(cfg.extract.chromatogram_schema),
+            &chrom,
+            "extract",
+            ch,
+        ),
+    );
 
     let feats = d("features.parquet");
     info!(stage = %"features", "run: stage start");
@@ -161,13 +175,16 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         cfg: &cfg.features,
         config_hash: ch,
     })?;
-    record(wf.record(
-        artifact::FEATURES.0,
-        artifact::FEATURES,
-        &feats,
-        "features",
-        ch,
-    ));
+    keep(
+        &mut manifest,
+        wf.record(
+            artifact::FEATURES.0,
+            artifact::FEATURES,
+            &feats,
+            "features",
+            ch,
+        ),
+    );
 
     let competed = d("psms_competed.parquet");
     info!(stage = %"compete", "run: stage start");
@@ -178,13 +195,16 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         config_hash: ch,
         features_hash: Some(&wf.content_hash),
     })?;
-    record(w.record(
-        artifact::PSMS_COMPETED.0,
-        artifact::PSMS_COMPETED,
-        &competed,
-        "compete",
-        ch,
-    ));
+    keep(
+        &mut manifest,
+        w.record(
+            artifact::PSMS_COMPETED.0,
+            artifact::PSMS_COMPETED,
+            &competed,
+            "compete",
+            ch,
+        ),
+    );
 
     Ok(ChainOutputs {
         run_windows: windows,
