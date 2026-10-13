@@ -683,7 +683,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                         artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
                         b.index
                     ),
-                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    crate::stages::predict_frag::precursors_schema(&out)?,
                     &out,
                     rows,
                     &rt_model,
@@ -765,7 +765,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                         artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
                         b.index
                     ),
-                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    crate::stages::predict_frag::precursors_schema(&out)?,
                     &out,
                     rows,
                     &rt_model,

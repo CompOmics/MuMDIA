@@ -247,6 +247,7 @@ import sys
 import threading
 import time
 
+import _torch_threads  # standard library only; torch is imported inside main()
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -381,54 +382,14 @@ def torch_thread_cap():
 def physical_cores():
     """Physical cores this process may run on, or None when they cannot be read.
 
-    Linux: the distinct cores behind the CPUs in `sched_getaffinity(0)`, from each CPU's
-    sysfs `topology/core_cpus_list` (`thread_siblings_list` before 5.5), so a container or a
-    `taskset` mask is respected and two hyperthreads of one core count once. Windows: the
-    `RelationProcessorCore` records of `GetLogicalProcessorInformationEx`, one per core.
+    `_torch_threads.physical_cores`, the count the DeepLC and IM2Deep workers cap their torch
+    pools at: on Linux the distinct cores behind the CPUs in `sched_getaffinity(0)`, from
+    sysfs, so a container or a `taskset` mask is respected and two hyperthreads of one core
+    count once; on Windows the `RelationProcessorCore` records of
+    `GetLogicalProcessorInformationEx`. Kept as a name of this module so the process sizing
+    below can be tested with a stand-in.
     """
-    if hasattr(os, "sched_getaffinity"):
-        try:
-            cpus = sorted(os.sched_getaffinity(0))
-        except OSError:
-            cpus = []
-        cores = set()
-        for cpu in cpus:
-            topo = "/sys/devices/system/cpu/cpu%d/topology/" % cpu
-            key = None
-            for name in ("core_cpus_list", "thread_siblings_list"):
-                try:
-                    with open(topo + name, encoding="ascii") as fh:
-                        key = fh.read().strip()
-                    break
-                except OSError:
-                    continue
-            if key is None:
-                return None
-            cores.add(key)
-        return len(cores) or None
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            import struct
-            from ctypes import wintypes
-
-            k32 = ctypes.windll.kernel32
-            size = wintypes.DWORD(0)
-            k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(size))
-            buf = ctypes.create_string_buffer(size.value)
-            if not k32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(size)):
-                return None
-            raw, n, off = buf.raw, 0, 0
-            while off + 8 <= size.value:
-                relationship, record_size = struct.unpack_from("<II", raw, off)
-                if record_size < 8:
-                    return None
-                n += relationship == 0
-                off += record_size
-            return n or None
-        except Exception:  # noqa: BLE001 - best effort; None falls back to os.cpu_count
-            return None
-    return None
+    return _torch_threads.physical_cores()[0]
 
 
 # What one child process holds beside its gathered training rows: the torch runtime and

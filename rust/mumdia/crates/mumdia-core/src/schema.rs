@@ -31,6 +31,12 @@ pub mod artifact {
     pub const PEPTIDES: (&str, u32) = ("peptides", 1);
     pub const PEPTIDOFORMS: (&str, u32) = ("peptidoforms", 1);
     pub const FRAGMENT_LIBRARY_PRECURSORS: (&str, u32) = ("fragment_library_precursors", 1);
+    /// v2: v1 plus a nullable Float64 `predicted_im` (1/K0, V s cm^-2). Written only when the
+    /// library has an ion-mobility source: `predict_frag.im_predictor` predicted it, or an
+    /// imported library carried at least one finite, positive value. The column's presence
+    /// therefore means "this library has 1/K0"; every other library is v1, byte for byte.
+    /// Readers select columns by name, so both versions load everywhere.
+    pub const FRAGMENT_LIBRARY_PRECURSORS_V2: (&str, u32) = ("fragment_library_precursors", 2);
     pub const FRAGMENT_LIBRARY_FRAGMENTS: (&str, u32) = ("fragment_library_fragments", 1);
     pub const PRESCAN_SURVIVORS: (&str, u32) = ("prescan_survivors", 1);
     pub const PRESCREEN_SCORES: (&str, u32) = ("prescreen_scores", 1);
@@ -102,6 +108,16 @@ pub mod artifact {
             CHROMATOGRAMS_V2
         } else {
             CHROMATOGRAMS
+        }
+    }
+
+    /// The precursor-library schema a table records: [`FRAGMENT_LIBRARY_PRECURSORS_V2`] when
+    /// it carries `predicted_im`, else [`FRAGMENT_LIBRARY_PRECURSORS`].
+    pub fn fragment_library_precursors(has_im: bool) -> (&'static str, u32) {
+        if has_im {
+            FRAGMENT_LIBRARY_PRECURSORS_V2
+        } else {
+            FRAGMENT_LIBRARY_PRECURSORS
         }
     }
 }

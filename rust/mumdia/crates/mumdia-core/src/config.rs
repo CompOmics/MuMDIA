@@ -108,6 +108,31 @@ pub enum FragPredictorKind {
     Peptdeep,
 }
 
+/// Where a FASTA-built library's `predicted_im` (1/K0) comes from; see
+/// [`PredictFragConfig::im_predictor`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImPredictorKind {
+    /// No ion-mobility prediction. The library has no `predicted_im` column and is the
+    /// version-1 table.
+    #[default]
+    None,
+    /// IM2Deep Python sidecar (`im2deep_worker.py`, docs/13_sidecars.md): one CCS per
+    /// (peptidoform, charge) from the single-conformer model, converted to 1/K0 at the
+    /// precursor m/z. A hard requirement: the run fails without an IM2Deep interpreter.
+    Im2deep,
+    /// `im2deep` when an IM2Deep interpreter resolves (`predict_frag.im2deep_python`, its
+    /// environment variable or discovery), otherwise `none`, with a log line.
+    Auto,
+}
+
+impl ImPredictorKind {
+    /// Whether this is the default, which the canonical configuration omits.
+    pub fn is_none(&self) -> bool {
+        matches!(self, ImPredictorKind::None)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RescorerKind {
@@ -989,6 +1014,23 @@ pub struct PredictFragConfig {
     pub peptdeep_python: Option<String>,
     /// Python executable for the DeepLC sidecar (env with deeplc + pyarrow).
     pub deeplc_python: Option<String>,
+    /// Ion-mobility predictor for the library's `predicted_im` (1/K0, V s cm^-2) in a FASTA
+    /// build. `none` (the default): the library has no `predicted_im` column. `im2deep`:
+    /// IM2Deep predicts one 1/K0 per (peptidoform, charge), and the run fails without an
+    /// IM2Deep interpreter (`im2deep_python`). `auto`: `im2deep` when an IM2Deep interpreter
+    /// resolves, otherwise `none` with a log line. Decoys built by the native digest get their
+    /// own prediction, as they get their own iRT. A candidate IM2Deep returns no value for is
+    /// dropped with its pair, under the same 2% ceiling as a missing iRT or intensity.
+    /// Library-input mode ignores the key: an imported library carries its own 1/K0. Omitted
+    /// from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "ImPredictorKind::is_none")]
+    pub im_predictor: ImPredictorKind,
+    /// Python executable for the IM2Deep sidecar (env with im2deep >= 2.0.0, psm_utils, torch
+    /// and pyarrow), or `"auto"` to discover one (`MUMDIA_PYTHON_IM2DEEP`). Used only when
+    /// `im_predictor` is `im2deep` or `auto`. Omitted from the canonical configuration when
+    /// unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub im2deep_python: Option<String>,
     /// Directory holding the sidecar worker scripts.
     pub sidecar_script_dir: String,
     /// Skip DeepLC in a FASTA library build (`rt_predictor = deeplc`) when the multi-head
@@ -1030,8 +1072,8 @@ pub struct PredictFragConfig {
     /// 9.8M-peptidoform HYE library). Set, the orchestrator looks the library up under a key
     /// of everything that determines it: the FASTA's content hash, the `digest`,
     /// `peptidoforms` and `predict_frag` sections (all but this field), `rng_seed`, whether
-    /// the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep or
-    /// DeepLC version the build uses, the worker scripts' content and the running
+    /// the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep,
+    /// DeepLC or IM2Deep version the build uses, the worker scripts' content and the running
     /// executable's content. A hit is copied to the paths a build writes (a byte copy, never
     /// a hard link, and checked against the blake3 recorded when it was stored) and digest,
     /// peptidoforms and predict-frag are skipped; a miss is built and then stored. When a
@@ -1069,9 +1111,25 @@ impl Default for PredictFragConfig {
             peptdeep_instrument: "Lumos".to_string(),
             peptdeep_python: None,
             deeplc_python: None,
+            im_predictor: ImPredictorKind::None,
+            im2deep_python: None,
             sidecar_script_dir: "scripts".to_string(),
             defer_deeplc_to_multihead: true,
             library_cache: Some("auto".to_string()),
+        }
+    }
+}
+
+impl PredictFragConfig {
+    /// The ion-mobility predictor a library build runs: `auto` becomes `im2deep` when an
+    /// IM2Deep interpreter resolved and `none` otherwise. Meaningful after interpreter
+    /// resolution (`mumdia::python::resolve`), which leaves `im2deep_python` either a
+    /// concrete path or unset.
+    pub fn im_predictor_resolved(&self) -> ImPredictorKind {
+        match self.im_predictor {
+            ImPredictorKind::Auto if self.im2deep_python.is_some() => ImPredictorKind::Im2deep,
+            ImPredictorKind::Auto => ImPredictorKind::None,
+            kind => kind,
         }
     }
 }
@@ -4534,6 +4592,58 @@ mod tests {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }
         assert!(Config::from_json(r#"{"convert":{"bruker_reader":"native"}}"#).is_err());
+    }
+
+    #[test]
+    fn the_im_predictor_defaults_to_none_and_leaves_the_config_hash_alone() {
+        let d = Config::default();
+        assert_eq!(d.predict_frag.im_predictor, ImPredictorKind::None);
+        assert_eq!(d.predict_frag.im2deep_python, None);
+        // Omitted at the default, so a configuration that sets neither field keeps the
+        // canonical form, and with it the config hash, it had before they existed.
+        let canon = d.canonical_json();
+        assert!(
+            !canon.contains("im_predictor") && !canon.contains("im2deep_python"),
+            "the defaults must not change the canonical configuration"
+        );
+        let explicit = Config::from_json(r#"{"predict_frag":{"im_predictor":"none"}}"#).unwrap();
+        assert_eq!(explicit.canonical_json(), canon);
+        // A set value is part of the configuration's identity and round-trips.
+        for (json, kind) in [
+            ("im2deep", ImPredictorKind::Im2deep),
+            ("auto", ImPredictorKind::Auto),
+        ] {
+            let c = Config::from_json(&format!(
+                r#"{{"predict_frag":{{"im_predictor":"{json}","im2deep_python":"/py"}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(c.predict_frag.im_predictor, kind);
+            let canon = c.canonical_json();
+            assert!(
+                canon.contains(&format!(r#""im_predictor":"{json}""#)),
+                "{canon}"
+            );
+            assert!(canon.contains(r#""im2deep_python":"/py""#), "{canon}");
+            let again = Config::from_json(&canon).unwrap();
+            assert_eq!(again.predict_frag.im_predictor, kind);
+        }
+        assert!(Config::from_json(r#"{"predict_frag":{"im_predictor":"ccs"}}"#).is_err());
+    }
+
+    #[test]
+    fn auto_im_prediction_resolves_on_the_interpreter() {
+        let mut pf = PredictFragConfig::default();
+        assert_eq!(pf.im_predictor_resolved(), ImPredictorKind::None);
+        pf.im_predictor = ImPredictorKind::Auto;
+        assert_eq!(pf.im_predictor_resolved(), ImPredictorKind::None);
+        pf.im2deep_python = Some("/py".into());
+        assert_eq!(pf.im_predictor_resolved(), ImPredictorKind::Im2deep);
+        // An explicit choice is never second-guessed.
+        pf.im_predictor = ImPredictorKind::None;
+        assert_eq!(pf.im_predictor_resolved(), ImPredictorKind::None);
+        pf.im_predictor = ImPredictorKind::Im2deep;
+        pf.im2deep_python = None;
+        assert_eq!(pf.im_predictor_resolved(), ImPredictorKind::Im2deep);
     }
 
     #[test]

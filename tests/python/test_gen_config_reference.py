@@ -165,6 +165,37 @@ def scan_python(text):
     return snapshot(reads), snapshot(sets)
 
 
+def test_a_helper_in_a_shared_module_is_followed_into_the_modules_that_call_it():
+    """`_torch_threads.thread_cap(env_var, default)` reads the variable its caller names.
+
+    The call sites live in other files, so the scanner must know the helper before it
+    reads them; otherwise `MUMDIA_DEEPLC_THREAD_CAP` and `MUMDIA_IM2DEEP_THREAD_CAP` would
+    drop out of the reference.
+    """
+    shared = '''\
+import os
+
+
+def thread_cap(env_var, default):
+    raw = os.environ.get(env_var, default).strip()
+    return raw
+'''
+    worker = '''\
+from _torch_threads import thread_cap
+
+
+def main():
+    cap = thread_cap("MUMDIA_T_CAP", "auto")
+'''
+    # The worker sorts before the shared module here, as `deeplc_worker.py` does not.
+    reads, _ = gen.scan_python_env([("scripts/w.py", worker), ("scripts/_shared.py", shared)])
+    got = snapshot(reads)
+    assert "MUMDIA_T_CAP" in got, got
+    sites, defaults = got["MUMDIA_T_CAP"]
+    assert sites == ["scripts/w.py::main"]
+    assert defaults == [('"auto"', ("scripts/w.py::main",))]
+
+
 def line_of(text, needle):
     return text[: text.index(needle)].count("\n") + 1
 

@@ -11,6 +11,11 @@ a matched FDP. This tool keeps the decoy sequences, their pairing, precursor m/z
 and replaces only the decoy fragments with DIA-NN's prediction for those sequences. It is
 the default step for an imported library since 2026-10-09.
 
+A decoy's 1/K0 follows its iRT: when the library carries `predicted_im`, each decoy keeps
+the value `make_reverse_decoys.py` copied from its target, null included, and a 1/K0 the
+prediction may carry for the decoy sequence is not used. The decoy then shares its
+target's mobility window as it shares its retention-time window (docs/06).
+
   python predict_decoys.py build <in_prec> <in_frag> <out_prec> <out_frag> --diann <diann>
         [--threads N] [--work DIR] [--keep-unimod 4,35,...] [--diann-arg ARG ...]
       the whole chain: write the decoys as a DIA-NN library TSV, let DIA-NN predict them,

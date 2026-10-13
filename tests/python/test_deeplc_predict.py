@@ -1,7 +1,8 @@
 """Thread policy and prediction plumbing of the two DeepLC workers.
 
-The thread-cap helpers are pure stdlib, but both workers import DeepLC at module scope, so
-they are lifted out of the source with `ast` and executed on their own. That keeps the
+The thread-cap helpers live in `scripts/_torch_threads.py`, which is pure stdlib and is
+imported here directly. Other helpers are lifted out of the workers' source with `ast` and
+executed on their own, because both workers import DeepLC at module scope. That keeps the
 policy testable on an interpreter without DeepLC, which is every CI job.
 """
 
@@ -22,9 +23,11 @@ THREAD_HELPERS = [
     "_windows_physical_cores",
     "_sysfs_physical_cores",
     "physical_cores",
-    "deeplc_thread_cap",
+    "thread_cap",
     "capped_threads",
 ]
+TORCH_WORKERS = ["deeplc_worker.py", "deeplc_finetune.py", "im2deep_worker.py",
+                 "nn_rescore_worker.py"]
 
 
 def _function_sources(script, names):
@@ -40,25 +43,37 @@ def _function_sources(script, names):
     return found
 
 
-def _thread_helpers(script="deeplc_finetune.py"):
-    """The four thread helpers of `script`, executed in a namespace of their own."""
-    namespace = {"os": os, "sys": sys}
-    for source in _function_sources(script, THREAD_HELPERS).values():
-        exec(compile(source, str(SCRIPTS / script), "exec"), namespace)  # noqa: S102
-    return namespace
+def _thread_helpers():
+    """The shared thread helpers of `scripts/_torch_threads.py`, by name."""
+    spec = importlib.util.spec_from_file_location("_torch_threads", SCRIPTS / "_torch_threads.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return {name: getattr(module, name) for name in THREAD_HELPERS}
 
 
-def test_both_workers_carry_the_same_thread_cap_helpers():
-    """The helpers are copied rather than shared, so they must not drift apart.
+def _deeplc_cap(helpers):
+    return helpers["thread_cap"]("MUMDIA_DEEPLC_THREAD_CAP", "auto")
 
-    `deeplc_worker.py` cannot import `deeplc_finetune.py`: that module's body pins the
-    OpenMP pools and imports psm_utils, which the predict-frag worker does not need.
+
+def test_the_torch_workers_share_one_copy_of_the_thread_helpers():
+    """One module holds the thread policy; no worker carries a copy that could drift.
+
+    The copies used to be pinned to the same source text by this test, and the rescorer's
+    own copy had already drifted (no pair fallback, no affinity count without sysfs).
+    `load_base_model` is still copied between the two DeepLC workers: `deeplc_worker.py`
+    cannot import `deeplc_finetune.py`, whose module body pins the OpenMP pools and imports
+    psm_utils.
     """
-    shared = THREAD_HELPERS + ["load_base_model"]
-    a = _function_sources("deeplc_worker.py", shared)
-    b = _function_sources("deeplc_finetune.py", shared)
-    for name in shared:
-        assert a[name] == b[name], "{} differs between the two DeepLC workers".format(name)
+    for script in TORCH_WORKERS:
+        text = (SCRIPTS / script).read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        own = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+        copies = own & (set(THREAD_HELPERS) - {"physical_cores"})
+        assert not copies, "{} defines its own {}".format(script, sorted(copies))
+        assert "_torch_threads" in text, "{} does not use _torch_threads".format(script)
+    a = _function_sources("deeplc_worker.py", ["load_base_model"])
+    b = _function_sources("deeplc_finetune.py", ["load_base_model"])
+    assert a == b, "load_base_model differs between the two DeepLC workers"
 
 
 def test_the_model_load_falls_back_on_any_private_api_change(monkeypatch, capsys):
@@ -114,15 +129,20 @@ def test_the_cap_is_a_ceiling_and_never_a_target():
 def test_the_environment_override_sets_or_disables_the_cap(monkeypatch):
     helpers = _thread_helpers()
     monkeypatch.setenv("MUMDIA_DEEPLC_THREAD_CAP", "0")
-    assert helpers["deeplc_thread_cap"]()[0] == 0
+    assert _deeplc_cap(helpers) == (0, "MUMDIA_DEEPLC_THREAD_CAP=0 (no cap)")
     monkeypatch.setenv("MUMDIA_DEEPLC_THREAD_CAP", "12")
-    assert helpers["deeplc_thread_cap"]() == (12, "MUMDIA_DEEPLC_THREAD_CAP")
+    assert _deeplc_cap(helpers) == (12, "MUMDIA_DEEPLC_THREAD_CAP")
     auto = helpers["physical_cores"]()[0] or 0
     # `int(float("inf"))` raises OverflowError, not ValueError, and used to crash both
     # workers at start-up instead of falling back to auto.
     for raw in ("auto", "", "twelve", "nan", "inf", "-inf", "1e400"):
         monkeypatch.setenv("MUMDIA_DEEPLC_THREAD_CAP", raw)
-        assert helpers["deeplc_thread_cap"]()[0] == auto, raw
+        assert _deeplc_cap(helpers)[0] == auto, raw
+    # Each worker has its own variable: the IM2Deep cap does not move DeepLC's.
+    monkeypatch.setenv("MUMDIA_DEEPLC_THREAD_CAP", "auto")
+    monkeypatch.setenv("MUMDIA_IM2DEEP_THREAD_CAP", "3")
+    assert helpers["thread_cap"]("MUMDIA_IM2DEEP_THREAD_CAP", "auto") == (3, "MUMDIA_IM2DEEP_THREAD_CAP")
+    assert _deeplc_cap(helpers)[0] == auto
 
 
 def _fake_sysfs(root, cpus):

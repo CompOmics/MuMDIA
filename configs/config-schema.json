@@ -1325,6 +1325,37 @@
       "source_struct": "PredictFragConfig"
     },
     {
+      "path": "predict_frag.im_predictor",
+      "name": "im_predictor",
+      "section": "predict_frag",
+      "rust_type": "ImPredictorKind",
+      "kind": "enum",
+      "optional": false,
+      "default": "none",
+      "default_text": "`none`",
+      "help": "Ion-mobility predictor for the library's `predicted_im` (1/K0, V s cm^-2) in a FASTA build. `none` (the default): the library has no `predicted_im` column. `im2deep`: IM2Deep predicts one 1/K0 per (peptidoform, charge), and the run fails without an IM2Deep interpreter (`im2deep_python`). `auto`: `im2deep` when an IM2Deep interpreter resolves, otherwise `none` with a log line. Decoys built by the native digest get their own prediction, as they get their own iRT. A candidate IM2Deep returns no value for is dropped with its pair, under the same 2% ceiling as a missing iRT or intensity. Library-input mode ignores the key: an imported library carries its own 1/K0. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "PredictFragConfig",
+      "choices": [
+        "none",
+        "im2deep",
+        "auto"
+      ]
+    },
+    {
+      "path": "predict_frag.im2deep_python",
+      "name": "im2deep_python",
+      "section": "predict_frag",
+      "rust_type": "Option<String>",
+      "kind": "other",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Python executable for the IM2Deep sidecar (env with im2deep >= 2.0.0, psm_utils, torch and pyarrow), or `\"auto\"` to discover one (`MUMDIA_PYTHON_IM2DEEP`). Used only when `im_predictor` is `im2deep` or `auto`. Omitted from the canonical configuration when unset.",
+      "gates": [],
+      "source_struct": "PredictFragConfig"
+    },
+    {
       "path": "predict_frag.sidecar_script_dir",
       "name": "sidecar_script_dir",
       "section": "predict_frag",
@@ -1359,7 +1390,7 @@
       "optional": true,
       "default": "\"auto\"",
       "default_text": "\"auto\"",
-      "help": "Where `run` and `run-experiment` keep the library they build from a FASTA, to reuse it on a later run. `\"auto\"` (the default since 2026-09-28): `libraries/` under the engine's cache root, which is `MUMDIA_CACHE_DIR` when it is set and otherwise the per-user cache directory (`$XDG_CACHE_HOME/mumdia` or `~/.cache/mumdia` on Linux, `~/Library/Caches/mumdia` on macOS, `%LOCALAPPDATA%\\mumdia\\cache` on Windows; `MUMDIA_CACHE_DIR=off` turns `\"auto\"` off). A path: that directory, as given. `null` or `\"off\"`: every FASTA run builds its library, the behaviour before 2026-09-28. A FASTA-mode run digests, expands peptidoforms and predicts the library on every invocation, and one `run` per file is the way to search files separately, so each file paid the whole build again (about an hour of predict-frag on the 9.8M-peptidoform HYE library). Set, the orchestrator looks the library up under a key of everything that determines it: the FASTA's content hash, the `digest`, `peptidoforms` and `predict_frag` sections (all but this field), `rng_seed`, whether the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep or DeepLC version the build uses, the worker scripts' content and the running executable's content. A hit is copied to the paths a build writes (a byte copy, never a hard link, and checked against the blake3 recorded when it was stored) and digest, peptidoforms and predict-frag are skipped; a miss is built and then stored. When a predictor version cannot be read, nothing is looked up or stored. The run stays in FASTA mode, so every other decision is the one a rebuild makes. A hit is byte-identical to a rebuild when the build is deterministic, which the native predictors are; with a sidecar predictor it reuses the stored prediction. The manifest records the two library tables with the stage `library-cache`, and the run directory then holds no `peptides.parquet` or `peptidoforms.parquet` (an earlier build's are removed). Validate by running one FASTA search twice with the same cache directory and comparing `peptides.tsv` and `proteins.tsv` (the smoke test does this). A stored entry whose files changed is rebuilt and replaced, and temporary directories left by a killed store are removed after an hour. The cache is bounded: after a run stores into it, the least recently used entries of this cache and of `rt_im_train.deeplc_projection_cache` are removed until the two together are within `MUMDIA_CACHE_MAX_GB` (default 100 GiB; an entry used within the last hour is kept). The key covers the running executable, so every engine build stores its own entries and the bound is what removes the old ones. `mumdia doctor` reports the directory and its size.",
+      "help": "Where `run` and `run-experiment` keep the library they build from a FASTA, to reuse it on a later run. `\"auto\"` (the default since 2026-09-28): `libraries/` under the engine's cache root, which is `MUMDIA_CACHE_DIR` when it is set and otherwise the per-user cache directory (`$XDG_CACHE_HOME/mumdia` or `~/.cache/mumdia` on Linux, `~/Library/Caches/mumdia` on macOS, `%LOCALAPPDATA%\\mumdia\\cache` on Windows; `MUMDIA_CACHE_DIR=off` turns `\"auto\"` off). A path: that directory, as given. `null` or `\"off\"`: every FASTA run builds its library, the behaviour before 2026-09-28. A FASTA-mode run digests, expands peptidoforms and predicts the library on every invocation, and one `run` per file is the way to search files separately, so each file paid the whole build again (about an hour of predict-frag on the 9.8M-peptidoform HYE library). Set, the orchestrator looks the library up under a key of everything that determines it: the FASTA's content hash, the `digest`, `peptidoforms` and `predict_frag` sections (all but this field), `rng_seed`, whether the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep, DeepLC or IM2Deep version the build uses, the worker scripts' content and the running executable's content. A hit is copied to the paths a build writes (a byte copy, never a hard link, and checked against the blake3 recorded when it was stored) and digest, peptidoforms and predict-frag are skipped; a miss is built and then stored. When a predictor version cannot be read, nothing is looked up or stored. The run stays in FASTA mode, so every other decision is the one a rebuild makes. A hit is byte-identical to a rebuild when the build is deterministic, which the native predictors are; with a sidecar predictor it reuses the stored prediction. The manifest records the two library tables with the stage `library-cache`, and the run directory then holds no `peptides.parquet` or `peptidoforms.parquet` (an earlier build's are removed). Validate by running one FASTA search twice with the same cache directory and comparing `peptides.tsv` and `proteins.tsv` (the smoke test does this). A stored entry whose files changed is rebuilt and replaced, and temporary directories left by a killed store are removed after an hour. The cache is bounded: after a run stores into it, the least recently used entries of this cache and of `rt_im_train.deeplc_projection_cache` are removed until the two together are within `MUMDIA_CACHE_MAX_GB` (default 100 GiB; an entry used within the last hour is kept). The key covers the running executable, so every engine build stores its own entries and the bound is what removes the old ones. `mumdia doctor` reports the directory and its size.",
       "gates": [],
       "source_struct": "PredictFragConfig"
     },

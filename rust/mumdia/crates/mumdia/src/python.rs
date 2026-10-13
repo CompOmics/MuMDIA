@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Result};
-use mumdia_core::config::{Config, FragPredictorKind, LibraryIrt, RescorerKind, RtPredictorKind};
+use mumdia_core::config::{
+    Config, FragPredictorKind, ImPredictorKind, LibraryIrt, RescorerKind, RtPredictorKind,
+};
 use tracing::{info, warn};
 
 /// The literal a config uses to ask for discovery rather than naming a path.
@@ -44,6 +46,8 @@ pub enum Role {
     Peptdeep,
     /// `mbr.python`: `mbr_worker.py`.
     Mbr,
+    /// `predict_frag.im2deep_python`: `im2deep_worker.py`.
+    Im2deep,
 }
 
 impl Role {
@@ -54,6 +58,7 @@ impl Role {
             Role::Ms2pip => "predict_frag.ms2pip_python",
             Role::Peptdeep => "predict_frag.peptdeep_python",
             Role::Mbr => "mbr.python",
+            Role::Im2deep => "predict_frag.im2deep_python",
         }
     }
 
@@ -63,6 +68,7 @@ impl Role {
     pub fn version_floor(self) -> Option<(&'static str, (u32, u32, u32))> {
         match self {
             Role::DeepLc => Some(("deeplc", mumdia_core::constants::MIN_DEEPLC_VERSION)),
+            Role::Im2deep => Some(("im2deep", mumdia_core::constants::MIN_IM2DEEP_VERSION)),
             Role::Rescore | Role::Ms2pip | Role::Peptdeep | Role::Mbr => None,
         }
     }
@@ -75,6 +81,7 @@ impl Role {
             Role::Ms2pip => "MUMDIA_PYTHON_MS2PIP",
             Role::Peptdeep => "MUMDIA_PYTHON_PEPTDEEP",
             Role::Mbr => "MUMDIA_PYTHON_MBR",
+            Role::Im2deep => "MUMDIA_PYTHON_IM2DEEP",
         }
     }
 
@@ -106,6 +113,8 @@ impl Role {
                 "pyarrow",
             ],
             Role::Mbr => &["numpy", "pyarrow"],
+            // `im2deep_worker.py` builds a `psm_utils.PSMList` and sizes torch's thread pool.
+            Role::Im2deep => &["im2deep", "psm_utils", "torch", "numpy", "pyarrow"],
         }
     }
 
@@ -121,6 +130,7 @@ impl Role {
             Role::Ms2pip => &["ms2pip_worker.py"],
             Role::Peptdeep => &["peptdeep_worker.py"],
             Role::Mbr => &["mbr_worker.py"],
+            Role::Im2deep => &["im2deep_worker.py"],
         }
     }
 
@@ -131,6 +141,7 @@ impl Role {
             Role::Ms2pip => cfg.predict_frag.ms2pip_python.as_deref(),
             Role::Peptdeep => cfg.predict_frag.peptdeep_python.as_deref(),
             Role::Mbr => cfg.mbr.python.as_deref(),
+            Role::Im2deep => cfg.predict_frag.im2deep_python.as_deref(),
         }
     }
 
@@ -141,6 +152,7 @@ impl Role {
             Role::Ms2pip => cfg.predict_frag.ms2pip_python = Some(value),
             Role::Peptdeep => cfg.predict_frag.peptdeep_python = Some(value),
             Role::Mbr => cfg.mbr.python = Some(value),
+            Role::Im2deep => cfg.predict_frag.im2deep_python = Some(value),
         }
     }
 
@@ -157,6 +169,7 @@ impl Role {
             Role::Ms2pip => cfg.predict_frag.ms2pip_python = None,
             Role::Peptdeep => cfg.predict_frag.peptdeep_python = None,
             Role::Mbr => cfg.mbr.python = None,
+            Role::Im2deep => cfg.predict_frag.im2deep_python = None,
         }
     }
 
@@ -180,11 +193,14 @@ impl Role {
             Role::Ms2pip => cfg.predict_frag.predictor == FragPredictorKind::Ms2pip,
             Role::Peptdeep => cfg.predict_frag.predictor == FragPredictorKind::Peptdeep,
             Role::Mbr => cfg.mbr.strategy.transfers(),
+            Role::Im2deep => cfg.predict_frag.im_predictor == ImPredictorKind::Im2deep,
         }
     }
 
     /// Whether the configuration would USE the role if an interpreter is available,
-    /// without requiring one. Only DeepLC has this state: under the default
+    /// without requiring one. IM2Deep has this state under `predict_frag.im_predictor =
+    /// auto`, which predicts the library's 1/K0 when an interpreter resolves and builds a
+    /// library without it otherwise. DeepLC has it by default: under the default
     /// `rt_im_train.library_irt = auto` a library-input run re-predicts the imported iRT
     /// with the DeepLC base model when `predict_frag.deeplc_python` resolves and keeps the
     /// imported values, with a warning, when it does not. Discovery therefore runs for a
@@ -202,17 +218,19 @@ impl Role {
                 // configuration want DeepLC, which three tests caught.
                 !self.required_by(cfg) && cfg.rt_im_train.library_irt == LibraryIrt::Auto
             }
+            Role::Im2deep => cfg.predict_frag.im_predictor == ImPredictorKind::Auto,
             _ => false,
         }
     }
 }
 
-pub const ALL_ROLES: [Role; 5] = [
+pub const ALL_ROLES: [Role; 6] = [
     Role::Rescore,
     Role::DeepLc,
     Role::Ms2pip,
     Role::Peptdeep,
     Role::Mbr,
+    Role::Im2deep,
 ];
 
 /// How a role's interpreter was determined, for logging and for `doctor`.
@@ -504,13 +522,24 @@ pub fn resolve_with(cfg: &mut Config, strictness: Strictness) -> Result<Vec<Reso
                 // Wanted, not required: the run goes on without it. `run` says what that
                 // means for the retention times when it gets there.
                 role.clear(cfg);
-                info!(
-                    field = role.field(),
-                    "python: no interpreter found for an optional role; a library-input run \
-                     will keep the imported iRT and skip the multi-head RT calibration, which is \
-                     worth 4.8% of peptides on AIF and 14.3% on Astral (set {} or name one)",
-                    role.env_var()
-                );
+                if role == Role::Im2deep {
+                    info!(
+                        field = role.field(),
+                        "python: no IM2Deep interpreter found, so predict_frag.im_predictor = \
+                         auto resolves to none and a library built from the FASTA carries no \
+                         predicted 1/K0 (set {} or name one)",
+                        role.env_var()
+                    );
+                } else {
+                    info!(
+                        field = role.field(),
+                        "python: no interpreter found for an optional role; a library-input \
+                         run will keep the imported iRT and skip the multi-head RT calibration, \
+                         which is worth 4.8% of peptides on AIF and 14.3% on Astral (set {} or \
+                         name one)",
+                        role.env_var()
+                    );
+                }
                 out.push(Resolution {
                     role,
                     python: None,
@@ -651,19 +680,60 @@ mod tests {
         );
         assert_eq!(judge_version(None, floor), FloorCheck::Unknown);
         assert_eq!(fmt_version(floor), "4.5.0");
-        // Only DeepLC has a floor today; every other role reports none.
+        // DeepLC and IM2Deep have a floor; every other role reports none.
         for role in ALL_ROLES {
-            match role.version_floor() {
-                Some((module, f)) => {
-                    assert_eq!(role, Role::DeepLc);
-                    assert_eq!(
-                        (module, f),
-                        ("deeplc", mumdia_core::constants::MIN_DEEPLC_VERSION)
-                    );
-                }
-                None => assert_ne!(role, Role::DeepLc),
+            match (role, role.version_floor()) {
+                (Role::DeepLc, f) => assert_eq!(
+                    f,
+                    Some(("deeplc", mumdia_core::constants::MIN_DEEPLC_VERSION))
+                ),
+                (Role::Im2deep, f) => assert_eq!(
+                    f,
+                    Some(("im2deep", mumdia_core::constants::MIN_IM2DEEP_VERSION))
+                ),
+                (_, f) => assert_eq!(f, None, "{role:?}"),
             }
         }
+        assert_eq!(mumdia_core::constants::MIN_IM2DEEP_VERSION, (2, 0, 0));
+        assert_eq!(
+            judge_version(Some("1.1.0".into()), (2, 0, 0)),
+            FloorCheck::TooOld("1.1.0".into())
+        );
+    }
+
+    #[test]
+    fn the_im2deep_role_follows_the_im_predictor() {
+        let mut cfg = Config::default();
+        assert!(!Role::Im2deep.required_by(&cfg) && !Role::Im2deep.wanted_by(&cfg));
+        assert_eq!(Role::Im2deep.field(), "predict_frag.im2deep_python");
+        assert_eq!(Role::Im2deep.env_var(), "MUMDIA_PYTHON_IM2DEEP");
+        assert_eq!(Role::Im2deep.workers(), &["im2deep_worker.py"]);
+        assert!(Role::Im2deep.modules(&cfg).contains(&"im2deep"));
+        // An explicit `im2deep` is a hard requirement; `auto` only wants an interpreter.
+        cfg.predict_frag.im_predictor = ImPredictorKind::Im2deep;
+        assert!(Role::Im2deep.required_by(&cfg) && !Role::Im2deep.wanted_by(&cfg));
+        cfg.predict_frag.im_predictor = ImPredictorKind::Auto;
+        assert!(!Role::Im2deep.required_by(&cfg) && Role::Im2deep.wanted_by(&cfg));
+        // Under `auto` a miss resolves to no prediction rather than an error, and the field
+        // never keeps the literal "auto".
+        cfg.rt_im_train.library_irt = LibraryIrt::Library;
+        cfg.predict_frag.im2deep_python = Some(AUTO.into());
+        std::env::set_var("MUMDIA_PYTHON_IM2DEEP", "/definitely/not/an/interpreter");
+        let res = resolve(&mut cfg);
+        std::env::remove_var("MUMDIA_PYTHON_IM2DEEP");
+        let res = res.expect("an optional role never fails resolution");
+        let r = res.iter().find(|r| r.role == Role::Im2deep).unwrap();
+        assert_eq!(cfg.predict_frag.im2deep_python, r.python);
+        assert!(cfg
+            .predict_frag
+            .im2deep_python
+            .as_deref()
+            .is_none_or(|p| !p.eq_ignore_ascii_case(AUTO)));
+        let resolved = cfg.predict_frag.im_predictor_resolved();
+        assert_eq!(
+            resolved == ImPredictorKind::Im2deep,
+            cfg.predict_frag.im2deep_python.is_some()
+        );
     }
 
     #[test]

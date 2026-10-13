@@ -17,6 +17,8 @@ separation.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -198,7 +200,12 @@ def _import_worker():
     import pathlib
 
     importorskip_any("numpy", "folds_for returns a numpy array")
-    path = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "nn_rescore_worker.py"
+    scripts = pathlib.Path(__file__).resolve().parents[2] / "scripts"
+    path = scripts / "nn_rescore_worker.py"
+    # The worker imports `_torch_threads` from its own directory, which Python puts on
+    # `sys.path` only when it runs the file as a script.
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
     spec = importlib.util.spec_from_file_location("nn_rescore_worker_under_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

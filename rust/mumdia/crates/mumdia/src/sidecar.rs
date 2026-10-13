@@ -67,7 +67,7 @@ pub fn run_ms2pip(
     charges: &[i32],
     model: &str,
 ) -> Result<FragmentIntensityMap> {
-    let (inp, outp) = fragment_request(workdir, "ms2pip", ids, peptidoforms, charges)?;
+    let (inp, outp) = fragment_request(workdir, "ms2pip", ids, peptidoforms, charges, None)?;
     // The worker sizes its MS2PIP process pool from this. Left to itself it capped the
     // pool at min(8, cpu_count), which on the 9.8M-peptidoform HYE library left 24 of
     // the 32 requested cores idle for the whole prediction.
@@ -79,8 +79,10 @@ pub fn run_ms2pip(
     read_fragment_intensities(&outp, ids, "MS2PIP")
 }
 
-/// Write the three-column request both fragment-intensity workers read, and name the
-/// output file. Returns `(input, output)`.
+/// Write the `id, peptidoform, charge` request the fragment-intensity workers and the
+/// IM2Deep worker read, and name the output file. Returns `(input, output)`. `extra` appends
+/// one Float64 column (`(name, values)`, one value per id): IM2Deep takes the precursor m/z
+/// to convert its CCS to 1/K0. Without it the file is the three-column request.
 ///
 /// Per-invocation names. Fixed ones made two concurrent runs clobber each other, and
 /// silently rather than loudly: the readback key is a row index into each process's own
@@ -94,20 +96,67 @@ fn fragment_request(
     ids: &[u32],
     peptidoforms: &[String],
     charges: &[i32],
+    extra: Option<(&str, &[f64])>,
 ) -> Result<(String, String)> {
     std::fs::create_dir_all(workdir).ok();
     let pid = std::process::id();
     let inp = format!("{workdir}/{tag}_in_{pid}.parquet");
     let outp = format!("{workdir}/{tag}_out_{pid}.parquet");
-    write_table(
-        &inp,
-        vec![
-            Col::U32("id".into(), ids.to_vec()),
-            Col::Str("peptidoform".into(), peptidoforms.to_vec()),
-            Col::I32("charge".into(), charges.to_vec()),
-        ],
-    )?;
+    let mut cols = vec![
+        Col::U32("id".into(), ids.to_vec()),
+        Col::Str("peptidoform".into(), peptidoforms.to_vec()),
+        Col::I32("charge".into(), charges.to_vec()),
+    ];
+    if let Some((name, values)) = extra {
+        cols.push(Col::F64(name.into(), values.to_vec()));
+    }
+    write_table(&inp, cols)?;
     Ok((inp, outp))
+}
+
+/// Read a worker's `id -> value` table: one scalar per requested id, such as DeepLC's
+/// `predicted_rt` or IM2Deep's `predicted_im`.
+///
+/// Shared for the same reason as [`read_fragment_intensities`]. Returned ids must be
+/// requested ones, each at most once: a repeated id used to overwrite silently and an
+/// unrequested one was kept. Coverage, the ids with no row, is the caller's to decide, and
+/// predict-frag drops those candidates with their pairs rather than substituting a value
+/// (docs/29 #17). `finite_positive` also refuses a value that is not finite and above zero,
+/// for a quantity that cannot be anything else (1/K0); a retention time can be negative on
+/// a model's scale, so DeepLC's readback leaves it off. `who` names the worker and `noun`
+/// what was requested, in the errors.
+fn read_id_scalars<T: Copy + Into<f64> + std::fmt::Display>(
+    out_path: &str,
+    ids: &[u32],
+    who: &str,
+    noun: &str,
+    column: &str,
+    read: fn(&TableFile, &str) -> Result<Vec<T>>,
+    finite_positive: bool,
+) -> Result<HashMap<u32, T>> {
+    let t = TableFile::open(out_path)?;
+    let oid = t.u32("id")?;
+    let values = read(&t, column)?;
+    let requested: std::collections::HashSet<u32> = ids.iter().copied().collect();
+    let mut map: HashMap<u32, T> = HashMap::with_capacity(oid.len());
+    for (id, value) in oid.into_iter().zip(values) {
+        if !requested.contains(&id) {
+            bail!(
+                "{who} worker returned id {id}, which was not among the {} {noun} requested",
+                ids.len()
+            );
+        }
+        if finite_positive {
+            let v: f64 = value.into();
+            if !(v.is_finite() && v > 0.0) {
+                bail!("{who} worker returned a {column} of {value} for id {id}; it must be finite and positive");
+            }
+        }
+        if map.insert(id, value).is_some() {
+            bail!("{who} worker returned id {id} more than once");
+        }
+    }
+    Ok(map)
 }
 
 /// Read the five-column fragment-intensity table both workers write.
@@ -183,7 +232,7 @@ pub fn run_peptdeep(
     nce: f64,
     instrument: &str,
 ) -> Result<FragmentIntensityMap> {
-    let (inp, outp) = fragment_request(workdir, "peptdeep", ids, peptidoforms, charges)?;
+    let (inp, outp) = fragment_request(workdir, "peptdeep", ids, peptidoforms, charges, None)?;
     let nce_s = nce.to_string();
     let processes = rayon::current_num_threads().max(1).to_string();
     info!(
@@ -244,9 +293,16 @@ pub fn require_version(python: &str, module: &str, floor: (u32, u32, u32)) -> Re
 /// is none to ask: the manifest's RT identity should say which DeepLC release produced the
 /// library, not only the recipe (docs/30, model identity).
 pub fn deeplc_identity(python: Option<&str>, suffix: &str) -> String {
-    match python.and_then(|py| module_version(py, "deeplc")) {
-        Some(v) => format!("deeplc-{v}-{suffix}"),
-        None => format!("deeplc-{suffix}"),
+    model_identity(python, "deeplc", suffix)
+}
+
+/// `<module>-<version>-<suffix>` when the interpreter answers, `<module>-<suffix>` when there
+/// is none to ask: the identity a library or a manifest records for a sidecar model, naming
+/// the installed release as well as the recipe.
+pub fn model_identity(python: Option<&str>, module: &str, suffix: &str) -> String {
+    match python.and_then(|py| module_version(py, module)) {
+        Some(v) => format!("{module}-{v}-{suffix}"),
+        None => format!("{module}-{suffix}"),
     }
 }
 
@@ -333,29 +389,57 @@ pub fn run_deeplc(
     let threads = rayon::current_num_threads().max(1).to_string();
     info!(n = ids.len(), threads = %threads, "sidecar: running DeepLC");
     run_worker(python, script, &[&inp, &outp, &threads], true).context("DeepLC worker failed")?;
+    read_id_scalars(
+        &outp,
+        ids,
+        "DeepLC",
+        "peptidoforms",
+        "predicted_rt",
+        TableFile::f32,
+        false,
+    )
+}
 
-    let t = TableFile::open(&outp)?;
-    let oid = t.u32("id")?;
-    let rt = t.f32("predicted_rt")?;
-    // Returned ids must be a subset of the requested ones, each at most once. A repeated
-    // id used to overwrite silently and an unrequested one was kept; coverage (ids with
-    // no prediction) is the caller's to decide, and it drops those candidates rather
-    // than substituting a value (docs/29 #17).
-    let requested: std::collections::HashSet<u32> = ids.iter().copied().collect();
-    let mut map: HashMap<u32, f32> = HashMap::with_capacity(oid.len());
-    for (id, value) in oid.into_iter().zip(rt) {
-        if !requested.contains(&id) {
-            bail!(
-                "DeepLC worker returned id {id}, which was not among the {} peptidoforms \
-                 requested",
-                ids.len()
-            );
-        }
-        if map.insert(id, value).is_some() {
-            bail!("DeepLC worker returned id {id} more than once");
-        }
-    }
-    Ok(map)
+/// IM2Deep: one predicted 1/K0 (V s cm^-2) per (peptidoform, charge), from the worker's
+/// CCS converted at the given precursor m/z. Returns `id -> predicted_im`. Positional
+/// contract: `im2deep_worker.py <in.parquet> <out.parquet> <threads>`; the request is the
+/// fragment workers' `id, peptidoform, charge` table plus `precursor_mz`.
+pub fn run_im2deep(
+    python: &str,
+    script: &str,
+    workdir: &str,
+    ids: &[u32],
+    peptidoforms: &[String],
+    charges: &[i32],
+    precursor_mz: &[f64],
+) -> Result<HashMap<u32, f64>> {
+    require_version(
+        python,
+        "im2deep",
+        mumdia_core::constants::MIN_IM2DEEP_VERSION,
+    )?;
+    let (inp, outp) = fragment_request(
+        workdir,
+        "im2deep",
+        ids,
+        peptidoforms,
+        charges,
+        Some(("precursor_mz", precursor_mz)),
+    )?;
+    // The worker caps torch's CPU pool at the physical cores available to it
+    // (`MUMDIA_IM2DEEP_THREAD_CAP`), as the DeepLC workers do.
+    let threads = rayon::current_num_threads().max(1).to_string();
+    info!(n = ids.len(), threads = %threads, "sidecar: running IM2Deep");
+    run_worker(python, script, &[&inp, &outp, &threads], true).context("IM2Deep worker failed")?;
+    read_id_scalars(
+        &outp,
+        ids,
+        "IM2Deep",
+        "precursors",
+        "predicted_im",
+        TableFile::f64,
+        true,
+    )
 }
 
 /// DeepLC multitask fine-tune: adapt the RT model to this run's confident seed
@@ -818,6 +902,144 @@ mod placeholder_tests {
         assert!(require_every_row_repredicted(&lib).is_err());
         std::fs::remove_file(&summary).unwrap();
         assert!(require_every_row_repredicted(&lib).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod scalar_reader_tests {
+    use super::{fragment_request, read_id_scalars};
+    use mumdia_io::table::{write_table, Col, TableFile};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("mumdia_scalars_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn table_f64(dir: &std::path::Path, name: &str, ids: Vec<u32>, v: Vec<f64>) -> String {
+        let p = dir
+            .join(format!("{name}.parquet"))
+            .to_string_lossy()
+            .into_owned();
+        write_table(
+            &p,
+            vec![
+                Col::U32("id".into(), ids),
+                Col::F64("predicted_im".into(), v),
+            ],
+        )
+        .unwrap();
+        p
+    }
+
+    fn im(path: &str, ids: &[u32]) -> anyhow::Result<std::collections::HashMap<u32, f64>> {
+        read_id_scalars(
+            path,
+            ids,
+            "IM2Deep",
+            "precursors",
+            "predicted_im",
+            TableFile::f64,
+            true,
+        )
+    }
+
+    #[test]
+    fn the_reader_checks_the_subset_each_id_once_and_optionally_the_value() {
+        let dir = scratch("checks");
+        // A subset of the request is fine: coverage is the caller's to judge.
+        let ok = table_f64(&dir, "ok", vec![0, 2], vec![0.8, 1.1]);
+        let m = im(&ok, &[0, 1, 2]).unwrap();
+        assert_eq!((m[&0], m[&2], m.len()), (0.8, 1.1, 2));
+        let stray = table_f64(&dir, "stray", vec![0, 9], vec![0.8, 1.1]);
+        let e = im(&stray, &[0, 1]).unwrap_err().to_string();
+        assert!(
+            e.contains("id 9") && e.contains("2 precursors requested"),
+            "{e}"
+        );
+        let dup = table_f64(&dir, "dup", vec![0, 0], vec![0.8, 0.9]);
+        assert!(im(&dup, &[0])
+            .unwrap_err()
+            .to_string()
+            .contains("more than once"));
+        for (name, bad) in [
+            ("nan", f64::NAN),
+            ("zero", 0.0),
+            ("neg", -0.5),
+            ("inf", f64::INFINITY),
+        ] {
+            let p = table_f64(&dir, name, vec![0], vec![bad]);
+            assert!(im(&p, &[0]).is_err(), "{name}");
+            // The same value passes with the check off, as DeepLC's readback runs.
+            let off =
+                read_id_scalars(&p, &[0], "x", "y", "predicted_im", TableFile::f64, false).unwrap();
+            assert_eq!(off.len(), 1);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_deeplc_readback_keeps_its_values_and_its_messages() {
+        // `run_deeplc` reads through the shared reader with the check off: a negative or
+        // zero retention time on the model's scale comes back unchanged, bit for bit.
+        let dir = scratch("deeplc");
+        let p = dir.join("out.parquet").to_string_lossy().into_owned();
+        let rt = vec![-3.25f32, 0.0, 1234.567];
+        write_table(
+            &p,
+            vec![
+                Col::U32("id".into(), vec![0, 1, 2]),
+                Col::F32("predicted_rt".into(), rt.clone()),
+            ],
+        )
+        .unwrap();
+        let read = |ids: &[u32]| {
+            read_id_scalars(
+                &p,
+                ids,
+                "DeepLC",
+                "peptidoforms",
+                "predicted_rt",
+                TableFile::f32,
+                false,
+            )
+        };
+        let m = read(&[0, 1, 2]).unwrap();
+        for (i, v) in rt.iter().enumerate() {
+            assert_eq!(m[&(i as u32)].to_bits(), v.to_bits());
+        }
+        let e = read(&[0, 1]).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "DeepLC worker returned id 2, which was not among the 2 peptidoforms requested"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_request_gains_an_extra_column_only_when_asked() {
+        let dir = scratch("request");
+        let w = dir.to_string_lossy().into_owned();
+        let peps = vec!["PEPTIDEK".to_string(), "SAMPLER".to_string()];
+        let (inp, _) = fragment_request(&w, "plain", &[0, 1], &peps, &[2, 3], None).unwrap();
+        assert_eq!(
+            mumdia_io::table::column_names(&inp).unwrap(),
+            ["id", "peptidoform", "charge"]
+        );
+        let (inp, _) = fragment_request(
+            &w,
+            "mz",
+            &[0, 1],
+            &peps,
+            &[2, 3],
+            Some(("precursor_mz", &[450.5, 401.2])),
+        )
+        .unwrap();
+        let t = TableFile::open(&inp).unwrap();
+        assert_eq!(t.f64("precursor_mz").unwrap(), vec![450.5, 401.2]);
+        assert_eq!(t.i32("charge").unwrap(), vec![2, 3]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

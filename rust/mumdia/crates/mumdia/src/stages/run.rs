@@ -261,7 +261,7 @@ pub fn run(p: RunParams) -> Result<()> {
             let np = mumdia_io::table::nrows(lp)?;
             let nf = mumdia_io::table::nrows(lf)?;
             library_input_records.push(LibraryInputRecord {
-                schema: artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                schema: crate::stages::predict_frag::precursors_schema(lp)?,
                 path: lp.to_string(),
                 rows: np,
                 input_role: "lib_precursors",
@@ -302,7 +302,7 @@ pub fn run(p: RunParams) -> Result<()> {
                 crate::library_cache::remove_build_intermediates(p.out_dir);
                 man.record(wp.record(
                     artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    crate::stages::predict_frag::precursors_schema(&lib_p)?,
                     &lib_p,
                     "library-cache",
                     &ch,
@@ -401,7 +401,7 @@ pub fn run(p: RunParams) -> Result<()> {
                 })?;
                 man.record(wp.record(
                     artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    crate::stages::predict_frag::precursors_schema(&lib_p)?,
                     &lib_p,
                     "predict-frag",
                     &ch,
@@ -486,7 +486,7 @@ pub fn run(p: RunParams) -> Result<()> {
             );
             man.record(record_artifact(
                 artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                crate::stages::predict_frag::precursors_schema(&sp)?,
                 &sp,
                 st.precursors,
                 "prescreen",
@@ -690,7 +690,7 @@ pub fn run(p: RunParams) -> Result<()> {
             let n_mh = mumdia_io::table::nrows(&lib_p_mh)?;
             man.record(record_artifact(
                 artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                crate::stages::predict_frag::precursors_schema(&lib_p_mh)?,
                 &lib_p_mh,
                 n_mh,
                 "deeplc-multihead",
@@ -735,7 +735,7 @@ pub fn run(p: RunParams) -> Result<()> {
             let n_ft = mumdia_io::table::nrows(&lib_p_ft)?;
             man.record(record_artifact(
                 artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                crate::stages::predict_frag::precursors_schema(&lib_p_ft)?,
                 &lib_p_ft,
                 n_ft,
                 "deeplc-finetune",
@@ -774,7 +774,7 @@ pub fn run(p: RunParams) -> Result<()> {
             let n_dl = mumdia_io::table::nrows(&lib_p_dl)?;
             man.record(record_artifact(
                 artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                crate::stages::predict_frag::precursors_schema(&lib_p_dl)?,
                 &lib_p_dl,
                 n_dl,
                 "deeplc-repredict",

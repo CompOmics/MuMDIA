@@ -15,7 +15,7 @@
 //! The key ([`LibraryCache::for_config`]) covers the FASTA's content hash, the `digest`,
 //! `peptidoforms` and `predict_frag` sections (all but the cache directory itself), the
 //! RNG seed that scrambles decoys, whether the iRT is a deferred DeepLC placeholder, the
-//! installed MS2PIP, AlphaPeptDeep and DeepLC versions that the build would use, the
+//! installed MS2PIP, AlphaPeptDeep, DeepLC and IM2Deep versions that the build would use, the
 //! worker scripts' content, and the running executable's content, so a rebuilt engine or
 //! an upgraded predictor never picks up an old library. When a version cannot be
 //! determined the library is neither looked up nor stored, and the run builds as usual.
@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use mumdia_core::config::{Config, FragPredictorKind, RtPredictorKind};
+use mumdia_core::config::{Config, FragPredictorKind, ImPredictorKind, RtPredictorKind};
 use mumdia_io::report::{ArtifactReport, Written};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -533,6 +533,20 @@ fn key_material(
             version(&pf.deeplc_python, "deeplc", "deeplc_python")?
         }
     };
+    // The 1/K0 prediction is part of the library (`predicted_im`), so an IM2Deep upgrade must
+    // miss like a fragment or retention-time predictor upgrade. Named only when a predictor
+    // runs, so the key of a library without 1/K0 is the one it had before IM existed.
+    let im_model = match pf.im_predictor_resolved() {
+        ImPredictorKind::None => None,
+        ImPredictorKind::Im2deep | ImPredictorKind::Auto => {
+            workers.push("im2deep_worker.py");
+            Some(version(&pf.im2deep_python, "im2deep", "im2deep_python")?)
+        }
+    };
+    let mut models = serde_json::json!({ "fragment": fragment_model, "rt": rt_model });
+    if let Some(im) = im_model {
+        models["im"] = serde_json::Value::String(im);
+    }
     let mut worker_hashes = serde_json::Map::new();
     for w in workers {
         let path = crate::sidecar::resolve_script(&pf.sidecar_script_dir, w);
@@ -552,7 +566,7 @@ fn key_material(
         "peptidoforms": serde_json::to_value(&cfg.peptidoforms)?,
         "predict_frag": predict_frag,
         "rt_placeholder": rt_placeholder,
-        "models": { "fragment": fragment_model, "rt": rt_model },
+        "models": models,
         "workers": worker_hashes,
         "engine": { "version": engine.0, "git_sha": engine.1, "exe_blake3": exe_hash },
     }))
@@ -629,6 +643,39 @@ mod tests {
         cfg.predict_frag.library_cache = Some(dir.to_string_lossy().into_owned());
         LibraryCache::for_config(cfg, &fasta.to_string_lossy(), false, ("0", "sha"))
             .expect("native predictors key without any interpreter")
+    }
+
+    #[test]
+    fn the_key_names_an_im_model_only_when_one_predicts() {
+        let root = tmp("imkey");
+        let fasta = root.join("x.fasta");
+        std::fs::write(&fasta, ">P1\nPEPTIDEK\n").unwrap();
+        let f = fasta.to_string_lossy().into_owned();
+        // At the default the key material is the one it was before 1/K0 existed: no `im`
+        // model, no IM2Deep worker hash and no new `predict_frag` field.
+        let cfg = Config::default();
+        let m = key_material(&cfg, &f, false, ("0", "sha")).unwrap();
+        assert_eq!(
+            m["models"],
+            serde_json::json!({"fragment": "native", "rt": "native"})
+        );
+        assert_eq!(m["workers"], serde_json::json!({}));
+        let pf = m["predict_frag"].as_object().unwrap();
+        assert!(!pf.contains_key("im_predictor") && !pf.contains_key("im2deep_python"));
+        // `auto` without an interpreter resolves to no prediction, and keys as such apart
+        // from the setting itself.
+        let mut auto = Config::default();
+        auto.predict_frag.im_predictor = ImPredictorKind::Auto;
+        let ma = key_material(&auto, &f, false, ("0", "sha")).unwrap();
+        assert_eq!(ma["models"], m["models"]);
+        assert_eq!(ma["predict_frag"]["im_predictor"], "auto");
+        // An IM2Deep build whose version cannot be read is neither looked up nor stored.
+        let mut im = Config::default();
+        im.predict_frag.im_predictor = ImPredictorKind::Im2deep;
+        assert!(key_material(&im, &f, false, ("0", "sha")).is_err());
+        im.predict_frag.library_cache = Some(root.join("cache").to_string_lossy().into_owned());
+        assert!(LibraryCache::for_config(&im, &f, false, ("0", "sha")).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -356,3 +356,57 @@ def test_keep_unimod_refuses_an_accession_outside_the_catalogue(diann_lib, tmp_p
     )
     assert r.returncode != 0
     assert "not in the modification catalogue" in (r.stderr + r.stdout)
+
+
+def _with_column(diann_lib, tmp_path, name, value_of):
+    """The fixture library with an ion-mobility column `name`, valued per precursor."""
+    src = pq.read_table(diann_lib)
+    keys = zip(src.column("Modified.Sequence").to_pylist(),
+               src.column("Precursor.Charge").to_pylist())
+    values = [value_of(m, z) for m, z in keys]
+    lib = tmp_path / f"diann_lib_{name}.parquet"
+    pq.write_table(src.append_column(name, pa.array(values, pa.float64())), str(lib),
+                   compression="snappy")
+    prec = tmp_path / f"{name}_precursors.parquet"
+    frag = tmp_path / f"{name}_fragments.parquet"
+    stdout, _ = run_worker_ok("import_diann_lib.py", lib, prec, frag)
+    return prec, frag, stdout
+
+
+def test_a_library_without_ion_mobility_has_no_predicted_im_column(imported):
+    """No IM column in the source: the version-1 table, with no always-null column."""
+    assert "predicted_im" not in pq.read_schema(str(imported["prec"])).names
+
+
+@pytest.mark.parametrize("name", ["IM", "IonMobility"])
+def test_library_ion_mobility_is_written_as_predicted_im(diann_lib, tmp_path, name):
+    """A finite positive 1/K0 is kept per precursor; anything else becomes null."""
+    def value_of(modseq, charge):
+        if modseq == "PEPTIDEK":
+            return 0.80 + 0.1 * charge
+        if modseq.startswith("SC"):
+            return float("nan")
+        if modseq.startswith("M"):
+            return 0.0
+        return 1.05
+
+    prec, frag, stdout = _with_column(diann_lib, tmp_path, name, value_of)
+    assert_library_load_invariants(prec, frag, require_both_labels=False,
+                                   check_string_type=True)
+    field = pq.read_schema(str(prec)).field("predicted_im")
+    assert field.type == pa.float64() and field.nullable
+    cols = pq.read_table(str(prec)).to_pydict()
+    got = {(p, z): v for p, z, v in zip(cols["peptidoform"], cols["charge"], cols["predicted_im"])}
+    assert got[("PEPTIDEK", 2)] == pytest.approx(1.0)
+    assert got[("PEPTIDEK", 3)] == pytest.approx(1.1)
+    assert got[("K[Farnesyl]ITTENR", 2)] == pytest.approx(1.05)
+    assert got[("SC[Carbamidomethyl]ENICK", 2)] is None, "non-finite is null"
+    assert got[("M[Oxidation]ELLOWK", 2)] is None, "non-positive is null"
+    assert f"3 of 5 precursors carry a library 1/K0 (from {name}); 2 are null" in stdout
+
+
+def test_an_all_zero_ion_mobility_column_is_not_written(diann_lib, tmp_path):
+    """A library predicted without ion mobility (zeros) stays the version-1 table."""
+    prec, _, stdout = _with_column(diann_lib, tmp_path, "IM", lambda m, z: 0.0)
+    assert "predicted_im" not in pq.read_schema(str(prec)).names
+    assert "no finite positive value in IM" in stdout

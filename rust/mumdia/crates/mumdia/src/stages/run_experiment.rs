@@ -2218,7 +2218,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         ));
         artifacts.push((
             "empirical_library_precursors".to_string(),
-            artifact::FRAGMENT_LIBRARY_PRECURSORS,
+            crate::stages::predict_frag::precursors_schema(&sp.library.precursors)?,
             sp.library.precursors.clone(),
             "second-pass",
             None,

@@ -142,6 +142,10 @@ one row per diaPASEF slot. Provenance only; no stage reads them.
 
 ### fragment_library precursors (`predict_frag.rs:197-211`)
 
+Schema `fragment_library_precursors` version 1, or version 2 when the library has an
+ion-mobility source (`artifact::fragment_library_precursors(has_im)`). Version 2 is version
+1 plus `predicted_im`; the column is never written always-null.
+
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
 | `candidate_id` | UInt32 | no | - | contiguous id, sorted by ascending `precursor_mz` (the fragment-index build key) |
@@ -154,6 +158,7 @@ one row per diaPASEF slot. Provenance only; no stage reads them.
 | `label` | Utf8 | no | - | `target` or `decoy` |
 | `protein` | Utf8 | no | - | protein accessions |
 | `n_fragments` | Int32 | no | - | number of fragments kept for this candidate after top-N |
+| `predicted_im` | Float64 | yes | V s cm^-2 (1/K0) | version 2 only. Library reduced ion mobility: IM2Deep's single-conformer CCS converted at `precursor_mz` (predict-frag under `predict_frag.im_predictor`; never null there, a miss is dropped with its pair), or the imported library's `IM` / `IonMobility` (null where the source value is missing, non-finite or not positive). A script-built decoy carries its target's value, null included |
 
 ### fragment_library fragments (`predict_frag.rs:212-223`)
 

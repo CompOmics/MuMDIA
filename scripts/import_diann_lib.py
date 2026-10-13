@@ -12,6 +12,12 @@ gives the ProForma name. Precursors carrying any other UniMod are dropped, and s
 precursors with a modification before their first residue, because the engine does not
 implement terminal modifications.
 
+Ion mobility: the library's 1/K0 (`IM` in a 2.x parquet, `IonMobility` in older exports)
+is written as `predicted_im` (float64, V s cm^-2; precursor table version 2), but only when
+at least one precursor carries a finite, positive value. Missing, non-finite and
+non-positive values are null. A library without such a value, such as one predicted for an
+instrument without ion mobility, gets no column and is the version-1 table.
+
 Usage: python import_diann_lib.py <diann_lib.parquet> <out_precursors.parquet> <out_fragments.parquet>
               [--charge-by-basic-residues] [--keep-unimod <id,id,...>]
 
@@ -104,7 +110,8 @@ def _fragment_basic_sites(seq_s, typ_s, k_s):
 _META_COLS = ["Modified.Sequence", "Stripped.Sequence", "Precursor.Charge", "Precursor.Mz", "RT"]
 _FRAG_COLS = ["Product.Mz", "Relative.Intensity", "Fragment.Type", "Fragment.Series.Number",
               "Fragment.Charge"]
-_OPTIONAL_COLS = ["Decoy", "Fragment.Loss.Type", "Protein.Names", "Protein.Ids"]
+_OPTIONAL_COLS = ["Decoy", "Fragment.Loss.Type", "Protein.Names", "Protein.Ids", "IM",
+                  "IonMobility"]
 # 0.01 Da bins for the fragment cardinality; wide enough for any fragment m/z.
 _MZ_BIN_MAX = 1_000_000
 
@@ -183,6 +190,7 @@ def main():
         raise SystemExit(f"{inp}: not a DIA-NN fragment-level library, missing columns {missing}")
     optional = [c for c in _OPTIONAL_COLS if c in present]
     prot_col = "Protein.Names" if "Protein.Names" in present else "Protein.Ids"
+    im_col = next((c for c in ("IM", "IonMobility") if c in present), None)
     read_cols = _META_COLS + _FRAG_COLS + optional
 
     # ---- pass 1: precursor table, fragment counts, fragment m/z cardinality ----
@@ -218,6 +226,8 @@ def main():
             "Precursor.Charge": df.loc[first, "Precursor.Charge"].astype(np.int32).to_numpy(),
             "Precursor.Mz": df.loc[first, "Precursor.Mz"].astype(np.float64).to_numpy(),
             "RT": df.loc[first, "RT"].astype(np.float32).to_numpy(),
+            "IM": df.loc[first, im_col].astype(np.float64).to_numpy() if im_col
+            else np.full(int(first.sum()), np.nan),
             "protein_str": df.loc[first, prot_col].astype(str).to_numpy() if prot_col in df.columns
             else np.full(int(first.sum()), "", dtype=object),
         })
@@ -281,6 +291,17 @@ def main():
         "protein": keys["protein_str"],
         "n_fragments": keys["key"].map(nfrag).fillna(0).astype(np.int32),
     })
+    # 1/K0 only from a library that has it: written as NaN, which arrow stores as null.
+    im = keys["IM"].where(np.isfinite(keys["IM"]) & (keys["IM"] > 0))
+    n_im = int(im.notna().sum())
+    if n_im:
+        prec["predicted_im"] = im.astype(np.float64)
+        print(f"ion mobility: {n_im} of {len(prec)} precursors carry a library 1/K0 (from "
+              f"{im_col}); {len(prec) - n_im} are null")
+    else:
+        print("ion mobility: " + (f"no finite positive value in {im_col}" if im_col
+                                  else "no IM column in the library")
+              + "; written without predicted_im")
     write_engine_parquet(prec, outp)
     key_index = pd.Index(keys["key"])
     del prec_parts, count_parts, nfrag

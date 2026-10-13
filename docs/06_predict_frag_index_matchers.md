@@ -78,6 +78,21 @@ DeepLC.
 | `label` | str |
 | `protein` | str |
 | `n_fragments` | i32 (kept fragment count after top-N) |
+| `predicted_im` | f64, nullable (1/K0, V s cm^-2); version 2 only |
+
+`predicted_im` exists only when the library has an ion-mobility source, and its
+presence is what "this library has 1/K0" means. predict-frag writes it when
+`predict_frag.im_predictor` resolves to `im2deep`; `import_diann_lib.py` writes it when
+the source library carries at least one finite, positive 1/K0 (`IM` or `IonMobility`),
+with null for every other precursor. Such a table is schema
+`("fragment_library_precursors", 2)`, chosen by the selector
+`artifact::fragment_library_precursors(has_im)`. Every other library is version 1, with
+the exact bytes it had before the column existed. Every site that records a precursor
+table in the manifest (predict-frag, the library cache, an imported or prefiltered
+library, the DeepLC rewrites, a band library, the second-pass library) reads the version
+from the table's own footer (`predict_frag::precursors_schema`), so the manifest names the
+version that was written. Readers select columns by name, so both versions load
+everywhere; no stage reads `predicted_im` yet.
 
 **fragment_library_fragments** (schema `("fragment_library_fragments", 1)`,
 `schema.rs:14`), written at `predict_frag.rs:254-266`:
@@ -99,9 +114,10 @@ is diagnostic: `Library::load` does not read it, and no stage consumes it yet.
 
 Each artifact also gets an `ArtifactReport` (`predict_frag.rs:277-295`) recording
 row count, blake3 content hash, params (`top_n`, `ms2pip_model`, `rt_predictor`,
-`fragment_predictor`), a shared `stats` map (`candidates`, `fragments`,
-`parse_errors`, `predict_frag.rs:269-272`), and `model_identity` (the concatenated
-RT + fragment model ids, `predict_frag.rs:133`). Both reports share the same
+`fragment_predictor`, and `im_predictor` when 1/K0 was predicted), a shared `stats` map
+(`candidates`, `fragments`, `parse_errors`, the drop counts, and
+`without_im` when 1/K0 was predicted), and `model_identity` (the concatenated
+RT + fragment model ids, with the IM2Deep id appended when 1/K0 was predicted). Both reports share the same
 `stats`/`model_identity`; only `rows` differs per artifact (`predict_frag.rs:282-286`).
 The schema ids are the constants `artifact::FRAGMENT_LIBRARY_PRECURSORS` /
 `artifact::FRAGMENT_LIBRARY_FRAGMENTS` (`schema.rs:13-14`). `run` itself returns
@@ -160,6 +176,13 @@ and errors otherwise (`predict_frag.rs:318-321`); its returned model id is
 `deeplc-<installed version>-base`, the version read from the interpreter, not a trait
 `identity()` (the sidecar path has no `RtPredictor` impl to query). It was the literal
 `"deeplc-4.0-mt"` until docs/30, which named a family, not the release that predicted.
+
+**1/K0 assignment** (`ImRequest`). Only under `predict_frag.im_predictor`. The request
+deduplicates by `(peptidoform, charge)` in first-seen row order, sends each pair's
+precursor m/z, and writes the returned 1/K0 on the `Raw`, where it survives the drop and
+the m/z sort. A candidate IM2Deep returns no value for joins the iRT and intensity misses
+in `drop_unpredicted`: it leaves with its pair, under the same 2% ceiling, and the warning
+counts it as `without_im`. The worker and its contract are in docs/13.
 
 **intensity assignment** (`assign_intensities`, `predict_frag.rs:359`). Native
 path calls `NativeFrag::predict_intensities`. MS2PIP path runs the sidecar over
@@ -677,6 +700,8 @@ so the struct holds exactly these fields and unknown keys are rejected):
 | `ms2pip_model` | `"HCDch2"` | MS2PIP model name passed as argv; `*ch2` models predict the doubly charged series too |
 | `ms2pip_python` | `None` | interpreter for the MS2PIP sidecar; required when `predictor=ms2pip`, else the stage errors |
 | `deeplc_python` | `None` | interpreter for the DeepLC sidecar; required when `rt_predictor=deeplc`, else the stage errors |
+| `im_predictor` | `None` (`ImPredictorKind`) | `none`: no 1/K0 and the version-1 table. `im2deep`: IM2Deep 1/K0 per (peptidoform, charge), requires an IM2Deep interpreter. `auto`: `im2deep` when an IM2Deep interpreter resolves, otherwise `none` with a log line. Library-input mode ignores it |
+| `im2deep_python` | `None` | interpreter for the IM2Deep sidecar (`auto` discovers one, `MUMDIA_PYTHON_IM2DEEP`) |
 | `sidecar_script_dir` | `"scripts"` | directory searched by `resolve_script` for the worker scripts |
 | `library_cache` | `"auto"` | where `run` and `run-experiment` store a FASTA-built library and reuse it on a later run with the same key: `"auto"` is `libraries/` under the engine's cache root (docs/14, "The engine's caches"), a path is that directory, `null` is off (see "Reusing a FASTA-built library" below) |
 
@@ -797,6 +822,20 @@ Matcher selection (both stages default to `Fragindex`):
   does not return is dropped from the library together with its pair (it used to be
   anchored at iRT 0.0); the library report's `candidates_dropped_unpredicted` counts
   them so a large miss is visible rather than silent.
+- **A decoy's 1/K0 follows its iRT.** Script-built decoys (`make_reverse_decoys.py`,
+  `make_shift_decoys.py`, and the `predict_decoys.py` merge, which replaces only the
+  fragments) copy their target's precursor row, so a decoy keeps its target's library
+  `predicted_im`, null included, as it keeps the target's iRT and precursor m/z, and it
+  shares the target's mobility window. Native FASTA decoys are peptidoforms of their own,
+  so IM2Deep predicts their 1/K0 as DeepLC predicts their iRT. Both rules keep the decoy
+  in the same position relative to its target on every axis the extraction windows use;
+  the Python decoy tests pin the copy (`test_decoy_keeps_the_target_precursor_mz_and_irt`,
+  `test_merge_keeps_targets_and_takes_the_predicted_decoy_fragments`). Whether a copied
+  1/K0 is as valid as a predicted one on diaPASEF is an open measurement.
+- **`augment_library.py` adds entries without 1/K0.** Its internal predict-frag runs
+  with `im_predictor = none` whatever the config says, so an imported library with
+  `predicted_im` gets null for the added entries rather than a second 1/K0 source, and
+  the helper prints how many rows carry a library 1/K0.
 - **An imported library can carry one iRT per stripped peptide.** The importer
   copies `predicted_irt` verbatim from the source library's RT column
   (`import_diann_lib.py:148`) and library load accepts it unchecked

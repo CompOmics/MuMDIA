@@ -1514,17 +1514,18 @@ def scan_python_env(
     """
     reads: dict[str, EnvVar] = {}
     sets: dict[str, EnvVar] = {}
+    # Helper functions of the shape `def f(name, default): ... os.environ.get(name, default)`.
+    # The body is searched to the helper's last line, taken from the syntax tree.
+    # A fixed character window after the `def` made detection depend on how many
+    # blank or docstring lines stood between the signature and the read. Collected over
+    # every source before any call site is read, because a helper in a shared module
+    # (`_torch_threads.thread_cap`) is called from the workers that import it.
+    helpers: dict[str, None] = {}
     for rel, text in sources:
         lines = text.split("\n")
-        scopes = python_scopes(text, rel)
         last_line = {
-            (start, name.rsplit(".", 1)[-1]): end for start, end, name in scopes
+            (start, name.rsplit(".", 1)[-1]): end for start, end, name in python_scopes(text, rel)
         }
-        # Helper functions of the shape `def f(name, default): ... os.environ.get(name, default)`.
-        # The body is searched to the helper's last line, taken from the syntax tree.
-        # A fixed character window after the `def` made detection depend on how many
-        # blank or docstring lines stood between the signature and the read.
-        helpers: dict[str, None] = {}
         for m in PY_ENV_FN.finditer(text):
             fname, p_name, p_default = m.group(1), m.group(2), m.group(3)
             def_line = text.count("\n", 0, m.start()) + 1
@@ -1534,6 +1535,9 @@ def scan_python_env(
                 rf"os\.(?:environ\.get|getenv)\(\s*{p_name}\s*,\s*{p_default}\s*\)", block
             ):
                 helpers[fname] = None
+    for rel, text in sources:
+        lines = text.split("\n")
+        scopes = python_scopes(text, rel)
         for i, line in enumerate(lines, 1):
             site = site_anchor(rel, python_scope_at(scopes, i))
             code = line.split("#", 1)[0] if not line.strip().startswith("#") else ""
