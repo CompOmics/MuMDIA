@@ -686,7 +686,7 @@ Every lookup the worker makes is for a candidate that is a confident target of s
 run (`allc`, the union of the per-run confident sets), so the per-run apex maps and
 the per-candidate metadata hold only those candidates, and rescore's selected-peak
 lookup is built only for a run whose competed table has several peaks of one
-candidate (never under the default `extract.retain_top_peaks = 1`). The accepted
+candidate (never under the default `extract.promote_top_peaks = 1`). The accepted
 transfers are flagged in the augmented scored table by one sorted-key lookup on
 `(source, candidate_id)` instead of a Python loop over every row (`flag_transfers`),
 and the frames the flagging no longer needs are released before the whole scored

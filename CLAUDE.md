@@ -153,12 +153,14 @@ Key semantics:
   eliminate a target against its decoy. Peptide-level q estimation subsequently
   performs picked target-decoy competition through the shared
   `base_peptide_id`; keep that pairing intact.
-- `extract.retain_top_peaks > 1` (default 1) writes the alternative peaks as
-  additional `psms_extracted` rows with `peak_rank >= 1` (plus a diagnostic
-  `.peaks.parquet`), `features` carries `peak_rank`, `compete` keys on it, and
-  `rescore` keeps one row per candidate and records `selected_peak_rank`. The
-  plumbing exists; what the default still lacks is entrapment validation on two
-  acquisitions.
+- Two keys, two jobs. `extract.retain_top_peaks = K > 1` (default 1) only enumerates up
+  to K peak hypotheses per candidate into the unscored diagnostic sidecar
+  `<psms>.peaks.parquet`; the primary table keeps the selected apex alone.
+  `extract.promote_top_peaks = K > 1` (default 1, `<= retain_top_peaks`) writes the
+  alternatives as additional `psms_extracted` rows with `peak_rank >= 1`;
+  `features` carries `peak_rank`, `compete` keys on it, and `rescore` keeps one row
+  per candidate and records `selected_peak_rank`. The plumbing exists; what the
+  default still lacks is entrapment validation on two acquisitions.
 
 ## Validated sensitivity workflow
 
@@ -861,8 +863,9 @@ sensitivity result for it.
 
 Do not enable these by default from a single AIF count:
 
-- model-visible top-K peaks (`extract.retain_top_peaks > 1`; implemented through
-  features, compete and rescore, default 1);
+- model-visible top-K peaks (`extract.promote_top_peaks > 1`; implemented through
+  features, compete and rescore, default 1). On a diaPASEF E. coli run it cost
+  peptides as implemented: -5.7% at K = 2 and -5.9% at K = 3 (one seed);
 - adaptive RT windows;
 - held-out RT window sizing (`rt_im_train.window_holdout_frac`). Implemented and
   measured on the AIF benchmark: +1.1% peptides with DeepLC 4.1.0 at unchanged
