@@ -110,6 +110,9 @@ struct SeedLibraryKey {
     fragment_offset: Option<u32>,
     precursor_span: Option<(usize, usize)>,
     fragindex: bool,
+    /// The index carries each posting's fragment ordinal, which
+    /// `search_seed.count_fragments_once` reads ([`FragIndex::build_mz_only_with_ordinals`]).
+    fragment_ordinals: bool,
     tol_bits: u64,
     bucket_size: usize,
 }
@@ -126,6 +129,11 @@ impl SeedLibrary {
     /// DeepLC step. The bucketed matcher keeps the full load, because `page_search` serves
     /// `idx_int` out of arrays built from the intensities.
     ///
+    /// Under `search_seed.count_fragments_once` the fragindex index also carries each
+    /// posting's fragment ordinal ([`FragIndex::build_mz_only_with_ordinals`], 2 bytes per
+    /// posting), which the count-once accumulation keys on. With the key off it is the plain
+    /// m/z-only index.
+    ///
     /// `fragment_offset` and `precursor_span` select the rows exactly as for
     /// [`Library::load_for_stage`]: the whole table, a band file, or a row span of the
     /// whole table.
@@ -138,12 +146,14 @@ impl SeedLibrary {
         bucket_size: usize,
     ) -> Result<SeedLibrary> {
         let fragindex = matches!(cfg.matcher, MatcherKind::Fragindex);
+        let fragment_ordinals = fragindex && cfg.count_fragments_once;
         let key = SeedLibraryKey {
             precursors: precursors.to_string(),
             fragments: fragments.to_string(),
             fragment_offset,
             precursor_span,
             fragindex,
+            fragment_ordinals,
             tol_bits: cfg.fragment_tol_ppm.to_bits(),
             bucket_size,
         };
@@ -154,7 +164,11 @@ impl SeedLibrary {
                 fragment_offset,
                 precursor_span,
             )?;
-            let fidx = FragIndex::build_mz_only(&lib, cfg.fragment_tol_ppm);
+            let fidx = if fragment_ordinals {
+                FragIndex::build_mz_only_with_ordinals(&lib, cfg.fragment_tol_ppm)
+            } else {
+                FragIndex::build_mz_only(&lib, cfg.fragment_tol_ppm)
+            };
             return Ok(SeedLibrary {
                 lib,
                 fidx: Some(fidx),
@@ -217,6 +231,12 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
         ],
     )?;
     let fragindex = matches!(p.cfg.matcher, MatcherKind::Fragindex);
+    // Config validation refuses this; a configuration built in code is refused here too,
+    // rather than silently counting every matching peak on the bucketed matcher.
+    anyhow::ensure!(
+        fragindex || !p.cfg.count_fragments_once,
+        "search-seed: search_seed.count_fragments_once needs search_seed.matcher = fragindex"
+    );
     // The calibrant ids are library-wide: local id plus where the band starts, which is the
     // fragment offset of a band file and the first row of a span.
     let gid_base = p
@@ -234,6 +254,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             fragment_offset: p.fragment_offset,
             precursor_span: p.precursor_span,
             fragindex,
+            fragment_ordinals: fragindex && p.cfg.count_fragments_once,
             tol_bits: p.cfg.fragment_tol_ppm.to_bits(),
             bucket_size: p.bucket_size,
         };
@@ -422,6 +443,21 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
     // The same deviations keyed by library-wide candidate id and scan, written beside the
     // masscal for a grouped run to pool. Stays empty otherwise.
     let mut calibrants = crate::masscal::Calibrants::default();
+    // Spectra with per-peak 1/K0 (a diaPASEF run) give each confident target an observed
+    // 1/K0, the anchor rt-im-train calibrates the library's `predicted_im` against: the
+    // intensity-weighted median 1/K0 of its matched fragment peaks in its best scan.
+    // Fragments inherit the precursor's mobility in diaPASEF, because the TIMS separation
+    // precedes fragmentation. A matched peak is the calibrant's own nearest peak, counted
+    // only within the search tolerance, not the wider calibrant collection window, so
+    // random matches stay out. Without per-peak 1/K0 nothing is collected and the seed
+    // table is v1, byte for byte (`artifact::seed_psms`).
+    let has_im = scans.iter().any(|s| s.im.is_some());
+    let mut obs_im_c: Vec<Option<f64>> = if has_im {
+        vec![None; n_rows]
+    } else {
+        Vec::new()
+    };
+    let mut im_pts: Vec<(f64, f64)> = Vec::new();
     for (i, (cid, b)) in rows.iter().enumerate() {
         if is_dec[i] {
             continue;
@@ -451,29 +487,25 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             // the learned tolerance came out too tight. The 50 ppm floor is kept for the
             // narrow-tolerance case, where a wider window would just admit noise.
             let collect_ppm = 50.0_f64.max(p.cfg.fragment_tol_ppm);
+            // The scan's 1/K0 when this row is one of its anchors.
+            let scan_im = scan.im.as_deref().filter(|_| confident);
+            im_pts.clear();
             for &fmz in mzs {
                 // library m/z is stored f32; widen once, the value is unchanged
                 let fmz = fmz as f64;
-                let (lo, hi) = mumdia_core::constants::ppm_bounds(fmz, collect_ppm);
-                // Observed m/z is stored f32 too, and widening is exact, so the
-                // partition point, the walk bound and the ppm deviation are all computed
-                // on the same doubles a widened-at-load peak carried.
-                let s = scan.peaks.partition_point(|pk| (pk.mz as f64) < lo);
-                let (mut bestd, mut bestppm) = (f64::MAX, None);
-                let mut j = s;
-                while j < scan.peaks.len() && (scan.peaks[j].mz as f64) <= hi {
-                    let pmz = scan.peaks[j].mz as f64;
-                    let d = (pmz - fmz).abs();
-                    if d < bestd {
-                        bestd = d;
-                        bestppm = Some(mumdia_core::constants::ppm_diff(pmz, fmz));
-                    }
-                    j += 1;
-                }
-                if let Some(pp) = bestppm {
+                // The nearest peak within the collection window, ties to the lower m/z
+                // (`spectra::nearest_peak`, shared with the 1/K0 points below).
+                let nearest = crate::spectra::nearest_peak(&scan.peaks, fmz, collect_ppm);
+                if let Some(j) = nearest {
+                    let pp = mumdia_core::constants::ppm_diff(scan.peaks[j].mz as f64, fmz);
                     if confident {
                         devs.push(pp);
                         dev_mz.push(fmz);
+                    }
+                    if let Some(im) = scan_im {
+                        if pp.abs() <= p.cfg.fragment_tol_ppm {
+                            im_pts.push((im[j] as f64, scan.peaks[j].intensity as f64));
+                        }
                     }
                     if p.emit_calibrants {
                         calibrants.candidate_id.push(gid);
@@ -485,6 +517,9 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
                         calibrants.ppm.push(pp as f32);
                     }
                 }
+            }
+            if scan_im.is_some() {
+                obs_im_c[i] = crate::stats::weighted_median(&mut im_pts);
             }
         }
     }
@@ -518,54 +553,67 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
         "search-seed: mass recalibration"
     );
 
-    let seed_written = write_table_hashed(
-        p.out,
-        vec![
-            Col::U32("candidate_id".into(), cid_c),
-            Col::Str("peptidoform".into(), pform_c),
-            Col::I32("charge".into(), charge_c),
-            Col::F64("precursor_mz".into(), mz_c),
-            Col::U32("base_peptide_id".into(), base_c),
-            Col::Str("protein".into(), prot_c),
-            // Materialised here and nowhere else: the artifact's column is text, but the
-            // engine never needed the strings for anything but the write itself. (A `Col`
-            // variant over a two-valued dictionary would remove these too; that is a
-            // mumdia-io change.)
-            Col::Str("label".into(), label_column(&is_dec)),
-            Col::F64("score".into(), score_c),
-            Col::F64("spectrum_q".into(), q_c),
-            Col::F64("observed_rt".into(), rt_c),
-            Col::F32("predicted_irt".into(), irt_c),
-            Col::I32("matched_peaks".into(), matched_c),
-            Col::U32("scan_index".into(), scan_c),
-        ],
-    )?;
+    let n_obs_im = obs_im_c.iter().filter(|v| v.is_some()).count();
+    let schema = artifact::seed_psms(has_im);
+    let mut cols = vec![
+        Col::U32("candidate_id".into(), cid_c),
+        Col::Str("peptidoform".into(), pform_c),
+        Col::I32("charge".into(), charge_c),
+        Col::F64("precursor_mz".into(), mz_c),
+        Col::U32("base_peptide_id".into(), base_c),
+        Col::Str("protein".into(), prot_c),
+        // Materialised here and nowhere else: the artifact's column is text, but the
+        // engine never needed the strings for anything but the write itself. (A `Col`
+        // variant over a two-valued dictionary would remove these too; that is a
+        // mumdia-io change.)
+        Col::Str("label".into(), label_column(&is_dec)),
+        Col::F64("score".into(), score_c),
+        Col::F64("spectrum_q".into(), q_c),
+        Col::F64("observed_rt".into(), rt_c),
+        Col::F32("predicted_irt".into(), irt_c),
+        Col::I32("matched_peaks".into(), matched_c),
+        Col::U32("scan_index".into(), scan_c),
+    ];
+    if has_im {
+        cols.push(Col::OptF64("observed_im".into(), obs_im_c));
+    }
+    let seed_written = write_table_hashed(p.out, cols)?;
     let n = seed_written.rows;
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("psms".to_string(), json!(n));
     stats.insert(format!("targets_at_q{}", p.cfg.fdr_seed), json!(n_at_1pct));
+    if has_im {
+        stats.insert("with_observed_im".to_string(), json!(n_obs_im));
+    }
     if let Some((n_cal, bytes, n_targets)) = calibrant_stats {
         stats.insert("calibrant_deviations".to_string(), json!(n_cal));
         stats.insert("calibrant_bytes".to_string(), json!(bytes));
         stats.insert("calibrant_target_rows".to_string(), json!(n_targets));
     }
     let report = ArtifactReport {
-        logical_name: artifact::SEED_PSMS.0.to_string(),
-        schema_name: artifact::SEED_PSMS.0.to_string(),
-        schema_version: artifact::SEED_PSMS.1,
+        logical_name: schema.0.to_string(),
+        schema_name: schema.0.to_string(),
+        schema_version: schema.1,
         stage: "search-seed".to_string(),
         rows: n,
         // Computed while the table was written.
         content_hash: seed_written.content_hash,
-        params: json!({
-            "fragment_tol_ppm": p.cfg.fragment_tol_ppm,
-            "report_psms": p.cfg.report_psms,
-            "min_matched_peaks": p.cfg.min_matched_peaks,
-            "top_n_peaks": p.cfg.top_n_peaks,
-            "fdr_seed": p.cfg.fdr_seed,
-        }),
+        params: {
+            let mut v = json!({
+                "fragment_tol_ppm": p.cfg.fragment_tol_ppm,
+                "report_psms": p.cfg.report_psms,
+                "min_matched_peaks": p.cfg.min_matched_peaks,
+                "top_n_peaks": p.cfg.top_n_peaks,
+                "fdr_seed": p.cfg.fdr_seed,
+            });
+            // Only when on, so a default report is unchanged.
+            if p.cfg.count_fragments_once {
+                v["count_fragments_once"] = json!(true);
+            }
+            v
+        },
         stats,
         model_identity: Some("native-seed-hyperscore-v1".to_string()),
         elapsed_ms: elapsed,
@@ -613,6 +661,16 @@ fn label_column(is_decoy: &[bool]) -> Vec<String> {
         .iter()
         .map(|&d| if d { "decoy" } else { "target" }.to_string())
         .collect()
+}
+
+/// The schema a seed table on disk records: version 2 when it carries `observed_im`, else
+/// version 1 (`artifact::seed_psms`). Read from the parquet footer, so an orchestrator
+/// records the version the stage actually wrote, not a constant.
+pub fn seed_schema(path: &str) -> Result<(&'static str, u32)> {
+    let has_im = mumdia_io::table::column_names(path)?
+        .iter()
+        .any(|c| c == "observed_im");
+    Ok(artifact::seed_psms(has_im))
 }
 
 /// The `(lower_mz, upper_mz)` `convert` writes for an MS2 scan whose reported isolation
@@ -867,7 +925,11 @@ fn seed_fragindex_windows_chunked(
                         .iter()
                         .map(|&pi| (scan.peaks[pi].mz as f64, scan.peaks[pi].intensity))
                         .collect();
-                    scratch.accumulate(idx, &peaks, lo, hi);
+                    if cfg.count_fragments_once {
+                        scratch.accumulate_count_once(idx, &peaks, lo, hi);
+                    } else {
+                        scratch.accumulate(idx, &peaks, lo, hi);
+                    }
                     // The candidates that reached `min_matched_peaks`, which the scratch
                     // collected as they reached it (`SeedScratch::qualified`) instead of
                     // this loop filtering every candidate the scan touched. They come in a
@@ -1113,6 +1175,7 @@ mod peak_selection_tests {
                     intensity: i as f32,
                 })
                 .collect(),
+            im: None,
         }
     }
 
@@ -1259,6 +1322,7 @@ mod chunk_tests {
                 rt_seconds: (s / 3) as f64 * 2.0,
                 window: window(in_a),
                 peaks,
+                im: None,
             });
         }
         let cfg = SearchSeedConfig {

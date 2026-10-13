@@ -121,8 +121,9 @@ pub enum ImPredictorKind {
     /// (peptidoform, charge) from the single-conformer model, converted to 1/K0 at the
     /// precursor m/z. A hard requirement: the run fails without an IM2Deep interpreter.
     Im2deep,
-    /// `im2deep` when an IM2Deep interpreter resolves (`predict_frag.im2deep_python`, its
-    /// environment variable or discovery), otherwise `none`, with a log line.
+    /// `im2deep` when the run's spectra carry 1/K0 (a diaPASEF `.d`, `mumdia::instrument`)
+    /// AND an IM2Deep interpreter resolves (`predict_frag.im2deep_python`, its environment
+    /// variable or discovery), otherwise `none`, with a log line.
     Auto,
 }
 
@@ -428,6 +429,21 @@ impl Default for ConvertConfig {
             tdf_im_smooth_scans: 8.0,
         }
     }
+}
+
+// The `rt_im_train` ion-mobility keys at their defaults, which the canonical configuration
+// omits.
+fn is_default_im_min_anchors_per_charge(v: &usize) -> bool {
+    *v == RtImTrainConfig::default().im_min_anchors_per_charge
+}
+fn is_default_p_im(v: &f64) -> bool {
+    *v == RtImTrainConfig::default().p_im
+}
+fn is_default_im_window_multiplier(v: &f64) -> bool {
+    *v == RtImTrainConfig::default().im_window_multiplier
+}
+fn is_default_im_window_min(v: &f64) -> bool {
+    *v == RtImTrainConfig::default().im_window_min
 }
 
 // The `convert.tdf_*` keys at their defaults, which the canonical configuration omits.
@@ -1017,8 +1033,9 @@ pub struct PredictFragConfig {
     /// Ion-mobility predictor for the library's `predicted_im` (1/K0, V s cm^-2) in a FASTA
     /// build. `none` (the default): the library has no `predicted_im` column. `im2deep`:
     /// IM2Deep predicts one 1/K0 per (peptidoform, charge), and the run fails without an
-    /// IM2Deep interpreter (`im2deep_python`). `auto`: `im2deep` when an IM2Deep interpreter
-    /// resolves, otherwise `none` with a log line. Decoys built by the native digest get their
+    /// IM2Deep interpreter (`im2deep_python`). `auto`: `im2deep` when the run's spectra
+    /// carry 1/K0 (a diaPASEF `.d`) and an IM2Deep interpreter resolves, otherwise `none` with
+    /// a log line; a standalone `predict-frag` has no run, so there it is `none`. Decoys built by the native digest get their
     /// own prediction, as they get their own iRT. A candidate IM2Deep returns no value for is
     /// dropped with its pair, under the same 2% ceiling as a missing iRT or intensity.
     /// Library-input mode ignores the key: an imported library carries its own 1/K0. Omitted
@@ -1121,13 +1138,18 @@ impl Default for PredictFragConfig {
 }
 
 impl PredictFragConfig {
-    /// The ion-mobility predictor a library build runs: `auto` becomes `im2deep` when an
-    /// IM2Deep interpreter resolved and `none` otherwise. Meaningful after interpreter
-    /// resolution (`mumdia::python::resolve`), which leaves `im2deep_python` either a
-    /// concrete path or unset.
-    pub fn im_predictor_resolved(&self) -> ImPredictorKind {
+    /// The ion-mobility predictor a library build runs for a run whose spectra do
+    /// (`run_has_im`) or do not carry 1/K0: `auto` becomes `im2deep` only when they do and an
+    /// IM2Deep interpreter resolved, and `none` otherwise. An explicit choice is returned as
+    /// it is. `run_has_im` is `mumdia::instrument`'s one predicate; a build with no run (a
+    /// standalone `predict-frag`) passes false. Meaningful after interpreter resolution
+    /// (`mumdia::python::resolve`), which leaves `im2deep_python` either a concrete path or
+    /// unset.
+    pub fn im_predictor_for(&self, run_has_im: bool) -> ImPredictorKind {
         match self.im_predictor {
-            ImPredictorKind::Auto if self.im2deep_python.is_some() => ImPredictorKind::Im2deep,
+            ImPredictorKind::Auto if run_has_im && self.im2deep_python.is_some() => {
+                ImPredictorKind::Im2deep
+            }
             ImPredictorKind::Auto => ImPredictorKind::None,
             kind => kind,
         }
@@ -1176,6 +1198,16 @@ pub struct SearchSeedConfig {
     /// tolerance is `1.5 x p95(|deviation - median|)`; on an instrument whose fragment mass
     /// error is well under a ppm (Astral) the floor, not the data, sets it.
     pub frag_tol_floor_ppm: f64,
+    /// Count each predicted fragment of a candidate at most once per spectrum, with the
+    /// intensity of its most intense matching peak, instead of once per matching peak. On
+    /// diaPASEF slot spectra the mobility pieces of one fragment ion sit at one m/z and
+    /// would otherwise count as several fragments in the hyperscore's `ln(matched!)`
+    /// (docs/07_search_seed.md). Needs `matcher = fragindex`, whose seed index then also
+    /// holds each posting's fragment ordinal (2 bytes per posting). Default false: the seed
+    /// is unchanged. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical
+    /// configuration at its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub count_fragments_once: bool,
 }
 impl Default for SearchSeedConfig {
     fn default() -> Self {
@@ -1189,8 +1221,15 @@ impl Default for SearchSeedConfig {
             two_pass_mass_cal: true,
             mass_cal_loess: false,
             frag_tol_floor_ppm: 5.0,
+            count_fragments_once: false,
         }
     }
+}
+
+/// A `false` flag, which the canonical configuration omits for keys added after the
+/// configuration hash was frozen for their section.
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// Heads `rt_im_train.multihead_calibration` uses when it is left to decide.
@@ -1377,6 +1416,26 @@ pub struct RtImTrainConfig {
     /// DIA-NN library iRT and 10,181 from a per-run fine-tune, with `w_rt` 343 s against
     /// 632 s and 472 s (docs/08 section 4c). `run-experiment` predicts once per experiment.
     pub library_irt: LibraryIrt,
+    /// Ion-mobility calibration (docs/08_rt_im_train.md, "Ion-mobility calibration"): a
+    /// charge with fewer anchors than this uses the global CCS fit rather than its own.
+    /// The calibration runs only when the seed carries `observed_im` (spectra with 1/K0)
+    /// and the library `predicted_im`. Default 50. Omitted from the canonical configuration
+    /// at its default.
+    #[serde(skip_serializing_if = "is_default_im_min_anchors_per_charge")]
+    pub im_min_anchors_per_charge: usize,
+    /// Percentile of the held-out |observed - calibrated| 1/K0 residuals that sizes the IM
+    /// half-window `w_im`, as `p_rt` sizes `w_rt`. Default 0.95. Omitted from the canonical
+    /// configuration at its default.
+    #[serde(skip_serializing_if = "is_default_p_im")]
+    pub p_im: f64,
+    /// Multiplier on that percentile. Default 1.0. Omitted from the canonical configuration
+    /// at its default.
+    #[serde(skip_serializing_if = "is_default_im_window_multiplier")]
+    pub im_window_multiplier: f64,
+    /// Lower clamp of the IM half-window, in V s cm^-2. Default 0.005. Omitted from the
+    /// canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_default_im_window_min")]
+    pub im_window_min: f64,
     /// Worker processes for the whole-library DeepLC prediction: the multi-head
     /// calibration, the base-model re-prediction under `library_irt`, and the prediction
     /// after `finetune_deeplc` (`deeplc_finetune.py --shards`). The calibration or the
@@ -1583,6 +1642,10 @@ impl Default for RtImTrainConfig {
             rt_window_min_s: 1.0,
             window_holdout_frac: 0.0,
             library_irt: LibraryIrt::Auto,
+            im_min_anchors_per_charge: 50,
+            p_im: 0.95,
+            im_window_multiplier: 1.0,
+            im_window_min: 0.005,
             deeplc_predict_shards: 0,
             deeplc_projection_cache: Some("auto".to_string()),
         }
@@ -3540,6 +3603,7 @@ impl Config {
             ("search_seed.fdr_seed", self.search_seed.fdr_seed),
             ("rt_im_train.q_train", self.rt_im_train.q_train),
             ("rt_im_train.p_rt", self.rt_im_train.p_rt),
+            ("rt_im_train.p_im", self.rt_im_train.p_im),
             ("rt_im_train.loess_span", self.rt_im_train.loess_span),
         ] {
             if !value.is_finite() || value <= 0.0 || value > 1.0 {
@@ -3547,6 +3611,29 @@ impl Config {
                     "{name} must be finite and in (0, 1] (got {value})"
                 )));
             }
+        }
+        if !self.rt_im_train.im_window_multiplier.is_finite()
+            || self.rt_im_train.im_window_multiplier <= 0.0
+        {
+            return Err(Invalid(format!(
+                "rt_im_train.im_window_multiplier must be finite and > 0 (got {})",
+                self.rt_im_train.im_window_multiplier
+            )));
+        }
+        if !self.rt_im_train.im_window_min.is_finite() || self.rt_im_train.im_window_min < 0.0 {
+            return Err(Invalid(format!(
+                "rt_im_train.im_window_min must be finite and >= 0 (got {})",
+                self.rt_im_train.im_window_min
+            )));
+        }
+        if self.search_seed.count_fragments_once
+            && !matches!(self.search_seed.matcher, MatcherKind::Fragindex)
+        {
+            return Err(Invalid(
+                "search_seed.count_fragments_once needs search_seed.matcher = fragindex: the \
+                 bucketed matcher has no fragment ordinals to count a fragment once by"
+                    .into(),
+            ));
         }
         if !self.rt_im_train.window_holdout_frac.is_finite()
             || !(0.0..1.0).contains(&self.rt_im_train.window_holdout_frac)
@@ -4594,6 +4681,63 @@ mod tests {
         assert!(Config::from_json(r#"{"convert":{"bruker_reader":"native"}}"#).is_err());
     }
 
+    /// The seed and calibration keys of the diaPASEF work are omitted from the canonical
+    /// configuration at their defaults, so a configuration that does not set them keeps the
+    /// config hash it had before they existed, and an explicit default changes nothing.
+    #[test]
+    fn seed_and_im_calibration_keys_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        let canon = d.canonical_json();
+        for key in [
+            "count_fragments_once",
+            "im_min_anchors_per_charge",
+            "p_im",
+            "im_window_multiplier",
+            "im_window_min",
+        ] {
+            assert!(!canon.contains(key), "{key} in {canon}");
+        }
+        let explicit = Config::from_json(
+            r#"{"search_seed":{"count_fragments_once":false},
+                "rt_im_train":{"im_min_anchors_per_charge":50,"p_im":0.95,
+                "im_window_multiplier":1.0,"im_window_min":0.005}}"#,
+        )
+        .unwrap();
+        // The config hash is the hash of exactly this string.
+        assert_eq!(explicit.canonical_json(), canon);
+        for (json, key) in [
+            (
+                r#"{"search_seed":{"count_fragments_once":true}}"#,
+                r#""count_fragments_once":true"#,
+            ),
+            (
+                r#"{"rt_im_train":{"im_min_anchors_per_charge":20}}"#,
+                r#""im_min_anchors_per_charge":20"#,
+            ),
+            (r#"{"rt_im_train":{"p_im":0.9}}"#, r#""p_im":0.9"#),
+            (
+                r#"{"rt_im_train":{"im_window_multiplier":1.5}}"#,
+                r#""im_window_multiplier":1.5"#,
+            ),
+            (
+                r#"{"rt_im_train":{"im_window_min":0.01}}"#,
+                r#""im_window_min":0.01"#,
+            ),
+        ] {
+            let c = Config::from_json(json).unwrap();
+            assert!(c.canonical_json().contains(key), "{json}");
+        }
+        for bad in [
+            r#"{"search_seed":{"count_fragments_once":true,"matcher":"bucketed"}}"#,
+            r#"{"rt_im_train":{"p_im":0.0}}"#,
+            r#"{"rt_im_train":{"p_im":1.5}}"#,
+            r#"{"rt_im_train":{"im_window_multiplier":0.0}}"#,
+            r#"{"rt_im_train":{"im_window_min":-0.1}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
     #[test]
     fn the_im_predictor_defaults_to_none_and_leaves_the_config_hash_alone() {
         let d = Config::default();
@@ -4631,19 +4775,25 @@ mod tests {
     }
 
     #[test]
-    fn auto_im_prediction_resolves_on_the_interpreter() {
+    fn auto_im_prediction_resolves_on_the_run_and_the_interpreter() {
         let mut pf = PredictFragConfig::default();
-        assert_eq!(pf.im_predictor_resolved(), ImPredictorKind::None);
+        for has_im in [false, true] {
+            assert_eq!(pf.im_predictor_for(has_im), ImPredictorKind::None);
+        }
         pf.im_predictor = ImPredictorKind::Auto;
-        assert_eq!(pf.im_predictor_resolved(), ImPredictorKind::None);
+        assert_eq!(pf.im_predictor_for(true), ImPredictorKind::None);
         pf.im2deep_python = Some("/py".into());
-        assert_eq!(pf.im_predictor_resolved(), ImPredictorKind::Im2deep);
+        assert_eq!(pf.im_predictor_for(true), ImPredictorKind::Im2deep);
+        // A run without 1/K0 predicts none under `auto`, interpreter or not.
+        assert_eq!(pf.im_predictor_for(false), ImPredictorKind::None);
         // An explicit choice is never second-guessed.
         pf.im_predictor = ImPredictorKind::None;
-        assert_eq!(pf.im_predictor_resolved(), ImPredictorKind::None);
+        assert_eq!(pf.im_predictor_for(true), ImPredictorKind::None);
         pf.im_predictor = ImPredictorKind::Im2deep;
         pf.im2deep_python = None;
-        assert_eq!(pf.im_predictor_resolved(), ImPredictorKind::Im2deep);
+        for has_im in [false, true] {
+            assert_eq!(pf.im_predictor_for(has_im), ImPredictorKind::Im2deep);
+        }
     }
 
     #[test]

@@ -1077,10 +1077,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             let lib_f = d("fragment_library_fragments.parquet");
             // `predict_frag.library_cache`, as in `run`: a stored library with the same key
             // is published here instead of being built.
+            // One library serves every run: it carries 1/K0 when any run's spectra will
+            // (`instrument::input_has_im`, decided before conversion as in `run`).
+            let run_has_im = p.mzmls.iter().any(|m| crate::instrument::input_has_im(m));
             let cache = crate::library_cache::LibraryCache::for_config(
                 cfg,
                 fasta,
                 irt_placeholder,
+                run_has_im,
                 (&prov.mumdia_version, &prov.git_sha),
             );
             if cache
@@ -1117,6 +1121,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     work_dir: &d("sidecar_work"),
                     cfg: &cfg.predict_frag,
                     config_hash: &ch,
+                    run_has_im,
                 })?;
                 match &cache {
                     Some(c) => {

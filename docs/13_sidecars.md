@@ -355,8 +355,8 @@ precede numpy and pyarrow (`deeplc_worker.py:13-29`, see **DeepLC import order**
 under gotchas).
 
 **IM2Deep predict** (`predict_frag.rs`, `ImRequest`, worker `im2deep_worker.py`).
-Selected by `predict_frag.im_predictor = "im2deep"`, or `"auto"` when an IM2Deep
-interpreter resolves (`im_predictor_resolved`). `ImRequest` deduplicates by
+Selected by `predict_frag.im_predictor = "im2deep"`, or `"auto"` when the run's input
+carries 1/K0 and an IM2Deep interpreter resolves (`im_predictor_for`, docs/35 section 4). `ImRequest` deduplicates by
 `(peptidoform, charge)` in first-seen row order, because 1/K0 depends on the charge,
 calls `run_im2deep` with each pair's precursor m/z, and writes `r.im`. It runs after the
 fragment worker, one worker at a time, unless `MUMDIA_PREDICT_FRAG_CONCURRENT=1` puts it
@@ -904,7 +904,7 @@ configured.
 | `predict_frag.ms2pip_model` | `"HCDch2"` | 3rd positional arg to `ms2pip_worker.py`; `*ch2` models emit the `b2`/`y2` series as `frag_charge` 2 |
 | `predict_frag.ms2pip_python` | `None` | interpreter for MS2PIP (env with ms2pip+pyarrow) |
 | `predict_frag.deeplc_python` | `None` | interpreter for DeepLC predict AND fine-tune |
-| `predict_frag.im_predictor` | `none` | `im2deep` engages `im2deep_worker.py` (requires `im2deep_python`); `auto` engages it only when an IM2Deep interpreter resolves. Omitted from the canonical config at `none` |
+| `predict_frag.im_predictor` | `none` | `im2deep` engages `im2deep_worker.py` (requires `im2deep_python`); `auto` engages it only on a run whose input carries 1/K0 and when an IM2Deep interpreter resolves. Omitted from the canonical config at `none` |
 | `predict_frag.im2deep_python` | `None` | interpreter for IM2Deep (env with im2deep >= 2.0.0, psm_utils, torch, pyarrow); omitted from the canonical config when unset |
 | `predict_frag.sidecar_script_dir` | `"scripts"` | dir passed to `resolve_script` for all workers |
 | `rt_im_train.finetune_deeplc` | `false` | engage `deeplc_finetune.py` in `run` (requires `deeplc_python`) |

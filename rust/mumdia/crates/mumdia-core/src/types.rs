@@ -103,6 +103,10 @@ pub struct Ms2Scan {
     pub window: IsolationWindow,
     /// m/z sorted peaks.
     pub peaks: Vec<Peak>,
+    /// Per-peak 1/K0 (V s cm^-2), parallel to `peaks`, for spectra that carry ion mobility
+    /// (spectra v2, the native diaPASEF reader). `None` on 3D spectra, where nothing is
+    /// decoded or allocated for it.
+    pub im: Option<Vec<f32>>,
 }
 
 #[cfg(test)]
@@ -116,9 +120,9 @@ mod tests {
     /// and an `Option<f32>` costs a full word because an `f32` has no niche -- which is how
     /// the dead `ion_mobility` came to be a third of the struct.
     ///
-    /// This pins the layout the load path and the ~22 read sites were sized for. If a 4D
-    /// run needs ion mobility, give the SCAN a `Vec<f32>` parallel to `peaks` and leave
-    /// this at 8.
+    /// This pins the layout the load path and the ~22 read sites were sized for. A 4D run's
+    /// ion mobility is on the SCAN (`Ms2Scan::im`, a `Vec<f32>` parallel to `peaks`), so
+    /// this stays at 8.
     #[test]
     fn peak_is_two_f32_and_nothing_else() {
         assert_eq!(size_of::<Peak>(), 8, "Peak must stay two f32 wide");

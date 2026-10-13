@@ -1333,7 +1333,7 @@
       "optional": false,
       "default": "none",
       "default_text": "`none`",
-      "help": "Ion-mobility predictor for the library's `predicted_im` (1/K0, V s cm^-2) in a FASTA build. `none` (the default): the library has no `predicted_im` column. `im2deep`: IM2Deep predicts one 1/K0 per (peptidoform, charge), and the run fails without an IM2Deep interpreter (`im2deep_python`). `auto`: `im2deep` when an IM2Deep interpreter resolves, otherwise `none` with a log line. Decoys built by the native digest get their own prediction, as they get their own iRT. A candidate IM2Deep returns no value for is dropped with its pair, under the same 2% ceiling as a missing iRT or intensity. Library-input mode ignores the key: an imported library carries its own 1/K0. Omitted from the canonical configuration at its default.",
+      "help": "Ion-mobility predictor for the library's `predicted_im` (1/K0, V s cm^-2) in a FASTA build. `none` (the default): the library has no `predicted_im` column. `im2deep`: IM2Deep predicts one 1/K0 per (peptidoform, charge), and the run fails without an IM2Deep interpreter (`im2deep_python`). `auto`: `im2deep` when the run's spectra carry 1/K0 (a diaPASEF `.d`) and an IM2Deep interpreter resolves, otherwise `none` with a log line; a standalone `predict-frag` has no run, so there it is `none`. Decoys built by the native digest get their own prediction, as they get their own iRT. A candidate IM2Deep returns no value for is dropped with its pair, under the same 2% ceiling as a missing iRT or intensity. Library-input mode ignores the key: an imported library carries its own 1/K0. Omitted from the canonical configuration at its default.",
       "gates": [],
       "source_struct": "PredictFragConfig",
       "choices": [
@@ -1515,6 +1515,21 @@
       "default_text": "5.0",
       "help": "Floor (ppm) on the fragment tolerance learned from the seed's calibrants, which `extract` then searches with. Default 5, the value that was hard-coded. The learned tolerance is `1.5 x p95(|deviation - median|)`; on an instrument whose fragment mass error is well under a ppm (Astral) the floor, not the data, sets it.",
       "gates": [],
+      "source_struct": "SearchSeedConfig"
+    },
+    {
+      "path": "search_seed.count_fragments_once",
+      "name": "count_fragments_once",
+      "section": "search_seed",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Count each predicted fragment of a candidate at most once per spectrum, with the intensity of its most intense matching peak, instead of once per matching peak. On diaPASEF slot spectra the mobility pieces of one fragment ion sit at one m/z and would otherwise count as several fragments in the hyperscore's `ln(matched!)` (docs/07_search_seed.md). Needs `matcher = fragindex`, whose seed index then also holds each posting's fragment ordinal (2 bytes per posting). Default false: the seed is unchanged. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
       "source_struct": "SearchSeedConfig"
     },
     {
@@ -1846,6 +1861,58 @@
         "library",
         "deeplc"
       ]
+    },
+    {
+      "path": "rt_im_train.im_min_anchors_per_charge",
+      "name": "im_min_anchors_per_charge",
+      "section": "rt_im_train",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 50,
+      "default_text": "50",
+      "help": "Ion-mobility calibration (docs/08_rt_im_train.md, \"Ion-mobility calibration\"): a charge with fewer anchors than this uses the global CCS fit rather than its own. The calibration runs only when the seed carries `observed_im` (spectra with 1/K0) and the library `predicted_im`. Default 50. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
+      "path": "rt_im_train.p_im",
+      "name": "p_im",
+      "section": "rt_im_train",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.95,
+      "default_text": "0.95",
+      "help": "Percentile of the held-out |observed - calibrated| 1/K0 residuals that sizes the IM half-window `w_im`, as `p_rt` sizes `w_rt`. Default 0.95. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
+      "path": "rt_im_train.im_window_multiplier",
+      "name": "im_window_multiplier",
+      "section": "rt_im_train",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 1.0,
+      "default_text": "1.0",
+      "help": "Multiplier on that percentile. Default 1.0. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
+      "path": "rt_im_train.im_window_min",
+      "name": "im_window_min",
+      "section": "rt_im_train",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.005,
+      "default_text": "0.005",
+      "help": "Lower clamp of the IM half-window, in V s cm^-2. Default 0.005. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
     },
     {
       "path": "rt_im_train.deeplc_predict_shards",

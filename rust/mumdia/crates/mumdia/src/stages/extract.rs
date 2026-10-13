@@ -5220,6 +5220,7 @@ mod accumulate_tests {
                         intensity: 10.0 + (si + k) as f32,
                     })
                     .collect(),
+                im: None,
             })
             .collect()
     }

@@ -45,7 +45,8 @@ pub struct FragIndex {
     /// Predicted intensity per posting. Empty on an m/z-only index
     /// ([`FragIndex::build_mz_only`]).
     post_int: Vec<f32>,
-    /// Candidate-local fragment ordinal per posting. Empty on an m/z-only index.
+    /// Candidate-local fragment ordinal per posting. Empty on an m/z-only index, unless it
+    /// was built with them ([`FragIndex::build_mz_only_with_ordinals`]).
     post_frag: Vec<u16>,
     /// Precursor m/z indexed by candidate id (ascending); for `candidate_range`. The
     /// library's own array, shared rather than copied.
@@ -81,7 +82,7 @@ impl FragIndex {
             "FragIndex::build needs the library's fragment payload (predicted intensities); \
              an m/z-only library indexes with FragIndex::build_mz_only"
         );
-        Self::build_chunked(lib, tol_ppm, None, true)
+        Self::build_chunked(lib, tol_ppm, None, true, true)
     }
 
     /// The seed's index: postings of candidate and m/z only, no predicted intensity and no
@@ -97,7 +98,19 @@ impl FragIndex {
     ///
     /// [`Library::load_mz_only`]: crate::index::Library::load_mz_only
     pub fn build_mz_only(lib: &Library, tol_ppm: f64) -> FragIndex {
-        Self::build_chunked(lib, tol_ppm, None, false)
+        Self::build_chunked(lib, tol_ppm, None, false, false)
+    }
+
+    /// The seed's index under `search_seed.count_fragments_once`: the m/z-only index plus
+    /// each posting's candidate-local fragment ordinal, which
+    /// [`SeedScratch::accumulate_count_once`] keys on (through
+    /// [`FragIndex::probe_peak_cand_frag`]). Still no predicted intensity, so an m/z-only
+    /// library indexes with it, at 2 bytes per posting more than [`FragIndex::build_mz_only`].
+    /// The geometry, `bin_start`, `post_cand`, `post_mz` and `post_frag` are the full
+    /// index's bit for bit, and the entry points that hand out a posting's intensity refuse
+    /// it as they refuse an m/z-only index.
+    pub fn build_mz_only_with_ordinals(lib: &Library, tol_ppm: f64) -> FragIndex {
+        Self::build_chunked(lib, tol_ppm, None, false, true)
     }
 
     /// Whether the postings carry their intensity and ordinal (a [`FragIndex::build`]
@@ -106,14 +119,23 @@ impl FragIndex {
         self.post_int.len() == self.post_mz.len()
     }
 
+    /// Whether the postings carry their candidate-local fragment ordinal: a
+    /// [`FragIndex::build`] or a [`FragIndex::build_mz_only_with_ordinals`] index.
+    pub fn has_ordinals(&self) -> bool {
+        self.post_frag.len() == self.post_mz.len()
+    }
+
     /// [`FragIndex::build`] with an explicit chunk count (tests drive many chunks over a
     /// small library through this); `None` picks it. `payload` false builds the m/z-only
-    /// index.
+    /// index. `ordinals` fills the fragment ordinals on an m/z-only build
+    /// ([`FragIndex::build_mz_only_with_ordinals`]); a payload build carries them whatever
+    /// it says, so the ordinal array is allocated only when one of the two asks for it.
     fn build_chunked(
         lib: &Library,
         tol_ppm: f64,
         n_chunks: Option<usize>,
         payload: bool,
+        ordinals: bool,
     ) -> FragIndex {
         let t0 = std::time::Instant::now();
         let n_cand = lib.n_candidates();
@@ -194,8 +216,10 @@ impl FragIndex {
         let post_cand: Vec<AtomicU32> = atomic_u32_zeroed(total);
         let post_mz: Vec<AtomicU32> = atomic_u32_zeroed(total);
         let n_payload = if payload { total } else { 0 };
+        let with_ordinals = payload || ordinals;
+        let n_ordinals = if with_ordinals { total } else { 0 };
         let post_int: Vec<AtomicU32> = atomic_u32_zeroed(n_payload);
-        let post_frag: Vec<AtomicU16> = (0..n_payload)
+        let post_frag: Vec<AtomicU16> = (0..n_ordinals)
             .into_par_iter()
             .map(|_| AtomicU16::new(0))
             .collect();
@@ -213,6 +237,8 @@ impl FragIndex {
                         post_mz[slot].store(mz.to_bits(), Ordering::Relaxed);
                         if payload {
                             post_int[slot].store(lib.frag_int[gi].to_bits(), Ordering::Relaxed);
+                        }
+                        if with_ordinals {
                             post_frag[slot].store(k as u16, Ordering::Relaxed);
                         }
                     }
@@ -449,6 +475,47 @@ impl FragIndex {
             for (&mz, &cid) in self.post_mz[a..z].iter().zip(&self.post_cand[a..z]) {
                 if within_ppm(mz as f64, peak_mz, self.tol_ppm) {
                     f(cid);
+                }
+            }
+        }
+    }
+
+    /// [`FragIndex::probe_peak_cand`] that also hands out each posting's candidate-local
+    /// fragment ordinal: the same bins, narrowing, predicate and posting order, calling
+    /// `f(cid, pfrag)`. The probe of [`SeedScratch::accumulate_count_once`]. It needs the
+    /// ordinals ([`FragIndex::has_ordinals`]) and not the predicted intensities, so it works
+    /// on a [`FragIndex::build_mz_only_with_ordinals`] index as well as a full one, and it
+    /// refuses a plain m/z-only index rather than handing out zeros.
+    #[inline]
+    pub fn probe_peak_cand_frag<F: FnMut(u32, u16)>(
+        &self,
+        peak_mz: f64,
+        cand_lo: u32,
+        cand_hi: u32,
+        mut f: F,
+    ) {
+        assert!(
+            self.has_ordinals(),
+            "probe_peak_cand_frag hands out fragment ordinals, which an m/z-only index does \
+             not hold (build it with FragIndex::build_mz_only_with_ordinals)"
+        );
+        if cand_hi <= cand_lo {
+            return;
+        }
+        let b = self.bins.bin(peak_mz);
+        let lo_bin = b.saturating_sub(1);
+        let hi_bin = (b + 1).min(self.bins.n_bins - 1);
+        for nb in lo_bin..=hi_bin {
+            let (a, z) = self.narrow_bin(nb, cand_lo, cand_hi);
+            if z <= a {
+                continue;
+            }
+            let mzs = &self.post_mz[a..z];
+            let cands = &self.post_cand[a..z];
+            let frags = &self.post_frag[a..z];
+            for ((&mz, &cid), &pfrag) in mzs.iter().zip(cands).zip(frags) {
+                if within_ppm(mz as f64, peak_mz, self.tol_ppm) {
+                    f(cid, pfrag);
                 }
             }
         }
@@ -834,6 +901,9 @@ pub struct SeedScratch {
     /// the profiled 54.8M-candidate library), almost all of it never touched because a
     /// worker only ever sees candidates inside one window.
     base: u32,
+    /// `(candidate, fragment ordinal, peak intensity)` hits of the current scan, for
+    /// [`SeedScratch::accumulate_count_once`]. Empty and unallocated otherwise.
+    hits: Vec<(u32, u16, f32)>,
 }
 
 /// One candidate's accumulator slot (16 bytes).
@@ -864,6 +934,7 @@ impl SeedScratch {
             min_count: u32::try_from(min_count).unwrap_or(u32::MAX).max(1),
             epoch: 0,
             base: 0,
+            hits: Vec::new(),
         }
     }
 
@@ -920,7 +991,73 @@ impl SeedScratch {
         }
     }
 
-    /// Candidates hit in the last `accumulate`, in first-touch (probe) order.
+    /// [`SeedScratch::accumulate`] with each predicted fragment of a candidate counted at
+    /// most once per scan, with the intensity of its most intense matching peak, instead of
+    /// once per matching peak (`search_seed.count_fragments_once`). Two peaks at one m/z (the
+    /// mobility pieces of one fragment ion in a diaPASEF slot spectrum) then count as one
+    /// fragment in the hyperscore's `ln(matched!)`. The index must carry the fragment
+    /// ordinals ([`FragIndex::has_ordinals`]).
+    ///
+    /// The hits of the scan are collected, sorted by (candidate, fragment) and reduced to
+    /// one maximum per pair, and the maxima are added in that order, so `obs_sum` does not
+    /// depend on the peak order and `touched` comes out in candidate order. With no fragment
+    /// matched twice, the counts and the qualified set are those of
+    /// [`SeedScratch::accumulate`].
+    pub fn accumulate_count_once(
+        &mut self,
+        idx: &FragIndex,
+        peaks: &[(f64, f32)],
+        cand_lo: u32,
+        cand_hi: u32,
+    ) {
+        self.epoch += 1;
+        self.touched.clear();
+        self.qualified.clear();
+        // Index relative to this window's first candidate.
+        self.base = cand_lo;
+        self.ensure((cand_hi.saturating_sub(cand_lo)) as usize + 1);
+        let (epoch, base, min_count) = (self.epoch, self.base, self.min_count);
+        let SeedScratch {
+            slots,
+            touched,
+            qualified,
+            hits,
+            ..
+        } = self;
+        hits.clear();
+        for &(mz, inten) in peaks {
+            idx.probe_peak_cand_frag(mz, cand_lo, cand_hi, |cid, pfrag| {
+                hits.push((cid, pfrag, inten));
+            });
+        }
+        hits.sort_unstable_by_key(|h| (h.0, h.1));
+        let mut i = 0;
+        while i < hits.len() {
+            let (cid, frag, mut top) = hits[i];
+            i += 1;
+            while i < hits.len() && hits[i].0 == cid && hits[i].1 == frag {
+                top = top.max(hits[i].2);
+                i += 1;
+            }
+            let s = &mut slots[(cid - base) as usize];
+            if s.stamp != epoch {
+                *s = SeedSlot {
+                    stamp: epoch,
+                    count: 0,
+                    obs_sum: 0.0,
+                };
+                touched.push(cid);
+            }
+            s.count += 1;
+            s.obs_sum += top as f64;
+            if s.count == min_count {
+                qualified.push(cid);
+            }
+        }
+    }
+
+    /// Candidates hit in the last `accumulate`, in first-touch (probe) order (candidate
+    /// order after [`SeedScratch::accumulate_count_once`]).
     /// Callers that need determinism across a float reduction sort this first.
     pub fn touched(&self) -> &[u32] {
         &self.touched
@@ -1383,7 +1520,7 @@ mod tests {
         for tol in [20.0, 7.5] {
             let serial = FragIndex::build_serial(&lib, tol);
             for chunks in [1usize, 2, 3, 7, 64] {
-                let par = FragIndex::build_chunked(&lib, tol, Some(chunks), true);
+                let par = FragIndex::build_chunked(&lib, tol, Some(chunks), true, true);
                 assert_same_index(&par, &serial, &format!("tol {tol} chunks {chunks}"));
             }
             assert_same_index(&FragIndex::build(&lib, tol), &serial, "build");
@@ -1402,7 +1539,7 @@ mod tests {
         let lib = lib_from(&cands);
         let serial = FragIndex::build_serial(&lib, 20.0);
         for chunks in [1usize, 4, 50, 200] {
-            let par = FragIndex::build_chunked(&lib, 20.0, Some(chunks), true);
+            let par = FragIndex::build_chunked(&lib, 20.0, Some(chunks), true, true);
             assert_same_index(&par, &serial, &format!("gappy chunks {chunks}"));
         }
     }
@@ -1448,7 +1585,7 @@ mod tests {
         let lib = lib_from(&cands);
         let serial = FragIndex::build_serial(&lib, tol);
         for chunks in [1usize, 2, 5, cands.len()] {
-            let par = FragIndex::build_chunked(&lib, tol, Some(chunks), true);
+            let par = FragIndex::build_chunked(&lib, tol, Some(chunks), true, true);
             assert_same_index(&par, &serial, &format!("edges chunks {chunks}"));
         }
         // And the clamping is what it claims: NaN and -inf in bin 0, +inf in the top bin.
@@ -1541,7 +1678,7 @@ mod tests {
         for tol in [20.0, 7.5] {
             let full = FragIndex::build(&lib, tol);
             for chunks in [None, Some(1usize), Some(5)] {
-                let mz = FragIndex::build_chunked(&lib, tol, chunks, false);
+                let mz = FragIndex::build_chunked(&lib, tol, chunks, false, false);
                 assert!(full.has_payload() && !mz.has_payload());
                 assert!(mz.post_int.is_empty() && mz.post_frag.is_empty());
                 assert_eq!(format!("{:?}", mz.bins), format!("{:?}", full.bins));
@@ -1607,6 +1744,238 @@ mod tests {
                 assert_eq!(a.count(c), b.count(c));
                 assert_eq!(a.obs_sum(c).to_bits(), b.obs_sum(c).to_bits());
             }
+        }
+    }
+
+    #[test]
+    fn count_once_counts_a_fragment_once_at_its_most_intense_peak() {
+        let tol = 20.0;
+        // Candidate 0: fragments at 600 and 800. Two peaks at 600 (one ion cut in two
+        // along mobility) and one at 800.
+        let lib = lib_from(&[(vec![(600.00, 1.0), (800.00, 1.0)], 400.0)]);
+        let idx = FragIndex::build(&lib, tol);
+        let peaks = [(600.00, 5.0), (600.001, 3.0), (800.00, 2.0)];
+        let mut sc = SeedScratch::new(idx.n_cand());
+        sc.accumulate(&idx, &peaks, 0, 1);
+        assert_eq!(
+            (sc.count(0), sc.obs_sum(0)),
+            (3, 10.0),
+            "the plain accumulation counts peaks"
+        );
+        let mut sc = SeedScratch::new(idx.n_cand());
+        sc.accumulate_count_once(&idx, &peaks, 0, 1);
+        assert_eq!(
+            (sc.count(0), sc.obs_sum(0)),
+            (2, 7.0),
+            "count-once counts fragments"
+        );
+        // The next scan starts clean.
+        sc.accumulate_count_once(&idx, &[(800.00, 4.0)], 0, 1);
+        assert_eq!((sc.count(0), sc.obs_sum(0)), (1, 4.0));
+        assert_eq!(sc.touched(), &[0]);
+        // The seed's own index, m/z and ordinals only, gives the same.
+        let seed_idx = FragIndex::build_mz_only_with_ordinals(&lib, tol);
+        let mut sc = SeedScratch::new(seed_idx.n_cand());
+        sc.accumulate_count_once(&seed_idx, &peaks, 0, 1);
+        assert_eq!((sc.count(0), sc.obs_sum(0)), (2, 7.0));
+    }
+
+    /// With no predicted fragment matched by two peaks, counting each fragment once is the
+    /// plain accumulation: the same candidates, counts and qualified set, and the same
+    /// observed sums (bit for bit where the peaks meet each candidate's fragments in ordinal
+    /// order, as they do in the hand-built library).
+    #[test]
+    fn count_once_is_the_plain_accumulation_when_no_fragment_repeats() {
+        let tol = 20.0;
+        let lib = lib_from(&[
+            (vec![(300.0, 1.0), (450.0, 1.0), (700.0, 1.0)], 400.0),
+            (vec![(310.0, 1.0), (455.0, 1.0), (720.0, 1.0)], 401.0),
+            (vec![(300.0, 1.0), (460.0, 1.0)], 402.0),
+        ]);
+        let idx = FragIndex::build_mz_only_with_ordinals(&lib, tol);
+        let peaks = [
+            (300.0, 2.5),
+            (310.0, 1.25),
+            (450.0, 7.0),
+            (455.0, 0.5),
+            (700.0, 3.0),
+            (720.0, 9.0),
+        ];
+        let (mut plain, mut once) = (
+            SeedScratch::with_min_count(4, 2),
+            SeedScratch::with_min_count(4, 2),
+        );
+        plain.accumulate(&idx, &peaks, 0, 3);
+        once.accumulate_count_once(&idx, &peaks, 0, 3);
+        let sorted = |v: &[u32]| {
+            let mut v = v.to_vec();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(sorted(plain.touched()), sorted(once.touched()));
+        assert_eq!(sorted(plain.qualified()), sorted(once.qualified()));
+        for &c in plain.touched() {
+            assert_eq!(plain.count(c), once.count(c), "cand {c}");
+            assert_eq!(
+                plain.obs_sum(c).to_bits(),
+                once.obs_sum(c).to_bits(),
+                "cand {c}"
+            );
+        }
+
+        // A random library, with peaks spaced well beyond twice the tolerance so that no
+        // fragment can be matched twice in a scan.
+        let lib = random_lib(2_000, 0x0ce0);
+        let idx = FragIndex::build_mz_only_with_ordinals(&lib, tol);
+        let mut mzs: Vec<f64> = lib.frag_mz.iter().map(|&m| m as f64).collect();
+        mzs.sort_by(|a, b| a.total_cmp(b));
+        let mut peaks: Vec<(f64, f32)> = Vec::new();
+        for m in mzs {
+            if peaks
+                .last()
+                .is_none_or(|&(p, _)| (m - p) / p * 1e6 > 3.0 * tol)
+            {
+                peaks.push((m, 1.0 + (peaks.len() % 13) as f32));
+            }
+        }
+        let (mut plain, mut once) = (
+            SeedScratch::with_min_count(4, 3),
+            SeedScratch::with_min_count(4, 3),
+        );
+        for &(lo, hi) in &[(0u32, 2_000u32), (300, 1_100)] {
+            plain.accumulate(&idx, &peaks, lo, hi);
+            once.accumulate_count_once(&idx, &peaks, lo, hi);
+            assert!(!plain.touched().is_empty());
+            assert_eq!(sorted(plain.touched()), sorted(once.touched()));
+            assert_eq!(sorted(plain.qualified()), sorted(once.qualified()));
+            for &c in plain.touched() {
+                assert_eq!(plain.count(c), once.count(c), "cand {c}");
+                let (a, b) = (plain.obs_sum(c), once.obs_sum(c));
+                assert!(
+                    (a - b).abs() <= 1e-9 * a.abs().max(1.0),
+                    "cand {c}: {a} {b}"
+                );
+            }
+        }
+    }
+
+    /// The seed's ordinal index (`build_mz_only_with_ordinals`, for
+    /// `search_seed.count_fragments_once`) is the full index without its intensities: the
+    /// same geometry, offsets, candidates, m/z and ordinals, bit for bit, and
+    /// `probe_peak_cand_frag` reports exactly the `(cid, pfrag)` pairs of `probe_peak`, in
+    /// the same order, on either index. A plain m/z-only index holds no ordinals.
+    #[test]
+    fn the_ordinal_index_is_the_full_index_without_its_intensities() {
+        let lib = random_lib(2_000, 0x0d1a);
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for tol in [20.0, 7.5] {
+            let full = FragIndex::build(&lib, tol);
+            assert!(full.has_ordinals());
+            assert!(!FragIndex::build_mz_only(&lib, tol).has_ordinals());
+            for chunks in [None, Some(1usize), Some(5)] {
+                let ord = FragIndex::build_chunked(&lib, tol, chunks, false, true);
+                assert!(ord.has_ordinals() && !ord.has_payload());
+                assert!(ord.post_int.is_empty());
+                assert_eq!(format!("{:?}", ord.bins), format!("{:?}", full.bins));
+                assert_eq!(ord.bin_start, full.bin_start);
+                assert_eq!(ord.post_cand, full.post_cand);
+                assert_eq!(bits(&ord.post_mz), bits(&full.post_mz));
+                assert_eq!(ord.post_frag, full.post_frag);
+                assert_eq!(ord.prec_mz, full.prec_mz);
+                for &(lo, hi) in &[(0u32, 2_000u32), (300, 900), (1_999, 2_000), (5, 5)] {
+                    for (i, &m) in lib.frag_mz.iter().enumerate().step_by(7) {
+                        let q = m as f64 * (1.0 + [0.0, 0.9, -0.9, 1.3][i % 4] * tol * 1e-6);
+                        let mut want = Vec::new();
+                        full.probe_peak(q, lo, hi, |c, _, _, f| want.push((c, f)));
+                        let mut got_full = Vec::new();
+                        full.probe_peak_cand_frag(q, lo, hi, |c, f| got_full.push((c, f)));
+                        let mut got_ord = Vec::new();
+                        ord.probe_peak_cand_frag(q, lo, hi, |c, f| got_ord.push((c, f)));
+                        assert_eq!(got_full, want, "q={q} window=({lo},{hi})");
+                        assert_eq!(got_ord, want, "q={q} window=({lo},{hi})");
+                    }
+                }
+            }
+            let public = FragIndex::build_mz_only_with_ordinals(&lib, tol);
+            assert_eq!(public.post_frag, full.post_frag);
+            assert!(public.post_int.is_empty());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "m/z-only index")]
+    fn a_plain_mz_only_index_refuses_the_ordinal_probe() {
+        let lib = random_lib(50, 3);
+        FragIndex::build_mz_only(&lib, 20.0).probe_peak_cand_frag(500.0, 0, 50, |_, _| {});
+    }
+
+    /// Count-once against a reference built from the full index's `(cid, pfrag)` postings:
+    /// per scan, each (candidate, fragment) counts once, at its most intense matching peak,
+    /// and a candidate's observed sum adds those maxima in (candidate, fragment) order, bit
+    /// for bit. Over the seed's ordinal index the scratch sees the same; its touched list is
+    /// in candidate order and its qualified list is exactly the touched candidates at or
+    /// above the minimum count. Every peak comes twice (the copy 1 ppm higher), so there
+    /// are duplicates to remove.
+    #[test]
+    fn count_once_is_the_per_fragment_maximum_summed_in_fragment_order() {
+        use std::collections::BTreeMap;
+        let lib = random_lib(3_000, 0x0f1a);
+        let full = FragIndex::build(&lib, 20.0);
+        let ord = FragIndex::build_mz_only_with_ordinals(&lib, 20.0);
+        let scans: Vec<Vec<(f64, f32)>> = dense_scans(&lib, 30, 300)
+            .into_iter()
+            .map(|s| {
+                let mut v: Vec<(f64, f32)> = s
+                    .iter()
+                    .flat_map(|&(m, i)| [(m, i), (m * (1.0 + 1e-6), i * 0.5 + 1.0)])
+                    .collect();
+                v.sort_by(|a, b| a.0.total_cmp(&b.0));
+                v
+            })
+            .collect();
+        let min = 3usize;
+        let mut a = SeedScratch::with_min_count(4, min);
+        let mut b = SeedScratch::with_min_count(4, min);
+        for (k, peaks) in scans.iter().enumerate() {
+            let (lo, hi) = if k % 3 == 0 { (0, 3_000) } else { (500, 2_100) };
+            let mut top: BTreeMap<(u32, u16), f32> = BTreeMap::new();
+            for &(mz, inten) in peaks {
+                full.probe_peak(mz, lo, hi, |cid, _, _, pfrag| {
+                    let e = top.entry((cid, pfrag)).or_insert(inten);
+                    *e = e.max(inten);
+                });
+            }
+            let mut want: BTreeMap<u32, (u32, f64)> = BTreeMap::new();
+            for (&(cid, _), &t) in &top {
+                let e = want.entry(cid).or_insert((0, 0.0));
+                e.0 += 1;
+                e.1 += t as f64;
+            }
+            a.accumulate_count_once(&full, peaks, lo, hi);
+            b.accumulate_count_once(&ord, peaks, lo, hi);
+            let want_ids: Vec<u32> = want.keys().copied().collect();
+            assert!(!want_ids.is_empty(), "scan {k}: the fixture must match");
+            assert_eq!(
+                a.touched(),
+                &want_ids[..],
+                "scan {k}: touched, candidate order"
+            );
+            assert_eq!(b.touched(), a.touched(), "scan {k}: ordinal index");
+            for (&cid, &(n, s)) in &want {
+                assert_eq!(a.count(cid), n, "scan {k} cand {cid}");
+                assert_eq!(a.obs_sum(cid).to_bits(), s.to_bits(), "scan {k} cand {cid}");
+                assert_eq!(b.count(cid), n, "scan {k} cand {cid}");
+                assert_eq!(b.obs_sum(cid).to_bits(), s.to_bits(), "scan {k} cand {cid}");
+            }
+            let mut q: Vec<u32> = a.qualified().to_vec();
+            q.sort_unstable();
+            let want_q: Vec<u32> = want
+                .iter()
+                .filter(|(_, v)| v.0 as usize >= min)
+                .map(|(c, _)| *c)
+                .collect();
+            assert_eq!(q, want_q, "scan {k}: qualified");
+            assert_eq!(b.qualified(), a.qualified(), "scan {k}: qualified order");
         }
     }
 

@@ -1,6 +1,7 @@
 //! Shared numeric kernels (docs/14_build_test_deploy_gotchas.md):
 //! population-variance Pearson with a zero-variance guard returning 0, cosine
-//! similarity, spectral angle. One implementation, unit-tested.
+//! similarity, spectral angle, intensity-weighted median and mean absolute deviation.
+//! One implementation, unit-tested.
 
 /// Population Pearson correlation; returns 0 on zero variance (documented guard).
 pub fn pearson(a: &[f64], b: &[f64]) -> f64 {
@@ -192,9 +193,64 @@ pub fn spectral_angle(a: &[f64], b: &[f64]) -> f64 {
     1.0 - 2.0 * c.acos() / std::f64::consts::PI
 }
 
+/// Weighted median of `(value, weight)` pairs: the smallest value whose cumulative weight
+/// reaches half the total. `None` when empty or weightless. Sorts `pts` in place by value.
+pub fn weighted_median(pts: &mut [(f64, f64)]) -> Option<f64> {
+    let total: f64 = pts.iter().map(|p| p.1).sum();
+    if pts.is_empty() || total.is_nan() || total <= 0.0 {
+        return None;
+    }
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut acc = 0.0;
+    for &(v, w) in pts.iter() {
+        acc += w;
+        if acc >= 0.5 * total {
+            return Some(v);
+        }
+    }
+    pts.last().map(|p| p.0)
+}
+
+/// Weighted mean absolute deviation of `(value, weight)` pairs from `center`:
+/// `sum(w * |v - center|) / sum(w)`. Not a median absolute deviation. `None` when
+/// weightless.
+pub fn weighted_mean_abs_dev(pts: &[(f64, f64)], center: f64) -> Option<f64> {
+    let total: f64 = pts.iter().map(|p| p.1).sum();
+    if total.is_nan() || total <= 0.0 {
+        return None;
+    }
+    Some(
+        pts.iter()
+            .map(|&(v, w)| w * (v - center).abs())
+            .sum::<f64>()
+            / total,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weighted_median_follows_the_intensity() {
+        assert_eq!(weighted_median(&mut []), None);
+        assert_eq!(weighted_median(&mut [(0.9, 0.0)]), None);
+        // One intense peak outweighs two faint interferers on either side.
+        assert_eq!(
+            weighted_median(&mut [(1.10, 1.0), (0.85, 10.0), (0.70, 1.0)]),
+            Some(0.85)
+        );
+        assert_eq!(weighted_median(&mut [(0.8, 1.0), (0.9, 1.0)]), Some(0.8));
+    }
+
+    #[test]
+    fn weighted_mean_abs_dev_is_the_weighted_mean_distance() {
+        assert_eq!(weighted_mean_abs_dev(&[], 1.0), None);
+        assert_eq!(weighted_mean_abs_dev(&[(0.9, 0.0)], 1.0), None);
+        // (1 * 0.5 + 3 * 0.1) / 4 = 0.2, where the weighted median distance would be 0.1.
+        let d = weighted_mean_abs_dev(&[(0.5, 1.0), (1.1, 3.0)], 1.0).unwrap();
+        assert!((d - 0.2).abs() < 1e-12, "{d}");
+    }
 
     #[test]
     fn pearson_perfect_and_flat() {

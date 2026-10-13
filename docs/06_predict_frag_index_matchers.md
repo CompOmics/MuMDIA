@@ -700,7 +700,7 @@ so the struct holds exactly these fields and unknown keys are rejected):
 | `ms2pip_model` | `"HCDch2"` | MS2PIP model name passed as argv; `*ch2` models predict the doubly charged series too |
 | `ms2pip_python` | `None` | interpreter for the MS2PIP sidecar; required when `predictor=ms2pip`, else the stage errors |
 | `deeplc_python` | `None` | interpreter for the DeepLC sidecar; required when `rt_predictor=deeplc`, else the stage errors |
-| `im_predictor` | `None` (`ImPredictorKind`) | `none`: no 1/K0 and the version-1 table. `im2deep`: IM2Deep 1/K0 per (peptidoform, charge), requires an IM2Deep interpreter. `auto`: `im2deep` when an IM2Deep interpreter resolves, otherwise `none` with a log line. Library-input mode ignores it |
+| `im_predictor` | `None` (`ImPredictorKind`) | `none`: no 1/K0 and the version-1 table. `im2deep`: IM2Deep 1/K0 per (peptidoform, charge), requires an IM2Deep interpreter. `auto`: `im2deep` when the run's input carries 1/K0 (a diaPASEF `.d`) and an IM2Deep interpreter resolves, otherwise `none` with a log line (a standalone `predict-frag` has no run, so `none`). Library-input mode ignores it |
 | `im2deep_python` | `None` | interpreter for the IM2Deep sidecar (`auto` discovers one, `MUMDIA_PYTHON_IM2DEEP`) |
 | `sidecar_script_dir` | `"scripts"` | directory searched by `resolve_script` for the worker scripts |
 | `library_cache` | `"auto"` | where `run` and `run-experiment` store a FASTA-built library and reuse it on a later run with the same key: `"auto"` is `libraries/` under the engine's cache root (docs/14, "The engine's caches"), a path is that directory, `null` is off (see "Reusing a FASTA-built library" below) |

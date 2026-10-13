@@ -432,7 +432,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             let rec: Vec<mumdia_core::manifest::ArtifactRecord> = if keep_records {
                 vec![written.record(
                     &format!("{}[g{:02}]", artifact::SEED_PSMS.0, b.index),
-                    artifact::SEED_PSMS,
+                    search_seed::seed_schema(&seed)?,
                     &seed,
                     "search-seed",
                     ch,
@@ -521,7 +521,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     record_hashing(
         g.man.as_deref_mut(),
         artifact::SEED_PSMS.0,
-        artifact::SEED_PSMS,
+        search_seed::seed_schema(&pooled_seed)?,
         &pooled_seed,
         n,
         "seed-pool",

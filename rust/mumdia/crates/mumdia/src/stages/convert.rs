@@ -1009,7 +1009,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     std::fs::create_dir_all(p.out_dir).ok();
     // A diaPASEF `.d` is read natively and keeps its ion mobility; the routing decision is
     // the one `raw::ensure_mzml` made when it passed the path through unconverted.
-    let native_tdf = crate::raw::detect(p.mzml) == crate::raw::Vendor::BrukerTdf;
+    let native_tdf = crate::instrument::input_has_im(p.mzml);
     // `declared` is the spectrum count the source promises, for the truncation check; 0
     // skips it (the native reader reads the frame table whole, not as a stream).
     let (mzml_reader, declared, instrument) = if native_tdf {

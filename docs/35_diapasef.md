@@ -14,7 +14,7 @@ peak carries a 1/K0. Using that dimension takes seven layers:
 
 1. read the `.d` natively and keep the 1/K0 of every peak (section 2, in the tree);
 2. tell apart the windows that share an m/z range and differ in 1/K0 (section 3, in the tree);
-3. predict and calibrate the 1/K0 of each precursor (section 4);
+3. predict and calibrate the 1/K0 of each precursor (section 4, in the tree);
 4. gate and score candidates with 1/K0 (section 5);
 5. rebuild traces from the raw TIMS events and choose the apex jointly in retention time and
    1/K0 (section 6);
@@ -25,11 +25,15 @@ Until a layer lands, the 1/K0 columns it would read are written but ignored. A r
 `.d` works end to end after layers 1 and 2: the seed search, extraction and features see the
 4D spectra artifacts and use only their m/z, intensity and retention time.
 
-The one predicate for 4D behaviour is "the spectra carry per-peak 1/K0". It is read from the
-record `convert` writes (`params.reader = "timsrust"`, through `instrument::provenance`), never
-from the instrument model: a timsTOF mzML converted by msconvert has no 1/K0 and is a 3D run.
-Before conversion, the orchestrators use the input routing (`raw::Vendor::BrukerTdf`), which
-makes the same decision conversion will make.
+The one predicate for 4D behaviour is "the spectra carry per-peak 1/K0" (`Reader::has_im` in
+`crate::instrument`). After conversion it is read from the record `convert` writes
+(`params.reader = "timsrust"`, `instrument::spectra_has_im`), never from the instrument model:
+a timsTOF mzML converted by msconvert has no 1/K0 and is a 3D run. Before conversion, the
+orchestrators use the input routing (`instrument::input_has_im`, from `raw::Vendor::BrukerTdf`).
+`convert` chooses its reader through the same function (`instrument::reader_for_input`), so the
+two answers cannot disagree. The settings that depend on it resolve from one of the two:
+library-build keys from the input, before anything is converted, and a stage that reads
+converted spectra from the record.
 
 ## 2. Conversion
 
@@ -166,8 +170,44 @@ ion in another mobility band. A 1/K0 term is part of section 5.
 
 ## 4. Library and calibration 1/K0
 
-Filled by PR 2: the library's `predicted_im` (IM2Deep in FASTA mode, the imported library's own
-value otherwise), the seed's observed 1/K0, and the per-run 1/K0 calibration and window.
+Library 1/K0. A precursor library carries `predicted_im` (nullable Float64, 1/K0 in V s cm^-2,
+`fragment_library_precursors` v2) only when it has an ion-mobility source: predict-frag with
+`predict_frag.im_predictor = im2deep` (or `auto` with an IM2Deep interpreter), or an imported
+library with at least one finite positive `IM`/`IonMobility`. Otherwise the table is v1, byte
+for byte. IM2Deep (>= 2.0.0, `scripts/im2deep_worker.py`) predicts one single-conformer CCS per
+(peptidoform, charge), converted to 1/K0 at the precursor m/z with IM2Deep's Mason-Schamp
+constants (`mumdia_core::constants::im_to_ccs` inverts it). A candidate without a prediction is
+dropped with its pair under the 2% ceiling. A decoy's 1/K0 follows its iRT: script-built decoys
+copy the target's value, native FASTA decoys get their own prediction. `augment_library.py` adds
+entries with null 1/K0. Re-predicting an imported library's 1/K0 is deferred (IM D3 H1: +2.3%,
+three seeds, one acquisition, no entrapment).
+
+`im_predictor = auto` resolves per run on the predicate of section 1: it is `im2deep` only when
+the run's input carries 1/K0 (`instrument::input_has_im`, decided before conversion) and an
+IM2Deep interpreter resolves (`PredictFragConfig::im_predictor_for`). A 3D run, and a standalone
+`predict-frag`, which has no run, predict no 1/K0 under `auto`, with a log line; an explicit
+`im2deep` is a hard requirement everywhere. The library cache keys the resolved choice. The
+desktop application points `MUMDIA_PYTHON_IM2DEEP` at its primary environment, where IM2Deep is
+installed.
+
+Seed 1/K0. When the searched spectra carry per-peak 1/K0, the seed writes `observed_im` and
+`seed_psms` v2 (docs/07 step 6): for each confident target, the intensity-weighted median 1/K0
+of its matched fragment peaks at its best scan, each peak being the calibrant's own nearest peak
+(`spectra::nearest_peak`) and counted only within `fragment_tol_ppm`. A 3D seed is v1, byte for
+byte, and its calibrants are unchanged. The seed is ungated in 1/K0: it runs before any
+calibration exists. `search_seed.count_fragments_once` (default false, `matcher = fragindex`
+only) counts each predicted fragment once per spectrum at its most intense peak, so the mobility
+pieces of one fragment ion at one m/z do not count as several matched fragments; it is
+benchmark-gated together with the reader's valley fractions (section 9).
+
+Calibration 1/K0. rt-im-train fits, on the same confident targets, a per-charge linear map of
+the library's CCS onto the observed CCS, and sizes the half-window `w_im` on held-out anchors
+(30% of the base peptides, `IM_HOLDOUT_FRAC`) at `p_im` times `im_window_multiplier`, floored at
+`im_window_min` (docs/08 section 7). It fills the existing `im_pred_cal`, `im_lo` and `im_hi`
+columns of `run_windows` (still v1) and writes the `im_*` block and `w_im_sizing` of `cal.json`,
+both only on a run whose seed carries `observed_im`. No stage reads the IM windows yet: the
+1/K0 gate of extraction is section 5. The IM anchors follow the relaxed anchor cut of
+`anchor_q_ladder`. There is no refit of the calibration on identifications.
 
 ## 5. Extraction and features
 

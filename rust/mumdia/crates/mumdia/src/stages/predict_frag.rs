@@ -35,6 +35,11 @@ pub struct PredictFragParams<'a> {
     /// calibration, and checks afterwards that it re-predicted every row, may set it; the
     /// library's model identity then says the iRT is a placeholder.
     pub rt_placeholder: bool,
+    /// The run this library is built for reads spectra with per-peak 1/K0
+    /// (`instrument::input_has_im`), which is what `predict_frag.im_predictor = auto`
+    /// resolves on ([`PredictFragConfig::im_predictor_for`]). False for a build with no run,
+    /// such as a standalone `predict-frag`.
+    pub run_has_im: bool,
 }
 
 /// A candidate before intensity/iRT assignment.
@@ -593,9 +598,14 @@ impl ImRequest {
     /// `None` when the build predicts no 1/K0 (`predict_frag.im_predictor` resolves to
     /// `none`).
     fn new(p: &PredictFragParams, raws: &[Raw]) -> Result<Option<Self>> {
-        match p.cfg.im_predictor_resolved() {
+        match p.cfg.im_predictor_for(p.run_has_im) {
             ImPredictorKind::None => {
-                if p.cfg.im_predictor == ImPredictorKind::Auto {
+                if p.cfg.im_predictor == ImPredictorKind::Auto && !p.run_has_im {
+                    info!(
+                        "predict-frag: predict_frag.im_predictor = auto and the run's spectra \
+                         carry no 1/K0, so the library carries no predicted 1/K0"
+                    );
+                } else if p.cfg.im_predictor == ImPredictorKind::Auto {
                     info!(
                         "predict-frag: predict_frag.im_predictor = auto and no IM2Deep \
                          interpreter resolved, so the library carries no predicted 1/K0 (set \
@@ -604,7 +614,7 @@ impl ImRequest {
                 }
                 Ok(None)
             }
-            // `im_predictor_resolved` never returns `Auto`.
+            // `im_predictor_for` never returns `Auto`.
             ImPredictorKind::Im2deep | ImPredictorKind::Auto => {
                 let python = p.cfg.im2deep_python.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("im_predictor=im2deep requires predict_frag.im2deep_python")
@@ -1337,6 +1347,7 @@ mod im_tests {
             work_dir: &path("work"),
             config_hash: "h",
             rt_placeholder: false,
+            run_has_im: false,
         })
         .unwrap();
         assert_eq!(

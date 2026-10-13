@@ -370,6 +370,7 @@ fn library_build_stages_return_the_hashes_of_the_files_they_wrote() {
             cfg: &cfg.predict_frag,
             work_dir: &tmp("predict_frag_work"),
             config_hash: "test",
+            run_has_im: false,
         })
         .unwrap();
     assert_written(&wprec, &prec);
@@ -1244,6 +1245,170 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         h(&empty),
         "an empty lent MS2 slice was searched instead of the artifact"
     );
+}
+
+/// Five scans of one window carrying the target's three fragments (`craft_library`) and two
+/// noise peaks, with per-peak 1/K0 when `with_im` (spectra v2). The fragment peaks sit at
+/// 0.90, 0.92 and 1.10, so their intensity-weighted median is 0.92 in every scan.
+fn craft_ms2_im(with_im: bool) -> String {
+    let path = tmp(if with_im {
+        "ms2_im.parquet"
+    } else {
+        "ms2_3d.parquet"
+    });
+    let n = 5usize;
+    let mz: Vec<Vec<f32>> = vec![vec![120.0, 200.1, 300.2, 400.3, 600.0]; n];
+    let inten: Vec<Vec<f32>> = (0..n)
+        .map(|i| {
+            let a = 1000.0 + 100.0 * i as f32;
+            vec![50.0, a, a * 0.8, a * 0.6, 40.0]
+        })
+        .collect();
+    let mut cols = vec![
+        Col::U32("scan_index".into(), (0..n as u32).collect()),
+        Col::Str("id".into(), (0..n).map(|i| format!("scan={i}")).collect()),
+        Col::F64(
+            "rt_seconds".into(),
+            (0..n).map(|i| 100.0 + 10.0 * i as f64).collect(),
+        ),
+        Col::U32("window_id".into(), vec![0; n]),
+        Col::F64("window_target".into(), vec![500.0; n]),
+        Col::F64("window_lower".into(), vec![498.0; n]),
+        Col::F64("window_upper".into(), vec![502.0; n]),
+        Col::OptF64("precursor_mz".into(), vec![Some(500.0); n]),
+        Col::OptI32("precursor_charge".into(), vec![None; n]),
+    ];
+    if with_im {
+        cols.push(Col::OptF32("window_im_lower".into(), vec![Some(0.8); n]));
+        cols.push(Col::OptF32("window_im_upper".into(), vec![Some(1.2); n]));
+    }
+    cols.push(Col::LargeListF32("mz".into(), mz));
+    cols.push(Col::LargeListF32("intensity".into(), inten));
+    if with_im {
+        cols.push(Col::LargeListF32(
+            "im".into(),
+            vec![vec![0.70, 0.90, 0.92, 1.10, 1.30]; n],
+        ));
+    }
+    write_table(&path, cols).unwrap();
+    path
+}
+
+/// The seed writes `observed_im` and `seed_psms` v2 only when the searched spectra carry
+/// per-peak 1/K0, and then every other column, the mass calibration and the report fields
+/// are those of the same scans without it: a 3D seed keeps v1's exact column set and
+/// report. `count_fragments_once` is the plain seed when no fragment is matched twice.
+#[test]
+fn the_seed_writes_observed_im_only_for_spectra_with_ion_mobility() {
+    let (prec, frag) = craft_library();
+    let mut cfg = Config::default();
+    cfg.search_seed.min_matched_peaks = 2;
+    // One target: its q is only confident at a cut of 1.
+    cfg.search_seed.fdr_seed = 1.0;
+    let seed = |ms2: &str, cfg: &mumdia_core::config::SearchSeedConfig, tag: &str| {
+        let out = tmp(&format!("seed_im_{tag}.parquet"));
+        let rows = stages::search_seed::run(stages::search_seed::SearchSeedParams {
+            precursor_span: None,
+            fragment_offset: None,
+            ms2_scans: None,
+            emit_calibrants: false,
+            library: None,
+            ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            out: &out,
+            cfg,
+            bucket_size: Config::default().extract.bucket_size,
+            config_hash: "test",
+        })
+        .unwrap();
+        assert!(rows > 0, "{tag}: the fixture must give seed rows");
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{out}.report.json")).unwrap())
+                .unwrap();
+        (out, report)
+    };
+    let v1_cols = [
+        "candidate_id",
+        "peptidoform",
+        "charge",
+        "precursor_mz",
+        "base_peptide_id",
+        "protein",
+        "label",
+        "score",
+        "spectrum_q",
+        "observed_rt",
+        "predicted_irt",
+        "matched_peaks",
+        "scan_index",
+    ];
+    let ms2_3d = craft_ms2_im(false);
+    let ms2_4d = craft_ms2_im(true);
+    assert!(mumdia::spectra::load_ms2(&ms2_3d)
+        .unwrap()
+        .iter()
+        .all(|s| s.im.is_none()));
+    assert!(mumdia::spectra::load_ms2(&ms2_4d).unwrap().iter().all(|s| s
+        .im
+        .as_ref()
+        .map(Vec::len)
+        == Some(s.peaks.len())));
+
+    let (s3, r3) = seed(&ms2_3d, &cfg.search_seed, "3d");
+    assert_eq!(mumdia_io::table::column_names(&s3).unwrap(), v1_cols);
+    assert_eq!(r3["schema_version"], 1);
+    assert!(r3["stats"].get("with_observed_im").is_none());
+    assert!(r3["params"].get("count_fragments_once").is_none());
+    assert_eq!(
+        stages::search_seed::seed_schema(&s3).unwrap(),
+        ("seed_psms", 1)
+    );
+
+    let (s4, r4) = seed(&ms2_4d, &cfg.search_seed, "4d");
+    let mut v2_cols: Vec<&str> = v1_cols.to_vec();
+    v2_cols.push("observed_im");
+    assert_eq!(mumdia_io::table::column_names(&s4).unwrap(), v2_cols);
+    assert_eq!(r4["schema_version"], 2);
+    assert_eq!(r4["stats"]["with_observed_im"], 1);
+    assert_eq!(
+        stages::search_seed::seed_schema(&s4).unwrap(),
+        ("seed_psms", 2)
+    );
+    let (t3, t4) = (TableFile::open(&s3).unwrap(), TableFile::open(&s4).unwrap());
+    let labels = t4.str("label").unwrap();
+    let obs = t4.opt_f64("observed_im").unwrap();
+    for (i, l) in labels.iter().enumerate() {
+        let want = (l == "target").then_some(0.92f32 as f64);
+        assert_eq!(obs[i], want, "row {i} ({l})");
+    }
+    // Every other column, and the mass calibration, are those of the 3D seed.
+    assert_eq!(
+        t3.u32("candidate_id").unwrap(),
+        t4.u32("candidate_id").unwrap()
+    );
+    assert_eq!(t3.u32("scan_index").unwrap(), t4.u32("scan_index").unwrap());
+    for c in ["score", "spectrum_q", "observed_rt"] {
+        let bits =
+            |t: &TableFile| -> Vec<u64> { t.f64(c).unwrap().iter().map(|v| v.to_bits()).collect() };
+        assert_eq!(bits(&t3), bits(&t4), "{c}");
+    }
+    assert_eq!(
+        std::fs::read(format!("{s3}.masscal.json")).unwrap(),
+        std::fs::read(format!("{s4}.masscal.json")).unwrap()
+    );
+    for k in ["psms", "targets_at_q1"] {
+        assert_eq!(r3["stats"][k], r4["stats"][k], "{k}");
+    }
+
+    // No fragment of this fixture is matched by two peaks, so counting each fragment once
+    // gives the plain seed's table; only the report says the key was on.
+    let mut once = cfg.search_seed.clone();
+    once.count_fragments_once = true;
+    let (s3o, r3o) = seed(&ms2_3d, &once, "3d_once");
+    let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
+    assert_eq!(h(&s3), h(&s3o));
+    assert_eq!(r3o["params"]["count_fragments_once"], true);
 }
 
 /// Two isolation windows, one library band under each, built so that the bands' own q

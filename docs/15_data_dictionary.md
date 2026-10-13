@@ -194,6 +194,14 @@ ion-mobility source (`artifact::fragment_library_precursors(has_im)`). Version 2
 | `predicted_irt` | Float32 | no | iRT units | library predicted iRT (carried) |
 | `matched_peaks` | Int32 | no | - | matched fragment count at the best scan |
 | `scan_index` | UInt32 | no | - | `scan_index` of the best-scoring MS2 scan |
+| `observed_im` | Float64 | yes | 1/K0 (V s cm^-2) | v2 only: the intensity-weighted median 1/K0 of the matched fragment peaks of a confident target (`q <= fdr_seed`) in its best scan, each peak being the calibrant's nearest peak within `fragment_tol_ppm`; null for every other row |
+
+Version 1 has the thirteen columns above `observed_im`. Version 2 (`artifact::seed_psms(true)`)
+adds `observed_im` and is written only when the searched spectra carry per-peak 1/K0 (spectra
+v2, the native diaPASEF reader); its report then also carries the stat `with_observed_im`, the
+number of rows with a value. A 3D seed is version 1, byte for byte. Every manifest site records
+the version read from the table's footer (`search_seed::seed_schema`). The report's `params`
+gain `count_fragments_once: true` only when that key is on.
 
 ### `<seed>.masscal.json` (`search_seed.rs:217-227`)
 
@@ -239,9 +247,13 @@ so `deeplc_finetune.py` reads it as it reads `seed_psms`. One row per candidate,
 | `rt_pred_cal` | Float64 | no | s | predicted iRT calibrated to this run's observed RT |
 | `rt_lo` | Float64 | no | s | lower RT window bound (`rt_pred_cal - width`) |
 | `rt_hi` | Float64 | no | s | upper RT window bound (`rt_pred_cal + width`) |
-| `im_pred_cal` | Float64 | yes | 1/K0 | calibrated ion mobility; always null in the 3D MVP |
-| `im_lo` | Float64 | yes | 1/K0 | IM window lower bound; always null |
-| `im_hi` | Float64 | yes | 1/K0 | IM window upper bound; always null |
+| `im_pred_cal` | Float64 | yes | 1/K0 | the library `predicted_im` through this run's ion-mobility calibration (docs/08, "Ion-mobility calibration"); null on a 3D run, without a calibration, and for a row without a finite, positive `predicted_im` |
+| `im_lo` | Float64 | yes | 1/K0 | `im_pred_cal - w_im`; null where `im_pred_cal` is |
+| `im_hi` | Float64 | yes | 1/K0 | `im_pred_cal + w_im`; null where `im_pred_cal` is |
+
+The table stays version 1 on every run: the three IM columns were always part of it. They are
+filled only when the seed carries `observed_im` and the library `predicted_im`; no stage reads
+them yet (docs/35 section 4).
 
 ### `<run_windows>` cal.json (`rt_im_train.rs:290-302`)
 
@@ -257,6 +269,27 @@ RT-calibration sidecar (written to `out_cal`, not part of the Parquet contract).
 | `multiplier` | number | RT window multiplier |
 | `n_train` | integer | number of confident anchors used |
 | `calibration_status` | string | `loess`, `linear`, or `fallback_fixed` |
+
+On a run whose seed carries `observed_im` (spectra with 1/K0), and only there, `cal.json` also
+holds the ion-mobility block below, and the `run_windows` report's stats gain `im_n_train` and
+`w_im`. A 3D `cal.json` has none of these keys.
+
+| field | JSON type | meaning |
+|---|---|---|
+| `im_method` | string | `per_charge_linear_ccs`, or `unavailable` (the library has no `predicted_im`, or too few anchors) |
+| `im_n_train` | integer or null | ion-mobility anchors: confident targets at the anchor cut with a finite, positive observed and predicted 1/K0, one per candidate |
+| `im_global` | object or null | `{a, b}` of the global fit `obs_ccs = a + b * pred_ccs` |
+| `im_per_charge` | object or null | per charge with at least `im_min_anchors_per_charge` anchors: `{a, b, n}`; other charges use `im_global` |
+| `w_im` | number or null | IM half-window (1/K0) |
+| `w_im_sizing` | string or null | `holdout`, or `holdout_fallback_in_sample` when one side of the split had too few anchors |
+| `p_im` | number | residual percentile that sizes `w_im` |
+| `im_window_multiplier` | number | multiplier on that percentile |
+| `im_window_min` | number | lower clamp of `w_im` |
+| `im_holdout_frac` | number | fraction of anchor base peptides held out (the constant 0.3) |
+| `im_n_holdout` | integer or null | held-out anchors |
+| `im_holdout_resid_abs_median` | number or null | median held-out absolute residual (1/K0) |
+| `im_holdout_resid_p_im` | number or null | held-out residual at `p_im`, before the multiplier |
+| `im_in_sample_resid_abs_median` | number or null | median in-sample absolute residual (a fit diagnostic, not an error estimate) |
 
 ---
 

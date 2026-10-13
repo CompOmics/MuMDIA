@@ -9,8 +9,16 @@
 //! The same report says which reader wrote the spectra (`params.reader`, written only for
 //! the native diaPASEF reader; absent means mzML) and from which source (`params.mzml`).
 //! [`provenance`] reads all three. The instrument is provenance only: whether the spectra
-//! carry 1/K0 is the reader's fact ([`Provenance::has_im`]), never the model name's, because
+//! carry 1/K0 is the reader's fact ([`Reader::has_im`]), never the model name's, because
 //! a timsTOF mzML written by msconvert has no 1/K0.
+//!
+//! That fact has two sources, and both go through [`Reader::has_im`] so they cannot disagree:
+//! before conversion the raw dispatch says which reader `convert` will use
+//! ([`reader_for_input`], which `convert` itself calls to choose the reader it records), and
+//! after it the recorded `params.reader` says which reader did ([`spectra_has_im`]). Every
+//! TIMS-dependent setting (`predict_frag.im_predictor = auto` today) resolves from one of the
+//! two: [`input_has_im`] for library-build keys, decided before anything is converted, and
+//! [`spectra_has_im`] for a stage that reads converted spectra.
 //!
 //! The header is read as text, as `convert`'s declared spectrum count is: the instrument
 //! description sits in the first few KiB of every mzML, and mzdata does not expose the
@@ -131,11 +139,44 @@ pub struct Provenance {
     pub source: Option<String>,
 }
 
-impl Provenance {
-    /// Do the spectra carry per-peak 1/K0? The one predicate for 4D behaviour.
-    pub fn has_im(&self) -> bool {
-        self.reader == Reader::Timsrust
+impl Reader {
+    /// Do spectra written by this reader carry per-peak 1/K0? The one predicate for 4D
+    /// behaviour.
+    pub fn has_im(self) -> bool {
+        self == Reader::Timsrust
     }
+}
+
+impl Provenance {
+    /// Do the spectra carry per-peak 1/K0? [`Reader::has_im`] of the recorded reader.
+    pub fn has_im(&self) -> bool {
+        self.reader.has_im()
+    }
+}
+
+/// The reader `convert` uses for the input at `path`, from the raw dispatch: the native
+/// timsTOF reader for a diaPASEF `.d` (`raw::Vendor::BrukerTdf`), mzML for everything else
+/// (a vendor file is converted to mzML first). `convert` chooses its reader through this
+/// function, so the reader predicted before conversion is the one it records.
+pub fn reader_for_input(path: &str) -> Reader {
+    if crate::raw::detect(path) == crate::raw::Vendor::BrukerTdf {
+        Reader::Timsrust
+    } else {
+        Reader::Mzml
+    }
+}
+
+/// Will the spectra converted from the input at `path` carry per-peak 1/K0? Decided before
+/// conversion, for the settings that must be known first (the library build).
+pub fn input_has_im(path: &str) -> bool {
+    reader_for_input(path).has_im()
+}
+
+/// Do the converted spectra at `spectra_path` carry per-peak 1/K0, by the reader `convert`
+/// recorded? False for a missing or unreadable report, and for spectra converted before the
+/// reader was recorded (all of which are mzML).
+pub fn spectra_has_im(spectra_path: &str) -> bool {
+    provenance(spectra_path).is_some_and(|p| p.has_im())
 }
 
 /// The provenance `convert` recorded for the spectra artifact at `spectra_path`
@@ -417,6 +458,42 @@ mod tests {
         assert!(p.has_im());
         assert_eq!(p.source.as_deref(), Some("b.d"));
         assert_eq!(recorded(spectra), Some(inst));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The two sources of the 4D predicate agree: the raw dispatch before conversion and the
+    /// reader `convert` records after it, both through `Reader::has_im`.
+    #[test]
+    fn the_input_and_the_recorded_reader_answer_the_same_question() {
+        let dir = std::env::temp_dir().join(format!("mumdia_has_im_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dia = dir.join("dia.d");
+        crate::raw::tdf_fixture(&dia, &[0, 9, 9], "2", true);
+        let dda = dir.join("dda.d");
+        crate::raw::tdf_fixture(&dda, &[0, 8], "2", true);
+        let dia = dia.to_str().unwrap();
+        assert_eq!(reader_for_input(dia), Reader::Timsrust);
+        assert!(input_has_im(dia));
+        for other in [dda.to_str().unwrap(), "run.mzML", "run.raw"] {
+            assert_eq!(reader_for_input(other), Reader::Mzml, "{other}");
+            assert!(!input_has_im(other), "{other}");
+        }
+        let spectra = dir.join("spectra_ms2.parquet");
+        let spectra = spectra.to_str().unwrap();
+        assert!(!spectra_has_im(spectra), "no report reads as mzML");
+        for (reader, want) in [(Some(READER_TIMSRUST), true), (None, false)] {
+            let mut params = serde_json::json!({"mzml": dia});
+            if let Some(r) = reader {
+                params["reader"] = serde_json::json!(r);
+            }
+            std::fs::write(
+                format!("{spectra}.report.json"),
+                serde_json::json!({ "params": params }).to_string(),
+            )
+            .unwrap();
+            assert_eq!(spectra_has_im(spectra), want);
+            assert_eq!(Reader::Timsrust.has_im(), input_has_im(dia));
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

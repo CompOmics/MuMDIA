@@ -729,7 +729,7 @@ mod tests {
             .im2deep_python
             .as_deref()
             .is_none_or(|p| !p.eq_ignore_ascii_case(AUTO)));
-        let resolved = cfg.predict_frag.im_predictor_resolved();
+        let resolved = cfg.predict_frag.im_predictor_for(true);
         assert_eq!(
             resolved == ImPredictorKind::Im2deep,
             cfg.predict_frag.im2deep_python.is_some()

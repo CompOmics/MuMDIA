@@ -98,13 +98,19 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
         .iter()
         .map(|s| std::mem::size_of_val(s.peaks.as_slice()))
         .sum();
-    crate::memlog::report(
-        "ms2 scans",
-        &[
-            ("peaks", peak_bytes),
-            ("scan_spine", std::mem::size_of_val(out.as_slice())),
-        ],
-    );
+    let im_bytes: usize = out
+        .iter()
+        .filter_map(|s| s.im.as_deref())
+        .map(std::mem::size_of_val)
+        .sum();
+    let mut parts = vec![
+        ("peaks", peak_bytes),
+        ("scan_spine", std::mem::size_of_val(out.as_slice())),
+    ];
+    if im_bytes > 0 {
+        parts.push(("peak_im", im_bytes));
+    }
+    crate::memlog::report("ms2 scans", &parts);
     // The decode's own wall time. The stage logs bracket it together with the library load
     // and the index build, so without this line no log could say which of the three a seed
     // or an extract spent its load phase on.
@@ -128,7 +134,6 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
     let wtarget = t.f64("window_target")?;
     // The window's 1/K0 bounds (spectra v2, a diaPASEF source), which tell apart slots that
     // share an m/z range (`IsolationWindow::key`). Absent in a v1 artifact: no mobility.
-    // The per-peak `im` list of v2 is not decoded; no stage reads it yet.
     let window_im = |name: &str| -> Result<Vec<Option<f32>>> {
         if t.has_column(name) {
             t.opt_f32(name)
@@ -137,6 +142,9 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
         }
     };
     let (wim_lo, wim_hi) = (window_im("window_im_lower")?, window_im("window_im_upper")?);
+    // The per-peak 1/K0 list of v2, decoded only when the artifact has it, so a 3D run
+    // allocates nothing for it and every scan's `im` is `None`.
+    let has_im = t.has_column("im");
     // The "id" column is NOT read. It stays in the artifact, where an external consumer can
     // find the mzML native id of any scan by `scan_index`, but decoding it here built one
     // String per scan (~72 B of header plus payload each, ~17 MB and 233 k allocations on
@@ -150,9 +158,19 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
     // getters used, so it stays aligned.
     let mut out = Vec::with_capacity(t.nrows);
     let mut i = 0usize;
-    t.for_each_batch(Some(&["mz", "intensity"]), SCAN_BATCH_ROWS, |b| {
+    let lists: &[&str] = if has_im {
+        &["mz", "intensity", "im"]
+    } else {
+        &["mz", "intensity"]
+    };
+    t.for_each_batch(Some(lists), SCAN_BATCH_ROWS, |b| {
         let mza = list_col(b, "mz")?;
         let ina = list_col(b, "intensity")?;
+        let ima = if has_im {
+            Some(list_col(b, "im")?)
+        } else {
+            None
+        };
         for k in 0..mza.len() {
             // A null list is an empty slice, so a scan with either list null is empty.
             let (mf, iff) = (mza.row_slice(k, "mz")?, ina.row_slice(k, "intensity")?);
@@ -162,6 +180,20 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
                 .zip(&iff[..n])
                 .map(|(&mz, &intensity)| Peak { mz, intensity })
                 .collect();
+            let im = match &ima {
+                Some(a) => {
+                    let v = a.row_slice(k, "im")?;
+                    if v.len() < n {
+                        return Err(anyhow!(
+                            "scan {}: {} 1/K0 values for {n} peaks",
+                            scan_index[i],
+                            v.len()
+                        ));
+                    }
+                    Some(v[..n].to_vec())
+                }
+                None => None,
+            };
             out.push(Ms2Scan {
                 scan_index: scan_index[i],
                 rt_seconds: rt[i],
@@ -173,12 +205,37 @@ fn decode_ms2(t: &TableFile) -> Result<Vec<Ms2Scan>> {
                     im_upper: wim_hi[i],
                 },
                 peaks,
+                im,
             });
             i += 1;
         }
         Ok(())
     })?;
     Ok(out)
+}
+
+/// Index of the peak of `peaks` (m/z ascending) nearest `target` within `tol_ppm`, or `None`
+/// when no peak lies inside the window. A tie keeps the first, lower-m/z peak: only a
+/// strictly smaller distance replaces the current best.
+///
+/// The one nearest-peak rule of the seed: its calibrant ppm deviations and its 1/K0 points
+/// (`search_seed`) both take the peak this returns, so a 4D run's 1/K0 comes from the very
+/// peak whose deviation calibrates the mass, and a 3D run's calibrants are what they were.
+/// The m/z are widened from f32 once, which is exact, so the window bounds, the walk and the
+/// distance are computed on the doubles a widened-at-load peak carried.
+pub fn nearest_peak(peaks: &[Peak], target: f64, tol_ppm: f64) -> Option<usize> {
+    let (lo, hi) = mumdia_core::constants::ppm_bounds(target, tol_ppm);
+    let mut j = peaks.partition_point(|pk| (pk.mz as f64) < lo);
+    let (mut best_d, mut best) = (f64::MAX, None);
+    while j < peaks.len() && (peaks[j].mz as f64) <= hi {
+        let d = (peaks[j].mz as f64 - target).abs();
+        if d < best_d {
+            best_d = d;
+            best = Some(j);
+        }
+        j += 1;
+    }
+    best
 }
 
 /// Load MS1 scans (spectra_ms1.parquet), RT-sorted. Decoded in parallel parts exactly as
@@ -349,6 +406,7 @@ mod serial {
                         im_upper: None,
                     },
                     peaks,
+                    im: None,
                 });
                 i += 1;
             }

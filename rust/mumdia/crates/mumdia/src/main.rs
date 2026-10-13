@@ -1369,6 +1369,9 @@ fn real_main() -> Result<()> {
                 work_dir: &work_dir,
                 cfg: &cfg.predict_frag,
                 config_hash: &ch,
+                // No run: `im_predictor = auto` predicts nothing here (an explicit
+                // `im2deep` still does).
+                run_has_im: false,
             })?;
         }
         Cmd::SearchSeed {
@@ -1569,7 +1572,7 @@ fn real_main() -> Result<()> {
             }
             cfg.prescreen.write_scores |= write_scores;
             cfg.validate()?;
-            if mumdia::instrument::provenance(&ms2).is_some_and(|p| p.has_im()) {
+            if mumdia::instrument::spectra_has_im(&ms2) {
                 anyhow::bail!(
                     "{ms2} was converted from a diaPASEF .d and carries 1/K0; the prescreen \
                      groups spectra by m/z window only and does not support it yet"

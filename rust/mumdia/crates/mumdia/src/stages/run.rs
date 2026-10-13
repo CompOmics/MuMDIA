@@ -59,10 +59,7 @@ pub(crate) fn refuse_unsupported_on_4d(
     inputs: &[String],
     experiment: bool,
 ) -> Result<()> {
-    let Some(tdf) = inputs
-        .iter()
-        .find(|m| crate::raw::detect(m) == crate::raw::Vendor::BrukerTdf)
-    else {
+    let Some(tdf) = inputs.iter().find(|m| crate::instrument::input_has_im(m)) else {
         return Ok(());
     };
     if cfg.groups.window_groups > 1 {
@@ -278,6 +275,10 @@ pub fn run(p: RunParams) -> Result<()> {
             // Build the library from the FASTA digest. preflight guarantees the
             // FASTA is present in this branch.
             let fasta = p.fasta.expect("preflight guarantees --fasta in build mode");
+            // Whether this run's spectra will carry 1/K0, from the raw dispatch, before
+            // anything is converted: the library-build keys resolve on it
+            // (`predict_frag.im_predictor = auto`), and conversion decides the same way.
+            let run_has_im = crate::instrument::input_has_im(p.mzml);
             let lib_p = d("fragment_library_precursors.parquet");
             let lib_f = d("fragment_library_fragments.parquet");
             // `predict_frag.library_cache`: a library stored by an earlier run with the same
@@ -292,6 +293,7 @@ pub fn run(p: RunParams) -> Result<()> {
                     cfg,
                     fasta,
                     rt_placeholder,
+                    run_has_im,
                     (&man.mumdia_version, &man.git_sha),
                 )
             };
@@ -398,6 +400,7 @@ pub fn run(p: RunParams) -> Result<()> {
                     work_dir: &d("sidecar_work"),
                     cfg: &cfg.predict_frag,
                     config_hash: &ch,
+                    run_has_im,
                 })?;
                 man.record(wp.record(
                     artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
@@ -580,7 +583,7 @@ pub fn run(p: RunParams) -> Result<()> {
         })?;
         man.record(w.record(
             artifact::SEED_PSMS.0,
-            artifact::SEED_PSMS,
+            search_seed::seed_schema(&seed)?,
             &seed,
             "search-seed",
             &ch,

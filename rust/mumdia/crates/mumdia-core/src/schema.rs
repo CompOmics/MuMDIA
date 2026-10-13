@@ -41,6 +41,10 @@ pub mod artifact {
     pub const PRESCAN_SURVIVORS: (&str, u32) = ("prescan_survivors", 1);
     pub const PRESCREEN_SCORES: (&str, u32) = ("prescreen_scores", 1);
     pub const SEED_PSMS: (&str, u32) = ("seed_psms", 1);
+    /// v2: v1 plus a nullable Float64 `observed_im`, the intensity-weighted median 1/K0 of a
+    /// confident target's matched fragment peaks. Written only when the searched spectra
+    /// carry per-peak 1/K0; every other seed is v1, byte for byte.
+    pub const SEED_PSMS_V2: (&str, u32) = ("seed_psms", 2);
     /// The confident targets of a bootstrap search, in the seed's column shape, that the
     /// multi-head calibration is refitted on under `rt_im_train.multihead_anchors = search`
     /// (`<run>/rt_bootstrap/search_anchors.parquet`, `stages::rt_bootstrap`).
@@ -111,6 +115,16 @@ pub mod artifact {
         }
     }
 
+    /// The seed schema a search writes: [`SEED_PSMS_V2`] when the searched spectra carry
+    /// per-peak 1/K0, else [`SEED_PSMS`].
+    pub fn seed_psms(has_im: bool) -> (&'static str, u32) {
+        if has_im {
+            SEED_PSMS_V2
+        } else {
+            SEED_PSMS
+        }
+    }
+
     /// The precursor-library schema a table records: [`FRAGMENT_LIBRARY_PRECURSORS_V2`] when
     /// it carries `predicted_im`, else [`FRAGMENT_LIBRARY_PRECURSORS`].
     pub fn fragment_library_precursors(has_im: bool) -> (&'static str, u32) {
@@ -139,5 +153,8 @@ mod tests {
         assert_eq!(spectra_ms1(false), SPECTRA_MS1);
         assert_eq!(spectra_ms2(false), SPECTRA_MS2);
         assert_eq!(isolation_windows(false), ISOLATION_WINDOWS);
+        assert_eq!(seed_psms(false), SEED_PSMS);
+        assert_eq!(seed_psms(false), ("seed_psms", 1));
+        assert_eq!(seed_psms(true), ("seed_psms", 2));
     }
 }
