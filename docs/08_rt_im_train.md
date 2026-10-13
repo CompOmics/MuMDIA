@@ -309,6 +309,11 @@ points the smoother interpolated, so `w_rt` is systematically narrower than the
 RT error on library candidates that were not anchors. `p_rt = 0.95` and
 `rt_window_multiplier` absorb part of that gap. Do not read `w_rt` as a measured
 95th percentile of prediction error over the whole library.
+
+`rt_window_multiplier` is acquisition-specific. The Orbitrap and Astral examples set 1.5. On
+diaPASEF, with retrace on, 1.5 lost 1.8% and 2.0 lost 2.9% of peptides against 1.0 (three
+seeds, IM branch): the wider window returned about 100 precursors and lost 373 more to a
+wrong peak inside it. The diaPASEF recipe keeps the default 1.0 (docs/35 sections 9 and 12).
 `window_holdout_frac` (next subsection) replaces this in-sample estimate with a
 measured one.
 
@@ -947,8 +952,14 @@ in-sample, with a warning, and `w_im_sizing` says `holdout_fallback_in_sample`. 
 null, which means "do not gate", and `cal.json` records `im_method = unavailable`. A seed
 with 1/K0 against a library without `predicted_im` records the same.
 
+Measured on the E. coli diaPASEF run (IM2Deep 2.0.2, main with the valley splits and the
+count-once seed): 4,024 training and 1,166 held-out anchors, held-out median |residual| 0.0097
+V s cm^-2, `w_im` 0.033. The IM branch, on its native-reader base, had 4,313 anchors, a
+held-out median of 0.0105 and p95 of 0.0398 (in-sample 0.0103, so the linear fit does not
+memorise), `w_im` 0.040 and a window recall of 97.6% (docs/35 section 11).
+
 There is no refit of the IM calibration on identifications and no robust anchor filter; both
-are outside this stage (docs/35). Whether an OLS per charge or a robust fit under a relaxed
+are outside this stage (docs/35 section 7). Whether an OLS per charge or a robust fit under a relaxed
 anchor cut is better is unmeasured. A grouped run is refused on diaPASEF input, and its shared
 fit (`fit_from_seed`) joins no library rows, so it fits no IM calibration.
 
@@ -1289,11 +1300,11 @@ though the enum variant still exists.
 
 ## How to extend / modify
 
-- **Add IM (4D).** Populate `im_pred_cal`/`im_lo`/`im_hi` (currently `None` at
-  rt_im_train.rs:261-263) from an IM calibration analogous to the RT path (an
-  IM2Deep-style model), and add IM config fields to `RtImTrainConfig`. The output
-  columns already exist and are nullable, so downstream reads survive the
-  transition. `extract` and the IM feature families must then consume them.
+- **Change the IM (4D) calibration.** It is section 7: a per-charge linear map in CCS
+  space that fills `im_pred_cal`/`im_lo`/`im_hi` only on a run whose seed carries
+  `observed_im`; `extract` reads the window for its 1/K0 gate and the IM feature
+  family reads `im_pred_cal`. A change there is measured on diaPASEF with the arms of
+  docs/35 section 14, and a 3D run must keep its exact `run_windows` and `cal.json`.
 - **Change the calibration model.** Extend `CalibrationMethod` (config.rs:56-61) and
   branch in the `predict` closure setup (rt_im_train.rs:133-150). Keep `linear_fit` as
   the universal fallback so a degenerate anchor set never panics. New models belong

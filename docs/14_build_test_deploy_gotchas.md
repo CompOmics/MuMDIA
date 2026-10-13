@@ -582,8 +582,12 @@ behaviour is exercised nowhere in CI except inside the Docker job's `doctor` and
 import checks, and the smoke job is deliberately native-only. `pytest` coverage
 of the worker contracts is still outstanding
 (`docs/22_release_plan.md`, WP6). The JSON parse is likewise a syntax floor; the
-real config check is the Rust test `shipped_configs_parse` (`config.rs:1651`),
-which loads every shipped config under `deny_unknown_fields`.
+real config check is the Rust test `shipped_configs_parse` (`config.rs`), which loads
+every shipped config under `deny_unknown_fields` and runs `Config::validate` on it. Until
+the diaPASEF documentation work it resolved the repository root one directory short
+(`rust/`), found none of the configs and passed through its `continue`; it now counts the
+configs it read and fails when a listed one is missing from a full checkout. A new example
+config is added to its list.
 
 **Release workflow.** `release.yml` fires on `v*` tags and on a manual
 `workflow_dispatch` rehearsal (`release.yml:13-35`). Permissions are per job
@@ -899,6 +903,33 @@ spec, `check_doc_refs.py` catches a citation to a document a clone does not
 receive, and the Docker job's real DeepLC import catches the import-order fault.
 None of that runs a Python worker on data. The outstanding item is `pytest`
 coverage of the worker contracts (`docs/22_release_plan.md`, WP6).
+
+**No diaPASEF fixture in CI (decision).** Every TIMS path is covered in CI only at the
+level of its kernels and of 3D identity: unit tests build small `analysis.tdf` SQLite files
+for the routing probe (`raw.rs`) and the `TimsCalibration` reader (`convert/tdf.rs`), the
+reader's centroiding, valley splits and peak caps are tested on in-memory points, the
+retrace kernels and patch rules and the second pass's consensus 1/K0 have their own unit
+tests, and `tests/pipeline.rs` crafts 4D spectra, windows and extraction inputs by hand
+(`craft_ms2_im`, `craft_ms1_im`, `craft_windows_im`) for the seed's `observed_im` and the
+1/K0 gate. No synthetic `.d` is
+generated or committed. A `.d` needs `analysis.tdf_bin` frames in Bruker's compressed
+binary layout, which timsrust decodes but nothing in the repository encodes, and a
+hand-written encoder would test the reader against the encoder's own reading of the format
+rather than against an instrument. The end-to-end check is therefore one real-file test,
+ignored by default because the file is several gigabytes:
+
+```text
+cd rust/mumdia
+MUMDIA_BENCH_TDF=/path/to/run.d cargo test -p mumdia -- --ignored tdf_real
+```
+
+`tdf_real_diapasef_frames_split_into_slots_with_mobility_inside_them` decodes the first 60
+frames and asserts that every MS2 slot spectrum has one 1/K0 per peak, inside the slot's
+1/K0 bounds, in m/z order. Without the variable it returns at once. It belongs in the local
+validation of any change to `stages/convert/tdf.rs`, `tims_frames.rs` or `raw.rs`, together
+with a G1 run of the recipe (`docs/35_diapasef.md` sections 9 and 14). The smoke job's 3D
+expectations (`ci/check_smoke.py`) are the CI gate that the TIMS code changes nothing on
+mzML input.
 
 **Docker gotchas.** The two conda envs are pinned to Python 3.11 on purpose (see
 above); bumping to 3.12 reintroduces a source build of `pandas<2`.

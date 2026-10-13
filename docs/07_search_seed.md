@@ -215,7 +215,11 @@ index via `page_search` and needs no separate build.
   The default `accumulate` and `probe_peak_cand` are untouched. With no fragment matched
   twice the counts and the qualified set are the default's
   (`count_once_is_the_plain_accumulation_when_no_fragment_repeats`). Config validation
-  refuses the key with `matcher = bucketed`. Benchmark-gated (docs/35_diapasef.md).
+  refuses the key with `matcher = bucketed`. Benchmark-gated (docs/35_diapasef.md, arm
+  T13). On the IM branch the mobility valley split alone cut the seed's confident anchors
+  from 5,200 to 3,331, and counting once brought them to 5,534, +3.8% peptides with the
+  split (three seeds). The diaPASEF recipe (`configs/examples/diapasef.json`) sets it
+  with both valley fractions.
 - *Bucketed path* (serial, `search_seed.rs:66-107`): per scan, `candidate_range` on
   the Library, `select_peaks`, then `page_search` for each probed peak accumulates
   `(count, obs_sum)` into a `HashMap`. Same `min_matched_peaks` filter, hyperscore,
@@ -324,7 +328,9 @@ spread they were cut from, so every pass would tighten it for no reason in the d
 (`the_mad_second_pass_refits_the_offset_and_keeps_the_width`). At 0 the result is the
 P95 estimator's, bit for bit. On the IM branch MAD with k = 4 gave +5.7% over the P95
 arm on diaPASEF E. coli (three seeds, single pass); HYE was not isolated, and every IM
-number is single-pass. The key is benchmark-gated (docs/35_diapasef.md, arm T3), and
+number is single-pass. On main with two-pass mass calibration (diaPASEF E. coli, one seed)
+k = 4 learned 10.0 ppm against 11.7 ppm for P95 and gave 11,037 peptides against 11,072, no
+gain. The key is benchmark-gated (docs/35_diapasef.md, arm T3), and
 whether one estimator can serve every acquisition is open; if one ties or wins
 everywhere, the other is retired.
 

@@ -492,6 +492,13 @@ instrument-agnostic in its code, but it was measured only on diaPASEF. A recomme
 diaPASEF or any other acquisition, needs a second known-ratio set. Quantification is
 deterministic on fixed identifications, so these keys need no entrapment arm.
 
+The diaPASEF recipe (`configs/examples/diapasef.json`) sets the measured base
+(`fixed_scan_halfwidth 4`, `interference_envelope`, `baseline_subtract`) with
+`fragment_selection = cross_run` and `baseline_source = experiment`. The width
+(`fixed_scan_halfwidth_scale`) is left out of it as the next lever to confirm. The IM
+branch's quantification and match-between-runs record on the same data is condensed in
+docs/35_diapasef.md section 8.
+
 Provenance: IM branch (PR #140) commits `7ac12e7` (weights), `1bc59a2` (background) and
 `42ccfe2` (width), measured with its `quant_diag/requant_crw.sh` requant harness. The IM keys
 `quant.cross_run_weights`, `cross_run_background` and `cross_run_width` are the three keys

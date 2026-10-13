@@ -1,9 +1,11 @@
 # 35. diaPASEF: timsTOF input with ion mobility
 > Part of the MuMDIA developer documentation (see docs/README.md).
 
-This document describes how MuMDIA reads and searches diaPASEF data from a Bruker timsTOF.
-It is filled in as the support lands, one pull request at a time. A section that names a later
-pull request describes work that is not in the tree yet.
+This document describes how MuMDIA reads, searches and quantifies diaPASEF data from a Bruker
+timsTOF. Sections 1 to 8 describe the mechanisms, section 9 how to run them, section 10 the
+artifacts that carry 1/K0, sections 11 to 13 what was measured and how the losses were
+diagnosed, and sections 14 and 15 what is open and what is not supported. Every TIMS key
+is off by default; `configs/examples/diapasef.json` is the recipe that turns them on.
 
 ## 1. What diaPASEF support consists of
 
@@ -20,13 +22,13 @@ peak carries a 1/K0. Using that dimension takes seven layers:
    1/K0 (section 6, in the tree);
 6. extend retention-time recalibration and match-between-runs with a 1/K0 window (section 7, in
    the tree);
-7. quantify with cross-run fragment consistency (section 8).
+7. quantify with cross-run fragment consistency (section 8, in the tree).
 
-Until a layer lands, the 1/K0 columns it would read are written but ignored. A run on a diaPASEF
-`.d` works end to end after layers 1 and 2: the seed search, extraction and features see the
-4D spectra artifacts and use only their m/z, intensity and retention time. Layer 4 adds the
-1/K0 evidence to every 4D run and makes the gate and the feature family available behind keys
-that default to off.
+A run on a diaPASEF `.d` with the default configuration uses layers 1 and 2 and records the
+1/K0 evidence of layer 4: the seed search, extraction and features use the m/z, intensity and
+retention time, and the 1/K0 columns are written for the keys that read them. The 1/K0 gate,
+the feature family, retrace, the re-pick and the cross-run quant selectors are each behind a
+key that defaults to off.
 
 The one predicate for 4D behaviour is "the spectra carry per-peak 1/K0" (`Reader::has_im` in
 `crate::instrument`). After conversion it is read from the record `convert` writes
@@ -203,7 +205,7 @@ byte, and its calibrants are unchanged. The seed is ungated in 1/K0: it runs bef
 calibration exists. `search_seed.count_fragments_once` (default false, `matcher = fragindex`
 only) counts each predicted fragment once per spectrum at its most intense peak, so the mobility
 pieces of one fragment ion at one m/z do not count as several matched fragments; it is
-benchmark-gated together with the reader's valley fractions (section 9).
+benchmark-gated together with the reader's valley fractions (section 14, arm T13).
 
 Calibration 1/K0. rt-im-train fits, on the same confident targets, a per-charge linear map of
 the library's CCS onto the observed CCS, and sizes the half-window `w_im` on held-out anchors
@@ -382,7 +384,7 @@ is refused when the chain reaches retrace, with the reason.
 
 All counts are stripped peptides at `peptide_q_value` 1% with `nn_torch`, on the base the IM
 branch had at the time (the L1d configuration with its RT refit); the integrated pipeline is
-re-measured under gates G1 to G5 and arms T3b and T10 (plan section 9).
+re-measured under gates G1 to G5 and arms T3b and T10 (section 14).
 
 | arm | E. coli peptides (seeds 0 / 1 / 2, mean) | entrapment | HYE diaPASEF, six runs, seed 0 |
 |---|---|---|---|
@@ -523,9 +525,351 @@ pass is reported until it has run on a TIMS pool.
 The cross-run quant levers (`quant.fragment_selection = cross_run`, `quant.baseline_source =
 experiment`, `quant.fixed_scan_halfwidth_scale`) are described, with their diaPASEF
 measurements, in docs/12_quant_lfq_align_mbr_report_audit.md, "Cross-run fragment selection
-and background".
+and background". Main's default quantification on diaPASEF is unmeasured: every number below
+used predicted fragment selection and the interference envelope, which are not defaults.
 
-## 9. Recipe, results and open levers
+### The quantification record, condensed
 
-Filled by PR 7: the example configuration, the measured ladder with its units, seeds and
-entrapment results, the closed levers, and the open ones.
+HYE diaPASEF, ProteoBench `quant_lfq_DIA_ion_diaPASEF` at `min_obs` 3, measured on the IM
+branch with identifications fixed at its re-pick configuration (seed 0: 92,540 ions; seeds 1
+and 2: 92,141 and 92,475). Global is the median |log2 ratio error|, eq the mean of the
+per-species medians (species-equalised), CV the median of the per-condition CVs.
+
+| step | global / eq / CV | commit |
+|---|---|---|
+| default quant, earlier identification base | 0.222 / 0.549 / 0.122 | `c5d41bb` |
+| `fragment_selection = predicted` + `interference_envelope` | 0.182 / 0.307 / 0.114 | `c5d41bb` |
+| the same on the re-pick identifications (the IM branch's shipped quant) | 0.172 / 0.358 / 0.107 | `7ac12e7` |
+| fixed window of 4 scans | 0.136 / 0.230 / 0.089 | `7ac12e7` |
+| + `baseline_subtract` (12 flank scans, quantile 0.25): the base of docs/12 | 0.138 / 0.217 / 0.092 | `7ac12e7` |
+| + cross-run weights and experiment background (three ID sets) | 0.133-0.134 / 0.180-0.181 / 0.087 | `7ac12e7`, `1bc59a2` |
+| + cross-run width, scale 2.5 (three ID sets) | 0.129-0.130 / 0.177-0.178 / 0.083 | `42ccfe2` |
+
+The recipe (section 9) sets the measured base and the first two cross-run selectors. The
+width (`quant.fixed_scan_halfwidth_scale`) is the next lever: it gained on all three ID sets
+but rests on one known-ratio dataset, like the rest of the record (G4).
+
+Match-between-runs on the IM branch, same data (its mechanisms are not ported; main's second
+pass is the one mechanism, section 7):
+
+- **Transfer** (`42ccfe2`): 98.5-99.5% of transferred values sit within 5 s of the
+  reference retention time, so the transfers take the right peak, but their signal is 2.4
+  log2 units fainter. Cosine and 1/K0 guards did not separate the error. Lowering
+  `min_anchor_runs` to 1 added 4,752 ions and worsened eq from 0.220 to 0.229.
+- **Integration at the predicted retention time with a cross-fitted null** (`3f8516c`, three
+  seeds): the second anchor tier added 928 to 1,083 ions at eq +0.002 to +0.004; the
+  first tier was rejected on quant (eq +0.012).
+- **Re-extraction at the anchors' 1/K0 band** (`3f8516c`, three seeds): 2.7 times the
+  accepted rows of the integration arm and 2,300 to 2,516 more ions; re-extraction alone gave
+  the best eq of any MBR arm (100,799 ions, global 0.135, eq 0.204, seed 0), and re-extraction
+  followed by the rescuable tier 102,772 ions at eq 0.216.
+- **Second search on an empirical library** (`0fd81bc`, `940ee33`): with the empirical
+  library's own intensities at q 0.01, 105,801 ions but eq 0.235; with predicted intensities
+  and new decoys (arm D), 105,078 ions, global 0.137, eq 0.209 (seed 0), which is 2,154 to
+  2,306 more ions than the transfer union at eq -0.007 to -0.008. Single-run E. coli
+  entrapment of arm D: FDP 0.487-0.492% against 0.367-0.473% for pass 1. The library cut is
+  the report cut: 534-536 of 656 entrapment library entries were accepted in pass 2.
+
+MBR of any kind compresses ratios, on diaPASEF as elsewhere (docs/12). The IM branch's arm D
+is the reference for main's second pass on TIMS data, which has not been measured (G4).
+
+## 9. How to run diaPASEF
+
+The recipe is `configs/examples/diapasef.json`. It derives from
+`configs/examples/fasta-peptdeep.json` and sets:
+
+| section | values | why |
+|---|---|---|
+| `convert` | `tdf_mz_valley 0.5`, `tdf_im_valley 0.5` | valley splits of the native centroids (section 2) |
+| `predict_frag` | `predictor peptdeep`, `peptdeep_model generic`, `peptdeep_instrument timsTOF`, `peptdeep_nce 35`, `top_n_fragments 12`; `im_predictor im2deep`; every interpreter `auto` | AlphaPeptDeep at timsTOF settings (no `charge2_from_precursor_charge` change: it predicts charge-2 fragments), IM2Deep 1/K0 |
+| `search_seed` | `count_fragments_once true` | one count per predicted fragment and spectrum (section 4) |
+| `rt_im_train` | `rt_window_multiplier 1.0` | see below |
+| `extract` | `im_gate fragments`, `retain_top_peaks 5`; `gate_min_score 0.6` and `apex_rt_prior_s 120` as in the FASTA example | the 1/K0 gate (section 5) and the sidecar peaks the re-pick chooses among |
+| `features` | `set extended`, `im_features on` | the ion-mobility family (section 5) |
+| `retrace` | `enabled true`, `repick true` | section 6 |
+| `rescore` | `nn_torch`, `strict true` | |
+| `mbr` | `strategy second_pass` | the default of `run-experiment`, written out; supported on 4D since section 7 |
+| `quant` | `fixed_scan_halfwidth 4`, `interference_envelope true`, `baseline_subtract true`, `fragment_selection cross_run`, `baseline_source experiment` | the measured base and the first two cross-run selectors (section 8) |
+
+`rt_window_multiplier` stays at 1.0, the engine default. The 1.5 of the Orbitrap and Astral
+examples (`diann-library.json`, the prescreen examples) must not be carried over: on
+diaPASEF 1.5 lost 1.8% and 2.0 lost 2.9% of peptides (section 12).
+
+Every TIMS key the recipe sets is off by default, and no existing default depends on the
+instrument; the recipe is how a diaPASEF run gets them. Check the environment first, then
+search:
+
+```text
+mumdia doctor --config configs/examples/diapasef.json
+
+mumdia run --fasta proteome.fasta --mzml run01.d \
+  --out-dir out_run01 --config configs/examples/diapasef.json
+
+mumdia run --fasta proteome.fasta --mzml run01.d --mzml run02.d --mzml run03.d \
+  --out-dir out_exp --config configs/examples/diapasef.json
+```
+
+`doctor` resolves the AlphaPeptDeep, DeepLC, IM2Deep and rescore interpreters as the run will
+(`MUMDIA_PYTHON_PEPTDEEP`, `MUMDIA_PYTHON_DEEPLC`, `MUMDIA_PYTHON_IM2DEEP`,
+`MUMDIA_PYTHON_RESCORE`, or an activated environment) and checks the DeepLC and IM2Deep
+floors. The environments are `env/mumdia-peptdeep.yml` (AlphaPeptDeep) and
+`env/mumdia-deeplc.yml` (DeepLC, IM2Deep and the NN rescorer). A single `.d` searches as one
+run; several are one experiment with a pooled rescore, the second pass and the cross-run
+quant (a single run falls back to the per-run quant settings, with a log line). The `.d`
+must be a diaPASEF acquisition that timsrust reads (section 2); any other Bruker `.d` goes
+to msconvert as a 3D run, and the recipe is then refused before the search, because retrace
+needs the raw events.
+
+The recipe has no MS2PIP arm. The engine ladder of section 11 used MS2PIP `timsTOF2024`; with
+a single-charge MS2PIP model set `charge2_from_precursor_charge` to 99 (docs/06).
+
+## 10. Data model
+
+Which artifact carries which 1/K0 column. Each 4D version is chosen by a selector in
+`mumdia_core::schema::artifact` and written only when the run carries 1/K0; a 3D run writes
+the 3D version and its exact bytes. docs/15 has the column definitions.
+
+| artifact | 3D | 4D | 1/K0 content |
+|---|---|---|---|
+| `spectra_ms1` | v1 | v2 | `im`: per-peak 1/K0 list |
+| `spectra_ms2` | v1 | v2 | `im` per-peak list; `window_im_lower`, `window_im_upper` (the slot's bounds) |
+| `isolation_windows` | v1 | v2 | `im_lower`, `im_upper`, one row per slot (provenance only) |
+| spectra reports | | | `params.reader = "timsrust"`, the `convert.tdf_*` settings |
+| `fragment_library_precursors` | v1 | v2 when a 1/K0 source exists | `predicted_im` (nullable) |
+| `seed_psms` | v1 | v2 | `observed_im` |
+| `run_windows` | v1 | v1 | `im_pred_cal`, `im_lo`, `im_hi` filled |
+| `cal.json` | | | `im_*` block, `w_im_sizing`; `im_window_floor` in the second pass |
+| `psms_extracted` | v2 | v4 | `apex_im`, `apex_im_mad`, `ms1_apex_im`, `im_pred_cal`; `imc_ref_w` only under `retrace.apex_features`; retrace patches values in place |
+| `chromatograms` | v1, v2 | v3 (v1 + `im`), v4 (v2 + `im_trimmed`) | per-point 1/K0, written only while a consumer is on |
+| `chromatograms.centroid.parquet` | | | extract's table before retrace; deleted after retrace succeeds |
+| `features` | | | the `ion_mobility` family (nine columns, ten with `imc_ref_w`) |
+| `fragment_quant` | v1 | v1 | v5 under the cross-run export, on any acquisition (section 8) |
+| `empirical_library.json` | | | `im` (consensus offsets and counts) and `diagnostics`, on experiments with 1/K0 |
+
+`ms2_to_ms1`, `psms_competed`, `psms_scored` and the quant tables carry no 1/K0 column; the
+second pass and the shadow term join `apex_im` from `psms_extracted` on
+`(candidate_id, selected_peak_rank)`.
+
+## 11. Measured results
+
+### On main
+
+E. coli, timsTOF Ultra 2, 15 min gradient, 50 ng, one run. FASTA library with MS2PIP
+`timsTOF2024`, DeepLC 4.5.0 and IM2Deep 2.0.2; strict `nn_torch`; one seed per arm. Counts are
+stripped peptides at `peptide_q_value` 1%, precursors at `precursor_q` 1% and protein groups at
+`pg_q_value` 1%. The decoy fraction was 0.98% in every arm. Each row adds to the one above.
+
+| step (PR of the series) | peptides | precursors | protein groups | wall | change |
+|---|---|---|---|---|---|
+| native reader, 1/K0 unused (PR 1) | 8,735 | 10,227 | 1,571 | 7:55 | |
+| + valley splits 0.5 / 0.5, count-once seed, IM2Deep, 1/K0 calibration not yet used by extract (PR 2) | 10,544 | 12,478 | 1,722 | 10:54 | +20.7% |
+| + `im_gate fragments`, `im_features on` (PR 3) | 11,072 | 13,032 | 1,774 | 12:40 | +5.0% |
+| + `retrace.enabled` (PR 4) | 11,688 | 13,920 | 1,833 | 12:42 | +5.6% |
+| + `retrace.repick`, `retain_top_peaks 5` (PR 4) | 12,624 | 15,093 | 1,899 | 12:56 | +8.0% |
+
+The 1/K0 calibration of the PR 2 arm used 4,024 training and 1,166 held-out anchors, with a
+held-out median |residual| of 0.0097 and `w_im` 0.033. The retrace arms peaked at 18.8 and
+18.7 GB. `search_seed.frag_tol_mad_k 4` on the PR 3 arm gave 11,037 (-0.3%): with two-pass
+mass calibration it learned 10.0 ppm against 11.7 ppm for the default estimator, and no
+gain. The converted spectra (`spectra_ms1`, `spectra_ms2`, `isolation_windows`,
+`ms2_to_ms1`) are identical, column for column, to the IM branch's, and conversion takes 50 s.
+
+Single seeds: a difference under about 1% between two of these arms is not a measurement
+(docs/28). The arms that are still to be run on this base are in section 14.
+
+<!-- MEASUREMENT: AlphaPeptDeep recipe arm (configs/examples/diapasef.json on the E. coli run, three nn_torch seeds, entrapment FDP): peptides / precursors / protein groups, decoy fraction, wall, peak -->
+
+<!-- MEASUREMENT: six-run HYE diaPASEF experiment with the recipe (second pass, cross-run quant): experiment-wide peptides / precursors / protein groups, second-pass diagnostics (decoy fraction in anchor and non-anchor runs), ProteoBench ions / global / eq / CV at min_obs 3, wall, peak -->
+
+### On the IM branch
+
+The prototype ladder of the IM branch (PR #140). Same E. coli run, three `nn_torch` seeds
+unless marked, decoy fraction 0.98-0.99% in every arm. Each row was measured on the base the
+branch had at the time: the extraction gate `apex_pearson` at 0.2 (gate 0 from P6c on),
+single-pass mass calibration, and none of the defaults main gained since (among them the
+`window_mean` gate, two-pass mass calibration, `rt_bootstrap` and the second pass).
+The HYE column is the six-run HYE diaPASEF experiment, pooled, seed 0, no entrapment.
+Entrapment is E. coli plus a 1:1 human entrapment proteome (section 14), FDP at the peptide
+level.
+
+| step | commit | peptides (mean) | change | entrapment | HYE peptides |
+|---|---|---|---|---|---|
+| P0: msconvert route (one seed) | `7f9aa3f` | 7,662 | | | no result: 0 seed anchors, then out of memory |
+| P1: native reader, 1/K0 unused (one seed) | `29575e1`, `76d57b6` | 7,231 | -5.6%, 5.2x faster (45:30 to 8:45) | | |
+| P2: IM2Deep and 1/K0 calibration, unused | `c5d41bb` | identical to P1 | | | |
+| P4: + fragment 1/K0 gate | `c5d41bb` | 7,615 | +5.7% | | |
+| P5: + ion-mobility features | `c5d41bb` | 7,753 | +1.8% | | |
+| P6: + MS2PIP `timsTOF2024` (charge-1 fragments), `frag_tol_mad_k 4`, gate 0, `apex_count_window 3` | `c5d41bb` | 9,507 | +22.6% | FDP 0.355-0.378% | 54,895 |
+| L1c: + AlphaPeptDeep `generic`, `timsTOF`, NCE 35 | `31cba11` | 10,899 | +14.6% | FDP 0.438-0.483% | 60,547 (+10.3%) |
+| + m/z valley split 0.5 | `ba1b3bf`, `31cba11` | 11,990 | +10.0% | FDP 0.445-0.456% | 67,768 (+11.9%) |
+| + mobility valley split 0.5 and count-once seed | `ba1b3bf`, `1b186c6`, `31cba11` | 12,451 | +3.8% | FDP 0.403-0.408% | 73,169 (+8.0%) |
+| L1d: + RT refit on identifications (not ported, section 7) | `029ac82`, `db6d434` | 12,919 | +3.8% | FDP 0.413-0.438% | 77,734 (+6.2%) |
+| + retrace | `907652f` | 13,678 | +5.9% | 12,922 real, FDP 0.40-0.44% | 89,424 (+15.0%) |
+| + raw apex scalars and `imc_ref_w` | `2739f88` | 13,920 | +1.8% | +2.2% real, FDP 0.43-0.51% | 92,951 (+3.9%) |
+| + re-pick (`retain_top_peaks 5`) | `f544cd7` | 14,911 | +7.4% | 13,975 real (+5.4%), FDP 0.37-0.47% | 100,790 (+8.4%) |
+
+Components of P6, each over P5 (three seeds): `timsTOF2024` with charge-1 fragments +2.7%;
+with `frag_tol_mad_k 4` (12.54 ppm) +8.5%; with gate 0 +21.2%; with `apex_count_window 3`
++22.6%. On HYE, k = 4 learned 18.4-18.5 ppm. AlphaPeptDeep NCE: 25 gave 10,728, 30 gave 10,797,
+35 gave 10,899 and 40 gave 10,631.
+
+What separates the two ladders is not one switch. Main's base has the `window_mean` gate at
+0.6 (the IM branch ran gate 0 from P6), the p95 tolerance with two-pass mass calibration (the
+IM branch: MAD k = 4, single pass), `apex_count_window` 5 (the IM branch: 3), no RT refit
+(the IM branch's L1d, +3.8%), and MS2PIP rather than AlphaPeptDeep in the measured arms (the
+IM branch's L1c, +14.6%). Arms T3, T4, T5 and T1 of section 14 and the recipe arm measure
+them one at a time; a shortfall is bisected with them before any IM mechanism is restored.
+
+## 12. Closed levers
+
+Measured and not kept. Commits are on the IM branch; seeds are `nn_torch` seeds on the E. coli
+run unless marked.
+
+| lever | result | commit |
+|---|---|---|
+| 1/K0 width and peak-shape features (P7, `im_shape_features`, `tdf_im_width`) | -0.9% (three seeds; seed 2 -2.8%); re-test on valley-split spectra -0.1% | `c5d41bb`, `907652f` |
+| seed 1/K0 gate (`search_seed.im_gate`, `im_window`) | no more anchors (4,313 off, 3,865 at a fixed 0.06, 4,358 two-pass 0.10); a narrow gate biased the 1/K0 calibration (`w_im` 0.0247, window recall 84.2% against 97.6%); end to end -0.05% | `c5d41bb` |
+| MS1 reads in the 1/K0 gate (`im_gate = fragments_ms1`) | -0.6% (one seed) | `c5d41bb` |
+| `top_n_fragments` other than 12 | 8, 10, 16, 20, 24 and a 200 m/z floor lose or tie against 12; with retrace on, 16 -3.3% and 24 -8.0% | `907652f`, `2739f88` |
+| fragment-model fine-tune, cross-fitted (E. coli) | held-out PCC 0.887 to 0.902, but -1.5% peptides and -5% seed anchors; open on HYE (section 14) | `907652f` |
+| shared-Gaussian co-elution fit | univariate AUC 0.57-0.59 against 0.594 for `xcorr_shape`; +0.010 cross-validated AUC; not taken to a rescore | `907652f` |
+| `extract.apex_rt_prior_s 8` | +1.6% on the `retrace_apex` base, but entrapment real +0.7% at an FDP of 0.49-0.50% against 0.45-0.47%: about 6% of the added peptides were false | `907652f`, `2739f88` |
+| RT prior on the re-pick | +0.25%; entrapment -0.6% real at FDP 0.41-0.42%; HYE rows +0.5% | `caeede4`, `63d104f` |
+| `extract.promote_top_peaks` (scored alternatives) | K = 2 -5.7%, K = 3 -5.9% (P6 base, seed 0): about 40 features are copied from rank 0 onto every alternative, and a wrong alternative beat the right rank-0 peak 40% of the time; a top-3 model trained on rank 0 only, +1.3%, was dropped | `31cba11`, `907652f` |
+| retrace summation tolerance 7 or 5 ppm | -1.0%, -2.3% | `f544cd7` |
+| `rt_im_train.rt_window_multiplier` 1.5 or 2.0 with retrace on | -1.8% (13,429), -2.9% (13,282), decoy fraction 0.99%; at 1.5 about 100 precursors came back inside the window and 373 more lost to a wrong peak inside it | `1c5b9a1` |
+| 1/K0 window narrowed to `apex_im` +/- delta | delta 0.008 -8.0%, 0.012 -1.4%, 0.020 +1.4% (seed 0); not recommended | `31cba11` |
+| `convert.tdf_mz_ppm 5` | +3.6%, but the seed fell to 615 anchors; superseded by the valley split | `31cba11` |
+| `tdf_min_points 1` | -17% (P1); for MS1 only +0.25% / -0.2% | `76d57b6`, `31cba11` |
+| valley fraction and smoothing | m/z 0.3 -6.1%; smoothing 12 ppm -4.4%; m/z 0.7 +1.6%, nothing once the mobility split and count-once are on | `31cba11` |
+| refit widths as fitted, and fragment mass recalibration on identifications | -4.0%; 7.99 ppm -2.7%, 10.11 ppm -0.3% | `31cba11` |
+| `peak_claim = coelution_shadow`, contested-evidence features | -8.7%, -0.4% (seed 0) | `31cba11` |
+
+## 13. How losses were diagnosed
+
+The IM branch's levers were chosen from a precursor-level loss classifier
+(`bench/tims/tims_loss.py`, from `31cba11`), not from count sweeps. It takes a reference set of
+precursors identified at 1% by an independent search of the same run (17,591 on E. coli),
+keyed on the stripped sequence with I and L merged plus the charge, pairs each with
+MuMDIA's best-scoring target row, and puts it in exactly one class:
+
+- not in the library;
+- not extracted: retention time outside the window, 1/K0 outside the window, or both inside
+  (the extraction gate or the presence rules);
+- accepted at pooled PSM `q_value` 1%;
+- right peak, low score: the apex within 5 s of the reference retention time, not accepted;
+- wrong peak inside the RT window;
+- wrong peak outside the RT window.
+
+On the P6 base: 0 not in the library; 194, 173 and 395 not extracted (RT, 1/K0, gate or
+presence; 270 of the 395 in the faintest quintile); 10,138 accepted (57.6%); 4,327 right peak
+with a low score (24.6%, q quartiles 0.049 / 0.209 / 0.758); 1,384 wrong peak inside the
+window (7.9%); 980 wrong peak outside it (5.6%, of which 436 were modform confusions, 431 of
+them in the Met-oxidation count). The losses were faint precursors, not borderline ones:
+acceptance by abundance quintile, faintest first, was 19.6 / 38.7 / 59.2 / 77.8 / 92.9%, and
+only 6.9% of the rejects had q between 1% and 2%. With retrace on (`1c5b9a1`) the accepted
+share rose from 77.6% to 80.8% and the right-peak rejects fell from 2,484 to 1,882; the
+wrong-peak classes did not move (829 to 847 inside, 415 to 433 outside), which is what the
+re-pick then addressed.
+
+Follow-up diagnostics, each from the classifier's classes (`31cba11` unless marked):
+
+- Right-peak rejects carry evidence at decoy level in every family (library intensity
+  agreement and fragment co-elution: AUC 0.48-0.52 against score-matched decoys); fragment
+  count, mass error, 1/K0 and retention time are not what they lack. On HYE (`0bb0984`) the
+  same class had 30% less fragment signal than accepted precursors of the same reference
+  abundance, and a perfect apex recovered about a quarter of that gap.
+- An apex oracle: the reference apex was among the top 1 / 2 / 3 / 5 extracted peaks for
+  31.3 / 67.6 / 86.6 / 98.7% of the wrong-peak-in-window class, the evidence behind
+  `retain_top_peaks 5` and the re-pick.
+- A retention-time oracle gave +2.0% (seed 0, diagnostic only).
+- An imported spectral library on the same keys gave +8.3%, and the gain was its charge-2
+  fragments; on the retrace base the same imported fragments lost 3.5% (`f544cd7`).
+
+**D5, corrected.** The first MS1 diagnostic (D5) found the MS1 monoisotopic peak missing for
+3,384 of 10,138 accepted precursors (33%), the nearest centroid a median -34.2 ppm from the
+monoisotopic m/z, and attributed it to single-linkage chaining across scans at
+`tdf_mz_ppm` 10. A 5 ppm follow-up seemed to rule chaining out; it had not tested a clean
+split, because one TOF index is about 4.4-7 ppm wide below m/z 500 and 5 ppm linkage cuts
+single ions. The m/z valley split settled it: MS1 found for 97.3% of accepted precursors
+(from 66.5%), missing-MS1 precursors 3,837 to 346, median |ppm| of the found peak 3.3 (from
+5.0). So D5's loss was chaining, and the valley split is its correction. Its effect is part
+of the valley-split row of section 11, not a separate gain: MS1 presence is not a
+discriminant by itself (targets 76.2%, decoys 75.0%).
+
+**The raw-MS1 gain is a separate item.** Rebuilding `ms1_mono`, `ms1_iso1` and `ms1_iso2`
+from the raw MS1 frame nearest each grid point, at 20 ppm and within `apex_im +/- 0.015`, gave
++1.6% (three seeds; +/- 0.025: +1.5%) with entrapment real peptides +1.85% at an FDP of
+0.44-0.46% against 0.42-0.46% (`907652f`). It is the origin of `retrace.ms1`, which stays a
+switch until arm T10 repeats the ablation on main.
+
+On HYE run 0 (`caeede4`, `0bb0984`), against the reference search's precursors: the re-pick
+fixed 9,014 and broke 2,464; the reference peak was outside the top 5 for 4,257, 905 of them
+outside the RT window. Of the remaining per-run gap, 97.4% is charge 2 and 47.7% is peptides
+of length 7 to 9. Retention-time error (median 3.8 s), 1/K0 error (0.0099), decoy shadowing
+and picked competition were ruled out as causes.
+
+## 14. Open levers and open measurements
+
+**Fragment-model fine-tuning.** On HYE diaPASEF, AlphaPeptDeep `generic` fine-tuned for 10
+epochs (learning rate 1e-4) on 79,937 precursors at pooled q 0.001 raised held-out cosine from
+0.9720 to 0.9834 and target rows per run by 3.4% (90,514 to 93,604), with peptides +2.5%,
+ProteoBench ions +3.5% and global / eq / CV 0.132 / 0.181 / 0.085 against 0.130 / 0.177 / 0.083
+(`0bb0984`, with the `bench/ms2_finetune` scripts that stay on the IM branch). It was not
+cross-fitted: the model was trained on the runs it then scored. The earlier E. coli fine-tune,
+cross-fitted, lost 1.5% (section 12; recalled in `f90809c`). A cross-fitted HYE run and an E.
+coli entrapment run decide between a real gain and train/score overlap. It is not ported; it
+can return as its own measured proposal.
+
+**Second-pass and quant measurements on TIMS data.** Main's second pass has not run on a
+diaPASEF pool, and the cross-run quant rests on one known-ratio dataset (sections 7 and 8).
+
+Planned arms, each against main's integrated base with the recipe. The gates are named G0 to
+G5: G0 byte identity of every 3D artifact, report, manifest entry and config hash, G1 the E. coli run with three paired seeds on one host, G2 E. coli entrapment (ratio
+0.563430) and, for the second pass, a multi-run entrapment on HYE, G3 the six-run HYE
+diaPASEF set, G4 ProteoBench HYE at `min_obs` 3, G5 wall time and process-tree peak against a
+64 GB budget.
+
+| arm | question |
+|---|---|
+| T1 | does an RT recentre on identifications add to `rt_bootstrap`? |
+| T2 | `multihead_anchors = search` against `auto` on TIMS, after the guards |
+| T3 | fragment tolerance estimator: p95 two-pass, MAD k = 4 two-pass and single-pass, p95 single-pass; also on the 3D benchmarks, to retire one |
+| T3b | T3 with retrace and the re-pick on |
+| T4 | `gate_min_score` 0, 0.3, 0.45, 0.6 under `window_mean` with the 1/K0 gate on |
+| T5 | `apex_count_window` 5 against 3 |
+| T6 | shadow demotion off, on, and on with `rescore.shadow_im_tolerance` |
+| T7 | decoy 1/K0: copied against predicted, entrapment |
+| T8 | second-pass 1/K0: consensus against calibrated library 1/K0 |
+| T9 | second-pass 1/K0 floor: first-pass `w_im` against a fixed 0.04 |
+| T10 | retrace MS1: `retrace.ms1` on and off, `ms1_scan_halfwidth` 0 against 1, `prec_tol_ppm` 3 against a TIMS value |
+| T11 | `rt_window_multiplier` 1.0 against 1.5 on main |
+| T12 | `im_gate` and `im_features` paired on and off, with entrapment and HYE seeds |
+| T13 | the valley fractions (m/z 0.5 to 0.7) and count-once as one package on HYE, three seeds |
+
+Each TIMS-only key moves to `auto` (or, for the valley fractions, to a TIMS default) only in
+its own change, with entrapment and a second acquisition. The entrapment FASTA is made with
+`bench/make_entrapment_fasta.py`; its ratio is a property of the library (0.563430 for the
+E. coli diaPASEF library), so it is computed for each library (`bench/README.md`).
+
+## 15. Limits
+
+- **Reader scope.** timsrust 0.4.2 classifies frames by `MsMsType` only, and MuMDIA reads a
+  `.d` natively only when it holds diaPASEF frames (type 9) and no ddaPASEF frames.
+  Synchro-PASEF, midiaPASEF, slice-PASEF and older TDF compression are untested. Only Ultra 2
+  E. coli and HYE runs were searched end to end; a timsTOF Pro run was only converted.
+- **Calibration.** Only the first `TimsCalibration` row is used; a file with several logs a
+  warning. Without a model 2 row the scan-to-1/K0 conversion is linear, with a warning.
+- **Intensities.** `intensity_correction_factor` is ignored, which is exact only while the
+  frames share one ramp time.
+- **Refused on 4D input:** grouped runs (`groups.window_groups > 1`) and the prescreen, both
+  keyed on m/z windows (section 3); retrace on a run not read natively from a `.d`; the
+  cross-run quant step under grouped runs or `rt_library_scope = per_run`.
+- **Window coverage.** The chromatogram grid's coverage test is on m/z only, exact while the
+  slots of a scheme have disjoint m/z ranges (section 3).
+- **Memory.** Retrace holds every frame inside the candidates' RT windows (21 GB on the
+  E. coli run on the IM branch; the E. coli runs with retrace on main peaked at 18.7-18.8 GB;
+  36-39 GB per HYE run on the IM branch). The pooled HYE rescore needed `MUMDIA_NN_STORE=f16` on a 64 GB node on the
+  IM branch.
+- **Evidence.** Most HYE numbers are one seed, no multi-run diaPASEF entrapment exists, and
+  the quantification record rests on one known-ratio dataset.

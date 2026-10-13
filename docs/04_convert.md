@@ -549,7 +549,7 @@ vendor file was involved.
 | Input | Converter | State |
 |---|---|---|
 | mzML | none | supported |
-| Bruker timsTOF `.d` (dir) with diaPASEF frames | none: native reader (timsrust), ion mobility kept | supported; the 1/K0 columns are written but not yet used by the search (docs/35_diapasef.md) |
+| Bruker timsTOF `.d` (dir) with diaPASEF frames | none: native reader (timsrust), ion mobility kept | supported; the 1/K0 calibration, gate, features, retrace and cross-run quant are opt-in (`configs/examples/diapasef.json`, docs/35_diapasef.md) |
 | Thermo `.raw` (file) | ThermoRawFileParser, or msconvert | **exercised end to end** (doxy, 2026-09-06: a 3.7 GB Astral `.raw` through `mumdia convert --mzml x.raw`, ThermoRawFileParser 2.0.0 found by `auto`, 6:40 and 4.4 GB for the converter, 3.4 GB mzML renamed into place beside the input, reused by the next run in 1.3 s; `peak-census` on the same `.raw` likewise) |
 | Bruker `.d` (dir), any other | msconvert | wired, unverified; **ion mobility is discarded** |
 | SCIEX `.wiff` / `.wiff2` | msconvert | wired, unverified; a `.wiff` needs its `.wiff.scan` companion beside it, and the engine names that file when msconvert fails without it |

@@ -135,7 +135,7 @@ machine could import what the worker imports. The message lists every place that
 was searched and every module that was required. In order of directness: name the
 interpreter in the config; export the role's variable
 (`MUMDIA_PYTHON_RESCORE`, `MUMDIA_PYTHON_DEEPLC`, `MUMDIA_PYTHON_MS2PIP`,
-`MUMDIA_PYTHON_MBR`); or activate an environment so `CONDA_PREFIX` or
+`MUMDIA_PYTHON_PEPTDEEP`, `MUMDIA_PYTHON_IM2DEEP`, `MUMDIA_PYTHON_MBR`); or activate an environment so `CONDA_PREFIX` or
 `VIRTUAL_ENV` points at it. `env/mumdia-rescore.yml` and `env/mumdia-deeplc.yml`
 build suitable environments.
 

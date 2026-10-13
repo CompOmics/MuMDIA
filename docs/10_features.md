@@ -708,6 +708,12 @@ the rescore schema check, which names the family; `run-experiment` resolves the 
 once for the experiment, so its runs share one schema. Promotion of the default to
 `auto` waits for a paired on/off entrapment arm and seeds on a second acquisition.
 
+Measured: +1.8% peptides on E. coli diaPASEF on the IM branch (three seeds, on top of the
+1/K0 gate); on main the gate and the family together gave +5.0% (one seed). The IM
+branch's 1/K0 width and peak-shape block (P7) lost 0.9% and is not ported, and a
+shared-Gaussian co-elution fit separated no better than `xcorr_shape` (docs/35 section 12).
+The diaPASEF recipe (`configs/examples/diapasef.json`) sets `im_features = on`.
+
 ## The Percolator PIN (`write_pin`, `features.rs:1537`)
 
 Streamed row-by-row through a `BufWriter` (not materialized as one String).

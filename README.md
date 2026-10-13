@@ -267,10 +267,12 @@ silently ignored. Every field not mentioned keeps its default.
   field-level reference.
 
 **Interpreter resolution.** A Python field (`rescore.python`,
-`predict_frag.deeplc_python`, `predict_frag.ms2pip_python`, `mbr.python`) may be
+`predict_frag.deeplc_python`, `predict_frag.ms2pip_python`,
+`predict_frag.peptdeep_python`, `predict_frag.im2deep_python`, `mbr.python`) may be
 an absolute path, or `"auto"`, or absent. Under `"auto"` the engine searches, in
 order, the role's own variable (`MUMDIA_PYTHON_RESCORE`, `MUMDIA_PYTHON_DEEPLC`,
-`MUMDIA_PYTHON_MS2PIP`, `MUMDIA_PYTHON_MBR`), then `MUMDIA_PYTHON`, then an
+`MUMDIA_PYTHON_MS2PIP`, `MUMDIA_PYTHON_PEPTDEEP`, `MUMDIA_PYTHON_IM2DEEP`,
+`MUMDIA_PYTHON_MBR`), then `MUMDIA_PYTHON`, then an
 activated environment via `CONDA_PREFIX` or `VIRTUAL_ENV`, then `python3` and
 `python` on `PATH`. A candidate is accepted only if it can import the modules
 that role's workers import, so `auto` cannot quietly select a Python without
@@ -581,19 +583,25 @@ are listed so the documentation cannot imply a capability that is not there.
 | library-ranked quantification and background subtraction | `quant.fragment_selection` and `baseline_subtract` default to off; the fixed window (`fixed_scan_halfwidth`, 3) is the default since 2026-10-04, and `fixed_window_s` stays off |
 | acquisition-specific peak caps | the shipped default is uncapped at both conversion entry points. A cap must come from a sweep on the acquisition it will be used on |
 | percolator rescoring | declared in the config enum and rejected by validation |
+| diaPASEF ion-mobility keys | `predict_frag.im_predictor`, `convert.tdf_mz_valley`/`tdf_im_valley`, `search_seed.count_fragments_once`, `extract.im_gate`, `features.im_features`, `retrace.*`, all off by default and set by `configs/examples/diapasef.json`. On one E. coli diaPASEF run (one seed) they took peptides from 8,735 to 12,624 at a 0.98% decoy fraction; each default waits for entrapment and a second acquisition (`docs/35_diapasef.md`) |
 
 Hard limits of this release:
 
-- **mzML input, plus vendor formats by external conversion.** The engine reads
-  mzML. A vendor path passed to `--mzml` is converted first: Thermo `.raw` by
-  ThermoRawFileParser (which the desktop application installs), and Bruker `.d`,
-  SCIEX `.wiff`, Agilent `.d` and Waters `.raw` by ProteoWizard `msconvert` (which
-  MuMDIA locates but does not install). `mumdia doctor` reports both converters.
-  Only Thermo is exercised end to end; the other four are wired and unverified
-  (`docs/04_convert.md`, "Vendor formats").
-- **No ion mobility.** The pipeline is 3D; the ion-mobility columns exist in the
-  artifacts and are always null. Bruker diaPASEF input is accepted but loses the
-  mobility separation the acquisition exists to produce.
+- **mzML and Bruker diaPASEF input, other vendor formats by external conversion.** The
+  engine reads mzML, and reads a Bruker diaPASEF `.d` natively (timsrust), keeping the
+  1/K0 of every peak. Any other vendor path passed to `--mzml` is converted first: Thermo
+  `.raw` by ThermoRawFileParser (which the desktop application installs), and other
+  Bruker `.d`, SCIEX `.wiff`, Agilent `.d` and Waters `.raw` by ProteoWizard `msconvert`
+  (which MuMDIA locates but does not install). `mumdia doctor` reports both converters.
+  Thermo and diaPASEF are exercised end to end; the msconvert formats are wired and
+  unverified (`docs/04_convert.md`, "Vendor formats").
+- **Ion mobility on diaPASEF only, and opt-in.** On a diaPASEF `.d` the 1/K0 calibration,
+  the 1/K0 extraction gate and features, the raw-event retrace and re-pick, and the
+  cross-run quant selectors are available behind keys that default to off;
+  `configs/examples/diapasef.json` turns them on (`docs/35_diapasef.md`). The reader takes
+  diaPASEF frames only (no synchro-, midia- or slice-PASEF), grouped runs and the
+  prescreen are refused on such input, and a Bruker `.d` on the msconvert route loses its
+  mobility separation.
 - **No wildcard or terminal variable modifications.** Both are rejected at
   peptidoform expansion.
 - **Several files are one experiment by default.** `run` with several `--mzml`, like

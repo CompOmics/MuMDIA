@@ -130,6 +130,12 @@ than a number. Both are recorded in every run's `manifest.json`.
   config hash and, on a run with at least 2,500 seed anchors, its output; on a run with fewer
   the output changes. `"seed"` restores the previous behaviour (`docs/08_rt_im_train.md`
   section 4f).
+- One version-floor check for interpreter discovery, `doctor` and the sidecar launch
+  (`Role::version_floor`, `sidecar::require_version`) (#185).
+- One extract-to-compete chain for `run` and `run-experiment` (`stages::chain`), with the
+  manifest records and the lent MS2 decode of single-run `run` (#186).
+- `CLAUDE.md` corrected: `retain_top_peaks` writes an unscored sidecar and
+  `promote_top_peaks` writes scored rows (#187).
 
 ### Added
 
@@ -160,6 +166,66 @@ than a number. Both are recorded in every run's `manifest.json`.
   cache on, about 2x that run with it off (`docs/08_rt_im_train.md` section 4f). The default
   is omitted from the canonical configuration, so existing config
   hashes and every default output are unchanged.
+- **diaPASEF (timsTOF) support.** Native diaPASEF input with ion mobility, ported in a
+  series of pull requests from the IM branch (PR #140, rodvrees) onto main's mechanisms; `docs/35_diapasef.md` is the guide. No
+  existing default changes and no existing key gains a new value. Every new key is off by
+  default and omitted from the canonical configuration at its default, so the config hash of
+  every existing configuration is unchanged, and a 3D (mzML) run writes the same artifacts,
+  reports and manifest entries byte for byte. Every 4D column and artifact version is written
+  only when the spectra carry 1/K0. `configs/examples/diapasef.json` turns the TIMS options on.
+  Measured on one E. coli diaPASEF run (timsTOF Ultra 2, 15 min, 50 ng, FASTA library, strict
+  `nn_torch`, one seed, decoy fraction 0.98% in every arm): 8,735 peptides at 1% with the
+  native reader alone, 12,624 with every step below through the re-pick.
+- **Native diaPASEF reader and window identity on (m/z, 1/K0)** (#188). A Bruker `.d` with
+  diaPASEF frames (`MsMsType` 9, no 8, TDF compression 2) is read natively through timsrust
+  0.4.2 and keeps the 1/K0 of every peak; every other Bruker `.d` keeps msconvert, and only
+  those are warned about discarded ion mobility. Spectra and isolation windows are v2 on such
+  input (`im` per peak, the slot's 1/K0 bounds), reports record `params.reader = "timsrust"`,
+  the `convert.tdf_*` centroiding keys are new (valley fractions 0), and scans are grouped by
+  `IsolationWindow::key()`, m/z and 1/K0 bounds. Grouped runs and the prescreen are refused on
+  diaPASEF input. `peak-census` and the desktop application read a `.d` without msconvert.
+  On the E. coli run the IM branch measured 8:45 end to end natively against 45:30 for the
+  msconvert route; on main the native run takes 7:55.
+- **Library and calibration 1/K0** (#189). `predict_frag.im_predictor` (`none` | `im2deep` |
+  `auto`) with `scripts/im2deep_worker.py` (IM2Deep >= 2.0.0, `MUMDIA_PYTHON_IM2DEEP`,
+  `Role::version_floor`), a nullable `predicted_im` (`fragment_library_precursors` v2 only
+  when a library has 1/K0; the importer maps `IM`/`IonMobility`), the seed's `observed_im`
+  (`seed_psms` v2), `search_seed.count_fragments_once`, and a per-charge linear 1/K0
+  calibration in CCS space with a held-out `w_im` in `run_windows` and `cal.json`.
+  `scripts/_torch_threads.py` is the one torch thread policy. With the valley splits at 0.5:
+  10,544 peptides (+20.7%).
+- **Extraction and features with 1/K0** (#190). `extract.im_gate` (`off` | `fragments` |
+  `auto`), `psms_extracted` v4 evidence (`apex_im`, `apex_im_mad`, `ms1_apex_im`,
+  `im_pred_cal`), chromatograms v3/v4 with per-point 1/K0, the `ion_mobility` feature family
+  behind `features.im_features` (`off` | `on` | `auto`), `search_seed.frag_tol_mad_k`,
+  `rescore.shadow_im_tolerance`, and row groups encoded in flight on the codec pool. Gate and
+  family: 11,072 peptides (+5.0%).
+- **Retrace** (#191). `retrace.enabled` rebuilds every fragment and MS1 trace point from the
+  raw timsTOF events after extract, and `retrace.repick` chooses the apex again in retention
+  time and 1/K0 among the `retain_top_peaks` peaks; one in-place `psms_extracted` patch,
+  `retrace.apex_features` (`imc_ref_w`), `mumdia retrace`, one shared leave-one-out
+  reference-correlation kernel and one `masscal.json` reader. Retrace 11,688 (+5.6%), re-pick
+  12,624 (+8.0%) at an 18.7-18.8 GB peak.
+- **RT anchor guards and the second pass on diaPASEF** (#192). `rt_im_train.anchor_x_filter`
+  (Q1/Q3 +/- 3 IQR on the anchors' predicted iRT, off) and a multi-head output-range guard in
+  `deeplc_finetune.py` (a no-op when nothing is out of range). The second pass gains a
+  consensus 1/K0, a 1/K0 window floor from each run's first-pass `w_im`, a quantification
+  trace pad and diagnostics on runs with 1/K0, and is no longer refused on diaPASEF input.
+- **Cross-run quantification** (#193). `quant.fragment_selection = cross_run`,
+  `quant.baseline_source` (`run` | `experiment`) and `quant.fixed_scan_halfwidth_scale` switch
+  on a two-pass cross-run step in `run-experiment` (`fragment_quant` v5 only under the export,
+  `quant --export-cross-run`, `quant --cross-run-from`). Instrument-agnostic code, measured on
+  HYE diaPASEF only (docs/12).
+- **Documentation, recipe and bench** (this change). `configs/examples/diapasef.json` (also
+  checked by `shipped_configs_parse`, which now finds the repository's configs; it had
+  resolved one directory short and checked none), `docs/35_diapasef.md` completed (data
+  model, measured ladder, closed levers, loss diagnosis, open arms, limits), and
+  `bench/tims/` (`tims_loss.py`, `tims_compare.py`, `tims_im_check.py`,
+  `tims_centroid_pairs.py`, against a neutral `--reference` table),
+  `bench/feature_selection/fs_univariate.py` and `fs_loss_evidence.py` (`rank_auc` in
+  `fs_lib.py`, no scikit-learn), and `bench/make_entrapment_fasta.py`.
+  `env/mumdia-peptdeep.yml` pins `pyarrow<20`: peptdeep 1.5.1 requires NumPy 1.x, which
+  pyarrow 26 refuses at import.
 
 ## [0.6.0] - 2026-10-11
 

@@ -1,0 +1,54 @@
+{
+  "convert": {
+    "tdf_mz_valley": 0.5,
+    "tdf_im_valley": 0.5
+  },
+  "features": {
+    "set": "extended",
+    "im_features": "on"
+  },
+  "search_seed": {
+    "count_fragments_once": true
+  },
+  "rt_im_train": {
+    "rt_window_multiplier": 1.0
+  },
+  "extract": {
+    "apex_rt_prior_s": 120.0,
+    "gate_min_score": 0.6,
+    "im_gate": "fragments",
+    "retain_top_peaks": 5
+  },
+  "retrace": {
+    "enabled": true,
+    "repick": true
+  },
+  "predict_frag": {
+    "predictor": "peptdeep",
+    "rt_predictor": "deeplc",
+    "im_predictor": "im2deep",
+    "peptdeep_model": "generic",
+    "peptdeep_nce": 35.0,
+    "peptdeep_instrument": "timsTOF",
+    "top_n_fragments": 12,
+    "peptdeep_python": "auto",
+    "deeplc_python": "auto",
+    "im2deep_python": "auto",
+    "sidecar_script_dir": "scripts"
+  },
+  "rescore": {
+    "classifier": "nn_torch",
+    "python": "auto",
+    "strict": true
+  },
+  "mbr": {
+    "strategy": "second_pass"
+  },
+  "quant": {
+    "fixed_scan_halfwidth": 4,
+    "interference_envelope": true,
+    "fragment_selection": "cross_run",
+    "baseline_subtract": true,
+    "baseline_source": "experiment"
+  }
+}

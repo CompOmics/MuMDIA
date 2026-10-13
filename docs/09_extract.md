@@ -788,7 +788,10 @@ stay ungated on 4D data as well (both off by default). The `window_mean` gate's 
 spectrum is built from the hit groups, which the 1/K0 gate filters, so it reads gated
 evidence with no further change; its scan grid stays m/z-keyed. The isolated gate
 effect was measured only on E. coli (+5.7%, three seeds); promoting the default to
-`auto` needs a paired gate-on/gate-off entrapment arm and HYE diaPASEF seeds.
+`auto` needs a paired gate-on/gate-off entrapment arm and HYE diaPASEF seeds. On main the
+gate and the ion-mobility feature family together gave +5.0% on the same run (one seed,
+docs/35 section 11). The diaPASEF recipe (`configs/examples/diapasef.json`) sets
+`im_gate = fragments`.
 
 **Evidence** (psms_extracted v4), computed per accepted row at the row's own apex, so a
 promoted alternative peak carries its own (`im_at`). The apex scan is the one the demix
@@ -1033,7 +1036,7 @@ here for one index.
 | knob | extra columns / artifact | validation status |
 |---|---|---|
 | `extract.retain_top_peaks` (`config.rs:635`, default 1) | `<out_psms>.peaks.parquet` sidecar, unscored, written only when K>1 (`extract.rs:2544`); no PSM columns | ID loop not closed (sidecar peaks are unscored); gate pending |
-| `extract.promote_top_peaks` (`config.rs:645`, default 1) | extra `psms_extracted` rows with `peak_rank >= 1` (`extract.rs:2297`); no new columns | **not schema-neutral in rows**: changes the scored population and therefore FDR; gate pending |
+| `extract.promote_top_peaks` (`config.rs:645`, default 1) | extra `psms_extracted` rows with `peak_rank >= 1` (`extract.rs:2297`); no new columns | **not schema-neutral in rows**: changes the scored population and therefore FDR; on diaPASEF (IM branch, seed 0) K = 2 lost 5.7% and K = 3 5.9%, and `retrace.repick` is the diaPASEF path (docs/35 section 12); gate pending |
 | `extract.emit_candidate_audit` (`config.rs:658`) | none in `extract.rs` (unused there); in `run` it gates the `audit` stage -> `candidate_audit.parquet` (`run.rs:428`) | diagnostic; no ID effect |
 | `extract.emit_gate_diagnostics` (`config.rs:673`) | 4 F32 cols `gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy` (`extract.rs:2511`) | diagnostic; no ID effect |
 | `extract.apex_evidence_rank` (`config.rs:667`) | none; changes the apex-selection score (`extract.rs:1890`) | **now the default**, promoted on correctness grounds rather than a count (docs/25 section 2): the legacy score cannot distinguish "no signature fragment observed anywhere" from "the earliest qualifying scan is the apex" |
@@ -1043,8 +1046,9 @@ here for one index.
 | `extract.emit_contested_features` (`config.rs:611`) | 2 F64 cols `contested_count_frac`, `apportioned_frac` (`extract.rs:2505`); forces the two-pass path (`extract.rs:1443`) | not measured; gate pending |
 | `extract.emit_demix_features` (`config.rs:592`) | 5 F32 cols `deconv_explained_frac`, `deconv_active`, `deconv_share`, `deconv_max_collinearity`, `shadow_kept_frac` (`extract.rs:2517`) | not measured; gate pending |
 | `extract.peak_claim` = `CoelutionMultiCue` / `CoelutionDemix` / `CoelutionShadow` (`config.rs:132`) | none; MultiCue is non-destructive unless `claim_cues.reassign`, the other two always rewrite extracted intensity | not measured; gate pending |
-| `retrace.enabled` (default false, diaPASEF only) | none; rewrites the chromatogram values from the raw `.d` and patches the `psms_extracted` apex scalars (section 9) | IM branch: +5.9% peptides E. coli (3 seeds), entrapment at an unchanged FDP, HYE +15.0% (seed 0); gate pending on main (docs/35 section 6) |
-| `retrace.repick` (default false) | none; patches `apex_rt` / `apex_im` | IM branch: +7.4% peptides E. coli (3 seeds), entrapment +5.4% real peptides at an FDP of 0.37-0.47%, HYE +8.4% (seed 0); gate pending on main |
+| `retrace.enabled` (default false, diaPASEF only) | none; rewrites the chromatogram values from the raw `.d` and patches the `psms_extracted` apex scalars (section 9) | IM branch: +5.9% peptides E. coli (3 seeds), entrapment at an unchanged FDP, HYE +15.0% (seed 0); main: +5.6% E. coli (one seed, docs/35 section 11); gate pending on main (docs/35 section 6) |
+| `retrace.repick` (default false) | none; patches `apex_rt` / `apex_im` | IM branch: +7.4% peptides E. coli (3 seeds), entrapment +5.4% real peptides at an FDP of 0.37-0.47%, HYE +8.4% (seed 0); main: +8.0% E. coli (one seed); gate pending on main |
+| `extract.im_gate` (default `off`, diaPASEF only) | none; fragment peaks outside the 1/K0 window are not matched (section 8) | IM branch: +5.7% E. coli (3 seeds); main, with `features.im_features`: +5.0% (one seed); gate: paired entrapment and HYE seeds (docs/35 arm T12) |
 | `retrace.apex_features` (default false) | 1 F64 col `imc_ref_w` in `psms_extracted`; the tenth ion-mobility feature | IM branch: +1.3% alone, about 2.7% FDP on the added peptides; gate pending |
 | `compete.mode` (`CompetitionMode`, `config.rs:840`, default `winner_take_all`) | retains more rows in `competed`; optional `<out>.compete_audit.parquet` via `emit_competition_audit` (`config.rs:850`) | not measured; gate pending |
 

@@ -373,6 +373,28 @@ single library-based pass on a library derived from DIA-NN. Protein-group parity
 alongside a peptide and precursor gap is consistent with MuMDIA being
 high-precision and recall-limited on faint precursors (finding A9).
 
+### A13. diaPASEF: decisions carried from the ion-mobility work
+
+docs/35_diapasef.md is the full record; these are the decisions that set its shape.
+
+- **Native reader over msconvert.** A diaPASEF `.d` is read natively (timsrust, per-peak
+  1/K0 kept) and every other Bruker `.d` keeps msconvert. On the E. coli Ultra 2 run the
+  msconvert route took 45:30 against 8:45, and on the six-run HYE diaPASEF set it found 0
+  seed anchors and then ran out of memory, because collapsing the mobility dimension merges
+  the ions a slot separates.
+- **Mobility gap of 30 scans.** The native centroiding splits a trace where two consecutive
+  points are more than `convert.tdf_im_gap_scans` 30 scans apart, with
+  `tdf_min_points` 2 (1 cost 17% of peptides). Both rest on a peak census of one run and the
+  seed plateau, so they are provisional (docs/35 section 2).
+- **The 1/K0 width and peak-shape features (P7) are closed.** -0.9% over three seeds, -0.1%
+  on a re-test; not ported (docs/35 section 12).
+- **Fragment-model fine-tuning is open, not adopted.** +3.4% per run on HYE diaPASEF without
+  cross-fitting against -1.5% cross-fitted on E. coli; a cross-fitted HYE run decides
+  (docs/35 section 14).
+- **Measured on main** (E. coli diaPASEF, one seed): 8,735 peptides with the native reader,
+  12,624 with the 1/K0 calibration, gate, features, retrace and re-pick, at a decoy fraction
+  of 0.98% in every arm (docs/35 section 11). Every TIMS key is off by default.
+
 ---
 
 ## Part B: Contracts
@@ -548,6 +570,7 @@ ProteoBench precursor matrix, `run_psm_q` for cross-run quantification,
 5. **Per-run figure-of-merit tolerance-optimization loop** (set each tolerance
    from a high percentile of the 1-percent-FDR error distribution and iterate to a
    stable precursor count).
-6. **Beyond-MVP:** learned protein-group FDR plus parsimony, native vendor
-   readers (Thermo `.raw`, Bruker `.d`/TDF), and ion mobility / diaPASEF (full 4D;
-   the data model is already IM-nullable throughout).
+6. **Beyond-MVP:** learned protein-group FDR plus parsimony, and a native Thermo
+   `.raw` reader. Bruker diaPASEF TDF is read natively, with 1/K0 used in calibration,
+   extraction, features, retrace, the second pass and quantification (finding A13,
+   docs/35_diapasef.md); its open arms are listed there.

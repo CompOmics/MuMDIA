@@ -31,12 +31,19 @@ policy for tuning and validation.
   - `mumdia-core`: typed config, schemas, manifest, masses/constants.
   - `mumdia-io`: Arrow/Parquet table layer, hashes, JSON, artifact reports.
   - `mumdia`: CLI/library, fragment index, FDR/rescoring, and stages.
-- `scripts/`: eight engine-invoked Python workers plus five imported-library
-  helpers (thirteen scripts), and `_lib_io.py`, the shared writer the helpers use so
-  they cannot emit a parquet the engine rejects. Includes `augment_library.py`, which adds the
-  tryptic FASTA peptides an imported library is missing. Sidecars use positional
-  file contracts.
-- `docs/`: tracked developer guide (`01` through `21`); start at
+- `scripts/`: nineteen scripts and three shared modules. Nine workers are launched by
+  the engine (`ms2pip_worker.py`, `peptdeep_worker.py`, `deeplc_worker.py`,
+  `deeplc_finetune.py`, `im2deep_worker.py`, `mokapot_worker.py`, `nn_rescore_worker.py`,
+  `entrapment_worker.py`, `mbr_worker.py`); five are imported-library helpers
+  (`import_diann_lib.py`, `make_reverse_decoys.py`, `predict_decoys.py`,
+  `make_shift_decoys.py`, `augment_library.py`, which adds the tryptic FASTA peptides an
+  imported library is missing); five are library-scale recipes (`sort_fragments.py`,
+  `mz_range_survivors.py`, `assemble_survivors.py`, `shard_parquet.py`,
+  `mh_shard_predict.py`). The shared modules are `_lib_io.py`, the writer the helpers use so
+  they cannot emit a parquet the engine rejects, `_torch_threads.py`, the torch CPU thread
+  policy, and `_unimod.py`, the modification catalogue. Sidecars use positional file
+  contracts (`docs/13_sidecars.md`).
+- `docs/`: tracked developer guide (`01` through `35`); start at
   `docs/README.md`.
 - `env/`, `docker/`, `Dockerfile`: sidecar environments and deployable configs.
 - `lib/`, `fasta/`, `mzml_files/`: large local inputs, intentionally untracked.
@@ -389,6 +396,38 @@ failure side in `docs/17_troubleshooting.md`:
 NnTorch seeds NumPy and PyTorch, but training kernels are not guaranteed
 bit-for-bit deterministic; `MUMDIA_NN_SEEDS > 1` is an explicit ensemble. DeepLC
 fine-tuning also is not guaranteed deterministic.
+
+## diaPASEF (timsTOF)
+
+`docs/35_diapasef.md` is the guide; these are the rules.
+
+- A Bruker `.d` with diaPASEF frames is read natively (timsrust, 1/K0 per peak); every
+  other `.d` goes to msconvert as a 3D run. The one 4D predicate is "the spectra carry
+  per-peak 1/K0" (`instrument`, `params.reader = "timsrust"`), never the instrument name.
+- Every TIMS key is off by default: `convert.tdf_mz_valley`/`tdf_im_valley`,
+  `predict_frag.im_predictor`, `search_seed.count_fragments_once`, `frag_tol_mad_k`,
+  `extract.im_gate`, `features.im_features`, `retrace.*`, `rt_im_train.anchor_x_filter`,
+  `rescore.shadow_im_tolerance` and the cross-run quant selectors. Promote one only in its
+  own change, with entrapment and a second acquisition (docs/35 section 14).
+- `configs/examples/diapasef.json` is the recipe. Start a diaPASEF search from it and run
+  `mumdia doctor --config` on it first (AlphaPeptDeep, DeepLC, IM2Deep, `nn_torch`).
+- Never carry the Orbitrap `rt_window_multiplier` 1.5 to diaPASEF: 1.5 lost 1.8% and 2.0
+  lost 2.9% of peptides there. The recipe keeps 1.0.
+- 3D byte identity is a hard rule: with no 1/K0 in the spectra every artifact, report,
+  manifest entry and the config hash stay byte-identical. New keys are skipped in
+  `canonical_json` at their defaults; a 4D column or version is written only through an
+  `artifact::X(has_im)` selector; `ci/check_smoke.py`'s 3D expectations do not change.
+- Measured on main (E. coli diaPASEF, one seed, decoy fraction 0.98%): native reader
+  8,735 peptides; + valley splits, count-once, IM2Deep and calibration 10,544; + gate and
+  features 11,072; + retrace 11,688; + re-pick 12,624 (docs/35 section 11).
+- Refused on diaPASEF input: grouped runs (`groups.window_groups > 1`), the prescreen,
+  retrace on spectra not read natively from a `.d`; in any configuration, retrace with
+  `promote_top_peaks > 1` or grouped runs, and `retrace.repick` without
+  `retain_top_peaks >= 2` or with `apex_refine_intensity`.
+- Reader scope: `MsMsType` 9 only (no synchro-, midia- or slice-PASEF), the first
+  `TimsCalibration` row, `intensity_correction_factor` ignored.
+- The real-file reader test is `MUMDIA_BENCH_TDF=<run.d> cargo test -p mumdia --
+  --ignored tdf_real`; there is no `.d` fixture in CI (docs/14).
 
 ## FDR and sidecar rules
 

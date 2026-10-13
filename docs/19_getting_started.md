@@ -146,25 +146,31 @@ mumdia doctor --config configs/examples/diann-library.json
 
 ## 2. Converting vendor files to centroided mzML
 
-The engine itself reads only mzML, through the `mzdata` crate built with the
-`mzml` feature only (`docs/04_convert.md`; `CLAUDE.md` build notes). `convert`
-(Stage 0) is the sole point that touches a vendor format.
+The engine reads mzML, through the `mzdata` crate built with the `mzml` feature only
+(`docs/04_convert.md`; `CLAUDE.md` build notes), and Bruker diaPASEF `.d` directories
+natively (below). `convert` (Stage 0) is the sole point that touches a vendor format.
 
 **Thermo `.raw` needs no manual step.** Pass it to `--mzml` and the engine converts
 it to mzML first with ThermoRawFileParser, reusing the result on later runs. It
 needs the converter installed once; `mumdia doctor` says whether it is, and
 `convert.thermo_raw_parser` or `MUMDIA_THERMO_PARSER` points at it.
 
-Bruker `.d`, SCIEX `.wiff`, Agilent `.d` and Waters `.raw` are also accepted, through
+**Bruker diaPASEF `.d` needs no conversion either.** Pass the `.d` directory to `--mzml`;
+`convert` reads it natively (timsrust) and keeps the 1/K0 of every peak. No msconvert is
+needed. The ion-mobility settings are off by default: start from
+`configs/examples/diapasef.json` and read `docs/35_diapasef.md` section 9.
+
+Other Bruker `.d` (BAF, ddaPASEF, PRM, older TDF compression), SCIEX `.wiff`, Agilent `.d`
+and Waters `.raw` are also accepted, through
 ProteoWizard `msconvert`, which MuMDIA locates but does not install: its vendor
 readers carry each instrument maker's own licence terms. **These four are wired but
 unverified** -- no such file has been converted by this code -- so converting them
 yourself with `msconvert` first is the safer route today, and remains valid for
 Thermo too. See `docs/04_convert.md`, "Vendor formats".
 
-If your data is Bruker diaPASEF, read the ion-mobility warning in that section
-before drawing conclusions from the identification count: this pipeline is 3D and
-discards the mobility dimension.
+A Bruker `.d` that is not diaPASEF goes through msconvert as a 3D run, which discards
+the mobility dimension; read the ion-mobility warning in that section before drawing
+conclusions from its identification count.
 
 Produce centroided mzML using the vendor peak-picking filter:
 

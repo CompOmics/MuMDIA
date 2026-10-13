@@ -24,6 +24,34 @@ import pyarrow.parquet as pq
 
 NON_FEATURE = {"SpecId", "Label", "ScanNr", "ExpMass", "CalcMass", "Peptide", "Proteins"}
 
+# The metadata columns of a features / competed parquet, copied from `NON_FEATURE_COLUMNS` in
+# rust/mumdia/crates/mumdia/src/stages/features.rs. Every other column is a feature. Used only
+# when the `.schema.json` companion is missing, as the engine does.
+FEATURE_TABLE_METADATA = (
+    "candidate_id", "peptidoform_id", "base_peptide_id", "peptidoform", "protein", "label",
+    "precursor_mz", "prelim_score", "apex_rt", "elution_lo", "elution_hi", "peak_rank",
+    "source", "unique_evidence",
+)
+
+
+def read_feature_columns(features_path: str) -> list[str]:
+    """The ordered feature columns of a features.parquet (or psms_competed.parquet).
+
+    Read from the `<features_path>.schema.json` companion (`feature_columns`), which the
+    features and compete stages write beside the table. Without the companion, the list is
+    every parquet column that is not in FEATURE_TABLE_METADATA, in file order, which is how
+    the engine reconstructs it (`FeatureSchema::read`).
+    """
+    import json
+
+    companion = features_path + ".schema.json"
+    if os.path.exists(companion):
+        with open(companion, encoding="utf-8") as fh:
+            return list(json.load(fh)["feature_columns"])
+    print(f"warning: {companion} not found; feature columns taken from the parquet schema", flush=True)
+    meta = set(FEATURE_TABLE_METADATA)
+    return [c for c in pq.read_schema(features_path).names if c not in meta]
+
 # The configuration the engine ships: `RescoreConfig` defaults (folds 3, num_iter 10,
 # train_fdr 0.01) are passed to the worker as MUMDIA_NN_FOLDS / ITERS / TRAIN_FDR
 # (rescore.rs), overriding the worker's own docstring default of 5 iterations. The measured
@@ -230,6 +258,39 @@ def n_targets_at_col(col, tgt, fdr, topk=0):
             return cnt
     order = np.argsort(-col, kind="stable")
     return _count_at_fdr_sorted(tgt[order], fdr)[0]
+
+
+def rank_auc(pos, neg) -> float:
+    """Mann-Whitney rank AUC: P(pos > neg) + P(pos == neg) / 2.
+
+    `pos` and `neg` are 1-D arrays (or Series) of one feature in two populations. NaN values
+    are dropped from each side first. The two sides are pooled and ranked with average ranks
+    for ties, and the AUC is the Mann-Whitney U of `pos` divided by len(pos) * len(neg).
+    0.5 means no separation; above 0.5 means higher values are more `pos`-like; below 0.5
+    means lower values are. A constant feature gives exactly 0.5. Returns NaN when either
+    side is empty after the NaN drop. +-inf are ordinary values here: they rank at the ends.
+
+    This is the same number as a ROC AUC of `pos` (label 1) against `neg` (label 0), so it
+    needs no scikit-learn. The sort is stable and the sums are float64, so the result is
+    deterministic.
+    """
+    x = np.asarray(pos, dtype=np.float64).ravel()
+    y = np.asarray(neg, dtype=np.float64).ravel()
+    x = x[~np.isnan(x)]
+    y = y[~np.isnan(y)]
+    n1, n0 = len(x), len(y)
+    if n1 == 0 or n0 == 0:
+        return float("nan")
+    v = np.concatenate([x, y])
+    order = np.argsort(v, kind="stable")
+    sv = v[order]
+    # Tie groups of the sorted values: first position and size of each. The average of the
+    # 1-based ranks start+1 .. start+count is start + (count + 1) / 2.
+    _, start, count = np.unique(sv, return_index=True, return_counts=True)
+    ranks = np.empty(len(v), dtype=np.float64)
+    ranks[order] = np.repeat(start + (count + 1) / 2.0, count)
+    u = ranks[:n1].sum() - n1 * (n1 + 1) / 2.0
+    return float(u / (float(n1) * float(n0)))
 
 
 def n_targets_at_many(X, is_target, fdr, topk=0):

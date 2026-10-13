@@ -706,6 +706,16 @@ so the struct holds exactly these fields and unknown keys are rejected):
 | `sidecar_script_dir` | `"scripts"` | directory searched by `resolve_script` for the worker scripts |
 | `library_cache` | `"auto"` | where `run` and `run-experiment` store a FASTA-built library and reuse it on a later run with the same key: `"auto"` is `libraries/` under the engine's cache root (docs/14, "The engine's caches"), a path is that directory, `null` is off (see "Reusing a FASTA-built library" below) |
 
+**Predictor settings for diaPASEF.** No predictor default depends on the instrument. The
+diaPASEF recipe (`configs/examples/diapasef.json`, docs/35 section 9) sets AlphaPeptDeep
+(`predictor = peptdeep`, `peptdeep_model = generic`, `peptdeep_instrument = timsTOF`,
+`peptdeep_nce = 35`, `top_n_fragments = 12`) and IM2Deep (`im_predictor = im2deep`). A
+single-charge MS2PIP model, `timsTOF2024` among them, needs `charge2_from_precursor_charge`
+above the highest precursor charge (99), so that no charge-2 fragment falls back to the
+native heuristic described under "intensity assignment"; on the IM branch's diaPASEF
+benchmark that was +2.7% peptides against `HCDch2` with charge-2 fragments (three seeds).
+The AlphaPeptDeep recipe needs no such setting.
+
 ### Reusing a FASTA-built library
 
 A FASTA-mode `run` builds its library on every invocation, and one `run` per file is

@@ -4690,11 +4690,18 @@ mod tests {
         //
         // Only TRACKED configs are listed. Machine- or collaborator-specific configs stay
         // untracked (see .gitignore), so they are checked by `mumdia doctor`, not here.
-        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+        // CARGO_MANIFEST_DIR is rust/mumdia/crates/mumdia-core, four levels below the
+        // repository root. The root was once three levels up, which resolved to `rust/`,
+        // found no config at all and passed vacuously through the `continue` below.
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../..");
+        let examples_present = std::path::Path::new(&format!("{root}/configs/examples")).is_dir();
+        let mut checked = 0usize;
         for name in [
             "configs/examples/native.json",
             "configs/examples/fasta-sidecars.json",
             "configs/examples/diann-library.json",
+            "configs/examples/fasta-peptdeep.json",
+            "configs/examples/diapasef.json",
             "configs/examples/prescreen-balanced.json",
             "configs/examples/prescreen-oxidation.json",
             "configs/examples/prescreen-components.json",
@@ -4709,6 +4716,11 @@ mod tests {
                 .unwrap_or_else(|e| panic!("shipped config {name} does not parse: {e}"));
             c.validate()
                 .unwrap_or_else(|e| panic!("shipped config {name} does not validate: {e}"));
+            checked += 1;
+        }
+        // In a full checkout every listed config must have been read.
+        if examples_present {
+            assert_eq!(checked, 10, "a listed shipped config was not found");
         }
     }
 
