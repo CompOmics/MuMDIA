@@ -42,6 +42,10 @@ pub struct Ms1Scan {
     /// `Vec<f64>` copy held, at two-thirds of the footprint.
     pub mz: Vec<f32>,
     pub intensity: Vec<f32>,
+    /// Per-peak 1/K0 (V s cm^-2), parallel to `mz`, for spectra that carry ion mobility
+    /// (spectra v2, the native diaPASEF reader). `None` on 3D spectra, where nothing is
+    /// decoded or allocated for it.
+    pub im: Option<Vec<f32>>,
 }
 
 /// The named peak-list column of one batch as a borrowed view ([`ListF32`]), whichever
@@ -238,6 +242,38 @@ pub fn nearest_peak(peaks: &[Peak], target: f64, tol_ppm: f64) -> Option<usize> 
     best
 }
 
+/// Index of the peak of the MS1 scan `scan` within `tol_ppm` of `target` whose 1/K0 lies
+/// nearest `near`, or the most intense such peak when `near` is `None`. `None` on a scan
+/// without per-peak 1/K0 or without an in-tolerance peak. A tie keeps the lower index: only
+/// a strictly smaller distance, or a strictly larger intensity, replaces the best.
+///
+/// The one rule for picking a precursor's MS1 peak on 4D data, where the most intense peak
+/// within a few ppm is often another ion in another mobility band: extract's
+/// `ms1_apex_im` (nearest the apex 1/K0) and the MS1 mass calibration (`ms1cal`, nearest
+/// the seed's `observed_im`). The m/z are widened from f32 once, which is exact.
+pub fn ms1_peak_near(
+    scan: &Ms1Scan,
+    target: f64,
+    tol_ppm: f64,
+    near: Option<f64>,
+) -> Option<usize> {
+    let im = scan.im.as_deref()?;
+    let (lo, hi) = mumdia_core::constants::ppm_bounds(target, tol_ppm);
+    let mut i = scan.mz.partition_point(|&m| (m as f64) < lo);
+    let mut best: Option<(f64, usize)> = None; // (cost, peak index)
+    while i < scan.mz.len() && (scan.mz[i] as f64) <= hi {
+        let cost = match near {
+            Some(n) => (im[i] as f64 - n).abs(),
+            None => -(scan.intensity[i] as f64),
+        };
+        if best.is_none_or(|(bc, _)| cost < bc) {
+            best = Some((cost, i));
+        }
+        i += 1;
+    }
+    best.map(|b| b.1)
+}
+
 /// Load MS1 scans (spectra_ms1.parquet), RT-sorted. Decoded in parallel parts exactly as
 /// [`load_ms2`] is.
 pub fn load_ms1(path: &str) -> Result<Vec<Ms1Scan>> {
@@ -258,14 +294,20 @@ pub fn load_ms1(path: &str) -> Result<Vec<Ms1Scan>> {
         .iter()
         .map(|s| std::mem::size_of_val(s.intensity.as_slice()))
         .sum();
-    crate::memlog::report(
-        "ms1 scans",
-        &[
-            ("mz", mz_bytes),
-            ("intensity", int_bytes),
-            ("scan_spine", std::mem::size_of_val(out.as_slice())),
-        ],
-    );
+    let im_bytes: usize = out
+        .iter()
+        .filter_map(|s| s.im.as_deref())
+        .map(std::mem::size_of_val)
+        .sum();
+    let mut parts_mem = vec![
+        ("mz", mz_bytes),
+        ("intensity", int_bytes),
+        ("scan_spine", std::mem::size_of_val(out.as_slice())),
+    ];
+    if im_bytes > 0 {
+        parts_mem.push(("peak_im", im_bytes));
+    }
+    crate::memlog::report("ms1 scans", &parts_mem);
     tracing::info!(
         ms1 = path,
         scans = out.len(),
@@ -283,11 +325,24 @@ fn decode_ms1(t: &TableFile) -> Result<Vec<Ms1Scan>> {
     let rt = t.f64("rt_seconds")?;
     // mz and intensity are copied straight out of each row's slice of the batch's values
     // (no widening, no intermediate Vec<Vec<f32>>).
+    // The per-peak 1/K0 list of v2, decoded only when the artifact has it, so a 3D run
+    // allocates nothing for it and every scan's `im` is `None`.
+    let has_im = t.has_column("im");
+    let lists: &[&str] = if has_im {
+        &["mz", "intensity", "im"]
+    } else {
+        &["mz", "intensity"]
+    };
     let mut out = Vec::with_capacity(t.nrows);
     let mut i = 0usize;
-    t.for_each_batch(Some(&["mz", "intensity"]), SCAN_BATCH_ROWS, |b| {
+    t.for_each_batch(Some(lists), SCAN_BATCH_ROWS, |b| {
         let mza = list_col(b, "mz")?;
         let ina = list_col(b, "intensity")?;
+        let ima = if has_im {
+            Some(list_col(b, "im")?)
+        } else {
+            None
+        };
         for k in 0..mza.len() {
             // Truncate to the shorter list, as `load_ms2` does. The two list columns are
             // decoded independently and either can be null, so a spectra artifact whose
@@ -301,11 +356,26 @@ fn decode_ms1(t: &TableFile) -> Result<Vec<Ms1Scan>> {
             // per column that are freed immediately.
             let (mf, iff) = (mza.row_slice(k, "mz")?, ina.row_slice(k, "intensity")?);
             let n = mf.len().min(iff.len());
+            let im = match &ima {
+                Some(a) => {
+                    let v = a.row_slice(k, "im")?;
+                    if v.len() < n {
+                        return Err(anyhow!(
+                            "MS1 scan {}: {} 1/K0 values for {n} peaks",
+                            scan_index[i],
+                            v.len()
+                        ));
+                    }
+                    Some(v[..n].to_vec())
+                }
+                None => None,
+            };
             out.push(Ms1Scan {
                 scan_index: scan_index[i],
                 rt_seconds: rt[i],
                 mz: mf[..n].to_vec(),
                 intensity: iff[..n].to_vec(),
+                im,
             });
             i += 1;
         }
@@ -439,6 +509,7 @@ mod serial {
                     rt_seconds: rt[i],
                     mz: mf.map(|m| m.values()[..n].to_vec()).unwrap_or_default(),
                     intensity: iff.map(|x| x.values()[..n].to_vec()).unwrap_or_default(),
+                    im: None,
                 });
                 i += 1;
             }
@@ -452,6 +523,27 @@ mod serial {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ms1_apex_im`'s rule: the in-tolerance peak nearest the given 1/K0, the most intense
+    /// without one, ties to the lower index, and nothing on a scan without 1/K0.
+    #[test]
+    fn ms1_peak_near_picks_the_peak_nearest_the_fragment_mobility() {
+        let s = Ms1Scan {
+            scan_index: 0,
+            rt_seconds: 0.0,
+            mz: vec![500.0, 500.0005, 500.001, 600.0],
+            intensity: vec![1.0, 2.0, 4.0, 9.0],
+            im: Some(vec![0.8, 1.0, 1.2, 0.95]),
+        };
+        let near = |n| ms1_peak_near(&s, 500.0005, 10.0, n);
+        assert_eq!(near(Some(0.97)), Some(1));
+        assert_eq!(near(None), Some(2), "the most intense in tolerance");
+        assert_eq!(near(Some(0.6)), Some(0));
+        assert_eq!(near(Some(1.1)), Some(1), "a tie keeps the lower index");
+        assert_eq!(ms1_peak_near(&s, 700.0, 10.0, None), None);
+        let flat = Ms1Scan { im: None, ..s };
+        assert_eq!(ms1_peak_near(&flat, 500.0005, 10.0, None), None);
+    }
     use mumdia_io::table::{write_table, Col};
 
     /// A spectra table shaped like `convert`'s (LargeList peak columns), with the awkward

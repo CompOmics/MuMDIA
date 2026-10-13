@@ -190,6 +190,10 @@ pub fn run(p: RunParams) -> Result<()> {
     resolved.predict_frag.sidecar_script_dir =
         crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
     crate::python::resolve(&mut resolved)?;
+    // `features.im_features = auto` resolves on the one TIMS predicate, decided from the
+    // raw dispatch before anything is converted, as the library-build keys are. Every stage
+    // then sees `on` or `off`, and the manifest records what ran.
+    resolved.resolve_im_features(crate::instrument::input_has_im(p.mzml));
     pre.step("resolve_interpreters");
     let cfg = &resolved;
     preflight(&p, cfg)?;
@@ -843,6 +847,8 @@ pub fn run(p: RunParams) -> Result<()> {
     // all this run's rows: source 0 for every one.
     let sources = vec![0u32; competed.len()];
     let shadow_windows = vec![d("spectra/isolation_windows.parquet")];
+    // The run's extracted rows, for the shadow test's 1/K0 term (`rescore.shadow_im_tolerance`).
+    let shadow_psms = vec![psms.clone()];
     let w = rescore::run_hashed(rescore::RescoreParams {
         competed: &competed,
         sources: (competed.len() > 1).then_some(sources.as_slice()),
@@ -851,10 +857,10 @@ pub fn run(p: RunParams) -> Result<()> {
         script_dir: &cfg.predict_frag.sidecar_script_dir,
         cfg: &cfg.rescore,
         config_hash: &ch,
-        shadow: Some(crate::stages::shadow::ShadowInputs::new(
-            &lib_f,
-            &shadow_windows,
-        )),
+        shadow: Some(
+            crate::stages::shadow::ShadowInputs::new(&lib_f, &shadow_windows)
+                .with_psms_extracted(&shadow_psms),
+        ),
     })?;
     man.record(w.record(
         artifact::PSMS_SCORED.0,
@@ -1010,7 +1016,7 @@ pub fn run(p: RunParams) -> Result<()> {
         .insert("rescorer".into(), actual_rescorer_model);
     man.model_identities.insert(
         "feature_schema_id".into(),
-        features::feature_schema_id(&features::active_features(cfg.features.set)),
+        features::feature_schema_id(&features::active_features_for(&cfg.features, false)),
     );
 
     // The input hashes, taken on the background thread started at the top, and the

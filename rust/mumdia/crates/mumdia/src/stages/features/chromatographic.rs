@@ -1031,6 +1031,11 @@ mod tests {
             deconv_share: 0.0,
             deconv_max_collin: 0.0,
             deconv_shadow: 0.0,
+            apex_im: None,
+            apex_im_mad: None,
+            ms1_apex_im: None,
+            im_pred_cal: None,
+            im_traces: Vec::new(),
         }
     }
 

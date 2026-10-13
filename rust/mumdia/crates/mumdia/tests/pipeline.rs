@@ -205,6 +205,7 @@ fn run_extract(prec: &str, frag: &str, ms2: &str, win: &str, tag: &str) -> (Stri
         precursor_span: None,
         fragment_offset: None,
         rt_windows: None,
+        chrom_im: false,
         sibling_bands: 1,
         scans: None,
         ms2,
@@ -395,6 +396,7 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         fragment_offset: None,
         sibling_bands: 1,
         rt_windows: None,
+        chrom_im: false,
         scans: None,
         ms2: &ms2,
         library_precursors: &prec,
@@ -549,6 +551,7 @@ fn chromatograms_v2_leave_every_downstream_table_byte_identical() {
             precursor_span: None,
             fragment_offset: None,
             rt_windows: None,
+            chrom_im: false,
             sibling_bands: 1,
             scans: None,
             ms2: &ms2,
@@ -935,6 +938,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
             precursor_span: None,
             fragment_offset: None,
             rt_windows: None,
+            chrom_im: false,
             sibling_bands: 1,
             scans: shared,
             ms2: &ms2,
@@ -1021,6 +1025,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         precursor_span: None,
         fragment_offset: None,
         rt_windows: None,
+        chrom_im: false,
         sibling_bands: 1,
         scans: None,
         ms2: &ms2,
@@ -1050,6 +1055,7 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
         precursor_span: None,
         fragment_offset: None,
         rt_windows: None,
+        chrom_im: false,
         sibling_bands: 1,
         scans: None,
         ms2: &ms2,
@@ -1095,6 +1101,7 @@ fn extract_does_not_believe_an_empty_lent_ms1_over_a_named_one() {
             precursor_span: None,
             fragment_offset: None,
             rt_windows: None,
+            chrom_im: false,
             sibling_bands: 1,
             scans: shared,
             ms2: &ms2,
@@ -1409,6 +1416,306 @@ fn the_seed_writes_observed_im_only_for_spectra_with_ion_mobility() {
     let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
     assert_eq!(h(&s3), h(&s3o));
     assert_eq!(r3o["params"]["count_fragments_once"], true);
+}
+
+/// MS1 scans at the fixture's apex RTs: around the precursor m/z 500.0, an intense peak at
+/// 1/K0 1.30 and a weak one 1 ppm above at 0.93, with per-peak 1/K0 when `with_im`.
+fn craft_ms1_im(with_im: bool) -> String {
+    let path = tmp(if with_im {
+        "ms1_im.parquet"
+    } else {
+        "ms1_3d.parquet"
+    });
+    let n = 5usize;
+    let mut cols = vec![
+        Col::U32("scan_index".into(), (100..100 + n as u32).collect()),
+        Col::F64(
+            "rt_seconds".into(),
+            (0..n).map(|i| 101.0 + 10.0 * i as f64).collect(),
+        ),
+        Col::LargeListF32("mz".into(), vec![vec![499.0, 500.0, 500.0005, 501.0]; n]),
+        Col::LargeListF32("intensity".into(), vec![vec![10.0, 900.0, 100.0, 120.0]; n]),
+    ];
+    if with_im {
+        cols.push(Col::LargeListF32(
+            "im".into(),
+            vec![vec![0.80, 1.30, 0.93, 0.95]; n],
+        ));
+    }
+    write_table(&path, cols).unwrap();
+    path
+}
+
+/// `run_windows` of the two-candidate library with, when given, the target's 1/K0 window.
+fn craft_windows_im(im: Option<(f64, f64, f64)>) -> String {
+    let path = tmp("windows_im.parquet");
+    let (cal, lo, hi) = match im {
+        Some((c, l, h)) => (
+            vec![Some(c), None],
+            vec![Some(l), None],
+            vec![Some(h), None],
+        ),
+        None => (vec![None, None], vec![None, None], vec![None, None]),
+    };
+    write_table(
+        &path,
+        vec![
+            Col::U32("candidate_id".into(), vec![0, 1]),
+            Col::F64("rt_pred_cal".into(), vec![120.0, 120.0]),
+            Col::F64("rt_lo".into(), vec![90.0, 90.0]),
+            Col::F64("rt_hi".into(), vec![150.0, 150.0]),
+            Col::OptF64("im_pred_cal".into(), cal),
+            Col::OptF64("im_lo".into(), lo),
+            Col::OptF64("im_hi".into(), hi),
+        ],
+    )
+    .unwrap();
+    path
+}
+
+/// Extract on the 1/K0 fixtures: `(psms_extracted, chromatograms)` and their reports.
+#[allow(clippy::too_many_arguments)]
+fn extract_im(
+    prec: &str,
+    frag: &str,
+    ms2: &str,
+    ms1: &str,
+    win: &str,
+    cfg: &mumdia_core::config::ExtractConfig,
+    chrom_im: bool,
+    tag: &str,
+) -> (String, String, serde_json::Value, serde_json::Value) {
+    let psms = tmp(&format!("psms_im_{tag}.parquet"));
+    let chrom = tmp(&format!("chrom_im_{tag}.parquet"));
+    stages::extract::run(stages::extract::ExtractParams {
+        precursor_span: None,
+        fragment_offset: None,
+        rt_windows: None,
+        chrom_im,
+        sibling_bands: 1,
+        scans: None,
+        ms2,
+        library_precursors: prec,
+        library_fragments: frag,
+        run_windows: win,
+        ms1: Some(ms1),
+        mass_cal: None,
+        out_psms: &psms,
+        out_chrom: &chrom,
+        restrict_candidates: None,
+        cfg,
+        config_hash: "test",
+    })
+    .unwrap();
+    let report = |p: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(format!("{p}.report.json")).unwrap()).unwrap()
+    };
+    let (rp, rc) = (report(&psms), report(&chrom));
+    (psms, chrom, rp, rc)
+}
+
+/// Extract on spectra with per-peak 1/K0 writes psms_extracted v4 with the apex 1/K0
+/// evidence and, only while a consumer is on, chromatograms v3/v4 with the per-point 1/K0;
+/// the 1/K0 gate drops exactly the fragment outside the target's window. On the same
+/// spectra without 1/K0 (3D) every artifact is main's: psms_extracted v2 with its null
+/// `apex_im`, chromatograms v1/v2, the same bytes whatever the 1/K0 settings say, and no
+/// 1/K0 field in a report.
+#[test]
+fn extract_writes_the_1k0_evidence_only_for_spectra_with_ion_mobility() {
+    use mumdia_core::config::ImGate;
+    let (prec, frag) = craft_library();
+    let (ms2_3d, ms2_4d) = (craft_ms2_im(false), craft_ms2_im(true));
+    let (ms1_3d, ms1_4d) = (craft_ms1_im(false), craft_ms1_im(true));
+    let win_3d = craft_windows_im(None);
+    // The target's window holds its b2 (0.90) and y3 (0.92) peaks, not its y4 (1.10).
+    let win_4d = craft_windows_im(Some((0.92, 0.85, 1.0)));
+    let mut cfg = Config::default().extract;
+    cfg.apex_count_window = 1;
+    // Two of three fragments must still pass under the gate.
+    cfg.presence_min_fragments = 2;
+    cfg.presence_min_matched = 2;
+    cfg.gate_min_score = 0.0;
+    let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
+
+    // 3D: main's tables, whatever the 1/K0 settings and windows say.
+    let (p3, c3, rp3, rc3) = extract_im(&prec, &frag, &ms2_3d, &ms1_3d, &win_3d, &cfg, false, "3d");
+    assert_eq!(rp3["schema_version"], 2);
+    assert_eq!(rc3["schema_version"], 2);
+    for r in [&rp3, &rc3] {
+        assert!(r["params"].get("reader").is_none() && r["params"].get("im_gate").is_none());
+    }
+    let names3 = mumdia_io::table::column_names(&p3).unwrap();
+    assert!(names3.iter().any(|c| c == "apex_im"));
+    for c in ["apex_im_mad", "ms1_apex_im", "im_pred_cal"] {
+        assert!(!names3.iter().any(|x| x == c), "{c} on a 3D table");
+    }
+    assert!(TableFile::open(&p3)
+        .unwrap()
+        .opt_f64("apex_im")
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+    assert_eq!(
+        stages::extract::psms_schema(&p3).unwrap(),
+        ("psms_extracted", 2)
+    );
+    assert_eq!(
+        mumdia::chromatograms::recorded_schema(&c3).unwrap(),
+        ("chromatograms", 2)
+    );
+    let mut gated = cfg.clone();
+    gated.im_gate = ImGate::Fragments;
+    for (tag, c, w, chrom_im) in [
+        ("3d_im", &cfg, &win_3d, true),
+        ("3d_gate", &gated, &win_4d, true),
+    ] {
+        let (p, c, _, _) = extract_im(&prec, &frag, &ms2_3d, &ms1_3d, w, c, chrom_im, tag);
+        assert_eq!(h(&p), h(&p3), "{tag}: psms_extracted");
+        assert_eq!(h(&c), h(&c3), "{tag}: chromatograms");
+    }
+
+    // 4D, gate off, no consumer of the per-point 1/K0: psms_extracted v4, chromatograms v2.
+    let (p4, c4, rp4, rc4) = extract_im(&prec, &frag, &ms2_4d, &ms1_4d, &win_4d, &cfg, false, "4d");
+    assert_eq!(rp4["schema_version"], 4);
+    assert_eq!(rc4["schema_version"], 2);
+    assert_eq!(rp4["params"]["reader"], "timsrust");
+    assert_eq!(rp4["params"]["im_gate"], false);
+    assert!(
+        mumdia::instrument::spectra_has_im(&c4),
+        "the predicate reads the chromatograms"
+    );
+    assert_eq!(
+        stages::extract::psms_schema(&p4).unwrap(),
+        ("psms_extracted", 4)
+    );
+    let t4 = TableFile::open(&p4).unwrap();
+    let cid = t4.u32("candidate_id").unwrap();
+    let i = cid
+        .iter()
+        .position(|&c| c == 0)
+        .expect("the target is accepted");
+    let approx = |v: Option<f64>, want: f64| v.is_some_and(|x| (x - want).abs() < 1e-6);
+    assert!(approx(t4.opt_f64("apex_im").unwrap()[i], 0.92));
+    // (|0.90 - 0.92| x a + 0 + |1.10 - 0.92| x 0.6a) / 2.4a
+    assert!(approx(
+        t4.opt_f64("apex_im_mad").unwrap()[i],
+        (0.02 + 0.6 * 0.18) / 2.4
+    ));
+    assert!(
+        approx(t4.opt_f64("ms1_apex_im").unwrap()[i], 0.93),
+        "the MS1 peak nearest the apex 1/K0, not the most intense"
+    );
+    assert_eq!(t4.opt_f64("im_pred_cal").unwrap()[i], Some(0.92));
+    assert_eq!(
+        mumdia::chromatograms::recorded_schema(&c4).unwrap(),
+        ("chromatograms", 2)
+    );
+    // Every 3D column but `apex_im` holds the 3D values.
+    let t3 = TableFile::open(&p3).unwrap();
+    for c in ["apex_rt", "rt_pred_cal", "precursor_mz"] {
+        assert_eq!(t3.f64(c).unwrap(), t4.f64(c).unwrap(), "{c}");
+    }
+    assert_eq!(
+        t3.i32("n_matched_fragments").unwrap(),
+        t4.i32("n_matched_fragments").unwrap()
+    );
+
+    // With a consumer on: the per-point 1/K0, v4 in the default layout and v3 in v1.
+    let (_, c4i, _, rc4i) =
+        extract_im(&prec, &frag, &ms2_4d, &ms1_4d, &win_4d, &cfg, true, "4d_im");
+    assert_eq!(rc4i["schema_version"], 4);
+    let mut v1 = cfg.clone();
+    v1.chromatogram_schema = 1;
+    let (_, c3i, _, rc3i) = extract_im(&prec, &frag, &ms2_4d, &ms1_4d, &win_4d, &v1, true, "4d_v1");
+    assert_eq!(rc3i["schema_version"], 3);
+    let im_of = |path: &str| -> Vec<(u32, String, Vec<f32>, Vec<f32>)> {
+        let tf = TableFile::open(path).unwrap();
+        let mut out = Vec::new();
+        mumdia::chromatograms::for_each_row(&tf, |r| {
+            out.push((
+                r.cid,
+                r.name.to_string(),
+                r.intensity.to_vec(),
+                r.im.expect("a 4D table with the list").to_vec(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+        out
+    };
+    let (rows4, rows3) = (im_of(&c4i), im_of(&c3i));
+    assert_eq!(rows4, rows3, "both layouts decode to the same 1/K0");
+    for (c, name, it, im) in &rows4 {
+        assert_eq!(it.len(), im.len(), "{c} {name}");
+        let want = match name.as_str() {
+            "b2" => 0.90,
+            "y3" => 0.92,
+            "y4" => 1.10,
+            _ => 0.0, // the MS1 rows carry no 1/K0
+        };
+        for (v, m) in it.iter().zip(im) {
+            if *v > 0.0 {
+                assert!((*m as f64 - want).abs() < 1e-4, "{c} {name}: {m}");
+            } else {
+                assert_eq!(*m, 0.0, "{c} {name}: a zero point has no 1/K0");
+            }
+        }
+    }
+    // The traces are those of the table without the list.
+    let traces = |path: &str| -> Vec<(u32, String, Vec<f32>)> {
+        let tf = TableFile::open(path).unwrap();
+        let mut out = Vec::new();
+        mumdia::chromatograms::for_each_row(&tf, |r| {
+            out.push((r.cid, r.name.to_string(), r.intensity.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        out
+    };
+    assert_eq!(traces(&c4i), traces(&c4));
+
+    // The 1/K0 gate: the target's y4 (1.10) lies outside its window and is not matched.
+    let (pg, cg, rpg, _) = extract_im(
+        &prec, &frag, &ms2_4d, &ms1_4d, &win_4d, &gated, true, "4d_gate",
+    );
+    assert_eq!(rpg["params"]["im_gate"], true);
+    let tg = TableFile::open(&pg).unwrap();
+    let ig = tg
+        .u32("candidate_id")
+        .unwrap()
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap();
+    assert_eq!(tg.i32("n_matched_fragments").unwrap()[ig], 2);
+    assert_eq!(t4.i32("n_matched_fragments").unwrap()[i], 3);
+    // apex_im over the gated fragments: the weighted median of 0.90 (a) and 0.92 (0.8a).
+    assert!(approx(tg.opt_f64("apex_im").unwrap()[ig], 0.90));
+    let y4 = im_of(&cg)
+        .into_iter()
+        .find(|r| r.0 == 0 && r.1 == "y4")
+        .unwrap();
+    assert!(y4.2.is_empty(), "the gated fragment is never observed");
+    // `auto` takes the gate here: the spectra and the windows carry 1/K0.
+    let mut auto = cfg.clone();
+    auto.im_gate = ImGate::Auto;
+    let (pa, _, _, _) = extract_im(
+        &prec, &frag, &ms2_4d, &ms1_4d, &win_4d, &auto, true, "4d_auto",
+    );
+    assert_eq!(h(&pa), h(&pg));
+    // Without 1/K0 windows `auto` is off, and an explicit gate runs ungated.
+    for (tag, c) in [("4d_auto_nowin", &auto), ("4d_gate_nowin", &gated)] {
+        let (p, _, rp, _) = extract_im(&prec, &frag, &ms2_4d, &ms1_4d, &win_3d, c, false, tag);
+        assert_eq!(rp["params"]["im_gate"], false, "{tag}");
+        let t = TableFile::open(&p).unwrap();
+        let j = t
+            .u32("candidate_id")
+            .unwrap()
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap();
+        assert_eq!(t.i32("n_matched_fragments").unwrap()[j], 3, "{tag}");
+        assert_eq!(t.opt_f64("im_pred_cal").unwrap()[j], None, "{tag}");
+    }
 }
 
 /// Two isolation windows, one library band under each, built so that the bands' own q
@@ -1830,6 +2137,7 @@ fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
             precursor_span: None,
             fragment_offset: None,
             rt_windows: None,
+            chrom_im: false,
             sibling_bands: 1,
             scans: shared,
             ms2: &ms2,
@@ -1890,6 +2198,7 @@ fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
         precursor_span: None,
         fragment_offset: None,
         rt_windows: None,
+        chrom_im: false,
         sibling_bands: 1,
         scans: Some(stages::extract::SharedScans {
             ms2: &handed,
@@ -2107,6 +2416,7 @@ fn extract_takes_the_handed_rt_windows_only_when_they_are_its_own() {
             precursor_span: None,
             fragment_offset: None,
             rt_windows,
+            chrom_im: false,
             sibling_bands: 1,
             scans: None,
             ms2: &ms2,

@@ -971,6 +971,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     resolved.predict_frag.sidecar_script_dir =
         crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
     crate::python::resolve(&mut resolved)?;
+    // `features.im_features = auto` resolves once for the experiment, on whether any run's
+    // spectra will carry 1/K0 (`instrument::input_has_im`, as the library build decides),
+    // so every run is scored with one feature schema and the pooled rescore accepts them.
+    resolved.resolve_im_features(p.mzmls.iter().any(|m| crate::instrument::input_has_im(m)));
     pre.step("resolve_interpreters");
     let p = RunExperimentParams {
         config: &resolved,
@@ -1823,6 +1827,12 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .iter()
         .map(|nm| format!("{}/spectra/isolation_windows.parquet", d(nm)))
         .collect();
+    // Each run's extracted rows, for the shadow test's 1/K0 term
+    // (`rescore.shadow_im_tolerance`).
+    let shadow_psms: Vec<String> = names
+        .iter()
+        .map(|nm| format!("{}/psms_extracted.parquet", d(nm)))
+        .collect();
     // Under `mbr.strategy = second_pass` (the default) this rescore is the first pass, kept
     // under `first_pass/`, and the experiment's `scored_combined.parquet` is the second pass's.
     let second_pass_on = cfg.mbr.strategy == mumdia_core::config::MbrStrategy::SecondPass;
@@ -1844,10 +1854,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         script_dir: &cfg.predict_frag.sidecar_script_dir,
         cfg: &cfg.rescore,
         config_hash: &ch,
-        shadow: Some(crate::stages::shadow::ShadowInputs::new(
-            &lib_f,
-            &shadow_windows,
-        )),
+        shadow: Some(
+            crate::stages::shadow::ShadowInputs::new(&lib_f, &shadow_windows)
+                .with_psms_extracted(&shadow_psms),
+        ),
     })?;
 
     // --- match-between-runs: the second pass ---
@@ -2189,7 +2199,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .insert("rescorer".into(), actual_rescorer_model);
     prov.model_identities.insert(
         "feature_schema_id".into(),
-        features::feature_schema_id(&features::active_features(cfg.features.set)),
+        features::feature_schema_id(&features::active_features_for(&cfg.features, false)),
     );
     prov.model_identities.insert(
         "mbr".into(),

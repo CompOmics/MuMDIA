@@ -391,6 +391,7 @@ fn bootstrap_and_refit(p: &Refit, library: &str, anchors_path: &str) -> Result<A
     .context("the bootstrap search (rt-im-train to compete) failed")?;
     let scored = format!("{bdir}/psms_scored.parquet");
     let windows = vec![p.converted.isolation_windows.clone()];
+    let psms = vec![format!("{bdir}/psms_extracted.parquet")];
     rescore::run_hashed(rescore::RescoreParams {
         competed: std::slice::from_ref(&competed),
         sources: None,
@@ -399,7 +400,9 @@ fn bootstrap_and_refit(p: &Refit, library: &str, anchors_path: &str) -> Result<A
         script_dir: &cfg.predict_frag.sidecar_script_dir,
         cfg: &cfg.rescore,
         config_hash: p.config_hash,
-        shadow: Some(crate::stages::shadow::ShadowInputs::new(p.lib_f, &windows)),
+        shadow: Some(
+            crate::stages::shadow::ShadowInputs::new(p.lib_f, &windows).with_psms_extracted(&psms),
+        ),
     })
     .context("the bootstrap single-run rescore failed")?;
     // The bootstrap's widest tables are only an input of the rescore that just read them.

@@ -915,18 +915,22 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     ms2: &ms2_scans,
                     ms1: Some(&ms1_scans),
                 }),
+                chrom_im: cfg
+                    .features
+                    .im_features
+                    .on(crate::instrument::spectra_has_im(&g.converted.ms2)),
             })?;
             if keep_records {
                 recs.push(psms_written.record(
                     &format!("{}[g{:02}]", artifact::PSMS_EXTRACTED.0, b.index),
-                    artifact::PSMS_EXTRACTED,
+                    extract::psms_schema(&psms)?,
                     &psms,
                     "extract",
                     ch,
                 ));
                 recs.push(chrom_written.record(
                     &format!("{}[g{:02}]", artifact::CHROMATOGRAMS.0, b.index),
-                    artifact::chromatograms(cfg.extract.chromatogram_schema),
+                    crate::chromatograms::recorded_schema(&chrom)?,
                     &chrom,
                     "extract",
                     ch,
@@ -1194,6 +1198,16 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             })
             .collect()
     };
+    // The versions the pooled tables hold, read from them: they were spliced from the bands'
+    // tables, so they are the bands' versions.
+    let pooled_psms_schema = match (&stats.psms_hash, pool_psms) {
+        (Some(_), true) => extract::psms_schema(&out.psms)?,
+        _ => artifact::PSMS_EXTRACTED,
+    };
+    let pooled_chrom_schema = match &stats.chromatograms_hash {
+        Some(_) => crate::chromatograms::recorded_schema(&pooled_chrom_path)?,
+        None => artifact::CHROMATOGRAMS,
+    };
     let pooled_artifacts = stats
         .psms_hash
         .clone()
@@ -1201,7 +1215,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         .map(|h| {
             (
                 artifact::PSMS_EXTRACTED.0,
-                artifact::PSMS_EXTRACTED,
+                pooled_psms_schema,
                 &out.psms,
                 stats.psms,
                 h,
@@ -1211,8 +1225,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         .chain(stats.chromatograms_hash.clone().map(|h| {
             (
                 artifact::CHROMATOGRAMS.0,
-                // Spliced from the bands' tables, which share the configured layout.
-                artifact::chromatograms(cfg.extract.chromatogram_schema),
+                // Spliced from the bands' tables, which share one layout.
+                pooled_chrom_schema,
                 &pooled_chrom_path,
                 stats.chromatograms,
                 h,

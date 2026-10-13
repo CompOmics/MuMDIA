@@ -1208,6 +1208,18 @@ pub struct SearchSeedConfig {
     /// configuration at its default.
     #[serde(skip_serializing_if = "is_false")]
     pub count_fragments_once: bool,
+    /// Size the learned fragment tolerance from the robust spread of the calibrant
+    /// deviations, `frag_tol_mad_k x 1.4826 x MAD`, instead of `1.5 x p95`, where MAD is
+    /// the median of `|deviation - median|`. Still floored at `frag_tol_floor_ppm`. Under
+    /// `two_pass_mass_cal` the second pass refits only the offset on the deviations inside
+    /// the first-pass window and keeps the first-pass width: a MAD re-estimated on inliers
+    /// truncated at that width is narrower than the spread it was cut from. A p95 is set by
+    /// the tail of the deviations, so a 10% shoulder of random matches can widen it
+    /// several-fold, where the MAD follows the core. Default 0: the p95 estimator,
+    /// bit-identical to before the key existed. Benchmark-gated (docs/07_search_seed.md).
+    /// Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub frag_tol_mad_k: f64,
 }
 impl Default for SearchSeedConfig {
     fn default() -> Self {
@@ -1222,6 +1234,7 @@ impl Default for SearchSeedConfig {
             mass_cal_loess: false,
             frag_tol_floor_ppm: 5.0,
             count_fragments_once: false,
+            frag_tol_mad_k: 0.0,
         }
     }
 }
@@ -1230,6 +1243,12 @@ impl Default for SearchSeedConfig {
 /// configuration hash was frozen for their section.
 fn is_false(v: &bool) -> bool {
     !*v
+}
+
+/// A number left at 0 ("off"), which the canonical configuration omits for keys added
+/// after the configuration hash was frozen for their section.
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// Heads `rt_im_train.multihead_calibration` uses when it is left to decide.
@@ -1913,6 +1932,82 @@ pub struct ExtractConfig {
     /// summed-window entropy, coverage and cosine minus this times the apex RT error over
     /// the candidate's own window half-width on that side (clipped to 1).
     pub gate_rt_weight: f64,
+    /// The 1/K0 gate of a run whose spectra carry ion mobility (a diaPASEF `.d` read by the
+    /// native reader): a fragment peak whose 1/K0 lies outside the candidate's calibrated
+    /// 1/K0 window (`run_windows.im_lo`/`im_hi`, from `rt-im-train`) is not matched to that
+    /// candidate, as a peak outside its RT window is not. See [`ImGate`]. Default `off`.
+    /// Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its
+    /// default.
+    #[serde(skip_serializing_if = "ImGate::is_off")]
+    pub im_gate: ImGate,
+}
+
+/// `extract.im_gate`: whether fragment peaks are matched only inside a candidate's 1/K0
+/// window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImGate {
+    /// No 1/K0 gate: every fragment peak inside the RT window is matched, as on 3D data.
+    #[default]
+    Off,
+    /// A fragment peak outside the candidate's 1/K0 window is not matched. The MS1 lookups
+    /// are not gated. A run without per-peak 1/K0, or whose `run_windows` has no 1/K0
+    /// window, is extracted without the gate and says so in the log.
+    Fragments,
+    /// `fragments` when the run's spectra carry 1/K0 (`mumdia::instrument`) and its
+    /// `run_windows` carries 1/K0 windows, `off` otherwise.
+    Auto,
+}
+
+impl ImGate {
+    /// Whether this is the default, which the canonical configuration omits.
+    pub fn is_off(&self) -> bool {
+        matches!(self, ImGate::Off)
+    }
+
+    /// The gate a run applies: `auto` becomes `fragments` when the spectra carry 1/K0
+    /// (`has_im`) and the windows do (`windows_have_im`); an explicit `fragments` stays
+    /// on, and extract then warns when either is missing.
+    pub fn resolve(self, has_im: bool, windows_have_im: bool) -> bool {
+        match self {
+            ImGate::Off => false,
+            ImGate::Fragments => true,
+            ImGate::Auto => has_im && windows_have_im,
+        }
+    }
+}
+
+/// `features.im_features`: the ion-mobility feature family.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImFeatures {
+    /// No ion-mobility features. The feature schema is the 3D one.
+    #[default]
+    Off,
+    /// The ion-mobility family is part of the `extended` set. On a run without 1/K0 its
+    /// columns are 0.
+    On,
+    /// `on` when the spectra carry 1/K0 (`mumdia::instrument`), `off` otherwise.
+    Auto,
+}
+
+impl ImFeatures {
+    /// Whether this is the default, which the canonical configuration omits.
+    pub fn is_off(&self) -> bool {
+        matches!(self, ImFeatures::Off)
+    }
+
+    /// Whether the family is on for a run or experiment whose spectra do (`has_im`) or do
+    /// not carry 1/K0. The orchestrators resolve it once and hand the stages `on` or `off`
+    /// ([`Config::resolve_im_features`]), so the schema id they record and the features
+    /// stage agree.
+    pub fn on(self, has_im: bool) -> bool {
+        match self {
+            ImFeatures::Off => false,
+            ImFeatures::On => true,
+            ImFeatures::Auto => has_im,
+        }
+    }
 }
 impl Default for ExtractConfig {
     fn default() -> Self {
@@ -1997,6 +2092,7 @@ impl Default for ExtractConfig {
             gate_mode: GateMode::WindowMean, // window-summed agreement minus RT term (since 2026-10-08)
             gate_coelution_min: 0.5,         // used only by GateMode::Combined
             gate_rt_weight: 0.2,             // used only by GateMode::WindowMean
+            im_gate: ImGate::Off,
         }
     }
 }
@@ -2111,6 +2207,15 @@ pub struct FeaturesConfig {
     /// restores the single loader and `0` is read as `1`. A memory knob and a speed knob,
     /// not a sensitivity knob.
     pub chrom_loaders: usize,
+    /// The ion-mobility family (`im.rs`, docs/10_features.md): the apex 1/K0 against the
+    /// calibrated prediction, the fragment 1/K0 dispersion at the apex, the MS1 precursor
+    /// 1/K0, and the 1/K0 of the fragment traces over the elution peak. Part of the
+    /// `extended` set only, appended after the other families. See [`ImFeatures`]. On a run
+    /// whose spectra carry 1/K0 it also makes extract write the per-point 1/K0 list of
+    /// each chromatogram row (chromatograms v3/v4). Default `off`. Benchmark-gated
+    /// (docs/35_diapasef.md). Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "ImFeatures::is_off")]
+    pub im_features: ImFeatures,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -2131,6 +2236,7 @@ impl Default for FeaturesConfig {
             bound_confident_pct: 50.0, // median confident half-width
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
             chrom_loaders: 3,
+            im_features: ImFeatures::Off,
         }
     }
 }
@@ -2678,6 +2784,17 @@ pub struct RescoreConfig {
     /// Candidates examined per run: the top `shadow_region x accepted` rows by first-pass
     /// score.
     pub shadow_region: usize,
+    /// The 1/K0 term of the shadow test on a run whose spectra carry ion mobility: a lender
+    /// counts only when its apex 1/K0 is within this distance (V s cm^-2) of the
+    /// candidate's own. Two precursors co-isolated in one diaPASEF slot but separated in
+    /// mobility do not share fragment peaks, so a shared fragment m/z is not borrowed
+    /// evidence there. The apex 1/K0 is joined from each run's `psms_extracted` on
+    /// `(candidate_id, selected_peak_rank)`; a row without one (3D data, or a lender or
+    /// candidate whose apex 1/K0 is null) keeps the m/z-and-RT test alone. Default 0: off,
+    /// bit-identical to before the key existed. Benchmark-gated (docs/35_diapasef.md).
+    /// Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub shadow_im_tolerance: f64,
     /// Fewest decoys the classifier is trained with. Below this the learned classifier
     /// is not trained (a handful of decoys lets it overfit, one decoy then outranks every
     /// target and nothing passes 1%): the candidates are ranked by their untrained
@@ -2731,6 +2848,7 @@ impl Default for RescoreConfig {
             shadow_ppm: 10.0,
             shadow_rt_s: 3.0,
             shadow_region: 8,
+            shadow_im_tolerance: 0.0,
             classifier: t(),
             folds: 3,
             train_fdr: 0.01,
@@ -3316,6 +3434,24 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Resolve `features.im_features = auto` for a run or an experiment whose spectra do
+    /// (`has_im`) or do not carry 1/K0, to `on` or `off`. The orchestrators call it once,
+    /// before any stage runs, and hand every stage the resolved configuration, so the
+    /// feature schema id the manifest records, the chromatograms extract writes and the
+    /// features stage all see one answer. An explicit `on` or `off` is kept. Like the
+    /// sidecar interpreters, it is resolved before the configuration is hashed, so the
+    /// manifest records what ran; a configuration that leaves the key at its default
+    /// hashes as it always did.
+    pub fn resolve_im_features(&mut self, has_im: bool) {
+        if self.features.im_features == ImFeatures::Auto {
+            self.features.im_features = if has_im {
+                ImFeatures::On
+            } else {
+                ImFeatures::Off
+            };
+        }
+    }
+
     /// Whether this run's library retention times come from DeepLC.
     ///
     /// Imported library: whatever `library_irt` resolves to. FASTA: whether the library
@@ -3634,6 +3770,23 @@ impl Config {
                  bucketed matcher has no fragment ordinals to count a fragment once by"
                     .into(),
             ));
+        }
+        if !(self.search_seed.frag_tol_mad_k.is_finite() && self.search_seed.frag_tol_mad_k >= 0.0)
+        {
+            return Err(Invalid(format!(
+                "search_seed.frag_tol_mad_k must be finite and >= 0 (got {}); 0 keeps the \
+                 1.5 x p95 tolerance",
+                self.search_seed.frag_tol_mad_k
+            )));
+        }
+        if !(self.rescore.shadow_im_tolerance.is_finite()
+            && self.rescore.shadow_im_tolerance >= 0.0)
+        {
+            return Err(Invalid(format!(
+                "rescore.shadow_im_tolerance must be finite and >= 0 (got {}); 0 leaves the \
+                 shadow test without a 1/K0 term",
+                self.rescore.shadow_im_tolerance
+            )));
         }
         if !self.rt_im_train.window_holdout_frac.is_finite()
             || !(0.0..1.0).contains(&self.rt_im_train.window_holdout_frac)
@@ -4736,6 +4889,98 @@ mod tests {
         ] {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }
+    }
+
+    /// The extraction and feature keys of the diaPASEF work are omitted from the canonical
+    /// configuration at their defaults, so a configuration that does not set them keeps the
+    /// config hash it had before they existed, and an explicit default changes nothing.
+    #[test]
+    fn extraction_and_feature_im_keys_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        assert_eq!(d.extract.im_gate, ImGate::Off);
+        assert_eq!(d.features.im_features, ImFeatures::Off);
+        assert_eq!(d.search_seed.frag_tol_mad_k, 0.0);
+        assert_eq!(d.rescore.shadow_im_tolerance, 0.0);
+        let canon = d.canonical_json();
+        for key in [
+            "im_gate",
+            "im_features",
+            "frag_tol_mad_k",
+            "shadow_im_tolerance",
+        ] {
+            assert!(!canon.contains(key), "{key} in {canon}");
+        }
+        let explicit = Config::from_json(
+            r#"{"extract":{"im_gate":"off"},"features":{"im_features":"off"},
+                "search_seed":{"frag_tol_mad_k":0.0},"rescore":{"shadow_im_tolerance":0.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.canonical_json(), canon);
+        for (json, key) in [
+            (
+                r#"{"extract":{"im_gate":"fragments"}}"#,
+                r#""im_gate":"fragments""#,
+            ),
+            (r#"{"extract":{"im_gate":"auto"}}"#, r#""im_gate":"auto""#),
+            (
+                r#"{"features":{"im_features":"on"}}"#,
+                r#""im_features":"on""#,
+            ),
+            (
+                r#"{"features":{"im_features":"auto"}}"#,
+                r#""im_features":"auto""#,
+            ),
+            (
+                r#"{"search_seed":{"frag_tol_mad_k":4.0}}"#,
+                r#""frag_tol_mad_k":4.0"#,
+            ),
+            (
+                r#"{"rescore":{"shadow_im_tolerance":0.02}}"#,
+                r#""shadow_im_tolerance":0.02"#,
+            ),
+        ] {
+            let c = Config::from_json(json).unwrap();
+            assert!(c.canonical_json().contains(key), "{json}");
+        }
+        for bad in [
+            r#"{"extract":{"im_gate":"fragments_ms1"}}"#,
+            r#"{"features":{"im_features":true}}"#,
+            r#"{"search_seed":{"frag_tol_mad_k":-1.0}}"#,
+            r#"{"rescore":{"shadow_im_tolerance":-0.01}}"#,
+            r#"{"features":{"im_shape_features":true}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// `auto` resolves on the one TIMS predicate; explicit values are kept.
+    #[test]
+    fn the_im_gate_and_family_resolve_on_the_run() {
+        assert!(!ImGate::Off.resolve(true, true));
+        assert!(ImGate::Fragments.resolve(false, false));
+        assert!(ImGate::Auto.resolve(true, true));
+        assert!(!ImGate::Auto.resolve(true, false));
+        assert!(!ImGate::Auto.resolve(false, true));
+        for has_im in [false, true] {
+            assert!(!ImFeatures::Off.on(has_im));
+            assert!(ImFeatures::On.on(has_im));
+            assert_eq!(ImFeatures::Auto.on(has_im), has_im);
+            let mut c = Config::default();
+            c.features.im_features = ImFeatures::Auto;
+            c.resolve_im_features(has_im);
+            let want = if has_im {
+                ImFeatures::On
+            } else {
+                ImFeatures::Off
+            };
+            assert_eq!(c.features.im_features, want);
+            // A resolved value is not resolved again.
+            c.resolve_im_features(!has_im);
+            assert_eq!(c.features.im_features, want);
+        }
+        let mut c = Config::default();
+        c.resolve_im_features(true);
+        assert_eq!(c.features.im_features, ImFeatures::Off);
     }
 
     #[test]

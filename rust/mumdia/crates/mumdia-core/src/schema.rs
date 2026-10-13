@@ -51,6 +51,12 @@ pub mod artifact {
     pub const RT_BOOTSTRAP_ANCHORS: (&str, u32) = ("rt_bootstrap_anchors", 1);
     pub const RUN_WINDOWS: (&str, u32) = ("run_windows", 1);
     pub const PSMS_EXTRACTED: (&str, u32) = ("psms_extracted", 2);
+    /// v4, written only when the extracted spectra carry per-peak 1/K0: `apex_im` filled
+    /// (the intensity-weighted median 1/K0 of the candidate's matched fragment peaks in its
+    /// apex scan), and nullable `apex_im_mad`, `ms1_apex_im` and `im_pred_cal`. The number
+    /// and meaning are the IM branch's v4; v3 (`apex_im` filled alone) is never written. A
+    /// 3D extract writes v2, byte for byte. Readers select columns by name.
+    pub const PSMS_EXTRACTED_V4: (&str, u32) = ("psms_extracted", 4);
     /// v1: every row stores its whole `rt` axis and its whole `intensity` trace.
     pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 1);
     /// v2, the default (`extract.chromatogram_schema = 2`): the axis once per candidate
@@ -58,6 +64,14 @@ pub mod artifact {
     /// and `trace_offset` / `trace_len` to rebuild it (`mumdia::chromatograms`). Every reader
     /// in the engine accepts both; the renamed lists make a v1-only reader fail on v2.
     pub const CHROMATOGRAMS_V2: (&str, u32) = ("chromatograms", 2);
+    /// v3: v1 with a per-point 1/K0 list `im` parallel to `intensity` (`+0.0` where the
+    /// trace has no peak). Written only when the spectra carry 1/K0 and a consumer of the
+    /// list is on; otherwise the table is v1.
+    pub const CHROMATOGRAMS_V3: (&str, u32) = ("chromatograms", 3);
+    /// v4: v2 with `im_trimmed`, each row's per-point 1/K0 cut to the run
+    /// `intensity_trimmed` keeps (the same `trace_offset`, the same length). Written under
+    /// the same condition as v3; otherwise the table is v2.
+    pub const CHROMATOGRAMS_V4: (&str, u32) = ("chromatograms", 4);
     /// v2: the feature columns are Float32 except the few `F64_FEATURE_COLUMNS` of
     /// `stages/features.rs`; v1 stored every feature as Float64. Every reader accepts both.
     pub const FEATURES: (&str, u32) = ("features", 2);
@@ -105,13 +119,26 @@ pub mod artifact {
         }
     }
 
-    /// The chromatogram schema for `extract.chromatogram_schema`: [`CHROMATOGRAMS_V2`] for 2,
-    /// else [`CHROMATOGRAMS`] (config validation admits only 1 and 2).
-    pub fn chromatograms(schema: u32) -> (&'static str, u32) {
-        if schema == CHROMATOGRAMS_V2.1 {
-            CHROMATOGRAMS_V2
+    /// The chromatogram schema a table records: its layout (`extract.chromatogram_schema`,
+    /// 1 or 2, which config validation enforces) and whether it carries the per-point 1/K0
+    /// list: [`CHROMATOGRAMS`], [`CHROMATOGRAMS_V2`], [`CHROMATOGRAMS_V3`] or
+    /// [`CHROMATOGRAMS_V4`].
+    pub fn chromatograms(schema: u32, has_im: bool) -> (&'static str, u32) {
+        match (schema == CHROMATOGRAMS_V2.1, has_im) {
+            (false, false) => CHROMATOGRAMS,
+            (true, false) => CHROMATOGRAMS_V2,
+            (false, true) => CHROMATOGRAMS_V3,
+            (true, true) => CHROMATOGRAMS_V4,
+        }
+    }
+
+    /// The `psms_extracted` schema an extract writes: [`PSMS_EXTRACTED_V4`] when the
+    /// extracted spectra carry per-peak 1/K0, else [`PSMS_EXTRACTED`].
+    pub fn psms_extracted(has_im: bool) -> (&'static str, u32) {
+        if has_im {
+            PSMS_EXTRACTED_V4
         } else {
-            CHROMATOGRAMS
+            PSMS_EXTRACTED
         }
     }
 
@@ -156,5 +183,18 @@ mod tests {
         assert_eq!(seed_psms(false), SEED_PSMS);
         assert_eq!(seed_psms(false), ("seed_psms", 1));
         assert_eq!(seed_psms(true), ("seed_psms", 2));
+    }
+
+    /// Extraction keeps main's 3D versions; 1/K0 moves psms_extracted to v4 and each
+    /// chromatogram layout to its IM number.
+    #[test]
+    fn extraction_selectors_keep_3d_at_main_versions() {
+        assert_eq!(psms_extracted(false), PSMS_EXTRACTED);
+        assert_eq!(psms_extracted(false), ("psms_extracted", 2));
+        assert_eq!(psms_extracted(true), ("psms_extracted", 4));
+        assert_eq!(chromatograms(1, false), CHROMATOGRAMS);
+        assert_eq!(chromatograms(2, false), CHROMATOGRAMS_V2);
+        assert_eq!(chromatograms(1, true), ("chromatograms", 3));
+        assert_eq!(chromatograms(2, true), ("chromatograms", 4));
     }
 }

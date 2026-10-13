@@ -227,9 +227,34 @@ pub fn weighted_mean_abs_dev(pts: &[(f64, f64)], center: f64) -> Option<f64> {
     )
 }
 
+/// Weighted mean and population standard deviation of `(value, weight)` pairs:
+/// `sum(w * v) / sum(w)` and `sqrt(sum(w * (v - mean)^2) / sum(w))`. `None` when the
+/// weights sum to zero or less.
+pub fn weighted_mean_sd(pts: &[(f64, f64)]) -> Option<(f64, f64)> {
+    let sw: f64 = pts.iter().map(|p| p.1).sum();
+    if sw <= 0.0 {
+        return None;
+    }
+    let mean = pts.iter().map(|p| p.0 * p.1).sum::<f64>() / sw;
+    let var = pts.iter().map(|p| p.1 * (p.0 - mean).powi(2)).sum::<f64>() / sw;
+    Some((mean, var.sqrt()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weighted_mean_sd_weighs_each_point() {
+        assert_eq!(weighted_mean_sd(&[]), None);
+        assert_eq!(weighted_mean_sd(&[(1.0, 0.0)]), None);
+        let (m, sd) = weighted_mean_sd(&[(0.9, 1.0), (1.0, 1.0)]).unwrap();
+        assert!((m - 0.95).abs() < 1e-12 && (sd - 0.05).abs() < 1e-12);
+        // Weight 3 at 1.0 against 1 at 0.0: mean 0.75, variance 3/16.
+        let (m, sd) = weighted_mean_sd(&[(1.0, 3.0), (0.0, 1.0)]).unwrap();
+        assert!((m - 0.75).abs() < 1e-12);
+        assert!((sd - (3.0f64 / 16.0).sqrt()).abs() < 1e-12);
+    }
 
     #[test]
     fn weighted_median_follows_the_intensity() {

@@ -141,13 +141,22 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         restrict_candidates: survivors.as_deref(),
         cfg: &ext_cfg,
         config_hash: ch,
+        // The per-point 1/K0 of the traces, for the ion-mobility feature family. The callers
+        // resolved `features.im_features` once for the run or the experiment
+        // (`Config::resolve_im_features`); the spectra's own record answers an unresolved
+        // `auto`.
+        chrom_im: cfg
+            .features
+            .im_features
+            .on(crate::instrument::spectra_has_im(&co.ms2)),
     })?;
     drop(lent_ms2);
     keep(
         &mut manifest,
         wpsm.record(
             artifact::PSMS_EXTRACTED.0,
-            artifact::PSMS_EXTRACTED,
+            // The version extract wrote (v4 on spectra with 1/K0), read from the table.
+            extract::psms_schema(&psms)?,
             &psms,
             "extract",
             ch,
@@ -157,7 +166,8 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         &mut manifest,
         wchr.record(
             artifact::CHROMATOGRAMS.0,
-            artifact::chromatograms(cfg.extract.chromatogram_schema),
+            // The layout and the 1/K0 list the table holds, read from the table.
+            crate::chromatograms::recorded_schema(&chrom)?,
             &chrom,
             "extract",
             ch,

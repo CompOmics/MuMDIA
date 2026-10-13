@@ -376,6 +376,10 @@ enum Cmd {
         /// demotion.
         #[arg(long, num_args = 1..)]
         isolation_windows: Vec<String>,
+        /// `psms_extracted.parquet` of each input run, in source order, for the 1/K0 term
+        /// of shadow demotion (`rescore.shadow_im_tolerance`).
+        #[arg(long, num_args = 1..)]
+        psms_extracted: Vec<String>,
     },
     /// Quantify identified peptides + roll up to protein groups.
     Quant {
@@ -1489,6 +1493,12 @@ fn real_main() -> Result<()> {
                 // Standalone: the windows come from the named file, which is this stage's
                 // contract; only the orchestrators hand them over in memory.
                 rt_windows: None,
+                // The per-point 1/K0 of the traces, for the ion-mobility feature family,
+                // resolved on the spectra's own record.
+                chrom_im: cfg
+                    .features
+                    .im_features
+                    .on(mumdia::instrument::spectra_has_im(&ms2)),
                 // Standalone: this invocation decodes the run itself.
                 scans: None,
                 ms2: &ms2,
@@ -1701,6 +1711,7 @@ fn real_main() -> Result<()> {
             config,
             lib_fragments,
             isolation_windows,
+            psms_extracted,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
@@ -1714,12 +1725,10 @@ fn real_main() -> Result<()> {
                 script_dir: &cfg.predict_frag.sidecar_script_dir,
                 cfg: &cfg.rescore,
                 config_hash: &ch,
-                shadow: lib_fragments
-                    .as_deref()
-                    .map(|lf| stages::shadow::ShadowInputs {
-                        lib_fragments: lf,
-                        isolation_windows: &isolation_windows,
-                    }),
+                shadow: lib_fragments.as_deref().map(|lf| {
+                    stages::shadow::ShadowInputs::new(lf, &isolation_windows)
+                        .with_psms_extracted(&psms_extracted)
+                }),
             })?;
         }
         Cmd::Run {

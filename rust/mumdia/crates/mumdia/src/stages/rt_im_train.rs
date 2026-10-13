@@ -427,12 +427,22 @@ pub struct RtFit {
 /// precursor table, another band), which the file-based contract cannot do, because
 /// `extract` reads the `run_windows` path it is given.
 ///
-/// Retention time only. The ion-mobility columns of a run with 1/K0 are in the file; no
-/// stage reads them yet.
+/// On a run with an ion-mobility calibration the same holds for the 1/K0 window and the
+/// calibrated 1/K0 of every candidate (`im_lo`, `im_hi`, `im_pred_cal`): `-inf`/`+inf` and
+/// `None` for a candidate without one. They are `None` as a whole when no row carries a
+/// 1/K0 window, which is every 3D run, so a 3D extract holds nothing for them.
 pub struct RtWindows {
     pub(crate) rt_cal: Vec<f64>,
     pub(crate) rt_lo: Vec<f64>,
     pub(crate) rt_hi: Vec<f64>,
+    /// Per-candidate 1/K0 window bounds (`run_windows.im_lo`/`im_hi`) at the width the
+    /// peaks' 1/K0 is stored at, `-inf`/`+inf` for a candidate without one; `None` when no
+    /// row has one.
+    pub(crate) im_lo: Option<Vec<f32>>,
+    pub(crate) im_hi: Option<Vec<f32>>,
+    /// Per-candidate calibrated 1/K0 (`run_windows.im_pred_cal`, psms_extracted v4
+    /// `im_pred_cal`); `None` exactly when `im_lo` is.
+    pub(crate) im_cal: Option<Vec<Option<f64>>>,
     /// `(library_precursors, run_windows)` of the `rt-im-train` call that fitted these
     /// windows; `None` for windows read back from a file, which are never handed over.
     pub(crate) fitted_for: Option<(String, String)>,
@@ -446,6 +456,29 @@ impl RtWindows {
 
     pub fn is_empty(&self) -> bool {
         self.rt_cal.is_empty()
+    }
+
+    /// Whether candidate `c` may take a peak at retention time `rt` and, when `im` is
+    /// given, at 1/K0 `im`. The one window test of extract: every probe, the two-pass
+    /// arbitration, the demix and the promoted alternatives go through it. `im` is `None`
+    /// when the 1/K0 gate is off (`extract.im_gate`) or the scan carries no 1/K0, and the
+    /// test is then the retention-time test alone, `!(rt < rt_lo || rt > rt_hi)`, as it
+    /// always was. A candidate without a 1/K0 window holds `-inf`/`+inf` and is never
+    /// gated, as an unbounded RT window is not.
+    #[inline]
+    pub(crate) fn admits(&self, c: usize, rt: f64, im: Option<f32>) -> bool {
+        if rt < self.rt_lo[c] || rt > self.rt_hi[c] {
+            return false;
+        }
+        match (im, &self.im_lo, &self.im_hi) {
+            (Some(x), Some(lo), Some(hi)) => !(x < lo[c] || x > hi[c]),
+            _ => true,
+        }
+    }
+
+    /// Whether any candidate has a 1/K0 window, which `extract.im_gate = auto` needs.
+    pub(crate) fn has_im(&self) -> bool {
+        self.im_lo.is_some()
     }
 
     /// Why these windows are NOT the ones `extract` would read from `run_windows` for the
@@ -485,22 +518,55 @@ impl RtWindows {
 /// Collects the dense windows while the table is streamed out, or refuses to.
 struct RtWindowsBuilder {
     w: RtWindows,
-    /// A row with a NaN `rt_lo` or `rt_hi` was seen. `extract` rejects such a table with
-    /// the row named; the in-memory form is then withheld, so `extract` reads the file
-    /// and reports exactly that error.
+    /// A row with a NaN `rt_lo` or `rt_hi`, or a NaN 1/K0 bound, was seen. `extract`
+    /// rejects such a table with the row named; the in-memory form is then withheld, so
+    /// `extract` reads the file and reports exactly that error.
     poisoned: bool,
+    /// Rows that carried a 1/K0 window. None at all leaves the 1/K0 fields `None`, as
+    /// `read_run_windows` leaves them for a table whose 1/K0 columns are all null.
+    n_im: usize,
 }
 
 impl RtWindowsBuilder {
-    fn new(n: usize) -> RtWindowsBuilder {
+    /// `with_im`: the fit has an ion-mobility calibration, so the rows carry 1/K0 windows.
+    fn new(n: usize, with_im: bool) -> RtWindowsBuilder {
         RtWindowsBuilder {
             w: RtWindows {
                 rt_cal: vec![f64::NAN; n],
                 rt_lo: vec![f64::NEG_INFINITY; n],
                 rt_hi: vec![f64::INFINITY; n],
+                im_lo: with_im.then(|| vec![f32::NEG_INFINITY; n]),
+                im_hi: with_im.then(|| vec![f32::INFINITY; n]),
+                im_cal: with_im.then(|| vec![None; n]),
                 fitted_for: None,
             },
             poisoned: false,
+            n_im: 0,
+        }
+    }
+
+    /// One written row's 1/K0 columns, in row order: the scatter `read_run_windows` applies
+    /// to `im_pred_cal`, `im_lo` and `im_hi`. A row whose bounds are null keeps the
+    /// unbounded window, and a NaN bound poisons the builder as a NaN RT bound does.
+    #[inline]
+    fn im_row(&mut self, cid: u32, cal: Option<f64>, lo: Option<f64>, hi: Option<f64>) {
+        let c = cid as usize;
+        let (Some(wlo), Some(whi), Some(wcal)) =
+            (&mut self.w.im_lo, &mut self.w.im_hi, &mut self.w.im_cal)
+        else {
+            return;
+        };
+        if c >= wcal.len() {
+            return;
+        }
+        wcal[c] = cal;
+        if let (Some(l), Some(h)) = (lo, hi) {
+            if l.is_nan() || h.is_nan() {
+                self.poisoned = true;
+            }
+            wlo[c] = l as f32;
+            whi[c] = h as f32;
+            self.n_im += 1;
         }
     }
 
@@ -522,6 +588,11 @@ impl RtWindowsBuilder {
     /// `run_windows` path they were written to; `None` when a NaN bound was seen.
     fn finish(self, library_precursors: &str, run_windows: &str) -> Option<RtWindows> {
         let mut w = self.w;
+        if self.n_im == 0 {
+            w.im_lo = None;
+            w.im_hi = None;
+            w.im_cal = None;
+        }
         w.fitted_for = Some((library_precursors.to_string(), run_windows.to_string()));
         (!self.poisoned).then_some(w)
     }
@@ -1283,7 +1354,7 @@ fn write_windows(
         }
     }
     let mut n_nonfinite_irt = 0u64;
-    let mut kept = keep_windows.then(|| RtWindowsBuilder::new(n));
+    let mut kept = keep_windows.then(|| RtWindowsBuilder::new(n, im_cal.is_some()));
     let windows = write_table_chunked_hashed(p.out_windows, n, |r| {
         let k = r.len();
         let (mut cid_c, mut cal_c, mut lo_c, mut hi_c) = (
@@ -1344,6 +1415,11 @@ fn write_windows(
             }
             _ => [vec![None; k], vec![None; k], vec![None; k]],
         };
+        if let (Some(b), true) = (kept.as_mut(), im_cal.is_some()) {
+            for (j, &c) in cid_c.iter().enumerate() {
+                b.im_row(c, im_c[j], imlo_c[j], imhi_c[j]);
+            }
+        }
         Ok(vec![
             Col::U32("candidate_id".into(), cid_c),
             Col::F64("rt_pred_cal".into(), cal_c),
@@ -1841,7 +1917,13 @@ mod tests {
             })
             .unwrap();
             assert_eq!(written.rows, n as u64);
-            assert!(kept.is_some(), "{tag}: the RT windows are handed over");
+            let kept = kept.expect("the RT windows are handed over");
+            // The 4D arm of the in-memory/file equivalence: the 1/K0 windows handed to
+            // extract are the ones it reads back from the file just written.
+            let from_file = crate::stages::extract::read_run_windows(&windows, n).unwrap();
+            assert_eq!(bits(&kept), bits(&from_file), "{tag}");
+            assert_eq!(im_bits(&kept), im_bits(&from_file), "{tag}");
+            assert_eq!(kept.has_im(), lib_im && seed_im, "{tag}");
             let cal_json: serde_json::Value = mumdia_io::json::read_json(&cal).unwrap();
             let w = TableFile::open(&windows).unwrap();
             let cols = (
@@ -2012,6 +2094,17 @@ mod tests {
             .collect()
     }
 
+    /// Bit patterns of a window set's 1/K0 fields; `None` when it has none.
+    #[allow(clippy::type_complexity)]
+    fn im_bits(w: &RtWindows) -> Option<Vec<(u32, u32, Option<u64>)>> {
+        let (lo, hi, cal) = (w.im_lo.as_ref()?, w.im_hi.as_ref()?, w.im_cal.as_ref()?);
+        Some(
+            (0..w.len())
+                .map(|c| (lo[c].to_bits(), hi[c].to_bits(), cal[c].map(f64::to_bits)))
+                .collect(),
+        )
+    }
+
     /// The windows handed to extract in memory are the arrays extract builds from the file
     /// the same call wrote, bit for bit, under each window plan: calibrated LOESS, adaptive
     /// per-bin widths, and the unbounded plan of a run without anchors. The library has
@@ -2121,6 +2214,9 @@ mod tests {
                 bits(&from_file),
                 "{tag}: in memory != read back"
             );
+            // A 3D run holds no 1/K0 window either way.
+            assert_eq!(im_bits(&kept), None, "{tag}");
+            assert_eq!(im_bits(&from_file), None, "{tag}");
             // Handed over only to the extract of the library and the file they were
             // fitted for; a table of the same size elsewhere, another run_windows path or
             // another candidate count reads the file instead.
@@ -2165,7 +2261,7 @@ mod tests {
             .unwrap();
         };
         write(&path, &rows);
-        let mut b = RtWindowsBuilder::new(4);
+        let mut b = RtWindowsBuilder::new(4, false);
         for &(c, cal, lo, hi) in &rows {
             b.row(c, cal, lo, hi);
         }
@@ -2176,7 +2272,7 @@ mod tests {
         assert!(kept.rt_cal[1].is_nan() && kept.rt_lo[3] == f64::NEG_INFINITY);
 
         write(&path, &[(1u32, 3.0, f64::NAN, 4.0)]);
-        let mut b = RtWindowsBuilder::new(4);
+        let mut b = RtWindowsBuilder::new(4, false);
         b.row(1, 3.0, f64::NAN, 4.0);
         assert!(
             b.finish("lib", "rw").is_none(),
@@ -2187,9 +2283,87 @@ mod tests {
             .unwrap();
         assert!(err.to_string().contains("NaN RT bound"), "{err}");
         // A NaN bound on a row past the library is not checked by extract either.
-        let mut b = RtWindowsBuilder::new(1);
+        let mut b = RtWindowsBuilder::new(1, false);
         b.row(1, 3.0, f64::NAN, 4.0);
         assert!(b.finish("lib", "rw").is_some());
+    }
+
+    /// The 1/K0 half of the scatter: a null window stays unbounded, a repeated id takes the
+    /// last row, a NaN 1/K0 bound withholds the in-memory form and is refused from the file
+    /// with the row named, and a table whose 1/K0 columns are all null holds no 1/K0 window,
+    /// in memory or read back.
+    #[test]
+    fn the_windows_builder_scatters_the_im_columns_as_extract_reads_them() {
+        type Row = (u32, Option<f64>, Option<f64>, Option<f64>);
+        let write = |path: &str, rows: &[Row]| {
+            write_table(
+                path,
+                vec![
+                    Col::U32("candidate_id".into(), rows.iter().map(|r| r.0).collect()),
+                    Col::F64("rt_pred_cal".into(), vec![10.0; rows.len()]),
+                    Col::F64("rt_lo".into(), vec![5.0; rows.len()]),
+                    Col::F64("rt_hi".into(), vec![15.0; rows.len()]),
+                    Col::OptF64("im_pred_cal".into(), rows.iter().map(|r| r.1).collect()),
+                    Col::OptF64("im_lo".into(), rows.iter().map(|r| r.2).collect()),
+                    Col::OptF64("im_hi".into(), rows.iter().map(|r| r.3).collect()),
+                ],
+            )
+            .unwrap();
+        };
+        let build = |rows: &[Row]| {
+            let mut b = RtWindowsBuilder::new(4, true);
+            for &(c, cal, lo, hi) in rows {
+                b.row(c, 10.0, 5.0, 15.0);
+                b.im_row(c, cal, lo, hi);
+            }
+            b.finish("lib", "rw")
+        };
+        let rows: Vec<Row> = vec![
+            (0, Some(0.9), Some(0.88), Some(0.92)),
+            (2, None, None, None),
+            (3, Some(1.0), Some(0.97), Some(1.03)),
+            (3, Some(1.1), Some(1.07), Some(1.13)), // repeated: this one wins
+            (8, Some(1.2), Some(1.1), Some(1.3)),   // past the library
+        ];
+        let path = scratch("builder_im_windows.parquet");
+        write(&path, &rows);
+        let kept = build(&rows).expect("no NaN bound");
+        let read = crate::stages::extract::read_run_windows(&path, 4).unwrap();
+        assert_eq!(bits(&kept), bits(&read));
+        assert_eq!(im_bits(&kept), im_bits(&read));
+        let lo = kept.im_lo.as_ref().unwrap();
+        assert_eq!(lo[3], 1.07f32);
+        assert_eq!(lo[1], f32::NEG_INFINITY, "a candidate without a row");
+        assert_eq!(lo[2], f32::NEG_INFINITY, "a row without a 1/K0 window");
+        assert!(kept.has_im());
+        // The gate: inside the window, outside it, and a candidate without one.
+        assert!(kept.admits(0, 10.0, Some(0.9)));
+        assert!(!kept.admits(0, 10.0, Some(0.95)));
+        assert!(kept.admits(0, 10.0, None), "no 1/K0 test asked for");
+        assert!(
+            !kept.admits(0, 20.0, Some(0.9)),
+            "the RT test still applies"
+        );
+        assert!(kept.admits(2, 10.0, Some(5.0)), "unbounded in 1/K0");
+
+        // All null: no 1/K0 window in memory or read back.
+        let nulls: Vec<Row> = vec![(0, None, None, None), (1, None, None, None)];
+        write(&path, &nulls);
+        let kept = build(&nulls).expect("no NaN bound");
+        let read = crate::stages::extract::read_run_windows(&path, 4).unwrap();
+        assert_eq!(im_bits(&kept), None);
+        assert_eq!(im_bits(&read), None);
+        assert!(!read.has_im());
+        assert!(read.admits(0, 10.0, Some(9.0)), "no window, no gate");
+
+        // A NaN bound.
+        let bad: Vec<Row> = vec![(1, Some(1.0), Some(f64::NAN), Some(1.1))];
+        write(&path, &bad);
+        assert!(build(&bad).is_none(), "a NaN bound must not be handed over");
+        let err = crate::stages::extract::read_run_windows(&path, 4)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("NaN 1/K0 bound"), "{err}");
     }
 
     #[test]
