@@ -339,6 +339,22 @@ own apex.
 | `ms1_apex_im` | Float64 | yes | 1/K0 | v4 only: in the MS1 scan nearest the apex, the 1/K0 of the peak within `extract.prec_tol_ppm` of the offset-corrected precursor m/z that lies nearest `apex_im` (the most intense in-tolerance peak without an `apex_im`); not gated; null without MS1 or without such a peak |
 | `im_pred_cal` | Float64 | yes | 1/K0 | v4 only: the candidate's `run_windows.im_pred_cal`; null without an ion-mobility calibration |
 
+**Retrace patch** (`retrace.enabled`, docs/09 section 9). On a diaPASEF run whose
+chromatograms retrace rebuilt from the raw events, `psms_extracted` is patched once, in
+place, and keeps version 4: per rank-0 row, `apex_rt` and `apex_im` under `retrace.repick`
+(the re-picked apex and its band centre); `apex_intensity` and `n_matched_fragments` read
+from the rebuilt fragment traces at the apex; `ms1_mono`, `ms1_iso1` and `ms1_iso2` read
+from the rebuilt MS1 traces at the apex, null only where extract had none and the raw trace
+is 0 there. `ms1_isom1`, `apex_im_mad` and `ms1_apex_im` keep extract's values. A row whose
+candidate has no rebuilt rows keeps all of extract's values. The table's report records
+the patch under `params.retrace` (`patched_columns` and the row counts). One optional
+column, read by name and written only under `retrace.apex_features` (as `rt_lo`/`rt_hi`
+are only under `extract.emit_rt_window`):
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `imc_ref_w` | Float64 | no | correlation | retrace's apex 1/K0 agreement: over the rebuilt fragment rows with signal, the predicted-intensity-weighted mean leave-one-out reference correlation of each fragment's raw 1/K0 profile (`apex_im +/- 0.04`, 40 bins, MS2 frames within 1.5 s of the apex); 0.0 with no such fragment or no rebuilt rows |
+
 Conditional columns, appended only when `extract.emit_contested_features`
 (`extract.rs:1498-1501`):
 
@@ -446,8 +462,8 @@ page.
 #### 1/K0 lists (versions 3 and 4)
 
 On spectra that carry per-peak 1/K0, and only while a consumer of the list is on (the
-ion-mobility feature family, `features.im_features`), each row also carries its per-point
-1/K0. Version 3 is version 1 plus `im`, version 4 is version 2 plus `im_trimmed`
+ion-mobility feature family, `features.im_features`, or retrace, `retrace.enabled`), each
+row also carries its per-point 1/K0. Version 3 is version 1 plus `im`, version 4 is version 2 plus `im_trimmed`
 (`artifact::chromatograms(schema, has_im)`), so `extract.chromatogram_schema = 1` keeps
 working on 4D data. Otherwise the table is version 1 or 2, byte for byte.
 
@@ -462,6 +478,18 @@ version from its columns, `rewrite` carries the list between layouts, and the po
 bands whose columns differ. The extract report of a 4D run carries `params.reader =
 "timsrust"` and `params.im_gate` (the gate it applied) in both tables' reports, so a stage
 that reads only these artifacts resolves the TIMS predicate from them.
+
+#### Rebuilt by retrace
+
+Under `retrace.enabled` extract writes its table to `chromatograms.centroid.parquet`, and
+retrace writes `chromatograms.parquet` with the same rows, the same layout and the same
+version: the intensities of the fragment and MS1 rows are sums of raw timsTOF events
+(docs/09 section 9), and a rebuilt fragment point's 1/K0 is the intensity-weighted 1/K0 of
+its events (`+0.0` where they sum to nothing). The centroid table is deleted after
+retrace succeeds. The report (`stage = "retrace"`) carries extract's parameters, the reader,
+and retrace's own under `params.retrace`; its `stats` carry the rebuilt and copied row
+counts, the frames decoded, the raw events summed and the median MS1 mass residual
+(`ms1_mass_residual_ppm_median`).
 
 ### `<psms>.peaks.parquet`, top-K peak retention (`extract.rs:1532-1543`)
 

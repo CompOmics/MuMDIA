@@ -229,7 +229,7 @@ to v1 for it.
 
 On spectra that carry 1/K0, and only while a consumer of the list is on
 (`ExtractParams::chrom_im`: the ion-mobility feature family, `features.im_features`;
-retrace once it lands), every row also carries its per-point 1/K0: `im`, parallel to
+retrace, section 9), every row also carries its per-point 1/K0: `im`, parallel to
 `intensity`, in v1 (schema v3), and `im_trimmed`, cut to the run `intensity_trimmed`
 keeps with the same `trace_offset`, in v2 (schema v4). The value at a point is the 1/K0
 of the peak whose intensity the trace holds there (`Hit::im`, 1e-4 resolution), and
@@ -815,6 +815,129 @@ with an `observed_im` takes, over the same three scans, the in-tolerance peak wh
 1/K0 lies nearest it, by the same `ms1_peak_near` rule; an anchor without one keeps the
 most-intense rule.
 
+### 9. Raw-event trace rebuild (`retrace`, diaPASEF, default off)
+
+`retrace.enabled` adds the `retrace` stage between extract and features
+(`stages/retrace.rs`). It rewrites `chromatograms.parquet` from the raw timsTOF events of
+the `.d`, with the same rows in the same order, in the same layout and schema version as
+extract's table (v3 or v4, the per-point 1/K0 list included), so features, quant and the
+pooled readers read it unchanged. It then patches `psms_extracted` once, in place. Off,
+the stage does not run and every artifact is byte-identical
+(`the_chain_without_retrace_is_byte_identical_and_refuses_retrace_on_3d_input` in
+`tests/pipeline.rs`). docs/35_diapasef.md section 6 has the measurements.
+
+Why: an extract trace point is the intensity of one convert centroid, and convert's
+centroiding loses weak signal (single-linkage m/z chaining, `convert.tdf_min_points`, the
+scan gap). The MS1 isotope traces are also ungated in 1/K0, and on the E. coli diaPASEF run
+about two thirds of their signal came from other ions at the same m/z.
+
+What a rebuilt point is, per chromatogram row:
+
+- fragment rows (`predicted_intensity > 0`): the sum of every raw event in the grid
+  point's frame (the MS2 frame within 1 ms of the point's RT), in the quad slots whose
+  isolation window holds the precursor m/z, with TOF inside the learned fragment tolerance
+  of the calibrated fragment m/z, and 1/K0 inside `apex_im +/- retrace.im_half_width`
+  (`im_pred_cal` when `apex_im` is null). The m/z calibration is extract's, read through
+  the one reader `masscal::read_mass_cal` and applied with `MassOffset::factor_at`. The
+  point's 1/K0 is the intensity-weighted 1/K0 of the events, and `+0.0` where they sum to
+  nothing, so both layouts decode to the same list. A point counts any event with an
+  intensity above 0 (the IM branch's `min_events` floor is not kept: at its default of 1
+  it was a no-op, and 2 or 3 lost identifications);
+- MS1 rows (`ms1_mono`, `ms1_iso1`, `ms1_iso2`, when `retrace.ms1`): the same sum over the
+  MS1 frames extract's MS1 read takes at the grid RT (`ms1_neighbours`: the nearest frame
+  and its `extract.ms1_scan_halfwidth` neighbours, the largest sum kept), within
+  `extract.prec_tol_ppm` of the row's own m/z and inside the same 1/K0 band. The row's m/z
+  already carries extract's learned MS1 offset (`(precursor_mz + dmz) * (1 +
+  ms1_ppm_offset * 1e-6)`), so retrace never applies the offset again. It checks it
+  instead: the report records the median ppm residual of the raw `ms1_mono` events against
+  the row m/z (`stats.ms1_mass_residual_ppm_median`), and the stage warns when it exceeds
+  half the precursor tolerance. A half-width of 0 is the IM branch's nearest-frame rule;
+  the prototype's +1.6% was measured with it, at 20 ppm, before `ms1_scan_halfwidth`,
+  `prec_tol_ppm = 3` and `ms1_calibrate` existed (arm T10 measures the difference);
+- every other row and column (`frag_obs_mz` included) is copied.
+
+The TOF -> m/z converter and the 1/K0 calibration are convert's (`convert::RawTdf`:
+`tof_of`, `mz_of`, `im_of_scan`), so raw events, centroids and `apex_im` share one scale.
+The rule reads no label.
+
+**Apex re-pick** (`retrace.repick`, default off). Before any trace is built, retrace scores
+extract's apex and every `<psms_extracted>.peaks.parquet` peak of the candidate
+(`extract.retain_top_peaks`, 5 measured) on the raw events. For each peak it takes the MS2
+frames within 1.5 s of that peak's apex and bins each fragment's events at 0.002 over the
+`run_windows` 1/K0 window. For each +/-0.015 band (15 bins) it computes the cosine of the
+square-rooted band sums against the square-rooted predictions, and the
+prediction-weighted band intensity `I`. The band with the best `cos x sqrt(I / I_max)`
+scores the peak `cos x ln(1 + I)`, and the peak with the highest score wins; ties go to
+extract's apex, then to the lower rank. A candidate without signal keeps extract's apex.
+The winner's apex RT and band centre (the prediction-weighted 1/K0 centroid of the profile
+inside the band) replace `apex_rt` and `apex_im`, and the traces and the apex scalars are
+built around them. The re-pick reads no retention time. It overrides the apex that
+`apex_evidence_rank` chose, by design. It needs `retain_top_peaks >= 2` and
+`promote_top_peaks = 1`, and is refused with `apex_refine_intensity` (`Config::validate`).
+`apex_im_mad` and `ms1_apex_im` stay those of extract's apex. Diagnostic:
+`MUMDIA_REPICK_DUMP=<path>` writes every scored peak (candidate, order with 0 for
+extract's apex, apex RT, score); the pick is the same either way.
+
+**The psms_extracted patch.** Retrace patches `psms_extracted` once, per rank-0 row, and
+records what it did under `params.retrace` in the table's report (`patched_columns` and
+the row counts). The schema version stays 4.
+
+- `apex_rt` and `apex_im` of a re-picked candidate.
+- `apex_intensity` (the sum over the fragment rows of the trace point nearest the apex)
+  and `n_matched_fragments` (fragment rows with any signal), whenever a fragment row of the
+  candidate was rebuilt. Raw traces beside centroid scalars would leave the table
+  inconsistent (the scalars alone measured +0.6% on the IM branch).
+- `ms1_mono`, `ms1_iso1` and `ms1_iso2` at the point nearest the apex, each when its row
+  was rebuilt. A refreshed value stays null only where extract had none and the raw trace
+  has no signal at the apex either.
+- `ms1_isom1` is not refreshed. There is no `-1` isotope trace to rebuild it from, so it
+  stays extract's centroid value, summed over the MS1 scans without a 1/K0 band
+  (IM-blind).
+- `imc_ref_w` only under `retrace.apex_features` (a new column, read by name, 0.0 without
+  a record). Over the rebuilt fragment rows, a raw 1/K0 profile per fragment in
+  `apex_im +/- 0.04` (40 bins), summed over the MS2 frames within 1.5 s of the apex, in the
+  quad slots holding the precursor and inside the fragment's TOF window. The score is the
+  predicted-intensity-weighted mean leave-one-out reference correlation of each profile
+  with signal (`stats::loo_ref_corr`, the kernel the co-elution and interference families
+  use). The ion-mobility feature family carries it as its tenth feature (docs/10).
+
+A rank-0 row whose candidate has no rebuilt rows keeps extract's values, with a warning.
+The other readers of `psms_extracted` see the patched values: the shadow demotion's 1/K0
+term (`extract::apex_im_by_peak`) reads the re-picked `apex_im`, and quant integrates
+around the `apex_rt` the scored rows carry from features.
+
+**Where it runs.** `retrace::run_if_enabled`, inside the extract-to-compete core
+(`chain::extract_to_compete`), so in `run`, every run of `run-experiment`, and the second
+pass. The core takes a flag (`ChainParams::retrace`): the RT bootstrap pass passes it off,
+because that pass only collects anchors. Extract then writes its centroid traces, with the
+per-point 1/K0 list, to `chromatograms.centroid.parquet`; retrace writes
+`chromatograms.parquet`, and the centroid table (12-17 GB on a HYE diaPASEF run) is deleted
+afterwards through the helper that also deletes a grouped run's band tables
+(`stages::delete_intermediate`). The manifest records each table once, as the later stages
+read it. The `.d` path comes from the spectra report (`params.mzml` with
+`reader = timsrust`); a run whose spectra were read from mzML, including a timsTOF mzML
+from msconvert, is refused with the reason, as are `groups.window_groups > 1` and
+`extract.promote_top_peaks > 1` (`Config::validate`). The standalone `mumdia retrace`
+takes the same inputs by path (docs/23), and `mumdia extract` writes the 1/K0 list for it
+under `retrace.enabled`.
+
+**How it runs.** The frame index is read without decoding, and every frame inside the
+extracted candidates' RT windows (plus 5 s) is decoded once and held as a `TofFrame`
+(`convert::tims_frames`): its events sorted by TOF and packed into one `u64` each, with a
+table of the first event of every 64-index TOF bucket, so a TOF window is one short binary
+search (`TofFrame::first_at`, pinned to the whole-frame `partition_point` by a unit test).
+The chromatograms are read by the table's actual row groups, so a v2 table is always
+decoded from a row-group start, on one reader plus up to seven leased from a process-wide
+pool (`sched::DecoderLease`, which also bounds the features stage's decoders). They are
+summed in parallel per candidate, with the frames and slot scans planned once per
+candidate grid, and written through `chromatograms::writer` with whole row groups encoded
+on the codec pool (`TableWriter::with_row_groups_in_flight`,
+`chromatograms::ROW_GROUPS_IN_FLIGHT`). The writer publishes only after the last row group,
+so an error leaves no partial table. Peak memory is the held frames. The report's `stats`
+carry the rebuilt and copied row counts, the frames decoded, the readers, the raw events
+summed, the fragment grid points without a frame, the MS1 residual and the time of each
+phase.
+
 ## Key types and functions
 
 | Name | file:line | What it does |
@@ -825,7 +948,8 @@ most-intense rule.
 | `Contested` | `extract.rs:130` | Per-candidate two-pass contested-peak stats: `won`/`lost` intensity, `n_won`/`n_lost` peak counts, `apportioned` share |
 | `CandOut` | `extract.rs:1656` | Per-candidate parallel-map result (PSM row + chrom rows + peaks); one candidate may yield several |
 | `Prober` / `Prober::probe` | `extract.rs:38`, `extract.rs:57` | Dispatch a peak probe to fragindex or bucketed backend |
-| `MassOffset::factor_at` | `extract.rs:640` | Scalar or m/z-interpolated ppm divisor for observed m/z |
+| `MassOffset::factor_at` / `read_mass_cal` | `masscal.rs` | Scalar or m/z-interpolated ppm divisor for observed m/z; the one reader of `masscal.json`, shared with retrace |
+| `ms1_neighbours` | `extract.rs` | The MS1 scans an MS1 read takes the maximum over (`ms1_scan_halfwidth`); shared with retrace |
 | `claim_cue_multiplier` | `extract.rs:163` | Composite per-claimant cue weight for `CoelutionMultiCue` |
 | `demix_apex_scan` / `demix_solve_scan` | `extract.rs:259`, `extract.rs:279` | Spectrum-centric ridge-NNLS demix at one scan |
 | `demix_features_for` | `extract.rs:414` | Per-candidate demix features from a solved scan |
@@ -919,6 +1043,9 @@ here for one index.
 | `extract.emit_contested_features` (`config.rs:611`) | 2 F64 cols `contested_count_frac`, `apportioned_frac` (`extract.rs:2505`); forces the two-pass path (`extract.rs:1443`) | not measured; gate pending |
 | `extract.emit_demix_features` (`config.rs:592`) | 5 F32 cols `deconv_explained_frac`, `deconv_active`, `deconv_share`, `deconv_max_collinearity`, `shadow_kept_frac` (`extract.rs:2517`) | not measured; gate pending |
 | `extract.peak_claim` = `CoelutionMultiCue` / `CoelutionDemix` / `CoelutionShadow` (`config.rs:132`) | none; MultiCue is non-destructive unless `claim_cues.reassign`, the other two always rewrite extracted intensity | not measured; gate pending |
+| `retrace.enabled` (default false, diaPASEF only) | none; rewrites the chromatogram values from the raw `.d` and patches the `psms_extracted` apex scalars (section 9) | IM branch: +5.9% peptides E. coli (3 seeds), entrapment at an unchanged FDP, HYE +15.0% (seed 0); gate pending on main (docs/35 section 6) |
+| `retrace.repick` (default false) | none; patches `apex_rt` / `apex_im` | IM branch: +7.4% peptides E. coli (3 seeds), entrapment +5.4% real peptides at an FDP of 0.37-0.47%, HYE +8.4% (seed 0); gate pending on main |
+| `retrace.apex_features` (default false) | 1 F64 col `imc_ref_w` in `psms_extracted`; the tenth ion-mobility feature | IM branch: +1.3% alone, about 2.7% FDP on the added peptides; gate pending |
 | `compete.mode` (`CompetitionMode`, `config.rs:840`, default `winner_take_all`) | retains more rows in `competed`; optional `<out>.compete_audit.parquet` via `emit_competition_audit` (`config.rs:850`) | not measured; gate pending |
 
 ## Invariants, determinism, gotchas

@@ -51,7 +51,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 
 | Section | Struct | Fields | Stage document |
 |---|---|---|---|
-| [(top level)](#top-level) | `Config` | 17 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
+| [(top level)](#top-level) | `Config` | 18 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
 | [`convert`](#convert) | `ConvertConfig` | 12 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
 | [`prescreen`](#prescreen) | `PrescreenConfig` | 31 |  |
@@ -73,6 +73,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`mbr`](#mbr) | `MbrConfig` | 9 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 3 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
 | [`groups`](#groups) | `GroupsConfig` | 8 |  |
+| [`retrace`](#retrace) | `RetraceConfig` | 5 | [docs/09_extract.md](09_extract.md) |
 | [`peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]`](#peptidoformsfixed_mods--peptidoformsvariable_mods) | `ResidueMod` | 2 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 
 ## (top level)
@@ -98,6 +99,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | `mbr` | `MbrConfig` | the `MbrConfig` section's own defaults |  |  |
 | `experiment` | `ExperimentConfig` | the `ExperimentConfig` section's own defaults |  |  |
 | `groups` | `GroupsConfig` | the `GroupsConfig` section's own defaults |  |  |
+| `retrace` | `RetraceConfig` | the `RetraceConfig` section's own defaults |  | Raw-event trace rebuild for diaPASEF runs (`RetraceConfig`). Omitted from the canonical configuration while every key is at its default. |
 
 ## convert
 
@@ -541,6 +543,20 @@ Searching a run one isolation-window group at a time. A group of isolation windo
 | `delete_band_intermediates` | `bool` | `true` |  | Delete each band's `psms_extracted.parquet` and `features.parquet` (with their reports and schema companions, and `run.pin` where one was written) once the pool is written. Default `true` since 2026-09-27 (previously `false`). Disk only: no stage reads them after pooling. The features are carried by the competed table and the extracted table's one reader, the candidate audit, reads the pooled copy. On the immunopeptidomics runs the band features alone were 55 GB per run, in an experiment that wrote about 2.7 TB of artifacts. The manifest keeps their records, and the band directories can no longer be re-featured (set `false` to keep them for that); the chromatograms and competed tables that quant, rescore and `mumdia pool --groups-dir` read are kept. Measured before the default changed, on an eight-band entrapment run: `psms_scored.parquet`, the three quant tables and both TSVs byte-identical. |
 | `pool_competed` | `bool` | `false` |  | Write the run's pooled `psms_competed.parquet`. Default `false` since 2026-09-26 (previously `true`). With `false`, rescore reads the bands' own competed tables in band order, each with the run's `source`, and the pooled copy is not written: one full write and read of the run's widest artifact less (17.5 GB on one immunopeptidomics run of 63 bands, about 83 GB per run before the feature columns were narrowed to f32). This happens only where it cannot change a result: the bands' library row spans must be disjoint, so no candidate was searched in two bands and there is no overlap duplicate to drop, and neither the candidate audit (`extract.emit_candidate_audit`) nor match-between-runs (`mbr.strategy`), which read the pooled table, may be on. Otherwise the table is pooled as with `true`, and the log says why. `psms_scored.parquet` is byte-identical either way; what changes is the artifact set. The run's manifest then has no pooled `psms_competed` record, the scored table's report lists the band tables under `competed_inputs` with their `competed_sources`, and a later standalone `mumdia rescore` or audit needs the table rebuilt first with `mumdia pool --groups-dir`, which the band tables allow. `true` writes the pooled table as before. The default changed on the byte-identity, measured with `pool_chromatograms` off alongside (`docs/33_window_groups.md` section 5): on one immunopeptidomics run of 63 bands, `psms_scored.parquet`, the three quant tables and both TSVs were identical to the pooled run's, the run directory went from 152 to 80 GB, and the pool stage from 66 s (30 min on a disk that sustained 22 MB/s) to nothing; on a six-run HYE experiment of 16 bands a run, all 36 outputs the two arms share were identical. |
 | `pool_chromatograms` | `bool` | `false` |  | Write the run's pooled `chromatograms.parquet`. Default `false` since 2026-09-26 (previously `true`; see `pool_competed` for the measurement). With `false`, quant reads the bands' own chromatogram tables in band order, dropping from each the candidates the pool's overlap dedup gave to another band, and the pooled copy is not written: one full splice write, hash and read of the run's largest artifact less (59.5 GB on the immunopeptidomics run above). The pool writes those loser sets to `groups/overlap_losers.parquet` (`band`, `candidate_id`, with the band tables it belongs to named in its footer), so a later `mumdia quant --chromatograms <band tables> --overlap-losers <that file>` reads the same rows, and refuses band tables that are not the named ones in their order. Unlike `pool_competed` this holds for overlapping bands as well, including an overlap candidate compete deleted in one band (the losers are found in the chromatogram tables themselves), and nothing but quant reads the pooled table (the candidate audit and match-between-runs do not). The quant tables are byte-identical either way; what changes is the artifact set. There is no pooled `chromatograms.parquet` (one an earlier run left in the directory is removed) and no manifest record for it, `overlap_losers.parquet` is written and recorded instead, and the quant report's `chromatograms` lists the band tables with `chromatogram_dropped_candidates`. The band chromatogram tables are then the run's only chromatograms, so the band directories are no longer disposable once the run is accepted: deleting them loses re-quantification. `mumdia pool --groups-dir` rebuilds the pooled table from them. `true` writes the pooled table as before. |
+
+## retrace
+
+`RetraceConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/09_extract.md](09_extract.md).
+
+Chromatogram traces rebuilt from the raw timsTOF events (the `retrace` stage, between extract and features; docs/35_diapasef.md section 6, docs/09 section 9). Each fragment trace point becomes the sum of every raw event in the grid point's frame and in the quad slots whose isolation window holds the precursor, within the learned fragment tolerance and inside `apex_im +/- im_half_width`, instead of the intensity of one centroid. The MS1 isotope traces are rebuilt the same way from the MS1 frames extract samples. diaPASEF only: a run whose spectra were not read natively from a `.d` is refused. Every key is omitted from the canonical configuration at its default, and the whole section with them, so a configuration that does not set it keeps its config hash.
+
+| Field | Type | Default | Gated | Description |
+|---|---|---|---|---|
+| `enabled` | `bool` | `false` | benchmark-gated | Run the stage inside `run` and `run-experiment` (and the second pass), after extract. Extract then writes its centroid traces to `chromatograms.centroid.parquet`, which is deleted once retrace has written `chromatograms.parquet`. Not in the RT bootstrap pass, which only collects anchors. Default false. Benchmark-gated (docs/35_diapasef.md). |
+| `repick` | `bool` | `false` | benchmark-gated | Re-choose each candidate's apex retention time and 1/K0 centre on the raw events before the traces are rebuilt, among extract's apex and the peaks of the `extract.retain_top_peaks` sidecar. Needs `retain_top_peaks >= 2` and `promote_top_peaks = 1`, and is refused with `extract.apex_refine_intensity`. It overrides the apex that `apex_evidence_rank` chose, by design. Default false. Benchmark-gated. |
+| `im_half_width` | `f64` | `0.015` |  | Half-width in 1/K0 of the band around the candidate's `apex_im` (`im_pred_cal` when that is null) inside which raw events are summed, for the fragment and the MS1 traces alike. Measured flat from 0.012 to 0.020 on one diaPASEF run. Default 0.015. |
+| `ms1` | `bool` | `true` |  | Also rebuild the MS1 isotope traces (`ms1_mono`, `ms1_iso1`, `ms1_iso2`) and their apex scalars. False copies the centroid MS1 rows and keeps extract's MS1 scalars. Default true; kept as a switch until an engine ablation of the raw MS1 band confirms the prototype's +1.6%. |
+| `apex_features` | `bool` | `false` | benchmark-gated | Write `imc_ref_w` into `psms_extracted`, the agreement of the fragments' raw 1/K0 profiles at the apex, which the ion-mobility feature family then carries as its tenth feature. Needs `enabled` and a `features.im_features` other than `off`. Default false. Benchmark-gated: alone it measured +1.3% peptides, and the added peptides carried about 2.7% FDP. |
 
 ## peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]
 
@@ -1126,6 +1142,7 @@ moves to another function.
 | `MUMDIA_PYTHON_PEPTDEEP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `MUMDIA_PYTHON_RESCORE` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `MUMDIA_QUANT_SELECTIVE_READ` | engine | computed: on (quant skips, unread, the chromatogram data pages that hold no kept row). `0` reads every page of every row group it opens; the outputs are the same (`stages/quant.rs` `selective_read_enabled`) | `rust/mumdia/crates/mumdia/src/stages/quant.rs::selective_read_enabled` |
+| `MUMDIA_REPICK_DUMP` | engine | computed: off. Diagnostic: a path makes `retrace.repick` write every peak it scored there (candidate, order, apex RT, score); the pick is the same either way (`stages/retrace.rs` `repick`) | `rust/mumdia/crates/mumdia/src/stages/retrace.rs::repick` |
 | `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_hashed`, `scripts/mokapot_worker.py::main`, `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_RTW_FEATURES` | engine | computed: on when unset; `0` leaves the window-scaled RT error family out (`features.rs` `env_families`) | `rust/mumdia/crates/mumdia/src/stages/features.rs::env_families` |
 | `MUMDIA_SCRIPTS` | sidecar | `os.path.dirname(os.path.abspath(__file__` | `scripts/mh_shard_predict.py::<module>` |
@@ -1145,7 +1162,7 @@ moves to another function.
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `XDG_CACHE_HOME` | engine | computed: set by the desktop environment, often unset; an absolute value puts the engine's caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 
-100 variables are read: 38 engine-side, 66 sidecar-side, 4 on both sides.
+101 variables are read: 39 engine-side, 66 sidecar-side, 4 on both sides.
 
 ### Variables the code sets
 
@@ -1202,6 +1219,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-23 structs and 297 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 38 enumerations, 1 named profile(s), 100 environment variables read and 20 set.
+24 structs and 303 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 38 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
-28 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+31 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

@@ -17,7 +17,7 @@ peak carries a 1/K0. Using that dimension takes seven layers:
 3. predict and calibrate the 1/K0 of each precursor (section 4, in the tree);
 4. gate and score candidates with 1/K0 (section 5, in the tree);
 5. rebuild traces from the raw TIMS events and choose the apex jointly in retention time and
-   1/K0 (section 6);
+   1/K0 (section 6, in the tree);
 6. extend retention-time recalibration and match-between-runs with a 1/K0 window (section 7);
 7. quantify with cross-run fragment consistency (section 8).
 
@@ -253,7 +253,7 @@ calibration takes, on 4D data, the in-tolerance peak nearest the seed's `observe
 of the most intense one (`ms1cal::estimate`), by the same `spectra::ms1_peak_near` rule.
 
 Chromatograms carry the per-point 1/K0 only while a consumer is on (the feature family below;
-retrace in section 6): version 3 is version 1 plus `im`, version 4 is version 2 plus
+retrace, section 6): version 3 is version 1 plus `im`, version 4 is version 2 plus
 `im_trimmed`, the IM branch's numbering, so `extract.chromatogram_schema = 1` keeps working. The
 list adds about 38% to the table. Every recording site reads the version back from the table
 (`chromatograms::recorded_schema`). The 4D chromatogram writer encodes whole row groups as jobs
@@ -282,7 +282,7 @@ family fails the rescore schema check, whose message names the family. Evidence:
 E. coli (P5, three seeds), entrapment only with the block on, one unpaired HYE seed; the default
 moves to `auto` with arm T12 and seeds on a second acquisition. The IM branch's 1/K0 peak-shape
 block (P7, `im_shape_features`: -0.9%, re-test -0.1%) is not ported. `imc_ref_w`, the retrace
-apex co-elution in 1/K0, comes with retrace (section 6). An open question is a pooled
+apex co-elution in 1/K0, is the family's tenth feature under `retrace.apex_features` (section 6). An open question is a pooled
 `|im_error| / w_im` feature, by analogy with `rtw_*`: the IM branch dropped it as constant
 within one run, but `run-experiment` pools runs by default.
 
@@ -314,8 +314,115 @@ refused on 4D input until section 7.
 
 ## 6. Retrace
 
-Filled by PR 4: rebuilding the chromatogram traces from the raw TIMS events of the `.d`, and
-re-picking the apex jointly in retention time and 1/K0.
+An extract trace point on a diaPASEF run is the intensity of one convert centroid, and the
+centroiding loses weak signal. Retrace rebuilds the traces from the raw TIMS events of the
+`.d`, after extract and before features, and can choose the apex again, jointly in retention
+time and 1/K0, on the same events. docs/09 section 9 describes the stage; this section gives
+its place in the diaPASEF work and its measurements.
+
+### What it does
+
+- Every fragment trace point becomes the sum of the raw events in the grid point's frame, in
+  the quad slots whose isolation window holds the precursor, within the learned fragment
+  tolerance of the calibrated fragment m/z and inside `apex_im +/- retrace.im_half_width`
+  (0.015). The MS1 isotope traces are rebuilt the same way from the MS1 frames extract
+  samples (`ms1_neighbours`, `extract.ms1_scan_halfwidth`), within `extract.prec_tol_ppm` of
+  the MS1 row's m/z, which already carries the learned MS1 offset.
+- `retrace.repick` (default off) chooses, among extract's apex and the
+  `extract.retain_top_peaks` sidecar peaks, the peak whose best 1/K0 band agrees best with
+  the library, and moves `apex_rt` and `apex_im` there before the traces are rebuilt.
+- `psms_extracted` is patched once, in place (v4 kept): the re-picked apex, the apex scalars
+  read from the rebuilt traces, and under `retrace.apex_features` the column `imc_ref_w`,
+  which the ion-mobility feature family carries as its tenth feature.
+
+Keys: `retrace.enabled` (false), `retrace.repick` (false), `retrace.im_half_width` (0.015,
+fragments and MS1), `retrace.ms1` (true) and `retrace.apex_features` (false), all omitted
+from the canonical configuration at their defaults. `Config::validate` refuses `repick`
+without `extract.retain_top_peaks >= 2`, with `extract.apex_refine_intensity`, and
+`repick` or `apex_features` without `enabled`; `apex_features` with
+`features.im_features = off`; and `enabled` with `groups.window_groups > 1` or with
+`extract.promote_top_peaks > 1`. A run whose spectra were not read natively from a `.d`
+is refused when the chain reaches retrace, with the reason.
+
+### How it differs from the IM branch
+
+- It reads and writes the v2 chromatogram layout through `crate::chromatograms` and records
+  the version through `chromatograms(layout, has_im)`; the IM branch forced
+  `chromatogram_schema = 1` under retrace. The rows are read by the table's actual row
+  groups, and the writer is the chromatogram writer with whole row groups encoded on the
+  codec pool (`with_row_groups_in_flight`); `ParallelTableWriter` is not ported. Retrace's
+  bytes therefore differ from the IM branch's through encoding only, and a comparison with an
+  IM-branch retrace artifact is a content comparison.
+- One `psms_extracted` patch replaces the IM branch's `psms_extracted.repick.parquet` and
+  `<chromatograms>.apex.parquet`; the apex scalars are refreshed whenever retrace rewrites
+  traces, with no key, and `features.retrace_apex` became `retrace.apex_features`.
+  `ms1_isom1` has no trace to rebuild from and stays IM-blind (docs/09 section 9).
+- Retrace runs inside the extract-to-compete core. The RT bootstrap pass does not retrace;
+  `run`, `run-experiment` and the second pass do. The centroid table is deleted after
+  retrace succeeds, through the helper that also deletes a grouped run's band tables; there
+  is no `MUMDIA_KEEP_INTERMEDIATE`.
+- The mass calibration is read through the one reader of `masscal.json`
+  (`masscal::read_mass_cal`), and the MS1 frames through the selection extract's MS1 read
+  uses. A half-width of 0 there is the IM branch's nearest-frame rule; the default of 1 takes
+  the largest sum over the nearest frame and its two neighbours.
+- A fragment grid point whose raw sum is empty gets the 1/K0 `+0.0` (the IM branch kept the
+  centroid value), so the trace keeps the invariant both chromatogram layouts rely on. The
+  1/K0 at a zero-intensity point is read by no feature.
+- `min_events` (a no-op at its default of 1) and `ms1_im_half_width` are not ported.
+- `imc_ref_w` goes through the one leave-one-out reference-correlation kernel
+  (`stats::loo_ref_corr`), which the co-elution and interference families now share; the 3D
+  feature values are bit-identical (`the_loo_kernel_is_bit_identical_to_the_copies_it_replaced`).
+- The chromatogram readers beyond the first are leased from a process-wide pool
+  (`sched::DecoderLease`, the features stage's lease, lifted to the crate) instead of a fixed
+  eight.
+
+### Measured on the IM branch
+
+All counts are stripped peptides at `peptide_q_value` 1% with `nn_torch`, on the base the IM
+branch had at the time (the L1d configuration with its RT refit); the integrated pipeline is
+re-measured under gates G1 to G5 and arms T3b and T10 (plan section 9).
+
+| arm | E. coli peptides (seeds 0 / 1 / 2, mean) | entrapment | HYE diaPASEF, six runs, seed 0 |
+|---|---|---|---|
+| retrace off | 12,927 / 12,950 / 12,874 (12,917) | | 77,734 peptides |
+| `retrace.enabled` | 13,619 / 13,679 / 13,735 (13,678, +5.9%) | real peptides at the prototype's level, FDP 0.40-0.44% | 89,424 peptides (+15.0%); ProteoBench ions 69,856 -> 77,627, median abs epsilon 0.185 -> 0.171, CV 0.118 -> 0.108 |
+| + `retrace.repick` | 14,869 / 14,911 / 14,953 (14,911, +7.4%) | 13,975 real peptides (+5.4% over the control's 13,258) at an FDP of 0.37-0.47% | 100,790 peptides (+8.4% over the same pipeline without the re-pick); ProteoBench ions +15.2% |
+
+Decoy fraction 0.99% in every E. coli arm. Precursors on E. coli rose from 15,679 to 16,737
+with retrace and to 18,544 with the re-pick.
+
+Levers measured on the retrace base:
+
+- The apex scalars refreshed from the raw traces alone: +0.6%. Main refreshes them with every
+  retrace, so a table never holds raw traces beside centroid scalars.
+- `imc_ref_w` alone: +1.3%, both together +1.8% (13,920); entrapment for both +2.2% real
+  peptides at an FDP of 0.43-0.51% against 0.40-0.44%. The added peptides carried about 2.7%
+  FDP, so `retrace.apex_features` stays off until an entrapment recheck of the added set.
+- The raw MS1 band: +1.6% (three seeds, entrapment-clean) at 20 ppm and the nearest frame.
+  `retrace.ms1` stays a switch until an engine ablation confirms it (arm T10, which also
+  compares `ms1_scan_halfwidth` 0 with 1 and 3 ppm with the diaPASEF value).
+- Narrowing the summation tolerance to 7 or 5 ppm lost 1.0% or 2.3%; retrace sums within the
+  learned tolerance. A band half-width from 0.012 to 0.020 was flat. Event floors of 2 or 3
+  lost identifications.
+- An RT prior on the re-pick (sigma = the RT-window half-width) moved 3,064 candidates of one
+  HYE run onto the reference peak, but identifications stayed within seed noise: E. coli
+  +0.25%, entrapment -0.6% real peptides at an FDP of 0.41-0.42%, HYE target rows +0.5%. Not
+  kept. `MUMDIA_REPICK_DUMP` writes every scored peak, which is what this counterfactual was
+  computed from.
+- K = 3 or 8 sidecar peaks instead of 5, and aligning the seed rows to the chosen apex, were
+  within noise.
+
+### Cost
+
+Retrace holds every frame inside the candidates' RT windows: 21 GB on the E. coli file and
+36-39 GB per HYE diaPASEF run, on top of extract's own peak, which is why it stays a stage
+after extract rather than folding into it. On the IM branch it took 12 s on E. coli and 160 s
+per HYE run (7.4e9 trace points) before the TOF bucket table, with the re-pick 15 s and
+6-7.5 min. Profiles showed 70-80% of the busy time in the whole-frame binary search for the
+first event of each TOF window; the per-frame bucket table (`TofFrame::first_at`) took one
+HYE retrace call from 2:37 to 1:44 at 0.9 GB more memory. The integrated stage is re-measured
+under G5 (one retrace and three concurrent ones), because the v2 layout, the codec-pool
+writer and the leased readers all change its wall time.
 
 ## 7. Retention-time guards and match-between-runs
 

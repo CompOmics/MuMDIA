@@ -64,6 +64,11 @@ competition columns default to 0.0 when absent: `contested_frac`,
 With the ion-mobility family on (see `ion_mobility` below), the 1/K0 evidence of
 `psms_extracted` v4 is read as well (`opt_f64`, all `None` when absent): `apex_im`,
 `apex_im_mad`, `ms1_apex_im`, `im_pred_cal`. With the family off they are not read.
+Under `retrace.apex_features` (`FeaturesParams::imc_ref_w`) the family also reads
+retrace's `imc_ref_w` (f64), which must then be present; a table without it is an error,
+not a column of zeros. After a retrace the apex scalars this stage reads
+(`apex_rt`, `apex_im`, `apex_intensity`, `n_matched_fragments`, `ms1_mono`, `ms1_iso1`,
+`ms1_iso2`) are the patched raw-trace values (docs/09 section 9).
 
 ### Consumed: chromatograms (`features.rs:591`-`618`)
 
@@ -323,12 +328,15 @@ The registry the battery reads is `families(im)`, three layers deep:
    on by default since 2026-10-08 and left out by `MUMDIA_WINDOW_FEATURES=0` or
    `MUMDIA_RTW_FEATURES=0` (which restores the previous schema). It is read once
    per process: its `OnceLock` holds only these environment-gated families;
-3. `families(im)`, which appends `ion_mobility` when `im` is on. `im` is
-   `features.im_features` as the run or experiment resolved it, passed into
-   `active_features(set, im)`, `extended_name_refs(im)`,
-   `extended_value_plan(im)` and `extended_values(e, im)`. Nothing latches it, so
-   the schema id an orchestrator records, the features stage and the rescore
-   projection read one list. Each of the two resulting lists is built once.
+3. `families(im)`, which appends `ion_mobility` when `im` is on, and after it the
+   one-name family of `imc_ref_w` under `ImFamily::WithImcRefW`. `im` is an
+   `ImFamily` (`Off`, `On`, `WithImcRefW`; a `bool` converts to the first two):
+   `features.im_features` as the run or experiment resolved it, with `imc_ref_w` when
+   `retrace.apex_features` is on in a pass that retraced. It is passed into
+   `active_features(set, im)`, `extended_name_refs(im)`, `extended_value_plan(im)`
+   and `extended_values(e, im)`. Nothing latches it, so the schema id an orchestrator
+   records (`active_features_of(config, has_im)`), the features stage and the rescore
+   projection read one list. Each of the three resulting lists is built once.
 
 Deduplication (`extended_name_refs`, `features.rs:84`): a name that already
 appears in `MINIMAL_FEATURES` or `RICH_EXTRA` (`reserved_names`,
@@ -337,8 +345,9 @@ appearance. In the current tree four Extended names are dropped as reserved
 collisions: `spectral_angle` (similarity vs Minimal), `rt_error_abs` (rt vs
 Minimal), `peptide_length` and `seed_identified` (novel vs Minimal/Rich). So the
 380 raw family names of the default registry (sixteen families plus `window` and
-`rt_window`) reduce to 376 unique Extended names, and the nine `ion_mobility` names
-make 385 when the family is on.
+`rt_window`) reduce to 376 unique Extended names, the nine `ion_mobility` names
+make 385 when the family is on, and `imc_ref_w` makes 386 under
+`retrace.apex_features`.
 
 ## The three feature sets
 
@@ -657,7 +666,7 @@ window is `psms_extracted`'s `rt_lo`/`rt_hi` (`extract.emit_rt_window`) and the 
 half-width the smallest over all rows; all 0 without them. Appended after `window`
 by `env_families()`; `MUMDIA_RTW_FEATURES=0` leaves it out.
 
-### ion_mobility (9, `im.rs`)
+### ion_mobility (9, or 10 with `imc_ref_w`; `im.rs`)
 
 The 1/K0 evidence of a diaPASEF run (docs/35_diapasef.md). In the battery only when
 `features.im_features` resolves on (`off` by default; `auto` is on when the spectra
@@ -678,7 +687,14 @@ from `psms_extracted` v4 and three from the per-point 1/K0 of the chromatograms:
   intensity or 1/K0: |weighted mean 1/K0 - prediction|, the weighted SD of all points,
   and the SD of the per-fragment mean 1/K0 weighted by each fragment's summed
   intensity (0 with fewer than two fragments). `stats::weighted_mean_sd` is the
-  kernel.
+  kernel;
+- `imc_ref_w` (`im::APEX_NAMES`), the tenth, only under `retrace.apex_features`:
+  retrace's apex 1/K0 agreement of the fragments, the predicted-intensity-weighted
+  mean leave-one-out reference correlation of each fragment's raw 1/K0 profile at the
+  apex (`stats::loo_ref_corr`, the kernel of `frag_loo_ref_corr_*` and of the
+  interference family's prune; docs/09 section 9). Measured on the IM branch: +1.3%
+  peptides alone on E. coli (three seeds), and the added peptides carried about 2.7%
+  FDP, so it stays off until an entrapment recheck.
 
 A missing input gives 0.0, so the columns are constant on a 3D run, and there is no
 data gate on column presence: the switch alone decides whether the columns exist.

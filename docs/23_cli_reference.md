@@ -46,6 +46,7 @@ Commands:
   rt-im-train     Per-run RT calibration + windows -> run_windows.parquet, cal.json
   sub-library     Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires
   extract         Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
+  retrace         Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. The configuration's `retrace` section applies, `enabled` aside
   features        Compute the minimal feature set -> features.parquet + PIN
   pool            Pool a grouped run's band artifacts into the run-level tables
   compete         Keep the best candidate per competition group -> psms_competed.parquet
@@ -142,6 +143,7 @@ first sentence of the description, with the full text in the section below.
 | [`rt-im-train`](#rt-im-train) | yes | Per-run RT calibration + windows -> run_windows.parquet, cal.json |
 | [`sub-library`](#sub-library) | yes | Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires |
 | [`extract`](#extract) | yes | Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms |
+| [`retrace`](#retrace) | yes | Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. |
 | [`features`](#features) | yes | Compute the minimal feature set -> features.parquet + PIN |
 | [`pool`](#pool) | no | Pool a grouped run's band artifacts into the run-level tables |
 | [`compete`](#compete) | yes | Keep the best candidate per competition group -> psms_competed.parquet |
@@ -160,8 +162,8 @@ first sentence of the description, with the full text in the section below.
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-22 of the 26 documented subcommands accept `--config`:
- `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
+23 of the 27 documented subcommands accept `--config`:
+ `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 4 do not, so every setting they use comes from their own flags:
  `audit`, `inspect`, `pool`, `quant-lfq`.
@@ -429,6 +431,41 @@ Options:
 
       --fragment-offset <FRAGMENT_OFFSET>
           The library row that `--lib-precursors` row 0 came from, when that table is one isolation-window band of a larger library (`groups.window_groups` writes such bands, with ids rebased to `0..n`). The band's fragments are then read from the shared `--lib-fragments` table by that id range, selectively when the table is sorted by `candidate_id`, so a band needs no fragment table of its own
+
+      --config <CONFIG>
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
+
+## retrace
+
+```text
+Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. The configuration's `retrace` section applies, `enabled` aside
+
+Usage: mumdia retrace [OPTIONS] --raw <RAW> --chromatograms <CHROMATOGRAMS> --psms-extracted <PSMS_EXTRACTED> --run-windows <RUN_WINDOWS> --lib-precursors <LIB_PRECURSORS> --out <OUT>
+
+Options:
+      --raw <RAW>
+          The diaPASEF `.d` the spectra were converted from
+
+      --chromatograms <CHROMATOGRAMS>
+          Extract's chromatograms (the centroid traces), with their per-point 1/K0
+
+      --psms-extracted <PSMS_EXTRACTED>
+          Extract's psms_extracted; under `retrace.repick` its `.peaks.parquet` sidecar must sit beside it
+
+      --run-windows <RUN_WINDOWS>
+
+      --lib-precursors <LIB_PRECURSORS>
+
+      --mass-cal <MASS_CAL>
+          Optional mass recalibration json (search-seed <seed>.masscal.json)
+
+      --out <OUT>
+          The rebuilt chromatograms
+
+      --out-psms <OUT_PSMS>
+          Where the patched psms_extracted goes; default: patch --psms-extracted in place
 
       --config <CONFIG>
 ```

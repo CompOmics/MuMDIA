@@ -80,6 +80,7 @@ STAGE_DOC = {
     "rt_im_train": "docs/08_rt_im_train.md",
     "extract": "docs/09_extract.md",
     "extract.claim_cues": "docs/09_extract.md",
+    "retrace": "docs/09_extract.md",
     "features": "docs/10_features.md",
     "compete": "docs/11_compete_rescore_fdr.md",
     "rescore": "docs/11_compete_rescore_fdr.md",
@@ -1177,6 +1178,11 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "on (quant skips, unread, the chromatogram data pages that hold no kept row). "
         "`0` reads every page of every row group it opens; the outputs are the same "
         "(`stages/quant.rs` `selective_read_enabled`)"
+    ),
+    "MUMDIA_REPICK_DUMP": (
+        "off. Diagnostic: a path makes `retrace.repick` write every peak it scored there "
+        "(candidate, order, apex RT, score); the pick is the same either way "
+        "(`stages/retrace.rs` `repick`)"
     ),
     "MUMDIA_SIDECAR_DIR": (
         "`<out-dir>/sidecar_work` under `run` and `run-experiment`; `sidecar_work` in the "
