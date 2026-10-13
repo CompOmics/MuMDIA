@@ -18,7 +18,8 @@ peak carries a 1/K0. Using that dimension takes seven layers:
 4. gate and score candidates with 1/K0 (section 5, in the tree);
 5. rebuild traces from the raw TIMS events and choose the apex jointly in retention time and
    1/K0 (section 6, in the tree);
-6. extend retention-time recalibration and match-between-runs with a 1/K0 window (section 7);
+6. extend retention-time recalibration and match-between-runs with a 1/K0 window (section 7, in
+   the tree);
 7. quantify with cross-run fragment consistency (section 8).
 
 Until a layer lands, the 1/K0 columns it would read are written but ignored. A run on a diaPASEF
@@ -162,10 +163,11 @@ to change:
   calibration and chromatogram schema all key on m/z only. They come back together with a
   measured grouped diaPASEF run;
 - the prescreen (`prescreen.enabled`, `tag_prefilter`, `score_before_prediction`): its window
-  groups are keyed on the m/z pair;
-- the experiment second pass (`mbr.strategy = second_pass`, the default of `run-experiment`): it
-  has no 1/K0 window for the transferred precursors. Set `mbr.strategy = none`. Section 7 lifts
-  this refusal.
+  groups are keyed on the m/z pair.
+
+The experiment second pass (`mbr.strategy = second_pass`, the default of `run-experiment`) was
+refused here until it had a 1/K0 window for the precursors it searches again; section 7 adds it
+and lifts the refusal.
 
 Shadow demotion (`rescore.shadow_min_shared`) keys on m/z isolation windows; on diaPASEF it may
 demote a precursor that shares fragment m/z with a co-isolated ion in another mobility band. Its
@@ -309,8 +311,8 @@ their apex 1/K0 lie within the tolerance. The apex 1/K0 is joined from each run'
 without an apex 1/K0, every row of a 3D run, and a rescore given no `psms_extracted`
 (`--psms-extracted` for a standalone `mumdia rescore`) keep the m/z-and-RT test, so with the
 term off the demotion is bit-identical. Arm T6 compares the demotion off, on without the term,
-and on with it. The second-pass rescore gets no `psms_extracted` yet; the second pass is
-refused on 4D input until section 7.
+and on with it. The second-pass rescore reads each run's second-pass `psms_extracted`, whose
+candidate ids are the empirical library's (section 7).
 
 ## 6. Retrace
 
@@ -426,8 +428,95 @@ writer and the leased readers all change its wall time.
 
 ## 7. Retention-time guards and match-between-runs
 
-Filled by PR 5: the anchor filters of the retention-time calibration and the 1/K0 extension of
-the experiment second pass, which lifts the refusal of section 3.
+### Retention time from identifications
+
+`rt_bootstrap` (`rt_im_train.multihead_anchors`, docs/08 section 4f) is the one mechanism that
+refits retention time on identifications. The IM branch's `rt_im_train.refit` (a full first
+pass, a pooled rescore, a cross-fitted 80-head refit, a LOESS and 1/K0 recentre, and a second
+extraction per run) is not ported: cross-fitting measured equal to in-sample fitting (12,916
+against 12,871), and its gain cannot be split onto the bootstrap's design without an arm on
+TIMS data (arm T1 below).
+
+What the refit taught is kept as two guards (docs/08 section 4g). With many anchors the
+multi-head calibration returned absurd iRTs for about 2% of library rows (up to 3.8e5 s) and an
+erratic ridge alpha; on HYE diaPASEF the first pass accepted 63-64k target PSMs per run, well
+past the 29,419 anchors at which the spline failed, so both guards are preconditions of
+`multihead_anchors = search` on TIMS data.
+
+- **Anchor x-domain filter** (`rt_im_train.anchor_x_filter`, default off): the anchors outside
+  `[Q1 - 3 IQR, Q3 + 3 IQR]` of their predicted iRT are dropped before any fit, so a few absurd
+  anchors no longer stretch the LOESS grid. It replaces the IM branch's `robust_calibration`,
+  whose p0.5 / p99.5 x fences break down at 0.5% contamination per side; the branch's y-outlier
+  cut is not ported. On one HYE diaPASEF run the IM filter took the global slope from 0.03-0.13
+  to about 1.00 and the in-sample residual to 3.7-4.0 s, removing 362-489 anchors. It becomes
+  always on only if it removes 0 anchors on the 3D benchmark anchors (G0).
+- **Multi-head output-range guard** (`deeplc_finetune.py`, no key): calibrated iRTs more than
+  one anchor RT span beyond the anchors are clamped before the library is written, on every
+  prediction path, with the count, fraction and ridge alpha in the library's `summary.json`. It
+  is a no-op when nothing is out of range, which is expected on 3D data (to be verified under
+  G0 on Astral and AIF).
+
+No anchor cap is added (`--max-ref` takes the first rows in m/z order, and a cap did not
+prevent the failure).
+
+Planned arms: **T2**, `multihead_anchors = search` against `auto` on TIMS after both guards (the
+native seed has about 5,000 anchors, so `auto` keeps the seed; reference IM L1d variant B, E. coli
+12,919 over three seeds, entrapment 11,989 real at an FDP of 0.41-0.44%); **T1**, the RT
+recentre increment, the bootstrap with and without a second LOESS on the search anchors, three
+seeds, E. coli entrapment and quantification ions. A recentre that gains becomes one default-off
+sub-option of `rt_bootstrap`, not a refit path, and widths are never sized from the refit (IM
+arm A1, refit widths: -4.0%). Runs without a DeepLC interpreter get no bootstrap, so they would
+not get a recentre either.
+
+### Match-between-runs: the second pass on 4D data
+
+Main's second pass (docs/12, "Second pass") is the one mechanism; the IM branch's
+`mbr.second_pass` keys, `scripts/mbr_second_pass.py`, its separate decoys and its re-extraction
+tier are not ported (its arms B to D showed that the split library and report cut and the new
+decoys add nothing worth a second mechanism: eq -0.004 at 300 fewer ions, and -0.003 at about
+750 fewer ions). Main's second pass gains three things on data with 1/K0, each a no-op on 3D
+data:
+
+- **Consensus 1/K0.** The median of the runs' re-picked apex 1/K0 among the confident apexes,
+  joined from each run's `psms_extracted` on `(candidate_id, selected_peak_rank)` through the
+  ordered-map join the shadow term uses (`extract::apex_im_where`), each run moved onto the
+  retention-time reference by its median offset over at least `MIN_SHARED` shared precursors
+  (IM measured offsets of -0.002 to +0.0002). Fallbacks: the winning row's apex 1/K0, then the
+  library's `predicted_im`. One override per library row carries the retention time and the
+  1/K0 (`sub_library::LibOverride`), and `plan_rows` gives it to both members of each pair, so
+  the decoy shares its target's values (section 4 rule). Offsets and counts go to
+  `empirical_library.json` (`im`).
+- **1/K0 window floor.** With an observed consensus the second-pass `w_im` falls to about
+  0.008-0.010, and the IM branch lost 8% of the reproducible rows to the 1/K0 gate (37,326
+  first-pass accepted library rows not reproduced, 33,755 not extracted; 99,711 ions against
+  105,801 with a 0.04 floor). Each run's `im_window_min` is raised to its first-pass `w_im`;
+  `cal.json` records the floor and its source. It is derived from the data and has no key.
+- **Quantification trace pad.** Extract and retrace record traces `(fixed integration
+  half-width + baseline flanks) x cycle time` beyond the narrow second-pass RT window (IM's
+  held-out p99 of the consensus residual: +/-7.6-8.8 s, against about +/-15 s that a 4-scan
+  half-width plus flanks needs at 0.97 s per scan), while the apex, the gate and every feature
+  stay inside it. It replaces the IM branch's separate quantification traces.
+
+Retrace runs in the second pass (the chain hook of section 6, on there), and the second pass
+reuses the first pass's run plan. Two things remain to be checked on one diaPASEF experiment:
+that the second-pass chain's peak with retrace stays at or below the first pass's, and how often
+quantification windows and flanks were clipped before the pad (G4).
+
+**Diagnostics** (IM test 4): after the pooled second-pass rescore, per run the targets accepted
+by each pass, the new ones and the dropped ones, and the accepted decoys per accepted target in
+anchor and non-anchor runs, logged and written to `empirical_library.json` (`diagnostics`). On
+the IM branch this decoy fraction was 0.77-0.79% in anchor runs against 1.84-1.89% in non-anchor
+runs, about twice the nominal 1% where most new rows are; it is the open FDR point of the second
+pass on TIMS data, and the multi-run entrapment (G2) is its gate.
+
+**The library cut is the report cut.** In IM entrapment test 3, 113-114 of 125 reportable false
+library entries came back in pass 2. `Config::validate` warns when `mbr.q_anchor > 0.01`.
+
+Planned arms: **T8**, consensus 1/K0 against the calibrated library 1/K0 in the second pass,
+both under the floor (G2 multi-run entrapment, G3, G4); the override's 1/K0 stays only if T8
+shows a gain. **T9**, the first-pass `w_im` floor against IM's fixed 0.04, with the first-pass
+`w_im` values and the 1/K0-gate losses on second-pass rows. No diaPASEF result of main's second
+pass is reported until it has run on a TIMS pool.
 
 ## 8. Quantification
 

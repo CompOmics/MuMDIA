@@ -271,6 +271,7 @@ RT-calibration sidecar (written to `out_cal`, not part of the Parquet contract).
 | `multiplier` | number | RT window multiplier |
 | `n_train` | integer | number of confident anchors used |
 | `calibration_status` | string | `loess`, `linear`, or `fallback_fixed` |
+| `n_rt_outliers_removed` | integer | only under `rt_im_train.anchor_x_filter` and only when above 0: the anchors outside `[Q1 - 3 IQR, Q3 + 3 IQR]` of their predicted iRT, dropped before every fit; `n_train` counts the rest |
 
 On a run whose seed carries `observed_im` (spectra with 1/K0), and only there, `cal.json` also
 holds the ion-mobility block below, and the `run_windows` report's stats gain `im_n_train` and
@@ -288,6 +289,7 @@ holds the ion-mobility block below, and the `run_windows` report's stats gain `i
 | `im_window_multiplier` | number | multiplier on that percentile |
 | `im_window_min` | number | lower clamp of `w_im` |
 | `im_holdout_frac` | number | fraction of anchor base peptides held out (the constant 0.3) |
+| `im_window_floor` | object | second pass of match-between-runs only, on a run whose first pass had a finite `w_im`: `{floor, configured, first_pass_w_im, source}`, the `im_window_min` applied (the larger of the configured value and the first pass's `w_im`) and the first-pass `cal.json` it came from |
 | `im_n_holdout` | integer or null | held-out anchors |
 | `im_holdout_resid_abs_median` | number or null | median held-out absolute residual (1/K0) |
 | `im_holdout_resid_p_im` | number or null | held-out residual at `p_im`, before the multiplier |
@@ -393,6 +395,14 @@ grid are available.
 
 `rt`/`intensity` use `LargeList` (64-bit offsets) because the total list-value
 count can exceed the 32-bit `ListArray` offset ceiling on large candidate sets.
+
+Each trace covers the candidate's RT window `[rt_lo, rt_hi]`, with one exception: the second
+pass of match-between-runs on a run with ion mobility records the traces `params.trace_pad_s`
+seconds further on each side (the extract report of both tables, carried by retrace), so a
+fixed integration window and its baseline flanks fit around an apex near the window's edge
+(docs/12, "Second pass"). The schema is unchanged. The features stage reads the parameter and
+cuts every trace back to the row's window (`psms_extracted` `rt_lo`, `rt_hi`) before computing
+anything; quantification reads the whole trace.
 
 The table above is schema version 1, the default before 2026-09-27. Version 2, the
 default since, is the layout below. Versions 3 and 4 add the per-point 1/K0 of a 4D run to
@@ -958,14 +968,40 @@ The default `mbr.strategy = second_pass` adds these to an experiment directory
 | path | content |
 |---|---|
 | `first_pass/scored_combined.parquet` | the pooled first pass, `psms_scored` schema |
-| `second_pass/library/lib_precursors.parquet` | `fragment_library_precursors`: the first library's rows of every experiment-wide accepted target and its paired decoy, ids contiguous from 0, `predicted_irt` = cross-run consensus (s, reference run's scale) |
+| `second_pass/library/lib_precursors.parquet` | `fragment_library_precursors`: the first library's rows of every experiment-wide accepted target and its paired decoy, ids contiguous from 0, `predicted_irt` = cross-run consensus (s, reference run's scale); on an experiment with ion mobility and a library with `predicted_im`, `predicted_im` = cross-run consensus apex 1/K0 (reference run's scale), the decoy taking its target's value in both columns |
 | `second_pass/library/lib_fragments.parquet` | `fragment_library_fragments` of those rows, ids remapped |
 | `second_pass/library/entries.parquet` | `candidate_id` (u32) of the first library's rows kept |
-| `second_pass/library/empirical_library.json` | counts and alignment summary (`entries`, `targets`, `decoys`, `reference_source`, `runs_aligned`, `runs_unaligned`, `entries_from_winner`, `entries_without_decoy`, `median_observations`, `q`) |
+| `second_pass/library/empirical_library.json` | counts and alignment summary (`entries`, `targets`, `decoys`, `reference_source`, `runs_aligned`, `runs_unaligned`, `entries_from_winner`, `entries_without_decoy`, `median_observations`, `q`); `im` and `diagnostics` below, each only on an experiment with ion mobility |
 | `second_pass/<run>/` | the run's seed, windows, calibration, extraction, features and competed table on the empirical library |
 
 The root `scored_combined.parquet` is then the second pass's, its `candidate_id` in the
 empirical library's numbering.
+
+`empirical_library.json`, `im` (present when some run's first-pass `psms_extracted` carries an
+apex 1/K0):
+
+| field | JSON type | meaning |
+|---|---|---|
+| `reference_source` | integer or null | the run every run's 1/K0 was moved onto: the retention-time reference |
+| `runs_aligned` | integer | runs moved by their median offset, the reference included |
+| `runs_unaligned` | integer | runs with apex 1/K0 values sharing fewer than 200 precursors with the reference; they keep their own scale |
+| `offsets` | object | per `source`, the median of (reference - run) apex 1/K0 over the shared precursors; 0 for the reference |
+| `entries_from_runs` | integer | entries whose 1/K0 is the median over their confident runs |
+| `entries_from_winner` | integer | entries with no confident run carrying a 1/K0, which take their winning row's |
+| `entries_without_im` | integer | entries with no finite 1/K0, which keep the library's `predicted_im` |
+
+`empirical_library.json`, `diagnostics` (written after the pooled second-pass rescore; logged on
+every experiment, written on one with ion mobility). Rows are scored target or decoy rows at
+`run_psm_q <= q`; a decoy belongs to the entry it is paired with, and an entry's anchor runs are
+the runs where the first pass accepted it:
+
+| field | JSON type | meaning |
+|---|---|---|
+| `q` | number | `mbr.q_anchor` |
+| `runs` | array | per run: `source`, `first_pass_accepted` and `second_pass_accepted` (targets), `new` (accepted by the second pass only), `dropped_in_library` (accepted by the first pass only, among the entries), `dropped_outside_library` (accepted by the first pass in this run but not experiment-wide, so never searched again) |
+| `targets_anchor`, `decoys_anchor` | integer | accepted second-pass targets and decoys in their entry's anchor runs |
+| `targets_non_anchor`, `decoys_non_anchor` | integer | the same in the other runs |
+| `decoy_fraction_anchor`, `decoy_fraction_non_anchor` | number or null | decoys over targets of each group; null without targets |
 
 ## `audit` (`stages/audit.rs`)
 

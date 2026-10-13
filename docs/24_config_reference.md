@@ -63,7 +63,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`peptidoforms`](#peptidoforms) | `PeptidoformsConfig` | 7 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`predict_frag`](#predict_frag) | `PredictFragConfig` | 17 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
 | [`search_seed`](#search_seed) | `SearchSeedConfig` | 11 | [docs/07_search_seed.md](07_search_seed.md) |
-| [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 30 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
+| [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 31 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
 | [`extract`](#extract) | `ExtractConfig` | 44 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
 | [`features`](#features) | `FeaturesConfig` | 12 | [docs/10_features.md](10_features.md) |
@@ -318,6 +318,7 @@ Fragment traces over consecutive same-window scans.
 | `anchor_q_ladder` | `Vec<f64>` | `[0.02, 0.05]` |  | Relaxed `spectrum_q` cuts tried, in order, when fewer than `min_seed_for_calibration` target anchors pass `q_train`. Rungs at or below `q_train` are ignored; empty keeps the strict cut. When even the last rung is short, the multi-head calibration is skipped (the library keeps base-model retention times) instead of failing on an empty reference. |
 | `loess_span` | `f64` | `0.3` |  | LOESS span (fraction of points in each local fit). |
 | `loess_robust_iters` | `usize` | `0` |  | Robustness iterations of the RT LOESS (bisquare reweighting on six median absolute residuals). 0 (default) is the plain fit; 2 keeps a handful of false seed anchors from pulling the curve (single-cell runs: residuals of +14 to +82 s moved the calibration 2-3 s across the mid-gradient). |
+| `anchor_x_filter` | `bool` | `false` |  | Drop the anchors whose predicted iRT lies outside `[Q1 - 3 IQR, Q3 + 3 IQR]` of the anchors' predicted iRT before anything is fitted to them: the linear and LOESS fits, the window sizing (in-sample, held-out and local) and the composition correction all see the same filtered anchors. A few anchors with an absurd predicted iRT stretch the LOESS grid over the whole x range, so the gradient falls into one or two grid cells; `loess_robust_iters` reweights residuals and does not stop that. `cal.json` records `n_rt_outliers_removed` when anchors were removed. Default false: every anchor is fitted, as before. Omitted from the canonical configuration at its default. |
 | `composition_correction` | `bool` | `true` |  | Correct each candidate's calibrated RT for the composition-dependent residual that the predicted RT leaves (a per-run Huber regression of the anchors' residuals on charge 3, charge >= 4, length, internal K/R, His and Met-ox): on the single-cell Astral runs found charge-4 precursors elute 4.6-8.1 s before their calibrated prediction and 8-14% of them fell outside the window. The window width is unchanged; only its centre moves. Decoys share their target's composition, so their windows move with it. On by default since 2026-10-08. |
 | `fallback_rt_window_s` | `f64` | `120.0` |  | Fallback fixed RT window in seconds when calibration cannot be fit. |
 | `finetune_deeplc` | `bool` | `false` |  | Fine-tune the DeepLC multitask model on this run's confident seed PSMs and rewrite the library's `predicted_irt` before RT calibration. Requires `predict_frag.deeplc_python` (the DeepLC interpreter). Off by default; the main use is library-input mode, where the base iRT comes from the imported library rather than a DeepLC prediction. |
@@ -1219,6 +1220,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-24 structs and 303 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 38 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 304 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 38 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
 31 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

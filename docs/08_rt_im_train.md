@@ -215,6 +215,11 @@ anchor. `sorted_anchor_vectors` (rt_im_train.rs:54-60) then sorts the anchors by
 before any float reduction makes the fit order-stable (see the determinism note in
 the gotchas).
 
+Under `rt_im_train.anchor_x_filter` (default off) the anchors whose predicted iRT lies outside
+`[Q1 - 3 IQR, Q3 + 3 IQR]` of the anchors' predicted iRT are dropped right here
+(`calibrate::x_domain_inliers`), before the first fit, so every later consumer sees the
+filtered set and `n_train` counts it. Section 4g gives the reason.
+
 ### 3. Fit the calibration map
 
 Calibration is attempted only when `calibration_available = n_train >= 2`
@@ -821,6 +826,50 @@ single-cell plate and the HYE mixture above. `seed` restores the previous behavi
 `search` forces the bootstrap. The Rust unit tests and the stub arms of `ci/smoke.sh` (section
 5c: `boot*`, `auto`, `auto_overlap`, `auto_seed`) exercise the orchestration, the decision and
 the anchor table; the real DeepLC refit is exercised only by the runs above.
+
+### 4g. Guards against absurd predicted iRT (2026-10-13)
+
+A large multi-head refit can return a few calibrated iRTs far outside the gradient. On the IM
+branch's diaPASEF work, a refit on 29k anchors and more (`n/500 + 5` spline knots) left 1.95%
+of target and 1.97% of decoy library rows at absurd values, up to 3.8e5 s, and the ridge alpha
+it chose moved erratically with the anchor count (2,000 anchors: 1e5; 5,000: 1e2; 11,357:
+1e-3; 20,000: 1e3). Two guards act on the two places such values do harm.
+
+**Anchor x-domain filter** (`rt_im_train.anchor_x_filter`, default off). The LOESS grid spans
+the smallest to the largest anchor iRT (section 3), so a handful of anchors at |iRT| ~1e5
+stretch it until the whole gradient sits in one or two grid cells, and the curve inside the
+gradient becomes the straight line between them. On one HYE diaPASEF run 11 of 58k anchors
+moved the curve by 51 s; without the filter the global slope came out at 0.03-0.13, with it
+about 1.00 and in-sample residuals of 3.7-4.0 s. The filter drops anchors outside
+`[Q1 - 3 IQR, Q3 + 3 IQR]` of predicted iRT before `linear_fit` (section 2). It is independent
+of `loess_robust_iters`: bisquare reweighting acts on residuals and leaves the grid's x range
+where it is (`calibrate.rs` test `bisquare_weights_do_not_stop_the_grid_stretch`). The
+quartile fences break down only at a quarter of the anchors on one side; fixed p0.5 / p99.5
+fences, which the IM branch used, break down at 0.5% per side. `cal.json` records
+`n_rt_outliers_removed` only when it removed anchors, so a run without removals writes the
+`cal.json` it always wrote. The y-outlier cut of the IM branch (anchors beyond six robust SD of
+a first fit) is not ported: it removed 0.6-0.8% of clean anchors, and `loess_robust_iters`
+covers y outliers for the curve (it does not reweight the `w_rt` sizing or the reported
+residuals). The filter stays off until it is shown to remove 0 anchors on the 3D benchmarks
+(AIF, HYE, Astral, single cell, immunopeptidomics); then it can be always on.
+
+**Multi-head output-range guard** (`deeplc_finetune.py`, multi-head path only, no key). Values
+in the library misplace windows directly, and no anchor guard touches them. After every
+prediction path (one process, the projection cache and the shards; the recipe
+`mh_shard_predict.py predict` per shard), every finite calibrated iRT outside
+`[min anchor RT - m, max anchor RT + m]`, `m` the anchors' RT span, is clamped to that range
+before the library or its bands are written. Clamped rather than set non-finite: the library
+loader refuses a non-finite `predicted_irt` (`index.rs`), and the rewrite keeps the imported
+value for a non-finite prediction, on another scale. When nothing is out of range the
+predictions are passed on untouched and the library is byte-identical; a value a whole anchor
+span beyond the anchors is not a peptide eluting early or late, so on normal data the guard
+does nothing. `<lib_out>.summary.json` records it under `multihead.output_range` (`bounds`,
+`n_out_of_range`, `fraction` of the predicted sequences, `predicted`, `action`) beside
+`multihead.ridge_alpha`; the recipe's `merge` sums the shards' records into `output_range`.
+
+No anchor cap is added: `--max-ref` takes the first N reference rows in table order (for
+search anchors, precursor m/z), the engine never passes it, and the alpha was erratic across
+subset sizes without a cap preventing the failure.
 
 ### 5. Optional adaptive per-region window (default off)
 

@@ -1658,6 +1658,19 @@
       "source_struct": "RtImTrainConfig"
     },
     {
+      "path": "rt_im_train.anchor_x_filter",
+      "name": "anchor_x_filter",
+      "section": "rt_im_train",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Drop the anchors whose predicted iRT lies outside `[Q1 - 3 IQR, Q3 + 3 IQR]` of the anchors' predicted iRT before anything is fitted to them: the linear and LOESS fits, the window sizing (in-sample, held-out and local) and the composition correction all see the same filtered anchors. A few anchors with an absurd predicted iRT stretch the LOESS grid over the whole x range, so the gradient falls into one or two grid cells; `loess_robust_iters` reweights residuals and does not stop that. `cal.json` records `n_rt_outliers_removed` when anchors were removed. Default false: every anchor is fitted, as before. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
       "path": "rt_im_train.composition_correction",
       "name": "composition_correction",
       "section": "rt_im_train",

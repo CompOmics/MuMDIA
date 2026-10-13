@@ -112,7 +112,8 @@ first pass, schema `psms_scored`, with its `.report.json`); `second_pass/library
 `entries.parquet` (`candidate_id` of the first library's rows kept) and
 `empirical_library.json` (`entries`, `targets`, `decoys`, `fragment_rows`,
 `reference_source`, `runs_aligned`, `runs_unaligned`, `entries_from_winner`,
-`entries_without_decoy`, `median_observations`, `q`); and `second_pass/<run>/` with the
+`entries_without_decoy`, `median_observations`, `q`, and on an experiment with ion
+mobility `im` and `diagnostics`, docs/15); and `second_pass/<run>/` with the
 run's `seed_psms`, `run_windows`, `cal.json`, `psms_extracted`, `chromatograms`,
 `features` and `psms_competed` on the empirical library. The experiment's
 `scored_combined.parquet` is the second pass's, and its `candidate_id` refers to the
@@ -484,8 +485,64 @@ second pass is a search hit of its own, scored against its own decoys.
    fragment-rarity prescreen is off: the library is already the screened set. Runs are
    scheduled as the first pass's are (`experiment.parallel_runs`).
 5. **Pooled rescore** of the second pass into the experiment's `scored_combined.parquet`,
-   with shadow demotion against the empirical library's fragments. The split, the per-run
-   quantification, the cross-run LFQ and the report read it.
+   with shadow demotion against the empirical library's fragments and each run's
+   second-pass `psms_extracted` (the 1/K0 term, `rescore.shadow_im_tolerance`). The split,
+   the per-run quantification, the cross-run LFQ and the report read it.
+6. **Diagnostics** (`second_pass::diagnose`). Against the first pass, at
+   `run_psm_q <= q_anchor`: per run the targets each pass accepted, the new ones, and the
+   dropped ones inside and outside the library; and the accepted decoys per accepted target
+   in each entry's anchor runs (where the first pass accepted it) and in the other runs.
+   Logged on every experiment; on an experiment with ion mobility also written to
+   `empirical_library.json` (`diagnostics`, docs/15). A second-pass identification is a
+   search hit and never carries `is_transferred`.
+
+**The library cut is also the report cut.** Nearly every false entry the library admits
+comes back in the second pass: in an entrapment test on the IM branch, 113-114 of 125
+reportable false library entries were reported again. Raising `mbr.q_anchor` above 0.01
+therefore loosens the reported FDR, not only the library, and `Config::validate` warns.
+
+#### On runs with ion mobility (diaPASEF)
+
+The second pass runs on diaPASEF input as on any other (the refusal of earlier releases is
+lifted). Three additions apply only where the data carry 1/K0; a 3D experiment's library,
+windows, chromatograms and summaries are those described above.
+
+- **Consensus 1/K0.** Each confident apex of step 3 also has an apex 1/K0, joined from the
+  run's first-pass `psms_extracted` on `(candidate_id, selected_peak_rank)` (after retrace,
+  the re-picked value), through the ordered-map join the shadow demotion uses. Every run is
+  moved onto the retention-time reference run by its median offset (reference minus run) over
+  at least 200 shared precursors, then the entry takes the median. A run sharing fewer keeps
+  its own scale. An entry with no confident run carrying a 1/K0 takes its winning row's; an
+  entry with no finite value keeps the library's `predicted_im`. The decoy takes its
+  target's value, as it takes its retention time, so within every pair the precursor m/z,
+  `predicted_irt` and `predicted_im` are equal. A library without `predicted_im` keeps its
+  schema, with a warning: a 1/K0 window the first pass never had is not introduced here. The
+  offsets go to `empirical_library.json` (`im`).
+- **1/K0 window floor.** Calibrated against a consensus 1/K0, a run's `w_im` falls far below
+  the first pass's, and the 1/K0 gate then rejects reproducible rows. Each run's
+  `rt_im_train.im_window_min` is raised to its first-pass `w_im` (from the run's first-pass
+  `cal.json`) when that is larger; `cal.json` records the floor and its source
+  (`im_window_floor`). No configuration key: a run without a first-pass `w_im` (every 3D run)
+  keeps the configured value.
+- **Quantification trace pad.** The second-pass RT window is narrow around the consensus
+  retention time, and extract records traces only inside it, so a fixed integration window
+  and its baseline flanks around an apex near the edge are clipped. Extract (and retrace)
+  record the traces `pad` seconds further on each side, `pad` = (the largest integration
+  half-width, `quant.fixed_scan_halfwidth`, or `quant.fixed_window_s` in seconds, plus
+  `quant.baseline_flank_scans` under `baseline_subtract`) x the run's cycle time (the median
+  spacing of one isolation window's scans). Apex choice, the gate, the peak claim and
+  `psms_extracted` see only the window; a padded hit takes no part in a peak claim. The
+  features stage cuts every trace back to the window (`params.trace_pad_s` in the
+  chromatograms' report, `rt_lo`/`rt_hi` of `psms_extracted`), so the features are those of
+  the unpadded table; only quantification reads the pad. It needs `extract.emit_rt_window`
+  (on by default) and is not applied under a two-pass co-elution peak claim. How often quant
+  windows and flanks were clipped before the pad is not yet measured.
+
+Retrace runs in the second pass as in the first. The second pass reuses the first pass's
+run plan (`experiment.parallel_runs`). No diaPASEF measurement of the second pass is
+reported here yet; the comparisons planned for it (consensus against calibrated library
+1/K0, the first-pass floor against a fixed one, multi-run entrapment) are listed in
+docs/35.
 
 Fallbacks, each logged, after which the first pass is copied to the root and is the
 result: the first pass accepted no target; the second pass extracted no decoy (it cannot
