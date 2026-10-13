@@ -6,6 +6,8 @@
 //! discrete peaks.
 
 mod tdf;
+pub(crate) mod tims_frames;
+pub(crate) use tdf::RawTdf;
 pub use tdf::TdfParams;
 
 use std::io::SeekFrom;

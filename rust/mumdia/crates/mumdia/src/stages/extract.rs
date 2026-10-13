@@ -32,6 +32,7 @@ use tracing::{info, warn};
 use mumdia_core::constants::{ppm_bounds, ISOTOPE_SPACING};
 
 use crate::index::Library;
+use crate::masscal::MassOffset;
 use crate::matchers::binning::LogBins;
 #[cfg(test)]
 use crate::matchers::fragindex::NarrowedProbe;
@@ -1061,8 +1062,9 @@ impl ScanGroups {
     }
 }
 
-/// Index of the value in ascending `rts` nearest to `t` (binary search).
-fn nearest_index(rts: &[f64], t: f64) -> usize {
+/// Index of the value in ascending `rts` nearest to `t` (binary search), the earlier one
+/// on a tie.
+pub(crate) fn nearest_index(rts: &[f64], t: f64) -> usize {
     if rts.is_empty() {
         return 0;
     }
@@ -1425,11 +1427,17 @@ fn demix_features_for(d: &DemixScan, cid: u32) -> DemixFeatures {
 /// [`sum_near`] in the MS1 scan nearest `j` and its `half` neighbours either side: the
 /// maximum over those scans (`extract.ms1_scan_halfwidth`; 0 reads scan `j` only).
 fn ms1_near(scans: &[Ms1Scan], j: usize, half: usize, target: f64, tol_ppm: f64) -> f32 {
-    let lo = j.saturating_sub(half);
-    let hi = (j + half).min(scans.len().saturating_sub(1));
-    (lo..=hi)
+    ms1_neighbours(j, half, scans.len())
         .map(|k| sum_near(&scans[k].mz, &scans[k].intensity, target, tol_ppm))
         .fold(0.0f32, f32::max)
+}
+
+/// The MS1 scans an MS1 read takes the maximum over: scan `j`, the one nearest the time
+/// read ([`nearest_index`]), and its `half` neighbours either side, clipped to the `n`
+/// scans of the run (`extract.ms1_scan_halfwidth`; 0 is scan `j` alone). The one frame
+/// selection of extract's MS1 reads ([`ms1_near`]) and retrace's raw MS1 sums.
+pub(crate) fn ms1_neighbours(j: usize, half: usize, n: usize) -> std::ops::RangeInclusive<usize> {
+    j.saturating_sub(half)..=(j + half).min(n.saturating_sub(1))
 }
 
 /// `x` when finite, else 0.
@@ -1552,43 +1560,14 @@ fn coelution_gate_score(groups: &ScanGroups, distinct: &[u16], sig: &[u16], fint
     }
 }
 
-/// fragindex non-two-pass accumulation over isolation-window groups, in parallel.
-/// Each scan belongs to exactly one window, so the groups are independent; the
-/// per-candidate hit lists are merged by concatenating in (window-sorted) group
-/// order. Bit-identical to serial accumulation: the per-candidate cascade rt-sorts
-/// hits before the apex sum, and same-rt hits for a candidate all come from one
-/// window, so the concatenation order does not affect the rt-sorted result. Only
-/// the PeakClaim::None / Winner / Proportional (non-two-pass) strategies use this;
-/// the co-elution two-pass path stays serial.
-/// Per-peak mass-offset correction applied to an observed peak m/z before library
-/// matching. Either a single scalar ppm offset (`grid_*` empty, the default) or an
-/// m/z-dependent grid (sorted ascending) that is linearly interpolated and clamped
-/// at the ends. `factor_at(mz)` returns the divisor `1 + ppm(mz) * 1e-6`.
-struct MassOffset {
-    scalar_ppm: f64,
-    grid_mz: Vec<f64>,
-    grid_ppm: Vec<f64>,
-}
-impl MassOffset {
-    #[inline]
-    fn factor_at(&self, mz: f64) -> f64 {
-        let ppm = if self.grid_mz.len() >= 2 {
-            match self.grid_mz.binary_search_by(|g| g.total_cmp(&mz)) {
-                Ok(i) => self.grid_ppm[i],
-                Err(0) => self.grid_ppm[0],
-                Err(i) if i >= self.grid_mz.len() => self.grid_ppm[self.grid_mz.len() - 1],
-                Err(i) => {
-                    let (x0, x1) = (self.grid_mz[i - 1], self.grid_mz[i]);
-                    let (y0, y1) = (self.grid_ppm[i - 1], self.grid_ppm[i]);
-                    y0 + (y1 - y0) * (mz - x0) / (x1 - x0)
-                }
-            }
-        } else {
-            self.scalar_ppm
-        };
-        1.0 + ppm * 1e-6
-    }
-}
+// fragindex non-two-pass accumulation over isolation-window groups, in parallel.
+// Each scan belongs to exactly one window, so the groups are independent; the
+// per-candidate hit lists are merged by concatenating in (window-sorted) group
+// order. Bit-identical to serial accumulation: the per-candidate cascade rt-sorts
+// hits before the apex sum, and same-rt hits for a candidate all come from one
+// window, so the concatenation order does not affect the rt-sorted result. Only
+// the PeakClaim::None / Winner / Proportional (non-two-pass) strategies use this;
+// the co-elution two-pass path stays serial.
 
 /// One isolation window and the scans acquired in it, with the candidate range that
 /// window can match. Ascending by window m/z, which (precursors being sorted by m/z)
@@ -2613,54 +2592,6 @@ fn extract_twopass_windows(
     (acc, contested)
 }
 
-/// The mass calibration extract applies, as read from `ExtractParams::mass_cal`.
-struct MassCalRead {
-    frag_offset: f64,
-    frag_tol: f64,
-    grid_mz: Vec<f64>,
-    grid_ppm: Vec<f64>,
-    /// The file it came from; `None` when no file was passed or it does not exist, and the
-    /// values are the configured fallback (no offset, `extract.frag_tol_ppm`).
-    from_file: Option<String>,
-}
-
-/// Read the per-run mass recalibration: the scalar offset + learned tolerance, plus an
-/// optional m/z-dependent correction grid (mass_cal_loess). No logging here; the caller
-/// reports it once the spectra are in, where the stage always reported it.
-fn read_mass_cal(p: &ExtractParams) -> Result<MassCalRead> {
-    let read_grid = |v: &serde_json::Value, key: &str| -> Vec<f64> {
-        v.get(key)
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|e| e.as_f64()).collect())
-            .unwrap_or_default()
-    };
-    match p.mass_cal {
-        Some(path) if std::path::Path::new(path).exists() => {
-            let v: serde_json::Value = mumdia_io::json::read_json(path)?;
-            Ok(MassCalRead {
-                frag_offset: v
-                    .get("frag_ppm_offset")
-                    .and_then(|x| x.as_f64())
-                    .unwrap_or(0.0),
-                frag_tol: v
-                    .get("frag_tol_ppm")
-                    .and_then(|x| x.as_f64())
-                    .unwrap_or(p.cfg.frag_tol_ppm),
-                grid_mz: read_grid(&v, "mz_cal_grid_mz"),
-                grid_ppm: read_grid(&v, "mz_cal_grid_ppm"),
-                from_file: Some(path.to_string()),
-            })
-        }
-        _ => Ok(MassCalRead {
-            frag_offset: 0.0,
-            frag_tol: p.cfg.frag_tol_ppm,
-            grid_mz: Vec::new(),
-            grid_ppm: Vec::new(),
-            from_file: None,
-        }),
-    }
-}
-
 /// Decode the spectra the caller did not lend: `(ms2, ms1)`, each `None` when the lent
 /// buffer is used instead.
 ///
@@ -3382,7 +3313,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // tolerance is what the fragment index is built at, so building the index while the
     // spectra decode needs it up front. Its errors and its log lines stay where they were,
     // after the spectra (`mass?` below).
-    let mass = read_mass_cal(&p);
+    let mass = crate::masscal::read_mass_cal(p.mass_cal, p.cfg.frag_tol_ppm);
     let load_indexed = || -> Result<(Library, Option<FragIndex>, Option<LogBins>)> {
         let lib = Library::load_for_stage(
             p.library_precursors,
@@ -3398,12 +3329,12 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // index's own when it is built, and computed on its own when it is not; either
         // way it is `FragIndex::geometry` at the learned tolerance.
         let (fidx, bins) = match (&mass, fragindex, global_index) {
-            (Ok(m), true, true) => {
-                let f = FragIndex::build(&lib, m.frag_tol);
+            (Ok((_, tol)), true, true) => {
+                let f = FragIndex::build(&lib, *tol);
                 let b = f.bins().clone();
                 (Some(f), Some(b))
             }
-            (Ok(m), true, false) => (None, Some(FragIndex::geometry(&lib, m.frag_tol))),
+            (Ok((_, tol)), true, false) => (None, Some(FragIndex::geometry(&lib, *tol))),
             _ => (None, None),
         };
         Ok((lib, fidx, bins))
@@ -3559,18 +3490,13 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // Per-run mass recalibration (optional): the scalar offset + learned tolerance, plus
     // an optional m/z-dependent correction grid (mass_cal_loess), read at the top of the
     // stage (`read_mass_cal`) and reported here, where it always was.
-    let MassCalRead {
-        frag_offset,
-        frag_tol,
-        grid_mz,
-        grid_ppm,
-        from_file,
-    } = mass?;
-    if let Some(path) = from_file.as_deref() {
+    let (mass_off, frag_tol) = mass?;
+    let frag_offset = mass_off.scalar_ppm;
+    if let Some(path) = crate::masscal::existing(p.mass_cal) {
         info!(
             frag_ppm_offset = frag_offset,
             frag_tol_ppm = frag_tol,
-            mz_cal_grid = grid_mz.len(),
+            mz_cal_grid = mass_off.grid_len(),
             "extract: using mass recalibration"
         );
         // `extract.frag_tol_ppm` is a FALLBACK, not a setting, in any orchestrated
@@ -3589,20 +3515,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             );
         }
     }
-    // The grid is used only if both arrays agree in length and have >= 2 points.
-    let mass_off = if grid_mz.len() >= 2 && grid_mz.len() == grid_ppm.len() {
-        MassOffset {
-            scalar_ppm: frag_offset,
-            grid_mz,
-            grid_ppm,
-        }
-    } else {
-        MassOffset {
-            scalar_ppm: frag_offset,
-            grid_mz: Vec::new(),
-            grid_ppm: Vec::new(),
-        }
-    };
 
     // The fragment index, built with the library above at this same learned tolerance,
     // when a path needs the global one; and the geometry the streamed path's task-local

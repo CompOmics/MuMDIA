@@ -946,6 +946,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 out_pin: "",
                 cfg: &cfg.features,
                 config_hash: ch,
+                // A grouped run is never retraced (`Config::validate`).
+                imc_ref_w: false,
             })?;
             Ok(BandExtract {
                 index: b.index,
@@ -1018,6 +1020,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     out_pin: &pin,
                     cfg: &cfg.features,
                     config_hash: ch,
+                    imc_ref_w: false,
                 },
                 bounds,
             )?;
@@ -1308,19 +1311,10 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         let (mut files, mut bytes) = (0u64, 0u64);
         for (index, _) in &cals {
             for name in ["psms_extracted.parquet", "features.parquet", "run.pin"] {
-                let base = gd(*index, name);
-                for f in [
-                    base.clone(),
-                    format!("{base}.report.json"),
-                    format!("{base}.schema.json"),
-                ] {
-                    if let Ok(meta) = std::fs::metadata(&f) {
-                        std::fs::remove_file(&f)
-                            .with_context(|| format!("deleting the band intermediate {f}"))?;
-                        files += 1;
-                        bytes += meta.len();
-                    }
-                }
+                let (f, b) =
+                    crate::stages::delete_intermediate(&gd(*index, name), "band intermediate")?;
+                files += f;
+                bytes += b;
             }
         }
         info!(

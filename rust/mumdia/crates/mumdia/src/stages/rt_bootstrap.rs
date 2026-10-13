@@ -387,6 +387,8 @@ fn bootstrap_and_refit(p: &Refit, library: &str, anchors_path: &str) -> Result<A
         p.converted,
         p.seed,
         &bdir,
+        // The pass only collects anchors: no retrace (`chain::ChainParams::retrace`).
+        false,
     )
     .context("the bootstrap search (rt-im-train to compete) failed")?;
     let scored = format!("{bdir}/psms_scored.parquet");
@@ -411,6 +413,8 @@ fn bootstrap_and_refit(p: &Refit, library: &str, anchors_path: &str) -> Result<A
         "psms_extracted.parquet",
         "psms_extracted.parquet.peaks.parquet",
         "chromatograms.parquet",
+        // Retrace's centroid intermediate, should a bootstrap pass ever retrace.
+        crate::stages::retrace::CENTROID_NAME,
         "features.parquet",
         "run.pin",
         "psms_competed.parquet",

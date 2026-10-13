@@ -240,9 +240,149 @@ pub fn weighted_mean_sd(pts: &[(f64, f64)]) -> Option<(f64, f64)> {
     Some((mean, var.sqrt()))
 }
 
+/// How [`loo_ref_corr`] forms the leave-one-out reference of member `f`: a profile built
+/// from the members' weighted traces with `f`'s own contribution left out. The two forms
+/// differ in floating point (a sum of the others is not bit-identical to a total minus one
+/// term), and each caller keeps the form its values were defined with.
+pub enum LooRef<'a> {
+    /// `total[t] - w[f] * traces[f][t]` over the points the two share, `total` unchanged
+    /// beyond them, where `total` is the weighted sum of every member, built by the caller:
+    /// the co-elution family's `frag_loo_ref_corr_*` and retrace's `imc_ref_w`.
+    Subtract(&'a [f64]),
+    /// The weighted sum over `set` of every member but `f`, `len` points long, a member's
+    /// trace cut at `len` and a member past the end of `traces` skipped: the interference
+    /// family's prune, retained-set mean and dominant-fragment correlation.
+    SumOthers { set: &'a [usize], len: usize },
+}
+
+/// Member `f`'s leave-one-out reference ([`LooRef`]), from the members' `traces` and their
+/// weights `w` (the predicted intensities).
+pub fn loo_reference<T: AsRef<[f64]>>(traces: &[T], w: &[f64], f: usize, r: LooRef) -> Vec<f64> {
+    match r {
+        LooRef::Subtract(total) => {
+            let mut out = total.to_vec();
+            let wf = w[f];
+            for (v, x) in out.iter_mut().zip(traces[f].as_ref()) {
+                *v -= wf * x;
+            }
+            out
+        }
+        LooRef::SumOthers { set, len } => {
+            let mut acc = vec![0.0f64; len];
+            for &g in set {
+                if g == f || g >= traces.len() {
+                    continue;
+                }
+                let wg = w[g];
+                for (a, v) in acc.iter_mut().zip(traces[g].as_ref()) {
+                    *a += wg * v;
+                }
+            }
+            acc
+        }
+    }
+}
+
+/// The leave-one-out reference correlation of member `f`: the [`pearson`] correlation of
+/// its trace with its leave-one-out reference ([`loo_reference`]). The one kernel every
+/// leave-one-out reference correlation goes through: the co-elution and interference
+/// families on elution traces, and retrace's `imc_ref_w` on 1/K0 profiles.
+pub fn loo_ref_corr<T: AsRef<[f64]>>(traces: &[T], w: &[f64], f: usize, r: LooRef) -> f64 {
+    pearson(traces[f].as_ref(), &loo_reference(traces, w, f, r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kernel reproduces, bit for bit, the two private copies it replaced: the
+    /// co-elution family's subtraction loop and the interference family's `loo_ref`. The
+    /// 3D feature values therefore do not change. Traces of unequal length, members past
+    /// the end and an excluded member are all exercised.
+    #[test]
+    fn the_loo_kernel_is_bit_identical_to_the_copies_it_replaced() {
+        // The co-elution loop as it stood: R^{-f} = R - pred[f] * traces[f].
+        fn coelution_old(traces: &[Vec<f64>], pred: &[f64], r: &[f64], k: usize) -> Vec<f64> {
+            let mut loo = Vec::new();
+            let t = r.len();
+            for (i, trace) in traces.iter().enumerate().take(k) {
+                let mut rm = r.to_vec();
+                let lf = pred[i];
+                for (idx, val) in rm.iter_mut().enumerate().take(t) {
+                    if idx < trace.len() {
+                        *val -= lf * trace[idx];
+                    }
+                }
+                loo.push(pearson(trace, &rm));
+            }
+            loo
+        }
+        // The interference `loo_ref` as it stood.
+        #[allow(clippy::needless_range_loop)]
+        fn loo_ref_old(
+            traces: &[Vec<f64>],
+            pred: &[f64],
+            set: &[usize],
+            exclude: usize,
+            tp: usize,
+        ) -> Vec<f64> {
+            let mut acc = vec![0.0f64; tp];
+            for &g in set {
+                if g == exclude || g >= traces.len() {
+                    continue;
+                }
+                let x = &traces[g];
+                let w = pred[g];
+                let n = x.len().min(tp);
+                for t in 0..n {
+                    acc[t] += w * x[t];
+                }
+            }
+            acc
+        }
+        // A deterministic pseudo-random stream.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for case in 0..200usize {
+            let k = 1 + case % 9;
+            let tp = 3 + case % 17;
+            let traces: Vec<Vec<f64>> = (0..k)
+                .map(|i| {
+                    // Some traces shorter or longer than the reference.
+                    let n = if i % 3 == 0 { tp } else { tp + i % 4 - 1 };
+                    (0..n).map(|_| next() * 1e4).collect()
+                })
+                .collect();
+            let pred: Vec<f64> = (0..k).map(|_| next()).collect();
+            let r: Vec<f64> = (0..tp).map(|_| next() * 3e4).collect();
+            let old = coelution_old(&traces, &pred, &r, k);
+            for (f, want) in old.iter().enumerate() {
+                let got = loo_ref_corr(&traces, &pred, f, LooRef::Subtract(&r));
+                assert_eq!(got.to_bits(), want.to_bits(), "case {case}, fragment {f}");
+            }
+            // A set with members past the end, as the interference calls can pass.
+            let set: Vec<usize> = (0..k + 2).filter(|g| g % 2 == 0 || *g >= k).collect();
+            for &f in set.iter().filter(|&&f| f < k) {
+                let sum = LooRef::SumOthers { set: &set, len: tp };
+                let want = pearson(&traces[f], &loo_ref_old(&traces, &pred, &set, f, tp));
+                assert_eq!(
+                    loo_ref_corr(&traces, &pred, f, sum).to_bits(),
+                    want.to_bits(),
+                    "case {case}, member {f}"
+                );
+                let sum = LooRef::SumOthers { set: &set, len: tp };
+                assert_eq!(
+                    loo_reference(&traces, &pred, f, sum),
+                    loo_ref_old(&traces, &pred, &set, f, tp)
+                );
+            }
+        }
+    }
 
     #[test]
     fn weighted_mean_sd_weighs_each_point() {

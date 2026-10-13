@@ -239,6 +239,7 @@ fn search_second_pass(
             &co,
             &seed,
             &run_out,
+            true,
         )
     };
     let all: Vec<usize> = (0..n).collect();
@@ -468,7 +469,7 @@ fn chain_after_seed(
         rayon::current_num_threads(),
         BootInputs { ch, lib_f, co },
     )?;
-    let (competed, chrom) = finish_run(cfg, ch, &lib_p, lib_f, co, seed, out)?;
+    let (competed, chrom) = finish_run(cfg, ch, &lib_p, lib_f, co, seed, out, true)?;
     Ok((
         vec![competed],
         vec![ChromTable::whole(&chrom)],
@@ -632,8 +633,11 @@ fn adapt_rt_library(
     Ok((lib_p, produced_rt_lib))
 }
 
-/// Retention-time windows, extract, features and compete of one ungrouped run on `lib_p`.
-/// Returns `(competed, chromatograms)`.
+/// Retention-time windows, extract, the optional retrace, features and compete of one
+/// ungrouped run on `lib_p`. `retrace` says whether this pass may retrace
+/// (`chain::ChainParams::retrace`): off for the RT bootstrap pass only. Returns
+/// `(competed, chromatograms)`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_run(
     cfg: &Config,
     ch: &str,
@@ -642,6 +646,7 @@ pub(crate) fn finish_run(
     co: &convert::ConvertOutputs,
     seed: &str,
     out: &str,
+    retrace: bool,
 ) -> Result<(String, String)> {
     let o = crate::stages::chain::extract_to_compete(crate::stages::chain::ChainParams {
         cfg,
@@ -653,6 +658,7 @@ pub(crate) fn finish_run(
         out_dir: out,
         lent_ms2: None,
         manifest: None,
+        retrace,
     })?;
     Ok((o.competed, o.chromatograms))
 }
@@ -975,6 +981,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // spectra will carry 1/K0 (`instrument::input_has_im`, as the library build decides),
     // so every run is scored with one feature schema and the pooled rescore accepts them.
     resolved.resolve_im_features(p.mzmls.iter().any(|m| crate::instrument::input_has_im(m)));
+    crate::stages::retrace::refuse_inputs_without_raw_events(&resolved, p.mzmls)?;
     pre.step("resolve_interpreters");
     let p = RunExperimentParams {
         config: &resolved,
@@ -1600,7 +1607,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         // Under `parallel_runs = auto`, the first run's finish is what every later run
         // repeats after its reused adaptation, so its peak alone sizes them.
         let window = plan.is_auto().then(crate::sched::PeakWindow::open);
-        let (comp0, chrom0) = finish_run(cfg, &ch, &lib0, &lib_f, &co0, &seed0, &out0)?;
+        let (comp0, chrom0) = finish_run(cfg, &ch, &lib0, &lib_f, &co0, &seed0, &out0, true)?;
         competed.push(vec![comp0]);
         chroms.push(vec![ChromTable::whole(&chrom0)]);
         if produced.is_none() {
@@ -1627,7 +1634,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     co,
                 },
             )?;
-            finish_run(cfg, &ch, &lib_p, &lib_f, co, seed, &out)
+            finish_run(cfg, &ch, &lib_p, &lib_f, co, seed, &out, true)
         };
         let items: Vec<(usize, &(convert::ConvertOutputs, String))> =
             (1..n_runs).zip(fronts.iter()).collect();
@@ -2199,7 +2206,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .insert("rescorer".into(), actual_rescorer_model);
     prov.model_identities.insert(
         "feature_schema_id".into(),
-        features::feature_schema_id(&features::active_features_for(&cfg.features, false)),
+        features::feature_schema_id(&features::active_features_of(cfg, false)),
     );
     prov.model_identities.insert(
         "mbr".into(),

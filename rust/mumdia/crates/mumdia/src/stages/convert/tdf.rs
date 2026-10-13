@@ -433,15 +433,32 @@ impl Ctx {
 }
 
 /// A diaPASEF `.d` opened for decoding: the frame reader with the TOF -> m/z and
-/// scan -> 1/K0 calibration that convert centroids with.
-struct RawTdf {
-    reader: FrameReader,
+/// scan -> 1/K0 calibration that convert centroids with. Retrace reads the raw events
+/// through the same handle ([`RawTdf::tof_of`], [`RawTdf::im_of_scan`]), so raw events,
+/// centroids and every 1/K0 derived from them share one m/z and one 1/K0 scale.
+pub(crate) struct RawTdf {
+    pub(crate) reader: FrameReader,
     mz: Tof2MzConverter,
     im: ScanImCalibration,
 }
 
 impl RawTdf {
-    fn open(path: &str) -> Result<Self> {
+    /// The fractional TOF index of an m/z: the inverse of the converter convert uses.
+    pub(crate) fn tof_of(&self, mz: f64) -> f64 {
+        self.mz.invert(mz)
+    }
+
+    /// The m/z of a (fractional) TOF index, as convert computes it.
+    pub(crate) fn mz_of(&self, tof: f64) -> f64 {
+        self.mz.convert(tof)
+    }
+
+    /// The 1/K0 of a TIMS scan index, as convert computes it.
+    pub(crate) fn im_of_scan(&self, scan: f64) -> f64 {
+        self.im.im(scan)
+    }
+
+    pub(crate) fn open(path: &str) -> Result<Self> {
         let meta = MetadataReader::new(path).map_err(|e| anyhow!("{path}: {e}"))?;
         let reader = FrameReader::new(path).map_err(|e| anyhow!("{path}: {e}"))?;
         match reader.get_acquisition() {

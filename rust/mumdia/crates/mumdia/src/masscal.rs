@@ -238,6 +238,93 @@ pub fn json_path(seed_out: &str) -> String {
     format!("{seed_out}.masscal.json")
 }
 
+/// The per-peak mass-offset correction a reader applies to an observed peak m/z before
+/// library matching, as `masscal.json` gives it. Either a single scalar ppm offset (`grid_*`
+/// empty, the default) or an m/z-dependent grid (sorted ascending) that is linearly
+/// interpolated and clamped at the ends. `factor_at(mz)` returns the divisor
+/// `1 + ppm(mz) * 1e-6`. Extract matches with it and retrace sums raw events with it, both
+/// through [`read_mass_cal`], so the raw traces sit on exactly the calibration the centroid
+/// traces were matched with.
+pub(crate) struct MassOffset {
+    pub(crate) scalar_ppm: f64,
+    pub(crate) grid_mz: Vec<f64>,
+    pub(crate) grid_ppm: Vec<f64>,
+}
+
+impl MassOffset {
+    #[inline]
+    pub(crate) fn factor_at(&self, mz: f64) -> f64 {
+        let ppm = if self.grid_mz.len() >= 2 {
+            match self.grid_mz.binary_search_by(|g| g.total_cmp(&mz)) {
+                Ok(i) => self.grid_ppm[i],
+                Err(0) => self.grid_ppm[0],
+                Err(i) if i >= self.grid_mz.len() => self.grid_ppm[self.grid_mz.len() - 1],
+                Err(i) => {
+                    let (x0, x1) = (self.grid_mz[i - 1], self.grid_mz[i]);
+                    let (y0, y1) = (self.grid_ppm[i - 1], self.grid_ppm[i]);
+                    y0 + (y1 - y0) * (mz - x0) / (x1 - x0)
+                }
+            }
+        } else {
+            self.scalar_ppm
+        };
+        1.0 + ppm * 1e-6
+    }
+
+    /// Points of the m/z grid in use (0: the scalar offset).
+    pub(crate) fn grid_len(&self) -> usize {
+        self.grid_mz.len()
+    }
+}
+
+/// `path` when it is given and exists: the mass calibration [`read_mass_cal`] reads from a
+/// file rather than its fallback.
+pub(crate) fn existing(path: Option<&str>) -> Option<&str> {
+    path.filter(|m| std::path::Path::new(m).exists())
+}
+
+/// The one reader of a search-seed `masscal.json`: `(mass offset, fragment tolerance ppm)`,
+/// or no offset and `fallback_tol_ppm` when no file is given or it does not exist. The m/z
+/// grid is used only when both arrays agree in length and have at least two points. No
+/// logging here; extract reports the calibration once its spectra are in, where it always
+/// did.
+pub(crate) fn read_mass_cal(
+    path: Option<&str>,
+    fallback_tol_ppm: f64,
+) -> Result<(MassOffset, f64)> {
+    let Some(path) = existing(path) else {
+        return Ok((
+            MassOffset {
+                scalar_ppm: 0.0,
+                grid_mz: Vec::new(),
+                grid_ppm: Vec::new(),
+            },
+            fallback_tol_ppm,
+        ));
+    };
+    let v: serde_json::Value = mumdia_io::json::read_json(path)?;
+    let num = |key: &str| v.get(key).and_then(|x| x.as_f64());
+    let grid = |key: &str| -> Vec<f64> {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|e| e.as_f64()).collect())
+            .unwrap_or_default()
+    };
+    let (mut grid_mz, mut grid_ppm) = (grid("mz_cal_grid_mz"), grid("mz_cal_grid_ppm"));
+    if !(grid_mz.len() >= 2 && grid_mz.len() == grid_ppm.len()) {
+        grid_mz.clear();
+        grid_ppm.clear();
+    }
+    Ok((
+        MassOffset {
+            scalar_ppm: num("frag_ppm_offset").unwrap_or(0.0),
+            grid_mz,
+            grid_ppm,
+        },
+        num("frag_tol_ppm").unwrap_or(fallback_tol_ppm),
+    ))
+}
+
 /// `<seed>.masscal.parquet`, the calibrant deviation sidecar beside the masscal.
 ///
 /// Absent from an ungrouped run, which fits on the deviations it still holds in memory,
@@ -314,6 +401,41 @@ pub fn read_calibrants(path: &str) -> Result<Calibrants> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one reader: no file is the fallback tolerance and no offset; a file gives its
+    /// offset and tolerance, and its m/z grid only when both arrays agree and hold two
+    /// points or more.
+    #[test]
+    fn read_mass_cal_reads_the_file_or_falls_back() {
+        let (off, tol) = read_mass_cal(None, 20.0).unwrap();
+        assert_eq!((off.scalar_ppm, off.grid_len(), tol), (0.0, 0, 20.0));
+        let (_, tol) = read_mass_cal(Some("/definitely/not/a/masscal.json"), 15.0).unwrap();
+        assert_eq!(tol, 15.0);
+        let dir = std::env::temp_dir().join(format!("mumdia_masscal_read_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, v: serde_json::Value| -> String {
+            let p = dir.join(name).to_str().unwrap().to_string();
+            std::fs::write(&p, v.to_string()).unwrap();
+            p
+        };
+        let good = write(
+            "good.json",
+            json!({"frag_ppm_offset": -1.5, "frag_tol_ppm": 8.0,
+                   "mz_cal_grid_mz": [200.0, 600.0], "mz_cal_grid_ppm": [-1.0, -2.0]}),
+        );
+        let (off, tol) = read_mass_cal(Some(&good), 20.0).unwrap();
+        assert_eq!((off.scalar_ppm, tol, off.grid_len()), (-1.5, 8.0, 2));
+        assert!((off.factor_at(400.0) - (1.0 - 1.5e-6)).abs() < 1e-15);
+        let ragged = write(
+            "ragged.json",
+            json!({"frag_ppm_offset": 2.0, "mz_cal_grid_mz": [200.0, 600.0],
+                   "mz_cal_grid_ppm": [1.0]}),
+        );
+        let (off, tol) = read_mass_cal(Some(&ragged), 20.0).unwrap();
+        assert_eq!((off.grid_len(), tol), (0, 20.0));
+        assert_eq!(off.factor_at(400.0), 1.0 + 2.0 * 1e-6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// The single-pass fit these tests are written against; the default is two passes
     /// since 2026-10-11, and the tests that need it set it themselves.

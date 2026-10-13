@@ -27,6 +27,18 @@ pub const NAMES: &[&str] = &[
 pub const N_SCALAR: usize = 6;
 pub const N_ELUTION: usize = 3;
 
+/// The family's tenth feature, appended after [`NAMES`] only under
+/// `retrace.apex_features` (`super::ImFamily::WithImcRefW`): retrace's apex 1/K0 agreement
+/// of the fragments, the predicted-intensity-weighted mean leave-one-out correlation of
+/// each fragment's raw 1/K0 profile at the apex (`stats::loo_ref_corr`). 0 when retrace
+/// found no fragment with signal.
+pub const APEX_NAMES: &[&str] = &["imc_ref_w"];
+
+/// The value of [`APEX_NAMES`], read from `psms_extracted` onto the [`Evidence`].
+pub fn apex_values(e: &Evidence) -> Vec<f64> {
+    vec![e.imc_ref_w]
+}
+
 /// The family's values, in [`NAMES`] order.
 pub fn values(e: &Evidence) -> Vec<f64> {
     let mut v = Vec::with_capacity(NAMES.len());

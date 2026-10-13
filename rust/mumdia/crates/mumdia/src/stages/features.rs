@@ -95,22 +95,72 @@ fn env_families() -> &'static [(&'static [&'static str], FamilyFn)] {
     })
 }
 
-/// The families of the extended set: [`env_families`], then the ion-mobility family
-/// ([`im`]) when `im` is on. `im` is `features.im_features` as the run or experiment
-/// resolved it ([`FeaturesConfig`]), passed down rather than latched here, so the schema id
-/// an orchestrator records, the features stage and the rescore projection read one list.
-/// Both lists are fixed for the process, so each is built once.
-fn families(im: bool) -> &'static [(&'static [&'static str], FamilyFn)] {
-    if !im {
-        return env_families();
+/// The ion-mobility columns of the extended battery: none, the ion-mobility family
+/// (`features/im.rs`), or the family with retrace's `imc_ref_w` as its tenth feature
+/// (`retrace.apex_features`). A plain `bool` converts to `Off` or `On`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImFamily {
+    Off,
+    On,
+    WithImcRefW,
+}
+
+impl ImFamily {
+    /// The family as `features.im_features` resolved it (`im`), with `imc_ref_w` when
+    /// retrace wrote it (`imc_ref_w`, which the family must be on to carry).
+    pub fn of(im: bool, imc_ref_w: bool) -> ImFamily {
+        match (im, imc_ref_w) {
+            (false, _) => ImFamily::Off,
+            (true, false) => ImFamily::On,
+            (true, true) => ImFamily::WithImcRefW,
+        }
     }
-    static WITH_IM: std::sync::OnceLock<Vec<(&'static [&'static str], FamilyFn)>> =
-        std::sync::OnceLock::new();
-    WITH_IM.get_or_init(|| {
-        let mut v = env_families().to_vec();
-        v.push((im::NAMES, im::values));
-        v
-    })
+
+    /// Whether the ion-mobility family is on.
+    pub fn on(self) -> bool {
+        self != ImFamily::Off
+    }
+
+    fn index(self) -> usize {
+        match self {
+            ImFamily::Off => 0,
+            ImFamily::On => 1,
+            ImFamily::WithImcRefW => 2,
+        }
+    }
+}
+
+impl From<bool> for ImFamily {
+    fn from(im: bool) -> ImFamily {
+        ImFamily::of(im, false)
+    }
+}
+
+/// The families of the extended set: [`env_families`], then the ion-mobility family
+/// ([`im`]) when it is on, then `imc_ref_w` ([`im::APEX_NAMES`]) under
+/// [`ImFamily::WithImcRefW`]. The switch is `features.im_features` as the run or
+/// experiment resolved it ([`FeaturesConfig`]) and `retrace.apex_features`, passed down
+/// rather than latched here, so the schema id an orchestrator records, the features stage
+/// and the rescore projection read one list. The lists are fixed for the process, so each
+/// is built once.
+fn families(im: impl Into<ImFamily>) -> &'static [(&'static [&'static str], FamilyFn)] {
+    type Families = std::sync::OnceLock<Vec<(&'static [&'static str], FamilyFn)>>;
+    static WITH_IM: Families = std::sync::OnceLock::new();
+    static WITH_APEX: Families = std::sync::OnceLock::new();
+    match im.into() {
+        ImFamily::Off => env_families(),
+        ImFamily::On => WITH_IM.get_or_init(|| {
+            let mut v = env_families().to_vec();
+            v.push((im::NAMES, im::values));
+            v
+        }),
+        ImFamily::WithImcRefW => WITH_APEX.get_or_init(|| {
+            let mut v = env_families().to_vec();
+            v.push((im::NAMES, im::values));
+            v.push((im::APEX_NAMES, im::apex_values));
+            v
+        }),
+    }
 }
 
 /// Names already used by the Minimal/Rich sets, which the extended battery must
@@ -127,7 +177,8 @@ fn reserved_names() -> std::collections::HashSet<&'static str> {
 /// deduplicated: a name that repeats across families, or collides with a
 /// Minimal/Rich name, is kept only on first appearance. This makes the schema
 /// robust to independently-authored family modules reusing a name.
-fn extended_name_refs(im: bool) -> Vec<&'static str> {
+fn extended_name_refs(im: impl Into<ImFamily>) -> Vec<&'static str> {
+    let im = im.into();
     let reserved = reserved_names();
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -145,8 +196,8 @@ fn extended_name_refs(im: bool) -> Vec<&'static str> {
 }
 
 /// Extended-battery feature names in registry order (deduplicated), with the ion-mobility
-/// family when `im` is on.
-pub fn extended_names(im: bool) -> Vec<String> {
+/// columns `im` names ([`ImFamily`]).
+pub fn extended_names(im: impl Into<ImFamily>) -> Vec<String> {
     extended_name_refs(im)
         .iter()
         .map(|s| s.to_string())
@@ -159,10 +210,14 @@ pub fn extended_names(im: bool) -> Vec<String> {
 /// is computed once (not rebuilt per PSM). It reproduces exactly the same
 /// survivors, in the same order, as the reserved + `seen` filter below and as
 /// [`extended_name_refs`], keeping names and values in lockstep.
-fn extended_value_plan(im: bool) -> &'static Vec<Vec<usize>> {
-    static PLAN: [std::sync::OnceLock<Vec<Vec<usize>>>; 2] =
-        [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
-    PLAN[im as usize].get_or_init(|| {
+fn extended_value_plan(im: impl Into<ImFamily>) -> &'static Vec<Vec<usize>> {
+    let im = im.into();
+    static PLAN: [std::sync::OnceLock<Vec<Vec<usize>>>; 3] = [
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+    ];
+    PLAN[im.index()].get_or_init(|| {
         let reserved = reserved_names();
         let mut seen = std::collections::HashSet::new();
         let mut plan = Vec::with_capacity(families(im).len());
@@ -186,7 +241,8 @@ fn extended_value_plan(im: bool) -> &'static Vec<Vec<usize>> {
 /// as [`extended_name_refs`]. Each family returns exactly `NAMES.len()` values;
 /// the registry applies the identical dedup predicate to values so names and
 /// values stay in lockstep.
-fn extended_values(e: &Evidence, im: bool) -> Vec<f64> {
+fn extended_values(e: &Evidence, im: impl Into<ImFamily>) -> Vec<f64> {
+    let im = im.into();
     let plan = extended_value_plan(im);
     let mut out = Vec::with_capacity(plan.iter().map(|keep| keep.len()).sum());
     for ((names, f), keep) in families(im).iter().zip(plan) {
@@ -258,9 +314,10 @@ pub const RICH_EXTRA: &[&str] = &[
 ];
 
 /// The ordered active feature list for the configured set. `im` is the resolved
-/// `features.im_features`: under `extended` it appends the ion-mobility family after the
-/// other families (`families`); the smaller sets have no family battery and ignore it.
-pub fn active_features(set: FeatureSet, im: bool) -> Vec<String> {
+/// `features.im_features`, with `imc_ref_w` when `retrace.apex_features` wrote it
+/// ([`ImFamily`]): under `extended` it appends the ion-mobility columns after the other
+/// families (`families`); the smaller sets have no family battery and ignore it.
+pub fn active_features(set: FeatureSet, im: impl Into<ImFamily>) -> Vec<String> {
     let mut v: Vec<String> = MINIMAL_FEATURES.iter().map(|s| s.to_string()).collect();
     if matches!(set, FeatureSet::Rich | FeatureSet::Extended) {
         v.extend(RICH_EXTRA.iter().map(|s| s.to_string()));
@@ -288,6 +345,18 @@ pub fn active_features(set: FeatureSet, im: bool) -> Vec<String> {
 /// (`Config::resolve_im_features`), so `has_im` then changes nothing.
 pub fn active_features_for(cfg: &FeaturesConfig, has_im: bool) -> Vec<String> {
     active_features(cfg.set, cfg.im_features.on(has_im))
+}
+
+/// The active feature list of a run's search pass, for the schema id an orchestrator
+/// records: [`active_features_for`], with `imc_ref_w` when `retrace.apex_features` is on
+/// (the main pass and the second pass retrace; `Config::validate` refuses the key without
+/// `retrace.enabled` and without the ion-mobility family).
+pub fn active_features_of(cfg: &mumdia_core::config::Config, has_im: bool) -> Vec<String> {
+    let im = cfg.features.im_features.on(has_im);
+    active_features(
+        cfg.features.set,
+        ImFamily::of(im, cfg.retrace.apex_features),
+    )
 }
 
 /// Whether the ion-mobility family is on for the features stage reading `chromatograms`:
@@ -746,6 +815,9 @@ pub struct Evidence {
     /// Per-fragment per-point 1/K0 over `axis` (0.0 where a point has none), fragment
     /// order; empty when the chromatograms carry no 1/K0 or it was not read.
     pub im_traces: Vec<Vec<f64>>,
+    /// Retrace's apex 1/K0 agreement of the fragments (`psms_extracted.imc_ref_w`), 0.0
+    /// when it was not written or not read ([`ImFamily::WithImcRefW`]).
+    pub imc_ref_w: f64,
 }
 
 /// Parse a fragment name like `b3`, `y7`, `b3^2` into (is_b, ordinal, charge).
@@ -1199,6 +1271,7 @@ fn evidence_from(
         ms1_apex_im: None,
         im_pred_cal: None,
         im_traces,
+        imc_ref_w: 0.0,
     }
 }
 
@@ -1212,6 +1285,10 @@ pub struct FeaturesParams<'a> {
     pub out_pin: &'a str,
     pub cfg: &'a FeaturesConfig,
     pub config_hash: &'a str,
+    /// Carry retrace's `imc_ref_w` (`psms_extracted`) as the tenth feature of the
+    /// ion-mobility family: `retrace.apex_features` in a pass that retraced. Read only while
+    /// the family is on; the column must then be in `psms`.
+    pub imc_ref_w: bool,
 }
 
 /// Chromatogram rows resident at once in the chunked feature pass. At the ~200-point
@@ -2190,60 +2267,9 @@ const BOUNDS_DECODERS: usize = 8;
 static BOUNDS_DECODER_BUDGET: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(BOUNDS_DECODERS);
 
-/// A reservation against [`BOUNDS_DECODER_BUDGET`], returned to it on drop.
-///
-/// Take-what-is-left rather than a blocking semaphore: a lease is acquired from inside a
-/// rayon worker, and a worker that blocks cannot steal, so waiting for a permit would
-/// stall the enclosing band-level or run-level parallelism (and would make progress depend
-/// on the pool being large enough to run every permit holder). A call that finds the
-/// budget empty gets zero and decodes on one thread, which is the serial pass.
-///
-/// The bound this gives is `BOUNDS_DECODERS + (C - 1)` concurrently open decoders, for `C`
-/// concurrent calls: the budget covers the first eight, and every call that got nothing
-/// still runs its own single decoder. At `groups.parallel = 4` that is 11 rather than 32,
-/// and at the default `C = 1` it is exactly eight.
-struct DecoderLease {
-    budget: &'static std::sync::atomic::AtomicUsize,
-    n: usize,
-}
-
-impl DecoderLease {
-    /// Take up to `want` decoders, however many the budget still holds. Never blocks.
-    fn take(want: usize) -> Self {
-        Self::take_from(&BOUNDS_DECODER_BUDGET, want)
-    }
-
-    /// [`DecoderLease::take`] against an explicit budget, so the arithmetic can be tested
-    /// on a budget of its own rather than on the shared one every other test competes for.
-    fn take_from(budget: &'static std::sync::atomic::AtomicUsize, want: usize) -> Self {
-        use std::sync::atomic::Ordering::{AcqRel, Acquire};
-        let mut cur = budget.load(Acquire);
-        loop {
-            let n = want.min(cur);
-            match budget.compare_exchange_weak(cur, cur - n, AcqRel, Acquire) {
-                Ok(_) => return DecoderLease { budget, n },
-                Err(seen) => cur = seen,
-            }
-        }
-    }
-
-    /// Threads to decode on: the lease, or one when the budget was empty.
-    fn decoders(&self) -> usize {
-        self.n.max(1)
-    }
-
-    /// What the budget actually granted, which may be zero.
-    fn granted(&self) -> usize {
-        self.n
-    }
-}
-
-impl Drop for DecoderLease {
-    fn drop(&mut self) {
-        self.budget
-            .fetch_add(self.n, std::sync::atomic::Ordering::Release);
-    }
-}
+// Both budgets of this stage are leased through `crate::sched::DecoderLease`, whose
+// take-what-is-left rule gives the bound stated on `BOUNDS_DECODERS`.
+use crate::sched::DecoderLease;
 
 /// The `(first_row, n_rows)` sub-chunks the confident-bounds pass reads, on the ABSOLUTE
 /// `chunk_rows` grid rather than one restarted per span.
@@ -2350,7 +2376,10 @@ fn confident_half_widths(
     // count, so this call never has more row groups resident than it leased, whatever the
     // pool size. The groups are equal-sized runs of equal-sized reads, so the imbalance is
     // at most one sub-chunk.
-    let lease = DecoderLease::take(rayon::current_num_threads().min(BOUNDS_DECODERS));
+    let lease = DecoderLease::take_from(
+        &BOUNDS_DECODER_BUDGET,
+        rayon::current_num_threads().min(BOUNDS_DECODERS),
+    );
     let per = subs.len().div_ceil(lease.decoders()).max(1);
     // `collect::<Vec<Result<_>>>` rather than `collect::<Result<Vec<_>>>`: the latter keeps
     // whichever error a worker recorded first, so a run with two failing sub-chunk groups
@@ -3207,6 +3236,23 @@ fn run_chunked(
         im_col("ms1_apex_im"),
         im_col("im_pred_cal"),
     );
+    // Retrace's `imc_ref_w`, the family's tenth feature, under `retrace.apex_features`
+    // (`FeaturesParams::imc_ref_w`). The switch comes from the configuration, as the schema
+    // id the orchestrator records does, so a table without the column is an error rather
+    // than a silent column of zeros.
+    let im_fam = ImFamily::of(im_on, p.imc_ref_w);
+    let imc_ref_w: Vec<f64> = if im_fam == ImFamily::WithImcRefW {
+        if !ps.has_column("imc_ref_w") {
+            anyhow::bail!(
+                "features: retrace.apex_features is on, but {} has no imc_ref_w column; \
+                 retrace writes it when it runs with retrace.apex_features",
+                p.psms
+            );
+        }
+        ps.f64("imc_ref_w")?
+    } else {
+        Vec::new()
+    };
     if im_on && !matches!(p.cfg.set, FeatureSet::Extended) {
         warn!(
             set = ?p.cfg.set,
@@ -3329,7 +3375,7 @@ fn run_chunked(
     };
 
     let gradient = apex_rt.iter().cloned().fold(0.0f64, f64::max).max(1.0);
-    let cols_active = active_features(p.cfg.set, im_on);
+    let cols_active = active_features(p.cfg.set, im_fam);
     let n = ps.nrows;
 
     // --- Cross-candidate charge-state corroboration (Extended set) ---
@@ -3371,7 +3417,7 @@ fn run_chunked(
     drop((pf_of_row, pf_int));
 
     let extended = matches!(p.cfg.set, FeatureSet::Extended);
-    let ext_names = extended_name_refs(im_on);
+    let ext_names = extended_name_refs(im_fam);
 
     // The two expensive per-PSM computations (`fragment_features` and, when the
     // extended set is active, `PeakTraces` + `evidence_from` + `extended_values`) are pure
@@ -3628,9 +3674,12 @@ fn run_chunked(
                         ev.ms1_apex_im = ms1_apex_im[i];
                         ev.im_pred_cal = im_cal[i];
                     }
+                    if im_fam == ImFamily::WithImcRefW {
+                        ev.imc_ref_w = imc_ref_w[i];
+                    }
                     // Truncating zip, exactly as the name/value zip in the assembly
                     // did: a family that returned fewer values leaves the tail at 0.0.
-                    for (dst, v) in ext.iter_mut().zip(extended_values(&ev, im_on)) {
+                    for (dst, v) in ext.iter_mut().zip(extended_values(&ev, im_fam)) {
                         *dst = v;
                     }
                 }
@@ -4820,6 +4869,64 @@ mod tests {
                 "{n} in the compact preset"
             );
         }
+    }
+
+    /// `imc_ref_w` is the family's tenth column, after the nine, only under
+    /// `retrace.apex_features`; the configuration-level list the orchestrators record
+    /// follows the key, and without it every list is the one before the column existed.
+    #[test]
+    fn imc_ref_w_is_the_tenth_column_of_the_family_only_under_apex_features() {
+        assert_eq!(ImFamily::of(false, true), ImFamily::Off);
+        assert_eq!(ImFamily::from(true), ImFamily::On);
+        let on = active_features(FeatureSet::Extended, ImFamily::On);
+        let apex = active_features(FeatureSet::Extended, ImFamily::WithImcRefW);
+        assert_eq!(apex.len(), on.len() + 1);
+        let at = on
+            .iter()
+            .position(|c| c == im::NAMES[im::NAMES.len() - 1])
+            .unwrap();
+        assert_eq!(apex[at + 1], "imc_ref_w");
+        assert_eq!(apex[..=at], on[..=at]);
+        assert_eq!(apex[at + 2..], on[at + 1..]);
+        // The smaller sets carry no family.
+        for set in [FeatureSet::Minimal, FeatureSet::Rich] {
+            assert_eq!(
+                active_features(set, ImFamily::WithImcRefW),
+                active_features(set, false)
+            );
+        }
+        // The values follow the names, `imc_ref_w` from the Evidence.
+        let axis: Vec<f32> = (0..5).map(|k| 100.0 + k as f32).collect();
+        let tr: Vec<Vec<f32>> = vec![vec![1.0, 4.0, 9.0, 4.0, 1.0], vec![0.5, 2.0, 6.0, 2.0, 0.5]];
+        let rows: Vec<ChromRow> = (0..2)
+            .map(|i| ChromRow {
+                frag_name: ["y3", "y4"][i],
+                frag_mz: 300.0 + i as f64,
+                frag_obs_mz: 300.0 + i as f64,
+                pred_int: [0.8f32, 0.6][i],
+                rt: &axis,
+                inten: &tr[i],
+                im: &[],
+            })
+            .collect();
+        let mut e = build_evidence(&rows, align_traces(&rows), &[], 102.0, 0.5, 1, None);
+        e.imc_ref_w = 0.625;
+        let vals = extended_values(&e, ImFamily::WithImcRefW);
+        assert_eq!(vals.len(), extended_names(ImFamily::WithImcRefW).len());
+        let ext = extended_names(ImFamily::WithImcRefW);
+        let k = ext.iter().position(|c| c == "imc_ref_w").unwrap();
+        assert_eq!(vals[k], 0.625);
+        // The configuration-level list: the key adds the column, the 3D default does not.
+        let mut cfg = mumdia_core::config::Config::default();
+        cfg.features.set = FeatureSet::Extended;
+        assert_eq!(
+            active_features_of(&cfg, false),
+            active_features_for(&cfg.features, false)
+        );
+        cfg.features.im_features = ImFeatures::On;
+        cfg.retrace.enabled = true;
+        cfg.retrace.apex_features = true;
+        assert_eq!(active_features_of(&cfg, false), apex);
     }
 
     /// The family reads the per-point 1/K0 the Evidence carries on its elution axis, and the
@@ -6430,7 +6537,7 @@ mod tests {
             // A second concurrent call gets nothing and falls back to one decoder of its
             // own: never zero (it must make progress without waiting), never eight.
             let b = DecoderLease::take_from(&BUDGET, BOUNDS_DECODERS);
-            assert_eq!(b.n, 0);
+            assert_eq!(b.granted(), 0);
             assert_eq!(b.decoders(), 1, "a starved call decodes serially");
             // So C concurrent calls open at most BOUNDS_DECODERS + (C - 1) decoders.
             let c = DecoderLease::take_from(&BUDGET, BOUNDS_DECODERS);
@@ -6444,7 +6551,7 @@ mod tests {
         {
             let a = DecoderLease::take_from(&BUDGET, 3);
             let b = DecoderLease::take_from(&BUDGET, BOUNDS_DECODERS);
-            assert_eq!((a.n, b.n), (3, BOUNDS_DECODERS - 3));
+            assert_eq!((a.granted(), b.granted()), (3, BOUNDS_DECODERS - 3));
             assert_eq!(free(), 0);
         }
         assert_eq!(free(), BOUNDS_DECODERS);
@@ -6872,6 +6979,7 @@ mod tests {
                         out_pin: pin,
                         cfg: &cfg,
                         config_hash: "test",
+                        imc_ref_w: false,
                     },
                     chunk,
                 )
@@ -7290,6 +7398,7 @@ mod tests {
                         out_pin: "",
                         cfg: &cfg,
                         config_hash: "test",
+                        imc_ref_w: false,
                     },
                     300,
                     usize::MAX,
@@ -7365,6 +7474,7 @@ mod tests {
                 out_pin: "",
                 cfg: &cfg,
                 config_hash: "test",
+                imc_ref_w: false,
             })
             .unwrap()
         };
@@ -7504,6 +7614,7 @@ mod tests {
                     out_pin: &pin,
                     cfg: &cfg,
                     config_hash: "test",
+                    imc_ref_w: false,
                 },
                 chunk_rows,
                 max_psm_rows,
@@ -7727,6 +7838,7 @@ mod tests {
                         out_pin: "",
                         cfg: &cfg,
                         config_hash: "test",
+                        imc_ref_w: false,
                     },
                     chunk_rows,
                     max_psm_rows,
@@ -7782,6 +7894,7 @@ mod tests {
                     out_pin: "",
                     cfg: &cfg,
                     config_hash: "test",
+                    imc_ref_w: false,
                 },
                 chunk_rows,
                 max_psm,
@@ -8042,6 +8155,7 @@ mod tests {
                     out_pin: "",
                     cfg: &cfg,
                     config_hash: "test",
+                    imc_ref_w: false,
                 },
                 100,
                 usize::MAX,
@@ -8125,6 +8239,7 @@ mod tests {
                     out_pin: &pin,
                     cfg: &cfg,
                     config_hash: "test",
+                    imc_ref_w: false,
                 },
                 4,
             )
@@ -8170,6 +8285,7 @@ mod tests {
                     out_pin: &pin2,
                     cfg: &cfg,
                     config_hash: "test",
+                    imc_ref_w: false,
                 },
                 4,
             );
@@ -8229,6 +8345,7 @@ mod tests {
             out_pin: &pin,
             cfg: &cfg,
             config_hash: "test",
+            imc_ref_w: false,
         };
 
         run_chunked(

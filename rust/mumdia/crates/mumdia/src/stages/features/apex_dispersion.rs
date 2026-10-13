@@ -298,6 +298,7 @@ mod tests {
             ms1_apex_im: None,
             im_pred_cal: None,
             im_traces: Vec::new(),
+            imc_ref_w: 0.0,
         }
     }
 

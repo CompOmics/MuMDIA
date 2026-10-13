@@ -311,6 +311,37 @@ enum Cmd {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its
+    /// psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this
+    /// after extract under `retrace.enabled`; standalone it takes the same inputs by path.
+    /// The configuration's `retrace` section applies, `enabled` aside.
+    Retrace {
+        /// The diaPASEF `.d` the spectra were converted from.
+        #[arg(long)]
+        raw: String,
+        /// Extract's chromatograms (the centroid traces), with their per-point 1/K0.
+        #[arg(long)]
+        chromatograms: String,
+        /// Extract's psms_extracted; under `retrace.repick` its `.peaks.parquet` sidecar
+        /// must sit beside it.
+        #[arg(long)]
+        psms_extracted: String,
+        #[arg(long)]
+        run_windows: String,
+        #[arg(long)]
+        lib_precursors: String,
+        /// Optional mass recalibration json (search-seed <seed>.masscal.json).
+        #[arg(long)]
+        mass_cal: Option<String>,
+        /// The rebuilt chromatograms.
+        #[arg(long)]
+        out: String,
+        /// Where the patched psms_extracted goes; default: patch --psms-extracted in place.
+        #[arg(long)]
+        out_psms: Option<String>,
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Compute the minimal feature set -> features.parquet + PIN.
     Features {
         #[arg(long)]
@@ -1493,12 +1524,13 @@ fn real_main() -> Result<()> {
                 // Standalone: the windows come from the named file, which is this stage's
                 // contract; only the orchestrators hand them over in memory.
                 rt_windows: None,
-                // The per-point 1/K0 of the traces, for the ion-mobility feature family,
-                // resolved on the spectra's own record.
-                chrom_im: cfg
-                    .features
-                    .im_features
-                    .on(mumdia::instrument::spectra_has_im(&ms2)),
+                // The per-point 1/K0 of the traces, for the ion-mobility feature family and
+                // for a `mumdia retrace` to follow (`retrace.enabled`), resolved on the
+                // spectra's own record.
+                chrom_im: {
+                    let has_im = mumdia::instrument::spectra_has_im(&ms2);
+                    cfg.features.im_features.on(has_im) || (cfg.retrace.enabled && has_im)
+                },
                 // Standalone: this invocation decodes the run itself.
                 scans: None,
                 ms2: &ms2,
@@ -1511,6 +1543,33 @@ fn real_main() -> Result<()> {
                 out_chrom: &out_chromatograms,
                 restrict_candidates: restrict_candidates.as_deref(),
                 cfg: &cfg.extract,
+                config_hash: &ch,
+            })?;
+        }
+        Cmd::Retrace {
+            raw,
+            chromatograms,
+            psms_extracted,
+            run_windows,
+            lib_precursors,
+            mass_cal,
+            out,
+            out_psms,
+            config,
+        } => {
+            let cfg = load_config(&config)?;
+            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            stages::retrace::run_hashed(stages::retrace::RetraceParams {
+                raw: &raw,
+                chromatograms: &chromatograms,
+                psms_extracted: &psms_extracted,
+                out_psms: out_psms.as_deref().unwrap_or(&psms_extracted),
+                run_windows: &run_windows,
+                library_precursors: &lib_precursors,
+                mass_cal: mass_cal.as_deref(),
+                extract: &cfg.extract,
+                out: &out,
+                cfg: &cfg.retrace,
                 config_hash: &ch,
             })?;
         }
@@ -1532,6 +1591,9 @@ fn real_main() -> Result<()> {
                 out_pin: &out_pin,
                 cfg: &cfg.features,
                 config_hash: &ch,
+                // `retrace.apex_features` names the column a retraced psms_extracted
+                // carries; it is read only while the ion-mobility family is on.
+                imc_ref_w: cfg.retrace.apex_features,
             })?;
         }
         Cmd::Prescan {

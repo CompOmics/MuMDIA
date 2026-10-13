@@ -3385,6 +3385,81 @@ impl Default for GroupsConfig {
     }
 }
 
+/// Chromatogram traces rebuilt from the raw timsTOF events (the `retrace` stage, between
+/// extract and features; docs/35_diapasef.md section 6, docs/09 section 9). Each fragment
+/// trace point becomes the sum of every raw event in the grid point's frame and in the quad
+/// slots whose isolation window holds the precursor, within the learned fragment tolerance
+/// and inside `apex_im +/- im_half_width`, instead of the intensity of one centroid. The MS1
+/// isotope traces are rebuilt the same way from the MS1 frames extract samples. diaPASEF
+/// only: a run whose spectra were not read natively from a `.d` is refused. Every key is
+/// omitted from the canonical configuration at its default, and the whole section with
+/// them, so a configuration that does not set it keeps its config hash.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetraceConfig {
+    /// Run the stage inside `run` and `run-experiment` (and the second pass), after extract.
+    /// Extract then writes its centroid traces to `chromatograms.centroid.parquet`, which is
+    /// deleted once retrace has written `chromatograms.parquet`. Not in the RT bootstrap
+    /// pass, which only collects anchors. Default false. Benchmark-gated
+    /// (docs/35_diapasef.md).
+    #[serde(skip_serializing_if = "is_false")]
+    pub enabled: bool,
+    /// Re-choose each candidate's apex retention time and 1/K0 centre on the raw events
+    /// before the traces are rebuilt, among extract's apex and the peaks of the
+    /// `extract.retain_top_peaks` sidecar. Needs `retain_top_peaks >= 2` and
+    /// `promote_top_peaks = 1`, and is refused with `extract.apex_refine_intensity`. It
+    /// overrides the apex that `apex_evidence_rank` chose, by design. Default false.
+    /// Benchmark-gated.
+    #[serde(skip_serializing_if = "is_false")]
+    pub repick: bool,
+    /// Half-width in 1/K0 of the band around the candidate's `apex_im` (`im_pred_cal` when
+    /// that is null) inside which raw events are summed, for the fragment and the MS1
+    /// traces alike. Measured flat from 0.012 to 0.020 on one diaPASEF run. Default 0.015.
+    #[serde(skip_serializing_if = "is_default_retrace_im_half_width")]
+    pub im_half_width: f64,
+    /// Also rebuild the MS1 isotope traces (`ms1_mono`, `ms1_iso1`, `ms1_iso2`) and their
+    /// apex scalars. False copies the centroid MS1 rows and keeps extract's MS1 scalars.
+    /// Default true; kept as a switch until an engine ablation of the raw MS1 band confirms
+    /// the prototype's +1.6%.
+    #[serde(skip_serializing_if = "is_true")]
+    pub ms1: bool,
+    /// Write `imc_ref_w` into `psms_extracted`, the agreement of the fragments' raw 1/K0
+    /// profiles at the apex, which the ion-mobility feature family then carries as its
+    /// tenth feature. Needs `enabled` and a `features.im_features` other than `off`.
+    /// Default false. Benchmark-gated: alone it measured +1.3% peptides, and the added
+    /// peptides carried about 2.7% FDP.
+    #[serde(skip_serializing_if = "is_false")]
+    pub apex_features: bool,
+}
+impl Default for RetraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repick: false,
+            im_half_width: 0.015,
+            ms1: true,
+            apex_features: false,
+        }
+    }
+}
+
+fn is_default_retrace_im_half_width(v: &f64) -> bool {
+    *v == RetraceConfig::default().im_half_width
+}
+
+/// A `true` flag, which the canonical configuration omits for a key whose default is on.
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+impl RetraceConfig {
+    /// Whether every key is at its default, so the canonical configuration omits the
+    /// section.
+    pub fn is_default(&self) -> bool {
+        *self == RetraceConfig::default()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -3408,6 +3483,10 @@ pub struct Config {
     pub experiment: ExperimentConfig,
     #[serde(default)]
     pub groups: GroupsConfig,
+    /// Raw-event trace rebuild for diaPASEF runs ([`RetraceConfig`]). Omitted from the
+    /// canonical configuration while every key is at its default.
+    #[serde(default, skip_serializing_if = "RetraceConfig::is_default")]
+    pub retrace: RetraceConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -3429,6 +3508,7 @@ impl Default for Config {
             mbr: t(),
             experiment: t(),
             groups: t(),
+            retrace: t(),
         }
     }
 }
@@ -4278,6 +4358,75 @@ impl Config {
                 "rt_im_train.adaptive_rt_bins must be >= 1 when adaptive_rt_window is on".into(),
             ));
         }
+        self.validate_retrace()?;
+        Ok(())
+    }
+
+    /// The refusals of the `retrace` section (docs/35_diapasef.md section 6). Whether the
+    /// input is a diaPASEF `.d` is a property of the run, not of the configuration, so that
+    /// one is checked where the run's spectra are known (`retrace::raw_input`).
+    fn validate_retrace(&self) -> Result<(), crate::error::ConfigError> {
+        use crate::error::ConfigError::Invalid;
+        let r = &self.retrace;
+        if !(r.im_half_width.is_finite() && r.im_half_width > 0.0) {
+            return Err(Invalid(format!(
+                "retrace.im_half_width must be finite and > 0 (got {})",
+                r.im_half_width
+            )));
+        }
+        if !r.enabled {
+            for (on, key) in [
+                (r.repick, "retrace.repick"),
+                (r.apex_features, "retrace.apex_features"),
+            ] {
+                if on {
+                    return Err(Invalid(format!(
+                        "{key} needs retrace.enabled: it works on the raw events the retrace \
+                         stage reads"
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        if self.groups.window_groups > 1 {
+            return Err(Invalid(
+                "retrace.enabled is not supported with groups.window_groups > 1: the bands' \
+                 chromatograms are not retraced"
+                    .into(),
+            ));
+        }
+        if self.extract.promote_top_peaks > 1 {
+            return Err(Invalid(format!(
+                "retrace.enabled refreshes the apex scalars of each candidate's selected apex \
+                 (peak_rank 0), so it cannot be combined with extract.promote_top_peaks = {} \
+                 (scored alternative peaks); set promote_top_peaks = 1",
+                self.extract.promote_top_peaks
+            )));
+        }
+        if r.repick {
+            if self.extract.retain_top_peaks < 2 {
+                return Err(Invalid(format!(
+                    "retrace.repick chooses among extract's apex and the peaks of the \
+                     extract.retain_top_peaks sidecar, so it needs retain_top_peaks >= 2 (got \
+                     {}); 5 is the measured setting",
+                    self.extract.retain_top_peaks
+                )));
+            }
+            if self.extract.apex_refine_intensity {
+                return Err(Invalid(
+                    "retrace.repick and extract.apex_refine_intensity both re-choose the apex; \
+                     enable one of them"
+                        .into(),
+                ));
+            }
+        }
+        if r.apex_features && self.features.im_features.is_off() {
+            return Err(Invalid(
+                "retrace.apex_features writes imc_ref_w, a feature of the ion-mobility family, \
+                 so it needs features.im_features = on or auto"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -4889,6 +5038,89 @@ mod tests {
         ] {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }
+    }
+
+    /// The `retrace` section is omitted from the canonical configuration while every key is
+    /// at its default, so a configuration that does not set it keeps its config hash, and
+    /// an explicit default section changes nothing.
+    #[test]
+    fn retrace_keys_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        assert!(d.retrace.is_default());
+        assert!(!d.retrace.enabled && !d.retrace.repick && !d.retrace.apex_features);
+        assert!(d.retrace.ms1);
+        assert_eq!(d.retrace.im_half_width, 0.015);
+        let canon = d.canonical_json();
+        assert!(!canon.contains("retrace"), "{canon}");
+        for explicit in [
+            r#"{"retrace":{}}"#,
+            r#"{"retrace":{"enabled":false,"repick":false,"im_half_width":0.015,
+                "ms1":true,"apex_features":false}}"#,
+        ] {
+            assert_eq!(
+                Config::from_json(explicit).unwrap().canonical_json(),
+                canon,
+                "{explicit}"
+            );
+        }
+        // A set key is written, alone: the other keys stay at their defaults and omitted.
+        let on = Config::from_json(r#"{"retrace":{"enabled":true}}"#).unwrap();
+        assert!(on
+            .canonical_json()
+            .contains(r#""retrace":{"enabled":true}"#));
+        let narrow =
+            Config::from_json(r#"{"retrace":{"enabled":true,"im_half_width":0.012}}"#).unwrap();
+        assert!(narrow
+            .canonical_json()
+            .contains(r#""retrace":{"enabled":true,"im_half_width":0.012}"#));
+        let no_ms1 = Config::from_json(r#"{"retrace":{"enabled":true,"ms1":false}}"#).unwrap();
+        assert!(no_ms1.canonical_json().contains(r#""ms1":false"#));
+        // The keys the IM branch had and this section does not.
+        for gone in [
+            r#"{"retrace":{"min_events":1}}"#,
+            r#"{"retrace":{"ms1_im_half_width":0.015}}"#,
+            r#"{"features":{"retrace_apex":true}}"#,
+        ] {
+            assert!(Config::from_json(gone).is_err(), "{gone} must be refused");
+        }
+    }
+
+    /// The combinations `retrace` cannot run with are refused at load, with the key named.
+    #[test]
+    fn retrace_exclusions_are_refused_at_load() {
+        let err = |json: &str| -> String {
+            match Config::from_json(json) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{json} must be refused"),
+            }
+        };
+        // Keys that only act inside the stage need the stage.
+        assert!(err(r#"{"retrace":{"repick":true}}"#).contains("retrace.enabled"));
+        assert!(err(r#"{"retrace":{"apex_features":true}}"#).contains("retrace.enabled"));
+        assert!(err(r#"{"retrace":{"im_half_width":0.0}}"#).contains("im_half_width"));
+        assert!(err(r#"{"retrace":{"im_half_width":-0.01}}"#).contains("im_half_width"));
+        // Grouped runs and scored alternative peaks.
+        assert!(
+            err(r#"{"retrace":{"enabled":true},"groups":{"window_groups":2}}"#)
+                .contains("window_groups")
+        );
+        assert!(err(r#"{"retrace":{"enabled":true},
+                "extract":{"retain_top_peaks":3,"promote_top_peaks":2}}"#)
+        .contains("promote_top_peaks"));
+        // The re-pick needs the top-K sidecar and is exclusive with the intensity refine.
+        assert!(err(r#"{"retrace":{"enabled":true,"repick":true}}"#).contains("retain_top_peaks"));
+        assert!(err(r#"{"retrace":{"enabled":true,"repick":true},
+                "extract":{"retain_top_peaks":5,"apex_refine_intensity":true}}"#)
+        .contains("apex_refine_intensity"));
+        // `imc_ref_w` belongs to the ion-mobility family.
+        assert!(err(r#"{"retrace":{"enabled":true,"apex_features":true}}"#).contains("im_features"));
+        // The measured recipe passes.
+        let ok = Config::from_json(
+            r#"{"retrace":{"enabled":true,"repick":true,"apex_features":true},
+                "extract":{"retain_top_peaks":5},"features":{"im_features":"auto"}}"#,
+        )
+        .unwrap();
+        assert!(ok.retrace.enabled && ok.retrace.repick && ok.retrace.apex_features);
     }
 
     /// The extraction and feature keys of the diaPASEF work are omitted from the canonical

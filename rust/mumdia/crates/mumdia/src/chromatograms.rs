@@ -1387,6 +1387,7 @@ mod tests {
                 out_pin: "",
                 cfg: &fcfg,
                 config_hash: "test",
+                imc_ref_w: false,
             })
             .unwrap();
             let tf = t.elapsed().as_secs_f64();

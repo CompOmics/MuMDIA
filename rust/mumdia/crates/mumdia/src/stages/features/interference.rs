@@ -14,7 +14,7 @@
 use std::borrow::Cow;
 
 use super::Evidence;
-use crate::stats::{cosine, pearson, pearson_vs, Centered};
+use crate::stats::{cosine, loo_ref_corr, pearson_vs, Centered, LooRef};
 
 pub const NAMES: &[&str] = &[
     "explained_variance_ref",
@@ -196,8 +196,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         let mut min_corr = f64::INFINITY;
         let mut min_f = usize::MAX;
         for &f in &s_set {
-            let lr = loo_ref(e, &s_set, f, tp);
-            let c = pearson(&e.traces[f], &lr);
+            let c = loo_corr(e, &s_set, f, tp);
             if c < min_corr {
                 min_corr = c;
                 min_f = f;
@@ -377,8 +376,7 @@ pub fn values(e: &Evidence) -> Vec<f64> {
     }
     let dominant_frag_ref_corr = if k > 0 && best < e.traces.len() {
         let all: Vec<usize> = (0..k).filter(|&g| g < e.traces.len()).collect();
-        let lr = loo_ref(e, &all, best, tp);
-        pearson(&e.traces[best], &lr)
+        loo_corr(e, &all, best, tp)
     } else {
         0.0
     };
@@ -535,22 +533,11 @@ fn ss(a: &[f64]) -> f64 {
     a.iter().map(|x| x * x).sum()
 }
 
-/// Leave-one-out reference profile: predicted-intensity-weighted sum of the
-/// peak traces of every fragment in `set` except `exclude`. Length `tp`.
-fn loo_ref(e: &Evidence, set: &[usize], exclude: usize, tp: usize) -> Vec<f64> {
-    let mut acc = vec![0.0f64; tp];
-    for &g in set {
-        if g == exclude || g >= e.traces.len() {
-            continue;
-        }
-        let x = &e.traces[g];
-        let w = e.pred[g];
-        let n = x.len().min(tp);
-        for t in 0..n {
-            acc[t] += w * x[t];
-        }
-    }
-    acc
+/// Leave-one-out reference correlation of fragment `f` against the
+/// predicted-intensity-weighted sum of the peak traces of every other fragment in `set`,
+/// `tp` points long (the shared kernel, `stats::loo_ref_corr`).
+fn loo_corr(e: &Evidence, set: &[usize], f: usize, tp: usize) -> f64 {
+    loo_ref_corr(&e.traces, &e.pred, f, LooRef::SumOthers { set, len: tp })
 }
 
 /// Mean leave-one-out reference correlation over `set`.
@@ -564,8 +551,7 @@ fn mean_loo(e: &Evidence, set: &[usize], tp: usize) -> f64 {
         if f >= e.traces.len() {
             continue;
         }
-        let lr = loo_ref(e, set, f, tp);
-        s += pearson(&e.traces[f], &lr);
+        s += loo_corr(e, set, f, tp);
         c += 1;
     }
     if c > 0 {

@@ -194,6 +194,7 @@ pub fn run(p: RunParams) -> Result<()> {
     // raw dispatch before anything is converted, as the library-build keys are. Every stage
     // then sees `on` or `off`, and the manifest records what ran.
     resolved.resolve_im_features(crate::instrument::input_has_im(p.mzml));
+    crate::stages::retrace::refuse_inputs_without_raw_events(&resolved, &[p.mzml])?;
     pre.step("resolve_interpreters");
     let cfg = &resolved;
     preflight(&p, cfg)?;
@@ -826,6 +827,7 @@ pub fn run(p: RunParams) -> Result<()> {
             out_dir: p.out_dir,
             lent_ms2,
             manifest: Some(&mut man),
+            retrace: true,
         })?;
         let chrom = vec![quant::ChromTable::whole(&out.chromatograms)];
         (
@@ -1016,7 +1018,7 @@ pub fn run(p: RunParams) -> Result<()> {
         .insert("rescorer".into(), actual_rescorer_model);
     man.model_identities.insert(
         "feature_schema_id".into(),
-        features::feature_schema_id(&features::active_features_for(&cfg.features, false)),
+        features::feature_schema_id(&features::active_features_of(cfg, false)),
     );
 
     // The input hashes, taken on the background thread started at the top, and the

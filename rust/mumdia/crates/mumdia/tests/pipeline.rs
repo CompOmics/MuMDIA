@@ -276,6 +276,7 @@ fn features_compete_rescore_run_on_crafted_input() {
         out_pin: &pin,
         cfg: &cfg.features,
         config_hash: "test",
+        imc_ref_w: false,
     })
     .unwrap();
     // PIN header exists.
@@ -425,6 +426,7 @@ fn search_stages_return_the_hashes_of_the_files_they_wrote() {
         out_pin: &tmp("hashed.pin"),
         cfg: &cfg.features,
         config_hash: "test",
+        imc_ref_w: false,
     })
     .unwrap();
     assert_written(&wfeat, &feats);
@@ -485,6 +487,7 @@ fn downstream_bytes(psms: &str, chrom: &str, cfg: &Config, tag: &str) -> Vec<Vec
         out_pin: "",
         cfg: &cfg.features,
         config_hash: "test",
+        imc_ref_w: false,
     })
     .unwrap();
     let competed = tmp(&format!("v2_{tag}_competed.parquet"));
@@ -757,6 +760,7 @@ fn features_chunking_is_value_preserving() {
                 out_pin: &pin,
                 cfg: &cfg.features,
                 config_hash: "test",
+                imc_ref_w: false,
             },
             chunk_rows,
         )
@@ -2513,4 +2517,111 @@ fn extract_takes_the_handed_rt_windows_only_when_they_are_its_own() {
         );
         assert_eq!(got.1, from_file.1, "{tag}: chromatograms after the refusal");
     }
+}
+
+/// The extract-to-compete core with retrace off writes the bytes it wrote before retrace
+/// existed, whether the pass allows retrace or not (`ChainParams::retrace`) and whatever the
+/// disabled `retrace` section holds; and `retrace.enabled` on a run read from mzML (3D, no
+/// raw events) is refused with the reason, not run.
+#[test]
+fn the_chain_without_retrace_is_byte_identical_and_refuses_retrace_on_3d_input() {
+    let (prec, frag) = craft_library();
+    let ms2 = craft_ms2_with_decoy(true);
+    let ms1 = craft_ms1();
+    let base = Config::default();
+    let seed = tmp("chain_seed.parquet");
+    stages::search_seed::run(stages::search_seed::SearchSeedParams {
+        precursor_span: None,
+        fragment_offset: None,
+        ms2_scans: None,
+        emit_calibrants: false,
+        library: None,
+        ms2: &ms2,
+        library_precursors: &prec,
+        library_fragments: &frag,
+        out: &seed,
+        cfg: &base.search_seed,
+        bucket_size: base.extract.bucket_size,
+        config_hash: "test",
+    })
+    .unwrap();
+    let co = stages::convert::ConvertOutputs {
+        ms1: ms1.clone(),
+        ms2: ms2.clone(),
+        isolation_windows: String::new(),
+        ms2_to_ms1: String::new(),
+        hashes: stages::convert::ConvertHashes {
+            ms1: String::new(),
+            ms2: String::new(),
+            isolation_windows: String::new(),
+            ms2_to_ms1: String::new(),
+        },
+        schemas: stages::convert::ConvertSchemas::for_source(false),
+    };
+    let chain = |cfg: &Config, allow: bool, tag: &str| {
+        let dir = tmp(&format!("chain_{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = stages::chain::extract_to_compete(stages::chain::ChainParams {
+            cfg,
+            config_hash: "test",
+            lib_p: &prec,
+            lib_f: &frag,
+            converted: &co,
+            seed: &seed,
+            out_dir: &dir,
+            lent_ms2: None,
+            manifest: None,
+            retrace: allow,
+        });
+        (dir, out)
+    };
+    let bytes = |dir: &str| -> Vec<(String, Vec<u8>)> {
+        let mut v: Vec<(String, Vec<u8>)> = [
+            "run_windows.parquet",
+            "cal.json",
+            "psms_extracted.parquet",
+            "chromatograms.parquet",
+            "features.parquet",
+            "psms_competed.parquet",
+        ]
+        .iter()
+        .map(|n| (n.to_string(), std::fs::read(format!("{dir}/{n}")).unwrap()))
+        .collect();
+        v.sort();
+        v
+    };
+    let (d0, o0) = chain(&base, false, "off");
+    o0.unwrap();
+    assert!(
+        mumdia_io::table::nrows(&format!("{d0}/psms_extracted.parquet")).unwrap() > 0,
+        "the chain extracted nothing, so the comparison is between empty tables"
+    );
+    let want = bytes(&d0);
+    let (d1, o1) = chain(&base, true, "allowed");
+    o1.unwrap();
+    assert_eq!(bytes(&d1), want, "allowing retrace changed a 3D chain");
+    let disabled = Config::from_json(r#"{"retrace":{"im_half_width":0.02,"ms1":false}}"#).unwrap();
+    let (d2, o2) = chain(&disabled, true, "disabled");
+    o2.unwrap();
+    assert_eq!(
+        bytes(&d2),
+        want,
+        "a disabled retrace section changed a 3D chain"
+    );
+    assert!(!std::path::Path::new(&format!("{d2}/{}", stages::retrace::CENTROID_NAME)).exists());
+    // Enabled: a pass that may retrace refuses the mzML-read run; the bootstrap pass, which
+    // never retraces, runs it as before.
+    let on = Config::from_json(r#"{"retrace":{"enabled":true}}"#).unwrap();
+    let (_, refused) = chain(&on, true, "refused");
+    let err = format!(
+        "{:#}",
+        refused.err().expect("retrace on 3D input must fail")
+    );
+    assert!(
+        err.contains("retrace.enabled") && err.contains("native"),
+        "{err}"
+    );
+    let (d3, o3) = chain(&on, false, "bootstrap");
+    o3.unwrap();
+    assert_eq!(bytes(&d3), want, "the bootstrap pass retraced");
 }

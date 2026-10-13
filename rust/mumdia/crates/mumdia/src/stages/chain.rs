@@ -1,5 +1,5 @@
 //! The chain every ungrouped search runs after its seed and its retention-time library:
-//! rt-im-train, the optional prescreen, extract, features and compete.
+//! rt-im-train, the optional prescreen, extract, the optional retrace, features and compete.
 //!
 //! One implementation for every caller. Single-run `run` passes its manifest (so each
 //! artifact is recorded) and the MS2 decode its seed lends on; `run-experiment`, the
@@ -15,7 +15,7 @@ use mumdia_core::types::Ms2Scan;
 use mumdia_io::record_artifact;
 use tracing::info;
 
-use crate::stages::{compete, convert, extract, features, prescreen, rt_im_train};
+use crate::stages::{compete, convert, extract, features, prescreen, retrace, rt_im_train};
 
 /// The inputs of one run's extract-to-compete chain.
 pub struct ChainParams<'a> {
@@ -33,6 +33,11 @@ pub struct ChainParams<'a> {
     pub lent_ms2: Option<Vec<Ms2Scan>>,
     /// Records every artifact of the chain when given.
     pub manifest: Option<&'a mut Manifest>,
+    /// Whether this pass may retrace (`retrace.enabled` decides whether it does): on for
+    /// `run`, `run-experiment` and the second pass, off for the RT bootstrap pass, which
+    /// only collects anchors and would pay retrace's 100-150 s and 36-39 GB per HYE run for
+    /// nothing it uses.
+    pub retrace: bool,
 }
 
 /// The chain's outputs, by path.
@@ -63,6 +68,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         out_dir,
         lent_ms2,
         mut manifest,
+        retrace: retrace_allowed,
     } = p;
     let d = |name: &str| format!("{out_dir}/{name}");
 
@@ -116,6 +122,16 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
 
     let psms = d("psms_extracted.parquet");
     let chrom = d("chromatograms.parquet");
+    let mass_cal = format!("{seed}.masscal.json");
+    // Under `retrace.enabled`, extract writes its centroid traces aside, with their
+    // per-point 1/K0, and retrace writes `chromatograms.parquet` from the raw events, so
+    // every later stage reads the usual path.
+    let raw = retrace::raw_if_enabled(cfg, retrace_allowed, &co.ms2)?;
+    let chrom_extract = if raw.is_some() {
+        d(retrace::CENTROID_NAME)
+    } else {
+        chrom.clone()
+    };
     info!(stage = %"extract", "run: stage start");
     let ext_cfg =
         crate::stages::ms1cal::extract_cfg(&cfg.extract, seed, &co.ms1, cfg.rt_im_train.q_train)?;
@@ -135,22 +151,44 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         library_fragments: lib_f,
         run_windows: &windows,
         ms1: Some(&co.ms1),
-        mass_cal: Some(&format!("{seed}.masscal.json")),
+        mass_cal: Some(&mass_cal),
         out_psms: &psms,
-        out_chrom: &chrom,
+        out_chrom: &chrom_extract,
         restrict_candidates: survivors.as_deref(),
         cfg: &ext_cfg,
         config_hash: ch,
-        // The per-point 1/K0 of the traces, for the ion-mobility feature family. The callers
-        // resolved `features.im_features` once for the run or the experiment
-        // (`Config::resolve_im_features`); the spectra's own record answers an unresolved
-        // `auto`.
-        chrom_im: cfg
-            .features
-            .im_features
-            .on(crate::instrument::spectra_has_im(&co.ms2)),
+        // The per-point 1/K0 of the traces, for the ion-mobility feature family and for
+        // retrace. The callers resolved `features.im_features` once for the run or the
+        // experiment (`Config::resolve_im_features`); the spectra's own record answers an
+        // unresolved `auto`.
+        chrom_im: raw.is_some()
+            || cfg
+                .features
+                .im_features
+                .on(crate::instrument::spectra_has_im(&co.ms2)),
     })?;
     drop(lent_ms2);
+    // The rebuilt chromatograms and the patched psms_extracted, when retrace runs; the
+    // centroid table is deleted once it is read.
+    let retraced = retrace::run_if_enabled(
+        raw.as_deref(),
+        cfg,
+        &ext_cfg,
+        ch,
+        retrace::ChainFiles {
+            centroid: &chrom_extract,
+            psms_extracted: &psms,
+            run_windows: &windows,
+            library_precursors: lib_p,
+            mass_cal: &mass_cal,
+            out: &chrom,
+        },
+    )?;
+    // Each table is recorded once, as the later stages read it.
+    let (wpsm, wchr, chrom_stage) = match retraced {
+        Some(r) => (r.psms_extracted, r.chromatograms, "retrace"),
+        None => (wpsm, wchr, "extract"),
+    };
     keep(
         &mut manifest,
         wpsm.record(
@@ -169,7 +207,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
             // The layout and the 1/K0 list the table holds, read from the table.
             crate::chromatograms::recorded_schema(&chrom)?,
             &chrom,
-            "extract",
+            chrom_stage,
             ch,
         ),
     );
@@ -184,6 +222,8 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         out_pin: &d("run.pin"),
         cfg: &cfg.features,
         config_hash: ch,
+        // Retrace's `imc_ref_w`, when this pass retraced under `retrace.apex_features`.
+        imc_ref_w: raw.is_some() && cfg.retrace.apex_features,
     })?;
     keep(
         &mut manifest,
