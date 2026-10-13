@@ -641,66 +641,18 @@ pub(crate) fn finish_run(
     seed: &str,
     out: &str,
 ) -> Result<(String, String)> {
-    let d = |name: &str| format!("{out}/{name}");
-    let windows = d("run_windows.parquet");
-    let rt_cfg = rt_im_train::with_anchor_cut(
-        &cfg.rt_im_train,
-        &rt_im_train::plan_anchors(seed, &cfg.rt_im_train)?,
-    );
-    // Handed to extract in memory; see `rt_im_train::RtWindows`.
-    let (_, fitted_windows) = rt_im_train::run_in_memory(rt_im_train::RtImTrainParams {
-        precursor_span: None,
-        anchor_irt_from_seed: false,
-        seed_psms: seed,
-        library_precursors: lib_p,
-        out_windows: &windows,
-        out_cal: &d("cal.json"),
-        cfg: &rt_cfg,
+    let o = crate::stages::chain::extract_to_compete(crate::stages::chain::ChainParams {
+        cfg,
         config_hash: ch,
+        lib_p,
+        lib_f,
+        converted: co,
+        seed,
+        out_dir: out,
+        lent_ms2: None,
+        manifest: None,
     })?;
-    let survivors =
-        prescreen::run_if_enabled(cfg, ch, &co.ms2, Some(&co.ms1), lib_p, &windows, out)?;
-    let psms = d("psms_extracted.parquet");
-    let chrom = d("chromatograms.parquet");
-    let ext_cfg =
-        crate::stages::ms1cal::extract_cfg(&cfg.extract, seed, &co.ms1, cfg.rt_im_train.q_train)?;
-    extract::run(extract::ExtractParams {
-        precursor_span: None,
-        fragment_offset: None,
-        sibling_bands: 1,
-        rt_windows: fitted_windows,
-        scans: None,
-        ms2: &co.ms2,
-        library_precursors: lib_p,
-        library_fragments: lib_f,
-        run_windows: &windows,
-        ms1: Some(&co.ms1),
-        mass_cal: Some(&format!("{seed}.masscal.json")),
-        out_psms: &psms,
-        out_chrom: &chrom,
-        restrict_candidates: survivors.as_deref(),
-        cfg: &ext_cfg,
-        config_hash: ch,
-    })?;
-    let feats = d("features.parquet");
-    let features_written = features::run_hashed(features::FeaturesParams {
-        psms: &psms,
-        chromatograms: &chrom,
-        seed: Some(seed),
-        out: &feats,
-        out_pin: &d("run.pin"),
-        cfg: &cfg.features,
-        config_hash: ch,
-    })?;
-    let competed = d("psms_competed.parquet");
-    compete::run(compete::CompeteParams {
-        features: &feats,
-        out: &competed,
-        cfg: &cfg.compete,
-        config_hash: ch,
-        features_hash: Some(&features_written.content_hash),
-    })?;
-    Ok((competed, chrom))
+    Ok((o.competed, o.chromatograms))
 }
 
 /// Split an experiment-wide scored table into per-run tables by the `source`

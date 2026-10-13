@@ -3,6 +3,7 @@
 
 pub mod align;
 pub mod audit;
+pub mod chain;
 pub mod compete;
 pub mod convert;
 pub mod digest;
