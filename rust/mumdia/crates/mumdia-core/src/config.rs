@@ -1350,7 +1350,8 @@ pub struct RtImTrainConfig {
     /// adapting run: `search` when its seed search found fewer than
     /// `multihead_search_below` anchors (distinct target base peptides at `q_train`, the
     /// count `rt_im_train::plan_anchors` makes) or had to relax `q_train` through
-    /// `anchor_q_ladder` to find enough, else `seed`. Under `run-experiment` with
+    /// `anchor_q_ladder` to find enough, and on every run whose spectra carry 1/K0
+    /// (diaPASEF, whatever its anchor count), else `seed`. Under `run-experiment` with
     /// `experiment.rt_library_scope = first_run_only` only the first run adapts the library,
     /// so only it is ever searched twice; under `per_run` every run decides for itself. The
     /// per-run LOESS still fits on the seed anchors.
@@ -1360,7 +1361,11 @@ pub struct RtImTrainConfig {
     /// Astral HeLa, 1,249 seed anchors: +5.1% real precursors at entrapment FDP 1%; a
     /// 216-cell single-cell plate (100-250 seed anchors per cell): +7.8% / +5.5% precursors;
     /// Orbitrap AIF E. coli entrapment, 5,025: +0.9%; ProteoBench Astral entrapment, 13,786:
-    /// +0.46%. The cost is a fixed extract-to-rescore pass and a second library prediction
+    /// +0.46%. On diaPASEF the gain does not fall with the anchor count (2026-10-14): the six
+    /// 60 min HYE runs of the ProteoBench diaPASEF module, 11,144 seed anchors, +5.7% peptides
+    /// and +6.5% ProteoBench ions (one seed); the 15 min E. coli run, 4,639 seed anchors,
+    /// +0.6% peptides over three seeds with the entrapment FDP 0.43% against 0.46%; hence the
+    /// 1/K0 rule. The cost is a fixed extract-to-rescore pass and a second library prediction
     /// on the adapting run, which reads the DeepLC projection cache the first one wrote: +63
     /// s on a single-cell run, +4 to 5 min (+51% wall) on a three-run bulk Astral experiment
     /// with a 17M-row library. `auto` buys the large gain where seed anchors are scarce and
@@ -1566,7 +1571,7 @@ pub enum LibraryIrt {
 #[serde(rename_all = "snake_case")]
 pub enum MultiheadAnchors {
     /// `search` when the adapting run's seed search is short of anchors
-    /// (`RtImTrainConfig::multihead_search_below`), else `seed`.
+    /// (`RtImTrainConfig::multihead_search_below`) or its spectra carry 1/K0, else `seed`.
     #[default]
     Auto,
     /// The run's confident seed PSMs (`spectrum_q <= q_train`).

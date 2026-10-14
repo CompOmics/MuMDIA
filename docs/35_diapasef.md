@@ -461,9 +461,14 @@ past the 29,419 anchors at which the spline failed, so both guards are precondit
 No anchor cap is added (`--max-ref` takes the first rows in m/z order, and a cap did not
 prevent the failure).
 
-Planned arms: **T2**, `multihead_anchors = search` against `auto` on TIMS after both guards (the
-native seed has about 5,000 anchors, so `auto` keeps the seed; reference IM L1d variant B, E. coli
-12,919 over three seeds, entrapment 11,989 real at an FDP of 0.41-0.44%); **T1**, the RT
+Arm **T2**, `multihead_anchors = search` against the anchor-count `auto` on TIMS after both
+guards, is measured (2026-10-14, section 11, "ProteoBench HYE diaPASEF"): +5.7% peptides on the
+six 60 min HYE runs (11,144 seed anchors, one seed) and +0.6% on the E. coli run (4,639, three
+seeds) at an entrapment FDP of 0.39-0.46% against 0.42-0.51%. `auto` therefore chooses `search`
+on every run whose spectra carry 1/K0 (docs/08 section 4f, "the 1/K0 rule"). The IM branch's
+per-run refit still leads by 2.0% peptides on the HYE runs (100,392 against 98,373, same library
+and raw files); `experiment.rt_library_scope = per_run` and a 1/K0 recentre are the next arms.
+Planned: **T1**, the RT
 recentre increment, the bootstrap with and without a second LOESS on the search anchors, three
 seeds, E. coli entrapment and quantification ions. A recentre that gains becomes one default-off
 sub-option of `rt_bootstrap`, not a refit path, and widths are never sized from the refit (IM
@@ -710,7 +715,11 @@ conditions A and B in triplicate (expected log2 B/A: human 0, yeast -1, E. coli 
 `run-experiment` per arm with an imported FASTA library built once (missed cleavages 1, length
 7-30, charges 2-4, MS2PIP `timsTOF2024`, DeepLC, IM2Deep; 14.7M precursors with decoys,
 `library_irt = library`), the PR 4 settings of the table above, strict `nn_torch`, seed 0.
-Peptides per run are stripped peptides at `run_psm_q` 1%, the mean of the six runs; the
+`library_irt = library` on an imported library also switches the automatic multi-head
+calibration off, so these arms and the recipe arm below ran without it; the recipe itself builds
+its library from FASTA with DeepLC and runs it (the E. coli recipe runs above did). On the
+60 min set the omission cost 12% of the peptides (next subsection), so these numbers are a lower
+bound for the recipe. Peptides per run are stripped peptides at `run_psm_q` 1%, the mean of the six runs; the
 quantified precursors are `peptides.tsv` rows with a quantity in at least two runs of each
 condition, and the ratios are their medians.
 
@@ -762,6 +771,31 @@ and quant keys; seed 0, 64 threads, alone on the host.
 Per run the second pass added 9,119-9,879 accepted rows and dropped 1,818-2,487. The decoy
 fraction was 0.84% in anchor runs and 1.56% in non-anchor runs, the same split as with the PR 4
 settings.
+
+**ProteoBench HYE diaPASEF.** The six public runs of the ProteoBench module
+`quant_lfq_DIA_ion_diaPASEF` (timsTOF SCP, about 60 min, `ttSCP_diaPASEF_Condition_{A,B}`),
+the module's FASTA, the AlphaPeptDeep library of the recipe (14.7M precursors with decoys,
+identical row for row to the IM branch's l1d library in a sample of 18,477 precursors and
+221,724 fragments), the recipe's extraction and quant keys, seed 0, 120 threads, scored offline
+with ProteoBench 0.18.6 (`bench/pb_eval.py`, Custom format, k = 3); nothing uploaded. Peptides
+are stripped peptides at the experiment-wide `peptide_q_value` 1%.
+
+| arm | ions (k = 3) | global / eq / CV | E. coli log2 A/B | peptides | `w_rt` | wall / peak |
+|---|---|---|---|---|---|---|
+| no MBR, no multi-head calibration (`library_irt = library`) | 72,051 | 0.119 / 0.158 / 0.076 | -1.86 | 82,148 | 155 s | 1:41 / 480 GB |
+| no MBR, multi-head 80 | 84,841 | 0.127 / 0.168 / 0.083 | -1.86 | 93,061 | 40-45 s | 0:48 / 258 GB |
+| no MBR, multi-head 80, search anchors | 90,363 | 0.130 / 0.175 / 0.085 | -1.86 | 98,373 | 24-27 s | 1:03 / 199 GB |
+| second pass, multi-head 80, search anchors | 103,185 | 0.139 / 0.208 / 0.092 | -1.78 | 97,979 | 25-33 s | 1:03 / 196 GB |
+| IM branch binary and configuration, no MBR | 94,099 | 0.131 / 0.178 / 0.084 | -1.84 | 100,392 | 27.6 s | 1:15 / 172 GB |
+
+Global is the median |log2 ratio error|, eq the mean of the per-species medians, CV the median
+per-condition CV. The IM branch arm reproduces its own thestral result (92,540 ions, 100,790
+peptides) on these raw files with this library, so the remaining gap is in the engine path: its
+per-run RT refit with a 1/K0 recentre (arm T1, sections 7 and 14). The wide RT windows without a multi-head
+calibration are also why that arm needed 120-136 GB per run in extract. The second pass added
+14.2% ions; its decoy fraction was 0.87% in anchor runs and 1.70% in non-anchor runs, and the
+ions it adds carry most of the ratio compression (E. coli log2 -0.86 for ions accepted in one
+first-pass run, -1.87 for ions accepted in all six).
 
 
 ### On the IM branch
@@ -920,7 +954,7 @@ diaPASEF set, G4 ProteoBench HYE at `min_obs` 3, G5 wall time and process-tree p
 | arm | question |
 |---|---|
 | T1 | does an RT recentre on identifications add to `rt_bootstrap`? |
-| T2 | `multihead_anchors = search` against `auto` on TIMS, after the guards |
+| T2 | `multihead_anchors = search` against `auto` on TIMS, after the guards: measured, `auto` now chooses `search` on 1/K0 data (section 7) |
 | T3 | fragment tolerance estimator: p95 two-pass, MAD k = 4 two-pass and single-pass, p95 single-pass; also on the 3D benchmarks, to retire one |
 | T3b | T3 with retrace and the re-pick on |
 | T4 | `gate_min_score` 0, 0.3, 0.45, 0.6 under `window_mean` with the 1/K0 gate on |

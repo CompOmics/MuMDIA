@@ -130,6 +130,15 @@ than a number. Both are recorded in every run's `manifest.json`.
   config hash and, on a run with at least 2,500 seed anchors, its output; on a run with fewer
   the output changes. `"seed"` restores the previous behaviour (`docs/08_rt_im_train.md`
   section 4f).
+- **`multihead_anchors = "auto"` also chooses search anchors on diaPASEF**: every adapting
+  run whose converted spectra carry 1/K0 is searched once to refit its multi-head
+  calibration, whatever its seed anchor count. On diaPASEF the gain does not fall with the
+  count: the six 60 min HYE runs of the ProteoBench diaPASEF module (11,144 seed anchors)
+  +5.7% peptides and +6.5% ProteoBench ions at k = 3, `w_rt` 40-45 s -> 24-27 s, one seed;
+  the 15 min E. coli run (4,639) +0.6% over three seeds at an entrapment FDP of 0.42-0.51% ->
+  0.39-0.46%. The cost is one bootstrap pass on the first run (about 6 min on the 60 min set).
+  `anchors_auto` records `ion_mobility`. 3D runs are unchanged; `"seed"` restores the
+  previous behaviour on diaPASEF (`docs/08_rt_im_train.md` section 4f).
 - One version-floor check for interpreter discovery, `doctor` and the sidecar launch
   (`Role::version_floor`, `sidecar::require_version`) (#185).
 - One extract-to-compete chain for `run` and `run-experiment` (`stages::chain`), with the

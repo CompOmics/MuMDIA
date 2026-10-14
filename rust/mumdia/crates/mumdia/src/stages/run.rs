@@ -634,7 +634,8 @@ pub fn run(p: RunParams) -> Result<()> {
             // Under `multihead_anchors = search`, or `auto` on a seed short of anchors,
             // this seed-anchored fit goes to `rt_bootstrap/` and the refit below takes the
             // usual name.
-            let search = rt_bootstrap::decide(cfg, mh_heads, &anchor_plan, p.out_dir);
+            let has_im = crate::instrument::input_has_im(p.mzml);
+            let search = rt_bootstrap::decide(cfg, mh_heads, &anchor_plan, has_im, p.out_dir);
             let lib_p_mh = rt_bootstrap::seed_library_path(search, p.out_dir);
             info!(stage = %"deeplc-multihead", "run: stage start");
             crate::sidecar::run_deeplc_multihead(
@@ -684,7 +685,7 @@ pub fn run(p: RunParams) -> Result<()> {
             } else {
                 lib_p_mh
             };
-            rt_bootstrap::record_auto(cfg, &anchor_plan, search, &lib_p_mh);
+            rt_bootstrap::record_auto(cfg, &anchor_plan, has_im, search, &lib_p_mh);
             let n_mh = mumdia_io::table::nrows(&lib_p_mh)?;
             man.record(record_artifact(
                 artifact::FRAGMENT_LIBRARY_PRECURSORS.0,

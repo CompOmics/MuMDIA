@@ -685,7 +685,8 @@ confident identifications of a full search of the same run instead. `"seed"` nev
 (`rt_bootstrap::decide`): `search` when the seed found fewer than
 `rt_im_train.multihead_search_below` anchors (default 2,500; distinct target base peptides at
 `q_train`, the count `rt_im_train::plan_anchors` makes), or reached `min_seed_for_calibration`
-only after relaxing `q_train` through `anchor_q_ladder`; otherwise `seed`. The gain of the
+only after relaxing `q_train` through `anchor_q_ladder`; on a run whose spectra carry 1/K0 (diaPASEF) whatever the count (the 1/K0
+rule, below); otherwise `seed`. The gain of the
 bootstrap falls steeply with the seed anchor count (below), so `auto` spends the extra pass
 where it buys several percent and not where it buys half of one. Wherever no multi-head
 calibration runs, and on a grouped run, `auto` is `seed`.
@@ -824,6 +825,25 @@ refitted library depends on which targets the bootstrap search accepts, and that
 the arithmetic of DeepLC and the NN, so it is draw-sensitive like a fine-tune. A bulk run at a
 different thread count (64) doubled one run's `w_rt` (49 to 98 s) and lost 0.35%; at 32
 threads all nine `search` jobs kept `w_rt` within a few seconds of `seed`.
+
+**diaPASEF: the 1/K0 rule** (2026-10-14). On timsTOF diaPASEF the gain does not fall with the
+seed anchor count, so `auto` also chooses `search` on every adapting run whose spectra carry
+1/K0 (`instrument::spectra_has_im`, the converted spectra's recorded reader), whatever its
+seed count. Measured with the diaPASEF recipe (docs/35), `nn_torch`, peptdeep / DeepLC /
+IM2Deep library, multi-head calibration on, one host:
+
+| Set | Seed anchors | Search anchors | `seed` | `search` | FDR |
+|---|---|---|---|---|---|
+| ProteoBench HYE diaPASEF, six 60 min runs, seed 0 | 11,144 | 60,502 | 93,061 peptides, 84,841 ions (k = 3) | 98,373 (+5.7%), 90,363 ions (+6.5%) | decoy fraction unchanged |
+| E. coli 15 min, three seeds | 4,639 | 14,938 | 13,962 (mean) | 14,044 (+0.6%, every seed up) | entrapment FDP 0.42-0.51% -> 0.39-0.46% |
+
+On the HYE runs `w_rt` fell from 40-45 s to 24-27 s, the level of the IM branch's per-run RT
+refit (27.6 s). The ProteoBench scores (median |epsilon| global / species-equalised / CV) were
+0.127 / 0.168 / 0.083 with seed anchors and 0.130 / 0.175 / 0.085 with search anchors, on 6.5%
+more ions, most of them weaker ones. The bootstrap pass added about 6 min,
+the whole six-run experiment 1:03 against 0:48 at 120 threads. One HYE seed only: the size of
+the gain, not its sign, is what further seeds would refine. The `anchors_auto` record carries
+`ion_mobility`, and the INFO line names the reason.
 
 **Status.** `auto` is the default since 2026-10-12: entrapment through the engine on three
 datasets and two acquisition types (Orbitrap Astral, Orbitrap AIF), with seeds, plus the

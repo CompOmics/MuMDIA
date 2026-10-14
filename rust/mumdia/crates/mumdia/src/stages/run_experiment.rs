@@ -674,7 +674,8 @@ fn adapt_rt_library(
         // Under `multihead_anchors = search`, or `auto` on a seed short of anchors, the
         // seed-anchored fit goes to `rt_bootstrap/` and the refitted library takes the usual
         // name; otherwise this is the usual name.
-        let search = rt_bootstrap::decide(cfg, mh_heads, &plan, out);
+        let has_im = crate::instrument::spectra_has_im(&boot.co.ms2);
+        let search = rt_bootstrap::decide(cfg, mh_heads, &plan, has_im, out);
         let lib_p_mh = rt_bootstrap::seed_library_path(search, out);
         crate::sidecar::run_deeplc_multihead(
             python,
@@ -711,7 +712,7 @@ fn adapt_rt_library(
         } else {
             lib_p_mh
         };
-        rt_bootstrap::record_auto(cfg, &plan, search, &lib_p_mh);
+        rt_bootstrap::record_auto(cfg, &plan, has_im, search, &lib_p_mh);
         produced_rt_lib = Some(lib_p_mh.clone());
         lib_p_mh
     } else if cfg.rt_im_train.finetune_deeplc {
