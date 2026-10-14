@@ -1,6 +1,6 @@
 # Python sidecar contract tests
 
-Contract tests for the eleven Python workers in `scripts/`. The Rust unit suite
+Contract tests for the Python workers in `scripts/`. The Rust unit suite
 does not exercise any of them: it can pass while a worker violates a file
 contract, and the violation then surfaces hours into a real run, after the
 search compute has already been spent.

@@ -517,16 +517,21 @@ library entries came back in pass 2. `Config::validate` warns when `mbr.q_anchor
 Planned arms: **T8**, consensus 1/K0 against the calibrated library 1/K0 in the second pass,
 both under the floor (G2 multi-run entrapment, G3, G4); the override's 1/K0 stays only if T8
 shows a gain. **T9**, the first-pass `w_im` floor against IM's fixed 0.04, with the first-pass
-`w_im` values and the 1/K0-gate losses on second-pass rows. No diaPASEF result of main's second
-pass is reported until it has run on a TIMS pool.
+`w_im` values and the 1/K0-gate losses on second-pass rows.
+
+Main's second pass on the six 5 min HYE diaPASEF runs (section 11, seed 0): +18.7% peptides per
+run at an unchanged pooled decoy fraction of 1.07%, with the decoy fraction at 0.82% in anchor
+runs and 1.63% in non-anchor runs, the same pattern as on the IM branch.
 
 ## 8. Quantification
 
 The cross-run quant levers (`quant.fragment_selection = cross_run`, `quant.baseline_source =
 experiment`, `quant.fixed_scan_halfwidth_scale`) are described, with their diaPASEF
 measurements, in docs/12_quant_lfq_align_mbr_report_audit.md, "Cross-run fragment selection
-and background". Main's default quantification on diaPASEF is unmeasured: every number below
-used predicted fragment selection and the interference envelope, which are not defaults.
+and background". The record below used predicted fragment selection and the interference
+envelope, which are not defaults. Main's default quantification and the cross-run levers were
+measured on main only on the six 5 min HYE runs (section 11), with the median-ratio metrics of
+that section rather than ProteoBench.
 
 ### The quantification record, condensed
 
@@ -571,7 +576,9 @@ pass is the one mechanism, section 7):
   the report cut: 534-536 of 656 entrapment library entries were accepted in pass 2.
 
 MBR of any kind compresses ratios, on diaPASEF as elsewhere (docs/12). The IM branch's arm D
-is the reference for main's second pass on TIMS data, which has not been measured (G4).
+is the reference for main's second pass on TIMS data. On main, with the cross-run levers, the
+second pass raised the 5 min HYE species-equalised error from 0.301 to 0.363 and quantified 40%
+more precursors (section 11); ProteoBench on the 60 min set (G4) is still open.
 
 ## 9. How to run diaPASEF
 
@@ -677,9 +684,85 @@ gain. The converted spectra (`spectra_ms1`, `spectra_ms2`, `isolation_windows`,
 Single seeds: a difference under about 1% between two of these arms is not a measurement
 (docs/28). The arms that are still to be run on this base are in section 14.
 
-<!-- MEASUREMENT: AlphaPeptDeep recipe arm (configs/examples/diapasef.json on the E. coli run, three nn_torch seeds, entrapment FDP): peptides / precursors / protein groups, decoy fraction, wall, peak -->
+**The recipe.** `configs/examples/diapasef.json` (section 9: AlphaPeptDeep `generic`,
+`timsTOF`, NCE 35, and the PR 2 to PR 6 keys) on the same run, three `nn_torch` seeds:
 
-<!-- MEASUREMENT: six-run HYE diaPASEF experiment with the recipe (second pass, cross-run quant): experiment-wide peptides / precursors / protein groups, second-pass diagnostics (decoy fraction in anchor and non-anchor runs), ProteoBench ions / global / eq / CV at min_obs 3, wall, peak -->
+| | seed 0 | seed 1 | seed 2 |
+|---|---|---|---|
+| peptides | 14,004 | 13,934 | 13,948 |
+| precursors | 17,086 | 17,046 | 16,898 |
+| protein groups | 1,977 | 1,963 | 1,973 |
+
+The decoy fraction was 0.98% in every seed, the process peak 19.9 GB, and the wall 19:40 to
+23:04 with two searches sharing the host at 32 threads each. A single-seed PR 4 arm with
+AlphaPeptDeep and without the recipe's extraction and RT keys gave 14,139 peptides in 9:46.
+
+Entrapment, the same three seeds against the E. coli FASTA plus a 1:1 human entrapment
+proteome (`bench/make_entrapment_fasta.py`; the built library's ratio is 0.574592, 988,128 real
+against 1,719,704 entrapment target candidates): 13,293 / 13,392 / 13,331 real and 96 / 116 /
+106 entrapment peptides at `peptide_q_value` 1%. The engine's estimator
+(`fdr::entrapment_q`, ratio x entrapment + 1 over real) gives an FDP of 0.42 / 0.51 / 0.46%,
+in the range of the IM branch's re-pick arm (0.37-0.47%). The combined upper bound,
+entrapment x (1 + ratio) over all accepted peptides, is 1.13 / 1.35 / 1.24%.
+
+**Six-run HYE diaPASEF experiment.** PXD070049, timsTOF Ultra 2, 5 min gradient, 50 ng,
+conditions A and B in triplicate (expected log2 B/A: human 0, yeast -1, E. coli +2). One
+`run-experiment` per arm with an imported FASTA library built once (missed cleavages 1, length
+7-30, charges 2-4, MS2PIP `timsTOF2024`, DeepLC, IM2Deep; 14.7M precursors with decoys,
+`library_irt = library`), the PR 4 settings of the table above, strict `nn_torch`, seed 0.
+Peptides per run are stripped peptides at `run_psm_q` 1%, the mean of the six runs; the
+quantified precursors are `peptides.tsv` rows with a quantity in at least two runs of each
+condition, and the ratios are their medians.
+
+| arm | peptides per run | decoy fraction | precursors / protein groups (experiment) | quantified precursors | human | yeast | E. coli | species-equalised error | CV |
+|---|---|---|---|---|---|---|---|---|---|
+| no MBR | 27,951 | 1.07% | 36,698 / 8,345 | 22,619 | +0.121 | -0.434 | +1.419 | 0.450 | 0.061 |
+| no MBR, cross-run quant | 27,951 | 1.07% | 36,698 / 8,345 | 22,618 | +0.164 | -0.633 | +1.808 | 0.301 | 0.067 |
+| second pass | 33,190 (+18.7%) | 1.07% | 36,664 / 9,073 | 31,673 | +0.113 | -0.318 | +1.009 | 0.616 | 0.063 |
+| second pass, cross-run quant | 33,190 | 1.07% | 36,664 / 9,073 | 31,673 | +0.171 | -0.560 | +1.657 | 0.363 | 0.076 |
+
+Cross-run quant is `fragment_selection = cross_run`, `baseline_subtract` and
+`baseline_source = experiment`. It changed no identification. On the cross-run MaxLFQ protein
+groups the species-equalised error fell from 0.465 to 0.255 without the second pass (6,620
+groups) and from 0.642 to 0.345 with it (8,169 groups).
+
+The second pass built 40,017 empirical library entries, aligned all six runs (1/K0 offsets at
+most 0.0014 against the reference run), took every entry's 1/K0 from the runs, and set each
+run's 1/K0 window floor to its first-pass `w_im` (0.033-0.034). Per run it added 7,395-7,817
+accepted rows and dropped 1,578-2,564 against the first pass. The decoy fraction was 0.82%
+among rows accepted in a run that anchored the entry and 1.63% among rows accepted in the other
+runs: the pooled level is unchanged, but the transferred subset carries twice the decoy rate.
+Without cross-run quant the extra rows compress the ratios (E. coli +1.009 against +1.419);
+with it the compression mostly goes (+1.657).
+
+The no-MBR arm ran alone on a 128-core host at 64 threads and took 44 min; the other three ran
+concurrently at 40 threads each and took 1:53 each, so wall times are not comparable between
+the rows. The largest process peaked at 107 GB in every arm; the pooled rescore scored 31.2M
+PSMs.
+
+The IM branch's HYE column below is the ProteoBench HYE diaPASEF set, a different acquisition
+(about a 60 min gradient), and its counts are not comparable with these.
+
+**The recipe on the six runs.** The same data with `configs/examples/diapasef.json`: the
+library rebuilt with AlphaPeptDeep (`generic`, `timsTOF`, NCE 35) on the same digest, DeepLC
+and IM2Deep (1:45 for 14.7M precursors at 48 threads), and the recipe's extraction, second-pass
+and quant keys; seed 0, 64 threads, alone on the host.
+
+| | recipe | second pass, cross-run quant (PR 4 settings, table above) |
+|---|---|---|
+| peptides per run | 39,507 | 33,190 |
+| decoy fraction | 1.12% | 1.07% |
+| precursors / protein groups (experiment) | 43,518 / 9,984 | 36,664 / 9,073 |
+| quantified precursors | 37,887 | 31,673 |
+| human / yeast / E. coli | +0.149 / -0.612 / +1.661 | +0.171 / -0.560 / +1.657 |
+| species-equalised error / CV | 0.349 / 0.080 | 0.363 / 0.076 |
+| protein groups, cross-run MaxLFQ: n / species-equalised error | 9,027 / 0.335 | 8,169 / 0.345 |
+| wall / peak | 39:13 / 121 GB | 1:53 (shared host) / 107 GB |
+
+Per run the second pass added 9,119-9,879 accepted rows and dropped 1,818-2,487. The decoy
+fraction was 0.84% in anchor runs and 1.56% in non-anchor runs, the same split as with the PR 4
+settings.
+
 
 ### On the IM branch
 
@@ -821,12 +904,16 @@ cross-fitted, lost 1.5% (section 12; recalled in `f90809c`). A cross-fitted HYE 
 coli entrapment run decide between a real gain and train/score overlap. It is not ported; it
 can return as its own measured proposal.
 
-**Second-pass and quant measurements on TIMS data.** Main's second pass has not run on a
-diaPASEF pool, and the cross-run quant rests on one known-ratio dataset (sections 7 and 8).
+**Second-pass and quant measurements on TIMS data.** Main's second pass and the cross-run
+quant have run on one diaPASEF pool, the six 5 min HYE runs of section 11, with one seed and
+no multi-run entrapment. The second pass held the pooled decoy fraction, but its transferred
+rows carried twice the decoy rate of the anchored rows (1.63% against 0.82%). A multi-run
+entrapment on HYE and a second known-ratio diaPASEF set decide whether the second pass and
+the cross-run quant become TIMS defaults.
 
 Planned arms, each against main's integrated base with the recipe. The gates are named G0 to
 G5: G0 byte identity of every 3D artifact, report, manifest entry and config hash, G1 the E. coli run with three paired seeds on one host, G2 E. coli entrapment (ratio
-0.563430) and, for the second pass, a multi-run entrapment on HYE, G3 the six-run HYE
+0.574592 for the recipe's library) and, for the second pass, a multi-run entrapment on HYE, G3 the six-run HYE
 diaPASEF set, G4 ProteoBench HYE at `min_obs` 3, G5 wall time and process-tree peak against a
 64 GB budget.
 
@@ -850,7 +937,7 @@ diaPASEF set, G4 ProteoBench HYE at `min_obs` 3, G5 wall time and process-tree p
 Each TIMS-only key moves to `auto` (or, for the valley fractions, to a TIMS default) only in
 its own change, with entrapment and a second acquisition. The entrapment FASTA is made with
 `bench/make_entrapment_fasta.py`; its ratio is a property of the library (0.563430 for the
-E. coli diaPASEF library), so it is computed for each library (`bench/README.md`).
+IM branch's E. coli diaPASEF library, 0.574592 for the recipe's), so it is computed for each library (`bench/README.md`).
 
 ## 15. Limits
 

@@ -40,8 +40,9 @@ names it must carry. RT is read in minutes. A reference without `IM` works for
 is N_real / N_entrap over the library's target candidates. It changes with the
 proteomes, the digest, the modifications and the charges, so compute it for each
 built library with `make_entrapment_fasta.py --ratio-library` and the run config's
-marker, exclude and contaminant settings. The E. coli diaPASEF library measured
-0.563430 (670,590 real against 1,190,193 entrapment target candidates);
+marker, exclude and contaminant settings. The IM branch's E. coli diaPASEF library measured
+0.563430 (670,590 real against 1,190,193 entrapment target candidates), the
+`configs/examples/diapasef.json` library 0.574592 (988,128 against 1,719,704);
 `fs_lib.ENTRAP_RATIO` = 0.560632 belongs to the August E. coli AIF library below
 and is wrong for any other. `entrapment_fdp.py` reads the ratio from the run
 config (`rescore.entrapment_ratio`, default 1.0), and `fs_lib.entrapment_fdp`
