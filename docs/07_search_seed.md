@@ -42,10 +42,11 @@ DeepLC fine-tune (`run.rs:237-280`).
 | `rust/mumdia/crates/mumdia/src/matchers/fragindex.rs` | `FragIndex` (CSR inverted fragment index) + `SeedScratch` epoch accumulator |
 | `rust/mumdia/crates/mumdia/src/index.rs` | `Library::load`, `candidate_range`, `page_search` (bucketed backend), `cand_frags` |
 | `rust/mumdia/crates/mumdia/src/calibrate.rs` | `percentile` used by the tolerance fit |
-| `rust/mumdia/crates/mumdia/src/spectra.rs` | `load_ms2` (reads the converted MS2 Parquet into `Ms2Scan`) |
+| `rust/mumdia/crates/mumdia/src/spectra.rs` | `load_ms2` (reads the converted MS2 Parquet into `Ms2Scan`, with the per-peak 1/K0 of spectra v2), `nearest_peak` (the one nearest-peak rule of the calibrants and the 1/K0 points) |
+| `rust/mumdia/crates/mumdia/src/stats.rs` | `weighted_median` (the observed 1/K0) |
 | `rust/mumdia/crates/mumdia-core/src/constants.rs` | `ppm_bounds`, `ppm_diff`, `within_ppm` (the shared ppm math) |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `SearchSeedConfig` (`:286`), `MatcherKind` (`:38`) |
-| `rust/mumdia/crates/mumdia-core/src/schema.rs` | `artifact::SEED_PSMS = ("seed_psms", 1)` (`:15`) |
+| `rust/mumdia/crates/mumdia-core/src/schema.rs` | `artifact::SEED_PSMS = ("seed_psms", 1)`, `SEED_PSMS_V2` and the selector `artifact::seed_psms(has_im)` |
 | `rust/mumdia/crates/mumdia/src/main.rs` | CLI `Cmd::SearchSeed` (`:75`, dispatch `:458`) |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | orchestrator wiring (`:219`), masscal handoff to extract (`:309`) |
 
@@ -95,13 +96,20 @@ a candidate that always ranks below `report_psms` gets no row even if it cleared
 | `predicted_irt` | f32 | library iRT, copied through (unused in scoring) |
 | `matched_peaks` | i32 | matched-fragment count at the best scan |
 | `scan_index` | u32 | `scan_index` of the best-scoring scan |
+| `observed_im` | f64, nullable | v2 only: observed 1/K0 of a confident target (step 6) |
+
+The seed is version 2 (`artifact::seed_psms(true)`), with the `observed_im` column and the
+report stat `with_observed_im`, only when the searched scans carry per-peak 1/K0 (spectra v2,
+the native diaPASEF reader). Otherwise it is version 1 with exactly the columns above it, byte
+for byte. The orchestrators record the version read from the table's footer
+(`search_seed::seed_schema`), not a constant.
 
 **`<out>.masscal.json`** (fitted and serialised by `masscal::MassCal`, `masscal.rs`):
 
 | key | type | meaning |
 |---|---|---|
 | `frag_ppm_offset` | f64 | median signed ppm of `observed_peak` relative to `predicted_fragment` (`ppm_diff(peak_mz, fmz)`), i.e. the systematic offset |
-| `frag_tol_ppm` | f64 | learned tolerance: `max(5.0, 1.5 * P95(|dev - offset|))` |
+| `frag_tol_ppm` | f64 | learned tolerance: `max(frag_tol_floor_ppm, 1.5 * P95(|dev - offset|))`, or `max(frag_tol_floor_ppm, frag_tol_mad_k * 1.4826 * MAD)` under `search_seed.frag_tol_mad_k` |
 | `frag_ppm_sigma` | f64 | duplicate of `frag_tol_ppm` (the learned tolerance is the local mass-uncertainty estimate) |
 | `n_dev` | usize | number of fragment-to-nearest-peak deviations collected (`devs.len()`) |
 | `cal_passes` | int | 0 (fallback, too few devs), 1 (single pass), or 2 (robust second pass) |
@@ -117,7 +125,8 @@ matched hyperscore postings.
 **`<out>.report.json`** (`ArtifactReport`, `search_seed.rs:256-274`): rows,
 `content_hash` (blake3 of the output Parquet, `search_seed.rs:262`), `params`
 (`fragment_tol_ppm`, `report_psms`, `min_matched_peaks`, `top_n_peaks`,
-`fdr_seed`; note `matcher` and `two_pass_mass_cal` are *not* recorded in `params`),
+`fdr_seed`, and `count_fragments_once: true` only when that key is on; note `matcher`
+and `two_pass_mass_cal` are *not* recorded in `params`),
 a `stats` map (`psms`, and `targets_at_q<fdr_seed>` whose key is the float-
 formatted threshold, e.g. `targets_at_q0.01`), `model_identity =
 "native-seed-hyperscore-v1"`, and `elapsed_ms`.
@@ -194,6 +203,23 @@ index via `page_search` and needs no separate build.
   best is the one the scan-by-scan walk gives
   (`chunk_tests::a_chunked_seed_is_the_one_task_per_window_seed_exactly`). An ungrouped
   run with many windows mostly keeps one task per group.
+- *Count each fragment once* (`count_fragments_once`, default false, fragindex only). The
+  default accumulation counts every matched posting, so two peaks inside the tolerance of
+  one predicted fragment count as two matched fragments in `ln(matched!)`. On a diaPASEF
+  slot spectrum the mobility pieces of one fragment ion sit at one m/z and do exactly
+  that. With the key on, the seed index also carries each posting's fragment ordinal
+  (`FragIndex::build_mz_only_with_ordinals`, 2 bytes per posting more; the lent
+  `SeedLibrary` records it in its key), and `SeedScratch::accumulate_count_once` collects
+  the scan's `(candidate, fragment, intensity)` hits, sorts them by `(candidate, fragment)`
+  and counts each pair once at its most intense peak, adding the maxima in that order.
+  The default `accumulate` and `probe_peak_cand` are untouched. With no fragment matched
+  twice the counts and the qualified set are the default's
+  (`count_once_is_the_plain_accumulation_when_no_fragment_repeats`). Config validation
+  refuses the key with `matcher = bucketed`. Benchmark-gated (docs/35_diapasef.md, arm
+  T13). On the IM branch the mobility valley split alone cut the seed's confident anchors
+  from 5,200 to 3,331, and counting once brought them to 5,534, +3.8% peptides with the
+  split (three seeds). The diaPASEF recipe (`configs/examples/diapasef.json`) sets it
+  with both valley fractions.
 - *Bucketed path* (serial, `search_seed.rs:66-107`): per scan, `candidate_range` on
   the Library, `select_peaks`, then `page_search` for each probed peak accumulates
   `(count, obs_sum)` into a `HashMap`. Same `min_matched_peaks` filter, hyperscore,
@@ -252,19 +278,36 @@ finds the low edge, then a linear scan to the high edge).
 This `partition_point` + linear scan **assumes `scan.peaks` is m/z-ascending**;
 `load_ms2` does not re-sort peaks by m/z (`spectra.rs:20-97`), so the assumption
 rests on `convert` writing peaks in m/z order. The nearest peak by absolute m/z
-distance contributes one signed ppm deviation (`ppm_diff(peak_mz, fmz)`,
-`constants.rs:66`) to `devs` (`:426-449`). Every library fragment of the candidate
+distance (`spectra::nearest_peak`; a tie keeps the first, lower-m/z peak, because only a
+strictly smaller distance replaces the best) contributes one signed ppm deviation
+(`ppm_diff(peak_mz, fmz)`, `constants.rs:66`) to `devs` (`:426-449`). Every library fragment of the candidate
 is probed, not only those that matched during scoring, so a fragment that found no
 scoring posting can still supply a calibrant. The 50 ppm floor keeps the net wider
 than a narrow `fragment_tol_ppm`, so a systematic offset larger than the tolerance can
 still be measured; on a wide-tolerance search the net is the tolerance itself, so the
 percentile that sets the learned tolerance is not truncated by the net.
 
-The fit closure (`:187-194`) takes deviations, sorts them, takes the median as the
-offset (`sorted[len/2]`, the upper-middle element for even-length inputs, not the
-two-element average), then sets `tol = max(5.0, 1.5 * P95(|dev - offset|))` using
-`calibrate::percentile(.., 0.95)` (nearest-rank on `round(p*(n-1))`,
-`calibrate.rs:156-164`). Control flow (`:195-216`):
+**Observed 1/K0** (`observed_im`, spectra with per-peak 1/K0 only). The same walk gives each
+confident target its observed 1/K0: every nearest peak whose deviation lies within
+`fragment_tol_ppm` (not the wider collection window, so random matches stay out) contributes
+its `(1/K0, intensity)`, and `observed_im` is the intensity-weighted median of those points
+(`stats::weighted_median`: the smallest value whose cumulative weight reaches half the
+total). Fragments inherit the precursor's mobility in diaPASEF, because the TIMS separation
+precedes fragmentation, so the median over the matched fragments is the precursor's 1/K0
+at its best scan, and an intense fragment outweighs a faint interferer at another 1/K0. The
+1/K0 point of a fragment is the peak whose deviation calibrates the mass, so a 3D run's
+calibrants are unchanged by the shared helper. Decoys, unconfident targets and a target
+without a matched peak in tolerance get null. rt-im-train calibrates the library's
+`predicted_im` against these values (docs/08_rt_im_train.md, "Ion-mobility calibration").
+The grouped seed pool does not carry the column yet: a grouped run is refused on diaPASEF
+input (docs/35_diapasef.md section 3).
+
+The one estimator is `masscal::fit_floored(devs, floor, mad_k)`. It takes the median
+of the deviations as the offset (`sorted[len/2]`, the upper-middle element for
+even-length inputs, not the two-element average) and sets the tolerance to
+`max(floor, 1.5 * P95(|dev - offset|))` using `calibrate::percentile(.., 0.95)`
+(nearest-rank on `round(p*(n-1))`). `floor` is `search_seed.frag_tol_floor_ppm` (default
+5) in every pass. Control flow (`MassCal::fit_from`):
 
 - `devs.len() < 20`: fallback, `(0.0, fragment_tol_ppm, cal_passes = 0)` (no
   offset, tolerance unchanged).
@@ -272,6 +315,30 @@ two-element average), then sets `tol = max(5.0, 1.5 * P95(|dev - offset|))` usin
 - if `two_pass_mass_cal`: keep only deviations inside `|dev - o1| <= t1` and, when
   `>= 20` survive, re-fit to `(o2, t2, 2)`; otherwise keep the single-pass result.
   The second pass rejects random-match outliers so they cannot bias the median.
+
+`search_seed.frag_tol_mad_k` (default 0, off) replaces the P95 width with the robust
+sigma of the deviations: `mad_k * 1.4826 * MAD`, MAD being the median of
+`|dev - offset|`, still floored at `frag_tol_floor_ppm`. A P95 is set by the tail of the
+deviations, so a shoulder of random matches (10% of the deviations in
+`the_mad_estimator_ignores_a_shoulder_that_sets_the_p95`) can widen it several-fold,
+where the MAD follows the core. Under `two_pass_mass_cal` its second pass refits the
+offset only, on the deviations inside the first-pass window, and keeps the first-pass
+width: a MAD re-estimated on inliers truncated at that width is narrower than the
+spread they were cut from, so every pass would tighten it for no reason in the data
+(`the_mad_second_pass_refits_the_offset_and_keeps_the_width`). At 0 the result is the
+P95 estimator's, bit for bit. On the IM branch MAD with k = 4 gave +5.7% over the P95
+arm on diaPASEF E. coli (three seeds, single pass); HYE was not isolated, and every IM
+number is single-pass. On main with two-pass mass calibration (diaPASEF E. coli, one seed)
+k = 4 learned 10.0 ppm against 11.7 ppm for P95 and gave 11,037 peptides against 11,072, no
+gain. The key is benchmark-gated (docs/35_diapasef.md, arm T3), and
+whether one estimator can serve every acquisition is open; if one ties or wins
+everywhere, the other is retired.
+
+A negative result, recorded so it is not tried again: do not size the fragment tolerance
+from accepted identifications. The IM branch's variant C re-estimated the tolerance from
+the deviations of the identified precursors and set it to 7.99 ppm, which cost 2.7% of
+the identifications; a fixed 8 ppm cost 3.7%. The accepted set is already filtered by the
+tolerance it would size, so its spread understates the run's.
 
 The estimator is `masscal::MassCal::fit_from` and the JSON body its `to_json`, both in
 `masscal.rs`, because a grouped search fits the very same estimator a second time: each
@@ -320,6 +387,10 @@ tolerance (falling back to the config value if the file is absent,
 | `FragIndex::build` / `build_mz_only` | `fragindex.rs:78` / `:99` | build the CSR inverted index at a fixed tolerance; `build_mz_only` without the intensity and fragment-ordinal payload (`has_payload`, `:105`) |
 | `FragIndex::probe_peak` / `probe_peak_cand` | `fragindex.rs:396` / `:425` | matched postings for one peak in a candidate range; `probe_peak_cand` reports the candidate only and is what the seed probes through (it also serves an m/z-only index) |
 | `SeedScratch::with_min_count` / `accumulate` / `qualified` | `fragindex.rs:667` / `:691` / `:741` | epoch-stamped `(count, obs_sum)` accumulator, one 16-byte slot per candidate; `qualified` lists the candidates that reached `min_matched_peaks`, in first-reached order |
+| `SeedScratch::accumulate_count_once` / `FragIndex::probe_peak_cand_frag` / `build_mz_only_with_ordinals` | `fragindex.rs` | `count_fragments_once`: each (candidate, fragment) counted once per scan at its most intense peak, through an m/z-only index that also holds the fragment ordinals |
+| `spectra::nearest_peak` | `spectra.rs` | nearest peak within a ppm window, ties to the first; serves the calibrant deviations and the 1/K0 points |
+| `stats::weighted_median` | `stats.rs` | the observed 1/K0 of a confident target |
+| `seed_schema` | `search_seed.rs` | the `seed_psms` version a table on disk records (v2 when it has `observed_im`) |
 | `Library::candidate_range` | `index.rs:1612` | half-open candidate id range for an isolation window |
 | `Library::page_search` | `index.rs:1621` | bucketed inverted-index probe (bucketed backend) |
 | `Library::cand_frag_mz` | `index.rs:1566` | fragment m/z slice for a candidate; the one fragment accessor an m/z-only library serves |
@@ -346,13 +417,16 @@ on load.
 | `min_matched_peaks` | `4` | minimum matched fragments for a candidate to score in a scan |
 | `top_n_peaks` | `300` | probe only the N most intense peaks per scan (`0` = all); seed-only, does not shrink the extract artifact |
 | `matcher` | `Fragindex` | backend; `MatcherKind::Bucketed` (`config.rs:38`) uses the serial `page_search` path |
-| `two_pass_mass_cal` | `false` | robust second-pass mass fit on the in-window inliers (sensitivity_plan P3.1) |
+| `two_pass_mass_cal` | `true` | robust second-pass mass fit on the in-window inliers (sensitivity_plan P3.1); default true since 2026-10-11 |
+| `count_fragments_once` | `false` | count each predicted fragment once per spectrum at its most intense matching peak (step 3); fragindex only; omitted from the canonical configuration at the default |
+| `frag_tol_floor_ppm` | `5.0` | floor of the learned tolerance, in both passes |
+| `frag_tol_mad_k` | `0.0` | `> 0`: the learned tolerance is `frag_tol_mad_k * 1.4826 * MAD` instead of `1.5 * P95`, and the second pass refits the offset only (step 6); omitted from the canonical configuration at the default; benchmark-gated |
 
 `bucket_size` for the bucketed Library index is taken from `cfg.extract.bucket_size`,
 not from `SearchSeedConfig` (`run.rs:225`). The 50 ppm mass-calibration search
-window, the `min 5.0 ppm` tolerance floor, the `1.5 * P95` scale, and the `>= 20`
-deviation threshold are hardcoded in `search_seed.rs` (`:167`, `:192`, `:195`),
-not config fields.
+window, the `1.5 * P95` scale, the `1.4826` MAD-to-sigma factor and the `>= 20`
+deviation threshold are constants (`search_seed.rs`, `masscal.rs`), not config fields;
+the floor is `frag_tol_floor_ppm`.
 
 The standalone subcommand `Cmd::SearchSeed` (`main.rs:75-86`, dispatch `:458-476`)
 takes `--ms2`, `--lib-precursors`, `--lib-fragments`, `--out`, and

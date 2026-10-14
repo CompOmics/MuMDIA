@@ -108,6 +108,32 @@ pub enum FragPredictorKind {
     Peptdeep,
 }
 
+/// Where a FASTA-built library's `predicted_im` (1/K0) comes from; see
+/// [`PredictFragConfig::im_predictor`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImPredictorKind {
+    /// No ion-mobility prediction. The library has no `predicted_im` column and is the
+    /// version-1 table.
+    #[default]
+    None,
+    /// IM2Deep Python sidecar (`im2deep_worker.py`, docs/13_sidecars.md): one CCS per
+    /// (peptidoform, charge) from the single-conformer model, converted to 1/K0 at the
+    /// precursor m/z. A hard requirement: the run fails without an IM2Deep interpreter.
+    Im2deep,
+    /// `im2deep` when the run's spectra carry 1/K0 (a diaPASEF `.d`, `mumdia::instrument`)
+    /// AND an IM2Deep interpreter resolves (`predict_frag.im2deep_python`, its environment
+    /// variable or discovery), otherwise `none`, with a log line.
+    Auto,
+}
+
+impl ImPredictorKind {
+    /// Whether this is the default, which the canonical configuration omits.
+    pub fn is_none(&self) -> bool {
+        matches!(self, ImPredictorKind::None)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RescorerKind {
@@ -344,6 +370,47 @@ pub struct ConvertConfig {
     /// `1` converts one at a time, as before. Only the first conversion of an input pays
     /// this at all; `reuse_converted` skips the rest. Not measured at scale.
     pub parallel_conversions: usize,
+    /// Native diaPASEF reader (`stages::convert::tdf`): m/z merge tolerance in ppm between
+    /// neighbouring TOF points of one centroid (single linkage). Default 10.
+    ///
+    /// Read only for a timsTOF `.d` whose frames are diaPASEF, which `convert` reads
+    /// natively; every other input ignores the `tdf_*` keys. Each `tdf_*` key is omitted
+    /// from the canonical configuration at its default, so it changes no config hash.
+    #[serde(skip_serializing_if = "is_default_tdf_mz_ppm")]
+    pub tdf_mz_ppm: f64,
+    /// Native diaPASEF reader: a gap of more than this many TIMS scans without signal
+    /// splits one m/z trace into separate centroids. Default 30. Provisional: it rests on a
+    /// peak census of one run and the seed plateau, not on an end-to-end sweep.
+    #[serde(skip_serializing_if = "is_default_tdf_im_gap_scans")]
+    pub tdf_im_gap_scans: u32,
+    /// Native diaPASEF reader: a centroid built from fewer raw TOF x scan points than this
+    /// is dropped. Default 2. Provisional, as `tdf_im_gap_scans`.
+    #[serde(skip_serializing_if = "is_default_tdf_min_points")]
+    pub tdf_min_points: u32,
+    /// Native diaPASEF reader: split each m/z x mobility cluster at the valleys of its
+    /// m/z profile. A local minimum of the smoothed profile is a cut when it is below this
+    /// fraction of the smaller of the two humps beside it, so one ion stays one centroid and
+    /// two neighbouring ions become two. Must be in [0, 1); 0 (default) is off and leaves
+    /// the centroids unchanged. Benchmark-gated (docs/35_diapasef.md).
+    #[serde(skip_serializing_if = "is_default_tdf_mz_valley")]
+    pub tdf_mz_valley: f64,
+    /// Native diaPASEF reader: half-width in ppm of the triangular smoothing applied to the
+    /// m/z profile before `tdf_mz_valley` looks for valleys; 0 is no smoothing. Default 8.
+    /// Unused while `tdf_mz_valley` is 0.
+    #[serde(skip_serializing_if = "is_default_tdf_mz_smooth_ppm")]
+    pub tdf_mz_smooth_ppm: f64,
+    /// Native diaPASEF reader: split each cluster (after the m/z valley split, when that is
+    /// on) at the valleys of its mobility profile, the summed intensity per TIMS scan after
+    /// a triangular smoothing of half-width `tdf_im_smooth_scans`. Separates ions of one m/z
+    /// whose mobility profiles touch without a `tdf_im_gap_scans` gap. Must be in [0, 1);
+    /// 0 (default) is off and leaves the centroids unchanged. Benchmark-gated.
+    #[serde(skip_serializing_if = "is_default_tdf_im_valley")]
+    pub tdf_im_valley: f64,
+    /// Native diaPASEF reader: half-width in TIMS scans of the mobility profile smoothing
+    /// used by `tdf_im_valley`; 0 is no smoothing. Default 8. Unused while `tdf_im_valley`
+    /// is 0.
+    #[serde(skip_serializing_if = "is_default_tdf_im_smooth_scans")]
+    pub tdf_im_smooth_scans: f64,
 }
 impl Default for ConvertConfig {
     fn default() -> Self {
@@ -353,8 +420,53 @@ impl Default for ConvertConfig {
             msconvert_args: Vec::new(),
             reuse_converted: true,
             parallel_conversions: 4,
+            tdf_mz_ppm: 10.0,
+            tdf_im_gap_scans: 30,
+            tdf_min_points: 2,
+            tdf_mz_valley: 0.0,
+            tdf_mz_smooth_ppm: 8.0,
+            tdf_im_valley: 0.0,
+            tdf_im_smooth_scans: 8.0,
         }
     }
+}
+
+// The `rt_im_train` ion-mobility keys at their defaults, which the canonical configuration
+// omits.
+fn is_default_im_min_anchors_per_charge(v: &usize) -> bool {
+    *v == RtImTrainConfig::default().im_min_anchors_per_charge
+}
+fn is_default_p_im(v: &f64) -> bool {
+    *v == RtImTrainConfig::default().p_im
+}
+fn is_default_im_window_multiplier(v: &f64) -> bool {
+    *v == RtImTrainConfig::default().im_window_multiplier
+}
+fn is_default_im_window_min(v: &f64) -> bool {
+    *v == RtImTrainConfig::default().im_window_min
+}
+
+// The `convert.tdf_*` keys at their defaults, which the canonical configuration omits.
+fn is_default_tdf_mz_ppm(v: &f64) -> bool {
+    *v == ConvertConfig::default().tdf_mz_ppm
+}
+fn is_default_tdf_im_gap_scans(v: &u32) -> bool {
+    *v == ConvertConfig::default().tdf_im_gap_scans
+}
+fn is_default_tdf_min_points(v: &u32) -> bool {
+    *v == ConvertConfig::default().tdf_min_points
+}
+fn is_default_tdf_mz_valley(v: &f64) -> bool {
+    *v == ConvertConfig::default().tdf_mz_valley
+}
+fn is_default_tdf_mz_smooth_ppm(v: &f64) -> bool {
+    *v == ConvertConfig::default().tdf_mz_smooth_ppm
+}
+fn is_default_tdf_im_valley(v: &f64) -> bool {
+    *v == ConvertConfig::default().tdf_im_valley
+}
+fn is_default_tdf_im_smooth_scans(v: &f64) -> bool {
+    *v == ConvertConfig::default().tdf_im_smooth_scans
 }
 
 /// Sequence-tag prescan (`mumdia prescan`). Prunes modification-bearing candidates that have no
@@ -918,6 +1030,24 @@ pub struct PredictFragConfig {
     pub peptdeep_python: Option<String>,
     /// Python executable for the DeepLC sidecar (env with deeplc + pyarrow).
     pub deeplc_python: Option<String>,
+    /// Ion-mobility predictor for the library's `predicted_im` (1/K0, V s cm^-2) in a FASTA
+    /// build. `none` (the default): the library has no `predicted_im` column. `im2deep`:
+    /// IM2Deep predicts one 1/K0 per (peptidoform, charge), and the run fails without an
+    /// IM2Deep interpreter (`im2deep_python`). `auto`: `im2deep` when the run's spectra
+    /// carry 1/K0 (a diaPASEF `.d`) and an IM2Deep interpreter resolves, otherwise `none` with
+    /// a log line; a standalone `predict-frag` has no run, so there it is `none`. Decoys built by the native digest get their
+    /// own prediction, as they get their own iRT. A candidate IM2Deep returns no value for is
+    /// dropped with its pair, under the same 2% ceiling as a missing iRT or intensity.
+    /// Library-input mode ignores the key: an imported library carries its own 1/K0. Omitted
+    /// from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "ImPredictorKind::is_none")]
+    pub im_predictor: ImPredictorKind,
+    /// Python executable for the IM2Deep sidecar (env with im2deep >= 2.0.0, psm_utils, torch
+    /// and pyarrow), or `"auto"` to discover one (`MUMDIA_PYTHON_IM2DEEP`). Used only when
+    /// `im_predictor` is `im2deep` or `auto`. Omitted from the canonical configuration when
+    /// unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub im2deep_python: Option<String>,
     /// Directory holding the sidecar worker scripts.
     pub sidecar_script_dir: String,
     /// Skip DeepLC in a FASTA library build (`rt_predictor = deeplc`) when the multi-head
@@ -959,8 +1089,8 @@ pub struct PredictFragConfig {
     /// 9.8M-peptidoform HYE library). Set, the orchestrator looks the library up under a key
     /// of everything that determines it: the FASTA's content hash, the `digest`,
     /// `peptidoforms` and `predict_frag` sections (all but this field), `rng_seed`, whether
-    /// the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep or
-    /// DeepLC version the build uses, the worker scripts' content and the running
+    /// the iRT is a deferred DeepLC placeholder, the installed MS2PIP, AlphaPeptDeep,
+    /// DeepLC or IM2Deep version the build uses, the worker scripts' content and the running
     /// executable's content. A hit is copied to the paths a build writes (a byte copy, never
     /// a hard link, and checked against the blake3 recorded when it was stored) and digest,
     /// peptidoforms and predict-frag are skipped; a miss is built and then stored. When a
@@ -998,9 +1128,30 @@ impl Default for PredictFragConfig {
             peptdeep_instrument: "Lumos".to_string(),
             peptdeep_python: None,
             deeplc_python: None,
+            im_predictor: ImPredictorKind::None,
+            im2deep_python: None,
             sidecar_script_dir: "scripts".to_string(),
             defer_deeplc_to_multihead: true,
             library_cache: Some("auto".to_string()),
+        }
+    }
+}
+
+impl PredictFragConfig {
+    /// The ion-mobility predictor a library build runs for a run whose spectra do
+    /// (`run_has_im`) or do not carry 1/K0: `auto` becomes `im2deep` only when they do and an
+    /// IM2Deep interpreter resolved, and `none` otherwise. An explicit choice is returned as
+    /// it is. `run_has_im` is `mumdia::instrument`'s one predicate; a build with no run (a
+    /// standalone `predict-frag`) passes false. Meaningful after interpreter resolution
+    /// (`mumdia::python::resolve`), which leaves `im2deep_python` either a concrete path or
+    /// unset.
+    pub fn im_predictor_for(&self, run_has_im: bool) -> ImPredictorKind {
+        match self.im_predictor {
+            ImPredictorKind::Auto if run_has_im && self.im2deep_python.is_some() => {
+                ImPredictorKind::Im2deep
+            }
+            ImPredictorKind::Auto => ImPredictorKind::None,
+            kind => kind,
         }
     }
 }
@@ -1047,6 +1198,28 @@ pub struct SearchSeedConfig {
     /// tolerance is `1.5 x p95(|deviation - median|)`; on an instrument whose fragment mass
     /// error is well under a ppm (Astral) the floor, not the data, sets it.
     pub frag_tol_floor_ppm: f64,
+    /// Count each predicted fragment of a candidate at most once per spectrum, with the
+    /// intensity of its most intense matching peak, instead of once per matching peak. On
+    /// diaPASEF slot spectra the mobility pieces of one fragment ion sit at one m/z and
+    /// would otherwise count as several fragments in the hyperscore's `ln(matched!)`
+    /// (docs/07_search_seed.md). Needs `matcher = fragindex`, whose seed index then also
+    /// holds each posting's fragment ordinal (2 bytes per posting). Default false: the seed
+    /// is unchanged. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical
+    /// configuration at its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub count_fragments_once: bool,
+    /// Size the learned fragment tolerance from the robust spread of the calibrant
+    /// deviations, `frag_tol_mad_k x 1.4826 x MAD`, instead of `1.5 x p95`, where MAD is
+    /// the median of `|deviation - median|`. Still floored at `frag_tol_floor_ppm`. Under
+    /// `two_pass_mass_cal` the second pass refits only the offset on the deviations inside
+    /// the first-pass window and keeps the first-pass width: a MAD re-estimated on inliers
+    /// truncated at that width is narrower than the spread it was cut from. A p95 is set by
+    /// the tail of the deviations, so a 10% shoulder of random matches can widen it
+    /// several-fold, where the MAD follows the core. Default 0: the p95 estimator,
+    /// bit-identical to before the key existed. Benchmark-gated (docs/07_search_seed.md).
+    /// Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub frag_tol_mad_k: f64,
 }
 impl Default for SearchSeedConfig {
     fn default() -> Self {
@@ -1060,8 +1233,22 @@ impl Default for SearchSeedConfig {
             two_pass_mass_cal: true,
             mass_cal_loess: false,
             frag_tol_floor_ppm: 5.0,
+            count_fragments_once: false,
+            frag_tol_mad_k: 0.0,
         }
     }
+}
+
+/// A `false` flag, which the canonical configuration omits for keys added after the
+/// configuration hash was frozen for their section.
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// A number left at 0 ("off"), which the canonical configuration omits for keys added
+/// after the configuration hash was frozen for their section.
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// Heads `rt_im_train.multihead_calibration` uses when it is left to decide.
@@ -1094,6 +1281,16 @@ pub struct RtImTrainConfig {
     /// from pulling the curve (single-cell runs: residuals of +14 to +82 s moved the
     /// calibration 2-3 s across the mid-gradient).
     pub loess_robust_iters: usize,
+    /// Drop the anchors whose predicted iRT lies outside `[Q1 - 3 IQR, Q3 + 3 IQR]` of the
+    /// anchors' predicted iRT before anything is fitted to them: the linear and LOESS fits,
+    /// the window sizing (in-sample, held-out and local) and the composition correction all
+    /// see the same filtered anchors. A few anchors with an absurd predicted iRT stretch the
+    /// LOESS grid over the whole x range, so the gradient falls into one or two grid cells;
+    /// `loess_robust_iters` reweights residuals and does not stop that. `cal.json` records
+    /// `n_rt_outliers_removed` when anchors were removed. Default false: every anchor is
+    /// fitted, as before. Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub anchor_x_filter: bool,
     /// Correct each candidate's calibrated RT for the composition-dependent residual that
     /// the predicted RT leaves (a per-run Huber regression of the anchors' residuals on
     /// charge 3, charge >= 4, length, internal K/R, His and Met-ox): on the single-cell
@@ -1248,6 +1445,26 @@ pub struct RtImTrainConfig {
     /// DIA-NN library iRT and 10,181 from a per-run fine-tune, with `w_rt` 343 s against
     /// 632 s and 472 s (docs/08 section 4c). `run-experiment` predicts once per experiment.
     pub library_irt: LibraryIrt,
+    /// Ion-mobility calibration (docs/08_rt_im_train.md, "Ion-mobility calibration"): a
+    /// charge with fewer anchors than this uses the global CCS fit rather than its own.
+    /// The calibration runs only when the seed carries `observed_im` (spectra with 1/K0)
+    /// and the library `predicted_im`. Default 50. Omitted from the canonical configuration
+    /// at its default.
+    #[serde(skip_serializing_if = "is_default_im_min_anchors_per_charge")]
+    pub im_min_anchors_per_charge: usize,
+    /// Percentile of the held-out |observed - calibrated| 1/K0 residuals that sizes the IM
+    /// half-window `w_im`, as `p_rt` sizes `w_rt`. Default 0.95. Omitted from the canonical
+    /// configuration at its default.
+    #[serde(skip_serializing_if = "is_default_p_im")]
+    pub p_im: f64,
+    /// Multiplier on that percentile. Default 1.0. Omitted from the canonical configuration
+    /// at its default.
+    #[serde(skip_serializing_if = "is_default_im_window_multiplier")]
+    pub im_window_multiplier: f64,
+    /// Lower clamp of the IM half-window, in V s cm^-2. Default 0.005. Omitted from the
+    /// canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_default_im_window_min")]
+    pub im_window_min: f64,
     /// Worker processes for the whole-library DeepLC prediction: the multi-head
     /// calibration, the base-model re-prediction under `library_irt`, and the prediction
     /// after `finetune_deeplc` (`deeplc_finetune.py --shards`). The calibration or the
@@ -1438,6 +1655,7 @@ impl Default for RtImTrainConfig {
             anchor_q_ladder: vec![0.02, 0.05],
             loess_span: 0.3,
             loess_robust_iters: 0,
+            anchor_x_filter: false,
             composition_correction: true,
             fallback_rt_window_s: 120.0,
             finetune_deeplc: false,
@@ -1454,6 +1672,10 @@ impl Default for RtImTrainConfig {
             rt_window_min_s: 1.0,
             window_holdout_frac: 0.0,
             library_irt: LibraryIrt::Auto,
+            im_min_anchors_per_charge: 50,
+            p_im: 0.95,
+            im_window_multiplier: 1.0,
+            im_window_min: 0.005,
             deeplc_predict_shards: 0,
             deeplc_projection_cache: Some("auto".to_string()),
         }
@@ -1721,6 +1943,82 @@ pub struct ExtractConfig {
     /// summed-window entropy, coverage and cosine minus this times the apex RT error over
     /// the candidate's own window half-width on that side (clipped to 1).
     pub gate_rt_weight: f64,
+    /// The 1/K0 gate of a run whose spectra carry ion mobility (a diaPASEF `.d` read by the
+    /// native reader): a fragment peak whose 1/K0 lies outside the candidate's calibrated
+    /// 1/K0 window (`run_windows.im_lo`/`im_hi`, from `rt-im-train`) is not matched to that
+    /// candidate, as a peak outside its RT window is not. See [`ImGate`]. Default `off`.
+    /// Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its
+    /// default.
+    #[serde(skip_serializing_if = "ImGate::is_off")]
+    pub im_gate: ImGate,
+}
+
+/// `extract.im_gate`: whether fragment peaks are matched only inside a candidate's 1/K0
+/// window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImGate {
+    /// No 1/K0 gate: every fragment peak inside the RT window is matched, as on 3D data.
+    #[default]
+    Off,
+    /// A fragment peak outside the candidate's 1/K0 window is not matched. The MS1 lookups
+    /// are not gated. A run without per-peak 1/K0, or whose `run_windows` has no 1/K0
+    /// window, is extracted without the gate and says so in the log.
+    Fragments,
+    /// `fragments` when the run's spectra carry 1/K0 (`mumdia::instrument`) and its
+    /// `run_windows` carries 1/K0 windows, `off` otherwise.
+    Auto,
+}
+
+impl ImGate {
+    /// Whether this is the default, which the canonical configuration omits.
+    pub fn is_off(&self) -> bool {
+        matches!(self, ImGate::Off)
+    }
+
+    /// The gate a run applies: `auto` becomes `fragments` when the spectra carry 1/K0
+    /// (`has_im`) and the windows do (`windows_have_im`); an explicit `fragments` stays
+    /// on, and extract then warns when either is missing.
+    pub fn resolve(self, has_im: bool, windows_have_im: bool) -> bool {
+        match self {
+            ImGate::Off => false,
+            ImGate::Fragments => true,
+            ImGate::Auto => has_im && windows_have_im,
+        }
+    }
+}
+
+/// `features.im_features`: the ion-mobility feature family.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImFeatures {
+    /// No ion-mobility features. The feature schema is the 3D one.
+    #[default]
+    Off,
+    /// The ion-mobility family is part of the `extended` set. On a run without 1/K0 its
+    /// columns are 0.
+    On,
+    /// `on` when the spectra carry 1/K0 (`mumdia::instrument`), `off` otherwise.
+    Auto,
+}
+
+impl ImFeatures {
+    /// Whether this is the default, which the canonical configuration omits.
+    pub fn is_off(&self) -> bool {
+        matches!(self, ImFeatures::Off)
+    }
+
+    /// Whether the family is on for a run or experiment whose spectra do (`has_im`) or do
+    /// not carry 1/K0. The orchestrators resolve it once and hand the stages `on` or `off`
+    /// ([`Config::resolve_im_features`]), so the schema id they record and the features
+    /// stage agree.
+    pub fn on(self, has_im: bool) -> bool {
+        match self {
+            ImFeatures::Off => false,
+            ImFeatures::On => true,
+            ImFeatures::Auto => has_im,
+        }
+    }
 }
 impl Default for ExtractConfig {
     fn default() -> Self {
@@ -1805,6 +2103,7 @@ impl Default for ExtractConfig {
             gate_mode: GateMode::WindowMean, // window-summed agreement minus RT term (since 2026-10-08)
             gate_coelution_min: 0.5,         // used only by GateMode::Combined
             gate_rt_weight: 0.2,             // used only by GateMode::WindowMean
+            im_gate: ImGate::Off,
         }
     }
 }
@@ -1919,6 +2218,15 @@ pub struct FeaturesConfig {
     /// restores the single loader and `0` is read as `1`. A memory knob and a speed knob,
     /// not a sensitivity knob.
     pub chrom_loaders: usize,
+    /// The ion-mobility family (`im.rs`, docs/10_features.md): the apex 1/K0 against the
+    /// calibrated prediction, the fragment 1/K0 dispersion at the apex, the MS1 precursor
+    /// 1/K0, and the 1/K0 of the fragment traces over the elution peak. Part of the
+    /// `extended` set only, appended after the other families. See [`ImFeatures`]. On a run
+    /// whose spectra carry 1/K0 it also makes extract write the per-point 1/K0 list of
+    /// each chromatogram row (chromatograms v3/v4). Default `off`. Benchmark-gated
+    /// (docs/35_diapasef.md). Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "ImFeatures::is_off")]
+    pub im_features: ImFeatures,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -1939,6 +2247,7 @@ impl Default for FeaturesConfig {
             bound_confident_pct: 50.0, // median confident half-width
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
             chrom_loaders: 3,
+            im_features: ImFeatures::Off,
         }
     }
 }
@@ -2162,6 +2471,8 @@ pub struct QuantConfig {
     /// `predicted` ranks by the library (predicted or empirical) fragment intensity,
     /// a per-precursor constant, so every run sums the same fragments. Astral HYE
     /// 2026-08-26: CV 0.163 -> 0.112 on 6/6 ions at top-3. Benchmark-gated.
+    /// `cross_run` weights each fragment by its consistency across the runs of an
+    /// experiment ([`FragmentSelection::CrossRun`]); benchmark-gated as well.
     pub fragment_selection: FragmentSelection,
     /// When > 0, integrate each fragment over the `2k+1` scans centred on the
     /// identification apex instead of the descent-walk window (`bound_peak`
@@ -2190,6 +2501,37 @@ pub struct QuantConfig {
     /// seconds of the identification apex (instrument-independent alternative to
     /// `fixed_scan_halfwidth`, which it overrides). 0 (default) = off.
     pub fixed_window_s: f64,
+    /// Where the flank background of `baseline_subtract` comes from. `run` (default): the
+    /// `baseline_quantile` quantile of this run's flanks. `experiment`: one level per
+    /// (candidate, fragment), the mean over every run of the raw flank mean, which the
+    /// cross-run step of `run-experiment` fits and subtracts in place of the per-run
+    /// quantile (docs/12, "Cross-run fragment selection and background"). Needs
+    /// `baseline_subtract = true`. Without the cross-run step (`run`, or `quant` without
+    /// `--cross-run-from`) the per-run quantile applies. Benchmark-gated. Omitted from the
+    /// canonical configuration at its default.
+    #[serde(skip_serializing_if = "BaselineSource::is_run")]
+    pub baseline_source: BaselineSource,
+    /// When > 0, the cross-run step integrates each candidate over its own scan halfwidth
+    /// `h = clamp(round(fixed_scan_halfwidth_scale x HWHM), 3, 7)` in every run, in place
+    /// of `fixed_scan_halfwidth`. HWHM is the half width at half maximum, in scans, of the
+    /// candidate's summed fragment trace in its brightest run, measured in the first pass;
+    /// the experiment background is then taken beyond that window. Needs the scan form of
+    /// the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`) and
+    /// `baseline_source = experiment`. 0 (default) = off. Benchmark-gated. Omitted from the
+    /// canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub fixed_scan_halfwidth_scale: f64,
+}
+
+impl QuantConfig {
+    /// Whether quantification needs the cross-run step of `run-experiment`: a first quant
+    /// pass over every run, a fit over their fragment tables, and a second pass with it.
+    /// The one trigger of that step.
+    pub fn needs_cross_run_fit(&self) -> bool {
+        self.fragment_selection == FragmentSelection::CrossRun
+            || self.baseline_source == BaselineSource::Experiment
+            || self.fixed_scan_halfwidth_scale > 0.0
+    }
 }
 
 /// Fragment ranking for the quant top-N sum. See [`QuantConfig::fragment_selection`].
@@ -2201,6 +2543,31 @@ pub enum FragmentSelection {
     ObservedArea,
     /// Rank fragments by library intensity (`predicted_intensity` in the chromatogram table).
     Predicted,
+    /// Weight every fragment by its consistency across the runs of an experiment, fitted
+    /// by the cross-run step of `run-experiment`: the quantity is `sum(weight x area)` with
+    /// the same weights in every run (docs/12, "Cross-run fragment selection and
+    /// background"). Where no weight was fitted (single run, `quant` without
+    /// `--cross-run-from`, a candidate with no positive weighted area), `predicted`
+    /// applies, with `top_n_fragments`.
+    CrossRun,
+}
+
+/// Source of the flank background level. See [`QuantConfig::baseline_source`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineSource {
+    /// The `baseline_quantile` quantile of this run's flanks.
+    #[default]
+    Run,
+    /// The mean flank level over every run of the experiment (cross-run step).
+    Experiment,
+}
+
+impl BaselineSource {
+    /// The default, which the canonical configuration omits.
+    pub fn is_run(&self) -> bool {
+        *self == BaselineSource::Run
+    }
 }
 impl Default for QuantConfig {
     fn default() -> Self {
@@ -2222,6 +2589,8 @@ impl Default for QuantConfig {
             baseline_flank_scans: 12,
             baseline_quantile: 0.25,
             fixed_window_s: 0.0,
+            baseline_source: BaselineSource::Run,
+            fixed_scan_halfwidth_scale: 0.0,
         }
     }
 }
@@ -2486,6 +2855,17 @@ pub struct RescoreConfig {
     /// Candidates examined per run: the top `shadow_region x accepted` rows by first-pass
     /// score.
     pub shadow_region: usize,
+    /// The 1/K0 term of the shadow test on a run whose spectra carry ion mobility: a lender
+    /// counts only when its apex 1/K0 is within this distance (V s cm^-2) of the
+    /// candidate's own. Two precursors co-isolated in one diaPASEF slot but separated in
+    /// mobility do not share fragment peaks, so a shared fragment m/z is not borrowed
+    /// evidence there. The apex 1/K0 is joined from each run's `psms_extracted` on
+    /// `(candidate_id, selected_peak_rank)`; a row without one (3D data, or a lender or
+    /// candidate whose apex 1/K0 is null) keeps the m/z-and-RT test alone. Default 0: off,
+    /// bit-identical to before the key existed. Benchmark-gated (docs/35_diapasef.md).
+    /// Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub shadow_im_tolerance: f64,
     /// Fewest decoys the classifier is trained with. Below this the learned classifier
     /// is not trained (a handful of decoys lets it overfit, one decoy then outranks every
     /// target and nothing passes 1%): the candidates are ranked by their untrained
@@ -2539,6 +2919,7 @@ impl Default for RescoreConfig {
             shadow_ppm: 10.0,
             shadow_rt_s: 3.0,
             shadow_region: 8,
+            shadow_im_tolerance: 0.0,
             classifier: t(),
             folds: 3,
             train_fdr: 0.01,
@@ -3075,6 +3456,81 @@ impl Default for GroupsConfig {
     }
 }
 
+/// Chromatogram traces rebuilt from the raw timsTOF events (the `retrace` stage, between
+/// extract and features; docs/35_diapasef.md section 6, docs/09 section 9). Each fragment
+/// trace point becomes the sum of every raw event in the grid point's frame and in the quad
+/// slots whose isolation window holds the precursor, within the learned fragment tolerance
+/// and inside `apex_im +/- im_half_width`, instead of the intensity of one centroid. The MS1
+/// isotope traces are rebuilt the same way from the MS1 frames extract samples. diaPASEF
+/// only: a run whose spectra were not read natively from a `.d` is refused. Every key is
+/// omitted from the canonical configuration at its default, and the whole section with
+/// them, so a configuration that does not set it keeps its config hash.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetraceConfig {
+    /// Run the stage inside `run` and `run-experiment` (and the second pass), after extract.
+    /// Extract then writes its centroid traces to `chromatograms.centroid.parquet`, which is
+    /// deleted once retrace has written `chromatograms.parquet`. Not in the RT bootstrap
+    /// pass, which only collects anchors. Default false. Benchmark-gated
+    /// (docs/35_diapasef.md).
+    #[serde(skip_serializing_if = "is_false")]
+    pub enabled: bool,
+    /// Re-choose each candidate's apex retention time and 1/K0 centre on the raw events
+    /// before the traces are rebuilt, among extract's apex and the peaks of the
+    /// `extract.retain_top_peaks` sidecar. Needs `retain_top_peaks >= 2` and
+    /// `promote_top_peaks = 1`, and is refused with `extract.apex_refine_intensity`. It
+    /// overrides the apex that `apex_evidence_rank` chose, by design. Default false.
+    /// Benchmark-gated.
+    #[serde(skip_serializing_if = "is_false")]
+    pub repick: bool,
+    /// Half-width in 1/K0 of the band around the candidate's `apex_im` (`im_pred_cal` when
+    /// that is null) inside which raw events are summed, for the fragment and the MS1
+    /// traces alike. Measured flat from 0.012 to 0.020 on one diaPASEF run. Default 0.015.
+    #[serde(skip_serializing_if = "is_default_retrace_im_half_width")]
+    pub im_half_width: f64,
+    /// Also rebuild the MS1 isotope traces (`ms1_mono`, `ms1_iso1`, `ms1_iso2`) and their
+    /// apex scalars. False copies the centroid MS1 rows and keeps extract's MS1 scalars.
+    /// Default true; kept as a switch until an engine ablation of the raw MS1 band confirms
+    /// the prototype's +1.6%.
+    #[serde(skip_serializing_if = "is_true")]
+    pub ms1: bool,
+    /// Write `imc_ref_w` into `psms_extracted`, the agreement of the fragments' raw 1/K0
+    /// profiles at the apex, which the ion-mobility feature family then carries as its
+    /// tenth feature. Needs `enabled` and a `features.im_features` other than `off`.
+    /// Default false. Benchmark-gated: alone it measured +1.3% peptides, and the added
+    /// peptides carried about 2.7% FDP.
+    #[serde(skip_serializing_if = "is_false")]
+    pub apex_features: bool,
+}
+impl Default for RetraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repick: false,
+            im_half_width: 0.015,
+            ms1: true,
+            apex_features: false,
+        }
+    }
+}
+
+fn is_default_retrace_im_half_width(v: &f64) -> bool {
+    *v == RetraceConfig::default().im_half_width
+}
+
+/// A `true` flag, which the canonical configuration omits for a key whose default is on.
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+impl RetraceConfig {
+    /// Whether every key is at its default, so the canonical configuration omits the
+    /// section.
+    pub fn is_default(&self) -> bool {
+        *self == RetraceConfig::default()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -3098,6 +3554,10 @@ pub struct Config {
     pub experiment: ExperimentConfig,
     #[serde(default)]
     pub groups: GroupsConfig,
+    /// Raw-event trace rebuild for diaPASEF runs ([`RetraceConfig`]). Omitted from the
+    /// canonical configuration while every key is at its default.
+    #[serde(default, skip_serializing_if = "RetraceConfig::is_default")]
+    pub retrace: RetraceConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -3119,11 +3579,30 @@ impl Default for Config {
             mbr: t(),
             experiment: t(),
             groups: t(),
+            retrace: t(),
         }
     }
 }
 
 impl Config {
+    /// Resolve `features.im_features = auto` for a run or an experiment whose spectra do
+    /// (`has_im`) or do not carry 1/K0, to `on` or `off`. The orchestrators call it once,
+    /// before any stage runs, and hand every stage the resolved configuration, so the
+    /// feature schema id the manifest records, the chromatograms extract writes and the
+    /// features stage all see one answer. An explicit `on` or `off` is kept. Like the
+    /// sidecar interpreters, it is resolved before the configuration is hashed, so the
+    /// manifest records what ran; a configuration that leaves the key at its default
+    /// hashes as it always did.
+    pub fn resolve_im_features(&mut self, has_im: bool) {
+        if self.features.im_features == ImFeatures::Auto {
+            self.features.im_features = if has_im {
+                ImFeatures::On
+            } else {
+                ImFeatures::Off
+            };
+        }
+    }
+
     /// Whether this run's library retention times come from DeepLC.
     ///
     /// Imported library: whatever `library_irt` resolves to. FASTA: whether the library
@@ -3219,6 +3698,37 @@ impl Config {
         {
             return Err(Invalid(
                 "quant.baseline_quantile must be finite and in [0, 1].".into(),
+            ));
+        }
+        if self.quant.baseline_source == BaselineSource::Experiment && !self.quant.baseline_subtract
+        {
+            return Err(Invalid(
+                "quant.baseline_source = experiment replaces the level baseline_subtract \
+                 subtracts, so it needs quant.baseline_subtract = true."
+                    .into(),
+            ));
+        }
+        let scale = self.quant.fixed_scan_halfwidth_scale;
+        if !scale.is_finite() || scale < 0.0 {
+            return Err(Invalid(format!(
+                "quant.fixed_scan_halfwidth_scale must be finite and >= 0 (got {scale}); 0 is off."
+            )));
+        }
+        if scale > 0.0 && (self.quant.fixed_scan_halfwidth == 0 || self.quant.fixed_window_s > 0.0)
+        {
+            return Err(Invalid(
+                "quant.fixed_scan_halfwidth_scale needs the scan form of the fixed window \
+                 (quant.fixed_scan_halfwidth > 0 and quant.fixed_window_s = 0): the halfwidth \
+                 it chooses is a number of scans."
+                    .into(),
+            ));
+        }
+        if scale > 0.0 && self.quant.baseline_source != BaselineSource::Experiment {
+            return Err(Invalid(
+                "quant.fixed_scan_halfwidth_scale needs quant.baseline_source = experiment: \
+                 the width was measured only with the experiment background taken beyond the \
+                 chosen window."
+                    .into(),
             ));
         }
         // The entrapment estimate is
@@ -3371,6 +3881,18 @@ impl Config {
                  The default second_pass searches every run again instead (docs/12)."
             );
         }
+        // The second pass's library is cut at `q_anchor`, and that cut is also the report's:
+        // with entrapment, 113-114 of 125 reportable false library entries came back in the
+        // second pass (docs/12, "Second pass").
+        if self.mbr.strategy == MbrStrategy::SecondPass && self.mbr.q_anchor > 0.01 {
+            tracing::warn!(
+                q_anchor = self.mbr.q_anchor,
+                "mbr.q_anchor above 0.01 under mbr.strategy = second_pass: the empirical library \
+                 is cut at q_anchor, and nearly every false entry it admits is reported again by \
+                 the second pass, so this cut sets the reported FDR rather than the 1% cut of \
+                 the final rescore (docs/12, \"Second pass\")"
+            );
+        }
         if self.quant.fixed_window_s > 0.0 && self.quant.fixed_scan_halfwidth > 0 {
             tracing::warn!(
                 fixed_window_s = self.quant.fixed_window_s,
@@ -3387,6 +3909,16 @@ impl Config {
                 "quant.baseline_subtract applies only to the fixed-window integration, \
                  which is off (fixed_scan_halfwidth = 0 and fixed_window_s = 0), so no \
                  baseline is subtracted"
+            );
+        }
+        if self.quant.fragment_selection == FragmentSelection::CrossRun
+            && self.quant.fixed_scan_halfwidth == 0
+            && self.quant.fixed_window_s == 0.0
+        {
+            tracing::warn!(
+                "quant.fragment_selection = cross_run correlates each fragment over the fixed \
+                 window, which is off (fixed_scan_halfwidth = 0 and fixed_window_s = 0), so \
+                 every candidate takes equal weights"
             );
         }
         // ── numeric domains (docs/29 #18) ───────────────────────────────────────
@@ -3411,6 +3943,7 @@ impl Config {
             ("search_seed.fdr_seed", self.search_seed.fdr_seed),
             ("rt_im_train.q_train", self.rt_im_train.q_train),
             ("rt_im_train.p_rt", self.rt_im_train.p_rt),
+            ("rt_im_train.p_im", self.rt_im_train.p_im),
             ("rt_im_train.loess_span", self.rt_im_train.loess_span),
         ] {
             if !value.is_finite() || value <= 0.0 || value > 1.0 {
@@ -3418,6 +3951,46 @@ impl Config {
                     "{name} must be finite and in (0, 1] (got {value})"
                 )));
             }
+        }
+        if !self.rt_im_train.im_window_multiplier.is_finite()
+            || self.rt_im_train.im_window_multiplier <= 0.0
+        {
+            return Err(Invalid(format!(
+                "rt_im_train.im_window_multiplier must be finite and > 0 (got {})",
+                self.rt_im_train.im_window_multiplier
+            )));
+        }
+        if !self.rt_im_train.im_window_min.is_finite() || self.rt_im_train.im_window_min < 0.0 {
+            return Err(Invalid(format!(
+                "rt_im_train.im_window_min must be finite and >= 0 (got {})",
+                self.rt_im_train.im_window_min
+            )));
+        }
+        if self.search_seed.count_fragments_once
+            && !matches!(self.search_seed.matcher, MatcherKind::Fragindex)
+        {
+            return Err(Invalid(
+                "search_seed.count_fragments_once needs search_seed.matcher = fragindex: the \
+                 bucketed matcher has no fragment ordinals to count a fragment once by"
+                    .into(),
+            ));
+        }
+        if !(self.search_seed.frag_tol_mad_k.is_finite() && self.search_seed.frag_tol_mad_k >= 0.0)
+        {
+            return Err(Invalid(format!(
+                "search_seed.frag_tol_mad_k must be finite and >= 0 (got {}); 0 keeps the \
+                 1.5 x p95 tolerance",
+                self.search_seed.frag_tol_mad_k
+            )));
+        }
+        if !(self.rescore.shadow_im_tolerance.is_finite()
+            && self.rescore.shadow_im_tolerance >= 0.0)
+        {
+            return Err(Invalid(format!(
+                "rescore.shadow_im_tolerance must be finite and >= 0 (got {}); 0 leaves the \
+                 shadow test without a 1/K0 term",
+                self.rescore.shadow_im_tolerance
+            )));
         }
         if !self.rt_im_train.window_holdout_frac.is_finite()
             || !(0.0..1.0).contains(&self.rt_im_train.window_holdout_frac)
@@ -3537,6 +4110,26 @@ impl Config {
         if self.predict_frag.charge2_from_precursor_charge < 1 {
             return Err(Invalid(
                 "predict_frag.charge2_from_precursor_charge must be >= 1".into(),
+            ));
+        }
+        let cv = &self.convert;
+        let frac = |v: f64| (0.0..1.0).contains(&v);
+        let width = |v: f64| v.is_finite() && v >= 0.0;
+        if !(cv.tdf_mz_ppm.is_finite() && cv.tdf_mz_ppm > 0.0) || cv.tdf_min_points == 0 {
+            return Err(Invalid(
+                "convert.tdf_mz_ppm must be finite and > 0, and convert.tdf_min_points >= 1".into(),
+            ));
+        }
+        if !(frac(cv.tdf_mz_valley)
+            && frac(cv.tdf_im_valley)
+            && width(cv.tdf_mz_smooth_ppm)
+            && width(cv.tdf_im_smooth_scans))
+        {
+            return Err(Invalid(
+                "convert.tdf_mz_valley and convert.tdf_im_valley must be in [0, 1) (0 disables \
+                 the valley split), and convert.tdf_mz_smooth_ppm and \
+                 convert.tdf_im_smooth_scans finite and >= 0."
+                    .into(),
             ));
         }
         if self
@@ -3889,6 +4482,75 @@ impl Config {
                 "rt_im_train.adaptive_rt_bins must be >= 1 when adaptive_rt_window is on".into(),
             ));
         }
+        self.validate_retrace()?;
+        Ok(())
+    }
+
+    /// The refusals of the `retrace` section (docs/35_diapasef.md section 6). Whether the
+    /// input is a diaPASEF `.d` is a property of the run, not of the configuration, so that
+    /// one is checked where the run's spectra are known (`retrace::raw_input`).
+    fn validate_retrace(&self) -> Result<(), crate::error::ConfigError> {
+        use crate::error::ConfigError::Invalid;
+        let r = &self.retrace;
+        if !(r.im_half_width.is_finite() && r.im_half_width > 0.0) {
+            return Err(Invalid(format!(
+                "retrace.im_half_width must be finite and > 0 (got {})",
+                r.im_half_width
+            )));
+        }
+        if !r.enabled {
+            for (on, key) in [
+                (r.repick, "retrace.repick"),
+                (r.apex_features, "retrace.apex_features"),
+            ] {
+                if on {
+                    return Err(Invalid(format!(
+                        "{key} needs retrace.enabled: it works on the raw events the retrace \
+                         stage reads"
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        if self.groups.window_groups > 1 {
+            return Err(Invalid(
+                "retrace.enabled is not supported with groups.window_groups > 1: the bands' \
+                 chromatograms are not retraced"
+                    .into(),
+            ));
+        }
+        if self.extract.promote_top_peaks > 1 {
+            return Err(Invalid(format!(
+                "retrace.enabled refreshes the apex scalars of each candidate's selected apex \
+                 (peak_rank 0), so it cannot be combined with extract.promote_top_peaks = {} \
+                 (scored alternative peaks); set promote_top_peaks = 1",
+                self.extract.promote_top_peaks
+            )));
+        }
+        if r.repick {
+            if self.extract.retain_top_peaks < 2 {
+                return Err(Invalid(format!(
+                    "retrace.repick chooses among extract's apex and the peaks of the \
+                     extract.retain_top_peaks sidecar, so it needs retain_top_peaks >= 2 (got \
+                     {}); 5 is the measured setting",
+                    self.extract.retain_top_peaks
+                )));
+            }
+            if self.extract.apex_refine_intensity {
+                return Err(Invalid(
+                    "retrace.repick and extract.apex_refine_intensity both re-choose the apex; \
+                     enable one of them"
+                        .into(),
+                ));
+            }
+        }
+        if r.apex_features && self.features.im_features.is_off() {
+            return Err(Invalid(
+                "retrace.apex_features writes imc_ref_w, a feature of the ion-mobility family, \
+                 so it needs features.im_features = on or auto"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -4028,11 +4690,18 @@ mod tests {
         //
         // Only TRACKED configs are listed. Machine- or collaborator-specific configs stay
         // untracked (see .gitignore), so they are checked by `mumdia doctor`, not here.
-        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+        // CARGO_MANIFEST_DIR is rust/mumdia/crates/mumdia-core, four levels below the
+        // repository root. The root was once three levels up, which resolved to `rust/`,
+        // found no config at all and passed vacuously through the `continue` below.
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../..");
+        let examples_present = std::path::Path::new(&format!("{root}/configs/examples")).is_dir();
+        let mut checked = 0usize;
         for name in [
             "configs/examples/native.json",
             "configs/examples/fasta-sidecars.json",
             "configs/examples/diann-library.json",
+            "configs/examples/fasta-peptdeep.json",
+            "configs/examples/diapasef.json",
             "configs/examples/prescreen-balanced.json",
             "configs/examples/prescreen-oxidation.json",
             "configs/examples/prescreen-components.json",
@@ -4047,6 +4716,11 @@ mod tests {
                 .unwrap_or_else(|e| panic!("shipped config {name} does not parse: {e}"));
             c.validate()
                 .unwrap_or_else(|e| panic!("shipped config {name} does not validate: {e}"));
+            checked += 1;
+        }
+        // In a full checkout every listed config must have been read.
+        if examples_present {
+            assert_eq!(checked, 10, "a listed shipped config was not found");
         }
     }
 
@@ -4386,6 +5060,456 @@ mod tests {
         let sp: Config = serde_json::from_str(r#"{"mbr":{"strategy":"second_pass"}}"#).unwrap();
         assert_eq!(sp.mbr.strategy, MbrStrategy::SecondPass);
         assert!(d.validate().is_ok());
+    }
+
+    /// The native diaPASEF reader keys are omitted from the canonical configuration at their
+    /// defaults, so every configuration that does not set them keeps the config hash it had
+    /// before they existed. A non-default value is part of the configuration's identity.
+    #[test]
+    fn tdf_reader_keys_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        let canon = d.canonical_json();
+        assert!(!canon.contains("tdf_"), "{canon}");
+        let explicit = Config::from_json(
+            r#"{"convert":{"tdf_mz_ppm":10.0,"tdf_im_gap_scans":30,"tdf_min_points":2,
+                "tdf_mz_valley":0.0,"tdf_mz_smooth_ppm":8.0,"tdf_im_valley":0.0,
+                "tdf_im_smooth_scans":8.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.canonical_json(), canon);
+        for (json, key) in [
+            (r#"{"convert":{"tdf_mz_ppm":12.0}}"#, r#""tdf_mz_ppm":12.0"#),
+            (
+                r#"{"convert":{"tdf_im_gap_scans":20}}"#,
+                r#""tdf_im_gap_scans":20"#,
+            ),
+            (
+                r#"{"convert":{"tdf_min_points":3}}"#,
+                r#""tdf_min_points":3"#,
+            ),
+            (
+                r#"{"convert":{"tdf_mz_valley":0.7}}"#,
+                r#""tdf_mz_valley":0.7"#,
+            ),
+            (
+                r#"{"convert":{"tdf_mz_smooth_ppm":4.0}}"#,
+                r#""tdf_mz_smooth_ppm":4.0"#,
+            ),
+            (
+                r#"{"convert":{"tdf_im_valley":0.5}}"#,
+                r#""tdf_im_valley":0.5"#,
+            ),
+            (
+                r#"{"convert":{"tdf_im_smooth_scans":4.0}}"#,
+                r#""tdf_im_smooth_scans":4.0"#,
+            ),
+        ] {
+            let c = Config::from_json(json).unwrap();
+            assert!(c.canonical_json().contains(key), "{json}");
+        }
+        for bad in [
+            r#"{"convert":{"tdf_mz_valley":1.0}}"#,
+            r#"{"convert":{"tdf_im_valley":-0.1}}"#,
+            r#"{"convert":{"tdf_mz_smooth_ppm":-1.0}}"#,
+            r#"{"convert":{"tdf_mz_ppm":0.0}}"#,
+            r#"{"convert":{"tdf_min_points":0}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+        }
+        assert!(Config::from_json(r#"{"convert":{"bruker_reader":"native"}}"#).is_err());
+    }
+
+    /// The cross-run quant keys are omitted from the canonical configuration at their
+    /// defaults, so the default config hash is the one it was before they existed; a
+    /// non-default value is part of the configuration's identity.
+    #[test]
+    fn cross_run_quant_keys_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        let canon = d.canonical_json();
+        for key in ["baseline_source", "fixed_scan_halfwidth_scale"] {
+            assert!(!canon.contains(key), "{key} in {canon}");
+        }
+        assert!(!d.quant.needs_cross_run_fit());
+        let explicit = Config::from_json(
+            r#"{"quant":{"baseline_source":"run","fixed_scan_halfwidth_scale":0.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.canonical_json(), canon);
+        let set = Config::from_json(
+            r#"{"quant":{"fragment_selection":"cross_run","baseline_subtract":true,
+                "baseline_source":"experiment","fixed_scan_halfwidth_scale":2.5}}"#,
+        )
+        .unwrap();
+        let c = set.canonical_json();
+        assert!(c.contains(r#""fragment_selection":"cross_run""#), "{c}");
+        assert!(c.contains(r#""baseline_source":"experiment""#), "{c}");
+        assert!(c.contains(r#""fixed_scan_halfwidth_scale":2.5"#), "{c}");
+    }
+
+    /// Each of the three keys alone is the trigger of the cross-run step, and nothing else is.
+    #[test]
+    fn needs_cross_run_fit_is_any_of_the_three_keys() {
+        let mut q = QuantConfig::default();
+        assert!(!q.needs_cross_run_fit());
+        q.fragment_selection = FragmentSelection::Predicted;
+        q.baseline_subtract = true;
+        q.baseline_quantile = 0.6;
+        assert!(!q.needs_cross_run_fit());
+        q.fragment_selection = FragmentSelection::CrossRun;
+        assert!(q.needs_cross_run_fit());
+        let mut q = QuantConfig {
+            baseline_source: BaselineSource::Experiment,
+            ..QuantConfig::default()
+        };
+        assert!(q.needs_cross_run_fit());
+        q.baseline_source = BaselineSource::Run;
+        q.fixed_scan_halfwidth_scale = 2.5;
+        assert!(q.needs_cross_run_fit());
+    }
+
+    /// The dependencies between the cross-run keys are refused at load, each naming the key
+    /// it needs.
+    #[test]
+    fn cross_run_quant_key_dependencies_are_validated() {
+        for (bad, needle) in [
+            (
+                r#"{"quant":{"baseline_source":"experiment"}}"#,
+                "baseline_subtract",
+            ),
+            (
+                r#"{"quant":{"baseline_subtract":true,"fixed_scan_halfwidth_scale":2.5}}"#,
+                "baseline_source = experiment",
+            ),
+            (
+                r#"{"quant":{"baseline_subtract":true,"baseline_source":"experiment",
+                    "fixed_scan_halfwidth_scale":2.5,"fixed_scan_halfwidth":0}}"#,
+                "scan form",
+            ),
+            (
+                r#"{"quant":{"baseline_subtract":true,"baseline_source":"experiment",
+                    "fixed_scan_halfwidth_scale":2.5,"fixed_window_s":4.0}}"#,
+                "scan form",
+            ),
+            (
+                r#"{"quant":{"fixed_scan_halfwidth_scale":-1.0}}"#,
+                "finite and >= 0",
+            ),
+        ] {
+            let err = Config::from_json(bad).unwrap_err().to_string();
+            assert!(err.contains(needle), "{bad}: {err}");
+        }
+        for good in [
+            r#"{"quant":{"fragment_selection":"cross_run"}}"#,
+            r#"{"quant":{"baseline_subtract":true,"baseline_source":"experiment"}}"#,
+            r#"{"quant":{"baseline_subtract":true,"baseline_source":"experiment",
+                "fixed_scan_halfwidth":4,"fixed_scan_halfwidth_scale":2.5}}"#,
+        ] {
+            assert!(Config::from_json(good).is_ok(), "{good}");
+        }
+    }
+
+    /// The seed and calibration keys of the diaPASEF work are omitted from the canonical
+    /// configuration at their defaults, so a configuration that does not set them keeps the
+    /// config hash it had before they existed, and an explicit default changes nothing.
+    #[test]
+    fn seed_and_im_calibration_keys_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        let canon = d.canonical_json();
+        for key in [
+            "count_fragments_once",
+            "im_min_anchors_per_charge",
+            "p_im",
+            "im_window_multiplier",
+            "im_window_min",
+        ] {
+            assert!(!canon.contains(key), "{key} in {canon}");
+        }
+        let explicit = Config::from_json(
+            r#"{"search_seed":{"count_fragments_once":false},
+                "rt_im_train":{"im_min_anchors_per_charge":50,"p_im":0.95,
+                "im_window_multiplier":1.0,"im_window_min":0.005}}"#,
+        )
+        .unwrap();
+        // The config hash is the hash of exactly this string.
+        assert_eq!(explicit.canonical_json(), canon);
+        for (json, key) in [
+            (
+                r#"{"search_seed":{"count_fragments_once":true}}"#,
+                r#""count_fragments_once":true"#,
+            ),
+            (
+                r#"{"rt_im_train":{"im_min_anchors_per_charge":20}}"#,
+                r#""im_min_anchors_per_charge":20"#,
+            ),
+            (r#"{"rt_im_train":{"p_im":0.9}}"#, r#""p_im":0.9"#),
+            (
+                r#"{"rt_im_train":{"im_window_multiplier":1.5}}"#,
+                r#""im_window_multiplier":1.5"#,
+            ),
+            (
+                r#"{"rt_im_train":{"im_window_min":0.01}}"#,
+                r#""im_window_min":0.01"#,
+            ),
+        ] {
+            let c = Config::from_json(json).unwrap();
+            assert!(c.canonical_json().contains(key), "{json}");
+        }
+        for bad in [
+            r#"{"search_seed":{"count_fragments_once":true,"matcher":"bucketed"}}"#,
+            r#"{"rt_im_train":{"p_im":0.0}}"#,
+            r#"{"rt_im_train":{"p_im":1.5}}"#,
+            r#"{"rt_im_train":{"im_window_multiplier":0.0}}"#,
+            r#"{"rt_im_train":{"im_window_min":-0.1}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// `rt_im_train.anchor_x_filter` is omitted from the canonical configuration at its
+    /// default, so the config hash of every configuration that does not set it is unchanged.
+    #[test]
+    fn the_anchor_x_filter_leaves_the_default_config_hash_alone() {
+        let d = Config::default();
+        assert!(!d.rt_im_train.anchor_x_filter);
+        let canon = d.canonical_json();
+        assert!(!canon.contains("anchor_x_filter"), "{canon}");
+        let explicit = Config::from_json(r#"{"rt_im_train":{"anchor_x_filter":false}}"#).unwrap();
+        assert_eq!(explicit.canonical_json(), canon);
+        let on = Config::from_json(r#"{"rt_im_train":{"anchor_x_filter":true}}"#).unwrap();
+        assert!(on.canonical_json().contains(r#""anchor_x_filter":true"#));
+    }
+
+    /// The `retrace` section is omitted from the canonical configuration while every key is
+    /// at its default, so a configuration that does not set it keeps its config hash, and
+    /// an explicit default section changes nothing.
+    #[test]
+    fn retrace_keys_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        assert!(d.retrace.is_default());
+        assert!(!d.retrace.enabled && !d.retrace.repick && !d.retrace.apex_features);
+        assert!(d.retrace.ms1);
+        assert_eq!(d.retrace.im_half_width, 0.015);
+        let canon = d.canonical_json();
+        assert!(!canon.contains("retrace"), "{canon}");
+        for explicit in [
+            r#"{"retrace":{}}"#,
+            r#"{"retrace":{"enabled":false,"repick":false,"im_half_width":0.015,
+                "ms1":true,"apex_features":false}}"#,
+        ] {
+            assert_eq!(
+                Config::from_json(explicit).unwrap().canonical_json(),
+                canon,
+                "{explicit}"
+            );
+        }
+        // A set key is written, alone: the other keys stay at their defaults and omitted.
+        let on = Config::from_json(r#"{"retrace":{"enabled":true}}"#).unwrap();
+        assert!(on
+            .canonical_json()
+            .contains(r#""retrace":{"enabled":true}"#));
+        let narrow =
+            Config::from_json(r#"{"retrace":{"enabled":true,"im_half_width":0.012}}"#).unwrap();
+        assert!(narrow
+            .canonical_json()
+            .contains(r#""retrace":{"enabled":true,"im_half_width":0.012}"#));
+        let no_ms1 = Config::from_json(r#"{"retrace":{"enabled":true,"ms1":false}}"#).unwrap();
+        assert!(no_ms1.canonical_json().contains(r#""ms1":false"#));
+        // The keys the IM branch had and this section does not.
+        for gone in [
+            r#"{"retrace":{"min_events":1}}"#,
+            r#"{"retrace":{"ms1_im_half_width":0.015}}"#,
+            r#"{"features":{"retrace_apex":true}}"#,
+        ] {
+            assert!(Config::from_json(gone).is_err(), "{gone} must be refused");
+        }
+    }
+
+    /// The combinations `retrace` cannot run with are refused at load, with the key named.
+    #[test]
+    fn retrace_exclusions_are_refused_at_load() {
+        let err = |json: &str| -> String {
+            match Config::from_json(json) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{json} must be refused"),
+            }
+        };
+        // Keys that only act inside the stage need the stage.
+        assert!(err(r#"{"retrace":{"repick":true}}"#).contains("retrace.enabled"));
+        assert!(err(r#"{"retrace":{"apex_features":true}}"#).contains("retrace.enabled"));
+        assert!(err(r#"{"retrace":{"im_half_width":0.0}}"#).contains("im_half_width"));
+        assert!(err(r#"{"retrace":{"im_half_width":-0.01}}"#).contains("im_half_width"));
+        // Grouped runs and scored alternative peaks.
+        assert!(
+            err(r#"{"retrace":{"enabled":true},"groups":{"window_groups":2}}"#)
+                .contains("window_groups")
+        );
+        assert!(err(r#"{"retrace":{"enabled":true},
+                "extract":{"retain_top_peaks":3,"promote_top_peaks":2}}"#)
+        .contains("promote_top_peaks"));
+        // The re-pick needs the top-K sidecar and is exclusive with the intensity refine.
+        assert!(err(r#"{"retrace":{"enabled":true,"repick":true}}"#).contains("retain_top_peaks"));
+        assert!(err(r#"{"retrace":{"enabled":true,"repick":true},
+                "extract":{"retain_top_peaks":5,"apex_refine_intensity":true}}"#)
+        .contains("apex_refine_intensity"));
+        // `imc_ref_w` belongs to the ion-mobility family.
+        assert!(err(r#"{"retrace":{"enabled":true,"apex_features":true}}"#).contains("im_features"));
+        // The measured recipe passes.
+        let ok = Config::from_json(
+            r#"{"retrace":{"enabled":true,"repick":true,"apex_features":true},
+                "extract":{"retain_top_peaks":5},"features":{"im_features":"auto"}}"#,
+        )
+        .unwrap();
+        assert!(ok.retrace.enabled && ok.retrace.repick && ok.retrace.apex_features);
+    }
+
+    /// The extraction and feature keys of the diaPASEF work are omitted from the canonical
+    /// configuration at their defaults, so a configuration that does not set them keeps the
+    /// config hash it had before they existed, and an explicit default changes nothing.
+    #[test]
+    fn extraction_and_feature_im_keys_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        assert_eq!(d.extract.im_gate, ImGate::Off);
+        assert_eq!(d.features.im_features, ImFeatures::Off);
+        assert_eq!(d.search_seed.frag_tol_mad_k, 0.0);
+        assert_eq!(d.rescore.shadow_im_tolerance, 0.0);
+        let canon = d.canonical_json();
+        for key in [
+            "im_gate",
+            "im_features",
+            "frag_tol_mad_k",
+            "shadow_im_tolerance",
+        ] {
+            assert!(!canon.contains(key), "{key} in {canon}");
+        }
+        let explicit = Config::from_json(
+            r#"{"extract":{"im_gate":"off"},"features":{"im_features":"off"},
+                "search_seed":{"frag_tol_mad_k":0.0},"rescore":{"shadow_im_tolerance":0.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.canonical_json(), canon);
+        for (json, key) in [
+            (
+                r#"{"extract":{"im_gate":"fragments"}}"#,
+                r#""im_gate":"fragments""#,
+            ),
+            (r#"{"extract":{"im_gate":"auto"}}"#, r#""im_gate":"auto""#),
+            (
+                r#"{"features":{"im_features":"on"}}"#,
+                r#""im_features":"on""#,
+            ),
+            (
+                r#"{"features":{"im_features":"auto"}}"#,
+                r#""im_features":"auto""#,
+            ),
+            (
+                r#"{"search_seed":{"frag_tol_mad_k":4.0}}"#,
+                r#""frag_tol_mad_k":4.0"#,
+            ),
+            (
+                r#"{"rescore":{"shadow_im_tolerance":0.02}}"#,
+                r#""shadow_im_tolerance":0.02"#,
+            ),
+        ] {
+            let c = Config::from_json(json).unwrap();
+            assert!(c.canonical_json().contains(key), "{json}");
+        }
+        for bad in [
+            r#"{"extract":{"im_gate":"fragments_ms1"}}"#,
+            r#"{"features":{"im_features":true}}"#,
+            r#"{"search_seed":{"frag_tol_mad_k":-1.0}}"#,
+            r#"{"rescore":{"shadow_im_tolerance":-0.01}}"#,
+            r#"{"features":{"im_shape_features":true}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// `auto` resolves on the one TIMS predicate; explicit values are kept.
+    #[test]
+    fn the_im_gate_and_family_resolve_on_the_run() {
+        assert!(!ImGate::Off.resolve(true, true));
+        assert!(ImGate::Fragments.resolve(false, false));
+        assert!(ImGate::Auto.resolve(true, true));
+        assert!(!ImGate::Auto.resolve(true, false));
+        assert!(!ImGate::Auto.resolve(false, true));
+        for has_im in [false, true] {
+            assert!(!ImFeatures::Off.on(has_im));
+            assert!(ImFeatures::On.on(has_im));
+            assert_eq!(ImFeatures::Auto.on(has_im), has_im);
+            let mut c = Config::default();
+            c.features.im_features = ImFeatures::Auto;
+            c.resolve_im_features(has_im);
+            let want = if has_im {
+                ImFeatures::On
+            } else {
+                ImFeatures::Off
+            };
+            assert_eq!(c.features.im_features, want);
+            // A resolved value is not resolved again.
+            c.resolve_im_features(!has_im);
+            assert_eq!(c.features.im_features, want);
+        }
+        let mut c = Config::default();
+        c.resolve_im_features(true);
+        assert_eq!(c.features.im_features, ImFeatures::Off);
+    }
+
+    #[test]
+    fn the_im_predictor_defaults_to_none_and_leaves_the_config_hash_alone() {
+        let d = Config::default();
+        assert_eq!(d.predict_frag.im_predictor, ImPredictorKind::None);
+        assert_eq!(d.predict_frag.im2deep_python, None);
+        // Omitted at the default, so a configuration that sets neither field keeps the
+        // canonical form, and with it the config hash, it had before they existed.
+        let canon = d.canonical_json();
+        assert!(
+            !canon.contains("im_predictor") && !canon.contains("im2deep_python"),
+            "the defaults must not change the canonical configuration"
+        );
+        let explicit = Config::from_json(r#"{"predict_frag":{"im_predictor":"none"}}"#).unwrap();
+        assert_eq!(explicit.canonical_json(), canon);
+        // A set value is part of the configuration's identity and round-trips.
+        for (json, kind) in [
+            ("im2deep", ImPredictorKind::Im2deep),
+            ("auto", ImPredictorKind::Auto),
+        ] {
+            let c = Config::from_json(&format!(
+                r#"{{"predict_frag":{{"im_predictor":"{json}","im2deep_python":"/py"}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(c.predict_frag.im_predictor, kind);
+            let canon = c.canonical_json();
+            assert!(
+                canon.contains(&format!(r#""im_predictor":"{json}""#)),
+                "{canon}"
+            );
+            assert!(canon.contains(r#""im2deep_python":"/py""#), "{canon}");
+            let again = Config::from_json(&canon).unwrap();
+            assert_eq!(again.predict_frag.im_predictor, kind);
+        }
+        assert!(Config::from_json(r#"{"predict_frag":{"im_predictor":"ccs"}}"#).is_err());
+    }
+
+    #[test]
+    fn auto_im_prediction_resolves_on_the_run_and_the_interpreter() {
+        let mut pf = PredictFragConfig::default();
+        for has_im in [false, true] {
+            assert_eq!(pf.im_predictor_for(has_im), ImPredictorKind::None);
+        }
+        pf.im_predictor = ImPredictorKind::Auto;
+        assert_eq!(pf.im_predictor_for(true), ImPredictorKind::None);
+        pf.im2deep_python = Some("/py".into());
+        assert_eq!(pf.im_predictor_for(true), ImPredictorKind::Im2deep);
+        // A run without 1/K0 predicts none under `auto`, interpreter or not.
+        assert_eq!(pf.im_predictor_for(false), ImPredictorKind::None);
+        // An explicit choice is never second-guessed.
+        pf.im_predictor = ImPredictorKind::None;
+        assert_eq!(pf.im_predictor_for(true), ImPredictorKind::None);
+        pf.im_predictor = ImPredictorKind::Im2deep;
+        pf.im2deep_python = None;
+        for has_im in [false, true] {
+            assert_eq!(pf.im_predictor_for(has_im), ImPredictorKind::Im2deep);
+        }
     }
 
     #[test]

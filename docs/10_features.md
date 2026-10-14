@@ -61,6 +61,14 @@ Columns read (getter -> column): `candidate_id` (u32), `apex_rt` (f64),
 competition columns default to 0.0 when absent: `contested_frac`,
 `contested_count_frac`, `apportioned_frac`. Optional MS1 apex isotope columns
 (`opt_f64`, default `None`): `ms1_isom1`, `ms1_mono`, `ms1_iso1`, `ms1_iso2`.
+With the ion-mobility family on (see `ion_mobility` below), the 1/K0 evidence of
+`psms_extracted` v4 is read as well (`opt_f64`, all `None` when absent): `apex_im`,
+`apex_im_mad`, `ms1_apex_im`, `im_pred_cal`. With the family off they are not read.
+Under `retrace.apex_features` (`FeaturesParams::imc_ref_w`) the family also reads
+retrace's `imc_ref_w` (f64), which must then be present; a table without it is an error,
+not a column of zeros. After a retrace the apex scalars this stage reads
+(`apex_rt`, `apex_im`, `apex_intensity`, `n_matched_fragments`, `ms1_mono`, `ms1_iso1`,
+`ms1_iso2`) are the patched raw-trace values (docs/09 section 9).
 
 ### Consumed: chromatograms (`features.rs:591`-`618`)
 
@@ -79,6 +87,15 @@ nothing earlier. The confident-bounds pass reads sub-chunks on the absolute
 `ChromStream::open_at` opens the table at that row group's first row and follows the
 rows before the sub-chunk through the decoder without keeping them, so the samples
 are v1's in order, bit for bit.
+
+With the ion-mobility family on, the main pass also reads each row's per-point 1/K0
+list where the table has one (`im` in chromatograms v3, `im_trimmed` in v4):
+`ChromStream::open(ch, want_im)` projects it, the decoder rebuilds a v4 list with the
+trace's `+0.0` margins (`Decoder::row_im`), and the chunk stores it on the intensities'
+offsets (`RowSet::im_vals`, `ChromRow::im`). `want_im` is the resolved family switch;
+the confident-bounds pass (`open_at`) never reads it. On a 4D run the list roughly
+doubles the resident trace memory of a chunk. With the family off, and on any table
+without the list, the projection and the stored chunk are what they were.
 
 ### Consumed: seed PSMs (optional, `features.rs:620`-`652`)
 
@@ -257,6 +274,13 @@ section). It mirrors the alignment and peak-bounding of
   window grid) is sliced directly; any other grid goes through the RT-keyed map.
 - `ref_profile_full` (the raw-weighted reference over the whole window) and
   `pair_stats` (see "Per-PSM shared statistics" below).
+- Ion mobility, read only by the `ion_mobility` family: `apex_im`, `apex_im_mad`,
+  `ms1_apex_im`, `im_pred_cal` (filled by the caller from `psms_extracted` v4, as the
+  `deconv_*` scalars are; `None` when absent or with the family off) and `im_traces`
+  (each fragment's per-point 1/K0 over `axis`, 0.0 where a point has none; empty when
+  the chromatograms carry no list or it was not read). The alignment carries the list
+  beside the traces (`TraceAlign::im_full`) through the same shared-axis or RT-keyed
+  build, so `im_traces[f][k]` belongs to `traces[f][k]`.
 
 In the chunked pass the parts are built once per PSM and shared with
 `fragment_features`: `apex_intensities` (the nearest-apex intensity per row),
@@ -290,12 +314,29 @@ exercise. `fragment_features` borrows the shared window only when
 
 ### The Extended battery
 
-`FAMILIES` (`features.rs:52`) is an ordered array of `(NAMES, values)` pairs;
+`FAMILIES` (`features.rs:58`) is an ordered array of `(NAMES, values)` pairs;
 the order is part of the frozen schema and is append-only. Each family exposes
 `NAMES: &[&str]` and `values(&Evidence) -> Vec<f64>` of identical length and
-matching order. `extended_values` (`features.rs:138`) calls each family and
-applies the precomputed dedup plan (`extended_value_plan`, `features.rs:112`),
+matching order. `extended_values` calls each family and
+applies the precomputed dedup plan (`extended_value_plan`),
 keeping names and values in lockstep, and coerces any non-finite value to 0.0.
+
+The registry the battery reads is `families(im)`, three layers deep:
+
+1. `FAMILIES`, the sixteen families from `similarity` to `demix`;
+2. `env_families()`, which appends `window` (`wf*`) and `rt_window` (`rtw*`), each
+   on by default since 2026-10-08 and left out by `MUMDIA_WINDOW_FEATURES=0` or
+   `MUMDIA_RTW_FEATURES=0` (which restores the previous schema). It is read once
+   per process: its `OnceLock` holds only these environment-gated families;
+3. `families(im)`, which appends `ion_mobility` when `im` is on, and after it the
+   one-name family of `imc_ref_w` under `ImFamily::WithImcRefW`. `im` is an
+   `ImFamily` (`Off`, `On`, `WithImcRefW`; a `bool` converts to the first two):
+   `features.im_features` as the run or experiment resolved it, with `imc_ref_w` when
+   `retrace.apex_features` is on in a pass that retraced. It is passed into
+   `active_features(set, im)`, `extended_name_refs(im)`, `extended_value_plan(im)`
+   and `extended_values(e, im)`. Nothing latches it, so the schema id an orchestrator
+   records (`active_features_of(config, has_im)`), the features stage and the rescore
+   projection read one list. Each of the three resulting lists is built once.
 
 Deduplication (`extended_name_refs`, `features.rs:84`): a name that already
 appears in `MINIMAL_FEATURES` or `RICH_EXTRA` (`reserved_names`,
@@ -303,7 +344,10 @@ appears in `MINIMAL_FEATURES` or `RICH_EXTRA` (`reserved_names`,
 appearance. In the current tree four Extended names are dropped as reserved
 collisions: `spectral_angle` (similarity vs Minimal), `rt_error_abs` (rt vs
 Minimal), `peptide_length` and `seed_identified` (novel vs Minimal/Rich). So the
-335 raw family names reduce to 331 unique Extended names.
+380 raw family names of the default registry (sixteen families plus `window` and
+`rt_window`) reduce to 376 unique Extended names, the nine `ion_mobility` names
+make 385 when the family is on, and `imc_ref_w` makes 386 under
+`retrace.apex_features`.
 
 ## The three feature sets
 
@@ -323,8 +367,9 @@ list:
   `base_width_rt`, `seed_score`, `seed_identified`, `matched_fraction`,
   `profile_cos`, `ref_corr`, `best_ref_corr`, `low_frag_coel`, `evidence`,
   `contrast_min`, `resid_corr`, `coel_clean`, `shadow_frac`.
-- `Extended` (381 = Minimal + Rich + 331 family names + 6 psms-derived): appends
-  `extended_names()` then six columns computed outside the family registry.
+- `Extended` (426 = Minimal + Rich + 376 family names + 6 psms-derived, 435 with
+  the `ion_mobility` family): appends `extended_names(im)` then six columns computed
+  outside the family registry.
   Three co-elution peak-contest metrics (`peak_contested_frac`,
   `peak_contested_count_frac`, `peak_apportioned_frac`) come from the PSM
   columns (default 0.0 when absent) and separate peak-borrowing decoys from
@@ -332,9 +377,11 @@ list:
   `charge_multi_flag`, `cross_charge_intensity_log`) aggregate across the charge
   states of one peptidoform, an axis invisible to the per-PSM Evidence families.
 
-The size invariant is asserted in `feature_sets_sized` (`features.rs:1590`):
-`Extended.len() == 14 + 30 + extended_names().len() + 6`, and all Extended names
-are unique. `FeatureSet` (`config.rs:65`) has exactly `Minimal`, `Rich`,
+The size invariant is asserted in `feature_sets_sized`:
+`Extended.len() == 14 + 30 + extended_names(false).len() + 6`, and all Extended names
+are unique. `the_ion_mobility_family_is_an_appended_extended_family` pins where the
+family goes (after `rt_window`, before the six psms-derived columns) and that the
+smaller sets ignore the switch. `FeatureSet` (`config.rs:65`) has exactly `Minimal`, `Rich`,
 `Extended`; the earlier `Custom` variant is gone (do not document it).
 
 ## Extended family reference
@@ -575,6 +622,98 @@ Names: `frag_mass_err_median`, `frag_mass_err_abs_median`, `frag_mass_err_std`,
 (fraction in the strongest fragment), `frac_top3_pred_observed`,
 `frac_top5_pred_observed`. Has unit tests (`mass_uncertainty.rs:142`).
 
+### demix (5, `demix.rs`)
+
+The spectrum-centric demix of extract, carried into the battery: the per-candidate
+result of the non-negative least-squares fit of the co-isolated candidate x fragment
+matrix at the apex scan. Names: `deconv_explained_frac` (energy of the apex spectrum
+the joint fit explains), `deconv_active` (1 when the candidate survives the active
+set), `deconv_share` (its fraction of the demixed abundance at its apex),
+`deconv_max_collinearity` (largest cosine of its design column with a co-isolated
+rival; near 1 means the split is arbitrary), `shadow_kept_frac` (fraction of its apex
+intensity left after subtracting the co-eluters' unique-ion estimates). Read from the
+`psms_extracted` columns of the same names, filled only under
+`extract.emit_demix_features`; otherwise all 0, so the vector effect is nil. Every
+value is clamped to [0, 1]. The last family of `FAMILIES`.
+
+### window (34, `window.rs`)
+
+Fixed-window integrated evidence, for low ion counts where a fragment is present in
+one scan and absent in the next, so the single apex scan and a peak bounded on that
+trace both read Poisson noise. For k = 1, 2, 3, every fragment is summed over the
+apex +-k scans of the full extracted axis, independent of the detected peak bounds,
+and the summed spectrum is scored against the library (eleven names each,
+`wf1_*`, `wf2_*`, `wf3_*`): `cos_sqrt` and `pearson_sqrt` (on square roots),
+`pearson`, `nfrag` (fragments present), `predw_cov` (share of predicted intensity
+present), `top3_cov` (of the three most intense predicted fragments), `logsum`
+(`ln(1 + total)`), `scans_ge2` and `scans_ge3` (scans of the window with at least two
+and three fragments at once), `occ_mean` (mean scans per present fragment) and
+`entropy_sim` (sqrt spectral-entropy similarity). `wf_contrast` is
+`ln(1 + apex +-2) - ln(1 + flanks +-3..+-6)`. Appended after `FAMILIES` by
+`env_families()`; `MUMDIA_WINDOW_FEATURES=0` leaves it out.
+
+### rt_window (5, `rt_window.rs`)
+
+The retention-time error scaled by the window it was searched in. Under the
+widen-only local RT window a candidate at a gradient end may be searched several
+global widths from its prediction, and `rt_error_*` cannot tell a large error inside
+a widened window from one the global window would have excluded. Names:
+`rtw_scaled` and `rtw_scaled_abs` (signed and absolute error over the window
+half-width on its own side), `rtw_err_over_global` (error over the global
+half-width), `rtw_excess_global` (the part of the absolute error beyond the global
+half-width, over it), `rtw_widening` (mean half-width over the global one). The
+window is `psms_extracted`'s `rt_lo`/`rt_hi` (`extract.emit_rt_window`) and the global
+half-width the smallest over all rows; all 0 without them. Appended after `window`
+by `env_families()`; `MUMDIA_RTW_FEATURES=0` leaves it out.
+
+### ion_mobility (9, or 10 with `imc_ref_w`; `im.rs`)
+
+The 1/K0 evidence of a diaPASEF run (docs/35_diapasef.md). In the battery only when
+`features.im_features` resolves on (`off` by default; `auto` is on when the spectra
+carry 1/K0), appended after `rt_window`. Part of the `extended` set only: `minimal`
+and `rich` have no family battery and ignore the switch, with a warning. Six scalars
+from `psms_extracted` v4 and three from the per-point 1/K0 of the chromatograms:
+
+- `im_error`, `im_error_abs`: the apex 1/K0 (`apex_im`, the intensity-weighted median
+  1/K0 of the matched fragment peaks in the apex scan) minus the calibrated
+  prediction (`im_pred_cal`), signed and absolute;
+- `im_frag_mad`: the fragments' intensity-weighted mean absolute deviation from
+  `apex_im` (`apex_im_mad`);
+- `ms1_im_error_abs`, `ms1_frag_im_diff`, `has_ms1_im`: the MS1 precursor peak's 1/K0
+  (`ms1_apex_im`) against the prediction and against `apex_im`, and whether one was
+  found;
+- `im_elution_error_abs`, `im_elution_sd`, `im_elution_frag_sd`: over the elution peak
+  (`Evidence::im_traces` on `axis`), intensity-weighted and skipping points without
+  intensity or 1/K0: |weighted mean 1/K0 - prediction|, the weighted SD of all points,
+  and the SD of the per-fragment mean 1/K0 weighted by each fragment's summed
+  intensity (0 with fewer than two fragments). `stats::weighted_mean_sd` is the
+  kernel;
+- `imc_ref_w` (`im::APEX_NAMES`), the tenth, only under `retrace.apex_features`:
+  retrace's apex 1/K0 agreement of the fragments, the predicted-intensity-weighted
+  mean leave-one-out reference correlation of each fragment's raw 1/K0 profile at the
+  apex (`stats::loo_ref_corr`, the kernel of `frag_loo_ref_corr_*` and of the
+  interference family's prune; docs/09 section 9). Measured on the IM branch: +1.3%
+  peptides alone on E. coli (three seeds), and the added peptides carried about 2.7%
+  FDP, so it stays off until an entrapment recheck.
+
+A missing input gives 0.0, so the columns are constant on a 3D run, and there is no
+data gate on column presence: the switch alone decides whether the columns exist.
+Nothing reads a label: a decoy's library 1/K0 follows its target's (docs/06), and the
+paired-difference check on native IM2Deep decoys gave a median of +0.0001 and an SD of
+0.036 over 1.13M pairs. The elution triple equals the IM branch's raw-row computation
+bit for bit (`elution_on_the_peak_axis_is_the_raw_row_elution_bit_for_bit`). The
+compact rescore preset (`rescore.feature_preset = compact`) has none of these names,
+so it projects them out. A pool that mixes runs with and without the family fails
+the rescore schema check, which names the family; `run-experiment` resolves the switch
+once for the experiment, so its runs share one schema. Promotion of the default to
+`auto` waits for a paired on/off entrapment arm and seeds on a second acquisition.
+
+Measured: +1.8% peptides on E. coli diaPASEF on the IM branch (three seeds, on top of the
+1/K0 gate); on main the gate and the family together gave +5.0% (one seed). The IM
+branch's 1/K0 width and peak-shape block (P7) lost 0.9% and is not ported, and a
+shared-Gaussian co-elution fit separated no better than `xcorr_shape` (docs/35 section 12).
+The diaPASEF recipe (`configs/examples/diapasef.json`) sets `im_features = on`.
+
 ## The Percolator PIN (`write_pin`, `features.rs:1537`)
 
 Streamed row-by-row through a `BufWriter` (not materialized as one String).
@@ -690,6 +829,7 @@ variant no longer exists).
 | `bound_from_confident` | false | true = learn one global left/right half-width from the confident seed set and apply it to every candidate; false (default since 2026-10-04) = per-candidate detection |
 | `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
 | `chrom_loaders` | 3 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
+| `im_features` | `off` | the `ion_mobility` family (`off`, `on`, `auto` = on when the spectra carry 1/K0). `run` and `run-experiment` resolve it once (`Config::resolve_im_features`) and hand every stage `on` or `off`; a standalone `mumdia features` resolves `auto` from the reader extract recorded in the chromatograms report. On a 4D run it also makes extract write the chromatograms' per-point 1/K0 (v3/v4). Omitted from the canonical configuration at its default |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded
 `FRAG_TOL_PPM = 20.0` (`mass_accuracy.rs:44`), not `prec_tol_ppm`; Evidence does

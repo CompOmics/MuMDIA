@@ -31,6 +31,25 @@ struct Hashed {
     result: Result<(u64, String)>,
 }
 
+/// `(bytes, blake3)` of a directory input, the timsTOF `.d` that the native reader takes:
+/// the blake3 of one `<name>\t<blake3>\n` line per regular file directly inside it, in name
+/// order, and their summed size. One level, as the acquisition files sit there.
+fn hash_dir(path: &str) -> Result<(u64, String)> {
+    let mut files: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(path)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+        .collect();
+    files.sort();
+    let (mut bytes, mut listing) = (0u64, String::new());
+    for (name, p) in files {
+        let p = p.to_string_lossy();
+        bytes += std::fs::metadata(p.as_ref())?.len();
+        listing.push_str(&format!("{name}\t{}\n", mumdia_io::hash::blake3_file(&p)?));
+    }
+    Ok((bytes, mumdia_io::hash::blake3_str(&listing)))
+}
+
 fn hash_all(what: &str, inputs: Vec<(String, String)>) -> Vec<Hashed> {
     let t0 = Instant::now();
     let mut bytes_total = 0u64;
@@ -39,7 +58,13 @@ fn hash_all(what: &str, inputs: Vec<(String, String)>) -> Vec<Hashed> {
         .map(|(role, path)| {
             let result = std::fs::metadata(&path)
                 .map_err(anyhow::Error::from)
-                .and_then(|m| Ok((m.len(), mumdia_io::hash::blake3_file(&path)?)));
+                .and_then(|m| {
+                    if m.is_dir() {
+                        hash_dir(&path)
+                    } else {
+                        Ok((m.len(), mumdia_io::hash::blake3_file(&path)?))
+                    }
+                });
             if let Ok((b, _)) = &result {
                 bytes_total += b;
             }

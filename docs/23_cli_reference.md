@@ -46,6 +46,7 @@ Commands:
   rt-im-train     Per-run RT calibration + windows -> run_windows.parquet, cal.json
   sub-library     Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires
   extract         Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
+  retrace         Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. The configuration's `retrace` section applies, `enabled` aside
   features        Compute the minimal feature set -> features.parquet + PIN
   pool            Pool a grouped run's band artifacts into the run-level tables
   compete         Keep the best candidate per competition group -> psms_competed.parquet
@@ -57,7 +58,7 @@ Commands:
   align           Cross-run RT alignment (experiment-level) -> alignment.parquet
   mbr             Match-between-runs identification transfer (Stage D3) -> transferred.parquet
   inspect         Print schema, head sample, and row count for any artifact
-  peak-census     Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard
+  peak-census     Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard
   audit           Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute
   report          Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory
   cache           Show, trim or clear the engine's caches: FASTA-built libraries and DeepLC's trunk projection (docs/14, "The engine's caches")
@@ -142,6 +143,7 @@ first sentence of the description, with the full text in the section below.
 | [`rt-im-train`](#rt-im-train) | yes | Per-run RT calibration + windows -> run_windows.parquet, cal.json |
 | [`sub-library`](#sub-library) | yes | Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires |
 | [`extract`](#extract) | yes | Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms |
+| [`retrace`](#retrace) | yes | Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. |
 | [`features`](#features) | yes | Compute the minimal feature set -> features.parquet + PIN |
 | [`pool`](#pool) | no | Pool a grouped run's band artifacts into the run-level tables |
 | [`compete`](#compete) | yes | Keep the best candidate per competition group -> psms_competed.parquet |
@@ -153,15 +155,15 @@ first sentence of the description, with the full text in the section below.
 | [`align`](#align) | yes | Cross-run RT alignment (experiment-level) -> alignment.parquet |
 | [`mbr`](#mbr) | yes | Match-between-runs identification transfer (Stage D3) -> transferred.parquet |
 | [`inspect`](#inspect) | no | Print schema, head sample, and row count for any artifact |
-| [`peak-census`](#peak-census) | yes | Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard |
+| [`peak-census`](#peak-census) | yes | Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard |
 | [`audit`](#audit) | no | Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). |
 | [`report`](#report) | yes | Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory |
 | [`cache`](#cache) | yes | Show, trim or clear the engine's caches: FASTA-built libraries and DeepLC's trunk projection (docs/14, "The engine's caches") |
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-22 of the 26 documented subcommands accept `--config`:
- `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `report`, `rescore`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
+23 of the 27 documented subcommands accept `--config`:
+ `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 4 do not, so every setting they use comes from their own flags:
  `audit`, `inspect`, `pool`, `quant-lfq`.
@@ -435,6 +437,41 @@ Options:
 
 Plus the 5 repeated flags removed above: see "Global flags".
 
+## retrace
+
+```text
+Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. The configuration's `retrace` section applies, `enabled` aside
+
+Usage: mumdia retrace [OPTIONS] --raw <RAW> --chromatograms <CHROMATOGRAMS> --psms-extracted <PSMS_EXTRACTED> --run-windows <RUN_WINDOWS> --lib-precursors <LIB_PRECURSORS> --out <OUT>
+
+Options:
+      --raw <RAW>
+          The diaPASEF `.d` the spectra were converted from
+
+      --chromatograms <CHROMATOGRAMS>
+          Extract's chromatograms (the centroid traces), with their per-point 1/K0
+
+      --psms-extracted <PSMS_EXTRACTED>
+          Extract's psms_extracted; under `retrace.repick` its `.peaks.parquet` sidecar must sit beside it
+
+      --run-windows <RUN_WINDOWS>
+
+      --lib-precursors <LIB_PRECURSORS>
+
+      --mass-cal <MASS_CAL>
+          Optional mass recalibration json (search-seed <seed>.masscal.json)
+
+      --out <OUT>
+          The rebuilt chromatograms
+
+      --out-psms <OUT_PSMS>
+          Where the patched psms_extracted goes; default: patch --psms-extracted in place
+
+      --config <CONFIG>
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
+
 ## features
 
 ```text
@@ -521,6 +558,9 @@ Options:
 
       --isolation-windows <ISOLATION_WINDOWS>...
           `isolation_windows.parquet` of each input run, in source order, for shadow demotion
+
+      --psms-extracted <PSMS_EXTRACTED>...
+          `psms_extracted.parquet` of each input run, in source order, for the 1/K0 term of shadow demotion (`rescore.shadow_im_tolerance`)
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".
@@ -550,6 +590,12 @@ Options:
 
       --out-peak-bounds <OUT_PEAK_BOUNDS>
           Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt, width_s)
+
+      --export-cross-run
+          Write the cross-run export into `--out-fragment` (fragment_quant v5: the zero-area rows and the columns the cross-run fit reads). The first pass of the cross-run step; `run-experiment` runs it by itself
+
+      --cross-run-from <CROSS_RUN_FROM>...
+          The second pass of the cross-run step: the first-pass `--out-fragment` tables of every run of the experiment, written with `--export-cross-run`, in run order. The fit follows `quant.fragment_selection = cross_run`, `quant.baseline_source = experiment` and `quant.fixed_scan_halfwidth_scale`. Without it those keys fall back to the per-run quant
 
       --config <CONFIG>
 ```
@@ -716,9 +762,9 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ## peak-census
 
 ```text
-Peaks per MS2 spectrum for an mzML, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard.
+Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard.
 
-The pre-flight for a decision the documentation says must be made per acquisition. Reading it before setting a cap is the difference between bounding peak volume and deleting fragment evidence from most spectra.
+The pre-flight for a decision the documentation says must be made per acquisition. Reading it before setting a cap is the difference between bounding peak volume and deleting fragment evidence from most spectra. A diaPASEF `.d` is counted after the native reader's centroiding, which is what `convert` writes for it.
 
 Usage: mumdia peak-census [OPTIONS] --mzml <MZML>
 
@@ -726,7 +772,7 @@ Options:
       --mzml <MZML>
 
       --max-spectra <MAX_SPECTRA>
-          Stop after this many spectra from the head of the file (0 = all)
+          Stop after this many spectra from the head of the file (0 = all); for a diaPASEF `.d`, this many frames
 
           [default: 0]
 

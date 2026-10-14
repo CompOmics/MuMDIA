@@ -597,6 +597,62 @@ pub fn one_at_a_time_for_sidecars(
     plan.bounded(1, threads)
 }
 
+/// A reservation of reader or decoder threads against a process-wide budget, returned to it
+/// on drop. One mechanism for every stage that reads a large table on extra threads: the
+/// features stage's confident-bounds decoders and main-pass loaders, and retrace's
+/// chromatogram readers, each against a budget of its own.
+///
+/// Process-wide because a stage is itself invoked from inside a rayon `par_iter` on
+/// supported paths (`run_groups` under `groups.parallel > 1`, `run_experiment` under
+/// `experiment.parallel_runs > 1`), where `rayon::current_num_threads` reports the whole
+/// pool, so a per-call allowance would multiply with the concurrency.
+///
+/// Take-what-is-left rather than a blocking semaphore: a lease is acquired from inside a
+/// rayon worker, and a worker that blocks cannot steal, so waiting for a permit would
+/// stall the enclosing band-level or run-level parallelism (and would make progress depend
+/// on the pool being large enough to run every permit holder). A call that finds the
+/// budget empty gets zero and runs on its own one thread.
+///
+/// The bound this gives is `B + (C - 1)` concurrent threads for a budget of `B` and `C`
+/// concurrent calls: the budget covers the first `B`, and every call that got nothing still
+/// runs one thread of its own.
+pub(crate) struct DecoderLease {
+    budget: &'static std::sync::atomic::AtomicUsize,
+    n: usize,
+}
+
+impl DecoderLease {
+    /// Take up to `want` threads from `budget`, however many it still holds. Never blocks.
+    pub(crate) fn take_from(budget: &'static std::sync::atomic::AtomicUsize, want: usize) -> Self {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let mut cur = budget.load(Acquire);
+        loop {
+            let n = want.min(cur);
+            match budget.compare_exchange_weak(cur, cur - n, AcqRel, Acquire) {
+                Ok(_) => return DecoderLease { budget, n },
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    /// Threads to run on: the lease, or one when the budget was empty.
+    pub(crate) fn decoders(&self) -> usize {
+        self.n.max(1)
+    }
+
+    /// What the budget actually granted, which may be zero.
+    pub(crate) fn granted(&self) -> usize {
+        self.n
+    }
+}
+
+impl Drop for DecoderLease {
+    fn drop(&mut self) {
+        self.budget
+            .fetch_add(self.n, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

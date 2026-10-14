@@ -3,6 +3,7 @@
 
 pub mod align;
 pub mod audit;
+pub mod chain;
 pub mod compete;
 pub mod convert;
 pub mod digest;
@@ -17,6 +18,7 @@ pub mod prescreen;
 pub mod quant;
 pub mod report;
 pub mod rescore;
+pub mod retrace;
 pub mod rt_bootstrap;
 pub mod rt_im_train;
 pub mod run;
@@ -86,6 +88,29 @@ impl WideScan {
 /// Read options for the wide scans under `MUMDIA_WIDE_SCAN` ([`WideScan`]).
 pub(crate) fn wide_scan_options() -> mumdia_io::table::ScanOptions {
     WideScan::from_env().options()
+}
+
+/// Delete an intermediate table and its companions (`<path>.report.json`,
+/// `<path>.schema.json`), those that exist, and return the files and bytes removed. A file
+/// that exists and cannot be removed is an error naming it ("deleting the `what` <file>"),
+/// so a run never reports space it did not free. The one helper for intermediates a run
+/// deletes once their only reader is done: a grouped run's band tables
+/// (`groups.delete_band_intermediates`) and retrace's centroid chromatograms.
+pub(crate) fn delete_intermediate(path: &str, what: &str) -> anyhow::Result<(u64, u64)> {
+    use anyhow::Context as _;
+    let (mut files, mut bytes) = (0u64, 0u64);
+    for f in [
+        path.to_string(),
+        format!("{path}.report.json"),
+        format!("{path}.schema.json"),
+    ] {
+        if let Ok(meta) = std::fs::metadata(&f) {
+            std::fs::remove_file(&f).with_context(|| format!("deleting the {what} {f}"))?;
+            files += 1;
+            bytes += meta.len();
+        }
+    }
+    Ok((files, bytes))
 }
 
 #[cfg(test)]

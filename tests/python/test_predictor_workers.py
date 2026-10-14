@@ -681,3 +681,118 @@ def _load_finetune_worker():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+# ------------------------------------------------------------------ IM2Deep worker
+
+def test_im2deep_is_imported_first_at_module_scope():
+    """`import im2deep` precedes numpy, pyarrow and torch, as `import deeplc` does.
+
+    IM2Deep is torch-backed and imports DeepLC itself, so the Windows DLL-init failure the
+    DeepLC workers guard against applies to it unchanged.
+    """
+    text = _source("im2deep_worker.py")
+    lines = text.splitlines()
+    assert any(ln.startswith("import im2deep") for ln in lines), "not at module scope"
+    im2deep_at = first_line_matching(text, r"import im2deep\b")
+    for module in ("numpy", "pyarrow", "torch"):
+        at = first_line_matching(text, r"import {}\b".format(module))
+        assert at is not None and im2deep_at < at, module
+    assert '__name__ == "__main__"' in text
+
+
+# A stand-in for the IM2Deep 2.x API, psm_utils and torch, so the worker's file contract
+# runs without the real packages. `predict` returns a CCS that depends on the charge and the
+# sequence length; `ccs2im` is the Mason-Schamp conversion with IM2Deep's constants.
+_STUBS = {
+    "im2deep/__init__.py": '''
+import numpy as np
+__version__ = "{version}"
+SUMMARY, GAS, TEMP = 18509.8632163405, 28.013, 31.85 + 273.15
+
+def predict(psm_list, predict_kwargs=None):
+    assert predict_kwargs["num_threads"] >= 1
+    out = []
+    for psm in psm_list:
+        seq, z = psm.peptidoform.rsplit("/", 1)
+        out.append({ccs})
+    return np.asarray(out)
+
+def ccs2im(ccs, mz, charge):
+    m = mz * charge
+    reduced = m * GAS / (m + GAS)
+    return ccs / (SUMMARY * charge / np.sqrt(reduced * TEMP))
+''',
+    "psm_utils/__init__.py": '''
+class PSM:
+    def __init__(self, peptidoform, spectrum_id):
+        self.peptidoform, self.spectrum_id = peptidoform, spectrum_id
+
+class PSMList(list):
+    def __init__(self, psm_list):
+        super().__init__(psm_list)
+''',
+    "torch/__init__.py": '''
+def get_num_threads():
+    return 4
+''',
+}
+
+
+def _im2deep_stubs(root, version="2.0.2", ccs="300.0 + 10.0 * int(z) + len(seq)"):
+    for rel, body in _STUBS.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body.replace("{version}", version).replace("{ccs}", ccs),
+                        encoding="utf-8")
+    return {"PYTHONPATH": str(root)}
+
+
+def _im2deep_request(path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.table({
+        "id": pa.array([0, 1, 2], pa.uint32()),
+        "peptidoform": pa.array(["PEPTIDEK", "PEPTIDEK", "SAM[Oxidation]PLER"], pa.string()),
+        "charge": pa.array([2, 3, 2], pa.int32()),
+        "precursor_mz": pa.array([465.73, 310.82, 409.20], pa.float64()),
+    }), str(path))
+
+
+def test_im2deep_worker_writes_one_finite_positive_im_per_request(tmp_path):
+    import numpy as np
+
+    from conftest import assert_engine_readable_parquet, read_columns, run_worker_ok
+
+    env = _im2deep_stubs(tmp_path / "stubs")
+    env["MUMDIA_IM2DEEP_THREAD_CAP"] = "2"
+    _im2deep_request(tmp_path / "in.parquet")
+    out = tmp_path / "out.parquet"
+    stdout, _ = run_worker_ok("im2deep_worker.py", tmp_path / "in.parquet", out, 8, env=env)
+    assert "torch threads=2" in stdout and "MUMDIA_IM2DEEP_THREAD_CAP" in stdout
+    assert_engine_readable_parquet(out)
+    got = read_columns(out)
+    assert got["id"].tolist() == [0, 1, 2]
+    ccs = np.array([300.0 + 20 + 8, 300.0 + 30 + 8, 300.0 + 20 + 18])
+    assert np.allclose(got["ccs"], ccs.astype(np.float32))
+    mz, z = np.array([465.73, 310.82, 409.20]), np.array([2, 3, 2])
+    m = mz * z
+    factor = 18509.8632163405 * z / np.sqrt(m * 28.013 / (m + 28.013) * (31.85 + 273.15))
+    assert np.allclose(got["predicted_im"], ccs / factor, rtol=0, atol=1e-12)
+    assert np.all((got["predicted_im"] > 0.3) & (got["predicted_im"] < 2.0))
+
+
+def test_im2deep_worker_refuses_an_old_release_and_a_non_physical_value(tmp_path):
+    from conftest import run_worker
+
+    _im2deep_request(tmp_path / "in.parquet")
+    old = _im2deep_stubs(tmp_path / "old", version="1.1.0")
+    rc, _, err = run_worker("im2deep_worker.py", tmp_path / "in.parquet",
+                            tmp_path / "a.parquet", 1, env=old)
+    assert rc != 0 and "older than the required 2.0.0" in err
+    bad = _im2deep_stubs(tmp_path / "bad", ccs="-1.0")
+    rc, _, err = run_worker("im2deep_worker.py", tmp_path / "in.parquet",
+                            tmp_path / "b.parquet", 1, env=bad)
+    assert rc != 0 and "not a finite positive 1/K0" in err
+    assert not (tmp_path / "b.parquet").exists()

@@ -13,19 +13,28 @@
 //! 2. the consensus is the median of a precursor's mapped apexes; a precursor accepted
 //!    experiment-wide but in no single run takes the apex of its winning row.
 //!
+//! On a run with ion mobility the pair also gets a consensus 1/K0 the same way: each run's
+//! apex 1/K0 of the same confident apexes (joined from its `psms_extracted` on
+//! `(candidate_id, selected_peak_rank)`), moved onto the same reference run by the run's
+//! median 1/K0 offset over at least `MIN_SHARED` shared precursors, then the median. A 3D
+//! experiment has no apex 1/K0, and its library is the one it always was.
+//!
 //! The fragments are the library's own, for the target and the decoy alike, so the only
-//! thing the pair does not share with the first pass is its retention time, and that it
-//! shares with each other. Every run is then searched again on this library by the ordinary
-//! chain (seed, retention-time calibration, extract, features, compete) and rescored in one
-//! pool: the second pass controls its FDR with its own decoys, which is why it can report a
-//! precursor in a run where the first pass did not, and why it is measured against nulls rather
-//! than assumed (docs/12, "Second pass").
+//! thing the pair does not share with the first pass is its retention time (and 1/K0), and
+//! that it shares with each other. Every run is then searched again on this library by the
+//! ordinary chain (seed, retention-time calibration, extract, features, compete) and
+//! rescored in one pool: the second pass controls its FDR with its own decoys, which is why
+//! it can report a precursor in a run where the first pass did not, and why it is measured
+//! against nulls rather than assumed (docs/12, "Second pass"). [`diagnose`] measures it
+//! against the first pass after that rescore.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
-use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array,
+};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -33,10 +42,10 @@ use mumdia_io::table::{write_table, Col, TableFile};
 use serde::Serialize;
 use tracing::{info, warn};
 
-use crate::stages::sub_library;
+use crate::stages::sub_library::{self, LibOverride};
 
 /// Fewest precursors a run must share with the reference run for its apexes to be aligned
-/// onto the reference; below it the run keeps its own retention-time scale.
+/// onto the reference; below it the run keeps its own retention-time (and 1/K0) scale.
 pub const MIN_SHARED: usize = 200;
 /// Bins of the binned-median alignment curve.
 pub const ALIGN_BINS: usize = 80;
@@ -44,11 +53,15 @@ const BATCH_ROWS: usize = 1 << 16;
 
 pub struct BuildParams<'a> {
     /// The first pass's pooled scored table (`candidate_id`, `source`, `label`, `run_psm_q`,
-    /// `precursor_q`, `apex_rt`).
+    /// `precursor_q`, `apex_rt`, and `selected_peak_rank` when it has one).
     pub scored: &'a str,
     /// The library the first pass searched; its ids are the scored table's.
     pub lib_precursors: &'a str,
     pub lib_fragments: &'a str,
+    /// Each source's first-pass `psms_extracted`, by `source`, for the apex 1/K0. A table
+    /// without the 1/K0 evidence (v2, every 3D run), a missing one, or an empty slice gives
+    /// no consensus 1/K0.
+    pub psms_extracted: &'a [String],
     pub out_dir: &'a str,
     /// `mbr.q_anchor`.
     pub q: f64,
@@ -78,6 +91,82 @@ pub struct EmpiricalLibrary {
     /// Median number of runs behind an entry's consensus.
     pub median_observations: f64,
     pub q: f64,
+    /// The consensus 1/K0, when any run had an apex 1/K0; absent on a 3D experiment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub im: Option<ImConsensusSummary>,
+    /// The second pass against the first ([`diagnose`]), written after the pooled
+    /// second-pass rescore on an experiment with ion mobility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Diagnostics>,
+    /// The directory the library was written to.
+    #[serde(skip)]
+    pub dir: String,
+    /// The entries, ascending: the first pass's accepted target candidate ids.
+    #[serde(skip)]
+    pub entry_ids: Vec<u32>,
+    /// For every row of the empirical library, by its new `candidate_id`, the original id of
+    /// the entry it belongs to: the row's own id for a target, its paired target's for a
+    /// decoy.
+    #[serde(skip)]
+    pub entry_of: Vec<u32>,
+    /// Every `(source, candidate)` target the first pass accepted in its run
+    /// (`run_psm_q <= q`), entries or not.
+    #[serde(skip)]
+    pub first_pass_accepted: BTreeSet<(u32, u32)>,
+}
+
+/// How the consensus 1/K0 was formed (`empirical_library.json`, `im`).
+#[derive(Clone, Debug, Serialize)]
+pub struct ImConsensusSummary {
+    /// The run every run's 1/K0 was moved onto: the retention-time reference.
+    pub reference_source: Option<u32>,
+    /// Runs moved onto the reference by their median offset, the reference included.
+    pub runs_aligned: usize,
+    /// Runs with apex 1/K0 values but fewer than `MIN_SHARED` shared with the reference.
+    pub runs_unaligned: usize,
+    /// Each aligned run's offset (reference minus run, median over the shared precursors),
+    /// by `source`; the reference's is 0.
+    pub offsets: BTreeMap<u32, f64>,
+    /// Entries whose 1/K0 is the median over their runs.
+    pub entries_from_runs: u64,
+    /// Entries with no confident run that has a 1/K0, which take their winning row's.
+    pub entries_from_winner: u64,
+    /// Entries with no finite 1/K0 at all, which keep the library's `predicted_im`.
+    pub entries_without_im: u64,
+}
+
+/// The second pass against the first, per run and pooled (`empirical_library.json`,
+/// `diagnostics`). Rows are scored rows at `run_psm_q <= q`; a decoy belongs to the entry it
+/// is paired with. A run is an anchor run of an entry when the first pass accepted that
+/// entry in that run.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Diagnostics {
+    pub q: f64,
+    pub runs: Vec<RunDiagnostics>,
+    /// Accepted second-pass targets and decoys in their entry's anchor runs.
+    pub targets_anchor: u64,
+    pub decoys_anchor: u64,
+    /// The same in the other runs, where the first pass did not accept the entry.
+    pub targets_non_anchor: u64,
+    pub decoys_non_anchor: u64,
+    /// `decoys_anchor / targets_anchor`; `None` without targets.
+    pub decoy_fraction_anchor: Option<f64>,
+    /// `decoys_non_anchor / targets_non_anchor`; `None` without targets.
+    pub decoy_fraction_non_anchor: Option<f64>,
+}
+
+/// One run of [`Diagnostics`]: targets accepted by each pass, and the difference.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RunDiagnostics {
+    pub source: u32,
+    pub first_pass_accepted: u64,
+    pub second_pass_accepted: u64,
+    /// Accepted by the second pass and not by the first in this run.
+    pub new: u64,
+    /// Accepted by the first pass and not by the second, among the library's entries.
+    pub dropped_in_library: u64,
+    /// Accepted by the first pass in this run but not experiment-wide, so not searched again.
+    pub dropped_outside_library: u64,
 }
 
 /// A monotone binned-median curve mapping one run's retention times onto the reference's.
@@ -145,6 +234,94 @@ impl Curve {
     }
 }
 
+/// How one run's values are put on the reference run's scale: retention time by a curve,
+/// 1/K0 by a constant offset.
+enum Align {
+    Curve(Curve),
+    Offset(f64),
+}
+
+impl Align {
+    fn map(&self, x: f64) -> f64 {
+        match self {
+            Align::Curve(c) => c.map(x),
+            Align::Offset(d) => x + d,
+        }
+    }
+}
+
+/// What [`consensus_onto`] returns.
+struct Onto {
+    /// Per candidate, the median on the reference's scale and the number of runs behind it.
+    medians: BTreeMap<u32, (f64, u32)>,
+    aligned: usize,
+    unaligned: usize,
+    /// Each aligned non-reference run's alignment, by source.
+    maps: BTreeMap<u32, Align>,
+}
+
+/// Every run's values of `obs` (`(source, candidate_id, value)`, one per pair) moved onto
+/// run `ref_s`, by the alignment `fit` makes from the `(run, reference)` pairs of the
+/// candidates the two share (at least `MIN_SHARED`), then the median per candidate with the
+/// number of runs behind it. A run sharing fewer keeps its own scale and is counted as
+/// unaligned.
+fn consensus_onto(
+    obs: &[(u32, u32, f64)],
+    ref_s: u32,
+    fit: impl Fn(Vec<(f64, f64)>) -> Align,
+) -> Onto {
+    let mut by_run: BTreeMap<u32, Vec<(u32, f64)>> = BTreeMap::new();
+    for &(s, c, v) in obs {
+        by_run.entry(s).or_default().push((c, v));
+    }
+    let ref_v: HashMap<u32, f64> = by_run
+        .get(&ref_s)
+        .map(|v| v.iter().copied().collect())
+        .unwrap_or_default();
+    let mut mapped: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
+    let mut maps: BTreeMap<u32, Align> = BTreeMap::new();
+    let (mut aligned, mut unaligned) = (0usize, 0usize);
+    for (&s, v) in &by_run {
+        let align = if s == ref_s {
+            None
+        } else {
+            let shared: Vec<(f64, f64)> = v
+                .iter()
+                .filter_map(|&(c, x)| ref_v.get(&c).map(|&r| (x, r)))
+                .collect();
+            if shared.len() >= MIN_SHARED {
+                Some(fit(shared))
+            } else {
+                unaligned += 1;
+                None
+            }
+        };
+        if s == ref_s || align.is_some() {
+            aligned += 1;
+        }
+        for &(c, x) in v {
+            let m = align.as_ref().map_or(x, |a| a.map(x));
+            mapped.entry(c).or_default().push(m);
+        }
+        if let Some(a) = align {
+            maps.insert(s, a);
+        }
+    }
+    let medians = mapped
+        .into_iter()
+        .map(|(c, mut v)| {
+            v.sort_by(f64::total_cmp);
+            (c, (median_sorted(&v), v.len() as u32))
+        })
+        .collect();
+    Onto {
+        medians,
+        aligned,
+        unaligned,
+        maps,
+    }
+}
+
 /// The consensus retention time of every candidate in `obs` (`(source, candidate_id, apex)`,
 /// one per pair), on the reference run's scale, with the number of runs behind it.
 pub(crate) struct Consensus {
@@ -155,15 +332,15 @@ pub(crate) struct Consensus {
 }
 
 pub(crate) fn consensus(obs: &[(u32, u32, f64)]) -> Consensus {
-    let mut by_run: BTreeMap<u32, Vec<(u32, f64)>> = BTreeMap::new();
-    for &(s, c, rt) in obs {
-        by_run.entry(s).or_default().push((c, rt));
+    let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+    for &(s, _, _) in obs {
+        *counts.entry(s).or_default() += 1;
     }
     // The run with the most confident apexes, the lowest source on a tie.
     let mut reference: Option<(u32, usize)> = None;
-    for (&s, v) in &by_run {
-        if reference.is_none_or(|(_, n)| v.len() > n) {
-            reference = Some((s, v.len()));
+    for (&s, &n) in &counts {
+        if reference.is_none_or(|(_, m)| n > m) {
+            reference = Some((s, n));
         }
     }
     let Some((ref_s, _)) = reference else {
@@ -174,44 +351,62 @@ pub(crate) fn consensus(obs: &[(u32, u32, f64)]) -> Consensus {
             unaligned: 0,
         };
     };
-    let ref_rt: HashMap<u32, f64> = by_run[&ref_s].iter().copied().collect();
-    let mut mapped: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
-    let (mut aligned, mut unaligned) = (0usize, 0usize);
-    for (&s, v) in &by_run {
-        let curve = if s == ref_s {
-            None
-        } else {
-            let shared: Vec<(f64, f64)> = v
-                .iter()
-                .filter_map(|&(c, rt)| ref_rt.get(&c).map(|&r| (rt, r)))
-                .collect();
-            if shared.len() >= MIN_SHARED {
-                Some(Curve::fit(shared, ALIGN_BINS))
-            } else {
-                unaligned += 1;
-                None
-            }
-        };
-        if s == ref_s || curve.is_some() {
-            aligned += 1;
-        }
-        for &(c, rt) in v {
-            let m = curve.as_ref().map_or(rt, |k| k.map(rt));
-            mapped.entry(c).or_default().push(m);
-        }
-    }
-    let rt = mapped
-        .into_iter()
-        .map(|(c, mut v)| {
-            v.sort_by(f64::total_cmp);
-            (c, (median_sorted(&v) as f32, v.len() as u32))
-        })
-        .collect();
+    let Onto {
+        medians,
+        aligned,
+        unaligned,
+        ..
+    } = consensus_onto(obs, ref_s, |shared| {
+        Align::Curve(Curve::fit(shared, ALIGN_BINS))
+    });
     Consensus {
-        rt,
+        rt: medians
+            .into_iter()
+            .map(|(c, (v, n))| (c, (v as f32, n)))
+            .collect(),
         reference: Some(ref_s),
         aligned,
         unaligned,
+    }
+}
+
+/// The consensus 1/K0 of every candidate in `obs` (`(source, candidate_id, apex 1/K0)`), on
+/// the scale of run `reference` (the retention-time reference, so both consensus values
+/// refer to one run): each other run is moved by its median offset, reference minus run,
+/// over the candidates it shares with the reference.
+pub(crate) struct ImConsensus {
+    pub im: BTreeMap<u32, (f64, u32)>,
+    pub aligned: usize,
+    pub unaligned: usize,
+    pub offsets: BTreeMap<u32, f64>,
+}
+
+pub(crate) fn consensus_im(obs: &[(u32, u32, f64)], reference: u32) -> ImConsensus {
+    let Onto {
+        medians: im,
+        aligned,
+        unaligned,
+        maps,
+    } = consensus_onto(obs, reference, |shared| {
+        let mut d: Vec<f64> = shared.iter().map(|&(x, r)| r - x).collect();
+        d.sort_by(f64::total_cmp);
+        Align::Offset(median_sorted(&d))
+    });
+    let mut offsets: BTreeMap<u32, f64> = maps
+        .into_iter()
+        .map(|(s, a)| match a {
+            Align::Offset(d) => (s, d),
+            Align::Curve(_) => unreachable!("1/K0 is aligned by an offset"),
+        })
+        .collect();
+    if obs.iter().any(|&(s, _, _)| s == reference) {
+        offsets.insert(reference, 0.0);
+    }
+    ImConsensus {
+        im,
+        aligned,
+        unaligned,
+        offsets,
     }
 }
 
@@ -251,18 +446,41 @@ fn i64_col(b: &RecordBatch, name: &str, path: &str) -> Result<Int64Array> {
         .clone())
 }
 
+fn label_col(b: &RecordBatch, path: &str) -> Result<StringArray> {
+    let ix = b
+        .schema()
+        .index_of("label")
+        .map_err(|_| anyhow!("{path} has no label column"))?;
+    let a: ArrayRef = cast(b.column(ix), &DataType::Utf8)?;
+    Ok(a.as_any()
+        .downcast_ref::<StringArray>()
+        .expect("cast to utf8")
+        .clone())
+}
+
+/// A first-pass observation: the row's `run_psm_q` (or `precursor_q` for a winner), its
+/// apex, its `source` and its `selected_peak_rank` (0 for a table without the column).
+#[derive(Clone, Copy, Debug)]
+struct Obs {
+    q: f64,
+    rt: f64,
+    source: u32,
+    rank: i32,
+}
+
 /// The first pass's entries and observations, from one streaming pass over its scored table:
 /// the entries (sorted), every `(source, candidate)` apex at `run_psm_q <= q` (the row with the
 /// lowest `run_psm_q` where a pair has several), and each entry's winning row.
 struct Scan {
     entries: Vec<u32>,
-    obs: BTreeMap<(u32, u32), (f64, f64)>,
-    winner: BTreeMap<u32, (f64, f64)>,
+    obs: BTreeMap<(u32, u32), Obs>,
+    winner: BTreeMap<u32, Obs>,
 }
 
 fn scan_scored(path: &str, q: f64) -> Result<Scan> {
     let t = TableFile::open(path)?;
-    let cols = [
+    let with_rank = t.has_column("selected_peak_rank");
+    let mut cols = vec![
         "candidate_id",
         "source",
         "label",
@@ -270,22 +488,32 @@ fn scan_scored(path: &str, q: f64) -> Result<Scan> {
         "precursor_q",
         "apex_rt",
     ];
+    if with_rank {
+        cols.push("selected_peak_rank");
+    }
     let mut entries: Vec<u32> = Vec::new();
-    let mut obs: BTreeMap<(u32, u32), (f64, f64)> = BTreeMap::new();
-    let mut winner: BTreeMap<u32, (f64, f64)> = BTreeMap::new();
+    let mut obs: BTreeMap<(u32, u32), Obs> = BTreeMap::new();
+    let mut winner: BTreeMap<u32, Obs> = BTreeMap::new();
     for b in t.batches(Some(&cols), BATCH_ROWS)? {
         let b = b?;
         let cid = u32_col(&b, "candidate_id", path)?;
         let src = u32_col(&b, "source", path)?;
-        let label_ix = b.schema().index_of("label")?;
-        let label: ArrayRef = cast(b.column(label_ix), &DataType::Utf8)?;
-        let label = label
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("cast to utf8");
+        let label = label_col(&b, path)?;
         let run_q = f64_col(&b, "run_psm_q", path)?;
         let prec_q = f64_col(&b, "precursor_q", path)?;
         let apex = f64_col(&b, "apex_rt", path)?;
+        let rank: Option<Int32Array> = if with_rank {
+            let ix = b.schema().index_of("selected_peak_rank")?;
+            let a: ArrayRef = cast(b.column(ix), &DataType::Int32)?;
+            Some(
+                a.as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("cast to i32")
+                    .clone(),
+            )
+        } else {
+            None
+        };
         for i in 0..b.num_rows() {
             if !label.is_valid(i) || label.value(i) != "target" || !apex.is_valid(i) {
                 continue;
@@ -295,18 +523,37 @@ fn scan_scored(path: &str, q: f64) -> Result<Scan> {
                 continue;
             }
             let c = cid.value(i);
+            let r = rank
+                .as_ref()
+                .map_or(0, |a| if a.is_valid(i) { a.value(i) } else { 0 });
             if prec_q.is_valid(i) && prec_q.value(i) <= q {
                 entries.push(c);
                 let pq = prec_q.value(i);
-                if winner.get(&c).is_none_or(|&(w, _)| pq < w) {
-                    winner.insert(c, (pq, rt));
+                if winner.get(&c).is_none_or(|w| pq < w.q) {
+                    winner.insert(
+                        c,
+                        Obs {
+                            q: pq,
+                            rt,
+                            source: src.value(i),
+                            rank: r,
+                        },
+                    );
                 }
             }
             if run_q.is_valid(i) && run_q.value(i) <= q {
                 let rq = run_q.value(i);
                 let key = (src.value(i), c);
-                if obs.get(&key).is_none_or(|&(o, _)| rq < o) {
-                    obs.insert(key, (rq, rt));
+                if obs.get(&key).is_none_or(|o| rq < o.q) {
+                    obs.insert(
+                        key,
+                        Obs {
+                            q: rq,
+                            rt,
+                            source: src.value(i),
+                            rank: r,
+                        },
+                    );
                 }
             }
         }
@@ -320,8 +567,49 @@ fn scan_scored(path: &str, q: f64) -> Result<Scan> {
     })
 }
 
-/// The library rows the second pass keeps and their retention times: every entry and the
-/// decoy paired with it, both given the entry's consensus, and the number of entries that have
+/// The apex 1/K0 of the observations and winners the consensus needs, per source, from each
+/// source's `psms_extracted` through the shared ordered-map join
+/// (`extract::apex_im_where`, keyed on `(candidate_id, peak_rank)`). Only tables that carry
+/// the 1/K0 evidence (`ms1_apex_im`, v4) are read, so a 3D experiment reads none and gets an
+/// empty map.
+fn apex_im_of(
+    scan: &Scan,
+    is_entry: impl Fn(u32) -> bool,
+    psms_extracted: &[String],
+) -> Result<BTreeMap<(u32, u32), f64>> {
+    let mut wanted: BTreeMap<u32, BTreeSet<(u32, i32)>> = BTreeMap::new();
+    for (&(s, c), o) in &scan.obs {
+        if is_entry(c) {
+            wanted.entry(s).or_default().insert((c, o.rank));
+        }
+    }
+    for (&c, w) in &scan.winner {
+        wanted.entry(w.source).or_default().insert((c, w.rank));
+    }
+    let mut out: BTreeMap<(u32, u32), f64> = BTreeMap::new();
+    for (s, keys) in wanted {
+        let Some(path) = psms_extracted.get(s as usize) else {
+            continue;
+        };
+        if !std::path::Path::new(path).exists()
+            || !mumdia_io::table::column_names(path)?
+                .iter()
+                .any(|c| c == "ms1_apex_im")
+        {
+            continue;
+        }
+        let im = crate::stages::extract::apex_im_where(path, |c, r| keys.contains(&(c, r)))?;
+        for ((c, r), v) in im {
+            if v.is_finite() && keys.contains(&(c, r)) {
+                out.insert((s, c), v);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The rows the second pass keeps: every entry and the decoy paired with it, each mapped to
+/// its entry (the original candidate id of the target), and the number of entries that have
 /// no decoy.
 ///
 /// The pairing is by rank within `(base_peptide_id, charge)`: the i-th target and the i-th
@@ -331,17 +619,20 @@ fn scan_scored(path: &str, q: f64) -> Result<Scan> {
 /// target row, sharing both ids, and the rank then pairs the rows that share a
 /// `peptidoform_id`. Measured on four imported libraries (2M targets each): every target
 /// paired, every pair the shared-id pair, and every pair at the same precursor m/z.
-fn plan_rows(lib_precursors: &str, irt: &BTreeMap<u32, f32>) -> Result<(HashMap<u32, f32>, u64)> {
+fn plan_rows<T>(
+    lib_precursors: &str,
+    entries: &BTreeMap<u32, T>,
+) -> Result<(BTreeMap<u32, u32>, u64)> {
     let t = TableFile::open(lib_precursors)?;
     let cols = ["candidate_id", "base_peptide_id", "charge"];
-    let mut groups: HashMap<(u32, i64), ()> = HashMap::with_capacity(irt.len());
+    let mut groups: HashMap<(u32, i64), ()> = HashMap::with_capacity(entries.len());
     for b in t.batches(Some(&cols), BATCH_ROWS)? {
         let b = b?;
         let cid = u32_col(&b, "candidate_id", lib_precursors)?;
         let base = u32_col(&b, "base_peptide_id", lib_precursors)?;
         let ch = i64_col(&b, "charge", lib_precursors)?;
         for i in 0..b.num_rows() {
-            if irt.contains_key(&cid.value(i)) {
+            if entries.contains_key(&cid.value(i)) {
                 groups.insert((base.value(i), ch.value(i)), ());
             }
         }
@@ -362,11 +653,7 @@ fn plan_rows(lib_precursors: &str, irt: &BTreeMap<u32, f32>) -> Result<(HashMap<
         let pf = u32_col(&b, "peptidoform_id", lib_precursors)?;
         let base = u32_col(&b, "base_peptide_id", lib_precursors)?;
         let ch = i64_col(&b, "charge", lib_precursors)?;
-        let label: ArrayRef = cast(b.column(b.schema().index_of("label")?), &DataType::Utf8)?;
-        let label = label
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("cast to utf8");
+        let label = label_col(&b, lib_precursors)?;
         for i in 0..b.num_rows() {
             let key = (base.value(i), ch.value(i));
             if !groups.contains_key(&key) {
@@ -381,23 +668,36 @@ fn plan_rows(lib_precursors: &str, irt: &BTreeMap<u32, f32>) -> Result<(HashMap<
             }
         }
     }
-    let mut keep: HashMap<u32, f32> = HashMap::with_capacity(2 * irt.len());
+    let mut keep: BTreeMap<u32, u32> = BTreeMap::new();
     let mut unpaired = 0u64;
     for (_, (mut targets, mut decoys)) in members {
         targets.sort_unstable();
         decoys.sort_unstable();
         for (rank, &(_, c)) in targets.iter().enumerate() {
-            let Some(&v) = irt.get(&c) else { continue };
-            keep.insert(c, v);
+            if !entries.contains_key(&c) {
+                continue;
+            }
+            keep.insert(c, c);
             match decoys.get(rank) {
                 Some(&(_, d)) => {
-                    keep.insert(d, v);
+                    keep.insert(d, c);
                 }
                 None => unpaired += 1,
             }
         }
     }
     Ok((keep, unpaired))
+}
+
+/// Each kept row's override, the decoy taking its target's: its entry's consensus retention
+/// time and, when the entry has one, its consensus 1/K0.
+fn overrides_of(
+    rows: &BTreeMap<u32, u32>,
+    values: &BTreeMap<u32, LibOverride>,
+) -> HashMap<u32, LibOverride> {
+    rows.iter()
+        .filter_map(|(&row, entry)| values.get(entry).map(|&v| (row, v)))
+        .collect()
 }
 
 /// Build the empirical library of the second pass into `p.out_dir`
@@ -414,7 +714,7 @@ pub fn build_library(p: &BuildParams) -> Result<EmpiricalLibrary> {
         .obs
         .iter()
         .filter(|((_, c), _)| is_entry(*c))
-        .map(|(&(s, c), &(_, rt))| (s, c, rt))
+        .map(|(&(s, c), o)| (s, c, o.rt))
         .collect();
     let cons = consensus(&obs);
     let mut irt: BTreeMap<u32, f32> = cons.rt.iter().map(|(&c, &(v, _))| (c, v)).collect();
@@ -423,10 +723,10 @@ pub fn build_library(p: &BuildParams) -> Result<EmpiricalLibrary> {
     // otherwise. The second pass calibrates every run against this scale anyway.
     let mut from_winner = 0u64;
     for &c in &scan.entries {
-        if let (std::collections::btree_map::Entry::Vacant(slot), Some(&(_, rt))) =
+        if let (std::collections::btree_map::Entry::Vacant(slot), Some(w)) =
             (irt.entry(c), scan.winner.get(&c))
         {
-            slot.insert(rt as f32);
+            slot.insert(w.rt as f32);
             from_winner += 1;
         }
     }
@@ -439,6 +739,63 @@ pub fn build_library(p: &BuildParams) -> Result<EmpiricalLibrary> {
     };
     obs.clear();
 
+    // The consensus 1/K0, from the same confident apexes, on the same reference run.
+    let apex_im = apex_im_of(&scan, is_entry, p.psms_extracted)?;
+    let mut im: BTreeMap<u32, f64> = BTreeMap::new();
+    let mut im_summary: Option<ImConsensusSummary> = None;
+    if !apex_im.is_empty() {
+        let obs_im: Vec<(u32, u32, f64)> = scan
+            .obs
+            .keys()
+            .filter(|(_, c)| is_entry(*c))
+            .filter_map(|&(s, c)| apex_im.get(&(s, c)).map(|&v| (s, c, v)))
+            .collect();
+        let ic = match cons.reference {
+            Some(r) => consensus_im(&obs_im, r),
+            None => ImConsensus {
+                im: BTreeMap::new(),
+                aligned: 0,
+                unaligned: 0,
+                offsets: BTreeMap::new(),
+            },
+        };
+        let (mut from_runs, mut from_win, mut without) = (0u64, 0u64, 0u64);
+        for &c in &scan.entries {
+            let v = match ic.im.get(&c) {
+                Some(&(v, _)) => {
+                    from_runs += 1;
+                    Some(v)
+                }
+                None => {
+                    let w = scan
+                        .winner
+                        .get(&c)
+                        .and_then(|w| apex_im.get(&(w.source, c)).copied());
+                    if w.is_some() {
+                        from_win += 1;
+                    }
+                    w
+                }
+            };
+            match v.filter(|v| v.is_finite()) {
+                Some(v) => {
+                    im.insert(c, v);
+                }
+                None => without += 1,
+            }
+        }
+        im_summary = Some(ImConsensusSummary {
+            reference_source: cons.reference,
+            runs_aligned: ic.aligned,
+            runs_unaligned: ic.unaligned,
+            offsets: ic.offsets,
+            entries_from_runs: from_runs,
+            entries_from_winner: from_win,
+            entries_without_im: without,
+        });
+    }
+
+    let first_pass_accepted: BTreeSet<(u32, u32)> = scan.obs.keys().copied().collect();
     let mut lib = EmpiricalLibrary {
         precursors: d("lib_precursors.parquet"),
         fragments: d("lib_fragments.parquet"),
@@ -453,6 +810,12 @@ pub fn build_library(p: &BuildParams) -> Result<EmpiricalLibrary> {
         entries_without_decoy: 0,
         median_observations,
         q: p.q,
+        im: im_summary,
+        diagnostics: None,
+        dir: p.out_dir.to_string(),
+        entry_ids: scan.entries.clone(),
+        entry_of: Vec::new(),
+        first_pass_accepted,
     };
     if irt.is_empty() {
         warn!(
@@ -463,10 +826,26 @@ pub fn build_library(p: &BuildParams) -> Result<EmpiricalLibrary> {
         mumdia_io::json::write_json(&d("empirical_library.json"), &lib)?;
         return Ok(lib);
     }
-    let (keep, unpaired) = plan_rows(p.lib_precursors, &irt)?;
+    // One override per entry: the consensus retention time, and the consensus 1/K0 where
+    // there is one. `plan_rows` gives it to both members of each pair.
+    let values: BTreeMap<u32, LibOverride> = irt
+        .iter()
+        .map(|(&c, &v)| {
+            (
+                c,
+                LibOverride {
+                    irt: v,
+                    im: im.get(&c).copied(),
+                },
+            )
+        })
+        .collect();
+    let (rows, unpaired) = plan_rows(p.lib_precursors, &values)?;
     lib.entries_without_decoy = unpaired;
-    let mut survivors: Vec<u32> = keep.keys().copied().collect();
-    survivors.sort_unstable();
+    let keep = overrides_of(&rows, &values);
+    let survivors: Vec<u32> = rows.keys().copied().collect();
+    // The sub-library keeps the library's order, so the i-th kept row is new id i.
+    lib.entry_of = rows.values().copied().collect();
     let surv = d("entries.parquet");
     write_table(&surv, vec![Col::U32("candidate_id".into(), survivors)])?;
     let st = sub_library::run(sub_library::SubLibraryParams {
@@ -477,7 +856,7 @@ pub fn build_library(p: &BuildParams) -> Result<EmpiricalLibrary> {
         out_fragments: &lib.fragments,
         // Pair-complete already: every entry and its paired decoy.
         pair_linked: false,
-        predicted_irt: Some(&keep),
+        overrides: Some(&keep),
     })?;
     lib.targets = st.targets;
     lib.decoys = st.decoys;
@@ -512,7 +891,120 @@ pub fn build_library(p: &BuildParams) -> Result<EmpiricalLibrary> {
         elapsed_ms = t0.elapsed().as_millis() as u64,
         "second pass: empirical library"
     );
+    if let Some(s) = &lib.im {
+        info!(
+            reference_source = ?s.reference_source,
+            runs_aligned = s.runs_aligned,
+            runs_unaligned = s.runs_unaligned,
+            offsets = ?s.offsets,
+            entries_from_runs = s.entries_from_runs,
+            entries_from_winner = s.entries_from_winner,
+            entries_without_im = s.entries_without_im,
+            "second pass: consensus 1/K0"
+        );
+    }
     Ok(lib)
+}
+
+/// The second pass against the first, after the pooled second-pass rescore (`scored`, whose
+/// `candidate_id`s are the empirical library's): per run, the targets each pass accepted at
+/// `run_psm_q <= lib.q` and the difference, and the accepted decoys relative to the accepted
+/// targets in the entries' anchor runs (where the first pass accepted the entry) and in the
+/// other runs. Nothing is written to the scored table: a second-pass identification is a
+/// search hit, not a transfer.
+pub fn diagnose(lib: &EmpiricalLibrary, scored: &str, n_runs: usize) -> Result<Diagnostics> {
+    let t = TableFile::open(scored)?;
+    let cols = ["candidate_id", "source", "label", "run_psm_q"];
+    let mut second: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let mut d = Diagnostics {
+        q: lib.q,
+        ..Default::default()
+    };
+    for b in t.batches(Some(&cols), BATCH_ROWS)? {
+        let b = b?;
+        let cid = u32_col(&b, "candidate_id", scored)?;
+        let src = u32_col(&b, "source", scored)?;
+        let label = label_col(&b, scored)?;
+        let run_q = f64_col(&b, "run_psm_q", scored)?;
+        for i in 0..b.num_rows() {
+            if !run_q.is_valid(i) || run_q.value(i) > lib.q || !label.is_valid(i) {
+                continue;
+            }
+            let new_id = cid.value(i) as usize;
+            let Some(&entry) = lib.entry_of.get(new_id) else {
+                bail!(
+                    "{scored}: candidate_id {new_id} is not a row of the empirical library \
+                     ({} rows)",
+                    lib.entry_of.len()
+                );
+            };
+            let s = src.value(i);
+            let anchor = lib.first_pass_accepted.contains(&(s, entry));
+            match (label.value(i) == "decoy", anchor) {
+                (false, true) => d.targets_anchor += 1,
+                (false, false) => d.targets_non_anchor += 1,
+                (true, true) => d.decoys_anchor += 1,
+                (true, false) => d.decoys_non_anchor += 1,
+            }
+            if label.value(i) != "decoy" {
+                second.insert((s, entry));
+            }
+        }
+    }
+    let frac = |dec: u64, tar: u64| (tar > 0).then(|| dec as f64 / tar as f64);
+    d.decoy_fraction_anchor = frac(d.decoys_anchor, d.targets_anchor);
+    d.decoy_fraction_non_anchor = frac(d.decoys_non_anchor, d.targets_non_anchor);
+    let is_entry = |c: u32| lib.entry_ids.binary_search(&c).is_ok();
+    for s in 0..n_runs as u32 {
+        let first = lib.first_pass_accepted.range((s, 0)..=(s, u32::MAX));
+        let mut r = RunDiagnostics {
+            source: s,
+            ..Default::default()
+        };
+        for &(_, c) in first {
+            r.first_pass_accepted += 1;
+            if !second.contains(&(s, c)) {
+                if is_entry(c) {
+                    r.dropped_in_library += 1;
+                } else {
+                    r.dropped_outside_library += 1;
+                }
+            }
+        }
+        for &(_, c) in second.range((s, 0)..=(s, u32::MAX)) {
+            r.second_pass_accepted += 1;
+            if !lib.first_pass_accepted.contains(&(s, c)) {
+                r.new += 1;
+            }
+        }
+        info!(
+            source = s,
+            first_pass = r.first_pass_accepted,
+            second_pass = r.second_pass_accepted,
+            new = r.new,
+            dropped_in_library = r.dropped_in_library,
+            dropped_outside_library = r.dropped_outside_library,
+            q = lib.q,
+            "second pass: accepted targets against the first pass (run_psm_q)"
+        );
+        d.runs.push(r);
+    }
+    info!(
+        targets_anchor = d.targets_anchor,
+        decoys_anchor = d.decoys_anchor,
+        decoy_fraction_anchor = ?d.decoy_fraction_anchor,
+        targets_non_anchor = d.targets_non_anchor,
+        decoys_non_anchor = d.decoys_non_anchor,
+        decoy_fraction_non_anchor = ?d.decoy_fraction_non_anchor,
+        "second pass: accepted decoys per accepted target in anchor and non-anchor runs"
+    );
+    Ok(d)
+}
+
+/// Rewrite `empirical_library.json` with `d` as its `diagnostics`.
+pub fn record_diagnostics(lib: &mut EmpiricalLibrary, d: Diagnostics) -> Result<()> {
+    lib.diagnostics = Some(d);
+    mumdia_io::json::write_json(&format!("{}/empirical_library.json", lib.dir), lib)
 }
 
 #[cfg(test)]
@@ -670,6 +1162,7 @@ mod tests {
             scored: &scored,
             lib_precursors: &lp,
             lib_fragments: &lf,
+            psms_extracted: &[],
             out_dir: &out,
             q: 0.01,
         })
@@ -739,10 +1232,9 @@ mod tests {
         )
         .unwrap();
         let irt: BTreeMap<u32, f32> = [(2, 42.0)].into_iter().collect();
-        let (keep, unpaired) = plan_rows(&p, &irt).unwrap();
-        let mut kept: Vec<(u32, f32)> = keep.into_iter().collect();
-        kept.sort_by_key(|k| k.0);
-        assert_eq!(kept, vec![(2, 42.0), (3, 42.0)]);
+        let (rows, unpaired) = plan_rows(&p, &irt).unwrap();
+        let kept: Vec<(u32, u32)> = rows.into_iter().collect();
+        assert_eq!(kept, vec![(2, 2), (3, 2)], "the decoy belongs to entry 2");
         assert_eq!(unpaired, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -769,12 +1261,348 @@ mod tests {
             scored: &scored,
             lib_precursors: &lp,
             lib_fragments: &lf,
+            psms_extracted: &[],
             out_dir: &out,
             q: 0.01,
         })
         .unwrap();
         assert_eq!((lib.entries, lib.targets), (0, 0));
         assert!(!std::path::Path::new(&lib.precursors).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn consensus_im_moves_each_run_by_its_median_offset_onto_the_reference() {
+        let mut obs: Vec<(u32, u32, f64)> = Vec::new();
+        for c in 0..300u32 {
+            obs.push((0, c, 0.8 + 1e-4 * c as f64));
+            obs.push((1, c, 0.8 + 1e-4 * c as f64 + 0.01));
+        }
+        // Run 2 shares too little: it keeps its own scale.
+        for c in 0..50u32 {
+            obs.push((2, c, 0.9));
+        }
+        let ic = consensus_im(&obs, 0);
+        assert_eq!((ic.aligned, ic.unaligned), (2, 1));
+        assert_eq!(ic.offsets.len(), 2, "the reference and run 1");
+        assert_eq!(ic.offsets[&0], 0.0);
+        assert!((ic.offsets[&1] + 0.01).abs() < 1e-12, "{:?}", ic.offsets);
+        let (v, n) = ic.im[&100];
+        assert!((v - 0.81).abs() < 1e-9, "{v}");
+        assert_eq!(n, 2);
+        // Candidate 10: 0.801 twice and 0.9 unaligned: the median is 0.801.
+        let (v, n) = ic.im[&10];
+        assert!((v - 0.801).abs() < 1e-9, "{v}");
+        assert_eq!(n, 3);
+    }
+
+    /// A library of `n` target/decoy pairs (target `2k`, decoy `2k + 1`, one peptidoform and
+    /// one precursor m/z per pair) with a nullable `predicted_im`, two runs' first-pass scored
+    /// rows over every target, and each run's `psms_extracted` with the 1/K0 evidence when
+    /// `with_im` (v4) and without it otherwise (v2). Run 1 elutes 20 s later and 0.01 higher
+    /// in 1/K0 than run 0, and its rows were selected at peak rank 1.
+    fn im_experiment(dir: &str, n: u32, with_im: bool) -> (String, String, String, Vec<String>) {
+        let p = format!("{dir}/prec.parquet");
+        let f = format!("{dir}/frag.parquet");
+        let rows = 2 * n;
+        let pf: Vec<u32> = (0..rows).map(|i| i / 2).collect();
+        write_table(
+            &p,
+            vec![
+                Col::U32("candidate_id".into(), (0..rows).collect()),
+                Col::U32("peptidoform_id".into(), pf.clone()),
+                Col::U32("base_peptide_id".into(), pf.clone()),
+                Col::Str(
+                    "peptidoform".into(),
+                    pf.iter().map(|x| format!("P{x}")).collect(),
+                ),
+                Col::I32("charge".into(), vec![2; rows as usize]),
+                Col::F64(
+                    "precursor_mz".into(),
+                    (0..rows).map(|i| 400.0 + (i / 2) as f64).collect(),
+                ),
+                Col::F32("predicted_irt".into(), vec![-1.0; rows as usize]),
+                Col::OptF64("predicted_im".into(), vec![Some(0.5); rows as usize]),
+                Col::Str(
+                    "label".into(),
+                    (0..rows)
+                        .map(|i| if i % 2 == 0 { "target" } else { "decoy" }.to_string())
+                        .collect(),
+                ),
+                Col::Str("protein".into(), vec!["X".to_string(); rows as usize]),
+            ],
+        )
+        .unwrap();
+        write_table(
+            &f,
+            vec![
+                Col::U32(
+                    "candidate_id".into(),
+                    (0..rows).flat_map(|c| [c, c]).collect(),
+                ),
+                Col::F32(
+                    "frag_mz".into(),
+                    (0..2 * rows).map(|i| 100.0 + i as f32).collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        // Scored rows: every target in both runs; target 0 is confident in no run (its
+        // winner is run 1's row), so it takes the winner's 1/K0.
+        let scored = format!("{dir}/scored.parquet");
+        let (mut cid, mut src, mut rq, mut pq, mut rt, mut rank) =
+            (vec![], vec![], vec![], vec![], vec![], vec![]);
+        for s in 0..2u32 {
+            for k in 0..n {
+                cid.push(2 * k);
+                src.push(s);
+                rq.push(if k == 0 { 0.5 } else { 0.001 });
+                pq.push(if k == 0 && s == 0 { 1.0 } else { 0.001 });
+                rt.push(10.0 * k as f64 + 20.0 * s as f64);
+                rank.push(s as i32);
+            }
+        }
+        let m = cid.len();
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), cid),
+                Col::U32("source".into(), src),
+                Col::Str("label".into(), vec!["target".to_string(); m]),
+                Col::F64("run_psm_q".into(), rq),
+                Col::F64("precursor_q".into(), pq),
+                Col::F64("apex_rt".into(), rt),
+                Col::I32("selected_peak_rank".into(), rank),
+            ],
+        )
+        .unwrap();
+        // Each run's extracted rows: rank 0 and rank 1 of every target, the selected rank
+        // carrying the run's 1/K0 and the other an unrelated value.
+        let mut psms = Vec::new();
+        for s in 0..2u32 {
+            let path = format!("{dir}/psms_{s}.parquet");
+            let (mut c, mut r, mut im) = (vec![], vec![], vec![]);
+            for k in 0..n {
+                for rk in 0..2i32 {
+                    c.push(2 * k);
+                    r.push(rk);
+                    let v = if rk == s as i32 {
+                        0.8 + 1e-4 * k as f64 + 0.01 * s as f64
+                    } else {
+                        1.4
+                    };
+                    im.push(with_im.then_some(v));
+                }
+            }
+            let rows = c.len();
+            let mut cols = vec![
+                Col::U32("candidate_id".into(), c),
+                Col::I32("peak_rank".into(), r),
+                Col::OptF64("apex_im".into(), im),
+            ];
+            if with_im {
+                cols.push(Col::OptF64("ms1_apex_im".into(), vec![None; rows]));
+            }
+            write_table(&path, cols).unwrap();
+            psms.push(path);
+        }
+        (p, f, scored, psms)
+    }
+
+    /// The consensus 1/K0 of the empirical library, and the pair rule it rests on: within
+    /// every pair `plan_rows` formed, the target and its decoy carry the same precursor m/z,
+    /// `predicted_irt` and `predicted_im`.
+    #[test]
+    fn the_empirical_library_carries_a_consensus_im_shared_within_every_pair() {
+        let dir = tmp("im");
+        let n = 250u32;
+        let (lp, lf, scored, psms) = im_experiment(&dir, n, true);
+        let out = format!("{dir}/emp");
+        let lib = build_library(&BuildParams {
+            scored: &scored,
+            lib_precursors: &lp,
+            lib_fragments: &lf,
+            psms_extracted: &psms,
+            out_dir: &out,
+            q: 0.01,
+        })
+        .unwrap();
+        assert_eq!(
+            (lib.entries, lib.targets, lib.decoys),
+            (n as u64, n as u64, n as u64)
+        );
+        let im = lib.im.as_ref().expect("a consensus 1/K0");
+        assert_eq!(im.reference_source, Some(0));
+        assert_eq!((im.runs_aligned, im.runs_unaligned), (2, 0));
+        assert!((im.offsets[&1] + 0.01).abs() < 1e-9, "{:?}", im.offsets);
+        assert_eq!(
+            (
+                im.entries_from_runs,
+                im.entries_from_winner,
+                im.entries_without_im
+            ),
+            (n as u64 - 1, 1, 0)
+        );
+        let t = TableFile::open(&lib.precursors).unwrap();
+        let (cid, mz) = (
+            t.u32("candidate_id").unwrap(),
+            t.f64("precursor_mz").unwrap(),
+        );
+        let (irt, pim) = (
+            t.f32("predicted_irt").unwrap(),
+            t.opt_f64("predicted_im").unwrap(),
+        );
+        let label = t.str("label").unwrap();
+        assert_eq!(cid, (0..2 * n).collect::<Vec<_>>());
+        for k in 0..n as usize {
+            let (a, b) = (2 * k, 2 * k + 1);
+            assert_eq!((label[a].as_str(), label[b].as_str()), ("target", "decoy"));
+            assert_eq!(mz[a].to_bits(), mz[b].to_bits(), "pair {k}: precursor_mz");
+            assert_eq!(
+                irt[a].to_bits(),
+                irt[b].to_bits(),
+                "pair {k}: predicted_irt"
+            );
+            assert_eq!(
+                pim[a].map(f64::to_bits),
+                pim[b].map(f64::to_bits),
+                "pair {k}: predicted_im"
+            );
+        }
+        // The selected rank's 1/K0, put on the reference's scale, not the other rank's.
+        assert!((pim[2 * 100].unwrap() - (0.8 + 1e-4 * 100.0)).abs() < 1e-9);
+        // Target 0 was confident in no run: its winner (run 1, rank 1) gives the raw value.
+        assert!((pim[0].unwrap() - 0.81).abs() < 1e-12, "{:?}", pim[0]);
+        let json: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{out}/empirical_library.json")).unwrap();
+        assert_eq!(json["im"]["offsets"]["0"], 0.0);
+        assert!(json.get("diagnostics").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Without the 1/K0 evidence (a 3D experiment) the library keeps its `predicted_im`, and
+    /// the empirical library's summary and tables are those of a build that never looked for
+    /// one.
+    #[test]
+    fn a_3d_experiment_gets_no_consensus_im_and_the_same_library() {
+        let dir = tmp("im3d");
+        let (lp, lf, scored, psms) = im_experiment(&dir, 250, false);
+        let build = |tag: &str, psms: &[String]| {
+            let out = format!("{dir}/{tag}");
+            let lib = build_library(&BuildParams {
+                scored: &scored,
+                lib_precursors: &lp,
+                lib_fragments: &lf,
+                psms_extracted: psms,
+                out_dir: &out,
+                q: 0.01,
+            })
+            .unwrap();
+            let bytes = |p: &str| std::fs::read(p).unwrap();
+            (
+                lib,
+                bytes(&format!("{out}/lib_precursors.parquet")),
+                bytes(&format!("{out}/lib_fragments.parquet")),
+                std::fs::read_to_string(format!("{out}/empirical_library.json")).unwrap(),
+            )
+        };
+        let (lib, p1, f1, j1) = build("with", &psms);
+        let (_, p2, f2, j2) = build("without", &[]);
+        assert!(lib.im.is_none());
+        assert_eq!((p1, f1), (p2, f2));
+        // The summaries differ only in their directory.
+        assert_eq!(j1.replace("/with/", "/without/"), j2);
+        assert!(!j1.contains("\"im\""));
+        let t = TableFile::open(&lib.precursors).unwrap();
+        assert!(t
+            .opt_f64("predicted_im")
+            .unwrap()
+            .iter()
+            .all(|v| *v == Some(0.5)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The second pass against the first: per run the new and dropped targets, and the
+    /// accepted decoys per accepted target in the entries' anchor runs and in the others.
+    #[test]
+    fn the_diagnostics_compare_each_run_with_the_first_pass() {
+        let dir = tmp("diag");
+        let (lp, lf, scored, psms) = im_experiment(&dir, 250, true);
+        let out = format!("{dir}/emp");
+        let mut lib = build_library(&BuildParams {
+            scored: &scored,
+            lib_precursors: &lp,
+            lib_fragments: &lf,
+            psms_extracted: &psms,
+            out_dir: &out,
+            q: 0.01,
+        })
+        .unwrap();
+        // First pass: run 0 and run 1 accepted targets 2..500 (entry 0 in neither).
+        // Second pass, run 0: targets of entries 1..=9 (new ids 2, 4, .., 18) and the decoy
+        // of entry 1 (new id 3), all in anchor runs; entry 0's target (new id 0) and decoy
+        // (new id 1), both in a non-anchor run, and one row above the cut.
+        let rows: Vec<(u32, u32, &str, f64)> = (1..10u32)
+            .map(|k| (2 * k, 0, "target", 0.001))
+            .chain([
+                (3, 0, "decoy", 0.002),
+                (0, 0, "target", 0.003),
+                (1, 0, "decoy", 0.004),
+                (20, 0, "target", 0.5),
+            ])
+            .collect();
+        let s2 = format!("{dir}/scored2.parquet");
+        write_table(
+            &s2,
+            vec![
+                Col::U32("candidate_id".into(), rows.iter().map(|r| r.0).collect()),
+                Col::U32("source".into(), rows.iter().map(|r| r.1).collect()),
+                Col::Str(
+                    "label".into(),
+                    rows.iter().map(|r| r.2.to_string()).collect(),
+                ),
+                Col::F64("run_psm_q".into(), rows.iter().map(|r| r.3).collect()),
+            ],
+        )
+        .unwrap();
+        let d = diagnose(&lib, &s2, 2).unwrap();
+        assert_eq!((d.targets_anchor, d.decoys_anchor), (9, 1));
+        assert_eq!((d.targets_non_anchor, d.decoys_non_anchor), (1, 1));
+        assert!((d.decoy_fraction_anchor.unwrap() - 1.0 / 9.0).abs() < 1e-12);
+        assert_eq!(d.decoy_fraction_non_anchor, Some(1.0));
+        let r0 = &d.runs[0];
+        assert_eq!(
+            (
+                r0.first_pass_accepted,
+                r0.second_pass_accepted,
+                r0.new,
+                r0.dropped_in_library
+            ),
+            (249, 10, 1, 240)
+        );
+        assert_eq!(r0.dropped_outside_library, 0);
+        assert_eq!(
+            (d.runs[1].second_pass_accepted, d.runs[1].dropped_in_library),
+            (0, 249)
+        );
+        record_diagnostics(&mut lib, d).unwrap();
+        let json: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{out}/empirical_library.json")).unwrap();
+        assert_eq!(json["diagnostics"]["targets_anchor"], 9);
+        assert_eq!(json["diagnostics"]["runs"][0]["new"], 1);
+        // An id outside the library is an error, not a silent miss.
+        let bad = format!("{dir}/scored_bad.parquet");
+        write_table(
+            &bad,
+            vec![
+                Col::U32("candidate_id".into(), vec![10_000]),
+                Col::U32("source".into(), vec![0]),
+                Col::Str("label".into(), vec!["target".into()]),
+                Col::F64("run_psm_q".into(), vec![0.001]),
+            ],
+        )
+        .unwrap();
+        assert!(diagnose(&lib, &bad, 2).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

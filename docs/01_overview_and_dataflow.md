@@ -665,6 +665,6 @@ not part of the `run` chain and needs >=2 runs.
 - Stubs and unwired areas to be aware of: `mbr` has a wired standalone command
   (`mumdia mbr` -> `mbr_worker.py`) but is a partial sidecar (not the full
   experiment-wide flow) and is not in the `run` chain (needs >=2 runs); `align` is
-  likewise standalone-only (needs >=2 runs); ion mobility / 4D is a data-model
-  stub only (IM columns are always null in 3D); vendor readers other than mzML do
-  not exist. Do not document these as complete.
+  likewise standalone-only (needs >=2 runs); ion mobility / 4D (diaPASEF) is
+  partial and lands in steps (docs/35_diapasef.md says which layers are in the
+  tree; IM columns are null on 3D runs). Do not document these as complete.

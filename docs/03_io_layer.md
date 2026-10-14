@@ -136,7 +136,8 @@ limit of a 32-bit `ListArray` offset buffer (for example per-fragment
 chromatograms when extraction accepts a very large candidate set). The `Opt*`
 variants exist to back conditional and ion-mobility columns under the
 missing-value policy (`table.rs:5-6`; see `docs/18_findings_and_decisions.md`);
-ion-mobility columns are written null throughout the 3D MVP.
+ion-mobility columns are written null on 3D runs, or not written at all where an artifact has
+a 1/K0 variant (docs/35_diapasef.md).
 
 `Col` has four private helpers used by the writer (all non-`pub`):
 - `name()` (`table.rs:45`): the column name, via a match over every variant.
@@ -296,6 +297,27 @@ writer (`a_saturated_pool_sends_the_next_caller_to_its_own_thread`,
 `concurrent_writers_beyond_the_pool_size_write_the_serial_writers_file`). The
 timings below are for one writer at a time; a banded run with
 `groups.parallel >= 8` has not been timed against the serial codec.
+
+Row groups in flight (`TableWriter::with_row_groups_in_flight`,
+`WriteOptions::row_groups_in_flight`). A writer with a few large columns gains
+little from encoding the columns of one row group concurrently, so its one writer
+thread can bound the stage. With row groups in flight the encoder instead holds each
+full row group and submits it as one job to the codec pool while the next one fills,
+then appends the finished groups in order. Every column writer still receives the leaf
+slices the serial writer gives it, so the file is the same bytes
+(`the_parallel_encoder_writes_the_serial_writers_bytes` at 2 and 16 groups in flight,
+and `row_groups_in_flight_write_the_serial_writers_table` for the chromatogram writer
+in both layouts, with and without the 1/K0 list). The number in flight is bounded by
+the codec pool: never more than it has threads, none without a pool (`--threads 1`,
+`MUMDIA_PARQUET_THREADS` 0 or 1) or without a row-group cap, and a writer inside a
+rayon pool encodes each group on its own thread
+(`row_groups_in_flight_are_bounded_by_the_codec_pool`). A held group's rows stay
+resident until it is encoded, tens of MB per chromatogram group. Only the 4D
+chromatogram writer uses it (`chromatograms::ROW_GROUPS_IN_FLIGHT`, 16;
+docs/09_extract.md section 6). The IM branch measured 4:37 to 1:23 for a HYE
+diaPASEF extract on its forced v1 table, with a thread per row group outside the
+pool; the v2 gain is unmeasured, and enabling it for 3D tables waits for wall-time and
+RSS measurements on an Astral, an Orbitrap and a banded run.
 
 Measured on the AIF artifacts re-chunked to 65,536-row batches under the shipped
 properties (`bench_parallel_encode_a_real_artifact`, median of 3 rounds, every

@@ -72,20 +72,37 @@ pub const MIN_LOESS_CALIBRANTS: usize = 50;
 /// Panics on an empty slice; every caller goes through [`MassCal::fit_from`], which
 /// guards on [`MIN_CALIBRANTS`].
 pub fn fit(devs: &[f64]) -> (f64, f64) {
-    fit_floored(devs, DEFAULT_TOL_FLOOR_PPM)
+    fit_floored(devs, DEFAULT_TOL_FLOOR_PPM, 0.0)
 }
 
 /// The tolerance floor `fit` applies, and the default of `search_seed.frag_tol_floor_ppm`.
 pub const DEFAULT_TOL_FLOOR_PPM: f64 = 5.0;
 
-/// [`fit`] with the tolerance floored at `floor` ppm instead of 5.
-pub fn fit_floored(devs: &[f64], floor: f64) -> (f64, f64) {
+/// The robust sigma of a normal sample per unit of its median absolute deviation.
+const MAD_TO_SIGMA: f64 = 1.4826;
+
+/// The systematic offset of the deviations: the upper median, `sorted[n / 2]`.
+fn median_offset(devs: &[f64]) -> f64 {
     let mut sorted = devs.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
-    let offset = sorted[sorted.len() / 2];
+    sorted[sorted.len() / 2]
+}
+
+/// The one fragment tolerance estimator: median offset and a tolerance floored at `floor`
+/// ppm (`search_seed.frag_tol_floor_ppm`). The tolerance is `1.5 * p95(|dev - median|)`
+/// when `mad_k` is 0, which is bit-identical to the estimator before `mad_k` existed, and
+/// `mad_k * 1.4826 * MAD` otherwise (`search_seed.frag_tol_mad_k`), MAD being the median of
+/// `|dev - median|`: the robust sigma of the deviations, which a shoulder of random matches
+/// that sets the p95 does not move.
+pub fn fit_floored(devs: &[f64], floor: f64, mad_k: f64) -> (f64, f64) {
+    let offset = median_offset(devs);
     let centered: Vec<f64> = devs.iter().map(|x| (x - offset).abs()).collect();
-    let tol = (crate::calibrate::percentile(&centered, 0.95) * 1.5).max(floor);
-    (offset, tol)
+    let width = if mad_k > 0.0 {
+        crate::calibrate::percentile(&centered, 0.5) * MAD_TO_SIGMA * mad_k
+    } else {
+        crate::calibrate::percentile(&centered, 0.95) * 1.5
+    };
+    (offset, width.max(floor))
 }
 
 /// One fragment mass calibration: what `<seed>.masscal.json` carries and what `extract`
@@ -114,14 +131,18 @@ impl MassCal {
     /// `cfg.fragment_tol_ppm` is what a run with too few calibrants keeps.
     ///
     /// `cfg.two_pass_mass_cal` re-fits on the deviations inside the first-pass window, so
-    /// random-match outliers cannot bias the offset. `cfg.mass_cal_loess` additionally
+    /// random-match outliers cannot bias the offset. Under `cfg.frag_tol_mad_k` the second
+    /// pass refits the offset only and keeps the first-pass width: a MAD re-estimated on
+    /// deviations truncated at that width is narrower than the spread they were cut from,
+    /// so it would tighten the tolerance on every pass for no reason in the data. `cfg.mass_cal_loess` additionally
     /// samples a LOESS of deviation against fragment m/z on a fixed 25-Th grid, which
     /// `extract` interpolates per peak. Both read the deviations, so both work wherever
     /// the deviations are, which is the point of the calibrant sidecar.
     pub fn fit_from(devs: &[f64], dev_mz: &[f64], cfg: &SearchSeedConfig) -> MassCal {
         debug_assert_eq!(devs.len(), dev_mz.len());
         let (frag_ppm_offset, frag_tol_ppm, cal_passes) = if devs.len() >= MIN_CALIBRANTS {
-            let (o1, t1) = fit_floored(devs, cfg.frag_tol_floor_ppm);
+            let mad_k = cfg.frag_tol_mad_k;
+            let (o1, t1) = fit_floored(devs, cfg.frag_tol_floor_ppm, mad_k);
             if cfg.two_pass_mass_cal {
                 // Second pass: keep only deviations inside the first-pass window, so
                 // random-match outliers cannot bias the offset, then re-fit.
@@ -130,8 +151,10 @@ impl MassCal {
                     .cloned()
                     .filter(|d| (d - o1).abs() <= t1)
                     .collect();
-                if inl.len() >= MIN_CALIBRANTS {
-                    let (o2, t2) = fit_floored(&inl, cfg.frag_tol_floor_ppm);
+                if inl.len() >= MIN_CALIBRANTS && mad_k > 0.0 {
+                    (median_offset(&inl), t1, 2)
+                } else if inl.len() >= MIN_CALIBRANTS {
+                    let (o2, t2) = fit_floored(&inl, cfg.frag_tol_floor_ppm, 0.0);
                     (o2, t2, 2)
                 } else {
                     (o1, t1, 1)
@@ -215,6 +238,93 @@ pub fn json_path(seed_out: &str) -> String {
     format!("{seed_out}.masscal.json")
 }
 
+/// The per-peak mass-offset correction a reader applies to an observed peak m/z before
+/// library matching, as `masscal.json` gives it. Either a single scalar ppm offset (`grid_*`
+/// empty, the default) or an m/z-dependent grid (sorted ascending) that is linearly
+/// interpolated and clamped at the ends. `factor_at(mz)` returns the divisor
+/// `1 + ppm(mz) * 1e-6`. Extract matches with it and retrace sums raw events with it, both
+/// through [`read_mass_cal`], so the raw traces sit on exactly the calibration the centroid
+/// traces were matched with.
+pub(crate) struct MassOffset {
+    pub(crate) scalar_ppm: f64,
+    pub(crate) grid_mz: Vec<f64>,
+    pub(crate) grid_ppm: Vec<f64>,
+}
+
+impl MassOffset {
+    #[inline]
+    pub(crate) fn factor_at(&self, mz: f64) -> f64 {
+        let ppm = if self.grid_mz.len() >= 2 {
+            match self.grid_mz.binary_search_by(|g| g.total_cmp(&mz)) {
+                Ok(i) => self.grid_ppm[i],
+                Err(0) => self.grid_ppm[0],
+                Err(i) if i >= self.grid_mz.len() => self.grid_ppm[self.grid_mz.len() - 1],
+                Err(i) => {
+                    let (x0, x1) = (self.grid_mz[i - 1], self.grid_mz[i]);
+                    let (y0, y1) = (self.grid_ppm[i - 1], self.grid_ppm[i]);
+                    y0 + (y1 - y0) * (mz - x0) / (x1 - x0)
+                }
+            }
+        } else {
+            self.scalar_ppm
+        };
+        1.0 + ppm * 1e-6
+    }
+
+    /// Points of the m/z grid in use (0: the scalar offset).
+    pub(crate) fn grid_len(&self) -> usize {
+        self.grid_mz.len()
+    }
+}
+
+/// `path` when it is given and exists: the mass calibration [`read_mass_cal`] reads from a
+/// file rather than its fallback.
+pub(crate) fn existing(path: Option<&str>) -> Option<&str> {
+    path.filter(|m| std::path::Path::new(m).exists())
+}
+
+/// The one reader of a search-seed `masscal.json`: `(mass offset, fragment tolerance ppm)`,
+/// or no offset and `fallback_tol_ppm` when no file is given or it does not exist. The m/z
+/// grid is used only when both arrays agree in length and have at least two points. No
+/// logging here; extract reports the calibration once its spectra are in, where it always
+/// did.
+pub(crate) fn read_mass_cal(
+    path: Option<&str>,
+    fallback_tol_ppm: f64,
+) -> Result<(MassOffset, f64)> {
+    let Some(path) = existing(path) else {
+        return Ok((
+            MassOffset {
+                scalar_ppm: 0.0,
+                grid_mz: Vec::new(),
+                grid_ppm: Vec::new(),
+            },
+            fallback_tol_ppm,
+        ));
+    };
+    let v: serde_json::Value = mumdia_io::json::read_json(path)?;
+    let num = |key: &str| v.get(key).and_then(|x| x.as_f64());
+    let grid = |key: &str| -> Vec<f64> {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|e| e.as_f64()).collect())
+            .unwrap_or_default()
+    };
+    let (mut grid_mz, mut grid_ppm) = (grid("mz_cal_grid_mz"), grid("mz_cal_grid_ppm"));
+    if !(grid_mz.len() >= 2 && grid_mz.len() == grid_ppm.len()) {
+        grid_mz.clear();
+        grid_ppm.clear();
+    }
+    Ok((
+        MassOffset {
+            scalar_ppm: num("frag_ppm_offset").unwrap_or(0.0),
+            grid_mz,
+            grid_ppm,
+        },
+        num("frag_tol_ppm").unwrap_or(fallback_tol_ppm),
+    ))
+}
+
 /// `<seed>.masscal.parquet`, the calibrant deviation sidecar beside the masscal.
 ///
 /// Absent from an ungrouped run, which fits on the deviations it still holds in memory,
@@ -291,6 +401,41 @@ pub fn read_calibrants(path: &str) -> Result<Calibrants> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one reader: no file is the fallback tolerance and no offset; a file gives its
+    /// offset and tolerance, and its m/z grid only when both arrays agree and hold two
+    /// points or more.
+    #[test]
+    fn read_mass_cal_reads_the_file_or_falls_back() {
+        let (off, tol) = read_mass_cal(None, 20.0).unwrap();
+        assert_eq!((off.scalar_ppm, off.grid_len(), tol), (0.0, 0, 20.0));
+        let (_, tol) = read_mass_cal(Some("/definitely/not/a/masscal.json"), 15.0).unwrap();
+        assert_eq!(tol, 15.0);
+        let dir = std::env::temp_dir().join(format!("mumdia_masscal_read_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, v: serde_json::Value| -> String {
+            let p = dir.join(name).to_str().unwrap().to_string();
+            std::fs::write(&p, v.to_string()).unwrap();
+            p
+        };
+        let good = write(
+            "good.json",
+            json!({"frag_ppm_offset": -1.5, "frag_tol_ppm": 8.0,
+                   "mz_cal_grid_mz": [200.0, 600.0], "mz_cal_grid_ppm": [-1.0, -2.0]}),
+        );
+        let (off, tol) = read_mass_cal(Some(&good), 20.0).unwrap();
+        assert_eq!((off.scalar_ppm, tol, off.grid_len()), (-1.5, 8.0, 2));
+        assert!((off.factor_at(400.0) - (1.0 - 1.5e-6)).abs() < 1e-15);
+        let ragged = write(
+            "ragged.json",
+            json!({"frag_ppm_offset": 2.0, "mz_cal_grid_mz": [200.0, 600.0],
+                   "mz_cal_grid_ppm": [1.0]}),
+        );
+        let (off, tol) = read_mass_cal(Some(&ragged), 20.0).unwrap();
+        assert_eq!((off.grid_len(), tol), (0, 20.0));
+        assert_eq!(off.factor_at(400.0), 1.0 + 2.0 * 1e-6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// The single-pass fit these tests are written against; the default is two passes
     /// since 2026-10-11, and the tests that need it set it themselves.
@@ -394,6 +539,73 @@ mod tests {
             two.to_json()["frag_ppm_sigma"],
             two.to_json()["frag_tol_ppm"]
         );
+    }
+
+    #[test]
+    fn the_mad_estimator_ignores_a_shoulder_that_sets_the_p95() {
+        // A narrow core (|dev| <= 2) plus a 10% shoulder at 12-16 ppm: the shoulder is the
+        // p95, so the default tolerance is ~1.5 x 15; the MAD estimator follows the core.
+        let mut devs: Vec<f64> = (0..900).map(|i| ((i % 9) as f64 - 4.0) * 0.5).collect();
+        devs.extend((0..100).map(|i| -12.0 - (i % 5) as f64));
+        let mz = vec![500.0; devs.len()];
+        let p95 = MassCal::fit_from(&devs, &mz, &cfg());
+        let mut c = cfg();
+        c.frag_tol_mad_k = 4.0;
+        let mad = MassCal::fit_from(&devs, &mz, &c);
+        assert!(
+            p95.frag_tol_ppm > 15.0,
+            "p95 tolerance {}",
+            p95.frag_tol_ppm
+        );
+        assert!(
+            (5.0..10.0).contains(&mad.frag_tol_ppm),
+            "MAD tolerance {}",
+            mad.frag_tol_ppm
+        );
+        assert_eq!(mad.frag_ppm_offset, p95.frag_ppm_offset);
+        // The floor is the configured one, not a literal 5.
+        c.frag_tol_floor_ppm = 9.5;
+        assert_eq!(MassCal::fit_from(&devs, &mz, &c).frag_tol_ppm, 9.5);
+        // `mad_k = 0` is the p95 estimator, bit for bit.
+        assert_eq!(fit_floored(&devs, 5.0, 0.0), fit(&devs));
+    }
+
+    /// Under `two_pass_mass_cal` the MAD estimator's second pass moves the offset only: the
+    /// width stays the first pass's, where re-estimating the MAD on the inliers truncated at
+    /// that width would narrow it.
+    #[test]
+    fn the_mad_second_pass_refits_the_offset_and_keeps_the_width() {
+        // A core centred on +1 ppm with a long one-sided tail of random matches.
+        let mut devs: Vec<f64> = (0..600)
+            .map(|i| 1.0 + ((i % 13) as f64 - 6.0) * 0.4)
+            .collect();
+        devs.extend((0..150).map(|i| -9.0 - (i % 30) as f64 * 0.5));
+        let mz = vec![500.0; devs.len()];
+        let mut c = cfg();
+        c.frag_tol_mad_k = 3.0;
+        c.frag_tol_floor_ppm = 1.0;
+        let single = MassCal::fit_from(&devs, &mz, &c);
+        c.two_pass_mass_cal = true;
+        let two = MassCal::fit_from(&devs, &mz, &c);
+        assert_eq!(single.cal_passes, 1);
+        assert_eq!(two.cal_passes, 2);
+        assert_eq!(
+            two.frag_tol_ppm.to_bits(),
+            single.frag_tol_ppm.to_bits(),
+            "the width is the first pass's"
+        );
+        // The offset moved to the inliers' median, towards the core.
+        let (o1, t1) = fit_floored(&devs, 1.0, 3.0);
+        let inl: Vec<f64> = devs
+            .iter()
+            .copied()
+            .filter(|d| (d - o1).abs() <= t1)
+            .collect();
+        assert_eq!(two.frag_ppm_offset, median_offset(&inl));
+        assert!((two.frag_ppm_offset - 1.0).abs() < (o1 - 1.0).abs());
+        // Re-estimating the MAD on those inliers would have narrowed the width.
+        let (_, t_inl) = fit_floored(&inl, 1.0, 3.0);
+        assert!(t_inl < t1, "{t_inl} against {t1}");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Core data-model types (docs/02_config_and_data_model.md). Ion mobility is `Option` /
-//! nullable on the per-SCAN types, so the same model serves 3D and 4D runs; MVP is 3D so
-//! IM is always `None`. It is deliberately absent from [`Peak`]: see that type.
+//! nullable on the per-SCAN types, so the same model serves 3D and 4D runs: a diaPASEF
+//! window carries its 1/K0 bounds, a 3D window none. It is deliberately absent from
+//! [`Peak`]: see that type.
 
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +47,28 @@ impl IsolationWindow {
     pub fn covers(&self, mz: f64) -> bool {
         mz >= self.lower_mz && mz <= self.upper_mz
     }
+
+    /// Exact identity of a window for grouping scans: the bits of its (m/z, 1/K0) bounds.
+    /// diaPASEF slots can share an m/z range and differ only in mobility, so a key on the
+    /// m/z pair alone would merge scans of different slots into one chromatogram cadence.
+    /// The m/z bounds come first, so an ordered map over keys stays ascending in m/z (all
+    /// bounds are non-negative, and the IEEE bits of non-negative values order like the
+    /// values); an absent 1/K0 bound sorts last. A 3D window has no 1/K0 bounds, so its key
+    /// orders exactly as the m/z pair did.
+    #[inline]
+    pub fn key(&self) -> WindowKey {
+        let im = |v: Option<f32>| v.map_or(u32::MAX, f32::to_bits);
+        (
+            self.lower_mz.to_bits(),
+            self.upper_mz.to_bits(),
+            im(self.im_lower),
+            im(self.im_upper),
+        )
+    }
 }
+
+/// See [`IsolationWindow::key`].
+pub type WindowKey = (u64, u64, u32, u32);
 
 /// Whether a record is a target or a decoy, and which strategy made it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +103,10 @@ pub struct Ms2Scan {
     pub window: IsolationWindow,
     /// m/z sorted peaks.
     pub peaks: Vec<Peak>,
+    /// Per-peak 1/K0 (V s cm^-2), parallel to `peaks`, for spectra that carry ion mobility
+    /// (spectra v2, the native diaPASEF reader). `None` on 3D spectra, where nothing is
+    /// decoded or allocated for it.
+    pub im: Option<Vec<f32>>,
 }
 
 #[cfg(test)]
@@ -94,9 +120,9 @@ mod tests {
     /// and an `Option<f32>` costs a full word because an `f32` has no niche -- which is how
     /// the dead `ion_mobility` came to be a third of the struct.
     ///
-    /// This pins the layout the load path and the ~22 read sites were sized for. If a 4D
-    /// run needs ion mobility, give the SCAN a `Vec<f32>` parallel to `peaks` and leave
-    /// this at 8.
+    /// This pins the layout the load path and the ~22 read sites were sized for. A 4D run's
+    /// ion mobility is on the SCAN (`Ms2Scan::im`, a `Vec<f32>` parallel to `peaks`), so
+    /// this stays at 8.
     #[test]
     fn peak_is_two_f32_and_nothing_else() {
         assert_eq!(size_of::<Peak>(), 8, "Peak must stay two f32 wide");
@@ -104,6 +130,27 @@ mod tests {
         // Why the `Option` was 8 and not 4, recorded so the next person does not have to
         // rediscover it before deciding what a field costs.
         assert_eq!(size_of::<Option<f32>>(), 8);
+    }
+
+    /// Slots that share an m/z range but differ in 1/K0 have different keys; a 3D window's
+    /// key orders as its m/z pair, and a window with 1/K0 bounds sorts before one without.
+    #[test]
+    fn window_key_separates_mobility_slots_and_orders_by_mz_first() {
+        let w = |lo: f64, hi: f64, im: Option<(f32, f32)>| IsolationWindow {
+            target_mz: (lo + hi) / 2.0,
+            lower_mz: lo,
+            upper_mz: hi,
+            im_lower: im.map(|v| v.0),
+            im_upper: im.map(|v| v.1),
+        };
+        let a = w(500.0, 525.0, Some((0.6, 0.8)));
+        let b = w(500.0, 525.0, Some((0.8, 1.0)));
+        assert_ne!(a.key(), b.key());
+        assert!(a.key() < b.key());
+        assert!(w(400.0, 425.0, None).key() < a.key());
+        assert!(w(500.0, 520.0, None).key() < a.key());
+        assert!(a.key() < w(500.0, 525.0, None).key());
+        assert_eq!(w(400.0, 425.0, None).key(), w(400.0, 425.0, None).key());
     }
 
     /// Widening a stored peak m/z to `f64` is exact, so every consumer that says

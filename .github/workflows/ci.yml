@@ -239,8 +239,9 @@ jobs:
           - env_name: deeplc
             env_file: env/docker-deeplc.yml
             import_check: >-
-              import deeplc, numpy, pandas, pyarrow, torch, psm_utils;
-              print('deeplc', deeplc.__version__, '| torch', torch.__version__)
+              import deeplc, im2deep, numpy, pandas, pyarrow, torch, psm_utils;
+              print('deeplc', deeplc.__version__, '| im2deep', im2deep.__version__,
+              '| torch', torch.__version__)
           - env_name: rescore
             env_file: env/docker-rescore.yml
             import_check: >-

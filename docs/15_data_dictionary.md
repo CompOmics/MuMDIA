@@ -50,6 +50,12 @@ their own sections at the end.
 | `mz` | List\<Float32\> | yes | m/z | centroided, m/z-sorted peak m/z values |
 | `intensity` | List\<Float32\> | yes | counts | peak intensities aligned to `mz` |
 
+v2 (written only by the native diaPASEF reader, docs/35_diapasef.md) appends:
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `im` | LargeList\<Float32\> | yes | V s cm^-2 | per-peak intensity-weighted 1/K0, aligned to `mz` |
+
 ### spectra_ms2 (`convert.rs:198-213`)
 
 | column | Arrow type | nullable | units | meaning |
@@ -57,7 +63,7 @@ their own sections at the end.
 | `scan_index` | UInt32 | no | - | monotonic scan index (shared axis with MS1) |
 | `id` | Utf8 | no | - | vendor spectrum id string |
 | `rt_seconds` | Float64 | no | s | scan start time |
-| `window_id` | UInt32 | no | - | dense id of the distinct isolation window (`(lower,upper)` bits), matches `isolation_windows.window_id` |
+| `window_id` | UInt32 | no | - | dense id of the distinct isolation window (`IsolationWindow::key`: the m/z bound bits, and on v2 the 1/K0 bound bits), matches `isolation_windows.window_id` |
 | `window_target` | Float64 | no | m/z | isolation-window target m/z (0.0 for AIF/all-ion) |
 | `window_lower` | Float64 | no | m/z | isolation-window lower bound (0.0 for AIF full-range fallback) |
 | `window_upper` | Float64 | no | m/z | isolation-window upper bound (1.0e6 for AIF full-range fallback) |
@@ -65,6 +71,15 @@ their own sections at the end.
 | `precursor_charge` | Int32 | yes | - | precursor charge, null when absent |
 | `mz` | List\<Float32\> | yes | m/z | centroided fragment m/z values |
 | `intensity` | List\<Float32\> | yes | counts | fragment intensities aligned to `mz` |
+
+v2 (native diaPASEF only) adds `window_im_lower` and `window_im_upper` after
+`precursor_charge`, and `im` after `intensity`:
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `window_im_lower` | Float32 | yes | V s cm^-2 | the slot's lower 1/K0 bound |
+| `window_im_upper` | Float32 | yes | V s cm^-2 | the slot's upper 1/K0 bound |
+| `im` | LargeList\<Float32\> | yes | V s cm^-2 | per-peak intensity-weighted 1/K0, aligned to `mz` |
 
 ### isolation_windows (`convert.rs:215-226`)
 
@@ -76,6 +91,9 @@ The distinct-window column is `window_id` (verified: `convert.rs:218`).
 | `target` | Float64 | no | m/z | window target m/z |
 | `lower` | Float64 | no | m/z | window lower bound |
 | `upper` | Float64 | no | m/z | window upper bound |
+
+v2 (native diaPASEF only) adds `im_lower` and `im_upper` (Float32, nullable, V s cm^-2):
+one row per diaPASEF slot. Provenance only; no stage reads them.
 
 ### ms2_to_ms1 (`convert.rs:228-234`)
 
@@ -124,6 +142,10 @@ The distinct-window column is `window_id` (verified: `convert.rs:218`).
 
 ### fragment_library precursors (`predict_frag.rs:197-211`)
 
+Schema `fragment_library_precursors` version 1, or version 2 when the library has an
+ion-mobility source (`artifact::fragment_library_precursors(has_im)`). Version 2 is version
+1 plus `predicted_im`; the column is never written always-null.
+
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
 | `candidate_id` | UInt32 | no | - | contiguous id, sorted by ascending `precursor_mz` (the fragment-index build key) |
@@ -136,6 +158,7 @@ The distinct-window column is `window_id` (verified: `convert.rs:218`).
 | `label` | Utf8 | no | - | `target` or `decoy` |
 | `protein` | Utf8 | no | - | protein accessions |
 | `n_fragments` | Int32 | no | - | number of fragments kept for this candidate after top-N |
+| `predicted_im` | Float64 | yes | V s cm^-2 (1/K0) | version 2 only. Library reduced ion mobility: IM2Deep's single-conformer CCS converted at `precursor_mz` (predict-frag under `predict_frag.im_predictor`; never null there, a miss is dropped with its pair), or the imported library's `IM` / `IonMobility` (null where the source value is missing, non-finite or not positive). A script-built decoy carries its target's value, null included |
 
 ### fragment_library fragments (`predict_frag.rs:212-223`)
 
@@ -171,6 +194,14 @@ The distinct-window column is `window_id` (verified: `convert.rs:218`).
 | `predicted_irt` | Float32 | no | iRT units | library predicted iRT (carried) |
 | `matched_peaks` | Int32 | no | - | matched fragment count at the best scan |
 | `scan_index` | UInt32 | no | - | `scan_index` of the best-scoring MS2 scan |
+| `observed_im` | Float64 | yes | 1/K0 (V s cm^-2) | v2 only: the intensity-weighted median 1/K0 of the matched fragment peaks of a confident target (`q <= fdr_seed`) in its best scan, each peak being the calibrant's nearest peak within `fragment_tol_ppm`; null for every other row |
+
+Version 1 has the thirteen columns above `observed_im`. Version 2 (`artifact::seed_psms(true)`)
+adds `observed_im` and is written only when the searched spectra carry per-peak 1/K0 (spectra
+v2, the native diaPASEF reader); its report then also carries the stat `with_observed_im`, the
+number of rows with a value. A 3D seed is version 1, byte for byte. Every manifest site records
+the version read from the table's footer (`search_seed::seed_schema`). The report's `params`
+gain `count_fragments_once: true` only when that key is on.
 
 ### `<seed>.masscal.json` (`search_seed.rs:217-227`)
 
@@ -216,9 +247,15 @@ so `deeplc_finetune.py` reads it as it reads `seed_psms`. One row per candidate,
 | `rt_pred_cal` | Float64 | no | s | predicted iRT calibrated to this run's observed RT |
 | `rt_lo` | Float64 | no | s | lower RT window bound (`rt_pred_cal - width`) |
 | `rt_hi` | Float64 | no | s | upper RT window bound (`rt_pred_cal + width`) |
-| `im_pred_cal` | Float64 | yes | 1/K0 | calibrated ion mobility; always null in the 3D MVP |
-| `im_lo` | Float64 | yes | 1/K0 | IM window lower bound; always null |
-| `im_hi` | Float64 | yes | 1/K0 | IM window upper bound; always null |
+| `im_pred_cal` | Float64 | yes | 1/K0 | the library `predicted_im` through this run's ion-mobility calibration (docs/08, "Ion-mobility calibration"); null on a 3D run, without a calibration, and for a row without a finite, positive `predicted_im` |
+| `im_lo` | Float64 | yes | 1/K0 | `im_pred_cal - w_im`; null where `im_pred_cal` is |
+| `im_hi` | Float64 | yes | 1/K0 | `im_pred_cal + w_im`; null where `im_pred_cal` is |
+
+The table stays version 1 on every run: the three IM columns were always part of it. They are
+filled only when the seed carries `observed_im` and the library `predicted_im`. Extract reads
+them through its one `run_windows` reader (`extract::read_run_windows`) for the 1/K0 gate and
+for `psms_extracted`'s `im_pred_cal` (docs/09 section 8). A NaN `im_lo` or `im_hi` is refused
+with the row named, as a NaN RT bound is.
 
 ### `<run_windows>` cal.json (`rt_im_train.rs:290-302`)
 
@@ -234,6 +271,29 @@ RT-calibration sidecar (written to `out_cal`, not part of the Parquet contract).
 | `multiplier` | number | RT window multiplier |
 | `n_train` | integer | number of confident anchors used |
 | `calibration_status` | string | `loess`, `linear`, or `fallback_fixed` |
+| `n_rt_outliers_removed` | integer | only under `rt_im_train.anchor_x_filter` and only when above 0: the anchors outside `[Q1 - 3 IQR, Q3 + 3 IQR]` of their predicted iRT, dropped before every fit; `n_train` counts the rest |
+
+On a run whose seed carries `observed_im` (spectra with 1/K0), and only there, `cal.json` also
+holds the ion-mobility block below, and the `run_windows` report's stats gain `im_n_train` and
+`w_im`. A 3D `cal.json` has none of these keys.
+
+| field | JSON type | meaning |
+|---|---|---|
+| `im_method` | string | `per_charge_linear_ccs`, or `unavailable` (the library has no `predicted_im`, or too few anchors) |
+| `im_n_train` | integer or null | ion-mobility anchors: confident targets at the anchor cut with a finite, positive observed and predicted 1/K0, one per candidate |
+| `im_global` | object or null | `{a, b}` of the global fit `obs_ccs = a + b * pred_ccs` |
+| `im_per_charge` | object or null | per charge with at least `im_min_anchors_per_charge` anchors: `{a, b, n}`; other charges use `im_global` |
+| `w_im` | number or null | IM half-window (1/K0) |
+| `w_im_sizing` | string or null | `holdout`, or `holdout_fallback_in_sample` when one side of the split had too few anchors |
+| `p_im` | number | residual percentile that sizes `w_im` |
+| `im_window_multiplier` | number | multiplier on that percentile |
+| `im_window_min` | number | lower clamp of `w_im` |
+| `im_holdout_frac` | number | fraction of anchor base peptides held out (the constant 0.3) |
+| `im_window_floor` | object | second pass of match-between-runs only, on a run whose first pass had a finite `w_im`: `{floor, configured, first_pass_w_im, source}`, the `im_window_min` applied (the larger of the configured value and the first pass's `w_im`) and the first-pass `cal.json` it came from |
+| `im_n_holdout` | integer or null | held-out anchors |
+| `im_holdout_resid_abs_median` | number or null | median held-out absolute residual (1/K0) |
+| `im_holdout_resid_p_im` | number or null | held-out residual at `p_im`, before the multiplier |
+| `im_in_sample_resid_abs_median` | number or null | median in-sample absolute residual (a fit diagnostic, not an error estimate) |
 
 ---
 
@@ -247,7 +307,7 @@ One row per accepted candidate (the selected apex PSM).
 |---|---|---|---|---|
 | `candidate_id` | UInt32 | no | - | library candidate id |
 | `apex_rt` | Float64 | no | s | selected apex retention time |
-| `apex_im` | Float64 | yes | 1/K0 | apex ion mobility; always null in the 3D MVP |
+| `apex_im` | Float64 | yes | 1/K0 (V s cm^-2) | v2: always null. v4: the intensity-weighted median 1/K0 of the candidate's matched fragment peaks in its apex scan (each library fragment's nearest peak within the fragment tolerance, inside the 1/K0 window under `extract.im_gate`); null where the apex scan has none |
 | `apex_intensity` | Float32 | no | counts | summed observed intensity of all matched fragments at the apex scan |
 | `n_matched_fragments` | Int32 | no | - | count of distinct matched predicted fragments |
 | `n_predicted_fragments` | Int32 | no | - | number of predicted fragments in the library |
@@ -265,6 +325,37 @@ One row per accepted candidate (the selected apex PSM).
 | `ms1_mono` | Float64 | yes | counts | MS1 monoisotopic intensity near the apex; null when no MS1 |
 | `ms1_iso1` | Float64 | yes | counts | MS1 +1 isotope intensity; null when no MS1 |
 | `ms1_iso2` | Float64 | yes | counts | MS1 +2 isotope intensity; null when no MS1 |
+
+Version 2 (`artifact::PSMS_EXTRACTED`) is the table above, written by every run whose
+spectra carry no 1/K0. Version 4 (`artifact::psms_extracted(true)`) is written only when the
+extracted spectra carry per-peak 1/K0 (spectra v2, the native diaPASEF reader): `apex_im` is
+filled and three columns follow it, before `apex_intensity`. The number and the meaning are
+the IM branch's v4; its v3 (`apex_im` filled alone) and v5 (1/K0 peak-shape columns) are never
+written. Readers select columns by name; `extract::psms_schema` reads the version from the
+footer. Every row, the selected apex and every promoted alternative, carries the values of its
+own apex.
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `apex_im_mad` | Float64 | yes | 1/K0 | v4 only: the same fragment peaks' intensity-weighted mean absolute deviation from `apex_im` (not a median absolute deviation) |
+| `ms1_apex_im` | Float64 | yes | 1/K0 | v4 only: in the MS1 scan nearest the apex, the 1/K0 of the peak within `extract.prec_tol_ppm` of the offset-corrected precursor m/z that lies nearest `apex_im` (the most intense in-tolerance peak without an `apex_im`); not gated; null without MS1 or without such a peak |
+| `im_pred_cal` | Float64 | yes | 1/K0 | v4 only: the candidate's `run_windows.im_pred_cal`; null without an ion-mobility calibration |
+
+**Retrace patch** (`retrace.enabled`, docs/09 section 9). On a diaPASEF run whose
+chromatograms retrace rebuilt from the raw events, `psms_extracted` is patched once, in
+place, and keeps version 4: per rank-0 row, `apex_rt` and `apex_im` under `retrace.repick`
+(the re-picked apex and its band centre); `apex_intensity` and `n_matched_fragments` read
+from the rebuilt fragment traces at the apex; `ms1_mono`, `ms1_iso1` and `ms1_iso2` read
+from the rebuilt MS1 traces at the apex, null only where extract had none and the raw trace
+is 0 there. `ms1_isom1`, `apex_im_mad` and `ms1_apex_im` keep extract's values. A row whose
+candidate has no rebuilt rows keeps all of extract's values. The table's report records
+the patch under `params.retrace` (`patched_columns` and the row counts). One optional
+column, read by name and written only under `retrace.apex_features` (as `rt_lo`/`rt_hi`
+are only under `extract.emit_rt_window`):
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `imc_ref_w` | Float64 | no | correlation | retrace's apex 1/K0 agreement: over the rebuilt fragment rows with signal, the predicted-intensity-weighted mean leave-one-out reference correlation of each fragment's raw 1/K0 profile (`apex_im +/- 0.04`, 40 bins, MS2 frames within 1.5 s of the apex); 0.0 with no such fragment or no rebuilt rows |
 
 Conditional columns, appended only when `extract.emit_contested_features`
 (`extract.rs:1498-1501`):
@@ -305,8 +396,17 @@ grid are available.
 `rt`/`intensity` use `LargeList` (64-bit offsets) because the total list-value
 count can exceed the 32-bit `ListArray` offset ceiling on large candidate sets.
 
+Each trace covers the candidate's RT window `[rt_lo, rt_hi]`, with one exception: the second
+pass of match-between-runs on a run with ion mobility records the traces `params.trace_pad_s`
+seconds further on each side (the extract report of both tables, carried by retrace), so a
+fixed integration window and its baseline flanks fit around an apex near the window's edge
+(docs/12, "Second pass"). The schema is unchanged. The features stage reads the parameter and
+cuts every trace back to the row's window (`psms_extracted` `rt_lo`, `rt_hi`) before computing
+anything; quantification reads the whole trace.
+
 The table above is schema version 1, the default before 2026-09-27. Version 2, the
-default since, is the layout below.
+default since, is the layout below. Versions 3 and 4 add the per-point 1/K0 of a 4D run to
+versions 1 and 2 ("1/K0 lists", below).
 
 #### Layout v2 (`extract.chromatogram_schema = 2`)
 
@@ -368,6 +468,38 @@ the AIF run and 3.2% and 0.3% smaller on the other two, so the axis column (`rt`
 `rt_axis`) stays PLAIN in both layouts. These sizes were measured with the v2 lists
 still named `rt` and `intensity`; the rename changes two names in the footer and no
 page.
+
+#### 1/K0 lists (versions 3 and 4)
+
+On spectra that carry per-peak 1/K0, and only while a consumer of the list is on (the
+ion-mobility feature family, `features.im_features`, or retrace, `retrace.enabled`), each
+row also carries its per-point 1/K0. Version 3 is version 1 plus `im`, version 4 is version 2 plus `im_trimmed`
+(`artifact::chromatograms(schema, has_im)`), so `extract.chromatogram_schema = 1` keeps
+working on 4D data. Otherwise the table is version 1 or 2, byte for byte.
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `im` | LargeList\<Float32\> | yes | 1/K0 | v3: one value per `intensity` value: the 1/K0 of the peak the trace holds at that point, `+0.0` where the trace is `+0.0`; empty for a never-observed transition; `+0.0` at every point of an MS1 row |
+| `im_trimmed` | LargeList\<Float32\> | yes | 1/K0 | v4: `im` cut to the run `intensity_trimmed` keeps (the same `trace_offset`, the same length); the decoder rebuilds the full list with `+0.0` margins |
+
+The values have a resolution of 1e-4 V s cm^-2 (the extracted hit stores them as a u16). The
+list adds about 38% to the table. `mumdia::chromatograms::recorded_schema` reads a table's
+version from its columns, `rewrite` carries the list between layouts, and the pool refuses
+bands whose columns differ. The extract report of a 4D run carries `params.reader =
+"timsrust"` and `params.im_gate` (the gate it applied) in both tables' reports, so a stage
+that reads only these artifacts resolves the TIMS predicate from them.
+
+#### Rebuilt by retrace
+
+Under `retrace.enabled` extract writes its table to `chromatograms.centroid.parquet`, and
+retrace writes `chromatograms.parquet` with the same rows, the same layout and the same
+version: the intensities of the fragment and MS1 rows are sums of raw timsTOF events
+(docs/09 section 9), and a rebuilt fragment point's 1/K0 is the intensity-weighted 1/K0 of
+its events (`+0.0` where they sum to nothing). The centroid table is deleted after
+retrace succeeds. The report (`stage = "retrace"`) carries extract's parameters, the reader,
+and retrace's own under `params.retrace`; its `stats` carry the rebuilt and copied row
+counts, the frames decoded, the raw events summed and the median MS1 mass residual
+(`ms1_mass_residual_ppm_median`).
 
 ### `<psms>.peaks.parquet`, top-K peak retention (`extract.rs:1532-1543`)
 
@@ -780,6 +912,20 @@ Written only when `out_fragment` is set (ion-level directLFQ input).
 | `fragment_name` | Utf8 | no | - | fragment name |
 | `quantity` | Float64 | no | intensity x s | per-fragment trapezoid area over the peak window |
 
+Schema v1 holds only these columns and only the positive finite areas. Under the cross-run
+export (`quant --export-cross-run`, or the first pass of the cross-run step of
+`run-experiment`; docs/12_quant_lfq_align_mbr_report_audit.md, "Cross-run fragment selection
+and background") the table is v5: the zero-area fragments are kept, with `quantity` 0, and
+these columns follow. The number is above the IM branch's v2 to v4, whose meanings were not
+documented. Every value is NaN for a candidate integrated without a fixed window.
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `apex_corr` | Float64 | no | - | population Pearson correlation of the fragment's fixed-window samples (after the per-run baseline, before the envelope) with the sum of the candidate's other fragments; 0 for a flat window |
+| `flank_mean` | Float64 | no | counts | mean of the `baseline_flank_scans` raw samples either side of the fixed window; NaN without a flank sample |
+| `flank_mean_h3` .. `flank_mean_h7` | Float64 | no | counts | the same mean beyond a window of +/-3 to +/-7 scans around the apex |
+| `peak_hwhm` | Float64 | no | scans | the candidate's half width at half maximum in this run: of its summed fragment trace within +/-7 scans of the apex, each fragment less its `flank_mean`; one value per candidate, repeated on its rows |
+
 ### peak-bounds diagnostic (optional, `quant.rs:421-429`)
 
 Written only when `out_peak_bounds` is set and `bound_peak` is on.
@@ -836,14 +982,40 @@ The default `mbr.strategy = second_pass` adds these to an experiment directory
 | path | content |
 |---|---|
 | `first_pass/scored_combined.parquet` | the pooled first pass, `psms_scored` schema |
-| `second_pass/library/lib_precursors.parquet` | `fragment_library_precursors`: the first library's rows of every experiment-wide accepted target and its paired decoy, ids contiguous from 0, `predicted_irt` = cross-run consensus (s, reference run's scale) |
+| `second_pass/library/lib_precursors.parquet` | `fragment_library_precursors`: the first library's rows of every experiment-wide accepted target and its paired decoy, ids contiguous from 0, `predicted_irt` = cross-run consensus (s, reference run's scale); on an experiment with ion mobility and a library with `predicted_im`, `predicted_im` = cross-run consensus apex 1/K0 (reference run's scale), the decoy taking its target's value in both columns |
 | `second_pass/library/lib_fragments.parquet` | `fragment_library_fragments` of those rows, ids remapped |
 | `second_pass/library/entries.parquet` | `candidate_id` (u32) of the first library's rows kept |
-| `second_pass/library/empirical_library.json` | counts and alignment summary (`entries`, `targets`, `decoys`, `reference_source`, `runs_aligned`, `runs_unaligned`, `entries_from_winner`, `entries_without_decoy`, `median_observations`, `q`) |
+| `second_pass/library/empirical_library.json` | counts and alignment summary (`entries`, `targets`, `decoys`, `reference_source`, `runs_aligned`, `runs_unaligned`, `entries_from_winner`, `entries_without_decoy`, `median_observations`, `q`); `im` and `diagnostics` below, each only on an experiment with ion mobility |
 | `second_pass/<run>/` | the run's seed, windows, calibration, extraction, features and competed table on the empirical library |
 
 The root `scored_combined.parquet` is then the second pass's, its `candidate_id` in the
 empirical library's numbering.
+
+`empirical_library.json`, `im` (present when some run's first-pass `psms_extracted` carries an
+apex 1/K0):
+
+| field | JSON type | meaning |
+|---|---|---|
+| `reference_source` | integer or null | the run every run's 1/K0 was moved onto: the retention-time reference |
+| `runs_aligned` | integer | runs moved by their median offset, the reference included |
+| `runs_unaligned` | integer | runs with apex 1/K0 values sharing fewer than 200 precursors with the reference; they keep their own scale |
+| `offsets` | object | per `source`, the median of (reference - run) apex 1/K0 over the shared precursors; 0 for the reference |
+| `entries_from_runs` | integer | entries whose 1/K0 is the median over their confident runs |
+| `entries_from_winner` | integer | entries with no confident run carrying a 1/K0, which take their winning row's |
+| `entries_without_im` | integer | entries with no finite 1/K0, which keep the library's `predicted_im` |
+
+`empirical_library.json`, `diagnostics` (written after the pooled second-pass rescore; logged on
+every experiment, written on one with ion mobility). Rows are scored target or decoy rows at
+`run_psm_q <= q`; a decoy belongs to the entry it is paired with, and an entry's anchor runs are
+the runs where the first pass accepted it:
+
+| field | JSON type | meaning |
+|---|---|---|
+| `q` | number | `mbr.q_anchor` |
+| `runs` | array | per run: `source`, `first_pass_accepted` and `second_pass_accepted` (targets), `new` (accepted by the second pass only), `dropped_in_library` (accepted by the first pass only, among the entries), `dropped_outside_library` (accepted by the first pass in this run but not experiment-wide, so never searched again) |
+| `targets_anchor`, `decoys_anchor` | integer | accepted second-pass targets and decoys in their entry's anchor runs |
+| `targets_non_anchor`, `decoys_non_anchor` | integer | the same in the other runs |
+| `decoy_fraction_anchor`, `decoy_fraction_non_anchor` | number or null | decoys over targets of each group; null without targets |
 
 ## `audit` (`stages/audit.rs`)
 
@@ -1013,7 +1185,11 @@ contract files, not engine artifacts.
 `mumdia-core/src/schema.rs` freezes the `(logical name, version)` pairs. As of
 `schema.rs:7-25`: `psms_scored` and `psms_competed` are v4, and `features`,
 `psms_extracted`, `peptide_quant` and `protein_group_quant` v2; every other
-registered artifact is v1. Each artifact stamps its version into its own `report.json`
+registered artifact is v1. Artifacts with a 1/K0 variant take their version from a selector
+(`artifact::X(has_im)`) and record v1 or main's version on every 3D run: `spectra_ms1`,
+`spectra_ms2`, `isolation_windows`, `seed_psms` and, with an ion-mobility source,
+`fragment_library_precursors` are v2 on 4D data, `psms_extracted` v4 and `chromatograms` v3
+or v4 (docs/35_diapasef.md). Each artifact stamps its version into its own `report.json`
 (`mumdia-io/src/report.rs:14`) and into `manifest.json`
 (`mumdia-core/src/manifest.rs:15`), so an artifact on disk states its own version
 rather than inheriting the engine's.

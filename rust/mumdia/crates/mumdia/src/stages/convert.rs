@@ -1,7 +1,14 @@
-//! Stage 0 `mumdia convert`: read an mzML run into the normalized spectra
-//! artifact set (docs/04_convert.md). MVP is mzML-only and 3D, so ion-mobility
-//! columns are absent. Profile spectra are centroided (simple local-maxima)
-//! so downstream matching sees discrete peaks.
+//! Stage 0 `mumdia convert`: read an mzML run, or a timsTOF diaPASEF `.d` natively
+//! (`tdf`), into the normalized spectra artifact set (docs/04_convert.md). mzML input is
+//! 3D and writes the v1 artifacts, without ion-mobility columns. A diaPASEF `.d` writes the
+//! v2 artifacts, which add the per-peak 1/K0 and the window 1/K0 bounds (docs/35_diapasef.md).
+//! Profile mzML spectra are centroided (simple local-maxima) so downstream matching sees
+//! discrete peaks.
+
+mod tdf;
+pub(crate) mod tims_frames;
+pub(crate) use tdf::RawTdf;
+pub use tdf::TdfParams;
 
 use std::io::SeekFrom;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,6 +16,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use mumdia_core::schema::artifact;
+use mumdia_core::types::{IsolationWindow, WindowKey};
 use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{write_table_hashed, Col, TableWriter};
 use mzdata::io::mzml::MzMLReaderType;
@@ -96,33 +104,65 @@ fn peaks_of<S: SpectrumLike>(spec: &S, top_n: usize) -> (Vec<f32>, Vec<f32>, usi
     // peak in one spectrum is not a reason to refuse a whole run; the caller reports the
     // count so the loss is visible rather than silent.
     let n_before = mz.len();
-    let mut pairs: Vec<(f64, f32)> = mz
+    let pairs: Vec<(f64, f32)> = mz
         .into_iter()
         .zip(inten)
         .filter(|(m, i)| *i > 0.0 && m.is_finite() && i.is_finite())
         .collect();
     let dropped_nonfinite = n_before.saturating_sub(pairs.len());
-    if top_n > 0 && pairs.len() > top_n {
-        // `total_cmp` rather than `partial_cmp(..).unwrap()`. Every value here is finite
-        // by the filter above, so the two agree; `total_cmp` is a genuine total order, so
-        // it cannot panic and cannot trip the "comparison function does not correctly
-        // implement a total order" check that `sort_by` has had since Rust 1.81.
-        pairs.sort_by(|a, b| b.1.total_cmp(&a.1));
-        pairs.truncate(top_n);
-    }
-    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let pairs = cap_by_mz(pairs, top_n);
     let out_mz: Vec<f32> = pairs.iter().map(|(m, _)| *m as f32).collect();
     let out_in: Vec<f32> = pairs.iter().map(|(_, i)| *i).collect();
     (out_mz, out_in, dropped_nonfinite)
 }
 
+/// The mzML peak cap: the `top_n` most intense of finite `(m/z, intensity)` pairs (0 = all),
+/// sorted by m/z.
+fn cap_by_mz(mut pairs: Vec<(f64, f32)>, top_n: usize) -> Vec<(f64, f32)> {
+    if top_n > 0 && pairs.len() > top_n {
+        // The kept peaks stay in the selection's order (intensity descending, the lower
+        // index on ties) until the stable m/z sort below, so peaks of equal m/z keep the
+        // order the cap left them in.
+        let inten: Vec<f32> = pairs.iter().map(|p| p.1).collect();
+        pairs = top_n_by_intensity(&inten, top_n)
+            .into_iter()
+            .map(|k| pairs[k])
+            .collect();
+    }
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    pairs
+}
+
+/// The indices of the `top` most intense peaks, most intense first, the lower index first
+/// among equal intensities. The one selection step of both peak caps
+/// (`--top-peaks-ms1/ms2`): the mzML path re-sorts the kept peaks by m/z, the native
+/// timsTOF path returns them to index order.
+///
+/// `total_cmp` rather than `partial_cmp(..).unwrap()`: the mzML path filters non-finite
+/// values first, so the two agree there, and `total_cmp` is a genuine total order, so it
+/// cannot panic and cannot trip the "comparison function does not correctly implement a
+/// total order" check that `sort_by` has had since Rust 1.81. The sort is stable, which is
+/// what puts the lower index first on ties.
+fn top_n_by_intensity(inten: &[f32], top: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..inten.len()).collect();
+    idx.sort_by(|&a, &b| inten[b].total_cmp(&inten[a]));
+    idx.truncate(top);
+    idx
+}
+
 pub struct ConvertParams<'a> {
+    /// The spectra input: an mzML, or a diaPASEF `.d` that `raw::detect` classifies as
+    /// `Vendor::BrukerTdf` (read natively). Every other vendor file is converted to mzML
+    /// by `raw::ensure_mzml` before this stage.
     pub mzml: &'a str,
     pub out_dir: &'a str,
+    /// mzML: the first N spectra. Native diaPASEF: the first N frames.
     pub max_spectra: usize,
     pub top_peaks_ms2: usize,
     pub top_peaks_ms1: usize,
     pub config_hash: &'a str,
+    /// Native diaPASEF reading (`convert.tdf_*`); unused for mzML input.
+    pub tdf: TdfParams,
 }
 
 /// Result paths for chaining.
@@ -134,30 +174,39 @@ pub struct ConvertOutputs {
     /// The content hash each artifact's `<artifact>.report.json` records, so an
     /// orchestrator can record the four artifacts without reading and hashing them again.
     pub hashes: ConvertHashes,
+    /// The (name, version) each artifact was written with, so an orchestrator records the
+    /// version actually written (v2 spectra for a source with ion mobility).
+    pub schemas: ConvertSchemas,
 }
 
 impl ConvertOutputs {
-    /// The outputs an earlier [`run`] wrote into `out_dir`, with the content hashes their
-    /// reports recorded. For a later pass over the same spectra (the second pass of
-    /// match-between-runs), which must not convert the run again.
+    /// The outputs an earlier [`run`] wrote into `out_dir`, with the content hashes and
+    /// schema versions their reports recorded. For a later pass over the same spectra (the
+    /// second pass of match-between-runs), which must not convert the run again.
     pub fn existing(out_dir: &str) -> Result<ConvertOutputs> {
         let path = |name: &str| format!("{out_dir}/{name}");
-        let hash = |p: &str| -> Result<String> {
-            let r: ArtifactReport = mumdia_io::json::read_json(&format!("{p}.report.json"))
-                .with_context(|| format!("reading the conversion report of {p}"))?;
-            Ok(r.content_hash)
+        let report = |p: &str| -> Result<ArtifactReport> {
+            mumdia_io::json::read_json(&format!("{p}.report.json"))
+                .with_context(|| format!("reading the conversion report of {p}"))
         };
         let (ms1, ms2) = (path("spectra_ms1.parquet"), path("spectra_ms2.parquet"));
         let (iw, map) = (
             path("isolation_windows.parquet"),
             path("ms2_to_ms1.parquet"),
         );
+        let (r1, r2, riw, rmap) = (report(&ms1)?, report(&ms2)?, report(&iw)?, report(&map)?);
         Ok(ConvertOutputs {
+            schemas: ConvertSchemas {
+                ms1: (artifact::SPECTRA_MS1.0, r1.schema_version),
+                ms2: (artifact::SPECTRA_MS2.0, r2.schema_version),
+                isolation_windows: (artifact::ISOLATION_WINDOWS.0, riw.schema_version),
+                ms2_to_ms1: (artifact::MS2_TO_MS1.0, rmap.schema_version),
+            },
             hashes: ConvertHashes {
-                ms1: hash(&ms1)?,
-                ms2: hash(&ms2)?,
-                isolation_windows: hash(&iw)?,
-                ms2_to_ms1: hash(&map)?,
+                ms1: r1.content_hash,
+                ms2: r2.content_hash,
+                isolation_windows: riw.content_hash,
+                ms2_to_ms1: rmap.content_hash,
             },
             ms1,
             ms2,
@@ -176,6 +225,29 @@ pub struct ConvertHashes {
     pub ms2_to_ms1: String,
 }
 
+/// The (name, version) of each convert artifact, field for field with the paths of
+/// [`ConvertOutputs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConvertSchemas {
+    pub ms1: (&'static str, u32),
+    pub ms2: (&'static str, u32),
+    pub isolation_windows: (&'static str, u32),
+    pub ms2_to_ms1: (&'static str, u32),
+}
+
+impl ConvertSchemas {
+    /// The schemas a conversion writes: the v2 spectra and isolation windows when the
+    /// source carries ion mobility, the v1 artifacts otherwise.
+    pub fn for_source(has_im: bool) -> ConvertSchemas {
+        ConvertSchemas {
+            ms1: artifact::spectra_ms1(has_im),
+            ms2: artifact::spectra_ms2(has_im),
+            isolation_windows: artifact::isolation_windows(has_im),
+            ms2_to_ms1: artifact::MS2_TO_MS1,
+        }
+    }
+}
+
 /// Spectra per flushed chunk and per parquet row group. The peak columns are
 /// `LargeListF32`: a 32-bit arrow list offset saturates above 2^31-1 values, and the
 /// readers accept either width.
@@ -186,27 +258,35 @@ pub struct ConvertHashes {
 const SPECTRA_CHUNK: usize = 2048;
 
 /// Column accumulators for one chunk of MS1 scans. `cols()` drains them into exactly the
-/// column set `spectra_ms1.parquet` has always had.
+/// column set `spectra_ms1.parquet` has always had (v1), plus the per-peak `im` list for a
+/// source with ion mobility (v2).
 #[derive(Default)]
 struct Ms1Chunk {
     idx: Vec<u32>,
     rt: Vec<f64>,
     mz: Vec<Vec<f32>>,
     inten: Vec<Vec<f32>>,
+    im: Vec<Vec<f32>>,
 }
 
 impl Ms1Chunk {
-    fn cols(&mut self) -> Vec<Col> {
-        vec![
+    /// `has_im` is fixed per run, so every row group has the same columns.
+    fn cols(&mut self, has_im: bool) -> Vec<Col> {
+        let mut c = vec![
             Col::U32("scan_index".into(), std::mem::take(&mut self.idx)),
             Col::F64("rt_seconds".into(), std::mem::take(&mut self.rt)),
             Col::LargeListF32("mz".into(), std::mem::take(&mut self.mz)),
             Col::LargeListF32("intensity".into(), std::mem::take(&mut self.inten)),
-        ]
+        ];
+        if has_im {
+            c.push(Col::LargeListF32("im".into(), std::mem::take(&mut self.im)));
+        }
+        c
     }
 }
 
 /// Column accumulators for one chunk of MS2 scans (the `spectra_ms2.parquet` columns).
+/// The 1/K0 columns are filled only for a source with ion mobility (v2).
 #[derive(Default)]
 struct Ms2Chunk {
     idx: Vec<u32>,
@@ -218,13 +298,18 @@ struct Ms2Chunk {
     wu: Vec<f64>,
     pmz: Vec<Option<f64>>,
     pz: Vec<Option<i32>>,
+    im_lo: Vec<Option<f32>>,
+    im_hi: Vec<Option<f32>>,
     mz: Vec<Vec<f32>>,
     inten: Vec<Vec<f32>>,
+    im: Vec<Vec<f32>>,
 }
 
 impl Ms2Chunk {
-    fn cols(&mut self) -> Vec<Col> {
-        vec![
+    /// The v1 columns, and for a source with ion mobility (`has_im`, fixed per run) the
+    /// window 1/K0 bounds and the per-peak `im` list of v2.
+    fn cols(&mut self, has_im: bool) -> Vec<Col> {
+        let mut c = vec![
             Col::U32("scan_index".into(), std::mem::take(&mut self.idx)),
             Col::Str("id".into(), std::mem::take(&mut self.id)),
             Col::F64("rt_seconds".into(), std::mem::take(&mut self.rt)),
@@ -234,9 +319,26 @@ impl Ms2Chunk {
             Col::F64("window_upper".into(), std::mem::take(&mut self.wu)),
             Col::OptF64("precursor_mz".into(), std::mem::take(&mut self.pmz)),
             Col::OptI32("precursor_charge".into(), std::mem::take(&mut self.pz)),
-            Col::LargeListF32("mz".into(), std::mem::take(&mut self.mz)),
-            Col::LargeListF32("intensity".into(), std::mem::take(&mut self.inten)),
-        ]
+        ];
+        if has_im {
+            c.push(Col::OptF32(
+                "window_im_lower".into(),
+                std::mem::take(&mut self.im_lo),
+            ));
+            c.push(Col::OptF32(
+                "window_im_upper".into(),
+                std::mem::take(&mut self.im_hi),
+            ));
+        }
+        c.push(Col::LargeListF32("mz".into(), std::mem::take(&mut self.mz)));
+        c.push(Col::LargeListF32(
+            "intensity".into(),
+            std::mem::take(&mut self.inten),
+        ));
+        if has_im {
+            c.push(Col::LargeListF32("im".into(), std::mem::take(&mut self.im)));
+        }
+        c
     }
 }
 
@@ -286,6 +388,8 @@ enum Decoded {
         rt_s: f64,
         mz: Vec<f32>,
         inten: Vec<f32>,
+        /// Per-peak 1/K0; `None` for a 3D source.
+        im: Option<Vec<f32>>,
         nonfinite_peaks: usize,
     },
     Ms2(Box<Ms2Row>),
@@ -305,6 +409,10 @@ struct Ms2Row {
     wu: f64,
     pmz: Option<f64>,
     pz: Option<i32>,
+    /// Per-peak 1/K0 and the window's 1/K0 bounds; `None` for a 3D source.
+    im: Option<Vec<f32>>,
+    im_lo: Option<f32>,
+    im_hi: Option<f32>,
 }
 
 fn decode_one<S: SpectrumLike>(spec: &S, top_ms1: usize, top_ms2: usize) -> Decoded {
@@ -322,6 +430,7 @@ fn decode_one<S: SpectrumLike>(spec: &S, top_ms1: usize, top_ms2: usize) -> Deco
                 rt_s,
                 mz,
                 inten,
+                im: None,
                 nonfinite_peaks,
             }
         }
@@ -351,6 +460,9 @@ fn decode_one<S: SpectrumLike>(spec: &S, top_ms1: usize, top_ms2: usize) -> Deco
                 wu,
                 pmz,
                 pz,
+                im: None,
+                im_lo: None,
+                im_hi: None,
             }))
         }
         _ => Decoded::Other,
@@ -364,10 +476,15 @@ struct Fold {
     ms2_w: TableWriter,
     ms1: Ms1Chunk,
     ms2: Ms2Chunk,
-    /// Distinct isolation windows (id, target, lower, upper); ids by first
-    /// appearance in scan order.
-    uniq: Vec<(u64, f64, f64, f64)>,
-    seen: std::collections::HashMap<(u64, u64), u32>,
+    /// Whether the source carries ion mobility; fixes the column set of every chunk.
+    has_im: bool,
+    /// Distinct isolation windows; the id of a window is its index, by first appearance in
+    /// scan order.
+    uniq: Vec<IsolationWindow>,
+    /// Window identity ([`IsolationWindow::key`]): the m/z bounds, and for diaPASEF the
+    /// 1/K0 bounds, because slots can share an m/z range. A lookup only: ids come from
+    /// `uniq`, so no ordering depends on the hash.
+    seen: std::collections::HashMap<WindowKey, u32>,
     /// MS2 -> preceding MS1 scan map (two ints per MS2 scan; kept whole).
     map_ms2: Vec<u32>,
     map_ms1: Vec<i32>,
@@ -378,8 +495,9 @@ struct Fold {
 }
 
 impl Fold {
-    fn new(ms1_path: &str, ms2_path: &str) -> Self {
+    fn new(ms1_path: &str, ms2_path: &str, has_im: bool) -> Self {
         Self {
+            has_im,
             // Hashed as they are written, so the reports need no read-back of the spectra
             // (docs/03_io_layer.md, "Hash on write").
             ms1_w: TableWriter::new(ms1_path)
@@ -413,6 +531,7 @@ impl Fold {
                 rt_s,
                 mz,
                 inten,
+                im,
                 nonfinite_peaks,
             } => {
                 self.nonfinite_peaks += nonfinite_peaks;
@@ -420,9 +539,12 @@ impl Fold {
                 self.ms1.rt.push(rt_s);
                 self.ms1.mz.push(mz);
                 self.ms1.inten.push(inten);
+                if self.has_im {
+                    self.ms1.im.push(im.unwrap_or_default());
+                }
                 self.last_ms1_index = Some(scan_index);
                 if self.ms1.idx.len() >= SPECTRA_CHUNK {
-                    self.ms1_w.write_cols(self.ms1.cols())?;
+                    self.ms1_w.write_cols(self.ms1.cols(self.has_im))?;
                 }
             }
             Decoded::Ms2(r) => {
@@ -437,17 +559,32 @@ impl Fold {
                     wu,
                     pmz,
                     pz,
+                    im,
+                    im_lo,
+                    im_hi,
                 } = *r;
                 self.nonfinite_peaks += nonfinite_peaks;
+                // A key on a NaN bound would make every such scan a window of its own.
+                if [im_lo, im_hi].into_iter().flatten().any(|v| !v.is_finite()) {
+                    anyhow::bail!(
+                        "convert: spectrum {id} has a non-finite 1/K0 window bound \
+                         ({im_lo:?} to {im_hi:?}), so its isolation window cannot be \
+                         identified"
+                    );
+                }
+                let window = IsolationWindow {
+                    target_mz: wt,
+                    lower_mz: wl,
+                    upper_mz: wu,
+                    im_lower: im_lo,
+                    im_upper: im_hi,
+                };
                 let uniq = &mut self.uniq;
-                let win_id = *self
-                    .seen
-                    .entry((wl.to_bits(), wu.to_bits()))
-                    .or_insert_with(|| {
-                        let id = uniq.len() as u32;
-                        uniq.push((id as u64, wt, wl, wu));
-                        id
-                    });
+                let win_id = *self.seen.entry(window.key()).or_insert_with(|| {
+                    let id = uniq.len() as u32;
+                    uniq.push(window);
+                    id
+                });
                 self.ms2.idx.push(scan_index);
                 self.ms2.id.push(id);
                 self.ms2.rt.push(rt_s);
@@ -459,11 +596,16 @@ impl Fold {
                 self.ms2.pz.push(pz);
                 self.ms2.mz.push(mz);
                 self.ms2.inten.push(inten);
+                if self.has_im {
+                    self.ms2.im_lo.push(im_lo);
+                    self.ms2.im_hi.push(im_hi);
+                    self.ms2.im.push(im.unwrap_or_default());
+                }
                 self.map_ms2.push(scan_index);
                 self.map_ms1
                     .push(self.last_ms1_index.map(|x| x as i32).unwrap_or(-1));
                 if self.ms2.idx.len() >= SPECTRA_CHUNK {
-                    self.ms2_w.write_cols(self.ms2.cols())?;
+                    self.ms2_w.write_cols(self.ms2.cols(self.has_im))?;
                 }
             }
             Decoded::Other => {}
@@ -800,67 +942,15 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
     run_inner(p, None)
 }
 
-/// `force_threads` exists so a test can run the same input down both decode paths
-/// and diff the artifacts, without an environment variable that every other test
-/// in the process would see.
-fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOutputs> {
-    let t0 = Instant::now();
-    std::fs::create_dir_all(p.out_dir).ok();
-    info!(mzml = p.mzml, "convert: opening mzML");
-    let reader = mzdata::MZReader::open_path(p.mzml).with_context(|| format!("open {}", p.mzml))?;
-    // The number of spectra the file SAYS it has, read from its own header.
-    //
-    // The iteration below yields `Spectrum`, not `Result<Spectrum>`, so a parse error
-    // part-way through a file simply ends the iterator: a truncated download or a
-    // dropped network share produced a complete-looking artifact set covering the first
-    // fraction of the gradient, at exit 0, with no error. mzdata does log the parse
-    // failure, but a log line does not stop the pipeline and is easy to miss in a batch.
-    //
-    // Deliberately NOT `SpectrumSource::len()`: that comes from the index, and in an
-    // indexedmzML the index is at the END of the file, so exactly the truncation this
-    // guard is for makes it read 0. `spectrumList count` is in the header, a few hundred
-    // KiB in at most, so it survives any truncation long enough to be worth checking.
-    let declared = declared_spectrum_count(p.mzml).unwrap_or(0);
-    // The instrument, for the settings chosen per instrument (`extract.apex_count_window
-    // = "auto"`). Recorded in every spectra report; `null` when the header names none.
-    let instrument = crate::instrument::from_mzml(p.mzml);
-    match &instrument {
-        Some(i) => info!(
-            instrument = %i.describe(),
-            astral = i.is_astral(),
-            "convert: instrument from the mzML header"
-        ),
-        None => info!("convert: the mzML header names no instrument model"),
-    }
-
-    let ms1_path = format!("{}/spectra_ms1.parquet", p.out_dir);
-    let ms2_path = format!("{}/spectra_ms2.parquet", p.out_dir);
-    let iw_path = format!("{}/isolation_windows.parquet", p.out_dir);
-    let map_path = format!("{}/ms2_to_ms1.parquet", p.out_dir);
-
-    // Spectra stream to parquet in SPECTRA_CHUNK-scan row groups as they are decoded, so
-    // the run is never resident as a whole: the previous single `write_table` per MS level
-    // held every peak of the run, plus the encoder's copy, before the first byte reached
-    // disk. Rows and their order are unchanged; only the row-group layout differs.
-    //
-    // `Fold` also holds the two drop counters. Peaks dropped for a non-finite m/z or
-    // intensity are counted rather than ignored: a handful is a damaged spectrum, and a
-    // large fraction means the file or the converter that produced it is wrong, which is
-    // worth knowing before the numbers are believed.
-    //
-    // Spectra with a non-finite retention time are dropped and counted the same way.
-    // Retention time was the one externally supplied float this stage did not check, and
-    // it is the value everything downstream keys on. A single `NaN` scan start time in one
-    // scan of an mzML -- reproduced by editing one `scan start time` value in the fixture
-    // -- passed convert without a warning, was written into the spectra artifact, and then
-    // aborted `mumdia run` inside extract with `called `Option::unwrap()` on a `None`
-    // value` at `extract.rs`, naming neither the file, nor the scan, nor the value.
-    // Dropped rather than fatal, for the same reason as a bad peak: one unusable scan is
-    // not a reason to refuse a run, and a spectrum with no retention time cannot be placed
-    // in a chromatogram. The "no MS2 spectra" bail below is the backstop for a file whose
-    // retention times are ALL unusable.
-    let mut fold = Fold::new(&ms1_path, &ms2_path);
-
+/// The mzML decode: parallel from the file's offset index when that is safe, sequential
+/// otherwise. `declared` is the header's spectrum count. Returns the spectra read.
+fn drive_mzml(
+    reader: mzdata::MZReader<std::fs::File>,
+    declared: usize,
+    p: &ConvertParams,
+    force_threads: Option<usize>,
+    fold: &mut Fold,
+) -> Result<usize> {
     // Decode on several threads when the file's own offset index makes it safe.
     //
     // `MZReader::open_path` has ALREADY built or read that index (`new_indexed`), so the
@@ -888,10 +978,10 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         None
     };
     // And the index has to survive a two-spectrum probe before any row is produced.
-    let offsets = offsets.filter(|o| offsets_are_trustworthy(p.mzml, o, &p));
+    let offsets = offsets.filter(|o| offsets_are_trustworthy(p.mzml, o, p));
 
     note_decode_path(offsets.is_some());
-    let read = match offsets {
+    Ok(match offsets {
         Some(offsets) => {
             let n_total = if p.max_spectra > 0 {
                 offsets.len().min(p.max_spectra)
@@ -904,12 +994,112 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
                 "convert: decoding the mzML in parallel from its offset index"
             );
             drop(reader);
-            drive_parallel(p.mzml, &offsets, n_total, threads, &mut fold, &p)?
+            drive_parallel(p.mzml, &offsets, n_total, threads, fold, p)?
         }
         None => {
             debug!(threads, "convert: decoding the mzML sequentially");
-            drive_sequential(reader, &mut fold, &p)?
+            drive_sequential(reader, fold, p)?
         }
+    })
+}
+
+/// `force_threads` exists so a test can run the same input down both decode paths
+/// and diff the artifacts, without an environment variable that every other test
+/// in the process would see.
+fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOutputs> {
+    let t0 = Instant::now();
+    std::fs::create_dir_all(p.out_dir).ok();
+    // A diaPASEF `.d` is read natively and keeps its ion mobility; the routing decision is
+    // the one `raw::ensure_mzml` made when it passed the path through unconverted.
+    let native_tdf = crate::instrument::input_has_im(p.mzml);
+    // `declared` is the spectrum count the source promises, for the truncation check; 0
+    // skips it (the native reader reads the frame table whole, not as a stream).
+    let (mzml_reader, declared, instrument) = if native_tdf {
+        info!(
+            path = p.mzml,
+            "convert: reading the timsTOF diaPASEF .d natively"
+        );
+        let instrument = crate::instrument::from_tdf(p.mzml);
+        match &instrument {
+            Some(i) => info!(
+                instrument = %i.describe(),
+                "convert: instrument from the .d metadata"
+            ),
+            None => info!("convert: the .d metadata names no instrument model"),
+        }
+        (None, 0, instrument)
+    } else {
+        info!(mzml = p.mzml, "convert: opening mzML");
+        let reader =
+            mzdata::MZReader::open_path(p.mzml).with_context(|| format!("open {}", p.mzml))?;
+        // The number of spectra the file SAYS it has, read from its own header.
+        //
+        // The iteration below yields `Spectrum`, not `Result<Spectrum>`, so a parse error
+        // part-way through a file simply ends the iterator: a truncated download or a
+        // dropped network share produced a complete-looking artifact set covering the
+        // first fraction of the gradient, at exit 0, with no error. mzdata does log the
+        // parse failure, but a log line does not stop the pipeline and is easy to miss in a
+        // batch.
+        //
+        // Deliberately NOT `SpectrumSource::len()`: that comes from the index, and in an
+        // indexedmzML the index is at the END of the file, so exactly the truncation this
+        // guard is for makes it read 0. `spectrumList count` is in the header, a few
+        // hundred KiB in at most, so it survives any truncation long enough to be worth
+        // checking.
+        let declared = declared_spectrum_count(p.mzml).unwrap_or(0);
+        // The instrument, for the settings chosen per instrument
+        // (`extract.apex_count_window = "auto"`). Recorded in every spectra report; `null`
+        // when the header names none.
+        let instrument = crate::instrument::from_mzml(p.mzml);
+        match &instrument {
+            Some(i) => info!(
+                instrument = %i.describe(),
+                astral = i.is_astral(),
+                "convert: instrument from the mzML header"
+            ),
+            None => info!("convert: the mzML header names no instrument model"),
+        }
+        (Some(reader), declared, instrument)
+    };
+
+    let ms1_path = format!("{}/spectra_ms1.parquet", p.out_dir);
+    let ms2_path = format!("{}/spectra_ms2.parquet", p.out_dir);
+    let iw_path = format!("{}/isolation_windows.parquet", p.out_dir);
+    let map_path = format!("{}/ms2_to_ms1.parquet", p.out_dir);
+
+    // Spectra stream to parquet in SPECTRA_CHUNK-scan row groups as they are decoded, so
+    // the run is never resident as a whole: the previous single `write_table` per MS level
+    // held every peak of the run, plus the encoder's copy, before the first byte reached
+    // disk. Rows and their order are unchanged; only the row-group layout differs.
+    //
+    // `Fold` also holds the two drop counters. Peaks dropped for a non-finite m/z or
+    // intensity are counted rather than ignored: a handful is a damaged spectrum, and a
+    // large fraction means the file or the converter that produced it is wrong, which is
+    // worth knowing before the numbers are believed.
+    //
+    // Spectra with a non-finite retention time are dropped and counted the same way.
+    // Retention time was the one externally supplied float this stage did not check, and
+    // it is the value everything downstream keys on. A single `NaN` scan start time in one
+    // scan of an mzML -- reproduced by editing one `scan start time` value in the fixture
+    // -- passed convert without a warning, was written into the spectra artifact, and then
+    // aborted `mumdia run` inside extract with `called `Option::unwrap()` on a `None`
+    // value` at `extract.rs`, naming neither the file, nor the scan, nor the value.
+    // Dropped rather than fatal, for the same reason as a bad peak: one unusable scan is
+    // not a reason to refuse a run, and a spectrum with no retention time cannot be placed
+    // in a chromatogram. The "no MS2 spectra" bail below is the backstop for a file whose
+    // retention times are ALL unusable.
+    let mut fold = Fold::new(&ms1_path, &ms2_path, native_tdf);
+
+    let read = match mzml_reader {
+        Some(reader) => drive_mzml(reader, declared, &p, force_threads, &mut fold)?,
+        None => tdf::drive(
+            p.mzml,
+            p.max_spectra,
+            &p.tdf,
+            p.top_peaks_ms1,
+            p.top_peaks_ms2,
+            |i, d| fold.absorb(i, d),
+        )?,
     };
 
     // Final chunks (possibly empty: they fix the schema for a level with no scans). The
@@ -929,8 +1119,8 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         first_bad_rt,
         ..
     } = fold;
-    ms1_w.write_cols(ms1.cols())?;
-    ms2_w.write_cols(ms2.cols())?;
+    ms1_w.write_cols(ms1.cols(native_tdf))?;
+    ms2_w.write_cols(ms2.cols(native_tdf))?;
 
     // A short read means the file ended before the index said it would. `--max-spectra`
     // truncates deliberately, so it is excluded.
@@ -992,18 +1182,24 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     let ms2_written = ms2_w.close_hashed()?;
     let (n_ms1, n_ms2) = (ms1_written.rows, ms2_written.rows);
 
-    let iw_written = write_table_hashed(
-        &iw_path,
-        vec![
-            Col::U32(
-                "window_id".into(),
-                uniq.iter().map(|w| w.0 as u32).collect(),
-            ),
-            Col::F64("target".into(), uniq.iter().map(|w| w.1).collect()),
-            Col::F64("lower".into(), uniq.iter().map(|w| w.2).collect()),
-            Col::F64("upper".into(), uniq.iter().map(|w| w.3).collect()),
-        ],
-    )?;
+    let mut iw_cols = vec![
+        Col::U32("window_id".into(), (0..uniq.len() as u32).collect()),
+        Col::F64("target".into(), uniq.iter().map(|w| w.target_mz).collect()),
+        Col::F64("lower".into(), uniq.iter().map(|w| w.lower_mz).collect()),
+        Col::F64("upper".into(), uniq.iter().map(|w| w.upper_mz).collect()),
+    ];
+    // v2: the slot's 1/K0 bounds. Provenance only; no stage reads them back from here.
+    if native_tdf {
+        iw_cols.push(Col::OptF32(
+            "im_lower".into(),
+            uniq.iter().map(|w| w.im_lower).collect(),
+        ));
+        iw_cols.push(Col::OptF32(
+            "im_upper".into(),
+            uniq.iter().map(|w| w.im_upper).collect(),
+        ));
+    }
+    let iw_written = write_table_hashed(&iw_path, iw_cols)?;
 
     let map_written = write_table_hashed(
         &map_path,
@@ -1015,22 +1211,34 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
 
     let elapsed = t0.elapsed().as_millis();
     let n_iw = iw_written.rows;
+    let schemas = ConvertSchemas::for_source(native_tdf);
+    let mut params = json!({
+        "mzml": p.mzml,
+        "max_spectra": p.max_spectra,
+        "top_peaks_ms2": p.top_peaks_ms2,
+        "top_peaks_ms1": p.top_peaks_ms1,
+        "config_hash": p.config_hash,
+        "instrument": instrument,
+    });
+    // The reader and its centroiding settings, for a native diaPASEF run only: an mzML
+    // report keeps exactly the fields it always had, and an absent `reader` reads as mzML
+    // (`instrument::provenance`).
+    if native_tdf {
+        let obj = params.as_object_mut().expect("params is an object");
+        obj.insert("reader".into(), json!(crate::instrument::READER_TIMSRUST));
+        if let serde_json::Value::Object(tdf) = p.tdf.report_params() {
+            obj.extend(tdf);
+        }
+    }
     let mut hashes = write_reports(
         vec![
-            (&ms1_path, artifact::SPECTRA_MS1, ms1_written),
-            (&ms2_path, artifact::SPECTRA_MS2, ms2_written),
-            (&iw_path, artifact::ISOLATION_WINDOWS, iw_written),
-            (&map_path, artifact::MS2_TO_MS1, map_written),
+            (&ms1_path, schemas.ms1, ms1_written),
+            (&ms2_path, schemas.ms2, ms2_written),
+            (&iw_path, schemas.isolation_windows, iw_written),
+            (&map_path, schemas.ms2_to_ms1, map_written),
         ],
         elapsed,
-        json!({
-            "mzml": p.mzml,
-            "max_spectra": p.max_spectra,
-            "top_peaks_ms2": p.top_peaks_ms2,
-            "top_peaks_ms1": p.top_peaks_ms1,
-            "config_hash": p.config_hash,
-            "instrument": instrument,
-        }),
+        params,
     )?;
 
     info!(
@@ -1056,7 +1264,28 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
             isolation_windows: iw_hash,
             ms2_to_ms1: map_hash,
         },
+        schemas,
     })
+}
+
+/// Peaks per MS2 spectrum, and the MS1 spectrum count, of a timsTOF diaPASEF `.d` after
+/// native centroiding, uncapped: what `convert` would write (`mumdia peak-census`).
+/// `max_frames > 0` reads only the first frames.
+pub fn tdf_peak_counts(
+    path: &str,
+    max_frames: usize,
+    p: &TdfParams,
+) -> Result<(Vec<usize>, usize)> {
+    let (mut ms2, mut ms1) = (Vec::new(), 0usize);
+    tdf::drive(path, max_frames, p, 0, 0, |_, d| {
+        match d {
+            Decoded::Ms1 { .. } => ms1 += 1,
+            Decoded::Ms2(r) => ms2.push(r.mz.len()),
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok((ms2, ms1))
 }
 
 /// Write one report per artifact and return the content hashes they record, in `items`
@@ -1395,6 +1624,7 @@ mod tests {
                     top_peaks_ms2: 0,
                     top_peaks_ms1: 0,
                     config_hash: "test",
+                    tdf: TdfParams::default(),
                 },
                 Some(4),
             )
@@ -1446,6 +1676,7 @@ mod tests {
                     top_peaks_ms2: 0,
                     top_peaks_ms1: 0,
                     config_hash: "bench",
+                    tdf: TdfParams::default(),
                 },
                 Some(threads),
             )
@@ -1500,6 +1731,7 @@ mod tests {
             top_peaks_ms2: 0,
             top_peaks_ms1: 0,
             config_hash: "test",
+            tdf: TdfParams::default(),
         })
         .expect("a zlib-compressed mzML must convert");
 
@@ -1542,6 +1774,7 @@ mod tests {
                     top_peaks_ms2: 0,
                     top_peaks_ms1: 0,
                     config_hash: "test",
+                    tdf: TdfParams::default(),
                 },
                 Some(threads),
             )
@@ -1602,6 +1835,7 @@ mod tests {
                     top_peaks_ms2: 0,
                     top_peaks_ms1: 0,
                     config_hash: "test",
+                    tdf: TdfParams::default(),
                 },
                 Some(threads),
             )
@@ -1644,6 +1878,7 @@ mod tests {
                 top_peaks_ms2: 0,
                 top_peaks_ms1: 0,
                 config_hash: "test",
+                tdf: TdfParams::default(),
             },
             Some(4),
         )
@@ -1679,6 +1914,7 @@ mod tests {
             top_peaks_ms2: 0,
             top_peaks_ms1: 0,
             config_hash: "test",
+            tdf: TdfParams::default(),
         })
         .expect("a whole file with one unusable retention time must convert");
 
@@ -1694,6 +1930,258 @@ mod tests {
     /// path of the same name, and the hash its own report records. A swap between two
     /// fields would put one artifact's hash on another's record; the four files differ,
     /// so any swap fails here.
+    /// An mzML conversion writes exactly the v1 artifacts it always has: v1 recorded in
+    /// every report and in the returned schemas, no 1/K0 column, and no `reader` or
+    /// `tdf_*` field in the report params.
+    #[test]
+    fn an_mzml_conversion_writes_the_v1_artifacts_unchanged() {
+        let d = tmpdir("v1_shape");
+        let mzml_path = d.join("run.mzML");
+        std::fs::write(
+            &mzml_path,
+            mzml(4, &four_spectra(["0.10", "0.11", "0.20", "0.21"])),
+        )
+        .unwrap();
+        let out = run(ConvertParams {
+            mzml: mzml_path.to_str().unwrap(),
+            out_dir: d.to_str().unwrap(),
+            max_spectra: 0,
+            top_peaks_ms2: 0,
+            top_peaks_ms1: 0,
+            config_hash: "test",
+            tdf: TdfParams::default(),
+        })
+        .unwrap();
+        assert_eq!(out.schemas, ConvertSchemas::for_source(false));
+        let cols = |p: &str| mumdia_io::table::column_names(p).unwrap();
+        assert_eq!(
+            cols(&out.ms1),
+            ["scan_index", "rt_seconds", "mz", "intensity"]
+        );
+        assert_eq!(
+            cols(&out.ms2),
+            [
+                "scan_index",
+                "id",
+                "rt_seconds",
+                "window_id",
+                "window_target",
+                "window_lower",
+                "window_upper",
+                "precursor_mz",
+                "precursor_charge",
+                "mz",
+                "intensity"
+            ]
+        );
+        assert_eq!(
+            cols(&out.isolation_windows),
+            ["window_id", "target", "lower", "upper"]
+        );
+        for (path, schema) in [
+            (&out.ms1, artifact::SPECTRA_MS1),
+            (&out.ms2, artifact::SPECTRA_MS2),
+            (&out.isolation_windows, artifact::ISOLATION_WINDOWS),
+            (&out.ms2_to_ms1, artifact::MS2_TO_MS1),
+        ] {
+            let rep: ArtifactReport =
+                mumdia_io::json::read_json(&format!("{path}.report.json")).unwrap();
+            assert_eq!((rep.schema_name.as_str(), rep.schema_version), schema);
+            let params = rep.params.as_object().unwrap();
+            assert!(!params.contains_key("reader"), "{path}");
+            assert!(!params.keys().any(|k| k.starts_with("tdf_")), "{path}");
+        }
+        // A later pass reads the versions back from the reports.
+        let again = ConvertOutputs::existing(d.to_str().unwrap()).unwrap();
+        assert_eq!(again.schemas, out.schemas);
+        let p = crate::instrument::provenance(&out.ms2).unwrap();
+        assert!(!p.has_im());
+        assert_eq!(p.source.as_deref(), mzml_path.to_str());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The previous mzML cap, verbatim: the reference the shared selection must match.
+    fn cap_by_mz_before(mut pairs: Vec<(f64, f32)>, top_n: usize) -> Vec<(f64, f32)> {
+        if top_n > 0 && pairs.len() > top_n {
+            pairs.sort_by(|a, b| b.1.total_cmp(&a.1));
+            pairs.truncate(top_n);
+        }
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        pairs
+    }
+
+    /// The mzML cap through the shared selection step is bit for bit the previous cap,
+    /// including the order of peaks that tie in intensity, in m/z, or in both.
+    #[test]
+    fn the_capped_mzml_peaks_are_byte_identical_to_the_previous_cap() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..500 {
+            let n = (next() % 60) as usize;
+            // Few distinct values, so ties in intensity and in m/z are common.
+            let pairs: Vec<(f64, f32)> = (0..n)
+                .map(|_| {
+                    (
+                        300.0 + (next() % 12) as f64 * 0.25,
+                        1.0 + (next() % 5) as f32,
+                    )
+                })
+                .collect();
+            for top in [0usize, 1, 2, 5, 10, 30, 59, 60, 100] {
+                let a = cap_by_mz(pairs.clone(), top);
+                let b = cap_by_mz_before(pairs.clone(), top);
+                let bits = |v: &[(f64, f32)]| {
+                    v.iter()
+                        .map(|(m, i)| (m.to_bits(), i.to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(&a), bits(&b), "n {n} top {top}");
+            }
+        }
+    }
+
+    /// The same capped conversion, written twice, is the same bytes, and the cap keeps
+    /// the most intense peaks of each spectrum.
+    #[test]
+    fn a_capped_conversion_keeps_the_most_intense_peaks() {
+        let d = tmpdir("capped");
+        let mzml_path = d.join("run.mzML");
+        std::fs::write(&mzml_path, mzml(5 * 4, &synthetic_run(5, 3, 50))).unwrap();
+        let conv = |sub: &str| {
+            let out = d.join(sub);
+            run_inner(
+                ConvertParams {
+                    mzml: mzml_path.to_str().unwrap(),
+                    out_dir: out.to_str().unwrap(),
+                    max_spectra: 0,
+                    top_peaks_ms2: 7,
+                    top_peaks_ms1: 3,
+                    config_hash: "test",
+                    tdf: TdfParams::default(),
+                },
+                Some(1),
+            )
+            .unwrap()
+        };
+        let (a, b) = (conv("a"), conv("b"));
+        assert_eq!(a.hashes.ms2, b.hashes.ms2);
+        assert_eq!(a.hashes.ms1, b.hashes.ms1);
+        let scans = crate::spectra::load_ms2(&a.ms2).unwrap();
+        assert!(scans.iter().all(|s| s.peaks.len() == 7));
+        for s in &scans {
+            assert!(s.peaks.windows(2).all(|w| w[0].mz <= w[1].mz));
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// diaPASEF slots with one m/z range but different 1/K0 ranges are distinct windows,
+    /// and per-peak mobility plus the window bounds are written in the v2 columns, which
+    /// the MS2 loader reads back as the window's 1/K0 bounds.
+    #[test]
+    fn mobility_slots_are_separate_windows_and_round_trip_through_the_artifact() {
+        let d = tmpdir("im_slots");
+        let (m1, m2) = (d.join("ms1.parquet"), d.join("ms2.parquet"));
+        let (m1, m2) = (m1.to_str().unwrap(), m2.to_str().unwrap());
+        let mut fold = Fold::new(m1, m2, true);
+        fold.absorb(
+            0,
+            Decoded::Ms1 {
+                rt_s: 9.0,
+                mz: vec![500.0, 600.0],
+                inten: vec![3.0, 4.0],
+                im: Some(vec![0.9, 1.1]),
+                nonfinite_peaks: 0,
+            },
+        )
+        .unwrap();
+        for (k, (lo, hi)) in [(0.6f32, 0.8f32), (0.8, 1.0)].into_iter().enumerate() {
+            let row = Ms2Row {
+                rt_s: 10.0,
+                id: format!("frame=2 slot={k}"),
+                mz: vec![300.0, 400.0],
+                inten: vec![1.0, 2.0],
+                nonfinite_peaks: 0,
+                wt: 512.5,
+                wl: 500.0,
+                wu: 525.0,
+                pmz: Some(512.5),
+                pz: None,
+                im: Some(vec![lo, hi]),
+                im_lo: Some(lo),
+                im_hi: Some(hi),
+            };
+            fold.absorb(k as u32 + 1, Decoded::Ms2(Box::new(row)))
+                .unwrap();
+        }
+        assert_eq!(
+            fold.uniq.len(),
+            2,
+            "one m/z range at two mobilities is two windows"
+        );
+        let Fold {
+            mut ms1_w,
+            mut ms2_w,
+            mut ms1,
+            mut ms2,
+            ..
+        } = fold;
+        ms1_w.write_cols(ms1.cols(true)).unwrap();
+        ms2_w.write_cols(ms2.cols(true)).unwrap();
+        ms1_w.close().unwrap();
+        ms2_w.close().unwrap();
+        let cols = mumdia_io::table::column_names(m2).unwrap();
+        for c in ["window_im_lower", "window_im_upper", "im"] {
+            assert!(cols.iter().any(|x| x == c), "{c} missing: {cols:?}");
+        }
+        let t = mumdia_io::table::TableFile::open(m1).unwrap();
+        assert_eq!(t.list_f32("im").unwrap(), vec![vec![0.9, 1.1]]);
+        let scans = crate::spectra::load_ms2(m2).unwrap();
+        assert_eq!(scans.len(), 2);
+        assert_eq!(scans[1].window.im_lower, Some(0.8));
+        assert_eq!(scans[1].window.im_upper, Some(1.0));
+        assert_ne!(scans[0].window.key(), scans[1].window.key());
+        // The MS1 loader ignores the column it does not use.
+        assert_eq!(
+            crate::spectra::load_ms1(m1).unwrap()[0].mz,
+            vec![500.0, 600.0]
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A non-finite 1/K0 window bound cannot key a window, so it is refused.
+    #[test]
+    fn a_non_finite_window_mobility_is_refused() {
+        let d = tmpdir("im_nan");
+        let (m1, m2) = (d.join("ms1.parquet"), d.join("ms2.parquet"));
+        let mut fold = Fold::new(m1.to_str().unwrap(), m2.to_str().unwrap(), true);
+        let row = Ms2Row {
+            rt_s: 10.0,
+            id: "frame=2 slot=0".into(),
+            mz: vec![300.0],
+            inten: vec![1.0],
+            nonfinite_peaks: 0,
+            wt: 512.5,
+            wl: 500.0,
+            wu: 525.0,
+            pmz: None,
+            pz: None,
+            im: Some(vec![0.7]),
+            im_lo: Some(f32::NAN),
+            im_hi: Some(1.0),
+        };
+        let e = fold
+            .absorb(0, Decoded::Ms2(Box::new(row)))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("non-finite 1/K0"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn the_returned_hashes_are_those_of_the_files_written() {
         let d = tmpdir("hashes");
@@ -1710,6 +2198,7 @@ mod tests {
             top_peaks_ms2: 0,
             top_peaks_ms1: 0,
             config_hash: "test",
+            tdf: TdfParams::default(),
         })
         .unwrap();
         for (path, hash) in [
@@ -1746,6 +2235,7 @@ mod tests {
             top_peaks_ms2: 0,
             top_peaks_ms1: 0,
             config_hash: "test",
+            tdf: TdfParams::default(),
         })
         .expect("a mid-file bad retention time was never a truncation");
         assert_eq!(rows_in_report(&out.ms1), 2);
@@ -1772,6 +2262,7 @@ mod tests {
             top_peaks_ms2: 0,
             top_peaks_ms1: 0,
             config_hash: "test",
+            tdf: TdfParams::default(),
         });
         let Err(err) = res else {
             panic!("a file shorter than its own header must be refused");
@@ -1801,6 +2292,7 @@ mod tests {
             top_peaks_ms2: 0,
             top_peaks_ms1: 0,
             config_hash: "test",
+            tdf: TdfParams::default(),
         })
         .expect("--max-spectra is a deliberate short read");
         assert_eq!(rows_in_report(&out.ms1), 1);

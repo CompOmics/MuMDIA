@@ -104,6 +104,16 @@ def test_merge_keeps_targets_and_takes_the_predicted_decoy_fragments(libraries, 
     for pid, lab in zip(pids, labels):
         by_pid.setdefault(pid, []).append(lab)
     assert all(sorted(v) == ["decoy", "target"] for v in by_pid.values())
+    # Only the fragments are replaced: the decoy keeps its target's library 1/K0, null
+    # included, as it keeps the iRT. A predicted decoy 1/K0 is not taken from the prediction.
+    ims = out_prec.column("predicted_im").to_pylist()
+    irts = out_prec.column("predicted_irt").to_pylist()
+    pair = {}
+    for pid, lab, im, irt in zip(pids, labels, ims, irts):
+        pair.setdefault(pid, {})[lab] = (im, irt)
+    assert all(v["decoy"] == v["target"] for v in pair.values())
+    assert any(v["target"][0] is None for v in pair.values())
+    assert any(v["target"][0] is not None for v in pair.values())
 
     cid = np.asarray(out_frag.column("candidate_id").to_pylist())
     inten = np.asarray(out_frag.column("predicted_intensity").to_pylist())

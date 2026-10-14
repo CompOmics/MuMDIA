@@ -43,4 +43,8 @@ dependencies:
       # >= 83 closes PYSEC-2026-3447, as in env/mumdia-deeplc.yml.
       - setuptools>=83
       - peptdeep==1.5.1
-      - pyarrow
+      # peptdeep 1.5.1 requires numpy<2 (it resolves 1.26.4), and pyarrow 26 refuses it at
+      # import ("pyarrow requires NumPy 2.0 or newer, found 1.26.4") without declaring the
+      # requirement, so pip pairs the two and the worker fails on its first import. 19.0.1
+      # imports and runs the worker with numpy 1.26.4 (verified on Linux, 2026-10-13).
+      - "pyarrow<20"

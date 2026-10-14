@@ -39,6 +39,7 @@ from conftest import (
     run_worker_ok,
     stripped,
     fragment_mz,
+    library_im,
 )
 
 DELTA_CH2 = 14.015650
@@ -92,6 +93,7 @@ def _write_target_library(directory, mz_scale=1.0):
         "protein": pa.array(
             ["PROT{}_ECOLI".format(r["base_peptide_id"]) for r in rows], pa.string()),
         "n_fragments": pa.array([len(FRAGMENTS)] * len(rows), pa.int32()),
+        "predicted_im": pa.array([library_im(r["candidate_id"]) for r in rows], pa.float64()),
     })
 
     fcid, fmz, fint, fname, fion, ford, fz = [], [], [], [], [], [], []
@@ -206,7 +208,9 @@ def test_decoy_keeps_the_target_precursor_mz_and_irt(builder, shift_library,
     Precursor m/z and iRT are what put the decoy in the same isolation window at
     the same retention time, so it experiences the same chimeric interference.
     A decoy at a different m/z or RT is an easier problem than the target and
-    the FDR it produces is optimistic.
+    the FDR it produces is optimistic. The library 1/K0 follows the iRT: the decoy
+    takes its target's value, null included, so it shares the target's mobility
+    window as well.
     """
     lib = shift_library if builder == "shift" else reverse_library
     prec, _, idx_t, idx_d = _split_by_label(lib["prec"], lib["frag"])
@@ -220,6 +224,10 @@ def test_decoy_keeps_the_target_precursor_mz_and_irt(builder, shift_library,
         assert float(prec["predicted_irt"][j]) == pytest.approx(
             float(prec["predicted_irt"][i]), rel=1e-6)
         assert int(prec["charge"][j]) == int(prec["charge"][i])
+        assert prec["predicted_im"][j] == prec["predicted_im"][i]
+    ims = list(prec["predicted_im"])
+    assert any(v is None for v in ims) and any(v is not None for v in ims), (
+        "the fixture must exercise both a null and a finite library 1/K0")
 
 
 @pytest.mark.parametrize("script", ["make_shift_decoys.py", "make_reverse_decoys.py"])
@@ -242,7 +250,8 @@ def test_builder_is_deterministic(script, target_library, tmp_path):
                 assert ca[col] == cb[col], "{} differs between builds".format(col)
             else:
                 assert np.allclose(np.asarray(ca[col], dtype=float),
-                                   np.asarray(cb[col], dtype=float), atol=0, rtol=0)
+                                   np.asarray(cb[col], dtype=float), atol=0, rtol=0,
+                                   equal_nan=True)
 
 
 @pytest.mark.parametrize("builder", ["shift", "reverse"])

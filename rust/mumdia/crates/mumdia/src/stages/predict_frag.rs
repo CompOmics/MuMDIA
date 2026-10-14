@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::{bail, Result};
-use mumdia_core::config::{FragPredictorKind, PredictFragConfig, RtPredictorKind};
+use mumdia_core::config::{FragPredictorKind, ImPredictorKind, PredictFragConfig, RtPredictorKind};
 use mumdia_core::mass::{parse_peptidoform, Fragment, ParsedPeptidoform};
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
@@ -35,6 +35,11 @@ pub struct PredictFragParams<'a> {
     /// calibration, and checks afterwards that it re-predicted every row, may set it; the
     /// library's model identity then says the iRT is a placeholder.
     pub rt_placeholder: bool,
+    /// The run this library is built for reads spectra with per-peak 1/K0
+    /// (`instrument::input_has_im`), which is what `predict_frag.im_predictor = auto`
+    /// resolves on ([`PredictFragConfig::im_predictor_for`]). False for a build with no run,
+    /// such as a standalone `predict-frag`.
+    pub run_has_im: bool,
 }
 
 /// A candidate before intensity/iRT assignment.
@@ -48,6 +53,8 @@ struct Raw {
     precursor_mz: f64,
     frags: Vec<Fragment>,
     irt: f32,
+    /// Predicted 1/K0 (V s cm^-2); `None` without an ion-mobility predictor.
+    im: Option<f64>,
     frag_int: Vec<f32>,
     /// Parsed form kept from phase A so `assign_rt`/`assign_intensities` reuse
     /// it instead of re-parsing `peptidoform` (identical parse output).
@@ -56,6 +63,17 @@ struct Raw {
 
 pub fn run(p: PredictFragParams) -> Result<(u64, u64)> {
     run_hashed(p).map(|(prec, frag)| (prec.rows, frag.rows))
+}
+
+/// The schema a precursor-library table on disk records: version 2 when it carries
+/// `predicted_im`, else version 1 (`artifact::fragment_library_precursors`). Read from the
+/// parquet footer, so every site that records a library, whether predict-frag, an importer,
+/// a DeepLC rewrite or a sub-library wrote it, records the version that was written.
+pub fn precursors_schema(path: &str) -> Result<(&'static str, u32)> {
+    let has_im = mumdia_io::table::column_names(path)?
+        .iter()
+        .any(|c| c == "predicted_im");
+    Ok(artifact::fragment_library_precursors(has_im))
 }
 
 /// [`run`], returning each output's row count and the content hash its report records
@@ -122,6 +140,7 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
                 precursor_mz: parsed.precursor_mz(z),
                 frags,
                 irt: 0.0,
+                im: None,
                 frag_int: Vec::new(),
                 parsed,
             })
@@ -142,8 +161,22 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         "predict-frag: parsed"
     );
 
-    let (rt_model_id, rt_missing, frag_model_id, frag_missing) = assign_predictions(&p, &mut raws)?;
-    let model_identity = format!("{rt_model_id}; {frag_model_id}");
+    let Predictions {
+        rt_id: rt_model_id,
+        rt_missing,
+        frag_id: frag_model_id,
+        frag_missing,
+        im,
+    } = assign_predictions(&p, &mut raws)?;
+    // The library carries 1/K0, and is the version-2 table, exactly when an ion-mobility
+    // predictor ran; otherwise every byte is the version-1 library's.
+    let has_im = im.is_some();
+    let (im_model_id, im_missing) = im.unwrap_or_default();
+    let model_identity = if has_im {
+        format!("{rt_model_id}; {frag_model_id}; {im_model_id}")
+    } else {
+        format!("{rt_model_id}; {frag_model_id}")
+    };
 
     // Coverage. A candidate a predictor returned nothing for is dropped, together with
     // every candidate sharing its pair key (base peptide, charge, modification set), so
@@ -152,21 +185,17 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
     // for DeepLC and the native heuristic for MS2PIP, and it produced a plausible, finite
     // library whose rows came from an unrecorded mixture of predictors (docs/29 #17).
     let n_before_drop = raws.len() as u64;
-    let (n_dropped_rows, n_dropped_pairs) = drop_unpredicted(&mut raws, &rt_missing, &frag_missing);
+    let missing = [
+        rt_missing.as_slice(),
+        frag_missing.as_slice(),
+        im_missing.as_slice(),
+    ];
+    let (n_dropped_rows, n_dropped_pairs) = drop_unpredicted(&mut raws, &missing);
     // The rows the predictors actually missed, and the rows that went with them for
     // sharing a pair key. Reported separately because the second number is the cost of
     // the position-free key (see `rows_to_drop`) and the first is the sidecar's own miss
     // rate; one warning conflating them hid a worker returning nothing for a large batch.
-    let n_direct = {
-        let mut d: Vec<usize> = rt_missing
-            .iter()
-            .chain(frag_missing.iter())
-            .copied()
-            .collect();
-        d.sort_unstable();
-        d.dedup();
-        d.len() as u64
-    };
+    let n_direct = unpredicted_rows(&missing).len() as u64;
     let n_collateral = n_dropped_rows.saturating_sub(n_direct);
     if n_dropped_rows > 0 {
         tracing::warn!(
@@ -176,6 +205,7 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
             pairs_dropped = n_dropped_pairs,
             without_irt = rt_missing.len(),
             without_intensities = frag_missing.len(),
+            without_im = im_missing.len(),
             "predict-frag: candidates without a prediction were dropped with their pairs \
              instead of receiving a substitute value; the counts are in the library report"
         );
@@ -261,6 +291,7 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         Vec::with_capacity(n),
         Vec::with_capacity(n),
     );
+    let mut im_c: Vec<Option<f64>> = Vec::with_capacity(if has_im { n } else { 0 });
     let (mut f_cid, mut f_mz, mut f_int) = (
         Vec::with_capacity(total_frags),
         Vec::with_capacity(total_frags),
@@ -285,6 +316,9 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         label_c.push(r.label);
         prot_c.push(r.protein);
         nfrag_c.push(r.frags.len() as i32);
+        if has_im {
+            im_c.push(r.im);
+        }
         for (fr, fi) in r.frags.into_iter().zip(r.frag_int) {
             f_cid.push(candidate_id);
             f_mz.push(fr.mz);
@@ -296,21 +330,24 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         }
     }
 
-    let prec_written = write_table_hashed(
-        p.out_precursors,
-        vec![
-            Col::U32("candidate_id".into(), cid),
-            Col::U32("peptidoform_id".into(), pfid),
-            Col::U32("base_peptide_id".into(), baseid),
-            Col::Str("peptidoform".into(), pform_c),
-            Col::I32("charge".into(), z_c),
-            Col::F64("precursor_mz".into(), mz_c),
-            Col::F32("predicted_irt".into(), irt_c),
-            Col::Str("label".into(), label_c),
-            Col::Str("protein".into(), prot_c),
-            Col::I32("n_fragments".into(), nfrag_c),
-        ],
-    )?;
+    let mut prec_cols = vec![
+        Col::U32("candidate_id".into(), cid),
+        Col::U32("peptidoform_id".into(), pfid),
+        Col::U32("base_peptide_id".into(), baseid),
+        Col::Str("peptidoform".into(), pform_c),
+        Col::I32("charge".into(), z_c),
+        Col::F64("precursor_mz".into(), mz_c),
+        Col::F32("predicted_irt".into(), irt_c),
+        Col::Str("label".into(), label_c),
+        Col::Str("protein".into(), prot_c),
+        Col::I32("n_fragments".into(), nfrag_c),
+    ];
+    if has_im {
+        // Version 2 (`artifact::fragment_library_precursors`). Nullable Float64, matching an
+        // imported library's column, although a predicted library has no null.
+        prec_cols.push(Col::OptF64("predicted_im".into(), im_c));
+    }
+    let prec_written = write_table_hashed(p.out_precursors, prec_cols)?;
     // Fragment cardinality: distinct precursors sharing each fragment m/z (0.01 Da
     // bin), matching the imported-library path. Computed once over the whole
     // library so downstream interference-aware feature/quant selection reads a
@@ -349,11 +386,19 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         "pairs_dropped_unpredicted".to_string(),
         json!(n_dropped_pairs),
     );
+    let mut params = json!({"top_n": p.cfg.top_n_fragments, "ms2pip_model": p.cfg.ms2pip_model,
+                            "rt_predictor": format!("{:?}", p.cfg.rt_predictor),
+                            "fragment_predictor": format!("{:?}", p.cfg.predictor)});
+    if has_im {
+        // Recorded only when 1/K0 was predicted, so a library without it keeps its report.
+        stats.insert("without_im".to_string(), json!(im_missing.len() as u64));
+        params["im_predictor"] = json!(format!("{:?}", ImPredictorKind::Im2deep));
+    }
     let mut written: Vec<Written> = Vec::with_capacity(2);
     for (path, schema, file) in [
         (
             p.out_precursors,
-            artifact::FRAGMENT_LIBRARY_PRECURSORS,
+            artifact::fragment_library_precursors(has_im),
             prec_written,
         ),
         (
@@ -370,9 +415,7 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
             rows: file.rows,
             // Both tables were hashed while they were written.
             content_hash: file.content_hash,
-            params: json!({"top_n": p.cfg.top_n_fragments, "ms2pip_model": p.cfg.ms2pip_model,
-                           "rt_predictor": format!("{:?}", p.cfg.rt_predictor),
-                           "fragment_predictor": format!("{:?}", p.cfg.predictor)}),
+            params: params.clone(),
             stats: stats.clone(),
             model_identity: Some(model_identity.clone()),
             elapsed_ms: elapsed,
@@ -392,74 +435,96 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
     Ok((prec, frag))
 }
 
-/// Predicted iRT and fragment intensities for every candidate: `(rt model id, rt missing,
-/// fragment model id, fragment missing)`, the missing lists being candidate indices the
-/// predictor returned nothing for (the caller drops those with their pairs).
+/// What the predictors returned: each model's identity and the candidate indices it
+/// returned nothing for (the caller drops those with their pairs). `im` is `None` when no
+/// ion-mobility predictor ran.
+struct Predictions {
+    rt_id: String,
+    rt_missing: Vec<usize>,
+    frag_id: String,
+    frag_missing: Vec<usize>,
+    im: Option<(String, Vec<usize>)>,
+}
+
+/// Predicted iRT, fragment intensities and, with `predict_frag.im_predictor`, 1/K0 for
+/// every candidate.
 ///
-/// When both come from sidecars (DeepLC and MS2PIP or AlphaPeptDeep) and
-/// `MUMDIA_PREDICT_FRAG_CONCURRENT=1` is set, the two workers run at the same time: they
-/// write disjoint fields of each candidate, and each gets exactly the request and thread
-/// count it gets when run alone, so the library is byte-identical either way (measured on
-/// the fixture library with DeepLC 4.5.0 and MS2PIP 4.2.0: 9.1 s against 14.7 s).
+/// The sidecar workers run one after another by default: DeepLC, then the fragment
+/// intensities, then IM2Deep. When `MUMDIA_PREDICT_FRAG_CONCURRENT=1` is set and at least
+/// two of them run, they run at the same time: they write disjoint fields of each
+/// candidate, and each gets exactly the request and thread count it gets when run alone,
+/// so the library is byte-identical either way (measured on the fixture library with
+/// DeepLC 4.5.0 and MS2PIP 4.2.0: 9.1 s against 14.7 s; IM2Deep alongside them is not
+/// measured).
 ///
 /// Off by default. Each worker sizes itself from the engine's whole thread count (MS2PIP
-/// starts that many processes, DeepLC takes that many torch threads), so at once they ask
-/// for twice the CPUs and hold both workers' memory; the saving on the fixture is the
-/// workers' start-up, and at scale, where both are CPU-bound (DeepLC 19 min and MS2PIP
-/// 35-39 min on the 9.8M-peptidoform HYE FASTA library, one after the other), neither the
-/// wall time nor the process-tree peak of the pair has been measured. Splitting the thread
+/// starts that many processes, DeepLC and IM2Deep take that many torch threads), so at once
+/// they ask for several times the CPUs and hold every worker's memory; the saving on the
+/// fixture is the workers' start-up, and at scale, where they are CPU-bound (DeepLC 19 min
+/// and MS2PIP 35-39 min on the 9.8M-peptidoform HYE FASTA library, one after the other),
+/// neither the wall time nor the process-tree peak has been measured. Splitting the thread
 /// budget instead would change DeepLC's torch thread count and with it the last bits of
 /// its predictions. Validate on a large FASTA build (wall time, peak, and a byte
 /// comparison of both library tables) before turning it on.
-fn assign_predictions(
-    p: &PredictFragParams,
-    raws: &mut [Raw],
-) -> Result<(String, Vec<usize>, String, Vec<usize>)> {
+fn assign_predictions(p: &PredictFragParams, raws: &mut [Raw]) -> Result<Predictions> {
     let rt_req = RtRequest::new(p, raws)?;
     let frag_req = FragRequest::new(p, raws)?;
+    let im_req = ImRequest::new(p, raws)?;
     let concurrent = std::env::var("MUMDIA_PREDICT_FRAG_CONCURRENT")
         .is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0");
-    let (rt_out, frag_out) = match (&rt_req, &frag_req, concurrent) {
-        (RtRequest::Deeplc(rt), Some(fr), true) => {
+    let deeplc = match &rt_req {
+        RtRequest::Deeplc(rt) => Some(rt),
+        _ => None,
+    };
+    let n_workers = [deeplc.is_some(), frag_req.is_some(), im_req.is_some()]
+        .iter()
+        .filter(|&&w| w)
+        .count();
+    let (rt_out, frag_out, im_out) = if concurrent && n_workers >= 2 {
+        if im_req.is_none() {
             info!(
                 "predict-frag: running the DeepLC and the fragment-intensity workers at the \
                  same time (MUMDIA_PREDICT_FRAG_CONCURRENT)"
             );
-            std::thread::scope(|scope| {
-                let deeplc = scope.spawn(|| rt.call(p));
-                let frag = fr.call(p);
-                if let Err(e) = &frag {
-                    // Said now rather than after the DeepLC join, which on a large library
-                    // is many minutes later: the stage fails either way, and the DeepLC
-                    // worker cannot be interrupted from here.
-                    tracing::error!(
-                        error = %format!("{e:#}"),
-                        "predict-frag: the fragment-intensity worker failed; waiting for the \
-                         DeepLC worker to exit before the stage fails"
-                    );
-                }
-                let rt = deeplc
-                    .join()
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("the DeepLC worker thread panicked")));
-                (Some(rt), Some(frag))
-            })
+        } else {
+            info!(
+                workers = n_workers,
+                "predict-frag: running the prediction workers at the same time \
+                 (MUMDIA_PREDICT_FRAG_CONCURRENT)"
+            );
         }
-        _ => {
-            let rt = match &rt_req {
-                RtRequest::Deeplc(rt) => Some(rt.call(p)),
-                _ => None,
-            };
-            // DeepLC first, as before: a failing DeepLC stops the stage before MS2PIP runs.
-            let rt = match rt {
-                Some(Err(e)) => return Err(e),
-                other => other,
-            };
-            (rt, frag_req.as_ref().map(|fr| fr.call(p)))
+        fn joined<T>(h: std::thread::ScopedJoinHandle<'_, Result<T>>, who: &str) -> Result<T> {
+            h.join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the {who} worker thread panicked")))
         }
+        let (rt, frag, im) = std::thread::scope(|scope| {
+            let rt = deeplc.map(|rt| scope.spawn(|| rt.call(p)));
+            let im = im_req.as_ref().map(|r| scope.spawn(|| r.call(p)));
+            let frag = frag_req.as_ref().map(|fr| fr.call(p));
+            if let Some(Err(e)) = &frag {
+                // Said now rather than after the other workers are joined, which on a large
+                // library is many minutes later: the stage fails either way, and the other
+                // workers cannot be interrupted from here.
+                tracing::error!(
+                    error = %format!("{e:#}"),
+                    "predict-frag: the fragment-intensity worker failed; waiting for the \
+                     other workers to exit before the stage fails"
+                );
+            }
+            let rt = rt.map(|h| joined(h, "DeepLC"));
+            let im = im.map(|h| joined(h, "IM2Deep"));
+            (rt, frag, im)
+        });
+        // DeepLC's error first, as when the workers run one after the other.
+        (rt.transpose()?, frag.transpose()?, im.transpose()?)
+    } else {
+        // DeepLC first, as before: a failing DeepLC stops the stage before MS2PIP runs, and
+        // a failing fragment worker before IM2Deep runs.
+        let rt = deeplc.map(|rt| rt.call(p)).transpose()?;
+        let frag = frag_req.as_ref().map(|fr| fr.call(p)).transpose()?;
+        let im = im_req.as_ref().map(|r| r.call(p)).transpose()?;
+        (rt, frag, im)
     };
-    // DeepLC's error first, as when the two ran one after the other.
-    let rt_out = rt_out.transpose()?;
-    let frag_out = frag_out.transpose()?;
     let (rt_id, rt_missing) = rt_req.apply(raws, rt_out)?;
     let (frag_id, frag_missing) = match (frag_req, frag_out) {
         (Some(fr), Some(map)) => fr.apply(p, raws, map)?,
@@ -474,7 +539,138 @@ fn assign_predictions(
             (m.identity(), Vec::new())
         }
     };
-    Ok((rt_id, rt_missing, frag_id, frag_missing))
+    let im = match (im_req, im_out) {
+        (Some(req), Some(out)) => Some(req.apply(raws, out)),
+        _ => None,
+    };
+    Ok(Predictions {
+        rt_id,
+        rt_missing,
+        frag_id,
+        frag_missing,
+        im,
+    })
+}
+
+/// The IM2Deep request: one prediction per unique (peptidoform, charge). 1/K0 depends on
+/// the charge, unlike the iRT, and the precursor m/z the worker converts the CCS at follows
+/// from the pair.
+struct ImRequest {
+    python: String,
+    script: String,
+    keys: ImKeys,
+}
+
+/// The unique (peptidoform, charge) pairs of the candidates, in first-seen row order, and
+/// each row's index into them. The request id of a pair is its index, so the request does
+/// not depend on hashing.
+#[derive(Debug, Default, PartialEq)]
+struct ImKeys {
+    peps: Vec<String>,
+    charges: Vec<i32>,
+    mzs: Vec<f64>,
+    row_ids: Vec<u32>,
+}
+
+impl ImKeys {
+    fn of<'a>(rows: impl IntoIterator<Item = (&'a str, i32, f64)>) -> Self {
+        let mut uniq: HashMap<(&'a str, i32), u32> = HashMap::new();
+        let mut keys = Self::default();
+        for (peptidoform, charge, mz) in rows {
+            let next = keys.peps.len() as u32;
+            let id = *uniq.entry((peptidoform, charge)).or_insert_with(|| {
+                keys.peps.push(peptidoform.to_string());
+                keys.charges.push(charge);
+                keys.mzs.push(mz);
+                next
+            });
+            keys.row_ids.push(id);
+        }
+        keys
+    }
+
+    fn ids(&self) -> Vec<u32> {
+        (0..self.peps.len() as u32).collect()
+    }
+}
+
+impl ImRequest {
+    /// `None` when the build predicts no 1/K0 (`predict_frag.im_predictor` resolves to
+    /// `none`).
+    fn new(p: &PredictFragParams, raws: &[Raw]) -> Result<Option<Self>> {
+        match p.cfg.im_predictor_for(p.run_has_im) {
+            ImPredictorKind::None => {
+                if p.cfg.im_predictor == ImPredictorKind::Auto && !p.run_has_im {
+                    info!(
+                        "predict-frag: predict_frag.im_predictor = auto and the run's spectra \
+                         carry no 1/K0, so the library carries no predicted 1/K0"
+                    );
+                } else if p.cfg.im_predictor == ImPredictorKind::Auto {
+                    info!(
+                        "predict-frag: predict_frag.im_predictor = auto and no IM2Deep \
+                         interpreter resolved, so the library carries no predicted 1/K0 (set \
+                         predict_frag.im2deep_python or MUMDIA_PYTHON_IM2DEEP)"
+                    );
+                }
+                Ok(None)
+            }
+            // `im_predictor_for` never returns `Auto`.
+            ImPredictorKind::Im2deep | ImPredictorKind::Auto => {
+                let python = p.cfg.im2deep_python.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("im_predictor=im2deep requires predict_frag.im2deep_python")
+                })?;
+                Ok(Some(Self {
+                    python: python.to_string(),
+                    script: crate::sidecar::resolve_script(
+                        &p.cfg.sidecar_script_dir,
+                        "im2deep_worker.py",
+                    ),
+                    keys: ImKeys::of(
+                        raws.iter()
+                            .map(|r| (r.peptidoform.as_str(), r.charge, r.precursor_mz)),
+                    ),
+                }))
+            }
+        }
+    }
+
+    fn call(&self, p: &PredictFragParams) -> Result<HashMap<u32, f64>> {
+        sidecar::run_im2deep(
+            &self.python,
+            &self.script,
+            p.work_dir,
+            &self.keys.ids(),
+            &self.keys.peps,
+            &self.keys.charges,
+            &self.keys.mzs,
+        )
+    }
+
+    /// Assign every candidate its 1/K0. Returns the model id and the candidates the worker
+    /// returned nothing for, which the caller drops with their pairs.
+    fn apply(self, raws: &mut [Raw], out: HashMap<u32, f64>) -> (String, Vec<usize>) {
+        let missing = assign_im(raws.iter_mut().map(|r| &mut r.im), &self.keys, &out);
+        // The single-conformer model, uncalibrated, like the DeepLC base model's iRT.
+        let id = sidecar::model_identity(Some(&self.python), "im2deep", "uni");
+        (id, missing)
+    }
+}
+
+/// Write each row's 1/K0 from the worker's `id -> value` map into `slots` (one per row, in
+/// the order the keys were built from). Returns the rows without a value.
+fn assign_im<'a>(
+    slots: impl Iterator<Item = &'a mut Option<f64>>,
+    keys: &ImKeys,
+    out: &HashMap<u32, f64>,
+) -> Vec<usize> {
+    let mut missing = Vec::new();
+    for (i, (slot, id)) in slots.zip(&keys.row_ids).enumerate() {
+        match out.get(id) {
+            Some(&v) => *slot = Some(v),
+            None => missing.push(i),
+        }
+    }
+    missing
 }
 
 /// How every candidate gets its iRT.
@@ -802,27 +998,27 @@ fn rows_to_drop(keys: &[(u32, i32, String)], missing: &[usize]) -> Vec<bool> {
     keys.iter().map(|k| doomed.contains(k)).collect()
 }
 
-/// Drop every candidate without a prediction together with its pair. Returns the
-/// number of rows and of distinct pair keys removed.
-fn drop_unpredicted(
-    raws: &mut Vec<Raw>,
-    rt_missing: &[usize],
-    frag_missing: &[usize],
-) -> (u64, u64) {
-    if rt_missing.is_empty() && frag_missing.is_empty() {
+/// The rows any predictor missed, ascending and each once. `missing` holds one list per
+/// predictor (iRT, intensities, 1/K0).
+fn unpredicted_rows(missing: &[&[usize]]) -> Vec<usize> {
+    let mut rows: Vec<usize> = missing.iter().flat_map(|m| m.iter().copied()).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    rows
+}
+
+/// Drop every candidate without a prediction together with its pair. `missing` holds
+/// one list of unpredicted rows per predictor. Returns the number of rows and of
+/// distinct pair keys removed.
+fn drop_unpredicted(raws: &mut Vec<Raw>, missing: &[&[usize]]) -> (u64, u64) {
+    if missing.iter().all(|m| m.is_empty()) {
         return (0, 0);
     }
     let keys: Vec<(u32, i32, String)> = raws
         .iter()
         .map(|r| pair_key(r.base_peptide_id, r.charge, &r.peptidoform))
         .collect();
-    let mut missing: Vec<usize> = rt_missing
-        .iter()
-        .chain(frag_missing.iter())
-        .copied()
-        .collect();
-    missing.sort_unstable();
-    missing.dedup();
+    let missing = unpredicted_rows(missing);
     let drop = rows_to_drop(&keys, &missing);
     let n_pairs = missing
         .iter()
@@ -1060,5 +1256,129 @@ mod cardinality_tests {
         let cid = vec![0u32, 1, 2, 0];
         let mz = vec![100.000, 100.004, 200.000, 100.001];
         assert_eq!(fragment_cardinality(&cid, &mz), vec![2, 2, 1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod im_tests {
+    use super::*;
+
+    #[test]
+    fn im_requests_are_deduplicated_by_peptidoform_and_charge_in_first_seen_order() {
+        let rows = [
+            ("SAMPLER", 2, 401.2),
+            ("PEPTIDEK", 2, 465.7),
+            ("SAMPLER", 2, 401.2),
+            ("SAMPLER", 3, 267.8),
+            ("DECOY_KEDITPEP", 2, 465.7),
+            ("PEPTIDEK", 2, 465.7),
+        ];
+        let keys = ImKeys::of(rows.iter().map(|&(p, z, mz)| (p, z, mz)));
+        assert_eq!(
+            keys.peps,
+            ["SAMPLER", "PEPTIDEK", "SAMPLER", "DECOY_KEDITPEP"],
+            "one request per (peptidoform, charge), the charge-3 form its own"
+        );
+        assert_eq!(keys.charges, [2, 2, 3, 2]);
+        assert_eq!(keys.mzs, [401.2, 465.7, 267.8, 465.7]);
+        assert_eq!(keys.row_ids, [0, 1, 0, 2, 3, 1]);
+        assert_eq!(keys.ids(), [0, 1, 2, 3]);
+        // The same rows give the same request, whatever the hasher.
+        assert_eq!(ImKeys::of(rows.iter().map(|&(p, z, mz)| (p, z, mz))), keys);
+    }
+
+    #[test]
+    fn im_values_follow_their_key_and_misses_are_reported_per_row() {
+        let rows = [("A", 2, 1.0), ("B", 2, 2.0), ("A", 2, 1.0), ("A", 3, 0.7)];
+        let keys = ImKeys::of(rows.iter().copied());
+        // The worker returned nothing for ("A", 3).
+        let out: HashMap<u32, f64> = [(0, 0.81), (1, 0.93)].into_iter().collect();
+        let mut slots = vec![None; rows.len()];
+        let missing = assign_im(slots.iter_mut(), &keys, &out);
+        assert_eq!(slots, [Some(0.81), Some(0.93), Some(0.81), None]);
+        assert_eq!(missing, [3]);
+    }
+
+    #[test]
+    fn an_im_miss_is_dropped_with_its_pair_like_any_other() {
+        // Rows 0 and 1 are a target and its decoy; row 2 another precursor. IM2Deep missed
+        // the decoy only, and both members of the pair leave the library.
+        let keys = vec![
+            pair_key(7, 2, "PEPTIDEK"),
+            pair_key(7, 2, "KEDITPEP"),
+            pair_key(8, 2, "SAMPLER"),
+        ];
+        let im_missing = [1usize];
+        let missing = unpredicted_rows(&[&[], &[], &im_missing]);
+        assert_eq!(missing, [1]);
+        assert_eq!(rows_to_drop(&keys, &missing), [true, true, false]);
+        // One row missed by two predictors counts once.
+        assert_eq!(unpredicted_rows(&[&[2, 0], &[2], &[1]]), [0, 1, 2]);
+    }
+
+    #[test]
+    fn a_library_without_an_im_predictor_is_the_version_1_table() {
+        let dir = std::env::temp_dir().join(format!("mumdia_pf_v1_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |n: &str| dir.join(n).to_string_lossy().into_owned();
+        mumdia_io::table::write_table(
+            &path("peptidoforms.parquet"),
+            vec![
+                Col::U32("id".into(), vec![0, 1]),
+                Col::U32("base_peptide_id".into(), vec![0, 0]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEPTIDEK".into(), "KEDITPEP".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 2]),
+                Col::Str("label".into(), vec!["target".into(), "decoy".into()]),
+                Col::Str("protein".into(), vec!["P1".into(), "DECOY_P1".into()]),
+            ],
+        )
+        .unwrap();
+        let cfg = PredictFragConfig::default();
+        let (prec, out_f) = (path("prec.parquet"), path("frag.parquet"));
+        run(PredictFragParams {
+            peptidoforms: &path("peptidoforms.parquet"),
+            out_precursors: &prec,
+            out_fragments: &out_f,
+            cfg: &cfg,
+            work_dir: &path("work"),
+            config_hash: "h",
+            rt_placeholder: false,
+            run_has_im: false,
+        })
+        .unwrap();
+        assert_eq!(
+            mumdia_io::table::column_names(&prec).unwrap(),
+            [
+                "candidate_id",
+                "peptidoform_id",
+                "base_peptide_id",
+                "peptidoform",
+                "charge",
+                "precursor_mz",
+                "predicted_irt",
+                "label",
+                "protein",
+                "n_fragments"
+            ]
+        );
+        let report: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{prec}.report.json")).unwrap();
+        assert_eq!(report["schema_version"], 1);
+        assert!(report["params"].get("im_predictor").is_none());
+        assert!(report["stats"].get("without_im").is_none());
+        assert!(!report["model_identity"]
+            .as_str()
+            .unwrap()
+            .contains("im2deep"));
+        assert_eq!(
+            artifact::fragment_library_precursors(false),
+            artifact::FRAGMENT_LIBRARY_PRECURSORS
+        );
+        assert_eq!(artifact::fragment_library_precursors(true).1, 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

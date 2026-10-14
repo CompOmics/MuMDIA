@@ -223,10 +223,12 @@ pub fn stamp_env(cmd: &mut std::process::Command) {
     // environments are not interchangeable: MS2PIP cannot share the primary one.
     let primary = managed_python(Env::Primary);
     if primary.is_file() {
+        // IM2Deep is installed into the primary environment (`console-requirements.txt`).
         for var in [
             "MUMDIA_PYTHON_RESCORE",
             "MUMDIA_PYTHON_DEEPLC",
             "MUMDIA_PYTHON_MBR",
+            "MUMDIA_PYTHON_IM2DEEP",
         ] {
             cmd.env(var, &primary);
         }
@@ -1377,6 +1379,7 @@ mod tests {
                 "MUMDIA_PYTHON_RESCORE",
                 "MUMDIA_PYTHON_DEEPLC",
                 "MUMDIA_PYTHON_MBR",
+                "MUMDIA_PYTHON_IM2DEEP",
             ] {
                 assert!(
                     stamped.iter().any(|s| s == var),

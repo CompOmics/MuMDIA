@@ -15,10 +15,38 @@ library, and hours of compute. The end-to-end test CI does run is
 | `pb_eval.py` | Score a submission offline with ProteoBench's own parser and scoring code. Nothing is uploaded and no token is used. `--module` selects the module, which fixes the run names and the expected ratios; an unknown id is rejected with the available list. |
 | `prov_filter.py` | Condition-evidence filters (F1 to F4) deciding which run values may be reported. Withholding transferred values in a condition with no direct identification is what removes low-abundance ratio compression; see the docstring for the measurements. |
 | `qab_score.py` | Score one arm of a quantification A/B directly from the per-run `peptide_quant.parquet` of a `run-experiment` output tree: features, completeness, median abs epsilon against the HYE expected ratios, and CV. Not ProteoBench's own numbers (see its docstring); the point is that two arms are scored identically. |
+| `make_entrapment_fasta.py` | Build a real + 1:1 foreign entrapment FASTA (`REAL_` / `ENTRAP_` accession prefixes, seeded sample). With `--ratio-library` it prints `rescore.entrapment_ratio` of a built library instead: real over entrapment target candidates, classified as the engine does. See the ratio note below. |
+| `tims/tims_compare.py` | Compare one run's `psms_scored.parquet` with a reference identification table of the same run (`--reference`) at one q: precursors, peptides and protein groups, each with its unit named, plus the I/L-merged peptide overlap. |
+| `tims/tims_loss.py` | Classify every reference precursor at q by why MuMDIA misses it: not in the library, not extracted (reference RT or 1/K0 outside the window, or inside both), accepted, right peak but low score, wrong peak inside or outside the RT window. Writes the per-precursor table that `fs_loss_evidence.py` reads. The stage-by-stage ladder of every candidate comes from `mumdia audit` and the stage `report.json` files, not from here. |
+| `tims/tims_im_check.py` | G1 check of ion mobility: median and p95 1/K0 error of the library `predicted_im`, the calibrated `im_pred_cal`, the seed's `observed_im` and the MS1 1/K0 against the reference's observed 1/K0, per charge, and the recall of the 1/K0 window. |
+| `tims/tims_centroid_pairs.py` | G1 check of the native diaPASEF reader: histograms of centroid pairs at the same 1/K0 by m/z distance and at the same m/z by 1/K0 distance, to show ions cut into pieces. Needs spectra v2 (per-peak `im`). |
+| `tims/tims_ref.py` | Shared helpers of the `tims/` scripts: the reference table's column names, the precursor key, and the reference peptidoform via `scripts/import_diann_lib.py`'s `to_proforma`. |
+| `feature_selection/fs_univariate.py` | Univariate separation of any feature column: the rank AUC of each `features.parquet.schema.json` column, targets against decoys (all, accepted at q, and a below-median-decoy-score null that flags leakage) or any given label, joined on `(candidate_id, peak_rank)`. |
+| `feature_selection/fs_loss_evidence.py` | Which features make a missed true precursor look like a decoy: rank AUCs of the `tims_loss.py` category against accepted precursors, an abundance-matched accepted set and score-matched decoys. |
 
 Requires `proteobench` (0.18.4 was used), `pyarrow`, `pandas`, `numpy`. That
 version provides the DIA ion modules `quant_lfq_DIA_ion_AIF`, `_Astral`,
-`_diaPASEF`, `_ZenoTOF`, `_lowinput` and `_plasma`.
+`_diaPASEF`, `_ZenoTOF`, `_lowinput` and `_plasma`. The `tims/` and
+`feature_selection/fs_univariate.py` / `fs_loss_evidence.py` scripts need only
+`pyarrow`, `pandas` and `numpy`; their AUC is `feature_selection/fs_lib.py`'s
+`rank_auc` (Mann-Whitney, average ranks for ties, NaN dropped), not scikit-learn.
+
+The reference table of the `tims/` scripts is a precursor-level parquet of an
+independent identification of the same run. `tims/tims_ref.py` lists the column
+names it must carry. RT is read in minutes. A reference without `IM` works for
+`tims_loss.py` and `tims_compare.py`; `tims_im_check.py` requires it.
+
+**The entrapment ratio is a property of the library.** `rescore.entrapment_ratio`
+is N_real / N_entrap over the library's target candidates. It changes with the
+proteomes, the digest, the modifications and the charges, so compute it for each
+built library with `make_entrapment_fasta.py --ratio-library` and the run config's
+marker, exclude and contaminant settings. The IM branch's E. coli diaPASEF library measured
+0.563430 (670,590 real against 1,190,193 entrapment target candidates), the
+`configs/examples/diapasef.json` library 0.574592 (988,128 against 1,719,704);
+`fs_lib.ENTRAP_RATIO` = 0.560632 belongs to the August E. coli AIF library below
+and is wrong for any other. `entrapment_fdp.py` reads the ratio from the run
+config (`rescore.entrapment_ratio`, default 1.0), and `fs_lib.entrapment_fdp`
+takes it as its `ratio` argument; pass the measured value to both.
 
 `prov_filter.py` was checked against the pipeline it was extracted from: on the
 six AIF runs it reproduces the recorded F1 counts exactly (69,190 / 71,432 /

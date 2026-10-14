@@ -160,8 +160,11 @@ pub fn conversion_space(inputs: &[String]) -> Vec<String> {
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
-        // mzML needs no conversion, so no extra space.
-        if !matches!(ext.as_str(), "raw" | "d" | "wiff" | "wiff2") {
+        // mzML needs no conversion, so no extra space, and neither does a diaPASEF `.d`,
+        // which the engine reads natively and never writes an mzML for.
+        if !matches!(ext.as_str(), "raw" | "d" | "wiff" | "wiff2")
+            || crate::thermo::needs(input) == crate::thermo::Needs::Nothing
+        {
             continue;
         }
         let Some(dir) = p.parent() else { continue };

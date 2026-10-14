@@ -39,6 +39,17 @@
 //! writer per band in flight under `groups.parallel`, plus features and compete writers)
 //! would share eight codec threads where they used to have one core each, and a band's
 //! candidate loop would stall on its writer's channel. Both paths write the same bytes.
+//!
+//! **Row groups in flight** (`ColumnEncoder::with_row_groups_in_flight`). A writer with
+//! few, large columns (extract's 4D chromatograms: a handful of list columns) gains little
+//! from encoding the columns of one row group concurrently, and its one writer thread then
+//! bounds the stage. Such a writer may instead hold each full row group and encode it as
+//! one job on the codec pool while the next fills, appending the finished groups in order.
+//! Each column writer still receives exactly the leaf slices the serial writer would give
+//! it, in the same order, so the file is the same bytes. The groups in flight are bounded by
+//! the codec pool: never more than it has threads, and none without a pool (`--threads 1`,
+//! `MUMDIA_PARQUET_THREADS` 0 or 1), so the setting adds no thread of its own. A writer
+//! called from inside a rayon pool encodes each group on its own thread, as above.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -173,9 +184,47 @@ pub(crate) fn codec_pool() -> Option<Arc<CodecPool>> {
 }
 
 /// One row group being encoded: the column writers of each root field, in schema order.
+/// With row groups in flight ([`ColumnEncoder::with_row_groups_in_flight`]) the writers are
+/// fed only when the group is full, as one codec-pool job, from the (split) batches held
+/// here.
 struct RowGroup {
     roots: Vec<Vec<ArrowColumnWriter>>,
     rows: usize,
+    batches: Vec<RecordBatch>,
+}
+
+/// A full row group being encoded as one codec-pool job: its column chunks in schema order,
+/// sent back when the job is done.
+type InFlight = std::sync::mpsc::Receiver<Result<Vec<ArrowColumnChunk>>>;
+
+/// Encode a held row group: per root, each (split) batch in arrival order, which is the
+/// sequence of writes the serial path makes to every column writer, then close the writers.
+fn encode_held(schema: &SchemaRef, rg: RowGroup) -> Result<Vec<ArrowColumnChunk>> {
+    let RowGroup {
+        mut roots, batches, ..
+    } = rg;
+    for (i, writers) in roots.iter_mut().enumerate() {
+        let field = schema.field(i);
+        for batch in &batches {
+            let leaves = compute_leaves(field, batch.column(i))?;
+            if leaves.len() != writers.len() {
+                return Err(anyhow!(
+                    "column '{}' has {} parquet leaves, the writer {}",
+                    field.name(),
+                    leaves.len(),
+                    writers.len()
+                ));
+            }
+            for (w, leaf) in writers.iter_mut().zip(&leaves) {
+                w.write(leaf)?;
+            }
+        }
+    }
+    roots
+        .into_iter()
+        .flatten()
+        .map(|w| w.close().map_err(anyhow::Error::from))
+        .collect()
 }
 
 /// A parquet writer that encodes a row group's columns concurrently and writes the file the
@@ -193,6 +242,14 @@ pub(crate) struct ColumnEncoder<W: Write + Send> {
     max_rows: Option<usize>,
     in_progress: Option<RowGroup>,
     pool: Option<Arc<CodecPool>>,
+    /// Full row groups encoded at once as codec-pool jobs; 1 (the default) encodes each
+    /// batch as it arrives.
+    in_flight: usize,
+    /// The row groups in flight, oldest first; appended to the file in this order.
+    pending: std::collections::VecDeque<InFlight>,
+    /// Index of the next row group to open (appended plus in flight). In the serial path it
+    /// equals the number of row groups appended, which is what the factory was given.
+    next_index: usize,
 }
 
 impl<W: Write + Send> ColumnEncoder<W> {
@@ -232,7 +289,30 @@ impl<W: Write + Send> ColumnEncoder<W> {
             max_rows,
             in_progress: None,
             pool,
+            in_flight: 1,
+            pending: std::collections::VecDeque::new(),
+            next_index: 0,
         })
+    }
+
+    /// Encode up to `n` full row groups at once, each as one job on the codec pool, and
+    /// append them in order (module docs). Bounded by the pool: at most its thread count,
+    /// and 1, the default behaviour, without a pool or without a row-group cap. The file is
+    /// the same bytes at every setting.
+    pub(crate) fn with_row_groups_in_flight(mut self, n: usize) -> ColumnEncoder<W> {
+        let bound = self.pool.as_ref().map_or(1, |p| p.threads());
+        self.in_flight = if self.max_rows.is_some() {
+            n.clamp(1, bound.max(1))
+        } else {
+            1
+        };
+        self
+    }
+
+    /// The row groups this encoder holds in flight at most (1: none).
+    #[cfg(test)]
+    pub(crate) fn row_groups_in_flight(&self) -> usize {
+        self.in_flight
     }
 
     /// Encode `batch`, splitting it at the row-group cap exactly where
@@ -249,14 +329,19 @@ impl<W: Write + Send> ColumnEncoder<W> {
             ));
         }
         if self.in_progress.is_none() {
-            let index = self.file.flushed_row_groups().len();
+            let index = self.next_index;
+            self.next_index += 1;
             let mut flat = self.factory.create_column_writers(index)?.into_iter();
             let roots = self
                 .leaves_per_root
                 .iter()
                 .map(|&n| flat.by_ref().take(n).collect())
                 .collect();
-            self.in_progress = Some(RowGroup { roots, rows: 0 });
+            self.in_progress = Some(RowGroup {
+                roots,
+                rows: 0,
+                batches: Vec::new(),
+            });
         }
         let buffered = self.in_progress.as_ref().map_or(0, |rg| rg.rows);
         if let Some(max) = self.max_rows {
@@ -268,6 +353,14 @@ impl<W: Write + Send> ColumnEncoder<W> {
         }
         let rg = self.in_progress.as_mut().expect("row group opened above");
         rg.rows += batch.num_rows();
+        if self.in_flight > 1 {
+            // Held until the group is full, then encoded as one codec-pool job (`submit`).
+            rg.batches.push(batch.clone());
+            if self.max_rows.is_some_and(|max| rg.rows >= max) {
+                self.submit()?;
+            }
+            return Ok(());
+        }
         let fields = self.schema.fields();
         let columns = batch.columns();
         let encode = |(i, writers): (usize, &mut Vec<ArrowColumnWriter>)| -> Result<()> {
@@ -305,8 +398,66 @@ impl<W: Write + Send> ColumnEncoder<W> {
         Ok(())
     }
 
+    /// Start encoding the in-progress row group as one codec-pool job, and append the
+    /// oldest groups in flight while more than `in_flight` are. From inside a rayon pool the
+    /// group is encoded on the calling thread (module docs).
+    fn submit(&mut self) -> Result<()> {
+        let Some(rg) = self.in_progress.take() else {
+            return Ok(());
+        };
+        let schema = self.schema.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        match self
+            .pool
+            .as_ref()
+            .filter(|_| rayon::current_thread_index().is_none())
+        {
+            Some(pool) => pool.pool.spawn(move || {
+                // A panic inside a pool job would abort the process; it is returned as the
+                // group's error instead, and surfaces where the group is appended.
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    encode_held(&schema, rg)
+                }))
+                .unwrap_or_else(|_| Err(anyhow!("parquet row-group encoder panicked")));
+                // The receiver is gone only when the writer was dropped unclosed.
+                let _ = tx.send(r);
+            }),
+            None => {
+                let _ = tx.send(encode_held(&schema, rg));
+            }
+        }
+        self.pending.push_back(rx);
+        while self.pending.len() > self.in_flight {
+            self.append_oldest()?;
+        }
+        Ok(())
+    }
+
+    /// Wait for the oldest row group in flight and append it.
+    fn append_oldest(&mut self) -> Result<()> {
+        let Some(rx) = self.pending.pop_front() else {
+            return Ok(());
+        };
+        let chunks = rx
+            .recv()
+            .map_err(|_| anyhow!("parquet row-group encoder job ended without a result"))??;
+        let mut out = self.file.next_row_group()?;
+        for chunk in chunks {
+            chunk.append_to_row_group(&mut out)?;
+        }
+        out.close()?;
+        Ok(())
+    }
+
     /// Close the in-progress row group and append its column chunks in schema order.
     fn flush(&mut self) -> Result<()> {
+        if self.in_flight > 1 {
+            self.submit()?;
+            while !self.pending.is_empty() {
+                self.append_oldest()?;
+            }
+            return Ok(());
+        }
         let Some(rg) = self.in_progress.take() else {
             return Ok(());
         };
@@ -441,8 +592,19 @@ mod tests {
         props: WriterProperties,
         pool: Option<Arc<CodecPool>>,
     ) -> Vec<u8> {
+        in_flight(batches, props, pool, 1)
+    }
+
+    fn in_flight(
+        batches: &[RecordBatch],
+        props: WriterProperties,
+        pool: Option<Arc<CodecPool>>,
+        n: usize,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut w = ColumnEncoder::try_new(&mut out, batches[0].schema(), props, pool).unwrap();
+        let mut w = ColumnEncoder::try_new(&mut out, batches[0].schema(), props, pool)
+            .unwrap()
+            .with_row_groups_in_flight(n);
         for b in batches {
             w.write(b).unwrap();
         }
@@ -493,6 +655,18 @@ mod tests {
                     "sizes {sizes:?} cap {cap:?} planned {planned} threads {:?}: {} bytes \
                      against the serial writer's {}",
                     pool.as_ref().map(|p| p.threads()),
+                    got.len(),
+                    want.len()
+                );
+            }
+            // Row groups encoded as codec-pool jobs, 2 and 16 at once, write the same bytes.
+            for n in [2, 16] {
+                let pool = Some(CodecPool::new(n).unwrap());
+                let got = in_flight(&batches, props(cap, planned), pool, n);
+                assert!(
+                    got == want,
+                    "sizes {sizes:?} cap {cap:?} planned {planned} in flight {n}: {} bytes \
+                     against the serial writer's {}",
                     got.len(),
                     want.len()
                 );
@@ -624,6 +798,48 @@ mod tests {
             0,
             "every turn was released"
         );
+    }
+
+    /// The groups in flight are bounded by the codec pool: at most its threads, none without
+    /// a pool (`--threads 1`, `MUMDIA_PARQUET_THREADS` 0 or 1) and none without a row cap.
+    #[test]
+    fn row_groups_in_flight_are_bounded_by_the_codec_pool() {
+        let b = batch(0, 10);
+        let capped = || {
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(4))
+                .build()
+        };
+        let enc = |props, pool, n| {
+            ColumnEncoder::try_new(Vec::new(), b.schema(), props, pool)
+                .unwrap()
+                .with_row_groups_in_flight(n)
+                .row_groups_in_flight()
+        };
+        assert_eq!(enc(capped(), Some(CodecPool::new(3).unwrap()), 16), 3);
+        assert_eq!(enc(capped(), Some(CodecPool::new(8).unwrap()), 2), 2);
+        assert_eq!(enc(capped(), None, 16), 1);
+        assert_eq!(enc(capped(), Some(CodecPool::new(4).unwrap()), 0), 1);
+        let uncapped = WriterProperties::builder()
+            .set_max_row_group_row_count(None)
+            .build();
+        assert_eq!(enc(uncapped, Some(CodecPool::new(4).unwrap()), 16), 1);
+        // From inside a rayon pool every group is encoded on the calling thread, and the
+        // file is the same.
+        let batches = vec![wide(0, 9_000), wide(9_000, 2_000)];
+        let props = || {
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(2_000))
+                .build()
+        };
+        let want = serial(&batches, props());
+        let outer = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let got =
+            outer.install(|| in_flight(&batches, props(), Some(CodecPool::new(4).unwrap()), 4));
+        assert!(got == want);
     }
 
     /// The encoder refuses the row-group splits it does not reproduce rather than writing a

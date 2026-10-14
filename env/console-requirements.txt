@@ -30,6 +30,15 @@
 deeplc==4.5.0
 torch==2.14.0+cpu
 psm-utils
+
+# IM2Deep (scripts/im2deep_worker.py) predicts a FASTA library's 1/K0 when
+# `predict_frag.im_predictor` asks for it. It is torch-backed and imports DeepLC itself,
+# so it shares this environment: im2deep 2.0.2 with deeplc 4.5.0, ms2pip 4.2.0, torch
+# 2.14.0+cpu, psm-utils and pyarrow resolve and import together on Python 3.11 (verified
+# 2026-10-13: numpy 2.4.6, pandas 2.3.3, pyarrow 26.0.0). 2.0.0 is the engine's floor
+# (`MIN_IM2DEEP_VERSION`): the `im2deep.predict` / `im2deep.ccs2im` API the worker calls.
+im2deep>=2.0.0
+
 # >= 83 closes PYSEC-2026-3447 (CVE-2026-59890). torch 2.12.1 declared setuptools<82
 # and pulled the affected 81.0.0 into every environment; 2.14.0 does not.
 setuptools>=83

@@ -84,7 +84,7 @@ jobs:
           # (torch DLL init after numpy) happens at import time and not at probe
           # time.
           docker run --rm --entrypoint /opt/conda/envs/deeplc/bin/python mumdia:ci \
-            -c "import deeplc, numpy, pyarrow, torch, psm_utils; print('deeplc', deeplc.__version__, '| torch', torch.__version__)"
+            -c "import deeplc, im2deep, numpy, pyarrow, torch, psm_utils; print('deeplc', deeplc.__version__, '| im2deep', im2deep.__version__, '| torch', torch.__version__)"
           docker run --rm --entrypoint /opt/conda/envs/rescore/bin/python mumdia:ci \
             -c "import mokapot, ms2pip, sklearn, numpy, pandas, pyarrow; print('mokapot', mokapot.__version__, '| ms2pip', ms2pip.__version__)"
 

@@ -36,6 +36,7 @@ Usage:
     [--decoy-strategy shift|reverse]
 """
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -79,6 +80,48 @@ def assign_base_ids(imported_base_by_seq, added_seqs, next_id):
             next_id += 1
         out.append(fresh[seq])
     return out
+
+
+def predict_frag_config(config, work_dir):
+    """The configuration for the internal predict-frag call: `config` with
+    `predict_frag.im_predictor` at `none`.
+
+    The added entries take their 1/K0 from nowhere: an imported library's 1/K0 comes from
+    the library, and predicting the added rows with another model would give the merged
+    table two 1/K0 sources. A config that already predicts none is used as given; otherwise
+    a copy is written to `work_dir`, with a relative `sidecar_script_dir` pointed at this
+    script's own directory, because the engine resolves that path against the config file.
+    """
+    if not config:
+        return config
+    with open(config, encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    pf = cfg.get("predict_frag") or {}
+    if pf.get("im_predictor", "none") == "none":
+        return config
+    pf["im_predictor"] = "none"
+    script_dir = pf.get("sidecar_script_dir", "scripts")
+    if not os.path.isabs(script_dir):
+        pf["sidecar_script_dir"] = os.path.dirname(os.path.abspath(__file__))
+    cfg["predict_frag"] = pf
+    path = os.path.join(work_dir, "aug_predict_frag_config.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2)
+    print("      predict-frag runs with predict_frag.im_predictor = none: the added entries "
+          "carry no 1/K0", flush=True)
+    return path
+
+
+def align_library_im(imported, added):
+    """`added` with a null `predicted_im` column when `imported` has one and it has not.
+
+    The merge selects the imported table's columns from both halves, so without the
+    column the concatenation fails on the missing key. Null, not a value: the added
+    entries have no library 1/K0.
+    """
+    if "predicted_im" in imported.columns and "predicted_im" not in added.columns:
+        added = added.assign(predicted_im=np.full(len(added), np.nan, dtype=np.float64))
+    return added
 
 
 def run_stage(mumdia_bin, subcmd, args, config):
@@ -156,7 +199,7 @@ def main():
               ["--peptidoforms", W("aug_missing_pforms.parquet"),
                "--out-precursors", W("aug_missing_prec.parquet"),
                "--out-fragments", W("aug_missing_frag.parquet"),
-               "--work-dir", args.work_dir], args.config)
+               "--work-dir", args.work_dir], predict_frag_config(args.config, args.work_dir))
     mprec = pd.read_parquet(W("aug_missing_prec.parquet"))
     mfrag = pd.read_parquet(W("aug_missing_frag.parquet"))
 
@@ -192,6 +235,7 @@ def main():
     imp_tfrag = imp_tfrag[imp_tfrag.candidate_id.isin(set(imp_t.candidate_id))].copy()
     pcols = list(imp_t.columns)
     fcols = list(imp_tfrag.columns)
+    mprec = align_library_im(imp_t, mprec)
     merged_prec = pd.concat([imp_t[pcols], mprec[pcols]], ignore_index=True)
     merged_frag = pd.concat([imp_tfrag[fcols], mfrag[fcols]], ignore_index=True)
     # recompute n_fragments from the emitted fragment rows.
@@ -200,6 +244,10 @@ def main():
     write_engine_parquet(merged_prec, W("aug_merged_prec.parquet"))
     write_engine_parquet(merged_frag, W("aug_merged_frag.parquet"))
     print(f"      merged target precursors: {len(merged_prec)} (added {len(mprec)})")
+    if "predicted_im" in merged_prec.columns:
+        n_im = int(merged_prec["predicted_im"].notna().sum())
+        print(f"      library 1/K0: {n_im} target precursors carry one, "
+              f"{len(merged_prec) - n_im} are null")
 
     # 7. Build paired decoys + densify via the existing decoy builder.
     print("[5/6] build paired decoys (%s)" % args.decoy_strategy, flush=True)

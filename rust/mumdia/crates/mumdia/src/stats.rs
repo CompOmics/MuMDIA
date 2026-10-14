@@ -1,6 +1,7 @@
 //! Shared numeric kernels (docs/14_build_test_deploy_gotchas.md):
 //! population-variance Pearson with a zero-variance guard returning 0, cosine
-//! similarity, spectral angle. One implementation, unit-tested.
+//! similarity, spectral angle, intensity-weighted median and mean absolute deviation.
+//! One implementation, unit-tested.
 
 /// Population Pearson correlation; returns 0 on zero variance (documented guard).
 pub fn pearson(a: &[f64], b: &[f64]) -> f64 {
@@ -192,9 +193,229 @@ pub fn spectral_angle(a: &[f64], b: &[f64]) -> f64 {
     1.0 - 2.0 * c.acos() / std::f64::consts::PI
 }
 
+/// Weighted median of `(value, weight)` pairs: the smallest value whose cumulative weight
+/// reaches half the total. `None` when empty or weightless. Sorts `pts` in place by value.
+pub fn weighted_median(pts: &mut [(f64, f64)]) -> Option<f64> {
+    let total: f64 = pts.iter().map(|p| p.1).sum();
+    if pts.is_empty() || total.is_nan() || total <= 0.0 {
+        return None;
+    }
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut acc = 0.0;
+    for &(v, w) in pts.iter() {
+        acc += w;
+        if acc >= 0.5 * total {
+            return Some(v);
+        }
+    }
+    pts.last().map(|p| p.0)
+}
+
+/// Weighted mean absolute deviation of `(value, weight)` pairs from `center`:
+/// `sum(w * |v - center|) / sum(w)`. Not a median absolute deviation. `None` when
+/// weightless.
+pub fn weighted_mean_abs_dev(pts: &[(f64, f64)], center: f64) -> Option<f64> {
+    let total: f64 = pts.iter().map(|p| p.1).sum();
+    if total.is_nan() || total <= 0.0 {
+        return None;
+    }
+    Some(
+        pts.iter()
+            .map(|&(v, w)| w * (v - center).abs())
+            .sum::<f64>()
+            / total,
+    )
+}
+
+/// Weighted mean and population standard deviation of `(value, weight)` pairs:
+/// `sum(w * v) / sum(w)` and `sqrt(sum(w * (v - mean)^2) / sum(w))`. `None` when the
+/// weights sum to zero or less.
+pub fn weighted_mean_sd(pts: &[(f64, f64)]) -> Option<(f64, f64)> {
+    let sw: f64 = pts.iter().map(|p| p.1).sum();
+    if sw <= 0.0 {
+        return None;
+    }
+    let mean = pts.iter().map(|p| p.0 * p.1).sum::<f64>() / sw;
+    let var = pts.iter().map(|p| p.1 * (p.0 - mean).powi(2)).sum::<f64>() / sw;
+    Some((mean, var.sqrt()))
+}
+
+/// How [`loo_ref_corr`] forms the leave-one-out reference of member `f`: a profile built
+/// from the members' weighted traces with `f`'s own contribution left out. The two forms
+/// differ in floating point (a sum of the others is not bit-identical to a total minus one
+/// term), and each caller keeps the form its values were defined with.
+pub enum LooRef<'a> {
+    /// `total[t] - w[f] * traces[f][t]` over the points the two share, `total` unchanged
+    /// beyond them, where `total` is the weighted sum of every member, built by the caller:
+    /// the co-elution family's `frag_loo_ref_corr_*` and retrace's `imc_ref_w`.
+    Subtract(&'a [f64]),
+    /// The weighted sum over `set` of every member but `f`, `len` points long, a member's
+    /// trace cut at `len` and a member past the end of `traces` skipped: the interference
+    /// family's prune, retained-set mean and dominant-fragment correlation.
+    SumOthers { set: &'a [usize], len: usize },
+}
+
+/// Member `f`'s leave-one-out reference ([`LooRef`]), from the members' `traces` and their
+/// weights `w` (the predicted intensities).
+pub fn loo_reference<T: AsRef<[f64]>>(traces: &[T], w: &[f64], f: usize, r: LooRef) -> Vec<f64> {
+    match r {
+        LooRef::Subtract(total) => {
+            let mut out = total.to_vec();
+            let wf = w[f];
+            for (v, x) in out.iter_mut().zip(traces[f].as_ref()) {
+                *v -= wf * x;
+            }
+            out
+        }
+        LooRef::SumOthers { set, len } => {
+            let mut acc = vec![0.0f64; len];
+            for &g in set {
+                if g == f || g >= traces.len() {
+                    continue;
+                }
+                let wg = w[g];
+                for (a, v) in acc.iter_mut().zip(traces[g].as_ref()) {
+                    *a += wg * v;
+                }
+            }
+            acc
+        }
+    }
+}
+
+/// The leave-one-out reference correlation of member `f`: the [`pearson`] correlation of
+/// its trace with its leave-one-out reference ([`loo_reference`]). The one kernel every
+/// leave-one-out reference correlation goes through: the co-elution and interference
+/// families on elution traces, and retrace's `imc_ref_w` on 1/K0 profiles.
+pub fn loo_ref_corr<T: AsRef<[f64]>>(traces: &[T], w: &[f64], f: usize, r: LooRef) -> f64 {
+    pearson(traces[f].as_ref(), &loo_reference(traces, w, f, r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kernel reproduces, bit for bit, the two private copies it replaced: the
+    /// co-elution family's subtraction loop and the interference family's `loo_ref`. The
+    /// 3D feature values therefore do not change. Traces of unequal length, members past
+    /// the end and an excluded member are all exercised.
+    #[test]
+    fn the_loo_kernel_is_bit_identical_to_the_copies_it_replaced() {
+        // The co-elution loop as it stood: R^{-f} = R - pred[f] * traces[f].
+        fn coelution_old(traces: &[Vec<f64>], pred: &[f64], r: &[f64], k: usize) -> Vec<f64> {
+            let mut loo = Vec::new();
+            let t = r.len();
+            for (i, trace) in traces.iter().enumerate().take(k) {
+                let mut rm = r.to_vec();
+                let lf = pred[i];
+                for (idx, val) in rm.iter_mut().enumerate().take(t) {
+                    if idx < trace.len() {
+                        *val -= lf * trace[idx];
+                    }
+                }
+                loo.push(pearson(trace, &rm));
+            }
+            loo
+        }
+        // The interference `loo_ref` as it stood.
+        #[allow(clippy::needless_range_loop)]
+        fn loo_ref_old(
+            traces: &[Vec<f64>],
+            pred: &[f64],
+            set: &[usize],
+            exclude: usize,
+            tp: usize,
+        ) -> Vec<f64> {
+            let mut acc = vec![0.0f64; tp];
+            for &g in set {
+                if g == exclude || g >= traces.len() {
+                    continue;
+                }
+                let x = &traces[g];
+                let w = pred[g];
+                let n = x.len().min(tp);
+                for t in 0..n {
+                    acc[t] += w * x[t];
+                }
+            }
+            acc
+        }
+        // A deterministic pseudo-random stream.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for case in 0..200usize {
+            let k = 1 + case % 9;
+            let tp = 3 + case % 17;
+            let traces: Vec<Vec<f64>> = (0..k)
+                .map(|i| {
+                    // Some traces shorter or longer than the reference.
+                    let n = if i % 3 == 0 { tp } else { tp + i % 4 - 1 };
+                    (0..n).map(|_| next() * 1e4).collect()
+                })
+                .collect();
+            let pred: Vec<f64> = (0..k).map(|_| next()).collect();
+            let r: Vec<f64> = (0..tp).map(|_| next() * 3e4).collect();
+            let old = coelution_old(&traces, &pred, &r, k);
+            for (f, want) in old.iter().enumerate() {
+                let got = loo_ref_corr(&traces, &pred, f, LooRef::Subtract(&r));
+                assert_eq!(got.to_bits(), want.to_bits(), "case {case}, fragment {f}");
+            }
+            // A set with members past the end, as the interference calls can pass.
+            let set: Vec<usize> = (0..k + 2).filter(|g| g % 2 == 0 || *g >= k).collect();
+            for &f in set.iter().filter(|&&f| f < k) {
+                let sum = LooRef::SumOthers { set: &set, len: tp };
+                let want = pearson(&traces[f], &loo_ref_old(&traces, &pred, &set, f, tp));
+                assert_eq!(
+                    loo_ref_corr(&traces, &pred, f, sum).to_bits(),
+                    want.to_bits(),
+                    "case {case}, member {f}"
+                );
+                let sum = LooRef::SumOthers { set: &set, len: tp };
+                assert_eq!(
+                    loo_reference(&traces, &pred, f, sum),
+                    loo_ref_old(&traces, &pred, &set, f, tp)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_mean_sd_weighs_each_point() {
+        assert_eq!(weighted_mean_sd(&[]), None);
+        assert_eq!(weighted_mean_sd(&[(1.0, 0.0)]), None);
+        let (m, sd) = weighted_mean_sd(&[(0.9, 1.0), (1.0, 1.0)]).unwrap();
+        assert!((m - 0.95).abs() < 1e-12 && (sd - 0.05).abs() < 1e-12);
+        // Weight 3 at 1.0 against 1 at 0.0: mean 0.75, variance 3/16.
+        let (m, sd) = weighted_mean_sd(&[(1.0, 3.0), (0.0, 1.0)]).unwrap();
+        assert!((m - 0.75).abs() < 1e-12);
+        assert!((sd - (3.0f64 / 16.0).sqrt()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn weighted_median_follows_the_intensity() {
+        assert_eq!(weighted_median(&mut []), None);
+        assert_eq!(weighted_median(&mut [(0.9, 0.0)]), None);
+        // One intense peak outweighs two faint interferers on either side.
+        assert_eq!(
+            weighted_median(&mut [(1.10, 1.0), (0.85, 10.0), (0.70, 1.0)]),
+            Some(0.85)
+        );
+        assert_eq!(weighted_median(&mut [(0.8, 1.0), (0.9, 1.0)]), Some(0.8));
+    }
+
+    #[test]
+    fn weighted_mean_abs_dev_is_the_weighted_mean_distance() {
+        assert_eq!(weighted_mean_abs_dev(&[], 1.0), None);
+        assert_eq!(weighted_mean_abs_dev(&[(0.9, 0.0)], 1.0), None);
+        // (1 * 0.5 + 3 * 0.1) / 4 = 0.2, where the weighted median distance would be 0.1.
+        let d = weighted_mean_abs_dev(&[(0.5, 1.0), (1.1, 3.0)], 1.0).unwrap();
+        assert!((d - 0.2).abs() < 1e-12, "{d}");
+    }
 
     #[test]
     fn pearson_perfect_and_flat() {

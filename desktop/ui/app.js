@@ -1021,10 +1021,10 @@ async function refreshThermo() {
   }
   banner(
     $("bruker-note"),
-    "Bruker diaPASEF: MuMDIA's pipeline is 3D and discards ion mobility, so a " +
-      "diaPASEF file loses the mobility separation that makes it selective. It will " +
-      "search, with calibrated q values, but with considerably fewer identifications " +
-      "than a 4D engine on the same data."
+    "Bruker: a timsTOF .d with diaPASEF frames is read directly, with its ion mobility " +
+      "kept, and needs no converter. Every other Bruker .d is converted with msconvert, " +
+      "which discards ion mobility: it will search, with calibrated q values, but a " +
+      "mobility-separated acquisition loses the separation that makes it selective."
   );
 
   if (installing && !state.thermoTimer) {
@@ -1085,7 +1085,12 @@ async function updateRawNote() {
     " Conversion takes several minutes and writes an mzML next to the input, which " +
     "later searches of the same file reuse. Peak statistics are reported during the run.";
 
-  if (v.needs === "ThermoParser") {
+  if (v.needs === "Nothing") {
+    // A diaPASEF .d: the engine reads it natively, so nothing is converted.
+    body.textContent =
+      "This timsTOF diaPASEF .d is read directly, with its ion mobility kept. No " +
+      "conversion and no converter are needed. Peak statistics are reported during the run.";
+  } else if (v.needs === "ThermoParser") {
     body.textContent = state.thermoReady
       ? `MuMDIA reads mzML, so this is converted first with ThermoRawFileParser.${common}`
       : "This needs the Thermo .raw converter, which is not installed. Go to Setup and " +
@@ -1093,12 +1098,13 @@ async function updateRawNote() {
   } else {
     let extra = "";
     if (v.label === "Bruker .d") {
-      // The thing a diaPASEF user must be told, and cannot infer.
+      // The thing the user must be told, and cannot infer: this .d is not diaPASEF, so
+      // it goes through msconvert and loses its ion mobility.
       extra =
-        " Note that MuMDIA's pipeline is 3D and discards ion mobility. For diaPASEF " +
-        "that removes the separation the acquisition exists to produce, so expect " +
-        "considerably fewer identifications than a 4D engine. The q values stay " +
-        "calibrated; the sensitivity does not.";
+        " This .d is not a timsTOF diaPASEF acquisition, so msconvert converts it and " +
+        "its ion mobility is discarded. For a mobility-separated acquisition that " +
+        "removes the separation it exists to produce. The q values stay calibrated; " +
+        "the sensitivity does not.";
     }
     body.textContent = state.msconvert
       ? `MuMDIA reads mzML, so this is converted first with msconvert.${common}${extra}`

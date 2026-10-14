@@ -108,6 +108,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import torch
 from psm_utils import PSM, PSMList
+from _torch_threads import capped_threads, thread_cap  # noqa: E402  (after deeplc, as every import here)
 
 STD = set("ACDEFGHIKLMNPQRSTVWY")
 MOD_RE = r"\[[^\]]*\]"
@@ -297,136 +298,6 @@ class PredictTimers:
                 round(self.forward, 3) if self.have_forward else None)
 
 
-def _windows_physical_cores():
-    """Physical core count from `GetLogicalProcessorInformationEx(RelationProcessorCore)`.
-
-    One record per physical core, across every processor group, whatever its efficiency
-    class: a hybrid CPU's efficiency cores are real cores for a forward pass, unlike a
-    second hyperthread on a core that is already busy. None when the call fails.
-    """
-    try:
-        import ctypes
-        import struct
-        from ctypes import wintypes
-
-        k32 = ctypes.windll.kernel32
-        relation_processor_core = 0
-        size = wintypes.DWORD(0)
-        k32.GetLogicalProcessorInformationEx(relation_processor_core, None, ctypes.byref(size))
-        buf = ctypes.create_string_buffer(size.value)
-        if not k32.GetLogicalProcessorInformationEx(
-            relation_processor_core, buf, ctypes.byref(size)
-        ):
-            return None
-        raw = buf.raw
-        cores = 0
-        off = 0
-        # SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX: Relationship (u32), Size (u32), payload.
-        while off + 8 <= size.value:
-            relationship, record_size = struct.unpack_from("<II", raw, off)
-            if record_size < 8:
-                return None
-            if relationship == relation_processor_core:
-                cores += 1
-            off += record_size
-        return cores or None
-    except Exception:  # noqa: BLE001 - detection is best effort; None means no cap
-        return None
-
-
-def _sysfs_physical_cores(cpus, sysfs="/sys/devices/system/cpu"):
-    """The number of physical cores behind the logical CPUs `cpus`, from sysfs, or None.
-
-    Each CPU's `topology/core_cpus_list` (Linux 5.5 and later; `thread_siblings_list`
-    before) names the logical CPUs that share its physical core, so its contents identify
-    that core on every architecture, and the hyperthreads of one core count once. The
-    `(physical_package_id, core_id)` pair is the fallback only: on many device-tree ARM64
-    systems `core_id` restarts in each cluster and the package id is the same for every
-    CPU, so the pairs of two clusters collide and eight cores count as four. None when a
-    CPU has no topology at all (some containers), which leaves the count to the caller.
-    """
-    cores = set()
-    for cpu in cpus:
-        topo = "%s/cpu%d/topology/" % (sysfs, cpu)
-        key = None
-        for name in ("core_cpus_list", "thread_siblings_list"):
-            try:
-                with open(topo + name, encoding="ascii") as fh:
-                    key = "cpus " + fh.read().strip()
-                break
-            except OSError:
-                continue
-        if key is None:
-            try:
-                with open(topo + "physical_package_id", encoding="ascii") as fh:
-                    package = fh.read().strip()
-                with open(topo + "core_id", encoding="ascii") as fh:
-                    core = fh.read().strip()
-            except OSError:
-                return None
-            key = "pair %s/%s" % (package, core)
-        cores.add(key)
-    return len(cores) or None
-
-
-def physical_cores():
-    """`(count, how)`: the physical cores this process may run on, or `(None, why)`.
-
-    Linux: the distinct physical cores (`_sysfs_physical_cores`) behind the CPUs in
-    `sched_getaffinity(0)`, so a container or a `taskset` mask is respected and two
-    hyperthreads of one core count once. Windows: every physical core of the machine.
-    Anywhere else the count is unknown and nothing is capped.
-    """
-    if hasattr(os, "sched_getaffinity"):
-        try:
-            cpus = sorted(os.sched_getaffinity(0))
-        except OSError:
-            cpus = []
-        if cpus:
-            n = _sysfs_physical_cores(cpus)
-            if n is None:
-                return len(cpus), "%d CPUs in the affinity mask (no sysfs topology)" % len(cpus)
-            return n, "%d physical cores under the affinity mask of %d CPUs" % (n, len(cpus))
-    if sys.platform == "win32":
-        n = _windows_physical_cores()
-        if n:
-            return n, "%d physical cores (GetLogicalProcessorInformationEx)" % n
-    return None, "physical core count unknown on this platform"
-
-
-def deeplc_thread_cap():
-    """`(cap, why)` for DeepLC's torch CPU threads; a cap of 0 means none.
-
-    Measured on doxy (EPYC, 64 cores, 128 CPUs): the multi-head step took 10:41 at 96
-    requested threads and 18:09 at 128, because every OpenMP-parallel op waits for its
-    slowest thread and a second hyperthread on a busy core is the slowest one. The cap is a
-    ceiling on what the engine asks for, never a target: a request at or below it is
-    taken as given. The engine asks for every logical CPU unless `--threads` says
-    otherwise, so on an SMT host the cap binds by default. `MUMDIA_DEEPLC_THREAD_CAP` sets
-    it explicitly; 0 disables it. A value that is not a finite number (`twelve`, `nan`,
-    `inf`) is reported and ignored.
-    """
-    raw = os.environ.get("MUMDIA_DEEPLC_THREAD_CAP", "auto").strip().lower()
-    if raw not in ("", "auto"):
-        try:
-            value = int(float(raw))
-        except (ValueError, OverflowError):
-            print("WARNING: MUMDIA_DEEPLC_THREAD_CAP=%r is not a number, 0 or auto; "
-                  "using auto" % raw, flush=True)
-        else:
-            if value <= 0:
-                return 0, "MUMDIA_DEEPLC_THREAD_CAP=0 (no cap)"
-            return value, "MUMDIA_DEEPLC_THREAD_CAP"
-    n, why = physical_cores()
-    return (n or 0), why
-
-
-def capped_threads(requested, cap):
-    """`requested` bounded by `cap` (0 = no cap), and at least 1."""
-    requested = max(1, int(requested))
-    return requested if cap <= 0 else max(1, min(requested, cap))
-
-
 def is_std(pf):
     # Same predicate as `all(c in STD for c in strip_mods(base_pf(pf)))`, but the regex
     # substitution only runs when there is actually a bracketed modification to strip.
@@ -435,6 +306,64 @@ def is_std(pf):
     if "[" in b:
         b = strip_mods(b)
     return not (set(b) - STD)
+
+
+def output_range_bounds(anchor_rt):
+    """The plausible range of a calibrated retention time: [min - span, max + span] of the
+    anchors' observed RT, span = max - min. None without two finite anchors.
+
+    A multi-head calibration predicts on the scale of the run it was fitted to, so a value a
+    whole anchor span beyond the first or last anchor is not a late or early peptide but a
+    failed extrapolation: after a large-anchor refit 1.95% of target and 1.97% of decoy rows
+    of one library came out as far as 3.8e5 s, with the ridge alpha moving erratically with
+    the anchor count. Those values sit in the library and misplace windows directly.
+    """
+    rt = np.asarray([v for v in anchor_rt if v is not None], dtype=np.float64)
+    rt = rt[np.isfinite(rt)]
+    if len(rt) < 2:
+        return None
+    lo, hi = float(rt.min()), float(rt.max())
+    span = hi - lo
+    return lo - span, hi + span
+
+
+def guard_output_range(values, bounds):
+    """`values` (float64 predictions) with every finite value outside `bounds` clamped to it,
+    and a record of what was done.
+
+    Clamped rather than set non-finite: the engine refuses a library whose `predicted_irt`
+    is not finite (`index.rs`), and a non-finite prediction would make `rewrite_irt` keep
+    the imported value, on another scale. When nothing is out of range the array is returned
+    as it came, so the written library is byte-identical to one written without the guard.
+    """
+    n = int(len(values))
+    if bounds is None:
+        return values, {"bounds": None, "n_out_of_range": 0, "fraction": 0.0,
+                        "predicted": n, "action": "none"}
+    lo, hi = bounds
+    finite = np.isfinite(values)
+    out = finite & ((values < lo) | (values > hi))
+    n_out = int(out.sum())
+    record = {"bounds": [lo, hi], "n_out_of_range": n_out,
+              "fraction": (n_out / n) if n else 0.0, "predicted": n,
+              "action": "clamped" if n_out else "none"}
+    if not n_out:
+        return values, record
+    guarded = np.array(values, dtype=np.float64, copy=True)
+    guarded[out] = np.clip(guarded[out], lo, hi)
+    return guarded, record
+
+
+def apply_output_range_guard(values, anchor_rt, label=""):
+    """`guard_output_range` with the bounds of `anchor_rt`, saying on stdout what it did."""
+    guarded, record = guard_output_range(values, output_range_bounds(anchor_rt))
+    if record["n_out_of_range"]:
+        prefix = f"[{label}] " if label else ""
+        print(f"{prefix}WARNING: {record['n_out_of_range']} of {record['predicted']} calibrated "
+              f"predictions ({100.0 * record['fraction']:.3f}%) lay outside "
+              f"[{record['bounds'][0]:.1f}, {record['bounds'][1]:.1f}] s, one anchor span "
+              f"beyond the anchors, and were clamped to it", flush=True)
+    return guarded, record
 
 
 def agg(a):
@@ -716,8 +645,8 @@ def main():
 
     # Bound torch's own thread pool; only one OpenMP pool spins now (matters on cpu). Both
     # the training and the prediction pool are capped at the physical cores this process
-    # may use (`deeplc_thread_cap`); a request at or below the cap is taken as given.
-    cap, cap_why = deeplc_thread_cap()
+    # may use (`_torch_threads.thread_cap`); a request at or below the cap is taken as given.
+    cap, cap_why = thread_cap("MUMDIA_DEEPLC_THREAD_CAP", "auto")
     train_threads = capped_threads(args.threads, cap)
     predict_asked = args.predict_threads if args.predict_threads > 0 else args.threads
     predict_threads = capped_threads(predict_asked, cap)
@@ -914,6 +843,12 @@ def main():
             parts = [p.get(key) for p in per_shard]
             timings[key] = None if any(v is None for v in parts) else round(sum(parts), 3)
     timings["predict"] = round(time.time() - t_pred0, 3)
+    # The multi-head output-range guard: one place after every prediction path (one process,
+    # the projection cache and the shards), before the library is rewritten.
+    range_record = None
+    if calibration is not None:
+        values, range_record = apply_output_range_guard(
+            values, [psm.retention_time for psm in ref_psms])
     print(f"prediction phase: {time.time() - t_pred0:.1f}s total "
           f"(featurisation {_fmt_s(timings['featurisation'])}, "
           f"forward pass {_fmt_s(timings['forward'])}"
@@ -922,7 +857,7 @@ def main():
     if band_pairs is not None:
         write_bands(band_pairs, band_pos, uniq, values, which, thread_record, shard_record,
                     timings,
-                    multihead_record(calibration, args.multihead, len(ref_psms))
+                    multihead_record(calibration, args.multihead, len(ref_psms), range_record)
                     if calibration is not None else None,
                     cache_record)
         return
@@ -945,7 +880,8 @@ def main():
     if cache_record is not None:
         summary["projection_cache"] = cache_record
     if calibration is not None:
-        summary["multihead"] = multihead_record(calibration, args.multihead, len(ref_psms))
+        summary["multihead"] = multihead_record(calibration, args.multihead, len(ref_psms),
+                                                range_record)
     with open(args.lib_out + ".summary.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     print(f"wrote library with re-predicted iRT ({which}): {args.lib_out}")
@@ -960,12 +896,14 @@ def main():
               f"the counts are in {args.lib_out}.summary.json", flush=True)
 
 
-def multihead_record(calibration, requested, anchors):
+def multihead_record(calibration, requested, anchors, output_range=None):
     """What the multi-head fit chose, so two runs can be compared head for head.
 
     A thread-count or version change moves the reference predictions in the last bits, and
-    the survey's validation asks whether the selected heads stayed the same. None of these
-    are read back by the engine.
+    the survey's validation asks whether the selected heads stayed the same. The ridge alpha
+    and the output-range guard's record (`guard_output_range`: how many predictions were
+    clamped and their fraction) show an unstable fit, which the alpha alone does not. None of
+    these are read back by the engine.
     """
     idx = getattr(calibration, "_head_idx", None)
     ridge = getattr(calibration, "_ridge", None)
@@ -977,6 +915,7 @@ def multihead_record(calibration, requested, anchors):
         "heads": None if idx is None else [int(h) for h in idx],
         "best_head": None if best is None else int(best),
         "ridge_alpha": None if alpha is None else float(alpha),
+        "output_range": output_range,
     }
 
 

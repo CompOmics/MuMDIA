@@ -527,6 +527,17 @@ def precursor_mz(tokens, charge):
     return (neutral + charge * PROTON) / charge
 
 
+def library_im(i):
+    """Library 1/K0 (V s cm^-2) for fixture precursor `i`, or None for every third one.
+
+    A library imported with ion mobility carries a nullable `predicted_im` (precursor
+    table version 2), and a precursor the source library had no value for is null. The
+    decoy builders must carry both kinds to the paired decoy unchanged: a decoy's 1/K0
+    follows its target, as its iRT does.
+    """
+    return None if i % 3 == 2 else round(0.70 + 0.05 * i, 4)
+
+
 # ---------------------------------------------------------------------------
 # source-order helper (the DeepLC/torch import-order contract)
 # ---------------------------------------------------------------------------

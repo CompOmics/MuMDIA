@@ -58,6 +58,7 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
             anyhow::bail!("--mzml not found: {m}");
         }
     }
+    crate::stages::run::refuse_unsupported_on_4d(p.config, p.mzmls)?;
     match (p.lib_precursors, p.lib_fragments) {
         (Some(lp), Some(lf)) => {
             for path in [lp, lf] {
@@ -154,6 +155,37 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
             cfg.mbr.strategy
         );
     }
+    refuse_unchecked_cross_run_step(cfg)?;
+    Ok(())
+}
+
+/// Refuse the cross-run quant step ([`QuantConfig::needs_cross_run_fit`]) where its fit is
+/// not yet known to be sound. The fit keys every reduction on `candidate_id` across runs, so
+/// a candidate id must name the same precursor in every run. That holds for one shared
+/// library and for the second pass's empirical library. It has not been checked for a
+/// grouped run, whose bands write their own tables, nor for per-run library adaptation.
+///
+/// [`QuantConfig::needs_cross_run_fit`]: mumdia_core::config::QuantConfig::needs_cross_run_fit
+fn refuse_unchecked_cross_run_step(cfg: &Config) -> Result<()> {
+    if !cfg.quant.needs_cross_run_fit() {
+        return Ok(());
+    }
+    if cfg.groups.window_groups > 1 {
+        anyhow::bail!(
+            "the cross-run quant step (quant.fragment_selection = cross_run, \
+             quant.baseline_source = experiment or quant.fixed_scan_halfwidth_scale > 0) is \
+             not supported with groups.window_groups > 1: candidate_id stability across a \
+             grouped run's bands has not been checked"
+        );
+    }
+    if cfg.experiment.rt_library_scope == RtLibraryScope::PerRun {
+        anyhow::bail!(
+            "the cross-run quant step (quant.fragment_selection = cross_run, \
+             quant.baseline_source = experiment or quant.fixed_scan_halfwidth_scale > 0) is \
+             not supported with experiment.rt_library_scope = per_run: candidate_id \
+             stability across per-run libraries has not been checked. Use first_run_only."
+        );
+    }
     Ok(())
 }
 
@@ -163,6 +195,18 @@ struct SecondPassOut {
     competed: Vec<String>,
     chroms: Vec<ChromTable>,
     library: second_pass::EmpiricalLibrary,
+    /// Every run's `psms_extracted` of the second pass, by run, for the shadow 1/K0 term.
+    psms_extracted: Vec<String>,
+    /// Some run's spectra carry 1/K0, so the diagnostics are written to
+    /// `empirical_library.json` (a 3D experiment's summary is what it always was).
+    has_im: bool,
+}
+
+/// The first pass's `w_im` of a run, from its `cal.json`: `None` for a run without one (every
+/// 3D run) or with a non-finite one.
+fn first_pass_w_im(cal: &str) -> Option<f64> {
+    let v: serde_json::Value = mumdia_io::json::read_json(cal).ok()?;
+    v.get("w_im")?.as_f64().filter(|w| w.is_finite())
 }
 
 /// The second pass (`mbr.strategy = second_pass`): the empirical library of the first pass's
@@ -174,7 +218,21 @@ struct SecondPassOut {
 ///
 /// The fragment-rarity prescreen is off here: the empirical library is already the screened
 /// set, and the second pass must search all of it. Under `parallel_runs = auto` the runs are
-/// pulled from the plan's queue, otherwise they run in chunks of `par` as the first pass did.
+/// pulled from the plan's queue, otherwise they run in chunks of `par` as the first pass did:
+/// the plan made for the first pass is reused as it is.
+///
+/// On a run whose spectra carry 1/K0 the chain gets two settings of its own
+/// (`chain::PassExtras`), and a 3D run neither:
+///
+/// - a 1/K0 window floor: `im_window_min` is raised to the run's first-pass `w_im`, because a
+///   consensus 1/K0 calibrates to a narrower window than the gate's evidence supports
+///   (recorded in `cal.json` as `im_window_floor`);
+/// - a quantification trace pad (`extract::TracePad::for_quant`): the narrow second-pass RT
+///   window would clip the fixed integration window and its baseline flanks of an apex near
+///   its edge. It needs `extract.emit_rt_window`, which tells the features stage where the
+///   window ends; without it there is no pad, with a warning.
+///
+/// Retrace runs here as in the first pass (`finish_run` with `retrace` on).
 #[allow(clippy::too_many_arguments)]
 fn search_second_pass(
     cfg: &Config,
@@ -188,10 +246,16 @@ fn search_second_pass(
     plan: &crate::sched::RunConcurrency,
     par: usize,
 ) -> Result<Option<SecondPassOut>> {
+    // The first pass's extracted rows, by source, for the consensus 1/K0.
+    let first_psms: Vec<String> = run_dirs
+        .iter()
+        .map(|d| format!("{d}/psms_extracted.parquet"))
+        .collect();
     let library = second_pass::build_library(&second_pass::BuildParams {
         scored: first_scored,
         lib_precursors: lib_p,
         lib_fragments: lib_f,
+        psms_extracted: &first_psms,
         out_dir: &format!("{out}/library"),
         q: cfg.mbr.q_anchor,
     })?;
@@ -230,14 +294,49 @@ fn search_second_pass(
             &run_out,
             Some(&seed_lib),
         )?;
+        // The run's own settings on 4D data; on a 3D run `cfg_run` is `cfg2` and the extras
+        // are the default, so its chain is the one it always was.
+        let mut cfg_run = cfg2.clone();
+        let mut extras = crate::stages::chain::PassExtras::default();
+        let first_cal = format!("{}/cal.json", run_dirs[i]);
+        if let Some(w) = first_pass_w_im(&first_cal) {
+            let configured = cfg_run.rt_im_train.im_window_min;
+            cfg_run.rt_im_train.im_window_min = configured.max(w);
+            extras.im_window_floor = Some(crate::stages::rt_im_train::ImWindowFloor {
+                configured,
+                first_pass_w_im: w,
+                source: &first_cal,
+            });
+            info!(
+                run = %names[i],
+                configured,
+                first_pass_w_im = w,
+                floor = cfg_run.rt_im_train.im_window_min,
+                "run-experiment: second pass, 1/K0 window floor from the first pass"
+            );
+        }
+        if crate::instrument::spectra_has_im(&co.ms2) {
+            match extract::TracePad::for_quant(&cfg.quant) {
+                Some(pad) if cfg.extract.emit_rt_window => extras.trace_pad = Some(pad),
+                Some(_) => warn!(
+                    run = %names[i],
+                    "run-experiment: second pass without extract.emit_rt_window, so the \
+                     chromatograms are not padded for quantification and a fixed integration \
+                     window near the RT window's edge is clipped"
+                ),
+                None => {}
+            }
+        }
         finish_run(
-            cfg2,
+            &cfg_run,
             ch,
             &library.precursors,
             &library.fragments,
             &co,
             &seed,
             &run_out,
+            true,
+            extras,
         )
     };
     let all: Vec<usize> = (0..n).collect();
@@ -267,10 +366,20 @@ fn search_second_pass(
         );
         return Ok(None);
     }
+    let has_im = run_dirs.iter().any(|d| {
+        convert::ConvertOutputs::existing(&format!("{d}/spectra"))
+            .is_ok_and(|co| crate::instrument::spectra_has_im(&co.ms2))
+    });
+    let psms_extracted = names
+        .iter()
+        .map(|nm| format!("{out}/{nm}/psms_extracted.parquet"))
+        .collect();
     Ok(Some(SecondPassOut {
         competed,
         chroms,
         library,
+        psms_extracted,
+        has_im,
     }))
 }
 
@@ -401,6 +510,7 @@ fn convert_run(
         top_peaks_ms2,
         top_peaks_ms1: 0,
         config_hash: &convert_hash,
+        tdf: convert::TdfParams::from_config(&cfg.convert),
     })
 }
 
@@ -466,7 +576,17 @@ fn chain_after_seed(
         rayon::current_num_threads(),
         BootInputs { ch, lib_f, co },
     )?;
-    let (competed, chrom) = finish_run(cfg, ch, &lib_p, lib_f, co, seed, out)?;
+    let (competed, chrom) = finish_run(
+        cfg,
+        ch,
+        &lib_p,
+        lib_f,
+        co,
+        seed,
+        out,
+        true,
+        Default::default(),
+    )?;
     Ok((
         vec![competed],
         vec![ChromTable::whole(&chrom)],
@@ -630,8 +750,11 @@ fn adapt_rt_library(
     Ok((lib_p, produced_rt_lib))
 }
 
-/// Retention-time windows, extract, features and compete of one ungrouped run on `lib_p`.
-/// Returns `(competed, chromatograms)`.
+/// Retention-time windows, extract, the optional retrace, features and compete of one
+/// ungrouped run on `lib_p`. `retrace` says whether this pass may retrace
+/// (`chain::ChainParams::retrace`): off for the RT bootstrap pass only. Returns
+/// `(competed, chromatograms)`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_run(
     cfg: &Config,
     ch: &str,
@@ -640,67 +763,23 @@ pub(crate) fn finish_run(
     co: &convert::ConvertOutputs,
     seed: &str,
     out: &str,
+    retrace: bool,
+    extras: crate::stages::chain::PassExtras,
 ) -> Result<(String, String)> {
-    let d = |name: &str| format!("{out}/{name}");
-    let windows = d("run_windows.parquet");
-    let rt_cfg = rt_im_train::with_anchor_cut(
-        &cfg.rt_im_train,
-        &rt_im_train::plan_anchors(seed, &cfg.rt_im_train)?,
-    );
-    // Handed to extract in memory; see `rt_im_train::RtWindows`.
-    let (_, fitted_windows) = rt_im_train::run_in_memory(rt_im_train::RtImTrainParams {
-        precursor_span: None,
-        anchor_irt_from_seed: false,
-        seed_psms: seed,
-        library_precursors: lib_p,
-        out_windows: &windows,
-        out_cal: &d("cal.json"),
-        cfg: &rt_cfg,
+    let o = crate::stages::chain::extract_to_compete(crate::stages::chain::ChainParams {
+        cfg,
         config_hash: ch,
+        lib_p,
+        lib_f,
+        converted: co,
+        seed,
+        out_dir: out,
+        lent_ms2: None,
+        manifest: None,
+        retrace,
+        extras,
     })?;
-    let survivors =
-        prescreen::run_if_enabled(cfg, ch, &co.ms2, Some(&co.ms1), lib_p, &windows, out)?;
-    let psms = d("psms_extracted.parquet");
-    let chrom = d("chromatograms.parquet");
-    let ext_cfg =
-        crate::stages::ms1cal::extract_cfg(&cfg.extract, seed, &co.ms1, cfg.rt_im_train.q_train)?;
-    extract::run(extract::ExtractParams {
-        precursor_span: None,
-        fragment_offset: None,
-        sibling_bands: 1,
-        rt_windows: fitted_windows,
-        scans: None,
-        ms2: &co.ms2,
-        library_precursors: lib_p,
-        library_fragments: lib_f,
-        run_windows: &windows,
-        ms1: Some(&co.ms1),
-        mass_cal: Some(&format!("{seed}.masscal.json")),
-        out_psms: &psms,
-        out_chrom: &chrom,
-        restrict_candidates: survivors.as_deref(),
-        cfg: &ext_cfg,
-        config_hash: ch,
-    })?;
-    let feats = d("features.parquet");
-    let features_written = features::run_hashed(features::FeaturesParams {
-        psms: &psms,
-        chromatograms: &chrom,
-        seed: Some(seed),
-        out: &feats,
-        out_pin: &d("run.pin"),
-        cfg: &cfg.features,
-        config_hash: ch,
-    })?;
-    let competed = d("psms_competed.parquet");
-    compete::run(compete::CompeteParams {
-        features: &feats,
-        out: &competed,
-        cfg: &cfg.compete,
-        config_hash: ch,
-        features_hash: Some(&features_written.content_hash),
-    })?;
-    Ok((competed, chrom))
+    Ok((o.competed, o.chromatograms))
 }
 
 /// Split an experiment-wide scored table into per-run tables by the `source`
@@ -1017,6 +1096,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     resolved.predict_frag.sidecar_script_dir =
         crate::python::resolve_script_dir(&resolved.predict_frag.sidecar_script_dir, p.config_path);
     crate::python::resolve(&mut resolved)?;
+    // `features.im_features = auto` resolves once for the experiment, on whether any run's
+    // spectra will carry 1/K0 (`instrument::input_has_im`, as the library build decides),
+    // so every run is scored with one feature schema and the pooled rescore accepts them.
+    resolved.resolve_im_features(p.mzmls.iter().any(|m| crate::instrument::input_has_im(m)));
+    crate::stages::retrace::refuse_inputs_without_raw_events(&resolved, p.mzmls)?;
     pre.step("resolve_interpreters");
     let p = RunExperimentParams {
         config: &resolved,
@@ -1123,10 +1207,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             let lib_f = d("fragment_library_fragments.parquet");
             // `predict_frag.library_cache`, as in `run`: a stored library with the same key
             // is published here instead of being built.
+            // One library serves every run: it carries 1/K0 when any run's spectra will
+            // (`instrument::input_has_im`, decided before conversion as in `run`).
+            let run_has_im = p.mzmls.iter().any(|m| crate::instrument::input_has_im(m));
             let cache = crate::library_cache::LibraryCache::for_config(
                 cfg,
                 fasta,
                 irt_placeholder,
+                run_has_im,
                 (&prov.mumdia_version, &prov.git_sha),
             );
             if cache
@@ -1163,6 +1251,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     work_dir: &d("sidecar_work"),
                     cfg: &cfg.predict_frag,
                     config_hash: &ch,
+                    run_has_im,
                 })?;
                 match &cache {
                     Some(c) => {
@@ -1637,7 +1726,17 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         // Under `parallel_runs = auto`, the first run's finish is what every later run
         // repeats after its reused adaptation, so its peak alone sizes them.
         let window = plan.is_auto().then(crate::sched::PeakWindow::open);
-        let (comp0, chrom0) = finish_run(cfg, &ch, &lib0, &lib_f, &co0, &seed0, &out0)?;
+        let (comp0, chrom0) = finish_run(
+            cfg,
+            &ch,
+            &lib0,
+            &lib_f,
+            &co0,
+            &seed0,
+            &out0,
+            true,
+            Default::default(),
+        )?;
         competed.push(vec![comp0]);
         chroms.push(vec![ChromTable::whole(&chrom0)]);
         if produced.is_none() {
@@ -1664,7 +1763,17 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     co,
                 },
             )?;
-            finish_run(cfg, &ch, &lib_p, &lib_f, co, seed, &out)
+            finish_run(
+                cfg,
+                &ch,
+                &lib_p,
+                &lib_f,
+                co,
+                seed,
+                &out,
+                true,
+                Default::default(),
+            )
         };
         let items: Vec<(usize, &(convert::ConvertOutputs, String))> =
             (1..n_runs).zip(fronts.iter()).collect();
@@ -1864,6 +1973,12 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .iter()
         .map(|nm| format!("{}/spectra/isolation_windows.parquet", d(nm)))
         .collect();
+    // Each run's extracted rows, for the shadow test's 1/K0 term
+    // (`rescore.shadow_im_tolerance`).
+    let shadow_psms: Vec<String> = names
+        .iter()
+        .map(|nm| format!("{}/psms_extracted.parquet", d(nm)))
+        .collect();
     // Under `mbr.strategy = second_pass` (the default) this rescore is the first pass, kept
     // under `first_pass/`, and the experiment's `scored_combined.parquet` is the second pass's.
     let second_pass_on = cfg.mbr.strategy == mumdia_core::config::MbrStrategy::SecondPass;
@@ -1885,14 +2000,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         script_dir: &cfg.predict_frag.sidecar_script_dir,
         cfg: &cfg.rescore,
         config_hash: &ch,
-        shadow: Some(crate::stages::shadow::ShadowInputs::new(
-            &lib_f,
-            &shadow_windows,
-        )),
+        shadow: Some(
+            crate::stages::shadow::ShadowInputs::new(&lib_f, &shadow_windows)
+                .with_psms_extracted(&shadow_psms),
+        ),
     })?;
 
     // --- match-between-runs: the second pass ---
-    let second = if second_pass_on {
+    let mut second = if second_pass_on {
         let run_dirs: Vec<String> = names.iter().map(|nm| d(nm)).collect();
         search_second_pass(
             cfg,
@@ -1915,7 +2030,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
              result"
         );
     }
-    let (scored_combined, scored_written) = match &second {
+    let (scored_combined, scored_written) = match &mut second {
         Some(sp) => {
             let scored = d("scored_combined.parquet");
             let written = rescore::run_hashed(rescore::RescoreParams {
@@ -1926,11 +2041,22 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 script_dir: &cfg.predict_frag.sidecar_script_dir,
                 cfg: &cfg.rescore,
                 config_hash: &ch,
-                shadow: Some(crate::stages::shadow::ShadowInputs::new(
-                    &sp.library.fragments,
-                    &shadow_windows,
-                )),
+                // The second pass's own extracted rows: its candidate ids are the empirical
+                // library's, not the first pass's.
+                shadow: Some(
+                    crate::stages::shadow::ShadowInputs::new(
+                        &sp.library.fragments,
+                        &shadow_windows,
+                    )
+                    .with_psms_extracted(&sp.psms_extracted),
+                ),
             })?;
+            // The second pass against the first: logged always, and written to
+            // `empirical_library.json` on an experiment with ion mobility.
+            let diag = second_pass::diagnose(&sp.library, &scored, names.len())?;
+            if sp.has_im {
+                second_pass::record_diagnostics(&mut sp.library, diag)?;
+            }
             chroms = sp.chroms.iter().map(|c| vec![c.clone()]).collect();
             (scored, written)
         }
@@ -2059,12 +2185,62 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         );
     }
     qcfg.q_filter = QuantQColumn::PsmQ;
-    let mut peptide_quants: Vec<String> = Vec::with_capacity(n_runs);
-    let mut protein_quants: Vec<String> = Vec::with_capacity(n_runs);
+    // Both quant loops run under the experiment's memory-bounded plan, each run in its own
+    // pool share, with the results in run order. An explicit `parallel_runs` keeps quant
+    // serial, as it was. Each loop reads `chroms`, which after a second pass are the second
+    // pass's chromatograms: the ones the reported quantities come from.
+    let run_idx: Vec<usize> = (0..n_runs).collect();
+    let quant_plan = if plan.is_auto() {
+        plan
+    } else {
+        crate::sched::RunConcurrency {
+            par: 1,
+            pool_threads: None,
+        }
+    };
+    // --- the cross-run step (`quant.needs_cross_run_fit`) ---
+    // Pass 1 quantifies every run with its per-run settings and writes its
+    // `fragment_quant.parquet` as the cross-run export; the fit over those tables is applied
+    // by pass 2, below, in every run. Pass 1's peptide and protein tables are temporary.
+    let cross_run = if qcfg.needs_cross_run_fit() {
+        let frag_tables = quant_plan.map_pooled(&run_idx, |&i| {
+            let ft = d(&format!("{}/fragment_quant.parquet", names[i]));
+            let tmp = |n: &str| d(&format!("{}/{n}.pass1.parquet", names[i]));
+            let written = quant::run_hashed(quant::QuantParams {
+                psms_scored: &split_paths[i],
+                chromatograms: &chroms[i],
+                out_peptide: &tmp("peptide_quant"),
+                out_protein: &tmp("protein_group_quant"),
+                out_fragment: Some(&ft),
+                out_peak_bounds: None,
+                cfg: &qcfg,
+                config_hash: &ch,
+                cross_run: None,
+                export_cross_run: true,
+            })?;
+            for n in ["peptide_quant", "protein_group_quant"] {
+                for path in [tmp(n), format!("{}.report.json", tmp(n))] {
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("removing the first-pass table {path}"))?;
+                }
+            }
+            Ok((ft, written.fragment.expect("out_fragment was set")))
+        })?;
+        let paths: Vec<String> = frag_tables.iter().map(|(p, _)| p.clone()).collect();
+        let fit = quant::fit_cross_run(&paths, &qcfg)?;
+        info!(
+            weights = fit.weights.as_ref().map(|w| w.len()),
+            background = fit.background.as_ref().map(|b| b.len()),
+            halfwidth = fit.halfwidth.as_ref().map(|h| h.len()),
+            "run-experiment: cross-run quant fit (candidates)"
+        );
+        Some((fit, frag_tables))
+    } else {
+        None
+    };
     // Each run's quant hashes its two tables for their reports; the manifest below reuses
     // those hashes instead of reading the tables again.
-    let mut quant_written: Vec<quant::QuantWritten> = Vec::with_capacity(n_runs);
-    for i in 0..n_runs {
+    let finals = quant_plan.map_pooled(&run_idx, |&i| {
         let pq = d(&format!("{}/peptide_quant.parquet", names[i]));
         let gq = d(&format!("{}/protein_group_quant.parquet", names[i]));
         let written = quant::run_hashed(quant::QuantParams {
@@ -2076,7 +2252,15 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             out_peak_bounds: None,
             cfg: &qcfg,
             config_hash: &ch,
+            cross_run: cross_run.as_ref().map(|(fit, _)| fit),
+            export_cross_run: false,
         })?;
+        Ok((pq, gq, written))
+    })?;
+    let mut peptide_quants: Vec<String> = Vec::with_capacity(n_runs);
+    let mut protein_quants: Vec<String> = Vec::with_capacity(n_runs);
+    let mut quant_written: Vec<quant::QuantWritten> = Vec::with_capacity(n_runs);
+    for (pq, gq, written) in finals {
         peptide_quants.push(pq);
         protein_quants.push(gq);
         quant_written.push(written);
@@ -2110,7 +2294,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     })?;
 
     // --- experiment manifest ---
-    let manifest = json!({
+    let mut manifest = json!({
         "config_hash": ch,
         "n_runs": n_runs,
         "runs": names,
@@ -2143,6 +2327,16 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "unit": "experiment-wide peptide_q_value / pg_q_value; n_runs on run_psm_q",
         },
     });
+    // The cross-run quant step and its first-pass fragment tables, only when it ran, so
+    // every other manifest keeps its bytes.
+    if let (Some((_, tables)), Some(m)) = (&cross_run, manifest.as_object_mut()) {
+        m.insert(
+            "cross_run_quant".to_string(),
+            json!({
+                "fragment_quants": tables.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            }),
+        );
+    }
     // Provenance parity with the single-run manifest: the identity of the code, of
     // the inputs (hashed at the start of the run, see above), and of every artifact
     // this stage produced.
@@ -2230,7 +2424,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .insert("rescorer".into(), actual_rescorer_model);
     prov.model_identities.insert(
         "feature_schema_id".into(),
-        features::feature_schema_id(&features::active_features(cfg.features.set)),
+        features::feature_schema_id(&features::active_features_of(cfg, false)),
     );
     prov.model_identities.insert(
         "mbr".into(),
@@ -2264,7 +2458,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         ));
         artifacts.push((
             "empirical_library_precursors".to_string(),
-            artifact::FRAGMENT_LIBRARY_PRECURSORS,
+            crate::stages::predict_frag::precursors_schema(&sp.library.precursors)?,
             sp.library.precursors.clone(),
             "second-pass",
             None,
@@ -2311,6 +2505,16 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "quant",
             Some(quant_written[i].protein.content_hash.clone()),
         ));
+        // The cross-run export of pass 1, written only when the step ran.
+        if let Some((_, tables)) = &cross_run {
+            artifacts.push((
+                format!("fragment_quant[{name}]"),
+                artifact::fragment_quant(true),
+                tables[i].0.clone(),
+                "quant",
+                Some(tables[i].1.content_hash.clone()),
+            ));
+        }
     }
     for (logical, schema, path, stage, known_hash) in artifacts {
         let rows = mumdia_io::table::nrows(&path)
@@ -2366,6 +2570,30 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
 mod tests {
     use super::*;
     use mumdia_io::table::{write_table, Col, Table};
+
+    /// The cross-run quant step is refused where candidate_id stability across runs has not
+    /// been checked, and only when one of its keys asks for it.
+    #[test]
+    fn the_cross_run_step_is_refused_where_candidate_ids_are_unchecked() {
+        let on = r#""quant":{"fragment_selection":"cross_run"}"#;
+        for (json, ok) in [
+            ("{}".to_string(), true),
+            (format!("{{{on}}}"), true),
+            (r#"{"groups":{"window_groups":2}}"#.to_string(), true),
+            (
+                r#"{"experiment":{"rt_library_scope":"per_run"}}"#.to_string(),
+                true,
+            ),
+            (format!(r#"{{{on},"groups":{{"window_groups":2}}}}"#), false),
+            (
+                format!(r#"{{{on},"experiment":{{"rt_library_scope":"per_run"}}}}"#),
+                false,
+            ),
+        ] {
+            let cfg = Config::from_json(&json).unwrap();
+            assert_eq!(refuse_unchecked_cross_run_step(&cfg).is_ok(), ok, "{json}");
+        }
+    }
 
     fn names(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()

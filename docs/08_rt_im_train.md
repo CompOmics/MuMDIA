@@ -27,8 +27,11 @@ writes a new precursor-library table with updated `predicted_irt` before Stage B
 reads it. The input library is unchanged. The fine-tune is a Python sidecar and
 is nondeterministic. It is default-off.
 
-Ion mobility (IM) is stubbed. The MVP is 3D, so the IM columns are always
-written null; there is no IM calibration or IM window.
+Ion mobility (IM) is calibrated only on a run whose spectra carry 1/K0 (diaPASEF). When the
+seed carries `observed_im` and the library `predicted_im`, the same confident targets fit a
+per-charge linear map of the library 1/K0 onto this run and a held-out IM half-window
+(section 7). On every other run the IM columns are written null and `cal.json` has no IM
+block, as before.
 
 ## Files
 
@@ -83,9 +86,9 @@ library candidate. Columns (rt_im_train.rs:266-277):
 | `rt_pred_cal` | f64 | calibrated predicted RT (seconds); `NaN` when calibration is unavailable (fewer than two anchors) |
 | `rt_lo` | f64 | `rt_pred_cal - width` (window lower bound, seconds); negative infinity when calibration is unavailable |
 | `rt_hi` | f64 | `rt_pred_cal + width` (window upper bound, seconds); positive infinity when calibration is unavailable |
-| `im_pred_cal` | f64, nullable | always `None` (3D MVP) |
-| `im_lo` | f64, nullable | always `None` |
-| `im_hi` | f64, nullable | always `None` |
+| `im_pred_cal` | f64, nullable | calibrated 1/K0 (section 7); `None` on a 3D run, without an IM calibration, and for a row without a finite, positive `predicted_im` |
+| `im_lo` | f64, nullable | `im_pred_cal - w_im`, `None` where `im_pred_cal` is |
+| `im_hi` | f64, nullable | `im_pred_cal + w_im`, `None` where `im_pred_cal` is |
 
 The unbounded row `(NaN, -inf, +inf)` is materialized by `candidate_window`
 (rt_im_train.rs:65-70) whenever no calibrated RT or window width is available; the
@@ -116,7 +119,10 @@ row named, as before. The file stays the artifact and the contract of the
 standalone stages: `mumdia extract` always reads it. One memory consequence: the
 24-byte-per-candidate arrays now exist from the end of `rt-im-train` through
 extract's library load, where extract used to allocate them (and a 28-byte decode
-beside them) only after the load.
+beside them) only after the load. On a run with an ion-mobility calibration the in-memory
+form also carries the 1/K0 windows and the calibrated 1/K0, filled as the rows are written,
+which extract reads for its 1/K0 gate (docs/09 section 8, docs/35 section 5); on every other
+run those fields are empty and cost nothing.
 
 **`cal.json`** (side artifact, written with `mumdia_io::json::write_json`,
 rt_im_train.rs:309-325). Fields:
@@ -133,6 +139,13 @@ rt_im_train.rs:309-325). Fields:
 | `rt_residual_median_s` | signed median residual `observed_rt - predict(irt)` over the training anchors (residual bias, seconds); computed as `NaN` when calibration is unavailable (rt_im_train.rs:293-306), which serde_json writes to the file as `null` |
 | `rt_residual_abs_median_s` | median absolute residual over the same anchors (seconds) |
 | `rt_residual_mad_s` | median absolute deviation of the signed residuals about their median (seconds) |
+
+On a run whose seed carries `observed_im`, and only there, `cal.json` also holds the IM block
+of section 7 (`im_method`, `im_n_train`, `im_global`, `im_per_charge`, `w_im`, `w_im_sizing`,
+`p_im`, `im_window_multiplier`, `im_window_min`, `im_holdout_frac`, `im_n_holdout`,
+`im_holdout_resid_abs_median`, `im_holdout_resid_p_im`, `im_in_sample_resid_abs_median`;
+docs/15 has the table), and the report's stats gain `im_n_train` and `w_im`. A 3D `cal.json`
+is unchanged.
 
 Every "median" among the three is the nearest-rank `percentile(.., 0.5)`
 (calibrate.rs:156-164), not an interpolated median.
@@ -167,14 +180,15 @@ hash and pass it as `config_hash`, but the stage never reads it (see gotchas).
 ### 1. Join iRT to candidates
 
 Read the library precursors' `candidate_id` and `predicted_irt` columns. This is
-the only source of iRT; both training and application use it. The
-`candidate_id -> predicted_irt` join the anchors are read through (`IrtJoin`) is
-built only when it is used: under `anchor_irt_from_seed` (a pooled seed of a grouped
+the only source of iRT; both training and application use it. On a run whose seed carries
+`observed_im`, the same open also reads `predicted_im` (section 7). The
+`candidate_id -> library row` join the anchors are read through (`CidJoin`, for the iRT and
+the 1/K0 alike) is built only when it is used: under `anchor_irt_from_seed` (a pooled seed of a grouped
 run) the seed table carries the iRT and nothing is joined. When it is used and the
 library carries `candidate_id` as the row-aligned range `0..n`, which is the layout
-the engine writes and `Library::load` requires, the join is a direct index into the
-iRT column. Any other layout gets the historical `HashMap<u32, f64>`, in which the
-last row with a given id wins. The hash table was built unconditionally before
+the engine writes and `Library::load` requires, the join is the id itself, a direct index
+into the columns. Any other layout gets a hash table from id to row, in which the last row
+with a given id wins, as in the historical `HashMap<u32, f64>` of the iRT. The hash table was built unconditionally before
 2026-09-25 and was about 4.5 GB of transient on an unbanded 203M-row library; the
 anchors it returns are the same either way
 (`the_irt_join_answers_what_the_hash_join_answered`).
@@ -200,6 +214,11 @@ anchor. `sorted_anchor_vectors` (rt_im_train.rs:54-60) then sorts the anchors by
 (rt_im_train.rs:121), with `n_train = train_irt.len()` (rt_im_train.rs:122). Sorting
 before any float reduction makes the fit order-stable (see the determinism note in
 the gotchas).
+
+Under `rt_im_train.anchor_x_filter` (default off) the anchors whose predicted iRT lies outside
+`[Q1 - 3 IQR, Q3 + 3 IQR]` of the anchors' predicted iRT are dropped right here
+(`calibrate::x_domain_inliers`), before the first fit, so every later consumer sees the
+filtered set and `n_train` counts it. Section 4g gives the reason.
 
 ### 3. Fit the calibration map
 
@@ -290,6 +309,11 @@ points the smoother interpolated, so `w_rt` is systematically narrower than the
 RT error on library candidates that were not anchors. `p_rt = 0.95` and
 `rt_window_multiplier` absorb part of that gap. Do not read `w_rt` as a measured
 95th percentile of prediction error over the whole library.
+
+`rt_window_multiplier` is acquisition-specific. The Orbitrap and Astral examples set 1.5. On
+diaPASEF, with retrace on, 1.5 lost 1.8% and 2.0 lost 2.9% of peptides against 1.0 (three
+seeds, IM branch): the wider window returned about 100 precursors and lost 373 more to a
+wrong peak inside it. The diaPASEF recipe keeps the default 1.0 (docs/35 sections 9 and 12).
 `window_holdout_frac` (next subsection) replaces this in-sample estimate with a
 measured one.
 
@@ -808,6 +832,50 @@ single-cell plate and the HYE mixture above. `seed` restores the previous behavi
 5c: `boot*`, `auto`, `auto_overlap`, `auto_seed`) exercise the orchestration, the decision and
 the anchor table; the real DeepLC refit is exercised only by the runs above.
 
+### 4g. Guards against absurd predicted iRT (2026-10-13)
+
+A large multi-head refit can return a few calibrated iRTs far outside the gradient. On the IM
+branch's diaPASEF work, a refit on 29k anchors and more (`n/500 + 5` spline knots) left 1.95%
+of target and 1.97% of decoy library rows at absurd values, up to 3.8e5 s, and the ridge alpha
+it chose moved erratically with the anchor count (2,000 anchors: 1e5; 5,000: 1e2; 11,357:
+1e-3; 20,000: 1e3). Two guards act on the two places such values do harm.
+
+**Anchor x-domain filter** (`rt_im_train.anchor_x_filter`, default off). The LOESS grid spans
+the smallest to the largest anchor iRT (section 3), so a handful of anchors at |iRT| ~1e5
+stretch it until the whole gradient sits in one or two grid cells, and the curve inside the
+gradient becomes the straight line between them. On one HYE diaPASEF run 11 of 58k anchors
+moved the curve by 51 s; without the filter the global slope came out at 0.03-0.13, with it
+about 1.00 and in-sample residuals of 3.7-4.0 s. The filter drops anchors outside
+`[Q1 - 3 IQR, Q3 + 3 IQR]` of predicted iRT before `linear_fit` (section 2). It is independent
+of `loess_robust_iters`: bisquare reweighting acts on residuals and leaves the grid's x range
+where it is (`calibrate.rs` test `bisquare_weights_do_not_stop_the_grid_stretch`). The
+quartile fences break down only at a quarter of the anchors on one side; fixed p0.5 / p99.5
+fences, which the IM branch used, break down at 0.5% per side. `cal.json` records
+`n_rt_outliers_removed` only when it removed anchors, so a run without removals writes the
+`cal.json` it always wrote. The y-outlier cut of the IM branch (anchors beyond six robust SD of
+a first fit) is not ported: it removed 0.6-0.8% of clean anchors, and `loess_robust_iters`
+covers y outliers for the curve (it does not reweight the `w_rt` sizing or the reported
+residuals). The filter stays off until it is shown to remove 0 anchors on the 3D benchmarks
+(AIF, HYE, Astral, single cell, immunopeptidomics); then it can be always on.
+
+**Multi-head output-range guard** (`deeplc_finetune.py`, multi-head path only, no key). Values
+in the library misplace windows directly, and no anchor guard touches them. After every
+prediction path (one process, the projection cache and the shards; the recipe
+`mh_shard_predict.py predict` per shard), every finite calibrated iRT outside
+`[min anchor RT - m, max anchor RT + m]`, `m` the anchors' RT span, is clamped to that range
+before the library or its bands are written. Clamped rather than set non-finite: the library
+loader refuses a non-finite `predicted_irt` (`index.rs`), and the rewrite keeps the imported
+value for a non-finite prediction, on another scale. When nothing is out of range the
+predictions are passed on untouched and the library is byte-identical; a value a whole anchor
+span beyond the anchors is not a peptide eluting early or late, so on normal data the guard
+does nothing. `<lib_out>.summary.json` records it under `multihead.output_range` (`bounds`,
+`n_out_of_range`, `fraction` of the predicted sequences, `predicted`, `action`) beside
+`multihead.ridge_alpha`; the recipe's `merge` sums the shards' records into `output_range`.
+
+No anchor cap is added: `--max-ref` takes the first N reference rows in table order (for
+search anchors, precursor m/z), the engine never passes it, and the alpha was erratic across
+subset sizes without a cap preventing the failure.
+
 ### 5. Optional adaptive per-region window (default off)
 
 When `adaptive_rt_window` is set (and `n_train >= min_anchors`, which guarantees the
@@ -836,7 +904,8 @@ calibration_available.then(|| predict(irt))` (rt_im_train.rs:247), the width is
 either the adaptive per-bin value or the global `w_rt` (rt_im_train.rs:248-255), and
 `candidate_window(calibrated_rt, width)` (rt_im_train.rs:256) produces the row
 `(cal, cal - width, cal + width)`, or the unbounded `(NaN, -inf, +inf)` when either
-value is absent. The three IM columns are pushed as `None` (rt_im_train.rs:261-263).
+value is absent. The three IM columns are the IM calibration applied to the row's
+`predicted_im` (section 7), or `None`.
 The table is written as it is computed: `write_table_chunked_hashed` asks for one
 65,536-row chunk at a time, the rows of that chunk are computed and encoded, and the
 next chunk follows. The chunk sequence is the one `write_table` uses, so
@@ -844,6 +913,55 @@ next chunk follows. The chunk sequence is the one `write_table` uses, so
 and those columns (76 bytes per candidate, 15 GB at 203M rows) are never resident.
 The file is hashed as it is written, so the report's content hash needs no read-back.
 Then `cal.json` is written and the artifact report is emitted.
+
+### 7. Ion-mobility calibration (spectra with 1/K0 only)
+
+A run whose spectra carry per-peak 1/K0 has a seed with `observed_im` (`seed_psms` v2,
+docs/07 step 6): the intensity-weighted median 1/K0 of each confident target's matched
+fragment peaks at its best scan. The stage notices the column in the seed's footer and only
+then decodes the library's `predicted_im`, in the same span-aware open that reads
+`candidate_id` and `predicted_irt` (`library_irt`), with NaN for a null. The anchors join it
+through the same candidate-id-to-row join as the iRT (`CidJoin`), so a library row gives both
+values. A 3D run reads no 1/K0 at all.
+
+Anchors are the confident targets of the seed (`spectrum_q < q_train`, `label = target`)
+with a finite, positive observed and predicted 1/K0, one per candidate rather than one per
+base peptide, because 1/K0 depends on charge where retention time does not. They are sorted
+by candidate id before any fit. The cut is the `q_train` the stage is given, so on a seed
+short of anchors the orchestrators' relaxed cut (`anchor_q_ladder` through `plan_anchors` and
+`with_anchor_cut`) applies to the IM anchors as it does to the RT anchors.
+
+The fit is linear in collision cross section, where the dependence on m/z and charge is
+removed: each 1/K0 is converted to CCS at the precursor m/z and charge
+(`mumdia_core::constants::im_to_ccs`, IM2Deep's Mason-Schamp constants), and
+`obs_ccs = a + b * pred_ccs` is fitted by least squares globally and per charge. A charge
+with fewer than `im_min_anchors_per_charge` anchors (default 50) uses the global fit. The
+calibrated 1/K0 of a library row is the fit applied to its CCS, converted back at its m/z
+and charge (`ccs_to_im`).
+
+`w_im` is always sized out of sample. The anchors are split by base peptide with the RT
+holdout rule (`base_peptide_id % 1000 < 300`, `IM_HOLDOUT_FRAC = 0.3`, a constant: the
+`window_holdout_frac` key also drives the DeepLC fine-tune and multi-head exclusion and is
+exclusive with `adaptive_rt_window`), the fit is repeated on the training side, and `w_im` is
+the `p_im` percentile (default 0.95) of the held-out absolute residuals times
+`im_window_multiplier` (default 1.0), floored at `im_window_min` (default 0.005 V s cm^-2).
+The calibration applied to the library still uses every anchor. With fewer than 20 held-out
+anchors or fewer than `min_seed_for_calibration` training anchors the width is sized
+in-sample, with a warning, and `w_im_sizing` says `holdout_fallback_in_sample`. With fewer than
+`min_seed_for_calibration` anchors in all there is no IM calibration: the IM columns stay
+null, which means "do not gate", and `cal.json` records `im_method = unavailable`. A seed
+with 1/K0 against a library without `predicted_im` records the same.
+
+Measured on the E. coli diaPASEF run (IM2Deep 2.0.2, main with the valley splits and the
+count-once seed): 4,024 training and 1,166 held-out anchors, held-out median |residual| 0.0097
+V s cm^-2, `w_im` 0.033. The IM branch, on its native-reader base, had 4,313 anchors, a
+held-out median of 0.0105 and p95 of 0.0398 (in-sample 0.0103, so the linear fit does not
+memorise), `w_im` 0.040 and a window recall of 97.6% (docs/35 section 11).
+
+There is no refit of the IM calibration on identifications and no robust anchor filter; both
+are outside this stage (docs/35 section 7). Whether an OLS per charge or a robust fit under a relaxed
+anchor cut is better is unmeasured. A grouped run is refused on diaPASEF input, and its shared
+fit (`fit_from_seed`) joins no library rows, so it fits no IM calibration.
 
 ### DeepLC multitask fine-tune (orchestrator pre-step, default off)
 
@@ -1044,8 +1162,7 @@ is unbounded by construction (docs/31 F7). Measured on HYE B01 with the imported
 All fields live under `rt_im_train` in the config (`RtImTrainConfig`,
 config.rs:447-512). The struct is `#[serde(default, deny_unknown_fields)]`, so any
 unknown key is a hard load error and every field has the default below. The config
-surface was pruned: there are no IM calibration fields (IM is a stub), and
-`CalibrationMethod::None` is a foot-gun rejected at load (config.rs:1336-1342) even
+surface was pruned, and `CalibrationMethod::None` is a foot-gun rejected at load (config.rs:1336-1342) even
 though the enum variant still exists.
 
 | field | default | effect |
@@ -1068,13 +1185,19 @@ though the enum variant still exists.
 | `rt_window_min_s` | `1.0` | Lower clamp (seconds) for any adaptive half-window (rt_im_train.rs:210); mirrors the 1s floor on the global window. |
 | `library_irt` | `auto` | Library-input mode only. `auto` re-predicts the imported `predicted_irt` with the DeepLC base model when `predict_frag.deeplc_python` is set and keeps it, with a warning, when not; `deeplc` requires the interpreter (preflight); `library` keeps the imported values. Ignored under `finetune_deeplc` and in FASTA mode. Section 4c has the measurement. |
 | `deeplc_predict_shards` | `0` | Worker processes for the whole-library DeepLC prediction (multi-head calibration, base-model re-prediction, the prediction after a fine-tune; `deeplc_finetune.py --shards`). The fit happens once, in the parent process, and is handed to every child; each child predicts a slice of the unique sequences cut at a multiple of the 100,000-sequence call, and the slices are joined in order. `K` processes share the thread budget, `budget / K` threads each; `0` is one process per 8 threads, and a GPU always gets one. Bit-identical to one process at equal threads per process, float-equivalent at the same engine thread count. Automatic by default since 2026-09-27 (one process per 8 threads, so one on a desktop budget of 8): 26:00 -> 18:02 and 29:47 -> 21:04 on two six- and five-run experiments with the peptides at 1% inside the seed spread (section "Sharded whole-library prediction"). |
+| `im_min_anchors_per_charge` | `50` | IM calibration (section 7): a charge with fewer anchors uses the global CCS fit. Omitted from the canonical configuration at the default. |
+| `p_im` | `0.95` | Held-out residual percentile that sizes `w_im` (section 7). Omitted from the canonical configuration at the default. |
+| `im_window_multiplier` | `1.0` | Multiplier on that percentile. Omitted from the canonical configuration at the default. |
+| `im_window_min` | `0.005` | Lower clamp of `w_im`, in V s cm^-2. Omitted from the canonical configuration at the default. |
 | `window_holdout_frac` | `0.0` | Size `w_rt` from held-out anchor residuals instead of in-sample ones (section 4b). `base_peptide_id % 1000 < round(frac*1000)` selects the holdout; the same rule excludes those peptides from the orchestrated DeepLC fine-tune. Range `[0.0, 0.9]`, `0.0` = off; mutually exclusive with `adaptive_rt_window`. Benchmark-gated. |
 
 ## Invariants, determinism, gotchas
 
-- **IM is a stub.** `im_pred_cal`, `im_lo`, `im_hi` are always `None`
-  (rt_im_train.rs:261-263). There is no IM calibration, no IM window, and no IM
-  config field. Any 4D/diaPASEF work must add both the model and the columns.
+- **IM only with 1/K0 on both sides.** `im_pred_cal`, `im_lo`, `im_hi` are filled only
+  when the seed carries `observed_im` and the library `predicted_im` (section 7). A 3D run
+  never decodes `predicted_im`, writes null IM columns and a `cal.json` without IM keys.
+  `predicted_im` is not routed through the finite-iRT checks: a null is NaN, and a row
+  without a finite, positive value gets a null IM window.
 - **Only targets anchor the fit.** Decoy seed PSMs are excluded
   (rt_im_train.rs:106); admitting them would inject random iRT/RT pairs. Keep this
   filter if you refactor anchor selection.
@@ -1177,11 +1300,11 @@ though the enum variant still exists.
 
 ## How to extend / modify
 
-- **Add IM (4D).** Populate `im_pred_cal`/`im_lo`/`im_hi` (currently `None` at
-  rt_im_train.rs:261-263) from an IM calibration analogous to the RT path (an
-  IM2Deep-style model), and add IM config fields to `RtImTrainConfig`. The output
-  columns already exist and are nullable, so downstream reads survive the
-  transition. `extract` and the IM feature families must then consume them.
+- **Change the IM (4D) calibration.** It is section 7: a per-charge linear map in CCS
+  space that fills `im_pred_cal`/`im_lo`/`im_hi` only on a run whose seed carries
+  `observed_im`; `extract` reads the window for its 1/K0 gate and the IM feature
+  family reads `im_pred_cal`. A change there is measured on diaPASEF with the arms of
+  docs/35 section 14, and a 3D run must keep its exact `run_windows` and `cal.json`.
 - **Change the calibration model.** Extend `CalibrationMethod` (config.rs:56-61) and
   branch in the `predict` closure setup (rt_im_train.rs:133-150). Keep `linear_fit` as
   the universal fallback so a degenerate anchor set never panics. New models belong

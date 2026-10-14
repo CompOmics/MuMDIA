@@ -387,10 +387,14 @@ fn bootstrap_and_refit(p: &Refit, library: &str, anchors_path: &str) -> Result<A
         p.converted,
         p.seed,
         &bdir,
+        // The pass only collects anchors: no retrace (`chain::ChainParams::retrace`).
+        false,
+        Default::default(),
     )
     .context("the bootstrap search (rt-im-train to compete) failed")?;
     let scored = format!("{bdir}/psms_scored.parquet");
     let windows = vec![p.converted.isolation_windows.clone()];
+    let psms = vec![format!("{bdir}/psms_extracted.parquet")];
     rescore::run_hashed(rescore::RescoreParams {
         competed: std::slice::from_ref(&competed),
         sources: None,
@@ -399,7 +403,9 @@ fn bootstrap_and_refit(p: &Refit, library: &str, anchors_path: &str) -> Result<A
         script_dir: &cfg.predict_frag.sidecar_script_dir,
         cfg: &cfg.rescore,
         config_hash: p.config_hash,
-        shadow: Some(crate::stages::shadow::ShadowInputs::new(p.lib_f, &windows)),
+        shadow: Some(
+            crate::stages::shadow::ShadowInputs::new(p.lib_f, &windows).with_psms_extracted(&psms),
+        ),
     })
     .context("the bootstrap single-run rescore failed")?;
     // The bootstrap's widest tables are only an input of the rescore that just read them.
@@ -408,6 +414,8 @@ fn bootstrap_and_refit(p: &Refit, library: &str, anchors_path: &str) -> Result<A
         "psms_extracted.parquet",
         "psms_extracted.parquet.peaks.parquet",
         "chromatograms.parquet",
+        // Retrace's centroid intermediate, should a bootstrap pass ever retrace.
+        crate::stages::retrace::CENTROID_NAME,
         "features.parquet",
         "run.pin",
         "psms_competed.parquet",
@@ -773,6 +781,7 @@ mod tests {
                 isolation_windows: String::new(),
                 ms2_to_ms1: String::new(),
             },
+            schemas: convert::ConvertSchemas::for_source(false),
         };
         let o = refit(&Refit {
             cfg: &cfg,

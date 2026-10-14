@@ -18,7 +18,7 @@
 use std::borrow::Cow;
 
 use super::{best_xcorr_normed, xcorr_norm, Evidence};
-use crate::stats::{pearson, pearson_pairs, pearson_vs, Centered};
+use crate::stats::{loo_ref_corr, pearson_pairs, pearson_vs, Centered, LooRef};
 
 pub const NAMES: &[&str] = &[
     "frag_ref_corr_mean",
@@ -356,19 +356,12 @@ pub fn values(e: &Evidence) -> Vec<f64> {
         pearson_vs(&s_trace, r, &r_c)
     };
 
-    // 32-33. leave-one-out ref correlation: R^{-f} = R - pred[f]*traces[f]
+    // 32-33. leave-one-out ref correlation: R^{-f} = R - pred[f]*traces[f], through the
+    // shared kernel (`stats::loo_ref_corr`).
     let mut loo: Vec<f64> = Vec::new();
     if has_traces {
-        let t = r.len();
-        for (i, trace) in traces.iter().enumerate().take(k) {
-            let mut rm = r.clone();
-            let lf = e.pred[i];
-            for (idx, val) in rm.iter_mut().enumerate().take(t) {
-                if idx < trace.len() {
-                    *val -= lf * trace[idx];
-                }
-            }
-            loo.push(pearson(trace, &rm));
+        for i in 0..k {
+            loo.push(loo_ref_corr(traces, &e.pred, i, LooRef::Subtract(r)));
         }
     }
     let f_loo_mean = mean_all(&loo);

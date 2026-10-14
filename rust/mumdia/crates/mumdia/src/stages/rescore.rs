@@ -1055,6 +1055,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                 score: &scores,
                 is_decoy: &is_decoy,
                 accepted: &accepted,
+                peak_rank: &peak_rank,
             },
             inputs,
             super::shadow::ShadowParams {
@@ -1062,6 +1063,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
                 ppm: p.cfg.shadow_ppm,
                 rt_s: p.cfg.shadow_rt_s,
                 region: p.cfg.shadow_region,
+                im_tol: p.cfg.shadow_im_tolerance,
             },
         )?;
         let floor = scores
@@ -1616,6 +1618,29 @@ fn validate_feature_schema(
 ) -> Result<()> {
     if expected.schema_id != actual.schema_id || expected.feature_columns != actual.feature_columns
     {
+        // A pool that mixes runs scored with and without the ion-mobility family (a 3D and
+        // a diaPASEF run under `features.im_features = auto`, resolved per run by
+        // standalone stages) is the one mismatch a configuration can make on its own; say
+        // so before the column lists.
+        let has_im = |s: &FeatureSchema| {
+            s.feature_columns
+                .iter()
+                .any(|c| crate::stages::features::im::NAMES.contains(&c.as_str()))
+        };
+        if has_im(expected) != has_im(actual) {
+            let (with, without) = if has_im(expected) {
+                ("the first input".to_string(), format!("'{path}'"))
+            } else {
+                (format!("'{path}'"), "the first input".to_string())
+            };
+            anyhow::bail!(
+                "rescore feature schema mismatch for '{path}': {with} carries the ion-mobility \
+                 feature family (features.im_features) and {without} does not. Runs pooled \
+                 into one rescore must share one feature schema: score every run with the \
+                 family on or every run with it off (run-experiment resolves \
+                 features.im_features once for the whole experiment)"
+            );
+        }
         anyhow::bail!(
             "rescore feature schema mismatch for '{path}': expected id '{}' columns {:?}, \
              found id '{}' columns {:?}",
@@ -6319,6 +6344,31 @@ b
             schema_id: "schema-b".into(),
         };
         assert!(validate_feature_schema(&expected, &different_id, "id.parquet").is_err());
+    }
+
+    /// A pool mixing runs scored with and without the ion-mobility family is refused by the
+    /// one schema check, with a message that names the family, in either order.
+    #[test]
+    fn a_mixed_3d_4d_pool_names_the_ion_mobility_family() {
+        use crate::stages::features::{active_features, feature_schema_id};
+        use mumdia_core::config::FeatureSet;
+        let schema = |im: bool| {
+            let cols = active_features(FeatureSet::Extended, im);
+            FeatureSchema {
+                schema_id: feature_schema_id(&cols),
+                feature_columns: cols,
+            }
+        };
+        let (flat, mobile) = (schema(false), schema(true));
+        assert_ne!(flat.schema_id, mobile.schema_id);
+        for (a, b) in [(&flat, &mobile), (&mobile, &flat)] {
+            let err = validate_feature_schema(a, b, "run2.parquet")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("ion-mobility feature family"), "{err}");
+            assert!(err.contains("features.im_features"), "{err}");
+        }
+        assert!(validate_feature_schema(&mobile, &schema(true), "same.parquet").is_ok());
     }
 
     /// `run_psm_q` exactly as `run` computed it before `per_source_q`: one index vector per

@@ -145,6 +145,17 @@ def predict(a):
             done = s + len(batch)
             rate = len(batch) / max(1e-9, time.time() - t1)
             print(f"  {done}/{len(seqs)}  {rate:.0f}/s  ETA {(len(seqs) - done) / rate / 60:.1f} min", flush=True)
+    # The worker's output-range guard, on the anchors the calibration was fitted to (the
+    # same reference `fit` builds), recorded beside the shard for `merge`.
+    ref_args = argparse.Namespace(seed_path=a.seed, q_train=a.q_train,
+                                  window_holdout_frac=a.holdout, max_ref=0, multihead=a.heads)
+    anchor_rt = [psm.retention_time for psm in W.build_reference(ref_args)]
+    guarded, record = W.apply_output_range_guard(out.astype(np.float64), anchor_rt,
+                                                 label=os.path.basename(a.shard))
+    if record["n_out_of_range"]:
+        out = guarded.astype(np.float32)
+    with open(a.out + ".range.json", "w", encoding="utf-8") as fh:
+        json.dump(record, fh, indent=2)
     pq.write_table(pa.table({"seq": pa.array(seqs, pa.string()), "irt": pa.array(out, pa.float32())}),
                    a.out, compression="snappy")
     print(f"wrote {len(seqs)} predictions -> {a.out} in {time.time() - t0:.0f}s", flush=True)
@@ -188,6 +199,16 @@ def merge(lib, out, preds):
     summary = {"rows": rows, "repredicted": re, "retained_imported": rows - re,
                "retained_non_standard": missing, "retained_no_prediction": rows - re - missing,
                "model": "the base model calibrated over multiple heads (sharded)", "lib_in": lib, "lib_out": out}
+    # The shards' output-range guard records (`predict`), summed.
+    ranges = [json.load(open(p + ".range.json", encoding="utf-8"))
+              for p in preds if os.path.exists(p + ".range.json")]
+    if ranges:
+        n_out = sum(r["n_out_of_range"] for r in ranges)
+        n_pred = sum(r["predicted"] for r in ranges)
+        summary["output_range"] = {"bounds": ranges[0]["bounds"], "n_out_of_range": n_out,
+                                   "fraction": (n_out / n_pred) if n_pred else 0.0,
+                                   "predicted": n_pred,
+                                   "action": "clamped" if n_out else "none"}
     with open(out + ".summary.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     print(f"merge: rows={rows} repredicted={re} retained_imported={rows - re} -> {out} in {time.time() - t0:.0f}s", flush=True)

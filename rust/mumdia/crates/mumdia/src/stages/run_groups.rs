@@ -432,7 +432,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             let rec: Vec<mumdia_core::manifest::ArtifactRecord> = if keep_records {
                 vec![written.record(
                     &format!("{}[g{:02}]", artifact::SEED_PSMS.0, b.index),
-                    artifact::SEED_PSMS,
+                    search_seed::seed_schema(&seed)?,
                     &seed,
                     "search-seed",
                     ch,
@@ -521,7 +521,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
     record_hashing(
         g.man.as_deref_mut(),
         artifact::SEED_PSMS.0,
-        artifact::SEED_PSMS,
+        search_seed::seed_schema(&pooled_seed)?,
         &pooled_seed,
         n,
         "seed-pool",
@@ -683,7 +683,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                         artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
                         b.index
                     ),
-                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    crate::stages::predict_frag::precursors_schema(&out)?,
                     &out,
                     rows,
                     &rt_model,
@@ -765,7 +765,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                         artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
                         b.index
                     ),
-                    artifact::FRAGMENT_LIBRARY_PRECURSORS,
+                    crate::stages::predict_frag::precursors_schema(&out)?,
                     &out,
                     rows,
                     &rt_model,
@@ -862,6 +862,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                         out_cal: &cal,
                         cfg: &cfg.rt_im_train,
                         config_hash: ch,
+                        im_window_floor: None,
                     },
                 )?,
                 // Per group: this band's own anchors, iRT joined from its own table.
@@ -873,6 +874,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     out_cal: &cal,
                     cfg: &cfg.rt_im_train,
                     config_hash: ch,
+                    im_window_floor: None,
                     anchor_irt_from_seed: false,
                 })?,
             };
@@ -915,18 +917,23 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     ms2: &ms2_scans,
                     ms1: Some(&ms1_scans),
                 }),
+                trace_pad: None,
+                chrom_im: cfg
+                    .features
+                    .im_features
+                    .on(crate::instrument::spectra_has_im(&g.converted.ms2)),
             })?;
             if keep_records {
                 recs.push(psms_written.record(
                     &format!("{}[g{:02}]", artifact::PSMS_EXTRACTED.0, b.index),
-                    artifact::PSMS_EXTRACTED,
+                    extract::psms_schema(&psms)?,
                     &psms,
                     "extract",
                     ch,
                 ));
                 recs.push(chrom_written.record(
                     &format!("{}[g{:02}]", artifact::CHROMATOGRAMS.0, b.index),
-                    artifact::chromatograms(cfg.extract.chromatogram_schema),
+                    crate::chromatograms::recorded_schema(&chrom)?,
                     &chrom,
                     "extract",
                     ch,
@@ -942,6 +949,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                 out_pin: "",
                 cfg: &cfg.features,
                 config_hash: ch,
+                // A grouped run is never retraced (`Config::validate`).
+                imc_ref_w: false,
             })?;
             Ok(BandExtract {
                 index: b.index,
@@ -1014,6 +1023,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     out_pin: &pin,
                     cfg: &cfg.features,
                     config_hash: ch,
+                    imc_ref_w: false,
                 },
                 bounds,
             )?;
@@ -1194,6 +1204,16 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             })
             .collect()
     };
+    // The versions the pooled tables hold, read from them: they were spliced from the bands'
+    // tables, so they are the bands' versions.
+    let pooled_psms_schema = match (&stats.psms_hash, pool_psms) {
+        (Some(_), true) => extract::psms_schema(&out.psms)?,
+        _ => artifact::PSMS_EXTRACTED,
+    };
+    let pooled_chrom_schema = match &stats.chromatograms_hash {
+        Some(_) => crate::chromatograms::recorded_schema(&pooled_chrom_path)?,
+        None => artifact::CHROMATOGRAMS,
+    };
     let pooled_artifacts = stats
         .psms_hash
         .clone()
@@ -1201,7 +1221,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         .map(|h| {
             (
                 artifact::PSMS_EXTRACTED.0,
-                artifact::PSMS_EXTRACTED,
+                pooled_psms_schema,
                 &out.psms,
                 stats.psms,
                 h,
@@ -1211,8 +1231,8 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         .chain(stats.chromatograms_hash.clone().map(|h| {
             (
                 artifact::CHROMATOGRAMS.0,
-                // Spliced from the bands' tables, which share the configured layout.
-                artifact::chromatograms(cfg.extract.chromatogram_schema),
+                // Spliced from the bands' tables, which share one layout.
+                pooled_chrom_schema,
                 &pooled_chrom_path,
                 stats.chromatograms,
                 h,
@@ -1294,19 +1314,10 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         let (mut files, mut bytes) = (0u64, 0u64);
         for (index, _) in &cals {
             for name in ["psms_extracted.parquet", "features.parquet", "run.pin"] {
-                let base = gd(*index, name);
-                for f in [
-                    base.clone(),
-                    format!("{base}.report.json"),
-                    format!("{base}.schema.json"),
-                ] {
-                    if let Ok(meta) = std::fs::metadata(&f) {
-                        std::fs::remove_file(&f)
-                            .with_context(|| format!("deleting the band intermediate {f}"))?;
-                        files += 1;
-                        bytes += meta.len();
-                    }
-                }
+                let (f, b) =
+                    crate::stages::delete_intermediate(&gd(*index, name), "band intermediate")?;
+                files += f;
+                bytes += b;
             }
         }
         info!(

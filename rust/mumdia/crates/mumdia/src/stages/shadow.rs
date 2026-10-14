@@ -12,6 +12,14 @@
 //! `region x accepted` rows of their run by first-pass score are examined (label-blind),
 //! because a candidate further down cannot cross the cut anyway.
 //!
+//! On a run whose spectra carry 1/K0 the test can take a 1/K0 term
+//! (`rescore.shadow_im_tolerance`, off by default): a lender then counts only when its apex
+//! 1/K0 lies within the tolerance of the candidate's, because two precursors co-isolated in
+//! one diaPASEF slot but separated in mobility do not share fragment peaks. The apex 1/K0 of
+//! each row is joined from its run's `psms_extracted` on `(candidate_id, peak_rank)`
+//! (`extract::apex_im_by_peak`); a row without one keeps the m/z-and-RT test alone, so with
+//! the term off, and on every 3D run, the demotion is what it was.
+//!
 //! Deterministic: rows are examined independently, lenders are pooled per row and sorted,
 //! and no floating-point value is reduced across rows.
 use std::collections::{HashMap, HashSet};
@@ -22,11 +30,14 @@ use mumdia_io::table::TableFile;
 use rayon::prelude::*;
 
 /// What the demotion reads besides the scored rows: the library's fragments and, per run
-/// (`source`), its isolation windows.
+/// (`source`), its isolation windows and, for the 1/K0 term, its `psms_extracted`.
 pub struct ShadowInputs<'a> {
     pub lib_fragments: &'a str,
     /// `isolation_windows.parquet` of each run, indexed by `source`.
     pub isolation_windows: &'a [String],
+    /// `psms_extracted.parquet` of each run, indexed by `source`, read only for the 1/K0
+    /// term (`rescore.shadow_im_tolerance`). Empty when the caller has none.
+    pub psms_extracted: &'a [String],
 }
 
 impl<'a> ShadowInputs<'a> {
@@ -34,12 +45,19 @@ impl<'a> ShadowInputs<'a> {
         ShadowInputs {
             lib_fragments,
             isolation_windows,
+            psms_extracted: &[],
         }
+    }
+
+    /// With each run's `psms_extracted`, for the 1/K0 term.
+    pub fn with_psms_extracted(mut self, psms_extracted: &'a [String]) -> Self {
+        self.psms_extracted = psms_extracted;
+        self
     }
 }
 
-/// A lender: `(apex_rt, score, candidate_id, base_peptide_id)`.
-type Lender = (f64, f64, u32, u32);
+/// A lender: `(apex_rt, score, candidate_id, base_peptide_id, apex 1/K0)`.
+type Lender = (f64, f64, u32, u32, Option<f64>);
 
 /// The scored rows the demotion examines, all of length `n`.
 pub struct ShadowRows<'a> {
@@ -52,6 +70,9 @@ pub struct ShadowRows<'a> {
     pub is_decoy: &'a [bool],
     /// First-pass accepted targets (the possible lenders).
     pub accepted: &'a [bool],
+    /// The peak each row selected (`selected_peak_rank`), which with `cid` finds the row's
+    /// extracted row for the 1/K0 term.
+    pub peak_rank: &'a [i32],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +81,56 @@ pub struct ShadowParams {
     pub ppm: f64,
     pub rt_s: f64,
     pub region: usize,
+    /// `rescore.shadow_im_tolerance`: the apex 1/K0 distance within which a lender counts;
+    /// 0 is no 1/K0 term.
+    pub im_tol: f64,
+}
+
+/// The apex 1/K0 of every row, joined from its run's `psms_extracted` on
+/// `(candidate_id, peak_rank)`; `None` for a row without one. All `None` when the 1/K0 term
+/// is off, and, with a warning, when the caller passed no `psms_extracted` for the runs.
+fn apex_ims(
+    rows: &ShadowRows,
+    inputs: &ShadowInputs,
+    prm: ShadowParams,
+    n_sources: usize,
+) -> Result<Vec<Option<f64>>> {
+    let n = rows.cid.len();
+    if prm.im_tol <= 0.0 {
+        return Ok(vec![None; n]);
+    }
+    if inputs.psms_extracted.len() < n_sources {
+        tracing::warn!(
+            given = inputs.psms_extracted.len(),
+            runs = n_sources,
+            "rescore: shadow_im_tolerance is set, but this rescore has no psms_extracted for \
+             every run; the shadow test runs without its 1/K0 term"
+        );
+        return Ok(vec![None; n]);
+    }
+    let by_source: Vec<std::collections::BTreeMap<(u32, i32), f64>> = inputs.psms_extracted
+        [..n_sources]
+        .iter()
+        .map(|p| {
+            // A grouped run that did not pool its bands has no run-level table; its rows
+            // keep the m/z-and-RT test.
+            if !std::path::Path::new(p).exists() {
+                tracing::warn!(
+                    psms_extracted = %p,
+                    "rescore: no psms_extracted for the shadow test's 1/K0 term of this run"
+                );
+                return Ok(std::collections::BTreeMap::new());
+            }
+            crate::stages::extract::apex_im_by_peak(p)
+        })
+        .collect::<Result<_>>()?;
+    Ok((0..n)
+        .map(|i| {
+            by_source[rows.source[i] as usize]
+                .get(&(rows.cid[i], rows.peak_rank[i]))
+                .copied()
+        })
+        .collect())
 }
 
 /// Isolation windows of one run as ascending `(lower, upper)`.
@@ -153,6 +224,7 @@ pub fn flag(rows: &ShadowRows, inputs: &ShadowInputs, prm: ShadowParams) -> Resu
     let win: Vec<Option<u32>> = (0..n)
         .map(|i| window_of(&windows[rows.source[i] as usize], rows.precursor_mz[i]))
         .collect();
+    let im = apex_ims(rows, inputs, prm, n_sources)?;
 
     // The label-blind region of each run: its top `region x accepted` rows by score.
     let mut by_source: Vec<Vec<usize>> = vec![Vec::new(); n_sources];
@@ -178,6 +250,7 @@ pub fn flag(rows: &ShadowRows, inputs: &ShadowInputs, prm: ShadowParams) -> Resu
                     rows.score[i],
                     rows.cid[i],
                     rows.base[i],
+                    im[i],
                 ));
             }
         }
@@ -215,6 +288,12 @@ pub fn flag(rows: &ShadowRows, inputs: &ShadowInputs, prm: ShadowParams) -> Resu
                 }
                 if c.2 == rows.cid[i] || c.3 == rows.base[i] || c.1 <= rows.score[i] {
                     continue;
+                }
+                // The 1/K0 term: a lender separated in mobility shares no fragment peak.
+                if let (Some(a), Some(b)) = (im[i], c.4) {
+                    if (a - b).abs() > prm.im_tol {
+                        continue;
+                    }
                 }
                 if let Some(f) = frags.get(&c.2) {
                     pool.extend_from_slice(f);
@@ -299,30 +378,79 @@ mod tests {
         let score = vec![0.99, 0.95, 0.95, 0.95, 0.95, 0.999];
         let is_decoy = vec![false, true, false, true, false, false];
         let accepted = vec![true, false, false, false, false, false];
+        let peak_rank = vec![0i32; 6];
         let windows = vec![win];
-        let d = flag(
-            &ShadowRows {
-                source: &source,
-                cid: &cid,
-                base: &base,
-                apex_rt: &apex,
-                precursor_mz: &mz,
-                score: &score,
-                is_decoy: &is_decoy,
-                accepted: &accepted,
-            },
-            &ShadowInputs {
-                lib_fragments: &frag,
-                isolation_windows: &windows,
-            },
-            ShadowParams {
-                min_shared: 3,
-                ppm: 10.0,
-                rt_s: 3.0,
-                region: 8,
-            },
+        let rows = ShadowRows {
+            source: &source,
+            cid: &cid,
+            base: &base,
+            apex_rt: &apex,
+            precursor_mz: &mz,
+            score: &score,
+            is_decoy: &is_decoy,
+            accepted: &accepted,
+            peak_rank: &peak_rank,
+        };
+        let prm = |im_tol: f64| ShadowParams {
+            min_shared: 3,
+            ppm: 10.0,
+            rt_s: 3.0,
+            region: 8,
+            im_tol,
+        };
+        let d = flag(&rows, &ShadowInputs::new(&frag, &windows), prm(0.0)).unwrap();
+        assert_eq!(d, vec![false, true, false, false, false, false]);
+
+        // The 1/K0 term. The lender (cid 1) and the borrower (cid 2) are 0.05 apart in
+        // apex 1/K0: within 0.1 the borrower is still demoted, within 0.02 it is not.
+        let psms = scratch("psms_extracted.parquet");
+        write_table(
+            &psms,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 2, 3, 4, 5, 6]),
+                Col::I32("peak_rank".into(), vec![0; 6]),
+                Col::OptF64(
+                    "apex_im".into(),
+                    vec![
+                        Some(0.90),
+                        Some(0.95),
+                        Some(0.9),
+                        None,
+                        Some(0.9),
+                        Some(0.9),
+                    ],
+                ),
+            ],
         )
         .unwrap();
-        assert_eq!(d, vec![false, true, false, false, false, false]);
+        let tables = vec![psms];
+        let with_im = ShadowInputs::new(&frag, &windows).with_psms_extracted(&tables);
+        assert_eq!(flag(&rows, &with_im, prm(0.1)).unwrap(), d);
+        assert_eq!(
+            flag(&rows, &with_im, prm(0.02)).unwrap(),
+            vec![false; 6],
+            "a lender separated in 1/K0 lends nothing"
+        );
+        // The term off reads no table: the same flags with or without one.
+        assert_eq!(flag(&rows, &with_im, prm(0.0)).unwrap(), d);
+        // A 3D table (no apex_im values) keeps the m/z-and-RT test.
+        let psms3 = scratch("psms_extracted_3d.parquet");
+        write_table(
+            &psms3,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 2]),
+                Col::I32("peak_rank".into(), vec![0; 2]),
+                Col::OptF64("apex_im".into(), vec![None; 2]),
+            ],
+        )
+        .unwrap();
+        let tables3 = vec![psms3];
+        let flat = ShadowInputs::new(&frag, &windows).with_psms_extracted(&tables3);
+        assert_eq!(flag(&rows, &flat, prm(0.02)).unwrap(), d);
+        // Without the tables the term is skipped with a warning.
+        assert_eq!(
+            flag(&rows, &ShadowInputs::new(&frag, &windows), prm(0.02)).unwrap(),
+            d
+        );
     }
 }

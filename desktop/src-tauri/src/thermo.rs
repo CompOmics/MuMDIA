@@ -66,10 +66,11 @@ fn asset() -> Option<Asset> {
 /// Mirrors `raw::detect` in the engine deliberately rather than importing it: the
 /// application does not depend on the engine crate, it spawns the engine binary.
 /// The two must agree, which is what `vendor_detection_matches_the_engines_own_rule`
-/// asserts against the same cases.
+/// and `only_a_diapasef_d_is_read_without_conversion` assert against the same cases.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Needs {
-    /// Readable as-is.
+    /// Readable as-is: mzML, or a timsTOF `.d` with diaPASEF frames, which the engine
+    /// reads natively ([`is_native_diapasef`]).
     Nothing,
     /// Thermo `.raw`: ThermoRawFileParser, which this application installs.
     ThermoParser,
@@ -90,9 +91,52 @@ pub fn needs(path: &str) -> Needs {
     match ext.as_str() {
         "raw" if p.is_dir() => Needs::Msconvert,
         "raw" => Needs::ThermoParser,
+        "d" if is_native_diapasef(p) => Needs::Nothing,
         "d" | "wiff" | "wiff2" => Needs::Msconvert,
         _ => Needs::Nothing,
     }
+}
+
+/// Does this `.d` hold diaPASEF frames that the engine reads natively?
+///
+/// The engine's rule (`raw::is_native_diapasef`), restated rather than imported for the
+/// reason [`Needs`] gives: `analysis.tdf` and `analysis.tdf_bin` present, diaPASEF frames
+/// (`Frames.MsMsType` 9) and no ddaPASEF frames (8), and `TimsCompressionType` 2. A
+/// read-only SQLite probe of the metadata; the frame data is never touched. Every other
+/// `.d` goes to msconvert in the engine, so it does here too.
+pub fn is_native_diapasef(dir: &std::path::Path) -> bool {
+    let tdf = dir.join("analysis.tdf");
+    if !tdf.is_file() || !dir.join("analysis.tdf_bin").is_file() {
+        return false;
+    }
+    probe_tdf(&tdf).unwrap_or(false)
+}
+
+/// The SQLite half of [`is_native_diapasef`].
+fn probe_tdf(tdf: &std::path::Path) -> rusqlite::Result<bool> {
+    use rusqlite::OptionalExtension;
+    let con = rusqlite::Connection::open_with_flags(
+        tdf,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let has_frames_of = |msms_type: i64| -> rusqlite::Result<bool> {
+        con.query_row(
+            "SELECT EXISTS(SELECT 1 FROM Frames WHERE MsMsType = ?1)",
+            [msms_type],
+            |r| r.get(0),
+        )
+    };
+    if has_frames_of(8)? || !has_frames_of(9)? {
+        return Ok(false);
+    }
+    let compression: Option<String> = con
+        .query_row(
+            "SELECT Value FROM GlobalMetadata WHERE Key = 'TimsCompressionType'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(compression.as_deref().map(str::trim) == Some("2"))
 }
 
 /// A human label for what the file is, for the note under the picker.
@@ -106,7 +150,9 @@ pub fn label(path: &str) -> &'static str {
         "raw" if p.is_dir() => "Waters .raw",
         "raw" => "Thermo .raw",
         "d" => {
-            if p.join("analysis.tdf").exists() || p.join("analysis.baf").exists() {
+            if is_native_diapasef(p) {
+                "Bruker timsTOF diaPASEF .d"
+            } else if p.join("analysis.tdf").exists() || p.join("analysis.baf").exists() {
                 "Bruker .d"
             } else if p.join("AcqData").exists() {
                 "Agilent .d"
@@ -800,6 +846,50 @@ mod tests {
 
         assert!(is_raw("a.raw"));
         assert!(!is_raw("a.d"));
+    }
+
+    /// A minimal timsTOF `.d`, as the engine's routing tests build it.
+    fn tdf_fixture(dir: &std::path::Path, msms_types: &[i64], compression: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let con = rusqlite::Connection::open(dir.join("analysis.tdf")).unwrap();
+        con.execute_batch(
+            "CREATE TABLE Frames (Id INTEGER PRIMARY KEY, MsMsType INTEGER);
+             CREATE TABLE GlobalMetadata (Key TEXT PRIMARY KEY, Value TEXT);",
+        )
+        .unwrap();
+        for (i, t) in msms_types.iter().enumerate() {
+            con.execute(
+                "INSERT INTO Frames (Id, MsMsType) VALUES (?1, ?2)",
+                [i as i64 + 1, *t],
+            )
+            .unwrap();
+        }
+        con.execute(
+            "INSERT INTO GlobalMetadata VALUES ('TimsCompressionType', ?1)",
+            [compression],
+        )
+        .unwrap();
+        std::fs::write(dir.join("analysis.tdf_bin"), b"").unwrap();
+    }
+
+    #[test]
+    fn only_a_diapasef_d_is_read_without_conversion() {
+        // The engine's rule: the native reader takes a diaPASEF .d, msconvert every other.
+        let d = std::env::temp_dir().join(format!("mumdia-thermo-tdf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let dia = d.join("dia.d");
+        tdf_fixture(&dia, &[0, 9], "2");
+        let dia = dia.to_str().unwrap();
+        assert_eq!(needs(dia), Needs::Nothing);
+        assert_eq!(label(dia), "Bruker timsTOF diaPASEF .d");
+        let dda = d.join("dda.d");
+        tdf_fixture(&dda, &[0, 8], "2");
+        assert_eq!(needs(dda.to_str().unwrap()), Needs::Msconvert);
+        assert_eq!(label(dda.to_str().unwrap()), "Bruker .d");
+        let old = d.join("old.d");
+        tdf_fixture(&old, &[0, 9], "1");
+        assert_eq!(needs(old.to_str().unwrap()), Needs::Msconvert);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

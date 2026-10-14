@@ -1,4 +1,4 @@
-# Python sidecars (12 scripts + one shared writer) + conda envs
+# Python sidecars (19 scripts + three shared modules) + conda envs
 > Part of the MuMDIA developer documentation (see docs/README.md).
 
 ## Purpose
@@ -16,20 +16,24 @@ interface. Any sidecar can be swapped for a native Rust implementation (or a
 different tool) without touching the callers. Failure handling is **not uniform**:
 only the rescore sidecars fall back to a native rescorer, and only when
 `rescore.strict = false`. The predictor sidecars and MBR have no fallback and no
-strict gate, so a crashed MS2PIP, DeepLC, or DeepLC fine-tune aborts the whole
-run. The matrix in **Failure behavior** below is authoritative.
+strict gate, so a crashed MS2PIP, AlphaPeptDeep, DeepLC, IM2Deep, or DeepLC fine-tune aborts the
+whole run. The matrix in **Failure behavior** below is authoritative.
 
-The 12 scripts split into four groups: **predictors** (`ms2pip_worker`,
-`peptdeep_worker`, `deeplc_worker`, `deeplc_finetune`) feed the run-independent
-library;
-**rescorers** (`mokapot_worker`, `nn_rescore_worker`, `entrapment_worker`) score
-the competed PSMs in Stage F; **MBR** (`mbr_worker`) transfers identifications
-across runs (Stage D3); and the **DIA-NN recipe** (`import_diann_lib`,
-`make_reverse_decoys`, `make_shift_decoys`, `augment_library`) is an offline,
-one-time toolchain that builds MuMDIA's target+decoy library schema. Three of the
-four convert a user-produced DIA-NN library into that schema; `augment_library`
-is the fourth, filling an imported library with the tryptic FASTA peptides it is
-missing (a completeness fix) before decoy generation.
+The 19 scripts split into five groups. Nine are launched by the engine:
+**predictors** (`ms2pip_worker`, `peptdeep_worker`, `deeplc_worker`, `deeplc_finetune`,
+`im2deep_worker`) feed the run-independent library; **rescorers** (`mokapot_worker`,
+`nn_rescore_worker`, `entrapment_worker`) score the competed PSMs in Stage F; **MBR**
+(`mbr_worker`) transfers identifications across runs (Stage D3). Ten are run by hand:
+the **DIA-NN recipe** (`import_diann_lib`, `make_reverse_decoys`, `predict_decoys`,
+`make_shift_decoys`, `augment_library`) is an offline, one-time toolchain that builds
+MuMDIA's target+decoy library schema from a user-produced DIA-NN library, with
+`augment_library` filling an imported library with the tryptic FASTA peptides it is
+missing (a completeness fix) before decoy generation; the **library-scale recipes**
+(`sort_fragments`, `mz_range_survivors`, `assemble_survivors`, `shard_parquet`,
+`mh_shard_predict`) reshape very large tables (docs/32). The three shared modules are
+imported, never run: `_lib_io` (the parquet writer the recipe scripts share),
+`_torch_threads` (the torch CPU thread policy) and `_unimod` (the modification
+catalogue).
 
 ## Failure behavior
 
@@ -41,7 +45,9 @@ that `Err` aborts or is caught.
 | worker (stage) | on nonzero exit | strict gate | fallback |
 |---|---|---|---|
 | ms2pip_worker (predict-frag) | aborts run | none | none: `run_ms2pip(...)?` propagates (`predict_frag.rs:333-341`); an empty result map is also a hard `bail!` (`predict_frag.rs:342-344`) |
+| peptdeep_worker (predict-frag) | aborts run | none | none: `run_peptdeep(...)?` propagates (`predict_frag.rs`, the MS2PIP arm) |
 | deeplc_worker (predict-frag) | aborts run | none | none: `run_deeplc(...)?` propagates (`predict_frag.rs:291`) |
+| im2deep_worker (predict-frag) | aborts run | none | none: `run_im2deep(...)?` propagates (`predict_frag.rs`, `ImRequest::call`) |
 | deeplc_finetune (run) | aborts run | none | none: `run_deeplc_finetune(...)?` propagates (`run.rs:253-263`) |
 | mbr_worker (`mumdia mbr`) | aborts command | none | none: `run_mbr(...)?` propagates (`main.rs:697-710`) |
 | mokapot_worker (rescore) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`rescore.rs:172-180`) |
@@ -49,7 +55,7 @@ that `Err` aborts or is caught.
 | percolator (rescore, unwired) | falls back / bails | `rescore.strict` | `native_tda` when `strict=false`, else bail (`rescore.rs:209-215`) |
 | entrapment_worker (rescore) | falls back / bails | `rescore.strict` | native linear entrapment rescorer (still `QMode::Entrapment`) when `strict=false`, else bail (`rescore.rs:255-264`) |
 
-A crashed MS2PIP, DeepLC, DeepLC fine-tune, or MBR worker aborts. A crashed
+A crashed MS2PIP, AlphaPeptDeep, DeepLC, IM2Deep, DeepLC fine-tune, or MBR worker aborts. A crashed
 rescorer aborts only under `rescore.strict = true`; otherwise its scores are
 silently replaced by the native path.
 
@@ -61,15 +67,17 @@ the column it keys the readback on.
 | worker | positional args in | output file | key column |
 |---|---|---|---|
 | ms2pip_worker | `<in.parquet> <out.parquet> <model> <processes>` (`sidecar.rs`, `run_ms2pip`; `processes` is the engine's thread count) | `ms2pip_out.parquet` | `id` |
+| peptdeep_worker | `<in.parquet> <out.parquet> <model> <nce> <instrument> <processes>` (`sidecar.rs`, `run_peptdeep`; `processes` is the engine's thread count) | `peptdeep_out.parquet` | `id` |
 | deeplc_worker | `<in.parquet> <out.parquet> [threads]` (`sidecar.rs`, `run_deeplc`; `threads` is the engine's thread count, capped by the worker, see **DeepLC thread cap**) | `deeplc_out.parquet` | `id` |
+| im2deep_worker | `<in.parquet> <out.parquet> [threads]` (`sidecar.rs`, `run_im2deep`; `threads` is the engine's thread count, capped by the worker under `MUMDIA_IM2DEEP_THREAD_CAP`, see **DeepLC thread cap**) | `im2deep_out.parquet` | `id` |
 | deeplc_finetune | `<lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac --seed --predict-threads [--shards K]` (`sidecar.rs`, `run_deeplc_finetune`; `--shards` only when `rt_im_train.deeplc_predict_shards` is not 1, for all three modes) | `<lib_out>` (= `fragment_library_precursors_ft.parquet`) | `peptidoform` (new table with replaced `predicted_irt`; input unchanged) |
 | mokapot_worker / nn_rescore_worker | `<rescore.pin> <out.parquet>` + env `MUMDIA_NN_FOLDS/ITERS/TRAIN_FDR` (`rescore.rs:781-792`) | `rescore_sidecar_out.parquet` | `candidate_id` (echoes the flat row index) |
 | entrapment_worker | `<in.parquet> <out.parquet> <folds>` (`rescore.rs:718-724`) | `entrapment_out.parquet` | `row_id` |
 | mbr_worker | `<scored> <psms_csv> <out> --q-anchor --min-anchor-runs --q-transfer --seed [--out-scored] [--frag-csv --consensus-corr-min]` (`sidecar.rs:193-211`) | `<out>.parquet` | `candidate_id` |
 
 For the mapping from each conda environment to the config field that points at it
-(`predict_frag.ms2pip_python`, `predict_frag.deeplc_python`, `rescore.python`,
-`mbr.python`) and the interpreter paths on this machine, see
+(`predict_frag.ms2pip_python`, `predict_frag.deeplc_python`,
+`predict_frag.im2deep_python`, `rescore.python`, `mbr.python`) and the interpreter paths on this machine, see
 `docs/19_getting_started.md`.
 
 ## Files
@@ -79,6 +87,8 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/ms2pip_worker.py` | Predictor: MS2PIP b/y fragment intensities per peptidoform+charge |
 | `scripts/peptdeep_worker.py` | Predictor: AlphaPeptDeep b/y fragment intensities per peptidoform+charge, conditioned on collision energy and instrument |
 | `scripts/deeplc_worker.py` | Predictor: DeepLC iRT per peptidoform (uncalibrated) |
+| `scripts/im2deep_worker.py` | Predictor: IM2Deep 1/K0 per (peptidoform, charge), from the single-conformer CCS converted at the precursor m/z (uncalibrated); only under `predict_frag.im_predictor` |
+| `scripts/_torch_threads.py` | Shared module: the torch CPU thread policy (physical-core count, `thread_cap`, `capped_threads`) the DeepLC and IM2Deep workers cap their pools with and the NN rescorer reads its core count from |
 | `scripts/deeplc_finetune.py` | Predictor: transfer-learn DeepLC on this run's seed and rewrite the library iRT; with `--no-finetune` (seed `-`) rewrite it with base-model predictions instead (`rt_im_train.library_irt`) |
 | `scripts/mokapot_worker.py` | Rescorer: mokapot brew over a PIN (model env-switchable: nn/logreg/xgb/percolator) |
 | `scripts/nn_rescore_worker.py` | Rescorer: PyTorch semi-supervised MLP over a PIN, in-memory or streaming memmap |
@@ -94,16 +104,16 @@ For the mapping from each conda environment to the config field that points at i
 | `scripts/assemble_survivors.py` | Recipe: survivors table -> renumbered library, target/decoy pair kept together on `peptidoform_id`, fragments streamed (docs/21, docs/32) |
 | `scripts/shard_parquet.py` | Recipe: row-group-aligned parquet split / concatenate |
 | `scripts/mh_shard_predict.py` | Recipe: deduplicated, sharded multi-head DeepLC calibration of a very large precursor table (`uniq` / `fit` / `predict --calibration` / `merge`; reuses `deeplc_finetune.py`). The engine shards the same prediction itself under `rt_im_train.deeplc_predict_shards`; the recipe streams the library by row group, which matters at 1e8 rows |
-| `rust/mumdia/crates/mumdia/src/sidecar.rs` | Rust clients: `resolve_script`, `run_ms2pip`, `run_peptdeep`, `run_deeplc`, `run_deeplc_finetune`, `run_mbr`, `run_worker`, and the shared `fragment_request` / `read_fragment_intensities` the two intensity predictors both use |
-| `rust/mumdia/crates/mumdia/src/stages/predict_frag.rs` | Call sites for MS2PIP + DeepLC (Stage C) |
+| `rust/mumdia/crates/mumdia/src/sidecar.rs` | Rust clients: `resolve_script`, `run_ms2pip`, `run_peptdeep`, `run_deeplc`, `run_im2deep`, `run_deeplc_finetune`, `run_mbr`, `run_worker`; the shared `fragment_request` (the `id, peptidoform, charge` request, with an optional extra column) and `read_fragment_intensities` the intensity predictors use; and `read_id_scalars`, the one `id -> value` reader behind DeepLC and IM2Deep |
+| `rust/mumdia/crates/mumdia/src/stages/predict_frag.rs` | Call sites for MS2PIP, AlphaPeptDeep, DeepLC and IM2Deep (Stage C) |
 | `rust/mumdia/crates/mumdia/src/stages/run.rs` | Call site for DeepLC fine-tune (between search-seed and rt-im-train) |
 | `rust/mumdia/crates/mumdia/src/stages/rescore.rs` | Call sites for mokapot/nn_torch (PIN) + entrapment (Parquet) sidecars |
 | `rust/mumdia/crates/mumdia/src/main.rs` | Call site for MBR (`Cmd::Mbr`) + `doctor` env probe |
-| `env/docker-rescore.yml` | Docker env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9 (py3.11) |
-| `env/docker-deeplc.yml` | Docker env `deeplc`: `deeplc==4.5.0` (PyPI; the engine's floor) + CPU torch (py3.11) |
+| `env/docker-rescore.yml` | Docker env `rescore`: mokapot 0.10.0 + ms2pip 4.2.0 (py3.11) |
+| `env/docker-deeplc.yml` | Docker env `deeplc`: `deeplc==4.5.0` (PyPI; the engine's floor) + `im2deep>=2.0.0` + CPU torch (py3.11) |
 | `env/mumdia-rescore.yml` | Minimal portable env for the mokapot logreg rescore path (py3.12) |
-| `env/mumdia-deeplc.yml` | Portable local env for the DeepLC sidecars: DeepLC 4.5.0 + CPU torch (py3.11) |
-| `env/mumdia-peptdeep.yml` | Portable local env for the AlphaPeptDeep sidecar: peptdeep 1.5.1 (py3.11), separate because it pins the alphabase stack |
+| `env/mumdia-deeplc.yml` | Portable local env for the DeepLC and IM2Deep sidecars: DeepLC 4.5.0 + IM2Deep >= 2.0.0 + CPU torch (py3.11); IM2Deep 2.0.2 resolves and imports next to DeepLC 4.5.0, MS2PIP 4.2.0 and torch 2.14.0 |
+| `env/mumdia-peptdeep.yml` | Portable local env for the AlphaPeptDeep sidecar: peptdeep 1.5.1 (py3.11), separate because it pins the alphabase stack. peptdeep requires `numpy<2`, and pyarrow 26 refuses NumPy 1.x at import, so the env pins `pyarrow<20` (19.0.1 verified) |
 
 ## Inputs and outputs
 
@@ -134,7 +144,22 @@ code.
   the same cap.
 - IN `deeplc_in.parquet`: `id` u32, `peptidoform` str.
 - OUT `deeplc_out.parquet`: `id` u32, `predicted_rt` f32. Rust returns
-  `HashMap<u32, f32>` (`sidecar.rs:104`).
+  `HashMap<u32, f32>` through `read_id_scalars` with the value check off: a returned
+  id must be a requested one and appear once, and the value is taken as written.
+
+**im2deep_worker** (`sidecar.rs` `run_im2deep`)
+- ARGV `<in> <out> [threads]`; `threads` sizes torch's CPU pool, capped at the physical
+  cores available to the process (`MUMDIA_IM2DEEP_THREAD_CAP`, the same policy as the
+  **DeepLC thread cap**, from `_torch_threads.py`).
+- IN `im2deep_in.parquet`: `id` u32, `peptidoform` str (ProForma), `charge` i32,
+  `precursor_mz` f64. The fragment workers' request, written by the same
+  `fragment_request`, with the precursor m/z as the extra column.
+- OUT `im2deep_out.parquet`: `id` u32, `ccs` f32 (A^2), `predicted_im` f64 (1/K0,
+  V s cm^-2), written through `_lib_io`. Rust reads `id` and `predicted_im` through
+  `read_id_scalars` with the value check on, so a non-finite or non-positive 1/K0 is an
+  error, and returns `HashMap<u32, f64>`.
+- The worker refuses an IM2Deep older than 2.0.0 and exits nonzero on a value that is not
+  a finite positive 1/K0, before writing anything.
 
 **deeplc_finetune** (`sidecar.rs:111` `run_deeplc_finetune`)
 - IN `<lib_in>` = `fragment_library_precursors.parquet` (needs `peptidoform`,
@@ -335,6 +360,23 @@ observed RT. Its module-level imports are order-dependent: `import deeplc` must
 precede numpy and pyarrow (`deeplc_worker.py:13-29`, see **DeepLC import order**
 under gotchas).
 
+**IM2Deep predict** (`predict_frag.rs`, `ImRequest`, worker `im2deep_worker.py`).
+Selected by `predict_frag.im_predictor = "im2deep"`, or `"auto"` when the run's input
+carries 1/K0 and an IM2Deep interpreter resolves (`im_predictor_for`, docs/35 section 4). `ImRequest` deduplicates by
+`(peptidoform, charge)` in first-seen row order, because 1/K0 depends on the charge,
+calls `run_im2deep` with each pair's precursor m/z, and writes `r.im`. It runs after the
+fragment worker, one worker at a time, unless `MUMDIA_PREDICT_FRAG_CONCURRENT=1` puts it
+beside the others (not measured). A candidate with no returned 1/K0 is dropped with its
+pair through `drop_unpredicted`, together with the iRT and intensity misses and under the
+same 2% ceiling; the warning and the library report count it as
+`without_im`. The model identity is `im2deep-<version>-uni`
+(`sidecar::model_identity`), appended to the library's. Only a library built with a
+predictor gets `predicted_im` and the version-2 precursor table; without one every byte
+is the version-1 library's. Native FASTA decoys are separate peptidoforms with their own
+sequence, so they get their own prediction, as they get their own iRT. The worker uses the
+single-conformer model uncalibrated, and converts its CCS to 1/K0 with IM2Deep's own
+Mason-Schamp conversion (N2), which `mumdia_core::constants::im_to_ccs` inverts.
+
 **DeepLC fine-tune** (`run.rs:242-263`, worker `deeplc_finetune.py`). Wired into
 `run` only when `rt_im_train.finetune_deeplc = true`; runs **between**
 search-seed and rt-im-train, rewriting `predicted_irt` in a copy of the library
@@ -494,7 +536,8 @@ with an older DeepLC.
 
 **DeepLC thread cap.** Every DeepLC call site asks for the engine's rayon thread count
 (the fine-tune's training pool keeps its own bound), and both workers cap what they
-give torch at the physical cores available to the process: on Linux the physical cores
+give torch at the physical cores available to the process (`_torch_threads.py`, shared
+with `im2deep_worker.py`, whose own override is `MUMDIA_IM2DEEP_THREAD_CAP`): on Linux the physical cores
 behind the CPUs of `sched_getaffinity(0)`, so a container or `taskset` mask is
 respected, counted as the distinct sysfs `core_cpus_list` sets (`thread_siblings_list`
 before Linux 5.5; the `(physical_package_id, core_id)` pair only where neither exists,
@@ -686,7 +729,7 @@ Every lookup the worker makes is for a candidate that is a confident target of s
 run (`allc`, the union of the per-run confident sets), so the per-run apex maps and
 the per-candidate metadata hold only those candidates, and rescore's selected-peak
 lookup is built only for a run whose competed table has several peaks of one
-candidate (never under the default `extract.retain_top_peaks = 1`). The accepted
+candidate (never under the default `extract.promote_top_peaks = 1`). The accepted
 transfers are flagged in the augmented scored table by one sorted-key lookup on
 `(source, candidate_id)` instead of a Python loop over every row (`flag_transfers`),
 and the frames the flagging no longer needs are released before the whole scored
@@ -779,6 +822,9 @@ every entry on one axis before extraction, so no explicit reconciliation is done
 | `run_worker` | `sidecar.rs:217` | Spawn `python <script> <argv...>`; `utf8=true` sets `PYTHONUTF8`/`PYTHONIOENCODING` (DeepLC/Keras crash on Windows cp1252) |
 | `run_ms2pip` | `sidecar.rs:42` | Write ms2pip_in.parquet, run worker, fold output to `HashMap<u32,HashMap<(u8,u16),f32>>` |
 | `run_deeplc` | `sidecar.rs:81` | Write deeplc_in.parquet, run worker with the engine's thread count, return `HashMap<u32,f32>` (`utf8=true`) |
+| `run_im2deep` | `sidecar.rs` | Write im2deep_in.parquet (`fragment_request` plus `precursor_mz`), run worker with the engine's thread count, return `HashMap<u32,f64>` of finite positive 1/K0 (`utf8=true`) |
+| `read_id_scalars` | `sidecar.rs` | Read a worker's `id -> value` table: requested ids only, each once, an optional finite-positive check |
+| `model_identity` | `sidecar.rs` | `<module>-<version>-<suffix>` for a sidecar model; `deeplc_identity` is its DeepLC case |
 | `run_deeplc_finetune` | `sidecar.rs:111` | Run `deeplc_finetune.py <lib_in> <seed> <lib_out> --epochs --patience --q-train --batch --window-holdout-frac --seed --predict-threads` (`utf8=true`) |
 | `run_mbr` | `sidecar.rs:162` | Run `mbr_worker.py <scored> <psms_csv> <out> [--out-scored] [--frag-csv --consensus-corr-min] --q-anchor --min-anchor-runs --q-transfer --seed` |
 | `run_pin_sidecar` | `rescore.rs:740` | Write PIN keyed by row index, run mokapot/nn worker, map `score` back by row index |
@@ -795,7 +841,7 @@ every entry on one axis before extraction, so no explicit reconciliation is done
 
 Each sidecar role has one config field naming the Python that runs it:
 `rescore.python`, `predict_frag.deeplc_python`, `predict_frag.ms2pip_python`,
-`mbr.python`. Implemented in `rust/mumdia/crates/mumdia/src/python.rs`.
+`predict_frag.peptdeep_python`, `predict_frag.im2deep_python`, `mbr.python`. Implemented in `rust/mumdia/crates/mumdia/src/python.rs`.
 
 A field may hold an absolute path, which is used as given and never
 second-guessed, or the string `"auto"` (or be absent), which asks the engine to
@@ -803,7 +849,7 @@ find one. Discovery order, from `python.rs`:
 
 | order | source | provenance reported |
 |---|---|---|
-| 1 | `MUMDIA_PYTHON_RESCORE` / `_DEEPLC` / `_MS2PIP` / `_MBR` | the variable name |
+| 1 | `MUMDIA_PYTHON_RESCORE` / `_DEEPLC` / `_MS2PIP` / `_PEPTDEEP` / `_IM2DEEP` / `_MBR` | the variable name |
 | 2 | `MUMDIA_PYTHON` (all roles) | `MUMDIA_PYTHON` |
 | 3 | `CONDA_PREFIX`: `bin/python`, `python.exe`, `Scripts/python.exe` | `CONDA_PREFIX` |
 | 4 | `VIRTUAL_ENV`, same three layouts | `VIRTUAL_ENV` |
@@ -820,11 +866,25 @@ stage hours later. The module lists live on `Role::modules` and are the same one
 | `Rescore`, mokapot or entrapment | mokapot, sklearn, numpy, pandas, pyarrow |
 | `DeepLc` | deeplc, numpy, pandas, pyarrow, torch, psm_utils |
 | `Ms2pip` | ms2pip, numpy, pandas |
+| `Peptdeep` | peptdeep, alphabase, torch, numpy, pandas, pyarrow |
 | `Mbr` | numpy, pyarrow |
+| `Im2deep` | im2deep, psm_utils, torch, numpy, pyarrow |
+
+Discovery reuses no other role's interpreter on its own: IM2Deep is found where the
+candidates above find it, so with the DeepLC environment activated, or named in
+`MUMDIA_PYTHON_IM2DEEP` or the config. Its version floor (`MIN_IM2DEEP_VERSION`, 2.0.0)
+is judged like DeepLC's (`Role::version_floor`): discovery skips an older interpreter,
+`doctor` fails on one, and the sidecar launch refuses it. `im_predictor = "im2deep"`
+requires the role; `"auto"` only wants it, so a miss resolves the predictor to `none`
+with a log line rather than an error.
 
 A role is resolved only when the configuration actually uses it
-(`Role::required_by`): the rescorer classifier, `rt_predictor`/`finetune_deeplc`,
-`predictor`, and `mbr.strategy` respectively. A default native run therefore
+(`Role::required_by`): the rescorer classifier for `Rescore`;
+`rt_predictor`, `finetune_deeplc`, `library_irt = deeplc` or an explicit multi-head head
+count for `DeepLc`; `predictor` for `Ms2pip` and `Peptdeep`; `mbr.strategy` for `Mbr`; and
+`im_predictor = im2deep` for `Im2deep`. A role can also be wanted without being required
+(`Role::wanted_by`: DeepLC under `library_irt = auto`, IM2Deep under `im_predictor = auto`),
+in which case a miss is a log line, not an error. A default native run therefore
 needs no interpreter, probes nothing, and works on a machine with no Python. A
 role that is needed but unresolvable is a hard error in preflight, naming the
 field, the environment variable, and the modules required.
@@ -850,11 +910,15 @@ configured.
 
 | field | default | effect |
 |---|---|---|
-| `predict_frag.predictor` | `native` | `ms2pip` engages `ms2pip_worker.py` (requires `ms2pip_python`) |
+| `predict_frag.predictor` | `native` | `ms2pip` engages `ms2pip_worker.py` (requires `ms2pip_python`); `peptdeep` engages `peptdeep_worker.py` (requires `peptdeep_python`) |
+| `predict_frag.peptdeep_model` / `peptdeep_nce` / `peptdeep_instrument` | `generic` / `30` / `Lumos` | 3rd to 5th positional args to `peptdeep_worker.py` under `predictor = peptdeep`; the diaPASEF recipe uses `generic`, 35 and `timsTOF` (docs/35 section 9) |
+| `predict_frag.peptdeep_python` | `None` | interpreter for AlphaPeptDeep (`MUMDIA_PYTHON_PEPTDEEP`; env `env/mumdia-peptdeep.yml`) |
 | `predict_frag.rt_predictor` | `native` | `deeplc` engages `deeplc_worker.py` (requires `deeplc_python`) |
 | `predict_frag.ms2pip_model` | `"HCDch2"` | 3rd positional arg to `ms2pip_worker.py`; `*ch2` models emit the `b2`/`y2` series as `frag_charge` 2 |
 | `predict_frag.ms2pip_python` | `None` | interpreter for MS2PIP (env with ms2pip+pyarrow) |
 | `predict_frag.deeplc_python` | `None` | interpreter for DeepLC predict AND fine-tune |
+| `predict_frag.im_predictor` | `none` | `im2deep` engages `im2deep_worker.py` (requires `im2deep_python`); `auto` engages it only on a run whose input carries 1/K0 and when an IM2Deep interpreter resolves. Omitted from the canonical config at `none` |
+| `predict_frag.im2deep_python` | `None` | interpreter for IM2Deep (env with im2deep >= 2.0.0, psm_utils, torch, pyarrow); omitted from the canonical config when unset |
 | `predict_frag.sidecar_script_dir` | `"scripts"` | dir passed to `resolve_script` for all workers |
 | `rt_im_train.finetune_deeplc` | `false` | engage `deeplc_finetune.py` in `run` (requires `deeplc_python`) |
 | `rt_im_train.finetune_epochs` | `25` | `--epochs` upper bound (early stopping usually halts first) |
@@ -1297,7 +1361,7 @@ MLP. Set it explicitly for the logreg path.
   like the DeepLC/torch one above. Update these lists when a worker's imports
   change so `mumdia doctor` stays truthful.
 - **Conda envs.** The committed reproducible specs are `env/docker-rescore.yml`
-  (env `rescore`: mokapot 0.10.0 + ms2pip 4.0.0.dev9, py3.11) and
+  (env `rescore`: mokapot 0.10.0 + ms2pip 4.2.0, py3.11) and
   `env/docker-deeplc.yml` (env `deeplc`: DeepLC 4.5.0 + CPU torch, py3.11); the
   Docker configs point interpreters at `/opt/conda/envs/{rescore,deeplc}/bin/python`
   (`docker/config.dia.json`, `docker/config.diann-lib.json`). For a native install
@@ -1308,8 +1372,12 @@ MLP. Set it explicitly for the logreg path.
   rankings (`docs/08_rt_im_train.md` section 4b), the multi-head calibration needs
   4.4.0 and the default projection cache 4.5.0, so an older DeepLC changes results
   and not only performance. The engine enforces it: `mumdia doctor` fails below
-  4.5.0 and `sidecar::require_deeplc_version` refuses to launch a DeepLC worker
-  (one constant, `mumdia_core::constants::MIN_DEEPLC_VERSION`). Anchor the tool version and let pip resolve
+  4.5.0 and the sidecar launch refuses an older DeepLC worker. Every version floor goes
+  through one check: `Role::version_floor` names the distribution and the oldest release
+  (`MIN_DEEPLC_VERSION` for DeepLC, `MIN_IM2DEEP_VERSION` 2.0.0 for IM2Deep, in
+  `mumdia_core::constants`), discovery and `doctor` judge it with `python::judge_version`,
+  and `sidecar::require_version` refuses the launch (`require_deeplc_version` is its
+  DeepLC call). AlphaPeptDeep, MS2PIP, the rescorers and MBR have no floor. Anchor the tool version and let pip resolve
   its scientific-Python graph; do not re-add an exact `pandas < 2` style pin,
   which has no cp312 wheel. A developer machine may also have older local envs
   (`deeplc_mt` holds the superseded a2 build); prefer the committed specs.
