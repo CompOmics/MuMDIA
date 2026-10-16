@@ -104,7 +104,9 @@ than a number. Both are recorded in every run's `manifest.json`.
   readers each instead of letting the first take the whole budget, and reads a skeleton
   centroid table: extract writes the rows retrace rebuilds from raw events as zeros on their
   axis (`retrace_skeleton` in the table's report), since decoding those centroid values was
-  most of retrace's read. Every retrace output is bit-identical. Under
+  most of retrace's read. Retrace also holds only the MS2 frames of the isolation windows its
+  current rows need instead of every MS2 frame of the run: the phase of five concurrent
+  retraces fell from 96-98 to 49-66 GB. Every retrace output is bit-identical. Under
   `retrace.enabled` the centroid table's bytes and hash change; it is deleted after retrace.
 - **`run-experiment` matches between runs by default with a second pass**
   (`mbr.strategy = "second_pass"`, the new default; it was `"none"`). The pooled first pass
