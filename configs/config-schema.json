@@ -2511,7 +2511,7 @@
       "optional": false,
       "default": false,
       "default_text": "false",
-      "help": "Emit the four gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy`) as extra `psms.parquet` columns, for the offline gate-metric comparison. Default `false` (diagnostic sidecar, like `emit_candidate_audit`): when off, neither the columns nor the extra per-candidate score computation happen, so the default chain is byte-identical.",
+      "help": "Emit the five gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy`, `gate_window_mean`) as extra `psms.parquet` columns, for the offline gate-metric comparison. Default `false` (diagnostic sidecar, like `emit_candidate_audit`): when off, neither the columns nor the extra per-candidate score computation happen, so the default chain is byte-identical.",
       "gates": [
         "diagnostic"
       ],
@@ -2563,6 +2563,21 @@
       "default_text": "0.2",
       "help": "Weight of the RT error in `GateMode::WindowMean`: the score is the mean of the summed-window entropy, coverage and cosine minus this times the apex RT error over the candidate's own window half-width on that side (clipped to 1).",
       "gates": [],
+      "source_struct": "ExtractConfig"
+    },
+    {
+      "path": "extract.gate_support_min",
+      "name": "gate_support_min",
+      "section": "extract",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "A second acceptance threshold under `GateMode::WindowMean`, the diaPASEF gate: a candidate must pass `gate_min_score` and this, without the MS1 rescue. On spectra that carry 1/K0 the score is the window-mean score plus `0.023 ln(1 + apex intensity)` and `0.009 ln(1 + MS1 monoisotopic intensity at the apex)`, minus `1.23` times the apex 1/K0 error against the calibrated prediction, `7.44` times the 1/K0 spread of the matched fragments at the apex (`apex_im_mad`) and `0.18` times the MS1-to-fragment 1/K0 difference: weights fitted on the gate-time quantities of two HYE diaPASEF runs, on targets only. Without 1/K0 it is the window-mean score plus `0.05 ln(1 + apex intensity)` and `0.02 ln(1 + MS1 mono)`. The MS1 term counts only where the apex reads the mono, +1 and +2 isotopes, as the `log_mono_ms1` feature does. 0 (default) is off. On the six ProteoBench HYE diaPASEF runs, 0.845 (with 1/K0) and 1.215 (without) keep about 42% of the candidates the window-mean gate at 0.6 passes; a window-mean threshold of 0.75 keeps 45% and loses more identifications (docs/35_diapasef.md section 16). Benchmark-gated.",
+      "gates": [
+        "benchmark-gated"
+      ],
       "source_struct": "ExtractConfig"
     },
     {

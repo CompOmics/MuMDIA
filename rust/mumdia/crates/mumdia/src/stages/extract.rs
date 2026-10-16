@@ -1498,6 +1498,30 @@ fn demix_features_for(d: &DemixScan, cid: u32) -> DemixFeatures {
     )
 }
 
+/// Weights of the apex intensity and MS1 terms of the support gate
+/// (`extract.gate_support_min`), on `ln(1 + intensity)`: the combination that, on a HYE
+/// diaPASEF run, ranked the candidates passing the window-mean gate at 0.6 so that the top
+/// 60% held 99.5% of the 1% identifications (docs/35_diapasef.md section 16).
+const GATE_SUPPORT_INTENSITY_WEIGHT: f64 = 0.05;
+const GATE_SUPPORT_MS1_WEIGHT: f64 = 0.02;
+
+/// The support gate on spectra that carry 1/K0 (diaPASEF), on the window-mean scale: the
+/// window-mean score, plus 0.023 ln(1 + apex intensity) and 0.009 ln(1 + MS1 mono), minus
+/// 1.23 |apex_im - im_pred_cal|, 7.44 apex_im_mad and 0.18 |ms1_apex_im - apex_im| (1/K0 in
+/// Vs/cm2). Fitted by logistic regression on the gate-time quantities of two HYE diaPASEF
+/// runs (standalone extract with the gate diagnostics), on targets only, identified at 1%
+/// against not identified; each run's weights tested on the other run's candidates, the two
+/// fits averaged. A missing 1/K0 value takes the 99th percentile of the observed ones there
+/// (docs/35_diapasef.md section 16).
+const GATE_IM_INTENSITY_WEIGHT: f64 = 0.023;
+const GATE_IM_MS1_WEIGHT: f64 = 0.009;
+const GATE_IM_ERR_WEIGHT: f64 = 1.23;
+const GATE_IM_MAD_WEIGHT: f64 = 7.44;
+const GATE_IM_MS1_ERR_WEIGHT: f64 = 0.18;
+const GATE_IM_ERR_MISSING: f64 = 0.039;
+const GATE_IM_MAD_MISSING: f64 = 0.024;
+const GATE_IM_MS1_ERR_MISSING: f64 = 0.265;
+
 /// Sum intensities of peaks within `tol_ppm` of `target` (m/z-sorted arrays).
 /// [`sum_near`] in the MS1 scan nearest `j` and its `half` neighbours either side: the
 /// maximum over those scans (`extract.ms1_scan_halfwidth`; 0 reads scan `j` only).
@@ -3046,6 +3070,9 @@ struct CandOut {
     gate_peak_spectral: f32,
     gate_coelution: f32,
     gate_spectral_entropy: f32,
+    /// The window-mean score (`GateMode::WindowMean`) of the candidate, whatever the gate
+    /// mode, for the offline design of a gate (`emit_gate_diagnostics` only).
+    gate_window_mean: f32,
     /// Spectrum-centric demix features (D2), all 0 unless `emit_demix_features`:
     /// residual-explained fraction, active-set survival flag, and this candidate's
     /// fraction of the total demixed abundance at its apex.
@@ -3113,6 +3140,7 @@ struct PsmRows {
     gate_peakspec: Vec<f32>,
     gate_coel: Vec<f32>,
     gate_se: Vec<f32>,
+    gate_wm: Vec<f32>,
     deconv_expl: Vec<f32>,
     deconv_act: Vec<f32>,
     deconv_share: Vec<f32>,
@@ -3163,6 +3191,7 @@ impl PsmRows {
             self.gate_peakspec.push(r.gate_peak_spectral);
             self.gate_coel.push(r.gate_coelution);
             self.gate_se.push(r.gate_spectral_entropy);
+            self.gate_wm.push(r.gate_window_mean);
         }
         if cfg.emit_demix_features {
             self.deconv_expl.push(r.deconv_explained);
@@ -3251,6 +3280,7 @@ impl PsmRows {
                 "gate_spectral_entropy".into(),
                 take(&mut self.gate_se),
             ));
+            cols.push(Col::F32("gate_window_mean".into(), take(&mut self.gate_wm)));
         }
         if cfg.emit_rt_window {
             cols.push(Col::F64("rt_lo".into(), take(&mut self.win_lo)));
@@ -4454,6 +4484,9 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             };
             mean - p.cfg.gate_rt_weight * rtw
         };
+        // Computed at most once: the acceptance gate and the support gate both read it.
+        let window_mean_once = std::cell::OnceCell::new();
+        let window_mean = || *window_mean_once.get_or_init(window_mean);
         // `to_vec` only where the co-elution score is actually asked for (a non-default
         // gate mode, or the diagnostics), so the default chain never materialises it.
         let coel = || coelution_gate_score(&groups, &distinct.to_vec(), &sig, fints0);
@@ -4484,6 +4517,74 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 }
             }
         }
+        // The 1/K0 evidence (psms_extracted v4) of a row with its apex at `rt`, the selected
+        // apex and every promoted alternative alike. It depends only on the candidate, the
+        // row's apex RT and the precursor m/z, so it is computed here, per accepted row,
+        // rather than in a pass over the finished table, which is streamed out in chunks.
+        // All `None` on 3D data.
+        let im_at = |rt: f64| -> ApexIm {
+            if !has_im {
+                return ApexIm::default();
+            }
+            ApexIm {
+                im_pred_cal: win
+                    .im_cal
+                    .as_ref()
+                    .and_then(|v| v.get(cid as usize).copied().flatten()),
+                ..apex_im_stats(
+                    &lib,
+                    scans,
+                    &rt_scan,
+                    ms1_scans,
+                    &ms1_rts,
+                    guard,
+                    &mass_off,
+                    frag_tol,
+                    p.cfg,
+                    cid,
+                    rt,
+                    c.precursor_mz,
+                )
+            }
+        };
+
+        // The selected apex's 1/K0 evidence, computed once: the support gate reads it on 1/K0
+        // data, and the rank-0 row carries it.
+        let im0_once = std::cell::OnceCell::new();
+        let im0_of = || *im0_once.get_or_init(|| im_at(apex_rt));
+
+        // The support gate (`extract.gate_support_min`): the window-mean score plus the
+        // apex intensity and MS1 terms the `log_apex_intensity` and `log_mono_ms1` features
+        // carry and, on spectra that carry 1/K0, three 1/K0 terms, without the MS1 rescue.
+        if p.cfg.gate_support_min > 0.0 && matches!(p.cfg.gate_mode, GateMode::WindowMean) {
+            let ms1 = match (o_ms1_mono, o_ms1_i1, o_ms1_i2) {
+                (Some(mono), Some(_), Some(_)) => (1.0 + mono).ln(),
+                _ => 0.0,
+            };
+            let ln_apex = (1.0 + apex_sum as f64).ln();
+            let support = if has_im {
+                let e = im0_of();
+                let abs_diff = |a: Option<f64>, b: Option<f64>, missing: f64| match (a, b) {
+                    (Some(a), Some(b)) if (a - b).is_finite() => (a - b).abs(),
+                    _ => missing,
+                };
+                window_mean() + GATE_IM_INTENSITY_WEIGHT * ln_apex + GATE_IM_MS1_WEIGHT * ms1
+                    - GATE_IM_ERR_WEIGHT * abs_diff(e.apex_im, e.im_pred_cal, GATE_IM_ERR_MISSING)
+                    - GATE_IM_MAD_WEIGHT
+                        * e.apex_im_mad
+                            .filter(|v| v.is_finite())
+                            .unwrap_or(GATE_IM_MAD_MISSING)
+                    - GATE_IM_MS1_ERR_WEIGHT
+                        * abs_diff(e.ms1_apex_im, e.apex_im, GATE_IM_MS1_ERR_MISSING)
+            } else {
+                window_mean()
+                    + GATE_SUPPORT_INTENSITY_WEIGHT * ln_apex
+                    + GATE_SUPPORT_MS1_WEIGHT * ms1
+            };
+            if support < p.cfg.gate_support_min {
+                return Vec::new();
+            }
+        }
 
         // Diagnostic scores (all four metrics, for the offline gate-metric
         // comparison). Computed and emitted ONLY when `emit_gate_diagnostics` is set,
@@ -4496,6 +4597,11 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             } else {
                 (0.0, 0.0, 0.0, 0.0)
             };
+        let gate_window_mean = if p.cfg.emit_gate_diagnostics {
+            window_mean()
+        } else {
+            0.0
+        };
 
         // Soft competition features from the co-elution arbitration (all 0 when the
         // two-pass path did not run). contested_frac: fraction of contested INTENSITY
@@ -4544,42 +4650,11 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             }
         }
 
-        // The 1/K0 evidence (psms_extracted v4) of a row with its apex at `rt`, the selected
-        // apex and every promoted alternative alike. It depends only on the candidate, the
-        // row's apex RT and the precursor m/z, so it is computed here, per accepted row,
-        // rather than in a pass over the finished table, which is streamed out in chunks.
-        // All `None` on 3D data.
-        let im_at = |rt: f64| -> ApexIm {
-            if !has_im {
-                return ApexIm::default();
-            }
-            ApexIm {
-                im_pred_cal: win
-                    .im_cal
-                    .as_ref()
-                    .and_then(|v| v.get(cid as usize).copied().flatten()),
-                ..apex_im_stats(
-                    &lib,
-                    scans,
-                    &rt_scan,
-                    ms1_scans,
-                    &ms1_rts,
-                    guard,
-                    &mass_off,
-                    frag_tol,
-                    p.cfg,
-                    cid,
-                    rt,
-                    c.precursor_mz,
-                )
-            }
-        };
-
         // The selected apex's 1/K0 evidence, computed once, before the traces: the rank-0 row
         // carries it, and a skeleton table (`ExtractParams::retrace_skeleton`) needs the
         // centre retrace will use to know which rows it rebuilds: this `apex_im`, or
         // `im_pred_cal` where that is not finite (`retrace::Skeleton`).
-        let im0 = im_at(apex_rt);
+        let im0 = im0_of();
         let skel_centre = match im0.apex_im.filter(|v| v.is_finite()) {
             Some(v) => v,
             None => im0.im_pred_cal.unwrap_or(f64::NAN),
@@ -4825,6 +4900,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             gate_peak_spectral: gate_peak_spectral as f32,
             gate_coelution: gate_coelution as f32,
             gate_spectral_entropy: gate_spectral_entropy as f32,
+            gate_window_mean: gate_window_mean as f32,
             deconv_explained: deconv_explained as f32,
             deconv_active: deconv_active as f32,
             deconv_share: deconv_share as f32,
@@ -4916,6 +4992,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 gate_peak_spectral: gate_peak_spectral as f32,
                 gate_coelution: gate_coelution as f32,
                 gate_spectral_entropy: gate_spectral_entropy as f32,
+                gate_window_mean: gate_window_mean as f32,
                 // Demix is a rank-0 apex feature; alternate peaks carry 0.
                 deconv_explained: 0.0,
                 deconv_active: 0.0,
@@ -5351,6 +5428,12 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             if let Some(obj) = params.as_object_mut() {
                 obj.insert("reader".into(), json!(crate::instrument::READER_TIMSRUST));
                 obj.insert("im_gate".into(), json!(im_gate));
+            }
+        }
+        // The support gate, only when it is on, so a report without it is unchanged.
+        if p.cfg.gate_support_min > 0.0 {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert("gate_support_min".into(), json!(p.cfg.gate_support_min));
             }
         }
         // A skeleton table says so in its own report, with the rows it left for retrace;
@@ -6532,6 +6615,7 @@ mod psms_stream_tests {
             gate_peak_spectral: 0.5,
             gate_coelution: -0.25,
             gate_spectral_entropy: (i % 9) as f32,
+            gate_window_mean: 0.0,
             deconv_explained: 0.0,
             deconv_active: 1.0,
             deconv_share: 0.5,

@@ -1946,9 +1946,9 @@ pub struct ExtractConfig {
     /// 6%; recomputed with this rule, 85% at the apex, 6% and 5% either side. Default
     /// false; benchmark-gated.
     pub apex_refine_intensity: bool,
-    /// Emit the four gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`,
-    /// `gate_coelution`, `gate_spectral_entropy`) as extra `psms.parquet` columns,
-    /// for the offline gate-metric comparison. Default `false` (diagnostic sidecar,
+    /// Emit the five gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`,
+    /// `gate_coelution`, `gate_spectral_entropy`, `gate_window_mean`) as extra
+    /// `psms.parquet` columns, for the offline gate-metric comparison. Default `false` (diagnostic sidecar,
     /// like `emit_candidate_audit`): when off, neither the columns nor the extra
     /// per-candidate score computation happen, so the default chain is byte-identical.
     pub emit_gate_diagnostics: bool,
@@ -1964,6 +1964,22 @@ pub struct ExtractConfig {
     /// summed-window entropy, coverage and cosine minus this times the apex RT error over
     /// the candidate's own window half-width on that side (clipped to 1).
     pub gate_rt_weight: f64,
+    /// A second acceptance threshold under `GateMode::WindowMean`, the diaPASEF gate: a
+    /// candidate must pass `gate_min_score` and this, without the MS1 rescue. On spectra that
+    /// carry 1/K0 the score is the window-mean score plus `0.023 ln(1 + apex intensity)` and
+    /// `0.009 ln(1 + MS1 monoisotopic intensity at the apex)`, minus `1.23` times the apex
+    /// 1/K0 error against the calibrated prediction, `7.44` times the 1/K0 spread of the
+    /// matched fragments at the apex (`apex_im_mad`) and `0.18` times the MS1-to-fragment 1/K0
+    /// difference: weights fitted on the gate-time quantities of two HYE diaPASEF runs, on
+    /// targets only. Without 1/K0 it is the window-mean score plus `0.05 ln(1 + apex
+    /// intensity)` and `0.02 ln(1 + MS1 mono)`. The MS1 term counts only where the apex reads
+    /// the mono, +1 and +2 isotopes, as the `log_mono_ms1` feature does. 0 (default) is off.
+    /// On the six ProteoBench HYE diaPASEF runs, 0.845 (with 1/K0) and 1.215 (without) keep
+    /// about 42% of the candidates the window-mean gate at 0.6 passes; a window-mean threshold
+    /// of 0.75 keeps 45% and loses more identifications (docs/35_diapasef.md section 16).
+    /// Benchmark-gated.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub gate_support_min: f64,
     /// The 1/K0 gate of a run whose spectra carry ion mobility (a diaPASEF `.d` read by the
     /// native reader): a fragment peak whose 1/K0 lies outside the candidate's calibrated
     /// 1/K0 window (`run_windows.im_lo`/`im_hi`, from `rt-im-train`) is not matched to that
@@ -2124,6 +2140,7 @@ impl Default for ExtractConfig {
             gate_mode: GateMode::WindowMean, // window-summed agreement minus RT term (since 2026-10-08)
             gate_coelution_min: 0.5,         // used only by GateMode::Combined
             gate_rt_weight: 0.2,             // used only by GateMode::WindowMean
+            gate_support_min: 0.0,           // off; benchmark-gated
             im_gate: ImGate::Off,
         }
     }
@@ -3705,6 +3722,13 @@ impl Config {
                  candidate and trimmed traces), not {}",
                 self.extract.chromatogram_schema
             )));
+        }
+        if !self.extract.gate_support_min.is_finite() || self.extract.gate_support_min < 0.0 {
+            return Err(Invalid(
+                "extract.gate_support_min must be finite and >= 0 (0 disables the support \
+                 gate)."
+                    .into(),
+            ));
         }
         if !self.extract.gate_min_score.is_finite()
             || !(0.0..=1.0).contains(&self.extract.gate_min_score)
@@ -5844,6 +5868,8 @@ mod tests {
         assert_eq!(c.search_seed.top_n_peaks, 0);
 
         assert!(Config::from_json(r#"{"extract":{"gate_min_score":-0.1}}"#).is_err());
+        assert!(Config::from_json(r#"{"extract":{"gate_support_min":-0.1}}"#).is_err());
+        assert!(Config::from_json(r#"{"extract":{"gate_support_min":1.4}}"#).is_ok());
         assert!(Config::from_json(r#"{"extract":{"gate_min_score":1.1}}"#).is_err());
     }
 

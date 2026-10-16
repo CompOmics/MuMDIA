@@ -64,7 +64,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`predict_frag`](#predict_frag) | `PredictFragConfig` | 17 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
 | [`search_seed`](#search_seed) | `SearchSeedConfig` | 11 | [docs/07_search_seed.md](07_search_seed.md) |
 | [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 31 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
-| [`extract`](#extract) | `ExtractConfig` | 44 | [docs/09_extract.md](09_extract.md) |
+| [`extract`](#extract) | `ExtractConfig` | 45 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
 | [`features`](#features) | `FeaturesConfig` | 12 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
@@ -388,10 +388,11 @@ Fragment traces over consecutive same-window scans.
 | `emit_candidate_audit` | `bool` | `false` | diagnostic | Diagnostic candidate-audit: when true, extraction records, for every probed candidate, either the survivor stage-flags or the earliest `RejectionReason`, and writes `<out-psms>.audit.parquet` (spec 01 §4 / P0.3). Near-zero cost when false (no per-candidate audit allocation). Default false (production). |
 | `apex_evidence_rank` | `bool` | `true` |  | Evidence-count apex selection: choose the apex scan by the NUMBER of distinct co-eluting predicted fragments present (breadth of evidence), using observed signature-ion intensity only as a sub-integer tiebreak. In wide-window DIA a single fragment m/z channel is chimeric, so the tallest scan is often a co-isolated interferent; the scan where the most of the peptide's own predicted transitions co-elute is a more reliable apex. Default `true`, on correctness grounds rather than a count: `false` keeps the legacy signature-intensity apex, whose score is 0.0 at every qualifying scan when none of the top-K predicted fragments is observed, so the strict `>` never replaces the first candidate and the apex silently becomes the LOWEST-RT qualifying scan. The rolling distinct-fragment count (`apex_count_window`) still gates which scans qualify in both modes. |
 | `apex_refine_intensity` | `bool` | `false` | benchmark-gated | Choose the apex by intensity INSIDE the region the fragment count selects. The qualifying scans (rolling distinct-fragment count within `apex_count_tol` of its maximum) are widened by the rolling half-width (`apex_count_window / 2`), and the apex is the scan in that region with the largest observed intensity of the top-K predicted fragments (`apex_top_fragments`, 3 by default), times the RT prior when it is on. The count still decides WHERE the peptide elutes, so a bright interferent outside the sustained-evidence region cannot take the apex; inside it, intensity decides WHICH scan. Without it the count also picks the scan, and on a tailing peak the rolling count is largest after the intensity maximum: measured on Astral REP1 (`apex_count_window` 5), the summed fragment intensity peaked one scan BEFORE the chosen apex for 41% of the accepted precursors and one scan after for 6%; recomputed with this rule, 85% at the apex, 6% and 5% either side. Default false; benchmark-gated. |
-| `emit_gate_diagnostics` | `bool` | `false` | diagnostic | Emit the four gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy`) as extra `psms.parquet` columns, for the offline gate-metric comparison. Default `false` (diagnostic sidecar, like `emit_candidate_audit`): when off, neither the columns nor the extra per-candidate score computation happen, so the default chain is byte-identical. |
+| `emit_gate_diagnostics` | `bool` | `false` | diagnostic | Emit the five gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`, `gate_coelution`, `gate_spectral_entropy`, `gate_window_mean`) as extra `psms.parquet` columns, for the offline gate-metric comparison. Default `false` (diagnostic sidecar, like `emit_candidate_audit`): when off, neither the columns nor the extra per-candidate score computation happen, so the default chain is byte-identical. |
 | `gate_mode` | `GateMode` | `window_mean` |  | Which spectral-agreement score the `gate_min_score` gate thresholds (sensitivity program). The legacy gate uses a single apex-scan intensity Pearson, which one chimeric scan can dominate. See `GateMode`. |
 | `gate_coelution_min` | `f64` | `0.5` |  | Second threshold for `GateMode::Combined`: the co-elution score must exceed this while the peak-integrated spectral score exceeds `gate_min_score`. Requiring BOTH is more specific (rejects interferents that pass one axis). |
 | `gate_rt_weight` | `f64` | `0.2` |  | Weight of the RT error in `GateMode::WindowMean`: the score is the mean of the summed-window entropy, coverage and cosine minus this times the apex RT error over the candidate's own window half-width on that side (clipped to 1). |
+| `gate_support_min` | `f64` | `0.0` | benchmark-gated | A second acceptance threshold under `GateMode::WindowMean`, the diaPASEF gate: a candidate must pass `gate_min_score` and this, without the MS1 rescue. On spectra that carry 1/K0 the score is the window-mean score plus `0.023 ln(1 + apex intensity)` and `0.009 ln(1 + MS1 monoisotopic intensity at the apex)`, minus `1.23` times the apex 1/K0 error against the calibrated prediction, `7.44` times the 1/K0 spread of the matched fragments at the apex (`apex_im_mad`) and `0.18` times the MS1-to-fragment 1/K0 difference: weights fitted on the gate-time quantities of two HYE diaPASEF runs, on targets only. Without 1/K0 it is the window-mean score plus `0.05 ln(1 + apex intensity)` and `0.02 ln(1 + MS1 mono)`. The MS1 term counts only where the apex reads the mono, +1 and +2 isotopes, as the `log_mono_ms1` feature does. 0 (default) is off. On the six ProteoBench HYE diaPASEF runs, 0.845 (with 1/K0) and 1.215 (without) keep about 42% of the candidates the window-mean gate at 0.6 passes; a window-mean threshold of 0.75 keeps 45% and loses more identifications (docs/35_diapasef.md section 16). Benchmark-gated. |
 | `im_gate` | `ImGate` | `off` | benchmark-gated | The 1/K0 gate of a run whose spectra carry ion mobility (a diaPASEF `.d` read by the native reader): a fragment peak whose 1/K0 lies outside the candidate's calibrated 1/K0 window (`run_windows.im_lo`/`im_hi`, from `rt-im-train`) is not matched to that candidate, as a peak outside its RT window is not. See `ImGate`. Default `off`. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its default. |
 
 ## extract.claim_cues
@@ -1222,12 +1223,63 @@ Every field whose struct has an `impl Default` resolved from the source.
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
-8 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
+59 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
 
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmRows::push: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmStream::push: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `chunk.slices_mut()``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `runs[r].span_mut(m)``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `*c``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.base_width_rt``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.best_ref_corr``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.charge_multi_flag``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.charge``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.coel_clean``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.coelution_best``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.coelution_mean``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.coelution_run``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.contrast_min``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.cross_charge_intensity_log``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.diff_by_intensity``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.evidence``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.frag_corr``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.frag_cosine``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.has_ms1``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.isotope_corr``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.library_norm_manhattan``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.library_rmsd``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.log_apex_intensity``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.log_mono_ms1``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.log_sn``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.low_frag_coel``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.matched_fraction``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.mean_mass_error``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.ms1_isom1_ratio``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.n_b_ions``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.n_charge_states``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.n_coelution_above``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.n_matched_fragments``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.n_observations``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.n_proteins``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.n_y_ions``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.peak_apportioned_frac``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.peak_contested_count_frac``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.peak_contested_frac``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.peptide_length``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.profile_cos``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.ref_corr``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.resid_corr``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.rt_error_abs``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.rt_error_rel``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.seed_identified``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.seed_score``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.shadow_frac``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.spectral_angle``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.sum_b_intensity``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.sum_y_intensity``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.weighted_mass_error``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.xcorr_coelution``
+- `rust/mumdia/crates/mumdia/src/stages/features.rs::run_chunked: env read via closure of `ix.xcorr_shape``
 - `rust/mumdia/crates/mumdia/src/stages/prescreen/tags.rs::discover: env read via closure of `alpha.key(alpha.canonical(a, b, c), z, false)``
 - `rust/mumdia/crates/mumdia/src/stages/prescreen/tags.rs::discover: env read via closure of `alpha.key(alpha.canonical(la as u16, p.1, p.2), z, true)``
 - `rust/mumdia/crates/mumdia/src/stages/prescreen/tags.rs::discover: env read via closure of `alpha.key(alpha.canonical(p.1, p.2, lb as u16), z, true)``
@@ -1235,6 +1287,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-24 structs and 307 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 39 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 308 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 39 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
-33 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+34 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
