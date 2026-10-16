@@ -1586,6 +1586,7 @@ fn real_main() -> Result<()> {
                 out: &out,
                 cfg: &cfg.retrace,
                 config_hash: &ch,
+                ms1_denoise: cfg.convert.tdf_ms1_denoise,
             })?;
         }
         Cmd::Features {

@@ -411,6 +411,18 @@ pub struct ConvertConfig {
     /// is 0.
     #[serde(skip_serializing_if = "is_default_tdf_im_smooth_scans")]
     pub tdf_im_smooth_scans: f64,
+    /// Native diaPASEF reader: remove MS1 noise before centroiding, with the method and
+    /// default MS1 settings of dnoise (Garrett, Diedrich and Yates, bioRxiv 2026,
+    /// doi:10.64898/2026.08.27.747603): keep only MS1 points on runs of at least 5 occupied
+    /// mobility scans (TOF neighbourhood +/- 3, gaps of up to 2 scans bridged, two passes),
+    /// drop features no diaPASEF window reaches (windows padded by 3 Th and 0.015 1/K0), and
+    /// drop the weak m/z halo of bright ions. Retrace applies the same filter to the raw MS1
+    /// frames it holds, so both read the same MS1 events. The tool's MS1 default on the six
+    /// ProteoBench HYE diaPASEF runs kept 8.7% of the MS1 points and left identifications
+    /// unchanged at 51 against 63 minutes (docs/35_diapasef.md section 16). MS/MS spectra are
+    /// never filtered. Default false.
+    #[serde(skip_serializing_if = "is_false")]
+    pub tdf_ms1_denoise: bool,
 }
 impl Default for ConvertConfig {
     fn default() -> Self {
@@ -427,6 +439,7 @@ impl Default for ConvertConfig {
             tdf_mz_smooth_ppm: 8.0,
             tdf_im_valley: 0.0,
             tdf_im_smooth_scans: 8.0,
+            tdf_ms1_denoise: false,
         }
     }
 }

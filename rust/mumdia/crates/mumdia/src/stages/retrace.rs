@@ -47,6 +47,7 @@ use tracing::{info, warn};
 use crate::chromatograms::{self, Layout, Optional, Rows};
 use crate::masscal::{read_mass_cal, MassOffset};
 use crate::sched::DecoderLease;
+use crate::stages::convert::ms1_denoise::Ms1Denoise;
 use crate::stages::convert::tims_frames::{scan_band, slot_scans, sum_events, Sum, TofFrame};
 use crate::stages::convert::RawTdf;
 use crate::stages::extract::{ms1_neighbours, nearest_index, read_run_windows};
@@ -118,6 +119,9 @@ pub struct RetraceParams<'a> {
     pub out: &'a str,
     pub cfg: &'a RetraceConfig,
     pub config_hash: &'a str,
+    /// `convert.tdf_ms1_denoise`: the MS1 frames held here pass the MS1 noise filter convert
+    /// applied, so the rebuilt MS1 traces read the same MS1 events as extract's.
+    pub ms1_denoise: bool,
 }
 
 /// The two tables retrace wrote, with the hashes their reports carry.
@@ -226,6 +230,7 @@ pub fn run_if_enabled(
         out: f.out,
         cfg: &cfg.retrace,
         config_hash,
+        ms1_denoise: cfg.convert.tdf_ms1_denoise,
     })?;
     // The centroid table is read by nothing once the rebuilt one is written (12-17 GB per
     // HYE diaPASEF run).
@@ -1051,6 +1056,12 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
             p.raw
         );
     }
+    // The MS1 noise filter convert applied (`convert.tdf_ms1_denoise`), on the MS1 frames
+    // held here as well, built from the run's diaPASEF windows.
+    let ms1_denoise = (p.ms1_denoise && p.cfg.ms1).then(|| {
+        let windows = raw.reader.get_dia_windows().unwrap_or_default();
+        Ms1Denoise::new(&windows, n_scans, |m| raw.tof_of(m), |s| raw.im_of_scan(s))
+    });
 
     // Per candidate: precursor m/z, the windows, and the band centre.
     let lib = TableFile::open(p.library_precursors)?;
@@ -1149,10 +1160,18 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
             if !(rt_min..=rt_max).contains(&h.rt_in_seconds) {
                 return Ok(None);
             }
-            let f = raw
+            let ms1 = h.ms_level == MSLevel::MS1;
+            // MS1 frames feed only the MS1 traces.
+            if ms1 && !p.cfg.ms1 {
+                return Ok(None);
+            }
+            let mut f = raw
                 .reader
                 .get(i)
                 .map_err(|e| anyhow!("{}: frame {i}: {e}", p.raw))?;
+            if let (true, Some(d)) = (ms1, ms1_denoise.as_ref()) {
+                d.apply_to_frame(&mut f);
+            }
             Ok(Some(TofFrame::new(f)?))
         })
         .collect::<Result<_>>()?;
