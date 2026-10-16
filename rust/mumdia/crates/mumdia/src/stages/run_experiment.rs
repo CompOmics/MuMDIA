@@ -565,7 +565,7 @@ fn chain_after_seed(
     let mh_heads = cfg
         .rt_im_train
         .multihead_heads(has_deeplc, cfg.deeplc_rt_source(library_input, has_deeplc));
-    let (lib_p, produced_rt_lib) = adapt_rt_library(
+    let adapted = adapt_rt_library(
         cfg,
         lib_p_base,
         seed,
@@ -579,7 +579,7 @@ fn chain_after_seed(
     let (competed, chrom) = finish_run(
         cfg,
         ch,
-        &lib_p,
+        &adapted.lib,
         lib_f,
         co,
         seed,
@@ -590,7 +590,7 @@ fn chain_after_seed(
     Ok((
         vec![competed],
         vec![ChromTable::whole(&chrom)],
-        produced_rt_lib,
+        adapted.produced,
     ))
 }
 
@@ -604,12 +604,23 @@ struct BootInputs<'a> {
     co: &'a convert::ConvertOutputs,
 }
 
+/// What [`adapt_rt_library`] chose for one run.
+struct Adapted {
+    /// The precursor table the rest of the run reads.
+    lib: String,
+    /// The table this run produced, which the runs after it may reuse.
+    produced: Option<String>,
+    /// Whether the adaptation searched the run in this process (the bootstrap pass of
+    /// `rt_bootstrap`: extract, features and compete on the seed-anchored library), so a
+    /// memory window around it measured a search of this run.
+    searched: bool,
+}
+
 /// Choose the precursor table the rest of an ungrouped run reads: a previous run's adapted
 /// library, this run's multi-head calibration or fine-tune of the base library (`threads`
-/// torch threads), or the base library. Returns `(table, the table this run produced)`.
-/// Under `rt_im_train.multihead_anchors = search`, or `auto` on a seed short of anchors, the
-/// multi-head calibration is refitted on the confident targets of a bootstrap search of this
-/// run (`rt_bootstrap::refit`).
+/// torch threads), or the base library. Under `rt_im_train.multihead_anchors = search`, or
+/// `auto` on 1/K0 spectra or a seed short of anchors, the multi-head calibration is refitted
+/// on the confident targets of a bootstrap search of this run (`rt_bootstrap::refit`).
 #[allow(clippy::too_many_arguments)]
 fn adapt_rt_library(
     cfg: &Config,
@@ -621,7 +632,7 @@ fn adapt_rt_library(
     irt_placeholder: bool,
     threads: usize,
     boot: BootInputs,
-) -> Result<(String, Option<String>)> {
+) -> Result<Adapted> {
     let d = |name: &str| format!("{out}/{name}");
     // DeepLC fine-tune. Under `RtLibraryScope::FirstRunOnly` the caller hands every run
     // after the first the library the first run produced, so the fine-tune -- the most
@@ -629,6 +640,7 @@ fn adapt_rt_library(
     // drift is then absorbed by `rt_im_train`'s per-run calibration below, which is fitted
     // separately for every run regardless.
     let mut produced_rt_lib: Option<String> = None;
+    let mut searched = false;
     // The anchor cut (`rt_im_train::plan_anchors`): relaxed on a seed short of anchors, and
     // when still short the multi-head calibration is skipped for this run, which then keeps
     // `lib_p_base` and adapts nothing for the runs after it to reuse.
@@ -714,6 +726,7 @@ fn adapt_rt_library(
         };
         rt_bootstrap::record_auto(cfg, &plan, has_im, search, &lib_p_mh);
         produced_rt_lib = Some(lib_p_mh.clone());
+        searched = search;
         lib_p_mh
     } else if cfg.rt_im_train.finetune_deeplc {
         let python = cfg
@@ -748,7 +761,11 @@ fn adapt_rt_library(
     } else {
         lib_p_base.to_string()
     };
-    Ok((lib_p, produced_rt_lib))
+    Ok(Adapted {
+        lib: lib_p,
+        produced: produced_rt_lib,
+        searched,
+    })
 }
 
 /// Retention-time windows, extract, the optional retrace, features and compete of one
@@ -1599,6 +1616,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // Opened just before the first run's chain when it runs alone under
     // `parallel_runs = auto`, so its peak sizes the chains after it.
     let mut first_window: Option<crate::sched::PeakWindow> = None;
+    // What that window measured, for the log.
+    let mut first_step = "the first run's chain";
+    // The first run's adapted library when only its adaptation ran alone and its finish
+    // joins the other runs' chains (below).
+    let mut first_lib: Option<String> = None;
     if overlapped {
         // Run 1's front, then its RT adaptation beside the fronts of runs 2..N on disjoint
         // thread budgets, then every run's rest on the whole pool.
@@ -1722,7 +1744,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("the overlapped runs' thread panicked")));
             (adapted, fronts)
         });
-        let (lib0, produced) = adapted?;
+        let Adapted {
+            lib: lib0,
+            produced,
+            ..
+        } = adapted?;
         let fronts = fronts?;
         // Under `parallel_runs = auto`, the first run's finish is what every later run
         // repeats after its reused adaptation, so its peak alone sizes them.
@@ -1749,7 +1775,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         let back = |i: usize, (co, seed): &(convert::ConvertOutputs, String)| {
             let out = d(&names[i]);
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain after the overlapped front");
-            let (lib_p, _) = adapt_rt_library(
+            let lib_p = adapt_rt_library(
                 cfg,
                 &lib_p_base,
                 seed,
@@ -1763,7 +1789,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     lib_f: &lib_f,
                     co,
                 },
-            )?;
+            )?
+            .lib;
             finish_run(
                 cfg,
                 &ch,
@@ -1824,13 +1851,70 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         info!(
             run = %names[0],
             n = n_runs,
-            "run-experiment: adapting the library's retention times on the first run only;              the remaining runs reuse that library and fit their own RT calibration on it              (experiment.rt_library_scope = per_run to adapt for every run instead)"
+            "run-experiment: adapting the library's retention times on the first run only; \
+             the remaining runs reuse that library and fit their own RT calibration on it \
+             (experiment.rt_library_scope = per_run to adapt for every run instead)"
         );
         // Under `parallel_runs = auto` the first run's peak sizes the rest (below).
-        first_window = plan.is_auto().then(crate::sched::PeakWindow::open);
-        let (comp, chrom, ft) = run_one(0, None, None)?;
-        competed.push(comp);
-        chroms.push(chrom);
+        let ft = match (&prepared[0], plan.is_auto()) {
+            // A converted and seeded run adapts first. When that adaptation searched the
+            // run (`rt_bootstrap`: extract, features and compete on the seed-anchored
+            // library, all of the finish but retrace), the window around it measured a
+            // search of this run, which sizes the chains as the whole first chain did, and
+            // the first run's finish joins the other runs' chains below instead of running
+            // alone. On the six HYE diaPASEF runs that alone time was about 5 of 48 min,
+            // with one of the six per-run pools idle in the parallel phase after it.
+            (Some((co0, seed0)), true) => {
+                let out0 = d(&names[0]);
+                let window = crate::sched::PeakWindow::open();
+                let adapted = adapt_rt_library(
+                    cfg,
+                    &lib_p_base,
+                    seed0,
+                    &out0,
+                    mh_heads_for_scope,
+                    None,
+                    irt_placeholder,
+                    rayon::current_num_threads(),
+                    BootInputs {
+                        ch: &ch,
+                        lib_f: &lib_f,
+                        co: co0,
+                    },
+                )?;
+                first_window = Some(window);
+                if adapted.searched {
+                    first_step = "the first run's retention-time adaptation (a search of it)";
+                    first_lib = Some(adapted.lib);
+                } else {
+                    // Nothing of a search ran in this process yet, so the finish runs
+                    // alone and is measured, as before.
+                    let (comp, chrom) = finish_run(
+                        cfg,
+                        &ch,
+                        &adapted.lib,
+                        &lib_f,
+                        co0,
+                        seed0,
+                        &out0,
+                        true,
+                        Default::default(),
+                    )?;
+                    competed.push(vec![comp]);
+                    chroms.push(vec![ChromTable::whole(&chrom)]);
+                    first = 1;
+                }
+                adapted.produced
+            }
+            _ => {
+                first_window = plan.is_auto().then(crate::sched::PeakWindow::open);
+                let (comp, chrom, ft) = run_one(0, None, None)?;
+                competed.push(comp);
+                chroms.push(chrom);
+                first = 1;
+                ft
+            }
+        };
         match ft {
             Some(path) => {
                 info!(library = %path, "run-experiment: reusing this adapted library for the remaining runs");
@@ -1840,10 +1924,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             // happen. Falling through with `None` means the rest fine-tune themselves --
             // slower, but never silently wrong.
             None => warn!(
-                "run-experiment: the first run produced no fine-tuned library; the                  remaining runs will each fine-tune"
+                "run-experiment: the first run produced no fine-tuned library; the \
+                 remaining runs will each fine-tune"
             ),
         }
-        first = 1;
     }
 
     // A grouped run writes a band out only where a DeepLC sidecar rewrites it, and the runs
@@ -1856,10 +1940,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         // Under `parallel_runs = auto` the chains are pulled from a queue, each in its own
         // pool. A chain that adapts the library itself (no adapted library to share) runs
         // a DeepLC worker no memory reading of this process includes, so those chains run
-        // one at a time. Otherwise the first run, when it ran alone above, sizes the rest;
-        // and when no chain has run alone yet and there is a memory reading to take, the
-        // first one runs alone now so the rest are sized on its measured peak. Without a
-        // reading that would only cost concurrency.
+        // one at a time. Otherwise the first run, when it or its adaptation ran alone
+        // above, sizes the rest; and when no chain has run alone yet and there is a memory
+        // reading to take, the first one runs alone now so the rest are sized on its
+        // measured peak. Without a reading that would only cost concurrency.
         let mut queue: &[usize] = &rest;
         if adapts_rt_library && shared_ft.is_none() {
             plan = crate::sched::one_at_a_time_for_sidecars(plan, threads_budget, "run-experiment");
@@ -1868,7 +1952,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 plan,
                 threads_budget,
                 "run-experiment",
-                "the first run's chain",
+                first_step,
                 w,
             );
         } else if first == 0
@@ -1908,6 +1992,22 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         // and a reused slice is the same bytes a run would have written (`run_groups`).
         let slices = std::sync::Mutex::new(slice_source.clone());
         let done = plan.map_pooled(queue, |&i| {
+            // The first run's finish, on the library its adaptation produced above.
+            if let (0, Some(lib0), Some((co0, seed0))) = (i, first_lib.as_deref(), &prepared[0]) {
+                info!(run = %names[0], i = 1, n = n_runs, "run-experiment: per-run chain, the first run's finish on its adapted library");
+                let (comp, chrom) = finish_run(
+                    cfg,
+                    &ch,
+                    lib0,
+                    &lib_f,
+                    co0,
+                    seed0,
+                    &d(&names[0]),
+                    true,
+                    Default::default(),
+                )?;
+                return Ok((vec![comp], vec![ChromTable::whole(&chrom)], None));
+            }
             info!(run = %names[i], i = i + 1, n = n_runs, "run-experiment: per-run chain");
             let from = slices.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let r = run_one(i, shared_ft.as_deref(), from.as_deref())?;

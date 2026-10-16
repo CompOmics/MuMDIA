@@ -3166,7 +3166,10 @@ pub struct ExperimentConfig {
     /// `0.7 x (available + resident) / peak` at once, where the peak is the process's
     /// `VmHWM` after that step and `available` is `MemAvailable`, lowered to the headroom
     /// of the process's memory cgroup (a container's or a batch job's limit) when that is
-    /// smaller. The peak counts this process only, not its child processes, so chains that
+    /// smaller. When the first run adapts the library with a search of itself
+    /// (`rt_im_train.multihead_anchors`, the bootstrap pass), only that adaptation runs
+    /// alone: its peak sizes the chains, and the first run's own chain then runs among
+    /// them. The peak counts this process only, not its child processes, so chains that
     /// each run their own DeepLC adaptation (`rt_library_scope = per_run`) run one at a
     /// time under `"auto"`; give a number to run such chains concurrently. Elsewhere (any
     /// platform but Linux) there is no memory reading, so `"auto"` runs the chains one at a
