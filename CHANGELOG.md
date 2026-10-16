@@ -157,6 +157,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   0.39-0.46%. The cost is one bootstrap pass on the first run (about 6 min on the 60 min set).
   `anchors_auto` records `ion_mobility`. 3D runs are unchanged; `"seed"` restores the
   previous behaviour on diaPASEF (`docs/08_rt_im_train.md` section 4f).
+- **The NN worker releases the raw handoff as it copies it.** Each copied 131,072-row group of
+  the memory-mapped handoff leaves the worker's resident set (`MADV_DONTNEED`), so the
+  handoff and the worker's matrix are no longer resident at once: the pooled rescore of six
+  HYE diaPASEF runs (28.5 million PSMs) peaked at 51.0 instead of 98.3 GB with the same
+  98,524 peptides at 1%. No effect on Windows or on a parquet or PIN handoff.
 - One version-floor check for interpreter discovery, `doctor` and the sidecar launch
   (`Role::version_floor`, `sidecar::require_version`) (#185).
 - One extract-to-compete chain for `run` and `run-experiment` (`stages::chain`), with the
