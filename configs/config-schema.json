@@ -201,6 +201,19 @@
       "source_struct": "ConvertConfig"
     },
     {
+      "path": "convert.tdf_ms1_denoise",
+      "name": "tdf_ms1_denoise",
+      "section": "convert",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Native diaPASEF reader: remove MS1 noise before centroiding, with the method and default MS1 settings of dnoise (Garrett, Diedrich and Yates, bioRxiv 2026, doi:10.64898/2026.08.27.747603): keep only MS1 points on runs of at least 5 occupied mobility scans (TOF neighbourhood +/- 3, gaps of up to 2 scans bridged, two passes), drop features no diaPASEF window reaches (windows padded by 3 Th and 0.015 1/K0), and drop the weak m/z halo of bright ions. Retrace applies the same filter to the raw MS1 frames it holds, so both read the same MS1 events. The tool's MS1 default on the six ProteoBench HYE diaPASEF runs kept 8.7% of the MS1 points and left identifications unchanged at 51 against 63 minutes (docs/35_diapasef.md section 16). MS/MS spectra are never filtered. Default false.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
       "path": "prescan.tol_da",
       "name": "tol_da",
       "section": "prescan",

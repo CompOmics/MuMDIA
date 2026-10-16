@@ -52,7 +52,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | Section | Struct | Fields | Stage document |
 |---|---|---|---|
 | [(top level)](#top-level) | `Config` | 18 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
-| [`convert`](#convert) | `ConvertConfig` | 12 |  |
+| [`convert`](#convert) | `ConvertConfig` | 13 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
 | [`prescreen`](#prescreen) | `PrescreenConfig` | 31 |  |
 | [`prescreen.tags`](#prescreentags) | `PrescreenTagsConfig` | 7 |  |
@@ -121,6 +121,7 @@ Vendor-format conversion, read by every subcommand that takes a spectra path (`r
 | `tdf_mz_smooth_ppm` | `f64` | `8.0` |  | Native diaPASEF reader: half-width in ppm of the triangular smoothing applied to the m/z profile before `tdf_mz_valley` looks for valleys; 0 is no smoothing. Default 8. Unused while `tdf_mz_valley` is 0. |
 | `tdf_im_valley` | `f64` | `0.0` | benchmark-gated | Native diaPASEF reader: split each cluster (after the m/z valley split, when that is on) at the valleys of its mobility profile, the summed intensity per TIMS scan after a triangular smoothing of half-width `tdf_im_smooth_scans`. Separates ions of one m/z whose mobility profiles touch without a `tdf_im_gap_scans` gap. Must be in [0, 1); 0 (default) is off and leaves the centroids unchanged. Benchmark-gated. |
 | `tdf_im_smooth_scans` | `f64` | `8.0` |  | Native diaPASEF reader: half-width in TIMS scans of the mobility profile smoothing used by `tdf_im_valley`; 0 is no smoothing. Default 8. Unused while `tdf_im_valley` is 0. |
+| `tdf_ms1_denoise` | `bool` | `false` |  | Native diaPASEF reader: remove MS1 noise before centroiding, with the method and default MS1 settings of dnoise (Garrett, Diedrich and Yates, bioRxiv 2026, doi:10.64898/2026.08.27.747603): keep only MS1 points on runs of at least 5 occupied mobility scans (TOF neighbourhood +/- 3, gaps of up to 2 scans bridged, two passes), drop features no diaPASEF window reaches (windows padded by 3 Th and 0.015 1/K0), and drop the weak m/z halo of bright ions. Retrace applies the same filter to the raw MS1 frames it holds, so both read the same MS1 events. The tool's MS1 default on the six ProteoBench HYE diaPASEF runs kept 8.7% of the MS1 points and left identifications unchanged at 51 against 63 minutes (docs/35_diapasef.md section 16). MS/MS spectra are never filtered. Default false. |
 
 ## prescan
 
@@ -1234,6 +1235,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-24 structs and 306 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 39 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 307 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 39 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
 33 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
