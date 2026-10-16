@@ -4721,20 +4721,35 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             let shift = 1.0 + p.cfg.ms1_ppm_offset * 1e-6;
             for (nm, dmz) in [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)] {
                 let mz = (c.precursor_mz + dmz) * shift;
-                let mut ints: Vec<f32> = t_grid
-                    .iter()
-                    .map(|&r| {
-                        let j = nearest_index(&ms1_rts, r);
-                        // No `as f32`: `sum_near` returns f32 and the target is `Vec<f32>`,
-                        // so the cast was an identity. It was tolerated while `ms1_scans`
-                        // was a `Vec<Ms1Scan>` and `clippy::unnecessary_cast` fires on it
-                        // now that it is a `&[Ms1Scan]` -- verified in both directions on
-                        // this tree with clippy 1.96.0, silent before and an error after,
-                        // though which of the lint's heuristics distinguishes `Vec`
-                        // indexing from slice indexing was not established.
-                        ms1_near(ms1_scans, j, p.cfg.ms1_scan_halfwidth, mz, tol)
-                    })
-                    .collect();
+                // A row the retrace skeleton zeroes is rebuilt by retrace from the raw events
+                // and its centroid values are never read, so they are not summed: the MS1
+                // reads of these XICs were about half of extract's busy time on a HYE
+                // diaPASEF run (gdb samples in `ms1_near`), every one of them then zeroed.
+                // The decision reads the row's identity only, never its values, so the
+                // table is the one the summing-then-zeroing wrote.
+                let skeleton = p
+                    .retrace_skeleton
+                    .is_some_and(|k| k.zeroes(true, c.precursor_mz, skel_centre, mz, nm, 0.0));
+                let ints: Vec<f32> = if skeleton {
+                    skel_rows += 1;
+                    vec![0.0; t_grid.len()]
+                } else {
+                    t_grid
+                        .iter()
+                        .map(|&r| {
+                            let j = nearest_index(&ms1_rts, r);
+                            // No `as f32`: `sum_near` returns f32 and the target is
+                            // `Vec<f32>`, so the cast was an identity. It was tolerated while
+                            // `ms1_scans` was a `Vec<Ms1Scan>` and `clippy::unnecessary_cast`
+                            // fires on it now that it is a `&[Ms1Scan]` -- verified in both
+                            // directions on this tree with clippy 1.96.0, silent before and
+                            // an error after, though which of the lint's heuristics
+                            // distinguishes `Vec` indexing from slice indexing was not
+                            // established.
+                            ms1_near(ms1_scans, j, p.cfg.ms1_scan_halfwidth, mz, tol)
+                        })
+                        .collect()
+                };
                 // The MS1 XICs carry no per-point 1/K0. With the list written every row's list is
                 // as long as its trace, so these hold +0.0, "no 1/K0", at every point.
                 let ims: Vec<f32> = if chrom_im {
@@ -4742,12 +4757,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 } else {
                     Vec::new()
                 };
-                if let Some(k) = p.retrace_skeleton {
-                    if k.zeroes(true, c.precursor_mz, skel_centre, mz, nm, 0.0) {
-                        ints.iter_mut().for_each(|x| *x = 0.0);
-                        skel_rows += 1;
-                    }
-                }
                 chrom_rows.push((cid, nm.to_string(), mz, mz, 0.0, grid_rt.clone(), ints, ims));
             }
         }
