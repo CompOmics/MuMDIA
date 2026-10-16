@@ -1360,6 +1360,11 @@ const CHUNK_PSM_ROWS: usize = 1 << 16;
 /// ~200 MB in flight instead of the writer default's ~3 GB.
 const FEATURE_ROW_GROUP_ROWS: usize = 1 << 16;
 
+/// Rows per block of the parallel assembly of a chunk's value columns: each block writes
+/// its own rows of every column, 2,048 x 8 bytes per column, so a block's slices of a few
+/// hundred columns stay in cache while its rows are written.
+const ASSEMBLE_BLOCK_ROWS: usize = 2048;
+
 /// Rows per decoded chromatogram batch. Matches the list-column batch size of the IO
 /// layer, so a batch is tens of MB whatever the chunk size is.
 const CHROM_BATCH_ROWS: usize = 1 << 12;
@@ -2020,8 +2025,9 @@ impl ValueMatrix {
     }
 
     /// Set the column `c` (as resolved once by [`ColIx`]) for chunk-local row `r`. A
-    /// feature outside the active set resolves to `None` and is dropped, exactly as the
-    /// old map was filtered by `cols_active` at write time.
+    /// feature outside the active set resolves to `None` and is dropped. The pass assembles
+    /// its rows in parallel blocks instead; the tests build matrices with it.
+    #[cfg(test)]
     fn set(&mut self, c: Option<usize>, r: usize, v: f64) {
         if let Some(c) = c {
             self.cols[c][r] = v;
@@ -3913,98 +3919,133 @@ fn run_chunked(
             let mut prelim = vec![0.0f64; rows_in_chunk];
             let mut elu_lo = vec![0.0f64; rows_in_chunk];
             let mut elu_hi = vec![0.0f64; rows_in_chunk];
-            for (r, i) in (lo..hi).enumerate() {
-                let ff = &frag_feats[r];
-                elu_lo[r] = ff.elution_lo;
-                elu_hi[r] = ff.elution_hi;
-                let rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
-                // MS1 isotope features.
-                let neutral = mz[i] * charge[i] as f64 - charge[i] as f64 * PROTON;
-                let (iso_corr, isom1_ratio, log_mono, has_ms1) =
-                    isotope_features(ms1_m1[i], ms1_mono[i], ms1_i1[i], ms1_i2[i], neutral);
-
-                m.set(ix.rt_error_abs, r, rt_err);
-                m.set(ix.rt_error_rel, r, rt_err / gradient);
-                m.set(ix.n_matched_fragments, r, n_matched[i] as f64);
-                m.set(ix.coelution_run, r, corun[i] as f64);
-                m.set(ix.log_apex_intensity, r, (1.0 + apex_int[i] as f64).ln());
-                m.set(ix.frag_corr, r, ff.frag_corr);
-                m.set(ix.frag_cosine, r, ff.frag_cosine);
-                m.set(ix.spectral_angle, r, ff.spectral_angle);
-                m.set(ix.coelution_mean, r, ff.coelution_mean);
-                m.set(ix.coelution_best, r, ff.coelution_best);
-                m.set(ix.n_coelution_above, r, ff.n_coelution_above);
-                m.set(ix.charge, r, charge[i] as f64);
-                m.set(ix.peptide_length, r, peptide_length(&pform[i]) as f64);
-                m.set(
-                    ix.n_proteins,
-                    r,
-                    (protein[i].matches(';').count() + 1) as f64,
+            // The rows are independent, so they are assembled in blocks of
+            // ASSEMBLE_BLOCK_ROWS in parallel, each block writing its own rows of every
+            // column: the same values in the same places as the row loop it replaces, which
+            // took 20-31 s of one core per pass on a HYE diaPASEF run while the pass's pool
+            // waited (per row: string parses, hash lookups and a scattered write per column).
+            {
+                type Block<'b> = (
+                    usize,
+                    Vec<&'b mut [f64]>,
+                    &'b mut [f64],
+                    &'b mut [f64],
+                    &'b mut [f64],
                 );
-                m.set(ix.library_norm_manhattan, r, ff.norm_manhattan);
-                m.set(ix.library_rmsd, r, ff.rmsd);
-                m.set(ix.xcorr_coelution, r, ff.xcorr_coelution);
-                m.set(ix.xcorr_shape, r, ff.xcorr_shape);
-                m.set(ix.sum_b_intensity, r, ff.sum_b);
-                m.set(ix.sum_y_intensity, r, ff.sum_y);
-                m.set(ix.diff_by_intensity, r, ff.sum_b - ff.sum_y);
-                m.set(ix.n_b_ions, r, ff.n_b);
-                m.set(ix.n_y_ions, r, ff.n_y);
-                m.set(ix.weighted_mass_error, r, ff.weighted_mass_error);
-                m.set(ix.mean_mass_error, r, ff.mean_mass_error);
-                m.set(ix.isotope_corr, r, iso_corr);
-                m.set(ix.ms1_isom1_ratio, r, isom1_ratio);
-                m.set(ix.log_mono_ms1, r, log_mono);
-                m.set(ix.has_ms1, r, has_ms1);
-                m.set(ix.log_sn, r, ff.log_sn);
-                m.set(ix.n_observations, r, ff.n_observations);
-                m.set(ix.base_width_rt, r, ff.base_width_rt);
-                m.set(
-                    ix.seed_score,
-                    r,
-                    *seed_score_map.get(&cid[i]).unwrap_or(&0.0),
-                );
-                m.set(
-                    ix.seed_identified,
-                    r,
-                    *seed_id_map.get(&cid[i]).unwrap_or(&0.0),
-                );
-                m.set(
-                    ix.matched_fraction,
-                    r,
-                    n_matched[i] as f64 / (n_pred[i].max(1) as f64),
-                );
-                m.set(ix.profile_cos, r, ff.profile_cos);
-                m.set(ix.ref_corr, r, ff.ref_corr);
-                m.set(ix.best_ref_corr, r, ff.best_ref_corr);
-                m.set(ix.low_frag_coel, r, ff.low_frag_coel);
-                m.set(ix.evidence, r, ff.evidence);
-                m.set(ix.contrast_min, r, ff.contrast_min);
-                m.set(ix.resid_corr, r, ff.resid_corr);
-                m.set(ix.coel_clean, r, ff.coel_clean);
-                m.set(ix.shadow_frac, r, ff.shadow_frac);
-                m.set(ix.peak_contested_frac, r, contested[i]);
-                m.set(ix.peak_contested_count_frac, r, contested_count[i]);
-                m.set(ix.peak_apportioned_frac, r, apportioned[i]);
-
-                // Extended battery (opt-in). Built once per PSM above and fanned out to the
-                // family modules; written here under the fixed registry-order columns.
-                if n_ext > 0 {
-                    let row = &ext_vals[r * n_ext..(r + 1) * n_ext];
-                    for (c, v) in ix.ext.iter().zip(row) {
-                        m.set(*c, r, *v);
+                let mut blocks: Vec<Block<'_>> = prelim
+                    .chunks_mut(ASSEMBLE_BLOCK_ROWS)
+                    .zip(elu_lo.chunks_mut(ASSEMBLE_BLOCK_ROWS))
+                    .zip(elu_hi.chunks_mut(ASSEMBLE_BLOCK_ROWS))
+                    .enumerate()
+                    .map(|(k, ((p, l), h))| {
+                        (
+                            k * ASSEMBLE_BLOCK_ROWS,
+                            Vec::with_capacity(m.cols.len()),
+                            p,
+                            l,
+                            h,
+                        )
+                    })
+                    .collect();
+                for col in m.cols.iter_mut() {
+                    for (blk, part) in blocks.iter_mut().zip(col.chunks_mut(ASSEMBLE_BLOCK_ROWS)) {
+                        blk.1.push(part);
                     }
                 }
+                blocks.into_par_iter().for_each(|(r0, mut cs, pr, el, eh)| {
+                    for rl in 0..pr.len() {
+                        let r = r0 + rl;
+                        let i = lo + r;
+                        let ff = &frag_feats[r];
+                        el[rl] = ff.elution_lo;
+                        eh[rl] = ff.elution_hi;
+                        let mut set = |c: Option<usize>, v: f64| {
+                            if let Some(c) = c {
+                                cs[c][rl] = v;
+                            }
+                        };
+                        let rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
+                        // MS1 isotope features.
+                        let neutral = mz[i] * charge[i] as f64 - charge[i] as f64 * PROTON;
+                        let (iso_corr, isom1_ratio, log_mono, has_ms1) =
+                            isotope_features(ms1_m1[i], ms1_mono[i], ms1_i1[i], ms1_i2[i], neutral);
 
-                // Cross-charge corroboration features (whole-run reductions, indexed by row).
-                m.set(ix.n_charge_states, r, f_n_charge[i]);
-                m.set(ix.charge_multi_flag, r, f_charge_multi[i]);
-                m.set(ix.cross_charge_intensity_log, r, f_cross_charge_int[i]);
+                        set(ix.rt_error_abs, rt_err);
+                        set(ix.rt_error_rel, rt_err / gradient);
+                        set(ix.n_matched_fragments, n_matched[i] as f64);
+                        set(ix.coelution_run, corun[i] as f64);
+                        set(ix.log_apex_intensity, (1.0 + apex_int[i] as f64).ln());
+                        set(ix.frag_corr, ff.frag_corr);
+                        set(ix.frag_cosine, ff.frag_cosine);
+                        set(ix.spectral_angle, ff.spectral_angle);
+                        set(ix.coelution_mean, ff.coelution_mean);
+                        set(ix.coelution_best, ff.coelution_best);
+                        set(ix.n_coelution_above, ff.n_coelution_above);
+                        set(ix.charge, charge[i] as f64);
+                        set(ix.peptide_length, peptide_length(&pform[i]) as f64);
+                        set(ix.n_proteins, (protein[i].matches(';').count() + 1) as f64);
+                        set(ix.library_norm_manhattan, ff.norm_manhattan);
+                        set(ix.library_rmsd, ff.rmsd);
+                        set(ix.xcorr_coelution, ff.xcorr_coelution);
+                        set(ix.xcorr_shape, ff.xcorr_shape);
+                        set(ix.sum_b_intensity, ff.sum_b);
+                        set(ix.sum_y_intensity, ff.sum_y);
+                        set(ix.diff_by_intensity, ff.sum_b - ff.sum_y);
+                        set(ix.n_b_ions, ff.n_b);
+                        set(ix.n_y_ions, ff.n_y);
+                        set(ix.weighted_mass_error, ff.weighted_mass_error);
+                        set(ix.mean_mass_error, ff.mean_mass_error);
+                        set(ix.isotope_corr, iso_corr);
+                        set(ix.ms1_isom1_ratio, isom1_ratio);
+                        set(ix.log_mono_ms1, log_mono);
+                        set(ix.has_ms1, has_ms1);
+                        set(ix.log_sn, ff.log_sn);
+                        set(ix.n_observations, ff.n_observations);
+                        set(ix.base_width_rt, ff.base_width_rt);
+                        set(ix.seed_score, *seed_score_map.get(&cid[i]).unwrap_or(&0.0));
+                        set(
+                            ix.seed_identified,
+                            *seed_id_map.get(&cid[i]).unwrap_or(&0.0),
+                        );
+                        set(
+                            ix.matched_fraction,
+                            n_matched[i] as f64 / (n_pred[i].max(1) as f64),
+                        );
+                        set(ix.profile_cos, ff.profile_cos);
+                        set(ix.ref_corr, ff.ref_corr);
+                        set(ix.best_ref_corr, ff.best_ref_corr);
+                        set(ix.low_frag_coel, ff.low_frag_coel);
+                        set(ix.evidence, ff.evidence);
+                        set(ix.contrast_min, ff.contrast_min);
+                        set(ix.resid_corr, ff.resid_corr);
+                        set(ix.coel_clean, ff.coel_clean);
+                        set(ix.shadow_frac, ff.shadow_frac);
+                        set(ix.peak_contested_frac, contested[i]);
+                        set(ix.peak_contested_count_frac, contested_count[i]);
+                        set(ix.peak_apportioned_frac, apportioned[i]);
 
-                prelim[r] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
-                    + ff.coelution_mean.max(0.0)
-                    + (1.0 + apex_int[i] as f64).ln() * 0.1
-                    - rt_err / gradient;
+                        // Extended battery (opt-in). Built once per PSM above and fanned
+                        // out to the family modules; written here under the fixed
+                        // registry-order columns.
+                        if n_ext > 0 {
+                            let row = &ext_vals[r * n_ext..(r + 1) * n_ext];
+                            for (c, v) in ix.ext.iter().zip(row) {
+                                set(*c, *v);
+                            }
+                        }
+
+                        // Cross-charge corroboration features (whole-run reductions,
+                        // indexed by row).
+                        set(ix.n_charge_states, f_n_charge[i]);
+                        set(ix.charge_multi_flag, f_charge_multi[i]);
+                        set(ix.cross_charge_intensity_log, f_cross_charge_int[i]);
+
+                        pr[rl] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
+                            + ff.coelution_mean.max(0.0)
+                            + (1.0 + apex_int[i] as f64).ln() * 0.1
+                            - rt_err / gradient;
+                    }
+                });
             }
             drop(frag_feats);
             // `ext_vals` and the matrix are both live for the whole assembly above, so the
