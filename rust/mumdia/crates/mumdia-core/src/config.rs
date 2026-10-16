@@ -2235,7 +2235,12 @@ pub struct FeaturesConfig {
     /// `--threads` (the engine's thread pool) or than it has chunks, so `--threads 1` decodes
     /// on one loader as before. Loaders beyond each pass's first come from a process-wide
     /// pool of four, so concurrent bands or runs (`groups.parallel`,
-    /// `experiment.parallel_runs`) share that pool instead of multiplying it. Default 3; `1`
+    /// `experiment.parallel_runs`) share that pool instead of multiplying it. Under
+    /// `experiment.parallel_runs = "auto"` the pool grows to `chrom_loaders - 1` per
+    /// concurrent run while the per-run chains execute, because the number of chains was
+    /// sized on the measured peak of a run that had all of its loaders; with the pool of four,
+    /// three of five concurrent passes on the six HYE diaPASEF runs decoded on one loader and
+    /// took 280-295 s against 95-104 s. Default 3; `1`
     /// restores the single loader and `0` is read as `1`. A memory knob and a speed knob,
     /// not a sensitivity knob.
     pub chrom_loaders: usize,

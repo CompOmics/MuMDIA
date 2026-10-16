@@ -2844,6 +2844,23 @@ const MAIN_LOADER_EXTRAS: usize = 4;
 static MAIN_LOADER_BUDGET: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(MAIN_LOADER_EXTRAS);
 
+/// Grow the main-pass loader pool so that `chains` concurrent passes can each take the
+/// `chrom_loaders - 1` extra loaders a pass alone takes, until the guard drops; `None` when
+/// the pool already holds that many. For the per-run chains of an automatic
+/// `run-experiment` plan, which were sized on the peak of a pass that had its loaders
+/// (`sched::BudgetGrowth`).
+pub(crate) fn grow_loaders_for_chains(
+    chrom_loaders: usize,
+    chains: usize,
+) -> Option<crate::sched::BudgetGrowth> {
+    let need = chrom_loaders
+        .max(1)
+        .saturating_sub(1)
+        .saturating_mul(chains);
+    let add = need.saturating_sub(MAIN_LOADER_EXTRAS);
+    (add > 0).then(|| crate::sched::BudgetGrowth::add(&MAIN_LOADER_BUDGET, add))
+}
+
 /// The main pass's loader request before the pool lease: `features.chrom_loaders` (at
 /// least one), and no more than there are chunks to decode or threads in the rayon pool.
 /// The pool is what `--threads` sizes, so a run held to one thread decodes on one loader,

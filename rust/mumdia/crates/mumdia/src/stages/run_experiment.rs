@@ -1987,6 +1987,23 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             n = n_runs,
             "run-experiment: per-run chains, each in a pool of its own (parallel_runs = auto)"
         );
+        // The chains were sized on the peak of a chain, or of a search of the first run,
+        // that ran alone and took all of its feature loaders (and, a whole chain, its
+        // retrace readers, about 0.1 GB each). The process-wide pools of both hold enough
+        // for a few concurrent calls only, so they grow by the chains in flight while the
+        // chains run (`sched::BudgetGrowth`). Neither changes a row: the loaders and readers
+        // only decode, and the tables keep their order.
+        let _loaders = (plan.par > 1)
+            .then(|| {
+                crate::stages::features::grow_loaders_for_chains(
+                    cfg.features.chrom_loaders,
+                    plan.par,
+                )
+            })
+            .flatten();
+        let _readers = (plan.par > 1)
+            .then(|| crate::stages::retrace::grow_readers_for_chains(plan.par))
+            .flatten();
         // A grouped run's band slices are reused by the runs that START after it finished;
         // which run that is depends on timing, as it depended on the chunk size before,
         // and a reused slice is the same bytes a run would have written (`run_groups`).

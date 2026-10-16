@@ -75,11 +75,20 @@ const READER_EXTRAS: usize = 7;
 /// `experiment.parallel_runs`. With a budget of one call's extras, the first of five
 /// concurrent retraces on HYE diaPASEF took all seven, the others read on one thread, and
 /// the slowest spent 390 s of its 489 s reading: one call's readers then set the wall time
-/// of the whole parallel phase.
+/// of the whole parallel phase. An automatic `run-experiment` plan grows the budget to
+/// every concurrent chain's share while its chains run ([`grow_readers_for_chains`]).
 const READER_CALLS: usize = 4;
 
 /// Extra readers of the process-wide pool not currently leased.
 static READER_BUDGET: AtomicUsize = AtomicUsize::new(READER_EXTRAS * READER_CALLS);
+
+/// Grow the reader pool so that `chains` concurrent retrace calls can each take all
+/// [`READER_EXTRAS`], until the guard drops; `None` when the pool already holds that many.
+/// For the per-run chains of an automatic `run-experiment` plan (`sched::BudgetGrowth`).
+pub(crate) fn grow_readers_for_chains(chains: usize) -> Option<crate::sched::BudgetGrowth> {
+    let add = (READER_EXTRAS * chains).saturating_sub(READER_EXTRAS * READER_CALLS);
+    (add > 0).then(|| crate::sched::BudgetGrowth::add(&READER_BUDGET, add))
+}
 
 // `retrace.apex_features` (docs/35_diapasef.md section 6): the apex mobility agreement is
 // scored on each fragment's raw 1/K0 profile over `apex_im +/- APEX_IM_HW`, in APEX_BINS
