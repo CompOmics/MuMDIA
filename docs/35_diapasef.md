@@ -1099,6 +1099,21 @@ four extras grants five standalone) took it to 38.4 s at 20 threads, then bound 
 computation, for 2.6 GB more, but to 62.4 s at 120 threads, where the decode competed with the
 computation's threads for cores; the default stays 3.
 
+### Rescore
+
+With the retrace frames held per window group, the experiment's highest point was the load of
+the pooled rescore: the NN worker memory-maps the raw handoff (28.5 million PSMs x 424
+features, 48 GB) and copies it into its own matrix, and every page it had read stayed in its
+resident set until the copy was done, so both were resident at once. The worker now drops each
+copied 131,072-row group of the mapping from its resident set (`MADV_DONTNEED`; the pages stay
+in the page cache, so a released row only faults back in with the same bytes). The pooled
+rescore of the six runs, three folds, NN seed 0: 98,524 peptides at 1% either way, maximum
+RSS 98.3 -> 51.0 GB, 13:35 -> 13:28.
+
+Two folds instead of three (`rescore.folds`, three NN seeds) gave 97,731 against 98,414
+peptides at 1% for 8% less wall time: the folds train in parallel, three processes of 16
+torch threads, so a smaller training split per fold saves little.
+
 ### MS1 noise
 
 The dnoise tool (P. T. Garrett, J. K. Diedrich and J. R. Yates III, bioRxiv 2026,
