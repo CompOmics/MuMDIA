@@ -283,6 +283,39 @@ def peptide_fold(peptide, folds):
     return int(hashlib.md5(strip_pep(peptide).encode()).hexdigest(), 16) % folds
 
 
+def mix_fold_keys(keys):
+    """The splitmix64 finaliser of each key (uint64, wrapping): a bijection that spreads
+    keys sharing a factor. The same mix as `rescoring::mix_fold_key` in the engine."""
+    z = keys.astype(np.uint64) + np.uint64(0x9E3779B97F4A7C15)
+    z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return z ^ (z >> np.uint64(31))
+
+
+def fold_keys_for(fold_keys, folds):
+    """The keys the folds are taken from: the engine's keys while `key % folds` gives every
+    fold at least half its share of the rows, otherwise their mix (`mix_fold_keys`).
+
+    A library whose keys share a factor with `folds` left folds empty under the plain
+    modulo: every base_peptide_id of an imported HYE library was even, so two folds put
+    every row in fold 0 and four used only two. The mix keeps a key's rows (a target and
+    its paired decoy) together, and the plain modulo leaves every other library's folds,
+    and so its scores, as they were. The engine's classifiers apply the same rule
+    (`rescoring::fold_assignment`). Decided once over all rows, since the streaming backend
+    folds chunk by chunk."""
+    if fold_keys is None or folds < 2 or len(fold_keys) == 0:
+        return fold_keys
+    counts = np.bincount((fold_keys % folds).astype(np.int64), minlength=folds)
+    if int(counts.min()) * 2 * folds >= len(fold_keys):
+        return fold_keys
+    print(
+        "nn_rescore_worker: the fold keys modulo %d leave a fold under half its share "
+        "(%s); folding on a mix of the keys instead" % (folds, counts.tolist()),
+        flush=True,
+    )
+    return mix_fold_keys(fold_keys)
+
+
 def folds_for(peptides, fold_keys, folds, off=0):
     """Fold index per row, preferring the engine's explicit keys.
 
@@ -2208,6 +2241,7 @@ def main():
             flush=True,
         )
 
+    fold_keys = fold_keys_for(fold_keys, FOLDS)
     _folds = lambda peptides, off=0: folds_for(peptides, fold_keys, FOLDS, off)
 
     mm_path = None

@@ -336,6 +336,43 @@ fn score_row(w: &[f64], r: &[f32]) -> f64 {
     z
 }
 
+/// The splitmix64 finaliser: a bijection on u64 that spreads keys sharing a factor.
+fn mix_fold_key(k: u64) -> u64 {
+    let mut z = k.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The cross-validation fold of each PSM from its fold key (the base peptide, which a target
+/// and its paired decoy share): `key % folds` while that gives every fold at least half its
+/// share of the PSMs, and otherwise `mix(key) % folds`. A library whose keys share a factor
+/// with `folds` left folds empty under the plain modulo: every `base_peptide_id` of an
+/// imported HYE library was even, so two folds put every PSM in fold 0 and four used only
+/// two. The mix keeps a key's PSMs together and the plain modulo leaves every other
+/// library's folds, and so its scores, as they were. `nn_rescore_worker.py` applies the same
+/// rule.
+pub fn fold_assignment(keys: &[u32], folds: usize) -> Vec<u32> {
+    let folds = folds.max(1);
+    let mut counts = vec![0usize; folds];
+    for &k in keys {
+        counts[k as usize % folds] += 1;
+    }
+    let balanced = counts.iter().all(|&c| c * 2 * folds >= keys.len());
+    if balanced {
+        return keys.iter().map(|&k| (k as usize % folds) as u32).collect();
+    }
+    tracing::warn!(
+        folds,
+        psms = keys.len(),
+        "rescore: the fold keys modulo the fold count leave a fold under half its share; \
+         folding on a mix of the keys instead"
+    );
+    keys.iter()
+        .map(|&k| (mix_fold_key(k as u64) % folds as u64) as u32)
+        .collect()
+}
+
 pub struct RescoreInput<'a> {
     pub features: &'a FeatureMatrix,
     pub is_decoy: &'a [bool],
@@ -391,14 +428,9 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
     let d = inp.features.n_features();
 
     // Fold assignment by fold_key (base peptide): all charge/mod variants of a
-    // peptide share a fold, so none leaks between train and test. The value is always
-    // below `folds` and never above the u32 key it came from, so u32 stores it exactly and
-    // the vector is 4 bytes per PSM rather than 8.
-    let fold_of: Vec<u32> = inp
-        .fold_key
-        .iter()
-        .map(|c| ((*c as usize) % folds) as u32)
-        .collect();
+    // peptide share a fold, so none leaks between train and test ([`fold_assignment`]).
+    // The value is below `folds`, so u32 stores it and the vector is 4 bytes per PSM.
+    let fold_of: Vec<u32> = fold_assignment(inp.fold_key, folds);
 
     // Folds are independent: each fits its own scaler + weights on its training rows and
     // scores only its own (disjoint) test set. Standardization is fit on the TRAIN fold
@@ -563,6 +595,39 @@ mod tests {
     use super::*;
     use crate::fdr::target_decoy_q;
 
+    /// Keys that all share a factor with the fold count (every key even, two or four folds)
+    /// still fill every fold, a key's PSMs stay in one fold, and keys that the plain modulo
+    /// already spreads keep exactly the plain modulo.
+    #[test]
+    fn folds_are_filled_when_every_key_shares_a_factor_with_the_fold_count() {
+        let even: Vec<u32> = (0..10_000u32).map(|k| 2 * k).collect();
+        for folds in [2usize, 4] {
+            let f = fold_assignment(&even, folds);
+            let mut counts = vec![0usize; folds];
+            for &x in &f {
+                counts[x as usize] += 1;
+            }
+            assert!(
+                counts.iter().all(|&c| c * 2 * folds >= even.len()),
+                "{folds} folds: {counts:?}"
+            );
+            // Repeated keys (a target and its decoy, several charges) share their fold.
+            let twice: Vec<u32> = even.iter().flat_map(|&k| [k, k]).collect();
+            let g = fold_assignment(&twice, folds);
+            assert!(g.chunks(2).all(|p| p[0] == p[1]));
+        }
+        let healthy: Vec<u32> = (0..10_000u32).collect();
+        for folds in [2usize, 3, 5] {
+            let plain: Vec<u32> = healthy.iter().map(|&k| k % folds as u32).collect();
+            assert_eq!(fold_assignment(&healthy, folds), plain);
+        }
+        // Three folds of even keys were already balanced, and stay the plain modulo.
+        let plain3: Vec<u32> = even.iter().map(|&k| k % 3).collect();
+        assert_eq!(fold_assignment(&even, 3), plain3);
+        // The mix is the one `nn_rescore_worker.mix_fold_keys` computes.
+        assert_eq!(mix_fold_key(3_735_928_559), 5_395_234_354_446_855_067);
+    }
+
     /// The previous standardiser, transcribed: `usize` row indices, which is what the
     /// per-fold bookkeeping used before it was narrowed to `u32`.
     fn fit_standardizer_reference(x: &FeatureMatrix, idx: &[usize]) -> (Vec<f64>, Vec<f64>) {
@@ -682,7 +747,10 @@ mod tests {
             return Vec::new();
         }
         let folds = inp.folds.max(1);
-        let fold_of: Vec<usize> = inp.fold_key.iter().map(|c| (*c as usize) % folds).collect();
+        let fold_of: Vec<usize> = fold_assignment(inp.fold_key, folds)
+            .into_iter()
+            .map(|f| f as usize)
+            .collect();
         let per_fold: Vec<Vec<(usize, f64)>> = (0..folds)
             .into_par_iter()
             .map(|test_fold| {
@@ -790,7 +858,10 @@ mod tests {
             return Vec::new();
         }
         let folds = inp.folds.max(1);
-        let fold_of: Vec<usize> = inp.fold_key.iter().map(|c| (*c as usize) % folds).collect();
+        let fold_of: Vec<usize> = fold_assignment(inp.fold_key, folds)
+            .into_iter()
+            .map(|f| f as usize)
+            .collect();
         let per_fold: Vec<Vec<(usize, f64)>> = (0..folds)
             .into_par_iter()
             .map(|test_fold| {
