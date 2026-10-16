@@ -1057,6 +1057,16 @@ not inside it, so it reported 0.0 throughout.
   took 13.9 s at 8 threads with them and 0.7 s without. Extract now writes the rows retrace
   rebuilds as zeros on their axis (`retrace::Skeleton`, recorded in the table's report), with
   the rule retrace classifies by, and retrace refuses a skeleton it would not rebuild in full.
+- **MS2 frames per window group.** Retrace decoded every MS2 frame of the run at its start and
+  held them beside the MS1 frames. It now holds the MS2 frames of the isolation windows its
+  current span of rows needs, and drops them when the span moves on: the library is sorted by
+  precursor m/z, so consecutive candidates fall in the same few windows. On run A_02
+  standalone at 20 threads the peak fell from 20.5 to 12.5 GB with every output byte
+  identical. A frame whose slots isolate several windows is decoded once per run of spans that
+  needs one of them (86,078 decodes of 30,988 frames, 38 s at 20 threads). On the six runs the
+  phase of five concurrent retraces fell from 96-98 to 49-66 GB at an unchanged wall time,
+  every identification and quantity bit-identical, which leaves the load of the pooled
+  rescore (95 GB) as the experiment's highest point.
 
 Three changes to the summing kernel were measured on one run (standalone, 20 threads, 3:46
 and 162 s of summing as the baseline) and left out, every output byte-identical: events
