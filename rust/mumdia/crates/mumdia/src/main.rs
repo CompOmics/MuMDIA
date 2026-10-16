@@ -1541,6 +1541,7 @@ fn real_main() -> Result<()> {
                 // for a `mumdia retrace` to follow (`retrace.enabled`), resolved on the
                 // spectra's own record.
                 trace_pad: None,
+                retrace_skeleton: None,
                 chrom_im: {
                     let has_im = mumdia::instrument::spectra_has_im(&ms2);
                     cfg.features.im_features.on(has_im) || (cfg.retrace.enabled && has_im)

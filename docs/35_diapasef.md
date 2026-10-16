@@ -994,3 +994,87 @@ IM branch's E. coli diaPASEF library, 0.574592 for the recipe's), so it is compu
   IM branch.
 - **Evidence.** Most HYE numbers are one seed, no multi-run diaPASEF entrapment exists, and
   the quantification record rests on one known-ratio dataset.
+
+## 16. Memory and speed
+
+Measured on hippogriff (128 cores, 755 GB) on the six ProteoBench HYE diaPASEF runs (60 min
+gradient, timsTOF SCP) at 120 threads, NN seed 0, with `MUMDIA_CACHE_DIR=off`, so both DeepLC
+calibrations of the first run start cold. Peaks are GNU `time` maximum RSS of the engine
+process unless named otherwise.
+
+### Where it goes
+
+| phase | wall | what takes it |
+|---|---|---|
+| first run alone | 18.8 min | conversion and seeds of all runs (1.6 min), the multi-head calibration (3.2), the RT bootstrap search (5.4), the refit and the first run's own chain (8.6) |
+| five runs in parallel | 14.3 min | per run: retrace about 5.5 min, extract about 3, features 1.5-4 |
+| pooled rescore | 14.9 min | `nn_torch` over 28.5 million PSMs |
+| quantification and report | 1.9 min | |
+
+The same engine and settings on six Astral runs (15 min gradients) took 12:07 at 23.3 GiB, and
+on six Orbitrap AIF runs 13:33 at 30.1 GiB. A diaPASEF run costs more for three reasons that
+the measurements below separate:
+
+- **Extraction rejects little.** 4.9 million of the 14.7 million library candidates pass per
+  run, against about 5% on Astral. On dense diaPASEF spectra almost every candidate matches
+  its fragments: the identified ones match 11.3 of 12 on average, the rest 10.9. Retrace,
+  features, the chromatogram tables and the pooled rescore all scale with that count.
+- **Retrace holds the run's raw events** (section 6), 2.86 billion of them in a 60 min HYE
+  run, two thirds of them MS1.
+- **The fragment-peak matches of extract** are held for every window group in flight.
+
+### Extract: windows in flight
+
+`extract.windows_in_flight` defaults to 4 on spectra that carry 1/K0 (16 otherwise). Measured
+standalone on run A_02 at 20 threads, the accepted candidates (4,907,155) and chromatogram rows
+(73,607,325) identical at every setting:
+
+| windows in flight | peak (anonymous heap) | wall |
+|---|---|---|
+| 16 (the previous default) | 45.1 GiB | 410 s (contended) |
+| 8 | 31.9 GiB | 194 s |
+| 4 | 21.4 GiB | 154 s |
+
+None of the peak is file-backed. Threads change little: 16 in flight took 51.5 GiB at 60
+threads and 51.9 at 120. On the six-run experiment the peak fell from 181 to 94 GiB, with every
+identification, quantity and loss class bit-identical, in 50 against 51 minutes. The memory
+record of the accumulator (`mem: extract hit accumulator`) reads its size after each batch,
+not inside it, so it reported 0.0 throughout.
+
+### Retrace
+
+- **Readers.** The chromatogram readers come from a process-wide budget. With one call's
+  worth (7 extra readers), the first of five concurrent retraces took all of them and the
+  others read on one thread: the slowest spent 390 s of its 489 s reading. The budget is now
+  four calls' worth (about 0.1 GB per reader).
+- **MS1 sums once per row.** An MS1 grid point takes the largest sum over its nearest MS1
+  frame and `extract.ms1_scan_halfwidth` neighbours either side, and consecutive points of a
+  row share all of those frames but one, so every MS1 frame of a row was summed three times
+  at the default. Each is now summed once per row, with every value bit-identical.
+- **Skeleton centroid table.** Retrace rebuilds about 90% of the rows from raw events and
+  reads only their axis and keys, but it decoded every centroid trace: the intensity and
+  1/K0 lists are 86% of the centroid table's 11.8 GiB, and a read benchmark of one run's table
+  took 13.9 s at 8 threads with them and 0.7 s without. Extract now writes the rows retrace
+  rebuilds as zeros on their axis (`retrace::Skeleton`, recorded in the table's report), with
+  the rule retrace classifies by, and retrace refuses a skeleton it would not rebuild in full.
+
+Three changes to the summing kernel were measured on one run (standalone, 20 threads, 3:46
+and 162 s of summing as the baseline) and left out, every output byte-identical: events
+grouped by mobility scan instead of by TOF (22:12; a fragment's TOF window covers only a few
+TOF indices, so one bucket lookup beats about 28 per-scan searches), candidates visited in
+retention-time order (3:46), and every lookup of a row group sorted by frame before summing
+(10:48: building and sorting the requests cost more than the cache misses they saved).
+Smaller TOF buckets (16 or 4 indices) and huge pages changed nothing. A micro-benchmark on the
+run's real frames puts one lookup at about 110 ns in retrace's order and 54 ns frame by frame.
+
+### MS1 noise
+
+The dnoise tool (P. T. Garrett, J. K. Diedrich and J. R. Yates III, bioRxiv 2026,
+doi:10.64898/2026.08.27.747603, MIT licence) removes MS1 points that do not form a run of at
+least 5 occupied mobility scans, points in the halo of a stronger ion, and MS1 points outside
+every diaPASEF window. On these runs its default (MS1 only) kept 8.7% of the MS1 points and
+40% of all points, cut the MS1 centroids from 254 million to 8.6 million per run, and left the
+identifications unchanged (89,973 against 90,363 ions at k = 3, precursors 109,962 against
+109,965) at 51 against 63 minutes. Its MS/MS mode kept 17% of all points and lost 9.2% of the
+ions, as `convert.tdf_min_points` 3 to 6 did (-5.9% to -20.1%): no MS/MS peak filter tried
+here is free.

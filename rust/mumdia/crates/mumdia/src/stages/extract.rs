@@ -173,6 +173,11 @@ pub struct ExtractParams<'a> {
     /// ([`TracePad`]). `None`, everywhere but the second pass of match-between-runs on a
     /// run with ion mobility, records exactly the window.
     pub trace_pad: Option<TracePad>,
+    /// Set when retrace rebuilds this table from the raw events right after extract
+    /// (`chain::extract_to_compete` under `retrace.enabled`): every row retrace rebuilds is
+    /// written with zeros on its axis, since retrace reads only the axis and the keys of
+    /// those rows (`retrace::Skeleton`). `None` everywhere else, which writes every trace.
+    pub retrace_skeleton: Option<crate::stages::retrace::Skeleton>,
 }
 
 /// How far beyond `[rt_lo, rt_hi]` extract records a candidate's traces: `scans` samples at
@@ -2132,14 +2137,30 @@ fn accumulate_groups(
 /// identical output throughout.
 const DEFAULT_MAX_WINDOWS_IN_FLIGHT: usize = 16;
 
+/// The default number of windows in flight on spectra with ion mobility (diaPASEF). Such a
+/// run has few window groups (24 on the ProteoBench HYE runs), each matched against dense
+/// spectra, so 16 in flight kept two thirds of a run's fragment-peak matches resident.
+/// Measured on one 60 min HYE diaPASEF run at 20 threads, standalone: 16 in flight
+/// 45.1 GiB, 8 31.9 GiB, 4 21.4 GiB, with identical accepted candidates and chromatogram
+/// rows, and 4 the fastest (154 s against 194 s at 8); on the six-run experiment the peak
+/// fell from 181 to 94 GiB at bit-identical identifications and 50 against 51 minutes.
+const DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM: usize = 4;
+
 /// Fewest candidates a probing task takes: below this the per-task narrowed bin cache (one
 /// entry per fragment bin) costs more than the posting-list work it divides.
 const MIN_CANDIDATES_PER_TASK: usize = 4096;
 
-fn groups_in_flight(cfg: &ExtractConfig) -> usize {
+/// `extract.windows_in_flight`, or its default: the rayon thread count capped at 16, and
+/// at [`DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM`] on spectra that carry 1/K0.
+fn groups_in_flight(cfg: &ExtractConfig, has_im: bool) -> usize {
+    let cap = if has_im {
+        DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM
+    } else {
+        DEFAULT_MAX_WINDOWS_IN_FLIGHT
+    };
     cfg.windows_in_flight
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| rayon::current_num_threads().min(DEFAULT_MAX_WINDOWS_IN_FLIGHT))
+        .unwrap_or_else(|| rayon::current_num_threads().min(cap))
         .max(1)
 }
 
@@ -4076,6 +4097,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             (groups, group_im, grid, width)
         };
 
+    // Rows of a skeleton table left as zeros for retrace (`ExtractParams::retrace_skeleton`).
+    let skeleton_rows = std::sync::atomic::AtomicU64::new(0);
     let per_candidate = |cid: u32, hits: &mut [Hit]| -> Vec<CandOut> {
         // Under a trace pad the candidate's hits reach `trace_pad_s` beyond its window. Every
         // score below reads only the hits inside the window, which are exactly the hits the
@@ -4521,6 +4544,48 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             }
         }
 
+        // The 1/K0 evidence (psms_extracted v4) of a row with its apex at `rt`, the selected
+        // apex and every promoted alternative alike. It depends only on the candidate, the
+        // row's apex RT and the precursor m/z, so it is computed here, per accepted row,
+        // rather than in a pass over the finished table, which is streamed out in chunks.
+        // All `None` on 3D data.
+        let im_at = |rt: f64| -> ApexIm {
+            if !has_im {
+                return ApexIm::default();
+            }
+            ApexIm {
+                im_pred_cal: win
+                    .im_cal
+                    .as_ref()
+                    .and_then(|v| v.get(cid as usize).copied().flatten()),
+                ..apex_im_stats(
+                    &lib,
+                    scans,
+                    &rt_scan,
+                    ms1_scans,
+                    &ms1_rts,
+                    guard,
+                    &mass_off,
+                    frag_tol,
+                    p.cfg,
+                    cid,
+                    rt,
+                    c.precursor_mz,
+                )
+            }
+        };
+
+        // The selected apex's 1/K0 evidence, computed once, before the traces: the rank-0 row
+        // carries it, and a skeleton table (`ExtractParams::retrace_skeleton`) needs the
+        // centre retrace will use to know which rows it rebuilds: this `apex_im`, or
+        // `im_pred_cal` where that is not finite (`retrace::Skeleton`).
+        let im0 = im_at(apex_rt);
+        let skel_centre = match im0.apex_im.filter(|v| v.is_finite()) {
+            Some(v) => v,
+            None => im0.im_pred_cal.unwrap_or(f64::NAN),
+        };
+        let mut skel_rows = 0u64;
+
         let mut chrom_rows: Vec<ChromOutputRow> = Vec::new();
         // The traces: from every hit over the padded range under a trace pad, otherwise the
         // groups every score read. Which fragments carry a trace is decided inside the window
@@ -4566,7 +4631,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             let frag = fi as u16;
             let (sm, sw) = wsum[fi];
             let obs_mz = if sw > 0.0 { sm / sw } else { fmzs[fi] as f64 };
-            let (rts, ints): (Vec<f32>, Vec<f32>) = if !observed.contains(frag) {
+            let (rts, mut ints): (Vec<f32>, Vec<f32>) = if !observed.contains(frag) {
                 (Vec::new(), Vec::new()) // absent predicted transition
             } else if !t_grid.is_empty() {
                 (
@@ -4594,7 +4659,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             // trace is +0.0 (an absent fragment in grid mode, or a hit of zero intensity), so
             // the v2 trim of the trace loses no 1/K0 and both layouts decode to the same list.
             // Empty for a never-observed fragment, as its trace is, and without `chrom_im`.
-            let ims: Vec<f32> = if !chrom_im || !observed.contains(frag) {
+            let mut ims: Vec<f32> = if !chrom_im || !observed.contains(frag) {
                 Vec::new()
             } else {
                 let im_of = |gi: usize, v: f32| -> f32 {
@@ -4614,6 +4679,23 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         .collect()
                 }
             };
+            // A row retrace rebuilds from the raw events keeps its axis and gets zeros: the
+            // centroid values would be decoded only to be replaced.
+            if let Some(k) = p.retrace_skeleton {
+                let name = lib.frag_name_str(fnames[fi]);
+                if k.zeroes(
+                    !rts.is_empty(),
+                    c.precursor_mz,
+                    skel_centre,
+                    fmzs[fi] as f64,
+                    name,
+                    fints[fi],
+                ) {
+                    ints.iter_mut().for_each(|x| *x = 0.0);
+                    ims.iter_mut().for_each(|x| *x = 0.0);
+                    skel_rows += 1;
+                }
+            }
             chrom_rows.push((
                 cid,
                 // Fragment names are interned in the library (a u16 dictionary id per
@@ -4639,7 +4721,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             let shift = 1.0 + p.cfg.ms1_ppm_offset * 1e-6;
             for (nm, dmz) in [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)] {
                 let mz = (c.precursor_mz + dmz) * shift;
-                let ints: Vec<f32> = t_grid
+                let mut ints: Vec<f32> = t_grid
                     .iter()
                     .map(|&r| {
                         let j = nearest_index(&ms1_rts, r);
@@ -4660,6 +4742,12 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 } else {
                     Vec::new()
                 };
+                if let Some(k) = p.retrace_skeleton {
+                    if k.zeroes(true, c.precursor_mz, skel_centre, mz, nm, 0.0) {
+                        ints.iter_mut().for_each(|x| *x = 0.0);
+                        skel_rows += 1;
+                    }
+                }
                 chrom_rows.push((cid, nm.to_string(), mz, mz, 0.0, grid_rt.clone(), ints, ims));
             }
         }
@@ -4699,37 +4787,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         let (deconv_explained, deconv_active, deconv_share, deconv_collin, deconv_shadow) =
             (0.0, 0.0, 0.0, 0.0, 0.0);
 
-        // The 1/K0 evidence (psms_extracted v4) of a row with its apex at `rt`, the selected
-        // apex and every promoted alternative alike. It depends only on the candidate, the
-        // row's apex RT and the precursor m/z, so it is computed here, per accepted row,
-        // rather than in a pass over the finished table, which is streamed out in chunks.
-        // All `None` on 3D data.
-        let im_at = |rt: f64| -> ApexIm {
-            if !has_im {
-                return ApexIm::default();
-            }
-            ApexIm {
-                im_pred_cal: win
-                    .im_cal
-                    .as_ref()
-                    .and_then(|v| v.get(cid as usize).copied().flatten()),
-                ..apex_im_stats(
-                    &lib,
-                    scans,
-                    &rt_scan,
-                    ms1_scans,
-                    &ms1_rts,
-                    guard,
-                    &mass_off,
-                    frag_tol,
-                    p.cfg,
-                    cid,
-                    rt,
-                    c.precursor_mz,
-                )
-            }
-        };
-
         let rank0 = CandOut {
             cid,
             peak_rank: 0, // selected apex; ranks >= 1 added when promote_top_peaks > 1
@@ -4764,10 +4821,11 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             deconv_share: deconv_share as f32,
             deconv_collin: deconv_collin as f32,
             deconv_shadow: deconv_shadow as f32,
-            im: im_at(apex_rt),
+            im: im0,
             chrom: chrom_rows,
             peaks,
         };
+        skeleton_rows.fetch_add(skel_rows, std::sync::atomic::Ordering::Relaxed);
         if p.cfg.promote_top_peaks <= 1 || groups.is_empty() {
             return vec![rank0];
         }
@@ -5018,7 +5076,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 n_materialized += c.len() as u64;
                 emit_batch(c)
             };
-            let step = groups_in_flight(p.cfg);
+            let step = groups_in_flight(p.cfg, has_im);
             let mut gi = 0usize;
             while gi < groups.len() {
                 let upto = (gi + step).min(groups.len());
@@ -5284,6 +5342,19 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             if let Some(obj) = params.as_object_mut() {
                 obj.insert("reader".into(), json!(crate::instrument::READER_TIMSRUST));
                 obj.insert("im_gate".into(), json!(im_gate));
+            }
+        }
+        // A skeleton table says so in its own report, with the rows it left for retrace;
+        // retrace refuses one it would not rebuild in full (`retrace::Skeleton`).
+        if let (Some(k), true) = (p.retrace_skeleton, path == p.out_chrom) {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert(
+                    crate::stages::retrace::Skeleton::PARAM.into(),
+                    json!({
+                        "ms1": k.ms1,
+                        "rows": skeleton_rows.load(std::sync::atomic::Ordering::Relaxed),
+                    }),
+                );
             }
         }
         // The traces reach this far beyond each candidate's RT window

@@ -95,6 +95,17 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **diaPASEF memory and speed (docs/35_diapasef.md section 16).** `extract.windows_in_flight`
+  defaults to 4 on spectra that carry 1/K0 (16 otherwise): extract held 45.1 GiB per HYE
+  diaPASEF run at 16 in flight and 21.4 at 4, with identical output, and the six-run
+  experiment peaked at 94 instead of 181 GiB at bit-identical identifications. Retrace sums
+  each MS1 frame of a row once instead of once per grid point that reaches it (three times at
+  the default `ms1_scan_halfwidth`), gives up to four concurrent calls eight chromatogram
+  readers each instead of letting the first take the whole budget, and reads a skeleton
+  centroid table: extract writes the rows retrace rebuilds from raw events as zeros on their
+  axis (`retrace_skeleton` in the table's report), since decoding those centroid values was
+  most of retrace's read. Every retrace output is bit-identical. Under
+  `retrace.enabled` the centroid table's bytes and hash change; it is deleted after retrace.
 - **`run-experiment` matches between runs by default with a second pass**
   (`mbr.strategy = "second_pass"`, the new default; it was `"none"`). The pooled first pass
   is kept as `first_pass/scored_combined.parquet`. Every target it accepts experiment-wide

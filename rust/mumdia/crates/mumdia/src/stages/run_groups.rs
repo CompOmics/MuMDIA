@@ -918,6 +918,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     ms1: Some(&ms1_scans),
                 }),
                 trace_pad: None,
+                retrace_skeleton: None,
                 chrom_im: cfg
                     .features
                     .im_features

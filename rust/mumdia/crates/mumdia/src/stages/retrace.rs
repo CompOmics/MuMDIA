@@ -28,7 +28,7 @@
 //! (`convert::tims_frames::TofFrame`); the chromatograms are then streamed one row group at
 //! a time, so memory does not grow with the number of trace points.
 
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -63,15 +63,22 @@ const RT_MARGIN_S: f64 = 5.0;
 /// frame RT is ~1e-4 s at the end of a gradient; frames are ~60 ms apart).
 const RT_MATCH_S: f64 = 1e-3;
 
-/// Chromatogram readers beyond each call's first, PROCESS-WIDE ([`DecoderLease`]): each
-/// holds one decoded row group of traces, so a per-call allowance would multiply with
-/// `experiment.parallel_runs`. A call takes up to its row-group count and its thread pool
-/// allows, so `--threads 1` reads on one thread; 1 + 7 is the eight readers the stage was
-/// measured with.
+/// Chromatogram readers a call takes beyond its first: up to its row-group count and its
+/// thread pool allow, so `--threads 1` reads on one thread; 1 + 7 is the eight readers the
+/// stage was measured with.
 const READER_EXTRAS: usize = 7;
 
-/// Extra readers of the [`READER_EXTRAS`] pool not currently leased.
-static READER_BUDGET: AtomicUsize = AtomicUsize::new(READER_EXTRAS);
+/// Concurrent retrace calls that each get all [`READER_EXTRAS`] from the process-wide
+/// budget ([`DecoderLease`]). Each reader holds about one decoded row group of traces
+/// (~0.1 GB), so the budget stays process-wide rather than multiplying freely with
+/// `experiment.parallel_runs`. With a budget of one call's extras, the first of five
+/// concurrent retraces on HYE diaPASEF took all seven, the others read on one thread, and
+/// the slowest spent 390 s of its 489 s reading: one call's readers then set the wall time
+/// of the whole parallel phase.
+const READER_CALLS: usize = 4;
+
+/// Extra readers of the process-wide pool not currently leased.
+static READER_BUDGET: AtomicUsize = AtomicUsize::new(READER_EXTRAS * READER_CALLS);
 
 // `retrace.apex_features` (docs/35_diapasef.md section 6): the apex mobility agreement is
 // scored on each fragment's raw 1/K0 profile over `apex_im +/- APEX_IM_HW`, in APEX_BINS
@@ -235,6 +242,86 @@ enum Kind {
     Copy,
     Frag,
     Ms1,
+}
+
+/// How retrace treats one chromatogram row: rebuilt from the raw events as a fragment or an
+/// MS1 isotope trace, or copied as extract wrote it. A row is rebuilt when it has a grid,
+/// its precursor and its own m/z are finite, its candidate has a finite 1/K0 centre, and it
+/// is an MS1 row under `retrace.ms1` or a fragment with a positive prediction. Extract
+/// evaluates the same rule when it writes a skeleton table ([`Skeleton`]), so a row it
+/// leaves as zeros is one this stage rebuilds.
+fn row_kind(
+    has_points: bool,
+    precursor_mz: f64,
+    centre: f64,
+    row_mz: f64,
+    name: &str,
+    predicted_intensity: f32,
+    ms1: bool,
+) -> Kind {
+    let ok = has_points && precursor_mz.is_finite() && centre.is_finite() && row_mz.is_finite();
+    match (ok, name.starts_with("ms1_")) {
+        (true, true) if ms1 => Kind::Ms1,
+        (true, false) if predicted_intensity > 0.0 => Kind::Frag,
+        _ => Kind::Copy,
+    }
+}
+
+/// A centroid table written for this stage to rebuild (`ExtractParams::retrace_skeleton`):
+/// the traces of the rows retrace rebuilds from raw events are left as zeros on their axis,
+/// because retrace reads only the axis and the keys of those rows, and decoding centroid
+/// values it then discards was most of its read time (95% of the decode on a HYE diaPASEF
+/// run). `ms1`: whether the MS1 isotope rows were among them (`retrace.ms1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Skeleton {
+    pub ms1: bool,
+}
+
+impl Skeleton {
+    /// The report parameter of a skeleton centroid table: `{"ms1": bool, "rows": n}`.
+    pub const PARAM: &'static str = "retrace_skeleton";
+
+    /// Whether extract leaves the row as zeros: exactly the rows [`row_kind`] rebuilds.
+    pub fn zeroes(
+        &self,
+        has_points: bool,
+        precursor_mz: f64,
+        centre: f64,
+        row_mz: f64,
+        name: &str,
+        predicted_intensity: f32,
+    ) -> bool {
+        row_kind(
+            has_points,
+            precursor_mz,
+            centre,
+            row_mz,
+            name,
+            predicted_intensity,
+            self.ms1,
+        ) != Kind::Copy
+    }
+
+    /// The skeleton a centroid table records in its report, if any.
+    pub fn recorded(path: &str) -> Result<Option<Skeleton>> {
+        let Ok(text) = std::fs::read_to_string(format!("{path}.report.json")) else {
+            return Ok(None);
+        };
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("{path}.report.json is not valid JSON"))?;
+        match v.get("params").and_then(|p| p.get(Skeleton::PARAM)) {
+            None => Ok(None),
+            Some(s) => {
+                let ms1 = s.get("ms1").and_then(|x| x.as_bool()).ok_or_else(|| {
+                    anyhow!(
+                        "{path}.report.json: {} without a boolean 'ms1'",
+                        Skeleton::PARAM
+                    )
+                })?;
+                Ok(Some(Skeleton { ms1 }))
+            }
+        }
+    }
 }
 
 /// One rebuilt row: its kind, its intensity and 1/K0 lists, the raw events summed, the
@@ -507,6 +594,52 @@ fn point_sum(
         }
     }
     best
+}
+
+/// The frame sums of one MS1 row, kept while its grid is walked. An MS1 grid point takes the
+/// largest sum over its nearest MS1 frame and `extract.ms1_scan_halfwidth` neighbours either
+/// side, and consecutive points of a row share all of those frames but one, so each MS1
+/// frame of a row was summed `2 * halfwidth + 1` times (3 at the default): about two thirds
+/// of retrace's MS1 lookups. Every point of a row sums the same TOF window in the same scans,
+/// so a frame's sum does not depend on the point that asks, and [`Ms1Seen::point_sum`]
+/// returns bit for bit what [`point_sum`] returns.
+#[derive(Default)]
+struct Ms1Seen {
+    /// (frame address, its sum), oldest first.
+    sums: Vec<(usize, Sum)>,
+}
+
+impl Ms1Seen {
+    /// The grid walks forward in retention time, so only the last few frames come back.
+    const KEEP: usize = 16;
+
+    fn point_sum(
+        &mut self,
+        frames: &[&TofFrame],
+        scans: &[(usize, usize)],
+        tof: (u32, u32),
+        scan_im: &[f64],
+    ) -> Sum {
+        let mut best = Sum::default();
+        for f in frames {
+            let key = *f as *const TofFrame as usize;
+            let s = match self.sums.iter().rev().find(|(k, _)| *k == key) {
+                Some(&(_, s)) => s,
+                None => {
+                    let s = sum_events(f, scans, tof.0, tof.1, scan_im);
+                    if self.sums.len() == Self::KEEP {
+                        self.sums.remove(0);
+                    }
+                    self.sums.push((key, s));
+                    s
+                }
+            };
+            if s.inten > best.inten {
+                best = s;
+            }
+        }
+        best
+    }
 }
 
 /// Per-candidate lookups indexed by `candidate_id`, NaN where absent.
@@ -956,6 +1089,17 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     let ch = TableFile::open(p.chromatograms)?;
     let layout = Layout::of(&ch)?;
     let opt = Optional::of(&ch);
+    // A skeleton table holds zeros where this stage rebuilds; one written for MS1 rows can
+    // only be read with them rebuilt.
+    let skeleton = Skeleton::recorded(p.chromatograms)?;
+    if skeleton.is_some_and(|k| k.ms1) && !p.cfg.ms1 {
+        bail!(
+            "{}: extract left its MS1 isotope traces for retrace to rebuild              ({} with ms1 true), and retrace.ms1 is false here, so they would be published              as zeros; run retrace with retrace.ms1 = true or extract this run again",
+            p.chromatograms,
+            Skeleton::PARAM
+        );
+    }
+    let lost_skeleton_rows = AtomicU64::new(0);
     if !opt.im {
         bail!(
             "{}: no per-point 1/K0 list; retrace needs the chromatograms of a diaPASEF run \
@@ -1201,18 +1345,31 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                         .map(|r| {
                             let pts = &s.rt[r][..];
                             let c = s.cid[r] as usize;
-                            let ok = !pts.is_empty()
-                                && c < pmz.len()
-                                && pmz[c].is_finite()
-                                && centre[c].is_finite()
-                                && s.fmz[r].is_finite();
-                            let is_ms1 = s.name[r].starts_with("ms1_");
-                            let kind = match (ok, is_ms1) {
-                                (true, true) if p.cfg.ms1 => Kind::Ms1,
-                                (true, false) if s.pint[r] > 0.0 => Kind::Frag,
-                                _ => Kind::Copy,
+                            let kind = if c < pmz.len() {
+                                row_kind(
+                                    !pts.is_empty(),
+                                    pmz[c],
+                                    centre[c],
+                                    s.fmz[r],
+                                    &s.name[r],
+                                    s.pint[r],
+                                    p.cfg.ms1,
+                                )
+                            } else {
+                                Kind::Copy
                             };
                             if kind == Kind::Copy {
+                                // In a skeleton table a fragment row with a grid and an
+                                // all-zero trace is one extract left for this stage to
+                                // rebuild (an observed fragment always has a non-zero
+                                // point). Copying it would publish zeros as the trace.
+                                if skeleton.is_some()
+                                    && !pts.is_empty()
+                                    && !s.name[r].starts_with("ms1_")
+                                    && s.int[r].iter().all(|&x| x == 0.0)
+                                {
+                                    lost_skeleton_rows.fetch_add(1, Ordering::Relaxed);
+                                }
                                 return RowOut {
                                     kind,
                                     int: s.int[r].clone(),
@@ -1242,11 +1399,16 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                                 (Vec::with_capacity(pts.len()), Vec::with_capacity(pts.len()));
                             let (mut ev, mut miss) = (0u64, 0u64);
                             let (mut sw, mut stof) = (0.0f64, 0.0f64);
+                            let mut seen = Ms1Seen::default();
                             for (fs, scans) in points {
                                 if fs.is_empty() {
                                     miss += 1;
                                 }
-                                let sum = point_sum(fs, scans, tof, scan_im);
+                                let sum = if frag {
+                                    point_sum(fs, scans, tof, scan_im)
+                                } else {
+                                    seen.point_sum(fs, scans, tof, scan_im)
+                                };
                                 ev += sum.n as u64;
                                 let hit = sum.inten > 0.0;
                                 ints.push(if hit { sum.inten as f32 } else { 0.0 });
@@ -1392,6 +1554,12 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                 break;
             }
         }
+        // A skeleton row this stage did not rebuild would be published as zeros: nothing is
+        // published then (the writer drops its file without the end marker).
+        let lost = lost_skeleton_rows.load(Ordering::Relaxed);
+        if lost > 0 {
+            sent_all = false;
+        }
         // The chunk that fixes the schema of a table without rows (empty otherwise), then
         // the end marker.
         if sent_all {
@@ -1413,6 +1581,10 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
             .map_err(|_| anyhow!("retrace: the writer panicked"))??;
         match (sent_all, written) {
             (true, Some((written, t_write))) => Ok((written, t_read, t_write)),
+            _ if lost > 0 => bail!(
+                "{}: {lost} fragment rows that extract left as zeros for retrace to rebuild                  were not rebuilt, so the skeleton and this retrace disagree (other run                  windows, psms_extracted or retrace settings than the extract that wrote it);                  nothing published",
+                p.chromatograms
+            ),
             _ => bail!("retrace: the writer stopped before the end; nothing published"),
         }
     })?;
@@ -1726,6 +1898,103 @@ mod tests {
         ];
         assert_eq!(ms1_frames(11.0, 1, &rt, &fi, &partial).len(), 1);
         assert!(ms1_frames(10.0, 0, &rt, &fi, &partial).is_empty());
+    }
+
+    /// Extract zeroes exactly the rows retrace rebuilds: the skeleton rule is `row_kind`,
+    /// for fragment and MS1 rows, with and without `retrace.ms1`, at every non-finite input.
+    #[test]
+    fn a_skeleton_zeroes_exactly_the_rows_retrace_rebuilds() {
+        let nan = f64::NAN;
+        for ms1 in [false, true] {
+            let k = Skeleton { ms1 };
+            for has in [false, true] {
+                for pmz in [500.0, nan] {
+                    for centre in [1.0, nan] {
+                        for mz in [300.0, nan] {
+                            for (name, pi) in [
+                                ("y5", 0.4f32),
+                                ("b3", 0.0),
+                                ("ms1_mono", 0.0),
+                                ("ms1_iso2", 0.0),
+                            ] {
+                                let kind = row_kind(has, pmz, centre, mz, name, pi, ms1);
+                                assert_eq!(
+                                    k.zeroes(has, pmz, centre, mz, name, pi),
+                                    kind != Kind::Copy,
+                                    "{name} ms1={ms1} has={has} pmz={pmz} centre={centre} mz={mz}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The rule itself: a fragment needs a prediction, an MS1 row needs retrace.ms1.
+        assert!(row_kind(true, 500.0, 1.0, 300.0, "y5", 0.4, false) == Kind::Frag);
+        assert!(row_kind(true, 500.0, 1.0, 300.0, "y5", 0.0, true) == Kind::Copy);
+        assert!(row_kind(true, 500.0, 1.0, 500.0, "ms1_mono", 0.0, true) == Kind::Ms1);
+        assert!(row_kind(true, 500.0, 1.0, 500.0, "ms1_mono", 0.0, false) == Kind::Copy);
+        assert!(row_kind(true, 500.0, nan, 300.0, "y5", 0.4, true) == Kind::Copy);
+    }
+
+    /// The marker a skeleton table carries in its report, absent on an ordinary table and
+    /// refused when malformed.
+    #[test]
+    fn a_skeleton_is_read_from_the_table_report() {
+        let dir = std::env::temp_dir().join(format!("mumdia_skeleton_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chrom.parquet").to_str().unwrap().to_string();
+        let report = format!("{path}.report.json");
+        assert_eq!(Skeleton::recorded(&path).unwrap(), None);
+        std::fs::write(&report, r#"{"params":{"trace_pad_s":2.0}}"#).unwrap();
+        assert_eq!(Skeleton::recorded(&path).unwrap(), None);
+        std::fs::write(
+            &report,
+            r#"{"params":{"retrace_skeleton":{"ms1":true,"rows":7}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Skeleton::recorded(&path).unwrap(),
+            Some(Skeleton { ms1: true })
+        );
+        std::fs::write(&report, r#"{"params":{"retrace_skeleton":{"rows":7}}}"#).unwrap();
+        assert!(Skeleton::recorded(&path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An MS1 row walked with the frame sums kept gives every point the same sum, bit for
+    /// bit, as summing each point's frames afresh: at every half-width, with ties (equal
+    /// frames), a frame that was not decoded, and points that share their nearest frame.
+    #[test]
+    fn ms1_seen_equals_summing_every_point_afresh() {
+        let scale = [3u32, 1, 5, 5, 2, 7, 1, 4, 4, 6];
+        let mut frames: Vec<Option<TofFrame>> = scale
+            .iter()
+            .map(|&m| {
+                let mut f = frame();
+                for x in f.intensities.iter_mut() {
+                    *x *= m;
+                }
+                Some(TofFrame::new(f).unwrap())
+            })
+            .collect();
+        frames[6] = None;
+        let rt: Vec<f64> = (0..scale.len()).map(|k| 10.0 + k as f64).collect();
+        let fi: Vec<usize> = (0..scale.len()).collect();
+        let im: Vec<f64> = (0..8).map(|s| 1.5 - 0.1 * s as f64).collect();
+        // Grid points every 0.6 s: some share their nearest MS1 frame.
+        let grid: Vec<f64> = (0..15).map(|p| 9.7 + 0.6 * p as f64).collect();
+        for half in 0..4 {
+            for (scans, tof) in [(vec![(0, 8)], (200, 200)), (vec![(2, 5)], (100, 300))] {
+                let mut seen = Ms1Seen::default();
+                for &t in &grid {
+                    let fs = ms1_frames(t, half, &rt, &fi, &frames);
+                    let want = point_sum(&fs, &scans, tof, &im);
+                    let got = seen.point_sum(&fs, &scans, tof, &im);
+                    assert_eq!(got, want, "half {half} t {t} scans {scans:?}");
+                }
+            }
+        }
     }
 
     /// The one patch of psms_extracted: re-picked apexes, refreshed scalars under the null
