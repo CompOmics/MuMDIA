@@ -873,6 +873,36 @@ def _fill_raw_block(src, col_idx, dst):
     return _block_moments(dst)
 
 
+def release_rows(matrix, r0, r1):
+    """Drop rows `[r0, r1)` of a read-only memory-mapped matrix from this process's
+    resident set (`MADV_DONTNEED`), once they have been copied out.
+
+    A mapped page that has been read stays in the process's RSS until it is unmapped, so
+    copying the 48 GB raw handoff of the six-run HYE diaPASEF pool into a 48 GB matrix
+    held both, and the rescore's resident peak was 95 GB against 51 GB once the copy was
+    done. The pages stay in the page cache, so a later read only faults them back in, with
+    the same bytes: dropping a page that holds rows still to be copied costs a refault,
+    never a value. A no-op where the platform has no `madvise` (Windows) or the array is
+    not memory-mapped.
+    """
+    import mmap
+
+    mm = getattr(matrix, "_mmap", None)
+    flag = getattr(mmap, "MADV_DONTNEED", None)
+    if mm is None or flag is None or not hasattr(mm, "madvise") or r1 <= r0:
+        return
+    try:
+        base = np.frombuffer(mm, dtype=np.uint8).ctypes.data
+        row = matrix.strides[0]
+        a = matrix.ctypes.data - base + r0 * row
+        b = matrix.ctypes.data - base + r1 * row
+        a -= a % mmap.PAGESIZE
+        if b > a:
+            mm.madvise(flag, a, b - a)
+    except (OSError, ValueError, BufferError):
+        pass
+
+
 def fill_raw_matrix(matrix, col_idx, n, chunk, out, group_rows, threads=1, initializer=None):
     """Fill `out` (n x nf float32) from a raw handoff's matrix; return (s1, s2).
 
@@ -881,6 +911,8 @@ def fill_raw_matrix(matrix, col_idx, n, chunk, out, group_rows, threads=1, initi
     row groups are, each group into its `moment_blocks`, and the sub-blocks' partial sums
     are added in order. `col_idx` is the selected columns' positions in the matrix, or
     None for all of them in order. `threads` fill disjoint sub-blocks of a group at once.
+    Each group's rows of a memory-mapped `matrix` leave the resident set once copied
+    (`release_rows`).
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -904,6 +936,7 @@ def fill_raw_matrix(matrix, col_idx, n, chunk, out, group_rows, threads=1, initi
             for p1, p2 in parts:
                 s1 += p1
                 s2 += p2
+            release_rows(matrix, g0, g0 + rows)
             _detail("load: fill + moments", time.time() - tf)
     finally:
         if pool is not None:
