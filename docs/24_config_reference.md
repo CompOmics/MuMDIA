@@ -1158,7 +1158,7 @@ moves to another function.
 | `MUMDIA_PYTHON_PEPTDEEP` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `MUMDIA_PYTHON_RESCORE` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `MUMDIA_QUANT_SELECTIVE_READ` | engine | computed: on (quant skips, unread, the chromatogram data pages that hold no kept row). `0` reads every page of every row group it opens; the outputs are the same (`stages/quant.rs` `selective_read_enabled`) | `rust/mumdia/crates/mumdia/src/stages/quant.rs::selective_read_enabled` |
-| `MUMDIA_REPICK_DUMP` | engine | computed: off. Diagnostic: a path makes `retrace.repick` write every peak it scored there (candidate, order, apex RT, score); the pick is the same either way (`stages/retrace.rs` `repick`) | `rust/mumdia/crates/mumdia/src/stages/retrace.rs::repick` |
+| `MUMDIA_REPICK_DUMP` | engine | computed: off. Diagnostic: a path makes `retrace.repick` write every peak it scored there (candidate, order, apex RT, score); the pick is the same either way (`stages/retrace.rs` `repick`) | `rust/mumdia/crates/mumdia/src/stages/retrace.rs::run_hashed` |
 | `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_hashed`, `scripts/mokapot_worker.py::main`, `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_RTW_FEATURES` | engine | computed: on when unset; `0` leaves the window-scaled RT error family out (`features.rs` `env_families`) | `rust/mumdia/crates/mumdia/src/stages/features.rs::env_families` |
 | `MUMDIA_SCRIPTS` | sidecar | `os.path.dirname(os.path.abspath(__file__` | `scripts/mh_shard_predict.py::<module>` |
