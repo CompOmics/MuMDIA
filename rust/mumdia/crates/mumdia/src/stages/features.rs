@@ -1575,7 +1575,7 @@ impl ChromChunk {
 /// reads each row's list, which the decoder rebuilds with the trace's `+0.0` margins
 /// ([`Decoder::row_im`]). Otherwise it projects and stores exactly what it did without it.
 struct ChromStream {
-    inner: mumdia_io::table::BatchReader,
+    inner: Batches,
     pending: Option<RecordBatch>,
     has_obs_mz: bool,
     /// Read each row's per-point 1/K0 (asked for and present): `im` in v1, `im_trimmed` in
@@ -1597,6 +1597,12 @@ impl ChromStream {
     /// `want_im` also projects the per-point 1/K0 list where the table has one; without it,
     /// or on a table without the list, the projection is the one the stream always read.
     fn open(ch: &TableFile, want_im: bool) -> Result<ChromStream> {
+        ChromStream::open_with(ch, want_im, false)
+    }
+
+    /// [`ChromStream::open`], with the batches decoded one ahead on a thread of their own
+    /// when `prefetch` is set ([`Batches::prefetch`]).
+    fn open_with(ch: &TableFile, want_im: bool, prefetch: bool) -> Result<ChromStream> {
         let has_obs_mz = ch.has_column("frag_obs_mz");
         let layout = Layout::of(ch)?;
         let has_im = want_im && ch.has_column(layout.im_column());
@@ -1614,8 +1620,13 @@ impl ChromStream {
         if has_im {
             cols.push(layout.im_column());
         }
+        let reader = ch.batches(Some(&cols), CHROM_BATCH_ROWS)?;
         Ok(ChromStream {
-            inner: ch.batches(Some(&cols), CHROM_BATCH_ROWS)?,
+            inner: if prefetch {
+                Batches::prefetch(reader)?
+            } else {
+                Batches::Direct(reader)
+            },
             pending: None,
             has_obs_mz,
             has_im,
@@ -1840,6 +1851,49 @@ impl ChromStream {
             chunk.close_candidate();
         }
         Ok(chunk)
+    }
+}
+
+/// Where a [`ChromStream`] takes its decoded batches from.
+enum Batches {
+    /// Decoded on the calling thread, when it asks for the next one.
+    Direct(mumdia_io::table::BatchReader),
+    /// Decoded one ahead on a thread of its own, in order: while the stream copies batch `i`
+    /// into its chunk, the next is already being decoded.
+    Prefetch(std::sync::mpsc::Receiver<Result<RecordBatch>>),
+}
+
+impl Batches {
+    /// Decode `reader` on a thread of its own, at most one batch ahead of the consumer
+    /// (the one in the channel) plus the one being decoded: two 4,096-row batches, a few MB.
+    ///
+    /// The main pass's loaders spent 73% of their time waiting for their own batch to
+    /// decode on the codec pool and 27% copying it into the chunk, one after the other
+    /// (gdb samples of a standalone features pass on a HYE diaPASEF run). The thread
+    /// overlaps the two. It mostly waits on the codec pool, which does the decoding, so it
+    /// adds little CPU. It stops at the end of the table, after an error, or when the stream
+    /// is dropped (the send fails).
+    fn prefetch(reader: mumdia_io::table::BatchReader) -> Result<Batches> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<RecordBatch>>(1);
+        std::thread::Builder::new()
+            .name("mumdia-chrom-prefetch".into())
+            .spawn(move || {
+                for b in reader {
+                    let failed = b.is_err();
+                    if tx.send(b).is_err() || failed {
+                        break;
+                    }
+                }
+            })
+            .context("spawning the chromatogram prefetch thread")?;
+        Ok(Batches::Prefetch(rx))
+    }
+
+    fn next(&mut self) -> Option<Result<RecordBatch>> {
+        match self {
+            Batches::Direct(r) => r.next(),
+            Batches::Prefetch(rx) => rx.recv().ok(),
+        }
     }
 }
 
@@ -2921,18 +2975,32 @@ struct LoadFault {
 ///
 /// `want_im` also reads each row's per-point 1/K0 where the table has it (the ion-mobility
 /// family, [`ChromStream::open`]).
+#[cfg(test)]
 fn load_chunk(
     ch: &TableFile,
     first: usize,
     n_rows: usize,
     want_im: bool,
 ) -> Result<(ChromChunk, NameTab)> {
+    load_chunk_with(ch, first, n_rows, want_im, false)
+}
+
+/// [`load_chunk`], with the chunk's batches decoded one ahead of the copy into the chunk
+/// when `prefetch` is set ([`Batches::prefetch`]). The chunk is the same either way: the
+/// batches arrive in order, and only when they are decoded changes.
+fn load_chunk_with(
+    ch: &TableFile,
+    first: usize,
+    n_rows: usize,
+    want_im: bool,
+    prefetch: bool,
+) -> Result<(ChromChunk, NameTab)> {
     let mut names = NameTab::default();
     if n_rows == 0 {
         return Ok((ChromChunk::new(), names));
     }
     let span = ch.span(first, n_rows)?;
-    let mut stream = ChromStream::open(&span, want_im)?;
+    let mut stream = ChromStream::open_with(&span, want_im, prefetch)?;
     let chunk = stream.read_chunk(n_rows, &mut names)?;
     Ok((chunk, names))
 }
@@ -2959,6 +3027,8 @@ struct ChunkLoader<'a> {
     loaders: usize,
     /// Read the per-point 1/K0 as well ([`load_chunk`]).
     want_im: bool,
+    /// Decode each chunk's batches one ahead of the copy ([`load_chunk_with`]).
+    prefetch: bool,
     state: std::sync::Mutex<LoadState>,
     cv: std::sync::Condvar,
     #[cfg(test)]
@@ -2994,6 +3064,7 @@ impl<'a> ChunkLoader<'a> {
             rows,
             loaders: loaders.max(1),
             want_im,
+            prefetch: false,
             state: std::sync::Mutex::new(LoadState {
                 next: 0,
                 taken: 0,
@@ -3005,6 +3076,13 @@ impl<'a> ChunkLoader<'a> {
             #[cfg(test)]
             fault: None,
         }
+    }
+
+    /// Decode each chunk's batches one ahead of the copy into the chunk, on a thread of
+    /// each loader's own ([`Batches::prefetch`]).
+    fn with_prefetch(mut self, prefetch: bool) -> ChunkLoader<'a> {
+        self.prefetch = prefetch;
+        self
     }
 
     #[cfg(test)]
@@ -3113,7 +3191,13 @@ impl<'a> ChunkLoader<'a> {
             #[cfg(test)]
             self.inject_before(j);
             let busy = Instant::now();
-            let r = load_chunk(self.ch, self.first[j], self.rows[j], self.want_im);
+            let r = load_chunk_with(
+                self.ch,
+                self.first[j],
+                self.rows[j],
+                self.want_im,
+                self.prefetch,
+            );
             #[cfg(test)]
             let r = self.inject_after(j, r);
             timers.add(&timers.loader_busy_ns, busy);
@@ -3606,7 +3690,10 @@ fn run_chunked(
     };
     // The per-point 1/K0 is decoded only for the ion-mobility family; without it the
     // loaders project exactly the columns they did before.
-    let loader = ChunkLoader::new(&ch, &chunk_first, &chunk_rows, n_loaders, im_on);
+    // Each loader decodes its chunk's next batch while it copies the current one, except
+    // on one thread (`--threads 1`), which adds no decode thread the budget did not grant.
+    let loader = ChunkLoader::new(&ch, &chunk_first, &chunk_rows, n_loaders, im_on)
+        .with_prefetch(rayon::current_num_threads() > 1);
     #[cfg(test)]
     let loader = loader.with_fault(match loaders {
         LoaderSource::Exact { fault, .. } => fault,
@@ -8171,6 +8258,62 @@ mod tests {
     /// The chunk a fault test fails; three loaders, so chunk `FAULT_AT - 1` can still be
     /// decoding when it fails.
     const FAULT_AT: usize = 3;
+
+    /// Every value a chunk holds, with its fragment names resolved, as bits.
+    fn chunk_content(c: &ChromChunk, names: &NameTab) -> Vec<String> {
+        let set = |s: &RowSet| {
+            format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                s.name_id
+                    .iter()
+                    .map(|&i| names.get(i).to_string())
+                    .collect::<Vec<_>>(),
+                s.frag_mz.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                s.frag_obs_mz
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                s.pred_int.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                s.axis_id,
+                s.int_off,
+                s.int_vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                s.im_vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                s.cand_off,
+            )
+        };
+        vec![
+            format!("{:?}", c.cids),
+            set(&c.frag),
+            set(&c.ms1),
+            format!("{:?}", c.axis_off),
+            format!(
+                "{:?}",
+                c.axis_vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_chunk_decoded_ahead_is_the_chunk_decoded_in_line() {
+        // `Batches::prefetch` only moves when each batch is decoded: every chunk of the plan
+        // must hold the same rows, names and value bits either way, with 1/K0 and without.
+        let (_dir, psms, chrom) = fault_fixture("prefetch");
+        let (first, rows) = kernel_chunk_plan(&psms, &chrom, 100, usize::MAX);
+        assert!(rows.len() > 2, "{} chunks", rows.len());
+        let ch = TableFile::open(&chrom).unwrap();
+        for want_im in [false, true] {
+            for j in 0..rows.len() {
+                let (a, na) = load_chunk_with(&ch, first[j], rows[j], want_im, false).unwrap();
+                let (b, nb) = load_chunk_with(&ch, first[j], rows[j], want_im, true).unwrap();
+                assert!(!a.cids.is_empty(), "chunk {j} is empty");
+                assert_eq!(
+                    chunk_content(&a, &na),
+                    chunk_content(&b, &nb),
+                    "chunk {j}, im {want_im}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_loader_failure_reaches_the_computation_in_chunk_order_and_never_hangs() {
