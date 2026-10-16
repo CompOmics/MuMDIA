@@ -247,6 +247,19 @@ than a number. Both are recorded in every run's `manifest.json`.
   `env/mumdia-peptdeep.yml` pins `pyarrow<20`: peptdeep 1.5.1 requires NumPy 1.x, which
   pyarrow 26 refuses at import.
 
+### Fixed
+
+- **Cross-validation folds are filled when every fold key shares a factor with the fold
+  count.** Rescoring assigns a PSM to fold `base_peptide_id % folds`, and the six-run HYE
+  diaPASEF pool carries only even `base_peptide_id` values, so `rescore.folds = 2` put every
+  PSM in fold 0 and the `nn_torch` worker stopped ("fold 0 is empty in training or
+  holdout"). When the plain modulo would leave a fold below half its share, the engine
+  (`rescoring::fold_assignment`) and the worker (`fold_keys_for`) now fold on a splitmix64
+  mix of the key and say so; any other key set keeps its folds, so results at the default 3
+  folds do not change. Measured on that pool at 2 folds (three NN seeds): 97,731 peptides at
+  1% against 98,414 at 3 folds, for 8% less rescore wall time, because the folds train in
+  parallel.
+
 ## [0.6.0] - 2026-10-11
 
 ### Added
