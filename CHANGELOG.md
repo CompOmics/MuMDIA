@@ -108,6 +108,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   current rows need instead of every MS2 frame of the run: the phase of five concurrent
   retraces fell from 96-98 to 49-66 GB. Every retrace output is bit-identical. Under
   `retrace.enabled` the centroid table's bytes and hash change; it is deleted after retrace.
+- **A faster features pass on large chromatogram tables.** Each main-pass loader decodes the
+  next batch of its chunk while it copies the current one, and a chunk's value columns are
+  assembled in parallel row blocks: on a HYE diaPASEF run the pass took 76.2 instead of 97.4 s
+  at 20 threads and 59.1 instead of 76.0 s at 120, the features table byte-identical
+  (docs/35_diapasef.md section 16).
 - **`run-experiment` matches between runs by default with a second pass**
   (`mbr.strategy = "second_pass"`, the new default; it was `"none"`). The pooled first pass
   is kept as `first_pass/scored_combined.parquet`. Every target it accepts experiment-wide
