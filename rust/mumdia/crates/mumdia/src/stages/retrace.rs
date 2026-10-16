@@ -1105,7 +1105,9 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     let skeleton = Skeleton::recorded(p.chromatograms)?;
     if skeleton.is_some_and(|k| k.ms1) && !p.cfg.ms1 {
         bail!(
-            "{}: extract left its MS1 isotope traces for retrace to rebuild              ({} with ms1 true), and retrace.ms1 is false here, so they would be published              as zeros; run retrace with retrace.ms1 = true or extract this run again",
+            "{}: extract left its MS1 isotope traces for retrace to rebuild ({} with ms1 \
+             true), and retrace.ms1 is false here, so they would be published as zeros; run \
+             retrace with retrace.ms1 = true or extract this run again",
             p.chromatograms,
             Skeleton::PARAM
         );
@@ -1601,7 +1603,10 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
         match (sent_all, written) {
             (true, Some((written, t_write))) => Ok((written, t_read, t_write)),
             _ if lost > 0 => bail!(
-                "{}: {lost} fragment rows that extract left as zeros for retrace to rebuild                  were not rebuilt, so the skeleton and this retrace disagree (other run                  windows, psms_extracted or retrace settings than the extract that wrote it);                  nothing published",
+                "{}: {lost} fragment rows that extract left as zeros for retrace to rebuild \
+                 were not rebuilt, so the skeleton and this retrace disagree (other run \
+                 windows, psms_extracted or retrace settings than the extract that wrote it); \
+                 nothing published",
                 p.chromatograms
             ),
             _ => bail!("retrace: the writer stopped before the end; nothing published"),
