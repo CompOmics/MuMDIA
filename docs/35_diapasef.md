@@ -1077,6 +1077,28 @@ retention-time order (3:46), and every lookup of a row group sorted by frame bef
 Smaller TOF buckets (16 or 4 indices) and huge pages changed nothing. A micro-benchmark on the
 run's real frames puts one lookup at about 110 ns in retrace's order and 54 ns frame by frame.
 
+### Features
+
+The main pass decodes the chromatogram table in chunks on loader threads
+(`features.chrom_loaders`, default 3) while it computes the features of the chunk before.
+gdb samples of a standalone pass on run A_02 put the loaders at 73% waiting for their own
+batch to decode on the codec pool and 27% copying it into the chunk, with the codec pool 64%
+idle: the pass was bound by the loaders. Each loader now decodes its chunk's next batch on a
+thread of its own while it copies the current one, and a chunk's value columns are assembled
+in parallel row blocks instead of on one thread. Standalone on A_02, every features table
+byte-identical:
+
+| | 20 threads | 120 threads |
+|---|---|---|
+| before | 97.4 s | 76.0 s |
+| the next batch decoded ahead | 75.7 s | 59.6 s |
+| and the columns assembled in parallel | 76.2 s (assembly 22.0 -> 9.1 s) | 59.1 s |
+
+The pass is still bound by its loaders. Five of them (`chrom_loaders` 6, of which a pool of
+four extras grants five standalone) took it to 38.4 s at 20 threads, then bound by the
+computation, for 2.6 GB more, but to 62.4 s at 120 threads, where the decode competed with the
+computation's threads for cores; the default stays 3.
+
 ### MS1 noise
 
 The dnoise tool (P. T. Garrett, J. K. Diedrich and J. R. Yates III, bioRxiv 2026,
