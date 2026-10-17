@@ -35,7 +35,7 @@ sha2 = "0.11"
 # Unpacking the ThermoRawFileParser release, which is a zip. Pure Rust, and
 # `deflate` only: shelling out would mean `unzip` on Linux and `tar`/PowerShell on
 # Windows, neither of which is guaranteed present.
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # The routing probe for a timsTOF `.d` (`thermo::is_native_diapasef`): a read-only look at
 # `analysis.tdf`, which is SQLite, to tell a diaPASEF `.d` (read natively by the engine)
 # from one that needs msconvert. The engine's own probe uses the same crate and minor
