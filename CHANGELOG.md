@@ -188,6 +188,13 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **A diaPASEF extraction gate** (`extract.gate_support_min`, opt-in): a second threshold on
+  the window-mean score plus apex intensity, MS1 and, on spectra that carry 1/K0, three 1/K0
+  terms, fitted on targets only. Six HYE diaPASEF runs at 0.845: 41% of the candidates of the
+  window-mean gate at 0.6, 26.8 instead of 41.6 min, 96,955 instead of 98,524 peptides and
+  86,877 instead of 89,973 ProteoBench ions; a window-mean threshold of 0.75 keeps 45% for
+  96,154 and 84,912. The gate diagnostics carry the window-mean score (`gate_window_mean`).
+  (docs/35_diapasef.md section 16.)
 - **Search-anchored multi-head calibration** (`rt_im_train.multihead_anchors = "search"`;
   `"auto"`, the default since the entry above, chooses it on runs short of seed anchors). The run that adapts the library (a single `run`, the
   first run of `run-experiment` under `rt_library_scope = first_run_only`, or every run under

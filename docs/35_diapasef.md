@@ -1146,6 +1146,45 @@ Two folds instead of three (`rescore.folds`, three NN seeds) gave 97,731 against
 peptides at 1% for 8% less wall time: the folds train in parallel, three processes of 16
 torch threads, so a smaller training split per fold saves little.
 
+### A diaPASEF gate
+
+The window-mean gate (`extract.gate_mode = window_mean`) was tuned on Astral and Q Exactive
+runs, where 0.6 keeps about 5% of the library and the top 10% of the candidates by the score
+hold 99.4-99.6% of the identifications. On these runs 0.6 keeps 33% of the library: the
+spectra of a diaPASEF frame are summed over the candidate's 1/K0 band, so nearly every
+candidate matches its fragments and the agreement scores sit high for most. A higher
+threshold buys time with identifications.
+
+`extract.gate_support_min` (opt-in) is a second threshold on the window-mean score plus the
+apex intensity and the MS1 monoisotopic intensity and, on spectra that carry 1/K0, three 1/K0
+terms: the apex 1/K0 error against the calibrated prediction, the 1/K0 spread of the matched
+fragments at the apex and the MS1-to-fragment 1/K0 difference. The weights come from a
+logistic regression on the gate-time quantities of runs A_02 and B_01 (a standalone extract
+with `emit_gate_diagnostics`, which carries the window-mean score), on targets only:
+identified at a run PSM q of 1% against not identified. A gate fitted on decoys could learn to
+tell them from targets and bias the FDR estimate; at every cut decoys pass at the rate of
+unidentified targets (40.7% against 40.9% at 0.845). Fitted on one run and applied to the
+other, the share of the gate-0.6 identifications kept at 45% of the candidates was 92.4-92.7%
+for the window-mean score, 94.0-94.1% with the intensity and MS1 terms and 94.5-94.8% with the
+1/K0 terms. The same score on the features after retrace kept 99.4% at 50%: retrace's raw-event
+traces separate the candidates far better than extract's centroids.
+
+Six runs, NN seed 0 (the 0.7, 0.75 and 0.8 arms on the build before the speed changes):
+
+| gate | candidates of gate 0.6 | wall | peptides at 1% | ions at k = 3 | eq. species abs epsilon | CV |
+|---|---|---|---|---|---|---|
+| window mean 0.6 | 100% | 41.6 min | 98,524 | 89,973 | 0.173 | 0.085 |
+| window mean 0.7 | 65% | 37.8 | 97,565 | 87,980 | 0.172 | 0.083 |
+| support 1.17, no 1/K0 terms | 55% | 30.4 | 97,527 | 88,220 | 0.173 | 0.084 |
+| window mean 0.75 | 45% | 30.5 | 96,154 | 84,912 | 0.171 | 0.082 |
+| support 1.215, no 1/K0 terms | 42% | 31.2 | 96,624 | 86,323 | 0.172 | 0.083 |
+| support 0.845, with 1/K0 | 41% | 26.8 | 96,955 | 86,877 | 0.171 | 0.083 |
+| window mean 0.8 | 27% | 25.7 | 92,709 | 79,575 | 0.166 | 0.079 |
+
+At the same share of candidates the diaPASEF gate loses about a third of what a higher
+window-mean threshold loses (-1.6% against -2.4% peptides, -3.4% against -5.6% ions), and the
+quantification is as good or slightly better, because what is lost is weak.
+
 ### MS1 noise
 
 The dnoise tool (P. T. Garrett, J. K. Diedrich and J. R. Yates III, bioRxiv 2026,
