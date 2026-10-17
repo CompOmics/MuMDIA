@@ -148,6 +148,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   config hash and, on a run with at least 2,500 seed anchors, its output; on a run with fewer
   the output changes. `"seed"` restores the previous behaviour (`docs/08_rt_im_train.md`
   section 4f).
+- **A native MS1 noise filter for diaPASEF, on by default** (`convert.tdf_ms1_denoise`): the
+  native reader keeps only MS1 points that form a run of at least 5 occupied mobility scans,
+  drops MS1 features no diaPASEF window reaches and the weak m/z halo of bright ions, with the
+  method and default MS1 settings of dnoise (Garrett, Diedrich and Yates, bioRxiv 2026, MIT);
+  retrace filters its raw MS1 frames the same way. MS/MS spectra are untouched. Six HYE
+  diaPASEF runs: identical identifications with 8.7% of the MS1 points; 15 min E. coli run
+  (three NN seeds): 14,121 against 14,044 peptides at 1%, entrapment FDP 0.30-0.38% against
+  0.39-0.46%. `false` restores the unfiltered MS1; only diaPASEF input reads it.
 - **`multihead_anchors = "auto"` also chooses search anchors on diaPASEF**: every adapting
   run whose converted spectra carry 1/K0 is searched once to refit its multi-head
   calibration, whatever its seed anchor count. On diaPASEF the gain does not fall with the
