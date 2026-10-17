@@ -162,6 +162,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   previous behaviour on diaPASEF (`docs/08_rt_im_train.md` section 4f).
 - One version-floor check for interpreter discovery, `doctor` and the sidecar launch
   (`Role::version_floor`, `sidecar::require_version`) (#185).
+- **`run-experiment` runs the first run's finish among the other chains** when its library
+  adaptation searched it (the RT bootstrap), and the feature-loader and retrace-reader pools
+  grow by the chains in flight under `parallel_runs = "auto"`. Six HYE diaPASEF runs, with the
+  other speed changes of this release: 41.6 instead of 49.9 min, every output bit-identical
+  (docs/35_diapasef.md section 16).
 - One extract-to-compete chain for `run` and `run-experiment` (`stages::chain`), with the
   manifest records and the lent MS2 decode of single-run `run` (#186).
 - `CLAUDE.md` corrected: `retain_top_peaks` writes an unscored sidecar and

@@ -1041,6 +1041,28 @@ identification, quantity and loss class bit-identical, in 50 against 51 minutes.
 record of the accumulator (`mem: extract hit accumulator`) reads its size after each batch,
 not inside it, so it reported 0.0 throughout.
 
+### Run order and decode pools
+
+Under `experiment.parallel_runs = "auto"` the first run's chain ran alone so that its peak
+could size the others. When the first run adapts the library with a search of itself (the RT
+bootstrap of `rt_im_train.multihead_anchors`), that search already measures a chain's peak
+in this process, so only the adaptation runs alone now and the first run's finish is the first
+item of the parallel queue. Before, the finish took about 4 min alone while one of six per-run
+pools sat idle in the phase after it.
+
+The feature loaders and retrace readers come from process-wide pools sized for a few
+concurrent calls. With five concurrent chains, three feature passes decoded on one loader
+(270-295 s against 59-104 s with three), and those passes were the last four minutes of the
+parallel phase. The pools now grow by the chains in flight while the chains run.
+
+The six runs on the build with these two changes, the features read-ahead and parallel
+assembly, the handoff release and the extract MS1 skip below: 41.6 against 49.9 min with every
+identification, quantity and ProteoBench metric bit-identical. The parallel phase starts at
+15.5 instead of 20.6 min and takes 10.0 instead of 12.9 with six chains instead of five;
+per run, features 74 instead of 170 s, retrace 289 instead of 234 s and extract 176 instead
+of 141 s, six chains contending for memory bandwidth instead of five. The peak, 88.9 GB, is
+now the phase of six concurrent extracts.
+
 ### Retrace
 
 - **Readers.** The chromatogram readers come from a process-wide budget. With one call's
