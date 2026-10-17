@@ -28,7 +28,7 @@
 //! (`convert::tims_frames::TofFrame`); the chromatograms are then streamed one row group at
 //! a time, so memory does not grow with the number of trace points.
 
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -47,6 +47,7 @@ use tracing::{info, warn};
 use crate::chromatograms::{self, Layout, Optional, Rows};
 use crate::masscal::{read_mass_cal, MassOffset};
 use crate::sched::DecoderLease;
+use crate::stages::convert::ms1_denoise::Ms1Denoise;
 use crate::stages::convert::tims_frames::{scan_band, slot_scans, sum_events, Sum, TofFrame};
 use crate::stages::convert::RawTdf;
 use crate::stages::extract::{ms1_neighbours, nearest_index, read_run_windows};
@@ -63,15 +64,31 @@ const RT_MARGIN_S: f64 = 5.0;
 /// frame RT is ~1e-4 s at the end of a gradient; frames are ~60 ms apart).
 const RT_MATCH_S: f64 = 1e-3;
 
-/// Chromatogram readers beyond each call's first, PROCESS-WIDE ([`DecoderLease`]): each
-/// holds one decoded row group of traces, so a per-call allowance would multiply with
-/// `experiment.parallel_runs`. A call takes up to its row-group count and its thread pool
-/// allows, so `--threads 1` reads on one thread; 1 + 7 is the eight readers the stage was
-/// measured with.
+/// Chromatogram readers a call takes beyond its first: up to its row-group count and its
+/// thread pool allow, so `--threads 1` reads on one thread; 1 + 7 is the eight readers the
+/// stage was measured with.
 const READER_EXTRAS: usize = 7;
 
-/// Extra readers of the [`READER_EXTRAS`] pool not currently leased.
-static READER_BUDGET: AtomicUsize = AtomicUsize::new(READER_EXTRAS);
+/// Concurrent retrace calls that each get all [`READER_EXTRAS`] from the process-wide
+/// budget ([`DecoderLease`]). Each reader holds about one decoded row group of traces
+/// (~0.1 GB), so the budget stays process-wide rather than multiplying freely with
+/// `experiment.parallel_runs`. With a budget of one call's extras, the first of five
+/// concurrent retraces on HYE diaPASEF took all seven, the others read on one thread, and
+/// the slowest spent 390 s of its 489 s reading: one call's readers then set the wall time
+/// of the whole parallel phase. An automatic `run-experiment` plan grows the budget to
+/// every concurrent chain's share while its chains run ([`grow_readers_for_chains`]).
+const READER_CALLS: usize = 4;
+
+/// Extra readers of the process-wide pool not currently leased.
+static READER_BUDGET: AtomicUsize = AtomicUsize::new(READER_EXTRAS * READER_CALLS);
+
+/// Grow the reader pool so that `chains` concurrent retrace calls can each take all
+/// [`READER_EXTRAS`], until the guard drops; `None` when the pool already holds that many.
+/// For the per-run chains of an automatic `run-experiment` plan (`sched::BudgetGrowth`).
+pub(crate) fn grow_readers_for_chains(chains: usize) -> Option<crate::sched::BudgetGrowth> {
+    let add = (READER_EXTRAS * chains).saturating_sub(READER_EXTRAS * READER_CALLS);
+    (add > 0).then(|| crate::sched::BudgetGrowth::add(&READER_BUDGET, add))
+}
 
 // `retrace.apex_features` (docs/35_diapasef.md section 6): the apex mobility agreement is
 // scored on each fragment's raw 1/K0 profile over `apex_im +/- APEX_IM_HW`, in APEX_BINS
@@ -111,6 +128,9 @@ pub struct RetraceParams<'a> {
     pub out: &'a str,
     pub cfg: &'a RetraceConfig,
     pub config_hash: &'a str,
+    /// `convert.tdf_ms1_denoise`: the MS1 frames held here pass the MS1 noise filter convert
+    /// applied, so the rebuilt MS1 traces read the same MS1 events as extract's.
+    pub ms1_denoise: bool,
 }
 
 /// The two tables retrace wrote, with the hashes their reports carry.
@@ -219,6 +239,7 @@ pub fn run_if_enabled(
         out: f.out,
         cfg: &cfg.retrace,
         config_hash,
+        ms1_denoise: cfg.convert.tdf_ms1_denoise,
     })?;
     // The centroid table is read by nothing once the rebuilt one is written (12-17 GB per
     // HYE diaPASEF run).
@@ -235,6 +256,86 @@ enum Kind {
     Copy,
     Frag,
     Ms1,
+}
+
+/// How retrace treats one chromatogram row: rebuilt from the raw events as a fragment or an
+/// MS1 isotope trace, or copied as extract wrote it. A row is rebuilt when it has a grid,
+/// its precursor and its own m/z are finite, its candidate has a finite 1/K0 centre, and it
+/// is an MS1 row under `retrace.ms1` or a fragment with a positive prediction. Extract
+/// evaluates the same rule when it writes a skeleton table ([`Skeleton`]), so a row it
+/// leaves as zeros is one this stage rebuilds.
+fn row_kind(
+    has_points: bool,
+    precursor_mz: f64,
+    centre: f64,
+    row_mz: f64,
+    name: &str,
+    predicted_intensity: f32,
+    ms1: bool,
+) -> Kind {
+    let ok = has_points && precursor_mz.is_finite() && centre.is_finite() && row_mz.is_finite();
+    match (ok, name.starts_with("ms1_")) {
+        (true, true) if ms1 => Kind::Ms1,
+        (true, false) if predicted_intensity > 0.0 => Kind::Frag,
+        _ => Kind::Copy,
+    }
+}
+
+/// A centroid table written for this stage to rebuild (`ExtractParams::retrace_skeleton`):
+/// the traces of the rows retrace rebuilds from raw events are left as zeros on their axis,
+/// because retrace reads only the axis and the keys of those rows, and decoding centroid
+/// values it then discards was most of its read time (95% of the decode on a HYE diaPASEF
+/// run). `ms1`: whether the MS1 isotope rows were among them (`retrace.ms1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Skeleton {
+    pub ms1: bool,
+}
+
+impl Skeleton {
+    /// The report parameter of a skeleton centroid table: `{"ms1": bool, "rows": n}`.
+    pub const PARAM: &'static str = "retrace_skeleton";
+
+    /// Whether extract leaves the row as zeros: exactly the rows `row_kind` rebuilds.
+    pub fn zeroes(
+        &self,
+        has_points: bool,
+        precursor_mz: f64,
+        centre: f64,
+        row_mz: f64,
+        name: &str,
+        predicted_intensity: f32,
+    ) -> bool {
+        row_kind(
+            has_points,
+            precursor_mz,
+            centre,
+            row_mz,
+            name,
+            predicted_intensity,
+            self.ms1,
+        ) != Kind::Copy
+    }
+
+    /// The skeleton a centroid table records in its report, if any.
+    pub fn recorded(path: &str) -> Result<Option<Skeleton>> {
+        let Ok(text) = std::fs::read_to_string(format!("{path}.report.json")) else {
+            return Ok(None);
+        };
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("{path}.report.json is not valid JSON"))?;
+        match v.get("params").and_then(|p| p.get(Skeleton::PARAM)) {
+            None => Ok(None),
+            Some(s) => {
+                let ms1 = s.get("ms1").and_then(|x| x.as_bool()).ok_or_else(|| {
+                    anyhow!(
+                        "{path}.report.json: {} without a boolean 'ms1'",
+                        Skeleton::PARAM
+                    )
+                })?;
+                Ok(Some(Skeleton { ms1 }))
+            }
+        }
+    }
 }
 
 /// One rebuilt row: its kind, its intensity and 1/K0 lists, the raw events summed, the
@@ -509,6 +610,52 @@ fn point_sum(
     best
 }
 
+/// The frame sums of one MS1 row, kept while its grid is walked. An MS1 grid point takes the
+/// largest sum over its nearest MS1 frame and `extract.ms1_scan_halfwidth` neighbours either
+/// side, and consecutive points of a row share all of those frames but one, so each MS1
+/// frame of a row was summed `2 * halfwidth + 1` times (3 at the default): about two thirds
+/// of retrace's MS1 lookups. Every point of a row sums the same TOF window in the same scans,
+/// so a frame's sum does not depend on the point that asks, and [`Ms1Seen::point_sum`]
+/// returns bit for bit what [`point_sum`] returns.
+#[derive(Default)]
+struct Ms1Seen {
+    /// (frame address, its sum), oldest first.
+    sums: Vec<(usize, Sum)>,
+}
+
+impl Ms1Seen {
+    /// The grid walks forward in retention time, so only the last few frames come back.
+    const KEEP: usize = 16;
+
+    fn point_sum(
+        &mut self,
+        frames: &[&TofFrame],
+        scans: &[(usize, usize)],
+        tof: (u32, u32),
+        scan_im: &[f64],
+    ) -> Sum {
+        let mut best = Sum::default();
+        for f in frames {
+            let key = *f as *const TofFrame as usize;
+            let s = match self.sums.iter().rev().find(|(k, _)| *k == key) {
+                Some(&(_, s)) => s,
+                None => {
+                    let s = sum_events(f, scans, tof.0, tof.1, scan_im);
+                    if self.sums.len() == Self::KEEP {
+                        self.sums.remove(0);
+                    }
+                    self.sums.push((key, s));
+                    s
+                }
+            };
+            if s.inten > best.inten {
+                best = s;
+            }
+        }
+        best
+    }
+}
+
 /// Per-candidate lookups indexed by `candidate_id`, NaN where absent.
 fn by_candidate(ids: &[u32], vals: impl Iterator<Item = f64>, n: usize) -> Vec<f64> {
     let mut v = vec![f64::NAN; n];
@@ -535,95 +682,105 @@ fn median(mut v: Vec<f64>) -> f64 {
     }
 }
 
-/// Re-choose the apex RT and 1/K0 centre of every rank-0 candidate on the raw events
-/// (`retrace.repick`). Returns the picks `(candidate, apex RT, 1/K0 centre)`, ascending in
-/// candidate id.
+/// What the re-pick reads once per call of the stage (`retrace.repick`): extract's top-K
+/// peak sidecar `(candidate, rank, apex RT)` and every candidate's predicted fragment rows
+/// `(candidate, calibrated m/z, predicted intensity)`, both sorted by candidate.
+struct RepickData {
+    alt: Vec<(u32, i32, f64)>,
+    fr: Vec<(u32, f64, f64)>,
+}
+
+/// A re-pick: candidate, apex RT, 1/K0 centre.
+type Pick = (u32, f64, f64);
+/// One scored peak of the re-pick dump: candidate, order (0 = extract's apex, then the
+/// sidecar ranks), apex RT, score.
+type ScoredPeak = (u32, u32, f64, f64);
+
+impl RepickData {
+    fn load(p: &RetraceParams, ch: &TableFile, mass_off: &MassOffset) -> Result<RepickData> {
+        let pk_path = format!("{}.peaks.parquet", p.psms_extracted);
+        let pk = TableFile::open(&pk_path).with_context(|| {
+            format!(
+                "retrace.repick needs extract's top-K peak sidecar {pk_path} \
+                 (extract.retain_top_peaks >= 2)"
+            )
+        })?;
+        let mut alt: Vec<(u32, i32, f64)> = pk
+            .u32("candidate_id")?
+            .into_iter()
+            .zip(pk.i32("peak_rank")?)
+            .zip(pk.f64("apex_rt")?)
+            .map(|((c, r), t)| (c, r, t))
+            .collect();
+        alt.sort_by_key(|x| (x.0, x.1));
+        // Fragment rows (predicted, not MS1) by candidate: calibrated m/z and prediction.
+        // These are plain columns in both layouts.
+        let (name_id, names) = ch.str_interned("frag_name")?;
+        let is_ms1: Vec<bool> = names.iter().map(|n| n.starts_with("ms1")).collect();
+        let (f_cid, f_mz, f_pi) = (
+            ch.u32("candidate_id")?,
+            ch.f64("frag_mz")?,
+            ch.f32("predicted_intensity")?,
+        );
+        let mut fr: Vec<(u32, f64, f64)> = (0..ch.nrows)
+            .filter(|&r| f_pi[r] > 0.0 && !is_ms1[name_id[r] as usize])
+            .map(|r| {
+                (
+                    f_cid[r],
+                    f_mz[r] * mass_off.factor_at(f_mz[r]),
+                    f_pi[r] as f64,
+                )
+            })
+            .collect();
+        fr.sort_by_key(|x| x.0);
+        Ok(RepickData { alt, fr })
+    }
+}
+
+/// Re-choose the apex RT and 1/K0 centre of the rank-0 candidates of the psms_extracted
+/// `rows` on the raw events (`retrace.repick`): the picks `(candidate, apex RT, 1/K0 centre)`
+/// in the order of `rows`, and with `dump` every scored peak `(candidate, order 0 = extract's
+/// apex then the sidecar ranks, apex RT, score)`, which `MUMDIA_REPICK_DUMP` writes. Every
+/// frame that isolates a candidate's precursor within [`REPICK_RT_HW_S`] of its peaks must be
+/// decoded in `frames`.
 #[allow(clippy::too_many_arguments)]
-fn repick(
-    p: &RetraceParams,
+fn repick_rows(
     raw: &RawTdf,
-    ch: &TableFile,
-    mass_off: &MassOffset,
+    data: &RepickData,
     frag_tol: f64,
+    rows: &[usize],
     ex_cid: &[u32],
     ex_rank: &[i32],
     apex_rt: &[f64],
     pmz: &[f64],
-    im_win: Option<(&[f32], &[f32])>,
+    (im_lo, im_hi): (&[f32], &[f32]),
     ms2_rt: &[f64],
     ms2_fi: &[usize],
     frames: &[Option<TofFrame>],
     scan_im: &[f64],
-) -> Result<Vec<(u32, f64, f64)>> {
-    let Some((im_lo, im_hi)) = im_win else {
-        warn!(
-            run_windows = p.run_windows,
-            "retrace: retrace.repick needs the 1/K0 windows of run_windows, and this run has \
-             none; extract's apex is kept"
-        );
-        return Ok(Vec::new());
-    };
+    dump: bool,
+) -> (Vec<Pick>, Vec<ScoredPeak>) {
+    let (alt, fr) = (&data.alt, &data.fr);
     let n_cand = pmz.len();
-    let pk_path = format!("{}.peaks.parquet", p.psms_extracted);
-    let pk = TableFile::open(&pk_path).with_context(|| {
-        format!(
-            "retrace.repick needs extract's top-K peak sidecar {pk_path} \
-             (extract.retain_top_peaks >= 2)"
-        )
-    })?;
-    let mut alt: Vec<(u32, i32, f64)> = pk
-        .u32("candidate_id")?
-        .into_iter()
-        .zip(pk.i32("peak_rank")?)
-        .zip(pk.f64("apex_rt")?)
-        .map(|((c, r), t)| (c, r, t))
-        .collect();
-    alt.sort_by_key(|x| (x.0, x.1));
-    // Fragment rows (predicted, not MS1) by candidate: calibrated m/z and prediction. These
-    // are plain columns in both layouts.
-    let (name_id, names) = ch.str_interned("frag_name")?;
-    let is_ms1: Vec<bool> = names.iter().map(|n| n.starts_with("ms1")).collect();
-    let (f_cid, f_mz, f_pi) = (
-        ch.u32("candidate_id")?,
-        ch.f64("frag_mz")?,
-        ch.f32("predicted_intensity")?,
-    );
-    let mut fr: Vec<(u32, f64, f64)> = (0..ch.nrows)
-        .filter(|&r| f_pi[r] > 0.0 && !is_ms1[name_id[r] as usize])
-        .map(|r| {
-            (
-                f_cid[r],
-                f_mz[r] * mass_off.factor_at(f_mz[r]),
-                f_pi[r] as f64,
-            )
-        })
-        .collect();
-    drop((name_id, names, f_cid, f_mz, f_pi));
-    fr.sort_by_key(|x| x.0);
     let range = |v: &[(u32, i32, f64)], c: u32| {
         v.partition_point(|x| x.0 < c)..v.partition_point(|x| x.0 <= c)
     };
     let frange = |c: u32| fr.partition_point(|x| x.0 < c)..fr.partition_point(|x| x.0 <= c);
     let tol = frag_tol * 1e-6;
-    // Diagnostic: MUMDIA_REPICK_DUMP=<path> writes every scored peak (candidate, order
-    // 0 = extract's apex then the sidecar ranks, apex RT, score). Off by default; the pick is
-    // the same either way. It is what the RT-prior counterfactual was measured from
-    // (docs/35_diapasef.md section 6).
-    let dump = std::env::var("MUMDIA_REPICK_DUMP").ok();
     // (pick: candidate, apex RT, 1/K0 centre; dumped rows: candidate, order, apex RT, score)
-    type Scored = (Option<(u32, f64, f64)>, Vec<(u32, u32, f64, f64)>);
-    let scored: Vec<Scored> = (0..ex_cid.len())
-        .into_par_iter()
-        .map(|i| {
+    type Scored = (Option<Pick>, Vec<ScoredPeak>);
+    let scored: Vec<Scored> = rows
+        .par_iter()
+        .map(|&i| {
             let (c, ci) = (ex_cid[i], ex_cid[i] as usize);
-            let mut rows: Vec<(u32, u32, f64, f64)> = Vec::new();
+            let mut dumped: Vec<ScoredPeak> = Vec::new();
             if ex_rank[i] != 0 || ci >= n_cand {
-                return (None, rows);
+                return (None, dumped);
             }
             let (a, b) = (im_lo[ci] as f64, im_hi[ci] as f64);
             let fs = &fr[frange(c)];
             if !(a.is_finite() && b > a && pmz[ci].is_finite()) || fs.is_empty() {
-                return (None, rows);
+                return (None, dumped);
             }
             let wins: Vec<(u32, u32)> = fs
                 .iter()
@@ -631,7 +788,7 @@ fn repick(
                 .collect();
             let pred: Vec<f64> = fs.iter().map(|x| x.2).collect();
             let band = scan_band(scan_im, a, b);
-            let peaks = std::iter::once(apex_rt[ci]).chain(alt[range(&alt, c)].iter().map(|x| x.2));
+            let peaks = std::iter::once(apex_rt[ci]).chain(alt[range(alt, c)].iter().map(|x| x.2));
             // First maximum wins, so ties go to extract's apex, then to the lower rank.
             let mut best = (0.0f64, f64::NAN, f64::NAN);
             for (order, t0) in peaks.enumerate().filter(|(_, t)| t.is_finite()) {
@@ -643,32 +800,64 @@ fn repick(
                     .filter(|(_, s)| !s.is_empty())
                     .collect();
                 let (s, cen) = joint_score(&fl, &wins, &pred, scan_im, a, b);
-                if dump.is_some() {
-                    rows.push((c, order as u32, t0, s));
+                if dump {
+                    dumped.push((c, order as u32, t0, s));
                 }
                 if s > best.0 {
                     best = (s, t0, cen);
                 }
             }
-            ((best.0 > 0.0).then_some((c, best.1, best.2)), rows)
+            ((best.0 > 0.0).then_some((c, best.1, best.2)), dumped)
         })
         .collect();
-    if let Some(path) = &dump {
-        let r: Vec<&(u32, u32, f64, f64)> = scored.iter().flat_map(|x| &x.1).collect();
-        write_table(
-            path,
-            vec![
-                Col::U32("candidate_id".into(), r.iter().map(|x| x.0).collect()),
-                Col::U32("order".into(), r.iter().map(|x| x.1).collect()),
-                Col::F64("apex_rt".into(), r.iter().map(|x| x.2).collect()),
-                Col::F64("score".into(), r.iter().map(|x| x.3).collect()),
-            ],
-        )?;
-        info!(rows = r.len(), path, "retrace: re-pick scores dumped");
+    let mut picks = Vec::new();
+    let mut dumped = Vec::new();
+    for (pick, rows) in scored {
+        picks.extend(pick);
+        dumped.extend(rows);
     }
-    let mut picks: Vec<(u32, f64, f64)> = scored.into_iter().filter_map(|x| x.0).collect();
-    picks.sort_by_key(|x| x.0);
-    Ok(picks)
+    (picks, dumped)
+}
+
+/// The MS2 frames that isolate a window in `want` (inside the RT range), decoded into
+/// `frames`, and every other decoded MS2 frame dropped: retrace holds the frames of the
+/// windows its current candidates sit in, not the run. Returns the frames decoded.
+#[allow(clippy::too_many_arguments)]
+fn hold_window_frames(
+    frames: &mut [Option<TofFrame>],
+    want: &[bool],
+    ms2_wins: &[Vec<u16>],
+    ms2_fi: &[usize],
+    ms2_rt: &[f64],
+    (rt_min, rt_max): (f64, f64),
+    raw: &RawTdf,
+    path: &str,
+) -> Result<usize> {
+    let mut to_load = Vec::new();
+    for (j, ws) in ms2_wins.iter().enumerate() {
+        let fi = ms2_fi[j];
+        let needed = (rt_min..=rt_max).contains(&ms2_rt[j]) && ws.iter().any(|&w| want[w as usize]);
+        match (needed, frames[fi].is_some()) {
+            (true, false) => to_load.push(fi),
+            (false, true) => frames[fi] = None,
+            _ => {}
+        }
+    }
+    let loaded: Vec<(usize, TofFrame)> = to_load
+        .par_iter()
+        .map(|&fi| -> Result<(usize, TofFrame)> {
+            let f = raw
+                .reader
+                .get(fi)
+                .map_err(|e| anyhow!("{path}: frame {fi}: {e}"))?;
+            Ok((fi, TofFrame::new(f)?))
+        })
+        .collect::<Result<_>>()?;
+    let n = loaded.len();
+    for (fi, f) in loaded {
+        frames[fi] = Some(f);
+    }
+    Ok(n)
 }
 
 /// What [`patch_psms`] changed.
@@ -904,6 +1093,35 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
             p.raw
         );
     }
+    // The isolation windows of the MS2 frames, for holding them window by window below: the
+    // distinct (isolation m/z, width) of every slot as inclusive m/z bounds, and per MS2 frame
+    // (in `ms2_fi` order) the windows its slots isolate.
+    let mut win_of: std::collections::BTreeMap<(u64, u64), u16> = std::collections::BTreeMap::new();
+    let mut win_bounds: Vec<(f64, f64)> = Vec::new();
+    let mut ms2_wins: Vec<Vec<u16>> = Vec::with_capacity(ms2_fi.len());
+    for &i in &ms2_fi {
+        let q = &heads[i].quadrupole_settings;
+        let mut ws: Vec<u16> = Vec::with_capacity(q.isolation_mz.len());
+        for k in 0..q.isolation_mz.len() {
+            let key = (q.isolation_mz[k].to_bits(), q.isolation_width[k].to_bits());
+            let w = match win_of.get(&key) {
+                Some(&w) => w,
+                None => {
+                    let half = q.isolation_width[k] / 2.0;
+                    win_bounds.push((q.isolation_mz[k] - half, q.isolation_mz[k] + half));
+                    let w = u16::try_from(win_bounds.len() - 1)
+                        .map_err(|_| anyhow!("{}: more than 65,535 isolation windows", p.raw))?;
+                    win_of.insert(key, w);
+                    w
+                }
+            };
+            ws.push(w);
+        }
+        ws.sort_unstable();
+        ws.dedup();
+        ms2_wins.push(ws);
+    }
+    drop(win_of);
     let n_scans = raw
         .reader
         .get(ms1_fi[0])
@@ -918,6 +1136,12 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
             p.raw
         );
     }
+    // The MS1 noise filter convert applied (`convert.tdf_ms1_denoise`), on the MS1 frames
+    // held here as well, built from the run's diaPASEF windows.
+    let ms1_denoise = (p.ms1_denoise && p.cfg.ms1).then(|| {
+        let windows = raw.reader.get_dia_windows().unwrap_or_default();
+        Ms1Denoise::new(&windows, n_scans, |m| raw.tof_of(m), |s| raw.im_of_scan(s))
+    });
 
     // Per candidate: precursor m/z, the windows, and the band centre.
     let lib = TableFile::open(p.library_precursors)?;
@@ -925,8 +1149,10 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     let n_cand = lib_cid.iter().map(|&c| c as usize + 1).max().unwrap_or(0);
     let pmz = by_candidate(&lib_cid, lib.f64("precursor_mz")?.into_iter(), n_cand);
     drop((lib, lib_cid));
-    let win = read_run_windows(p.run_windows, n_cand)?;
-    let mut centre: Vec<f64> = match &win.im_cal {
+    let mut win = read_run_windows(p.run_windows, n_cand)?;
+    // Owned here and lent to each span in turn: the re-pick of a span's candidates moves
+    // their apex and centre just before their rows are rebuilt.
+    let mut centre_own: Vec<f64> = match &win.im_cal {
         Some(v) => v.iter().map(|x| x.unwrap_or(f64::NAN)).collect(),
         None => vec![f64::NAN; n_cand],
     };
@@ -938,16 +1164,16 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
         ex.f64("apex_rt")?,
     );
     drop(ex);
-    let mut apex_rt = vec![f64::NAN; n_cand];
+    let mut apex_own = vec![f64::NAN; n_cand];
     for i in 0..ex_cid.len() {
         if ex_rank[i] != 0 {
             continue;
         }
-        if let Some(slot) = apex_rt.get_mut(ex_cid[i] as usize) {
+        if let Some(slot) = apex_own.get_mut(ex_cid[i] as usize) {
             *slot = ex_rt[i];
         }
         if let Some(v) = ex_im[i].filter(|v| v.is_finite()) {
-            if let Some(slot) = centre.get_mut(ex_cid[i] as usize) {
+            if let Some(slot) = centre_own.get_mut(ex_cid[i] as usize) {
                 *slot = v;
             }
         }
@@ -956,6 +1182,19 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     let ch = TableFile::open(p.chromatograms)?;
     let layout = Layout::of(&ch)?;
     let opt = Optional::of(&ch);
+    // A skeleton table holds zeros where this stage rebuilds; one written for MS1 rows can
+    // only be read with them rebuilt.
+    let skeleton = Skeleton::recorded(p.chromatograms)?;
+    if skeleton.is_some_and(|k| k.ms1) && !p.cfg.ms1 {
+        bail!(
+            "{}: extract left its MS1 isotope traces for retrace to rebuild ({} with ms1 \
+             true), and retrace.ms1 is false here, so they would be published as zeros; run \
+             retrace with retrace.ms1 = true or extract this run again",
+            p.chromatograms,
+            Skeleton::PARAM
+        );
+    }
+    let lost_skeleton_rows = AtomicU64::new(0);
     if !opt.im {
         bail!(
             "{}: no per-point 1/K0 list; retrace needs the chromatograms of a diaPASEF run \
@@ -995,56 +1234,89 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
         rt_min - RT_MARGIN_S - trace_pad,
         rt_max + RT_MARGIN_S + trace_pad,
     );
-    // All needed frames are resident, so the peak is about the run's raw size (21 GB on the
-    // E. coli diaPASEF run, 36 GB on a HYE run). Past that: decode RT blocks of frames and
-    // visit the rows by RT, which needs the rows grouped by RT (an external sort) first.
-    let frames: Vec<Option<TofFrame>> = heads
+    // The MS1 frames inside that range are decoded once and held: every MS1 trace reads them.
+    // The MS2 frames are held window by window in the span loop below
+    // (`hold_window_frames`): a span's candidates are consecutive in precursor m/z, so it
+    // needs only the frames of the windows that isolate that stretch, and retrace holds a
+    // window's frames instead of the run's (36-39 GB per HYE run when it held them all).
+    let mut frames_own: Vec<Option<TofFrame>> = heads
         .par_iter()
         .enumerate()
         .map(|(i, h)| -> Result<Option<TofFrame>> {
-            if !(rt_min..=rt_max).contains(&h.rt_in_seconds) {
+            // MS1 frames feed only the MS1 traces.
+            if h.ms_level != MSLevel::MS1
+                || !p.cfg.ms1
+                || !(rt_min..=rt_max).contains(&h.rt_in_seconds)
+            {
                 return Ok(None);
             }
-            let f = raw
+            let mut f = raw
                 .reader
                 .get(i)
                 .map_err(|e| anyhow!("{}: frame {i}: {e}", p.raw))?;
+            if let Some(d) = ms1_denoise.as_ref() {
+                d.apply_to_frame(&mut f);
+            }
             Ok(Some(TofFrame::new(f)?))
         })
         .collect::<Result<_>>()?;
     drop(heads);
-    let decoded = frames.iter().filter(|f| f.is_some()).count();
-    info!(frames = decoded, rt_min, rt_max, "retrace: frames decoded");
+    let mut decoded = frames_own.iter().filter(|f| f.is_some()).count();
+    info!(
+        ms1_frames = decoded,
+        rt_min, rt_max, "retrace: MS1 frames decoded"
+    );
     let t_decoded = t0.elapsed().as_millis();
 
     // `retrace.repick`: each candidate's apex RT and 1/K0 centre are chosen again on the raw
-    // events, among extract's apex and the top-K sidecar peaks, before any trace is built.
-    let picks = if p.cfg.repick {
-        let im_win = match (&win.im_lo, &win.im_hi) {
-            (Some(lo), Some(hi)) => Some((lo.as_slice(), hi.as_slice())),
-            _ => None,
-        };
-        let picks = repick(
-            &p, &raw, &ch, &mass_off, frag_tol, &ex_cid, &ex_rank, &apex_rt, &pmz, im_win, &ms2_rt,
-            &ms2_fi, &frames, &scan_im,
-        )?;
-        for &(c, t, im) in &picks {
-            apex_rt[c as usize] = t;
-            centre[c as usize] = im;
+    // events, among extract's apex and the top-K sidecar peaks, before its rows are rebuilt.
+    // It runs per span, on the span's frames, over a contiguous range of candidates (rank-0
+    // psms_extracted rows ordered by candidate), so every candidate is re-picked once.
+    let repick_data = match (p.cfg.repick, &win.im_lo, &win.im_hi) {
+        (false, _, _) => None,
+        (true, Some(_), Some(_)) => Some(RepickData::load(&p, &ch, &mass_off)?),
+        (true, _, _) => {
+            warn!(
+                run_windows = p.run_windows,
+                "retrace: retrace.repick needs the 1/K0 windows of run_windows, and this run \
+                 has none; extract's apex is kept"
+            );
+            None
         }
-        info!(
-            picked = picks.len(),
-            "retrace: apex re-picked on the raw events"
-        );
-        picks
-    } else {
-        Vec::new()
     };
-    let t_repick = t0.elapsed().as_millis() - t_decoded;
+    let (im_lo_own, im_hi_own) = (
+        win.im_lo.take().unwrap_or_default(),
+        win.im_hi.take().unwrap_or_default(),
+    );
+    let mut ex_order: Vec<usize> = (0..ex_cid.len()).filter(|&i| ex_rank[i] == 0).collect();
+    ex_order.sort_by_key(|&i| ex_cid[i]);
+    let dump_path = std::env::var("MUMDIA_REPICK_DUMP").ok();
+    let mut picks: Vec<(u32, f64, f64)> = Vec::new();
+    let mut dumped: Vec<(u32, u32, f64, f64)> = Vec::new();
+    let mut t_repick = 0u128;
+    let mut t_windows = 0u128;
+    // The windows whose (inclusive) m/z bounds reach the precursors of candidates `lo..hi`,
+    // widened by a hair so a precursor on a window edge never misses its window.
+    let want_windows = |lo: usize, hi: usize| -> Vec<bool> {
+        const EDGE: f64 = 1e-6;
+        let mut want = vec![false; win_bounds.len()];
+        let (mut a, mut b) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &m in &pmz[lo.min(pmz.len())..hi.min(pmz.len())] {
+            if m.is_finite() {
+                (a, b) = (a.min(m), b.max(m));
+            }
+        }
+        if a <= b {
+            for (w, &(l, u)) in win_bounds.iter().enumerate() {
+                want[w] = l <= b + EDGE && u >= a - EDGE;
+            }
+        }
+        want
+    };
     // The windows' RT bounds stay only for padded traces, which are counted inside them.
     let pad_win: Option<(Vec<f64>, Vec<f64>)> =
         (trace_pad > 0.0).then(|| (win.rt_lo.clone(), win.rt_hi.clone()));
-    drop((ex_cid, ex_rank, ex_im, ex_rt, win));
+    drop((ex_im, ex_rt, win));
 
     let hw = p.cfg.im_half_width;
     let half1 = p.extract.ms1_scan_halfwidth;
@@ -1052,8 +1324,8 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     let ftol = frag_tol * 1e-6;
     let want_prof = p.cfg.apex_features;
     let (ms1_rt, ms1_fi, ms2_rt, ms2_fi) = (&ms1_rt, &ms1_fi, &ms2_rt, &ms2_fi);
-    let (frames, scan_im, raw, mass_off) = (&frames, &scan_im, &raw, &mass_off);
-    let (centre, apex_rt, pmz) = (&centre, &apex_rt, &pmz);
+    let (scan_im, raw, mass_off) = (&scan_im, &raw, &mass_off);
+    let pmz = &pmz;
     let pad_win = &pad_win;
 
     // The input's actual row groups: each is read whole, so a v2 table is always read from
@@ -1131,10 +1403,60 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
         });
         let mut enc = chromatograms::Encoder::new(rg_rows);
         let mut sent_all = true;
+        let mut next_lo = 0usize;
         for i in 0..n_spans {
             let span = rx_ins[i % n_readers]
                 .recv()
                 .map_err(|_| anyhow!("retrace: a reader stopped early"))??;
+            // Every candidate up to this span's last: the frames of their windows held, then
+            // their re-pick, so `apex_rt` and `centre` are final for every row of the span.
+            let hi = span
+                .cid
+                .last()
+                .map_or(next_lo, |&c| c as usize + 1)
+                .max(next_lo);
+            let tw = Instant::now();
+            decoded += hold_window_frames(
+                &mut frames_own,
+                &want_windows(next_lo, hi),
+                &ms2_wins,
+                ms2_fi,
+                ms2_rt,
+                (rt_min, rt_max),
+                raw,
+                p.raw,
+            )?;
+            t_windows += tw.elapsed().as_millis();
+            if let Some(data) = &repick_data {
+                let tr = Instant::now();
+                let a = ex_order.partition_point(|&r| (ex_cid[r] as usize) < next_lo);
+                let b = ex_order.partition_point(|&r| (ex_cid[r] as usize) < hi);
+                let (pk, rows) = repick_rows(
+                    raw,
+                    data,
+                    frag_tol,
+                    &ex_order[a..b],
+                    &ex_cid,
+                    &ex_rank,
+                    &apex_own,
+                    pmz,
+                    (&im_lo_own, &im_hi_own),
+                    ms2_rt,
+                    ms2_fi,
+                    &frames_own,
+                    scan_im,
+                    dump_path.is_some(),
+                );
+                for &(c, t, im) in &pk {
+                    apex_own[c as usize] = t;
+                    centre_own[c as usize] = im;
+                }
+                picks.extend(pk);
+                dumped.extend(rows);
+                t_repick += tr.elapsed().as_millis();
+            }
+            next_lo = hi;
+            let (frames, centre, apex_rt) = (&frames_own, &centre_own, &apex_own);
             let tp = Instant::now();
             let n = span.cid.len();
             // Rows of one candidate are contiguous and share one grid, so the frames and the
@@ -1201,18 +1523,31 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                         .map(|r| {
                             let pts = &s.rt[r][..];
                             let c = s.cid[r] as usize;
-                            let ok = !pts.is_empty()
-                                && c < pmz.len()
-                                && pmz[c].is_finite()
-                                && centre[c].is_finite()
-                                && s.fmz[r].is_finite();
-                            let is_ms1 = s.name[r].starts_with("ms1_");
-                            let kind = match (ok, is_ms1) {
-                                (true, true) if p.cfg.ms1 => Kind::Ms1,
-                                (true, false) if s.pint[r] > 0.0 => Kind::Frag,
-                                _ => Kind::Copy,
+                            let kind = if c < pmz.len() {
+                                row_kind(
+                                    !pts.is_empty(),
+                                    pmz[c],
+                                    centre[c],
+                                    s.fmz[r],
+                                    &s.name[r],
+                                    s.pint[r],
+                                    p.cfg.ms1,
+                                )
+                            } else {
+                                Kind::Copy
                             };
                             if kind == Kind::Copy {
+                                // In a skeleton table a fragment row with a grid and an
+                                // all-zero trace is one extract left for this stage to
+                                // rebuild (an observed fragment always has a non-zero
+                                // point). Copying it would publish zeros as the trace.
+                                if skeleton.is_some()
+                                    && !pts.is_empty()
+                                    && !s.name[r].starts_with("ms1_")
+                                    && s.int[r].iter().all(|&x| x == 0.0)
+                                {
+                                    lost_skeleton_rows.fetch_add(1, Ordering::Relaxed);
+                                }
                                 return RowOut {
                                     kind,
                                     int: s.int[r].clone(),
@@ -1242,11 +1577,16 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                                 (Vec::with_capacity(pts.len()), Vec::with_capacity(pts.len()));
                             let (mut ev, mut miss) = (0u64, 0u64);
                             let (mut sw, mut stof) = (0.0f64, 0.0f64);
+                            let mut seen = Ms1Seen::default();
                             for (fs, scans) in points {
                                 if fs.is_empty() {
                                     miss += 1;
                                 }
-                                let sum = point_sum(fs, scans, tof, scan_im);
+                                let sum = if frag {
+                                    point_sum(fs, scans, tof, scan_im)
+                                } else {
+                                    seen.point_sum(fs, scans, tof, scan_im)
+                                };
                                 ev += sum.n as u64;
                                 let hit = sum.inten > 0.0;
                                 ints.push(if hit { sum.inten as f32 } else { 0.0 });
@@ -1392,6 +1732,49 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                 break;
             }
         }
+        // Candidates after the last span carry no rows; they are re-picked for the
+        // psms_extracted patch, on the frames of their windows.
+        if let (Some(data), true) = (&repick_data, sent_all && next_lo < pmz.len()) {
+            let tw = Instant::now();
+            decoded += hold_window_frames(
+                &mut frames_own,
+                &want_windows(next_lo, pmz.len()),
+                &ms2_wins,
+                ms2_fi,
+                ms2_rt,
+                (rt_min, rt_max),
+                raw,
+                p.raw,
+            )?;
+            t_windows += tw.elapsed().as_millis();
+            let tr = Instant::now();
+            let a = ex_order.partition_point(|&r| (ex_cid[r] as usize) < next_lo);
+            let (pk, rows) = repick_rows(
+                raw,
+                data,
+                frag_tol,
+                &ex_order[a..],
+                &ex_cid,
+                &ex_rank,
+                &apex_own,
+                pmz,
+                (&im_lo_own, &im_hi_own),
+                ms2_rt,
+                ms2_fi,
+                &frames_own,
+                scan_im,
+                dump_path.is_some(),
+            );
+            picks.extend(pk);
+            dumped.extend(rows);
+            t_repick += tr.elapsed().as_millis();
+        }
+        // A skeleton row this stage did not rebuild would be published as zeros: nothing is
+        // published then (the writer drops its file without the end marker).
+        let lost = lost_skeleton_rows.load(Ordering::Relaxed);
+        if lost > 0 {
+            sent_all = false;
+        }
         // The chunk that fixes the schema of a table without rows (empty otherwise), then
         // the end marker.
         if sent_all {
@@ -1413,10 +1796,46 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
             .map_err(|_| anyhow!("retrace: the writer panicked"))??;
         match (sent_all, written) {
             (true, Some((written, t_write))) => Ok((written, t_read, t_write)),
+            _ if lost > 0 => bail!(
+                "{}: {lost} fragment rows that extract left as zeros for retrace to rebuild \
+                 were not rebuilt, so the skeleton and this retrace disagree (other run \
+                 windows, psms_extracted or retrace settings than the extract that wrote it); \
+                 nothing published",
+                p.chromatograms
+            ),
             _ => bail!("retrace: the writer stopped before the end; nothing published"),
         }
     })?;
     drop(lease);
+    drop(frames_own);
+    picks.sort_by_key(|x| x.0);
+    if repick_data.is_some() {
+        info!(
+            picked = picks.len(),
+            "retrace: apex re-picked on the raw events"
+        );
+    }
+    if let Some(path) = &dump_path {
+        write_table(
+            path,
+            vec![
+                Col::U32("candidate_id".into(), dumped.iter().map(|x| x.0).collect()),
+                Col::U32("order".into(), dumped.iter().map(|x| x.1).collect()),
+                Col::F64("apex_rt".into(), dumped.iter().map(|x| x.2).collect()),
+                Col::F64("score".into(), dumped.iter().map(|x| x.3).collect()),
+            ],
+        )?;
+        info!(rows = dumped.len(), path, "retrace: re-pick scores dumped");
+    }
+    drop((
+        repick_data,
+        ex_cid,
+        ex_rank,
+        ex_order,
+        im_lo_own,
+        im_hi_own,
+        dumped,
+    ));
     apex_done.extend(pending.map(Apex::finish));
     apex_done.sort_by_key(|a| a.cid);
     if unmatched > 0 {
@@ -1473,9 +1892,12 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     stats.insert("rebuilt_fragment_rows".to_string(), json!(n_frag));
     stats.insert("rebuilt_ms1_rows".to_string(), json!(n_ms1));
     stats.insert("copied_rows".to_string(), json!(rows - n_frag - n_ms1));
+    // Frame decodes: the MS1 frames once, and each MS2 frame once per run of spans that
+    // needs one of its windows (a frame's slots isolate windows apart in m/z).
     stats.insert("frames_decoded".to_string(), json!(decoded));
     stats.insert("readers".to_string(), json!(n_readers));
     stats.insert("ms_setup_and_decode".to_string(), json!(t_decoded));
+    stats.insert("ms_window_frames".to_string(), json!(t_windows));
     stats.insert("ms_repick".to_string(), json!(t_repick));
     stats.insert("ms_read".to_string(), json!(t_read));
     stats.insert("ms_sum".to_string(), json!(t_sum));
@@ -1726,6 +2148,103 @@ mod tests {
         ];
         assert_eq!(ms1_frames(11.0, 1, &rt, &fi, &partial).len(), 1);
         assert!(ms1_frames(10.0, 0, &rt, &fi, &partial).is_empty());
+    }
+
+    /// Extract zeroes exactly the rows retrace rebuilds: the skeleton rule is `row_kind`,
+    /// for fragment and MS1 rows, with and without `retrace.ms1`, at every non-finite input.
+    #[test]
+    fn a_skeleton_zeroes_exactly_the_rows_retrace_rebuilds() {
+        let nan = f64::NAN;
+        for ms1 in [false, true] {
+            let k = Skeleton { ms1 };
+            for has in [false, true] {
+                for pmz in [500.0, nan] {
+                    for centre in [1.0, nan] {
+                        for mz in [300.0, nan] {
+                            for (name, pi) in [
+                                ("y5", 0.4f32),
+                                ("b3", 0.0),
+                                ("ms1_mono", 0.0),
+                                ("ms1_iso2", 0.0),
+                            ] {
+                                let kind = row_kind(has, pmz, centre, mz, name, pi, ms1);
+                                assert_eq!(
+                                    k.zeroes(has, pmz, centre, mz, name, pi),
+                                    kind != Kind::Copy,
+                                    "{name} ms1={ms1} has={has} pmz={pmz} centre={centre} mz={mz}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The rule itself: a fragment needs a prediction, an MS1 row needs retrace.ms1.
+        assert!(row_kind(true, 500.0, 1.0, 300.0, "y5", 0.4, false) == Kind::Frag);
+        assert!(row_kind(true, 500.0, 1.0, 300.0, "y5", 0.0, true) == Kind::Copy);
+        assert!(row_kind(true, 500.0, 1.0, 500.0, "ms1_mono", 0.0, true) == Kind::Ms1);
+        assert!(row_kind(true, 500.0, 1.0, 500.0, "ms1_mono", 0.0, false) == Kind::Copy);
+        assert!(row_kind(true, 500.0, nan, 300.0, "y5", 0.4, true) == Kind::Copy);
+    }
+
+    /// The marker a skeleton table carries in its report, absent on an ordinary table and
+    /// refused when malformed.
+    #[test]
+    fn a_skeleton_is_read_from_the_table_report() {
+        let dir = std::env::temp_dir().join(format!("mumdia_skeleton_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chrom.parquet").to_str().unwrap().to_string();
+        let report = format!("{path}.report.json");
+        assert_eq!(Skeleton::recorded(&path).unwrap(), None);
+        std::fs::write(&report, r#"{"params":{"trace_pad_s":2.0}}"#).unwrap();
+        assert_eq!(Skeleton::recorded(&path).unwrap(), None);
+        std::fs::write(
+            &report,
+            r#"{"params":{"retrace_skeleton":{"ms1":true,"rows":7}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Skeleton::recorded(&path).unwrap(),
+            Some(Skeleton { ms1: true })
+        );
+        std::fs::write(&report, r#"{"params":{"retrace_skeleton":{"rows":7}}}"#).unwrap();
+        assert!(Skeleton::recorded(&path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An MS1 row walked with the frame sums kept gives every point the same sum, bit for
+    /// bit, as summing each point's frames afresh: at every half-width, with ties (equal
+    /// frames), a frame that was not decoded, and points that share their nearest frame.
+    #[test]
+    fn ms1_seen_equals_summing_every_point_afresh() {
+        let scale = [3u32, 1, 5, 5, 2, 7, 1, 4, 4, 6];
+        let mut frames: Vec<Option<TofFrame>> = scale
+            .iter()
+            .map(|&m| {
+                let mut f = frame();
+                for x in f.intensities.iter_mut() {
+                    *x *= m;
+                }
+                Some(TofFrame::new(f).unwrap())
+            })
+            .collect();
+        frames[6] = None;
+        let rt: Vec<f64> = (0..scale.len()).map(|k| 10.0 + k as f64).collect();
+        let fi: Vec<usize> = (0..scale.len()).collect();
+        let im: Vec<f64> = (0..8).map(|s| 1.5 - 0.1 * s as f64).collect();
+        // Grid points every 0.6 s: some share their nearest MS1 frame.
+        let grid: Vec<f64> = (0..15).map(|p| 9.7 + 0.6 * p as f64).collect();
+        for half in 0..4 {
+            for (scans, tof) in [(vec![(0, 8)], (200, 200)), (vec![(2, 5)], (100, 300))] {
+                let mut seen = Ms1Seen::default();
+                for &t in &grid {
+                    let fs = ms1_frames(t, half, &rt, &fi, &frames);
+                    let want = point_sum(&fs, &scans, tof, &im);
+                    let got = seen.point_sum(&fs, &scans, tof, &im);
+                    assert_eq!(got, want, "half {half} t {t} scans {scans:?}");
+                }
+            }
+        }
     }
 
     /// The one patch of psms_extracted: re-picked apexes, refreshed scalars under the null

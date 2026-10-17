@@ -95,6 +95,24 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **diaPASEF memory and speed (docs/35_diapasef.md section 16).** `extract.windows_in_flight`
+  defaults to 4 on spectra that carry 1/K0 (16 otherwise): extract held 45.1 GiB per HYE
+  diaPASEF run at 16 in flight and 21.4 at 4, with identical output, and the six-run
+  experiment peaked at 94 instead of 181 GiB at bit-identical identifications. Retrace sums
+  each MS1 frame of a row once instead of once per grid point that reaches it (three times at
+  the default `ms1_scan_halfwidth`), gives up to four concurrent calls eight chromatogram
+  readers each instead of letting the first take the whole budget, and reads a skeleton
+  centroid table: extract writes the rows retrace rebuilds from raw events as zeros on their
+  axis (`retrace_skeleton` in the table's report), since decoding those centroid values was
+  most of retrace's read. Retrace also holds only the MS2 frames of the isolation windows its
+  current rows need instead of every MS2 frame of the run: the phase of five concurrent
+  retraces fell from 96-98 to 49-66 GB. Every retrace output is bit-identical. Under
+  `retrace.enabled` the centroid table's bytes and hash change; it is deleted after retrace.
+- **A faster features pass on large chromatogram tables.** Each main-pass loader decodes the
+  next batch of its chunk while it copies the current one, and a chunk's value columns are
+  assembled in parallel row blocks: on a HYE diaPASEF run the pass took 76.2 instead of 97.4 s
+  at 20 threads and 59.1 instead of 76.0 s at 120, the features table byte-identical
+  (docs/35_diapasef.md section 16).
 - **`run-experiment` matches between runs by default with a second pass**
   (`mbr.strategy = "second_pass"`, the new default; it was `"none"`). The pooled first pass
   is kept as `first_pass/scored_combined.parquet`. Every target it accepts experiment-wide
@@ -130,15 +148,53 @@ than a number. Both are recorded in every run's `manifest.json`.
   config hash and, on a run with at least 2,500 seed anchors, its output; on a run with fewer
   the output changes. `"seed"` restores the previous behaviour (`docs/08_rt_im_train.md`
   section 4f).
+- **A native MS1 noise filter for diaPASEF, on by default** (`convert.tdf_ms1_denoise`): the
+  native reader keeps only MS1 points that form a run of at least 5 occupied mobility scans,
+  drops MS1 features no diaPASEF window reaches and the weak m/z halo of bright ions, with the
+  method and default MS1 settings of dnoise (Garrett, Diedrich and Yates, bioRxiv 2026, MIT);
+  retrace filters its raw MS1 frames the same way. MS/MS spectra are untouched. Six HYE
+  diaPASEF runs: identical identifications with 8.7% of the MS1 points; 15 min E. coli run
+  (three NN seeds): 14,121 against 14,044 peptides at 1%, entrapment FDP 0.30-0.38% against
+  0.39-0.46%. `false` restores the unfiltered MS1; only diaPASEF input reads it.
+- **`multihead_anchors = "auto"` also chooses search anchors on diaPASEF**: every adapting
+  run whose converted spectra carry 1/K0 is searched once to refit its multi-head
+  calibration, whatever its seed anchor count. On diaPASEF the gain does not fall with the
+  count: the six 60 min HYE runs of the ProteoBench diaPASEF module (11,144 seed anchors)
+  +5.7% peptides and +6.5% ProteoBench ions at k = 3, `w_rt` 40-45 s -> 24-27 s, one seed;
+  the 15 min E. coli run (4,639) +0.6% over three seeds at an entrapment FDP of 0.42-0.51% ->
+  0.39-0.46%. The cost is one bootstrap pass on the first run (about 6 min on the 60 min set).
+  `anchors_auto` records `ion_mobility`. 3D runs are unchanged; `"seed"` restores the
+  previous behaviour on diaPASEF (`docs/08_rt_im_train.md` section 4f).
+- **The NN worker releases the raw handoff as it copies it.** Each copied 131,072-row group of
+  the memory-mapped handoff leaves the worker's resident set (`MADV_DONTNEED`), so the
+  handoff and the worker's matrix are no longer resident at once: the pooled rescore of six
+  HYE diaPASEF runs (28.5 million PSMs) peaked at 51.0 instead of 98.3 GB with the same
+  98,524 peptides at 1%. No effect on Windows or on a parquet or PIN handoff.
 - One version-floor check for interpreter discovery, `doctor` and the sidecar launch
   (`Role::version_floor`, `sidecar::require_version`) (#185).
+- **`run-experiment` runs the first run's finish among the other chains** when its library
+  adaptation searched it (the RT bootstrap), and the feature-loader and retrace-reader pools
+  grow by the chains in flight under `parallel_runs = "auto"`. Six HYE diaPASEF runs, with the
+  other speed changes of this release: 41.6 instead of 49.9 min, every output bit-identical
+  (docs/35_diapasef.md section 16).
 - One extract-to-compete chain for `run` and `run-experiment` (`stages::chain`), with the
   manifest records and the lent MS2 decode of single-run `run` (#186).
+- **Extract skips the MS1 traces a retrace skeleton zeroes.** About half of extract's busy time
+  on a HYE diaPASEF run was the MS1 reads of the three isotope traces per candidate, which the
+  skeleton then zeroed because retrace rebuilds those rows; the chromatogram table is
+  unchanged.
 - `CLAUDE.md` corrected: `retain_top_peaks` writes an unscored sidecar and
   `promote_top_peaks` writes scored rows (#187).
 
 ### Added
 
+- **A diaPASEF extraction gate** (`extract.gate_support_min`, opt-in): a second threshold on
+  the window-mean score plus apex intensity, MS1 and, on spectra that carry 1/K0, three 1/K0
+  terms, fitted on targets only. Six HYE diaPASEF runs at 0.845: 41% of the candidates of the
+  window-mean gate at 0.6, 26.8 instead of 41.6 min, 96,955 instead of 98,524 peptides and
+  86,877 instead of 89,973 ProteoBench ions; a window-mean threshold of 0.75 keeps 45% for
+  96,154 and 84,912. The gate diagnostics carry the window-mean score (`gate_window_mean`).
+  (docs/35_diapasef.md section 16.)
 - **Search-anchored multi-head calibration** (`rt_im_train.multihead_anchors = "search"`;
   `"auto"`, the default since the entry above, chooses it on runs short of seed anchors). The run that adapts the library (a single `run`, the
   first run of `run-experiment` under `rt_library_scope = first_run_only`, or every run under
@@ -226,6 +282,19 @@ than a number. Both are recorded in every run's `manifest.json`.
   `fs_lib.py`, no scikit-learn), and `bench/make_entrapment_fasta.py`.
   `env/mumdia-peptdeep.yml` pins `pyarrow<20`: peptdeep 1.5.1 requires NumPy 1.x, which
   pyarrow 26 refuses at import.
+
+### Fixed
+
+- **Cross-validation folds are filled when every fold key shares a factor with the fold
+  count.** Rescoring assigns a PSM to fold `base_peptide_id % folds`, and the six-run HYE
+  diaPASEF pool carries only even `base_peptide_id` values, so `rescore.folds = 2` put every
+  PSM in fold 0 and the `nn_torch` worker stopped ("fold 0 is empty in training or
+  holdout"). When the plain modulo would leave a fold below half its share, the engine
+  (`rescoring::fold_assignment`) and the worker (`fold_keys_for`) now fold on a splitmix64
+  mix of the key and say so; any other key set keeps its folds, so results at the default 3
+  folds do not change. Measured on that pool at 2 folds (three NN seeds): 97,731 peptides at
+  1% against 98,414 at 3 folds, for 8% less rescore wall time, because the folds train in
+  parallel.
 
 ## [0.6.0] - 2026-10-11
 

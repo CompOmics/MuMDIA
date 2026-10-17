@@ -1360,6 +1360,11 @@ const CHUNK_PSM_ROWS: usize = 1 << 16;
 /// ~200 MB in flight instead of the writer default's ~3 GB.
 const FEATURE_ROW_GROUP_ROWS: usize = 1 << 16;
 
+/// Rows per block of the parallel assembly of a chunk's value columns: each block writes
+/// its own rows of every column, 2,048 x 8 bytes per column, so a block's slices of a few
+/// hundred columns stay in cache while its rows are written.
+const ASSEMBLE_BLOCK_ROWS: usize = 2048;
+
 /// Rows per decoded chromatogram batch. Matches the list-column batch size of the IO
 /// layer, so a batch is tens of MB whatever the chunk size is.
 const CHROM_BATCH_ROWS: usize = 1 << 12;
@@ -1575,7 +1580,7 @@ impl ChromChunk {
 /// reads each row's list, which the decoder rebuilds with the trace's `+0.0` margins
 /// ([`Decoder::row_im`]). Otherwise it projects and stores exactly what it did without it.
 struct ChromStream {
-    inner: mumdia_io::table::BatchReader,
+    inner: Batches,
     pending: Option<RecordBatch>,
     has_obs_mz: bool,
     /// Read each row's per-point 1/K0 (asked for and present): `im` in v1, `im_trimmed` in
@@ -1597,6 +1602,12 @@ impl ChromStream {
     /// `want_im` also projects the per-point 1/K0 list where the table has one; without it,
     /// or on a table without the list, the projection is the one the stream always read.
     fn open(ch: &TableFile, want_im: bool) -> Result<ChromStream> {
+        ChromStream::open_with(ch, want_im, false)
+    }
+
+    /// [`ChromStream::open`], with the batches decoded one ahead on a thread of their own
+    /// when `prefetch` is set ([`Batches::prefetch`]).
+    fn open_with(ch: &TableFile, want_im: bool, prefetch: bool) -> Result<ChromStream> {
         let has_obs_mz = ch.has_column("frag_obs_mz");
         let layout = Layout::of(ch)?;
         let has_im = want_im && ch.has_column(layout.im_column());
@@ -1614,8 +1625,13 @@ impl ChromStream {
         if has_im {
             cols.push(layout.im_column());
         }
+        let reader = ch.batches(Some(&cols), CHROM_BATCH_ROWS)?;
         Ok(ChromStream {
-            inner: ch.batches(Some(&cols), CHROM_BATCH_ROWS)?,
+            inner: if prefetch {
+                Batches::prefetch(reader)?
+            } else {
+                Batches::Direct(reader)
+            },
             pending: None,
             has_obs_mz,
             has_im,
@@ -1843,6 +1859,49 @@ impl ChromStream {
     }
 }
 
+/// Where a [`ChromStream`] takes its decoded batches from.
+enum Batches {
+    /// Decoded on the calling thread, when it asks for the next one.
+    Direct(mumdia_io::table::BatchReader),
+    /// Decoded one ahead on a thread of its own, in order: while the stream copies batch `i`
+    /// into its chunk, the next is already being decoded.
+    Prefetch(std::sync::mpsc::Receiver<Result<RecordBatch>>),
+}
+
+impl Batches {
+    /// Decode `reader` on a thread of its own, at most one batch ahead of the consumer
+    /// (the one in the channel) plus the one being decoded: two 4,096-row batches, a few MB.
+    ///
+    /// The main pass's loaders spent 73% of their time waiting for their own batch to
+    /// decode on the codec pool and 27% copying it into the chunk, one after the other
+    /// (gdb samples of a standalone features pass on a HYE diaPASEF run). The thread
+    /// overlaps the two. It mostly waits on the codec pool, which does the decoding, so it
+    /// adds little CPU. It stops at the end of the table, after an error, or when the stream
+    /// is dropped (the send fails).
+    fn prefetch(reader: mumdia_io::table::BatchReader) -> Result<Batches> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<RecordBatch>>(1);
+        std::thread::Builder::new()
+            .name("mumdia-chrom-prefetch".into())
+            .spawn(move || {
+                for b in reader {
+                    let failed = b.is_err();
+                    if tx.send(b).is_err() || failed {
+                        break;
+                    }
+                }
+            })
+            .context("spawning the chromatogram prefetch thread")?;
+        Ok(Batches::Prefetch(rx))
+    }
+
+    fn next(&mut self) -> Option<Result<RecordBatch>> {
+        match self {
+            Batches::Direct(r) => r.next(),
+            Batches::Prefetch(rx) => rx.recv().ok(),
+        }
+    }
+}
+
 /// One unit of work: a contiguous run of PSM rows and the chromatogram rows they own.
 #[derive(Debug)]
 struct Chunk {
@@ -1966,8 +2025,9 @@ impl ValueMatrix {
     }
 
     /// Set the column `c` (as resolved once by [`ColIx`]) for chunk-local row `r`. A
-    /// feature outside the active set resolves to `None` and is dropped, exactly as the
-    /// old map was filtered by `cols_active` at write time.
+    /// feature outside the active set resolves to `None` and is dropped. The pass assembles
+    /// its rows in parallel blocks instead; the tests build matrices with it.
+    #[cfg(test)]
     fn set(&mut self, c: Option<usize>, r: usize, v: f64) {
         if let Some(c) = c {
             self.cols[c][r] = v;
@@ -2844,6 +2904,23 @@ const MAIN_LOADER_EXTRAS: usize = 4;
 static MAIN_LOADER_BUDGET: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(MAIN_LOADER_EXTRAS);
 
+/// Grow the main-pass loader pool so that `chains` concurrent passes can each take the
+/// `chrom_loaders - 1` extra loaders a pass alone takes, until the guard drops; `None` when
+/// the pool already holds that many. For the per-run chains of an automatic
+/// `run-experiment` plan, which were sized on the peak of a pass that had its loaders
+/// (`sched::BudgetGrowth`).
+pub(crate) fn grow_loaders_for_chains(
+    chrom_loaders: usize,
+    chains: usize,
+) -> Option<crate::sched::BudgetGrowth> {
+    let need = chrom_loaders
+        .max(1)
+        .saturating_sub(1)
+        .saturating_mul(chains);
+    let add = need.saturating_sub(MAIN_LOADER_EXTRAS);
+    (add > 0).then(|| crate::sched::BudgetGrowth::add(&MAIN_LOADER_BUDGET, add))
+}
+
 /// The main pass's loader request before the pool lease: `features.chrom_loaders` (at
 /// least one), and no more than there are chunks to decode or threads in the rayon pool.
 /// The pool is what `--threads` sizes, so a run held to one thread decodes on one loader,
@@ -2904,18 +2981,32 @@ struct LoadFault {
 ///
 /// `want_im` also reads each row's per-point 1/K0 where the table has it (the ion-mobility
 /// family, [`ChromStream::open`]).
+#[cfg(test)]
 fn load_chunk(
     ch: &TableFile,
     first: usize,
     n_rows: usize,
     want_im: bool,
 ) -> Result<(ChromChunk, NameTab)> {
+    load_chunk_with(ch, first, n_rows, want_im, false)
+}
+
+/// [`load_chunk`], with the chunk's batches decoded one ahead of the copy into the chunk
+/// when `prefetch` is set ([`Batches::prefetch`]). The chunk is the same either way: the
+/// batches arrive in order, and only when they are decoded changes.
+fn load_chunk_with(
+    ch: &TableFile,
+    first: usize,
+    n_rows: usize,
+    want_im: bool,
+    prefetch: bool,
+) -> Result<(ChromChunk, NameTab)> {
     let mut names = NameTab::default();
     if n_rows == 0 {
         return Ok((ChromChunk::new(), names));
     }
     let span = ch.span(first, n_rows)?;
-    let mut stream = ChromStream::open(&span, want_im)?;
+    let mut stream = ChromStream::open_with(&span, want_im, prefetch)?;
     let chunk = stream.read_chunk(n_rows, &mut names)?;
     Ok((chunk, names))
 }
@@ -2942,6 +3033,8 @@ struct ChunkLoader<'a> {
     loaders: usize,
     /// Read the per-point 1/K0 as well ([`load_chunk`]).
     want_im: bool,
+    /// Decode each chunk's batches one ahead of the copy ([`load_chunk_with`]).
+    prefetch: bool,
     state: std::sync::Mutex<LoadState>,
     cv: std::sync::Condvar,
     #[cfg(test)]
@@ -2977,6 +3070,7 @@ impl<'a> ChunkLoader<'a> {
             rows,
             loaders: loaders.max(1),
             want_im,
+            prefetch: false,
             state: std::sync::Mutex::new(LoadState {
                 next: 0,
                 taken: 0,
@@ -2988,6 +3082,13 @@ impl<'a> ChunkLoader<'a> {
             #[cfg(test)]
             fault: None,
         }
+    }
+
+    /// Decode each chunk's batches one ahead of the copy into the chunk, on a thread of
+    /// each loader's own ([`Batches::prefetch`]).
+    fn with_prefetch(mut self, prefetch: bool) -> ChunkLoader<'a> {
+        self.prefetch = prefetch;
+        self
     }
 
     #[cfg(test)]
@@ -3096,7 +3197,13 @@ impl<'a> ChunkLoader<'a> {
             #[cfg(test)]
             self.inject_before(j);
             let busy = Instant::now();
-            let r = load_chunk(self.ch, self.first[j], self.rows[j], self.want_im);
+            let r = load_chunk_with(
+                self.ch,
+                self.first[j],
+                self.rows[j],
+                self.want_im,
+                self.prefetch,
+            );
             #[cfg(test)]
             let r = self.inject_after(j, r);
             timers.add(&timers.loader_busy_ns, busy);
@@ -3589,7 +3696,10 @@ fn run_chunked(
     };
     // The per-point 1/K0 is decoded only for the ion-mobility family; without it the
     // loaders project exactly the columns they did before.
-    let loader = ChunkLoader::new(&ch, &chunk_first, &chunk_rows, n_loaders, im_on);
+    // Each loader decodes its chunk's next batch while it copies the current one, except
+    // on one thread (`--threads 1`), which adds no decode thread the budget did not grant.
+    let loader = ChunkLoader::new(&ch, &chunk_first, &chunk_rows, n_loaders, im_on)
+        .with_prefetch(rayon::current_num_threads() > 1);
     #[cfg(test)]
     let loader = loader.with_fault(match loaders {
         LoaderSource::Exact { fault, .. } => fault,
@@ -3809,98 +3919,133 @@ fn run_chunked(
             let mut prelim = vec![0.0f64; rows_in_chunk];
             let mut elu_lo = vec![0.0f64; rows_in_chunk];
             let mut elu_hi = vec![0.0f64; rows_in_chunk];
-            for (r, i) in (lo..hi).enumerate() {
-                let ff = &frag_feats[r];
-                elu_lo[r] = ff.elution_lo;
-                elu_hi[r] = ff.elution_hi;
-                let rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
-                // MS1 isotope features.
-                let neutral = mz[i] * charge[i] as f64 - charge[i] as f64 * PROTON;
-                let (iso_corr, isom1_ratio, log_mono, has_ms1) =
-                    isotope_features(ms1_m1[i], ms1_mono[i], ms1_i1[i], ms1_i2[i], neutral);
-
-                m.set(ix.rt_error_abs, r, rt_err);
-                m.set(ix.rt_error_rel, r, rt_err / gradient);
-                m.set(ix.n_matched_fragments, r, n_matched[i] as f64);
-                m.set(ix.coelution_run, r, corun[i] as f64);
-                m.set(ix.log_apex_intensity, r, (1.0 + apex_int[i] as f64).ln());
-                m.set(ix.frag_corr, r, ff.frag_corr);
-                m.set(ix.frag_cosine, r, ff.frag_cosine);
-                m.set(ix.spectral_angle, r, ff.spectral_angle);
-                m.set(ix.coelution_mean, r, ff.coelution_mean);
-                m.set(ix.coelution_best, r, ff.coelution_best);
-                m.set(ix.n_coelution_above, r, ff.n_coelution_above);
-                m.set(ix.charge, r, charge[i] as f64);
-                m.set(ix.peptide_length, r, peptide_length(&pform[i]) as f64);
-                m.set(
-                    ix.n_proteins,
-                    r,
-                    (protein[i].matches(';').count() + 1) as f64,
+            // The rows are independent, so they are assembled in blocks of
+            // ASSEMBLE_BLOCK_ROWS in parallel, each block writing its own rows of every
+            // column: the same values in the same places as the row loop it replaces, which
+            // took 20-31 s of one core per pass on a HYE diaPASEF run while the pass's pool
+            // waited (per row: string parses, hash lookups and a scattered write per column).
+            {
+                type Block<'b> = (
+                    usize,
+                    Vec<&'b mut [f64]>,
+                    &'b mut [f64],
+                    &'b mut [f64],
+                    &'b mut [f64],
                 );
-                m.set(ix.library_norm_manhattan, r, ff.norm_manhattan);
-                m.set(ix.library_rmsd, r, ff.rmsd);
-                m.set(ix.xcorr_coelution, r, ff.xcorr_coelution);
-                m.set(ix.xcorr_shape, r, ff.xcorr_shape);
-                m.set(ix.sum_b_intensity, r, ff.sum_b);
-                m.set(ix.sum_y_intensity, r, ff.sum_y);
-                m.set(ix.diff_by_intensity, r, ff.sum_b - ff.sum_y);
-                m.set(ix.n_b_ions, r, ff.n_b);
-                m.set(ix.n_y_ions, r, ff.n_y);
-                m.set(ix.weighted_mass_error, r, ff.weighted_mass_error);
-                m.set(ix.mean_mass_error, r, ff.mean_mass_error);
-                m.set(ix.isotope_corr, r, iso_corr);
-                m.set(ix.ms1_isom1_ratio, r, isom1_ratio);
-                m.set(ix.log_mono_ms1, r, log_mono);
-                m.set(ix.has_ms1, r, has_ms1);
-                m.set(ix.log_sn, r, ff.log_sn);
-                m.set(ix.n_observations, r, ff.n_observations);
-                m.set(ix.base_width_rt, r, ff.base_width_rt);
-                m.set(
-                    ix.seed_score,
-                    r,
-                    *seed_score_map.get(&cid[i]).unwrap_or(&0.0),
-                );
-                m.set(
-                    ix.seed_identified,
-                    r,
-                    *seed_id_map.get(&cid[i]).unwrap_or(&0.0),
-                );
-                m.set(
-                    ix.matched_fraction,
-                    r,
-                    n_matched[i] as f64 / (n_pred[i].max(1) as f64),
-                );
-                m.set(ix.profile_cos, r, ff.profile_cos);
-                m.set(ix.ref_corr, r, ff.ref_corr);
-                m.set(ix.best_ref_corr, r, ff.best_ref_corr);
-                m.set(ix.low_frag_coel, r, ff.low_frag_coel);
-                m.set(ix.evidence, r, ff.evidence);
-                m.set(ix.contrast_min, r, ff.contrast_min);
-                m.set(ix.resid_corr, r, ff.resid_corr);
-                m.set(ix.coel_clean, r, ff.coel_clean);
-                m.set(ix.shadow_frac, r, ff.shadow_frac);
-                m.set(ix.peak_contested_frac, r, contested[i]);
-                m.set(ix.peak_contested_count_frac, r, contested_count[i]);
-                m.set(ix.peak_apportioned_frac, r, apportioned[i]);
-
-                // Extended battery (opt-in). Built once per PSM above and fanned out to the
-                // family modules; written here under the fixed registry-order columns.
-                if n_ext > 0 {
-                    let row = &ext_vals[r * n_ext..(r + 1) * n_ext];
-                    for (c, v) in ix.ext.iter().zip(row) {
-                        m.set(*c, r, *v);
+                let mut blocks: Vec<Block<'_>> = prelim
+                    .chunks_mut(ASSEMBLE_BLOCK_ROWS)
+                    .zip(elu_lo.chunks_mut(ASSEMBLE_BLOCK_ROWS))
+                    .zip(elu_hi.chunks_mut(ASSEMBLE_BLOCK_ROWS))
+                    .enumerate()
+                    .map(|(k, ((p, l), h))| {
+                        (
+                            k * ASSEMBLE_BLOCK_ROWS,
+                            Vec::with_capacity(m.cols.len()),
+                            p,
+                            l,
+                            h,
+                        )
+                    })
+                    .collect();
+                for col in m.cols.iter_mut() {
+                    for (blk, part) in blocks.iter_mut().zip(col.chunks_mut(ASSEMBLE_BLOCK_ROWS)) {
+                        blk.1.push(part);
                     }
                 }
+                blocks.into_par_iter().for_each(|(r0, mut cs, pr, el, eh)| {
+                    for rl in 0..pr.len() {
+                        let r = r0 + rl;
+                        let i = lo + r;
+                        let ff = &frag_feats[r];
+                        el[rl] = ff.elution_lo;
+                        eh[rl] = ff.elution_hi;
+                        let put = &mut |c: Option<usize>, v: f64| {
+                            if let Some(c) = c {
+                                cs[c][rl] = v;
+                            }
+                        };
+                        let rt_err = calibrated_rt_error(apex_rt[i], rt_cal[i]);
+                        // MS1 isotope features.
+                        let neutral = mz[i] * charge[i] as f64 - charge[i] as f64 * PROTON;
+                        let (iso_corr, isom1_ratio, log_mono, has_ms1) =
+                            isotope_features(ms1_m1[i], ms1_mono[i], ms1_i1[i], ms1_i2[i], neutral);
 
-                // Cross-charge corroboration features (whole-run reductions, indexed by row).
-                m.set(ix.n_charge_states, r, f_n_charge[i]);
-                m.set(ix.charge_multi_flag, r, f_charge_multi[i]);
-                m.set(ix.cross_charge_intensity_log, r, f_cross_charge_int[i]);
+                        put(ix.rt_error_abs, rt_err);
+                        put(ix.rt_error_rel, rt_err / gradient);
+                        put(ix.n_matched_fragments, n_matched[i] as f64);
+                        put(ix.coelution_run, corun[i] as f64);
+                        put(ix.log_apex_intensity, (1.0 + apex_int[i] as f64).ln());
+                        put(ix.frag_corr, ff.frag_corr);
+                        put(ix.frag_cosine, ff.frag_cosine);
+                        put(ix.spectral_angle, ff.spectral_angle);
+                        put(ix.coelution_mean, ff.coelution_mean);
+                        put(ix.coelution_best, ff.coelution_best);
+                        put(ix.n_coelution_above, ff.n_coelution_above);
+                        put(ix.charge, charge[i] as f64);
+                        put(ix.peptide_length, peptide_length(&pform[i]) as f64);
+                        put(ix.n_proteins, (protein[i].matches(';').count() + 1) as f64);
+                        put(ix.library_norm_manhattan, ff.norm_manhattan);
+                        put(ix.library_rmsd, ff.rmsd);
+                        put(ix.xcorr_coelution, ff.xcorr_coelution);
+                        put(ix.xcorr_shape, ff.xcorr_shape);
+                        put(ix.sum_b_intensity, ff.sum_b);
+                        put(ix.sum_y_intensity, ff.sum_y);
+                        put(ix.diff_by_intensity, ff.sum_b - ff.sum_y);
+                        put(ix.n_b_ions, ff.n_b);
+                        put(ix.n_y_ions, ff.n_y);
+                        put(ix.weighted_mass_error, ff.weighted_mass_error);
+                        put(ix.mean_mass_error, ff.mean_mass_error);
+                        put(ix.isotope_corr, iso_corr);
+                        put(ix.ms1_isom1_ratio, isom1_ratio);
+                        put(ix.log_mono_ms1, log_mono);
+                        put(ix.has_ms1, has_ms1);
+                        put(ix.log_sn, ff.log_sn);
+                        put(ix.n_observations, ff.n_observations);
+                        put(ix.base_width_rt, ff.base_width_rt);
+                        put(ix.seed_score, *seed_score_map.get(&cid[i]).unwrap_or(&0.0));
+                        put(
+                            ix.seed_identified,
+                            *seed_id_map.get(&cid[i]).unwrap_or(&0.0),
+                        );
+                        put(
+                            ix.matched_fraction,
+                            n_matched[i] as f64 / (n_pred[i].max(1) as f64),
+                        );
+                        put(ix.profile_cos, ff.profile_cos);
+                        put(ix.ref_corr, ff.ref_corr);
+                        put(ix.best_ref_corr, ff.best_ref_corr);
+                        put(ix.low_frag_coel, ff.low_frag_coel);
+                        put(ix.evidence, ff.evidence);
+                        put(ix.contrast_min, ff.contrast_min);
+                        put(ix.resid_corr, ff.resid_corr);
+                        put(ix.coel_clean, ff.coel_clean);
+                        put(ix.shadow_frac, ff.shadow_frac);
+                        put(ix.peak_contested_frac, contested[i]);
+                        put(ix.peak_contested_count_frac, contested_count[i]);
+                        put(ix.peak_apportioned_frac, apportioned[i]);
 
-                prelim[r] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
-                    + ff.coelution_mean.max(0.0)
-                    + (1.0 + apex_int[i] as f64).ln() * 0.1
-                    - rt_err / gradient;
+                        // Extended battery (opt-in). Built once per PSM above and fanned
+                        // out to the family modules; written here under the fixed
+                        // registry-order columns.
+                        if n_ext > 0 {
+                            let row = &ext_vals[r * n_ext..(r + 1) * n_ext];
+                            for (c, v) in ix.ext.iter().zip(row) {
+                                put(*c, *v);
+                            }
+                        }
+
+                        // Cross-charge corroboration features (whole-run reductions,
+                        // indexed by row).
+                        put(ix.n_charge_states, f_n_charge[i]);
+                        put(ix.charge_multi_flag, f_charge_multi[i]);
+                        put(ix.cross_charge_intensity_log, f_cross_charge_int[i]);
+
+                        pr[rl] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
+                            + ff.coelution_mean.max(0.0)
+                            + (1.0 + apex_int[i] as f64).ln() * 0.1
+                            - rt_err / gradient;
+                    }
+                });
             }
             drop(frag_feats);
             // `ext_vals` and the matrix are both live for the whole assembly above, so the
@@ -8154,6 +8299,62 @@ mod tests {
     /// The chunk a fault test fails; three loaders, so chunk `FAULT_AT - 1` can still be
     /// decoding when it fails.
     const FAULT_AT: usize = 3;
+
+    /// Every value a chunk holds, with its fragment names resolved, as bits.
+    fn chunk_content(c: &ChromChunk, names: &NameTab) -> Vec<String> {
+        let set = |s: &RowSet| {
+            format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                s.name_id
+                    .iter()
+                    .map(|&i| names.get(i).to_string())
+                    .collect::<Vec<_>>(),
+                s.frag_mz.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                s.frag_obs_mz
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                s.pred_int.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                s.axis_id,
+                s.int_off,
+                s.int_vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                s.im_vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                s.cand_off,
+            )
+        };
+        vec![
+            format!("{:?}", c.cids),
+            set(&c.frag),
+            set(&c.ms1),
+            format!("{:?}", c.axis_off),
+            format!(
+                "{:?}",
+                c.axis_vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_chunk_decoded_ahead_is_the_chunk_decoded_in_line() {
+        // `Batches::prefetch` only moves when each batch is decoded: every chunk of the plan
+        // must hold the same rows, names and value bits either way, with 1/K0 and without.
+        let (_dir, psms, chrom) = fault_fixture("prefetch");
+        let (first, rows) = kernel_chunk_plan(&psms, &chrom, 100, usize::MAX);
+        assert!(rows.len() > 2, "{} chunks", rows.len());
+        let ch = TableFile::open(&chrom).unwrap();
+        for want_im in [false, true] {
+            for j in 0..rows.len() {
+                let (a, na) = load_chunk_with(&ch, first[j], rows[j], want_im, false).unwrap();
+                let (b, nb) = load_chunk_with(&ch, first[j], rows[j], want_im, true).unwrap();
+                assert!(!a.cids.is_empty(), "chunk {j} is empty");
+                assert_eq!(
+                    chunk_content(&a, &na),
+                    chunk_content(&b, &nb),
+                    "chunk {j}, im {want_im}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_loader_failure_reaches_the_computation_in_chunk_order_and_never_hangs() {

@@ -411,6 +411,21 @@ pub struct ConvertConfig {
     /// is 0.
     #[serde(skip_serializing_if = "is_default_tdf_im_smooth_scans")]
     pub tdf_im_smooth_scans: f64,
+    /// Native diaPASEF reader: remove MS1 noise before centroiding, with the method and
+    /// default MS1 settings of dnoise (Garrett, Diedrich and Yates, bioRxiv 2026,
+    /// doi:10.64898/2026.08.27.747603): keep only MS1 points on runs of at least 5 occupied
+    /// mobility scans (TOF neighbourhood +/- 3, gaps of up to 2 scans bridged, two passes),
+    /// drop features no diaPASEF window reaches (windows padded by 3 Th and 0.015 1/K0), and
+    /// drop the weak m/z halo of bright ions. Retrace applies the same filter to the raw MS1
+    /// frames it holds, so both read the same MS1 events. MS/MS spectra are never filtered.
+    /// Default true since 2026-10-17; only the native diaPASEF reader reads it. On the six
+    /// ProteoBench HYE diaPASEF runs it kept 8.7% of the MS1 points with identical
+    /// identifications (98,524 peptides at 1%, 89,973 ProteoBench ions at k = 3); on the
+    /// 15 min E. coli run 14,121 against 14,044 peptides at 1% and an entrapment FDP of
+    /// 0.30-0.38% against 0.39-0.46% (three NN seeds each; docs/35_diapasef.md section 16).
+    /// `false` restores the unfiltered MS1.
+    #[serde(skip_serializing_if = "is_true")]
+    pub tdf_ms1_denoise: bool,
 }
 impl Default for ConvertConfig {
     fn default() -> Self {
@@ -427,6 +442,7 @@ impl Default for ConvertConfig {
             tdf_mz_smooth_ppm: 8.0,
             tdf_im_valley: 0.0,
             tdf_im_smooth_scans: 8.0,
+            tdf_ms1_denoise: true,
         }
     }
 }
@@ -1350,7 +1366,8 @@ pub struct RtImTrainConfig {
     /// adapting run: `search` when its seed search found fewer than
     /// `multihead_search_below` anchors (distinct target base peptides at `q_train`, the
     /// count `rt_im_train::plan_anchors` makes) or had to relax `q_train` through
-    /// `anchor_q_ladder` to find enough, else `seed`. Under `run-experiment` with
+    /// `anchor_q_ladder` to find enough, and on every run whose spectra carry 1/K0
+    /// (diaPASEF, whatever its anchor count), else `seed`. Under `run-experiment` with
     /// `experiment.rt_library_scope = first_run_only` only the first run adapts the library,
     /// so only it is ever searched twice; under `per_run` every run decides for itself. The
     /// per-run LOESS still fits on the seed anchors.
@@ -1360,7 +1377,11 @@ pub struct RtImTrainConfig {
     /// Astral HeLa, 1,249 seed anchors: +5.1% real precursors at entrapment FDP 1%; a
     /// 216-cell single-cell plate (100-250 seed anchors per cell): +7.8% / +5.5% precursors;
     /// Orbitrap AIF E. coli entrapment, 5,025: +0.9%; ProteoBench Astral entrapment, 13,786:
-    /// +0.46%. The cost is a fixed extract-to-rescore pass and a second library prediction
+    /// +0.46%. On diaPASEF the gain does not fall with the anchor count (2026-10-14): the six
+    /// 60 min HYE runs of the ProteoBench diaPASEF module, 11,144 seed anchors, +5.7% peptides
+    /// and +6.5% ProteoBench ions (one seed); the 15 min E. coli run, 4,639 seed anchors,
+    /// +0.6% peptides over three seeds with the entrapment FDP 0.43% against 0.46%; hence the
+    /// 1/K0 rule. The cost is a fixed extract-to-rescore pass and a second library prediction
     /// on the adapting run, which reads the DeepLC projection cache the first one wrote: +63
     /// s on a single-cell run, +4 to 5 min (+51% wall) on a three-run bulk Astral experiment
     /// with a 17M-row library. `auto` buys the large gain where seed anchors are scarce and
@@ -1566,7 +1587,7 @@ pub enum LibraryIrt {
 #[serde(rename_all = "snake_case")]
 pub enum MultiheadAnchors {
     /// `search` when the adapting run's seed search is short of anchors
-    /// (`RtImTrainConfig::multihead_search_below`), else `seed`.
+    /// (`RtImTrainConfig::multihead_search_below`) or its spectra carry 1/K0, else `seed`.
     #[default]
     Auto,
     /// The run's confident seed PSMs (`spectrum_q <= q_train`).
@@ -1687,12 +1708,15 @@ impl Default for RtImTrainConfig {
 pub struct ExtractConfig {
     /// Isolation windows probed per batch before the candidates no later window can touch
     /// are scored and written. `None` (the default) uses the rayon thread count capped at
-    /// 16. The hit accumulator holds the windows in flight, so this sets the stage's peak
-    /// almost linearly: on the HYE benchmark at 32 threads, 32 in flight is 24.65 GiB, 16 is
-    /// 16.57 GiB and 8 is 12.31 GiB, with identical output (docs/27 section 3.10). It is a
-    /// memory knob only: each window is probed in parallel over sub-ranges of its
-    /// candidates, so a small batch still uses every thread. Set 8 or 4 on a memory-bound
-    /// machine. Not a sensitivity knob. It does move the chromatogram table's parquet row
+    /// 16, and at 4 on spectra that carry 1/K0 (diaPASEF). The hit accumulator holds the
+    /// windows in flight, so this sets the stage's peak almost linearly: on the HYE benchmark
+    /// at 32 threads, 32 in flight is 24.65 GiB, 16 is 16.57 GiB and 8 is 12.31 GiB, with
+    /// identical output (docs/27 section 3.10). A diaPASEF run has few, dense window groups,
+    /// and one 60 min HYE run at 20 threads took 45.1 GiB at 16, 31.9 at 8 and 21.4 at 4,
+    /// fastest at 4, with identical output (docs/35_diapasef.md section 16). It is a memory
+    /// knob only: each window is probed in parallel over sub-ranges of its candidates, so a
+    /// small batch still uses every thread. Set 8 or 4 on a memory-bound machine. Not a
+    /// sensitivity knob. It does move the chromatogram table's parquet row
     /// group boundaries, which follow the flush batches, so two runs at different settings
     /// produce files that differ byte for byte while holding the same rows in the same
     /// order with the same values (measured on one band: 29,028,466 rows, 10.4 billion
@@ -1925,9 +1949,9 @@ pub struct ExtractConfig {
     /// 6%; recomputed with this rule, 85% at the apex, 6% and 5% either side. Default
     /// false; benchmark-gated.
     pub apex_refine_intensity: bool,
-    /// Emit the four gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`,
-    /// `gate_coelution`, `gate_spectral_entropy`) as extra `psms.parquet` columns,
-    /// for the offline gate-metric comparison. Default `false` (diagnostic sidecar,
+    /// Emit the five gate-diagnostic scores (`gate_apex`, `gate_peak_spectral`,
+    /// `gate_coelution`, `gate_spectral_entropy`, `gate_window_mean`) as extra
+    /// `psms.parquet` columns, for the offline gate-metric comparison. Default `false` (diagnostic sidecar,
     /// like `emit_candidate_audit`): when off, neither the columns nor the extra
     /// per-candidate score computation happen, so the default chain is byte-identical.
     pub emit_gate_diagnostics: bool,
@@ -1943,6 +1967,22 @@ pub struct ExtractConfig {
     /// summed-window entropy, coverage and cosine minus this times the apex RT error over
     /// the candidate's own window half-width on that side (clipped to 1).
     pub gate_rt_weight: f64,
+    /// A second acceptance threshold under `GateMode::WindowMean`, the diaPASEF gate: a
+    /// candidate must pass `gate_min_score` and this, without the MS1 rescue. On spectra that
+    /// carry 1/K0 the score is the window-mean score plus `0.023 ln(1 + apex intensity)` and
+    /// `0.009 ln(1 + MS1 monoisotopic intensity at the apex)`, minus `1.23` times the apex
+    /// 1/K0 error against the calibrated prediction, `7.44` times the 1/K0 spread of the
+    /// matched fragments at the apex (`apex_im_mad`) and `0.18` times the MS1-to-fragment 1/K0
+    /// difference: weights fitted on the gate-time quantities of two HYE diaPASEF runs, on
+    /// targets only. Without 1/K0 it is the window-mean score plus `0.05 ln(1 + apex
+    /// intensity)` and `0.02 ln(1 + MS1 mono)`. The MS1 term counts only where the apex reads
+    /// the mono, +1 and +2 isotopes, as the `log_mono_ms1` feature does. 0 (default) is off.
+    /// On the six ProteoBench HYE diaPASEF runs, 0.845 (with 1/K0) and 1.215 (without) keep
+    /// about 42% of the candidates the window-mean gate at 0.6 passes; a window-mean threshold
+    /// of 0.75 keeps 45% and loses more identifications (docs/35_diapasef.md section 16).
+    /// Benchmark-gated.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub gate_support_min: f64,
     /// The 1/K0 gate of a run whose spectra carry ion mobility (a diaPASEF `.d` read by the
     /// native reader): a fragment peak whose 1/K0 lies outside the candidate's calibrated
     /// 1/K0 window (`run_windows.im_lo`/`im_hi`, from `rt-im-train`) is not matched to that
@@ -2103,6 +2143,7 @@ impl Default for ExtractConfig {
             gate_mode: GateMode::WindowMean, // window-summed agreement minus RT term (since 2026-10-08)
             gate_coelution_min: 0.5,         // used only by GateMode::Combined
             gate_rt_weight: 0.2,             // used only by GateMode::WindowMean
+            gate_support_min: 0.0,           // off; benchmark-gated
             im_gate: ImGate::Off,
         }
     }
@@ -2214,7 +2255,12 @@ pub struct FeaturesConfig {
     /// `--threads` (the engine's thread pool) or than it has chunks, so `--threads 1` decodes
     /// on one loader as before. Loaders beyond each pass's first come from a process-wide
     /// pool of four, so concurrent bands or runs (`groups.parallel`,
-    /// `experiment.parallel_runs`) share that pool instead of multiplying it. Default 3; `1`
+    /// `experiment.parallel_runs`) share that pool instead of multiplying it. Under
+    /// `experiment.parallel_runs = "auto"` the pool grows to `chrom_loaders - 1` per
+    /// concurrent run while the per-run chains execute, because the number of chains was
+    /// sized on the measured peak of a run that had all of its loaders; with the pool of four,
+    /// three of five concurrent passes on the six HYE diaPASEF runs decoded on one loader and
+    /// took 280-295 s against 95-104 s. Default 3; `1`
     /// restores the single loader and `0` is read as `1`. A memory knob and a speed knob,
     /// not a sensitivity knob.
     pub chrom_loaders: usize,
@@ -3145,7 +3191,10 @@ pub struct ExperimentConfig {
     /// `0.7 x (available + resident) / peak` at once, where the peak is the process's
     /// `VmHWM` after that step and `available` is `MemAvailable`, lowered to the headroom
     /// of the process's memory cgroup (a container's or a batch job's limit) when that is
-    /// smaller. The peak counts this process only, not its child processes, so chains that
+    /// smaller. When the first run adapts the library with a search of itself
+    /// (`rt_im_train.multihead_anchors`, the bootstrap pass), only that adaptation runs
+    /// alone: its peak sizes the chains, and the first run's own chain then runs among
+    /// them. The peak counts this process only, not its child processes, so chains that
     /// each run their own DeepLC adaptation (`rt_library_scope = per_run`) run one at a
     /// time under `"auto"`; give a number to run such chains concurrently. Elsewhere (any
     /// platform but Linux) there is no memory reading, so `"auto"` runs the chains one at a
@@ -3676,6 +3725,13 @@ impl Config {
                  candidate and trimmed traces), not {}",
                 self.extract.chromatogram_schema
             )));
+        }
+        if !self.extract.gate_support_min.is_finite() || self.extract.gate_support_min < 0.0 {
+            return Err(Invalid(
+                "extract.gate_support_min must be finite and >= 0 (0 disables the support \
+                 gate)."
+                    .into(),
+            ));
         }
         if !self.extract.gate_min_score.is_finite()
             || !(0.0..=1.0).contains(&self.extract.gate_min_score)
@@ -5815,6 +5871,8 @@ mod tests {
         assert_eq!(c.search_seed.top_n_peaks, 0);
 
         assert!(Config::from_json(r#"{"extract":{"gate_min_score":-0.1}}"#).is_err());
+        assert!(Config::from_json(r#"{"extract":{"gate_support_min":-0.1}}"#).is_err());
+        assert!(Config::from_json(r#"{"extract":{"gate_support_min":1.4}}"#).is_ok());
         assert!(Config::from_json(r#"{"extract":{"gate_min_score":1.1}}"#).is_err());
     }
 

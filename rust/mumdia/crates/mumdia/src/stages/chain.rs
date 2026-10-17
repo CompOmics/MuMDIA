@@ -183,6 +183,11 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
                 .im_features
                 .on(crate::instrument::spectra_has_im(&co.ms2)),
         trace_pad: extras.trace_pad,
+        // Retrace reads only the axis and keys of the rows it rebuilds, so extract writes
+        // those as zeros (`retrace::Skeleton`).
+        retrace_skeleton: raw.as_ref().map(|_| retrace::Skeleton {
+            ms1: cfg.retrace.ms1,
+        }),
     })?;
     drop(lent_ms2);
     // The rebuilt chromatograms and the patched psms_extracted, when retrace runs; the
