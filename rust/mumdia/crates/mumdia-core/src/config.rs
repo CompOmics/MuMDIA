@@ -417,11 +417,14 @@ pub struct ConvertConfig {
     /// mobility scans (TOF neighbourhood +/- 3, gaps of up to 2 scans bridged, two passes),
     /// drop features no diaPASEF window reaches (windows padded by 3 Th and 0.015 1/K0), and
     /// drop the weak m/z halo of bright ions. Retrace applies the same filter to the raw MS1
-    /// frames it holds, so both read the same MS1 events. The tool's MS1 default on the six
-    /// ProteoBench HYE diaPASEF runs kept 8.7% of the MS1 points and left identifications
-    /// unchanged at 51 against 63 minutes (docs/35_diapasef.md section 16). MS/MS spectra are
-    /// never filtered. Default false.
-    #[serde(skip_serializing_if = "is_false")]
+    /// frames it holds, so both read the same MS1 events. MS/MS spectra are never filtered.
+    /// Default true since 2026-10-17; only the native diaPASEF reader reads it. On the six
+    /// ProteoBench HYE diaPASEF runs it kept 8.7% of the MS1 points with identical
+    /// identifications (98,524 peptides at 1%, 89,973 ProteoBench ions at k = 3); on the
+    /// 15 min E. coli run 14,121 against 14,044 peptides at 1% and an entrapment FDP of
+    /// 0.30-0.38% against 0.39-0.46% (three NN seeds each; docs/35_diapasef.md section 16).
+    /// `false` restores the unfiltered MS1.
+    #[serde(skip_serializing_if = "is_true")]
     pub tdf_ms1_denoise: bool,
 }
 impl Default for ConvertConfig {
@@ -439,7 +442,7 @@ impl Default for ConvertConfig {
             tdf_mz_smooth_ppm: 8.0,
             tdf_im_valley: 0.0,
             tdf_im_smooth_scans: 8.0,
-            tdf_ms1_denoise: false,
+            tdf_ms1_denoise: true,
         }
     }
 }

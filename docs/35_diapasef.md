@@ -1125,3 +1125,11 @@ identifications unchanged (89,973 against 90,363 ions at k = 3, precursors 109,9
 109,965) at 51 against 63 minutes. Its MS/MS mode kept 17% of all points and lost 9.2% of the
 ions, as `convert.tdf_min_points` 3 to 6 did (-5.9% to -20.1%): no MS/MS peak filter tried
 here is free.
+
+The native reader now applies the same MS1 filter itself (`convert.tdf_ms1_denoise`, on by
+default since 2026-10-17), and retrace applies it to the raw MS1 frames it holds, so no
+pre-processing step is needed. On the six runs it gives exactly the identifications of the
+tool's own output (98,524 peptides at 1%, 89,973 ions at k = 3), at about 33 s more conversion
+per run than reading files the tool had cleaned. On the 15 min E. coli run, three NN seeds per
+arm: 14,121 against 14,044 peptides at 1%, and on the entrapment library 13,384 against 13,375
+real peptides at an entrapment FDP of 0.30-0.38% against 0.39-0.46%.
