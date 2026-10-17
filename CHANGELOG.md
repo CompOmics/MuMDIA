@@ -179,6 +179,10 @@ than a number. Both are recorded in every run's `manifest.json`.
   (docs/35_diapasef.md section 16).
 - One extract-to-compete chain for `run` and `run-experiment` (`stages::chain`), with the
   manifest records and the lent MS2 decode of single-run `run` (#186).
+- **Extract skips the MS1 traces a retrace skeleton zeroes.** About half of extract's busy time
+  on a HYE diaPASEF run was the MS1 reads of the three isotope traces per candidate, which the
+  skeleton then zeroed because retrace rebuilds those rows; the chromatogram table is
+  unchanged.
 - `CLAUDE.md` corrected: `retain_top_peaks` writes an unscored sidecar and
   `promote_top_peaks` writes scored rows (#187).
 
