@@ -651,7 +651,7 @@ fn unzip(archive: &std::path::Path, target: &PathBuf) -> Result<(), String> {
         let Some(rel) = entry.enclosed_name() else {
             return Err(format!(
                 "the archive contains an unsafe path ({}); refusing to unpack it",
-                entry.name()
+                entry.name().unwrap_or_default()
             ));
         };
         let out = target.join(rel);
@@ -671,8 +671,11 @@ fn unzip(archive: &std::path::Path, target: &PathBuf) -> Result<(), String> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // Permission bits only: a set-user-ID, set-group-ID or sticky bit from
+            // the archive is never applied.
             if let Some(mode) = entry.unix_mode() {
-                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode));
+                let _ =
+                    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode & 0o777));
             }
         }
     }
@@ -945,7 +948,7 @@ mod tests {
         {
             let f = std::fs::File::create(&archive).unwrap();
             let mut w = zip::ZipWriter::new(f);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             // `start_file` rejects some names, so the raw name goes in through the
             // path-less API to build the hostile archive this must refuse.
@@ -977,7 +980,7 @@ mod tests {
         {
             let f = std::fs::File::create(&archive).unwrap();
             let mut w = zip::ZipWriter::new(f);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             w.start_file("ThermoRawFileParser.exe", opts).unwrap();
             std::io::Write::write_all(&mut w, b"launcher").unwrap();
