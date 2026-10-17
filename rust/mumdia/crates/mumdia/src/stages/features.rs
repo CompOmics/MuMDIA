@@ -3959,7 +3959,7 @@ fn run_chunked(
                         let ff = &frag_feats[r];
                         el[rl] = ff.elution_lo;
                         eh[rl] = ff.elution_hi;
-                        let mut set = |c: Option<usize>, v: f64| {
+                        let put = &mut |c: Option<usize>, v: f64| {
                             if let Some(c) = c {
                                 cs[c][rl] = v;
                             }
@@ -3970,59 +3970,59 @@ fn run_chunked(
                         let (iso_corr, isom1_ratio, log_mono, has_ms1) =
                             isotope_features(ms1_m1[i], ms1_mono[i], ms1_i1[i], ms1_i2[i], neutral);
 
-                        set(ix.rt_error_abs, rt_err);
-                        set(ix.rt_error_rel, rt_err / gradient);
-                        set(ix.n_matched_fragments, n_matched[i] as f64);
-                        set(ix.coelution_run, corun[i] as f64);
-                        set(ix.log_apex_intensity, (1.0 + apex_int[i] as f64).ln());
-                        set(ix.frag_corr, ff.frag_corr);
-                        set(ix.frag_cosine, ff.frag_cosine);
-                        set(ix.spectral_angle, ff.spectral_angle);
-                        set(ix.coelution_mean, ff.coelution_mean);
-                        set(ix.coelution_best, ff.coelution_best);
-                        set(ix.n_coelution_above, ff.n_coelution_above);
-                        set(ix.charge, charge[i] as f64);
-                        set(ix.peptide_length, peptide_length(&pform[i]) as f64);
-                        set(ix.n_proteins, (protein[i].matches(';').count() + 1) as f64);
-                        set(ix.library_norm_manhattan, ff.norm_manhattan);
-                        set(ix.library_rmsd, ff.rmsd);
-                        set(ix.xcorr_coelution, ff.xcorr_coelution);
-                        set(ix.xcorr_shape, ff.xcorr_shape);
-                        set(ix.sum_b_intensity, ff.sum_b);
-                        set(ix.sum_y_intensity, ff.sum_y);
-                        set(ix.diff_by_intensity, ff.sum_b - ff.sum_y);
-                        set(ix.n_b_ions, ff.n_b);
-                        set(ix.n_y_ions, ff.n_y);
-                        set(ix.weighted_mass_error, ff.weighted_mass_error);
-                        set(ix.mean_mass_error, ff.mean_mass_error);
-                        set(ix.isotope_corr, iso_corr);
-                        set(ix.ms1_isom1_ratio, isom1_ratio);
-                        set(ix.log_mono_ms1, log_mono);
-                        set(ix.has_ms1, has_ms1);
-                        set(ix.log_sn, ff.log_sn);
-                        set(ix.n_observations, ff.n_observations);
-                        set(ix.base_width_rt, ff.base_width_rt);
-                        set(ix.seed_score, *seed_score_map.get(&cid[i]).unwrap_or(&0.0));
-                        set(
+                        put(ix.rt_error_abs, rt_err);
+                        put(ix.rt_error_rel, rt_err / gradient);
+                        put(ix.n_matched_fragments, n_matched[i] as f64);
+                        put(ix.coelution_run, corun[i] as f64);
+                        put(ix.log_apex_intensity, (1.0 + apex_int[i] as f64).ln());
+                        put(ix.frag_corr, ff.frag_corr);
+                        put(ix.frag_cosine, ff.frag_cosine);
+                        put(ix.spectral_angle, ff.spectral_angle);
+                        put(ix.coelution_mean, ff.coelution_mean);
+                        put(ix.coelution_best, ff.coelution_best);
+                        put(ix.n_coelution_above, ff.n_coelution_above);
+                        put(ix.charge, charge[i] as f64);
+                        put(ix.peptide_length, peptide_length(&pform[i]) as f64);
+                        put(ix.n_proteins, (protein[i].matches(';').count() + 1) as f64);
+                        put(ix.library_norm_manhattan, ff.norm_manhattan);
+                        put(ix.library_rmsd, ff.rmsd);
+                        put(ix.xcorr_coelution, ff.xcorr_coelution);
+                        put(ix.xcorr_shape, ff.xcorr_shape);
+                        put(ix.sum_b_intensity, ff.sum_b);
+                        put(ix.sum_y_intensity, ff.sum_y);
+                        put(ix.diff_by_intensity, ff.sum_b - ff.sum_y);
+                        put(ix.n_b_ions, ff.n_b);
+                        put(ix.n_y_ions, ff.n_y);
+                        put(ix.weighted_mass_error, ff.weighted_mass_error);
+                        put(ix.mean_mass_error, ff.mean_mass_error);
+                        put(ix.isotope_corr, iso_corr);
+                        put(ix.ms1_isom1_ratio, isom1_ratio);
+                        put(ix.log_mono_ms1, log_mono);
+                        put(ix.has_ms1, has_ms1);
+                        put(ix.log_sn, ff.log_sn);
+                        put(ix.n_observations, ff.n_observations);
+                        put(ix.base_width_rt, ff.base_width_rt);
+                        put(ix.seed_score, *seed_score_map.get(&cid[i]).unwrap_or(&0.0));
+                        put(
                             ix.seed_identified,
                             *seed_id_map.get(&cid[i]).unwrap_or(&0.0),
                         );
-                        set(
+                        put(
                             ix.matched_fraction,
                             n_matched[i] as f64 / (n_pred[i].max(1) as f64),
                         );
-                        set(ix.profile_cos, ff.profile_cos);
-                        set(ix.ref_corr, ff.ref_corr);
-                        set(ix.best_ref_corr, ff.best_ref_corr);
-                        set(ix.low_frag_coel, ff.low_frag_coel);
-                        set(ix.evidence, ff.evidence);
-                        set(ix.contrast_min, ff.contrast_min);
-                        set(ix.resid_corr, ff.resid_corr);
-                        set(ix.coel_clean, ff.coel_clean);
-                        set(ix.shadow_frac, ff.shadow_frac);
-                        set(ix.peak_contested_frac, contested[i]);
-                        set(ix.peak_contested_count_frac, contested_count[i]);
-                        set(ix.peak_apportioned_frac, apportioned[i]);
+                        put(ix.profile_cos, ff.profile_cos);
+                        put(ix.ref_corr, ff.ref_corr);
+                        put(ix.best_ref_corr, ff.best_ref_corr);
+                        put(ix.low_frag_coel, ff.low_frag_coel);
+                        put(ix.evidence, ff.evidence);
+                        put(ix.contrast_min, ff.contrast_min);
+                        put(ix.resid_corr, ff.resid_corr);
+                        put(ix.coel_clean, ff.coel_clean);
+                        put(ix.shadow_frac, ff.shadow_frac);
+                        put(ix.peak_contested_frac, contested[i]);
+                        put(ix.peak_contested_count_frac, contested_count[i]);
+                        put(ix.peak_apportioned_frac, apportioned[i]);
 
                         // Extended battery (opt-in). Built once per PSM above and fanned
                         // out to the family modules; written here under the fixed
@@ -4030,15 +4030,15 @@ fn run_chunked(
                         if n_ext > 0 {
                             let row = &ext_vals[r * n_ext..(r + 1) * n_ext];
                             for (c, v) in ix.ext.iter().zip(row) {
-                                set(*c, *v);
+                                put(*c, *v);
                             }
                         }
 
                         // Cross-charge corroboration features (whole-run reductions,
                         // indexed by row).
-                        set(ix.n_charge_states, f_n_charge[i]);
-                        set(ix.charge_multi_flag, f_charge_multi[i]);
-                        set(ix.cross_charge_intensity_log, f_cross_charge_int[i]);
+                        put(ix.n_charge_states, f_n_charge[i]);
+                        put(ix.charge_multi_flag, f_charge_multi[i]);
+                        put(ix.cross_charge_intensity_log, f_cross_charge_int[i]);
 
                         pr[rl] = n_matched[i] as f64 * (0.5 + ff.frag_corr.max(0.0))
                             + ff.coelution_mean.max(0.0)
