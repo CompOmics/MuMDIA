@@ -46,7 +46,7 @@ pub struct TdfParams {
     pub im_valley: f64,
     /// Half-width in TIMS scans of the mobility profile smoothing.
     pub im_smooth_scans: f64,
-    /// Remove MS1 noise before centroiding (`convert.tdf_ms1_denoise`, [`Ms1Denoise`]).
+    /// Remove MS1 noise before centroiding (`convert.tdf_ms1_denoise`, `ms1_denoise::Ms1Denoise`).
     pub ms1_denoise: bool,
 }
 
