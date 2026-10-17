@@ -590,10 +590,202 @@ pub fn percolator_lite(inp: RescoreInput) -> Vec<f64> {
     final_score
 }
 
+/// The input of [`prefilter_scores`].
+pub struct PrefilterInput<'a> {
+    /// A few feature columns of every PSM.
+    pub features: &'a FeatureMatrix,
+    pub is_decoy: &'a [bool],
+    /// The fold key the rescore uses (the base peptide), so a peptide's PSMs share a fold.
+    pub fold_key: &'a [u32],
+    /// The starting score of the positive-set selection (`prelim_score`).
+    pub init_score: &'a [f64],
+    pub folds: usize,
+    /// At most this many training rows per fold, taken by a fixed stride.
+    pub max_train_rows: usize,
+    /// Positive-set iterations.
+    pub num_iter: usize,
+    pub train_fdr: f64,
+}
+
+/// An out-of-fold linear score per PSM, for dropping the weakest PSMs before the rescore
+/// (`rescore.prefilter_keep`).
+///
+/// The semi-supervised fit of [`percolator_lite`] on a budget: for each fold, the training
+/// rows are every `stride`-th row outside the fold (`max_train_rows` at most), the model is
+/// a logistic regression of the targets at `train_fdr` against the decoys of that sample,
+/// refitted `num_iter` times on its own scores, and each PSM is scored only by the model of
+/// the fold it is held out of. No PSM's score depends on its own label, which is what keeps
+/// a cut on it label-blind for the PSMs it scores. `None` when a fold found fewer than 10
+/// confident targets to fit on, so there is no model to cut by.
+pub fn prefilter_scores(inp: PrefilterInput) -> Option<Vec<f64>> {
+    let n = inp.features.rows();
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    assert!(
+        n <= u32::MAX as usize,
+        "prefilter_scores: {n} rows exceeds the u32 row index"
+    );
+    assert_eq!(inp.fold_key.len(), n, "prefilter_scores: fold keys");
+    assert_eq!(inp.is_decoy.len(), n, "prefilter_scores: decoy labels");
+    assert_eq!(inp.init_score.len(), n, "prefilter_scores: initial scores");
+    let folds = inp.folds.max(2);
+    let d = inp.features.n_features();
+    let fold_of = fold_assignment(inp.fold_key, folds);
+    let mut out = vec![f64::NEG_INFINITY; n];
+    for test_fold in 0..folds as u32 {
+        let outside = fold_of.iter().filter(|&&f| f != test_fold).count();
+        if outside == 0 {
+            continue;
+        }
+        let stride = outside.div_ceil(inp.max_train_rows.max(1)).max(1);
+        let train_idx: Vec<u32> = fold_of
+            .iter()
+            .enumerate()
+            .filter(|(_, &f)| f != test_fold)
+            .map(|(i, _)| i as u32)
+            .step_by(stride)
+            .collect();
+        let (mean, std) = fit_standardizer(inp.features, &train_idx);
+        let mut xtr: Vec<f32> = vec![0.0; train_idx.len().saturating_mul(d)];
+        xtr.par_chunks_mut(d.max(1))
+            .zip(train_idx.par_iter())
+            .for_each(|(o, &i)| std_row_into(inp.features.row(i as usize), &mean, &std, o));
+        let xrow = |k: usize| -> &[f32] { &xtr[k * d..(k + 1) * d] };
+        let decoy: Vec<bool> = train_idx
+            .iter()
+            .map(|&i| inp.is_decoy[i as usize])
+            .collect();
+        let mut scores: Vec<f64> = train_idx
+            .iter()
+            .map(|&i| inp.init_score[i as usize])
+            .collect();
+        let mut w = vec![0.0; d + 1];
+        for _ in 0..inp.num_iter.max(1) {
+            let q = target_decoy_q_split(&scores, &decoy);
+            let mut rows: Vec<&[f32]> = Vec::new();
+            let mut ys: Vec<f64> = Vec::new();
+            for (k, &is_d) in decoy.iter().enumerate() {
+                if is_d {
+                    rows.push(xrow(k));
+                    ys.push(0.0);
+                } else if q[k] <= inp.train_fdr {
+                    rows.push(xrow(k));
+                    ys.push(1.0);
+                }
+            }
+            if ys.iter().filter(|&&v| v > 0.5).count() < 10 {
+                return None;
+            }
+            w = logreg_fit(&rows, &ys, 1e-3, 100, 0.5);
+            scores = (0..train_idx.len())
+                .into_par_iter()
+                .map(|k| score_row(&w, xrow(k)))
+                .collect();
+        }
+        let test_idx: Vec<u32> = fold_of
+            .iter()
+            .enumerate()
+            .filter(|(_, &f)| f == test_fold)
+            .map(|(i, _)| i as u32)
+            .collect();
+        let scored: Vec<f64> = test_idx
+            .par_iter()
+            .map(|&i| score_std_row(&w, inp.features.row(i as usize), &mean, &std))
+            .collect();
+        for (&i, s) in test_idx.iter().zip(scored) {
+            out[i as usize] = s;
+        }
+    }
+    Some(out)
+}
+
+/// Which rows a cut keeps: the `keep` fraction of the rows with the highest `scores`,
+/// whatever their labels, ties broken by row index so the cut is deterministic.
+pub fn prefilter_keep_mask(scores: &[f64], keep: f64) -> Vec<bool> {
+    let n = scores.len();
+    let k = ((n as f64) * keep.clamp(0.0, 1.0)).round() as usize;
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.par_sort_unstable_by(|&a, &b| {
+        scores[b as usize]
+            .total_cmp(&scores[a as usize])
+            .then(a.cmp(&b))
+    });
+    let mut mask = vec![false; n];
+    for &i in &order[..k.min(n)] {
+        mask[i as usize] = true;
+    }
+    mask
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fdr::target_decoy_q;
+
+    /// The prefilter scores every PSM out of fold, and on a pool where the targets carry
+    /// signal its cut keeps the signal: the top half holds nearly all the high-signal
+    /// targets and decoys and plain targets in equal shares.
+    #[test]
+    fn the_prefilter_keeps_signal_and_treats_decoys_like_plain_targets() {
+        let n = 20_000usize;
+        let mut m = FeatureMatrix::with_capacity(n, 3);
+        let mut is_decoy = Vec::with_capacity(n);
+        let mut real = Vec::with_capacity(n);
+        let mut x = 12345u64;
+        let mut rnd = || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        for i in 0..n {
+            let d = i % 2 == 1;
+            let r = !d && i % 10 == 0;
+            let shift = if r { 2.5 } else { 0.0 };
+            m.push(rnd() + shift);
+            m.push(rnd() * 0.5 + shift * 0.5);
+            m.push(rnd());
+            is_decoy.push(d);
+            real.push(r);
+        }
+        let m = m.finish().unwrap();
+        let fold_key: Vec<u32> = (0..n as u32).map(|i| i / 2).collect();
+        // The preliminary score the rescore starts from: the first feature.
+        let init: Vec<f64> = (0..n).map(|i| m.row(i)[0] as f64).collect();
+        let s = prefilter_scores(PrefilterInput {
+            features: &m,
+            is_decoy: &is_decoy,
+            fold_key: &fold_key,
+            init_score: &init,
+            folds: 3,
+            max_train_rows: 5_000,
+            num_iter: 3,
+            train_fdr: 0.01,
+        })
+        .expect("the pool has confident targets");
+        assert!(
+            s.iter().all(|v| v.is_finite()),
+            "every PSM is scored out of fold"
+        );
+        let keep = prefilter_keep_mask(&s, 0.5);
+        assert_eq!(keep.iter().filter(|&&k| k).count(), n / 2);
+        let share = |sel: &dyn Fn(usize) -> bool| {
+            let (k, t) = (0..n)
+                .filter(|&i| sel(i))
+                .fold((0, 0), |(k, t), i| (k + keep[i] as usize, t + 1));
+            k as f64 / t as f64
+        };
+        assert!(share(&|i| real[i]) > 0.99, "{}", share(&|i| real[i]));
+        let (dec, plain) = (
+            share(&|i| is_decoy[i]),
+            share(&|i| !is_decoy[i] && !real[i]),
+        );
+        assert!(
+            (dec - plain).abs() < 0.03,
+            "decoys {dec} against plain targets {plain}"
+        );
+    }
 
     /// Keys that all share a factor with the fold count (every key even, two or four folds)
     /// still fill every fold, a key's PSMs stay in one fold, and keys that the plain modulo

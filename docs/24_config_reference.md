@@ -68,7 +68,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
 | [`features`](#features) | `FeaturesConfig` | 12 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
-| [`rescore`](#rescore) | `RescoreConfig` | 28 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
+| [`rescore`](#rescore) | `RescoreConfig` | 30 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`quant`](#quant) | `QuantConfig` | 19 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`mbr`](#mbr) | `MbrConfig` | 9 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 3 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
@@ -454,6 +454,8 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `train_fdr` | `f64` | `0.01` |  |  |
 | `num_iter` | `usize` | `10` |  | number of semi-supervised iterations for the native rescorer. |
 | `max_feature_matrix_gib` | `f64` | `0.0` |  | Refuse a rescore whose in-memory feature matrix would exceed this many GiB. 0 (default) means no ceiling, which is the previous behaviour. The matrix is a flat f32 `FeatureMatrix`: four bytes per value. Nothing in the workspace estimates or checks available memory (there is deliberately no `sysinfo` dependency), so an experiment-wide rescore over enough runs was simply killed by the OS after however long it took to get there. `native_tda` fits its folds one at a time and holds one standardised training copy, `(folds - 1) / folds` of the matrix, so its peak is `1 + (folds - 1) / folds` times this figure: 1.67x at the default 3 folds, 1.80x at 5, approaching 2x and never above it. It does not grow with `folds`. Setting a ceiling converts that into an error at startup, naming the estimate and the two ways out. It is not a batching implementation: sub-batching changes which PSMs share a pooled `q_value`, so it is the operator's decision, not a silent one. |
+| `prefilter_keep` | `f64` | `0.0` | benchmark-gated | Keep only this fraction of the competed PSMs for the classifier, the ones a quick cross-validated linear model scores highest; 0 (default) keeps every PSM. The model is fitted per experiment on `prefilter_features` (a default list when unset): for each fold a logistic regression of the targets at `train_fdr` against the decoys of a 400,000-row sample of the other folds, refitted three times, and every PSM is scored by the model of the fold it is held out of, on the rescore's own fold keys. The cut takes the top fraction of that score whatever the label, so the classifier, its q values and the scored table see only the kept rows; a dropped PSM is not identified. Must be in [0, 1). Benchmark-gated: a cut on a model trained against the decoys must be checked with an entrapment (docs/35_diapasef.md section 16). |
+| `prefilter_features` | `Option<Vec<String>>` | `null` |  | The feature columns the prefilter model reads; unset is a default list of agreement, co-elution, intensity, matched-count, retention-time, MS1 and peak-shape features. Names the competed table does not carry are skipped with a warning. |
 | `python` | `Option<String>` | `null` |  |  |
 | `percolator_bin` | `Option<String>` | `null` |  | Path to an external `percolator` executable. Parsed and never read: no stage launches percolator, and `RescorerKind` has no variant that would. It is the only silently inert config field in the tree, since the three MBR ones warn (see `validate`). Kept rather than deleted because the external-percolator path is still intended; `validate` now warns when it is set. |
 | `entrapment_marker` | `Option<String>` | `null` |  | Protein-accession substring marking spike-in (entrapment) negatives, e.g. "_HUMAN". Required when `classifier = entrapment`; PSMs whose protein contains it are the empirical false population. |
@@ -1236,6 +1238,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-24 structs and 308 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 39 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 310 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 39 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
-34 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+35 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.

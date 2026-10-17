@@ -2784,6 +2784,23 @@ pub struct RescoreConfig {
     /// the two ways out. It is not a batching implementation: sub-batching changes which
     /// PSMs share a pooled `q_value`, so it is the operator's decision, not a silent one.
     pub max_feature_matrix_gib: f64,
+    /// Keep only this fraction of the competed PSMs for the classifier, the ones a quick
+    /// cross-validated linear model scores highest; 0 (default) keeps every PSM. The model
+    /// is fitted per experiment on `prefilter_features` (a default list when unset): for each
+    /// fold a logistic regression of the targets at `train_fdr` against the decoys of a
+    /// 400,000-row sample of the other folds, refitted three times, and every PSM is scored
+    /// by the model of the fold it is held out of, on the rescore's own fold keys. The cut
+    /// takes the top fraction of that score whatever the label, so the classifier, its q
+    /// values and the scored table see only the kept rows; a dropped PSM is not
+    /// identified. Must be in [0, 1). Benchmark-gated: a cut on a model trained against the
+    /// decoys must be checked with an entrapment (docs/35_diapasef.md section 16).
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub prefilter_keep: f64,
+    /// The feature columns the prefilter model reads; unset is a default list of agreement,
+    /// co-elution, intensity, matched-count, retention-time, MS1 and peak-shape features.
+    /// Names the competed table does not carry are skipped with a warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefilter_features: Option<Vec<String>>,
     pub python: Option<String>,
     /// Path to an external `percolator` executable.
     ///
@@ -2971,6 +2988,8 @@ impl Default for RescoreConfig {
             train_fdr: 0.01,
             num_iter: 10,
             max_feature_matrix_gib: 0.0, // no ceiling; previous behaviour
+            prefilter_keep: 0.0,         // off; benchmark-gated
+            prefilter_features: None,
             python: None,
             percolator_bin: None,
             entrapment_marker: None,
@@ -3852,6 +3871,13 @@ impl Config {
                 "rescore.folds must be >= 2 so every PSM can receive an \
                  out-of-fold score."
                     .into(),
+            ));
+        }
+        if !self.rescore.prefilter_keep.is_finite()
+            || !(0.0..1.0).contains(&self.rescore.prefilter_keep)
+        {
+            return Err(Invalid(
+                "rescore.prefilter_keep must be finite and in [0, 1) (0 keeps every PSM).".into(),
             ));
         }
         if self.rescore.num_iter == 0 {
