@@ -2784,6 +2784,28 @@ pub struct RescoreConfig {
     /// the two ways out. It is not a batching implementation: sub-batching changes which
     /// PSMs share a pooled `q_value`, so it is the operator's decision, not a silent one.
     pub max_feature_matrix_gib: f64,
+    /// Send only the strongest competed PSMs to the classifier: those a quick
+    /// cross-validated linear model scores above the decoy that completes this fraction of
+    /// the decoys (default 0.35); 0 keeps every PSM. The model is fitted per experiment on
+    /// `prefilter_features` (a default list when unset): for each fold a logistic regression
+    /// of the targets at `train_fdr` against the decoys of a 400,000-row sample of the other
+    /// folds, refitted three times, and every PSM is scored by the model of the fold it is
+    /// held out of, on the rescore's own fold keys. Targets and decoys above the cut are all
+    /// kept, so the share of rows kept follows the pool: 36% on a six-run diaPASEF pool, 49%
+    /// on a six-run Astral pool at 0.35. The classifier, its q values and the scored table
+    /// see only the kept rows; a dropped PSM is not identified. When the model cannot be
+    /// fitted (too few confident targets, a missing or non-finite column) or the pool has
+    /// fewer decoys than `min_train_decoys` (100 at least) every PSM goes to the classifier
+    /// with a warning. Must be in [0, 1). The default since 2026-10-17: at
+    /// 0.35 within 0.11% of the peptides on diaPASEF, Astral and Orbitrap pools, an
+    /// unchanged species-entrapment FDP and carbamidomethyl null, for 41-45% of the rescore
+    /// wall time and 54-60% of its peak memory (docs/35_diapasef.md section 16).
+    pub prefilter_keep_decoys: f64,
+    /// The feature columns the prefilter model reads; unset is a default list of agreement,
+    /// co-elution, intensity, matched-count, retention-time, MS1 and peak-shape features.
+    /// Names the competed table does not carry are skipped with a warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefilter_features: Option<Vec<String>>,
     pub python: Option<String>,
     /// Path to an external `percolator` executable.
     ///
@@ -2971,6 +2993,8 @@ impl Default for RescoreConfig {
             train_fdr: 0.01,
             num_iter: 10,
             max_feature_matrix_gib: 0.0, // no ceiling; previous behaviour
+            prefilter_keep_decoys: 0.35, // docs/35_diapasef.md section 16
+            prefilter_features: None,
             python: None,
             percolator_bin: None,
             entrapment_marker: None,
@@ -3852,6 +3876,13 @@ impl Config {
                 "rescore.folds must be >= 2 so every PSM can receive an \
                  out-of-fold score."
                     .into(),
+            ));
+        }
+        if !self.rescore.prefilter_keep_decoys.is_finite()
+            || !(0.0..1.0).contains(&self.rescore.prefilter_keep_decoys)
+        {
+            return Err(Invalid(
+                "rescore.prefilter_keep_decoys must be finite and in [0, 1) (0 is off).".into(),
             ));
         }
         if self.rescore.num_iter == 0 {

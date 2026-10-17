@@ -17,7 +17,10 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::fdr::{entrapment_q, target_decoy_q_by, target_decoy_q_split};
-use crate::rescoring::{percolator_lite, FeatureMatrix, RescoreInput};
+use crate::rescoring::{
+    percolator_lite, prefilter_decoy_cut_mask, prefilter_scores, FeatureMatrix, PrefilterInput,
+    RescoreInput,
+};
 use crate::stages::features::FeatureSchema;
 
 /// Fewest rows per decoded batch while streaming the ~390 feature columns of a competed
@@ -610,6 +613,59 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     if let Some(l) = bad_label {
         anyhow::bail!("unknown PSM label {l:?}; expected \"target\" or \"decoy\"");
     }
+    // `rescore.prefilter_keep_decoys`: drop the PSMs a quick out-of-fold linear model scores
+    // lowest, before anything reads the full feature set. Every per-row column is cut to the
+    // kept rows here, and the feature pass below skips the dropped ones, so the classifier,
+    // the q values and the scored table see the kept rows only.
+    let prefilter_on = p.cfg.prefilter_keep_decoys > 0.0;
+    let keep_mask: Option<Vec<bool>> = if prefilter_on && total_rows > 0 {
+        prefilter_mask(
+            &p,
+            &expected_schema.feature_columns,
+            &is_decoy,
+            &base,
+            &prelim,
+            total_rows,
+        )?
+    } else {
+        None
+    };
+    let mut prefilter_report: Option<serde_json::Value> = None;
+    if let Some(mask) = &keep_mask {
+        let keep: Vec<usize> = (0..total_rows).filter(|&i| mask[i]).collect();
+        let (n_dec_all, n_dec_kept) = (
+            is_decoy.iter().filter(|&&d| d).count(),
+            keep.iter().filter(|&&i| is_decoy[i]).count(),
+        );
+        macro_rules! keep_rows {
+            ($($v:ident),+ $(,)?) => {$(
+                { let tmp: Vec<_> = keep.iter().map(|&i| $v[i].clone()).collect(); $v = tmp; }
+            )+};
+        }
+        pform = pform.gather(&keep);
+        protein = protein.gather(&keep);
+        keep_rows!(
+            cid, peak_rank, is_decoy, base, charge, prelim, mz, apex_rt, elution_lo, elution_hi,
+            source
+        );
+        info!(
+            psms = total_rows,
+            kept = keep.len(),
+            decoys = n_dec_all,
+            decoys_kept = n_dec_kept,
+            targets_kept = keep.len() - n_dec_kept,
+            "rescore: prefilter kept {:.1}% of the PSMs by an out-of-fold linear score",
+            100.0 * keep.len() as f64 / total_rows.max(1) as f64
+        );
+        prefilter_report = Some(serde_json::json!({
+            "keep_decoys": p.cfg.prefilter_keep_decoys,
+            "psms": total_rows,
+            "kept": keep.len(),
+            "decoys": n_dec_all,
+            "decoys_kept": n_dec_kept,
+        }));
+        total_rows = keep.len();
+    }
     let (mut is_entrapment, mut is_real_target) = classify_entrapment(p.cfg, &protein, &is_decoy);
     let mut n = cid.len();
     // First row with a non-finite prelim_score/precursor_mz, if any. Found here but NOT
@@ -677,7 +733,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         // the row index.
         let streamed = {
             let mut w = HandoffWriter::new(&paths, &feat_names, &is_decoy, &pform, &protein, &mz)?;
-            let scan = for_each_feature_batch(p.competed, &feat_names, |b| {
+            let scan = for_each_feature_batch(p.competed, &feat_names, keep_mask.as_deref(), |b| {
                 // The row-at-a-time scan stopped at the first row that either held a
                 // non-finite feature or was the offending scalar row, and
                 // `bail_non_finite` chose between the two on the row index. A batch that
@@ -725,7 +781,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         );
         prewritten = Some(paths);
     } else {
-        let feats = load_feature_matrix(p.competed, &feat_names, total_rows)?;
+        let feats = load_feature_matrix(p.competed, &feat_names, total_rows, keep_mask.as_deref())?;
         // Same guard as the streamed path's: the feature pass and the metadata pass are
         // separate reads of the same files and only this comparison ties them together.
         refuse_row_disagreement("the feature matrix", feats.rows(), n)?;
@@ -1314,6 +1370,10 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     }
     if let Some(env) = &nn_env {
         params["nn_env"] = json!(env);
+    }
+    // Only under `rescore.prefilter_keep_decoys`, so a report without it is unchanged.
+    if let Some(pre) = prefilter_report {
+        params["prefilter"] = pre;
     }
     let report = ArtifactReport {
         logical_name: artifact::PSMS_SCORED.0.to_string(),
@@ -2883,7 +2943,7 @@ fn for_each_feature_row_with(
     mut f: impl FnMut(usize, &[f32]) -> Result<()>,
 ) -> Result<()> {
     let mut row: Vec<f32> = vec![0.0; feat_names.len()];
-    for_each_feature_batch_with(competed, feat_names, scan, batch_rows, |b| {
+    for_each_feature_batch_with(competed, feat_names, scan, batch_rows, None, |b| {
         for k in 0..b.rows {
             b.row_into(k, &mut row);
             f(b.first_row + k, &row)?;
@@ -3020,6 +3080,7 @@ impl FeatureBatch<'_> {
 fn for_each_feature_batch(
     competed: &[String],
     feat_names: &[String],
+    keep: Option<&[bool]>,
     f: impl FnMut(&FeatureBatch<'_>) -> Result<()>,
 ) -> Result<()> {
     let mode = super::WideScan::from_env();
@@ -3028,6 +3089,7 @@ fn for_each_feature_batch(
         feat_names,
         &mode.options(),
         |t| feature_batch_rows(t, mode),
+        keep,
         f,
     )
 }
@@ -3037,10 +3099,14 @@ fn for_each_feature_batch_with(
     feat_names: &[String],
     scan: &mumdia_io::table::ScanOptions,
     batch_rows: impl Fn(&TableFile) -> usize,
+    keep: Option<&[bool]>,
     mut f: impl FnMut(&FeatureBatch<'_>) -> Result<()>,
 ) -> Result<()> {
     let names: Vec<&str> = feat_names.iter().map(String::as_str).collect();
+    // `flat` numbers the rows handed out (the kept ones under a `keep` mask, every one
+    // without); `read` numbers the rows read, which the mask is indexed by.
     let mut flat = 0usize;
+    let mut read = 0usize;
     for path in competed {
         let t = TableFile::open(path)?;
         let reader = t.scan(Some(&names), batch_rows(&t), scan)?;
@@ -3054,6 +3120,24 @@ fn for_each_feature_batch_with(
             .collect::<Result<_>>()?;
         for b in reader {
             let b = b?;
+            let n_read = b.num_rows();
+            let b = match keep {
+                Some(mask) => {
+                    let m = mask.get(read..read + n_read).ok_or_else(|| {
+                        anyhow!("rescore: the prefilter mask is shorter than the competed rows")
+                    })?;
+                    read += n_read;
+                    if m.iter().all(|&k| k) {
+                        b
+                    } else {
+                        arrow::compute::filter_record_batch(
+                            &b,
+                            &arrow::array::BooleanArray::from(m.to_vec()),
+                        )?
+                    }
+                }
+                None => b,
+            };
             let cols: Vec<FeatureCol<'_>> = order
                 .iter()
                 .map(|&i| {
@@ -3082,11 +3166,126 @@ fn for_each_feature_batch_with(
     Ok(())
 }
 
+/// The prefilter's default columns (`rescore.prefilter_features`): the agreement and
+/// co-elution scores that best separated targets from decoys on a HYE diaPASEF run, and one
+/// or two of each other family, so the per-experiment fit has varied evidence to weigh.
+/// Fewest decoys a pool needs before `rescore.prefilter_keep_decoys` cuts it.
+const PREFILTER_MIN_DECOYS: usize = 100;
+
+const DEFAULT_PREFILTER_FEATURES: &[&str] = &[
+    "pairwise_coelution_weighted",
+    "wf1_cos_sqrt",
+    "spectral_entropy_similarity",
+    "harmonic_mean_sim",
+    "manhattan_sim",
+    "library_norm_manhattan",
+    "wf2_cos_sqrt",
+    "spectrum_cosine_sqrt",
+    "spectral_entropy_similarity_topk",
+    "pairwise_coelution_hi",
+    "profile_cos",
+    "library_rmsd",
+    "scribe_score",
+    "frag_ref_corr_topk_weighted",
+    "frag_loo_ref_corr_mean",
+    "frag_cosine",
+    "coelution_mean",
+    "evidence",
+    "ref_corr",
+    "frac_frags_apex_aligned",
+    "log_apex_intensity",
+    "log_total_matched_intensity",
+    "n_matched_fragments",
+    "matched_fraction",
+    "rt_error_abs",
+    "rt_error_over_peak_width",
+    "log_mono_ms1",
+    "ms1_isotope_cosine_apex",
+    "gaussian_fit_r2",
+    "apex_prominence",
+    "median_abs_frag_ppm",
+    "n_peak_scans",
+];
+
+/// The rows `rescore.prefilter_keep_decoys` keeps, or `None` when the prefilter cannot run (no
+/// prefilter column in the table, a non-finite value, which the full validation reports, or
+/// too few confident targets to fit on); the rescore then keeps every PSM and says why.
+fn prefilter_mask(
+    p: &RescoreParams,
+    available: &[String],
+    is_decoy: &[bool],
+    base: &[u32],
+    prelim: &[f64],
+    total_rows: usize,
+) -> Result<Option<Vec<bool>>> {
+    let wanted: Vec<String> = match &p.cfg.prefilter_features {
+        Some(v) => v.clone(),
+        None => DEFAULT_PREFILTER_FEATURES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    };
+    let cols: Vec<String> = wanted
+        .iter()
+        .filter(|n| available.contains(n))
+        .cloned()
+        .collect();
+    if cols.len() < wanted.len() {
+        warn!(
+            missing = wanted.len() - cols.len(),
+            used = cols.len(),
+            "rescore: prefilter columns the competed table does not carry are skipped"
+        );
+    }
+    let skip = |why: &str| {
+        warn!("rescore: prefilter not applied ({why}); every PSM goes to the classifier");
+        Ok(None)
+    };
+    // A cut by decoy share on a pool with few decoys removes targets the q values need: one
+    // decoy in 316 PSMs put the cut at that decoy, kept 96 targets and raised the q floor
+    // 1/T above 1%, so nothing passed. The classifier's own minimum applies, and 100 at least.
+    let n_dec = is_decoy.iter().filter(|&&d| d).count();
+    if n_dec < p.cfg.min_train_decoys.max(PREFILTER_MIN_DECOYS) {
+        return skip("fewer decoys than rescore.min_train_decoys, and 100 at least");
+    }
+    if cols.is_empty() {
+        return skip("none of its feature columns is in the competed table");
+    }
+    if prelim.iter().any(|v| !v.is_finite()) {
+        return skip("a non-finite prelim_score");
+    }
+    let t = Instant::now();
+    let m = load_feature_matrix(p.competed, &cols, total_rows, None)?;
+    if m.find_non_finite().is_some() {
+        return skip("a non-finite value in its feature columns");
+    }
+    let Some(scores) = prefilter_scores(PrefilterInput {
+        features: &m,
+        is_decoy,
+        fold_key: base,
+        init_score: prelim,
+        folds: p.cfg.folds,
+        max_train_rows: 400_000,
+        num_iter: 3,
+        train_fdr: p.cfg.train_fdr,
+    }) else {
+        return skip("too few confident targets in a fold to fit on");
+    };
+    let mask = prefilter_decoy_cut_mask(&scores, is_decoy, p.cfg.prefilter_keep_decoys);
+    info!(
+        features = cols.len(),
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "rescore: prefilter model fitted out of fold"
+    );
+    Ok(Some(mask))
+}
+
 /// The engine's own copy of the feature values: one contiguous f32 buffer.
 fn load_feature_matrix(
     competed: &[String],
     feat_names: &[String],
     total_rows: usize,
+    keep: Option<&[bool]>,
 ) -> Result<FeatureMatrix> {
     let nf = feat_names.len();
     let mut m = FeatureMatrix::with_capacity(total_rows, nf);
@@ -3094,7 +3293,7 @@ fn load_feature_matrix(
     // so after the first batch it costs no allocation; the values are the ones
     // `for_each_feature_row` hands out, in the same rows.
     let mut block: Vec<f32> = Vec::new();
-    for_each_feature_batch(competed, feat_names, |b| {
+    for_each_feature_batch(competed, feat_names, keep, |b| {
         block.clear();
         block.resize(b.rows * nf, 0.0);
         b.rows_into(0, &mut block);
@@ -4383,6 +4582,53 @@ b
             .to_string()
     }
 
+    /// Under a prefilter mask the feature stream hands out exactly the kept rows of the
+    /// unmasked matrix, in order, every value bit for bit, across inputs and batches, and
+    /// numbers them densely.
+    #[test]
+    fn a_masked_feature_stream_is_the_kept_rows_of_the_matrix() {
+        let names: Vec<String> = ["f0", "f1", "f2"].iter().map(|s| s.to_string()).collect();
+        let a = scratch("mask_a.parquet");
+        let b = scratch("mask_b.parquet");
+        crafted_competed(&a, 7, 100.0, &names, false);
+        crafted_competed(&b, 5, 900.0, &names, false);
+        let competed = vec![a, b];
+        let full = load_feature_matrix(&competed, &names, 12, None).unwrap();
+        let keep: Vec<bool> = (0..12).map(|i| i % 3 != 1).collect();
+        let kept: Vec<usize> = (0..12).filter(|&i| keep[i]).collect();
+        let m = load_feature_matrix(&competed, &names, kept.len(), Some(&keep)).unwrap();
+        assert_eq!(m.rows(), kept.len());
+        for (k, &i) in kept.iter().enumerate() {
+            assert_eq!(
+                m.row(k).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                full.row(i).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "kept row {k} is source row {i}"
+            );
+        }
+        let mut firsts = Vec::new();
+        for_each_feature_batch_with(
+            &competed,
+            &names,
+            &mumdia_io::table::ScanOptions::default(),
+            |_| 2,
+            Some(&keep),
+            |b| {
+                firsts.push((b.first_row, b.rows));
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut next = 0;
+        for (first, rows) in firsts {
+            assert_eq!(first, next, "dense numbering of the kept rows");
+            next += rows;
+        }
+        assert_eq!(next, kept.len());
+        // A mask shorter than the rows read is an error, not a silent truncation.
+        let short = vec![true; 5];
+        assert!(load_feature_matrix(&competed, &names, 5, Some(&short)).is_err());
+    }
+
     #[test]
     fn streamed_feature_rows_are_the_matrix_rows() {
         // The streamed handoff never builds a `FeatureMatrix`, so the equality that has to
@@ -4395,7 +4641,7 @@ b
         crafted_competed(&b, 5, 900.0, &names, true);
         let competed = vec![a, b];
 
-        let m = load_feature_matrix(&competed, &names, 12).unwrap();
+        let m = load_feature_matrix(&competed, &names, 12, None).unwrap();
         assert_eq!(m.rows(), 12);
         let mut seen: Vec<(usize, Vec<f32>)> = Vec::new();
         for_each_feature_row(&competed, &names, |i, v| {
@@ -4420,7 +4666,7 @@ b
         // The batch form's own scan finds it too, in the batch that holds it and in no
         // earlier one.
         let mut found = Vec::new();
-        for_each_feature_batch(&competed, &names, |b| {
+        for_each_feature_batch(&competed, &names, None, |b| {
             found.push((b.first_row, b.first_non_finite()));
             Ok(())
         })
@@ -4452,7 +4698,7 @@ b
         .unwrap();
         let names: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
         let mut got = None;
-        for_each_feature_batch(std::slice::from_ref(&path), &names, |b| {
+        for_each_feature_batch(std::slice::from_ref(&path), &names, None, |b| {
             got = b.first_non_finite();
             Ok(())
         })
@@ -4482,7 +4728,7 @@ b
         crafted_competed(&a, 2_500, 100.0, &names, false);
         crafted_competed(&b, 1_300, 900.0, &names, true);
         let competed = vec![a, b];
-        let m = load_feature_matrix(&competed, &names, 3_800).unwrap();
+        let m = load_feature_matrix(&competed, &names, 3_800, None).unwrap();
         let mut rows = FeatureMatrix::with_capacity(3_800, names.len());
         for_each_feature_row(&competed, &names, |_, v| {
             rows.push_row(v);
@@ -4708,7 +4954,7 @@ b
         let pform = flat(&(0..n).map(|i| format!("PEPTIDEK/{i}")).collect::<Vec<_>>());
         let protein = flat(&(0..n).map(|i| format!("sp|P{i:05}|X")).collect::<Vec<_>>());
         let mz: Vec<f64> = (0..n).map(|i| 400.0 + i as f64 * 1.5).collect();
-        let m = load_feature_matrix(&competed, &names, n).unwrap();
+        let m = load_feature_matrix(&competed, &names, n, None).unwrap();
 
         for use_pq in [true, false] {
             let from_matrix = SidecarPaths {
@@ -4767,6 +5013,7 @@ b
                         &names,
                         &scan,
                         |_| batch,
+                        None,
                         |b| w.push_batch(b),
                     )
                     .unwrap();
@@ -4855,8 +5102,8 @@ b
                 .flat_map(|i| m.row(i).iter().map(|v| v.to_bits()).collect::<Vec<_>>())
                 .collect()
         };
-        let m_mixed = load_feature_matrix(&mixed, &names, n).unwrap();
-        let m_narrowed = load_feature_matrix(&narrowed, &names, n).unwrap();
+        let m_mixed = load_feature_matrix(&mixed, &names, n, None).unwrap();
+        let m_narrowed = load_feature_matrix(&narrowed, &names, n, None).unwrap();
         assert_eq!(bits(&m_mixed), bits(&m_narrowed), "the matrix differs");
         assert_eq!(m_mixed.find_non_finite(), Some((0, 1)), "the null is NaN");
         assert_eq!(m_narrowed.find_non_finite(), Some((0, 1)));
@@ -4892,6 +5139,7 @@ b
                         &names,
                         &mumdia_io::table::ScanOptions::default(),
                         |_| batch,
+                        None,
                         |b| w.push_batch(b),
                     )
                     .unwrap();
@@ -4956,7 +5204,7 @@ b
         let pform = flat(&(0..n).map(|i| format!("PEPTIDEK/{i}")).collect::<Vec<_>>());
         let protein = flat(&(0..n).map(|i| format!("sp|P{i:05}|X")).collect::<Vec<_>>());
         let mz: Vec<f64> = (0..n).map(|i| 400.0 + i as f64 * 1.5).collect();
-        let m = load_feature_matrix(&competed, &names, n).unwrap();
+        let m = load_feature_matrix(&competed, &names, n, None).unwrap();
 
         let parquet = SidecarPaths {
             handoff: scratch("rawref.features.parquet"),
@@ -5068,6 +5316,7 @@ b
                 &names,
                 &mumdia_io::table::ScanOptions::default(),
                 |_| batch,
+                None,
                 |b| w.push_batch(b),
             )
             .unwrap();
@@ -5207,6 +5456,7 @@ b
                 &names,
                 &mumdia_io::table::ScanOptions::default(),
                 |_| 16_384,
+                None,
                 |b| w.push_batch(b),
             )
             .unwrap();

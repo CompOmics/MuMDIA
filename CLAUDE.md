@@ -703,6 +703,18 @@ sections 10-16:
 - Reference point, 2026-09-05: a complete HYE single run is 17:52 at 16.5 GiB on 32 threads
   (extract 16.5 GiB is the tallest stage, `extract.windows_in_flight: 8` takes it to 12.3),
   and the six-run pooled rescore is 18 minutes at 15.9 GB for 72,344 peptides.
+- `rescore.prefilter_keep_decoys` (default 0.35 since 2026-10-17) drops the weakest competed
+  PSMs before the classifier: an out-of-fold logistic regression on 32 feature columns, cut
+  at the score where 35% of the decoys remain, targets and decoys alike, so the share of rows
+  kept follows the pool (36% diaPASEF, 49% Astral). Measured within 0.11% of the peptides on
+  diaPASEF, Astral and Orbitrap pools (seeds), with the HeLa species-entrapment FDP (1.81%
+  against 1.79%) and the single-cell carbamidomethyl null (379 against 374) unchanged, for
+  41-45% of the rescore wall and 54-60% of its peak. A cut by a fixed share of rows was
+  refuted (-0.75% on Astral at 35%): the loss follows the share of decoys kept. It stands
+  aside with a warning when a fold has too few confident targets (3 of 24 single-cell
+  files) or the pool has fewer than 100 decoys. Under `native_tda` it is a sensitivity gain
+  as well (Astral +8.8%; HeLa +28.7% human precursors per run at a species-entrapment FDP of
+  2.01% against 2.08%). docs/35 section 16.
 
 ### Sidecar and IO contracts
 
