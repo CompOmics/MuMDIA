@@ -2796,6 +2796,13 @@ pub struct RescoreConfig {
     /// decoys must be checked with an entrapment (docs/35_diapasef.md section 16).
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub prefilter_keep: f64,
+    /// The same prefilter, cut by decoys instead of rows: keep the highest-scoring PSMs down
+    /// to the one that brings in this fraction of the decoys, so the share of rows kept
+    /// follows the pool (more where many targets are identifiable). 0 (default) is off; at
+    /// most one of `prefilter_keep` and `prefilter_keep_decoys` may be set. Must be in
+    /// [0, 1). Benchmark-gated like `prefilter_keep`.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub prefilter_keep_decoys: f64,
     /// The feature columns the prefilter model reads; unset is a default list of agreement,
     /// co-elution, intensity, matched-count, retention-time, MS1 and peak-shape features.
     /// Names the competed table does not carry are skipped with a warning.
@@ -2989,6 +2996,7 @@ impl Default for RescoreConfig {
             num_iter: 10,
             max_feature_matrix_gib: 0.0, // no ceiling; previous behaviour
             prefilter_keep: 0.0,         // off; benchmark-gated
+            prefilter_keep_decoys: 0.0,  // off; benchmark-gated
             prefilter_features: None,
             python: None,
             percolator_bin: None,
@@ -3878,6 +3886,19 @@ impl Config {
         {
             return Err(Invalid(
                 "rescore.prefilter_keep must be finite and in [0, 1) (0 keeps every PSM).".into(),
+            ));
+        }
+        if !self.rescore.prefilter_keep_decoys.is_finite()
+            || !(0.0..1.0).contains(&self.rescore.prefilter_keep_decoys)
+        {
+            return Err(Invalid(
+                "rescore.prefilter_keep_decoys must be finite and in [0, 1) (0 is off).".into(),
+            ));
+        }
+        if self.rescore.prefilter_keep > 0.0 && self.rescore.prefilter_keep_decoys > 0.0 {
+            return Err(Invalid(
+                "set at most one of rescore.prefilter_keep and rescore.prefilter_keep_decoys."
+                    .into(),
             ));
         }
         if self.rescore.num_iter == 0 {

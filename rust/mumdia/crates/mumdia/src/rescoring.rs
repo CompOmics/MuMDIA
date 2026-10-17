@@ -700,20 +700,47 @@ pub fn prefilter_scores(inp: PrefilterInput) -> Option<Vec<f64>> {
     Some(out)
 }
 
-/// Which rows a cut keeps: the `keep` fraction of the rows with the highest `scores`,
-/// whatever their labels, ties broken by row index so the cut is deterministic.
-pub fn prefilter_keep_mask(scores: &[f64], keep: f64) -> Vec<bool> {
-    let n = scores.len();
-    let k = ((n as f64) * keep.clamp(0.0, 1.0)).round() as usize;
-    let mut order: Vec<u32> = (0..n as u32).collect();
+/// Row indices by descending `scores`, ties broken by row index so every cut is deterministic.
+fn prefilter_order(scores: &[f64]) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..scores.len() as u32).collect();
     order.par_sort_unstable_by(|&a, &b| {
         scores[b as usize]
             .total_cmp(&scores[a as usize])
             .then(a.cmp(&b))
     });
+    order
+}
+
+/// Which rows a cut keeps: the `keep` fraction of the rows with the highest `scores`,
+/// whatever their labels, ties broken by row index so the cut is deterministic.
+pub fn prefilter_keep_mask(scores: &[f64], keep: f64) -> Vec<bool> {
+    let n = scores.len();
+    let k = ((n as f64) * keep.clamp(0.0, 1.0)).round() as usize;
     let mut mask = vec![false; n];
-    for &i in &order[..k.min(n)] {
+    for &i in &prefilter_order(scores)[..k.min(n)] {
         mask[i as usize] = true;
+    }
+    mask
+}
+
+/// Which rows a decoy-fraction cut keeps: the highest-scoring rows down to the one that
+/// brings in the `keep_decoys` fraction of the decoys, targets and decoys alike above it.
+/// The share of rows kept then follows the pool: a pool with many identifiable targets keeps
+/// more rows than one where most targets look like decoys, at the same decoy count.
+pub fn prefilter_decoy_cut_mask(scores: &[f64], is_decoy: &[bool], keep_decoys: f64) -> Vec<bool> {
+    let n = scores.len();
+    let n_dec = is_decoy.iter().filter(|&&d| d).count();
+    let want = ((n_dec as f64) * keep_decoys.clamp(0.0, 1.0)).ceil() as usize;
+    let mut mask = vec![false; n];
+    let mut seen = 0usize;
+    for &i in &prefilter_order(scores) {
+        if seen >= want {
+            break;
+        }
+        mask[i as usize] = true;
+        if is_decoy[i as usize] {
+            seen += 1;
+        }
     }
     mask
 }
@@ -1563,5 +1590,19 @@ mod tests {
             }
         }
         assert!(ts / tn as f64 > ds / dn as f64);
+    }
+    /// The decoy-fraction cut stops at the decoy that completes the requested share, and the
+    /// targets above it are kept whatever their number.
+    #[test]
+    fn the_decoy_cut_keeps_rows_down_to_the_requested_decoy_share() {
+        // Scores descending by index: T T D T D T D D (decoys at 2, 4, 6, 7).
+        let scores = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        let dec = [false, false, true, false, true, false, true, true];
+        let m = prefilter_decoy_cut_mask(&scores, &dec, 0.5);
+        assert_eq!(m, [true, true, true, true, true, false, false, false]);
+        let all = prefilter_decoy_cut_mask(&scores, &dec, 1.0);
+        assert_eq!(all.iter().filter(|&&k| k).count(), 8);
+        let none = prefilter_decoy_cut_mask(&scores, &dec, 0.0);
+        assert!(none.iter().all(|&k| !k));
     }
 }

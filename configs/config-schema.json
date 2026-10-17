@@ -3047,6 +3047,21 @@
       "source_struct": "RescoreConfig"
     },
     {
+      "path": "rescore.prefilter_keep_decoys",
+      "name": "prefilter_keep_decoys",
+      "section": "rescore",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "The same prefilter, cut by decoys instead of rows: keep the highest-scoring PSMs down to the one that brings in this fraction of the decoys, so the share of rows kept follows the pool (more where many targets are identifiable). 0 (default) is off; at most one of `prefilter_keep` and `prefilter_keep_decoys` may be set. Must be in [0, 1). Benchmark-gated like `prefilter_keep`.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "RescoreConfig"
+    },
+    {
       "path": "rescore.prefilter_features",
       "name": "prefilter_features",
       "section": "rescore",

@@ -18,8 +18,8 @@ use tracing::{info, warn};
 
 use crate::fdr::{entrapment_q, target_decoy_q_by, target_decoy_q_split};
 use crate::rescoring::{
-    percolator_lite, prefilter_keep_mask, prefilter_scores, FeatureMatrix, PrefilterInput,
-    RescoreInput,
+    percolator_lite, prefilter_decoy_cut_mask, prefilter_keep_mask, prefilter_scores,
+    FeatureMatrix, PrefilterInput, RescoreInput,
 };
 use crate::stages::features::FeatureSchema;
 
@@ -613,11 +613,12 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     if let Some(l) = bad_label {
         anyhow::bail!("unknown PSM label {l:?}; expected \"target\" or \"decoy\"");
     }
-    // `rescore.prefilter_keep`: drop the PSMs a quick out-of-fold linear model scores
+    // `rescore.prefilter_keep` or `prefilter_keep_decoys`: drop the PSMs a quick out-of-fold linear model scores
     // lowest, before anything reads the full feature set. Every per-row column is cut to the
     // kept rows here, and the feature pass below skips the dropped ones, so the classifier,
     // the q values and the scored table see the kept rows only.
-    let keep_mask: Option<Vec<bool>> = if p.cfg.prefilter_keep > 0.0 && total_rows > 0 {
+    let prefilter_on = p.cfg.prefilter_keep > 0.0 || p.cfg.prefilter_keep_decoys > 0.0;
+    let keep_mask: Option<Vec<bool>> = if prefilter_on && total_rows > 0 {
         prefilter_mask(
             &p,
             &expected_schema.feature_columns,
@@ -653,11 +654,12 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
             decoys = n_dec_all,
             decoys_kept = n_dec_kept,
             targets_kept = keep.len() - n_dec_kept,
-            "rescore: prefilter kept the top {:.0}% of the PSMs by an out-of-fold linear score",
-            100.0 * p.cfg.prefilter_keep
+            "rescore: prefilter kept {:.1}% of the PSMs by an out-of-fold linear score",
+            100.0 * keep.len() as f64 / total_rows.max(1) as f64
         );
         prefilter_report = Some(serde_json::json!({
             "keep": p.cfg.prefilter_keep,
+            "keep_decoys": p.cfg.prefilter_keep_decoys,
             "psms": total_rows,
             "kept": keep.len(),
             "decoys": n_dec_all,
@@ -1370,7 +1372,7 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     if let Some(env) = &nn_env {
         params["nn_env"] = json!(env);
     }
-    // Only under `rescore.prefilter_keep`, so a report without it is unchanged.
+    // Only under `rescore.prefilter_keep` or `prefilter_keep_decoys`, so a report without it is unchanged.
     if let Some(pre) = prefilter_report {
         params["prefilter"] = pre;
     }
@@ -3203,7 +3205,7 @@ const DEFAULT_PREFILTER_FEATURES: &[&str] = &[
     "n_peak_scans",
 ];
 
-/// The rows `rescore.prefilter_keep` keeps, or `None` when the prefilter cannot run (no
+/// The rows `rescore.prefilter_keep` (or `prefilter_keep_decoys`) keeps, or `None` when the prefilter cannot run (no
 /// prefilter column in the table, a non-finite value, which the full validation reports, or
 /// too few confident targets to fit on); the rescore then keeps every PSM and says why.
 fn prefilter_mask(
@@ -3260,7 +3262,11 @@ fn prefilter_mask(
     }) else {
         return skip("too few confident targets in a fold to fit on");
     };
-    let mask = prefilter_keep_mask(&scores, p.cfg.prefilter_keep);
+    let mask = if p.cfg.prefilter_keep_decoys > 0.0 {
+        prefilter_decoy_cut_mask(&scores, is_decoy, p.cfg.prefilter_keep_decoys)
+    } else {
+        prefilter_keep_mask(&scores, p.cfg.prefilter_keep)
+    };
     info!(
         features = cols.len(),
         elapsed_ms = t.elapsed().as_millis() as u64,
