@@ -3032,21 +3032,6 @@
       "source_struct": "RescoreConfig"
     },
     {
-      "path": "rescore.prefilter_keep",
-      "name": "prefilter_keep",
-      "section": "rescore",
-      "rust_type": "f64",
-      "kind": "float",
-      "optional": false,
-      "default": 0.0,
-      "default_text": "0.0",
-      "help": "Keep only this fraction of the competed PSMs for the classifier, the ones a quick cross-validated linear model scores highest; 0 (default) keeps every PSM. The model is fitted per experiment on `prefilter_features` (a default list when unset): for each fold a logistic regression of the targets at `train_fdr` against the decoys of a 400,000-row sample of the other folds, refitted three times, and every PSM is scored by the model of the fold it is held out of, on the rescore's own fold keys. The cut takes the top fraction of that score whatever the label, so the classifier, its q values and the scored table see only the kept rows; a dropped PSM is not identified. Must be in [0, 1). Benchmark-gated: a cut on a model trained against the decoys must be checked with an entrapment (docs/35_diapasef.md section 16).",
-      "gates": [
-        "benchmark-gated"
-      ],
-      "source_struct": "RescoreConfig"
-    },
-    {
       "path": "rescore.prefilter_keep_decoys",
       "name": "prefilter_keep_decoys",
       "section": "rescore",
@@ -3055,7 +3040,7 @@
       "optional": false,
       "default": 0.0,
       "default_text": "0.0",
-      "help": "The same prefilter, cut by decoys instead of rows: keep the highest-scoring PSMs down to the one that brings in this fraction of the decoys, so the share of rows kept follows the pool (more where many targets are identifiable). 0 (default) is off; at most one of `prefilter_keep` and `prefilter_keep_decoys` may be set. Must be in [0, 1). Benchmark-gated like `prefilter_keep`.",
+      "help": "Send only the strongest competed PSMs to the classifier: those a quick cross-validated linear model scores above the decoy that completes this fraction of the decoys; 0 (default) keeps every PSM. The model is fitted per experiment on `prefilter_features` (a default list when unset): for each fold a logistic regression of the targets at `train_fdr` against the decoys of a 400,000-row sample of the other folds, refitted three times, and every PSM is scored by the model of the fold it is held out of, on the rescore's own fold keys. Targets and decoys above the cut are all kept, so the share of rows kept follows the pool: 36% on a six-run diaPASEF pool, 49% on a six-run Astral pool at 0.35. The classifier, its q values and the scored table see only the kept rows; a dropped PSM is not identified. When the model cannot be fitted (too few confident targets, a missing or non-finite column) every PSM goes to the classifier with a warning. Must be in [0, 1). Benchmark-gated (docs/35_diapasef.md section 16).",
       "gates": [
         "benchmark-gated"
       ],

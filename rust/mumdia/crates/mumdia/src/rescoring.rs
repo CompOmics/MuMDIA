@@ -608,7 +608,7 @@ pub struct PrefilterInput<'a> {
 }
 
 /// An out-of-fold linear score per PSM, for dropping the weakest PSMs before the rescore
-/// (`rescore.prefilter_keep`).
+/// (`rescore.prefilter_keep_decoys`).
 ///
 /// The semi-supervised fit of [`percolator_lite`] on a budget: for each fold, the training
 /// rows are every `stride`-th row outside the fold (`max_train_rows` at most), the model is
@@ -711,18 +711,6 @@ fn prefilter_order(scores: &[f64]) -> Vec<u32> {
     order
 }
 
-/// Which rows a cut keeps: the `keep` fraction of the rows with the highest `scores`,
-/// whatever their labels, ties broken by row index so the cut is deterministic.
-pub fn prefilter_keep_mask(scores: &[f64], keep: f64) -> Vec<bool> {
-    let n = scores.len();
-    let k = ((n as f64) * keep.clamp(0.0, 1.0)).round() as usize;
-    let mut mask = vec![false; n];
-    for &i in &prefilter_order(scores)[..k.min(n)] {
-        mask[i as usize] = true;
-    }
-    mask
-}
-
 /// Which rows a decoy-fraction cut keeps: the highest-scoring rows down to the one that
 /// brings in the `keep_decoys` fraction of the decoys, targets and decoys alike above it.
 /// The share of rows kept then follows the pool: a pool with many identifiable targets keeps
@@ -751,8 +739,8 @@ mod tests {
     use crate::fdr::target_decoy_q;
 
     /// The prefilter scores every PSM out of fold, and on a pool where the targets carry
-    /// signal its cut keeps the signal: the top half holds nearly all the high-signal
-    /// targets and decoys and plain targets in equal shares.
+    /// signal its cut keeps the signal: the cut at half the decoys holds nearly all the
+    /// high-signal targets and keeps decoys and plain targets in equal shares.
     #[test]
     fn the_prefilter_keeps_signal_and_treats_decoys_like_plain_targets() {
         let n = 20_000usize;
@@ -795,8 +783,7 @@ mod tests {
             s.iter().all(|v| v.is_finite()),
             "every PSM is scored out of fold"
         );
-        let keep = prefilter_keep_mask(&s, 0.5);
-        assert_eq!(keep.iter().filter(|&&k| k).count(), n / 2);
+        let keep = prefilter_decoy_cut_mask(&s, &is_decoy, 0.5);
         let share = |sel: &dyn Fn(usize) -> bool| {
             let (k, t) = (0..n)
                 .filter(|&i| sel(i))

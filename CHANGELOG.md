@@ -194,7 +194,22 @@ than a number. Both are recorded in every run's `manifest.json`.
   window-mean gate at 0.6, 26.8 instead of 41.6 min, 96,955 instead of 98,524 peptides and
   86,877 instead of 89,973 ProteoBench ions; a window-mean threshold of 0.75 keeps 45% for
   96,154 and 84,912. The gate diagnostics carry the window-mean score (`gate_window_mean`).
-  (docs/35_diapasef.md section 16.)
+  On the second diaPASEF acquisition (six 5-min HYE runs, two NN seeds) 0.845 gave 38,478
+  instead of 39,164 peptides in 22.5-23.5 instead of 42-46 min, and on the E. coli
+  entrapment run (three seeds) 13,892 instead of 14,121 peptides at an FDP of 0.32-0.35%
+  against 0.30-0.38%. (docs/35_diapasef.md section 16.)
+- **A prefilter before the classifier** (`rescore.prefilter_keep_decoys`, opt-in): a
+  cross-validated logistic regression on 32 feature columns (`rescore.prefilter_features`)
+  scores every competed PSM out of fold, and only the PSMs above the decoy that completes the
+  given fraction of the decoys go to the classifier. The share of rows kept follows the pool.
+  At 0.35, pooled rescores of stored competed tables (NN seeds 0-2 unless stated): six HYE
+  diaPASEF runs (seed 0) 98,412 against 98,524 peptides at 1% in 8:39 instead of 14:56 at
+  20.6 instead of 51.0 GB; six Astral HYE runs 116,660 against 116,571; one HYE Orbitrap run
+  63,053 against 62,960; 22 HeLa runs on a human + yeast + E. coli library 352,838 against
+  352,096 human precursors per run at a species-entrapment FDP of 1.81% against 1.79%, in
+  6:04 instead of 10:35 at 13.8 instead of 33.6 GB; 24 single cells pooled 169,007 against
+  168,249 precursors with 379 against 374 carbamidomethylated targets (the cells were not
+  alkylated). (docs/35_diapasef.md section 16.)
 - **Search-anchored multi-head calibration** (`rt_im_train.multihead_anchors = "search"`;
   `"auto"`, the default since the entry above, chooses it on runs short of seed anchors). The run that adapts the library (a single `run`, the
   first run of `run-experiment` under `rt_library_scope = first_run_only`, or every run under

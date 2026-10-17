@@ -2784,23 +2784,19 @@ pub struct RescoreConfig {
     /// the two ways out. It is not a batching implementation: sub-batching changes which
     /// PSMs share a pooled `q_value`, so it is the operator's decision, not a silent one.
     pub max_feature_matrix_gib: f64,
-    /// Keep only this fraction of the competed PSMs for the classifier, the ones a quick
-    /// cross-validated linear model scores highest; 0 (default) keeps every PSM. The model
-    /// is fitted per experiment on `prefilter_features` (a default list when unset): for each
-    /// fold a logistic regression of the targets at `train_fdr` against the decoys of a
-    /// 400,000-row sample of the other folds, refitted three times, and every PSM is scored
-    /// by the model of the fold it is held out of, on the rescore's own fold keys. The cut
-    /// takes the top fraction of that score whatever the label, so the classifier, its q
-    /// values and the scored table see only the kept rows; a dropped PSM is not
-    /// identified. Must be in [0, 1). Benchmark-gated: a cut on a model trained against the
-    /// decoys must be checked with an entrapment (docs/35_diapasef.md section 16).
-    #[serde(skip_serializing_if = "is_zero_f64")]
-    pub prefilter_keep: f64,
-    /// The same prefilter, cut by decoys instead of rows: keep the highest-scoring PSMs down
-    /// to the one that brings in this fraction of the decoys, so the share of rows kept
-    /// follows the pool (more where many targets are identifiable). 0 (default) is off; at
-    /// most one of `prefilter_keep` and `prefilter_keep_decoys` may be set. Must be in
-    /// [0, 1). Benchmark-gated like `prefilter_keep`.
+    /// Send only the strongest competed PSMs to the classifier: those a quick
+    /// cross-validated linear model scores above the decoy that completes this fraction of
+    /// the decoys; 0 (default) keeps every PSM. The model is fitted per experiment on
+    /// `prefilter_features` (a default list when unset): for each fold a logistic regression
+    /// of the targets at `train_fdr` against the decoys of a 400,000-row sample of the other
+    /// folds, refitted three times, and every PSM is scored by the model of the fold it is
+    /// held out of, on the rescore's own fold keys. Targets and decoys above the cut are all
+    /// kept, so the share of rows kept follows the pool: 36% on a six-run diaPASEF pool, 49%
+    /// on a six-run Astral pool at 0.35. The classifier, its q values and the scored table
+    /// see only the kept rows; a dropped PSM is not identified. When the model cannot be
+    /// fitted (too few confident targets, a missing or non-finite column) every PSM goes to
+    /// the classifier with a warning. Must be in [0, 1). Benchmark-gated
+    /// (docs/35_diapasef.md section 16).
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub prefilter_keep_decoys: f64,
     /// The feature columns the prefilter model reads; unset is a default list of agreement,
@@ -2995,7 +2991,6 @@ impl Default for RescoreConfig {
             train_fdr: 0.01,
             num_iter: 10,
             max_feature_matrix_gib: 0.0, // no ceiling; previous behaviour
-            prefilter_keep: 0.0,         // off; benchmark-gated
             prefilter_keep_decoys: 0.0,  // off; benchmark-gated
             prefilter_features: None,
             python: None,
@@ -3881,24 +3876,11 @@ impl Config {
                     .into(),
             ));
         }
-        if !self.rescore.prefilter_keep.is_finite()
-            || !(0.0..1.0).contains(&self.rescore.prefilter_keep)
-        {
-            return Err(Invalid(
-                "rescore.prefilter_keep must be finite and in [0, 1) (0 keeps every PSM).".into(),
-            ));
-        }
         if !self.rescore.prefilter_keep_decoys.is_finite()
             || !(0.0..1.0).contains(&self.rescore.prefilter_keep_decoys)
         {
             return Err(Invalid(
                 "rescore.prefilter_keep_decoys must be finite and in [0, 1) (0 is off).".into(),
-            ));
-        }
-        if self.rescore.prefilter_keep > 0.0 && self.rescore.prefilter_keep_decoys > 0.0 {
-            return Err(Invalid(
-                "set at most one of rescore.prefilter_keep and rescore.prefilter_keep_decoys."
-                    .into(),
             ));
         }
         if self.rescore.num_iter == 0 {

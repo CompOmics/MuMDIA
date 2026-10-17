@@ -1185,6 +1185,54 @@ At the same share of candidates the diaPASEF gate loses about a third of what a 
 window-mean threshold loses (-1.6% against -2.4% peptides, -3.4% against -5.6% ions), and the
 quantification is as good or slightly better, because what is lost is weak.
 
+The second diaPASEF acquisition (six 5-min HYE runs, two NN seeds) agrees: at 0.845, 38,209 and
+38,747 against 39,297 and 39,030 peptides at 1% (-1.75%), in 22.5-23.5 against 42-46 min. On
+the E. coli entrapment run (three NN seeds) the gate gave 13,908, 13,879 and 13,889 against
+14,251, 13,980 and 14,133 peptides, at an entrapment FDP of 0.35, 0.33 and 0.32% against 0.30,
+0.38 and 0.33%. A threshold of 0.82 (5-min HYE, seed 0) kept more candidates and took 29 min
+for 38,406 peptides, no better than 0.845.
+
+### A prefilter before the classifier
+
+On a large pool the classifier is the rescore's cost, and most of what it scores is never
+identified. `rescore.prefilter_keep_decoys` (opt-in) removes that part first. A logistic
+regression on 32 feature columns (agreement, co-elution, intensity, matched counts, retention
+time, MS1 and peak shape; `rescore.prefilter_features` replaces the list) is fitted per fold on
+a sample of at most 400,000 rows of the other folds, the targets at `train_fdr` against the
+decoys, refitted three times on its own scores, and every PSM is scored by the model of the
+fold it is held out of. The PSMs above the decoy that completes the given fraction of the
+decoys go to the classifier, targets and decoys alike; the rest are dropped before the full
+feature set is read.
+
+The cut is set by decoys, not by rows, because a fixed share of rows does not carry across
+acquisitions. Keeping the top 35% of the rows lost 0.27% of the peptides on the six-run
+diaPASEF pool, where that kept 34% of the decoys, but 0.75% on a six-run Astral pool, where
+most targets rank above most decoys and the same 35% kept only 19% of the decoys. On every pool
+the loss followed the share of decoys kept, not of rows.
+
+Pooled rescores of stored competed tables, NN seeds 0-2 except where stated, at 0.35:
+
+| pool | PSMs | rows kept | peptides at 1% (keep all) | with the prefilter | wall | peak RSS |
+|---|---|---|---|---|---|---|
+| six HYE diaPASEF runs (seed 0) | 28.5 M | 36.4% | 98,524 | 98,412 | 14:56 -> 8:39 | 51.0 -> 20.6 GB |
+| six Astral HYE runs | 3.13 M | 48.7% | 116,571 | 116,660 | 5:49 -> 3:33 | 7.2 -> 4.1 GB |
+| one HYE Orbitrap run | 1.84 M | 39.0% | 62,960 | 63,053 | | 3.9 -> 2.2 GB |
+
+At 0.45 the three pools gave 98,546, 116,882 and 62,816: the same within seed noise, for less
+of the saving.
+
+The model is fitted on the target and decoy labels, so the cut was checked against nulls the
+labels do not see. 22 HeLa runs searched against a human + yeast + E. coli library (accepted
+yeast and E. coli targets are false): 352,838 against 352,096 human precursors per run at a run
+PSM q of 1%, entrapment FDP 1.81% against 1.79%, and 23,734 against 23,781 precursors at a
+precursor q of 1% at 1.75% either way; the rescore took 6:04 instead of 10:35 at 13.8 instead of
+33.6 GB. 24 single cells, which were not alkylated, on a library with free and
+carbamidomethylated cysteine (accepted carbamidomethylated targets are false): pooled, 169,007
+against 168,249 precursors per run with 379 against 374 carbamidomethylated targets over three
+seeds, 2:59 instead of 5:06 at 7.1 instead of 15.6 GB; per file, 161,055 against 161,371 with
+144 against 147. On three of the 24 single-cell files a fold had fewer than 10 confident targets
+to fit on, and the prefilter stood aside with a warning.
+
 ### MS1 noise
 
 The dnoise tool (P. T. Garrett, J. K. Diedrich and J. R. Yates III, bioRxiv 2026,
