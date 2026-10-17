@@ -3169,6 +3169,9 @@ fn for_each_feature_batch_with(
 /// The prefilter's default columns (`rescore.prefilter_features`): the agreement and
 /// co-elution scores that best separated targets from decoys on a HYE diaPASEF run, and one
 /// or two of each other family, so the per-experiment fit has varied evidence to weigh.
+/// Fewest decoys a pool needs before `rescore.prefilter_keep_decoys` cuts it.
+const PREFILTER_MIN_DECOYS: usize = 100;
+
 const DEFAULT_PREFILTER_FEATURES: &[&str] = &[
     "pairwise_coelution_weighted",
     "wf1_cos_sqrt",
@@ -3238,6 +3241,13 @@ fn prefilter_mask(
         warn!("rescore: prefilter not applied ({why}); every PSM goes to the classifier");
         Ok(None)
     };
+    // A cut by decoy share on a pool with few decoys removes targets the q values need: one
+    // decoy in 316 PSMs put the cut at that decoy, kept 96 targets and raised the q floor
+    // 1/T above 1%, so nothing passed. The classifier's own minimum applies, and 100 at least.
+    let n_dec = is_decoy.iter().filter(|&&d| d).count();
+    if n_dec < p.cfg.min_train_decoys.max(PREFILTER_MIN_DECOYS) {
+        return skip("fewer decoys than rescore.min_train_decoys, and 100 at least");
+    }
     if cols.is_empty() {
         return skip("none of its feature columns is in the competed table");
     }

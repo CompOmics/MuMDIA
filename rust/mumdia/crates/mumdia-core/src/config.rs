@@ -2794,8 +2794,9 @@ pub struct RescoreConfig {
     /// kept, so the share of rows kept follows the pool: 36% on a six-run diaPASEF pool, 49%
     /// on a six-run Astral pool at 0.35. The classifier, its q values and the scored table
     /// see only the kept rows; a dropped PSM is not identified. When the model cannot be
-    /// fitted (too few confident targets, a missing or non-finite column) every PSM goes to
-    /// the classifier with a warning. Must be in [0, 1). The default since 2026-10-17: at
+    /// fitted (too few confident targets, a missing or non-finite column) or the pool has
+    /// fewer decoys than `min_train_decoys` (100 at least) every PSM goes to the classifier
+    /// with a warning. Must be in [0, 1). The default since 2026-10-17: at
     /// 0.35 within 0.11% of the peptides on diaPASEF, Astral and Orbitrap pools, an
     /// unchanged species-entrapment FDP and carbamidomethyl null, for 41-45% of the rescore
     /// wall time and 54-60% of its peak memory (docs/35_diapasef.md section 16).
