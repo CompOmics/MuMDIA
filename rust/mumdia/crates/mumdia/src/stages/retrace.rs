@@ -286,7 +286,7 @@ impl Skeleton {
     /// The report parameter of a skeleton centroid table: `{"ms1": bool, "rows": n}`.
     pub const PARAM: &'static str = "retrace_skeleton";
 
-    /// Whether extract leaves the row as zeros: exactly the rows [`row_kind`] rebuilds.
+    /// Whether extract leaves the row as zeros: exactly the rows `row_kind` rebuilds.
     pub fn zeroes(
         &self,
         has_points: bool,
