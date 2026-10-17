@@ -283,6 +283,39 @@ def peptide_fold(peptide, folds):
     return int(hashlib.md5(strip_pep(peptide).encode()).hexdigest(), 16) % folds
 
 
+def mix_fold_keys(keys):
+    """The splitmix64 finaliser of each key (uint64, wrapping): a bijection that spreads
+    keys sharing a factor. The same mix as `rescoring::mix_fold_key` in the engine."""
+    z = keys.astype(np.uint64) + np.uint64(0x9E3779B97F4A7C15)
+    z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return z ^ (z >> np.uint64(31))
+
+
+def fold_keys_for(fold_keys, folds):
+    """The keys the folds are taken from: the engine's keys while `key % folds` gives every
+    fold at least half its share of the rows, otherwise their mix (`mix_fold_keys`).
+
+    A library whose keys share a factor with `folds` left folds empty under the plain
+    modulo: every base_peptide_id of an imported HYE library was even, so two folds put
+    every row in fold 0 and four used only two. The mix keeps a key's rows (a target and
+    its paired decoy) together, and the plain modulo leaves every other library's folds,
+    and so its scores, as they were. The engine's classifiers apply the same rule
+    (`rescoring::fold_assignment`). Decided once over all rows, since the streaming backend
+    folds chunk by chunk."""
+    if fold_keys is None or folds < 2 or len(fold_keys) == 0:
+        return fold_keys
+    counts = np.bincount((fold_keys % folds).astype(np.int64), minlength=folds)
+    if int(counts.min()) * 2 * folds >= len(fold_keys):
+        return fold_keys
+    print(
+        "nn_rescore_worker: the fold keys modulo %d leave a fold under half its share "
+        "(%s); folding on a mix of the keys instead" % (folds, counts.tolist()),
+        flush=True,
+    )
+    return mix_fold_keys(fold_keys)
+
+
 def folds_for(peptides, fold_keys, folds, off=0):
     """Fold index per row, preferring the engine's explicit keys.
 
@@ -840,6 +873,36 @@ def _fill_raw_block(src, col_idx, dst):
     return _block_moments(dst)
 
 
+def release_rows(matrix, r0, r1):
+    """Drop rows `[r0, r1)` of a read-only memory-mapped matrix from this process's
+    resident set (`MADV_DONTNEED`), once they have been copied out.
+
+    A mapped page that has been read stays in the process's RSS until it is unmapped, so
+    copying the 48 GB raw handoff of the six-run HYE diaPASEF pool into a 48 GB matrix
+    held both, and the rescore's resident peak was 95 GB against 51 GB once the copy was
+    done. The pages stay in the page cache, so a later read only faults them back in, with
+    the same bytes: dropping a page that holds rows still to be copied costs a refault,
+    never a value. A no-op where the platform has no `madvise` (Windows) or the array is
+    not memory-mapped.
+    """
+    import mmap
+
+    mm = getattr(matrix, "_mmap", None)
+    flag = getattr(mmap, "MADV_DONTNEED", None)
+    if mm is None or flag is None or not hasattr(mm, "madvise") or r1 <= r0:
+        return
+    try:
+        base = np.frombuffer(mm, dtype=np.uint8).ctypes.data
+        row = matrix.strides[0]
+        a = matrix.ctypes.data - base + r0 * row
+        b = matrix.ctypes.data - base + r1 * row
+        a -= a % mmap.PAGESIZE
+        if b > a:
+            mm.madvise(flag, a, b - a)
+    except (OSError, ValueError, BufferError):
+        pass
+
+
 def fill_raw_matrix(matrix, col_idx, n, chunk, out, group_rows, threads=1, initializer=None):
     """Fill `out` (n x nf float32) from a raw handoff's matrix; return (s1, s2).
 
@@ -848,6 +911,8 @@ def fill_raw_matrix(matrix, col_idx, n, chunk, out, group_rows, threads=1, initi
     row groups are, each group into its `moment_blocks`, and the sub-blocks' partial sums
     are added in order. `col_idx` is the selected columns' positions in the matrix, or
     None for all of them in order. `threads` fill disjoint sub-blocks of a group at once.
+    Each group's rows of a memory-mapped `matrix` leave the resident set once copied
+    (`release_rows`).
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -871,6 +936,7 @@ def fill_raw_matrix(matrix, col_idx, n, chunk, out, group_rows, threads=1, initi
             for p1, p2 in parts:
                 s1 += p1
                 s2 += p2
+            release_rows(matrix, g0, g0 + rows)
             _detail("load: fill + moments", time.time() - tf)
     finally:
         if pool is not None:
@@ -2208,6 +2274,7 @@ def main():
             flush=True,
         )
 
+    fold_keys = fold_keys_for(fold_keys, FOLDS)
     _folds = lambda peptides, off=0: folds_for(peptides, fold_keys, FOLDS, off)
 
     mm_path = None

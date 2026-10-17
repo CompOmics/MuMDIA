@@ -742,6 +742,34 @@ def test_a_raw_handoff_of_another_version_is_refused(tmp_path):
             mod.read_raw_handoff(path)
 
 
+def test_released_rows_of_the_raw_matrix_read_back_unchanged(tmp_path):
+    """`release_rows` drops rows of the mapped raw matrix from the resident set once they
+    are copied (`MADV_DONTNEED` on Linux, a no-op elsewhere): a later read faults them back
+    in with the same bytes, a page shared with rows still to be copied included, and the
+    copy `fill_raw_matrix` makes, releasing as it goes, is the matrix exactly."""
+    import importlib.util
+
+    pytest.importorskip("pandas")
+    spec = importlib.util.spec_from_file_location(
+        "nn_rescore_worker_mod", SCRIPTS / "nn_rescore_worker.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    features, _keys, n = _identity_pool_f32(tmp_path)
+    raw = _raw_handoff_of(tmp_path, features)
+    m = mod.read_raw_handoff(raw)["matrix"]
+    want = np.array(m)
+    for r0, r1 in [(0, n), (3, 5), (5, 3), (n - 1, n)]:
+        mod.release_rows(m, r0, r1)
+        assert np.array_equal(np.asarray(m), want, equal_nan=True), (r0, r1)
+    # The fill writes a non-finite cell (the fixture has some) as 0.0.
+    copied = np.where(np.isfinite(want), want, np.float32(0.0)).astype(np.float32)
+    for threads in (1, 2):
+        out = np.empty_like(want)
+        mod.fill_raw_matrix(m, None, n, 7, out, 5, threads=threads)
+        assert np.array_equal(out, copied), threads
+        assert np.array_equal(np.asarray(m), want, equal_nan=True), threads
+
+
 def test_scoring_forward_does_not_depend_on_the_batch_address(torch_available):
     """The MLP forward must give the same bytes wherever its input batch sits in memory.
 

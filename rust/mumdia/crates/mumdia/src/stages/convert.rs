@@ -5,6 +5,7 @@
 //! Profile mzML spectra are centroided (simple local-maxima) so downstream matching sees
 //! discrete peaks.
 
+pub(crate) mod ms1_denoise;
 mod tdf;
 pub(crate) mod tims_frames;
 pub(crate) use tdf::RawTdf;

@@ -44,18 +44,28 @@ pub fn always(cfg: &Config, mh_heads: usize) -> bool {
 }
 
 /// Whether this run refits its multi-head calibration on search anchors, given the anchor
-/// cut its seed search reached (`rt_im_train::plan_anchors`). `search`: whenever a
-/// multi-head calibration runs (`mh_heads > 0`). `auto`: when one runs on an ungrouped run
-/// and the seed is short of anchors, fewer than `multihead_search_below` at `q_train` or
-/// only enough after relaxing `q_train` through `anchor_q_ladder`. `seed`: never.
-pub fn active(cfg: &Config, mh_heads: usize, plan: &AnchorPlan) -> bool {
+/// cut its seed search reached (`rt_im_train::plan_anchors`) and whether its spectra carry
+/// 1/K0 (`has_im`, `instrument::spectra_has_im`). `search`: whenever a multi-head
+/// calibration runs (`mh_heads > 0`). `auto`: when one runs on an ungrouped run that either
+/// carries 1/K0 (diaPASEF) or whose seed is short of anchors, fewer than
+/// `multihead_search_below` at `q_train` or only enough after relaxing `q_train` through
+/// `anchor_q_ladder`. `seed`: never.
+///
+/// The 1/K0 rule rests on a measurement, not on the anchor count: on the six 60 min HYE
+/// diaPASEF runs of the ProteoBench module the seed found 11,144 anchors, far above the
+/// threshold, and the search anchors still gave +5.7% peptides (93,061 to 98,373) and +6.5%
+/// ProteoBench ions; on the 15 min E. coli diaPASEF run +0.6% over three seeds with the
+/// entrapment FDP unchanged (docs/08 section 4f).
+pub fn active(cfg: &Config, mh_heads: usize, plan: &AnchorPlan, has_im: bool) -> bool {
     if mh_heads == 0 {
         return false;
     }
     match cfg.rt_im_train.multihead_anchors {
         MultiheadAnchors::Seed => false,
         MultiheadAnchors::Search => true,
-        MultiheadAnchors::Auto => cfg.groups.window_groups <= 1 && short_of_anchors(cfg, plan),
+        MultiheadAnchors::Auto => {
+            cfg.groups.window_groups <= 1 && (has_im || short_of_anchors(cfg, plan))
+        }
     }
 }
 
@@ -68,14 +78,21 @@ fn short_of_anchors(cfg: &Config, plan: &AnchorPlan) -> bool {
 
 /// [`active`], with one INFO line saying what `auto` chose and why. Called once per
 /// adapting run, before its multi-head calibration.
-pub fn decide(cfg: &Config, mh_heads: usize, plan: &AnchorPlan, out: &str) -> bool {
-    let search = active(cfg, mh_heads, plan);
+pub fn decide(cfg: &Config, mh_heads: usize, plan: &AnchorPlan, has_im: bool, out: &str) -> bool {
+    let search = active(cfg, mh_heads, plan, has_im);
     if mh_heads > 0
         && cfg.rt_im_train.multihead_anchors == MultiheadAnchors::Auto
         && cfg.groups.window_groups <= 1
     {
         let below = cfg.rt_im_train.multihead_search_below;
-        if search {
+        if search && !short_of_anchors(cfg, plan) {
+            info!(
+                run = %out,
+                seed_anchors = plan.n_anchors,
+                "rt-bootstrap: multihead_anchors = auto chose search anchors: the spectra carry \
+                 1/K0, so the run is searched once to refit its multi-head calibration"
+            );
+        } else if search {
             info!(
                 run = %out,
                 seed_anchors = plan.n_anchors,
@@ -93,7 +110,7 @@ pub fn decide(cfg: &Config, mh_heads: usize, plan: &AnchorPlan, out: &str) -> bo
                 seed_anchors = plan.n_anchors,
                 multihead_search_below = below,
                 "rt-bootstrap: multihead_anchors = auto kept the seed anchors: {} at q_train, \
-                 at least {below}",
+                 at least {below}, and no 1/K0",
                 plan.n_anchors
             );
         }
@@ -129,10 +146,11 @@ pub fn seed_library_path(search: bool, out: &str) -> String {
 }
 
 /// Under `multihead_anchors = auto`, record in `<library>.summary.json` what was chosen and
-/// on which count (`anchors_auto`: seed anchors, the anchor cut, the threshold, the choice).
+/// on which grounds (`anchors_auto`: seed anchors, the anchor cut, the threshold, whether
+/// the spectra carry 1/K0, the choice).
 /// Nothing under `seed` or `search`. The anchor source itself is recorded by [`refit`], or
 /// here as `seed` when `auto` kept the seed anchors.
-pub fn record_auto(cfg: &Config, plan: &AnchorPlan, search: bool, library: &str) {
+pub fn record_auto(cfg: &Config, plan: &AnchorPlan, has_im: bool, search: bool, library: &str) {
     if cfg.rt_im_train.multihead_anchors != MultiheadAnchors::Auto {
         return;
     }
@@ -141,6 +159,7 @@ pub fn record_auto(cfg: &Config, plan: &AnchorPlan, search: bool, library: &str)
             "seed_anchors": plan.n_anchors,
             "anchor_q": plan.q_train,
             "multihead_search_below": cfg.rt_im_train.multihead_search_below,
+            "ion_mobility": has_im,
             "chose": if search { "search" } else { "seed" },
         },
     });
@@ -674,10 +693,11 @@ mod tests {
         let mut search = Config::default();
         search.rt_im_train.multihead_anchors = MultiheadAnchors::Search;
         for p in [plan(0.01, 10), plan(0.01, 100_000), plan(0.05, 60)] {
-            assert!(!active(&seed, 80, &p));
-            assert!(active(&search, 80, &p));
+            assert!(!active(&seed, 80, &p, false));
+            assert!(!active(&seed, 80, &p, true));
+            assert!(active(&search, 80, &p, false));
             assert!(
-                !active(&search, 0, &p),
+                !active(&search, 0, &p, false),
                 "inert without a multi-head calibration"
             );
         }
@@ -699,26 +719,50 @@ mod tests {
         // Measured points: single cells (100-250) and a single-cell HeLa run (1,249) search;
         // Orbitrap AIF (5,025) and bulk Astral (13,786) keep the seed anchors.
         for n in [97, 250, 1_249, below - 1] {
-            assert!(active(&cfg, 80, &plan(q, n)), "{n} seed anchors");
+            assert!(active(&cfg, 80, &plan(q, n), false), "{n} seed anchors");
         }
         for n in [below, 5_025, 13_786] {
-            assert!(!active(&cfg, 80, &plan(q, n)), "{n} seed anchors");
+            assert!(!active(&cfg, 80, &plan(q, n), false), "{n} seed anchors");
         }
         // Enough anchors only after relaxing q_train: short of anchors by definition.
-        assert!(active(&cfg, 80, &plan(0.05, 10_000)));
+        assert!(active(&cfg, 80, &plan(0.05, 10_000), false));
         // No multi-head calibration, or a grouped run: auto is seed.
-        assert!(!active(&cfg, 0, &plan(q, 10)));
+        assert!(!active(&cfg, 0, &plan(q, 10), false));
         let mut grouped = Config::default();
         grouped.groups.window_groups = 4;
-        assert!(!active(&grouped, 80, &plan(q, 10)));
+        assert!(!active(&grouped, 80, &plan(q, 10), false));
         // The threshold is the configured one; 0 searches only a relaxed run.
         let mut zero = Config::default();
         zero.rt_im_train.multihead_search_below = 0;
-        assert!(!active(&zero, 80, &plan(q, 10)));
-        assert!(active(&zero, 80, &plan(0.02, 60)));
+        assert!(!active(&zero, 80, &plan(q, 10), false));
+        assert!(active(&zero, 80, &plan(0.02, 60), false));
         // decide() is active() plus a log line.
-        assert!(decide(&cfg, 80, &plan(q, 10), "r0"));
-        assert!(!decide(&cfg, 80, &plan(q, 13_786), "r0"));
+        assert!(decide(&cfg, 80, &plan(q, 10), false, "r0"));
+        assert!(!decide(&cfg, 80, &plan(q, 13_786), false, "r0"));
+    }
+
+    #[test]
+    fn auto_searches_a_run_with_ion_mobility_whatever_its_anchor_count() {
+        // Measured on diaPASEF: 11,144 seed anchors on a 60 min HYE run and the search
+        // anchors still gained 5.7% peptides; 4,639 on the 15 min E. coli run, +0.6%.
+        let cfg = Config::default();
+        let q = cfg.rt_im_train.q_train;
+        for n in [10, 4_639, 11_144, 100_000] {
+            assert!(
+                active(&cfg, 80, &plan(q, n), true),
+                "{n} seed anchors with 1/K0"
+            );
+            assert!(decide(&cfg, 80, &plan(q, n), true, "r0"));
+        }
+        // Still nothing without a multi-head calibration, and nothing on a grouped run.
+        assert!(!active(&cfg, 0, &plan(q, 13_786), true));
+        let mut grouped = Config::default();
+        grouped.groups.window_groups = 4;
+        assert!(!active(&grouped, 80, &plan(q, 13_786), true));
+        // An explicit seed still means seed.
+        let mut seed = Config::default();
+        seed.rt_im_train.multihead_anchors = MultiheadAnchors::Seed;
+        assert!(!active(&seed, 80, &plan(q, 10), true));
     }
 
     #[test]
@@ -727,13 +771,14 @@ mod tests {
         let lib = format!("{d}/{MULTIHEAD_LIBRARY}");
         std::fs::write(format!("{lib}.summary.json"), br#"{"rows": 3}"#).unwrap();
         let cfg = Config::default();
-        record_auto(&cfg, &plan(0.01, 13_786), false, &lib);
+        record_auto(&cfg, &plan(0.01, 13_786), false, false, &lib);
         let v: serde_json::Value =
             mumdia_io::json::read_json(&format!("{lib}.summary.json")).unwrap();
         assert_eq!(v["rows"], 3, "the worker's summary is kept");
         assert_eq!(v["anchor_source"], "seed");
         assert_eq!(v["anchors_auto"]["seed_anchors"], 13_786);
         assert_eq!(v["anchors_auto"]["chose"], "seed");
+        assert_eq!(v["anchors_auto"]["ion_mobility"], false);
         assert_eq!(
             v["anchors_auto"]["multihead_search_below"],
             cfg.rt_im_train.multihead_search_below
@@ -742,7 +787,7 @@ mod tests {
 
         // A search choice leaves the anchor source to the refit that recorded it.
         record_anchor_source(&lib, serde_json::json!({"anchor_source": "search"}));
-        record_auto(&cfg, &plan(0.01, 200), true, &lib);
+        record_auto(&cfg, &plan(0.01, 200), false, true, &lib);
         assert_eq!(anchor_source(&lib).as_deref(), Some("search"));
         let v: serde_json::Value =
             mumdia_io::json::read_json(&format!("{lib}.summary.json")).unwrap();
@@ -752,7 +797,7 @@ mod tests {
         let other = format!("{d}/other.parquet");
         let mut seed = Config::default();
         seed.rt_im_train.multihead_anchors = MultiheadAnchors::Seed;
-        record_auto(&seed, &plan(0.01, 10), false, &other);
+        record_auto(&seed, &plan(0.01, 10), false, false, &other);
         assert!(!std::path::Path::new(&format!("{other}.summary.json")).exists());
         assert_eq!(anchor_source(&other), None);
         std::fs::remove_dir_all(&d).ok();

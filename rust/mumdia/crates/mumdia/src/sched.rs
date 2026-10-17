@@ -653,6 +653,41 @@ impl Drop for DecoderLease {
     }
 }
 
+/// More room in a [`DecoderLease`] budget while the guard lives.
+///
+/// The budgets are sized for a few concurrent calls. The per-run chains of an automatic
+/// `run-experiment` plan are sized on the measured peak of a chain or a search that ran
+/// alone and took a call's whole share, so while they run the budget grows to that share
+/// per chain: a call that got nothing ran on one thread, and on the six HYE diaPASEF runs
+/// three of five feature passes did, for 280-295 s against 95-104 s for the two that got
+/// their loaders.
+pub(crate) struct BudgetGrowth {
+    budget: &'static std::sync::atomic::AtomicUsize,
+    n: usize,
+}
+
+impl BudgetGrowth {
+    /// Add `n` threads to `budget` until the guard drops.
+    pub(crate) fn add(budget: &'static std::sync::atomic::AtomicUsize, n: usize) -> Self {
+        budget.fetch_add(n, std::sync::atomic::Ordering::Release);
+        BudgetGrowth { budget, n }
+    }
+}
+
+impl Drop for BudgetGrowth {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        // Every lease of the phase that grew the budget has returned by the time the phase
+        // ends, so what was added is free again. Should one still be out, only what is free
+        // is taken back rather than wrapping the counter, and the budget stays that much
+        // larger.
+        let n = self.n;
+        let _ = self
+            .budget
+            .fetch_update(AcqRel, Acquire, |v| Some(v.saturating_sub(n)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,5 +1046,35 @@ mod tests {
             .map_pooled(&[0usize, 1], |_| Ok(std::thread::current().id()))
             .unwrap();
         assert!(ids.iter().all(|&id| id == caller));
+    }
+
+    #[test]
+    fn a_grown_budget_grants_more_while_the_guard_lives_and_returns_to_its_size() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BUDGET: AtomicUsize = AtomicUsize::new(4);
+        let a = DecoderLease::take_from(&BUDGET, 3);
+        let b = DecoderLease::take_from(&BUDGET, 3);
+        assert_eq!((a.granted(), b.granted()), (3, 1));
+        drop((a, b));
+        {
+            let _grown = BudgetGrowth::add(&BUDGET, 8);
+            let leases: Vec<DecoderLease> = (0..4)
+                .map(|_| DecoderLease::take_from(&BUDGET, 3))
+                .collect();
+            assert_eq!(
+                leases.iter().map(DecoderLease::granted).collect::<Vec<_>>(),
+                vec![3, 3, 3, 3]
+            );
+        }
+        assert_eq!(BUDGET.load(Ordering::SeqCst), 4);
+        // A lease still out when the guard drops (the chain phase cannot leave one: it
+        // returns only after every chain has) does not wrap the counter; the room it holds
+        // comes back with it.
+        let grown = BudgetGrowth::add(&BUDGET, 2);
+        let held = DecoderLease::take_from(&BUDGET, 6);
+        drop(grown);
+        assert_eq!(BUDGET.load(Ordering::SeqCst), 0);
+        drop(held);
+        assert_eq!(BUDGET.load(Ordering::SeqCst), 6);
     }
 }

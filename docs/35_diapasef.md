@@ -461,9 +461,14 @@ past the 29,419 anchors at which the spline failed, so both guards are precondit
 No anchor cap is added (`--max-ref` takes the first rows in m/z order, and a cap did not
 prevent the failure).
 
-Planned arms: **T2**, `multihead_anchors = search` against `auto` on TIMS after both guards (the
-native seed has about 5,000 anchors, so `auto` keeps the seed; reference IM L1d variant B, E. coli
-12,919 over three seeds, entrapment 11,989 real at an FDP of 0.41-0.44%); **T1**, the RT
+Arm **T2**, `multihead_anchors = search` against the anchor-count `auto` on TIMS after both
+guards, is measured (2026-10-14, section 11, "ProteoBench HYE diaPASEF"): +5.7% peptides on the
+six 60 min HYE runs (11,144 seed anchors, one seed) and +0.6% on the E. coli run (4,639, three
+seeds) at an entrapment FDP of 0.39-0.46% against 0.42-0.51%. `auto` therefore chooses `search`
+on every run whose spectra carry 1/K0 (docs/08 section 4f, "the 1/K0 rule"). The IM branch's
+per-run refit still leads by 2.0% peptides on the HYE runs (100,392 against 98,373, same library
+and raw files); `experiment.rt_library_scope = per_run` and a 1/K0 recentre are the next arms.
+Planned: **T1**, the RT
 recentre increment, the bootstrap with and without a second LOESS on the search anchors, three
 seeds, E. coli entrapment and quantification ions. A recentre that gains becomes one default-off
 sub-option of `rt_bootstrap`, not a refit path, and widths are never sized from the refit (IM
@@ -710,7 +715,11 @@ conditions A and B in triplicate (expected log2 B/A: human 0, yeast -1, E. coli 
 `run-experiment` per arm with an imported FASTA library built once (missed cleavages 1, length
 7-30, charges 2-4, MS2PIP `timsTOF2024`, DeepLC, IM2Deep; 14.7M precursors with decoys,
 `library_irt = library`), the PR 4 settings of the table above, strict `nn_torch`, seed 0.
-Peptides per run are stripped peptides at `run_psm_q` 1%, the mean of the six runs; the
+`library_irt = library` on an imported library also switches the automatic multi-head
+calibration off, so these arms and the recipe arm below ran without it; the recipe itself builds
+its library from FASTA with DeepLC and runs it (the E. coli recipe runs above did). On the
+60 min set the omission cost 12% of the peptides (next subsection), so these numbers are a lower
+bound for the recipe. Peptides per run are stripped peptides at `run_psm_q` 1%, the mean of the six runs; the
 quantified precursors are `peptides.tsv` rows with a quantity in at least two runs of each
 condition, and the ratios are their medians.
 
@@ -762,6 +771,31 @@ and quant keys; seed 0, 64 threads, alone on the host.
 Per run the second pass added 9,119-9,879 accepted rows and dropped 1,818-2,487. The decoy
 fraction was 0.84% in anchor runs and 1.56% in non-anchor runs, the same split as with the PR 4
 settings.
+
+**ProteoBench HYE diaPASEF.** The six public runs of the ProteoBench module
+`quant_lfq_DIA_ion_diaPASEF` (timsTOF SCP, about 60 min, `ttSCP_diaPASEF_Condition_{A,B}`),
+the module's FASTA, the AlphaPeptDeep library of the recipe (14.7M precursors with decoys,
+identical row for row to the IM branch's l1d library in a sample of 18,477 precursors and
+221,724 fragments), the recipe's extraction and quant keys, seed 0, 120 threads, scored offline
+with ProteoBench 0.18.6 (`bench/pb_eval.py`, Custom format, k = 3); nothing uploaded. Peptides
+are stripped peptides at the experiment-wide `peptide_q_value` 1%.
+
+| arm | ions (k = 3) | global / eq / CV | E. coli log2 A/B | peptides | `w_rt` | wall / peak |
+|---|---|---|---|---|---|---|
+| no MBR, no multi-head calibration (`library_irt = library`) | 72,051 | 0.119 / 0.158 / 0.076 | -1.86 | 82,148 | 155 s | 1:41 / 480 GB |
+| no MBR, multi-head 80 | 84,841 | 0.127 / 0.168 / 0.083 | -1.86 | 93,061 | 40-45 s | 0:48 / 258 GB |
+| no MBR, multi-head 80, search anchors | 90,363 | 0.130 / 0.175 / 0.085 | -1.86 | 98,373 | 24-27 s | 1:03 / 199 GB |
+| second pass, multi-head 80, search anchors | 103,185 | 0.139 / 0.208 / 0.092 | -1.78 | 97,979 | 25-33 s | 1:03 / 196 GB |
+| IM branch binary and configuration, no MBR | 94,099 | 0.131 / 0.178 / 0.084 | -1.84 | 100,392 | 27.6 s | 1:15 / 172 GB |
+
+Global is the median |log2 ratio error|, eq the mean of the per-species medians, CV the median
+per-condition CV. The IM branch arm reproduces its own thestral result (92,540 ions, 100,790
+peptides) on these raw files with this library, so the remaining gap is in the engine path: its
+per-run RT refit with a 1/K0 recentre (arm T1, sections 7 and 14). The wide RT windows without a multi-head
+calibration are also why that arm needed 120-136 GB per run in extract. The second pass added
+14.2% ions; its decoy fraction was 0.87% in anchor runs and 1.70% in non-anchor runs, and the
+ions it adds carry most of the ratio compression (E. coli log2 -0.86 for ions accepted in one
+first-pass run, -1.87 for ions accepted in all six).
 
 
 ### On the IM branch
@@ -920,7 +954,7 @@ diaPASEF set, G4 ProteoBench HYE at `min_obs` 3, G5 wall time and process-tree p
 | arm | question |
 |---|---|
 | T1 | does an RT recentre on identifications add to `rt_bootstrap`? |
-| T2 | `multihead_anchors = search` against `auto` on TIMS, after the guards |
+| T2 | `multihead_anchors = search` against `auto` on TIMS, after the guards: measured, `auto` now chooses `search` on 1/K0 data (section 7) |
 | T3 | fragment tolerance estimator: p95 two-pass, MAD k = 4 two-pass and single-pass, p95 single-pass; also on the 3D benchmarks, to retire one |
 | T3b | T3 with retrace and the re-pick on |
 | T4 | `gate_min_score` 0, 0.3, 0.45, 0.6 under `window_mean` with the 1/K0 gate on |
@@ -960,3 +994,213 @@ IM branch's E. coli diaPASEF library, 0.574592 for the recipe's), so it is compu
   IM branch.
 - **Evidence.** Most HYE numbers are one seed, no multi-run diaPASEF entrapment exists, and
   the quantification record rests on one known-ratio dataset.
+
+## 16. Memory and speed
+
+Measured on hippogriff (128 cores, 755 GB) on the six ProteoBench HYE diaPASEF runs (60 min
+gradient, timsTOF SCP) at 120 threads, NN seed 0, with `MUMDIA_CACHE_DIR=off`, so both DeepLC
+calibrations of the first run start cold. Peaks are GNU `time` maximum RSS of the engine
+process unless named otherwise.
+
+### Where it goes
+
+| phase | wall | what takes it |
+|---|---|---|
+| first run alone | 18.8 min | conversion and seeds of all runs (1.6 min), the multi-head calibration (3.2), the RT bootstrap search (5.4), the refit and the first run's own chain (8.6) |
+| five runs in parallel | 14.3 min | per run: retrace about 5.5 min, extract about 3, features 1.5-4 |
+| pooled rescore | 14.9 min | `nn_torch` over 28.5 million PSMs |
+| quantification and report | 1.9 min | |
+
+The same engine and settings on six Astral runs (15 min gradients) took 12:07 at 23.3 GiB, and
+on six Orbitrap AIF runs 13:33 at 30.1 GiB. A diaPASEF run costs more for three reasons that
+the measurements below separate:
+
+- **Extraction rejects little.** 4.9 million of the 14.7 million library candidates pass per
+  run, against about 5% on Astral. On dense diaPASEF spectra almost every candidate matches
+  its fragments: the identified ones match 11.3 of 12 on average, the rest 10.9. Retrace,
+  features, the chromatogram tables and the pooled rescore all scale with that count.
+- **Retrace holds the run's raw events** (section 6), 2.86 billion of them in a 60 min HYE
+  run, two thirds of them MS1.
+- **The fragment-peak matches of extract** are held for every window group in flight.
+
+### Extract: windows in flight
+
+`extract.windows_in_flight` defaults to 4 on spectra that carry 1/K0 (16 otherwise). Measured
+standalone on run A_02 at 20 threads, the accepted candidates (4,907,155) and chromatogram rows
+(73,607,325) identical at every setting:
+
+| windows in flight | peak (anonymous heap) | wall |
+|---|---|---|
+| 16 (the previous default) | 45.1 GiB | 410 s (contended) |
+| 8 | 31.9 GiB | 194 s |
+| 4 | 21.4 GiB | 154 s |
+
+None of the peak is file-backed. Threads change little: 16 in flight took 51.5 GiB at 60
+threads and 51.9 at 120. On the six-run experiment the peak fell from 181 to 94 GiB, with every
+identification, quantity and loss class bit-identical, in 50 against 51 minutes. The memory
+record of the accumulator (`mem: extract hit accumulator`) reads its size after each batch,
+not inside it, so it reported 0.0 throughout.
+
+### Extract: MS1 traces under a skeleton
+
+gdb samples of a standalone extract of run A_02 at 20 threads put about half of its busy time
+in the MS1 reads of the three isotope traces it writes per candidate (`ms1_near`, the maximum
+over the nearest MS1 scan and its neighbours at every grid point). When retrace follows, the
+skeleton then zeroed every one of those rows. The skeleton decision reads only a row's
+identity, so it is taken first now and a zeroed row is written without being read; the table
+is the one the reading-then-zeroing wrote. The bootstrap pass, which does not retrace, still
+reads them.
+
+### Run order and decode pools
+
+Under `experiment.parallel_runs = "auto"` the first run's chain ran alone so that its peak
+could size the others. When the first run adapts the library with a search of itself (the RT
+bootstrap of `rt_im_train.multihead_anchors`), that search already measures a chain's peak
+in this process, so only the adaptation runs alone now and the first run's finish is the first
+item of the parallel queue. Before, the finish took about 4 min alone while one of six per-run
+pools sat idle in the phase after it.
+
+The feature loaders and retrace readers come from process-wide pools sized for a few
+concurrent calls. With five concurrent chains, three feature passes decoded on one loader
+(270-295 s against 59-104 s with three), and those passes were the last four minutes of the
+parallel phase. The pools now grow by the chains in flight while the chains run.
+
+The six runs on the build with these two changes, the features read-ahead and parallel
+assembly, the handoff release and the extract MS1 skip below: 41.6 against 49.9 min with every
+identification, quantity and ProteoBench metric bit-identical. The parallel phase starts at
+15.5 instead of 20.6 min and takes 10.0 instead of 12.9 with six chains instead of five;
+per run, features 74 instead of 170 s, retrace 289 instead of 234 s and extract 176 instead
+of 141 s, six chains contending for memory bandwidth instead of five. The peak, 88.9 GB, is
+now the phase of six concurrent extracts.
+
+### Retrace
+
+- **Readers.** The chromatogram readers come from a process-wide budget. With one call's
+  worth (7 extra readers), the first of five concurrent retraces took all of them and the
+  others read on one thread: the slowest spent 390 s of its 489 s reading. The budget is now
+  four calls' worth (about 0.1 GB per reader).
+- **MS1 sums once per row.** An MS1 grid point takes the largest sum over its nearest MS1
+  frame and `extract.ms1_scan_halfwidth` neighbours either side, and consecutive points of a
+  row share all of those frames but one, so every MS1 frame of a row was summed three times
+  at the default. Each is now summed once per row, with every value bit-identical.
+- **Skeleton centroid table.** Retrace rebuilds about 90% of the rows from raw events and
+  reads only their axis and keys, but it decoded every centroid trace: the intensity and
+  1/K0 lists are 86% of the centroid table's 11.8 GiB, and a read benchmark of one run's table
+  took 13.9 s at 8 threads with them and 0.7 s without. Extract now writes the rows retrace
+  rebuilds as zeros on their axis (`retrace::Skeleton`, recorded in the table's report), with
+  the rule retrace classifies by, and retrace refuses a skeleton it would not rebuild in full.
+- **MS2 frames per window group.** Retrace decoded every MS2 frame of the run at its start and
+  held them beside the MS1 frames. It now holds the MS2 frames of the isolation windows its
+  current span of rows needs, and drops them when the span moves on: the library is sorted by
+  precursor m/z, so consecutive candidates fall in the same few windows. On run A_02
+  standalone at 20 threads the peak fell from 20.5 to 12.5 GB with every output byte
+  identical. A frame whose slots isolate several windows is decoded once per run of spans that
+  needs one of them (86,078 decodes of 30,988 frames, 38 s at 20 threads). On the six runs the
+  phase of five concurrent retraces fell from 96-98 to 49-66 GB at an unchanged wall time,
+  every identification and quantity bit-identical, which leaves the load of the pooled
+  rescore (95 GB) as the experiment's highest point.
+
+Three changes to the summing kernel were measured on one run (standalone, 20 threads, 3:46
+and 162 s of summing as the baseline) and left out, every output byte-identical: events
+grouped by mobility scan instead of by TOF (22:12; a fragment's TOF window covers only a few
+TOF indices, so one bucket lookup beats about 28 per-scan searches), candidates visited in
+retention-time order (3:46), and every lookup of a row group sorted by frame before summing
+(10:48: building and sorting the requests cost more than the cache misses they saved).
+Smaller TOF buckets (16 or 4 indices) and huge pages changed nothing. A micro-benchmark on the
+run's real frames puts one lookup at about 110 ns in retrace's order and 54 ns frame by frame.
+
+### Features
+
+The main pass decodes the chromatogram table in chunks on loader threads
+(`features.chrom_loaders`, default 3) while it computes the features of the chunk before.
+gdb samples of a standalone pass on run A_02 put the loaders at 73% waiting for their own
+batch to decode on the codec pool and 27% copying it into the chunk, with the codec pool 64%
+idle: the pass was bound by the loaders. Each loader now decodes its chunk's next batch on a
+thread of its own while it copies the current one, and a chunk's value columns are assembled
+in parallel row blocks instead of on one thread. Standalone on A_02, every features table
+byte-identical:
+
+| | 20 threads | 120 threads |
+|---|---|---|
+| before | 97.4 s | 76.0 s |
+| the next batch decoded ahead | 75.7 s | 59.6 s |
+| and the columns assembled in parallel | 76.2 s (assembly 22.0 -> 9.1 s) | 59.1 s |
+
+The pass is still bound by its loaders. Five of them (`chrom_loaders` 6, of which a pool of
+four extras grants five standalone) took it to 38.4 s at 20 threads, then bound by the
+computation, for 2.6 GB more, but to 62.4 s at 120 threads, where the decode competed with the
+computation's threads for cores; the default stays 3.
+
+### Rescore
+
+With the retrace frames held per window group, the experiment's highest point was the load of
+the pooled rescore: the NN worker memory-maps the raw handoff (28.5 million PSMs x 424
+features, 48 GB) and copies it into its own matrix, and every page it had read stayed in its
+resident set until the copy was done, so both were resident at once. The worker now drops each
+copied 131,072-row group of the mapping from its resident set (`MADV_DONTNEED`; the pages stay
+in the page cache, so a released row only faults back in with the same bytes). The pooled
+rescore of the six runs, three folds, NN seed 0: 98,524 peptides at 1% either way, maximum
+RSS 98.3 -> 51.0 GB, 13:35 -> 13:28.
+
+Two folds instead of three (`rescore.folds`, three NN seeds) gave 97,731 against 98,414
+peptides at 1% for 8% less wall time: the folds train in parallel, three processes of 16
+torch threads, so a smaller training split per fold saves little.
+
+### A diaPASEF gate
+
+The window-mean gate (`extract.gate_mode = window_mean`) was tuned on Astral and Q Exactive
+runs, where 0.6 keeps about 5% of the library and the top 10% of the candidates by the score
+hold 99.4-99.6% of the identifications. On these runs 0.6 keeps 33% of the library: the
+spectra of a diaPASEF frame are summed over the candidate's 1/K0 band, so nearly every
+candidate matches its fragments and the agreement scores sit high for most. A higher
+threshold buys time with identifications.
+
+`extract.gate_support_min` (opt-in) is a second threshold on the window-mean score plus the
+apex intensity and the MS1 monoisotopic intensity and, on spectra that carry 1/K0, three 1/K0
+terms: the apex 1/K0 error against the calibrated prediction, the 1/K0 spread of the matched
+fragments at the apex and the MS1-to-fragment 1/K0 difference. The weights come from a
+logistic regression on the gate-time quantities of runs A_02 and B_01 (a standalone extract
+with `emit_gate_diagnostics`, which carries the window-mean score), on targets only:
+identified at a run PSM q of 1% against not identified. A gate fitted on decoys could learn to
+tell them from targets and bias the FDR estimate; at every cut decoys pass at the rate of
+unidentified targets (40.7% against 40.9% at 0.845). Fitted on one run and applied to the
+other, the share of the gate-0.6 identifications kept at 45% of the candidates was 92.4-92.7%
+for the window-mean score, 94.0-94.1% with the intensity and MS1 terms and 94.5-94.8% with the
+1/K0 terms. The same score on the features after retrace kept 99.4% at 50%: retrace's raw-event
+traces separate the candidates far better than extract's centroids.
+
+Six runs, NN seed 0 (the 0.7, 0.75 and 0.8 arms on the build before the speed changes):
+
+| gate | candidates of gate 0.6 | wall | peptides at 1% | ions at k = 3 | eq. species abs epsilon | CV |
+|---|---|---|---|---|---|---|
+| window mean 0.6 | 100% | 41.6 min | 98,524 | 89,973 | 0.173 | 0.085 |
+| window mean 0.7 | 65% | 37.8 | 97,565 | 87,980 | 0.172 | 0.083 |
+| support 1.17, no 1/K0 terms | 55% | 30.4 | 97,527 | 88,220 | 0.173 | 0.084 |
+| window mean 0.75 | 45% | 30.5 | 96,154 | 84,912 | 0.171 | 0.082 |
+| support 1.215, no 1/K0 terms | 42% | 31.2 | 96,624 | 86,323 | 0.172 | 0.083 |
+| support 0.845, with 1/K0 | 41% | 26.8 | 96,955 | 86,877 | 0.171 | 0.083 |
+| window mean 0.8 | 27% | 25.7 | 92,709 | 79,575 | 0.166 | 0.079 |
+
+At the same share of candidates the diaPASEF gate loses about a third of what a higher
+window-mean threshold loses (-1.6% against -2.4% peptides, -3.4% against -5.6% ions), and the
+quantification is as good or slightly better, because what is lost is weak.
+
+### MS1 noise
+
+The dnoise tool (P. T. Garrett, J. K. Diedrich and J. R. Yates III, bioRxiv 2026,
+doi:10.64898/2026.08.27.747603, MIT licence) removes MS1 points that do not form a run of at
+least 5 occupied mobility scans, points in the halo of a stronger ion, and MS1 points outside
+every diaPASEF window. On these runs its default (MS1 only) kept 8.7% of the MS1 points and
+40% of all points, cut the MS1 centroids from 254 million to 8.6 million per run, and left the
+identifications unchanged (89,973 against 90,363 ions at k = 3, precursors 109,962 against
+109,965) at 51 against 63 minutes. Its MS/MS mode kept 17% of all points and lost 9.2% of the
+ions, as `convert.tdf_min_points` 3 to 6 did (-5.9% to -20.1%): no MS/MS peak filter tried
+here is free.
+
+The native reader now applies the same MS1 filter itself (`convert.tdf_ms1_denoise`, on by
+default since 2026-10-17), and retrace applies it to the raw MS1 frames it holds, so no
+pre-processing step is needed. On the six runs it gives exactly the identifications of the
+tool's own output (98,524 peptides at 1%, 89,973 ions at k = 3), at about 33 s more conversion
+per run than reading files the tool had cleaned. On the 15 min E. coli run, three NN seeds per
+arm: 14,121 against 14,044 peptides at 1%, and on the entrapment library 13,384 against 13,375
+real peptides at an entrapment FDP of 0.30-0.38% against 0.39-0.46%.

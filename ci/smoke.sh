@@ -1056,6 +1056,8 @@ for name, chose in (("auto", "search"), ("auto_overlap", "search"), ("auto_seed"
     auto = summary.get("anchors_auto") or {}
     if auto.get("chose") != chose or summary.get("anchor_source") != chose:
         fail("%s: the summary records %r" % (name, summary))
+    if auto.get("ion_mobility") is not False:
+        fail("%s: a 3D run recorded ion_mobility %r" % (name, auto.get("ion_mobility")))
     if (stub / name / "b/rt_bootstrap").exists() or list((stub / name / "b").glob("fragment_library*")):
         fail("%s: run b adapted the library instead of reusing run a's" % name)
     m = json.loads((stub / name / "experiment_manifest.json").read_text("utf-8"))

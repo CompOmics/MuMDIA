@@ -173,6 +173,11 @@ pub struct ExtractParams<'a> {
     /// ([`TracePad`]). `None`, everywhere but the second pass of match-between-runs on a
     /// run with ion mobility, records exactly the window.
     pub trace_pad: Option<TracePad>,
+    /// Set when retrace rebuilds this table from the raw events right after extract
+    /// (`chain::extract_to_compete` under `retrace.enabled`): every row retrace rebuilds is
+    /// written with zeros on its axis, since retrace reads only the axis and the keys of
+    /// those rows (`retrace::Skeleton`). `None` everywhere else, which writes every trace.
+    pub retrace_skeleton: Option<crate::stages::retrace::Skeleton>,
 }
 
 /// How far beyond `[rt_lo, rt_hi]` extract records a candidate's traces: `scans` samples at
@@ -1493,6 +1498,30 @@ fn demix_features_for(d: &DemixScan, cid: u32) -> DemixFeatures {
     )
 }
 
+/// Weights of the apex intensity and MS1 terms of the support gate
+/// (`extract.gate_support_min`), on `ln(1 + intensity)`: the combination that, on a HYE
+/// diaPASEF run, ranked the candidates passing the window-mean gate at 0.6 so that the top
+/// 60% held 99.5% of the 1% identifications (docs/35_diapasef.md section 16).
+const GATE_SUPPORT_INTENSITY_WEIGHT: f64 = 0.05;
+const GATE_SUPPORT_MS1_WEIGHT: f64 = 0.02;
+
+/// The support gate on spectra that carry 1/K0 (diaPASEF), on the window-mean scale: the
+/// window-mean score, plus 0.023 ln(1 + apex intensity) and 0.009 ln(1 + MS1 mono), minus
+/// 1.23 |apex_im - im_pred_cal|, 7.44 apex_im_mad and 0.18 |ms1_apex_im - apex_im| (1/K0 in
+/// Vs/cm2). Fitted by logistic regression on the gate-time quantities of two HYE diaPASEF
+/// runs (standalone extract with the gate diagnostics), on targets only, identified at 1%
+/// against not identified; each run's weights tested on the other run's candidates, the two
+/// fits averaged. A missing 1/K0 value takes the 99th percentile of the observed ones there
+/// (docs/35_diapasef.md section 16).
+const GATE_IM_INTENSITY_WEIGHT: f64 = 0.023;
+const GATE_IM_MS1_WEIGHT: f64 = 0.009;
+const GATE_IM_ERR_WEIGHT: f64 = 1.23;
+const GATE_IM_MAD_WEIGHT: f64 = 7.44;
+const GATE_IM_MS1_ERR_WEIGHT: f64 = 0.18;
+const GATE_IM_ERR_MISSING: f64 = 0.039;
+const GATE_IM_MAD_MISSING: f64 = 0.024;
+const GATE_IM_MS1_ERR_MISSING: f64 = 0.265;
+
 /// Sum intensities of peaks within `tol_ppm` of `target` (m/z-sorted arrays).
 /// [`sum_near`] in the MS1 scan nearest `j` and its `half` neighbours either side: the
 /// maximum over those scans (`extract.ms1_scan_halfwidth`; 0 reads scan `j` only).
@@ -2132,14 +2161,30 @@ fn accumulate_groups(
 /// identical output throughout.
 const DEFAULT_MAX_WINDOWS_IN_FLIGHT: usize = 16;
 
+/// The default number of windows in flight on spectra with ion mobility (diaPASEF). Such a
+/// run has few window groups (24 on the ProteoBench HYE runs), each matched against dense
+/// spectra, so 16 in flight kept two thirds of a run's fragment-peak matches resident.
+/// Measured on one 60 min HYE diaPASEF run at 20 threads, standalone: 16 in flight
+/// 45.1 GiB, 8 31.9 GiB, 4 21.4 GiB, with identical accepted candidates and chromatogram
+/// rows, and 4 the fastest (154 s against 194 s at 8); on the six-run experiment the peak
+/// fell from 181 to 94 GiB at bit-identical identifications and 50 against 51 minutes.
+const DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM: usize = 4;
+
 /// Fewest candidates a probing task takes: below this the per-task narrowed bin cache (one
 /// entry per fragment bin) costs more than the posting-list work it divides.
 const MIN_CANDIDATES_PER_TASK: usize = 4096;
 
-fn groups_in_flight(cfg: &ExtractConfig) -> usize {
+/// `extract.windows_in_flight`, or its default: the rayon thread count capped at 16, and
+/// at [`DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM`] on spectra that carry 1/K0.
+fn groups_in_flight(cfg: &ExtractConfig, has_im: bool) -> usize {
+    let cap = if has_im {
+        DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM
+    } else {
+        DEFAULT_MAX_WINDOWS_IN_FLIGHT
+    };
     cfg.windows_in_flight
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| rayon::current_num_threads().min(DEFAULT_MAX_WINDOWS_IN_FLIGHT))
+        .unwrap_or_else(|| rayon::current_num_threads().min(cap))
         .max(1)
 }
 
@@ -3025,6 +3070,9 @@ struct CandOut {
     gate_peak_spectral: f32,
     gate_coelution: f32,
     gate_spectral_entropy: f32,
+    /// The window-mean score (`GateMode::WindowMean`) of the candidate, whatever the gate
+    /// mode, for the offline design of a gate (`emit_gate_diagnostics` only).
+    gate_window_mean: f32,
     /// Spectrum-centric demix features (D2), all 0 unless `emit_demix_features`:
     /// residual-explained fraction, active-set survival flag, and this candidate's
     /// fraction of the total demixed abundance at its apex.
@@ -3092,6 +3140,7 @@ struct PsmRows {
     gate_peakspec: Vec<f32>,
     gate_coel: Vec<f32>,
     gate_se: Vec<f32>,
+    gate_wm: Vec<f32>,
     deconv_expl: Vec<f32>,
     deconv_act: Vec<f32>,
     deconv_share: Vec<f32>,
@@ -3142,6 +3191,7 @@ impl PsmRows {
             self.gate_peakspec.push(r.gate_peak_spectral);
             self.gate_coel.push(r.gate_coelution);
             self.gate_se.push(r.gate_spectral_entropy);
+            self.gate_wm.push(r.gate_window_mean);
         }
         if cfg.emit_demix_features {
             self.deconv_expl.push(r.deconv_explained);
@@ -3230,6 +3280,7 @@ impl PsmRows {
                 "gate_spectral_entropy".into(),
                 take(&mut self.gate_se),
             ));
+            cols.push(Col::F32("gate_window_mean".into(), take(&mut self.gate_wm)));
         }
         if cfg.emit_rt_window {
             cols.push(Col::F64("rt_lo".into(), take(&mut self.win_lo)));
@@ -4076,6 +4127,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             (groups, group_im, grid, width)
         };
 
+    // Rows of a skeleton table left as zeros for retrace (`ExtractParams::retrace_skeleton`).
+    let skeleton_rows = std::sync::atomic::AtomicU64::new(0);
     let per_candidate = |cid: u32, hits: &mut [Hit]| -> Vec<CandOut> {
         // Under a trace pad the candidate's hits reach `trace_pad_s` beyond its window. Every
         // score below reads only the hits inside the window, which are exactly the hits the
@@ -4431,6 +4484,9 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             };
             mean - p.cfg.gate_rt_weight * rtw
         };
+        // Computed at most once: the acceptance gate and the support gate both read it.
+        let window_mean_once = std::cell::OnceCell::new();
+        let window_mean = || *window_mean_once.get_or_init(window_mean);
         // `to_vec` only where the co-elution score is actually asked for (a non-default
         // gate mode, or the diagnostics), so the default chain never materialises it.
         let coel = || coelution_gate_score(&groups, &distinct.to_vec(), &sig, fints0);
@@ -4461,6 +4517,74 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 }
             }
         }
+        // The 1/K0 evidence (psms_extracted v4) of a row with its apex at `rt`, the selected
+        // apex and every promoted alternative alike. It depends only on the candidate, the
+        // row's apex RT and the precursor m/z, so it is computed here, per accepted row,
+        // rather than in a pass over the finished table, which is streamed out in chunks.
+        // All `None` on 3D data.
+        let im_at = |rt: f64| -> ApexIm {
+            if !has_im {
+                return ApexIm::default();
+            }
+            ApexIm {
+                im_pred_cal: win
+                    .im_cal
+                    .as_ref()
+                    .and_then(|v| v.get(cid as usize).copied().flatten()),
+                ..apex_im_stats(
+                    &lib,
+                    scans,
+                    &rt_scan,
+                    ms1_scans,
+                    &ms1_rts,
+                    guard,
+                    &mass_off,
+                    frag_tol,
+                    p.cfg,
+                    cid,
+                    rt,
+                    c.precursor_mz,
+                )
+            }
+        };
+
+        // The selected apex's 1/K0 evidence, computed once: the support gate reads it on 1/K0
+        // data, and the rank-0 row carries it.
+        let im0_once = std::cell::OnceCell::new();
+        let im0_of = || *im0_once.get_or_init(|| im_at(apex_rt));
+
+        // The support gate (`extract.gate_support_min`): the window-mean score plus the
+        // apex intensity and MS1 terms the `log_apex_intensity` and `log_mono_ms1` features
+        // carry and, on spectra that carry 1/K0, three 1/K0 terms, without the MS1 rescue.
+        if p.cfg.gate_support_min > 0.0 && matches!(p.cfg.gate_mode, GateMode::WindowMean) {
+            let ms1 = match (o_ms1_mono, o_ms1_i1, o_ms1_i2) {
+                (Some(mono), Some(_), Some(_)) => (1.0 + mono).ln(),
+                _ => 0.0,
+            };
+            let ln_apex = (1.0 + apex_sum as f64).ln();
+            let support = if has_im {
+                let e = im0_of();
+                let abs_diff = |a: Option<f64>, b: Option<f64>, missing: f64| match (a, b) {
+                    (Some(a), Some(b)) if (a - b).is_finite() => (a - b).abs(),
+                    _ => missing,
+                };
+                window_mean() + GATE_IM_INTENSITY_WEIGHT * ln_apex + GATE_IM_MS1_WEIGHT * ms1
+                    - GATE_IM_ERR_WEIGHT * abs_diff(e.apex_im, e.im_pred_cal, GATE_IM_ERR_MISSING)
+                    - GATE_IM_MAD_WEIGHT
+                        * e.apex_im_mad
+                            .filter(|v| v.is_finite())
+                            .unwrap_or(GATE_IM_MAD_MISSING)
+                    - GATE_IM_MS1_ERR_WEIGHT
+                        * abs_diff(e.ms1_apex_im, e.apex_im, GATE_IM_MS1_ERR_MISSING)
+            } else {
+                window_mean()
+                    + GATE_SUPPORT_INTENSITY_WEIGHT * ln_apex
+                    + GATE_SUPPORT_MS1_WEIGHT * ms1
+            };
+            if support < p.cfg.gate_support_min {
+                return Vec::new();
+            }
+        }
 
         // Diagnostic scores (all four metrics, for the offline gate-metric
         // comparison). Computed and emitted ONLY when `emit_gate_diagnostics` is set,
@@ -4473,6 +4597,11 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             } else {
                 (0.0, 0.0, 0.0, 0.0)
             };
+        let gate_window_mean = if p.cfg.emit_gate_diagnostics {
+            window_mean()
+        } else {
+            0.0
+        };
 
         // Soft competition features from the co-elution arbitration (all 0 when the
         // two-pass path did not run). contested_frac: fraction of contested INTENSITY
@@ -4521,6 +4650,17 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             }
         }
 
+        // The selected apex's 1/K0 evidence, computed once, before the traces: the rank-0 row
+        // carries it, and a skeleton table (`ExtractParams::retrace_skeleton`) needs the
+        // centre retrace will use to know which rows it rebuilds: this `apex_im`, or
+        // `im_pred_cal` where that is not finite (`retrace::Skeleton`).
+        let im0 = im0_of();
+        let skel_centre = match im0.apex_im.filter(|v| v.is_finite()) {
+            Some(v) => v,
+            None => im0.im_pred_cal.unwrap_or(f64::NAN),
+        };
+        let mut skel_rows = 0u64;
+
         let mut chrom_rows: Vec<ChromOutputRow> = Vec::new();
         // The traces: from every hit over the padded range under a trace pad, otherwise the
         // groups every score read. Which fragments carry a trace is decided inside the window
@@ -4566,7 +4706,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             let frag = fi as u16;
             let (sm, sw) = wsum[fi];
             let obs_mz = if sw > 0.0 { sm / sw } else { fmzs[fi] as f64 };
-            let (rts, ints): (Vec<f32>, Vec<f32>) = if !observed.contains(frag) {
+            let (rts, mut ints): (Vec<f32>, Vec<f32>) = if !observed.contains(frag) {
                 (Vec::new(), Vec::new()) // absent predicted transition
             } else if !t_grid.is_empty() {
                 (
@@ -4594,7 +4734,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             // trace is +0.0 (an absent fragment in grid mode, or a hit of zero intensity), so
             // the v2 trim of the trace loses no 1/K0 and both layouts decode to the same list.
             // Empty for a never-observed fragment, as its trace is, and without `chrom_im`.
-            let ims: Vec<f32> = if !chrom_im || !observed.contains(frag) {
+            let mut ims: Vec<f32> = if !chrom_im || !observed.contains(frag) {
                 Vec::new()
             } else {
                 let im_of = |gi: usize, v: f32| -> f32 {
@@ -4614,6 +4754,23 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         .collect()
                 }
             };
+            // A row retrace rebuilds from the raw events keeps its axis and gets zeros: the
+            // centroid values would be decoded only to be replaced.
+            if let Some(k) = p.retrace_skeleton {
+                let name = lib.frag_name_str(fnames[fi]);
+                if k.zeroes(
+                    !rts.is_empty(),
+                    c.precursor_mz,
+                    skel_centre,
+                    fmzs[fi] as f64,
+                    name,
+                    fints[fi],
+                ) {
+                    ints.iter_mut().for_each(|x| *x = 0.0);
+                    ims.iter_mut().for_each(|x| *x = 0.0);
+                    skel_rows += 1;
+                }
+            }
             chrom_rows.push((
                 cid,
                 // Fragment names are interned in the library (a u16 dictionary id per
@@ -4639,20 +4796,35 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             let shift = 1.0 + p.cfg.ms1_ppm_offset * 1e-6;
             for (nm, dmz) in [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)] {
                 let mz = (c.precursor_mz + dmz) * shift;
-                let ints: Vec<f32> = t_grid
-                    .iter()
-                    .map(|&r| {
-                        let j = nearest_index(&ms1_rts, r);
-                        // No `as f32`: `sum_near` returns f32 and the target is `Vec<f32>`,
-                        // so the cast was an identity. It was tolerated while `ms1_scans`
-                        // was a `Vec<Ms1Scan>` and `clippy::unnecessary_cast` fires on it
-                        // now that it is a `&[Ms1Scan]` -- verified in both directions on
-                        // this tree with clippy 1.96.0, silent before and an error after,
-                        // though which of the lint's heuristics distinguishes `Vec`
-                        // indexing from slice indexing was not established.
-                        ms1_near(ms1_scans, j, p.cfg.ms1_scan_halfwidth, mz, tol)
-                    })
-                    .collect();
+                // A row the retrace skeleton zeroes is rebuilt by retrace from the raw events
+                // and its centroid values are never read, so they are not summed: the MS1
+                // reads of these XICs were about half of extract's busy time on a HYE
+                // diaPASEF run (gdb samples in `ms1_near`), every one of them then zeroed.
+                // The decision reads the row's identity only, never its values, so the
+                // table is the one the summing-then-zeroing wrote.
+                let skeleton = p
+                    .retrace_skeleton
+                    .is_some_and(|k| k.zeroes(true, c.precursor_mz, skel_centre, mz, nm, 0.0));
+                let ints: Vec<f32> = if skeleton {
+                    skel_rows += 1;
+                    vec![0.0; t_grid.len()]
+                } else {
+                    t_grid
+                        .iter()
+                        .map(|&r| {
+                            let j = nearest_index(&ms1_rts, r);
+                            // No `as f32`: `sum_near` returns f32 and the target is
+                            // `Vec<f32>`, so the cast was an identity. It was tolerated while
+                            // `ms1_scans` was a `Vec<Ms1Scan>` and `clippy::unnecessary_cast`
+                            // fires on it now that it is a `&[Ms1Scan]` -- verified in both
+                            // directions on this tree with clippy 1.96.0, silent before and
+                            // an error after, though which of the lint's heuristics
+                            // distinguishes `Vec` indexing from slice indexing was not
+                            // established.
+                            ms1_near(ms1_scans, j, p.cfg.ms1_scan_halfwidth, mz, tol)
+                        })
+                        .collect()
+                };
                 // The MS1 XICs carry no per-point 1/K0. With the list written every row's list is
                 // as long as its trace, so these hold +0.0, "no 1/K0", at every point.
                 let ims: Vec<f32> = if chrom_im {
@@ -4699,37 +4871,6 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         let (deconv_explained, deconv_active, deconv_share, deconv_collin, deconv_shadow) =
             (0.0, 0.0, 0.0, 0.0, 0.0);
 
-        // The 1/K0 evidence (psms_extracted v4) of a row with its apex at `rt`, the selected
-        // apex and every promoted alternative alike. It depends only on the candidate, the
-        // row's apex RT and the precursor m/z, so it is computed here, per accepted row,
-        // rather than in a pass over the finished table, which is streamed out in chunks.
-        // All `None` on 3D data.
-        let im_at = |rt: f64| -> ApexIm {
-            if !has_im {
-                return ApexIm::default();
-            }
-            ApexIm {
-                im_pred_cal: win
-                    .im_cal
-                    .as_ref()
-                    .and_then(|v| v.get(cid as usize).copied().flatten()),
-                ..apex_im_stats(
-                    &lib,
-                    scans,
-                    &rt_scan,
-                    ms1_scans,
-                    &ms1_rts,
-                    guard,
-                    &mass_off,
-                    frag_tol,
-                    p.cfg,
-                    cid,
-                    rt,
-                    c.precursor_mz,
-                )
-            }
-        };
-
         let rank0 = CandOut {
             cid,
             peak_rank: 0, // selected apex; ranks >= 1 added when promote_top_peaks > 1
@@ -4759,15 +4900,17 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             gate_peak_spectral: gate_peak_spectral as f32,
             gate_coelution: gate_coelution as f32,
             gate_spectral_entropy: gate_spectral_entropy as f32,
+            gate_window_mean: gate_window_mean as f32,
             deconv_explained: deconv_explained as f32,
             deconv_active: deconv_active as f32,
             deconv_share: deconv_share as f32,
             deconv_collin: deconv_collin as f32,
             deconv_shadow: deconv_shadow as f32,
-            im: im_at(apex_rt),
+            im: im0,
             chrom: chrom_rows,
             peaks,
         };
+        skeleton_rows.fetch_add(skel_rows, std::sync::atomic::Ordering::Relaxed);
         if p.cfg.promote_top_peaks <= 1 || groups.is_empty() {
             return vec![rank0];
         }
@@ -4849,6 +4992,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 gate_peak_spectral: gate_peak_spectral as f32,
                 gate_coelution: gate_coelution as f32,
                 gate_spectral_entropy: gate_spectral_entropy as f32,
+                gate_window_mean: gate_window_mean as f32,
                 // Demix is a rank-0 apex feature; alternate peaks carry 0.
                 deconv_explained: 0.0,
                 deconv_active: 0.0,
@@ -5018,7 +5162,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 n_materialized += c.len() as u64;
                 emit_batch(c)
             };
-            let step = groups_in_flight(p.cfg);
+            let step = groups_in_flight(p.cfg, has_im);
             let mut gi = 0usize;
             while gi < groups.len() {
                 let upto = (gi + step).min(groups.len());
@@ -5284,6 +5428,25 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             if let Some(obj) = params.as_object_mut() {
                 obj.insert("reader".into(), json!(crate::instrument::READER_TIMSRUST));
                 obj.insert("im_gate".into(), json!(im_gate));
+            }
+        }
+        // The support gate, only when it is on, so a report without it is unchanged.
+        if p.cfg.gate_support_min > 0.0 {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert("gate_support_min".into(), json!(p.cfg.gate_support_min));
+            }
+        }
+        // A skeleton table says so in its own report, with the rows it left for retrace;
+        // retrace refuses one it would not rebuild in full (`retrace::Skeleton`).
+        if let (Some(k), true) = (p.retrace_skeleton, path == p.out_chrom) {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert(
+                    crate::stages::retrace::Skeleton::PARAM.into(),
+                    json!({
+                        "ms1": k.ms1,
+                        "rows": skeleton_rows.load(std::sync::atomic::Ordering::Relaxed),
+                    }),
+                );
             }
         }
         // The traces reach this far beyond each candidate's RT window
@@ -6452,6 +6615,7 @@ mod psms_stream_tests {
             gate_peak_spectral: 0.5,
             gate_coelution: -0.25,
             gate_spectral_entropy: (i % 9) as f32,
+            gate_window_mean: 0.0,
             deconv_explained: 0.0,
             deconv_active: 1.0,
             deconv_share: 0.5,

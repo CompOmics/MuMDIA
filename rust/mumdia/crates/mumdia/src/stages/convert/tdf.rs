@@ -15,6 +15,8 @@
 //! Frames are decoded in parallel and handed to the sink in frame order, so the output does
 //! not depend on the thread count.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::{anyhow, bail, Context, Result};
 use mumdia_core::config::ConvertConfig;
 use rayon::prelude::*;
@@ -23,6 +25,7 @@ use timsrust::readers::{FrameReader, MetadataReader};
 use timsrust::{AcquisitionType, Frame, MSLevel};
 use tracing::{info, warn};
 
+use super::ms1_denoise::Ms1Denoise;
 use super::{top_n_by_intensity, Decoded, Ms2Row};
 
 /// Frames decoded per parallel batch. Bounds the resident raw frames (an MS1 frame is
@@ -43,6 +46,8 @@ pub struct TdfParams {
     pub im_valley: f64,
     /// Half-width in TIMS scans of the mobility profile smoothing.
     pub im_smooth_scans: f64,
+    /// Remove MS1 noise before centroiding (`convert.tdf_ms1_denoise`, `ms1_denoise::Ms1Denoise`).
+    pub ms1_denoise: bool,
 }
 
 impl TdfParams {
@@ -55,12 +60,13 @@ impl TdfParams {
             mz_smooth_ppm: c.tdf_mz_smooth_ppm,
             im_valley: c.tdf_im_valley,
             im_smooth_scans: c.tdf_im_smooth_scans,
+            ms1_denoise: c.tdf_ms1_denoise,
         }
     }
 
     /// The settings as the `convert.tdf_*` keys they come from, for the spectra reports.
     pub fn report_params(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "tdf_mz_ppm": self.mz_ppm,
             "tdf_im_gap_scans": self.im_gap_scans,
             "tdf_min_points": self.min_points,
@@ -68,7 +74,14 @@ impl TdfParams {
             "tdf_mz_smooth_ppm": self.mz_smooth_ppm,
             "tdf_im_valley": self.im_valley,
             "tdf_im_smooth_scans": self.im_smooth_scans,
-        })
+        });
+        // Only when on, so a report at the default is what it was.
+        if self.ms1_denoise {
+            if let Some(o) = v.as_object_mut() {
+                o.insert("tdf_ms1_denoise".into(), serde_json::json!(true));
+            }
+        }
+        v
     }
 }
 
@@ -363,10 +376,21 @@ struct Ctx {
     p: TdfParams,
     top_ms1: usize,
     top_ms2: usize,
+    /// The run's MS1 noise filter under `convert.tdf_ms1_denoise`, and the MS1 points it
+    /// was given and kept.
+    ms1: Option<Ms1Denoise>,
+    ms1_points: AtomicU64,
+    ms1_kept: AtomicU64,
 }
 
 impl Ctx {
-    fn spectrum(&self, f: &Frame, scans: std::ops::Range<usize>, top: usize) -> Centroids {
+    fn spectrum(
+        &self,
+        f: &Frame,
+        scans: std::ops::Range<usize>,
+        top: usize,
+        denoise: Option<&Ms1Denoise>,
+    ) -> Centroids {
         let n_scans = f.scan_offsets.len().saturating_sub(1);
         let scans = scans.start.min(n_scans)..scans.end.min(n_scans);
         let mut pts = Vec::with_capacity(f.scan_offsets[scans.end] - f.scan_offsets[scans.start]);
@@ -374,6 +398,12 @@ impl Ctx {
             for k in f.scan_offsets[s]..f.scan_offsets[s + 1] {
                 pts.push((f.tof_indices[k], s as u32, f.intensities[k]));
             }
+        }
+        if let Some(d) = denoise {
+            self.ms1_points
+                .fetch_add(pts.len() as u64, Ordering::Relaxed);
+            d.apply(&mut pts, n_scans);
+            self.ms1_kept.fetch_add(pts.len() as u64, Ordering::Relaxed);
         }
         // Raw detector counts: `intensity_correction_factor` (accumulation-time
         // normalisation) is ignored, which is exact while frames share one ramp time.
@@ -391,7 +421,7 @@ impl Ctx {
         }
         match f.ms_level {
             MSLevel::MS1 => {
-                let c = self.spectrum(f, 0..usize::MAX, self.top_ms1);
+                let c = self.spectrum(f, 0..usize::MAX, self.top_ms1, self.ms1.as_ref());
                 vec![Decoded::Ms1 {
                     rt_s,
                     mz: c.mz,
@@ -405,7 +435,7 @@ impl Ctx {
                 (0..q.len())
                     .map(|k| {
                         let (s0, s1) = (q.scan_starts[k], q.scan_ends[k]);
-                        let c = self.spectrum(f, s0..s1, self.top_ms2);
+                        let c = self.spectrum(f, s0..s1, self.top_ms2, None);
                         let (a, b) = (self.im.im(s0 as f64), self.im.im(s1 as f64));
                         let half = q.isolation_width[k] / 2.0;
                         let target = q.isolation_mz[k];
@@ -490,12 +520,37 @@ pub(super) fn drive(
     mut sink: impl FnMut(u32, Decoded) -> Result<()>,
 ) -> Result<usize> {
     let RawTdf { reader, mz, im } = RawTdf::open(path)?;
+    // The MS1 filter's window gate is built once per run, from its diaPASEF windows and
+    // the scan count of its first frame.
+    let ms1 = if p.ms1_denoise {
+        let n_scans = match reader.len() {
+            0 => 0,
+            _ => reader
+                .get(0)
+                .map_err(|e| anyhow!("{path}: frame 0: {e}"))?
+                .scan_offsets
+                .len()
+                .saturating_sub(1),
+        };
+        let windows = reader.get_dia_windows().unwrap_or_default();
+        Some(Ms1Denoise::new(
+            &windows,
+            n_scans,
+            |m| mz.invert(m),
+            |s| im.im(s),
+        ))
+    } else {
+        None
+    };
     let ctx = Ctx {
         mz,
         im,
         p: *p,
         top_ms1,
         top_ms2,
+        ms1,
+        ms1_points: AtomicU64::new(0),
+        ms1_kept: AtomicU64::new(0),
     };
     let n = match max_frames {
         0 => reader.len(),
@@ -520,6 +575,19 @@ pub(super) fn drive(
             }
         }
     }
+    if let Some(d) = &ctx.ms1 {
+        let (points, kept) = (
+            ctx.ms1_points.load(Ordering::Relaxed),
+            ctx.ms1_kept.load(Ordering::Relaxed),
+        );
+        info!(
+            points,
+            kept,
+            kept_pct = 100.0 * kept as f64 / points.max(1) as f64,
+            window_gate = d.gated(),
+            "convert: MS1 noise filter (convert.tdf_ms1_denoise)"
+        );
+    }
     Ok(emitted)
 }
 
@@ -535,6 +603,7 @@ mod tests {
         mz_smooth_ppm: 4.0,
         im_valley: 0.0,
         im_smooth_scans: 4.0,
+        ms1_denoise: false,
     };
     const V: TdfParams = TdfParams {
         mz_valley: 0.5,
