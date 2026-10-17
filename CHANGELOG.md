@@ -209,7 +209,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   352,096 human precursors per run at a species-entrapment FDP of 1.81% against 1.79%, in
   6:04 instead of 10:35 at 13.8 instead of 33.6 GB; 24 single cells pooled 169,007 against
   168,249 precursors with 379 against 374 carbamidomethylated targets (the cells were not
-  alkylated). (docs/35_diapasef.md section 16.)
+  alkylated). Under `native_tda` it also raises sensitivity: six Astral runs 96,840 -> 105,400
+  peptides, and the 22 HeLa runs 197,636 -> 254,382 human precursors per run at a
+  species-entrapment FDP of 2.01% against 2.08%, in 14:36 instead of 39:02. A pool with fewer
+  decoys than `rescore.min_train_decoys` (100 at least) is not cut.
+  (docs/35_diapasef.md section 16.)
 - **Search-anchored multi-head calibration** (`rt_im_train.multihead_anchors = "search"`;
   `"auto"`, the default since the entry above, chooses it on runs short of seed anchors). The run that adapts the library (a single `run`, the
   first run of `run-experiment` under `rt_library_scope = first_run_only`, or every run under

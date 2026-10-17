@@ -1234,6 +1234,19 @@ seeds, 2:59 instead of 5:06 at 7.1 instead of 15.6 GB; per file, 161,055 against
 144 against 147. On three of the 24 single-cell files a fold had fewer than 10 confident targets
 to fit on, and the prefilter stood aside with a warning.
 
+Every number above used `nn_torch`. Under `native_tda` the prefilter is also a sensitivity
+gain, because the linear model fits the boundary far better without the weak bulk: one HYE
+Orbitrap run 51,118 -> 55,461 peptides at 1% (2:04 instead of 5:33), the six Astral runs
+96,840 -> 105,400 (4:19 instead of 8:06), and the 22 HeLa runs 197,636 -> 254,382 human
+precursors per run at a species-entrapment FDP of 2.01% against 2.08% (precursor level
+9,955 -> 14,887 at 2.17% against 2.38%), the precursors new with the prefilter at 2.26%, in
+14:36 instead of 39:02 at 20.8 instead of 55.8 GB. One seed each; `native_tda` is
+deterministic.
+
+A pool with fewer decoys than `rescore.min_train_decoys` (100 at least) is not cut: on the
+smoke fixture, one decoy in 316 PSMs put the cut at that decoy, kept 96 targets and raised the
+q floor (decoys + 1) / targets to 1.04%, so nothing passed 1%.
+
 ### MS1 noise
 
 The dnoise tool (P. T. Garrett, J. K. Diedrich and J. R. Yates III, bioRxiv 2026,
