@@ -1041,6 +1041,16 @@ identification, quantity and loss class bit-identical, in 50 against 51 minutes.
 record of the accumulator (`mem: extract hit accumulator`) reads its size after each batch,
 not inside it, so it reported 0.0 throughout.
 
+### Extract: MS1 traces under a skeleton
+
+gdb samples of a standalone extract of run A_02 at 20 threads put about half of its busy time
+in the MS1 reads of the three isotope traces it writes per candidate (`ms1_near`, the maximum
+over the nearest MS1 scan and its neighbours at every grid point). When retrace follows, the
+skeleton then zeroed every one of those rows. The skeleton decision reads only a row's
+identity, so it is taken first now and a zeroed row is written without being read; the table
+is the one the reading-then-zeroing wrote. The bootstrap pass, which does not retrace, still
+reads them.
+
 ### Run order and decode pools
 
 Under `experiment.parallel_runs = "auto"` the first run's chain ran alone so that its peak
