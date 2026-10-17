@@ -3038,12 +3038,10 @@
       "rust_type": "f64",
       "kind": "float",
       "optional": false,
-      "default": 0.0,
-      "default_text": "0.0",
-      "help": "Send only the strongest competed PSMs to the classifier: those a quick cross-validated linear model scores above the decoy that completes this fraction of the decoys; 0 (default) keeps every PSM. The model is fitted per experiment on `prefilter_features` (a default list when unset): for each fold a logistic regression of the targets at `train_fdr` against the decoys of a 400,000-row sample of the other folds, refitted three times, and every PSM is scored by the model of the fold it is held out of, on the rescore's own fold keys. Targets and decoys above the cut are all kept, so the share of rows kept follows the pool: 36% on a six-run diaPASEF pool, 49% on a six-run Astral pool at 0.35. The classifier, its q values and the scored table see only the kept rows; a dropped PSM is not identified. When the model cannot be fitted (too few confident targets, a missing or non-finite column) every PSM goes to the classifier with a warning. Must be in [0, 1). Benchmark-gated (docs/35_diapasef.md section 16).",
-      "gates": [
-        "benchmark-gated"
-      ],
+      "default": 0.35,
+      "default_text": "0.35",
+      "help": "Send only the strongest competed PSMs to the classifier: those a quick cross-validated linear model scores above the decoy that completes this fraction of the decoys (default 0.35); 0 keeps every PSM. The model is fitted per experiment on `prefilter_features` (a default list when unset): for each fold a logistic regression of the targets at `train_fdr` against the decoys of a 400,000-row sample of the other folds, refitted three times, and every PSM is scored by the model of the fold it is held out of, on the rescore's own fold keys. Targets and decoys above the cut are all kept, so the share of rows kept follows the pool: 36% on a six-run diaPASEF pool, 49% on a six-run Astral pool at 0.35. The classifier, its q values and the scored table see only the kept rows; a dropped PSM is not identified. When the model cannot be fitted (too few confident targets, a missing or non-finite column) every PSM goes to the classifier with a warning. Must be in [0, 1). The default since 2026-10-17: at 0.35 within 0.11% of the peptides on diaPASEF, Astral and Orbitrap pools, an unchanged species-entrapment FDP and carbamidomethyl null, for 41-45% of the rescore wall time and 54-60% of its peak memory (docs/35_diapasef.md section 16).",
+      "gates": [],
       "source_struct": "RescoreConfig"
     },
     {

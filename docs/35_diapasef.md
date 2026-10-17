@@ -1195,7 +1195,8 @@ for 38,406 peptides, no better than 0.845.
 ### A prefilter before the classifier
 
 On a large pool the classifier is the rescore's cost, and most of what it scores is never
-identified. `rescore.prefilter_keep_decoys` (opt-in) removes that part first. A logistic
+identified. `rescore.prefilter_keep_decoys` (default 0.35 since 2026-10-17; 0 turns it off)
+removes that part first. A logistic
 regression on 32 feature columns (agreement, co-elution, intensity, matched counts, retention
 time, MS1 and peak shape; `rescore.prefilter_features` replaces the list) is fitted per fold on
 a sample of at most 400,000 rows of the other folds, the targets at `train_fdr` against the

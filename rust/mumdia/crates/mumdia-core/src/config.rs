@@ -2786,7 +2786,7 @@ pub struct RescoreConfig {
     pub max_feature_matrix_gib: f64,
     /// Send only the strongest competed PSMs to the classifier: those a quick
     /// cross-validated linear model scores above the decoy that completes this fraction of
-    /// the decoys; 0 (default) keeps every PSM. The model is fitted per experiment on
+    /// the decoys (default 0.35); 0 keeps every PSM. The model is fitted per experiment on
     /// `prefilter_features` (a default list when unset): for each fold a logistic regression
     /// of the targets at `train_fdr` against the decoys of a 400,000-row sample of the other
     /// folds, refitted three times, and every PSM is scored by the model of the fold it is
@@ -2795,9 +2795,10 @@ pub struct RescoreConfig {
     /// on a six-run Astral pool at 0.35. The classifier, its q values and the scored table
     /// see only the kept rows; a dropped PSM is not identified. When the model cannot be
     /// fitted (too few confident targets, a missing or non-finite column) every PSM goes to
-    /// the classifier with a warning. Must be in [0, 1). Benchmark-gated
-    /// (docs/35_diapasef.md section 16).
-    #[serde(skip_serializing_if = "is_zero_f64")]
+    /// the classifier with a warning. Must be in [0, 1). The default since 2026-10-17: at
+    /// 0.35 within 0.11% of the peptides on diaPASEF, Astral and Orbitrap pools, an
+    /// unchanged species-entrapment FDP and carbamidomethyl null, for 41-45% of the rescore
+    /// wall time and 54-60% of its peak memory (docs/35_diapasef.md section 16).
     pub prefilter_keep_decoys: f64,
     /// The feature columns the prefilter model reads; unset is a default list of agreement,
     /// co-elution, intensity, matched-count, retention-time, MS1 and peak-shape features.
@@ -2991,7 +2992,7 @@ impl Default for RescoreConfig {
             train_fdr: 0.01,
             num_iter: 10,
             max_feature_matrix_gib: 0.0, // no ceiling; previous behaviour
-            prefilter_keep_decoys: 0.0,  // off; benchmark-gated
+            prefilter_keep_decoys: 0.35, // docs/35_diapasef.md section 16
             prefilter_features: None,
             python: None,
             percolator_bin: None,

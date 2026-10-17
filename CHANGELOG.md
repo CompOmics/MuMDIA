@@ -198,8 +198,8 @@ than a number. Both are recorded in every run's `manifest.json`.
   instead of 39,164 peptides in 22.5-23.5 instead of 42-46 min, and on the E. coli
   entrapment run (three seeds) 13,892 instead of 14,121 peptides at an FDP of 0.32-0.35%
   against 0.30-0.38%. (docs/35_diapasef.md section 16.)
-- **A prefilter before the classifier** (`rescore.prefilter_keep_decoys`, opt-in): a
-  cross-validated logistic regression on 32 feature columns (`rescore.prefilter_features`)
+- **A prefilter before the classifier** (`rescore.prefilter_keep_decoys`, default 0.35; 0
+  restores the previous behaviour): a cross-validated logistic regression on 32 feature columns (`rescore.prefilter_features`)
   scores every competed PSM out of fold, and only the PSMs above the decoy that completes the
   given fraction of the decoys go to the classifier. The share of rows kept follows the pool.
   At 0.35, pooled rescores of stored competed tables (NN seeds 0-2 unless stated): six HYE
