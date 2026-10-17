@@ -207,9 +207,9 @@
       "rust_type": "bool",
       "kind": "bool",
       "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Native diaPASEF reader: remove MS1 noise before centroiding, with the method and default MS1 settings of dnoise (Garrett, Diedrich and Yates, bioRxiv 2026, doi:10.64898/2026.08.27.747603): keep only MS1 points on runs of at least 5 occupied mobility scans (TOF neighbourhood +/- 3, gaps of up to 2 scans bridged, two passes), drop features no diaPASEF window reaches (windows padded by 3 Th and 0.015 1/K0), and drop the weak m/z halo of bright ions. Retrace applies the same filter to the raw MS1 frames it holds, so both read the same MS1 events. The tool's MS1 default on the six ProteoBench HYE diaPASEF runs kept 8.7% of the MS1 points and left identifications unchanged at 51 against 63 minutes (docs/35_diapasef.md section 16). MS/MS spectra are never filtered. Default false.",
+      "default": true,
+      "default_text": "true",
+      "help": "Native diaPASEF reader: remove MS1 noise before centroiding, with the method and default MS1 settings of dnoise (Garrett, Diedrich and Yates, bioRxiv 2026, doi:10.64898/2026.08.27.747603): keep only MS1 points on runs of at least 5 occupied mobility scans (TOF neighbourhood +/- 3, gaps of up to 2 scans bridged, two passes), drop features no diaPASEF window reaches (windows padded by 3 Th and 0.015 1/K0), and drop the weak m/z halo of bright ions. Retrace applies the same filter to the raw MS1 frames it holds, so both read the same MS1 events. MS/MS spectra are never filtered. Default true since 2026-10-17; only the native diaPASEF reader reads it. On the six ProteoBench HYE diaPASEF runs it kept 8.7% of the MS1 points with identical identifications (98,524 peptides at 1%, 89,973 ProteoBench ions at k = 3); on the 15 min E. coli run 14,121 against 14,044 peptides at 1% and an entrapment FDP of 0.30-0.38% against 0.39-0.46% (three NN seeds each; docs/35_diapasef.md section 16). `false` restores the unfiltered MS1.",
       "gates": [],
       "source_struct": "ConvertConfig"
     },
