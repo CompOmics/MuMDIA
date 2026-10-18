@@ -226,7 +226,10 @@ than a number. Both are recorded in every run's `manifest.json`.
   alkylated). Under `native_tda` it also raises sensitivity: six Astral runs 96,840 -> 105,400
   peptides, and the 22 HeLa runs 197,636 -> 254,382 human precursors per run at a
   species-entrapment FDP of 2.01% against 2.08%, in 14:36 instead of 39:02. A pool with fewer
-  decoys than `rescore.min_train_decoys` (100 at least) is not cut.
+  decoys than `rescore.min_train_decoys` (100 at least) is not cut, and neither is one below
+  `rescore.prefilter_min_psms` (default 1,000,000 PSMs): on the 27,376-PSM Orbitrap AIF
+  entrapment run the cut saved 2 s of a 10 s rescore and cost 1.3% of the real precursors at an
+  unchanged FDP, so single runs of that size are scored as before.
   (docs/35_diapasef.md section 16.)
 - **Search-anchored multi-head calibration** (`rt_im_train.multihead_anchors = "search"`;
   `"auto"`, the default, chooses it on runs short of seed anchors, see Changed). The run that

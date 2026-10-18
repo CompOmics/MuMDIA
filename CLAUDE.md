@@ -721,7 +721,9 @@ sections 10-16:
   41-45% of the rescore wall and 54-60% of its peak. A cut by a fixed share of rows was
   refuted (-0.75% on Astral at 35%): the loss follows the share of decoys kept. It stands
   aside with a warning when a fold has too few confident targets (3 of 24 single-cell
-  files) or the pool has fewer than 100 decoys. Under `native_tda` it is a sensitivity gain
+  files), the pool has fewer than 100 decoys, or it has fewer than
+  `rescore.prefilter_min_psms` (default 1,000,000) PSMs: on the 27k-PSM AIF entrapment run the
+  cut cost 1.3% of the real precursors for 2 s, so small single runs are scored whole. Under `native_tda` it is a sensitivity gain
   as well (Astral +8.8%; HeLa +28.7% human precursors per run at a species-entrapment FDP of
   2.01% against 2.08%). docs/35 section 16.
 

@@ -2801,11 +2801,19 @@ pub struct RescoreConfig {
     /// see only the kept rows; a dropped PSM is not identified. When the model cannot be
     /// fitted (too few confident targets, a missing or non-finite column) or the pool has
     /// fewer decoys than `min_train_decoys` (100 at least) every PSM goes to the classifier
-    /// with a warning. Must be in [0, 1). The default since 2026-10-17: at
+    /// with a warning, and a pool smaller than `prefilter_min_psms` is not cut. Must be in
+    /// [0, 1). The default since 2026-10-17: at
     /// 0.35 within 0.11% of the peptides on diaPASEF, Astral and Orbitrap pools, an
     /// unchanged species-entrapment FDP and carbamidomethyl null, for 41-45% of the rescore
     /// wall time and 54-60% of its peak memory (docs/35_diapasef.md section 16).
     pub prefilter_keep_decoys: f64,
+    /// The fewest competed PSMs a pool needs before `prefilter_keep_decoys` cuts it (default
+    /// 1,000,000); a smaller pool goes to the classifier whole. The prefilter is a speed and
+    /// memory lever for large pools: on the 27,376-PSM Orbitrap AIF entrapment run it saved 2 s
+    /// of a 10 s rescore and cost 1.3% of the real precursors at an unchanged FDP, while every
+    /// pool measured from 1.8 million PSMs up lost nothing (docs/35_diapasef.md section 16).
+    /// 0 cuts every pool.
+    pub prefilter_min_psms: usize,
     /// The feature columns the prefilter model reads; unset is a default list of agreement,
     /// co-elution, intensity, matched-count, retention-time, MS1 and peak-shape features.
     /// Names the competed table does not carry are skipped with a warning.
@@ -2999,6 +3007,7 @@ impl Default for RescoreConfig {
             num_iter: 10,
             max_feature_matrix_gib: 0.0, // no ceiling; previous behaviour
             prefilter_keep_decoys: 0.35, // docs/35_diapasef.md section 16
+            prefilter_min_psms: 1_000_000,
             prefilter_features: None,
             python: None,
             percolator_bin: None,

@@ -1254,6 +1254,14 @@ precursors per run at a species-entrapment FDP of 2.01% against 2.08% (precursor
 14:36 instead of 39:02 at 20.8 instead of 55.8 GB. One seed each; `native_tda` is
 deterministic.
 
+A pool below `rescore.prefilter_min_psms` (default 1,000,000 PSMs) is not cut either. The
+prefilter is a speed and memory lever for large pools, and on a small one it can cost
+identifications for no measurable saving: on the Orbitrap AIF E. coli entrapment run (27,376
+PSMs, 7,280 decoys), rescored three times per arm, it gave 11,644 against 11,798 real
+precursors at an entrapment FDP of 1% (-1.3%) at an unchanged FDP at q 1% (1.05-1.12% against
+1.07-1.11%), for 7.9 instead of 9.8 s. Every pool measured from 1.8 million PSMs up was within
+seed noise or better.
+
 A pool with fewer decoys than `rescore.min_train_decoys` (100 at least) is not cut: on the
 smoke fixture, one decoy in 316 PSMs put the cut at that decoy, kept 96 targets and raised the
 q floor (decoys + 1) / targets to 1.04%, so nothing passed 1%.
