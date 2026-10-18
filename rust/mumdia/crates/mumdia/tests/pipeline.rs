@@ -978,14 +978,16 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     let (psms_own_b, _chrom_own_b, _) = run_one(None, &cal_b, "own_b");
     assert!(
         rows_a > 0,
-        "extract found nothing under the first calibration, so every equality below             compares empty tables"
+        "extract found nothing under the first calibration, so every equality below \
+            compares empty tables"
     );
 
     let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
     assert_ne!(
         h(&psms_own_a),
         h(&psms_own_b),
-        "the two mass calibrations make no difference to the output, so alternating them             over one buffer tests nothing"
+        "the two mass calibrations make no difference to the output, so alternating them \
+            over one buffer tests nothing"
     );
 
     // One decode, lent to four extracts in a row under alternating calibrations, as a
@@ -1062,7 +1064,8 @@ fn extract_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     assert_ne!(
         h(&psms_own_a),
         h(&psms_noclaim),
-        "the peak-claim strategy changes nothing on this fixture, so the destructive path             is untested here"
+        "the peak-claim strategy changes nothing on this fixture, so the destructive path \
+            is untested here"
     );
 
     // Guard: the MS1 fixture has to reach the output, or the shared-MS1 half of this test
@@ -1220,7 +1223,8 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     let (own, own_rows) = run_one(None, "own");
     assert!(
         own_rows > 0,
-        "the seed found nothing on this fixture, so every equality below compares empty             tables"
+        "the seed found nothing on this fixture, so every equality below compares empty \
+            tables"
     );
     let scans = mumdia::spectra::load_ms2(&ms2).unwrap();
     let (a, _) = run_one(Some(&scans), "shared_a");
@@ -1264,7 +1268,8 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     assert_ne!(
         h(&own),
         h(&out),
-        "search_seed.top_n_peaks does not bind on this fixture, so select_peaks never             caps and the capping branch is untested here"
+        "search_seed.top_n_peaks does not bind on this fixture, so select_peaks never \
+            caps and the capping branch is untested here"
     );
 
     // An empty lent slice is the caller having nothing to lend, not an empty run.

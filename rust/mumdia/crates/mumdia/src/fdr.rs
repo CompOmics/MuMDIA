@@ -599,7 +599,8 @@ mod tests {
         for (i, v) in q.iter().take(4).enumerate() {
             assert!(
                 *v <= 0.25 + 1e-12,
-                "finite target {i} should keep q = 1/4, got {v} (a non-finite score                  outranking it would raise this): {q:?}"
+                "finite target {i} should keep q = 1/4, got {v} (a non-finite score \
+                 outranking it would raise this): {q:?}"
             );
         }
     }

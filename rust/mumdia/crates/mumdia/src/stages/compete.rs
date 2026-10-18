@@ -909,7 +909,9 @@ fn copy_kept_rows_with(
                     let col = b.column(*i);
                     if !f.is_nullable() && col.null_count() > 0 {
                         return Err(anyhow!(
-                            "column '{}' has {} null values in rows {row0}..{row1} of the                              features table, and the competed schema declares it                              non-nullable",
+                            "column '{}' has {} null values in rows {row0}..{row1} of the \
+                             features table, and the competed schema declares it \
+                             non-nullable",
                             f.name(),
                             col.null_count()
                         ));

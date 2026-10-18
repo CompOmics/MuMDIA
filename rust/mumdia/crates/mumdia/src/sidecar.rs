@@ -749,7 +749,8 @@ fn push_projection_cache<'a>(args: &mut Vec<&'a str>, dir: Option<&'a crate::cac
     let Some(path) = dir.path.to_str() else {
         warn!(
             dir = %dir.path.display(),
-            "rt_im_train.deeplc_projection_cache: the directory is not valid UTF-8; predicting              without the projection cache"
+            "rt_im_train.deeplc_projection_cache: the directory is not valid UTF-8; predicting \
+             without the projection cache"
         );
         return;
     };

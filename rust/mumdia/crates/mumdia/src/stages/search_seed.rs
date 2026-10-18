@@ -288,7 +288,8 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             warn!(
                 ms2 = p.ms2,
                 scans = owned.len(),
-                "search-seed: the caller lent an empty MS2 buffer for a run that has                  scans; decoding the artifact instead of searching nothing"
+                "search-seed: the caller lent an empty MS2 buffer for a run that has \
+                 scans; decoding the artifact instead of searching nothing"
             );
         }
         Ok(Some(owned))

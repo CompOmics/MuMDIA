@@ -257,11 +257,17 @@ fn pooled_masscal(
         warn!(
             missing,
             groups = p.calibrants.len(),
-            "seed-pool: a group has no calibrant deviation sidecar, which is a band                  directory seeded before the pooled mass calibration existed. Combining the                  bands' fitted scalars instead, which is measurably WIDER than one fit over the                  pooled deviations (11.40 against 8.45 ppm on the six-file HYE Astral                  benchmark). Re-run search-seed on the bands to get the pooled fit"
+            "seed-pool: a group has no calibrant deviation sidecar, which is a band \
+                 directory seeded before the pooled mass calibration existed. Combining the \
+                 bands' fitted scalars instead, which is measurably WIDER than one fit over the \
+                 pooled deviations (11.40 against 8.45 ppm on the six-file HYE Astral \
+                 benchmark). Re-run search-seed on the bands to get the pooled fit"
         );
         if p.cfg.mass_cal_loess {
             warn!(
-                "seed-pool: search_seed.mass_cal_loess is set but cannot be honoured from                      the bands' scalars -- an m/z-dependent grid needs the deviations. extract                      will apply the scalar offset only"
+                "seed-pool: search_seed.mass_cal_loess is set but cannot be honoured from \
+                     the bands' scalars -- an m/z-dependent grid needs the deviations. extract \
+                     will apply the scalar offset only"
             );
         }
         return Ok(None);
@@ -290,7 +296,8 @@ fn pooled_masscal(
         warn!(
             calibrants = devs.len(),
             frag_tol_ppm = cal.frag_tol_ppm,
-            "seed-pool: too few pooled calibrants to fit a fragment tolerance; extract runs                  at the configured tolerance with no offset"
+            "seed-pool: too few pooled calibrants to fit a fragment tolerance; extract runs \
+                 at the configured tolerance with no offset"
         );
     }
     info!(
@@ -341,7 +348,8 @@ fn combine_band_scalars(p: &SeedPoolParams) -> Result<MassCal> {
     } else {
         warn!(
             frag_tol_ppm = uncalibrated_tol,
-            "seed-pool: no group had confident seeds to calibrate mass; extract runs at the              configured fragment tolerance with no offset"
+            "seed-pool: no group had confident seeds to calibrate mass; extract runs at the \
+             configured fragment tolerance with no offset"
         );
         (0.0, uncalibrated_tol, 0.0, 0.0)
     };

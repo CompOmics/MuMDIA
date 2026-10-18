@@ -1506,7 +1506,8 @@ fn real_main() -> Result<()> {
                 overrides: None,
             })?;
             println!(
-                "sub-library: {} precursors ({} targets, {} decoys) and {} fragment rows from                  {} survivors of {}",
+                "sub-library: {} precursors ({} targets, {} decoys) and {} fragment rows from \
+                 {} survivors of {}",
                 st.precursors,
                 st.targets,
                 st.decoys,
@@ -1749,7 +1750,8 @@ fn real_main() -> Result<()> {
                 bands_disjoint: false,
             })?;
             println!(
-                "pooled {} bands: {} competed rows, {} chromatogram rows, {} overlap                  duplicates removed{}",
+                "pooled {} bands: {} competed rows, {} chromatogram rows, {} overlap \
+                 duplicates removed{}",
                 bands.len(),
                 stats.competed,
                 stats.chromatograms,

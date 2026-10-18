@@ -517,321 +517,322 @@ pub fn run(p: RunParams) -> Result<()> {
     // Grouped: everything from the seed to the competed table happens one isolation-window
     // group at a time, and the pooled artifacts come back under the same names the
     // ungrouped path writes, so rescore, quant and report below are shared.
-    let (seed, lib_p, psms, chrom, feats, competed, grouped_rt_model) = if cfg.groups.window_groups
-        > 1
-    {
-        let pooled = run_groups::run(run_groups::GroupRun {
-            cfg,
-            config_hash: &ch,
-            converted: &co,
-            lib_precursors: &lib_p,
-            lib_fragments: &lib_f,
-            out_dir: p.out_dir,
-            man: Some(&mut man),
-            shared_bands: None,
-            mh_heads,
-            library_input: p.lib_precursors.is_some(),
-            // A single run re-predicts nothing before banding.
-            library_irt_repredicted: false,
-            slices_from: None,
-            irt_placeholder: rt_placeholder,
-        })?;
-        (
-            pooled.seed,
-            lib_p.clone(),
-            pooled.psms,
-            pooled.chromatograms,
-            pooled.features,
-            pooled.competed,
-            Some(pooled.rt_model),
-        )
-    } else {
-        let seed = d("seed_psms.parquet");
-        // Ungrouped: the seed and the extract below are the only readers of the
-        // spectra. Whether the seed's MS2 decode is lent on to extract depends on what
-        // runs between them. A DeepLC step (multi-head calibration, fine-tune or
-        // re-prediction) is where the tallest sidecar of a single run sits, and holding
-        // the scans (~1 GB) across it would add them to the process-tree peak, so then
-        // each stage decodes its own and drops it. Without one, only rt-im-train runs in
-        // between, which holds far less than extract does with the scans resident
-        // anyway, so the decode is kept and lent: one MS2 decode per run instead of two.
-        let rt_sidecar = mh_heads > 0
-            || cfg.rt_im_train.finetune_deeplc
-            || cfg.rt_im_train.repredicts_library_irt(
-                p.lib_precursors.is_some(),
-                cfg.predict_frag.deeplc_python.is_some(),
-            );
-        info!(stage = %"search-seed", "run: stage start");
-        let (w, seed_ms2) = search_seed::run_returning_scans(search_seed::SearchSeedParams {
-            precursor_span: None,
-            fragment_offset: None,
-            ms2_scans: None,
-            emit_calibrants: false,
-            library: None,
-            ms2: &co.ms2,
-            library_precursors: &lib_p,
-            library_fragments: &lib_f,
-            out: &seed,
-            cfg: &cfg.search_seed,
-            bucket_size: cfg.extract.bucket_size,
-            config_hash: &ch,
-        })?;
-        man.record(w.record(
-            artifact::SEED_PSMS.0,
-            search_seed::seed_schema(&seed)?,
-            &seed,
-            "search-seed",
-            &ch,
-        ));
-        // Consumed here either way: kept for extract, or freed now, before any sidecar.
-        // (A conditional move would leave the scans alive to the end of this block.)
-        // Only on extract's fragindex matcher: the bucketed one builds a sorted copy of
-        // every library fragment in its load, and extract keeps its decode out of that
-        // transient for the same reason, so scans held from the seed would put it back.
-        let lend = !rt_sidecar
-            && matches!(
-                cfg.extract.matcher,
-                mumdia_core::config::MatcherKind::Fragindex
-            );
-        let lent_ms2: Option<Vec<mumdia_core::types::Ms2Scan>> = seed_ms2.filter(|_| lend);
+    let (seed, lib_p, psms, chrom, feats, competed, grouped_rt_model) =
+        if cfg.groups.window_groups > 1 {
+            let pooled = run_groups::run(run_groups::GroupRun {
+                cfg,
+                config_hash: &ch,
+                converted: &co,
+                lib_precursors: &lib_p,
+                lib_fragments: &lib_f,
+                out_dir: p.out_dir,
+                man: Some(&mut man),
+                shared_bands: None,
+                mh_heads,
+                library_input: p.lib_precursors.is_some(),
+                // A single run re-predicts nothing before banding.
+                library_irt_repredicted: false,
+                slices_from: None,
+                irt_placeholder: rt_placeholder,
+            })?;
+            (
+                pooled.seed,
+                lib_p.clone(),
+                pooled.psms,
+                pooled.chromatograms,
+                pooled.features,
+                pooled.competed,
+                Some(pooled.rt_model),
+            )
+        } else {
+            let seed = d("seed_psms.parquet");
+            // Ungrouped: the seed and the extract below are the only readers of the
+            // spectra. Whether the seed's MS2 decode is lent on to extract depends on what
+            // runs between them. A DeepLC step (multi-head calibration, fine-tune or
+            // re-prediction) is where the tallest sidecar of a single run sits, and holding
+            // the scans (~1 GB) across it would add them to the process-tree peak, so then
+            // each stage decodes its own and drops it. Without one, only rt-im-train runs in
+            // between, which holds far less than extract does with the scans resident
+            // anyway, so the decode is kept and lent: one MS2 decode per run instead of two.
+            let rt_sidecar = mh_heads > 0
+                || cfg.rt_im_train.finetune_deeplc
+                || cfg.rt_im_train.repredicts_library_irt(
+                    p.lib_precursors.is_some(),
+                    cfg.predict_frag.deeplc_python.is_some(),
+                );
+            info!(stage = %"search-seed", "run: stage start");
+            let (w, seed_ms2) = search_seed::run_returning_scans(search_seed::SearchSeedParams {
+                precursor_span: None,
+                fragment_offset: None,
+                ms2_scans: None,
+                emit_calibrants: false,
+                library: None,
+                ms2: &co.ms2,
+                library_precursors: &lib_p,
+                library_fragments: &lib_f,
+                out: &seed,
+                cfg: &cfg.search_seed,
+                bucket_size: cfg.extract.bucket_size,
+                config_hash: &ch,
+            })?;
+            man.record(w.record(
+                artifact::SEED_PSMS.0,
+                search_seed::seed_schema(&seed)?,
+                &seed,
+                "search-seed",
+                &ch,
+            ));
+            // Consumed here either way: kept for extract, or freed now, before any sidecar.
+            // (A conditional move would leave the scans alive to the end of this block.)
+            // Only on extract's fragindex matcher: the bucketed one builds a sorted copy of
+            // every library fragment in its load, and extract keeps its decode out of that
+            // transient for the same reason, so scans held from the seed would put it back.
+            let lend = !rt_sidecar
+                && matches!(
+                    cfg.extract.matcher,
+                    mumdia_core::config::MatcherKind::Fragindex
+                );
+            let lent_ms2: Option<Vec<mumdia_core::types::Ms2Scan>> = seed_ms2.filter(|_| lend);
 
-        // The anchor cut every anchor consumer below uses (multi-head, fine-tune,
-        // rt-im-train): `q_train`, relaxed through `anchor_q_ladder` on a run whose seed
-        // is short of anchors. Still short at the last rung, the multi-head calibration
-        // is skipped rather than handed an empty reference, and an imported library gets
-        // the base-model re-prediction it would otherwise have overwritten.
-        let anchor_plan = rt_im_train::plan_anchors(&seed, &cfg.rt_im_train)?;
-        let rt_cfg = rt_im_train::with_anchor_cut(&cfg.rt_im_train, &anchor_plan);
-        let mh_skipped = mh_heads > 0 && !anchor_plan.sufficient;
-        if mh_skipped && rt_placeholder {
-            anyhow::bail!(
-                    "the library carries placeholder retention times for the multi-head                      calibration to replace, but the seed search found only {} target anchors                      (need {}) even at q {}; re-run without predict_frag.defer_deeplc_to_multihead",
+            // The anchor cut every anchor consumer below uses (multi-head, fine-tune,
+            // rt-im-train): `q_train`, relaxed through `anchor_q_ladder` on a run whose seed
+            // is short of anchors. Still short at the last rung, the multi-head calibration
+            // is skipped rather than handed an empty reference, and an imported library gets
+            // the base-model re-prediction it would otherwise have overwritten.
+            let anchor_plan = rt_im_train::plan_anchors(&seed, &cfg.rt_im_train)?;
+            let rt_cfg = rt_im_train::with_anchor_cut(&cfg.rt_im_train, &anchor_plan);
+            let mh_skipped = mh_heads > 0 && !anchor_plan.sufficient;
+            if mh_skipped && rt_placeholder {
+                anyhow::bail!(
+                    "the library carries placeholder retention times for the multi-head \
+                     calibration to replace, but the seed search found only {} target anchors \
+                     (need {}) even at q {}; re-run without predict_frag.defer_deeplc_to_multihead",
                     anchor_plan.n_anchors,
                     rt_cfg.min_seed_for_calibration,
                     anchor_plan.q_train
                 );
-        }
-        let mh_heads = if mh_skipped { 0 } else { mh_heads };
-
-        // Optional DeepLC multitask fine-tune: adapt the RT model to this run's
-        // confident seed PSMs and rewrite the library's predicted_irt before RT
-        // calibration. The seed is iRT-independent, so it was computed above on the
-        // base library and is reused here. rt-im-train and extract then read the
-        // fine-tuned library.
-        let lib_p = if mh_heads > 0 {
-            // Multi-head calibration occupies the fine-tune's slot: it needs this run's
-            // confident seed PSMs, which exist only now, and it rewrites the same library the
-            // fine-tune would. Validation refuses both at once.
-            let python = cfg
-                .predict_frag
-                .deeplc_python
-                .as_deref()
-                .expect("mh_heads is 0 unless an interpreter resolved");
-            let script = crate::sidecar::resolve_script(
-                &cfg.predict_frag.sidecar_script_dir,
-                "deeplc_finetune.py",
-            );
-            // Under `multihead_anchors = search`, or `auto` on a seed short of anchors,
-            // this seed-anchored fit goes to `rt_bootstrap/` and the refit below takes the
-            // usual name.
-            let has_im = crate::instrument::input_has_im(p.mzml);
-            let search = rt_bootstrap::decide(cfg, mh_heads, &anchor_plan, has_im, p.out_dir);
-            let lib_p_mh = rt_bootstrap::seed_library_path(search, p.out_dir);
-            info!(stage = %"deeplc-multihead", "run: stage start");
-            crate::sidecar::run_deeplc_multihead(
-                python,
-                &script,
-                &lib_p,
-                &seed,
-                &lib_p_mh,
-                mh_heads,
-                rt_cfg.q_train,
-                cfg.rt_im_train.window_holdout_frac,
-                rayon::current_num_threads(),
-                cfg.rt_im_train.deeplc_predict_shards,
-                crate::cache::projection_dir(cfg).as_ref(),
-            )?;
-            if rt_placeholder {
-                crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
             }
-            let lib_p_mh = if search {
-                info!(stage = %"rt-bootstrap", "run: stage start");
-                let o = rt_bootstrap::refit(&rt_bootstrap::Refit {
-                    cfg,
-                    config_hash: &ch,
-                    converted: &co,
-                    lib_p_base: &lib_p,
-                    lib_f: &lib_f,
-                    seed: &seed,
-                    out: p.out_dir,
-                    seed_library: &lib_p_mh,
+            let mh_heads = if mh_skipped { 0 } else { mh_heads };
+
+            // Optional DeepLC multitask fine-tune: adapt the RT model to this run's
+            // confident seed PSMs and rewrite the library's predicted_irt before RT
+            // calibration. The seed is iRT-independent, so it was computed above on the
+            // base library and is reused here. rt-im-train and extract then read the
+            // fine-tuned library.
+            let lib_p = if mh_heads > 0 {
+                // Multi-head calibration occupies the fine-tune's slot: it needs this run's
+                // confident seed PSMs, which exist only now, and it rewrites the same library the
+                // fine-tune would. Validation refuses both at once.
+                let python = cfg
+                    .predict_frag
+                    .deeplc_python
+                    .as_deref()
+                    .expect("mh_heads is 0 unless an interpreter resolved");
+                let script = crate::sidecar::resolve_script(
+                    &cfg.predict_frag.sidecar_script_dir,
+                    "deeplc_finetune.py",
+                );
+                // Under `multihead_anchors = search`, or `auto` on a seed short of anchors,
+                // this seed-anchored fit goes to `rt_bootstrap/` and the refit below takes the
+                // usual name.
+                let has_im = crate::instrument::input_has_im(p.mzml);
+                let search = rt_bootstrap::decide(cfg, mh_heads, &anchor_plan, has_im, p.out_dir);
+                let lib_p_mh = rt_bootstrap::seed_library_path(search, p.out_dir);
+                info!(stage = %"deeplc-multihead", "run: stage start");
+                crate::sidecar::run_deeplc_multihead(
+                    python,
+                    &script,
+                    &lib_p,
+                    &seed,
+                    &lib_p_mh,
                     mh_heads,
-                    threads: rayon::current_num_threads(),
-                    irt_placeholder: rt_placeholder,
-                    seed_anchors: anchor_plan.n_anchors,
-                })?;
-                if let (Some(t), Some(path)) = (o.anchors, o.anchors_path.as_deref()) {
-                    search_refit = true;
-                    man.record(record_artifact(
-                        artifact::RT_BOOTSTRAP_ANCHORS.0,
-                        artifact::RT_BOOTSTRAP_ANCHORS,
-                        path,
-                        t.rows as u64,
-                        "rt-bootstrap",
-                        &ch,
-                    )?);
+                    rt_cfg.q_train,
+                    cfg.rt_im_train.window_holdout_frac,
+                    rayon::current_num_threads(),
+                    cfg.rt_im_train.deeplc_predict_shards,
+                    crate::cache::projection_dir(cfg).as_ref(),
+                )?;
+                if rt_placeholder {
+                    crate::sidecar::require_every_row_repredicted(&lib_p_mh)?;
                 }
-                o.library
-            } else {
+                let lib_p_mh = if search {
+                    info!(stage = %"rt-bootstrap", "run: stage start");
+                    let o = rt_bootstrap::refit(&rt_bootstrap::Refit {
+                        cfg,
+                        config_hash: &ch,
+                        converted: &co,
+                        lib_p_base: &lib_p,
+                        lib_f: &lib_f,
+                        seed: &seed,
+                        out: p.out_dir,
+                        seed_library: &lib_p_mh,
+                        mh_heads,
+                        threads: rayon::current_num_threads(),
+                        irt_placeholder: rt_placeholder,
+                        seed_anchors: anchor_plan.n_anchors,
+                    })?;
+                    if let (Some(t), Some(path)) = (o.anchors, o.anchors_path.as_deref()) {
+                        search_refit = true;
+                        man.record(record_artifact(
+                            artifact::RT_BOOTSTRAP_ANCHORS.0,
+                            artifact::RT_BOOTSTRAP_ANCHORS,
+                            path,
+                            t.rows as u64,
+                            "rt-bootstrap",
+                            &ch,
+                        )?);
+                    }
+                    o.library
+                } else {
+                    lib_p_mh
+                };
+                rt_bootstrap::record_auto(cfg, &anchor_plan, has_im, search, &lib_p_mh);
+                let n_mh = mumdia_io::table::nrows(&lib_p_mh)?;
+                man.record(record_artifact(
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+                    crate::stages::predict_frag::precursors_schema(&lib_p_mh)?,
+                    &lib_p_mh,
+                    n_mh,
+                    "deeplc-multihead",
+                    &ch,
+                )?);
                 lib_p_mh
-            };
-            rt_bootstrap::record_auto(cfg, &anchor_plan, has_im, search, &lib_p_mh);
-            let n_mh = mumdia_io::table::nrows(&lib_p_mh)?;
-            man.record(record_artifact(
-                artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                crate::stages::predict_frag::precursors_schema(&lib_p_mh)?,
-                &lib_p_mh,
-                n_mh,
-                "deeplc-multihead",
-                &ch,
-            )?);
-            lib_p_mh
-        } else if cfg.rt_im_train.finetune_deeplc {
-            let python = cfg
-                .predict_frag
-                .deeplc_python
-                .as_deref()
-                .expect("preflight guarantees deeplc_python when finetune_deeplc is set");
-            let script = crate::sidecar::resolve_script(
-                &cfg.predict_frag.sidecar_script_dir,
-                "deeplc_finetune.py",
-            );
-            let lib_p_ft = d("fragment_library_precursors_ft.parquet");
-            info!(stage = %"deeplc-finetune", "run: stage start");
-            crate::sidecar::run_deeplc_finetune(
-                python,
-                &script,
-                &lib_p,
-                &seed,
-                &lib_p_ft,
-                cfg.rt_im_train.finetune_epochs,
-                cfg.rt_im_train.finetune_patience,
-                rt_cfg.q_train,
-                cfg.rt_im_train.finetune_batch,
-                // Held-out window sizing: the sidecar must exclude the same peptides
-                // from the fine-tune reference that rt-im-train later scores as
-                // held-out, else adapter memorization leaks into the "held-out"
-                // residuals and the window shrinks back toward in-sample optimism.
-                cfg.rt_im_train.window_holdout_frac,
-                cfg.rng_seed,
-                rayon::current_num_threads(),
-                cfg.rt_im_train.deeplc_predict_shards,
-            )?;
-            // The fine-tuned precursor table is the artifact actually consumed by
-            // RT calibration and extraction. Replace the base-library manifest entry
-            // so provenance points at the downstream input instead of only at the
-            // pre-fine-tune table.
-            let n_ft = mumdia_io::table::nrows(&lib_p_ft)?;
-            man.record(record_artifact(
-                artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                crate::stages::predict_frag::precursors_schema(&lib_p_ft)?,
-                &lib_p_ft,
-                n_ft,
-                "deeplc-finetune",
-                &ch,
-            )?);
-            lib_p_ft
-        } else if (mh_skipped && p.lib_precursors.is_some())
-            || cfg.rt_im_train.repredicts_library_irt(
-                p.lib_precursors.is_some(),
-                cfg.predict_frag.deeplc_python.is_some(),
-            )
-        {
-            // Library-input mode without a fine-tune: replace the imported iRT with DeepLC
-            // base-model predictions before calibration. The prediction does not depend on
-            // the run, so `run-experiment` computes it once for all runs instead.
-            let python = cfg
-                .predict_frag
-                .deeplc_python
-                .as_deref()
-                .expect("repredicts_library_irt implies deeplc_python");
-            let script = crate::sidecar::resolve_script(
-                &cfg.predict_frag.sidecar_script_dir,
-                "deeplc_finetune.py",
-            );
-            let lib_p_dl = d("fragment_library_precursors_deeplc.parquet");
-            info!(stage = %"deeplc-repredict", "run: stage start");
-            crate::sidecar::run_deeplc_repredict(
-                python,
-                &script,
-                &lib_p,
-                &lib_p_dl,
-                rayon::current_num_threads(),
-                cfg.rt_im_train.deeplc_predict_shards,
-                crate::cache::projection_dir(cfg).as_ref(),
-            )?;
-            let n_dl = mumdia_io::table::nrows(&lib_p_dl)?;
-            man.record(record_artifact(
-                artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                crate::stages::predict_frag::precursors_schema(&lib_p_dl)?,
-                &lib_p_dl,
-                n_dl,
-                "deeplc-repredict",
-                &ch,
-            )?);
-            lib_p_dl
-        } else {
-            // Two reasons land here, and the log has to name the right one: without a DeepLC
-            // interpreter the imported iRT is kept as is (worth a warning); with one, the
-            // multi-head calibration re-predicts the library itself against this run's anchors
-            // and a base-model re-prediction first would only be overwritten
-            // (`repredicts_library_irt`), which is a plan, not a shortfall.
-            if p.lib_precursors.is_some()
-                && matches!(
-                    cfg.rt_im_train.library_irt,
-                    mumdia_core::config::LibraryIrt::Auto
+            } else if cfg.rt_im_train.finetune_deeplc {
+                let python = cfg
+                    .predict_frag
+                    .deeplc_python
+                    .as_deref()
+                    .expect("preflight guarantees deeplc_python when finetune_deeplc is set");
+                let script = crate::sidecar::resolve_script(
+                    &cfg.predict_frag.sidecar_script_dir,
+                    "deeplc_finetune.py",
+                );
+                let lib_p_ft = d("fragment_library_precursors_ft.parquet");
+                info!(stage = %"deeplc-finetune", "run: stage start");
+                crate::sidecar::run_deeplc_finetune(
+                    python,
+                    &script,
+                    &lib_p,
+                    &seed,
+                    &lib_p_ft,
+                    cfg.rt_im_train.finetune_epochs,
+                    cfg.rt_im_train.finetune_patience,
+                    rt_cfg.q_train,
+                    cfg.rt_im_train.finetune_batch,
+                    // Held-out window sizing: the sidecar must exclude the same peptides
+                    // from the fine-tune reference that rt-im-train later scores as
+                    // held-out, else adapter memorization leaks into the "held-out"
+                    // residuals and the window shrinks back toward in-sample optimism.
+                    cfg.rt_im_train.window_holdout_frac,
+                    cfg.rng_seed,
+                    rayon::current_num_threads(),
+                    cfg.rt_im_train.deeplc_predict_shards,
+                )?;
+                // The fine-tuned precursor table is the artifact actually consumed by
+                // RT calibration and extraction. Replace the base-library manifest entry
+                // so provenance points at the downstream input instead of only at the
+                // pre-fine-tune table.
+                let n_ft = mumdia_io::table::nrows(&lib_p_ft)?;
+                man.record(record_artifact(
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+                    crate::stages::predict_frag::precursors_schema(&lib_p_ft)?,
+                    &lib_p_ft,
+                    n_ft,
+                    "deeplc-finetune",
+                    &ch,
+                )?);
+                lib_p_ft
+            } else if (mh_skipped && p.lib_precursors.is_some())
+                || cfg.rt_im_train.repredicts_library_irt(
+                    p.lib_precursors.is_some(),
+                    cfg.predict_frag.deeplc_python.is_some(),
                 )
             {
-                if cfg.predict_frag.deeplc_python.is_none() {
-                    tracing::warn!(
+                // Library-input mode without a fine-tune: replace the imported iRT with DeepLC
+                // base-model predictions before calibration. The prediction does not depend on
+                // the run, so `run-experiment` computes it once for all runs instead.
+                let python = cfg
+                    .predict_frag
+                    .deeplc_python
+                    .as_deref()
+                    .expect("repredicts_library_irt implies deeplc_python");
+                let script = crate::sidecar::resolve_script(
+                    &cfg.predict_frag.sidecar_script_dir,
+                    "deeplc_finetune.py",
+                );
+                let lib_p_dl = d("fragment_library_precursors_deeplc.parquet");
+                info!(stage = %"deeplc-repredict", "run: stage start");
+                crate::sidecar::run_deeplc_repredict(
+                    python,
+                    &script,
+                    &lib_p,
+                    &lib_p_dl,
+                    rayon::current_num_threads(),
+                    cfg.rt_im_train.deeplc_predict_shards,
+                    crate::cache::projection_dir(cfg).as_ref(),
+                )?;
+                let n_dl = mumdia_io::table::nrows(&lib_p_dl)?;
+                man.record(record_artifact(
+                    artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
+                    crate::stages::predict_frag::precursors_schema(&lib_p_dl)?,
+                    &lib_p_dl,
+                    n_dl,
+                    "deeplc-repredict",
+                    &ch,
+                )?);
+                lib_p_dl
+            } else {
+                // Two reasons land here, and the log has to name the right one: without a DeepLC
+                // interpreter the imported iRT is kept as is (worth a warning); with one, the
+                // multi-head calibration re-predicts the library itself against this run's anchors
+                // and a base-model re-prediction first would only be overwritten
+                // (`repredicts_library_irt`), which is a plan, not a shortfall.
+                if p.lib_precursors.is_some()
+                    && matches!(
+                        cfg.rt_im_train.library_irt,
+                        mumdia_core::config::LibraryIrt::Auto
+                    )
+                {
+                    if cfg.predict_frag.deeplc_python.is_none() {
+                        tracing::warn!(
                     "run: keeping the imported library iRT because no predict_frag.deeplc_python \
                      is configured; configure one to re-predict with DeepLC, or set \
                      rt_im_train.library_irt = library to silence this"
                 );
-                } else {
-                    tracing::info!(
+                    } else {
+                        tracing::info!(
                         "run: the multi-head calibration re-predicts the library iRT against this \
                      run's anchors; skipping the base-model re-prediction it would overwrite"
                     );
+                    }
                 }
-            }
-            lib_p
-        };
+                lib_p
+            };
 
-        let out = chain::extract_to_compete(chain::ChainParams {
-            cfg,
-            config_hash: &ch,
-            lib_p: &lib_p,
-            lib_f: &lib_f,
-            converted: &co,
-            seed: &seed,
-            out_dir: p.out_dir,
-            lent_ms2,
-            manifest: Some(&mut man),
-            retrace: true,
-            extras: Default::default(),
-        })?;
-        let chrom = vec![quant::ChromTable::whole(&out.chromatograms)];
-        (
-            seed,
-            lib_p,
-            out.psms_extracted,
-            chrom,
-            out.features,
-            vec![out.competed],
-            None,
-        )
-    };
+            let out = chain::extract_to_compete(chain::ChainParams {
+                cfg,
+                config_hash: &ch,
+                lib_p: &lib_p,
+                lib_f: &lib_f,
+                converted: &co,
+                seed: &seed,
+                out_dir: p.out_dir,
+                lent_ms2,
+                manifest: Some(&mut man),
+                retrace: true,
+                extras: Default::default(),
+            })?;
+            let chrom = vec![quant::ChromTable::whole(&out.chromatograms)];
+            (
+                seed,
+                lib_p,
+                out.psms_extracted,
+                chrom,
+                out.features,
+                vec![out.competed],
+                None,
+            )
+        };
     let _ = &feats;
     let _ = &seed;
 

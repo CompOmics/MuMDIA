@@ -655,7 +655,9 @@ fn adapt_rt_library(
         Some(a) if mh_heads > 0 && !a.sufficient => {
             if irt_placeholder {
                 anyhow::bail!(
-                    "the library carries placeholder retention times for the multi-head                      calibration to replace, but the seed search of {out} found only {} target                      anchors even at q {}; re-run without predict_frag.defer_deeplc_to_multihead",
+                    "the library carries placeholder retention times for the multi-head \
+                     calibration to replace, but the seed search of {out} found only {} target \
+                     anchors even at q {}; re-run without predict_frag.defer_deeplc_to_multihead",
                     a.n_anchors,
                     a.q_train
                 );
@@ -2055,7 +2057,8 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         info!(
             parallel_runs = par,
             n = n_runs,
-            "run-experiment: per-run chains in parallel (each run can hold tens of GB;              lower experiment.parallel_runs if memory is tight)"
+            "run-experiment: per-run chains in parallel (each run can hold tens of GB; \
+             lower experiment.parallel_runs if memory is tight)"
         );
         for chunk in rest.chunks(par) {
             let done: Vec<(Vec<String>, Vec<ChromTable>, Option<String>)> = chunk
