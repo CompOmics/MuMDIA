@@ -827,7 +827,8 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
         tracing::warn!(
             decoys = n_train_decoys,
             min_train_decoys = p.cfg.min_train_decoys,
-            "rescore: too few decoys to train a classifier; ranking by the untrained              prelim_score with plain target-decoy competition"
+            "rescore: too few decoys to train a classifier; ranking by the untrained \
+             prelim_score with plain target-decoy competition"
         );
         classifier_used = "prelim_score_few_decoys";
         model_identity = "prelim-score".to_string();

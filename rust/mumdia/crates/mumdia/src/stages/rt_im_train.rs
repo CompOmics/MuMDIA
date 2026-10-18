@@ -906,7 +906,8 @@ pub fn plan_anchors(seed_psms: &str, cfg: &RtImTrainConfig) -> Result<AnchorPlan
             last_q = plan.q_train,
             n_anchors = plan.n_anchors,
             need,
-            "rt-im-train: too few seed anchors even at the most relaxed cut; retention-time              calibration that needs anchors is skipped"
+            "rt-im-train: too few seed anchors even at the most relaxed cut; retention-time \
+             calibration that needs anchors is skipped"
         );
     }
     Ok(plan)

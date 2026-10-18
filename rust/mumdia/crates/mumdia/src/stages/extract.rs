@@ -3700,7 +3700,9 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 configured_frag_tol_ppm = p.cfg.frag_tol_ppm,
                 learned_frag_tol_ppm = frag_tol,
                 mass_cal = path,
-                "extract: extract.frag_tol_ppm is overridden by the learned tolerance                      from mass calibration. It applies only when no --mass-cal is passed;                      to widen the search tolerance, set search_seed.fragment_tol_ppm"
+                "extract: extract.frag_tol_ppm is overridden by the learned tolerance \
+                     from mass calibration. It applies only when no --mass-cal is passed; \
+                     to widen the search tolerance, set search_seed.fragment_tol_ppm"
             );
         }
     }

@@ -2335,7 +2335,8 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     if n_transferred > 0 {
         info!(
             transferred_psms = n_transferred,
-            "quant: including match-between-runs transfers, which the selected q column              does not itself reflect"
+            "quant: including match-between-runs transfers, which the selected q column \
+             does not itself reflect"
         );
     }
     // Every map in this stage is keyed on `candidate_id` alone, and `candidate_id` is a
@@ -2483,7 +2484,9 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         scored_apex = CidMarks::over(&[]);
         warn!(
             psms_scored = p.psms_scored,
-            "quant: scored table has no apex_rt column (pre-v3 artifact); every              quantity will be integrated around a RE-DETECTED apex, which reproduces              the identification apex only about half the time"
+            "quant: scored table has no apex_rt column (pre-v3 artifact); every \
+             quantity will be integrated around a RE-DETECTED apex, which reproduces \
+             the identification apex only about half the time"
         );
     }
     let candidates_with_scored_apex = scored_apex.count();

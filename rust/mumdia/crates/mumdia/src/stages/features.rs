@@ -397,7 +397,8 @@ impl FeatureSchema {
                 // no reason to decode ~390 columns of data to read their names.
                 let names = mumdia_io::table::column_names(artifact_path).with_context(|| {
                     format!(
-                        "reading {companion} failed ({e}) and the artifact itself could                          not be read to reconstruct the feature schema"
+                        "reading {companion} failed ({e}) and the artifact itself could \
+                         not be read to reconstruct the feature schema"
                     )
                 })?;
                 let feature_columns: Vec<String> = names
@@ -2676,7 +2677,8 @@ pub fn bounds_from_samples(s: &BoundSamples, cfg: &FeaturesConfig) -> Option<(f6
     } else {
         warn!(
             n_confident = s.lefts.len(),
-            "features: bound_from_confident set but < 20 confident anchors; falling back              to per-candidate boundary"
+            "features: bound_from_confident set but < 20 confident anchors; falling back \
+             to per-candidate boundary"
         );
         None
     }

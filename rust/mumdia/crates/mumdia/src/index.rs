@@ -202,7 +202,8 @@ fn read_is_decoy(pt: &TableFile, path: &str) -> Result<Vec<bool>> {
                     // neighbour's label.
                     crate::fdr::validate_labels(&[other.to_string()])?;
                     anyhow::bail!(
-                        "library precursor row {} of {path} has label '{other}', which is                          neither 'target' nor 'decoy'",
+                        "library precursor row {} of {path} has label '{other}', which is \
+                         neither 'target' nor 'decoy'",
                         out.len()
                     );
                 }
@@ -1225,7 +1226,8 @@ impl Library {
             (Some((first, n)), off) => {
                 if off.is_some_and(|o| o as usize != first) {
                     anyhow::bail!(
-                        "a row span starting at {first} was asked for with fragment offset                          {off:?}; the span's first row is the offset"
+                        "a row span starting at {first} was asked for with fragment offset \
+                         {off:?}; the span's first row is the offset"
                     );
                 }
                 if n == 0 {

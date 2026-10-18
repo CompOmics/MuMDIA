@@ -1149,7 +1149,9 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         warn!(
             nonfinite_peaks,
             mzml = p.mzml,
-            "convert: dropped peaks with a non-finite m/z or intensity. A few indicate a              damaged spectrum; a large number indicates a problem with the file or with              the converter that wrote it"
+            "convert: dropped peaks with a non-finite m/z or intensity. A few indicate a \
+             damaged spectrum; a large number indicates a problem with the file or with \
+             the converter that wrote it"
         );
     }
     if nonfinite_rt > 0 {
