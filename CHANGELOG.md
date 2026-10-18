@@ -7,6 +7,18 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.7.0` is a minor rather than a patch release: it reads a new kind of data and changes what
+a search finds. Bruker diaPASEF (`.d`) is read natively with ion mobility through the library,
+extraction, features, a raw-event retrace and cross-run quantification (`docs/35_diapasef.md`).
+`run-experiment` now matches between runs with a second pass over an empirical library of the
+pooled first pass (`mbr.strategy = "second_pass"`), the run that adapts the library refits its
+multi-head RT calibration on search anchors when its seed found few (`multihead_anchors =
+"auto"`), and the rescore sends only the PSMs an out-of-fold linear model scores above 35% of
+the decoys to the classifier (`rescore.prefilter_keep_decoys`), which leaves `nn_torch`
+identifications unchanged for about 40% of the rescore's time and half of its memory and raises
+`native_tda` identifications by 9-29% at an unchanged entrapment FDP. On diaPASEF input a second
+extraction gate, an MS1 noise filter and search anchors are on by default.
+
 `0.6.0` is a minor rather than a patch release: it changes what a search finds and how far its
 reported FDR can be trusted. The extraction gate is now the window-mean gate at 0.6
 (`extract.gate_mode = window_mean`) instead of the apex-Pearson gate at 0.2, and eight
@@ -91,18 +103,9 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
-## [Unreleased]
+## [0.7.0] - 2026-10-18
 
 ### Changed
-
-- **The diaPASEF gate is on by default on spectra that carry 1/K0**
-  (`extract.gate_support_min`, unset = 0.845 on 1/K0 spectra, off otherwise; 0 turns it off).
-  Six 60-min HYE diaPASEF runs: 96,955 instead of 98,524 peptides at 1% (-1.6%) in 26.8
-  instead of 41.6 min; six 5-min HYE runs: -1.75% peptides in 22.5-23.5 instead of 42-46 min;
-  the E. coli entrapment run: -1.6% peptides at an entrapment FDP of 0.32-0.35% against
-  0.30-0.38% (three NN seeds). Quantification accuracy is unchanged or slightly better. 0.82
-  loses 0.8% on E. coli for less of the speed. Spectra without 1/K0 are unchanged.
-  (docs/35_diapasef.md section 16.)
 
 - **diaPASEF memory and speed (docs/35_diapasef.md section 16).** `extract.windows_in_flight`
   defaults to 4 on spectra that carry 1/K0 (16 otherwise): extract held 45.1 GiB per HYE
@@ -197,19 +200,21 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
-- **A diaPASEF extraction gate** (`extract.gate_support_min`, opt-in): a second threshold on
-  the window-mean score plus apex intensity, MS1 and, on spectra that carry 1/K0, three 1/K0
-  terms, fitted on targets only. Six HYE diaPASEF runs at 0.845: 41% of the candidates of the
-  window-mean gate at 0.6, 26.8 instead of 41.6 min, 96,955 instead of 98,524 peptides and
-  86,877 instead of 89,973 ProteoBench ions; a window-mean threshold of 0.75 keeps 45% for
-  96,154 and 84,912. The gate diagnostics carry the window-mean score (`gate_window_mean`).
-  On the second diaPASEF acquisition (six 5-min HYE runs, two NN seeds) 0.845 gave 38,478
-  instead of 39,164 peptides in 22.5-23.5 instead of 42-46 min, and on the E. coli
-  entrapment run (three seeds) 13,892 instead of 14,121 peptides at an FDP of 0.32-0.35%
-  against 0.30-0.38%. (docs/35_diapasef.md section 16.)
+- **A diaPASEF extraction gate, on by default on spectra that carry 1/K0**
+  (`extract.gate_support_min`; unset is 0.845 on 1/K0 spectra and off otherwise, 0 turns it
+  off): a second threshold on the window-mean score plus apex intensity, MS1 and three 1/K0
+  terms, fitted on targets only. It is a speed default that costs identifications. Six 60-min
+  HYE diaPASEF runs: 41% of the candidates of the window-mean gate at 0.6, 26.8 instead of
+  41.6 min, 96,955 instead of 98,524 peptides at 1% (-1.6%) and 86,877 instead of 89,973
+  ProteoBench ions, at unchanged or slightly better quantification; a window-mean threshold
+  of 0.75 keeps 45% for 96,154 and 84,912. Six 5-min HYE runs (two NN seeds): 38,478 instead
+  of 39,164 peptides in 22.5-23.5 instead of 42-46 min. The E. coli entrapment run (three
+  seeds): 13,892 instead of 14,121 peptides at an entrapment FDP of 0.32-0.35% against
+  0.30-0.38%; 0.82 loses 0.8% there for less of the speed. The gate diagnostics carry the
+  window-mean score (`gate_window_mean`). (docs/35_diapasef.md section 16.)
 - **A prefilter before the classifier** (`rescore.prefilter_keep_decoys`, default 0.35; 0
-  restores the previous behaviour): a cross-validated logistic regression on 32 feature columns (`rescore.prefilter_features`)
-  scores every competed PSM out of fold, and only the PSMs above the decoy that completes the
+  restores the previous behaviour): a cross-validated logistic regression on 32 feature
+  columns (`rescore.prefilter_features`) scores every competed PSM out of fold, and only the PSMs above the decoy that completes the
   given fraction of the decoys go to the classifier. The share of rows kept follows the pool.
   At 0.35, pooled rescores of stored competed tables (NN seeds 0-2 unless stated): six HYE
   diaPASEF runs (seed 0) 98,412 against 98,524 peptides at 1% in 8:39 instead of 14:56 at
@@ -221,11 +226,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   alkylated). Under `native_tda` it also raises sensitivity: six Astral runs 96,840 -> 105,400
   peptides, and the 22 HeLa runs 197,636 -> 254,382 human precursors per run at a
   species-entrapment FDP of 2.01% against 2.08%, in 14:36 instead of 39:02. A pool with fewer
-  decoys than `rescore.min_train_decoys` (100 at least) is not cut.
+  decoys than `rescore.min_train_decoys` (100 at least) is not cut, and neither is one below
+  `rescore.prefilter_min_psms` (default 1,000,000 PSMs): on the 27,376-PSM Orbitrap AIF
+  entrapment run the cut saved 2 s of a 10 s rescore and cost 1.3% of the real precursors at an
+  unchanged FDP, so single runs of that size are scored as before.
   (docs/35_diapasef.md section 16.)
 - **Search-anchored multi-head calibration** (`rt_im_train.multihead_anchors = "search"`;
-  `"auto"`, the default since the entry above, chooses it on runs short of seed anchors). The run that adapts the library (a single `run`, the
-  first run of `run-experiment` under `rt_library_scope = first_run_only`, or every run under
+  `"auto"`, the default, chooses it on runs short of seed anchors, see Changed). The run that
+  adapts the library (a single `run`, the first run of `run-experiment` under `rt_library_scope = first_run_only`, or every run under
   `per_run`) is searched once on the seed-anchored library, in `<run>/rt_bootstrap/`
   (rt-im-train, extract, features, compete and a single-run rescore). Its targets at
   `precursor_q <= q_train`, with observed RT = `apex_rt`, are written as
@@ -247,16 +255,15 @@ than a number. Both are recorded in every run's `manifest.json`.
   +7.8% / +5.5% precursors at decoy fraction 0.0097 in both arms. It costs one extra
   extract-to-rescore pass and one extra library prediction per adapting run, once per
   experiment under `first_run_only`: +63 s on one single-cell run with the DeepLC projection
-  cache on, about 2x that run with it off (`docs/08_rt_im_train.md` section 4f). The default
-  is omitted from the canonical configuration, so existing config
-  hashes and every default output are unchanged.
+  cache on, about 2x that run with it off (`docs/08_rt_im_train.md` section 4f).
 - **diaPASEF (timsTOF) support.** Native diaPASEF input with ion mobility, ported in a
-  series of pull requests from the IM branch (PR #140, rodvrees) onto main's mechanisms; `docs/35_diapasef.md` is the guide. No
-  existing default changes and no existing key gains a new value. Every new key is off by
-  default and omitted from the canonical configuration at its default, so the config hash of
-  every existing configuration is unchanged, and a 3D (mzML) run writes the same artifacts,
-  reports and manifest entries byte for byte. Every 4D column and artifact version is written
-  only when the spectra carry 1/K0. `configs/examples/diapasef.json` turns the TIMS options on.
+  series of pull requests from the IM branch (PR #140, rodvrees) onto main's mechanisms;
+  `docs/35_diapasef.md` is the guide. A 3D (mzML) run writes the same artifacts, reports and
+  manifest entries as without it; every 4D column and artifact version is written only when
+  the spectra carry 1/K0. The TIMS options were added off by default; within this release the
+  MS1 noise filter, the diaPASEF gate, search anchors and four windows in flight became the
+  defaults on diaPASEF input (entries above). `configs/examples/diapasef.json` is the measured
+  recipe.
   Measured on one E. coli diaPASEF run (timsTOF Ultra 2, 15 min, 50 ng, FASTA library, strict
   `nn_torch`, one seed, decoy fraction 0.98% in every arm): 8,735 peptides at 1% with the
   native reader alone, 12,624 with every step below through the re-pick.
@@ -300,7 +307,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   on a two-pass cross-run step in `run-experiment` (`fragment_quant` v5 only under the export,
   `quant --export-cross-run`, `quant --cross-run-from`). Instrument-agnostic code, measured on
   HYE diaPASEF only (docs/12).
-- **Documentation, recipe and bench** (this change). `configs/examples/diapasef.json` (also
+- **Documentation, recipe and bench** (#194). `configs/examples/diapasef.json` (also
   checked by `shipped_configs_parse`, which now finds the repository's configs; it had
   resolved one directory short and checked none), `docs/35_diapasef.md` completed (data
   model, measured ladder, closed levers, loss diagnosis, open arms, limits), and

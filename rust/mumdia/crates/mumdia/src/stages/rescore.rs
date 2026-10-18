@@ -3219,6 +3219,17 @@ fn prefilter_mask(
     prelim: &[f64],
     total_rows: usize,
 ) -> Result<Option<Vec<bool>>> {
+    // A speed and memory lever for large pools: on a small one it saves seconds and can cost
+    // identifications (the 27,376-PSM AIF entrapment run lost 1.3% of its real precursors for 2 s
+    // of a 10 s rescore), so a pool below `rescore.prefilter_min_psms` goes through whole.
+    if total_rows < p.cfg.prefilter_min_psms {
+        info!(
+            psms = total_rows,
+            prefilter_min_psms = p.cfg.prefilter_min_psms,
+            "rescore: prefilter not applied to a pool below rescore.prefilter_min_psms"
+        );
+        return Ok(None);
+    }
     let wanted: Vec<String> = match &p.cfg.prefilter_features {
         Some(v) => v.clone(),
         None => DEFAULT_PREFILTER_FEATURES
