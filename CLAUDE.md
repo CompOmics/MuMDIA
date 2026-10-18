@@ -308,6 +308,15 @@ changed to 0.6 to match the default classifier. `native_tda` has since risen to
 describes this configuration and the default is back to 0.2. Re-derive the optimum
 rather than inheriting it if you change the library, the apex mode or the folds.
 
+On diaPASEF (spectra that carry 1/K0) a second gate is on by default since 2026-10-18:
+`extract.gate_support_min` unset is 0.845, the window-mean score plus intensity, MS1 and three
+1/K0 terms, fitted on targets only. The window-mean gate at 0.6 passes 33% of the library
+there (about 5% on Astral and Orbitrap), and the second gate keeps 41% of that: -1.6% peptides
+for -36% wall on six 60-min HYE runs, -1.75% for -48% on six 5-min runs, the E. coli
+entrapment FDP unchanged (0.32-0.35% against 0.30-0.38%). It is a speed default that costs
+identifications; 0 restores the previous behaviour. It stays off without 1/K0 (docs/35
+section 16).
+
 DeepLC 4.5.0 or newer is required wherever DeepLC runs (`predict-frag` in FASTA mode, the
 optional fine-tune, the multi-head calibration; 4.5.0 since 2026-09-28, for the default
 projection cache): `mumdia doctor` fails on an older one, `sidecar::require_deeplc_version`

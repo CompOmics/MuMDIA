@@ -1559,6 +1559,9 @@ fn extract_writes_the_1k0_evidence_only_for_spectra_with_ion_mobility() {
     cfg.presence_min_fragments = 2;
     cfg.presence_min_matched = 2;
     cfg.gate_min_score = 0.0;
+    // The diaPASEF gate is on by default on 1/K0 spectra; this test is about the 1/K0
+    // evidence, not the gate, so the synthetic target must pass whatever its support.
+    cfg.gate_support_min = Some(0.0);
     let h = |p: &str| mumdia_io::hash::blake3_file(p).unwrap();
 
     // 3D: main's tables, whatever the 1/K0 settings and windows say.

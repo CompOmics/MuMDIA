@@ -95,6 +95,15 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **The diaPASEF gate is on by default on spectra that carry 1/K0**
+  (`extract.gate_support_min`, unset = 0.845 on 1/K0 spectra, off otherwise; 0 turns it off).
+  Six 60-min HYE diaPASEF runs: 96,955 instead of 98,524 peptides at 1% (-1.6%) in 26.8
+  instead of 41.6 min; six 5-min HYE runs: -1.75% peptides in 22.5-23.5 instead of 42-46 min;
+  the E. coli entrapment run: -1.6% peptides at an entrapment FDP of 0.32-0.35% against
+  0.30-0.38% (three NN seeds). Quantification accuracy is unchanged or slightly better. 0.82
+  loses 0.8% on E. coli for less of the speed. Spectra without 1/K0 are unchanged.
+  (docs/35_diapasef.md section 16.)
+
 - **diaPASEF memory and speed (docs/35_diapasef.md section 16).** `extract.windows_in_flight`
   defaults to 4 on spectra that carry 1/K0 (16 otherwise): extract held 45.1 GiB per HYE
   diaPASEF run at 16 in flight and 21.4 at 4, with identical output, and the six-run
