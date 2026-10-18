@@ -2174,6 +2174,24 @@ const DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM: usize = 4;
 /// entry per fragment bin) costs more than the posting-list work it divides.
 const MIN_CANDIDATES_PER_TASK: usize = 4096;
 
+/// The diaPASEF gate's default threshold on spectra that carry 1/K0
+/// (`extract.gate_support_min` unset; docs/35_diapasef.md section 16).
+const DEFAULT_GATE_SUPPORT_MIN_IM: f64 = 0.845;
+
+/// `extract.gate_support_min`, or its default: [`DEFAULT_GATE_SUPPORT_MIN_IM`] on spectra that
+/// carry 1/K0, off (0) otherwise. The gate is defined on the window-mean score, so under any
+/// other `gate_mode` it is off whatever the setting, and the report does not name it.
+fn support_gate_min(cfg: &ExtractConfig, has_im: bool) -> f64 {
+    if !matches!(cfg.gate_mode, GateMode::WindowMean) {
+        return 0.0;
+    }
+    cfg.gate_support_min.unwrap_or(if has_im {
+        DEFAULT_GATE_SUPPORT_MIN_IM
+    } else {
+        0.0
+    })
+}
+
 /// `extract.windows_in_flight`, or its default: the rayon thread count capped at 16, and
 /// at [`DEFAULT_MAX_WINDOWS_IN_FLIGHT_IM`] on spectra that carry 1/K0.
 fn groups_in_flight(cfg: &ExtractConfig, has_im: bool) -> usize {
@@ -3583,6 +3601,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // for themselves. Every 1/K0 path below is keyed on it or on the resolved gate, so a 3D
     // run takes main's path unchanged.
     let has_im = scans.iter().any(|s| s.im.is_some());
+    let support_min = support_gate_min(p.cfg, has_im);
     // `extract.im_gate`: `auto` takes the gate when both the spectra and the windows carry
     // 1/K0. An explicit `fragments` without either runs ungated and says so.
     let mut im_gate = p.cfg.im_gate.resolve(has_im, win.has_im());
@@ -4558,7 +4577,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         // The support gate (`extract.gate_support_min`): the window-mean score plus the
         // apex intensity and MS1 terms the `log_apex_intensity` and `log_mono_ms1` features
         // carry and, on spectra that carry 1/K0, three 1/K0 terms, without the MS1 rescue.
-        if p.cfg.gate_support_min > 0.0 && matches!(p.cfg.gate_mode, GateMode::WindowMean) {
+        if support_min > 0.0 {
             let ms1 = match (o_ms1_mono, o_ms1_i1, o_ms1_i2) {
                 (Some(mono), Some(_), Some(_)) => (1.0 + mono).ln(),
                 _ => 0.0,
@@ -4583,7 +4602,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     + GATE_SUPPORT_INTENSITY_WEIGHT * ln_apex
                     + GATE_SUPPORT_MS1_WEIGHT * ms1
             };
-            if support < p.cfg.gate_support_min {
+            if support < support_min {
                 return Vec::new();
             }
         }
@@ -5433,9 +5452,9 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             }
         }
         // The support gate, only when it is on, so a report without it is unchanged.
-        if p.cfg.gate_support_min > 0.0 {
+        if support_min > 0.0 {
             if let Some(obj) = params.as_object_mut() {
-                obj.insert("gate_support_min".into(), json!(p.cfg.gate_support_min));
+                obj.insert("gate_support_min".into(), json!(support_min));
             }
         }
         // A skeleton table says so in its own report, with the rows it left for retrace;
@@ -6825,5 +6844,20 @@ mod ms1_near_tests {
         // the window is clipped at both ends
         assert_eq!(ms1_near(&scans, 0, 1, 600.0, 5.0), 300.0);
         assert_eq!(ms1_near(&scans, 2, 5, 600.0, 5.0), 700.0);
+    }
+    /// The diaPASEF gate is on by default on 1/K0 spectra only, an explicit setting wins
+    /// (0 turns it off), and it never applies outside the window-mean gate.
+    #[test]
+    fn the_support_gate_defaults_on_for_ion_mobility_spectra_only() {
+        use super::{support_gate_min, ExtractConfig, GateMode, DEFAULT_GATE_SUPPORT_MIN_IM};
+        let mut cfg = ExtractConfig::default();
+        assert_eq!(support_gate_min(&cfg, true), DEFAULT_GATE_SUPPORT_MIN_IM);
+        assert_eq!(support_gate_min(&cfg, false), 0.0);
+        cfg.gate_support_min = Some(0.0);
+        assert_eq!(support_gate_min(&cfg, true), 0.0);
+        cfg.gate_support_min = Some(1.215);
+        assert_eq!(support_gate_min(&cfg, false), 1.215);
+        cfg.gate_mode = GateMode::ApexPearson;
+        assert_eq!(support_gate_min(&cfg, true), 0.0);
     }
 }

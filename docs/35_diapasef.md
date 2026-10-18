@@ -1155,7 +1155,8 @@ spectra of a diaPASEF frame are summed over the candidate's 1/K0 band, so nearly
 candidate matches its fragments and the agreement scores sit high for most. A higher
 threshold buys time with identifications.
 
-`extract.gate_support_min` (opt-in) is a second threshold on the window-mean score plus the
+`extract.gate_support_min` (default 0.845 on spectra that carry 1/K0 since 2026-10-18, off
+otherwise; 0 turns it off) is a second threshold on the window-mean score plus the
 apex intensity and the MS1 monoisotopic intensity and, on spectra that carry 1/K0, three 1/K0
 terms: the apex 1/K0 error against the calibrated prediction, the 1/K0 spread of the matched
 fragments at the apex and the MS1-to-fragment 1/K0 difference. The weights come from a
@@ -1189,8 +1190,18 @@ The second diaPASEF acquisition (six 5-min HYE runs, two NN seeds) agrees: at 0.
 38,747 against 39,297 and 39,030 peptides at 1% (-1.75%), in 22.5-23.5 against 42-46 min. On
 the E. coli entrapment run (three NN seeds) the gate gave 13,908, 13,879 and 13,889 against
 14,251, 13,980 and 14,133 peptides, at an entrapment FDP of 0.35, 0.33 and 0.32% against 0.30,
-0.38 and 0.33%. A threshold of 0.82 (5-min HYE, seed 0) kept more candidates and took 29 min
-for 38,406 peptides, no better than 0.845.
+0.38 and 0.33%. A threshold of 0.82 kept more candidates: on the 5-min HYE runs (seed 0) it
+took 29 min for 38,406 peptides, and on the E. coli run (three seeds) it gave 14,007, 14,001 and
+14,008 peptides at an entrapment FDP of 0.37, 0.37 and 0.32%, a smaller loss (-0.8%) for less
+of the speed.
+
+The gate is the default on spectra that carry 1/K0 since 2026-10-18, at 0.845: it trades about
+1.6% of the peptides for a third to a half of the wall time, at an unchanged entrapment FDP and
+an unchanged or slightly better quantification. Set `extract.gate_support_min` to 0 for the
+previous behaviour, or to 0.82 for a smaller loss at less of the speed. It applies only under
+`extract.gate_mode = window_mean` (the default), and on spectra without 1/K0 it stays off: the
+weights without the 1/K0 terms were fitted on the same diaPASEF runs and were not validated on
+an Orbitrap or Astral acquisition.
 
 ### A prefilter before the classifier
 
@@ -1246,6 +1257,15 @@ deterministic.
 A pool with fewer decoys than `rescore.min_train_decoys` (100 at least) is not cut: on the
 smoke fixture, one decoy in 316 PSMs put the cut at that decoy, kept 96 targets and raised the
 q floor (decoys + 1) / targets to 1.04%, so nothing passed 1%.
+
+End to end, the prefilter at 0.35 against none (hippogriff, one NN seed per arm unless
+stated): six 5-min HYE diaPASEF runs 39,214 and 38,965 against 39,297 and 39,030 peptides at 1%
+(two seeds) in 40:02 and 39:15 against 42:08 and 46:08; 22 HeLa runs (`run`, second-pass MBR,
+64 threads) 24,588 against 24,673 peptides in 15:36 against 21:04 at a peak of 18.6 against
+31.5 GB; one single cell (32 threads) 6,924 against 6,852 peptides in 4:31 against 4:34 from a
+cold DeepLC projection cache and 1:37 against 1:40 from a warm one. The same HeLa experiment
+before the diaPASEF speed changes and the prefilter took 22:02 at 59.4 GB (24,309 peptides),
+and the single cell 5:21 cold and 1:41 warm.
 
 ### MS1 noise
 

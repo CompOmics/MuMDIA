@@ -1976,13 +1976,18 @@ pub struct ExtractConfig {
     /// difference: weights fitted on the gate-time quantities of two HYE diaPASEF runs, on
     /// targets only. Without 1/K0 it is the window-mean score plus `0.05 ln(1 + apex
     /// intensity)` and `0.02 ln(1 + MS1 mono)`. The MS1 term counts only where the apex reads
-    /// the mono, +1 and +2 isotopes, as the `log_mono_ms1` feature does. 0 (default) is off.
-    /// On the six ProteoBench HYE diaPASEF runs, 0.845 (with 1/K0) and 1.215 (without) keep
-    /// about 42% of the candidates the window-mean gate at 0.6 passes; a window-mean threshold
-    /// of 0.75 keeps 45% and loses more identifications (docs/35_diapasef.md section 16).
-    /// Benchmark-gated.
-    #[serde(skip_serializing_if = "is_zero_f64")]
-    pub gate_support_min: f64,
+    /// the mono, +1 and +2 isotopes, as the `log_mono_ms1` feature does. 0 is off.
+    ///
+    /// Unset (the default) is 0.845 on spectra that carry 1/K0 and off otherwise. On the six
+    /// ProteoBench HYE diaPASEF runs, 0.845 keeps 41% of the candidates the window-mean gate
+    /// at 0.6 passes, for -1.6% peptides at 1% and -36% wall time (26.8 against 41.6 min);
+    /// on six 5-min HYE diaPASEF runs -1.75% peptides at -48% wall time; on the E. coli
+    /// diaPASEF entrapment run -1.6% peptides at an entrapment FDP of 0.32-0.35% against
+    /// 0.30-0.38% (three NN seeds). A window-mean threshold of 0.75 keeps 45% and loses more
+    /// identifications. Without 1/K0 the gate is not fitted for a default; 1.215 kept 42% on
+    /// the same runs (docs/35_diapasef.md section 16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_support_min: Option<f64>,
     /// The 1/K0 gate of a run whose spectra carry ion mobility (a diaPASEF `.d` read by the
     /// native reader): a fragment peak whose 1/K0 lies outside the candidate's calibrated
     /// 1/K0 window (`run_windows.im_lo`/`im_hi`, from `rt-im-train`) is not matched to that
@@ -2143,7 +2148,7 @@ impl Default for ExtractConfig {
             gate_mode: GateMode::WindowMean, // window-summed agreement minus RT term (since 2026-10-08)
             gate_coelution_min: 0.5,         // used only by GateMode::Combined
             gate_rt_weight: 0.2,             // used only by GateMode::WindowMean
-            gate_support_min: 0.0,           // off; benchmark-gated
+            gate_support_min: None,          // 0.845 on 1/K0 spectra, off otherwise
             im_gate: ImGate::Off,
         }
     }
@@ -3750,7 +3755,11 @@ impl Config {
                 self.extract.chromatogram_schema
             )));
         }
-        if !self.extract.gate_support_min.is_finite() || self.extract.gate_support_min < 0.0 {
+        if self
+            .extract
+            .gate_support_min
+            .is_some_and(|v| !v.is_finite() || v < 0.0)
+        {
             return Err(Invalid(
                 "extract.gate_support_min must be finite and >= 0 (0 disables the support \
                  gate)."
