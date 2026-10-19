@@ -67,8 +67,9 @@ impl FragIndex {
     /// - the fragments are cut into chunks at candidate boundaries (the library is CSR in
     ///   candidate order, so a chunk is a contiguous run of candidates), and pass 1 counts
     ///   one bin histogram per chunk, concurrently;
-    /// - chunk `j`'s cursor in bin `b` starts at `bin_start[b]` plus the counts of chunks
-    ///   `0..j` in that bin. Every chunk therefore owns disjoint slots, and within a bin
+    /// - chunk `j`'s slots in bin `b` start at `bin_start[b]` plus the counts of chunks
+    ///   `0..j` in that bin (the cursor holds the second term, so it stays `u32` when
+    ///   `bin_start` is `u64`). Every chunk therefore owns disjoint slots, and within a bin
     ///   the chunks follow each other in candidate order, so `post_cand` is ascending
     ///   within every bin exactly as the serial candidate-order scatter leaves it;
     /// - pass 2 scatters every chunk concurrently. Safe Rust: the posting arrays are
@@ -571,22 +572,66 @@ impl FragIndex {
         let b = (bin as usize).min(self.bins.n_bins - 1);
         let lo_bin = b.saturating_sub(1);
         let hi_bin = (b + 1).min(self.bins.n_bins - 1);
+        // A cached range is a u32 pair relative to a base: 0 on a narrow index, the bin's
+        // start on a wide one (no bin holds 2^32 postings), so it fits whatever the size of
+        // the index. The width is matched once per peak and the bin loop is monomorphised
+        // for each, so a narrow index's cached hit reads nothing but the cache. Measured on
+        // `bench_probe` (one pinned core, 12 alternating rounds, against 32-bit offsets):
+        // narrow-window arms +0.2% / +3.7%, where matching per bin was +1.3% / +5.4% and an
+        // absolute u64 cache +4.5% / +8.4%.
+        match &self.bin_start {
+            crate::offsets::Offsets::Narrow(_) => {
+                self.probe_win_bins(nw, peak_mz, lo_bin, hi_bin, &mut f, |_| 0)
+            }
+            crate::offsets::Offsets::Wide(v) => {
+                self.probe_win_bins(nw, peak_mz, lo_bin, hi_bin, &mut f, |nb| v[nb] as usize)
+            }
+        }
+    }
+
+    /// The bin loop of [`FragIndex::probe_peak_win_binned`] for one offset width, `base(nb)`
+    /// being what bin `nb`'s cached range is relative to.
+    #[inline(always)]
+    fn probe_win_bins<F: FnMut(u32, f64, f32, u16)>(
+        &self,
+        nw: &mut WindowNarrow,
+        peak_mz: f64,
+        lo_bin: usize,
+        hi_bin: usize,
+        f: &mut F,
+        base: impl Fn(usize) -> usize,
+    ) {
         for nb in lo_bin..=hi_bin {
-            // Cached relative to the bin's start, so the pair stays u32 whatever the size
-            // of the index (no bin holds 2^32 postings).
             let (a, z) = match nw.range[nb] {
-                (u32::MAX, _) => {
-                    let r = self.narrow_bin(nb, nw.cand_lo, nw.cand_hi);
-                    let s = self.bin_start.get(nb);
-                    nw.range[nb] = ((r.0 - s) as u32, (r.1 - s) as u32);
-                    r
-                }
+                (u32::MAX, _) => self.fill_window_range(nw, nb),
                 (a, z) => {
-                    let s = self.bin_start.get(nb);
+                    let s = base(nb);
                     (s + a as usize, s + z as usize)
                 }
             };
-            self.emit_range(a, z, peak_mz, &mut f);
+            self.emit_range(a, z, peak_mz, f);
+        }
+    }
+
+    /// First probe of bin `nb` in a window: narrow it and cache the range. Out of line, so
+    /// the cached-hit loop stays small.
+    #[cold]
+    #[inline(never)]
+    fn fill_window_range(&self, nw: &mut WindowNarrow, nb: usize) -> (usize, usize) {
+        let r = self.narrow_bin(nb, nw.cand_lo, nw.cand_hi);
+        let s = self.cache_base(nb);
+        nw.range[nb] = ((r.0 - s) as u32, (r.1 - s) as u32);
+        r
+    }
+
+    /// What a [`WindowNarrow`] range of bin `nb` is stored relative to: nothing (0) while
+    /// the posting indices fit `u32`, the bin's start once they do not (no single bin holds
+    /// 2^32 postings, so the relative pair always fits).
+    #[inline]
+    fn cache_base(&self, nb: usize) -> usize {
+        match &self.bin_start {
+            crate::offsets::Offsets::Narrow(_) => 0,
+            crate::offsets::Offsets::Wide(v) => v[nb] as usize,
         }
     }
 
@@ -680,9 +725,10 @@ impl FragIndex {
 /// `(window, bin)` instead of once per peak.
 ///
 /// Entries are filled lazily, so a window only pays for the bins its peaks actually
-/// reach. Each range is stored relative to its bin's start, so it fits `u32` however large
-/// the index (no bin holds 2^32 postings), and `u32::MAX` marks "not yet computed": a
-/// relative offset that large cannot occur.
+/// reach. Each range is a `u32` pair: absolute posting indices on an index whose postings
+/// fit `u32`, relative to the bin's start on a larger one (no bin holds 2^32 postings), so it
+/// fits however large the index. `u32::MAX` marks "not yet computed": on a narrow index no
+/// posting index reaches it, and on a wide one no relative offset does.
 ///
 /// Cost is 8 bytes per bin (order of 1 MB for a 20 ppm index over the usual
 /// fragment m/z range), held by one worker for the duration of one window.

@@ -2406,13 +2406,9 @@ mod tests {
         w.close().unwrap();
     }
 
-    /// The parallel fragment passes (row-group and page-range parts, atomic counts, the
-    /// identity placement of an ascending table, per-part name dictionaries merged in part
-    /// order) must produce the arrays of the serial pass bit for bit, on every layout and
-    /// every kind of load: whole, a range of the table, and a band against the shared
-    /// table.
-    /// Above 2^32 - 1 fragment rows the offsets are `u64` (`crate::offsets`): forced wide,
-    /// every load layout must place the same fragments at the same offsets.
+    /// Above 2^32 - 1 fragment rows the offsets are `u64` (`crate::offsets`): forced wide, a
+    /// whole load and a range load, serial and parted, must place the same fragments at the
+    /// same offsets as the narrow load.
     #[test]
     fn a_wide_fragment_load_places_what_a_narrow_one_places() {
         let dir = unique_dir("wide_frag");
@@ -2450,6 +2446,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The parallel fragment passes (row-group and page-range parts, atomic counts, the
+    /// identity placement of an ascending table, per-part name dictionaries merged in part
+    /// order) must produce the arrays of the serial pass bit for bit, on every layout and
+    /// every kind of load: whole, a range of the table, and a band against the shared
+    /// table.
     #[test]
     fn parallel_fragment_passes_reproduce_the_serial_arrays() {
         let dir = unique_dir("par_frag");

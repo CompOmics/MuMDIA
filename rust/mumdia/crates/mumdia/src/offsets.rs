@@ -5,8 +5,11 @@
 //! 2^32 - 1 fragment rows. An imported library for an unspecific (HLA class I) digest of
 //! the human proteome passes that: 4.7 billion rows on one immunopeptidomics library. A
 //! library that fits keeps the 4-byte layout, and so its memory; only a larger one is held
-//! as `u64`. The variant is fixed when the offsets are built, so the branch in [`get`] is
-//! the same on every access and costs nothing measurable in a hot loop.
+//! as `u64`. The variant is fixed when the offsets are built, so the branch in [`get`] goes
+//! the same way on every access. It is not free in the tightest loop, the windowed fragment
+//! probe, which therefore matches the width once per peak instead
+//! (`FragIndex::probe_peak_win_binned`). End to end on a library that fits, every stage
+//! output was byte-identical to 32-bit offsets at an unchanged wall time and peak memory.
 //!
 //! [`get`]: Offsets::get
 
