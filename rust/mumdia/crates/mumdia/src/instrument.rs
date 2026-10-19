@@ -37,6 +37,9 @@ pub const ASTRAL_ANALYZER: &str = "MS:1003379";
 /// PSI-MS accession of "instrument serial number", which shares the parameter group with
 /// the model and is never the model.
 const SERIAL_NUMBER: &str = "MS:1000529";
+/// PSI-MS accession of "customization": free text, under which mzdata stores a Thermo
+/// instrument method.
+const CUSTOMIZATION: &str = "MS:1000032";
 
 /// How much of the file the header is looked for in. The instrument description precedes
 /// `<run>`; 1 MiB is what `convert` already reads for the spectrum count.
@@ -98,6 +101,49 @@ pub fn from_tdf(dir: &str) -> Option<Instrument> {
         name,
         astral_analyzer: false,
     })
+}
+
+/// `params.reader` of spectra read directly from a Thermo `.raw` (`convert.thermo_native`).
+pub const READER_THERMO: &str = "thermorawfilereader";
+
+/// The instrument a reader's metadata describes (a Thermo `.raw` read through mzdata): the
+/// model is the first controlled parameter of an instrument configuration other than the
+/// serial number, and the Astral analyzer is looked for among the components, as
+/// [`parse_header`] does for an mzML. `None` when no configuration names a model.
+pub fn from_configurations<'a>(
+    configs: impl IntoIterator<Item = &'a mzdata::meta::InstrumentConfiguration>,
+) -> Option<Instrument> {
+    let mut configs: Vec<&mzdata::meta::InstrumentConfiguration> = configs.into_iter().collect();
+    // A HashMap's order is not stable; the lowest configuration id decides.
+    configs.sort_by_key(|c| c.id);
+    let mut inst = Instrument::default();
+    for c in &configs {
+        for comp in &c.components {
+            if comp
+                .params
+                .iter()
+                .any(|p| p.curie_str().as_deref() == Some(ASTRAL_ANALYZER))
+            {
+                inst.astral_analyzer = true;
+            }
+        }
+    }
+    for c in &configs {
+        for p in &c.params {
+            let Some(accession) = p.curie_str() else {
+                continue;
+            };
+            // The serial number, and the instrument method text mzdata stores as
+            // `customization`, precede the model.
+            if accession == SERIAL_NUMBER || accession == CUSTOMIZATION {
+                continue;
+            }
+            inst.accession = accession;
+            inst.name = p.name.clone();
+            return Some(inst);
+        }
+    }
+    inst.astral_analyzer.then_some(inst)
 }
 
 /// The instrument the mzML at `path` declares, or `None` when the header cannot be read or

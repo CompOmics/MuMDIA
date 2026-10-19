@@ -44,6 +44,11 @@ dhat = { version = "0.3", optional = true }
 
 [features]
 dhat-heap = ["dep:dhat"]
+# Read Thermo .raw files directly (`convert.thermo_native`), through mzdata and Thermo's
+# RawFileReader hosted on a .NET 8 runtime. Off by default: it needs that runtime on the
+# machine, downloads the .NET host library at build time, and its use is subject to the
+# RawFileReader licence (docs/04_convert.md, "Native Thermo reading").
+thermo = ["mzdata/thermo"]
 
 [lints]
 workspace = true

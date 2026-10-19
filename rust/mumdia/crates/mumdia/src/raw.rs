@@ -893,6 +893,22 @@ pub fn ensure_mzml(
     if !src.exists() {
         bail!("{input} does not exist");
     }
+    // `convert.thermo_native`: the `.raw` goes to `convert` as it is, which reads it through
+    // mzdata (`stages::convert`, `Source::Thermo`).
+    if vendor == Vendor::Thermo && cfg.thermo_native {
+        if !cfg!(feature = "thermo") {
+            bail!(
+                "convert.thermo_native is set, but this MuMDIA was built without the `thermo` \
+                 feature, so it cannot read {input} directly. Use a build with that feature, \
+                 or unset convert.thermo_native to convert it with ThermoRawFileParser"
+            );
+        }
+        info!(
+            raw = input,
+            "convert: reading the Thermo .raw directly (convert.thermo_native)"
+        );
+        return Ok(input.to_string());
+    }
     let stem = src
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())

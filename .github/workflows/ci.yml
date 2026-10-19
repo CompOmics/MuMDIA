@@ -55,6 +55,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The opt-in native Thermo reader (`--features thermo`, docs/04_convert.md) is not in
+      # any release build, so lint it here or it can rot unnoticed. Downloads the .NET host
+      # library at build time; needs no .NET runtime.
+      - name: Clippy (thermo feature)
+        run: cargo clippy -p mumdia --all-targets --locked --features thermo -- -D warnings
+
       # Rustdoc, warnings as errors. Not previously run anywhere, and it was failing:
       # four bracketed prose expressions (`[i0,i1,i2]`, `[0,1]`) were parsed as
       # intra-doc links to items that do not exist, and three public doc comments
