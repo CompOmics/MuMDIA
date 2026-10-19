@@ -14,6 +14,7 @@ pub mod library_cache;
 pub mod masscal;
 pub mod matchers;
 pub mod memlog;
+pub mod offsets;
 pub mod peaks;
 pub mod predict;
 pub mod prestage;
