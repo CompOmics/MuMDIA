@@ -470,8 +470,9 @@ fn load_fragments(
     };
     if ft.nrows > u32::MAX as usize {
         anyhow::bail!(
-            "fragment library has {} rows; per-candidate fragment offsets are u32",
-            ft.nrows
+            "fragment library has {} rows, more than the {} the engine can index              (per-candidate fragment offsets are 32-bit). Keep fewer fragments per              precursor, for example the 12 most intense:              `python scripts/cap_library_fragments.py <lib_fragments.parquet>              <capped.parquet> --top 12` (the precursor table stays as it is), or search              a smaller library",
+            ft.nrows,
+            u32::MAX
         );
     }
     let range = FragRange {

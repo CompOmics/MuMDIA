@@ -103,6 +103,16 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Added
+
+- **`scripts/cap_library_fragments.py`**: keeps the N most intense fragments of every
+  precursor of a spectral library (`--top`, default 12), streaming, into a new fragment
+  table. The engine indexes at most 2^32 - 1 fragment rows, and an imported library for an
+  unspecific (HLA) digest of a large proteome can exceed that (4.7 billion rows on one
+  immunopeptidomics library); the load error now names this helper.
+
 ## [0.7.0] - 2026-10-18
 
 ### Changed
