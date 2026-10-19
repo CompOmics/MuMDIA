@@ -86,6 +86,15 @@ fn peaks_of<S: SpectrumLike>(spec: &S, top_n: usize) -> (Vec<f32>, Vec<f32>, usi
         }
         None => (Vec::new(), Vec::new()),
     };
+    // A reader that centroids on read (a Thermo `.raw` under `convert.thermo_native`) hands
+    // over a centroid list and no signal arrays. An mzML spectrum always carries its arrays,
+    // so this changes nothing there.
+    if mz.is_empty() {
+        if let mzdata::spectrum::RefPeakDataLevel::Centroid(peaks) = spec.peaks() {
+            mz = peaks.iter().map(|p| p.mz()).collect();
+            inten = peaks.iter().map(|p| p.intensity()).collect();
+        }
+    }
     if spec.signal_continuity() == SignalContinuity::Profile {
         let (cm, ci) = centroid(&mz, &inten);
         mz = cm;
@@ -943,6 +952,60 @@ pub fn run(p: ConvertParams) -> Result<ConvertOutputs> {
     run_inner(p, None)
 }
 
+/// Where `convert` reads its spectra from.
+enum Source {
+    Mzml(Box<mzdata::MZReader<std::fs::File>>),
+    /// A Thermo `.raw` read directly (`convert.thermo_native`).
+    #[cfg(feature = "thermo")]
+    Thermo(Box<mzdata::io::thermo::ThermoRawReader>),
+    /// A timsTOF diaPASEF `.d`, read by [`tdf::drive`].
+    Tdf,
+}
+
+/// Open a Thermo `.raw` directly: vendor-centroided spectra, as ThermoRawFileParser writes
+/// them by default, the spectrum count from the file's own index for the truncation check,
+/// and the instrument from its metadata.
+#[cfg(feature = "thermo")]
+fn open_thermo(path: &str) -> Result<(Source, usize, Option<crate::instrument::Instrument>)> {
+    info!(
+        raw = path,
+        "convert: opening the Thermo .raw (vendor centroids)"
+    );
+    let reader = mzdata::io::thermo::ThermoRawReader::new_with_detail_level_and_centroiding(
+        path,
+        DetailLevel::Full,
+        true,
+    )
+    .with_context(|| {
+        format!(
+            "open {path} with Thermo's RawFileReader. This needs a .NET 8 runtime \
+             (https://dotnet.microsoft.com/download/dotnet/8.0); without one, unset \
+             convert.thermo_native to convert the file with ThermoRawFileParser"
+        )
+    })?;
+    let declared = reader.len();
+    let instrument =
+        crate::instrument::from_configurations(reader.instrument_configurations().values());
+    match &instrument {
+        Some(i) => info!(
+            instrument = %i.describe(),
+            astral = i.is_astral(),
+            "convert: instrument from the .raw metadata"
+        ),
+        None => info!("convert: the .raw metadata names no instrument model"),
+    }
+    Ok((Source::Thermo(Box::new(reader)), declared, instrument))
+}
+
+#[cfg(not(feature = "thermo"))]
+fn open_thermo(path: &str) -> Result<(Source, usize, Option<crate::instrument::Instrument>)> {
+    anyhow::bail!(
+        "{path} is a Thermo .raw, which this MuMDIA (built without the `thermo` feature) \
+         cannot read directly; convert it to mzML first, or let `run` do so with \
+         ThermoRawFileParser"
+    )
+}
+
 /// The mzML decode: parallel from the file's offset index when that is safe, sequential
 /// otherwise. `declared` is the header's spectrum count. Returns the spectra read.
 fn drive_mzml(
@@ -1013,9 +1076,14 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     // A diaPASEF `.d` is read natively and keeps its ion mobility; the routing decision is
     // the one `raw::ensure_mzml` made when it passed the path through unconverted.
     let native_tdf = crate::instrument::input_has_im(p.mzml);
+    // A Thermo `.raw` reaches this stage only under `convert.thermo_native`: otherwise
+    // `raw::ensure_mzml` converted it to mzML first.
+    let native_thermo = !native_tdf && crate::raw::detect(p.mzml) == crate::raw::Vendor::Thermo;
     // `declared` is the spectrum count the source promises, for the truncation check; 0
     // skips it (the native reader reads the frame table whole, not as a stream).
-    let (mzml_reader, declared, instrument) = if native_tdf {
+    let (source, declared, instrument) = if native_thermo {
+        open_thermo(p.mzml)?
+    } else if native_tdf {
         info!(
             path = p.mzml,
             "convert: reading the timsTOF diaPASEF .d natively"
@@ -1028,7 +1096,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
             ),
             None => info!("convert: the .d metadata names no instrument model"),
         }
-        (None, 0, instrument)
+        (Source::Tdf, 0, instrument)
     } else {
         info!(mzml = p.mzml, "convert: opening mzML");
         let reader =
@@ -1060,7 +1128,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
             ),
             None => info!("convert: the mzML header names no instrument model"),
         }
-        (Some(reader), declared, instrument)
+        (Source::Mzml(Box::new(reader)), declared, instrument)
     };
 
     let ms1_path = format!("{}/spectra_ms1.parquet", p.out_dir);
@@ -1091,9 +1159,11 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     // retention times are ALL unusable.
     let mut fold = Fold::new(&ms1_path, &ms2_path, native_tdf);
 
-    let read = match mzml_reader {
-        Some(reader) => drive_mzml(reader, declared, &p, force_threads, &mut fold)?,
-        None => tdf::drive(
+    let read = match source {
+        Source::Mzml(reader) => drive_mzml(*reader, declared, &p, force_threads, &mut fold)?,
+        #[cfg(feature = "thermo")]
+        Source::Thermo(reader) => drive_sequential(*reader, &mut fold, &p)?,
+        Source::Tdf => tdf::drive(
             p.mzml,
             p.max_spectra,
             &p.tdf,
@@ -1226,6 +1296,11 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     // The reader and its centroiding settings, for a native diaPASEF run only: an mzML
     // report keeps exactly the fields it always had, and an absent `reader` reads as mzML
     // (`instrument::provenance`).
+    if native_thermo {
+        let obj = params.as_object_mut().expect("params is an object");
+        obj.insert("reader".into(), json!(crate::instrument::READER_THERMO));
+        obj.insert("centroiding".into(), json!("vendor"));
+    }
     if native_tdf {
         let obj = params.as_object_mut().expect("params is an object");
         obj.insert("reader".into(), json!(crate::instrument::READER_TIMSRUST));

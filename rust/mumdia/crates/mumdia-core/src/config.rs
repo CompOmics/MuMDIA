@@ -328,6 +328,13 @@ pub struct ConvertConfig {
     /// a fallback would convert with a different program than the one asked for and
     /// vendor conversion is not reproducible across converters.
     pub thermo_raw_parser: String,
+    /// Read a Thermo `.raw` directly instead of converting it to mzML first: through mzdata
+    /// and Thermo's RawFileReader, with the vendor centroiding ThermoRawFileParser also
+    /// uses. No mzML is written. Needs an engine built with the `thermo` feature and a
+    /// .NET 8 runtime on the machine, and is subject to Thermo's RawFileReader licence.
+    /// Off by default (benchmark-gated, docs/04_convert.md, "Native Thermo reading").
+    #[serde(skip_serializing_if = "is_false")]
+    pub thermo_native: bool,
     /// Path to ProteoWizard `msconvert`, or `"auto"` to search.
     ///
     /// Used for every vendor format except Thermo, which prefers
@@ -431,6 +438,7 @@ impl Default for ConvertConfig {
     fn default() -> Self {
         Self {
             thermo_raw_parser: "auto".to_string(),
+            thermo_native: false,
             msconvert: "auto".to_string(),
             msconvert_args: Vec::new(),
             reuse_converted: true,
