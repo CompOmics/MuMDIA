@@ -624,6 +624,60 @@ impl Fold {
     }
 }
 
+/// Spectra per batch handed from the Thermo reader thread to the decode pool.
+#[cfg(feature = "thermo")]
+const THERMO_BATCH: usize = 512;
+
+/// The Thermo `.raw` decode (`convert.thermo_native`): one thread reads spectra from the
+/// RawFileReader in file order, which is serial by nature, and the pool decodes each batch
+/// (peak extraction and the `--top-peaks` caps), which is the larger share of the work on a
+/// dense Astral file. The batches are folded in order with the same `scan_index` and the
+/// same `read` count as [`drive_sequential`], so the output is identical to it.
+#[cfg(feature = "thermo")]
+fn drive_thermo(
+    reader: mzdata::io::thermo::ThermoRawReader,
+    fold: &mut Fold,
+    p: &ConvertParams,
+) -> Result<usize> {
+    use rayon::prelude::*;
+    let limit = if p.max_spectra > 0 {
+        p.max_spectra
+    } else {
+        usize::MAX
+    };
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<mzdata::spectrum::MultiLayerSpectrum>>(4);
+    let mut read = 0usize;
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || {
+            let mut batch = Vec::with_capacity(THERMO_BATCH);
+            for spec in reader.take(limit) {
+                batch.push(spec);
+                if batch.len() == THERMO_BATCH {
+                    let full = std::mem::replace(&mut batch, Vec::with_capacity(THERMO_BATCH));
+                    if tx.send(full).is_err() {
+                        return;
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let _ = tx.send(batch);
+            }
+        });
+        for batch in rx.iter() {
+            let decoded: Vec<Decoded> = batch
+                .par_iter()
+                .map(|s| decode_one(s, p.top_peaks_ms1, p.top_peaks_ms2))
+                .collect();
+            for d in decoded {
+                fold.absorb(read as u32, d)?;
+                read += 1;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(read)
+}
+
 /// The one-thread decode, unchanged in every observable respect: the iterator
 /// yields spectra in file order, `scan_index` is the ordinal, and a parse error
 /// part-way through simply ends the iterator.
@@ -1162,7 +1216,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     let read = match source {
         Source::Mzml(reader) => drive_mzml(*reader, declared, &p, force_threads, &mut fold)?,
         #[cfg(feature = "thermo")]
-        Source::Thermo(reader) => drive_sequential(*reader, &mut fold, &p)?,
+        Source::Thermo(reader) => drive_thermo(*reader, &mut fold, &p)?,
         Source::Tdf => tdf::drive(
             p.mzml,
             p.max_spectra,

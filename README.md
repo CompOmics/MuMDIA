@@ -131,8 +131,9 @@ experiment the TSVs are experiment-wide, with one quantity column per run. Detai
 ## Limits
 
 - Input is mzML or a Bruker diaPASEF `.d`. Thermo `.raw` is converted with
-  ThermoRawFileParser; other vendor formats go through ProteoWizard `msconvert` and are
-  not verified end to end ([`docs/04_convert.md`](docs/04_convert.md)).
+  ThermoRawFileParser, or read directly by a build with the opt-in `thermo` feature; other
+  vendor formats go through ProteoWizard `msconvert` and are not verified end to end
+  ([`docs/04_convert.md`](docs/04_convert.md)).
 - Wildcard and terminal variable modifications are not supported.
 - CI builds and tests the engine on three platforms and runs an end-to-end smoke test, but
   does not run the Python sidecars on data. The PyTorch rescorer and the DeepLC fine-tune
