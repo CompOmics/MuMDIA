@@ -397,7 +397,8 @@ The library is structure-of-arrays, indexed by local candidate id: one column pe
 precursor field (`peptidoform_id`, `base_peptide_id`, `charge`, `predicted_irt`,
 `is_decoy`), the peptidoform text as one arena (`peptidoform(cid)`), the protein
 interned (`protein(cid)`; an empty value reads as `UNASSIGNED`), the fragment slice
-bounds as one `u32` CSR array (`frag_offsets`, `frag_range(cid)`), and `prec_mz`
+bounds as one CSR array (`frag_offsets`, `frag_range(cid)`; `u32` while the library
+has at most 2^32 - 1 fragment rows, `u64` beyond, `mumdia::offsets`), and `prec_mz`
 as an `Arc<[f64]>` that every `FragIndex` built from the library shares instead of
 copying. `cand(cid)` returns the fields of one candidate as a borrowed `CandInfo`.
 The struct-per-candidate layout it replaced held two owned `String`s, a duplicate
@@ -459,8 +460,8 @@ array, including m/z on bin edges and one ULP either side, zero, negative and
 subnormal values, the top bin, NaN and both infinities). The m/z range is a parallel
 min/max over the finite values, which is exact. The fragments are cut into chunks at
 candidate boundaries; pass 1 counts one bin histogram per chunk, and chunk `j`'s
-cursor in bin `b` starts at `bin_start[b]` plus the counts of chunks `0..j` in that
-bin, so the chunks own disjoint slots and follow each other in candidate order within
+slots in bin `b` start at `bin_start[b]` plus the counts of chunks `0..j` in that
+bin (the cursor holds the second term), so the chunks own disjoint slots and follow each other in candidate order within
 every bin. Pass 2 scatters the chunks concurrently into atomic posting arrays with
 relaxed stores (safe Rust; the workspace forbids `unsafe`), which are then converted to
 plain arrays in place. The chunk count is one per thread, capped so a chunk holds at
@@ -662,7 +663,7 @@ m/z (`Library::local_frag_index`, `index.rs:325`).
 | `run_worker` | `sidecar.rs:217` | shared launcher; bails on non-zero exit; `utf8` sets `PYTHONUTF8`/`PYTHONIOENCODING` |
 | `Candidate` | `index.rs:43` | one candidate as an owned record; only the input of `Library::from_candidates` (tests, benchmarks). A loaded library holds the same fields as columns |
 | `CandInfo` / `Library::cand` | `index.rs:59` / `index.rs:1506` | one candidate's precursor fields, borrowed from the library's columns |
-| `Library` | `index.rs:81` | columnar library indexed by local candidate id: per-field precursor columns, a peptidoform arena, interned proteins, `u32` CSR `frag_offsets`, the fragment m/z, intensity and interned-name arrays, `prec_mz` as an `Arc<[f64]>` shared with `FragIndex`, plus the optional bucketed inverted index |
+| `Library` | `index.rs:81` | columnar library indexed by local candidate id: per-field precursor columns, a peptidoform arena, interned proteins, CSR `frag_offsets` (`u32`, or `u64` past 2^32 - 1 fragment rows), the fragment m/z, intensity and interned-name arrays, `prec_mz` as an `Arc<[f64]>` shared with `FragIndex`, plus the optional bucketed inverted index |
 | `Library::load` / `load_with` | `index.rs:1021` / `index.rs:1028` | read Parquet, validate labels, group fragments, enforce preconditions; parallel (concurrent precursor columns, parted fragment passes) and bit-identical to the serial load; `load_with` can skip the bucketed index and is what both stages call |
 | `Library::load_range_with` / `load_with_fragment_offset` | `index.rs:1059` / `index.rs:1095` | a precursor m/z range of one library file, or a band file against the library-wide fragment table (isolation-window groups) |
 | `Library::load_mz_only` | `index.rs:1133` | the seed's library: precursor columns and fragment m/z; the payload columns are decoded and checked as the full load checks them, then discarded |
@@ -804,8 +805,13 @@ Matcher selection (both stages default to `Fragindex`):
   null (`index.rs:232-243`). The label column is also validated: any value other
   than `"target"`/`"decoy"` is rejected up front by `fdr::validate_labels`
   (`index.rs:89`, `fdr.rs:127`).
-- **total_frags must fit u32.** `FragIndex::build` asserts this
-  (`fragindex.rs:58`) because posting indices are u32.
+- **No total fragment limit; a per-bin one.** `frag_offsets` and the index's
+  `bin_start` are `u32` while the library has at most 2^32 - 1 fragment rows and
+  `u64` beyond (`mumdia::offsets::Offsets`), so a library that fits keeps the 4-byte
+  layout. What stays `u32` is per bin and per window: `FragIndex::build` asserts that
+  no bin holds 2^32 postings, a `WindowNarrow` caches its ranges relative to the bin
+  start on a wide index, and a `LocalIndex` asserts its window's postings fit `u32`.
+  The candidate id stays `u32`.
 - **f32 posting m/z, f64 math.** Index/posting m/z is stored f32; the ppm verify
   widens to f64 (`fragindex.rs:228-229`, `index.rs` module docs). f32 ULP is
   ~0.12 ppm, 200-400x below the 20-50 ppm regime, so storage precision is not a

@@ -116,6 +116,18 @@ than a number. Both are recorded in every run's `manifest.json`.
   also compares a URL pin (`name @ url`) with the source the installed package records, so
   an existing visDIA environment is reported outdated (`mumdia-viewer 13b3a9c -> c674f9f`)
   and the Setup screen offers the update.
+### Changed
+
+- **Libraries of more than 2^32 - 1 fragment rows load and search.** The per-candidate
+  fragment offsets and the fragment index's per-bin posting offsets were 32-bit, so such a
+  library was refused ("fragment library has N rows; per-candidate fragment offsets are
+  u32"); an imported library for an unspecific (HLA) digest of the human proteome had 4.7
+  billion. Both are now held as 32-bit while the rows fit and as 64-bit beyond
+  (`offsets::Offsets`), so a library that fits keeps its layout, its memory and its output
+  byte for byte (one Astral run end to end: every stage output identical, wall and peak
+  memory unchanged). A window's cached posting ranges stay 32-bit either way, relative to
+  their bin on a 64-bit index. Tests force the 64-bit form on small libraries and compare
+  whole and range loads, the index build and the probes with the 32-bit form.
 
 ## [0.7.0] - 2026-10-18
 

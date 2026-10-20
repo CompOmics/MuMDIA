@@ -36,8 +36,9 @@ fn atomic_u32_zeroed(n: usize) -> Vec<AtomicU32> {
 /// `fragment_tol_ppm`, extract at the learned masscal tolerance).
 pub struct FragIndex {
     bins: LogBins,
-    /// CSR row offsets, length `n_bins + 1`.
-    bin_start: Vec<u32>,
+    /// CSR row offsets, length `n_bins + 1`; `u64` only when the postings exceed u32
+    /// (`crate::offsets::Offsets`).
+    bin_start: crate::offsets::Offsets,
     /// Owning candidate id per posting (== dense candidate index, precondition).
     post_cand: Vec<u32>,
     /// Predicted m/z per posting, f32.
@@ -66,8 +67,9 @@ impl FragIndex {
     /// - the fragments are cut into chunks at candidate boundaries (the library is CSR in
     ///   candidate order, so a chunk is a contiguous run of candidates), and pass 1 counts
     ///   one bin histogram per chunk, concurrently;
-    /// - chunk `j`'s cursor in bin `b` starts at `bin_start[b]` plus the counts of chunks
-    ///   `0..j` in that bin. Every chunk therefore owns disjoint slots, and within a bin
+    /// - chunk `j`'s slots in bin `b` start at `bin_start[b]` plus the counts of chunks
+    ///   `0..j` in that bin (the cursor holds the second term, so it stays `u32` when
+    ///   `bin_start` is `u64`). Every chunk therefore owns disjoint slots, and within a bin
     ///   the chunks follow each other in candidate order, so `post_cand` is ascending
     ///   within every bin exactly as the serial candidate-order scatter leaves it;
     /// - pass 2 scatters every chunk concurrently. Safe Rust: the posting arrays are
@@ -144,11 +146,10 @@ impl FragIndex {
         // stores its candidates as columns indexed by that id, so this holds by
         // construction (and `Library::from_candidates` asserts it for a hand-built one).
         let total = lib.frag_mz.len();
-        assert!(total <= u32::MAX as usize, "total_frags exceeds u32");
         // Every fragment belongs to exactly one candidate, in candidate order: the
         // chunking below cuts the fragment array at candidate boundaries.
         assert_eq!(
-            lib.frag_offsets.last().copied().unwrap_or(0) as usize,
+            lib.frag_offsets.last(),
             total,
             "the library's fragment offsets must tile its fragment arrays"
         );
@@ -169,10 +170,8 @@ impl FragIndex {
             .clamp(1, n_cand.max(1));
         let mut bounds: Vec<usize> = (0..=n_chunks)
             .map(|j| {
-                let target = (total as u64 * j as u64 / n_chunks as u64) as u32;
-                lib.frag_offsets
-                    .partition_point(|&o| o < target)
-                    .min(n_cand)
+                let target = (total as u128 * j as u128 / n_chunks as u128) as usize;
+                lib.frag_offsets.partition_point(target).min(n_cand)
             })
             .collect();
         bounds[0] = 0;
@@ -189,22 +188,26 @@ impl FragIndex {
             .par_iter()
             .map(|&(c0, c1)| {
                 let mut h = vec![0u32; n_bins];
-                let (a, z) = (lib.frag_offsets[c0] as usize, lib.frag_offsets[c1] as usize);
+                let (a, z) = (lib.frag_offsets.get(c0), lib.frag_offsets.get(c1));
                 for &mz in &lib.frag_mz[a..z] {
                     h[bins.bin(mz as f64)] += 1;
                 }
                 h
             })
             .collect();
-        // Per-bin totals -> CSR start offsets, then each chunk's histogram becomes its
-        // starting cursor in every bin: the bin's start plus the earlier chunks' counts.
-        let mut bin_start = vec![0u32; n_bins + 1];
+        // Per-bin totals -> CSR start offsets (u64 while summing, narrowed when the total
+        // fits u32), then each chunk's histogram becomes its starting cursor in every bin
+        // RELATIVE to the bin's start: the earlier chunks' counts. A bin never holds 2^32
+        // postings, so the cursors stay u32 whatever the library's size.
+        let mut starts: Vec<u64> = vec![0; n_bins + 1];
         for b in 0..n_bins {
-            let n: u32 = cursors.iter().map(|h| h[b]).sum();
-            bin_start[b + 1] = bin_start[b] + n;
+            let n: u64 = cursors.iter().map(|h| h[b] as u64).sum();
+            assert!(n <= u32::MAX as u64, "a fragment bin holds 2^32 postings");
+            starts[b + 1] = starts[b] + n;
         }
+        let bin_start = crate::offsets::Offsets::from_values(starts);
         for b in 0..n_bins {
-            let mut run = bin_start[b];
+            let mut run = 0u32;
             for h in cursors.iter_mut() {
                 let n = h[b];
                 h[b] = run;
@@ -231,7 +234,7 @@ impl FragIndex {
                     for (k, gi) in lib.frag_range(c as u32).enumerate() {
                         let mz = lib.frag_mz[gi];
                         let b = bins.bin(mz as f64); // bin by the stored (f32) value
-                        let slot = cur[b] as usize;
+                        let slot = bin_start.get(b) + cur[b] as usize;
                         cur[b] += 1;
                         post_cand[slot].store(c as u32, Ordering::Relaxed);
                         post_mz[slot].store(mz.to_bits(), Ordering::Relaxed);
@@ -356,28 +359,25 @@ impl FragIndex {
             mz_max = 2.0;
         }
         let bins = LogBins::new(tol_ppm, mz_min.max(1.0), mz_max.max(mz_min.max(1.0) + 1e-6));
-        let mut bin_start = vec![0u32; bins.n_bins + 1];
+        let mut counts = vec![0u32; bins.n_bins + 1];
         for &mz in &lib.frag_mz {
-            bin_start[bins.bin(mz as f64) + 1] += 1;
+            counts[bins.bin(mz as f64) + 1] += 1;
         }
-        for b in 0..bins.n_bins {
-            bin_start[b + 1] += bin_start[b];
-        }
+        let bin_start = crate::offsets::Offsets::from_counts(counts);
         let mut post_cand = vec![0u32; total];
         let mut post_mz = vec![0f32; total];
         let mut post_int = vec![0f32; total];
         let mut post_frag = vec![0u16; total];
-        let mut cursor: Vec<u32> = bin_start[..bins.n_bins].to_vec();
+        let mut cursor = bin_start.cursors();
         for c in 0..n_cand {
             for (k, gi) in lib.frag_range(c as u32).enumerate() {
                 let mz = lib.frag_mz[gi];
                 let b = bins.bin(mz as f64);
-                let slot = cursor[b] as usize;
+                let slot = cursor.next(b);
                 post_cand[slot] = c as u32;
                 post_mz[slot] = mz;
                 post_int[slot] = lib.frag_int[gi];
                 post_frag[slot] = k as u16;
-                cursor[b] += 1;
             }
         }
         FragIndex {
@@ -572,16 +572,66 @@ impl FragIndex {
         let b = (bin as usize).min(self.bins.n_bins - 1);
         let lo_bin = b.saturating_sub(1);
         let hi_bin = (b + 1).min(self.bins.n_bins - 1);
+        // A cached range is a u32 pair relative to a base: 0 on a narrow index, the bin's
+        // start on a wide one (no bin holds 2^32 postings), so it fits whatever the size of
+        // the index. The width is matched once per peak and the bin loop is monomorphised
+        // for each, so a narrow index's cached hit reads nothing but the cache. Measured on
+        // `bench_probe` (one pinned core, 12 alternating rounds, against 32-bit offsets):
+        // narrow-window arms +0.2% / +3.7%, where matching per bin was +1.3% / +5.4% and an
+        // absolute u64 cache +4.5% / +8.4%.
+        match &self.bin_start {
+            crate::offsets::Offsets::Narrow(_) => {
+                self.probe_win_bins(nw, peak_mz, lo_bin, hi_bin, &mut f, |_| 0)
+            }
+            crate::offsets::Offsets::Wide(v) => {
+                self.probe_win_bins(nw, peak_mz, lo_bin, hi_bin, &mut f, |nb| v[nb] as usize)
+            }
+        }
+    }
+
+    /// The bin loop of [`FragIndex::probe_peak_win_binned`] for one offset width, `base(nb)`
+    /// being what bin `nb`'s cached range is relative to.
+    #[inline(always)]
+    fn probe_win_bins<F: FnMut(u32, f64, f32, u16)>(
+        &self,
+        nw: &mut WindowNarrow,
+        peak_mz: f64,
+        lo_bin: usize,
+        hi_bin: usize,
+        f: &mut F,
+        base: impl Fn(usize) -> usize,
+    ) {
         for nb in lo_bin..=hi_bin {
             let (a, z) = match nw.range[nb] {
-                (u32::MAX, _) => {
-                    let r = self.narrow_bin(nb, nw.cand_lo, nw.cand_hi);
-                    nw.range[nb] = (r.0 as u32, r.1 as u32);
-                    r
+                (u32::MAX, _) => self.fill_window_range(nw, nb),
+                (a, z) => {
+                    let s = base(nb);
+                    (s + a as usize, s + z as usize)
                 }
-                (a, z) => (a as usize, z as usize),
             };
-            self.emit_range(a, z, peak_mz, &mut f);
+            self.emit_range(a, z, peak_mz, f);
+        }
+    }
+
+    /// First probe of bin `nb` in a window: narrow it and cache the range. Out of line, so
+    /// the cached-hit loop stays small.
+    #[cold]
+    #[inline(never)]
+    fn fill_window_range(&self, nw: &mut WindowNarrow, nb: usize) -> (usize, usize) {
+        let r = self.narrow_bin(nb, nw.cand_lo, nw.cand_hi);
+        let s = self.cache_base(nb);
+        nw.range[nb] = ((r.0 - s) as u32, (r.1 - s) as u32);
+        r
+    }
+
+    /// What a [`WindowNarrow`] range of bin `nb` is stored relative to: nothing (0) while
+    /// the posting indices fit `u32`, the bin's start once they do not (no single bin holds
+    /// 2^32 postings, so the relative pair always fits).
+    #[inline]
+    fn cache_base(&self, nb: usize) -> usize {
+        match &self.bin_start {
+            crate::offsets::Offsets::Narrow(_) => 0,
+            crate::offsets::Offsets::Wide(v) => v[nb] as usize,
         }
     }
 
@@ -590,8 +640,7 @@ impl FragIndex {
     /// binary search rather than a scan.
     #[inline]
     fn narrow_bin(&self, nb: usize, cand_lo: u32, cand_hi: u32) -> (usize, usize) {
-        let s = self.bin_start[nb] as usize;
-        let e = self.bin_start[nb + 1] as usize;
+        let (s, e) = (self.bin_start.get(nb), self.bin_start.get(nb + 1));
         if e <= s {
             return (s, s);
         }
@@ -676,9 +725,10 @@ impl FragIndex {
 /// `(window, bin)` instead of once per peak.
 ///
 /// Entries are filled lazily, so a window only pays for the bins its peaks actually
-/// reach. `u32::MAX` marks "not yet computed"; it cannot collide with a real posting
-/// index because `bin_start` is itself `u32`, so an index that large could not be
-/// represented in the first place.
+/// reach. Each range is a `u32` pair: absolute posting indices on an index whose postings
+/// fit `u32`, relative to the bin's start on a larger one (no bin holds 2^32 postings), so it
+/// fits however large the index. `u32::MAX` marks "not yet computed": on a narrow index no
+/// posting index reaches it, and on a wide one no relative offset does.
 ///
 /// Cost is 8 bytes per bin (order of 1 MB for a 20 ppm index over the usual
 /// fragment m/z range), held by one worker for the duration of one window.
@@ -775,12 +825,17 @@ impl LocalIndex {
         if cand_hi <= cand_lo {
             return out;
         }
-        let a = lib.frag_offsets[cand_lo as usize] as usize;
-        let z = lib.frag_offsets[cand_hi as usize] as usize;
+        let a = lib.frag_offsets.get(cand_lo as usize);
+        let z = lib.frag_offsets.get(cand_hi as usize);
         let n = z - a;
         if n == 0 {
             return out;
         }
+        // The local index's own offsets are u32: one isolation window's candidates.
+        assert!(
+            n <= u32::MAX as usize,
+            "a LocalIndex over {n} postings exceeds u32"
+        );
         // Bin each posting once, by the stored f32 m/z widened, as the global build does.
         let bin: Vec<u32> = lib.frag_mz[a..z]
             .iter()
@@ -1417,7 +1472,7 @@ mod tests {
             let lib = lib_from(&cands);
             let idx = FragIndex::build(&lib, tol);
             let b = idx.bins.bin(600.0);
-            let (a, z) = (idx.bin_start[b] as usize, idx.bin_start[b + 1] as usize);
+            let (a, z) = (idx.bin_start.get(b), idx.bin_start.get(b + 1));
             assert_eq!(z - a, n_post, "fixture did not put the run in one bin");
             let iters = 4_000_000 / (n_post + 2);
             let mut best = (f64::INFINITY, f64::INFINITY);
@@ -1544,6 +1599,59 @@ mod tests {
         }
     }
 
+    /// Above 2^32 - 1 fragments the library's offsets and the index's bin offsets are
+    /// `u64` (`crate::offsets`). Forced wide on a small library, the index must hold the
+    /// same postings at the same offsets and every probe, plain and windowed, must find
+    /// the same matches as the narrow one.
+    #[test]
+    fn a_wide_index_finds_what_the_narrow_index_finds() {
+        let lib = random_lib(3_000, 0xb16);
+        let wlib = crate::offsets::force_wide(|| random_lib(3_000, 0xb16));
+        assert!(!lib.frag_offsets.is_wide() && wlib.frag_offsets.is_wide());
+        assert!(lib.frag_offsets.iter().eq(wlib.frag_offsets.iter()));
+        let narrow = FragIndex::build(&lib, 20.0);
+        let wide = crate::offsets::force_wide(|| FragIndex::build(&wlib, 20.0));
+        assert!(wide.bin_start.is_wide() && !narrow.bin_start.is_wide());
+        assert!(narrow.bin_start.iter().eq(wide.bin_start.iter()));
+        assert_eq!(narrow.post_cand, wide.post_cand);
+        assert_eq!(narrow.post_frag, wide.post_frag);
+        let hits = |idx: &FragIndex, mz: f64| {
+            let mut v = Vec::new();
+            idx.probe_peak(mz, 0, 3_000, |c: u32, d: f64, i: f32, k: u16| {
+                v.push((c, d.to_bits(), i.to_bits(), k))
+            });
+            v
+        };
+        let win_hits = |idx: &FragIndex, mz: f64| {
+            let mut nw = idx.window_narrow(500, 2_500);
+            let mut v = Vec::new();
+            idx.probe_peak_win(&mut nw, mz, |c, d, i, k| {
+                v.push((c, d.to_bits(), i.to_bits(), k))
+            });
+            // Twice, so the second probe reads the cached (relative) ranges.
+            idx.probe_peak_win(&mut nw, mz, |c, d, i, k| {
+                v.push((c, d.to_bits(), i.to_bits(), k))
+            });
+            v
+        };
+        let mut found = 0;
+        for i in 0..400 {
+            let mz = 100.0 + 1900.0 * i as f64 / 400.0;
+            let (a, b) = (hits(&narrow, mz), hits(&wide, mz));
+            assert_eq!(a, b, "probe at {mz}");
+            assert_eq!(
+                win_hits(&narrow, mz),
+                win_hits(&wide, mz),
+                "windowed probe at {mz}"
+            );
+            found += a.len();
+        }
+        assert!(
+            found > 0,
+            "the probes found nothing, so they compared nothing"
+        );
+    }
+
     /// The m/z that the bin geometry treats specially must land in the same bins through
     /// the parallel build: values exactly on bin edges and one f32 ULP either side, values
     /// below the range (zero, negative, subnormal, below 1.0 where the range is clamped),
@@ -1640,8 +1748,8 @@ mod tests {
                 let mut n_emitted = 0usize;
                 for &(lo, hi) in &ranges {
                     let mut local = LocalIndex::build(lib, &bins, tol, lo, hi);
-                    let want_len = lib.frag_offsets[hi.max(lo) as usize] as usize
-                        - lib.frag_offsets[lo as usize] as usize;
+                    let want_len = lib.frag_offsets.get(hi.max(lo) as usize)
+                        - lib.frag_offsets.get(lo as usize);
                     assert_eq!(local.len(), want_len, "postings of {lo}..{hi}");
                     let mut narrowed = NarrowedProbe {
                         idx: &idx,
