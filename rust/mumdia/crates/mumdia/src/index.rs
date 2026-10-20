@@ -76,7 +76,8 @@ pub struct CandInfo<'a> {
 /// 96 bytes of struct plus two allocations per precursor, ~180 bytes in all, against about
 /// 60 here. `peptidoform` is one arena ([`Library::peptidoform`]), `protein` is interned
 /// ([`Library::protein`]; a library has far fewer protein groups than precursors), the
-/// fragment bounds are one `u32` CSR array ([`Library::frag_offsets`]), and `prec_mz` is
+/// fragment bounds are one CSR array (`u32`, `u64` only past 2^32 - 1 rows;
+/// [`Library::frag_offsets`]), and `prec_mz` is
 /// shared with the fragment index instead of copied into it.
 pub struct Library {
     pub peptidoform_id: Vec<u32>,
@@ -93,7 +94,7 @@ pub struct Library {
     protein_dict: Vec<String>,
     /// CSR fragment offsets, `n_candidates() + 1` entries: candidate `c`'s fragments are
     /// `frag_offsets[c]..frag_offsets[c + 1]` of the fragment arrays below.
-    pub frag_offsets: Vec<u32>,
+    pub frag_offsets: crate::offsets::Offsets,
     /// Per-candidate fragment arrays, contiguous, grouped by candidate.
     /// Fragment m/z, f32. Both matchers already quantise to f32 before use (the
     /// fragindex bins and stores `mz as f32`, the naive matcher compares
@@ -402,7 +403,7 @@ fn load_precursors(
 /// The fragment columns of a library, grouped by candidate.
 #[derive(Debug)]
 struct FragmentColumns {
-    frag_offsets: Vec<u32>,
+    frag_offsets: crate::offsets::Offsets,
     frag_mz: Vec<f32>,
     frag_int: Vec<f32>,
     frag_name_id: Vec<u16>,
@@ -468,12 +469,9 @@ fn load_fragments(
     } else {
         TableFile::open(fragments)?
     };
-    if ft.nrows > u32::MAX as usize {
-        anyhow::bail!(
-            "fragment library has {} rows; per-candidate fragment offsets are u32",
-            ft.nrows
-        );
-    }
+    // No limit on the row count: the offsets are 64-bit beyond u32
+    // (`crate::offsets::Offsets`). What stays bounded is the candidate id (u32), checked
+    // per row by `FragRange::local`.
     let range = FragRange {
         fragments,
         frag_offset,
@@ -492,7 +490,7 @@ fn load_fragments(
         .collect();
 
     // Pass 1.
-    let (mut frag_offsets, infos) = if parts.len() > 1 {
+    let (counts, infos) = if parts.len() > 1 {
         let counts: Vec<AtomicU32> = (0..=ncand).map(|_| AtomicU32::new(0)).collect();
         let infos = crate::colread::first_err(
             parts
@@ -513,11 +511,10 @@ fn load_fragments(
         let info = count_part(&ft, 0, &range, |c| counts[c + 1] += 1)?;
         (counts, vec![info])
     };
-    for c in 0..ncand {
-        frag_offsets[c + 1] += frag_offsets[c];
-    }
+    // Prefix sums in place while the rows fit u32, as u64 when they do not.
+    let frag_offsets = crate::offsets::Offsets::from_counts(counts);
     // Rows in range, which for a range load is fewer than the rows decoded.
-    let n_frag_rows = frag_offsets[ncand] as usize;
+    let n_frag_rows = frag_offsets.get(ncand);
 
     // The m/z-only load still DECODES and CHECKS all four columns, through the same pass
     // and the same checks as the full load, and then discards the two payload columns
@@ -837,7 +834,7 @@ fn place_part<'a>(
 fn scatter_serial(
     ft: &TableFile,
     range: &FragRange,
-    frag_offsets: &[u32],
+    frag_offsets: &crate::offsets::Offsets,
     out: FragOut,
 ) -> Result<Vec<String>> {
     let FragOut {
@@ -852,7 +849,7 @@ fn scatter_serial(
     // in first-appearance order over the KEPT rows, exactly as the per-row map assigned
     // them.
     let mut names = mumdia_io::table::StrInterner::new();
-    let mut cursor: Vec<u32> = frag_offsets.to_vec();
+    let mut cursor = frag_offsets.cursors();
     crate::colread::for_each_zipped(
         ft,
         PASS2_COLUMNS,
@@ -872,8 +869,7 @@ fn scatter_serial(
                 else {
                     continue;
                 };
-                let pos = cursor[c] as usize;
-                cursor[c] += 1;
+                let pos = cursor.next(c);
                 // NULLs were rejected above, so the physical values are the values.
                 frag_mz[pos] = batch.mz.value(k) as f32;
                 if let Some(frag_int) = int.as_deref_mut() {
@@ -1413,8 +1409,7 @@ impl Library {
         if build_bucketed {
             let mut entries: Vec<(f32, u32, f32)> = Vec::with_capacity(n_frag_rows);
             for c in 0..ncand {
-                let (s, e) = (fc.frag_offsets[c] as usize, fc.frag_offsets[c + 1] as usize);
-                for gi in s..e {
+                for gi in fc.frag_offsets.range(c) {
                     entries.push((fc.frag_mz[gi], c as u32, fc.frag_int[gi]));
                 }
             }
@@ -1475,7 +1470,7 @@ impl Library {
                 ("idx_cid", crate::memlog::bytes_of(&lib.idx_cid)),
                 ("idx_int", crate::memlog::bytes_of(&lib.idx_int)),
                 ("precursor_columns", lib.precursor_bytes()),
-                ("frag_offsets", crate::memlog::bytes_of(&lib.frag_offsets)),
+                ("frag_offsets", lib.frag_offsets.bytes()),
             ],
         );
         tracing::info!(
@@ -1507,8 +1502,8 @@ impl Library {
         let mut pform_data = String::new();
         let mut proteins = mumdia_io::table::StrInterner::new();
         let mut protein_id = Vec::with_capacity(n);
-        let mut frag_offsets = Vec::with_capacity(n + 1);
-        frag_offsets.push(0u32);
+        let mut frag_offsets: Vec<u64> = Vec::with_capacity(n + 1);
+        frag_offsets.push(0);
         let mut prec_mz = Vec::with_capacity(n);
         let (mut pfid, mut base, mut charge, mut irt, mut dec) = (
             Vec::with_capacity(n),
@@ -1537,7 +1532,7 @@ impl Library {
             pform_data.push_str(&cd.peptidoform);
             pform_offsets.push(pform_data.len());
             protein_id.push(proteins.intern(&cd.protein));
-            frag_offsets.push(u32::try_from(cd.frag_start + cd.n_frag).expect("u32 offsets"));
+            frag_offsets.push((cd.frag_start + cd.n_frag) as u64);
         }
         assert_eq!(
             *frag_offsets.last().unwrap() as usize,
@@ -1554,7 +1549,7 @@ impl Library {
             pform_data,
             protein_id,
             protein_dict: proteins.into_values(),
-            frag_offsets,
+            frag_offsets: crate::offsets::Offsets::from_values(frag_offsets),
             frag_mz,
             frag_int,
             frag_name_id,
@@ -1590,7 +1585,7 @@ impl Library {
     #[inline]
     pub fn frag_range(&self, cid: u32) -> std::ops::Range<usize> {
         let c = cid as usize;
-        self.frag_offsets[c] as usize..self.frag_offsets[c + 1] as usize
+        self.frag_offsets.range(c)
     }
 
     /// Candidate `cid`'s precursor fields, borrowed.
@@ -2409,6 +2404,46 @@ mod tests {
         ])
         .unwrap();
         w.close().unwrap();
+    }
+
+    /// Above 2^32 - 1 fragment rows the offsets are `u64` (`crate::offsets`): forced wide, a
+    /// whole load and a range load, serial and parted, must place the same fragments at the
+    /// same offsets as the narrow load.
+    #[test]
+    fn a_wide_fragment_load_places_what_a_narrow_one_places() {
+        let dir = unique_dir("wide_frag");
+        std::fs::create_dir_all(&dir).unwrap();
+        let n_cand = 300u32;
+        for order in ["ascending", "shuffled"] {
+            let f = dir
+                .join(format!("frag_{order}.parquet"))
+                .to_str()
+                .unwrap()
+                .to_string();
+            write_parts_fragments(&f, n_cand, order, 41);
+            for (off, n, partial) in [(0usize, n_cand as usize, false), (50, 120, true)] {
+                for parts in [1usize, 4] {
+                    let narrow = load_fragments(&f, off, n, partial, parts, true).unwrap();
+                    let wide = crate::offsets::force_wide(|| {
+                        load_fragments(&f, off, n, partial, parts, true).unwrap()
+                    });
+                    let what = format!("{order} band=({off},{n}) parts={parts}");
+                    assert!(
+                        wide.frag_offsets.is_wide() && !narrow.frag_offsets.is_wide(),
+                        "{what}"
+                    );
+                    assert!(
+                        narrow.frag_offsets.iter().eq(wide.frag_offsets.iter()),
+                        "{what}"
+                    );
+                    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&narrow.frag_mz), bits(&wide.frag_mz), "{what}: mz");
+                    assert_eq!(bits(&narrow.frag_int), bits(&wide.frag_int), "{what}: int");
+                    assert_eq!(narrow.frag_name_id, wide.frag_name_id, "{what}: names");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The parallel fragment passes (row-group and page-range parts, atomic counts, the

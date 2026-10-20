@@ -103,6 +103,21 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Changed
+
+- **Libraries of more than 2^32 - 1 fragment rows load and search.** The per-candidate
+  fragment offsets and the fragment index's per-bin posting offsets were 32-bit, so such a
+  library was refused ("fragment library has N rows; per-candidate fragment offsets are
+  u32"); an imported library for an unspecific (HLA) digest of the human proteome had 4.7
+  billion. Both are now held as 32-bit while the rows fit and as 64-bit beyond
+  (`offsets::Offsets`), so a library that fits keeps its layout, its memory and its output
+  byte for byte (one Astral run end to end: every stage output identical, wall and peak
+  memory unchanged). A window's cached posting ranges stay 32-bit either way, relative to
+  their bin on a 64-bit index. Tests force the 64-bit form on small libraries and compare
+  whole and range loads, the index build and the probes with the 32-bit form.
+
 ## [0.7.0] - 2026-10-18
 
 ### Changed
