@@ -105,6 +105,17 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **visDIA shows the second pass of a match-between-runs experiment.** Since 0.7.0
+  `run-experiment` matches between runs with a second pass by default, and the scores and
+  quantities it reports are the second pass's. visDIA read each run's chromatograms,
+  features and library from the first pass, whose candidate ids differ, so every candidate
+  showed "No chromatogram rows for this candidate". The desktop application now pins visDIA
+  at c674f9f (CompOmics/visDIA#7), which reads them from `second_pass/`. The application
+  also compares a URL pin (`name @ url`) with the source the installed package records, so
+  an existing visDIA environment is reported outdated (`mumdia-viewer 13b3a9c -> c674f9f`)
+  and the Setup screen offers the update.
 ### Changed
 
 - **Libraries of more than 2^32 - 1 fragment rows load and search.** The per-candidate

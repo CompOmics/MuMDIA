@@ -59,7 +59,8 @@ pub struct Status {
     /// Whether a bundled `uv` was found, without which nothing can be installed.
     pub uv: Option<String>,
     /// Packages this application pins exactly whose installed version differs, as
-    /// `name installed -> pinned`. Non-empty means the environment is not `complete`:
+    /// `name installed -> pinned`, and packages pinned to a source URL (`name @ url`) that
+    /// were installed from another one, as `name <installed commit> -> <pinned commit>`. Non-empty means the environment is not `complete`:
     /// the engine refuses a DeepLC below its floor (4.5.0 since 2026-09-28), so an
     /// environment installed by an older release would import cleanly and then fail
     /// every search that needs DeepLC. Installing again upgrades it in place.
@@ -327,16 +328,33 @@ fn requirements_text(env: Env) -> &'static str {
     }
 }
 
-/// The exactly pinned packages (`name==version` lines) of `requirements` whose installed
-/// version in `versions` differs, as `name installed -> pinned`. A package that is not
-/// among the reported versions, or pinned with anything but `==`, is not compared.
+/// The pinned packages of `requirements` that the environment does not match: an exact
+/// pin (`name==version`) whose installed version in `versions` differs, as
+/// `name installed -> pinned`, and a URL pin (`name @ url`) whose installed source in
+/// `urls` (the package's `direct_url.json`) is another URL, as
+/// `name <installed> -> <pinned>`, each shortened to its commit when it has one. A package
+/// that is not among the reported versions or URLs, or pinned another way, is not compared.
 fn outdated_pins(
     requirements: &str,
     versions: &std::collections::BTreeMap<String, String>,
+    urls: &std::collections::BTreeMap<String, String>,
 ) -> Vec<String> {
     let mut out = Vec::new();
     for line in requirements.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
+        if let Some((name, pinned)) = line.split_once(" @ ") {
+            let (name, pinned) = (name.trim().to_ascii_lowercase(), pinned.trim());
+            if let Some(installed) = urls.get(&name) {
+                if installed != pinned {
+                    out.push(format!(
+                        "{name} {} -> {}",
+                        short_source(installed),
+                        short_source(pinned)
+                    ));
+                }
+            }
+            continue;
+        }
         let Some((name, pinned)) = line.split_once("==") else {
             continue;
         };
@@ -391,6 +409,46 @@ fn missing_modules(python: &Path, modules: &[&str]) -> Result<Vec<String>, Strin
         .collect())
 }
 
+/// A source URL as the user can read it: the commit of a GitHub archive or `@`-pinned
+/// URL, shortened to seven characters, otherwise the URL itself.
+fn short_source(url: &str) -> String {
+    let tail = url.rsplit(['/', '@']).next().unwrap_or(url);
+    let stem = tail.strip_suffix(".zip").unwrap_or(tail);
+    if stem.len() >= 7 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
+        stem[..7].to_string()
+    } else {
+        url.to_string()
+    }
+}
+
+/// The source URL each of `packages` was installed from, as its `direct_url.json` records
+/// it (a package installed from an index has none and is left out).
+fn direct_urls(python: &Path, packages: &[&str]) -> std::collections::BTreeMap<String, String> {
+    let script = format!(
+        "import importlib.metadata as m, json\n\
+         for name in {:?}:\n\
+         \x20   try:\n\
+         \x20       d = m.distribution(name).read_text('direct_url.json')\n\
+         \x20       if d: print(name, json.loads(d).get('url', ''))\n\
+         \x20   except Exception: pass",
+        packages
+    );
+    let mut out = std::collections::BTreeMap::new();
+    if let Ok(o) = crate::engine::command(python)
+        .args(["-c", &script])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            if let Some((k, v)) = line.trim().split_once(' ') {
+                if !v.is_empty() {
+                    out.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 fn versions(python: &Path, modules: &[&str]) -> std::collections::BTreeMap<String, String> {
     let script = format!(
         "import importlib.metadata as m\n\
@@ -434,7 +492,8 @@ pub fn status_of(env: Env) -> Status {
                 // `sklearn` is imported as `sklearn` but distributed as
                 // `scikit-learn`, so ask metadata for the name pip knows.
                 s.versions = versions(&py, REPORT_VERSIONS);
-                s.outdated = outdated_pins(requirements_text(env), &s.versions);
+                let urls = direct_urls(&py, REPORT_VERSIONS);
+                s.outdated = outdated_pins(requirements_text(env), &s.versions, &urls);
                 s.complete = s.outdated.is_empty();
             }
         }
@@ -1268,6 +1327,30 @@ mod tests {
     }
 
     #[test]
+    fn a_viewer_installed_from_another_commit_is_outdated() {
+        let pin = "https://github.com/CompOmics/visDIA/archive/c674f9fad94f640750559076d2d88c8a564e2102.zip";
+        let reqs = format!("# viewer\nmumdia-viewer @ {pin}\n");
+        let urls = |u: &str| {
+            [("mumdia-viewer".to_string(), u.to_string())]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let versions = std::collections::BTreeMap::new();
+        assert!(outdated_pins(&reqs, &versions, &urls(pin)).is_empty());
+        let old = "https://github.com/CompOmics/visDIA/archive/13b3a9c255885df93970fc070869928cd810fadf.zip";
+        assert_eq!(
+            outdated_pins(&reqs, &versions, &urls(old)),
+            vec!["mumdia-viewer 13b3a9c -> c674f9f".to_string()]
+        );
+        // Not installed from a URL at all: nothing to compare.
+        assert!(outdated_pins(&reqs, &versions, &std::collections::BTreeMap::new()).is_empty());
+        // The shipped viewer requirement is a URL pin, which is what makes this work.
+        assert!(REQUIREMENTS_VISDIA
+            .lines()
+            .any(|l| l.trim_start().starts_with("mumdia-viewer @ ")));
+    }
+
+    #[test]
     fn an_environment_behind_the_pins_is_outdated() {
         let reqs = "--extra-index-url https://download.pytorch.org/whl/cpu\n\
                     # comment\n\
@@ -1288,14 +1371,15 @@ mod tests {
             ("mokapot", "0.10.0"),
             ("numpy", "2.4.6"),
         ]);
-        assert!(outdated_pins(reqs, &current).is_empty());
+        let no_urls = std::collections::BTreeMap::new();
+        assert!(outdated_pins(reqs, &current, &no_urls).is_empty());
         let old = v(&[
             ("deeplc", "4.4.0"),
             ("torch", "2.14.0+cpu"),
             ("numpy", "1.26.4"),
         ]);
         assert_eq!(
-            outdated_pins(reqs, &old),
+            outdated_pins(reqs, &old, &no_urls),
             vec!["deeplc 4.4.0 -> 4.5.0".to_string()]
         );
         // The shipped requirements pin DeepLC exactly, which is what makes this work.
