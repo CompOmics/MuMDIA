@@ -136,6 +136,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   an existing visDIA environment is reported outdated (`mumdia-viewer 13b3a9c -> c674f9f`)
   and the Setup screen offers the update.
 
+### Security
+
+- **Desktop application: `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.10.** The desktop
+  lockfile carried `rustls-webpki` 0.103.15 (RUSTSEC-2026-0382, certificate verification may
+  accept distrusted intermediates) and `webpki-roots` 1.0.9 (RUSTSEC-2026-0381, bundled roots
+  trust distrusted emSign intermediates); both are patch updates. The engine does not use
+  either crate.
+
 ## [0.7.0] - 2026-10-18
 
 ### Changed
