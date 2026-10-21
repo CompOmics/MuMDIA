@@ -45,11 +45,51 @@ pub enum MatcherKind {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Enzyme {
-    /// Trypsin/P: cut after K or R (including before P).
+    /// Trypsin/P: cut after K or R (including before P). Rule `K*,R*`.
     #[default]
     TrypsinP,
-    /// Classic trypsin: cut after K or R but not before P.
+    /// Classic trypsin: cut after K or R but not before P. Rule `K*,R*,!*P`.
     Trypsin,
+    /// Lys-C: cut after K. Rule `K*`.
+    LysC,
+    /// Lys-N: cut before K. Rule `*K`.
+    LysN,
+    /// Arg-C: cut after R, not before P. Rule `R*,!*P`.
+    ArgC,
+    /// Asp-N: cut before D. Rule `*D`.
+    AspN,
+    /// Glu-C: cut after E (bicarbonate buffer). Rule `E*`; `E*,D*` as a custom rule.
+    GluC,
+    /// Chymotrypsin, high specificity: cut after F, Y or W, not before P.
+    /// Rule `F*,Y*,W*,!*P`.
+    Chymotrypsin,
+    /// Non-specific: every peptide bond (rule `**`). Peptides are enumerated by length
+    /// (`digest.min_len..=digest.max_len`), so `digest.missed_cleavages` does not apply,
+    /// and N-terminal Met excision adds nothing (every start position is enumerated).
+    /// For immunopeptidomics and peptidomics; the search space grows with the length
+    /// range, about one peptide per residue and length.
+    NonSpecific,
+    /// The rule in `digest.cleavage_rule` (residue pairs around the cut, `*` any, `!`
+    /// never; the syntax of DIA-NN `--cut`), e.g. `K*,R*,D*,!*P`.
+    Custom,
+}
+
+impl Enzyme {
+    /// The configuration name (`trypsin_p`, ...), the key of `enzymes.json`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Enzyme::TrypsinP => "trypsin_p",
+            Enzyme::Trypsin => "trypsin",
+            Enzyme::LysC => "lys_c",
+            Enzyme::LysN => "lys_n",
+            Enzyme::ArgC => "arg_c",
+            Enzyme::AspN => "asp_n",
+            Enzyme::GluC => "glu_c",
+            Enzyme::Chymotrypsin => "chymotrypsin",
+            Enzyme::NonSpecific => "non_specific",
+            Enzyme::Custom => "custom",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -904,6 +944,12 @@ impl PrescreenConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DigestConfig {
     pub enzyme: Enzyme,
+    /// The cleavage rule of `enzyme = "custom"`: residue pairs around the cut separated by
+    /// commas, `*` for any residue, a leading `!` for a pair never cut (the syntax of
+    /// DIA-NN `--cut`), e.g. `K*,R*,D*,!*P`. Only with `enzyme = "custom"`. Omitted from the
+    /// canonical configuration when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleavage_rule: Option<String>,
     pub missed_cleavages: u32,
     pub min_len: usize,
     pub max_len: usize,
@@ -915,10 +961,26 @@ pub struct DigestConfig {
     /// makes the search database structurally miss those excised peptides.
     pub n_term_met_excision: bool,
 }
+impl DigestConfig {
+    /// The cleavage rule this digest applies: the preset of `enzyme`, or
+    /// `cleavage_rule` under `enzyme = "custom"`.
+    pub fn rule(&self) -> Result<crate::cleavage::CleavageRule, String> {
+        let text = match self.enzyme {
+            Enzyme::Custom => self.cleavage_rule.as_deref().ok_or_else(|| {
+                "digest.enzyme = \"custom\" needs digest.cleavage_rule (e.g. \"K*,R*,!*P\")"
+                    .to_string()
+            })?,
+            e => crate::cleavage::preset_rule(e.name())
+                .ok_or_else(|| format!("no preset rule for digest.enzyme = {}", e.name()))?,
+        };
+        crate::cleavage::CleavageRule::parse(text).map_err(|m| format!("digest.cleavage_rule: {m}"))
+    }
+}
 impl Default for DigestConfig {
     fn default() -> Self {
         Self {
             enzyme: t(),
+            cleavage_rule: None,
             missed_cleavages: 2,
             min_len: 5,
             max_len: 50,
@@ -4147,6 +4209,13 @@ impl Config {
                 )));
             }
         }
+        if self.digest.cleavage_rule.is_some() && self.digest.enzyme != Enzyme::Custom {
+            return Err(Invalid(format!(
+                "digest.cleavage_rule is set but digest.enzyme = \"{}\"; set digest.enzyme =                  \"custom\" to use the rule, or remove it",
+                self.digest.enzyme.name()
+            )));
+        }
+        self.digest.rule().map_err(Invalid)?;
         if self.digest.min_len == 0 || self.digest.min_len > self.digest.max_len {
             return Err(Invalid(format!(
                 "digest.min_len must be >= 1 and <= digest.max_len (got {} and {})",
@@ -4692,6 +4761,46 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `digest.cleavage_rule` belongs to `enzyme = "custom"` only, a custom rule must
+    /// parse, every preset resolves to its rule, and an unset rule leaves the canonical
+    /// configuration (and so every config hash and library cache key) as it was.
+    #[test]
+    fn cleavage_rules_validate_and_stay_out_of_the_canonical_json_when_unset() {
+        let with = |enzyme: Enzyme, rule: Option<&str>| {
+            let mut c = Config::default();
+            c.digest.enzyme = enzyme;
+            c.digest.cleavage_rule = rule.map(str::to_string);
+            c.validate()
+        };
+        assert!(with(Enzyme::Custom, None).is_err());
+        assert!(with(Enzyme::Custom, Some("K*,R*,D*,!*P")).is_ok());
+        assert!(with(Enzyme::Custom, Some("KRP")).is_err());
+        assert!(with(Enzyme::Trypsin, Some("K*")).is_err());
+        for e in [
+            Enzyme::TrypsinP,
+            Enzyme::Trypsin,
+            Enzyme::LysC,
+            Enzyme::LysN,
+            Enzyme::ArgC,
+            Enzyme::AspN,
+            Enzyme::GluC,
+            Enzyme::Chymotrypsin,
+            Enzyme::NonSpecific,
+        ] {
+            assert!(with(e, None).is_ok(), "{e:?}");
+            let named: Enzyme = serde_json::from_value(serde_json::json!(e.name())).unwrap();
+            assert_eq!(named, e);
+        }
+        let json = serde_json::to_string(&DigestConfig::default()).unwrap();
+        assert!(!json.contains("cleavage_rule"), "{json}");
+        let parsed: DigestConfig =
+            serde_json::from_str(r#"{"enzyme": "custom", "cleavage_rule": "E*,D*"}"#).unwrap();
+        assert_eq!(
+            parsed.rule().unwrap(),
+            crate::cleavage::CleavageRule::parse("E*,D*").unwrap()
+        );
+    }
 
     #[test]
     fn the_default_extraction_gate_is_window_mean_at_0_6() {

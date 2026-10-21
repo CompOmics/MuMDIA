@@ -136,7 +136,7 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         top_peaks_ms1: usize,
     },
-    /// Fully-tryptic digest + decoy pairing -> peptides.parquet.
+    /// Tryptic or non-specific digest (`digest.enzyme`) + decoy pairing -> peptides.parquet.
     Digest {
         #[arg(long)]
         fasta: String,

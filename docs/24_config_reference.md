@@ -58,7 +58,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`prescreen.tags`](#prescreentags) | `PrescreenTagsConfig` | 7 |  |
 | [`prescreen.mass_hypotheses`](#prescreenmass_hypotheses) | `PrescreenMassConfig` | 7 |  |
 | [`prescreen.trace`](#prescreentrace) | `PrescreenTraceConfig` | 8 |  |
-| [`digest`](#digest) | `DigestConfig` | 6 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
+| [`digest`](#digest) | `DigestConfig` | 7 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`digest.decoy`](#digestdecoy) | `DecoyConfig` | 1 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`peptidoforms`](#peptidoforms) | `PeptidoformsConfig` | 7 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`predict_frag`](#predict_frag) | `PredictFragConfig` | 17 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
@@ -235,6 +235,7 @@ Fragment traces over consecutive same-window scans.
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
 | `enzyme` | `Enzyme` | `trypsin_p` |  |  |
+| `cleavage_rule` | `Option<String>` | `null` |  | The cleavage rule of `enzyme = "custom"`: residue pairs around the cut separated by commas, `*` for any residue, a leading `!` for a pair never cut (the syntax of DIA-NN `--cut`), e.g. `K*,R*,D*,!*P`. Only with `enzyme = "custom"`. Omitted from the canonical configuration when unset. |
 | `missed_cleavages` | `u32` | `2` |  |  |
 | `min_len` | `usize` | `5` |  |  |
 | `max_len` | `usize` | `50` |  |  |
@@ -670,8 +671,16 @@ Decoy-transfer null for the MBR false-transfer FDR (M4). `ReverseSequence` trans
 
 | Value | Default | Description |
 |---|---|---|
-| `trypsin_p` | yes | Trypsin/P: cut after K or R (including before P). |
-| `trypsin` |  | Classic trypsin: cut after K or R but not before P. |
+| `trypsin_p` | yes | Trypsin/P: cut after K or R (including before P). Rule `K*,R*`. |
+| `trypsin` |  | Classic trypsin: cut after K or R but not before P. Rule `K*,R*,!*P`. |
+| `lys_c` |  | Lys-C: cut after K. Rule `K*`. |
+| `lys_n` |  | Lys-N: cut before K. Rule `*K`. |
+| `arg_c` |  | Arg-C: cut after R, not before P. Rule `R*,!*P`. |
+| `asp_n` |  | Asp-N: cut before D. Rule `*D`. |
+| `glu_c` |  | Glu-C: cut after E (bicarbonate buffer). Rule `E*`; `E*,D*` as a custom rule. |
+| `chymotrypsin` |  | Chymotrypsin, high specificity: cut after F, Y or W, not before P. Rule `F*,Y*,W*,!*P`. |
+| `non_specific` |  | Non-specific: every peptide bond (rule `**`). Peptides are enumerated by length (`digest.min_len..=digest.max_len`), so `digest.missed_cleavages` does not apply, and N-terminal Met excision adds nothing (every start position is enumerated). For immunopeptidomics and peptidomics; the search space grows with the length range, about one peptide per residue and length. |
+| `custom` |  | The rule in `digest.cleavage_rule` (residue pairs around the cut, `*` any, `!` never; the syntax of DIA-NN `--cut`), e.g. `K*,R*,D*,!*P`. |
 
 ### `FeaturePreset`
 
@@ -1239,6 +1248,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-24 structs and 311 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 39 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 312 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 39 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
 33 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
