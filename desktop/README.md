@@ -316,6 +316,18 @@ the build log, and its "Command being run" panel lists every command the build h
 started (prediction, re-export, conversion, decoys, decoy prediction), from
 `BuildState::commands`.
 
+**The cleavage rule is one of the digest parameters.** The Cleavage choice lists the
+engine's presets (`mumdia-core/src/enzymes.json` through the `enzymes` command:
+Trypsin/P, Trypsin, Lys-C, Lys-N, Arg-C, Asp-N, Glu-C, chymotrypsin, non-specific) and
+a custom rule in DIA-NN's `--cut` pair syntax (`K*,R*,D*,!*P`). It reaches the DIA-NN
+build as `--cut`, the built-in path as `digest.enzyme` / `digest.cleavage_rule`, and the
+search-space estimate. Under a rule that cuts every bond peptides are enumerated by
+length, so the missed-cleavage field is disabled and the DIA-NN build asks for
+`max_len - 1` missed cleavages, the sites a peptide of the maximum length spans; the
+GlyGly `--no-cut-after-mod` rule is passed only for a rule that cuts after K. The
+application's rule parser (`enzymes.rs`) mirrors the engine's and is tested on the same
+`test_vectors`.
+
 **A predicted library is cached, content-addressed.** It depends on the FASTA's bytes
 and the digest parameters and on nothing else: not the mzML, not the thread count. So
 `library_cache_dir` keys it on a digest of the FASTA plus every parameter that changes
@@ -323,7 +335,9 @@ the output plus the DIA-NN version, and the search reuses it. Without that, offe
 this on the search screen would promise a whole-proteome prediction on every run. The
 DIA-NN version is in the key because its version changes what it predicts, and reusing
 a library across versions would silently change results. The thread count is
-deliberately out, because including it would miss the cache for nothing.
+deliberately out, because including it would miss the cache for nothing. The cleavage
+rule enters the key only when it is not Trypsin/P, the rule every earlier build used,
+so libraries cached before the choice existed are still found.
 
 `cached_library` requires **both** tables. A build interrupted between writing them
 would otherwise read as a usable cache entry and the search would fail on a missing
@@ -425,8 +439,9 @@ inputs at Start, so a plan computed before the last change cannot decide the run
 "Off" and "Custom" write it.
 
 The size comes from the library footer in library mode (`mumdia inspect`, rows only)
-and from the FASTA otherwise (`sizing::fasta_space`): a Trypsin/P digest with the
-screen's missed cleavages and lengths, N-terminal Met excision, every charge in range,
+and from the FASTA otherwise (`sizing::fasta_space`): a digest under the screen's
+cleavage rule with its missed cleavages and lengths (every window of the length range
+for a non-specific rule), N-terminal Met excision, every charge in range,
 one paired decoy per target, and each distinct peptide's modified forms counted exactly
 as the elementary symmetric sums of its sites' alternatives up to the variable maximum.
 On the E. coli FASTA with the engine defaults it gives 1,925,388 precursors against the
