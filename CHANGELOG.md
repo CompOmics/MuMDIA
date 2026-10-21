@@ -7,6 +7,10 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.7.1` is a patch release: libraries of more than 2^32 - 1 fragment rows load and search,
+and the desktop application's visDIA pin reads the second pass of a match-between-runs
+experiment. A library that fits gives the same output as with 0.7.0.
+
 `0.7.0` is a minor rather than a patch release: it reads a new kind of data and changes what
 a search finds. Bruker diaPASEF (`.d`) is read natively with ion mobility through the library,
 extraction, features, a raw-event retrace and cross-run quantification (`docs/35_diapasef.md`).
@@ -103,7 +107,22 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
-## [Unreleased]
+## [0.7.1] - 2026-10-21
+
+### Changed
+
+- **Libraries of more than 2^32 - 1 fragment rows load and search.** The per-candidate
+  fragment offsets and the fragment index's per-bin posting offsets were 32-bit, so such a
+  library was refused ("fragment library has N rows; per-candidate fragment offsets are
+  u32"); an imported library for an unspecific (HLA) digest of the human proteome had 4.7
+  billion. Both are now held as 32-bit while the rows fit and as 64-bit beyond
+  (`offsets::Offsets`), so a library that fits keeps its layout, its memory and its output
+  byte for byte (one Astral run end to end: every stage output identical, wall and peak
+  memory unchanged). A window's cached posting ranges stay 32-bit either way, relative to
+  their bin on a 64-bit index. Tests force the 64-bit form on small libraries and compare
+  whole and range loads, the index build and the probes with the 32-bit form. A two-run diaPASEF
+  immunopeptidomics search on a library of 379 million candidates and 4.5 billion fragment
+  rows ran end to end (2:03 wall, 241 GB peak, 96 threads).
 
 ### Fixed
 
@@ -116,18 +135,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   also compares a URL pin (`name @ url`) with the source the installed package records, so
   an existing visDIA environment is reported outdated (`mumdia-viewer 13b3a9c -> c674f9f`)
   and the Setup screen offers the update.
-### Changed
 
-- **Libraries of more than 2^32 - 1 fragment rows load and search.** The per-candidate
-  fragment offsets and the fragment index's per-bin posting offsets were 32-bit, so such a
-  library was refused ("fragment library has N rows; per-candidate fragment offsets are
-  u32"); an imported library for an unspecific (HLA) digest of the human proteome had 4.7
-  billion. Both are now held as 32-bit while the rows fit and as 64-bit beyond
-  (`offsets::Offsets`), so a library that fits keeps its layout, its memory and its output
-  byte for byte (one Astral run end to end: every stage output identical, wall and peak
-  memory unchanged). A window's cached posting ranges stay 32-bit either way, relative to
-  their bin on a 64-bit index. Tests force the 64-bit form on small libraries and compare
-  whole and range loads, the index build and the probes with the 32-bit form.
+### Security
+
+- **Desktop application: `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.10.** The desktop
+  lockfile carried `rustls-webpki` 0.103.15 (RUSTSEC-2026-0382, certificate verification may
+  accept distrusted intermediates) and `webpki-roots` 1.0.9 (RUSTSEC-2026-0381, bundled roots
+  trust distrusted emSign intermediates); both are patch updates. The engine does not use
+  either crate.
 
 ## [0.7.0] - 2026-10-18
 
