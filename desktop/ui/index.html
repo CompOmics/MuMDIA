@@ -283,6 +283,14 @@
         <div class="card-title">Digest</div>
         <div class="grid2">
           <div class="row">
+            <label for="d-enzyme">Cleavage</label>
+            <select id="d-enzyme"><option value="trypsin_p">Trypsin/P</option></select>
+          </div>
+          <div class="row" id="d-rule-row" hidden>
+            <label for="d-rule">Rule</label>
+            <input type="text" id="d-rule" placeholder="K*,R*,!*P" spellcheck="false" />
+          </div>
+          <div class="row">
             <label for="d-missed">Missed cleavages</label>
             <input type="number" id="d-missed" value="1" min="0" max="5" />
           </div>
@@ -299,6 +307,7 @@
             <input type="number" id="d-maxz" value="3" min="1" max="10" />
           </div>
         </div>
+        <p class="hint" id="d-enzyme-note"></p>
         <p class="hint">
           These decide the search space whichever way the library is built. With the
           built-in predictors they are written into the run's configuration on top of

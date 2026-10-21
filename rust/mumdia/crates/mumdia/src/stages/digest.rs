@@ -1,5 +1,5 @@
-//! Stage A `mumdia digest`: fully-tryptic enumeration + decoy pairing
-//! (docs/05_digest_peptidoforms.md). Experiment-wide, computed once. MVP uses a
+//! Stage A `mumdia digest`: enzymatic (tryptic) or non-specific enumeration + decoy
+//! pairing (docs/05_digest_peptidoforms.md). Experiment-wide, computed once. MVP uses a
 //! documented, clean-room decoy scheme (reverse or seeded scramble); the DIA-NN
 //! terminal shift map is a later license-checked addition
 //! (docs/14_build_test_deploy_gotchas.md).
@@ -8,7 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use mumdia_core::config::{DecoyStrategy, DigestConfig, Enzyme};
+use mumdia_core::cleavage::CleavageRule;
+use mumdia_core::config::{DecoyStrategy, DigestConfig};
 use mumdia_core::constants::is_standard_residue;
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
@@ -48,33 +49,20 @@ pub fn read_fasta(path: &str) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// Tryptic cleavage sites: index positions (0-based, after this residue) where
-/// the enzyme cuts.
-fn cleavage_sites(seq: &[u8], enzyme: Enzyme) -> Vec<usize> {
-    let mut sites = vec![0usize];
-    for i in 0..seq.len() {
-        let c = seq[i];
-        if c == b'K' || c == b'R' {
-            let before_p = i + 1 < seq.len() && seq[i + 1] == b'P';
-            let cut = match enzyme {
-                Enzyme::TrypsinP => true,
-                Enzyme::Trypsin => !before_p,
-            };
-            if cut {
-                sites.push(i + 1);
-            }
-        }
-    }
-    if *sites.last().unwrap() != seq.len() {
-        sites.push(seq.len());
-    }
-    sites
+/// Enumerate the peptides of one protein under `cfg`'s rule; see [`digest_with`].
+#[cfg(test)]
+fn digest_protein(seq: &[u8], cfg: &DigestConfig) -> Vec<(usize, usize, String)> {
+    digest_with(seq, cfg, &cfg.rule().unwrap())
 }
 
-/// Enumerate tryptic peptides for one protein with up to `missed` missed
-/// cleavages, respecting length bounds and dropping ambiguous residues.
-fn digest_protein(seq: &[u8], cfg: &DigestConfig) -> Vec<(usize, usize, String)> {
-    let sites = cleavage_sites(seq, cfg.enzyme);
+/// Enumerate the peptides of one protein: the spans between cleavage sites of `rule` with
+/// up to `missed_cleavages` missed cleavages, or every peptide of an allowed length when
+/// the rule cuts every bond; length bounds respected, ambiguous residues dropped.
+fn digest_with(seq: &[u8], cfg: &DigestConfig, rule: &CleavageRule) -> Vec<(usize, usize, String)> {
+    if rule.is_non_specific() {
+        return digest_non_specific(seq, cfg);
+    }
+    let sites = rule.sites(seq);
     let mut out = Vec::new();
     for i in 0..sites.len().saturating_sub(1) {
         for j in (i + 1)..sites.len() {
@@ -116,6 +104,52 @@ fn digest_protein(seq: &[u8], cfg: &DigestConfig) -> Vec<(usize, usize, String)>
     }
     out
 }
+
+/// Every peptide of `min_len..=max_len` residues, by start then length, that contains
+/// only standard residues. `missed_cleavages` does not apply, and N-terminal Met excision
+/// adds nothing because the excised form is the peptide starting at position 1. A run of
+/// standard residues is found once per start, so the scan is O(residues x lengths).
+fn digest_non_specific(seq: &[u8], cfg: &DigestConfig) -> Vec<(usize, usize, String)> {
+    let n = seq.len();
+    // next_bad[i]: the first position >= i holding a non-standard residue (n if none).
+    let mut next_bad = vec![n; n + 1];
+    for i in (0..n).rev() {
+        next_bad[i] = if is_standard_residue(seq[i]) {
+            next_bad[i + 1]
+        } else {
+            i
+        };
+    }
+    let mut out = Vec::new();
+    for start in 0..n {
+        let stop = next_bad[start].min(start + cfg.max_len).min(n);
+        for end in (start + cfg.min_len)..=stop {
+            out.push((
+                start,
+                end,
+                String::from_utf8_lossy(&seq[start..end]).to_string(),
+            ));
+        }
+    }
+    out
+}
+
+/// Peptides (with repeats) a non-specific digest of these proteins enumerates before
+/// de-duplication: the count to warn about before holding them all in memory.
+fn non_specific_upper_bound(proteins: &[(String, String)], cfg: &DigestConfig) -> u64 {
+    let mut total = 0u64;
+    for (_, seq) in proteins {
+        let n = seq.len();
+        for len in cfg.min_len..=cfg.max_len.min(n) {
+            total += (n - len + 1) as u64;
+        }
+    }
+    total
+}
+
+/// Above this many enumerated peptides a non-specific digest warns: every distinct
+/// peptide, its decoy and the collision sets are held in memory (roughly 100 bytes each).
+const NON_SPECIFIC_WARN_PEPTIDES: u64 = 300_000_000;
 
 /// Make a decoy sequence from a target (docs/05_digest_peptidoforms.md). Reverse
 /// keeps the C-terminal residue fixed; scramble seeded-shuffles the interior.
@@ -221,6 +255,22 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
     let t0 = Instant::now();
     let proteins = read_fasta(p.fasta)?;
     info!(proteins = proteins.len(), "digest: read fasta");
+    let rule = p.cfg.rule().map_err(anyhow::Error::msg)?;
+    if rule.is_non_specific() {
+        let bound = non_specific_upper_bound(&proteins, p.cfg);
+        info!(
+            enumerated_upper_bound = bound,
+            min_len = p.cfg.min_len,
+            max_len = p.cfg.max_len,
+            "digest: non-specific cleavage (every peptide bond; digest.missed_cleavages and              N-terminal Met excision do not apply)"
+        );
+        if bound > NON_SPECIFIC_WARN_PEPTIDES {
+            warn!(
+                enumerated_upper_bound = bound,
+                "digest: a non-specific digest of this FASTA and length range enumerates more                  than {NON_SPECIFIC_WARN_PEPTIDES} peptides before de-duplication; memory and                  the predictors scale with it. Narrow digest.min_len..max_len or the FASTA if                  that is more than intended"
+            );
+        }
+    }
 
     // Dedup target peptides by sequence, aggregating protein accessions.
     let mut pep_proteins: HashMap<String, Vec<String>> = HashMap::new();
@@ -228,7 +278,7 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
     let mut order: Vec<String> = Vec::new();
     for (acc, seq) in &proteins {
         let bytes = seq.as_bytes();
-        for (start, end, pep) in digest_protein(bytes, p.cfg) {
+        for (start, end, pep) in digest_with(bytes, p.cfg, &rule) {
             // Look up with the borrowed key so the common already-seen case does
             // not clone `pep`; clone only on the first (Vacant) encounter. The last
             // use moves `pep` into `order`, keeping insertion order unchanged.
@@ -354,7 +404,8 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
         content_hash: mumdia_io::hash::blake3_file(p.out)?,
         params: json!({
             "enzyme": format!("{:?}", p.cfg.enzyme),
-            "missed_cleavages": p.cfg.missed_cleavages,
+            // Not applied under a non-specific rule, so not recorded as if it were.
+            "missed_cleavages": (!rule.is_non_specific()).then_some(p.cfg.missed_cleavages),
             "min_len": p.cfg.min_len, "max_len": p.cfg.max_len,
             "decoy_strategy": format!("{:?}", p.cfg.decoy.strategy),
             "rng_seed": p.rng_seed,
@@ -364,6 +415,11 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
         model_identity: None,
         elapsed_ms: elapsed,
     };
+    let mut report = report;
+    if let Some(rule) = &p.cfg.cleavage_rule {
+        // Recorded only for a custom rule, so a preset's report is what it always was.
+        report.params["cleavage_rule"] = json!(rule);
+    }
     report.write_for(p.out)?;
 
     info!(
@@ -379,6 +435,7 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mumdia_core::config::Enzyme;
 
     #[test]
     fn trypsin_p_cleaves_after_kr() {
@@ -397,6 +454,132 @@ mod tests {
         assert!(peps.contains(&"MK".to_string()), "{peps:?}");
         assert!(peps.contains(&"R".to_string()), "{peps:?}");
         assert!(peps.contains(&"PADEK".to_string()), "{peps:?}");
+    }
+
+    /// Non-specific: every window of an allowed length, whatever the residues and the
+    /// missed-cleavage setting; a non-standard residue splits the sequence; Met excision
+    /// adds no extra rows (the excised form is the window starting at 1).
+    /// The trypsin site finder this module had before cleavage rules, kept as the
+    /// reference the rule-driven one must reproduce exactly.
+    fn legacy_tryptic_sites(seq: &[u8], trypsin_p: bool) -> Vec<usize> {
+        let mut sites = vec![0usize];
+        for i in 0..seq.len() {
+            let c = seq[i];
+            if c == b'K' || c == b'R' {
+                let before_p = i + 1 < seq.len() && seq[i + 1] == b'P';
+                if trypsin_p || !before_p {
+                    sites.push(i + 1);
+                }
+            }
+        }
+        if *sites.last().unwrap() != seq.len() {
+            sites.push(seq.len());
+        }
+        sites
+    }
+
+    /// The `trypsin_p` and `trypsin` presets cut exactly where the hard-coded trypsin did,
+    /// on random sequences rich in K, R and P, so a tryptic library is unchanged.
+    #[test]
+    fn trypsin_presets_reproduce_the_legacy_sites() {
+        let alphabet = b"KRPKRPACDEFGHILMNQSTVWY";
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for (enzyme, tp) in [(Enzyme::TrypsinP, true), (Enzyme::Trypsin, false)] {
+            let rule = DigestConfig {
+                enzyme,
+                ..Default::default()
+            }
+            .rule()
+            .unwrap();
+            for _ in 0..2000 {
+                state = splitmix64(&mut state);
+                let n = 1 + (state % 60) as usize;
+                let seq: Vec<u8> = (0..n)
+                    .map(|_| {
+                        state = splitmix64(&mut state);
+                        alphabet[(state % alphabet.len() as u64) as usize]
+                    })
+                    .collect();
+                assert_eq!(
+                    rule.sites(&seq),
+                    legacy_tryptic_sites(&seq, tp),
+                    "{enzyme:?} {}",
+                    String::from_utf8_lossy(&seq)
+                );
+            }
+        }
+    }
+
+    /// A preset and a custom rule with the same text digest alike; Asp-N cuts before D.
+    #[test]
+    fn presets_and_custom_rules_digest_alike() {
+        let asp = DigestConfig {
+            enzyme: Enzyme::AspN,
+            missed_cleavages: 0,
+            min_len: 1,
+            ..Default::default()
+        };
+        let custom = DigestConfig {
+            enzyme: Enzyme::Custom,
+            cleavage_rule: Some("*D".into()),
+            ..asp.clone()
+        };
+        let peps = |c: &DigestConfig| -> Vec<String> {
+            digest_protein(b"AADKKDAA", c)
+                .into_iter()
+                .map(|(_, _, p)| p)
+                .collect()
+        };
+        assert_eq!(peps(&asp), vec!["AA", "DKK", "DAA"]);
+        assert_eq!(peps(&asp), peps(&custom));
+    }
+
+    #[test]
+    fn non_specific_enumerates_every_window_of_the_allowed_lengths() {
+        let cfg = DigestConfig {
+            enzyme: Enzyme::NonSpecific,
+            missed_cleavages: 0,
+            min_len: 10,
+            max_len: 10,
+            ..Default::default()
+        };
+        let seq = b"MAEGKRSTVLDPQWYHNFIC";
+        let got = digest_protein(seq, &cfg);
+        assert_eq!(got.len(), seq.len() - 10 + 1, "{got:?}");
+        for (k, (s, e, p)) in got.iter().enumerate() {
+            assert_eq!((*s, *e), (k, k + 10));
+            assert_eq!(p.as_bytes(), &seq[k..k + 10]);
+        }
+
+        let cfg = DigestConfig {
+            min_len: 3,
+            max_len: 4,
+            ..cfg
+        };
+        // X splits PEPT|IDE: windows of 3-4 inside each run only.
+        let peps: Vec<String> = digest_protein(b"PEPTXIDE", &cfg)
+            .into_iter()
+            .map(|(_, _, p)| p)
+            .collect();
+        assert_eq!(peps, vec!["PEP", "PEPT", "EPT", "IDE"], "{peps:?}");
+    }
+
+    /// The upper bound the non-specific warning reads is the window count before
+    /// de-duplication.
+    #[test]
+    fn non_specific_upper_bound_counts_windows() {
+        let cfg = DigestConfig {
+            enzyme: Enzyme::NonSpecific,
+            min_len: 8,
+            max_len: 12,
+            ..Default::default()
+        };
+        let prots = vec![
+            ("a".to_string(), "A".repeat(20)),
+            ("b".to_string(), "A".repeat(9)),
+        ];
+        // 20 residues: 13+12+11+10+9 = 55; 9 residues: lengths 8, 9 -> 2+1 = 3.
+        assert_eq!(non_specific_upper_bound(&prots, &cfg), 58);
     }
 
     #[test]

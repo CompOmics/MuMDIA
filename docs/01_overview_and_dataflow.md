@@ -124,7 +124,7 @@ Parquet artifacts and their column schemas as written in the code:
 `ms2_to_ms1.parquet` (`convert.rs:234`): `ms2_scan_index` u32,
 `ms1_scan_index` i32 (the preceding MS1 scan; -1 if none).
 
-`peptides.parquet` (digest; FASTA mode only): fully-tryptic stripped peptides
+`peptides.parquet` (digest; FASTA mode only): stripped peptides of the configured cleavage rule (tryptic by default)
 plus their paired decoys.
 
 `peptidoforms.parquet` (peptidoforms; FASTA mode only): concrete peptidoforms

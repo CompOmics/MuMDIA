@@ -132,6 +132,12 @@ pub struct SpaceRequest {
     pub fasta: Option<String>,
     #[serde(default)]
     pub lib_precursors: Option<String>,
+    /// The cleavage preset (`enzymes.json`), Trypsin/P by default.
+    #[serde(default = "default_enzyme")]
+    pub enzyme: String,
+    /// The rule of `enzyme = "custom"`.
+    #[serde(default)]
+    pub cleavage_rule: Option<String>,
     #[serde(default = "one")]
     pub missed_cleavages: usize,
     #[serde(default = "seven")]
@@ -157,6 +163,9 @@ pub struct SpaceRequest {
 
 fn one() -> usize {
     1
+}
+fn default_enzyme() -> String {
+    crate::enzymes::DEFAULT_ENZYME.to_string()
 }
 fn two() -> usize {
     2
@@ -263,14 +272,18 @@ fn library_rows(engine: &Path, table: &str) -> Result<u64, String> {
 /// Distinct target peptides and library precursors (targets plus their decoys) a FASTA
 /// gives under the Search tab's digest and modification settings.
 ///
-/// Mirrors the native digest closely enough for sizing, not exactly: Trypsin/P (the engine
-/// default), the configured missed cleavages and length range, N-terminal methionine
-/// excision (the default), every charge in range, and one paired decoy per target
-/// peptidoform. Each distinct peptide's modified forms are counted exactly: with `a_i`
+/// Mirrors the native digest closely enough for sizing, not exactly: the chosen cleavage
+/// rule (Trypsin/P by default) with the configured missed cleavages, or every window of the
+/// length range under a non-specific rule; N-terminal methionine excision (the default),
+/// every charge in range, and one paired decoy per target peptidoform. Each distinct peptide's modified forms are counted exactly: with `a_i`
 /// variable alternatives at site `i`, the forms with at most `k` modified sites are the
 /// elementary symmetric polynomials `e_0..e_k` of the `a_i`, summed.
 pub fn fasta_space(path: &Path, req: &SpaceRequest) -> Result<(u64, u64), String> {
     let text = std::fs::read(path).map_err(|e| format!("could not read the FASTA: {e}"))?;
+    let rule = crate::enzymes::Rule::parse(&crate::enzymes::resolve(
+        &req.enzyme,
+        req.cleavage_rule.as_deref(),
+    )?)?;
     let mut alternatives = [0u32; 256];
     for m in &req.variable {
         let r = m.residue.to_ascii_uppercase();
@@ -298,7 +311,7 @@ pub fn fasta_space(path: &Path, req: &SpaceRequest) -> Result<(u64, u64), String
         forms += modified_forms(pep, &alternatives, req.max_variable_mods);
     };
     for seq in proteins(&text) {
-        digest(&seq, req, &mut count);
+        digest(&seq, req, &rule, &mut count);
     }
     let precursors = (forms * charges * 2.0).round() as u64;
     Ok((peptides, precursors))
@@ -326,15 +339,24 @@ fn proteins(text: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// Tryptic (Trypsin/P) peptides of one protein, with N-terminal Met excision.
-fn digest(seq: &[u8], req: &SpaceRequest, emit: &mut impl FnMut(&[u8])) {
-    let mut sites: Vec<usize> = vec![0];
-    for (i, &aa) in seq.iter().enumerate() {
-        if (aa == b'K' || aa == b'R') && i + 1 < seq.len() {
-            sites.push(i + 1);
+/// The peptides of one protein under `rule`: the spans between its sites with up to
+/// `missed_cleavages` missed cleavages and N-terminal Met excision, or every window of the
+/// length range when the rule cuts every bond.
+fn digest(
+    seq: &[u8],
+    req: &SpaceRequest,
+    rule: &crate::enzymes::Rule,
+    emit: &mut impl FnMut(&[u8]),
+) {
+    if rule.is_non_specific() {
+        for start in 0..seq.len() {
+            for end in (start + req.min_len)..=(start + req.max_len).min(seq.len()) {
+                emit(&seq[start..end]);
+            }
         }
+        return;
     }
-    sites.push(seq.len());
+    let sites = rule.sites(seq);
     let mut starts: Vec<(usize, usize)> = (0..sites.len() - 1).map(|s| (s, sites[s])).collect();
     if seq.first() == Some(&b'M') && sites.len() > 1 && sites[1] > 1 {
         // The Met-excised forms of the N-terminal peptides start at residue 1.
@@ -442,6 +464,8 @@ mod tests {
             mode: "fasta".into(),
             fasta: None,
             lib_precursors: None,
+            enzyme: default_enzyme(),
+            cleavage_rule: None,
             missed_cleavages: 1,
             min_len: 3,
             max_len: 30,
@@ -476,7 +500,8 @@ mod tests {
     fn the_digest_counts_missed_cleavages_lengths_and_met_excision() {
         let mut got: Vec<String> = Vec::new();
         let r = req(&[], 1);
-        digest(b"MAKPEPRGGK", &r, &mut |p| {
+        let rule = crate::enzymes::Rule::parse("K*,R*").unwrap();
+        digest(b"MAKPEPRGGK", &r, &rule, &mut |p| {
             got.push(String::from_utf8(p.to_vec()).unwrap())
         });
         got.sort();
@@ -488,6 +513,40 @@ mod tests {
                 .filter(|p| p.len() >= 3)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// A non-specific rule counts every window of the length range (de-duplicated across
+    /// proteins), and a custom rule is applied.
+    #[test]
+    fn other_cleavage_rules_are_counted() {
+        let dir = std::env::temp_dir().join(format!("mumdia-sizing-ns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.fasta");
+        std::fs::write(
+            &f,
+            ">a
+ACDEFGHIKLMN
+>b
+ACDEFGHIKL
+",
+        )
+        .unwrap();
+        let mut r = req(&[], 1);
+        r.enzyme = "non_specific".into();
+        r.min_len = 10;
+        r.max_len = 10;
+        // a: ACDEFGHIKL, CDEFGHIKLM, DEFGHIKLMN; b: ACDEFGHIKL again.
+        let (pep, prec) = fasta_space(&f, &r).unwrap();
+        assert_eq!((pep, prec), (3, 3 * 2 * 2));
+        let mut c = req(&[], 0);
+        c.enzyme = "custom".into();
+        c.cleavage_rule = Some("*D".into());
+        c.missed_cleavages = 0;
+        // Before D: AC | DEFGHIKLMN (10) and AC | DEFGHIKL (8); length >= 3 keeps those two.
+        assert_eq!(fasta_space(&f, &c).unwrap().0, 2);
+        c.cleavage_rule = Some("DD D".into());
+        assert!(fasta_space(&f, &c).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

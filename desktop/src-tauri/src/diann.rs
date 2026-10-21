@@ -900,6 +900,13 @@ pub fn install(installer: Arc<Installer>) -> Result<(), String> {
 pub struct BuildRequest {
     pub fasta: String,
     pub out_dir: String,
+    /// The cleavage preset (`enzymes.json`: `trypsin_p`, `lys_c`, `non_specific`, ...,
+    /// `custom`). Trypsin/P by default, the rule this builder always used.
+    #[serde(default = "d_enzyme")]
+    pub enzyme: String,
+    /// The rule of `enzyme = "custom"`, in DIA-NN `--cut` syntax.
+    #[serde(default)]
+    pub cleavage_rule: Option<String>,
     #[serde(default = "d_missed")]
     pub missed_cleavages: u32,
     #[serde(default = "d_min_len")]
@@ -1052,6 +1059,18 @@ fn d_max_var() -> u32 {
 fn d_missed() -> u32 {
     1
 }
+fn d_enzyme() -> String {
+    crate::enzymes::DEFAULT_ENZYME.to_string()
+}
+
+/// The DIA-NN `--cut` rule of a request: its preset's, or its custom rule, checked.
+pub fn cut_rule(req: &BuildRequest) -> Result<String, String> {
+    crate::enzymes::resolve(&req.enzyme, req.cleavage_rule.as_deref())
+}
+
+/// The rule every library before the cleavage choice was built with; it keeps the cache
+/// key it always had.
+const LEGACY_CUT: &str = "K*,R*";
 fn d_min_len() -> u32 {
     7
 }
@@ -1129,6 +1148,11 @@ pub fn library_cache_dir(req: &BuildRequest, diann_version: &str) -> Result<Path
     if !plan.is_legacy() {
         h.update(format!("|mods={}", plan.key()).as_bytes());
     }
+    // Likewise the cleavage: Trypsin/P keeps the key it always had.
+    let cut = cut_rule(req)?;
+    if cut != LEGACY_CUT {
+        h.update(format!("|cut={cut}").as_bytes());
+    }
     let key = crate::components::hex(h.finalize());
     Ok(crate::components::data_dir()
         .join(LIBRARY_CACHE_NAME)
@@ -1172,6 +1196,7 @@ fn mark_cache_complete(dir: &Path, req: &BuildRequest, version: &str) {
         "fasta": req.fasta,
         "diann_version": version,
         "recipe_version": RECIPE_VERSION,
+        "cleavage": cut_rule(req).ok(),
         "missed_cleavages": req.missed_cleavages,
         "pep_len": [req.min_pep_len, req.max_pep_len],
         "charge": [req.min_charge, req.max_charge],
@@ -1486,7 +1511,17 @@ fn find_predicted_speclib(dir: &Path, stem: &str) -> Option<PathBuf> {
 /// missing here for the whole of this feature's life and nothing caught it, because
 /// the arguments were built inline and the only statement that they were right was a
 /// comment.
-fn predict_args(req: &BuildRequest, plan: &ModPlan, out_lib: &Path) -> Vec<String> {
+fn predict_args(req: &BuildRequest, plan: &ModPlan, out_lib: &Path) -> Result<Vec<String>, String> {
+    let cut = cut_rule(req)?;
+    let rule = crate::enzymes::Rule::parse(&cut)?;
+    // Under a rule that cuts every bond a peptide of n residues spans n - 1 cleavage
+    // sites, so DIA-NN needs that many missed cleavages to enumerate it; the setting is
+    // not a choice there.
+    let missed = if rule.is_non_specific() {
+        req.missed_cleavages.max(req.max_pep_len.saturating_sub(1))
+    } else {
+        req.missed_cleavages
+    };
     let mut args: Vec<String> = vec![
         "--fasta".into(),
         req.fasta.clone(),
@@ -1494,7 +1529,7 @@ fn predict_args(req: &BuildRequest, plan: &ModPlan, out_lib: &Path) -> Vec<Strin
         "--gen-spec-lib".into(),
         "--predictor".into(),
         "--cut".into(),
-        "K*,R*".into(),
+        cut.clone(),
         // Emit N-terminal initiator-Met-excised forms.
         //
         // Not optional, and its absence was a silent scientific defect rather than a
@@ -1509,7 +1544,7 @@ fn predict_args(req: &BuildRequest, plan: &ModPlan, out_lib: &Path) -> Vec<Strin
         // result rather than a library-recipe defect.
         "--met-excision".into(),
         "--missed-cleavages".into(),
-        req.missed_cleavages.to_string(),
+        missed.to_string(),
         "--min-pep-len".into(),
         req.min_pep_len.to_string(),
         "--max-pep-len".into(),
@@ -1540,12 +1575,16 @@ fn predict_args(req: &BuildRequest, plan: &ModPlan, out_lib: &Path) -> Vec<Strin
         }
     }
     // Trypsin does not cleave after a GlyGly-modified lysine, so its peptides carry the
-    // remnant on an internal K; DIA-NN documents this flag for that search.
-    if plan
-        .fixed
-        .iter()
-        .chain(&plan.variable)
-        .any(|m| m.name == "GlyGly" && m.residue == 'K')
+    // remnant on an internal K; DIA-NN documents this flag for that search. It only means
+    // something for a rule that cuts after K, and a non-specific rule enumerates every
+    // span anyway.
+    if rule.cuts_after(b'K')
+        && !rule.is_non_specific()
+        && plan
+            .fixed
+            .iter()
+            .chain(&plan.variable)
+            .any(|m| m.name == "GlyGly" && m.residue == 'K')
     {
         args.push("--no-cut-after-mod".into());
         args.push("UniMod:121".into());
@@ -1554,7 +1593,7 @@ fn predict_args(req: &BuildRequest, plan: &ModPlan, out_lib: &Path) -> Vec<Strin
     args.push(out_lib.display().to_string());
     args.push("--threads".into());
     args.push(req.threads.to_string());
-    args
+    Ok(args)
 }
 
 /// Predict a library with the user's DIA-NN, then convert it to MuMDIA's schema.
@@ -1634,7 +1673,13 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
                 return;
             }
         };
-        let args = predict_args(&req, &plan, &out_lib);
+        let args = match predict_args(&req, &plan, &out_lib) {
+            Ok(a) => a,
+            Err(e) => {
+                builder.fail(e);
+                return;
+            }
+        };
 
         let version_for_cache = status.version.clone();
         builder.log(format!("== DIA-NN: {}", status.version.unwrap_or_default()));
@@ -1859,6 +1904,8 @@ mod tests {
         let err = build(
             Arc::new(Builder::default()),
             BuildRequest {
+                enzyme: d_enzyme(),
+                cleavage_rule: None,
                 fasta: "nonexistent.fasta".into(),
                 out_dir: ".".into(),
                 missed_cleavages: 1,
@@ -2266,6 +2313,8 @@ mod tests {
         BuildRequest {
             fasta: fasta.to_string(),
             out_dir: String::new(),
+            enzyme: d_enzyme(),
+            cleavage_rule: None,
             missed_cleavages: 1,
             min_pep_len: 7,
             max_pep_len: 30,
@@ -2278,6 +2327,45 @@ mod tests {
             variable_mods: vec![],
             max_variable_mods: 1,
         }
+    }
+
+    /// The cleavage choice reaches DIA-NN's `--cut`; a non-specific rule asks for the
+    /// missed cleavages a peptide of the maximum length spans and drops the GlyGly
+    /// no-cut rule; a custom rule passes through; Trypsin/P is the default and the
+    /// argument list it always was; a malformed custom rule is refused.
+    #[test]
+    fn the_cleavage_choice_reaches_the_diann_arguments() {
+        let value = |args: &[String], flag: &str| -> String {
+            let i = args.iter().position(|a| a == flag).unwrap();
+            args[i + 1].clone()
+        };
+        let base = a_request("x.fasta");
+        let args = predict_args(&base, &ModPlan::of(&base).unwrap(), Path::new("o")).unwrap();
+        assert_eq!(value(&args, "--cut"), "K*,R*");
+        assert_eq!(value(&args, "--missed-cleavages"), "1");
+
+        let mut ns = a_request("x.fasta");
+        ns.enzyme = "non_specific".into();
+        ns.min_pep_len = 10;
+        ns.max_pep_len = 10;
+        ns.variable_mods = vec![site("GlyGly", 'K')];
+        let args = predict_args(&ns, &ModPlan::of(&ns).unwrap(), Path::new("o")).unwrap();
+        assert_eq!(value(&args, "--cut"), "**");
+        assert_eq!(value(&args, "--missed-cleavages"), "9");
+        assert!(!args.iter().any(|a| a == "--no-cut-after-mod"), "{args:?}");
+
+        let mut cu = a_request("x.fasta");
+        cu.enzyme = "custom".into();
+        cu.cleavage_rule = Some("E*,D*".into());
+        let args = predict_args(&cu, &ModPlan::of(&cu).unwrap(), Path::new("o")).unwrap();
+        assert_eq!(value(&args, "--cut"), "E*,D*");
+        cu.cleavage_rule = Some("E*,DXP".into());
+        assert!(predict_args(&cu, &ModPlan::of(&cu).unwrap(), Path::new("o")).is_err());
+
+        // An old request without the fields reads as Trypsin/P.
+        let old: BuildRequest =
+            serde_json::from_str(r#"{"fasta": "x.fasta", "out_dir": "o"}"#).unwrap();
+        assert_eq!(cut_rule(&old).unwrap(), "K*,R*");
     }
 
     #[test]
@@ -2310,6 +2398,12 @@ mod tests {
             |r: &mut BuildRequest| r.max_charge = 5,
             |r: &mut BuildRequest| r.carbamidomethyl = false,
             |r: &mut BuildRequest| r.oxidation = false,
+            |r: &mut BuildRequest| r.enzyme = "lys_c".into(),
+            |r: &mut BuildRequest| r.enzyme = "non_specific".into(),
+            |r: &mut BuildRequest| {
+                r.enzyme = "custom".into();
+                r.cleavage_rule = Some("K*,R*,D*,!*P".into());
+            },
         ] {
             let mut r = a_request(path);
             mutate(&mut r);
@@ -2419,7 +2513,7 @@ mod tests {
         // it structurally misses those peptides -- 209 of DIA-NN's own 1% peptides on
         // the AIF benchmark, every one of them this form.
         let req = a_request("x.fasta");
-        let args = predict_args(&req, &ModPlan::of(&req).unwrap(), Path::new("out/lib"));
+        let args = predict_args(&req, &ModPlan::of(&req).unwrap(), Path::new("out/lib")).unwrap();
         assert!(
             args.iter().any(|a| a == "--met-excision"),
             "the recipe must emit Met-excised peptides: {args:?}"
@@ -2459,8 +2553,8 @@ PEPTIDEK
         assert!(pf.is_legacy() && pl.is_legacy());
         let out = Path::new("out/lib");
         assert_eq!(
-            predict_args(&flags, &pf, out),
-            predict_args(&lists, &pl, out)
+            predict_args(&flags, &pf, out).unwrap(),
+            predict_args(&lists, &pl, out).unwrap()
         );
         assert_eq!(
             library_cache_dir(&flags, "DIA-NN 2.0").unwrap(),
@@ -2494,7 +2588,7 @@ PEPTIDEK
         r.max_variable_mods = 2;
         let plan = ModPlan::of(&r).unwrap();
         assert!(!plan.is_legacy());
-        let args = predict_args(&r, &plan, Path::new("out/lib"));
+        let args = predict_args(&r, &plan, Path::new("out/lib")).unwrap();
         let after = |flag: &str| -> Vec<String> {
             args.iter()
                 .enumerate()

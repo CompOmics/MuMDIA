@@ -107,6 +107,21 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Added
+
+- **Cleavage rules: presets, custom rules and non-specific digestion.** `digest.enzyme`
+  gains `lys_c`, `lys_n`, `arg_c`, `asp_n`, `glu_c`, `chymotrypsin`, `non_specific` and
+  `custom` with `digest.cleavage_rule`, written in the residue-pair syntax of DIA-NN
+  `--cut` (`K*,R*,!*P` is trypsin, `**` every bond). Under a rule that cuts every bond the
+  digest enumerates every peptide of `min_len..=max_len` residues, for immunopeptidomics
+  and peptidomics, with `missed_cleavages` and Met excision not applied. The desktop
+  application's Search screen has a Cleavage choice that reaches the DIA-NN library build
+  (`--cut`), the built-in engine path and the search-space estimate. Tryptic digests are
+  byte-identical to before, and existing configuration hashes and cached libraries are
+  unchanged (docs/05_digest_peptidoforms.md, "Cleavage rules").
+
 ## [0.7.1] - 2026-10-21
 
 ### Changed

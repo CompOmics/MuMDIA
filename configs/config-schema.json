@@ -1000,8 +1000,29 @@
       "source_struct": "DigestConfig",
       "choices": [
         "trypsin_p",
-        "trypsin"
+        "trypsin",
+        "lys_c",
+        "lys_n",
+        "arg_c",
+        "asp_n",
+        "glu_c",
+        "chymotrypsin",
+        "non_specific",
+        "custom"
       ]
+    },
+    {
+      "path": "digest.cleavage_rule",
+      "name": "cleavage_rule",
+      "section": "digest",
+      "rust_type": "Option<String>",
+      "kind": "other",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "The cleavage rule of `enzyme = \"custom\"`: residue pairs around the cut separated by commas, `*` for any residue, a leading `!` for a pair never cut (the syntax of DIA-NN `--cut`), e.g. `K*,R*,D*,!*P`. Only with `enzyme = \"custom\"`. Omitted from the canonical configuration when unset.",
+      "gates": [],
+      "source_struct": "DigestConfig"
     },
     {
       "path": "digest.missed_cleavages",

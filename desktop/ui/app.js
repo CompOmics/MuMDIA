@@ -208,6 +208,7 @@ async function init() {
     t.addEventListener("click", () => setMode(t.dataset.mode));
   }
   await initMods();
+  await initCleavage();
   initSearchOptions();
   for (const r of document.querySelectorAll('input[name="runmode"]')) {
     r.addEventListener("change", () => (state.runMode = r.value));
@@ -1339,9 +1340,12 @@ function libraryParams(fasta) {
     const v = parseInt(el.value, 10);
     return Number.isFinite(v) ? v : dflt;
   };
+  const enzyme = $("d-enzyme") ? $("d-enzyme").value : "trypsin_p";
   return {
     fasta,
     out_dir: "",
+    enzyme,
+    cleavage_rule: enzyme === "custom" ? ($("d-rule").value || "").trim() : null,
     missed_cleavages: n("d-missed", 1),
     min_pep_len: n("d-minlen", 7),
     max_pep_len: n("d-maxlen", 30),
@@ -1367,7 +1371,10 @@ function libraryParams(fasta) {
 // choices survive. Modification lists are the whole list: an unticked box means none.
 function digestOverrides() {
   const d = libraryParams("");
+  const cleavage = { "digest.enzyme": d.enzyme };
+  if (d.enzyme === "custom") cleavage["digest.cleavage_rule"] = d.cleavage_rule;
   return {
+    ...cleavage,
     "digest.missed_cleavages": d.missed_cleavages,
     "digest.min_len": d.min_pep_len,
     "digest.max_len": d.max_pep_len,
@@ -1478,6 +1485,53 @@ function loadMods() {
       state.mods.set(key, kind);
     }
   }
+}
+
+// ── cleavage ────────────────────────────────────────────────────────────────
+// The presets are the engine's own `enzymes.json` (through the `enzymes` command), so a
+// rule offered here is one the engine's digest and the DIA-NN build both apply. A custom
+// rule uses DIA-NN's `--cut` pair syntax. Under a rule that cuts every bond peptides are
+// enumerated by length, so the missed-cleavage count does not apply.
+let ENZYMES = [{ name: "trypsin_p", label: "Trypsin/P", note: "after K or R, also before P", rule: "K*,R*" }];
+
+function cleavageChanged() {
+  const name = $("d-enzyme").value;
+  const p = ENZYMES.find((e) => e.name === name) || ENZYMES[0];
+  show($("d-rule-row"), name === "custom");
+  const nonSpecific = p.rule === "**" || (name === "custom" && ($("d-rule").value || "").trim() === "**");
+  $("d-missed").disabled = nonSpecific;
+  const rule = name === "custom" ? "pairs around the cut, * any residue, ! never cut" : p.rule;
+  $("d-enzyme-note").textContent =
+    `${p.label}: ${p.note}${rule ? ` (rule ${rule})` : ""}.` +
+    (nonSpecific ? " Missed cleavages do not apply; the search space grows with the length range." : "");
+  try { localStorage.setItem("mumdia.cleavage", JSON.stringify({ name, rule: $("d-rule").value })); } catch {}
+  if (state.libSrc === "diann") refreshLibSrcNote();
+  scheduleSpace();
+}
+
+async function initCleavage() {
+  try {
+    ENZYMES = await invoke("enzymes");
+  } catch {}
+  const sel = $("d-enzyme");
+  sel.innerHTML = "";
+  for (const e of ENZYMES) {
+    const o = document.createElement("option");
+    o.value = e.name;
+    o.textContent = e.label;
+    sel.appendChild(o);
+  }
+  sel.value = "trypsin_p";
+  try {
+    const saved = JSON.parse(localStorage.getItem("mumdia.cleavage") || "null");
+    if (saved && ENZYMES.some((e) => e.name === saved.name)) {
+      sel.value = saved.name;
+      $("d-rule").value = saved.rule || "";
+    }
+  } catch {}
+  sel.addEventListener("change", cleavageChanged);
+  $("d-rule").addEventListener("change", cleavageChanged);
+  cleavageChanged();
 }
 
 async function initMods() {
@@ -1707,6 +1761,8 @@ function spaceRequest(libPrecursors) {
     mode: library ? "library" : "fasta",
     fasta: state.picks.fasta || null,
     lib_precursors: library || null,
+    enzyme: d.enzyme,
+    cleavage_rule: d.cleavage_rule,
     missed_cleavages: d.missed_cleavages,
     min_len: d.min_pep_len,
     max_len: d.max_pep_len,

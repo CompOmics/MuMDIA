@@ -8,9 +8,10 @@ These two stages build the run-independent, experiment-wide peptide search space
 from a FASTA file, before any spectra are touched. They run once per experiment
 and their outputs are reused across all runs.
 
-- **digest** (Stage A) performs a fully-tryptic in-silico digest of the input
-  proteins (also emitting the initiator-methionine-excised form of each
-  protein-N-terminal peptide by default, see "How it works"), deduplicates the
+- **digest** (Stage A) performs an in-silico digest of the input proteins under a
+  cleavage rule (Trypsin/P by default; other presets, a custom rule or non-specific
+  cleavage, see "Cleavage rules"), also emitting the initiator-methionine-excised
+  form of each protein-N-terminal peptide by default (see "How it works"), deduplicates the
   resulting peptides by stripped sequence, and mints a collision-checked, paired
   target-decoy null (reverse or seeded scramble). Output is one
   `peptides.parquet` table of stripped target and decoy sequences with a
@@ -101,14 +102,15 @@ recipe").
 ### digest (digest.rs:184 `run`)
 
 1. **Parse FASTA** with `read_fasta` (digest.rs:25).
-2. **Per-protein cleavage** in `cleavage_sites` (digest.rs:52). Sites is seeded
-   with `0`, then for each residue that is `K` or `R` a cut index `i+1` is pushed;
-   Trypsin/P (`Enzyme::TrypsinP`, the default) always cuts, classic `Enzyme::Trypsin`
-   suppresses the cut when the next residue is `P` (`before_p`, digest.rs:57). The
-   sequence length is appended as a final site if not already present
-   (digest.rs:67). Sites are strictly increasing, so peptides are contiguous
-   half-open `[start, end)` spans.
-3. **Peptide enumeration** in `digest_protein` (digest.rs:75). For every ordered
+2. **Per-protein cleavage** by the configuration's rule (`DigestConfig::rule`,
+   `mumdia_core::cleavage::CleavageRule::sites`, see "Cleavage rules"). Sites is seeded
+   with `0`, then a cut index `i` is pushed wherever the bond between `seq[i-1]` and
+   `seq[i]` is cut; Trypsin/P (`Enzyme::TrypsinP`, the default, rule `K*,R*`) cuts after
+   every K and R, classic `Enzyme::Trypsin` (`K*,R*,!*P`) not before P. The sequence
+   length is appended as a final site if not already present. Sites are strictly
+   increasing, so peptides are contiguous half-open `[start, end)` spans. A rule that
+   cuts every bond takes the length-window branch of step 3 instead.
+3. **Peptide enumeration** in `digest_with`. For every ordered
    pair of sites `(i, j)` with `i < j`, the number of missed cleavages is
    `j - i - 1`; the inner loop `break`s once that exceeds `cfg.missed_cleavages`
    (digest.rs:81), so at most `missed_cleavages + 1` fragments are joined. Length
@@ -286,8 +288,9 @@ run.rs:136).
 
 | Field | Section | Default | Effect |
 |---|---|---|---|
-| `enzyme` | digest | `TrypsinP` | `trypsin_p` cuts after K/R including before P; `trypsin` suppresses the cut before P |
-| `missed_cleavages` | digest | `2` | Max missed cleavages; joins at most `missed_cleavages + 1` tryptic fragments |
+| `enzyme` | digest | `trypsin_p` | Cleavage preset (`trypsin_p`, `trypsin`, `lys_c`, `lys_n`, `arg_c`, `asp_n`, `glu_c`, `chymotrypsin`, `non_specific`) or `custom`; see "Cleavage rules" |
+| `cleavage_rule` | digest | unset | The rule of `enzyme = "custom"`, DIA-NN `--cut` pair syntax, e.g. `K*,R*,D*,!*P` |
+| `missed_cleavages` | digest | `2` | Max missed cleavages; joins at most `missed_cleavages + 1` fragments between sites. Not applied under a non-specific rule |
 | `min_len` | digest | `5` | Minimum peptide length (residues) |
 | `max_len` | digest | `50` | Maximum peptide length (residues) |
 | `decoy.strategy` | digest | `reverse` | `reverse` / `scramble` realized; `diann_shift` and `none` produce no decoy (`diann_shift` rejected by `validate`) |
@@ -402,13 +405,57 @@ types elsewhere, not here). `DecoyConfig` (config.rs:172) carries only
   `digest`/`peptidoforms`; the FASTA-build branch is the `_ =>` arm at run.rs:127.
   Do not assume `peptides.parquet` / `peptidoforms.parquet` exist for every run.
 
+## Cleavage rules
+
+`digest.enzyme` names a preset, or `custom` with the rule in `digest.cleavage_rule`. A
+rule is written in the residue-pair syntax of DIA-NN `--cut`: pairs (residue before the
+cut, residue after it) separated by commas, `*` for any residue, a leading `!` for a
+pair that is never cut. A bond is cut when some positive pair matches and no `!` pair
+does. The desktop application's DIA-NN library build passes the same text to `--cut`, so
+a library built either way follows one rule.
+
+| `digest.enzyme` | Rule | Cuts |
+|---|---|---|
+| `trypsin_p` (default) | `K*,R*` | after K or R, also before P |
+| `trypsin` | `K*,R*,!*P` | after K or R, not before P |
+| `lys_c` | `K*` | after K |
+| `lys_n` | `*K` | before K |
+| `arg_c` | `R*,!*P` | after R, not before P |
+| `asp_n` | `*D` | before D |
+| `glu_c` | `E*` | after E (bicarbonate buffer; `E*,D*` as a custom rule for phosphate buffer) |
+| `chymotrypsin` | `F*,Y*,W*,!*P` | after F, Y or W, not before P (high specificity) |
+| `non_specific` | `**` | every bond |
+| `custom` | `digest.cleavage_rule` | e.g. `K*,R*,D*,!*P`, or `F*,Y*,W*,L*,M*,!*P` for low-specificity chymotrypsin |
+
+The presets live in `mumdia-core/src/enzymes.json`, which the desktop application
+includes as well; the engine (`mumdia_core::cleavage`) and the application
+(`desktop/src-tauri/src/enzymes.rs`) are both tested against its `test_vectors`.
+`digest.cleavage_rule` is valid only with `enzyme = "custom"` (`Config::validate`
+refuses it otherwise, and refuses a rule that does not parse), and it is omitted from
+the canonical configuration when unset, so existing configuration hashes and library
+cache keys do not change.
+
+**Non-specific cleavage.** A rule whose only positive pair is `**` with no `!` pair
+(`non_specific`) enumerates every window of `min_len..=max_len` standard residues
+(`digest_non_specific`): `missed_cleavages` does not apply, and N-terminal Met excision
+adds nothing, because the excised form is the window starting at position 1. The report
+records `missed_cleavages` as null. A human proteome gives about one peptide per residue
+and length: about 11 million distinct 10-mers, about 60 million 8- to 12-mers. The digest
+logs the number of windows it will enumerate and warns above 3 x 10^8, because every
+distinct peptide, its decoy and the collision sets are held in memory. Decoys keep the
+C-terminal residue as for any rule; targets and their reversed decoys stay exchangeable.
+
+The tryptic presets reproduce the former hard-coded trypsin cut exactly (test
+`trypsin_presets_reproduce_the_legacy_sites` on 4,000 random sequences), and a tryptic
+digest's `peptides.parquet` and report are byte-identical to those before the change.
+
 ## How to extend / modify
 
-- **New enzyme.** Add a variant to `Enzyme` (config.rs:46) and a match arm in
-  `cleavage_sites` (digest.rs:58). Keep the site list strictly increasing and
-  terminated at `seq.len()`; the rest of `digest_protein` is enzyme-agnostic.
-  Semi-tryptic search would require changing how spans are enumerated in
-  `digest_protein` (digest.rs:75), not just the cut list.
+- **New enzyme.** Add the preset to `mumdia-core/src/enzymes.json` and a variant to
+  `Enzyme` with its `name()` (config.rs); `every_preset_parses_...` and the config
+  round-trip test check that the two agree. A rule that the pair syntax cannot express
+  is a `custom` rule in most cases. Semi-specific digestion (one terminus enzymatic)
+  would need a different span enumeration in `digest_with`, not just a rule.
 - **New decoy scheme.** Add a `DecoyStrategy` variant (config.rs:17) and a match
   arm in `make_decoy` (digest.rs:107). Preserve the C-terminal residue and
   determinism (seed the PRNG from the sequence as scramble does, digest.rs:117).
