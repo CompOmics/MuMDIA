@@ -144,8 +144,9 @@ On a run whose seed carries `observed_im`, and only there, `cal.json` also holds
 of section 7 (`im_method`, `im_n_train`, `im_global`, `im_per_charge`, `w_im`, `w_im_sizing`,
 `p_im`, `im_window_multiplier`, `im_window_min`, `im_holdout_frac`, `im_n_holdout`,
 `im_holdout_resid_abs_median`, `im_holdout_resid_p_im`, `im_in_sample_resid_abs_median`;
-docs/15 has the table), and the report's stats gain `im_n_train` and `w_im`. A 3D `cal.json`
-is unchanged.
+docs/15 has the table; under `im_window_sizing = seed_decoy_corrected`, the default, also the
+`im_window_sizing` block of section 7), and the report's stats gain `im_n_train` and `w_im`.
+A 3D `cal.json` is unchanged.
 
 Every "median" among the three is the nearest-rank `percentile(.., 0.5)`
 (calibrate.rs:156-164), not an interpolated median.
@@ -938,7 +939,8 @@ Then `cal.json` is written and the artifact report is emitted.
 
 A run whose spectra carry per-peak 1/K0 has a seed with `observed_im` (`seed_psms` v2,
 docs/07 step 6): the intensity-weighted median 1/K0 of each confident target's matched
-fragment peaks at its best scan. The stage notices the column in the seed's footer and only
+fragment peaks at its best scan, and under the default `im_window_sizing =
+seed_decoy_corrected` of every other PSM up to `im_window_sizing_q` as well (below). The stage notices the column in the seed's footer and only
 then decodes the library's `predicted_im`, in the same span-aware open that reads
 `candidate_id` and `predicted_irt` (`library_irt`), with NaN for a null. The anchors join it
 through the same candidate-id-to-row join as the iRT (`CidJoin`), so a library row gives both
@@ -947,9 +949,13 @@ values. A 3D run reads no 1/K0 at all.
 Anchors are the confident targets of the seed (`spectrum_q < q_train`, `label = target`)
 with a finite, positive observed and predicted 1/K0, one per candidate rather than one per
 base peptide, because 1/K0 depends on charge where retention time does not. They are sorted
-by candidate id before any fit. The cut is the `q_train` the stage is given, so on a seed
-short of anchors the orchestrators' relaxed cut (`anchor_q_ladder` through `plan_anchors` and
-`with_anchor_cut`) applies to the IM anchors as it does to the RT anchors.
+by candidate id before any fit. The cut is the `q_train` the stage is given and, from the
+orchestrators and the standalone stage, also the seed's own confident cut
+(`search_seed.fdr_seed`, `RtImTrainParams::im_anchor_q`). On a seed short of anchors the
+relaxed cut (`anchor_q_ladder` through `plan_anchors` and `with_anchor_cut`) therefore adds RT
+anchors but no IM anchors. This was already the effect before the decoy-corrected sizing,
+because only the confident targets carried `observed_im`; the sizing gives weaker rows one,
+and the seed cut keeps them out of the calibration.
 
 The fit is linear in collision cross section, where the dependence on m/z and charge is
 removed: each 1/K0 is converted to CCS at the precursor m/z and charge
@@ -959,12 +965,14 @@ with fewer than `im_min_anchors_per_charge` anchors (default 50) uses the global
 calibrated 1/K0 of a library row is the fit applied to its CCS, converted back at its m/z
 and charge (`ccs_to_im`).
 
-`w_im` is always sized out of sample. The anchors are split by base peptide with the RT
+The anchors' `w_im` is always sized out of sample. The anchors are split by base peptide with the RT
 holdout rule (`base_peptide_id % 1000 < 300`, `IM_HOLDOUT_FRAC = 0.3`, a constant: the
 `window_holdout_frac` key also drives the DeepLC fine-tune and multi-head exclusion and is
 exclusive with `adaptive_rt_window`), the fit is repeated on the training side, and `w_im` is
 the `p_im` percentile (default 0.95) of the held-out absolute residuals times
-`im_window_multiplier` (default 1.0), floored at `im_window_min` (default 0.005 V s cm^-2).
+`im_window_multiplier` (default 1.3 since 2026-10-22, 1.0 before), floored at `im_window_min`
+(default 0.005 V s cm^-2). The default `im_window_sizing = seed_decoy_corrected` can then
+widen it (below).
 The calibration applied to the library still uses every anchor. With fewer than 20 held-out
 anchors or fewer than `min_seed_for_calibration` training anchors the width is sized
 in-sample, with a warning, and `w_im_sizing` says `holdout_fallback_in_sample`. With fewer than
@@ -982,6 +990,79 @@ There is no refit of the IM calibration on identifications and no robust anchor 
 are outside this stage (docs/35 section 7). Whether an OLS per charge or a robust fit under a relaxed
 anchor cut is better is unmeasured. A grouped run is refused on diaPASEF input, and its shared
 fit (`fit_from_seed`) joins no library rows, so it fits no IM calibration.
+
+#### The 1/K0 window from the whole seed, decoy-corrected (default since 2026-10-22)
+
+The anchors are the confident seed targets. The working hypothesis is that on a run with few
+of them, or a peptide class the 1/K0 predictor handles less well, they are the peptides it
+predicts best, so the percentile of their residuals is too narrow for the rest of the
+identifiable population, and the 1/K0 gate then removes true fragment peaks. It rests on one
+synthetic HLA-I pool (below). `rt_im_train.im_window_sizing = "seed_decoy_corrected"` (the
+default; `anchors` restores the previous sizing) sizes the window from every seed PSM instead.
+The seed search matches fragment peaks without a 1/K0 window, so its residuals are not
+truncated by one. The window acts only where it is read: through the 1/K0 gate
+(`extract.im_gate`, off by default, `fragments` in the diaPASEF recipe) and retrace (also a
+recipe setting). The calibration itself, `im_pred_cal`, which the support gate and the IM
+features read, does not change.
+
+- search-seed records `observed_im` for every PSM, target or decoy, with `spectrum_q` at most
+  `im_window_sizing_q` (default 0.1), by the anchors' rule (the intensity-weighted median 1/K0
+  of the nearest peak to each library fragment within the search tolerance). It does so in a
+  separate pass after the calibrant loop, so the mass calibration does not change.
+- Stage B applies the anchor calibration to each of those PSMs and takes the `p_im` percentile
+  of the true hits' residuals: at a residual `r`, the targets minus the decoys with a residual
+  of at most `r`, over all targets minus all decoys, because a false target is distributed as
+  a decoy (`decoy_corrected_quantile`).
+- That estimate times `im_window_multiplier`, floored at `im_window_min`, replaces the anchors'
+  `w_im` (which carries the same multiplier) only when it is wider. It is not used when the
+  targets minus the decoys are fewer than 100 (`SEED_SIZING_MIN_TRUE`), or when no decoy
+  carries an observed 1/K0, which means the seed was written without the extra pass (an older
+  engine, or `search-seed` under `anchors`); both cases log a warning.
+- The anchors, and so the calibration, are those of `anchors` sizing: the extra rows enter
+  only the estimate (the seed's confident cut above).
+- `cal.json` gains an `im_window_sizing` block (`mode`, `q_max`, `seed_targets`, `seed_decoys`,
+  `decoy_corrected_p_im`, `applied`), and `w_im_sizing` says `seed_decoy_corrected` when the
+  estimate was applied.
+
+A run without 1/K0 has no IM calibration and is not affected: the seed records nothing extra,
+and every 3D artifact, report and config hash is byte-identical. The estimate had settled at
+q 0.1 on every run measured (0.05 to 0.3 checked).
+
+Measured 2026-10-21 and 2026-10-22 with the diaPASEF recipe (`configs/examples/diapasef.json`,
+1/K0 gate on), NN seeds as stated, one host per data set:
+
+- single runs: stripped peptides at peptide q 1%;
+- six-run experiments: the mean per-run count on `run_psm_q`, then the experiment-wide
+  `peptides.tsv` rows;
+- entrapment FDP: `(r * E + 1) / R` at peptide q 1%, with `r` = 0.5746.
+
+| data | `anchors` x1.0 (before) | `seed_decoy_corrected` x1.0 | `seed_decoy_corrected` x1.3 (default) |
+|---|---|---|---|
+| E. coli diaPASEF 15 min, 3 seeds: peptides | 13,940 | 13,952 | 14,025 |
+| the same run on an E. coli + human entrapment library: real peptides, FDP | 13,043, 0.34-0.39% | 13,176, 0.34-0.42% | 13,430, 0.39-0.43% |
+| HYE diaPASEF 5 min, 6 runs, 2 seeds: per run, experiment-wide | 33,346, 38,500 | 33,493, 38,680 | 33,262, 38,563 |
+| HYE diaPASEF 60 min (ProteoBench), 6 runs, 1 seed: per run, experiment-wide | 84,751, 95,871 | 84,635, 96,145 | 83,897, 96,082 |
+| the same: ProteoBench ions at `min_obs` 3, median absolute epsilon global / species-equalised | 99,113, 0.136 / 0.205 | 99,209, 0.136 / 0.203 | 98,642, 0.135 / 0.202 |
+| synthetic HLA-I pool of 1,000 peptides, 2 runs, non-specific 8-12-mer library of 379M precursors, 1 seed, per-run RT bootstrap, no second pass: exact pool sequences | 499 | 663 | pending |
+| `w_im`, V s cm^-2: E. coli; HYE 5 min; ProteoBench; HLA pool | not recorded; not recorded; 0.040; not recorded | 0.039; 0.035; 0.041; 0.053 and 0.057 | 0.051; 0.046; 0.053; pending |
+
+Against the previous default (`anchors` x1.0), x1.3:
+
+- E. coli: +0.6% peptides, with every seed above every seed of both other arms.
+- E. coli entrapment library: +3.0% real peptides, at an FDP of 0.39-0.43% against 0.34-0.39%.
+- HYE 5 min: -0.25% per run (lower than `seed_decoy_corrected` x1.0 on both seeds, -0.7%),
+  +0.2% experiment-wide.
+- ProteoBench: -1.0% per run, +0.2% experiment-wide, -0.5% ions, with epsilon equal or
+  slightly lower. This is one seed per arm, so it is not a measurement in the sense of
+  CLAUDE.md.
+
+On the bulk data, x1.3 therefore trades up to about 1% of the per-run counts on HYE for the
+E. coli and entrapment gains. The HLA pool is where the window matters. Its seed had 1,104 and
+1,045 targets at q 0.1, against 109 decoys on the first run. At x1.0 the decoy-corrected
+estimate set `w_im` to 0.053 and 0.057; the anchors' `w_im` on this pool was not recorded. On
+the same pool, the anchors' window widened 2.5x found 722 pool sequences, and the 1/K0 gate
+switched off found 709. Fixed floors of 0.041 and 0.05 on the anchors' window found 604 and
+646. x1.3 was chosen for this pool class.
 
 ### DeepLC multitask fine-tune (orchestrator pre-step, default off)
 
@@ -1207,7 +1288,9 @@ though the enum variant still exists.
 | `deeplc_predict_shards` | `0` | Worker processes for the whole-library DeepLC prediction (multi-head calibration, base-model re-prediction, the prediction after a fine-tune; `deeplc_finetune.py --shards`). The fit happens once, in the parent process, and is handed to every child; each child predicts a slice of the unique sequences cut at a multiple of the 100,000-sequence call, and the slices are joined in order. `K` processes share the thread budget, `budget / K` threads each; `0` is one process per 8 threads, and a GPU always gets one. Bit-identical to one process at equal threads per process, float-equivalent at the same engine thread count. Automatic by default since 2026-09-27 (one process per 8 threads, so one on a desktop budget of 8): 26:00 -> 18:02 and 29:47 -> 21:04 on two six- and five-run experiments with the peptides at 1% inside the seed spread (section "Sharded whole-library prediction"). |
 | `im_min_anchors_per_charge` | `50` | IM calibration (section 7): a charge with fewer anchors uses the global CCS fit. Omitted from the canonical configuration at the default. |
 | `p_im` | `0.95` | Held-out residual percentile that sizes `w_im` (section 7). Omitted from the canonical configuration at the default. |
-| `im_window_multiplier` | `1.0` | Multiplier on that percentile. Omitted from the canonical configuration at the default. |
+| `im_window_multiplier` | `1.3` | Multiplier on that percentile and on the decoy-corrected seed estimate (section 7). 1.0 before 2026-10-22. Omitted from the canonical configuration at the default. |
+| `im_window_sizing` | `seed_decoy_corrected` | How `w_im` is sized: from every seed PSM up to `im_window_sizing_q`, decoy-corrected, never below the anchors' value (section 7); `anchors` is the sizing before 2026-10-22. Does nothing without 1/K0. Omitted from the canonical configuration at the default. |
+| `im_window_sizing_q` | `0.1` | Highest seed `spectrum_q` that enters the decoy-corrected sizing. Omitted from the canonical configuration at the default. |
 | `im_window_min` | `0.005` | Lower clamp of `w_im`, in V s cm^-2. Omitted from the canonical configuration at the default. |
 | `window_holdout_frac` | `0.0` | Size `w_rt` from held-out anchor residuals instead of in-sample ones (section 4b). `base_peptide_id % 1000 < round(frac*1000)` selects the holdout; the same rule excludes those peptides from the orchestrated DeepLC fine-tune. Range `[0.0, 0.9]`, `0.0` = off; mutually exclusive with `adaptive_rt_window`. Benchmark-gated. |
 

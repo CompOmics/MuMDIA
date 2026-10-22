@@ -194,7 +194,7 @@ ion-mobility source (`artifact::fragment_library_precursors(has_im)`). Version 2
 | `predicted_irt` | Float32 | no | iRT units | library predicted iRT (carried) |
 | `matched_peaks` | Int32 | no | - | matched fragment count at the best scan |
 | `scan_index` | UInt32 | no | - | `scan_index` of the best-scoring MS2 scan |
-| `observed_im` | Float64 | yes | 1/K0 (V s cm^-2) | v2 only: the intensity-weighted median 1/K0 of the matched fragment peaks of a confident target (`q <= fdr_seed`) in its best scan, each peak being the calibrant's nearest peak within `fragment_tol_ppm`; null for every other row |
+| `observed_im` | Float64 | yes | 1/K0 (V s cm^-2) | v2 only: the intensity-weighted median 1/K0 of the matched fragment peaks of a confident target (`q <= fdr_seed`) in its best scan, each peak being the calibrant's nearest peak within `fragment_tol_ppm`. Under `rt_im_train.im_window_sizing = seed_decoy_corrected` (the default) every other PSM with `spectrum_q <= im_window_sizing_q`, targets and decoys, carries one by the same rule, for the window sizing only; null for every other row |
 
 Version 1 has the thirteen columns above `observed_im`. Version 2 (`artifact::seed_psms(true)`)
 adds `observed_im` and is written only when the searched spectra carry per-peak 1/K0 (spectra
@@ -284,10 +284,11 @@ holds the ion-mobility block below, and the `run_windows` report's stats gain `i
 | `im_global` | object or null | `{a, b}` of the global fit `obs_ccs = a + b * pred_ccs` |
 | `im_per_charge` | object or null | per charge with at least `im_min_anchors_per_charge` anchors: `{a, b, n}`; other charges use `im_global` |
 | `w_im` | number or null | IM half-window (1/K0) |
-| `w_im_sizing` | string or null | `holdout`, or `holdout_fallback_in_sample` when one side of the split had too few anchors |
+| `w_im_sizing` | string or null | `holdout`, or `holdout_fallback_in_sample` when one side of the split had too few anchors, or `seed_decoy_corrected` when the decoy-corrected seed estimate widened `w_im` |
 | `p_im` | number | residual percentile that sizes `w_im` |
-| `im_window_multiplier` | number | multiplier on that percentile |
+| `im_window_multiplier` | number | multiplier on that percentile and on the decoy-corrected seed estimate |
 | `im_window_min` | number | lower clamp of `w_im` |
+| `im_window_sizing` | object | under `rt_im_train.im_window_sizing = seed_decoy_corrected` (the default) only: `{mode, q_max, seed_targets, seed_decoys, decoy_corrected_p_im, applied}`, the seed PSMs up to `q_max` that entered the estimate, the decoy-corrected `p_im` residual (null when targets minus decoys were fewer than 100) and whether it widened `w_im` |
 | `im_holdout_frac` | number | fraction of anchor base peptides held out (the constant 0.3) |
 | `im_window_floor` | object | second pass of match-between-runs only, on a run whose first pass had a finite `w_im`: `{floor, configured, first_pass_w_im, source}`, the `im_window_min` applied (the larger of the configured value and the first pass's `w_im`) and the first-pass `cal.json` it came from |
 | `im_n_holdout` | integer or null | held-out anchors |
