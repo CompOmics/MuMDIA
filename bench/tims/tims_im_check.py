@@ -94,6 +94,8 @@ def main():
     ap.add_argument("--seed", help="seed_psms.parquet (v2, observed_im)")
     ap.add_argument("--ms1", help="spectra_ms1.parquet (v2, per-peak im)")
     ap.add_argument("--q", type=float, default=0.01)
+    ap.add_argument("--seed-q", type=float, default=0.01,
+                    help="seed spectrum_q of the confident targets (search_seed.fdr_seed)")
     ap.add_argument("--json")
     a = ap.parse_args()
 
@@ -113,8 +115,13 @@ def main():
     if a.seed:
         if "observed_im" not in pq.read_schema(a.seed).names:
             raise SystemExit(f"{a.seed} has no observed_im (seed_psms version 1: no ion mobility)")
-        # One row per candidate; observed_im is filled for confident targets only.
-        seed = pd.read_parquet(a.seed, columns=["candidate_id", "observed_im"]).dropna()
+        # One row per candidate. observed_im is filled for the confident targets, and under
+        # rt_im_train.im_window_sizing = seed_decoy_corrected (the default) also for weaker
+        # targets and decoys up to the sizing cut; keep the confident targets only.
+        seed = pd.read_parquet(a.seed, columns=["candidate_id", "observed_im", "label",
+                                                "spectrum_q"])
+        seed = seed[(seed["label"] == "target") & (seed["spectrum_q"] <= a.seed_q)]
+        seed = seed[["candidate_id", "observed_im"]].dropna()
         df = df.merge(seed.rename(columns={"observed_im": "seed_obs"}), on="candidate_id",
                       how="left")
     if a.ms1:

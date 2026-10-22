@@ -96,7 +96,7 @@ a candidate that always ranks below `report_psms` gets no row even if it cleared
 | `predicted_irt` | f32 | library iRT, copied through (unused in scoring) |
 | `matched_peaks` | i32 | matched-fragment count at the best scan |
 | `scan_index` | u32 | `scan_index` of the best-scoring scan |
-| `observed_im` | f64, nullable | v2 only: observed 1/K0 of a confident target (step 6) |
+| `observed_im` | f64, nullable | v2 only: observed 1/K0 of a confident target and, under `rt_im_train.im_window_sizing = seed_decoy_corrected` (the default), of every other PSM up to `im_window_sizing_q` (step 6) |
 
 The seed is version 2 (`artifact::seed_psms(true)`), with the `observed_im` column and the
 report stat `with_observed_im`, only when the searched scans carry per-peak 1/K0 (spectra v2,
@@ -296,9 +296,14 @@ total). Fragments inherit the precursor's mobility in diaPASEF, because the TIMS
 precedes fragmentation, so the median over the matched fragments is the precursor's 1/K0
 at its best scan, and an intense fragment outweighs a faint interferer at another 1/K0. The
 1/K0 point of a fragment is the peak whose deviation calibrates the mass, so a 3D run's
-calibrants are unchanged by the shared helper. Decoys, unconfident targets and a target
-without a matched peak in tolerance get null. rt-im-train calibrates the library's
-`predicted_im` against these values (docs/08_rt_im_train.md, "Ion-mobility calibration").
+calibrants are unchanged by the shared helper. Under `rt_im_train.im_window_sizing =
+seed_decoy_corrected`, the default (`SearchSeedParams::observed_im_q`), a separate pass after
+the calibrant walk gives every other PSM with `spectrum_q` at most `im_window_sizing_q`
+(default 0.1), targets and decoys, an `observed_im` by the same rule; rt-im-train uses those
+rows only to size the 1/K0 window, and takes its anchors from the confident targets alone.
+Under `anchors`, decoys and unconfident targets get null. A row without a matched peak in
+tolerance gets null either way. rt-im-train calibrates the library's `predicted_im` against
+these values (docs/08_rt_im_train.md, "Ion-mobility calibration").
 The grouped seed pool does not carry the column yet: a grouped run is refused on diaPASEF
 input (docs/35_diapasef.md section 3).
 

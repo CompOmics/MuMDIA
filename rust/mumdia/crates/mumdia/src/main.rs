@@ -1431,6 +1431,7 @@ fn real_main() -> Result<()> {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::search_seed::run(stages::search_seed::SearchSeedParams {
+                observed_im_q: cfg.rt_im_train.seed_observed_im_q(),
                 precursor_span: None,
                 fragment_offset: None,
                 // Standalone: this invocation decodes the run itself.
@@ -1484,6 +1485,7 @@ fn real_main() -> Result<()> {
                 cfg: &cfg.rt_im_train,
                 config_hash: &ch,
                 im_window_floor: None,
+                im_anchor_q: Some(cfg.search_seed.fdr_seed),
             })?;
         }
         Cmd::SubLibrary {

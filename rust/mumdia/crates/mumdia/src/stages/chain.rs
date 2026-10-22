@@ -108,6 +108,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         cfg: &rt_cfg,
         config_hash: ch,
         im_window_floor: extras.im_window_floor,
+        im_anchor_q: Some(cfg.search_seed.fdr_seed),
     })?;
     keep(
         &mut manifest,

@@ -39,6 +39,13 @@ pub struct RtImTrainParams<'a> {
     /// The second pass of match-between-runs raised `cfg.im_window_min` to this run's
     /// first-pass `w_im`; recorded in `cal.json` as `im_window_floor`. `None` everywhere else.
     pub im_window_floor: Option<ImWindowFloor<'a>>,
+    /// The seed's own confident cut (`search_seed.fdr_seed`): an ion-mobility anchor must be
+    /// at or below it as well as below `cfg.q_train`. Until `im_window_sizing =
+    /// seed_decoy_corrected` only those targets carried `observed_im`, so a relaxed anchor
+    /// cut (`anchor_q_ladder`) never added IM anchors; the sizing gives weaker rows an
+    /// `observed_im` for its window estimate, and this keeps them out of the calibration.
+    /// `None`: `cfg.q_train` alone.
+    pub im_anchor_q: Option<f64>,
 }
 
 /// Where a run's 1/K0 window floor came from, when the second pass raised it
@@ -732,7 +739,14 @@ fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(Written, Option<R
     } else {
         CidJoin::new(&lib.cid)
     };
-    let fit = fit_anchors(p.seed_psms, p.cfg, &join, &lib.irt, lib.im.as_deref())?;
+    let fit = fit_anchors(
+        p.seed_psms,
+        p.cfg,
+        &join,
+        &lib.irt,
+        lib.im.as_deref(),
+        p.im_anchor_q,
+    )?;
     // Its hash-map form has drop glue, so end it here explicitly.
     drop(join);
     write_windows(
@@ -925,7 +939,7 @@ pub fn with_anchor_cut(cfg: &RtImTrainConfig, plan: &AnchorPlan) -> RtImTrainCon
 /// `groups.calibration = global`. No library is read.
 pub fn fit_from_seed(seed_psms: &str, cfg: &RtImTrainConfig) -> Result<RtFit> {
     check_cfg(cfg)?;
-    fit_anchors(seed_psms, cfg, &CidJoin::Unused, &[], None)
+    fit_anchors(seed_psms, cfg, &CidJoin::Unused, &[], None, None)
 }
 
 /// Write the windows of `p.library_precursors` and its `cal.json` from a fit made by
@@ -964,6 +978,7 @@ fn fit_anchors(
     join: &CidJoin,
     lib_irt: &[f32],
     lib_im: Option<&[f64]>,
+    im_anchor_q: Option<f64>,
 ) -> Result<RtFit> {
     let holdout_frac = cfg.window_holdout_frac;
     // Training rows: confident seed PSMs, one apex (best score) per peptide;
@@ -1055,7 +1070,17 @@ fn fit_anchors(
     // The ion-mobility calibration, on a seed with 1/K0 only.
     let im_reported = seed.has_column("observed_im");
     let im = if im_reported {
-        im_from_seed(&seed, &s_cid, &s_base, &s_q, &s_label, cfg, join, lib_im)?
+        im_from_seed(
+            &seed,
+            &s_cid,
+            &s_base,
+            &s_q,
+            &s_label,
+            cfg,
+            join,
+            lib_im,
+            im_anchor_q,
+        )?
     } else {
         None
     };
@@ -1582,6 +1607,18 @@ fn write_windows(
         {
             obj.extend(extra);
         }
+        // The decoy-corrected seed sizing (the default), on a run with an IM calibration only,
+        // so a 3D cal.json is unchanged.
+        if let Some(e) = im.and_then(|c| c.seed.as_ref()) {
+            cal_json["im_window_sizing"] = json!({
+                "mode": "seed_decoy_corrected",
+                "q_max": p.cfg.im_window_sizing_q,
+                "seed_targets": e.n_targets,
+                "seed_decoys": e.n_decoys,
+                "decoy_corrected_p_im": e.p_im_residual,
+                "applied": e.applied,
+            });
+        }
         // The second pass's floor on `w_im` and where it came from.
         if let Some(f) = &p.im_window_floor {
             cal_json["im_window_floor"] = json!({
@@ -1648,8 +1685,9 @@ fn write_windows(
 /// The ion-mobility calibration from the confident target rows of a seed with
 /// `observed_im` (`s_*` are the seed columns `fit_anchors` decoded): each anchor's observed
 /// 1/K0 from the seed, its `predicted_im` from its library row (`join`, `lib_im`). The
-/// confident cut is `cfg.q_train`, so under `anchor_q_ladder` the IM anchors follow the
-/// relaxed cut the RT anchors use (`with_anchor_cut`). The seed holds one row per candidate,
+/// confident cut is `cfg.q_train` and, when given, the seed's own cut `im_anchor_q`
+/// (`RtImTrainParams::im_anchor_q`), so a relaxed `anchor_q_ladder` cut adds RT anchors but
+/// no IM anchors. The seed holds one row per candidate,
 /// and 1/K0 depends on charge where RT does not, so the anchors are per candidate, not per
 /// base peptide. `None`, with a warning, when there is nothing to calibrate.
 #[allow(clippy::too_many_arguments)]
@@ -1662,6 +1700,7 @@ fn im_from_seed(
     cfg: &RtImTrainConfig,
     join: &CidJoin,
     lib_im: Option<&[f64]>,
+    im_anchor_q: Option<f64>,
 ) -> Result<Option<ImCal>> {
     if matches!(join, CidJoin::Unused) {
         warn!(
@@ -1683,7 +1722,11 @@ fn im_from_seed(
     let s_z = seed.i32("charge")?;
     let mut anchors: Vec<ImAnchor> = Vec::new();
     for i in 0..seed.nrows {
-        if !s_q[i].is_finite() || s_q[i] >= cfg.q_train || s_label[i] != "target" {
+        if !s_q[i].is_finite()
+            || s_q[i] >= cfg.q_train
+            || im_anchor_q.is_some_and(|c| s_q[i] > c)
+            || s_label[i] != "target"
+        {
             continue;
         }
         let (Some(obs), Some(row)) = (s_obs[i], join.row(s_cid[i])) else {
@@ -1703,7 +1746,73 @@ fn im_from_seed(
     }
     // A fixed order before any fit or reduction.
     anchors.sort_by_key(|a| a.cid);
-    let fit = fit_im(&anchors, cfg);
+    let mut fit = fit_im(&anchors, cfg);
+    if let (Some(c), mumdia_core::config::ImWindowSizing::SeedDecoyCorrected) =
+        (fit.as_mut(), cfg.im_window_sizing)
+    {
+        // Every seed PSM up to the cut, targets and decoys, against this calibration.
+        let (mut t, mut d) = (Vec::new(), Vec::new());
+        for i in 0..seed.nrows {
+            if !(s_q[i].is_finite() && s_q[i] <= cfg.im_window_sizing_q) {
+                continue;
+            }
+            let (Some(obs), Some(row)) = (s_obs[i], join.row(s_cid[i])) else {
+                continue;
+            };
+            let pred = lib_im[row];
+            if !(obs.is_finite() && obs > 0.0 && pred.is_finite() && pred > 0.0) {
+                continue;
+            }
+            let r = (obs - im_predict(&c.coefs, pred, s_mz[i], s_z[i])).abs();
+            if s_label[i] == "decoy" {
+                d.push(r);
+            } else {
+                t.push(r);
+            }
+        }
+        let (n_t, n_d) = (t.len(), d.len());
+        // No decoy with a 1/K0: the seed was written without `observed_im_q` (an older
+        // engine, or `search-seed` under `anchors`), so only its confident targets carry
+        // one and there is nothing to correct against.
+        let est = if n_d == 0 {
+            warn!(
+                seed_targets = n_t,
+                "rt-im-train: no seed decoy carries an observed 1/K0, so the seed was not                  written for the decoy-corrected 1/K0 window; keeping the anchors' w_im"
+            );
+            None
+        } else {
+            decoy_corrected_quantile(&mut t, &mut d, cfg.p_im, SEED_SIZING_MIN_TRUE)
+        };
+        let sized = est.map(|e| (e * cfg.im_window_multiplier).max(cfg.im_window_min));
+        let applied = sized.is_some_and(|w| w > c.w_im);
+        info!(
+            seed_targets = n_t,
+            seed_decoys = n_d,
+            q_max = cfg.im_window_sizing_q,
+            decoy_corrected_p_im = est,
+            anchors_w_im = c.w_im,
+            applied,
+            "rt-im-train: 1/K0 window from every seed PSM, decoy-corrected              (rt_im_train.im_window_sizing = seed_decoy_corrected)"
+        );
+        if est.is_none() && n_d > 0 {
+            warn!(
+                seed_targets = n_t,
+                seed_decoys = n_d,
+                min_true = SEED_SIZING_MIN_TRUE,
+                "rt-im-train: too few seed targets above the decoys for the decoy-corrected                  1/K0 window; keeping the anchors' w_im"
+            );
+        }
+        c.seed = Some(SeedImEstimate {
+            p_im_residual: est,
+            n_targets: n_t,
+            n_decoys: n_d,
+            applied,
+        });
+        if applied {
+            c.w_im = sized.unwrap();
+            c.sizing = "seed_decoy_corrected";
+        }
+    }
     match &fit {
         Some(c) => info!(
             n_anchors = c.n_train,
@@ -1719,6 +1828,55 @@ fn im_from_seed(
         ),
     }
     Ok(fit)
+}
+
+/// Fewest true hits (targets minus decoys) the decoy-corrected 1/K0 window is taken from.
+const SEED_SIZING_MIN_TRUE: usize = 100;
+
+/// The decoy-corrected sizing of `rt_im_train.im_window_sizing = "seed_decoy_corrected"`,
+/// for `cal.json`.
+#[derive(Clone, Debug)]
+struct SeedImEstimate {
+    /// The `p_im` percentile of the true hits' |observed - calibrated| 1/K0.
+    p_im_residual: Option<f64>,
+    n_targets: usize,
+    n_decoys: usize,
+    /// Whether it widened `w_im` (it never narrows the anchors' window).
+    applied: bool,
+}
+
+/// The `q` quantile of the TRUE hits among `targets` and `decoys` residuals: the smallest
+/// target residual `x` at which `(T(<= x) - D(<= x)) / (T - D)`, made non-decreasing, reaches
+/// `q`. A false target is distributed as a decoy, so the difference of the two cumulative
+/// counts is the true hits' cumulative count. `None` when `T - D < min_true`. Both inputs are
+/// sorted in place; the result depends on the values only, not their order.
+fn decoy_corrected_quantile(
+    targets: &mut [f64],
+    decoys: &mut [f64],
+    q: f64,
+    min_true: usize,
+) -> Option<f64> {
+    if targets.len() < decoys.len() + min_true {
+        return None;
+    }
+    targets.sort_by(f64::total_cmp);
+    decoys.sort_by(f64::total_cmp);
+    let n_true = (targets.len() - decoys.len()) as f64;
+    let (mut j, mut best) = (0usize, 0.0f64);
+    for (k, &x) in targets.iter().enumerate() {
+        // Count every target at the same value before reading the fraction.
+        if k + 1 < targets.len() && targets[k + 1] == x {
+            continue;
+        }
+        while j < decoys.len() && decoys[j] <= x {
+            j += 1;
+        }
+        best = best.max((k + 1) as f64 - j as f64);
+        if best / n_true >= q {
+            return Some(x);
+        }
+    }
+    targets.last().copied()
 }
 
 /// One ion-mobility calibration anchor: a confident target seed PSM with an observed and a
@@ -1745,6 +1903,8 @@ type ImCoefs = (
 struct ImCal {
     coefs: ImCoefs,
     w_im: f64,
+    /// The decoy-corrected seed sizing, when configured.
+    seed: Option<SeedImEstimate>,
     /// `holdout`, or `holdout_fallback_in_sample` (the `w_rt_sizing` vocabulary).
     sizing: &'static str,
     n_train: usize,
@@ -1840,6 +2000,7 @@ fn fit_im(anchors: &[ImAnchor], cfg: &RtImTrainConfig) -> Option<ImCal> {
     Some(ImCal {
         coefs,
         w_im: (p_resid * cfg.im_window_multiplier).max(cfg.im_window_min),
+        seed: None,
         sizing,
         n_train: anchors.len(),
         n_holdout: held.len(),
@@ -1874,6 +2035,30 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// True residuals uniform on [0, 0.05) mixed with false targets and an equal number of
+    /// decoys uniform on [0, 0.3): the decoy-corrected 95th percentile is the true one
+    /// (0.0475), where the targets' plain percentile is far wider; too few true hits is None.
+    #[test]
+    fn the_decoy_corrected_quantile_is_the_true_hits_quantile() {
+        let true_hits: Vec<f64> = (0..2000)
+            .map(|i| 0.05 * (i as f64 + 0.5) / 2000.0)
+            .collect();
+        let false_hits: Vec<f64> = (0..1000).map(|i| 0.3 * (i as f64 + 0.5) / 1000.0).collect();
+        let mut t: Vec<f64> = true_hits.iter().chain(&false_hits).copied().collect();
+        let mut d = false_hits.clone();
+        let est = decoy_corrected_quantile(&mut t, &mut d, 0.95, 100).unwrap();
+        assert!((est - 0.0475).abs() < 0.001, "{est}");
+        let mut plain = true_hits
+            .iter()
+            .chain(&false_hits)
+            .copied()
+            .collect::<Vec<_>>();
+        plain.sort_by(f64::total_cmp);
+        assert!(plain[(0.95 * plain.len() as f64) as usize] > 0.2);
+        let (mut t2, mut d2) = (vec![0.01; 150], vec![0.2; 100]);
+        assert!(decoy_corrected_quantile(&mut t2, &mut d2, 0.95, 100).is_none());
     }
 
     #[test]
@@ -1995,6 +2180,7 @@ mod tests {
                 cfg,
                 config_hash: "test",
                 im_window_floor: floor,
+                im_anchor_q: None,
                 anchor_irt_from_seed: false,
             })
             .unwrap();
@@ -2061,7 +2247,13 @@ mod tests {
         let anchors = anchors_at(cfg.q_train);
         let want = fit_im(&anchors, &cfg).expect("anchors calibrate");
         assert_eq!(cal_json["im_n_train"], anchors.len());
-        assert_eq!(cal_json["w_im"].as_f64(), Some(want.w_im));
+        // A number read back from `cal.json` can be one ulp off (serde_json's default float
+        // parser), so it is compared to 1e-12; the windows themselves are compared bit for bit.
+        let close = |v: &serde_json::Value, want: f64| {
+            v.as_f64()
+                .is_some_and(|x| (x - want).abs() <= 1e-12 * want.abs())
+        };
+        assert!(close(&cal_json["w_im"], want.w_im), "{}", cal_json["w_im"]);
         for i in 0..n {
             let Some(p) = pred[i] else {
                 assert!(im_c[i].is_none() && im_lo[i].is_none() && im_hi[i].is_none());
@@ -2094,12 +2286,16 @@ mod tests {
         };
         let (cal_floor, (_, f_lo, f_hi)) =
             stage_with("im_floor", true, true, &floored, Some(floor));
-        assert_eq!(cal_floor["w_im"].as_f64(), Some(4.0 * want.w_im));
-        assert_eq!(cal_floor["im_window_floor"]["source"], "first/cal.json");
-        assert_eq!(
-            cal_floor["im_window_floor"]["floor"].as_f64(),
-            Some(4.0 * want.w_im)
+        assert!(
+            close(&cal_floor["w_im"], 4.0 * want.w_im),
+            "{}",
+            cal_floor["w_im"]
         );
+        assert_eq!(cal_floor["im_window_floor"]["source"], "first/cal.json");
+        assert!(close(
+            &cal_floor["im_window_floor"]["floor"],
+            4.0 * want.w_im
+        ));
         assert_eq!(
             cal_floor["im_window_floor"]["configured"].as_f64(),
             Some(cfg.im_window_min)
@@ -2119,6 +2315,142 @@ mod tests {
         let more = anchors_at(0.05);
         assert!(more.len() > anchors.len());
         assert_eq!(cal_relaxed["im_n_train"], more.len());
+    }
+
+    /// `seed_decoy_corrected` sizing on a seed whose weaker rows (targets and decoys up to
+    /// `im_window_sizing_q`) carry `observed_im`: `w_im` is the decoy-corrected `p_im`
+    /// residual of the true hits times the multiplier, wider than the anchors' window, and
+    /// `cal.json` says so, while `anchors` keeps the anchors' window. With the seed's own cut
+    /// (`im_anchor_q`) a relaxed anchor cut adds no IM anchors from those rows.
+    #[test]
+    fn seed_decoy_corrected_sizing_widens_w_im_from_the_true_hits() {
+        use mumdia_core::config::ImWindowSizing;
+        use mumdia_core::constants::{ccs_to_im, im_to_ccs};
+        // 600 confident anchors 0.004 off their calibrated 1/K0; at q 0.05, 300 true targets
+        // 0.02 off, and 100 false targets spread as the 100 decoys are.
+        let (n_anchor, n_wide, n_decoy) = (600usize, 300usize, 100usize);
+        let n = n_anchor + n_wide + 100 + n_decoy;
+        let z: Vec<i32> = (0..n).map(|i| if i % 3 == 0 { 3 } else { 2 }).collect();
+        let mz: Vec<f64> = (0..n).map(|i| 400.0 + i as f64 * 0.5).collect();
+        let pred: Vec<f64> = (0..n).map(|i| 0.7 + i as f64 * 0.0005).collect();
+        let offset = |i: usize| -> f64 {
+            let sign = if i.is_multiple_of(2) { 1.0 } else { -1.0 };
+            if i < n_anchor {
+                sign * 0.004
+            } else if i < n_anchor + n_wide {
+                sign * 0.02
+            } else {
+                ((i * 37) % 201) as f64 / 1000.0 - 0.1
+            }
+        };
+        let obs: Vec<Option<f64>> = (0..n)
+            .map(|i| {
+                let (a, b) = if z[i] == 2 {
+                    (10.0, 1.02)
+                } else {
+                    (-5.0, 0.98)
+                };
+                let truth = ccs_to_im(a + b * im_to_ccs(pred[i], mz[i], z[i]), mz[i], z[i]);
+                Some(truth + offset(i))
+            })
+            .collect();
+        let q: Vec<f64> = (0..n)
+            .map(|i| if i < n_anchor { 0.001 } else { 0.05 })
+            .collect();
+        let label: Vec<String> = (0..n)
+            .map(|i| if i >= n - n_decoy { "decoy" } else { "target" }.to_string())
+            .collect();
+        let irt: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
+        let prec = scratch("sdc_prec.parquet");
+        let seed = scratch("sdc_seed.parquet");
+        write_table(
+            &prec,
+            vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::F32("predicted_irt".into(), irt.clone()),
+                Col::F64("precursor_mz".into(), mz.clone()),
+                Col::I32("charge".into(), z.clone()),
+                Col::OptF64(
+                    "predicted_im".into(),
+                    pred.iter().map(|&p| Some(p)).collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        write_table(
+            &seed,
+            vec![
+                Col::U32("candidate_id".into(), (0..n as u32).collect()),
+                Col::U32("base_peptide_id".into(), (0..n as u32).collect()),
+                Col::F64("spectrum_q".into(), q),
+                Col::F64("score".into(), (0..n).map(|i| 1.0 + i as f64).collect()),
+                Col::F64(
+                    "observed_rt".into(),
+                    irt.iter().map(|&x| 60.0 + 30.0 * x as f64).collect(),
+                ),
+                Col::Str("label".into(), label),
+                Col::F64("precursor_mz".into(), mz),
+                Col::I32("charge".into(), z),
+                Col::OptF64("observed_im".into(), obs),
+            ],
+        )
+        .unwrap();
+        let run = |tag: &str, cfg: &RtImTrainConfig, im_anchor_q: Option<f64>| {
+            let cal = scratch(&format!("sdc_cal_{tag}.json"));
+            run_in_memory(RtImTrainParams {
+                precursor_span: None,
+                seed_psms: &seed,
+                library_precursors: &prec,
+                out_windows: &scratch(&format!("sdc_windows_{tag}.parquet")),
+                out_cal: &cal,
+                cfg,
+                config_hash: "test",
+                im_window_floor: None,
+                im_anchor_q,
+                anchor_irt_from_seed: false,
+            })
+            .unwrap();
+            let v: serde_json::Value = mumdia_io::json::read_json(&cal).unwrap();
+            v
+        };
+        let cfg = RtImTrainConfig::default();
+        let anchors_cfg = RtImTrainConfig {
+            im_window_sizing: ImWindowSizing::Anchors,
+            ..cfg.clone()
+        };
+        let sized = run("seed", &cfg, Some(0.01));
+        let plain = run("anchors", &anchors_cfg, Some(0.01));
+        assert_eq!(plain["w_im_sizing"], "holdout");
+        assert!(plain.get("im_window_sizing").is_none(), "{plain}");
+        assert_eq!(sized["w_im_sizing"], "seed_decoy_corrected");
+        let block = &sized["im_window_sizing"];
+        assert_eq!(block["applied"], true);
+        assert_eq!(block["seed_targets"], n - n_decoy);
+        assert_eq!(block["seed_decoys"], n_decoy);
+        // The true hits' p95 lies in the 0.02 group; the plain p95 of every target, false
+        // ones included, would lie among the false targets' spread (about 0.05).
+        let est = block["decoy_corrected_p_im"].as_f64().unwrap();
+        assert!((0.015..0.025).contains(&est), "{est}");
+        let w = sized["w_im"].as_f64().unwrap();
+        assert!(
+            (w - est * cfg.im_window_multiplier).abs() <= 1e-9 * w,
+            "{w} {est}"
+        );
+        assert!(w > plain["w_im"].as_f64().unwrap());
+        // The anchors are the 600 confident targets either way, and a relaxed cut adds the
+        // weaker targets only without the seed's own cut.
+        assert_eq!(sized["im_n_train"], n_anchor);
+        assert_eq!(plain["im_n_train"], n_anchor);
+        let relaxed = with_anchor_cut(
+            &cfg,
+            &AnchorPlan {
+                q_train: 0.1,
+                n_anchors: n,
+                sufficient: true,
+            },
+        );
+        assert_eq!(run("pinned", &relaxed, Some(0.01))["im_n_train"], n_anchor);
+        assert_eq!(run("free", &relaxed, None)["im_n_train"], n - n_decoy);
     }
 
     #[test]
@@ -2313,6 +2645,7 @@ mod tests {
                 cfg: &cfg,
                 config_hash: "test",
                 im_window_floor: None,
+                im_anchor_q: None,
                 anchor_irt_from_seed: false,
             };
             let (written, kept) = run_in_memory(params()).unwrap();
@@ -2745,6 +3078,7 @@ mod tests {
                 cfg: &cfg,
                 config_hash: "h",
                 im_window_floor: None,
+                im_anchor_q: None,
                 anchor_irt_from_seed: true,
             })
             .unwrap();
@@ -2851,6 +3185,7 @@ mod tests {
                 cfg,
                 config_hash: "h",
                 im_window_floor: None,
+                im_anchor_q: None,
                 anchor_irt_from_seed: true,
             })
             .unwrap();

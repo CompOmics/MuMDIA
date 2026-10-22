@@ -111,6 +111,29 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Changed
+
+- **diaPASEF: the 1/K0 window is sized from the whole seed, decoy-corrected, and widened
+  1.3x.** `rt_im_train.im_window_sizing` defaults to `seed_decoy_corrected`. search-seed
+  records the observed 1/K0 of every PSM up to a seed q of 0.1 (`im_window_sizing_q`),
+  targets and decoys. rt-im-train takes the 95th percentile of the true hits' residuals (at
+  each residual, the targets minus the decoys at or below it), multiplies it by
+  `rt_im_train.im_window_multiplier` and uses the result as `w_im` where it is wider than the
+  anchors' window. The multiplier defaults to 1.3 (was 1.0) and applies to both windows;
+  `anchors` with 1.0 restores the previous windows. The IM anchors, and so the calibration,
+  are unchanged: the weaker rows enter only the estimate. The window acts through the 1/K0
+  gate and retrace, which the diaPASEF recipe turns on. On a synthetic HLA-I peptide pool
+  (one seed) the exact pool sequences found rose from 499 to 663 at 1.0x and 708 at 1.3x,
+  with the hits from other pools at 5 in both. Against the
+  previous window, x1.3 measured +0.6% peptides on an E. coli run (three seeds), +3.0% real
+  peptides on its entrapment library at an FDP of 0.39-0.43% against 0.34-0.39%, -0.25% per
+  run on six 5 min HYE runs (two seeds) and -1.0% per run on the six ProteoBench HYE
+  diaPASEF runs (one seed), with the experiment-wide counts +0.2% on both (docs/08 section
+  7). `cal.json` gains an `im_window_sizing` block on runs with 1/K0. Spectra without 1/K0
+  are unaffected: every 3D artifact, report and config hash is unchanged.
+
 ## [0.8.0] - 2026-10-22
 
 ### Added

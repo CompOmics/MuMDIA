@@ -82,6 +82,12 @@ pub struct SearchSeedParams<'a> {
     /// An ungrouped run already fits on every deviation it has, writes no sidecar, and
     /// selects exactly the rows it always did.
     pub emit_calibrants: bool,
+    /// Record `observed_im` for every PSM (targets and decoys) with `spectrum_q` at most this,
+    /// not only for the confident targets, on spectra with 1/K0. Set by
+    /// `rt_im_train.im_window_sizing = "seed_decoy_corrected"`
+    /// (`RtImTrainConfig::seed_observed_im_q`), which sizes the 1/K0 window from them. `None`
+    /// keeps the seed table exactly as before.
+    pub observed_im_q: Option<f64>,
     /// The library and index, already loaded ([`SeedLibrary::load`]) by a caller that
     /// seeds several runs against the same library (`run-experiment`), instead of each
     /// seed loading them again. It must be the one these params would load: same
@@ -522,6 +528,36 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             if scan_im.is_some() {
                 obs_im_c[i] = crate::stats::weighted_median(&mut im_pts);
             }
+        }
+    }
+    // `rt_im_train.im_window_sizing = "seed_decoy_corrected"`: the same observed 1/K0 for
+    // every other PSM up to `observed_im_q`, targets and decoys, by the same rule (the
+    // nearest peak to each library fragment, within the search tolerance). A separate pass,
+    // so the loop above, and with it the mass calibration, is untouched; without 1/K0 in the
+    // spectra nothing is added.
+    if let Some(q_max) = p.observed_im_q.filter(|_| has_im) {
+        for (i, (cid, b)) in rows.iter().enumerate() {
+            if obs_im_c[i].is_some() || q[i].is_nan() || q[i] > q_max {
+                continue;
+            }
+            let Some(scan) = scan_by_index.get(&b.scan_index) else {
+                continue;
+            };
+            let Some(im) = scan.im.as_deref() else {
+                continue;
+            };
+            im_pts.clear();
+            for &fmz in lib.cand_frag_mz(*cid) {
+                let fmz = fmz as f64;
+                let collect_ppm = 50.0_f64.max(p.cfg.fragment_tol_ppm);
+                if let Some(j) = crate::spectra::nearest_peak(&scan.peaks, fmz, collect_ppm) {
+                    let pp = mumdia_core::constants::ppm_diff(scan.peaks[j].mz as f64, fmz);
+                    if pp.abs() <= p.cfg.fragment_tol_ppm {
+                        im_pts.push((im[j] as f64, scan.peaks[j].intensity as f64));
+                    }
+                }
+            }
+            obs_im_c[i] = crate::stats::weighted_median(&mut im_pts);
         }
     }
     // Median offset + 95th-percentile-of-centered tolerance, with the optional robust

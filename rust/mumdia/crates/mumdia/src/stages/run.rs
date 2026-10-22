@@ -562,6 +562,7 @@ pub fn run(p: RunParams) -> Result<()> {
                 );
             info!(stage = %"search-seed", "run: stage start");
             let (w, seed_ms2) = search_seed::run_returning_scans(search_seed::SearchSeedParams {
+                observed_im_q: cfg.rt_im_train.seed_observed_im_q(),
                 precursor_span: None,
                 fragment_offset: None,
                 ms2_scans: None,
