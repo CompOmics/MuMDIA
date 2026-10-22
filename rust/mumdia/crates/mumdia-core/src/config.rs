@@ -501,6 +501,33 @@ fn is_default_im_window_multiplier(v: &f64) -> bool {
 fn is_default_im_window_min(v: &f64) -> bool {
     *v == RtImTrainConfig::default().im_window_min
 }
+fn is_default_im_window_sizing(v: &ImWindowSizing) -> bool {
+    *v == ImWindowSizing::default()
+}
+fn is_default_im_window_sizing_q(v: &f64) -> bool {
+    *v == RtImTrainConfig::default().im_window_sizing_q
+}
+
+/// How `rt-im-train` sizes the ion-mobility half-window `w_im`
+/// (`rt_im_train.im_window_sizing`, docs/08_rt_im_train.md "Ion-mobility calibration").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImWindowSizing {
+    /// The `p_im` percentile of the held-out confident seed anchors' residuals.
+    #[default]
+    Anchors,
+    /// The `p_im` percentile of the TRUE-hit residuals among every seed PSM up to
+    /// `im_window_sizing_q`, targets and decoys: the cumulative count of targets minus that
+    /// of decoys within a residual, over targets minus decoys, is the true hits' residual
+    /// distribution, because a false target is distributed as a decoy. The seed search
+    /// matches peaks without a 1/K0 window, so these residuals are not truncated by one, and
+    /// a run whose confident anchors are only its best-predicted peptides (few anchors, an
+    /// unusual peptide class) gets the window its identifiable population needs. Never
+    /// below the anchors' value; the anchors' value when targets minus decoys are fewer
+    /// than 100. The search-seed stage then records `observed_im` for every PSM up to the
+    /// cut instead of only the confident targets. Targets and decoys are windowed alike.
+    SeedDecoyCorrected,
+}
 
 // The `convert.tdf_*` keys at their defaults, which the canonical configuration omits.
 fn is_default_tdf_mz_ppm(v: &f64) -> bool {
@@ -1548,6 +1575,16 @@ pub struct RtImTrainConfig {
     /// canonical configuration at its default.
     #[serde(skip_serializing_if = "is_default_im_window_min")]
     pub im_window_min: f64,
+    /// How `w_im` is sized: `anchors` (default) or `seed_decoy_corrected`
+    /// ([`ImWindowSizing`]). Opt-in, measured on diaPASEF immunopeptidomics, HYE and an
+    /// E. coli entrapment run. Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_default_im_window_sizing")]
+    pub im_window_sizing: ImWindowSizing,
+    /// Highest seed `spectrum_q` a PSM enters `seed_decoy_corrected` sizing with. Default
+    /// 0.1, where the estimate had settled on every run measured (0.05 to 0.3 checked).
+    /// Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_default_im_window_sizing_q")]
+    pub im_window_sizing_q: f64,
     /// Worker processes for the whole-library DeepLC prediction: the multi-head
     /// calibration, the base-model re-prediction under `library_irt`, and the prediction
     /// after `finetune_deeplc` (`deeplc_finetune.py --shards`). The calibration or the
@@ -1674,6 +1711,14 @@ fn is_default_multihead_search_below(v: &usize) -> bool {
 }
 
 impl RtImTrainConfig {
+    /// The seed `spectrum_q` up to which search-seed records `observed_im` for every PSM
+    /// (targets and decoys): `Some(im_window_sizing_q)` under `seed_decoy_corrected`, `None`
+    /// otherwise, when only the confident targets carry it.
+    pub fn seed_observed_im_q(&self) -> Option<f64> {
+        (self.im_window_sizing == ImWindowSizing::SeedDecoyCorrected)
+            .then_some(self.im_window_sizing_q)
+    }
+
     /// How many LC-setup heads this run should calibrate over: 0 when it should not.
     ///
     /// The single place that turns the configured value into a decision, so the two
@@ -1759,6 +1804,8 @@ impl Default for RtImTrainConfig {
             p_im: 0.95,
             im_window_multiplier: 1.0,
             im_window_min: 0.005,
+            im_window_sizing: ImWindowSizing::Anchors,
+            im_window_sizing_q: 0.1,
             deeplc_predict_shards: 0,
             deeplc_projection_cache: Some("auto".to_string()),
         }
@@ -4133,6 +4180,15 @@ impl Config {
                 self.rt_im_train.im_window_min
             )));
         }
+        if !(self.rt_im_train.im_window_sizing_q > 0.0
+            && self.rt_im_train.im_window_sizing_q <= 0.5)
+        {
+            return Err(Invalid(format!(
+                "rt_im_train.im_window_sizing_q must be in (0, 0.5] (got {}): it is the seed q \
+                 up to which PSMs size the decoy-corrected 1/K0 window",
+                self.rt_im_train.im_window_sizing_q
+            )));
+        }
         if self.search_seed.count_fragments_once
             && !matches!(self.search_seed.matcher, MatcherKind::Fragindex)
         {
@@ -4761,6 +4817,20 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decoy-corrected 1/K0 window sizing is opt-in: by default the seed records no extra
+    /// observed 1/K0 and the canonical configuration carries neither key.
+    #[test]
+    fn im_window_sizing_is_opt_in_and_out_of_the_canonical_json_by_default() {
+        let rt = RtImTrainConfig::default();
+        assert_eq!(rt.im_window_sizing, ImWindowSizing::Anchors);
+        assert_eq!(rt.seed_observed_im_q(), None);
+        let json = serde_json::to_string(&rt).unwrap();
+        assert!(!json.contains("im_window_sizing"), "{json}");
+        let on: RtImTrainConfig =
+            serde_json::from_str(r#"{"im_window_sizing": "seed_decoy_corrected"}"#).unwrap();
+        assert_eq!(on.seed_observed_im_q(), Some(0.1));
+    }
 
     /// `digest.cleavage_rule` belongs to `enzyme = "custom"` only, a custom rule must
     /// parse, every preset resolves to its rule, and an unset rule leaves the canonical

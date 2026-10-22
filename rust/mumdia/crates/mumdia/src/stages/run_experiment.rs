@@ -528,6 +528,7 @@ fn seed_run(
 ) -> Result<String> {
     let seed = format!("{out}/seed_psms.parquet");
     search_seed::run(search_seed::SearchSeedParams {
+        observed_im_q: cfg.rt_im_train.seed_observed_im_q(),
         precursor_span: None,
         fragment_offset: None,
         // One reader at a time, as in the ungrouped `run`.

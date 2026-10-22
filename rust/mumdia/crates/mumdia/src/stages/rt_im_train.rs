@@ -1582,6 +1582,18 @@ fn write_windows(
         {
             obj.extend(extra);
         }
+        // The decoy-corrected seed sizing, only when configured, so a default cal.json is
+        // unchanged.
+        if let Some(e) = im.and_then(|c| c.seed.as_ref()) {
+            cal_json["im_window_sizing"] = json!({
+                "mode": "seed_decoy_corrected",
+                "q_max": p.cfg.im_window_sizing_q,
+                "seed_targets": e.n_targets,
+                "seed_decoys": e.n_decoys,
+                "decoy_corrected_p_im": e.p_im_residual,
+                "applied": e.applied,
+            });
+        }
         // The second pass's floor on `w_im` and where it came from.
         if let Some(f) = &p.im_window_floor {
             cal_json["im_window_floor"] = json!({
@@ -1703,7 +1715,62 @@ fn im_from_seed(
     }
     // A fixed order before any fit or reduction.
     anchors.sort_by_key(|a| a.cid);
-    let fit = fit_im(&anchors, cfg);
+    let mut fit = fit_im(&anchors, cfg);
+    if let (Some(c), mumdia_core::config::ImWindowSizing::SeedDecoyCorrected) =
+        (fit.as_mut(), cfg.im_window_sizing)
+    {
+        // Every seed PSM up to the cut, targets and decoys, against this calibration.
+        let (mut t, mut d) = (Vec::new(), Vec::new());
+        for i in 0..seed.nrows {
+            if !(s_q[i].is_finite() && s_q[i] <= cfg.im_window_sizing_q) {
+                continue;
+            }
+            let (Some(obs), Some(row)) = (s_obs[i], join.row(s_cid[i])) else {
+                continue;
+            };
+            let pred = lib_im[row];
+            if !(obs.is_finite() && obs > 0.0 && pred.is_finite() && pred > 0.0) {
+                continue;
+            }
+            let r = (obs - im_predict(&c.coefs, pred, s_mz[i], s_z[i])).abs();
+            if s_label[i] == "decoy" {
+                d.push(r);
+            } else {
+                t.push(r);
+            }
+        }
+        let (n_t, n_d) = (t.len(), d.len());
+        let est = decoy_corrected_quantile(&mut t, &mut d, cfg.p_im, SEED_SIZING_MIN_TRUE);
+        let sized = est.map(|e| (e * cfg.im_window_multiplier).max(cfg.im_window_min));
+        let applied = sized.is_some_and(|w| w > c.w_im);
+        info!(
+            seed_targets = n_t,
+            seed_decoys = n_d,
+            q_max = cfg.im_window_sizing_q,
+            decoy_corrected_p_im = est,
+            anchors_w_im = c.w_im,
+            applied,
+            "rt-im-train: 1/K0 window from every seed PSM, decoy-corrected              (rt_im_train.im_window_sizing = seed_decoy_corrected)"
+        );
+        if est.is_none() {
+            warn!(
+                seed_targets = n_t,
+                seed_decoys = n_d,
+                min_true = SEED_SIZING_MIN_TRUE,
+                "rt-im-train: too few seed targets above the decoys for the decoy-corrected                  1/K0 window; keeping the anchors' w_im"
+            );
+        }
+        c.seed = Some(SeedImEstimate {
+            p_im_residual: est,
+            n_targets: n_t,
+            n_decoys: n_d,
+            applied,
+        });
+        if applied {
+            c.w_im = sized.unwrap();
+            c.sizing = "seed_decoy_corrected";
+        }
+    }
     match &fit {
         Some(c) => info!(
             n_anchors = c.n_train,
@@ -1719,6 +1786,55 @@ fn im_from_seed(
         ),
     }
     Ok(fit)
+}
+
+/// Fewest true hits (targets minus decoys) the decoy-corrected 1/K0 window is taken from.
+const SEED_SIZING_MIN_TRUE: usize = 100;
+
+/// The decoy-corrected sizing of `rt_im_train.im_window_sizing = "seed_decoy_corrected"`,
+/// for `cal.json`.
+#[derive(Clone, Debug)]
+struct SeedImEstimate {
+    /// The `p_im` percentile of the true hits' |observed - calibrated| 1/K0.
+    p_im_residual: Option<f64>,
+    n_targets: usize,
+    n_decoys: usize,
+    /// Whether it widened `w_im` (it never narrows the anchors' window).
+    applied: bool,
+}
+
+/// The `q` quantile of the TRUE hits among `targets` and `decoys` residuals: the smallest
+/// target residual `x` at which `(T(<= x) - D(<= x)) / (T - D)`, made non-decreasing, reaches
+/// `q`. A false target is distributed as a decoy, so the difference of the two cumulative
+/// counts is the true hits' cumulative count. `None` when `T - D < min_true`. Both inputs are
+/// sorted in place; the result depends on the values only, not their order.
+fn decoy_corrected_quantile(
+    targets: &mut [f64],
+    decoys: &mut [f64],
+    q: f64,
+    min_true: usize,
+) -> Option<f64> {
+    if targets.len() < decoys.len() + min_true {
+        return None;
+    }
+    targets.sort_by(f64::total_cmp);
+    decoys.sort_by(f64::total_cmp);
+    let n_true = (targets.len() - decoys.len()) as f64;
+    let (mut j, mut best) = (0usize, 0.0f64);
+    for (k, &x) in targets.iter().enumerate() {
+        // Count every target at the same value before reading the fraction.
+        if k + 1 < targets.len() && targets[k + 1] == x {
+            continue;
+        }
+        while j < decoys.len() && decoys[j] <= x {
+            j += 1;
+        }
+        best = best.max((k + 1) as f64 - j as f64);
+        if best / n_true >= q {
+            return Some(x);
+        }
+    }
+    targets.last().copied()
 }
 
 /// One ion-mobility calibration anchor: a confident target seed PSM with an observed and a
@@ -1745,6 +1861,8 @@ type ImCoefs = (
 struct ImCal {
     coefs: ImCoefs,
     w_im: f64,
+    /// The decoy-corrected seed sizing, when configured.
+    seed: Option<SeedImEstimate>,
     /// `holdout`, or `holdout_fallback_in_sample` (the `w_rt_sizing` vocabulary).
     sizing: &'static str,
     n_train: usize,
@@ -1840,6 +1958,7 @@ fn fit_im(anchors: &[ImAnchor], cfg: &RtImTrainConfig) -> Option<ImCal> {
     Some(ImCal {
         coefs,
         w_im: (p_resid * cfg.im_window_multiplier).max(cfg.im_window_min),
+        seed: None,
         sizing,
         n_train: anchors.len(),
         n_holdout: held.len(),
@@ -1874,6 +1993,30 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// True residuals uniform on [0, 0.05) mixed with false targets and an equal number of
+    /// decoys uniform on [0, 0.3): the decoy-corrected 95th percentile is the true one
+    /// (0.0475), where the targets' plain percentile is far wider; too few true hits is None.
+    #[test]
+    fn the_decoy_corrected_quantile_is_the_true_hits_quantile() {
+        let true_hits: Vec<f64> = (0..2000)
+            .map(|i| 0.05 * (i as f64 + 0.5) / 2000.0)
+            .collect();
+        let false_hits: Vec<f64> = (0..1000).map(|i| 0.3 * (i as f64 + 0.5) / 1000.0).collect();
+        let mut t: Vec<f64> = true_hits.iter().chain(&false_hits).copied().collect();
+        let mut d = false_hits.clone();
+        let est = decoy_corrected_quantile(&mut t, &mut d, 0.95, 100).unwrap();
+        assert!((est - 0.0475).abs() < 0.001, "{est}");
+        let mut plain = true_hits
+            .iter()
+            .chain(&false_hits)
+            .copied()
+            .collect::<Vec<_>>();
+        plain.sort_by(f64::total_cmp);
+        assert!(plain[(0.95 * plain.len() as f64) as usize] > 0.2);
+        let (mut t2, mut d2) = (vec![0.01; 150], vec![0.2; 100]);
+        assert!(decoy_corrected_quantile(&mut t2, &mut d2, 0.95, 100).is_none());
     }
 
     #[test]

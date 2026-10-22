@@ -1203,6 +1203,7 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     let run_one = |shared: Option<&[Ms2Scan]>, tag: &str| -> (String, u64) {
         let out = tmp(&format!("seed_{tag}.parquet"));
         let rows = stages::search_seed::run(stages::search_seed::SearchSeedParams {
+            observed_im_q: None,
             precursor_span: None,
             fragment_offset: None,
             ms2_scans: shared,
@@ -1251,6 +1252,7 @@ fn search_seed_from_a_shared_scan_buffer_is_byte_identical_and_read_only() {
     uncapped.search_seed.top_n_peaks = 0;
     let out = tmp("seed_uncapped.parquet");
     stages::search_seed::run(stages::search_seed::SearchSeedParams {
+        observed_im_q: None,
         precursor_span: None,
         fragment_offset: None,
         ms2_scans: None,
@@ -1328,6 +1330,64 @@ fn craft_ms2_im(with_im: bool) -> String {
     path
 }
 
+/// `observed_im_q` (set by `rt_im_train.im_window_sizing = "seed_decoy_corrected"`): the
+/// seed records the observed 1/K0 of EVERY PSM up to the cut, non-confident targets and (by
+/// the same label-blind pass) decoys, by the anchors' rule; without it only the confident targets carry one,
+/// and every other column and the mass calibration are the same either way.
+#[test]
+fn the_seed_records_observed_im_for_every_psm_up_to_the_sizing_cut_only_when_asked() {
+    let (prec, frag) = craft_library();
+    let mut cfg = Config::default();
+    cfg.search_seed.min_matched_peaks = 2;
+    // Nothing is confident, so the default seed records no observed 1/K0 at all.
+    cfg.search_seed.fdr_seed = 0.0;
+    let ms2 = craft_ms2_im(true);
+    let seed = |obs_q: Option<f64>, tag: &str| {
+        let out = tmp(&format!("seed_obsq_{tag}.parquet"));
+        stages::search_seed::run(stages::search_seed::SearchSeedParams {
+            observed_im_q: obs_q,
+            precursor_span: None,
+            fragment_offset: None,
+            ms2_scans: None,
+            emit_calibrants: false,
+            library: None,
+            ms2: &ms2,
+            library_precursors: &prec,
+            library_fragments: &frag,
+            out: &out,
+            cfg: &cfg.search_seed,
+            bucket_size: Config::default().extract.bucket_size,
+            config_hash: "test",
+        })
+        .unwrap();
+        out
+    };
+    let (plain, all) = (seed(None, "none"), seed(Some(1.0), "all"));
+    let (tp, ta) = (
+        TableFile::open(&plain).unwrap(),
+        TableFile::open(&all).unwrap(),
+    );
+    // The fixture's seed holds non-confident target rows (fdr_seed = 0); the pass that fills
+    // them has no label condition, so a decoy row takes the same path.
+    let labels = ta.str("label").unwrap();
+    assert!(!labels.is_empty(), "the fixture must give seed rows");
+    assert!(tp
+        .opt_f64("observed_im")
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+    let obs = ta.opt_f64("observed_im").unwrap();
+    for (i, l) in labels.iter().enumerate() {
+        assert_eq!(obs[i], Some(0.92f32 as f64), "row {i} ({l})");
+    }
+    assert_eq!(tp.f64("score").unwrap(), ta.f64("score").unwrap());
+    assert_eq!(tp.f64("spectrum_q").unwrap(), ta.f64("spectrum_q").unwrap());
+    assert_eq!(
+        std::fs::read_to_string(format!("{plain}.masscal.json")).unwrap(),
+        std::fs::read_to_string(format!("{all}.masscal.json")).unwrap()
+    );
+}
+
 /// The seed writes `observed_im` and `seed_psms` v2 only when the searched spectra carry
 /// per-peak 1/K0, and then every other column, the mass calibration and the report fields
 /// are those of the same scans without it: a 3D seed keeps v1's exact column set and
@@ -1342,6 +1402,7 @@ fn the_seed_writes_observed_im_only_for_spectra_with_ion_mobility() {
     let seed = |ms2: &str, cfg: &mumdia_core::config::SearchSeedConfig, tag: &str| {
         let out = tmp(&format!("seed_im_{tag}.parquet"));
         let rows = stages::search_seed::run(stages::search_seed::SearchSeedParams {
+            observed_im_q: None,
             precursor_span: None,
             fragment_offset: None,
             ms2_scans: None,
@@ -2006,6 +2067,7 @@ fn pooled_mass_calibration_equals_the_unbanded_fit(overlap: bool) {
     let seed = |prec: &str, offset: Option<u32>, emit: bool, tag: &str| -> String {
         let out = tmp(&format!("two_band_seed_{arm}_{tag}.parquet"));
         stages::search_seed::run(stages::search_seed::SearchSeedParams {
+            observed_im_q: None,
             precursor_span: None,
             fragment_offset: offset,
             ms2_scans: None,
@@ -2140,6 +2202,7 @@ fn the_seed_hands_back_its_decode_and_extract_over_it_is_byte_identical() {
     let cfg = Config::default();
     let seed_params = |out: &str, shared: Option<&[Ms2Scan]>| {
         stages::search_seed::run_returning_scans(stages::search_seed::SearchSeedParams {
+            observed_im_q: None,
             precursor_span: None,
             fragment_offset: None,
             ms2_scans: shared,
@@ -2278,6 +2341,7 @@ fn a_lent_seed_library_gives_the_seed_it_would_have_loaded() {
         cfg.search_seed.matcher = matcher;
         let seed = |out: &str, library: Option<&stages::search_seed::SeedLibrary>| {
             stages::search_seed::run(stages::search_seed::SearchSeedParams {
+                observed_im_q: None,
                 precursor_span: None,
                 fragment_offset: None,
                 ms2_scans: None,
@@ -2566,6 +2630,7 @@ fn the_chain_without_retrace_is_byte_identical_and_refuses_retrace_on_3d_input()
     let base = Config::default();
     let seed = tmp("chain_seed.parquet");
     stages::search_seed::run(stages::search_seed::SearchSeedParams {
+        observed_im_q: None,
         precursor_span: None,
         fragment_offset: None,
         ms2_scans: None,

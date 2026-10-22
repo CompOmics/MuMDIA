@@ -413,6 +413,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             let seed = gd(b.index, "seed_psms.parquet");
             info!(stage = %"search-seed", group = b.index, "run: stage start");
             let written = search_seed::run_hashed(search_seed::SearchSeedParams {
+            observed_im_q: cfg.rt_im_train.seed_observed_im_q(),
                 precursor_span: Some((first, n)),
                 ms2: &g.converted.ms2,
                 library_precursors: g.lib_precursors,

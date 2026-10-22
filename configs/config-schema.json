@@ -1978,6 +1978,36 @@
       "source_struct": "RtImTrainConfig"
     },
     {
+      "path": "rt_im_train.im_window_sizing",
+      "name": "im_window_sizing",
+      "section": "rt_im_train",
+      "rust_type": "ImWindowSizing",
+      "kind": "enum",
+      "optional": false,
+      "default": "anchors",
+      "default_text": "`anchors`",
+      "help": "How `w_im` is sized: `anchors` (default) or `seed_decoy_corrected` (`ImWindowSizing`). Opt-in, measured on diaPASEF immunopeptidomics, HYE and an E. coli entrapment run. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig",
+      "choices": [
+        "anchors",
+        "seed_decoy_corrected"
+      ]
+    },
+    {
+      "path": "rt_im_train.im_window_sizing_q",
+      "name": "im_window_sizing_q",
+      "section": "rt_im_train",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.1,
+      "default_text": "0.1",
+      "help": "Highest seed `spectrum_q` a PSM enters `seed_decoy_corrected` sizing with. Default 0.1, where the estimate had settled on every run measured (0.05 to 0.3 checked). Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
       "path": "rt_im_train.deeplc_predict_shards",
       "name": "deeplc_predict_shards",
       "section": "rt_im_train",
