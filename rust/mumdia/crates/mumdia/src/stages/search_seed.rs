@@ -533,8 +533,8 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
     // `rt_im_train.im_window_sizing = "seed_decoy_corrected"`: the same observed 1/K0 for
     // every other PSM up to `observed_im_q`, targets and decoys, by the same rule (the
     // nearest peak to each library fragment, within the search tolerance). A separate pass,
-    // so the loop above, and with it the mass calibration and every default seed table, is
-    // untouched.
+    // so the loop above, and with it the mass calibration, is untouched; without 1/K0 in the
+    // spectra nothing is added.
     if let Some(q_max) = p.observed_im_q.filter(|_| has_im) {
         for (i, (cid, b)) in rows.iter().enumerate() {
             if obs_im_c[i].is_some() || q[i].is_nan() || q[i] > q_max {

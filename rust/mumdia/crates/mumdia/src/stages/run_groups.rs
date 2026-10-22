@@ -876,6 +876,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     cfg: &cfg.rt_im_train,
                     config_hash: ch,
                     im_window_floor: None,
+                    im_anchor_q: Some(cfg.search_seed.fdr_seed),
                     anchor_irt_from_seed: false,
                 })?,
             };

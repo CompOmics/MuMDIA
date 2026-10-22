@@ -1485,6 +1485,7 @@ fn real_main() -> Result<()> {
                 cfg: &cfg.rt_im_train,
                 config_hash: &ch,
                 im_window_floor: None,
+                im_anchor_q: Some(cfg.search_seed.fdr_seed),
             })?;
         }
         Cmd::SubLibrary {
