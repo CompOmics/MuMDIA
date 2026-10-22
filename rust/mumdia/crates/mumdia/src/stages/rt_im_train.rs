@@ -2204,7 +2204,13 @@ mod tests {
         let anchors = anchors_at(cfg.q_train);
         let want = fit_im(&anchors, &cfg).expect("anchors calibrate");
         assert_eq!(cal_json["im_n_train"], anchors.len());
-        assert_eq!(cal_json["w_im"].as_f64(), Some(want.w_im));
+        // A number read back from `cal.json` can be one ulp off (serde_json's default float
+        // parser), so it is compared to 1e-12; the windows themselves are compared bit for bit.
+        let close = |v: &serde_json::Value, want: f64| {
+            v.as_f64()
+                .is_some_and(|x| (x - want).abs() <= 1e-12 * want.abs())
+        };
+        assert!(close(&cal_json["w_im"], want.w_im), "{}", cal_json["w_im"]);
         for i in 0..n {
             let Some(p) = pred[i] else {
                 assert!(im_c[i].is_none() && im_lo[i].is_none() && im_hi[i].is_none());
@@ -2237,12 +2243,16 @@ mod tests {
         };
         let (cal_floor, (_, f_lo, f_hi)) =
             stage_with("im_floor", true, true, &floored, Some(floor));
-        assert_eq!(cal_floor["w_im"].as_f64(), Some(4.0 * want.w_im));
-        assert_eq!(cal_floor["im_window_floor"]["source"], "first/cal.json");
-        assert_eq!(
-            cal_floor["im_window_floor"]["floor"].as_f64(),
-            Some(4.0 * want.w_im)
+        assert!(
+            close(&cal_floor["w_im"], 4.0 * want.w_im),
+            "{}",
+            cal_floor["w_im"]
         );
+        assert_eq!(cal_floor["im_window_floor"]["source"], "first/cal.json");
+        assert!(close(
+            &cal_floor["im_window_floor"]["floor"],
+            4.0 * want.w_im
+        ));
         assert_eq!(
             cal_floor["im_window_floor"]["configured"].as_f64(),
             Some(cfg.im_window_min)
