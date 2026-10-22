@@ -7,6 +7,10 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.8.0` is a minor release: it adds cleavage rules to the digest and to the desktop
+application's Search screen (enzyme presets, custom rules, non-specific digestion). Tryptic
+libraries and existing configurations are unchanged.
+
 `0.7.1` is a patch release: libraries of more than 2^32 - 1 fragment rows load and search,
 and the desktop application's visDIA pin reads the second pass of a match-between-runs
 experiment. A library that fits gives the same output as with 0.7.0.
@@ -107,7 +111,7 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
-## [Unreleased]
+## [0.8.0] - 2026-10-22
 
 ### Added
 
