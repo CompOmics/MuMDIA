@@ -219,7 +219,7 @@ seed_decoy_corrected`, `im_window_multiplier` 1.3, was 1.0) it then widens that 
 `p_im` percentile of the true hits' residuals among every seed PSM up to a seed q of 0.1,
 decoy-corrected, times the multiplier. The anchors and the calibration do not change. The
 choice was made for a synthetic HLA-I pool, where the exact pool sequences found rose from 499
-to 663 at 1.0x (one seed). Against the previous window, x1.3 measured +0.6% peptides on
+to 663 at 1.0x and 708 at 1.3x (one seed). Against the previous window, x1.3 measured +0.6% peptides on
 E. coli, +3.0% real peptides on its entrapment library at an FDP of 0.39-0.43% (against
 0.34-0.39%), -0.25% per run on six 5 min HYE runs and -1.0% per run on ProteoBench HYE (one
 seed); the table is in docs/08 section 7. `anchors` with 1.0 restores the previous window.

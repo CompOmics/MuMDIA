@@ -424,10 +424,11 @@ fine-tuning also is not guaranteed deterministic.
   seed PSM up to seed q 0.1, and `im_window_multiplier` is 1.3 (was 1.0) for both windows.
   The IM anchors stay at the seed's confident cut, so the calibration is unchanged, and the
   window acts only through the 1/K0 gate and retrace (recipe settings). Chosen for a
-  synthetic HLA-I pool (499 -> 663 exact pool sequences at 1.0x, one seed). Against the old
-  window, x1.3 measured E. coli +0.6% peptides and +3.0% real entrapment peptides at an FDP
-  of 0.39-0.43% (against 0.34-0.39%), HYE 5 min -0.25% per run, ProteoBench HYE -1.0% per
-  run on one seed (docs/08 section 7). `anchors` with 1.0 restores the old window.
+  synthetic HLA-I pool (499 -> 663 exact pool sequences at 1.0x, 708 at 1.3x, one seed).
+  Against the old window, x1.3 measured E. coli +0.6% peptides and +3.0% real entrapment
+  peptides at an FDP of 0.39-0.43% (against 0.34-0.39%), HYE 5 min -0.25% per run,
+  ProteoBench HYE -1.0% per run on one seed (docs/08 section 7). `anchors` with 1.0 restores
+  the old window.
 - `configs/examples/diapasef.json` is the recipe. Start a diaPASEF search from it and run
   `mumdia doctor --config` on it first (AlphaPeptDeep, DeepLC, IM2Deep, `nn_torch`).
 - Never carry the Orbitrap `rt_window_multiplier` 1.5 to diaPASEF: 1.5 lost 1.8% and 2.0

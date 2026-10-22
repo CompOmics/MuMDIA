@@ -1043,8 +1043,8 @@ Measured 2026-10-21 and 2026-10-22 with the diaPASEF recipe (`configs/examples/d
 | HYE diaPASEF 5 min, 6 runs, 2 seeds: per run, experiment-wide | 33,346, 38,500 | 33,493, 38,680 | 33,262, 38,563 |
 | HYE diaPASEF 60 min (ProteoBench), 6 runs, 1 seed: per run, experiment-wide | 84,751, 95,871 | 84,635, 96,145 | 83,897, 96,082 |
 | the same: ProteoBench ions at `min_obs` 3, median absolute epsilon global / species-equalised | 99,113, 0.136 / 0.205 | 99,209, 0.136 / 0.203 | 98,642, 0.135 / 0.202 |
-| synthetic HLA-I pool of 1,000 peptides, 2 runs, non-specific 8-12-mer library of 379M precursors, 1 seed, per-run RT bootstrap, no second pass: exact pool sequences | 499 | 663 | pending |
-| `w_im`, V s cm^-2: E. coli; HYE 5 min; ProteoBench; HLA pool | not recorded; not recorded; 0.040; not recorded | 0.039; 0.035; 0.041; 0.053 and 0.057 | 0.051; 0.046; 0.053; pending |
+| synthetic HLA-I pool of 1,000 peptides, 2 runs, non-specific 8-12-mer library of 379M precursors, 1 seed, per-run RT bootstrap, no second pass: exact pool sequences (per run); sequences of the other pools | 499 (385, 481); 1 | 663 (611, 630); 5 | 708 (673, 669); 5 |
+| `w_im`, V s cm^-2: E. coli; HYE 5 min; ProteoBench; HLA pool | not recorded; not recorded; 0.040; not recorded | 0.039; 0.035; 0.041; 0.053 and 0.057 | 0.051; 0.046; 0.053; 0.069 and 0.074 |
 
 Against the previous default (`anchors` x1.0), x1.3:
 
@@ -1059,10 +1059,13 @@ Against the previous default (`anchors` x1.0), x1.3:
 On the bulk data, x1.3 therefore trades up to about 1% of the per-run counts on HYE for the
 E. coli and entrapment gains. The HLA pool is where the window matters. Its seed had 1,104 and
 1,045 targets at q 0.1, against 109 decoys on the first run. At x1.0 the decoy-corrected
-estimate set `w_im` to 0.053 and 0.057; the anchors' `w_im` on this pool was not recorded. On
-the same pool, the anchors' window widened 2.5x found 722 pool sequences, and the 1/K0 gate
-switched off found 709. Fixed floors of 0.041 and 0.05 on the anchors' window found 604 and
-646. x1.3 was chosen for this pool class.
+estimate set `w_im` to 0.053 and 0.057, and x1.3 to 0.069 and 0.074, which found 708 pool
+sequences against 663, with the hits from other pools (false by construction) unchanged at 5.
+The anchors' `w_im` on this pool was not recorded. On the same pool, the anchors' window
+widened 2.5x found 722 pool sequences (6 from other pools), and the 1/K0 gate switched off
+found 709. Fixed floors of 0.041 and 0.05 on the anchors' window found 604 and 646. x1.3 was
+chosen for this pool class. The x1.0 and x1.3 runs ran on different hosts (4:55 against 3:26
+wall), so their times are not compared.
 
 ### DeepLC multitask fine-tune (orchestrator pre-step, default off)
 

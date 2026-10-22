@@ -125,7 +125,8 @@ than a number. Both are recorded in every run's `manifest.json`.
   `anchors` with 1.0 restores the previous windows. The IM anchors, and so the calibration,
   are unchanged: the weaker rows enter only the estimate. The window acts through the 1/K0
   gate and retrace, which the diaPASEF recipe turns on. On a synthetic HLA-I peptide pool
-  (one seed) the exact pool sequences found rose from 499 to 663 at 1.0x. Against the
+  (one seed) the exact pool sequences found rose from 499 to 663 at 1.0x and 708 at 1.3x,
+  with the hits from other pools at 5 in both. Against the
   previous window, x1.3 measured +0.6% peptides on an E. coli run (three seeds), +3.0% real
   peptides on its entrapment library at an FDP of 0.39-0.43% against 0.34-0.39%, -0.25% per
   run on six 5 min HYE runs (two seeds) and -1.0% per run on the six ProteoBench HYE
