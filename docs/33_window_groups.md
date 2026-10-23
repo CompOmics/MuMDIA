@@ -37,6 +37,7 @@ on.
 | `delete_band_intermediates` | `true` | Delete each band's `psms_extracted` and `features` tables once the pool is written (section 6). Disk only; default since 2026-09-27. |
 | `pool_competed` | `false` | `false` leaves the competed rows per band and has rescore read the band tables with a table-to-source map, where that cannot change a result (section 5). `psms_scored.parquet` is byte-identical; the pooled competed table is not written. `true` writes it. Default since 2026-09-26. |
 | `pool_chromatograms` | `false` | `false` leaves the chromatograms per band and has quant read the band tables with the overlap losers the pool persists to `groups/overlap_losers.parquet` (section 5). The quant tables are byte-identical; the pooled chromatogram table is not written, and the band directories become the run's only chromatograms (section 6). `true` writes it. Default since 2026-09-26. |
+| `allow_unbounded_rt` | `false` | A seed or a retention-time fit with fewer than two target anchors stops the run before a band extracts, because unbounded windows make every band extract every candidate over the whole gradient (section 4c). `true` extracts with unbounded windows as before, with a warning. Omitted from the canonical configuration at `false`. |
 
 `run-experiment` (and `run` with several `--mzml`, which dispatches to it) searches every run
 grouped, with one experiment-wide rescore over the pooled competed tables and the
@@ -209,7 +210,12 @@ and is not measured here; the block count is exact.
 
 `ci/smoke.sh` runs a grouped arm (`window_groups: 3, parallel: 2, calibration: per_group`)
 so that this path, and `run_groups` generally, has regression cover: without it every
-assertion in the suite is about the ungrouped `scans: None` arm, which is a no-op.
+assertion in the suite is about the ungrouped `scans: None` arm, which is a no-op. The arm
+sets `allow_unbounded_rt: true`, because no band of the fixture reaches a confident anchor
+on its own q scale (section 4c). Three more runs check the refusal: the same search without
+the key and a global search without anchors both stop right after the seed, with no band
+windows, no extracted table and one MS2 decode, and the global search with the key extracts
+and logs the warning.
 
 ## 4. The seed pool and the two calibration modes
 
@@ -372,7 +378,8 @@ search that table.
 one pooling pass cheaper and every group is independent, but each group fits on a fraction
 of the anchors, and the fit quality sets the RT window that the extract of every group then
 pays for. On the CI fixture it cannot fit at all (no band has a confident anchor, for the
-`1/T` reason above); on a real run every band has thousands.
+`1/T` reason above), and at real scale it fails in the same way: on AT10234AUH three of
+seven bands had no confident seed on their own q scale (section 8).
 
 ### 4b. One retention-time adaptation per run (`groups.rt_adaptation`)
 
@@ -433,6 +440,77 @@ whole-library column band by band, under both the multi-head calibration and the
 an unbanded run predicts. Before defaulting it on: the per-band max |delta `predicted_irt`|
 and the selected heads against `per_band`, and peptides at 1% on a banded HYE arm inside the
 seed spread, on two acquisitions.
+
+### 4c. Too few anchors: the run stops before it extracts (`groups.allow_unbounded_rt`)
+
+With fewer than two target anchors, `rt-im-train` has no mapping from iRT to the run's
+retention time, and it falls back to unbounded windows (`calibration_status =
+insufficient_anchors_unbounded`, the warning "fewer than two target anchors; using unbounded
+RT windows"). A seed without anchors usually has no fragment calibrants either, and
+`seed-pool` then keeps the configured `search_seed.fragment_tol_ppm` (20 ppm by default)
+instead of a learned tolerance ("too few pooled calibrants"). Every band then extracts every
+candidate of its library band over the whole gradient. An ungrouped search on an ordinary
+library survives this fallback, and some workflows rely on it: single-cell blank wells are
+searched that way. A grouped search on a library large enough to need bands does not.
+
+Measured 2026-10-23 on one Astral immunopeptidomics run (63 bands, `groups.parallel = 8`, a
+203M-precursor 8-12-mer library) whose pooled seed gave fewer than two anchors and no
+calibrants: a 150 GB watchdog stopped the extraction at 153 GB on v0.8.0 and at 156 GB on the
+earlier engine 6333855, and a sweep job reached 507.6 GB before the host's earlyoom stopped
+it. On the file whose seed did give anchors, the same configuration peaked at 34-35 GB on
+v0.8.0 and 49 GB on 6333855. Section 8 had already measured single unbounded bands: one
+reached 560 GB, and one aborted at 664 GB at the host's commit limit.
+
+A grouped run therefore stops with an error instead of extracting without windows. It checks
+twice:
+
+- **On the seeds, right after `seed-pool`.** Under `calibration = global` the pooled seed is
+  counted, under `per_group` each band's own seed, as the confident target peptides at
+  `spectrum_q < rt_im_train.q_train` (`rt_im_train::seed_anchor_bound`, the rows the fit
+  takes before it joins their iRT). A seed with fewer than two cannot give a fit with two, so
+  the run stops here, before the MS1 offset, the band slices, the DeepLC sidecars and the
+  extraction decode. Under `per_group` one error names every band whose seed has fewer than
+  two. A run without anchors therefore stops right after its seed, not after a DeepLC pass
+  over the whole library or after most bands have extracted.
+- **On the fit itself.** A seed with anchors can still give a fit on fewer than two, when the
+  re-predicted iRT is not finite or `rt_im_train.anchor_x_filter` removes them. Under
+  `global` the shared fit is checked before the spectra are decoded for extraction; under
+  `per_group` each band's fit is checked before the band's `run_windows.parquet`, `cal.json`
+  or any extraction output is written. Bands already in flight then finish, and no further
+  band starts (`groups::run_bounded`). This message says how many of the seed's anchors the
+  fit kept and points at the iRT rather than at the seed.
+
+The errors begin `groups: the retention-time windows would be unbounded` (`global`),
+`groups: the retention-time windows of band gNN would be unbounded` or `groups: the
+retention-time windows of N of the M bands would be unbounded` (`per_group`). Each names the
+run's output directory, so a multi-run experiment says which run stopped, and gives the
+number of anchors, the number of bands and the fragment tolerance extract would use. A
+grouped run takes its anchors at `rt_im_train.q_train` and, unlike an ungrouped one, does
+not relax that cut through `rt_im_train.anchor_q_ladder`, so it refuses some seeds that an
+ungrouped run would calibrate at a looser cut.
+
+The decision is `rt_im_train::windows_unbounded` (`n_train < 2`), the same function that
+chooses the unbounded windows, and the seed count bounds `n_train` from above, so a run is
+refused exactly when it would have extracted without windows. A fit on two or more anchors is
+not affected, including one below `min_seed_for_calibration` that gets the fixed fallback
+window. On real data `per_group` bands often have no confident anchor on their own q scale
+(on AT10234AUH three of seven, section 8), so that mode now stops where it used to extract
+without windows. The ungrouped path is unchanged.
+
+What to do:
+
+1. Check the seed: the library and its decoys, the seed's fragment tolerance
+   (`search_seed.fragment_tol_ppm`) and the input file. The run's `seed_psms.parquet` and
+   `seed_psms.parquet.masscal.json` are written before the check. When the error says the
+   fit kept fewer anchors than the seed had, check the library's `predicted_irt` and the
+   DeepLC step that rewrote it instead.
+2. Search the run ungrouped (`groups.window_groups = 1`) if the library fits in memory
+   without bands. The ungrouped path keeps the unbounded fallback.
+3. Under `per_group`, use `calibration = global` (the default), which fits one calibration on
+   the anchors of every band.
+4. To extract with unbounded windows deliberately, set `groups.allow_unbounded_rt = true`.
+   The run then behaves exactly as before, with a warning that names the key. The key is
+   omitted from the canonical configuration at `false`, so no existing config hash changes.
 
 ## 5. The artifact pool
 

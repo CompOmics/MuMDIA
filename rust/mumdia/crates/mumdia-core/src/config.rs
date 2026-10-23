@@ -3640,6 +3640,37 @@ pub struct GroupsConfig {
     /// --groups-dir` rebuilds the pooled table from them. `true` writes the pooled table as
     /// before.
     pub pool_chromatograms: bool,
+    /// Let the bands extract with unbounded retention-time windows. Default `false`: when the
+    /// fit a band extracts with has fewer than two target anchors (the pooled seed under
+    /// `calibration = global`, the band's own seed under `per_group`), the run stops with an
+    /// error before a band extracts with it. The seeds are counted right after `seed-pool`,
+    /// before any DeepLC sidecar or extraction, and the fit itself is checked again before
+    /// its windows are written. `true` keeps the previous behaviour and logs a warning that
+    /// names this key.
+    ///
+    /// The default refuses because the memory of such a run has no bound. With fewer than two
+    /// anchors `rt-im-train` falls back to unbounded windows, and a seed without anchors
+    /// usually has no fragment calibrants either, so extract also searches at the configured
+    /// `search_seed.fragment_tol_ppm` instead of a learned tolerance. Every band then
+    /// extracts every candidate over the whole gradient. Measured 2026-10-23 on one Astral
+    /// immunopeptidomics run (63 bands, `parallel` 8, a 203M-precursor 8-12-mer library) whose
+    /// seed gave no anchors: a 150 GB watchdog stopped the extraction at 153 GB on v0.8.0 and
+    /// at 156 GB on the earlier engine 6333855, and a sweep job reached 507.6 GB before the
+    /// host's out-of-memory guard stopped it. On a file whose seed gave anchors the same
+    /// configuration peaked at 34-35 GB on v0.8.0 and 49 GB on 6333855. Single unbounded bands
+    /// had already reached 560 GB, and 664 GB when one aborted at the host's commit limit
+    /// (`docs/33_window_groups.md` section 8).
+    ///
+    /// Check the seed first: the library and its decoys, the seed's fragment tolerance and
+    /// the input file. A run without a confident seed can be searched ungrouped
+    /// (`window_groups = 1`), which keeps the unbounded fallback: on an ordinary library it
+    /// fits in memory, and single-cell blank wells are searched that way. Under `per_group`,
+    /// `calibration = global` fits one calibration on the anchors of every band. Omitted
+    /// from the canonical configuration at its default, so the config hash of every
+    /// configuration that does not set it is unchanged (`docs/33_window_groups.md` section
+    /// 4c).
+    #[serde(skip_serializing_if = "is_false")]
+    pub allow_unbounded_rt: bool,
 }
 impl Default for GroupsConfig {
     fn default() -> Self {
@@ -3652,6 +3683,7 @@ impl Default for GroupsConfig {
             delete_band_intermediates: true,
             pool_competed: false,
             pool_chromatograms: false,
+            allow_unbounded_rt: false,
         }
     }
 }
@@ -6042,6 +6074,31 @@ mod tests {
         assert_eq!(Config::default().groups.balance, GroupBalance::Precursors);
         let c = Config::from_json(r#"{"groups":{"balance":"cost"}}"#).unwrap();
         assert_eq!(c.groups.balance, GroupBalance::Cost);
+    }
+
+    /// `groups.allow_unbounded_rt` is off by default and omitted from the canonical
+    /// configuration while off, so the config hash of every configuration that does not set
+    /// it is unchanged and an explicit `false` changes nothing. `true` parses and is part of
+    /// the configuration's identity.
+    #[test]
+    fn allow_unbounded_rt_defaults_off_and_leaves_the_default_config_hash_alone() {
+        let d = Config::default();
+        assert!(!d.groups.allow_unbounded_rt);
+        let canon = d.canonical_json();
+        assert!(!canon.contains("allow_unbounded_rt"), "{canon}");
+        let explicit = Config::from_json(r#"{"groups":{"allow_unbounded_rt":false}}"#).unwrap();
+        assert!(!explicit.groups.allow_unbounded_rt);
+        assert_eq!(explicit.canonical_json(), canon);
+        let on = Config::from_json(r#"{"groups":{"window_groups":4,"allow_unbounded_rt":true}}"#)
+            .unwrap();
+        assert!(on.groups.allow_unbounded_rt);
+        let c = on.canonical_json();
+        assert!(c.contains(r#""allow_unbounded_rt":true"#), "{c}");
+        // The serialized form reads back to the same setting.
+        let back = Config::from_json(&c).unwrap();
+        assert!(back.groups.allow_unbounded_rt);
+        assert_eq!(back.canonical_json(), c);
+        assert!(Config::from_json(r#"{"groups":{"allow_unbounded_rt":"yes"}}"#).is_err());
     }
 
     #[test]

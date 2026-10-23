@@ -31,6 +31,7 @@ is the source of truth if it has moved.
 | Every modified form of a peptide is missing from the output; `precursor_q` reports exactly 1.000 precursors per peptide | `compete.group_by = base_peptide` keys the stripped sequence, not the precursor (`compete.rs:88`), and deletes all but the top-scoring sibling before rescore (`compete.rs:319-340`) | Set `compete.group_by = peptidoform_charge` (`compete.rs:93-98`); required for any PTM search |
 | `cal.json` reports a small `rt_residual_abs_median_s` but RT windows still miss peptides | The residual is measured on the same anchors the calibration was fitted to (`rt_im_train.rs:137`, `rt_im_train.rs:177-185`), so it is in-sample | Treat it as a fit diagnostic; size external RT tolerances from an out-of-sample comparison |
 | RT windows in a PTM search behave as if the modification were absent | The imported library gave every modform of a stripped peptide the same `predicted_irt` | Check per-stripped-peptide variance of `predicted_irt` in the library; re-predict iRT per peptidoform |
+| A grouped run (`groups.window_groups > 1`) stops with `groups: the retention-time windows would be unbounded` (or `... of band gNN would be unbounded`, `... of N of the M bands would be unbounded`) | The seed has fewer than two confident target anchors, or the fit kept fewer than two of them, so every band would extract every candidate over the whole gradient, usually at the configured fragment tolerance, and the memory has no bound (`run_groups.rs:828-880`, `run_groups.rs:438-469`, `rt_im_train.rs:80`) | Check the seed (library, decoys, `search_seed.fragment_tol_ppm`, input file), or the library's `predicted_irt` when the fit lost the anchors; search the run ungrouped; under `per_group` use `calibration = global`; or set `groups.allow_unbounded_rt = true` deliberately. See "Grouped search: unbounded retention-time windows" below |
 | A single-file run spends over half an hour before extract starts | `rt_im_train.finetune_deeplc = true` fine-tunes and then re-predicts iRT over the whole library on every file | Fine-tune once into the library's `predicted_irt`, then run with `finetune_deeplc = false` and the per-run LOESS |
 | `OSError: [WinError 1114] ... Error loading "...\torch\lib\c10.dll"` from a DeepLC worker | numpy/pyarrow were imported before `deeplc`; DeepLC 4.x is torch-backed and the wrong order aborts torch DLL init | Keep `import deeplc` first (`scripts/deeplc_worker.py:26`); the ordering is load-bearing, do not sort those imports |
 | `mumdia doctor` is green, then the run crashes at the DeepLC fine-tune on a missing import | doctor probed only part of what `deeplc_finetune.py` imports | Current doctor probes `deeplc,numpy,pandas,pyarrow,torch,psm_utils` (`main.rs:370`); re-run it after any env change |
@@ -294,6 +295,46 @@ was 0.9876 for unmodified peptides but 0.4980 for modified ones. Before trusting
 RT windows in a PTM search, check the per-stripped-peptide variance of
 `predicted_irt` in the library; if it is zero for most groups, re-predict iRT per
 peptidoform.
+
+## Grouped search: unbounded retention-time windows
+
+**Symptom.** A grouped run (`groups.window_groups > 1`) stops with an error that begins
+`groups: the retention-time windows would be unbounded` (`groups.calibration = global`), or
+`groups: the retention-time windows of band gNN would be unbounded` or `... of N of the M
+bands would be unbounded` (`per_group`). The message names the run's output directory and
+gives the number of target anchors, the number of bands and the fragment tolerance extract
+would have used. Usually it comes right after `seed-pool`, before any DeepLC step.
+
+**Cause.** The seed has fewer than two confident target anchors (`spectrum_q` below
+`rt_im_train.q_train`), or, more rarely, the retention-time fit kept fewer than two of them
+because their re-predicted iRT is not finite or `rt_im_train.anchor_x_filter` removed them;
+the message says which. `rt-im-train` then has no mapping from iRT to retention time and
+falls back to unbounded windows, and a seed without anchors usually leaves the fragment
+tolerance at the configured `search_seed.fragment_tol_ppm` as well. Every band would
+extract every candidate over the whole gradient. On one 63-band Astral immunopeptidomics
+run with a 203M-precursor 8-12-mer library, a 150 GB watchdog stopped the extraction at
+153 GB on v0.8.0 and at 156 GB on the earlier engine 6333855, and a sweep job reached
+507.6 GB before the host stopped it; on a file whose seed gave anchors the same
+configuration peaked at 34-35 GB on v0.8.0 and 49 GB on 6333855. Since 2026-10-23 the grouped run refuses such a
+seed or fit before a band extracts with it (`docs/33_window_groups.md` section 4c). The
+ungrouped path is unchanged and still falls back to unbounded windows.
+
+**Fix.**
+
+- Check the seed first. A seed without confident targets points to the library and its
+  decoys (decoys that score like targets), the seed's fragment tolerance
+  (`search_seed.fragment_tol_ppm`), or the input file (empty, truncated or blank). The
+  pooled `seed_psms.parquet` and its `masscal.json` are written before the check. A grouped
+  run takes its anchors at `rt_im_train.q_train` and does not relax that cut through
+  `rt_im_train.anchor_q_ladder` as an ungrouped run does.
+- When the message says the fit kept fewer anchors than the seed had, check the library's
+  `predicted_irt` and the DeepLC step that rewrote it in this run.
+- Search the run ungrouped (`groups.window_groups = 1`) if the library fits in memory
+  without bands.
+- Under `groups.calibration = per_group`, switch to `global` (the default). A band holds a
+  fraction of the anchors and often reaches no confident seed on its own q scale.
+- To extract with unbounded windows deliberately, set `groups.allow_unbounded_rt = true`.
+  The run then behaves as before and logs a warning that names the key.
 
 ## External Parquet and library preconditions
 
