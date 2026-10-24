@@ -847,8 +847,7 @@ fn hold_window_frames(
         .par_iter()
         .map(|&fi| -> Result<(usize, TofFrame)> {
             let f = raw
-                .reader
-                .get(fi)
+                .frame(fi)
                 .map_err(|e| anyhow!("{path}: frame {fi}: {e}"))?;
             Ok((fi, TofFrame::new(f)?))
         })
@@ -1123,8 +1122,7 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
     }
     drop(win_of);
     let n_scans = raw
-        .reader
-        .get(ms1_fi[0])
+        .frame(ms1_fi[0])
         .map_err(|e| anyhow!("{}: frame {}: {e}", p.raw, ms1_fi[0]))?
         .scan_offsets
         .len()
@@ -1251,8 +1249,7 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
                 return Ok(None);
             }
             let mut f = raw
-                .reader
-                .get(i)
+                .frame(i)
                 .map_err(|e| anyhow!("{}: frame {i}: {e}", p.raw))?;
             if let Some(d) = ms1_denoise.as_ref() {
                 d.apply_to_frame(&mut f);
