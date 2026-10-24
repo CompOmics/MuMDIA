@@ -134,6 +134,15 @@ than a number. Both are recorded in every run's `manifest.json`.
   7). `cal.json` gains an `im_window_sizing` block on runs with 1/K0. Spectra without 1/K0
   are unaffected: every 3D artifact, report and config hash is unchanged.
 
+### Fixed
+
+- **diaPASEF: a frame recorded without peaks no longer stops conversion.** A timsTOF frame
+  with `Frames.NumPeaks` 0 stores no compressed payload, and convert and retrace failed on
+  it with `frame 0: Decompression fails`; the first frame of some timsTOF Pro runs is one.
+  Such a frame is now read as its scans with no peaks, which gives an empty MS1 spectrum or
+  one empty spectrum per slot. A frame that declares peaks and cannot be decoded is still an
+  error. Runs without such frames convert as before.
+
 ## [0.8.0] - 2026-10-22
 
 ### Added
