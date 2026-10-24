@@ -577,7 +577,7 @@ instead, and the quant report's `chromatograms` lists the band tables with
 groups/g00/chromatograms.parquet ... --overlap-losers groups/overlap_losers.parquet`, with
 the band tables in band order, or `mumdia pool --groups-dir` rebuilds the pooled table.
 `true` writes the pooled table. To validate on a data set, run the same grouped
-configuration with the default and with `true` and compare `peptide_quant.parquet`,
+configuration with the default and with `true` and compare `ion_quant.parquet`,
 `protein_group_quant.parquet` and `fragment_quant.parquet` byte for byte; the smoke does
 this on its three-band fixture. Done on the AIF benchmark in four bands (augmented DIA-NN
 library, `native_tda`, 1,050,807 chromatogram rows, disjoint bands): the three quant tables,

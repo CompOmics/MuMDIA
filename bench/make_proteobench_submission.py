@@ -48,7 +48,7 @@ def fasta_entry_map(path: str) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("runs", nargs="+", help="RUN_NAME=peptide_quant.parquet pairs")
+    ap.add_argument("runs", nargs="+", help="RUN_NAME=ion_quant.parquet pairs")
     ap.add_argument("--fasta", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--min-fragments", type=int, default=1, help="minimum n_fragments_used per quantity")

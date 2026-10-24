@@ -315,7 +315,7 @@ def main() -> int:
     # ---------------------------------------------------------------------- quant
     print("quantification")
     pep_q = pq.read_table(
-        out / "peptide_quant.parquet", columns=["quantity", "quant_status", "n_fragments_used"]
+        out / "ion_quant.parquet", columns=["quantity", "quant_status", "n_fragments_used"]
     ).to_pydict()
     quantified = [
         (q, n) for q, s, n in zip(pep_q["quantity"], pep_q["quant_status"], pep_q["n_fragments_used"])
@@ -340,7 +340,7 @@ def main() -> int:
     # apex only about half the time. Nothing asserted it, so a schema change that dropped
     # `apex_rt` from the scored table would have made every quantity wrong while all the
     # other assertions here stayed green.
-    qrep = json.loads((out / "peptide_quant.parquet.report.json").read_text(encoding="utf-8"))
+    qrep = json.loads((out / "ion_quant.parquet.report.json").read_text(encoding="utf-8"))
     # The stage records these under `params`; fall back to the report root so a schema
     # move fails on the assertion rather than on a KeyError here.
     qstats = qrep.get("params", qrep)
@@ -454,7 +454,7 @@ def main() -> int:
                  f"{len(set(src))} distinct source values")
 
         for r in ("a", "b"):
-            for name in ("peptide_quant.parquet", "protein_group_quant.parquet"):
+            for name in ("ion_quant.parquet", "protein_group_quant.parquet"):
                 p = exp / r / name
                 c.ok(p.is_file() and pq.read_metadata(p).num_rows > 0,
                      f"run {r} wrote a non-empty {name}",

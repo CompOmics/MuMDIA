@@ -116,7 +116,8 @@ library (predicted library, import, paired decoys with predicted spectra) is des
 |---|---|
 | `peptides.tsv`, `proteins.tsv` | identified precursors and protein groups, for reading |
 | `psms_scored.parquet` | every scored PSM with all q columns; the unit for analysis |
-| `peptide_quant.parquet`, `protein_group_quant.parquet` | quantities for analysis |
+| `ion_quant.parquet` | quantities per peptidoform and charge, retaining modifications |
+| `protein_group_quant.parquet` | protein-group quantities |
 | `lfq_maxlfq.parquet` | cross-run protein matrix (experiments) |
 | `manifest.json`, `*.report.json` | provenance, hashes, parameters, model identities |
 

@@ -116,7 +116,7 @@
     },
     "peptide_quant": {
       "logical_name": "peptide_quant",
-      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/peptide_quant.parquet",
+      "path": "C:/Users/robbi/AppData/Local/Temp/claude/H--OneDrive---UGent-MuMDIA-NG/ed948dad-9d5a-423e-9f52-cf197cbee207/scratchpad/smoke_final/out/ion_quant.parquet",
       "format": "parquet",
       "schema_name": "peptide_quant",
       "schema_version": 2,

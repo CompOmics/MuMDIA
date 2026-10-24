@@ -4120,7 +4120,7 @@ mod tests {
     fn quant_run_preserves_unquantifiable_ids_and_applied_window_contract() {
         let scored = quant_test_path("scored.parquet");
         let chrom = quant_test_path("chrom.parquet");
-        let peptide = quant_test_path("peptide_quant.parquet");
+        let peptide = quant_test_path("ion_quant.parquet");
         let protein = quant_test_path("protein_quant.parquet");
         let fragment = quant_test_path("fragment_quant.parquet");
         let bounds = quant_test_path("peak_bounds.parquet");

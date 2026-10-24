@@ -611,7 +611,7 @@ Usage: mumdia quant-lfq [OPTIONS] --out <OUT>
 
 Options:
       --inputs <INPUTS>...
-          One per-run table per run: peptide_quant.parquet for maxlfq, fragment_quant.parquet for directlfq
+          One per-run table per run: ion_quant.parquet for maxlfq, fragment_quant.parquet for directlfq
 
       --method <METHOD>
           `maxlfq` (peptide-level) or `directlfq` (ion/fragment-level)

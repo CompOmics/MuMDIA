@@ -45,7 +45,9 @@ stages that operate across multiple runs.
 Consumes `psms_scored.parquet` (from `rescore`) and `chromatograms.parquet` (from
 `extract`). Produces two mandatory artifacts and two optional ones.
 
-`peptide_quant.parquet` (schema `PEPTIDE_QUANT` v2):
+`ion_quant.parquet` (schema `PEPTIDE_QUANT` v2):
+
+Each row is a peptidoform and precursor charge; modification annotations in `peptidoform` are retained. The generated filename was previously `peptide_quant.parquet`. Existing result directories keep their recorded paths, while new runs use `ion_quant.parquet`. The Parquet schema, CLI options and manifest keys retain their existing names.
 
 | column | type | meaning |
 |---|---|---|
@@ -172,7 +174,7 @@ handler prints a one-line summary (`main.rs:806`).
 experiment root, rows selected on the experiment-wide `peptide_q_value` /
 `pg_q_value`, an `n_runs` column counting the runs whose own `run_psm_q` accepts
 the precursor or group, and one quantity column per run (`quantity_<run>` from each
-run's `peptide_quant.parquet`, `lfq_<run>` from `lfq_maxlfq.parquet`). No per-run
+run's `ion_quant.parquet`, `lfq_<run>` from `lfq_maxlfq.parquet`). No per-run
 TSV is written, because the grouped q columns are assigned to each group's
 experiment-wide winner only.
 
@@ -834,7 +836,7 @@ but is filtered and labeled with peptide-level q. It is neither a stripped-pepti
 table nor a `precursor_q`-controlled precursor table. Report filtering is also
 independent of `quant.q_filter`, so a report row can legitimately have a blank
 quantity when quant excluded it or marked it nonquantifiable. Use
-`peptide_quant.parquet`/`protein_group_quant.parquet` for numerical analysis:
+`ion_quant.parquet`/`protein_group_quant.parquet` for numerical analysis:
 Parquet retains nullable f64 precision and status/bounds, while TSV quantity is a
 presentation value rounded to one decimal.
 

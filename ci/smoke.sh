@@ -355,7 +355,7 @@ test ! -e "$work/out_grouped_pool/groups/overlap_losers.parquet" \
     || { echo "the overlap losers were written beside the pooled chromatograms"; exit 1; }
 cmp -s "$work/out_grouped/psms_scored.parquet" "$work/out_grouped_pool/psms_scored.parquet" \
     || { echo "rescoring the pooled competed table changed psms_scored.parquet"; exit 1; }
-for f in peptide_quant.parquet protein_group_quant.parquet fragment_quant.parquet peptides.tsv proteins.tsv; do
+for f in ion_quant.parquet protein_group_quant.parquet fragment_quant.parquet peptides.tsv proteins.tsv; do
     cmp -s "$work/out_grouped/$f" "$work/out_grouped_pool/$f" \
         || { echo "quantifying the pooled chromatograms changed $f"; exit 1; }
 done
@@ -430,7 +430,7 @@ grep -q 'chromatogram row groups resized' "$work/chrom_v2_rg1.log" \
     || { echo "MUMDIA_CHROM_ROW_GROUP_ROWS did not reach extract"; exit 1; }
 for d in out_chrom_v1 out_chrom_v2_rg1; do
     for f in psms_extracted.parquet features.parquet psms_competed.parquet psms_scored.parquet \
-             peptide_quant.parquet protein_group_quant.parquet fragment_quant.parquet \
+             ion_quant.parquet protein_group_quant.parquet fragment_quant.parquet \
              peptides.tsv proteins.tsv; do
         cmp -s "$work/out/$f" "$work/$d/$f" \
             || { echo "the chromatogram layout ($d) changed $f"; exit 1; }
@@ -452,7 +452,7 @@ for arm in grouped_v1 grouped_nopool_v1; do
         --out-dir "$work/out_$arm" --config "$work/$arm.json" --threads 4 \
         > "$work/$arm.log" 2>&1 \
         || { tail -30 "$work/$arm.log"; echo "the grouped chromatograms v1 run ($arm) failed"; exit 1; }
-    for f in psms_scored.parquet peptide_quant.parquet protein_group_quant.parquet \
+    for f in psms_scored.parquet ion_quant.parquet protein_group_quant.parquet \
              fragment_quant.parquet peptides.tsv proteins.tsv; do
         cmp -s "$work/out_grouped/$f" "$work/out_$arm/$f" \
             || { echo "the chromatogram layout changed $f of the grouped run ($arm)"; exit 1; }
@@ -1098,7 +1098,7 @@ echo "=== smoke: assertions"
 echo "=== smoke: also check inspect and report run standalone"
 "$BIN" inspect "$work/out/psms_scored.parquet" > /dev/null
 "$BIN" report --psms-scored "$work/out/psms_scored.parquet" --out-dir "$work/report_only" \
-    --peptide-quant "$work/out/peptide_quant.parquet" --q 0.05 > /dev/null
+    --peptide-quant "$work/out/ion_quant.parquet" --q 0.05 > /dev/null
 test -s "$work/report_only/peptides.tsv"
 
 # Hashes of the user-facing outputs, for the cross-platform comparison in CI.

@@ -63,7 +63,7 @@ def load_arm(arm: Path) -> dict[tuple[str, int], dict[str, float]]:
     table: dict[tuple[str, int], dict[str, float]] = {}
     proteins: dict[tuple[str, int], str] = {}
     for run in RUNS_A + RUNS_B:
-        path = arm / run / "peptide_quant.parquet"
+        path = arm / run / "ion_quant.parquet"
         if not path.is_file():
             raise SystemExit(f"missing {path}")
         t = pq.read_table(

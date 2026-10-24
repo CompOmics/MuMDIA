@@ -115,6 +115,8 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- Rename the precursor quantity output from `peptide_quant.parquet` to `ion_quant.parquet` in single-run and experiment outputs. Each row retains its modified peptidoform and charge. Update scripts that open the generated filename directly; table schemas, CLI options and existing manifest field names are unchanged.
+
 - **diaPASEF: the 1/K0 window is sized from the whole seed, decoy-corrected, and widened
   1.3x.** `rt_im_train.im_window_sizing` defaults to `seed_decoy_corrected`. search-seed
   records the observed 1/K0 of every PSM up to a seed q of 0.1 (`im_window_sizing_q`),

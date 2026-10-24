@@ -14,7 +14,7 @@ library, and hours of compute. The end-to-end test CI does run is
 | `make_proteobench_submission.py` | Build a ProteoBench "Custom" input TSV from per-run `pepquant_<run>.parquet`. Expands MuMDIA's protein entry names back to full FASTA identifiers so ProteoBench's own `Cont_` contaminant flag and `_HUMAN`/`_YEAST`/`_ECOLI` species flags apply unchanged. |
 | `pb_eval.py` | Score a submission offline with ProteoBench's own parser and scoring code. Nothing is uploaded and no token is used. `--module` selects the module, which fixes the run names and the expected ratios; an unknown id is rejected with the available list. |
 | `prov_filter.py` | Condition-evidence filters (F1 to F4) deciding which run values may be reported. Withholding transferred values in a condition with no direct identification is what removes low-abundance ratio compression; see the docstring for the measurements. |
-| `qab_score.py` | Score one arm of a quantification A/B directly from the per-run `peptide_quant.parquet` of a `run-experiment` output tree: features, completeness, median abs epsilon against the HYE expected ratios, and CV. Not ProteoBench's own numbers (see its docstring); the point is that two arms are scored identically. |
+| `qab_score.py` | Score one arm of a quantification A/B directly from the per-run `ion_quant.parquet` of a `run-experiment` output tree: features, completeness, median abs epsilon against the HYE expected ratios, and CV. Not ProteoBench's own numbers (see its docstring); the point is that two arms are scored identically. |
 | `make_entrapment_fasta.py` | Build a real + 1:1 foreign entrapment FASTA (`REAL_` / `ENTRAP_` accession prefixes, seeded sample). With `--ratio-library` it prints `rescore.entrapment_ratio` of a built library instead: real over entrapment target candidates, classified as the engine does. See the ratio note below. |
 | `tims/tims_compare.py` | Compare one run's `psms_scored.parquet` with a reference identification table of the same run (`--reference`) at one q: precursors, peptides and protein groups, each with its unit named, plus the I/L-merged peptide overlap. |
 | `tims/tims_loss.py` | Classify every reference precursor at q by why MuMDIA misses it: not in the library, not extracted (reference RT or 1/K0 outside the window, or inside both), accepted, right peak but low score, wrong peak inside or outside the RT window. Writes the per-precursor table that `fs_loss_evidence.py` reads. The stage-by-stage ladder of every candidate comes from `mumdia audit` and the stage `report.json` files, not from here. |
@@ -182,7 +182,7 @@ Both arms ran with `MUMDIA_NN_STREAM_GB=64` so both used the in-memory rescore
 backend; they are therefore comparable to each other, but not to HYE numbers recorded
 on the streaming memmap path.
 
-Metrics from `bench/qab_score.py` over the per-run `peptide_quant.parquet`: feature = (peptidoform, charge),
+Metrics from `bench/qab_score.py` over the per-run `ion_quant.parquet`: feature = (peptidoform, charge),
 `quant_status == "quantified"` only, species from the `_HUMAN`/`_YEAST`/`_ECOLI`
 suffixes with multi-species groups dropped (about 900 per arm), expected log2 A/B of
 0 / +1 / -2 from the module's `module_settings.toml`. These are not ProteoBench's own
