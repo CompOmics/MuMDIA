@@ -296,7 +296,7 @@ pub struct ExperimentReportParams<'a> {
     pub scored: &'a str,
     /// Run names in `source` order; they name the per-run quantity columns.
     pub run_names: &'a [String],
-    /// Per-run `peptide_quant.parquet`, in `source` order: the same per-run precursor
+    /// Per-run `ion_quant.parquet`, in `source` order: the same per-run precursor
     /// quantities the single-run report shows. Empty writes no quantity columns.
     pub peptide_quants: &'a [String],
     /// The cross-run protein matrix (`lfq_maxlfq.parquet`: protein_group, run, quantity),
@@ -1017,7 +1017,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let qa = tmp("a_peptide_quant.parquet");
+        let qa = tmp("a_ion_quant.parquet");
         write_table(
             &qa,
             vec![
@@ -1027,7 +1027,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let qb = tmp("b_peptide_quant.parquet");
+        let qb = tmp("b_ion_quant.parquet");
         write_table(
             &qb,
             vec![
@@ -1431,7 +1431,7 @@ mod tests {
     #[test]
     fn report_joins_quantities_and_leaves_unquantified_rows_empty() {
         let scored = scored_table();
-        let quant = tmp("peptide_quant.parquet");
+        let quant = tmp("ion_quant.parquet");
         // Only the first passing precursor is quantified.
         write_table(
             &quant,

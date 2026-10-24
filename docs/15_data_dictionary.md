@@ -877,6 +877,8 @@ pooled `q_value`, and `run_psm_q`, and does not select a run
 
 ### peptide_quant (schema v2, `quant.rs:487-502`)
 
+Written as `ion_quant.parquet`: one row per peptidoform and charge, including modified peptidoforms. The schema identifier remains `peptide_quant` v2; the filename distinguishes precursor-ion quantities from an unmodified-peptide rollup.
+
 | column | Arrow type | nullable | units | meaning |
 |---|---|---|---|---|
 | `candidate_id` | UInt32 | no | - | library candidate id |
@@ -1129,7 +1131,7 @@ admitted through a transferred row carries the flag so the reader can tell.
 
 Values are formatted for reading, not for analysis: `q_value` is printed to six
 decimals, `score` to four, and `quantity` to one
-(`report.rs:39-45,110-120,144`). Use `peptide_quant.parquet` and
+(`report.rs:39-45,110-120,144`). Use `ion_quant.parquet` and
 `protein_group_quant.parquet` for anything quantitative.
 
 ### `peptides.tsv` (`report.rs:95-122`)
@@ -1146,7 +1148,7 @@ the best q (`report.rs:90,105-108`). Targets only, filtered on
 | `protein` | `protein` | the PSM's protein string, not the inferred group |
 | `q_value` | `peptide_q_value` | **base-peptide** q, six decimals |
 | `score` | `score` | rescorer score, four decimals |
-| `quantity` | `peptide_quant.parquet` joined on `(peptidoform, charge)` | empty when the precursor was not quantifiable or no `--peptide-quant` was passed (`report.rs:39-45,61-72`) |
+| `quantity` | `ion_quant.parquet` joined on `(peptidoform, charge)` | empty when the precursor was not quantifiable or no `--peptide-quant` was passed (`report.rs:39-45,61-72`) |
 | `is_transferred` | `is_transferred` (`mumdia mbr`), `false` without it | `true` when the row was admitted as a match-between-runs transfer rather than on its q |
 | `transfer_q` | `transfer_q` (`mumdia mbr`) | the transfer q the row was accepted at, six decimals; empty on every other row |
 

@@ -453,7 +453,7 @@ enum Cmd {
     },
     /// Combine per-run quant tables into a protein-by-run matrix (cross-run LFQ).
     QuantLfq {
-        /// One per-run table per run: peptide_quant.parquet for maxlfq,
+        /// One per-run table per run: ion_quant.parquet for maxlfq,
         /// fragment_quant.parquet for directlfq.
         #[arg(long, num_args = 1..)]
         inputs: Vec<String>,

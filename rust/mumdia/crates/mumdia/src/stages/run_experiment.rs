@@ -2331,7 +2331,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             let written = quant::run_hashed(quant::QuantParams {
                 psms_scored: &split_paths[i],
                 chromatograms: &chroms[i],
-                out_peptide: &tmp("peptide_quant"),
+                out_peptide: &tmp("ion_quant"),
                 out_protein: &tmp("protein_group_quant"),
                 out_fragment: Some(&ft),
                 out_peak_bounds: None,
@@ -2340,7 +2340,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 cross_run: None,
                 export_cross_run: true,
             })?;
-            for n in ["peptide_quant", "protein_group_quant"] {
+            for n in ["ion_quant", "protein_group_quant"] {
                 for path in [tmp(n), format!("{}.report.json", tmp(n))] {
                     std::fs::remove_file(&path)
                         .with_context(|| format!("removing the first-pass table {path}"))?;
@@ -2363,7 +2363,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // Each run's quant hashes its two tables for their reports; the manifest below reuses
     // those hashes instead of reading the tables again.
     let finals = quant_plan.map_pooled(&run_idx, |&i| {
-        let pq = d(&format!("{}/peptide_quant.parquet", names[i]));
+        let pq = d(&format!("{}/ion_quant.parquet", names[i]));
         let gq = d(&format!("{}/protein_group_quant.parquet", names[i]));
         let written = quant::run_hashed(quant::QuantParams {
             psms_scored: &split_paths[i],

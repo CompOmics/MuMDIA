@@ -194,7 +194,7 @@ u32, carried `apex_rt`/`elution_lo`/`elution_hi`, `score` f64, `q_value` f64,
 `run_psm_q` f64, `experiment_psm_q` f64, `precursor_q` f64. The q-value columns
 are independent per level, not a rollup (see Gotchas).
 
-`peptide_quant.parquet` (schema version 2): `candidate_id`, `base_peptide_id`,
+`ion_quant.parquet` (schema version 2): `candidate_id`, `base_peptide_id`,
 `peptidoform`, `charge`, `protein_group`, nullable `quantity`, `quant_status`,
 `n_fragments_used`, and nullable applied integration apex/bounds.
 `protein_group_quant.parquet` (schema version 2): `protein_group`, nullable
@@ -376,7 +376,7 @@ Per-subcommand specifics that are easy to miss:
                                                |
         [optional] lib_p + psms_extracted + competed + scored --> audit --> candidate_audit.parquet
                                                |
-        psms_scored + chromatograms --> quant --> peptide_quant.parquet,
+        psms_scored + chromatograms --> quant --> ion_quant.parquet,
                                                   protein_group_quant.parquet, fragment_quant.parquet
                                                |
         psms_scored + quant --> report --> peptides.tsv, proteins.tsv

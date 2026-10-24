@@ -906,7 +906,7 @@ pub fn run(p: RunParams) -> Result<()> {
         })?;
     }
 
-    let pep_q = d("peptide_quant.parquet");
+    let pep_q = d("ion_quant.parquet");
     let pg_q = d("protein_group_quant.parquet");
     let frag_q = d("fragment_quant.parquet");
     info!(stage = %"quant", "run: stage start");
