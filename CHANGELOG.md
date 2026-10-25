@@ -144,6 +144,27 @@ than a number. Both are recorded in every run's `manifest.json`.
   diaPASEF runs (one seed), with the experiment-wide counts +0.2% on both (docs/08 section
   7). `cal.json` gains an `im_window_sizing` block on runs with 1/K0. Spectra without 1/K0
   are unaffected: every 3D artifact, report and config hash is unchanged.
+- **A grouped search stops instead of extracting without retention-time windows.** When the
+  retention-time fit of a window-group search (`groups.window_groups > 1`) has fewer than two
+  target anchors, `rt-im-train` falls back to unbounded windows, and every band extracts
+  every candidate over the whole gradient, usually at the configured fragment tolerance
+  because such a seed has no calibrants either. The run now stops with an error before a
+  band extracts with such a fit. The seeds are counted right after `seed-pool` (the pooled
+  seed under `groups.calibration = global`, each band's own under `per_group`, every short
+  band named in one error), before the MS1 offset, the band slices, the DeepLC sidecars and
+  the extraction decode; the fit itself is checked again before its windows are written,
+  for anchors lost to a non-finite iRT or `rt_im_train.anchor_x_filter`. The message names
+  the run's output directory, gives the anchor count, the number of bands and the fragment
+  tolerance, and says what to check. The new key `groups.allow_unbounded_rt = true`
+  restores the previous behaviour with a warning; at its default `false` it is omitted from
+  the canonical configuration, so no config hash changes. The decision uses the same
+  function as `rt-im-train` (`rt_im_train::windows_unbounded`). Measured on one Astral
+  immunopeptidomics run (63 bands, `groups.parallel` 8, a 203M-precursor 8-12-mer library)
+  whose seed gave no anchors: a 150 GB watchdog stopped the extraction at 153 GB on 0.8.0
+  and at 156 GB on an earlier engine, and a sweep job reached 507.6 GB before the host's
+  out-of-memory guard stopped it. On a file whose seed gave anchors the same configuration
+  peaked at 34-35 GB on 0.8.0 and 49 GB on the earlier engine. Ungrouped searches are
+  unchanged and keep the unbounded fallback (docs/33 section 4c, docs/17).
 
 ## [0.8.0] - 2026-10-22
 

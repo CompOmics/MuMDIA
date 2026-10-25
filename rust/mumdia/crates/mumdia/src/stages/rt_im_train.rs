@@ -73,8 +73,16 @@ enum WindowPlan {
     Calibrated,
 }
 
+/// Whether a fit on `n_train` anchors leaves the RT windows unbounded: zero or one point
+/// cannot define an iRT -> RT mapping across the gradient. The one rule [`window_plan`] and
+/// the grouped run's refusal of unbounded windows (`groups.allow_unbounded_rt`,
+/// `run_groups`) both read, so the two cannot disagree.
+pub(crate) fn windows_unbounded(n_train: usize) -> bool {
+    n_train < 2
+}
+
 fn window_plan(n_train: usize, min_anchors: usize, fallback_width: f64) -> WindowPlan {
-    if n_train < 2 {
+    if windows_unbounded(n_train) {
         WindowPlan::Unbounded
     } else if n_train < min_anchors {
         WindowPlan::Fixed(fallback_width)
@@ -700,17 +708,32 @@ pub fn run(p: RtImTrainParams) -> Result<u64> {
 /// [`run`], returning the output's row count and the content hash its report records, so
 /// an orchestrator can record the artifact without reading and hashing it again.
 pub fn run_hashed(p: RtImTrainParams) -> Result<Written> {
-    run_impl(p, false).map(|(written, _)| written)
+    run_impl(p, false, |_| Ok(())).map(|(written, _)| written)
 }
 
 /// [`run_hashed`], also returning the fitted windows in the form `extract` consumes, so an
 /// orchestrator can hand them over instead of having `extract` decode the table it just
 /// wrote. `None` only when the table holds a NaN bound (see [`RtWindows`]).
 pub fn run_in_memory(p: RtImTrainParams) -> Result<(Written, Option<RtWindows>)> {
-    run_impl(p, true)
+    run_impl(p, true, |_| Ok(()))
 }
 
-fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(Written, Option<RtWindows>)> {
+/// [`run_in_memory`], with `check` called on the fit before anything is written. An error
+/// from `check` is returned as it is, and neither the windows nor `cal.json` are written:
+/// a grouped run under `groups.calibration = per_group` refuses a band whose own anchors
+/// leave the windows unbounded this way (`groups.allow_unbounded_rt`).
+pub fn run_in_memory_checked(
+    p: RtImTrainParams,
+    check: impl FnOnce(&RtFit) -> Result<()>,
+) -> Result<(Written, Option<RtWindows>)> {
+    run_impl(p, true, check)
+}
+
+fn run_impl(
+    p: RtImTrainParams,
+    keep_windows: bool,
+    check: impl FnOnce(&RtFit) -> Result<()>,
+) -> Result<(Written, Option<RtWindows>)> {
     let t0 = Instant::now();
     // `--out` must not be one of this stage's own inputs: every input is read
     // before the output is published, so writing over one replaces it and exits 0
@@ -749,6 +772,7 @@ fn run_impl(p: RtImTrainParams, keep_windows: bool) -> Result<(Written, Option<R
     )?;
     // Its hash-map form has drop glue, so end it here explicitly.
     drop(join);
+    check(&fit)?;
     write_windows(
         &fit,
         &ApplyParams {
@@ -864,26 +888,7 @@ pub struct AnchorPlan {
 /// curve at all. Counted as `fit_anchors` counts: finite target rows, one per base
 /// peptide.
 pub fn plan_anchors(seed_psms: &str, cfg: &RtImTrainConfig) -> Result<AnchorPlan> {
-    let seed = TableFile::open(seed_psms)?;
-    let s_base = seed.u32("base_peptide_id")?;
-    let s_q = seed.f64("spectrum_q")?;
-    let s_score = seed.f64("score")?;
-    let s_rt = seed.f64("observed_rt")?;
-    let s_label = seed.str("label")?;
-    // Best (lowest) q per target base peptide; the count at a cut is then one comparison.
-    let mut best_q: HashMap<u32, f64> = HashMap::new();
-    for i in 0..seed.nrows {
-        if !s_q[i].is_finite() || !s_score[i].is_finite() || !s_rt[i].is_finite() {
-            continue;
-        }
-        if s_label[i] != "target" {
-            continue;
-        }
-        let e = best_q.entry(s_base[i]).or_insert(f64::INFINITY);
-        if s_q[i] < *e {
-            *e = s_q[i];
-        }
-    }
+    let best_q = best_target_q(seed_psms)?;
     let count = |q: f64| best_q.values().filter(|&&v| v < q).count();
     let need = cfg.min_seed_for_calibration.max(2);
     let mut plan = AnchorPlan {
@@ -925,6 +930,47 @@ pub fn plan_anchors(seed_psms: &str, cfg: &RtImTrainConfig) -> Result<AnchorPlan
         );
     }
     Ok(plan)
+}
+
+/// Best (lowest) `spectrum_q` per target base peptide, over the seed rows with a finite q,
+/// score and retention time: the rows `fit_anchors` may take as anchors before it joins
+/// their iRT. The anchor count at a cut is then one comparison per peptide.
+fn best_target_q(seed_psms: &str) -> Result<HashMap<u32, f64>> {
+    let seed = TableFile::open(seed_psms)?;
+    let s_base = seed.u32("base_peptide_id")?;
+    let s_q = seed.f64("spectrum_q")?;
+    let s_score = seed.f64("score")?;
+    let s_rt = seed.f64("observed_rt")?;
+    let s_label = seed.str("label")?;
+    let mut best_q: HashMap<u32, f64> = HashMap::new();
+    for i in 0..seed.nrows {
+        if !s_q[i].is_finite() || !s_score[i].is_finite() || !s_rt[i].is_finite() {
+            continue;
+        }
+        if s_label[i] != "target" {
+            continue;
+        }
+        let e = best_q.entry(s_base[i]).or_insert(f64::INFINITY);
+        if s_q[i] < *e {
+            *e = s_q[i];
+        }
+    }
+    Ok(best_q)
+}
+
+/// The most anchors a fit at `q_train` on `seed_psms` can keep: the distinct target base
+/// peptides with a finite score and retention time at `spectrum_q < q_train`, counted as
+/// [`plan_anchors`] counts them and without its log lines. `fit_anchors` takes the same rows
+/// and also drops those without a finite iRT and those `anchor_x_filter` removes, and
+/// `seed_pool::refresh_irt` changes only the iRT, so the fit's `n_train` is never larger.
+/// A grouped run counts each seed with it before any retention-time step, so that a seed
+/// that cannot give bounded windows ([`windows_unbounded`]) is refused before the DeepLC
+/// sidecars and the extraction (`groups.allow_unbounded_rt`).
+pub(crate) fn seed_anchor_bound(seed_psms: &str, q_train: f64) -> Result<usize> {
+    Ok(best_target_q(seed_psms)?
+        .values()
+        .filter(|&&v| v < q_train)
+        .count())
 }
 
 /// `cfg` with the anchor cut of `plan`.
@@ -1087,7 +1133,7 @@ fn fit_anchors(
 
     // Fit calibration predicted_irt -> observed RT (seconds).
     // Zero or one point cannot define a useful mapping across the gradient.
-    let calibration_available = n_train >= 2;
+    let calibration_available = !windows_unbounded(n_train);
     let (slope, intercept) = if calibration_available {
         linear_fit(&train_irt, &train_rt)
     } else {
@@ -2840,6 +2886,26 @@ mod tests {
         );
     }
 
+    /// `windows_unbounded` is the rule `window_plan` applies, for every anchor count and
+    /// every `min_anchors`, so the grouped run's refusal (`run_groups`) refuses exactly the
+    /// fits that `rt-im-train` would give unbounded windows.
+    #[test]
+    fn windows_unbounded_is_the_window_plan_rule() {
+        assert!(windows_unbounded(0));
+        assert!(windows_unbounded(1));
+        assert!(!windows_unbounded(2));
+        assert!(!windows_unbounded(10_000));
+        for min_anchors in [2usize, 3, 20, 50] {
+            for n_train in 0..=60 {
+                assert_eq!(
+                    windows_unbounded(n_train),
+                    window_plan(n_train, min_anchors, 120.0) == WindowPlan::Unbounded,
+                    "n_train {n_train}, min_anchors {min_anchors}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn unavailable_calibration_emits_unbounded_window_and_nan_prediction() {
         let (cal, lo, hi) = candidate_window(None, None);
@@ -3114,6 +3180,151 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// `run_in_memory_checked` hands the fit to its check before anything is written. A check
+    /// that refuses leaves neither the windows nor `cal.json`, and one that accepts writes what
+    /// `run` writes. The per-group refusal of unbounded windows in `run_groups` rests on this.
+    #[test]
+    fn a_refused_fit_check_writes_nothing_and_an_accepted_one_writes_what_run_writes() {
+        fn params<'a>(
+            seed: &'a str,
+            lib: &'a str,
+            windows: &'a str,
+            cal: &'a str,
+            cfg: &'a RtImTrainConfig,
+        ) -> RtImTrainParams<'a> {
+            RtImTrainParams {
+                precursor_span: None,
+                seed_psms: seed,
+                library_precursors: lib,
+                out_windows: windows,
+                out_cal: cal,
+                cfg,
+                config_hash: "h",
+                im_window_floor: None,
+                im_anchor_q: None,
+                anchor_irt_from_seed: false,
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("mumdia_rt_checked_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // One target anchor: the decoy and the unconfident row of the helper do not count.
+        let (seed, lib) = anchors_and_library(&dir, 1);
+        let out = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        let cfg = RtImTrainConfig::default();
+
+        let (w_ref, c_ref) = (out("w_refused.parquet"), out("cal_refused.json"));
+        let refused = run_in_memory_checked(params(&seed, &lib, &w_ref, &c_ref, &cfg), |fit| {
+            assert_eq!(fit.n_train(), 1);
+            if windows_unbounded(fit.n_train()) {
+                anyhow::bail!("refused: {} anchor", fit.n_train());
+            }
+            Ok(())
+        });
+        let Err(err) = refused else {
+            panic!("the check's error was not returned");
+        };
+        assert_eq!(err.to_string(), "refused: 1 anchor");
+        assert!(!std::path::Path::new(&w_ref).exists(), "windows written");
+        assert!(!std::path::Path::new(&c_ref).exists(), "cal.json written");
+
+        let (w_ok, c_ok) = (out("w_accepted.parquet"), out("cal_accepted.json"));
+        let (written, _) =
+            run_in_memory_checked(params(&seed, &lib, &w_ok, &c_ok, &cfg), |_| Ok(())).unwrap();
+        let (w_run, c_run) = (out("w_run.parquet"), out("cal_run.json"));
+        let rows = run(params(&seed, &lib, &w_run, &c_run, &cfg)).unwrap();
+        assert_eq!(written.rows, rows);
+        assert_eq!(
+            std::fs::read(&w_ok).unwrap(),
+            std::fs::read(&w_run).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&c_ok).unwrap(),
+            std::fs::read(&c_run).unwrap()
+        );
+        let cal: serde_json::Value = mumdia_io::json::read_json(&c_ok).unwrap();
+        assert_eq!(cal["calibration_status"], INSUFFICIENT_ANCHORS_STATUS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `seed_anchor_bound` counts what `plan_anchors` counts at `q_train`, and the fit never
+    /// keeps more: it also drops anchors without a finite iRT. The grouped run's early
+    /// refusal of unbounded windows rests on this bound, so it can never refuse a seed whose
+    /// fit would have bounded windows.
+    #[test]
+    fn the_seed_anchor_bound_counts_what_plan_anchors_counts_and_bounds_the_fit() {
+        let dir = std::env::temp_dir().join(format!("mumdia_rt_bound_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Six target anchors at q 0.001; the decoy and the row at q 0.5 do not count.
+        let (seed, lib) = anchors_and_library(&dir, 6);
+        let cfg = RtImTrainConfig {
+            anchor_q_ladder: Vec::new(),
+            ..RtImTrainConfig::default()
+        };
+        let bound = seed_anchor_bound(&seed, cfg.q_train).unwrap();
+        assert_eq!(bound, 6);
+        assert_eq!(bound, plan_anchors(&seed, &cfg).unwrap().n_anchors);
+        // A cut at or below every anchor's q leaves none: the comparison is strict, as in
+        // `fit_anchors`.
+        assert_eq!(seed_anchor_bound(&seed, 0.001).unwrap(), 0);
+        assert_eq!(seed_anchor_bound(&seed, 1.0).unwrap(), 7);
+        // The seed's own iRT is finite for every anchor: the shared fit keeps all six.
+        assert_eq!(fit_from_seed(&seed, &cfg).unwrap().n_train(), 6);
+
+        let out = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        let fit_on = |lib: &str, tag: &str| -> usize {
+            let (w, c) = (
+                out(&format!("w_{tag}.parquet")),
+                out(&format!("c_{tag}.json")),
+            );
+            let mut n_train = usize::MAX;
+            run_in_memory_checked(
+                RtImTrainParams {
+                    precursor_span: None,
+                    seed_psms: &seed,
+                    library_precursors: lib,
+                    out_windows: &w,
+                    out_cal: &c,
+                    cfg: &cfg,
+                    config_hash: "h",
+                    im_window_floor: None,
+                    im_anchor_q: None,
+                    anchor_irt_from_seed: false,
+                },
+                |fit| {
+                    n_train = fit.n_train();
+                    Ok(())
+                },
+            )
+            .unwrap();
+            n_train
+        };
+        // The helper's library has no finite iRT for candidate 3: the fit keeps five.
+        assert_eq!(fit_on(&lib, "lib"), 5);
+        // A library with a finite iRT for one anchor only: the bound is six, the fit has one,
+        // which is the case the grouped run's second, exact check exists for.
+        let sparse = out("lib_sparse.parquet");
+        write_table(
+            &sparse,
+            vec![
+                Col::U32("candidate_id".into(), (0..11u32).collect()),
+                Col::F32(
+                    "predicted_irt".into(),
+                    (0..11)
+                        .map(|i| if i == 0 { 1.0 } else { f32::NAN })
+                        .collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        let n_sparse = fit_on(&sparse, "sparse");
+        assert_eq!(n_sparse, 1);
+        assert!(windows_unbounded(n_sparse) && !windows_unbounded(bound));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `anchor_x_filter` drops the anchors with an absurd predicted iRT before the fit, the
     /// window sizing and the residuals use them, so the windows are those of the clean
     /// anchors alone and cal.json records how many it dropped. Off, every anchor is fitted

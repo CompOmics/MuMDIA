@@ -27,7 +27,7 @@ use mumdia_io::record_artifact;
 use mumdia_io::report::ArtifactReport;
 use mumdia_io::table::TableFile;
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{compete, convert, extract, features, pool, rt_im_train, search_seed, seed_pool};
 use crate::groups;
@@ -170,6 +170,302 @@ fn record_hashing(
         )?);
     }
     Ok(())
+}
+
+/// Whose anchors a grouped run's retention-time fit is made on, for [`refuse_unbounded_rt`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RtFitScope {
+    /// The pooled seed of every band (`groups.calibration = global`): one fit for every band.
+    Pooled,
+    /// The band of this index, fitted on its own seed (`groups.calibration = per_group`).
+    Band(usize),
+}
+
+impl RtFitScope {
+    fn band(self) -> Option<usize> {
+        match self {
+            RtFitScope::Pooled => None,
+            RtFitScope::Band(index) => Some(index),
+        }
+    }
+}
+
+/// A count of retention-time anchors, and where it was taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Anchors {
+    /// On the seed, before any retention-time step (`rt_im_train::seed_anchor_bound`): the
+    /// confident target peptides, which is the most anchors the fit can keep. A seed with
+    /// fewer than two is refused before the DeepLC sidecars, the band slices and the
+    /// extraction.
+    Seed(usize),
+    /// On the fit itself (`RtFit::n_train`), with the seed's count when it was taken. A fit
+    /// below a seed of two or more lost the other anchors to a non-finite iRT or to
+    /// `rt_im_train.anchor_x_filter`.
+    Fit { n_train: usize, seed: Option<usize> },
+}
+
+impl Anchors {
+    /// The anchors the windows would be fitted on (`Fit`), or at most that many (`Seed`).
+    fn n(self) -> usize {
+        match self {
+            Anchors::Seed(n) | Anchors::Fit { n_train: n, .. } => n,
+        }
+    }
+}
+
+/// The run a refusal is about, for its message.
+#[derive(Clone, Copy, Debug)]
+struct RtRun<'a> {
+    /// The run's output directory, so that a multi-run experiment says which run stopped.
+    out_dir: &'a str,
+    /// Bands in the run's plan.
+    bands: usize,
+    /// `rt_im_train.q_train`, the cut the anchors are taken at.
+    q_train: f64,
+}
+
+/// The fragment tolerance a band's extract would search with, for the refusal's message.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PlannedFragTol {
+    ppm: f64,
+    /// Whether the seed learned it from its calibrants (`cal_passes > 0` in the masscal).
+    /// `false` is the configured tolerance that a seed with too few calibrants keeps; `None`
+    /// is unknown.
+    learned: Option<bool>,
+}
+
+/// The fragment tolerance extract would search with under the masscal at `path`: what
+/// `crate::masscal::read_mass_cal` gives with extract's `fallback_ppm`, which is the reader
+/// extract uses. `None` when the file cannot be read; the message then leaves it out.
+fn planned_frag_tol(path: &str, fallback_ppm: f64) -> Option<PlannedFragTol> {
+    let (_, ppm) = crate::masscal::read_mass_cal(Some(path), fallback_ppm).ok()?;
+    let learned = crate::masscal::existing(Some(path))
+        .and_then(|p| mumdia_io::json::read_json::<serde_json::Value>(p).ok())
+        .and_then(|v| v.get("cal_passes").and_then(|c| c.as_u64()))
+        .map(|passes| passes > 0);
+    Some(PlannedFragTol { ppm, learned })
+}
+
+/// What a grouped run does with a retention-time fit on `n_train` anchors before a band
+/// extracts with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnboundedRt {
+    /// The windows are bounded.
+    Bounded,
+    /// The windows are unbounded, and `groups.allow_unbounded_rt` asks for that.
+    Allowed,
+    /// The windows are unbounded, and the run stops.
+    Refused,
+}
+
+/// The decision of [`refuse_unbounded_rt`]. Unbounded is `rt_im_train::windows_unbounded`,
+/// the rule by which `rt-im-train` itself falls back to unbounded windows, so a fit is
+/// refused exactly when it would give them.
+fn unbounded_rt(n_train: usize, allow: bool) -> UnboundedRt {
+    if !rt_im_train::windows_unbounded(n_train) {
+        UnboundedRt::Bounded
+    } else if allow {
+        UnboundedRt::Allowed
+    } else {
+        UnboundedRt::Refused
+    }
+}
+
+fn target_anchors(n: usize) -> String {
+    if n == 1 {
+        "1 target anchor".to_string()
+    } else {
+        format!("{n} target anchors")
+    }
+}
+
+/// The fragment-tolerance clause of the message, from the tolerance of every refused fit
+/// whose masscal could be read: one tolerance is stated with its origin, several as their
+/// range.
+fn tolerance_clause(tols: &[PlannedFragTol]) -> String {
+    let Some(first) = tols.first() else {
+        return String::new();
+    };
+    if tols.iter().all(|t| t == first) {
+        let ppm = first.ppm;
+        return match first.learned {
+            Some(true) => {
+                format!(
+                    ", and extract would search at the learned fragment tolerance of {ppm:.1} ppm"
+                )
+            }
+            Some(false) => format!(
+                ", and with too few fragment calibrants to learn a tolerance extract would \
+                 search at the configured {ppm:.1} ppm"
+            ),
+            None => format!(", and extract would search at a fragment tolerance of {ppm:.1} ppm"),
+        };
+    }
+    let lo = tols.iter().map(|t| t.ppm).fold(f64::INFINITY, f64::min);
+    let hi = tols.iter().map(|t| t.ppm).fold(f64::NEG_INFINITY, f64::max);
+    format!(", and extract would search at fragment tolerances from {lo:.1} to {hi:.1} ppm")
+}
+
+/// What a fit did with its seed's anchors, for an [`Anchors::Fit`] refusal.
+fn fit_clause(n_train: usize, seed: Option<usize>) -> String {
+    match seed {
+        Some(s) if s > n_train => format!(
+            "kept {n_train} of the seed's {s} confident target peptides, fewer than the two a \
+             retention-time calibration needs: the others have no finite predicted iRT or fall \
+             outside the fences of rt_im_train.anchor_x_filter"
+        ),
+        _ => format!(
+            "had {}, fewer than the two a retention-time calibration needs",
+            target_anchors(n_train)
+        ),
+    }
+}
+
+/// The refusal of the unbounded fits `refused` (the pooled one, or one or more bands): what
+/// happened, what it would cost and what to try. `tols` are their fragment tolerances.
+fn unbounded_rt_message(
+    run: RtRun,
+    refused: &[(RtFitScope, Anchors)],
+    tols: &[PlannedFragTol],
+) -> String {
+    let tol = tolerance_clause(tols);
+    let cut = format!(
+        "target peptides at spectrum_q below rt_im_train.q_train = {}",
+        run.q_train
+    );
+    let name = |s: RtFitScope| match s.band() {
+        Some(i) => format!("g{i:02}"),
+        None => "pooled".to_string(),
+    };
+    let mut m = match refused {
+        [(RtFitScope::Pooled, a)] => {
+            let what = match *a {
+                Anchors::Seed(n) => format!(
+                    "The pooled seed of the {} bands has {} ({cut}), fewer than the two a \
+                     retention-time calibration needs{tol}.",
+                    run.bands,
+                    target_anchors(n)
+                ),
+                Anchors::Fit { n_train, seed } => format!(
+                    "The retention-time fit on the pooled seed of the {} bands {}{tol}.",
+                    run.bands,
+                    fit_clause(n_train, seed)
+                ),
+            };
+            format!(
+                "groups: the retention-time windows would be unbounded in {}. {what} Every band \
+                 would then extract every candidate over the whole gradient, and the memory of \
+                 the run has no bound (docs/33_window_groups.md section 4c).",
+                run.out_dir
+            )
+        }
+        _ => {
+            let head = match refused {
+                [(s, _)] => format!(
+                    "groups: the retention-time windows of band {} would be unbounded in {}.",
+                    name(*s),
+                    run.out_dir
+                ),
+                _ => format!(
+                    "groups: the retention-time windows of {} of the {} bands would be \
+                     unbounded in {}.",
+                    refused.len(),
+                    run.bands,
+                    run.out_dir
+                ),
+            };
+            let what = match refused {
+                [(s, Anchors::Fit { n_train, seed })] => format!(
+                    "The retention-time fit of band {} {}{tol}.",
+                    name(*s),
+                    fit_clause(*n_train, *seed)
+                ),
+                [(s, a)] => format!(
+                    "The seed of band {} has {} ({cut}), fewer than the two a retention-time \
+                     calibration needs{tol}.",
+                    name(*s),
+                    target_anchors(a.n())
+                ),
+                _ => {
+                    let list: Vec<String> = refused
+                        .iter()
+                        .map(|(s, a)| format!("{} {}", name(*s), a.n()))
+                        .collect();
+                    format!(
+                        "Their seeds have fewer than the two target anchors a retention-time \
+                         calibration needs ({cut}): {}{tol}.",
+                        list.join(", ")
+                    )
+                }
+            };
+            format!(
+                "{head} Under groups.calibration = per_group each band is calibrated on its own \
+                 seed. {what} Such a band would extract every one of its candidates over the \
+                 whole gradient, and its memory has no bound (docs/33_window_groups.md section \
+                 4c). groups.calibration = global fits one calibration on the anchors of all {} \
+                 bands.",
+                run.bands
+            )
+        }
+    };
+    if refused.iter().all(|(_, a)| matches!(a, Anchors::Seed(_))) {
+        m.push_str(
+            " Check the seed: the library and its decoys, search_seed.fragment_tol_ppm and the \
+             input file. A grouped run takes its anchors at rt_im_train.q_train and does not \
+             relax that cut through rt_im_train.anchor_q_ladder, as an ungrouped run does. A \
+             run without a confident seed can be searched ungrouped (groups.window_groups = 1).",
+        );
+    } else {
+        m.push_str(
+            " The rt-im-train warning above that it is using unbounded RT windows is about this \
+             fit. Check the library's predicted_irt and the DeepLC step that rewrote it in this \
+             run, or search the run ungrouped (groups.window_groups = 1).",
+        );
+    }
+    m.push_str(" To extract with unbounded windows anyway, set groups.allow_unbounded_rt = true");
+    m
+}
+
+/// Stop a grouped run when a retention-time fit it would extract with leaves the windows
+/// unbounded. `fits` are the fits checked at once: the pooled one (`calibration = global`),
+/// or one per band (`per_group`), and the error names every unbounded one. A grouped run
+/// checks twice: on the seeds' anchor counts right after `seed-pool` ([`Anchors::Seed`],
+/// before any DeepLC sidecar, band slice or extraction), and on the fit itself
+/// ([`Anchors::Fit`], before its windows are written). With `allow`
+/// (`groups.allow_unbounded_rt`) the run goes on exactly as before, with a warning per
+/// unbounded fit. An ungrouped run is not checked: it keeps the unbounded fallback of
+/// `rt-im-train`. `frag_tol` is read only for unbounded fits.
+fn refuse_unbounded_rt(
+    run: RtRun,
+    fits: &[(RtFitScope, Anchors)],
+    allow: bool,
+    frag_tol: impl Fn(RtFitScope) -> Option<PlannedFragTol>,
+) -> Result<()> {
+    let unbounded: Vec<(RtFitScope, Anchors)> = fits
+        .iter()
+        .copied()
+        .filter(|(_, a)| unbounded_rt(a.n(), allow) != UnboundedRt::Bounded)
+        .collect();
+    if unbounded.is_empty() {
+        return Ok(());
+    }
+    if allow {
+        for (scope, a) in &unbounded {
+            warn!(
+                n_train = a.n(),
+                bands = run.bands,
+                group = scope.band(),
+                out_dir = %run.out_dir,
+                frag_tol_ppm = frag_tol(*scope).map(|t| t.ppm),
+                "groups: fewer than two retention-time anchors; extracting with unbounded RT \
+                 windows because groups.allow_unbounded_rt = true. Every candidate is \
+                 extracted over the whole gradient, and the memory is not bounded"
+            );
+        }
+        return Ok(());
+    }
+    let tols: Vec<PlannedFragTol> = unbounded.iter().filter_map(|(s, _)| frag_tol(*s)).collect();
+    bail!("{}", unbounded_rt_message(run, &unbounded, &tols))
 }
 
 /// Content fingerprint of the scans lent to the bands. FNV-1a over every field the
@@ -529,6 +825,59 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         ch,
     )?;
     let global = cfg.groups.calibration == GroupCalibration::Global;
+    // A seed with fewer than two confident target anchors cannot give a fit with bounded
+    // windows (`rt_im_train::seed_anchor_bound` bounds the fit's `n_train` from above), and
+    // unbounded windows make every band extract every candidate over the whole gradient.
+    // Refused here, before the MS1 offset, the band slices, the DeepLC sidecars and the
+    // extraction decode, so a run without anchors stops right after its seed rather than
+    // after a DeepLC pass over the whole library or after most bands have extracted. Every
+    // seed whose fit a band would apply is counted: the pooled one under `global`, each
+    // band's own under `per_group`, all named in one error. The exact check on the fit
+    // itself follows below, for the anchors a non-finite iRT or `anchor_x_filter` removes.
+    // Nothing is counted when `groups.allow_unbounded_rt` lets the run go on anyway.
+    let rt_run = RtRun {
+        out_dir: g.out_dir,
+        bands: bands.len(),
+        q_train: cfg.rt_im_train.q_train,
+    };
+    let (pooled_seed_anchors, band_seed_anchors): (Option<usize>, BTreeMap<usize, usize>) =
+        if cfg.groups.allow_unbounded_rt {
+            (None, BTreeMap::new())
+        } else {
+            // `extract_cfg` below changes only the MS1 offset, so the configured fragment
+            // tolerance is extract's fallback here as well.
+            let frag_tol = |s: RtFitScope| {
+                let seed = match s.band() {
+                    None => pooled_seed.as_str(),
+                    Some(i) => bands.iter().find(|b| b.index == i)?.seed.as_str(),
+                };
+                planned_frag_tol(&crate::masscal::json_path(seed), cfg.extract.frag_tol_ppm)
+            };
+            if global {
+                let n = rt_im_train::seed_anchor_bound(&pooled_seed, rt_run.q_train)?;
+                refuse_unbounded_rt(
+                    rt_run,
+                    &[(RtFitScope::Pooled, Anchors::Seed(n))],
+                    false,
+                    frag_tol,
+                )?;
+                (Some(n), BTreeMap::new())
+            } else {
+                let counts = bands
+                    .iter()
+                    .map(|b| {
+                        let n = rt_im_train::seed_anchor_bound(&b.seed, rt_run.q_train)?;
+                        Ok((b.index, n))
+                    })
+                    .collect::<Result<BTreeMap<usize, usize>>>()?;
+                let fits: Vec<(RtFitScope, Anchors)> = counts
+                    .iter()
+                    .map(|(&i, &n)| (RtFitScope::Band(i), Anchors::Seed(n)))
+                    .collect();
+                refuse_unbounded_rt(rt_run, &fits, false, frag_tol)?;
+                (None, counts)
+            }
+        };
     // The MS1 offset is one per run, so it is learned once from the pooled seed rather than
     // per band (a band holds too few anchors for a stable median).
     let ext_cfg = crate::stages::ms1cal::extract_cfg(
@@ -801,6 +1150,28 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             bands = bands.len(),
             "groups: retention-time calibration fitted once for every band"
         );
+        // The exact check, on the fit every band applies: a seed with anchors can still give
+        // a fit on fewer than two, when the re-predicted iRT is not finite or
+        // `anchor_x_filter` removes them. Refused before the spectra are decoded for
+        // extraction; allowed, this is where the warning is logged
+        // (`groups.allow_unbounded_rt`).
+        refuse_unbounded_rt(
+            rt_run,
+            &[(
+                RtFitScope::Pooled,
+                Anchors::Fit {
+                    n_train: fit.n_train(),
+                    seed: pooled_seed_anchors,
+                },
+            )],
+            cfg.groups.allow_unbounded_rt,
+            |_| {
+                planned_frag_tol(
+                    &crate::masscal::json_path(&pooled_seed),
+                    ext_cfg.frag_tol_ppm,
+                )
+            },
+        )?;
         Some(fit)
     } else {
         None
@@ -850,6 +1221,11 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             let mut recs: Vec<mumdia_core::manifest::ArtifactRecord> = Vec::new();
             let windows = gd(b.index, "run_windows.parquet");
             let cal = gd(b.index, "cal.json");
+            let mass_cal = if global {
+                format!("{pooled_seed}.masscal.json")
+            } else {
+                format!("{}.masscal.json", b.seed)
+            };
             info!(stage = %"rt-im-train", group = b.index, "run: stage start");
             // Handed to this band's extract in memory; see `rt_im_train::RtWindows`.
             let (windows_written, fitted_windows) = match &shared_rt_fit {
@@ -866,19 +1242,39 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                         im_window_floor: None,
                     },
                 )?,
-                // Per group: this band's own anchors, iRT joined from its own table.
-                None => rt_im_train::run_in_memory(rt_im_train::RtImTrainParams {
-                    precursor_span: b.span,
-                    seed_psms: &b.seed,
-                    library_precursors: &b.prec,
-                    out_windows: &windows,
-                    out_cal: &cal,
-                    cfg: &cfg.rt_im_train,
-                    config_hash: ch,
-                    im_window_floor: None,
-                    im_anchor_q: Some(cfg.search_seed.fdr_seed),
-                    anchor_irt_from_seed: false,
-                })?,
+                // Per group: this band's own anchors, iRT joined from its own table. The
+                // seeds were counted after `seed-pool`; this is the exact check on the band's
+                // fit, for anchors lost to a non-finite iRT or `anchor_x_filter`. A refused
+                // band writes no `run_windows.parquet` or `cal.json` and does not extract;
+                // allowed, this is where its warning is logged (`groups.allow_unbounded_rt`).
+                None => rt_im_train::run_in_memory_checked(
+                    rt_im_train::RtImTrainParams {
+                        precursor_span: b.span,
+                        seed_psms: &b.seed,
+                        library_precursors: &b.prec,
+                        out_windows: &windows,
+                        out_cal: &cal,
+                        cfg: &cfg.rt_im_train,
+                        config_hash: ch,
+                        im_window_floor: None,
+                        im_anchor_q: Some(cfg.search_seed.fdr_seed),
+                        anchor_irt_from_seed: false,
+                    },
+                    |fit| {
+                        refuse_unbounded_rt(
+                            rt_run,
+                            &[(
+                                RtFitScope::Band(b.index),
+                                Anchors::Fit {
+                                    n_train: fit.n_train(),
+                                    seed: band_seed_anchors.get(&b.index).copied(),
+                                },
+                            )],
+                            cfg.groups.allow_unbounded_rt,
+                            |_| planned_frag_tol(&mass_cal, ext_cfg.frag_tol_ppm),
+                        )
+                    },
+                )?,
             };
             if keep_records {
                 recs.push(windows_written.record(
@@ -889,11 +1285,6 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
                     ch,
                 ));
             }
-            let mass_cal = if global {
-                format!("{pooled_seed}.masscal.json")
-            } else {
-                format!("{}.masscal.json", b.seed)
-            };
             let psms = gd(b.index, "psms_extracted.parquet");
             let chrom = gd(b.index, "chromatograms.parquet");
             info!(stage = %"extract", group = b.index, candidates = b.n, "run: stage start");
@@ -1338,4 +1729,268 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
         "groups: done"
     );
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RUN: RtRun<'static> = RtRun {
+        out_dir: "out/run_b",
+        bands: 63,
+        q_train: 0.01,
+    };
+
+    fn configured(ppm: f64) -> impl Fn(RtFitScope) -> Option<PlannedFragTol> {
+        move |_| {
+            Some(PlannedFragTol {
+                ppm,
+                learned: Some(false),
+            })
+        }
+    }
+
+    fn refusal(
+        fits: &[(RtFitScope, Anchors)],
+        frag_tol: impl Fn(RtFitScope) -> Option<PlannedFragTol>,
+    ) -> String {
+        refuse_unbounded_rt(RUN, fits, false, frag_tol)
+            .unwrap_err()
+            .to_string()
+    }
+
+    fn assert_contains(e: &str, needles: &[&str]) {
+        for needle in needles {
+            assert!(e.contains(needle), "{needle:?} not in: {e}");
+        }
+    }
+
+    /// The decision is `rt_im_train::windows_unbounded`: zero or one anchor is unbounded, two
+    /// are not, and only the unbounded case reads `groups.allow_unbounded_rt`.
+    #[test]
+    fn a_fit_on_fewer_than_two_anchors_is_refused_unless_allowed() {
+        for n_train in [0usize, 1] {
+            assert_eq!(unbounded_rt(n_train, false), UnboundedRt::Refused);
+            assert_eq!(unbounded_rt(n_train, true), UnboundedRt::Allowed);
+        }
+        for n_train in [2usize, 3, 49, 50, 13_786] {
+            assert_eq!(unbounded_rt(n_train, false), UnboundedRt::Bounded);
+            assert_eq!(unbounded_rt(n_train, true), UnboundedRt::Bounded);
+        }
+        for n_train in 0..100 {
+            assert_eq!(
+                unbounded_rt(n_train, false) == UnboundedRt::Refused,
+                rt_im_train::windows_unbounded(n_train),
+                "n_train {n_train}"
+            );
+        }
+    }
+
+    /// A bounded fit passes without reading the masscal, an allowed unbounded one passes, and
+    /// a refused one stops with a message that names the run and says what happened, what it
+    /// costs and what to try: for the pooled seed, and for a band's own fit that lost the
+    /// seed's anchors to the iRT.
+    #[test]
+    fn the_guard_stops_an_unbounded_fit_with_a_message_naming_the_key() {
+        let pooled = RtFitScope::Pooled;
+        let band = RtFitScope::Band(5);
+        let unread = |_| -> Option<PlannedFragTol> { panic!("a bounded fit reads no masscal") };
+        let ok = |fits: &[(RtFitScope, Anchors)], allow| {
+            refuse_unbounded_rt(RUN, fits, allow, configured(20.0)).is_ok()
+        };
+        assert!(refuse_unbounded_rt(RUN, &[(pooled, Anchors::Seed(2))], false, unread).is_ok());
+        let bounded_fit = Anchors::Fit {
+            n_train: 400,
+            seed: Some(410),
+        };
+        assert!(refuse_unbounded_rt(RUN, &[(band, bounded_fit)], false, unread).is_ok());
+        assert!(ok(&[(pooled, Anchors::Seed(0))], true));
+        let lost = Anchors::Fit {
+            n_train: 1,
+            seed: Some(3),
+        };
+        assert!(ok(&[(band, lost)], true));
+
+        // The pooled seed: the early check, before any retention-time step.
+        let e = refusal(&[(pooled, Anchors::Seed(0))], configured(20.0));
+        assert!(
+            e.starts_with("groups: the retention-time windows would be unbounded in out/run_b.")
+        );
+        assert_contains(
+            &e,
+            &[
+                "The pooled seed of the 63 bands has 0 target anchors",
+                "rt_im_train.q_train = 0.01",
+                "too few fragment calibrants",
+                "the configured 20.0 ppm",
+                "every candidate over the whole gradient",
+                "no bound",
+                "the library and its decoys",
+                "search_seed.fragment_tol_ppm",
+                "rt_im_train.anchor_q_ladder",
+                "groups.window_groups = 1",
+                "groups.allow_unbounded_rt = true",
+            ],
+        );
+        assert!(!e.contains("per_group"), "{e}");
+
+        // A band's fit that kept fewer anchors than its seed had: the exact check names the
+        // iRT, not the seed.
+        let e = refusal(&[(band, lost)], |_| {
+            Some(PlannedFragTol {
+                ppm: 9.5,
+                learned: Some(true),
+            })
+        });
+        assert!(e.starts_with(
+            "groups: the retention-time windows of band g05 would be unbounded in out/run_b."
+        ));
+        assert_contains(
+            &e,
+            &[
+                "groups.calibration = per_group",
+                "kept 1 of the seed's 3 confident target peptides",
+                "no finite predicted iRT",
+                "rt_im_train.anchor_x_filter",
+                "the learned fragment tolerance of 9.5 ppm",
+                "groups.calibration = global",
+                "all 63 bands",
+                "The rt-im-train warning above",
+                "predicted_irt",
+                "groups.allow_unbounded_rt = true",
+            ],
+        );
+        assert!(!e.contains("library and its decoys"), "{e}");
+        // A fit without the seed's count says how many anchors it had.
+        let e = refusal(
+            &[(
+                pooled,
+                Anchors::Fit {
+                    n_train: 1,
+                    seed: None,
+                },
+            )],
+            configured(20.0),
+        );
+        assert_contains(
+            &e,
+            &["The retention-time fit on the pooled seed of the 63 bands had 1 target anchor,"],
+        );
+        // Without a readable masscal the message leaves the tolerance out.
+        let e = refusal(&[(pooled, Anchors::Seed(1))], |_| None);
+        assert!(!e.contains("fragment tolerance of"), "{e}");
+        assert!(!e.contains(" ppm"), "{e}");
+        assert_contains(&e, &["has 1 target anchor (", "needs. Every band"]);
+    }
+
+    /// Under `per_group` the seeds of every band are checked at once: the error names each
+    /// band whose seed cannot bound its windows, and only those, and reads only their
+    /// masscals. A run where every band has anchors goes on.
+    #[test]
+    fn a_per_group_refusal_names_every_unbounded_band_and_only_those() {
+        let fits = [
+            (RtFitScope::Band(0), Anchors::Seed(0)),
+            (RtFitScope::Band(1), Anchors::Seed(250)),
+            (RtFitScope::Band(2), Anchors::Seed(1)),
+            (RtFitScope::Band(3), Anchors::Seed(2)),
+        ];
+        let tol = |s: RtFitScope| match s {
+            RtFitScope::Band(0) => Some(PlannedFragTol {
+                ppm: 20.0,
+                learned: Some(false),
+            }),
+            RtFitScope::Band(2) => Some(PlannedFragTol {
+                ppm: 9.5,
+                learned: Some(true),
+            }),
+            other => panic!("the masscal of a bounded fit was read: {other:?}"),
+        };
+        let e = refusal(&fits, tol);
+        assert!(
+            e.starts_with(
+                "groups: the retention-time windows of 2 of the 63 bands would be unbounded in \
+                 out/run_b."
+            ),
+            "{e}"
+        );
+        assert_contains(
+            &e,
+            &[
+                "Their seeds have fewer than the two target anchors",
+                "rt_im_train.q_train = 0.01): g00 0, g02 1,",
+                "fragment tolerances from 9.5 to 20.0 ppm",
+                "groups.calibration = global",
+                "groups.allow_unbounded_rt = true",
+            ],
+        );
+        assert!(!e.contains("g01") && !e.contains("g03"), "{e}");
+        // Allowed, the same bands go on; with anchors in every band nothing is refused.
+        assert!(refuse_unbounded_rt(RUN, &fits, true, tol).is_ok());
+        let anchored = [
+            (RtFitScope::Band(1), Anchors::Seed(250)),
+            (RtFitScope::Band(3), Anchors::Seed(2)),
+        ];
+        assert!(refuse_unbounded_rt(RUN, &anchored, false, tol).is_ok());
+        // One band is named on its own.
+        let e = refusal(&fits[..1], tol);
+        assert!(
+            e.starts_with("groups: the retention-time windows of band g00 would be unbounded"),
+            "{e}"
+        );
+        assert_contains(
+            &e,
+            &[
+                "The seed of band g00 has 0 target anchors (",
+                "the configured 20.0 ppm",
+            ],
+        );
+    }
+
+    /// The tolerance in the message is the one extract would read from the masscal that
+    /// `seed-pool` writes (`MassCal::to_json`), learned or the configured fallback, and
+    /// extract's own fallback when there is no masscal.
+    #[test]
+    fn the_planned_fragment_tolerance_is_read_from_the_masscal() {
+        let dir =
+            std::env::temp_dir().join(format!("mumdia_groups_frag_tol_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        let seed_cfg = mumdia_core::config::SearchSeedConfig::default();
+        // Enough calibrants for a learned tolerance, and none at all.
+        let devs: Vec<f64> = (0..500)
+            .map(|i| 0.4 + ((i * 37 % 101) as f64 - 50.0) * 0.05)
+            .collect();
+        let dev_mz: Vec<f64> = (0..500).map(|i| 200.0 + i as f64).collect();
+        let learned_cal = crate::masscal::MassCal::fit_from(&devs, &dev_mz, &seed_cfg);
+        assert!(learned_cal.cal_passes > 0);
+        let learned = path("learned.masscal.json");
+        mumdia_io::json::write_json(&learned, &learned_cal.to_json()).unwrap();
+        let uncal_cal = crate::masscal::MassCal::fit_from(&[], &[], &seed_cfg);
+        assert_eq!(uncal_cal.cal_passes, 0);
+        let uncal = path("uncal.masscal.json");
+        mumdia_io::json::write_json(&uncal, &uncal_cal.to_json()).unwrap();
+        assert_eq!(
+            planned_frag_tol(&learned, 15.0),
+            Some(PlannedFragTol {
+                ppm: learned_cal.frag_tol_ppm,
+                learned: Some(true)
+            })
+        );
+        assert_eq!(
+            planned_frag_tol(&uncal, 15.0),
+            Some(PlannedFragTol {
+                ppm: seed_cfg.fragment_tol_ppm,
+                learned: Some(false)
+            })
+        );
+        assert_eq!(
+            planned_frag_tol(&path("absent.masscal.json"), 15.0),
+            Some(PlannedFragTol {
+                ppm: 15.0,
+                learned: None
+            })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
