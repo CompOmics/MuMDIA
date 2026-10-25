@@ -629,7 +629,12 @@ Measured against ThermoRawFileParser 1.4.5 (`-f 2 -m 2`, peak picking on, the ar
 Requirements and limits:
 
 - A .NET 8 runtime on the machine that runs the search (`DOTNET_ROOT` when it is not in the
-  default location). The build downloads the .NET host library (`nethost`).
+  default location). The build downloads the .NET host library (`nethost`): the build script
+  of `nethost-sys` 0.7.3 fetches Microsoft's NuGet package and unpacks it with zip 6.0.0,
+  which carries three extraction advisories (RUSTSEC-2026-0367, -0368, -0369). They concern
+  unpacking an untrusted archive, which happens only at build time and only for that
+  package, and no release in the chain reaches the fixed zip 9.0, so CI's `cargo audit`
+  ignores them until one does (`.github/workflows/ci.yml`).
 - Windows: the host library is built against the static C runtime, so the build needs
   `RUSTFLAGS="-C target-feature=+crt-static"`. Linux: a glibc build; the fully static musl
   release target cannot host the runtime.
