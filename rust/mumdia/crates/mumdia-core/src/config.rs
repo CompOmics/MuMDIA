@@ -45,11 +45,51 @@ pub enum MatcherKind {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Enzyme {
-    /// Trypsin/P: cut after K or R (including before P).
+    /// Trypsin/P: cut after K or R (including before P). Rule `K*,R*`.
     #[default]
     TrypsinP,
-    /// Classic trypsin: cut after K or R but not before P.
+    /// Classic trypsin: cut after K or R but not before P. Rule `K*,R*,!*P`.
     Trypsin,
+    /// Lys-C: cut after K. Rule `K*`.
+    LysC,
+    /// Lys-N: cut before K. Rule `*K`.
+    LysN,
+    /// Arg-C: cut after R, not before P. Rule `R*,!*P`.
+    ArgC,
+    /// Asp-N: cut before D. Rule `*D`.
+    AspN,
+    /// Glu-C: cut after E (bicarbonate buffer). Rule `E*`; `E*,D*` as a custom rule.
+    GluC,
+    /// Chymotrypsin, high specificity: cut after F, Y or W, not before P.
+    /// Rule `F*,Y*,W*,!*P`.
+    Chymotrypsin,
+    /// Non-specific: every peptide bond (rule `**`). Peptides are enumerated by length
+    /// (`digest.min_len..=digest.max_len`), so `digest.missed_cleavages` does not apply,
+    /// and N-terminal Met excision adds nothing (every start position is enumerated).
+    /// For immunopeptidomics and peptidomics; the search space grows with the length
+    /// range, about one peptide per residue and length.
+    NonSpecific,
+    /// The rule in `digest.cleavage_rule` (residue pairs around the cut, `*` any, `!`
+    /// never; the syntax of DIA-NN `--cut`), e.g. `K*,R*,D*,!*P`.
+    Custom,
+}
+
+impl Enzyme {
+    /// The configuration name (`trypsin_p`, ...), the key of `enzymes.json`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Enzyme::TrypsinP => "trypsin_p",
+            Enzyme::Trypsin => "trypsin",
+            Enzyme::LysC => "lys_c",
+            Enzyme::LysN => "lys_n",
+            Enzyme::ArgC => "arg_c",
+            Enzyme::AspN => "asp_n",
+            Enzyme::GluC => "glu_c",
+            Enzyme::Chymotrypsin => "chymotrypsin",
+            Enzyme::NonSpecific => "non_specific",
+            Enzyme::Custom => "custom",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -468,6 +508,35 @@ fn is_default_im_window_multiplier(v: &f64) -> bool {
 }
 fn is_default_im_window_min(v: &f64) -> bool {
     *v == RtImTrainConfig::default().im_window_min
+}
+fn is_default_im_window_sizing(v: &ImWindowSizing) -> bool {
+    *v == ImWindowSizing::default()
+}
+fn is_default_im_window_sizing_q(v: &f64) -> bool {
+    *v == RtImTrainConfig::default().im_window_sizing_q
+}
+
+/// How `rt-im-train` sizes the ion-mobility half-window `w_im`
+/// (`rt_im_train.im_window_sizing`, docs/08_rt_im_train.md "Ion-mobility calibration").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImWindowSizing {
+    /// The `p_im` percentile of the held-out confident seed anchors' residuals. The default
+    /// until 2026-10-22.
+    Anchors,
+    /// The `p_im` percentile of the TRUE-hit residuals among every seed PSM up to
+    /// `im_window_sizing_q`, targets and decoys: the cumulative count of targets minus that
+    /// of decoys within a residual, over targets minus decoys, is the true hits' residual
+    /// distribution, because a false target is distributed as a decoy. The seed search
+    /// matches peaks without a 1/K0 window, so these residuals are not truncated by one, and
+    /// a run whose confident anchors are only its best-predicted peptides (few anchors, an
+    /// unusual peptide class) gets the window its identifiable population needs. Never
+    /// below the anchors' value; the anchors' value when targets minus decoys are fewer
+    /// than 100. The search-seed stage then records `observed_im` for every PSM up to the
+    /// cut instead of only the confident targets. Targets and decoys are windowed alike.
+    /// The default since 2026-10-22; without 1/K0 in the spectra it does nothing.
+    #[default]
+    SeedDecoyCorrected,
 }
 
 // The `convert.tdf_*` keys at their defaults, which the canonical configuration omits.
@@ -912,6 +981,12 @@ impl PrescreenConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DigestConfig {
     pub enzyme: Enzyme,
+    /// The cleavage rule of `enzyme = "custom"`: residue pairs around the cut separated by
+    /// commas, `*` for any residue, a leading `!` for a pair never cut (the syntax of
+    /// DIA-NN `--cut`), e.g. `K*,R*,D*,!*P`. Only with `enzyme = "custom"`. Omitted from the
+    /// canonical configuration when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleavage_rule: Option<String>,
     pub missed_cleavages: u32,
     pub min_len: usize,
     pub max_len: usize,
@@ -923,10 +998,26 @@ pub struct DigestConfig {
     /// makes the search database structurally miss those excised peptides.
     pub n_term_met_excision: bool,
 }
+impl DigestConfig {
+    /// The cleavage rule this digest applies: the preset of `enzyme`, or
+    /// `cleavage_rule` under `enzyme = "custom"`.
+    pub fn rule(&self) -> Result<crate::cleavage::CleavageRule, String> {
+        let text = match self.enzyme {
+            Enzyme::Custom => self.cleavage_rule.as_deref().ok_or_else(|| {
+                "digest.enzyme = \"custom\" needs digest.cleavage_rule (e.g. \"K*,R*,!*P\")"
+                    .to_string()
+            })?,
+            e => crate::cleavage::preset_rule(e.name())
+                .ok_or_else(|| format!("no preset rule for digest.enzyme = {}", e.name()))?,
+        };
+        crate::cleavage::CleavageRule::parse(text).map_err(|m| format!("digest.cleavage_rule: {m}"))
+    }
+}
 impl Default for DigestConfig {
     fn default() -> Self {
         Self {
             enzyme: t(),
+            cleavage_rule: None,
             missed_cleavages: 2,
             min_len: 5,
             max_len: 50,
@@ -1486,14 +1577,26 @@ pub struct RtImTrainConfig {
     /// configuration at its default.
     #[serde(skip_serializing_if = "is_default_p_im")]
     pub p_im: f64,
-    /// Multiplier on that percentile. Default 1.0. Omitted from the canonical configuration
-    /// at its default.
+    /// Multiplier on that percentile, and on the decoy-corrected seed estimate of
+    /// `im_window_sizing = "seed_decoy_corrected"`. Default 1.3 since 2026-10-22 (1.0
+    /// before). Omitted from the canonical configuration at its default.
     #[serde(skip_serializing_if = "is_default_im_window_multiplier")]
     pub im_window_multiplier: f64,
     /// Lower clamp of the IM half-window, in V s cm^-2. Default 0.005. Omitted from the
     /// canonical configuration at its default.
     #[serde(skip_serializing_if = "is_default_im_window_min")]
     pub im_window_min: f64,
+    /// How `w_im` is sized: `seed_decoy_corrected` (default since 2026-10-22) or `anchors`
+    /// (the previous default) ([`ImWindowSizing`]). Measured on diaPASEF
+    /// immunopeptidomics, two HYE acquisitions and an E. coli entrapment run. Omitted from
+    /// the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_default_im_window_sizing")]
+    pub im_window_sizing: ImWindowSizing,
+    /// Highest seed `spectrum_q` a PSM enters `seed_decoy_corrected` sizing with. Default
+    /// 0.1, where the estimate had settled on every run measured (0.05 to 0.3 checked).
+    /// Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_default_im_window_sizing_q")]
+    pub im_window_sizing_q: f64,
     /// Worker processes for the whole-library DeepLC prediction: the multi-head
     /// calibration, the base-model re-prediction under `library_irt`, and the prediction
     /// after `finetune_deeplc` (`deeplc_finetune.py --shards`). The calibration or the
@@ -1620,6 +1723,14 @@ fn is_default_multihead_search_below(v: &usize) -> bool {
 }
 
 impl RtImTrainConfig {
+    /// The seed `spectrum_q` up to which search-seed records `observed_im` for every PSM
+    /// (targets and decoys): `Some(im_window_sizing_q)` under `seed_decoy_corrected`, `None`
+    /// otherwise, when only the confident targets carry it.
+    pub fn seed_observed_im_q(&self) -> Option<f64> {
+        (self.im_window_sizing == ImWindowSizing::SeedDecoyCorrected)
+            .then_some(self.im_window_sizing_q)
+    }
+
     /// How many LC-setup heads this run should calibrate over: 0 when it should not.
     ///
     /// The single place that turns the configured value into a decision, so the two
@@ -1703,8 +1814,10 @@ impl Default for RtImTrainConfig {
             library_irt: LibraryIrt::Auto,
             im_min_anchors_per_charge: 50,
             p_im: 0.95,
-            im_window_multiplier: 1.0,
+            im_window_multiplier: 1.3,
             im_window_min: 0.005,
+            im_window_sizing: ImWindowSizing::SeedDecoyCorrected,
+            im_window_sizing_q: 0.1,
             deeplc_predict_shards: 0,
             deeplc_projection_cache: Some("auto".to_string()),
         }
@@ -3535,6 +3648,37 @@ pub struct GroupsConfig {
     /// --groups-dir` rebuilds the pooled table from them. `true` writes the pooled table as
     /// before.
     pub pool_chromatograms: bool,
+    /// Let the bands extract with unbounded retention-time windows. Default `false`: when the
+    /// fit a band extracts with has fewer than two target anchors (the pooled seed under
+    /// `calibration = global`, the band's own seed under `per_group`), the run stops with an
+    /// error before a band extracts with it. The seeds are counted right after `seed-pool`,
+    /// before any DeepLC sidecar or extraction, and the fit itself is checked again before
+    /// its windows are written. `true` keeps the previous behaviour and logs a warning that
+    /// names this key.
+    ///
+    /// The default refuses because the memory of such a run has no bound. With fewer than two
+    /// anchors `rt-im-train` falls back to unbounded windows, and a seed without anchors
+    /// usually has no fragment calibrants either, so extract also searches at the configured
+    /// `search_seed.fragment_tol_ppm` instead of a learned tolerance. Every band then
+    /// extracts every candidate over the whole gradient. Measured 2026-10-23 on one Astral
+    /// immunopeptidomics run (63 bands, `parallel` 8, a 203M-precursor 8-12-mer library) whose
+    /// seed gave no anchors: a 150 GB watchdog stopped the extraction at 153 GB on v0.8.0 and
+    /// at 156 GB on the earlier engine 6333855, and a sweep job reached 507.6 GB before the
+    /// host's out-of-memory guard stopped it. On a file whose seed gave anchors the same
+    /// configuration peaked at 34-35 GB on v0.8.0 and 49 GB on 6333855. Single unbounded bands
+    /// had already reached 560 GB, and 664 GB when one aborted at the host's commit limit
+    /// (`docs/33_window_groups.md` section 8).
+    ///
+    /// Check the seed first: the library and its decoys, the seed's fragment tolerance and
+    /// the input file. A run without a confident seed can be searched ungrouped
+    /// (`window_groups = 1`), which keeps the unbounded fallback: on an ordinary library it
+    /// fits in memory, and single-cell blank wells are searched that way. Under `per_group`,
+    /// `calibration = global` fits one calibration on the anchors of every band. Omitted
+    /// from the canonical configuration at its default, so the config hash of every
+    /// configuration that does not set it is unchanged (`docs/33_window_groups.md` section
+    /// 4c).
+    #[serde(skip_serializing_if = "is_false")]
+    pub allow_unbounded_rt: bool,
 }
 impl Default for GroupsConfig {
     fn default() -> Self {
@@ -3547,6 +3691,7 @@ impl Default for GroupsConfig {
             delete_band_intermediates: true,
             pool_competed: false,
             pool_chromatograms: false,
+            allow_unbounded_rt: false,
         }
     }
 }
@@ -4079,6 +4224,15 @@ impl Config {
                 self.rt_im_train.im_window_min
             )));
         }
+        if !(self.rt_im_train.im_window_sizing_q > 0.0
+            && self.rt_im_train.im_window_sizing_q <= 0.5)
+        {
+            return Err(Invalid(format!(
+                "rt_im_train.im_window_sizing_q must be in (0, 0.5] (got {}): it is the seed q \
+                 up to which PSMs size the decoy-corrected 1/K0 window",
+                self.rt_im_train.im_window_sizing_q
+            )));
+        }
         if self.search_seed.count_fragments_once
             && !matches!(self.search_seed.matcher, MatcherKind::Fragindex)
         {
@@ -4155,6 +4309,13 @@ impl Config {
                 )));
             }
         }
+        if self.digest.cleavage_rule.is_some() && self.digest.enzyme != Enzyme::Custom {
+            return Err(Invalid(format!(
+                "digest.cleavage_rule is set but digest.enzyme = \"{}\"; set digest.enzyme =                  \"custom\" to use the rule, or remove it",
+                self.digest.enzyme.name()
+            )));
+        }
+        self.digest.rule().map_err(Invalid)?;
         if self.digest.min_len == 0 || self.digest.min_len > self.digest.max_len {
             return Err(Invalid(format!(
                 "digest.min_len must be >= 1 and <= digest.max_len (got {} and {})",
@@ -4700,6 +4861,68 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decoy-corrected 1/K0 window sizing at 1.3x is the default: the seed records
+    /// observed 1/K0 up to `im_window_sizing_q`, and the canonical configuration carries
+    /// neither key. The previous behaviour, `anchors` at 1.0x, is explicit and therefore
+    /// part of the canonical configuration.
+    #[test]
+    fn im_window_sizing_defaults_to_seed_decoy_corrected_and_stays_out_of_the_canonical_json() {
+        let rt = RtImTrainConfig::default();
+        assert_eq!(rt.im_window_sizing, ImWindowSizing::SeedDecoyCorrected);
+        assert_eq!(rt.im_window_multiplier, 1.3);
+        assert_eq!(rt.seed_observed_im_q(), Some(0.1));
+        let json = serde_json::to_string(&rt).unwrap();
+        assert!(!json.contains("im_window_sizing"), "{json}");
+        assert!(!json.contains("im_window_multiplier"), "{json}");
+        let old: RtImTrainConfig =
+            serde_json::from_str(r#"{"im_window_sizing": "anchors", "im_window_multiplier": 1.0}"#)
+                .unwrap();
+        assert_eq!(old.seed_observed_im_q(), None);
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(json.contains(r#""im_window_sizing":"anchors""#), "{json}");
+        assert!(json.contains(r#""im_window_multiplier":1.0"#), "{json}");
+    }
+
+    /// `digest.cleavage_rule` belongs to `enzyme = "custom"` only, a custom rule must
+    /// parse, every preset resolves to its rule, and an unset rule leaves the canonical
+    /// configuration (and so every config hash and library cache key) as it was.
+    #[test]
+    fn cleavage_rules_validate_and_stay_out_of_the_canonical_json_when_unset() {
+        let with = |enzyme: Enzyme, rule: Option<&str>| {
+            let mut c = Config::default();
+            c.digest.enzyme = enzyme;
+            c.digest.cleavage_rule = rule.map(str::to_string);
+            c.validate()
+        };
+        assert!(with(Enzyme::Custom, None).is_err());
+        assert!(with(Enzyme::Custom, Some("K*,R*,D*,!*P")).is_ok());
+        assert!(with(Enzyme::Custom, Some("KRP")).is_err());
+        assert!(with(Enzyme::Trypsin, Some("K*")).is_err());
+        for e in [
+            Enzyme::TrypsinP,
+            Enzyme::Trypsin,
+            Enzyme::LysC,
+            Enzyme::LysN,
+            Enzyme::ArgC,
+            Enzyme::AspN,
+            Enzyme::GluC,
+            Enzyme::Chymotrypsin,
+            Enzyme::NonSpecific,
+        ] {
+            assert!(with(e, None).is_ok(), "{e:?}");
+            let named: Enzyme = serde_json::from_value(serde_json::json!(e.name())).unwrap();
+            assert_eq!(named, e);
+        }
+        let json = serde_json::to_string(&DigestConfig::default()).unwrap();
+        assert!(!json.contains("cleavage_rule"), "{json}");
+        let parsed: DigestConfig =
+            serde_json::from_str(r#"{"enzyme": "custom", "cleavage_rule": "E*,D*"}"#).unwrap();
+        assert_eq!(
+            parsed.rule().unwrap(),
+            crate::cleavage::CleavageRule::parse("E*,D*").unwrap()
+        );
+    }
 
     #[test]
     fn the_default_extraction_gate_is_window_mean_at_0_6() {
@@ -5340,7 +5563,7 @@ mod tests {
         let explicit = Config::from_json(
             r#"{"search_seed":{"count_fragments_once":false},
                 "rt_im_train":{"im_min_anchors_per_charge":50,"p_im":0.95,
-                "im_window_multiplier":1.0,"im_window_min":0.005}}"#,
+                "im_window_multiplier":1.3,"im_window_min":0.005}}"#,
         )
         .unwrap();
         // The config hash is the hash of exactly this string.
@@ -5859,6 +6082,31 @@ mod tests {
         assert_eq!(Config::default().groups.balance, GroupBalance::Precursors);
         let c = Config::from_json(r#"{"groups":{"balance":"cost"}}"#).unwrap();
         assert_eq!(c.groups.balance, GroupBalance::Cost);
+    }
+
+    /// `groups.allow_unbounded_rt` is off by default and omitted from the canonical
+    /// configuration while off, so the config hash of every configuration that does not set
+    /// it is unchanged and an explicit `false` changes nothing. `true` parses and is part of
+    /// the configuration's identity.
+    #[test]
+    fn allow_unbounded_rt_defaults_off_and_leaves_the_default_config_hash_alone() {
+        let d = Config::default();
+        assert!(!d.groups.allow_unbounded_rt);
+        let canon = d.canonical_json();
+        assert!(!canon.contains("allow_unbounded_rt"), "{canon}");
+        let explicit = Config::from_json(r#"{"groups":{"allow_unbounded_rt":false}}"#).unwrap();
+        assert!(!explicit.groups.allow_unbounded_rt);
+        assert_eq!(explicit.canonical_json(), canon);
+        let on = Config::from_json(r#"{"groups":{"window_groups":4,"allow_unbounded_rt":true}}"#)
+            .unwrap();
+        assert!(on.groups.allow_unbounded_rt);
+        let c = on.canonical_json();
+        assert!(c.contains(r#""allow_unbounded_rt":true"#), "{c}");
+        // The serialized form reads back to the same setting.
+        let back = Config::from_json(&c).unwrap();
+        assert!(back.groups.allow_unbounded_rt);
+        assert_eq!(back.canonical_json(), c);
+        assert!(Config::from_json(r#"{"groups":{"allow_unbounded_rt":"yes"}}"#).is_err());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! Types, config, the run manifest, a ProForma/UniMod mass model, physical
 //! constants, and error types. No stage-specific logic lives here.
 
+pub mod cleavage;
 pub mod config;
 pub mod constants;
 pub mod error;

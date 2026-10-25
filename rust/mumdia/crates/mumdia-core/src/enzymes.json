@@ -1,0 +1,27 @@
+{
+  "_comment": "Cleavage presets of digest.enzyme, in the residue-pair rule syntax of DIA-NN --cut: comma-separated pairs (residue before the cut, residue after it), '*' = any residue, a leading '!' = never cut there. A bond is cut when a positive pair matches and no '!' pair does. Read by the engine (mumdia-core/src/cleavage.rs) and the desktop application (desktop/src-tauri/src/enzymes.rs); both are tested against 'test_vectors'. Standard specificities from the literature; a variant is a 'custom' rule.",
+  "presets": {
+    "trypsin_p": {"rule": "K*,R*", "label": "Trypsin/P", "note": "after K or R, also before P"},
+    "trypsin": {"rule": "K*,R*,!*P", "label": "Trypsin", "note": "after K or R, not before P"},
+    "lys_c": {"rule": "K*", "label": "Lys-C", "note": "after K"},
+    "lys_n": {"rule": "*K", "label": "Lys-N", "note": "before K"},
+    "arg_c": {"rule": "R*,!*P", "label": "Arg-C", "note": "after R, not before P"},
+    "asp_n": {"rule": "*D", "label": "Asp-N", "note": "before D"},
+    "glu_c": {"rule": "E*", "label": "Glu-C", "note": "after E (bicarbonate buffer; 'E*,D*' as a custom rule for phosphate buffer)"},
+    "chymotrypsin": {"rule": "F*,Y*,W*,!*P", "label": "Chymotrypsin", "note": "after F, Y or W, not before P (high specificity)"},
+    "non_specific": {"rule": "**", "label": "Non-specific", "note": "every peptide bond; peptides by length, missed cleavages do not apply"},
+    "custom": {"rule": null, "label": "Custom rule", "note": "digest.cleavage_rule, e.g. 'K*,R*,D*,!*P'"}
+  },
+  "test_vectors": [
+    {"rule": "K*,R*", "seq": "MKRPADEK", "sites": [0, 2, 3, 8]},
+    {"rule": "K*,R*,!*P", "seq": "MKRPADEK", "sites": [0, 2, 8]},
+    {"rule": "K*,R*,!*P", "seq": "AKPRKAR", "sites": [0, 4, 5, 7]},
+    {"rule": "*K", "seq": "AAKAAKK", "sites": [0, 2, 5, 6, 7]},
+    {"rule": "*D", "seq": "DAADA", "sites": [0, 3, 5]},
+    {"rule": "E*", "seq": "AEEA", "sites": [0, 2, 3, 4]},
+    {"rule": "F*,Y*,W*,!*P", "seq": "AFPAYAWA", "sites": [0, 5, 7, 8]},
+    {"rule": "R*,!*P", "seq": "RPRAR", "sites": [0, 3, 5]},
+    {"rule": "K*,R*,D*,!*P", "seq": "ADKPRA", "sites": [0, 2, 5, 6]},
+    {"rule": "!K*,**", "seq": "AKA", "sites": [0, 1, 3]}
+  ]
+}

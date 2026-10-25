@@ -37,7 +37,7 @@ Usage: mumdia [OPTIONS] <COMMAND>
 
 Commands:
   convert         Read an mzML run into the normalized spectra artifact set
-  digest          Fully-tryptic digest + decoy pairing -> peptides.parquet
+  digest          Tryptic or non-specific digest (`digest.enzyme`) + decoy pairing -> peptides.parquet
   peptidoforms    Fixed+variable modification and charge enumeration -> peptidoforms.parquet
   predict-frag    Spectral library: b/y m/z + predicted intensity + iRT -> fragment_library
   prescan         Sequence-tag prescan: keep only modification-bearing candidates whose anchored trimers are observed in this run -> prescan_survivors.parquet. Label-blind by construction, so it prunes search space without touching target-decoy exchangeability
@@ -134,7 +134,7 @@ first sentence of the description, with the full text in the section below.
 | Subcommand | `--config` | Purpose |
 |---|---|---|
 | [`convert`](#convert) | yes | Read an mzML run into the normalized spectra artifact set |
-| [`digest`](#digest) | yes | Fully-tryptic digest + decoy pairing -> peptides.parquet |
+| [`digest`](#digest) | yes | Tryptic or non-specific digest (`digest.enzyme`) + decoy pairing -> peptides.parquet |
 | [`peptidoforms`](#peptidoforms) | yes | Fixed+variable modification and charge enumeration -> peptidoforms.parquet |
 | [`predict-frag`](#predict-frag) | yes | Spectral library: b/y m/z + predicted intensity + iRT -> fragment_library |
 | [`prescan`](#prescan) | yes | Sequence-tag prescan: keep only modification-bearing candidates whose anchored trimers are observed in this run -> prescan_survivors.parquet. |
@@ -207,7 +207,7 @@ Plus the 5 repeated flags removed above: see "Global flags".
 ## digest
 
 ```text
-Fully-tryptic digest + decoy pairing -> peptides.parquet
+Tryptic or non-specific digest (`digest.enzyme`) + decoy pairing -> peptides.parquet
 
 Usage: mumdia digest [OPTIONS] --fasta <FASTA> --out <OUT>
 

@@ -418,7 +418,7 @@ listed with its default and effect. Fields marked **default-off**, **inert**, or
 |---|---|---|---|
 | `DecoyStrategy` | config.rs:17-28 | **`reverse`**, `scramble`, `diann_shift`, `none` | `diann_shift` rejected by validate; `none` produces no decoys (invalid FDR) |
 | `MatcherKind` | config.rs:38-42 | `bucketed`, **`fragindex`** | fragment-matcher backend for search-seed + extract |
-| `Enzyme` | config.rs:46-52 | **`trypsin_p`**, `trypsin` | cut after K/R, with/without before-P |
+| `Enzyme` | config.rs | **`trypsin_p`**, `trypsin`, `lys_c`, `lys_n`, `arg_c`, `asp_n`, `glu_c`, `chymotrypsin`, `non_specific`, `custom` | cleavage preset or a custom rule (docs/05, "Cleavage rules") |
 | `CalibrationMethod` | config.rs:56-61 | **`loess`**, `linear`, `none` | `none` rejected by validate (falls through to linear) |
 | `FeatureSet` | config.rs:65-75 | **`minimal`** (14), `rich` (44), `extended` (387) | superset battery in `stages/features/`; the `feature_sets_sized` test (`features.rs:1724-1738`) asserts 14, 14+30, and `14 + 30 + extended_names().len() + 6`, which currently resolves to 387 (337 deduplicated family names) |
 | `RtPredictorKind` | config.rs:79-86 | **`native`**, `deeplc` | DeepLC is a Python sidecar |
@@ -633,7 +633,8 @@ already written at `{:.6}` and the worker casts to f32 regardless.
 
 | Field | Default | Effect |
 |---|---|---|
-| `enzyme` | `trypsin_p` | cleavage rule |
+| `enzyme` | `trypsin_p` | cleavage preset, or `custom` |
+| `cleavage_rule` | unset | rule of `enzyme = "custom"`, DIA-NN `--cut` pair syntax |
 | `missed_cleavages` | 2 | max missed cleavages |
 | `min_len` | 5 | min peptide length |
 | `max_len` | 50 | max peptide length |

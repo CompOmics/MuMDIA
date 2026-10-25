@@ -42,8 +42,10 @@ pub mod artifact {
     pub const PRESCREEN_SCORES: (&str, u32) = ("prescreen_scores", 1);
     pub const SEED_PSMS: (&str, u32) = ("seed_psms", 1);
     /// v2: v1 plus a nullable Float64 `observed_im`, the intensity-weighted median 1/K0 of a
-    /// confident target's matched fragment peaks. Written only when the searched spectra
-    /// carry per-peak 1/K0; every other seed is v1, byte for byte.
+    /// confident target's matched fragment peaks, and under `rt_im_train.im_window_sizing =
+    /// seed_decoy_corrected` (the default) of every other PSM up to `im_window_sizing_q`.
+    /// Written only when the searched spectra carry per-peak 1/K0; every other seed is v1,
+    /// byte for byte.
     pub const SEED_PSMS_V2: (&str, u32) = ("seed_psms", 2);
     /// The confident targets of a bootstrap search, in the seed's column shape, that the
     /// multi-head calibration is refitted on under `rt_im_train.multihead_anchors = search`

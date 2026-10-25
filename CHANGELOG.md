@@ -7,6 +7,14 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.8.0` is a minor release: it adds cleavage rules to the digest and to the desktop
+application's Search screen (enzyme presets, custom rules, non-specific digestion). Tryptic
+libraries and existing configurations are unchanged.
+
+`0.7.1` is a patch release: libraries of more than 2^32 - 1 fragment rows load and search,
+and the desktop application's visDIA pin reads the second pass of a match-between-runs
+experiment. A library that fits gives the same output as with 0.7.0.
+
 `0.7.0` is a minor rather than a patch release: it reads a new kind of data and changes what
 a search finds. Bruker diaPASEF (`.d`) is read natively with ion mobility through the library,
 extraction, features, a raw-event retrace and cross-run quantification (`docs/35_diapasef.md`).
@@ -115,6 +123,109 @@ than a number. Both are recorded in every run's `manifest.json`.
   in 81 s against 787 s of conversion plus a 3.6 GB mzML; on a six-file HYE experiment
   159,740 against 159,525 peptides at 1%. Release builds do not enable the feature
   (docs/04_convert.md, "Native Thermo reading").
+
+### Changed
+
+- **diaPASEF: the 1/K0 window is sized from the whole seed, decoy-corrected, and widened
+  1.3x.** `rt_im_train.im_window_sizing` defaults to `seed_decoy_corrected`. search-seed
+  records the observed 1/K0 of every PSM up to a seed q of 0.1 (`im_window_sizing_q`),
+  targets and decoys. rt-im-train takes the 95th percentile of the true hits' residuals (at
+  each residual, the targets minus the decoys at or below it), multiplies it by
+  `rt_im_train.im_window_multiplier` and uses the result as `w_im` where it is wider than the
+  anchors' window. The multiplier defaults to 1.3 (was 1.0) and applies to both windows;
+  `anchors` with 1.0 restores the previous windows. The IM anchors, and so the calibration,
+  are unchanged: the weaker rows enter only the estimate. The window acts through the 1/K0
+  gate and retrace, which the diaPASEF recipe turns on. On a synthetic HLA-I peptide pool
+  (one seed) the exact pool sequences found rose from 499 to 663 at 1.0x and 708 at 1.3x,
+  with the hits from other pools at 5 in both. Against the
+  previous window, x1.3 measured +0.6% peptides on an E. coli run (three seeds), +3.0% real
+  peptides on its entrapment library at an FDP of 0.39-0.43% against 0.34-0.39%, -0.25% per
+  run on six 5 min HYE runs (two seeds) and -1.0% per run on the six ProteoBench HYE
+  diaPASEF runs (one seed), with the experiment-wide counts +0.2% on both (docs/08 section
+  7). `cal.json` gains an `im_window_sizing` block on runs with 1/K0. Spectra without 1/K0
+  are unaffected: every 3D artifact, report and config hash is unchanged.
+- **A grouped search stops instead of extracting without retention-time windows.** When the
+  retention-time fit of a window-group search (`groups.window_groups > 1`) has fewer than two
+  target anchors, `rt-im-train` falls back to unbounded windows, and every band extracts
+  every candidate over the whole gradient, usually at the configured fragment tolerance
+  because such a seed has no calibrants either. The run now stops with an error before a
+  band extracts with such a fit. The seeds are counted right after `seed-pool` (the pooled
+  seed under `groups.calibration = global`, each band's own under `per_group`, every short
+  band named in one error), before the MS1 offset, the band slices, the DeepLC sidecars and
+  the extraction decode; the fit itself is checked again before its windows are written,
+  for anchors lost to a non-finite iRT or `rt_im_train.anchor_x_filter`. The message names
+  the run's output directory, gives the anchor count, the number of bands and the fragment
+  tolerance, and says what to check. The new key `groups.allow_unbounded_rt = true`
+  restores the previous behaviour with a warning; at its default `false` it is omitted from
+  the canonical configuration, so no config hash changes. The decision uses the same
+  function as `rt-im-train` (`rt_im_train::windows_unbounded`). Measured on one Astral
+  immunopeptidomics run (63 bands, `groups.parallel` 8, a 203M-precursor 8-12-mer library)
+  whose seed gave no anchors: a 150 GB watchdog stopped the extraction at 153 GB on 0.8.0
+  and at 156 GB on an earlier engine, and a sweep job reached 507.6 GB before the host's
+  out-of-memory guard stopped it. On a file whose seed gave anchors the same configuration
+  peaked at 34-35 GB on 0.8.0 and 49 GB on the earlier engine. Ungrouped searches are
+  unchanged and keep the unbounded fallback (docs/33 section 4c, docs/17).
+
+### Fixed
+
+- **diaPASEF: a frame recorded without peaks no longer stops conversion.** A timsTOF frame
+  with `Frames.NumPeaks` 0 stores no compressed payload, and convert and retrace failed on
+  it with `frame 0: Decompression fails`; the first frame of some timsTOF Pro runs is one.
+  Such a frame is now read as its scans with no peaks, which gives an empty MS1 spectrum or
+  one empty spectrum per slot. A frame that declares peaks and cannot be decoded is still an
+  error. Runs without such frames convert as before.
+
+## [0.8.0] - 2026-10-22
+
+### Added
+
+- **Cleavage rules: presets, custom rules and non-specific digestion.** `digest.enzyme`
+  gains `lys_c`, `lys_n`, `arg_c`, `asp_n`, `glu_c`, `chymotrypsin`, `non_specific` and
+  `custom` with `digest.cleavage_rule`, written in the residue-pair syntax of DIA-NN
+  `--cut` (`K*,R*,!*P` is trypsin, `**` every bond). Under a rule that cuts every bond the
+  digest enumerates every peptide of `min_len..=max_len` residues, for immunopeptidomics
+  and peptidomics, with `missed_cleavages` and Met excision not applied. The desktop
+  application's Search screen has a Cleavage choice that reaches the DIA-NN library build
+  (`--cut`), the built-in engine path and the search-space estimate. Tryptic digests are
+  byte-identical to before, and existing configuration hashes and cached libraries are
+  unchanged (docs/05_digest_peptidoforms.md, "Cleavage rules").
+
+## [0.7.1] - 2026-10-21
+
+### Changed
+
+- **Libraries of more than 2^32 - 1 fragment rows load and search.** The per-candidate
+  fragment offsets and the fragment index's per-bin posting offsets were 32-bit, so such a
+  library was refused ("fragment library has N rows; per-candidate fragment offsets are
+  u32"); an imported library for an unspecific (HLA) digest of the human proteome had 4.7
+  billion. Both are now held as 32-bit while the rows fit and as 64-bit beyond
+  (`offsets::Offsets`), so a library that fits keeps its layout, its memory and its output
+  byte for byte (one Astral run end to end: every stage output identical, wall and peak
+  memory unchanged). A window's cached posting ranges stay 32-bit either way, relative to
+  their bin on a 64-bit index. Tests force the 64-bit form on small libraries and compare
+  whole and range loads, the index build and the probes with the 32-bit form. A two-run diaPASEF
+  immunopeptidomics search on a library of 379 million candidates and 4.5 billion fragment
+  rows ran end to end (2:03 wall, 241 GB peak, 96 threads).
+
+### Fixed
+
+- **visDIA shows the second pass of a match-between-runs experiment.** Since 0.7.0
+  `run-experiment` matches between runs with a second pass by default, and the scores and
+  quantities it reports are the second pass's. visDIA read each run's chromatograms,
+  features and library from the first pass, whose candidate ids differ, so every candidate
+  showed "No chromatogram rows for this candidate". The desktop application now pins visDIA
+  at c674f9f (CompOmics/visDIA#7), which reads them from `second_pass/`. The application
+  also compares a URL pin (`name @ url`) with the source the installed package records, so
+  an existing visDIA environment is reported outdated (`mumdia-viewer 13b3a9c -> c674f9f`)
+  and the Setup screen offers the update.
+
+### Security
+
+- **Desktop application: `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.10.** The desktop
+  lockfile carried `rustls-webpki` 0.103.15 (RUSTSEC-2026-0382, certificate verification may
+  accept distrusted intermediates) and `webpki-roots` 1.0.9 (RUSTSEC-2026-0381, bundled roots
+  trust distrusted emSign intermediates); both are patch updates. The engine does not use
+  either crate.
 
 ## [0.7.0] - 2026-10-18
 

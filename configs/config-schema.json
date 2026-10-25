@@ -1015,8 +1015,29 @@
       "source_struct": "DigestConfig",
       "choices": [
         "trypsin_p",
-        "trypsin"
+        "trypsin",
+        "lys_c",
+        "lys_n",
+        "arg_c",
+        "asp_n",
+        "glu_c",
+        "chymotrypsin",
+        "non_specific",
+        "custom"
       ]
+    },
+    {
+      "path": "digest.cleavage_rule",
+      "name": "cleavage_rule",
+      "section": "digest",
+      "rust_type": "Option<String>",
+      "kind": "other",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "The cleavage rule of `enzyme = \"custom\"`: residue pairs around the cut separated by commas, `*` for any residue, a leading `!` for a pair never cut (the syntax of DIA-NN `--cut`), e.g. `K*,R*,D*,!*P`. Only with `enzyme = \"custom\"`. Omitted from the canonical configuration when unset.",
+      "gates": [],
+      "source_struct": "DigestConfig"
     },
     {
       "path": "digest.missed_cleavages",
@@ -1952,9 +1973,9 @@
       "rust_type": "f64",
       "kind": "float",
       "optional": false,
-      "default": 1.0,
-      "default_text": "1.0",
-      "help": "Multiplier on that percentile. Default 1.0. Omitted from the canonical configuration at its default.",
+      "default": 1.3,
+      "default_text": "1.3",
+      "help": "Multiplier on that percentile, and on the decoy-corrected seed estimate of `im_window_sizing = \"seed_decoy_corrected\"`. Default 1.3 since 2026-10-22 (1.0 before). Omitted from the canonical configuration at its default.",
       "gates": [],
       "source_struct": "RtImTrainConfig"
     },
@@ -1968,6 +1989,36 @@
       "default": 0.005,
       "default_text": "0.005",
       "help": "Lower clamp of the IM half-window, in V s cm^-2. Default 0.005. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
+      "path": "rt_im_train.im_window_sizing",
+      "name": "im_window_sizing",
+      "section": "rt_im_train",
+      "rust_type": "ImWindowSizing",
+      "kind": "enum",
+      "optional": false,
+      "default": "seed_decoy_corrected",
+      "default_text": "`seed_decoy_corrected`",
+      "help": "How `w_im` is sized: `seed_decoy_corrected` (default since 2026-10-22) or `anchors` (the previous default) (`ImWindowSizing`). Measured on diaPASEF immunopeptidomics, two HYE acquisitions and an E. coli entrapment run. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "RtImTrainConfig",
+      "choices": [
+        "anchors",
+        "seed_decoy_corrected"
+      ]
+    },
+    {
+      "path": "rt_im_train.im_window_sizing_q",
+      "name": "im_window_sizing_q",
+      "section": "rt_im_train",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.1,
+      "default_text": "0.1",
+      "help": "Highest seed `spectrum_q` a PSM enters `seed_decoy_corrected` sizing with. Default 0.1, where the estimate had settled on every run measured (0.05 to 0.3 checked). Omitted from the canonical configuration at its default.",
       "gates": [],
       "source_struct": "RtImTrainConfig"
     },
@@ -3970,6 +4021,19 @@
       "default": false,
       "default_text": "false",
       "help": "Write the run's pooled `chromatograms.parquet`. Default `false` since 2026-09-26 (previously `true`; see `pool_competed` for the measurement). With `false`, quant reads the bands' own chromatogram tables in band order, dropping from each the candidates the pool's overlap dedup gave to another band, and the pooled copy is not written: one full splice write, hash and read of the run's largest artifact less (59.5 GB on the immunopeptidomics run above). The pool writes those loser sets to `groups/overlap_losers.parquet` (`band`, `candidate_id`, with the band tables it belongs to named in its footer), so a later `mumdia quant --chromatograms <band tables> --overlap-losers <that file>` reads the same rows, and refuses band tables that are not the named ones in their order. Unlike `pool_competed` this holds for overlapping bands as well, including an overlap candidate compete deleted in one band (the losers are found in the chromatogram tables themselves), and nothing but quant reads the pooled table (the candidate audit and match-between-runs do not). The quant tables are byte-identical either way; what changes is the artifact set. There is no pooled `chromatograms.parquet` (one an earlier run left in the directory is removed) and no manifest record for it, `overlap_losers.parquet` is written and recorded instead, and the quant report's `chromatograms` lists the band tables with `chromatogram_dropped_candidates`. The band chromatogram tables are then the run's only chromatograms, so the band directories are no longer disposable once the run is accepted: deleting them loses re-quantification. `mumdia pool --groups-dir` rebuilds the pooled table from them. `true` writes the pooled table as before.",
+      "gates": [],
+      "source_struct": "GroupsConfig"
+    },
+    {
+      "path": "groups.allow_unbounded_rt",
+      "name": "allow_unbounded_rt",
+      "section": "groups",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Let the bands extract with unbounded retention-time windows. Default `false`: when the fit a band extracts with has fewer than two target anchors (the pooled seed under `calibration = global`, the band's own seed under `per_group`), the run stops with an error before a band extracts with it. The seeds are counted right after `seed-pool`, before any DeepLC sidecar or extraction, and the fit itself is checked again before its windows are written. `true` keeps the previous behaviour and logs a warning that names this key. The default refuses because the memory of such a run has no bound. With fewer than two anchors `rt-im-train` falls back to unbounded windows, and a seed without anchors usually has no fragment calibrants either, so extract also searches at the configured `search_seed.fragment_tol_ppm` instead of a learned tolerance. Every band then extracts every candidate over the whole gradient. Measured 2026-10-23 on one Astral immunopeptidomics run (63 bands, `parallel` 8, a 203M-precursor 8-12-mer library) whose seed gave no anchors: a 150 GB watchdog stopped the extraction at 153 GB on v0.8.0 and at 156 GB on the earlier engine 6333855, and a sweep job reached 507.6 GB before the host's out-of-memory guard stopped it. On a file whose seed gave anchors the same configuration peaked at 34-35 GB on v0.8.0 and 49 GB on 6333855. Single unbounded bands had already reached 560 GB, and 664 GB when one aborted at the host's commit limit (`docs/33_window_groups.md` section 8). Check the seed first: the library and its decoys, the seed's fragment tolerance and the input file. A run without a confident seed can be searched ungrouped (`window_groups = 1`), which keeps the unbounded fallback: on an ordinary library it fits in memory, and single-cell blank wells are searched that way. Under `per_group`, `calibration = global` fits one calibration on the anchors of every band. Omitted from the canonical configuration at its default, so the config hash of every configuration that does not set it is unchanged (`docs/33_window_groups.md` section 4c).",
       "gates": [],
       "source_struct": "GroupsConfig"
     },

@@ -5,7 +5,9 @@ This document describes how MuMDIA reads, searches and quantifies diaPASEF data 
 timsTOF. Sections 1 to 8 describe the mechanisms, section 9 how to run them, section 10 the
 artifacts that carry 1/K0, sections 11 to 13 what was measured and how the losses were
 diagnosed, and sections 14 and 15 what is open and what is not supported. Every TIMS key
-is off by default; `configs/examples/diapasef.json` is the recipe that turns them on.
+is off by default; `configs/examples/diapasef.json` is the recipe that turns them on. Two
+exceptions act only on spectra with 1/K0: the second extraction gate (section 16) and the
+sizing of the 1/K0 window (section 4), which takes effect through the recipe's 1/K0 gate.
 
 ## 1. What diaPASEF support consists of
 
@@ -95,6 +97,13 @@ native reader.
   Both fractions default to 0, which leaves the centroids unchanged.
 - **Intensities** are raw detector counts. `intensity_correction_factor` is ignored, which is
   exact while frames share one ramp time.
+- **Frames without peaks.** A frame recorded without peaks (`Frames.NumPeaks` 0) stores only
+  the 8-byte blob header in `analysis.tdf_bin`, which timsrust 0.4.2 fails to decompress
+  ("Decompression fails"). The reader lists such frames when it opens the run and returns
+  each with its `Frames.NumScans` scans and no peaks, so it becomes an empty MS1 spectrum or
+  one empty spectrum per slot, and the cycle keeps its frames. Retrace reads frames through
+  the same function. A frame that declares peaks and cannot be decoded is still an error. The
+  first frame of the timsTOF Pro runs of PXD028735 and PXD041421 is such a frame.
 - **Determinism.** Frames are decoded in parallel batches and handed to the writer in frame
   order, so the output does not depend on the thread count.
 - **Peak caps.** `--top-peaks-ms1/ms2` select the kept peaks with the same step as the mzML path
@@ -200,7 +209,9 @@ installed.
 Seed 1/K0. When the searched spectra carry per-peak 1/K0, the seed writes `observed_im` and
 `seed_psms` v2 (docs/07 step 6): for each confident target, the intensity-weighted median 1/K0
 of its matched fragment peaks at its best scan, each peak being the calibrant's own nearest peak
-(`spectra::nearest_peak`) and counted only within `fragment_tol_ppm`. A 3D seed is v1, byte for
+(`spectra::nearest_peak`) and counted only within `fragment_tol_ppm`. Under the default
+`rt_im_train.im_window_sizing = seed_decoy_corrected` every other PSM up to a seed q of 0.1,
+targets and decoys, carries one too, for the window sizing below. A 3D seed is v1, byte for
 byte, and its calibrants are unchanged. The seed is ungated in 1/K0: it runs before any
 calibration exists. `search_seed.count_fragments_once` (default false, `matcher = fragindex`
 only) counts each predicted fragment once per spectrum at its most intense peak, so the mobility
@@ -210,11 +221,21 @@ benchmark-gated together with the reader's valley fractions (section 14, arm T13
 Calibration 1/K0. rt-im-train fits, on the same confident targets, a per-charge linear map of
 the library's CCS onto the observed CCS, and sizes the half-window `w_im` on held-out anchors
 (30% of the base peptides, `IM_HOLDOUT_FRAC`) at `p_im` times `im_window_multiplier`, floored at
-`im_window_min` (docs/08 section 7). It fills the existing `im_pred_cal`, `im_lo` and `im_hi`
-columns of `run_windows` (still v1) and writes the `im_*` block and `w_im_sizing` of `cal.json`,
-both only on a run whose seed carries `observed_im`. Extraction reads the IM windows for its
-1/K0 gate and its `im_pred_cal` column (section 5). The IM anchors follow the relaxed anchor cut of
-`anchor_q_ladder`. There is no refit of the calibration on identifications.
+`im_window_min` (docs/08 section 7). By default since 2026-10-22 (`im_window_sizing =
+seed_decoy_corrected`, `im_window_multiplier` 1.3, was 1.0) it then widens that window to the
+`p_im` percentile of the true hits' residuals among every seed PSM up to a seed q of 0.1,
+decoy-corrected, times the multiplier. The anchors and the calibration do not change. The
+choice was made for a synthetic HLA-I pool, where the exact pool sequences found rose from 499
+to 663 at 1.0x and 708 at 1.3x (one seed). Against the previous window, x1.3 measured +0.6% peptides on
+E. coli, +3.0% real peptides on its entrapment library at an FDP of 0.39-0.43% (against
+0.34-0.39%), -0.25% per run on six 5 min HYE runs and -1.0% per run on ProteoBench HYE (one
+seed); the table is in docs/08 section 7. `anchors` with 1.0 restores the previous window.
+rt-im-train fills the existing `im_pred_cal`, `im_lo` and `im_hi` columns of `run_windows`
+(still v1) and writes the `im_*` block and `w_im_sizing` of `cal.json`, both only on a run
+whose seed carries `observed_im`. Extraction reads the IM windows for its
+1/K0 gate and its `im_pred_cal` column (section 5). The IM anchors stay at the seed's confident
+cut (`search_seed.fdr_seed`) when `anchor_q_ladder` relaxes the RT anchors' cut. There is no
+refit of the calibration on identifications.
 
 ## 5. Extraction and features
 

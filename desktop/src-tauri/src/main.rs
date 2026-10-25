@@ -481,6 +481,13 @@ fn modifications() -> Result<serde_json::Value, String> {
         .map_err(|e| format!("the modification catalogue does not parse: {e}"))
 }
 
+/// The cleavage presets the engine's digest and the DIA-NN build both apply
+/// (`mumdia-core/src/enzymes.json`), for the Search screen's Cleavage choice.
+#[tauri::command]
+fn enzymes() -> Vec<mumdia_console::enzymes::Preset> {
+    mumdia_console::enzymes::presets()
+}
+
 /// The size of the chosen search space and the band plan this machine would use for it.
 ///
 /// Reading a whole proteome takes a moment, so it runs off the interface thread.
@@ -723,6 +730,7 @@ fn main() {
             save_settings,
             derive_config,
             modifications,
+            enzymes,
             search_space,
             config_overrides,
             peak_census,
