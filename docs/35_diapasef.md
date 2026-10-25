@@ -97,6 +97,13 @@ native reader.
   Both fractions default to 0, which leaves the centroids unchanged.
 - **Intensities** are raw detector counts. `intensity_correction_factor` is ignored, which is
   exact while frames share one ramp time.
+- **Frames without peaks.** A frame recorded without peaks (`Frames.NumPeaks` 0) stores only
+  the 8-byte blob header in `analysis.tdf_bin`, which timsrust 0.4.2 fails to decompress
+  ("Decompression fails"). The reader lists such frames when it opens the run and returns
+  each with its `Frames.NumScans` scans and no peaks, so it becomes an empty MS1 spectrum or
+  one empty spectrum per slot, and the cycle keeps its frames. Retrace reads frames through
+  the same function. A frame that declares peaks and cannot be decoded is still an error. The
+  first frame of the timsTOF Pro runs of PXD028735 and PXD041421 is such a frame.
 - **Determinism.** Frames are decoded in parallel batches and handed to the writer in frame
   order, so the output does not depend on the thread count.
 - **Peak caps.** `--top-peaks-ms1/ms2` select the kept peaks with the same step as the mzML path

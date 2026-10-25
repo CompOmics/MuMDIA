@@ -166,6 +166,15 @@ than a number. Both are recorded in every run's `manifest.json`.
   peaked at 34-35 GB on 0.8.0 and 49 GB on the earlier engine. Ungrouped searches are
   unchanged and keep the unbounded fallback (docs/33 section 4c, docs/17).
 
+### Fixed
+
+- **diaPASEF: a frame recorded without peaks no longer stops conversion.** A timsTOF frame
+  with `Frames.NumPeaks` 0 stores no compressed payload, and convert and retrace failed on
+  it with `frame 0: Decompression fails`; the first frame of some timsTOF Pro runs is one.
+  Such a frame is now read as its scans with no peaks, which gives an empty MS1 spectrum or
+  one empty spectrum per slot. A frame that declares peaks and cannot be decoded is still an
+  error. Runs without such frames convert as before.
+
 ## [0.8.0] - 2026-10-22
 
 ### Added
