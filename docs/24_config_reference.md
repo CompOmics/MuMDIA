@@ -1269,6 +1269,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-24 structs and 317 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 40 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 319 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 40 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
-34 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+34 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.
