@@ -22,6 +22,8 @@ unchanged.
            (`lfq_maxlfq.parquet.precursor.parquet`, one row per (peptidoform, charge, run)).
            For a precursor quantified from one feature, as here, its value is the raw quantity
            divided by one size factor per run, estimated over all ions and species together.
+           The factors differ between conditions as well, so every ratio between two
+           conditions moves by the same amount: the species gaps stay, the human median moves.
            A value the raw table does not have stays empty.
   aligned  within-condition replicate alignment of the raw quantities. For every run the
            offset is the median over its ions of (log2 quantity minus the mean log2 quantity
@@ -29,8 +31,10 @@ unchanged.
            2^offset. The estimate never reads a species or protein label. It uses the
            condition of each run only to group replicates, and the replicates of one
            condition share one sample composition, so it cannot change composition: it removes
-           loading or injection differences between replicates, and the species gaps between
-           conditions stay as they are. It does not correct an offset between conditions.
+           loading or injection differences between replicates. The offsets of one condition
+           average to about zero, so the ratio of an ion seen in every replicate barely moves;
+           the ratio of an ion with a missing replicate loses the bias of the replicates it
+           was seen in. It does not correct an offset between conditions.
 
 --condition-gate keeps the values of an ion in a condition only if at least one run of that
 condition both quantified the ion and identified it in the first pass (target,
