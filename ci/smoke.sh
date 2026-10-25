@@ -268,12 +268,17 @@ echo "    ok: run completed, drop reported, identifications unchanged"
 #     OWN mass calibration to the run's spectra, which since the bands share one decoded
 #     buffer is the configuration most exposed to a stage writing a corrected m/z back
 #     into the scans.
+#
+#     `allow_unbounded_rt: true` because no band of this fixture reaches a confident seed
+#     anchor on its own q scale (the `1/T` floor, docs/33 section 4), so every band extracts
+#     with unbounded RT windows, which a grouped run refuses by default (docs/33 section
+#     4c). The refusal itself is checked right after this arm.
 echo "=== smoke: the grouped orchestrator"
 cat > "$work/grouped.json" <<'JSONEOF'
 {
   "features": { "set": "extended" },
   "extract": { "apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2 },
-  "groups": { "window_groups": 3, "parallel": 2, "calibration": "per_group" }
+  "groups": { "window_groups": 3, "parallel": 2, "allow_unbounded_rt": true, "calibration": "per_group" }
 }
 JSONEOF
 "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
@@ -314,7 +319,81 @@ n_grouped=$(($(wc -l < "$work/out_grouped/peptides.tsv") - 1))
     || { echo "the grouped run found only $n_grouped peptides; expected at least 100"; exit 1; }
 diff "$work/out_grouped/peptides.tsv" "$work/out_grouped2/peptides.tsv" > /dev/null \
     || { echo "two grouped runs of the same input disagree"; exit 1; }
+grep -q 'because groups.allow_unbounded_rt = true' "$work/grouped.log" \
+    || { echo "the grouped run extracted with unbounded windows without the warning"; exit 1; }
 echo "    ok: 3 bands, $n_ms2 MS2 + $n_ms1 MS1 decodes, $n_grouped peptides, reproducible"
+
+#     Without `groups.allow_unbounded_rt` a grouped run stops before a band extracts with
+#     unbounded RT windows (docs/33 section 4c). The seeds are counted right after
+#     `seed-pool`, so both refusals come before any band slice, DeepLC sidecar or retention-
+#     time fit, and before the spectra are decoded for extraction: the MS2 is decoded once
+#     (the seeding phase) instead of twice. Under per_group every band of the fixture has no
+#     anchor, so the one error names all three. Under global a `q_train` below the pooled
+#     seed's `1/T` floor leaves the pooled seed without anchors; the same search with the key
+#     set must extract, with the warning, which is the global call site's allowed branch.
+echo "=== smoke: a grouped run refuses unbounded RT windows"
+sed 's/"allow_unbounded_rt": true, //' "$work/grouped.json" > "$work/grouped_refused.json"
+if grep -q 'allow_unbounded_rt' "$work/grouped_refused.json"; then
+    echo "could not derive the refused per_group config"; exit 1
+fi
+cat > "$work/grouped_refused_global.json" <<'JSONEOF'
+{
+  "features": { "set": "extended" },
+  "extract": { "apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2 },
+  "rt_im_train": { "q_train": 0.001 },
+  "groups": { "window_groups": 2, "calibration": "global" }
+}
+JSONEOF
+for arm in grouped_refused grouped_refused_global; do
+    if "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+        --out-dir "$work/out_$arm" --config "$work/$arm.json" --threads 4 \
+        > "$work/$arm.log" 2>&1; then
+        echo "$arm: a grouped run without anchors extracted with unbounded windows"; exit 1
+    fi
+    grep -q 'groups.allow_unbounded_rt = true' "$work/$arm.log" \
+        || { tail -5 "$work/$arm.log"; echo "$arm: the refusal does not name the key"; exit 1; }
+    grep -q "would be unbounded in .*out_$arm" "$work/$arm.log" \
+        || { echo "$arm: the refusal does not name the run's directory"; exit 1; }
+    for f in "$work/out_$arm"/groups/g*/run_windows.parquet \
+             "$work/out_$arm"/groups/g*/cal.json \
+             "$work/out_$arm"/groups/g*/psms_extracted.parquet; do
+        if [ -e "$f" ]; then echo "$arm: a refused band wrote $f"; exit 1; fi
+    done
+    n_ms2=$(grep -c 'stage=load-ms2' "$work/$arm.log" || true)
+    [ "$n_ms2" = "1" ] \
+        || { echo "$arm: the refusal came after the extraction decode ($n_ms2 MS2 decodes)"; exit 1; }
+    if grep -q 'stage=rt-' "$work/$arm.log"; then
+        echo "$arm: the refusal came after a retention-time stage started"; exit 1
+    fi
+done
+grep -q 'groups: the retention-time windows of 3 of the 3 bands would be unbounded' \
+    "$work/grouped_refused.log" \
+    || { echo "the per_group refusal does not name the three bands at once"; exit 1; }
+grep -q 'g00 0, g01 0, g02 0' "$work/grouped_refused.log" \
+    || { echo "the per_group refusal does not list each band's anchors"; exit 1; }
+grep -q 'to learn a tolerance extract would search at the configured' "$work/grouped_refused.log" \
+    || { echo "the per_group refusal does not give the configured fragment tolerance"; exit 1; }
+grep -q 'groups: the retention-time windows would be unbounded' \
+    "$work/grouped_refused_global.log" \
+    || { echo "the global refusal is not the pooled one"; exit 1; }
+grep -q 'The pooled seed of the 2 bands has 0 target anchors' "$work/grouped_refused_global.log" \
+    || { echo "the global refusal does not count the pooled seed's anchors"; exit 1; }
+grep -q 'the learned fragment tolerance of' "$work/grouped_refused_global.log" \
+    || { echo "the global refusal does not give the learned fragment tolerance"; exit 1; }
+sed 's/"calibration": "global" }/"calibration": "global", "allow_unbounded_rt": true }/' \
+    "$work/grouped_refused_global.json" > "$work/grouped_allowed_global.json"
+grep -q '"allow_unbounded_rt": true' "$work/grouped_allowed_global.json" \
+    || { echo "could not derive the allowed global config"; exit 1; }
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_grouped_allowed_global" --config "$work/grouped_allowed_global.json" \
+    --threads 4 > "$work/grouped_allowed_global.log" 2>&1 \
+    || { tail -30 "$work/grouped_allowed_global.log"; echo "the allowed global grouped run failed"; exit 1; }
+grep -q 'because groups.allow_unbounded_rt = true' "$work/grouped_allowed_global.log" \
+    || { echo "the allowed global run extracted with unbounded windows without the warning"; exit 1; }
+n_ms2=$(grep -c 'stage=load-ms2' "$work/grouped_allowed_global.log" || true)
+[ "$n_ms2" = "2" ] \
+    || { echo "the allowed global run did not reach the extraction decode ($n_ms2 MS2 decodes)"; exit 1; }
+echo "    ok: per_group and global runs without anchors stop after the seed; allowed, global extracts"
 
 # The default grouped run above left the competed rows and the chromatograms per band
 # (`groups.pool_competed` and `groups.pool_chromatograms` are `false` by default since

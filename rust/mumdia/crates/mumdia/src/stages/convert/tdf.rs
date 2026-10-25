@@ -15,13 +15,14 @@
 //! Frames are decoded in parallel and handed to the sink in frame order, so the output does
 //! not depend on the thread count.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, bail, Context, Result};
 use mumdia_core::config::ConvertConfig;
 use rayon::prelude::*;
 use timsrust::converters::{ConvertableDomain, Scan2ImConverter, Tof2MzConverter};
-use timsrust::readers::{FrameReader, MetadataReader};
+use timsrust::readers::{FrameReader, FrameReaderError, MetadataReader};
 use timsrust::{AcquisitionType, Frame, MSLevel};
 use tracing::{info, warn};
 
@@ -470,9 +471,69 @@ pub(crate) struct RawTdf {
     pub(crate) reader: FrameReader,
     mz: Tof2MzConverter,
     im: ScanImCalibration,
+    /// The scan count of every frame recorded without peaks, by frame index ([`empty_frames`]).
+    empty: BTreeMap<usize, usize>,
+}
+
+/// Frame `i` with its peaks. A frame in `empty` is returned with its scans and no peaks: it
+/// stores no compressed payload, which the frame reader would reject.
+fn read_frame(
+    reader: &FrameReader,
+    empty: &BTreeMap<usize, usize>,
+    i: usize,
+) -> Result<Frame, FrameReaderError> {
+    match empty.get(&i) {
+        Some(&n_scans) => {
+            let mut f = reader.get_frame_without_coordinates(i)?;
+            f.scan_offsets = vec![0; n_scans + 1];
+            Ok(f)
+        }
+        None => reader.get(i),
+    }
+}
+
+/// The scan count of every frame recorded without peaks (`Frames.NumPeaks` 0), keyed by its
+/// frame-reader index. Such a frame's blob in `analysis.tdf_bin` is the 8-byte header alone,
+/// and the frame reader fails on it with "Decompression fails"; in some acquisitions the
+/// first frame of every run is one.
+fn empty_frames(path: &str, reader: &FrameReader) -> Result<BTreeMap<usize, usize>> {
+    let db = format!("{path}/analysis.tdf");
+    let con =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open {db}"))?;
+    let mut st = con.prepare("SELECT Id, NumScans FROM Frames WHERE NumPeaks = 0")?;
+    let by_id: BTreeMap<usize, usize> = st
+        .query_map([], |r| {
+            Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut out = BTreeMap::new();
+    if by_id.is_empty() {
+        return Ok(out);
+    }
+    // The reader indexes frames by table row, not by `Id`; map through the id it records.
+    for i in 0..reader.len() {
+        let id = reader
+            .get_frame_without_coordinates(i)
+            .map_err(|e| anyhow!("{path}: frame header {i}: {e}"))?
+            .index;
+        if let Some(&n_scans) = by_id.get(&id) {
+            out.insert(i, n_scans);
+        }
+    }
+    info!(
+        frames = out.len(),
+        "timsTOF: frames recorded without peaks are read as empty frames"
+    );
+    Ok(out)
 }
 
 impl RawTdf {
+    /// Frame `i` with its peaks, through [`read_frame`].
+    pub(crate) fn frame(&self, i: usize) -> Result<Frame, FrameReaderError> {
+        read_frame(&self.reader, &self.empty, i)
+    }
+
     /// The fractional TOF index of an m/z: the inverse of the converter convert uses.
     pub(crate) fn tof_of(&self, mz: f64) -> f64 {
         self.mz.invert(mz)
@@ -503,6 +564,7 @@ impl RawTdf {
         Ok(Self {
             im: ScanImCalibration::read(path, meta.im_converter)?,
             mz: meta.mz_converter,
+            empty: empty_frames(path, &reader)?,
             reader,
         })
     }
@@ -519,14 +581,18 @@ pub(super) fn drive(
     top_ms2: usize,
     mut sink: impl FnMut(u32, Decoded) -> Result<()>,
 ) -> Result<usize> {
-    let RawTdf { reader, mz, im } = RawTdf::open(path)?;
+    let RawTdf {
+        reader,
+        mz,
+        im,
+        empty,
+    } = RawTdf::open(path)?;
     // The MS1 filter's window gate is built once per run, from its diaPASEF windows and
     // the scan count of its first frame.
     let ms1 = if p.ms1_denoise {
         let n_scans = match reader.len() {
             0 => 0,
-            _ => reader
-                .get(0)
+            _ => read_frame(&reader, &empty, 0)
                 .map_err(|e| anyhow!("{path}: frame 0: {e}"))?
                 .scan_offsets
                 .len()
@@ -562,8 +628,7 @@ pub(super) fn drive(
         let batch: Vec<Result<Vec<Decoded>>> = (start..(start + FRAME_CHUNK).min(n))
             .into_par_iter()
             .map(|i| {
-                let f = reader
-                    .get(i)
+                let f = read_frame(&reader, &empty, i)
                     .map_err(|e| anyhow!("{path}: frame {i}: {e}"))?;
                 Ok(ctx.frame(&f))
             })
@@ -872,6 +937,96 @@ mod tests {
         }
         let cal = ScanImCalibration::read(d.to_str().unwrap(), linear()).unwrap();
         assert!((cal.im(200.0) - 1.0 / (0.5 + 100.0 / 200.0)).abs() < 1e-12);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A two-frame diaPASEF `.d` (an MS1 frame, then an MS2 frame of two slots) whose frames
+    /// store no payload: each blob in `analysis.tdf_bin` is the 8-byte header alone. The MS2
+    /// frame declares `ms2_peaks` peaks.
+    fn headers_only_d(tag: &str, ms2_peaks: i64) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("mumdia_tdf_{tag}_{}.d", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let blob = [8u32.to_le_bytes(), 100u32.to_le_bytes()].concat();
+        std::fs::write(d.join("analysis.tdf_bin"), [blob.clone(), blob].concat()).unwrap();
+        let con = rusqlite::Connection::open(d.join("analysis.tdf")).unwrap();
+        con.execute_batch(&format!(
+            "CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT);
+             INSERT INTO GlobalMetadata VALUES ('TimsCompressionType', '2'),
+               ('AcquisitionSoftware', 'test'), ('MzAcqRangeLower', '100'),
+               ('MzAcqRangeUpper', '1700'), ('OneOverK0AcqRangeLower', '0.6'),
+               ('OneOverK0AcqRangeUpper', '1.6'), ('DigitizerNumSamples', '400000');
+             CREATE TABLE Frames (Id INTEGER PRIMARY KEY, Time REAL, ScanMode INTEGER,
+               MsMsType INTEGER, NumPeaks INTEGER, NumScans INTEGER, TimsId INTEGER,
+               AccumulationTime REAL);
+             INSERT INTO Frames VALUES (1, 1.0, 9, 0, 0, 100, 0, 100.0),
+               (2, 1.1, 9, 9, {ms2_peaks}, 100, 8, 100.0);
+             CREATE TABLE DiaFrameMsMsInfo (Frame INTEGER, WindowGroup INTEGER);
+             INSERT INTO DiaFrameMsMsInfo VALUES (2, 1);
+             CREATE TABLE DiaFrameMsMsWindows (WindowGroup INTEGER, ScanNumBegin INTEGER,
+               ScanNumEnd INTEGER, IsolationMz REAL, IsolationWidth REAL, CollisionEnergy REAL);
+             INSERT INTO DiaFrameMsMsWindows VALUES (1, 10, 40, 500.0, 25.0, 30.0),
+               (1, 50, 80, 700.0, 25.0, 30.0);
+             CREATE TABLE TimsCalibration (Id INTEGER PRIMARY KEY, ModelType INTEGER,
+               C0 REAL, C1 REAL, C2 REAL, C3 REAL, C4 REAL, C5 REAL, C6 REAL, C7 REAL);"
+        ))
+        .unwrap();
+        d
+    }
+
+    /// A frame recorded without peaks has no payload to decompress. It becomes empty
+    /// spectra in frame order (one MS1, one per MS2 slot), with and without the MS1 filter,
+    /// whose scan count is read from the first frame.
+    #[test]
+    fn frames_recorded_without_peaks_decode_as_empty_spectra() {
+        let d = headers_only_d("empty", 0);
+        for ms1_denoise in [false, true] {
+            let p = TdfParams {
+                ms1_denoise,
+                ..TdfParams::default()
+            };
+            let mut got = Vec::new();
+            let n = drive(d.to_str().unwrap(), 0, &p, 0, 0, |i, s| {
+                got.push(match s {
+                    Decoded::Ms1 { mz, .. } => (i, "ms1", 0.0, mz.len()),
+                    Decoded::Ms2(r) => (i, "ms2", r.wt, r.mz.len()),
+                    _ => (i, "other", 0.0, 0),
+                });
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(n, 3);
+            assert_eq!(
+                got,
+                vec![
+                    (0, "ms1", 0.0, 0),
+                    (1, "ms2", 500.0, 0),
+                    (2, "ms2", 700.0, 0)
+                ]
+            );
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Only a frame that declares no peaks is read as empty: a frame that declares peaks
+    /// and stores no payload is still an error.
+    #[test]
+    fn a_frame_with_peaks_and_no_payload_is_still_an_error() {
+        let d = headers_only_d("corrupt", 3);
+        let err = drive(
+            d.to_str().unwrap(),
+            0,
+            &TdfParams::default(),
+            0,
+            0,
+            |_, _| Ok(()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("frame 1") && err.contains("Decompression"),
+            "{err}"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 
