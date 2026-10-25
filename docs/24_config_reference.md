@@ -1263,6 +1263,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-24 structs and 315 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 40 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 316 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 40 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
 33 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
