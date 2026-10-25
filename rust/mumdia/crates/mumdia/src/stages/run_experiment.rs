@@ -2718,7 +2718,10 @@ mod tests {
     #[test]
     fn the_second_pass_pads_the_traces_of_every_run() {
         let cfg = Config::default();
-        assert!(cfg.extract.emit_rt_window, "the default writes the RT window");
+        assert!(
+            cfg.extract.emit_rt_window,
+            "the default writes the RT window"
+        );
         assert_eq!(
             second_pass_trace_pad(&cfg, "a"),
             Some(extract::TracePad {
