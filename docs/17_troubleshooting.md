@@ -32,6 +32,7 @@ is the source of truth if it has moved.
 | `cal.json` reports a small `rt_residual_abs_median_s` but RT windows still miss peptides | The residual is measured on the same anchors the calibration was fitted to (`rt_im_train.rs:137`, `rt_im_train.rs:177-185`), so it is in-sample | Treat it as a fit diagnostic; size external RT tolerances from an out-of-sample comparison |
 | RT windows in a PTM search behave as if the modification were absent | The imported library gave every modform of a stripped peptide the same `predicted_irt` | Check per-stripped-peptide variance of `predicted_irt` in the library; re-predict iRT per peptidoform |
 | A grouped run (`groups.window_groups > 1`) stops with `groups: the retention-time windows would be unbounded` (or `... of band gNN would be unbounded`, `... of N of the M bands would be unbounded`) | The seed has fewer than two confident target anchors, or the fit kept fewer than two of them, so every band would extract every candidate over the whole gradient, usually at the configured fragment tolerance, and the memory has no bound (`run_groups.rs:828-880`, `run_groups.rs:438-469`, `rt_im_train.rs:80`) | Check the seed (library, decoys, `search_seed.fragment_tol_ppm`, input file), or the library's `predicted_irt` when the fit lost the anchors; search the run ungrouped; under `per_group` use `calibration = global`; or set `groups.allow_unbounded_rt = true` deliberately. See "Grouped search: unbounded retention-time windows" below |
+| `search-seed: too few confident targets at the configured fragment tolerance; the search at the wider tolerance found more and is used` (warning), or `search-seed: done ... confident=0` followed by `rt-im-train: ... using unbounded RT windows` and an extraction that runs out of memory | The run's fragment m/z are off by about `search_seed.fragment_tol_ppm` or more, so the seed at that tolerance finds no confident target and nothing calibrates the offset (+19.6 ppm on the timsTOF Pro runs of PXD028735; `search_seed.rs`, `search_with_widening`) | The warning needs no action: the retry at `fragment_tol_ppm * widen_tol_factor` found the targets and the mass calibration in `<seed>.masscal.json` gives the offset. If the seed still finds nothing, the offset is beyond the retry: raise `search_seed.fragment_tol_ppm` or `widen_tol_factor`, and check the library and its decoys. See "Seed: no confident targets" below |
 | A single-file run spends over half an hour before extract starts | `rt_im_train.finetune_deeplc = true` fine-tunes and then re-predicts iRT over the whole library on every file | Fine-tune once into the library's `predicted_irt`, then run with `finetune_deeplc = false` and the per-run LOESS |
 | `OSError: [WinError 1114] ... Error loading "...\torch\lib\c10.dll"` from a DeepLC worker | numpy/pyarrow were imported before `deeplc`; DeepLC 4.x is torch-backed and the wrong order aborts torch DLL init | Keep `import deeplc` first (`scripts/deeplc_worker.py:26`); the ordering is load-bearing, do not sort those imports |
 | `mumdia doctor` is green, then the run crashes at the DeepLC fine-tune on a missing import | doctor probed only part of what `deeplc_finetune.py` imports | Current doctor probes `deeplc,numpy,pandas,pyarrow,torch,psm_utils` (`main.rs:370`); re-run it after any env change |
@@ -295,6 +296,31 @@ was 0.9876 for unmodified peptides but 0.4980 for modified ones. Before trusting
 RT windows in a PTM search, check the per-stripped-peptide variance of
 `predicted_irt` in the library; if it is zero for most groups, re-predict iRT per
 peptidoform.
+
+## Seed: no confident targets
+
+**Symptom.** `search-seed: done ... confident=0` (or a handful), then `rt-im-train: too few
+seed anchors ... n_anchors=0`, `fewer than two target anchors; using unbounded RT windows`
+and `too few ion-mobility anchors; ... the IM windows are null`, then an extraction over every
+candidate of the library whose memory grows until the host or a watchdog stops it. Since the
+tolerance retry the seed may instead warn `too few confident targets at the configured
+fragment tolerance; the search at the wider tolerance found more and is used`.
+
+**Cause.** The seed scores fragments at one tolerance, `search_seed.fragment_tol_ppm` (20
+ppm), and the mass calibration measures the offset only from the confident targets that
+search finds. Fragment m/z that are off by about the tolerance match almost nothing. On the
+timsTOF Pro HYE runs of PXD028735 the seed found 0 confident targets at 20 ppm and 3,937 at
+40 ppm, where the calibration measured +19.6 ppm (MAD 10.3); the jobs of that dataset reached
+332-404 GB in extraction. A seed can also find nothing for other reasons: a library without
+valid decoys, a run with almost no signal, or a library that does not match the sample.
+
+**Fix.** `search_seed.widen_tol_below` (50 by default) retries the seed once at
+`fragment_tol_ppm * widen_tol_factor` (2x) when fewer targets pass `fdr_seed`, and keeps the
+wider search when it finds more (`docs/07_search_seed.md`, "Tolerance retry"); the warning
+above says it did, and the seed report's `widen_tol` block records both counts. When even the
+retry finds nothing, raise `search_seed.fragment_tol_ppm` (or the factor) for that
+acquisition, or check the library and its decoys. The bands of a grouped run do not retry; a
+grouped run stops instead (next section).
 
 ## Grouped search: unbounded retention-time windows
 

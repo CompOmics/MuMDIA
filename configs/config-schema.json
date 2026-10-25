@@ -1583,6 +1583,32 @@
       "source_struct": "SearchSeedConfig"
     },
     {
+      "path": "search_seed.widen_tol_below",
+      "name": "widen_tol_below",
+      "section": "search_seed",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": null,
+      "default_text": null,
+      "help": "When fewer than this many targets pass `fdr_seed` at `fragment_tol_ppm`, search the run once more at `fragment_tol_ppm x widen_tol_factor` and keep that search when it finds more confident targets; its tolerance then also sets the mass calibration and the observed 1/K0. An acquisition whose fragment m/z are off by about the tolerance (+19.6 ppm on the timsTOF Pro HYE runs of PXD028735) otherwise matches nothing: 0 confident seed PSMs at 20 ppm against 3,937 at 40, so no retention-time anchors, unbounded windows and an extraction over every candidate. 50 is the anchor count the retention time fit needs. A run that reaches it at `fragment_tol_ppm` searches once, as before. Not applied to the bands of a grouped run, whose calibrants `seed-pool` pools at one tolerance. 0 turns the retry off. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "SearchSeedConfig"
+    },
+    {
+      "path": "search_seed.widen_tol_factor",
+      "name": "widen_tol_factor",
+      "section": "search_seed",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": null,
+      "default_text": null,
+      "help": "The factor of the retry's fragment tolerance (`widen_tol_below`); must be > 1. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "SearchSeedConfig"
+    },
+    {
       "path": "rt_im_train.calibration_method",
       "name": "calibration_method",
       "section": "rt_im_train",

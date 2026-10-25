@@ -62,7 +62,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`digest.decoy`](#digestdecoy) | `DecoyConfig` | 1 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`peptidoforms`](#peptidoforms) | `PeptidoformsConfig` | 7 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 | [`predict_frag`](#predict_frag) | `PredictFragConfig` | 17 | [docs/06_predict_frag_index_matchers.md](06_predict_frag_index_matchers.md) |
-| [`search_seed`](#search_seed) | `SearchSeedConfig` | 11 | [docs/07_search_seed.md](07_search_seed.md) |
+| [`search_seed`](#search_seed) | `SearchSeedConfig` | 13 | [docs/07_search_seed.md](07_search_seed.md) |
 | [`rt_im_train`](#rt_im_train) | `RtImTrainConfig` | 33 | [docs/08_rt_im_train.md](08_rt_im_train.md) |
 | [`extract`](#extract) | `ExtractConfig` | 45 | [docs/09_extract.md](09_extract.md) |
 | [`extract.claim_cues`](#extractclaim_cues) | `ClaimCues` | 7 | [docs/09_extract.md](09_extract.md) |
@@ -305,6 +305,8 @@ Fragment traces over consecutive same-window scans.
 | `frag_tol_floor_ppm` | `f64` | `5.0` |  | Floor (ppm) on the fragment tolerance learned from the seed's calibrants, which `extract` then searches with. Default 5, the value that was hard-coded. The learned tolerance is `1.5 x p95(\|deviation - median\|)`; on an instrument whose fragment mass error is well under a ppm (Astral) the floor, not the data, sets it. |
 | `count_fragments_once` | `bool` | `false` | benchmark-gated | Count each predicted fragment of a candidate at most once per spectrum, with the intensity of its most intense matching peak, instead of once per matching peak. On diaPASEF slot spectra the mobility pieces of one fragment ion sit at one m/z and would otherwise count as several fragments in the hyperscore's `ln(matched!)` (docs/07_search_seed.md). Needs `matcher = fragindex`, whose seed index then also holds each posting's fragment ordinal (2 bytes per posting). Default false: the seed is unchanged. Benchmark-gated (docs/35_diapasef.md). Omitted from the canonical configuration at its default. |
 | `frag_tol_mad_k` | `f64` | `0.0` | benchmark-gated | Size the learned fragment tolerance from the robust spread of the calibrant deviations, `frag_tol_mad_k x 1.4826 x MAD`, instead of `1.5 x p95`, where MAD is the median of `\|deviation - median\|`. Still floored at `frag_tol_floor_ppm`. Under `two_pass_mass_cal` the second pass refits only the offset on the deviations inside the first-pass window and keeps the first-pass width: a MAD re-estimated on inliers truncated at that width is narrower than the spread it was cut from. A p95 is set by the tail of the deviations, so a 10% shoulder of random matches can widen it several-fold, where the MAD follows the core. Default 0: the p95 estimator, bit-identical to before the key existed. Benchmark-gated (docs/07_search_seed.md). Omitted from the canonical configuration at its default. |
+| `widen_tol_below` | `usize` | unresolved |  | When fewer than this many targets pass `fdr_seed` at `fragment_tol_ppm`, search the run once more at `fragment_tol_ppm x widen_tol_factor` and keep that search when it finds more confident targets; its tolerance then also sets the mass calibration and the observed 1/K0. An acquisition whose fragment m/z are off by about the tolerance (+19.6 ppm on the timsTOF Pro HYE runs of PXD028735) otherwise matches nothing: 0 confident seed PSMs at 20 ppm against 3,937 at 40, so no retention-time anchors, unbounded windows and an extraction over every candidate. 50 is the anchor count the retention time fit needs. A run that reaches it at `fragment_tol_ppm` searches once, as before. Not applied to the bands of a grouped run, whose calibrants `seed-pool` pools at one tolerance. 0 turns the retry off. Omitted from the canonical configuration at its default. |
+| `widen_tol_factor` | `f64` | unresolved |  | The factor of the retry's fragment tolerance (`widen_tol_below`); must be > 1. Omitted from the canonical configuration at its default. |
 
 ## rt_im_train
 
@@ -1243,7 +1245,10 @@ one exception noted in its own help text: it sets `MUMDIA_NN_THREADS` and
 Listed rather than omitted, so a parsing gap is visible in the document
 instead of looking like an absent field.
 
-Every field whose struct has an `impl Default` resolved from the source.
+2 field default(s) could not be resolved:
+
+- `search_seed.widen_tol_below` (`usize`): unresolved expression `DEFAULT_WIDEN_TOL_BELOW`
+- `search_seed.widen_tol_factor` (`f64`): unresolved expression `DEFAULT_WIDEN_TOL_FACTOR`
 
 2 field(s) have no default because the owning struct has no `impl Default`. That is the source's intent, not a parsing gap: a list element must carry every key.
 
@@ -1263,6 +1268,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-24 structs and 316 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 40 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 318 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 40 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
-33 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
+33 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

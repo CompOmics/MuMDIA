@@ -126,6 +126,19 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **The seed search retries at a wider fragment tolerance when it finds too few confident
+  targets.** A run whose fragment m/z are off by about `search_seed.fragment_tol_ppm` (20 ppm)
+  found no confident seed target, so nothing calibrated the offset, retention-time and 1/K0
+  windows were unbounded, and the extraction ran over every candidate until memory ran out:
+  the timsTOF Pro HYE runs of PXD028735 are off by about +20 ppm and found 0 confident targets
+  at 20 ppm, 3,937 at 40 ppm, and reached 332-404 GB in extraction. When fewer than
+  `search_seed.widen_tol_below` (50) targets pass `fdr_seed`, the seed now searches once more at
+  `fragment_tol_ppm x search_seed.widen_tol_factor` (2) on the same library and keeps that
+  search when it finds more; the mass calibration, the observed 1/K0 and the report follow its
+  tolerance, the report records both searches (`widen_tol`), and the stage warns. A run that
+  reaches 50 at the configured tolerance is unchanged, byte for byte. The bands of a grouped
+  run do not retry. Both keys are omitted from the canonical configuration at their defaults,
+  so no config hash changes (docs/07, "Tolerance retry"; docs/17).
 - **diaPASEF: the 1/K0 window is sized from the whole seed, decoy-corrected, and widened
   1.3x.** `rt_im_train.im_window_sizing` defaults to `seed_decoy_corrected`. search-seed
   records the observed 1/K0 of every PSM up to a seed q of 0.1 (`im_window_sizing_q`),

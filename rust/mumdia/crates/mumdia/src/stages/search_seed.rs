@@ -336,58 +336,15 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
         "search-seed: loaded"
     );
 
-    // Best-per-candidate PSM. The fragindex path parallelizes across isolation-window
-    // groups (each scan belongs to exactly one window, so groups are independent) and
-    // is bit-identical to the serial path via a deterministic per-candidate merge; the
-    // bucketed path stays serial.
-    let best: HashMap<u32, Best> = if let Some(idx) = fidx {
-        seed_fragindex_windows(idx, scans, p.cfg)
-    } else {
-        let mut best: HashMap<u32, Best> = HashMap::new();
-        for scan in scans {
-            let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
-            if hi <= lo {
-                continue;
-            }
-            let peak_idx = select_peaks(scan, p.cfg.top_n_peaks);
-            let mut acc: HashMap<u32, (u32, f64)> = HashMap::new();
-            for &pidx in &peak_idx {
-                let peak = &scan.peaks[pidx];
-                let inten = peak.intensity as f64;
-                // Observed m/z is stored f32; widen once, the value is unchanged.
-                let obs_mz = peak.mz as f64;
-                lib.page_search(obs_mz, p.cfg.fragment_tol_ppm, lo, hi, |cid, _mz, _pi| {
-                    let e = acc.entry(cid).or_insert((0, 0.0));
-                    e.0 += 1;
-                    e.1 += inten;
-                });
-            }
-            let mut scored: Vec<(u32, f64, u32)> = acc
-                .into_iter()
-                .filter(|(_, v)| v.0 as usize >= p.cfg.min_matched_peaks)
-                .map(|(cid, v)| (cid, hyperscore(v.0, v.1), v.0))
-                .collect();
-            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-            scored.truncate(p.cfg.report_psms);
-            for (cid, score, matched) in scored {
-                let entry = best.entry(cid).or_insert(Best {
-                    score: f64::NEG_INFINITY,
-                    rt: 0.0,
-                    matched: 0,
-                    scan_index: 0,
-                });
-                if score > entry.score {
-                    *entry = Best {
-                        score,
-                        rt: scan.rt_seconds,
-                        matched,
-                        scan_index: scan.scan_index,
-                    };
-                }
-            }
-        }
-        best
-    };
+    // Best-per-candidate PSM at the configured fragment tolerance, and once more at a wider
+    // one when that finds too few confident targets (`search_seed.widen_tol_below`). The
+    // bands of a grouped run keep the configured tolerance: `seed-pool` pools their
+    // calibrants at one tolerance.
+    let (best, widened_cfg, widening) =
+        search_with_widening(lib, fidx, scans, p.cfg, !p.emit_calibrants);
+    // The tolerance of the search that was kept, which the mass calibration, the observed
+    // 1/K0 and the report below follow.
+    let cfg: &SearchSeedConfig = widened_cfg.as_ref().unwrap_or(p.cfg);
 
     // Assemble PSM rows (best per candidate) and compute q-values.
     let mut rows: Vec<(u32, &Best)> = best.iter().map(|(k, v)| (*k, v)).collect();
@@ -493,7 +450,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             // could not observe a deviation beyond 50, so its p95 was bounded at 50 and
             // the learned tolerance came out too tight. The 50 ppm floor is kept for the
             // narrow-tolerance case, where a wider window would just admit noise.
-            let collect_ppm = 50.0_f64.max(p.cfg.fragment_tol_ppm);
+            let collect_ppm = 50.0_f64.max(cfg.fragment_tol_ppm);
             // The scan's 1/K0 when this row is one of its anchors.
             let scan_im = scan.im.as_deref().filter(|_| confident);
             im_pts.clear();
@@ -510,7 +467,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
                         dev_mz.push(fmz);
                     }
                     if let Some(im) = scan_im {
-                        if pp.abs() <= p.cfg.fragment_tol_ppm {
+                        if pp.abs() <= cfg.fragment_tol_ppm {
                             im_pts.push((im[j] as f64, scan.peaks[j].intensity as f64));
                         }
                     }
@@ -549,10 +506,10 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             im_pts.clear();
             for &fmz in lib.cand_frag_mz(*cid) {
                 let fmz = fmz as f64;
-                let collect_ppm = 50.0_f64.max(p.cfg.fragment_tol_ppm);
+                let collect_ppm = 50.0_f64.max(cfg.fragment_tol_ppm);
                 if let Some(j) = crate::spectra::nearest_peak(&scan.peaks, fmz, collect_ppm) {
                     let pp = mumdia_core::constants::ppm_diff(scan.peaks[j].mz as f64, fmz);
-                    if pp.abs() <= p.cfg.fragment_tol_ppm {
+                    if pp.abs() <= cfg.fragment_tol_ppm {
                         im_pts.push((im[j] as f64, scan.peaks[j].intensity as f64));
                     }
                 }
@@ -564,7 +521,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
     // second pass and the optional m/z-dependent grid. The estimator lives in
     // `crate::masscal` because `seed-pool` fits the very same one over the pooled
     // deviations of a grouped run.
-    let cal = crate::masscal::MassCal::fit_from(&devs, &dev_mz, p.cfg);
+    let cal = crate::masscal::MassCal::fit_from(&devs, &dev_mz, cfg);
     mumdia_io::json::write_json(&crate::masscal::json_path(p.out), &cal.to_json())?;
     // `(deviations, in-memory bytes, target rows)` of the sidecar, for the artifact report:
     // every target row of the band is offered, so this is what an at-scale run needs to
@@ -639,7 +596,7 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
         content_hash: seed_written.content_hash,
         params: {
             let mut v = json!({
-                "fragment_tol_ppm": p.cfg.fragment_tol_ppm,
+                "fragment_tol_ppm": cfg.fragment_tol_ppm,
                 "report_psms": p.cfg.report_psms,
                 "min_matched_peaks": p.cfg.min_matched_peaks,
                 "top_n_peaks": p.cfg.top_n_peaks,
@@ -648,6 +605,16 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
             // Only when on, so a default report is unchanged.
             if p.cfg.count_fragments_once {
                 v["count_fragments_once"] = json!(true);
+            }
+            // Only when the retry ran, so a seed that searched once reports as before.
+            if let Some(w) = &widening {
+                v["widen_tol"] = json!({
+                    "base_fragment_tol_ppm": w.base_tol,
+                    "base_confident": w.base_confident,
+                    "wide_fragment_tol_ppm": w.wide_tol,
+                    "wide_confident": w.wide_confident,
+                    "adopted": w.adopted,
+                });
             }
             v
         },
@@ -665,6 +632,161 @@ pub fn run_returning_scans(p: SearchSeedParams) -> Result<(Written, Option<Vec<M
     );
     drop(owned_library);
     Ok((report.written(), owned_scans))
+}
+
+/// Best-per-candidate PSM at `cfg.fragment_tol_ppm`. The fragindex path (`idx`, built at
+/// that tolerance) parallelizes across isolation-window groups (each scan belongs to exactly
+/// one window, so groups are independent) and is bit-identical to the serial path via a
+/// deterministic per-candidate merge; the bucketed path stays serial.
+fn search_best(
+    lib: &Library,
+    idx: Option<&FragIndex>,
+    scans: &[Ms2Scan],
+    cfg: &SearchSeedConfig,
+) -> HashMap<u32, Best> {
+    if let Some(idx) = idx {
+        return seed_fragindex_windows(idx, scans, cfg);
+    }
+    let mut best: HashMap<u32, Best> = HashMap::new();
+    for scan in scans {
+        let (lo, hi) = lib.candidate_range(scan.window.lower_mz, scan.window.upper_mz);
+        if hi <= lo {
+            continue;
+        }
+        let peak_idx = select_peaks(scan, cfg.top_n_peaks);
+        let mut acc: HashMap<u32, (u32, f64)> = HashMap::new();
+        for &pidx in &peak_idx {
+            let peak = &scan.peaks[pidx];
+            let inten = peak.intensity as f64;
+            // Observed m/z is stored f32; widen once, the value is unchanged.
+            let obs_mz = peak.mz as f64;
+            lib.page_search(obs_mz, cfg.fragment_tol_ppm, lo, hi, |cid, _mz, _pi| {
+                let e = acc.entry(cid).or_insert((0, 0.0));
+                e.0 += 1;
+                e.1 += inten;
+            });
+        }
+        let mut scored: Vec<(u32, f64, u32)> = acc
+            .into_iter()
+            .filter(|(_, v)| v.0 as usize >= cfg.min_matched_peaks)
+            .map(|(cid, v)| (cid, hyperscore(v.0, v.1), v.0))
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.truncate(cfg.report_psms);
+        for (cid, score, matched) in scored {
+            let entry = best.entry(cid).or_insert(Best {
+                score: f64::NEG_INFINITY,
+                rt: 0.0,
+                matched: 0,
+                scan_index: 0,
+            });
+            if score > entry.score {
+                *entry = Best {
+                    score,
+                    rt: scan.rt_seconds,
+                    matched,
+                    scan_index: scan.scan_index,
+                };
+            }
+        }
+    }
+    best
+}
+
+/// The targets of `best` that pass `fdr` by the seed's own target-decoy q, computed as the
+/// stage computes it for its table (rows in candidate order).
+fn confident_targets(best: &HashMap<u32, Best>, lib: &Library, fdr: f64) -> usize {
+    let mut rows: Vec<(u32, f64)> = best.iter().map(|(c, b)| (*c, b.score)).collect();
+    rows.sort_by_key(|(c, _)| *c);
+    let sd: Vec<(f64, bool)> = rows
+        .iter()
+        .map(|(c, s)| (*s, lib.is_decoy[*c as usize]))
+        .collect();
+    let q = target_decoy_q(&sd);
+    let is_dec: Vec<bool> = sd.iter().map(|(_, d)| *d).collect();
+    count_targets_at_q(&q, &is_dec, fdr)
+}
+
+/// What the tolerance retry did (`search_seed.widen_tol_below`).
+#[derive(Clone, Debug, PartialEq)]
+struct Widening {
+    base_tol: f64,
+    base_confident: usize,
+    wide_tol: f64,
+    wide_confident: usize,
+    adopted: bool,
+}
+
+/// [`search_best`] at the configured tolerance and, when that finds fewer than
+/// `cfg.widen_tol_below` confident targets and `allow` is set, once more at
+/// `fragment_tol_ppm x widen_tol_factor` on the same library (the fragindex path builds an
+/// index at the wider tolerance for that search and drops it afterwards). The wider search
+/// is kept only when it finds more confident targets. Returns the kept search, its
+/// configuration when it is the wider one (`None`: the configured one), and what the retry
+/// did (`None`: no retry).
+fn search_with_widening(
+    lib: &Library,
+    idx: Option<&FragIndex>,
+    scans: &[Ms2Scan],
+    cfg: &SearchSeedConfig,
+    allow: bool,
+) -> (
+    HashMap<u32, Best>,
+    Option<SearchSeedConfig>,
+    Option<Widening>,
+) {
+    let best = search_best(lib, idx, scans, cfg);
+    if !allow || cfg.widen_tol_below == 0 {
+        return (best, None, None);
+    }
+    let base_confident = confident_targets(&best, lib, cfg.fdr_seed);
+    if base_confident >= cfg.widen_tol_below {
+        return (best, None, None);
+    }
+    let mut wide_cfg = cfg.clone();
+    wide_cfg.fragment_tol_ppm = cfg.fragment_tol_ppm * cfg.widen_tol_factor;
+    let wide_best = {
+        let wide_idx = idx.map(|_| {
+            if cfg.count_fragments_once {
+                FragIndex::build_mz_only_with_ordinals(lib, wide_cfg.fragment_tol_ppm)
+            } else {
+                FragIndex::build_mz_only(lib, wide_cfg.fragment_tol_ppm)
+            }
+        });
+        search_best(lib, wide_idx.as_ref(), scans, &wide_cfg)
+    };
+    let wide_confident = confident_targets(&wide_best, lib, cfg.fdr_seed);
+    let w = Widening {
+        base_tol: cfg.fragment_tol_ppm,
+        base_confident,
+        wide_tol: wide_cfg.fragment_tol_ppm,
+        wide_confident,
+        adopted: wide_confident > base_confident,
+    };
+    if w.adopted {
+        warn!(
+            base_fragment_tol_ppm = w.base_tol,
+            base_confident = w.base_confident,
+            wide_fragment_tol_ppm = w.wide_tol,
+            wide_confident = w.wide_confident,
+            widen_tol_below = cfg.widen_tol_below,
+            "search-seed: too few confident targets at the configured fragment tolerance; \
+             the search at the wider tolerance found more and is used. The fragment m/z of \
+             this run are probably off by about the configured tolerance; the mass \
+             calibration below measures the offset"
+        );
+        (wide_best, Some(wide_cfg), Some(w))
+    } else {
+        info!(
+            base_fragment_tol_ppm = w.base_tol,
+            base_confident = w.base_confident,
+            wide_fragment_tol_ppm = w.wide_tol,
+            wide_confident = w.wide_confident,
+            "search-seed: too few confident targets at the configured fragment tolerance, \
+             and no more at the wider one; the configured search is kept"
+        );
+        (best, None, Some(w))
+    }
 }
 
 /// Peak indices to probe for a scan: the `top_n` most intense (index-ascending
@@ -1383,5 +1505,149 @@ mod chunk_tests {
         let a = seed_fragindex_windows_chunked(&idx_b, &scans, &cfg, 1, usize::MAX);
         let b = seed_fragindex_windows_chunked(&idx_b, &scans, &cfg, 64, 1);
         assert_eq!(bits(&a), bits(&b));
+    }
+}
+
+#[cfg(test)]
+mod widen_tests {
+    use super::{search_best, search_with_widening, Best, Widening};
+    use crate::index::{Candidate, Library};
+    use crate::matchers::fragindex::FragIndex;
+    use mumdia_core::config::SearchSeedConfig;
+    use mumdia_core::types::{IsolationWindow, Ms2Scan, Peak};
+    use std::collections::HashMap;
+
+    /// 300 candidates (every third a decoy) with six fragments each, and one scan per target
+    /// holding its fragments with every m/z off by `offset_ppm`.
+    fn fixture(offset_ppm: f64) -> (Library, Vec<Ms2Scan>) {
+        let (mut frag_mz, mut frag_int, mut frag_name_id, mut cs) =
+            (vec![], vec![], vec![], vec![]);
+        let frags =
+            |i: usize| -> Vec<f64> { (0..6).map(|k| 200.0 + (i * 6 + k) as f64 * 1.37).collect() };
+        for i in 0..300usize {
+            let start = frag_mz.len();
+            for mz in frags(i) {
+                frag_mz.push(mz as f32);
+                frag_int.push(1.0);
+                frag_name_id.push(0u16);
+            }
+            cs.push(Candidate {
+                candidate_id: i as u32,
+                peptidoform_id: i as u32,
+                base_peptide_id: i as u32,
+                peptidoform: String::new(),
+                charge: 2,
+                precursor_mz: 400.0 + i as f64 * 0.5,
+                predicted_irt: 0.0,
+                is_decoy: i % 3 == 0,
+                protein: String::new(),
+                frag_start: start,
+                n_frag: 6,
+            });
+        }
+        let lib =
+            Library::from_candidates(cs, frag_mz, frag_int, frag_name_id, vec!["f".to_string()]);
+        let window = IsolationWindow {
+            target_mz: 475.0,
+            lower_mz: 390.0,
+            upper_mz: 560.0,
+            im_lower: None,
+            im_upper: None,
+        };
+        let scans = (0..300usize)
+            .filter(|i| i % 3 != 0)
+            .enumerate()
+            .map(|(s, i)| {
+                let mut peaks: Vec<Peak> = frags(i)
+                    .into_iter()
+                    .map(|mz| Peak {
+                        mz: (mz * (1.0 + offset_ppm * 1e-6)) as f32,
+                        intensity: 1000.0,
+                    })
+                    .collect();
+                peaks.sort_by(|a, b| a.mz.total_cmp(&b.mz));
+                Ms2Scan {
+                    scan_index: s as u32,
+                    rt_seconds: s as f64,
+                    window,
+                    peaks,
+                    im: None,
+                }
+            })
+            .collect();
+        (lib, scans)
+    }
+
+    fn bits(m: &HashMap<u32, Best>) -> Vec<(u32, u64, u32)> {
+        let mut v: Vec<_> = m
+            .iter()
+            .map(|(c, b)| (*c, b.score.to_bits(), b.scan_index))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Fragments 30 ppm off match nothing at 20 ppm; the retry at 40 ppm finds every target
+    /// and is the search that is kept, with its tolerance.
+    #[test]
+    fn an_offset_beyond_the_tolerance_is_found_by_the_wider_retry() {
+        let (lib, scans) = fixture(30.0);
+        let cfg = SearchSeedConfig::default();
+        assert_eq!((cfg.widen_tol_below, cfg.widen_tol_factor), (50, 2.0));
+        let idx = FragIndex::build_mz_only(&lib, cfg.fragment_tol_ppm);
+        assert!(search_best(&lib, Some(&idx), &scans, &cfg).is_empty());
+        let (best, wide, w) = search_with_widening(&lib, Some(&idx), &scans, &cfg, true);
+        assert_eq!(
+            w,
+            Some(Widening {
+                base_tol: 20.0,
+                base_confident: 0,
+                wide_tol: 40.0,
+                wide_confident: 200,
+                adopted: true,
+            })
+        );
+        assert_eq!(wide.map(|c| c.fragment_tol_ppm), Some(40.0));
+        assert_eq!(best.len(), 200);
+    }
+
+    /// A run that reaches `widen_tol_below` at the configured tolerance searches once, with
+    /// exactly the result of the plain search.
+    #[test]
+    fn a_run_with_enough_confident_targets_searches_once() {
+        let (lib, scans) = fixture(2.0);
+        let cfg = SearchSeedConfig::default();
+        let idx = FragIndex::build_mz_only(&lib, cfg.fragment_tol_ppm);
+        let plain = search_best(&lib, Some(&idx), &scans, &cfg);
+        let (best, wide, w) = search_with_widening(&lib, Some(&idx), &scans, &cfg, true);
+        assert_eq!((wide.is_none(), w), (true, None));
+        assert_eq!(bits(&best), bits(&plain));
+    }
+
+    /// The retry is not taken when it is turned off or not allowed (the bands of a grouped
+    /// run), and a retry that finds no more confident targets keeps the configured search.
+    #[test]
+    fn the_retry_is_off_not_allowed_or_not_kept_when_it_finds_no_more() {
+        let (lib, scans) = fixture(30.0);
+        let off = SearchSeedConfig {
+            widen_tol_below: 0,
+            ..Default::default()
+        };
+        let idx = FragIndex::build_mz_only(&lib, off.fragment_tol_ppm);
+        let (b, wide, w) = search_with_widening(&lib, Some(&idx), &scans, &off, true);
+        assert!(b.is_empty() && wide.is_none() && w.is_none());
+        let cfg = SearchSeedConfig::default();
+        let (b, wide, w) = search_with_widening(&lib, Some(&idx), &scans, &cfg, false);
+        assert!(b.is_empty() && wide.is_none() && w.is_none());
+        // 100 ppm off: neither 20 nor 40 ppm matches, so the configured search stands.
+        let (lib, scans) = fixture(100.0);
+        let (b, wide, w) =
+            search_with_widening(&lib, Some(&idx_for(&lib, &cfg)), &scans, &cfg, true);
+        assert!(b.is_empty() && wide.is_none());
+        assert_eq!(w.map(|w| (w.wide_confident, w.adopted)), Some((0, false)));
+    }
+
+    fn idx_for(lib: &Library, cfg: &SearchSeedConfig) -> FragIndex {
+        FragIndex::build_mz_only(lib, cfg.fragment_tol_ppm)
     }
 }

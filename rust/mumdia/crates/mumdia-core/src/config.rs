@@ -1327,6 +1327,23 @@ pub struct SearchSeedConfig {
     /// Omitted from the canonical configuration at its default.
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub frag_tol_mad_k: f64,
+    /// When fewer than this many targets pass `fdr_seed` at `fragment_tol_ppm`, search the run
+    /// once more at `fragment_tol_ppm x widen_tol_factor` and keep that search when it finds
+    /// more confident targets; its tolerance then also sets the mass calibration and the
+    /// observed 1/K0. An acquisition whose fragment m/z are off by about the tolerance (+19.6
+    /// ppm on the timsTOF Pro HYE runs of PXD028735) otherwise matches nothing: 0 confident
+    /// seed PSMs at 20 ppm against 3,937 at 40, so no retention-time anchors, unbounded
+    /// windows and an extraction over every candidate. 50 is the anchor count the retention
+    /// time fit needs. A run that reaches it at `fragment_tol_ppm` searches once, as before.
+    /// Not applied to the bands of a grouped run, whose calibrants `seed-pool` pools at one
+    /// tolerance. 0 turns the retry off. Omitted from the canonical configuration at its
+    /// default.
+    #[serde(skip_serializing_if = "is_default_widen_tol_below")]
+    pub widen_tol_below: usize,
+    /// The factor of the retry's fragment tolerance (`widen_tol_below`); must be > 1.
+    /// Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_default_widen_tol_factor")]
+    pub widen_tol_factor: f64,
 }
 impl Default for SearchSeedConfig {
     fn default() -> Self {
@@ -1342,8 +1359,23 @@ impl Default for SearchSeedConfig {
             frag_tol_floor_ppm: 5.0,
             count_fragments_once: false,
             frag_tol_mad_k: 0.0,
+            widen_tol_below: DEFAULT_WIDEN_TOL_BELOW,
+            widen_tol_factor: DEFAULT_WIDEN_TOL_FACTOR,
         }
     }
+}
+
+/// `search_seed.widen_tol_below` at its default.
+const DEFAULT_WIDEN_TOL_BELOW: usize = 50;
+/// `search_seed.widen_tol_factor` at its default.
+const DEFAULT_WIDEN_TOL_FACTOR: f64 = 2.0;
+
+fn is_default_widen_tol_below(v: &usize) -> bool {
+    *v == DEFAULT_WIDEN_TOL_BELOW
+}
+
+fn is_default_widen_tol_factor(v: &f64) -> bool {
+    *v == DEFAULT_WIDEN_TOL_FACTOR
 }
 
 /// A `false` flag, which the canonical configuration omits for keys added after the
@@ -4270,6 +4302,15 @@ impl Config {
                 self.search_seed.frag_tol_mad_k
             )));
         }
+        if !(self.search_seed.widen_tol_factor.is_finite()
+            && self.search_seed.widen_tol_factor > 1.0)
+        {
+            return Err(Invalid(format!(
+                "search_seed.widen_tol_factor must be finite and > 1 (got {}); turn the retry \
+                 off with search_seed.widen_tol_below = 0 instead",
+                self.search_seed.widen_tol_factor
+            )));
+        }
         if !(self.rescore.shadow_im_tolerance.is_finite()
             && self.rescore.shadow_im_tolerance >= 0.0)
         {
@@ -4956,6 +4997,32 @@ mod tests {
         let parsed: MbrConfig =
             serde_json::from_str(r#"{"second_pass_prefilter_keep_decoys": 0.5}"#).unwrap();
         assert_eq!(parsed.second_pass_prefilter_keep_decoys, Some(0.5));
+    }
+
+    /// The seed's tolerance retry is on at its defaults (50 confident targets, 2x), which the
+    /// canonical configuration omits so that no config hash changes; a factor of 1 or below
+    /// is refused, and `widen_tol_below = 0` turns the retry off and is part of the canonical
+    /// configuration.
+    #[test]
+    fn the_seed_tolerance_retry_defaults_stay_out_of_the_canonical_json() {
+        let c = Config::default();
+        assert_eq!(
+            (
+                c.search_seed.widen_tol_below,
+                c.search_seed.widen_tol_factor
+            ),
+            (50, 2.0)
+        );
+        assert!(!c.canonical_json().contains("widen_tol"));
+        for bad in [1.0, 0.5, f64::NAN, f64::INFINITY] {
+            let mut c = Config::default();
+            c.search_seed.widen_tol_factor = bad;
+            assert!(c.validate().is_err(), "{bad} accepted");
+        }
+        let mut off = Config::default();
+        off.search_seed.widen_tol_below = 0;
+        assert!(off.validate().is_ok());
+        assert!(off.canonical_json().contains(r#""widen_tol_below":0"#));
     }
 
     /// `digest.cleavage_rule` belongs to `enzyme = "custom"` only, a custom rule must

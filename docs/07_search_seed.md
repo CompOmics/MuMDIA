@@ -363,6 +363,40 @@ no stats and is byte-identical.
 **7. Write** `seed_psms.parquet` (`write_table`, `:233`) and the `ArtifactReport`
 (`:256-274`), then log `psms`, `confident`, `elapsed_ms`.
 
+### Tolerance retry (`widen_tol_below`)
+
+The seed searches at one fixed fragment tolerance, and the mass calibration can only measure
+an offset from the confident targets that search finds. A run whose fragment m/z are off by
+about the tolerance therefore finds no confident target at all: nothing to calibrate the
+offset from, no retention-time anchors, unbounded RT windows and no 1/K0 windows, and an
+extraction over every candidate across the whole gradient, whose memory has no bound. On the
+timsTOF Pro HYE runs of PXD028735 (otofControl 6.0, 2021) the fragments are off by about +20
+ppm: the seed of `LFQ_timsTOFPro_diaPASEF_Ecoli_01` found 0 confident targets at 20 ppm,
+3,937 at 40 ppm (mass calibration: offset +19.6 ppm, MAD 10.3 ppm) and 2,522 at 80 ppm, and
+the run-experiment jobs of that dataset reached 332-404 GB in extraction before a memory
+watchdog stopped them. Most other timsTOF acquisitions of the benchmark collection calibrate
+at 20 ppm, with offsets of -17 to +7 ppm; 40 of 108 timsTOF Pro 2 runs whose calibrated runs
+sit at -15 ppm, and the 346 runs of a single-cell timsTOF set, did not calibrate at all (their
+cause is not yet established).
+
+When fewer than `widen_tol_below` targets pass `fdr_seed` at `fragment_tol_ppm`
+(`search_with_widening`), the stage searches the same scans once more at `fragment_tol_ppm *
+widen_tol_factor` on the same loaded library; on the fragindex path it builds a second index
+at that tolerance for the retry and drops it afterwards, so the retry costs one more search
+and one more index build, and the two indexes are resident together for the retry. The wider
+search is kept only when it finds more confident targets. Everything after the search then
+follows the kept search's tolerance: the calibrant collection window, the observed 1/K0
+points, the mass calibration (whose learned tolerance and offset extract applies) and the
+`fragment_tol_ppm` in the report. The report also gains a `widen_tol` block (both tolerances,
+both confident counts, whether the wider search was kept), written only when the retry ran,
+and the stage logs a warning when the wider search is kept.
+
+A run that reaches `widen_tol_below` at the configured tolerance searches once: its seed
+table, mass calibration and report are byte-identical to before the key existed. 50 is the
+anchor count the retention-time fit needs (`rt_im_train`). The bands of a grouped run do not
+retry, because `seed-pool` pools their calibrants and refits one calibration at one
+tolerance; a grouped run whose seed has too few anchors stops instead (docs/33 section 4c).
+
 ### How the outputs are consumed
 
 `run` writes the seed to `seed_psms.parquet` (`run.rs:218-235`) and passes
@@ -426,6 +460,8 @@ on load.
 | `count_fragments_once` | `false` | count each predicted fragment once per spectrum at its most intense matching peak (step 3); fragindex only; omitted from the canonical configuration at the default |
 | `frag_tol_floor_ppm` | `5.0` | floor of the learned tolerance, in both passes |
 | `frag_tol_mad_k` | `0.0` | `> 0`: the learned tolerance is `frag_tol_mad_k * 1.4826 * MAD` instead of `1.5 * P95`, and the second pass refits the offset only (step 6); omitted from the canonical configuration at the default; benchmark-gated |
+| `widen_tol_below` | `50` | fewer confident targets than this at `fragment_tol_ppm`: search once more at `fragment_tol_ppm * widen_tol_factor` and keep the wider search when it finds more ("Tolerance retry" above); not applied to the bands of a grouped run; `0` = off; omitted from the canonical configuration at the default |
+| `widen_tol_factor` | `2.0` | the retry's tolerance factor, `> 1`; omitted from the canonical configuration at the default |
 
 `bucket_size` for the bucketed Library index is taken from `cfg.extract.bucket_size`,
 not from `SearchSeedConfig` (`run.rs:225`). The 50 ppm mass-calibration search
