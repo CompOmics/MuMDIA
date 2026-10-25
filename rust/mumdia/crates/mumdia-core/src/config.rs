@@ -2674,21 +2674,38 @@ pub struct QuantConfig {
     /// fragments (their areas are inflated) and so varies run to run.
     /// `predicted` ranks by the library (predicted or empirical) fragment intensity,
     /// a per-precursor constant, so every run sums the same fragments. Astral HYE
-    /// 2026-08-26: CV 0.163 -> 0.112 on 6/6 ions at top-3. Benchmark-gated.
-    /// `cross_run` weights each fragment by its consistency across the runs of an
-    /// experiment ([`FragmentSelection::CrossRun`]); benchmark-gated as well.
+    /// 2026-08-26 (pipeline of that date): CV 0.163 -> 0.112 on 6/6 ions at top-3. That
+    /// CV gain does not reproduce with 0.8.0: on fixed ProteoBench Astral identifications,
+    /// 6/6 ions, the median CV is 0.136 for `observed_area` and 0.151 for `predicted`.
+    /// Benchmark-gated. `cross_run` weights each fragment by its consistency across the
+    /// runs of an experiment ([`FragmentSelection::CrossRun`]); benchmark-gated as well.
+    /// Under interference `observed_area` compresses the ratios of the minor species: with
+    /// 0.8.0 on fixed identifications (ProteoBench default view, ions in at least 3 of 6
+    /// runs) the E. coli median log2 A/B (expected -2) is -1.43 / -1.68 / -1.71 for
+    /// `observed_area` / `predicted` / `cross_run` on Astral and -1.50 / -1.75 / -1.79 on
+    /// Q Exactive AIF, while the global |eps| and the CV get worse on Astral (docs/12,
+    /// "Fragment selection under interference").
     pub fragment_selection: FragmentSelection,
     /// When > 0, integrate each fragment over the `2k+1` scans centred on the
     /// identification apex instead of the descent-walk window (`bound_peak`
     /// window ignored; falls back to it when the apex is unknown). A fixed narrow
     /// window is far less sensitive to interference in the peak wings than the
     /// walked bounds. Default 3 (seven samples) since 2026-10-04; 0 restores the walked
-    /// window. Measured on the six-file Astral HYE experiment (one seed, 63,141
-    /// precursors quantified in at least 2 runs per condition): median |log2 ratio
-    /// error| 0.266 -> 0.163, species-equal 0.322 -> 0.201, median CV 0.19 -> 0.10, the
-    /// identifications unchanged. The width is in samples of the precursor's window, so
-    /// it scales with the cycle time; check it on an acquisition with much wider or
-    /// narrower peaks.
+    /// window. Measured 2026-10-04, with the pipeline of that date (before the second
+    /// pass became the default in 0.7.0), on the six-file Astral HYE experiment (one
+    /// seed, 63,141 precursors quantified in at least 2 runs per condition): median
+    /// |log2 ratio error| 0.266 -> 0.163, species-weighted 0.322 -> 0.201, median CV
+    /// 0.19 -> 0.10, the identifications unchanged. Those values do not describe 0.8.0.
+    /// Under the same ion filter (ProteoBench-scored precursors quantified in at least 2
+    /// runs per condition) the 0.8.0 ProteoBench Astral run measures 0.218 and 0.294
+    /// (113,876 precursors, one seed). The fixed window still beats the walked one with
+    /// 0.8.0 on fixed identifications, ProteoBench default view (ions in at least 3 of 6
+    /// runs): Astral species-weighted |eps| 0.355 against 0.475, global 0.238 against
+    /// 0.326, CV 0.151 against 0.237; Q Exactive AIF 0.329 against 0.542 (docs/12). On a
+    /// 3D second pass the traces are not padded, so the window is clipped near the edge of
+    /// the narrow second-pass RT window (docs/12). The width is in samples of the
+    /// precursor's window, so it scales with the cycle time; check it on an acquisition
+    /// with much wider or narrower peaks.
     pub fixed_scan_halfwidth: usize,
     /// Subtract a per-fragment local background before integrating (fixed-scan
     /// window only). The background is the `baseline_quantile` quantile of the
