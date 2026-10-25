@@ -632,7 +632,12 @@ spacing of one isolation window's scans). Apex choice, the gate, the peak claim 
 `psms_extracted` see only the window; a padded hit takes no part in a peak claim. The features
 stage cuts every trace back to the window (`params.trace_pad_s` in the chromatograms' report,
 `rt_lo`/`rt_hi` of `psms_extracted`), so the features are those of the unpadded table; only
-quantification reads the pad. It needs `extract.emit_rt_window` (on by default; without it the
+quantification reads the pad. The cut-back compares retention times in f32, while extract decides
+in f64 what is inside the window, so a pad point that lies just outside a bound but rounds onto
+the f32 bound is stored one f32 step outside it (about 1e-4 s). Until 2026-10-25 such points were
+read as inside, and 1 to 55 feature rows per run differed from the unpadded table (ProteoBench
+Astral 3-11 of about 135,000, diaPASEF 28-55 of about 144,000), which changed the classifier's
+training data and so the scored tables by seed-level amounts. It needs `extract.emit_rt_window` (on by default; without it the
 run is not padded, with a warning) and is not applied under a two-pass co-elution peak claim.
 The pad was applied on runs with 1/K0 only until 2026-10-25. Without it, on the six ProteoBench
 Astral runs (0.8.0, second-pass `w_rt` 4.5-12.7 s per run against about 9.8 s that a +-3-scan

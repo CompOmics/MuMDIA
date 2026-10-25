@@ -207,6 +207,15 @@ than a number. Both are recorded in every run's `manifest.json`.
   and the quantities of every 3D `run-experiment` on purpose; the second pass's
   `psms_extracted`, features and scored tables are those of the unpadded table, so
   identifications do not change.
+- **The features of a padded second pass are now exactly those of the unpadded table.** The
+  features stage cuts padded traces back to the RT window in f32, and extract decides in f64
+  which points are inside it, so a pad point just outside the window whose retention time
+  rounds onto the f32 bound was read as inside. A few feature rows per run differed (diaPASEF
+  second pass: 28-55 of about 144,000 per run), which changed the classifier's training data.
+  Such a point is now stored one f32 step outside the bound. Measured on ProteoBench Astral and
+  AIF: with the 3D pad above, the second pass's features, competed and scored tables are
+  byte-identical to an unpadded run. On diaPASEF this changes the second-pass features, scores
+  and identifications by seed-level amounts.
 
 ## [0.8.0] - 2026-10-22
 
