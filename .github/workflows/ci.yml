@@ -55,6 +55,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The opt-in native Thermo reader (`--features thermo`, docs/04_convert.md) is not in
+      # any release build, so lint it here or it can rot unnoticed. Downloads the .NET host
+      # library at build time; needs no .NET runtime.
+      - name: Clippy (thermo feature)
+        run: cargo clippy -p mumdia --all-targets --locked --features thermo -- -D warnings
+
       # Rustdoc, warnings as errors. Not previously run anywhere, and it was failing:
       # four bracketed prose expressions (`[i0,i1,i2]`, `[0,1]`) were parsed as
       # intra-doc links to items that do not exist, and three public doc comments
@@ -92,8 +98,21 @@ jobs:
       # is a compile-time proc macro whose 1.0.15 is its final release, so there is
       # nothing to bump to and a hard failure would only train people to ignore
       # this job. Deny the class that has a fix.
+      #
+      # Three advisories are ignored deliberately: RUSTSEC-2026-0367, -0368 and -0369
+      # in zip 6.0.0 (SUID/SGID bits kept, symlinks outside the destination, and Unix
+      # permissions applied through symlinks, all during extraction). zip is only a
+      # build dependency of nethost-sys 0.7.3, reached only under the opt-in `thermo`
+      # feature (mzdata -> thermorawfilereader -> netcorehost ^0.18 -> nethost-sys): its
+      # build script downloads Microsoft's nethost NuGet package from nuget.org over TLS
+      # and unpacks it. Nothing extracts an archive at run time, and release builds do
+      # not enable the feature. The fix is zip 9.0, and no release in the chain reaches
+      # it (nethost-sys 0.8.0 still requires zip ^8.3). Drop the ignores when
+      # thermorawfilereader moves to a netcorehost whose nethost-sys requires zip >= 9.
       - name: Audit
-        run: cargo audit --deny unsound --deny yanked
+        run: >-
+          cargo audit --deny unsound --deny yanked
+          --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
 
       # The desktop application has its own lockfile, which the step above does not
       # read (docs/29, work package C). One advisory is ignored deliberately:

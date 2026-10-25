@@ -54,6 +54,21 @@
       "source_struct": "ConvertConfig"
     },
     {
+      "path": "convert.thermo_native",
+      "name": "thermo_native",
+      "section": "convert",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Read a Thermo `.raw` directly instead of converting it to mzML first: through mzdata and Thermo's RawFileReader, with the vendor centroiding ThermoRawFileParser also uses. No mzML is written. Needs an engine built with the `thermo` feature and a .NET 8 runtime on the machine, and is subject to Thermo's RawFileReader licence. Off by default (benchmark-gated, docs/04_convert.md, \"Native Thermo reading\").",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ConvertConfig"
+    },
+    {
       "path": "convert.msconvert",
       "name": "msconvert",
       "section": "convert",

@@ -550,7 +550,7 @@ vendor file was involved.
 |---|---|---|
 | mzML | none | supported |
 | Bruker timsTOF `.d` (dir) with diaPASEF frames | none: native reader (timsrust), ion mobility kept | supported; the 1/K0 calibration, gate, features, retrace and cross-run quant are opt-in (`configs/examples/diapasef.json`, docs/35_diapasef.md) |
-| Thermo `.raw` (file) | ThermoRawFileParser, or msconvert | **exercised end to end** (doxy, 2026-09-06: a 3.7 GB Astral `.raw` through `mumdia convert --mzml x.raw`, ThermoRawFileParser 2.0.0 found by `auto`, 6:40 and 4.4 GB for the converter, 3.4 GB mzML renamed into place beside the input, reused by the next run in 1.3 s; `peak-census` on the same `.raw` likewise) |
+| Thermo `.raw` (file) | ThermoRawFileParser, or msconvert; or none under `convert.thermo_native` in a build with the `thermo` feature (opt-in, below) | **exercised end to end** (doxy, 2026-09-06: a 3.7 GB Astral `.raw` through `mumdia convert --mzml x.raw`, ThermoRawFileParser 2.0.0 found by `auto`, 6:40 and 4.4 GB for the converter, 3.4 GB mzML renamed into place beside the input, reused by the next run in 1.3 s; `peak-census` on the same `.raw` likewise) |
 | Bruker `.d` (dir), any other | msconvert | wired, unverified; **ion mobility is discarded** |
 | SCIEX `.wiff` / `.wiff2` | msconvert | wired, unverified; a `.wiff` needs its `.wiff.scan` companion beside it, and the engine names that file when msconvert fails without it |
 | Agilent `.d` (dir) | msconvert | wired, unverified |
@@ -574,7 +574,9 @@ Thermo and SCIEX, a .NET runtime, while the workspace pins `mzdata` to
 `default-features = false, features = ["mzml", "miniz_oxide"]` so that building
 MuMDIA needs no vendor SDK, C++ or .NET toolchain. Linking a vendor reader imposes
 that on every build on every platform, including the ones that never see a vendor
-file.
+file. The Thermo reader is now available behind an opt-in build feature
+("Native Thermo reading" below), which keeps the default build exactly as free of
+those toolchains as before.
 
 The native diaPASEF reader is the exception, because it needs none of those: a TDF is
 an SQLite index plus zstd-compressed frames. timsrust 0.4.2 (with only its `tdf`
@@ -598,6 +600,49 @@ and the `convert.tdf_*` settings, and `params.instrument` comes from
 decode failure. `peak-census` on such a `.d` counts after the native centroiding.
 docs/35_diapasef.md, section 2, has the reader in full, its settings, its measured
 motivation and its scope.
+
+### Native Thermo reading
+
+A build with the `thermo` Cargo feature (`cargo build --release --features thermo`) can
+read a Thermo `.raw` directly, through mzdata and Thermo's own RawFileReader hosted on a
+.NET 8 runtime, when `convert.thermo_native` is set. `raw::ensure_mzml` then passes the
+`.raw` through unconverted and `convert` reads it (`Source::Thermo`): no mzML is written
+and no ThermoRawFileParser is needed. The spectra are the vendor centroids, the same peak
+picking ThermoRawFileParser applies by default, so the two routes give the same spectra.
+One thread reads the file, which RawFileReader does serially, and the thread pool
+decodes the spectra in batches that are folded back in file order, byte-identical to a
+one-thread decode. The instrument comes from the file's metadata (the model is the first
+instrument-configuration parameter that is neither the serial number nor the instrument
+method text, which mzdata stores as `customization`), and the spectra reports record
+`params.reader = "thermorawfilereader"` and `params.centroiding = "vendor"`.
+
+Measured against ThermoRawFileParser 1.4.5 (`-f 2 -m 2`, peak picking on, the arguments
+`raw.rs` uses) on PXD071205 Astral files, 2026-10-19:
+
+| | native | via ThermoRawFileParser |
+|---|---|---|
+| one 15 min file, spectra | 2,022 MS1 / 188,011 MS2, 250 windows | identical counts, windows and MS2-to-MS1 map |
+| peaks | 249,976,110 MS2 | identical m/z everywhere; intensities identical except 2 tied peaks at one m/z stored in swapped order |
+| time and disk for that file | convert 81 s, no mzML | conversion 787 s (mono) and a 3.6 GB mzML, then convert 20 s |
+| six-file HYE experiment, peptides at 1% | 159,740 | 159,525 (NN seed noise) |
+
+Requirements and limits:
+
+- A .NET 8 runtime on the machine that runs the search (`DOTNET_ROOT` when it is not in the
+  default location). The build downloads the .NET host library (`nethost`): the build script
+  of `nethost-sys` 0.7.3 fetches Microsoft's NuGet package and unpacks it with zip 6.0.0,
+  which carries three extraction advisories (RUSTSEC-2026-0367, -0368, -0369). They concern
+  unpacking an untrusted archive, which happens only at build time and only for that
+  package, and no release in the chain reaches the fixed zip 9.0, so CI's `cargo audit`
+  ignores them until one does (`.github/workflows/ci.yml`).
+- Windows: the host library is built against the static C runtime, so the build needs
+  `RUSTFLAGS="-C target-feature=+crt-static"`. Linux: a glibc build; the fully static musl
+  release target cannot host the runtime.
+- Using RawFileReader means accepting Thermo's RawFileReader licence. The release
+  archives, the Docker image and the desktop application are built without the feature,
+  so nothing MuMDIA ships includes it.
+- Off by default and benchmark-gated: a build without the feature refuses
+  `convert.thermo_native` with a message rather than falling back to a converter.
 
 ### Two converters, and the licence difference between them
 

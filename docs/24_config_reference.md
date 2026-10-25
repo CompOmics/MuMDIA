@@ -52,7 +52,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | Section | Struct | Fields | Stage document |
 |---|---|---|---|
 | [(top level)](#top-level) | `Config` | 18 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
-| [`convert`](#convert) | `ConvertConfig` | 13 |  |
+| [`convert`](#convert) | `ConvertConfig` | 14 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
 | [`prescreen`](#prescreen) | `PrescreenConfig` | 31 |  |
 | [`prescreen.tags`](#prescreentags) | `PrescreenTagsConfig` | 7 |  |
@@ -110,6 +110,7 @@ Vendor-format conversion, read by every subcommand that takes a spectra path (`r
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
 | `thermo_raw_parser` | `String` | `"auto"` |  | Path to the ThermoRawFileParser executable, or `"auto"` to search. `"auto"` looks at `MUMDIA_THERMO_PARSER`, then beside the engine binary, then on `PATH`. Empty means the same as `"auto"`; a real path is used verbatim and its absence is an error rather than a silent fallback, because a fallback would convert with a different program than the one asked for and vendor conversion is not reproducible across converters. |
+| `thermo_native` | `bool` | `false` | benchmark-gated | Read a Thermo `.raw` directly instead of converting it to mzML first: through mzdata and Thermo's RawFileReader, with the vendor centroiding ThermoRawFileParser also uses. No mzML is written. Needs an engine built with the `thermo` feature and a .NET 8 runtime on the machine, and is subject to Thermo's RawFileReader licence. Off by default (benchmark-gated, docs/04_convert.md, "Native Thermo reading"). |
 | `msconvert` | `String` | `"auto"` |  | Path to ProteoWizard `msconvert`, or `"auto"` to search. Used for every vendor format except Thermo, which prefers ThermoRawFileParser: Bruker `.d`, SCIEX `.wiff`, Agilent `.d` and Waters `.raw`. It is also the Thermo fallback when no ThermoRawFileParser is found. `"auto"` searches `MUMDIA_MSCONVERT`, beside the engine binary, the version-stamped ProteoWizard directories under Program Files on Windows (newest first), then `PATH`. MuMDIA never ships or downloads ProteoWizard. Its vendor readers bundle the instrument vendors' own libraries under the vendors' licence terms, which the user accepts when obtaining it, and automating that acceptance is not MuMDIA's to do. |
 | `msconvert_args` | `Vec<String>` | `[]` |  | Extra arguments appended to every `msconvert` invocation. An escape hatch, not a tuning surface. The per-vendor defaults already request indexed 64-bit zlib mzML, vendor peak picking where it exists, and `--combineIonMobilitySpectra` for Bruker. Use this for something the defaults cannot express, such as an `--filter` that trims an acquisition. Arguments are passed through verbatim and are not validated. |
 | `reuse_converted` | `bool` | `true` |  | Reuse an mzML that already sits beside the `.raw` and is newer than it. On by default: conversion is minutes per file and its output is deterministic given the same converter, so re-running a search should not pay for it twice. Turn it off when the neighbouring mzML may have come from a different converter or a different `.raw` of the same name. |
@@ -1268,6 +1269,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-24 structs and 318 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 40 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 319 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 40 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
-33 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.
+34 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

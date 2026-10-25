@@ -115,6 +115,14 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **Native Thermo `.raw` reading, opt-in** (`convert.thermo_native`, in a build with the
+  `thermo` Cargo feature). A `.raw` is read directly through mzdata and Thermo's
+  RawFileReader on a .NET 8 runtime, with the vendor centroiding ThermoRawFileParser uses,
+  and no mzML is written. On a 15 min Astral file the spectra are the same as
+  ThermoRawFileParser 1.4.5's (every peak's m/z; intensities except 2 tied peaks of 250 M),
+  in 81 s against 787 s of conversion plus a 3.6 GB mzML; on a six-file HYE experiment
+  159,740 against 159,525 peptides at 1%. Release builds do not enable the feature
+  (docs/04_convert.md, "Native Thermo reading").
 - **`mbr.second_pass_prefilter_keep_decoys`: the rescore prefilter of the second pass alone.**
   The first-pass pool of a match-between-runs experiment holds every candidate of every run
   and needs the prefilter for memory; the second-pass pool holds the empirical library's
