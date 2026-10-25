@@ -1289,6 +1289,25 @@ cold DeepLC projection cache and 1:37 against 1:40 from a warm one. The same HeL
 before the diaPASEF speed changes and the prefilter took 22:02 at 59.4 GB (24,309 peptides),
 and the single cell 5:21 cold and 1:41 warm.
 
+The two pooled rescores of a second-pass experiment differ in size by an order of magnitude,
+and `mbr.second_pass_prefilter_keep_decoys` sets the prefilter of the second one alone (unset:
+`rescore.prefilter_keep_decoys`, as before). The first-pass pool holds every candidate of every
+run and needs the cut: with the prefilter off in both passes, an 18-run Astral experiment
+pooled 59.0 million PSMs (a 93.7 GiB feature matrix) and its rescore passed 382 GB before the
+memory watchdog of the benchmark worker stopped it, against a 48 GB peak with the prefilter;
+a 27-run Astral experiment pooled 106.1 million. The second-pass pool holds only the
+empirical library's candidates (6.6 and 4.1 million PSMs on those two experiments), and there the cut
+measured as a loss: on 216 single cells (Astral, 0.8.0, one seed) the second-pass prefilter
+kept 78% of 2.52 million PSMs, and turning it off in the second pass alone raised the
+precursors summed over the cells from 807,067 to 848,023 (Cell_A) and from 881,570 to 920,681
+(Cell_B), +5.1% and +4.4% (the prefilter cost 4.8% and 4.2% of what the pass finds without
+it), at an unchanged decoy fraction of 0.0098. With the prefilter off in
+both passes, an 18-run Astral HYE experiment (15 min, 50 ng; one seed) gained 7.7% precursors
+per run (125,045 against 116,081 at `run_psm_q` 1%) at a per-run decoy fraction of 0.0100 in
+both arms and +1.0% experiment-wide, with the A/B species-equalised median |log2 error| 0.33
+against 0.30. Whether the second-pass value should default to 0 is not yet measured on its own
+on bulk experiments; the key exists so that it can be.
+
 ### MS1 noise
 
 The dnoise tool (P. T. Garrett, J. K. Diedrich and J. R. Yates III, bioRxiv 2026,

@@ -3851,6 +3851,19 @@
       "source_struct": "MbrConfig"
     },
     {
+      "path": "mbr.second_pass_prefilter_keep_decoys",
+      "name": "second_pass_prefilter_keep_decoys",
+      "section": "mbr",
+      "rust_type": "Option<f64>",
+      "kind": "float",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Under `strategy = second_pass`: the `rescore.prefilter_keep_decoys` of the second-pass rescore only (0 = no prefilter there). Unset, the second pass uses `rescore.prefilter_keep_decoys` like the first. The first pass pools every candidate of every run (59M and 106M PSMs on 18- and 27-run Astral experiments) and needs the cut for memory; the second-pass pool holds the empirical library's candidates (6.6M and 4.1M PSMs on the same two), where the cut cost 4.2-4.8% of the precursors on a plate of single cells. Must be in [0, 1). Left out of the canonical configuration when unset.",
+      "gates": [],
+      "source_struct": "MbrConfig"
+    },
+    {
       "path": "experiment.parallel_runs",
       "name": "parallel_runs",
       "section": "experiment",

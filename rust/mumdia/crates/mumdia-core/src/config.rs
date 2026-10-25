@@ -2862,6 +2862,15 @@ pub struct MbrConfig {
     /// e.g. the `py312_mumdia` env). Required by the transfer variants only; `second_pass`
     /// and `none` run no sidecar.
     pub python: Option<String>,
+    /// Under `strategy = second_pass`: the `rescore.prefilter_keep_decoys` of the
+    /// second-pass rescore only (0 = no prefilter there). Unset, the second pass uses
+    /// `rescore.prefilter_keep_decoys` like the first. The first pass pools every candidate
+    /// of every run (59M and 106M PSMs on 18- and 27-run Astral experiments) and needs the
+    /// cut for memory; the second-pass pool holds the empirical library's candidates (6.6M
+    /// and 4.1M PSMs on the same two), where the cut cost 4.2-4.8% of the precursors on a plate of
+    /// single cells. Must be in [0, 1). Left out of the canonical configuration when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_pass_prefilter_keep_decoys: Option<f64>,
 }
 impl Default for MbrConfig {
     fn default() -> Self {
@@ -2875,6 +2884,7 @@ impl Default for MbrConfig {
             consensus_corr_min: 0.0,
             requant_all: false,
             python: None,
+            second_pass_prefilter_keep_decoys: None,
         }
     }
 }
@@ -4016,6 +4026,15 @@ impl Config {
                 "rescore.prefilter_keep_decoys must be finite and in [0, 1) (0 is off).".into(),
             ));
         }
+        if let Some(v) = self.mbr.second_pass_prefilter_keep_decoys {
+            if !v.is_finite() || !(0.0..1.0).contains(&v) {
+                return Err(Invalid(
+                    "mbr.second_pass_prefilter_keep_decoys must be finite and in [0, 1) (0 is \
+                     off)."
+                        .into(),
+                ));
+            }
+        }
         if self.rescore.num_iter == 0 {
             return Err(Invalid(
                 "rescore.num_iter must be >= 1 for iterative model training.".into(),
@@ -4097,6 +4116,15 @@ impl Config {
                  rt_transfer and full behave identically): it accepts a transfer on retention-time \
                  agreement alone, and its transfers measured 2.3-2.7% entrapment FDP at a 1% cut. \
                  The default second_pass searches every run again instead (docs/12)."
+            );
+        }
+        if self.mbr.strategy != MbrStrategy::SecondPass
+            && self.mbr.second_pass_prefilter_keep_decoys.is_some()
+        {
+            tracing::warn!(
+                strategy = ?self.mbr.strategy,
+                "mbr.second_pass_prefilter_keep_decoys is set but mbr.strategy is not \
+                 second_pass: there is no second-pass rescore, and the setting has no effect"
             );
         }
         // The second pass's library is cut at `q_anchor`, and that cut is also the report's:
@@ -4811,6 +4839,19 @@ impl Config {
         Ok(())
     }
 
+    /// The rescore configuration of the second pass: `rescore`, with
+    /// `mbr.second_pass_prefilter_keep_decoys` as its prefilter when that is set.
+    pub fn second_pass_rescore(&self) -> std::borrow::Cow<'_, RescoreConfig> {
+        match self.mbr.second_pass_prefilter_keep_decoys {
+            Some(keep) if keep != self.rescore.prefilter_keep_decoys => {
+                let mut r = self.rescore.clone();
+                r.prefilter_keep_decoys = keep;
+                std::borrow::Cow::Owned(r)
+            }
+            _ => std::borrow::Cow::Borrowed(&self.rescore),
+        }
+    }
+
     /// Canonical JSON of the fully-resolved config, for hashing into the
     /// manifest (docs/02_config_and_data_model.md).
     pub fn canonical_json(&self) -> String {
@@ -4842,6 +4883,47 @@ mod tests {
         let json = serde_json::to_string(&old).unwrap();
         assert!(json.contains(r#""im_window_sizing":"anchors""#), "{json}");
         assert!(json.contains(r#""im_window_multiplier":1.0"#), "{json}");
+    }
+
+    /// `mbr.second_pass_prefilter_keep_decoys` unset leaves the canonical configuration as it
+    /// was and gives the second pass `rescore` itself; set, it replaces only the prefilter of
+    /// the second-pass rescore, and it is validated like `rescore.prefilter_keep_decoys`.
+    #[test]
+    fn second_pass_prefilter_overrides_only_the_second_pass_and_is_absent_when_unset() {
+        let c = Config::default();
+        assert_eq!(c.mbr.second_pass_prefilter_keep_decoys, None);
+        assert!(!c.canonical_json().contains("second_pass_prefilter"));
+        assert!(matches!(
+            c.second_pass_rescore(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        let mut off = Config::default();
+        off.mbr.second_pass_prefilter_keep_decoys = Some(0.0);
+        assert!(off.validate().is_ok());
+        assert!(off
+            .canonical_json()
+            .contains(r#""second_pass_prefilter_keep_decoys":0.0"#));
+        let p2 = off.second_pass_rescore();
+        assert_eq!(p2.prefilter_keep_decoys, 0.0);
+        assert_eq!(off.rescore.prefilter_keep_decoys, 0.35);
+        assert_eq!(p2.folds, off.rescore.folds);
+
+        let mut same = Config::default();
+        same.mbr.second_pass_prefilter_keep_decoys = Some(same.rescore.prefilter_keep_decoys);
+        assert!(matches!(
+            same.second_pass_rescore(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        for bad in [1.0, -0.1, f64::NAN] {
+            let mut c = Config::default();
+            c.mbr.second_pass_prefilter_keep_decoys = Some(bad);
+            assert!(c.validate().is_err(), "{bad} accepted");
+        }
+        let parsed: MbrConfig =
+            serde_json::from_str(r#"{"second_pass_prefilter_keep_decoys": 0.5}"#).unwrap();
+        assert_eq!(parsed.second_pass_prefilter_keep_decoys, Some(0.5));
     }
 
     /// `digest.cleavage_rule` belongs to `enzyme = "custom"` only, a custom rule must

@@ -2155,13 +2155,23 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let (scored_combined, scored_written) = match &mut second {
         Some(sp) => {
             let scored = d("scored_combined.parquet");
+            // `mbr.second_pass_prefilter_keep_decoys`, when set, is this rescore's prefilter.
+            let second_rescore = cfg.second_pass_rescore();
+            if cfg.mbr.second_pass_prefilter_keep_decoys.is_some() {
+                info!(
+                    keep_decoys = second_rescore.prefilter_keep_decoys,
+                    first_pass = cfg.rescore.prefilter_keep_decoys,
+                    "run-experiment: second-pass rescore prefilter from \
+                     mbr.second_pass_prefilter_keep_decoys"
+                );
+            }
             let written = rescore::run_hashed(rescore::RescoreParams {
                 competed: &sp.competed,
                 sources: None,
                 out: &scored,
                 work_dir: &rescore::sidecar_work_dir(&d("sidecar_work")),
                 script_dir: &cfg.predict_frag.sidecar_script_dir,
-                cfg: &cfg.rescore,
+                cfg: &second_rescore,
                 config_hash: &ch,
                 // The second pass's own extracted rows: its candidate ids are the empirical
                 // library's, not the first pass's.
