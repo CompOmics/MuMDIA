@@ -22,8 +22,9 @@ unchanged.
            (`lfq_maxlfq.parquet.precursor.parquet`, one row per (peptidoform, charge, run)).
            For a precursor quantified from one feature, as here, its value is the raw quantity
            divided by one size factor per run, estimated over all ions and species together.
-           The factors differ between conditions as well, so every ratio between two
-           conditions moves by the same amount: the species gaps stay, the human median moves.
+           Within a condition this acts like `aligned`. The factors also differ between
+           conditions, and that part moves every ratio between two conditions by one amount:
+           the species gaps stay, the human median moves.
            A value the raw table does not have stays empty.
   aligned  within-condition replicate alignment of the raw quantities. For every run the
            offset is the median over its ions of (log2 quantity minus the mean log2 quantity
