@@ -5646,8 +5646,14 @@ mod trace_rt_tests {
         // just outside each bound, within f32 rounding of it
         for t in [lo - 1e-9, hi + 1e-9] {
             assert!(t as f32 == lo as f32 || t as f32 == hi as f32, "{t}");
-            assert!(!span(trace_rt(t, lo, hi, true)), "pad point {t} read as inside");
-            assert!(span(trace_rt(t, lo, hi, false)), "unpadded value of {t} changed");
+            assert!(
+                !span(trace_rt(t, lo, hi, true)),
+                "pad point {t} read as inside"
+            );
+            assert!(
+                span(trace_rt(t, lo, hi, false)),
+                "unpadded value of {t} changed"
+            );
             assert!((trace_rt(t, lo, hi, true) as f64 - t).abs() < 2e-4);
         }
         // bounds that are exact f32 values, with points a few microseconds outside
@@ -5655,7 +5661,10 @@ mod trace_rt_tests {
         for t in [lo2 - 4e-6, hi2 + 4e-6] {
             assert!(t as f32 == lo2 as f32 || t as f32 == hi2 as f32, "{t}");
             let v = trace_rt(t, lo2, hi2, true);
-            assert!(crate::chromatograms::window_span(&[v], lo2, hi2).is_empty(), "{t}");
+            assert!(
+                crate::chromatograms::window_span(&[v], lo2, hi2).is_empty(),
+                "{t}"
+            );
         }
         // inside, at and near the bounds, and well outside
         for t in [lo, lo + 1e-9, 662.0, hi - 1e-9, hi] {
