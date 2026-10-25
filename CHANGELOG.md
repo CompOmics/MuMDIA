@@ -123,6 +123,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   in 81 s against 787 s of conversion plus a 3.6 GB mzML; on a six-file HYE experiment
   159,740 against 159,525 peptides at 1%. Release builds do not enable the feature
   (docs/04_convert.md, "Native Thermo reading").
+- **`mbr.second_pass_prefilter_keep_decoys`: the rescore prefilter of the second pass alone.**
+  The first-pass pool of a match-between-runs experiment holds every candidate of every run
+  and needs the prefilter for memory; the second-pass pool holds the empirical library's
+  candidates and is an order of magnitude smaller, and on 216 single cells the prefilter there
+  cost 4.2-4.8% of the precursors at an unchanged decoy fraction. Set, the key replaces
+  `rescore.prefilter_keep_decoys` in the second-pass rescore only (0 turns the prefilter off
+  there); unset, nothing changes and the key stays out of the canonical configuration, so
+  config hashes are unchanged (docs/35 section 16, docs/12 "Second pass").
 
 ### Changed
 

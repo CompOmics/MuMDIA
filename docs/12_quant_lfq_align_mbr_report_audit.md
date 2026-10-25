@@ -606,7 +606,9 @@ second pass is a search hit of its own, scored against its own decoys.
 5. **Pooled rescore** of the second pass into the experiment's `scored_combined.parquet`,
    with shadow demotion against the empirical library's fragments and each run's
    second-pass `psms_extracted` (the 1/K0 term, `rescore.shadow_im_tolerance`). The split,
-   the per-run quantification, the cross-run LFQ and the report read it.
+   the per-run quantification, the cross-run LFQ and the report read it. Its rescore
+   prefilter is `rescore.prefilter_keep_decoys`, or `mbr.second_pass_prefilter_keep_decoys`
+   when that is set (0 = no prefilter in the second pass only; docs/35 section 16).
 6. **Diagnostics** (`second_pass::diagnose`). Against the first pass, at
    `run_psm_q <= q_anchor`: per run the targets each pass accepted, the new ones, and the
    dropped ones inside and outside the library; and the accepted decoys per accepted target
