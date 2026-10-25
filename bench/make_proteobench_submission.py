@@ -115,7 +115,11 @@ def experiment_indices(paths, exp_dir):
     for p in paths:
         i = by_path.get(os.path.realpath(p))
         if i is None:
-            m = re.fullmatch(r"r(\d+)", os.path.basename(os.path.dirname(os.path.realpath(p))))
+            # the directory as given first, so that a staged tree of links r<i>/peptide_quant.parquet
+            # to other tables works; then the resolved directory
+            m = None
+            for q in (os.path.abspath(p), os.path.realpath(p)):
+                m = m or re.fullmatch(r"r(\d+)", os.path.basename(os.path.dirname(q)))
             if m is None:
                 raise SystemExit(f"cannot find the experiment run index of {p}: it is not in "
                                  f"{man_path} and its directory is not named r<i>")
