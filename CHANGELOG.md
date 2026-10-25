@@ -195,6 +195,18 @@ than a number. Both are recorded in every run's `manifest.json`.
   Such a frame is now read as its scans with no peaks, which gives an empty MS1 spectrum or
   one empty spectrum per slot. A frame that declares peaks and cannot be decoded is still an
   error. Runs without such frames convert as before.
+- **The second pass of match-between-runs pads the chromatogram traces of 3D runs for
+  quantification too.** The quantification trace pad (docs/12, "Second pass") was applied
+  only to runs whose spectra carry 1/K0, and the warning about a missing pad was printed only
+  there. On 3D data the narrow second-pass RT window clipped quant's fixed integration window
+  around an apex near its edge: on the six ProteoBench Astral runs with 0.8.0, 2-29% of the
+  condition A quantities and 90-91% of the condition B quantities were integrated over fewer
+  than the 7 samples the default window asks for. Every second-pass run is now padded by the
+  quant integration window, with the warning when `extract.emit_rt_window` is off. This
+  changes the second-pass chromatograms (wider traces, `params.trace_pad_s` in their report)
+  and the quantities of every 3D `run-experiment` on purpose; the second pass's
+  `psms_extracted`, features and scored tables are those of the unpadded table, so
+  identifications do not change.
 
 ## [0.8.0] - 2026-10-22
 

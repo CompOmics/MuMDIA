@@ -523,7 +523,8 @@ data:
   half-width + baseline flanks) x cycle time` beyond the narrow second-pass RT window (IM's
   held-out p99 of the consensus residual: +/-7.6-8.8 s, against about +/-15 s that a 4-scan
   half-width plus flanks needs at 0.97 s per scan), while the apex, the gate and every feature
-  stay inside it. It replaces the IM branch's separate quantification traces.
+  stay inside it. It replaces the IM branch's separate quantification traces. The second
+  pass now pads 3D runs the same way (docs/12, "Second pass").
 
 Retrace runs in the second pass (the chain hook of section 6, on there), and the second pass
 reuses the first pass's run plan. Two things remain to be checked on one diaPASEF experiment:

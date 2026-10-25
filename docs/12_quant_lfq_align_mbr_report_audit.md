@@ -622,11 +622,31 @@ comes back in the second pass: in an entrapment test on the IM branch, 113-114 o
 reportable false library entries were reported again. Raising `mbr.q_anchor` above 0.01
 therefore loosens the reported FDR, not only the library, and `Config::validate` warns.
 
+**Quantification trace pad** (every run, 3D or 4D). The second-pass RT window is narrow
+around the consensus retention time, and extract records traces only inside it, so a fixed
+integration window and its baseline flanks around an apex near the edge are clipped. Extract
+records the traces `pad` seconds further on each side, `pad` = (the largest integration
+half-width, `quant.fixed_scan_halfwidth`, or `quant.fixed_window_s` in seconds, plus
+`quant.baseline_flank_scans` under `baseline_subtract`) x the run's cycle time (the median
+spacing of one isolation window's scans). Apex choice, the gate, the peak claim and
+`psms_extracted` see only the window; a padded hit takes no part in a peak claim. The features
+stage cuts every trace back to the window (`params.trace_pad_s` in the chromatograms' report,
+`rt_lo`/`rt_hi` of `psms_extracted`), so the features are those of the unpadded table; only
+quantification reads the pad. It needs `extract.emit_rt_window` (on by default; without it the
+run is not padded, with a warning) and is not applied under a two-pass co-elution peak claim.
+The pad was applied on runs with 1/K0 only until 2026-10-25. Without it, on the six ProteoBench
+Astral runs (0.8.0, second-pass `w_rt` 4.5-12.7 s per run against about 9.8 s that a +-3-scan
+window needs), 2-29% of the condition A quantities and 90-91% of the condition B quantities
+were integrated over fewer than the 7 samples the default window asks for; on the Orbitrap
+AIF runs 0.2% were. The pad changes the second pass's chromatograms and quantities on 3D data,
+and nothing upstream of them.
+
 #### On runs with ion mobility (diaPASEF)
 
 The second pass runs on diaPASEF input as on any other (the refusal of earlier releases is
-lifted). Three additions apply only where the data carry 1/K0; a 3D experiment's library,
-windows, chromatograms and summaries are those described above.
+lifted). Two additions apply only where the data carry 1/K0; a 3D experiment's library,
+windows and summaries are those described above. The quantification trace pad above applies
+to both, and retrace records the padded traces as extract does.
 
 - **Consensus 1/K0.** Each confident apex of step 3 also has an apex 1/K0, joined from the
   run's first-pass `psms_extracted` on `(candidate_id, selected_peak_rank)` (after retrace,
@@ -645,19 +665,6 @@ windows, chromatograms and summaries are those described above.
   `cal.json`) when that is larger; `cal.json` records the floor and its source
   (`im_window_floor`). No configuration key: a run without a first-pass `w_im` (every 3D run)
   keeps the configured value.
-- **Quantification trace pad.** The second-pass RT window is narrow around the consensus
-  retention time, and extract records traces only inside it, so a fixed integration window
-  and its baseline flanks around an apex near the edge are clipped. Extract (and retrace)
-  record the traces `pad` seconds further on each side, `pad` = (the largest integration
-  half-width, `quant.fixed_scan_halfwidth`, or `quant.fixed_window_s` in seconds, plus
-  `quant.baseline_flank_scans` under `baseline_subtract`) x the run's cycle time (the median
-  spacing of one isolation window's scans). Apex choice, the gate, the peak claim and
-  `psms_extracted` see only the window; a padded hit takes no part in a peak claim. The
-  features stage cuts every trace back to the window (`params.trace_pad_s` in the
-  chromatograms' report, `rt_lo`/`rt_hi` of `psms_extracted`), so the features are those of
-  the unpadded table; only quantification reads the pad. It needs `extract.emit_rt_window`
-  (on by default) and is not applied under a two-pass co-elution peak claim. How often quant
-  windows and flanks were clipped before the pad is not yet measured.
 
 Retrace runs in the second pass as in the first. The second pass reuses the first pass's
 run plan (`experiment.parallel_runs`). No diaPASEF measurement of the second pass is

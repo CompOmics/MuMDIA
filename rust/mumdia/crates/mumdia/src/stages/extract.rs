@@ -170,8 +170,8 @@ pub struct ExtractParams<'a> {
     /// v4); otherwise, and on every 3D run, it does not, and nothing is computed for it.
     pub chrom_im: bool,
     /// Record each candidate's traces beyond its RT window, for quantification
-    /// ([`TracePad`]). `None`, everywhere but the second pass of match-between-runs on a
-    /// run with ion mobility, records exactly the window.
+    /// ([`TracePad`]). `None`, everywhere but the second pass of match-between-runs (3D or
+    /// 4D), records exactly the window.
     pub trace_pad: Option<TracePad>,
     /// Set when retrace rebuilds this table from the raw events right after extract
     /// (`chain::extract_to_compete` under `retrace.enabled`): every row retrace rebuilds is
