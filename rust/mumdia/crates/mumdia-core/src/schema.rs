@@ -82,6 +82,11 @@ pub mod artifact {
     pub const PSMS_COMPETED: (&str, u32) = ("psms_competed", 4);
     pub const PSMS_SCORED: (&str, u32) = ("psms_scored", 4);
     pub const PEPTIDE_QUANT: (&str, u32) = ("peptide_quant", 2);
+    /// v3: v2 plus a Boolean `first_pass_id`, appended last: whether the row's precursor had
+    /// a first-pass identification in its run (`run_psm_q <= mbr.q_anchor`). Written only by
+    /// `run-experiment` under `mbr.first_pass_flag` when the second pass ran; every other
+    /// quant writes v2, byte for byte. Readers select columns by name.
+    pub const PEPTIDE_QUANT_V3: (&str, u32) = ("peptide_quant", 3);
     pub const PROTEIN_GROUP_QUANT: (&str, u32) = ("protein_group_quant", 2);
     pub const FRAGMENT_QUANT: (&str, u32) = ("fragment_quant", 1);
     /// v5, the cross-run export (`quant --export-cross-run`, or the first pass of the
@@ -148,6 +153,16 @@ pub mod artifact {
             FRAGMENT_QUANT_V5
         } else {
             FRAGMENT_QUANT
+        }
+    }
+
+    /// The `peptide_quant` schema a quant writes: [`PEPTIDE_QUANT_V3`] when it carries the
+    /// first-pass flag, else [`PEPTIDE_QUANT`].
+    pub fn peptide_quant(first_pass_flag: bool) -> (&'static str, u32) {
+        if first_pass_flag {
+            PEPTIDE_QUANT_V3
+        } else {
+            PEPTIDE_QUANT
         }
     }
 
@@ -223,5 +238,13 @@ mod tests {
         assert_eq!(fragment_quant(false), FRAGMENT_QUANT);
         assert_eq!(fragment_quant(false), ("fragment_quant", 1));
         assert_eq!(fragment_quant(true), ("fragment_quant", 5));
+    }
+
+    /// Only the first-pass flag moves `peptide_quant`, to v3.
+    #[test]
+    fn peptide_quant_selector_keeps_v2_without_the_flag() {
+        assert_eq!(peptide_quant(false), PEPTIDE_QUANT);
+        assert_eq!(peptide_quant(false), ("peptide_quant", 2));
+        assert_eq!(peptide_quant(true), ("peptide_quant", 3));
     }
 }

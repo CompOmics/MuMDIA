@@ -2349,6 +2349,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 config_hash: &ch,
                 cross_run: None,
                 export_cross_run: true,
+                first_pass_ids: None,
             })?;
             for n in ["peptide_quant", "protein_group_quant"] {
                 for path in [tmp(n), format!("{}.report.json", tmp(n))] {
@@ -2370,6 +2371,30 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     } else {
         None
     };
+    // `mbr.first_pass_flag`: per run, the second-pass candidates whose precursor the first
+    // pass identified in that run, which quant writes as `first_pass_id` (peptide_quant v3).
+    // Only after a second pass: without one every value is a first-pass value, and the
+    // tables keep their v2 bytes.
+    let first_pass_ids: Option<Vec<std::collections::BTreeSet<u32>>> = match &second {
+        Some(sp) if cfg.mbr.first_pass_flag => Some(
+            (0..n_runs)
+                .map(|i| {
+                    quant::first_pass_ids_of_run(
+                        &sp.library.entry_of,
+                        &sp.library.first_pass_accepted,
+                        i as u32,
+                    )
+                })
+                .collect(),
+        ),
+        _ => None,
+    };
+    if cfg.mbr.first_pass_flag && first_pass_ids.is_none() {
+        warn!(
+            "run-experiment: mbr.first_pass_flag is set but no second pass was applied, so \
+             peptide_quant carries no first_pass_id column"
+        );
+    }
     // Each run's quant hashes its two tables for their reports; the manifest below reuses
     // those hashes instead of reading the tables again.
     let finals = quant_plan.map_pooled(&run_idx, |&i| {
@@ -2386,6 +2411,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             config_hash: &ch,
             cross_run: cross_run.as_ref().map(|(fit, _)| fit),
             export_cross_run: false,
+            first_pass_ids: first_pass_ids.as_ref().map(|v| &v[i]),
         })?;
         Ok((pq, gq, written))
     })?;
@@ -2459,6 +2485,18 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "unit": "experiment-wide peptide_q_value / pg_q_value; n_runs on run_psm_q",
         },
     });
+    // The first-pass flag, only when it was written, so every other manifest keeps its
+    // bytes: the cut it was taken at and, per run, the flagged second-pass candidates.
+    if let (Some(ids), Some(m)) = (&first_pass_ids, manifest.as_object_mut()) {
+        m.insert(
+            "first_pass_flag".to_string(),
+            json!({
+                "column": quant::FIRST_PASS_ID,
+                "run_psm_q": cfg.mbr.q_anchor,
+                "candidates": ids.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            }),
+        );
+    }
     // The cross-run quant step and its first-pass fragment tables, only when it ran, so
     // every other manifest keeps its bytes.
     if let (Some((_, tables)), Some(m)) = (&cross_run, manifest.as_object_mut()) {
@@ -2625,7 +2663,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         ));
         artifacts.push((
             format!("peptide_quant[{name}]"),
-            artifact::PEPTIDE_QUANT,
+            artifact::peptide_quant(first_pass_ids.is_some()),
             peptide_quants[i].clone(),
             "quant",
             Some(quant_written[i].peptide.content_hash.clone()),

@@ -6,7 +6,7 @@
 //! multiple runs) reduce to a top-N sum; the method is a config strategy for
 //! later.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 
 use anyhow::{anyhow, Context as _, Result};
@@ -76,6 +76,35 @@ pub struct QuantParams<'a> {
     /// cross-run step, or by `quant --export-cross-run`. Never derived from the
     /// configuration, so a quant that does not ask for it writes `fragment_quant` v1.
     pub export_cross_run: bool,
+    /// The candidates of `psms_scored` that had a first-pass identification in this run,
+    /// set by `run-experiment` after a second pass under `mbr.first_pass_flag`
+    /// ([`first_pass_ids_of_run`]). `Some` adds the Boolean column `first_pass_id` to
+    /// `peptide_quant` and writes it as v3 ([`artifact::peptide_quant`]); `None` writes v2,
+    /// byte for byte.
+    pub first_pass_ids: Option<&'a BTreeSet<u32>>,
+}
+
+/// The `peptide_quant` v3 column that says whether the row's precursor had a first-pass
+/// identification in its run (`mbr.first_pass_flag`).
+pub const FIRST_PASS_ID: &str = "first_pass_id";
+
+/// The candidate ids of a second-pass run whose precursor the first pass identified in the
+/// same run: every id `c` of the empirical library whose entry `entry_of[c]` is in
+/// `first_pass_accepted` for `source` (`(source, first-pass candidate_id)` pairs at
+/// `run_psm_q <= mbr.q_anchor`, targets only). A decoy row maps to its paired target's
+/// entry, so it can be in the set too; quant reads target rows only, so that never reaches
+/// a quantity.
+pub fn first_pass_ids_of_run(
+    entry_of: &[u32],
+    first_pass_accepted: &BTreeSet<(u32, u32)>,
+    source: u32,
+) -> BTreeSet<u32> {
+    entry_of
+        .iter()
+        .enumerate()
+        .filter(|(_, &e)| first_pass_accepted.contains(&(source, e)))
+        .map(|(c, _)| c as u32)
+        .collect()
 }
 
 /// One value per (candidate, fragment name), fitted over every run of an experiment.
@@ -3026,22 +3055,32 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         add_protein_base_quantity(&mut per_group, pg.get(k), base[k], quantity);
     }
 
-    let n_pep = write_table(
-        p.out_peptide,
-        vec![
-            Col::U32("candidate_id".into(), q_cid),
-            Col::U32("base_peptide_id".into(), q_base),
-            Col::Str("peptidoform".into(), q_pform),
-            Col::I32("charge".into(), q_z),
-            Col::Str("protein_group".into(), q_pg),
-            Col::OptF64("quantity".into(), q_val),
-            Col::Str("quant_status".into(), q_status),
-            Col::I32("n_fragments_used".into(), q_nfrag),
-            Col::OptF64("integration_apex_rt".into(), q_apex),
-            Col::OptF64("integration_lo_rt".into(), q_lo),
-            Col::OptF64("integration_hi_rt".into(), q_hi),
-        ],
-    )?;
+    // `first_pass_id`, only when the caller gave the first-pass evidence: whether this
+    // row's precursor had a first-pass identification in this run. The column is appended
+    // last, so every column of v2 keeps its position.
+    let q_first: Option<Vec<bool>> = p
+        .first_pass_ids
+        .map(|ids| q_cid.iter().map(|c| ids.contains(c)).collect());
+    let n_first_pass_rows = q_first
+        .as_ref()
+        .map(|v| v.iter().filter(|&&x| x).count() as u64);
+    let mut pep_cols = vec![
+        Col::U32("candidate_id".into(), q_cid),
+        Col::U32("base_peptide_id".into(), q_base),
+        Col::Str("peptidoform".into(), q_pform),
+        Col::I32("charge".into(), q_z),
+        Col::Str("protein_group".into(), q_pg),
+        Col::OptF64("quantity".into(), q_val),
+        Col::Str("quant_status".into(), q_status),
+        Col::I32("n_fragments_used".into(), q_nfrag),
+        Col::OptF64("integration_apex_rt".into(), q_apex),
+        Col::OptF64("integration_lo_rt".into(), q_lo),
+        Col::OptF64("integration_hi_rt".into(), q_hi),
+    ];
+    if let Some(v) = q_first {
+        pep_cols.push(Col::Bool(FIRST_PASS_ID.into(), v));
+    }
+    let n_pep = write_table(p.out_peptide, pep_cols)?;
 
     // Protein-group rollup over unique, quantifiable base peptides only.
     let (mut g_name, mut g_val, mut g_status, mut g_npep) =
@@ -3241,9 +3280,20 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         }
     }
     let mut written: Vec<Written> = Vec::with_capacity(2);
-    for (path, schema, rows) in [
-        (p.out_peptide, artifact::PEPTIDE_QUANT, n_pep),
-        (p.out_protein, artifact::PROTEIN_GROUP_QUANT, n_pg),
+    // The first-pass flag's count goes into the peptide table's report alone, and only when
+    // the column was written, so every other report keeps its bytes.
+    let mut pep_stats = stats.clone();
+    if let Some(n) = n_first_pass_rows {
+        pep_stats.insert("first_pass_id_rows".to_string(), json!(n));
+    }
+    for (path, schema, rows, table_stats) in [
+        (
+            p.out_peptide,
+            artifact::peptide_quant(p.first_pass_ids.is_some()),
+            n_pep,
+            &pep_stats,
+        ),
+        (p.out_protein, artifact::PROTEIN_GROUP_QUANT, n_pg, &stats),
     ] {
         let report = ArtifactReport {
             logical_name: schema.0.to_string(),
@@ -3253,7 +3303,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             rows,
             content_hash: mumdia_io::hash::blake3_file(path)?,
             params: report_params.clone(),
-            stats: stats.clone(),
+            stats: table_stats.clone(),
             model_identity: None,
             elapsed_ms: elapsed,
         };
@@ -4113,6 +4163,135 @@ mod tests {
         );
     }
 
+    /// A second-pass candidate is flagged in a run exactly when its entry (the first-pass id
+    /// of its precursor, or of its paired target for a decoy) was accepted in that run.
+    #[test]
+    fn first_pass_ids_of_run_maps_second_pass_ids_through_their_entries() {
+        // New ids 0..5: targets 0 (entry 7), 1 (entry 9), 3 (entry 12); decoys 2 (pair of 9)
+        // and 4 (pair of 12).
+        let entry_of = vec![7u32, 9, 9, 12, 12];
+        let accepted: BTreeSet<(u32, u32)> = [(0, 7), (0, 12), (1, 9), (2, 99)].into();
+        assert_eq!(
+            first_pass_ids_of_run(&entry_of, &accepted, 0),
+            [0u32, 3, 4].into()
+        );
+        assert_eq!(
+            first_pass_ids_of_run(&entry_of, &accepted, 1),
+            [1u32, 2].into()
+        );
+        assert!(first_pass_ids_of_run(&entry_of, &accepted, 2).is_empty());
+        assert!(first_pass_ids_of_run(&entry_of, &accepted, 3).is_empty());
+        assert!(first_pass_ids_of_run(&[], &accepted, 0).is_empty());
+    }
+
+    /// `first_pass_ids` adds the column `first_pass_id` (last) and moves the table to
+    /// peptide_quant v3; every other column, the quantities and the protein table are those
+    /// of the run without it, and without it there is no such column and the table is v2.
+    #[test]
+    fn first_pass_flag_adds_one_column_and_changes_nothing_else() {
+        let scored = quant_test_path("fp_scored.parquet");
+        let chrom = quant_test_path("fp_chrom.parquet");
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 2, 3]),
+                Col::U32("base_peptide_id".into(), vec![10, 11, 12]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEP1".into(), "PEP2".into(), "PEP3".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 2, 3]),
+                Col::Str("label".into(), vec!["target".into(); 3]),
+                Col::Str("protein_group".into(), vec!["PG".into(); 3]),
+                Col::F64("peptide_q_value".into(), vec![0.0; 3]),
+                Col::F64("apex_rt".into(), vec![5.0; 3]),
+                Col::F64("elution_lo".into(), vec![4.0; 3]),
+                Col::F64("elution_hi".into(), vec![6.0; 3]),
+            ],
+        )
+        .unwrap();
+        let grid: Vec<f32> = (0..10).map(|rt| rt as f32).collect();
+        let peak = vec![0.0f32, 0.0, 0.0, 0.0, 5.0, 10.0, 5.0, 0.0, 0.0, 0.0];
+        write_table(
+            &chrom,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 2, 3]),
+                Col::Str(
+                    "frag_name".into(),
+                    vec!["b2".into(), "y3".into(), "y4".into()],
+                ),
+                Col::ListF32("rt".into(), vec![grid.clone(), grid.clone(), grid]),
+                Col::ListF32("intensity".into(), vec![peak.clone(), peak.clone(), peak]),
+            ],
+        )
+        .unwrap();
+        let cfg = QuantConfig::default();
+        let quant_once = |ids: Option<&BTreeSet<u32>>| -> (String, String) {
+            let pep = quant_test_path("fp_peptide.parquet");
+            let prot = quant_test_path("fp_protein.parquet");
+            run(QuantParams {
+                psms_scored: &scored,
+                chromatograms: &[ChromTable::whole(&chrom)],
+                out_peptide: &pep,
+                out_protein: &prot,
+                out_fragment: None,
+                out_peak_bounds: None,
+                cfg: &cfg,
+                config_hash: "test",
+                cross_run: None,
+                export_cross_run: false,
+                first_pass_ids: ids,
+            })
+            .unwrap();
+            (pep, prot)
+        };
+        let report_of = |path: &str| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(format!("{path}.report.json")).unwrap())
+                .unwrap()
+        };
+        let (pep0, prot0) = quant_once(None);
+        // Candidate 2 had no first-pass identification in this run; 99 is not in the table.
+        let ids: BTreeSet<u32> = [1u32, 3, 99].into();
+        let (pep1, prot1) = quant_once(Some(&ids));
+
+        let t0 = Table::read(&pep0).unwrap();
+        let t1 = Table::read(&pep1).unwrap();
+        let cols0 = mumdia_io::table::column_names(&pep0).unwrap();
+        let cols1 = mumdia_io::table::column_names(&pep1).unwrap();
+        assert!(!cols0.iter().any(|c| c == FIRST_PASS_ID));
+        assert_eq!(cols1.last().map(String::as_str), Some(FIRST_PASS_ID));
+        assert_eq!(&cols1[..cols1.len() - 1], &cols0[..]);
+        assert_eq!(t1.bool(FIRST_PASS_ID).unwrap(), vec![true, false, true]);
+        assert_eq!(
+            t0.u32("candidate_id").unwrap(),
+            t1.u32("candidate_id").unwrap()
+        );
+        assert_eq!(
+            t0.opt_f64("quantity").unwrap(),
+            t1.opt_f64("quantity").unwrap()
+        );
+        assert_eq!(
+            t0.str("quant_status").unwrap(),
+            t1.str("quant_status").unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&prot0).unwrap(),
+            std::fs::read(&prot1).unwrap(),
+            "the protein table does not depend on the flag"
+        );
+
+        let r0 = report_of(&pep0);
+        let r1 = report_of(&pep1);
+        assert_eq!(r0["schema_version"], 2);
+        assert!(r0["stats"].get("first_pass_id_rows").is_none());
+        assert_eq!(r1["schema_version"], 3);
+        assert_eq!(r1["stats"]["first_pass_id_rows"], 2);
+        let p0 = report_of(&prot0);
+        let p1 = report_of(&prot1);
+        assert_eq!(p0["schema_version"], p1["schema_version"]);
+        assert_eq!(p0["stats"], p1["stats"]);
+    }
+
     // Also the legacy-artifact regression: this chromatogram table carries no
     // `predicted_intensity` column, as every artifact written before that column existed
     // does. Quant must still read it and quantify from it unchanged.
@@ -4186,6 +4365,7 @@ mod tests {
             config_hash: "test",
             cross_run: None,
             export_cross_run: false,
+            first_pass_ids: None,
         })
         .unwrap();
         assert_eq!(rows, (4, 3));
@@ -4453,6 +4633,7 @@ mod tests {
             config_hash: "test",
             cross_run: None,
             export_cross_run: false,
+            first_pass_ids: None,
         })
         .unwrap();
         assert_eq!(rows, (1, 1));
@@ -4489,6 +4670,7 @@ mod tests {
                 config_hash: "test",
                 cross_run: None,
                 export_cross_run: false,
+                first_pass_ids: None,
             })
             .unwrap();
             let pq = Table::read(&peptide).unwrap();
@@ -4590,6 +4772,7 @@ mod tests {
             config_hash: "test",
             cross_run: fit,
             export_cross_run: export,
+            first_pass_ids: None,
         })
         .unwrap();
         out
@@ -4798,6 +4981,7 @@ mod tests {
             config_hash: "test",
             cross_run: None,
             export_cross_run: false,
+            first_pass_ids: None,
         })
         .unwrap();
         assert_eq!(rows.0, 2, "both identifications must be reported");
@@ -4837,6 +5021,7 @@ mod tests {
             config_hash: "test",
             cross_run: None,
             export_cross_run: false,
+            first_pass_ids: None,
         })
         .unwrap_err()
         .to_string();
@@ -5276,6 +5461,7 @@ mod tests {
             config_hash: "test",
             cross_run: None,
             export_cross_run: false,
+            first_pass_ids: None,
         })
         .unwrap();
         assert_eq!(rows, (3, 2));
@@ -5405,6 +5591,7 @@ mod tests {
                 config_hash: "test",
                 cross_run: None,
                 export_cross_run: false,
+                first_pass_ids: None,
             })
             .unwrap();
             let pq = Table::read(&peptide).unwrap();
@@ -6287,6 +6474,7 @@ mod tests {
             config_hash: "test",
             cross_run: None,
             export_cross_run: false,
+            first_pass_ids: None,
         })
     }
 
@@ -6491,6 +6679,7 @@ mod tests {
                 config_hash: "test",
                 cross_run: None,
                 export_cross_run: false,
+                first_pass_ids: None,
             })?;
             let mut report: serde_json::Value =
                 mumdia_io::json::read_json(&format!("{pep}.report.json")).unwrap();
@@ -6616,6 +6805,7 @@ mod tests {
                 config_hash: "test",
                 cross_run: None,
                 export_cross_run: false,
+                first_pass_ids: None,
             })
             .unwrap();
             [pep, prot, frag, pb]
@@ -6754,6 +6944,7 @@ mod tests {
                     config_hash: "test",
                     cross_run: None,
                     export_cross_run: false,
+                    first_pass_ids: None,
                 })
                 .unwrap();
                 files.extend([pep, prot, frag].iter().map(|p| std::fs::read(p).unwrap()));
@@ -6949,6 +7140,7 @@ mod tests {
                 config_hash: "test",
                 cross_run: None,
                 export_cross_run: false,
+                first_pass_ids: None,
             })
             .unwrap();
             // The quantities as well, so a failure says which column moved rather than

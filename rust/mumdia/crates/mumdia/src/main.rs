@@ -1961,6 +1961,7 @@ fn real_main() -> Result<()> {
                 config_hash: &ch,
                 cross_run: cross_run.as_ref(),
                 export_cross_run,
+                first_pass_ids: None,
             })?;
         }
         Cmd::QuantLfq {

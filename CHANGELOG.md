@@ -131,6 +131,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   `rescore.prefilter_keep_decoys` in the second-pass rescore only (0 turns the prefilter off
   there); unset, nothing changes and the key stays out of the canonical configuration, so
   config hashes are unchanged (docs/35 section 16, docs/12 "Second pass").
+- **`mbr.first_pass_flag`: first-pass evidence per quantity, opt-in.** After a second pass,
+  `run-experiment` writes a Boolean `first_pass_id` into every run's `peptide_quant`
+  (schema v3): whether the row's precursor had a first-pass identification in that run at
+  `run_psm_q <= mbr.q_anchor`. The experiment-wide `peptides.tsv` gets one `first_pass_<run>`
+  column per run. Identifications, q-values and quantities do not change. Off by default,
+  and then every table, report and configuration hash keeps its bytes.
+  `bench/quant_condition_gate.py` applies the condition-level filter the flag is for, given
+  a run-to-condition map (docs/12, "Second pass").
 
 ### Changed
 
