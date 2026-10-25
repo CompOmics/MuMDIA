@@ -55,9 +55,12 @@ directory name `r<i>` as the fallback. aligned and the gate need the condition o
 `--conditions A,A,A,B,B,B`, or by default the `Condition_<X>` part of each run name.
 
 The last stderr line is a summary: the ions written, the ProteoBench ion count (not a
-contaminant, exactly one species flag, values in at least --min-obs runs) and how many of those
-have a finite ratio for each pair of conditions, in total and per species. `--summary-json`
-writes the same numbers.
+contaminant, exactly one species flag of the module, values in at least --min-obs runs) and how
+many of those have a finite ratio for each pair of conditions, in total and per species.
+`--summary-json` writes the same numbers. `--species` must list the species flags of the module,
+as its species_mapper does: the Low Input module maps only HUMAN and YEAST, so it needs
+`--species HUMAN,YEAST` (with the default, ions carrying an E. coli flag are dropped or counted
+as ambiguous, and the count no longer equals ProteoBench's).
 """
 import argparse
 import itertools
@@ -130,11 +133,11 @@ def within_condition_offsets(long: pd.DataFrame) -> pd.Series:
     return (lq - m).groupby(long["run"]).median()
 
 
-def species_flags(proteins: pd.Series):
+def species_flags(proteins: pd.Series, species=SPECIES):
     """ProteoBench rules on an expanded protein string: (species, scored)."""
     s = proteins.fillna("")
     cont = s.str.contains("Cont_", regex=False)
-    flags = {sp: s.str.contains("_" + sp, regex=False) for sp in SPECIES}
+    flags = {sp: s.str.contains("_" + sp, regex=False) for sp in species}
     n = sum(f.astype(int) for f in flags.values())
     sp = pd.Series("", index=s.index, dtype=object)
     for k, f in flags.items():
@@ -142,8 +145,8 @@ def species_flags(proteins: pd.Series):
     return sp, (~cont) & (n == 1)
 
 
-def summarise(out: pd.DataFrame, run_cols, conds, min_obs: int) -> dict:
-    sp, scored = species_flags(out["Proteins"])
+def summarise(out: pd.DataFrame, run_cols, conds, min_obs: int, species=SPECIES) -> dict:
+    sp, scored = species_flags(out["Proteins"], species)
     present = out[run_cols].notna()
     counted = scored & (present.sum(axis=1) >= min_obs)
     pairs, n_c = [], {}
@@ -155,7 +158,7 @@ def summarise(out: pd.DataFrame, run_cols, conds, min_obs: int) -> dict:
     for x, y in pairs:
         res[f"finite_{x}/{y}"] = int((counted & (n_c[x] > 0) & (n_c[y] > 0)).sum())
     res["species"] = {}
-    for s in SPECIES:
+    for s in species:
         sel = counted & (sp == s)
         d = {"pb_ions": int(sel.sum())}
         for x, y in pairs:
@@ -190,6 +193,9 @@ def main() -> int:
     ap.add_argument("--min-obs", type=int, default=3,
                     help="minimum observed runs of an ion in the summary (ProteoBench default 3)")
     ap.add_argument("--summary-json", default=None, help="also write the summary as JSON")
+    ap.add_argument("--species", default=",".join(SPECIES),
+                    help="species flags of the module, for the summary only (default HUMAN,YEAST,ECOLI; "
+                         "the Low Input module needs HUMAN,YEAST)")
     a = ap.parse_args()
 
     specs = [s.split("=", 1) for s in a.runs]
@@ -316,12 +322,13 @@ def main() -> int:
     for sp in ("_HUMAN", "_YEAST", "_ECOLI"):
         print(f"  {sp}: {out['Proteins'].str.contains(sp).sum()}", file=sys.stderr)
 
-    summ = summarise(out, run_cols, conds, a.min_obs)
+    species = tuple(x.strip().upper() for x in a.species.split(",") if x.strip())
+    summ = summarise(out, run_cols, conds, a.min_obs, species)
     summ = {"quantity": a.quantity, "condition_gate": bool(a.condition_gate), **summ}
     parts = [f"quantity {a.quantity}", f"gate {'on' if a.condition_gate else 'off'}",
              f"ions written {summ['ions_written']}", f"ProteoBench ions (min_obs {a.min_obs}) {summ['pb_ions']}"]
     parts += [f"finite {k[7:]} {v}" for k, v in summ.items() if k.startswith("finite_")]
-    for s in SPECIES:
+    for s in species:
         d = summ["species"][s]
         parts.append(f"{s} ions {d['pb_ions']}" + "".join(
             f", finite {k[7:]} {v}" for k, v in d.items() if k.startswith("finite_")))
