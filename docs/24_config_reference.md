@@ -70,7 +70,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`rescore`](#rescore) | `RescoreConfig` | 31 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`quant`](#quant) | `QuantConfig` | 19 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
-| [`mbr`](#mbr) | `MbrConfig` | 9 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
+| [`mbr`](#mbr) | `MbrConfig` | 10 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 3 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
 | [`groups`](#groups) | `GroupsConfig` | 9 |  |
 | [`retrace`](#retrace) | `RetraceConfig` | 5 | [docs/09_extract.md](09_extract.md) |
@@ -525,6 +525,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `consensus_corr_min` | `f64` | `0.0` |  | Minimum correlation of the observed fragment pattern to the empirical consensus for a transfer to be accepted (interference guard; 0 disables). |
 | `requant_all` | `bool` | `false` | not yet wired | NOT YET WIRED. Would requantify already-identified precursors too (fill the matrix), not only transferred ones, under `strategy = Full`. No code reads this field yet; `validate()` warns if it is changed. |
 | `python` | `Option<String>` | `null` |  | Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy; e.g. the `py312_mumdia` env). Required by the transfer variants only; `second_pass` and `none` run no sidecar. |
+| `second_pass_prefilter_keep_decoys` | `Option<f64>` | `null` |  | Under `strategy = second_pass`: the `rescore.prefilter_keep_decoys` of the second-pass rescore only (0 = no prefilter there). Unset, the second pass uses `rescore.prefilter_keep_decoys` like the first. The first pass pools every candidate of every run (59M and 106M PSMs on 18- and 27-run Astral experiments) and needs the cut for memory; the second-pass pool holds the empirical library's candidates (6.6M and 4.1M PSMs on the same two), where the cut cost 4.2-4.8% of the precursors on a plate of single cells. Must be in [0, 1). Left out of the canonical configuration when unset. |
 
 ## experiment
 
@@ -1262,6 +1263,6 @@ Every field whose struct has an `impl Default` resolved from the source.
 
 ## Coverage
 
-24 structs and 315 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 40 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 316 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 40 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
 33 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 0 default(s) could not be resolved and 2 have none by design.
