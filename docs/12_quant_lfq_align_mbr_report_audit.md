@@ -363,10 +363,19 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
      finite apex is available: `trapezoid_fixed_opts` integrates a window centred on
      the apex, ignoring the walked bounds entirely. This is the mode the recorded
      ProteoBench Astral submission used, and the default since 2026-10-04
-     (`fixed_scan_halfwidth = 3`): on the six-file Astral HYE experiment it took the
-     median |log2 ratio error| from 0.266 to 0.163, the species-equal error from 0.322
-     to 0.201 and the median CV from 0.19 to 0.10 at the same identifications. Set 0 for
-     the walked window. The apex comes from `psms_scored`'s `apex_rt`
+     (`fixed_scan_halfwidth = 3`). Set 0 for the walked window. The measurements, each
+     with its pipeline and ion filter (one NN seed each):
+
+     | pipeline | data, ion filter | walked window | fixed window (h = 3) |
+     |---|---|---|---|
+     | 2026-10-04 (before the 0.7.0 second pass) | six-file Astral HYE, 63,141 precursors quantified in at least 2 runs per condition | global 0.266, species-weighted 0.322, CV 0.19 | 0.163, 0.201, CV 0.10 |
+     | 0.8.0 `run-experiment` (second pass) | ProteoBench Astral, ProteoBench-scored precursors in at least 2 runs per condition (113,876) | not run | global 0.218, species-weighted 0.294, CV 0.144 |
+     | 0.8.0, `quant` on fixed identifications | ProteoBench Astral, ProteoBench default view (ions in at least 3 of 6 runs, 132,079) | 0.326, 0.475, CV 0.237 | 0.238, 0.355, CV 0.151 |
+     | 0.8.0, `quant` on fixed identifications | ProteoBench Q Exactive AIF, default view (99,530) | 0.308, 0.542, CV 0.340 | 0.199, 0.329, CV 0.321 |
+
+     "Global" is the median |log2 A/B error| over all ions, "species-weighted" the mean of
+     the per-species medians. The 2026-10-04 values do not describe 0.8.0; the walked
+     window is worse than the fixed one in every row. The apex comes from `psms_scored`'s `apex_rt`
      (the identification apex) and, when `bound_peak` is off, is taken directly from
      it rather than from the peak walk. Two forms, and they are **not** interchangeable:
      `fixed_scan_halfwidth = h` always integrates `2h+1` samples, while
@@ -376,6 +385,25 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
      cycle). The window is skipped entirely when no sample lies within it, and widened
      to two samples when only one does, because `trapezoid` returns a HEIGHT for a
      single sample and mixing that with areas in one run corrupts relative quantities.
+
+     A fixed window can only integrate the samples extract recorded. In a second pass
+     extract records traces only inside the narrow second-pass RT window, and the
+     quantification trace pad that extends them is applied only to spectra with 1/K0
+     (`search_second_pass` requests `TracePad::for_quant` only when `spectra_has_im`;
+     see [On runs with ion mobility](#on-runs-with-ion-mobility-diapasef)). On a 3D
+     second pass a fixed window whose apex lies near the edge of the RT window is
+     therefore clipped to fewer than `2h+1` samples, and no warning is printed (the
+     warning exists only in the 1/K0 branch). Measured on the 0.8.0 ProteoBench Astral
+     run (cycle 1.64 s): 2.0%, 29.2% and 15.0% of the values of the three A runs and
+     90.0-90.9% of the values of the three B runs were integrated over fewer than 7
+     samples; on ProteoBench Q Exactive AIF (cycle 2.92 s) 0.1-0.5%. The size of the
+     resulting bias was estimated, not re-integrated: from the half-width dose-response of
+     the `predicted` top-6 arm on fixed identifications (human median log2 A/B -0.019,
+     +0.048 and +0.107 at h = 2, 3 and 5 on Astral, against -0.050, -0.052 and -0.052 on
+     AIF, where nothing is clipped), about +0.05 to +0.07 log2 toward A at h = 3, which
+     moves the species-weighted |eps| by about 0.01. Clipping does not explain the
+     compression of the minor species: on a 50 ng Astral set the per-run E. coli
+     compression was 0.22-0.24 log2 both in runs clipped 2% and in runs clipped 94%.
    - **bounded**, when `bound_peak` is on and no fixed window is configured:
      `trapezoid_window` restricts to the walked or consensus window.
    - **whole trace**, otherwise: `trapezoid` over every sample.
@@ -402,7 +430,10 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    [Profile-centred window and pattern fit](#profile-centred-window-and-pattern-fit)).
    Missing traces,
    all-zero/non-finite areas, or `top_n_fragments=0` produce a null quantity plus
-   an explicit `quant_status`; they are not converted to biological zero.
+   an explicit `quant_status`; they are not converted to biological zero. The default
+   `observed_area` top-3 rule compresses the ratios of the minor species under
+   interference; see
+   [Fragment selection under interference](#fragment-selection-under-interference).
 
    `passes_quant_filter` also admits a row flagged `is_transferred` by
    `mbr_worker.py`, whatever `q_filter` selects: MBR lowers only the PSM-level q
@@ -427,6 +458,59 @@ Trapezoid math: `trapezoid` sums `dt*(y_i+y_{i+1})/2` in f64 over consecutive RT
 samples; a single sample returns its raw intensity (`quant.rs:39`). `trapezoid_window`
 first filters to samples with `lo <= rt <= hi`, then calls `trapezoid` on the subset
 so the single-sample rule is identical; an empty window integrates to 0.
+
+#### Fragment selection under interference
+
+The default quant block (`top_n_fragments = 3`, `fragment_selection = observed_area`,
+`baseline_subtract = false`) sums, in each run separately, the 3 fragments with the largest
+observed area. A fragment that also carries co-eluting signal from another precursor has a
+larger area, so the rule selects it preferentially. Its ratio is then pulled toward the
+ratio of the background, which in a mixed-proteome design is mostly the majority species
+(human, log2 A/B 0 in the HYE designs). The minor species are compressed toward 0. The
+choice also changes between runs: on ProteoBench Astral 89-94% of the ions sum more than 3
+distinct fragments over the 6 runs, and a fragment that wins in only one run is the inflated
+one.
+
+Measured with 0.8.0 (2026-10-25, one NN seed per dataset). The fragment ratios depend on
+co-elution with the sibling fragments: on ProteoBench Astral, E. coli fragments whose median
+apex correlation with their siblings is at most 0 have a median log2 A/B of -0.35, those
+above 0.85 -1.85 to -1.92 (expected -2); on Q Exactive AIF -0.66 against -1.86 to -1.89. In
+about a third of the ions at least one of the three summed fragments has a median apex
+correlation of at most 0.3.
+
+Changing only `fragment_selection` with `mumdia quant` on fixed identifications and
+chromatograms of 0.8.0 runs, ProteoBench default view (ions in at least 3 of 6 runs,
+identical ion sets in every arm: Astral 132,079 ions, 127,830 finite ratios; AIF 99,530 and
+81,736). Species-weighted is the mean of the per-species median |eps|, global the median
+|eps| over all ions:
+
+| data | rule | species-weighted | global | CV median | median log2 A/B yeast (+1) / E. coli (-2) |
+|---|---|---|---|---|---|
+| Astral | `observed_area` top 3 (default) | 0.355 | 0.238 | 0.151 | 0.87 / -1.43 |
+| Astral | `predicted` top 3 | 0.301 | 0.249 | 0.172 | 0.95 / -1.68 |
+| Astral | `cross_run` | 0.291 | 0.246 | 0.161 | 0.98 / -1.71 |
+| AIF | `observed_area` top 3 (default) | 0.329 | 0.199 | 0.321 | 0.86 / -1.50 |
+| AIF | `predicted` top 3 | 0.251 | 0.185 | 0.321 | 0.94 / -1.75 |
+| AIF | `cross_run` | 0.259 | 0.187 | 0.331 | 0.96 / -1.79 |
+
+On ProteoBench Low Input (human and yeast only) the species-weighted |eps| is 0.605 under
+the default, 0.469 under `predicted` and 0.496 under `cross_run` (41,670 ions), and the
+human-yeast gap goes from 0.54 to 0.66 and 0.64 of its expected value. On ProteoBench
+diaPASEF, re-quantified offline from `fragment_quant`, `observed_area` top 3 gives 0.329
+(E. coli -1.43); the `configs/examples/diapasef.json` recipe, which uses `cross_run`, gives
+0.206.
+
+The interference-aware rules remove bias in the minor species, not noise. On Astral they
+make the global |eps| and the CV worse, and the per-ion SD of the human log2 A/B rises from
+0.46 to 0.60 under `cross_run` (0.53 to 0.80 in the lowest-abundance human tertile): bias in
+E. coli is traded for variance in the weak ions of every species. On AIF the global |eps|
+improves as well and the CV is unchanged. `predicted` is better on AIF and Low Input,
+`cross_run` on Astral; the differences between them (0.008-0.03) rest on one seed and are not
+interpretable. `observed_area` stays the default until a rule is chosen with seeds on
+several acquisitions; report the global |eps|, the CV and the per-species medians next to
+the species-weighted score when comparing rules. `baseline_source = experiment` on top of
+`cross_run` is not a remedy on Orbitrap data: it measured 0.296 against 0.291 on Astral and
+0.317 against 0.259 on AIF (E. coli over-corrected to -2.14).
 
 #### Cross-run fragment selection and background
 
@@ -904,7 +988,10 @@ windows, chromatograms and summaries are those described above.
   chromatograms' report, `rt_lo`/`rt_hi` of `psms_extracted`), so the features are those of
   the unpadded table; only quantification reads the pad. It needs `extract.emit_rt_window`
   (on by default) and is not applied under a two-pass co-elution peak claim. How often quant
-  windows and flanks were clipped before the pad is not yet measured.
+  windows and flanks were clipped before the pad is not yet measured on diaPASEF. The pad is
+  4D-only: a 3D second pass records no pad, and its fixed integration windows are clipped near
+  the edge of the RT window without a warning (measured on ProteoBench Astral under "fixed
+  window" in step 5 of the quant stage, above).
 
 Retrace runs in the second pass as in the first. The second pass reuses the first pass's
 run plan (`experiment.parallel_runs`). No diaPASEF measurement of the second pass is

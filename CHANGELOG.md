@@ -231,6 +231,13 @@ than a number. Both are recorded in every run's `manifest.json`.
   Such a frame is now read as its scans with no peaks, which gives an empty MS1 spectrum or
   one empty spectrum per slot. A frame that declares peaks and cannot be decoded is still an
   error. Runs without such frames convert as before.
+- **Documentation: quantification numbers carry their pipeline and ion filter.** The
+  `quant.fixed_scan_halfwidth` and `quant.fragment_selection` reference text and docs/12
+  quoted measurements of earlier pipelines as current. Each is now dated, with its ion filter,
+  next to what 0.8.0 measures. docs/12 now states that the second-pass trace pad applies only
+  to spectra with 1/K0, so a 3D second pass clips fixed windows near the RT window's edge, and
+  documents how the default `observed_area` top-3 rule compresses the ratios of the minor
+  species under interference ("Fragment selection under interference"). No output changes.
 
 ## [0.8.0] - 2026-10-22
 
