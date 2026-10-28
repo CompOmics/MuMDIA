@@ -4048,10 +4048,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/zstd@0.14.2",
+      "bom-ref": "pkg:cargo/zstd@0.14.3",
       "name": "zstd",
-      "version": "0.14.2",
-      "purl": "pkg:cargo/zstd@0.14.2",
+      "version": "0.14.3",
+      "purl": "pkg:cargo/zstd@0.14.3",
       "description": "Binding for the zstd compression library.",
       "licenses": [
         {
@@ -4086,10 +4086,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/zstd-safe@8.1.0",
+      "bom-ref": "pkg:cargo/zstd-safe@8.2.0",
       "name": "zstd-safe",
-      "version": "8.1.0",
-      "purl": "pkg:cargo/zstd-safe@8.1.0",
+      "version": "8.2.0",
+      "purl": "pkg:cargo/zstd-safe@8.2.0",
       "description": "Safe low-level bindings for the zstd compression library.",
       "licenses": [
         {
@@ -4105,10 +4105,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/zstd-sys@2.1.1+zstd.1.5.7",
+      "bom-ref": "pkg:cargo/zstd-sys@2.1.2+zstd.1.5.7",
       "name": "zstd-sys",
-      "version": "2.1.1+zstd.1.5.7",
-      "purl": "pkg:cargo/zstd-sys@2.1.1+zstd.1.5.7",
+      "version": "2.1.2+zstd.1.5.7",
+      "purl": "pkg:cargo/zstd-sys@2.1.2+zstd.1.5.7",
       "description": "Low-level bindings for the zstd compression library.",
       "licenses": [
         {
@@ -5072,7 +5072,7 @@
         "pkg:cargo/seq-macro@0.3.6",
         "pkg:cargo/snap@1.1.1",
         "pkg:cargo/twox-hash@2.1.2",
-        "pkg:cargo/zstd@0.14.2"
+        "pkg:cargo/zstd@0.14.3"
       ]
     },
     {
@@ -5567,17 +5567,17 @@
     {
       "ref": "pkg:cargo/zstd-safe@7.3.0",
       "dependsOn": [
-        "pkg:cargo/zstd-sys@2.1.1+zstd.1.5.7"
+        "pkg:cargo/zstd-sys@2.1.2+zstd.1.5.7"
       ]
     },
     {
-      "ref": "pkg:cargo/zstd-safe@8.1.0",
+      "ref": "pkg:cargo/zstd-safe@8.2.0",
       "dependsOn": [
-        "pkg:cargo/zstd-sys@2.1.1+zstd.1.5.7"
+        "pkg:cargo/zstd-sys@2.1.2+zstd.1.5.7"
       ]
     },
     {
-      "ref": "pkg:cargo/zstd-sys@2.1.1+zstd.1.5.7",
+      "ref": "pkg:cargo/zstd-sys@2.1.2+zstd.1.5.7",
       "dependsOn": [
         "pkg:cargo/cc@1.2.65",
         "pkg:cargo/pkg-config@0.3.34"
@@ -5590,9 +5590,9 @@
       ]
     },
     {
-      "ref": "pkg:cargo/zstd@0.14.2",
+      "ref": "pkg:cargo/zstd@0.14.3",
       "dependsOn": [
-        "pkg:cargo/zstd-safe@8.1.0"
+        "pkg:cargo/zstd-safe@8.2.0"
       ]
     }
   ]
