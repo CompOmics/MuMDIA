@@ -83,6 +83,7 @@ They are `pub const` tuples in the `artifact` submodule, referenced as
 | `psms_competed` | 2 | compete |
 | `psms_scored` | 3 | rescore |
 | `peptide_quant` | 2 | quant |
+| `peptide_quant` | 3 (`PEPTIDE_QUANT_V3`, only `run-experiment` after a second pass under `mbr.first_pass_flag`) | quant |
 | `protein_group_quant` | 2 | quant |
 | `fragment_quant` | 1 | quant |
 

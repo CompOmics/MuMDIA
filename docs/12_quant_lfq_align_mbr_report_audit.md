@@ -64,6 +64,10 @@ Consumes `psms_scored.parquet` (from `rescore`) and `chromatograms.parquet` (fro
 | `n_fragments_used` | i32 | number of positive finite fragments actually summed |
 | `integration_apex_rt` | nullable f64 | apex actually used for integration |
 | `integration_lo_rt` / `integration_hi_rt` | nullable f64 | integration bounds actually applied |
+| `first_pass_id` | bool | v3 only (`PEPTIDE_QUANT_V3`): the row's precursor had a first-pass identification in this run (`run-experiment`, second pass, `mbr.first_pass_flag`) |
+
+Without `mbr.first_pass_flag`, or without a second pass, the table is v2 and has no
+`first_pass_id`, byte for byte.
 
 `protein_group_quant.parquet` (schema `PROTEIN_GROUP_QUANT` v2):
 `protein_group` (str), nullable `quantity` (f64), `quant_status` (str), and
@@ -196,7 +200,10 @@ handler prints a one-line summary (`main.rs:806`).
 experiment root, rows selected on the experiment-wide `peptide_q_value` /
 `pg_q_value`, an `n_runs` column counting the runs whose own `run_psm_q` accepts
 the precursor or group, and one quantity column per run (`quantity_<run>` from each
-run's `peptide_quant.parquet`, `lfq_<run>` from `lfq_maxlfq.parquet`). No per-run
+run's `peptide_quant.parquet`, `lfq_<run>` from `lfq_maxlfq.parquet`). When every
+run's `peptide_quant` is v3 (`mbr.first_pass_flag`), one `first_pass_<run>` column per run
+follows the quantity columns: `true` or `false` from the run's `first_pass_id`, empty where
+the run has no quant row for the precursor; otherwise there is no such column. No per-run
 TSV is written, because the grouped q columns are assigned to each group's
 experiment-wide winner only.
 
@@ -956,6 +963,24 @@ the limitation is in quantification. The label-blind cross-run levers
 ([Cross-run fragment selection and background](#cross-run-fragment-selection-and-background))
 target this compression; they are measured on diaPASEF only and are not yet tested on these
 pools.
+
+**First-pass evidence flag (`mbr.first_pass_flag`, opt-in).** The compressed values are
+concentrated in the conditions where no run of the condition has a first-pass
+identification: there every value is a second-pass identification at the detection limit.
+With the key on, each run's `peptide_quant` gets a Boolean `first_pass_id` (schema v3): true
+where the row's precursor had a first-pass identification in that run (`run_psm_q <=
+mbr.q_anchor`, target; the same pairs `second_pass::diagnose` calls anchor runs). The flag
+is mapped through the empirical library's `entry_of`, so it is exact under any competition
+key. It changes no identification, q-value or quantity; the manifest records it under
+`experiment.first_pass_flag` (`run_psm_q`, flagged candidates per run). The engine has no
+condition design, so the condition-level filter itself is `bench/quant_condition_gate.py`:
+given a run-to-condition map it keeps a (precursor, condition) group's values only when at
+least one of its rows is flagged. On fixed identifications a filter of this kind removes
+12-15% of the finite A/B ratios of a ProteoBench HYE experiment and about 30% of the E. coli
+ones while the ProteoBench ion count falls by 3-5%, and a cut of the same size by lowest
+abundance reproduces 46-102% of its gain. It is a reporting operating point with fewer
+quantified ions, to be compared with other results at a matched number of finite ratios,
+not a better quantification. Not yet measured through the engine column.
 
 ### mbr (rescuable-tier transfer, opt-in)
 

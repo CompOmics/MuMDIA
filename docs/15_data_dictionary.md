@@ -890,6 +890,7 @@ pooled `q_value`, and `run_psm_q`, and does not select a run
 | `integration_apex_rt` | Float64 | yes | s | apex actually used for integration |
 | `integration_lo_rt` | Float64 | yes | s | integration lower bound actually used |
 | `integration_hi_rt` | Float64 | yes | s | integration upper bound actually used |
+| `first_pass_id` | Boolean | no | - | v3 only: the precursor had a first-pass identification in this run (`run_psm_q <= mbr.q_anchor`); written by `run-experiment` after a second pass under `mbr.first_pass_flag` |
 
 ### protein_group_quant (schema v2, `quant.rs:519-527`)
 
