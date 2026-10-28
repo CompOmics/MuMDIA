@@ -3057,6 +3057,17 @@ pub struct MbrConfig {
     /// single cells. Must be in [0, 1). Left out of the canonical configuration when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub second_pass_prefilter_keep_decoys: Option<f64>,
+    /// Under `strategy = second_pass`, `run-experiment` only: write a Boolean
+    /// `first_pass_id` into every run's `peptide_quant` (v3), true where the row's precursor
+    /// had a first-pass identification in that run (`run_psm_q <= q_anchor`, target), and a
+    /// `first_pass_<run>` column per run into the experiment-wide `peptides.tsv`. It is
+    /// evidence for a reporting filter (`bench/quant_condition_gate.py`), not a filter: no
+    /// identification, quantity or q-value changes. Quantities of conditions where no run
+    /// has a first-pass identification are the most compressed ones (docs/12, "Second
+    /// pass"). Off by default; then nothing is written and both tables keep their bytes.
+    /// Left out of the canonical configuration when off.
+    #[serde(skip_serializing_if = "is_false")]
+    pub first_pass_flag: bool,
 }
 impl Default for MbrConfig {
     fn default() -> Self {
@@ -3071,6 +3082,7 @@ impl Default for MbrConfig {
             requant_all: false,
             python: None,
             second_pass_prefilter_keep_decoys: None,
+            first_pass_flag: false,
         }
     }
 }
@@ -4373,6 +4385,13 @@ impl Config {
                  second_pass: there is no second-pass rescore, and the setting has no effect"
             );
         }
+        if self.mbr.strategy != MbrStrategy::SecondPass && self.mbr.first_pass_flag {
+            tracing::warn!(
+                strategy = ?self.mbr.strategy,
+                "mbr.first_pass_flag is set but mbr.strategy is not second_pass: every reported \
+                 value is a first-pass value, and no flag is written"
+            );
+        }
         // The second pass's library is cut at `q_anchor`, and that cut is also the report's:
         // with entrapment, 113-114 of 125 reportable false library entries came back in the
         // second pass (docs/12, "Second pass").
@@ -5203,6 +5222,21 @@ mod tests {
         let parsed: MbrConfig =
             serde_json::from_str(r#"{"second_pass_prefilter_keep_decoys": 0.5}"#).unwrap();
         assert_eq!(parsed.second_pass_prefilter_keep_decoys, Some(0.5));
+    }
+
+    /// `mbr.first_pass_flag` is off by default and absent from the canonical configuration
+    /// then, so no configuration hash moves; on, it is recorded and parses back.
+    #[test]
+    fn first_pass_flag_is_absent_from_the_canonical_configuration_when_off() {
+        let c = Config::default();
+        assert!(!c.mbr.first_pass_flag);
+        assert!(!c.canonical_json().contains("first_pass_flag"));
+        let mut on = Config::default();
+        on.mbr.first_pass_flag = true;
+        assert!(on.validate().is_ok());
+        assert!(on.canonical_json().contains(r#""first_pass_flag":true"#));
+        let parsed: MbrConfig = serde_json::from_str(r#"{"first_pass_flag": true}"#).unwrap();
+        assert!(parsed.first_pass_flag);
     }
 
     /// The seed's tolerance retry is on at its defaults (50 confident targets, 2x), which the

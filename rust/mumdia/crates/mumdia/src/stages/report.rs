@@ -400,6 +400,15 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
     // Per-run precursor quantities, one map per run, NaN for an unquantified precursor.
     let mut pep_quant: Vec<HashMap<(String, i32), f64>> =
         Vec::with_capacity(p.peptide_quants.len());
+    // Per-run first-pass flags (`peptide_quant` v3, `mbr.first_pass_flag`): true where any
+    // row of the precursor had a first-pass identification in that run. Only when every
+    // table carries the column, so a report without it keeps its bytes.
+    let first_pass_col = crate::stages::quant::FIRST_PASS_ID;
+    let mut all_flagged = !p.peptide_quants.is_empty();
+    for path in p.peptide_quants {
+        all_flagged &= TableFile::open(path)?.has_column(first_pass_col);
+    }
+    let mut pep_first: Vec<HashMap<(String, i32), bool>> = Vec::new();
     for path in p.peptide_quants {
         let q = TableFile::open(path)?;
         let qp = q.str("peptidoform")?;
@@ -410,6 +419,19 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
                 .map(|i| ((qp[i].clone(), qc[i]), qq[i]))
                 .collect(),
         );
+        if all_flagged {
+            let qf = q.bool(first_pass_col).with_context(|| {
+                format!(
+                    "experiment report: `{first_pass_col}` of {path} is present but not a \
+                     boolean column"
+                )
+            })?;
+            let mut flags: HashMap<(String, i32), bool> = HashMap::new();
+            for i in 0..q.nrows {
+                *flags.entry((qp[i].clone(), qc[i])).or_insert(false) |= qf[i];
+            }
+            pep_first.push(flags);
+        }
     }
     // Cross-run protein quantities: protein_group -> per-run MaxLFQ value, NaN for none.
     let mut prot_lfq: HashMap<String, Vec<f64>> = HashMap::new();
@@ -446,6 +468,9 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
             write!(w, "\tquantity_{name}")?;
         }
     }
+    for name in p.run_names.iter().take(pep_first.len()) {
+        write!(w, "\tfirst_pass_{name}")?;
+    }
     write!(w, "\tis_transferred\ttransfer_q")?;
     writeln!(w)?;
     let mut npep = 0u64;
@@ -475,6 +500,14 @@ pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
                 "\t{}",
                 qcell(quant.get(&key).copied().unwrap_or(f64::NAN))
             )?;
+        }
+        // Empty where the run has no quant row for the precursor, as its quantity cell is.
+        for flags in &pep_first {
+            match flags.get(&key) {
+                Some(true) => write!(w, "\ttrue")?,
+                Some(false) => write!(w, "\tfalse")?,
+                None => write!(w, "\t")?,
+            }
         }
         write!(w, "{}", transfer_cells(j))?;
         writeln!(w)?;
@@ -1105,6 +1138,122 @@ mod tests {
         assert_eq!(
             (pg[0], pg[2], pg[3], pg[4]),
             ("PG1", "2", "1000.0", "1200.0")
+        );
+    }
+
+    /// `peptide_quant` v3 tables (`mbr.first_pass_flag`) add one `first_pass_<run>` column
+    /// per run after the quantity columns: `true` / `false` from the run's flag, empty where
+    /// the run has no quant row. A table without the column in any run writes none, so the
+    /// report keeps its bytes.
+    #[test]
+    fn experiment_report_writes_first_pass_columns_only_from_flagged_tables() {
+        let scored = tmp("fp_scored_combined.parquet");
+        write_table(
+            &scored,
+            vec![
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEPTIDEK".into(), "PEPTIDEK".into(), "SECONDK".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 2, 3]),
+                Col::Str(
+                    "protein".into(),
+                    vec!["P1".into(), "P1".into(), "P2".into()],
+                ),
+                Col::Str("label".into(), vec!["target".into(); 3]),
+                Col::F64("peptide_q_value".into(), vec![0.001, 1.0, 0.005]),
+                Col::Str(
+                    "protein_group".into(),
+                    vec!["PG1".into(), "PG1".into(), "PG2".into()],
+                ),
+                Col::F64("pg_q_value".into(), vec![0.002, 1.0, 0.003]),
+                Col::F64("score".into(), vec![3.5, 3.0, 2.0]),
+                Col::U32("source".into(), vec![0, 1, 1]),
+                Col::F64("run_psm_q".into(), vec![0.001, 0.004, 0.005]),
+            ],
+        )
+        .unwrap();
+        let quant = |name: &str, pf: Vec<&str>, z: Vec<i32>, q: Vec<f64>, fp: Option<Vec<bool>>| {
+            let path = tmp(name);
+            let mut cols = vec![
+                Col::Str(
+                    "peptidoform".into(),
+                    pf.into_iter().map(String::from).collect(),
+                ),
+                Col::I32("charge".into(), z),
+                Col::F64("quantity".into(), q),
+            ];
+            if let Some(v) = fp {
+                cols.push(Col::Bool("first_pass_id".into(), v));
+            }
+            write_table(&path, cols).unwrap();
+            path
+        };
+        let qa = quant(
+            "fp_a.parquet",
+            vec!["PEPTIDEK"],
+            vec![2],
+            vec![100.0],
+            Some(vec![true]),
+        );
+        let qb = quant(
+            "fp_b.parquet",
+            vec!["PEPTIDEK", "SECONDK"],
+            vec![2, 3],
+            vec![120.0, 50.0],
+            Some(vec![false, true]),
+        );
+        let qb_plain = quant(
+            "fp_b_plain.parquet",
+            vec!["PEPTIDEK", "SECONDK"],
+            vec![2, 3],
+            vec![120.0, 50.0],
+            None,
+        );
+        let names = vec!["a".to_string(), "b".to_string()];
+        let report = |tables: &[String], tag: &str| -> Vec<String> {
+            let peptides = tmp(&format!("fp_{tag}_peptides.tsv"));
+            let proteins = tmp(&format!("fp_{tag}_proteins.tsv"));
+            run_experiment(ExperimentReportParams {
+                scored: &scored,
+                run_names: &names,
+                peptide_quants: tables,
+                protein_lfq: None,
+                out_peptides: &peptides,
+                out_proteins: &proteins,
+                q_threshold: 0.01,
+            })
+            .unwrap();
+            std::fs::read_to_string(&peptides)
+                .unwrap()
+                .lines()
+                .map(String::from)
+                .collect()
+        };
+
+        let lines = report(&[qa.clone(), qb], "flagged");
+        assert_eq!(
+            lines[0],
+            "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tn_runs\tquantity_a\t\
+             quantity_b\tfirst_pass_a\tfirst_pass_b\tis_transferred\ttransfer_q"
+        );
+        let pep: Vec<&str> = lines[1].split('\t').collect();
+        assert_eq!(
+            (pep[0], pep[7], pep[8], pep[9], pep[10], pep[11]),
+            ("PEPTIDEK", "100.0", "120.0", "true", "false", "false")
+        );
+        let sec: Vec<&str> = lines[2].split('\t').collect();
+        assert_eq!(
+            (sec[0], sec[7], sec[8], sec[9], sec[10], sec[11]),
+            ("SECONDK", "", "50.0", "", "true", "false")
+        );
+
+        // One run without the column: no first-pass column at all.
+        let mixed = report(&[qa, qb_plain], "mixed");
+        assert_eq!(
+            mixed[0],
+            "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tn_runs\tquantity_a\t\
+             quantity_b\tis_transferred\ttransfer_q"
         );
     }
 

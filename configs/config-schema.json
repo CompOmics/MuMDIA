@@ -3971,6 +3971,19 @@
       "source_struct": "MbrConfig"
     },
     {
+      "path": "mbr.first_pass_flag",
+      "name": "first_pass_flag",
+      "section": "mbr",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Under `strategy = second_pass`, `run-experiment` only: write a Boolean `first_pass_id` into every run's `peptide_quant` (v3), true where the row's precursor had a first-pass identification in that run (`run_psm_q <= q_anchor`, target), and a `first_pass_<run>` column per run into the experiment-wide `peptides.tsv`. It is evidence for a reporting filter (`bench/quant_condition_gate.py`), not a filter: no identification, quantity or q-value changes. Quantities of conditions where no run has a first-pass identification are the most compressed ones (docs/12, \"Second pass\"). Off by default; then nothing is written and both tables keep their bytes. Left out of the canonical configuration when off.",
+      "gates": [],
+      "source_struct": "MbrConfig"
+    },
+    {
       "path": "experiment.parallel_runs",
       "name": "parallel_runs",
       "section": "experiment",

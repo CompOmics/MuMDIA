@@ -70,7 +70,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`rescore`](#rescore) | `RescoreConfig` | 31 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`quant`](#quant) | `QuantConfig` | 23 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
-| [`mbr`](#mbr) | `MbrConfig` | 10 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
+| [`mbr`](#mbr) | `MbrConfig` | 11 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 3 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
 | [`groups`](#groups) | `GroupsConfig` | 9 |  |
 | [`retrace`](#retrace) | `RetraceConfig` | 5 | [docs/09_extract.md](09_extract.md) |
@@ -533,6 +533,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `requant_all` | `bool` | `false` | not yet wired | NOT YET WIRED. Would requantify already-identified precursors too (fill the matrix), not only transferred ones, under `strategy = Full`. No code reads this field yet; `validate()` warns if it is changed. |
 | `python` | `Option<String>` | `null` |  | Python interpreter for the `mbr_worker.py` sidecar (pandas/pyarrow/numpy; e.g. the `py312_mumdia` env). Required by the transfer variants only; `second_pass` and `none` run no sidecar. |
 | `second_pass_prefilter_keep_decoys` | `Option<f64>` | `null` |  | Under `strategy = second_pass`: the `rescore.prefilter_keep_decoys` of the second-pass rescore only (0 = no prefilter there). Unset, the second pass uses `rescore.prefilter_keep_decoys` like the first. The first pass pools every candidate of every run (59M and 106M PSMs on 18- and 27-run Astral experiments) and needs the cut for memory; the second-pass pool holds the empirical library's candidates (6.6M and 4.1M PSMs on the same two), where the cut cost 4.2-4.8% of the precursors on a plate of single cells. Must be in [0, 1). Left out of the canonical configuration when unset. |
+| `first_pass_flag` | `bool` | `false` |  | Under `strategy = second_pass`, `run-experiment` only: write a Boolean `first_pass_id` into every run's `peptide_quant` (v3), true where the row's precursor had a first-pass identification in that run (`run_psm_q <= q_anchor`, target), and a `first_pass_<run>` column per run into the experiment-wide `peptides.tsv`. It is evidence for a reporting filter (`bench/quant_condition_gate.py`), not a filter: no identification, quantity or q-value changes. Quantities of conditions where no run has a first-pass identification are the most compressed ones (docs/12, "Second pass"). Off by default; then nothing is written and both tables keep their bytes. Left out of the canonical configuration when off. |
 
 ## experiment
 
@@ -1297,6 +1298,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-24 structs and 323 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 42 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 324 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 42 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
 36 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

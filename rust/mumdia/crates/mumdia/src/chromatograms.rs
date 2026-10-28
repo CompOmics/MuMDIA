@@ -1438,6 +1438,7 @@ mod tests {
                 config_hash: "test",
                 cross_run: None,
                 export_cross_run: false,
+                first_pass_ids: None,
             })
             .unwrap();
             println!(
