@@ -69,7 +69,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`features`](#features) | `FeaturesConfig` | 12 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`rescore`](#rescore) | `RescoreConfig` | 31 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
-| [`quant`](#quant) | `QuantConfig` | 19 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
+| [`quant`](#quant) | `QuantConfig` | 23 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`mbr`](#mbr) | `MbrConfig` | 10 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 3 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
 | [`groups`](#groups) | `GroupsConfig` | 9 |  |
@@ -504,7 +504,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `reliable_q` | `f64` | `0.001` |  | Peptide q-value cutoff defining the "confident" set that calibrates the consensus half-widths (Consensus mode only). Tighter than `q_threshold`. |
 | `q_filter` | `QuantQColumn` | `peptide_q` |  | Which q-value column to filter candidates on (`peptide_q` default; `precursor_q` is single-run only; use `run_psm_q` for per-run slices of an experiment-wide rescore). See `QuantQColumn`. |
 | `interference_envelope` | `bool` | `false` | benchmark-gated | Apply an apex-outward interference-correction envelope to each fragment trace before integrating its area, stripping co-eluting interference in the peak wings. Off by default (identity on a clean peak). Opt-in and benchmark-gated: it changes reported quantities. |
-| `fragment_selection` | `FragmentSelection` | `observed_area` | benchmark-gated | Which fragments enter the top-N sum. `observed_area` (default, legacy) ranks by the integrated area itself, which preferentially selects interfered fragments (their areas are inflated) and so varies run to run. `predicted` ranks by the library (predicted or empirical) fragment intensity, a per-precursor constant, so every run sums the same fragments. Astral HYE 2026-08-26 (pipeline of that date): CV 0.163 -> 0.112 on 6/6 ions at top-3. That CV gain does not reproduce with 0.8.0: on fixed ProteoBench Astral identifications, 6/6 ions, the median CV is 0.136 for `observed_area` and 0.151 for `predicted`. Benchmark-gated. `cross_run` weights each fragment by its consistency across the runs of an experiment (`FragmentSelection::CrossRun`); benchmark-gated as well. Under interference `observed_area` compresses the ratios of the minor species: with 0.8.0 on fixed identifications (ProteoBench default view, ions in at least 3 of 6 runs) the E. coli median log2 A/B (expected -2) is -1.43 / -1.68 / -1.71 for `observed_area` / `predicted` / `cross_run` on Astral and -1.50 / -1.75 / -1.79 on Q Exactive AIF, while the global \|eps\| and the CV get worse on Astral (docs/12, "Fragment selection under interference"). |
+| `fragment_selection` | `FragmentSelection` | `observed_area` | benchmark-gated | Which fragments enter the top-N sum. `observed_area` (default, legacy) ranks by the integrated area itself, which preferentially selects interfered fragments (their areas are inflated) and so varies run to run. `predicted` ranks by the library (predicted or empirical) fragment intensity, a per-precursor constant, so every run sums the same fragments. Astral HYE 2026-08-26 (pipeline of that date): CV 0.163 -> 0.112 on 6/6 ions at top-3. That CV gain does not reproduce with 0.8.0: on fixed ProteoBench Astral identifications, 6/6 ions, the median CV is 0.136 for `observed_area` and 0.151 for `predicted`. Benchmark-gated. `cross_run` weights each fragment by its consistency across the runs of an experiment (`FragmentSelection::CrossRun`); benchmark-gated as well. Under interference `observed_area` compresses the ratios of the minor species: with 0.8.0 on fixed identifications (ProteoBench default view, ions in at least 3 of 6 runs) the E. coli median log2 A/B (expected -2) is -1.43 / -1.68 / -1.71 for `observed_area` / `predicted` / `cross_run` on Astral and -1.50 / -1.75 / -1.79 on Q Exactive AIF, while the global \|eps\| and the CV get worse on Astral (docs/12, "Fragment selection under interference"). `pattern_fit` and `pattern_profile` fit the window samples to the library pattern with one dispersion fitted over the runs of an experiment (`FragmentSelection::PatternFit`, `FragmentSelection::PatternProfile`); benchmark-gated. |
 | `fixed_scan_halfwidth` | `usize` | `3` |  | When > 0, integrate each fragment over the `2k+1` scans centred on the identification apex instead of the descent-walk window (`bound_peak` window ignored; falls back to it when the apex is unknown). A fixed narrow window is far less sensitive to interference in the peak wings than the walked bounds. Default 3 (seven samples) since 2026-10-04; 0 restores the walked window. Measured 2026-10-04, with the pipeline of that date (before the second pass became the default in 0.7.0), on the six-file Astral HYE experiment (one seed, 63,141 precursors quantified in at least 2 runs per condition): median \|log2 ratio error\| 0.266 -> 0.163, species-weighted 0.322 -> 0.201, median CV 0.19 -> 0.10, the identifications unchanged. Those values do not describe 0.8.0. Under the same ion filter (ProteoBench-scored precursors quantified in at least 2 runs per condition) the 0.8.0 ProteoBench Astral run measures 0.218 and 0.294 (113,876 precursors, one seed). The fixed window still beats the walked one with 0.8.0 on fixed identifications, ProteoBench default view (ions in at least 3 of 6 runs): Astral species-weighted \|eps\| 0.355 against 0.475, global 0.238 against 0.326, CV 0.151 against 0.237; Q Exactive AIF 0.329 against 0.542 (docs/12). On a 3D second pass the traces are not padded, so the window is clipped near the edge of the narrow second-pass RT window (docs/12). The width is in samples of the precursor's window, so it scales with the cycle time; check it on an acquisition with much wider or narrower peaks. |
 | `baseline_subtract` | `bool` | `false` | benchmark-gated | Subtract a per-fragment local background before integrating (fixed-scan window only). The background is the `baseline_quantile` quantile of the intensities in the two flanks (`baseline_flank_scans` samples on each side of the integration window); window intensities are clipped at zero after subtraction. Targets the additive floor that compresses ratios in the low-abundance condition. Off by default; benchmark-gated. |
 | `baseline_flank_scans` | `usize` | `12` |  | Flank length (samples per side) used to estimate the background. |
@@ -512,6 +512,10 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `fixed_window_s` | `f64` | `0.0` |  | When > 0, integrate each fragment over the samples within `fixed_window_s` seconds of the identification apex (instrument-independent alternative to `fixed_scan_halfwidth`, which it overrides). 0 (default) = off. |
 | `baseline_source` | `BaselineSource` | `run` | benchmark-gated | Where the flank background of `baseline_subtract` comes from. `run` (default): the `baseline_quantile` quantile of this run's flanks. `experiment`: one level per (candidate, fragment), the mean over every run of the raw flank mean, which the cross-run step of `run-experiment` fits and subtracts in place of the per-run quantile (docs/12, "Cross-run fragment selection and background"). Needs `baseline_subtract = true`. Without the cross-run step (`run`, or `quant` without `--cross-run-from`) the per-run quantile applies. Benchmark-gated. Omitted from the canonical configuration at its default. |
 | `fixed_scan_halfwidth_scale` | `f64` | `0.0` | benchmark-gated | When > 0, the cross-run step integrates each candidate over its own scan halfwidth `h = clamp(round(fixed_scan_halfwidth_scale x HWHM), 3, 7)` in every run, in place of `fixed_scan_halfwidth`. HWHM is the half width at half maximum, in scans, of the candidate's summed fragment trace in its brightest run, measured in the first pass; the experiment background is then taken beyond that window. Needs the scan form of the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`) and `baseline_source = experiment`. 0 (default) = off. Benchmark-gated. Omitted from the canonical configuration at its default. |
+| `normalisation` | `CrossRunNormalisation` | `off` | benchmark-gated | Cross-run normalisation of the per-run precursor quantities, by `run-experiment` after per-run quant and by `mumdia quant-normalise`. `off` (default): none. `stable_set`: one log2 shift per run and retention-time bin, the median deviation of a stable set of ions, those whose profile across the runs belongs to the largest population of a principal-component subspace of the run space (docs/12, "Cross-run normalisation"). The result is a separate table per run, `peptide_quant_normalised.parquet` (`quantity_normalised`), next to an unchanged `peptide_quant.parquet`, plus the fitted shifts in `quant_normalisation.parquet`. Benchmark-gated. Omitted from the canonical configuration at its default. |
+| `normalisation_lfq` | `bool` | `false` |  | The cross-run MaxLFQ of `run-experiment` reads `quantity_normalised` without its own median-ratio size factors, in place of `quantity` with them. Off by default, because the normalisation was measured on precursor quantities only and its effect on protein quantities is unmeasured. Omitted from the canonical configuration at its default. |
+| `normalisation_rank` | `Option<usize>` | `null` |  | `stable_set` only: the dimension of the subspace of the run space that holds the composition effects, fixed. Unset (the default), each iteration counts the eigenvalues of the most abundant complete ions' deviations above 3 times their median (at least 1, at most `n_runs - 2`), the rule the method was confirmed with. That count is fragile: on Q Exactive AIF it chose 2 where the design has two conditions (docs/12, "Cross-run normalisation"), so a design with `G` sample groups can fix it at `G - 1`. Must be >= 1. Omitted from the canonical configuration when unset. |
+| `window_centre` | `WindowCentre` | `apex` | benchmark-gated | Where the fixed scan window is centred. `apex` (default): on the sample nearest the identification apex. `profile`: on the centre of the 3-sample block, within 2 samples of that sample, with the largest summed raw intensity of the 6 fragments with the highest library intensity (ties to the smaller shift), one centre for all of the candidate's fragments (docs/12, "Profile-centred window and pattern fit"). The identification apex and `integration_apex_rt` do not move; `integration_lo_rt` and `integration_hi_rt` report the shifted window. Needs the scan form of the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`, `fixed_scan_halfwidth_scale = 0`). Benchmark-gated. Omitted from the canonical configuration at its default. |
 
 ## mbr
 
@@ -649,6 +653,17 @@ Within-group competition resolution (spec 04 §6). Only `WinnerTakeAll` removes 
 | `unique_evidence` |  | Keep a loser when it has enough independent evidence (`unique_fragment_count >= unique_evidence_min_fragments`); otherwise remove it (winner-take-all fallback). |
 | `margin_gated` |  | Remove a loser only when `winner_score - loser_score >= margin`; otherwise keep it. Conservative removal for the low-FDR region. |
 
+### `CrossRunNormalisation`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+Cross-run normalisation of precursor quantities. See `QuantConfig::normalisation`.
+
+| Value | Default | Description |
+|---|---|---|
+| `off` | yes | No normalisation table is written (default). |
+| `stable_set` |  | Per-run, retention-time-binned median of the log2 deviations of a stable set of ions, selected by their profile across the runs (`stages::quant_stable`). |
+
 ### `DecoyStrategy`
 
 (rust/mumdia/crates/mumdia-core/src/config.rs)
@@ -731,6 +746,8 @@ Fragment ranking for the quant top-N sum. See `QuantConfig::fragment_selection`.
 | `observed_area` | yes | Rank fragments by their own integrated area (legacy). |
 | `predicted` |  | Rank fragments by library intensity (`predicted_intensity` in the chromatogram table). |
 | `cross_run` |  | Weight every fragment by its consistency across the runs of an experiment, fitted by the cross-run step of `run-experiment`: the quantity is `sum(weight x area)` with the same weights in every run (docs/12, "Cross-run fragment selection and background"). Where no weight was fitted (single run, `quant` without `--cross-run-from`, a candidate with no positive weighted area), `predicted` applies, with `top_n_fragments`. |
+| `pattern_fit` |  | Fit the window samples of the candidate's 10 fragments with the largest library intensity (observed in at least one run of the experiment) to the library pattern `predicted_intensity^1.5`, in two robust levels: a rank-1 fragment x time model whose cells are winsorised at the model plus one standard deviation, then a fit of the winsorised areas to the pattern, both with Huber weights on the excess over the model and a noise variance `phi mu + (0.5 mu)^2 + phi^2`. `phi` is one dispersion per experiment, the variance over mean of the run-normalised fragment areas of every candidate in at least 3 runs, so the rule needs the cross-run step of `run-experiment` and at least 3 runs (docs/12, "Profile-centred window and pattern fit"). Without the step, or where `phi` cannot be estimated, `predicted` applies, with `top_n_fragments`. Needs the scan form of the fixed window and refuses the baseline and the envelope. Benchmark-gated. |
+| `pattern_profile` |  | As `pattern_fit`, but the quantity is the integral of the rank-1 model's elution profile over the window (the first level alone), times the pattern scale. Same needs and fallbacks. Benchmark-gated. |
 
 ### `GateMode`
 
@@ -1074,6 +1091,17 @@ How many DeepLC fine-tunes an experiment pays for.
 | `error` | yes |  |
 | `skip` |  |  |
 
+### `WindowCentre`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+Centre of the fixed scan window. See `QuantConfig::window_centre`.
+
+| Value | Default | Description |
+|---|---|---|
+| `apex` | yes | The sample nearest the identification apex (default). |
+| `profile` |  | The largest 3-sample block of the summed top-6 library fragments within 2 samples. |
+
 1 enum(s) are declared in `rust/mumdia/crates/mumdia-core/src/config.rs` but are not reachable from `Config`, so they are not config values: `NormalizeMethod`. They are CLI-only or helper types.
 
 ## Environment variables
@@ -1269,6 +1297,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-24 structs and 319 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 40 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 323 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 42 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
 
-34 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.
+36 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

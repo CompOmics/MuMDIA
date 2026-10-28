@@ -14,6 +14,10 @@ stages that operate across multiple runs.
 - **quant-lfq** (Stage G, `mumdia quant-lfq`): combine several per-run quant tables
   into a protein-by-run abundance matrix by MaxLFQ (peptide-level) or directLFQ
   (ion/fragment-level), with optional cross-run median-ratio normalization.
+- **quant-normalise** (`mumdia quant-normalise`, and `run-experiment` under
+  `quant.normalisation = "stable_set"`): opt-in cross-run normalisation of the per-run
+  precursor quantities by retention-time-binned medians of a stable set of ions, written
+  to separate tables.
 - **align** (Stage D2, `mumdia align`): put >=2 runs on a common RT coordinate by
   fitting a reference LOESS RT map per run and recording the residual spread.
 - **mbr** (Stage D3, `mumdia mbr`): partially wired match-between-runs identification
@@ -29,6 +33,7 @@ stages that operate across multiple runs.
 | path | role |
 |---|---|
 | `rust/mumdia/crates/mumdia/src/stages/quant.rs` | `quant` stage + `run_lfq_combine`/`size_factors` for `quant-lfq` |
+| `rust/mumdia/crates/mumdia/src/stages/quant_norm.rs` | opt-in cross-run normalisation (`quant-normalise`, `quant.normalisation`) |
 | `rust/mumdia/crates/mumdia/src/quant_lfq.rs` | MaxLFQ/directLFQ ratio-alignment core (`lfq_profile`, `maxlfq`, `directlfq`) |
 | `rust/mumdia/crates/mumdia/src/stages/align.rs` | Stage D2 cross-run RT alignment |
 | `rust/mumdia/crates/mumdia/src/stages/report.rs` | `peptides.tsv` + `proteins.tsv` writer |
@@ -74,7 +79,10 @@ emitted. This is the input for ion-level directLFQ. Under the cross-run export
 zero-area fragments are kept and eight Float64 columns follow (`apex_corr`,
 `flank_mean`, `flank_mean_h3` to `flank_mean_h7`, `peak_hwhm`; see
 [Cross-run fragment selection and background](#cross-run-fragment-selection-and-background)
-and docs/15_data_dictionary.md). Every other quant writes v1.
+and docs/15_data_dictionary.md). Under a pattern rule (`fragment_selection =
+pattern_fit` or `pattern_profile`) the export is v6, v5 plus `pattern_area`, `observed` and
+`window_rt` (see [Profile-centred window and pattern fit](#profile-centred-window-and-pattern-fit)).
+Every other quant writes v1.
 
 `<peak_bounds>.parquet` (optional diagnostic, `--out-peak-bounds`, only when
 `bound_peak` is on; `quant.rs:419`): `candidate_id`, `lo_rt`, `hi_rt`, `width_s`
@@ -101,7 +109,23 @@ sequence) and `<out>.precursor.parquet` (by peptidoform + charge), each with col
 from the same normalized feature matrix and LFQ engine. The protein output is
 unchanged. Unlike `quant` and
 `align`, `run_lfq_combine` writes no `<out>.report.json`: it calls `write_table` and
-logs, with no `ArtifactReport` (`quant.rs:720`).
+logs, with no `ArtifactReport` (`quant.rs:720`). `--quantity-column` names the input
+intensity column (`quantity` by default; `quantity_normalised` for the tables below).
+
+### quant-normalise (and `run-experiment` with `quant.normalisation` on)
+Consumes one `peptide_quant.parquet` per run, in run order. Produces one
+`peptide_quant_normalised.parquet` per run (schema `peptide_quant_normalised` v1),
+row-aligned with its input: `peptidoform`, `charge`, `protein_group`, `quantity` (the
+raw value), `quantity_normalised`, `normalisation_log2_shift` (f64; `quantity /
+quantity_normalised = 2^shift`), `quant_status`, `n_fragments_used`,
+`integration_apex_rt`. A row without a positive finite quantity keeps its value in both
+quantity columns. It also writes the shifts table (schema `quant_normalisation` v1):
+`run`, `bin` (-1 for the run's global shift), `rt_lo`, `rt_hi`, `rt_center` (null on the
+global row), `n_ions`, `n_estimation`, `log2_median` (the bin's median deviation before
+smoothing; the global shift on the global row), `log2_shift`.
+Every table has a `<artifact>.report.json`. In `run-experiment` the tables are
+`<run>/peptide_quant_normalised.parquet` and `quant_normalisation.parquet` at the
+experiment root, and the manifest records both and a `cross_run_normalisation` block.
 
 ### align
 Consumes one `seed_psms.parquet` per run (`--seed-psms`, first is the reference).
@@ -393,7 +417,11 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
    from the ranking rather than sorted to the front. `cross_run` sums every fragment
    with a weight fitted across the runs of an experiment (see
    [Cross-run fragment selection and background](#cross-run-fragment-selection-and-background));
-   where no weight was fitted it ranks as `predicted`. Missing traces,
+   where no weight was fitted it ranks as `predicted`. `pattern_fit` and
+   `pattern_profile` fit the window samples to the library pattern with a dispersion
+   fitted across the runs (see
+   [Profile-centred window and pattern fit](#profile-centred-window-and-pattern-fit)).
+   Missing traces,
    all-zero/non-finite areas, or `top_n_fragments=0` produce a null quantity plus
    an explicit `quant_status`; they are not converted to biological zero. The default
    `observed_area` top-3 rule compresses the ratios of the minor species under
@@ -594,6 +622,146 @@ minimum-clean-ion rule. Peak-window and fragment-selection policies are single-r
 choices unless the opt-in cross-run step above runs. Evaluate changes on
 known-ratio data rather than identification count alone.
 
+#### Profile-centred window and pattern fit
+
+Two keys change where the fixed window sits and how its samples become a quantity. Both are
+off by default and benchmark-gated. The code is `stages/quant_pattern.rs`.
+
+**`window_centre = "profile"`** (default `apex`). Per candidate and run, quant sums the raw
+traces of the 6 fragments with the highest `predicted_intensity` (ties in row order; a
+fragment without a trace adds nothing) sample by sample, around the sample `k` nearest the
+identification apex. It then tries the shifts `0, -1, +1, -2, +2` in that order. A shift is
+taken when the 3-sample block centred on `k + s` beats the best block so far by a relative
+1e-9, so ties go to the smaller shift. Every fragment of the candidate is integrated over
+the fixed `+-fixed_scan_halfwidth` window around that one centre, clipped to the trace and
+widened to two samples as the apex window is. A row whose axis differs from the
+candidate's is centred on its own nearest sample, moved by the same shift. The shift is
+local to the run and reads nothing across runs, so it also applies to a single-run `run`
+and under every fragment rule. `integration_apex_rt` stays the identification apex.
+`integration_lo_rt` and `integration_hi_rt` report the shifted window. The key needs the
+scan form of the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`,
+`fixed_scan_halfwidth_scale = 0`); validation refuses anything else.
+
+**`fragment_selection = "pattern_fit"` / `"pattern_profile"`.** Both rules model the window
+samples against the library pattern `p[f] = predicted_intensity^1.5`, the same in every run.
+The fragment set `S` holds the 10 fragments with the largest `p` among those with a trace in
+at least one run of the experiment, and it is the same set in every run. A fragment
+without a trace in a run counts as 0 there and is not replaced. The quantity is scaled by
+the sum of `p` over the 3 largest fragments of `S`, a per-candidate constant.
+
+- Level 1, a rank-1 fragment x time model. `x[f, t] ~ p[f] g[t]` over `S` and the window
+  samples, where `g` is a free elution profile per run. `g[t] = sum_f W x / sum_f W p`. The
+  Huber weights `W` (threshold 1) act on the standardised excess
+  `max(0, (x - mu) / sd)`, so only signal above the model is down-weighted: interference
+  adds. The variance is `phi_cell mu + (0.5 mu)^2 + phi_cell^2`. The model is reweighted 6
+  times and evaluated a seventh. `pattern_profile` reports the trapezoid of `g` over the
+  window times the scale.
+- Level 2, `pattern_fit` only. Every cell of `S` is winsorised at `mu + sd`. The winsorised
+  traces are integrated, and the areas are fitted to the pattern: `c = sum w a / sum w p`,
+  with Huber weights on the excess and the variance `phi mu + (0.5 mu)^2 + phi^2`, in 6
+  reweightings. The rule reports `c` times the scale. Level 1 removes interference that
+  fills part of the window. Level 2 removes interference that inflates one fragment
+  throughout it.
+
+`phi` is one dispersion per experiment and reads no condition or species label. Take each
+candidate quantified in at least 3 runs, with at least 3 fragments whose area sum is
+positive. Divide each run's fragment areas by the run's share of the candidate's total area.
+Per fragment, take the variance of those normalised areas over the runs, corrected by
+`F / (F - 1)` for the scale each run spent (`F` is the number of such fragments), and divide
+it by their mean. `phi` is the median of that ratio over the cells whose mean lies between
+the 20th and 60th percentile of the means. `phi_cell = phi / dt`, where `dt` is the median
+sample spacing within twice the halfwidth of every window centre. All areas are trapezoids in
+f64 over the window samples (one sample weighs 1).
+
+These are cross-run rules. They switch on the cross-run step
+(`QuantConfig::needs_cross_run_fit`). Pass 1 writes `fragment_quant` v6: the v5 export plus
+`pattern_area` (each fragment's area over the window), `observed` (the fragment has a trace)
+and `window_rt` (the window's retention times within twice the halfwidth of the centre, on
+the candidate's first row and empty on the others). `quant_pattern::fit_pattern`, reached
+through `fit_cross_run`, takes `phi`, `dt` and the observed fragments of each candidate from
+those tables. Pass 2 applies them. Without the step (`run` with one `--mzml`, or `quant`
+without `--cross-run-from`), and where `phi` cannot be estimated (fewer than 3 runs share a
+candidate, or a `phi` of 0 from runs that do not vary), both rules rank as `predicted` with
+`top_n_fragments`, with the window centre
+kept. They log that, and the reports record `"fragment_selection_fallback": "Predicted"`.
+When the fit ran, the reports record `pattern_fit` (`phi`, `dt_s`, the cells that estimated
+`phi`) and `candidates_pattern`. A candidate whose `S` is empty is not quantified
+(`no_pattern_fragments`). The rules model raw samples, so validation refuses them with
+`baseline_subtract` and `interference_envelope`, and they need the scan form of the fixed
+window. `run-experiment` refuses them where it refuses the other cross-run keys (grouped
+runs, per-run libraries).
+
+**Measured (2026-10-26), confirmation stage of a preregistered study.** These numbers come
+from the label-free pipelines: profile window, pattern rule and `normalisation =
+"stable_set"`. The identifications are fixed: the 0.8.0 second-pass identifications of one
+`nn_torch` seed per set, on second-pass chromatograms whose 3D traces were padded for
+quantification beyond the second-pass RT window. The engine's second pass records that pad
+only on runs with 1/K0 ("Quantification trace pad" under the second pass), so on a 3D run
+the fixed window can be clipped near the edge of the narrow second-pass RT window, and
+these numbers need the padded traces to reproduce. An
+offline prototype quantified them, and this stage reproduces it (below). Scoring follows
+ProteoBench 0.18.6 metrics. An ion counts when it is in at least 3 runs, and for a
+Generation Beta pair in both conditions; scores are unfilled. The sets were held out from
+development: ProteoBench Astral and Q Exactive AIF seeds 1 and 2 (mean of the two), Low
+Input seeds 0 and 1, Generation Beta 50 ng and 250 pg seed 0, and diaPASEF seed 0. Astral
+and AIF were developed on seed 0 of the same six raw files. The reference is the default
+(`observed_area`, apex window). `predicted` is the top-3 rule, and on diaPASEF the
+configured recipe (`configs/examples/diapasef.json`) is listed as well.
+
+| set | species-weighted \|eps\| default / `predicted` / `pattern_fit` / `pattern_profile` | global \|eps\| | median CV | human SD |
+|---|---|---|---|---|
+| Astral | 0.3389 / 0.2859 / 0.2495 / 0.2588 | 0.2273 / 0.2372 / 0.1907 / 0.1867 | 0.1431 / 0.1647 / 0.1370 / 0.1312 | 0.433 / 0.478 / 0.369 / 0.362 |
+| Q Exactive AIF | 0.3258 / 0.2501 / 0.2039 / 0.2075 | 0.1981 / 0.1838 / 0.1534 / 0.1480 | 0.3212 / 0.3215 / 0.1552 / 0.1484 | 0.839 / 0.903 / 1.026 / 0.981 |
+| Low Input | 0.6043 / 0.4689 / 0.4757 / 0.5013 | 0.4782 / 0.4354 / 0.3357 / 0.3406 | 0.1794 / 0.1971 / 0.1355 / 0.1291 | 0.470 / 0.512 / 0.383 / 0.371 |
+| Generation Beta 50 ng A/B | 0.3514 / 0.2761 / 0.2595 / 0.2733 | 0.2025 / 0.2077 / 0.1655 / 0.1638 | 0.1705 / 0.1963 / 0.1615 / 0.1552 | 0.400 / 0.433 / 0.332 / 0.330 |
+| Generation Beta 250 pg A/B | 0.5176 / 0.4714 / 0.3838 / 0.3917 | 0.3955 / 0.4058 / 0.2383 / 0.2368 | 0.2276 / 0.2626 / 0.2129 / 0.2062 | 0.543 / 0.596 / 0.457 / 0.456 |
+| diaPASEF | 0.3548 / 0.2779 / 0.2617 / 0.3023 | 0.1379 / 0.1363 / 0.1191 / 0.1155 | 0.0832 / 0.0875 / 0.0735 / 0.0680 | 0.230 / 0.232 / 0.205 / 0.191 |
+| diaPASEF, recipe | 0.2024 | 0.1360 | 0.0873 | 0.305 |
+
+The parts, each on its own and on the same sets. The window centre takes `predicted` from
+0.286 to 0.284 species-weighted on Astral, from 0.250 to 0.227 on AIF, from 0.469 to 0.466
+on Low Input and from 0.278 to 0.269 on diaPASEF, and from 0.276 to 0.278 on Generation
+Beta 50 ng. On that window, `pattern_fit` takes it to 0.258 on Astral and 0.207 on AIF. On
+Low Input it gives 0.481, worse than `predicted`. The stable-set normalisation then moves
+the global error and the CV most (below).
+
+What the table does not show:
+
+- Neither pipeline met the preregistered decision rules. Both fail the AIF human SD unit,
+  and against the recipe they fail the diaPASEF species-weighted unit, so neither is a
+  default.
+- The AIF human SD rises. A later check on the same identifications placed the increase in
+  the human ions whose MS1 isotope trace also changes 3 to 8 fold between the conditions:
+  identification or assignment outliers, which the default compresses. On human ions with
+  an MS1 ratio within 0.5 log2, the study's leading pipelines (these, with a censored
+  condition mean on top) were more precise than the default.
+- The pattern rules carry a bias that follows the condition-specific mismatch between the
+  observed and the library pattern: 0.1 to 0.3 log2 on human ions in the outer quintiles of
+  that mismatch, smaller under `pattern_profile` than under `pattern_fit`. `predicted`
+  carries it too.
+- The diaPASEF recipe keeps the better species-weighted error through its experiment
+  background. The pattern rules refuse a baseline. A background on top of the pattern fit
+  was an unregistered lead that closed the gap on diaPASEF and cost precision on Astral.
+- The Generation Beta 250 pg compression of transferred low-load values remains.
+- A censored condition mean that the study also confirmed was not ported. It needs the
+  condition labels, and in data with no true change it creates ratios of about 0.2 log2 on
+  the ions with a missing run.
+
+Port check. On the fixed identifications and padded chromatograms of Astral and AIF seed 0
+(the development pair), and of Low Input seed 0 and Generation Beta 50 ng seed 0 (held
+out), `quant` and `quant-normalise` built from this code gave the prototype's quantities
+for every row (748,454, 533,158, 246,897 and 2,100,502 rows). The largest relative
+difference was 3.9e-15, with no row quantified by one and not the other. `phi` and `dt` were
+identical, and every ProteoBench score agreed to 4e-15. `window_centre = profile` with
+`predicted` was identical to the bit. Unit tests repeat both on a synthetic experiment
+whose reference values the prototype computed (`quant::pattern_tests`,
+`quant_norm::tests::stable_set_reproduces_the_prototype`).
+
+Cost, with 16 threads on fixed identifications: pass 1, pass 2 and the normalisation took
+29 s for the six Astral runs and 192 s for the 18 Generation Beta 50 ng runs. Most of the
+latter is the standalone CLI refitting the cross-run fit in each pass-2 call (9 s each),
+which `run-experiment` does once.
+
 ### quant-lfq (`quant.rs:657`, `run_lfq_combine`)
 
 Reads each input table and builds `data: protein_group -> feature_key -> Vec<Option<f64>>`
@@ -632,6 +800,78 @@ With a single input, `run_lfq_combine` reduces to the per-run sum.
 If no positive feature is complete across all runs, `MedianRatio` returns identity
 factors (`1.0`) without estimating a scale correction. Inspect the logged
 `size_factors`; identity may mean either balanced data or no usable complete cases.
+
+`MedianRatio` is blind to sample composition. On a mixed-proteome design every
+complete-case feature of a changed species pulls the median, so the factors shift every
+species, the background included, and the gaps between species do not change.
+
+### Cross-run normalisation (`quant_norm.rs`, `quant.normalisation`, opt-in)
+
+`peptide_quant.quantity` is a raw area. A run that was loaded or sprayed more carries
+larger quantities for every precursor, and the deviation depends on retention time.
+`quant.normalisation = "stable_set"` (default `off`) estimates one log2 shift per run as a
+function of retention time, after per-run quant in `run-experiment`, or on existing
+tables with `mumdia quant-normalise --inputs ... --outputs ... --shifts-out ...`. The
+estimator (`quant_stable.rs`) follows the per-run retention-time curve of a stable set of
+ions, selected by their profile across the runs. An ion is one `(peptidoform, charge)`, with
+log2 quantity `y` in a run; duplicate rows of one ion in a run keep the largest quantity.
+
+1. Deviations are leave-one-out. The reference of an ion in run `j` is the median over the
+   other runs of `y - s_r(rt)`, given at least `max(2, ceil(n_runs / 2)) - 1` other runs.
+   The deviation is `y_j` minus that reference, so a run never enters its own reference.
+2. A first pass fits every run on the deviations of all its ions (step 4).
+3. Three passes then select a stable set first. The complete ions (quantified in every run)
+   give `D = (y - s)` less the ion's mean over the runs. The most abundant half by mean
+   `y`, less the 5% with the largest `|D|`, gives the principal components of the run space.
+   Every composition effect of a design with `G` sample groups lies in a `G - 1`
+   dimensional subspace of it. The dimension `k` is the number of eigenvalues above 3
+   times their median (at least 1, at most `n_runs - 2`), or `normalisation_rank`. In that
+   subspace, a mean shift from the coordinate median finds the largest population: a
+   Gaussian kernel of bandwidth `sigma` (the per-element residual SD outside the
+   subspace), cut at 4 bandwidths, 200 steps at most. The stable ions are the complete ions
+   within `2 sigma` of it.
+4. Per run, on the fit ions. With fewer than 200 the run is not shifted. The global shift
+   is the median deviation. The curve takes the median deviation of `min(20, n / 200)`
+   equal-count retention-time bins at their median retention time, smoothed 1/4, 1/2, 1/4
+   when there are 3 or more bins, and is linear between the bins and constant beyond them.
+   With fewer than 2 bins the run takes the global shift, and so does a row without a
+   retention time.
+5. The fitted runs' global shifts are centred on their mean.
+
+`quantity_normalised = quantity / 2^shift`. The shifts report records, for each pass after
+the first, `k`, the eigenvalues, `sigma`, and the complete and stable ions. The bin count
+(20) and the minimum (200) are fixed. `quant-normalise` runs `stable_set` also when
+`quant.normalisation` is `off`. The estimator knows no conditions or species, so it cannot
+remove an offset that every ion of one condition shares, whatever its species.
+
+`peptide_quant` and the `quantity_<run>` columns of the experiment `peptides.tsv` are not
+changed. A single-run `run` writes no normalised table and warns. Off, nothing is written
+and no key enters the canonical configuration.
+
+The automatic `k` is the rule the method was confirmed with, and it is fragile. On every Q
+Exactive AIF set it chose 2 under the pattern rules, where the design has two conditions.
+The stable set then shrank from about 37,500 to 7,800 ions, and part of the AIF run offsets
+was taken for composition. Fixing `k` at `G - 1 = 1` (`normalisation_rank = 1`) lowered
+the AIF median CV under `pattern_fit` from 0.155 to 0.142 (post hoc); the other sets moved by
+at most 0.001. Setting the rank needs the number of sample groups, but not which run belongs
+to which. The estimate assumes that the largest population of ions is unchanged. On Low
+Input the human background changes by +0.263 log2, and the method still moved the human
+median toward it (-0.13 to -0.03) and improved every score there. On Generation Beta 250 pg
+it removed a -0.30 human offset of condition A, which exposed the compression of the
+E. coli ratio that the offset had hidden.
+
+Measured on the same fixed identifications as the pattern rules (table under
+[Profile-centred window and pattern fit](#profile-centred-window-and-pattern-fit)). Under
+`pattern_fit`, the stable set moved the global error from 0.205 to 0.191 on Astral, from
+0.163 to 0.153 on AIF, from 0.413 to 0.336 on Low Input and from 0.376 to 0.238 on
+Generation Beta 250 pg A/B, and the AIF median CV from 0.326 to 0.155. On the default rule
+it took the AIF CV from 0.321 to 0.152.
+
+The cross-run MaxLFQ keeps reading `quantity` with its median-ratio factors unless
+`normalisation_lfq = true`, because the method was measured on precursor quantities only.
+With it, MaxLFQ reads `quantity_normalised` with `NormalizeMethod::None` in place of
+`quantity` with `MedianRatio`. Status: benchmark-gated. It changes reported normalised
+quantities only, never an identification.
 
 ### align (`align.rs:53`, `run`)
 
@@ -1023,7 +1263,11 @@ FDR/reporting).
   winners only (`rescore.rs:721-728`). For experiment-wide rescoring, slice by
   `source` and normally use `RunPsmQ`; `q_filter` alone does not select the run.
   `run-experiment` ignores this field and forces `PsmQ` (`run_experiment.rs:498`).
-- `fragment_selection` (`ObservedArea`): `ObservedArea`, `Predicted` or `CrossRun`.
+- `fragment_selection` (`ObservedArea`): `ObservedArea`, `Predicted`, `CrossRun`,
+  `PatternFit` or `PatternProfile`.
+- `window_centre` (`Apex`): `Apex` or `Profile`, the profile-centred fixed window
+  ([Profile-centred window and pattern fit](#profile-centred-window-and-pattern-fit));
+  omitted from the canonical configuration at its default.
 - `baseline_source` (`Run`): `Run` or `Experiment` (needs `baseline_subtract`).
 - `fixed_scan_halfwidth_scale` (0, off): the per-candidate width of the cross-run step.
   The last two are omitted from the canonical configuration at their defaults, and all
@@ -1033,6 +1277,12 @@ FDR/reporting).
 **`quant-lfq`** takes no config struct; `--method` (maxlfq/directlfq) and `--normalize`
 (median_ratio/median/none, parsed by `NormalizeMethod::from_token`, `config.rs:754`)
 are CLI args. Default normalize is `median_ratio`.
+
+**Cross-run normalisation** (`quant.normalisation`, default `off`, or `stable_set`) and its
+settings `normalisation_rank` (unset, automatic) and `normalisation_lfq` (false) are read by
+`run-experiment` and `quant-normalise`; all three are omitted from the canonical
+configuration at their defaults. See
+[Cross-run normalisation](#cross-run-normalisation-quant_normrs-quantnormalisation-opt-in).
 
 **align** reads `rt_im_train.q_train` (0.01, `config.rs:326`) as the anchor cutoff;
 `grid_n` is hardcoded to 100 in `main.rs:667` and the LOESS span to 0.4 in `align.rs:93`.

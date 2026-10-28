@@ -200,6 +200,9 @@ def main() -> int:
     ap.add_argument("--species", default=",".join(SPECIES),
                     help="species flags of the module, for the summary only (default HUMAN,YEAST,ECOLI; "
                          "the Low Input module needs HUMAN,YEAST)")
+    ap.add_argument("--quantity-column", default="quantity",
+                    help="intensity column: quantity (default), or quantity_normalised of "
+                         "peptide_quant_normalised tables (quant.normalisation)")
     a = ap.parse_args()
 
     specs = [s.split("=", 1) for s in a.runs]
@@ -229,6 +232,8 @@ def main() -> int:
         t = pq.read_table(path).to_pandas()
         n0 = len(t)
         t = t[~t["peptidoform"].str.startswith("DECOY_")]
+        if a.quantity_column != "quantity":
+            t = t.drop(columns=["quantity"]).rename(columns={a.quantity_column: "quantity"})
         t = t[t["quantity"].notna() & (t["quantity"] > 0)]
         if "n_fragments_used" in t.columns:
             t = t[t["n_fragments_used"] >= a.min_fragments]
