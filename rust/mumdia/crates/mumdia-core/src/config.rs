@@ -1392,6 +1392,11 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+/// A `true` flag, which the canonical configuration omits for a key whose default is on.
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
 /// A number left at 0 ("off"), which the canonical configuration omits for keys added
 /// after the configuration hash was frozen for their section.
 fn is_zero_f64(v: &f64) -> bool {
@@ -2677,6 +2682,9 @@ pub struct QuantConfig {
     /// 2026-08-26: CV 0.163 -> 0.112 on 6/6 ions at top-3. Benchmark-gated.
     /// `cross_run` weights each fragment by its consistency across the runs of an
     /// experiment ([`FragmentSelection::CrossRun`]); benchmark-gated as well.
+    /// `pattern_fit` and `pattern_profile` fit the window samples to the library pattern with
+    /// one dispersion fitted over the runs of an experiment ([`FragmentSelection::PatternFit`],
+    /// [`FragmentSelection::PatternProfile`]); benchmark-gated.
     pub fragment_selection: FragmentSelection,
     /// When > 0, integrate each fragment over the `2k+1` scans centred on the
     /// identification apex instead of the descent-walk window (`bound_peak`
@@ -2725,6 +2733,81 @@ pub struct QuantConfig {
     /// canonical configuration at its default.
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub fixed_scan_halfwidth_scale: f64,
+    /// Cross-run normalisation of the per-run precursor quantities, by `run-experiment`
+    /// after per-run quant and by `mumdia quant-normalise`. `off` (default): none.
+    /// `stable_set`: one log2 shift per run and retention-time bin, the median deviation of a
+    /// stable set of ions, those whose profile across the runs belongs to the largest
+    /// population of a principal-component subspace of the run space (docs/12, "Cross-run
+    /// normalisation"). The result is a separate table per run,
+    /// `peptide_quant_normalised.parquet` (`quantity_normalised`), next to an unchanged
+    /// `peptide_quant.parquet`, plus the fitted shifts in `quant_normalisation.parquet`.
+    /// Benchmark-gated. Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "CrossRunNormalisation::is_off")]
+    pub normalisation: CrossRunNormalisation,
+    /// The cross-run MaxLFQ of `run-experiment` reads `quantity_normalised` without its own
+    /// median-ratio size factors, in place of `quantity` with them. Off by default, because
+    /// the normalisation was measured on precursor quantities only and its effect on protein
+    /// quantities is unmeasured. Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub normalisation_lfq: bool,
+    /// `stable_set` only: the dimension of the subspace of the run space that holds the
+    /// composition effects, fixed. Unset (the default), each iteration counts the
+    /// eigenvalues of the most abundant complete ions' deviations above 3 times their
+    /// median (at least 1, at most `n_runs - 2`), the rule the method was confirmed with.
+    /// That count is fragile: on Q Exactive AIF it chose 2 where the design has two
+    /// conditions (docs/12, "Cross-run normalisation"), so a design with `G` sample groups
+    /// can fix it at `G - 1`. Must be >= 1. Omitted from the canonical configuration when
+    /// unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalisation_rank: Option<usize>,
+    /// Where the fixed scan window is centred. `apex` (default): on the sample nearest the
+    /// identification apex. `profile`: on the centre of the 3-sample block, within 2 samples
+    /// of that sample, with the largest summed raw intensity of the 6 fragments with the
+    /// highest library intensity (ties to the smaller shift), one centre for all of the
+    /// candidate's fragments (docs/12, "Profile-centred window and pattern fit"). The
+    /// identification apex and `integration_apex_rt` do not move; `integration_lo_rt` and
+    /// `integration_hi_rt` report the shifted window. Needs the scan form of the fixed window
+    /// (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`, `fixed_scan_halfwidth_scale = 0`).
+    /// Benchmark-gated. Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "WindowCentre::is_apex")]
+    pub window_centre: WindowCentre,
+}
+
+/// Centre of the fixed scan window. See [`QuantConfig::window_centre`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowCentre {
+    /// The sample nearest the identification apex (default).
+    #[default]
+    Apex,
+    /// The largest 3-sample block of the summed top-6 library fragments within 2 samples.
+    Profile,
+}
+
+impl WindowCentre {
+    /// The default, which the canonical configuration omits.
+    pub fn is_apex(&self) -> bool {
+        *self == WindowCentre::Apex
+    }
+}
+
+/// Cross-run normalisation of precursor quantities. See [`QuantConfig::normalisation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossRunNormalisation {
+    /// No normalisation table is written (default).
+    #[default]
+    Off,
+    /// Per-run, retention-time-binned median of the log2 deviations of a stable set of
+    /// ions, selected by their profile across the runs (`stages::quant_stable`).
+    StableSet,
+}
+
+impl CrossRunNormalisation {
+    /// The default, which the canonical configuration omits.
+    pub fn is_off(&self) -> bool {
+        *self == CrossRunNormalisation::Off
+    }
 }
 
 impl QuantConfig {
@@ -2732,9 +2815,16 @@ impl QuantConfig {
     /// pass over every run, a fit over their fragment tables, and a second pass with it.
     /// The one trigger of that step.
     pub fn needs_cross_run_fit(&self) -> bool {
-        self.fragment_selection == FragmentSelection::CrossRun
+        self.fragment_selection.uses_cross_run_weights()
+            || self.fragment_selection.uses_pattern_fit()
             || self.baseline_source == BaselineSource::Experiment
             || self.fixed_scan_halfwidth_scale > 0.0
+    }
+
+    /// Whether the cross-run MaxLFQ of `run-experiment` reads the normalised quantity
+    /// ([`QuantConfig::normalisation_lfq`]), given that the normalisation ran.
+    pub fn lfq_reads_normalised(&self) -> bool {
+        !self.normalisation.is_off() && self.normalisation_lfq
     }
 }
 
@@ -2754,6 +2844,41 @@ pub enum FragmentSelection {
     /// `--cross-run-from`, a candidate with no positive weighted area), `predicted`
     /// applies, with `top_n_fragments`.
     CrossRun,
+    /// Fit the window samples of the candidate's 10 fragments with the largest library
+    /// intensity (observed in at least one run of the experiment) to the library pattern
+    /// `predicted_intensity^1.5`, in two robust levels: a rank-1 fragment x time model whose
+    /// cells are winsorised at the model plus one standard deviation, then a fit of the
+    /// winsorised areas to the pattern, both with Huber weights on the excess over the model
+    /// and a noise variance `phi mu + (0.5 mu)^2 + phi^2`. `phi` is one dispersion per
+    /// experiment, the variance over mean of the run-normalised fragment areas of every
+    /// candidate in at least 3 runs, so the rule needs the cross-run step of
+    /// `run-experiment` and at least 3 runs (docs/12, "Profile-centred window and pattern
+    /// fit"). Without the step, or where `phi` cannot be estimated, `predicted` applies,
+    /// with `top_n_fragments`. Needs the scan form of the fixed window and refuses the
+    /// baseline and the envelope. Benchmark-gated.
+    PatternFit,
+    /// As `pattern_fit`, but the quantity is the integral of the rank-1 model's elution
+    /// profile over the window (the first level alone), times the pattern scale. Same
+    /// needs and fallbacks. Benchmark-gated.
+    PatternProfile,
+}
+
+impl FragmentSelection {
+    /// Whether the cross-run step fits one weight per (candidate, fragment) for this rule.
+    pub fn uses_cross_run_weights(self) -> bool {
+        self == Self::CrossRun
+    }
+
+    /// Whether the cross-run step fits the pattern model's dispersion and fragment sets for
+    /// this rule.
+    pub fn uses_pattern_fit(self) -> bool {
+        matches!(self, Self::PatternFit | Self::PatternProfile)
+    }
+
+    /// Whether this rule ranks by `predicted_intensity`, itself or in its fallback.
+    pub fn ranks_by_predicted(self) -> bool {
+        !matches!(self, Self::ObservedArea)
+    }
 }
 
 /// Source of the flank background level. See [`QuantConfig::baseline_source`].
@@ -2795,6 +2920,10 @@ impl Default for QuantConfig {
             fixed_window_s: 0.0,
             baseline_source: BaselineSource::Run,
             fixed_scan_halfwidth_scale: 0.0,
+            normalisation: CrossRunNormalisation::Off,
+            normalisation_lfq: false,
+            normalisation_rank: None,
+            window_centre: WindowCentre::Apex,
         }
     }
 }
@@ -3812,11 +3941,6 @@ fn is_default_retrace_im_half_width(v: &f64) -> bool {
     *v == RetraceConfig::default().im_half_width
 }
 
-/// A `true` flag, which the canonical configuration omits for a key whose default is on.
-fn is_true(v: &bool) -> bool {
-    *v
-}
-
 impl RetraceConfig {
     /// Whether every key is at its default, so the canonical configuration omits the
     /// section.
@@ -4027,6 +4151,39 @@ impl Config {
                  it chooses is a number of scans."
                     .into(),
             ));
+        }
+        if self.quant.normalisation_rank == Some(0) {
+            return Err(Invalid(
+                "quant.normalisation_rank must be >= 1 (unset chooses it per iteration).".into(),
+            ));
+        }
+        let scan_window =
+            self.quant.fixed_scan_halfwidth > 0 && self.quant.fixed_window_s == 0.0 && scale == 0.0;
+        if self.quant.window_centre == WindowCentre::Profile && !scan_window {
+            return Err(Invalid(
+                "quant.window_centre = profile moves the fixed scan window by whole samples, \
+                 so it needs quant.fixed_scan_halfwidth > 0, quant.fixed_window_s = 0 and \
+                 quant.fixed_scan_halfwidth_scale = 0."
+                    .into(),
+            ));
+        }
+        if self.quant.fragment_selection.uses_pattern_fit() {
+            if !scan_window {
+                return Err(Invalid(format!(
+                    "quant.fragment_selection = {:?} fits the samples of the fixed scan \
+                     window, so it needs quant.fixed_scan_halfwidth > 0, \
+                     quant.fixed_window_s = 0 and quant.fixed_scan_halfwidth_scale = 0.",
+                    self.quant.fragment_selection
+                )));
+            }
+            if self.quant.baseline_subtract || self.quant.interference_envelope {
+                return Err(Invalid(format!(
+                    "quant.fragment_selection = {:?} models the raw window samples, so it \
+                     does not combine with quant.baseline_subtract or \
+                     quant.interference_envelope.",
+                    self.quant.fragment_selection
+                )));
+            }
         }
         if scale > 0.0 && self.quant.baseline_source != BaselineSource::Experiment {
             return Err(Invalid(
@@ -4985,6 +5142,30 @@ mod tests {
         assert!(json.contains(r#""im_window_multiplier":1.0"#), "{json}");
     }
 
+    /// The cross-run normalisation is off by default and none of its keys is part of the
+    /// canonical configuration at its default; set, each one is, and an unknown method is
+    /// refused.
+    #[test]
+    fn cross_run_normalisation_defaults_stay_out_of_the_canonical_json() {
+        let c = Config::default();
+        assert_eq!(c.quant.normalisation, CrossRunNormalisation::Off);
+        assert!(c.validate().is_ok());
+        assert!(!c.canonical_json().contains("normalisation"));
+        let on: QuantConfig =
+            serde_json::from_str(r#"{"normalisation": "stable_set", "normalisation_lfq": true}"#)
+                .unwrap();
+        assert_eq!(on.normalisation, CrossRunNormalisation::StableSet);
+        let json = serde_json::to_string(&on).unwrap();
+        assert!(json.contains(r#""normalisation":"stable_set""#), "{json}");
+        assert!(json.contains(r#""normalisation_lfq":true"#), "{json}");
+        for gone in [
+            r#"{"normalisation": "rt_mode"}"#,
+            r#"{"normalisation": "median"}"#,
+        ] {
+            assert!(serde_json::from_str::<QuantConfig>(gone).is_err(), "{gone}");
+        }
+    }
+
     /// `mbr.second_pass_prefilter_keep_decoys` unset leaves the canonical configuration as it
     /// was and gives the second pass `rescore` itself; set, it replaces only the prefilter of
     /// the second-pass rescore, and it is validated like `rescore.prefilter_keep_decoys`.
@@ -5663,6 +5844,66 @@ mod tests {
         assert!(c.contains(r#""fragment_selection":"cross_run""#), "{c}");
         assert!(c.contains(r#""baseline_source":"experiment""#), "{c}");
         assert!(c.contains(r#""fixed_scan_halfwidth_scale":2.5"#), "{c}");
+    }
+
+    /// The profile-centred window, the pattern rules and the stable-set normalisation parse,
+    /// stay out of the canonical configuration at their defaults, and are refused where their
+    /// window or their inputs do not exist.
+    #[test]
+    fn pattern_rules_window_centre_and_stable_set_parse_and_validate() {
+        let d = Config::default();
+        let canon = d.canonical_json();
+        for key in [
+            "window_centre",
+            "normalisation_rank",
+            "normalisation_lfq",
+            "pattern",
+        ] {
+            assert!(!canon.contains(key), "{key} in {canon}");
+        }
+        assert!(!d.quant.lfq_reads_normalised() || d.quant.normalisation.is_off());
+        let c = Config::from_json(
+            r#"{"quant":{"fragment_selection":"pattern_fit","window_centre":"profile",
+                "normalisation":"stable_set","normalisation_rank":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.quant.fragment_selection, FragmentSelection::PatternFit);
+        assert_eq!(c.quant.window_centre, WindowCentre::Profile);
+        assert_eq!(c.quant.normalisation, CrossRunNormalisation::StableSet);
+        assert!(c.quant.needs_cross_run_fit());
+        assert!(c.quant.fragment_selection.ranks_by_predicted());
+        assert!(!c.quant.fragment_selection.uses_cross_run_weights());
+        // MaxLFQ reads the stable-set quantities only when asked to.
+        assert!(!c.quant.lfq_reads_normalised());
+        let cj = c.canonical_json();
+        for key in [
+            r#""fragment_selection":"pattern_fit""#,
+            r#""window_centre":"profile""#,
+            r#""normalisation":"stable_set""#,
+            r#""normalisation_rank":1"#,
+        ] {
+            assert!(cj.contains(key), "{key} missing from {cj}");
+        }
+        let p = Config::from_json(r#"{"quant":{"fragment_selection":"pattern_profile"}}"#).unwrap();
+        assert!(p.quant.fragment_selection.uses_pattern_fit());
+        assert!(p.quant.needs_cross_run_fit());
+        let off: QuantConfig = serde_json::from_str(r#"{"normalisation_lfq":true}"#).unwrap();
+        assert!(!off.lfq_reads_normalised());
+        let on: QuantConfig =
+            serde_json::from_str(r#"{"normalisation":"stable_set","normalisation_lfq":true}"#)
+                .unwrap();
+        assert!(on.lfq_reads_normalised());
+        for bad in [
+            r#"{"quant":{"normalisation_rank":0}}"#,
+            r#"{"quant":{"window_centre":"profile","fixed_scan_halfwidth":0}}"#,
+            r#"{"quant":{"window_centre":"profile","fixed_window_s":5.0}}"#,
+            r#"{"quant":{"fragment_selection":"pattern_fit","fixed_scan_halfwidth":0}}"#,
+            r#"{"quant":{"fragment_selection":"pattern_fit","baseline_subtract":true}}"#,
+            r#"{"quant":{"fragment_selection":"pattern_profile","interference_envelope":true}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} accepted");
+        }
+        assert!(Config::from_json(r#"{"quant":{"window_centre":"apex_rt"}}"#).is_err());
     }
 
     /// Each of the three keys alone is the trigger of the cross-run step, and nothing else is.

@@ -246,10 +246,10 @@ Licence identifiers by crate count:
 | `zlib-rs` | 0.6.8 | Zlib | - | [https://github.com/trifectatechfoundation/zlib-rs](https://github.com/trifectatechfoundation/zlib-rs) |
 | `zmij` | 1.0.21 | MIT | - | [https://github.com/dtolnay/zmij](https://github.com/dtolnay/zmij) |
 | `zstd` | 0.13.3 | MIT | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
-| `zstd` | 0.14.2 | BSD-3-Clause | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
+| `zstd` | 0.14.3 | BSD-3-Clause | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
 | `zstd-safe` | 7.3.0 | BSD-3-Clause | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
-| `zstd-safe` | 8.1.0 | BSD-3-Clause | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
-| `zstd-sys` | 2.1.1+zstd.1.5.7 | BSD-3-Clause | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
+| `zstd-safe` | 8.2.0 | BSD-3-Clause | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
+| `zstd-sys` | 2.1.2+zstd.1.5.7 | BSD-3-Clause | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
 
 ## Licence texts
 
@@ -992,7 +992,7 @@ Notices recovered for 149 of 208 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2016 Alexandre Bury
 
-**zstd 0.14.2**
+**zstd 0.14.3**
 
 - Copyright (c) 2026, Alexandre Bury
 
@@ -1000,11 +1000,11 @@ Notices recovered for 149 of 208 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2026, Alexandre Bury
 
-**zstd-safe 8.1.0**
+**zstd-safe 8.2.0**
 
 - Copyright (c) 2026, Alexandre Bury
 
-**zstd-sys 2.1.1+zstd.1.5.7**
+**zstd-sys 2.1.2+zstd.1.5.7**
 
 - Copyright (c) 2026, Alexandre Bury
 - Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.

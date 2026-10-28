@@ -928,6 +928,16 @@ documented. Every value is NaN for a candidate integrated without a fixed window
 | `flank_mean_h3` .. `flank_mean_h7` | Float64 | no | counts | the same mean beyond a window of +/-3 to +/-7 scans around the apex |
 | `peak_hwhm` | Float64 | no | scans | the candidate's half width at half maximum in this run: of its summed fragment trace within +/-7 scans of the apex, each fragment less its `flank_mean`; one value per candidate, repeated on its rows |
 
+Under a pattern rule (`quant.fragment_selection = pattern_fit` or `pattern_profile`) the
+export is v6: v5 plus these columns, for the pattern fit of the cross-run step
+(docs/12_quant_lfq_align_mbr_report_audit.md, "Profile-centred window and pattern fit").
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `pattern_area` | Float64 | no | intensity x s | the fragment's trapezoid area over the window samples around the candidate's window centre, in f64; 0 without a trace |
+| `observed` | Boolean | no | - | the fragment has a trace in this run |
+| `window_rt` | List<Float32> | no | s | the candidate's retention times within twice the halfwidth of the window centre, on the candidate's first row; empty on its other rows |
+
 ### peak-bounds diagnostic (optional, `quant.rs:421-429`)
 
 Written only when `out_peak_bounds` is set and `bound_peak` is on.

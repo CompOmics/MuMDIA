@@ -3643,7 +3643,7 @@
       "optional": false,
       "default": "observed_area",
       "default_text": "`observed_area`",
-      "help": "Which fragments enter the top-N sum. `observed_area` (default, legacy) ranks by the integrated area itself, which preferentially selects interfered fragments (their areas are inflated) and so varies run to run. `predicted` ranks by the library (predicted or empirical) fragment intensity, a per-precursor constant, so every run sums the same fragments. Astral HYE 2026-08-26: CV 0.163 -> 0.112 on 6/6 ions at top-3. Benchmark-gated. `cross_run` weights each fragment by its consistency across the runs of an experiment (`FragmentSelection::CrossRun`); benchmark-gated as well.",
+      "help": "Which fragments enter the top-N sum. `observed_area` (default, legacy) ranks by the integrated area itself, which preferentially selects interfered fragments (their areas are inflated) and so varies run to run. `predicted` ranks by the library (predicted or empirical) fragment intensity, a per-precursor constant, so every run sums the same fragments. Astral HYE 2026-08-26: CV 0.163 -> 0.112 on 6/6 ions at top-3. Benchmark-gated. `cross_run` weights each fragment by its consistency across the runs of an experiment (`FragmentSelection::CrossRun`); benchmark-gated as well. `pattern_fit` and `pattern_profile` fit the window samples to the library pattern with one dispersion fitted over the runs of an experiment (`FragmentSelection::PatternFit`, `FragmentSelection::PatternProfile`); benchmark-gated.",
       "gates": [
         "benchmark-gated"
       ],
@@ -3651,7 +3651,9 @@
       "choices": [
         "observed_area",
         "predicted",
-        "cross_run"
+        "cross_run",
+        "pattern_fit",
+        "pattern_profile"
       ]
     },
     {
@@ -3754,6 +3756,70 @@
         "benchmark-gated"
       ],
       "source_struct": "QuantConfig"
+    },
+    {
+      "path": "quant.normalisation",
+      "name": "normalisation",
+      "section": "quant",
+      "rust_type": "CrossRunNormalisation",
+      "kind": "enum",
+      "optional": false,
+      "default": "off",
+      "default_text": "`off`",
+      "help": "Cross-run normalisation of the per-run precursor quantities, by `run-experiment` after per-run quant and by `mumdia quant-normalise`. `off` (default): none. `stable_set`: one log2 shift per run and retention-time bin, the median deviation of a stable set of ions, those whose profile across the runs belongs to the largest population of a principal-component subspace of the run space (docs/12, \"Cross-run normalisation\"). The result is a separate table per run, `peptide_quant_normalised.parquet` (`quantity_normalised`), next to an unchanged `peptide_quant.parquet`, plus the fitted shifts in `quant_normalisation.parquet`. Benchmark-gated. Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "QuantConfig",
+      "choices": [
+        "off",
+        "stable_set"
+      ]
+    },
+    {
+      "path": "quant.normalisation_lfq",
+      "name": "normalisation_lfq",
+      "section": "quant",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "The cross-run MaxLFQ of `run-experiment` reads `quantity_normalised` without its own median-ratio size factors, in place of `quantity` with them. Off by default, because the normalisation was measured on precursor quantities only and its effect on protein quantities is unmeasured. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "QuantConfig"
+    },
+    {
+      "path": "quant.normalisation_rank",
+      "name": "normalisation_rank",
+      "section": "quant",
+      "rust_type": "Option<usize>",
+      "kind": "integer",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "`stable_set` only: the dimension of the subspace of the run space that holds the composition effects, fixed. Unset (the default), each iteration counts the eigenvalues of the most abundant complete ions' deviations above 3 times their median (at least 1, at most `n_runs - 2`), the rule the method was confirmed with. That count is fragile: on Q Exactive AIF it chose 2 where the design has two conditions (docs/12, \"Cross-run normalisation\"), so a design with `G` sample groups can fix it at `G - 1`. Must be >= 1. Omitted from the canonical configuration when unset.",
+      "gates": [],
+      "source_struct": "QuantConfig"
+    },
+    {
+      "path": "quant.window_centre",
+      "name": "window_centre",
+      "section": "quant",
+      "rust_type": "WindowCentre",
+      "kind": "enum",
+      "optional": false,
+      "default": "apex",
+      "default_text": "`apex`",
+      "help": "Where the fixed scan window is centred. `apex` (default): on the sample nearest the identification apex. `profile`: on the centre of the 3-sample block, within 2 samples of that sample, with the largest summed raw intensity of the 6 fragments with the highest library intensity (ties to the smaller shift), one centre for all of the candidate's fragments (docs/12, \"Profile-centred window and pattern fit\"). The identification apex and `integration_apex_rt` do not move; `integration_lo_rt` and `integration_hi_rt` report the shifted window. Needs the scan form of the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`, `fixed_scan_halfwidth_scale = 0`). Benchmark-gated. Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "QuantConfig",
+      "choices": [
+        "apex",
+        "profile"
+      ]
     },
     {
       "path": "mbr.strategy",
