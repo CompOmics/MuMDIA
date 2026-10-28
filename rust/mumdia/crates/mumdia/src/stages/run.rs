@@ -909,6 +909,12 @@ pub fn run(p: RunParams) -> Result<()> {
     let pep_q = d("peptide_quant.parquet");
     let pg_q = d("protein_group_quant.parquet");
     let frag_q = d("fragment_quant.parquet");
+    if !cfg.quant.normalisation.is_off() {
+        warn!(
+            "run: quant.normalisation is a cross-run step; a single run has no reference, so \
+             no normalised table is written (give several --mzml, or use quant-normalise)"
+        );
+    }
     info!(stage = %"quant", "run: stage start");
     let wq = quant::run_hashed(quant::QuantParams {
         psms_scored: &scored,
@@ -921,6 +927,7 @@ pub fn run(p: RunParams) -> Result<()> {
         config_hash: &ch,
         cross_run: None,
         export_cross_run: false,
+        first_pass_ids: None,
     })?;
     man.record(wq.peptide.record(
         artifact::PEPTIDE_QUANT.0,

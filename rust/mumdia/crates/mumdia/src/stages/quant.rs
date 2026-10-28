@@ -6,7 +6,7 @@
 //! multiple runs) reduce to a top-N sum; the method is a config strategy for
 //! later.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 
 use anyhow::{anyhow, Context as _, Result};
@@ -14,12 +14,13 @@ use arrow::array::{Array, Float32Array, StringArray, UInt32Array};
 use arrow::record_batch::RecordBatch;
 use mumdia_core::config::{
     BaselineSource, FragmentSelection, NormalizeMethod, PeakWindowMode, QuantConfig, QuantQColumn,
-    RollupMethod,
+    RollupMethod, WindowCentre,
 };
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{column_names, write_table, Col, ListF32, TableFile};
 
+use super::quant_pattern::{self, PatternFit, PatternInput, PatternQuantity};
 use crate::chromatograms::{
     Decoder, Layout, TraceCols, INTENSITY, INTENSITY_TRIMMED, RT, RT_AXIS, TRACE_LEN, TRACE_OFFSET,
 };
@@ -76,6 +77,35 @@ pub struct QuantParams<'a> {
     /// cross-run step, or by `quant --export-cross-run`. Never derived from the
     /// configuration, so a quant that does not ask for it writes `fragment_quant` v1.
     pub export_cross_run: bool,
+    /// The candidates of `psms_scored` that had a first-pass identification in this run,
+    /// set by `run-experiment` after a second pass under `mbr.first_pass_flag`
+    /// ([`first_pass_ids_of_run`]). `Some` adds the Boolean column `first_pass_id` to
+    /// `peptide_quant` and writes it as v3 ([`artifact::peptide_quant`]); `None` writes v2,
+    /// byte for byte.
+    pub first_pass_ids: Option<&'a BTreeSet<u32>>,
+}
+
+/// The `peptide_quant` v3 column that says whether the row's precursor had a first-pass
+/// identification in its run (`mbr.first_pass_flag`).
+pub const FIRST_PASS_ID: &str = "first_pass_id";
+
+/// The candidate ids of a second-pass run whose precursor the first pass identified in the
+/// same run: every id `c` of the empirical library whose entry `entry_of[c]` is in
+/// `first_pass_accepted` for `source` (`(source, first-pass candidate_id)` pairs at
+/// `run_psm_q <= mbr.q_anchor`, targets only). A decoy row maps to its paired target's
+/// entry, so it can be in the set too; quant reads target rows only, so that never reaches
+/// a quantity.
+pub fn first_pass_ids_of_run(
+    entry_of: &[u32],
+    first_pass_accepted: &BTreeSet<(u32, u32)>,
+    source: u32,
+) -> BTreeSet<u32> {
+    entry_of
+        .iter()
+        .enumerate()
+        .filter(|(_, &e)| first_pass_accepted.contains(&(source, e)))
+        .map(|(c, _)| c as u32)
+        .collect()
 }
 
 /// One value per (candidate, fragment name), fitted over every run of an experiment.
@@ -94,6 +124,10 @@ pub struct CrossRunFit {
     /// `fixed_scan_halfwidth_scale > 0`: the candidate's fixed-window scan halfwidth, in
     /// place of `fixed_scan_halfwidth`.
     pub halfwidth: Option<BTreeMap<u32, usize>>,
+    /// `fragment_selection = pattern_fit` or `pattern_profile`: the dispersion and the
+    /// observed fragments ([`quant_pattern::fit_pattern`]). `None` also when the rule was
+    /// asked for and `phi` could not be estimated, which falls back to `predicted`.
+    pub pattern: Option<PatternFit>,
 }
 
 /// Smallest scan halfwidth `fixed_scan_halfwidth_scale` chooses. The export carries the
@@ -978,14 +1012,48 @@ fn fixed_window_indices(
     // integrating one scan more than the nominal window asked for. Reachable when the
     // cycle time approaches the window width, or on a sparse observed-scan trace
     // (`extract.emit_window_grid = false`).
-    if hi - lo < 2 && rt.len() >= 2 {
-        if hi < rt.len() {
-            hi += 1;
+    at_least_two_samples(&mut lo, &mut hi, rt.len());
+    Some((lo, hi))
+}
+
+/// Widen `[lo, hi)` to two samples when it holds fewer and the trace has two: one sample
+/// to the right when there is one, else one to the left (see [`fixed_window_indices`]).
+fn at_least_two_samples(lo: &mut usize, hi: &mut usize, len: usize) {
+    if *hi - *lo < 2 && len >= 2 {
+        if *hi < len {
+            *hi += 1;
         } else {
-            lo = lo.saturating_sub(1);
+            *lo = lo.saturating_sub(1);
         }
     }
+}
+
+/// The scan form of the fixed window, `half` samples either side of sample `centre`
+/// (clipped to the trace, widened to two samples as [`fixed_window_indices`] does). `None`
+/// for an empty trace. The window of `quant.window_centre = profile`, whose centre is the
+/// apex sample moved by [`quant_pattern::profile_shift`].
+fn scan_window_at(len: usize, centre: usize, half: usize) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+    let centre = centre.min(len - 1);
+    let (mut lo, mut hi) = (centre.saturating_sub(half), (centre + half + 1).min(len));
+    at_least_two_samples(&mut lo, &mut hi, len);
     Some((lo, hi))
+}
+
+/// Per candidate, what phase 2 of [`run_hashed`] applied: the integration bounds and apex,
+/// the cross-run export's peak HWHM, the fragments whose experiment background fell back
+/// to the per-run quantile, the pattern rule's quantity (when the pattern fit is applied)
+/// and, under the pattern export, the window's retention times for the spacing fit.
+struct Applied {
+    lo_rt: f64,
+    hi_rt: f64,
+    apex: f64,
+    hwhm: f64,
+    bg_fallback: u32,
+    pattern: Option<PatternQuantity>,
+    window_rt: Vec<f32>,
 }
 
 /// True when `rt` is non-decreasing, non-negative and NaN-free, the property
@@ -1125,8 +1193,12 @@ fn select_fragment_areas(
     match selection {
         FragmentSelection::ObservedArea => summarize_fragment_areas(areas.map(|a| a.0), top_n),
         // `cross_run` reaches this ranking only as its fallback, for a candidate without a
-        // fitted weight or without a positive weighted area in this run.
-        FragmentSelection::Predicted | FragmentSelection::CrossRun => {
+        // fitted weight or without a positive weighted area in this run; `pattern_fit` and
+        // `pattern_profile` when no pattern fit is applied.
+        FragmentSelection::Predicted
+        | FragmentSelection::CrossRun
+        | FragmentSelection::PatternFit
+        | FragmentSelection::PatternProfile => {
             let Some((areas, preds)) = areas else {
                 return (None, 0, "no_fragment_traces");
             };
@@ -2519,13 +2591,9 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         }
     }
     let has_pred = has_pred.unwrap_or(false);
-    // `cross_run` ranks by the same column wherever it falls back to `predicted`.
-    if !has_pred
-        && matches!(
-            p.cfg.fragment_selection,
-            FragmentSelection::Predicted | FragmentSelection::CrossRun
-        )
-    {
+    // `cross_run` and the pattern rules rank by the same column wherever they fall back to
+    // `predicted`.
+    if !has_pred && p.cfg.fragment_selection.ranks_by_predicted() {
         anyhow::bail!(
             "quant.fragment_selection = {:?} ranks fragments by the \
              `predicted_intensity` column, which {} does not carry. Re-run `extract` to \
@@ -2545,9 +2613,20 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             fragment_selection = ?p.cfg.fragment_selection,
             baseline_source = ?p.cfg.baseline_source,
             "quant: the cross-run step did not run (a single run, or quant without \
-             --cross-run-from): fragment_selection = cross_run falls back to predicted with \
-             top_n_fragments, baseline_source = experiment to the per-run quantile, and \
+             --cross-run-from): fragment_selection = cross_run, pattern_fit or \
+             pattern_profile falls back to predicted with top_n_fragments, \
+             baseline_source = experiment to the per-run quantile, and \
              fixed_scan_halfwidth_scale to fixed_scan_halfwidth"
+        );
+    }
+    let pattern_fit: Option<&PatternFit> = p.cross_run.and_then(|x| x.pattern.as_ref());
+    if p.cfg.fragment_selection.uses_pattern_fit() && p.cross_run.is_some() && pattern_fit.is_none()
+    {
+        warn!(
+            fragment_selection = ?p.cfg.fragment_selection,
+            "quant: the cross-run step could not estimate the pattern dispersion (fewer than \
+             3 runs share a candidate, or the runs do not vary); the rule falls back to \
+             predicted with top_n_fragments"
         );
     }
     // The selective read wants the table's offset index, so that the pages holding no
@@ -2714,11 +2793,22 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     let mut flank_by_slot: Vec<f64> = vec![f64::NAN; x_len];
     let mut flank_h_by_slot: Vec<[f64; CROSS_RUN_HALFWIDTHS]> =
         vec![[f64::NAN; CROSS_RUN_HALFWIDTHS]; x_len];
+    // `quant.window_centre = profile` and the pattern rules, which validation confines to
+    // the scan form of the fixed window. The pattern export (the cross-run export under a
+    // pattern rule) adds each slot's pattern-window area and whether it has a trace.
+    let profile_centre = p.cfg.window_centre == WindowCentre::Profile && want_fixed;
+    let pattern_rule = p.cfg.fragment_selection.uses_pattern_fit() && want_fixed;
+    let pattern_export = export && pattern_rule;
+    let p_len = if pattern_export { index.rows.len() } else { 0 };
+    let mut parea_by_slot: Vec<f64> = vec![0.0; p_len];
+    let mut pobs_by_slot: Vec<bool> = vec![false; p_len];
     type Slots<'s> = (
         &'s mut [f64],
         &'s mut [f64],
         &'s mut [f64],
         &'s mut [[f64; CROSS_RUN_HALFWIDTHS]],
+        &'s mut [f64],
+        &'s mut [bool],
     );
     let mut slices: Vec<Slots> = Vec::with_capacity(index.len());
     {
@@ -2726,18 +2816,25 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         let mut crest: &mut [f64] = &mut corr_by_slot;
         let mut frest: &mut [f64] = &mut flank_by_slot;
         let mut hrest: &mut [[f64; CROSS_RUN_HALFWIDTHS]] = &mut flank_h_by_slot;
+        let mut prest: &mut [f64] = &mut parea_by_slot;
+        let mut orest: &mut [bool] = &mut pobs_by_slot;
         for ci in 0..index.len() {
             let n = index.cand_off[ci + 1] - index.cand_off[ci];
             let nx = if export { n } else { 0 };
+            let np = if pattern_export { n } else { 0 };
             let (head, tail) = rest.split_at_mut(n);
             let (chead, ctail) = crest.split_at_mut(nx);
             let (fhead, ftail) = frest.split_at_mut(nx);
             let (hhead, htail) = hrest.split_at_mut(nx);
-            slices.push((head, chead, fhead, hhead));
+            let (phead, ptail) = prest.split_at_mut(np);
+            let (ohead, otail) = orest.split_at_mut(np);
+            slices.push((head, chead, fhead, hhead, phead, ohead));
             rest = tail;
             crest = ctail;
             frest = ftail;
             hrest = htail;
+            prest = ptail;
+            orest = otail;
         }
     }
     // The second pass of the cross-run step: the experiment background per (candidate,
@@ -2746,10 +2843,10 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     let halfwidths = p.cross_run.and_then(|x| x.halfwidth.as_ref());
     // Per candidate: (lo_rt, hi_rt, integration_apex, peak HWHM for the export, fragments
     // whose experiment background was missing and fell back to the per-run quantile).
-    let applied: Vec<(f64, f64, f64, f64, u32)> = slices
+    let applied: Vec<Applied> = slices
         .par_iter_mut()
         .enumerate()
-        .map(|(ci, (out, cout, fout, hout))| {
+        .map(|(ci, (out, cout, fout, hout, pout, oout))| {
             let c = index.cids[ci];
             let rows = index.rows_of(ci);
             let (lo_rt, hi_rt, integration_apex) = if !p.cfg.bound_peak {
@@ -2802,17 +2899,69 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             let mut windows: Vec<Option<Vec<f32>>> = Vec::new();
             let mut summed = [0.0f64; 2 * CROSS_RUN_HALFWIDTH_MAX + 1];
             let mut bg_fallback = 0u32;
+            // The profile-centred window and the pattern rules work on the candidate's axis,
+            // the axis of its first row with a trace; a row on another axis is centred on its
+            // own nearest sample, moved by the same shift, and the pattern rules read it as a
+            // fragment without a trace.
+            let cand_axis: Option<u32> = if fixed && (profile_centre || pattern_rule) {
+                rows.iter()
+                    .map(|&i| store.axis_id[i])
+                    .find(|&a| a != NO_AXIS)
+            } else {
+                None
+            };
+            let cand_k =
+                cand_axis.map(|a| nearest_index(store.axis(a), integration_apex, store.rt_sorted));
+            let shift: isize = match (cand_axis, cand_k) {
+                (Some(a), Some(k)) if profile_centre => {
+                    let slots = quant_pattern::top_predicted_slots(
+                        &index.slot_pred[index.slots(ci)],
+                        quant_pattern::PROFILE_FRAGMENTS,
+                    );
+                    let mut prof = [0.0f64; 2 * quant_pattern::PROFILE_SPAN + 1];
+                    for &sl in &slots {
+                        let i = rows[sl];
+                        if store.axis_id[i] != a {
+                            continue;
+                        }
+                        let it = store.inten(i);
+                        for (j, acc) in prof.iter_mut().enumerate() {
+                            if let Some(idx) = (k + j).checked_sub(quant_pattern::PROFILE_SPAN) {
+                                if let Some(&v) = it.get(idx) {
+                                    if v.is_finite() {
+                                        *acc += v as f64;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    quant_pattern::profile_shift(&prof)
+                }
+                _ => 0,
+            };
+            let centre_on = |k: usize, len: usize| -> usize {
+                (k as isize + shift).clamp(0, len.saturating_sub(1) as isize) as usize
+            };
             for (slot, &i) in rows.iter().enumerate() {
                 let rt = store.rt(i);
                 let it = store.inten(i);
                 out[slot] = if fixed {
-                    match fixed_window_indices(
-                        rt,
-                        integration_apex,
-                        half,
-                        p.cfg.fixed_window_s,
-                        store.rt_sorted,
-                    ) {
+                    let window = if profile_centre {
+                        let k = match (cand_axis, cand_k) {
+                            (Some(a), Some(k)) if store.axis_id[i] == a => k,
+                            _ => nearest_index(rt, integration_apex, store.rt_sorted),
+                        };
+                        scan_window_at(rt.len(), centre_on(k, rt.len()), half)
+                    } else {
+                        fixed_window_indices(
+                            rt,
+                            integration_apex,
+                            half,
+                            p.cfg.fixed_window_s,
+                            store.rt_sorted,
+                        )
+                    };
+                    match window {
                         Some((lo, hi)) => {
                             flo = flo.min(rt[lo] as f64);
                             fhi = fhi.max(rt[hi - 1] as f64);
@@ -2891,20 +3040,93 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             } else {
                 (lo_rt, hi_rt)
             };
-            (lo_rt, hi_rt, integration_apex, hwhm, bg_fallback)
+            // The pattern rules: the window samples of every slot around the candidate's
+            // centre, for the export's areas and spacings and for the fitted quantity.
+            let mut pattern: Option<PatternQuantity> = None;
+            let mut window_rt: Vec<f32> = Vec::new();
+            if pattern_rule && (pattern_export || pattern_fit.is_some()) {
+                let nt = 2 * half + 1;
+                let n = rows.len();
+                let mut rtw = vec![f64::NAN; nt];
+                let mut x = vec![0.0f64; n * nt];
+                if let (Some(a), Some(k)) = (cand_axis, cand_k) {
+                    let ax = store.axis(a);
+                    let c = centre_on(k, ax.len());
+                    for (t, r) in rtw.iter_mut().enumerate() {
+                        if let Some(&v) = (c + t).checked_sub(half).and_then(|j| ax.get(j)) {
+                            *r = v as f64;
+                        }
+                    }
+                    for (slot, &i) in rows.iter().enumerate() {
+                        if store.axis_id[i] != a {
+                            continue;
+                        }
+                        let it = store.inten(i);
+                        for t in 0..nt {
+                            if let Some(&v) = (c + t).checked_sub(half).and_then(|j| it.get(j)) {
+                                if v.is_finite() {
+                                    x[slot * nt + t] = v as f64;
+                                }
+                            }
+                        }
+                    }
+                    if pattern_export {
+                        let lo = c.saturating_sub(2 * half);
+                        let hi = (c + 2 * half + 1).min(ax.len());
+                        window_rt = ax[lo..hi].to_vec();
+                    }
+                }
+                if pattern_export {
+                    let tw = quant_pattern::trapezoid_weights(&rtw);
+                    for (slot, &i) in rows.iter().enumerate() {
+                        pout[slot] =
+                            quant_pattern::weighted_area(&x[slot * nt..(slot + 1) * nt], &tw);
+                        oout[slot] = !store.rt(i).is_empty();
+                    }
+                }
+                if let Some(fit) = pattern_fit {
+                    let seen = fit.observed.get(&c);
+                    let eligible: Vec<bool> = rows
+                        .iter()
+                        .map(|&i| seen.is_some_and(|s| s.contains(store.name(i))))
+                        .collect();
+                    pattern = Some(quant_pattern::pattern_quantity(
+                        &PatternInput {
+                            x: &x,
+                            rt: &rtw,
+                            pred: &index.slot_pred[index.slots(ci)],
+                            eligible: &eligible,
+                        },
+                        fit.phi,
+                        fit.phi_cell(),
+                        p.cfg.fragment_selection == FragmentSelection::PatternProfile,
+                    ));
+                }
+            }
+            Applied {
+                lo_rt,
+                hi_rt,
+                apex: integration_apex,
+                hwhm,
+                bg_fallback,
+                pattern,
+                window_rt,
+            }
         })
         .collect();
     drop(slices);
     let applied_win: Vec<(f64, f64, f64)> =
-        applied.iter().map(|&(l, h, a, _, _)| (l, h, a)).collect();
+        applied.iter().map(|a| (a.lo_rt, a.hi_rt, a.apex)).collect();
+    let parea_by_slot = parea_by_slot;
+    let pobs_by_slot = pobs_by_slot;
     let area_by_slot = area_by_slot;
     let corr_by_slot = corr_by_slot;
     let flank_by_slot = flank_by_slot;
     let flank_h_by_slot = flank_h_by_slot;
     // Fragments (and their candidates) without an experiment background, which kept the
     // per-run quantile.
-    let bg_fallback_fragments: u64 = applied.iter().map(|x| x.4 as u64).sum();
-    let bg_fallback_candidates = applied.iter().filter(|x| x.4 > 0).count();
+    let bg_fallback_fragments: u64 = applied.iter().map(|x| x.bg_fallback as u64).sum();
+    let bg_fallback_candidates = applied.iter().filter(|x| x.bg_fallback > 0).count();
     if pooled_bg.is_some() && bg_fallback_fragments > 0 {
         info!(
             candidates = bg_fallback_candidates,
@@ -2973,6 +3195,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     // back to the `predicted` top-N rule for a candidate without a positive weighted area.
     let weights = p.cross_run.and_then(|x| x.weights.as_ref());
     let mut n_weighted = 0u64;
+    let mut n_pattern = 0u64;
     // One pass over the accepted rows, in table order, which is the order the filter over
     // every row visited them in.
     for (k, &c) in acc_cid.iter().enumerate() {
@@ -2981,6 +3204,11 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             None => select_fragment_areas(None, p.cfg.top_n_fragments, p.cfg.fragment_selection),
             Some(ci) => {
                 let slot = *selected.entry(ci).or_insert_with(|| {
+                    if let Some(q) = applied[ci].pattern {
+                        n_pattern += 1;
+                        selections.push(q);
+                        return selections.len() - 1;
+                    }
                     let r = index.slots(ci);
                     let weighted = weights.and_then(|fw| fw.get(&c)).and_then(|w| {
                         weighted_quantity(
@@ -3026,22 +3254,32 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         add_protein_base_quantity(&mut per_group, pg.get(k), base[k], quantity);
     }
 
-    let n_pep = write_table(
-        p.out_peptide,
-        vec![
-            Col::U32("candidate_id".into(), q_cid),
-            Col::U32("base_peptide_id".into(), q_base),
-            Col::Str("peptidoform".into(), q_pform),
-            Col::I32("charge".into(), q_z),
-            Col::Str("protein_group".into(), q_pg),
-            Col::OptF64("quantity".into(), q_val),
-            Col::Str("quant_status".into(), q_status),
-            Col::I32("n_fragments_used".into(), q_nfrag),
-            Col::OptF64("integration_apex_rt".into(), q_apex),
-            Col::OptF64("integration_lo_rt".into(), q_lo),
-            Col::OptF64("integration_hi_rt".into(), q_hi),
-        ],
-    )?;
+    // `first_pass_id`, only when the caller gave the first-pass evidence: whether this
+    // row's precursor had a first-pass identification in this run. The column is appended
+    // last, so every column of v2 keeps its position.
+    let q_first: Option<Vec<bool>> = p
+        .first_pass_ids
+        .map(|ids| q_cid.iter().map(|c| ids.contains(c)).collect());
+    let n_first_pass_rows = q_first
+        .as_ref()
+        .map(|v| v.iter().filter(|&&x| x).count() as u64);
+    let mut pep_cols = vec![
+        Col::U32("candidate_id".into(), q_cid),
+        Col::U32("base_peptide_id".into(), q_base),
+        Col::Str("peptidoform".into(), q_pform),
+        Col::I32("charge".into(), q_z),
+        Col::Str("protein_group".into(), q_pg),
+        Col::OptF64("quantity".into(), q_val),
+        Col::Str("quant_status".into(), q_status),
+        Col::I32("n_fragments_used".into(), q_nfrag),
+        Col::OptF64("integration_apex_rt".into(), q_apex),
+        Col::OptF64("integration_lo_rt".into(), q_lo),
+        Col::OptF64("integration_hi_rt".into(), q_hi),
+    ];
+    if let Some(v) = q_first {
+        pep_cols.push(Col::Bool(FIRST_PASS_ID.into(), v));
+    }
+    let n_pep = write_table(p.out_peptide, pep_cols)?;
 
     // Protein-group rollup over unique, quantifiable base peptides only.
     let (mut g_name, mut g_val, mut g_status, mut g_npep) =
@@ -3081,12 +3319,15 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         );
         // The cross-run export's columns, filled only under the export.
         let (mut f_corr, mut f_flank, mut f_hwhm) = (Vec::new(), Vec::new(), Vec::new());
+        // The pattern export's columns, filled only under it.
+        let (mut f_parea, mut f_pobs, mut f_prt) = (Vec::new(), Vec::new(), Vec::new());
         let mut f_flank_h: Vec<Vec<f64>> = vec![Vec::new(); CROSS_RUN_HALFWIDTHS];
         for (k, &c) in acc_cid.iter().enumerate() {
             // The fragment name comes from the interned table by row rather than from a
             // per-candidate `Vec<(&str, f64)>` built alongside the areas; the rows are the
             // same rows in the same order.
             if let Some(ci) = index.find(c) {
+                let first_slot = index.slots(ci).start;
                 for slot in index.slots(ci) {
                     // The export keeps the zero areas too, because the experiment
                     // background averages the flank over every run; directLFQ, the weight
@@ -3107,7 +3348,18 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                         for (j, col) in f_flank_h.iter_mut().enumerate() {
                             col.push(flank_h_by_slot[slot][j]);
                         }
-                        f_hwhm.push(applied[ci].3);
+                        f_hwhm.push(applied[ci].hwhm);
+                    }
+                    if pattern_export {
+                        f_parea.push(parea_by_slot[slot]);
+                        f_pobs.push(pobs_by_slot[slot]);
+                        // The window's retention times once per candidate block, on its
+                        // first row, so the spacing fit counts each candidate once.
+                        f_prt.push(if slot == first_slot {
+                            applied[ci].window_rt.clone()
+                        } else {
+                            Vec::new()
+                        });
                     }
                 }
             }
@@ -3130,6 +3382,11 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                 ));
             }
             cols.push(Col::F64("peak_hwhm".into(), f_hwhm));
+        }
+        if pattern_export {
+            cols.push(Col::F64("pattern_area".into(), f_parea));
+            cols.push(Col::Bool("observed".into(), f_pobs));
+            cols.push(Col::ListF32("window_rt".into(), f_prt));
         }
         let fragment_rows = write_table(fpath, cols)?;
         fragment_output = Some((fpath, fragment_rows));
@@ -3224,6 +3481,35 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                 json!(format!("{:?}", FragmentSelection::Predicted)),
             );
         }
+        if p.cfg.fragment_selection.uses_pattern_fit() {
+            match pattern_fit {
+                Some(fit) => {
+                    params.insert(
+                        "pattern_fit".to_string(),
+                        json!({
+                            "phi": fit.phi,
+                            "dt_s": fit.dt,
+                            "cells": fit.n_cells,
+                            "cells_eligible": fit.n_cells_eligible,
+                            "candidates": fit.observed.len(),
+                        }),
+                    );
+                    params.insert("candidates_pattern".to_string(), json!(n_pattern));
+                }
+                None => {
+                    params.insert(
+                        "fragment_selection_fallback".to_string(),
+                        json!(format!("{:?}", FragmentSelection::Predicted)),
+                    );
+                }
+            }
+        }
+        if p.cfg.window_centre != WindowCentre::Apex {
+            params.insert(
+                "window_centre".to_string(),
+                json!(format!("{:?}", p.cfg.window_centre)),
+            );
+        }
         if export {
             params.insert("cross_run_export".to_string(), json!(true));
         }
@@ -3241,9 +3527,20 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         }
     }
     let mut written: Vec<Written> = Vec::with_capacity(2);
-    for (path, schema, rows) in [
-        (p.out_peptide, artifact::PEPTIDE_QUANT, n_pep),
-        (p.out_protein, artifact::PROTEIN_GROUP_QUANT, n_pg),
+    // The first-pass flag's count goes into the peptide table's report alone, and only when
+    // the column was written, so every other report keeps its bytes.
+    let mut pep_stats = stats.clone();
+    if let Some(n) = n_first_pass_rows {
+        pep_stats.insert("first_pass_id_rows".to_string(), json!(n));
+    }
+    for (path, schema, rows, table_stats) in [
+        (
+            p.out_peptide,
+            artifact::peptide_quant(p.first_pass_ids.is_some()),
+            n_pep,
+            &pep_stats,
+        ),
+        (p.out_protein, artifact::PROTEIN_GROUP_QUANT, n_pg, &stats),
     ] {
         let report = ArtifactReport {
             logical_name: schema.0.to_string(),
@@ -3253,7 +3550,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             rows,
             content_hash: mumdia_io::hash::blake3_file(path)?,
             params: report_params.clone(),
-            stats: stats.clone(),
+            stats: table_stats.clone(),
             model_identity: None,
             elapsed_ms: elapsed,
         };
@@ -3263,9 +3560,13 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     let mut fragment_written: Option<Written> = None;
     if let Some((path, rows)) = fragment_output {
         let report = ArtifactReport {
-            logical_name: artifact::fragment_quant(export).0.to_string(),
-            schema_name: artifact::fragment_quant(export).0.to_string(),
-            schema_version: artifact::fragment_quant(export).1,
+            logical_name: artifact::fragment_quant(export, pattern_export)
+                .0
+                .to_string(),
+            schema_name: artifact::fragment_quant(export, pattern_export)
+                .0
+                .to_string(),
+            schema_version: artifact::fragment_quant(export, pattern_export).1,
             stage: "quant".to_string(),
             rows,
             content_hash: mumdia_io::hash::blake3_file(path)?,
@@ -3488,10 +3789,32 @@ pub fn fit_cross_run(fragment_tables: &[String], cfg: &QuantConfig) -> Result<Cr
         }
         bg
     });
+    let pattern = if cfg.fragment_selection.uses_pattern_fit() {
+        let fit = quant_pattern::fit_pattern(fragment_tables)?;
+        match &fit {
+            Some(f) => info!(
+                phi = f.phi,
+                dt_s = f.dt,
+                cells = f.n_cells,
+                candidates = f.observed.len(),
+                "quant: pattern fit (label-free dispersion)"
+            ),
+            None => warn!(
+                runs = fragment_tables.len(),
+                "quant: the pattern dispersion could not be estimated (no candidate in at \
+                 least 3 runs, or runs that do not vary); the pattern rule falls back to \
+                 predicted"
+            ),
+        }
+        fit
+    } else {
+        None
+    };
     Ok(CrossRunFit {
         weights,
         background,
         halfwidth: half,
+        pattern,
     })
 }
 
@@ -3503,11 +3826,15 @@ pub fn fit_cross_run(fragment_tables: &[String], cfg: &QuantConfig) -> Result<Cr
 /// quantity, n_features. With one input this reduces to the per-run sum.
 ///
 /// `normalize` applies a cross-run size factor to the feature-by-run matrix
-/// before rollup (see `size_factors`).
+/// before rollup (see `size_factors`). `quantity_column` names the intensity column of
+/// the inputs: `quantity`, or `quantity_normalised` of the `peptide_quant_normalised`
+/// tables of the cross-run normalisation (`stages::quant_norm`), which are then read
+/// with `NormalizeMethod::None`.
 pub fn run_lfq_combine(
     inputs: &[String],
     by_fragment: bool,
     normalize: NormalizeMethod,
+    quantity_column: &str,
     out: &str,
 ) -> Result<u64> {
     use std::collections::BTreeMap;
@@ -3519,7 +3846,7 @@ pub fn run_lfq_combine(
         let pform = t.str("peptidoform")?;
         let z = t.i32("charge")?;
         let pgc = t.str("protein_group")?;
-        let q = t.opt_f64("quantity")?;
+        let q = t.opt_f64(quantity_column)?;
         let fname = if by_fragment {
             Some(t.str("fragment_name")?)
         } else {
@@ -4113,6 +4440,135 @@ mod tests {
         );
     }
 
+    /// A second-pass candidate is flagged in a run exactly when its entry (the first-pass id
+    /// of its precursor, or of its paired target for a decoy) was accepted in that run.
+    #[test]
+    fn first_pass_ids_of_run_maps_second_pass_ids_through_their_entries() {
+        // New ids 0..5: targets 0 (entry 7), 1 (entry 9), 3 (entry 12); decoys 2 (pair of 9)
+        // and 4 (pair of 12).
+        let entry_of = vec![7u32, 9, 9, 12, 12];
+        let accepted: BTreeSet<(u32, u32)> = [(0, 7), (0, 12), (1, 9), (2, 99)].into();
+        assert_eq!(
+            first_pass_ids_of_run(&entry_of, &accepted, 0),
+            [0u32, 3, 4].into()
+        );
+        assert_eq!(
+            first_pass_ids_of_run(&entry_of, &accepted, 1),
+            [1u32, 2].into()
+        );
+        assert!(first_pass_ids_of_run(&entry_of, &accepted, 2).is_empty());
+        assert!(first_pass_ids_of_run(&entry_of, &accepted, 3).is_empty());
+        assert!(first_pass_ids_of_run(&[], &accepted, 0).is_empty());
+    }
+
+    /// `first_pass_ids` adds the column `first_pass_id` (last) and moves the table to
+    /// peptide_quant v3; every other column, the quantities and the protein table are those
+    /// of the run without it, and without it there is no such column and the table is v2.
+    #[test]
+    fn first_pass_flag_adds_one_column_and_changes_nothing_else() {
+        let scored = quant_test_path("fp_scored.parquet");
+        let chrom = quant_test_path("fp_chrom.parquet");
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 2, 3]),
+                Col::U32("base_peptide_id".into(), vec![10, 11, 12]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEP1".into(), "PEP2".into(), "PEP3".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 2, 3]),
+                Col::Str("label".into(), vec!["target".into(); 3]),
+                Col::Str("protein_group".into(), vec!["PG".into(); 3]),
+                Col::F64("peptide_q_value".into(), vec![0.0; 3]),
+                Col::F64("apex_rt".into(), vec![5.0; 3]),
+                Col::F64("elution_lo".into(), vec![4.0; 3]),
+                Col::F64("elution_hi".into(), vec![6.0; 3]),
+            ],
+        )
+        .unwrap();
+        let grid: Vec<f32> = (0..10).map(|rt| rt as f32).collect();
+        let peak = vec![0.0f32, 0.0, 0.0, 0.0, 5.0, 10.0, 5.0, 0.0, 0.0, 0.0];
+        write_table(
+            &chrom,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 2, 3]),
+                Col::Str(
+                    "frag_name".into(),
+                    vec!["b2".into(), "y3".into(), "y4".into()],
+                ),
+                Col::ListF32("rt".into(), vec![grid.clone(), grid.clone(), grid]),
+                Col::ListF32("intensity".into(), vec![peak.clone(), peak.clone(), peak]),
+            ],
+        )
+        .unwrap();
+        let cfg = QuantConfig::default();
+        let quant_once = |ids: Option<&BTreeSet<u32>>| -> (String, String) {
+            let pep = quant_test_path("fp_peptide.parquet");
+            let prot = quant_test_path("fp_protein.parquet");
+            run(QuantParams {
+                psms_scored: &scored,
+                chromatograms: &[ChromTable::whole(&chrom)],
+                out_peptide: &pep,
+                out_protein: &prot,
+                out_fragment: None,
+                out_peak_bounds: None,
+                cfg: &cfg,
+                config_hash: "test",
+                cross_run: None,
+                export_cross_run: false,
+                first_pass_ids: ids,
+            })
+            .unwrap();
+            (pep, prot)
+        };
+        let report_of = |path: &str| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(format!("{path}.report.json")).unwrap())
+                .unwrap()
+        };
+        let (pep0, prot0) = quant_once(None);
+        // Candidate 2 had no first-pass identification in this run; 99 is not in the table.
+        let ids: BTreeSet<u32> = [1u32, 3, 99].into();
+        let (pep1, prot1) = quant_once(Some(&ids));
+
+        let t0 = Table::read(&pep0).unwrap();
+        let t1 = Table::read(&pep1).unwrap();
+        let cols0 = mumdia_io::table::column_names(&pep0).unwrap();
+        let cols1 = mumdia_io::table::column_names(&pep1).unwrap();
+        assert!(!cols0.iter().any(|c| c == FIRST_PASS_ID));
+        assert_eq!(cols1.last().map(String::as_str), Some(FIRST_PASS_ID));
+        assert_eq!(&cols1[..cols1.len() - 1], &cols0[..]);
+        assert_eq!(t1.bool(FIRST_PASS_ID).unwrap(), vec![true, false, true]);
+        assert_eq!(
+            t0.u32("candidate_id").unwrap(),
+            t1.u32("candidate_id").unwrap()
+        );
+        assert_eq!(
+            t0.opt_f64("quantity").unwrap(),
+            t1.opt_f64("quantity").unwrap()
+        );
+        assert_eq!(
+            t0.str("quant_status").unwrap(),
+            t1.str("quant_status").unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&prot0).unwrap(),
+            std::fs::read(&prot1).unwrap(),
+            "the protein table does not depend on the flag"
+        );
+
+        let r0 = report_of(&pep0);
+        let r1 = report_of(&pep1);
+        assert_eq!(r0["schema_version"], 2);
+        assert!(r0["stats"].get("first_pass_id_rows").is_none());
+        assert_eq!(r1["schema_version"], 3);
+        assert_eq!(r1["stats"]["first_pass_id_rows"], 2);
+        let p0 = report_of(&prot0);
+        let p1 = report_of(&prot1);
+        assert_eq!(p0["schema_version"], p1["schema_version"]);
+        assert_eq!(p0["stats"], p1["stats"]);
+    }
+
     // Also the legacy-artifact regression: this chromatogram table carries no
     // `predicted_intensity` column, as every artifact written before that column existed
     // does. Quant must still read it and quantify from it unchanged.
@@ -4186,6 +4642,7 @@ mod tests {
             config_hash: "test",
             cross_run: None,
             export_cross_run: false,
+            first_pass_ids: None,
         })
         .unwrap();
         assert_eq!(rows, (4, 3));
@@ -4453,6 +4910,7 @@ mod tests {
             config_hash: "test",
             cross_run: None,
             export_cross_run: false,
+            first_pass_ids: None,
         })
         .unwrap();
         assert_eq!(rows, (1, 1));
@@ -4489,6 +4947,7 @@ mod tests {
                 config_hash: "test",
                 cross_run: None,
                 export_cross_run: false,
+                first_pass_ids: None,
             })
             .unwrap();
             let pq = Table::read(&peptide).unwrap();
@@ -4590,6 +5049,7 @@ mod tests {
             config_hash: "test",
             cross_run: fit,
             export_cross_run: export,
+            first_pass_ids: None,
         })
         .unwrap();
         out
@@ -4681,7 +5141,14 @@ mod tests {
         assert_eq!(e.f64("peak_hwhm").unwrap(), vec![1.75; 4]);
         // directLFQ reads the export as it reads v1: the zero-area row is not a feature.
         let lfq = quant_test_path("crx_lfq.parquet");
-        run_lfq_combine(&[ex[2].clone()], true, NormalizeMethod::None, &lfq).unwrap();
+        run_lfq_combine(
+            &[ex[2].clone()],
+            true,
+            NormalizeMethod::None,
+            "quantity",
+            &lfq,
+        )
+        .unwrap();
         assert_eq!(
             Table::read(&lfq).unwrap().i32("n_features").unwrap(),
             vec![3]
@@ -4798,6 +5265,7 @@ mod tests {
             config_hash: "test",
             cross_run: None,
             export_cross_run: false,
+            first_pass_ids: None,
         })
         .unwrap();
         assert_eq!(rows.0, 2, "both identifications must be reported");
@@ -4837,6 +5305,7 @@ mod tests {
             config_hash: "test",
             cross_run: None,
             export_cross_run: false,
+            first_pass_ids: None,
         })
         .unwrap_err()
         .to_string();
@@ -5276,6 +5745,7 @@ mod tests {
             config_hash: "test",
             cross_run: None,
             export_cross_run: false,
+            first_pass_ids: None,
         })
         .unwrap();
         assert_eq!(rows, (3, 2));
@@ -5405,6 +5875,7 @@ mod tests {
                 config_hash: "test",
                 cross_run: None,
                 export_cross_run: false,
+                first_pass_ids: None,
             })
             .unwrap();
             let pq = Table::read(&peptide).unwrap();
@@ -6287,6 +6758,7 @@ mod tests {
             config_hash: "test",
             cross_run: None,
             export_cross_run: false,
+            first_pass_ids: None,
         })
     }
 
@@ -6491,6 +6963,7 @@ mod tests {
                 config_hash: "test",
                 cross_run: None,
                 export_cross_run: false,
+                first_pass_ids: None,
             })?;
             let mut report: serde_json::Value =
                 mumdia_io::json::read_json(&format!("{pep}.report.json")).unwrap();
@@ -6616,6 +7089,7 @@ mod tests {
                 config_hash: "test",
                 cross_run: None,
                 export_cross_run: false,
+                first_pass_ids: None,
             })
             .unwrap();
             [pep, prot, frag, pb]
@@ -6754,6 +7228,7 @@ mod tests {
                     config_hash: "test",
                     cross_run: None,
                     export_cross_run: false,
+                    first_pass_ids: None,
                 })
                 .unwrap();
                 files.extend([pep, prot, frag].iter().map(|p| std::fs::read(p).unwrap()));
@@ -6949,6 +7424,7 @@ mod tests {
                 config_hash: "test",
                 cross_run: None,
                 export_cross_run: false,
+                first_pass_ids: None,
             })
             .unwrap();
             // The quantities as well, so a failure says which column moved rather than
@@ -7645,5 +8121,398 @@ mod source_guard_tests {
         );
         let t = TableFile::open(&p).unwrap();
         assert!(pooled_source_count(&t, &p).is_err());
+    }
+}
+
+/// `quant.window_centre = profile` and the pattern rules, end to end through [`run`] and
+/// [`fit_cross_run`] on a synthetic three-run experiment, against the values the prototype
+/// the methods were confirmed with gives on the same data
+/// (`bench/quant_methods/synth_ref.py`, case 1).
+#[cfg(test)]
+mod pattern_tests {
+    use super::*;
+    use mumdia_io::table::Table;
+
+    const N_AX: usize = 41;
+    const LOAD: [u32; 3] = [10, 13, 8];
+    const PRED: [f32; 8] = [1.0, 0.9, 0.75, 0.6, 0.5, 0.4, 0.3, 0.2];
+    const SHAPE: [u32; 5] = [100, 80, 45, 18, 5];
+    /// Candidate, scored apex (s after 100), true peak centre sample, runs.
+    const CANDS: [(u32, f64, usize, &[usize]); 5] = [
+        (10, 40.4, 21, &[0, 1, 2]),
+        (20, 42.6, 20, &[0, 1, 2]),
+        (30, 37.0, 17, &[0, 1, 2]),
+        (40, 4.0, 3, &[0, 1]),
+        (50, 40.0, 22, &[0, 1, 2]),
+    ];
+    /// Rows in the prototype's order (run, candidate) and its quantities.
+    const ROWS: [(usize, u32); 14] = [
+        (0, 10),
+        (0, 20),
+        (0, 30),
+        (0, 40),
+        (0, 50),
+        (1, 10),
+        (1, 20),
+        (1, 30),
+        (1, 40),
+        (1, 50),
+        (2, 10),
+        (2, 20),
+        (2, 30),
+        (2, 50),
+    ];
+    const SHIFT: [i32; 14] = [1, -1, -1, 1, 2, 1, -1, -1, 1, 2, 1, -1, -1, 2];
+    const PHI: f64 = 1086.2949789094118;
+    const C2LF: [f64; 14] = [
+        2169353.43805547,
+        1896146.2519767878,
+        2222083.827423845,
+        2221938.6118362444,
+        2196943.2903761487,
+        2819329.80958559,
+        3046537.0302179568,
+        2887149.5214470695,
+        2887323.7801312855,
+        2854853.2565688933,
+        1736180.0566841306,
+        1778413.8466537124,
+        1805249.7608345042,
+        1758535.256983633,
+    ];
+    const C3LF: [f64; 14] = [
+        2173205.323826184,
+        1907824.358242858,
+        2226733.4535551243,
+        2226618.2556439345,
+        2204293.4595128223,
+        2823181.6953577967,
+        3049623.7659868146,
+        2892435.0767964977,
+        2892543.4983599624,
+        2862571.98804129,
+        1740031.9424538394,
+        1782740.374875478,
+        1813410.5310352927,
+        1765156.5972632084,
+    ];
+    const D1_PRED3: [f64; 14] = [
+        1952160.0, 1952100.0, 1952300.0, 1952280.0, 1952150.0, 2537270.0, 2787320.0, 2537190.0,
+        2537280.0, 2537370.0, 1562170.0, 1562220.0, 1562200.0, 1562160.0,
+    ];
+    const D1_OBS3: [f64; 14] = [
+        1952160.0, 1952100.0, 1952300.0, 1952280.0, 1952150.0, 2537270.0, 2787320.0, 2537190.0,
+        2537280.0, 2537370.0, 1562170.0, 1562220.0, 1596240.0, 1562160.0,
+    ];
+    const DEF_OBS3: [f64; 14] = [
+        1846070.0, 1846300.0, 1846280.0, 1785080.0, 1528300.0, 2399600.0, 2699390.0, 2399480.0,
+        2319905.0, 1985990.0, 1477280.0, 1477400.0, 1522510.0, 1223000.0,
+    ];
+
+    fn path(name: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("mumdia_quant_pattern_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!("{n}_{name}"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn pred_of(c: u32) -> [f32; 8] {
+        let mut p = PRED;
+        p.rotate_right(((c / 10) % 8) as usize);
+        p
+    }
+
+    fn observed(c: u32, r: usize, f: usize) -> bool {
+        !((c == 10 && f == 7) || (c == 20 && f == 5 && r == 0) || (c == 50 && f == 0))
+    }
+
+    fn intensity(c: u32, r: usize, f: usize, centre: usize) -> Vec<f32> {
+        let p = (pred_of(c)[f] as f64 * 100.0).round() as u32;
+        (0..N_AX)
+            .map(|t| {
+                let d = t.abs_diff(centre);
+                let h = SHAPE.get(d).copied().unwrap_or(0);
+                let mut v = LOAD[r] * p * h;
+                v += ((r as u32 * 7 + f as u32 * 13 + t as u32 * 3 + c) % 11) * 10;
+                if c == 20 && f == 2 && r == 1 && (centre + 1..=centre + 3).contains(&t) {
+                    v += 50000;
+                }
+                if c == 30 && f == 0 && r == 2 {
+                    v += 20000;
+                }
+                v as f32
+            })
+            .collect()
+    }
+
+    /// One run's scored and chromatogram tables.
+    fn run_tables(r: usize) -> (String, String) {
+        let scored = path(&format!("scored{r}.parquet"));
+        let chrom = path(&format!("chrom{r}.parquet"));
+        let here: Vec<&(u32, f64, usize, &[usize])> =
+            CANDS.iter().filter(|c| c.3.contains(&r)).collect();
+        let n = here.len();
+        write_table(
+            &scored,
+            vec![
+                Col::U32("candidate_id".into(), here.iter().map(|c| c.0).collect()),
+                Col::U32("base_peptide_id".into(), here.iter().map(|c| c.0).collect()),
+                Col::Str(
+                    "peptidoform".into(),
+                    here.iter().map(|c| format!("P{}", c.0)).collect(),
+                ),
+                Col::I32("charge".into(), vec![2; n]),
+                Col::Str("label".into(), vec!["target".into(); n]),
+                Col::Str("protein_group".into(), vec!["PG".into(); n]),
+                Col::F64("peptide_q_value".into(), vec![0.0; n]),
+                Col::F64("apex_rt".into(), here.iter().map(|c| 100.0 + c.1).collect()),
+            ],
+        )
+        .unwrap();
+        let axis: Vec<f32> = (0..N_AX).map(|t| (100.0 + 2.0 * t as f64) as f32).collect();
+        let (mut cid, mut name, mut rt, mut it, mut pr) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for c in &here {
+            for f in 0..8 {
+                cid.push(c.0);
+                name.push(format!("f{f}"));
+                pr.push(pred_of(c.0)[f]);
+                if observed(c.0, r, f) {
+                    rt.push(axis.clone());
+                    it.push(intensity(c.0, r, f, c.2));
+                } else {
+                    rt.push(Vec::new());
+                    it.push(Vec::new());
+                }
+            }
+        }
+        write_table(
+            &chrom,
+            vec![
+                Col::U32("candidate_id".into(), cid),
+                Col::Str("frag_name".into(), name),
+                Col::ListF32("rt".into(), rt),
+                Col::ListF32("intensity".into(), it),
+                Col::F32("predicted_intensity".into(), pr),
+            ],
+        )
+        .unwrap();
+        (scored, chrom)
+    }
+
+    /// Quantify run `r` and return its peptide table, with the fragment table when given.
+    fn quantify(
+        r: usize,
+        tables: &(String, String),
+        cfg: &QuantConfig,
+        fit: Option<&CrossRunFit>,
+        fragment: Option<&str>,
+    ) -> String {
+        let pep = path(&format!("pep{r}.parquet"));
+        let prot = path(&format!("prot{r}.parquet"));
+        run(QuantParams {
+            psms_scored: &tables.0,
+            chromatograms: &[ChromTable::whole(&tables.1)],
+            out_peptide: &pep,
+            out_protein: &prot,
+            out_fragment: fragment,
+            out_peak_bounds: None,
+            cfg,
+            config_hash: "test",
+            cross_run: fit,
+            export_cross_run: fragment.is_some(),
+            first_pass_ids: None,
+        })
+        .unwrap();
+        pep
+    }
+
+    fn quantities(peps: &[String]) -> BTreeMap<(usize, u32), Option<f64>> {
+        let mut m = BTreeMap::new();
+        for (r, p) in peps.iter().enumerate() {
+            let t = Table::read(p).unwrap();
+            for (c, q) in t
+                .u32("candidate_id")
+                .unwrap()
+                .into_iter()
+                .zip(t.opt_f64("quantity").unwrap())
+            {
+                m.insert((r, c), q);
+            }
+        }
+        m
+    }
+
+    fn assert_close(got: &BTreeMap<(usize, u32), Option<f64>>, want: &[f64; 14], tol: f64) {
+        for (k, &w) in ROWS.iter().zip(want) {
+            let g = got[k].unwrap_or_else(|| panic!("{k:?} not quantified"));
+            assert!(
+                ((g - w) / w).abs() <= tol,
+                "{k:?}: {g} against the prototype's {w}"
+            );
+        }
+    }
+
+    /// The experiment under the cross-run step: pass 1 with the export, the fit, pass 2.
+    fn cross_run_experiment(cfg: &QuantConfig) -> (CrossRunFit, Vec<String>) {
+        let tables: Vec<(String, String)> = (0..3).map(run_tables).collect();
+        let frags: Vec<String> = (0..3).map(|r| path(&format!("frag{r}.parquet"))).collect();
+        for (r, t) in tables.iter().enumerate() {
+            quantify(r, t, cfg, None, Some(&frags[r]));
+        }
+        let rep: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{}.report.json", frags[0])).unwrap();
+        assert_eq!(
+            rep["schema_version"], 6,
+            "the pattern export is fragment_quant v6"
+        );
+        let fit = fit_cross_run(&frags, cfg).unwrap();
+        let peps = tables
+            .iter()
+            .enumerate()
+            .map(|(r, t)| quantify(r, t, cfg, Some(&fit), None))
+            .collect();
+        (fit, peps)
+    }
+
+    #[test]
+    fn pattern_fit_with_the_profile_window_reproduces_the_prototype() {
+        let cfg = QuantConfig {
+            fragment_selection: FragmentSelection::PatternFit,
+            window_centre: WindowCentre::Profile,
+            ..QuantConfig::default()
+        };
+        let (fit, peps) = cross_run_experiment(&cfg);
+        let pf = fit
+            .pattern
+            .as_ref()
+            .expect("phi is estimable on three runs");
+        assert!(
+            ((pf.phi - PHI) / PHI).abs() < 1e-12,
+            "phi {} against {PHI}",
+            pf.phi
+        );
+        assert_eq!(pf.dt, 2.0);
+        // Candidate 10's f7 has no trace in any run; candidate 20's f5 has one in runs 1-2.
+        assert!(!pf.observed[&10].contains("f7"));
+        assert!(pf.observed[&20].contains("f5"));
+        assert_close(&quantities(&peps), &C2LF, 1e-9);
+        let rep: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{}.report.json", peps[0])).unwrap();
+        assert_eq!(rep["params"]["window_centre"], "Profile");
+        assert_eq!(rep["params"]["candidates_pattern"], 5);
+        assert!(rep["params"]["fragment_selection_fallback"].is_null());
+    }
+
+    #[test]
+    fn pattern_profile_with_the_profile_window_reproduces_the_prototype() {
+        let cfg = QuantConfig {
+            fragment_selection: FragmentSelection::PatternProfile,
+            window_centre: WindowCentre::Profile,
+            ..QuantConfig::default()
+        };
+        let (_, peps) = cross_run_experiment(&cfg);
+        assert_close(&quantities(&peps), &C3LF, 1e-9);
+    }
+
+    /// The window centre alone is per run: no cross-run step, and the top-N rules on the
+    /// moved window are the prototype's to the last bit.
+    #[test]
+    fn the_profile_window_moves_the_top_n_rules_as_the_prototype_does() {
+        let tables: Vec<(String, String)> = (0..3).map(run_tables).collect();
+        for (sel, centre, want) in [
+            (
+                FragmentSelection::Predicted,
+                WindowCentre::Profile,
+                &D1_PRED3,
+            ),
+            (
+                FragmentSelection::ObservedArea,
+                WindowCentre::Profile,
+                &D1_OBS3,
+            ),
+            (
+                FragmentSelection::ObservedArea,
+                WindowCentre::Apex,
+                &DEF_OBS3,
+            ),
+        ] {
+            let cfg = QuantConfig {
+                fragment_selection: sel,
+                window_centre: centre,
+                ..QuantConfig::default()
+            };
+            let peps: Vec<String> = tables
+                .iter()
+                .enumerate()
+                .map(|(r, t)| quantify(r, t, &cfg, None, None))
+                .collect();
+            assert_close(&quantities(&peps), want, 0.0);
+        }
+        // The shift the prototype found moves the reported bounds by as many samples.
+        let cfg = QuantConfig {
+            window_centre: WindowCentre::Profile,
+            ..QuantConfig::default()
+        };
+        for (r, tr) in tables.iter().enumerate() {
+            let pep = quantify(r, tr, &cfg, None, None);
+            let t = Table::read(&pep).unwrap();
+            let base = quantify(r, tr, &QuantConfig::default(), None, None);
+            let b = Table::read(&base).unwrap();
+            let (lo, blo) = (
+                t.opt_f64("integration_lo_rt").unwrap(),
+                b.opt_f64("integration_lo_rt").unwrap(),
+            );
+            let apex = t.opt_f64("integration_apex_rt").unwrap();
+            assert_eq!(apex, b.opt_f64("integration_apex_rt").unwrap());
+            for (k, c) in t.u32("candidate_id").unwrap().iter().enumerate() {
+                let i = ROWS.iter().position(|x| *x == (r, *c)).unwrap();
+                let moved = (lo[k].unwrap() - blo[k].unwrap()) / 2.0;
+                // Candidate 40 sits at the start of its trace, where the window is clipped.
+                if *c != 40 {
+                    assert_eq!(moved, SHIFT[i] as f64, "run {r} candidate {c}");
+                }
+            }
+        }
+    }
+
+    /// Without the cross-run step the pattern rules are `predicted`, and say so.
+    #[test]
+    fn the_pattern_rules_fall_back_to_predicted_without_the_fit() {
+        let tables: Vec<(String, String)> = (0..3).map(run_tables).collect();
+        let pred = QuantConfig {
+            fragment_selection: FragmentSelection::Predicted,
+            window_centre: WindowCentre::Profile,
+            ..QuantConfig::default()
+        };
+        let pat = QuantConfig {
+            fragment_selection: FragmentSelection::PatternFit,
+            ..pred.clone()
+        };
+        let a = quantify(0, &tables[0], &pred, None, None);
+        let b = quantify(0, &tables[0], &pat, None, None);
+        assert_eq!(
+            Table::read(&a).unwrap().opt_f64("quantity").unwrap(),
+            Table::read(&b).unwrap().opt_f64("quantity").unwrap()
+        );
+        let rep: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{b}.report.json")).unwrap();
+        assert_eq!(rep["params"]["fragment_selection_fallback"], "Predicted");
+        // Two runs cannot estimate phi: the fit has no pattern and pass 2 falls back too.
+        let frags: Vec<String> = (0..2).map(|r| path(&format!("two{r}.parquet"))).collect();
+        for r in 0..2 {
+            quantify(r, &tables[r], &pat, None, Some(&frags[r]));
+        }
+        let fit = fit_cross_run(&frags, &pat).unwrap();
+        assert!(fit.pattern.is_none());
+        let c = quantify(0, &tables[0], &pat, Some(&fit), None);
+        assert_eq!(
+            Table::read(&a).unwrap().opt_f64("quantity").unwrap(),
+            Table::read(&c).unwrap().opt_f64("quantity").unwrap()
+        );
     }
 }

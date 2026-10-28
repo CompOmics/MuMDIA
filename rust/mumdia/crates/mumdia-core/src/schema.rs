@@ -82,6 +82,11 @@ pub mod artifact {
     pub const PSMS_COMPETED: (&str, u32) = ("psms_competed", 4);
     pub const PSMS_SCORED: (&str, u32) = ("psms_scored", 4);
     pub const PEPTIDE_QUANT: (&str, u32) = ("peptide_quant", 2);
+    /// v3: v2 plus a Boolean `first_pass_id`, appended last: whether the row's precursor had
+    /// a first-pass identification in its run (`run_psm_q <= mbr.q_anchor`). Written only by
+    /// `run-experiment` under `mbr.first_pass_flag` when the second pass ran; every other
+    /// quant writes v2, byte for byte. Readers select columns by name.
+    pub const PEPTIDE_QUANT_V3: (&str, u32) = ("peptide_quant", 3);
     pub const PROTEIN_GROUP_QUANT: (&str, u32) = ("protein_group_quant", 2);
     pub const FRAGMENT_QUANT: (&str, u32) = ("fragment_quant", 1);
     /// v5, the cross-run export (`quant --export-cross-run`, or the first pass of the
@@ -91,8 +96,23 @@ pub mod artifact {
     /// branch's v2 to v4, whose meanings were never documented, so a table written there is
     /// never read as this one.
     pub const FRAGMENT_QUANT_V5: (&str, u32) = ("fragment_quant", 5);
+    /// v6, the cross-run export under a pattern rule (`quant.fragment_selection =
+    /// pattern_fit` or `pattern_profile`): v5 plus `pattern_area` (Float64, the fragment's
+    /// area over the pattern window), `observed` (Boolean, the fragment has a trace) and
+    /// `window_rt` (`List<Float32>`, the retention times within twice the halfwidth of the
+    /// window centre, on each candidate's first row and empty on the others). Every other
+    /// export writes v5, byte for byte.
+    pub const FRAGMENT_QUANT_V6: (&str, u32) = ("fragment_quant", 6);
     /// Cross-run MaxLFQ table, written only by `run-experiment` and `quant-lfq`.
     pub const LFQ_MAXLFQ: (&str, u32) = ("lfq_maxlfq", 1);
+    /// A run's precursor quantities after the cross-run normalisation
+    /// (`quant.normalisation`), row-aligned with its `peptide_quant`: the raw `quantity`,
+    /// `quantity_normalised` and the log2 shift between them. Written only by
+    /// `run-experiment` with the normalisation on and by `quant-normalise`.
+    pub const PEPTIDE_QUANT_NORMALISED: (&str, u32) = ("peptide_quant_normalised", 1);
+    /// The per-run, per-retention-time-bin shifts of the cross-run normalisation. Written
+    /// next to the [`PEPTIDE_QUANT_NORMALISED`] tables.
+    pub const QUANT_NORMALISATION: (&str, u32) = ("quant_normalisation", 1);
     /// The candidates a grouped run's pool dropped from each band (`band`,
     /// `candidate_id`), written by a grouped run under `groups.pool_chromatograms = false`,
     /// the default.
@@ -141,13 +161,24 @@ pub mod artifact {
         }
     }
 
-    /// The `fragment_quant` schema a quant writes: [`FRAGMENT_QUANT_V5`] under the cross-run
-    /// export, else [`FRAGMENT_QUANT`].
-    pub fn fragment_quant(cross_run_export: bool) -> (&'static str, u32) {
-        if cross_run_export {
-            FRAGMENT_QUANT_V5
+    /// The `fragment_quant` schema a quant writes: [`FRAGMENT_QUANT_V6`] under the cross-run
+    /// export of a pattern rule, [`FRAGMENT_QUANT_V5`] under any other cross-run export,
+    /// else [`FRAGMENT_QUANT`].
+    pub fn fragment_quant(cross_run_export: bool, pattern_export: bool) -> (&'static str, u32) {
+        match (cross_run_export, pattern_export) {
+            (true, true) => FRAGMENT_QUANT_V6,
+            (true, false) => FRAGMENT_QUANT_V5,
+            (false, _) => FRAGMENT_QUANT,
+        }
+    }
+
+    /// The `peptide_quant` schema a quant writes: [`PEPTIDE_QUANT_V3`] when it carries the
+    /// first-pass flag, else [`PEPTIDE_QUANT`].
+    pub fn peptide_quant(first_pass_flag: bool) -> (&'static str, u32) {
+        if first_pass_flag {
+            PEPTIDE_QUANT_V3
         } else {
-            FRAGMENT_QUANT
+            PEPTIDE_QUANT
         }
     }
 
@@ -217,11 +248,22 @@ mod tests {
         assert_eq!(chromatograms(2, true), ("chromatograms", 4));
     }
 
-    /// Only the cross-run export moves `fragment_quant`, to v5.
+    /// Only the cross-run export moves `fragment_quant`, to v5, and to v6 under a pattern
+    /// rule.
     #[test]
     fn fragment_quant_selector_keeps_v1_without_the_export() {
-        assert_eq!(fragment_quant(false), FRAGMENT_QUANT);
-        assert_eq!(fragment_quant(false), ("fragment_quant", 1));
-        assert_eq!(fragment_quant(true), ("fragment_quant", 5));
+        assert_eq!(fragment_quant(false, false), FRAGMENT_QUANT);
+        assert_eq!(fragment_quant(false, false), ("fragment_quant", 1));
+        assert_eq!(fragment_quant(false, true), ("fragment_quant", 1));
+        assert_eq!(fragment_quant(true, false), ("fragment_quant", 5));
+        assert_eq!(fragment_quant(true, true), ("fragment_quant", 6));
+    }
+
+    /// Only the first-pass flag moves `peptide_quant`, to v3.
+    #[test]
+    fn peptide_quant_selector_keeps_v2_without_the_flag() {
+        assert_eq!(peptide_quant(false), PEPTIDE_QUANT);
+        assert_eq!(peptide_quant(false), ("peptide_quant", 2));
+        assert_eq!(peptide_quant(true), ("peptide_quant", 3));
     }
 }

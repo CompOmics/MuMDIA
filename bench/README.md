@@ -11,9 +11,11 @@ library, and hours of compute. The end-to-end test CI does run is
 
 | file | purpose |
 |---|---|
-| `make_proteobench_submission.py` | Build a ProteoBench "Custom" input TSV from per-run `pepquant_<run>.parquet`. Expands MuMDIA's protein entry names back to full FASTA identifiers so ProteoBench's own `Cont_` contaminant flag and `_HUMAN`/`_YEAST`/`_ECOLI` species flags apply unchanged. |
+| `make_proteobench_submission.py` | Build a ProteoBench "Custom" input TSV from per-run `peptide_quant.parquet`. Expands MuMDIA's protein entry names back to full FASTA identifiers so ProteoBench's own `Cont_` contaminant flag and `_HUMAN`/`_YEAST`/`_ECOLI` species flags apply unchanged. Without options it submits the raw `quantity` unchanged. `--quantity maxlfq` submits the cross-run MaxLFQ precursor table, `--quantity aligned` aligns the replicates within each condition (label-blind; it cannot change composition or the offset between conditions), and `--condition-gate` applies rule F1 of `prov_filter.py` from `first_pass/scored_combined.parquet` of a `run-experiment` tree. The last stderr line gives the ProteoBench ion count and the finite-ratio count per species (pass `--species HUMAN,YEAST` for the Low Input module, whose species mapper has no E. coli). Report both with any gated result, because the gate removes far more finite ratios than ions. |
 | `pb_eval.py` | Score a submission offline with ProteoBench's own parser and scoring code. Nothing is uploaded and no token is used. `--module` selects the module, which fixes the run names and the expected ratios; an unknown id is rejected with the available list. |
 | `prov_filter.py` | Condition-evidence filters (F1 to F4) deciding which run values may be reported. Withholding transferred values in a condition with no direct identification is what removes low-abundance ratio compression; see the docstring for the measurements. |
+| `quant_condition_gate.py` | Rule F1 of `prov_filter.py` on a `run-experiment` output tree: given a run-to-condition map, keep a (precursor, condition) group's values only when one of its runs has a first-pass identification. Reads the engine's `first_pass_id` (`peptide_quant` v3, `mbr.first_pass_flag`) or, with `--derive-first-pass`, derives it from `first_pass/scored_combined.parquet` and reports where the two disagree. Writes gated per-run tables that `make_proteobench_submission.py` reads. An ion-count trade: compare at a matched number of finite ratios. |
+| `quant_methods/synth_ref.py` | Reference values for the unit tests of the profile-centred window, the pattern rules and the stable-set normalisation: the quantification study's prototype on two small synthetic cases that the Rust tests rebuild exactly. Needs the study's prototype code (`MUMDIA_QUANT_PROTOTYPE`), which is not in this repository. |
 | `qab_score.py` | Score one arm of a quantification A/B directly from the per-run `peptide_quant.parquet` of a `run-experiment` output tree: features, completeness, median abs epsilon against the HYE expected ratios, and CV. Not ProteoBench's own numbers (see its docstring); the point is that two arms are scored identically. |
 | `make_entrapment_fasta.py` | Build a real + 1:1 foreign entrapment FASTA (`REAL_` / `ENTRAP_` accession prefixes, seeded sample). With `--ratio-library` it prints `rescore.entrapment_ratio` of a built library instead: real over entrapment target candidates, classified as the engine does. See the ratio note below. |
 | `tims/tims_compare.py` | Compare one run's `psms_scored.parquet` with a reference identification table of the same run (`--reference`) at one q: precursors, peptides and protein groups, each with its unit named, plus the I/L-merged peptide overlap. |
@@ -319,19 +321,16 @@ current fragment selection does not remove.
 # 1. Per-run analysis and pooled rescore produce pepquant_<run>.parquet.
 #    See docs/22_release_plan.md WP7 for the second-pass workflow this used.
 
-# 2. Withhold values with no direct identification in their condition.
-bench/prov_filter.py --quant-dir out/quant --pass1-dir out/pool_nombr \
-    --out-dir out/quant --rules F1 \
-    --runs A_REP1,A_REP2,A_REP3,B_REP1,B_REP2,B_REP3 \
-    --conditions A,A,A,B,B,B
-
-# 3. Build the submission TSV.
+# 2. Build the submission TSV from the run-experiment tree. Without options the raw
+#    quantity is submitted unchanged. --condition-gate withholds the values of a condition
+#    with no first-pass identification (rule F1 of prov_filter.py, which does the same on
+#    the older scored_src<i> layout); --quantity aligned or maxlfq replaces the raw value.
 bench/make_proteobench_submission.py --fasta ProteoBenchFASTA_MixedSpecies_HYE.fasta \
-    --out submission.tsv \
-    LFQ_Astral_DIA_15min_50ng_Condition_A_REP1=out/quant_F1/pepquant_A_REP1.parquet \
+    --out submission.tsv --condition-gate --quantity aligned \
+    LFQ_Astral_DIA_15min_50ng_Condition_A_REP1=out/r0/peptide_quant.parquet \
     ...
 
-# 4. Score it offline.
+# 3. Score it offline.
 bench/pb_eval.py submission.tsv --format Custom \
     --module quant_lfq_DIA_ion_Astral --out-prefix results/mumdia
 ```

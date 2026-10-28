@@ -115,6 +115,34 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **Profile-centred window, pattern-fit fragment rules and stable-set normalisation,
+  opt-in** (`quant.window_centre = "profile"`, `quant.fragment_selection = "pattern_fit"` /
+  `"pattern_profile"`, `quant.normalisation = "stable_set"` with `quant.normalisation_rank`
+  and `quant.normalisation_lfq`, `mumdia quant-normalise`). The profile window moves the
+  fixed window by up to 2 samples onto the largest 3-sample block of the summed traces of
+  the 6 strongest library fragments; it is per run. The pattern rules fit the window samples
+  of the 10 strongest library fragments seen in any run to the library pattern, as a robust
+  rank-1 fragment x time model (`pattern_profile`) or with a second robust fit of the
+  winsorised areas (`pattern_fit`), with one label-free dispersion that the cross-run step
+  of `run-experiment` fits over all runs (fragment_quant v6 in its first pass). Without the
+  step, or with fewer than 3 runs per candidate, they fall back to `predicted`.
+  `stable_set` fits one log2 shift per run and retention-time bin after per-run quant: the
+  median leave-one-out deviation of the ions whose cross-run profile belongs to the largest
+  population of a principal-component subspace. It writes
+  `<run>/peptide_quant_normalised.parquet` (`quantity_normalised`) next to an unchanged
+  `peptide_quant.parquet`, and the shifts to `quant_normalisation.parquet`; the cross-run
+  MaxLFQ reads the normalised quantity only with `normalisation_lfq = true`. `quant-lfq` and
+  `bench/make_proteobench_submission.py` take `--quantity-column`. Measured 2026-10-26 on
+  fixed 0.8.0 identifications of held-out sets (ProteoBench metrics, ions in at least 3
+  runs), profile window + `pattern_fit` + `stable_set` against the default: species-weighted
+  |eps| Astral 0.339 -> 0.250, Q Exactive AIF 0.326 -> 0.204, Low Input 0.604 -> 0.476,
+  Generation Beta 250 pg A/B 0.518 -> 0.384; median CV lower on every set; the AIF human SD
+  higher (0.839 -> 1.026) and the diaPASEF recipe still better on the species-weighted
+  error (0.202 against 0.262). The engine reproduces the prototype these numbers come from
+  to 4e-15 per row. Every new key stays out of the canonical configuration at its default,
+  so outputs and config hashes are unchanged (docs/12, "Profile-centred window and pattern
+  fit", "Cross-run normalisation").
+
 - **Native Thermo `.raw` reading, opt-in** (`convert.thermo_native`, in a build with the
   `thermo` Cargo feature). A `.raw` is read directly through mzdata and Thermo's
   RawFileReader on a .NET 8 runtime, with the vendor centroiding ThermoRawFileParser uses,
@@ -131,6 +159,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   `rescore.prefilter_keep_decoys` in the second-pass rescore only (0 turns the prefilter off
   there); unset, nothing changes and the key stays out of the canonical configuration, so
   config hashes are unchanged (docs/35 section 16, docs/12 "Second pass").
+- **`mbr.first_pass_flag`: first-pass evidence per quantity, opt-in.** After a second pass,
+  `run-experiment` writes a Boolean `first_pass_id` into every run's `peptide_quant`
+  (schema v3): whether the row's precursor had a first-pass identification in that run at
+  `run_psm_q <= mbr.q_anchor`. The experiment-wide `peptides.tsv` gets one `first_pass_<run>`
+  column per run. Identifications, q-values and quantities do not change. Off by default,
+  and then every table, report and configuration hash keeps its bytes.
+  `bench/quant_condition_gate.py` applies the condition-level filter the flag is for, given
+  a run-to-condition map (docs/12, "Second pass").
 
 ### Changed
 
@@ -216,6 +252,13 @@ than a number. Both are recorded in every run's `manifest.json`.
   AIF: with the 3D pad above, the second pass's features, competed and scored tables are
   byte-identical to an unpadded run. On diaPASEF this changes the second-pass features, scores
   and identifications by seed-level amounts.
+- **Documentation: quantification numbers carry their pipeline and ion filter.** The
+  `quant.fixed_scan_halfwidth` and `quant.fragment_selection` reference text and docs/12
+  quoted measurements of earlier pipelines as current. Each is now dated, with its ion filter,
+  next to what 0.8.0 measures. docs/12 documents how much a 3D second pass clipped fixed
+  windows near the RT window's edge before the trace pad above, and how the default
+  `observed_area` top-3 rule compresses the ratios of the minor species under interference
+  ("Fragment selection under interference"). No output changes.
 
 ## [0.8.0] - 2026-10-22
 

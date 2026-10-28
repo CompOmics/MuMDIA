@@ -677,7 +677,7 @@ the 3D version and its exact bytes. docs/15 has the column definitions.
 | `chromatograms` | v1, v2 | v3 (v1 + `im`), v4 (v2 + `im_trimmed`) | per-point 1/K0, written only while a consumer is on |
 | `chromatograms.centroid.parquet` | | | extract's table before retrace; deleted after retrace succeeds |
 | `features` | | | the `ion_mobility` family (nine columns, ten with `imc_ref_w`) |
-| `fragment_quant` | v1 | v1 | v5 under the cross-run export, on any acquisition (section 8) |
+| `fragment_quant` | v1 | v1 | v5 under the cross-run export, v6 under a pattern rule, on any acquisition (section 8) |
 | `empirical_library.json` | | | `im` (consensus offsets and counts) and `diagnostics`, on experiments with 1/K0 |
 
 `ms2_to_ms1`, `psms_competed`, `psms_scored` and the quant tables carry no 1/K0 column; the

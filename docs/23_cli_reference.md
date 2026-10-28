@@ -36,34 +36,35 @@ MuMDIA DIA search engine (Rust MVP)
 Usage: mumdia [OPTIONS] <COMMAND>
 
 Commands:
-  convert         Read an mzML run into the normalized spectra artifact set
-  digest          Tryptic or non-specific digest (`digest.enzyme`) + decoy pairing -> peptides.parquet
-  peptidoforms    Fixed+variable modification and charge enumeration -> peptidoforms.parquet
-  predict-frag    Spectral library: b/y m/z + predicted intensity + iRT -> fragment_library
-  prescan         Sequence-tag prescan: keep only modification-bearing candidates whose anchored trimers are observed in this run -> prescan_survivors.parquet. Label-blind by construction, so it prunes search space without touching target-decoy exchangeability
-  prescreen       Fragment-rarity prescreen: score every candidate on its own window's spectra and keep those above a label-blind calibration quantile -> survivors in the prescan_survivors contract, for `extract --restrict-candidates` (docs/34_prescreen.md)
-  search-seed     Native broad DIA seed search over the fragment index -> seed_psms.parquet
-  rt-im-train     Per-run RT calibration + windows -> run_windows.parquet, cal.json
-  sub-library     Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires
-  extract         Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
-  retrace         Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. The configuration's `retrace` section applies, `enabled` aside
-  features        Compute the minimal feature set -> features.parquet + PIN
-  pool            Pool a grouped run's band artifacts into the run-level tables
-  compete         Keep the best candidate per competition group -> psms_competed.parquet
-  rescore         Rescore + native target-decoy q-values -> psms_scored.parquet
-  quant           Quantify identified peptides + roll up to protein groups
-  quant-lfq       Combine per-run quant tables into a protein-by-run matrix (cross-run LFQ)
-  run             Orchestrate the full pipeline on one run and write a manifest. Given several --mzml, the files are searched as ONE pooled experiment (`run-experiment`: one combined rescore, per-run quant, cross-run LFQ), which is the default treatment of a multi-file input; use `run-experiment` directly for run names
-  run-experiment  Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. Pass --mzml once per run (>= 2)
-  align           Cross-run RT alignment (experiment-level) -> alignment.parquet
-  mbr             Match-between-runs identification transfer (Stage D3) -> transferred.parquet
-  inspect         Print schema, head sample, and row count for any artifact
-  peak-census     Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard
-  audit           Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute
-  report          Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory
-  cache           Show, trim or clear the engine's caches: FASTA-built libraries and DeepLC's trunk projection (docs/14, "The engine's caches")
-  doctor          Check that the configured Python sidecar environments are usable
-  help            Print this message or the help of the given subcommand(s)
+  convert          Read an mzML run into the normalized spectra artifact set
+  digest           Tryptic or non-specific digest (`digest.enzyme`) + decoy pairing -> peptides.parquet
+  peptidoforms     Fixed+variable modification and charge enumeration -> peptidoforms.parquet
+  predict-frag     Spectral library: b/y m/z + predicted intensity + iRT -> fragment_library
+  prescan          Sequence-tag prescan: keep only modification-bearing candidates whose anchored trimers are observed in this run -> prescan_survivors.parquet. Label-blind by construction, so it prunes search space without touching target-decoy exchangeability
+  prescreen        Fragment-rarity prescreen: score every candidate on its own window's spectra and keep those above a label-blind calibration quantile -> survivors in the prescan_survivors contract, for `extract --restrict-candidates` (docs/34_prescreen.md)
+  search-seed      Native broad DIA seed search over the fragment index -> seed_psms.parquet
+  rt-im-train      Per-run RT calibration + windows -> run_windows.parquet, cal.json
+  sub-library      Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires
+  extract          Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
+  retrace          Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. The configuration's `retrace` section applies, `enabled` aside
+  features         Compute the minimal feature set -> features.parquet + PIN
+  pool             Pool a grouped run's band artifacts into the run-level tables
+  compete          Keep the best candidate per competition group -> psms_competed.parquet
+  rescore          Rescore + native target-decoy q-values -> psms_scored.parquet
+  quant            Quantify identified peptides + roll up to protein groups
+  quant-lfq        Combine per-run quant tables into a protein-by-run matrix (cross-run LFQ)
+  quant-normalise  Cross-run normalisation of per-run precursor quantities -> peptide_quant_normalised
+  run              Orchestrate the full pipeline on one run and write a manifest. Given several --mzml, the files are searched as ONE pooled experiment (`run-experiment`: one combined rescore, per-run quant, cross-run LFQ), which is the default treatment of a multi-file input; use `run-experiment` directly for run names
+  run-experiment   Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. Pass --mzml once per run (>= 2)
+  align            Cross-run RT alignment (experiment-level) -> alignment.parquet
+  mbr              Match-between-runs identification transfer (Stage D3) -> transferred.parquet
+  inspect          Print schema, head sample, and row count for any artifact
+  peak-census      Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard
+  audit            Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute
+  report           Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory
+  cache            Show, trim or clear the engine's caches: FASTA-built libraries and DeepLC's trunk projection (docs/14, "The engine's caches")
+  doctor           Check that the configured Python sidecar environments are usable
+  help             Print this message or the help of the given subcommand(s)
 
 Options:
       --threads <N>
@@ -150,6 +151,7 @@ first sentence of the description, with the full text in the section below.
 | [`rescore`](#rescore) | yes | Rescore + native target-decoy q-values -> psms_scored.parquet |
 | [`quant`](#quant) | yes | Quantify identified peptides + roll up to protein groups |
 | [`quant-lfq`](#quant-lfq) | no | Combine per-run quant tables into a protein-by-run matrix (cross-run LFQ) |
+| [`quant-normalise`](#quant-normalise) | yes | Cross-run normalisation of per-run precursor quantities -> peptide_quant_normalised |
 | [`run`](#run) | yes | Orchestrate the full pipeline on one run and write a manifest. |
 | [`run-experiment`](#run-experiment) | yes | Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. |
 | [`align`](#align) | yes | Cross-run RT alignment (experiment-level) -> alignment.parquet |
@@ -162,8 +164,8 @@ first sentence of the description, with the full text in the section below.
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-23 of the 27 documented subcommands accept `--config`:
- `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
+24 of the 28 documented subcommands accept `--config`:
+ `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `quant-normalise`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 4 do not, so every setting they use comes from their own flags:
  `audit`, `inspect`, `pool`, `quant-lfq`.
@@ -592,10 +594,10 @@ Options:
           Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt, width_s)
 
       --export-cross-run
-          Write the cross-run export into `--out-fragment` (fragment_quant v5: the zero-area rows and the columns the cross-run fit reads). The first pass of the cross-run step; `run-experiment` runs it by itself
+          Write the cross-run export into `--out-fragment` (fragment_quant v5: the zero-area rows and the columns the cross-run fit reads; v6 under `quant.fragment_selection = pattern_fit` or `pattern_profile`, with the pattern columns). The first pass of the cross-run step; `run-experiment` runs it by itself
 
       --cross-run-from <CROSS_RUN_FROM>...
-          The second pass of the cross-run step: the first-pass `--out-fragment` tables of every run of the experiment, written with `--export-cross-run`, in run order. The fit follows `quant.fragment_selection = cross_run`, `quant.baseline_source = experiment` and `quant.fixed_scan_halfwidth_scale`. Without it those keys fall back to the per-run quant
+          The second pass of the cross-run step: the first-pass `--out-fragment` tables of every run of the experiment, written with `--export-cross-run`, in run order. The fit follows `quant.fragment_selection = cross_run`, `pattern_fit` or `pattern_profile`, `quant.baseline_source = experiment` and `quant.fixed_scan_halfwidth_scale`. Without it those keys fall back to the per-run quant
 
       --config <CONFIG>
 ```
@@ -623,7 +625,36 @@ Options:
 
           [default: median_ratio]
 
+      --quantity-column <QUANTITY_COLUMN>
+          The intensity column of the inputs: `quantity` (default), or `quantity_normalised` of `quant-normalise` tables (then with `--normalize none`)
+
+          [default: quantity]
+
       --out <OUT>
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
+
+## quant-normalise
+
+```text
+Cross-run normalisation of per-run precursor quantities -> peptide_quant_normalised
+
+`quant.normalisation`, docs/12 "Cross-run normalisation": per run and retention-time bin, the median log2 deviation of a stable set of ions (`stable_set`). Writes one `peptide_quant_normalised` table per input and the fitted shifts. The estimator setting is `quant.normalisation_rank` of `--config`; the method is `stable_set` also when `quant.normalisation` is `off`, since running this subcommand is the request.
+
+Usage: mumdia quant-normalise [OPTIONS] --inputs <INPUTS>... --outputs <OUTPUTS>... --shifts-out <SHIFTS_OUT>
+
+Options:
+      --inputs <INPUTS>...
+          One `peptide_quant.parquet` per run, in run order
+
+      --outputs <OUTPUTS>...
+          One output table per input, in the same order
+
+      --shifts-out <SHIFTS_OUT>
+          The shifts table (`quant_normalisation.parquet`)
+
+      --config <CONFIG>
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".
