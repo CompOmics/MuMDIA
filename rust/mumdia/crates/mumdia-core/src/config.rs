@@ -2709,9 +2709,9 @@ pub struct QuantConfig {
     /// (113,876 precursors, one seed). The fixed window still beats the walked one with
     /// 0.8.0 on fixed identifications, ProteoBench default view (ions in at least 3 of 6
     /// runs): Astral species-weighted |eps| 0.355 against 0.475, global 0.238 against
-    /// 0.326, CV 0.151 against 0.237; Q Exactive AIF 0.329 against 0.542 (docs/12). On a
-    /// 3D second pass the traces are not padded, so the window is clipped near the edge of
-    /// the narrow second-pass RT window (docs/12). The width is in samples of the
+    /// 0.326, CV 0.151 against 0.237; Q Exactive AIF 0.329 against 0.542 (docs/12). Those
+    /// 0.8.0 numbers are on 3D second-pass traces that were not yet padded, so the window
+    /// was clipped near the edge of the narrow second-pass RT window (docs/12). The width is in samples of the
     /// precursor's window, so it scales with the cycle time; check it on an acquisition
     /// with much wider or narrower peaks.
     pub fixed_scan_halfwidth: usize,

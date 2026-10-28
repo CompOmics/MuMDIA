@@ -2742,8 +2742,8 @@ fn the_chain_without_retrace_is_byte_identical_and_refuses_retrace_on_3d_input()
     assert_eq!(bytes(&d3), want, "the bootstrap pass retraced");
 }
 
-/// Under a trace pad (`extract::TracePad`, the second pass's quantification coverage on 4D
-/// data) extract records each candidate's traces beyond its RT window, and nothing else
+/// Under a trace pad (`extract::TracePad`, the second pass's quantification coverage, here
+/// on 3D spectra) extract records each candidate's traces beyond its RT window, and nothing else
 /// moves: `psms_extracted` (apex, gate, evidence) is the same file, and the features read
 /// from the padded chromatograms are the features of the unpadded ones, because the stage
 /// cuts every trace back to the window it finds in the table's report and the rows' rt_lo /

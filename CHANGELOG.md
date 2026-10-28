@@ -231,13 +231,34 @@ than a number. Both are recorded in every run's `manifest.json`.
   Such a frame is now read as its scans with no peaks, which gives an empty MS1 spectrum or
   one empty spectrum per slot. A frame that declares peaks and cannot be decoded is still an
   error. Runs without such frames convert as before.
+- **The second pass of match-between-runs pads the chromatogram traces of 3D runs for
+  quantification too.** The quantification trace pad (docs/12, "Second pass") was applied
+  only to runs whose spectra carry 1/K0, and the warning about a missing pad was printed only
+  there. On 3D data the narrow second-pass RT window clipped quant's fixed integration window
+  around an apex near its edge: on the six ProteoBench Astral runs with 0.8.0, 2-29% of the
+  condition A quantities and 90-91% of the condition B quantities were integrated over fewer
+  than the 7 samples the default window asks for. Every second-pass run is now padded by the
+  quant integration window, with the warning when `extract.emit_rt_window` is off. This
+  changes the second-pass chromatograms (wider traces, `params.trace_pad_s` in their report)
+  and the quantities of every 3D `run-experiment` on purpose; the second pass's
+  `psms_extracted`, features and scored tables are those of the unpadded table, so
+  identifications do not change.
+- **The features of a padded second pass are now exactly those of the unpadded table.** The
+  features stage cuts padded traces back to the RT window in f32, and extract decides in f64
+  which points are inside it, so a pad point just outside the window whose retention time
+  rounds onto the f32 bound was read as inside. A few feature rows per run differed (diaPASEF
+  second pass: 28-55 of about 144,000 per run), which changed the classifier's training data.
+  Such a point is now stored one f32 step outside the bound. Measured on ProteoBench Astral and
+  AIF: with the 3D pad above, the second pass's features, competed and scored tables are
+  byte-identical to an unpadded run. On diaPASEF this changes the second-pass features, scores
+  and identifications by seed-level amounts.
 - **Documentation: quantification numbers carry their pipeline and ion filter.** The
   `quant.fixed_scan_halfwidth` and `quant.fragment_selection` reference text and docs/12
   quoted measurements of earlier pipelines as current. Each is now dated, with its ion filter,
-  next to what 0.8.0 measures. docs/12 now states that the second-pass trace pad applies only
-  to spectra with 1/K0, so a 3D second pass clips fixed windows near the RT window's edge, and
-  documents how the default `observed_area` top-3 rule compresses the ratios of the minor
-  species under interference ("Fragment selection under interference"). No output changes.
+  next to what 0.8.0 measures. docs/12 documents how much a 3D second pass clipped fixed
+  windows near the RT window's edge before the trace pad above, and how the default
+  `observed_area` top-3 rule compresses the ratios of the minor species under interference
+  ("Fragment selection under interference"). No output changes.
 
 ## [0.8.0] - 2026-10-22
 

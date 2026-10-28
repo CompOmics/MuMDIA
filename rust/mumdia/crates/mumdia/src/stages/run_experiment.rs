@@ -211,6 +211,28 @@ fn first_pass_w_im(cal: &str) -> Option<f64> {
     v.get("w_im")?.as_f64().filter(|w| w.is_finite())
 }
 
+/// The quantification trace pad of one second-pass run (`extract::TracePad::for_quant`),
+/// whether or not its spectra carry 1/K0. The second-pass RT window is narrow around the
+/// consensus retention time on 3D data too (ProteoBench Astral: `w_rt` 4.5-12.7 s per run,
+/// against the 9.8 s a +-3-scan integration window needs), and without the pad quant
+/// integrates the fixed window of an apex near the window's edge over fewer samples than it
+/// asks for. `None` for the walked integration window (no fixed half-width), and `None` with a
+/// warning without `extract.emit_rt_window`, which the features stage needs to cut the padded
+/// traces back to the window.
+fn second_pass_trace_pad(cfg: &Config, run: &str) -> Option<extract::TracePad> {
+    let pad = extract::TracePad::for_quant(&cfg.quant)?;
+    if cfg.extract.emit_rt_window {
+        return Some(pad);
+    }
+    warn!(
+        run = %run,
+        "run-experiment: second pass without extract.emit_rt_window, so the chromatograms are \
+         not padded for quantification and a fixed integration window near the RT window's \
+         edge is clipped"
+    );
+    None
+}
+
 /// The second pass (`mbr.strategy = second_pass`): the empirical library of the first pass's
 /// pooled scored table (`second_pass::build_library`) into `<out>/library`, then every run
 /// searched again on it from the spectra its first pass converted (`run_dirs[i]/spectra`),
@@ -223,16 +245,14 @@ fn first_pass_w_im(cal: &str) -> Option<f64> {
 /// pulled from the plan's queue, otherwise they run in chunks of `par` as the first pass did:
 /// the plan made for the first pass is reused as it is.
 ///
-/// On a run whose spectra carry 1/K0 the chain gets two settings of its own
-/// (`chain::PassExtras`), and a 3D run neither:
+/// The chain gets up to two settings of its own (`chain::PassExtras`):
 ///
-/// - a 1/K0 window floor: `im_window_min` is raised to the run's first-pass `w_im`, because a
-///   consensus 1/K0 calibrates to a narrower window than the gate's evidence supports
-///   (recorded in `cal.json` as `im_window_floor`);
-/// - a quantification trace pad (`extract::TracePad::for_quant`): the narrow second-pass RT
-///   window would clip the fixed integration window and its baseline flanks of an apex near
-///   its edge. It needs `extract.emit_rt_window`, which tells the features stage where the
-///   window ends; without it there is no pad, with a warning.
+/// - on a run whose spectra carry 1/K0 only, a 1/K0 window floor: `im_window_min` is raised
+///   to the run's first-pass `w_im`, because a consensus 1/K0 calibrates to a narrower window
+///   than the gate's evidence supports (recorded in `cal.json` as `im_window_floor`);
+/// - on every run, 3D or 4D, a quantification trace pad ([`second_pass_trace_pad`]): the
+///   narrow second-pass RT window would clip the fixed integration window and its baseline
+///   flanks of an apex near its edge.
 ///
 /// Retrace runs here as in the first pass (`finish_run` with `retrace` on).
 #[allow(clippy::too_many_arguments)]
@@ -296,8 +316,8 @@ fn search_second_pass(
             &run_out,
             Some(&seed_lib),
         )?;
-        // The run's own settings on 4D data; on a 3D run `cfg_run` is `cfg2` and the extras
-        // are the default, so its chain is the one it always was.
+        // The run's own settings: the 1/K0 window floor on 4D data only (on a 3D run
+        // `cfg_run` is `cfg2`), the quantification trace pad on every run.
         let mut cfg_run = cfg2.clone();
         let mut extras = crate::stages::chain::PassExtras::default();
         let first_cal = format!("{}/cal.json", run_dirs[i]);
@@ -317,18 +337,7 @@ fn search_second_pass(
                 "run-experiment: second pass, 1/K0 window floor from the first pass"
             );
         }
-        if crate::instrument::spectra_has_im(&co.ms2) {
-            match extract::TracePad::for_quant(&cfg.quant) {
-                Some(pad) if cfg.extract.emit_rt_window => extras.trace_pad = Some(pad),
-                Some(_) => warn!(
-                    run = %names[i],
-                    "run-experiment: second pass without extract.emit_rt_window, so the \
-                     chromatograms are not padded for quantification and a fixed integration \
-                     window near the RT window's edge is clipped"
-                ),
-                None => {}
-            }
-        }
+        extras.trace_pad = second_pass_trace_pad(cfg, &names[i]);
         finish_run(
             &cfg_run,
             ch,
@@ -2809,6 +2818,42 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
 mod tests {
     use super::*;
     use mumdia_io::table::{write_table, Col, Table};
+
+    /// The second pass pads every run's traces for quantification, 3D or 4D: the pad
+    /// depends on the quant integration window and `extract.emit_rt_window` only, never
+    /// on the spectra (it used to be applied on runs with 1/K0 alone).
+    #[test]
+    fn the_second_pass_pads_the_traces_of_every_run() {
+        let cfg = Config::default();
+        assert!(
+            cfg.extract.emit_rt_window,
+            "the default writes the RT window"
+        );
+        assert_eq!(
+            second_pass_trace_pad(&cfg, "a"),
+            Some(extract::TracePad {
+                scans: cfg.quant.fixed_scan_halfwidth,
+                seconds: 0.0
+            }),
+            "the default configuration pads by the fixed integration half-width"
+        );
+        let mut off = cfg.clone();
+        off.extract.emit_rt_window = false;
+        assert_eq!(
+            second_pass_trace_pad(&off, "a"),
+            None,
+            "no pad the features stage could not cut back"
+        );
+        let mut walked = cfg.clone();
+        walked.quant.fixed_scan_halfwidth = 0;
+        walked.quant.fixed_window_s = 0.0;
+        walked.quant.baseline_subtract = false;
+        assert_eq!(
+            second_pass_trace_pad(&walked, "a"),
+            None,
+            "the walked window needs no pad"
+        );
+    }
 
     /// The cross-run quant step is refused where candidate_id stability across runs has not
     /// been checked, and only when one of its keys asks for it.

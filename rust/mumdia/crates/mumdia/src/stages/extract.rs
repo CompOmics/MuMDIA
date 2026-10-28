@@ -170,8 +170,8 @@ pub struct ExtractParams<'a> {
     /// v4); otherwise, and on every 3D run, it does not, and nothing is computed for it.
     pub chrom_im: bool,
     /// Record each candidate's traces beyond its RT window, for quantification
-    /// ([`TracePad`]). `None`, everywhere but the second pass of match-between-runs on a
-    /// run with ion mobility, records exactly the window.
+    /// ([`TracePad`]). `None`, everywhere but the second pass of match-between-runs (3D or
+    /// 4D), records exactly the window.
     pub trace_pad: Option<TracePad>,
     /// Set when retrace rebuilds this table from the raw events right after extract
     /// (`chain::extract_to_compete` under `retrace.enabled`): every row retrace rebuilds is
@@ -209,6 +209,28 @@ impl TracePad {
         }
         (scans > 0 || seconds > 0.0).then_some(TracePad { scans, seconds })
     }
+}
+
+/// The f32 retention time a trace point is stored at. The features stage cuts a padded
+/// table back to `[lo, hi]` in f32 (`chromatograms::window_span`), while extract decides
+/// what is inside in f64, so a pad point just outside a bound whose RT rounds onto the f32
+/// bound would be read back as inside the window, and a few features would differ from the
+/// unpadded extraction's. Under a trace pad (`padded`) such a point is stored one f32 step
+/// outside the bound instead (about 1e-4 s from its RT at 1,000 s); every other point,
+/// and every point without a pad, is `t as f32`. Rounding is monotonic, so a point inside
+/// `[lo, hi]` always rounds into `[lo as f32, hi as f32]` and is kept by the cut-back.
+#[inline]
+fn trace_rt(t: f64, lo: f64, hi: f64, padded: bool) -> f32 {
+    let v = t as f32;
+    if padded {
+        if t < lo && v >= lo as f32 {
+            return (lo as f32).next_down();
+        }
+        if t > hi && v <= hi as f32 {
+            return (hi as f32).next_up();
+        }
+    }
+    v
 }
 
 /// One run's decoded spectra, lent to a stage instead of being re-decoded by it.
@@ -4712,7 +4734,12 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 observed.insert(f);
             }
         }
-        let grid_rt: Vec<f32> = t_grid.iter().map(|&r| r as f32).collect();
+        // Pad points on the f32 window bound are stored just outside it (`trace_rt`).
+        let is_padded = padded.is_some();
+        let grid_rt: Vec<f32> = t_grid
+            .iter()
+            .map(|&r| trace_rt(r, lo_c, hi_c, is_padded))
+            .collect();
         // Emit a row for EVERY predicted transition so the feature families see the
         // full predicted set (a missing strong ion is penalized). An OBSERVED
         // fragment carries its grid-sampled (or sorted) trace; a NEVER-OBSERVED one
@@ -4744,7 +4771,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 let mut ints: Vec<f32> = Vec::new();
                 for i in 0..t_groups.len() {
                     if let Some(v) = t_groups.get(i, frag) {
-                        rts.push(t_groups.rt(i) as f32);
+                        rts.push(trace_rt(t_groups.rt(i), lo_c, hi_c, is_padded));
                         ints.push(v);
                     }
                 }
@@ -5602,6 +5629,53 @@ mod frag_set_tests {
         assert_eq!(set.to_vec(), reference);
         assert_eq!(set.len(), reference.len());
         assert!(set.contains(1200) && set.contains(3) && !set.contains(4));
+    }
+}
+
+#[cfg(test)]
+mod trace_rt_tests {
+    use super::trace_rt;
+
+    /// Under a trace pad, a point outside the window never rounds into the f32 window the
+    /// features stage cuts back to, and a point inside always does; without a pad every point
+    /// is its plain f32 value.
+    #[test]
+    fn pad_points_stay_outside_the_f32_window() {
+        let (lo, hi) = (658.011151_f64, 667.565473_f64);
+        let span = |v: f32| crate::chromatograms::window_span(&[v], lo, hi).len() == 1;
+        // just outside each bound, within f32 rounding of it
+        for t in [lo - 1e-9, hi + 1e-9] {
+            assert!(t as f32 == lo as f32 || t as f32 == hi as f32, "{t}");
+            assert!(
+                !span(trace_rt(t, lo, hi, true)),
+                "pad point {t} read as inside"
+            );
+            assert!(
+                span(trace_rt(t, lo, hi, false)),
+                "unpadded value of {t} changed"
+            );
+            assert!((trace_rt(t, lo, hi, true) as f64 - t).abs() < 2e-4);
+        }
+        // bounds that are exact f32 values, with points a few microseconds outside
+        let (lo2, hi2) = (658.0_f64, 667.5_f64);
+        for t in [lo2 - 4e-6, hi2 + 4e-6] {
+            assert!(t as f32 == lo2 as f32 || t as f32 == hi2 as f32, "{t}");
+            let v = trace_rt(t, lo2, hi2, true);
+            assert!(
+                crate::chromatograms::window_span(&[v], lo2, hi2).is_empty(),
+                "{t}"
+            );
+        }
+        // inside, at and near the bounds, and well outside
+        for t in [lo, lo + 1e-9, 662.0, hi - 1e-9, hi] {
+            assert!(span(trace_rt(t, lo, hi, true)), "in-window point {t} cut");
+            assert_eq!(trace_rt(t, lo, hi, true), t as f32);
+        }
+        for t in [lo - 1.6, hi + 1.6] {
+            assert_eq!(trace_rt(t, lo, hi, true), t as f32);
+        }
+        // unbounded windows
+        assert_eq!(trace_rt(5.0, f64::NEG_INFINITY, f64::INFINITY, true), 5.0);
     }
 }
 

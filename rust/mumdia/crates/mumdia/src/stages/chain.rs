@@ -42,15 +42,16 @@ pub struct ChainParams<'a> {
     pub extras: PassExtras<'a>,
 }
 
-/// The settings the second pass of match-between-runs gives a run's chain, on a run with ion
-/// mobility (`run_experiment::search_second_pass`). The default, which every other caller
-/// passes, changes nothing.
+/// The settings the second pass of match-between-runs gives a run's chain
+/// (`run_experiment::search_second_pass`). The default, which every other caller passes,
+/// changes nothing.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PassExtras<'a> {
     /// The 1/K0 window floor the caller wrote into `cfg.rt_im_train.im_window_min`, recorded
-    /// in `cal.json`.
+    /// in `cal.json`. Set on a run with ion mobility only.
     pub im_window_floor: Option<rt_im_train::ImWindowFloor<'a>>,
-    /// Traces recorded beyond the RT window for quantification.
+    /// Traces recorded beyond the RT window for quantification. Set on every second-pass
+    /// run, 3D or 4D, under a fixed quant integration window and `extract.emit_rt_window`.
     pub trace_pad: Option<extract::TracePad>,
 }
 

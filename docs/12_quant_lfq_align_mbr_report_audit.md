@@ -388,22 +388,21 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
 
      A fixed window can only integrate the samples extract recorded. In a second pass
      extract records traces only inside the narrow second-pass RT window, and the
-     quantification trace pad that extends them is applied only to spectra with 1/K0
-     (`search_second_pass` requests `TracePad::for_quant` only when `spectra_has_im`;
-     see [On runs with ion mobility](#on-runs-with-ion-mobility-diapasef)). On a 3D
-     second pass a fixed window whose apex lies near the edge of the RT window is
-     therefore clipped to fewer than `2h+1` samples, and no warning is printed (the
-     warning exists only in the 1/K0 branch). Measured on the 0.8.0 ProteoBench Astral
-     run (cycle 1.64 s): 2.0%, 29.2% and 15.0% of the values of the three A runs and
-     90.0-90.9% of the values of the three B runs were integrated over fewer than 7
-     samples; on ProteoBench Q Exactive AIF (cycle 2.92 s) 0.1-0.5%. The size of the
-     resulting bias was estimated, not re-integrated: from the half-width dose-response of
-     the `predicted` top-6 arm on fixed identifications (human median log2 A/B -0.019,
-     +0.048 and +0.107 at h = 2, 3 and 5 on Astral, against -0.050, -0.052 and -0.052 on
-     AIF, where nothing is clipped), about +0.05 to +0.07 log2 toward A at h = 3, which
-     moves the species-weighted |eps| by about 0.01. Clipping does not explain the
-     compression of the minor species: on a 50 ng Astral set the per-run E. coli
-     compression was 0.22-0.24 log2 both in runs clipped 2% and in runs clipped 94%.
+     quantification trace pad extends them on every run ("Quantification trace pad" under
+     the second pass). Up to 0.8.0 the pad was applied only to spectra with 1/K0, so on a
+     3D second pass a fixed window whose apex lay near the edge of the RT window was
+     clipped to fewer than `2h+1` samples, without a warning. Measured on the 0.8.0
+     ProteoBench Astral run (cycle 1.64 s): 2.0%, 29.2% and 15.0% of the values of the three
+     A runs and 90.0-90.9% of the values of the three B runs were integrated over fewer
+     than 7 samples; on ProteoBench Q Exactive AIF (cycle 2.92 s) 0.1-0.5%. The bias this
+     caused was estimated from the half-width dose-response of the `predicted` top-6 arm on
+     fixed identifications (human median log2 A/B -0.019, +0.048 and +0.107 at h = 2, 3 and
+     5 on Astral, against -0.050, -0.052 and -0.052 on AIF, where nothing is clipped):
+     about +0.05 to +0.07 log2 toward A at h = 3, which moves the species-weighted |eps| by
+     about 0.01. With the pad, no Astral value is integrated over fewer than 7 samples.
+     Clipping does not explain the compression of the minor species: on a 50 ng Astral set
+     the per-run E. coli compression was 0.22-0.24 log2 both in runs clipped 2% and in runs
+     clipped 94%.
    - **bounded**, when `bound_peak` is on and no fixed window is configured:
      `trapezoid_window` restricts to the walked or consensus window.
    - **whole trace**, otherwise: `trapezoid` over every sample.
@@ -702,10 +701,8 @@ runs, per-run libraries).
 from the label-free pipelines: profile window, pattern rule and `normalisation =
 "stable_set"`. The identifications are fixed: the 0.8.0 second-pass identifications of one
 `nn_torch` seed per set, on second-pass chromatograms whose 3D traces were padded for
-quantification beyond the second-pass RT window. The engine's second pass records that pad
-only on runs with 1/K0 ("Quantification trace pad" under the second pass), so on a 3D run
-the fixed window can be clipped near the edge of the narrow second-pass RT window, and
-these numbers need the padded traces to reproduce. An
+quantification beyond the second-pass RT window, as the engine's second pass now records
+them on every run ("Quantification trace pad" under the second pass). An
 offline prototype quantified them, and this stage reproduces it (below). Scoring follows
 ProteoBench 0.18.6 metrics. An ion counts when it is in at least 3 runs, and for a
 Generation Beta pair in both conditions; scores are unfilled. The sets were held out from
@@ -953,11 +950,36 @@ comes back in the second pass: in an entrapment test on the IM branch, 113-114 o
 reportable false library entries were reported again. Raising `mbr.q_anchor` above 0.01
 therefore loosens the reported FDR, not only the library, and `Config::validate` warns.
 
+**Quantification trace pad** (every run, 3D or 4D). The second-pass RT window is narrow
+around the consensus retention time, and extract records traces only inside it, so a fixed
+integration window and its baseline flanks around an apex near the edge are clipped. Extract
+records the traces `pad` seconds further on each side, `pad` = (the largest integration
+half-width, `quant.fixed_scan_halfwidth`, or `quant.fixed_window_s` in seconds, plus
+`quant.baseline_flank_scans` under `baseline_subtract`) x the run's cycle time (the median
+spacing of one isolation window's scans). Apex choice, the gate, the peak claim and
+`psms_extracted` see only the window; a padded hit takes no part in a peak claim. The features
+stage cuts every trace back to the window (`params.trace_pad_s` in the chromatograms' report,
+`rt_lo`/`rt_hi` of `psms_extracted`), so the features are those of the unpadded table; only
+quantification reads the pad. The cut-back compares retention times in f32, while extract decides
+in f64 what is inside the window, so a pad point that lies just outside a bound but rounds onto
+the f32 bound is stored one f32 step outside it (about 1e-4 s). Until 2026-10-25 such points were
+read as inside, and 1 to 55 feature rows per run differed from the unpadded table (ProteoBench
+Astral 3-11 of about 135,000, diaPASEF 28-55 of about 144,000), which changed the classifier's
+training data and so the scored tables by seed-level amounts. It needs `extract.emit_rt_window` (on by default; without it the
+run is not padded, with a warning) and is not applied under a two-pass co-elution peak claim.
+The pad was applied on runs with 1/K0 only until 2026-10-25. Without it, on the six ProteoBench
+Astral runs (0.8.0, second-pass `w_rt` 4.5-12.7 s per run against about 9.8 s that a +-3-scan
+window needs), 2-29% of the condition A quantities and 90-91% of the condition B quantities
+were integrated over fewer than the 7 samples the default window asks for; on the Orbitrap
+AIF runs 0.2% were. The pad changes the second pass's chromatograms and quantities on 3D data,
+and nothing upstream of them.
+
 #### On runs with ion mobility (diaPASEF)
 
 The second pass runs on diaPASEF input as on any other (the refusal of earlier releases is
-lifted). Three additions apply only where the data carry 1/K0; a 3D experiment's library,
-windows, chromatograms and summaries are those described above.
+lifted). Two additions apply only where the data carry 1/K0; a 3D experiment's library,
+windows and summaries are those described above. The quantification trace pad above applies
+to both, and retrace records the padded traces as extract does.
 
 - **Consensus 1/K0.** Each confident apex of step 3 also has an apex 1/K0, joined from the
   run's first-pass `psms_extracted` on `(candidate_id, selected_peak_rank)` (after retrace,
@@ -976,22 +998,6 @@ windows, chromatograms and summaries are those described above.
   `cal.json`) when that is larger; `cal.json` records the floor and its source
   (`im_window_floor`). No configuration key: a run without a first-pass `w_im` (every 3D run)
   keeps the configured value.
-- **Quantification trace pad.** The second-pass RT window is narrow around the consensus
-  retention time, and extract records traces only inside it, so a fixed integration window
-  and its baseline flanks around an apex near the edge are clipped. Extract (and retrace)
-  record the traces `pad` seconds further on each side, `pad` = (the largest integration
-  half-width, `quant.fixed_scan_halfwidth`, or `quant.fixed_window_s` in seconds, plus
-  `quant.baseline_flank_scans` under `baseline_subtract`) x the run's cycle time (the median
-  spacing of one isolation window's scans). Apex choice, the gate, the peak claim and
-  `psms_extracted` see only the window; a padded hit takes no part in a peak claim. The
-  features stage cuts every trace back to the window (`params.trace_pad_s` in the
-  chromatograms' report, `rt_lo`/`rt_hi` of `psms_extracted`), so the features are those of
-  the unpadded table; only quantification reads the pad. It needs `extract.emit_rt_window`
-  (on by default) and is not applied under a two-pass co-elution peak claim. How often quant
-  windows and flanks were clipped before the pad is not yet measured on diaPASEF. The pad is
-  4D-only: a 3D second pass records no pad, and its fixed integration windows are clipped near
-  the edge of the RT window without a warning (measured on ProteoBench Astral under "fixed
-  window" in step 5 of the quant stage, above).
 
 Retrace runs in the second pass as in the first. The second pass reuses the first pass's
 run plan (`experiment.parallel_runs`). No diaPASEF measurement of the second pass is

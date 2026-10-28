@@ -398,8 +398,8 @@ grid are available.
 count can exceed the 32-bit `ListArray` offset ceiling on large candidate sets.
 
 Each trace covers the candidate's RT window `[rt_lo, rt_hi]`, with one exception: the second
-pass of match-between-runs on a run with ion mobility records the traces `params.trace_pad_s`
-seconds further on each side (the extract report of both tables, carried by retrace), so a
+pass of match-between-runs, on 3D and 4D runs alike, records the traces `params.trace_pad_s`
+seconds further on each side (the extract report of both tables, carried by retrace on 4D), so a
 fixed integration window and its baseline flanks fit around an apex near the window's edge
 (docs/12, "Second pass"). The schema is unchanged. The features stage reads the parameter and
 cuts every trace back to the row's window (`psms_extracted` `rt_lo`, `rt_hi`) before computing
