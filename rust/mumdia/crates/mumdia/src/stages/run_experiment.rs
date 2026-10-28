@@ -173,16 +173,18 @@ fn refuse_unchecked_cross_run_step(cfg: &Config) -> Result<()> {
     if cfg.groups.window_groups > 1 {
         anyhow::bail!(
             "the cross-run quant step (quant.fragment_selection = cross_run, \
-             quant.baseline_source = experiment or quant.fixed_scan_halfwidth_scale > 0) is \
-             not supported with groups.window_groups > 1: candidate_id stability across a \
+             pattern_fit or pattern_profile, quant.baseline_source = experiment or \
+             quant.fixed_scan_halfwidth_scale > 0) is not supported with \
+             groups.window_groups > 1: candidate_id stability across a \
              grouped run's bands has not been checked"
         );
     }
     if cfg.experiment.rt_library_scope == RtLibraryScope::PerRun {
         anyhow::bail!(
             "the cross-run quant step (quant.fragment_selection = cross_run, \
-             quant.baseline_source = experiment or quant.fixed_scan_halfwidth_scale > 0) is \
-             not supported with experiment.rt_library_scope = per_run: candidate_id \
+             pattern_fit or pattern_profile, quant.baseline_source = experiment or \
+             quant.fixed_scan_halfwidth_scale > 0) is not supported with \
+             experiment.rt_library_scope = per_run: candidate_id \
              stability across per-run libraries has not been checked. Use first_run_only."
         );
     }
@@ -2397,13 +2399,44 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         protein_quants.push(gq);
         quant_written.push(written);
     }
+    // --- cross-run normalisation (`quant.normalisation`, opt-in) ---
+    // A separate table per run next to an unchanged peptide_quant, and the fitted shifts at
+    // the experiment root. Off, nothing is written and every other artifact keeps its bytes.
+    let normalised = if cfg.quant.normalisation.is_off() {
+        None
+    } else {
+        let tables: Vec<String> = names
+            .iter()
+            .map(|nm| d(&format!("{nm}/peptide_quant_normalised.parquet")))
+            .collect();
+        let shifts = d("quant_normalisation.parquet");
+        let written = crate::stages::quant_norm::run(crate::stages::quant_norm::NormaliseParams {
+            inputs: &peptide_quants,
+            outputs: &tables,
+            shifts_out: &shifts,
+            cfg: &cfg.quant,
+            config_hash: &ch,
+        })?;
+        Some((tables, shifts, written))
+    };
+    let lfq_reads_normalised = normalised.is_some() && cfg.quant.lfq_reads_normalised();
     let lfq = d("lfq_maxlfq.parquet");
-    let n_lfq = quant::run_lfq_combine(
-        &peptide_quants,
-        false,
-        mumdia_core::config::NormalizeMethod::MedianRatio,
-        &lfq,
-    )?;
+    let n_lfq = match (&normalised, lfq_reads_normalised) {
+        (Some((tables, _, _)), true) => quant::run_lfq_combine(
+            tables,
+            false,
+            mumdia_core::config::NormalizeMethod::None,
+            "quantity_normalised",
+            &lfq,
+        )?,
+        _ => quant::run_lfq_combine(
+            &peptide_quants,
+            false,
+            mumdia_core::config::NormalizeMethod::MedianRatio,
+            "quantity",
+            &lfq,
+        )?,
+    };
 
     // --- experiment-wide report ---
     // peptides.tsv and proteins.tsv at the experiment root, selected on the
@@ -2459,6 +2492,18 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "unit": "experiment-wide peptide_q_value / pg_q_value; n_runs on run_psm_q",
         },
     });
+    // The cross-run normalisation, only when it ran, so every other manifest keeps its bytes.
+    if let (Some((tables, shifts, _)), Some(m)) = (&normalised, manifest.as_object_mut()) {
+        m.insert(
+            "cross_run_normalisation".to_string(),
+            json!({
+                "method": format!("{:?}", cfg.quant.normalisation),
+                "peptide_quants_normalised": tables,
+                "shifts": shifts,
+                "lfq_input": if lfq_reads_normalised { "quantity_normalised" } else { "quantity" },
+            }),
+        );
+    }
     // The cross-run quant step and its first-pass fragment tables, only when it ran, so
     // every other manifest keeps its bytes.
     if let (Some((_, tables)), Some(m)) = (&cross_run, manifest.as_object_mut()) {
@@ -2637,11 +2682,24 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "quant",
             Some(quant_written[i].protein.content_hash.clone()),
         ));
+        if let Some((tables, _, written)) = &normalised {
+            artifacts.push((
+                format!("peptide_quant_normalised[{name}]"),
+                artifact::PEPTIDE_QUANT_NORMALISED,
+                tables[i].clone(),
+                "quant-normalise",
+                Some(written.tables[i].content_hash.clone()),
+            ));
+        }
         // The cross-run export of pass 1, written only when the step ran.
         if let Some((_, tables)) = &cross_run {
             artifacts.push((
                 format!("fragment_quant[{name}]"),
-                artifact::fragment_quant(true),
+                artifact::fragment_quant(
+                    true,
+                    cfg.quant.fragment_selection.uses_pattern_fit()
+                        && cfg.quant.fixed_scan_halfwidth > 0,
+                ),
                 tables[i].0.clone(),
                 "quant",
                 Some(tables[i].1.content_hash.clone()),
@@ -2657,6 +2715,17 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             ),
             None => mumdia_io::record_artifact(&logical, schema, &path, rows, stage, &ch)?,
         });
+    }
+    if let Some((_, shifts, written)) = &normalised {
+        prov.record(mumdia_io::record_artifact_with_hash(
+            artifact::QUANT_NORMALISATION.0,
+            artifact::QUANT_NORMALISATION,
+            shifts,
+            written.n_shift_rows,
+            "quant-normalise",
+            &ch,
+            written.shifts.content_hash.clone(),
+        ));
     }
     prov.record(mumdia_io::record_artifact(
         artifact::LFQ_MAXLFQ.0,

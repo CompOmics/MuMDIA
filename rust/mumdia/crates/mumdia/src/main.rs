@@ -437,15 +437,17 @@ enum Cmd {
         #[arg(long)]
         out_peak_bounds: Option<String>,
         /// Write the cross-run export into `--out-fragment` (fragment_quant v5: the zero-area
-        /// rows and the columns the cross-run fit reads). The first pass of the cross-run
-        /// step; `run-experiment` runs it by itself.
+        /// rows and the columns the cross-run fit reads; v6 under `quant.fragment_selection =
+        /// pattern_fit` or `pattern_profile`, with the pattern columns). The first pass of the
+        /// cross-run step; `run-experiment` runs it by itself.
         #[arg(long, requires = "out_fragment")]
         export_cross_run: bool,
         /// The second pass of the cross-run step: the first-pass `--out-fragment` tables of
         /// every run of the experiment, written with `--export-cross-run`, in run order. The
-        /// fit follows `quant.fragment_selection = cross_run`, `quant.baseline_source =
-        /// experiment` and `quant.fixed_scan_halfwidth_scale`. Without it those keys fall
-        /// back to the per-run quant.
+        /// fit follows `quant.fragment_selection = cross_run`, `pattern_fit` or
+        /// `pattern_profile`, `quant.baseline_source = experiment` and
+        /// `quant.fixed_scan_halfwidth_scale`. Without it those keys fall back to the per-run
+        /// quant.
         #[arg(long, num_args = 1..)]
         cross_run_from: Vec<String>,
         #[arg(long)]
@@ -463,8 +465,32 @@ enum Cmd {
         /// Cross-run normalization: `median_ratio` (default), `median`, or `none`.
         #[arg(long, default_value = "median_ratio")]
         normalize: String,
+        /// The intensity column of the inputs: `quantity` (default), or
+        /// `quantity_normalised` of `quant-normalise` tables (then with `--normalize none`).
+        #[arg(long, default_value = "quantity")]
+        quantity_column: String,
         #[arg(long)]
         out: String,
+    },
+    /// Cross-run normalisation of per-run precursor quantities -> peptide_quant_normalised
+    ///
+    /// `quant.normalisation`, docs/12 "Cross-run normalisation": per run and retention-time
+    /// bin, the median log2 deviation of a stable set of ions (`stable_set`). Writes one
+    /// `peptide_quant_normalised` table per input and the fitted shifts. The estimator
+    /// setting is `quant.normalisation_rank` of `--config`; the method is `stable_set` also
+    /// when `quant.normalisation` is `off`, since running this subcommand is the request.
+    QuantNormalise {
+        /// One `peptide_quant.parquet` per run, in run order.
+        #[arg(long, num_args = 1.., required = true)]
+        inputs: Vec<String>,
+        /// One output table per input, in the same order.
+        #[arg(long, num_args = 1.., required = true)]
+        outputs: Vec<String>,
+        /// The shifts table (`quant_normalisation.parquet`).
+        #[arg(long)]
+        shifts_out: String,
+        #[arg(long)]
+        config: Option<String>,
     },
     /// Orchestrate the full pipeline on one run and write a manifest. Given several
     /// --mzml, the files are searched as ONE pooled experiment (`run-experiment`:
@@ -1932,6 +1958,7 @@ fn real_main() -> Result<()> {
                     anyhow::bail!(
                         "--cross-run-from was given, but the configuration asks for no \
                          cross-run fit: set quant.fragment_selection = cross_run, \
+                         pattern_fit or pattern_profile, \
                          quant.baseline_source = experiment or \
                          quant.fixed_scan_halfwidth_scale > 0"
                     );
@@ -1967,6 +1994,7 @@ fn real_main() -> Result<()> {
             inputs,
             method,
             normalize,
+            quantity_column,
             out,
         } => {
             let by_fragment = method.eq_ignore_ascii_case("directlfq");
@@ -1979,7 +2007,26 @@ fn real_main() -> Result<()> {
                         "--normalize must be median_ratio, median, or none (got {normalize})"
                     )
                 })?;
-            stages::quant::run_lfq_combine(&inputs, by_fragment, norm, &out)?;
+            stages::quant::run_lfq_combine(&inputs, by_fragment, norm, &quantity_column, &out)?;
+        }
+        Cmd::QuantNormalise {
+            inputs,
+            outputs,
+            shifts_out,
+            config,
+        } => {
+            let mut cfg = load_config(&config)?;
+            if cfg.quant.normalisation.is_off() {
+                cfg.quant.normalisation = mumdia_core::config::CrossRunNormalisation::StableSet;
+            }
+            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            stages::quant_norm::run(stages::quant_norm::NormaliseParams {
+                inputs: &inputs,
+                outputs: &outputs,
+                shifts_out: &shifts_out,
+                cfg: &cfg.quant,
+                config_hash: &ch,
+            })?;
         }
         Cmd::Align {
             seed_psms,

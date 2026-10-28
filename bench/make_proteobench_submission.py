@@ -52,6 +52,9 @@ def main() -> int:
     ap.add_argument("--fasta", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--min-fragments", type=int, default=1, help="minimum n_fragments_used per quantity")
+    ap.add_argument("--quantity-column", default="quantity",
+                    help="intensity column: quantity (default), or quantity_normalised of "
+                         "peptide_quant_normalised tables (quant.normalisation)")
     a = ap.parse_args()
 
     emap = fasta_entry_map(a.fasta)
@@ -62,6 +65,8 @@ def main() -> int:
         t = pq.read_table(path).to_pandas()
         n0 = len(t)
         t = t[~t["peptidoform"].str.startswith("DECOY_")]
+        if a.quantity_column != "quantity":
+            t = t.drop(columns=["quantity"]).rename(columns={a.quantity_column: "quantity"})
         t = t[t["quantity"].notna() & (t["quantity"] > 0)]
         if "n_fragments_used" in t.columns:
             t = t[t["n_fragments_used"] >= a.min_fragments]
