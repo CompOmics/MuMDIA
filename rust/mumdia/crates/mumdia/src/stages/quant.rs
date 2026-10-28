@@ -8325,6 +8325,7 @@ mod pattern_tests {
             config_hash: "test",
             cross_run: fit,
             export_cross_run: fragment.is_some(),
+            first_pass_ids: None,
         })
         .unwrap();
         pep
