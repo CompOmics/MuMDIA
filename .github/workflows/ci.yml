@@ -109,10 +109,27 @@ jobs:
       # not enable the feature. The fix is zip 9.0, and no release in the chain reaches
       # it (nethost-sys 0.8.0 still requires zip ^8.3). Drop the ignores when
       # thermorawfilereader moves to a netcorehost whose nethost-sys requires zip >= 9.
+      #
+      # Thirteen zstd advisories are ignored deliberately, all on zstd 0.13.3 /
+      # zstd-safe 7.3.0, which only timsrust 0.4.2 (the diaPASEF reader) pulls in:
+      # RUSTSEC-2026-0391 (data of an abandoned stream on a reused context), -0398 and
+      # -0396 (Seekable), -0403 (failed streaming decode of a legacy frame), and the
+      # unsound -0395, -0397, -0399, -0400, -0401, -0402, -0404, -0405, -0406
+      # (dictionaries, cloned or multithreaded contexts, OutBuffer/InBuffer positions,
+      # dictionary training). timsrust calls only `zstd::decode_all`, a fresh one-shot
+      # decoder per TDF frame, with no dictionary, Seekable, cloning, multithreading or
+      # context reuse. parquet's zstd is on the fixed 0.14.3 / zstd-safe 8.2.0. The fix
+      # for the timsrust path is zstd >= 0.14.3, which needs timsrust >= 0.6; drop these
+      # ignores when the reader moves there.
       - name: Audit
         run: >-
           cargo audit --deny unsound --deny yanked
           --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
+          --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0395 --ignore RUSTSEC-2026-0396
+          --ignore RUSTSEC-2026-0397 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0399
+          --ignore RUSTSEC-2026-0400 --ignore RUSTSEC-2026-0401 --ignore RUSTSEC-2026-0402
+          --ignore RUSTSEC-2026-0403 --ignore RUSTSEC-2026-0404 --ignore RUSTSEC-2026-0405
+          --ignore RUSTSEC-2026-0406
 
       # The desktop application has its own lockfile, which the step above does not
       # read (docs/29, work package C). One advisory is ignored deliberately:
