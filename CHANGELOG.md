@@ -7,6 +7,23 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.9.0` is a minor rather than a patch release: it changes what a search finds on some data
+and the quantities of every 3D match-between-runs experiment. When the seed search finds too
+few confident targets it searches once more at twice the fragment tolerance and keeps the
+wider search when it finds more, so a run whose fragment m/z are offset by about the
+configured tolerance is calibrated instead of extracted without retention-time and 1/K0
+windows; a run that reaches the threshold is unchanged. On diaPASEF input the 1/K0 window is
+sized from the whole seed, decoy-corrected, and widened 1.3x. A window-group search whose
+seed gives no anchors stops with an error instead of extracting every candidate over the
+whole gradient (`groups.allow_unbounded_rt` restores the previous behaviour). The second pass
+of `run-experiment` now pads the chromatogram traces of 3D runs for quantification, which
+changes their quantities and not their identifications, and the features of a padded
+second pass equal those of the unpadded table, which moves diaPASEF second-pass
+identifications by seed-level amounts. A timsTOF frame recorded without peaks no longer stops
+conversion. New and opt-in are native Thermo `.raw` reading, a profile-centred quantification
+window with pattern-fit fragment rules and stable-set normalisation, a per-quantity
+first-pass flag, and a prefilter setting for the second-pass rescore alone.
+
 `0.8.0` is a minor release: it adds cleavage rules to the digest and to the desktop
 application's Search screen (enzyme presets, custom rules, non-specific digestion). Tryptic
 libraries and existing configurations are unchanged.
@@ -111,7 +128,7 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
-## [Unreleased]
+## [0.9.0] - 2026-10-29
 
 ### Added
 
@@ -259,6 +276,17 @@ than a number. Both are recorded in every run's `manifest.json`.
   windows near the RT window's edge before the trace pad above, and how the default
   `observed_area` top-3 rule compresses the ratios of the minor species under interference
   ("Fragment selection under interference"). No output changes.
+
+### Security
+
+- **zstd 0.14.3 for Parquet; desktop application: tokio 1.54.1.** The `parquet` crate's
+  zstd dependency moves to `zstd` 0.14.3 / `zstd-safe` 8.2.0 (the same libzstd 1.5.7), which
+  closes the zstd advisories on that path. The remaining zstd advisories concern `zstd`
+  0.13.3, which only the timsTOF reader (`timsrust` 0.4.2) pulls in; it calls only
+  `zstd::decode_all`, a fresh one-shot decoder per frame, so none of the affected functions
+  is reached, and the audit ignores them with that reason until the reader moves to a newer
+  `timsrust`. The desktop lockfile moves `tokio` to 1.54.1 for RUSTSEC-2026-0386 (I/O
+  safety of `AsyncFd::new` and related constructors). Lock-only; no output changes.
 
 ## [0.8.0] - 2026-10-22
 
