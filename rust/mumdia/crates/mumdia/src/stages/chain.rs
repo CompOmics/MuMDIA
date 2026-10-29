@@ -121,6 +121,9 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
             ch,
         ),
     );
+    // A run left without a calibration is extracted over the whole gradient; say so now,
+    // with the causes the library points to, rather than only in the end summary.
+    crate::stages::rt_health::warn_after_fit(&d("cal.json"), out_dir, lib_f);
 
     let survivors =
         prescreen::run_if_enabled(cfg, ch, &co.ms2, Some(&co.ms1), lib_p, &windows, out_dir)?;

@@ -59,7 +59,12 @@ pub struct ImWindowFloor<'a> {
     pub source: &'a str,
 }
 
-const INSUFFICIENT_ANCHORS_STATUS: &str = "insufficient_anchors_unbounded";
+/// `calibration_status` of a run with fewer than two target anchors: no iRT -> RT mapping,
+/// so every candidate is extracted over the whole gradient (`rt_health` reports it).
+pub(crate) const INSUFFICIENT_ANCHORS_STATUS: &str = "insufficient_anchors_unbounded";
+/// `calibration_status` of a run with too few anchors for a residual-sized window: the
+/// broad `fallback_rt_window_s` around a fit on those few anchors.
+pub(crate) const FALLBACK_FIXED_STATUS: &str = "fallback_fixed";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum WindowPlan {
@@ -1263,7 +1268,7 @@ fn fit_anchors(
                 n_train,
                 min_anchors, "rt-im-train: too few target anchors; using fallback fixed RT window"
             );
-            (Some(width), "fallback_fixed".to_string())
+            (Some(width), FALLBACK_FIXED_STATUS.to_string())
         }
         WindowPlan::Calibrated => {
             let width = match &holdout_sizing {

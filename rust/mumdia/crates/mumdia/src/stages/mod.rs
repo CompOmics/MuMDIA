@@ -23,6 +23,7 @@ pub mod report;
 pub mod rescore;
 pub mod retrace;
 pub mod rt_bootstrap;
+pub mod rt_health;
 pub mod rt_im_train;
 pub mod run;
 pub mod run_experiment;
