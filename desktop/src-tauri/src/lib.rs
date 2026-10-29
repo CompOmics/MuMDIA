@@ -9,6 +9,7 @@ pub mod diann;
 pub mod engine;
 pub mod enzymes;
 pub mod mods;
+pub mod predictors;
 pub mod preflight;
 pub mod run;
 pub mod settings;
