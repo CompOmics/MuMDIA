@@ -33,6 +33,7 @@ is the source of truth if it has moved.
 | RT windows in a PTM search behave as if the modification were absent | The imported library gave every modform of a stripped peptide the same `predicted_irt` | Check per-stripped-peptide variance of `predicted_irt` in the library; re-predict iRT per peptidoform |
 | A grouped run (`groups.window_groups > 1`) stops with `groups: the retention-time windows would be unbounded` (or `... of band gNN would be unbounded`, `... of N of the M bands would be unbounded`) | The seed has fewer than two confident target anchors, or the fit kept fewer than two of them, so every band would extract every candidate over the whole gradient, usually at the configured fragment tolerance, and the memory has no bound (`run_groups.rs:828-880`, `run_groups.rs:438-469`, `rt_im_train.rs:80`) | Check the seed (library, decoys, `search_seed.fragment_tol_ppm`, input file), or the library's `predicted_irt` when the fit lost the anchors; search the run ungrouped; under `per_group` use `calibration = global`; or set `groups.allow_unbounded_rt = true` deliberately. See "Grouped search: unbounded retention-time windows" below |
 | `search-seed: too few confident targets at the configured fragment tolerance; the search at the wider tolerance found more and is used` (warning), or `search-seed: done ... confident=0` followed by `rt-im-train: ... using unbounded RT windows` and an extraction that runs out of memory | The run's fragment m/z are off by about `search_seed.fragment_tol_ppm` or more, so the seed at that tolerance finds no confident target and nothing calibrates the offset (+19.6 ppm on the timsTOF Pro runs of PXD028735; `search_seed.rs`, `search_with_widening`) | The warning needs no action: the retry at `fragment_tol_ppm * widen_tol_factor` found the targets and the mass calibration in `<seed>.masscal.json` gives the offset. If the seed still finds nothing, the offset is beyond the retry: raise `search_seed.fragment_tol_ppm` or `widen_tol_factor`, and check the library and its decoys. See "Seed: no confident targets" below |
+| `SEARCH DEGRADED: N of M run(s) ... had no retention-time calibration` at the end of a run, `RETENTION-TIME CALIBRATION FAILED for <run>` after `rt-im-train`, or `predict-frag: this FASTA search predicts its library with native fragment intensities` at the start | The seed of those runs left fewer target anchors than `rt_im_train.min_seed_for_calibration`, so their windows were unbounded or the broad fixed fallback; in a FASTA search the usual cause is the native fragment predictor | Predict the library with MS2PIP or AlphaPeptDeep and DeepLC (IM2Deep as well for diaPASEF), or search an imported library; the manifest lists the runs under `rt_calibration_missing`. See "Seed: no confident targets" below |
 | A single-file run spends over half an hour before extract starts | `rt_im_train.finetune_deeplc = true` fine-tunes and then re-predicts iRT over the whole library on every file | Fine-tune once into the library's `predicted_irt`, then run with `finetune_deeplc = false` and the per-run LOESS |
 | `OSError: [WinError 1114] ... Error loading "...\torch\lib\c10.dll"` from a DeepLC worker | numpy/pyarrow were imported before `deeplc`; DeepLC 4.x is torch-backed and the wrong order aborts torch DLL init | Keep `import deeplc` first (`scripts/deeplc_worker.py:26`); the ordering is load-bearing, do not sort those imports |
 | `mumdia doctor` is green, then the run crashes at the DeepLC fine-tune on a missing import | doctor probed only part of what `deeplc_finetune.py` imports | Current doctor probes `deeplc,numpy,pandas,pyarrow,torch,psm_utils` (`main.rs:370`); re-run it after any env change |
@@ -321,6 +322,38 @@ above says it did, and the seed report's `widen_tol` block records both counts. 
 retry finds nothing, raise `search_seed.fragment_tol_ppm` (or the factor) for that
 acquisition, or check the library and its decoys. The bands of a grouped run do not retry; a
 grouped run stops instead (next section).
+
+**Cause: native fragment intensities.** A FASTA search whose library was predicted with the
+native heuristic (`predict_frag.predictor = native`, the engine default) often finds no
+confident target in the seed at any tolerance, because the predicted intensities rank the
+wrong fragments: the search space is right and the scores are not. The same mechanism is
+recorded for heuristic charge-2 fragments under MS2PIP's single-charge models (CLAUDE.md,
+`HCDch2`). It needs no instrument offset to happen. A desktop user searched twelve diaPASEF
+runs this way, with native retention times and no 1/K0 predictor as well: every run had
+`n_anchors=0`, every run was extracted with unbounded windows, and the search took about ten
+hours and reported a small fraction of the identifications the data hold. The tolerance
+retry cannot help here. Predict the library with MS2PIP or AlphaPeptDeep and DeepLC (with
+IM2Deep for diaPASEF; `configs/examples/fasta-sidecars.json`,
+`configs/examples/diapasef.json`), or search an imported library.
+
+**How it is reported.** A FASTA search on native fragment intensities logs `predict-frag:
+this FASTA search predicts its library with native fragment intensities ...` before its
+first stage. A run that ends `rt-im-train` without a calibration logs `RETENTION-TIME
+CALIBRATION FAILED for <run> (<n> target anchors, status ...)`, with the likely causes; the
+native predictors are named first when the library's own report
+(`fragment_library_fragments.parquet.report.json`, `params.fragment_predictor`) says they
+predicted it. `run` and `run-experiment` end with `SEARCH DEGRADED: N of M run(s) in the
+first pass had no retention-time calibration ...` and record each such run, with its pass,
+status and anchor count, under `rt_calibration_missing` in `manifest.json` (or in the
+`experiment` block of `experiment_manifest.json`). The field exists only when a run had no
+calibration (`stages/rt_health.rs`), and the desktop application shows it at the top of the
+results screen.
+
+**Why the search is not stopped.** An ungrouped search with unbounded windows is slow, not
+fatal, and some runs have no anchors legitimately: a blank well of a single-cell plate, or a
+run the second pass of `run-experiment` searches again on the consensus retention times of
+the others. A stop would end those experiments. A grouped search, where unbounded windows
+multiply the memory by the number of bands, stops (next section).
 
 ## Grouped search: unbounded retention-time windows
 

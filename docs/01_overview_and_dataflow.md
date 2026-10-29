@@ -505,7 +505,13 @@ keys are recorded: `rt_predictor`, `fragment_predictor`, `rescorer`, and
 fine-tuned precursor table is recorded when it is the table actually consumed
 downstream. Calibration JSON, PIN/schema companions, report TSVs, and some
 optional diagnostic sidecars are not manifest artifacts. The manifest is written last to
-`<out_dir>/manifest.json` (`run.rs:501`) with `mumdia_io::json::write_json`. The
+`<out_dir>/manifest.json` (`run.rs:501`) with `mumdia_io::json::write_json`. A run
+without a retention-time calibration (`calibration_status` `insufficient_anchors_unbounded` or
+`fallback_fixed` in its `cal.json`) adds `rt_calibration_missing`, a list of
+`RtCalibrationGap` records (`run`, `pass`, `calibration_status`, `n_train`, `cal_json`); the
+field is skipped when empty, so a calibrated run's manifest is unchanged
+(`stages/rt_health.rs`). `run-experiment` writes the same list, per pass, in the `experiment`
+block of `experiment_manifest.json`. The
 manifest is provenance recorded, not required: because inputs are
 path-addressable, no stage depends on it to run (docs/18 B1).
 
