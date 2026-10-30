@@ -188,6 +188,16 @@ pub fn run(p: RunParams) -> Result<()> {
     pre.step("resolve_interpreters");
     let cfg = &resolved;
     preflight(&p, cfg)?;
+    // What the library is predicted with, for the native-model warning now and the causes
+    // the end summary names (`rt_health`).
+    let native = crate::stages::rt_health::NativePredictions::of_config(
+        cfg,
+        p.lib_precursors.is_none(),
+        crate::instrument::input_has_im(p.mzml),
+    );
+    if let Some(w) = crate::stages::rt_health::native_predictor_warning(&native) {
+        warn!("{w}");
+    }
     pre.step("preflight");
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
     std::fs::create_dir_all(p.out_dir).ok();
@@ -1062,6 +1072,17 @@ pub fn run(p: RunParams) -> Result<()> {
             ),
         }
     }
+
+    // A run without a retention-time calibration, recorded only when it happened so a
+    // calibrated run's manifest keeps its bytes, and said once more at the end.
+    let run_name = std::path::Path::new(p.mzml)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.mzml.to_string());
+    if let Some(gap) = crate::stages::rt_health::gap_of(&d("cal.json"), &run_name, "run") {
+        man.rt_calibration_missing.push(gap);
+    }
+    crate::stages::rt_health::warn_summary(&man.rt_calibration_missing, 1, &native);
 
     let manifest_path = d("manifest.json");
     mumdia_io::json::write_json(&manifest_path, &man)?;

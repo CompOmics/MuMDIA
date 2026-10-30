@@ -88,6 +88,10 @@ const state = {
   space: null,
   spaceSeq: 0,
   spaceTimer: null,
+  // The built-in path's predictor plan (`builtin_plan`), with the same stale-answer
+  // counter: each check runs `mumdia doctor` once per recipe it considers.
+  builtinSeq: 0,
+  builtinTimer: null,
   // Output folders this application has used. The only thing it remembers; what
   // each one contains is read back from the folder.
   known: JSON.parse(localStorage.getItem("mumdia.folders") || "[]"),
@@ -220,6 +224,8 @@ async function init() {
       if (r.value === "diann") refreshLibSrcNote();
     });
   }
+  // The built-in path's predictors depend on the preset as well as on the files.
+  $("preset").addEventListener("change", scheduleBuiltinPlan);
   for (const b of document.querySelectorAll("[data-pick]")) {
     b.addEventListener("click", () => pick(b.dataset.pick));
   }
@@ -1120,6 +1126,7 @@ function setMode(mode) {
   show($("mode-fasta"), mode === "fasta");
   show($("mode-library"), mode === "library");
   scheduleSpace();
+  scheduleBuiltinPlan();
 }
 
 // ── file pickers ────────────────────────────────────────────────────────────
@@ -1247,6 +1254,7 @@ async function pick(what) {
     await renderMzmlList();
     updateRawNote();
     refreshPrescreenNote();
+    scheduleBuiltinPlan();
     // The peak census reads one file, and only an mzML: with several selected there
     // is no single answer to show, and for a vendor path it would convert first.
     if (state.picks.mzml.length === 1 && !isVendor(state.picks.mzml[0])) {
@@ -1953,6 +1961,65 @@ function selectLibSrc(which) {
   const r = $(which === "diann" ? "libsrc-diann" : "libsrc-builtin");
   if (r) r.checked = true;
   show($("libsrc-params"), which === "diann");
+  scheduleBuiltinPlan();
+}
+
+// ── built-in predictors ─────────────────────────────────────────────────────
+// A FASTA search on the built-in path predicts its library with what its configuration
+// names, and the preset selected by default (the imported-library one) names no fragment
+// predictor, which left such searches on the engine's native models. `builtin_plan`
+// replaces a preset that names none with the first recipe whose interpreters the engine
+// finds (the diaPASEF recipe for a timsTOF diaPASEF .d), and says when the search would
+// still run on native predictions. Shown here while the choice is being made, and asked
+// again at Start.
+function scheduleBuiltinPlan() {
+  clearTimeout(state.builtinTimer);
+  state.builtinTimer = setTimeout(refreshBuiltinPlan, 400);
+}
+
+async function builtinPlan() {
+  return invoke("builtin_plan", { preset: $("preset").value || null, mzml: state.picks.mzml });
+}
+
+async function refreshBuiltinPlan() {
+  const note = $("libsrc-builtin-note");
+  const warn = $("builtin-warn");
+  const seq = ++state.builtinSeq;
+  if (state.mode !== "fasta" || state.libSrc !== "builtin") {
+    note.textContent = "";
+    banner(warn, "");
+    return;
+  }
+  note.textContent = "Checking which predictors are installed…";
+  let plan;
+  try {
+    plan = await builtinPlan();
+  } catch (e) {
+    if (seq !== state.builtinSeq) return;
+    note.textContent = `Could not check the predictors: ${e}`;
+    banner(warn, "");
+    return;
+  }
+  if (seq !== state.builtinSeq) return;
+  note.textContent = plan.note;
+  banner(warn, plan.warning || "");
+}
+
+// Ask before a search that would run on native predictions, or on diaPASEF spectra
+// without predicted 1/K0. True to go on.
+async function confirmPredictors(warning) {
+  const message = `${warning}\n\nStart the search anyway?`;
+  try {
+    return await dialog.ask(message, {
+      title: "This search would be slow and insensitive",
+      kind: "warning",
+      okLabel: "Start anyway",
+      cancelLabel: "Go back",
+    });
+  } catch {
+    // A dialog plugin that cannot ask must not turn the warning into a silent start.
+    return window.confirm(message);
+  }
 }
 
 /// Build the library if needed and return its two tables, or null on failure.
@@ -2151,9 +2218,11 @@ function renderBatchSummary() {
   for (const r of b.results) {
     const row = document.createElement("div");
     const n = r.results ? fmtInt(r.results.peptides_1pct) : null;
+    const uncalibrated = (r.results?.rt_calibration_missing || []).length > 0;
     row.textContent = r.error
       ? `${baseName(r.file)} — failed: ${r.error}`
-      : `${baseName(r.file)} — ${n ?? "?"} peptides at 1%`;
+      : `${baseName(r.file)} — ${n ?? "?"} peptides at 1%` +
+        (uncalibrated ? " — DEGRADED: no retention-time calibration" : "");
     // Each file of a separate-files batch is its own result, in its own folder.
     if (!r.error && r.out_dir) {
       const open = node("button", "btn quiet small", "Open in visDIA");
@@ -2243,6 +2312,29 @@ async function startSearch() {
   // validated by the engine before anything starts. With nothing chosen the preset is
   // passed unchanged, as before.
   let config = $("preset").value || null;
+
+  // The built-in path: the predictors the library is built with, chosen and checked now
+  // (`builtin_plan`). A search that would still run on native predictions, or on a
+  // diaPASEF .d without predicted 1/K0, starts only when the user says so.
+  if (state.mode === "fasta" && !built) {
+    let plan = null;
+    try {
+      plan = await builtinPlan();
+    } catch (e) {
+      banner($("start-error"), `Could not check the predictors: ${e}`);
+      screen("input");
+      return;
+    }
+    config = plan.base;
+    $("libsrc-builtin-note").textContent = plan.note;
+    banner($("builtin-warn"), plan.warning || "");
+    if (plan.warning && !(await confirmPredictors(plan.warning))) {
+      banner($("start-error"), plan.warning);
+      screen("input");
+      return;
+    }
+  }
+
   const bands = await resolveBands(built ? built[0] : null);
   if ($("prescreen").value === "after" && bands.bands > 1) {
     banner(
@@ -2578,6 +2670,39 @@ function render(s) {
   }
 }
 
+// The runs the engine recorded without a retention-time calibration
+// (`rt_calibration_missing` in its manifest), as the sentence the results screen leads
+// with, or "" for a calibrated search. Such a run's first-pass search found too few
+// confident anchors, so its candidates were extracted over the whole gradient (or a broad
+// fixed window): the search finished, slowly, with far fewer identifications than the
+// data hold, and nothing else on this screen would say so.
+function degradedMessage(r) {
+  const gaps = r?.rt_calibration_missing || [];
+  if (!gaps.length) return "";
+  const runs = (pred) => new Set(gaps.filter(pred).map((g) => g.run)).size;
+  const first = runs((g) => g.pass !== "second_pass");
+  const second = runs((g) => g.pass === "second_pass");
+  const n = r.n_runs || Math.max(first, second);
+  const parts = [];
+  if (first) {
+    parts.push(
+      n > 1
+        ? `${first} of ${n} runs had no retention-time calibration`
+        : "This run had no retention-time calibration"
+    );
+  }
+  if (second) parts.push(`${second} of ${n} runs had none in the second pass`);
+  return (
+    `SEARCH DEGRADED: ${parts.join("; ")}. The first-pass search found too few ` +
+    "confident anchors, so candidates were extracted over the whole gradient: the " +
+    "search was slow and the counts below are far lower than these data should give. " +
+    "The usual cause is the native fragment predictor; others are a mass offset beyond " +
+    "the search tolerance or a library that does not fit the sample. Search again with " +
+    "MS2PIP or AlphaPeptDeep and DeepLC (with IM2Deep for diaPASEF), or with a predicted " +
+    "or imported library. The log names the cause it found."
+  );
+}
+
 function renderResults(s) {
   // The per-file breakdown belongs to a batch; a single run shows its own counts.
   show($("res-batch-card"), false);
@@ -2616,6 +2741,8 @@ function renderResults(s) {
   } else {
     banner($("res-warn"), "");
   }
+
+  banner($("res-degraded"), degradedMessage(r));
 
   // Every count names its row unit and its q-value column. A number without both
   // is not interpretable, and this is where a screenshot gets taken.

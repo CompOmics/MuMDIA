@@ -1151,6 +1151,16 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         );
     }
     preflight(&p)?;
+    // What the library is predicted with, for the native-model warning now and the causes
+    // the end summary names (`rt_health`).
+    let native = crate::stages::rt_health::NativePredictions::of_config(
+        cfg,
+        p.lib_precursors.is_none(),
+        p.mzmls.iter().any(|m| crate::instrument::input_has_im(m)),
+    );
+    if let Some(w) = crate::stages::rt_health::native_predictor_warning(&native) {
+        warn!("{w}");
+    }
     pre.step("preflight");
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
     std::fs::create_dir_all(p.out_dir).ok();
@@ -2493,6 +2503,26 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         q_threshold: cfg.quant.q_threshold,
     })?;
 
+    // Runs without a retention-time calibration, per pass: each run's own seed (the first
+    // pass) and, when it ran, the second pass on the consensus library.
+    let mut rt_gaps = Vec::new();
+    for nm in &names {
+        if let Some(g) =
+            crate::stages::rt_health::gap_of(&format!("{}/cal.json", d(nm)), nm, "first_pass")
+        {
+            rt_gaps.push(g);
+        }
+    }
+    if second.is_some() {
+        for nm in &names {
+            let cal = format!("{}/cal.json", d(&format!("second_pass/{nm}")));
+            if let Some(g) = crate::stages::rt_health::gap_of(&cal, nm, "second_pass") {
+                rt_gaps.push(g);
+            }
+        }
+    }
+    crate::stages::rt_health::warn_summary(&rt_gaps, n_runs, &native);
+
     // --- experiment manifest ---
     let mut manifest = json!({
         "config_hash": ch,
@@ -2527,6 +2557,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "unit": "experiment-wide peptide_q_value / pg_q_value; n_runs on run_psm_q",
         },
     });
+    // The runs without a retention-time calibration, only when there were any, so every
+    // other manifest keeps its bytes (`rt_health`).
+    if let (false, Some(m)) = (rt_gaps.is_empty(), manifest.as_object_mut()) {
+        m.insert("rt_calibration_missing".to_string(), json!(rt_gaps));
+    }
     // The first-pass flag, only when it was written, so every other manifest keeps its
     // bytes: the cut it was taken at and, per run, the flagged second-pass candidates.
     if let (Some(ids), Some(m)) = (&first_pass_ids, manifest.as_object_mut()) {
