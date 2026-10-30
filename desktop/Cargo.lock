@@ -1943,6 +1943,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "ureq",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

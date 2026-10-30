@@ -76,6 +76,8 @@ const state = {
   // A Start is in progress: library build, derived configuration, preflight, launch.
   starting: false,
   setupTimer: null,
+  // Polls the Visual C++ runtime installation while it runs.
+  vcrtTimer: null,
   schema: null,
   overrides: {},
   savedConfig: null,
@@ -228,6 +230,7 @@ async function init() {
   $("install-ms2pip").addEventListener("click", () => installComponents("ms2pip"));
   $("install-visdia").addEventListener("click", () => installComponents("visdia"));
   $("recheck-primary").addEventListener("click", () => recheckComponents("primary"));
+  $("vcrt-install").addEventListener("click", installVcRuntime);
   $("open-visdia").addEventListener("click", (e) =>
     openVisdia(state.outDir, e.currentTarget, $("visdia-error"), state.picks.fasta)
   );
@@ -577,6 +580,7 @@ async function refreshComponents() {
   show($("primary-bar"), installing || testing(p));
   show($("install-log-card"), installing || p.install_status === "failed");
   show($("recheck-primary"), loadFailed);
+  renderVcRuntime(c.vc_runtime);
 
   if (installing) {
     pill.textContent = "installing…";
@@ -747,6 +751,62 @@ async function recheckComponents(env) {
     return;
   }
   refreshComponents();
+}
+
+// "Install Visual C++ runtime" (`vcruntime.rs`): offered on Windows when the real import
+// failed on a torch DLL, and only ever run on this click. The backend downloads
+// Microsoft's installer, refuses it unless its signature is valid and Microsoft's, runs it
+// elevated (Windows asks for permission), and tests the packages again afterwards.
+function renderVcRuntime(vc) {
+  if (!vc) return;
+  const s = vc.state || {};
+  const busy = ["downloading", "verifying", "installing"].includes(s.phase);
+  const spoke = busy || s.phase === "done" || s.phase === "failed";
+  show($("vcrt-install"), vc.available && vc.needed && !busy);
+  $("vcrt-install").disabled = busy;
+  show($("vcrt-status"), vc.available && spoke && !!s.message);
+  $("vcrt-status").textContent = s.message || "";
+  const bar = $("vcrt-bar");
+  show(bar, vc.available && busy);
+  bar.classList.toggle("pct", s.phase === "downloading" && s.percent > 0);
+  bar.firstElementChild.style.width =
+    s.phase === "downloading" && s.percent > 0 ? `${s.percent}%` : "";
+  if (busy && !state.vcrtTimer) {
+    state.vcrtTimer = setInterval(pollVcRuntime, 700);
+  } else if (!busy && state.vcrtTimer) {
+    clearInterval(state.vcrtTimer);
+    state.vcrtTimer = null;
+  }
+}
+
+async function pollVcRuntime() {
+  let s;
+  try {
+    s = await invoke("vcruntime_state");
+  } catch {
+    return;
+  }
+  const busy = ["downloading", "verifying", "installing"].includes(s.phase);
+  if (busy) {
+    renderVcRuntime({ available: true, needed: true, state: s });
+  } else {
+    // Finished: the backend has asked for the packages to be tested again, so the whole
+    // screen is refreshed, which shows "testing..." and then the new result.
+    clearInterval(state.vcrtTimer);
+    state.vcrtTimer = null;
+    refreshComponents();
+  }
+}
+
+async function installVcRuntime() {
+  banner($("setup-error"), "");
+  try {
+    await invoke("vcruntime_install");
+  } catch (e) {
+    banner($("setup-error"), String(e));
+    return;
+  }
+  pollVcRuntime();
 }
 
 async function installComponents(env) {
