@@ -1148,6 +1148,7 @@ moves to another function.
 | `MUMDIA_CONVERT_THREADS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/convert.rs::convert_threads` |
 | `MUMDIA_DEEPLC_RAW_OUTPUT` | sidecar | `""` | `scripts/deeplc_finetune.py::quiet_deeplc_progress`, `scripts/deeplc_worker.py::quiet_deeplc_progress` |
 | `MUMDIA_DEEPLC_THREAD_CAP` | both | `"auto"` | `rust/mumdia/crates/mumdia/src/sched.rs::auto_overlap_threads`, `scripts/deeplc_finetune.py::main`, `scripts/deeplc_worker.py::main` |
+| `MUMDIA_DOCTOR_IMPORT_CHECK` | engine | computed: on when unset: `mumdia doctor` imports each used role's modules for real; `0` skips that import, as `--no-import-check` does (`main.rs` `real_main`) | `rust/mumdia/crates/mumdia/src/main.rs::real_main` |
 | `MUMDIA_ENTRAPMENT_MODEL` | sidecar | `"gbm"` | `scripts/entrapment_worker.py::_new_model` |
 | `MUMDIA_IM2DEEP_THREAD_CAP` | sidecar | `"auto"` | `scripts/im2deep_worker.py::main` |
 | `MUMDIA_KEEP_HANDOFF` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::keep_handoff` |
@@ -1238,7 +1239,7 @@ moves to another function.
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `XDG_CACHE_HOME` | engine | computed: set by the desktop environment, often unset; an absolute value puts the engine's caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 
-101 variables are read: 39 engine-side, 66 sidecar-side, 4 on both sides.
+102 variables are read: 40 engine-side, 66 sidecar-side, 4 on both sides.
 
 ### Variables the code sets
 
@@ -1267,8 +1268,8 @@ one exception noted in its own help text: it sets `MUMDIA_NN_THREADS` and
 | `NUMEXPR_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py::<module>` |
 | `OMP_NUM_THREADS` | both | `"1"` in deeplc_finetune.py; `n.to_string()` in main.rs | `rust/mumdia/crates/mumdia/src/main.rs::apply_threads`, `scripts/deeplc_finetune.py::<module>` |
 | `OPENBLAS_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py::<module>` |
-| `PYTHONIOENCODING` | engine | `"utf-8"` | `rust/mumdia/crates/mumdia/src/sidecar.rs::run_worker` |
-| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/sidecar.rs::run_worker`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs::free_bytes`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_entrapment_gbm` |
+| `PYTHONIOENCODING` | engine | `"utf-8"` | `rust/mumdia/crates/mumdia/src/python.rs::import_probe_command`, `rust/mumdia/crates/mumdia/src/sidecar.rs::run_worker` |
+| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/python.rs::import_probe_command`, `rust/mumdia/crates/mumdia/src/sidecar.rs::run_worker`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs::free_bytes` |
 
 ## Unresolved by the generator
 
@@ -1298,6 +1299,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-24 structs and 324 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 42 enumerations, 1 named profile(s), 101 environment variables read and 20 set.
+24 structs and 324 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 42 enumerations, 1 named profile(s), 102 environment variables read and 20 set.
 
 36 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

@@ -924,6 +924,11 @@ Options:
           Emit the report as JSON on stdout instead of prose on stdout.
 
           For a caller that has to act on the result rather than read it: the desktop application renders one row per role and offers to install what is missing, which means it needs the modules and versions as data, not a paragraph to regex. The exit status is unchanged.
+
+      --no-import-check
+          Skip the real import of each interpreter's packages and only check that they are installed.
+
+          By default every interpreter the configuration uses is asked to import its role's packages for real (`deeplc` first, then torch with one operation), with a 120 s bound per role. That costs seconds, and it is the only check that catches a package which is installed but cannot load, such as a torch whose DLLs fail to initialise on Windows. `MUMDIA_DOCTOR_IMPORT_CHECK=0` does the same as this flag, for a caller that cannot know whether its engine has it.
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".
