@@ -13,7 +13,8 @@
   every other program that also installed them.
 
   Used only through tauri.vcruntime.conf.json, which the release and CI builds pass with
-  `cargo tauri build --config`. The module's path comes from TAURI_MUMDIA_VC_CRT_MSM
+  `cargo tauri build` with its config option (an XML comment cannot hold two hyphens
+  in a row, hence the wording). The module's path comes from TAURI_MUMDIA_VC_CRT_MSM
   (the bundler passes only TAURI_* variables to WiX), which ci/find_vc_merge_module.ps1
   sets from the Visual Studio installation on the build machine. A plain
   `cargo tauri build` does not read this file and builds an MSI without the runtime.
