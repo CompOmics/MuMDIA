@@ -325,7 +325,15 @@ pub fn judge_signature(sig: &Signature) -> Result<(), String> {
 /// Ask Windows PowerShell for a file's Authenticode signature. The path arrives in the
 /// environment variable `MUMDIA_VCREDIST_FILE` rather than in the script text, so no
 /// character in it can change the script.
+///
+/// The module that defines `Get-AuthenticodeSignature` is imported from Windows
+/// PowerShell's own directory (`$PSHOME`). Left to autoloading, a `PSModulePath`
+/// inherited from PowerShell 7 points Windows PowerShell at PowerShell 7's copy of the
+/// module, which it cannot load (`CouldNotAutoloadMatchingModule`, seen on the CI
+/// runner); `win::signature` also drops the inherited `PSModulePath`.
 pub const SIGNATURE_SCRIPT: &str = "$ErrorActionPreference = 'Stop'\n\
+     Import-Module (Join-Path $PSHOME \
+     'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1')\n\
      $s = Get-AuthenticodeSignature -LiteralPath $env:MUMDIA_VCREDIST_FILE\n\
      $subject = ''\n\
      if ($s.SignerCertificate) { $subject = $s.SignerCertificate.Subject }\n\
@@ -642,6 +650,7 @@ pub mod win {
                 SIGNATURE_SCRIPT,
             ])
             .env("MUMDIA_VCREDIST_FILE", path)
+            .env_remove("PSModulePath")
             .stdin(std::process::Stdio::null())
             .output()
             .map_err(|e| format!("Windows PowerShell could not be started to check it: {e}"))?;
@@ -912,6 +921,9 @@ mod tests {
     fn the_script_takes_the_path_from_the_environment_only() {
         assert!(SIGNATURE_SCRIPT.contains("-LiteralPath $env:MUMDIA_VCREDIST_FILE"));
         assert!(SIGNATURE_SCRIPT.contains("ConvertTo-Json -Compress"));
+        assert!(SIGNATURE_SCRIPT.contains(
+            r"Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1')"
+        ));
     }
 
     #[test]
