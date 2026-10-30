@@ -16,4 +16,5 @@ pub mod run;
 pub mod settings;
 pub mod sizing;
 pub mod thermo;
+pub mod vcruntime;
 pub mod viewer;
