@@ -133,6 +133,87 @@ upgrade is tested again. The application's own `doctor` calls, which ask only wh
 roles a configuration needs and which converters exist, set
 `MUMDIA_DOCTOR_IMPORT_CHECK=0` so they do not repeat that import.
 
+### The Visual C++ runtime
+
+PyTorch's Windows wheels need the Microsoft Visual C++ 2015-2022 x64 runtime
+(`vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`) at 14.40 or newer, and a
+fresh Windows does not always have one; without it the real import above fails on
+`torch\lib\c10.dll`. Two things provide it.
+
+**The installer carries it.** The release MSI merges Microsoft's merge module for the
+runtime (`Microsoft_VC14x_CRT_x64.msm`) from the Visual Studio installation on the
+build runner (`src-tauri/wix/vc-runtime.wxs`, added by `tauri.vcruntime.conf.json`).
+Installing MuMDIA therefore installs the runtime into `System32` with Windows
+Installer's own rules: no network at install time, and a file is never replaced by an
+older one, so a machine that already has a newer runtime keeps it and the
+installation succeeds. The runtime files are shared, reference-counted components:
+uninstalling MuMDIA leaves them for the other programs that installed them too. The
+options considered, and why this one:
+
+- **the merge module (chosen)**: native to the MSI that Tauri already builds, works
+  offline, and needs no custom action. Microsoft describes merge modules for the
+  runtime as deprecated in favour of the redistributable installer, but still ships
+  and supports them; the cost of the choice is that a runtime installed this way is
+  updated by installing a newer MuMDIA or the redistributable, not on its own;
+- **running `vc_redist.x64.exe` from a custom action**: it is itself a Windows
+  Installer package, and Windows Installer runs one installation at a time, so
+  launched from inside the MSI's own installation it fails with 1618 ("another
+  installation is in progress") unless it is scheduled after the installation has
+  finished, outside its transaction and its elevation. It also adds 25 MB that must be pinned and
+  re-pinned;
+- **an NSIS bundle**: Tauri can build one and run the redistributable from it, but
+  it would replace the MSI, which existing installations upgrade from, and give up
+  the administrative install the release workflow inspects.
+
+`release.yml` locates the module with `ci/find_vc_merge_module.ps1`, checks it before
+the build and the built MSI after it with `ci/check_msi_runtime.ps1` (the merge module
+recorded in `ModuleSignature`, the three DLLs in the `File` table at 14.40 or newer,
+installed into `System64Folder`), and the Windows CI job also installs the MSI on a
+runner that already has a newer runtime and uninstalls it again. A plain
+`cargo tauri build` does not read the overlay and produces an MSI without the
+runtime, which is the right default on a developer machine without Visual Studio's
+merge modules.
+
+The runtime is redistributed under the Microsoft Visual Studio license terms, which
+allow the files on Visual Studio's redistribution list (REDIST.TXT), the runtime's
+merge modules among them, to be distributed as part of an application. It is not a
+Rust dependency, so it is not in `THIRD_PARTY_LICENSES.md` or `sbom.cdx.json`, both
+of which describe the engine binary; in Windows' list of installed programs it is
+part of MuMDIA rather than an entry of its own.
+
+**The Components screen installs it on request.** For a machine where the installer
+did not provide it (an installation from an older MSI, or a runtime removed
+afterwards), a failed real import whose traceback is a torch DLL failure shows
+**Install Visual C++ runtime** next to Re-check, on Windows only. Nothing happens until it is pressed.
+Then `vcruntime.rs`:
+
+1. downloads https://aka.ms/vs/17/release/vc_redist.x64.exe, Microsoft's permanent
+   link to the current redistributable, into a new directory under `%TEMP%`, with
+   progress (a proxy is read from `HTTPS_PROXY` / `ALL_PROXY`; a failed download says
+   so and gives the link to install it by hand);
+2. holds the file open so that it can be read but not replaced, and asks Windows for
+   its Authenticode signature (`Get-AuthenticodeSignature`, with the path passed in
+   an environment variable, never in the script). Anything but a valid signature
+   whose signer's organisation is `Microsoft Corporation` is refused and the file
+   deleted;
+3. launches it elevated with `/install /passive /norestart`: Windows shows its
+   permission prompt, and declining it is reported as such. The installer's own
+   window shows its progress;
+4. reads the exit code: 0 installed; 1638, this or a newer runtime was already there,
+   so the failure is more likely an older `msvcp140.dll` earlier on `PATH`
+   (`where msvcp140.dll` lists them in the order Windows tries them); 3010, installed
+   but Windows must restart first, which the screen says; 1602 closed, 1618 another
+   installation running, anything else with the code and the manual link;
+5. after 0, 1638 or 3010, tests every environment whose import failed again, as
+   Re-check does, so the cards move to "testing..." and then to the new result.
+
+The sequence is a small state machine over three steps behind a trait, so it and
+every message are unit-tested without Windows; the Windows CI job runs the real
+signature check on system binaries, the hold, and the whole sequence against
+Microsoft's server on the runner (which takes the 1638 path). Not tested anywhere: a
+real Windows machine without the runtime, and the permission prompt itself, which
+the hosted runners do not show.
+
 ### Uninstalling does not remove them
 
 An MSI removes exactly what it placed under Program Files. Everything the
@@ -655,6 +736,9 @@ README alone, so DeepLC, the neural rescorer, mokapot and the DIA-NN import all
 failed at the point of use; `release.yml` now stages `scripts/*.py` and opens every
 bundle it built (`msiexec /a` on Windows, `--appimage-extract` on Linux) to assert
 the console, the engine, `uv` and the workers are inside and the engine runs.
+On Windows the build also passes `--config src-tauri/tauri.vcruntime.conf.json`,
+which merges the Visual C++ runtime into the MSI ("The Visual C++ runtime" above), and
+the same inspection checks that it is there.
 
 Everything else the application needs from the repository is compiled in with
 `include_str!`: the settings schema, and the three requirement sets. That is both

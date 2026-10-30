@@ -130,6 +130,23 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Added
+
+- **The desktop installer provides the Microsoft Visual C++ x64 runtime that PyTorch
+  needs on Windows.** The MSI merges Microsoft's runtime merge module from the build
+  runner's Visual Studio, so a fresh installation can load `torch\lib\c10.dll`. It needs
+  no network at install time, never replaces a newer runtime, and leaves the shared runtime
+  in place on uninstall. The release workflow and a new Windows CI job check the built MSI
+  for the module and its DLLs (`ci/check_msi_runtime.ps1`), and the CI job installs and
+  uninstalls it on a runner with a newer runtime. The runtime is redistributed under the
+  Visual Studio license terms (desktop/README.md, "The Visual C++ runtime").
+- **Install Visual C++ runtime, on the Components screen.** On Windows, when the real
+  import fails on a torch DLL, the screen offers to install the runtime. On that click only,
+  the application downloads Microsoft's redistributable, refuses it unless its Authenticode
+  signature is valid and from Microsoft Corporation, runs it elevated after Windows'
+  permission prompt, reports its exit code (installed, already installed, restart
+  required, or the failure with the manual link) and tests the packages again.
+
 ### Fixed
 
 - **A Python environment whose torch cannot load is reported before a search, not two
