@@ -101,3 +101,6 @@ if ($failures.Count -gt 0) {
     exit 1
 }
 Write-Output "the package carries the Visual C++ x64 runtime ($MinVersion or newer)"
+# An explicit exit code: the callers test $LASTEXITCODE, which is $null in a step that ran no
+# native command before this script, and `$null -ne 0` is true.
+exit 0
