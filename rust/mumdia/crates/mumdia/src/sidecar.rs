@@ -861,16 +861,130 @@ fn run_worker(python: &str, script: &str, args: &[&str], utf8: bool) -> Result<(
             })
             .collect::<Vec<_>>()
             .join(" ");
+        let diagnosis = failure_diagnosis(python, script);
         bail!(
             "sidecar worker failed: {script} exited with {status}.\n\
              interpreter: {python}\n\
              command: {python} {script} {argv}\n\
              The worker's own output, including any Python traceback, is above this \
              error. Reproduce it by running that command directly. \
-             `mumdia doctor --config <config>` checks the environment."
+             `mumdia doctor --config <config>` checks the environment.{diagnosis}"
         );
     }
     Ok(())
+}
+
+/// The torch-backed modules a worker imports first, which a failed run re-imports to
+/// explain itself. Empty for a worker that never loads torch.
+fn torch_modules_of(script: &str) -> &'static [&'static str] {
+    let name = std::path::Path::new(script)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if name.starts_with("deeplc") {
+        &["deeplc", "torch"]
+    } else if name.starts_with("im2deep") {
+        &["im2deep", "torch"]
+    } else if name.starts_with("peptdeep") {
+        &["peptdeep", "torch"]
+    } else if name.starts_with("nn_rescore") {
+        &["torch"]
+    } else {
+        &[]
+    }
+}
+
+/// What to add to the error of a failed torch-backed worker: the result of a real import
+/// of what it imports, and the fix when that names one (`python::load_failure_hint`).
+/// Empty when the imports load, so the error is unchanged for every other failure.
+///
+/// Worker output is inherited rather than captured (see `run_worker`), so the engine
+/// never holds the worker's traceback; a fresh import in the same interpreter reproduces
+/// a load failure deterministically and costs a few seconds only on a path that has
+/// already failed. This is what reaches a user who never runs `doctor`: a torch whose
+/// DLLs cannot initialise on Windows otherwise ends a search minutes in with an
+/// `OSError: [WinError 1114]` and no hint that the Visual C++ runtime is the cause.
+pub fn failure_diagnosis(python: &str, script: &str) -> String {
+    let modules = torch_modules_of(script);
+    if modules.is_empty() {
+        return String::new();
+    }
+    let probed = crate::python::import_probe(
+        std::path::Path::new(python),
+        modules,
+        crate::python::FAILURE_PROBE_TIMEOUT,
+    );
+    describe_failure_probe(probed.ok())
+}
+
+/// The text `failure_diagnosis` appends for a probe result; split out to be tested
+/// without an interpreter.
+fn describe_failure_probe(probe: Option<crate::python::ImportProbe>) -> String {
+    match probe {
+        Some(crate::python::ImportProbe::Unloadable { module, detail }) => {
+            let hint = crate::python::load_failure_hint(&detail)
+                .map(|h| format!("\n{h}"))
+                .unwrap_or_default();
+            format!(
+                "\nA fresh `import {module}` in this interpreter fails as well, so the \
+                 environment cannot load it:\n{detail}{hint}"
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod failure_diagnosis_tests {
+    use super::{describe_failure_probe, torch_modules_of};
+    use crate::python::{ImportProbe, VC_RUNTIME_HINT};
+
+    #[test]
+    fn only_torch_backed_workers_are_probed_after_a_failure() {
+        assert_eq!(
+            torch_modules_of("C:/Program Files/MuMDIA/binaries/scripts/deeplc_finetune.py"),
+            &["deeplc", "torch"]
+        );
+        assert_eq!(
+            torch_modules_of("scripts/deeplc_worker.py"),
+            &["deeplc", "torch"]
+        );
+        assert_eq!(torch_modules_of("scripts/nn_rescore_worker.py"), &["torch"]);
+        assert_eq!(
+            torch_modules_of("scripts/im2deep_worker.py"),
+            &["im2deep", "torch"]
+        );
+        assert!(torch_modules_of("scripts/mbr_worker.py").is_empty());
+        assert!(torch_modules_of("scripts/ms2pip_worker.py").is_empty());
+    }
+
+    #[test]
+    fn a_dll_failure_adds_the_traceback_and_the_runtime_hint() {
+        let detail = "OSError: [WinError 1114] A dynamic link library (DLL) initialization \
+                      routine failed. Error loading \"C:\\env\\torch\\lib\\c10.dll\""
+            .to_string();
+        let text = describe_failure_probe(Some(ImportProbe::Unloadable {
+            module: "deeplc".into(),
+            detail: detail.clone(),
+        }));
+        assert!(text.contains("`import deeplc`"));
+        assert!(text.contains(&detail));
+        assert!(text.ends_with(VC_RUNTIME_HINT));
+        // Another import failure is reported without a hint that does not apply.
+        let text = describe_failure_probe(Some(ImportProbe::Unloadable {
+            module: "torch".into(),
+            detail: "ImportError: numpy.core.multiarray failed to import".into(),
+        }));
+        assert!(text.contains("numpy.core.multiarray"));
+        assert!(!text.contains("Visual C++"));
+        // Imports that load, a hung probe and an interpreter that cannot start add nothing.
+        assert_eq!(describe_failure_probe(Some(ImportProbe::Loaded)), "");
+        assert_eq!(
+            describe_failure_probe(Some(ImportProbe::TimedOut { seconds: 60 })),
+            ""
+        );
+        assert_eq!(describe_failure_probe(None), "");
+    }
 }
 
 #[cfg(test)]

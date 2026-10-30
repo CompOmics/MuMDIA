@@ -678,6 +678,7 @@ pub fn needs_no_sidecar(engine: &Path, config: Option<&str>) -> Result<bool, Str
     // The same environment the run itself gets. Asking `doctor` without it would
     // answer for a different engine than the one that will run.
     crate::components::stamp_env(&mut cmd);
+    crate::components::skip_doctor_import_check(&mut cmd);
     cmd.arg("doctor").arg("--json");
     if let Some(c) = config {
         if !c.trim().is_empty() {

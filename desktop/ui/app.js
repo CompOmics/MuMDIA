@@ -227,6 +227,7 @@ async function init() {
   $("install-primary").addEventListener("click", () => installComponents("primary"));
   $("install-ms2pip").addEventListener("click", () => installComponents("ms2pip"));
   $("install-visdia").addEventListener("click", () => installComponents("visdia"));
+  $("recheck-primary").addEventListener("click", () => recheckComponents("primary"));
   $("open-visdia").addEventListener("click", (e) =>
     openVisdia(state.outDir, e.currentTarget, $("visdia-error"), state.picks.fasta)
   );
@@ -568,13 +569,30 @@ async function refreshComponents() {
   const pill = $("primary-pill");
   const btn = $("install-primary");
   const installing = p.install_status === "installing";
-  show($("primary-bar"), installing);
+  // The real import of the packages (`loadcheck`), run once an installation ends and the
+  // first time a session finds an environment: `find_spec` alone passed a torch that
+  // could not load its DLLs.
+  const testing = (e) => e && e.load_check === "running";
+  const loadFailed = p.load_check === "failed";
+  show($("primary-bar"), installing || testing(p));
   show($("install-log-card"), installing || p.install_status === "failed");
+  show($("recheck-primary"), loadFailed);
 
   if (installing) {
     pill.textContent = "installing…";
     pill.className = "pill warn";
     btn.disabled = true;
+  } else if (testing(p)) {
+    pill.textContent = "testing…";
+    pill.className = "pill warn";
+    btn.disabled = true;
+  } else if (loadFailed) {
+    // Installed, but a package does not load. Installing again repairs a damaged
+    // package; a missing system runtime needs Re-check once it is fixed.
+    pill.textContent = "cannot load";
+    pill.className = "pill bad";
+    btn.disabled = !c.primary.uv;
+    btn.textContent = "Reinstall";
   } else if (p.complete) {
     pill.textContent = "installed";
     pill.className = "pill ok";
@@ -603,6 +621,8 @@ async function refreshComponents() {
     );
   } else if (p.error) {
     banner($("setup-error"), p.error);
+  } else if (m.load_error || v.load_error) {
+    banner($("setup-error"), m.load_error ? `MS2PIP: ${m.load_error}` : `visDIA: ${v.load_error}`);
   } else if ((p.outdated || []).length) {
     banner(
       $("setup-error"),
@@ -620,6 +640,15 @@ async function refreshComponents() {
     mpill.textContent = "installing…";
     mpill.className = "pill warn";
     mbtn.disabled = true;
+  } else if (testing(m)) {
+    mpill.textContent = "testing…";
+    mpill.className = "pill warn";
+    mbtn.disabled = true;
+  } else if (m.load_check === "failed") {
+    mpill.textContent = "cannot load";
+    mpill.className = "pill bad";
+    mbtn.disabled = false;
+    mbtn.textContent = "Reinstall";
   } else if (m.complete) {
     mpill.textContent = "installed";
     mpill.className = "pill ok";
@@ -639,6 +668,15 @@ async function refreshComponents() {
     vpill.textContent = "installing…";
     vpill.className = "pill warn";
     vbtn.disabled = true;
+  } else if (testing(v)) {
+    vpill.textContent = "testing…";
+    vpill.className = "pill warn";
+    vbtn.disabled = true;
+  } else if (v.load_check === "failed") {
+    vpill.textContent = "cannot load";
+    vpill.className = "pill bad";
+    vbtn.disabled = !c.primary.uv;
+    vbtn.textContent = "Reinstall";
   } else if (v.complete) {
     vpill.textContent = "installed";
     vpill.className = "pill ok";
@@ -652,9 +690,19 @@ async function refreshComponents() {
   }
   refreshVisdiaButtons();
 
-  // One log pane, showing whichever installation is talking.
+  // One log pane, showing whichever installation is talking, or the optional
+  // environment whose packages failed to load.
+  const optionalFailed =
+    m.load_check === "failed" ? m : v.load_check === "failed" ? v : null;
   const active =
-    m.install_status === "installing" ? m : v.install_status === "installing" ? v : p;
+    m.install_status === "installing"
+      ? m
+      : v.install_status === "installing"
+        ? v
+        : !(p.install_log || []).length && optionalFailed
+          ? optionalFailed
+          : p;
+  if (active === optionalFailed) show($("install-log-card"), true);
   const logEl = $("install-log");
   const text = (active.install_log || []).join("\n");
   if (logEl.textContent !== text) {
@@ -670,7 +718,12 @@ async function refreshComponents() {
   // The DIA-NN card's build button depends on `componentsReady`, which is only
   // known here.
   const busy =
-    installing || m.install_status === "installing" || v.install_status === "installing";
+    installing ||
+    m.install_status === "installing" ||
+    v.install_status === "installing" ||
+    testing(p) ||
+    testing(m) ||
+    testing(v);
   if (busy && !state.setupTimer) {
     state.setupTimer = setInterval(refreshComponents, 900);
   } else if (!busy && state.setupTimer) {
@@ -680,6 +733,20 @@ async function refreshComponents() {
     // the transition: walking a Python environment is too slow for the poll itself.
     refreshManaged();
   }
+}
+
+// Test again whether the packages load, after something outside the application was
+// fixed (the Visual C++ runtime, for one). The backend forgets its last result and the
+// next status poll starts the import.
+async function recheckComponents(env) {
+  banner($("setup-error"), "");
+  try {
+    await invoke("components_recheck", { env });
+  } catch (e) {
+    banner($("setup-error"), String(e));
+    return;
+  }
+  refreshComponents();
 }
 
 async function installComponents(env) {

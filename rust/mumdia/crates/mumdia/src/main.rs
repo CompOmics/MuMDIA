@@ -701,6 +701,17 @@ enum Cmd {
         /// paragraph to regex. The exit status is unchanged.
         #[arg(long)]
         json: bool,
+        /// Skip the real import of each interpreter's packages and only check that they
+        /// are installed.
+        ///
+        /// By default every interpreter the configuration uses is asked to import its
+        /// role's packages for real (`deeplc` first, then torch with one operation), with
+        /// a 120 s bound per role. That costs seconds, and it is the only check that
+        /// catches a package which is installed but cannot load, such as a torch whose
+        /// DLLs fail to initialise on Windows. `MUMDIA_DOCTOR_IMPORT_CHECK=0` does the
+        /// same as this flag, for a caller that cannot know whether its engine has it.
+        #[arg(long)]
+        no_import_check: bool,
     },
 }
 
@@ -732,6 +743,18 @@ struct RoleReport {
     env_var: String,
     /// Anything worth saying that is not a failure, such as a DeepLC below the floor.
     warnings: Vec<String>,
+    /// Whether the modules were imported for real (`python::import_probe`), rather than
+    /// only located. False under `--no-import-check` and for a role that was not probed.
+    import_checked: bool,
+    /// Of `modules`, the one the real import failed on (at most one: the probe stops at
+    /// the first failure, which is the cause of any that follow).
+    unloadable: Vec<String>,
+    /// The end of the interpreter's stderr from the failed import, traceback included,
+    /// or why the import did not finish.
+    import_error: Option<String>,
+    /// What to do about `import_error`, when the failure is one the engine recognises
+    /// (`python::load_failure_hint`).
+    hint: Option<String>,
 }
 
 /// The worker-script directory check, which runs before any interpreter.
@@ -751,6 +774,8 @@ struct ScriptsReport {
 #[derive(serde::Serialize)]
 struct DoctorReport {
     ok: bool,
+    /// Whether the interpreters' packages were imported for real (`--no-import-check`).
+    import_check: bool,
     scripts: ScriptsReport,
     roles: Vec<RoleReport>,
     /// The Thermo `.raw` converter, if one can be found.
@@ -899,8 +924,14 @@ fn peak_census(
 /// checked that `sidecar_script_dir` existed (the most common misconfiguration,
 /// and the one baked into the tracked example config), and reported no versions,
 /// so a DeepLC old enough to change results looked identical to a current one.
-fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
+fn doctor_report(cfg: &Config, config_path: Option<&str>, import_check: bool) -> DoctorReport {
     use mumdia::python::{self, Role, ALL_ROLES};
+
+    // One real import per interpreter and module list: the roles that share an
+    // interpreter usually import different lists (deeplc first for DeepLC, torch first
+    // for the NN rescorer), but a configuration that names one list twice pays once.
+    let mut probes: std::collections::BTreeMap<(String, Vec<String>), _> =
+        std::collections::BTreeMap::new();
 
     let mut cfg = cfg.clone();
     let script_dir = python::resolve_script_dir(&cfg.predict_frag.sidecar_script_dir, config_path);
@@ -989,6 +1020,10 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
             versions: std::collections::BTreeMap::new(),
             env_var: role.env_var().to_string(),
             warnings: Vec::new(),
+            import_checked: false,
+            unloadable: Vec::new(),
+            import_error: None,
+            hint: None,
         };
 
         // Neither needed nor named: say so and probe nothing. Discovery here used to
@@ -1076,6 +1111,52 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
                                 }
                             }
                         }
+                        // Located is not loadable: `find_spec` never loads a native
+                        // library, so a torch whose DLLs cannot initialise passed every
+                        // check above and then ended a search minutes in. A role the run
+                        // will use (required, or wanted and found) fails `doctor` on it.
+                        if import_check && r.status != "fail" {
+                            let key = (p.clone(), r.modules.clone());
+                            let probed = probes
+                                .entry(key)
+                                .or_insert_with(|| {
+                                    python::import_probe(
+                                        interp,
+                                        &module_refs,
+                                        python::IMPORT_PROBE_TIMEOUT,
+                                    )
+                                    .map_err(|e| e.to_string())
+                                })
+                                .clone();
+                            r.import_checked = true;
+                            let blocking = required || wanted;
+                            let failed = match probed {
+                                Ok(python::ImportProbe::Loaded) => false,
+                                Ok(python::ImportProbe::Unloadable { module, detail }) => {
+                                    r.hint = python::load_failure_hint(&detail).map(str::to_string);
+                                    r.unloadable.push(module);
+                                    r.import_error = Some(detail);
+                                    true
+                                }
+                                Ok(python::ImportProbe::TimedOut { seconds }) => {
+                                    r.import_error = Some(format!(
+                                        "importing {} did not finish within {seconds} s",
+                                        r.modules.join(", ")
+                                    ));
+                                    true
+                                }
+                                Err(e) => {
+                                    r.import_error = Some(e);
+                                    true
+                                }
+                            };
+                            if failed {
+                                if blocking {
+                                    ok = false;
+                                }
+                                r.status = if blocking { "fail" } else { "warn" }.into();
+                            }
+                        }
                     }
                     Ok(missing) => {
                         if required {
@@ -1125,6 +1206,7 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>) -> DoctorReport {
 
     DoctorReport {
         ok,
+        import_check,
         scripts,
         roles,
         thermo,
@@ -1191,6 +1273,22 @@ fn print_doctor(rep: &DoctorReport) {
                 r.env_var,
                 r.modules.join(", ")
             ),
+            (status, Some(p)) if r.import_error.is_some() => {
+                let tag = if status == "fail" { "FAIL" } else { "warn" };
+                match r.unloadable.first() {
+                    Some(m) => println!(
+                        "  [{tag}] {label}: {p} ({}) has {m} installed, but importing it fails:",
+                        r.provenance
+                    ),
+                    None => println!("  [{tag}] {label}: {p} ({})", r.provenance),
+                }
+                for line in r.import_error.as_deref().unwrap_or("").lines() {
+                    println!("\x20        | {line}");
+                }
+                if let Some(h) = &r.hint {
+                    println!("\x20        {h}");
+                }
+            }
             (status, Some(p))
                 if r.missing.is_empty() && r.warnings.iter().all(|w| w.contains("DeepLC")) =>
             {
@@ -2262,12 +2360,18 @@ fn real_main() -> Result<()> {
                 }
             }
         }
-        Cmd::Doctor { config, json } => {
+        Cmd::Doctor {
+            config,
+            json,
+            no_import_check,
+        } => {
             // Deliberately the raw loader: doctor must be able to diagnose a
             // configuration whose interpreters do not resolve, so it cannot go
             // through the resolving loader that would bail first.
             let cfg = load_config_raw(&config)?;
-            let report = doctor_report(&cfg, config.as_deref());
+            let import_check = !no_import_check
+                && std::env::var("MUMDIA_DOCTOR_IMPORT_CHECK").map_or(true, |v| v.trim() != "0");
+            let report = doctor_report(&cfg, config.as_deref(), import_check);
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -2392,5 +2496,150 @@ mod cli_tests {
             Cmd::Convert { top_peaks_ms2, .. } => assert_eq!(top_peaks_ms2, 300),
             _ => panic!("expected convert command"),
         }
+    }
+    #[test]
+    fn doctor_imports_for_real_unless_asked_not_to() {
+        let cli = Cli::try_parse_from(["mumdia", "doctor"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Doctor {
+                no_import_check: false,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["mumdia", "doctor", "--no-import-check", "--json"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Doctor {
+                no_import_check: true,
+                json: true,
+                ..
+            }
+        ));
+    }
+
+    /// The JSON schema only grows: every field a consumer (the desktop application) read
+    /// before the import check is still there with its old meaning, and the new ones sit
+    /// beside them.
+    #[test]
+    fn the_doctor_json_keeps_its_fields_and_adds_the_import_check() {
+        let rep = doctor_report(&Config::default(), None, false);
+        let v = serde_json::to_value(&rep).unwrap();
+        for k in [
+            "ok",
+            "scripts",
+            "roles",
+            "thermo",
+            "msconvert",
+            "caches",
+            "import_check",
+        ] {
+            assert!(v.get(k).is_some(), "doctor --json lost `{k}`");
+        }
+        assert_eq!(v["import_check"], serde_json::json!(false));
+        let role = &v["roles"][0];
+        for k in [
+            "wanted",
+            "role",
+            "field",
+            "required",
+            "status",
+            "python",
+            "provenance",
+            "modules",
+            "missing",
+            "versions",
+            "env_var",
+            "warnings",
+            "import_checked",
+            "unloadable",
+            "import_error",
+            "hint",
+        ] {
+            assert!(role.get(k).is_some(), "a doctor role lost `{k}`: {role}");
+        }
+    }
+
+    /// The case `find_spec` cannot see: every package is installed, and torch raises on
+    /// import the way a torch without its Visual C++ runtime does. `doctor` must fail the
+    /// role, name torch, carry the traceback and the hint, and say nothing of the kind
+    /// under `--no-import-check`.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_fails_a_role_whose_torch_cannot_load() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(py) = ["python3", "python"].into_iter().find(|p| {
+            std::process::Command::new(p)
+                .args(["-c", "pass"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        }) else {
+            eprintln!("skipped: no Python interpreter on this host");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mumdia-doctor-torch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let site = dir.join("site");
+        for m in ["torch", "numpy", "pandas", "pyarrow"] {
+            std::fs::create_dir_all(site.join(m)).unwrap();
+            let body = if m == "torch" {
+                "raise OSError(r'[WinError 1114] A dynamic link library (DLL) initialization \
+                 routine failed. Error loading \"C:\\env\\torch\\lib\\c10.dll\" or one of its \
+                 dependencies.')\n"
+            } else {
+                "__version__ = '0'\n"
+            };
+            std::fs::write(site.join(m).join("__init__.py"), body).unwrap();
+        }
+        // An "interpreter" whose packages are exactly the fakes above.
+        let interp = dir.join("python");
+        std::fs::write(
+            &interp,
+            format!(
+                "#!/bin/sh\nPYTHONPATH='{}' PYTHONNOUSERSITE=1 exec {py} -S \"$@\"\n",
+                site.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&interp, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.rescore.classifier = mumdia_core::config::RescorerKind::NnTorch;
+        cfg.rescore.python = Some(interp.display().to_string());
+
+        let rescore = |rep: &DoctorReport| {
+            let v = serde_json::to_value(rep).unwrap();
+            v["roles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["role"] == "rescore")
+                .cloned()
+                .unwrap()
+        };
+
+        let checked = doctor_report(&cfg, None, true);
+        assert!(!checked.ok);
+        let r = rescore(&checked);
+        assert_eq!(
+            r["missing"],
+            serde_json::json!([]),
+            "find_spec sees every package"
+        );
+        assert_eq!(r["status"], "fail", "{r}");
+        assert_eq!(r["import_checked"], true);
+        assert_eq!(r["unloadable"], serde_json::json!(["torch"]));
+        assert!(r["import_error"]
+            .as_str()
+            .unwrap()
+            .contains("WinError 1114"));
+        assert_eq!(r["hint"], mumdia::python::VC_RUNTIME_HINT);
+
+        let unchecked = doctor_report(&cfg, None, false);
+        let r = rescore(&unchecked);
+        assert_eq!(r["import_checked"], false);
+        assert_eq!(r["unloadable"], serde_json::json!([]));
+        assert_ne!(r["status"], "fail", "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

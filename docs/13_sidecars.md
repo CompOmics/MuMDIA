@@ -1012,7 +1012,17 @@ MLP. Set it explicitly for the logreg path.
   it after the module-level numpy/pyarrow and reproduced the crash. The fault was
   latent because imported-library mode skips predict-frag entirely, so only a
   FASTA-mode library build exercises `deeplc_worker.py`. Do not let an import
-  sorter reorder these lines.
+  sorter reorder these lines. The same error with `import deeplc` as the first
+  import is a different fault, a missing or outdated Visual C++ runtime
+  (docs/17_troubleshooting.md, "The torch DLL crash: two causes").
+- **A failed torch-backed worker explains itself.** Worker output is inherited, not
+  captured (`run_worker`), so the engine never holds the traceback. When a DeepLC,
+  IM2Deep, AlphaPeptDeep or NN-rescore worker exits non-zero, the engine imports that
+  worker's torch-backed modules once more in the same interpreter
+  (`python::import_probe`, 60 s bound) and, if that import fails too, appends its
+  stderr tail to the error, plus the Visual C++ runtime hint when the text is a torch
+  DLL failure (`python::load_failure_hint`, `sidecar::failure_diagnosis`). A worker that
+  failed for any other reason gets an unchanged error.
 - **Parquet written outside `mumdia-io` must be SNAPPY plus arrow `utf8`.** The
   engine's `parquet` dependency is built with `default-features = false,
   features = ["arrow","snap"]` (`rust/mumdia/Cargo.toml:23-24`), so SNAPPY is the
@@ -1355,11 +1365,23 @@ MLP. Set it explicitly for the logreg path.
   itself; probing only `deeplc,numpy,pandas` let a green `doctor` precede a crash
   at the fine-tune step, which on an experiment-wide batch surfaces long after the
   run is launched. An interpreter left `None` prints `[skip]` (native path,
-  `main.rs:381`). It probes with `importlib.util.find_spec` and reports
-  `MISSING <pkgs>`; note `mbr.python` is **not** probed by `doctor`. The probe
-  only asks whether a module is importable, so it cannot catch an ordering fault
-  like the DeepLC/torch one above. Update these lists when a worker's imports
-  change so `mumdia doctor` stays truthful.
+  `main.rs:381`). It first locates the modules with `importlib.util.find_spec` and
+  reports the missing ones. Then, unless `--no-import-check` is given (or
+  `MUMDIA_DOCTOR_IMPORT_CHECK=0` is set), it imports them for real in a fresh process
+  (`python::import_probe`): `deeplc` first, as the workers do, then the rest, and one
+  `torch.zeros(1)` once torch is loaded, with a 120 s bound per role. `find_spec`
+  never loads a native library, so without this a torch whose DLLs cannot initialise
+  passed `doctor` and stopped the first search minutes in. A role the run will use
+  (required, or wanted and found) fails on an import failure; the JSON report carries
+  it per role as `import_checked`, `unloadable`, `import_error` (the stderr tail) and
+  `hint`, and `import_check` at the top level, beside the fields it always had. The
+  check runs by default because `doctor` exists to say whether a run will start, and a
+  few seconds is cheap against a search that stops at its RT stage; the desktop
+  application's own configuration questions to `doctor` set
+  `MUMDIA_DOCTOR_IMPORT_CHECK=0`, since they need roles and converters, not imports.
+  Discovery keeps the location-only probe, because it runs for every candidate at the
+  start of every run. Update these lists when a worker's imports change so
+  `mumdia doctor` stays truthful.
 - **Conda envs.** The committed reproducible specs are `env/docker-rescore.yml`
   (env `rescore`: mokapot 0.10.0 + ms2pip 4.2.0, py3.11) and
   `env/docker-deeplc.yml` (env `deeplc`: DeepLC 4.5.0 + CPU torch, py3.11); the

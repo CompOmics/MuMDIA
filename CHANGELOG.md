@@ -128,6 +128,29 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Fixed
+
+- **A Python environment whose torch cannot load is reported before a search, not two
+  minutes into one.** `mumdia doctor` and the desktop application checked the sidecar
+  packages with `importlib.util.find_spec`, which locates a package without loading its
+  native libraries, so a torch that could not initialise its DLLs on Windows passed every
+  check and the first DeepLC worker stopped with `OSError: [WinError 1114] ... c10.dll`.
+  `doctor` now imports each used role's modules for real by default (`deeplc` first, then
+  one torch operation, 120 s per role) and fails a role whose import fails, with the end
+  of the traceback and, for a torch DLL failure, the fix: install the Microsoft Visual
+  C++ 2015-2022 x64 runtime and reboot, or remove an older `msvcp140.dll` earlier on
+  `PATH`. `--no-import-check` or `MUMDIA_DOCTOR_IMPORT_CHECK=0` skips it; the JSON
+  report gains `import_check` and, per role, `import_checked`, `unloadable`,
+  `import_error` and `hint`, and no field changed. The desktop application runs the same
+  import when an installation finishes and the first time a session finds an installed
+  environment, marks an environment that fails it as unusable, shows the traceback in the
+  installation log and offers Re-check. A torch-backed worker that fails during a run is
+  followed by one real import in the same interpreter, whose result and hint are appended
+  to the engine's error. Search outputs are unchanged (docs/17_troubleshooting.md, "The
+  torch DLL crash: two causes").
+
 ## [0.9.0] - 2026-10-29
 
 ### Added

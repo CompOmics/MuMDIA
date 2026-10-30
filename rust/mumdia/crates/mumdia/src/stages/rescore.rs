@@ -4014,7 +4014,10 @@ fn run_pin_sidecar(
         }));
     }
     if !status.success() {
-        anyhow::bail!("{script_name} exited with {status}");
+        anyhow::bail!(
+            "{script_name} exited with {status}{}",
+            crate::sidecar::failure_diagnosis(python, &script)
+        );
     }
     let worker_ms = t_worker.elapsed().as_millis();
     let t_read = Instant::now();

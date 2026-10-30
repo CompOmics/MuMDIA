@@ -114,6 +114,25 @@ narrow on purpose -- "this configuration requires no sidecar at all", asked of
 `native_tda` would be wrong: on an imported library it measured 10,847 against
 `nn_torch`'s 10,914.
 
+**Installed is tested by importing, not by finding.** The routine status check asks
+`importlib.util.find_spec`, which is cheap enough to run on every refresh because it
+only locates a package; it never loads a native library. That let an environment whose
+torch could not initialise its DLLs (a Windows machine without a current Microsoft
+Visual C++ runtime) show every component green, and the first search stopped two
+minutes in with `OSError: [WinError 1114] ... torch\lib\c10.dll`. So `loadcheck`
+imports the packages for real, in a subprocess bounded at 120 s, `deeplc` first as the
+workers do and with one torch operation: when an installation finishes, and the first
+time a session finds an environment already installed (in the background; the card
+reads "testing..." meanwhile and a search waits for it). An environment that fails is
+marked "cannot load", the installation log shows the end of the traceback, the banner
+says what to do (for a torch DLL failure: install the runtime from
+https://aka.ms/vs/17/release/vc_redist.x64.exe, reboot, check for an older
+`msvcp140.dll` on `PATH` with `where msvcp140.dll`), and **Re-check** runs the import
+again. The result is kept for the session and per set of package versions, so an
+upgrade is tested again. The application's own `doctor` calls, which ask only which
+roles a configuration needs and which converters exist, set
+`MUMDIA_DOCTOR_IMPORT_CHECK=0` so they do not repeat that import.
+
 ### Uninstalling does not remove them
 
 An MSI removes exactly what it placed under Program Files. Everything the

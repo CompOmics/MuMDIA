@@ -34,8 +34,9 @@ is the source of truth if it has moved.
 | A grouped run (`groups.window_groups > 1`) stops with `groups: the retention-time windows would be unbounded` (or `... of band gNN would be unbounded`, `... of N of the M bands would be unbounded`) | The seed has fewer than two confident target anchors, or the fit kept fewer than two of them, so every band would extract every candidate over the whole gradient, usually at the configured fragment tolerance, and the memory has no bound (`run_groups.rs:828-880`, `run_groups.rs:438-469`, `rt_im_train.rs:80`) | Check the seed (library, decoys, `search_seed.fragment_tol_ppm`, input file), or the library's `predicted_irt` when the fit lost the anchors; search the run ungrouped; under `per_group` use `calibration = global`; or set `groups.allow_unbounded_rt = true` deliberately. See "Grouped search: unbounded retention-time windows" below |
 | `search-seed: too few confident targets at the configured fragment tolerance; the search at the wider tolerance found more and is used` (warning), or `search-seed: done ... confident=0` followed by `rt-im-train: ... using unbounded RT windows` and an extraction that runs out of memory | The run's fragment m/z are off by about `search_seed.fragment_tol_ppm` or more, so the seed at that tolerance finds no confident target and nothing calibrates the offset (+19.6 ppm on the timsTOF Pro runs of PXD028735; `search_seed.rs`, `search_with_widening`) | The warning needs no action: the retry at `fragment_tol_ppm * widen_tol_factor` found the targets and the mass calibration in `<seed>.masscal.json` gives the offset. If the seed still finds nothing, the offset is beyond the retry: raise `search_seed.fragment_tol_ppm` or `widen_tol_factor`, and check the library and its decoys. See "Seed: no confident targets" below |
 | A single-file run spends over half an hour before extract starts | `rt_im_train.finetune_deeplc = true` fine-tunes and then re-predicts iRT over the whole library on every file | Fine-tune once into the library's `predicted_irt`, then run with `finetune_deeplc = false` and the per-run LOESS |
-| `OSError: [WinError 1114] ... Error loading "...\torch\lib\c10.dll"` from a DeepLC worker | numpy/pyarrow were imported before `deeplc`; DeepLC 4.x is torch-backed and the wrong order aborts torch DLL init | Keep `import deeplc` first (`scripts/deeplc_worker.py:26`); the ordering is load-bearing, do not sort those imports |
-| `mumdia doctor` is green, then the run crashes at the DeepLC fine-tune on a missing import | doctor probed only part of what `deeplc_finetune.py` imports | Current doctor probes `deeplc,numpy,pandas,pyarrow,torch,psm_utils` (`main.rs:370`); re-run it after any env change |
+| `OSError: [WinError 1114] ... Error loading "...\torch\lib\c10.dll"` (or `[WinError 126]` on a file under `torch\lib`, or `DLL load failed while importing _C`), and the traceback's first frame is `import deeplc` or `import torch` | The Microsoft Visual C++ 2015-2022 x64 runtime is missing or outdated, or an older `msvcp140.dll`/`vcruntime140.dll` earlier on `PATH` is loaded instead of it; torch cannot initialise its DLLs on this machine | Install the latest runtime (https://aka.ms/vs/17/release/vc_redist.x64.exe), reboot, then re-check (`mumdia doctor --config <config>`, or Re-check in the desktop application); `where msvcp140.dll` lists every copy Windows finds. See "The torch DLL crash: two causes" below |
+| The same `WinError 1114` from a DeepLC worker, and the traceback shows numpy or pyarrow imported before torch | numpy/pyarrow were imported before `deeplc`; DeepLC 4.x is torch-backed and the wrong order aborts torch DLL init | Keep `import deeplc` first (`scripts/deeplc_worker.py:26`); the ordering is load-bearing, do not sort those imports |
+| `mumdia doctor` is green, then the run crashes at the DeepLC fine-tune on a missing import | doctor probed only part of what `deeplc_finetune.py` imports, or ran with `--no-import-check` | Current doctor probes `deeplc,numpy,pandas,pyarrow,torch,psm_utils` and imports them for real by default; re-run it after any env change |
 | `Parquet error: Disabled feature at compile time: zstd` | A parquet written outside `mumdia-io` used zstd; the parquet crate is built without that codec | Write SNAPPY (`table.rs:205`); polars defaults to zstd, so pass the compression explicitly |
 | `column '<name>' is not utf8` (for example `column 'peptidoform' is not utf8`) | The string column is arrow `large_utf8`, the polars default | Cast string columns to arrow `utf8` before writing (`table.rs:511`) |
 | `library precursor row N has candidate_id M but candidate_id must be the contiguous range 0..ncand` | An externally built library has non-row-aligned candidate ids | Reindex so `candidate_id` is `0..ncand` in precursor row order (`index.rs:112-125`) |
@@ -100,22 +101,51 @@ scores are silently native, not the classifier the config named. Set
 `params.classifier` and `model_identity` in
 `psms_scored.parquet.report.json` match what was intended.
 
-**DeepLC import order and the torch DLL crash.** `scripts/deeplc_worker.py` must
-`import deeplc` before numpy and pyarrow (`scripts/deeplc_worker.py:26`). DeepLC
-4.x is torch-backed, and on Windows importing numpy (and the pyarrow that follows
-it) first aborts torch's DLL initialisation outright:
+**The torch DLL crash: two causes.** On Windows a torch-backed worker can stop with
 
 ```text
 OSError: [WinError 1114] A dynamic link library (DLL) initialization routine failed.
 Error loading "...\torch\lib\c10.dll" or one of its dependencies.
 ```
 
-`deeplc_finetune.py` already ordered its imports this way; the prediction worker
-deferred `import deeplc` into `main()`, which put it after the module-level numpy
-and pyarrow and reproduced the crash. The ordering is load-bearing, not
-stylistic, so do not sort those imports. The bug stayed latent for a long time
-because imported-library mode skips `predict-frag` entirely: only a FASTA-mode
-library build reaches the native RT-prediction path.
+(or `[WinError 126] The specified module could not be found` on a file under
+`torch\lib`). Two different faults produce it, and the traceback tells them apart by
+what ran before `import torch`.
+
+*Missing or outdated Visual C++ runtime.* The traceback starts at `import deeplc` (or
+`import torch`) as the worker's first import, goes through `deeplc/core.py` to
+`import torch`, and ends in `torch/__init__.py`'s `_load_dll_libraries`. Nothing was
+imported before torch, so the order is not the cause: torch cannot initialise its DLLs
+on this machine. The PyTorch wheels the shipped environments pin (`torch==2.14.0+cpu`
+in `env/console-requirements.txt`) need the Microsoft Visual C++ 2015-2022 x64 runtime.
+Install the latest one from https://aka.ms/vs/17/release/vc_redist.x64.exe, reboot,
+then check again. If it is installed already, an older `msvcp140.dll` or
+`vcruntime140.dll` in a directory earlier on `PATH` (some vendor software installs its
+own copy) can be loaded in its place; `where msvcp140.dll` lists every copy Windows
+finds, in the order it tries them, and the first one wins.
+
+This case used to pass every check: `mumdia doctor` and the desktop application's
+component screen asked `importlib.util.find_spec`, which locates a package without
+executing it and so never loads a DLL. `doctor` now imports each role's modules for
+real (`deeplc` first, then one torch operation; `--no-import-check` skips it), and the
+desktop application does the same when an installation finishes and the first time a
+session finds an installed environment, with a Re-check button for after the fix. A
+torch-backed worker that fails during a run is followed by the same real import, and its
+error then carries the runtime hint when the import reproduces the DLL failure
+(`sidecar::failure_diagnosis`).
+
+*Import order.* The traceback shows numpy or pyarrow imported before torch, in the
+worker's own module. `scripts/deeplc_worker.py` must `import deeplc` before numpy and
+pyarrow (`scripts/deeplc_worker.py:26`). DeepLC 4.x is torch-backed, and on Windows
+importing numpy (and the pyarrow that follows it) first aborts torch's DLL
+initialisation outright. `deeplc_finetune.py` already ordered its imports this way;
+the prediction worker deferred `import deeplc` into `main()`, which put it after the
+module-level numpy and pyarrow and reproduced the crash. The ordering is load-bearing,
+not stylistic, so do not sort those imports. The bug stayed latent for a long time
+because imported-library mode skips `predict-frag` entirely: only a FASTA-mode library
+build reaches the native RT-prediction path. Both shipped workers are ordered
+correctly, so a traceback whose first import is `import deeplc` is the runtime case
+above.
 
 **A green doctor that still crashes at fine-tune.** `mumdia doctor` probes the
 DeepLC interpreter for `deeplc,numpy,pandas,pyarrow,torch,psm_utils`
@@ -126,6 +156,10 @@ after the run was launched. In practice DeepLC 4.x pulls torch and psm-utils
 itself, so the extra names usually catch a missing pyarrow; the check asserts
 what the scripts import rather than what the dependency tree implies. Re-run
 doctor after any environment change instead of trusting an earlier green result.
+Since the real-import check, a green doctor also means each of those modules loaded in
+a fresh interpreter, not only that it was found; that costs a few seconds per role,
+bounded at 120 s, and `--no-import-check` (or `MUMDIA_DOCTOR_IMPORT_CHECK=0`) restores
+the location-only check.
 
 ## Sidecar interpreter not found, or the wrong one used
 

@@ -216,6 +216,19 @@ fn components_install(
     )
 }
 
+/// Test again whether an environment's packages load (`components::Installer::recheck`),
+/// for after the user fixed something outside the application, such as installing the
+/// Visual C++ runtime. The interface polls `components_status` for the result.
+#[tauri::command]
+fn components_recheck(
+    state: tauri::State<'_, AppState>,
+    env: Option<components::Env>,
+) -> Result<(), String> {
+    state
+        .installer
+        .recheck(env.unwrap_or(components::Env::Primary))
+}
+
 /// What is running that would make removing managed data unsafe, if anything.
 ///
 /// Every answer names something the user can see and wait for, because that is what
@@ -330,14 +343,7 @@ fn preflight(
 
     let comp = state.installer.refresh(components::Env::Primary);
     if !comp.complete {
-        blockers.push(format!(
-            "The analysis components are not installed{}.",
-            if comp.missing.is_empty() {
-                String::new()
-            } else {
-                format!(" (missing {})", comp.missing.join(", "))
-            }
-        ));
+        blockers.push(components::blocker(&comp));
     }
 
     // A vendor file with no converter fails inside the engine, after the run has been
@@ -726,6 +732,7 @@ fn main() {
             components_install,
             components_removable,
             components_remove,
+            components_recheck,
             config_schema,
             save_settings,
             derive_config,
