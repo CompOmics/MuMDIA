@@ -434,6 +434,162 @@ jobs:
       - name: Frontend agrees with the backend
         run: python ci/check_desktop_ui.py
 
+  # The desktop application on Windows, the platform its installer and its Visual C++
+  # runtime handling exist for. The Linux job above never compiles the `cfg(windows)`
+  # code (`vcruntime::win`: the elevated launch and the signature check), and nothing
+  # else builds the MSI before a release rehearsal does.
+  #
+  # Gated on a change under desktop/ (or this workflow, or the two MSI scripts), as the
+  # sidecar jobs are on theirs: a cold Windows build of the application and the bundler
+  # costs about twenty minutes, which a change to the engine alone should not pay.
+  desktop-windows:
+    name: desktop app (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Does the desktop application or its installer change?
+        id: touched
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "schedule" ] || [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
+          if git diff --name-only "$base" HEAD \
+             | grep -Eq '^(desktop/|ci/check_msi_runtime\.ps1$|ci/find_vc_merge_module\.ps1$|\.github/workflows/ci\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no desktop change; skipping"
+          fi
+
+      - name: Cache cargo
+        if: steps.touched.outputs.run == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-tauri.exe
+            desktop/target
+          key: ${{ runner.os }}-desktop-${{ hashFiles('desktop/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-desktop-
+
+      - name: Clippy (windows)
+        if: steps.touched.outputs.run == 'true'
+        working-directory: desktop/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Includes the Windows-only tests: Windows' own judgement of real signatures (a
+      # system binary passes, an unsigned file does not) and the hold on the downloaded
+      # file (it can be checked and run, not replaced).
+      - name: Unit tests (windows)
+        if: steps.touched.outputs.run == 'true'
+        working-directory: desktop/src-tauri
+        run: cargo test --lib
+
+      # The "Install Visual C++ runtime" button's whole sequence against Microsoft's
+      # server: download, signature, elevated launch, exit code. The runner already has a
+      # runtime at least as new, so this exercises "this or a newer version is already
+      # installed" (1638) or a repair (0) without changing what the steps below rely on.
+      - name: The Visual C++ runtime installer runs end to end
+        if: steps.touched.outputs.run == 'true'
+        # A permission prompt nobody can answer would otherwise hold the job for hours.
+        # The hosted runners do not show one; this bounds the case where they start to.
+        timeout-minutes: 10
+        working-directory: desktop/src-tauri
+        run: cargo test --lib -- --ignored real_runtime_install --nocapture
+
+      - name: Locate the Visual C++ runtime merge module
+        if: steps.touched.outputs.run == 'true'
+        shell: pwsh
+        run: |
+          $msm = & ./ci/find_vc_merge_module.ps1
+          if (-not $msm) { Write-Error "no merge module found"; exit 1 }
+          Write-Output "merge module: $msm"
+          & ./ci/check_msi_runtime.ps1 -Msi $msm
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "TAURI_MUMDIA_VC_CRT_MSM=$msm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # The resources the bundle globs for. The workers are copied; the engine is not
+      # built, because this job is about the installer, and the release rehearsal builds
+      # and runs the real bundle.
+      - name: Stage the bundled files
+        if: steps.touched.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktop/src-tauri/binaries/scripts
+          cp scripts/*.py desktop/src-tauri/binaries/scripts/
+
+      - name: Install the Tauri bundler
+        if: steps.touched.outputs.run == 'true'
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build the MSI with the Visual C++ runtime
+        if: steps.touched.outputs.run == 'true'
+        working-directory: desktop
+        run: cargo tauri build --bundles msi --config src-tauri/tauri.vcruntime.conf.json
+
+      - name: The MSI carries the Visual C++ runtime
+        if: steps.touched.outputs.run == 'true'
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem desktop/target/release/bundle/msi/*.msi | Select-Object -First 1).FullName
+          & ./ci/check_msi_runtime.ps1 -Msi $msi
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # Install and uninstall it for real. The runner's runtime is at least as new as
+      # the module's, which is the case that must not fail: Windows Installer keeps the
+      # newer files and the installation succeeds. Uninstalling must leave the runtime
+      # in place, because other programs installed it too.
+      - name: The MSI installs over a newer runtime and uninstalls cleanly
+        if: steps.touched.outputs.run == 'true'
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem desktop/target/release/bundle/msi/*.msi | Select-Object -First 1).FullName
+          $sys = Join-Path $env:SystemRoot "System32"
+          $dlls = @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")
+          foreach ($f in $dlls) {
+            Write-Output ("{0} before install: {1}" -f $f, (Get-Item (Join-Path $sys $f)).VersionInfo.FileVersion)
+          }
+          $log = Join-Path $env:RUNNER_TEMP "msi-install.log"
+          $p = Start-Process msiexec.exe -ArgumentList @("/i", "`"$msi`"", "/qn", "/norestart", "/l*v", "`"$log`"") -Wait -PassThru
+          Write-Output "msiexec /i exited $($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            Get-Content $log -Tail 80
+            Write-Error "the MSI did not install"; exit 1
+          }
+          Select-String -Path $log -Pattern "vcruntime140|msvcp140" | Select-Object -First 15 | ForEach-Object { $_.Line }
+          foreach ($f in $dlls) {
+            Write-Output ("{0} after install: {1}" -f $f, (Get-Item (Join-Path $sys $f)).VersionInfo.FileVersion)
+          }
+          $u = Start-Process msiexec.exe -ArgumentList @("/x", "`"$msi`"", "/qn", "/norestart") -Wait -PassThru
+          Write-Output "msiexec /x exited $($u.ExitCode)"
+          if ($u.ExitCode -ne 0 -and $u.ExitCode -ne 3010) { Write-Error "the MSI did not uninstall"; exit 1 }
+          foreach ($f in $dlls) {
+            $path = Join-Path $sys $f
+            if (-not (Test-Path $path)) { Write-Error "uninstalling MuMDIA removed the shared $f"; exit 1 }
+            Write-Output ("{0} after uninstall: {1}" -f $f, (Get-Item $path).VersionInfo.FileVersion)
+          }
+
+      - name: Upload the MSI
+        if: steps.touched.outputs.run == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: desktop-msi-ci
+          path: desktop/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 7
+
   smoke-cross-platform:
     name: cross-platform byte equality
     runs-on: ubuntu-latest

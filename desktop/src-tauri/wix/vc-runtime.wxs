@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Microsoft Visual C++ x64 runtime that PyTorch needs, merged into the MSI.
+
+  PyTorch's Windows wheels cannot load torch\lib\c10.dll without a current Visual C++
+  2015-2022 x64 runtime ([WinError 1114]), and a fresh Windows does not always have one.
+  Microsoft ships the runtime as a merge module (Microsoft_VC14x_CRT_x64.msm) with Visual
+  Studio, for exactly this: an MSI that carries it installs it with Windows Installer's
+  own rules. It needs no network at install time, and Windows Installer never replaces a
+  newer vcruntime140.dll or msvcp140.dll than the one in the module, so a machine that
+  already has a newer runtime keeps it and the installation still succeeds. The files are
+  shared, reference-counted components in System32: uninstalling MuMDIA leaves them for
+  every other program that also installed them.
+
+  Used only through tauri.vcruntime.conf.json, which the release and CI builds pass with
+  `cargo tauri build --config`. The module's path comes from TAURI_MUMDIA_VC_CRT_MSM
+  (the bundler passes only TAURI_* variables to WiX), which ci/find_vc_merge_module.ps1
+  sets from the Visual Studio installation on the build machine. A plain
+  `cargo tauri build` does not read this file and builds an MSI without the runtime.
+  desktop/README.md, "The Visual C++ runtime", has the reasoning and the licence.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="TARGETDIR">
+      <Merge Id="VCRuntimeX64" SourceFile="$(env.TAURI_MUMDIA_VC_CRT_MSM)" DiskId="1" Language="0" />
+    </DirectoryRef>
+  </Fragment>
+</Wix>
