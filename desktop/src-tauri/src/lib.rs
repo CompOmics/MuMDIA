@@ -10,6 +10,7 @@ pub mod engine;
 pub mod enzymes;
 pub mod loadcheck;
 pub mod mods;
+pub mod predictors;
 pub mod preflight;
 pub mod run;
 pub mod settings;

@@ -228,6 +228,37 @@ pub struct Results {
     /// per-file unit there is `run_psm_q`, from the split tables. The interface has to
     /// say which it is showing.
     pub experiment_wide: bool,
+    /// The runs the engine recorded without a retention-time calibration
+    /// (`rt_calibration_missing` in `manifest.json`, or in the `experiment` block of
+    /// `experiment_manifest.json`): each with `run`, `pass`, `calibration_status` and
+    /// `n_train`. Empty for a calibrated search, whose manifest has no such field.
+    pub rt_calibration_missing: Vec<serde_json::Value>,
+    /// The runs of the search, for "N of M runs": 1 for a single run.
+    pub n_runs: u64,
+}
+
+/// The runs without a retention-time calibration and the number of runs, from the
+/// manifest the engine wrote in `dir`.
+fn calibration_gaps(dir: &Path, experiment_wide: bool) -> (Vec<serde_json::Value>, u64) {
+    let read = |name: &str| -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(dir.join(name)).ok()?).ok()
+    };
+    let (block, n_runs) = if experiment_wide {
+        let Some(m) = read("experiment_manifest.json") else {
+            return (Vec::new(), 0);
+        };
+        let e = m.get("experiment").cloned().unwrap_or_default();
+        let n = e.get("n_runs").and_then(|n| n.as_u64()).unwrap_or(0);
+        (e, n)
+    } else {
+        (read("manifest.json").unwrap_or_default(), 1)
+    };
+    let gaps = block
+        .get("rt_calibration_missing")
+        .and_then(|g| g.as_array())
+        .cloned()
+        .unwrap_or_default();
+    (gaps, n_runs)
 }
 
 /// The whole observable state of a run. Serialised to the interface on every poll.
@@ -1004,6 +1035,7 @@ fn read_results(dir: &Path) -> Option<Results> {
     };
     let text = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let (gaps, n_runs) = calibration_gaps(dir, experiment_wide);
     let params = v.get("params");
     let stats = v.get("stats");
     let s = |o: Option<&serde_json::Value>, k: &str| -> String {
@@ -1028,6 +1060,8 @@ fn read_results(dir: &Path) -> Option<Results> {
         has_peptides_tsv: dir.join("peptides.tsv").is_file(),
         has_proteins_tsv: dir.join("proteins.tsv").is_file(),
         experiment_wide,
+        rt_calibration_missing: gaps,
+        n_runs,
     })
 }
 
@@ -1076,6 +1110,37 @@ mod tests {
         let run = new_run(&format!("run-{name}"), &r, "mumdia run ...".into(), None);
         run.set(|s| s.status = "running".into());
         (run, dir)
+    }
+
+    /// The results read the engine's calibration gaps from the manifest of either kind,
+    /// and a manifest without the field (every calibrated search) gives none.
+    #[test]
+    fn the_results_carry_the_runs_without_a_retention_time_calibration() {
+        let dir = scratch("gaps");
+        let gap = serde_json::json!({"run": "r1", "pass": "first_pass",
+            "calibration_status": "insufficient_anchors_unbounded", "n_train": 0,
+            "cal_json": "r1/cal.json"});
+        std::fs::write(
+            dir.join("experiment_manifest.json"),
+            serde_json::json!({"experiment": {"n_runs": 12,
+                "rt_calibration_missing": [gap.clone()]}})
+            .to_string(),
+        )
+        .unwrap();
+        let (gaps, n) = calibration_gaps(&dir, true);
+        assert_eq!((gaps.len(), n), (1, 12));
+        assert_eq!(gaps[0]["run"], "r1");
+
+        std::fs::write(dir.join("manifest.json"), r#"{"config_hash": "x"}"#).unwrap();
+        assert_eq!(calibration_gaps(&dir, false), (Vec::new(), 1));
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::json!({"rt_calibration_missing": [gap]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(calibration_gaps(&dir, false).0.len(), 1);
+        assert_eq!(calibration_gaps(&dir.join("absent"), true), (Vec::new(), 0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -362,11 +362,16 @@
         <label class="check">
           <input type="radio" name="libsrc" id="libsrc-builtin" value="builtin" />
           <span>
-            <b>Built-in predictors</b> — the engine digests the FASTA itself and predicts with
-            MS2PIP and DeepLC when the preset asks for them (the fasta-sidecars preset
-            does), native predictors otherwise. No DIA-NN needed.
+            <b>Built-in predictors</b> — the engine digests the FASTA itself and predicts the
+            library with the predictors that are installed: the diaPASEF recipe (AlphaPeptDeep,
+            DeepLC and IM2Deep) for a timsTOF diaPASEF .d, otherwise MS2PIP or AlphaPeptDeep
+            with DeepLC. A preset that names its own predictor keeps it. The native predictors
+            are a last resort and usually make the search slow and insensitive. No DIA-NN
+            needed.
+            <span class="hint inline" id="libsrc-builtin-note"></span>
           </span>
         </label>
+        <div id="builtin-warn" class="banner warn" hidden></div>
       </div>
 
       <div class="mode" id="mode-library" hidden>
@@ -570,6 +575,7 @@
 
     <div id="visdia-error" class="banner bad" hidden></div>
     <div id="res-warn" class="banner warn" hidden></div>
+    <div id="res-degraded" class="banner bad" hidden></div>
 
     <div class="kpis" id="kpis"></div>
 

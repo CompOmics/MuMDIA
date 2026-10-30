@@ -1103,6 +1103,7 @@ provenance for reproducibility. Top-level `Manifest`:
 | `config_hash` | string | hash of the resolved config |
 | `model_identities` | object | map of role (`rt_predictor`, `fragment_predictor`, `rescorer`, `feature_schema_id`) to identity string |
 | `artifacts` | object | map of logical name to `ArtifactRecord` |
+| `rt_calibration_missing` | array | only when the run had no retention-time calibration: one `{run, pass, calibration_status, n_train, cal_json}` per uncalibrated run (`stages/rt_health.rs`); `run-experiment` writes it in the `experiment` block of `experiment_manifest.json`, with `pass` `first_pass` or `second_pass` |
 
 Each `ArtifactRecord`:
 

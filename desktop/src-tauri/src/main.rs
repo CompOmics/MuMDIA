@@ -3,7 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use mumdia_console::{
-    components, diann, engine, preflight as pf, run, settings, sizing, thermo, viewer,
+    components, diann, engine, predictors, preflight as pf, run, settings, sizing, thermo, viewer,
 };
 
 use std::collections::HashMap;
@@ -341,6 +341,19 @@ fn preflight(
         Err(e) => blockers.push(e),
     }
 
+    // A FASTA search predicts its library with whatever the configuration names, and the
+    // engine default is the native models. Said here too, not only by `builtin_plan`, so a
+    // configuration from the settings editor or a batch is covered as well.
+    let mut warnings: Vec<String> = Vec::new();
+    if req.fasta.is_some() {
+        if let Ok(cfg) = predictors::read_preset(req.config.as_deref()) {
+            let diapasef = predictors::any_diapasef(&req.mzml);
+            if let Some(w) = predictors::warning(&predictors::Predictors::of(&cfg), diapasef) {
+                warnings.push(w);
+            }
+        }
+    }
+
     let comp = state.installer.refresh(components::Env::Primary);
     if !comp.complete {
         blockers.push(components::blocker(&comp));
@@ -353,7 +366,6 @@ fn preflight(
     // searched. The answer comes from the engine's own search (`doctor --json`) FOR
     // THIS REQUEST'S CONFIGURATION, and the rule that turns it into a blocker or a note
     // is the engine's (`thermo::converter_verdict`).
-    let mut warnings: Vec<String> = Vec::new();
     match thermo::converters(req.config.as_deref()) {
         Some(conv) => {
             let (b, notes) = thermo::converter_verdict(&req.mzml, &conv);
@@ -477,6 +489,54 @@ fn derive_config(
     let path = settings::derive("search-derived", base.as_deref(), overrides)?;
     settings::validate(&path)?;
     Ok(path)
+}
+
+/// What a FASTA search on the built-in path will predict its library with, and the
+/// configuration its settings are derived from (`predictors::plan`).
+///
+/// The preset selected by default is the imported-library one, which names no fragment
+/// predictor; deriving from it ran FASTA searches on the native models. A preset that names
+/// none is therefore replaced by the first recipe whose interpreters the engine finds: the
+/// diaPASEF recipe for a timsTOF diaPASEF `.d`, then MS2PIP or AlphaPeptDeep with DeepLC.
+/// Each candidate costs one `mumdia doctor`, so this runs off the interface thread.
+#[tauri::command]
+async fn builtin_plan(
+    preset: Option<String>,
+    mzml: Vec<String>,
+) -> Result<predictors::Plan, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let selected = predictors::read_preset(preset.as_deref())?;
+        let diapasef = predictors::any_diapasef(&mzml);
+        let dir = materialise_presets()?;
+        // A preset this application ships (or the engine defaults) may be replaced by a
+        // recipe; a settings file the user saved may not, since that would drop the edits.
+        let replaceable = preset
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| {
+                Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| PRESET_FILES.iter().any(|(name, _)| *name == n))
+            })
+            .unwrap_or(true);
+        let engine = engine::resolve().ok().map(|(p, _)| p);
+        let usable = |cfg: &Path| {
+            engine
+                .as_deref()
+                .is_some_and(|e| predictors::doctor_ok(e, cfg))
+        };
+        Ok(predictors::plan(
+            preset.as_deref(),
+            &selected,
+            replaceable,
+            diapasef,
+            &dir,
+            &usable,
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The modifications the engine knows by name, with the Search tab's quick sets: the
@@ -679,9 +739,19 @@ const PRESET_FILES: &[(&str, &str)] = &[
         "diann-library.json",
         include_str!("../../../configs/examples/diann-library.json"),
     ),
+    // The diaPASEF recipe, which `builtin_plan` chooses for a timsTOF diaPASEF `.d` when
+    // its interpreters are found.
+    (
+        "diapasef.json",
+        include_str!("../../../configs/examples/diapasef.json"),
+    ),
     (
         "fasta-sidecars.json",
         include_str!("../../../configs/examples/fasta-sidecars.json"),
+    ),
+    (
+        "fasta-peptdeep.json",
+        include_str!("../../../configs/examples/fasta-peptdeep.json"),
     ),
     (
         "native.json",
@@ -728,6 +798,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             engine_info,
+            builtin_plan,
             components_status,
             components_install,
             components_removable,

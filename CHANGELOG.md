@@ -150,6 +150,41 @@ than a number. Both are recorded in every run's `manifest.json`.
   followed by one real import in the same interpreter, whose result and hint are appended
   to the engine's error. Search outputs are unchanged (docs/17_troubleshooting.md, "The
   torch DLL crash: two causes").
+### Added
+
+- **A search without a retention-time calibration is reported as degraded.** When a run's
+  seed leaves fewer target anchors than `rt_im_train.min_seed_for_calibration`, its
+  retention-time windows are unbounded or the broad fixed fallback, and the search finishes
+  slowly with far fewer identifications than the data hold. Such a run now logs a prominent
+  warning right after `rt-im-train` that names the consequence and the likely causes (native
+  fragment or retention-time predictions, read from the library's own report; a fragment m/z
+  offset beyond the seed tolerance; a library that does not fit the sample; a blank run).
+  `run` and `run-experiment` end with one summary line (for example "12 of 12 run(s) in the
+  first pass had no retention-time calibration") and record each such run under
+  `rt_calibration_missing` in `manifest.json`, or in the `experiment` block of
+  `experiment_manifest.json` with its pass. The field is written only when a run had no
+  calibration, so every calibrated search keeps its artifacts, reports and manifest
+  byte-identical. The search is not stopped: a blank well has no anchors by construction, and
+  the second pass searches such runs again on the consensus retention times of the others; a
+  window-group search still stops, as before (docs/17, "Seed: no confident targets").
+- **A FASTA search on native fragment intensities warns at its start.** `run` and
+  `run-experiment` log one warning before the first stage when `predict_frag.predictor` is
+  `native` in FASTA mode, naming native retention times and, on spectra with ion mobility, a
+  missing 1/K0 predictor as well, and pointing to the predictor sidecars and the recipes
+  (`configs/examples/fasta-sidecars.json`, `configs/examples/diapasef.json`). No artifact
+  changes.
+- **Desktop application: the built-in library path chooses its predictors.** A FASTA search
+  on the built-in predictors derived its configuration from the selected preset, and the
+  preset selected by default, the one for an imported library, names no fragment predictor,
+  so such searches ran on the native models. A preset that names no fragment predictor is
+  now replaced by the first recipe whose interpreters `mumdia doctor` finds: the diaPASEF
+  recipe (AlphaPeptDeep, DeepLC, IM2Deep) for a timsTOF diaPASEF `.d`, then MS2PIP with
+  DeepLC, then AlphaPeptDeep with DeepLC. A preset or saved settings file that names a
+  predictor is kept. The Search screen says which predictors will be used, and a search that
+  would still run on native predictions, or on a diaPASEF `.d` without predicted 1/K0, shows
+  what that costs and starts only after the user confirms. The results screen leads with the
+  engine's `rt_calibration_missing` record when a search had runs without a retention-time
+  calibration. The diaPASEF and AlphaPeptDeep recipes are now offered as presets.
 
 ## [0.9.0] - 2026-10-29
 

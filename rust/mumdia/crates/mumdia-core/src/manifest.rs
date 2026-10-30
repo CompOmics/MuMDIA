@@ -29,6 +29,26 @@ pub struct InputRecord {
     pub content_hash: String,
 }
 
+/// A run whose retention-time calibration was not fitted: its seed left fewer target
+/// anchors than `rt_im_train.min_seed_for_calibration`, so the RT windows are unbounded
+/// (`insufficient_anchors_unbounded`) or the broad fixed fallback (`fallback_fixed`).
+/// Recorded by `mumdia::stages::rt_health` only when it happens, so the manifest of every
+/// calibrated run keeps its bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RtCalibrationGap {
+    /// The run's name: the input file stem of a single run, the run directory of an
+    /// experiment.
+    pub run: String,
+    /// `run` for a single search; `first_pass` or `second_pass` in an experiment.
+    pub pass: String,
+    /// `calibration_status` from the run's `cal.json`.
+    pub calibration_status: String,
+    /// The target anchors the fit had (`n_train` in `cal.json`).
+    pub n_train: u64,
+    /// The `cal.json` the status was read from.
+    pub cal_json: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub mumdia_version: String,
@@ -54,6 +74,11 @@ pub struct Manifest {
     #[serde(default)]
     pub inputs: BTreeMap<String, InputRecord>,
     pub artifacts: BTreeMap<String, ArtifactRecord>,
+    /// Runs without a retention-time calibration ([`RtCalibrationGap`]). Written only
+    /// when non-empty, so a calibrated run's manifest is byte-identical to one written
+    /// before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rt_calibration_missing: Vec<RtCalibrationGap>,
 }
 
 impl Manifest {
@@ -71,6 +96,7 @@ impl Manifest {
             model_identities: BTreeMap::new(),
             inputs: BTreeMap::new(),
             artifacts: BTreeMap::new(),
+            rt_calibration_missing: Vec::new(),
         }
     }
 
@@ -174,6 +200,29 @@ mod tests {
         assert!(m.cli_args.is_empty());
         assert!(m.inputs.is_empty());
         assert_eq!(m.model_identities["rescorer"], "native-percolator-lite-v1");
+    }
+
+    /// The calibration-gap field is written only when a run had one, so the manifest of a
+    /// calibrated run has exactly the keys it had before the field existed.
+    #[test]
+    fn the_calibration_gap_field_is_written_only_when_present() {
+        let mut m = Manifest::new("{}".into(), "c".repeat(64));
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("rt_calibration_missing"), "{json}");
+        m.rt_calibration_missing.push(RtCalibrationGap {
+            run: "r1".into(),
+            pass: "run".into(),
+            calibration_status: "insufficient_anchors_unbounded".into(),
+            n_train: 0,
+            cal_json: "out/cal.json".into(),
+        });
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            json.contains("\"rt_calibration_missing\":[{\"run\":\"r1\""),
+            "{json}"
+        );
+        let back: Manifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rt_calibration_missing, m.rt_calibration_missing);
     }
 
     #[test]

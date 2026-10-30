@@ -382,6 +382,48 @@ automatically, because the alternative is retyping two long paths.
 MuMDIA reads only the library. Invoking DIA-NN is not reading its source, so the
 clean-room boundary is unchanged.
 
+### Which predictors the built-in path uses
+
+The built-in path derives the run's configuration from the selected preset, and until
+this section existed it took the preset as it was. The preset selected by default is
+`diann-library`, which is right for a library predicted or imported before the search and
+names no fragment predictor, so a FASTA search that fell back to the built-in path (the
+first library option unavailable) predicted its library with the engine's native models. A desktop user searched
+twelve timsTOF diaPASEF runs that way: the native intensities left the seed of every run
+without a confident anchor, every run was extracted over the whole gradient, and the search
+took about ten hours for a small fraction of the identifications, with nothing on the
+screen saying why.
+
+`builtin_plan` (`predictors.rs`) now decides, from the selected preset and the selected
+files:
+
+- a preset or saved settings file that names `predict_frag.predictor` is the user's choice
+  and is kept;
+- a preset this application ships that names none (or the engine defaults) is replaced by
+  the first recipe whose interpreters `mumdia doctor --json` reports as usable: the
+  diaPASEF recipe (`diapasef.json`: AlphaPeptDeep, DeepLC, IM2Deep and the diaPASEF
+  extraction, retrace and quantification settings) when any file is a timsTOF diaPASEF
+  `.d`, then `fasta-sidecars.json` (MS2PIP, DeepLC), then `fasta-peptdeep.json`
+  (AlphaPeptDeep, DeepLC). The digest and modification fields are merged on top of the
+  recipe exactly as they were on top of the preset;
+- a saved settings file that names no predictor is kept, because replacing it would drop
+  the user's edits, and is warned about.
+
+The Search screen shows the plan under the built-in option (`libsrc-builtin-note`), and a
+warning (`builtin-warn`) when the search would still run on native fragment intensities, or
+on a diaPASEF `.d` without predicted 1/K0. Start asks the plan again and, when it carries a
+warning, opens a dialog that says what the search would cost and starts only on "Start
+anyway". `preflight` adds the same warning for any FASTA configuration, so a batch or a
+configuration from the settings editor is covered too. Each recipe considered costs one
+`mumdia doctor`, which imports the interpreters' packages, so the plan runs off the
+interface thread and a stale answer is dropped.
+
+The engine reports the other half: a run whose seed left no retention-time calibration is
+recorded under `rt_calibration_missing` in its manifest (docs/17, "Seed: no confident
+targets"). `read_results` reads it, and the results screen leads with a red banner
+(`res-degraded`), "SEARCH DEGRADED: N of M runs had no retention-time calibration", with the
+usual causes; a separate-files batch marks each such file in its per-file list.
+
 ## Several files
 
 The Spectra picker takes a list. One file is an ordinary search; several mean one of
