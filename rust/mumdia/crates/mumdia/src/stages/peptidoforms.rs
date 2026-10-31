@@ -549,10 +549,14 @@ mod tests {
         cfg.variable_mods.push(ResidueMod {
             residue: 'K',
             name: "HCysThiolactone".to_string(),
+            position: ModPosition::Anywhere,
         });
-        let (_fixed, variable) = validated_rules(&cfg).unwrap();
-        assert_eq!(variable, vec![('M', "Oxidation"), ('K', "HCysThiolactone")]);
-        let sites = vec![(4usize, vec!["HCysThiolactone"])];
+        let rules = validated_rules(&cfg).unwrap();
+        assert_eq!(
+            rules.variable,
+            vec![('M', "Oxidation"), ('K', "HCysThiolactone")]
+        );
+        let sites = vec![(residue_slot(4), vec!["HCysThiolactone"])];
         let forms: Vec<String> = variable_combos(&sites, 1)
             .iter()
             .map(|c| proforma("PEPTKIDER", c))
