@@ -342,6 +342,63 @@ enum Cmd {
         #[arg(long)]
         config: Option<String>,
     },
+    /// The 1/K0 profile (mobilogram) of candidates' fragment and MS1 ions, read from the
+    /// raw events of a diaPASEF `.d` (docs/35_diapasef.md section 17). Read-only.
+    ///
+    /// Per candidate: the MS2 frames whose quad slots isolate the precursor (the frame
+    /// nearest the apex RT and `--frames` such frames either side) and the MS1 frames
+    /// nearest the same RT. Per ion (the chromatogram's predicted fragments and MS1
+    /// isotopes), the raw intensity is binned in 1/K0 over the scans of those slots, at the
+    /// run's fragment mass offset and tolerance and `extract.prec_tol_ppm` for MS1. Prints
+    /// JSON on stdout, or writes a long parquet table (or JSON) with `--out`.
+    Mobilogram {
+        /// The run directory: psms_extracted, chromatograms, run_windows and the seed's
+        /// masscal are read from it, and the `.d` is the one its spectra report names. A
+        /// second-pass run directory takes the spectra of its first pass.
+        #[arg(long)]
+        run_dir: Option<String>,
+        /// Candidate ids (`candidate_id`), one or more.
+        #[arg(long = "candidate", value_name = "ID", num_args = 1.., required = true)]
+        candidates: Vec<u32>,
+        /// Print JSON on stdout (the default without --out).
+        #[arg(long, conflicts_with = "out")]
+        json: bool,
+        /// Write the profiles to this file instead: `.json` as printed, anything else as a
+        /// parquet table with one row per candidate, ion, frame and non-zero bin.
+        #[arg(long)]
+        out: Option<String>,
+        /// Frames either side of the centre frame, per MS level (0: the centre frame only).
+        #[arg(long, default_value_t = mumdia::stages::mobilogram::DEFAULT_FRAMES)]
+        frames: usize,
+        /// Bin width in 1/K0 (V s cm^-2).
+        #[arg(long, default_value_t = mumdia::stages::mobilogram::DEFAULT_BIN)]
+        bin: f64,
+        /// The psms_extracted row of each candidate (`peak_rank`; 0 is extract's apex).
+        #[arg(long, default_value_t = 0)]
+        peak_rank: i32,
+        /// Centre the frames on this retention time (s) instead of each candidate's apex.
+        #[arg(long)]
+        rt: Option<f64>,
+        /// The diaPASEF `.d`; default: the one the run's spectra report names.
+        #[arg(long)]
+        raw: Option<String>,
+        /// Override `<run-dir>/psms_extracted.parquet`.
+        #[arg(long)]
+        psms_extracted: Option<String>,
+        /// Override `<run-dir>/chromatograms.parquet`.
+        #[arg(long)]
+        chromatograms: Option<String>,
+        /// Override `<run-dir>/run_windows.parquet`.
+        #[arg(long)]
+        run_windows: Option<String>,
+        /// Override `<run-dir>/seed_psms.parquet.masscal.json`.
+        #[arg(long)]
+        mass_cal: Option<String>,
+        /// Configuration for `extract.prec_tol_ppm` and the fallback fragment tolerance;
+        /// default: the one the run's manifest recorded.
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Compute the minimal feature set -> features.parquet + PIN.
     Features {
         #[arg(long)]
@@ -1715,6 +1772,51 @@ fn real_main() -> Result<()> {
                 config_hash: &ch,
                 ms1_denoise: cfg.convert.tdf_ms1_denoise,
             })?;
+        }
+        Cmd::Mobilogram {
+            run_dir,
+            candidates,
+            json: _,
+            out,
+            frames,
+            bin,
+            peak_rank,
+            rt,
+            raw,
+            psms_extracted,
+            chromatograms,
+            run_windows,
+            mass_cal,
+            config,
+        } => {
+            use stages::mobilogram;
+            let cfg = match &config {
+                Some(_) => Some(load_config(&config)?),
+                None => None,
+            };
+            let m = mobilogram::run(mobilogram::MobilogramParams {
+                run_dir: run_dir.as_deref(),
+                raw: raw.as_deref(),
+                psms_extracted: psms_extracted.as_deref(),
+                chromatograms: chromatograms.as_deref(),
+                run_windows: run_windows.as_deref(),
+                mass_cal: mass_cal.as_deref(),
+                config: cfg,
+                candidates: &candidates,
+                peak_rank,
+                rt,
+                frames,
+                bin,
+            })?;
+            match out {
+                Some(o) if o.to_ascii_lowercase().ends_with(".json") => {
+                    mumdia_io::json::write_json(&o, &m)?
+                }
+                Some(o) => {
+                    mobilogram::write_parquet(&m, &o)?;
+                }
+                None => println!("{}", serde_json::to_string(&m)?),
+            }
         }
         Cmd::Features {
             psms_extracted,

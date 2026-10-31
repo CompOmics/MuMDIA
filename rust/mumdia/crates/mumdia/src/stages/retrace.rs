@@ -48,7 +48,9 @@ use crate::chromatograms::{self, Layout, Optional, Rows};
 use crate::masscal::{read_mass_cal, MassOffset};
 use crate::sched::DecoderLease;
 use crate::stages::convert::ms1_denoise::Ms1Denoise;
-use crate::stages::convert::tims_frames::{scan_band, slot_scans, sum_events, Sum, TofFrame};
+use crate::stages::convert::tims_frames::{
+    scan_band, scan_mobilities, slot_scans, sum_events, tof_window, Sum, TofFrame,
+};
 use crate::stages::convert::RawTdf;
 use crate::stages::extract::{ms1_neighbours, nearest_index, read_run_windows};
 use crate::stats::{loo_ref_corr, LooRef};
@@ -567,13 +569,6 @@ fn nearest_point(rt: &[f32], int: &[f32], t: f64) -> f64 {
         }
     }
     best.1
-}
-
-/// Inclusive TOF index window of the m/z interval `[lo, hi]`.
-fn tof_window(raw: &RawTdf, lo: f64, hi: f64) -> (u32, u32) {
-    let a = raw.tof_of(lo).ceil().max(0.0);
-    let b = raw.tof_of(hi).floor().max(0.0);
-    (a as u32, b as u32)
 }
 
 /// The decoded MS1 frames an MS1 grid point at `t` sums: the frame nearest `t` and its
@@ -1127,13 +1122,7 @@ pub fn run_hashed(p: RetraceParams) -> Result<RetraceWritten> {
         .scan_offsets
         .len()
         .saturating_sub(1);
-    let scan_im: Vec<f64> = (0..n_scans).map(|s| raw.im_of_scan(s as f64)).collect();
-    if !scan_im.windows(2).all(|w| w[0] > w[1]) {
-        bail!(
-            "{}: 1/K0 is not strictly decreasing in the scan index",
-            p.raw
-        );
-    }
+    let scan_im = scan_mobilities(n_scans, |s| raw.im_of_scan(s), p.raw)?;
     // The MS1 noise filter convert applied (`convert.tdf_ms1_denoise`), on the MS1 frames
     // held here as well, built from the run's diaPASEF windows.
     let ms1_denoise = (p.ms1_denoise && p.cfg.ms1).then(|| {

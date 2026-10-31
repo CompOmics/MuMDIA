@@ -153,6 +153,15 @@ than a number. Both are recorded in every run's `manifest.json`.
   plain-language `label`, which the Search screen shows under the name and matches in its
   filter, so typing "homocysteine" finds both. The carbamidomethylated form of the free
   thiol, cleavage blocked at a modified lysine and the N-terminal adduct are not modelled.
+- **`mumdia mobilogram`: the 1/K0 profile of a diaPASEF candidate's ions, from the raw
+  events of the `.d`.** For the given candidates it bins, in 1/K0, the raw events of every
+  predicted fragment and MS1 isotope in the frames nearest the apex (or `--rt`) and
+  `--frames` either side, over the quad slots that isolate the precursor, at the run's
+  fragment mass offset and tolerance and `extract.prec_tol_ppm`, with convert's 1/K0
+  calibration. Inputs are found from `--run-dir`, each with an override; output is JSON on
+  stdout or a long parquet table. Read-only, and no search output changes. visDIA uses it
+  for the mobilogram of its precursor page, and the desktop application passes its engine
+  to the viewer it starts as `MUMDIA_BIN` (docs/35_diapasef.md section 17).
 
 ### Fixed
 

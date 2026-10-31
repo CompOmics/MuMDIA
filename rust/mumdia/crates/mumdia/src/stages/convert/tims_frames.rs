@@ -9,12 +9,16 @@
 //!
 //! The module knows nothing about candidates or chromatograms: it answers "which events of
 //! this frame lie in this TOF window, in these scans", and the stage that asks decides what
-//! to sum. A later raw-event consumer reuses it.
+//! to sum. Retrace sums them per trace point ([`sum_events`]); `mumdia mobilogram` bins them
+//! in 1/K0 ([`bin_events`]). Both take the scan -> 1/K0 table from [`scan_mobilities`] and
+//! the m/z -> TOF window from [`tof_window`], so the two share one calibration.
 
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use timsrust::{Frame, QuadrupoleSettings};
+
+use super::RawTdf;
 
 /// Bits of a packed event: `tof << TOF_SHIFT | scan << SCAN_SHIFT | intensity`.
 const TOF_SHIFT: u32 = 44;
@@ -150,6 +154,59 @@ pub(crate) fn sum_events(
     s
 }
 
+/// Bin the raw events of `f` with TOF index in `[t_lo, t_hi]` whose scan lies in one of
+/// `scans` (half-open ranges) by their 1/K0: an event of scan `s` adds its intensity to
+/// `out[k]`, `k = floor((scan_im[s] - im_lo) / bin)`, when `0 <= k < out.len()`; an event
+/// outside that range is dropped, not clamped into an edge bin. Returns the intensity it
+/// binned. With `scans` merged ([`slot_scans`]) every event is counted once, and over a bin
+/// range that holds every scan of `scans` the binned intensity is the [`sum_events`]
+/// intensity of the same window.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bin_events(
+    f: &TofFrame,
+    scans: &[(usize, usize)],
+    t_lo: u32,
+    t_hi: u32,
+    scan_im: &[f64],
+    im_lo: f64,
+    bin: f64,
+    out: &mut [f64],
+) -> f64 {
+    let mut binned = 0.0;
+    f.visit(scans, t_lo, t_hi, scan_im.len(), |sc, _, w| {
+        let x = (scan_im[sc] - im_lo) / bin;
+        if x >= 0.0 && (x as usize) < out.len() {
+            out[x as usize] += w;
+            binned += w;
+        }
+    });
+    binned
+}
+
+/// The 1/K0 of every scan `0..n_scans` through `im_of` (`RawTdf::im_of_scan`, the
+/// calibration convert centroids with: Bruker's `TimsCalibration` model 2 when the `.d`
+/// has one), refused unless strictly decreasing in the scan index, as TIMS mobility is and
+/// as [`scan_band`] requires.
+pub(crate) fn scan_mobilities(
+    n_scans: usize,
+    im_of: impl Fn(f64) -> f64,
+    path: &str,
+) -> Result<Vec<f64>> {
+    let scan_im: Vec<f64> = (0..n_scans).map(|s| im_of(s as f64)).collect();
+    if !scan_im.windows(2).all(|w| w[0] > w[1]) {
+        bail!("{path}: 1/K0 is not strictly decreasing in the scan index");
+    }
+    Ok(scan_im)
+}
+
+/// Inclusive TOF index window of the m/z interval `[lo, hi]`, through the converter convert
+/// uses.
+pub(crate) fn tof_window(raw: &RawTdf, lo: f64, hi: f64) -> (u32, u32) {
+    let a = raw.tof_of(lo).ceil().max(0.0);
+    let b = raw.tof_of(hi).floor().max(0.0);
+    (a as u32, b as u32)
+}
+
 /// First scan (inclusive) and last scan (exclusive) with 1/K0 in `[lo, hi]`, given
 /// `scan_im` strictly decreasing in the scan index, as TIMS mobility is.
 pub(crate) fn scan_band(scan_im: &[f64], lo: f64, hi: f64) -> (usize, usize) {
@@ -259,6 +316,80 @@ pub(crate) mod tests {
             collision_energy: vec![0.0, 0.0],
         };
         assert_eq!(slot_scans(&q, 502.0, (0, 8)), vec![(0, 6)]);
+    }
+
+    #[test]
+    fn bin_events_bins_by_scan_mobility_and_conserves_the_window_sum() {
+        let f = TofFrame::new(frame()).unwrap();
+        // Scan s at 1/K0 1.5 - 0.1 s: scans 0..8 span 1.5 down to 0.8.
+        let im: Vec<f64> = (0..8).map(|s| 1.5 - 0.1 * s as f64).collect();
+        // One bin per scan, offset by half a bin so no 1/K0 sits on a bin edge.
+        let (lo, bin) = (0.75, 0.1);
+        let mut out = vec![0.0; 8];
+        let got = bin_events(&f, &[(0, 8)], 200, 200, &im, lo, bin, &mut out);
+        // TOF 200 in scan s has intensity s + 1, and scan s falls in bin 7 - s.
+        assert_eq!(out, vec![8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0]);
+        let s = sum_events(&f, &[(0, 8)], 200, 200, &im);
+        assert_eq!(got, s.inten);
+        // The binned centre of mass is the weighted 1/K0 of sum_events (here exactly: one
+        // scan per bin, at the bin centre).
+        let com: f64 = out
+            .iter()
+            .enumerate()
+            .map(|(k, w)| w * (lo + (k as f64 + 0.5) * bin))
+            .sum::<f64>()
+            / got;
+        assert!((com - s.imw / s.inten).abs() < 1e-9);
+        // Coarser bins, two scans per bin: the same total.
+        let mut two = vec![0.0; 4];
+        bin_events(&f, &[(0, 8)], 100, 300, &im, lo, 0.2, &mut two);
+        let total = sum_events(&f, &[(0, 8)], 100, 300, &im).inten;
+        assert_eq!(two.iter().sum::<f64>(), total);
+    }
+
+    #[test]
+    fn bin_events_clips_to_the_slot_scans_and_counts_overlapping_slots_once() {
+        let mut fr = frame();
+        // Two overlapping slots that both hold 502: scans 0..5 and 3..8.
+        fr.quadrupole_settings = Arc::new(QuadrupoleSettings {
+            index: 1,
+            scan_starts: vec![0, 3],
+            scan_ends: vec![5, 8],
+            isolation_mz: vec![500.0, 505.0],
+            isolation_width: vec![20.0, 20.0],
+            collision_energy: vec![0.0, 0.0],
+        });
+        let f = TofFrame::new(fr).unwrap();
+        let im: Vec<f64> = (0..8).map(|s| 1.5 - 0.1 * s as f64).collect();
+        let scans = slot_scans(f.quad(), 502.0, (0, 8));
+        assert_eq!(scans, vec![(0, 8)]);
+        let mut out = vec![0.0; 8];
+        // Every scan once: 1 + 2 + ... + 8, though scans 3 and 4 lie in both slots.
+        assert_eq!(
+            bin_events(&f, &scans, 300, 300, &im, 0.75, 0.1, &mut out),
+            36.0
+        );
+        // A precursor only the second slot holds: its scans 3..8 alone, bins 0..5.
+        let scans = slot_scans(f.quad(), 514.0, (0, 8));
+        assert_eq!(scans, vec![(3, 8)]);
+        let mut out = vec![0.0; 8];
+        bin_events(&f, &scans, 300, 300, &im, 0.75, 0.1, &mut out);
+        assert_eq!(out, vec![8.0, 7.0, 6.0, 5.0, 4.0, 0.0, 0.0, 0.0]);
+        // Events outside the bin range are dropped, not clamped into the edge bins: bins
+        // [1.25, 1.35) and [1.35, 1.45) hold scans 2 and 1 only.
+        let mut out = vec![0.0; 2];
+        let got = bin_events(&f, &[(0, 8)], 300, 300, &im, 1.25, 0.1, &mut out);
+        assert_eq!((out, got), (vec![3.0, 2.0], 5.0));
+    }
+
+    #[test]
+    fn scan_mobilities_is_the_converter_per_scan_and_refuses_a_rising_axis() {
+        let im_of = |s: f64| 1.6 - 0.001 * s;
+        let v = scan_mobilities(900, im_of, "x.d").unwrap();
+        assert_eq!(v.len(), 900);
+        assert!(v.iter().enumerate().all(|(s, &x)| x == im_of(s as f64)));
+        assert!(scan_mobilities(3, |s| 1.0 + s, "x.d").is_err());
+        assert!(scan_mobilities(3, |_| 1.0, "x.d").is_err());
     }
 
     #[test]
