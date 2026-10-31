@@ -88,14 +88,29 @@ pattern_fit` or `pattern_profile`) the export is v6, v5 plus `pattern_area`, `ob
 `window_rt` (see [Profile-centred window and pattern fit](#profile-centred-window-and-pattern-fit)).
 Every other quant writes v1.
 
+`quant_fragments.parquet` (optional, `quant.fragment_detail` under `run` and
+`run-experiment`, or `--out-quant-fragments`; schema `QUANT_FRAGMENTS` v1): which fragments
+made each quantity. One row per fragment of every candidate the quant reached:
+`candidate_id`, `fragment_name`, `area` (after any baseline and envelope, 0 kept),
+`selected`, `weight`, `rank`, `background` and `rule`; docs/15_data_dictionary.md has the
+column contract. The selected areas times their weights add up to `quantity` under the top-N
+rules (in `rank` order, bit for bit) and under `cross_run` (in table order); under the pattern
+rules `selected` names the fitted fragments and `weight` is NaN, because the quantity is a
+fit. `run-experiment` writes it from the final quant of each run, after the cross-run step and
+on the second pass's chromatograms, so it describes `peptide_quant`; the cross-run step's
+pass-1 `fragment_quant` describes an intermediate quantity and is not a substitute. Off by
+default: with the key off quant computes none of it and every artifact, report and manifest
+keeps its bytes. The desktop application turns it on for its viewer.
+
 `<peak_bounds>.parquet` (optional diagnostic, `--out-peak-bounds`, only when
 `bound_peak` is on; `quant.rs:419`): `candidate_id`, `lo_rt`, `hi_rt`, `width_s`
 (all f64). Not part of the quant contract; it is a view of the integration windows.
 A row is emitted only for a candidate whose chosen `(lo_rt, hi_rt)` are both finite
 (`quant.rs:399`), so unbounded/degenerate windows are absent.
 
-`peptide_quant`, `protein_group_quant`, and an emitted `fragment_quant` receive a
-sidecar `<artifact>.report.json`; the peak-bounds diagnostic does not. Recorded
+`peptide_quant`, `protein_group_quant`, and an emitted `fragment_quant` or
+`quant_fragments` receive a sidecar `<artifact>.report.json`; the peak-bounds diagnostic
+does not. Recorded
 params include the q filter, integration settings, config hash, and exact scored
 and chromatogram inputs. Stats distinguish row counts from quantified and
 nonquantifiable rows.

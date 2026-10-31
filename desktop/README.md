@@ -306,6 +306,12 @@ and removing the environment is refused while one runs. For the search just fini
 the FASTA chosen on the Search screen is passed with `--fasta`, so a library DIA-NN
 built from it still gets sequence coverage.
 
+Every search started here sets `quant.fragment_detail` (`viewerOverrides` in `app.js`,
+merged through `derive_config` like the Search screen's fields), so each run also writes
+`quant_fragments.parquet`: which fragments made each precursor quantity, with their areas
+and weights. The viewer marks those fragments on the chromatograms. The table is small and
+changes no other output; a command-line search writes it only when the configuration asks.
+
 `viewer::tests::a_results_folder_is_served_and_stopped` (ignored by default; set
 `MUMDIA_TEST_VISDIA_DIR` to a results folder, with the environment installed) starts
 the real viewer, fetches its page, checks the reuse, and stops it.
@@ -551,7 +557,9 @@ that turning them on does not need a settings file. Each becomes a configuration
 merged on top of the chosen preset through `derive_config`, the same route the digest
 fields take, and the engine validates the result before anything starts. With all three
 at their defaults (prescreen off, automatic bands that resolve to one band, the standard
-modifications) the preset reaches the engine unchanged in library mode.
+modifications) the preset reaches the engine unchanged in library mode, except for
+`quant.fragment_detail`, which every search started here sets for the viewer (see
+"visDIA, the results viewer").
 
 **Prescreen** (`prescreen.*`, docs/34). The screen says what it is for and what it
 costs: a candidate it removes can never be identified, so it trades identifications for

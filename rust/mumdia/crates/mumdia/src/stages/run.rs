@@ -919,6 +919,11 @@ pub fn run(p: RunParams) -> Result<()> {
     let pep_q = d("peptide_quant.parquet");
     let pg_q = d("protein_group_quant.parquet");
     let frag_q = d("fragment_quant.parquet");
+    // `quant.fragment_detail`: the fragments behind each quantity, for a viewer.
+    let quant_frags = cfg
+        .quant
+        .fragment_detail
+        .then(|| d("quant_fragments.parquet"));
     if !cfg.quant.normalisation.is_off() {
         warn!(
             "run: quant.normalisation is a cross-run step; a single run has no reference, so \
@@ -933,6 +938,7 @@ pub fn run(p: RunParams) -> Result<()> {
         out_protein: &pg_q,
         out_fragment: Some(&frag_q),
         out_peak_bounds: None,
+        out_quant_fragments: quant_frags.as_deref(),
         cfg: &cfg.quant,
         config_hash: &ch,
         cross_run: None,
@@ -975,6 +981,17 @@ pub fn run(p: RunParams) -> Result<()> {
             &ch,
         )?,
     });
+    // Recorded only when written, so a run without `quant.fragment_detail` keeps its
+    // manifest.
+    if let (Some(path), Some(w)) = (&quant_frags, &wq.quant_fragments) {
+        man.record(w.record(
+            artifact::QUANT_FRAGMENTS.0,
+            artifact::QUANT_FRAGMENTS,
+            path,
+            "quant",
+            &ch,
+        ));
+    }
 
     // Human-readable report (peptides.tsv + proteins.tsv) + stdout summary.
     let pep_tsv = d("peptides.tsv");

@@ -938,6 +938,35 @@ export is v6: v5 plus these columns, for the pattern fit of the cross-run step
 | `observed` | Boolean | no | - | the fragment has a trace in this run |
 | `window_rt` | List<Float32> | no | s | the candidate's retention times within twice the halfwidth of the window centre, on the candidate's first row; empty on its other rows |
 
+### quant_fragments (optional, `quant.rs`, `run_hashed`)
+
+Written when `out_quant_fragments` is set: by `run` and `run-experiment` under
+`quant.fragment_detail` (beside each run's `peptide_quant.parquet`), or by
+`quant --out-quant-fragments`. One row per fragment of every candidate the quant reached
+(every accepted candidate with chromatogram rows, `ms1_*` rows excluded), sorted by
+`candidate_id` and, within a candidate, in chromatogram order. Under `run-experiment` it is
+written by the final quant: after the cross-run step and on the second pass's chromatograms
+when those ran, so it describes the reported `peptide_quant`. The cross-run step's pass-1
+`fragment_quant` does not.
+
+| column | Arrow type | nullable | units | meaning |
+|---|---|---|---|---|
+| `candidate_id` | UInt32 | no | - | library candidate id, as in `peptide_quant` |
+| `fragment_name` | Utf8 | no | - | fragment name, as in the chromatograms |
+| `area` | Float64 | no | intensity x s | the fragment's integrated area, after any baseline subtraction and envelope; 0 kept |
+| `selected` | Boolean | no | - | the rule used this fragment for the candidate's quantity |
+| `weight` | Float64 | no | - | 1 under the top-N rules; the fitted cross-run weight under `cross_run` (NaN for a fragment without one); NaN under the pattern rules |
+| `rank` | Int32 | no | - | 1-based position in the rule's ranking (area, or library intensity then area; `weight x area` under `cross_run`; library intensity under the pattern rules); 0 for a fragment the rule did not rank |
+| `background` | Float64 | no | counts | the level subtracted from each window sample before integrating: the experiment background, or the per-run flank quantile; NaN when none was subtracted |
+| `rule` | Utf8 | no | - | the rule that made the candidate's quantity: `observed_area`, `predicted` (also the fallback of `cross_run` and the pattern rules), `cross_run`, `pattern_fit` or `pattern_profile` |
+
+Under `observed_area` and `predicted` the selected areas, summed in `rank` order, are the
+candidate's `quantity`, bit for bit; under `cross_run` the selected `weight x area`, summed
+in table order, are. The pattern rules fit the selected fragments' window samples to the
+library pattern, so their quantity is not a sum of areas: `selected` names the fragments the
+fit used (as many as `n_fragments_used`) and `weight` is NaN. The report records `candidates`
+and `selected_fragments`.
+
 ### peak-bounds diagnostic (optional, `quant.rs:421-429`)
 
 Written only when `out_peak_bounds` is set and `bound_peak` is on.

@@ -69,7 +69,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`features`](#features) | `FeaturesConfig` | 12 | [docs/10_features.md](10_features.md) |
 | [`compete`](#compete) | `CompeteConfig` | 6 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
 | [`rescore`](#rescore) | `RescoreConfig` | 31 | [docs/11_compete_rescore_fdr.md](11_compete_rescore_fdr.md) |
-| [`quant`](#quant) | `QuantConfig` | 23 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
+| [`quant`](#quant) | `QuantConfig` | 24 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`mbr`](#mbr) | `MbrConfig` | 11 | [docs/12_quant_lfq_align_mbr_report_audit.md](12_quant_lfq_align_mbr_report_audit.md) |
 | [`experiment`](#experiment) | `ExperimentConfig` | 3 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
 | [`groups`](#groups) | `GroupsConfig` | 9 |  |
@@ -516,6 +516,7 @@ Composable per-claimant weight cues for `PeakClaim::CoelutionMultiCue` (the modu
 | `normalisation_lfq` | `bool` | `false` |  | The cross-run MaxLFQ of `run-experiment` reads `quantity_normalised` without its own median-ratio size factors, in place of `quantity` with them. Off by default, because the normalisation was measured on precursor quantities only and its effect on protein quantities is unmeasured. Omitted from the canonical configuration at its default. |
 | `normalisation_rank` | `Option<usize>` | `null` |  | `stable_set` only: the dimension of the subspace of the run space that holds the composition effects, fixed. Unset (the default), each iteration counts the eigenvalues of the most abundant complete ions' deviations above 3 times their median (at least 1, at most `n_runs - 2`), the rule the method was confirmed with. That count is fragile: on Q Exactive AIF it chose 2 where the design has two conditions (docs/12, "Cross-run normalisation"), so a design with `G` sample groups can fix it at `G - 1`. Must be >= 1. Omitted from the canonical configuration when unset. |
 | `window_centre` | `WindowCentre` | `apex` | benchmark-gated | Where the fixed scan window is centred. `apex` (default): on the sample nearest the identification apex. `profile`: on the centre of the 3-sample block, within 2 samples of that sample, with the largest summed raw intensity of the 6 fragments with the highest library intensity (ties to the smaller shift), one centre for all of the candidate's fragments (docs/12, "Profile-centred window and pattern fit"). The identification apex and `integration_apex_rt` do not move; `integration_lo_rt` and `integration_hi_rt` report the shifted window. Needs the scan form of the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`, `fixed_scan_halfwidth_scale = 0`). Benchmark-gated. Omitted from the canonical configuration at its default. |
+| `fragment_detail` | `bool` | `false` |  | Write which fragments made each precursor quantity: the final quant of `run` and of `run-experiment` (after the cross-run step and the second pass, when they run) also writes `quant_fragments.parquet` beside each run's `peptide_quant.parquet` (`quant_fragments` v1, docs/15): one row per fragment of every quantified candidate, with its integrated area (after any baseline and envelope, zero areas kept), whether the rule selected it, its weight and rank in that rule, and the background subtracted from it. Under the top-N rules and `cross_run` the selected areas times their weights add up to `quantity`; the pattern rules write NaN weights, because their quantity is a fit rather than a sum. A viewer reads it to show the fragments behind a quantity. Off by default: no other artifact, report or manifest entry changes with it, and the table costs one row per fragment of the quantified candidates. Omitted from the canonical configuration at its default. |
 
 ## mbr
 
@@ -1299,6 +1300,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-24 structs and 324 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 42 enumerations, 1 named profile(s), 102 environment variables read and 20 set.
+24 structs and 325 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 42 enumerations, 1 named profile(s), 102 environment variables read and 20 set.
 
 36 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

@@ -2366,6 +2366,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 out_protein: &tmp("protein_group_quant"),
                 out_fragment: Some(&ft),
                 out_peak_bounds: None,
+                out_quant_fragments: None,
                 cfg: &qcfg,
                 config_hash: &ch,
                 cross_run: None,
@@ -2421,6 +2422,13 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let finals = quant_plan.map_pooled(&run_idx, |&i| {
         let pq = d(&format!("{}/peptide_quant.parquet", names[i]));
         let gq = d(&format!("{}/protein_group_quant.parquet", names[i]));
+        // `quant.fragment_detail`: the fragments behind each of this run's reported
+        // quantities. This is the final quant, after the cross-run step and on the second
+        // pass's chromatograms when those ran, so the table describes `peptide_quant`; the
+        // cross-run step's pass-1 `fragment_quant` does not.
+        let qf = qcfg
+            .fragment_detail
+            .then(|| d(&format!("{}/quant_fragments.parquet", names[i])));
         let written = quant::run_hashed(quant::QuantParams {
             psms_scored: &split_paths[i],
             chromatograms: &chroms[i],
@@ -2428,20 +2436,23 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             out_protein: &gq,
             out_fragment: None,
             out_peak_bounds: None,
+            out_quant_fragments: qf.as_deref(),
             cfg: &qcfg,
             config_hash: &ch,
             cross_run: cross_run.as_ref().map(|(fit, _)| fit),
             export_cross_run: false,
             first_pass_ids: first_pass_ids.as_ref().map(|v| &v[i]),
         })?;
-        Ok((pq, gq, written))
+        Ok((pq, gq, qf, written))
     })?;
     let mut peptide_quants: Vec<String> = Vec::with_capacity(n_runs);
     let mut protein_quants: Vec<String> = Vec::with_capacity(n_runs);
+    let mut quant_fragment_tables: Vec<Option<String>> = Vec::with_capacity(n_runs);
     let mut quant_written: Vec<quant::QuantWritten> = Vec::with_capacity(n_runs);
-    for (pq, gq, written) in finals {
+    for (pq, gq, qf, written) in finals {
         peptide_quants.push(pq);
         protein_quants.push(gq);
+        quant_fragment_tables.push(qf);
         quant_written.push(written);
     }
     // --- cross-run normalisation (`quant.normalisation`, opt-in) ---
@@ -2764,6 +2775,18 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "quant",
             Some(quant_written[i].protein.content_hash.clone()),
         ));
+        // `quant.fragment_detail` only, so every other manifest keeps its entries.
+        if let (Some(path), Some(w)) =
+            (&quant_fragment_tables[i], &quant_written[i].quant_fragments)
+        {
+            artifacts.push((
+                format!("quant_fragments[{name}]"),
+                artifact::QUANT_FRAGMENTS,
+                path.clone(),
+                "quant",
+                Some(w.content_hash.clone()),
+            ));
+        }
         if let Some((tables, _, written)) = &normalised {
             artifacts.push((
                 format!("peptide_quant_normalised[{name}]"),
