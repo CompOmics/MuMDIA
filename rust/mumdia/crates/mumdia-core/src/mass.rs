@@ -14,7 +14,8 @@ use crate::error::MassError;
 pub const MODIFICATIONS_JSON: &str = include_str!("modifications.json");
 
 /// One catalogue entry: a UniMod PSI-MS name, its accession, its monoisotopic delta, and the
-/// residues the Search tab offers it on (the engine accepts the name on any residue).
+/// residues the Search tab offers it on (the engine accepts the name on any residue), and an
+/// optional plain-language label the Search tab shows and filters on.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct Modification {
     pub name: String,
@@ -22,6 +23,8 @@ pub struct Modification {
     pub mass: f64,
     pub residues: String,
     pub group: String,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -625,6 +628,40 @@ mod tests {
     }
 
     #[test]
+    fn homocysteinylation_shifts_lysine_and_cysteine_by_the_unimod_deltas() {
+        // UniMod 1270 (HCysThiolactone, C4H7NOS) on K and 1271 (HCysteinyl, C4H7NO2S)
+        // on C, pinned as absolute deltas so a wrong entry cannot agree with itself.
+        let plain_k = parse_peptidoform("PEPTKIDER").unwrap().neutral_mass();
+        let hcy_k = parse_peptidoform("PEPTK[HCysThiolactone]IDER")
+            .unwrap()
+            .neutral_mass();
+        assert!(
+            (hcy_k - plain_k - 117.024_835).abs() < MDA,
+            "N-homocysteinylation delta = {}",
+            hcy_k - plain_k
+        );
+        let plain_c = parse_peptidoform("PEPTCIDER").unwrap().neutral_mass();
+        let hcy_c = parse_peptidoform("PEPTC[HCysteinyl]IDER")
+            .unwrap()
+            .neutral_mass();
+        assert!(
+            (hcy_c - plain_c - 133.019_749).abs() < MDA,
+            "S-homocysteinylation delta = {}",
+            hcy_c - plain_c
+        );
+        let labelled = |n: &str| {
+            modifications()
+                .iter()
+                .find(|m| m.name == n)
+                .and_then(|m| m.label.clone())
+                .unwrap_or_default()
+        };
+        assert!(labelled("HCysThiolactone").contains("homocysteine"));
+        assert!(labelled("HCysteinyl").contains("homocysteinylation"));
+        assert!(labelled("Carbamidomethyl").is_empty());
+    }
+
+    #[test]
     fn every_catalogue_mass_matches_its_elemental_composition() {
         // UniMod deltas recomputed from their compositions, to 1e-5 Da,
         // so a typed mass that is off by a digit fails here rather than in a search.
@@ -651,6 +688,7 @@ mod tests {
             ("Carbamyl", comp(1., 1., 1., 1., 0., 0.)),
             ("Nitro", comp(0., -1., 1., 2., 0., 0.)),
             ("Cysteinyl", comp(3., 5., 1., 2., 1., 0.)),
+            ("HCysteinyl", comp(4., 7., 1., 2., 1., 0.)),
             ("Glutathione", comp(10., 15., 3., 6., 1., 0.)),
             ("Phospho", comp(0., 1., 0., 3., 0., 1.)),
             ("Sulfo", comp(0., 0., 0., 3., 1., 0.)),
@@ -661,6 +699,7 @@ mod tests {
             ("Crotonyl", comp(4., 4., 0., 1., 0., 0.)),
             ("Malonyl", comp(3., 2., 0., 3., 0., 0.)),
             ("Succinyl", comp(4., 4., 0., 3., 0., 0.)),
+            ("HCysThiolactone", comp(4., 7., 1., 1., 1., 0.)),
             ("Methyl", comp(1., 2., 0., 0., 0., 0.)),
             ("Dimethyl", comp(2., 4., 0., 0., 0., 0.)),
             ("Trimethyl", comp(3., 6., 0., 0., 0., 0.)),

@@ -1719,7 +1719,9 @@ function renderMods() {
       .filter((k) => k.split("|")[0] === m.name)
       .map((k) => k.split("|")[1]);
     const residues = [...new Set([...m.residues, ...extra])];
-    const hay = `${m.name} ${m.group} ${residues.join(" ")} unimod:${m.unimod}`.toLowerCase();
+    // The optional label is a plain-language description ("N-homocysteinylation") for a
+    // UniMod name that does not say what it is, so it is shown and matched by the filter.
+    const hay = `${m.name} ${m.label || ""} ${m.group} ${residues.join(" ")} unimod:${m.unimod}`.toLowerCase();
     if (words.length && !words.every((w) => hay.includes(w))) continue;
     if (m.group !== group) {
       group = m.group;
@@ -1738,6 +1740,12 @@ function renderMods() {
     mass.className = "mmass";
     mass.textContent = `${m.mass >= 0 ? "+" : ""}${m.mass.toFixed(4)} Da · UniMod:${m.unimod}`;
     label.append(name, mass);
+    if (m.label) {
+      const desc = document.createElement("div");
+      desc.className = "mlabel";
+      desc.textContent = m.label;
+      label.appendChild(desc);
+    }
     const chips = document.createElement("div");
     chips.className = "chips";
     let on = false;
