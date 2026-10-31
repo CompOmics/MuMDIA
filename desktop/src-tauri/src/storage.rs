@@ -283,13 +283,9 @@ fn in_onedrive(path: &Path, roots: &[PathBuf]) -> bool {
         let r = norm(r);
         !r.is_empty() && (p == r || p.starts_with(&format!("{r}/")))
     };
-    roots.iter().any(under)
-        || path.components().any(|c| match c {
-            std::path::Component::Normal(n) => {
-                n.to_string_lossy().to_lowercase().starts_with("onedrive")
-            }
-            _ => false,
-        })
+    // Folder names by the text, not `components()`: on Windows the share of
+    // `//server/OneDrive` is part of the prefix component.
+    roots.iter().any(under) || p.split('/').any(|seg| seg.starts_with("onedrive"))
 }
 
 fn onedrive_roots() -> Vec<PathBuf> {

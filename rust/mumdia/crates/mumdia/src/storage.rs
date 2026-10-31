@@ -256,12 +256,9 @@ fn in_onedrive_with(path: &Path, roots: &[String]) -> bool {
     {
         return true;
     }
-    path.components().any(|c| match c {
-        std::path::Component::Normal(n) => {
-            n.to_string_lossy().to_lowercase().starts_with("onedrive")
-        }
-        _ => false,
-    })
+    // By the text, not `components()`: on Windows the share of `//server/OneDrive`
+    // is part of the prefix component.
+    p.split('/').any(|seg| seg.starts_with("onedrive"))
 }
 
 /// The OneDrive folders of this account, from the variables the OneDrive client sets.
