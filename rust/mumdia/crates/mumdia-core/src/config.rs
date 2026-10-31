@@ -1055,10 +1055,12 @@ impl Default for PeptidoformsConfig {
             fixed_mods: vec![ResidueMod {
                 residue: 'C',
                 name: "Carbamidomethyl".to_string(),
+                position: ModPosition::Anywhere,
             }],
             variable_mods: vec![ResidueMod {
                 residue: 'M',
                 name: "Oxidation".to_string(),
+                position: ModPosition::Anywhere,
             }],
             max_variable_mods: 1,
             charge_min: 2,
@@ -1069,13 +1071,135 @@ impl Default for PeptidoformsConfig {
     }
 }
 
+impl PeptidoformsConfig {
+    /// Whether any fixed or variable rule is placed at the protein N-terminus. The digest
+    /// then records which peptides start a protein (`protein_n_term`, peptides v2); without
+    /// such a rule it writes the v1 table, byte for byte.
+    pub fn has_protein_n_term_rule(&self) -> bool {
+        self.fixed_mods
+            .iter()
+            .chain(&self.variable_mods)
+            .any(|m| m.position == ModPosition::ProteinNTerm)
+    }
+
+    /// The first terminal rule the peptidoform stage cannot place, as a message naming it.
+    ///
+    /// A terminal rule takes the residue `*`; a terminal modification restricted to one
+    /// residue (N-terminal acetylation of S only, say) and the C-terminal positions are
+    /// refused rather than approximated. At most one fixed rule may sit on the N-terminus,
+    /// and a fixed N-terminal rule excludes every variable one, because a terminus carries
+    /// one group.
+    pub fn terminal_rule_problem(&self) -> Option<String> {
+        let mut fixed_n_term: Vec<&ResidueMod> = Vec::new();
+        let mut variable_n_term: Vec<&ResidueMod> = Vec::new();
+        for (kind, list) in [
+            ("fixed", &self.fixed_mods),
+            ("variable", &self.variable_mods),
+        ] {
+            for m in list.iter().filter(|m| !m.position.is_anywhere()) {
+                if !m.position.is_n_term() {
+                    return Some(format!(
+                        "peptidoforms.{kind}_mods: '{}' at position {}: C-terminal \
+                         modifications are not implemented (peptide_n_term and \
+                         protein_n_term are)",
+                        m.name,
+                        m.position.name()
+                    ));
+                }
+                if m.residue != '*' {
+                    return Some(format!(
+                        "peptidoforms.{kind}_mods: '{}' at position {} names residue '{}'; a \
+                         terminal rule takes residue '*' (any first residue), and a terminal \
+                         modification restricted to one residue is not implemented",
+                        m.name,
+                        m.position.name(),
+                        m.residue
+                    ));
+                }
+                if kind == "fixed" {
+                    fixed_n_term.push(m);
+                } else {
+                    variable_n_term.push(m);
+                }
+            }
+        }
+        let show = |m: &ResidueMod| format!("'{}' ({})", m.name, m.position.name());
+        if fixed_n_term.len() > 1 {
+            return Some(format!(
+                "peptidoforms.fixed_mods: two fixed N-terminal modifications ({} and {}); a \
+                 terminus carries one group",
+                show(fixed_n_term[0]),
+                show(fixed_n_term[1])
+            ));
+        }
+        if let (Some(f), Some(v)) = (fixed_n_term.first(), variable_n_term.first()) {
+            return Some(format!(
+                "peptidoforms: fixed N-terminal modification {} and variable N-terminal \
+                 modification {}; a terminus carries one group, so fixed and variable \
+                 N-terminal rules cannot be combined",
+                show(f),
+                show(v)
+            ));
+        }
+        None
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResidueMod {
-    /// Target residue; `*` for any / terminal handled separately in MVP.
+    /// Target residue; `*` for a terminal rule (any first residue).
     pub residue: char,
     /// UniMod name.
     pub name: String,
+    /// Where the modification sits: on `residue` wherever it occurs (`anywhere`, the
+    /// default, omitted from the canonical configuration so the hash of every existing
+    /// configuration is unchanged), on the N-terminus of every peptide (`peptide_n_term`),
+    /// or on the N-terminus of a peptide that starts its protein (`protein_n_term`, with or
+    /// without the initiator methionine). A terminal rule takes residue `*`.
+    /// `peptide_c_term` and `protein_c_term` are recognised only to be refused.
+    #[serde(default, skip_serializing_if = "ModPosition::is_anywhere")]
+    pub position: ModPosition,
+}
+
+/// The position of a [`ResidueMod`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModPosition {
+    /// On the rule's residue wherever it occurs.
+    #[default]
+    Anywhere,
+    /// On the N-terminal amine of every peptide.
+    PeptideNTerm,
+    /// On the N-terminal amine of a peptide that starts its protein: at protein position 0,
+    /// or at position 1 after the initiator methionine (`digest.n_term_met_excision`).
+    ProteinNTerm,
+    /// Refused at load: C-terminal modifications are not implemented.
+    PeptideCTerm,
+    /// Refused at load: C-terminal modifications are not implemented.
+    ProteinCTerm,
+}
+
+impl ModPosition {
+    pub fn is_anywhere(&self) -> bool {
+        *self == ModPosition::Anywhere
+    }
+
+    /// Whether the rule sits on the N-terminal amine rather than on a residue.
+    pub fn is_n_term(&self) -> bool {
+        matches!(self, ModPosition::PeptideNTerm | ModPosition::ProteinNTerm)
+    }
+
+    /// The configuration spelling.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ModPosition::Anywhere => "anywhere",
+            ModPosition::PeptideNTerm => "peptide_n_term",
+            ModPosition::ProteinNTerm => "protein_n_term",
+            ModPosition::PeptideCTerm => "peptide_c_term",
+            ModPosition::ProteinCTerm => "protein_c_term",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -4607,6 +4731,9 @@ impl Config {
                  AlphaPeptDeep's own vocabulary"
                     .into(),
             ));
+        }
+        if let Some(problem) = self.peptidoforms.terminal_rule_problem() {
+            return Err(Invalid(problem));
         }
         if self.peptidoforms.charge_min < 1
             || self.peptidoforms.charge_min > self.peptidoforms.charge_max

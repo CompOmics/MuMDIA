@@ -1506,6 +1506,7 @@ fn real_main() -> Result<()> {
                 cfg: &cfg.digest,
                 rng_seed: cfg.rng_seed,
                 config_hash: &ch,
+                protein_n_term: cfg.peptidoforms.has_protein_n_term_rule(),
             })?;
         }
         Cmd::Peptidoforms {

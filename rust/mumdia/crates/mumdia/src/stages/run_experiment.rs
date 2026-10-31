@@ -1277,6 +1277,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                     cfg: &cfg.digest,
                     rng_seed: cfg.rng_seed,
                     config_hash: &ch,
+                    protein_n_term: cfg.peptidoforms.has_protein_n_term_rule(),
                 })?;
                 let pf = d("peptidoforms.parquet");
                 peptidoforms::run(peptidoforms::PeptidoformsParams {

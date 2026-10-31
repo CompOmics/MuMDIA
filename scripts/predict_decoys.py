@@ -51,6 +51,9 @@ from _unimod import MODIFICATIONS  # noqa: E402
 
 TO_UNIMOD = {name: uid for name, uid, _ in MODIFICATIONS}
 MODS = re.compile(r"\[([^\]]+)\]")
+# The ProForma N-terminal group, `[Name]-`, and every modification with a terminal dash.
+NTERM = re.compile(r"^\[([^\]]+)\]-")
+STRIP = re.compile(r"-?\[[^\]]+\]-?")
 
 
 def strip_decoy(pform):
@@ -58,8 +61,23 @@ def strip_decoy(pform):
 
 
 def to_diann(pform):
-    """MuMDIA peptidoform (ProForma names) -> DIA-NN modified sequence (UniMod ids)."""
-    return "_" + MODS.sub(lambda m: f"[UniMod:{TO_UNIMOD[m.group(1)]}]", strip_decoy(pform)) + "_"
+    """MuMDIA peptidoform (ProForma names) -> DIA-NN modified sequence (UniMod ids).
+
+    DIA-NN writes an N-terminal modification before the first residue without a dash
+    (`(UniMod:1)PEPK`), so the ProForma group `[Acetyl]-` becomes `[UniMod:1]` there.
+    """
+    s = strip_decoy(pform)
+    lead = ""
+    m = NTERM.match(s)
+    if m:
+        lead = f"[UniMod:{TO_UNIMOD[m.group(1)]}]"
+        s = s[m.end():]
+    return "_" + lead + MODS.sub(lambda m: f"[UniMod:{TO_UNIMOD[m.group(1)]}]", s) + "_"
+
+
+def stripped(pform):
+    """The residues of a peptidoform: no DECOY_ marker, no modification, no terminal dash."""
+    return STRIP.sub("", strip_decoy(pform))
 
 
 def load_precursors(path):
@@ -112,8 +130,7 @@ def tsv(in_prec, in_frag, out):
                 "ProteinId\tiRT\n")
         for cid, pform, z, mz in zip(dec.candidate_id, dec.peptidoform, dec.charge, dec.precursor_mz):
             frag_mz = first[cid] if np.isfinite(first[cid]) else mz
-            stripped = MODS.sub("", strip_decoy(pform))
-            f.write(f"{to_diann(pform)}\t{stripped}\t{z}\t{mz:.6f}\t{frag_mz:.6f}\t1\ty\t1\t1\t"
+            f.write(f"{to_diann(pform)}\t{stripped(pform)}\t{z}\t{mz:.6f}\t{frag_mz:.6f}\t1\ty\t1\t1\t"
                     f"DECOYSET\t0\n")
     print(f"tsv: {len(dec)} decoy precursors -> {out}")
 

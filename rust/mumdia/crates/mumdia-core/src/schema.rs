@@ -29,6 +29,13 @@ pub mod artifact {
     pub const ISOLATION_WINDOWS_V2: (&str, u32) = ("isolation_windows", 2);
     pub const MS2_TO_MS1: (&str, u32) = ("ms2_to_ms1", 1);
     pub const PEPTIDES: (&str, u32) = ("peptides", 1);
+    /// v2: v1 plus a Boolean `protein_n_term`, appended last: whether the peptide starts a
+    /// protein (at position 0 in any protein it occurs in, or at position 1 after the
+    /// initiator methionine under `digest.n_term_met_excision`); a decoy carries its
+    /// target's value. Written only when a modification rule is placed at the protein
+    /// N-terminus (`peptidoforms.*_mods[].position = "protein_n_term"`); every other digest
+    /// writes v1, byte for byte. Readers select columns by name.
+    pub const PEPTIDES_V2: (&str, u32) = ("peptides", 2);
     pub const PEPTIDOFORMS: (&str, u32) = ("peptidoforms", 1);
     pub const FRAGMENT_LIBRARY_PRECURSORS: (&str, u32) = ("fragment_library_precursors", 1);
     /// v2: v1 plus a nullable Float64 `predicted_im` (1/K0, V s cm^-2). Written only when the
@@ -117,6 +124,16 @@ pub mod artifact {
     /// `candidate_id`), written by a grouped run under `groups.pool_chromatograms = false`,
     /// the default.
     pub const OVERLAP_LOSERS: (&str, u32) = ("overlap_losers", 1);
+
+    /// The `peptides` schema a digest writes: [`PEPTIDES_V2`] when it records the
+    /// protein N-terminus flag, else [`PEPTIDES`].
+    pub fn peptides(protein_n_term: bool) -> (&'static str, u32) {
+        if protein_n_term {
+            PEPTIDES_V2
+        } else {
+            PEPTIDES
+        }
+    }
 
     /// The `spectra_ms1` schema a conversion writes: [`SPECTRA_MS1_V2`] when the source
     /// carries ion mobility, else [`SPECTRA_MS1`].
@@ -257,6 +274,14 @@ mod tests {
         assert_eq!(fragment_quant(false, true), ("fragment_quant", 1));
         assert_eq!(fragment_quant(true, false), ("fragment_quant", 5));
         assert_eq!(fragment_quant(true, true), ("fragment_quant", 6));
+    }
+
+    /// Only a protein N-terminal rule moves `peptides`, to v2.
+    #[test]
+    fn peptides_selector_keeps_v1_without_a_protein_n_term_rule() {
+        assert_eq!(peptides(false), PEPTIDES);
+        assert_eq!(peptides(false), ("peptides", 1));
+        assert_eq!(peptides(true), ("peptides", 2));
     }
 
     /// Only the first-pass flag moves `peptide_quant`, to v3.

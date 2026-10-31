@@ -936,11 +936,27 @@ pub struct BuildRequest {
     pub max_variable_mods: u32,
 }
 
-/// One modification on one residue, by catalogue name.
+/// One modification on one residue, by catalogue name, or on a terminus.
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ModSite {
     pub name: String,
     pub residue: char,
+    /// `protein_n_term` or `peptide_n_term` for a terminal site, whose residue is `*`;
+    /// empty (or `anywhere`) for a residue, which is how every earlier request reads.
+    #[serde(default)]
+    pub position: String,
+}
+
+impl ModSite {
+    /// DIA-NN's site token for a terminal site: `*n` for the protein N-terminus, `n` for
+    /// the peptide N-terminus (the `--var-mod`/`--fixed-mod` site syntax).
+    fn terminal_token(&self) -> Option<&'static str> {
+        match self.position.as_str() {
+            "protein_n_term" => Some("*n"),
+            "peptide_n_term" => Some("n"),
+            _ => None,
+        }
+    }
 }
 
 /// The modifications a request asks for, normalised: catalogue order is irrelevant, the
@@ -956,6 +972,7 @@ fn site(name: &str, residue: char) -> ModSite {
     ModSite {
         name: name.into(),
         residue,
+        position: String::new(),
     }
 }
 
@@ -978,6 +995,11 @@ impl ModPlan {
         } else {
             (req.fixed_mods.clone(), req.variable_mods.clone())
         };
+        for m in fixed.iter_mut().chain(variable.iter_mut()) {
+            if m.position == "anywhere" {
+                m.position.clear();
+            }
+        }
         for m in fixed.iter().chain(&variable) {
             if crate::mods::lookup(&m.name).is_none() {
                 return Err(format!(
@@ -985,9 +1007,38 @@ impl ModPlan {
                     m.name
                 ));
             }
-            if !m.residue.is_ascii_uppercase() {
-                return Err(format!("{} on '{}': not a residue", m.name, m.residue));
+            if m.position.is_empty() {
+                if !m.residue.is_ascii_uppercase() {
+                    return Err(format!("{} on '{}': not a residue", m.name, m.residue));
+                }
+            } else if m.terminal_token().is_none() {
+                return Err(format!(
+                    "{} at '{}': the terminal positions are protein_n_term and peptide_n_term",
+                    m.name, m.position
+                ));
+            } else if m.residue != '*' {
+                return Err(format!(
+                    "{} at {} names residue '{}'; a terminal site takes '*'",
+                    m.name, m.position, m.residue
+                ));
             }
+        }
+        // One group per terminus, as the engine requires: at most one fixed N-terminal site,
+        // and none variable beside it.
+        let n_fixed = fixed
+            .iter()
+            .filter(|m| m.terminal_token().is_some())
+            .count();
+        let n_var = variable
+            .iter()
+            .filter(|m| m.terminal_token().is_some())
+            .count();
+        if n_fixed > 1 || (n_fixed == 1 && n_var > 0) {
+            return Err(
+                "a peptide N-terminus carries one group: at most one fixed N-terminal \
+                 modification, and no variable one beside it"
+                    .into(),
+            );
         }
         fixed.sort();
         fixed.dedup();
@@ -1011,11 +1062,15 @@ impl ModPlan {
             && (self.variable.is_empty() || self.max_variable == 1)
     }
 
-    /// Canonical text for the cache key.
+    /// Canonical text for the cache key. A residue site is `Name@R` as it always was; a
+    /// terminal site is `Name@*n` or `Name@n`, its DIA-NN site token.
     fn key(&self) -> String {
         let list = |v: &[ModSite]| {
             v.iter()
-                .map(|m| format!("{}@{}", m.name, m.residue))
+                .map(|m| match m.terminal_token() {
+                    Some(t) => format!("{}@{t}", m.name),
+                    None => format!("{}@{}", m.name, m.residue),
+                })
                 .collect::<Vec<_>>()
                 .join(",")
         };
@@ -1027,14 +1082,20 @@ impl ModPlan {
         )
     }
 
-    /// `name -> residues` in name order, for one DIA-NN argument per modification.
+    /// `name -> residues` in name order, for one DIA-NN argument per modification. A
+    /// terminal site is an argument of its own after the residue one, with its site token
+    /// (`*n`, `n`), so a residue list never mixes with a terminus.
     fn grouped(v: &[ModSite]) -> Vec<(&'static crate::mods::Modification, String)> {
-        let mut by: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
+        let mut by: std::collections::BTreeMap<(&str, &str), String> =
+            std::collections::BTreeMap::new();
         for m in v {
-            by.entry(m.name.as_str()).or_default().push(m.residue);
+            match m.terminal_token() {
+                Some(t) => by.entry((m.name.as_str(), t)).or_default().push_str(t),
+                None => by.entry((m.name.as_str(), "")).or_default().push(m.residue),
+            }
         }
         by.into_iter()
-            .filter_map(|(n, r)| crate::mods::lookup(n).map(|m| (m, r)))
+            .filter_map(|((n, _), r)| crate::mods::lookup(n).map(|m| (m, r)))
             .collect()
     }
 
@@ -2635,6 +2696,79 @@ PEPTIDEK
         // A name outside the catalogue is refused before DIA-NN runs.
         let mut bad = base.clone();
         bad.variable_mods = vec![site("NotAModification", 'K')];
+        assert!(ModPlan::of(&bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn terminal(name: &str, position: &str) -> ModSite {
+        ModSite {
+            name: name.into(),
+            residue: '*',
+            position: position.into(),
+        }
+    }
+
+    /// Protein N-terminal acetylation is DIA-NN's `*n` site, an argument of its own next to
+    /// a residue acetyl, a cache key of its own, and its accession is kept at import.
+    #[test]
+    fn a_protein_n_terminal_site_is_the_star_n_token() {
+        let dir = std::env::temp_dir().join(format!("mumdia-diann-nterm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("a.fasta");
+        std::fs::write(&fa, b">sp|P1|X\nMPEPTIDEK\n").unwrap();
+        let base = a_request(fa.to_str().unwrap());
+        let mut r = base.clone();
+        r.fixed_mods = vec![site("Carbamidomethyl", 'C')];
+        r.variable_mods = vec![
+            site("Oxidation", 'M'),
+            terminal("Acetyl", "protein_n_term"),
+            site("Acetyl", 'K'),
+        ];
+        let plan = ModPlan::of(&r).unwrap();
+        assert!(!plan.is_legacy());
+        let args = predict_args(&r, &plan, Path::new("out/lib")).unwrap();
+        let after = |flag: &str| -> Vec<String> {
+            args.iter()
+                .enumerate()
+                .filter(|(_, a)| *a == flag)
+                .map(|(i, _)| args[i + 1].clone())
+                .collect()
+        };
+        assert_eq!(
+            after("--var-mod"),
+            vec![
+                "UniMod:1,42.010565,K".to_string(),
+                "UniMod:1,42.010565,*n".to_string(),
+                "UniMod:35,15.994915,M".to_string(),
+            ]
+        );
+        assert!(args.iter().any(|a| a == "--met-excision"));
+        assert_eq!(plan.unimod_ids(), vec![1, 4, 35]);
+        assert!(plan.key().contains("Acetyl@*n"), "{}", plan.key());
+        let mut residue_only = r.clone();
+        residue_only.variable_mods = vec![site("Oxidation", 'M'), site("Acetyl", 'K')];
+        assert_ne!(
+            library_cache_dir(&r, "DIA-NN 2.0").unwrap(),
+            library_cache_dir(&residue_only, "DIA-NN 2.0").unwrap()
+        );
+        // `anywhere` is the residue site it always was.
+        let mut spelled = residue_only.clone();
+        spelled.variable_mods[1].position = "anywhere".into();
+        assert_eq!(
+            ModPlan::of(&spelled).unwrap(),
+            ModPlan::of(&residue_only).unwrap()
+        );
+        // Refused: a residue on a terminal site, a C-terminus, fixed and variable N-termini.
+        let mut bad = base.clone();
+        bad.variable_mods = vec![ModSite {
+            residue: 'S',
+            ..terminal("Acetyl", "protein_n_term")
+        }];
+        assert!(ModPlan::of(&bad).is_err());
+        bad.variable_mods = vec![terminal("Acetyl", "protein_c_term")];
+        assert!(ModPlan::of(&bad).is_err());
+        bad.variable_mods = vec![terminal("Acetyl", "protein_n_term")];
+        bad.fixed_mods = vec![terminal("Propionyl", "peptide_n_term")];
         assert!(ModPlan::of(&bad).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

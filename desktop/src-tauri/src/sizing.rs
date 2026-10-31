@@ -10,7 +10,7 @@
 //! 8); they cost repeated fixed work, which is why the plan bands only when the unbanded
 //! search would not fit.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
@@ -121,6 +121,10 @@ fn parse_meminfo_total(meminfo: &str) -> Option<u64> {
 pub struct ModChoice {
     pub name: String,
     pub residue: char,
+    /// `peptide_n_term` or `protein_n_term` for a terminal choice (residue `*`); empty, or
+    /// `anywhere`, for a residue.
+    #[serde(default)]
+    pub position: String,
 }
 
 /// The search space the Search tab describes.
@@ -285,30 +289,51 @@ pub fn fasta_space(path: &Path, req: &SpaceRequest) -> Result<(u64, u64), String
         req.cleavage_rule.as_deref(),
     )?)?;
     let mut alternatives = [0u32; 256];
+    // N-terminal alternatives: on every peptide, and on a peptide that starts a protein.
+    let (mut n_term_any, mut n_term_protein) = (0u32, 0u32);
     for m in &req.variable {
-        let r = m.residue.to_ascii_uppercase();
-        if r.is_ascii_uppercase() {
-            alternatives[r as usize] += 1;
+        match m.position.as_str() {
+            "peptide_n_term" => n_term_any += 1,
+            "protein_n_term" => n_term_protein += 1,
+            _ => {
+                let r = m.residue.to_ascii_uppercase();
+                if r.is_ascii_uppercase() {
+                    alternatives[r as usize] += 1;
+                }
+            }
         }
     }
     let charges = (req.max_charge.saturating_sub(req.min_charge) + 1) as f64;
-    let mut seen: HashSet<u64> = HashSet::new();
+    // Peptide hash -> whether a protein starts with it. The engine's flag is an OR over
+    // every occurrence, so a later occurrence at a protein N-terminus adds the forms the
+    // first, internal one did not count.
+    let mut seen: HashMap<u64, bool> = HashMap::new();
     let mut dedup = true;
     let mut peptides = 0u64;
     let mut forms = 0f64;
-    let mut count = |pep: &[u8]| {
+    let forms_of = |pep: &[u8], starts: bool| {
+        let n_term = n_term_any + if starts { n_term_protein } else { 0 };
+        modified_forms(pep, &alternatives, req.max_variable_mods, n_term)
+    };
+    let mut count = |pep: &[u8], starts: bool| {
         if dedup {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             pep.hash(&mut h);
-            if !seen.insert(h.finish()) {
+            let key = h.finish();
+            if let Some(flag) = seen.get_mut(&key) {
+                if starts && !*flag && n_term_protein > 0 {
+                    *flag = true;
+                    forms += forms_of(pep, true) - forms_of(pep, false);
+                }
                 return;
             }
+            seen.insert(key, starts);
             if seen.len() >= DEDUP_LIMIT {
                 dedup = false;
             }
         }
         peptides += 1;
-        forms += modified_forms(pep, &alternatives, req.max_variable_mods);
+        forms += forms_of(pep, starts);
     };
     for seq in proteins(&text) {
         digest(&seq, req, &rule, &mut count);
@@ -341,17 +366,20 @@ fn proteins(text: &[u8]) -> Vec<Vec<u8>> {
 
 /// The peptides of one protein under `rule`: the spans between its sites with up to
 /// `missed_cleavages` missed cleavages and N-terminal Met excision, or every window of the
-/// length range when the rule cuts every bond.
+/// length range when the rule cuts every bond. Each comes with whether it starts the
+/// protein: at position 0, or at 1 after an initiator methionine (the engine's
+/// `protein_n_term` flag under the default Met excision).
 fn digest(
     seq: &[u8],
     req: &SpaceRequest,
     rule: &crate::enzymes::Rule,
-    emit: &mut impl FnMut(&[u8]),
+    emit: &mut impl FnMut(&[u8], bool),
 ) {
+    let starts_protein = |from: usize| from == 0 || (from == 1 && seq.first() == Some(&b'M'));
     if rule.is_non_specific() {
         for start in 0..seq.len() {
             for end in (start + req.min_len)..=(start + req.max_len).min(seq.len()) {
-                emit(&seq[start..end]);
+                emit(&seq[start..end], starts_protein(start));
             }
         }
         return;
@@ -366,17 +394,20 @@ fn digest(
         for end in (s + 1)..sites.len().min(s + 2 + req.missed_cleavages) {
             let len = sites[end] - from;
             if len >= req.min_len && len <= req.max_len {
-                emit(&seq[from..sites[end]]);
+                emit(&seq[from..sites[end]], starts_protein(from));
             }
         }
     }
 }
 
-fn modified_forms(pep: &[u8], alternatives: &[u32; 256], max_var: usize) -> f64 {
+/// The modified forms of `pep` with at most `max_var` variable sites; `n_term` is the
+/// number of N-terminal alternatives that apply to it, one more site when nonzero.
+fn modified_forms(pep: &[u8], alternatives: &[u32; 256], max_var: usize, n_term: u32) -> f64 {
     let mut e = vec![0f64; max_var + 1];
     e[0] = 1.0;
-    for &aa in pep {
-        let a = alternatives[aa as usize] as f64;
+    let sites = std::iter::once(n_term).chain(pep.iter().map(|&aa| alternatives[aa as usize]));
+    for a in sites {
+        let a = a as f64;
         if a > 0.0 {
             for j in (1..=max_var).rev() {
                 e[j] += e[j - 1] * a;
@@ -476,6 +507,7 @@ mod tests {
                 .map(|(n, r)| ModChoice {
                     name: n.to_string(),
                     residue: *r,
+                    position: String::new(),
                 })
                 .collect(),
             max_variable_mods: max_var,
@@ -490,10 +522,39 @@ mod tests {
         alt[b'S' as usize] = 1;
         alt[b'M' as usize] = 2;
         // Sites S, M, S: a = (1, 2, 1). e0 = 1, e1 = 4, e2 = 1*2 + 1*1 + 2*1 = 5, e3 = 2.
-        assert_eq!(modified_forms(b"ASMSK", &alt, 0), 1.0);
-        assert_eq!(modified_forms(b"ASMSK", &alt, 1), 5.0);
-        assert_eq!(modified_forms(b"ASMSK", &alt, 2), 10.0);
-        assert_eq!(modified_forms(b"ASMSK", &alt, 3), 12.0);
+        assert_eq!(modified_forms(b"ASMSK", &alt, 0, 0), 1.0);
+        assert_eq!(modified_forms(b"ASMSK", &alt, 1, 0), 5.0);
+        assert_eq!(modified_forms(b"ASMSK", &alt, 2, 0), 10.0);
+        assert_eq!(modified_forms(b"ASMSK", &alt, 3, 0), 12.0);
+        // One N-terminal alternative is one more site, counted toward the maximum.
+        assert_eq!(modified_forms(b"ASMSK", &alt, 1, 1), 6.0);
+        assert_eq!(modified_forms(b"ASMSK", &alt, 2, 1), 15.0);
+    }
+
+    /// A protein N-terminal choice adds forms to the peptides that start a protein, the
+    /// Met-retained and Met-excised ones, including a peptide first seen inside another
+    /// protein.
+    #[test]
+    fn protein_n_terminal_choices_count_on_protein_starts_only() {
+        let dir = std::env::temp_dir().join(format!("mumdia-sizing-nt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.fasta");
+        // a: MAGGGK | SSSR; b: GGGRSSSR -> GGGR, SSSR (starts b), GGGRSSSR (starts b).
+        std::fs::write(&f, ">a\nMAGGGKSSSR\n>b\nSSSRGGGR\n").unwrap();
+        let mut r = req(&[], 1);
+        r.missed_cleavages = 0;
+        let (pep, plain) = fasta_space(&f, &r).unwrap();
+        // MAGGGK, AGGGK (excised), SSSR, GGGR: 4 peptides, 4 forms x 2 charges x 2 labels.
+        assert_eq!((pep, plain), (4, 16));
+        r.variable.push(ModChoice {
+            name: "Acetyl".into(),
+            residue: '*',
+            position: "protein_n_term".into(),
+        });
+        // MAGGGK, AGGGK and SSSR (internal in a, first in b) gain one form each.
+        let (_, acetyl) = fasta_space(&f, &r).unwrap();
+        assert_eq!(acetyl, (4 + 3) * 2 * 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -501,7 +562,7 @@ mod tests {
         let mut got: Vec<String> = Vec::new();
         let r = req(&[], 1);
         let rule = crate::enzymes::Rule::parse("K*,R*").unwrap();
-        digest(b"MAKPEPRGGK", &r, &rule, &mut |p| {
+        digest(b"MAKPEPRGGK", &r, &rule, &mut |p, _| {
             got.push(String::from_utf8(p.to_vec()).unwrap())
         });
         got.sort();

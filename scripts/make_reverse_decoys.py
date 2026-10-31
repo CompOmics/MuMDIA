@@ -50,12 +50,42 @@ RES = {
 UNIMOD = dict(MASS_BY_NAME)
 WATER=18.010564684; PROTON=1.007276466812
 TOK=re.compile(r'([A-Z])(\[[^\]]*\])?')
+# A whole residue string: residues, each optionally followed by one bracketed modification.
+RESIDUES=re.compile(r'(?:[A-Z](?:\[[^\]]*\])?)*')
+# The ProForma N-terminal group, `[Name]-`, before the first residue.
+NTERM=re.compile(r'^\[([^\]]*)\]-')
 MAX_TRIES=30
 
-def parse(pform):
-    """peptidoform (DECOY_ stripped) -> list of (residue, modname|'') tokens."""
+def split_nterm(pform):
+    """peptidoform -> (N-terminal group name or '', the residue string after it).
+
+    The group belongs to the N-terminus, not to a residue, so a reversed or scrambled
+    decoy keeps it at its own N-terminus. Read as residues, the 'A' of `[Acetyl]-` was
+    parsed as an alanine: the decoy gained a residue and lost the acetyl, and its
+    precursor no longer matched its target's.
+    """
     pform = pform.replace('DECOY_','')
-    return [(res, mod[1:-1] if mod else '') for res,mod in TOK.findall(pform)]
+    m = NTERM.match(pform)
+    if m:
+        return m.group(1), pform[m.end():]
+    return '', pform
+
+def nterm(pform):
+    """The N-terminal group name of a peptidoform, or ''."""
+    return split_nterm(pform)[0]
+
+def parse(pform):
+    """peptidoform (DECOY_ stripped) -> list of (residue, modname|'') tokens.
+
+    Residues only: the N-terminal group is `nterm(pform)`. Anything else that is not a
+    residue string (a C-terminal group, a stray bracket) yields an unknown residue '?', so
+    `valid` refuses the precursor and it is reported rather than misread.
+    """
+    _, rest = split_nterm(pform)
+    toks = [(res, mod[1:-1] if mod else '') for res,mod in TOK.findall(rest)]
+    if not RESIDUES.fullmatch(rest):
+        toks.append(('?', ''))
+    return toks
 
 class UnknownMod(Exception):
     """A modification this script cannot assign a mass to."""
@@ -94,15 +124,16 @@ def mod_mass(name):
         raise UnknownMod(name) from None
 
 def tmass(tok): return RES[tok[0]] + mod_mass(tok[1])
-def valid(toks):
-    """Every residue has a mass AND every modification has a mass.
+def valid(toks, nt=''):
+    """Every residue has a mass AND every modification has a mass, the N-terminal group
+    `nt` included.
 
     The modification half was missing, so a peptidoform with an unmodellable mod was
     called valid and went on to be reversed with that mod silently weighing nothing.
     """
     if len(toks) == 0 or not all(r in RES for r, _ in toks):
         return False
-    for _, m in toks:
+    for m in [nt] + [m for _, m in toks]:
         try:
             mod_mass(m)
         except UnknownMod:
@@ -110,10 +141,11 @@ def valid(toks):
     return True
 
 
-def unknown_mods(toks):
-    """The modification names in `toks` that have no mass, for reporting."""
+def unknown_mods(toks, nt=''):
+    """The modification names in `toks` and the N-terminal group `nt` that have no mass,
+    for reporting."""
     out = []
-    for _, m in toks:
+    for m in [nt] + [m for _, m in toks]:
         try:
             mod_mass(m)
         except UnknownMod:
@@ -126,12 +158,14 @@ def il_key(sequence):
     """The sequence as the instrument sees it: I and L are isobaric (same residue mass,
     same fragment m/z), so two sequences that differ only by I/L are the same peptide."""
     return sequence.replace('I', 'L')
-def to_pform(toks): return ''.join(r + (f'[{m}]' if m else '') for r,m in toks)
+def to_pform(toks, nt=''):
+    return (f'[{nt}]-' if nt else '') + ''.join(r + (f'[{m}]' if m else '') for r,m in toks)
 def reverse_keep_cterm(t): return t[:-1][::-1] + t[-1:] if len(t) >= 2 else t[:]
 
-def frag_mz(toks, ion, ordinal, z):
+def frag_mz(toks, ion, ordinal, z, nt=''):
     if ion == 'b':
-        s = sum(tmass(t) for t in toks[:ordinal])
+        # A b ion carries the N-terminus and therefore its group.
+        s = mod_mass(nt) + sum(tmass(t) for t in toks[:ordinal])
     else:
         s = sum(tmass(t) for t in toks[len(toks)-ordinal:]) + WATER
     return (s + z*PROTON)/z
@@ -160,17 +194,22 @@ def scramble(toks, gen):
         inter[i], inter[j] = inter[j], inter[i]
     return inter + toks[-1:]
 
-def _cumulative_masses(toks_list, width):
+def _cumulative_masses(toks_list, width, nterms=None):
     """Per peptide, the cumulative residue+modification mass after k residues, k = 0..L,
     zero-padded to `width` + 1 columns, plus each peptide's length. Feeds the
-    vectorised b/y calculator: a b_k ion sums the first k residues, a y_k ion the last k."""
+    vectorised b/y calculator: a b_k ion sums the first k residues, a y_k ion the last k.
+
+    `nterms` (one group name per peptide, '' for none) starts each row at the N-terminal
+    group's mass, so every b ion carries it and every y ion (a difference of two
+    cumulative sums) does not."""
     n = len(toks_list)
     cum = np.zeros((n, width + 1), dtype=np.float64)
     length = np.zeros(n, dtype=np.int64)
     for i, toks in enumerate(toks_list):
         L = len(toks)
         length[i] = L
-        acc = 0.0
+        acc = mod_mass(nterms[i]) if nterms else 0.0
+        cum[i, 0] = acc
         for k, tok in enumerate(toks):
             acc += tmass(tok)
             cum[i, k + 1] = acc
@@ -194,6 +233,7 @@ def main():
     tprec = prec[prec.label == 'target'].copy().reset_index(drop=True)
     tids = tprec.candidate_id.to_numpy().astype(np.int64)
     tgt_toks = {cid: parse(pf) for cid, pf in zip(tprec.candidate_id, tprec.peptidoform)}
+    tgt_nterm = {cid: nterm(pf) for cid, pf in zip(tprec.candidate_id, tprec.peptidoform)}
     target_stripped = {il_key(stripped(t)) for t in tgt_toks.values()}
 
     # Name the modifications this script cannot model, before anything is written.
@@ -202,7 +242,7 @@ def main():
     # population, which is easy to miss and biases every q-value that depends on it.
     unmapped = {}
     for cid, t in tgt_toks.items():
-        for m in unknown_mods(t):
+        for m in unknown_mods(t, tgt_nterm[cid]):
             unmapped[m] = unmapped.get(m, 0) + 1
     if unmapped:
         listed = ", ".join(f"{k!r} x{v}" for k, v in sorted(unmapped.items()))
@@ -221,10 +261,11 @@ def main():
     err = []
     for cid, g in sample.groupby('candidate_id', sort=True):
         t = tgt_toks.get(int(cid))
-        if t is None or not valid(t):
+        nt = tgt_nterm.get(int(cid), '')
+        if t is None or not valid(t, nt):
             continue
         for x in g.itertuples():
-            err.append(1e6 * abs(frag_mz(t, x.ion_type, int(x.ordinal), int(x.frag_charge)) - x.mz) / x.mz)
+            err.append(1e6 * abs(frag_mz(t, x.ion_type, int(x.ordinal), int(x.frag_charge), nt) - x.mz) / x.mz)
     err = np.array(err)
     if len(err) == 0:
         sys.exit("ABORT: no target fragments found to validate the m/z calculator against")
@@ -241,7 +282,7 @@ def main():
     decoy_owner = {}
     for cid in sorted(tgt_toks):
         t = tgt_toks[cid]
-        if not valid(t):
+        if not valid(t, tgt_nterm[cid]):
             rev[cid] = None; invalid += 1; continue
         source = stripped(t)
         gen = splitmix(stable_seed(source) ^ 0xD1CE)
@@ -272,7 +313,9 @@ def main():
     dprec['candidate_id'] = dprec['candidate_id'] + off
     dprec['label'] = 'decoy'
     dprec['protein'] = 'DECOY_' + dprec['protein'].astype(str)
-    dprec['peptidoform'] = dprec['candidate_id'].map(lambda nc: 'DECOY_' + to_pform(rev[nc - off]))
+    # The decoy keeps its target's N-terminal group at its own N-terminus.
+    dprec['peptidoform'] = dprec['candidate_id'].map(
+        lambda nc: 'DECOY_' + to_pform(rev[nc - off], tgt_nterm[nc - off]))
 
     allp = pd.concat([tprec_out, dprec], ignore_index=True).sort_values('precursor_mz', kind='mergesort').reset_index(drop=True)
     # old candidate_id -> new, as an array: the ids are 0..2*off, so a lookup table
@@ -288,7 +331,7 @@ def main():
     kept_mask[np.array(keep, dtype=np.int64)] = True
     rev_toks = [rev[cid] for cid in keep]
     width = max((len(t) for t in rev_toks), default=0)
-    cum, length = _cumulative_masses(rev_toks, width)
+    cum, length = _cumulative_masses(rev_toks, width, [tgt_nterm[cid] for cid in keep])
     row_of = np.full(off, -1, dtype=np.int64)
     row_of[np.array(keep, dtype=np.int64)] = np.arange(len(keep), dtype=np.int64)
 

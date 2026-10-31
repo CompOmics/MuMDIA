@@ -199,9 +199,11 @@ strategies keep the C-terminal residue fixed and rewrite the interior `b[..n-1]`
    validation once, so a bad config fails fast:
    - charge range: `charge_min >= 1` and `charge_min <= charge_max`, else a hard
      `anyhow::bail!` (peptidoforms.rs:126-138);
+   - terminal rules are checked by `PeptidoformsConfig::terminal_rule_problem`
+     (the same check `Config::validate` runs at load; see "Terminal modifications");
    - fixed and variable mod names are resolved by `known_mods` (peptidoforms.rs:85),
-     which rejects a `*` residue (wildcard/terminal mods are unimplemented,
-     peptidoforms.rs:92-98) and looks each name up in `unimod_mass` (mass.rs:13,
+     which rejects a `*` residue on a rule placed `anywhere` (a wildcard residue is
+     valid only for a terminal rule) and looks each name up in `unimod_mass` (mass.rs:13,
      peptidoforms.rs:99). An unknown name is handled per `unknown_modification`:
      `Error` bails with `unknown <fixed|variable> modification '<name>' in config`
      (peptidoforms.rs:101-103); `Skip` warns and drops the rule
@@ -228,13 +230,18 @@ strategies keep the C-terminal residue fixed and rewrite the interior `b[..n-1]`
 3. **Per digest row** (peptidoforms.rs:201): compute `base_peptide_id` as
    `target_id` when it is `>= 0` (the row is a decoy) else the row's own `id`
    (peptidoforms.rs:203-207).
-4. **Fixed mods** (peptidoforms.rs:210-217): for each residue index, if any
-   validated fixed rule's `residue` char matches, record `(index, name)`. Fixed
-   mods apply to every matching residue and are always present.
-5. **Variable-mod candidate sites** (peptidoforms.rs:219-228): the same
-   residue-char scan collects, per modified site, a `Vec` of the alternative mod
-   names configured for that residue (`var_sites: Vec<(usize, Vec<&str>)>`). A
-   single residue can therefore offer more than one variable alternative.
+4. **Fixed mods**: for each residue index, if any validated fixed rule's `residue`
+   char matches, record `(slot, name)`. Fixed mods apply to every matching residue and
+   are always present. A fixed N-terminal rule adds the N-terminal slot to every
+   peptide its position covers. Sites are numbered in slots: slot 0 is the N-terminus
+   and slot `i + 1` is residue `i`, so an N-terminal site sorts before every residue
+   site and the residue sites keep the order they always had.
+5. **Variable-mod candidate sites**: the same residue-char scan collects, per modified
+   site, a `Vec` of the alternative mod names configured for that residue
+   (`var_sites: Vec<(usize, Vec<&str>)>`). A single residue can therefore offer more
+   than one variable alternative. The variable N-terminal rules that apply to the
+   peptide form one more site, slot 0, before the residues; it counts toward
+   `max_variable_mods` like any other site.
 6. **Combination enumeration** (`variable_combos`, peptidoforms.rs:58): returns the
    empty subset plus every size-`k` subset of candidate **sites** for
    `k = 1..=max_variable_mods.min(n)`, using an in-place combinatorial index
@@ -253,7 +260,8 @@ strategies keep the C-terminal residue fixed and rewrite the interior `b[..n-1]`
    peptide. Each row gets a fresh `id`, the source `peptide_id`, the computed
    `base_peptide_id`, and the copied `label`/`protein`.
 
-`proforma` (peptidoforms.rs:19) walks the stripped sequence and, at each residue
+`proforma` (peptidoforms.rs:19) writes an N-terminal group as `[<name>]-` before the
+first residue, then walks the stripped sequence and, at each residue
 index, appends `[<name>]` for the **first** mod found at that position
 (`mods.iter().find`, peptidoforms.rs:23). Because validation now forbids two mods
 on one residue (see gotchas), this first-match is a defensive fallback rather than
@@ -271,11 +279,12 @@ a live silent-drop path.
 | `make_decoy` | digest.rs:101 | One transform: reverse or seeded-scramble decoy of the interior, C-term fixed; `None` if `len < 3` or strategy `None`/`DiannShift` |
 | `splitmix64` | digest.rs:159 | Deterministic PRNG step for the scramble shuffle |
 | `fnv1a` | digest.rs:167 | Per-peptide hash mixed into the scramble seed |
-| `DigestParams` | digest.rs:176 | `fasta`, `out`, `cfg: &DigestConfig`, `rng_seed`, `config_hash` |
+| `DigestParams` | digest.rs:176 | `fasta`, `out`, `cfg: &DigestConfig`, `rng_seed`, `config_hash`, `protein_n_term` (record the protein N-terminus flag, peptides v2) |
+| `starts_protein` | digest.rs | Whether a peptide at `start` starts its protein: position 0, or position 1 after an initiator `M` under `n_term_met_excision` |
 | `peptidoforms::run` | peptidoforms.rs:186 | Stage A2 entry point; validate rules, enumerate mods+charges, write `peptidoforms.parquet` |
 | `validated_rules` | peptidoforms.rs:125 | Validate charges and fixed/variable rules (stacking, overlap, dedup, unknown-mod policy) before expansion |
 | `known_mods` | peptidoforms.rs:85 | Resolve one mod list against `unimod_mass` under `UnknownModPolicy`; reject `*` residue |
-| `proforma` | peptidoforms.rs:19 | Build ProForma-lite string from stripped peptide + `(position, name)` mods |
+| `proforma` | peptidoforms.rs:19 | Build ProForma-lite string from stripped peptide + `(slot, name)` mods; slot 0 is the N-terminal group `[Name]-` |
 | `variable_combos` | peptidoforms.rs:58 | Enumerate modified-site subsets up to `max_var`, expanding per-site alternatives |
 | `expand_site_choices` | peptidoforms.rs:34 | Enumerate the per-site alternative assignments for one selected set of sites |
 | `PeptidoformsParams` | peptidoforms.rs:179 | `peptides`, `out`, `cfg: &PeptidoformsConfig`, `config_hash` |
@@ -300,8 +309,9 @@ run.rs:136).
 | `max_len` | digest | `50` | Maximum peptide length (residues) |
 | `decoy.strategy` | digest | `reverse` | `reverse` / `scramble` realized; `diann_shift` and `none` produce no decoy (`diann_shift` rejected by `validate`) |
 | `n_term_met_excision` | digest | `true` | When a protein begins with `M`, also emit the initiator-Met-removed form of its N-terminal peptides (re-checked against `min_len`/`max_len` and the residue allowlist); mirrors DIA-NN `--met-excision`. Field config.rs:194, default config.rs:204 |
-| `fixed_mods` | peptidoforms | `[{C: Carbamidomethyl}]` | Applied to every matching residue |
+| `fixed_mods` | peptidoforms | `[{C: Carbamidomethyl}]` | Applied to every matching residue, or to every peptide a terminal rule's `position` covers |
 | `variable_mods` | peptidoforms | `[{M: Oxidation}]` | Enumerated as optional subsets |
+| `*_mods[].position` | peptidoforms | `anywhere` (omitted) | `anywhere`, `peptide_n_term` or `protein_n_term`; a terminal rule takes residue `*`. See "Terminal modifications" |
 | `max_variable_mods` | peptidoforms | `1` | Max simultaneous variable mods per peptidoform |
 | `charge_min` | peptidoforms | `2` | Lowest precursor charge emitted |
 | `charge_max` | peptidoforms | `3` | Highest precursor charge emitted |
@@ -310,16 +320,14 @@ run.rs:136).
 `rng_seed` is `0` by default (config.rs:991) and only affects the `scramble`
 decoy strategy; `reverse` is independent of the seed.
 
-Config was recently pruned of dead fields in this area. `ResidueMod`
-(config.rs:235) is only `{ residue: char, name: String }`; there is no
-position/terminal specifier field. Unlike the enclosing `DigestConfig` /
-`PeptidoformsConfig`, `ResidueMod` carries `#[serde(deny_unknown_fields)]` but
-**not** `#[serde(default)]` (config.rs:233-234), so both `residue` and `name` are
-mandatory in every mod entry; an entry missing either key is a load error rather
-than a defaulted value. The doc comment on `residue` (config.rs:236) still
-mentions `*` for "any / terminal handled separately in MVP", but that handling
-was never implemented; the current code instead rejects a `*` residue with a hard
-error at validation (see gotchas). There is no `DecoySource` field on
+`ResidueMod` is `{ residue: char, name: String, position: ModPosition }`. Unlike the
+enclosing `DigestConfig` / `PeptidoformsConfig`, `ResidueMod` carries
+`#[serde(deny_unknown_fields)]` but **not** `#[serde(default)]`, so `residue` and
+`name` are mandatory in every mod entry; an entry missing either key is a load error
+rather than a defaulted value. `position` alone defaults (`anywhere`) and is skipped
+when serialised at that default, so the canonical configuration, the configuration
+hash and the library-cache key of every configuration written before the field existed
+are unchanged. There is no `DecoySource` field on
 `DigestConfig` (the "dead/unwired config surface" list in CLAUDE.md refers to
 types elsewhere, not here). `DecoyConfig` (config.rs:172) carries only
 `strategy`.
@@ -366,13 +374,11 @@ types elsewhere, not here). `DecoyConfig` (config.rs:172) carries only
   some target. Peptides with `len < 3` return `None` from `make_decoy`
   (digest.rs:104) and are likewise dropped as a pair; with the default
   `min_len = 5` this only bites if a caller lowers `min_len`.
-- **No terminal modifications, and `*` is rejected.** `ResidueMod` matches on an
-  exact residue char (peptidoforms.rs:211, peptidoforms.rs:220). There is no
-  N-term/C-term matching, so protein/peptide N-terminal acetylation and similar
-  terminal mods cannot be enumerated. A `*` residue is no longer silently
-  unmatched: `known_mods` hard-fails on it up front (peptidoforms.rs:92-98,
-  message `unsupported '*' residue ...`). The `mass.rs` parser does model terminal
-  mod deltas, but Stage A2 never produces terminal-mod ProForma strings.
+- **N-terminal modifications only, and `*` only on a terminal rule.** A rule placed
+  `anywhere` matches an exact residue char, and a `*` residue there is refused
+  (`unsupported '*' residue ...`). The N-terminal positions are implemented (see
+  "Terminal modifications"); the C-terminal positions and terminal rules restricted to
+  one residue are refused at load.
 - **Two mods on one residue are prevented at validation.** `validated_rules`
   rejects two fixed mods on the same residue (peptidoforms.rs:145-153) and a
   fixed + variable mod on the same residue (peptidoforms.rs:167-172), and
@@ -409,6 +415,68 @@ types elsewhere, not here). `DecoyConfig` (config.rs:172) carries only
   `run` takes the library-input branch (run.rs:98) and never calls
   `digest`/`peptidoforms`; the FASTA-build branch is the `_ =>` arm at run.rs:127.
   Do not assume `peptides.parquet` / `peptidoforms.parquet` exist for every run.
+
+## Terminal modifications
+
+A modification rule carries a `position`: `anywhere` (the default, a residue
+modification), `peptide_n_term` (the N-terminal amine of every peptide) or
+`protein_n_term` (the N-terminal amine of a peptide that starts a protein). A terminal
+rule takes residue `*`:
+
+```json
+"peptidoforms": {
+  "variable_mods": [
+    {"residue": "M", "name": "Oxidation"},
+    {"residue": "*", "name": "Acetyl", "position": "protein_n_term"}
+  ],
+  "max_variable_mods": 2
+}
+```
+
+The feature is opt-in: no shipped configuration places a terminal rule, and a
+configuration without one produces the tables, the canonical configuration and the
+library-cache key it always did.
+
+**Which peptides start a protein.** When a `protein_n_term` rule is configured, the
+digest records a Boolean `protein_n_term` per row (peptides v2, `artifact::PEPTIDES_V2`;
+appended last). A peptide starts a protein when it occurs at protein position 0, or at
+position 1 of a protein that begins with `M` while `digest.n_term_met_excision` is on
+(the Met-excised form). The flag is an OR over every protein the peptide occurs in: the
+digest keeps only the first occurrence's `start`, so a peptide that is internal in the
+first protein read and N-terminal in a later one is still flagged. A peptide at position
+1 after any other first residue (a K, say) is an ordinary cleavage product and is not
+flagged. A decoy carries its target's flag rather than one computed from its own
+sequence, so a target and its decoy expand into the same terminal forms. Without a
+`protein_n_term` rule the column is not written and the table is v1; the peptidoform
+stage refuses a protein-N-terminal rule on a table without the column and says to run
+the digest again with that configuration.
+
+**Expansion.** The N-terminal group is slot 0 of the site numbering, before every
+residue. A variable N-terminal rule is one more site with its alternatives and counts
+toward `max_variable_mods`, so with the default maximum of 1 an eligible peptide gains
+the acetylated form beside the oxidised one, and `max_variable_mods = 2` is needed for
+the two together. Both the Met-retained and the Met-excised N-terminus are eligible.
+The acetylated form keeps the peptide's whole protein list, as every other modified
+form does. The ProForma string is `[Acetyl]-SEQ`, and a modification of the first
+residue follows the group: `[Acetyl]-S[Phospho]EK`. A terminus carries one group, so at
+most one fixed N-terminal rule is accepted and a fixed N-terminal rule excludes every
+variable one; the C-terminal positions (`peptide_c_term`, `protein_c_term`) and a
+terminal rule naming a residue are refused at load.
+
+**Downstream.** The mass model adds the group to the precursor and to every b ion and
+to no y ion (`ParsedPeptidoform::n_term_mod`). `predict-frag` tags the group in the
+modification signature that pairs a target with its decoy (`n-term:Acetyl`), so an
+N-terminal acetyl and a lysine acetyl of one peptide are different precursors; the
+native retention model adds the group's mass term like a residue adduct. The prescan
+tokenises the residues after a known group, because a trimer tag is a residue mass
+difference that the group does not change. The Python helpers read the group as a
+terminal group rather than as residues: `make_reverse_decoys.py` keeps it at the
+decoy's N-terminus and adds it to every decoy b ion, `deeplc_finetune.py` and
+`mh_shard_predict.py` predict the acetylated rows on the base model's scale,
+`augment_library.py`, `predict_decoys.py` and `nn_rescore_worker.py` strip it with its
+dash, and `import_diann_lib.py` keeps a leading `(UniMod:N)` as `[Name]-` when accession
+N is kept (`--keep-unimod 1,4,35` for protein N-terminal acetylation) and reports how
+many N-terminal precursors it kept and dropped.
 
 ## Cleavage rules
 
@@ -477,17 +545,21 @@ digest's `peptides.parquet` and report are byte-identical to those before the ch
   The catalogue is the single allowlist the Stage A2 validation (`known_mods`), the mass
   model and the desktop Search tab consult. Then reference it by name in
   `fixed_mods`/`variable_mods`.
-- **Support a second mod per position or terminal mods.** Change `proforma`
-  (peptidoforms.rs:19) to emit all mods at a position (e.g. concatenate multiple
-  `[...]` groups) instead of `find`-ing the first, relax the stacking/overlap and
-  `*` checks in `validated_rules` (peptidoforms.rs:92-98, peptidoforms.rs:145-172),
-  and extend `ResidueMod` (config.rs:235) plus the residue-matching loops
-  (peptidoforms.rs:210-228) with a position/terminal specifier. The mass model in
-  `mass.rs` already carries `n_term_mod` fields to build on.
+- **Support a second mod per position.** Change `proforma` (peptidoforms.rs:19) to
+  emit all mods at a position (e.g. concatenate multiple `[...]` groups) instead of
+  `find`-ing the first, and relax the stacking/overlap checks in `validated_rules`.
+- **C-terminal or residue-restricted terminal modifications.** Add a slot after the
+  last residue in `peptidoforms.rs` (the mass model already reads `-[Name]` into
+  `c_term_mod`), a protein C-terminus flag in the digest beside `protein_n_term`, and
+  lift the refusal in `PeptidoformsConfig::terminal_rule_problem`. Every helper listed
+  under "Terminal modifications" must then learn the C-terminal group as well.
 - **Schema changes.** Adding or reordering `peptides.parquet` /
   `peptidoforms.parquet` columns is a schema change; bump the version in
   `artifact::PEPTIDES` / `artifact::PEPTIDOFORMS` (schema.rs:11-12) and update the
-  downstream readers (`Table::read` callers in predict-frag and later stages).
+  downstream readers (`Table::read` callers in predict-frag and later stages). The
+  `protein_n_term` column is written through the selector `artifact::peptides(flag)`
+  (`PEPTIDES_V2`), so a digest without a protein-N-terminal rule stays v1 byte for
+  byte.
 - **Testing.** Existing unit tests live at the bottom of each file
   (digest.rs:360, peptidoforms.rs:291). digest: `trypsin_p_cleaves_after_kr`
   (digest.rs:365) pins Trypsin/P cut sites; `met_excision_emits_both_n_term_forms`

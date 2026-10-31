@@ -60,6 +60,9 @@ impl RtPredictor for NativeRt {
             // small hydrophobic shift for a mass adduct
             s += 0.01 * m;
         }
+        // A terminal group is an adduct like any other. Both are 0.0 for every peptidoform
+        // without one, so every earlier prediction is unchanged.
+        s += 0.01 * (pep.n_term_mod + pep.c_term_mod);
         // Length term dampens very long peptides eluting infinitely late.
         s += (pep.residues.len() as f64).sqrt();
         s as f32

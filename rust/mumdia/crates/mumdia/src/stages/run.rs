@@ -330,10 +330,11 @@ pub fn run(p: RunParams) -> Result<()> {
                     cfg: &cfg.digest,
                     rng_seed: cfg.rng_seed,
                     config_hash: &ch,
+                    protein_n_term: cfg.peptidoforms.has_protein_n_term_rule(),
                 })?;
                 man.record(w.record(
                     artifact::PEPTIDES.0,
-                    artifact::PEPTIDES,
+                    artifact::peptides(cfg.peptidoforms.has_protein_n_term_rule()),
                     &dig,
                     "digest",
                     &ch,

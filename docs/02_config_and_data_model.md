@@ -93,6 +93,7 @@ id into the Parquet file itself).
 | `ISOLATION_WINDOWS` | `isolation_windows` | 1 |
 | `MS2_TO_MS1` | `ms2_to_ms1` | 1 |
 | `PEPTIDES` | `peptides` | 1 |
+| `PEPTIDES_V2` | `peptides` | 2 (adds `protein_n_term`; written only with a protein-N-terminal modification rule, through `artifact::peptides(flag)`) |
 | `PEPTIDOFORMS` | `peptidoforms` | 1 |
 | `FRAGMENT_LIBRARY_PRECURSORS` | `fragment_library_precursors` | 1 |
 | `FRAGMENT_LIBRARY_FRAGMENTS` | `fragment_library_fragments` | 1 |
@@ -666,11 +667,18 @@ imported path, `import_diann_lib.py --charge-by-basic-residues` applies the same
 rule (on the reference DIA-NN E. coli library it dropped 7.9% of precursors, almost
 all charge-3 with a single basic residue).
 
-`ResidueMod` (config.rs:342-349) is `{residue: char, name: String}` where `name`
-is a UniMod name. The doc comment reserves `residue: '*'` for "any" and notes
-terminal mods are handled separately in the MVP (config.rs:345).
-`deny_unknown_fields` applies but the struct has no `#[serde(default)]` (unlike
-every other section), so both keys are required inside a `ResidueMod` entry.
+`ResidueMod` is `{residue: char, name: String, position: ModPosition}` where `name`
+is a UniMod name. `position` is `anywhere` (the default: the modification sits on
+`residue` wherever it occurs), `peptide_n_term` or `protein_n_term`; a terminal rule
+takes `residue: '*'`. The C-terminal spellings `peptide_c_term` and `protein_c_term`
+parse only to be refused by `Config::validate`, as are a terminal rule naming a residue,
+two fixed N-terminal rules, and a fixed N-terminal rule beside a variable one
+(`PeptidoformsConfig::terminal_rule_problem`). `position` is skipped when serialised at
+its default, so the canonical configuration and its hash are unchanged for every
+configuration without a terminal rule. `deny_unknown_fields` applies but the struct has
+no `#[serde(default)]` (unlike every other section), so `residue` and `name` are
+required inside a `ResidueMod` entry. docs/05_digest_peptidoforms.md, "Terminal
+modifications", has the behaviour.
 
 ### `PredictFragConfig` (config.rs:359-399)
 

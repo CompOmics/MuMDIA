@@ -604,6 +604,16 @@ selection is made and refused at Start, because the peptidoform stage would refu
 mid-run. A DIA-NN build carries the whole selection (see below). The selection is
 remembered between sessions in browser storage, as a convenience only.
 
+A modification whose catalogue entry lists `termini` also has a terminal chip: Acetyl
+offers "Prot N-term", protein N-terminal acetylation, and the quick set "Protein
+N-terminal acetylation" selects it as variable. A terminal site is saved and sent as
+`{"residue": "*", "name": "Acetyl", "position": "protein_n_term"}`
+(`peptidoforms.*_mods[].position`, docs/05_digest_peptidoforms.md, "Terminal
+modifications"); a residue site keeps the form it always had. A fixed N-terminal site
+beside a second fixed or a variable one is reported like two modifications on one residue.
+The planned library size counts the terminal site on the peptides that start a protein,
+Met-retained and Met-excised, as one more variable site.
+
 Validated 2026-10-05: the Search screen driven in headless Edge with a mocked command
 bridge (catalogue, sets, filter, conflicts, the derived overrides at Start), and the
 derived configuration run end to end on the smoke fixture: the prescreen before
@@ -628,7 +638,10 @@ spreads of 40-90), 3.2x less wall time and 3.4x less memory.
 
 DIA-NN builds take the same selection (`ModPlan` in `diann.rs`): carbamidomethyl C is
 `--unimod4`, every other modification `--fixed-mod` / `--var-mod UniMod:<id>,<mass>,<residues>`
-under `--var-mods <max>`, plus `--no-cut-after-mod UniMod:121` for GlyGly K. The standard
+under `--var-mods <max>`, plus `--no-cut-after-mod UniMod:121` for GlyGly K. A terminal site
+is an argument of its own with DIA-NN's site token, `--var-mod UniMod:1,42.010565,*n` for
+protein N-terminal acetylation (`n` for the peptide N-terminus), and the importer keeps the
+leading `(UniMod:1)` DIA-NN writes as the ProForma group `[Acetyl]-`. The standard
 selection keeps its arguments and cache key, so existing cached libraries are reused, and
 the importer is told which accessions to keep (`--keep-unimod`). Checked with DIA-NN 2.2.0
 on 60 E. coli proteins with Phospho STY, GlyGly K and Oxidation M: all 33,885 target

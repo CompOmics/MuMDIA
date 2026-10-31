@@ -243,6 +243,19 @@ pub struct DigestParams<'a> {
     pub cfg: &'a DigestConfig,
     pub rng_seed: u64,
     pub config_hash: &'a str,
+    /// Record which peptides start a protein, as the Boolean column `protein_n_term`
+    /// (peptides v2). Set when a modification rule is placed at the protein N-terminus
+    /// ([`mumdia_core::config::PeptidoformsConfig::has_protein_n_term_rule`]); without it
+    /// the table is v1, byte for byte.
+    pub protein_n_term: bool,
+}
+
+/// Whether a peptide that starts at `start` in `seq` starts the protein: at position 0, or
+/// at position 1 as the initiator-Met-excised form when `digest.n_term_met_excision` is on.
+/// The peptide at position 1 of a protein that does not begin with `M` (one following an
+/// N-terminal K, say) is an ordinary cleavage product and does not.
+fn starts_protein(seq: &[u8], start: usize, cfg: &DigestConfig) -> bool {
+    start == 0 || (start == 1 && cfg.n_term_met_excision && seq.first() == Some(&b'M'))
 }
 
 pub fn run(p: DigestParams) -> Result<u64> {
@@ -275,10 +288,20 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
     // Dedup target peptides by sequence, aggregating protein accessions.
     let mut pep_proteins: HashMap<String, Vec<String>> = HashMap::new();
     let mut pep_pos: HashMap<String, (i32, i32)> = HashMap::new();
+    // Peptides that start a protein in at least one of the proteins they occur in. The
+    // position kept in `pep_pos` is the first occurrence's only, so the flag is an OR over
+    // every occurrence rather than a property of that one.
+    let mut starts_a_protein: HashSet<String> = HashSet::new();
     let mut order: Vec<String> = Vec::new();
     for (acc, seq) in &proteins {
         let bytes = seq.as_bytes();
         for (start, end, pep) in digest_with(bytes, p.cfg, &rule) {
+            if p.protein_n_term
+                && starts_protein(bytes, start, p.cfg)
+                && !starts_a_protein.contains(&pep)
+            {
+                starts_a_protein.insert(pep.clone());
+            }
             // Look up with the borrowed key so the common already-seen case does
             // not clone `pep`; clone only on the first (Vacant) encounter. The last
             // use moves `pep` into `order`, keeping insertion order unchanged.
@@ -297,6 +320,7 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
     let (mut id_c, mut pep_c, mut prot_c, mut start_c, mut end_c) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut label_c, mut target_c, mut strat_c) = (Vec::new(), Vec::new(), Vec::new());
+    let mut nterm_c: Vec<bool> = Vec::new();
 
     let target_sequences: HashSet<String> = order.iter().map(|s| il_key(s)).collect();
     let mut used_decoys: HashSet<String> = HashSet::new();
@@ -344,6 +368,8 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
         label_c.push("target".to_string());
         target_c.push(-1i32);
         strat_c.push(format!("{:?}", p.cfg.decoy.strategy).to_lowercase());
+        let starts = starts_a_protein.contains(pep);
+        nterm_c.push(starts);
 
         // Materialize sequence-rewrite decoys here (docs/05_digest_peptidoforms.md).
         if let Some(dec) = decoy {
@@ -357,6 +383,9 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
             label_c.push("decoy".to_string());
             target_c.push(tid as i32);
             strat_c.push(format!("{:?}", p.cfg.decoy.strategy).to_lowercase());
+            // A decoy takes its target's eligibility, never its own sequence's: the pair
+            // then expands into the same terminal forms and stays exchangeable.
+            nterm_c.push(starts);
         }
     }
 
@@ -369,19 +398,26 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
             "digest: dropped target/decoy pairs with no collision-free decoy permutation"
         );
     }
-    let rows = write_table(
-        p.out,
-        vec![
-            Col::U32("id".into(), id_c),
-            Col::Str("peptide".into(), pep_c),
-            Col::Str("protein".into(), prot_c),
-            Col::I32("start".into(), start_c),
-            Col::I32("end".into(), end_c),
-            Col::Str("label".into(), label_c),
-            Col::I32("target_id".into(), target_c),
-            Col::Str("decoy_strategy".into(), strat_c),
-        ],
-    )?;
+    let n_protein_n_term_targets = nterm_c
+        .iter()
+        .zip(&label_c)
+        .filter(|(f, l)| **f && *l == "target")
+        .count();
+    let mut columns = vec![
+        Col::U32("id".into(), id_c),
+        Col::Str("peptide".into(), pep_c),
+        Col::Str("protein".into(), prot_c),
+        Col::I32("start".into(), start_c),
+        Col::I32("end".into(), end_c),
+        Col::Str("label".into(), label_c),
+        Col::I32("target_id".into(), target_c),
+        Col::Str("decoy_strategy".into(), strat_c),
+    ];
+    if p.protein_n_term {
+        columns.push(Col::Bool("protein_n_term".into(), nterm_c));
+    }
+    let schema = artifact::peptides(p.protein_n_term);
+    let rows = write_table(p.out, columns)?;
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();
@@ -395,10 +431,16 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
         "dropped_target_decoy_pairs".to_string(),
         json!(dropped_pairs),
     );
+    if p.protein_n_term {
+        stats.insert(
+            "protein_n_term_targets".to_string(),
+            json!(n_protein_n_term_targets),
+        );
+    }
     let report = ArtifactReport {
-        logical_name: artifact::PEPTIDES.0.to_string(),
-        schema_name: artifact::PEPTIDES.0.to_string(),
-        schema_version: artifact::PEPTIDES.1,
+        logical_name: schema.0.to_string(),
+        schema_name: schema.0.to_string(),
+        schema_version: schema.1,
         stage: "digest".to_string(),
         rows,
         content_hash: mumdia_io::hash::blake3_file(p.out)?,
@@ -738,6 +780,146 @@ mod tests {
         .expect("a collision-free scramble exists");
         assert!(retries > 0);
         assert!(!targets.contains(&il_key(&decoy)));
+    }
+
+    /// Digest `fasta` into a scratch directory with `protein_n_term` set as given, and read
+    /// back (peptide, label, target_id, flag) per row plus the report's schema version.
+    #[allow(clippy::type_complexity)]
+    fn digest_fasta(
+        tag: &str,
+        fasta: &str,
+        protein_n_term: bool,
+    ) -> (Vec<(String, String, i32, Option<bool>)>, Vec<String>, u64) {
+        let dir = std::env::temp_dir().join(format!("mumdia_digest_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("p.fasta").to_string_lossy().into_owned();
+        let out = dir.join("peptides.parquet").to_string_lossy().into_owned();
+        std::fs::write(&fa, fasta).unwrap();
+        let cfg = DigestConfig {
+            missed_cleavages: 0,
+            min_len: 5,
+            ..Default::default()
+        };
+        run(DigestParams {
+            fasta: &fa,
+            out: &out,
+            cfg: &cfg,
+            rng_seed: 7,
+            config_hash: "h",
+            protein_n_term,
+        })
+        .unwrap();
+        let t = mumdia_io::table::TableFile::open(&out).unwrap();
+        let names = t.column_names();
+        let flags = t
+            .has_column("protein_n_term")
+            .then(|| t.bool("protein_n_term").unwrap());
+        let (pep, label, tid) = (
+            t.str("peptide").unwrap(),
+            t.str("label").unwrap(),
+            t.i32("target_id").unwrap(),
+        );
+        let rows = (0..t.nrows)
+            .map(|i| {
+                (
+                    pep[i].clone(),
+                    label[i].clone(),
+                    tid[i],
+                    flags.as_ref().map(|f| f[i]),
+                )
+            })
+            .collect();
+        let report: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{out}.report.json")).unwrap();
+        let version = report["schema_version"].as_u64().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (rows, names, version)
+    }
+
+    /// P1 starts with M (its first peptide and the Met-excised form start the protein); the
+    /// peptide WNDLLSTEFR is internal in P2, which is read first, and N-terminal in P3, so
+    /// the flag is an OR over occurrences; VLDEFGHIK starts at position 1 after a K, which
+    /// is a cleavage product and not a protein N-terminus.
+    const NTERM_FASTA: &str = ">P1\nMSEQPEPTIDEKAAAGGGLLLR\n>P2\nGGGAAAKWNDLLSTEFRK\n\
+                               >P3\nWNDLLSTEFRAGHIPEDK\n>P4\nKVLDEFGHIKR\n";
+
+    #[test]
+    fn protein_n_term_flag_marks_every_peptide_that_starts_a_protein() {
+        let (rows, names, version) = digest_fasta("flag", NTERM_FASTA, true);
+        assert_eq!(version, 2);
+        assert_eq!(names.last().map(String::as_str), Some("protein_n_term"));
+        let flag = |p: &str| {
+            rows.iter()
+                .find(|r| r.0 == p && r.1 == "target")
+                .unwrap_or_else(|| panic!("{p} not digested: {rows:?}"))
+                .3
+                .unwrap()
+        };
+        for p in ["MSEQPEPTIDEK", "SEQPEPTIDEK", "GGGAAAK", "WNDLLSTEFR"] {
+            assert!(flag(p), "{p} starts a protein");
+        }
+        for p in ["AAAGGGLLLR", "AGHIPEDK", "VLDEFGHIK"] {
+            assert!(!flag(p), "{p} does not start a protein");
+        }
+        // Every decoy carries its target's flag, whatever its own sequence.
+        let mut n_decoys = 0;
+        for (i, r) in rows.iter().enumerate() {
+            if r.1 == "decoy" {
+                n_decoys += 1;
+                let target = rows.iter().take(i).rev().find(|t| t.1 == "target").unwrap();
+                assert_eq!(r.3, target.3, "decoy {} of {}", r.0, target.0);
+            }
+        }
+        assert!(n_decoys >= 7);
+        let flagged = |label: &str| {
+            rows.iter()
+                .filter(|r| r.1 == label && r.3 == Some(true))
+                .count()
+        };
+        assert_eq!(flagged("target"), flagged("decoy"));
+    }
+
+    #[test]
+    fn without_a_protein_n_term_rule_the_table_is_version_1() {
+        let (rows, names, version) = digest_fasta("noflag", NTERM_FASTA, false);
+        assert_eq!(version, 1);
+        assert_eq!(
+            names,
+            [
+                "id",
+                "peptide",
+                "protein",
+                "start",
+                "end",
+                "label",
+                "target_id",
+                "decoy_strategy"
+            ]
+        );
+        assert!(rows.iter().all(|r| r.3.is_none()));
+        // The rows themselves are those of the flagged digest.
+        let (flagged, _, _) = digest_fasta("noflag2", NTERM_FASTA, true);
+        let strip = |v: &[(String, String, i32, Option<bool>)]| {
+            v.iter()
+                .map(|r| (r.0.clone(), r.1.clone(), r.2))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(&rows), strip(&flagged));
+    }
+
+    #[test]
+    fn met_excision_off_leaves_position_1_unflagged() {
+        let cfg = DigestConfig {
+            n_term_met_excision: false,
+            ..Default::default()
+        };
+        assert!(starts_protein(b"MSEQK", 0, &cfg));
+        assert!(!starts_protein(b"MSEQK", 1, &cfg));
+        let on = DigestConfig::default();
+        assert!(starts_protein(b"MSEQK", 1, &on));
+        assert!(!starts_protein(b"KSEQK", 1, &on));
+        assert!(!starts_protein(b"MSEQK", 2, &on));
     }
 
     #[test]

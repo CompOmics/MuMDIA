@@ -44,7 +44,7 @@ import pyarrow.parquet as pq
 # tests/python/test_deeplc_predict.py. `*` rather than `+`: the worker predicts a row whose
 # stripped base is empty (a bare "DECOY_"), because `is_std("")` is true.
 STD_RE = r"^[ACDEFGHIKLMNPQRSTVWY]*$"
-MOD_RE = r"\[[^\]]*\]"
+MOD_RE = r"-?\[[^\]]*\]-?"
 
 
 def _bases(col):
