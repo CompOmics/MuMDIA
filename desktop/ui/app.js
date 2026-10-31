@@ -1537,8 +1537,20 @@ const FALLBACK_CATALOGUE = {
   sets: [],
 };
 
-function modKey(name, residue) {
-  return `${name}|${residue}`;
+// A residue site is "name|R", as it always was; a terminal site is "name|*|position"
+// (`protein_n_term` or `peptide_n_term`), so saved residue choices still read.
+const TERMINI = {
+  protein_n_term: { chip: "Prot N-term", text: "protein N-terminus" },
+  peptide_n_term: { chip: "Pep N-term", text: "peptide N-terminus" },
+};
+
+function modKey(name, residue, position) {
+  return position ? `${name}|${residue}|${position}` : `${name}|${residue}`;
+}
+
+function parseModKey(key) {
+  const [name, residue, position] = String(key).split("|");
+  return { name, residue, position: position || "" };
 }
 
 function maxVariableMods() {
@@ -1553,11 +1565,14 @@ function selectedMods() {
   const variable = [];
   for (const m of state.catalogue?.modifications || []) {
     const picked = [...state.mods.entries()]
-      .filter(([k]) => k.split("|")[0] === m.name)
-      .map(([k, kind]) => [k.split("|")[1], kind])
-      .sort((a, b) => a[0].localeCompare(b[0]));
-    for (const [residue, kind] of picked) {
-      (kind === "fix" ? fixed : variable).push({ residue, name: m.name });
+      .map(([k, kind]) => ({ ...parseModKey(k), kind }))
+      .filter((x) => x.name === m.name)
+      .sort((a, b) => (a.residue + a.position).localeCompare(b.residue + b.position));
+    for (const x of picked) {
+      const site = x.position
+        ? { residue: x.residue, name: m.name, position: x.position }
+        : { residue: x.residue, name: m.name };
+      (x.kind === "fix" ? fixed : variable).push(site);
     }
   }
   return { fixed, variable };
@@ -1568,9 +1583,13 @@ function selectedMods() {
 function modProblems() {
   const { fixed, variable } = selectedMods();
   const out = [];
+  // A terminal site is keyed by the terminus: the engine places one group there.
   const byResidue = (list) => {
     const m = new Map();
-    for (const x of list) m.set(x.residue, [...(m.get(x.residue) || []), x.name]);
+    for (const x of list) {
+      const at = x.position ? "the N-terminus" : x.residue;
+      m.set(at, [...(m.get(at) || []), x.name]);
+    }
     return m;
   };
   const fx = byResidue(fixed);
@@ -1615,8 +1634,9 @@ function loadMods() {
   for (const e of entries) {
     if (!Array.isArray(e) || e.length !== 2) continue;
     const [key, kind] = e;
-    const [name, residue] = String(key).split("|");
-    if (known.has(name) && /^[A-Z]$/.test(residue || "") && (kind === "var" || kind === "fix")) {
+    const { name, residue, position } = parseModKey(key);
+    const site = position ? residue === "*" && position in TERMINI : /^[A-Z]$/.test(residue || "");
+    if (known.has(name) && site && (kind === "var" || kind === "fix")) {
       state.mods.set(key, kind);
     }
   }
@@ -1688,8 +1708,8 @@ async function initMods() {
     sel.value = "";
     if (!set) return;
     if (set.replace) state.mods.clear();
-    for (const [n, r] of set.fixed || []) state.mods.set(modKey(n, r), "fix");
-    for (const [n, r] of set.variable || []) state.mods.set(modKey(n, r), "var");
+    for (const [n, r, pos] of set.fixed || []) state.mods.set(modKey(n, r, pos), "fix");
+    for (const [n, r, pos] of set.variable || []) state.mods.set(modKey(n, r, pos), "var");
     modsChanged();
   });
   $("mod-filter").addEventListener("input", renderMods);
@@ -1715,13 +1735,26 @@ function renderMods() {
   for (const m of state.catalogue.modifications) {
     // The catalogue's residues, plus any a saved or set choice put elsewhere, so a
     // selected site is never invisible.
-    const extra = [...state.mods.keys()]
-      .filter((k) => k.split("|")[0] === m.name)
-      .map((k) => k.split("|")[1]);
+    const chosen = [...state.mods.keys()].map(parseModKey).filter((x) => x.name === m.name);
+    const extra = chosen.filter((x) => !x.position).map((x) => x.residue);
     const residues = [...new Set([...m.residues, ...extra])];
+    // The catalogue's termini, plus any a saved or set choice put there.
+    const termini = [
+      ...new Set([...(m.termini || []), ...chosen.filter((x) => x.position).map((x) => x.position)]),
+    ].filter((t) => t in TERMINI);
+    const sites = [
+      ...residues.map((r) => ({ key: modKey(m.name, r), label: r, text: r })),
+      ...termini.map((t) => ({
+        key: modKey(m.name, "*", t),
+        label: TERMINI[t].chip,
+        text: `the ${TERMINI[t].text}`,
+      })),
+    ];
     // The optional label is a plain-language description ("N-homocysteinylation") for a
     // UniMod name that does not say what it is, so it is shown and matched by the filter.
-    const hay = `${m.name} ${m.label || ""} ${m.group} ${residues.join(" ")} unimod:${m.unimod}`.toLowerCase();
+    const hay = `${m.name} ${m.label || ""} ${m.group} ${residues.join(" ")} ${termini
+      .map((t) => `${TERMINI[t].chip} ${TERMINI[t].text}`)
+      .join(" ")} unimod:${m.unimod}`.toLowerCase();
     if (words.length && !words.every((w) => hay.includes(w))) continue;
     if (m.group !== group) {
       group = m.group;
@@ -1749,15 +1782,14 @@ function renderMods() {
     const chips = document.createElement("div");
     chips.className = "chips";
     let on = false;
-    for (const r of residues) {
-      const key = modKey(m.name, r);
+    for (const { key, label: chipLabel, text } of sites) {
       const kind = state.mods.get(key);
       if (kind) on = true;
       const b = document.createElement("button");
       b.type = "button";
       b.className = "chip" + (kind === "var" ? " var" : kind === "fix" ? " fix" : "");
-      b.textContent = r;
-      b.title = `${m.name} on ${r}: ${
+      b.textContent = chipLabel;
+      b.title = `${m.name} on ${text}: ${
         kind === "var" ? "variable" : kind === "fix" ? "fixed" : "not searched"
       }`;
       b.addEventListener("click", () => {
@@ -1784,7 +1816,10 @@ function renderMods() {
 
 function describeMods(list) {
   const by = new Map();
-  for (const x of list) by.set(x.name, [...(by.get(x.name) || []), x.residue]);
+  for (const x of list) {
+    const at = x.position ? TERMINI[x.position]?.text || x.position : x.residue;
+    by.set(x.name, [...(by.get(x.name) || []), at]);
+  }
   return [...by].map(([n, rs]) => `${n} (${rs.join(", ")})`).join(", ");
 }
 

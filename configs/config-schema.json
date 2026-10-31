@@ -4244,7 +4244,7 @@
           "optional": false,
           "default": null,
           "default_text": null,
-          "help": "Target residue; `*` for any / terminal handled separately in MVP.",
+          "help": "Target residue; `*` for a terminal rule (any first residue).",
           "gates": [],
           "source_struct": "ResidueMod"
         },
@@ -4260,6 +4260,26 @@
           "help": "UniMod name.",
           "gates": [],
           "source_struct": "ResidueMod"
+        },
+        {
+          "path": "position",
+          "name": "position",
+          "section": "",
+          "rust_type": "ModPosition",
+          "kind": "enum",
+          "optional": false,
+          "default": "anywhere",
+          "default_text": "`anywhere`",
+          "help": "Where the modification sits: on `residue` wherever it occurs (`anywhere`, the default, omitted from the canonical configuration so the hash of every existing configuration is unchanged), on the N-terminus of every peptide (`peptide_n_term`), or on the N-terminus of a peptide that starts its protein (`protein_n_term`, with or without the initiator methionine). A terminal rule takes residue `*`. `peptide_c_term` and `protein_c_term` are recognised only to be refused.",
+          "gates": [],
+          "source_struct": "ResidueMod",
+          "choices": [
+            "anywhere",
+            "peptide_n_term",
+            "protein_n_term",
+            "peptide_c_term",
+            "protein_c_term"
+          ]
         }
       ]
     }

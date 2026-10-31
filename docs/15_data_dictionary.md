@@ -118,6 +118,7 @@ one row per diaPASEF slot. Provenance only; no stage reads them.
 | `label` | Utf8 | no | - | `target` or `decoy` |
 | `target_id` | Int32 | no | - | for a decoy, the `id` of its paired target; -1 for a target |
 | `decoy_strategy` | Utf8 | no | - | lowercased decoy strategy name (e.g. `reverse`, `scramble`) |
+| `protein_n_term` | Boolean | no | - | v2 only (written when a modification rule has `position = "protein_n_term"`): the peptide starts a protein, at position 0 or after the initiator Met, in any protein it occurs in; a decoy carries its target's value |
 
 ---
 

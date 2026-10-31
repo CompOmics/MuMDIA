@@ -74,7 +74,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`experiment`](#experiment) | `ExperimentConfig` | 3 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
 | [`groups`](#groups) | `GroupsConfig` | 9 |  |
 | [`retrace`](#retrace) | `RetraceConfig` | 5 | [docs/09_extract.md](09_extract.md) |
-| [`peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]`](#peptidoformsfixed_mods--peptidoformsvariable_mods) | `ResidueMod` | 2 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
+| [`peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]`](#peptidoformsfixed_mods--peptidoformsvariable_mods) | `ResidueMod` | 3 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 
 ## (top level)
 
@@ -589,8 +589,9 @@ Element type of `peptidoforms.fixed_mods` and `peptidoforms.variable_mods`. Each
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
-| `residue` | `char` | none: must be set |  | Target residue; `*` for any / terminal handled separately in MVP. |
+| `residue` | `char` | none: must be set |  | Target residue; `*` for a terminal rule (any first residue). |
 | `name` | `String` | none: must be set |  | UniMod name. |
+| `position` | `ModPosition` | `anywhere` |  | Where the modification sits: on `residue` wherever it occurs (`anywhere`, the default, omitted from the canonical configuration so the hash of every existing configuration is unchanged), on the N-terminus of every peptide (`peptide_n_term`), or on the N-terminus of a peptide that starts its protein (`protein_n_term`, with or without the initiator methionine). A terminal rule takes residue `*`. `peptide_c_term` and `protein_c_term` are recognised only to be refused. |
 
 ## Named profiles
 
@@ -894,6 +895,20 @@ Match-between-runs strategy (docs/12_quant_lfq_align_mbr_report_audit.md, "Secon
 | `empirical_library` |  | Rescuable-tier transfer; behaves as `RtTransfer`. |
 | `rt_transfer` |  | Rescuable-tier transfer on cross-run expected retention time (`mbr_worker.py`). |
 | `full` |  | Rescuable-tier transfer; behaves as `RtTransfer`. |
+
+### `ModPosition`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+The position of a `ResidueMod`.
+
+| Value | Default | Description |
+|---|---|---|
+| `anywhere` | yes | On the rule's residue wherever it occurs. |
+| `peptide_n_term` |  | On the N-terminal amine of every peptide. |
+| `protein_n_term` |  | On the N-terminal amine of a peptide that starts its protein: at protein position 0, or at position 1 after the initiator methionine (`digest.n_term_met_excision`). |
+| `peptide_c_term` |  | Refused at load: C-terminal modifications are not implemented. |
+| `protein_c_term` |  | Refused at load: C-terminal modifications are not implemented. |
 
 ### `MultiheadAnchors`
 
@@ -1299,6 +1314,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-24 structs and 324 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 42 enumerations, 1 named profile(s), 102 environment variables read and 20 set.
+24 structs and 325 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 43 enumerations, 1 named profile(s), 102 environment variables read and 20 set.
 
 36 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

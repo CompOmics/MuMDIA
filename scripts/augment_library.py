@@ -49,11 +49,13 @@ import pandas as pd
 # variant, so this helper silently emitted libraries the engine would not load.
 from _lib_io import write_engine_parquet
 
-STRIP_MODS = re.compile(r"\[[^\]]*\]")
+# A bracketed modification, with the dash of a terminal group (`[Acetyl]-PEPK`).
+STRIP_MODS = re.compile(r"-?\[[^\]]*\]-?")
 
 
 def stripped(peptidoform: str) -> str:
-    """Base amino-acid sequence: drop a DECOY_ prefix and bracketed mod blocks."""
+    """Base amino-acid sequence: drop a DECOY_ prefix, bracketed mod blocks and the dash of
+    a terminal group."""
     s = peptidoform[6:] if peptidoform.startswith("DECOY_") else peptidoform
     return STRIP_MODS.sub("", s)
 

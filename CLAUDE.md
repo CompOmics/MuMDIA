@@ -137,6 +137,11 @@ Key semantics:
   Without it the search database structurally misses those peptides; old configs
   still parse because the field defaults on. `augment_library.py` reuses this
   same digest to fill an imported library's missing tryptic peptides.
+- Terminal modifications are opt-in: a rule with `position = "protein_n_term"` (or
+  `peptide_n_term`), residue `*`, makes the digest write `protein_n_term` (peptides v2,
+  Met-retained and Met-excised starts, OR over proteins, decoys inherit) and adds the
+  `[Name]-` site, counted in `max_variable_mods`; without one every artifact, hash and cache
+  key is unchanged (docs/05, "Terminal modifications").
 - The engine keeps two caches by default (`mumdia::cache`, docs/14 "The engine's
   caches"): FASTA-built libraries (`predict_frag.library_cache`, byte-identical on a hit)
   and DeepLC's trunk projection (`rt_im_train.deeplc_projection_cache`, DeepLC >= 4.5.0,

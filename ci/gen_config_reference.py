@@ -580,6 +580,18 @@ def type_default(rtype: str, enums: dict[str, Enum], structs: dict[str, Struct])
     return None
 
 
+def field_serde_default(
+    field: "Field", struct: "Struct", enums: dict[str, Enum], structs: dict[str, Struct]
+) -> str | None:
+    """The default of a field with its own `#[serde(default)]` in a struct without
+    `impl Default`: an omitted key takes the type's default. `None` for any other field."""
+    if struct.has_default_impl:
+        return None
+    if not any(re.match(r"#\[serde\(default\b", a) for a in field.attrs):
+        return None
+    return type_default(field.rtype, enums, structs)
+
+
 def render_default(
     expr: str, rtype: str, enums: dict[str, Enum], structs: dict[str, Struct]
 ) -> str | None:
@@ -652,14 +664,25 @@ def render_struct_literal(
         fname, _, fexpr = name_expr.partition(":")
         fname = fname.strip()
         ftype = ""
+        fattrs: list[str] = []
         if struct:
             for f in struct.fields:
                 if f.name == fname:
                     ftype = f.rtype
+                    fattrs = f.attrs
         rendered = render_default(fexpr, ftype, enums, structs)
         if rendered is None:
             return None
-        parts.append(f'"{fname}": {rendered.strip("`")}')
+        # A field serde skips at its default is not in the serialised value either, so
+        # the rendered default stays the JSON a configuration carries.
+        if any("skip_serializing_if" in a for a in fattrs) and rendered == type_default(
+            ftype, enums, structs
+        ):
+            continue
+        value = rendered.strip("`")
+        if base_type(ftype) in enums:
+            value = f'"{value}"'
+        parts.append(f'"{fname}": {value}')
     return "{" + ", ".join(parts) + "}"
 
 
@@ -1597,6 +1620,8 @@ def field_rows(
         rendered = None
         if field.default_expr is not None:
             rendered = render_default(field.default_expr, field.rtype, enums, structs)
+        else:
+            rendered = field_serde_default(field, struct, enums, structs)
         field.default_rendered = rendered
         key = f"{path}.{field.name}" if path else field.name
         if rendered is None:
@@ -2194,7 +2219,7 @@ def build_schema(config_text: str) -> dict:
         rendered = (
             render_default(field.default_expr, field.rtype, enums, structs)
             if field.default_expr is not None
-            else None
+            else field_serde_default(field, struct, enums, structs)
         )
         # `render_default` produces a Markdown cell, so an enum arrives as
         # `` `base_peptide` `` and a number as text. The schema is data: strip the

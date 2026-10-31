@@ -1,5 +1,5 @@
 {
-  "_comment": "The modifications MuMDIA knows by name: the engine's mass table (mumdia_core::mass::unimod_mass) and the desktop Search tab both read this file, so a name the app offers is always one the engine accepts. Names are UniMod PSI-MS names, which the MS2PIP and DeepLC sidecars resolve through psm_utils; masses are UniMod monoisotopic deltas. 'residues' are the sites the Search tab offers for the modification; the engine accepts the name on any residue. Terminal modifications are not implemented (peptidoforms.rs refuses '*'), so none is listed. 'label', when present, is a plain-language description the Search tab shows beside the name and matches in its filter, for entries whose UniMod name does not say what they are. 'sets' are the Search tab's quick selections.",
+  "_comment": "The modifications MuMDIA knows by name: the engine's mass table (mumdia_core::mass::unimod_mass) and the desktop Search tab both read this file, so a name the app offers is always one the engine accepts. Names are UniMod PSI-MS names, which the MS2PIP and DeepLC sidecars resolve through psm_utils; masses are UniMod monoisotopic deltas. 'residues' are the sites the Search tab offers for the modification; the engine accepts the name on any residue. 'termini' are the terminal positions the Search tab offers (peptidoforms position peptide_n_term or protein_n_term; a set names one as [name, \"*\", position]). 'label', when present, is a plain-language description the Search tab shows beside the name and matches in its filter, for entries whose UniMod name does not say what they are. 'sets' are the Search tab's quick selections.",
   "modifications": [
     { "name": "Carbamidomethyl", "unimod": 4, "mass": 57.021463735, "residues": "C", "group": "Alkylation" },
     { "name": "Propionamide", "unimod": 24, "mass": 71.037114, "residues": "C", "group": "Alkylation" },
@@ -18,7 +18,7 @@
     { "name": "Glutathione", "unimod": 55, "mass": 305.068156, "residues": "C", "group": "Oxidation and artefacts" },
     { "name": "Phospho", "unimod": 21, "mass": 79.96633109, "residues": "STYH", "group": "Phosphorylation and sulfation" },
     { "name": "Sulfo", "unimod": 40, "mass": 79.956815, "residues": "YST", "group": "Phosphorylation and sulfation" },
-    { "name": "Acetyl", "unimod": 1, "mass": 42.010564684, "residues": "KSTY", "group": "Acylation" },
+    { "name": "Acetyl", "unimod": 1, "mass": 42.010564684, "residues": "KSTY", "termini": ["protein_n_term"], "group": "Acylation" },
     { "name": "Formyl", "unimod": 122, "mass": 27.994915, "residues": "KST", "group": "Acylation" },
     { "name": "Propionyl", "unimod": 58, "mass": 56.026215, "residues": "K", "group": "Acylation" },
     { "name": "Butyryl", "unimod": 1289, "mass": 70.041865, "residues": "K", "group": "Acylation" },
@@ -68,6 +68,10 @@
     {
       "name": "Ubiquitination remnant (GlyGly K)",
       "variable": [["GlyGly", "K"]]
+    },
+    {
+      "name": "Protein N-terminal acetylation",
+      "variable": [["Acetyl", "*", "protein_n_term"]]
     },
     {
       "name": "Cysteine prenylation",

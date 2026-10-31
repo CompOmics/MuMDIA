@@ -153,6 +153,103 @@ print(f"tag prefilter: {n}/{len(want)} planted peptides identified")
 assert n >= 100, n
 PYEOF
 
+# 4t. Protein N-terminal acetylation (`peptidoforms.variable_mods[].position =
+#     "protein_n_term"`), on a FASTA of its own: five proteins begin with M (so the
+#     Met-retained and the Met-excised first peptide both start a protein), GLTDEWQYNSAPVEK
+#     is internal in one protein and the first peptide of another, and two proteins begin
+#     with K (the peptide at position 1 follows a cleavage and does not start the protein).
+#     The digest writes peptides v2 here and only here; every acetylated library form is a
+#     protein N-terminal peptide, on targets and decoys alike; the planted acetylated
+#     precursors are identified, and no accepted acetylated row is on any other peptide.
+echo "=== smoke: protein N-terminal acetylation"
+nt="$work/nterm"
+mkdir -p "$nt"
+"$PY" - "$cfg" "$nt/cfg.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+pf = c.setdefault("peptidoforms", {})
+pf["variable_mods"] = [
+    {"residue": "M", "name": "Oxidation"},
+    {"residue": "*", "name": "Acetyl", "position": "protein_n_term"},
+]
+pf["max_variable_mods"] = 2
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+"$BIN" digest --fasta test_data/fixture_nterm.fasta --out "$nt/peptides.parquet" \
+    --config "$nt/cfg.json"
+"$BIN" peptidoforms --peptides "$nt/peptides.parquet" --out "$nt/peptidoforms.parquet" \
+    --config "$nt/cfg.json"
+"$BIN" predict-frag --peptidoforms "$nt/peptidoforms.parquet" \
+    --out-precursors "$nt/lib_prec.parquet" --out-fragments "$nt/lib_frag.parquet" \
+    --work-dir "$nt/sidecar" --config "$nt/cfg.json"
+"$PY" ci/make_fixture_mzml.py \
+    --precursors "$nt/lib_prec.parquet" --fragments "$nt/lib_frag.parquet" \
+    --out "$nt/fixture.mzML" --manifest "$nt/planted.json" \
+    --n-planted 60 --windows 8 --include-prefix "[Acetyl]-" --quiet
+"$BIN" run --fasta test_data/fixture_nterm.fasta --mzml "$nt/fixture.mzML" \
+    --out-dir "$nt/out" --config "$nt/cfg.json" --threads 2 > "$nt/run.log" 2>&1 \
+    || { tail -30 "$nt/run.log"; exit 1; }
+"$PY" - "$nt" "$work/out" test_data/fixture_nterm.fasta <<'PYEOF'
+import json, os, re, sys
+import pyarrow.parquet as pq
+
+nt, main_out, fasta = sys.argv[1:4]
+proteins, seq = [], []
+for line in open(fasta):
+    if line.startswith(">"):
+        if seq:
+            proteins.append("".join(seq))
+        seq = []
+    else:
+        seq.append(line.strip())
+proteins.append("".join(seq))
+
+def starts_a_protein(pep):
+    """Independent of the engine: the first residues of a protein, with or without M."""
+    return any(p.startswith(pep) or (p.startswith("M") and p[1:].startswith(pep))
+               for p in proteins)
+
+def residues(pf):
+    pf = pf[len("DECOY_"):] if pf.startswith("DECOY_") else pf
+    return re.sub(r"-?\[[^\]]*\]-?", "", pf)
+
+# Peptides v2 in this arm, v1 in the plain run.
+rep = json.load(open(os.path.join(nt, "peptides.parquet.report.json")))
+assert rep["schema_version"] == 2, rep["schema_version"]
+plain = json.load(open(os.path.join(main_out, "peptides.parquet.report.json")))
+assert plain["schema_version"] == 1, plain["schema_version"]
+assert "protein_n_term" not in pq.read_schema(os.path.join(main_out, "peptides.parquet")).names
+pep = pq.read_table(os.path.join(nt, "peptides.parquet")).to_pydict()
+flag = {p: f for p, f, l in zip(pep["peptide"], pep["protein_n_term"], pep["label"]) if l == "target"}
+assert flag["GLTDEWQYNSAPVEK"], "a peptide internal in one protein and first in another"
+for p, f in flag.items():
+    assert f == starts_a_protein(p), (p, f)
+
+# The library: acetylated forms on protein N-terminal targets only, as many decoys.
+lib = pq.read_table(os.path.join(nt, "lib_prec.parquet")).to_pydict()
+ac = {l: [pf for pf, ll in zip(lib["peptidoform"], lib["label"]) if ll == l and "[Acetyl]-" in pf]
+      for l in ("target", "decoy")}
+assert ac["target"] and len(ac["target"]) == len(ac["decoy"]), {k: len(v) for k, v in ac.items()}
+bad = [pf for pf in ac["target"] if not starts_a_protein(residues(pf))]
+assert not bad, bad
+assert any(residues(pf) == "GLTDEWQYNSAPVEK" for pf in ac["target"])
+
+# The search: planted acetylated precursors found, none accepted elsewhere.
+planted = {p["peptidoform"] for p in json.load(open(os.path.join(nt, "planted.json")))["planted"]
+           if p["peptidoform"].startswith("[Acetyl]-")}
+s = pq.read_table(os.path.join(nt, "out", "psms_scored.parquet"),
+                  columns=["peptidoform", "label", "q_value"]).to_pydict()
+accepted = {pf for pf, l, q in zip(s["peptidoform"], s["label"], s["q_value"])
+            if l == "target" and q <= 0.01}
+found = planted & accepted
+print(f"N-terminal acetyl: {len(ac['target'])} target and {len(ac['decoy'])} decoy library "
+      f"forms; {len(found)}/{len(planted)} planted acetylated precursors identified")
+assert len(planted) >= 10, len(planted)
+assert len(found) >= 0.8 * len(planted), (len(found), len(planted))
+wrong = [pf for pf in accepted if pf.startswith("[Acetyl]-") and not starts_a_protein(residues(pf))]
+assert not wrong, wrong
+PYEOF
+
 # 4a. `predict_frag.library_cache`: the first FASTA run builds the library and stores it,
 #     the second finds it and skips digest, peptidoforms and predict-frag. Both must give
 #     the plain run's TSVs byte for byte, and a plain FASTA run names the --lib-* reuse.

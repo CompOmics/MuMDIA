@@ -132,6 +132,23 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **Protein N-terminal acetylation, and N-terminal modifications in general, as an opt-in
+  search option.** A modification rule takes a `position`: `anywhere` (the default and the
+  previous behaviour), `peptide_n_term` or `protein_n_term`, with residue `*`, for example
+  `{"residue": "*", "name": "Acetyl", "position": "protein_n_term"}` in
+  `peptidoforms.variable_mods`. With a protein N-terminal rule the digest records which
+  peptides start a protein, at position 0 or after the initiator methionine, in any protein
+  they occur in (`protein_n_term`, `peptides` schema version 2), and a decoy takes its
+  target's value; the peptidoform stage adds the N-terminal group as one more variable site,
+  counted in `max_variable_mods`, written `[Acetyl]-SEQ`. C-terminal positions, terminal rules
+  restricted to one residue, two fixed N-terminal groups and a fixed beside a variable
+  N-terminal group are refused at load. A configuration without a terminal rule produces the
+  same tables, configuration hash and library-cache key as before. The catalogue lists the
+  termini a modification is offered at, the desktop Search screen has a protein N-terminal
+  chip and a "Protein N-terminal acetylation" set, a DIA-NN library build passes the site as
+  `*n`, and the planned library size counts it (docs/05_digest_peptidoforms.md, "Terminal
+  modifications").
+
 - **The desktop installer provides the Microsoft Visual C++ x64 runtime that PyTorch
   needs on Windows.** The MSI merges Microsoft's runtime merge module from the build
   runner's Visual Studio, so a fresh installation can load `torch\lib\c10.dll`. It needs
@@ -156,6 +173,19 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **The library helpers read an N-terminal group as a terminal group.** Each misread
+  `[Acetyl]-PEPK` silently: `make_reverse_decoys.py` took the "A" of "Acetyl" for an alanine,
+  so the decoy gained a residue and lost the acetyl; `deeplc_finetune.py` and
+  `mh_shard_predict.py` left the dash after stripping the bracket, so acetylated rows were
+  not re-predicted and kept a retention time on another scale; `augment_library.py`,
+  `predict_decoys.py` and the fallback fold key of `nn_rescore_worker.py` produced `-PEPK` as
+  the stripped sequence; the prescan dropped such candidates; and `import_diann_lib.py`
+  dropped every precursor with a modification before its first residue. The importer now
+  keeps a leading `(UniMod:N)` as `[Name]-` when accession N is kept (`--keep-unimod`) and
+  reports how many such precursors it kept and dropped; by default accession 1 is not kept,
+  so a default import is unchanged. `predict-frag` tags a terminal group in the signature
+  that pairs a target with its decoy, so an N-terminal and a lysine acetyl of one peptide
+  are separate precursors.
 - **A Python environment whose torch cannot load is reported before a search, not two
   minutes into one.** `mumdia doctor` and the desktop application checked the sidecar
   packages with `importlib.util.find_spec`, which locates a package without loading its

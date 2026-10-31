@@ -234,6 +234,11 @@ code.
   peptidoform, charge, precursor_mz, predicted_irt, label(="target"), protein,
   n_fragments`. `<out_fragments>`: `candidate_id, mz, predicted_intensity, name,
   ion_type, ordinal, frag_charge` (`import_diann_lib.py:59-83`).
+- A modification written before the first residue (`(UniMod:1)PEPK`) is N-terminal.
+  It is kept as the ProForma group `[Acetyl]-PEPK` when its accession is kept
+  (`--keep-unimod 1,4,35` for protein N-terminal acetylation), and the precursor is
+  dropped otherwise, as every precursor with an accession outside the kept set is. The
+  import prints how many N-terminally modified precursors it kept and dropped.
 
 **predict_decoys** (offline; the desktop DIA-NN build calls it)
 
@@ -253,6 +258,10 @@ reproduced the bench prototype's output exactly (202,012,453 fragment rows). `ts
 - IN/OUT the same precursor+fragment schema as `import_diann_lib`, reading a
   target-only (or target-half) library and emitting a target+decoy library
   re-sorted by `precursor_mz` with contiguous re-indexed `candidate_id`.
+- A reverse decoy keeps its target's N-terminal group (`[Acetyl]-`) at its own
+  N-terminus, at the target's precursor m/z, and every decoy b ion carries the group's
+  mass. The tokenizer used to read the "A" of "Acetyl" as an alanine; a C-terminal group
+  is refused (no decoy, reported) rather than misread.
 
 **augment_library** (offline; no Rust caller, but shells out to the `mumdia`
 binary and to a decoy builder)
@@ -389,8 +398,11 @@ Algorithm: (1) build the reference from confident **target** seed PSMs with
 the weights (`deeplc_finetune.py:128`); (4) predict every unique standard
 peptidoform on its **`DECOY_`-stripped** underlying sequence so decoys land on the
 same iRT scale as targets (`base_pf`, and `library_bases` for the whole column; both
-strip only a leading `DECOY_`). A peptidoform that is non-standard (`is_std` false,
-e.g. a terminal mod outside `STD`), was not predicted, or came back non-finite keeps
+strip only a leading `DECOY_`). Modifications are stripped with `MOD_RE`, which takes
+the dash of a terminal group with its bracket, so `[Acetyl]-PEPK` is the standard
+sequence `PEPK` and is predicted (before 2026-10-31 the dash survived, `-PEPK` failed
+`is_std`, and every N-terminally modified row kept its library retention time on another
+scale). A peptidoform that is non-standard (`is_std` false), was not predicted, or came back non-finite keeps
 its **original** `predicted_irt` unchanged (`rewrite_irt`), so only the sequences
 DeepLC actually re-predicted move onto the fine-tuned scale. The unique set, the
 seed filter and the write-back run in Arrow and the base model is loaded once
