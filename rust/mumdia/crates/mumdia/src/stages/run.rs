@@ -277,172 +277,75 @@ pub fn run(p: RunParams) -> Result<()> {
             (lp.to_string(), lf.to_string())
         }
         _ => {
-            // Build the library from the FASTA digest. preflight guarantees the
-            // FASTA is present in this branch.
+            // Build the library from the FASTA digest, or restore it from the library
+            // cache (`library_build`, shared with `run-experiment` and `build-library`).
+            // preflight guarantees the FASTA is present in this branch.
             let fasta = p.fasta.expect("preflight guarantees --fasta in build mode");
-            // Whether this run's spectra will carry 1/K0, from the raw dispatch, before
-            // anything is converted: the library-build keys resolve on it
-            // (`predict_frag.im_predictor = auto`), and conversion decides the same way.
-            let run_has_im = crate::instrument::input_has_im(p.mzml);
-            let lib_p = d("fragment_library_precursors.parquet");
-            let lib_f = d("fragment_library_fragments.parquet");
-            // `predict_frag.library_cache`: a library stored by an earlier run with the same
-            // FASTA, build settings, predictor versions and engine is published here instead
-            // of being built (`library_cache`).
-            // A tag-prefiltered library depends on this run's spectra, so it is neither
-            // restored from nor stored in the library cache.
-            let cache = if before_prediction {
-                None
-            } else {
-                crate::library_cache::LibraryCache::for_config(
-                    cfg,
-                    fasta,
-                    rt_placeholder,
-                    run_has_im,
-                    (&man.mumdia_version, &man.git_sha),
-                )
-            };
-            if let Some((wp, wf)) = cache.as_ref().and_then(|c| c.restore(&lib_p, &lib_f)) {
-                pre.first_stage("library-cache");
-                // A reused output directory may still hold an earlier build's digest and
-                // peptidoforms, which did not produce this library.
-                crate::library_cache::remove_build_intermediates(p.out_dir);
-                man.record(wp.record(
-                    artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                    crate::stages::predict_frag::precursors_schema(&lib_p)?,
-                    &lib_p,
-                    "library-cache",
+            // Tag prefilter: only the peptidoforms it keeps reach MS2PIP and DeepLC. The
+            // spectra are converted for it here, before any prediction.
+            let mut prefilter = |pf: &str,
+                                 man: &mut Manifest,
+                                 pre: &mut crate::prestage::PreStageTimer|
+             -> Result<String> {
+                pre.first_stage("convert");
+                info!(stage = %"convert", "run: stage start");
+                let co = convert_and_record(&p, cfg, &spectra_dir, man)?;
+                let surv = prescreen::run_before_prediction(cfg, &ch, &co.ms2, pf, p.out_dir)?
+                    .expect("a prediction prefilter is set");
+                man.record(record_artifact(
+                    "prediction_prefilter_survivors",
+                    artifact::PRESCAN_SURVIVORS,
+                    &surv,
+                    mumdia_io::table::nrows(&surv)?,
+                    "prescreen",
                     &ch,
-                ));
-                man.record(wf.record(
-                    artifact::FRAGMENT_LIBRARY_FRAGMENTS.0,
-                    artifact::FRAGMENT_LIBRARY_FRAGMENTS,
-                    &lib_f,
-                    "library-cache",
-                    &ch,
-                ));
-            } else {
-                let dig = d("peptides.parquet");
-                pre.first_stage("digest");
-                let w = digest::run_hashed(digest::DigestParams {
-                    fasta,
-                    out: &dig,
-                    cfg: &cfg.digest,
-                    rng_seed: cfg.rng_seed,
-                    config_hash: &ch,
-                })?;
-                man.record(w.record(
-                    artifact::PEPTIDES.0,
-                    artifact::PEPTIDES,
-                    &dig,
-                    "digest",
-                    &ch,
-                ));
-
-                let pf = d("peptidoforms.parquet");
-                let w = peptidoforms::run_hashed(peptidoforms::PeptidoformsParams {
-                    peptides: &dig,
-                    out: &pf,
-                    cfg: &cfg.peptidoforms,
-                    config_hash: &ch,
-                })?;
-                man.record(w.record(
+                )?);
+                let kept = d("peptidoforms_tag_prefiltered.parquet");
+                let n = prescreen::filter_rows(pf, "id", &surv, &kept)?;
+                info!(
+                    kept = n,
+                    of = mumdia_io::table::nrows(pf)?,
+                    "run: peptidoforms passed to prediction after the prediction prefilter"
+                );
+                man.record(record_artifact(
                     artifact::PEPTIDOFORMS.0,
                     artifact::PEPTIDOFORMS,
-                    &pf,
-                    "peptidoforms",
+                    &kept,
+                    n,
+                    "prescreen",
                     &ch,
-                ));
-
-                // Tag prefilter: only the peptidoforms it keeps reach MS2PIP and DeepLC.
-                let pf = if before_prediction {
-                    pre.first_stage("convert");
-                    info!(stage = %"convert", "run: stage start");
-                    let co = convert_and_record(&p, cfg, &spectra_dir, &mut man)?;
-                    let surv = prescreen::run_before_prediction(cfg, &ch, &co.ms2, &pf, p.out_dir)?
-                        .expect("a prediction prefilter is set");
-                    man.record(record_artifact(
-                        "prediction_prefilter_survivors",
-                        artifact::PRESCAN_SURVIVORS,
-                        &surv,
-                        mumdia_io::table::nrows(&surv)?,
-                        "prescreen",
-                        &ch,
-                    )?);
-                    let kept = d("peptidoforms_tag_prefiltered.parquet");
-                    let n = prescreen::filter_rows(&pf, "id", &surv, &kept)?;
-                    info!(
-                        kept = n,
-                        of = mumdia_io::table::nrows(&pf)?,
-                        "run: peptidoforms passed to prediction after the prediction prefilter"
-                    );
-                    man.record(record_artifact(
-                        artifact::PEPTIDOFORMS.0,
-                        artifact::PEPTIDOFORMS,
-                        &kept,
-                        n,
-                        "prescreen",
-                        &ch,
-                    )?);
-                    early_co = Some(co);
-                    kept
-                } else {
-                    pf
-                };
-
-                if cfg.predict_frag.defer_deeplc_to_multihead && !rt_placeholder {
-                    info!(
-                        "run: predict_frag.defer_deeplc_to_multihead is set, but no multi-head \
-                         calibration re-predicts this library (it needs rt_predictor = deeplc \
-                         and a DeepLC interpreter); predicting it with DeepLC as usual"
-                    );
-                }
-                let (wp, wf) = predict_frag::run_hashed(predict_frag::PredictFragParams {
-                    rt_placeholder,
-                    peptidoforms: &pf,
-                    out_precursors: &lib_p,
-                    out_fragments: &lib_f,
-                    work_dir: &d("sidecar_work"),
-                    cfg: &cfg.predict_frag,
+                )?);
+                early_co = Some(co);
+                Ok(kept)
+            };
+            let engine = (man.mumdia_version.clone(), man.git_sha.clone());
+            let lib = library_build::build(
+                &library_build::BuildParams {
+                    cfg,
                     config_hash: &ch,
-                    run_has_im,
-                })?;
-                man.record(wp.record(
-                    artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
-                    crate::stages::predict_frag::precursors_schema(&lib_p)?,
-                    &lib_p,
-                    "predict-frag",
-                    &ch,
-                ));
-                man.record(wf.record(
-                    artifact::FRAGMENT_LIBRARY_FRAGMENTS.0,
-                    artifact::FRAGMENT_LIBRARY_FRAGMENTS,
-                    &lib_f,
-                    "predict-frag",
-                    &ch,
-                ));
-                match &cache {
-                    Some(c) => {
-                        c.store(&lib_p, &lib_f);
-                        // A stored library can be several GB: bring the caches back within
-                        // MUMDIA_CACHE_MAX_GB now rather than only at the end of the run.
-                        crate::cache::enforce_for(cfg);
-                    }
-                    None => {
-                        if let Some(hint) =
-                            crate::library_cache::reuse_hint(cfg, &lib_p, &lib_f, rt_placeholder)
-                        {
-                            info!(
-                                "run: to search another file against this library without \
-                                 building it again, pass {hint}, or turn \
-                                 predict_frag.library_cache on (\"auto\" or a directory) and \
-                                 keep --fasta"
-                            );
-                        }
-                    }
-                }
-            }
-            (lib_p, lib_f)
+                    fasta,
+                    out_dir: p.out_dir,
+                    rt_placeholder,
+                    // Whether this run's spectra will carry 1/K0, from the raw dispatch,
+                    // before anything is converted: the library-build keys resolve on it
+                    // (`predict_frag.im_predictor = auto`), and conversion decides the same
+                    // way.
+                    run_has_im: crate::instrument::input_has_im(p.mzml),
+                    engine: (&engine.0, &engine.1),
+                    // A tag-prefiltered library depends on this run's spectra, so it is
+                    // neither restored from nor stored in the library cache.
+                    use_cache: !before_prediction,
+                    caller: "run",
+                },
+                Some(&mut man),
+                &mut pre,
+                if before_prediction {
+                    Some(&mut prefilter as library_build::PeptidoformFilter)
+                } else {
+                    None
+                },
+            )?;
+            (lib.precursors, lib.fragments)
         }
     };
 

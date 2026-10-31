@@ -146,6 +146,24 @@ than a number. Both are recorded in every run's `manifest.json`.
   signature is valid and from Microsoft Corporation, runs it elevated after Windows'
   permission prompt, reports its exit code (installed, already installed, restart
   required, or the failure with the manual link) and tests the packages again.
+- **`mumdia build-library` builds the spectral library of a FASTA search without
+  spectra** (issue #233). It runs the library build of `run` and `run-experiment`, now one
+  function (`stages/library_build.rs`), so it restores the library from or stores it into
+  `predict_frag.library_cache` under the key a later `run --fasta` with the same FASTA and
+  configuration computes, and that search skips digest, peptidoforms and predict-frag.
+  `--out-dir` receives the two library tables, `manifest.json` and `library.json` (row
+  counts, predictor models, cache key, and the `--lib-precursors` / `--lib-fragments`
+  invocation with the `rt_im_train.library_irt` value that reproduces the FASTA search).
+  `--ion-mobility on` builds for timsTOF diaPASEF spectra, which matters under
+  `predict_frag.im_predictor = auto`. A prefilter before prediction is refused, since its
+  library depends on spectra. The outputs of `run` and `run-experiment` are unchanged
+  (docs/06, "Building a library without spectra").
+- **Desktop application: Build library only.** In FASTA mode the Search screen builds the
+  library without searching and without spectra, with DIA-NN or with the built-in
+  predictors, for timsTOF diaPASEF or for other instruments (set from the selected spectra
+  when there are any). The result card shows the counts, models and paths, and offers
+  Search with this library, Copy to folder and Reveal. A library-mode search of a library
+  built this way uses the `rt_im_train.library_irt` its `library.json` names.
 
 ### Fixed
 
