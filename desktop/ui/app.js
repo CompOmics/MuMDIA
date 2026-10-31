@@ -2005,6 +2005,14 @@ async function resolveBands(libPrecursors) {
   }
 }
 
+// What the viewer reads beyond the defaults. `quant.fragment_detail` writes, beside each
+// run's quantities, which fragments made each quantity (`quant_fragments.parquet`), so the
+// viewer can mark them on the chromatograms. It costs one small table per run and changes no
+// other output, so every search started here asks for it.
+function viewerOverrides() {
+  return { "quant.fragment_detail": true };
+}
+
 function bandOverrides(b) {
   // Automatic with one band leaves whatever the preset says; Off and Custom are explicit.
   if (b.bands > 1 || b.explicit) {
@@ -2475,6 +2483,7 @@ async function startSearch() {
     return;
   }
   const overrides = {
+    ...viewerOverrides(),
     ...(state.mode === "fasta" && !built ? digestOverrides() : {}),
     ...prescreenOverrides(),
     ...bandOverrides(bands),
