@@ -603,12 +603,13 @@ The list is the engine's catalogue, `rust/mumdia/crates/mumdia-core/src/modifica
 embedded in both the engine's mass table and this application (`modifications`
 command), so every name offered is one the engine accepts and a new entry appears in
 both at once. Each residue chip cycles variable, fixed, not searched; the quick sets come
-from the same file; a filter narrows the list by name, residue, group or accession. Two
+from the same file; a filter narrows the list by name, label, residue, group or accession.
+An entry may carry a plain-language `label`, shown under its name, for a UniMod name that
+does not say what it is: typing "homocysteine" finds `HCysThiolactone` (UniMod 1270,
+N-homocysteinylation of K) and `HCysteinyl` (UniMod 1271, S-homocysteinylation of C). Two
 fixed modifications on one residue, or a fixed and a variable one, are reported as the
 selection is made and refused at Start, because the peptidoform stage would refuse them
-mid-run. A DIA-NN build carries only carbamidomethyl on C and oxidation on M, which are
-what `BuildRequest` and the importer support, so any other selected modification with
-DIA-NN chosen is refused with the reason rather than dropped. The selection is
+mid-run. A DIA-NN build carries the whole selection (see below). The selection is
 remembered between sessions in browser storage, as a convenience only.
 
 Validated 2026-10-05: the Search screen driven in headless Edge with a mocked command

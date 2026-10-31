@@ -299,14 +299,16 @@ tolerance edge. Index probing must use `within_ppm`; do not substitute a
 `ppm_bounds` window there.
 
 **UniMod catalogue** (`crates/mumdia-core/src/modifications.json`, read by
-`mass::unimod_mass`): 34 residue modifications by UniMod PSI-MS name, accession and
+`mass::unimod_mass`): 36 residue modifications by UniMod PSI-MS name, accession and
 monoisotopic delta, among them `Carbamidomethyl` 57.021463735, `Oxidation` 15.994914620,
 `Acetyl` 42.010564684, `Phospho` 79.966331090, `Deamidated` 0.984016106, `Methyl`
 14.015650064, `Dimethyl` 28.031300128, `Carbamyl` 43.005813726 and the cysteine prenylation
 deltas `Farnesyl` 204.1878011, `GeranylGeranyl` 272.2504012, `Hydroxyfarnesyl` 220.1827157
 (the eleven names of the earlier table, at unchanged values), plus alkylation alternatives,
 oxidation products, acylations, methylations, `GlyGly`, `HexNAc`, `Hex`, `Sulfo`,
-`Palmitoyl` and `Biotin`. A unit test recomputes every delta from its elemental
+`Palmitoyl`, `Biotin` and homocysteinylation (`HCysThiolactone` 117.024835 on K,
+`HCysteinyl` 133.019749 on C). An entry may carry an optional plain-language `label`,
+which the desktop Search tab shows and matches in its filter; the engine ignores it. A unit test recomputes every delta from its elemental
 composition. The desktop Search tab lists the same file. Terminal modifications are not
 implemented. An unknown name is `MassError::UnknownModification`, never a silent zero.
 
