@@ -2318,6 +2318,40 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .collect();
     let split_written = split_by_source(&scored_for_quant, &split_paths)?;
 
+    // --- modification site localisation, per run (`localise.enabled`, experimental) ---
+    // Reporting only: each run's split scored table against its own spectra, after the final
+    // rescore. The apex 1/K0 comes from the extracted rows the scored rows came from: the
+    // second pass's when it ran.
+    let localisation: Vec<String> = if cfg.localise.enabled {
+        let mut out = Vec::with_capacity(n_runs);
+        for i in 0..n_runs {
+            let run_dir = d(&names[i]);
+            let table = format!("{run_dir}/localisation.parquet");
+            let extracted = match &second {
+                Some(sp) => sp.psms_extracted.get(i).cloned(),
+                None => Some(format!("{run_dir}/psms_extracted.parquet")),
+            };
+            let mass_cal = crate::masscal::json_path(&format!("{run_dir}/seed_psms.parquet"));
+            info!(stage = %"localise", run = %names[i], "run-experiment: stage start");
+            crate::stages::localise::run(crate::stages::localise::LocaliseParams {
+                scored: &split_paths[i],
+                spectra_ms2: &format!("{run_dir}/spectra/spectra_ms2.parquet"),
+                mass_cal: Some(&mass_cal),
+                psms_extracted: extracted.as_deref(),
+                source: Some(i as u32),
+                out: &table,
+                cfg: &cfg.localise,
+                variable_mods: &cfg.peptidoforms.variable_mods,
+                fallback_tol_ppm: cfg.extract.frag_tol_ppm,
+                config_hash: &ch,
+            })?;
+            out.push(table);
+        }
+        out
+    } else {
+        Vec::new()
+    };
+
     let mut qcfg = cfg.quant.clone();
     // Per-run quant gates on the pooled `q_value`, not on whatever `quant.q_filter` says. The
     // grouped q columns (peptide_q_value / precursor_q / pg_q_value) are assigned only to the
@@ -2493,15 +2527,24 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // in the split tables.
     let pep_tsv = d("peptides.tsv");
     let prot_tsv = d("proteins.tsv");
-    let (n_rep_pep, n_rep_prot) = report::run_experiment(report::ExperimentReportParams {
-        scored: &scored_for_quant,
-        run_names: &names,
-        peptide_quants: &peptide_quants,
-        protein_lfq: Some(&lfq),
-        out_peptides: &pep_tsv,
-        out_proteins: &prot_tsv,
-        q_threshold: cfg.quant.q_threshold,
-    })?;
+    let sites_tsv = d("sites.tsv");
+    let loc = (!localisation.is_empty()).then(|| report::Localisation {
+        tables: &localisation,
+        fasta: p.fasta,
+        out_sites: &sites_tsv,
+    });
+    let (n_rep_pep, n_rep_prot) = report::run_experiment_localised(
+        report::ExperimentReportParams {
+            scored: &scored_for_quant,
+            run_names: &names,
+            peptide_quants: &peptide_quants,
+            protein_lfq: Some(&lfq),
+            out_peptides: &pep_tsv,
+            out_proteins: &prot_tsv,
+            q_threshold: cfg.quant.q_threshold,
+        },
+        loc.as_ref(),
+    )?;
 
     // Runs without a retention-time calibration, per pass: each run's own seed (the first
     // pass) and, when it ran, the second pass on the consensus library.
@@ -2573,6 +2616,12 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 "candidates": ids.iter().map(|s| s.len()).collect::<Vec<_>>(),
             }),
         );
+    }
+    // The per-run localisation tables, only when the stage ran, so every other manifest keeps
+    // its bytes; `mumdia report --experiment-dir` reads them from here.
+    if let (false, Some(m)) = (localisation.is_empty(), manifest.as_object_mut()) {
+        m.insert("localisation".to_string(), json!(localisation));
+        m.insert("sites".to_string(), json!(sites_tsv));
     }
     // The cross-run normalisation, only when it ran, so every other manifest keeps its bytes.
     if let (Some((tables, shifts, _)), Some(m)) = (&normalised, manifest.as_object_mut()) {

@@ -117,6 +117,12 @@ pub mod artifact {
     /// `candidate_id`), written by a grouped run under `groups.pool_chromatograms = false`,
     /// the default.
     pub const OVERLAP_LOSERS: (&str, u32) = ("overlap_losers", 1);
+    /// The `localise` stage's per-run table (`localisation.parquet`): one row per scored row
+    /// that carries a localised modification, with its isomer group and peak, the posterior
+    /// over the placements, the site probabilities, the false localisation rates and the
+    /// picked target-decoy `isomer_group_q` (docs/36_ptm_localisation.md). Written only when
+    /// the stage runs.
+    pub const LOCALISATION: (&str, u32) = ("localisation", 1);
 
     /// The `spectra_ms1` schema a conversion writes: [`SPECTRA_MS1_V2`] when the source
     /// carries ion mobility, else [`SPECTRA_MS1`].

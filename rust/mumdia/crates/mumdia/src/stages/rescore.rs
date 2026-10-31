@@ -194,7 +194,7 @@ impl FlatStr {
 
 /// Which empirical null the q-values are computed against.
 #[derive(Clone, Copy, PartialEq)]
-enum QMode {
+pub(crate) enum QMode {
     /// Target-decoy competition (native / mokapot / percolator paths).
     Decoy,
     /// Spike-in entrapment population (the `Entrapment` classifier).
@@ -1953,7 +1953,7 @@ fn dense_group_ids(keys: &[u32]) -> (std::borrow::Cow<'_, [u32]>, usize) {
 /// largest hash table in the stage to reproduce their own input: measured on
 /// out_hye/psms_competed.parquet, 746,772 distinct `base_peptide_id` and 879,018 distinct
 /// (peptidoform, charge) over 879,027 rows, against 69,958 distinct proteins.
-fn grouped_q(
+pub(crate) fn grouped_q(
     keys: &[u32],
     scores: &[f64],
     is_decoy: &[bool],

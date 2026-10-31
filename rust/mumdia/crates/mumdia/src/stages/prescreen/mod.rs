@@ -1282,7 +1282,9 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     if cfg.localization != PrescreenLocalization::Own {
         let keys: Vec<Option<String>> = (0..n)
             .into_par_iter()
-            .map(|i| sibling_key(pform(i), charge[i], label_id[i]))
+            .map(|i| {
+                crate::stages::localise::hypotheses::sibling_key(pform(i), charge[i], label_id[i])
+            })
             .collect();
         let mut best: HashMap<&str, (f64, usize)> = HashMap::new();
         for i in 0..n {
@@ -1627,24 +1629,6 @@ pub(crate) fn quantile_linear(sorted: &[f64], q: f64) -> f64 {
     let lo = pos.floor() as usize;
     let hi = pos.ceil() as usize;
     sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo as f64)
-}
-
-/// Modification siblings: same residues, charge, label and modification composition (the
-/// sorted deltas, terminal ones included), so they differ only in localization.
-fn sibling_key(pf: &str, charge: i32, label: u32) -> Option<String> {
-    let p = parse_peptidoform(pf).ok()?;
-    let mut d: Vec<i64> = p
-        .mods
-        .iter()
-        .chain([&p.n_term_mod, &p.c_term_mod])
-        .filter(|&&x| x != 0.0)
-        .map(|&x| (x * 1e4).round() as i64)
-        .collect();
-    d.sort_unstable();
-    Some(format!(
-        "{}/{charge}/{label}/{d:?}",
-        String::from_utf8_lossy(&p.residues)
-    ))
 }
 
 /// MS1 scans as `(rt, mz ascending, intensity)`, ascending RT.

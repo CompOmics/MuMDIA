@@ -3846,6 +3846,28 @@ impl TableFile {
         Ok(out)
     }
 
+    /// Read a nullable utf8 column; a null cell is `None`.
+    pub fn opt_str(&self, name: &str) -> Result<Vec<Option<String>>> {
+        let mut out = Vec::with_capacity(self.nrows);
+        for b in self.column(name, SCALAR_BATCH_ROWS)? {
+            let col = b?;
+            let a: &StringArray = downcast(col.column(0), name, "utf8")?;
+            out.extend((0..a.len()).map(|k| (!a.is_null(k)).then(|| a.value(k).to_string())));
+        }
+        Ok(out)
+    }
+
+    /// Read a nullable i32 column; a null cell is `None`.
+    pub fn opt_i32(&self, name: &str) -> Result<Vec<Option<i32>>> {
+        let mut out = Vec::with_capacity(self.nrows);
+        for b in self.column(name, SCALAR_BATCH_ROWS)? {
+            let col = b?;
+            let a: &Int32Array = downcast(col.column(0), name, "i32")?;
+            out.extend((0..a.len()).map(|k| (!a.is_null(k)).then(|| a.value(k))));
+        }
+        Ok(out)
+    }
+
     /// Read a nullable f32 column; a null cell is `None`.
     pub fn opt_f32(&self, name: &str) -> Result<Vec<Option<f32>>> {
         let mut out = Vec::with_capacity(self.nrows);

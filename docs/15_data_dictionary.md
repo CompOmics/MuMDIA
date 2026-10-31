@@ -1029,6 +1029,22 @@ the runs where the first pass accepted it:
 | `targets_non_anchor`, `decoys_non_anchor` | integer | the same in the other runs |
 | `decoy_fraction_anchor`, `decoy_fraction_non_anchor` | number or null | decoys over targets of each group; null without targets |
 
+## `localise` (`stages/localise/`, opt-in)
+
+### localisation (schema v1, `localise/mod.rs`, `run`)
+
+Written only under `localise.enabled` or by `mumdia localise`: one row per scored row of one
+run that carries a localised modification, in scored-table order. The column list, the
+status values and the units (`isomer_group_q`, the two false localisation rates) are in
+docs/36_ptm_localisation.md section 5. Nullable columns (`isomer_peak_id`,
+`best_site_peptidoform`, `site_probabilities`, `min_site_prob`, `peptidoform_probability`,
+`own_site_prob`, `delta_loglik`, `site_flr_model`, `site_flr_decoy`) are null on rows that
+were not localised (`status` `not_attempted_q`, `too_many_hypotheses`, `no_spectra`).
+`isomer_group_q` is on the group's winning row and 1.0 on the others, like every grouped q.
+
+When the stage ran, `peptides.tsv` gains `site_probability`, `localised` and
+`best_site_peptidoform`, and `sites.tsv` is written beside it (docs/36 section 5).
+
 ## `audit` (`stages/audit.rs`)
 
 ### candidate_audit.parquet (`audit.rs:180-200`)

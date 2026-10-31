@@ -51,7 +51,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 
 | Section | Struct | Fields | Stage document |
 |---|---|---|---|
-| [(top level)](#top-level) | `Config` | 18 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
+| [(top level)](#top-level) | `Config` | 19 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
 | [`convert`](#convert) | `ConvertConfig` | 14 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
 | [`prescreen`](#prescreen) | `PrescreenConfig` | 31 |  |
@@ -74,6 +74,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`experiment`](#experiment) | `ExperimentConfig` | 3 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
 | [`groups`](#groups) | `GroupsConfig` | 9 |  |
 | [`retrace`](#retrace) | `RetraceConfig` | 5 | [docs/09_extract.md](09_extract.md) |
+| [`localise`](#localise) | `LocaliseConfig` | 11 | [docs/36_ptm_localisation.md](36_ptm_localisation.md) |
 | [`peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]`](#peptidoformsfixed_mods--peptidoformsvariable_mods) | `ResidueMod` | 2 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 
 ## (top level)
@@ -100,6 +101,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | `experiment` | `ExperimentConfig` | the `ExperimentConfig` section's own defaults |  |  |
 | `groups` | `GroupsConfig` | the `GroupsConfig` section's own defaults |  |  |
 | `retrace` | `RetraceConfig` | the `RetraceConfig` section's own defaults |  | Raw-event trace rebuild for diaPASEF runs (`RetraceConfig`). Omitted from the canonical configuration while every key is at its default. |
+| `localise` | `LocaliseConfig` | the `LocaliseConfig` section's own defaults |  | Modification site localisation (`LocaliseConfig`). Omitted from the canonical configuration while every key is at its default. |
 
 ## convert
 
@@ -578,6 +580,26 @@ Chromatogram traces rebuilt from the raw timsTOF events (the `retrace` stage, be
 | `im_half_width` | `f64` | `0.015` |  | Half-width in 1/K0 of the band around the candidate's `apex_im` (`im_pred_cal` when that is null) inside which raw events are summed, for the fragment and the MS1 traces alike. Measured flat from 0.012 to 0.020 on one diaPASEF run. Default 0.015. |
 | `ms1` | `bool` | `true` |  | Also rebuild the MS1 isotope traces (`ms1_mono`, `ms1_iso1`, `ms1_iso2`) and their apex scalars. False copies the centroid MS1 rows and keeps extract's MS1 scalars. Default true; kept as a switch until an engine ablation of the raw MS1 band confirms the prototype's +1.6%. |
 | `apex_features` | `bool` | `false` | benchmark-gated | Write `imc_ref_w` into `psms_extracted`, the agreement of the fragments' raw 1/K0 profiles at the apex, which the ion-mobility feature family then carries as its tenth feature. Needs `enabled` and a `features.im_features` other than `off`. Default false. Benchmark-gated: alone it measured +1.3% peptides, and the added peptides carried about 2.7% FDP. |
+
+## localise
+
+`LocaliseConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/36_ptm_localisation.md](36_ptm_localisation.md).
+
+Site localisation of modifications on the identified peptidoforms (the `localise` stage, docs/36_ptm_localisation.md). Positional isomers (the same residues, charge and modification composition, differing only in where a modification sits) are separate candidates in the search and can all be accepted on one chromatographic peak. The stage groups them, enumerates every placement of each localised modification on its candidate residues, reads the site-determining fragment ions back from the MS2 spectra at the identification apex, and turns their presence into a posterior over the placements and a probability per site. It is reporting only: identifications, q-values and every other artifact are unchanged, and it adds `localisation.parquet`, three columns of `peptides.tsv` and `sites.tsv`. Experimental and opt-in; every key is omitted from the canonical configuration at its default, and the whole section with them, so a configuration that does not set it keeps its config hash.
+
+| Field | Type | Default | Gated | Description |
+|---|---|---|---|---|
+| `enabled` | `bool` | `false` |  | Run the stage inside `run` and `run-experiment` (per run, after the final rescore). Default false. `mumdia localise` runs it on its own whatever this says. |
+| `mods` | `Vec<String>` | `["Phospho"]` |  | The modifications to localise, by catalogue name. A peptidoform carrying none of them is not in the table; one carrying several is localised for the first of this list it carries, the others held where the identification put them. The candidate residues of a modification are the residues `peptidoforms.variable_mods` gives it, or, when the configuration has none for it (an imported library), the residues it is found on in the scored table. Default `["Phospho"]`. |
+| `threshold` | `f64` | `0.75` |  | Site probability at or above which a site counts as localised: every site of the best placement must reach it. Default 0.75. |
+| `decoy_residue` | `String` | `"A"` |  | The decoy residue: placements on it are scored alongside the real ones but never searched, and how often it wins estimates the false localisation rate empirically. One residue letter that is not a candidate residue of a localised modification, or `""` to score no decoy placements. Default `"A"`. |
+| `q_max` | `f64` | `0.01` |  | Rows are localised when their `run_psm_q` is at or below this. The others are in the table, for the isomer-group q, with status `not_attempted_q`. Default 0.01. |
+| `max_hypotheses` | `usize` | `200` |  | Peptides with more placements than this are not localised (status `too_many_hypotheses`). Default 200. |
+| `peak_rt_tol_s` | `f64` | `5.0` |  | Accepted isomers whose apexes lie within this many seconds of a peak's first apex share that peak and one localisation; isomers further apart are separate peaks, each localised on its own. Default 5.0. |
+| `apex_scans` | `usize` | `2` |  | MS2 scans either side of the apex scan the fragment evidence is read from. Default 2. |
+| `im_half_width` | `f64` | `0.05` |  | Half-width in 1/K0 of the band around the apex 1/K0 a fragment peak must fall in, on spectra that carry ion mobility. Ignored on 3D spectra. Default 0.05. |
+| `prior_strength` | `f64` | `64.0` |  | Pseudo-count weight of the run-wide detection and false-presence rates against a peak's own. Default 64: against 8 it localised more peaks at a lower false localisation rate on both validation sets (docs/36_ptm_localisation.md section 7). |
+| `temperature` | `f64` | `1.0` |  | Divisor of the log-likelihoods before the softmax. 1 is the likelihood as fitted; above 1 flattens the posterior. Default 1.0. |
 
 ## peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]
 
@@ -1299,6 +1321,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-24 structs and 324 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 42 enumerations, 1 named profile(s), 102 environment variables read and 20 set.
+25 structs and 336 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 42 enumerations, 1 named profile(s), 102 environment variables read and 20 set.
 
 36 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

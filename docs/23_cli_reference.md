@@ -47,6 +47,7 @@ Commands:
   sub-library      Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires
   extract          Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
   retrace          Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. The configuration's `retrace` section applies, `enabled` aside
+  localise         Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. Reporting only: nothing upstream changes
   features         Compute the minimal feature set -> features.parquet + PIN
   pool             Pool a grouped run's band artifacts into the run-level tables
   compete          Keep the best candidate per competition group -> psms_competed.parquet
@@ -145,6 +146,7 @@ first sentence of the description, with the full text in the section below.
 | [`sub-library`](#sub-library) | yes | Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires |
 | [`extract`](#extract) | yes | Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms |
 | [`retrace`](#retrace) | yes | Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. |
+| [`localise`](#localise) | yes | Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. |
 | [`features`](#features) | yes | Compute the minimal feature set -> features.parquet + PIN |
 | [`pool`](#pool) | no | Pool a grouped run's band artifacts into the run-level tables |
 | [`compete`](#compete) | yes | Keep the best candidate per competition group -> psms_competed.parquet |
@@ -164,8 +166,8 @@ first sentence of the description, with the full text in the section below.
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-24 of the 28 documented subcommands accept `--config`:
- `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `quant-normalise`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
+25 of the 29 documented subcommands accept `--config`:
+ `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `localise`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `quant-normalise`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 4 do not, so every setting they use comes from their own flags:
  `audit`, `inspect`, `pool`, `quant-lfq`.
@@ -468,6 +470,36 @@ Options:
 
       --out-psms <OUT_PSMS>
           Where the patched psms_extracted goes; default: patch --psms-extracted in place
+
+      --config <CONFIG>
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
+
+## localise
+
+```text
+Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. Reporting only: nothing upstream changes
+
+Usage: mumdia localise [OPTIONS] --psms-scored <PSMS_SCORED> --spectra-ms2 <SPECTRA_MS2> --out <OUT>
+
+Options:
+      --psms-scored <PSMS_SCORED>
+          One run's scored table: a run's psms_scored.parquet, or a run's scored.parquet of a run-experiment
+
+      --spectra-ms2 <SPECTRA_MS2>
+          That run's spectra_ms2.parquet
+
+      --mass-cal <MASS_CAL>
+          The run's search-seed masscal.json (fragment mass offset and tolerance)
+
+      --psms-extracted <PSMS_EXTRACTED>
+          The psms_extracted.parquet the scored rows came from: each row's apex 1/K0 on spectra with ion mobility. Without it the 1/K0 is read from the spectra
+
+      --source <SOURCE>
+          Keep only the rows of this source; required when the table holds several runs
+
+      --out <OUT>
 
       --config <CONFIG>
 ```
@@ -874,6 +906,12 @@ Options:
       --peptide-quant <PEPTIDE_QUANT>
 
       --protein-quant <PROTEIN_QUANT>
+
+      --localisation <LOCALISATION>
+          A `localise` table of the run: adds the localisation columns to peptides.tsv and writes sites.tsv. In experiment mode the tables the manifest names are used
+
+      --fasta <FASTA>
+          A FASTA to number the sites of sites.tsv on their proteins
 
       --q <Q>
           Reported q threshold. Defaults to `quant.q_threshold` from `--config` when that is given, otherwise 0.01. An explicit value always wins
