@@ -4351,9 +4351,9 @@
       "rust_type": "f64",
       "kind": "float",
       "optional": false,
-      "default": 8.0,
-      "default_text": "8.0",
-      "help": "Pseudo-count weight of the run-wide detection and false-presence rates against a peak's own. Default 8.",
+      "default": 64.0,
+      "default_text": "64.0",
+      "help": "Pseudo-count weight of the run-wide detection and false-presence rates against a peak's own. Default 64: against 8 it localised more peaks at a lower false localisation rate on both validation sets (docs/36_ptm_localisation.md section 7).",
       "gates": [],
       "source_struct": "LocaliseConfig"
     },

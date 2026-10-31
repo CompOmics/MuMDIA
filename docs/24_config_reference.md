@@ -598,7 +598,7 @@ Site localisation of modifications on the identified peptidoforms (the `localise
 | `peak_rt_tol_s` | `f64` | `5.0` |  | Accepted isomers whose apexes lie within this many seconds of a peak's first apex share that peak and one localisation; isomers further apart are separate peaks, each localised on its own. Default 5.0. |
 | `apex_scans` | `usize` | `2` |  | MS2 scans either side of the apex scan the fragment evidence is read from. Default 2. |
 | `im_half_width` | `f64` | `0.05` |  | Half-width in 1/K0 of the band around the apex 1/K0 a fragment peak must fall in, on spectra that carry ion mobility. Ignored on 3D spectra. Default 0.05. |
-| `prior_strength` | `f64` | `8.0` |  | Pseudo-count weight of the run-wide detection and false-presence rates against a peak's own. Default 8. |
+| `prior_strength` | `f64` | `64.0` |  | Pseudo-count weight of the run-wide detection and false-presence rates against a peak's own. Default 64: against 8 it localised more peaks at a lower false localisation rate on both validation sets (docs/36_ptm_localisation.md section 7). |
 | `temperature` | `f64` | `1.0` |  | Divisor of the log-likelihoods before the softmax. 1 is the likelihood as fitted; above 1 flattens the posterior. Default 1.0. |
 
 ## peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]

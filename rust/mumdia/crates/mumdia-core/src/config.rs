@@ -4024,7 +4024,8 @@ pub struct LocaliseConfig {
     #[serde(skip_serializing_if = "is_default_localise_im_half_width")]
     pub im_half_width: f64,
     /// Pseudo-count weight of the run-wide detection and false-presence rates against a
-    /// peak's own. Default 8.
+    /// peak's own. Default 64: against 8 it localised more peaks at a lower false localisation rate on
+    /// both validation sets (docs/36_ptm_localisation.md section 7).
     #[serde(skip_serializing_if = "is_default_localise_prior_strength")]
     pub prior_strength: f64,
     /// Divisor of the log-likelihoods before the softmax. 1 is the likelihood as fitted;
@@ -4044,7 +4045,7 @@ impl Default for LocaliseConfig {
             peak_rt_tol_s: 5.0,
             apex_scans: 2,
             im_half_width: 0.05,
-            prior_strength: 8.0,
+            prior_strength: 64.0,
             temperature: 1.0,
         }
     }

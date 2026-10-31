@@ -143,9 +143,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   `best_site_peptidoform` to `peptides.tsv` and writes `sites.tsv`, numbered on the proteins
   when a FASTA is given (`mumdia report --localisation`, `--fasta`). Reporting only: with the
   stage on or off, identifications, q-values and quantities are the same, and a configuration
-  without the section keeps its config hash. On a twelve-run Arabidopsis phospho diaPASEF
-  experiment 32.4% of the peaks with a choice of site were localised at 0.75, at a false
-  localisation rate of 9.3% by the model and 9.0% by the decoy residue (docs/36_ptm_localisation.md).
+  without the section keeps its config hash. On 166 synthetic phosphopeptides with known sites
+  (Orbitrap DIA) 59.0% of the peaks with a choice of site were localised at 0.75 with 10.0% of
+  them wrong, against a decoy-residue estimate of 10.9%; on a twelve-run Arabidopsis phospho
+  diaPASEF experiment 32.8% were localised at a decoy-residue estimate of 6.7%
+  (docs/36_ptm_localisation.md).
 - **The desktop installer provides the Microsoft Visual C++ x64 runtime that PyTorch
   needs on Windows.** The MSI merges Microsoft's runtime merge module from the build
   runner's Visual Studio, so a fresh installation can load `torch\lib\c10.dll`. It needs

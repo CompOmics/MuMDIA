@@ -839,9 +839,11 @@ PTM counting rule: count modified peptides at the positional-isomer-group level
 the Arabidopsis phospho set 52% of accepted phospho rows were a second or later placement,
 82% of those on the best one's peak. Site probabilities (`localise`, docs/36, experimental and
 opt-in) are reporting only: nothing upstream reads them, and identifications and q-values are
-the same with the stage on or off. A site is localised at `localise.threshold` (0.75, about 9%
-false localisation rate on Arabidopsis by both the model and the decoy residue; 0.9 is about
-3-4%); a peptidoform's site is unvalidated unless the stage localised it.
+the same with the stage on or off. A site is localised at `localise.threshold` (0.75: 10.0% of calls wrong on
+synthetic phosphopeptides with known sites, 6.7% by the decoy residue on Arabidopsis; 0.9:
+5.8% and 2.6%). Read `site_flr_decoy`, which tracked the true rate on the synthetic set;
+`site_flr_model` was 1.5-3x optimistic there. A peptidoform's site is unvalidated unless the
+stage localised it.
 
 Use Parquet quantities for analysis; TSV values are rounded for presentation.
 Cross-run consensus ions, interference-aware ion selection, minimum clean-ion

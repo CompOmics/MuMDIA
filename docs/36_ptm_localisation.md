@@ -65,7 +65,7 @@ consulted.
    probability `d` is the share of the peak's common ions that are present and the
    false-presence probability `f` the share of its impossible variants that are present, each
    shrunk towards the run-wide share (Laplace-smoothed over the target peaks) by
-   `localise.prior_strength` (8) pseudo-counts (`model::Counts::shrunk`). Under a hypothesis a
+   `localise.prior_strength` (64) pseudo-counts (`model::Counts::shrunk`). Under a hypothesis a
    site-determining ion it predicts is present with probability `d` and one it does not predict
    with probability `f`; the log-likelihood is the sum over the site-determining ions. The
    posterior is the softmax of the log-likelihoods divided by `localise.temperature` (1), with a
@@ -195,50 +195,103 @@ things.
   direction-specific false-presence rates were both worse calibrated against the decoy residue.
 - **No temperature.** With the impossible-variant rates the model FLR and the decoy-residue FLR
   agreed at temperature 1 (0.75: 9.5% against 8.7%; 0.9: 3.0% against 3.9%; 0.99: 0.2%
-  against 0.2%), so the default is 1.
+  against 0.2%), so the default is 1. The synthetic set below shows the agreement is
+  acquisition-dependent.
 
 ### Arabidopsis phospho diaPASEF, twelve runs (engine)
 
-The twelve-run time course of the Arabidopsis phospho set 2025-17-03B (timsTOF Pro diaPASEF, FASTA library with
-Phospho STY and Met oxidation, at most two variable modifications, second-pass experiment),
-stage run per run on the final split tables:
+The twelve-run time course of the Arabidopsis phospho set 2025-17-03B (timsTOF Pro diaPASEF,
+FASTA library with Phospho STY and Met oxidation, at most two variable modifications,
+second-pass experiment), stage run per run on the final split tables with the defaults:
 
 | measure | value |
 |---|---|
 | target peaks, summed over runs | 31,862 |
 | with a choice (at least two real placements) | 29,335 |
-| localised at 0.75 | 9,513 (32.4%; 27.9% to 37.2% per run) |
+| localised at 0.75 | 9,613 (32.8%; 27.7% to 37.3% per run) |
 | unambiguous (one real placement) | 2,527 |
-| decoy-residue wins (best on A) | 3,050 |
+| decoy-residue wins (best on A) | 2,879 |
 | candidate to decoy-residue position ratio | 3.72 |
 
 | threshold | localised | model FLR | decoy-residue FLR |
 |---|---|---|---|
-| 0.5 | 15,736 (53.6%) | 20.7% | 18.9% |
-| 0.75 | 9,513 (32.4%) | 9.3% | 9.0% |
-| 0.9 | 5,352 (18.2%) | 3.0% | 3.9% |
-| 0.99 | 2,185 (7.4%) | 0.2% | 0.7% |
+| 0.5 | 16,178 (55.1%) | 21.6% | 17.6% |
+| 0.75 | 9,613 (32.8%) | 10.4% | 6.7% |
+| 0.9 | 4,861 (16.6%) | 3.0% | 2.6% |
+| 0.99 | 1,876 (6.4%) | 0.3% | 0.8% |
 
 - **Cross-run consistency.** Of the pairs of runs in which the same peptide, charge and
-  composition were localised (main peak per run), 93.5% name the same placement at 0.75
-  (29,509 pairs) and 97.3% at 0.9 (16,534 pairs).
+  composition were localised (main peak per run), 94.8% name the same placement at 0.75
+  (30,680 pairs) and 97.8% at 0.9 (16,022 pairs).
 - **Co-eluting isomers.** 45,220 accepted rows sit on peaks with more than one accepted isomer;
-  the posterior of the row's own placement is below 0.25 for 54.5% of them and at or above 0.75
-  for 8.6%.
+  the posterior of the row's own placement is below 0.25 for 53.2% of them and at or above 0.75
+  for 8.3%.
 - **Separated isomers.** 2,625 groups have two or more peaks at one charge in one run; where at
-  least two of the peaks were localised, 267 name a different site on each peak and 137 the same
-  site on each (a peptide eluting twice, or a peak split by the 5 s rule).
+  least two of the peaks were localised, 270 name a different site on each peak and 137 the same
+  site on each. 90% of the same-site pairs have the second apex inside the first one's elution
+  bounds (median apex gap 6.4 s against 49.4 s for different sites): mostly one peak split by the
+  5 s rule.
 - **Isomer groups.** 28,678 target and 268 decoy groups at `isomer_group_q <= 0.01`, summed over
   runs (0.93%).
 
-The decoy-residue estimate rests on the assumption that a wrong call lands on an alanine as
-often as on any other candidate position; it is an estimate, not a ground truth. At 0.75 about
-one localised site in eleven is wrong on this data by both estimates, which is why the
-threshold is a reviewable default and 0.9 (about 3 to 4%) is the conservative choice.
-
 ### Synthetic phosphopeptides with known sites
 
-SYNTHETIC_PLACEHOLDER
+PXD019797 / JPST000859 (Kitata et al., Nat Commun 2021): 166 synthetic phosphopeptides from 61
+human proteins (139 mono-, 21 di- and 6 tri-phosphorylated; 117 sequence and phospho-count
+groups, 30 of them with two to five positional isomers synthesised and pooled), acquired by DIA
+on an Orbitrap Fusion Lumos (10 Th windows, 500 to 1,000 m/z, 160 min gradient). The three
+replicates of the pure pool (`PhosphoPooledSynth_DIA..._1903090{1,2,3}.raw`) were searched as one
+experiment against a FASTA of the 61 proteins (trypsin, two missed cleavages, Phospho STY and Met
+oxidation, at most three variable modifications, charges 2 to 4, AlphaPeptDeep fragments,
+DeepLC retention times, `nn_torch`). A call is correct when its placement is one of the
+synthesised isomers of that sequence and phospho count; isomers of one sequence were pooled, so
+a co-eluting mixture is possible, and the 87 groups with a single synthesised placement are
+also scored on their own.
+
+1,207 target peaks fell on a synthesised sequence and phospho count, 1,165 of them with a
+choice of site (94 sequences). With the defaults:
+
+| threshold | localised | wrong | true FLR | model FLR | decoy-residue FLR |
+|---|---|---|---|---|---|
+| 0.5 | 830 (71.2%) | 125 | 15.1% | 12.0% | 30.2% |
+| 0.75 | 687 (59.0%) | 69 | 10.0% | 6.2% | 10.9% |
+| 0.9 | 479 (41.1%) | 28 | 5.8% | 2.1% | 7.3% |
+| 0.99 | 240 (20.6%) | 3 | 1.3% | 0.2% | 1.8% |
+
+Single-placement groups only (690 peaks, 68 sequences): 0.75 400 localised, true FLR 11.3%
+(model 5.4%, decoy residue 15.7%); 0.9 293, 6.1% (1.7%, 9.4%); 0.99 150, 0.0%. Share correct
+by minimum site probability, all groups: 0.75 to 0.9 80.3% (mean probability 0.84), 0.9 to
+0.99 89.5% (0.96), 0.99 and above 98.8% (1.00).
+
+What this says:
+
+- **The decoy-residue FLR tracks the true FLR**: 10.9% against 10.0% at 0.75, 7.3% against 5.8%
+  at 0.9, 1.8% against 1.3% at 0.99. It is the estimate to read.
+- **The model FLR is overconfident on this data** by a factor of 1.5 to 3 at 0.75 and above, while
+  on the Arabidopsis set it was within a factor of 1.6 of the decoy residue in the other
+  direction. The model's absolute calibration depends on the acquisition; its ranking does not
+  (the share correct rises monotonically with the probability). With 8 pseudo-counts, a temperature of 1.5
+  to 2 brought the model FLR to the true FLR here (1.5: 8.3% model against 9.5% true at 0.75)
+  and made it conservative on Arabidopsis (1.5: 10.6% against a decoy-residue 4.3%), so no
+  single temperature fits both. A per-run fit against the decoy residue would not work on this
+  search: most of its accepted phospho peaks are not synthesised peptides, and over all of them
+  the decoy-residue rate exceeded the model's at every temperature tried (1 to 3). The default
+  stays 1.
+- **Prior strength.** Against 8 pseudo-counts, 64 localised more peaks at a lower error on both
+  sets (synthetic 0.75: 687 at 10.0% true FLR against 642 at 11.7%; 0.9: 479 at 5.8% against 496
+  at 8.7%; Arabidopsis 0.75: 9,613 at a decoy-residue 6.7% against 9,513 at 9.0%, cross-run
+  agreement 94.8% against 93.5%), and 32 to 1,000 were within noise of each other; 64 is the
+  default.
+- **Threshold.** About one call in ten is wrong at 0.75 (synthetic 10.0% true, Arabidopsis 6.7%
+  decoy residue), one in twenty at 0.9. 0.75 stays the reviewable default; 0.9 is the
+  conservative choice.
+
+Only 1,165 of the 3,650 target peaks with a choice in this search are on synthesised peptides:
+the restricted FASTA accepts phospho forms of other peptides of the 61 proteins (synthesis by-
+products, in-source fragments, and false identifications in a search space this small). Their
+decoy-residue wins (48% decoy-residue FLR at 0.75 over all 3,650) are why a run-level temperature
+fit is not safe. The dilutions of the pool into yeast (`PhosphoPooledSynth{4x,20x}dY`) are in
+section 7 of the PR record rather than here until they are complete.
 
 ## 8. Limits and open work
 
