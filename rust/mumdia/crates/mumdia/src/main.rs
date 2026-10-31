@@ -342,6 +342,32 @@ enum Cmd {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Site probabilities of a localised modification on one run's scored rows
+    /// (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. Reporting only:
+    /// nothing upstream changes.
+    Localise {
+        /// One run's scored table: a run's psms_scored.parquet, or a run's scored.parquet
+        /// of a run-experiment.
+        #[arg(long)]
+        psms_scored: String,
+        /// That run's spectra_ms2.parquet.
+        #[arg(long)]
+        spectra_ms2: String,
+        /// The run's search-seed masscal.json (fragment mass offset and tolerance).
+        #[arg(long)]
+        mass_cal: Option<String>,
+        /// The psms_extracted.parquet the scored rows came from: each row's apex 1/K0 on
+        /// spectra with ion mobility. Without it the 1/K0 is read from the spectra.
+        #[arg(long)]
+        psms_extracted: Option<String>,
+        /// Keep only the rows of this source; required when the table holds several runs.
+        #[arg(long)]
+        source: Option<u32>,
+        #[arg(long)]
+        out: String,
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Compute the minimal feature set -> features.parquet + PIN.
     Features {
         #[arg(long)]
@@ -660,6 +686,13 @@ enum Cmd {
         peptide_quant: Option<String>,
         #[arg(long, conflicts_with = "experiment_dir")]
         protein_quant: Option<String>,
+        /// A `localise` table of the run: adds the localisation columns to peptides.tsv and
+        /// writes sites.tsv. In experiment mode the tables the manifest names are used.
+        #[arg(long, conflicts_with = "experiment_dir")]
+        localisation: Option<String>,
+        /// A FASTA to number the sites of sites.tsv on their proteins.
+        #[arg(long)]
+        fasta: Option<String>,
         /// Reported q threshold. Defaults to `quant.q_threshold` from `--config`
         /// when that is given, otherwise 0.01. An explicit value always wins.
         #[arg(long)]
@@ -1716,6 +1749,39 @@ fn real_main() -> Result<()> {
                 ms1_denoise: cfg.convert.tdf_ms1_denoise,
             })?;
         }
+        Cmd::Localise {
+            psms_scored,
+            spectra_ms2,
+            mass_cal,
+            psms_extracted,
+            source,
+            out,
+            config,
+        } => {
+            let cfg = load_config(&config)?;
+            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            let s = stages::localise::run(stages::localise::LocaliseParams {
+                scored: &psms_scored,
+                spectra_ms2: &spectra_ms2,
+                mass_cal: mass_cal.as_deref(),
+                psms_extracted: psms_extracted.as_deref(),
+                source,
+                out: &out,
+                cfg: &cfg.localise,
+                variable_mods: &cfg.peptidoforms.variable_mods,
+                fallback_tol_ppm: cfg.extract.frag_tol_ppm,
+                config_hash: &ch,
+            })?;
+            println!(
+                "MuMDIA localise: {} rows, {} peaks, {} of {} target peaks with a choice \
+                 localised, {} isomer groups at isomer_group_q <= 0.01\n  {out}",
+                s.rows,
+                s.peaks,
+                s.localised_target_peaks,
+                s.ambiguous_target_peaks,
+                s.isomer_groups_at_1pct
+            );
+        }
         Cmd::Features {
             psms_extracted,
             chromatograms,
@@ -2216,6 +2282,8 @@ fn real_main() -> Result<()> {
             out_dir,
             peptide_quant,
             protein_quant,
+            localisation,
+            fasta,
             q,
             config,
         } => {
@@ -2260,12 +2328,28 @@ fn real_main() -> Result<()> {
                     })?
                     .to_string();
                 let lfq = e.get("lfq").and_then(|v| v.as_str()).map(String::from);
+                // The run's localisation tables, when the `localise` stage ran.
+                let loc_tables: Vec<String> = e
+                    .get("localisation")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let out = out_dir.unwrap_or_else(|| exp.clone());
                 std::fs::create_dir_all(&out)?;
                 let pep = format!("{out}/peptides.tsv");
                 let prot = format!("{out}/proteins.tsv");
-                let (n_pep, n_prot) =
-                    stages::report::run_experiment(stages::report::ExperimentReportParams {
+                let sites = format!("{out}/sites.tsv");
+                let loc = (!loc_tables.is_empty()).then(|| stages::report::Localisation {
+                    tables: &loc_tables,
+                    fasta: fasta.as_deref(),
+                    out_sites: &sites,
+                });
+                let (n_pep, n_prot) = stages::report::run_experiment_localised(
+                    stages::report::ExperimentReportParams {
                         scored: &scored,
                         run_names: &runs,
                         peptide_quants: &peptide_quants,
@@ -2273,7 +2357,9 @@ fn real_main() -> Result<()> {
                         out_peptides: &pep,
                         out_proteins: &prot,
                         q_threshold: q,
-                    })?;
+                    },
+                    loc.as_ref(),
+                )?;
                 println!(
                     "MuMDIA: {n_pep} precursors, {n_prot} protein groups at experiment-wide \
                      q <= {q} over {} runs\n  {pep}\n  {prot}",
@@ -2285,14 +2371,24 @@ fn real_main() -> Result<()> {
                 std::fs::create_dir_all(&out_dir)?;
                 let pep = format!("{out_dir}/peptides.tsv");
                 let prot = format!("{out_dir}/proteins.tsv");
-                let (n_pep, n_prot) = stages::report::run(stages::report::ReportParams {
-                    scored: &psms_scored,
-                    peptide_quant: peptide_quant.as_deref(),
-                    protein_quant: protein_quant.as_deref(),
-                    out_peptides: &pep,
-                    out_proteins: &prot,
-                    q_threshold: q,
-                })?;
+                let sites = format!("{out_dir}/sites.tsv");
+                let loc_tables: Vec<String> = localisation.into_iter().collect();
+                let loc = (!loc_tables.is_empty()).then(|| stages::report::Localisation {
+                    tables: &loc_tables,
+                    fasta: fasta.as_deref(),
+                    out_sites: &sites,
+                });
+                let (n_pep, n_prot) = stages::report::run_localised(
+                    stages::report::ReportParams {
+                        scored: &psms_scored,
+                        peptide_quant: peptide_quant.as_deref(),
+                        protein_quant: protein_quant.as_deref(),
+                        out_peptides: &pep,
+                        out_proteins: &prot,
+                        q_threshold: q,
+                    },
+                    loc.as_ref(),
+                )?;
                 println!(
                     "MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {q}\n  {pep}\n  {prot}"
                 );

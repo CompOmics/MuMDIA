@@ -916,6 +916,36 @@ pub fn run(p: RunParams) -> Result<()> {
         })?;
     }
 
+    // Modification site localisation (`localise.enabled`, experimental): reporting only,
+    // read by nothing upstream, so identifications and quantities are the same either way.
+    let localisation = if cfg.localise.enabled {
+        info!(stage = %"localise", "run: stage start");
+        let out = d("localisation.parquet");
+        let mass_cal = crate::masscal::json_path(&seed);
+        let s = crate::stages::localise::run(crate::stages::localise::LocaliseParams {
+            scored: &scored,
+            spectra_ms2: &co.ms2,
+            mass_cal: Some(&mass_cal),
+            psms_extracted: Some(&psms),
+            source: None,
+            out: &out,
+            cfg: &cfg.localise,
+            variable_mods: &cfg.peptidoforms.variable_mods,
+            fallback_tol_ppm: cfg.extract.frag_tol_ppm,
+            config_hash: &ch,
+        })?;
+        man.record(s.written.record(
+            artifact::LOCALISATION.0,
+            artifact::LOCALISATION,
+            &out,
+            "localise",
+            &ch,
+        ));
+        Some(out)
+    } else {
+        None
+    };
+
     let pep_q = d("peptide_quant.parquet");
     let pg_q = d("protein_group_quant.parquet");
     let frag_q = d("fragment_quant.parquet");
@@ -980,14 +1010,24 @@ pub fn run(p: RunParams) -> Result<()> {
     let pep_tsv = d("peptides.tsv");
     let prot_tsv = d("proteins.tsv");
     info!(stage = %"report", "run: stage start");
-    let (n_pep, n_prot) = report::run(report::ReportParams {
-        scored: &scored,
-        peptide_quant: Some(&pep_q),
-        protein_quant: Some(&pg_q),
-        out_peptides: &pep_tsv,
-        out_proteins: &prot_tsv,
-        q_threshold: cfg.quant.q_threshold,
-    })?;
+    let loc_tables: Vec<String> = localisation.iter().cloned().collect();
+    let sites_tsv = d("sites.tsv");
+    let loc = localisation.as_ref().map(|_| report::Localisation {
+        tables: &loc_tables,
+        fasta: p.fasta,
+        out_sites: &sites_tsv,
+    });
+    let (n_pep, n_prot) = report::run_localised(
+        report::ReportParams {
+            scored: &scored,
+            peptide_quant: Some(&pep_q),
+            protein_quant: Some(&pg_q),
+            out_peptides: &pep_tsv,
+            out_proteins: &prot_tsv,
+            q_threshold: cfg.quant.q_threshold,
+        },
+        loc.as_ref(),
+    )?;
     println!(
         "MuMDIA: {n_pep} precursor rows, {n_prot} protein groups at peptide/PG q <= {} (rescorer used: {})\n  {}\n  {}",
         cfg.quant.q_threshold, actual_rescorer, pep_tsv, prot_tsv

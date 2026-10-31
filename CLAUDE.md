@@ -833,6 +833,16 @@ on a modification-rich library, at an unchanged peptide count. It remains
 available as an explicit peptide-level population; never use it for a PTM
 search.
 
+PTM counting rule: count modified peptides at the positional-isomer-group level
+(`isomer_group_q` of `localisation.parquet`, one per group), not per peptidoform. Under
+`peptidoform_charge` every accepted placement of a modified peptide is its own precursor; on
+the Arabidopsis phospho set 52% of accepted phospho rows were a second or later placement,
+82% of those on the best one's peak. Site probabilities (`localise`, docs/36, experimental and
+opt-in) are reporting only: nothing upstream reads them, and identifications and q-values are
+the same with the stage on or off. A site is localised at `localise.threshold` (0.75, about 9%
+false localisation rate on Arabidopsis by both the model and the decoy residue; 0.9 is about
+3-4%); a peptidoform's site is unvalidated unless the stage localised it.
+
 Use Parquet quantities for analysis; TSV values are rounded for presentation.
 Cross-run consensus ions, interference-aware ion selection, minimum clean-ion
 rules, connected-component LFQ diagnostics, and the ratio compression of the

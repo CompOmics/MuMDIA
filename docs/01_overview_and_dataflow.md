@@ -374,12 +374,18 @@ Per-subcommand specifics that are easy to miss:
                                                |
         psms_competed --> rescore --> psms_scored.parquet
                                                |
+        [optional] psms_scored + spectra_ms2 + masscal + psms_extracted
+                        --> localise --> localisation.parquet   (localise.enabled;
+                                         docs/36, reporting only)
+                                               |
         [optional] lib_p + psms_extracted + competed + scored --> audit --> candidate_audit.parquet
                                                |
         psms_scored + chromatograms --> quant --> peptide_quant.parquet,
                                                   protein_group_quant.parquet, fragment_quant.parquet
                                                |
         psms_scored + quant --> report --> peptides.tsv, proteins.tsv
+                                           [+ sites.tsv and three peptides.tsv columns
+                                            when localise ran]
                                                |
                               selected primary Parquets recorded --> manifest.json
 ```

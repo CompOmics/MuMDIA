@@ -3966,6 +3966,129 @@ impl RetraceConfig {
     }
 }
 
+/// Site localisation of modifications on the identified peptidoforms (the `localise` stage,
+/// docs/36_ptm_localisation.md). Positional isomers (the same residues, charge and
+/// modification composition, differing only in where a modification sits) are separate
+/// candidates in the search and can all be accepted on one chromatographic peak. The stage
+/// groups them, enumerates every placement of each localised modification on its candidate
+/// residues, reads the site-determining fragment ions back from the MS2 spectra at the
+/// identification apex, and turns their presence into a posterior over the placements and a
+/// probability per site. It is reporting only: identifications, q-values and every other
+/// artifact are unchanged, and it adds `localisation.parquet`, three columns of
+/// `peptides.tsv` and `sites.tsv`. Experimental and opt-in; every key is omitted from the
+/// canonical configuration at its default, and the whole section with them, so a
+/// configuration that does not set it keeps its config hash.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocaliseConfig {
+    /// Run the stage inside `run` and `run-experiment` (per run, after the final rescore).
+    /// Default false. `mumdia localise` runs it on its own whatever this says.
+    #[serde(skip_serializing_if = "is_false")]
+    pub enabled: bool,
+    /// The modifications to localise, by catalogue name. A peptidoform carrying none of them
+    /// is not in the table; one carrying several is localised for the first of this list it
+    /// carries, the others held where the identification put them. The candidate residues
+    /// of a modification are the residues `peptidoforms.variable_mods` gives it, or, when the
+    /// configuration has none for it (an imported library), the residues it is found on in
+    /// the scored table. Default `["Phospho"]`.
+    #[serde(skip_serializing_if = "is_default_localise_mods")]
+    pub mods: Vec<String>,
+    /// Site probability at or above which a site counts as localised: every site of the best
+    /// placement must reach it. Default 0.75.
+    #[serde(skip_serializing_if = "is_default_localise_threshold")]
+    pub threshold: f64,
+    /// The decoy residue: placements on it are scored alongside the real ones but never
+    /// searched, and how often it wins estimates the false localisation rate empirically.
+    /// One residue letter that is not a candidate residue of a localised modification, or
+    /// `""` to score no decoy placements. Default `"A"`.
+    #[serde(skip_serializing_if = "is_default_localise_decoy_residue")]
+    pub decoy_residue: String,
+    /// Rows are localised when their `run_psm_q` is at or below this. The others are in the
+    /// table, for the isomer-group q, with status `not_attempted_q`. Default 0.01.
+    #[serde(skip_serializing_if = "is_default_localise_q_max")]
+    pub q_max: f64,
+    /// Peptides with more placements than this are not localised (status
+    /// `too_many_hypotheses`). Default 200.
+    #[serde(skip_serializing_if = "is_default_localise_max_hypotheses")]
+    pub max_hypotheses: usize,
+    /// Accepted isomers whose apexes lie within this many seconds of a peak's first apex share
+    /// that peak and one localisation; isomers further apart are separate peaks, each
+    /// localised on its own. Default 5.0.
+    #[serde(skip_serializing_if = "is_default_localise_peak_rt_tol")]
+    pub peak_rt_tol_s: f64,
+    /// MS2 scans either side of the apex scan the fragment evidence is read from. Default 2.
+    #[serde(skip_serializing_if = "is_default_localise_apex_scans")]
+    pub apex_scans: usize,
+    /// Half-width in 1/K0 of the band around the apex 1/K0 a fragment peak must fall in, on
+    /// spectra that carry ion mobility. Ignored on 3D spectra. Default 0.05.
+    #[serde(skip_serializing_if = "is_default_localise_im_half_width")]
+    pub im_half_width: f64,
+    /// Pseudo-count weight of the run-wide detection and false-presence rates against a
+    /// peak's own. Default 8.
+    #[serde(skip_serializing_if = "is_default_localise_prior_strength")]
+    pub prior_strength: f64,
+    /// Divisor of the log-likelihoods before the softmax. 1 is the likelihood as fitted;
+    /// above 1 flattens the posterior. Default 1.0.
+    #[serde(skip_serializing_if = "is_default_localise_temperature")]
+    pub temperature: f64,
+}
+impl Default for LocaliseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mods: vec!["Phospho".to_string()],
+            threshold: 0.75,
+            decoy_residue: "A".to_string(),
+            q_max: 0.01,
+            max_hypotheses: 200,
+            peak_rt_tol_s: 5.0,
+            apex_scans: 2,
+            im_half_width: 0.05,
+            prior_strength: 8.0,
+            temperature: 1.0,
+        }
+    }
+}
+
+fn is_default_localise_mods(v: &Vec<String>) -> bool {
+    *v == LocaliseConfig::default().mods
+}
+fn is_default_localise_threshold(v: &f64) -> bool {
+    *v == LocaliseConfig::default().threshold
+}
+fn is_default_localise_decoy_residue(v: &String) -> bool {
+    *v == LocaliseConfig::default().decoy_residue
+}
+fn is_default_localise_q_max(v: &f64) -> bool {
+    *v == LocaliseConfig::default().q_max
+}
+fn is_default_localise_max_hypotheses(v: &usize) -> bool {
+    *v == LocaliseConfig::default().max_hypotheses
+}
+fn is_default_localise_peak_rt_tol(v: &f64) -> bool {
+    *v == LocaliseConfig::default().peak_rt_tol_s
+}
+fn is_default_localise_apex_scans(v: &usize) -> bool {
+    *v == LocaliseConfig::default().apex_scans
+}
+fn is_default_localise_im_half_width(v: &f64) -> bool {
+    *v == LocaliseConfig::default().im_half_width
+}
+fn is_default_localise_prior_strength(v: &f64) -> bool {
+    *v == LocaliseConfig::default().prior_strength
+}
+fn is_default_localise_temperature(v: &f64) -> bool {
+    *v == LocaliseConfig::default().temperature
+}
+
+impl LocaliseConfig {
+    /// Whether every key is at its default, so the canonical configuration omits the
+    /// section.
+    pub fn is_default(&self) -> bool {
+        *self == LocaliseConfig::default()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -3993,6 +4116,10 @@ pub struct Config {
     /// canonical configuration while every key is at its default.
     #[serde(default, skip_serializing_if = "RetraceConfig::is_default")]
     pub retrace: RetraceConfig,
+    /// Modification site localisation ([`LocaliseConfig`]). Omitted from the canonical
+    /// configuration while every key is at its default.
+    #[serde(default, skip_serializing_if = "LocaliseConfig::is_default")]
+    pub localise: LocaliseConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -4015,6 +4142,7 @@ impl Default for Config {
             experiment: t(),
             groups: t(),
             retrace: t(),
+            localise: t(),
         }
     }
 }
@@ -5019,6 +5147,81 @@ impl Config {
             ));
         }
         self.validate_retrace()?;
+        self.validate_localise()?;
+        Ok(())
+    }
+
+    /// The refusals of the `localise` section (docs/36_ptm_localisation.md).
+    fn validate_localise(&self) -> Result<(), crate::error::ConfigError> {
+        use crate::error::ConfigError::Invalid;
+        let l = &self.localise;
+        if l.mods.is_empty() {
+            return Err(Invalid(
+                "localise.mods must name at least one modification".into(),
+            ));
+        }
+        for m in &l.mods {
+            if crate::mass::unimod_mass(m).is_none() {
+                return Err(Invalid(format!(
+                    "localise.mods: unknown modification '{m}' (use a catalogue name, such \
+                     as \"Phospho\")"
+                )));
+            }
+        }
+        if !(l.threshold > 0.0 && l.threshold <= 1.0) {
+            return Err(Invalid(format!(
+                "localise.threshold must be in (0, 1] (got {})",
+                l.threshold
+            )));
+        }
+        if !(l.q_max > 0.0 && l.q_max <= 1.0) {
+            return Err(Invalid(format!(
+                "localise.q_max must be in (0, 1] (got {})",
+                l.q_max
+            )));
+        }
+        if l.max_hypotheses < 2 {
+            return Err(Invalid(format!(
+                "localise.max_hypotheses must be >= 2 (got {})",
+                l.max_hypotheses
+            )));
+        }
+        for (v, key) in [
+            (l.peak_rt_tol_s, "localise.peak_rt_tol_s"),
+            (l.im_half_width, "localise.im_half_width"),
+            (l.temperature, "localise.temperature"),
+        ] {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(Invalid(format!("{key} must be finite and > 0 (got {v})")));
+            }
+        }
+        if !(l.prior_strength.is_finite() && l.prior_strength >= 0.0) {
+            return Err(Invalid(format!(
+                "localise.prior_strength must be finite and >= 0 (got {})",
+                l.prior_strength
+            )));
+        }
+        let d = l.decoy_residue.as_bytes();
+        if !(d.is_empty()
+            || (d.len() == 1
+                && d[0].is_ascii_uppercase()
+                && crate::constants::is_standard_residue(d[0])))
+        {
+            return Err(Invalid(format!(
+                "localise.decoy_residue must be one standard residue letter or \"\" (got \
+                 '{}')",
+                l.decoy_residue
+            )));
+        }
+        for v in &self.peptidoforms.variable_mods {
+            if l.mods.contains(&v.name) && l.decoy_residue.starts_with(v.residue) {
+                return Err(Invalid(format!(
+                    "localise.decoy_residue '{}' is searched with {} \
+                     (peptidoforms.variable_mods), so it cannot be the decoy residue",
+                    l.decoy_residue, v.name
+                )));
+            }
+        }
         Ok(())
     }
 

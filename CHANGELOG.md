@@ -132,6 +132,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **Modification site localisation, experimental and opt-in (`localise.enabled`).** A new
+  stage after the final rescore, also available as `mumdia localise`, groups the accepted
+  positional isomers of each modified peptide into peaks, scores every placement of the
+  modification on its candidate residues and on a decoy residue (A, never searched) by the
+  presence of site-determining fragment ions read back from the MS2 spectra at the apex, and
+  writes site probabilities, a model-based and a decoy-residue false localisation rate, and
+  `isomer_group_q`, a picked target-decoy q over positional-isomer groups, to
+  `localisation.parquet`. The report adds `site_probability`, `localised` and
+  `best_site_peptidoform` to `peptides.tsv` and writes `sites.tsv`, numbered on the proteins
+  when a FASTA is given (`mumdia report --localisation`, `--fasta`). Reporting only: with the
+  stage on or off, identifications, q-values and quantities are the same, and a configuration
+  without the section keeps its config hash. On a twelve-run Arabidopsis phospho diaPASEF
+  experiment 32.4% of the peaks with a choice of site were localised at 0.75, at a false
+  localisation rate of 9.3% by the model and 9.0% by the decoy residue (docs/36_ptm_localisation.md).
 - **The desktop installer provides the Microsoft Visual C++ x64 runtime that PyTorch
   needs on Windows.** The MSI merges Microsoft's runtime merge module from the build
   runner's Visual Studio, so a fresh installation can load `torch\lib\c10.dll`. It needs

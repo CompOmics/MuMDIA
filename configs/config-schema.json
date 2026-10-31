@@ -24,7 +24,8 @@
     "mbr",
     "experiment",
     "groups",
-    "retrace"
+    "retrace",
+    "localise"
   ],
   "fields": [
     {
@@ -4225,6 +4226,149 @@
         "benchmark-gated"
       ],
       "source_struct": "RetraceConfig"
+    },
+    {
+      "path": "localise.enabled",
+      "name": "enabled",
+      "section": "localise",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Run the stage inside `run` and `run-experiment` (per run, after the final rescore). Default false. `mumdia localise` runs it on its own whatever this says.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.mods",
+      "name": "mods",
+      "section": "localise",
+      "rust_type": "Vec<String>",
+      "kind": "other",
+      "optional": false,
+      "default": "[\"Phospho\"]",
+      "default_text": "[\"Phospho\"]",
+      "help": "The modifications to localise, by catalogue name. A peptidoform carrying none of them is not in the table; one carrying several is localised for the first of this list it carries, the others held where the identification put them. The candidate residues of a modification are the residues `peptidoforms.variable_mods` gives it, or, when the configuration has none for it (an imported library), the residues it is found on in the scored table. Default `[\"Phospho\"]`.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.threshold",
+      "name": "threshold",
+      "section": "localise",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.75,
+      "default_text": "0.75",
+      "help": "Site probability at or above which a site counts as localised: every site of the best placement must reach it. Default 0.75.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.decoy_residue",
+      "name": "decoy_residue",
+      "section": "localise",
+      "rust_type": "String",
+      "kind": "string",
+      "optional": false,
+      "default": "\"A\"",
+      "default_text": "\"A\"",
+      "help": "The decoy residue: placements on it are scored alongside the real ones but never searched, and how often it wins estimates the false localisation rate empirically. One residue letter that is not a candidate residue of a localised modification, or `\"\"` to score no decoy placements. Default `\"A\"`.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.q_max",
+      "name": "q_max",
+      "section": "localise",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.01,
+      "default_text": "0.01",
+      "help": "Rows are localised when their `run_psm_q` is at or below this. The others are in the table, for the isomer-group q, with status `not_attempted_q`. Default 0.01.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.max_hypotheses",
+      "name": "max_hypotheses",
+      "section": "localise",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 200,
+      "default_text": "200",
+      "help": "Peptides with more placements than this are not localised (status `too_many_hypotheses`). Default 200.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.peak_rt_tol_s",
+      "name": "peak_rt_tol_s",
+      "section": "localise",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 5.0,
+      "default_text": "5.0",
+      "help": "Accepted isomers whose apexes lie within this many seconds of a peak's first apex share that peak and one localisation; isomers further apart are separate peaks, each localised on its own. Default 5.0.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.apex_scans",
+      "name": "apex_scans",
+      "section": "localise",
+      "rust_type": "usize",
+      "kind": "integer",
+      "optional": false,
+      "default": 2,
+      "default_text": "2",
+      "help": "MS2 scans either side of the apex scan the fragment evidence is read from. Default 2.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.im_half_width",
+      "name": "im_half_width",
+      "section": "localise",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.05,
+      "default_text": "0.05",
+      "help": "Half-width in 1/K0 of the band around the apex 1/K0 a fragment peak must fall in, on spectra that carry ion mobility. Ignored on 3D spectra. Default 0.05.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.prior_strength",
+      "name": "prior_strength",
+      "section": "localise",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 8.0,
+      "default_text": "8.0",
+      "help": "Pseudo-count weight of the run-wide detection and false-presence rates against a peak's own. Default 8.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.temperature",
+      "name": "temperature",
+      "section": "localise",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 1.0,
+      "default_text": "1.0",
+      "help": "Divisor of the log-likelihoods before the softmax. 1 is the likelihood as fitted; above 1 flattens the posterior. Default 1.0.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
     }
   ],
   "list_sections": [
