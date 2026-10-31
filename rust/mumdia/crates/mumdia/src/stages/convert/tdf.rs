@@ -179,6 +179,14 @@ impl ScanImCalibration {
             ScanImCalibration::Linear(l) => l.convert(scan),
         }
     }
+
+    /// Which calibration this is, for a report.
+    fn name(&self) -> &'static str {
+        match self {
+            ScanImCalibration::Model2 { .. } => "TimsCalibration model 2",
+            ScanImCalibration::Linear(_) => "linear between the acquisition range bounds",
+        }
+    }
 }
 
 /// One centroided spectrum: m/z-sorted peaks with a per-peak 1/K0.
@@ -547,6 +555,11 @@ impl RawTdf {
     /// The 1/K0 of a TIMS scan index, as convert computes it.
     pub(crate) fn im_of_scan(&self, scan: f64) -> f64 {
         self.im.im(scan)
+    }
+
+    /// The scan -> 1/K0 calibration in use, named for a report.
+    pub(crate) fn im_calibration(&self) -> &'static str {
+        self.im.name()
     }
 
     pub(crate) fn open(path: &str) -> Result<Self> {

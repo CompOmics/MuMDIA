@@ -9,6 +9,7 @@ pub mod convert;
 pub mod digest;
 pub mod extract;
 pub mod features;
+pub mod mobilogram;
 pub mod ms1cal;
 pub mod peptidoforms;
 pub mod pool;

@@ -136,6 +136,12 @@ pub fn open(viewers: &Viewers, dir: &str, fasta: Option<&str>) -> Result<String,
     if let Some(f) = fasta.filter(|f| Path::new(f).is_file()) {
         cmd.args(["--fasta", f]);
     }
+    // The engine this application runs, for the raw mobilogram of a diaPASEF run (visDIA
+    // calls `mumdia mobilogram`). Passed as `MUMDIA_BIN` rather than `--engine`, so that a
+    // viewer installed before that option existed still starts.
+    if let Ok((engine, _)) = crate::engine::resolve() {
+        cmd.env("MUMDIA_BIN", engine);
+    }
     // Python buffers a piped stdout, and the address line would then arrive only when
     // the buffer filled, which for a quiet server is never.
     cmd.env("PYTHONUNBUFFERED", "1")

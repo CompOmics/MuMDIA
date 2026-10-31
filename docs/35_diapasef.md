@@ -4,7 +4,8 @@
 This document describes how MuMDIA reads, searches and quantifies diaPASEF data from a Bruker
 timsTOF. Sections 1 to 8 describe the mechanisms, section 9 how to run them, section 10 the
 artifacts that carry 1/K0, sections 11 to 13 what was measured and how the losses were
-diagnosed, and sections 14 and 15 what is open and what is not supported. Every TIMS key
+diagnosed, sections 14 and 15 what is open and what is not supported, section 16 memory
+and speed, and section 17 the mobilogram command. Every TIMS key
 is off by default; `configs/examples/diapasef.json` is the recipe that turns them on. Two
 exceptions act only on spectra with 1/K0: the second extraction gate (section 16) and the
 sizing of the 1/K0 window (section 4), which takes effect through the recipe's 1/K0 gate.
@@ -1335,3 +1336,66 @@ tool's own output (98,524 peptides at 1%, 89,973 ions at k = 3), at about 33 s m
 per run than reading files the tool had cleaned. On the 15 min E. coli run, three NN seeds per
 arm: 14,121 against 14,044 peptides at 1%, and on the entrapment library 13,384 against 13,375
 real peptides at an entrapment FDP of 0.30-0.38% against 0.39-0.46%.
+
+## 17. Mobilograms
+
+No artifact holds a 1/K0 profile: convert keeps one intensity-weighted 1/K0 per centroid,
+extract and retrace one per trace point, and the apex profiles of `retrace.apex_features` are
+scored and dropped. `mumdia mobilogram` reads the profile of a few candidates from the raw
+events of the `.d`. It is read-only and meant for inspection; visDIA calls it for the
+precursor page of a diaPASEF run (`mumdia-viewer --engine`, or `MUMDIA_BIN`, which the
+desktop application sets to its own engine).
+
+```text
+mumdia mobilogram --run-dir <run> --candidate 1468 [1470 ...] [--frames 2] [--bin 0.002]
+                  [--rt <s>] [--peak-rank 0] [--json | --out profiles.parquet]
+```
+
+### What it reads
+
+- Per candidate, the `psms_extracted` row at `--peak-rank` (0, extract's apex, by default):
+  the precursor m/z, `apex_rt`, `apex_im` and `ms1_apex_im`; its chromatogram rows, the
+  fragments with a positive prediction and the MS1 isotope rows, for their m/z; and the 1/K0
+  window and calibrated prediction of `run_windows`. Only the row groups whose
+  `candidate_id` statistics can hold a requested candidate are read.
+- The fragment mass offset and tolerance of the seed's `masscal.json`, as retrace takes
+  them, and `extract.prec_tol_ppm` from the configuration the run recorded (`manifest.json`,
+  or the `experiment_manifest.json` above a run of an experiment), or from `--config`.
+- The `.d` the spectra report names (`params.mzml`, native reader only; a second-pass run
+  directory takes the spectra of its first pass). `--raw` gives the `.d` where it is now, and
+  every other input has an override flag.
+
+### What it computes
+
+- The MS2 frames with a quad slot whose isolation window holds the precursor: the one
+  nearest the apex RT (or `--rt`) and `--frames` such frames either side. The MS1 frames: the
+  nearest MS1 frame and `--frames` either side.
+- Per ion and frame, the raw intensity binned in 1/K0 (`--bin`, default 0.002, about two
+  scans). A fragment counts the events within the fragment tolerance of its offset-corrected
+  m/z in the scans of the slots that hold the precursor, with overlapping slots merged so no
+  event is counted twice; an MS1 isotope the events within `extract.prec_tol_ppm` of its
+  row's m/z in the same 1/K0 range. The bins span the 1/K0 range of those slots and start on
+  a multiple of the bin width.
+- The scan to 1/K0 and m/z to TOF conversions are convert's (`TimsCalibration` model 2 when
+  the `.d` has one), shared with retrace (`tims_frames::scan_mobilities`,
+  `tims_frames::tof_window`). The MS1 events are not passed through the MS1 noise filter.
+
+The JSON on stdout (`format` `mumdia-mobilogram`, `format_version` 1) gives per candidate the
+bin centres, the frames read (reader index, `Frames.Id`, RT, offset from the centre frame)
+and per ion the intensities summed over the frames and per frame; a candidate that cannot be
+profiled is listed under `errors` with the reason. `--out x.parquet` writes a long table, one
+row per candidate, ion, frame and non-zero bin; `--out x.json` writes the JSON.
+
+### Measured
+
+Run r0 of a twelve-run Arabidopsis phospho experiment (MuMDIA 0.9.0, 3.8 GB `.d`): 0.27 s for
+one candidate and 1.7 s for 50, each call opening the `.d`; 2.7 s for one call on a
+7.2 GB HYE `.d`. For 50 accepted targets, the intensity-weighted 1/K0 of the summed fragment
+profile within 0.03 of its maximum lay within 0.01 of `apex_im` for 88% of them (median
+absolute difference 0.0029), and the maximum itself for 76% (median 0.0055).
+`MUMDIA_BENCH_TDF=<run.d> cargo test -p mumdia -- --ignored tdf_real` checks on a real `.d`
+that the binned profile of a slot holds exactly the intensity retrace sums for the same
+window, centred within half a bin of its weighted 1/K0.
+
+No per-run artifact is written. An opt-in artifact for sharing profiles without the `.d`
+(about 200 MB a run) is left for later.
