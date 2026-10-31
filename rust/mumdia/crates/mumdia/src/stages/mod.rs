@@ -9,6 +9,7 @@ pub mod convert;
 pub mod digest;
 pub mod extract;
 pub mod features;
+pub mod library_build;
 pub mod ms1cal;
 pub mod peptidoforms;
 pub mod pool;

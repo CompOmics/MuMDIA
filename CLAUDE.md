@@ -101,7 +101,9 @@ Key semantics:
   the engine binary, and skips digest, peptidoforms and predict-frag
   (`library_cache.rs`). Without it, a FASTA run logs the `--lib-*` command, with the
   `rt_im_train.library_irt` value that keeps its retention-time handling, that would
-  reuse the library it just built.
+  reuse the library it just built. `mumdia build-library` builds (or restores) that library
+  without spectra through the same `stages/library_build.rs` as `run` and
+  `run-experiment`, so a later FASTA search with the same settings hits the cache.
 - Standalone stages can be reused manually because inputs are path-addressable.
 - Both `convert` and `run` default `--top-peaks-ms2` to `0` (uncapped). The cap
   is destructive: `convert.rs:76-79` keeps only the top N peaks per MS2 spectrum

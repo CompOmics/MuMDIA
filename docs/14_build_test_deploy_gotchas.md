@@ -469,7 +469,7 @@ Two caches are on by default since 2026-09-28 (`mumdia::cache`):
 
 | cache | setting | default directory | entry |
 |---|---|---|---|
-| FASTA-built libraries | `predict_frag.library_cache` | `<root>/libraries` | `<24 hex>/` with the two tables, their reports, `entry.json` (docs/06, "Reusing a FASTA-built library") |
+| FASTA-built libraries | `predict_frag.library_cache` | `<root>/libraries` | `<24 hex>/` with the two tables, their reports, `entry.json` (docs/06, "Reusing a FASTA-built library"); `run`, `run-experiment` and `build-library` store and restore through one function, so a library `build-library` stored is the one a FASTA search finds |
 | DeepLC trunk projection | `rt_im_train.deeplc_projection_cache` | `<root>/deeplc_projections` | `<40 hex>/projections.npy` and `meta.json` (docs/13, "Projection cache"; DeepLC 4.5.0 or newer) |
 
 Both settings default to `"auto"`. The root is `MUMDIA_CACHE_DIR` when it is set, and

@@ -375,6 +375,25 @@
           </span>
         </label>
         <div id="builtin-warn" class="banner warn" hidden></div>
+
+        <div class="rule"></div>
+        <div class="card-title">Only the library</div>
+        <div class="grid2">
+          <div class="row">
+            <label for="lib-for">Library for</label>
+            <select id="lib-for">
+              <option value="other">Other instruments</option>
+              <option value="diapasef">timsTOF diaPASEF</option>
+            </select>
+          </div>
+        </div>
+        <p class="hint" id="lib-for-note"></p>
+        <p class="hint">
+          <b>Build library only</b>, below, predicts the library from this FASTA and these
+          settings without searching, and needs no spectra. A later search with the same
+          FASTA and settings finds it and skips the prediction; it can also be searched from
+          the spectral library tab.
+        </p>
       </div>
 
       <div class="mode" id="mode-library" hidden>
@@ -494,6 +513,7 @@
 
     <div class="actions">
       <button class="btn big" id="start">Start search</button>
+      <button class="btn quiet" id="build-library">Build library only</button>
       <span class="hint inline">Runs take from minutes to hours.</span>
     </div>
   </section>
@@ -581,6 +601,19 @@
     <div id="res-degraded" class="banner bad" hidden></div>
 
     <div class="kpis" id="kpis"></div>
+
+    <div class="card" id="res-library-card" hidden>
+      <div class="card-title">Spectral library</div>
+      <div id="lib-summary" class="files"></div>
+      <p class="hint" id="lib-reuse"></p>
+      <div class="row">
+        <button class="btn" id="lib-search">Search with this library</button>
+        <button class="btn quiet" id="lib-copy">Copy to folder…</button>
+        <button class="btn quiet" id="lib-reveal">Reveal</button>
+      </div>
+      <div id="lib-error" class="banner bad" hidden></div>
+      <div id="lib-copied" class="banner ok" hidden></div>
+    </div>
 
     <div class="card" id="res-batch-card" hidden>
       <div class="card-title">Per file</div>

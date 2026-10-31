@@ -62,6 +62,8 @@ fn a_fasta_search_runs_to_completion_and_reports_itself() {
         lib_fragments: None,
         config: None,
         threads: Some(2),
+        build_library: false,
+        ion_mobility: None,
     };
 
     let run = mumdia_console::run::start("e2e".into(), req).expect("the engine should start");
@@ -132,6 +134,8 @@ fn stopping_a_run_kills_it_and_leaves_no_temp_files() {
         lib_fragments: None,
         config: None,
         threads: Some(1),
+        build_library: false,
+        ion_mobility: None,
     };
     let run = mumdia_console::run::start("cancel".into(), req).expect("the engine should start");
 

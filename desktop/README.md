@@ -505,6 +505,37 @@ targets"). `read_results` reads it, and the results screen leads with a red bann
 (`res-degraded`), "SEARCH DEGRADED: N of M runs had no retention-time calibration", with the
 usual causes; a separate-files batch marks each such file in its per-file list.
 
+### Building only the library
+
+"Build library only", beside Start in FASTA mode, predicts the library a search would and
+stops (issue #233). No spectra are needed; before it existed the only way to get a library
+without searching was to start a search on a dummy spectra file and stop it after the
+prediction. Both library sources are covered.
+
+- **DIA-NN** runs `ensureLibrary`, the same build and cache a FASTA search with DIA-NN
+  uses, and shows the result card. The library does not depend on the instrument.
+- **The built-in predictors** run the engine's `build-library` through the ordinary run
+  machinery (`run::Request::build_library`; one engine process, its log, Stop and the
+  results-folder reservation). The configuration is derived exactly as for a search
+  (`builtin_plan`, then `derive_config` with the digest and modification fields), so the
+  engine stores the library in its library cache under the key the later FASTA search
+  computes, and that search skips the prediction. The library is written into the
+  results folder, with the engine's `library.json`.
+
+"Library for" (timsTOF diaPASEF, or other instruments) is the acquisition the library is
+built for. It is set from the selected spectra when there are any, and the user may change
+it. `builtin_plan` takes it as an explicit `diapasef` flag, so with no spectra the plan can
+still choose the diaPASEF recipe, and the engine receives it as `--ion-mobility on|off`,
+the value a search of such spectra passes on its own.
+
+The result card shows the counts, the predictor models, the cache key and the paths, with
+"Search with this library" (the spectral-library tab with the two tables), "Copy to
+folder…" (`copy_library`: the tables, their reports and `library.json`, whose paths it
+rewrites, into an empty folder) and "Reveal". A library-mode search of tables that
+`library.json` describes (`library_info`) sets `rt_im_train.library_irt` to the value it
+names, which handles the retention times as the FASTA search would; the other settings
+are the selected preset's. Converting the library to other formats is not offered.
+
 ## Several files
 
 The Spectra picker takes a list. One file is an ordinary search; several mean one of

@@ -541,14 +541,19 @@ fn derive_config(
 /// none is therefore replaced by the first recipe whose interpreters the engine finds: the
 /// diaPASEF recipe for a timsTOF diaPASEF `.d`, then MS2PIP or AlphaPeptDeep with DeepLC.
 /// Each candidate costs one `mumdia doctor`, so this runs off the interface thread.
+///
+/// `diapasef` says which acquisition the library is for. Unset, it is read from the
+/// selected spectra; a library built without spectra (issue #233) passes the choice the
+/// user made on the Search screen.
 #[tauri::command]
 async fn builtin_plan(
     preset: Option<String>,
     mzml: Vec<String>,
+    diapasef: Option<bool>,
 ) -> Result<predictors::Plan, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let selected = predictors::read_preset(preset.as_deref())?;
-        let diapasef = predictors::any_diapasef(&mzml);
+        let diapasef = diapasef.unwrap_or_else(|| predictors::any_diapasef(&mzml));
         let dir = materialise_presets()?;
         // A preset this application ships (or the engine defaults) may be replaced by a
         // recipe; a settings file the user saved may not, since that would drop the edits.
@@ -658,6 +663,33 @@ fn cancel_run(state: tauri::State<'_, AppState>, id: String) -> Result<(), Strin
         }
         None => Err(format!("no such run: {id}")),
     }
+}
+
+/// The engine's `library.json` beside a precursor table, when it describes that table:
+/// a library `build-library` wrote. `None` for any other table.
+#[tauri::command]
+fn library_info(precursors: String) -> Option<serde_json::Value> {
+    mumdia_console::library::info_for(Path::new(&precursors))
+}
+
+/// Copy a library's tables (with their reports and `library.json`) into a folder the user
+/// chose; returns the copied precursor and fragment tables.
+#[tauri::command]
+async fn copy_library(
+    precursors: String,
+    fragments: String,
+    dest: String,
+) -> Result<(String, String), String> {
+    // A whole-proteome library is gigabytes, so the copy runs off the interface thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        mumdia_console::library::copy_to(
+            Path::new(&precursors),
+            Path::new(&fragments),
+            Path::new(&dest),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Open a folder in the platform file manager.
@@ -862,6 +894,8 @@ fn main() {
             run_state,
             cancel_run,
             reveal,
+            library_info,
+            copy_library,
             presets,
             diann_status,
             diann_set_path,

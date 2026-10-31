@@ -256,6 +256,7 @@ order:
 | `digest` (`main.rs:43`) | `--fasta`, `--config` | `--out` = `peptides.parquet` |
 | `peptidoforms` (`main.rs:52`) | `--peptides`, `--config` | `--out` = `peptidoforms.parquet` |
 | `predict-frag` (`main.rs:61`) | `--peptidoforms`, `--work-dir` (default `sidecar_work`), `--config` | `--out-precursors`, `--out-fragments` (the library pair) |
+| `build-library` | `--fasta`, `--out-dir`, `--config`, `--profile`, `--ion-mobility off\|on` | the library pair of a FASTA search, built or restored from the library cache, with `manifest.json` and `library.json` (docs/06, "Building a library without spectra") |
 | `search-seed` (`main.rs:75`) | `--ms2`, `--lib-precursors`, `--lib-fragments`, `--config` | `--out` = `seed_psms.parquet` (+ `<out>.masscal.json`) |
 | `rt-im-train` (`main.rs:88`) | `--seed-psms`, `--lib-precursors`, `--config` | `--out-windows` = `run_windows.parquet`, `--out-cal` = `cal.json` |
 | `extract` (`main.rs:101`) | `--ms2`, `--lib-precursors`, `--lib-fragments`, `--run-windows`, `--ms1` (opt), `--mass-cal` (opt), `--restrict-candidates` (opt allowlist), `--config` | `--out-psms` = `psms_extracted.parquet`, `--out-chromatograms` = `chromatograms.parquet` (+ `<psms>.peaks.parquet` when `retain_top_peaks>1`) |
@@ -402,7 +403,9 @@ The spectral library is the experiment-level, run-independent artifact pair
   `peptidoforms::run` writes `peptidoforms.parquet` (`run.rs:149`), and
   `predict_frag::run` writes both library Parquet files (`run.rs:166`). The
   returned `(lib_p, lib_f)` paths feed the rest of the chain. This path has zero
-  external runtime dependencies (native predictors).
+  external runtime dependencies (native predictors). The branch is
+  `stages::library_build::build`, shared with `run-experiment` and `build-library`, which
+  also restores the library from `predict_frag.library_cache` (docs/06).
 
 `preflight` (`run.rs:38`) validates the mode before any compute: exactly one of
 the two source configurations must be present, and every required input path must

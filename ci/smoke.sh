@@ -216,6 +216,56 @@ if ls "$work"/cache_root/libraries/*/entry.json > /dev/null 2>&1; then
 fi
 echo "    ok: stored under MUMDIA_CACHE_DIR/libraries, reused (digest skipped), kept over a bound while in use, a named directory used, all byte-identical to the plain run"
 
+# 4a'. `build-library` (issue #233): the plain run's library, built without spectra. It must
+#      be the library `run --fasta` builds, byte for byte, and be stored under the key that
+#      run computes, so a FASTA run after it finds the library and skips the build. The
+#      same build with --ion-mobility on is the same library when nothing predicts 1/K0, and
+#      a prefilter before prediction, whose library depends on spectra, is refused.
+echo "=== smoke: build-library, then a FASTA run that finds the library"
+bl_env=(MUMDIA_CACHE_DIR="$work/buildlib_root")
+env "${bl_env[@]}" "$BIN" build-library --fasta test_data/fixture.fasta \
+    --out-dir "$work/out_buildlib" --config "$cfg" --threads 2 > "$work/buildlib.log" 2>&1 \
+    || { tail -20 "$work/buildlib.log"; echo "build-library failed"; exit 1; }
+for f in fragment_library_precursors.parquet fragment_library_fragments.parquet; do
+    cmp -s "$work/out/$f" "$work/out_buildlib/$f" \
+        || { echo "build-library built a different $f than run --fasta"; exit 1; }
+done
+env "${bl_env[@]}" "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_after_buildlib" --config "$cfg" --threads 2 \
+    > "$work/after_buildlib.log" 2>&1 \
+    || { tail -20 "$work/after_buildlib.log"; echo "the run after build-library failed"; exit 1; }
+grep -q "library cache: reusing the stored library" "$work/after_buildlib.log" \
+    || { echo "a FASTA run after build-library did not find the library it built"; exit 1; }
+for f in peptides.tsv proteins.tsv; do
+    cmp -s "$work/out/$f" "$work/out_after_buildlib/$f" \
+        || { echo "the run on the build-library library changed $f"; exit 1; }
+done
+env "${bl_env[@]}" "$BIN" build-library --fasta test_data/fixture.fasta \
+    --out-dir "$work/out_buildlib_im" --config "$cfg" --ion-mobility on \
+    > "$work/buildlib_im.log" 2>&1 \
+    || { tail -20 "$work/buildlib_im.log"; echo "build-library --ion-mobility on failed"; exit 1; }
+"$PY" - "$work/out_buildlib/library.json" "$work/out_buildlib_im/library.json" \
+    "$work/out_buildlib/manifest.json" <<'PYEOF'
+import json, sys
+built, im, man = (json.load(open(p)) for p in sys.argv[1:4])
+assert built["origin"] == "built" and built["cache"]["stored"], built
+assert built["precursors"]["rows"] > 0 and built["fragments"]["rows"] > 0, built
+assert built["precursors"]["targets"] + built["precursors"]["decoys"] == built["precursors"]["rows"]
+assert built["reuse"]["library_irt"] in ("library", "deeplc"), built["reuse"]
+assert "--lib-precursors" in built["reuse"]["library"], built["reuse"]
+assert im["origin"] == "library-cache" and im["cache"]["key"] == built["cache"]["key"], im
+assert man["artifacts"]["fragment_library_precursors"]["producing_stage"] == "predict-frag", man
+PYEOF
+if env "${bl_env[@]}" "$BIN" build-library --fasta test_data/fixture.fasta \
+    --out-dir "$work/out_buildlib_prescreen" --config "$work/prescreen.json" \
+    > "$work/buildlib_prescreen.log" 2>&1; then
+    echo "build-library built a library with a prefilter before prediction"; exit 1
+fi
+grep -q "prescreen.tag_prefilter filters the peptidoforms on a run's spectra" \
+    "$work/buildlib_prescreen.log" \
+    || { tail -5 "$work/buildlib_prescreen.log"; echo "the prefilter refusal does not name it"; exit 1; }
+echo "    ok: build-library wrote the run's library byte for byte, a FASTA run found it, --ion-mobility on kept the key, a prefilter was refused"
+
 # 4b. A malformed retention time must not abort the run.
 #
 #     Regression test for a reproduced crash: one `NaN` scan start time in one scan of
