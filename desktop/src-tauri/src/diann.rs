@@ -2612,6 +2612,26 @@ PEPTIDEK
             library_cache_dir(&r, "DIA-NN 2.0").unwrap(),
             library_cache_dir(&base, "DIA-NN 2.0").unwrap()
         );
+        // Homocysteinylation of K (issue #234) is passed by accession and mass like any
+        // other catalogue entry, and the importer is told to keep its accession.
+        let mut hcy = base.clone();
+        hcy.fixed_mods = vec![site("Carbamidomethyl", 'C')];
+        hcy.variable_mods = vec![site("HCysThiolactone", 'K'), site("Oxidation", 'M')];
+        let hplan = ModPlan::of(&hcy).unwrap();
+        assert!(!hplan.is_legacy());
+        let hargs = predict_args(&hcy, &hplan, Path::new("out/lib")).unwrap();
+        let hvar: Vec<&String> = hargs
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--var-mod")
+            .map(|(i, _)| &hargs[i + 1])
+            .collect();
+        assert_eq!(
+            hvar,
+            vec!["UniMod:1270,117.024835,K", "UniMod:35,15.994915,M"]
+        );
+        assert!(!hargs.iter().any(|a| a == "--no-cut-after-mod"));
+        assert_eq!(hplan.unimod_ids(), vec![4, 35, 1270]);
         // A name outside the catalogue is refused before DIA-NN runs.
         let mut bad = base.clone();
         bad.variable_mods = vec![site("NotAModification", 'K')];
