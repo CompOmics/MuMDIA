@@ -463,6 +463,60 @@ under `--out-dir`, except its caches: the image sets `MUMDIA_CACHE_DIR=/cache` a
 Mount a named volume there (`-v mumdia-cache:/cache`) to keep the caches between
 containers; without one they last as long as the container ("The engine's caches" below).
 
+### Where MuMDIA writes
+
+A run writes to five places, and every one of them can be moved without touching the
+configuration, so no configuration hash and no output byte depends on where they are
+(`mumdia::storage`):
+
+| what | default | moved by | if it cannot be written |
+|---|---|---|---|
+| results | `--out-dir` | the flag | `run` / `run-experiment` stop before any stage, naming the directory and the fix |
+| rescore sidecar files (handoff, fold keys, NN memmap) | `<out-dir>/sidecar_work` | `MUMDIA_SIDECAR_DIR` (`rescore --work-dir`) | an explicitly set one stops the run before any stage |
+| caches (libraries, DeepLC projections) | the per-user cache directory (next section) | `--cache-dir`, `MUMDIA_CACHE_DIR` | one prominent warning, and the default caches are off for that run |
+| temporary files of the engine and of every process it starts | the system's (`TMP`/`TEMP`/`TMPDIR`) | `--temp-dir`, `MUMDIA_TEMP_DIR` | an explicitly set one is an error at startup |
+| predictor model downloads (MS2PIP, AlphaPeptDeep) | `~/.ms2pip`, `~/peptdeep` | `MUMDIA_MODEL_DIR` (`<dir>/ms2pip`, `<dir>/peptdeep`) | the predictor's own download error |
+
+A flag wins over its variable, which wins over the default. `--cache-dir` and `--temp-dir`
+are global flags, accepted on either side of the subcommand. Every one of these paths is
+made absolute against the working directory once, at startup, before any thread exists,
+so the engine and the workers it starts in other directories agree on one place: a
+relative `MUMDIA_CACHE_DIR` used to resolve against whatever directory each process ran
+in. The temporary directory is created if needed and becomes `TMP`, `TEMP` and `TMPDIR`
+for the engine and every child (Rust's `std::env::temp_dir` and Python's `tempfile` both
+read them), and `MPLCONFIGDIR` goes under it unless it is set. The Docker image sets
+`MUMDIA_MODEL_DIR=/cache/models`, because the uid a container runs as has no writable home.
+
+"Writable" means that a file can be created in the directory and renamed there
+(`storage::probe_writable`): the caches publish an entry by renaming it into place, and a
+cloud-synced folder or a network share can take the write and refuse the rename. The
+results folder and an explicit sidecar directory are probed at the start of `run` and
+`run-experiment` (`storage::prepare_output`); before that, `create_dir_all(..).ok()`
+discarded the error and an unwritable results folder surfaced minutes later as a stage
+failure naming one artifact. The cache root is probed there too when the configuration
+uses a default (`"auto"`) cache, and an unwritable one switches the default caches off for
+the process (`cache::disable_default_root`) with one warning rather than failing: a run
+without its cache builds what it would have reused, and the output is byte-identical
+(asserted by `ci/smoke.sh` with a read-only root). A location inside OneDrive or on a
+network share gets a warning, never a refusal.
+
+`mumdia doctor` has a `storage` section (`--json`: `storage.ok` and `storage.locations[]`,
+each with `role`, `status`, `source`, `dir` and `detail`; `dir` holds `path`, `exists`,
+`writable`, `error`, `free_bytes`, `notes`). It checks every location without creating
+anything, probing the nearest existing ancestor of a directory that does not exist yet;
+`doctor --out-dir DIR` adds the results folder. An unwritable results folder, sidecar
+directory or explicit temporary directory fails the report, an unwritable cache root is a
+warning. The desktop application exports these locations from its Storage folder setting
+(`desktop/README.md`, "Storage folder").
+
+`storage::free_space` is the engine's one free-space function: the library cache's store,
+the rescore sidecar space check (which used to ask the sidecar's interpreter) and `doctor`
+all ask it. The standard library has no free-space call and the workspace forbids `unsafe`,
+so it asks the platform's tool: `df -Pk` on Unix and macOS, and Windows PowerShell on
+Windows, .NET `DriveInfo` for a drive letter and the Scripting runtime's `GetDrive` for a
+`\\server\share` path, which `DriveInfo` refuses. When neither answers, every caller goes
+ahead as it would without the check.
+
 ### The engine's caches
 
 Two caches are on by default since 2026-09-28 (`mumdia::cache`):
@@ -472,8 +526,9 @@ Two caches are on by default since 2026-09-28 (`mumdia::cache`):
 | FASTA-built libraries | `predict_frag.library_cache` | `<root>/libraries` | `<24 hex>/` with the two tables, their reports, `entry.json` (docs/06, "Reusing a FASTA-built library") |
 | DeepLC trunk projection | `rt_im_train.deeplc_projection_cache` | `<root>/deeplc_projections` | `<40 hex>/projections.npy` and `meta.json` (docs/13, "Projection cache"; DeepLC 4.5.0 or newer) |
 
-Both settings default to `"auto"`. The root is `MUMDIA_CACHE_DIR` when it is set, and
-otherwise the per-user cache directory: `$XDG_CACHE_HOME/mumdia` (an absolute
+Both settings default to `"auto"`. The root is `--cache-dir` or `MUMDIA_CACHE_DIR` when
+one is set (a relative path made absolute against the working directory), and otherwise
+the per-user cache directory: `$XDG_CACHE_HOME/mumdia` (an absolute
 `XDG_CACHE_HOME` only) or `~/.cache/mumdia` on Linux and other Unix systems,
 `~/Library/Caches/mumdia` on macOS, and `%LOCALAPPDATA%\mumdia\cache` on Windows, inside
 the desktop application's data directory. It is an environment variable, like
@@ -514,11 +569,9 @@ a desktop user can see and free the space without knowing where the directory is
 
 A library store leaves room on the cache's disk: it is skipped, with a warning, when it
 would leave less than 10 GiB free (`MUMDIA_CACHE_MIN_FREE_GB`, `0` for no margin), because
-the rest of the run writes its own tables to disk, often the same one. The standard library has no
-free-space call and the workspace forbids `unsafe`, so `cache::free_space` asks the
-platform's tool (`df -Pk` on Unix and macOS, .NET `DriveInfo` through PowerShell on
-Windows); when neither answers (a network share), the store goes ahead as before. The
-projection cache has its own check in the worker (the projection plus 1 GB), made before the
+the rest of the run writes its own tables to disk, often the same one. The free space comes
+from `storage::free_space` (previous section); when it cannot be determined, the store goes
+ahead as before. The projection cache has its own check in the worker (the projection plus 1 GB), made before the
 file exists because a memory-mapped write that runs out of disk kills the process.
 
 The two conda envs both pin `python=3.11` on purpose: mokapot and MS2PIP pull

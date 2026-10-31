@@ -60,6 +60,23 @@ struct Cli {
     /// Warnings and errors only. Overridden by --log-level.
     #[arg(short = 'q', long, global = true, conflicts_with = "verbose")]
     quiet: bool,
+
+    /// Root of the engine's caches (FASTA-built libraries, DeepLC projections), or `off`.
+    ///
+    /// Wins over `MUMDIA_CACHE_DIR`, which wins over the per-user cache directory. A
+    /// relative path is resolved against the working directory. A root that cannot be
+    /// written switches the default caches off for the run with one warning
+    /// (docs/14_build_test_deploy_gotchas.md, "Where MuMDIA writes").
+    #[arg(long, global = true, value_name = "DIR")]
+    cache_dir: Option<String>,
+
+    /// Temporary directory of the engine and of every process it starts.
+    ///
+    /// Wins over `MUMDIA_TEMP_DIR`. It becomes `TMP`, `TEMP` and `TMPDIR` for the engine
+    /// and its Python workers, and `MPLCONFIGDIR` goes under it unless set. Created if
+    /// needed; one that cannot be written is an error. Default: the system's.
+    #[arg(long, global = true, value_name = "DIR")]
+    temp_dir: Option<String>,
 }
 
 impl Cli {
@@ -712,6 +729,9 @@ enum Cmd {
         /// same as this flag, for a caller that cannot know whether its engine has it.
         #[arg(long)]
         no_import_check: bool,
+        /// Also check that this results folder can be written (nothing is created).
+        #[arg(long)]
+        out_dir: Option<String>,
     },
 }
 
@@ -790,6 +810,11 @@ struct DoctorReport {
     /// The on-disk caches (`mumdia::cache`): where they are, how large, and the bound.
     /// Never a failure: a run without a cache builds what it would have reused.
     caches: mumdia::cache::CachesReport,
+    /// Where a run writes (`mumdia::storage`): the output directory (with `--out-dir`),
+    /// the sidecar, temporary, cache and model directories, each checked for a write and a
+    /// rename without creating anything. A location a run must write to that cannot be
+    /// written fails the report; an unwritable cache root is a warning.
+    storage: mumdia::storage::StorageReport,
 }
 
 /// What `mumdia cache` does.
@@ -924,7 +949,12 @@ fn peak_census(
 /// checked that `sidecar_script_dir` existed (the most common misconfiguration,
 /// and the one baked into the tracked example config), and reported no versions,
 /// so a DeepLC old enough to change results looked identical to a current one.
-fn doctor_report(cfg: &Config, config_path: Option<&str>, import_check: bool) -> DoctorReport {
+fn doctor_report(
+    cfg: &Config,
+    config_path: Option<&str>,
+    import_check: bool,
+    out_dir: Option<&str>,
+) -> DoctorReport {
     use mumdia::python::{self, Role, ALL_ROLES};
 
     // One real import per interpreter and module list: the roles that share an
@@ -1204,14 +1234,16 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>, import_check: bool) ->
         &cfg.convert.msconvert,
     );
 
+    let storage = mumdia::storage::report(out_dir);
     DoctorReport {
-        ok,
+        ok: ok && storage.ok,
         import_check,
         scripts,
         roles,
         thermo,
         msconvert,
         caches: mumdia::cache::report(&cfg),
+        storage,
     }
 }
 
@@ -1334,6 +1366,7 @@ fn print_doctor(rep: &DoctorReport) {
     }
 
     print_caches(&rep.caches);
+    print_storage(&rep.storage);
 
     if rep.ok {
         println!("mumdia doctor: configuration is runnable");
@@ -1382,6 +1415,37 @@ fn print_caches(caches: &mumdia::cache::CachesReport) {
                     v.unwrap_or("null")
                 ),
             },
+        }
+    }
+}
+
+/// The storage section of `doctor`: one line per location, then its notes.
+fn print_storage(storage: &mumdia::storage::StorageReport) {
+    println!("storage");
+    for l in &storage.locations {
+        let tag = match l.status.as_str() {
+            "ok" => " ok ",
+            "fail" => "FAIL",
+            "warn" => "warn",
+            _ => "skip",
+        };
+        match &l.dir {
+            Some(d) => {
+                let free = d
+                    .free_bytes
+                    .map_or(String::new(), |b| format!(", {} free", gib(b)));
+                println!("  [{tag}] {}: {} (from {}){free}", l.role, d.path, l.source);
+                if let Some(e) = &d.error {
+                    println!("         not writable: {e}");
+                }
+                for n in &d.notes {
+                    println!("         {n}");
+                }
+            }
+            None => println!("  [{tag}] {}: {}", l.role, l.source),
+        }
+        if let Some(detail) = &l.detail {
+            println!("         {detail}");
         }
     }
 }
@@ -1459,6 +1523,18 @@ fn real_main() -> Result<()> {
     let _dhat = dhat::Profiler::new_heap();
     let cli = Cli::parse();
     mumdia_io::init_logging_level(cli.log_filter().as_deref());
+    // Before any thread pool exists, because it sets environment variables. `doctor`
+    // reports an unusable temporary directory instead of stopping on it.
+    let storage = mumdia::storage::apply(&mumdia::storage::StorageFlags {
+        cache_dir: cli.cache_dir.clone(),
+        temp_dir: cli.temp_dir.clone(),
+    });
+    if let Err(e) = storage {
+        if !matches!(cli.cmd, Cmd::Doctor { .. }) {
+            return Err(e);
+        }
+        tracing::warn!("{e:#}");
+    }
     apply_threads(cli.threads)?;
     match cli.cmd {
         Cmd::Convert {
@@ -2364,6 +2440,7 @@ fn real_main() -> Result<()> {
             config,
             json,
             no_import_check,
+            out_dir,
         } => {
             // Deliberately the raw loader: doctor must be able to diagnose a
             // configuration whose interpreters do not resolve, so it cannot go
@@ -2371,7 +2448,7 @@ fn real_main() -> Result<()> {
             let cfg = load_config_raw(&config)?;
             let import_check = !no_import_check
                 && std::env::var("MUMDIA_DOCTOR_IMPORT_CHECK").map_or(true, |v| v.trim() != "0");
-            let report = doctor_report(&cfg, config.as_deref(), import_check);
+            let report = doctor_report(&cfg, config.as_deref(), import_check, out_dir.as_deref());
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -2398,6 +2475,13 @@ mod cli_tests {
         assert_eq!(a.threads, Some(8));
         assert_eq!(b.threads, Some(8));
         assert!(matches!(a.cmd, Cmd::Doctor { .. }));
+        // The storage flags are global too.
+        let c = Cli::parse_from(["mumdia", "doctor", "--cache-dir", "c", "--temp-dir", "t"]);
+        let d = Cli::parse_from(["mumdia", "--cache-dir", "c", "--temp-dir", "t", "doctor"]);
+        for x in [c, d] {
+            assert_eq!(x.cache_dir.as_deref(), Some("c"));
+            assert_eq!(x.temp_dir.as_deref(), Some("t"));
+        }
     }
 
     #[test]
@@ -2523,7 +2607,7 @@ mod cli_tests {
     /// beside them.
     #[test]
     fn the_doctor_json_keeps_its_fields_and_adds_the_import_check() {
-        let rep = doctor_report(&Config::default(), None, false);
+        let rep = doctor_report(&Config::default(), None, false, None);
         let v = serde_json::to_value(&rep).unwrap();
         for k in [
             "ok",
@@ -2533,10 +2617,51 @@ mod cli_tests {
             "msconvert",
             "caches",
             "import_check",
+            "storage",
         ] {
             assert!(v.get(k).is_some(), "doctor --json lost `{k}`");
         }
         assert_eq!(v["import_check"], serde_json::json!(false));
+        // The storage section: a verdict and one entry per location, each with the same
+        // fields, the directory's own check when there is a directory.
+        assert!(v["storage"]["ok"].is_boolean());
+        let roles: Vec<&str> = v["storage"]["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["role"].as_str().unwrap())
+            .collect();
+        for r in ["sidecar", "temp", "cache_root", "models"] {
+            assert!(roles.contains(&r), "no storage location `{r}`: {roles:?}");
+        }
+        for l in v["storage"]["locations"].as_array().unwrap() {
+            for k in ["role", "status", "source", "dir", "detail"] {
+                assert!(l.get(k).is_some(), "a storage location lost `{k}`: {l}");
+            }
+            if l["dir"].is_object() {
+                for k in ["path", "exists", "writable", "error", "free_bytes", "notes"] {
+                    assert!(l["dir"].get(k).is_some(), "a storage dir lost `{k}`: {l}");
+                }
+            }
+        }
+        // With --out-dir the output folder is checked too, and an unwritable one fails.
+        let blocked =
+            std::env::temp_dir().join(format!("mumdia_doctor_out_{}", std::process::id()));
+        std::fs::write(&blocked, b"a file, not a folder").unwrap();
+        let below = blocked.join("results");
+        let rep = doctor_report(
+            &Config::default(),
+            None,
+            false,
+            Some(&below.to_string_lossy()),
+        );
+        let _ = std::fs::remove_file(&blocked);
+        assert!(!rep.ok && !rep.storage.ok);
+        assert!(rep
+            .storage
+            .locations
+            .iter()
+            .any(|l| l.role == "output" && l.status == "fail"));
         let role = &v["roles"][0];
         for k in [
             "wanted",
@@ -2618,7 +2743,7 @@ mod cli_tests {
                 .unwrap()
         };
 
-        let checked = doctor_report(&cfg, None, true);
+        let checked = doctor_report(&cfg, None, true, None);
         assert!(!checked.ok);
         let r = rescore(&checked);
         assert_eq!(
@@ -2635,7 +2760,7 @@ mod cli_tests {
             .contains("WinError 1114"));
         assert_eq!(r["hint"], mumdia::python::VC_RUNTIME_HINT);
 
-        let unchecked = doctor_report(&cfg, None, false);
+        let unchecked = doctor_report(&cfg, None, false, None);
         let r = rescore(&unchecked);
         assert_eq!(r["import_checked"], false);
         assert_eq!(r["unloadable"], serde_json::json!([]));

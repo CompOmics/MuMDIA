@@ -1163,7 +1163,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     }
     pre.step("preflight");
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
-    std::fs::create_dir_all(p.out_dir).ok();
+    // The output directory must take a write and a rename before any compute: the
+    // previous `create_dir_all(..).ok()` discarded the error, and an unwritable folder
+    // surfaced minutes later as a stage failure naming one artifact (`storage`).
+    crate::storage::prepare_output(p.out_dir, cfg)?;
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
     let n_runs = p.mzmls.len();
 

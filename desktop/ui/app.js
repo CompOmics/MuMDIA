@@ -204,6 +204,7 @@ async function init() {
         refreshComponents();
         refreshDiann();
         refreshThermo();
+        refreshStorage();
         refreshManaged();
       }
       if (b.dataset.screen === "settings") loadSettings();
@@ -264,7 +265,15 @@ async function init() {
   refreshComponents();
   refreshDiann();
   refreshThermo();
-  // Setup is the first screen, so its managed-data card is filled from the start.
+  // Setup is the first screen, so its storage and managed-data cards are filled from the
+  // start.
+  $("storage-change").addEventListener("click", chooseStorage);
+  $("storage-reset").addEventListener("click", () => setStorage(null));
+  // With a folder chosen, the checkbox applies at once; without one, with the next choice.
+  $("storage-move-envs").addEventListener("change", () => {
+    if (state.storage && state.storage.configured) setStorage(state.storage.folder);
+  });
+  refreshStorage();
   refreshManaged();
   $("stop").addEventListener("click", stop);
   $("another").addEventListener("click", () => screen("input"));
@@ -934,6 +943,73 @@ async function refreshManaged() {
   } catch (e) {
     banner($("managed-error"), String(e));
   }
+}
+
+// -- storage folder ------------------------------------------------------
+// One setting for where MuMDIA writes (desktop/src-tauri/src/storage.rs). The folder
+// picker and the reset change it; the checkbox decides whether the Python environments
+// move too, which means installing them again, so it applies with the next change.
+function renderStorage(s) {
+  state.storage = s;
+  const pill = $("storage-pill");
+  if (!s.writable) {
+    pill.textContent = "cannot be written";
+    pill.className = "pill bad";
+  } else {
+    pill.textContent = s.configured ? "chosen" : "default";
+    pill.className = s.configured ? "pill ok" : "pill mute";
+  }
+  const free = s.free_bytes == null ? "" : ` (${bytesLabel(s.free_bytes)} free)`;
+  $("storage-where").textContent = s.folder + free;
+  $("storage-envs").textContent =
+    s.environments === s.folder
+      ? "The Python environments and downloaded tools are in this folder too."
+      : `Python environments and downloaded tools: ${s.environments}`;
+  $("storage-move-envs").checked = !!s.move_environments;
+  show($("storage-reset"), s.configured);
+  banner($("storage-error"), s.error ? `MuMDIA cannot write here: ${s.error}` : "");
+  banner($("storage-warn"), (s.warnings || []).join("\n"));
+}
+
+async function refreshStorage() {
+  try {
+    renderStorage(await invoke("storage_info"));
+  } catch (e) {
+    banner($("storage-error"), String(e));
+  }
+}
+
+async function setStorage(folder) {
+  const moveEnvironments = $("storage-move-envs").checked;
+  const before = state.storage;
+  if (moveEnvironments && folder && before && !before.move_environments) {
+    const ok = await dialog.ask(
+      "The Python environments and downloaded tools will be looked for in the new " +
+        "folder, so they have to be installed again from this screen. Continue?",
+      { title: "Move the Python environments", kind: "warning" }
+    );
+    if (!ok) {
+      $("storage-move-envs").checked = false;
+      return;
+    }
+  }
+  banner($("storage-error"), "");
+  try {
+    renderStorage(await invoke("storage_set", { folder, moveEnvironments }));
+    // Every other Setup card reads the folders that just moved.
+    refreshComponents();
+    refreshThermo();
+    refreshDiann();
+    refreshManaged();
+  } catch (e) {
+    banner($("storage-error"), String(e));
+  }
+}
+
+async function chooseStorage() {
+  const chosen = await dialog.open({ directory: true, multiple: false });
+  if (!chosen) return;
+  await setStorage(Array.isArray(chosen) ? chosen[0] : chosen);
 }
 
 // -- DIA-NN --------------------------------------------------------------

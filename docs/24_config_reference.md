@@ -1132,7 +1132,7 @@ default trait method, inline modules and nested Rust functions joined with
 function. No line number is cited, so the tables change only when a read
 moves to another function.
 
-13 of these are also SET by the engine before the worker starts, so the worker's own fallback applies only when the engine did not set it: `MUMDIA_NN_FOLDS`, `MUMDIA_NN_FOLD_KEYS`, `MUMDIA_NN_ITERS`, `MUMDIA_NN_MARGIN_FRAC`, `MUMDIA_NN_NEG_RATIO`, `MUMDIA_NN_NEG_SELECT`, `MUMDIA_NN_SEEDS`, `MUMDIA_NN_THREADS`, `MUMDIA_NN_TRAIN_FDR`, `MUMDIA_NN_TRAIN_SUB`, `MUMDIA_NN_WARM_EPOCHS`, `MUMDIA_NN_WARM_START`, `OMP_NUM_THREADS`. See the next table.
+14 of these are also SET by the engine before the worker starts, so the worker's own fallback applies only when the engine did not set it: `MUMDIA_MODEL_DIR`, `MUMDIA_NN_FOLDS`, `MUMDIA_NN_FOLD_KEYS`, `MUMDIA_NN_ITERS`, `MUMDIA_NN_MARGIN_FRAC`, `MUMDIA_NN_NEG_RATIO`, `MUMDIA_NN_NEG_SELECT`, `MUMDIA_NN_SEEDS`, `MUMDIA_NN_THREADS`, `MUMDIA_NN_TRAIN_FDR`, `MUMDIA_NN_TRAIN_SUB`, `MUMDIA_NN_WARM_EPOCHS`, `MUMDIA_NN_WARM_START`, `OMP_NUM_THREADS`. See the next table.
 
 | Variable | Side | Default in code | Read at |
 |---|---|---|---|
@@ -1140,8 +1140,9 @@ moves to another function.
 | `DEEPLC_FT_THREADS` | sidecar | `"8"` | `scripts/deeplc_finetune.py::<module>` |
 | `HOME` | engine | computed: set by the operating system; on Unix and macOS the per-user cache directory under it holds the engine's caches when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 | `LOCALAPPDATA` | engine | computed: set by Windows; `%LOCALAPPDATA%\mumdia\cache` holds the engine's caches when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
+| `MPLCONFIGDIR` | engine | computed: matplotlib's own (`~/.config/matplotlib`); under `--temp-dir` / `MUMDIA_TEMP_DIR` the engine sets it to `<temp>/matplotlib` for its workers unless it is set (`storage.rs` `apply`) | `rust/mumdia/crates/mumdia/src/storage.rs::apply` |
 | `MUMDIA_BREW_ITERS` | sidecar | `"20"` | `scripts/mokapot_worker.py::make_model` |
-| `MUMDIA_CACHE_DIR` | engine | computed: the per-user cache directory: `$XDG_CACHE_HOME/mumdia` or `~/.cache/mumdia` (Linux and other Unix), `~/Library/Caches/mumdia` (macOS), `%LOCALAPPDATA%\mumdia\cache` (Windows). A path moves the `"auto"` caches there; `off` / `0` / `false` / `none` turns them off (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
+| `MUMDIA_CACHE_DIR` | engine | computed: the per-user cache directory: `$XDG_CACHE_HOME/mumdia` or `~/.cache/mumdia` (Linux and other Unix), `~/Library/Caches/mumdia` (macOS), `%LOCALAPPDATA%\mumdia\cache` (Windows). A path moves the `"auto"` caches there (`--cache-dir` wins over it; a relative path is made absolute at startup); `off` / `0` / `false` / `none` turns them off (`cache.rs` `root`, `storage.rs` `apply`) | `rust/mumdia/crates/mumdia/src/cache.rs::root`, `rust/mumdia/crates/mumdia/src/storage.rs::apply` |
 | `MUMDIA_CACHE_MAX_GB` | engine | computed: 100 (GiB): the library and DeepLC projection caches together, least recently used entries removed first, none used within the last hour. `0` or `unlimited` is no bound (`cache.rs` `budget`) | `rust/mumdia/crates/mumdia/src/cache.rs::budget` |
 | `MUMDIA_CACHE_MIN_FREE_GB` | engine | computed: 10 (GiB): the free space a library-cache store must leave on the cache's disk, measured before the copy; `0` is no margin (`library_cache.rs` `min_free_after_store`) | `rust/mumdia/crates/mumdia/src/library_cache.rs::min_free_after_store` |
 | `MUMDIA_CHROM_ROW_GROUP_ROWS` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/chromatograms.rs::row_group_rows` |
@@ -1154,6 +1155,7 @@ moves to another function.
 | `MUMDIA_KEEP_HANDOFF` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::keep_handoff` |
 | `MUMDIA_LR_C` | sidecar | `"1.0"` | `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_LR_MAX_ITER` | sidecar | `"1000"` | `scripts/mokapot_worker.py::make_model` |
+| `MUMDIA_MODEL_DIR` | both | `""` | `rust/mumdia/crates/mumdia/src/storage.rs::apply`, `rust/mumdia/crates/mumdia/src/storage.rs::report`, `scripts/ms2pip_worker.py::model_dir`, +1 more |
 | `MUMDIA_MOKAPOT_WORKERS` | sidecar | `"3"` | `scripts/mokapot_worker.py::main` |
 | `MUMDIA_MSCONVERT` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate_msconvert` |
 | `MUMDIA_NN_ALPHA` | sidecar | `"1e-4"` | `scripts/mokapot_worker.py::make_model` |
@@ -1223,8 +1225,9 @@ moves to another function.
 | `MUMDIA_RESCORE_MODEL` | both | `"nn"` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_hashed`, `scripts/mokapot_worker.py::main`, `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_RTW_FEATURES` | engine | computed: on when unset; `0` leaves the window-scaled RT error family out (`features.rs` `env_families`) | `rust/mumdia/crates/mumdia/src/stages/features.rs::env_families` |
 | `MUMDIA_SCRIPTS` | sidecar | `os.path.dirname(os.path.abspath(__file__` | `scripts/mh_shard_predict.py::<module>` |
-| `MUMDIA_SIDECAR_DIR` | engine | computed: `<out-dir>/sidecar_work` under `run` and `run-experiment`; `sidecar_work` in the current directory, or `--work-dir`, for `mumdia rescore`. A path moves the rescore sidecar files there (`stages/rescore.rs` `sidecar_work_dir`) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::sidecar_work_dir` |
+| `MUMDIA_SIDECAR_DIR` | engine | computed: `<out-dir>/sidecar_work` under `run` and `run-experiment`; `sidecar_work` in the current directory, or `--work-dir`, for `mumdia rescore`. A path moves the rescore sidecar files there (`stages/rescore.rs` `sidecar_work_dir`) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::sidecar_work_dir`, `rust/mumdia/crates/mumdia/src/storage.rs::prepare_output`, `rust/mumdia/crates/mumdia/src/storage.rs::report` |
 | `MUMDIA_SIDECAR_SPACE_CHECK` | engine | computed: on (before the handoff is written, a rescore sidecar run is refused when its work directory has less room than a PIN or raw handoff cannot be smaller than, and warned about below the files' usual size). `0` / `off` / `false` / `no` skips the check (`stages/rescore.rs` `check_sidecar_space`) | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::check_sidecar_space` |
+| `MUMDIA_TEMP_DIR` | engine | computed: the system's temporary directory. A path (or `--temp-dir`, which wins) is created, must take a write and a rename, and becomes `TMP`, `TEMP` and `TMPDIR` of the engine and every worker it starts, with `MPLCONFIGDIR` under it unless set (`storage.rs` `apply`) | `rust/mumdia/crates/mumdia/src/storage.rs::apply`, `rust/mumdia/crates/mumdia/src/storage.rs::report` |
 | `MUMDIA_THERMO_PARSER` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate_parser` |
 | `MUMDIA_WIDE_SCAN` | engine | computed: `plain`: the plain reader with its parallel decode for rescore's feature stream and compete's pass-through copy. `rowgroup` decodes the feature stream one row group a batch; `coalesced` reads each row group's projected column chunks in one sequential read (`stages/mod.rs` `WideScan`) | `rust/mumdia/crates/mumdia/src/stages/mod.rs::WideScan::from_env` |
 | `MUMDIA_WINDOW_FEATURES` | engine | computed: on when unset; `0` leaves the fixed-window feature family out (`features.rs` `env_families`) | `rust/mumdia/crates/mumdia/src/stages/features.rs::env_families` |
@@ -1233,13 +1236,16 @@ moves to another function.
 | `MUMDIA_XGB_LR` | sidecar | `"0.1"` | `scripts/mokapot_worker.py::make_model` |
 | `MUMDIA_XGB_TREES` | sidecar | `"200"` | `scripts/mokapot_worker.py::make_model` |
 | `OMP_NUM_THREADS` | both | `16` | `rust/mumdia/crates/mumdia/src/main.rs::apply_threads`, `scripts/nn_rescore_worker.py::main` |
+| `OneDrive` | engine | computed: set by the OneDrive client on Windows; a results, cache or temporary directory under it gets a location warning, never a refusal (`storage.rs` `location_notes`) | `rust/mumdia/crates/mumdia/src/storage.rs::onedrive_roots` |
+| `OneDriveCommercial` | engine | computed: set by the OneDrive client for a work or school account; as `OneDrive` (`storage.rs` `location_notes`) | `rust/mumdia/crates/mumdia/src/storage.rs::onedrive_roots` |
+| `OneDriveConsumer` | engine | computed: set by the OneDrive client for a personal account; as `OneDrive` (`storage.rs` `location_notes`) | `rust/mumdia/crates/mumdia/src/storage.rs::onedrive_roots` |
 | `PATH` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate` |
 | `ProgramFiles` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate_msconvert` |
 | `ProgramFiles(x86)` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/raw.rs::locate_msconvert` |
 | `VIRTUAL_ENV` | engine | none (unset means off) | `rust/mumdia/crates/mumdia/src/python.rs::candidates` |
 | `XDG_CACHE_HOME` | engine | computed: set by the desktop environment, often unset; an absolute value puts the engine's caches in `$XDG_CACHE_HOME/mumdia` on Linux when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`) | `rust/mumdia/crates/mumdia/src/cache.rs::root` |
 
-102 variables are read: 40 engine-side, 66 sidecar-side, 4 on both sides.
+108 variables are read: 46 engine-side, 67 sidecar-side, 5 on both sides.
 
 ### Variables the code sets
 
@@ -1252,7 +1258,10 @@ one exception noted in its own help text: it sets `MUMDIA_NN_THREADS` and
 |---|---|---|---|
 | `KMP_DUPLICATE_LIB_OK` | sidecar | `"TRUE"` | `scripts/deeplc_finetune.py::<module>` |
 | `MKL_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py::<module>` |
-| `MUMDIA_FREE_SPACE_PATH` | engine | `&probe` | `rust/mumdia/crates/mumdia/src/cache.rs::free_space` |
+| `MPLCONFIGDIR` | engine | `t.join("matplotlib")` | `rust/mumdia/crates/mumdia/src/storage.rs::apply` |
+| `MUMDIA_CACHE_DIR` | engine | `v` | `rust/mumdia/crates/mumdia/src/storage.rs::apply` |
+| `MUMDIA_FREE_SPACE_PATH` | engine | `plain_windows_path(&probe)` | `rust/mumdia/crates/mumdia/src/storage.rs::free_space` |
+| `MUMDIA_MODEL_DIR` | engine | `v` | `rust/mumdia/crates/mumdia/src/storage.rs::apply` |
 | `MUMDIA_NN_FOLDS` | engine | `p.cfg.folds.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
 | `MUMDIA_NN_FOLD_KEYS` | engine | `foldkeys` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
 | `MUMDIA_NN_ITERS` | engine | `p.cfg.num_iter.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
@@ -1265,11 +1274,15 @@ one exception noted in its own help text: it sets `MUMDIA_NN_THREADS` and
 | `MUMDIA_NN_TRAIN_SUB` | engine | `p.cfg.train_subsample.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
 | `MUMDIA_NN_WARM_EPOCHS` | engine | `p.cfg.train_warm_epochs.to_string()` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
 | `MUMDIA_NN_WARM_START` | engine | `if p.cfg.train_warm_epochs > 0 { "1" } else { "0" }` | `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_pin_sidecar` |
+| `MUMDIA_TEMP_DIR` | engine | `t` | `rust/mumdia/crates/mumdia/src/storage.rs::apply` |
 | `NUMEXPR_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py::<module>` |
 | `OMP_NUM_THREADS` | both | `"1"` in deeplc_finetune.py; `n.to_string()` in main.rs | `rust/mumdia/crates/mumdia/src/main.rs::apply_threads`, `scripts/deeplc_finetune.py::<module>` |
 | `OPENBLAS_NUM_THREADS` | sidecar | `"1"` | `scripts/deeplc_finetune.py::<module>` |
 | `PYTHONIOENCODING` | engine | `"utf-8"` | `rust/mumdia/crates/mumdia/src/python.rs::import_probe_command`, `rust/mumdia/crates/mumdia/src/sidecar.rs::run_worker` |
-| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/python.rs::import_probe_command`, `rust/mumdia/crates/mumdia/src/sidecar.rs::run_worker`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs::free_bytes` |
+| `PYTHONUTF8` | engine | `"1"` | `rust/mumdia/crates/mumdia/src/python.rs::import_probe_command`, `rust/mumdia/crates/mumdia/src/sidecar.rs::run_worker`, `rust/mumdia/crates/mumdia/src/stages/rescore.rs::run_entrapment_gbm` |
+| `TEMP` | engine | `t` | `rust/mumdia/crates/mumdia/src/storage.rs::apply` |
+| `TMP` | engine | `t` | `rust/mumdia/crates/mumdia/src/storage.rs::apply` |
+| `TMPDIR` | engine | `t` | `rust/mumdia/crates/mumdia/src/storage.rs::apply` |
 
 ## Unresolved by the generator
 
@@ -1299,6 +1312,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-24 structs and 324 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 42 enumerations, 1 named profile(s), 102 environment variables read and 20 set.
+24 structs and 324 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 42 enumerations, 1 named profile(s), 108 environment variables read and 27 set.
 
 36 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

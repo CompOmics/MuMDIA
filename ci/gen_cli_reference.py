@@ -31,7 +31,7 @@ embedded, and no path is emitted. `clap` is built with only the `derive`
 feature, so it does not wrap help text to the terminal width and the text is
 identical piped or not.
 
-Global flags. The four `global = true` flags are accepted on either side of the
+Global flags. The `global = true` flags are accepted on either side of the
 subcommand, so clap repeats them in every subcommand help text, as it repeats
 `-h, --help`. Reproducing all of that would add roughly 300 lines of noise, so
 this script takes the intersection of the option entries present in EVERY

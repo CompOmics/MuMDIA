@@ -216,6 +216,62 @@ if ls "$work"/cache_root/libraries/*/entry.json > /dev/null 2>&1; then
 fi
 echo "    ok: stored under MUMDIA_CACHE_DIR/libraries, reused (digest skipped), kept over a bound while in use, a named directory used, all byte-identical to the plain run"
 
+# 4s. Where MuMDIA writes (`mumdia::storage`, docs/14 "Where MuMDIA writes"). A cache root
+#     that cannot be written switches the default caches off with one warning, and the run
+#     is byte-identical to the plain one, which ran with MUMDIA_CACHE_DIR=off; `--temp-dir`
+#     moves the temporary files of the engine and its workers without changing a byte; an
+#     output directory that cannot be written stops the run before any stage, naming the
+#     fix; `doctor --json` reports every location.
+echo "=== smoke: storage locations"
+ro="$work/ro_cache"
+mkdir -p "$ro"
+chmod 555 "$ro"
+if ( : > "$ro/.probe" ) 2> /dev/null; then
+    rm -f "$ro/.probe"
+    echo "    skip: a read-only directory is writable here (root, or no POSIX permissions)"
+else
+    MUMDIA_CACHE_DIR="$ro" "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+        --out-dir "$work/out_ro_cache" --config "$cfg" --threads 2 \
+        > "$work/ro_cache.log" 2>&1 || { tail -20 "$work/ro_cache.log"; echo "a read-only cache root failed the run"; exit 1; }
+    grep -q "cache root from MUMDIA_CACHE_DIR is not writable" "$work/ro_cache.log" \
+        || { tail -20 "$work/ro_cache.log"; echo "a read-only cache root was not reported"; exit 1; }
+    for f in peptides.tsv proteins.tsv; do
+        cmp -s "$work/out/$f" "$work/out_ro_cache/$f" \
+            || { echo "a read-only cache root changed $f"; exit 1; }
+    done
+    [ -z "$(ls -A "$ro")" ] || { echo "the read-only cache root was written to"; exit 1; }
+fi
+chmod 755 "$ro"
+"$BIN" --temp-dir "$work/temp_arm" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_temp_dir" --config "$cfg" --threads 2 \
+    > "$work/temp_dir.log" 2>&1 || { tail -20 "$work/temp_dir.log"; echo "--temp-dir failed the run"; exit 1; }
+[ -d "$work/temp_arm" ] || { echo "--temp-dir did not create its directory"; exit 1; }
+for f in peptides.tsv proteins.tsv; do
+    cmp -s "$work/out/$f" "$work/out_temp_dir/$f" \
+        || { echo "--temp-dir changed $f"; exit 1; }
+done
+# Below a file, so no directory can be created there. A path relative to the repository
+# root, which the engine and this shell both resolve the same way; on the Windows runner a
+# `/tmp/...` argument reaches the engine unconverted and names another directory.
+if "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir test_data/fixture.fasta/out --config "$cfg" --threads 2 > "$work/blocked.log" 2>&1; then
+    tail -5 "$work/blocked.log"
+    echo "a run into an unwritable output directory did not fail"; exit 1
+fi
+grep -q "the output directory is not writable" "$work/blocked.log" \
+    || { tail -5 "$work/blocked.log"; echo "an unwritable output directory was not named"; exit 1; }
+"$BIN" doctor --config "$cfg" --json --no-import-check --out-dir "$work/out" > "$work/doctor_storage.json"
+"$PY" - "$work/doctor_storage.json" <<'PYEOF'
+import json, sys
+s = json.load(open(sys.argv[1]))["storage"]
+roles = {l["role"]: l for l in s["locations"]}
+assert s["ok"], s
+for r in ("output", "sidecar", "temp", "cache_root", "models"):
+    assert r in roles, (r, sorted(roles))
+assert roles["output"]["status"] in ("ok", "warn") and roles["output"]["dir"]["writable"], roles["output"]
+PYEOF
+echo "    ok: a read-only cache root and --temp-dir leave the output byte-identical, an unwritable output directory stops the run, doctor reports the locations"
+
 # 4b. A malformed retention time must not abort the run.
 #
 #     Regression test for a reproduced crash: one `NaN` scan start time in one scan of
