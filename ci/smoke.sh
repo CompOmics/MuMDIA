@@ -250,10 +250,11 @@ for f in peptides.tsv proteins.tsv; do
     cmp -s "$work/out/$f" "$work/out_temp_dir/$f" \
         || { echo "--temp-dir changed $f"; exit 1; }
 done
-echo "not a directory" > "$work/blocked"
-if "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
-    --out-dir "$work/blocked/out" --config "$cfg" --threads 2 > "$work/blocked.log" 2>&1; then
-    tail -5 "$work/blocked.log"; ls -la "$work"/blocked*
+# Below a file, so no directory can be created there. A path relative to the repository
+# root, which the engine and this shell both resolve the same way; on the Windows runner a
+# `/tmp/...` argument reaches the engine unconverted and names another directory.
+if "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \n    --out-dir test_data/fixture.fasta/out --config "$cfg" --threads 2 > "$work/blocked.log" 2>&1; then
+    tail -5 "$work/blocked.log"
     echo "a run into an unwritable output directory did not fail"; exit 1
 fi
 grep -q "the output directory is not writable" "$work/blocked.log" \
