@@ -380,6 +380,31 @@ mod tests {
     }
 
     #[test]
+    fn homocysteine_thiolactone_on_lysine_is_a_known_variable_modification() {
+        // Issue #234: N-homocysteinylation (UniMod 1270) offered as a variable K site.
+        let mut cfg = PeptidoformsConfig::default();
+        cfg.variable_mods.push(ResidueMod {
+            residue: 'K',
+            name: "HCysThiolactone".to_string(),
+        });
+        let (_fixed, variable) = validated_rules(&cfg).unwrap();
+        assert_eq!(variable, vec![('M', "Oxidation"), ('K', "HCysThiolactone")]);
+        let sites = vec![(4usize, vec!["HCysThiolactone"])];
+        let forms: Vec<String> = variable_combos(&sites, 1)
+            .iter()
+            .map(|c| proforma("PEPTKIDER", c))
+            .collect();
+        assert_eq!(forms, vec!["PEPTKIDER", "PEPTK[HCysThiolactone]IDER"]);
+        let delta = mumdia_core::mass::parse_peptidoform(&forms[1])
+            .unwrap()
+            .neutral_mass()
+            - mumdia_core::mass::parse_peptidoform(&forms[0])
+                .unwrap()
+                .neutral_mass();
+        assert!((delta - 117.024_835).abs() < 1e-5, "delta = {delta}");
+    }
+
+    #[test]
     fn skip_policy_removes_unknown_modification() {
         let mut cfg = PeptidoformsConfig::default();
         cfg.variable_mods.push(ResidueMod {

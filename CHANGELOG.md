@@ -165,6 +165,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   Search with this library, Copy to folder and Reveal. A library-mode search of a library
   built this way uses the `rt_im_train.library_irt` its `library.json` names.
 
+- **Homocysteinylation in the modification catalogue.** `HCysThiolactone` (UniMod 1270,
+  N-homocysteinylation of K, +117.024835) and `HCysteinyl` (UniMod 1271,
+  S-homocysteinylation of C, +133.019749) can be searched by name, and the Search screen
+  gains the quick set "Homocysteinylation (K)". A catalogue entry may carry an optional
+  plain-language `label`, which the Search screen shows under the name and matches in its
+  filter, so typing "homocysteine" finds both. The carbamidomethylated form of the free
+  thiol, cleavage blocked at a modified lysine and the N-terminal adduct are not modelled.
+
 ### Fixed
 
 - **A Python environment whose torch cannot load is reported before a search, not two
