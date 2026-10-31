@@ -28,3 +28,4 @@ pub mod solve;
 pub mod spectra;
 pub mod stages;
 pub mod stats;
+pub mod storage;

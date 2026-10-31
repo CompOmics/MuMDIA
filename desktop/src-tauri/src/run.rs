@@ -46,24 +46,36 @@ const LOG_TAIL: usize = 4000;
 /// found no training signal) was readable only by reproducing the run.
 pub const RUN_LOG_NAME: &str = "mumdia-console.log";
 
-/// Open the run log for appending and write its header. `None` when the folder cannot
-/// take it, which must not stop the search.
-fn open_run_log(out_dir: &Path, command: &str) -> Option<Arc<Mutex<std::fs::File>>> {
+/// Open the run log for appending and write its header.
+///
+/// An error when the results folder cannot take it. That used to be silent (`None`, and
+/// the search went on), but a folder that refuses a log file refuses the engine's
+/// artifacts too, and the engine then failed minutes in naming one artifact, with no log
+/// left to read. Refusing here says which folder, before anything starts.
+fn open_run_log(out_dir: &Path, command: &str) -> Result<Arc<Mutex<std::fs::File>>, String> {
     use std::io::Write;
+    let path = out_dir.join(RUN_LOG_NAME);
+    let cannot = |e: std::io::Error| {
+        format!(
+            "cannot write the run log {} ({e}). Choose a results folder you can write to.",
+            path.display()
+        )
+    };
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(out_dir.join(RUN_LOG_NAME))
-        .ok()?;
+        .open(&path)
+        .map_err(cannot)?;
     let started = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let _ = writeln!(
+    writeln!(
         f,
         "==== MuMDIA console run, started at unix time {started}\n==== {command}"
-    );
-    Some(Arc::new(Mutex::new(f)))
+    )
+    .map_err(cannot)?;
+    Ok(Arc::new(Mutex::new(f)))
 }
 
 /// The results folders of the runs in flight, by canonical path, each with the id of
@@ -752,7 +764,13 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
         args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
     );
 
-    let run_log = open_run_log(Path::new(&req.out_dir), &display);
+    let run_log = match open_run_log(Path::new(&req.out_dir), &display) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            release_out_dir(&reservation);
+            return Err(e);
+        }
+    };
     let run = new_run(&id, &req, display, Some(reservation));
 
     let mut cmd = engine::command(&exe);

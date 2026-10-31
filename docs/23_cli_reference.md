@@ -22,7 +22,7 @@ Every block below is the binary's own help text, right-stripped and with
 the program name normalized to `mumdia` (a Windows build reports
 `mumdia.exe`). Nothing is paraphrased. Two mechanical edits are applied:
 
-- the 4 flags clap marks `global = true`, and `-h, --help`, are removed
+- the 6 flags clap marks `global = true`, and `-h, --help`, are removed
   from the per-subcommand blocks and documented once under "Global flags"
   below, because clap repeats them in every subcommand;
 - `mumdia help` gets a table row but no section, because
@@ -81,6 +81,16 @@ Options:
   -q, --quiet
           Warnings and errors only. Overridden by --log-level
 
+      --cache-dir <DIR>
+          Root of the engine's caches (FASTA-built libraries, DeepLC projections), or `off`.
+
+          Wins over `MUMDIA_CACHE_DIR`, which wins over the per-user cache directory. A relative path is resolved against the working directory. A root that cannot be written switches the default caches off for the run with one warning (docs/14_build_test_deploy_gotchas.md, "Where MuMDIA writes").
+
+      --temp-dir <DIR>
+          Temporary directory of the engine and of every process it starts.
+
+          Wins over `MUMDIA_TEMP_DIR`. It becomes `TMP`, `TEMP` and `TMPDIR` for the engine and its Python workers, and `MPLCONFIGDIR` goes under it unless set. Created if needed; one that cannot be written is an error. Default: the system's.
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -90,7 +100,7 @@ Options:
 
 ## Global flags
 
-These 4 options are declared `global = true`, so they are accepted on
+These 6 options are declared `global = true`, so they are accepted on
 EITHER side of the subcommand: `mumdia --threads 8 extract ...` and
 `mumdia extract --threads 8 ...` are equivalent and reach the same value.
 They are removed from the per-subcommand blocks below to keep this document
@@ -98,8 +108,10 @@ readable, as is `-h, --help`, which every subcommand also accepts.
 
 | Flag | Purpose |
 |---|---|
+| `--cache-dir <DIR>` | Root of the engine's caches (FASTA-built libraries, DeepLC projections), or `off`. Wins over `MUMDIA_CACHE_DIR`, which wins over the per-user cache directory. A relative path is resolved against the working directory. A root that cannot be written switches the default caches off for the run with one warning (docs/14_build_test_deploy_gotchas.md, "Where MuMDIA writes"). |
 | `--log-level <LEVEL>` | Log level: `error`, `warn`, `info` (default), `debug`, or `trace`. Accepts any `RUST_LOG` filter, so `mumdia=debug,extract=trace` also works |
 | `-q, --quiet` | Warnings and errors only. Overridden by --log-level |
+| `--temp-dir <DIR>` | Temporary directory of the engine and of every process it starts. Wins over `MUMDIA_TEMP_DIR`. It becomes `TMP`, `TEMP` and `TMPDIR` for the engine and its Python workers, and `MPLCONFIGDIR` goes under it unless set. Created if needed; one that cannot be written is an error. Default: the system's. |
 | `--threads <N>` | Worker threads of the engine's thread pools. Default: every core. Sets the engine's rayon pool to N threads and the parquet codec pool to min(N, 8) threads, serial at N = 1 (docs/03_io_layer.md, "Parallel column codec"). The codec pool encodes and decodes artifacts for writer and loader threads that run beside the rayon pool, so up to N + min(N, 8) threads can be busy at once; add `MUMDIA_PARQUET_THREADS=1` to keep the parquet codec serial and the run near N threads. N is also forwarded to the Python sidecars as `MUMDIA_NN_THREADS` and `OMP_NUM_THREADS` unless those are already set. Without this there was no way to bound MuMDIA at all except the undocumented `RAYON_NUM_THREADS`, which the engine never read and which does not reach the sidecars; on a shared machine that made a run antisocial. Note the NN rescore worker measured FASTER on 8 threads than on 32 (docs/13_sidecars.md). |
 | `-v, --verbose...` | More detail: `-v` for debug, `-vv` for trace. Overridden by --log-level |
 | `-h, --help` | Print help (see a summary with '-h') |
@@ -108,11 +120,21 @@ The same text as the binary prints it:
 
 ```text
 Options:
+      --cache-dir <DIR>
+          Root of the engine's caches (FASTA-built libraries, DeepLC projections), or `off`.
+
+          Wins over `MUMDIA_CACHE_DIR`, which wins over the per-user cache directory. A relative path is resolved against the working directory. A root that cannot be written switches the default caches off for the run with one warning (docs/14_build_test_deploy_gotchas.md, "Where MuMDIA writes").
+
       --log-level <LEVEL>
           Log level: `error`, `warn`, `info` (default), `debug`, or `trace`. Accepts any `RUST_LOG` filter, so `mumdia=debug,extract=trace` also works
 
   -q, --quiet
           Warnings and errors only. Overridden by --log-level
+
+      --temp-dir <DIR>
+          Temporary directory of the engine and of every process it starts.
+
+          Wins over `MUMDIA_TEMP_DIR`. It becomes `TMP`, `TEMP` and `TMPDIR` for the engine and its Python workers, and `MPLCONFIGDIR` goes under it unless set. Created if needed; one that cannot be written is an error. Default: the system's.
 
       --threads <N>
           Worker threads of the engine's thread pools. Default: every core.
@@ -204,7 +226,7 @@ Options:
           [default: 0]
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## digest
 
@@ -221,7 +243,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## peptidoforms
 
@@ -238,7 +260,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## predict-frag
 
@@ -262,7 +284,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## prescan
 
@@ -286,7 +308,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## prescreen
 
@@ -331,7 +353,7 @@ Options:
           The database-free tag prefilter only: keep the candidates with an observed trimer in their isolation window (no fragment score; pass no --run-windows for the retention-time-free prefilter)
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## search-seed
 
@@ -352,7 +374,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## rt-im-train
 
@@ -373,7 +395,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## sub-library
 
@@ -400,7 +422,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## extract
 
@@ -437,7 +459,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## retrace
 
@@ -472,7 +494,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## features
 
@@ -496,7 +518,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## pool
 
@@ -518,7 +540,7 @@ Options:
           Also pool `psms_extracted`, which only the candidate audit reads
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## compete
 
@@ -535,7 +557,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## rescore
 
@@ -565,7 +587,7 @@ Options:
           `psms_extracted.parquet` of each input run, in source order, for the 1/K0 term of shadow demotion (`rescore.shadow_im_tolerance`)
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## quant
 
@@ -602,7 +624,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## quant-lfq
 
@@ -633,7 +655,7 @@ Options:
       --out <OUT>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## quant-normalise
 
@@ -657,7 +679,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## run
 
@@ -695,7 +717,7 @@ Options:
           [default: 0]
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## run-experiment
 
@@ -730,7 +752,7 @@ Options:
           [default: 0]
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## align
 
@@ -748,7 +770,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## mbr
 
@@ -775,7 +797,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## inspect
 
@@ -788,7 +810,7 @@ Arguments:
   <ARTIFACT>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## peak-census
 
@@ -811,7 +833,7 @@ Options:
           Configuration file, read for `convert.*` so a vendor file can be converted the same way `run` converts it
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## audit
 
@@ -852,7 +874,7 @@ Options:
           [default: ""]
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## report
 
@@ -884,7 +906,7 @@ Options:
           Without it, a config setting `quant.q_threshold = 0.05` yielded 0.05 from `run` and 0.01 from `report` on the same scored table, silently.
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## cache
 
@@ -908,7 +930,7 @@ Options:
           Emit the result as JSON on stdout. The desktop application lists and clears the caches through it
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## doctor
 
@@ -929,6 +951,9 @@ Options:
           Skip the real import of each interpreter's packages and only check that they are installed.
 
           By default every interpreter the configuration uses is asked to import its role's packages for real (`deeplc` first, then torch with one operation), with a 120 s bound per role. That costs seconds, and it is the only check that catches a package which is installed but cannot load, such as a torch whose DLLs fail to initialise on Windows. `MUMDIA_DOCTOR_IMPORT_CHECK=0` does the same as this flag, for a caller that cannot know whether its engine has it.
+
+      --out-dir <OUT_DIR>
+          Also check that this results folder can be written (nothing is created)
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".

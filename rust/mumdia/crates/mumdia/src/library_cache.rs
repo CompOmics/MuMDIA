@@ -434,7 +434,7 @@ impl LibraryCache {
             .filter_map(|f| std::fs::metadata(&f).ok().map(|m| m.len()))
             .sum();
         let margin = min_free_after_store();
-        if let Some(free) = crate::cache::free_space(&self.dir) {
+        if let Some(free) = crate::storage::free_space(&self.dir) {
             anyhow::ensure!(
                 free >= need.saturating_add(margin),
                 "{} has {:.2} GiB free; storing this {:.2} GiB library would leave less than \

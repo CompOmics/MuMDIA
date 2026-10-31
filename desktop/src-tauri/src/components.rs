@@ -177,24 +177,26 @@ pub fn hex(bytes: impl AsRef<[u8]>) -> String {
     })
 }
 
-/// Per-user application data, where the managed environment is created.
+/// Per-user application data: predicted libraries, saved settings, and (exported to the
+/// engine) caches, temporary files and model downloads. The storage folder chosen on the
+/// Setup screen, else the default folder (`crate::storage`).
 ///
 /// Not beside the executable: on Windows that is under Program Files, which a
 /// normal user cannot write to, and an installer that needs administrator rights to
 /// finish its first run is not the easy installation this exists to provide.
 pub fn data_dir() -> PathBuf {
-    let base = if cfg!(windows) {
-        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-    } else {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-    };
-    base.unwrap_or_else(std::env::temp_dir).join("MuMDIA")
+    crate::storage::storage_dir()
+}
+
+/// Where the managed Python environments and the downloaded tools (ThermoRawFileParser,
+/// DIA-NN) live: the default folder, unless the user moved them with the storage folder
+/// (`crate::storage`), because a moved environment has to be installed again.
+pub fn tools_dir() -> PathBuf {
+    crate::storage::tools_dir()
 }
 
 pub fn venv_dir(env: Env) -> PathBuf {
-    data_dir().join(env.dir_name())
+    tools_dir().join(env.dir_name())
 }
 
 /// The interpreter inside a managed environment, whether or not it exists yet.
@@ -257,6 +259,9 @@ pub fn stamp_env(cmd: &mut std::process::Command) {
     if let Some(p) = runnable_thermo_parser() {
         cmd.env("MUMDIA_THERMO_PARSER", p);
     }
+    // The storage folder's caches, temporary files and model downloads, when one was
+    // chosen on the Setup screen; never over a variable the user set.
+    crate::storage::apply(cmd);
 }
 
 /// Mark a `mumdia doctor` call as a question about the configuration (which roles it
@@ -271,7 +276,7 @@ pub fn skip_doctor_import_check(cmd: &mut std::process::Command) {
 
 /// Where a managed ThermoRawFileParser is unpacked.
 pub fn thermo_dir() -> PathBuf {
-    data_dir().join(THERMO_DIR_NAME)
+    tools_dir().join(THERMO_DIR_NAME)
 }
 
 /// Shared with [`inventory`], which offers to remove this directory.
@@ -394,7 +399,7 @@ fn outdated_pins(
 /// installation fails the exact input is still on disk to look at.
 pub fn requirements(env: Env) -> Result<PathBuf, String> {
     let text = requirements_text(env);
-    let dir = data_dir();
+    let dir = tools_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let path = dir.join(env.requirements_name());
     std::fs::write(&path, text).map_err(|e| format!("could not write {}: {e}", path.display()))?;
@@ -772,8 +777,8 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
     })?;
     let reqs = requirements(env)?;
     let venv = venv_dir(env);
-    std::fs::create_dir_all(data_dir())
-        .map_err(|e| format!("cannot create {}: {e}", data_dir().display()))?;
+    std::fs::create_dir_all(tools_dir())
+        .map_err(|e| format!("cannot create {}: {e}", tools_dir().display()))?;
 
     {
         let mut s = installer
@@ -866,6 +871,9 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
         for (title, args) in steps {
             log(&installer, format!("== {title}"));
             let mut cmd = crate::engine::command(&uv);
+            // uv's package cache (and, with the environments moved, its interpreters) in
+            // the storage folder, when one was chosen.
+            crate::storage::apply(&mut cmd);
             cmd.args(&args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -1046,7 +1054,11 @@ fn size_on_disk(p: &Path) -> u64 {
 /// owns it exports, so a renamed directory cannot quietly become unremovable. An item
 /// with nothing on disk is omitted: the interface shows what exists rather than a
 /// catalogue of what could.
-fn inventory(root: &Path) -> Vec<Removable> {
+fn inventory(tools: &Path, data: &Path) -> Vec<Removable> {
+    // The environments and the downloaded tools are under `tools`, what the application
+    // builds and saves under `data` (the storage folder); without a storage folder the two
+    // are the same directory.
+    let root = tools;
     let items: Vec<(&str, &str, &str, bool, Vec<PathBuf>)> = vec![
         (
             "primary",
@@ -1104,7 +1116,7 @@ fn inventory(root: &Path) -> Vec<Removable> {
              library is not predicted twice. Rebuilding one means running the prediction \
              again, which takes hours on a whole proteome.",
             true,
-            vec![root.join(crate::diann::LIBRARY_CACHE_NAME)],
+            vec![data.join(crate::diann::LIBRARY_CACHE_NAME)],
         ),
         (
             "settings",
@@ -1113,7 +1125,7 @@ fn inventory(root: &Path) -> Vec<Removable> {
              located. A few kilobytes; searches and their results are untouched.",
             false,
             vec![
-                root.join(crate::settings::CONFIG_DIR_NAME),
+                data.join(crate::settings::CONFIG_DIR_NAME),
                 root.join(crate::diann::STATE_FILE_NAME),
             ],
         ),
@@ -1143,9 +1155,10 @@ fn inventory(root: &Path) -> Vec<Removable> {
         .collect()
 }
 
-/// Delete one inventory item under `root`, returning the bytes freed.
-fn remove_in(root: &Path, id: &str) -> Result<u64, String> {
-    let item = inventory(root)
+/// Delete one inventory item under `tools` or `data` (see [`inventory`]), returning the
+/// bytes freed.
+fn remove_in(tools: &Path, data: &Path, id: &str) -> Result<u64, String> {
+    let item = inventory(tools, data)
         .into_iter()
         .find(|r| r.id == id)
         .ok_or_else(|| format!("`{id}` is not a removable component, or is not installed"))?;
@@ -1154,9 +1167,11 @@ fn remove_in(root: &Path, id: &str) -> Result<u64, String> {
     // checked before anything is touched -- and checked on the real PARENT directory,
     // because canonicalising the item itself would follow a link and resolve to the
     // target this then deletes.
-    let real_root = root
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve {}: {e}", root.display()))?;
+    // A root that does not exist holds no item, so it is simply not a candidate.
+    let real_roots: Vec<PathBuf> = [tools, data]
+        .iter()
+        .filter_map(|r| r.canonicalize().ok())
+        .collect();
     let mut freed = 0u64;
     for path in &item.paths {
         let p = PathBuf::from(path);
@@ -1165,10 +1180,11 @@ fn remove_in(root: &Path, id: &str) -> Result<u64, String> {
             .ok_or_else(|| format!("{path} has no parent directory"))?
             .canonicalize()
             .map_err(|e| format!("cannot resolve the parent of {path}: {e}"))?;
-        if !parent.starts_with(&real_root) {
+        if !real_roots.iter().any(|r| parent.starts_with(r)) {
             return Err(format!(
-                "refusing to remove {path}: it resolves outside {}",
-                root.display()
+                "refusing to remove {path}: it resolves outside {} and {}",
+                tools.display(),
+                data.display()
             ));
         }
         let md =
@@ -1199,7 +1215,7 @@ fn remove_in(root: &Path, id: &str) -> Result<u64, String> {
 /// What this application has created under [`data_dir`], as removable items, and the
 /// engine's own caches when they hold anything.
 pub fn removable() -> Vec<Removable> {
-    let mut items = inventory(&data_dir());
+    let mut items = inventory(&tools_dir(), &data_dir());
     items.extend(
         engine_cache_json(&["cache", "--json"])
             .ok()
@@ -1216,7 +1232,7 @@ pub fn remove(id: &str) -> Result<u64, String> {
     if id == ENGINE_CACHES_ID {
         return clear_engine_caches();
     }
-    remove_in(&data_dir(), id)
+    remove_in(&tools_dir(), &data_dir(), id)
 }
 
 /// The `id` of the engine's caches among the [`removable`] items.
@@ -1364,7 +1380,7 @@ mod tests {
     fn the_inventory_lists_only_what_is_on_disk() {
         let d = scratch("listing");
         assert!(
-            inventory(&d).is_empty(),
+            inventory(&d, &d).is_empty(),
             "an empty data directory has nothing to remove"
         );
 
@@ -1377,7 +1393,7 @@ mod tests {
             100,
         );
 
-        let inv = inventory(&d);
+        let inv = inventory(&d, &d);
         let ids: Vec<&str> = inv.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1412,7 +1428,7 @@ mod tests {
             30,
         );
 
-        let freed = remove_in(&d, "primary").unwrap();
+        let freed = remove_in(&d, &d, "primary").unwrap();
         assert_eq!(freed, 2060, "everything the item covers, and nothing else");
         assert!(!d.join("python").exists());
         assert!(!d.join("console-requirements.txt").exists());
@@ -1422,7 +1438,7 @@ mod tests {
             .join("my.json")
             .is_file());
         assert_eq!(
-            inventory(&d)
+            inventory(&d, &d)
                 .iter()
                 .map(|r| r.id.clone())
                 .collect::<Vec<_>>(),
@@ -1433,18 +1449,63 @@ mod tests {
     }
 
     #[test]
+    fn with_a_storage_folder_the_items_come_from_both_folders() {
+        // The environments stay where they were installed; libraries and saved settings
+        // follow the storage folder (`crate::storage`).
+        let tools = scratch("two-roots-tools");
+        let data = scratch("two-roots-data");
+        file(&tools.join("python").join("pyvenv.cfg"), 10);
+        file(&tools.join(crate::diann::STATE_FILE_NAME), 3);
+        file(
+            &data
+                .join(crate::diann::LIBRARY_CACHE_NAME)
+                .join("k")
+                .join("lib_precursors.parquet"),
+            100,
+        );
+        file(
+            &data.join(crate::settings::CONFIG_DIR_NAME).join("a.json"),
+            7,
+        );
+        // A library left in the default folder is not the storage folder's.
+        file(
+            &tools
+                .join(crate::diann::LIBRARY_CACHE_NAME)
+                .join("old")
+                .join("x.parquet"),
+            1000,
+        );
+        let inv = inventory(&tools, &data);
+        let by = |id: &str| inv.iter().find(|r| r.id == id).cloned().unwrap();
+        assert_eq!(by("primary").bytes, 10);
+        assert_eq!(by("libraries").bytes, 100);
+        assert_eq!(
+            by("settings").bytes,
+            10,
+            "the saved settings and the DIA-NN state"
+        );
+        assert_eq!(remove_in(&tools, &data, "settings").unwrap(), 10);
+        assert!(!data.join(crate::settings::CONFIG_DIR_NAME).exists());
+        assert!(!tools.join(crate::diann::STATE_FILE_NAME).exists());
+        assert_eq!(remove_in(&tools, &data, "libraries").unwrap(), 100);
+        assert!(tools.join(crate::diann::LIBRARY_CACHE_NAME).exists());
+        let _ = std::fs::remove_dir_all(&tools);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
     fn an_unknown_or_absent_item_is_refused_rather_than_guessed() {
         let d = scratch("unknown");
         // A recursive delete taking a string from the interface: anything that is not
         // one of the known ids must fail before the disk is touched.
         for id in ["", "..", "python", "primary", "../../Users"] {
-            let e = remove_in(&d, id).unwrap_err();
+            let e = remove_in(&d, &d, id).unwrap_err();
             assert!(e.contains("not a removable component"), "{id}: {e}");
         }
         // `primary` is refused above only because nothing is installed. Once it is, the
         // same id works: the guard is presence, not a name filter.
         file(&d.join("python").join("pyvenv.cfg"), 1);
-        assert!(remove_in(&d, "primary").is_ok());
+        assert!(remove_in(&d, &d, "primary").is_ok());
 
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1828,7 +1889,9 @@ mod tests {
         for (k, v) in cmd.get_envs() {
             let Some(v) = v else { continue };
             let key = k.to_string_lossy();
-            if key.starts_with("MUMDIA_") {
+            // The interpreters and the converter; the storage folder's directories
+            // (`MUMDIA_CACHE_DIR` and the like) are folders the engine creates.
+            if key.starts_with("MUMDIA_PYTHON") || key == "MUMDIA_THERMO_PARSER" {
                 assert!(
                     std::path::Path::new(v).is_file(),
                     "{key} was stamped with {v:?}, which is not a file"

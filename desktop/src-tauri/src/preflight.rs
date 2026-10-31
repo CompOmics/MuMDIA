@@ -37,22 +37,32 @@ pub struct Disk {
 fn free_bytes(path: &Path) -> Option<u64> {
     #[cfg(windows)]
     {
-        // `wmic` is gone from recent Windows, so use PowerShell's provider, which is
-        // present on every supported version.
-        let drive = path.components().next().map(|c| {
-            c.as_os_str()
-                .to_string_lossy()
-                .trim_end_matches('\\')
-                .to_string()
-        })?;
-        let drive = drive.trim_end_matches(':').to_string();
+        // `wmic` is gone from recent Windows, so ask .NET through Windows PowerShell, which
+        // is present on every supported version: `DriveInfo` for a drive letter, and the
+        // Scripting runtime's `GetDrive` for a network share, which neither `DriveInfo` nor
+        // `Get-PSDrive` (used before) can answer. The engine asks the same way
+        // (`mumdia::storage::free_space`). The path goes in the child's environment, so
+        // no quoting can go wrong, without the `\\?\` prefix `canonicalize` adds.
+        let s = path.to_string_lossy();
+        let plain = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            s.into_owned()
+        };
         let out = std::process::Command::new("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                &format!("(Get-PSDrive -Name '{drive}').Free"),
+                r"$p = [System.IO.Path]::GetFullPath($env:MUMDIA_FREE_SPACE_PATH);
+                  $r = [System.IO.Path]::GetPathRoot($p);
+                  if ($r.StartsWith('\\')) {
+                    [uint64](New-Object -ComObject Scripting.FileSystemObject).GetDrive($r.TrimEnd('\')).AvailableSpace
+                  } else { [uint64]([System.IO.DriveInfo]::new($r).AvailableFreeSpace) }",
             ])
+            .env("MUMDIA_FREE_SPACE_PATH", plain)
             .output()
             .ok()?;
         String::from_utf8_lossy(&out.stdout)
@@ -128,7 +138,7 @@ fn is_writable(dir: &Path) -> bool {
 
 /// Free bytes on the volume holding `dir`, walking up to the nearest existing
 /// ancestor because the directory may not exist yet.
-fn free_space(dir: &Path) -> Option<u64> {
+pub fn free_space(dir: &Path) -> Option<u64> {
     let mut probe = dir.to_path_buf();
     while !probe.exists() {
         match probe.parent() {

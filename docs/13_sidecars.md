@@ -973,7 +973,15 @@ plus the three the Rust caller injects: `MUMDIA_NN_FOLDS` (worker default
 3), `MUMDIA_NN_ITERS` (worker default 5, but `run_pin_sidecar` overrides it with
 `rescore.num_iter` = 10), `MUMDIA_NN_TRAIN_FDR` (0.01). These worker defaults
 apply only when the sidecar is run standalone. `entrapment_worker.py`:
-`MUMDIA_ENTRAPMENT_MODEL` (`gbm`|`nn`). `deeplc_finetune.py`: `DEEPLC_FT_THREADS`
+`MUMDIA_ENTRAPMENT_MODEL` (`gbm`|`nn`). `ms2pip_worker.py` and `peptdeep_worker.py`:
+`MUMDIA_MODEL_DIR`, unset by default, moves the model files each downloads on first use
+from `~/.ms2pip` and `~/peptdeep` to `<MUMDIA_MODEL_DIR>/ms2pip` (MS2PIP's `model_dir`)
+and `<MUMDIA_MODEL_DIR>/peptdeep` (AlphaPeptDeep's `PEPTDEEP_HOME`, set in
+`global_settings` before the model manager is created; peptdeep 1.5 reads it each time it
+locates its model archive). Every worker inherits the temporary directory the engine
+chose: with `--temp-dir` or `MUMDIA_TEMP_DIR` the engine sets `TMP`, `TEMP`, `TMPDIR` and,
+unless set, `MPLCONFIGDIR` before it starts a worker (docs/14, "Where MuMDIA writes").
+`deeplc_finetune.py`: `DEEPLC_FT_THREADS`
 (8, the training pool) plus argparse flags. Note the mokapot worker's **code default
 model is `nn`** (the sklearn MLP inside mokapot), even though the recommended portable path
 (`env/mumdia-rescore.yml`) sets `MUMDIA_RESCORE_MODEL=logreg`; the Rust caller
@@ -1067,8 +1075,11 @@ MLP. Set it explicitly for the logreg path.
   the worker's scores have passed `align_sidecar_scores`, and the entrapment worker's
   files as well; a handoff or fold-keys write that fails removes what it wrote. A
   failed worker still leaves its input behind for a rerun; `MUMDIA_KEEP_HANDOFF=1`
-  keeps the files on success too. Before a byte is written, the engine asks the
-  sidecar interpreter for the free space of that directory (`shutil.disk_usage`). It
+  keeps the files on success too. Before a byte is written, the engine asks for the
+  free space of that directory (`storage::free_space`, the engine's one free-space
+  function, which also answers for a `\\server\share` path; it used to ask the sidecar
+  interpreter's `shutil.disk_usage`). An explicitly set `MUMDIA_SIDECAR_DIR` that cannot
+  take a write and a rename stops `run` and `run-experiment` before any stage. It
   refuses the run only when the space is below what the files cannot be smaller
   than, which counts uncompressed bytes alone: 9 bytes a value plus 32 a row for the
   PIN, exactly 4 bytes a value for the raw matrix. A parquet file has no such floor

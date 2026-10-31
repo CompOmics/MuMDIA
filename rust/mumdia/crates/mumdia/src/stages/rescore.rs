@@ -716,7 +716,6 @@ pub fn run_hashed(p: RescoreParams) -> Result<Written> {
     if stream_to_handoff {
         let paths = sidecar_paths(&p, sidecar_script.expect("checked in the condition"));
         check_sidecar_space(
-            p.cfg.python.as_deref(),
             &paths.dir(),
             n,
             feat_names.len(),
@@ -2104,7 +2103,6 @@ fn run_entrapment_gbm(
         ));
     }
     check_sidecar_space(
-        Some(python),
         p.work_dir,
         cid.len(),
         feat_names.len(),
@@ -3532,27 +3530,6 @@ fn nn_memmap_bytes(
     matrix.saturating_add(side)
 }
 
-/// Free bytes on the filesystem that holds `dir`, asked of the sidecar's own interpreter
-/// (`shutil.disk_usage`): the standard library has no portable free-space call, and the
-/// interpreter is the one thing every sidecar run already requires. `None` when it cannot
-/// be asked, which skips the check rather than failing a run the sidecar would then fail
-/// anyway, with its own clearer error.
-fn free_bytes(python: &str, dir: &str) -> Option<u64> {
-    let out = std::process::Command::new(python)
-        .args([
-            "-c",
-            "import shutil, sys; print(shutil.disk_usage(sys.argv[1]).free)",
-            dir,
-        ])
-        .env("PYTHONUTF8", "1")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
-}
-
 /// Refuse a sidecar run whose work directory cannot hold its files, before a byte of them
 /// is written, and warn when it may not (`MUMDIA_SIDECAR_SPACE_CHECK=0` skips the check).
 /// `nn` says the worker is `nn_rescore_worker.py`, whose memmap the estimate then counts.
@@ -3562,7 +3539,6 @@ fn free_bytes(python: &str, dir: &str) -> Option<u64> {
 /// only below the floor of [`handoff_space`], which a parquet handoff does not have, so for
 /// the default handoff it warns and goes on.
 fn check_sidecar_space(
-    python: Option<&str>,
     dir: &str,
     rows: usize,
     nf: usize,
@@ -3578,7 +3554,10 @@ fn check_sidecar_space(
     let handoff = handoff_space(rows_u, nf_u, format, 0).estimate;
     let memmap = nn_memmap_bytes(nn, rows_u, nf_u, format, handoff, |k| std::env::var(k).ok());
     let need = handoff_space(rows_u, nf_u, format, memmap);
-    let Some(free) = python.and_then(|py| free_bytes(py, dir)) else {
+    // The engine's one free-space function (`storage::free_space`), which also answers for a
+    // network-share work directory. Unknown free space skips the check rather than
+    // failing a run the sidecar would then fail anyway, with its own clearer error.
+    let Some(free) = crate::storage::free_space(std::path::Path::new(dir)) else {
         tracing::debug!(
             dir,
             "rescore: free space unknown; skipping the sidecar space check"
@@ -3870,7 +3849,6 @@ fn run_pin_sidecar(
         None => {
             let paths = sidecar_paths(p, script_name);
             check_sidecar_space(
-                Some(python),
                 &paths.dir(),
                 cid.len(),
                 feat_names.len(),
@@ -6793,20 +6771,8 @@ b
         space_verdict(pin.estimate, pin, "D:/x", 1_000, 100, HandoffFormat::Pin).unwrap();
         // A parquet handoff is never refused, however little room there is.
         space_verdict(0, pq, "D:/x", 1_000, 100, HandoffFormat::Parquet).unwrap();
-        // An interpreter that cannot be started skips the check.
-        assert_eq!(
-            free_bytes("mumdia-no-such-interpreter-for-this-test", "."),
-            None
-        );
-        check_sidecar_space(
-            Some("mumdia-no-such-interpreter-for-this-test"),
-            ".",
-            usize::MAX / 4,
-            1_000,
-            HandoffFormat::Pin,
-            true,
-        )
-        .unwrap();
+        // A directory whose volume cannot be named skips the check.
+        assert_eq!(crate::storage::free_space(std::path::Path::new("")), None);
     }
 
     #[test]

@@ -519,7 +519,7 @@ pub fn install(installer: Arc<Installer>) -> Result<(), String> {
     }
 
     std::thread::spawn(move || {
-        let dir = crate::components::data_dir();
+        let dir = crate::components::tools_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             installer.fail(format!("cannot create {}: {e}", dir.display()));
             return;
@@ -933,7 +933,7 @@ mod tests {
     #[test]
     fn the_managed_converter_lives_under_the_per_user_data_directory() {
         let d = crate::components::thermo_dir();
-        assert!(d.starts_with(crate::components::data_dir()));
+        assert!(d.starts_with(crate::components::tools_dir()));
     }
 
     #[test]

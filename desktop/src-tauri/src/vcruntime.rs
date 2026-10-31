@@ -509,13 +509,14 @@ pub fn drive(
     }
 }
 
-/// A new directory for one download, under the user's temporary folder.
+/// A new directory for one download, under the storage folder's `temp/` when one was
+/// chosen on the Setup screen, else the user's temporary folder (`storage::temp_dir`).
 fn work_dir() -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("mumdia-vcredist-{}-{nanos}", std::process::id()))
+    crate::storage::temp_dir().join(format!("mumdia-vcredist-{}-{nanos}", std::process::id()))
 }
 
 /// Start an installation on its own thread. `then` runs after an installation that left

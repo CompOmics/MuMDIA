@@ -321,6 +321,47 @@ fn components_removable() -> serde_json::Value {
     })
 }
 
+/// The storage folder: where it is, how much room it has, and whether it can be written
+/// (`storage::info`).
+#[tauri::command]
+fn storage_info() -> mumdia_console::storage::Info {
+    mumdia_console::storage::info()
+}
+
+/// Choose the storage folder (`folder: null` goes back to the default) and whether the
+/// Python environments move with it, then return the new state.
+///
+/// Refused while anything is running, for the same reason as a removal: a search, an
+/// installation or a library build is reading or writing the folders this moves, and
+/// would carry on in the old place. Nothing is copied: the caches, libraries and models
+/// are rebuilt or downloaded again where the new folder is, and the old folder can be
+/// cleared from the Managed data card before the change or removed by hand.
+#[tauri::command]
+fn storage_set(
+    state: tauri::State<'_, AppState>,
+    folder: Option<String>,
+    move_environments: bool,
+) -> Result<mumdia_console::storage::Info, String> {
+    if let Some(busy) = managed_work_in_progress(&state) {
+        return Err(format!(
+            "{busy}. Wait for it to finish, or stop it, before changing the storage folder."
+        ));
+    }
+    mumdia_console::storage::set(folder.as_deref(), move_environments)?;
+    // The install trackers keep a terminal state that describes the old folders.
+    for env in [
+        components::Env::Primary,
+        components::Env::Ms2pip,
+        components::Env::Visdia,
+    ] {
+        state.installer.forget(env);
+    }
+    state.thermo.forget();
+    state.diann_installer.forget();
+    state.diann.forget();
+    Ok(mumdia_console::storage::info())
+}
+
 /// Delete one managed component's data, and return the bytes freed with the new list.
 ///
 /// Destructive, so it refuses while anything might be reading those files: a search
@@ -400,6 +441,13 @@ fn preflight(
     if !comp.complete {
         blockers.push(components::blocker(&comp));
     }
+
+    // Where the search writes: the results folder and a chosen storage folder must take a
+    // write and a rename; a network or OneDrive location, or a nearly full storage folder,
+    // is a warning (`storage::preflight`).
+    let (b, w) = mumdia_console::storage::preflight(&req.out_dir);
+    blockers.extend(b);
+    warnings.extend(w);
 
     // A vendor file with no converter fails inside the engine, after the run has been
     // launched and the interface has switched to the progress screen. Caught here it is
@@ -846,6 +894,8 @@ fn main() {
             components_removable,
             components_remove,
             components_recheck,
+            storage_info,
+            storage_set,
             vcruntime_install,
             vcruntime_state,
             config_schema,
