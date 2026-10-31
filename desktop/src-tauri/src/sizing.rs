@@ -375,11 +375,11 @@ fn digest(
     rule: &crate::enzymes::Rule,
     emit: &mut impl FnMut(&[u8], bool),
 ) {
-    let starts = |from: usize| from == 0 || (from == 1 && seq.first() == Some(&b'M'));
+    let starts_protein = |from: usize| from == 0 || (from == 1 && seq.first() == Some(&b'M'));
     if rule.is_non_specific() {
         for start in 0..seq.len() {
             for end in (start + req.min_len)..=(start + req.max_len).min(seq.len()) {
-                emit(&seq[start..end], starts(start));
+                emit(&seq[start..end], starts_protein(start));
             }
         }
         return;
@@ -394,7 +394,7 @@ fn digest(
         for end in (s + 1)..sites.len().min(s + 2 + req.missed_cleavages) {
             let len = sites[end] - from;
             if len >= req.min_len && len <= req.max_len {
-                emit(&seq[from..sites[end]], starts(from));
+                emit(&seq[from..sites[end]], starts_protein(from));
             }
         }
     }
