@@ -529,9 +529,17 @@ jobs:
           mkdir -p desktop/src-tauri/binaries/scripts
           cp scripts/*.py desktop/src-tauri/binaries/scripts/
 
+      # The cache above restores cargo-tauri.exe but not cargo's install records, so a plain
+      # `cargo install` on a cache hit refuses with "binary already exists in destination".
       - name: Install the Tauri bundler
         if: steps.touched.outputs.run == 'true'
-        run: cargo install tauri-cli --version "^2" --locked
+        shell: bash
+        run: |
+          if cargo tauri --version 2>/dev/null | grep -q '^tauri-cli 2\.'; then
+            echo "cargo-tauri from the cache: $(cargo tauri --version)"
+          else
+            cargo install tauri-cli --version "^2" --locked --force
+          fi
 
       - name: Build the MSI with the Visual C++ runtime
         if: steps.touched.outputs.run == 'true'

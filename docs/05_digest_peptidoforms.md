@@ -213,11 +213,16 @@ strategies keep the C-terminal residue fixed and rewrite the interior `b[..n-1]`
      (fixed-variable stacking, peptidoforms.rs:167-172).
 
    The `unimod_mass` allowlist is the modification catalogue
-   `crates/mumdia-core/src/modifications.json` (34 UniMod residue modifications,
+   `crates/mumdia-core/src/modifications.json` (36 UniMod residue modifications,
    embedded at build time by `mass.rs`). The desktop Search tab offers exactly that
    list, so a modification chosen there is always one the engine accepts. Extending the
    set is one catalogue entry plus its composition in the
    `every_catalogue_mass_matches_its_elemental_composition` test (see "How to extend").
+   The digest does not model cleavage blocked by a modification: an acylated lysine such
+   as `HCysThiolactone` (N-homocysteinylation) still closes a tryptic peptide, so the
+   modification can sit on the C-terminal K and the missed-cleavage form is reached only
+   through `missed_cleavages`. The DIA-NN build passes `--no-cut-after-mod` for GlyGly K
+   alone.
 2. **Read** the digest table (peptidoforms.rs:189-194): columns `id`, `peptide`,
    `protein`, `label`, `target_id`.
 3. **Per digest row** (peptidoforms.rs:201): compute `base_peptide_id` as

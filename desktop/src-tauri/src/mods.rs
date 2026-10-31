@@ -44,6 +44,13 @@ mod tests {
         assert_eq!(lookup("Carbamidomethyl").map(|m| m.unimod), Some(4));
         assert_eq!(lookup("Oxidation").map(|m| m.unimod), Some(35));
         assert_eq!(lookup("Phospho").map(|m| m.unimod), Some(21));
+        // Homocysteinylation (issue #234): N on K, S on C.
+        let k = lookup("HCysThiolactone").expect("UniMod 1270 is in the catalogue");
+        assert_eq!(k.unimod, 1270);
+        assert!((k.mass - 117.024_835).abs() < 1e-9);
+        let c = lookup("HCysteinyl").expect("UniMod 1271 is in the catalogue");
+        assert_eq!(c.unimod, 1271);
+        assert!((c.mass - 133.019_749).abs() < 1e-9);
         assert!(lookup("NotAModification").is_none());
     }
 }
