@@ -650,6 +650,94 @@ print(f"    ok: empirical library {lib['entries']} entries + {lib['decoys']} pai
       f"{lib['runs_aligned']} runs aligned; no decoy extracted, so the first pass stands")
 PYEOF
 
+# 5q. `quant.fragment_detail`: the single run and the two-run experiment with the key on.
+#     Each run's final quant writes quant_fragments.parquet beside its peptide_quant and the
+#     manifest records it; every other table is the plain search's, byte for byte, and no
+#     plain search writes the table. Under the default rule (observed_area, top 3) the
+#     selected areas, summed in rank order, are each quantity exactly.
+echo "=== smoke: quant.fragment_detail"
+"$PY" - "$cfg" "$work/qf.json" "$work/exp_seq.json" "$work/exp_qf.json" <<'PYEOF'
+import json, sys
+for src, dst in ((sys.argv[1], sys.argv[2]), (sys.argv[3], sys.argv[4])):
+    c = json.load(open(src, encoding="utf-8"))
+    c.setdefault("quant", {})["fragment_detail"] = True
+    json.dump(c, open(dst, "w", encoding="utf-8"), indent=2)
+PYEOF
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_qf" --config "$work/qf.json" --threads 2 > "$work/qf.log" 2>&1 \
+    || { tail -30 "$work/qf.log"; echo "the run with quant.fragment_detail failed"; exit 1; }
+"$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" \
+    --run-names a --run-names b \
+    --out-dir "$work/exp_qf" --config "$work/exp_qf.json" > "$work/exp_qf.log" 2>&1 \
+    || { tail -30 "$work/exp_qf.log"; echo "run-experiment with quant.fragment_detail failed"; exit 1; }
+for f in psms_scored.parquet peptide_quant.parquet protein_group_quant.parquet \
+         fragment_quant.parquet peptides.tsv proteins.tsv; do
+    cmp -s "$work/out/$f" "$work/out_qf/$f" \
+        || { echo "quant.fragment_detail changed $f"; exit 1; }
+done
+for f in scored_combined.parquet a/peptide_quant.parquet b/peptide_quant.parquet \
+         a/protein_group_quant.parquet b/protein_group_quant.parquet lfq_maxlfq.parquet \
+         peptides.tsv proteins.tsv; do
+    cmp -s "$work/exp/$f" "$work/exp_qf/$f" \
+        || { echo "quant.fragment_detail changed the experiment's $f"; exit 1; }
+done
+for f in out/quant_fragments.parquet exp/a/quant_fragments.parquet exp/b/quant_fragments.parquet; do
+    [ ! -e "$work/$f" ] || { echo "a search without quant.fragment_detail wrote $f"; exit 1; }
+done
+"$PY" - "$work" <<'PYEOF'
+import json, os, sys
+import pyarrow.parquet as pq
+work = sys.argv[1]
+def check(ok, what):
+    if not ok:
+        sys.exit("quant.fragment_detail: " + what)
+single = json.load(open(os.path.join(work, "out_qf", "manifest.json"), encoding="utf-8"))
+exp = json.load(open(os.path.join(work, "exp_qf", "experiment_manifest.json"), encoding="utf-8"))
+check("quant_fragments" not in json.load(open(os.path.join(work, "out", "manifest.json"),
+      encoding="utf-8"))["artifacts"], "the plain run's manifest records quant_fragments")
+cases = [(os.path.join(work, "out_qf"), single["artifacts"]["quant_fragments"])]
+for run in ("a", "b"):
+    cases.append((os.path.join(work, "exp_qf", run), exp["artifacts"][f"quant_fragments[{run}]"]))
+total = 0
+for d, rec in cases:
+    path = os.path.join(d, "quant_fragments.parquet")
+    report = json.load(open(path + ".report.json", encoding="utf-8"))
+    check(rec["schema_name"] == "quant_fragments" and rec["schema_version"] == 1,
+          f"{d}: the manifest records {rec['schema_name']} v{rec['schema_version']}")
+    check(rec["content_hash"] == report["content_hash"], f"{d}: manifest and report hashes differ")
+    qf = pq.read_table(path).to_pylist()
+    check([r["candidate_id"] for r in qf] == sorted(r["candidate_id"] for r in qf),
+          f"{d}: not sorted by candidate_id")
+    by = {}
+    for r in qf:
+        by.setdefault(r["candidate_id"], []).append(r)
+    pq_rows = pq.read_table(os.path.join(d, "peptide_quant.parquet"),
+                            columns=["candidate_id", "quantity", "n_fragments_used"]).to_pylist()
+    n = 0
+    for row in pq_rows:
+        if row["quantity"] is None:
+            continue
+        rows = by.get(row["candidate_id"])
+        check(rows is not None, f"{d}: quantified candidate {row['candidate_id']} has no rows")
+        check(all(r["rule"] == "observed_area" and r["weight"] == 1.0 for r in rows),
+              f"{d}: candidate {row['candidate_id']} is not under observed_area")
+        sel = sorted((r for r in rows if r["selected"]), key=lambda r: r["rank"])
+        check(len(sel) == row["n_fragments_used"],
+              f"{d}: candidate {row['candidate_id']} selects {len(sel)} fragments, "
+              f"n_fragments_used {row['n_fragments_used']}")
+        q = 0.0
+        for r in sel:
+            q += r["weight"] * r["area"]
+        check(q == row["quantity"],
+              f"{d}: candidate {row['candidate_id']}: {q!r} against quantity {row['quantity']!r}")
+        n += 1
+    check(n > 50, f"{d}: only {n} quantified candidates")
+    total += n
+print(f"    ok: {total} quantities over {len(cases)} runs reproduced exactly from the selected "
+      "fragments; every other table unchanged")
+PYEOF
+
 # 5b. The same experiment with `experiment.parallel_runs = 2`, and one whose second run
 #     cannot be converted.
 #

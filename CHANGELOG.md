@@ -132,6 +132,17 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **`quant.fragment_detail` records which fragments made each precursor quantity.** Off by
+  default. Set, the final quant of `run` and of `run-experiment` (after the cross-run step and
+  the second pass) also writes `quant_fragments.parquet` beside each run's
+  `peptide_quant.parquet` (`quant_fragments` v1, recorded in the manifest): per fragment of
+  every quantified candidate its integrated area, whether the rule selected it, its weight,
+  its rank in the rule and the background subtracted from it, and the rule that applied. Under
+  the top-N rules and `cross_run` the selected areas times their weights add up to the
+  reported quantity; under the pattern rules the table names the fitted fragments. The
+  standalone `quant` writes it with `--out-quant-fragments`. With the key off no artifact,
+  report, manifest entry or configuration hash changes. The desktop application sets it for
+  every search, for the viewer (docs/12, docs/15).
 - **The desktop installer provides the Microsoft Visual C++ x64 runtime that PyTorch
   needs on Windows.** The MSI merges Microsoft's runtime merge module from the build
   runner's Visual Studio, so a fresh installation can load `torch\lib\c10.dll`. It needs

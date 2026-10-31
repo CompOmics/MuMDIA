@@ -593,6 +593,9 @@ Options:
       --out-peak-bounds <OUT_PEAK_BOUNDS>
           Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt, width_s)
 
+      --out-quant-fragments <OUT_QUANT_FRAGMENTS>
+          Optional account of the fragments behind every quantity (quant_fragments v1: per fragment its area, whether the rule selected it, its weight, rank and background). `run` and `run-experiment` write it under `quant.fragment_detail`
+
       --export-cross-run
           Write the cross-run export into `--out-fragment` (fragment_quant v5: the zero-area rows and the columns the cross-run fit reads; v6 under `quant.fragment_selection = pattern_fit` or `pattern_profile`, with the pattern columns). The first pass of the cross-run step; `run-experiment` runs it by itself
 

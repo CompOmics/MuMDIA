@@ -436,6 +436,11 @@ enum Cmd {
         /// Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt, width_s).
         #[arg(long)]
         out_peak_bounds: Option<String>,
+        /// Optional account of the fragments behind every quantity (quant_fragments v1: per
+        /// fragment its area, whether the rule selected it, its weight, rank and
+        /// background). `run` and `run-experiment` write it under `quant.fragment_detail`.
+        #[arg(long)]
+        out_quant_fragments: Option<String>,
         /// Write the cross-run export into `--out-fragment` (fragment_quant v5: the zero-area
         /// rows and the columns the cross-run fit reads; v6 under `quant.fragment_selection =
         /// pattern_fit` or `pattern_profile`, with the pattern columns). The first pass of the
@@ -2043,6 +2048,7 @@ fn real_main() -> Result<()> {
             out_protein,
             out_fragment,
             out_peak_bounds,
+            out_quant_fragments,
             export_cross_run,
             cross_run_from,
             config,
@@ -2082,6 +2088,7 @@ fn real_main() -> Result<()> {
                 out_protein: &out_protein,
                 out_fragment: out_fragment.as_deref(),
                 out_peak_bounds: out_peak_bounds.as_deref(),
+                out_quant_fragments: out_quant_fragments.as_deref(),
                 cfg: &cfg.quant,
                 config_hash: &ch,
                 cross_run: cross_run.as_ref(),

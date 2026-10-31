@@ -66,6 +66,13 @@ pub struct QuantParams<'a> {
     /// width_s). Emitted only when `bound_peak` is on; a diagnostic of the
     /// integration windows, not part of the quant contract.
     pub out_peak_bounds: Option<&'a str>,
+    /// Optional account of the fragments behind every quantity
+    /// ([`artifact::QUANT_FRAGMENTS`]): per fragment of each candidate the quant reached,
+    /// its area, whether the rule selected it, its weight, its rank and the background
+    /// subtracted from it. `run` and `run-experiment` set it under
+    /// `quant.fragment_detail`. `None` computes none of it, and every other output is the
+    /// same either way.
+    pub out_quant_fragments: Option<&'a str>,
     pub cfg: &'a QuantConfig,
     pub config_hash: &'a str,
     /// The cross-run fit ([`fit_cross_run`]) that the second pass of the cross-run step
@@ -2338,6 +2345,8 @@ pub struct QuantWritten {
     pub protein: Written,
     /// `Some` exactly when `QuantParams::out_fragment` was set.
     pub fragment: Option<Written>,
+    /// `Some` exactly when `QuantParams::out_quant_fragments` was set.
+    pub quant_fragments: Option<Written>,
 }
 
 /// [`run`], returning each output's row count and the content hash its report records, so
@@ -2354,9 +2363,14 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             .iter()
             .map(|t| ("--chromatograms", t.path.as_str())),
     );
-    for out in [Some(p.out_peptide), Some(p.out_protein), p.out_fragment]
-        .into_iter()
-        .flatten()
+    for out in [
+        Some(p.out_peptide),
+        Some(p.out_protein),
+        p.out_fragment,
+        p.out_quant_fragments,
+    ]
+    .into_iter()
+    .flatten()
     {
         mumdia_io::refuse_output_over_input(out, &inputs)?;
     }
@@ -2802,6 +2816,11 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     let p_len = if pattern_export { index.rows.len() } else { 0 };
     let mut parea_by_slot: Vec<f64> = vec![0.0; p_len];
     let mut pobs_by_slot: Vec<bool> = vec![false; p_len];
+    // The fragment account's background per slot (`out_quant_fragments`): the level
+    // subtracted before integrating, NaN where none was. Empty without the account.
+    let detail = p.out_quant_fragments.is_some();
+    let d_len = if detail { index.rows.len() } else { 0 };
+    let mut bg_by_slot: Vec<f64> = vec![f64::NAN; d_len];
     type Slots<'s> = (
         &'s mut [f64],
         &'s mut [f64],
@@ -2809,6 +2828,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         &'s mut [[f64; CROSS_RUN_HALFWIDTHS]],
         &'s mut [f64],
         &'s mut [bool],
+        &'s mut [f64],
     );
     let mut slices: Vec<Slots> = Vec::with_capacity(index.len());
     {
@@ -2818,23 +2838,27 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         let mut hrest: &mut [[f64; CROSS_RUN_HALFWIDTHS]] = &mut flank_h_by_slot;
         let mut prest: &mut [f64] = &mut parea_by_slot;
         let mut orest: &mut [bool] = &mut pobs_by_slot;
+        let mut brest: &mut [f64] = &mut bg_by_slot;
         for ci in 0..index.len() {
             let n = index.cand_off[ci + 1] - index.cand_off[ci];
             let nx = if export { n } else { 0 };
             let np = if pattern_export { n } else { 0 };
+            let nd = if detail { n } else { 0 };
             let (head, tail) = rest.split_at_mut(n);
             let (chead, ctail) = crest.split_at_mut(nx);
             let (fhead, ftail) = frest.split_at_mut(nx);
             let (hhead, htail) = hrest.split_at_mut(nx);
             let (phead, ptail) = prest.split_at_mut(np);
             let (ohead, otail) = orest.split_at_mut(np);
-            slices.push((head, chead, fhead, hhead, phead, ohead));
+            let (bhead, btail) = brest.split_at_mut(nd);
+            slices.push((head, chead, fhead, hhead, phead, ohead, bhead));
             rest = tail;
             crest = ctail;
             frest = ftail;
             hrest = htail;
             prest = ptail;
             orest = otail;
+            brest = btail;
         }
     }
     // The second pass of the cross-run step: the experiment background per (candidate,
@@ -2846,7 +2870,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     let applied: Vec<Applied> = slices
         .par_iter_mut()
         .enumerate()
-        .map(|(ci, (out, cout, fout, hout, pout, oout))| {
+        .map(|(ci, (out, cout, fout, hout, pout, oout, bout))| {
             let c = index.cids[ci];
             let rows = index.rows_of(ci);
             let (lo_rt, hi_rt, integration_apex) = if !p.cfg.bound_peak {
@@ -3014,6 +3038,14 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                             if export {
                                 windows.push(Some(w.clone()));
                             }
+                            if detail {
+                                bout[slot] = match pooled {
+                                    Some(&b) => b,
+                                    None => baseline.map_or(f64::NAN, |(flank, quantile)| {
+                                        flank_baseline(it, lo, hi, flank, quantile) as f64
+                                    }),
+                                };
+                            }
                             integrate_window(&rt[lo..hi], w, p.cfg.interference_envelope)
                         }
                         None => {
@@ -3123,6 +3155,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     let corr_by_slot = corr_by_slot;
     let flank_by_slot = flank_by_slot;
     let flank_h_by_slot = flank_h_by_slot;
+    let bg_by_slot = bg_by_slot;
     // Fragments (and their candidates) without an experiment background, which kept the
     // per-run quantile.
     let bg_fallback_fragments: u64 = applied.iter().map(|x| x.bg_fallback as u64).sum();
@@ -3196,6 +3229,9 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     let weights = p.cross_run.and_then(|x| x.weights.as_ref());
     let mut n_weighted = 0u64;
     let mut n_pattern = 0u64;
+    // Under `out_quant_fragments`: per selection, the candidate position, the rule that made
+    // the quantity and the number of fragments it used. Empty otherwise.
+    let mut detail_rules: Vec<(usize, DetailRule, usize)> = Vec::new();
     // One pass over the accepted rows, in table order, which is the order the filter over
     // every row visited them in.
     for (k, &c) in acc_cid.iter().enumerate() {
@@ -3206,6 +3242,9 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                 let slot = *selected.entry(ci).or_insert_with(|| {
                     if let Some(q) = applied[ci].pattern {
                         n_pattern += 1;
+                        if detail {
+                            detail_rules.push((ci, DetailRule::Pattern, q.1));
+                        }
                         selections.push(q);
                         return selections.len() - 1;
                     }
@@ -3217,16 +3256,23 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                             w,
                         )
                     });
-                    if weighted.is_some() {
+                    let rule = if weighted.is_some() {
                         n_weighted += 1;
-                    }
-                    selections.push(weighted.unwrap_or_else(|| {
+                        DetailRule::Weighted
+                    } else {
+                        DetailRule::Ranked
+                    };
+                    let q = weighted.unwrap_or_else(|| {
                         select_fragment_areas(
                             Some((&area_by_slot[r.clone()], &index.slot_pred[r])),
                             p.cfg.top_n_fragments,
                             p.cfg.fragment_selection,
                         )
-                    }));
+                    });
+                    if detail {
+                        detail_rules.push((ci, rule, q.1));
+                    }
+                    selections.push(q);
                     selections.len() - 1
                 });
                 selections[slot]
@@ -3390,6 +3436,79 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         }
         let fragment_rows = write_table(fpath, cols)?;
         fragment_output = Some((fpath, fragment_rows));
+    }
+
+    // Optional account of the fragments behind every quantity (`quant_fragments` v1), in
+    // candidate order and, within a candidate, in chromatogram order.
+    let mut detail_output: Option<(&str, u64, u64, u64)> = None;
+    if let Some(dpath) = p.out_quant_fragments {
+        detail_rules.sort_by_key(|d| d.0);
+        let n_rows: usize = detail_rules
+            .iter()
+            .map(|&(ci, _, _)| index.slots(ci).len())
+            .sum();
+        let mut d_cid: Vec<u32> = Vec::with_capacity(n_rows);
+        let mut d_name: Vec<String> = Vec::with_capacity(n_rows);
+        let mut d_area: Vec<f64> = Vec::with_capacity(n_rows);
+        let mut d_sel: Vec<bool> = Vec::with_capacity(n_rows);
+        let mut d_weight: Vec<f64> = Vec::with_capacity(n_rows);
+        let mut d_rank: Vec<i32> = Vec::with_capacity(n_rows);
+        let mut d_bg: Vec<f64> = Vec::with_capacity(n_rows);
+        let mut d_rule: Vec<String> = Vec::with_capacity(n_rows);
+        for &(ci, rule, used) in &detail_rules {
+            let c = index.cids[ci];
+            let r = index.slots(ci);
+            let names: Vec<&str> = r.clone().map(|s| store.name(index.rows[s])).collect();
+            // The pattern rules fit only the fragments the experiment observed, exactly as
+            // phase 2 handed them to the fit.
+            let eligible: Vec<bool> = match (rule, pattern_fit) {
+                (DetailRule::Pattern, Some(fit)) => {
+                    let seen = fit.observed.get(&c);
+                    names
+                        .iter()
+                        .map(|nm| seen.is_some_and(|s| s.contains(*nm)))
+                        .collect()
+                }
+                _ => vec![false; names.len()],
+            };
+            let account = fragment_account(
+                &FragmentAccountInput {
+                    areas: &area_by_slot[r.clone()],
+                    preds: &index.slot_pred[r.clone()],
+                    names: &names,
+                    weights: weights.and_then(|fw| fw.get(&c)),
+                    eligible: &eligible,
+                },
+                rule,
+                used,
+                p.cfg.fragment_selection,
+            );
+            for (k, slot) in r.enumerate() {
+                d_cid.push(c);
+                d_name.push(names[k].to_string());
+                d_area.push(area_by_slot[slot]);
+                d_sel.push(account.selected[k]);
+                d_weight.push(account.weight[k]);
+                d_rank.push(account.rank[k]);
+                d_bg.push(bg_by_slot[slot]);
+                d_rule.push(account.rule.to_string());
+            }
+        }
+        let n_selected = d_sel.iter().filter(|&&b| b).count() as u64;
+        let rows = write_table(
+            dpath,
+            vec![
+                Col::U32("candidate_id".into(), d_cid),
+                Col::Str("fragment_name".into(), d_name),
+                Col::F64("area".into(), d_area),
+                Col::Bool("selected".into(), d_sel),
+                Col::F64("weight".into(), d_weight),
+                Col::I32("rank".into(), d_rank),
+                Col::F64("background".into(), d_bg),
+                Col::Str("rule".into(), d_rule),
+            ],
+        )?;
+        detail_output = Some((dpath, rows, detail_rules.len() as u64, n_selected));
     }
 
     let elapsed = t0.elapsed().as_millis();
@@ -3557,6 +3676,26 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         report.write_for(path)?;
         written.push(report.written());
     }
+    let mut detail_written: Option<Written> = None;
+    if let Some((path, rows, candidates, selected)) = detail_output {
+        let mut detail_stats = stats.clone();
+        detail_stats.insert("candidates".to_string(), json!(candidates));
+        detail_stats.insert("selected_fragments".to_string(), json!(selected));
+        let report = ArtifactReport {
+            logical_name: artifact::QUANT_FRAGMENTS.0.to_string(),
+            schema_name: artifact::QUANT_FRAGMENTS.0.to_string(),
+            schema_version: artifact::QUANT_FRAGMENTS.1,
+            stage: "quant".to_string(),
+            rows,
+            content_hash: mumdia_io::hash::blake3_file(path)?,
+            params: report_params.clone(),
+            stats: detail_stats,
+            model_identity: None,
+            elapsed_ms: elapsed,
+        };
+        report.write_for(path)?;
+        detail_written = Some(report.written());
+    }
     let mut fragment_written: Option<Written> = None;
     if let Some((path, rows)) = fragment_output {
         let report = ArtifactReport {
@@ -3593,7 +3732,156 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         peptide,
         protein,
         fragment: fragment_written,
+        quant_fragments: detail_written,
     })
+}
+
+/// Which rule made one candidate's quantity, for the fragment account
+/// ([`QuantParams::out_quant_fragments`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailRule {
+    /// The top-N sum of [`select_fragment_areas`], ranked by `quant.fragment_selection`
+    /// (`observed_area`, or `predicted`, which `cross_run` and the pattern rules fall back
+    /// to).
+    Ranked,
+    /// `sum(weight x area)` of [`weighted_quantity`], with the cross-run weights.
+    Weighted,
+    /// The pattern fit of [`quant_pattern::pattern_quantity`].
+    Pattern,
+}
+
+/// One candidate's fragments as the account reads them, parallel per slot.
+struct FragmentAccountInput<'a> {
+    areas: &'a [f64],
+    preds: &'a [f32],
+    names: &'a [&'a str],
+    /// The candidate's cross-run weights by fragment name, when it has any.
+    weights: Option<&'a BTreeMap<String, f64>>,
+    /// The pattern rules' eligibility per slot (the experiment observed the fragment).
+    eligible: &'a [bool],
+}
+
+/// Per slot of one candidate: whether the rule selected the fragment, its weight and its
+/// rank (1-based, 0 when the rule did not rank it), with the rule's configuration name.
+#[derive(Debug, PartialEq)]
+struct FragmentAccount {
+    selected: Vec<bool>,
+    weight: Vec<f64>,
+    rank: Vec<i32>,
+    rule: &'static str,
+}
+
+/// The fragment account of one candidate under the rule that made its quantity, `used`
+/// being the fragment count that rule reported (`n_fragments_used`).
+///
+/// - `Ranked`: every fragment with a positive finite area (and, ranked by library
+///   intensity, a finite one) is ranked in the order [`select_fragment_areas`] sorts it;
+///   the first `used` are selected and every weight is 1, so the selected areas summed in
+///   rank order are the quantity, bit for bit.
+/// - `Weighted`: the fragments [`weighted_quantity`] sums (positive finite area, positive
+///   weight) are selected and ranked by their contribution `weight x area`; a fragment
+///   without a fitted weight has weight NaN. The selected `weight x area` summed in
+///   chromatogram order are the quantity, bit for bit.
+/// - `Pattern`: the fragments [`quant_pattern::pattern_quantity`] fits are selected and
+///   ranked by library intensity. Their quantity is a fit of the window samples to the
+///   library pattern rather than a sum of areas, so every weight is NaN.
+fn fragment_account(
+    inp: &FragmentAccountInput,
+    rule: DetailRule,
+    used: usize,
+    selection: FragmentSelection,
+) -> FragmentAccount {
+    let n = inp.areas.len();
+    let mut selected = vec![false; n];
+    let mut rank = vec![0i32; n];
+    let (weight, name) = match rule {
+        DetailRule::Ranked => {
+            let order = ranked_fragment_slots(inp.areas, inp.preds, selection);
+            for (j, &s) in order.iter().enumerate() {
+                rank[s] = j as i32 + 1;
+                selected[s] = j < used;
+            }
+            let name = if selection == FragmentSelection::ObservedArea {
+                "observed_area"
+            } else {
+                "predicted"
+            };
+            (vec![1.0; n], name)
+        }
+        DetailRule::Weighted => {
+            let w: Vec<f64> = inp
+                .names
+                .iter()
+                .map(|nm| {
+                    inp.weights
+                        .and_then(|m| m.get(*nm))
+                        .copied()
+                        .unwrap_or(f64::NAN)
+                })
+                .collect();
+            let mut order: Vec<usize> = (0..n)
+                .filter(|&k| {
+                    let a = inp.areas[k];
+                    a.is_finite() && a > 0.0 && w[k] > 0.0
+                })
+                .collect();
+            order.sort_by(|&a, &b| (w[b] * inp.areas[b]).total_cmp(&(w[a] * inp.areas[a])));
+            for (j, &s) in order.iter().enumerate() {
+                rank[s] = j as i32 + 1;
+                selected[s] = true;
+            }
+            (w, "cross_run")
+        }
+        DetailRule::Pattern => {
+            let fitted = quant_pattern::pattern_fragments(inp.preds, inp.eligible);
+            for (j, &s) in fitted.iter().enumerate() {
+                rank[s] = j as i32 + 1;
+                selected[s] = true;
+            }
+            let name = if selection == FragmentSelection::PatternProfile {
+                "pattern_profile"
+            } else {
+                "pattern_fit"
+            };
+            (vec![f64::NAN; n], name)
+        }
+    };
+    FragmentAccount {
+        selected,
+        weight,
+        rank,
+        rule: name,
+    }
+}
+
+/// The slots [`select_fragment_areas`] ranks, in its order: the fragments with a positive
+/// finite area, by area under `observed_area`, and by library intensity (finite only), then
+/// area, under every other selection. The sorts are stable over slot order, as that
+/// function's are over its values, so ties fall the same way and the first `used` slots are
+/// the fragments its sum took.
+fn ranked_fragment_slots(areas: &[f64], preds: &[f32], selection: FragmentSelection) -> Vec<usize> {
+    let positive = |k: usize| areas[k].is_finite() && areas[k] > 0.0;
+    match selection {
+        FragmentSelection::ObservedArea => {
+            let mut order: Vec<usize> = (0..areas.len()).filter(|&k| positive(k)).collect();
+            order.sort_by(|&a, &b| areas[b].total_cmp(&areas[a]));
+            order
+        }
+        FragmentSelection::Predicted
+        | FragmentSelection::CrossRun
+        | FragmentSelection::PatternFit
+        | FragmentSelection::PatternProfile => {
+            let mut order: Vec<usize> = (0..areas.len())
+                .filter(|&k| positive(k) && preds[k].is_finite())
+                .collect();
+            order.sort_by(|&a, &b| {
+                preds[b]
+                    .total_cmp(&preds[a])
+                    .then(areas[b].total_cmp(&areas[a]))
+            });
+            order
+        }
+    }
 }
 
 /// Weighted quantity of one candidate: `sum(weight x area)` over its fragments with a
@@ -4513,6 +4801,7 @@ mod tests {
                 out_protein: &prot,
                 out_fragment: None,
                 out_peak_bounds: None,
+                out_quant_fragments: None,
                 cfg: &cfg,
                 config_hash: "test",
                 cross_run: None,
@@ -4638,6 +4927,7 @@ mod tests {
             out_protein: &protein,
             out_fragment: Some(&fragment),
             out_peak_bounds: Some(&bounds),
+            out_quant_fragments: None,
             cfg: &cfg,
             config_hash: "test",
             cross_run: None,
@@ -4906,6 +5196,7 @@ mod tests {
             out_protein: &protein,
             out_fragment: None,
             out_peak_bounds: None,
+            out_quant_fragments: None,
             cfg: &cfg,
             config_hash: "test",
             cross_run: None,
@@ -4943,6 +5234,7 @@ mod tests {
                 out_protein: &protein,
                 out_fragment: None,
                 out_peak_bounds: None,
+                out_quant_fragments: None,
                 cfg: &cfg,
                 config_hash: "test",
                 cross_run: None,
@@ -5045,6 +5337,7 @@ mod tests {
             out_protein: &out[1],
             out_fragment: Some(&out[2]),
             out_peak_bounds: None,
+            out_quant_fragments: None,
             cfg,
             config_hash: "test",
             cross_run: fit,
@@ -5213,6 +5506,382 @@ mod tests {
         assert_eq!(pq.opt_f64("quantity").unwrap(), vec![Some(612.5)]);
     }
 
+    /// One row of a fragment account: (candidate, fragment, area, selected, weight, rank,
+    /// background, rule).
+    type AccountRow = (u32, String, f64, bool, f64, i32, f64, String);
+
+    /// The rows of the fragment account at `path`, checking its columns.
+    fn account_rows(path: &str) -> Vec<AccountRow> {
+        assert_eq!(
+            column_names(path).unwrap(),
+            [
+                "candidate_id",
+                "fragment_name",
+                "area",
+                "selected",
+                "weight",
+                "rank",
+                "background",
+                "rule"
+            ]
+        );
+        let t = Table::read(path).unwrap();
+        let cid = t.u32("candidate_id").unwrap();
+        let name = t.str("fragment_name").unwrap();
+        let area = t.f64("area").unwrap();
+        let sel = t.bool("selected").unwrap();
+        let w = t.f64("weight").unwrap();
+        let rank = t.i32("rank").unwrap();
+        let bg = t.f64("background").unwrap();
+        let rule = t.str("rule").unwrap();
+        (0..cid.len())
+            .map(|i| {
+                (
+                    cid[i],
+                    name[i].clone(),
+                    area[i],
+                    sel[i],
+                    w[i],
+                    rank[i],
+                    bg[i],
+                    rule[i].clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The quantity the account of candidate `c` describes: the selected areas times their
+    /// weights, summed in rank order (the order the top-N sum adds them in).
+    fn account_quantity(rows: &[AccountRow], c: u32) -> f64 {
+        let mut sel: Vec<_> = rows.iter().filter(|r| r.0 == c && r.3).collect();
+        sel.sort_by_key(|r| r.5);
+        sel.iter().map(|r| r.4 * r.2).sum()
+    }
+
+    /// Every file a quant wrote, with each report's wall clock removed, for comparing two
+    /// quants of the same input.
+    fn quant_outputs(paths: &[&str]) -> Vec<(Vec<u8>, serde_json::Value)> {
+        paths
+            .iter()
+            .map(|p| {
+                let mut rep = report_of(p);
+                rep.as_object_mut().unwrap().remove("elapsed_ms");
+                (std::fs::read(p).unwrap(), rep)
+            })
+            .collect()
+    }
+
+    /// One quant of `(scored, chrom)` with and without the fragment account. Returns the
+    /// account's path; asserts that every other output is the same, byte for byte, and
+    /// that the account reports `quant_fragments` v1.
+    fn quant_with_account(
+        tag: &str,
+        input: &(String, String),
+        cfg: &QuantConfig,
+        fit: Option<&CrossRunFit>,
+    ) -> (String, String) {
+        let mut outs: Vec<Vec<(Vec<u8>, serde_json::Value)>> = Vec::new();
+        let mut account = String::new();
+        let mut peptide = String::new();
+        for with in [false, true] {
+            let out = [
+                quant_test_path(&format!("acc_{tag}_{with}_pep.parquet")),
+                quant_test_path(&format!("acc_{tag}_{with}_prot.parquet")),
+                quant_test_path(&format!("acc_{tag}_{with}_frag.parquet")),
+            ];
+            let acc = quant_test_path(&format!("acc_{tag}_{with}_qf.parquet"));
+            let w = run_hashed(QuantParams {
+                psms_scored: &input.0,
+                chromatograms: &[ChromTable::whole(&input.1)],
+                out_peptide: &out[0],
+                out_protein: &out[1],
+                out_fragment: Some(&out[2]),
+                out_peak_bounds: None,
+                out_quant_fragments: with.then_some(acc.as_str()),
+                cfg,
+                config_hash: "test",
+                cross_run: fit,
+                export_cross_run: false,
+                first_pass_ids: None,
+            })
+            .unwrap();
+            assert_eq!(w.quant_fragments.is_some(), with);
+            assert_eq!(std::path::Path::new(&acc).exists(), with);
+            outs.push(quant_outputs(&[&out[0], &out[1], &out[2]]));
+            if with {
+                let rep = report_of(&acc);
+                assert_eq!(rep["schema_name"], "quant_fragments");
+                assert_eq!(rep["schema_version"], 1);
+                assert_eq!(
+                    w.quant_fragments.unwrap().content_hash,
+                    rep["content_hash"].as_str().unwrap()
+                );
+                account = acc;
+                peptide = out[0].clone();
+            }
+        }
+        assert!(
+            outs[0] == outs[1],
+            "the fragment account changed another output of quant"
+        );
+        (account, peptide)
+    }
+
+    /// The account reproduces the reported quantity under each top-N rule, bit for bit, and
+    /// names the selected fragments: `observed_area` takes the largest areas, `predicted`
+    /// the library's strongest fragments whatever their areas.
+    #[test]
+    fn the_fragment_account_reproduces_the_top_n_quantities() {
+        let input = selection_fixture(true);
+        for (tag, cfg, want_sel, rule) in [
+            (
+                "observed",
+                QuantConfig {
+                    top_n_fragments: 2,
+                    fixed_window_s: 1.0,
+                    ..QuantConfig::default()
+                },
+                ["b2", "y3"],
+                "observed_area",
+            ),
+            (
+                "predicted",
+                QuantConfig {
+                    top_n_fragments: 2,
+                    fragment_selection: FragmentSelection::Predicted,
+                    fixed_window_s: 1.0,
+                    ..QuantConfig::default()
+                },
+                ["y3", "y5"],
+                "predicted",
+            ),
+        ] {
+            let (acc, pep) = quant_with_account(tag, &input, &cfg, None);
+            let rows = account_rows(&acc);
+            assert_eq!(rows.len(), 3, "{tag}: one row per fragment");
+            assert!(rows.iter().all(|r| r.0 == 1 && r.7 == rule && r.4 == 1.0));
+            let sel: Vec<&str> = rows.iter().filter(|r| r.3).map(|r| r.1.as_str()).collect();
+            let mut want = want_sel.to_vec();
+            want.sort();
+            let mut got = sel.clone();
+            got.sort();
+            assert_eq!(got, want, "{tag}");
+            // Ranks are 1..=3 over the three positive fragments, the selected ones first.
+            let mut ranks: Vec<i32> = rows.iter().map(|r| r.5).collect();
+            ranks.sort();
+            assert_eq!(ranks, [1, 2, 3]);
+            assert!(rows.iter().all(|r| r.3 == (r.5 <= 2)));
+            // No baseline subtraction: no background.
+            assert!(rows.iter().all(|r| r.6.is_nan()));
+            let q = Table::read(&pep).unwrap().opt_f64("quantity").unwrap()[0].unwrap();
+            assert_eq!(account_quantity(&rows, 1).to_bits(), q.to_bits(), "{tag}");
+        }
+    }
+
+    /// Under `cross_run` the account carries the fitted weights and reproduces `sum(weight x
+    /// area)`; the zero-area fragment stays in the table, unselected; the experiment
+    /// background is the background column. Without the fit the same configuration falls
+    /// back to `predicted`, and the account says so.
+    #[test]
+    fn the_fragment_account_reproduces_the_cross_run_quantity_and_its_fallback() {
+        let cfg = cross_run_cfg();
+        let runs = [
+            cross_run_fixture("acc0", 1.0),
+            cross_run_fixture("acc1", 2.0),
+        ];
+        let pass1: Vec<String> = runs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| cross_run_quant(&format!("accp1_{i}"), r, &cfg, None, true)[2].clone())
+            .collect();
+        let fit = fit_cross_run(&pass1, &cfg).unwrap();
+        for (i, r) in runs.iter().enumerate() {
+            let (acc, pep) = quant_with_account(&format!("crx{i}"), r, &cfg, Some(&fit));
+            let rows = account_rows(&acc);
+            let names: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+            assert_eq!(names, ["y3", "y4", "b2", "y7"]);
+            assert!(rows.iter().all(|r| r.7 == "cross_run"));
+            // y7 has no positive area in the first pass, so no weight.
+            assert_eq!(
+                rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                [true, true, true, false]
+            );
+            assert!(rows[..3].iter().all(|r| (r.4 - 10.0).abs() < 1e-9));
+            assert!(rows[3].4.is_nan());
+            assert_eq!(rows[3].2, 0.0);
+            assert_eq!(rows[3].5, 0);
+            assert_eq!(
+                rows.iter().map(|r| r.5).collect::<Vec<_>>(),
+                [1, 2, 3, 0],
+                "ranked by weight x area"
+            );
+            assert!(rows.iter().all(|r| r.6 == 0.0), "the experiment background");
+            let q = Table::read(&pep).unwrap().opt_f64("quantity").unwrap()[0].unwrap();
+            // `weighted_quantity` adds in chromatogram order.
+            let in_order: f64 = rows.iter().filter(|r| r.3).map(|r| r.4 * r.2).sum();
+            assert_eq!(in_order.to_bits(), q.to_bits());
+            assert!((account_quantity(&rows, 1) - q).abs() <= 1e-12 * q);
+        }
+        // The fallback: no fit, so `predicted` top 3 at +/-3 scans, and the per-run
+        // quantile background (zero flanks here).
+        let (acc, pep) = quant_with_account("crxfb", &runs[0], &cfg, None);
+        let rows = account_rows(&acc);
+        assert!(rows.iter().all(|r| r.7 == "predicted" && r.4 == 1.0));
+        assert_eq!(
+            rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+            [true, true, true, false]
+        );
+        assert!(rows.iter().all(|r| r.6 == 0.0));
+        let q = Table::read(&pep).unwrap().opt_f64("quantity").unwrap()[0].unwrap();
+        assert_eq!(q, 612.5);
+        assert_eq!(account_quantity(&rows, 1).to_bits(), q.to_bits());
+    }
+
+    /// [`ranked_fragment_slots`] takes the fragments [`select_fragment_areas`] sums, in its
+    /// order, for every top-N ranking, so the account reproduces the quantity bit for bit,
+    /// ties and non-finite values included; and [`fragment_account`] under `Weighted`
+    /// selects exactly what [`weighted_quantity`] sums.
+    #[test]
+    fn the_account_selects_what_the_quantity_sums_on_arbitrary_fragments() {
+        // A small deterministic generator, so the cases are the same on every machine.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let pool_a = [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            3.5,
+            3.5,
+            1e-300,
+            7.25,
+            100.0,
+            0.1,
+        ];
+        let pool_p = [0.0f32, f32::NAN, 1.0, 1.0, 0.5, 0.25, 2.0];
+        for case in 0..2000 {
+            let n = (next() % 9) as usize;
+            let areas: Vec<f64> = (0..n)
+                .map(|_| {
+                    pool_a[(next() % pool_a.len() as u64) as usize] * (1.0 + (next() % 3) as f64)
+                })
+                .collect();
+            let preds: Vec<f32> = (0..n)
+                .map(|_| pool_p[(next() % pool_p.len() as u64) as usize])
+                .collect();
+            let names: Vec<String> = (0..n).map(|k| format!("f{k}")).collect();
+            let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            for top_n in 0..5 {
+                for sel in [
+                    FragmentSelection::ObservedArea,
+                    FragmentSelection::Predicted,
+                ] {
+                    let (q, used, _) = select_fragment_areas(Some((&areas, &preds)), top_n, sel);
+                    let acc = fragment_account(
+                        &FragmentAccountInput {
+                            areas: &areas,
+                            preds: &preds,
+                            names: &name_refs,
+                            weights: None,
+                            eligible: &[],
+                        },
+                        DetailRule::Ranked,
+                        used,
+                        sel,
+                    );
+                    assert_eq!(acc.selected.iter().filter(|&&b| b).count(), used);
+                    let mut chosen: Vec<usize> = (0..n).filter(|&k| acc.selected[k]).collect();
+                    chosen.sort_by_key(|&k| acc.rank[k]);
+                    let sum: f64 = chosen.iter().map(|&k| acc.weight[k] * areas[k]).sum();
+                    if let Some(q) = q {
+                        assert_eq!(
+                            sum.to_bits(),
+                            q.to_bits(),
+                            "case {case} {sel:?} top {top_n}"
+                        );
+                    }
+                }
+            }
+            let mut weights: BTreeMap<String, f64> = BTreeMap::new();
+            for nm in &names {
+                if next() % 4 != 0 {
+                    weights.insert(nm.clone(), [0.0, 0.5, 2.0, -1.0][(next() % 4) as usize]);
+                }
+            }
+            if let Some((q, used, _)) =
+                weighted_quantity(&areas, name_refs.iter().copied(), &weights)
+            {
+                let acc = fragment_account(
+                    &FragmentAccountInput {
+                        areas: &areas,
+                        preds: &preds,
+                        names: &name_refs,
+                        weights: Some(&weights),
+                        eligible: &[],
+                    },
+                    DetailRule::Weighted,
+                    used,
+                    FragmentSelection::CrossRun,
+                );
+                assert_eq!(acc.selected.iter().filter(|&&b| b).count(), used);
+                let sum: f64 = (0..n)
+                    .filter(|&k| acc.selected[k])
+                    .map(|k| acc.weight[k] * areas[k])
+                    .sum();
+                assert_eq!(sum.to_bits(), q.unwrap().to_bits(), "case {case} weighted");
+            }
+        }
+    }
+
+    /// With a per-run baseline the background column is the flank quantile subtracted from
+    /// each fragment's window, and the area is what remains.
+    #[test]
+    fn the_fragment_account_records_the_per_run_background() {
+        let mut input = cross_run_fixture("accbg", 1.0);
+        // The same candidate on a floor of 5 under every sample of y3 and 2 under y4.
+        let chrom = quant_test_path("accbg_floor_chrom.parquet");
+        let grid: Vec<f32> = (0..41).map(|rt| rt as f32).collect();
+        let peak = |h: f32, floor: f32| -> Vec<f32> {
+            let mut v = vec![floor; 41];
+            for (d, x) in [(0usize, 100.0f32), (1, 80.0), (2, 40.0), (3, 10.0)] {
+                v[20 + d] = x * h + floor;
+                v[20 - d] = x * h + floor;
+            }
+            v
+        };
+        write_table(
+            &chrom,
+            vec![
+                Col::U32("candidate_id".into(), vec![1, 1]),
+                Col::Str("frag_name".into(), vec!["y3".into(), "y4".into()]),
+                Col::ListF32("rt".into(), vec![grid.clone(); 2]),
+                Col::ListF32("intensity".into(), vec![peak(1.0, 5.0), peak(0.5, 2.0)]),
+                Col::F32("predicted_intensity".into(), vec![1.0, 0.8]),
+            ],
+        )
+        .unwrap();
+        input.1 = chrom;
+        let cfg = QuantConfig {
+            baseline_subtract: true,
+            baseline_flank_scans: 3,
+            baseline_quantile: 0.5,
+            ..QuantConfig::default()
+        };
+        let (acc, pep) = quant_with_account("bg", &input, &cfg, None);
+        let rows = account_rows(&acc);
+        assert_eq!(rows.iter().map(|r| r.6).collect::<Vec<_>>(), [5.0, 2.0]);
+        // +/-3 scans less the floor: 10, 40, 80, 100, 80, 40, 10 (x 0.5 for y4).
+        assert_eq!(rows[0].2, 350.0);
+        assert_eq!(rows[1].2, 175.0);
+        let q = Table::read(&pep).unwrap().opt_f64("quantity").unwrap()[0].unwrap();
+        assert_eq!(account_quantity(&rows, 1).to_bits(), q.to_bits());
+    }
+
     #[test]
     fn an_empty_chromatogram_table_preserves_every_identification() {
         // Extraction can accept a candidate and still write no chromatogram for
@@ -5261,6 +5930,7 @@ mod tests {
             out_protein: &protein,
             out_fragment: None,
             out_peak_bounds: None,
+            out_quant_fragments: None,
             cfg: &cfg,
             config_hash: "test",
             cross_run: None,
@@ -5301,6 +5971,7 @@ mod tests {
             out_protein: &quant_test_path("err_protein.parquet"),
             out_fragment: None,
             out_peak_bounds: None,
+            out_quant_fragments: None,
             cfg: &cfg,
             config_hash: "test",
             cross_run: None,
@@ -5741,6 +6412,7 @@ mod tests {
             out_protein: &protein,
             out_fragment: Some(&fragment),
             out_peak_bounds: Some(&bounds),
+            out_quant_fragments: None,
             cfg: &cfg,
             config_hash: "test",
             cross_run: None,
@@ -5871,6 +6543,7 @@ mod tests {
                 out_protein: &protein,
                 out_fragment: None,
                 out_peak_bounds: bounds.as_deref(),
+                out_quant_fragments: None,
                 cfg: &cfg,
                 config_hash: "test",
                 cross_run: None,
@@ -6754,6 +7427,7 @@ mod tests {
             out_protein: &prot,
             out_fragment: None,
             out_peak_bounds: None,
+            out_quant_fragments: None,
             cfg: &QuantConfig::default(),
             config_hash: "test",
             cross_run: None,
@@ -6959,6 +7633,7 @@ mod tests {
                 out_protein: &prot,
                 out_fragment: Some(&frag),
                 out_peak_bounds: bounds.then_some(pb.as_str()),
+                out_quant_fragments: None,
                 cfg: &cfg,
                 config_hash: "test",
                 cross_run: None,
@@ -7085,6 +7760,7 @@ mod tests {
                 out_protein: &prot,
                 out_fragment: Some(&frag),
                 out_peak_bounds: Some(&pb),
+                out_quant_fragments: None,
                 cfg: &QuantConfig::default(),
                 config_hash: "test",
                 cross_run: None,
@@ -7224,6 +7900,7 @@ mod tests {
                     out_protein: &prot,
                     out_fragment: Some(&frag),
                     out_peak_bounds: None,
+                    out_quant_fragments: None,
                     cfg: &QuantConfig::default(),
                     config_hash: "test",
                     cross_run: None,
@@ -7420,6 +8097,7 @@ mod tests {
                 out_protein: &protein,
                 out_fragment: Some(&fragment),
                 out_peak_bounds: None,
+                out_quant_fragments: None,
                 cfg: &cfg,
                 config_hash: "test",
                 cross_run: None,
@@ -8321,6 +8999,7 @@ mod pattern_tests {
             out_protein: &prot,
             out_fragment: fragment,
             out_peak_bounds: None,
+            out_quant_fragments: None,
             cfg,
             config_hash: "test",
             cross_run: fit,
@@ -8514,5 +9193,60 @@ mod pattern_tests {
             Table::read(&a).unwrap().opt_f64("quantity").unwrap(),
             Table::read(&c).unwrap().opt_f64("quantity").unwrap()
         );
+    }
+
+    /// Under a pattern rule the account selects the fragments the fit used
+    /// (`n_fragments_used` of them), ranks them by library intensity and gives no weight,
+    /// since the quantity is a fit and not a sum of areas; the other outputs do not change.
+    #[test]
+    fn the_fragment_account_of_a_pattern_rule_names_the_fitted_fragments() {
+        let cfg = QuantConfig {
+            fragment_selection: FragmentSelection::PatternFit,
+            window_centre: WindowCentre::Profile,
+            ..QuantConfig::default()
+        };
+        let (fit, peps) = cross_run_experiment(&cfg);
+        let tables = run_tables(0);
+        let acc = path("acc_pattern.parquet");
+        let pep = path("acc_pattern_pep.parquet");
+        let prot = path("acc_pattern_prot.parquet");
+        run(QuantParams {
+            psms_scored: &tables.0,
+            chromatograms: &[ChromTable::whole(&tables.1)],
+            out_peptide: &pep,
+            out_protein: &prot,
+            out_fragment: None,
+            out_peak_bounds: None,
+            out_quant_fragments: Some(&acc),
+            cfg: &cfg,
+            config_hash: "test",
+            cross_run: Some(&fit),
+            export_cross_run: false,
+            first_pass_ids: None,
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&pep).unwrap(),
+            std::fs::read(&peps[0]).unwrap()
+        );
+        let t = Table::read(&acc).unwrap();
+        let cid = t.u32("candidate_id").unwrap();
+        assert!(cid.windows(2).all(|w| w[0] <= w[1]), "sorted by candidate");
+        let sel = t.bool("selected").unwrap();
+        let name = t.str("fragment_name").unwrap();
+        assert!(t.str("rule").unwrap().iter().all(|r| r == "pattern_fit"));
+        assert!(t.f64("weight").unwrap().iter().all(|w| w.is_nan()));
+        let q = Table::read(&pep).unwrap();
+        for (c, used) in q
+            .u32("candidate_id")
+            .unwrap()
+            .into_iter()
+            .zip(q.i32("n_fragments_used").unwrap())
+        {
+            let n = (0..cid.len()).filter(|&i| cid[i] == c && sel[i]).count();
+            assert_eq!(n as i32, used, "candidate {c}");
+        }
+        // Candidate 10's f7 was never observed, so the fit cannot use it.
+        assert!(!(0..cid.len()).any(|i| cid[i] == 10 && name[i] == "f7" && sel[i]));
     }
 }

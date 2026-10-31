@@ -1434,6 +1434,7 @@ mod tests {
                 out_protein: &prot,
                 out_fragment: Some(&frag),
                 out_peak_bounds: None,
+                out_quant_fragments: None,
                 cfg: &mumdia_core::config::QuantConfig::default(),
                 config_hash: "test",
                 cross_run: None,
