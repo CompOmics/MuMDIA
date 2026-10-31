@@ -457,9 +457,37 @@ jobs:
       - name: Install the Tauri bundler
         run: cargo install tauri-cli --version "^2" --locked
 
+      # The Microsoft Visual C++ x64 runtime that PyTorch needs on Windows. A machine
+      # without a current one cannot load `torch\lib\c10.dll` (`WinError 1114`), so the
+      # MSI carries Microsoft's merge module from the runner's Visual Studio
+      # (`desktop/src-tauri/wix/vc-runtime.wxs`, desktop/README.md "The Visual C++
+      # runtime"). The module itself is checked before the build: a runner image without
+      # it, or with one older than PyTorch accepts, fails here rather than shipping an
+      # installer that leaves the user's first search to find out.
+      - name: Locate the Visual C++ runtime merge module (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $msm = & ./ci/find_vc_merge_module.ps1
+          if (-not $msm) { Write-Error "no merge module found"; exit 1 }
+          Write-Output "merge module: $msm"
+          & ./ci/check_msi_runtime.ps1 -Msi $msm
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "TAURI_MUMDIA_VC_CRT_MSM=$msm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # On Windows the overlay adds the merge module (`tauri.vcruntime.conf.json`); the
+      # bundler passes TAURI_* variables, and only those, to WiX, which is how the
+      # fragment finds the module.
       - name: Build the installer
         working-directory: desktop
-        run: cargo tauri build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cargo tauri build --config src-tauri/tauri.vcruntime.conf.json
+          else
+            cargo tauri build
+          fi
 
       - name: Collect the installers
         shell: bash
@@ -517,6 +545,10 @@ jobs:
           }
           & (Join-Path $app.FullName "binaries\mumdia.exe") --version
           if ($LASTEXITCODE -ne 0) { Write-Error "the bundled engine does not run"; exit 1 }
+          # The Visual C++ runtime: the merge module's record, the three DLLs PyTorch
+          # loads at 14.40 or newer, and their placement in the 64-bit system directory.
+          & ./ci/check_msi_runtime.ps1 -Msi $msi
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Verify the bundle contents (Linux)
         if: runner.os == 'Linux'

@@ -1134,6 +1134,10 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
     "MUMDIA_RTW_FEATURES": (
         "on when unset; `0` leaves the window-scaled RT error family out (`features.rs` `env_families`)"
     ),
+    "MUMDIA_DOCTOR_IMPORT_CHECK": (
+        "on when unset: `mumdia doctor` imports each used role's modules for real; `0` "
+        "skips that import, as `--no-import-check` does (`main.rs` `real_main`)"
+    ),
     "HOME": (
         "set by the operating system; on Unix and macOS the per-user cache directory "
         "under it holds the engine's caches when MUMDIA_CACHE_DIR is unset (`cache.rs` `root`)"

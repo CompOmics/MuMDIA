@@ -242,6 +242,7 @@ pub fn validate(config_path: &str) -> Result<(), String> {
     // ask, and would report a perfectly good sidecar configuration as unusable.
     let mut cmd = crate::engine::command(&exe);
     crate::components::stamp_env(&mut cmd);
+    crate::components::skip_doctor_import_check(&mut cmd);
     let out = cmd
         .args(["doctor", "--config", config_path, "--json"])
         .output()

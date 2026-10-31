@@ -132,6 +132,43 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **The desktop installer provides the Microsoft Visual C++ x64 runtime that PyTorch
+  needs on Windows.** The MSI merges Microsoft's runtime merge module from the build
+  runner's Visual Studio, so a fresh installation can load `torch\lib\c10.dll`. It needs
+  no network at install time, never replaces a newer runtime, and leaves the shared runtime
+  in place on uninstall. The release workflow and a new Windows CI job check the built MSI
+  for the module and its DLLs (`ci/check_msi_runtime.ps1`), and the CI job installs and
+  uninstalls it on a runner with a newer runtime. The runtime is redistributed under the
+  Visual Studio license terms (desktop/README.md, "The Visual C++ runtime").
+- **Install Visual C++ runtime, on the Components screen.** On Windows, when the real
+  import fails on a torch DLL, the screen offers to install the runtime. On that click only,
+  the application downloads Microsoft's redistributable, refuses it unless its Authenticode
+  signature is valid and from Microsoft Corporation, runs it elevated after Windows'
+  permission prompt, reports its exit code (installed, already installed, restart
+  required, or the failure with the manual link) and tests the packages again.
+
+### Fixed
+
+- **A Python environment whose torch cannot load is reported before a search, not two
+  minutes into one.** `mumdia doctor` and the desktop application checked the sidecar
+  packages with `importlib.util.find_spec`, which locates a package without loading its
+  native libraries, so a torch that could not initialise its DLLs on Windows passed every
+  check and the first DeepLC worker stopped with `OSError: [WinError 1114] ... c10.dll`.
+  `doctor` now imports each used role's modules for real by default (`deeplc` first, then
+  one torch operation, 120 s per role) and fails a role whose import fails, with the end
+  of the traceback and, for a torch DLL failure, the fix: install the Microsoft Visual
+  C++ 2015-2022 x64 runtime and reboot, or remove an older `msvcp140.dll` earlier on
+  `PATH`. `--no-import-check` or `MUMDIA_DOCTOR_IMPORT_CHECK=0` skips it; the JSON
+  report gains `import_check` and, per role, `import_checked`, `unloadable`,
+  `import_error` and `hint`, and no field changed. The desktop application runs the same
+  import when an installation finishes and the first time a session finds an installed
+  environment, marks an environment that fails it as unusable, shows the traceback in the
+  installation log and offers Re-check. A torch-backed worker that fails during a run is
+  followed by one real import in the same interpreter, whose result and hint are appended
+  to the engine's error. Search outputs are unchanged (docs/17_troubleshooting.md, "The
+  torch DLL crash: two causes").
+### Added
+
 - **A search without a retention-time calibration is reported as degraded.** When a run's
   seed leaves fewer target anchors than `rt_im_train.min_seed_for_calibration`, its
   retention-time windows are unbounded or the broad fixed fallback, and the search finishes

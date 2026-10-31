@@ -285,17 +285,15 @@ fn candidates(role: Role) -> Vec<(PathBuf, &'static str)> {
 /// Ask an interpreter which of `modules` it cannot import. `Ok(vec![])` means all
 /// of them are importable.
 ///
-/// `find_spec` rather than a real import: importing torch or deeplc costs seconds
-/// and, for DeepLC specifically, has an ordering constraint the workers satisfy but
-/// a probe would not. The trade is that a package which is present but broken still
-/// passes here, which is why the container image runs a real import in CI.
+/// `find_spec` rather than a real import: importing torch or deeplc costs seconds,
+/// and discovery runs this for every candidate interpreter at the start of every run.
+/// The trade is that a package which is present but cannot load (a torch whose DLLs
+/// fail to initialise, for instance) still passes here. [`import_probe`] is the real
+/// import that catches it, and `doctor` runs it by default.
 pub fn missing_modules(python: &Path, modules: &[&str]) -> Result<Vec<String>> {
-    let code = format!(
-        "import importlib.util as u; \
-         print(','.join(p for p in '{}'.split(',') if u.find_spec(p) is None))",
-        modules.join(",")
-    );
-    let out = Command::new(python).args(["-c", &code]).output();
+    let out = Command::new(python)
+        .args(["-c", &missing_modules_script(modules)])
+        .output();
     match out {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -314,6 +312,216 @@ pub fn missing_modules(python: &Path, modules: &[&str]) -> Result<Vec<String>> {
                 if err.is_empty() { "no output" } else { &err }
             )
         }
+        Err(e) => bail!("cannot run {}: {e}", python.display()),
+    }
+}
+
+/// The script `missing_modules` runs: `find_spec` over `modules`, printing the absent
+/// ones comma-separated.
+fn missing_modules_script(modules: &[&str]) -> String {
+    format!(
+        "import importlib.util as u; \
+         print(','.join(p for p in '{}'.split(',') if u.find_spec(p) is None))",
+        modules.join(",")
+    )
+}
+
+/// How long `doctor`'s real import of one role's modules may take before it is reported
+/// as hung. A cold `import deeplc` (which loads torch) takes seconds; the first one after
+/// an installation on Windows can take tens of seconds while the new files are scanned.
+pub const IMPORT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The bound on the import probe that follows a failed worker (`sidecar`): shorter,
+/// because it only adds a diagnosis to an error the run already has.
+pub const FAILURE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What to do when PyTorch cannot load its DLLs on Windows. Repeated in the desktop
+/// application (`desktop/src-tauri/src/loadcheck.rs`), which cannot depend on this crate;
+/// the two are kept word for word.
+pub const VC_RUNTIME_HINT: &str = "PyTorch cannot load its DLLs on this machine. This is \
+     usually a missing or outdated Microsoft Visual C++ 2015-2022 x64 runtime: install the \
+     latest one from https://aka.ms/vs/17/release/vc_redist.x64.exe, reboot, then check \
+     again. If it is already installed, an older msvcp140.dll or vcruntime140.dll earlier \
+     on PATH can be loaded instead of it: `where msvcp140.dll` lists every copy Windows \
+     finds, in the order it tries them. See docs/17_troubleshooting.md.";
+
+/// The fix for an import failure, when its output names one this module recognises.
+///
+/// Recognised: PyTorch's Windows DLL failures, `[WinError 1114]` (a DLL initialization
+/// routine failed) or `[WinError 126]` (a module could not be found) while loading a file
+/// under `torch\lib`, and the `DLL load failed while importing` form of the same, all of
+/// which a missing or outdated Visual C++ runtime produces. The text is matched without
+/// regard to case or path separators, so the same function reads a probe's stderr and a
+/// worker's traceback.
+pub fn load_failure_hint(text: &str) -> Option<&'static str> {
+    let t = text.to_ascii_lowercase();
+    let names_torch = t.contains("c10.dll") || t.contains("torch");
+    let dll_error = t.contains("winerror 1114")
+        || t.contains("winerror 126")
+        || t.contains("dll load failed")
+        || t.contains("dll initialization routine failed");
+    (names_torch && dll_error).then_some(VC_RUNTIME_HINT)
+}
+
+/// What a real import of a role's modules found (`import_probe`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportProbe {
+    /// Every installed module imported, and torch, when it is one of them, ran an
+    /// operation.
+    Loaded,
+    /// `module` is installed but raising, or crashing the interpreter, on import.
+    /// `detail` is the tail of the interpreter's stderr, traceback included.
+    Unloadable { module: String, detail: String },
+    /// The interpreter had not finished importing after `seconds`.
+    TimedOut { seconds: u64 },
+}
+
+/// The script `import_probe` runs: a real import of each of `modules` in order, skipping
+/// the ones `find_spec` cannot locate (absence is `missing_modules`'s report, not this
+/// one's), and one torch operation once torch is loaded.
+///
+/// `deeplc` is moved to the front when present, because that is the order every DeepLC
+/// worker imports in (docs/13_sidecars.md) and a probe that imported numpy first could
+/// fail where the workers do not. Each import is announced before it is attempted, so a
+/// module that kills the interpreter outright (an access violation in a native extension)
+/// is still named.
+pub fn import_probe_script(modules: &[&str]) -> String {
+    let mut order: Vec<&str> = modules.iter().copied().filter(|m| *m == "deeplc").collect();
+    order.extend(modules.iter().copied().filter(|m| *m != "deeplc"));
+    let list = order
+        .iter()
+        .map(|m| format!("'{m}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "import importlib.util, sys, traceback\n\
+         for m in [{list}]:\n\
+         \x20   if importlib.util.find_spec(m) is None:\n\
+         \x20       continue\n\
+         \x20   print('MUMDIA_TRY ' + m, flush=True)\n\
+         \x20   try:\n\
+         \x20       __import__(m)\n\
+         \x20       if m == 'torch':\n\
+         \x20           sys.modules['torch'].zeros(1)\n\
+         \x20   except BaseException:\n\
+         \x20       traceback.print_exc()\n\
+         \x20       sys.stderr.flush()\n\
+         \x20       print('MUMDIA_UNLOADABLE ' + m, flush=True)\n\
+         \x20       sys.exit(3)\n\
+         print('MUMDIA_IMPORT_OK', flush=True)\n"
+    )
+}
+
+/// Read an import probe's output. Separate from the process handling so the rules can
+/// be tested on fixed text.
+pub fn judge_import_probe(success: bool, stdout: &str, stderr: &str) -> ImportProbe {
+    let mut tried = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line == "MUMDIA_IMPORT_OK" && success {
+            return ImportProbe::Loaded;
+        }
+        if let Some(m) = line.strip_prefix("MUMDIA_UNLOADABLE ") {
+            return ImportProbe::Unloadable {
+                module: m.to_string(),
+                detail: tail_lines(stderr, 15),
+            };
+        }
+        if let Some(m) = line.strip_prefix("MUMDIA_TRY ") {
+            tried = Some(m.to_string());
+        }
+    }
+    // No verdict line: the interpreter died, most likely inside the last import it
+    // announced.
+    ImportProbe::Unloadable {
+        module: tried.unwrap_or_else(|| "python".to_string()),
+        detail: tail_lines(stderr, 15),
+    }
+}
+
+/// The last `n` non-empty lines of `s`.
+pub fn tail_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// Run `cmd` to completion with both streams captured, or kill it after `timeout`.
+/// `Ok(None)` is a timeout.
+pub fn output_with_timeout(
+    mut cmd: Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Both pipes are drained on their own threads: a traceback larger than the pipe
+    // buffer would otherwise block the child and turn a failure into a timeout.
+    fn drain<R: Read + Send + 'static>(r: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let out = drain(child.stdout.take());
+    let err = drain(child.stderr.take());
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    Ok(Some(std::process::Output {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    }))
+}
+
+/// The command `import_probe` runs. UTF-8 output, because a traceback quotes paths, and a
+/// Windows user's profile path need not be representable in the console code page.
+fn import_probe_command(python: &Path, modules: &[&str]) -> Command {
+    let mut cmd = Command::new(python);
+    cmd.args(["-c", &import_probe_script(modules)])
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8");
+    cmd
+}
+
+/// Import `modules` for real in `python`, which `missing_modules` deliberately does not.
+///
+/// `find_spec` only locates a package; it never loads a native library. A torch whose
+/// DLLs cannot initialise on the machine, typically for want of the Visual C++ runtime,
+/// therefore passes `missing_modules` and then kills the first worker that imports it,
+/// minutes into a search. This is the check that catches it: `doctor` runs it by default,
+/// and a failed worker runs it to explain itself (`sidecar`). `Err` means the
+/// interpreter could not be started at all.
+pub fn import_probe(
+    python: &Path,
+    modules: &[&str],
+    timeout: std::time::Duration,
+) -> Result<ImportProbe> {
+    match output_with_timeout(import_probe_command(python, modules), timeout) {
+        Ok(Some(o)) => Ok(judge_import_probe(
+            o.status.success(),
+            &String::from_utf8_lossy(&o.stdout),
+            &String::from_utf8_lossy(&o.stderr),
+        )),
+        Ok(None) => Ok(ImportProbe::TimedOut {
+            seconds: timeout.as_secs(),
+        }),
         Err(e) => bail!("cannot run {}: {e}", python.display()),
     }
 }
@@ -1015,5 +1223,182 @@ mod tests {
             Some(AUTO),
             "an unresolved \"auto\" must not survive into the resolved config"
         );
+    }
+    /// The traceback a Windows user's DeepLC worker printed, cut to the lines that matter.
+    const WINERROR_1114: &str = r#"Traceback (most recent call last):
+  File "C:\Program Files\MuMDIA\binaries\scripts/deeplc_finetune.py", line 67, in <module>
+    import deeplc   # import before numpy (OpenMP load order)
+  File "C:\Users\x\AppData\Roaming\MuMDIA\python\Lib\site-packages\deeplc\core.py", line 10, in <module>
+    import torch
+  File "C:\Users\x\AppData\Roaming\MuMDIA\python\Lib\site-packages\torch\__init__.py", line 292, in _load_dll_libraries
+    raise err
+OSError: [WinError 1114] A dynamic link library (DLL) initialization routine failed. Error loading "C:\Users\x\AppData\Roaming\MuMDIA\python\Lib\site-packages\torch\lib\c10.dll" or one of its dependencies."#;
+
+    #[test]
+    fn a_torch_dll_failure_is_answered_with_the_runtime_hint() {
+        assert_eq!(load_failure_hint(WINERROR_1114), Some(VC_RUNTIME_HINT));
+        for text in [
+            r#"OSError: [WinError 126] The specified module could not be found. Error loading "C:\env\Lib\site-packages\torch\lib\fbgemm.dll" or one of its dependencies."#,
+            "ImportError: DLL load failed while importing _C: The specified module could not \
+             be found. (torch/_C)",
+            "oserror: [winerror 1114] ... error loading \"c:/env/torch/lib/c10.dll\"",
+        ] {
+            assert_eq!(load_failure_hint(text), Some(VC_RUNTIME_HINT), "{text}");
+        }
+        // Not a DLL failure, or not torch's: no hint, rather than a wrong one.
+        for text in [
+            "ModuleNotFoundError: No module named 'torch'",
+            r#"OSError: [WinError 126] The specified module could not be found. Error loading "C:\env\Lib\site-packages\duckdb\duckdb.dll""#,
+            "RuntimeError: CUDA out of memory",
+            "",
+        ] {
+            assert_eq!(load_failure_hint(text), None, "{text}");
+        }
+        let hint = VC_RUNTIME_HINT;
+        assert!(hint.contains("https://aka.ms/vs/17/release/vc_redist.x64.exe"));
+        assert!(hint.contains("where msvcp140.dll"));
+        assert!(hint.contains("reboot"));
+    }
+
+    #[test]
+    fn the_probe_imports_deeplc_first_and_runs_torch() {
+        let s = import_probe_script(&["numpy", "pandas", "pyarrow", "torch", "deeplc"]);
+        let list = s.lines().find(|l| l.starts_with("for m in")).unwrap();
+        assert_eq!(
+            list, "for m in ['deeplc', 'numpy', 'pandas', 'pyarrow', 'torch']:",
+            "deeplc must be imported before numpy, as every DeepLC worker does"
+        );
+        assert!(s.contains("sys.modules['torch'].zeros(1)"));
+        assert!(s.contains("find_spec(m) is None"));
+        // Without deeplc the order is the role's own.
+        let s = import_probe_script(&["torch", "numpy"]);
+        assert!(s.contains("for m in ['torch', 'numpy']:"));
+    }
+
+    #[test]
+    fn a_probe_is_judged_by_its_marker_lines() {
+        assert_eq!(
+            judge_import_probe(true, "MUMDIA_TRY deeplc\nMUMDIA_IMPORT_OK\n", ""),
+            ImportProbe::Loaded
+        );
+        assert_eq!(
+            judge_import_probe(
+                false,
+                "MUMDIA_TRY deeplc\nMUMDIA_UNLOADABLE deeplc\n",
+                WINERROR_1114
+            ),
+            ImportProbe::Unloadable {
+                module: "deeplc".into(),
+                detail: tail_lines(WINERROR_1114, 15),
+            }
+        );
+        // The interpreter died inside an import: the last one announced is named.
+        match judge_import_probe(false, "MUMDIA_TRY deeplc\nMUMDIA_TRY torch\n", "") {
+            ImportProbe::Unloadable { module, .. } => assert_eq!(module, "torch"),
+            other => panic!("{other:?}"),
+        }
+        // A verdict line from a process that then failed is not a success.
+        assert!(matches!(
+            judge_import_probe(false, "MUMDIA_IMPORT_OK\n", ""),
+            ImportProbe::Unloadable { .. }
+        ));
+        assert_eq!(tail_lines("a\n\nb\nc\n", 2), "b\nc");
+    }
+
+    /// A Python interpreter on this host, or `None` to skip the tests that need one.
+    fn any_python() -> Option<PathBuf> {
+        ["python3", "python"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| {
+                Command::new(p)
+                    .args(["-c", "import sys; sys.exit(0)"])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+            })
+    }
+
+    #[test]
+    fn a_package_that_cannot_load_passes_find_spec_and_fails_the_real_import() {
+        let Some(py) = any_python() else {
+            eprintln!("skipped: no Python interpreter on this host");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mumdia-loadprobe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (name, body) in [
+            ("okpkg", "VALUE = 1\n"),
+            (
+                "brokenpkg",
+                "raise OSError(r'[WinError 1114] A dynamic link library (DLL) initialization \
+                 routine failed. Error loading \"C:\\env\\torch\\lib\\c10.dll\" or one of its \
+                 dependencies.')\n",
+            ),
+            ("crashpkg", "import os\nos._exit(9)\n"),
+        ] {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+            std::fs::write(dir.join(name).join("__init__.py"), body).unwrap();
+        }
+        let path = dir.to_string_lossy().into_owned();
+
+        // find_spec, as `missing_modules` runs it: every package is present.
+        let o = Command::new(&py)
+            .args([
+                "-c",
+                &missing_modules_script(&["okpkg", "brokenpkg", "crashpkg"]),
+            ])
+            .env("PYTHONPATH", &path)
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+        assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "");
+
+        let probe = |mods: &[&str]| {
+            let mut cmd = import_probe_command(&py, mods);
+            cmd.env("PYTHONPATH", &path);
+            let o = output_with_timeout(cmd, IMPORT_PROBE_TIMEOUT)
+                .unwrap()
+                .expect("the probe must not time out");
+            judge_import_probe(
+                o.status.success(),
+                &String::from_utf8_lossy(&o.stdout),
+                &String::from_utf8_lossy(&o.stderr),
+            )
+        };
+        // The real import: the broken package is named, with its traceback, and the
+        // traceback earns the runtime hint.
+        match probe(&["okpkg", "brokenpkg"]) {
+            ImportProbe::Unloadable { module, detail } => {
+                assert_eq!(module, "brokenpkg");
+                assert!(detail.contains("WinError 1114"), "{detail}");
+                assert_eq!(load_failure_hint(&detail), Some(VC_RUNTIME_HINT));
+            }
+            other => panic!("expected the broken package to be reported: {other:?}"),
+        }
+        // A package that kills the interpreter is still named.
+        match probe(&["okpkg", "crashpkg"]) {
+            ImportProbe::Unloadable { module, .. } => assert_eq!(module, "crashpkg"),
+            other => panic!("{other:?}"),
+        }
+        // Absent modules are skipped (that is `missing_modules`' report); the rest load.
+        assert_eq!(
+            probe(&["okpkg", "not_a_module_mumdia"]),
+            ImportProbe::Loaded
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_probe_that_hangs_is_killed_at_the_timeout() {
+        let Some(py) = any_python() else {
+            eprintln!("skipped: no Python interpreter on this host");
+            return;
+        };
+        let mut cmd = Command::new(&py);
+        cmd.args(["-c", "import time; time.sleep(30)"]);
+        let t = std::time::Instant::now();
+        let out = output_with_timeout(cmd, std::time::Duration::from_millis(500)).unwrap();
+        assert!(out.is_none());
+        assert!(t.elapsed() < std::time::Duration::from_secs(20));
     }
 }

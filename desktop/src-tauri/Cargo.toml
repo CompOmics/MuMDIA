@@ -41,3 +41,17 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # from one that needs msconvert. The engine's own probe uses the same crate and minor
 # version; `bundled` builds SQLite from source, so no system library is needed.
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+# The elevated launch of Microsoft's Visual C++ runtime installer (`vcruntime::win`):
+# `ShellExecuteExW` with the `runas` verb, then a wait for its exit code (its
+# `SHELLEXECUTEINFOW` needs `Win32_System_Registry`). Already in the lockfile through
+# Tauri, so this adds features, not a crate.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }

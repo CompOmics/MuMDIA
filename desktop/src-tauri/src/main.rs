@@ -22,6 +22,7 @@ struct AppState {
     diann_installer: Arc<diann::Installer>,
     thermo: Arc<thermo::Installer>,
     viewers: Arc<viewer::Viewers>,
+    vcruntime: Arc<mumdia_console::vcruntime::Installer>,
 }
 
 /// Show a results folder in visDIA, starting the viewer if needed, and return its
@@ -191,13 +192,27 @@ fn engine_info() -> Result<engine::Info, String> {
 /// The state of the managed Python environment.
 #[tauri::command]
 fn components_status(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    let primary = state.installer.refresh(components::Env::Primary);
+    // Reported separately because it is optional and cannot share the primary
+    // environment: MS2PIP and DeepLC pin incompatible sqlalchemy majors.
+    let ms2pip = state.installer.refresh(components::Env::Ms2pip);
+    // Optional, for "Open in visDIA" on the Results and History screens.
+    let visdia = state.installer.refresh(components::Env::Visdia);
+    // Whether to offer "Install Visual C++ runtime": on Windows, when a real import failed
+    // on a torch DLL. Read from the statuses above, so it cannot disagree with the cards.
+    let vc_needed = mumdia_console::vcruntime::available()
+        && [&primary, &ms2pip, &visdia]
+            .iter()
+            .any(|s| mumdia_console::vcruntime::applies(s.load_error.as_deref()));
     serde_json::json!({
-        "primary": state.installer.refresh(components::Env::Primary),
-        // Reported separately because it is optional and cannot share the primary
-        // environment: MS2PIP and DeepLC pin incompatible sqlalchemy majors.
-        "ms2pip": state.installer.refresh(components::Env::Ms2pip),
-        // Optional, for "Open in visDIA" on the Results and History screens.
-        "visdia": state.installer.refresh(components::Env::Visdia),
+        "primary": primary,
+        "ms2pip": ms2pip,
+        "visdia": visdia,
+        "vc_runtime": {
+            "available": mumdia_console::vcruntime::available(),
+            "needed": vc_needed,
+            "state": state.vcruntime.snapshot(),
+        },
     })
 }
 
@@ -214,6 +229,46 @@ fn components_install(
         Arc::clone(&state.installer),
         env.unwrap_or(components::Env::Primary),
     )
+}
+
+/// Test again whether an environment's packages load (`components::Installer::recheck`),
+/// for after the user fixed something outside the application, such as installing the
+/// Visual C++ runtime. The interface polls `components_status` for the result.
+#[tauri::command]
+fn components_recheck(
+    state: tauri::State<'_, AppState>,
+    env: Option<components::Env>,
+) -> Result<(), String> {
+    state
+        .installer
+        .recheck(env.unwrap_or(components::Env::Primary))
+}
+
+/// Download Microsoft's Visual C++ x64 runtime installer, check that it is signed by
+/// Microsoft, and run it elevated (`vcruntime::install`). Only ever on the user's click;
+/// Windows shows its permission prompt. When it leaves the runtime installed, every
+/// environment whose packages failed to load is tested again, as Re-check does. The
+/// interface polls `vcruntime_state`.
+#[tauri::command]
+fn vcruntime_install(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let installer = Arc::clone(&state.installer);
+    mumdia_console::vcruntime::install(Arc::clone(&state.vcruntime), move || {
+        for env in [
+            components::Env::Primary,
+            components::Env::Ms2pip,
+            components::Env::Visdia,
+        ] {
+            if installer.refresh(env).load_check == "failed" {
+                let _ = installer.recheck(env);
+            }
+        }
+    })
+}
+
+/// Where the Visual C++ runtime installation is (`vcruntime::State`).
+#[tauri::command]
+fn vcruntime_state(state: tauri::State<'_, AppState>) -> mumdia_console::vcruntime::State {
+    state.vcruntime.snapshot()
 }
 
 /// What is running that would make removing managed data unsafe, if anything.
@@ -343,14 +398,7 @@ fn preflight(
 
     let comp = state.installer.refresh(components::Env::Primary);
     if !comp.complete {
-        blockers.push(format!(
-            "The analysis components are not installed{}.",
-            if comp.missing.is_empty() {
-                String::new()
-            } else {
-                format!(" (missing {})", comp.missing.join(", "))
-            }
-        ));
+        blockers.push(components::blocker(&comp));
     }
 
     // A vendor file with no converter fails inside the engine, after the run has been
@@ -797,6 +845,9 @@ fn main() {
             components_install,
             components_removable,
             components_remove,
+            components_recheck,
+            vcruntime_install,
+            vcruntime_state,
             config_schema,
             save_settings,
             derive_config,

@@ -222,6 +222,7 @@ pub fn converters(config: Option<&str>) -> Option<Converters> {
     let (exe, _) = crate::engine::resolve().ok()?;
     let mut cmd = crate::engine::command(&exe);
     crate::components::stamp_env(&mut cmd);
+    crate::components::skip_doctor_import_check(&mut cmd);
     // `doctor` exits non-zero when the configuration's interpreters do not resolve,
     // but it prints the report first, and the converter half is what is wanted here.
     let out = cmd.args(doctor_args(config)).output().ok()?;

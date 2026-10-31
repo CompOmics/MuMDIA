@@ -46,7 +46,8 @@ use serde::Serialize;
 pub struct Status {
     /// Absolute path to the managed interpreter, if it exists.
     pub python: Option<String>,
-    /// True when that interpreter can import everything every role needs.
+    /// True when that interpreter has everything every role needs, at the pinned
+    /// versions, and its packages load (`load_check` is `ok`).
     pub complete: bool,
     /// Modules the managed interpreter cannot import.
     pub missing: Vec<String>,
@@ -65,6 +66,12 @@ pub struct Status {
     /// environment installed by an older release would import cleanly and then fail
     /// every search that needs DeepLC. Installing again upgrades it in place.
     pub outdated: Vec<String>,
+    /// The real import of the packages (`loadcheck`): empty when it has not run for this
+    /// interpreter (nothing installed, or a package missing), otherwise `running`, `ok` or
+    /// `failed`. Only `ok` leaves the environment `complete`.
+    pub load_check: String,
+    /// Why the real import failed, as the interface shows it, when it did.
+    pub load_error: Option<String>,
 }
 
 /// Every module the primary environment must provide.
@@ -250,6 +257,16 @@ pub fn stamp_env(cmd: &mut std::process::Command) {
     if let Some(p) = runnable_thermo_parser() {
         cmd.env("MUMDIA_THERMO_PARSER", p);
     }
+}
+
+/// Mark a `mumdia doctor` call as a question about the configuration (which roles it
+/// needs, which converters it finds), so the engine skips its real import of every
+/// interpreter's packages. That import costs seconds per role, these calls sit on paths
+/// the user waits on, and the managed environments get their own (`loadcheck`). An
+/// environment variable rather than `--no-import-check` so that an engine from before the
+/// flag, found on PATH, still answers instead of rejecting the argument.
+pub fn skip_doctor_import_check(cmd: &mut std::process::Command) {
+    cmd.env("MUMDIA_DOCTOR_IMPORT_CHECK", "0");
 }
 
 /// Where a managed ThermoRawFileParser is unpacked.
@@ -510,12 +527,115 @@ pub fn status() -> Status {
     status_of(Env::Primary)
 }
 
+/// Why a search cannot start on `s`, an environment that is not `complete`: the sentence
+/// the pre-flight check shows.
+pub fn blocker(s: &Status) -> String {
+    match s.load_check.as_str() {
+        "running" => "The analysis components are still being tested (a real import of \
+                      DeepLC and PyTorch, which takes a few seconds). Try again in a moment."
+            .into(),
+        "failed" => format!(
+            "The analysis components are installed but cannot be used: {}",
+            s.load_error
+                .as_deref()
+                .unwrap_or("their packages do not load")
+        ),
+        _ => format!(
+            "The analysis components are not installed{}.",
+            if s.missing.is_empty() {
+                String::new()
+            } else {
+                format!(" (missing {})", s.missing.join(", "))
+            }
+        ),
+    }
+}
+
+/// The last real import of one environment's packages (`loadcheck`), and what it was
+/// run against.
+#[derive(Clone, Debug)]
+struct Probe {
+    /// The interpreter and the package versions the result belongs to (`probe_key`). A
+    /// result for another key is stale: the environment was replaced or upgraded.
+    key: String,
+    /// `None` while the import runs.
+    outcome: Option<crate::loadcheck::Outcome>,
+}
+
+/// What a probe result belongs to. The versions are part of it, so an environment that
+/// was upgraded in place is tested again.
+fn probe_key(s: &Status) -> String {
+    let mut key = s.python.clone().unwrap_or_default();
+    for (k, v) in &s.versions {
+        key.push_str(&format!("|{k}={v}"));
+    }
+    key
+}
+
+/// Fold the real-import result into a status from `status_of`. Returns true when no
+/// result exists for this interpreter yet, so the caller should start one.
+///
+/// Only an environment `find_spec` and the pins call complete is tested: a missing or
+/// outdated package is already reported, and installing again is the fix for those.
+fn apply_probe(s: &mut Status, probe: Option<&Probe>) -> bool {
+    if !s.complete || s.python.is_none() {
+        return false;
+    }
+    let key = probe_key(s);
+    let current = probe.filter(|p| p.key == key);
+    match current.map(|p| &p.outcome) {
+        None => {
+            s.complete = false;
+            s.load_check = "running".into();
+            true
+        }
+        Some(None) => {
+            s.complete = false;
+            s.load_check = "running".into();
+            false
+        }
+        Some(Some(outcome)) => {
+            match crate::loadcheck::report(outcome) {
+                None => s.load_check = "ok".into(),
+                Some((message, log)) => {
+                    s.complete = false;
+                    s.load_check = "failed".into();
+                    s.load_error = Some(message.clone());
+                    if s.error.is_none() {
+                        s.error = Some(message);
+                    }
+                    if s.install_status == "idle" {
+                        // Found on an environment that was already there: the log card
+                        // shows the traceback, as it would after an installation.
+                        s.install_status = "failed".into();
+                        s.install_log = log;
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Run the real import for `env`'s interpreter. Blocking; callers put it on a thread.
+fn run_probe(env: Env, python: &Path) -> crate::loadcheck::Outcome {
+    crate::loadcheck::probe(
+        crate::engine::command(python),
+        env.modules(),
+        crate::loadcheck::TIMEOUT,
+    )
+}
+
 /// Shared, mutable install state so the interface can poll while it runs.
 #[derive(Default)]
 pub struct Installer {
     primary: Mutex<Status>,
     ms2pip: Mutex<Status>,
     visdia: Mutex<Status>,
+    /// The real-import results, by environment directory name. Shared with the threads
+    /// that compute them, and kept for the session: the import costs seconds, so it runs
+    /// once per environment and version set rather than on every refresh.
+    probes: Arc<Mutex<std::collections::BTreeMap<&'static str, Probe>>>,
 }
 
 impl Installer {
@@ -533,9 +653,68 @@ impl Installer {
     /// without this a removed environment would keep reporting itself installed until
     /// the application restarted.
     pub fn forget(&self, env: Env) {
+        if let Ok(mut p) = self.probes.lock() {
+            p.remove(env.dir_name());
+        }
         if let Ok(mut s) = self.slot(env).lock() {
             *s = status_of(env);
         }
+    }
+
+    /// Test again whether an environment's packages load, after the user changed
+    /// something outside the application (installed the Visual C++ runtime, for one).
+    ///
+    /// Forgets the last result and the failure it caused; the next `refresh` starts a new
+    /// import in the background.
+    pub fn recheck(&self, env: Env) -> Result<(), String> {
+        if self.busy(env) {
+            return Err("an installation is running; it tests the packages when it ends".into());
+        }
+        if let Ok(mut p) = self.probes.lock() {
+            p.remove(env.dir_name());
+        }
+        if let Ok(mut s) = self.slot(env).lock() {
+            *s = Status::default();
+            s.install_status = "idle".into();
+        }
+        Ok(())
+    }
+
+    /// Fold the real-import result into `fresh`, starting the import on a thread of its
+    /// own when this interpreter has none yet. Never blocks on Python.
+    fn with_probe(&self, env: Env, fresh: &mut Status) {
+        let Ok(mut probes) = self.probes.lock() else {
+            return;
+        };
+        if !apply_probe(fresh, probes.get(env.dir_name())) {
+            return;
+        }
+        let key = probe_key(fresh);
+        let python = PathBuf::from(fresh.python.clone().unwrap_or_default());
+        probes.insert(
+            env.dir_name(),
+            Probe {
+                key: key.clone(),
+                outcome: None,
+            },
+        );
+        drop(probes);
+        let shared = Arc::clone(&self.probes);
+        std::thread::spawn(move || {
+            let outcome = run_probe(env, &python);
+            if let Ok(mut p) = shared.lock() {
+                // Recorded only if nothing newer replaced the entry meanwhile.
+                if p.get(env.dir_name()).is_some_and(|e| e.key == key) {
+                    p.insert(
+                        env.dir_name(),
+                        Probe {
+                            key,
+                            outcome: Some(outcome),
+                        },
+                    );
+                }
+            }
+        });
     }
 
     /// Whether an installation is running, without probing the interpreter.
@@ -552,7 +731,12 @@ impl Installer {
     /// Refresh one environment from disk. Cheap enough to call whenever the screen
     /// is shown.
     pub fn refresh(&self, env: Env) -> Status {
-        let fresh = status_of(env);
+        let mut fresh = status_of(env);
+        // An installation tests the packages itself when it ends; starting a second
+        // import underneath it would test a half-written environment.
+        if !self.busy(env) {
+            self.with_probe(env, &mut fresh);
+        }
         if let Ok(mut s) = self.slot(env).lock() {
             // Anything an installation put there outlives a refresh. Keeping only
             // "installing" lost the outcome: the install thread would set "done",
@@ -602,6 +786,11 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
         s.install_status = "installing".into();
         s.install_log.clear();
         s.error = None;
+    }
+    // The environment is about to change, so the last real-import result no longer
+    // describes it.
+    if let Ok(mut p) = installer.probes.lock() {
+        p.remove(env.dir_name());
     }
 
     std::thread::spawn(move || {
@@ -735,9 +924,46 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
         }
 
         // Verify rather than assume: uv exiting zero says the packages resolved, not
-        // that the interpreter can import them. A torch wheel that does not match the
-        // machine installs perfectly and fails on import.
-        let fresh = status_of(env);
+        // that the interpreter can load them. That takes two checks. `status_of` asks
+        // `find_spec`, which locates each package without executing it, so it reports a
+        // package that is absent and nothing more. It cannot see one that is installed
+        // but does not load: a torch whose DLLs fail to initialise (on Windows, for want
+        // of the Visual C++ runtime) passes it, and the first search then stops minutes
+        // in. The real import (`loadcheck`) is the second check, and it is the one that
+        // catches that.
+        let mut fresh = status_of(env);
+        if fresh.complete {
+            log(
+                &installer,
+                "== checking that the packages load (a real import, deeplc first)".into(),
+            );
+            let python = PathBuf::from(fresh.python.clone().unwrap_or_default());
+            let outcome = run_probe(env, &python);
+            if let Ok(mut p) = installer.probes.lock() {
+                p.insert(
+                    env.dir_name(),
+                    Probe {
+                        key: probe_key(&fresh),
+                        outcome: Some(outcome.clone()),
+                    },
+                );
+            }
+            match crate::loadcheck::report(&outcome) {
+                None => {
+                    fresh.load_check = "ok".into();
+                    log(&installer, "all packages load".into());
+                }
+                Some((message, lines)) => {
+                    // The heading is already in the log.
+                    for line in lines.into_iter().skip(1) {
+                        log(&installer, line);
+                    }
+                    fresh.complete = false;
+                    fresh.load_check = "failed".into();
+                    fresh.load_error = Some(message);
+                }
+            }
+        }
         if let Ok(mut s) = installer.slot(env).lock() {
             let log_so_far = s.install_log.clone();
             *s = fresh;
@@ -746,10 +972,13 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
                 s.install_status = "done".into();
             } else {
                 s.install_status = "failed".into();
-                s.error = Some(format!(
-                    "the packages installed but the interpreter still cannot import: {}",
-                    s.missing.join(", ")
-                ));
+                s.error = Some(match &s.load_error {
+                    Some(e) => e.clone(),
+                    None => format!(
+                        "the packages installed but the interpreter still cannot import: {}",
+                        s.missing.join(", ")
+                    ),
+                });
             }
         }
     });
@@ -1386,6 +1615,107 @@ mod tests {
         assert!(REQUIREMENTS_PRIMARY
             .lines()
             .any(|l| l.trim_start().starts_with("deeplc==")));
+    }
+
+    fn complete_status() -> Status {
+        let mut s = Status {
+            python: Some("/env/bin/python".into()),
+            complete: true,
+            install_status: "idle".into(),
+            ..Default::default()
+        };
+        s.versions.insert("torch".into(), "2.14.0+cpu".into());
+        s
+    }
+
+    #[test]
+    fn a_complete_environment_is_tested_once_and_held_back_until_it_loads() {
+        // No result yet: start one, and the environment is not usable meanwhile.
+        let mut s = complete_status();
+        assert!(apply_probe(&mut s, None));
+        assert!(!s.complete);
+        assert_eq!(s.load_check, "running");
+
+        // Running: wait, do not start a second.
+        let running = Probe {
+            key: probe_key(&complete_status()),
+            outcome: None,
+        };
+        let mut s = complete_status();
+        assert!(!apply_probe(&mut s, Some(&running)));
+        assert_eq!(s.load_check, "running");
+        assert!(!s.complete);
+
+        // Loaded: complete, nothing to start.
+        let loaded = Probe {
+            key: probe_key(&complete_status()),
+            outcome: Some(crate::loadcheck::Outcome::Loaded),
+        };
+        let mut s = complete_status();
+        assert!(!apply_probe(&mut s, Some(&loaded)));
+        assert!(s.complete);
+        assert_eq!(s.load_check, "ok");
+        assert!(s.error.is_none());
+
+        // A result for other versions is stale: the environment was upgraded.
+        let mut upgraded = complete_status();
+        upgraded
+            .versions
+            .insert("torch".into(), "2.15.0+cpu".into());
+        assert!(apply_probe(&mut upgraded, Some(&loaded)));
+    }
+
+    #[test]
+    fn a_torch_that_cannot_load_fails_the_environment_with_the_runtime_hint() {
+        let failed = Probe {
+            key: probe_key(&complete_status()),
+            outcome: Some(crate::loadcheck::Outcome::Unloadable {
+                module: "deeplc".into(),
+                detail: "OSError: [WinError 1114] A dynamic link library (DLL) initialization \
+                         routine failed. Error loading \"C:\\env\\torch\\lib\\c10.dll\""
+                    .into(),
+            }),
+        };
+        let mut s = complete_status();
+        assert!(!apply_probe(&mut s, Some(&failed)));
+        assert!(!s.complete);
+        assert_eq!(s.load_check, "failed");
+        let msg = s.load_error.clone().unwrap();
+        assert!(msg.contains("vc_redist.x64.exe"), "{msg}");
+        assert_eq!(s.error.as_deref(), Some(msg.as_str()));
+        // Found on an existing environment, it opens the log with the traceback.
+        assert_eq!(s.install_status, "failed");
+        assert!(s.install_log.iter().any(|l| l.contains("WinError 1114")));
+    }
+
+    #[test]
+    fn the_preflight_sentence_says_which_check_stopped_the_search() {
+        let mut s = Status {
+            missing: vec!["torch".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            blocker(&s),
+            "The analysis components are not installed (missing torch)."
+        );
+        s.missing.clear();
+        s.load_check = "running".into();
+        assert!(blocker(&s).contains("still being tested"));
+        s.load_check = "failed".into();
+        s.load_error = Some("`deeplc` cannot be loaded.".into());
+        assert!(blocker(&s).ends_with("cannot be used: `deeplc` cannot be loaded."));
+    }
+
+    #[test]
+    fn an_incomplete_environment_is_not_import_tested() {
+        // Missing or outdated packages are reported already; installing is the fix.
+        let mut s = complete_status();
+        s.complete = false;
+        s.missing = vec!["torch".into()];
+        assert!(!apply_probe(&mut s, None));
+        assert_eq!(s.load_check, "");
+        let mut s = Status::default();
+        assert!(!apply_probe(&mut s, None));
     }
 
     #[test]

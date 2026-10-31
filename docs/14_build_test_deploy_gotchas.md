@@ -871,8 +871,12 @@ fixed name. (6) Do not sort the imports in `scripts/deeplc_worker.py` or
 DeepLC 4.x is torch-backed, and on Windows importing numpy first aborts torch's
 DLL initialisation with `OSError: [WinError 1114] ... Error loading
 "...\torch\lib\c10.dll"`. Neither the Rust test suite nor `mumdia doctor` can
-catch this, and imported-library mode never reaches `deeplc_worker.py` at all, so
-the only thing that exercises it is a FASTA-mode library build.
+catch this (doctor's real import puts `deeplc` first by construction, so it tests the
+environment, not a worker's order), and imported-library mode never reaches
+`deeplc_worker.py` at all, so the only thing that exercises it is a FASTA-mode library
+build. The same error with `import deeplc` as the worker's first import is a missing or
+outdated Visual C++ runtime instead, which `doctor` does catch
+(docs/17_troubleshooting.md, "The torch DLL crash: two causes").
 
 **Test-coverage gaps (what green does NOT prove).** Both the `cargo test` suite
 and the smoke job exercise native paths only. Inside `cargo test` there is still
