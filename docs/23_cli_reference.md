@@ -559,7 +559,7 @@ Options:
           Configuration for `extract.prec_tol_ppm` and the fallback fragment tolerance; default: the one the run's manifest recorded
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## features
 
