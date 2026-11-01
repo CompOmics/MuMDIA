@@ -77,7 +77,9 @@ pub enum Root {
     Off(String),
 }
 
-fn is_off_word(v: &str) -> bool {
+/// Whether a setting is one of the words that mean "off" (`off`, `0`, `false`, `no`,
+/// `none`, in any case).
+pub(crate) fn is_off_word(v: &str) -> bool {
     matches!(
         v.trim().to_ascii_lowercase().as_str(),
         "off" | "0" | "false" | "no" | "none"
@@ -119,9 +121,25 @@ fn root_with(env: &dyn Fn(&str) -> Option<String>, os: Os) -> Root {
     }
 }
 
+/// Why the default caches were switched off for this process, when they were
+/// ([`disable_default_root`]).
+static DISABLED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Switch the default (`"auto"`) caches off for the rest of this process, with the reason
+/// [`root`] then reports. `run` and `run-experiment` do this when the root cannot be
+/// written (`crate::storage::prepare_output`); a directory the configuration names is
+/// not affected. A process variable rather than `MUMDIA_CACHE_DIR=off`, so it needs no
+/// change to the environment of a process whose threads are already running.
+pub fn disable_default_root(reason: String) {
+    let _ = DISABLED.set(reason);
+}
+
 /// The cache root of this process's environment. Every variable is read by its literal
 /// name, so the generated configuration reference (docs/24) lists each one.
 pub fn root() -> Root {
+    if let Some(why) = DISABLED.get() {
+        return Root::Off(why.clone());
+    }
     let vars = [
         ("MUMDIA_CACHE_DIR", std::env::var("MUMDIA_CACHE_DIR").ok()),
         ("XDG_CACHE_HOME", std::env::var("XDG_CACHE_HOME").ok()),
@@ -534,59 +552,6 @@ pub fn clear(dirs: &[PathBuf]) -> Cleared {
     out
 }
 
-/// Free space in bytes on the file system that holds `dir` (or its nearest existing
-/// ancestor), or `None` when it cannot be determined.
-///
-/// The standard library has no free-space call and the workspace forbids `unsafe`, so
-/// this asks the platform's own tool: POSIX `df -Pk` on Unix and macOS, .NET
-/// `DriveInfo` through Windows PowerShell on Windows, the path passed in the child's
-/// environment so no quoting can go wrong. A network share or a tool that is missing
-/// gives `None`, and a caller then proceeds as it would without the check.
-pub fn free_space(dir: &Path) -> Option<u64> {
-    let mut probe = dir.to_path_buf();
-    while !probe.exists() {
-        probe = probe.parent()?.to_path_buf();
-    }
-    let out = if cfg!(windows) {
-        std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "[System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot(\
-                 [System.IO.Path]::GetFullPath($env:MUMDIA_FREE_SPACE_PATH))).AvailableFreeSpace",
-            ])
-            .env("MUMDIA_FREE_SPACE_PATH", &probe)
-            .output()
-            .ok()?
-    } else {
-        std::process::Command::new("df")
-            .arg("-Pk")
-            .arg("--")
-            .arg(&probe)
-            .output()
-            .ok()?
-    };
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    if cfg!(windows) {
-        return text.trim().parse().ok();
-    }
-    parse_df_available(&text)
-}
-
-/// The available bytes of `df -Pk` output: the field before the capacity percentage on
-/// the last line, so a file-system or mount name with spaces in it cannot shift it.
-fn parse_df_available(text: &str) -> Option<u64> {
-    let line = text.lines().rev().find(|l| !l.trim().is_empty())?;
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    let pct = fields.iter().rposition(|f| f.ends_with('%'))?;
-    let kib: u64 = fields.get(pct.checked_sub(1)?)?.parse().ok()?;
-    Some(kib * 1024)
-}
-
 /// The cache directories this configuration uses in this environment.
 pub fn dirs_of(cfg: &Config) -> Vec<PathBuf> {
     [library_dir(cfg), projection_dir(cfg)]
@@ -940,28 +905,6 @@ mod tests {
         );
         assert_eq!(r.removed.bytes, 100 + 50 + 7 + 2 * LAST_USED_BYTES);
         assert!(r.failed.is_empty(), "{:?}", r.failed);
-    }
-
-    #[test]
-    fn the_df_available_column_is_found_by_the_capacity_field() {
-        let out = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n\
-                   /dev/sdb1       15000000000 1300000000 13000000 10% /public/local\n";
-        assert_eq!(parse_df_available(out), Some(13_000_000 * 1024));
-        // A mount point with a space in it does not move the column.
-        let spaced = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
-                      my disk 100 40 60 40% /Volumes/My Disk\n";
-        assert_eq!(parse_df_available(spaced), Some(60 * 1024));
-        assert_eq!(parse_df_available("garbage"), None);
-    }
-
-    #[test]
-    fn free_space_answers_for_the_temporary_directory() {
-        // Every platform the engine ships on has the tool; a missing one is `None`, which
-        // callers treat as "no check".
-        let t = std::env::temp_dir().join("mumdia-free-space-probe-does-not-exist/x");
-        if let Some(free) = free_space(&t) {
-            assert!(free > 0);
-        }
     }
 
     #[test]

@@ -190,10 +190,42 @@
       </div>
     </div>
 
+    <h1 class="section-h">Storage folder</h1>
+    <p class="sub">
+      Where MuMDIA keeps what it builds and downloads while it works: predicted libraries,
+      saved settings, search caches, temporary files and downloaded models. Choose a
+      folder on a local disk with room to spare when your user folder is small, synced,
+      or may not be written. A folder that already holds other files gets a MuMDIA
+      sub-folder. Nothing is copied: what was in the old folder is built or downloaded
+      again in the new one.
+    </p>
+
+    <div class="card" id="storage-card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">
+            Storage folder <span class="pill mute" id="storage-pill">checking…</span>
+          </div>
+          <div class="card-sub" id="storage-where"></div>
+          <div class="card-sub" id="storage-envs"></div>
+        </div>
+        <button class="btn quiet" id="storage-change">Change…</button>
+        <button class="btn quiet" id="storage-reset" hidden>Use the default</button>
+      </div>
+      <label class="check">
+        <input type="checkbox" id="storage-move-envs" />
+        Also keep the Python environments and downloaded tools there. They are installed
+        again from the Setup screen after the change (a few hundred megabytes).
+      </label>
+      <div id="storage-warn" class="banner warn" hidden></div>
+      <div id="storage-error" class="banner bad" hidden></div>
+    </div>
+
     <h1 class="section-h">Managed data</h1>
     <p class="sub">
-      Everything MuMDIA downloads or builds lives in one folder under your user
-      account. Uninstalling MuMDIA does not remove it: the installer only removes
+      Everything MuMDIA downloads or builds lives in the storage folder above, and the
+      Python environments and downloaded tools in its default folder unless you moved
+      them too. Uninstalling MuMDIA does not remove any of it: the installer only removes
       what it put in the program folder, and this is written while the application
       runs. Remove what you no longer need here.
     </p>
