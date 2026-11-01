@@ -772,6 +772,54 @@ predictors are; the smoke test runs one FASTA search twice with a cache (store, 
 reuse) and compares both TSVs with the plain run. With a sidecar predictor a hit reuses
 the stored prediction.
 
+`run` and `run-experiment` build or restore the library through one function,
+`stages::library_build::build`, so both key a library identically. The key covers what
+determines the library, not what a search does with it: a later search with other
+prescreen-after-calibration, band or rescoring settings, or other spectra of the same
+acquisition kind, finds the same entry.
+
+### Building a library without spectra
+
+`mumdia build-library --fasta F --out-dir D [--config C] [--profile P] [--ion-mobility
+off|on]` runs the same `library_build::build` that a FASTA search runs, with no spectra.
+It restores the library from `predict_frag.library_cache` or builds and stores it, and
+writes into `--out-dir` the two library tables with their reports, the digest and
+peptidoform tables of a build, a `manifest.json` (the FASTA's content hash, the tables'
+records, the predictor identities) and a `library.json`:
+
+| field | content |
+|---|---|
+| `precursors`, `fragments` | path and row count; the precursor entry also counts targets and decoys |
+| `models` | `fragment`, `rt` and, when 1/K0 is predicted, `im`, each with the installed version (the cache key's model names) |
+| `origin` | `built`, or `library-cache` for a restored library |
+| `cache` | directory, key, entry and whether the entry is stored; `null` when no cache is configured |
+| `ion_mobility`, `predicts_ion_mobility` | the `--ion-mobility` choice, and whether the precursor table carries `predicted_im` |
+| `reuse` | the two ways to search with the library: `run --fasta` with the same FASTA and configuration (a cache hit), or `--lib-precursors` / `--lib-fragments` with the `rt_im_train.library_irt` value `reuse_hint` names (`library_irt`) |
+
+The configuration is resolved as `run` resolves it, so the interpreter paths in
+`predict_frag`, which are part of the key, are the ones a search on the same machine
+resolves. The rescorer's and match-between-runs' interpreters are resolved best effort,
+since a library build does not run them; a predictor the build needs and cannot find is
+an error before the digest.
+
+- `--ion-mobility on` passes `run_has_im = true`, which is what a search of a timsTOF
+  diaPASEF `.d` passes. It changes the library, and so the key, only when
+  `predict_frag.im_predictor = auto` resolves to IM2Deep; with `none` (the default) the
+  library is the same either way, and the command warns that it carries no 1/K0. An
+  explicit `im2deep` predicts 1/K0 whatever the flag says.
+- `prescreen.tag_prefilter` and `prescreen.score_before_prediction` are refused: their
+  library depends on a run's spectra, and a search with either builds its own library
+  without the cache. The prescreen after calibration does not change the library.
+- `predict_frag.defer_deeplc_to_multihead` is ignored with a warning. Its placeholder
+  retention times are filled in by a search's multi-head calibration, so a library built
+  here carries DeepLC's predictions under a different key, and a search with the setting
+  does not find it; search it with `--lib-precursors` / `--lib-fragments` instead.
+
+A cache hit requires the same FASTA content, configuration sections, predictor versions,
+worker scripts and engine executable as the search that later looks the library up. The
+library is not converted to other formats; the two Parquet tables are the engine's
+library format (docs/15).
+
 Matcher selection (both stages default to `Fragindex`):
 
 | field | default | effect |

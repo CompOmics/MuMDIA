@@ -47,7 +47,6 @@ Commands:
   sub-library      Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires
   extract          Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
   retrace          Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. The configuration's `retrace` section applies, `enabled` aside
-  mobilogram       The 1/K0 profile (mobilogram) of candidates' fragment and MS1 ions, read from the raw events of a diaPASEF `.d` (docs/35_diapasef.md section 17). Read-only
   features         Compute the minimal feature set -> features.parquet + PIN
   pool             Pool a grouped run's band artifacts into the run-level tables
   compete          Keep the best candidate per competition group -> psms_competed.parquet
@@ -57,6 +56,7 @@ Commands:
   quant-normalise  Cross-run normalisation of per-run precursor quantities -> peptide_quant_normalised
   run              Orchestrate the full pipeline on one run and write a manifest. Given several --mzml, the files are searched as ONE pooled experiment (`run-experiment`: one combined rescore, per-run quant, cross-run LFQ), which is the default treatment of a multi-file input; use `run-experiment` directly for run names
   run-experiment   Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. Pass --mzml once per run (>= 2)
+  build-library    Build the spectral library of a FASTA search without spectra: digest -> peptidoforms -> predict-frag, restored from or stored into `predict_frag.library_cache` under the key a `run --fasta` uses. Writes the two library tables, manifest.json and library.json (counts, models, cache key and the commands that search with it) into --out-dir
   align            Cross-run RT alignment (experiment-level) -> alignment.parquet
   mbr              Match-between-runs identification transfer (Stage D3) -> transferred.parquet
   inspect          Print schema, head sample, and row count for any artifact
@@ -146,7 +146,6 @@ first sentence of the description, with the full text in the section below.
 | [`sub-library`](#sub-library) | yes | Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires |
 | [`extract`](#extract) | yes | Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms |
 | [`retrace`](#retrace) | yes | Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. |
-| [`mobilogram`](#mobilogram) | yes | The 1/K0 profile (mobilogram) of candidates' fragment and MS1 ions, read from the raw events of a diaPASEF `.d` (docs/35_diapasef.md section 17). |
 | [`features`](#features) | yes | Compute the minimal feature set -> features.parquet + PIN |
 | [`pool`](#pool) | no | Pool a grouped run's band artifacts into the run-level tables |
 | [`compete`](#compete) | yes | Keep the best candidate per competition group -> psms_competed.parquet |
@@ -156,6 +155,7 @@ first sentence of the description, with the full text in the section below.
 | [`quant-normalise`](#quant-normalise) | yes | Cross-run normalisation of per-run precursor quantities -> peptide_quant_normalised |
 | [`run`](#run) | yes | Orchestrate the full pipeline on one run and write a manifest. |
 | [`run-experiment`](#run-experiment) | yes | Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. |
+| [`build-library`](#build-library) | yes | Build the spectral library of a FASTA search without spectra: digest -> peptidoforms -> predict-frag, restored from or stored into `predict_frag.library_cache` under the key a `run --fasta` uses. |
 | [`align`](#align) | yes | Cross-run RT alignment (experiment-level) -> alignment.parquet |
 | [`mbr`](#mbr) | yes | Match-between-runs identification transfer (Stage D3) -> transferred.parquet |
 | [`inspect`](#inspect) | no | Print schema, head sample, and row count for any artifact |
@@ -167,7 +167,7 @@ first sentence of the description, with the full text in the section below.
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
 25 of the 29 documented subcommands accept `--config`:
- `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `mobilogram`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `quant-normalise`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
+ `align`, `build-library`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `quant-normalise`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 4 do not, so every setting they use comes from their own flags:
  `audit`, `inspect`, `pool`, `quant-lfq`.
@@ -476,67 +476,6 @@ Options:
 
 Plus the 5 repeated flags removed above: see "Global flags".
 
-## mobilogram
-
-```text
-The 1/K0 profile (mobilogram) of candidates' fragment and MS1 ions, read from the raw events of a diaPASEF `.d` (docs/35_diapasef.md section 17). Read-only.
-
-Per candidate: the MS2 frames whose quad slots isolate the precursor (the frame nearest the apex RT and `--frames` such frames either side) and the MS1 frames nearest the same RT. Per ion (the chromatogram's predicted fragments and MS1 isotopes), the raw intensity is binned in 1/K0 over the scans of those slots, at the run's fragment mass offset and tolerance and `extract.prec_tol_ppm` for MS1. Prints JSON on stdout, or writes a long parquet table (or JSON) with `--out`.
-
-Usage: mumdia mobilogram [OPTIONS] --candidate <ID>...
-
-Options:
-      --run-dir <RUN_DIR>
-          The run directory: psms_extracted, chromatograms, run_windows and the seed's masscal are read from it, and the `.d` is the one its spectra report names. A second-pass run directory takes the spectra of its first pass
-
-      --candidate <ID>...
-          Candidate ids (`candidate_id`), one or more
-
-      --json
-          Print JSON on stdout (the default without --out)
-
-      --out <OUT>
-          Write the profiles to this file instead: `.json` as printed, anything else as a parquet table with one row per candidate, ion, frame and non-zero bin
-
-      --frames <FRAMES>
-          Frames either side of the centre frame, per MS level (0: the centre frame only)
-
-          [default: 2]
-
-      --bin <BIN>
-          Bin width in 1/K0 (V s cm^-2)
-
-          [default: 0.002]
-
-      --peak-rank <PEAK_RANK>
-          The psms_extracted row of each candidate (`peak_rank`; 0 is extract's apex)
-
-          [default: 0]
-
-      --rt <RT>
-          Centre the frames on this retention time (s) instead of each candidate's apex
-
-      --raw <RAW>
-          The diaPASEF `.d`; default: the one the run's spectra report names
-
-      --psms-extracted <PSMS_EXTRACTED>
-          Override `<run-dir>/psms_extracted.parquet`
-
-      --chromatograms <CHROMATOGRAMS>
-          Override `<run-dir>/chromatograms.parquet`
-
-      --run-windows <RUN_WINDOWS>
-          Override `<run-dir>/run_windows.parquet`
-
-      --mass-cal <MASS_CAL>
-          Override `<run-dir>/seed_psms.parquet.masscal.json`
-
-      --config <CONFIG>
-          Configuration for `extract.prec_tol_ppm` and the fallback fragment tolerance; default: the one the run's manifest recorded
-```
-
-Plus the 5 repeated flags removed above: see "Global flags".
-
 ## features
 
 ```text
@@ -655,6 +594,9 @@ Options:
 
       --out-peak-bounds <OUT_PEAK_BOUNDS>
           Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt, width_s)
+
+      --out-quant-fragments <OUT_QUANT_FRAGMENTS>
+          Optional account of the fragments behind every quantity (quant_fragments v1: per fragment its area, whether the rule selected it, its weight, rank and background). `run` and `run-experiment` write it under `quant.fragment_detail`
 
       --export-cross-run
           Write the cross-run export into `--out-fragment` (fragment_quant v5: the zero-area rows and the columns the cross-run fit reads; v6 under `quant.fragment_selection = pattern_fit` or `pattern_profile`, with the pattern columns). The first pass of the cross-run step; `run-experiment` runs it by itself
@@ -791,6 +733,33 @@ Options:
 
       --top-peaks-ms2 <TOP_PEAKS_MS2>
           [default: 0]
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
+
+## build-library
+
+```text
+Build the spectral library of a FASTA search without spectra: digest -> peptidoforms -> predict-frag, restored from or stored into `predict_frag.library_cache` under the key a `run --fasta` uses. Writes the two library tables, manifest.json and library.json (counts, models, cache key and the commands that search with it) into --out-dir
+
+Usage: mumdia build-library [OPTIONS] --fasta <FASTA> --out-dir <OUT_DIR>
+
+Options:
+      --fasta <FASTA>
+          FASTA to digest into the library
+
+      --out-dir <OUT_DIR>
+
+      --config <CONFIG>
+
+      --profile <PROFILE>
+          Named tuning preset applied on top of --config/defaults, as for `run`
+
+      --ion-mobility <ION_MOBILITY>
+          `on` builds the library for spectra with ion mobility (a timsTOF diaPASEF .d), so `predict_frag.im_predictor = auto` predicts 1/K0 and a search of such spectra finds the library in the cache; `off` for every other acquisition
+
+          [default: off]
+          [possible values: off, on]
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".

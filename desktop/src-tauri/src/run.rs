@@ -168,6 +168,14 @@ pub struct Request {
     pub lib_fragments: Option<String>,
     pub config: Option<String>,
     pub threads: Option<usize>,
+    /// Build the library from `fasta` without searching (`mumdia build-library`, issue
+    /// #233). No spectra are needed: `mzml` and `experiment` are ignored.
+    #[serde(default)]
+    pub build_library: bool,
+    /// For `build_library`: build for spectra with ion mobility, a timsTOF diaPASEF `.d`
+    /// (`--ion-mobility on`). Unset is off.
+    #[serde(default)]
+    pub ion_mobility: Option<bool>,
 }
 
 /// One stage, as observed from the artifact reports it produced.
@@ -294,6 +302,11 @@ pub struct Snapshot {
     /// Stop was requested. The status stays `running` until the engine has actually
     /// been reaped, and the interface shows "Stopping" meanwhile.
     pub cancel_requested: bool,
+    /// True for a library build without a search (`mumdia build-library`).
+    pub build_library: bool,
+    /// The `library.json` a finished library build wrote: counts, models, cache key and
+    /// how to search with the library (`crate::library`).
+    pub library: Option<serde_json::Value>,
 }
 
 pub struct Run {
@@ -412,6 +425,11 @@ impl Run {
         let runs = scan_runs(out_dir);
         let root_stages = scan_root_stages(out_dir);
         let results = read_results(out_dir);
+        let library = if self.snapshot().build_library {
+            crate::library::read(out_dir)
+        } else {
+            None
+        };
         let status = terminal_status(cancelled, &outcome);
         // Released before the status is published, so a caller that sees the run end
         // can start another into the same folder without being refused.
@@ -421,6 +439,7 @@ impl Run {
             s.runs = runs;
             s.root_stages = root_stages;
             s.results = results;
+            s.library = library;
             s.exit_code = outcome.as_ref().ok().and_then(|st| st.code());
             s.error = match (&outcome, status) {
                 (_, "done" | "cancelled") => None,
@@ -475,6 +494,8 @@ fn new_run(id: &str, req: &Request, command: String, reservation: Option<String>
             library_mode: req.lib_precursors.is_some(),
             experiment: req.experiment,
             cancel_requested: false,
+            build_library: req.build_library,
+            library: None,
         }),
         pid: Mutex::new(None),
         cancelled: AtomicBool::new(false),
@@ -595,6 +616,9 @@ fn now_ms() -> u64 {
 /// Build the argument list, and reject the input combinations the engine would
 /// reject anyway — here, where the message can point at a field.
 fn argv(req: &Request) -> Result<Vec<String>, String> {
+    if req.build_library {
+        return library_argv(req);
+    }
     let lib = req.lib_precursors.is_some() || req.lib_fragments.is_some();
     if lib && req.fasta.is_some() {
         return Err("choose either a FASTA or a spectral library, not both".into());
@@ -673,6 +697,44 @@ fn argv(req: &Request) -> Result<Vec<String>, String> {
             a.push("--threads".into());
             a.push(t.to_string());
         }
+    }
+    Ok(a)
+}
+
+/// The arguments of a library build without a search: `mumdia build-library`, which
+/// digests the FASTA and predicts the library as a FASTA search would, under the key that
+/// search looks it up by in the library cache.
+fn library_argv(req: &Request) -> Result<Vec<String>, String> {
+    if req.lib_precursors.is_some() || req.lib_fragments.is_some() {
+        return Err("a library is built from a FASTA, not from another library".into());
+    }
+    let Some(fasta) = req.fasta.as_ref().filter(|f| !f.trim().is_empty()) else {
+        return Err("select the FASTA file to build the library from".into());
+    };
+    if req.out_dir.trim().is_empty() {
+        return Err("choose a folder for the library".into());
+    }
+    let mut a: Vec<String> = vec![
+        "build-library".into(),
+        "--fasta".into(),
+        fasta.clone(),
+        "--out-dir".into(),
+        req.out_dir.clone(),
+    ];
+    if let Some(c) = req.config.as_ref().filter(|c| !c.trim().is_empty()) {
+        a.push("--config".into());
+        a.push(c.clone());
+    }
+    a.push("--ion-mobility".into());
+    let im = if req.ion_mobility == Some(true) {
+        "on"
+    } else {
+        "off"
+    };
+    a.push(im.into());
+    if let Some(t) = req.threads.filter(|t| *t > 0) {
+        a.push("--threads".into());
+        a.push(t.to_string());
     }
     Ok(a)
 }
@@ -1079,6 +1141,8 @@ mod tests {
             lib_fragments: None,
             config: None,
             threads: None,
+            build_library: false,
+            ion_mobility: None,
         }
     }
 
@@ -1408,6 +1472,73 @@ mod tests {
         );
     }
 
+    /// A library build needs a FASTA and a folder, and no spectra: whatever the spectra
+    /// list holds is not passed, and the ion-mobility choice is always explicit.
+    #[test]
+    fn a_library_build_needs_no_spectra_and_names_its_instrument() {
+        let mut r = req();
+        r.build_library = true;
+        r.mzml = Vec::new();
+        assert!(argv(&r).unwrap_err().contains("FASTA"));
+        r.fasta = Some("p.fasta".into());
+        r.config = Some("c.json".into());
+        r.threads = Some(4);
+        assert_eq!(
+            argv(&r).unwrap(),
+            vec![
+                "build-library",
+                "--fasta",
+                "p.fasta",
+                "--out-dir",
+                "out",
+                "--config",
+                "c.json",
+                "--ion-mobility",
+                "off",
+                "--threads",
+                "4",
+            ]
+        );
+        r.ion_mobility = Some(true);
+        r.mzml = vec!["a.d".into(), "b.d".into()];
+        r.experiment = true;
+        let a = argv(&r).unwrap();
+        assert_eq!(a[0], "build-library");
+        assert!(a.windows(2).any(|w| w == ["--ion-mobility", "on"]), "{a:?}");
+        assert!(
+            !a.iter().any(|x| x == "--mzml" || x.ends_with(".d")),
+            "{a:?}"
+        );
+        r.lib_precursors = Some("p.parquet".into());
+        assert!(argv(&r).unwrap_err().contains("not from another library"));
+        r.lib_precursors = None;
+        r.out_dir = " ".into();
+        assert!(argv(&r).unwrap_err().contains("folder"));
+    }
+
+    /// A finished library build carries the engine's `library.json` in its snapshot; a
+    /// search does not read one.
+    #[test]
+    fn a_finished_library_build_reports_its_library() {
+        let (run, dir) = running("library_build");
+        run.set(|s| s.build_library = true);
+        std::fs::write(
+            dir.join("library.json"),
+            r#"{"precursors": {"path": "x/fragment_library_precursors.parquet", "rows": 7}}"#,
+        )
+        .unwrap();
+        run.publish_exit(Ok(exit_status(0)), &dir);
+        let s = run.snapshot();
+        assert_eq!(s.status, "done");
+        assert_eq!(s.library.unwrap()["precursors"]["rows"], 7);
+        let (run, dir2) = running("search_no_library");
+        std::fs::write(dir2.join("library.json"), "{}").unwrap();
+        run.publish_exit(Ok(exit_status(0)), &dir2);
+        assert!(run.snapshot().library.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
     #[test]
     fn library_mode_passes_both_tables_and_no_fasta() {
         let mut r = req();
@@ -1702,6 +1833,8 @@ mod multifile_tests {
             lib_fragments: None,
             config: None,
             threads: None,
+            build_library: false,
+            ion_mobility: None,
         }
     }
 

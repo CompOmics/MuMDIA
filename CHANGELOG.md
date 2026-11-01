@@ -132,6 +132,17 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **`quant.fragment_detail` records which fragments made each precursor quantity.** Off by
+  default. Set, the final quant of `run` and of `run-experiment` (after the cross-run step and
+  the second pass) also writes `quant_fragments.parquet` beside each run's
+  `peptide_quant.parquet` (`quant_fragments` v1, recorded in the manifest): per fragment of
+  every quantified candidate its integrated area, whether the rule selected it, its weight,
+  its rank in the rule and the background subtracted from it, and the rule that applied. Under
+  the top-N rules and `cross_run` the selected areas times their weights add up to the
+  reported quantity; under the pattern rules the table names the fitted fragments. The
+  standalone `quant` writes it with `--out-quant-fragments`. With the key off no artifact,
+  report, manifest entry or configuration hash changes. The desktop application sets it for
+  every search, for the viewer (docs/12, docs/15).
 - **The desktop installer provides the Microsoft Visual C++ x64 runtime that PyTorch
   needs on Windows.** The MSI merges Microsoft's runtime merge module from the build
   runner's Visual Studio, so a fresh installation can load `torch\lib\c10.dll`. It needs
@@ -146,6 +157,25 @@ than a number. Both are recorded in every run's `manifest.json`.
   signature is valid and from Microsoft Corporation, runs it elevated after Windows'
   permission prompt, reports its exit code (installed, already installed, restart
   required, or the failure with the manual link) and tests the packages again.
+- **`mumdia build-library` builds the spectral library of a FASTA search without
+  spectra** (issue #233). It runs the library build of `run` and `run-experiment`, now one
+  function (`stages/library_build.rs`), so it restores the library from or stores it into
+  `predict_frag.library_cache` under the key a later `run --fasta` with the same FASTA and
+  configuration computes, and that search skips digest, peptidoforms and predict-frag.
+  `--out-dir` receives the two library tables, `manifest.json` and `library.json` (row
+  counts, predictor models, cache key, and the `--lib-precursors` / `--lib-fragments`
+  invocation with the `rt_im_train.library_irt` value that reproduces the FASTA search).
+  `--ion-mobility on` builds for timsTOF diaPASEF spectra, which matters under
+  `predict_frag.im_predictor = auto`. A prefilter before prediction is refused, since its
+  library depends on spectra. The outputs of `run` and `run-experiment` are unchanged
+  (docs/06, "Building a library without spectra").
+- **Desktop application: Build library only.** In FASTA mode the Search screen builds the
+  library without searching and without spectra, with DIA-NN or with the built-in
+  predictors, for timsTOF diaPASEF or for other instruments (set from the selected spectra
+  when there are any). The result card shows the counts, models and paths, and offers
+  Search with this library, Copy to folder and Reveal. A library-mode search of a library
+  built this way uses the `rt_im_train.library_irt` its `library.json` names.
+
 - **Homocysteinylation in the modification catalogue.** `HCysThiolactone` (UniMod 1270,
   N-homocysteinylation of K, +117.024835) and `HCysteinyl` (UniMod 1271,
   S-homocysteinylation of C, +133.019749) can be searched by name, and the Search screen
