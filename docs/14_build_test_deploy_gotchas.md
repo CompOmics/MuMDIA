@@ -471,7 +471,7 @@ configuration, so no configuration hash and no output byte depends on where they
 
 | what | default | moved by | if it cannot be written |
 |---|---|---|---|
-| results | `--out-dir` | the flag | `run` / `run-experiment` stop before any stage, naming the directory and the fix |
+| results | `--out-dir` | the flag | `run` / `run-experiment` / `build-library` stop before any stage, naming the directory and the fix |
 | rescore sidecar files (handoff, fold keys, NN memmap) | `<out-dir>/sidecar_work` | `MUMDIA_SIDECAR_DIR` (`rescore --work-dir`) | an explicitly set one stops the run before any stage |
 | caches (libraries, DeepLC projections) | the per-user cache directory (next section) | `--cache-dir`, `MUMDIA_CACHE_DIR` | one prominent warning, and the default caches are off for that run |
 | temporary files of the engine and of every process it starts | the system's (`TMP`/`TEMP`/`TMPDIR`) | `--temp-dir`, `MUMDIA_TEMP_DIR` | an explicitly set one is an error at startup |
@@ -490,9 +490,10 @@ read them), and `MPLCONFIGDIR` goes under it unless it is set. The Docker image 
 "Writable" means that a file can be created in the directory and renamed there
 (`storage::probe_writable`): the caches publish an entry by renaming it into place, and a
 cloud-synced folder or a network share can take the write and refuse the rename. The
-results folder and an explicit sidecar directory are probed at the start of `run` and
-`run-experiment` (`storage::prepare_output`); before that, `create_dir_all(..).ok()`
-discarded the error and an unwritable results folder surfaced minutes later as a stage
+results folder and an explicit sidecar directory are probed at the start of `run`,
+`run-experiment` and `build-library` (`storage::prepare_output`; `build-library` with an
+unwritable cache root builds the library into its `--out-dir` and does not store it);
+before that, `create_dir_all(..).ok()` discarded the error and an unwritable results folder surfaced minutes later as a stage
 failure naming one artifact. The cache root is probed there too when the configuration
 uses a default (`"auto"`) cache, and an unwritable one switches the default caches off for
 the process (`cache::disable_default_root`) with one warning rather than failing: a run

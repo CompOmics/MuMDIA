@@ -445,7 +445,8 @@ pub fn apply(flags: &StorageFlags) -> Result<Decision> {
 /// checked when `cfg` uses a default (`"auto"`) cache, and an unwritable one switches the
 /// default caches off for this process ([`crate::cache::disable_default_root`]; the DeepLC
 /// worker learns its cache from its arguments, so it is off there too) with one warning: a
-/// run without its cache only builds what it would have reused. Called by `run` and `run-experiment`; the cache warning is
+/// run without its cache only builds what it would have reused. Called by `run`,
+/// `run-experiment` and `build-library`; the cache warning is
 /// given once per process.
 pub fn prepare_output(out_dir: &str, cfg: &mumdia_core::config::Config) -> Result<()> {
     probe_writable(Path::new(out_dir)).map_err(|f| {

@@ -260,6 +260,13 @@ if "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
 fi
 grep -q "the output directory is not writable" "$work/blocked.log" \
     || { tail -5 "$work/blocked.log"; echo "an unwritable output directory was not named"; exit 1; }
+if "$BIN" build-library --fasta test_data/fixture.fasta --out-dir test_data/fixture.fasta/lib \
+    --config "$cfg" --threads 2 > "$work/blocked_lib.log" 2>&1; then
+    tail -5 "$work/blocked_lib.log"
+    echo "build-library into an unwritable output directory did not fail"; exit 1
+fi
+grep -q "the output directory is not writable" "$work/blocked_lib.log" \
+    || { tail -5 "$work/blocked_lib.log"; echo "build-library did not name an unwritable output directory"; exit 1; }
 "$BIN" doctor --config "$cfg" --json --no-import-check --out-dir "$work/out" > "$work/doctor_storage.json"
 "$PY" - "$work/doctor_storage.json" <<'PYEOF'
 import json, sys
@@ -270,7 +277,7 @@ for r in ("output", "sidecar", "temp", "cache_root", "models"):
     assert r in roles, (r, sorted(roles))
 assert roles["output"]["status"] in ("ok", "warn") and roles["output"]["dir"]["writable"], roles["output"]
 PYEOF
-echo "    ok: a read-only cache root and --temp-dir leave the output byte-identical, an unwritable output directory stops the run, doctor reports the locations"
+echo "    ok: a read-only cache root and --temp-dir leave the output byte-identical, an unwritable output directory stops run and build-library, doctor reports the locations"
 
 # 4a'. `build-library` (issue #233): the plain run's library, built without spectra. It must
 #      be the library `run --fasta` builds, byte for byte, and be stored under the key that

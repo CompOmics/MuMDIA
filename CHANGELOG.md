@@ -137,12 +137,12 @@ than a number. Both are recorded in every run's `manifest.json`.
   new `MUMDIA_TEMP_DIR`) move the caches and the temporary files of the engine and every
   worker it starts (`TMP`, `TEMP`, `TMPDIR`, and `MPLCONFIGDIR` unless set); the new
   `MUMDIA_MODEL_DIR` moves the MS2PIP and AlphaPeptDeep model downloads from the home
-  directory. Relative paths are made absolute once at startup. `run` and `run-experiment`
-  check that the output directory and an explicit `MUMDIA_SIDECAR_DIR` take a write and a
-  rename before any stage and stop with the directory and the fix otherwise; an unwritable
-  cache root turns the default caches off for the run with one warning, with output
-  byte-identical to a run without caches. `mumdia doctor` gains a `storage` section (and
-  `--out-dir`) that checks every location without creating anything. The engine has one
+  directory. Relative paths are made absolute once at startup. `run`, `run-experiment` and
+  `build-library` check that the output directory and an explicit `MUMDIA_SIDECAR_DIR` take
+  a write and a rename before any stage and stop with the directory and the fix otherwise;
+  an unwritable cache root turns the default caches off for the run with one warning, with
+  output byte-identical to a run without caches. `mumdia doctor` gains a `storage` section
+  (and `--out-dir`) that checks every location without creating anything. The engine has one
   free-space function, which also answers for network shares. The desktop application's
   Setup screen gains a Storage folder setting that moves its libraries, settings, caches,
   temporary files, model downloads and `uv` cache, and optionally the Python environments;

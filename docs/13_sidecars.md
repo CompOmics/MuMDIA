@@ -1079,7 +1079,7 @@ MLP. Set it explicitly for the logreg path.
   free space of that directory (`storage::free_space`, the engine's one free-space
   function, which also answers for a `\\server\share` path; it used to ask the sidecar
   interpreter's `shutil.disk_usage`). An explicitly set `MUMDIA_SIDECAR_DIR` that cannot
-  take a write and a rename stops `run` and `run-experiment` before any stage. It
+  take a write and a rename stops `run`, `run-experiment` and `build-library` before any stage. It
   refuses the run only when the space is below what the files cannot be smaller
   than, which counts uncompressed bytes alone: 9 bytes a value plus 32 a row for the
   PIN, exactly 4 bytes a value for the raw matrix. A parquet file has no such floor
