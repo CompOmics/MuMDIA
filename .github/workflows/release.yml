@@ -239,7 +239,7 @@ jobs:
           mkdir -p "$stage/ci" "$stage/test_data"
           cp "$root/ci/smoke.sh" "$root/ci/check_smoke.py" \
              "$root/ci/make_fixture_mzml.py" "$stage/ci/"
-          cp "$root/test_data/fixture.fasta" "$stage/test_data/"
+          cp "$root/test_data/fixture.fasta" "$root/test_data/fixture_nterm.fasta" "$stage/test_data/"
           cd dist
           if [ -n "${{ matrix.exe }}" ]; then
             7z a "$name.zip" "$name" >/dev/null

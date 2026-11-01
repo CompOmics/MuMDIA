@@ -10,6 +10,8 @@ pub mod digest;
 pub mod extract;
 pub mod features;
 pub mod library_build;
+pub mod localise;
+pub mod mobilogram;
 pub mod ms1cal;
 pub mod peptidoforms;
 pub mod pool;

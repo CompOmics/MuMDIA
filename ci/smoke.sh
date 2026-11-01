@@ -153,6 +153,124 @@ print(f"tag prefilter: {n}/{len(want)} planted peptides identified")
 assert n >= 100, n
 PYEOF
 
+# 4t. Protein N-terminal acetylation (`peptidoforms.variable_mods[].position =
+#     "protein_n_term"`), on a FASTA of its own: five proteins begin with M (so the
+#     Met-retained and the Met-excised first peptide both start a protein), GLTDEWQYNSAPVEK
+#     is internal in one protein and the first peptide of another, and two proteins begin
+#     with K (the peptide at position 1 follows a cleavage and does not start the protein).
+#     The digest writes peptides v2 here and only here; every acetylated library form is a
+#     protein N-terminal peptide, on targets and decoys alike; the planted acetylated
+#     precursors are identified, and no accepted acetylated row is on any other peptide.
+echo "=== smoke: protein N-terminal acetylation"
+nt="$work/nterm"
+mkdir -p "$nt"
+"$PY" - "$cfg" "$nt/cfg.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+pf = c.setdefault("peptidoforms", {})
+pf["variable_mods"] = [
+    {"residue": "M", "name": "Oxidation"},
+    {"residue": "*", "name": "Acetyl", "position": "protein_n_term"},
+]
+pf["max_variable_mods"] = 2
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+"$BIN" digest --fasta test_data/fixture_nterm.fasta --out "$nt/peptides.parquet" \
+    --config "$nt/cfg.json"
+"$BIN" peptidoforms --peptides "$nt/peptides.parquet" --out "$nt/peptidoforms.parquet" \
+    --config "$nt/cfg.json"
+"$BIN" predict-frag --peptidoforms "$nt/peptidoforms.parquet" \
+    --out-precursors "$nt/lib_prec.parquet" --out-fragments "$nt/lib_frag.parquet" \
+    --work-dir "$nt/sidecar" --config "$nt/cfg.json"
+"$PY" ci/make_fixture_mzml.py \
+    --precursors "$nt/lib_prec.parquet" --fragments "$nt/lib_frag.parquet" \
+    --out "$nt/fixture.mzML" --manifest "$nt/planted.json" \
+    --n-planted 60 --windows 8 --include-prefix "[Acetyl]-" --quiet
+"$BIN" run --fasta test_data/fixture_nterm.fasta --mzml "$nt/fixture.mzML" \
+    --out-dir "$nt/out" --config "$nt/cfg.json" --threads 2 > "$nt/run.log" 2>&1 \
+    || { tail -30 "$nt/run.log"; exit 1; }
+"$PY" - "$nt" "$work/out" test_data/fixture_nterm.fasta <<'PYEOF'
+import json, os, re, sys
+import pyarrow.parquet as pq
+
+nt, main_out, fasta = sys.argv[1:4]
+proteins, seq = [], []
+for line in open(fasta):
+    if line.startswith(">"):
+        if seq:
+            proteins.append("".join(seq))
+        seq = []
+    else:
+        seq.append(line.strip())
+proteins.append("".join(seq))
+
+def starts_a_protein(pep):
+    """Independent of the engine: the first residues of a protein, with or without M."""
+    return any(p.startswith(pep) or (p.startswith("M") and p[1:].startswith(pep))
+               for p in proteins)
+
+def residues(pf):
+    pf = pf[len("DECOY_"):] if pf.startswith("DECOY_") else pf
+    return re.sub(r"-?\[[^\]]*\]-?", "", pf)
+
+# Peptides v2 in this arm, v1 in the plain run.
+rep = json.load(open(os.path.join(nt, "peptides.parquet.report.json")))
+assert rep["schema_version"] == 2, rep["schema_version"]
+plain = json.load(open(os.path.join(main_out, "peptides.parquet.report.json")))
+assert plain["schema_version"] == 1, plain["schema_version"]
+assert "protein_n_term" not in pq.read_schema(os.path.join(main_out, "peptides.parquet")).names
+pep = pq.read_table(os.path.join(nt, "peptides.parquet")).to_pydict()
+flag = {p: f for p, f, l in zip(pep["peptide"], pep["protein_n_term"], pep["label"]) if l == "target"}
+assert flag["GLTDEWQYNSAPVEK"], "a peptide internal in one protein and first in another"
+for p, f in flag.items():
+    assert f == starts_a_protein(p), (p, f)
+
+# The library: acetylated forms on protein N-terminal targets only, as many decoys.
+lib = pq.read_table(os.path.join(nt, "lib_prec.parquet")).to_pydict()
+ac = {l: [pf for pf, ll in zip(lib["peptidoform"], lib["label"]) if ll == l and "[Acetyl]-" in pf]
+      for l in ("target", "decoy")}
+assert ac["target"] and len(ac["target"]) == len(ac["decoy"]), {k: len(v) for k, v in ac.items()}
+bad = [pf for pf in ac["target"] if not starts_a_protein(residues(pf))]
+assert not bad, bad
+assert any(residues(pf) == "GLTDEWQYNSAPVEK" for pf in ac["target"])
+
+# The search: planted acetylated precursors found, none accepted elsewhere.
+planted = {p["peptidoform"] for p in json.load(open(os.path.join(nt, "planted.json")))["planted"]
+           if p["peptidoform"].startswith("[Acetyl]-")}
+s = pq.read_table(os.path.join(nt, "out", "psms_scored.parquet"),
+                  columns=["peptidoform", "label", "q_value"]).to_pydict()
+accepted = {pf for pf, l, q in zip(s["peptidoform"], s["label"], s["q_value"])
+            if l == "target" and q <= 0.01}
+found = planted & accepted
+print(f"N-terminal acetyl: {len(ac['target'])} target and {len(ac['decoy'])} decoy library "
+      f"forms; {len(found)}/{len(planted)} planted acetylated precursors identified")
+assert len(planted) >= 10, len(planted)
+assert len(found) >= 0.8 * len(planted), (len(found), len(planted))
+wrong = [pf for pf in accepted if pf.startswith("[Acetyl]-") and not starts_a_protein(residues(pf))]
+assert not wrong, wrong
+PYEOF
+# The same configuration through `build-library` (the shared FASTA build of `run`,
+# `run-experiment` and `build-library`): peptides v2 with the flag, the acetylated forms,
+# and the library `run --fasta` built above, byte for byte.
+"$BIN" build-library --fasta test_data/fixture_nterm.fasta --out-dir "$nt/buildlib"     --config "$nt/cfg.json" --threads 2 > "$nt/buildlib.log" 2>&1     || { tail -20 "$nt/buildlib.log"; echo "build-library with a protein N-terminal rule failed"; exit 1; }
+for f in fragment_library_precursors.parquet fragment_library_fragments.parquet; do
+    cmp -s "$nt/out/$f" "$nt/buildlib/$f"         || { echo "build-library built a different $f than run --fasta (protein N-terminal rule)"; exit 1; }
+done
+"$PY" - "$nt/buildlib" <<'PYEOF'
+import json, os, sys
+import pyarrow.parquet as pq
+d = sys.argv[1]
+rep = json.load(open(os.path.join(d, "peptides.parquet.report.json")))
+assert rep["schema_version"] == 2, rep["schema_version"]
+assert "protein_n_term" in pq.read_schema(os.path.join(d, "peptides.parquet")).names
+man = json.load(open(os.path.join(d, "manifest.json")))
+assert man["artifacts"]["peptides"]["schema_version"] == 2, man["artifacts"]["peptides"]
+lib = pq.read_table(os.path.join(d, "fragment_library_precursors.parquet"),
+                    columns=["peptidoform"]).column("peptidoform").to_pylist()
+assert any(pf.startswith("[Acetyl]-") for pf in lib), "no acetylated form in the library"
+PYEOF
+echo "    ok: protein N-terminal acetylation through digest, run and build-library"
+
 # 4a. `predict_frag.library_cache`: the first FASTA run builds the library and stores it,
 #     the second finds it and skips digest, peptidoforms and predict-frag. Both must give
 #     the plain run's TSVs byte for byte, and a plain FASTA run names the --lib-* reuse.
@@ -215,6 +333,69 @@ if ls "$work"/cache_root/libraries/*/entry.json > /dev/null 2>&1; then
     echo "mumdia cache clear left a library entry"; exit 1
 fi
 echo "    ok: stored under MUMDIA_CACHE_DIR/libraries, reused (digest skipped), kept over a bound while in use, a named directory used, all byte-identical to the plain run"
+
+# 4s. Where MuMDIA writes (`mumdia::storage`, docs/14 "Where MuMDIA writes"). A cache root
+#     that cannot be written switches the default caches off with one warning, and the run
+#     is byte-identical to the plain one, which ran with MUMDIA_CACHE_DIR=off; `--temp-dir`
+#     moves the temporary files of the engine and its workers without changing a byte; an
+#     output directory that cannot be written stops the run before any stage, naming the
+#     fix; `doctor --json` reports every location.
+echo "=== smoke: storage locations"
+ro="$work/ro_cache"
+mkdir -p "$ro"
+chmod 555 "$ro"
+if ( : > "$ro/.probe" ) 2> /dev/null; then
+    rm -f "$ro/.probe"
+    echo "    skip: a read-only directory is writable here (root, or no POSIX permissions)"
+else
+    MUMDIA_CACHE_DIR="$ro" "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+        --out-dir "$work/out_ro_cache" --config "$cfg" --threads 2 \
+        > "$work/ro_cache.log" 2>&1 || { tail -20 "$work/ro_cache.log"; echo "a read-only cache root failed the run"; exit 1; }
+    grep -q "cache root from MUMDIA_CACHE_DIR is not writable" "$work/ro_cache.log" \
+        || { tail -20 "$work/ro_cache.log"; echo "a read-only cache root was not reported"; exit 1; }
+    for f in peptides.tsv proteins.tsv; do
+        cmp -s "$work/out/$f" "$work/out_ro_cache/$f" \
+            || { echo "a read-only cache root changed $f"; exit 1; }
+    done
+    [ -z "$(ls -A "$ro")" ] || { echo "the read-only cache root was written to"; exit 1; }
+fi
+chmod 755 "$ro"
+"$BIN" --temp-dir "$work/temp_arm" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_temp_dir" --config "$cfg" --threads 2 \
+    > "$work/temp_dir.log" 2>&1 || { tail -20 "$work/temp_dir.log"; echo "--temp-dir failed the run"; exit 1; }
+[ -d "$work/temp_arm" ] || { echo "--temp-dir did not create its directory"; exit 1; }
+for f in peptides.tsv proteins.tsv; do
+    cmp -s "$work/out/$f" "$work/out_temp_dir/$f" \
+        || { echo "--temp-dir changed $f"; exit 1; }
+done
+# Below a file, so no directory can be created there. A path relative to the repository
+# root, which the engine and this shell both resolve the same way; on the Windows runner a
+# `/tmp/...` argument reaches the engine unconverted and names another directory.
+if "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir test_data/fixture.fasta/out --config "$cfg" --threads 2 > "$work/blocked.log" 2>&1; then
+    tail -5 "$work/blocked.log"
+    echo "a run into an unwritable output directory did not fail"; exit 1
+fi
+grep -q "the output directory is not writable" "$work/blocked.log" \
+    || { tail -5 "$work/blocked.log"; echo "an unwritable output directory was not named"; exit 1; }
+if "$BIN" build-library --fasta test_data/fixture.fasta --out-dir test_data/fixture.fasta/lib \
+    --config "$cfg" --threads 2 > "$work/blocked_lib.log" 2>&1; then
+    tail -5 "$work/blocked_lib.log"
+    echo "build-library into an unwritable output directory did not fail"; exit 1
+fi
+grep -q "the output directory is not writable" "$work/blocked_lib.log" \
+    || { tail -5 "$work/blocked_lib.log"; echo "build-library did not name an unwritable output directory"; exit 1; }
+"$BIN" doctor --config "$cfg" --json --no-import-check --out-dir "$work/out" > "$work/doctor_storage.json"
+"$PY" - "$work/doctor_storage.json" <<'PYEOF'
+import json, sys
+s = json.load(open(sys.argv[1]))["storage"]
+roles = {l["role"]: l for l in s["locations"]}
+assert s["ok"], s
+for r in ("output", "sidecar", "temp", "cache_root", "models"):
+    assert r in roles, (r, sorted(roles))
+assert roles["output"]["status"] in ("ok", "warn") and roles["output"]["dir"]["writable"], roles["output"]
+PYEOF
+echo "    ok: a read-only cache root and --temp-dir leave the output byte-identical, an unwritable output directory stops run and build-library, doctor reports the locations"
 
 # 4a'. `build-library` (issue #233): the plain run's library, built without spectra. It must
 #      be the library `run --fasta` builds, byte for byte, and be stored under the key that

@@ -8,9 +8,11 @@ Kept modifications, by default: Carbamidomethyl (UniMod:4), Oxidation (35), and 
 three cysteine prenylations Farnesyl (44), GeranylGeranyl (48), Hydroxyfarnesyl (376).
 `--keep-unimod 4,35,21,...` names the kept accessions instead; each must be in the
 modification catalogue (`_unimod.py`, the engine's `modifications.json`), which also
-gives the ProForma name. Precursors carrying any other UniMod are dropped, and so are
-precursors with a modification before their first residue, because the engine does not
-implement terminal modifications.
+gives the ProForma name. Precursors carrying any other UniMod are dropped. A modification
+DIA-NN writes before the first residue is N-terminal (`(UniMod:1)PEPK`, protein N-terminal
+acetylation): it is kept as the ProForma group `[Acetyl]-PEPK` when its accession is kept
+(`--keep-unimod 1,4,35`), and dropped with the precursor otherwise, as before. The import
+prints how many N-terminally modified precursors it kept and dropped.
 
 Ion mobility: the library's 1/K0 (`IM` in a 2.x parquet, `IonMobility` in older exports)
 is written as `predicted_im` (float64, V s cm^-2; precursor table version 2), but only when
@@ -59,10 +61,20 @@ _KEPT_UNIMOD_IDS = _DEFAULT_KEPT_UNIMOD_IDS
 
 
 def to_proforma(modseq):
+    """DIA-NN modified sequence -> ProForma with catalogue names. A leading `(UniMod:N)` is
+    the N-terminal group and is written `[Name]-`, so it never reads as a modification of
+    the first residue (or of no residue)."""
     s = str(modseq)
+    lead = ""
+    if s.startswith("("):
+        close = s.find(")")
+        name = _UNIMOD_TO_PROFORMA.get(s[:close + 1]) if close > 0 else None
+        if name is not None:
+            lead = name + "-"
+            s = s[close + 1:]
     for unimod, name in _UNIMOD_TO_PROFORMA.items():
         s = s.replace(unimod, name)
-    return s
+    return lead + s
 
 
 def parse_kept_ids(value):
@@ -116,10 +128,21 @@ _OPTIONAL_COLS = ["Decoy", "Fragment.Loss.Type", "Protein.Names", "Protein.Ids",
 _MZ_BIN_MAX = 1_000_000
 
 
-def _filter_rows(df, charge_by_basic):
+def _n_term_precursors(df):
+    """Distinct (modified sequence, charge) pairs of `df` with a modification before the
+    first residue."""
+    seq = df["Modified.Sequence"].astype(str)
+    lead = df[seq.str.startswith("(")]
+    return set(zip(lead["Modified.Sequence"].astype(str), lead["Precursor.Charge"].astype(int)))
+
+
+def _filter_rows(df, charge_by_basic, n_term=None):
     """The importer's row filter on one batch: targets, b/y no-loss fragments, mapped
     modifications only, and the optional composition-based charge cap. Returns the
-    filtered frame and the (precursor, fragment) counts the charge cap removed."""
+    filtered frame and the (precursor, fragment) counts the charge cap removed.
+
+    `n_term`, a dict with sets `seen` and `kept`, collects the N-terminally modified
+    precursors before and after the modification filter, for the importer's report."""
     # Targets only (the re-exported speclib carries DIA-NN's own decoys).
     if "Decoy" in df.columns:
         df = df[df["Decoy"].astype(int) == 0]
@@ -128,13 +151,16 @@ def _filter_rows(df, charge_by_basic):
     if lt in df.columns:
         df = df[df[lt].astype(str).str.lower().isin(["noloss", "", "none", "nan"])]
     df = df[df["Fragment.Type"].astype(str).str.lower().isin(["b", "y"])]
-    # drop precursors carrying any mod we do not map (keep _KEPT_UNIMOD_IDS only).
+    # drop precursors carrying any mod we do not map (keep _KEPT_UNIMOD_IDS only). This
+    # covers an N-terminal modification too: kept when its accession is kept, and then
+    # written as the ProForma N-terminal group by `to_proforma`.
+    if n_term is not None:
+        n_term["seen"] |= _n_term_precursors(df)
     _kept_alt = "|".join(f"{i}\\)" for i in _KEPT_UNIMOD_IDS)
     df = df[~df["Modified.Sequence"].astype(str).str.contains(
         rf"\(UniMod:(?!{_kept_alt})", regex=True)]
-    # A modification before the first residue is N-terminal; the engine has no terminal
-    # modifications, and the ProForma written here would put it on no residue.
-    df = df[~df["Modified.Sequence"].astype(str).str.startswith("(")]
+    if n_term is not None:
+        n_term["kept"] |= _n_term_precursors(df)
     dropped = (0, 0)
     # Composition-based charge restriction (opt-in). Done before candidate_id
     # assignment so dropped rows never receive an id and n_fragments stays exact.
@@ -202,6 +228,7 @@ def main():
     prec_parts, count_parts = [], []
     card = np.zeros(_MZ_BIN_MAX, dtype=np.int64)
     dropped_prec = dropped_frag = 0
+    n_term = {"seen": set(), "kept": set()}
     n_frag_total = 0
     # The last precursor of a row group can continue into the next one; its (bin) set is
     # carried over so a bin seen on both sides of the boundary is counted once, exactly as a
@@ -209,7 +236,7 @@ def main():
     carry_key, carry_bins = None, set()
     for rg in range(pf.num_row_groups):
         df = pf.read_row_group(rg, columns=read_cols).to_pandas()
-        df, (dp, dfr) = _filter_rows(df, charge_by_basic)
+        df, (dp, dfr) = _filter_rows(df, charge_by_basic, n_term)
         dropped_prec += dp
         dropped_frag += dfr
         if not len(df):
@@ -249,6 +276,12 @@ def main():
             carry_bins |= last_bins
         else:
             carry_key, carry_bins = last, last_bins
+    if n_term["seen"]:
+        n_kept = len(n_term["kept"])
+        n_drop = len(n_term["seen"]) - n_kept
+        print(f"N-terminal modifications: kept {n_kept} and dropped {n_drop} target "
+              f"precursor(s) with a modification before the first residue (kept only when "
+              f"its UniMod accession is kept: --keep-unimod)")
     if charge_by_basic:
         print(
             f"charge-by-basic-residues: dropped {dropped_prec} precursor(s) and "

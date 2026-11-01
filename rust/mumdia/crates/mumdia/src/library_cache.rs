@@ -451,7 +451,7 @@ impl LibraryCache {
             .filter_map(|f| std::fs::metadata(&f).ok().map(|m| m.len()))
             .sum();
         let margin = min_free_after_store();
-        if let Some(free) = crate::cache::free_space(&self.dir) {
+        if let Some(free) = crate::storage::free_space(&self.dir) {
             anyhow::ensure!(
                 free >= need.saturating_add(margin),
                 "{} has {:.2} GiB free; storing this {:.2} GiB library would leave less than \
@@ -832,6 +832,35 @@ mod tests {
         assert_ne!(
             cache_for(&root.join("cache"), &fasta, &mut digest).key,
             base_key
+        );
+        // A terminal rule's position is part of the key: the same rule at the protein
+        // N-terminus and at every peptide N-terminus builds different libraries.
+        let nterm = |position| {
+            let mut c = cfg.clone();
+            c.peptidoforms
+                .variable_mods
+                .push(mumdia_core::config::ResidueMod {
+                    residue: '*',
+                    name: "Acetyl".into(),
+                    position,
+                });
+            c
+        };
+        let protein_key = cache_for(
+            &root.join("cache"),
+            &fasta,
+            &mut nterm(mumdia_core::config::ModPosition::ProteinNTerm),
+        )
+        .key;
+        assert_ne!(protein_key, base_key);
+        assert_ne!(
+            cache_for(
+                &root.join("cache"),
+                &fasta,
+                &mut nterm(mumdia_core::config::ModPosition::PeptideNTerm),
+            )
+            .key,
+            protein_key
         );
         // The cache directory is not part of the key.
         assert_eq!(

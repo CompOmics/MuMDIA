@@ -1055,10 +1055,12 @@ impl Default for PeptidoformsConfig {
             fixed_mods: vec![ResidueMod {
                 residue: 'C',
                 name: "Carbamidomethyl".to_string(),
+                position: ModPosition::Anywhere,
             }],
             variable_mods: vec![ResidueMod {
                 residue: 'M',
                 name: "Oxidation".to_string(),
+                position: ModPosition::Anywhere,
             }],
             max_variable_mods: 1,
             charge_min: 2,
@@ -1069,13 +1071,135 @@ impl Default for PeptidoformsConfig {
     }
 }
 
+impl PeptidoformsConfig {
+    /// Whether any fixed or variable rule is placed at the protein N-terminus. The digest
+    /// then records which peptides start a protein (`protein_n_term`, peptides v2); without
+    /// such a rule it writes the v1 table, byte for byte.
+    pub fn has_protein_n_term_rule(&self) -> bool {
+        self.fixed_mods
+            .iter()
+            .chain(&self.variable_mods)
+            .any(|m| m.position == ModPosition::ProteinNTerm)
+    }
+
+    /// The first terminal rule the peptidoform stage cannot place, as a message naming it.
+    ///
+    /// A terminal rule takes the residue `*`; a terminal modification restricted to one
+    /// residue (N-terminal acetylation of S only, say) and the C-terminal positions are
+    /// refused rather than approximated. At most one fixed rule may sit on the N-terminus,
+    /// and a fixed N-terminal rule excludes every variable one, because a terminus carries
+    /// one group.
+    pub fn terminal_rule_problem(&self) -> Option<String> {
+        let mut fixed_n_term: Vec<&ResidueMod> = Vec::new();
+        let mut variable_n_term: Vec<&ResidueMod> = Vec::new();
+        for (kind, list) in [
+            ("fixed", &self.fixed_mods),
+            ("variable", &self.variable_mods),
+        ] {
+            for m in list.iter().filter(|m| !m.position.is_anywhere()) {
+                if !m.position.is_n_term() {
+                    return Some(format!(
+                        "peptidoforms.{kind}_mods: '{}' at position {}: C-terminal \
+                         modifications are not implemented (peptide_n_term and \
+                         protein_n_term are)",
+                        m.name,
+                        m.position.name()
+                    ));
+                }
+                if m.residue != '*' {
+                    return Some(format!(
+                        "peptidoforms.{kind}_mods: '{}' at position {} names residue '{}'; a \
+                         terminal rule takes residue '*' (any first residue), and a terminal \
+                         modification restricted to one residue is not implemented",
+                        m.name,
+                        m.position.name(),
+                        m.residue
+                    ));
+                }
+                if kind == "fixed" {
+                    fixed_n_term.push(m);
+                } else {
+                    variable_n_term.push(m);
+                }
+            }
+        }
+        let show = |m: &ResidueMod| format!("'{}' ({})", m.name, m.position.name());
+        if fixed_n_term.len() > 1 {
+            return Some(format!(
+                "peptidoforms.fixed_mods: two fixed N-terminal modifications ({} and {}); a \
+                 terminus carries one group",
+                show(fixed_n_term[0]),
+                show(fixed_n_term[1])
+            ));
+        }
+        if let (Some(f), Some(v)) = (fixed_n_term.first(), variable_n_term.first()) {
+            return Some(format!(
+                "peptidoforms: fixed N-terminal modification {} and variable N-terminal \
+                 modification {}; a terminus carries one group, so fixed and variable \
+                 N-terminal rules cannot be combined",
+                show(f),
+                show(v)
+            ));
+        }
+        None
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResidueMod {
-    /// Target residue; `*` for any / terminal handled separately in MVP.
+    /// Target residue; `*` for a terminal rule (any first residue).
     pub residue: char,
     /// UniMod name.
     pub name: String,
+    /// Where the modification sits: on `residue` wherever it occurs (`anywhere`, the
+    /// default, omitted from the canonical configuration so the hash of every existing
+    /// configuration is unchanged), on the N-terminus of every peptide (`peptide_n_term`),
+    /// or on the N-terminus of a peptide that starts its protein (`protein_n_term`, with or
+    /// without the initiator methionine). A terminal rule takes residue `*`.
+    /// `peptide_c_term` and `protein_c_term` are recognised only to be refused.
+    #[serde(default, skip_serializing_if = "ModPosition::is_anywhere")]
+    pub position: ModPosition,
+}
+
+/// The position of a [`ResidueMod`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModPosition {
+    /// On the rule's residue wherever it occurs.
+    #[default]
+    Anywhere,
+    /// On the N-terminal amine of every peptide.
+    PeptideNTerm,
+    /// On the N-terminal amine of a peptide that starts its protein: at protein position 0,
+    /// or at position 1 after the initiator methionine (`digest.n_term_met_excision`).
+    ProteinNTerm,
+    /// Refused at load: C-terminal modifications are not implemented.
+    PeptideCTerm,
+    /// Refused at load: C-terminal modifications are not implemented.
+    ProteinCTerm,
+}
+
+impl ModPosition {
+    pub fn is_anywhere(&self) -> bool {
+        *self == ModPosition::Anywhere
+    }
+
+    /// Whether the rule sits on the N-terminal amine rather than on a residue.
+    pub fn is_n_term(&self) -> bool {
+        matches!(self, ModPosition::PeptideNTerm | ModPosition::ProteinNTerm)
+    }
+
+    /// The configuration spelling.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ModPosition::Anywhere => "anywhere",
+            ModPosition::PeptideNTerm => "peptide_n_term",
+            ModPosition::ProteinNTerm => "protein_n_term",
+            ModPosition::PeptideCTerm => "peptide_c_term",
+            ModPosition::ProteinCTerm => "protein_c_term",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3981,6 +4105,130 @@ impl RetraceConfig {
     }
 }
 
+/// Site localisation of modifications on the identified peptidoforms (the `localise` stage,
+/// docs/36_ptm_localisation.md). Positional isomers (the same residues, charge and
+/// modification composition, differing only in where a modification sits) are separate
+/// candidates in the search and can all be accepted on one chromatographic peak. The stage
+/// groups them, enumerates every placement of each localised modification on its candidate
+/// residues, reads the site-determining fragment ions back from the MS2 spectra at the
+/// identification apex, and turns their presence into a posterior over the placements and a
+/// probability per site. It is reporting only: identifications, q-values and every other
+/// artifact are unchanged, and it adds `localisation.parquet`, three columns of
+/// `peptides.tsv` and `sites.tsv`. Experimental and opt-in; every key is omitted from the
+/// canonical configuration at its default, and the whole section with them, so a
+/// configuration that does not set it keeps its config hash.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocaliseConfig {
+    /// Run the stage inside `run` and `run-experiment` (per run, after the final rescore).
+    /// Default false. `mumdia localise` runs it on its own whatever this says.
+    #[serde(skip_serializing_if = "is_false")]
+    pub enabled: bool,
+    /// The modifications to localise, by catalogue name. A peptidoform carrying none of them
+    /// is not in the table; one carrying several is localised for the first of this list it
+    /// carries, the others held where the identification put them. The candidate residues
+    /// of a modification are the residues `peptidoforms.variable_mods` gives it, or, when the
+    /// configuration has none for it (an imported library), the residues it is found on in
+    /// the scored table. Default `["Phospho"]`.
+    #[serde(skip_serializing_if = "is_default_localise_mods")]
+    pub mods: Vec<String>,
+    /// Site probability at or above which a site counts as localised: every site of the best
+    /// placement must reach it. Default 0.75.
+    #[serde(skip_serializing_if = "is_default_localise_threshold")]
+    pub threshold: f64,
+    /// The decoy residue: placements on it are scored alongside the real ones but never
+    /// searched, and how often it wins estimates the false localisation rate empirically.
+    /// One residue letter that is not a candidate residue of a localised modification, or
+    /// `""` to score no decoy placements. Default `"A"`.
+    #[serde(skip_serializing_if = "is_default_localise_decoy_residue")]
+    pub decoy_residue: String,
+    /// Rows are localised when their `run_psm_q` is at or below this. The others are in the
+    /// table, for the isomer-group q, with status `not_attempted_q`. Default 0.01.
+    #[serde(skip_serializing_if = "is_default_localise_q_max")]
+    pub q_max: f64,
+    /// Peptides with more placements than this are not localised (status
+    /// `too_many_hypotheses`). Default 200.
+    #[serde(skip_serializing_if = "is_default_localise_max_hypotheses")]
+    pub max_hypotheses: usize,
+    /// Accepted isomers whose apexes lie within this many seconds of a peak's first apex share
+    /// that peak and one localisation; isomers further apart are separate peaks, each
+    /// localised on its own. Default 5.0.
+    #[serde(skip_serializing_if = "is_default_localise_peak_rt_tol")]
+    pub peak_rt_tol_s: f64,
+    /// MS2 scans either side of the apex scan the fragment evidence is read from. Default 2.
+    #[serde(skip_serializing_if = "is_default_localise_apex_scans")]
+    pub apex_scans: usize,
+    /// Half-width in 1/K0 of the band around the apex 1/K0 a fragment peak must fall in, on
+    /// spectra that carry ion mobility. Ignored on 3D spectra. Default 0.05.
+    #[serde(skip_serializing_if = "is_default_localise_im_half_width")]
+    pub im_half_width: f64,
+    /// Pseudo-count weight of the run-wide detection and false-presence rates against a
+    /// peak's own. Default 64: against 8 it localised more peaks at a lower false localisation rate on
+    /// both validation sets (docs/36_ptm_localisation.md section 7).
+    #[serde(skip_serializing_if = "is_default_localise_prior_strength")]
+    pub prior_strength: f64,
+    /// Divisor of the log-likelihoods before the softmax. 1 is the likelihood as fitted;
+    /// above 1 flattens the posterior. Default 1.0.
+    #[serde(skip_serializing_if = "is_default_localise_temperature")]
+    pub temperature: f64,
+}
+impl Default for LocaliseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mods: vec!["Phospho".to_string()],
+            threshold: 0.75,
+            decoy_residue: "A".to_string(),
+            q_max: 0.01,
+            max_hypotheses: 200,
+            peak_rt_tol_s: 5.0,
+            apex_scans: 2,
+            im_half_width: 0.05,
+            prior_strength: 64.0,
+            temperature: 1.0,
+        }
+    }
+}
+
+fn is_default_localise_mods(v: &Vec<String>) -> bool {
+    *v == LocaliseConfig::default().mods
+}
+fn is_default_localise_threshold(v: &f64) -> bool {
+    *v == LocaliseConfig::default().threshold
+}
+fn is_default_localise_decoy_residue(v: &String) -> bool {
+    *v == LocaliseConfig::default().decoy_residue
+}
+fn is_default_localise_q_max(v: &f64) -> bool {
+    *v == LocaliseConfig::default().q_max
+}
+fn is_default_localise_max_hypotheses(v: &usize) -> bool {
+    *v == LocaliseConfig::default().max_hypotheses
+}
+fn is_default_localise_peak_rt_tol(v: &f64) -> bool {
+    *v == LocaliseConfig::default().peak_rt_tol_s
+}
+fn is_default_localise_apex_scans(v: &usize) -> bool {
+    *v == LocaliseConfig::default().apex_scans
+}
+fn is_default_localise_im_half_width(v: &f64) -> bool {
+    *v == LocaliseConfig::default().im_half_width
+}
+fn is_default_localise_prior_strength(v: &f64) -> bool {
+    *v == LocaliseConfig::default().prior_strength
+}
+fn is_default_localise_temperature(v: &f64) -> bool {
+    *v == LocaliseConfig::default().temperature
+}
+
+impl LocaliseConfig {
+    /// Whether every key is at its default, so the canonical configuration omits the
+    /// section.
+    pub fn is_default(&self) -> bool {
+        *self == LocaliseConfig::default()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -4008,6 +4256,10 @@ pub struct Config {
     /// canonical configuration while every key is at its default.
     #[serde(default, skip_serializing_if = "RetraceConfig::is_default")]
     pub retrace: RetraceConfig,
+    /// Modification site localisation ([`LocaliseConfig`]). Omitted from the canonical
+    /// configuration while every key is at its default.
+    #[serde(default, skip_serializing_if = "LocaliseConfig::is_default")]
+    pub localise: LocaliseConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -4030,6 +4282,7 @@ impl Default for Config {
             experiment: t(),
             groups: t(),
             retrace: t(),
+            localise: t(),
         }
     }
 }
@@ -4623,6 +4876,9 @@ impl Config {
                     .into(),
             ));
         }
+        if let Some(problem) = self.peptidoforms.terminal_rule_problem() {
+            return Err(Invalid(problem));
+        }
         if self.peptidoforms.charge_min < 1
             || self.peptidoforms.charge_min > self.peptidoforms.charge_max
         {
@@ -5034,6 +5290,81 @@ impl Config {
             ));
         }
         self.validate_retrace()?;
+        self.validate_localise()?;
+        Ok(())
+    }
+
+    /// The refusals of the `localise` section (docs/36_ptm_localisation.md).
+    fn validate_localise(&self) -> Result<(), crate::error::ConfigError> {
+        use crate::error::ConfigError::Invalid;
+        let l = &self.localise;
+        if l.mods.is_empty() {
+            return Err(Invalid(
+                "localise.mods must name at least one modification".into(),
+            ));
+        }
+        for m in &l.mods {
+            if crate::mass::unimod_mass(m).is_none() {
+                return Err(Invalid(format!(
+                    "localise.mods: unknown modification '{m}' (use a catalogue name, such \
+                     as \"Phospho\")"
+                )));
+            }
+        }
+        if !(l.threshold > 0.0 && l.threshold <= 1.0) {
+            return Err(Invalid(format!(
+                "localise.threshold must be in (0, 1] (got {})",
+                l.threshold
+            )));
+        }
+        if !(l.q_max > 0.0 && l.q_max <= 1.0) {
+            return Err(Invalid(format!(
+                "localise.q_max must be in (0, 1] (got {})",
+                l.q_max
+            )));
+        }
+        if l.max_hypotheses < 2 {
+            return Err(Invalid(format!(
+                "localise.max_hypotheses must be >= 2 (got {})",
+                l.max_hypotheses
+            )));
+        }
+        for (v, key) in [
+            (l.peak_rt_tol_s, "localise.peak_rt_tol_s"),
+            (l.im_half_width, "localise.im_half_width"),
+            (l.temperature, "localise.temperature"),
+        ] {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(Invalid(format!("{key} must be finite and > 0 (got {v})")));
+            }
+        }
+        if !(l.prior_strength.is_finite() && l.prior_strength >= 0.0) {
+            return Err(Invalid(format!(
+                "localise.prior_strength must be finite and >= 0 (got {})",
+                l.prior_strength
+            )));
+        }
+        let d = l.decoy_residue.as_bytes();
+        if !(d.is_empty()
+            || (d.len() == 1
+                && d[0].is_ascii_uppercase()
+                && crate::constants::is_standard_residue(d[0])))
+        {
+            return Err(Invalid(format!(
+                "localise.decoy_residue must be one standard residue letter or \"\" (got \
+                 '{}')",
+                l.decoy_residue
+            )));
+        }
+        for v in &self.peptidoforms.variable_mods {
+            if l.mods.contains(&v.name) && l.decoy_residue.starts_with(v.residue) {
+                return Err(Invalid(format!(
+                    "localise.decoy_residue '{}' is searched with {} \
+                     (peptidoforms.variable_mods), so it cannot be the decoy residue",
+                    l.decoy_residue, v.name
+                )));
+            }
+        }
         Ok(())
     }
 

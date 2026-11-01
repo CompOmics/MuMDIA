@@ -39,9 +39,11 @@ PRECURSORS = [
     ("K(UniMod:44)ITTENR", 2, 460.3, 25.0, "PRE1_HUMAN", 0, "noloss", ("y", "b", "y")),
     # dropped: UniMod:21 is not in the mapped set, so its ProForma name is unknown
     ("DROPME(UniMod:21)K", 2, 600.0, 40.0, "XXX_HUMAN", 0, "noloss", ("y", "b", "y")),
-    # dropped: a modification before the first residue is N-terminal, which the engine
-    # does not implement, even when its accession is kept
+    # kept: a modification before the first residue is N-terminal, written as the
+    # ProForma group `[Name]-` when its accession is kept
     ("(UniMod:4)NTERMCK", 2, 610.0, 41.0, "NTM_HUMAN", 0, "noloss", ("y", "b", "y")),
+    # dropped by default, kept with --keep-unimod 1: protein N-terminal acetylation
+    ("(UniMod:1)SACETYLK", 2, 620.0, 42.0, "NTA_HUMAN", 0, "noloss", ("y", "b", "y")),
     # dropped: DIA-NN's own decoy half
     ("DIANNDECOYK", 2, 700.0, 50.0, "YYY_HUMAN", 1, "noloss", ("y", "b", "y")),
     # dropped: every fragment carries a neutral loss
@@ -52,6 +54,7 @@ PRECURSORS = [
 FRAGMENT_SHAPE = ((3, 1), (2, 1), (5, 2))  # (Fragment.Series.Number, Fragment.Charge)
 
 KEPT_KEYS = [
+    ("[Carbamidomethyl]-NTERMCK", 2, 610.0),
     ("M[Oxidation]ELLOWK", 2, 480.1),
     ("SC[Carbamidomethyl]ENICK", 2, 420.2),
     ("K[Farnesyl]ITTENR", 2, 460.3),
@@ -193,8 +196,8 @@ def test_base_peptide_id_groups_charges_of_one_stripped_sequence(imported):
     for pform, base in zip(cols["peptidoform"], cols["base_peptide_id"]):
         by_pform.setdefault(pform, set()).add(int(base))
     assert len(by_pform["PEPTIDEK"]) == 1
-    assert len(set(int(b) for b in cols["base_peptide_id"])) == 4, (
-        "expected four distinct stripped sequences among the imported precursors"
+    assert len(set(int(b) for b in cols["base_peptide_id"])) == 5, (
+        "expected five distinct stripped sequences among the imported precursors"
     )
 
 
@@ -331,16 +334,42 @@ def test_imported_library_feeds_the_documented_decoy_builder_step(imported, tmp_
 
 def test_keep_unimod_names_the_kept_accessions(diann_lib, tmp_path):
     """`--keep-unimod` keeps the named catalogue accessions with their ProForma names (the
-    desktop passes the modifications the user selected), and the N-terminal row stays
-    dropped."""
+    desktop passes the modifications the user selected); an N-terminal row goes with its
+    accession."""
     prec = tmp_path / "p.parquet"
     frag = tmp_path / "f.parquet"
-    run_worker_ok("import_diann_lib.py", diann_lib, prec, frag, "--keep-unimod", "4,35,44,21")
+    out, _ = run_worker_ok("import_diann_lib.py", diann_lib, prec, frag,
+                           "--keep-unimod", "35,44,21")
     assert_library_load_invariants(prec, frag, require_both_labels=False)
     got = set(read_columns(prec)["peptidoform"])
     assert "DROPME[Phospho]K" in got
-    assert not any("NTERM" in g for g in got)
+    assert not any("NTERM" in g or "ACETYL" in g for g in got)
     assert not any("UniMod" in g for g in got)
+    assert "kept 0 and dropped 2 target precursor(s)" in out, out
+
+
+def test_an_n_terminal_acetyl_is_kept_as_the_proforma_group(diann_lib, tmp_path):
+    """`(UniMod:1)SACETYLK` is protein N-terminal acetylation: kept as `[Acetyl]-SACETYLK`
+    when accession 1 is kept, on the stripped sequence's own peptide id, and the import
+    says how many N-terminal precursors it kept and dropped."""
+    prec = tmp_path / "p.parquet"
+    frag = tmp_path / "f.parquet"
+    out, _ = run_worker_ok("import_diann_lib.py", diann_lib, prec, frag, "--keep-unimod", "1,4,35")
+    assert_library_load_invariants(prec, frag, require_both_labels=False)
+    cols = read_columns(prec)
+    got = set(cols["peptidoform"])
+    assert "[Acetyl]-SACETYLK" in got
+    assert "[Carbamidomethyl]-NTERMCK" in got
+    assert not any(g.startswith("[Acetyl]S") or "UniMod" in g for g in got)
+    assert "kept 2 and dropped 0 target precursor(s)" in out, out
+
+
+def test_by_default_an_n_terminal_acetyl_is_dropped_and_counted(diann_lib, tmp_path):
+    prec = tmp_path / "p.parquet"
+    frag = tmp_path / "f.parquet"
+    out, _ = run_worker_ok("import_diann_lib.py", diann_lib, prec, frag)
+    assert not any("ACETYL" in g for g in read_columns(prec)["peptidoform"])
+    assert "kept 1 and dropped 1 target precursor(s)" in out, out
 
 
 def test_keep_unimod_refuses_an_accession_outside_the_catalogue(diann_lib, tmp_path):
@@ -402,7 +431,7 @@ def test_library_ion_mobility_is_written_as_predicted_im(diann_lib, tmp_path, na
     assert got[("K[Farnesyl]ITTENR", 2)] == pytest.approx(1.05)
     assert got[("SC[Carbamidomethyl]ENICK", 2)] is None, "non-finite is null"
     assert got[("M[Oxidation]ELLOWK", 2)] is None, "non-positive is null"
-    assert f"3 of 5 precursors carry a library 1/K0 (from {name}); 2 are null" in stdout
+    assert f"4 of 6 precursors carry a library 1/K0 (from {name}); 2 are null" in stdout
 
 
 def test_an_all_zero_ion_mobility_column_is_not_written(diann_lib, tmp_path):

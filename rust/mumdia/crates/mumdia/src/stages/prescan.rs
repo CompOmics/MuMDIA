@@ -120,7 +120,20 @@ impl Alphabet {
     /// Tokenise a ProForma-lite peptidoform into alphabet indices. `None` when the sequence
     /// contains a residue or modification outside the alphabet: such a candidate cannot be tagged
     /// meaningfully, so it is dropped rather than screened on a partial sequence.
+    ///
+    /// A leading N-terminal group (`[Acetyl]-`) is skipped when the mass model knows it: a tag
+    /// is a mass difference between consecutive residues, which a terminal group does not
+    /// change, so the candidate is screened on its residues as the unmodified form is. The
+    /// group is never an anchor. An unknown group still drops the candidate.
     fn tokenise(&self, pform: &str) -> Option<Vec<usize>> {
+        let pform = match pform.strip_prefix('[') {
+            Some(rest) => {
+                let close = rest.find("]-")?;
+                unimod_mass(&rest[..close])?;
+                &rest[close + 2..]
+            }
+            None => pform,
+        };
         let b = pform.as_bytes();
         let mut out = Vec::with_capacity(b.len());
         let mut i = 0;
@@ -586,6 +599,19 @@ mod tests {
         let a = Alphabet::build(&cfg()).unwrap();
         assert!(a.tokenise("PEC[Phospho]K").is_none());
         assert!(a.tokenise("PEC[Carbamidomethyl]K").is_some());
+    }
+
+    /// An N-terminal group leaves the residue tokens as they are; an unknown or malformed
+    /// group drops the candidate.
+    #[test]
+    fn tokenise_skips_a_known_n_terminal_group() {
+        let a = Alphabet::build(&cfg()).unwrap();
+        assert_eq!(
+            a.tokenise("[Acetyl]-PEC[Carbamidomethyl]K").unwrap(),
+            a.tokenise("PEC[Carbamidomethyl]K").unwrap()
+        );
+        assert!(a.tokenise("[NotAModification]-PEPK").is_none());
+        assert!(a.tokenise("[Acetyl]PEPK").is_none());
     }
 
     #[test]

@@ -217,6 +217,12 @@ def main() -> int:
     )
     ap.add_argument("--seed", type=int, default=20260827)
     ap.add_argument(
+        "--include-prefix",
+        default=None,
+        help="also plant every target whose peptidoform starts with this text (for "
+             "example '[Acetyl]-'), on top of the strided selection",
+    )
+    ap.add_argument(
         "--quiet",
         action="store_true",
         help="print the summary but not the per-precursor listing. Exists so a caller "
@@ -247,6 +253,12 @@ def main() -> int:
     targets.sort(key=lambda i: (prec["charge"][i], prec["precursor_mz"][i]))
     stride = max(1, len(targets) // a.n_planted)
     chosen = targets[::stride][: a.n_planted]
+    if a.include_prefix:
+        # Every target with the prefix, merged into the same (charge, m/z) order, so a
+        # rare form (a terminal modification, say) is planted whatever the stride hits.
+        extra = [i for i in targets if prec["peptidoform"][i].startswith(a.include_prefix)]
+        picked = set(chosen) | set(extra)
+        chosen = [i for i in targets if i in picked]
 
     # Fragment m/z pool over the WHOLE library, targets and decoys alike. Noise
     # drawn from it is what gives decoys the chance evidence a real run has: real

@@ -210,6 +210,7 @@ async function init() {
         refreshComponents();
         refreshDiann();
         refreshThermo();
+        refreshStorage();
         refreshManaged();
       }
       if (b.dataset.screen === "settings") loadSettings();
@@ -282,7 +283,15 @@ async function init() {
   refreshComponents();
   refreshDiann();
   refreshThermo();
-  // Setup is the first screen, so its managed-data card is filled from the start.
+  // Setup is the first screen, so its storage and managed-data cards are filled from the
+  // start.
+  $("storage-change").addEventListener("click", chooseStorage);
+  $("storage-reset").addEventListener("click", () => setStorage(null));
+  // With a folder chosen, the checkbox applies at once; without one, with the next choice.
+  $("storage-move-envs").addEventListener("change", () => {
+    if (state.storage && state.storage.configured) setStorage(state.storage.folder);
+  });
+  refreshStorage();
   refreshManaged();
   $("stop").addEventListener("click", stop);
   $("another").addEventListener("click", () => screen("input"));
@@ -954,6 +963,73 @@ async function refreshManaged() {
   }
 }
 
+// -- storage folder ------------------------------------------------------
+// One setting for where MuMDIA writes (desktop/src-tauri/src/storage.rs). The folder
+// picker and the reset change it; the checkbox decides whether the Python environments
+// move too, which means installing them again, so it applies with the next change.
+function renderStorage(s) {
+  state.storage = s;
+  const pill = $("storage-pill");
+  if (!s.writable) {
+    pill.textContent = "cannot be written";
+    pill.className = "pill bad";
+  } else {
+    pill.textContent = s.configured ? "chosen" : "default";
+    pill.className = s.configured ? "pill ok" : "pill mute";
+  }
+  const free = s.free_bytes == null ? "" : ` (${bytesLabel(s.free_bytes)} free)`;
+  $("storage-where").textContent = s.folder + free;
+  $("storage-envs").textContent =
+    s.environments === s.folder
+      ? "The Python environments and downloaded tools are in this folder too."
+      : `Python environments and downloaded tools: ${s.environments}`;
+  $("storage-move-envs").checked = !!s.move_environments;
+  show($("storage-reset"), s.configured);
+  banner($("storage-error"), s.error ? `MuMDIA cannot write here: ${s.error}` : "");
+  banner($("storage-warn"), (s.warnings || []).join("\n"));
+}
+
+async function refreshStorage() {
+  try {
+    renderStorage(await invoke("storage_info"));
+  } catch (e) {
+    banner($("storage-error"), String(e));
+  }
+}
+
+async function setStorage(folder) {
+  const moveEnvironments = $("storage-move-envs").checked;
+  const before = state.storage;
+  if (moveEnvironments && folder && before && !before.move_environments) {
+    const ok = await dialog.ask(
+      "The Python environments and downloaded tools will be looked for in the new " +
+        "folder, so they have to be installed again from this screen. Continue?",
+      { title: "Move the Python environments", kind: "warning" }
+    );
+    if (!ok) {
+      $("storage-move-envs").checked = false;
+      return;
+    }
+  }
+  banner($("storage-error"), "");
+  try {
+    renderStorage(await invoke("storage_set", { folder, moveEnvironments }));
+    // Every other Setup card reads the folders that just moved.
+    refreshComponents();
+    refreshThermo();
+    refreshDiann();
+    refreshManaged();
+  } catch (e) {
+    banner($("storage-error"), String(e));
+  }
+}
+
+async function chooseStorage() {
+  const chosen = await dialog.open({ directory: true, multiple: false });
+  if (!chosen) return;
+  await setStorage(Array.isArray(chosen) ? chosen[0] : chosen);
+}
+
 // -- DIA-NN --------------------------------------------------------------
 // Detection, not installation. DIA-NN is closed source and its licence forbids
 // redistribution from 1.9 onward, so MuMDIA cannot fetch it the way it fetches
@@ -1590,8 +1666,20 @@ const FALLBACK_CATALOGUE = {
   sets: [],
 };
 
-function modKey(name, residue) {
-  return `${name}|${residue}`;
+// A residue site is "name|R", as it always was; a terminal site is "name|*|position"
+// (`protein_n_term` or `peptide_n_term`), so saved residue choices still read.
+const TERMINI = {
+  protein_n_term: { chip: "Prot N-term", text: "protein N-terminus" },
+  peptide_n_term: { chip: "Pep N-term", text: "peptide N-terminus" },
+};
+
+function modKey(name, residue, position) {
+  return position ? `${name}|${residue}|${position}` : `${name}|${residue}`;
+}
+
+function parseModKey(key) {
+  const [name, residue, position] = String(key).split("|");
+  return { name, residue, position: position || "" };
 }
 
 function maxVariableMods() {
@@ -1606,11 +1694,14 @@ function selectedMods() {
   const variable = [];
   for (const m of state.catalogue?.modifications || []) {
     const picked = [...state.mods.entries()]
-      .filter(([k]) => k.split("|")[0] === m.name)
-      .map(([k, kind]) => [k.split("|")[1], kind])
-      .sort((a, b) => a[0].localeCompare(b[0]));
-    for (const [residue, kind] of picked) {
-      (kind === "fix" ? fixed : variable).push({ residue, name: m.name });
+      .map(([k, kind]) => ({ ...parseModKey(k), kind }))
+      .filter((x) => x.name === m.name)
+      .sort((a, b) => (a.residue + a.position).localeCompare(b.residue + b.position));
+    for (const x of picked) {
+      const site = x.position
+        ? { residue: x.residue, name: m.name, position: x.position }
+        : { residue: x.residue, name: m.name };
+      (x.kind === "fix" ? fixed : variable).push(site);
     }
   }
   return { fixed, variable };
@@ -1621,9 +1712,13 @@ function selectedMods() {
 function modProblems() {
   const { fixed, variable } = selectedMods();
   const out = [];
+  // A terminal site is keyed by the terminus: the engine places one group there.
   const byResidue = (list) => {
     const m = new Map();
-    for (const x of list) m.set(x.residue, [...(m.get(x.residue) || []), x.name]);
+    for (const x of list) {
+      const at = x.position ? "the N-terminus" : x.residue;
+      m.set(at, [...(m.get(at) || []), x.name]);
+    }
     return m;
   };
   const fx = byResidue(fixed);
@@ -1668,8 +1763,9 @@ function loadMods() {
   for (const e of entries) {
     if (!Array.isArray(e) || e.length !== 2) continue;
     const [key, kind] = e;
-    const [name, residue] = String(key).split("|");
-    if (known.has(name) && /^[A-Z]$/.test(residue || "") && (kind === "var" || kind === "fix")) {
+    const { name, residue, position } = parseModKey(key);
+    const site = position ? residue === "*" && position in TERMINI : /^[A-Z]$/.test(residue || "");
+    if (known.has(name) && site && (kind === "var" || kind === "fix")) {
       state.mods.set(key, kind);
     }
   }
@@ -1741,8 +1837,8 @@ async function initMods() {
     sel.value = "";
     if (!set) return;
     if (set.replace) state.mods.clear();
-    for (const [n, r] of set.fixed || []) state.mods.set(modKey(n, r), "fix");
-    for (const [n, r] of set.variable || []) state.mods.set(modKey(n, r), "var");
+    for (const [n, r, pos] of set.fixed || []) state.mods.set(modKey(n, r, pos), "fix");
+    for (const [n, r, pos] of set.variable || []) state.mods.set(modKey(n, r, pos), "var");
     modsChanged();
   });
   $("mod-filter").addEventListener("input", renderMods);
@@ -1768,13 +1864,26 @@ function renderMods() {
   for (const m of state.catalogue.modifications) {
     // The catalogue's residues, plus any a saved or set choice put elsewhere, so a
     // selected site is never invisible.
-    const extra = [...state.mods.keys()]
-      .filter((k) => k.split("|")[0] === m.name)
-      .map((k) => k.split("|")[1]);
+    const chosen = [...state.mods.keys()].map(parseModKey).filter((x) => x.name === m.name);
+    const extra = chosen.filter((x) => !x.position).map((x) => x.residue);
     const residues = [...new Set([...m.residues, ...extra])];
+    // The catalogue's termini, plus any a saved or set choice put there.
+    const termini = [
+      ...new Set([...(m.termini || []), ...chosen.filter((x) => x.position).map((x) => x.position)]),
+    ].filter((t) => t in TERMINI);
+    const sites = [
+      ...residues.map((r) => ({ key: modKey(m.name, r), label: r, text: r })),
+      ...termini.map((t) => ({
+        key: modKey(m.name, "*", t),
+        label: TERMINI[t].chip,
+        text: `the ${TERMINI[t].text}`,
+      })),
+    ];
     // The optional label is a plain-language description ("N-homocysteinylation") for a
     // UniMod name that does not say what it is, so it is shown and matched by the filter.
-    const hay = `${m.name} ${m.label || ""} ${m.group} ${residues.join(" ")} unimod:${m.unimod}`.toLowerCase();
+    const hay = `${m.name} ${m.label || ""} ${m.group} ${residues.join(" ")} ${termini
+      .map((t) => `${TERMINI[t].chip} ${TERMINI[t].text}`)
+      .join(" ")} unimod:${m.unimod}`.toLowerCase();
     if (words.length && !words.every((w) => hay.includes(w))) continue;
     if (m.group !== group) {
       group = m.group;
@@ -1802,15 +1911,14 @@ function renderMods() {
     const chips = document.createElement("div");
     chips.className = "chips";
     let on = false;
-    for (const r of residues) {
-      const key = modKey(m.name, r);
+    for (const { key, label: chipLabel, text } of sites) {
       const kind = state.mods.get(key);
       if (kind) on = true;
       const b = document.createElement("button");
       b.type = "button";
       b.className = "chip" + (kind === "var" ? " var" : kind === "fix" ? " fix" : "");
-      b.textContent = r;
-      b.title = `${m.name} on ${r}: ${
+      b.textContent = chipLabel;
+      b.title = `${m.name} on ${text}: ${
         kind === "var" ? "variable" : kind === "fix" ? "fixed" : "not searched"
       }`;
       b.addEventListener("click", () => {
@@ -1837,7 +1945,10 @@ function renderMods() {
 
 function describeMods(list) {
   const by = new Map();
-  for (const x of list) by.set(x.name, [...(by.get(x.name) || []), x.residue]);
+  for (const x of list) {
+    const at = x.position ? TERMINI[x.position]?.text || x.position : x.residue;
+    by.set(x.name, [...(by.get(x.name) || []), at]);
+  }
   return [...by].map(([n, rs]) => `${n} (${rs.join(", ")})`).join(", ");
 }
 
