@@ -249,6 +249,27 @@ assert len(found) >= 0.8 * len(planted), (len(found), len(planted))
 wrong = [pf for pf in accepted if pf.startswith("[Acetyl]-") and not starts_a_protein(residues(pf))]
 assert not wrong, wrong
 PYEOF
+# The same configuration through `build-library` (the shared FASTA build of `run`,
+# `run-experiment` and `build-library`): peptides v2 with the flag, the acetylated forms,
+# and the library `run --fasta` built above, byte for byte.
+"$BIN" build-library --fasta test_data/fixture_nterm.fasta --out-dir "$nt/buildlib"     --config "$nt/cfg.json" --threads 2 > "$nt/buildlib.log" 2>&1     || { tail -20 "$nt/buildlib.log"; echo "build-library with a protein N-terminal rule failed"; exit 1; }
+for f in fragment_library_precursors.parquet fragment_library_fragments.parquet; do
+    cmp -s "$nt/out/$f" "$nt/buildlib/$f"         || { echo "build-library built a different $f than run --fasta (protein N-terminal rule)"; exit 1; }
+done
+"$PY" - "$nt/buildlib" <<'PYEOF'
+import json, os, sys
+import pyarrow.parquet as pq
+d = sys.argv[1]
+rep = json.load(open(os.path.join(d, "peptides.parquet.report.json")))
+assert rep["schema_version"] == 2, rep["schema_version"]
+assert "protein_n_term" in pq.read_schema(os.path.join(d, "peptides.parquet")).names
+man = json.load(open(os.path.join(d, "manifest.json")))
+assert man["artifacts"]["peptides"]["schema_version"] == 2, man["artifacts"]["peptides"]
+lib = pq.read_table(os.path.join(d, "fragment_library_precursors.parquet"),
+                    columns=["peptidoform"]).column("peptidoform").to_pylist()
+assert any(pf.startswith("[Acetyl]-") for pf in lib), "no acetylated form in the library"
+PYEOF
+echo "    ok: protein N-terminal acetylation through digest, run and build-library"
 
 # 4a. `predict_frag.library_cache`: the first FASTA run builds the library and stores it,
 #     the second finds it and skips digest, peptidoforms and predict-frag. Both must give
@@ -312,6 +333,56 @@ if ls "$work"/cache_root/libraries/*/entry.json > /dev/null 2>&1; then
     echo "mumdia cache clear left a library entry"; exit 1
 fi
 echo "    ok: stored under MUMDIA_CACHE_DIR/libraries, reused (digest skipped), kept over a bound while in use, a named directory used, all byte-identical to the plain run"
+
+# 4a'. `build-library` (issue #233): the plain run's library, built without spectra. It must
+#      be the library `run --fasta` builds, byte for byte, and be stored under the key that
+#      run computes, so a FASTA run after it finds the library and skips the build. The
+#      same build with --ion-mobility on is the same library when nothing predicts 1/K0, and
+#      a prefilter before prediction, whose library depends on spectra, is refused.
+echo "=== smoke: build-library, then a FASTA run that finds the library"
+bl_env=(MUMDIA_CACHE_DIR="$work/buildlib_root")
+env "${bl_env[@]}" "$BIN" build-library --fasta test_data/fixture.fasta \
+    --out-dir "$work/out_buildlib" --config "$cfg" --threads 2 > "$work/buildlib.log" 2>&1 \
+    || { tail -20 "$work/buildlib.log"; echo "build-library failed"; exit 1; }
+for f in fragment_library_precursors.parquet fragment_library_fragments.parquet; do
+    cmp -s "$work/out/$f" "$work/out_buildlib/$f" \
+        || { echo "build-library built a different $f than run --fasta"; exit 1; }
+done
+env "${bl_env[@]}" "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_after_buildlib" --config "$cfg" --threads 2 \
+    > "$work/after_buildlib.log" 2>&1 \
+    || { tail -20 "$work/after_buildlib.log"; echo "the run after build-library failed"; exit 1; }
+grep -q "library cache: reusing the stored library" "$work/after_buildlib.log" \
+    || { echo "a FASTA run after build-library did not find the library it built"; exit 1; }
+for f in peptides.tsv proteins.tsv; do
+    cmp -s "$work/out/$f" "$work/out_after_buildlib/$f" \
+        || { echo "the run on the build-library library changed $f"; exit 1; }
+done
+env "${bl_env[@]}" "$BIN" build-library --fasta test_data/fixture.fasta \
+    --out-dir "$work/out_buildlib_im" --config "$cfg" --ion-mobility on \
+    > "$work/buildlib_im.log" 2>&1 \
+    || { tail -20 "$work/buildlib_im.log"; echo "build-library --ion-mobility on failed"; exit 1; }
+"$PY" - "$work/out_buildlib/library.json" "$work/out_buildlib_im/library.json" \
+    "$work/out_buildlib/manifest.json" <<'PYEOF'
+import json, sys
+built, im, man = (json.load(open(p)) for p in sys.argv[1:4])
+assert built["origin"] == "built" and built["cache"]["stored"], built
+assert built["precursors"]["rows"] > 0 and built["fragments"]["rows"] > 0, built
+assert built["precursors"]["targets"] + built["precursors"]["decoys"] == built["precursors"]["rows"]
+assert built["reuse"]["library_irt"] in ("library", "deeplc"), built["reuse"]
+assert "--lib-precursors" in built["reuse"]["library"], built["reuse"]
+assert im["origin"] == "library-cache" and im["cache"]["key"] == built["cache"]["key"], im
+assert man["artifacts"]["fragment_library_precursors"]["producing_stage"] == "predict-frag", man
+PYEOF
+if env "${bl_env[@]}" "$BIN" build-library --fasta test_data/fixture.fasta \
+    --out-dir "$work/out_buildlib_prescreen" --config "$work/prescreen.json" \
+    > "$work/buildlib_prescreen.log" 2>&1; then
+    echo "build-library built a library with a prefilter before prediction"; exit 1
+fi
+grep -q "prescreen.tag_prefilter filters the peptidoforms on a run's spectra" \
+    "$work/buildlib_prescreen.log" \
+    || { tail -5 "$work/buildlib_prescreen.log"; echo "the prefilter refusal does not name it"; exit 1; }
+echo "    ok: build-library wrote the run's library byte for byte, a FASTA run found it, --ion-mobility on kept the key, a prefilter was refused"
 
 # 4b. A malformed retention time must not abort the run.
 #
@@ -745,6 +816,94 @@ lib = json.load(open(sys.argv[1] + "/second_pass/library/empirical_library.json"
 assert lib["entries"] > 100 and lib["targets"] == lib["entries"] and lib["decoys"] == lib["targets"], lib
 print(f"    ok: empirical library {lib['entries']} entries + {lib['decoys']} paired decoys, "
       f"{lib['runs_aligned']} runs aligned; no decoy extracted, so the first pass stands")
+PYEOF
+
+# 5q. `quant.fragment_detail`: the single run and the two-run experiment with the key on.
+#     Each run's final quant writes quant_fragments.parquet beside its peptide_quant and the
+#     manifest records it; every other table is the plain search's, byte for byte, and no
+#     plain search writes the table. Under the default rule (observed_area, top 3) the
+#     selected areas, summed in rank order, are each quantity exactly.
+echo "=== smoke: quant.fragment_detail"
+"$PY" - "$cfg" "$work/qf.json" "$work/exp_seq.json" "$work/exp_qf.json" <<'PYEOF'
+import json, sys
+for src, dst in ((sys.argv[1], sys.argv[2]), (sys.argv[3], sys.argv[4])):
+    c = json.load(open(src, encoding="utf-8"))
+    c.setdefault("quant", {})["fragment_detail"] = True
+    json.dump(c, open(dst, "w", encoding="utf-8"), indent=2)
+PYEOF
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$work/out_qf" --config "$work/qf.json" --threads 2 > "$work/qf.log" 2>&1 \
+    || { tail -30 "$work/qf.log"; echo "the run with quant.fragment_detail failed"; exit 1; }
+"$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" \
+    --run-names a --run-names b \
+    --out-dir "$work/exp_qf" --config "$work/exp_qf.json" > "$work/exp_qf.log" 2>&1 \
+    || { tail -30 "$work/exp_qf.log"; echo "run-experiment with quant.fragment_detail failed"; exit 1; }
+for f in psms_scored.parquet peptide_quant.parquet protein_group_quant.parquet \
+         fragment_quant.parquet peptides.tsv proteins.tsv; do
+    cmp -s "$work/out/$f" "$work/out_qf/$f" \
+        || { echo "quant.fragment_detail changed $f"; exit 1; }
+done
+for f in scored_combined.parquet a/peptide_quant.parquet b/peptide_quant.parquet \
+         a/protein_group_quant.parquet b/protein_group_quant.parquet lfq_maxlfq.parquet \
+         peptides.tsv proteins.tsv; do
+    cmp -s "$work/exp/$f" "$work/exp_qf/$f" \
+        || { echo "quant.fragment_detail changed the experiment's $f"; exit 1; }
+done
+for f in out/quant_fragments.parquet exp/a/quant_fragments.parquet exp/b/quant_fragments.parquet; do
+    [ ! -e "$work/$f" ] || { echo "a search without quant.fragment_detail wrote $f"; exit 1; }
+done
+"$PY" - "$work" <<'PYEOF'
+import json, os, sys
+import pyarrow.parquet as pq
+work = sys.argv[1]
+def check(ok, what):
+    if not ok:
+        sys.exit("quant.fragment_detail: " + what)
+single = json.load(open(os.path.join(work, "out_qf", "manifest.json"), encoding="utf-8"))
+exp = json.load(open(os.path.join(work, "exp_qf", "experiment_manifest.json"), encoding="utf-8"))
+check("quant_fragments" not in json.load(open(os.path.join(work, "out", "manifest.json"),
+      encoding="utf-8"))["artifacts"], "the plain run's manifest records quant_fragments")
+cases = [(os.path.join(work, "out_qf"), single["artifacts"]["quant_fragments"])]
+for run in ("a", "b"):
+    cases.append((os.path.join(work, "exp_qf", run), exp["artifacts"][f"quant_fragments[{run}]"]))
+total = 0
+for d, rec in cases:
+    path = os.path.join(d, "quant_fragments.parquet")
+    report = json.load(open(path + ".report.json", encoding="utf-8"))
+    check(rec["schema_name"] == "quant_fragments" and rec["schema_version"] == 1,
+          f"{d}: the manifest records {rec['schema_name']} v{rec['schema_version']}")
+    check(rec["content_hash"] == report["content_hash"], f"{d}: manifest and report hashes differ")
+    qf = pq.read_table(path).to_pylist()
+    check([r["candidate_id"] for r in qf] == sorted(r["candidate_id"] for r in qf),
+          f"{d}: not sorted by candidate_id")
+    by = {}
+    for r in qf:
+        by.setdefault(r["candidate_id"], []).append(r)
+    pq_rows = pq.read_table(os.path.join(d, "peptide_quant.parquet"),
+                            columns=["candidate_id", "quantity", "n_fragments_used"]).to_pylist()
+    n = 0
+    for row in pq_rows:
+        if row["quantity"] is None:
+            continue
+        rows = by.get(row["candidate_id"])
+        check(rows is not None, f"{d}: quantified candidate {row['candidate_id']} has no rows")
+        check(all(r["rule"] == "observed_area" and r["weight"] == 1.0 for r in rows),
+              f"{d}: candidate {row['candidate_id']} is not under observed_area")
+        sel = sorted((r for r in rows if r["selected"]), key=lambda r: r["rank"])
+        check(len(sel) == row["n_fragments_used"],
+              f"{d}: candidate {row['candidate_id']} selects {len(sel)} fragments, "
+              f"n_fragments_used {row['n_fragments_used']}")
+        q = 0.0
+        for r in sel:
+            q += r["weight"] * r["area"]
+        check(q == row["quantity"],
+              f"{d}: candidate {row['candidate_id']}: {q!r} against quantity {row['quantity']!r}")
+        n += 1
+    check(n > 50, f"{d}: only {n} quantified candidates")
+    total += n
+print(f"    ok: {total} quantities over {len(cases)} runs reproduced exactly from the selected "
+      "fragments; every other table unchanged")
 PYEOF
 
 # 5b. The same experiment with `experiment.parallel_runs = 2`, and one whose second run

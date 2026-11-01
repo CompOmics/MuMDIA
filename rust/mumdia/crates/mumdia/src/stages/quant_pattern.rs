@@ -190,15 +190,42 @@ pub fn weighted_area(x: &[f64], w: &[f64]) -> f64 {
     a
 }
 
-/// The `k` slots with the largest `p` among `ok` ones (ties in slot order), as a mask.
-fn top_mask(p: &[f64], ok: &[bool], k: usize) -> Vec<bool> {
+/// The `k` slots with the largest `p` among `ok` ones (ties in slot order), largest first.
+fn top_order(p: &[f64], ok: &[bool], k: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..p.len()).filter(|&i| ok[i]).collect();
     order.sort_by(|&a, &b| p[b].total_cmp(&p[a]).then(a.cmp(&b)));
+    order.truncate(k);
+    order
+}
+
+/// The `k` slots with the largest `p` among `ok` ones (ties in slot order), as a mask.
+fn top_mask(p: &[f64], ok: &[bool], k: usize) -> Vec<bool> {
     let mut m = vec![false; p.len()];
-    for &i in order.iter().take(k) {
+    for i in top_order(p, ok, k) {
         m[i] = true;
     }
     m
+}
+
+/// The library intensity the pattern rules weigh each slot by: `pred ^ PATTERN_GAMMA`, a
+/// NaN intensity counting as 0.
+fn pattern_intensity(pred: &[f32]) -> Vec<f64> {
+    pred.iter()
+        .map(|&v| {
+            let v = v as f64;
+            let v = if v.is_nan() { 0.0 } else { v };
+            v.powf(PATTERN_GAMMA)
+        })
+        .collect()
+}
+
+/// The slots [`pattern_quantity`] fits (its set `S`), largest library intensity first: the
+/// [`PATTERN_FRAGMENTS`] eligible slots with a positive library intensity. The fragment
+/// account of quant reads it to say which fragments a pattern quantity came from.
+pub fn pattern_fragments(pred: &[f32], eligible: &[bool]) -> Vec<usize> {
+    let p = pattern_intensity(pred);
+    let ok: Vec<bool> = (0..p.len()).map(|f| p[f] > 0.0 && eligible[f]).collect();
+    top_order(&p, &ok, PATTERN_FRAGMENTS)
 }
 
 /// Huber weight of the standardised excess of `x` over `mu`.
@@ -245,15 +272,7 @@ pub fn pattern_quantity(
     let nt = inp.rt.len();
     let nf = inp.pred.len();
     debug_assert_eq!(inp.x.len(), nf * nt);
-    let p: Vec<f64> = inp
-        .pred
-        .iter()
-        .map(|&v| {
-            let v = v as f64;
-            let v = if v.is_nan() { 0.0 } else { v };
-            v.powf(PATTERN_GAMMA)
-        })
-        .collect();
+    let p = pattern_intensity(inp.pred);
     let ok: Vec<bool> = (0..nf).map(|f| p[f] > 0.0 && inp.eligible[f]).collect();
     let sel = top_mask(&p, &ok, PATTERN_FRAGMENTS);
     let n_sel = sel.iter().filter(|&&s| s).count();

@@ -39,7 +39,7 @@ recipe").
 | `rust/mumdia/crates/mumdia-core/src/mass.rs` | `unimod_mass` (the UniMod name allowlist that validates modification names) |
 | `rust/mumdia/crates/mumdia-core/src/schema.rs` | `artifact::PEPTIDES` and `artifact::PEPTIDOFORMS` logical names + schema versions |
 | `rust/mumdia/crates/mumdia/src/main.rs` | CLI wiring: `Cmd::Digest` (main.rs:415), `Cmd::Peptidoforms` (main.rs:426) |
-| `rust/mumdia/crates/mumdia/src/stages/run.rs` | Orchestrator wiring in the FASTA-build branch (run.rs:132, run.rs:149) |
+| `rust/mumdia/crates/mumdia/src/stages/library_build.rs` | The shared FASTA library build that `run`, `run-experiment` and `build-library` call: digest (library_build.rs:141, with `protein_n_term` from the peptidoform rules) and peptidoforms (library_build.rs:160) |
 
 ## Inputs and outputs
 
@@ -298,7 +298,7 @@ a live silent-drop path.
 deny_unknown_fields)]`, so an unknown key is a load error and any omitted field
 takes the default below. `rng_seed` (config.rs:974, default `0`) is a top-level
 `Config` field, passed to digest as `DigestParams.rng_seed` (main.rs:422,
-run.rs:136).
+library_build.rs:141).
 
 | Field | Section | Default | Effect |
 |---|---|---|---|
@@ -412,8 +412,9 @@ types elsewhere, not here). `DecoyConfig` (config.rs:172) carries only
   `invalid_charges_and_wildcard_modifications_are_rejected` (peptidoforms.rs:381)
   pins the rejection.
 - **Library-input mode bypasses both stages.** When a prebuilt library is passed,
-  `run` takes the library-input branch (run.rs:98) and never calls
-  `digest`/`peptidoforms`; the FASTA-build branch is the `_ =>` arm at run.rs:127.
+  `run` takes the library-input branch (run.rs:255) and never calls
+  `digest`/`peptidoforms`; the FASTA-build branch is the `_ =>` arm at run.rs:279,
+  which calls `library_build::build`.
   Do not assume `peptides.parquet` / `peptidoforms.parquet` exist for every run.
 
 ## Terminal modifications
@@ -435,7 +436,11 @@ rule takes residue `*`:
 
 The feature is opt-in: no shipped configuration places a terminal rule, and a
 configuration without one produces the tables, the canonical configuration and the
-library-cache key it always did.
+library-cache key it always did. Use protein N-terminal acetylation for eukaryotic
+samples: in the validation of this option (PR #250) it added 2.3% precursors on human
+HeLa runs at an unchanged paired entrapment FDP, while on an E. coli proteome it cost
+0.6-0.8% of the identifications and most of its acetylated identifications were
+entrapment.
 
 **Which peptides start a protein.** When a `protein_n_term` rule is configured, the
 digest records a Boolean `protein_n_term` per row (peptides v2, `artifact::PEPTIDES_V2`;
