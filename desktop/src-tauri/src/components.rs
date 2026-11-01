@@ -1557,7 +1557,7 @@ mod tests {
 
     #[test]
     fn a_viewer_installed_from_another_commit_is_outdated() {
-        let pin = "https://github.com/CompOmics/visDIA/archive/c674f9fad94f640750559076d2d88c8a564e2102.zip";
+        let pin = "https://github.com/CompOmics/visDIA/archive/f06aad697a61ff41dc9c0e638815ccb6d0cfe6d0.zip";
         let reqs = format!("# viewer\nmumdia-viewer @ {pin}\n");
         let urls = |u: &str| {
             [("mumdia-viewer".to_string(), u.to_string())]
@@ -1566,10 +1566,10 @@ mod tests {
         };
         let versions = std::collections::BTreeMap::new();
         assert!(outdated_pins(&reqs, &versions, &urls(pin)).is_empty());
-        let old = "https://github.com/CompOmics/visDIA/archive/13b3a9c255885df93970fc070869928cd810fadf.zip";
+        let old = "https://github.com/CompOmics/visDIA/archive/c674f9fad94f640750559076d2d88c8a564e2102.zip";
         assert_eq!(
             outdated_pins(&reqs, &versions, &urls(old)),
-            vec!["mumdia-viewer 13b3a9c -> c674f9f".to_string()]
+            vec!["mumdia-viewer c674f9f -> f06aad6".to_string()]
         );
         // Not installed from a URL at all: nothing to compare.
         assert!(outdated_pins(&reqs, &versions, &std::collections::BTreeMap::new()).is_empty());

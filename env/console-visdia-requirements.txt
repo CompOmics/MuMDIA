@@ -8,8 +8,14 @@
 # user's machine, and everyone who installs this release gets the same viewer. The
 # application compares this URL with the one the installed viewer records
 # (`direct_url.json`), so moving the pin marks an existing environment outdated and the
-# Setup screen offers the update. c674f9f (CompOmics/visDIA#7) reads a second-pass
-# experiment's chromatograms, features and library from `second_pass/`; checked on a
-# six-run 0.7.0 experiment on 2026-10-19 (every accepted target of a run has chromatogram
-# rows). Move the pin together with a check of that kind.
-mumdia-viewer @ https://github.com/CompOmics/visDIA/archive/c674f9fad94f640750559076d2d88c8a564e2102.zip
+# Setup screen offers the update. f06aad6 adds to c674f9f (CompOmics/visDIA#7, which reads
+# a second-pass experiment's chromatograms, features and library from `second_pass/`) the
+# ion-mobility views (#8), a mobilogram card on the precursor page (#9) and the fragments
+# behind each quantity from `quant_fragments.parquet` (#10), and caps duckdb below 2 and
+# dash-mantine-components below 3. Checked on 2026-11-01: a fresh pip install of this
+# file (duckdb 1.5.6, dash-mantine-components 2.8.1) served a 12-run diaPASEF second-pass
+# experiment, every accepted target of every run had chromatogram rows, the 1/K0 evidence
+# and centroid mobilograms loaded, and on the smoke fixture with quant.fragment_detail the
+# viewer reproduced all 789 quantities exactly from the engine's fragments. Move the pin
+# together with a check of that kind.
+mumdia-viewer @ https://github.com/CompOmics/visDIA/archive/f06aad697a61ff41dc9c0e638815ccb6d0cfe6d0.zip

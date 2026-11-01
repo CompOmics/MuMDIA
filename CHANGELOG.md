@@ -184,6 +184,16 @@ than a number. Both are recorded in every run's `manifest.json`.
   filter, so typing "homocysteine" finds both. The carbamidomethylated form of the free
   thiol, cleavage blocked at a modified lysine and the N-terminal adduct are not modelled.
 
+### Changed
+
+- **The desktop application pins visDIA at f06aad6.** Over c674f9f it adds the ion-mobility
+  views (CompOmics/visDIA#8), a mobilogram card on the precursor page of diaPASEF runs (#9)
+  and the fragments behind each quantity, read from `quant_fragments.parquet` (#10), and
+  caps duckdb below 2 and dash-mantine-components below 3. An existing visDIA environment is
+  reported outdated (`mumdia-viewer c674f9f -> f06aad6`) and the Setup screen offers the
+  update. Checked with a fresh install on a 12-run diaPASEF second-pass experiment and on
+  the smoke fixture with `quant.fragment_detail` (env/console-visdia-requirements.txt).
+
 ### Fixed
 
 - **A Python environment whose torch cannot load is reported before a search, not two
