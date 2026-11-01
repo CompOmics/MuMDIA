@@ -339,9 +339,16 @@ A third, optional environment (`Env::Visdia`, `python-visdia`) holds
 for MuMDIA results. Its own environment because its Dash and DuckDB stack has nothing to
 do with the analysis packages, and neither should constrain the other.
 `env/console-visdia-requirements.txt` pins one visDIA commit through GitHub's source
-archive, so no git is needed and everyone on a release gets the same viewer; that commit
-was checked against this release's outputs (experiment and single run: counts,
-identification table, precursor detail, mirror spectrum). About 350 MB on Windows.
+archive, so no git is needed and everyone on a release gets the same viewer. The file's
+comment says what the pinned commit adds and the check on real outputs it was moved with
+(at f06aad6: a 12-run diaPASEF second-pass experiment, and the smoke fixture with
+`quant.fragment_detail`). About 350 MB on Windows.
+
+The precursor page's mobilogram card (diaPASEF runs) draws the centroids of the run's own
+spectra tables. Its raw-event source runs `mumdia mobilogram`, which the viewer finds
+through `--engine` or `MUMDIA_BIN` and which needs the run's `.d` on disk. Without an
+engine that has the subcommand, or without the `.d`, the card shows the centroids and
+says why the raw source is unavailable.
 
 "Open in visDIA" sits on the Results screen, on each History entry with a scored table,
 and on each file of a separate-files batch. `viewer::open` starts
