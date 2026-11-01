@@ -290,8 +290,22 @@ Only 1,165 of the 3,650 target peaks with a choice in this search are on synthes
 the restricted FASTA accepts phospho forms of other peptides of the 61 proteins (synthesis by-
 products, in-source fragments, and false identifications in a search space this small). Their
 decoy-residue wins (48% decoy-residue FLR at 0.75 over all 3,650) are why a run-level temperature
-fit is not safe. The dilutions of the pool into yeast (`PhosphoPooledSynth{4x,20x}dY`) are in
-section 7 of the PR record rather than here until they are complete.
+fit is not safe. The pool was also measured diluted into a yeast digest (`PhosphoPooledSynth4xdY` and
+`20xdY`, three replicates each; yeast is not in the FASTA, so its peptides are interference).
+The nine runs searched as one experiment, at 0.75 and 0.9:
+
+| sample | peaks with a choice | localised at 0.75 | true FLR | decoy-residue FLR | localised at 0.9 | true FLR | decoy-residue FLR |
+|---|---|---|---|---|---|---|---|
+| pure pool | 1,114 | 677 (60.8%) | 8.7% | 7.7% | 473 | 6.1% | 3.7% |
+| 4x in yeast | 863 | 544 (63.0%) | 10.3% | 8.0% | 389 | 7.5% | 1.1% |
+| 20x in yeast | 614 | 355 (57.8%) | 8.2% | 7.8% | 248 | 3.6% | 0.0% |
+
+The localisation rate and the error at 0.75 hold across a 20-fold dilution into a background
+proteome, and the decoy-residue estimate stays within about 2.5 points of the truth at 0.75; at
+0.9 it has too few decoy wins (0 to 4 per three runs) to be more than a bound. In the 20x runs a
+per-run `isomer_group_q` reached no group at 1% in two of three runs (minimum 0.011): about 230
+target groups per run, with the first decoy group early, which is the `1 / T` floor of a small
+population, not a fault.
 
 ## 8. Limits and open work
 
