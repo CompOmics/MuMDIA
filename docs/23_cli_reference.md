@@ -56,6 +56,7 @@ Commands:
   quant-normalise  Cross-run normalisation of per-run precursor quantities -> peptide_quant_normalised
   run              Orchestrate the full pipeline on one run and write a manifest. Given several --mzml, the files are searched as ONE pooled experiment (`run-experiment`: one combined rescore, per-run quant, cross-run LFQ), which is the default treatment of a multi-file input; use `run-experiment` directly for run names
   run-experiment   Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. Pass --mzml once per run (>= 2)
+  build-library    Build the spectral library of a FASTA search without spectra: digest -> peptidoforms -> predict-frag, restored from or stored into `predict_frag.library_cache` under the key a `run --fasta` uses. Writes the two library tables, manifest.json and library.json (counts, models, cache key and the commands that search with it) into --out-dir
   align            Cross-run RT alignment (experiment-level) -> alignment.parquet
   mbr              Match-between-runs identification transfer (Stage D3) -> transferred.parquet
   inspect          Print schema, head sample, and row count for any artifact
@@ -176,6 +177,7 @@ first sentence of the description, with the full text in the section below.
 | [`quant-normalise`](#quant-normalise) | yes | Cross-run normalisation of per-run precursor quantities -> peptide_quant_normalised |
 | [`run`](#run) | yes | Orchestrate the full pipeline on one run and write a manifest. |
 | [`run-experiment`](#run-experiment) | yes | Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. |
+| [`build-library`](#build-library) | yes | Build the spectral library of a FASTA search without spectra: digest -> peptidoforms -> predict-frag, restored from or stored into `predict_frag.library_cache` under the key a `run --fasta` uses. |
 | [`align`](#align) | yes | Cross-run RT alignment (experiment-level) -> alignment.parquet |
 | [`mbr`](#mbr) | yes | Match-between-runs identification transfer (Stage D3) -> transferred.parquet |
 | [`inspect`](#inspect) | no | Print schema, head sample, and row count for any artifact |
@@ -186,8 +188,8 @@ first sentence of the description, with the full text in the section below.
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-24 of the 28 documented subcommands accept `--config`:
- `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `quant-normalise`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
+25 of the 29 documented subcommands accept `--config`:
+ `align`, `build-library`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `quant-normalise`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 4 do not, so every setting they use comes from their own flags:
  `audit`, `inspect`, `pool`, `quant-lfq`.
@@ -615,6 +617,9 @@ Options:
       --out-peak-bounds <OUT_PEAK_BOUNDS>
           Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt, width_s)
 
+      --out-quant-fragments <OUT_QUANT_FRAGMENTS>
+          Optional account of the fragments behind every quantity (quant_fragments v1: per fragment its area, whether the rule selected it, its weight, rank and background). `run` and `run-experiment` write it under `quant.fragment_detail`
+
       --export-cross-run
           Write the cross-run export into `--out-fragment` (fragment_quant v5: the zero-area rows and the columns the cross-run fit reads; v6 under `quant.fragment_selection = pattern_fit` or `pattern_profile`, with the pattern columns). The first pass of the cross-run step; `run-experiment` runs it by itself
 
@@ -753,6 +758,33 @@ Options:
 ```
 
 Plus the 7 repeated flags removed above: see "Global flags".
+
+## build-library
+
+```text
+Build the spectral library of a FASTA search without spectra: digest -> peptidoforms -> predict-frag, restored from or stored into `predict_frag.library_cache` under the key a `run --fasta` uses. Writes the two library tables, manifest.json and library.json (counts, models, cache key and the commands that search with it) into --out-dir
+
+Usage: mumdia build-library [OPTIONS] --fasta <FASTA> --out-dir <OUT_DIR>
+
+Options:
+      --fasta <FASTA>
+          FASTA to digest into the library
+
+      --out-dir <OUT_DIR>
+
+      --config <CONFIG>
+
+      --profile <PROFILE>
+          Named tuning preset applied on top of --config/defaults, as for `run`
+
+      --ion-mobility <ION_MOBILITY>
+          `on` builds the library for spectra with ion mobility (a timsTOF diaPASEF .d), so `predict_frag.im_predictor = auto` predicts 1/K0 and a search of such spectra finds the library in the cache; `off` for every other acquisition
+
+          [default: off]
+          [possible values: off, on]
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
 
 ## align
 

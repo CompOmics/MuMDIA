@@ -222,8 +222,25 @@ impl LibraryCache {
     }
 
     /// The entry's directory.
-    fn entry_dir(&self) -> PathBuf {
+    pub fn entry_dir(&self) -> PathBuf {
         self.dir.join(&self.key)
+    }
+
+    /// The key this library is stored under: the first 24 hex digits of the blake3 of the
+    /// key material.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// The cache directory the entry lives in.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The predictor models the key names (`fragment`, `rt` and, when 1/K0 is predicted,
+    /// `im`), as recorded in `entry.json`.
+    pub fn models(&self) -> &serde_json::Value {
+        &self.material["models"]
     }
 
     /// The entry at `entry_dir`, if it is usable: an `entry.json` of this format and key
@@ -496,20 +513,24 @@ impl LibraryCache {
     }
 }
 
-/// Everything that determines a FASTA build's library, as JSON.
-fn key_material(
+/// The predictor models a FASTA build under `cfg` runs, by name and installed version
+/// (`fragment`, `rt`, and `im` when 1/K0 is predicted), as the cache key names them. An
+/// error when the version of a sidecar predictor cannot be read.
+pub fn model_identities(
     cfg: &Config,
-    fasta: &str,
     rt_placeholder: bool,
     run_has_im: bool,
-    engine: (&str, &str),
 ) -> Result<serde_json::Value> {
+    models_and_workers(cfg, rt_placeholder, run_has_im).map(|(models, _)| models)
+}
+
+/// The models of [`model_identities`] and the worker scripts that run them.
+fn models_and_workers(
+    cfg: &Config,
+    rt_placeholder: bool,
+    run_has_im: bool,
+) -> Result<(serde_json::Value, Vec<&'static str>)> {
     let pf = &cfg.predict_frag;
-    let mut predict_frag = serde_json::to_value(pf)?;
-    if let Some(o) = predict_frag.as_object_mut() {
-        // Where the library is kept does not change it.
-        o.remove("library_cache");
-    }
     let version = |python: &Option<String>, module: &str, field: &str| -> Result<String> {
         let py = python
             .as_deref()
@@ -518,7 +539,7 @@ fn key_material(
             .with_context(|| format!("cannot read the installed {module} version through {py}"))?;
         Ok(format!("{module}-{v}"))
     };
-    let mut workers: Vec<&str> = Vec::new();
+    let mut workers: Vec<&'static str> = Vec::new();
     let fragment_model = match pf.predictor {
         FragPredictorKind::Native => "native".to_string(),
         FragPredictorKind::Ms2pip => {
@@ -552,6 +573,24 @@ fn key_material(
     if let Some(im) = im_model {
         models["im"] = serde_json::Value::String(im);
     }
+    Ok((models, workers))
+}
+
+/// Everything that determines a FASTA build's library, as JSON.
+fn key_material(
+    cfg: &Config,
+    fasta: &str,
+    rt_placeholder: bool,
+    run_has_im: bool,
+    engine: (&str, &str),
+) -> Result<serde_json::Value> {
+    let pf = &cfg.predict_frag;
+    let mut predict_frag = serde_json::to_value(pf)?;
+    if let Some(o) = predict_frag.as_object_mut() {
+        // Where the library is kept does not change it.
+        o.remove("library_cache");
+    }
+    let (models, workers) = models_and_workers(cfg, rt_placeholder, run_has_im)?;
     let mut worker_hashes = serde_json::Map::new();
     for w in workers {
         let path = crate::sidecar::resolve_script(&pf.sidecar_script_dir, w);
@@ -591,19 +630,27 @@ pub fn reuse_hint(cfg: &Config, lib_p: &str, lib_f: &str, rt_placeholder: bool) 
     if rt_placeholder {
         return None;
     }
-    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
-    let heads = cfg
-        .rt_im_train
-        .multihead_heads(has_deeplc, cfg.deeplc_rt_source(false, has_deeplc));
-    let library_irt = if heads > 0 && cfg.predict_frag.rt_predictor == RtPredictorKind::Deeplc {
-        "deeplc"
-    } else {
-        "library"
-    };
+    let library_irt = reuse_library_irt(cfg);
     Some(format!(
         "--lib-precursors {lib_p} --lib-fragments {lib_f} (in place of --fasta) with \
          rt_im_train.library_irt = \"{library_irt}\""
     ))
+}
+
+/// The `rt_im_train.library_irt` under which a library-input search of a library this
+/// configuration built from the FASTA decides its retention-time handling as the FASTA
+/// search would ([`reuse_hint`]): `deeplc` when the multi-head calibration runs on DeepLC
+/// retention times, `library` otherwise (no base-model re-prediction, the same head count).
+pub fn reuse_library_irt(cfg: &Config) -> &'static str {
+    let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
+    let heads = cfg
+        .rt_im_train
+        .multihead_heads(has_deeplc, cfg.deeplc_rt_source(false, has_deeplc));
+    if heads > 0 && cfg.predict_frag.rt_predictor == RtPredictorKind::Deeplc {
+        "deeplc"
+    } else {
+        "library"
+    }
 }
 
 #[cfg(test)]
@@ -688,6 +735,48 @@ mod tests {
         assert!(key_material(&im, &f, false, false, ("0", "sha")).is_err());
         im.predict_frag.library_cache = Some(root.join("cache").to_string_lossy().into_owned());
         assert!(LibraryCache::for_config(&im, &f, false, false, ("0", "sha")).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `build-library --ion-mobility on` passes `run_has_im = true`, as a search of a
+    /// diaPASEF `.d` does: under `im_predictor = auto` with an IM2Deep interpreter that is a
+    /// different library and a different key, and the two keys a search of either kind
+    /// computes are the ones the build stored under. The interpreter is a stand-in that
+    /// answers any version query.
+    #[cfg(unix)]
+    #[test]
+    fn the_ion_mobility_flag_moves_the_key_when_it_changes_the_library() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp("imflag");
+        let fasta = root.join("x.fasta");
+        std::fs::write(&fasta, ">P1\nPEPTIDEK\n").unwrap();
+        let f = fasta.to_string_lossy().into_owned();
+        let py = root.join("python");
+        std::fs::write(&py, "#!/bin/sh\necho 1.0.0\n").unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(root.join("im2deep_worker.py"), "# stand-in\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.predict_frag.im_predictor = ImPredictorKind::Auto;
+        cfg.predict_frag.im2deep_python = Some(py.to_string_lossy().into_owned());
+        cfg.predict_frag.sidecar_script_dir = root.to_string_lossy().into_owned();
+        cfg.predict_frag.library_cache = Some(root.join("cache").to_string_lossy().into_owned());
+        let key = |cfg: &Config, im: bool| {
+            LibraryCache::for_config(cfg, &f, false, im, ("0", "sha"))
+                .expect("keyed")
+                .key()
+                .to_string()
+        };
+        assert_ne!(key(&cfg, true), key(&cfg, false));
+        assert_eq!(key(&cfg, true), key(&cfg, true));
+        let on = LibraryCache::for_config(&cfg, &f, false, true, ("0", "sha")).unwrap();
+        assert_eq!(on.models()["im"], "im2deep-1.0.0");
+        assert_eq!(
+            model_identities(&cfg, false, true).unwrap(),
+            on.models().clone()
+        );
+        // With no 1/K0 predicted the flag changes nothing: one library, one key.
+        cfg.predict_frag.im_predictor = ImPredictorKind::None;
+        assert_eq!(key(&cfg, true), key(&cfg, false));
         let _ = std::fs::remove_dir_all(&root);
     }
 

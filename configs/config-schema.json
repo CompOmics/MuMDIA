@@ -3822,6 +3822,19 @@
       ]
     },
     {
+      "path": "quant.fragment_detail",
+      "name": "fragment_detail",
+      "section": "quant",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Write which fragments made each precursor quantity: the final quant of `run` and of `run-experiment` (after the cross-run step and the second pass, when they run) also writes `quant_fragments.parquet` beside each run's `peptide_quant.parquet` (`quant_fragments` v1, docs/15): one row per fragment of every quantified candidate, with its integrated area (after any baseline and envelope, zero areas kept), whether the rule selected it, its weight and rank in that rule, and the background subtracted from it. Under the top-N rules and `cross_run` the selected areas times their weights add up to `quantity`; the pattern rules write NaN weights, because their quantity is a fit rather than a sum. A viewer reads it to show the fragments behind a quantity. Off by default: no other artifact, report or manifest entry changes with it, and the table costs one row per fragment of the quantified candidates. Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "QuantConfig"
+    },
+    {
       "path": "mbr.strategy",
       "name": "strategy",
       "section": "mbr",
