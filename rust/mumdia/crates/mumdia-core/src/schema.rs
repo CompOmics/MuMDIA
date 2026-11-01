@@ -103,6 +103,16 @@ pub mod artifact {
     /// window centre, on each candidate's first row and empty on the others). Every other
     /// export writes v5, byte for byte.
     pub const FRAGMENT_QUANT_V6: (&str, u32) = ("fragment_quant", 6);
+    /// The fragments behind each precursor quantity (`quant.fragment_detail`, or
+    /// `quant --out-quant-fragments`): one row per fragment of every candidate the final
+    /// quant reached, sorted by `candidate_id` and then in chromatogram order, with
+    /// `candidate_id` (UInt32), `fragment_name` (Utf8), `area` (Float64, the integrated area
+    /// after any baseline and envelope, zero kept), `selected` (Boolean), `weight` (Float64),
+    /// `rank` (Int32, 1-based within the rule, 0 for a fragment the rule did not rank),
+    /// `background` (Float64, the level subtracted before integrating, NaN where none was)
+    /// and `rule` (Utf8, the rule that made the candidate's quantity). Written only when
+    /// asked for; no other artifact changes with it.
+    pub const QUANT_FRAGMENTS: (&str, u32) = ("quant_fragments", 1);
     /// Cross-run MaxLFQ table, written only by `run-experiment` and `quant-lfq`.
     pub const LFQ_MAXLFQ: (&str, u32) = ("lfq_maxlfq", 1);
     /// A run's precursor quantities after the cross-run normalisation

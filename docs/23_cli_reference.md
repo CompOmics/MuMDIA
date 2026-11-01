@@ -47,7 +47,6 @@ Commands:
   sub-library      Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires
   extract          Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
   retrace          Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. The configuration's `retrace` section applies, `enabled` aside
-  localise         Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. Reporting only: nothing upstream changes
   features         Compute the minimal feature set -> features.parquet + PIN
   pool             Pool a grouped run's band artifacts into the run-level tables
   compete          Keep the best candidate per competition group -> psms_competed.parquet
@@ -57,6 +56,7 @@ Commands:
   quant-normalise  Cross-run normalisation of per-run precursor quantities -> peptide_quant_normalised
   run              Orchestrate the full pipeline on one run and write a manifest. Given several --mzml, the files are searched as ONE pooled experiment (`run-experiment`: one combined rescore, per-run quant, cross-run LFQ), which is the default treatment of a multi-file input; use `run-experiment` directly for run names
   run-experiment   Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. Pass --mzml once per run (>= 2)
+  build-library    Build the spectral library of a FASTA search without spectra: digest -> peptidoforms -> predict-frag, restored from or stored into `predict_frag.library_cache` under the key a `run --fasta` uses. Writes the two library tables, manifest.json and library.json (counts, models, cache key and the commands that search with it) into --out-dir
   align            Cross-run RT alignment (experiment-level) -> alignment.parquet
   mbr              Match-between-runs identification transfer (Stage D3) -> transferred.parquet
   inspect          Print schema, head sample, and row count for any artifact
@@ -146,7 +146,6 @@ first sentence of the description, with the full text in the section below.
 | [`sub-library`](#sub-library) | yes | Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires |
 | [`extract`](#extract) | yes | Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms |
 | [`retrace`](#retrace) | yes | Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. |
-| [`localise`](#localise) | yes | Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. |
 | [`features`](#features) | yes | Compute the minimal feature set -> features.parquet + PIN |
 | [`pool`](#pool) | no | Pool a grouped run's band artifacts into the run-level tables |
 | [`compete`](#compete) | yes | Keep the best candidate per competition group -> psms_competed.parquet |
@@ -156,6 +155,7 @@ first sentence of the description, with the full text in the section below.
 | [`quant-normalise`](#quant-normalise) | yes | Cross-run normalisation of per-run precursor quantities -> peptide_quant_normalised |
 | [`run`](#run) | yes | Orchestrate the full pipeline on one run and write a manifest. |
 | [`run-experiment`](#run-experiment) | yes | Experiment-wide orchestrator: run the per-file search chain over N runs, then one combined rescore, optional rescuable MBR transfer, per-run quant, and cross-run LFQ. |
+| [`build-library`](#build-library) | yes | Build the spectral library of a FASTA search without spectra: digest -> peptidoforms -> predict-frag, restored from or stored into `predict_frag.library_cache` under the key a `run --fasta` uses. |
 | [`align`](#align) | yes | Cross-run RT alignment (experiment-level) -> alignment.parquet |
 | [`mbr`](#mbr) | yes | Match-between-runs identification transfer (Stage D3) -> transferred.parquet |
 | [`inspect`](#inspect) | no | Print schema, head sample, and row count for any artifact |
@@ -167,7 +167,7 @@ first sentence of the description, with the full text in the section below.
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
 25 of the 29 documented subcommands accept `--config`:
- `align`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `localise`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `quant-normalise`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
+ `align`, `build-library`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `quant-normalise`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 4 do not, so every setting they use comes from their own flags:
  `audit`, `inspect`, `pool`, `quant-lfq`.
@@ -476,36 +476,6 @@ Options:
 
 Plus the 5 repeated flags removed above: see "Global flags".
 
-## localise
-
-```text
-Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. Reporting only: nothing upstream changes
-
-Usage: mumdia localise [OPTIONS] --psms-scored <PSMS_SCORED> --spectra-ms2 <SPECTRA_MS2> --out <OUT>
-
-Options:
-      --psms-scored <PSMS_SCORED>
-          One run's scored table: a run's psms_scored.parquet, or a run's scored.parquet of a run-experiment
-
-      --spectra-ms2 <SPECTRA_MS2>
-          That run's spectra_ms2.parquet
-
-      --mass-cal <MASS_CAL>
-          The run's search-seed masscal.json (fragment mass offset and tolerance)
-
-      --psms-extracted <PSMS_EXTRACTED>
-          The psms_extracted.parquet the scored rows came from: each row's apex 1/K0 on spectra with ion mobility. Without it the 1/K0 is read from the spectra
-
-      --source <SOURCE>
-          Keep only the rows of this source; required when the table holds several runs
-
-      --out <OUT>
-
-      --config <CONFIG>
-```
-
-Plus the 5 repeated flags removed above: see "Global flags".
-
 ## features
 
 ```text
@@ -624,6 +594,9 @@ Options:
 
       --out-peak-bounds <OUT_PEAK_BOUNDS>
           Optional per-candidate peak-window diagnostic (candidate_id, lo_rt, hi_rt, width_s)
+
+      --out-quant-fragments <OUT_QUANT_FRAGMENTS>
+          Optional account of the fragments behind every quantity (quant_fragments v1: per fragment its area, whether the rule selected it, its weight, rank and background). `run` and `run-experiment` write it under `quant.fragment_detail`
 
       --export-cross-run
           Write the cross-run export into `--out-fragment` (fragment_quant v5: the zero-area rows and the columns the cross-run fit reads; v6 under `quant.fragment_selection = pattern_fit` or `pattern_profile`, with the pattern columns). The first pass of the cross-run step; `run-experiment` runs it by itself
@@ -760,6 +733,33 @@ Options:
 
       --top-peaks-ms2 <TOP_PEAKS_MS2>
           [default: 0]
+```
+
+Plus the 5 repeated flags removed above: see "Global flags".
+
+## build-library
+
+```text
+Build the spectral library of a FASTA search without spectra: digest -> peptidoforms -> predict-frag, restored from or stored into `predict_frag.library_cache` under the key a `run --fasta` uses. Writes the two library tables, manifest.json and library.json (counts, models, cache key and the commands that search with it) into --out-dir
+
+Usage: mumdia build-library [OPTIONS] --fasta <FASTA> --out-dir <OUT_DIR>
+
+Options:
+      --fasta <FASTA>
+          FASTA to digest into the library
+
+      --out-dir <OUT_DIR>
+
+      --config <CONFIG>
+
+      --profile <PROFILE>
+          Named tuning preset applied on top of --config/defaults, as for `run`
+
+      --ion-mobility <ION_MOBILITY>
+          `on` builds the library for spectra with ion mobility (a timsTOF diaPASEF .d), so `predict_frag.im_predictor = auto` predicts 1/K0 and a search of such spectra finds the library in the cache; `off` for every other acquisition
+
+          [default: off]
+          [possible values: off, on]
 ```
 
 Plus the 5 repeated flags removed above: see "Global flags".
@@ -906,12 +906,6 @@ Options:
       --peptide-quant <PEPTIDE_QUANT>
 
       --protein-quant <PROTEIN_QUANT>
-
-      --localisation <LOCALISATION>
-          A `localise` table of the run: adds the localisation columns to peptides.tsv and writes sites.tsv. In experiment mode the tables the manifest names are used
-
-      --fasta <FASTA>
-          A FASTA to number the sites of sites.tsv on their proteins
 
       --q <Q>
           Reported q threshold. Defaults to `quant.q_threshold` from `--config` when that is given, otherwise 0.01. An explicit value always wins
