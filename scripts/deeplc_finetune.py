@@ -111,7 +111,11 @@ from psm_utils import PSM, PSMList
 from _torch_threads import capped_threads, thread_cap  # noqa: E402  (after deeplc, as every import here)
 
 STD = set("ACDEFGHIKLMNPQRSTVWY")
-MOD_RE = r"\[[^\]]*\]"
+# A bracketed modification, and the dash of a terminal group with it: `[Acetyl]-PEPK` strips
+# to `PEPK`. Without the dash the stripped base was `-PEPK`, which is not a standard
+# sequence, so every N-terminally modified row was left out of the prediction and kept a
+# retention time on another scale.
+MOD_RE = r"-?\[[^\]]*\]-?"
 strip_mods = lambda s: re.sub(MOD_RE, "", s)
 # Strip the decoy marker before prediction: a "DECOY_" peptidoform must be predicted on
 # its underlying sequence, else is_std rejects it (the '_') and the decoy keeps the base

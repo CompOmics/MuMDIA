@@ -266,7 +266,8 @@ def env_i(name, default):
 
 
 def strip_pep(p):
-    s = re.sub(r"\[[^\]]*\]", "", str(p))
+    # The dash of a terminal group goes with its bracket: `[Acetyl]-PEPK` is PEPK.
+    s = re.sub(r"-?\[[^\]]*\]-?", "", str(p))
     s = re.sub(r"^[A-Z-]\.", "", s)
     s = re.sub(r"\.[A-Z-]$", "", s)
     return s

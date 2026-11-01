@@ -144,9 +144,16 @@ pub fn build(
         cfg: &cfg.digest,
         rng_seed: cfg.rng_seed,
         config_hash: ch,
+        protein_n_term: cfg.peptidoforms.has_protein_n_term_rule(),
     })?;
     if let Some(m) = man.as_deref_mut() {
-        m.record(w.record(artifact::PEPTIDES.0, artifact::PEPTIDES, &dig, "digest", ch));
+        m.record(w.record(
+            artifact::PEPTIDES.0,
+            artifact::peptides(cfg.peptidoforms.has_protein_n_term_rule()),
+            &dig,
+            "digest",
+            ch,
+        ));
     }
 
     let pf = d("peptidoforms.parquet");
@@ -360,8 +367,11 @@ pub fn run(p: BuildLibraryParams) -> Result<serde_json::Value> {
     pre.step("preflight");
 
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
-    std::fs::create_dir_all(p.out_dir)
-        .with_context(|| format!("creating the output directory {}", p.out_dir))?;
+    // As `run` does: the output directory and an explicit MUMDIA_SIDECAR_DIR must take a
+    // write and a rename before any prediction, and an unwritable default cache root
+    // turns the caches off with one warning, so the library is built but not stored
+    // (`storage`).
+    crate::storage::prepare_output(p.out_dir, cfg)?;
     let mut man = Manifest::new(cfg.canonical_json(), ch.clone());
     info!(provenance = %man.provenance(), "build-library: build provenance");
     let input_hashes = crate::prestage::InputHashes::spawn(

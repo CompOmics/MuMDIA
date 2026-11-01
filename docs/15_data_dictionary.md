@@ -118,6 +118,7 @@ one row per diaPASEF slot. Provenance only; no stage reads them.
 | `label` | Utf8 | no | - | `target` or `decoy` |
 | `target_id` | Int32 | no | - | for a decoy, the `id` of its paired target; -1 for a target |
 | `decoy_strategy` | Utf8 | no | - | lowercased decoy strategy name (e.g. `reverse`, `scramble`) |
+| `protein_n_term` | Boolean | no | - | v2 only (written when a modification rule has `position = "protein_n_term"`): the peptide starts a protein, at position 0 or after the initiator Met, in any protein it occurs in; a decoy carries its target's value |
 
 ---
 
@@ -1057,6 +1058,22 @@ the runs where the first pass accepted it:
 | `targets_anchor`, `decoys_anchor` | integer | accepted second-pass targets and decoys in their entry's anchor runs |
 | `targets_non_anchor`, `decoys_non_anchor` | integer | the same in the other runs |
 | `decoy_fraction_anchor`, `decoy_fraction_non_anchor` | number or null | decoys over targets of each group; null without targets |
+
+## `localise` (`stages/localise/`, opt-in)
+
+### localisation (schema v1, `localise/mod.rs`, `run`)
+
+Written only under `localise.enabled` or by `mumdia localise`: one row per scored row of one
+run that carries a localised modification, in scored-table order. The column list, the
+status values and the units (`isomer_group_q`, the two false localisation rates) are in
+docs/36_ptm_localisation.md section 5. Nullable columns (`isomer_peak_id`,
+`best_site_peptidoform`, `site_probabilities`, `min_site_prob`, `peptidoform_probability`,
+`own_site_prob`, `delta_loglik`, `site_flr_model`, `site_flr_decoy`) are null on rows that
+were not localised (`status` `not_attempted_q`, `too_many_hypotheses`, `no_spectra`).
+`isomer_group_q` is on the group's winning row and 1.0 on the others, like every grouped q.
+
+When the stage ran, `peptides.tsv` gains `site_probability`, `localised` and
+`best_site_peptidoform`, and `sites.tsv` is written beside it (docs/36 section 5).
 
 ## `audit` (`stages/audit.rs`)
 

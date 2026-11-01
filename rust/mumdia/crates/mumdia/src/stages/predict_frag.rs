@@ -943,14 +943,29 @@ impl FragRequest {
 /// The modification content of a ProForma peptidoform, order-free: every bracketed
 /// token, sorted and joined. Two peptidoforms with the same base peptide, charge and
 /// signature are the same precursor on the target and decoy side.
+///
+/// A terminal group is tagged with its terminus (`n-term:Acetyl`, `c-term:Amidated`), so an
+/// N-terminal acetyl and a lysine acetyl are different content. A reverse decoy keeps its
+/// target's N-terminal group at its own N-terminus, so the tagged signature still pairs
+/// them.
 fn mod_signature(peptidoform: &str) -> String {
-    let mut mods: Vec<&str> = Vec::new();
-    let mut rest = peptidoform;
+    let s = peptidoform.strip_prefix("DECOY_").unwrap_or(peptidoform);
+    let mut mods: Vec<String> = Vec::new();
+    let mut rest = s;
     while let Some(open) = rest.find('[') {
         match rest[open..].find(']') {
             Some(close) => {
-                mods.push(&rest[open + 1..open + close]);
-                rest = &rest[open + close + 1..];
+                let name = &rest[open + 1..open + close];
+                let after = &rest[open + close + 1..];
+                let tagged = if open == 0 && after.starts_with('-') && rest.len() == s.len() {
+                    format!("n-term:{name}")
+                } else if open > 0 && rest[..open].ends_with('-') && after.is_empty() {
+                    format!("c-term:{name}")
+                } else {
+                    name.to_string()
+                };
+                mods.push(tagged);
+                rest = after;
             }
             None => break,
         }
@@ -1163,7 +1178,26 @@ mod cardinality_tests {
             mod_signature("C[Carbamidomethyl]M[Oxidation]C[Carbamidomethyl]K"),
             "Carbamidomethyl,Carbamidomethyl,Oxidation"
         );
-        assert_eq!(mod_signature("[Acetyl]-PEPTIDEK"), "Acetyl");
+        assert_eq!(mod_signature("[Acetyl]-PEPTIDEK"), "n-term:Acetyl");
+        assert_eq!(mod_signature("PEPTIDEK[Acetyl]"), "Acetyl");
+        assert_eq!(
+            mod_signature("[Acetyl]-S[Phospho]EPTIDEK"),
+            "Phospho,n-term:Acetyl"
+        );
+        assert_eq!(
+            mod_signature("DECOY_[Acetyl]-KEDITPES"),
+            mod_signature("[Acetyl]-SEPTIDEK")
+        );
+        assert_eq!(mod_signature("PEPTIDEK-[Amidated]"), "c-term:Amidated");
+        // A terminal acetyl and a lysine acetyl of one peptide are two precursors, not one.
+        assert_ne!(
+            pair_key(7, 2, "[Acetyl]-PEPTIDEK"),
+            pair_key(7, 2, "PEPTIDEK[Acetyl]")
+        );
+        assert_eq!(
+            pair_key(7, 2, "[Acetyl]-PEPTIDEK"),
+            pair_key(7, 2, "[Acetyl]-KEDITPEP")
+        );
         assert_eq!(mod_signature("PEPTIDEK"), "");
         let keys = vec![
             pair_key(7, 2, "PEPTIDEK"),

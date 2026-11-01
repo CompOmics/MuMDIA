@@ -353,6 +353,7 @@ fn library_build_stages_return_the_hashes_of_the_files_they_wrote() {
         cfg: &cfg.digest,
         rng_seed: cfg.rng_seed,
         config_hash: "test",
+        protein_n_term: cfg.peptidoforms.has_protein_n_term_rule(),
     })
     .unwrap();
     assert!(wd.rows > 0);
