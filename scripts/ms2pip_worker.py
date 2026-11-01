@@ -17,6 +17,10 @@ count; without the argument the historical cap of min(8, cpu_count) applies. On 
 9.8M-peptidoform HYE library that cap left 24 of the 32 requested cores idle for the
 whole prediction.
 
+`MUMDIA_MODEL_DIR`, when set, moves MS2PIP's XGBoost model files (downloaded on first
+use) from `~/.ms2pip` to `<MUMDIA_MODEL_DIR>/ms2pip`, for an account whose home
+directory cannot hold them or must not be written (docs/14, "Where MuMDIA writes").
+
 The output is assembled from numpy arrays per chunk rather than from four Python
 lists appended one fragment at a time. At 9.8M peptidoforms the lists were about
 300M appends and 13 GB of Python objects before the first byte was written.
@@ -99,6 +103,13 @@ def to_table(ids, ions, ords, chgs, ints):
     )
 
 
+def model_dir(subdir):
+    """`<MUMDIA_MODEL_DIR>/<subdir>` when MUMDIA_MODEL_DIR is set and not blank, else
+    None: the predictor's own default location."""
+    root = os.environ.get("MUMDIA_MODEL_DIR", "").strip()
+    return os.path.join(root, subdir) if root else None
+
+
 def main():
     in_path, out_path = sys.argv[1], sys.argv[2]
     model = sys.argv[3] if len(sys.argv) > 3 else "HCD"
@@ -120,6 +131,11 @@ def main():
     # with their parsed peptidoforms, in the main process until the chunk is flattened:
     # 640k-row chunks peaked at 56 GB on the 9.8M-peptidoform HYE library.
     chunk = max(100_000, 5_000 * procs)
+    # Passed only when set, so MS2PIP keeps its own default (`~/.ms2pip`) otherwise.
+    where = model_dir("ms2pip")
+    extra = {"model_dir": where} if where else {}
+    if where:
+        print(f"ms2pip_worker: model files in {where} (MUMDIA_MODEL_DIR)", flush=True)
     parts = []
     n_rows = 0
     for start in range(0, len(ids), chunk):
@@ -132,7 +148,7 @@ def main():
                 for i in range(start, end)
             ]
         )
-        results = predict_batch(psms, model=model, processes=procs)
+        results = predict_batch(psms, model=model, processes=procs, **extra)
         part = fragment_rows(results)
         n_rows += part[0].size
         parts.append(part)

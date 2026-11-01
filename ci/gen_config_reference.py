@@ -1150,7 +1150,38 @@ COMPUTED_ENV_DEFAULTS: dict[str, str] = {
         "the per-user cache directory: `$XDG_CACHE_HOME/mumdia` or `~/.cache/mumdia` "
         "(Linux and other Unix), `~/Library/Caches/mumdia` (macOS), "
         "`%LOCALAPPDATA%\\mumdia\\cache` (Windows). A path moves the `\"auto\"` caches "
-        "there; `off` / `0` / `false` / `none` turns them off (`cache.rs` `root`)"
+        "there (`--cache-dir` wins over it; a relative path is made absolute at startup); "
+        "`off` / `0` / `false` / `none` turns them off (`cache.rs` `root`, `storage.rs` "
+        "`apply`)"
+    ),
+    "MUMDIA_TEMP_DIR": (
+        "the system's temporary directory. A path (or `--temp-dir`, which wins) is created, "
+        "must take a write and a rename, and becomes `TMP`, `TEMP` and `TMPDIR` of the engine "
+        "and every worker it starts, with `MPLCONFIGDIR` under it unless set (`storage.rs` "
+        "`apply`)"
+    ),
+    "MUMDIA_MODEL_DIR": (
+        "each predictor's own: `~/.ms2pip` (MS2PIP), `~/peptdeep` (AlphaPeptDeep). A path "
+        "moves their model downloads to `<dir>/ms2pip` and `<dir>/peptdeep`; the engine "
+        "makes a relative one absolute (`storage.rs` `apply`, `ms2pip_worker.py` and "
+        "`peptdeep_worker.py` `model_dir`)"
+    ),
+    "MPLCONFIGDIR": (
+        "matplotlib's own (`~/.config/matplotlib`); under `--temp-dir` / `MUMDIA_TEMP_DIR` "
+        "the engine sets it to `<temp>/matplotlib` for its workers unless it is set "
+        "(`storage.rs` `apply`)"
+    ),
+    "OneDrive": (
+        "set by the OneDrive client on Windows; a results, cache or temporary directory "
+        "under it gets a location warning, never a refusal (`storage.rs` `location_notes`)"
+    ),
+    "OneDriveCommercial": (
+        "set by the OneDrive client for a work or school account; as `OneDrive` "
+        "(`storage.rs` `location_notes`)"
+    ),
+    "OneDriveConsumer": (
+        "set by the OneDrive client for a personal account; as `OneDrive` "
+        "(`storage.rs` `location_notes`)"
     ),
     "MUMDIA_CACHE_MIN_FREE_GB": (
         "10 (GiB): the free space a library-cache store must leave on the cache's disk, "
