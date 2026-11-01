@@ -784,7 +784,7 @@ Options:
           [possible values: off, on]
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## align
 
