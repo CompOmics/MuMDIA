@@ -2788,6 +2788,20 @@ pub struct QuantConfig {
     /// Benchmark-gated. Omitted from the canonical configuration at its default.
     #[serde(skip_serializing_if = "WindowCentre::is_apex")]
     pub window_centre: WindowCentre,
+    /// Write which fragments made each precursor quantity: the final quant of `run` and
+    /// of `run-experiment` (after the cross-run step and the second pass, when they run)
+    /// also writes `quant_fragments.parquet` beside each run's `peptide_quant.parquet`
+    /// (`quant_fragments` v1, docs/15): one row per fragment of every quantified candidate,
+    /// with its integrated area (after any baseline and envelope, zero areas kept), whether
+    /// the rule selected it, its weight and rank in that rule, and the background subtracted
+    /// from it. Under the top-N rules and `cross_run` the selected areas times their weights
+    /// add up to `quantity`; the pattern rules write NaN weights, because their quantity is
+    /// a fit rather than a sum. A viewer reads it to show the fragments behind a quantity.
+    /// Off by default: no other artifact, report or manifest entry changes with it, and the
+    /// table costs one row per fragment of the quantified candidates. Omitted from the
+    /// canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub fragment_detail: bool,
 }
 
 /// Centre of the fixed scan window. See [`QuantConfig::window_centre`].
@@ -2941,6 +2955,7 @@ impl Default for QuantConfig {
             normalisation_lfq: false,
             normalisation_rank: None,
             window_centre: WindowCentre::Apex,
+            fragment_detail: false,
         }
     }
 }
@@ -5861,6 +5876,24 @@ mod tests {
         assert!(c.contains(r#""fragment_selection":"cross_run""#), "{c}");
         assert!(c.contains(r#""baseline_source":"experiment""#), "{c}");
         assert!(c.contains(r#""fixed_scan_halfwidth_scale":2.5"#), "{c}");
+    }
+
+    /// `quant.fragment_detail` is off by default and absent from the canonical configuration
+    /// there, so a configuration that does not set it keeps its hash; set, it is part of it.
+    #[test]
+    fn fragment_detail_is_off_by_default_and_out_of_the_canonical_json() {
+        let d = Config::default();
+        assert!(!d.quant.fragment_detail);
+        let canon = d.canonical_json();
+        assert!(!canon.contains("fragment_detail"), "{canon}");
+        let explicit = Config::from_json(r#"{"quant":{"fragment_detail":false}}"#).unwrap();
+        assert_eq!(explicit.canonical_json(), canon);
+        let on = Config::from_json(r#"{"quant":{"fragment_detail":true}}"#).unwrap();
+        assert!(on.quant.fragment_detail);
+        assert!(on.validate().is_ok());
+        let c = on.canonical_json();
+        assert!(c.contains(r#""fragment_detail":true"#), "{c}");
+        assert_ne!(c, canon);
     }
 
     /// The profile-centred window, the pattern rules and the stable-set normalisation parse,
