@@ -22,7 +22,7 @@ Every block below is the binary's own help text, right-stripped and with
 the program name normalized to `mumdia` (a Windows build reports
 `mumdia.exe`). Nothing is paraphrased. Two mechanical edits are applied:
 
-- the 4 flags clap marks `global = true`, and `-h, --help`, are removed
+- the 6 flags clap marks `global = true`, and `-h, --help`, are removed
   from the per-subcommand blocks and documented once under "Global flags"
   below, because clap repeats them in every subcommand;
 - `mumdia help` gets a table row but no section, because
@@ -47,6 +47,8 @@ Commands:
   sub-library      Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires
   extract          Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
   retrace          Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. The configuration's `retrace` section applies, `enabled` aside
+  localise         Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. Reporting only: nothing upstream changes
+  mobilogram       The 1/K0 profile (mobilogram) of candidates' fragment and MS1 ions, read from the raw events of a diaPASEF `.d` (docs/35_diapasef.md section 17). Read-only
   features         Compute the minimal feature set -> features.parquet + PIN
   pool             Pool a grouped run's band artifacts into the run-level tables
   compete          Keep the best candidate per competition group -> psms_competed.parquet
@@ -82,6 +84,16 @@ Options:
   -q, --quiet
           Warnings and errors only. Overridden by --log-level
 
+      --cache-dir <DIR>
+          Root of the engine's caches (FASTA-built libraries, DeepLC projections), or `off`.
+
+          Wins over `MUMDIA_CACHE_DIR`, which wins over the per-user cache directory. A relative path is resolved against the working directory. A root that cannot be written switches the default caches off for the run with one warning (docs/14_build_test_deploy_gotchas.md, "Where MuMDIA writes").
+
+      --temp-dir <DIR>
+          Temporary directory of the engine and of every process it starts.
+
+          Wins over `MUMDIA_TEMP_DIR`. It becomes `TMP`, `TEMP` and `TMPDIR` for the engine and its Python workers, and `MPLCONFIGDIR` goes under it unless set. Created if needed; one that cannot be written is an error. Default: the system's.
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -91,7 +103,7 @@ Options:
 
 ## Global flags
 
-These 4 options are declared `global = true`, so they are accepted on
+These 6 options are declared `global = true`, so they are accepted on
 EITHER side of the subcommand: `mumdia --threads 8 extract ...` and
 `mumdia extract --threads 8 ...` are equivalent and reach the same value.
 They are removed from the per-subcommand blocks below to keep this document
@@ -99,8 +111,10 @@ readable, as is `-h, --help`, which every subcommand also accepts.
 
 | Flag | Purpose |
 |---|---|
+| `--cache-dir <DIR>` | Root of the engine's caches (FASTA-built libraries, DeepLC projections), or `off`. Wins over `MUMDIA_CACHE_DIR`, which wins over the per-user cache directory. A relative path is resolved against the working directory. A root that cannot be written switches the default caches off for the run with one warning (docs/14_build_test_deploy_gotchas.md, "Where MuMDIA writes"). |
 | `--log-level <LEVEL>` | Log level: `error`, `warn`, `info` (default), `debug`, or `trace`. Accepts any `RUST_LOG` filter, so `mumdia=debug,extract=trace` also works |
 | `-q, --quiet` | Warnings and errors only. Overridden by --log-level |
+| `--temp-dir <DIR>` | Temporary directory of the engine and of every process it starts. Wins over `MUMDIA_TEMP_DIR`. It becomes `TMP`, `TEMP` and `TMPDIR` for the engine and its Python workers, and `MPLCONFIGDIR` goes under it unless set. Created if needed; one that cannot be written is an error. Default: the system's. |
 | `--threads <N>` | Worker threads of the engine's thread pools. Default: every core. Sets the engine's rayon pool to N threads and the parquet codec pool to min(N, 8) threads, serial at N = 1 (docs/03_io_layer.md, "Parallel column codec"). The codec pool encodes and decodes artifacts for writer and loader threads that run beside the rayon pool, so up to N + min(N, 8) threads can be busy at once; add `MUMDIA_PARQUET_THREADS=1` to keep the parquet codec serial and the run near N threads. N is also forwarded to the Python sidecars as `MUMDIA_NN_THREADS` and `OMP_NUM_THREADS` unless those are already set. Without this there was no way to bound MuMDIA at all except the undocumented `RAYON_NUM_THREADS`, which the engine never read and which does not reach the sidecars; on a shared machine that made a run antisocial. Note the NN rescore worker measured FASTER on 8 threads than on 32 (docs/13_sidecars.md). |
 | `-v, --verbose...` | More detail: `-v` for debug, `-vv` for trace. Overridden by --log-level |
 | `-h, --help` | Print help (see a summary with '-h') |
@@ -109,11 +123,21 @@ The same text as the binary prints it:
 
 ```text
 Options:
+      --cache-dir <DIR>
+          Root of the engine's caches (FASTA-built libraries, DeepLC projections), or `off`.
+
+          Wins over `MUMDIA_CACHE_DIR`, which wins over the per-user cache directory. A relative path is resolved against the working directory. A root that cannot be written switches the default caches off for the run with one warning (docs/14_build_test_deploy_gotchas.md, "Where MuMDIA writes").
+
       --log-level <LEVEL>
           Log level: `error`, `warn`, `info` (default), `debug`, or `trace`. Accepts any `RUST_LOG` filter, so `mumdia=debug,extract=trace` also works
 
   -q, --quiet
           Warnings and errors only. Overridden by --log-level
+
+      --temp-dir <DIR>
+          Temporary directory of the engine and of every process it starts.
+
+          Wins over `MUMDIA_TEMP_DIR`. It becomes `TMP`, `TEMP` and `TMPDIR` for the engine and its Python workers, and `MPLCONFIGDIR` goes under it unless set. Created if needed; one that cannot be written is an error. Default: the system's.
 
       --threads <N>
           Worker threads of the engine's thread pools. Default: every core.
@@ -146,6 +170,8 @@ first sentence of the description, with the full text in the section below.
 | [`sub-library`](#sub-library) | yes | Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires |
 | [`extract`](#extract) | yes | Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms |
 | [`retrace`](#retrace) | yes | Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. |
+| [`localise`](#localise) | yes | Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. |
+| [`mobilogram`](#mobilogram) | yes | The 1/K0 profile (mobilogram) of candidates' fragment and MS1 ions, read from the raw events of a diaPASEF `.d` (docs/35_diapasef.md section 17). |
 | [`features`](#features) | yes | Compute the minimal feature set -> features.parquet + PIN |
 | [`pool`](#pool) | no | Pool a grouped run's band artifacts into the run-level tables |
 | [`compete`](#compete) | yes | Keep the best candidate per competition group -> psms_competed.parquet |
@@ -166,8 +192,8 @@ first sentence of the description, with the full text in the section below.
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
 
-25 of the 29 documented subcommands accept `--config`:
- `align`, `build-library`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `mbr`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `quant-normalise`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
+27 of the 31 documented subcommands accept `--config`:
+ `align`, `build-library`, `cache`, `compete`, `convert`, `digest`, `doctor`, `extract`, `features`, `localise`, `mbr`, `mobilogram`, `peak-census`, `peptidoforms`, `predict-frag`, `prescan`, `prescreen`, `quant`, `quant-normalise`, `report`, `rescore`, `retrace`, `rt-im-train`, `run`, `run-experiment`, `search-seed`, `sub-library`.
 
 4 do not, so every setting they use comes from their own flags:
  `audit`, `inspect`, `pool`, `quant-lfq`.
@@ -206,7 +232,7 @@ Options:
           [default: 0]
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## digest
 
@@ -223,7 +249,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## peptidoforms
 
@@ -240,7 +266,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## predict-frag
 
@@ -264,7 +290,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## prescan
 
@@ -288,7 +314,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## prescreen
 
@@ -333,7 +359,7 @@ Options:
           The database-free tag prefilter only: keep the candidates with an observed trimer in their isolation window (no fragment score; pass no --run-windows for the retention-time-free prefilter)
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## search-seed
 
@@ -354,7 +380,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## rt-im-train
 
@@ -375,7 +401,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## sub-library
 
@@ -402,7 +428,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## extract
 
@@ -439,7 +465,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## retrace
 
@@ -474,7 +500,98 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
+
+## localise
+
+```text
+Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. Reporting only: nothing upstream changes
+
+Usage: mumdia localise [OPTIONS] --psms-scored <PSMS_SCORED> --spectra-ms2 <SPECTRA_MS2> --out <OUT>
+
+Options:
+      --psms-scored <PSMS_SCORED>
+          One run's scored table: a run's psms_scored.parquet, or a run's scored.parquet of a run-experiment
+
+      --spectra-ms2 <SPECTRA_MS2>
+          That run's spectra_ms2.parquet
+
+      --mass-cal <MASS_CAL>
+          The run's search-seed masscal.json (fragment mass offset and tolerance)
+
+      --psms-extracted <PSMS_EXTRACTED>
+          The psms_extracted.parquet the scored rows came from: each row's apex 1/K0 on spectra with ion mobility. Without it the 1/K0 is read from the spectra
+
+      --source <SOURCE>
+          Keep only the rows of this source; required when the table holds several runs
+
+      --out <OUT>
+
+      --config <CONFIG>
+```
+
+Plus the 7 repeated flags removed above: see "Global flags".
+
+## mobilogram
+
+```text
+The 1/K0 profile (mobilogram) of candidates' fragment and MS1 ions, read from the raw events of a diaPASEF `.d` (docs/35_diapasef.md section 17). Read-only.
+
+Per candidate: the MS2 frames whose quad slots isolate the precursor (the frame nearest the apex RT and `--frames` such frames either side) and the MS1 frames nearest the same RT. Per ion (the chromatogram's predicted fragments and MS1 isotopes), the raw intensity is binned in 1/K0 over the scans of those slots, at the run's fragment mass offset and tolerance and `extract.prec_tol_ppm` for MS1. Prints JSON on stdout, or writes a long parquet table (or JSON) with `--out`.
+
+Usage: mumdia mobilogram [OPTIONS] --candidate <ID>...
+
+Options:
+      --run-dir <RUN_DIR>
+          The run directory: psms_extracted, chromatograms, run_windows and the seed's masscal are read from it, and the `.d` is the one its spectra report names. A second-pass run directory takes the spectra of its first pass
+
+      --candidate <ID>...
+          Candidate ids (`candidate_id`), one or more
+
+      --json
+          Print JSON on stdout (the default without --out)
+
+      --out <OUT>
+          Write the profiles to this file instead: `.json` as printed, anything else as a parquet table with one row per candidate, ion, frame and non-zero bin
+
+      --frames <FRAMES>
+          Frames either side of the centre frame, per MS level (0: the centre frame only)
+
+          [default: 2]
+
+      --bin <BIN>
+          Bin width in 1/K0 (V s cm^-2)
+
+          [default: 0.002]
+
+      --peak-rank <PEAK_RANK>
+          The psms_extracted row of each candidate (`peak_rank`; 0 is extract's apex)
+
+          [default: 0]
+
+      --rt <RT>
+          Centre the frames on this retention time (s) instead of each candidate's apex
+
+      --raw <RAW>
+          The diaPASEF `.d`; default: the one the run's spectra report names
+
+      --psms-extracted <PSMS_EXTRACTED>
+          Override `<run-dir>/psms_extracted.parquet`
+
+      --chromatograms <CHROMATOGRAMS>
+          Override `<run-dir>/chromatograms.parquet`
+
+      --run-windows <RUN_WINDOWS>
+          Override `<run-dir>/run_windows.parquet`
+
+      --mass-cal <MASS_CAL>
+          Override `<run-dir>/seed_psms.parquet.masscal.json`
+
+      --config <CONFIG>
+          Configuration for `extract.prec_tol_ppm` and the fallback fragment tolerance; default: the one the run's manifest recorded
+```
+
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## features
 
@@ -498,7 +615,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## pool
 
@@ -520,7 +637,7 @@ Options:
           Also pool `psms_extracted`, which only the candidate audit reads
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## compete
 
@@ -537,7 +654,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## rescore
 
@@ -567,7 +684,7 @@ Options:
           `psms_extracted.parquet` of each input run, in source order, for the 1/K0 term of shadow demotion (`rescore.shadow_im_tolerance`)
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## quant
 
@@ -607,7 +724,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## quant-lfq
 
@@ -638,7 +755,7 @@ Options:
       --out <OUT>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## quant-normalise
 
@@ -662,7 +779,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## run
 
@@ -700,7 +817,7 @@ Options:
           [default: 0]
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## run-experiment
 
@@ -735,7 +852,7 @@ Options:
           [default: 0]
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## build-library
 
@@ -762,7 +879,7 @@ Options:
           [possible values: off, on]
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## align
 
@@ -780,7 +897,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## mbr
 
@@ -807,7 +924,7 @@ Options:
       --config <CONFIG>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## inspect
 
@@ -820,7 +937,7 @@ Arguments:
   <ARTIFACT>
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## peak-census
 
@@ -843,7 +960,7 @@ Options:
           Configuration file, read for `convert.*` so a vendor file can be converted the same way `run` converts it
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## audit
 
@@ -884,7 +1001,7 @@ Options:
           [default: ""]
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## report
 
@@ -907,6 +1024,12 @@ Options:
 
       --protein-quant <PROTEIN_QUANT>
 
+      --localisation <LOCALISATION>
+          A `localise` table of the run: adds the localisation columns to peptides.tsv and writes sites.tsv. In experiment mode the tables the manifest names are used
+
+      --fasta <FASTA>
+          A FASTA to number the sites of sites.tsv on their proteins
+
       --q <Q>
           Reported q threshold. Defaults to `quant.q_threshold` from `--config` when that is given, otherwise 0.01. An explicit value always wins
 
@@ -916,7 +1039,7 @@ Options:
           Without it, a config setting `quant.q_threshold = 0.05` yielded 0.05 from `run` and 0.01 from `report` on the same scored table, silently.
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## cache
 
@@ -940,7 +1063,7 @@ Options:
           Emit the result as JSON on stdout. The desktop application lists and clears the caches through it
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".
 
 ## doctor
 
@@ -961,6 +1084,9 @@ Options:
           Skip the real import of each interpreter's packages and only check that they are installed.
 
           By default every interpreter the configuration uses is asked to import its role's packages for real (`deeplc` first, then torch with one operation), with a 120 s bound per role. That costs seconds, and it is the only check that catches a package which is installed but cannot load, such as a torch whose DLLs fail to initialise on Windows. `MUMDIA_DOCTOR_IMPORT_CHECK=0` does the same as this flag, for a caller that cannot know whether its engine has it.
+
+      --out-dir <OUT_DIR>
+          Also check that this results folder can be written (nothing is created)
 ```
 
-Plus the 5 repeated flags removed above: see "Global flags".
+Plus the 7 repeated flags removed above: see "Global flags".

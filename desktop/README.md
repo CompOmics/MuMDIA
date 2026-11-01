@@ -266,6 +266,55 @@ rm -rf ~/.local/share/MuMDIA
 mumdia cache clear      # the search caches, in ~/.cache/mumdia
 ```
 
+### Storage folder
+
+Before the Storage folder existed, everything above lived in fixed per-user places on the
+system drive: the data directory (`%LOCALAPPDATA%\MuMDIA`, `~/.local/share/MuMDIA`), the
+engine's caches, the system's temporary folder, the predictors' model downloads in the home
+folder, and `uv`'s package cache. On an account whose profile is small, roams, is synced or
+may not be written, a search failed in whichever came first, and nothing on the screen
+could move it.
+
+The Setup screen's **Storage folder** card shows the folder in use, its free space and
+whether it can be written (a file created and renamed there, which is what the caches and
+installers do), with **Change...** (a folder picker) and **Use the default**. A picked
+folder that is not new, not empty and not already a storage folder (marked by
+`.mumdia-storage`) gets a `MuMDIA` sub-folder, so a user's own `configs` or `libraries`
+folder in, say, Documents is never mixed with MuMDIA's or offered for removal on the
+Managed data card. The storage folder holds:
+
+| sub-folder | what | exported to the engine and `uv` as |
+|---|---|---|
+| `libraries/`, `configs/` | predicted DIA-NN libraries, saved settings | (the application's own) |
+| `cache/` | the engine's caches | `MUMDIA_CACHE_DIR` |
+| `temp/` | temporary files of the engine, its Python workers and this application (the Visual C++ runtime download) | `MUMDIA_TEMP_DIR` |
+| `models/` | MS2PIP and AlphaPeptDeep model downloads | `MUMDIA_MODEL_DIR` |
+| `uv-cache/` | `uv`'s package cache | `UV_CACHE_DIR` |
+
+The Python environments and the downloaded tools (ThermoRawFileParser, DIA-NN) stay in the
+default folder unless **Also keep the Python environments and downloaded tools there** is
+ticked: an environment cannot be relocated (its interpreter paths are absolute), so moving
+it means installing it again, a few hundred megabytes nobody should get by surprise. With
+the option, `uv`'s interpreters move too (`uv-python/`, `UV_PYTHON_INSTALL_DIR`). Nothing is
+copied in either case: the caches, libraries and models are rebuilt or downloaded where the
+new folder is, and the old folder's items can be removed from the Managed data card first.
+
+The setting is kept in `storage.json` in the default folder, the one place the application
+can find before it knows the setting. `MUMDIA_DATA_DIR`, set before the application starts,
+replaces that default folder (environments and `storage.json` included), for an account
+whose profile cannot be written at all. A variable exported to the engine never overrides
+one already in the application's environment, and nothing is exported while no folder is
+chosen, so the engine's own defaults then hold exactly as before. The folder is never a
+configuration value, so a configuration's hash and a search's output do not depend on it.
+
+A change is refused while a search, an installation, a library build or the viewer is
+running, as a removal is. The search preflight blocks a results folder or a chosen storage
+folder that cannot be written (checked without creating the results folder), and warns
+about a folder inside OneDrive or on a network share and about a storage folder with less
+than 20 GB free. The run log (`mumdia-console.log`) is opened before the engine starts, and
+a results folder that cannot take it stops the start with the reason instead of running a
+search with no log. The pure logic is `src/storage.rs`, with its tests.
+
 ### Two environments, not one (historical)
 
 MS2PIP could not share an environment with DeepLC at the versions this project

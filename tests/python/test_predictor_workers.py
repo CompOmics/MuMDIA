@@ -796,3 +796,85 @@ def test_im2deep_worker_refuses_an_old_release_and_a_non_physical_value(tmp_path
                             tmp_path / "b.parquet", 1, env=bad)
     assert rc != 0 and "not a finite positive 1/K0" in err
     assert not (tmp_path / "b.parquet").exists()
+
+
+@pytest.mark.parametrize("script", ["ms2pip_worker.py", "peptdeep_worker.py"])
+def test_model_dir_follows_mumdia_model_dir(script, monkeypatch, tmp_path):
+    """`MUMDIA_MODEL_DIR` moves a predictor's model downloads to `<dir>/<predictor>`;
+    unset or blank, the predictor keeps its own default (None)."""
+    spec = importlib.util.spec_from_file_location("mumdia_model_dir_" + script[:-3],
+                                                  SCRIPTS / script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.delenv("MUMDIA_MODEL_DIR", raising=False)
+    assert module.model_dir("x") is None
+    monkeypatch.setenv("MUMDIA_MODEL_DIR", "  ")
+    assert module.model_dir("x") is None
+    monkeypatch.setenv("MUMDIA_MODEL_DIR", str(tmp_path))
+    assert module.model_dir("x") == str(tmp_path / "x")
+
+
+def test_peptdeep_home_is_set_only_when_mumdia_model_dir_is(monkeypatch, tmp_path):
+    module = _load_peptdeep_worker()
+    settings = {"PEPTDEEP_HOME": "~/peptdeep"}
+    monkeypatch.delenv("MUMDIA_MODEL_DIR", raising=False)
+    assert module.use_model_dir(settings) is None
+    assert settings["PEPTDEEP_HOME"] == "~/peptdeep"
+    monkeypatch.setenv("MUMDIA_MODEL_DIR", str(tmp_path))
+    assert module.use_model_dir(settings) == str(tmp_path / "peptdeep")
+    assert settings["PEPTDEEP_HOME"] == str(tmp_path / "peptdeep")
+
+
+@pytest.mark.parametrize("model_root", [None, "models"])
+def test_ms2pip_worker_passes_the_model_dir_to_predict_batch(model_root, monkeypatch,
+                                                             tmp_path):
+    """The worker hands `<MUMDIA_MODEL_DIR>/ms2pip` to `predict_batch` as `model_dir`, and
+    passes no `model_dir` at all without the variable, so MS2PIP's own default holds.
+    MS2PIP and psm_utils are stood in for, so this runs without either installed."""
+    import sys
+    import types
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    calls = []
+
+    class PSM:
+        def __init__(self, peptidoform, spectrum_id):
+            self.peptidoform = peptidoform
+            self.spectrum_id = spectrum_id
+
+    class PSMList:
+        def __init__(self, psm_list):
+            self.psm_list = psm_list
+
+    class Result:
+        def __init__(self, psm):
+            self.psm = psm
+            self.predicted_intensity = None
+
+    def predict_batch(psms, **kwargs):
+        calls.append(kwargs)
+        return [Result(p) for p in psms.psm_list]
+
+    monkeypatch.setitem(sys.modules, "psm_utils",
+                        types.SimpleNamespace(PSM=PSM, PSMList=PSMList))
+    monkeypatch.setitem(sys.modules, "ms2pip",
+                        types.SimpleNamespace(predict_batch=predict_batch))
+    if model_root is None:
+        monkeypatch.delenv("MUMDIA_MODEL_DIR", raising=False)
+    else:
+        monkeypatch.setenv("MUMDIA_MODEL_DIR", str(tmp_path / model_root))
+    inp, out = tmp_path / "in.parquet", tmp_path / "out.parquet"
+    pq.write_table(pa.table({"id": pa.array([0, 1], pa.uint32()),
+                             "peptidoform": ["PEPTIDE", "PEPTIDEK"],
+                             "charge": [2, 3]}), inp)
+    module = _load_ms2pip_worker()
+    monkeypatch.setattr(sys, "argv", ["ms2pip_worker.py", str(inp), str(out), "HCD", "1"])
+    module.main()
+    assert len(calls) == 1
+    if model_root is None:
+        assert "model_dir" not in calls[0], calls[0]
+    else:
+        assert calls[0]["model_dir"] == str(tmp_path / model_root / "ms2pip")
+    assert pq.read_table(out).num_rows == 0

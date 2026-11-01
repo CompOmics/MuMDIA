@@ -154,6 +154,12 @@ Key semantics:
   `MUMDIA_CACHE_DIR=off` turns them off; benchmarks that time the library build or the
   multi-head step, or compare arms, should set it, or a fresh `MUMDIA_CACHE_DIR` per arm,
   so that no arm reuses another's work.
+- Every place a run writes can be moved without a config key (docs/14 "Where MuMDIA
+  writes"): `--cache-dir`/`MUMDIA_CACHE_DIR`, `--temp-dir`/`MUMDIA_TEMP_DIR` (becomes
+  `TMP`/`TEMP`/`TMPDIR` of every worker), `MUMDIA_MODEL_DIR` (MS2PIP and AlphaPeptDeep
+  downloads), `MUMDIA_SIDECAR_DIR`. `run`/`run-experiment` refuse an unwritable output or
+  explicit sidecar directory before any stage; an unwritable cache root only switches the
+  default caches off with a warning. `storage::free_space` is the one free-space function.
 - Imported-library mode skips digest, peptidoform expansion, and initial
   prediction. Under the default `rt_im_train.library_irt = auto` the imported
   iRT is re-predicted with the DeepLC base model when a DeepLC interpreter is
@@ -839,6 +845,18 @@ every charge and every modification variant of one peptide but the highest
 on a modification-rich library, at an unchanged peptide count. It remains
 available as an explicit peptide-level population; never use it for a PTM
 search.
+
+PTM counting rule: count modified peptides at the positional-isomer-group level
+(`isomer_group_q` of `localisation.parquet`, one per group), not per peptidoform. Under
+`peptidoform_charge` every accepted placement of a modified peptide is its own precursor; on
+the Arabidopsis phospho set 52% of accepted phospho rows were a second or later placement,
+82% of those on the best one's peak. Site probabilities (`localise`, docs/36, experimental and
+opt-in) are reporting only: nothing upstream reads them, and identifications and q-values are
+the same with the stage on or off. A site is localised at `localise.threshold` (0.75: 10.0% of calls wrong on
+synthetic phosphopeptides with known sites, 6.7% by the decoy residue on Arabidopsis; 0.9:
+5.8% and 2.6%). Read `site_flr_decoy`, which tracked the true rate on the synthetic set;
+`site_flr_model` was 1.5-3x optimistic there. A peptidoform's site is unvalidated unless the
+stage localised it.
 
 Use Parquet quantities for analysis; TSV values are rounded for presentation.
 Cross-run consensus ions, interference-aware ion selection, minimum clean-ion

@@ -148,6 +148,40 @@ than a number. Both are recorded in every run's `manifest.json`.
   chip and a "Protein N-terminal acetylation" set, a DIA-NN library build passes the site as
   `*n`, and the planned library size counts it (docs/05_digest_peptidoforms.md, "Terminal
   modifications").
+- **Modification site localisation, experimental and opt-in (`localise.enabled`).** A new
+  stage after the final rescore, also available as `mumdia localise`, groups the accepted
+  positional isomers of each modified peptide into peaks, scores every placement of the
+  modification on its candidate residues and on a decoy residue (A, never searched) by the
+  presence of site-determining fragment ions read back from the MS2 spectra at the apex, and
+  writes site probabilities, a model-based and a decoy-residue false localisation rate, and
+  `isomer_group_q`, a picked target-decoy q over positional-isomer groups, to
+  `localisation.parquet`. The report adds `site_probability`, `localised` and
+  `best_site_peptidoform` to `peptides.tsv` and writes `sites.tsv`, numbered on the proteins
+  when a FASTA is given (`mumdia report --localisation`, `--fasta`). Reporting only: with the
+  stage on or off, identifications, q-values and quantities are the same, and a configuration
+  without the section keeps its config hash. On 166 synthetic phosphopeptides with known sites
+  (Orbitrap DIA) 59.0% of the peaks with a choice of site were localised at 0.75 with 10.0% of
+  them wrong, against a decoy-residue estimate of 10.9%; on a twelve-run Arabidopsis phospho
+  diaPASEF experiment 32.8% were localised at a decoy-residue estimate of 6.7%
+  (docs/36_ptm_localisation.md).
+- **Every place MuMDIA writes can be moved, and an unwritable one is named before a search
+  starts.** The global flags `--cache-dir` and `--temp-dir` (over `MUMDIA_CACHE_DIR` and the
+  new `MUMDIA_TEMP_DIR`) move the caches and the temporary files of the engine and every
+  worker it starts (`TMP`, `TEMP`, `TMPDIR`, and `MPLCONFIGDIR` unless set); the new
+  `MUMDIA_MODEL_DIR` moves the MS2PIP and AlphaPeptDeep model downloads from the home
+  directory. Relative paths are made absolute once at startup. `run`, `run-experiment` and
+  `build-library` check that the output directory and an explicit `MUMDIA_SIDECAR_DIR` take
+  a write and a rename before any stage and stop with the directory and the fix otherwise;
+  an unwritable cache root turns the default caches off for the run with one warning, with
+  output byte-identical to a run without caches. `mumdia doctor` gains a `storage` section
+  (and `--out-dir`) that checks every location without creating anything. The engine has one
+  free-space function, which also answers for network shares. The desktop application's
+  Setup screen gains a Storage folder setting that moves its libraries, settings, caches,
+  temporary files, model downloads and `uv` cache, and optionally the Python environments;
+  its preflight blocks an unwritable results or storage folder and warns about OneDrive,
+  network shares and low space. No configuration key changes, so configuration hashes and
+  outputs are unchanged (docs/14, "Where MuMDIA writes"; desktop/README.md, "Storage
+  folder").
 - **`quant.fragment_detail` records which fragments made each precursor quantity.** Off by
   default. Set, the final quant of `run` and of `run-experiment` (after the cross-run step and
   the second pass) also writes `quant_fragments.parquet` beside each run's
@@ -199,6 +233,15 @@ than a number. Both are recorded in every run's `manifest.json`.
   plain-language `label`, which the Search screen shows under the name and matches in its
   filter, so typing "homocysteine" finds both. The carbamidomethylated form of the free
   thiol, cleavage blocked at a modified lysine and the N-terminal adduct are not modelled.
+- **`mumdia mobilogram`: the 1/K0 profile of a diaPASEF candidate's ions, from the raw
+  events of the `.d`.** For the given candidates it bins, in 1/K0, the raw events of every
+  predicted fragment and MS1 isotope in the frames nearest the apex (or `--rt`) and
+  `--frames` either side, over the quad slots that isolate the precursor, at the run's
+  fragment mass offset and tolerance and `extract.prec_tol_ppm`, with convert's 1/K0
+  calibration. Inputs are found from `--run-dir`, each with an override; output is JSON on
+  stdout or a long parquet table. Read-only, and no search output changes. visDIA uses it
+  for the mobilogram of its precursor page, and the desktop application passes its engine
+  to the viewer it starts as `MUMDIA_BIN` (docs/35_diapasef.md section 17).
 
 ### Fixed
 

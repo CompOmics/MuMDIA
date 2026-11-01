@@ -665,6 +665,20 @@ derived from one another, they are separately calibrated nulls.
 | `peptide_q_value` | `base_peptide_id` | best PSM per base peptide, TDA over that set | rescore.rs:370-378 |
 | `pg_q_value` | protein-accession-set string | best PSM per protein group, TDA over that set | rescore.rs:383-400 |
 
+Two more units live outside the scored table, in the `localise` stage's
+`localisation.parquet` (docs/36_ptm_localisation.md, opt-in), so the scored schema is
+unchanged:
+
+| column | grouping | how computed |
+|---|---|---|
+| `isomer_group_q` | `(source, base_peptide_id, modification composition)` over the rows that carry a localised modification | `grouped_q` (the same picked kernel) over those rows only, so it is also a modification-subset FDR; on the group's winning row, 1.0 on the others |
+| `site_flr_model`, `site_flr_decoy` | target peaks with at least two real placements, at the peak's minimum site probability | the model's mean `1 - p`, and decoy-residue wins times the candidate-to-decoy position ratio; both monotone in `p`. False localisation rates of sites, not q-values of identifications |
+
+Count modified peptides on `isomer_group_q` (one per positional-isomer group), not on
+`precursor_q`: under `peptidoform_charge` every accepted placement of one modified peptide
+is its own precursor, and on the Arabidopsis phospho set half the accepted phospho rows were
+a second or later placement on the same peak (docs/36 section 1).
+
 `precursor_q` groups on `(peptidoform, charge)` at this stage, but what reaches
 this stage depends on `compete.group_by`. Under the default
 `group_by = base_peptide`, compete has already collapsed every charge and

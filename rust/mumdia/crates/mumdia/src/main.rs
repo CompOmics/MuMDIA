@@ -60,6 +60,23 @@ struct Cli {
     /// Warnings and errors only. Overridden by --log-level.
     #[arg(short = 'q', long, global = true, conflicts_with = "verbose")]
     quiet: bool,
+
+    /// Root of the engine's caches (FASTA-built libraries, DeepLC projections), or `off`.
+    ///
+    /// Wins over `MUMDIA_CACHE_DIR`, which wins over the per-user cache directory. A
+    /// relative path is resolved against the working directory. A root that cannot be
+    /// written switches the default caches off for the run with one warning
+    /// (docs/14_build_test_deploy_gotchas.md, "Where MuMDIA writes").
+    #[arg(long, global = true, value_name = "DIR")]
+    cache_dir: Option<String>,
+
+    /// Temporary directory of the engine and of every process it starts.
+    ///
+    /// Wins over `MUMDIA_TEMP_DIR`. It becomes `TMP`, `TEMP` and `TMPDIR` for the engine
+    /// and its Python workers, and `MPLCONFIGDIR` goes under it unless set. Created if
+    /// needed; one that cannot be written is an error. Default: the system's.
+    #[arg(long, global = true, value_name = "DIR")]
+    temp_dir: Option<String>,
 }
 
 impl Cli {
@@ -339,6 +356,89 @@ enum Cmd {
         /// Where the patched psms_extracted goes; default: patch --psms-extracted in place.
         #[arg(long)]
         out_psms: Option<String>,
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Site probabilities of a localised modification on one run's scored rows
+    /// (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. Reporting only:
+    /// nothing upstream changes.
+    Localise {
+        /// One run's scored table: a run's psms_scored.parquet, or a run's scored.parquet
+        /// of a run-experiment.
+        #[arg(long)]
+        psms_scored: String,
+        /// That run's spectra_ms2.parquet.
+        #[arg(long)]
+        spectra_ms2: String,
+        /// The run's search-seed masscal.json (fragment mass offset and tolerance).
+        #[arg(long)]
+        mass_cal: Option<String>,
+        /// The psms_extracted.parquet the scored rows came from: each row's apex 1/K0 on
+        /// spectra with ion mobility. Without it the 1/K0 is read from the spectra.
+        #[arg(long)]
+        psms_extracted: Option<String>,
+        /// Keep only the rows of this source; required when the table holds several runs.
+        #[arg(long)]
+        source: Option<u32>,
+        #[arg(long)]
+        out: String,
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// The 1/K0 profile (mobilogram) of candidates' fragment and MS1 ions, read from the
+    /// raw events of a diaPASEF `.d` (docs/35_diapasef.md section 17). Read-only.
+    ///
+    /// Per candidate: the MS2 frames whose quad slots isolate the precursor (the frame
+    /// nearest the apex RT and `--frames` such frames either side) and the MS1 frames
+    /// nearest the same RT. Per ion (the chromatogram's predicted fragments and MS1
+    /// isotopes), the raw intensity is binned in 1/K0 over the scans of those slots, at the
+    /// run's fragment mass offset and tolerance and `extract.prec_tol_ppm` for MS1. Prints
+    /// JSON on stdout, or writes a long parquet table (or JSON) with `--out`.
+    Mobilogram {
+        /// The run directory: psms_extracted, chromatograms, run_windows and the seed's
+        /// masscal are read from it, and the `.d` is the one its spectra report names. A
+        /// second-pass run directory takes the spectra of its first pass.
+        #[arg(long)]
+        run_dir: Option<String>,
+        /// Candidate ids (`candidate_id`), one or more.
+        #[arg(long = "candidate", value_name = "ID", num_args = 1.., required = true)]
+        candidates: Vec<u32>,
+        /// Print JSON on stdout (the default without --out).
+        #[arg(long, conflicts_with = "out")]
+        json: bool,
+        /// Write the profiles to this file instead: `.json` as printed, anything else as a
+        /// parquet table with one row per candidate, ion, frame and non-zero bin.
+        #[arg(long)]
+        out: Option<String>,
+        /// Frames either side of the centre frame, per MS level (0: the centre frame only).
+        #[arg(long, default_value_t = mumdia::stages::mobilogram::DEFAULT_FRAMES)]
+        frames: usize,
+        /// Bin width in 1/K0 (V s cm^-2).
+        #[arg(long, default_value_t = mumdia::stages::mobilogram::DEFAULT_BIN)]
+        bin: f64,
+        /// The psms_extracted row of each candidate (`peak_rank`; 0 is extract's apex).
+        #[arg(long, default_value_t = 0)]
+        peak_rank: i32,
+        /// Centre the frames on this retention time (s) instead of each candidate's apex.
+        #[arg(long)]
+        rt: Option<f64>,
+        /// The diaPASEF `.d`; default: the one the run's spectra report names.
+        #[arg(long)]
+        raw: Option<String>,
+        /// Override `<run-dir>/psms_extracted.parquet`.
+        #[arg(long)]
+        psms_extracted: Option<String>,
+        /// Override `<run-dir>/chromatograms.parquet`.
+        #[arg(long)]
+        chromatograms: Option<String>,
+        /// Override `<run-dir>/run_windows.parquet`.
+        #[arg(long)]
+        run_windows: Option<String>,
+        /// Override `<run-dir>/seed_psms.parquet.masscal.json`.
+        #[arg(long)]
+        mass_cal: Option<String>,
+        /// Configuration for `extract.prec_tol_ppm` and the fallback fragment tolerance;
+        /// default: the one the run's manifest recorded.
         #[arg(long)]
         config: Option<String>,
     },
@@ -687,6 +787,13 @@ enum Cmd {
         peptide_quant: Option<String>,
         #[arg(long, conflicts_with = "experiment_dir")]
         protein_quant: Option<String>,
+        /// A `localise` table of the run: adds the localisation columns to peptides.tsv and
+        /// writes sites.tsv. In experiment mode the tables the manifest names are used.
+        #[arg(long, conflicts_with = "experiment_dir")]
+        localisation: Option<String>,
+        /// A FASTA to number the sites of sites.tsv on their proteins.
+        #[arg(long)]
+        fasta: Option<String>,
         /// Reported q threshold. Defaults to `quant.q_threshold` from `--config`
         /// when that is given, otherwise 0.01. An explicit value always wins.
         #[arg(long)]
@@ -739,6 +846,9 @@ enum Cmd {
         /// same as this flag, for a caller that cannot know whether its engine has it.
         #[arg(long)]
         no_import_check: bool,
+        /// Also check that this results folder can be written (nothing is created).
+        #[arg(long)]
+        out_dir: Option<String>,
     },
 }
 
@@ -817,6 +927,11 @@ struct DoctorReport {
     /// The on-disk caches (`mumdia::cache`): where they are, how large, and the bound.
     /// Never a failure: a run without a cache builds what it would have reused.
     caches: mumdia::cache::CachesReport,
+    /// Where a run writes (`mumdia::storage`): the output directory (with `--out-dir`),
+    /// the sidecar, temporary, cache and model directories, each checked for a write and a
+    /// rename without creating anything. A location a run must write to that cannot be
+    /// written fails the report; an unwritable cache root is a warning.
+    storage: mumdia::storage::StorageReport,
 }
 
 /// A switch given on the command line.
@@ -958,7 +1073,12 @@ fn peak_census(
 /// checked that `sidecar_script_dir` existed (the most common misconfiguration,
 /// and the one baked into the tracked example config), and reported no versions,
 /// so a DeepLC old enough to change results looked identical to a current one.
-fn doctor_report(cfg: &Config, config_path: Option<&str>, import_check: bool) -> DoctorReport {
+fn doctor_report(
+    cfg: &Config,
+    config_path: Option<&str>,
+    import_check: bool,
+    out_dir: Option<&str>,
+) -> DoctorReport {
     use mumdia::python::{self, Role, ALL_ROLES};
 
     // One real import per interpreter and module list: the roles that share an
@@ -1238,14 +1358,16 @@ fn doctor_report(cfg: &Config, config_path: Option<&str>, import_check: bool) ->
         &cfg.convert.msconvert,
     );
 
+    let storage = mumdia::storage::report(out_dir);
     DoctorReport {
-        ok,
+        ok: ok && storage.ok,
         import_check,
         scripts,
         roles,
         thermo,
         msconvert,
         caches: mumdia::cache::report(&cfg),
+        storage,
     }
 }
 
@@ -1368,6 +1490,7 @@ fn print_doctor(rep: &DoctorReport) {
     }
 
     print_caches(&rep.caches);
+    print_storage(&rep.storage);
 
     if rep.ok {
         println!("mumdia doctor: configuration is runnable");
@@ -1416,6 +1539,37 @@ fn print_caches(caches: &mumdia::cache::CachesReport) {
                     v.unwrap_or("null")
                 ),
             },
+        }
+    }
+}
+
+/// The storage section of `doctor`: one line per location, then its notes.
+fn print_storage(storage: &mumdia::storage::StorageReport) {
+    println!("storage");
+    for l in &storage.locations {
+        let tag = match l.status.as_str() {
+            "ok" => " ok ",
+            "fail" => "FAIL",
+            "warn" => "warn",
+            _ => "skip",
+        };
+        match &l.dir {
+            Some(d) => {
+                let free = d
+                    .free_bytes
+                    .map_or(String::new(), |b| format!(", {} free", gib(b)));
+                println!("  [{tag}] {}: {} (from {}){free}", l.role, d.path, l.source);
+                if let Some(e) = &d.error {
+                    println!("         not writable: {e}");
+                }
+                for n in &d.notes {
+                    println!("         {n}");
+                }
+            }
+            None => println!("  [{tag}] {}: {}", l.role, l.source),
+        }
+        if let Some(detail) = &l.detail {
+            println!("         {detail}");
         }
     }
 }
@@ -1493,6 +1647,18 @@ fn real_main() -> Result<()> {
     let _dhat = dhat::Profiler::new_heap();
     let cli = Cli::parse();
     mumdia_io::init_logging_level(cli.log_filter().as_deref());
+    // Before any thread pool exists, because it sets environment variables. `doctor`
+    // reports an unusable temporary directory instead of stopping on it.
+    let storage = mumdia::storage::apply(&mumdia::storage::StorageFlags {
+        cache_dir: cli.cache_dir.clone(),
+        temp_dir: cli.temp_dir.clone(),
+    });
+    if let Err(e) = storage {
+        if !matches!(cli.cmd, Cmd::Doctor { .. }) {
+            return Err(e);
+        }
+        tracing::warn!("{e:#}");
+    }
     apply_threads(cli.threads)?;
     match cli.cmd {
         Cmd::Convert {
@@ -1750,6 +1916,84 @@ fn real_main() -> Result<()> {
                 config_hash: &ch,
                 ms1_denoise: cfg.convert.tdf_ms1_denoise,
             })?;
+        }
+        Cmd::Localise {
+            psms_scored,
+            spectra_ms2,
+            mass_cal,
+            psms_extracted,
+            source,
+            out,
+            config,
+        } => {
+            let cfg = load_config(&config)?;
+            let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            let s = stages::localise::run(stages::localise::LocaliseParams {
+                scored: &psms_scored,
+                spectra_ms2: &spectra_ms2,
+                mass_cal: mass_cal.as_deref(),
+                psms_extracted: psms_extracted.as_deref(),
+                source,
+                out: &out,
+                cfg: &cfg.localise,
+                variable_mods: &cfg.peptidoforms.variable_mods,
+                fallback_tol_ppm: cfg.extract.frag_tol_ppm,
+                config_hash: &ch,
+            })?;
+            println!(
+                "MuMDIA localise: {} rows, {} peaks, {} of {} target peaks with a choice \
+                 localised, {} isomer groups at isomer_group_q <= 0.01\n  {out}",
+                s.rows,
+                s.peaks,
+                s.localised_target_peaks,
+                s.ambiguous_target_peaks,
+                s.isomer_groups_at_1pct
+            );
+        }
+        Cmd::Mobilogram {
+            run_dir,
+            candidates,
+            json: _,
+            out,
+            frames,
+            bin,
+            peak_rank,
+            rt,
+            raw,
+            psms_extracted,
+            chromatograms,
+            run_windows,
+            mass_cal,
+            config,
+        } => {
+            use stages::mobilogram;
+            let cfg = match &config {
+                Some(_) => Some(load_config(&config)?),
+                None => None,
+            };
+            let m = mobilogram::run(mobilogram::MobilogramParams {
+                run_dir: run_dir.as_deref(),
+                raw: raw.as_deref(),
+                psms_extracted: psms_extracted.as_deref(),
+                chromatograms: chromatograms.as_deref(),
+                run_windows: run_windows.as_deref(),
+                mass_cal: mass_cal.as_deref(),
+                config: cfg,
+                candidates: &candidates,
+                peak_rank,
+                rt,
+                frames,
+                bin,
+            })?;
+            match out {
+                Some(o) if o.to_ascii_lowercase().ends_with(".json") => {
+                    mumdia_io::json::write_json(&o, &m)?
+                }
+                Some(o) => {
+                    mobilogram::write_parquet(&m, &o)?;
+                }
+                None => println!("{}", serde_json::to_string(&m)?),
+            }
         }
         Cmd::Features {
             psms_extracted,
@@ -2272,6 +2516,8 @@ fn real_main() -> Result<()> {
             out_dir,
             peptide_quant,
             protein_quant,
+            localisation,
+            fasta,
             q,
             config,
         } => {
@@ -2316,12 +2562,28 @@ fn real_main() -> Result<()> {
                     })?
                     .to_string();
                 let lfq = e.get("lfq").and_then(|v| v.as_str()).map(String::from);
+                // The run's localisation tables, when the `localise` stage ran.
+                let loc_tables: Vec<String> = e
+                    .get("localisation")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let out = out_dir.unwrap_or_else(|| exp.clone());
                 std::fs::create_dir_all(&out)?;
                 let pep = format!("{out}/peptides.tsv");
                 let prot = format!("{out}/proteins.tsv");
-                let (n_pep, n_prot) =
-                    stages::report::run_experiment(stages::report::ExperimentReportParams {
+                let sites = format!("{out}/sites.tsv");
+                let loc = (!loc_tables.is_empty()).then(|| stages::report::Localisation {
+                    tables: &loc_tables,
+                    fasta: fasta.as_deref(),
+                    out_sites: &sites,
+                });
+                let (n_pep, n_prot) = stages::report::run_experiment_localised(
+                    stages::report::ExperimentReportParams {
                         scored: &scored,
                         run_names: &runs,
                         peptide_quants: &peptide_quants,
@@ -2329,7 +2591,9 @@ fn real_main() -> Result<()> {
                         out_peptides: &pep,
                         out_proteins: &prot,
                         q_threshold: q,
-                    })?;
+                    },
+                    loc.as_ref(),
+                )?;
                 println!(
                     "MuMDIA: {n_pep} precursors, {n_prot} protein groups at experiment-wide \
                      q <= {q} over {} runs\n  {pep}\n  {prot}",
@@ -2341,14 +2605,24 @@ fn real_main() -> Result<()> {
                 std::fs::create_dir_all(&out_dir)?;
                 let pep = format!("{out_dir}/peptides.tsv");
                 let prot = format!("{out_dir}/proteins.tsv");
-                let (n_pep, n_prot) = stages::report::run(stages::report::ReportParams {
-                    scored: &psms_scored,
-                    peptide_quant: peptide_quant.as_deref(),
-                    protein_quant: protein_quant.as_deref(),
-                    out_peptides: &pep,
-                    out_proteins: &prot,
-                    q_threshold: q,
-                })?;
+                let sites = format!("{out_dir}/sites.tsv");
+                let loc_tables: Vec<String> = localisation.into_iter().collect();
+                let loc = (!loc_tables.is_empty()).then(|| stages::report::Localisation {
+                    tables: &loc_tables,
+                    fasta: fasta.as_deref(),
+                    out_sites: &sites,
+                });
+                let (n_pep, n_prot) = stages::report::run_localised(
+                    stages::report::ReportParams {
+                        scored: &psms_scored,
+                        peptide_quant: peptide_quant.as_deref(),
+                        protein_quant: protein_quant.as_deref(),
+                        out_peptides: &pep,
+                        out_proteins: &prot,
+                        q_threshold: q,
+                    },
+                    loc.as_ref(),
+                )?;
                 println!(
                     "MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {q}\n  {pep}\n  {prot}"
                 );
@@ -2420,6 +2694,7 @@ fn real_main() -> Result<()> {
             config,
             json,
             no_import_check,
+            out_dir,
         } => {
             // Deliberately the raw loader: doctor must be able to diagnose a
             // configuration whose interpreters do not resolve, so it cannot go
@@ -2427,7 +2702,7 @@ fn real_main() -> Result<()> {
             let cfg = load_config_raw(&config)?;
             let import_check = !no_import_check
                 && std::env::var("MUMDIA_DOCTOR_IMPORT_CHECK").map_or(true, |v| v.trim() != "0");
-            let report = doctor_report(&cfg, config.as_deref(), import_check);
+            let report = doctor_report(&cfg, config.as_deref(), import_check, out_dir.as_deref());
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -2454,6 +2729,13 @@ mod cli_tests {
         assert_eq!(a.threads, Some(8));
         assert_eq!(b.threads, Some(8));
         assert!(matches!(a.cmd, Cmd::Doctor { .. }));
+        // The storage flags are global too.
+        let c = Cli::parse_from(["mumdia", "doctor", "--cache-dir", "c", "--temp-dir", "t"]);
+        let d = Cli::parse_from(["mumdia", "--cache-dir", "c", "--temp-dir", "t", "doctor"]);
+        for x in [c, d] {
+            assert_eq!(x.cache_dir.as_deref(), Some("c"));
+            assert_eq!(x.temp_dir.as_deref(), Some("t"));
+        }
     }
 
     #[test]
@@ -2635,7 +2917,7 @@ mod cli_tests {
     /// beside them.
     #[test]
     fn the_doctor_json_keeps_its_fields_and_adds_the_import_check() {
-        let rep = doctor_report(&Config::default(), None, false);
+        let rep = doctor_report(&Config::default(), None, false, None);
         let v = serde_json::to_value(&rep).unwrap();
         for k in [
             "ok",
@@ -2645,10 +2927,51 @@ mod cli_tests {
             "msconvert",
             "caches",
             "import_check",
+            "storage",
         ] {
             assert!(v.get(k).is_some(), "doctor --json lost `{k}`");
         }
         assert_eq!(v["import_check"], serde_json::json!(false));
+        // The storage section: a verdict and one entry per location, each with the same
+        // fields, the directory's own check when there is a directory.
+        assert!(v["storage"]["ok"].is_boolean());
+        let roles: Vec<&str> = v["storage"]["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["role"].as_str().unwrap())
+            .collect();
+        for r in ["sidecar", "temp", "cache_root", "models"] {
+            assert!(roles.contains(&r), "no storage location `{r}`: {roles:?}");
+        }
+        for l in v["storage"]["locations"].as_array().unwrap() {
+            for k in ["role", "status", "source", "dir", "detail"] {
+                assert!(l.get(k).is_some(), "a storage location lost `{k}`: {l}");
+            }
+            if l["dir"].is_object() {
+                for k in ["path", "exists", "writable", "error", "free_bytes", "notes"] {
+                    assert!(l["dir"].get(k).is_some(), "a storage dir lost `{k}`: {l}");
+                }
+            }
+        }
+        // With --out-dir the output folder is checked too, and an unwritable one fails.
+        let blocked =
+            std::env::temp_dir().join(format!("mumdia_doctor_out_{}", std::process::id()));
+        std::fs::write(&blocked, b"a file, not a folder").unwrap();
+        let below = blocked.join("results");
+        let rep = doctor_report(
+            &Config::default(),
+            None,
+            false,
+            Some(&below.to_string_lossy()),
+        );
+        let _ = std::fs::remove_file(&blocked);
+        assert!(!rep.ok && !rep.storage.ok);
+        assert!(rep
+            .storage
+            .locations
+            .iter()
+            .any(|l| l.role == "output" && l.status == "fail"));
         let role = &v["roles"][0];
         for k in [
             "wanted",
@@ -2730,7 +3053,7 @@ mod cli_tests {
                 .unwrap()
         };
 
-        let checked = doctor_report(&cfg, None, true);
+        let checked = doctor_report(&cfg, None, true, None);
         assert!(!checked.ok);
         let r = rescore(&checked);
         assert_eq!(
@@ -2747,7 +3070,7 @@ mod cli_tests {
             .contains("WinError 1114"));
         assert_eq!(r["hint"], mumdia::python::VC_RUNTIME_HINT);
 
-        let unchecked = doctor_report(&cfg, None, false);
+        let unchecked = doctor_report(&cfg, None, false, None);
         let r = rescore(&unchecked);
         assert_eq!(r["import_checked"], false);
         assert_eq!(r["unloadable"], serde_json::json!([]));

@@ -68,7 +68,7 @@ results. Record the version you used.";
 
 /// Where a located DIA-NN, and the acknowledgement, are remembered.
 fn state_file() -> PathBuf {
-    crate::components::data_dir().join(STATE_FILE_NAME)
+    crate::components::tools_dir().join(STATE_FILE_NAME)
 }
 
 /// Names under the data directory, shared with `components::inventory` so that the
@@ -108,7 +108,7 @@ fn load() -> Saved {
 }
 
 fn store(s: &Saved) -> Result<(), String> {
-    let dir = crate::components::data_dir();
+    let dir = crate::components::tools_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let text = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
     std::fs::write(state_file(), text)
@@ -678,7 +678,7 @@ impl Installer {
 
 /// Where a managed 1.8.1 is extracted. Per-user, so no administrator rights.
 fn managed_dir() -> PathBuf {
-    crate::components::data_dir().join(MANAGED_DIR_NAME)
+    crate::components::tools_dir().join(MANAGED_DIR_NAME)
 }
 
 /// Whether this platform can be offered the download at all, and what it costs.
@@ -787,7 +787,7 @@ pub fn install(installer: Arc<Installer>) -> Result<(), String> {
     }
 
     std::thread::spawn(move || {
-        let dir = crate::components::data_dir();
+        let dir = crate::components::tools_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             installer.fail(format!("cannot create {}: {e}", dir.display()));
             return;

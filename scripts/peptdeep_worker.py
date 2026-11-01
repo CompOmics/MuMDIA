@@ -22,7 +22,9 @@ its own fragments and asks a predictor only for an intensity per
 at this boundary.
 
 Run with an env that has peptdeep + pyarrow. The first run downloads AlphaPeptDeep's
-pretrained models into `~/peptdeep/pretrained_models`.
+pretrained models into `~/peptdeep/pretrained_models`, or into
+`<MUMDIA_MODEL_DIR>/peptdeep/pretrained_models` when MUMDIA_MODEL_DIR is set (docs/14,
+"Where MuMDIA writes").
 
 What this worker does NOT do:
 
@@ -208,6 +210,25 @@ def to_table(parts):
     )
 
 
+def model_dir(subdir):
+    """`<MUMDIA_MODEL_DIR>/<subdir>` when MUMDIA_MODEL_DIR is set and not blank, else
+    None: the predictor's own default location."""
+    root = os.environ.get("MUMDIA_MODEL_DIR", "").strip()
+    return os.path.join(root, subdir) if root else None
+
+
+def use_model_dir(settings):
+    """Point AlphaPeptDeep's home, where its pretrained models are downloaded and read, at
+    `<MUMDIA_MODEL_DIR>/peptdeep` when MUMDIA_MODEL_DIR is set. Returns the directory, or
+    None when the package default stays. peptdeep >= 1.5 reads `PEPTDEEP_HOME` from
+    `global_settings` each time it locates the model archive, so this must run before
+    `ModelManager` is created."""
+    where = model_dir("peptdeep")
+    if where:
+        settings["PEPTDEEP_HOME"] = where
+    return where
+
+
 def main():
     in_path, out_path = sys.argv[1], sys.argv[2]
     model = sys.argv[3] if len(sys.argv) > 3 else "generic"
@@ -284,6 +305,9 @@ def main():
             f"intensities would be wrong rather than absent: {', '.join(sorted(missing))}"
         )
 
+    where = use_model_dir(global_settings)
+    if where:
+        print(f"peptdeep_worker: models in {where} (MUMDIA_MODEL_DIR)", flush=True)
     mm = ModelManager(device=device)
     mm.load_installed_models(model)
     resolved = str(getattr(mm.ms2_model, "device", "unknown"))
