@@ -555,6 +555,28 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         top_peaks_ms2: usize,
     },
+    /// Build the spectral library of a FASTA search without spectra: digest ->
+    /// peptidoforms -> predict-frag, restored from or stored into
+    /// `predict_frag.library_cache` under the key a `run --fasta` uses. Writes the two
+    /// library tables, manifest.json and library.json (counts, models, cache key and the
+    /// commands that search with it) into --out-dir.
+    BuildLibrary {
+        /// FASTA to digest into the library.
+        #[arg(long)]
+        fasta: String,
+        #[arg(long)]
+        out_dir: String,
+        #[arg(long)]
+        config: Option<String>,
+        /// Named tuning preset applied on top of --config/defaults, as for `run`.
+        #[arg(long)]
+        profile: Option<String>,
+        /// `on` builds the library for spectra with ion mobility (a timsTOF diaPASEF .d),
+        /// so `predict_frag.im_predictor = auto` predicts 1/K0 and a search of such
+        /// spectra finds the library in the cache; `off` for every other acquisition.
+        #[arg(long, value_enum, default_value_t = OnOff::Off)]
+        ion_mobility: OnOff,
+    },
     /// Cross-run RT alignment (experiment-level) -> alignment.parquet.
     Align {
         /// One seed_psms.parquet per run; the first is the reference.
@@ -790,6 +812,13 @@ struct DoctorReport {
     /// The on-disk caches (`mumdia::cache`): where they are, how large, and the bound.
     /// Never a failure: a run without a cache builds what it would have reused.
     caches: mumdia::cache::CachesReport,
+}
+
+/// A switch given on the command line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum OnOff {
+    Off,
+    On,
 }
 
 /// What `mumdia cache` does.
@@ -2035,6 +2064,25 @@ fn real_main() -> Result<()> {
                 top_peaks_ms2,
             })?;
         }
+        Cmd::BuildLibrary {
+            fasta,
+            out_dir,
+            config,
+            profile,
+            ion_mobility,
+        } => {
+            let mut cfg = load_config(&config)?;
+            if let Some(pf) = &profile {
+                cfg.apply_profile(pf)?;
+            }
+            stages::library_build::run(stages::library_build::BuildLibraryParams {
+                config: &cfg,
+                config_path: config.as_deref(),
+                fasta: &fasta,
+                out_dir: &out_dir,
+                ion_mobility: ion_mobility == OnOff::On,
+            })?;
+        }
         Cmd::Quant {
             psms_scored,
             chromatograms,
@@ -2497,6 +2545,62 @@ mod cli_tests {
             _ => panic!("expected convert command"),
         }
     }
+    /// `build-library` needs no spectra, and builds for spectra without ion mobility unless
+    /// asked.
+    #[test]
+    fn build_library_takes_a_fasta_and_no_spectra() {
+        let cli = Cli::try_parse_from([
+            "mumdia",
+            "build-library",
+            "--fasta",
+            "x.fasta",
+            "--out-dir",
+            "lib",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::BuildLibrary {
+                ion_mobility,
+                config,
+                ..
+            } => {
+                assert_eq!(ion_mobility, OnOff::Off);
+                assert_eq!(config, None);
+            }
+            _ => panic!("expected build-library"),
+        }
+        let cli = Cli::try_parse_from([
+            "mumdia",
+            "build-library",
+            "--fasta",
+            "x.fasta",
+            "--out-dir",
+            "lib",
+            "--ion-mobility",
+            "on",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::BuildLibrary {
+                ion_mobility: OnOff::On,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["mumdia", "build-library", "--out-dir", "lib"]).is_err());
+        assert!(Cli::try_parse_from([
+            "mumdia",
+            "build-library",
+            "--fasta",
+            "x.fasta",
+            "--out-dir",
+            "lib",
+            "--mzml",
+            "run.mzML",
+        ])
+        .is_err());
+    }
+
     #[test]
     fn doctor_imports_for_real_unless_asked_not_to() {
         let cli = Cli::try_parse_from(["mumdia", "doctor"]).unwrap();

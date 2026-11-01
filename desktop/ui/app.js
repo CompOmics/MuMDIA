@@ -35,6 +35,8 @@ const STAGES_FASTA = [
   ["report", "Writing the report"],
 ];
 const SKIP_IN_LIBRARY_MODE = new Set(["digest", "peptidoforms", "predict-frag"]);
+// A library build without a search (`build-library`) runs only these.
+const LIBRARY_BUILD_STAGES = SKIP_IN_LIBRARY_MODE;
 
 const state = {
   mode: "fasta",
@@ -94,6 +96,9 @@ const state = {
   // counter: each check runs `mumdia doctor` once per recipe it considers.
   builtinSeq: 0,
   builtinTimer: null,
+  // The library on the results screen after "Build library only": its two tables, the
+  // folder they are in, and the engine's library.json for a built-in build.
+  libraryResult: null,
   // Output folders this application has used. The only thing it remembers; what
   // each one contains is read back from the folder.
   known: JSON.parse(localStorage.getItem("mumdia.folders") || "[]"),
@@ -178,6 +183,7 @@ async function init() {
     $("engine-line").textContent = "engine not found";
     banner($("engine-error"), String(e));
     $("start").disabled = true;
+    $("build-library").disabled = true;
   }
 
   try {
@@ -232,6 +238,18 @@ async function init() {
     b.addEventListener("click", () => pick(b.dataset.pick));
   }
   $("start").addEventListener("click", start);
+  $("build-library").addEventListener("click", buildLibraryOnly);
+  $("lib-for").addEventListener("change", () => {
+    refreshLibForNote();
+    scheduleBuiltinPlan();
+  });
+  refreshLibForNote();
+  $("lib-search").addEventListener("click", searchWithLibrary);
+  $("lib-copy").addEventListener("click", copyLibrary);
+  $("lib-reveal").addEventListener("click", () => {
+    const L = state.libraryResult;
+    if (L) invoke("reveal", { path: L.dir }).catch((e) => banner($("lib-error"), String(e)));
+  });
   $("install-primary").addEventListener("click", () => installComponents("primary"));
   $("install-ms2pip").addEventListener("click", () => installComponents("ms2pip"));
   $("install-visdia").addEventListener("click", () => installComponents("visdia"));
@@ -1252,6 +1270,8 @@ function setMode(mode) {
   for (const t of document.querySelectorAll(".tab")) t.classList.toggle("on", t.dataset.mode === mode);
   show($("mode-fasta"), mode === "fasta");
   show($("mode-library"), mode === "library");
+  // A library is built from a FASTA; there is nothing to build from a library.
+  show($("build-library"), mode === "fasta");
   scheduleSpace();
   scheduleBuiltinPlan();
 }
@@ -1306,6 +1326,7 @@ async function renderMzmlList() {
   }
 
   list.innerHTML = "";
+  let anyDiapasef = false;
   for (const [i, f] of files.entries()) {
     const li = document.createElement("li");
 
@@ -1328,6 +1349,7 @@ async function renderMzmlList() {
     } catch {
       /* Detection is advisory; preflight is the authority. */
     }
+    if (v && v.label === DIAPASEF_LABEL) anyDiapasef = true;
     if (v && v.needs !== "Nothing") {
       const ok =
         v.needs === "ThermoParser" ? state.thermoReady : !!state.msconvert;
@@ -1352,6 +1374,37 @@ async function renderMzmlList() {
 
     list.appendChild(li);
   }
+  // The library is for the spectra that are selected, when there are any; the user may
+  // still change it.
+  if (files.length) {
+    $("lib-for").value = anyDiapasef ? "diapasef" : "other";
+    refreshLibForNote();
+  }
+}
+
+// What `vendor_of` calls a .d the engine reads natively, with its ion mobility.
+const DIAPASEF_LABEL = "Bruker timsTOF diaPASEF .d";
+
+// What the "Library for" choice changes, under the library source chosen above it.
+function refreshLibForNote() {
+  const diapasef = $("lib-for").value === "diapasef";
+  let note;
+  if (state.libSrc === "diann") {
+    note =
+      "DIA-NN predicts one library whatever the instrument, so this choice changes nothing " +
+      "for it.";
+  } else if (diapasef) {
+    note =
+      "For a timsTOF diaPASEF .d: the diaPASEF recipe (AlphaPeptDeep, DeepLC and IM2Deep) " +
+      "predicts the library with its ion mobility (1/K0) when those are installed, and a " +
+      "search of diaPASEF spectra finds it.";
+  } else {
+    note =
+      "For spectra without ion mobility (Orbitrap, Astral and the other instruments); a " +
+      "search of such spectra finds it.";
+  }
+  if (state.picks.mzml.length) note += " Chosen from the selected spectra.";
+  $("lib-for-note").textContent = note;
 }
 
 function currentRunMode() {
@@ -2096,6 +2149,7 @@ function selectLibSrc(which) {
   const r = $(which === "diann" ? "libsrc-diann" : "libsrc-builtin");
   if (r) r.checked = true;
   show($("libsrc-params"), which === "diann");
+  refreshLibForNote();
   scheduleBuiltinPlan();
 }
 
@@ -2112,8 +2166,14 @@ function scheduleBuiltinPlan() {
   state.builtinTimer = setTimeout(refreshBuiltinPlan, 400);
 }
 
-async function builtinPlan() {
-  return invoke("builtin_plan", { preset: $("preset").value || null, mzml: state.picks.mzml });
+// `diapasef` is the acquisition a library built without spectra is for; a search leaves
+// it unset and the backend reads it from the selected spectra.
+async function builtinPlan(diapasef = null) {
+  return invoke("builtin_plan", {
+    preset: $("preset").value || null,
+    mzml: state.picks.mzml,
+    diapasef,
+  });
 }
 
 async function refreshBuiltinPlan() {
@@ -2128,7 +2188,10 @@ async function refreshBuiltinPlan() {
   note.textContent = "Checking which predictors are installed…";
   let plan;
   try {
-    plan = await builtinPlan();
+    // Without spectra, the plan is for the instrument chosen under "Library for".
+    plan = await builtinPlan(
+      state.picks.mzml.length ? null : $("lib-for").value === "diapasef"
+    );
   } catch (e) {
     if (seq !== state.builtinSeq) return;
     note.textContent = `Could not check the predictors: ${e}`;
@@ -2346,6 +2409,8 @@ function renderBatchSummary() {
   // Reuse the results screen's file list area for a per-file breakdown, because a
   // single set of counts would be a lie: these runs share no FDR.
   show($("res-batch-card"), true);
+  show($("res-library-card"), false);
+  show($("open-visdia"), true);
   show($("kpis"), false);
   const host = $("res-files");
   if (!host) return;
@@ -2370,6 +2435,307 @@ function renderBatchSummary() {
     host.appendChild(row);
   }
   refreshVisdiaButtons();
+}
+
+// ── a library without a search (issue #233) ─────────────────────────────────
+// "Build library only" predicts the library a FASTA search would, and stops there: no
+// spectra are needed. DIA-NN builds into its own cache, exactly as before a search. The
+// built-in predictors run the engine's `build-library` through the ordinary run machinery
+// (one engine process, its log, Stop, the results-folder reservation), which writes the
+// library into the results folder and stores it in the engine's library cache, where a
+// later FASTA search with the same settings finds it.
+async function buildLibraryOnly() {
+  if (state.starting) return;
+  state.starting = true;
+  $("start").disabled = true;
+  $("build-library").disabled = true;
+  try {
+    await startLibraryBuild();
+  } finally {
+    state.starting = false;
+    $("start").disabled = !state.engineOk;
+    $("build-library").disabled = !state.engineOk;
+  }
+}
+
+async function startLibraryBuild() {
+  banner($("start-error"), "");
+  banner($("preflight-block"), "");
+  const p = state.picks;
+  if (state.mode !== "fasta") {
+    banner($("start-error"), "A library is built from a FASTA: choose the From a FASTA tab.");
+    return;
+  }
+  if (!p.fasta) {
+    banner($("start-error"), "Choose a FASTA first.");
+    return;
+  }
+  const active = await activeRun();
+  if (active) {
+    banner(
+      $("start-error"),
+      `A search is still running in ${active.out_dir}. Stop it, or wait for it to finish, first.`
+    );
+    return;
+  }
+  const problems = modProblems();
+  if (problems.length) {
+    banner($("start-error"), problems.join("\n\n"));
+    return;
+  }
+  const diapasef = $("lib-for").value === "diapasef";
+
+  if (state.libSrc === "diann") {
+    const built = await ensureLibrary(p.fasta);
+    if (!built) return;
+    let plan = null;
+    try {
+      plan = await invoke("diann_library_plan", { req: libraryParams(p.fasta) });
+    } catch {
+      /* Only the version line is lost. */
+    }
+    let count = null;
+    try {
+      count = (await invoke("search_space", { req: spaceRequest(built[0]) })).precursors;
+    } catch {
+      /* The counts are a convenience. */
+    }
+    $("nav-results").disabled = false;
+    renderLibraryResult({
+      source: "diann",
+      precursors: built[0],
+      fragments: built[1],
+      diannVersion: plan?.diann_version || "",
+      precursorCount: count,
+      info: null,
+    });
+    screen("results");
+    return;
+  }
+
+  if (!p.out_dir) {
+    banner($("start-error"), "Choose a results folder: the library is written there.");
+    return;
+  }
+  let plan;
+  try {
+    plan = await builtinPlan(diapasef);
+  } catch (e) {
+    banner($("start-error"), `Could not check the predictors: ${e}`);
+    return;
+  }
+  $("libsrc-builtin-note").textContent = plan.note;
+  banner($("builtin-warn"), plan.warning || "");
+  if (plan.warning && !(await confirmPredictors(plan.warning))) {
+    banner($("start-error"), plan.warning);
+    return;
+  }
+  // The digest and modification choices, as a search derives them, so the library is the
+  // one a search with these settings looks up. Prescreen and bands do not change it.
+  let config = plan.base;
+  try {
+    config = await invoke("derive_config", { base: config, overrides: digestOverrides() });
+  } catch (e) {
+    banner($("start-error"), String(e));
+    return;
+  }
+  const threads = parseInt($("threads").value, 10);
+  const req = {
+    mzml: [],
+    experiment: false,
+    out_dir: p.out_dir,
+    fasta: p.fasta,
+    lib_precursors: null,
+    lib_fragments: null,
+    config,
+    threads: Number.isFinite(threads) && threads > 0 ? threads : null,
+    build_library: true,
+    ion_mobility: diapasef,
+  };
+  try {
+    const pf = await invoke("preflight", { req });
+    if (!pf.ok) {
+      banner(
+        $("preflight-block"),
+        pf.blockers.join("\n\n") +
+          (pf.components_complete ? "" : "\n\nOpen Setup to install the components.")
+      );
+      return;
+    }
+  } catch (e) {
+    banner($("preflight-block"), `Could not check before starting: ${e}`);
+  }
+  try {
+    state.runId = await invoke("start_run", { req });
+  } catch (e) {
+    banner($("start-error"), String(e));
+    return;
+  }
+  state.outDir = p.out_dir;
+  state.lastStatus = null;
+  state.batch = null;
+  $("nav-progress").disabled = false;
+  $("nav-results").disabled = true;
+  $("stop").disabled = false;
+  $("log").textContent = "";
+  banner($("run-error"), "");
+  screen("progress");
+  clearInterval(state.timer);
+  state.timer = setInterval(poll, 700);
+  poll();
+}
+
+// The folder a file is in.
+function dirOf(path) {
+  return (path || "").replace(/[\\/][^\\/]*$/, "");
+}
+
+// The library of a finished `build-library` run, from its library.json.
+function libraryOfBuild(s) {
+  const info = s.library || {};
+  const precursors = info.precursors?.path || `${s.out_dir}/fragment_library_precursors.parquet`;
+  return {
+    source: "builtin",
+    precursors,
+    fragments: info.fragments?.path || `${s.out_dir}/fragment_library_fragments.parquet`,
+    info: s.library || null,
+    elapsedMs: s.elapsed_ms,
+  };
+}
+
+// The result card of a library build: what was built, where, and how to search with it.
+function renderLibraryResult(L) {
+  L.dir = dirOf(L.precursors);
+  state.libraryResult = L;
+  state.outDir = L.dir;
+  show($("res-batch-card"), false);
+  show($("kpis"), false);
+  show($("open-visdia"), false);
+  show($("res-library-card"), true);
+  banner($("res-warn"), "");
+  banner($("res-degraded"), "");
+  banner($("lib-error"), "");
+  banner($("lib-copied"), "");
+  $("res-title").textContent = "Library built";
+
+  const info = L.info;
+  const lines = [];
+  const sub = [];
+  if (L.source === "diann") {
+    sub.push(`predicted by DIA-NN${L.diannVersion ? ` ${L.diannVersion}` : ""}`);
+    if (L.precursorCount != null) lines.push(`${fmtInt(L.precursorCount)} precursors`);
+  } else if (info) {
+    sub.push(info.origin === "library-cache" ? "restored from the library cache" : "built");
+    if (L.elapsedMs) sub.push(fmtDuration(L.elapsedMs));
+    const pr = info.precursors || {};
+    lines.push(
+      `${fmtInt(pr.rows)} precursors (${fmtInt(pr.targets)} targets, ${fmtInt(pr.decoys)} ` +
+        `decoys), ${fmtInt(info.fragments?.rows)} fragments`
+    );
+    const m = info.models || {};
+    const models = [`fragments: ${m.fragment ?? "?"}`, `retention time: ${m.rt ?? "?"}`];
+    models.push(`ion mobility: ${m.im ?? "none"}`);
+    lines.push(`Predicted with ${models.join(", ")}.`);
+    lines.push(
+      `For ${info.ion_mobility ? "timsTOF diaPASEF spectra" : "spectra without ion mobility"}` +
+        (info.predicts_ion_mobility ? ", with predicted 1/K0." : ".")
+    );
+    if (info.cache?.key) lines.push(`Library cache key ${info.cache.key}.`);
+  }
+  $("res-sub").textContent = sub.join(" · ");
+  $("lib-summary").innerHTML = "";
+  for (const l of lines) $("lib-summary").appendChild(node("div", "", l));
+
+  let reuse;
+  if (L.source === "diann") {
+    reuse =
+      "Kept in the DIA-NN library cache for this FASTA and these digest settings: a search " +
+      "from the FASTA with DIA-NN uses it without predicting again.";
+  } else {
+    const irt = info?.reuse?.library_irt;
+    reuse =
+      (info?.cache?.stored
+        ? "A search from the same FASTA with the same settings and installed predictors finds " +
+          "this library in the library cache and skips the prediction. "
+        : "The library cache is off, so a search from the FASTA predicts the library again. ") +
+      "Search with this library opens the spectral library tab with these tables" +
+      (irt
+        ? `, and the search then sets rt_im_train.library_irt = "${irt}", which handles ` +
+          "the retention times as a search from the FASTA would."
+        : ".");
+  }
+  $("lib-reuse").textContent = reuse;
+
+  const files = [
+    [L.precursors, "precursor table"],
+    [L.fragments, "fragment table"],
+  ];
+  if (L.source === "builtin") {
+    files.push([`${L.dir}/library.json`, "counts, models, cache key and how to search with it"]);
+    files.push([`${L.dir}/manifest.json`, "engine version, commit, and a hash of the FASTA"]);
+  }
+  $("files").innerHTML = "";
+  for (const [f, d] of files) {
+    const row = node("div");
+    row.append(node("code", "", f), " ", node("span", "hint inline", d));
+    $("files").appendChild(row);
+  }
+}
+
+// Put the library in the spectral library tab, ready to search.
+function searchWithLibrary() {
+  const L = state.libraryResult;
+  if (!L) return;
+  for (const [what, path] of [
+    ["lib_precursors", L.precursors],
+    ["lib_fragments", L.fragments],
+  ]) {
+    state.picks[what] = path;
+    const el = $(LABEL[what]);
+    el.textContent = path;
+    el.title = path;
+    el.classList.add("set");
+  }
+  setMode("library");
+  banner($("start-error"), "");
+  screen("input");
+}
+
+// The `rt_im_train.library_irt` the library.json beside a precursor table names, or null
+// for a table no `build-library` wrote.
+async function libraryIrtOf(precursors) {
+  if (!precursors) return null;
+  try {
+    const info = await invoke("library_info", { precursors });
+    return info?.reuse?.library_irt || null;
+  } catch {
+    return null;
+  }
+}
+
+async function copyLibrary() {
+  const L = state.libraryResult;
+  if (!L) return;
+  banner($("lib-error"), "");
+  banner($("lib-copied"), "");
+  const dest = await dialog.open({ directory: true, multiple: false });
+  if (!dest) return;
+  const btn = $("lib-copy");
+  btn.disabled = true;
+  btn.textContent = "Copying…";
+  try {
+    const [precursors] = await invoke("copy_library", {
+      precursors: L.precursors,
+      fragments: L.fragments,
+      dest,
+    });
+    banner($("lib-copied"), `Copied to ${dirOf(precursors)}.`);
+  } catch (e) {
+    banner($("lib-error"), String(e));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Copy to folder…";
+  }
 }
 
 // Start is asynchronous with several awaits before the run exists (library build,
@@ -2482,10 +2848,16 @@ async function startSearch() {
     screen("input");
     return;
   }
+  // A library this application built from a FASTA (`build-library`) is searched with the
+  // `rt_im_train.library_irt` its library.json names, so its retention times are handled
+  // as the FASTA search would have handled them.
+  const libraryIrt =
+    state.mode === "library" ? await libraryIrtOf(p.lib_precursors) : null;
   const overrides = {
     ...(state.mode === "fasta" && !built ? digestOverrides() : {}),
     ...prescreenOverrides(),
     ...bandOverrides(bands),
+    ...(libraryIrt ? { "rt_im_train.library_irt": libraryIrt } : {}),
   };
   if (Object.keys(overrides).length) {
     try {
@@ -2615,7 +2987,11 @@ async function poll() {
     $("stop").textContent = "Stop";
     if (s.status === "done") {
       $("nav-results").disabled = false;
-      renderResults(s);
+      if (s.build_library) {
+        renderLibraryResult(libraryOfBuild(s));
+      } else {
+        renderResults(s);
+      }
       screen("results");
     }
   }
@@ -2718,8 +3094,10 @@ function render(s) {
     ? [...(active.stages || []), ...(s.root_stages || [])]
     : s.stages;
   const seen = new Map(perFile.map((x) => [x.name, x]));
-  const expected = STAGES_FASTA.filter(
-    ([key]) => !(s.library_mode && SKIP_IN_LIBRARY_MODE.has(key))
+  const expected = STAGES_FASTA.filter(([key]) =>
+    s.build_library
+      ? LIBRARY_BUILD_STAGES.has(key)
+      : !(s.library_mode && SKIP_IN_LIBRARY_MODE.has(key))
   );
 
   // The furthest stage with a report is the one in progress; everything before it
@@ -2761,13 +3139,21 @@ function render(s) {
   });
   $("stages").innerHTML = rows.join("");
 
-  const titles = {
-    starting: "Starting",
-    running: "Searching",
-    done: "Finished",
-    failed: "Search failed",
-    cancelled: "Search stopped",
-  };
+  const titles = s.build_library
+    ? {
+        starting: "Starting",
+        running: "Building the library",
+        done: "Library built",
+        failed: "Library build failed",
+        cancelled: "Library build stopped",
+      }
+    : {
+        starting: "Starting",
+        running: "Searching",
+        done: "Finished",
+        failed: "Search failed",
+        cancelled: "Search stopped",
+      };
   $("prog-title").textContent = titles[s.status] || s.status;
   // Stop was pressed but the engine has not been reaped yet: the status stays
   // `running` until the waiter publishes the outcome, and the title says so.
@@ -2841,6 +3227,8 @@ function degradedMessage(r) {
 function renderResults(s) {
   // The per-file breakdown belongs to a batch; a single run shows its own counts.
   show($("res-batch-card"), false);
+  show($("res-library-card"), false);
+  show($("open-visdia"), true);
   show($("kpis"), true);
   const r = s.results;
   $("res-title").textContent = "Finished";
