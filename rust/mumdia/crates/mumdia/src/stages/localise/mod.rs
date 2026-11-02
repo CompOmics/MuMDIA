@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use mumdia_core::config::{LocaliseConfig, ResidueMod};
+use mumdia_core::config::{LocaliseConfig, ModPosition, ResidueMod};
 use mumdia_core::mass::parse_peptidoform;
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
@@ -60,8 +60,12 @@ pub struct LocaliseParams<'a> {
     pub source: Option<u32>,
     pub out: &'a str,
     pub cfg: &'a LocaliseConfig,
-    /// `peptidoforms.variable_mods`, which give the candidate residues of a modification.
+    /// `peptidoforms.variable_mods`, which give the candidate residues of a modification
+    /// (its residue rules) and whether it may sit on the N-terminus (its terminal rules).
     pub variable_mods: &'a [ResidueMod],
+    /// The search's FASTA, if any: which peptides start a protein, for a modification whose
+    /// N-terminal rule is `protein_n_term`.
+    pub fasta: Option<&'a str>,
     /// The fragment tolerance when no mass calibration is given (`extract.frag_tol_ppm`).
     pub fallback_tol_ppm: f64,
     pub config_hash: &'a str,
@@ -86,6 +90,44 @@ mod status {
     pub const NOT_ATTEMPTED_Q: &str = "not_attempted_q";
     pub const TOO_MANY: &str = "too_many_hypotheses";
     pub const NO_SPECTRA: &str = "no_spectra";
+}
+
+/// Where a localised modification may sit on the N-terminal amine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NTerm {
+    /// Never: the modification has no N-terminal rule.
+    No,
+    /// On every peptide (a `peptide_n_term` rule).
+    Any,
+    /// On a peptide that starts a protein (a `protein_n_term` rule; or, for a modification
+    /// without any rule, as on an imported library, the N-terminal sites the table carries):
+    /// a peptide some row of the table carries the modification on the N-terminus of, or a
+    /// target that starts a protein of the FASTA, at its first residue or after the initiator
+    /// methionine. A decoy follows its target through the shared base peptide.
+    ProteinStart,
+}
+
+impl NTerm {
+    fn name(self) -> &'static str {
+        match self {
+            NTerm::No => "none",
+            NTerm::Any => "peptide_n_term",
+            NTerm::ProteinStart => "protein_n_term",
+        }
+    }
+}
+
+/// The candidate slots of one localised modification.
+struct ModRules {
+    /// The residues of its residue rules (`position` `anywhere`), upper case, ascending.
+    residues: Vec<u8>,
+    n_term: NTerm,
+}
+
+/// Whether `pep` starts protein `seq`: at its first residue, or after the initiator
+/// methionine.
+fn starts_protein(seq: &[u8], pep: &[u8]) -> bool {
+    seq.starts_with(pep) || (seq.first() == Some(&b'M') && seq[1..].starts_with(pep))
 }
 
 /// One scored row that carries a localised modification.
@@ -227,36 +269,98 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
         .collect();
     drop(pform);
 
-    // Candidate residues per modification: the configured variable modifications, else the
-    // residues the scored table carries it on.
-    let candidates: Vec<Vec<u8>> = cfg
+    // Candidate slots per modification: the residues of its residue rules and the N-terminus
+    // where a terminal rule puts it, from the configured variable modifications; without any
+    // rule for it (an imported library), the residues and the N-terminus the scored table
+    // carries it on. A terminal rule's residue `*` is not a residue.
+    let rules: Vec<ModRules> = cfg
         .mods
         .iter()
         .enumerate()
         .map(|(mi, name)| {
-            let mut set: BTreeSet<u8> = p
-                .variable_mods
+            let own: Vec<&ResidueMod> =
+                p.variable_mods.iter().filter(|v| &v.name == name).collect();
+            if own.is_empty() {
+                let mut set: BTreeSet<u8> = BTreeSet::new();
+                let mut n_term = false;
+                for r in rows.iter().filter(|r| r.modi == mi) {
+                    for &s in &r.split.sites {
+                        match r.split.residue_at(s) {
+                            Some(c) => {
+                                set.insert(c);
+                            }
+                            None => n_term = true,
+                        }
+                    }
+                }
+                return ModRules {
+                    residues: set.into_iter().collect(),
+                    n_term: if n_term {
+                        NTerm::ProteinStart
+                    } else {
+                        NTerm::No
+                    },
+                };
+            }
+            let residues: BTreeSet<u8> = own
                 .iter()
-                .filter(|v| &v.name == name)
+                .filter(|v| v.position.is_anywhere())
                 .filter_map(|v| u8::try_from(v.residue).ok())
                 .map(|c| c.to_ascii_uppercase())
                 .collect();
-            if set.is_empty() {
-                for r in rows.iter().filter(|r| r.modi == mi) {
-                    for &s in &r.split.sites {
-                        set.insert(r.split.residues[s]);
-                    }
-                }
+            let n_term = if own.iter().any(|v| v.position == ModPosition::PeptideNTerm) {
+                NTerm::Any
+            } else if own.iter().any(|v| v.position == ModPosition::ProteinNTerm) {
+                NTerm::ProteinStart
+            } else {
+                NTerm::No
+            };
+            ModRules {
+                residues: residues.into_iter().collect(),
+                n_term,
             }
-            set.into_iter().collect()
         })
         .collect();
-    let decoy_residue: Vec<Option<u8>> = candidates
+    // The peptides (modification, base peptide) whose N-terminus a `ProteinStart`
+    // modification may sit on.
+    let mut n_term_peptides: BTreeSet<(usize, u32)> = rows
+        .iter()
+        .filter(|r| r.split.sites.contains(&r.split.n_term_slot()))
+        .map(|r| (r.modi, r.base_peptide_id))
+        .collect();
+    if let Some(fasta) = p.fasta {
+        if rules.iter().any(|m| m.n_term == NTerm::ProteinStart) {
+            let proteins: std::collections::HashMap<String, String> =
+                crate::stages::digest::read_fasta(fasta)
+                    .with_context(|| format!("localise: reading {fasta}"))?
+                    .into_iter()
+                    .collect();
+            for r in rows
+                .iter()
+                .filter(|r| !r.decoy && rules[r.modi].n_term == NTerm::ProteinStart)
+            {
+                let starts = r.protein.split(';').any(|acc| {
+                    proteins
+                        .get(acc)
+                        .is_some_and(|seq| starts_protein(seq.as_bytes(), &r.split.residues))
+                });
+                if starts {
+                    n_term_peptides.insert((r.modi, r.base_peptide_id));
+                }
+            }
+        }
+    }
+    let n_term_ok = |r: &Row| match rules[r.modi].n_term {
+        NTerm::No => false,
+        NTerm::Any => true,
+        NTerm::ProteinStart => n_term_peptides.contains(&(r.modi, r.base_peptide_id)),
+    };
+    let decoy_residue: Vec<Option<u8>> = rules
         .iter()
         .zip(&cfg.mods)
-        .map(|(c, name)| {
+        .map(|(m, name)| {
             let d = cfg.decoy_residue.as_bytes().first().copied()?;
-            if c.contains(&d) {
+            if m.residues.contains(&d) {
                 warn!(
                     modification = %name,
                     residue = %(d as char),
@@ -341,11 +445,16 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
         .map(|pk| {
             let r = &rows[pk.rep];
             let dec = decoy_residue[r.modi];
-            let positions = hypotheses::candidate_positions(&r.split, &candidates[r.modi], dec);
+            let positions = hypotheses::candidate_positions(
+                &r.split,
+                &rules[r.modi].residues,
+                dec,
+                n_term_ok(r),
+            );
             let k = r.split.sites.len();
             let n_decoy_positions = positions
                 .iter()
-                .filter(|&&i| Some(r.split.residues[i]) == dec)
+                .filter(|&&i| r.split.is_decoy_slot(i, dec))
                 .count();
             match hypotheses::enumerate(&positions, k, cfg.max_hypotheses) {
                 None => PeakResult {
@@ -357,7 +466,7 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
                 Some(hyps) => {
                     let on_decoy: Vec<bool> = hyps
                         .iter()
-                        .map(|h| h.iter().any(|&i| Some(r.split.residues[i]) == dec))
+                        .map(|h| h.iter().any(|&i| r.split.is_decoy_slot(i, dec)))
                         .collect();
                     let n_real = on_decoy.iter().filter(|&&d| !d).count();
                     PeakResult {
@@ -379,7 +488,7 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
             let rep = &rows[peaks[pi].rep];
             res.status = status::UNAMBIGUOUS;
             let real = res.on_decoy.iter().position(|&d| !d);
-            let mut sp = vec![0.0; rep.split.residues.len()];
+            let mut sp = vec![0.0; rep.split.n_slots()];
             let mut post = vec![0.0; res.hyps.len()];
             if let Some(h) = real {
                 post[h] = 1.0;
@@ -516,7 +625,7 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
                 let ll = model::loglik(res.hyps.len(), &obs, &d, &f);
                 let post = model::posterior(&ll, cfg.temperature);
                 let rep = &rows[peaks[pi].rep];
-                let sp = model::site_probabilities(rep.split.residues.len(), &res.hyps, &post);
+                let sp = model::site_probabilities(rep.split.n_slots(), &res.hyps, &post);
                 let b = model::best(&res.hyps, &post);
                 let min_sp = res.hyps[b]
                     .iter()
@@ -848,10 +957,12 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
             "psms_extracted": p.psms_extracted,
             "source": wanted_source,
             "mods": cfg.mods,
-            "candidate_residues": candidates
+            "candidate_residues": rules
                 .iter()
-                .map(|c| String::from_utf8_lossy(c).into_owned())
+                .map(|m| String::from_utf8_lossy(&m.residues).into_owned())
                 .collect::<Vec<_>>(),
+            "n_term": rules.iter().map(|m| m.n_term.name()).collect::<Vec<_>>(),
+            "fasta": p.fasta,
             "decoy_residue": cfg.decoy_residue,
             "threshold": cfg.threshold,
             "q_max": cfg.q_max,
@@ -900,12 +1011,12 @@ fn peak_of(rows: &[Row], members: Vec<usize>) -> Peak {
     Peak { rows: members, rep }
 }
 
-/// `S3:0.9120;T5:0.0710;A6:0.0170`: every candidate position (1-based) with its site
-/// probability.
+/// `S3:0.9120;T5:0.0710;A6:0.0170`: every candidate slot (a residue and its 1-based position,
+/// or `N-term`) with its site probability.
 fn site_string(s: &Split, positions: &[usize], sp: &[f64]) -> String {
     positions
         .iter()
-        .map(|&i| format!("{}{}:{:.4}", s.residues[i] as char, i + 1, sp[i]))
+        .map(|&i| format!("{}:{:.4}", s.slot_label(i), sp[i]))
         .collect::<Vec<_>>()
         .join(";")
 }

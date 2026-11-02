@@ -255,6 +255,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **Site localisation treats an N-terminal rule as a placement on the N-terminus.** For a
+  modification in `localise.mods` with an N-terminal rule (`position`
+  `peptide_n_term` or `protein_n_term`, residue `*`), the stage counted `*` among the candidate
+  residues and placed the modification on residues only: the N-terminally modified rows were
+  left out of `localisation.parquet`, and their residue isomers were localised as if the
+  N-terminus were no option. The N-terminus is now a placement of its own, on every peptide
+  for `peptide_n_term` and, for `protein_n_term`, on a peptide whose N-terminal form is among
+  the scored rows or that starts a protein of the search's FASTA (`run` and `run-experiment`
+  pass theirs, `mumdia localise --fasta`), so Acetyl with a protein N-terminal and a K rule is
+  localised between the two. While the N-terminus is open the decoy residue in first
+  position, whose fragments equal those of the N-terminal placement, is not scored.
+  `site_probabilities` names the slot `N-term` and `sites.tsv` lists it as residue `N-term`
+  at the peptide's first residue. Without a terminal rule for a localised modification the
+  localisation table is unchanged (docs/36_ptm_localisation.md).
 - **The library helpers read an N-terminal group as a terminal group.** Each misread
   `[Acetyl]-PEPK` silently: `make_reverse_decoys.py` took the "A" of "Acetyl" for an alanine,
   so the decoy gained a residue and lost the acetyl; `deeplc_finetune.py` and

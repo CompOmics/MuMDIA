@@ -39,14 +39,24 @@ consulted.
    isomers of a peak share one localisation, computed on its representative (the highest
    score). Isomers further apart are separate peaks, each localised on its own.
 3. **Hypotheses.** Every placement of the representative's count of the modification on its
-   candidate residues, in lexicographic order (`hypotheses::enumerate`). The candidate residues
-   are those `peptidoforms.variable_mods` gives the modification, or, without such an entry (an
-   imported library), the residues it is found on in the scored table. Other modifications stay
-   where the identification put them, and a residue that carries one is not a candidate.
-   Placements on the decoy residue (`localise.decoy_residue`, default `A`) are added; they are
-   never searched. A peptide with more than `localise.max_hypotheses` (200) placements is not
-   localised. A peptide with a single real placement is `unambiguous`: its site is fixed by the
-   sequence.
+   candidate slots, in lexicographic order (`hypotheses::enumerate`). A slot is a residue or
+   the N-terminal amine, which is a placement of its own and not the first residue's side
+   chain. The candidate residues are those of the modification's residue rules in
+   `peptidoforms.variable_mods` (`position` `anywhere`); a terminal rule (residue `*`) opens the
+   N-terminal slot instead: on every peptide for `peptide_n_term`, and for `protein_n_term` on a
+   peptide whose N-terminal form is among the scored rows or that starts a protein of the
+   search's FASTA, at its first residue or after the initiator methionine (a decoy follows its
+   target through the shared base peptide). Without any rule for the modification (an imported
+   library), the candidates are the residues it is found on in the scored table, and the
+   N-terminus on the peptides the table carries it there. Acetyl with a protein N-terminal and
+   a K rule is thus localised between the N-terminus and the lysines. Other modifications stay
+   where the identification put them, and a residue or N-terminus that carries one is not a
+   candidate. Placements on the decoy residue (`localise.decoy_residue`, default `A`) are
+   added; they are never searched. While the N-terminal slot is open the decoy residue in first
+   position is not: a modification there and one on the N-terminus give the same b and y
+   ladder, so that decoy could never lose. A peptide with more than `localise.max_hypotheses`
+   (200) placements is not localised. A peptide with a single real placement is
+   `unambiguous`: its site is fixed by the sequence.
 4. **Ions.** For every hypothesis, the b1 to b(n-1) and y1 to y(n-1) ions at fragment charge 1,
    and 2 for precursors of charge 3 or more (`ions::build`). One ion is one distinct m/z over all
    hypotheses (1e-4 Th), with the set of hypotheses that predict it. An ion every hypothesis
@@ -126,7 +136,7 @@ carries a localised modification, in scored-table order:
 | `is_peak_representative` | bool | the row the peak was localised on; count peaks on it |
 | `n_hypotheses` | u32 | placements scored, decoy residue included |
 | `best_site_peptidoform` | utf8, nullable | the best placement, other modifications as on the representative |
-| `site_probabilities` | utf8, nullable | `S3:0.9120;T5:0.0710;A6:0.0170`: every candidate position (1-based) with its probability |
+| `site_probabilities` | utf8, nullable | `S3:0.9120;T5:0.0710;A6:0.0170`: every candidate slot (residue and 1-based position, or `N-term`) with its probability |
 | `min_site_prob` | f64, nullable | the smallest site probability of the best placement |
 | `peptidoform_probability` | f64, nullable | the posterior of the row's own placement |
 | `own_site_prob` | f64, nullable | the smallest site probability of the row's own sites |
@@ -143,8 +153,9 @@ the peak's localised best) and `best_site_peptidoform` to `peptides.tsv`. In an 
 three cells come from the run of the row the precursor is reported on, its experiment-wide
 winner; experiment-level combination of the runs is not done. `sites.tsv` lists every site of
 a localised target peak representative: protein, protein position (from the FASTA of a FASTA
-run, or `mumdia report --fasta`; empty when the FASTA does not hold the peptide), residue,
-modification, peptide, peptide position, the best site probability over the runs, the false
+run, or `mumdia report --fasta`; empty when the FASTA does not hold the peptide), residue
+(`N-term` for the N-terminal slot, numbered at the peptide's first residue), modification,
+peptide, peptide position, the best site probability over the runs, the false
 localisation rates at it, the best placement and the number of runs it was localised in. The
 experiment manifest records the per-run tables under `localisation` and the file under `sites`.
 
@@ -172,8 +183,10 @@ mumdia localise --psms-scored exp/r0/scored.parquet --source 0 \
   --out exp/r0/localisation.parquet --config search.json
 ```
 
-The configuration matters for the candidate residues (`peptidoforms.variable_mods`) and the
-fallback fragment tolerance. Cost: under one second and about 1 GB per diaPASEF run of the
+The configuration matters for the candidate residues and terminal rules
+(`peptidoforms.variable_mods`) and the fallback fragment tolerance; `--fasta` tells a
+`protein_n_term` modification which peptides start a protein (`run` and `run-experiment` pass
+the search's FASTA). Cost: under one second and about 1 GB per diaPASEF run of the
 Arabidopsis set (146,690 MS2 scans, 64.5M peaks), most of it decoding the spectra.
 
 ## 7. Validation
@@ -313,8 +326,10 @@ population, not a fault.
   experiment report takes each precursor's cells from its winning run.
 - No neutral-loss ions. The impossible-variant rate absorbs part of their effect on the
   site-determining ions; scoring them would add evidence.
-- Terminal modifications are not localised (the hypotheses place the modification on residues
-  only); a modification carried on a residue together with another is not localised.
+- C-terminal modifications are not localised (the search refuses C-terminal rules); a
+  modification carried on a residue or the N-terminus together with another is not localised.
+  A modification on the N-terminus and the same one on the first residue give the same
+  fragments, so the stage reports them as ambiguous rather than choosing.
 - Several localised modifications in one peptide: only the first of `localise.mods` it carries
   is localised.
 - Separated isomers are localised independently; a placement claimed by one peak is not removed

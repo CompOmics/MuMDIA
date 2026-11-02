@@ -380,6 +380,11 @@ enum Cmd {
         /// Keep only the rows of this source; required when the table holds several runs.
         #[arg(long)]
         source: Option<u32>,
+        /// The search's FASTA: which peptides start a protein, for a modification whose
+        /// N-terminal rule is protein_n_term. Without it a peptide's N-terminus is a
+        /// placement only when the table carries the modification there.
+        #[arg(long)]
+        fasta: Option<String>,
         #[arg(long)]
         out: String,
         #[arg(long)]
@@ -1923,6 +1928,7 @@ fn real_main() -> Result<()> {
             mass_cal,
             psms_extracted,
             source,
+            fasta,
             out,
             config,
         } => {
@@ -1937,6 +1943,7 @@ fn real_main() -> Result<()> {
                 out: &out,
                 cfg: &cfg.localise,
                 variable_mods: &cfg.peptidoforms.variable_mods,
+                fasta: fasta.as_deref(),
                 fallback_tol_ppm: cfg.extract.frag_tol_ppm,
                 config_hash: &ch,
             })?;
