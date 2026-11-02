@@ -44,9 +44,9 @@ shape the v2 spectra artifact stores (`im`), added when a stage reads it.
 
 ## Inputs and outputs
 
-Input: one mzML file path (`--mzml`). `mzdata` is pinned at version `0.65` with
+Input: one mzML file path (`--mzml`). `mzdata` is pinned at version `0.68` with
 `default-features = false, features = ["mzml", "miniz_oxide"]`
-(`rust/mumdia/Cargo.toml:26`), so only mzML is compiled in; `miniz_oxide` gives
+(`rust/mumdia/Cargo.toml:43`), so only mzML is compiled in; `miniz_oxide` gives
 pure-Rust gzip for compressed mzML. No other input is read. The stage takes no
 config file (see Configuration).
 
