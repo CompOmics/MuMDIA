@@ -53,22 +53,22 @@ Licence identifiers by crate count:
 | `anstyle-wincon` | 3.0.11 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
 | `anyhow` | 1.0.104 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/anyhow](https://github.com/dtolnay/anyhow) |
 | `arrayvec` | 0.7.7 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/bluss/arrayvec](https://github.com/bluss/arrayvec) |
-| `arrow` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-arith` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-array` | 60.0.0 | Apache-2.0 AND MIT | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-buffer` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-cast` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-cmp` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-csv` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-data` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-ipc` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-json` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-ord` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-row` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-schema` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-select` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `arrow-string` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
-| `atoi` | 3.1.0 | MIT | - | [https://github.com/pacman82/atoi-rs](https://github.com/pacman82/atoi-rs) |
+| `arrow` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-arith` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-array` | 60.1.0 | Apache-2.0 AND MIT | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-buffer` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-cast` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-cmp` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-csv` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-data` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-ipc` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-json` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-ord` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-row` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-schema` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-select` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `arrow-string` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `atoi` | 3.1.1 | MIT | - | [https://github.com/pacman82/atoi-rs](https://github.com/pacman82/atoi-rs) |
 | `autocfg` | 1.5.1 | Apache-2.0 OR MIT | `Apache-2.0` | [https://github.com/cuviper/autocfg](https://github.com/cuviper/autocfg) |
 | `base64` | 0.23.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/marshallpierce/rust-base64](https://github.com/marshallpierce/rust-base64) |
 | `base64-simd` | 0.8.0 | MIT | - | [https://github.com/Nugine/simd](https://github.com/Nugine/simd) |
@@ -151,11 +151,11 @@ Licence identifiers by crate count:
 | `memmap2` | 0.9.11 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RazrFalcon/memmap2-rs](https://github.com/RazrFalcon/memmap2-rs) |
 | `mimalloc` | 0.1.52 | MIT | - | [https://github.com/purpleprotocol/mimalloc_rust](https://github.com/purpleprotocol/mimalloc_rust) |
 | `miniz_oxide` | 0.8.9 | MIT OR Zlib OR Apache-2.0 | `Apache-2.0` | [https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide) |
-| `mzdata` | 0.67.4 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
-| `mzdata-bindata` | 0.67.4 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
-| `mzdata-meta` | 0.67.4 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
-| `mzdata-param` | 0.67.4 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
-| `mzdata-spectrum` | 0.67.4 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata` | 0.68.0 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata-bindata` | 0.68.0 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata-meta` | 0.68.0 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata-param` | 0.68.0 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
+| `mzdata-spectrum` | 0.68.0 | Apache-2.0 | - | [https://github.com/mobiusklein/mzdata](https://github.com/mobiusklein/mzdata) |
 | `mzpeaks` | 1.0.9 | Apache-2.0 | - | [https://github.com/mobiusklein/mzpeaks](https://github.com/mobiusklein/mzpeaks) |
 | `nu-ansi-term` | 0.50.3 | MIT | - | [https://github.com/nushell/nu-ansi-term](https://github.com/nushell/nu-ansi-term) |
 | `num-bigint` | 0.5.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-num/num-bigint](https://github.com/rust-num/num-bigint) |
@@ -165,7 +165,7 @@ Licence identifiers by crate count:
 | `once_cell` | 1.21.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/matklad/once_cell](https://github.com/matklad/once_cell) |
 | `once_cell_polyfill` | 1.70.2 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/polyfill-rs/once_cell_polyfill](https://github.com/polyfill-rs/once_cell_polyfill) |
 | `outref` | 0.5.2 | MIT | - | [https://github.com/Nugine/outref](https://github.com/Nugine/outref) |
-| `parquet` | 60.0.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
+| `parquet` | 60.1.0 | Apache-2.0 | - | [https://github.com/apache/arrow-rs](https://github.com/apache/arrow-rs) |
 | `phf` | 0.14.0 | MIT | - | [https://github.com/rust-phf/rust-phf](https://github.com/rust-phf/rust-phf) |
 | `phf_generator` | 0.14.0 | MIT | - | [https://github.com/rust-phf/rust-phf](https://github.com/rust-phf/rust-phf) |
 | `phf_macros` | 0.14.0 | MIT | - | [https://github.com/rust-phf/rust-phf](https://github.com/rust-phf/rust-phf) |
@@ -191,7 +191,7 @@ Licence identifiers by crate count:
 | `serde` | 1.0.229 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
 | `serde_core` | 1.0.229 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
 | `serde_derive` | 1.0.229 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
-| `serde_json` | 1.0.151 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/json](https://github.com/serde-rs/json) |
+| `serde_json` | 1.0.154 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/serde-rs/json](https://github.com/serde-rs/json) |
 | `sha1` | 0.11.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
 | `sharded-slab` | 0.1.7 | MIT | - | [https://github.com/hawkw/sharded-slab](https://github.com/hawkw/sharded-slab) |
 | `shlex` | 2.0.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/comex/rust-shlex](https://github.com/comex/rust-shlex) |
@@ -404,11 +404,11 @@ Notices recovered for 149 of 208 crates (the remainder ship no copyright line in
 
 - Copyright (c) Ulrik Sverdrup "bluss" 2015-2023
 
-**arrow-array 60.0.0**
+**arrow-array 60.1.0**
 
 - Copyright (c) 2020-2022 Oliver Margetts
 
-**atoi 3.1.0**
+**atoi 3.1.1**
 
 - Copyright (c) 2017
 
@@ -1013,9 +1013,9 @@ Notices recovered for 149 of 208 crates (the remainder ship no copyright line in
 
 Apache-2.0 section 4(d) requires these to travel with the distribution.
 
-#### arrow 60.0.0, and 15 more
+#### arrow 60.1.0, and 15 more
 
-Shared by: `arrow 60.0.0`, `arrow-arith 60.0.0`, `arrow-array 60.0.0`, `arrow-buffer 60.0.0`, `arrow-cast 60.0.0`, `arrow-cmp 60.0.0`, `arrow-csv 60.0.0`, `arrow-data 60.0.0`, `arrow-ipc 60.0.0`, `arrow-json 60.0.0`, `arrow-ord 60.0.0`, `arrow-row 60.0.0`, `arrow-schema 60.0.0`, `arrow-select 60.0.0`, `arrow-string 60.0.0`, `parquet 60.0.0`.
+Shared by: `arrow 60.1.0`, `arrow-arith 60.1.0`, `arrow-array 60.1.0`, `arrow-buffer 60.1.0`, `arrow-cast 60.1.0`, `arrow-cmp 60.1.0`, `arrow-csv 60.1.0`, `arrow-data 60.1.0`, `arrow-ipc 60.1.0`, `arrow-json 60.1.0`, `arrow-ord 60.1.0`, `arrow-row 60.1.0`, `arrow-schema 60.1.0`, `arrow-select 60.1.0`, `arrow-string 60.1.0`, `parquet 60.1.0`.
 
 ```text
 Apache Arrow
