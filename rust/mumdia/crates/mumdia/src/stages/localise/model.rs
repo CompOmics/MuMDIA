@@ -115,6 +115,47 @@ pub(crate) fn best(hyps: &[Vec<usize>], post: &[f64]) -> usize {
     b
 }
 
+/// What a set of log-likelihoods calls at a temperature.
+pub(crate) struct Call {
+    pub best: usize,
+    /// The smallest site probability of the best hypothesis.
+    pub min_site_prob: f64,
+    pub post: Vec<f64>,
+    /// Per slot.
+    pub site_prob: Vec<f64>,
+}
+
+/// The posterior of `ll` at `temperature` over `hyps` (a peptide of `n_slots` slots), its best
+/// hypothesis and that hypothesis's smallest site probability.
+pub(crate) fn call(ll: &[f64], hyps: &[Vec<usize>], n_slots: usize, temperature: f64) -> Call {
+    let post = posterior(ll, temperature);
+    let site_prob = site_probabilities(n_slots, hyps, &post);
+    let b = best(hyps, &post);
+    let min_site_prob = hyps[b]
+        .iter()
+        .map(|&i| site_prob[i])
+        .fold(f64::INFINITY, f64::min);
+    Call {
+        best: b,
+        min_site_prob,
+        post,
+        site_prob,
+    }
+}
+
+/// The best hypothesis's log-likelihood less the runner-up's (0 with a single hypothesis).
+pub(crate) fn delta_loglik(ll: &[f64], best: usize) -> f64 {
+    let runner_up = (0..ll.len())
+        .filter(|&h| h != best)
+        .map(|h| ll[h])
+        .fold(f64::NEG_INFINITY, f64::max);
+    if runner_up.is_finite() {
+        ll[best] - runner_up
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

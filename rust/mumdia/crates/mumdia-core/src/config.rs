@@ -4113,7 +4113,8 @@ impl RetraceConfig {
 /// residues, reads the site-determining fragment ions back from the MS2 spectra at the
 /// identification apex, and turns their presence into a posterior over the placements and a
 /// probability per site. It is reporting only: identifications, q-values and every other
-/// artifact are unchanged, and it adds `localisation.parquet`, three columns of
+/// artifact are unchanged, and it adds `localisation.parquet` (per run),
+/// `localisation_experiment.parquet` (the runs of an experiment combined), columns of
 /// `peptides.tsv` and `sites.tsv`. Experimental and opt-in; every key is omitted from the
 /// canonical configuration at its default, and the whole section with them, so a
 /// configuration that does not set it keeps its config hash.
@@ -4135,7 +4136,10 @@ pub struct LocaliseConfig {
     #[serde(skip_serializing_if = "is_default_localise_mods")]
     pub mods: Vec<String>,
     /// Site probability at or above which a site counts as localised: every site of the best
-    /// placement must reach it. Default 0.75.
+    /// placement must reach it. Default 0.9: with the fitted temperature and elution-bounds
+    /// peaks, 0.75 left 7.2% to 11.6% of the calls on the synthetic phosphopeptides wrong and a
+    /// decoy-residue rate of 9.8% on the Arabidopsis experiment, 0.9 3.6% to 7.4% and 3.3%
+    /// (docs/36_ptm_localisation.md section 7).
     #[serde(skip_serializing_if = "is_default_localise_threshold")]
     pub threshold: f64,
     /// The decoy residue: placements on it are scored alongside the real ones but never
@@ -4152,11 +4156,29 @@ pub struct LocaliseConfig {
     /// `too_many_hypotheses`). Default 200.
     #[serde(skip_serializing_if = "is_default_localise_max_hypotheses")]
     pub max_hypotheses: usize,
-    /// Accepted isomers whose apexes lie within this many seconds of a peak's first apex share
-    /// that peak and one localisation; isomers further apart are separate peaks, each
-    /// localised on its own. Default 5.0.
+    /// How the accepted isomers of an isomer group and charge are cut into chromatographic
+    /// peaks, the isomers of one peak sharing one localisation. `elution_bounds`: two isomers
+    /// next to each other in apex order are on one peak when the apex of either lies inside
+    /// the other's elution bounds (`elution_lo` to `elution_hi` of the scored row) and the
+    /// summed profile of the fragments the two placements share has no valley between the two
+    /// apexes deeper than `peak_valley_ratio` of the lower apex. `apex_tolerance`: an isomer
+    /// joins a peak when its apex lies within `peak_rt_tol_s` of the peak's first apex (the
+    /// rule of the first version). A scored table without elution bounds is cut by
+    /// `apex_tolerance`. Default `elution_bounds`: on the synthetic phosphopeptides it cut 63%
+    /// fewer single-isomer sequences into two peaks than the 5 s rule while keeping 84 of its 86
+    /// pairs of peaks localised to different sites (docs/36_ptm_localisation.md section 7).
+    #[serde(skip_serializing_if = "is_default_localise_peak_rule")]
+    pub peak_rule: LocalisePeakRule,
+    /// `peak_rule = "apex_tolerance"`: isomers whose apexes lie within this many seconds of a
+    /// peak's first apex share that peak. Default 5.0.
     #[serde(skip_serializing_if = "is_default_localise_peak_rt_tol")]
     pub peak_rt_tol_s: f64,
+    /// `peak_rule = "elution_bounds"`: two isomers whose bounds overlap are separate peaks
+    /// when their shared-fragment profile falls between the two apexes below this fraction of
+    /// the lower apex (smoothed over three scans). 0 ignores the profile and cuts on the
+    /// bounds alone. Default 0.5.
+    #[serde(skip_serializing_if = "is_default_localise_peak_valley_ratio")]
+    pub peak_valley_ratio: f64,
     /// MS2 scans either side of the apex scan the fragment evidence is read from. Default 2.
     #[serde(skip_serializing_if = "is_default_localise_apex_scans")]
     pub apex_scans: usize,
@@ -4169,26 +4191,98 @@ pub struct LocaliseConfig {
     /// both validation sets (docs/36_ptm_localisation.md section 7).
     #[serde(skip_serializing_if = "is_default_localise_prior_strength")]
     pub prior_strength: f64,
-    /// Divisor of the log-likelihoods before the softmax. 1 is the likelihood as fitted;
-    /// above 1 flattens the posterior. Default 1.0.
+    /// Divisor of the log-likelihoods before the softmax: a number, or `"auto"` (also written
+    /// `0`), which fits it to the data. 1 is the likelihood as fitted; above 1 flattens the
+    /// posterior. `"auto"` chooses the temperature at which the model's expected wrong calls
+    /// match the decoy residue's estimate of them at 0.75, over the quarter of the run's (in
+    /// `run-experiment`, the pooled runs') peaks with a choice of site that see the largest
+    /// share of their site-determining ions, pulled towards 1 by a prior so that few
+    /// decoy-residue wins leave it near 1 (docs/36_ptm_localisation.md section 3); the fitted
+    /// value is in the report. Default `"auto"`.
+    #[serde(deserialize_with = "de_localise_temperature")]
     #[serde(skip_serializing_if = "is_default_localise_temperature")]
     pub temperature: f64,
+    /// Neutral-loss ions as evidence: for Phospho, the loss of phosphoric acid (97.9769 Da)
+    /// from every b and y ion that carries a phosphoserine or -threonine (and the decoy
+    /// residue, which stands in for them), scored as four ion classes of their own with
+    /// their own detection and false-presence rates. Other modifications have no neutral
+    /// loss. Default false: on the synthetic phosphopeptides it localised no more peaks at a
+    /// given true false localisation rate (docs/36_ptm_localisation.md section 7).
+    #[serde(skip_serializing_if = "is_default_localise_neutral_loss")]
+    pub neutral_loss: bool,
+    /// `run-experiment`: combine the runs into one site probability per consensus peak,
+    /// summing the log-likelihoods of the runs whose peak of the same precursor matches it in
+    /// aligned retention time, and write `localisation_experiment.parquet` and the
+    /// experiment-level columns of `peptides.tsv` and `sites.tsv`. The per-run tables are
+    /// the same either way. Default true.
+    #[serde(skip_serializing_if = "is_default_localise_combine_runs")]
+    pub combine_runs: bool,
+    /// The temperature of the combined posterior: a number, or `"auto"` (also written `0`),
+    /// fitted on the consensus peaks as `temperature` is on the run peaks, with its prior
+    /// centred on the run temperature times the square root of the mean number of runs summed.
+    /// Above the run temperature it discounts the evidence of runs that repeat each other's
+    /// interferences. Default `"auto"`.
+    #[serde(deserialize_with = "de_localise_temperature")]
+    #[serde(skip_serializing_if = "is_default_localise_experiment_temperature")]
+    pub experiment_temperature: f64,
 }
 impl Default for LocaliseConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             mods: vec!["Phospho".to_string()],
-            threshold: 0.75,
+            threshold: 0.9,
             decoy_residue: "A".to_string(),
             q_max: 0.01,
             max_hypotheses: 200,
+            peak_rule: LocalisePeakRule::ElutionBounds,
             peak_rt_tol_s: 5.0,
+            peak_valley_ratio: 0.5,
             apex_scans: 2,
             im_half_width: 0.05,
             prior_strength: 64.0,
-            temperature: 1.0,
+            temperature: 0.0, // LOCALISE_TEMPERATURE_AUTO
+            neutral_loss: false,
+            combine_runs: true,
+            experiment_temperature: 0.0, // LOCALISE_TEMPERATURE_AUTO
         }
+    }
+}
+
+/// How the `localise` stage cuts accepted isomers into peaks ([`LocaliseConfig::peak_rule`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalisePeakRule {
+    /// Within `peak_rt_tol_s` of the peak's first apex.
+    ApexTolerance,
+    /// Inside each other's elution bounds, without a valley in the shared-fragment profile.
+    #[default]
+    ElutionBounds,
+}
+
+/// `localise.temperature = "auto"`, as stored.
+pub const LOCALISE_TEMPERATURE_AUTO: f64 = 0.0;
+
+/// `localise.temperature` and `localise.experiment_temperature`: a number, or `"auto"`,
+/// stored as `0` so the canonical configuration stays numeric.
+fn de_localise_temperature<'de, D>(d: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Temperature {
+        Value(f64),
+        Word(String),
+    }
+    match Temperature::deserialize(d)? {
+        Temperature::Value(v) => Ok(v),
+        Temperature::Word(w) if w.trim().eq_ignore_ascii_case("auto") => {
+            Ok(LOCALISE_TEMPERATURE_AUTO)
+        }
+        Temperature::Word(w) => Err(serde::de::Error::custom(format!(
+            "localise temperature must be a number or \"auto\" (got \"{w}\")"
+        ))),
     }
 }
 
@@ -4222,12 +4316,38 @@ fn is_default_localise_prior_strength(v: &f64) -> bool {
 fn is_default_localise_temperature(v: &f64) -> bool {
     *v == LocaliseConfig::default().temperature
 }
+fn is_default_localise_peak_rule(v: &LocalisePeakRule) -> bool {
+    *v == LocaliseConfig::default().peak_rule
+}
+fn is_default_localise_peak_valley_ratio(v: &f64) -> bool {
+    *v == LocaliseConfig::default().peak_valley_ratio
+}
+fn is_default_localise_neutral_loss(v: &bool) -> bool {
+    *v == LocaliseConfig::default().neutral_loss
+}
+fn is_default_localise_combine_runs(v: &bool) -> bool {
+    *v == LocaliseConfig::default().combine_runs
+}
+fn is_default_localise_experiment_temperature(v: &f64) -> bool {
+    *v == LocaliseConfig::default().experiment_temperature
+}
 
 impl LocaliseConfig {
     /// Whether every key is at its default, so the canonical configuration omits the
     /// section.
     pub fn is_default(&self) -> bool {
         *self == LocaliseConfig::default()
+    }
+
+    /// The run temperature when it is a number; `None` under `"auto"`.
+    pub fn fixed_temperature(&self) -> Option<f64> {
+        (self.temperature != LOCALISE_TEMPERATURE_AUTO).then_some(self.temperature)
+    }
+
+    /// The combined temperature when it is a number; `None` under `"auto"`.
+    pub fn fixed_experiment_temperature(&self) -> Option<f64> {
+        (self.experiment_temperature != LOCALISE_TEMPERATURE_AUTO)
+            .then_some(self.experiment_temperature)
     }
 }
 
@@ -5334,11 +5454,26 @@ impl Config {
         for (v, key) in [
             (l.peak_rt_tol_s, "localise.peak_rt_tol_s"),
             (l.im_half_width, "localise.im_half_width"),
-            (l.temperature, "localise.temperature"),
         ] {
             if !(v.is_finite() && v > 0.0) {
                 return Err(Invalid(format!("{key} must be finite and > 0 (got {v})")));
             }
+        }
+        for (v, key) in [
+            (l.temperature, "localise.temperature"),
+            (l.experiment_temperature, "localise.experiment_temperature"),
+        ] {
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(Invalid(format!(
+                    "{key} must be \"auto\" (0) or finite and > 0 (got {v})"
+                )));
+            }
+        }
+        if !(l.peak_valley_ratio.is_finite() && (0.0..1.0).contains(&l.peak_valley_ratio)) {
+            return Err(Invalid(format!(
+                "localise.peak_valley_ratio must be in [0, 1) (got {})",
+                l.peak_valley_ratio
+            )));
         }
         if !(l.prior_strength.is_finite() && l.prior_strength >= 0.0) {
             return Err(Invalid(format!(
@@ -6420,6 +6555,53 @@ mod tests {
         assert_eq!(explicit.canonical_json(), canon);
         let on = Config::from_json(r#"{"rt_im_train":{"anchor_x_filter":true}}"#).unwrap();
         assert!(on.canonical_json().contains(r#""anchor_x_filter":true"#));
+    }
+
+    /// The `localise` section is omitted from the canonical configuration while every key is
+    /// at its default; the temperatures take a number or `"auto"` (stored as 0); the new keys
+    /// parse and their out-of-range values are refused.
+    #[test]
+    fn localise_keys_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        assert!(d.localise.is_default());
+        let canon = d.canonical_json();
+        assert!(!canon.contains("localise"), "{canon}");
+        for explicit in [r#"{"localise":{}}"#, r#"{"localise":{"enabled":false}}"#] {
+            assert_eq!(
+                Config::from_json(explicit).unwrap().canonical_json(),
+                canon,
+                "{explicit}"
+            );
+        }
+        let auto = Config::from_json(
+            r#"{"localise":{"temperature":"auto","experiment_temperature":" AUTO "}}"#,
+        )
+        .unwrap();
+        assert_eq!(auto.localise.fixed_temperature(), None);
+        assert_eq!(auto.localise.fixed_experiment_temperature(), None);
+        let fixed =
+            Config::from_json(r#"{"localise":{"temperature":1.5,"experiment_temperature":2}}"#)
+                .unwrap();
+        assert_eq!(fixed.localise.fixed_temperature(), Some(1.5));
+        assert_eq!(fixed.localise.fixed_experiment_temperature(), Some(2.0));
+        let rules = Config::from_json(
+            r#"{"localise":{"peak_rule":"apex_tolerance","neutral_loss":true,"combine_runs":false,
+                "peak_valley_ratio":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(rules.localise.peak_rule, LocalisePeakRule::ApexTolerance);
+        assert!(rules.localise.neutral_loss && !rules.localise.combine_runs);
+        let eb = Config::from_json(r#"{"localise":{"peak_rule":"elution_bounds"}}"#).unwrap();
+        assert_eq!(eb.localise.peak_rule, LocalisePeakRule::ElutionBounds);
+        for bad in [
+            r#"{"localise":{"temperature":"warm"}}"#,
+            r#"{"localise":{"temperature":-1}}"#,
+            r#"{"localise":{"experiment_temperature":-0.5}}"#,
+            r#"{"localise":{"peak_valley_ratio":1.0}}"#,
+            r#"{"localise":{"peak_rule":"apex"}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+        }
     }
 
     /// The `retrace` section is omitted from the canonical configuration while every key is

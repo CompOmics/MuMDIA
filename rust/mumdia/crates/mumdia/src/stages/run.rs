@@ -938,6 +938,7 @@ pub fn run(p: RunParams) -> Result<()> {
     let sites_tsv = d("sites.tsv");
     let loc = localisation.as_ref().map(|_| report::Localisation {
         tables: &loc_tables,
+        experiment: None,
         fasta: p.fasta,
         out_sites: &sites_tsv,
     });

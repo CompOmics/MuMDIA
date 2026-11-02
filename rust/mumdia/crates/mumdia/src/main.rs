@@ -360,16 +360,18 @@ enum Cmd {
         config: Option<String>,
     },
     /// Site probabilities of a localised modification on one run's scored rows
-    /// (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. Reporting only:
-    /// nothing upstream changes.
+    /// (experimental; docs/36_ptm_localisation.md) -> localisation.parquet; with
+    /// --experiment-dir, on every run of a finished run-experiment at one temperature, and
+    /// the runs combined -> localisation_experiment.parquet. Reporting only: nothing upstream
+    /// changes.
     Localise {
         /// One run's scored table: a run's psms_scored.parquet, or a run's scored.parquet
         /// of a run-experiment.
-        #[arg(long)]
-        psms_scored: String,
+        #[arg(long, required_unless_present = "experiment_dir")]
+        psms_scored: Option<String>,
         /// That run's spectra_ms2.parquet.
-        #[arg(long)]
-        spectra_ms2: String,
+        #[arg(long, required_unless_present = "experiment_dir")]
+        spectra_ms2: Option<String>,
         /// The run's search-seed masscal.json (fragment mass offset and tolerance).
         #[arg(long)]
         mass_cal: Option<String>,
@@ -385,8 +387,24 @@ enum Cmd {
         /// placement only when the table carries the modification there.
         #[arg(long)]
         fasta: Option<String>,
-        #[arg(long)]
-        out: String,
+        #[arg(long, required_unless_present = "experiment_dir")]
+        out: Option<String>,
+        /// A finished run-experiment directory: localise each of its runs (the inputs named
+        /// by experiment_manifest.json and the run directories) and combine them. Written in
+        /// place, and recorded in the manifest for `mumdia report --experiment-dir`, unless
+        /// --out-dir is given.
+        #[arg(
+            long,
+            conflicts_with_all = ["psms_scored", "spectra_ms2", "mass_cal", "psms_extracted", "source", "out"]
+        )]
+        experiment_dir: Option<String>,
+        /// With --experiment-dir: write <run>/localisation.parquet and
+        /// localisation_experiment.parquet here instead, and leave the experiment untouched.
+        #[arg(long, requires = "experiment_dir")]
+        out_dir: Option<String>,
+        /// With --experiment-dir: only these sources (comma-separated run indices).
+        #[arg(long, requires = "experiment_dir", value_delimiter = ',')]
+        sources: Vec<u32>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -1623,6 +1641,137 @@ fn load_config(path: &Option<String>) -> Result<Config> {
     Ok(cfg)
 }
 
+/// `mumdia localise --experiment-dir`: the `localise` stage on the runs of a finished
+/// run-experiment, from the inputs its manifest and run directories name, as
+/// `run-experiment` runs it (one temperature for the runs, then the combination).
+fn localise_experiment_dir(
+    exp: &str,
+    out_dir: Option<&str>,
+    sources: &[u32],
+    fasta: Option<&str>,
+    cfg: &Config,
+    ch: &str,
+) -> Result<()> {
+    let manifest_path = format!("{exp}/experiment_manifest.json");
+    let text = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("reading {manifest_path}"))?;
+    let mut m: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {manifest_path}"))?;
+    let e = m
+        .get("experiment")
+        .ok_or_else(|| anyhow::anyhow!("{manifest_path} has no `experiment` block"))?;
+    let names: Vec<String> = e
+        .get("runs")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .ok_or_else(|| anyhow::anyhow!("{manifest_path}: experiment.runs missing"))?;
+    let second_pass = e.get("second_pass").is_some_and(|v| !v.is_null());
+    let chosen: Vec<usize> = if sources.is_empty() {
+        (0..names.len()).collect()
+    } else {
+        for &s in sources {
+            if s as usize >= names.len() {
+                anyhow::bail!("--sources {s}: the experiment has {} runs", names.len());
+            }
+        }
+        let mut v: Vec<usize> = sources.iter().map(|&s| s as usize).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let in_place = out_dir.is_none();
+    let out_root = out_dir.unwrap_or(exp).to_string();
+    let run_dir = |i: usize| format!("{exp}/{}", names[i]);
+    let scored: Vec<String> = chosen
+        .iter()
+        .map(|&i| format!("{}/scored.parquet", run_dir(i)))
+        .collect();
+    let spectra: Vec<String> = chosen
+        .iter()
+        .map(|&i| format!("{}/spectra/spectra_ms2.parquet", run_dir(i)))
+        .collect();
+    let mass_cals: Vec<String> = chosen
+        .iter()
+        .map(|&i| mumdia::masscal::json_path(&format!("{}/seed_psms.parquet", run_dir(i))))
+        .collect();
+    let extracted: Vec<String> = chosen
+        .iter()
+        .map(|&i| {
+            if second_pass {
+                format!("{exp}/second_pass/{}/psms_extracted.parquet", names[i])
+            } else {
+                format!("{}/psms_extracted.parquet", run_dir(i))
+            }
+        })
+        .collect();
+    let tables: Vec<String> = chosen
+        .iter()
+        .map(|&i| format!("{out_root}/{}/localisation.parquet", names[i]))
+        .collect();
+    for t in &tables {
+        if let Some(parent) = std::path::Path::new(t).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let combined = (cfg.localise.combine_runs && chosen.len() > 1)
+        .then(|| format!("{out_root}/localisation_experiment.parquet"));
+    let s = stages::localise::run_experiment(stages::localise::ExperimentLocaliseParams {
+        runs: chosen
+            .iter()
+            .enumerate()
+            .map(|(k, &i)| stages::localise::LocaliseParams {
+                scored: &scored[k],
+                spectra_ms2: &spectra[k],
+                mass_cal: Some(&mass_cals[k]),
+                psms_extracted: Some(&extracted[k]),
+                source: Some(i as u32),
+                out: &tables[k],
+                cfg: &cfg.localise,
+                variable_mods: &cfg.peptidoforms.variable_mods,
+                fasta,
+                fallback_tol_ppm: cfg.extract.frag_tol_ppm,
+                config_hash: ch,
+            })
+            .collect(),
+        out: combined.as_deref(),
+        config_hash: ch,
+    })?;
+    // Recorded for `mumdia report --experiment-dir`, which reads the tables from the manifest.
+    if in_place && chosen.len() == names.len() {
+        if let Some(block) = m.get_mut("experiment").and_then(|v| v.as_object_mut()) {
+            block.insert("localisation".into(), serde_json::json!(tables));
+            block.insert(
+                "sites".into(),
+                serde_json::json!(format!("{exp}/sites.tsv")),
+            );
+            match &combined {
+                Some(x) => block.insert("localisation_experiment".into(), serde_json::json!(x)),
+                None => block.remove("localisation_experiment"),
+            };
+        }
+        mumdia_io::json::write_json(&manifest_path, &m)?;
+    }
+    for (k, r) in s.runs.iter().enumerate() {
+        println!(
+            "MuMDIA localise: {}: {} of {} target peaks with a choice localised  {}",
+            names[chosen[k]], r.localised_target_peaks, r.ambiguous_target_peaks, tables[k]
+        );
+    }
+    println!("  run temperature {:.3}", s.temperature);
+    if let (Some(c), Some(x)) = (&s.combined, &combined) {
+        println!(
+            "MuMDIA localise: experiment: {} consensus peaks, {} of {} with a choice localised \
+             at temperature {:.3}\n  {x}",
+            c.consensus_peaks, c.localised, c.with_a_choice, c.temperature
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // The reference point for the orchestrators' pre-stage timer, before anything else.
     mumdia::prestage::mark_process_start();
@@ -1930,32 +2079,53 @@ fn real_main() -> Result<()> {
             source,
             fasta,
             out,
+            experiment_dir,
+            out_dir,
+            sources,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
-            let s = stages::localise::run(stages::localise::LocaliseParams {
-                scored: &psms_scored,
-                spectra_ms2: &spectra_ms2,
-                mass_cal: mass_cal.as_deref(),
-                psms_extracted: psms_extracted.as_deref(),
-                source,
-                out: &out,
-                cfg: &cfg.localise,
-                variable_mods: &cfg.peptidoforms.variable_mods,
-                fasta: fasta.as_deref(),
-                fallback_tol_ppm: cfg.extract.frag_tol_ppm,
-                config_hash: &ch,
-            })?;
-            println!(
-                "MuMDIA localise: {} rows, {} peaks, {} of {} target peaks with a choice \
-                 localised, {} isomer groups at isomer_group_q <= 0.01\n  {out}",
-                s.rows,
-                s.peaks,
-                s.localised_target_peaks,
-                s.ambiguous_target_peaks,
-                s.isomer_groups_at_1pct
-            );
+            if let Some(exp) = experiment_dir {
+                localise_experiment_dir(
+                    &exp,
+                    out_dir.as_deref(),
+                    &sources,
+                    fasta.as_deref(),
+                    &cfg,
+                    &ch,
+                )?;
+            } else {
+                let (Some(psms_scored), Some(spectra_ms2), Some(out)) =
+                    (psms_scored, spectra_ms2, out)
+                else {
+                    anyhow::bail!("localise needs --psms-scored, --spectra-ms2 and --out, or --experiment-dir");
+                };
+                let s = stages::localise::run(stages::localise::LocaliseParams {
+                    scored: &psms_scored,
+                    spectra_ms2: &spectra_ms2,
+                    mass_cal: mass_cal.as_deref(),
+                    psms_extracted: psms_extracted.as_deref(),
+                    source,
+                    out: &out,
+                    cfg: &cfg.localise,
+                    variable_mods: &cfg.peptidoforms.variable_mods,
+                    fasta: fasta.as_deref(),
+                    fallback_tol_ppm: cfg.extract.frag_tol_ppm,
+                    config_hash: &ch,
+                })?;
+                println!(
+                    "MuMDIA localise: {} rows, {} peaks, {} of {} target peaks with a choice \
+                 localised at temperature {:.3}, {} isomer groups at isomer_group_q <= \
+                 0.01\n  {out}",
+                    s.rows,
+                    s.peaks,
+                    s.localised_target_peaks,
+                    s.ambiguous_target_peaks,
+                    s.temperature,
+                    s.isomer_groups_at_1pct
+                );
+            }
         }
         Cmd::Mobilogram {
             run_dir,
@@ -2579,6 +2749,11 @@ fn real_main() -> Result<()> {
                             .collect()
                     })
                     .unwrap_or_default();
+                // The experiment-level table, when the runs were combined.
+                let loc_experiment = e
+                    .get("localisation_experiment")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let out = out_dir.unwrap_or_else(|| exp.clone());
                 std::fs::create_dir_all(&out)?;
                 let pep = format!("{out}/peptides.tsv");
@@ -2586,6 +2761,7 @@ fn real_main() -> Result<()> {
                 let sites = format!("{out}/sites.tsv");
                 let loc = (!loc_tables.is_empty()).then(|| stages::report::Localisation {
                     tables: &loc_tables,
+                    experiment: loc_experiment.as_deref(),
                     fasta: fasta.as_deref(),
                     out_sites: &sites,
                 });
@@ -2616,6 +2792,7 @@ fn real_main() -> Result<()> {
                 let loc_tables: Vec<String> = localisation.into_iter().collect();
                 let loc = (!loc_tables.is_empty()).then(|| stages::report::Localisation {
                     tables: &loc_tables,
+                    experiment: None,
                     fasta: fasta.as_deref(),
                     out_sites: &sites,
                 });
