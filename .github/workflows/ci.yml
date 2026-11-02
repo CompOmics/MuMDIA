@@ -99,9 +99,10 @@ jobs:
       # nothing to bump to and a hard failure would only train people to ignore
       # this job. Deny the class that has a fix.
       #
-      # Three advisories are ignored deliberately: RUSTSEC-2026-0367, -0368 and -0369
-      # in zip 6.0.0 (SUID/SGID bits kept, symlinks outside the destination, and Unix
-      # permissions applied through symlinks, all during extraction). zip is only a
+      # Four advisories are ignored deliberately: RUSTSEC-2026-0367, -0368, -0369 and
+      # -0429 in zip 6.0.0 (SUID/SGID bits kept, symlinks outside the destination, Unix
+      # permissions applied through symlinks, and an abort on a symlink entry with a
+      # large declared size, all during extraction). zip is only a
       # build dependency of nethost-sys 0.7.3, reached only under the opt-in `thermo`
       # feature (mzdata -> thermorawfilereader -> netcorehost ^0.18 -> nethost-sys): its
       # build script downloads Microsoft's nethost NuGet package from nuget.org over TLS
@@ -125,6 +126,7 @@ jobs:
         run: >-
           cargo audit --deny unsound --deny yanked
           --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
+          --ignore RUSTSEC-2026-0429
           --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0395 --ignore RUSTSEC-2026-0396
           --ignore RUSTSEC-2026-0397 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0399
           --ignore RUSTSEC-2026-0400 --ignore RUSTSEC-2026-0401 --ignore RUSTSEC-2026-0402
