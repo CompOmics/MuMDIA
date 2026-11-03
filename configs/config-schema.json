@@ -4262,7 +4262,7 @@
       "optional": false,
       "default": "[\"Phospho\"]",
       "default_text": "[\"Phospho\"]",
-      "help": "The modifications to localise, by catalogue name. A peptidoform carrying none of them is not in the table; one carrying several is localised for the first of this list it carries, the others held where the identification put them. The candidate residues of a modification are the residues `peptidoforms.variable_mods` gives it, or, when the configuration has none for it (an imported library), the residues it is found on in the scored table. Default `[\"Phospho\"]`.",
+      "help": "The modifications to localise, by catalogue name. A peptidoform carrying none of them is not in the table; one carrying several is localised for the first of this list it carries, the others held where the identification put them. The candidate residues of a modification are those of its residue rules in `peptidoforms.variable_mods`, and a terminal rule (residue `*`) makes the N-terminus a placement of its own (for `protein_n_term`, on the peptides that start a protein); when the configuration has no rule for it (an imported library), the residues and the N-terminus it is found on in the scored table. Default `[\"Phospho\"]`.",
       "gates": [],
       "source_struct": "LocaliseConfig"
     },

@@ -26,9 +26,9 @@ fn scratch(name: &str) -> std::path::PathBuf {
     dir
 }
 
-/// The z = 1 b/y m/z of `pf` with the localised phospho on `sites`.
-fn ladder(pf: &str, sites: &[usize]) -> Vec<f64> {
-    let s = hypotheses::split(pf, "Phospho").unwrap();
+/// The z = 1 b/y m/z of `pf` with the localised `name` on `sites`.
+fn ladder_of(pf: &str, name: &str, sites: &[usize]) -> Vec<f64> {
+    let s = hypotheses::split(pf, name).unwrap();
     ions::build(&s, &[sites.to_vec()], 1)
         .ions
         .iter()
@@ -65,6 +65,16 @@ fn planted() -> Vec<(f64, &'static str, Vec<usize>)> {
 }
 
 fn fixture(name: &str) -> Fixture {
+    let planted: Vec<(f64, &str, &str, Vec<usize>)> = planted()
+        .into_iter()
+        .map(|(apex, pf, sites)| (apex, pf, "Phospho", sites))
+        .collect();
+    fixture_of(name, &rows(), &planted)
+}
+
+/// A scored table of `r` and spectra carrying, at each apex of `planted` (apex, peptidoform,
+/// modification, true slots), the ladder of that placement.
+fn fixture_of(name: &str, r: &[FixtureRow], planted: &[(f64, &str, &str, Vec<usize>)]) -> Fixture {
     let dir = scratch(name);
     let scored = dir.join("scored.parquet").to_str().unwrap().to_string();
     let spectra = dir
@@ -72,7 +82,6 @@ fn fixture(name: &str) -> Fixture {
         .to_str()
         .unwrap()
         .to_string();
-    let r = rows();
     write_table(
         &scored,
         vec![
@@ -98,8 +107,9 @@ fn fixture(name: &str) -> Fixture {
     let mut rt = Vec::new();
     let mut mz: Vec<Vec<f32>> = Vec::new();
     let mut it: Vec<Vec<f32>> = Vec::new();
-    for (apex, pf, sites) in planted() {
-        let lad = ladder(pf, &sites);
+    for (apex, pf, modname, sites) in planted {
+        let lad = ladder_of(pf, modname, sites);
+        let apex = *apex;
         for k in -10i32..=10 {
             let t = apex + k as f64;
             let mut peaks: Vec<(f32, f32)> = (0..40)
@@ -138,7 +148,29 @@ fn fixture(name: &str) -> Fixture {
     }
 }
 
+fn rule(residue: char, name: &str, position: ModPosition) -> ResidueMod {
+    ResidueMod {
+        residue,
+        name: name.into(),
+        position,
+    }
+}
+
 fn run_on(f: &Fixture, out: &str, cfg: &LocaliseConfig) -> LocaliseSummary {
+    let phospho: Vec<ResidueMod> = "STY"
+        .chars()
+        .map(|c| rule(c, "Phospho", ModPosition::Anywhere))
+        .collect();
+    run_with(f, out, cfg, &phospho, None)
+}
+
+fn run_with(
+    f: &Fixture,
+    out: &str,
+    cfg: &LocaliseConfig,
+    variable_mods: &[ResidueMod],
+    fasta: Option<&str>,
+) -> LocaliseSummary {
     let base = Config::default();
     run(LocaliseParams {
         scored: &f.scored,
@@ -148,23 +180,8 @@ fn run_on(f: &Fixture, out: &str, cfg: &LocaliseConfig) -> LocaliseSummary {
         source: None,
         out,
         cfg,
-        variable_mods: &[
-            ResidueMod {
-                residue: 'S',
-                name: "Phospho".into(),
-                position: ModPosition::Anywhere,
-            },
-            ResidueMod {
-                residue: 'T',
-                name: "Phospho".into(),
-                position: ModPosition::Anywhere,
-            },
-            ResidueMod {
-                residue: 'Y',
-                name: "Phospho".into(),
-                position: ModPosition::Anywhere,
-            },
-        ],
+        variable_mods,
+        fasta,
         fallback_tol_ppm: base.extract.frag_tol_ppm,
         config_hash: "test",
     })
@@ -293,6 +310,97 @@ fn no_decoy_residue_scores_no_decoy_placement() {
     let e = row_of(&o, "VADGS[Phospho]PTLK");
     assert_ne!(o.status[e], "decoy_residue");
     assert!(!o.best[e].contains("A[Phospho]"));
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+/// Acetyl with a protein N-terminal rule (residue `*`) and a K rule: the N-terminus is a
+/// placement of its own, never a residue `*`, and is a hypothesis only for a peptide that
+/// starts a protein (a row carries it there, or the FASTA says so).
+///
+/// - SAKPEDLTGR, both forms accepted on one peak, spectra carrying the N-terminal ladder:
+///   localised to the N-terminus;
+/// - GVKDLPETR, only the K form in the table, spectra carrying the K ladder: without the
+///   FASTA the N-terminus is no hypothesis and the site is fixed by the sequence; with a
+///   FASTA in which it starts a protein after the initiator methionine it is a hypothesis,
+///   and the K placement wins it.
+#[test]
+fn terminal_rules_are_an_n_terminal_placement() {
+    let r: Vec<FixtureRow> = vec![
+        ("[Acetyl]-SAKPEDLTGR", "target", 1, 100.0, 0.9, 0.001),
+        ("SAK[Acetyl]PEDLTGR", "target", 1, 100.3, 0.6, 0.002),
+        ("GVK[Acetyl]DLPETR", "target", 2, 300.0, 0.8, 0.001),
+    ];
+    let planted = vec![
+        (100.0, "[Acetyl]-SAKPEDLTGR", "Acetyl", vec![10]),
+        (300.0, "GVK[Acetyl]DLPETR", "Acetyl", vec![2]),
+    ];
+    let f = fixture_of("nterm", &r, &planted);
+    let cfg = LocaliseConfig {
+        mods: vec!["Acetyl".into()],
+        ..LocaliseConfig::default()
+    };
+    let rules = vec![
+        rule('*', "Acetyl", ModPosition::ProteinNTerm),
+        rule('K', "Acetyl", ModPosition::Anywhere),
+    ];
+    let out = f.dir.join("loc.parquet").to_str().unwrap().to_string();
+    let s = run_with(&f, &out, &cfg, &rules, None);
+    assert_eq!(s.rows, 3, "both Acetyl forms are in the table");
+    let o = read(&out);
+    let t = TableFile::open(&out).unwrap();
+    let sites = t.opt_str("site_probabilities").unwrap();
+    let a = row_of(&o, "[Acetyl]-SAKPEDLTGR");
+    let b = row_of(&o, "SAK[Acetyl]PEDLTGR");
+    assert_eq!(o.peak[a], o.peak[b]);
+    assert_eq!(o.status[a], "localised", "{:?}", sites[a]);
+    assert_eq!(o.best[a], "[Acetyl]-SAKPEDLTGR");
+    assert_eq!(o.best[b], "[Acetyl]-SAKPEDLTGR");
+    // the candidate slots: the decoy residue A2, K3 and the N-terminus; no `*`
+    let cells: Vec<&str> = sites[a]
+        .as_deref()
+        .unwrap()
+        .split(';')
+        .map(|c| c.split(':').next().unwrap())
+        .collect();
+    assert_eq!(cells, vec!["A2", "K3", "N-term"]);
+    let g = row_of(&o, "GVK[Acetyl]DLPETR");
+    assert_eq!(o.status[g], "unambiguous");
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{out}.report.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["params"]["candidate_residues"][0], "K");
+    assert_eq!(report["params"]["n_term"][0], "protein_n_term");
+
+    // with a FASTA in which GVKDLPETR starts a protein after its methionine
+    let fasta = f.dir.join("p.fasta").to_str().unwrap().to_string();
+    std::fs::write(&fasta, ">P1\nMGVKDLPETRSAKPEDLTGR\n").unwrap();
+    let out2 = f.dir.join("loc2.parquet").to_str().unwrap().to_string();
+    run_with(&f, &out2, &cfg, &rules, Some(&fasta));
+    let o2 = read(&out2);
+    let g2 = row_of(&o2, "GVK[Acetyl]DLPETR");
+    assert_eq!(o2.status[g2], "localised");
+    assert_eq!(o2.best[g2], "GVK[Acetyl]DLPETR");
+    // SAKPEDLTGR does not start P1, but its N-terminal form is in the table
+    assert_eq!(
+        o2.best[row_of(&o2, "SAK[Acetyl]PEDLTGR")],
+        "[Acetyl]-SAKPEDLTGR"
+    );
+
+    // a terminal rule alone: no residue candidate, the N-terminus only
+    let only_term = vec![rule('*', "Acetyl", ModPosition::PeptideNTerm)];
+    let out3 = f.dir.join("loc3.parquet").to_str().unwrap().to_string();
+    run_with(&f, &out3, &cfg, &only_term, None);
+    let rep3: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{out3}.report.json")).unwrap())
+            .unwrap();
+    assert_eq!(rep3["params"]["candidate_residues"][0], "");
+    assert_eq!(rep3["params"]["n_term"][0], "peptide_n_term");
+    let o3 = read(&out3);
+    // no residue rule, so K is no candidate: the peak's placements are the N-terminus and the
+    // decoy A2, and the N-terminus is fixed by the sequence
+    let a3 = row_of(&o3, "[Acetyl]-SAKPEDLTGR");
+    assert_eq!(o3.status[a3], "unambiguous");
+    assert_eq!(o3.best[a3], "[Acetyl]-SAKPEDLTGR");
     let _ = std::fs::remove_dir_all(&f.dir);
 }
 

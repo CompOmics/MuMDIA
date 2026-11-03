@@ -837,6 +837,7 @@ pub fn run(p: RunParams) -> Result<()> {
             out: &out,
             cfg: &cfg.localise,
             variable_mods: &cfg.peptidoforms.variable_mods,
+            fasta: p.fasta,
             fallback_tol_ppm: cfg.extract.frag_tol_ppm,
             config_hash: &ch,
         })?;

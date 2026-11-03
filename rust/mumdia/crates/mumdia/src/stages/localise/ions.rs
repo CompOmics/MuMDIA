@@ -85,9 +85,9 @@ pub(crate) fn build(s: &Split, hyps: &[Vec<usize>], zmax: u8) -> IonSet {
                 let mut taken = vec![false; k + 1];
                 for (hi, sites) in hyps.iter().enumerate() {
                     let c = if is_y {
-                        sites.iter().filter(|&&i| i >= n - o).count()
+                        sites.iter().filter(|&&i| s.in_suffix(i, o)).count()
                     } else {
-                        sites.iter().filter(|&&i| i < o).count()
+                        sites.iter().filter(|&&i| s.in_prefix(i, o)).count()
                     };
                     taken[c] = true;
                     let mz = (base + c as f64 * s.delta + z as f64 * PROTON) / z as f64;
@@ -179,6 +179,49 @@ mod tests {
         for &(mz, _) in &set.impossible {
             assert!(set.ions.iter().all(|i| key(i.mz) != key(mz)));
         }
+    }
+
+    /// A placement on the N-terminal slot gives the ladder of the N-terminally modified
+    /// peptidoform: every b ion carries it, no y ion does.
+    #[test]
+    fn the_n_terminal_slot_is_in_every_b_ion() {
+        let s = split("[Acetyl]-AKPEPK", "Acetyl").unwrap();
+        let hyps = vec![vec![1], vec![6]];
+        let set = build(&s, &hyps, 1);
+        for (hi, pf) in ["AK[Acetyl]PEPK", "[Acetyl]-AKPEPK"].iter().enumerate() {
+            let p = parse_peptidoform(pf).unwrap();
+            let n = p.residues.len();
+            let mut want: Vec<i64> = Vec::new();
+            let mut pre = p.n_term_mod;
+            for i in 0..n - 1 {
+                pre += residue_mass(p.residues[i]).unwrap() + p.mods[i];
+                want.push(key(pre + PROTON));
+            }
+            let mut suf = WATER;
+            for i in (1..n).rev() {
+                suf += residue_mass(p.residues[i]).unwrap() + p.mods[i];
+                want.push(key(suf + PROTON));
+            }
+            want.sort_unstable();
+            want.dedup();
+            let mut got: Vec<i64> = set
+                .ions
+                .iter()
+                .filter(|ion| ion.member[hi])
+                .map(|ion| key(ion.mz))
+                .collect();
+            got.sort_unstable();
+            assert_eq!(got, want, "{pf}");
+        }
+        // b1 and y5 tell the two apart, each with and without the acetyl
+        let sdi: Vec<&Ion> = set
+            .ions
+            .iter()
+            .filter(|i| !i.member.iter().all(|&m| m))
+            .collect();
+        assert_eq!(sdi.len(), 4);
+        assert_eq!(sdi.iter().filter(|i| i.class == 0).count(), 2);
+        assert_eq!(sdi.iter().filter(|i| i.class == 2).count(), 2);
     }
 
     #[test]

@@ -701,8 +701,9 @@ impl Localisation<'_> {
             Some(f) => crate::stages::digest::read_fasta(f)?.into_iter().collect(),
             None => HashMap::new(),
         };
-        // (protein, protein position, peptide, peptide position, residue, modification)
-        type Key = (String, Option<usize>, String, usize, char, String);
+        // (protein, protein position, peptide, peptide position, residue, modification); an
+        // N-terminal site is numbered at the first residue, with residue `N-term`
+        type Key = (String, Option<usize>, String, usize, String, String);
         let mut sites: std::collections::BTreeMap<Key, SiteRow> = Default::default();
         for path in self.tables {
             let t = TableFile::open(path)?;
@@ -726,28 +727,38 @@ impl Localisation<'_> {
                 let Some(split) = crate::stages::localise::hypotheses::split(b, &mods[i]) else {
                     continue;
                 };
-                let by_pos: HashMap<usize, f64> = ps
+                let n_res = split.residues.len();
+                let by_slot: HashMap<usize, f64> = ps
                     .split(';')
                     .filter_map(|cell| {
-                        let (rp, v) = cell.split_once(':')?;
-                        Some((rp.get(1..)?.parse::<usize>().ok()?, v.parse::<f64>().ok()?))
+                        let (label, v) = cell.split_once(':')?;
+                        Some((
+                            crate::stages::localise::hypotheses::parse_slot_label(label, n_res)?,
+                            v.parse::<f64>().ok()?,
+                        ))
                     })
                     .collect();
                 let peptide = String::from_utf8_lossy(&split.residues).into_owned();
                 for acc in protein[i].split(';').filter(|a| !a.is_empty()) {
                     let start = proteins.get(acc).and_then(|seq| seq.find(&peptide));
                     for &site in &split.sites {
-                        let prob = by_pos.get(&(site + 1)).copied().unwrap_or(f64::NAN);
+                        let prob = by_slot.get(&site).copied().unwrap_or(f64::NAN);
+                        // 1-based position in the peptide; the N-terminus at the first residue
+                        let at = if site < n_res { site + 1 } else { 1 };
+                        let residue = match split.residue_at(site) {
+                            Some(c) => (c as char).to_string(),
+                            None => crate::stages::localise::hypotheses::N_TERM_LABEL.to_string(),
+                        };
                         let key: Key = (
                             acc.to_string(),
-                            start.map(|s| s + site + 1),
+                            start.map(|s| s + at),
                             if start.is_some() {
                                 String::new()
                             } else {
                                 peptide.clone()
                             },
-                            if start.is_some() { 0 } else { site + 1 },
-                            split.residues[site] as char,
+                            if start.is_some() { 0 } else { at },
+                            residue,
                             mods[i].clone(),
                         );
                         let e = sites.entry(key).or_insert_with(|| SiteRow {
@@ -1675,6 +1686,66 @@ mod tests {
             site_rows[0]
         );
         assert!(site_rows[0].ends_with("\tPEPS[Phospho]TIDEK\t1"));
+    }
+
+    /// An N-terminal site is a row of its own in sites.tsv, residue `N-term`, numbered at the
+    /// peptide's first residue (protein position 2 after the initiator methionine), apart
+    /// from a site on that residue's side chain.
+    #[test]
+    fn sites_tsv_numbers_an_n_terminal_site() {
+        let loc = tmp("loc_nterm.parquet");
+        write_table(
+            &loc,
+            vec![
+                Col::U32("source".into(), vec![0, 1]),
+                Col::Str("label".into(), vec!["target".into(); 2]),
+                Col::Str("protein".into(), vec!["P3".into(); 2]),
+                Col::Bool("is_peak_representative".into(), vec![true, true]),
+                Col::Bool("localised".into(), vec![true, true]),
+                Col::Str("localised_mod".into(), vec!["Acetyl".into(); 2]),
+                Col::OptStr(
+                    "best_site_peptidoform".into(),
+                    vec![
+                        Some("[Acetyl]-KAPEPTIDR".into()),
+                        Some("K[Acetyl]APEPTIDR".into()),
+                    ],
+                ),
+                Col::OptStr(
+                    "site_probabilities".into(),
+                    vec![
+                        Some("K1:0.0400;N-term:0.9600".into()),
+                        Some("K1:0.9000;N-term:0.1000".into()),
+                    ],
+                ),
+                Col::OptF64("site_flr_model".into(), vec![Some(0.01); 2]),
+                Col::OptF64("site_flr_decoy".into(), vec![Some(0.02); 2]),
+            ],
+        )
+        .unwrap();
+        let fasta = tmp("nterm.fasta");
+        std::fs::write(&fasta, ">P3\nMKAPEPTIDRGG\n").unwrap();
+        let sites = tmp("nterm_sites.tsv");
+        let tables = vec![loc];
+        Localisation {
+            tables: &tables,
+            fasta: Some(&fasta),
+            out_sites: &sites,
+        }
+        .write_sites()
+        .unwrap();
+        let s = std::fs::read_to_string(&sites).unwrap();
+        let rows: Vec<&str> = s.lines().skip(1).collect();
+        assert_eq!(rows.len(), 2, "{s}");
+        assert!(
+            rows.iter()
+                .any(|r| r.starts_with("P3\t2\tK\tAcetyl\tKAPEPTIDR\t1\t0.9000\t")),
+            "{s}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.starts_with("P3\t2\tN-term\tAcetyl\tKAPEPTIDR\t1\t0.9600\t")),
+            "{s}"
+        );
     }
 
     #[test]

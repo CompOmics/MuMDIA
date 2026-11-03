@@ -525,6 +525,9 @@ Options:
       --source <SOURCE>
           Keep only the rows of this source; required when the table holds several runs
 
+      --fasta <FASTA>
+          The search's FASTA: which peptides start a protein, for a modification whose N-terminal rule is protein_n_term. Without it a peptide's N-terminus is a placement only when the table carries the modification there
+
       --out <OUT>
 
       --config <CONFIG>
