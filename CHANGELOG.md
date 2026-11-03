@@ -164,6 +164,30 @@ than a number. Both are recorded in every run's `manifest.json`.
   them wrong, against a decoy-residue estimate of 10.9%; on a twelve-run Arabidopsis phospho
   diaPASEF experiment 32.8% were localised at a decoy-residue estimate of 6.7%
   (docs/36_ptm_localisation.md).
+- **Site localisation: a probability per experiment, a fitted temperature, peaks by elution
+  bounds, neutral-loss ions.** In `run-experiment`, and in the new `mumdia localise
+  --experiment-dir`, every run is read before any is localised, one temperature serves all of
+  them, and the runs are combined (`localise.combine_runs`, default true): the peaks of a
+  precursor are matched across runs on the second pass's aligned retention-time scale and
+  their log-likelihoods summed, at an experiment temperature fitted the same way
+  (`localise.experiment_temperature`), into `localisation_experiment.parquet`, three
+  `experiment_*` columns of `peptides.tsv` and five of `sites.tsv`; the per-run tables do not
+  change with it. `localise.temperature` now defaults to `"auto"`: the temperature at which the
+  model's expected wrong calls match the decoy residue's estimate at 0.75, over the quarter of
+  the peaks with the largest share of site-determining ions present, moved from 1 only when the
+  two disagree by more than two standard errors. `localise.peak_rule` defaults to
+  `elution_bounds` (isomers inside each other's elution bounds share a peak unless the profile of
+  their shared fragments has a valley, `localise.peak_valley_ratio`; `apex_tolerance` keeps the
+  5 s rule), and `localise.threshold` to 0.9. `localise.neutral_loss` (off) scores the loss of
+  phosphoric acid from fragments with a phosphoserine or -threonine. The per-run table is schema
+  version 2: common-ion counts, the peak's elution bounds and each placement's log-likelihood.
+  Chosen on the synthetic phosphopeptides' pure pool, confirmed on its dilutions and on the
+  Arabidopsis experiment: the elution-bounds rule cut single-isomer sequences into two peaks 63%
+  to 92% less often while keeping the pairs localised to different sites, the fitted temperature
+  (1.29) brought the model's rate at 0.75 to 7.6% against a true 7.2%, and at 0.9 3.6% to 7.4% of
+  the synthetic calls and 3.3% of the Arabidopsis ones by the decoy residue were wrong; the
+  neutral-loss ions localised no more peaks at a given true rate (docs/36_ptm_localisation.md,
+  section 7).
 - **Every place MuMDIA writes can be moved, and an unwritable one is named before a search
   starts.** The global flags `--cache-dir` and `--temp-dir` (over `MUMDIA_CACHE_DIR` and the
   new `MUMDIA_TEMP_DIR`) move the caches and the temporary files of the engine and every

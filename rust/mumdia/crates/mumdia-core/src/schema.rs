@@ -138,8 +138,14 @@ pub mod artifact {
     /// that carries a localised modification, with its isomer group and peak, the posterior
     /// over the placements, the site probabilities, the false localisation rates and the
     /// picked target-decoy `isomer_group_q` (docs/36_ptm_localisation.md). Written only when
-    /// the stage runs.
-    pub const LOCALISATION: (&str, u32) = ("localisation", 1);
+    /// the stage runs. Version 2 adds the common-ion counts, the peak's elution bounds and,
+    /// on peak representatives, the hypotheses and their log-likelihoods.
+    pub const LOCALISATION: (&str, u32) = ("localisation", 2);
+    /// The `localise` stage's experiment-level table (`localisation_experiment.parquet`):
+    /// one row per consensus peak of `run-experiment`, its site probabilities from the summed
+    /// log-likelihoods of the runs that observed it (docs/36_ptm_localisation.md). Written
+    /// only when the stage runs on more than one run with `localise.combine_runs`.
+    pub const LOCALISATION_EXPERIMENT: (&str, u32) = ("localisation_experiment", 1);
 
     /// The `peptides` schema a digest writes: [`PEPTIDES_V2`] when it records the
     /// protein N-terminus flag, else [`PEPTIDES`].

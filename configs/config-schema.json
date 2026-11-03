@@ -4273,9 +4273,9 @@
       "rust_type": "f64",
       "kind": "float",
       "optional": false,
-      "default": 0.75,
-      "default_text": "0.75",
-      "help": "Site probability at or above which a site counts as localised: every site of the best placement must reach it. Default 0.75.",
+      "default": 0.9,
+      "default_text": "0.9",
+      "help": "Site probability at or above which a site counts as localised: every site of the best placement must reach it. Default 0.9: with the fitted temperature and elution-bounds peaks, 0.75 left 7.2% to 11.6% of the calls on the synthetic phosphopeptides wrong and a decoy-residue rate of 9.8% on the Arabidopsis experiment, 0.9 3.6% to 7.4% and 3.3% (docs/36_ptm_localisation.md section 7).",
       "gates": [],
       "source_struct": "LocaliseConfig"
     },
@@ -4319,6 +4319,23 @@
       "source_struct": "LocaliseConfig"
     },
     {
+      "path": "localise.peak_rule",
+      "name": "peak_rule",
+      "section": "localise",
+      "rust_type": "LocalisePeakRule",
+      "kind": "enum",
+      "optional": false,
+      "default": "elution_bounds",
+      "default_text": "`elution_bounds`",
+      "help": "How the accepted isomers of an isomer group and charge are cut into chromatographic peaks, the isomers of one peak sharing one localisation. `elution_bounds`: two isomers next to each other in apex order are on one peak when the apex of either lies inside the other's elution bounds (`elution_lo` to `elution_hi` of the scored row) and the summed profile of the fragments the two placements share has no valley between the two apexes deeper than `peak_valley_ratio` of the lower apex. `apex_tolerance`: an isomer joins a peak when its apex lies within `peak_rt_tol_s` of the peak's first apex (the rule of the first version). A scored table without elution bounds is cut by `apex_tolerance`. Default `elution_bounds`: on the synthetic phosphopeptides it cut 63% fewer single-isomer sequences into two peaks than the 5 s rule while keeping 84 of its 86 pairs of peaks localised to different sites (docs/36_ptm_localisation.md section 7).",
+      "gates": [],
+      "source_struct": "LocaliseConfig",
+      "choices": [
+        "apex_tolerance",
+        "elution_bounds"
+      ]
+    },
+    {
       "path": "localise.peak_rt_tol_s",
       "name": "peak_rt_tol_s",
       "section": "localise",
@@ -4327,7 +4344,20 @@
       "optional": false,
       "default": 5.0,
       "default_text": "5.0",
-      "help": "Accepted isomers whose apexes lie within this many seconds of a peak's first apex share that peak and one localisation; isomers further apart are separate peaks, each localised on its own. Default 5.0.",
+      "help": "`peak_rule = \"apex_tolerance\"`: isomers whose apexes lie within this many seconds of a peak's first apex share that peak. Default 5.0.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.peak_valley_ratio",
+      "name": "peak_valley_ratio",
+      "section": "localise",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.5,
+      "default_text": "0.5",
+      "help": "`peak_rule = \"elution_bounds\"`: two isomers whose bounds overlap are separate peaks when their shared-fragment profile falls between the two apexes below this fraction of the lower apex (smoothed over three scans). 0 ignores the profile and cuts on the bounds alone. Default 0.5.",
       "gates": [],
       "source_struct": "LocaliseConfig"
     },
@@ -4377,9 +4407,48 @@
       "rust_type": "f64",
       "kind": "float",
       "optional": false,
-      "default": 1.0,
-      "default_text": "1.0",
-      "help": "Divisor of the log-likelihoods before the softmax. 1 is the likelihood as fitted; above 1 flattens the posterior. Default 1.0.",
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "Divisor of the log-likelihoods before the softmax: a number, or `\"auto\"` (also written `0`), which fits it to the data. 1 is the likelihood as fitted; above 1 flattens the posterior. `\"auto\"` chooses the temperature at which the model's expected wrong calls match the decoy residue's estimate of them at 0.75, over the quarter of the run's (in `run-experiment`, the pooled runs') peaks with a choice of site that see the largest share of their site-determining ions, pulled towards 1 by a prior so that few decoy-residue wins leave it near 1 (docs/36_ptm_localisation.md section 3); the fitted value is in the report. Default `\"auto\"`.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.neutral_loss",
+      "name": "neutral_loss",
+      "section": "localise",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Neutral-loss ions as evidence: for Phospho, the loss of phosphoric acid (97.9769 Da) from every b and y ion that carries a phosphoserine or -threonine (and the decoy residue, which stands in for them), scored as four ion classes of their own with their own detection and false-presence rates. Other modifications have no neutral loss. Default false: on the synthetic phosphopeptides it localised no more peaks at a given true false localisation rate (docs/36_ptm_localisation.md section 7).",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.combine_runs",
+      "name": "combine_runs",
+      "section": "localise",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": true,
+      "default_text": "true",
+      "help": "`run-experiment`: combine the runs into one site probability per consensus peak, summing the log-likelihoods of the runs whose peak of the same precursor matches it in aligned retention time, and write `localisation_experiment.parquet` and the experiment-level columns of `peptides.tsv` and `sites.tsv`. The per-run tables are the same either way. Default true.",
+      "gates": [],
+      "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "localise.experiment_temperature",
+      "name": "experiment_temperature",
+      "section": "localise",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.0,
+      "default_text": "0.0",
+      "help": "The temperature of the combined posterior: a number, or `\"auto\"` (also written `0`), fitted on the consensus peaks as `temperature` is on the run peaks, with its prior centred on the run temperature times the square root of the mean number of runs summed. Above the run temperature it discounts the evidence of runs that repeat each other's interferences. Default `\"auto\"`.",
       "gates": [],
       "source_struct": "LocaliseConfig"
     }

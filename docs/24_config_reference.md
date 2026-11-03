@@ -74,7 +74,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`experiment`](#experiment) | `ExperimentConfig` | 3 | [docs/01_overview_and_dataflow.md](01_overview_and_dataflow.md) |
 | [`groups`](#groups) | `GroupsConfig` | 9 |  |
 | [`retrace`](#retrace) | `RetraceConfig` | 5 | [docs/09_extract.md](09_extract.md) |
-| [`localise`](#localise) | `LocaliseConfig` | 11 | [docs/36_ptm_localisation.md](36_ptm_localisation.md) |
+| [`localise`](#localise) | `LocaliseConfig` | 16 | [docs/36_ptm_localisation.md](36_ptm_localisation.md) |
 | [`peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]`](#peptidoformsfixed_mods--peptidoformsvariable_mods) | `ResidueMod` | 3 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 
 ## (top level)
@@ -586,21 +586,26 @@ Chromatogram traces rebuilt from the raw timsTOF events (the `retrace` stage, be
 
 `LocaliseConfig` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/36_ptm_localisation.md](36_ptm_localisation.md).
 
-Site localisation of modifications on the identified peptidoforms (the `localise` stage, docs/36_ptm_localisation.md). Positional isomers (the same residues, charge and modification composition, differing only in where a modification sits) are separate candidates in the search and can all be accepted on one chromatographic peak. The stage groups them, enumerates every placement of each localised modification on its candidate residues, reads the site-determining fragment ions back from the MS2 spectra at the identification apex, and turns their presence into a posterior over the placements and a probability per site. It is reporting only: identifications, q-values and every other artifact are unchanged, and it adds `localisation.parquet`, three columns of `peptides.tsv` and `sites.tsv`. Experimental and opt-in; every key is omitted from the canonical configuration at its default, and the whole section with them, so a configuration that does not set it keeps its config hash.
+Site localisation of modifications on the identified peptidoforms (the `localise` stage, docs/36_ptm_localisation.md). Positional isomers (the same residues, charge and modification composition, differing only in where a modification sits) are separate candidates in the search and can all be accepted on one chromatographic peak. The stage groups them, enumerates every placement of each localised modification on its candidate residues, reads the site-determining fragment ions back from the MS2 spectra at the identification apex, and turns their presence into a posterior over the placements and a probability per site. It is reporting only: identifications, q-values and every other artifact are unchanged, and it adds `localisation.parquet` (per run), `localisation_experiment.parquet` (the runs of an experiment combined), columns of `peptides.tsv` and `sites.tsv`. Experimental and opt-in; every key is omitted from the canonical configuration at its default, and the whole section with them, so a configuration that does not set it keeps its config hash.
 
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
 | `enabled` | `bool` | `false` |  | Run the stage inside `run` and `run-experiment` (per run, after the final rescore). Default false. `mumdia localise` runs it on its own whatever this says. |
 | `mods` | `Vec<String>` | `["Phospho"]` |  | The modifications to localise, by catalogue name. A peptidoform carrying none of them is not in the table; one carrying several is localised for the first of this list it carries, the others held where the identification put them. The candidate residues of a modification are those of its residue rules in `peptidoforms.variable_mods`, and a terminal rule (residue `*`) makes the N-terminus a placement of its own (for `protein_n_term`, on the peptides that start a protein); when the configuration has no rule for it (an imported library), the residues and the N-terminus it is found on in the scored table. Default `["Phospho"]`. |
-| `threshold` | `f64` | `0.75` |  | Site probability at or above which a site counts as localised: every site of the best placement must reach it. Default 0.75. |
+| `threshold` | `f64` | `0.9` |  | Site probability at or above which a site counts as localised: every site of the best placement must reach it. Default 0.9: with the fitted temperature and elution-bounds peaks, 0.75 left 7.2% to 11.6% of the calls on the synthetic phosphopeptides wrong and a decoy-residue rate of 9.8% on the Arabidopsis experiment, 0.9 3.6% to 7.4% and 3.3% (docs/36_ptm_localisation.md section 7). |
 | `decoy_residue` | `String` | `"A"` |  | The decoy residue: placements on it are scored alongside the real ones but never searched, and how often it wins estimates the false localisation rate empirically. One residue letter that is not a candidate residue of a localised modification, or `""` to score no decoy placements. Default `"A"`. |
 | `q_max` | `f64` | `0.01` |  | Rows are localised when their `run_psm_q` is at or below this. The others are in the table, for the isomer-group q, with status `not_attempted_q`. Default 0.01. |
 | `max_hypotheses` | `usize` | `200` |  | Peptides with more placements than this are not localised (status `too_many_hypotheses`). Default 200. |
-| `peak_rt_tol_s` | `f64` | `5.0` |  | Accepted isomers whose apexes lie within this many seconds of a peak's first apex share that peak and one localisation; isomers further apart are separate peaks, each localised on its own. Default 5.0. |
+| `peak_rule` | `LocalisePeakRule` | `elution_bounds` |  | How the accepted isomers of an isomer group and charge are cut into chromatographic peaks, the isomers of one peak sharing one localisation. `elution_bounds`: two isomers next to each other in apex order are on one peak when the apex of either lies inside the other's elution bounds (`elution_lo` to `elution_hi` of the scored row) and the summed profile of the fragments the two placements share has no valley between the two apexes deeper than `peak_valley_ratio` of the lower apex. `apex_tolerance`: an isomer joins a peak when its apex lies within `peak_rt_tol_s` of the peak's first apex (the rule of the first version). A scored table without elution bounds is cut by `apex_tolerance`. Default `elution_bounds`: on the synthetic phosphopeptides it cut 63% fewer single-isomer sequences into two peaks than the 5 s rule while keeping 84 of its 86 pairs of peaks localised to different sites (docs/36_ptm_localisation.md section 7). |
+| `peak_rt_tol_s` | `f64` | `5.0` |  | `peak_rule = "apex_tolerance"`: isomers whose apexes lie within this many seconds of a peak's first apex share that peak. Default 5.0. |
+| `peak_valley_ratio` | `f64` | `0.5` |  | `peak_rule = "elution_bounds"`: two isomers whose bounds overlap are separate peaks when their shared-fragment profile falls between the two apexes below this fraction of the lower apex (smoothed over three scans). 0 ignores the profile and cuts on the bounds alone. Default 0.5. |
 | `apex_scans` | `usize` | `2` |  | MS2 scans either side of the apex scan the fragment evidence is read from. Default 2. |
 | `im_half_width` | `f64` | `0.05` |  | Half-width in 1/K0 of the band around the apex 1/K0 a fragment peak must fall in, on spectra that carry ion mobility. Ignored on 3D spectra. Default 0.05. |
 | `prior_strength` | `f64` | `64.0` |  | Pseudo-count weight of the run-wide detection and false-presence rates against a peak's own. Default 64: against 8 it localised more peaks at a lower false localisation rate on both validation sets (docs/36_ptm_localisation.md section 7). |
-| `temperature` | `f64` | `1.0` |  | Divisor of the log-likelihoods before the softmax. 1 is the likelihood as fitted; above 1 flattens the posterior. Default 1.0. |
+| `temperature` | `f64` | `0.0` |  | Divisor of the log-likelihoods before the softmax: a number, or `"auto"` (also written `0`), which fits it to the data. 1 is the likelihood as fitted; above 1 flattens the posterior. `"auto"` chooses the temperature at which the model's expected wrong calls match the decoy residue's estimate of them at 0.75, over the quarter of the run's (in `run-experiment`, the pooled runs') peaks with a choice of site that see the largest share of their site-determining ions, pulled towards 1 by a prior so that few decoy-residue wins leave it near 1 (docs/36_ptm_localisation.md section 3); the fitted value is in the report. Default `"auto"`. |
+| `neutral_loss` | `bool` | `false` |  | Neutral-loss ions as evidence: for Phospho, the loss of phosphoric acid (97.9769 Da) from every b and y ion that carries a phosphoserine or -threonine (and the decoy residue, which stands in for them), scored as four ion classes of their own with their own detection and false-presence rates. Other modifications have no neutral loss. Default false: on the synthetic phosphopeptides it localised no more peaks at a given true false localisation rate (docs/36_ptm_localisation.md section 7). |
+| `combine_runs` | `bool` | `true` |  | `run-experiment`: combine the runs into one site probability per consensus peak, summing the log-likelihoods of the runs whose peak of the same precursor matches it in aligned retention time, and write `localisation_experiment.parquet` and the experiment-level columns of `peptides.tsv` and `sites.tsv`. The per-run tables are the same either way. Default true. |
+| `experiment_temperature` | `f64` | `0.0` |  | The temperature of the combined posterior: a number, or `"auto"` (also written `0`), fitted on the consensus peaks as `temperature` is on the run peaks, with its prior centred on the run temperature times the square root of the mean number of runs summed. Above the run temperature it discounts the evidence of runs that repeat each other's interferences. Default `"auto"`. |
 
 ## peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]
 
@@ -893,6 +898,17 @@ Source of `predicted_irt` for an imported library; see `RtImTrainConfig::library
 | `auto` | yes |  |
 | `library` |  |  |
 | `deeplc` |  |  |
+
+### `LocalisePeakRule`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+How the `localise` stage cuts accepted isomers into peaks (`LocaliseConfig::peak_rule`).
+
+| Value | Default | Description |
+|---|---|---|
+| `apex_tolerance` |  | Within `peak_rt_tol_s` of the peak's first apex. |
+| `elution_bounds` | yes | Inside each other's elution bounds, without a valley in the shared-fragment profile. |
 
 ### `MatcherKind`
 
@@ -1337,12 +1353,15 @@ instead of looking like an absent field.
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
-8 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
+11 environment read(s) whose name is not a literal. Reads with the same function, access and argument share one entry, which gives their number when there is more than one:
 
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmRows::push: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::PsmStream::push: env read via closure of `&mut self``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `chunk.slices_mut()``
 - `rust/mumdia/crates/mumdia/src/stages/extract.rs::flush_below: env read via closure of `runs[r].span_mut(m)``
+- `rust/mumdia/crates/mumdia/src/stages/localise/ions.rs::build: env read via closure of `mz_of(base, c, 0.0, z)``
+- `rust/mumdia/crates/mumdia/src/stages/localise/ions.rs::build: env read via closure of `mz_of(base, c, l.mass, z)``
+- `rust/mumdia/crates/mumdia/src/stages/localise/mod.rs::Spectra::valley: env read via closure of `&self``
 - `rust/mumdia/crates/mumdia/src/stages/prescreen/tags.rs::discover: env read via closure of `alpha.key(alpha.canonical(a, b, c), z, false)``
 - `rust/mumdia/crates/mumdia/src/stages/prescreen/tags.rs::discover: env read via closure of `alpha.key(alpha.canonical(la as u16, p.1, p.2), z, true)``
 - `rust/mumdia/crates/mumdia/src/stages/prescreen/tags.rs::discover: env read via closure of `alpha.key(alpha.canonical(p.1, p.2, lb as u16), z, true)``
@@ -1350,6 +1369,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-25 structs and 338 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 43 enumerations, 1 named profile(s), 108 environment variables read and 27 set.
+25 structs and 343 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 44 enumerations, 1 named profile(s), 108 environment variables read and 27 set.
 
 36 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.

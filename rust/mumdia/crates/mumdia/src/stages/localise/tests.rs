@@ -29,7 +29,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
 /// The z = 1 b/y m/z of `pf` with the localised `name` on `sites`.
 fn ladder_of(pf: &str, name: &str, sites: &[usize]) -> Vec<f64> {
     let s = hypotheses::split(pf, name).unwrap();
-    ions::build(&s, &[sites.to_vec()], 1)
+    ions::build(&s, &[sites.to_vec()], 1, None)
         .ions
         .iter()
         .map(|i| i.mz)
@@ -75,6 +75,18 @@ fn fixture(name: &str) -> Fixture {
 /// A scored table of `r` and spectra carrying, at each apex of `planted` (apex, peptidoform,
 /// modification, true slots), the ladder of that placement.
 fn fixture_of(name: &str, r: &[FixtureRow], planted: &[(f64, &str, &str, Vec<usize>)]) -> Fixture {
+    fixture_full(name, r, planted, 0, None)
+}
+
+/// [`fixture_of`] for run `source`, with elution bounds `apex -/+ half` on every row when
+/// `bounds` is given.
+fn fixture_full(
+    name: &str,
+    r: &[FixtureRow],
+    planted: &[(f64, &str, &str, Vec<usize>)],
+    source: u32,
+    bounds: Option<f64>,
+) -> Fixture {
     let dir = scratch(name);
     let scored = dir.join("scored.parquet").to_str().unwrap().to_string();
     let spectra = dir
@@ -82,49 +94,70 @@ fn fixture_of(name: &str, r: &[FixtureRow], planted: &[(f64, &str, &str, Vec<usi
         .to_str()
         .unwrap()
         .to_string();
-    write_table(
-        &scored,
-        vec![
-            Col::U32("candidate_id".into(), (0..r.len() as u32).collect()),
-            Col::Str(
-                "peptidoform".into(),
-                r.iter().map(|x| x.0.to_string()).collect(),
-            ),
-            Col::I32("charge".into(), vec![2; r.len()]),
-            Col::Str("label".into(), r.iter().map(|x| x.1.to_string()).collect()),
-            Col::Str("protein".into(), vec!["P1".to_string(); r.len()]),
-            Col::U32("base_peptide_id".into(), r.iter().map(|x| x.2).collect()),
-            Col::F64("apex_rt".into(), r.iter().map(|x| x.3).collect()),
-            Col::F64("score".into(), r.iter().map(|x| x.4).collect()),
-            Col::F64("run_psm_q".into(), r.iter().map(|x| x.5).collect()),
-            Col::U32("source".into(), vec![0; r.len()]),
-            Col::I32("selected_peak_rank".into(), vec![0; r.len()]),
-        ],
-    )
-    .unwrap();
-    // One wide window, a scan a second around every planted apex, the planted ladder
-    // present in the five scans nearest it, and a fixed scatter of unrelated peaks.
+    let mut cols = vec![
+        Col::U32("candidate_id".into(), (0..r.len() as u32).collect()),
+        Col::Str(
+            "peptidoform".into(),
+            r.iter().map(|x| x.0.to_string()).collect(),
+        ),
+        Col::I32("charge".into(), vec![2; r.len()]),
+        Col::Str("label".into(), r.iter().map(|x| x.1.to_string()).collect()),
+        Col::Str("protein".into(), vec!["P1".to_string(); r.len()]),
+        Col::U32("base_peptide_id".into(), r.iter().map(|x| x.2).collect()),
+        Col::F64("apex_rt".into(), r.iter().map(|x| x.3).collect()),
+        Col::F64("score".into(), r.iter().map(|x| x.4).collect()),
+        Col::F64("run_psm_q".into(), r.iter().map(|x| x.5).collect()),
+        Col::U32("source".into(), vec![source; r.len()]),
+        Col::I32("selected_peak_rank".into(), vec![0; r.len()]),
+    ];
+    if let Some(half) = bounds {
+        cols.push(Col::F64(
+            "elution_lo".into(),
+            r.iter().map(|x| x.3 - half).collect(),
+        ));
+        cols.push(Col::F64(
+            "elution_hi".into(),
+            r.iter().map(|x| x.3 + half).collect(),
+        ));
+    }
+    write_table(&scored, cols).unwrap();
+    // One wide window, a scan a second around every planted apex, each planted ladder
+    // present in the five scans nearest its apex, and a fixed scatter of unrelated peaks.
+    let ladders: Vec<(f64, Vec<f64>)> = planted
+        .iter()
+        .map(|(apex, pf, modname, sites)| (*apex, ladder_of(pf, modname, sites)))
+        .collect();
+    let mut times: Vec<f64> = ladders
+        .iter()
+        .flat_map(|(apex, _)| (-10i32..=10).map(move |k| apex + k as f64))
+        .collect();
+    times.sort_by(f64::total_cmp);
+    times.dedup();
     let mut rt = Vec::new();
     let mut mz: Vec<Vec<f32>> = Vec::new();
     let mut it: Vec<Vec<f32>> = Vec::new();
-    for (apex, pf, modname, sites) in planted {
-        let lad = ladder_of(pf, modname, sites);
-        let apex = *apex;
-        for k in -10i32..=10 {
-            let t = apex + k as f64;
-            let mut peaks: Vec<(f32, f32)> = (0..40)
-                .map(|j| (150.0 + j as f32 * 23.71 + k as f32 * 0.013, 50.0))
-                .collect();
-            if k.abs() <= 2 {
-                for &m in &lad {
-                    peaks.push((m as f32, 1000.0 / (1.0 + k.abs() as f32)));
+    for t in times {
+        let nearest = ladders
+            .iter()
+            .map(|(apex, _)| t - apex)
+            .min_by(|a, b| a.abs().total_cmp(&b.abs()))
+            .unwrap_or(0.0);
+        let k = nearest.round() as f32;
+        let mut peaks: Vec<(f32, f32)> = (0..40)
+            .map(|j| (150.0 + j as f32 * 23.71 + k * 0.013, 50.0))
+            .collect();
+        for (apex, lad) in &ladders {
+            let d = (t - apex).abs();
+            if d <= 2.0 + 1e-9 {
+                for &m in lad {
+                    peaks.push((m as f32, 1000.0 / (1.0 + d as f32)));
                 }
             }
-            peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
-            rt.push(t);
-            mz.push(peaks.iter().map(|p| p.0).collect());
-            it.push(peaks.iter().map(|p| p.1).collect());
         }
+        peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
+        rt.push(t);
+        mz.push(peaks.iter().map(|p| p.0).collect());
+        it.push(peaks.iter().map(|p| p.1).collect());
     }
     let ns = rt.len();
     write_table(
@@ -402,6 +435,207 @@ fn terminal_rules_are_an_n_terminal_placement() {
     assert_eq!(o3.status[a3], "unambiguous");
     assert_eq!(o3.best[a3], "[Acetyl]-SAKPEDLTGR");
     let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+/// Two isomers 9 s apart with overlapping elution bounds: the 5 s rule makes two peaks; the
+/// elution-bounds rule makes one when their shared fragments show one peak, and two when the
+/// shared-fragment profile dips between the apexes.
+#[test]
+fn the_elution_bounds_rule_merges_one_peak_and_keeps_two() {
+    let r: Vec<FixtureRow> = vec![
+        ("VT[Phospho]DGNSPEK", "target", 2, 300.0, 0.8, 0.001),
+        ("VTDGNS[Phospho]PEK", "target", 2, 309.0, 0.7, 0.001),
+    ];
+    let peaks_of = |name: &str, planted: &[(f64, &str, &str, Vec<usize>)], rule: &str| {
+        let f = fixture_full(name, &r, planted, 0, Some(10.0));
+        let cfg: LocaliseConfig = serde_json::from_value(serde_json::json!({
+            "peak_rule": rule
+        }))
+        .unwrap();
+        let out = f.dir.join("loc.parquet").to_str().unwrap().to_string();
+        run_on(&f, &out, &cfg);
+        let o = read(&out);
+        let _ = std::fs::remove_dir_all(&f.dir);
+        (o.peak[0], o.peak[1], o.best.clone())
+    };
+    let one = vec![(300.0, "VT[Phospho]DGNSPEK", "Phospho", vec![1])];
+    let (a, b, _) = peaks_of("eb_one_tol", &one, "apex_tolerance");
+    assert_ne!(a, b);
+    let (a, b, best) = peaks_of("eb_one", &one, "elution_bounds");
+    assert_eq!(a, b);
+    assert_eq!(best[1], "VT[Phospho]DGNSPEK");
+    let two = vec![
+        (300.0, "VT[Phospho]DGNSPEK", "Phospho", vec![1]),
+        (309.0, "VT[Phospho]DGNSPEK", "Phospho", vec![5]),
+    ];
+    let (a, b, best) = peaks_of("eb_two", &two, "elution_bounds");
+    assert_ne!(a, b);
+    assert_eq!(best[0], "VT[Phospho]DGNSPEK");
+    assert_eq!(best[1], "VTDGNS[Phospho]PEK");
+}
+
+/// Neutral-loss ions and the fitted temperature leave the planted calls standing and are
+/// recorded in the report; the fitted temperature is on the grid.
+#[test]
+fn neutral_loss_and_auto_temperature_run_on_the_fixture() {
+    let f = fixture("nl_auto");
+    let cfg: LocaliseConfig = serde_json::from_value(serde_json::json!({
+        "neutral_loss": true,
+        "temperature": "auto"
+    }))
+    .unwrap();
+    assert_eq!(cfg.fixed_temperature(), None);
+    let out = f.dir.join("loc.parquet").to_str().unwrap().to_string();
+    let s = run_on(&f, &out, &cfg);
+    assert!((0.25..=8.0).contains(&s.temperature), "{}", s.temperature);
+    let o = read(&out);
+    assert_eq!(
+        o.best[row_of(&o, "LSDGAT[Phospho]PEK")],
+        "LS[Phospho]DGATPEK"
+    );
+    let rep: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{out}.report.json")).unwrap())
+            .unwrap();
+    assert_eq!(rep["params"]["neutral_loss"], true);
+    assert_eq!(rep["stats"]["temperature"]["mode"], "auto");
+    assert_eq!(rep["schema_version"], 2);
+    // the classes of the loss ions have rates of their own
+    assert_eq!(
+        rep["stats"]["detection_rate_by_class"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+/// Two runs of an experiment: run 1 lacks VADGSPTLK and has the other peptides at the same
+/// retention times. The consensus peaks sum both runs' log-likelihoods where both observed
+/// the peak (one consensus peak per separated isomer), and only run 0's for VADGSPTLK; the
+/// per-run tables are those `run` writes for each run alone at the same temperature.
+#[test]
+fn the_runs_of_an_experiment_combine_into_consensus_peaks() {
+    let planted: Vec<(f64, &str, &str, Vec<usize>)> = planted()
+        .into_iter()
+        .map(|(apex, pf, sites)| (apex, pf, "Phospho", sites))
+        .collect();
+    let r0 = rows();
+    let r1: Vec<FixtureRow> = rows()
+        .into_iter()
+        .filter(|x| !x.0.starts_with("VADGS"))
+        .collect();
+    let f0 = fixture_full("x_r0", &r0, &planted, 0, None);
+    let f1 = fixture_full("x_r1", &r1, &planted, 1, None);
+    // a fixed run temperature: the per-run tables then equal those of `run` alone
+    let cfg = LocaliseConfig {
+        temperature: 1.0,
+        ..LocaliseConfig::default()
+    };
+    let phospho: Vec<ResidueMod> = "STY"
+        .chars()
+        .map(|c| rule(c, "Phospho", ModPosition::Anywhere))
+        .collect();
+    let base = Config::default();
+    let out0 = f0.dir.join("loc.parquet").to_str().unwrap().to_string();
+    let out1 = f1.dir.join("loc.parquet").to_str().unwrap().to_string();
+    let outx = f0.dir.join("loc_x.parquet").to_str().unwrap().to_string();
+    let params = |f: &Fixture, out: &str, s: u32| -> (String, String, String, u32) {
+        (f.scored.clone(), f.spectra.clone(), out.to_string(), s)
+    };
+    let inputs = [params(&f0, &out0, 0), params(&f1, &out1, 1)];
+    let s = run_experiment(ExperimentLocaliseParams {
+        runs: inputs
+            .iter()
+            .map(|(scored, spectra, out, src)| LocaliseParams {
+                scored,
+                spectra_ms2: spectra,
+                mass_cal: None,
+                psms_extracted: None,
+                source: Some(*src),
+                out,
+                cfg: &cfg,
+                variable_mods: &phospho,
+                fasta: None,
+                fallback_tol_ppm: base.extract.frag_tol_ppm,
+                config_hash: "test",
+            })
+            .collect(),
+        out: Some(&outx),
+        config_hash: "test",
+    })
+    .unwrap();
+    let c = s.combined.as_ref().unwrap();
+    assert!(c.consensus_peaks > 0);
+    let x = TableFile::open(&outx).unwrap();
+    let pf = x.str("peptidoform").unwrap();
+    let n_runs = x.u32("n_runs").unwrap();
+    let best = x.opt_str("best_site_peptidoform").unwrap();
+    let status = x.str("status").unwrap();
+    let label = x.str("label").unwrap();
+    let at = |p: &str| pf.iter().position(|q| q == p).unwrap();
+    let ls = at("LS[Phospho]DGATPEK");
+    assert_eq!(n_runs[ls], 2);
+    assert_eq!(status[ls], "localised");
+    assert_eq!(best[ls].as_deref(), Some("LS[Phospho]DGATPEK"));
+    // the separated pair: two consensus peaks, each from both runs, each its own site
+    let vt = at("VT[Phospho]DGNSPEK");
+    let vs = at("VTDGNS[Phospho]PEK");
+    assert_ne!(vt, vs);
+    assert_eq!((n_runs[vt], n_runs[vs]), (2, 2));
+    assert_eq!(best[vs].as_deref(), Some("VTDGNS[Phospho]PEK"));
+    // observed in run 0 only
+    let va = at("VADGS[Phospho]PTLK");
+    assert_eq!(n_runs[va], 1);
+    assert_eq!(status[va], "decoy_residue");
+    // decoys above q_max are no peaks, so no consensus peaks
+    assert!(label.iter().all(|l| l == "target"));
+    // the per-run tables equal `run` on each run alone at the same (fixed) temperature
+    let alone = f1.dir.join("alone.parquet").to_str().unwrap().to_string();
+    let a1 = run(LocaliseParams {
+        scored: &f1.scored,
+        spectra_ms2: &f1.spectra,
+        mass_cal: None,
+        psms_extracted: None,
+        source: Some(1),
+        out: &alone,
+        cfg: &cfg,
+        variable_mods: &phospho,
+        fasta: None,
+        fallback_tol_ppm: base.extract.frag_tol_ppm,
+        config_hash: "test",
+    })
+    .unwrap();
+    assert_eq!(a1.written.content_hash, s.runs[1].written.content_hash);
+    // deterministic
+    let outx2 = f0.dir.join("loc_x2.parquet").to_str().unwrap().to_string();
+    let s2 = run_experiment(ExperimentLocaliseParams {
+        runs: inputs
+            .iter()
+            .map(|(scored, spectra, _, src)| LocaliseParams {
+                scored,
+                spectra_ms2: spectra,
+                mass_cal: None,
+                psms_extracted: None,
+                source: Some(*src),
+                out: if *src == 0 { &out0 } else { &out1 },
+                cfg: &cfg,
+                variable_mods: &phospho,
+                fasta: None,
+                fallback_tol_ppm: base.extract.frag_tol_ppm,
+                config_hash: "test",
+            })
+            .collect(),
+        out: Some(&outx2),
+        config_hash: "test",
+    })
+    .unwrap();
+    assert_eq!(
+        s2.combined.unwrap().written.content_hash,
+        c.written.content_hash
+    );
+    let _ = std::fs::remove_dir_all(&f0.dir);
+    let _ = std::fs::remove_dir_all(&f1.dir);
 }
 
 #[test]

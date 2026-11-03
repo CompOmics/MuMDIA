@@ -227,8 +227,8 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<(u64
         "precursor\tstripped_sequence\tcharge\tprotein\tq_value\tscore\tquantity\t\
          is_transferred\ttransfer_q"
     )?;
-    if site_cells.is_some() {
-        write!(w, "{LOCALISATION_HEADER}")?;
+    if let Some(c) = &site_cells {
+        write!(w, "{}", c.header())?;
     }
     writeln!(w)?;
     let mut npep = 0u64;
@@ -509,8 +509,8 @@ pub fn run_experiment_localised(
         Some(l) => Some(l.lookup(true)?),
         None => None,
     };
-    if site_cells.is_some() {
-        write!(w, "{LOCALISATION_HEADER}")?;
+    if let Some(c) = &site_cells {
+        write!(w, "{}", c.header())?;
     }
     writeln!(w)?;
     let mut npep = 0u64;
@@ -621,11 +621,16 @@ pub fn run_experiment_localised(
 
 /// The three `peptides.tsv` columns the `localise` stage adds.
 const LOCALISATION_HEADER: &str = "\tsite_probability\tlocalised\tbest_site_peptidoform";
+/// The three more an experiment-level combination adds.
+const EXPERIMENT_LOCALISATION_HEADER: &str =
+    "\texperiment_site_probability\texperiment_localised\texperiment_best_site_peptidoform";
 
 /// The `localise` stage's tables, for the report (docs/36_ptm_localisation.md).
 pub struct Localisation<'a> {
     /// One `localisation.parquet` per run; each carries its run's `source`.
     pub tables: &'a [String],
+    /// The experiment-level `localisation_experiment.parquet`, when the runs were combined.
+    pub experiment: Option<&'a str>,
     /// A FASTA to number the sites on their proteins; without one `protein_position` is
     /// empty.
     pub fasta: Option<&'a str>,
@@ -638,17 +643,34 @@ pub struct SiteCells {
     by: HashMap<(u32, String, i32), String>,
     /// Whether the key ignores the source (a single-run report).
     any_source: bool,
+    /// Whether the experiment-level columns follow.
+    experiment: bool,
 }
 
 impl SiteCells {
-    /// `\t<site_probability>\t<localised>\t<best_site_peptidoform>`, empty cells for a
-    /// precursor the stage did not localise.
+    /// The header cells of the localisation columns.
+    fn header(&self) -> String {
+        if self.experiment {
+            format!("{LOCALISATION_HEADER}{EXPERIMENT_LOCALISATION_HEADER}")
+        } else {
+            LOCALISATION_HEADER.to_string()
+        }
+    }
+
+    /// `\t<site_probability>\t<localised>\t<best_site_peptidoform>` (and the three
+    /// experiment-level cells), empty cells for a precursor the stage did not localise.
     fn cells(&self, source: u32, pf: &str, charge: i32) -> String {
         let s = if self.any_source { 0 } else { source };
         self.by
             .get(&(s, pf.to_string(), charge))
             .cloned()
-            .unwrap_or_else(|| "\t\t\t".to_string())
+            .unwrap_or_else(|| {
+                if self.experiment {
+                    "\t\t\t\t\t\t".to_string()
+                } else {
+                    "\t\t\t".to_string()
+                }
+            })
     }
 }
 
@@ -659,13 +681,65 @@ struct SiteRow {
     flr_decoy: Option<f64>,
     best: String,
     sources: std::collections::BTreeSet<u32>,
+    /// The experiment level: the best probability over the localised consensus peaks naming
+    /// the site, the rates at it, its placement and the runs summed into it.
+    experiment: Option<ExperimentSite>,
+}
+
+/// A site's experiment-level cells: probability, model and decoy-residue rates, placement,
+/// runs combined.
+type ExperimentSite = (f64, Option<f64>, Option<f64>, String, u32);
+
+/// The site probability of every slot in a `site_probabilities` cell of a peptide of
+/// `n_res` residues.
+fn slot_probabilities(cell: &str, n_res: usize) -> HashMap<usize, f64> {
+    cell.split(';')
+        .filter_map(|c| {
+            let (label, v) = c.split_once(':')?;
+            Some((
+                crate::stages::localise::hypotheses::parse_slot_label(label, n_res)?,
+                v.parse::<f64>().ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// The consensus peaks of `localisation_experiment.parquet`, by the `(source,
+/// isomer_peak_id)` of each run peak they combine: `(site_probabilities, localised, best
+/// placement)`.
+type ExperimentPeaks = HashMap<(u32, i32), (Option<String>, bool, Option<String>)>;
+
+fn experiment_peaks(path: &str) -> Result<ExperimentPeaks> {
+    let t = TableFile::open(path)?;
+    let runs = t.str("runs")?;
+    let probs = t.opt_str("site_probabilities")?;
+    let localised = t.bool("localised")?;
+    let best = t.opt_str("best_site_peptidoform")?;
+    let mut out = HashMap::new();
+    for i in 0..t.nrows {
+        for m in runs[i].split(';').filter(|m| !m.is_empty()) {
+            let Some((s, p)) = m.split_once(':') else {
+                continue;
+            };
+            let (Ok(s), Ok(p)) = (s.parse::<u32>(), p.parse::<i32>()) else {
+                continue;
+            };
+            out.insert((s, p), (probs[i].clone(), localised[i], best[i].clone()));
+        }
+    }
+    Ok(out)
 }
 
 impl Localisation<'_> {
     /// The cells of every attempted row. A row is `localised` when its own placement is the
     /// peak's localised best placement; its `site_probability` is the smallest site
-    /// probability of its own sites.
+    /// probability of its own sites. With the experiment level, the same three of the
+    /// consensus peak its run peak joined.
     fn lookup(&self, per_source: bool) -> Result<SiteCells> {
+        let experiment = match self.experiment {
+            Some(x) => Some(experiment_peaks(x)?),
+            None => None,
+        };
         let mut by = HashMap::new();
         for path in self.tables {
             let t = TableFile::open(path)?;
@@ -675,27 +749,55 @@ impl Localisation<'_> {
             let own = t.opt_f64("own_site_prob")?;
             let localised = t.bool("localised")?;
             let best = t.opt_str("best_site_peptidoform")?;
+            let (peak, mods) = if experiment.is_some() {
+                (t.opt_i32("isomer_peak_id")?, t.str("localised_mod")?)
+            } else {
+                (Vec::new(), Vec::new())
+            };
             for i in 0..t.nrows {
                 let Some(b) = &best[i] else { continue };
                 let own_localised = localised[i] && *b == pf[i];
                 let p = own[i].map(|v| format!("{v:.4}")).unwrap_or_default();
                 let s = if per_source { source[i] } else { 0 };
-                by.insert(
-                    (s, pf[i].clone(), charge[i]),
-                    format!("\t{p}\t{own_localised}\t{b}"),
-                );
+                let mut cells = format!("\t{p}\t{own_localised}\t{b}");
+                if let Some(x) = &experiment {
+                    let found = peak[i].and_then(|pk| x.get(&(source[i], pk)));
+                    match found {
+                        Some((Some(ps), loc, Some(xb))) => {
+                            let own_p =
+                                crate::stages::localise::hypotheses::split(&pf[i], &mods[i])
+                                    .and_then(|sp| {
+                                        let by_slot = slot_probabilities(ps, sp.residues.len());
+                                        sp.sites
+                                            .iter()
+                                            .map(|s| by_slot.get(s).copied())
+                                            .collect::<Option<Vec<f64>>>()
+                                            .map(|v| v.into_iter().fold(f64::INFINITY, f64::min))
+                                    });
+                            let cell = own_p.map(|v| format!("{v:.4}")).unwrap_or_default();
+                            cells.push_str(&format!("\t{cell}\t{}\t{xb}", *loc && *xb == pf[i]));
+                        }
+                        _ => cells.push_str("\t\t\t"),
+                    }
+                }
+                by.insert((s, pf[i].clone(), charge[i]), cells);
             }
         }
         Ok(SiteCells {
             by,
             any_source: !per_source,
+            experiment: experiment.is_some(),
         })
     }
 
     /// `sites.tsv`: one row per localised site of a target peak representative, keyed by
     /// protein accession and protein position (peptide and peptide position when the FASTA
     /// does not hold the peptide), with the best site probability over the runs, the false
-    /// localisation rates at it and the number of runs it was localised in.
+    /// localisation rates at it and the number of runs it was localised in. With the
+    /// experiment level, also every site of a localised target consensus peak, and five more
+    /// columns: its best experiment-level probability, the rates at it, the placement and the
+    /// number of runs combined into it (a site localised only per run has them empty, one
+    /// localised only at the experiment level the per-run ones).
     fn write_sites(&self) -> Result<()> {
         let proteins: HashMap<String, String> = match self.fasta {
             Some(f) => crate::stages::digest::read_fasta(f)?.into_iter().collect(),
@@ -705,6 +807,53 @@ impl Localisation<'_> {
         // N-terminal site is numbered at the first residue, with residue `N-term`
         type Key = (String, Option<usize>, String, usize, String, String);
         let mut sites: std::collections::BTreeMap<Key, SiteRow> = Default::default();
+        // The keys of every site of placement `best` of modification `m` on `protein`, with
+        // the site probabilities of `ps`.
+        let keys_of = |protein: &str, best: &str, ps: &str, m: &str| -> Vec<(Key, f64)> {
+            let Some(split) = crate::stages::localise::hypotheses::split(best, m) else {
+                return Vec::new();
+            };
+            let n_res = split.residues.len();
+            let by_slot = slot_probabilities(ps, n_res);
+            let peptide = String::from_utf8_lossy(&split.residues).into_owned();
+            let mut out = Vec::new();
+            for acc in protein.split(';').filter(|a| !a.is_empty()) {
+                let start = proteins.get(acc).and_then(|seq| seq.find(&peptide));
+                for &site in &split.sites {
+                    let prob = by_slot.get(&site).copied().unwrap_or(f64::NAN);
+                    // 1-based position in the peptide; the N-terminus at the first residue
+                    let at = if site < n_res { site + 1 } else { 1 };
+                    let residue = match split.residue_at(site) {
+                        Some(c) => (c as char).to_string(),
+                        None => crate::stages::localise::hypotheses::N_TERM_LABEL.to_string(),
+                    };
+                    out.push((
+                        (
+                            acc.to_string(),
+                            start.map(|s| s + at),
+                            if start.is_some() {
+                                String::new()
+                            } else {
+                                peptide.clone()
+                            },
+                            if start.is_some() { 0 } else { at },
+                            residue,
+                            m.to_string(),
+                        ),
+                        prob,
+                    ));
+                }
+            }
+            out
+        };
+        let empty_row = || SiteRow {
+            prob: f64::NEG_INFINITY,
+            flr_model: None,
+            flr_decoy: None,
+            best: String::new(),
+            sources: Default::default(),
+            experiment: None,
+        };
         for path in self.tables {
             let t = TableFile::open(path)?;
             let source = t.u32("source")?;
@@ -724,73 +873,70 @@ impl Localisation<'_> {
                 let (Some(b), Some(ps)) = (&best[i], &probs[i]) else {
                     continue;
                 };
-                let Some(split) = crate::stages::localise::hypotheses::split(b, &mods[i]) else {
+                for (key, prob) in keys_of(&protein[i], b, ps, &mods[i]) {
+                    let e = sites.entry(key).or_insert_with(empty_row);
+                    e.sources.insert(source[i]);
+                    if prob > e.prob {
+                        e.prob = prob;
+                        e.flr_model = flr_m[i];
+                        e.flr_decoy = flr_d[i];
+                        e.best = b.clone();
+                    }
+                }
+            }
+        }
+        if let Some(x) = self.experiment {
+            let t = TableFile::open(x)?;
+            let label = t.str("label")?;
+            let protein = t.str("protein")?;
+            let localised = t.bool("localised")?;
+            let mods = t.str("localised_mod")?;
+            let best = t.opt_str("best_site_peptidoform")?;
+            let probs = t.opt_str("site_probabilities")?;
+            let flr_m = t.opt_f64("site_flr_model")?;
+            let flr_d = t.opt_f64("site_flr_decoy")?;
+            let n_runs = t.u32("n_runs")?;
+            for i in 0..t.nrows {
+                if !(localised[i] && label[i] == "target") {
+                    continue;
+                }
+                let (Some(b), Some(ps)) = (&best[i], &probs[i]) else {
                     continue;
                 };
-                let n_res = split.residues.len();
-                let by_slot: HashMap<usize, f64> = ps
-                    .split(';')
-                    .filter_map(|cell| {
-                        let (label, v) = cell.split_once(':')?;
-                        Some((
-                            crate::stages::localise::hypotheses::parse_slot_label(label, n_res)?,
-                            v.parse::<f64>().ok()?,
-                        ))
-                    })
-                    .collect();
-                let peptide = String::from_utf8_lossy(&split.residues).into_owned();
-                for acc in protein[i].split(';').filter(|a| !a.is_empty()) {
-                    let start = proteins.get(acc).and_then(|seq| seq.find(&peptide));
-                    for &site in &split.sites {
-                        let prob = by_slot.get(&site).copied().unwrap_or(f64::NAN);
-                        // 1-based position in the peptide; the N-terminus at the first residue
-                        let at = if site < n_res { site + 1 } else { 1 };
-                        let residue = match split.residue_at(site) {
-                            Some(c) => (c as char).to_string(),
-                            None => crate::stages::localise::hypotheses::N_TERM_LABEL.to_string(),
-                        };
-                        let key: Key = (
-                            acc.to_string(),
-                            start.map(|s| s + at),
-                            if start.is_some() {
-                                String::new()
-                            } else {
-                                peptide.clone()
-                            },
-                            if start.is_some() { 0 } else { at },
-                            residue,
-                            mods[i].clone(),
-                        );
-                        let e = sites.entry(key).or_insert_with(|| SiteRow {
-                            prob: f64::NEG_INFINITY,
-                            flr_model: None,
-                            flr_decoy: None,
-                            best: String::new(),
-                            sources: Default::default(),
-                        });
-                        e.sources.insert(source[i]);
-                        if prob > e.prob {
-                            e.prob = prob;
-                            e.flr_model = flr_m[i];
-                            e.flr_decoy = flr_d[i];
-                            e.best = b.clone();
-                        }
+                for (key, prob) in keys_of(&protein[i], b, ps, &mods[i]) {
+                    let e = sites.entry(key).or_insert_with(empty_row);
+                    if e.experiment.as_ref().is_none_or(|x| prob > x.0) {
+                        e.experiment = Some((prob, flr_m[i], flr_d[i], b.clone(), n_runs[i]));
                     }
                 }
             }
         }
         let target = mumdia_io::table::AtomicPath::new(self.out_sites)?;
         let mut w = std::io::BufWriter::new(std::fs::File::create(target.tmp())?);
-        writeln!(
+        write!(
             w,
             "protein\tprotein_position\tresidue\tmodification\tpeptide\tpeptide_position\t\
              site_probability\tsite_flr_model\tsite_flr_decoy\tbest_site_peptidoform\tn_runs"
         )?;
+        if self.experiment.is_some() {
+            write!(
+                w,
+                "\texperiment_site_probability\texperiment_site_flr_model\t\
+                 experiment_site_flr_decoy\texperiment_best_site_peptidoform\texperiment_n_runs"
+            )?;
+        }
+        writeln!(w)?;
         let opt = |v: Option<f64>| v.map(|x| format!("{x:.4}")).unwrap_or_default();
         for ((acc, ppos, pep, pepos, res, m), r) in &sites {
+            // the placement that names the peptide: the per-run best, else the experiment's
+            let named = if r.sources.is_empty() {
+                r.experiment.as_ref().map_or("", |x| x.3.as_str())
+            } else {
+                r.best.as_str()
+            };
             let (pep_cell, pos_cell) = if ppos.is_some() {
                 // numbered on the protein: name the peptide of the best placement
-                let pep = strip(&r.best);
+                let pep = strip(named);
                 let pos = ppos
                     .and_then(|p| proteins.get(acc).and_then(|s| s.find(&pep)).map(|s| p - s))
                     .unwrap_or(0);
@@ -798,16 +944,32 @@ impl Localisation<'_> {
             } else {
                 (pep.clone(), pepos.to_string())
             };
-            writeln!(
+            let run_cells = if r.sources.is_empty() {
+                "\t\t\t\t0".to_string()
+            } else {
+                format!(
+                    "{:.4}\t{}\t{}\t{}\t{}",
+                    r.prob,
+                    opt(r.flr_model),
+                    opt(r.flr_decoy),
+                    r.best,
+                    r.sources.len()
+                )
+            };
+            write!(
                 w,
-                "{acc}\t{}\t{res}\t{m}\t{pep_cell}\t{pos_cell}\t{:.4}\t{}\t{}\t{}\t{}",
+                "{acc}\t{}\t{res}\t{m}\t{pep_cell}\t{pos_cell}\t{run_cells}",
                 ppos.map(|p| p.to_string()).unwrap_or_default(),
-                r.prob,
-                opt(r.flr_model),
-                opt(r.flr_decoy),
-                r.best,
-                r.sources.len()
             )?;
+            if self.experiment.is_some() {
+                match &r.experiment {
+                    Some((p, fm, fd, b, n)) => {
+                        write!(w, "\t{p:.4}\t{}\t{}\t{b}\t{n}", opt(*fm), opt(*fd))?
+                    }
+                    None => write!(w, "\t\t\t\t\t")?,
+                }
+            }
+            writeln!(w)?;
         }
         w.flush()?;
         drop(w);
@@ -1654,6 +1816,7 @@ mod tests {
         let tables = vec![loc.clone()];
         let l = Localisation {
             tables: &tables,
+            experiment: None,
             fasta: Some(&fasta),
             out_sites: &sites,
         };
@@ -1728,6 +1891,7 @@ mod tests {
         let tables = vec![loc];
         Localisation {
             tables: &tables,
+            experiment: None,
             fasta: Some(&fasta),
             out_sites: &sites,
         }
@@ -1745,6 +1909,109 @@ mod tests {
             rows.iter()
                 .any(|r| r.starts_with("P3\t2\tN-term\tAcetyl\tKAPEPTIDR\t1\t0.9600\t")),
             "{s}"
+        );
+    }
+
+    /// With the experiment-level table, peptides.tsv gains three cells from the consensus
+    /// peak a row's run peak joined, and sites.tsv five columns: a site localised per run only
+    /// has them empty, a site localised at the experiment level only has the per-run ones
+    /// empty and `n_runs` 0.
+    #[test]
+    fn experiment_level_cells_and_sites() {
+        let loc = tmp("loc_run_x.parquet");
+        write_table(
+            &loc,
+            vec![
+                Col::U32("source".into(), vec![0, 0]),
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEPS[Phospho]TIDEK".into(), "PEPST[Phospho]IDEK".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 2]),
+                Col::Str("label".into(), vec!["target".into(); 2]),
+                Col::Str("protein".into(), vec!["P1".into(); 2]),
+                Col::OptI32("isomer_peak_id".into(), vec![Some(0), Some(0)]),
+                Col::Bool("is_peak_representative".into(), vec![true, false]),
+                Col::Bool("localised".into(), vec![true, true]),
+                Col::Str("localised_mod".into(), vec!["Phospho".into(); 2]),
+                Col::OptStr(
+                    "best_site_peptidoform".into(),
+                    vec![Some("PEPS[Phospho]TIDEK".into()); 2],
+                ),
+                Col::OptStr(
+                    "site_probabilities".into(),
+                    vec![Some("S4:0.9500;T5:0.0500".into()); 2],
+                ),
+                Col::OptF64("own_site_prob".into(), vec![Some(0.95), Some(0.05)]),
+                Col::OptF64("site_flr_model".into(), vec![Some(0.05); 2]),
+                Col::OptF64("site_flr_decoy".into(), vec![Some(0.04); 2]),
+            ],
+        )
+        .unwrap();
+        let xp = tmp("loc_experiment.parquet");
+        write_table(
+            &xp,
+            vec![
+                Col::Str("runs".into(), vec!["0:0;1:3".into()]),
+                Col::Str("label".into(), vec!["target".into()]),
+                Col::Str("protein".into(), vec!["P1".into()]),
+                Col::Bool("localised".into(), vec![true]),
+                Col::Str("localised_mod".into(), vec!["Phospho".into()]),
+                Col::OptStr(
+                    "best_site_peptidoform".into(),
+                    vec![Some("PEPST[Phospho]IDEK".into())],
+                ),
+                Col::OptStr(
+                    "site_probabilities".into(),
+                    vec![Some("S4:0.1000;T5:0.9000".into())],
+                ),
+                Col::OptF64("site_flr_model".into(), vec![Some(0.02)]),
+                Col::OptF64("site_flr_decoy".into(), vec![Some(0.03)]),
+                Col::U32("n_runs".into(), vec![2]),
+            ],
+        )
+        .unwrap();
+        let fasta = tmp("x.fasta");
+        std::fs::write(&fasta, ">P1\nAAPEPSTIDEKAA\n").unwrap();
+        let sites = tmp("x_sites.tsv");
+        let tables = vec![loc];
+        let l = Localisation {
+            tables: &tables,
+            experiment: Some(&xp),
+            fasta: Some(&fasta),
+            out_sites: &sites,
+        };
+        let cells = l.lookup(true).unwrap();
+        assert!(cells.header().ends_with(
+            "\texperiment_site_probability\texperiment_localised\texperiment_best_site_peptidoform"
+        ));
+        assert_eq!(
+            cells.cells(0, "PEPS[Phospho]TIDEK", 2),
+            "\t0.9500\ttrue\tPEPS[Phospho]TIDEK\t0.1000\tfalse\tPEPST[Phospho]IDEK"
+        );
+        assert_eq!(
+            cells.cells(0, "PEPST[Phospho]IDEK", 2),
+            "\t0.0500\tfalse\tPEPS[Phospho]TIDEK\t0.9000\ttrue\tPEPST[Phospho]IDEK"
+        );
+        assert_eq!(cells.cells(0, "LATEK", 2), "\t\t\t\t\t\t");
+        l.write_sites().unwrap();
+        let s = std::fs::read_to_string(&sites).unwrap();
+        let mut lines = s.lines();
+        assert!(lines.next().unwrap().ends_with("\texperiment_n_runs"));
+        let rows: Vec<&str> = lines.collect();
+        assert_eq!(rows.len(), 2, "{s}");
+        // S6 of P1: localised per run only
+        assert!(
+            rows[0].starts_with("P1\t6\tS\tPhospho\tPEPSTIDEK\t4\t0.9500\t0.0500\t0.0400\t")
+                && rows[0].ends_with("\t1\t\t\t\t\t"),
+            "{}",
+            rows[0]
+        );
+        // T7 of P1: localised at the experiment level only
+        assert_eq!(
+            rows[1],
+            "P1\t7\tT\tPhospho\tPEPSTIDEK\t5\t\t\t\t\t0\t0.9000\t0.0200\t0.0300\t\
+             PEPST[Phospho]IDEK\t2"
         );
     }
 

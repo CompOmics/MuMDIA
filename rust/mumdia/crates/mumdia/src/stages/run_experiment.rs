@@ -2272,40 +2272,56 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         .collect();
     let split_written = split_by_source(&scored_for_quant, &split_paths)?;
 
-    // --- modification site localisation, per run (`localise.enabled`, experimental) ---
+    // --- modification site localisation (`localise.enabled`, experimental) ---
     // Reporting only: each run's split scored table against its own spectra, after the final
-    // rescore. The apex 1/K0 comes from the extracted rows the scored rows came from: the
-    // second pass's when it ran.
-    let localisation: Vec<String> = if cfg.localise.enabled {
-        let mut out = Vec::with_capacity(n_runs);
-        for i in 0..n_runs {
-            let run_dir = d(&names[i]);
-            let table = format!("{run_dir}/localisation.parquet");
-            let extracted = match &second {
-                Some(sp) => sp.psms_extracted.get(i).cloned(),
-                None => Some(format!("{run_dir}/psms_extracted.parquet")),
-            };
-            let mass_cal = crate::masscal::json_path(&format!("{run_dir}/seed_psms.parquet"));
-            info!(stage = %"localise", run = %names[i], "run-experiment: stage start");
-            crate::stages::localise::run(crate::stages::localise::LocaliseParams {
-                scored: &split_paths[i],
-                spectra_ms2: &format!("{run_dir}/spectra/spectra_ms2.parquet"),
-                mass_cal: Some(&mass_cal),
-                psms_extracted: extracted.as_deref(),
-                source: Some(i as u32),
-                out: &table,
-                cfg: &cfg.localise,
-                variable_mods: &cfg.peptidoforms.variable_mods,
-                fasta: p.fasta,
-                fallback_tol_ppm: cfg.extract.frag_tol_ppm,
-                config_hash: &ch,
-            })?;
-            out.push(table);
-        }
-        out
-    } else {
-        Vec::new()
-    };
+    // rescore, at one temperature for every run, then (`localise.combine_runs`) the runs
+    // combined per consensus peak. The apex 1/K0 comes from the extracted rows the scored
+    // rows came from: the second pass's when it ran.
+    let (localisation, localisation_experiment): (Vec<String>, Option<String>) =
+        if cfg.localise.enabled {
+            let tables: Vec<String> = (0..n_runs)
+                .map(|i| format!("{}/localisation.parquet", d(&names[i])))
+                .collect();
+            let spectra: Vec<String> = (0..n_runs)
+                .map(|i| format!("{}/spectra/spectra_ms2.parquet", d(&names[i])))
+                .collect();
+            let mass_cals: Vec<String> = (0..n_runs)
+                .map(|i| crate::masscal::json_path(&format!("{}/seed_psms.parquet", d(&names[i]))))
+                .collect();
+            let extracted: Vec<Option<String>> = (0..n_runs)
+                .map(|i| match &second {
+                    Some(sp) => sp.psms_extracted.get(i).cloned(),
+                    None => Some(format!("{}/psms_extracted.parquet", d(&names[i]))),
+                })
+                .collect();
+            let combined = (cfg.localise.combine_runs && n_runs > 1)
+                .then(|| d("localisation_experiment.parquet"));
+            info!(stage = %"localise", runs = n_runs, "run-experiment: stage start");
+            crate::stages::localise::run_experiment(
+                crate::stages::localise::ExperimentLocaliseParams {
+                    runs: (0..n_runs)
+                        .map(|i| crate::stages::localise::LocaliseParams {
+                            scored: &split_paths[i],
+                            spectra_ms2: &spectra[i],
+                            mass_cal: Some(&mass_cals[i]),
+                            psms_extracted: extracted[i].as_deref(),
+                            source: Some(i as u32),
+                            out: &tables[i],
+                            cfg: &cfg.localise,
+                            variable_mods: &cfg.peptidoforms.variable_mods,
+                            fasta: p.fasta,
+                            fallback_tol_ppm: cfg.extract.frag_tol_ppm,
+                            config_hash: &ch,
+                        })
+                        .collect(),
+                    out: combined.as_deref(),
+                    config_hash: &ch,
+                },
+            )?;
+            (tables, combined)
+        } else {
+            (Vec::new(), None)
+        };
 
     let mut qcfg = cfg.quant.clone();
     // Per-run quant gates on the pooled `q_value`, not on whatever `quant.q_filter` says. The
@@ -2496,6 +2512,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     let sites_tsv = d("sites.tsv");
     let loc = (!localisation.is_empty()).then(|| report::Localisation {
         tables: &localisation,
+        experiment: localisation_experiment.as_deref(),
         fasta: p.fasta,
         out_sites: &sites_tsv,
     });
@@ -2588,6 +2605,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     if let (false, Some(m)) = (localisation.is_empty(), manifest.as_object_mut()) {
         m.insert("localisation".to_string(), json!(localisation));
         m.insert("sites".to_string(), json!(sites_tsv));
+        if let Some(x) = &localisation_experiment {
+            m.insert("localisation_experiment".to_string(), json!(x));
+        }
     }
     // The cross-run normalisation, only when it ran, so every other manifest keeps its bytes.
     if let (Some((tables, shifts, _)), Some(m)) = (&normalised, manifest.as_object_mut()) {

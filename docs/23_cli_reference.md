@@ -47,7 +47,7 @@ Commands:
   sub-library      Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires
   extract          Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms
   retrace          Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. The configuration's `retrace` section applies, `enabled` aside
-  localise         Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. Reporting only: nothing upstream changes
+  localise         Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet; with --experiment-dir, on every run of a finished run-experiment at one temperature, and the runs combined -> localisation_experiment.parquet. Reporting only: nothing upstream changes
   mobilogram       The 1/K0 profile (mobilogram) of candidates' fragment and MS1 ions, read from the raw events of a diaPASEF `.d` (docs/35_diapasef.md section 17). Read-only
   features         Compute the minimal feature set -> features.parquet + PIN
   pool             Pool a grouped run's band artifacts into the run-level tables
@@ -170,7 +170,7 @@ first sentence of the description, with the full text in the section below.
 | [`sub-library`](#sub-library) | yes | Subset a library to a set of candidates (a first pass's survivors, or prescan's), renumbered to the contiguous 0..n the fragment index requires |
 | [`extract`](#extract) | yes | Targeted 3D extraction (peak-major cascade) -> psms_extracted, chromatograms |
 | [`retrace`](#retrace) | yes | Rebuild a diaPASEF run's chromatograms from the raw timsTOF events, and patch its psms_extracted (docs/35_diapasef.md section 6). `run` and `run-experiment` do this after extract under `retrace.enabled`; standalone it takes the same inputs by path. |
-| [`localise`](#localise) | yes | Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. |
+| [`localise`](#localise) | yes | Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet; with --experiment-dir, on every run of a finished run-experiment at one temperature, and the runs combined -> localisation_experiment.parquet. |
 | [`mobilogram`](#mobilogram) | yes | The 1/K0 profile (mobilogram) of candidates' fragment and MS1 ions, read from the raw events of a diaPASEF `.d` (docs/35_diapasef.md section 17). |
 | [`features`](#features) | yes | Compute the minimal feature set -> features.parquet + PIN |
 | [`pool`](#pool) | no | Pool a grouped run's band artifacts into the run-level tables |
@@ -505,9 +505,9 @@ Plus the 7 repeated flags removed above: see "Global flags".
 ## localise
 
 ```text
-Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet. Reporting only: nothing upstream changes
+Site probabilities of a localised modification on one run's scored rows (experimental; docs/36_ptm_localisation.md) -> localisation.parquet; with --experiment-dir, on every run of a finished run-experiment at one temperature, and the runs combined -> localisation_experiment.parquet. Reporting only: nothing upstream changes
 
-Usage: mumdia localise [OPTIONS] --psms-scored <PSMS_SCORED> --spectra-ms2 <SPECTRA_MS2> --out <OUT>
+Usage: mumdia localise [OPTIONS]
 
 Options:
       --psms-scored <PSMS_SCORED>
@@ -529,6 +529,15 @@ Options:
           The search's FASTA: which peptides start a protein, for a modification whose N-terminal rule is protein_n_term. Without it a peptide's N-terminus is a placement only when the table carries the modification there
 
       --out <OUT>
+
+      --experiment-dir <EXPERIMENT_DIR>
+          A finished run-experiment directory: localise each of its runs (the inputs named by experiment_manifest.json and the run directories) and combine them. Written in place, and recorded in the manifest for `mumdia report --experiment-dir`, unless --out-dir is given
+
+      --out-dir <OUT_DIR>
+          With --experiment-dir: write <run>/localisation.parquet and localisation_experiment.parquet here instead, and leave the experiment untouched
+
+      --sources <SOURCES>
+          With --experiment-dir: only these sources (comma-separated run indices)
 
       --config <CONFIG>
 ```

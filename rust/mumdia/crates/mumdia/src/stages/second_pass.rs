@@ -331,19 +331,45 @@ pub(crate) struct Consensus {
     pub unaligned: usize,
 }
 
-pub(crate) fn consensus(obs: &[(u32, u32, f64)]) -> Consensus {
+/// The run with the most confident apexes in `obs`, the lowest source on a tie.
+fn reference_of(obs: &[(u32, u32, f64)]) -> Option<u32> {
     let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
     for &(s, _, _) in obs {
         *counts.entry(s).or_default() += 1;
     }
-    // The run with the most confident apexes, the lowest source on a tie.
     let mut reference: Option<(u32, usize)> = None;
     for (&s, &n) in &counts {
         if reference.is_none_or(|(_, m)| n > m) {
             reference = Some((s, n));
         }
     }
-    let Some((ref_s, _)) = reference else {
+    reference.map(|r| r.0)
+}
+
+/// The retention-time alignment [`consensus`] fits, by run: the reference run and the curve
+/// of every other run that shares at least `MIN_SHARED` of the candidates in `obs` (`(source,
+/// candidate_id, apex)`) with it. The reference, and a run without a curve, keep their own
+/// scale.
+pub(crate) fn alignment(obs: &[(u32, u32, f64)]) -> (Option<u32>, BTreeMap<u32, Curve>) {
+    let Some(ref_s) = reference_of(obs) else {
+        return (None, BTreeMap::new());
+    };
+    let onto = consensus_onto(obs, ref_s, |shared| {
+        Align::Curve(Curve::fit(shared, ALIGN_BINS))
+    });
+    let curves = onto
+        .maps
+        .into_iter()
+        .filter_map(|(s, a)| match a {
+            Align::Curve(c) => Some((s, c)),
+            Align::Offset(_) => None,
+        })
+        .collect();
+    (Some(ref_s), curves)
+}
+
+pub(crate) fn consensus(obs: &[(u32, u32, f64)]) -> Consensus {
+    let Some(ref_s) = reference_of(obs) else {
         return Consensus {
             rt: BTreeMap::new(),
             reference: None,

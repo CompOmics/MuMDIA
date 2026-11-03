@@ -110,6 +110,127 @@ impl ScanIndex {
         let hi = (k0 + apex_scans + 1).min(pool.len());
         pool[lo..hi].to_vec()
     }
+
+    /// Every scan of the windows holding a precursor at `prec_mz` (and apex 1/K0 `apex_im`
+    /// where known) from `rt_lo` to `rt_hi`, with one more scan of each window on either
+    /// side, pooled in retention-time order.
+    pub(crate) fn window_scans(
+        &self,
+        scans: &[Ms2Scan],
+        prec_mz: f64,
+        apex_im: Option<f64>,
+        rt_lo: f64,
+        rt_hi: f64,
+    ) -> Vec<usize> {
+        let mut pool: Vec<usize> = Vec::new();
+        for slot in &self.slots {
+            if prec_mz < slot.lower_mz || prec_mz > slot.upper_mz {
+                continue;
+            }
+            if let (Some(im), Some(a), Some(b)) = (apex_im, slot.im_lower, slot.im_upper) {
+                if im < a - SLOT_IM_SLACK || im > b + SLOT_IM_SLACK {
+                    continue;
+                }
+            }
+            let idx = &slot.scans;
+            let from = idx
+                .partition_point(|&i| scans[i].rt_seconds < rt_lo)
+                .saturating_sub(1);
+            let to = (idx.partition_point(|&i| scans[i].rt_seconds <= rt_hi) + 1).min(idx.len());
+            if from < to {
+                pool.extend_from_slice(&idx[from..to]);
+            }
+        }
+        pool.sort_by(|&a, &b| {
+            scans[a]
+                .rt_seconds
+                .total_cmp(&scans[b].rt_seconds)
+                .then(a.cmp(&b))
+        });
+        pool.dedup();
+        pool
+    }
+}
+
+/// The largest intensity of a peak of scan `i` within `tol_ppm` of `mz` after the mass
+/// offset (and inside the 1/K0 band when given), 0 when there is none.
+pub(crate) fn intensity(
+    scans: &[Ms2Scan],
+    i: usize,
+    mz: f64,
+    mass: &MassOffset,
+    tol_ppm: f64,
+    im: Option<(f64, f64)>,
+) -> f64 {
+    let target = mz * mass.factor_at(mz);
+    let (lo, hi) = (
+        target * (1.0 - tol_ppm * 1e-6),
+        target * (1.0 + tol_ppm * 1e-6),
+    );
+    let s = &scans[i];
+    let mut best = 0.0f64;
+    let mut j = s.peaks.partition_point(|p| (p.mz as f64) < lo);
+    while j < s.peaks.len() && (s.peaks[j].mz as f64) <= hi {
+        let inside = match (im, s.im.as_deref()) {
+            (Some((c, half)), Some(pim)) => ((pim[j] as f64) - c).abs() <= half,
+            _ => true,
+        };
+        if inside {
+            best = best.max(f64::from(s.peaks[j].intensity));
+        }
+        j += 1;
+    }
+    best
+}
+
+/// Whether the profile `trace` (one value per scan, in retention-time order, at `rts`) falls
+/// between the scans nearest `rt_a` and `rt_b` below `ratio` times the lower of the two
+/// apexes, after a three-scan moving average. The apex heights are the largest smoothed value
+/// within one scan of each; without a scan between the two, or without signal at either apex,
+/// there is no valley.
+pub(crate) fn has_valley(trace: &[f64], rts: &[f64], rt_a: f64, rt_b: f64, ratio: f64) -> bool {
+    let n = trace.len();
+    if n < 3 || ratio <= 0.0 {
+        return false;
+    }
+    let smooth: Vec<f64> = (0..n)
+        .map(|k| {
+            let (lo, hi) = (k.saturating_sub(1), (k + 1).min(n - 1));
+            trace[lo..=hi].iter().sum::<f64>() / (hi - lo + 1) as f64
+        })
+        .collect();
+    let nearest = |rt: f64| {
+        let mut best = (0, f64::INFINITY);
+        for (k, &t) in rts.iter().enumerate() {
+            let d = (t - rt).abs();
+            if d < best.1 {
+                best = (k, d);
+            }
+        }
+        best.0
+    };
+    let (mut ka, mut kb) = (nearest(rt_a), nearest(rt_b));
+    if ka > kb {
+        std::mem::swap(&mut ka, &mut kb);
+    }
+    if kb < ka + 2 {
+        return false;
+    }
+    let height = |k: usize| {
+        smooth[k.saturating_sub(1)..=(k + 1).min(n - 1)]
+            .iter()
+            .cloned()
+            .fold(0.0f64, f64::max)
+    };
+    let low = height(ka).min(height(kb));
+    if low <= 0.0 {
+        return false;
+    }
+    let valley = smooth[ka + 1..kb]
+        .iter()
+        .cloned()
+        .fold(f64::INFINITY, f64::min);
+    valley < ratio * low
 }
 
 /// Whether any peak of `scans[sel]` lies within `tol_ppm` of `mz` after the mass offset,
@@ -188,4 +309,28 @@ pub(crate) fn apex_im_of(
         }
     }
     pts.last().map(|p| p.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_valley_needs_a_dip_between_two_apexes() {
+        let rts: Vec<f64> = (0..11).map(f64::from).collect();
+        // two peaks at 2 and 8 with a dip to 0 between them
+        let two = [0., 5., 10., 5., 0., 0., 0., 5., 10., 5., 0.];
+        assert!(has_valley(&two, &rts, 2.0, 8.0, 0.5));
+        // one broad peak
+        let one = [0., 5., 8., 9., 10., 10., 10., 9., 8., 5., 0.];
+        assert!(!has_valley(&one, &rts, 2.0, 8.0, 0.5));
+        // a shallow dip passes a strict ratio and fails a loose one
+        let shallow = [0., 5., 10., 9., 7., 6., 7., 9., 10., 5., 0.];
+        assert!(!has_valley(&shallow, &rts, 2.0, 8.0, 0.5));
+        assert!(has_valley(&shallow, &rts, 2.0, 8.0, 0.9));
+        // adjacent apexes have nothing between them; no signal is no valley
+        assert!(!has_valley(&two, &rts, 2.0, 3.0, 0.5));
+        assert!(!has_valley(&[0.0; 11], &rts, 2.0, 8.0, 0.5));
+        assert!(!has_valley(&two, &rts, 2.0, 8.0, 0.0));
+    }
 }

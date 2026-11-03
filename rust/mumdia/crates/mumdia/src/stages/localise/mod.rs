@@ -8,38 +8,50 @@
 //! 1. groups the rows that carry a localised modification into isomer groups (source, base
 //!    peptide, modification composition, label) and computes `isomer_group_q`, a picked
 //!    target-decoy q over those groups, the unit to count modified peptides in;
-//! 2. splits each group's accepted rows (`run_psm_q <= localise.q_max`) into peaks by apex
-//!    retention time, per charge; the isomers on one peak share one localisation;
-//! 3. enumerates every placement of the modification's count on its candidate residues,
-//!    and on the decoy residue, whether or not the library carries that placement;
-//! 4. reads every fragment m/z of those placements from the MS2 scans at the apex
-//!    (`xic`), and scores the placements by the presence of their site-determining ions
-//!    (`model`);
-//! 5. writes the posterior, the site probabilities and the model and decoy-residue false
-//!    localisation rates to `localisation.parquet`.
+//! 2. cuts each group's accepted rows (`run_psm_q <= localise.q_max`) into chromatographic
+//!    peaks, per charge (`peaks`); the isomers on one peak share one localisation;
+//! 3. enumerates every placement of the modification's count on its candidate slots, and on
+//!    the decoy residue, whether or not the library carries that placement;
+//! 4. reads every fragment m/z of those placements (and their neutral losses) from the MS2
+//!    scans at the apex (`xic`), and scores the placements by the presence of their
+//!    site-determining ions (`model`);
+//! 5. turns the log-likelihoods into a posterior at a temperature, fixed or fitted to the
+//!    decoy residue (`calibrate`), and writes the site probabilities and the model and
+//!    decoy-residue false localisation rates to `localisation.parquet`.
 //!
-//! Nothing upstream reads the table: identifications, q-values and quantities are the same
+//! [`run_experiment`] does the same for every run of an experiment, with one temperature for
+//! all of them, and combines the runs into one site probability per consensus peak
+//! (`experiment`).
+//!
+//! Nothing upstream reads the tables: identifications, q-values and quantities are the same
 //! with the stage on or off. Every map that orders a fit or a sum is ordered, and peaks are
 //! computed in parallel into a vector in peak order, so the output is deterministic.
 
+mod calibrate;
+mod experiment;
 pub mod hypotheses;
 mod ions;
 mod model;
+mod peaks;
 mod xic;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use mumdia_core::config::{LocaliseConfig, ModPosition, ResidueMod};
+use mumdia_core::config::{LocaliseConfig, LocalisePeakRule, ModPosition, ResidueMod};
 use mumdia_core::mass::parse_peptidoform;
 use mumdia_core::schema::artifact;
+use mumdia_core::types::Ms2Scan;
 use mumdia_io::report::{ArtifactReport, Written};
 use mumdia_io::table::{write_table_hashed, Col, TableFile};
 use rayon::prelude::*;
 use serde_json::json;
 use tracing::{info, warn};
 
+pub use experiment::{
+    run_experiment, CombineSummary, ExperimentLocaliseParams, ExperimentLocaliseSummary,
+};
 use hypotheses::Split;
 use ions::N_CLASSES;
 use model::Counts;
@@ -79,6 +91,8 @@ pub struct LocaliseSummary {
     pub ambiguous_target_peaks: u64,
     pub localised_target_peaks: u64,
     pub isomer_groups_at_1pct: u64,
+    /// The temperature the posterior was computed at.
+    pub temperature: f64,
 }
 
 /// Peak-level status strings, written to the `status` column.
@@ -90,6 +104,8 @@ mod status {
     pub const NOT_ATTEMPTED_Q: &str = "not_attempted_q";
     pub const TOO_MANY: &str = "too_many_hypotheses";
     pub const NO_SPECTRA: &str = "no_spectra";
+    /// Internal: evidence read, posterior not yet computed.
+    pub const SCORED: &str = "scored";
 }
 
 /// Where a localised modification may sit on the N-terminal amine.
@@ -142,6 +158,8 @@ struct Row {
     protein: String,
     base_peptide_id: u32,
     apex_rt: f64,
+    /// `elution_lo`, `elution_hi` of the scored row, when the table has them.
+    elution: Option<(f64, f64)>,
     score: f64,
     run_psm_q: f64,
     peak_rank: i32,
@@ -151,10 +169,12 @@ struct Row {
     comp: Vec<i64>,
 }
 
-/// One peak: accepted rows of an isomer group and charge that share an apex.
+/// One peak: accepted rows of an isomer group and charge that share a chromatographic peak.
 struct Peak {
     rows: Vec<usize>,
     rep: usize,
+    /// The smallest `elution_lo` and largest `elution_hi` of its rows.
+    bounds: Option<(f64, f64)>,
 }
 
 /// What a peak's evidence and model gave.
@@ -164,15 +184,19 @@ struct PeakResult {
     hyps: Vec<Vec<usize>>,
     /// Whether each hypothesis uses the decoy residue.
     on_decoy: Vec<bool>,
+    /// The log-likelihood of each hypothesis, for a peak scored on its evidence.
+    ll: Vec<f64>,
     post: Vec<f64>,
     site_prob: Vec<f64>,
-    /// Candidate positions (real and decoy), ascending.
+    /// Candidate slots (real and decoy), ascending.
     positions: Vec<usize>,
     best: Option<usize>,
     min_site_prob: Option<f64>,
     delta_loglik: Option<f64>,
     n_sdi: u32,
     n_sdi_observed: u32,
+    n_common: u32,
+    n_common_observed: u32,
     n_real: usize,
     n_decoy_positions: usize,
     flr_model: Option<f64>,
@@ -187,8 +211,64 @@ struct Evidence {
     sdi: Vec<(usize, bool, Vec<bool>)>,
 }
 
-/// Run the stage. See the module documentation.
+/// The temperature a posterior is computed at, and how it was chosen.
+#[derive(Clone, Debug)]
+pub(crate) struct Temperature {
+    pub value: f64,
+    /// The fit, under `"auto"`.
+    pub fit: Option<calibrate::Fit>,
+}
+
+impl Temperature {
+    fn fixed(value: f64) -> Temperature {
+        Temperature { value, fit: None }
+    }
+
+    fn report(&self) -> serde_json::Value {
+        match &self.fit {
+            None => json!({"mode": "fixed", "value": self.value}),
+            Some(f) => json!({"mode": "auto", "value": self.value, "fit": f}),
+        }
+    }
+}
+
+/// One run analysed up to the log-likelihoods of its peaks.
+pub(crate) struct RunAnalysis {
+    source: u32,
+    rows: Vec<Row>,
+    group_of: Vec<u32>,
+    isomer_group_q: Vec<f64>,
+    peaks: Vec<Peak>,
+    peak_of_row: Vec<Option<u32>>,
+    results: Vec<PeakResult>,
+    rules: Vec<ModRules>,
+    /// The peak rule actually applied (`apex_tolerance` without elution bounds).
+    peak_rule: LocalisePeakRule,
+    global_d: [f64; N_CLASSES],
+    global_f: [f64; N_CLASSES],
+    tol_used: f64,
+    /// The candidate-to-decoy residue position ratio over the target peaks with a choice.
+    ratio: f64,
+    /// The FLR rows (target peaks with a real choice), after [`finish`].
+    flr_rows: Vec<usize>,
+    analyse_ms: u128,
+}
+
+/// Run the stage on one run. See the module documentation.
 pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
+    let t0 = Instant::now();
+    let mut a = analyse(&p)?;
+    let temp = match p.cfg.fixed_temperature() {
+        Some(t) => Temperature::fixed(t),
+        None => calibrate::fit_runs(&[&a], 1.0),
+    };
+    finish(&mut a, p.cfg, temp.value);
+    write(&a, &p, &temp, t0.elapsed().as_millis())
+}
+
+/// Read one run's scored rows and spectra up to the log-likelihood of every placement of
+/// every peak that needs evidence.
+fn analyse(p: &LocaliseParams) -> Result<RunAnalysis> {
     let t0 = Instant::now();
     let cfg = p.cfg;
     let t = TableFile::open(p.scored).with_context(|| format!("localise: opening {}", p.scored))?;
@@ -234,6 +314,17 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
     let protein = t.str_rows("protein", &idx)?;
     let bpid = t.u32_rows("base_peptide_id", &idx)?;
     let apex_rt = t.f64_rows("apex_rt", &idx)?;
+    let elution: Vec<Option<(f64, f64)>> =
+        if t.has_column("elution_lo") && t.has_column("elution_hi") {
+            let lo = t.f64_rows("elution_lo", &idx)?;
+            let hi = t.f64_rows("elution_hi", &idx)?;
+            lo.into_iter()
+                .zip(hi)
+                .map(|(a, b)| (a.is_finite() && b.is_finite() && a <= b).then_some((a, b)))
+                .collect()
+        } else {
+            vec![None; idx.len()]
+        };
     let score = t.f64_rows("score", &idx)?;
     let q_col = if t.has_column("run_psm_q") {
         "run_psm_q"
@@ -260,6 +351,7 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
             protein: protein[r].clone(),
             base_peptide_id: bpid[r],
             apex_rt: apex_rt[r],
+            elution: elution[r],
             score: score[r],
             run_psm_q: run_q[r],
             peak_rank: peak_rank[r],
@@ -372,6 +464,11 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
             Some(d)
         })
         .collect();
+    // Neutral losses: phosphoric acid from Phospho, nothing for any other modification.
+    let loss_of = |r: &Row| -> Option<ions::Loss> {
+        (cfg.neutral_loss && cfg.mods[r.modi] == "Phospho")
+            .then(|| ions::phosphate_loss(&r.split, decoy_residue[r.modi]))
+    };
 
     // --- isomer groups and their picked target-decoy q ---
     let mut group_ids: BTreeMap<(u32, u32, Vec<i64>, bool), u32> = BTreeMap::new();
@@ -404,32 +501,64 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
         1.0,
     );
 
-    // --- peaks: accepted rows of a group and charge, split by apex ---
+    // --- the accepted rows of each group and charge, ascending in apex ---
     let mut by_gc: BTreeMap<(u32, i32), Vec<usize>> = BTreeMap::new();
     for (r, row) in rows.iter().enumerate() {
         if row.run_psm_q <= cfg.q_max {
             by_gc.entry((group_of[r], row.charge)).or_default().push(r);
         }
     }
-    let mut peaks: Vec<Peak> = Vec::new();
-    for (_, mut members) in by_gc {
+    for members in by_gc.values_mut() {
         members.sort_by(|&a, &b| {
             rows[a]
                 .apex_rt
                 .total_cmp(&rows[b].apex_rt)
                 .then(rows[a].idx.cmp(&rows[b].idx))
         });
-        let mut cur: Vec<usize> = Vec::new();
-        for r in members {
-            if let Some(&first) = cur.first() {
-                if rows[r].apex_rt - rows[first].apex_rt > cfg.peak_rt_tol_s {
-                    peaks.push(peak_of(&rows, std::mem::take(&mut cur)));
-                }
+    }
+    // The elution-bounds rule needs the bounds; a table without them is cut by tolerance.
+    let peak_rule = match cfg.peak_rule {
+        LocalisePeakRule::ElutionBounds if rows.iter().all(|r| r.elution.is_none()) => {
+            if !rows.is_empty() {
+                warn!(
+                    scored = p.scored,
+                    "localise: the scored table has no elution bounds; peaks are cut by \
+                     localise.peak_rt_tol_s"
+                );
             }
-            cur.push(r);
+            LocalisePeakRule::ApexTolerance
         }
-        if !cur.is_empty() {
-            peaks.push(peak_of(&rows, cur));
+        r => r,
+    };
+
+    // The spectra: for the evidence, and for the valley test of the elution-bounds rule.
+    let needs_valley = peak_rule == LocalisePeakRule::ElutionBounds
+        && cfg.peak_valley_ratio > 0.0
+        && by_gc.values().any(|m| m.len() > 1);
+    let mut spectra: Option<Spectra> = None;
+    if needs_valley {
+        spectra = Some(Spectra::load(p)?);
+    }
+
+    // --- peaks ---
+    let mut peaks: Vec<Peak> = Vec::new();
+    {
+        let prow: Vec<peaks::PeakRow> = rows
+            .iter()
+            .map(|r| peaks::PeakRow {
+                apex: r.apex_rt,
+                bounds: r.elution,
+            })
+            .collect();
+        for members in by_gc.values() {
+            let mut valley = |a: usize, b: usize| -> bool {
+                spectra
+                    .as_ref()
+                    .is_some_and(|sp| sp.valley(&rows[a], &rows[b], cfg))
+            };
+            for cut in peaks::cut(&prow, members, peak_rule, cfg.peak_rt_tol_s, &mut valley) {
+                peaks.push(peak_of(&rows, cut));
+            }
         }
     }
     let mut peak_of_row: Vec<Option<u32>> = vec![None; rows.len()];
@@ -504,6 +633,7 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
     }
 
     // --- evidence from the spectra ---
+    let losses = cfg.neutral_loss;
     let need: Vec<usize> = (0..peaks.len())
         .filter(|&pi| results[pi].status.is_empty())
         .collect();
@@ -511,12 +641,164 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
     let mut global_f = [0.5; N_CLASSES];
     let mut tol_used = p.fallback_tol_ppm;
     if !need.is_empty() {
+        if spectra.is_none() {
+            spectra = Some(Spectra::load(p)?);
+        }
+        let sp = spectra.as_ref().expect("loaded above");
+        tol_used = sp.tol;
+        let evidence: Vec<Option<Evidence>> = need
+            .par_iter()
+            .map(|&pi| {
+                let r = &rows[peaks[pi].rep];
+                let res = &results[pi];
+                let zmax = if r.charge >= 3 { 2 } else { 1 };
+                let loss = loss_of(r);
+                let set = ions::build(&r.split, &res.hyps, zmax, loss.as_ref());
+                let (sel, band) = sp.apex_selection(r, &set, cfg)?;
+                let mut ev = Evidence {
+                    common: Counts::default(),
+                    impossible: Counts::default(),
+                    sdi: Vec::new(),
+                };
+                for (j, ion) in set.ions.iter().enumerate() {
+                    let here = xic::present(&sp.scans, &sel, ion.mz, &sp.mass, sp.tol, band);
+                    if set.is_common(j) {
+                        ev.common.add(ion.class, here);
+                    } else {
+                        ev.sdi.push((ion.class, here, ion.member.clone()));
+                    }
+                }
+                for &(mz, class) in &set.impossible {
+                    ev.impossible.add(
+                        class,
+                        xic::present(&sp.scans, &sel, mz, &sp.mass, sp.tol, band),
+                    );
+                }
+                Some(ev)
+            })
+            .collect();
+        // Run-wide rates from the target peaks, summed in peak order.
+        let (mut cd, mut cf) = (Counts::default(), Counts::default());
+        for (k, &pi) in need.iter().enumerate() {
+            if let (Some(ev), false) = (&evidence[k], rows[peaks[pi].rep].decoy) {
+                cd.merge(&ev.common);
+                cf.merge(&ev.impossible);
+            }
+        }
+        global_d = cd.laplace();
+        global_f = cf.laplace();
+        if losses {
+            ions::loss_false_presence_from_plain(&mut global_f);
+        }
+        let scored: Vec<(usize, PeakResult)> = need
+            .par_iter()
+            .zip(evidence.par_iter())
+            .map(|(&pi, ev)| {
+                let mut res = results[pi].clone();
+                let Some(ev) = ev else {
+                    res.status = status::NO_SPECTRA;
+                    return (pi, res);
+                };
+                let d = ev.common.shrunk(&global_d, cfg.prior_strength);
+                let mut f = ev.impossible.shrunk(&global_f, cfg.prior_strength);
+                if losses {
+                    ions::loss_false_presence_from_plain(&mut f);
+                }
+                let obs: Vec<model::Observed> = ev
+                    .sdi
+                    .iter()
+                    .map(|(c, here, m)| model::Observed {
+                        class: *c,
+                        present: *here,
+                        member: m,
+                    })
+                    .collect();
+                res.ll = model::loglik(res.hyps.len(), &obs, &d, &f);
+                res.n_sdi = ev.sdi.len() as u32;
+                res.n_sdi_observed = ev.sdi.iter().filter(|x| x.1).count() as u32;
+                res.n_common = ev.common.total.iter().sum::<u64>() as u32;
+                res.n_common_observed = ev.common.present.iter().sum::<u64>() as u32;
+                res.status = status::SCORED;
+                (pi, res)
+            })
+            .collect();
+        for (pi, res) in scored {
+            results[pi] = res;
+        }
+    }
+    drop(spectra);
+
+    // The target peaks with a real choice, and their candidate-to-decoy position ratio.
+    let flr_rows = choice_peaks(&rows, &peaks, &results);
+    let (real_pos, decoy_pos) = flr_rows.iter().fold((0usize, 0usize), |acc, &pi| {
+        let res = &results[pi];
+        (
+            acc.0 + res.positions.len() - res.n_decoy_positions,
+            acc.1 + res.n_decoy_positions,
+        )
+    });
+    let ratio = if decoy_pos > 0 {
+        real_pos as f64 / decoy_pos as f64
+    } else {
+        f64::NAN
+    };
+    Ok(RunAnalysis {
+        source: wanted_source,
+        rows,
+        group_of,
+        isomer_group_q,
+        peaks,
+        peak_of_row,
+        results,
+        rules,
+        peak_rule,
+        global_d,
+        global_f,
+        tol_used,
+        ratio,
+        flr_rows,
+        analyse_ms: t0.elapsed().as_millis(),
+    })
+}
+
+/// The target peaks with a real choice of site (two or more placements off the decoy
+/// residue) that the evidence scored: the population of the false localisation rates and of
+/// the temperature fit.
+fn choice_peaks(rows: &[Row], peaks: &[Peak], results: &[PeakResult]) -> Vec<usize> {
+    (0..peaks.len())
+        .filter(|&pi| {
+            let res = &results[pi];
+            !rows[peaks[pi].rep].decoy
+                && res.n_real >= 2
+                && matches!(
+                    res.status,
+                    status::SCORED | status::LOCALISED | status::AMBIGUOUS | status::DECOY_RESIDUE
+                )
+        })
+        .collect()
+}
+
+/// The scans at an apex and the 1/K0 band (centre, half-width) of its evidence.
+type ApexSelection = (Vec<usize>, Option<(f64, f64)>);
+
+/// The run's spectra, as the evidence reads them.
+struct Spectra {
+    scans: Vec<Ms2Scan>,
+    index: xic::ScanIndex,
+    has_im: bool,
+    mass: crate::masscal::MassOffset,
+    tol: f64,
+    /// Apex 1/K0 per `(candidate_id, peak_rank)` from `psms_extracted`.
+    apex_im: BTreeMap<(u32, i32), f64>,
+}
+
+impl Spectra {
+    fn load(p: &LocaliseParams) -> Result<Spectra> {
         let scans = crate::spectra::load_ms2(p.spectra_ms2)
             .with_context(|| format!("localise: loading {}", p.spectra_ms2))?;
         let has_im = scans.iter().any(|s| s.im.is_some());
         let index = xic::ScanIndex::new(&scans);
         let (mass, tol) = crate::masscal::read_mass_cal(p.mass_cal, p.fallback_tol_ppm)?;
-        tol_used = tol;
         let apex_im: BTreeMap<(u32, i32), f64> = match (has_im, p.psms_extracted) {
             (true, Some(path)) if std::path::Path::new(path).exists() => {
                 let e = TableFile::open(path)?;
@@ -541,170 +823,161 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
             }
             _ => BTreeMap::new(),
         };
-        let evidence: Vec<Option<Evidence>> = need
-            .par_iter()
-            .map(|&pi| {
-                let r = &rows[peaks[pi].rep];
-                let res = &results[pi];
-                let prec_mz = parse_peptidoform(&r.pform)
-                    .map(|pp| pp.precursor_mz(r.charge))
-                    .unwrap_or(f64::NAN);
-                let zmax = if r.charge >= 3 { 2 } else { 1 };
-                let set = ions::build(&r.split, &res.hyps, zmax);
-                let known_im = if has_im {
-                    apex_im.get(&(r.candidate_id, r.peak_rank)).copied()
-                } else {
-                    None
-                };
-                let sel = index.apex_scans(&scans, prec_mz, r.apex_rt, known_im, cfg.apex_scans);
-                if sel.is_empty() {
-                    return None;
-                }
-                let im = if has_im {
-                    known_im.or_else(|| {
-                        let common: Vec<f64> = (0..set.ions.len())
-                            .filter(|&j| set.is_common(j))
-                            .map(|j| set.ions[j].mz)
-                            .collect();
-                        xic::apex_im_of(&scans, &sel, &common, &mass, tol)
-                    })
-                } else {
-                    None
-                };
-                let band = im.map(|c| (c, cfg.im_half_width));
-                let mut ev = Evidence {
-                    common: Counts::default(),
-                    impossible: Counts::default(),
-                    sdi: Vec::new(),
-                };
-                for (j, ion) in set.ions.iter().enumerate() {
-                    let here = xic::present(&scans, &sel, ion.mz, &mass, tol, band);
-                    if set.is_common(j) {
-                        ev.common.add(ion.class, here);
-                    } else {
-                        ev.sdi.push((ion.class, here, ion.member.clone()));
-                    }
-                }
-                for &(mz, class) in &set.impossible {
-                    ev.impossible
-                        .add(class, xic::present(&scans, &sel, mz, &mass, tol, band));
-                }
-                Some(ev)
-            })
-            .collect();
-        // Run-wide rates from the target peaks, summed in peak order.
-        let (mut cd, mut cf) = (Counts::default(), Counts::default());
-        for (k, &pi) in need.iter().enumerate() {
-            if let (Some(ev), false) = (&evidence[k], rows[peaks[pi].rep].decoy) {
-                cd.merge(&ev.common);
-                cf.merge(&ev.impossible);
-            }
-        }
-        global_d = cd.laplace();
-        global_f = cf.laplace();
-        let scored: Vec<(usize, PeakResult)> = need
-            .par_iter()
-            .zip(evidence.par_iter())
-            .map(|(&pi, ev)| {
-                let mut res = results[pi].clone();
-                let Some(ev) = ev else {
-                    res.status = status::NO_SPECTRA;
-                    return (pi, res);
-                };
-                let d = ev.common.shrunk(&global_d, cfg.prior_strength);
-                let f = ev.impossible.shrunk(&global_f, cfg.prior_strength);
-                let obs: Vec<model::Observed> = ev
-                    .sdi
-                    .iter()
-                    .map(|(c, here, m)| model::Observed {
-                        class: *c,
-                        present: *here,
-                        member: m,
-                    })
-                    .collect();
-                let ll = model::loglik(res.hyps.len(), &obs, &d, &f);
-                let post = model::posterior(&ll, cfg.temperature);
-                let rep = &rows[peaks[pi].rep];
-                let sp = model::site_probabilities(rep.split.n_slots(), &res.hyps, &post);
-                let b = model::best(&res.hyps, &post);
-                let min_sp = res.hyps[b]
-                    .iter()
-                    .map(|&i| sp[i])
-                    .fold(f64::INFINITY, f64::min);
-                let runner_up = (0..ll.len())
-                    .filter(|&h| h != b)
-                    .map(|h| ll[h])
-                    .fold(f64::NEG_INFINITY, f64::max);
-                res.delta_loglik = Some(if runner_up.is_finite() {
-                    ll[b] - runner_up
-                } else {
-                    0.0
-                });
-                res.n_sdi = ev.sdi.len() as u32;
-                res.n_sdi_observed = ev.sdi.iter().filter(|x| x.1).count() as u32;
-                res.status = if res.on_decoy[b] {
-                    status::DECOY_RESIDUE
-                } else if min_sp >= cfg.threshold {
-                    status::LOCALISED
-                } else {
-                    status::AMBIGUOUS
-                };
-                res.best = Some(b);
-                res.min_site_prob = Some(min_sp);
-                res.post = post;
-                res.site_prob = sp;
-                (pi, res)
-            })
-            .collect();
-        for (pi, res) in scored {
-            results[pi] = res;
+        Ok(Spectra {
+            scans,
+            index,
+            has_im,
+            mass,
+            tol,
+            apex_im,
+        })
+    }
+
+    /// The row's apex 1/K0 from `psms_extracted`, on spectra with ion mobility.
+    fn known_im(&self, r: &Row) -> Option<f64> {
+        if self.has_im {
+            self.apex_im.get(&(r.candidate_id, r.peak_rank)).copied()
+        } else {
+            None
         }
     }
 
-    // --- false localisation rates over the target peaks with a real choice ---
-    let flr_rows: Vec<usize> = (0..peaks.len())
-        .filter(|&pi| {
-            let res = &results[pi];
-            !rows[peaks[pi].rep].decoy
-                && res.n_real >= 2
-                && res.min_site_prob.is_some()
-                && matches!(
-                    res.status,
-                    status::LOCALISED | status::AMBIGUOUS | status::DECOY_RESIDUE
-                )
-        })
-        .collect();
-    let (real_pos, decoy_pos) = flr_rows.iter().fold((0usize, 0usize), |acc, &pi| {
-        let res = &results[pi];
-        (
-            acc.0 + res.positions.len() - res.n_decoy_positions,
-            acc.1 + res.n_decoy_positions,
-        )
-    });
-    let ratio = if decoy_pos > 0 {
-        real_pos as f64 / decoy_pos as f64
-    } else {
-        f64::NAN
-    };
+    /// The scans at the apex of row `r` and the 1/K0 band of its evidence; `None` when no
+    /// scan holds it.
+    fn apex_selection(
+        &self,
+        r: &Row,
+        set: &ions::IonSet,
+        cfg: &LocaliseConfig,
+    ) -> Option<ApexSelection> {
+        let prec_mz = parse_peptidoform(&r.pform)
+            .map(|pp| pp.precursor_mz(r.charge))
+            .unwrap_or(f64::NAN);
+        let known_im = self.known_im(r);
+        let sel = self
+            .index
+            .apex_scans(&self.scans, prec_mz, r.apex_rt, known_im, cfg.apex_scans);
+        if sel.is_empty() {
+            return None;
+        }
+        let im = if self.has_im {
+            known_im.or_else(|| {
+                let common: Vec<f64> = (0..set.ions.len())
+                    .filter(|&j| set.is_common(j))
+                    .map(|j| set.ions[j].mz)
+                    .collect();
+                xic::apex_im_of(&self.scans, &sel, &common, &self.mass, self.tol)
+            })
+        } else {
+            None
+        };
+        Some((sel, im.map(|c| (c, cfg.im_half_width))))
+    }
+
+    /// Whether the summed profile of the fragments rows `a` and `b` (apex `a` first) share has
+    /// a valley between their apexes (`localise.peak_valley_ratio`).
+    fn valley(&self, a: &Row, b: &Row, cfg: &LocaliseConfig) -> bool {
+        let zmax = if a.charge >= 3 { 2 } else { 1 };
+        let hyps = vec![a.split.sites.clone(), b.split.sites.clone()];
+        if hyps[0].len() != hyps[1].len() {
+            return false;
+        }
+        let set = ions::build(&a.split, &hyps, zmax, None);
+        let shared: Vec<f64> = (0..set.ions.len())
+            .filter(|&j| set.is_common(j))
+            .map(|j| set.ions[j].mz)
+            .collect();
+        if shared.is_empty() {
+            return false;
+        }
+        let prec_mz = parse_peptidoform(&a.pform)
+            .map(|pp| pp.precursor_mz(a.charge))
+            .unwrap_or(f64::NAN);
+        let im = self.known_im(a).or_else(|| self.known_im(b));
+        let sel = self
+            .index
+            .window_scans(&self.scans, prec_mz, im, a.apex_rt, b.apex_rt);
+        let band = im.map(|c| (c, cfg.im_half_width));
+        let trace: Vec<f64> = sel
+            .iter()
+            .map(|&i| {
+                shared
+                    .iter()
+                    .map(|&mz| xic::intensity(&self.scans, i, mz, &self.mass, self.tol, band))
+                    .sum()
+            })
+            .collect();
+        let rts: Vec<f64> = sel.iter().map(|&i| self.scans[i].rt_seconds).collect();
+        xic::has_valley(&trace, &rts, a.apex_rt, b.apex_rt, cfg.peak_valley_ratio)
+    }
+}
+
+/// The posterior at `temperature` of every peak scored on its evidence, its call, and the
+/// false localisation rates.
+fn finish(a: &mut RunAnalysis, cfg: &LocaliseConfig, temperature: f64) {
+    for pi in 0..a.peaks.len() {
+        if a.results[pi].ll.is_empty() {
+            continue;
+        }
+        let n_slots = a.rows[a.peaks[pi].rep].split.n_slots();
+        let res = &mut a.results[pi];
+        let c = model::call(&res.ll, &res.hyps, n_slots, temperature);
+        res.delta_loglik = Some(model::delta_loglik(&res.ll, c.best));
+        res.status = if res.on_decoy[c.best] {
+            status::DECOY_RESIDUE
+        } else if c.min_site_prob >= cfg.threshold {
+            status::LOCALISED
+        } else {
+            status::AMBIGUOUS
+        };
+        res.best = Some(c.best);
+        res.min_site_prob = Some(c.min_site_prob);
+        res.post = c.post;
+        res.site_prob = c.site_prob;
+    }
+    a.flr_rows = choice_peaks(&a.rows, &a.peaks, &a.results);
     let flr = flr_curve(
-        &flr_rows
+        &a.flr_rows
             .iter()
             .map(|&pi| {
-                let res = &results[pi];
+                let res = &a.results[pi];
                 (
                     res.min_site_prob.unwrap_or(0.0),
                     res.status == status::DECOY_RESIDUE,
                 )
             })
             .collect::<Vec<_>>(),
-        ratio,
+        a.ratio,
     );
-    for (k, &pi) in flr_rows.iter().enumerate() {
-        results[pi].flr_model = Some(flr[k].0);
-        results[pi].flr_decoy = flr[k].1;
+    for (k, &pi) in a.flr_rows.iter().enumerate() {
+        a.results[pi].flr_model = Some(flr[k].0);
+        a.results[pi].flr_decoy = flr[k].1;
     }
+}
 
-    // --- the table ---
+/// The placements of a peak in `hypothesis_sites`: each placement's slot labels joined by
+/// `,`, the placements by `;`, in hypothesis order.
+fn hypothesis_text(s: &Split, hyps: &[Vec<usize>]) -> String {
+    hyps.iter()
+        .map(|h| {
+            h.iter()
+                .map(|&i| s.slot_label(i))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Write `localisation.parquet` and its report.
+fn write(
+    a: &RunAnalysis,
+    p: &LocaliseParams,
+    temp: &Temperature,
+    elapsed_ms: u128,
+) -> Result<LocaliseSummary> {
+    let cfg = p.cfg;
+    let (rows, peaks, results) = (&a.rows, &a.peaks, &a.results);
     let m = rows.len();
     let mut c_status = Vec::with_capacity(m);
     let mut c_peak = Vec::with_capacity(m);
@@ -719,11 +992,17 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
     let mut c_nhyp = Vec::with_capacity(m);
     let mut c_nsdi = Vec::with_capacity(m);
     let mut c_nobs = Vec::with_capacity(m);
+    let mut c_ncom = Vec::with_capacity(m);
+    let mut c_ncom_obs = Vec::with_capacity(m);
     let mut c_dll = Vec::with_capacity(m);
     let mut c_flrm = Vec::with_capacity(m);
     let mut c_flrd = Vec::with_capacity(m);
+    let mut c_lo = Vec::with_capacity(m);
+    let mut c_hi = Vec::with_capacity(m);
+    let mut c_hyps = Vec::with_capacity(m);
+    let mut c_ll = Vec::with_capacity(m);
     for (r, row) in rows.iter().enumerate() {
-        let Some(pi) = peak_of_row[r] else {
+        let Some(pi) = a.peak_of_row[r] else {
             c_status.push(status::NOT_ATTEMPTED_Q.to_string());
             c_peak.push(None);
             c_rep.push(false);
@@ -737,25 +1016,43 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
             c_nhyp.push(0);
             c_nsdi.push(0);
             c_nobs.push(0);
+            c_ncom.push(0);
+            c_ncom_obs.push(0);
             c_dll.push(None);
             c_flrm.push(None);
             c_flrd.push(None);
+            c_lo.push(None);
+            c_hi.push(None);
+            c_hyps.push(None);
+            c_ll.push(Vec::new());
             continue;
         };
         let pk = &peaks[pi as usize];
         let res = &results[pi as usize];
         let rep = &rows[pk.rep];
         let name = &cfg.mods[rep.modi];
+        let is_rep = pk.rep == r;
         c_status.push(res.status.to_string());
         c_peak.push(Some(pi as i32));
-        c_rep.push(pk.rep == r);
+        c_rep.push(is_rep);
         c_nhyp.push(res.hyps.len() as u32);
         c_nsdi.push(res.n_sdi);
         c_nobs.push(res.n_sdi_observed);
+        c_ncom.push(res.n_common);
+        c_ncom_obs.push(res.n_common_observed);
         c_dll.push(res.delta_loglik);
         c_flrm.push(res.flr_model);
         c_flrd.push(res.flr_decoy);
         c_min.push(res.min_site_prob);
+        c_lo.push(pk.bounds.map(|b| b.0));
+        c_hi.push(pk.bounds.map(|b| b.1));
+        if is_rep && !res.ll.is_empty() {
+            c_hyps.push(Some(hypothesis_text(&rep.split, &res.hyps)));
+            c_ll.push(res.ll.clone());
+        } else {
+            c_hyps.push(None);
+            c_ll.push(Vec::new());
+        }
         match res.best {
             Some(b) if !res.post.is_empty() => {
                 c_best.push(Some(hypotheses::render(
@@ -801,7 +1098,7 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
     }
     let n_groups_1pct = rows
         .iter()
-        .zip(&isomer_group_q)
+        .zip(&a.isomer_group_q)
         .filter(|(r, &q)| !r.decoy && q <= 0.01)
         .count() as u64;
     let written = write_table_hashed(
@@ -837,8 +1134,8 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
                 "localised_mod".into(),
                 rows.iter().map(|r| cfg.mods[r.modi].clone()).collect(),
             ),
-            Col::U32("isomer_group_id".into(), group_of),
-            Col::F64("isomer_group_q".into(), isomer_group_q),
+            Col::U32("isomer_group_id".into(), a.group_of.clone()),
+            Col::F64("isomer_group_q".into(), a.isomer_group_q.clone()),
             Col::OptI32("isomer_peak_id".into(), c_peak),
             Col::Bool("is_peak_representative".into(), c_rep),
             Col::U32("n_hypotheses".into(), c_nhyp),
@@ -855,6 +1152,12 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
             Col::OptF64("site_flr_model".into(), c_flrm),
             Col::OptF64("site_flr_decoy".into(), c_flrd),
             Col::Str("status".into(), c_status),
+            Col::U32("n_common".into(), c_ncom),
+            Col::U32("n_common_observed".into(), c_ncom_obs),
+            Col::OptF64("peak_rt_lo".into(), c_lo),
+            Col::OptF64("peak_rt_hi".into(), c_hi),
+            Col::OptStr("hypothesis_sites".into(), c_hyps),
+            Col::ListF64("hypothesis_loglik".into(), c_ll),
         ],
     )?;
 
@@ -870,24 +1173,25 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
             .filter(|(pi, _)| results[*pi].status == s)
             .count() as u64
     };
-    let ambiguous = flr_rows.len() as u64;
-    let localised_amb = flr_rows
+    let ambiguous = a.flr_rows.len() as u64;
+    let localised_amb = a
+        .flr_rows
         .iter()
         .filter(|&&pi| results[pi].status == status::LOCALISED)
         .count() as u64;
     // The rates at the threshold: those of the lowest probability still at or above it,
     // which are the largest, the curves being monotone.
-    let at_threshold = flr_rows
+    let at_threshold = a
+        .flr_rows
         .iter()
-        .zip(&flr)
-        .filter(|(&pi, _)| results[pi].min_site_prob.unwrap_or(0.0) >= cfg.threshold)
-        .map(|(_, f)| *f)
-        .reduce(|a, b| {
+        .filter(|&&pi| results[pi].min_site_prob.unwrap_or(0.0) >= cfg.threshold)
+        .map(|&pi| (results[pi].flr_model.unwrap_or(0.0), results[pi].flr_decoy))
+        .reduce(|x, y| {
             (
-                a.0.max(b.0),
-                match (a.1, b.1) {
-                    (Some(x), Some(y)) => Some(x.max(y)),
-                    (x, y) => x.or(y),
+                x.0.max(y.0),
+                match (x.1, y.1) {
+                    (Some(u), Some(v)) => Some(u.max(v)),
+                    (u, v) => u.or(v),
                 },
             )
         });
@@ -936,12 +1240,13 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
         "site_flr_decoy_at_threshold".into(),
         json!(at_threshold.and_then(|f| f.1)),
     );
-    stats.insert("candidate_to_decoy_residue_ratio".into(), json!(ratio));
-    stats.insert("detection_rate_by_class".into(), json!(global_d));
-    stats.insert("false_presence_rate_by_class".into(), json!(global_f));
+    stats.insert("candidate_to_decoy_residue_ratio".into(), json!(a.ratio));
+    stats.insert("detection_rate_by_class".into(), json!(a.global_d));
+    stats.insert("false_presence_rate_by_class".into(), json!(a.global_f));
     stats.insert("isomer_groups_at_1pct".into(), json!(n_groups_1pct));
-    stats.insert("fragment_tol_ppm".into(), json!(tol_used));
-    let elapsed = t0.elapsed().as_millis();
+    stats.insert("fragment_tol_ppm".into(), json!(a.tol_used));
+    stats.insert("temperature".into(), temp.report());
+    stats.insert("peak_rule".into(), json!(peak_rule_name(a.peak_rule)));
     ArtifactReport {
         logical_name: artifact::LOCALISATION.0.to_string(),
         schema_name: artifact::LOCALISATION.0.to_string(),
@@ -955,27 +1260,37 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
             "spectra_ms2": p.spectra_ms2,
             "mass_cal": p.mass_cal,
             "psms_extracted": p.psms_extracted,
-            "source": wanted_source,
+            "source": a.source,
             "mods": cfg.mods,
-            "candidate_residues": rules
+            "candidate_residues": a.rules
                 .iter()
                 .map(|m| String::from_utf8_lossy(&m.residues).into_owned())
                 .collect::<Vec<_>>(),
-            "n_term": rules.iter().map(|m| m.n_term.name()).collect::<Vec<_>>(),
+            "n_term": a.rules.iter().map(|m| m.n_term.name()).collect::<Vec<_>>(),
             "fasta": p.fasta,
             "decoy_residue": cfg.decoy_residue,
             "threshold": cfg.threshold,
             "q_max": cfg.q_max,
             "max_hypotheses": cfg.max_hypotheses,
+            "peak_rule": peak_rule_name(cfg.peak_rule),
             "peak_rt_tol_s": cfg.peak_rt_tol_s,
+            "peak_valley_ratio": cfg.peak_valley_ratio,
             "apex_scans": cfg.apex_scans,
             "im_half_width": cfg.im_half_width,
             "prior_strength": cfg.prior_strength,
-            "temperature": cfg.temperature,
+            "temperature": cfg.fixed_temperature().map_or(json!("auto"), |t| json!(t)),
+            "neutral_loss": cfg.neutral_loss,
         }),
         stats,
-        model_identity: Some("localise-sdi-presence-v1".to_string()),
-        elapsed_ms: elapsed,
+        model_identity: Some(
+            if cfg.neutral_loss {
+                "localise-sdi-presence-v2-neutral-loss"
+            } else {
+                "localise-sdi-presence-v2"
+            }
+            .to_string(),
+        ),
+        elapsed_ms,
     }
     .write_for(p.out)?;
     info!(
@@ -985,7 +1300,9 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
         with_a_choice = ambiguous,
         localised = localised_amb,
         isomer_groups_at_1pct = n_groups_1pct,
-        elapsed_ms = elapsed as u64,
+        temperature = temp.value,
+        analyse_ms = a.analyse_ms as u64,
+        elapsed_ms = elapsed_ms as u64,
         "localise: done"
     );
     Ok(LocaliseSummary {
@@ -995,10 +1312,19 @@ pub fn run(p: LocaliseParams) -> Result<LocaliseSummary> {
         ambiguous_target_peaks: ambiguous,
         localised_target_peaks: localised_amb,
         isomer_groups_at_1pct: n_groups_1pct,
+        temperature: temp.value,
     })
 }
 
-/// A peak of `members` with its representative: the highest score, ties to the earlier row.
+fn peak_rule_name(r: LocalisePeakRule) -> &'static str {
+    match r {
+        LocalisePeakRule::ApexTolerance => "apex_tolerance",
+        LocalisePeakRule::ElutionBounds => "elution_bounds",
+    }
+}
+
+/// A peak of `members` with its representative (the highest score, ties to the earlier row)
+/// and its elution bounds.
 fn peak_of(rows: &[Row], members: Vec<usize>) -> Peak {
     let mut rep = members[0];
     for &r in &members[1..] {
@@ -1008,7 +1334,15 @@ fn peak_of(rows: &[Row], members: Vec<usize>) -> Peak {
             rep = r;
         }
     }
-    Peak { rows: members, rep }
+    let bounds = members
+        .iter()
+        .filter_map(|&r| rows[r].elution)
+        .reduce(|x, y| (x.0.min(y.0), x.1.max(y.1)));
+    Peak {
+        rows: members,
+        rep,
+        bounds,
+    }
 }
 
 /// `S3:0.9120;T5:0.0710;A6:0.0170`: every candidate slot (a residue and its 1-based position,
