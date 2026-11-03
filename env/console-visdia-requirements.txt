@@ -16,6 +16,13 @@
 # file (duckdb 1.5.6, dash-mantine-components 2.8.1) served a 12-run diaPASEF second-pass
 # experiment, every accepted target of every run had chromatogram rows, the 1/K0 evidence
 # and centroid mobilograms loaded, and on the smoke fixture with quant.fragment_detail the
-# viewer reproduced all 789 quantities exactly from the engine's fragments. Move the pin
-# together with a check of that kind.
-mumdia-viewer @ https://github.com/CompOmics/visDIA/archive/f06aad697a61ff41dc9c0e638815ccb6d0cfe6d0.zip
+# viewer reproduced all 789 quantities exactly from the engine's fragments. e2010e3
+# (CompOmics/visDIA#11) sizes DuckDB's memory limit to the machine instead of a fixed
+# 512 MB (a quarter of physical memory, 1 to 16 GiB; MUMDIA_VIEWER_MEMORY_LIMIT overrides
+# it), turns off parquet prefetching and makes the grouped tables cheaper; the fixed limit
+# failed every identification table of results of 8.5M rows and more under DuckDB 2.
+# Checked on 2026-11-03: a fresh pip install of this file resolved duckdb 1.5.6, the
+# viewer reported a limit of 16.0 GiB on a 755 GiB host, and the precursor, peptide and
+# protein-group tables of an 8.5M-row and a 31.2M-row diaPASEF result loaded.
+# Move the pin together with a check of that kind.
+mumdia-viewer @ https://github.com/CompOmics/visDIA/archive/e2010e3a8c7d78dd0a6a7af83bb4936347e6132f.zip

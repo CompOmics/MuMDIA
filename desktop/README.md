@@ -342,7 +342,14 @@ do with the analysis packages, and neither should constrain the other.
 archive, so no git is needed and everyone on a release gets the same viewer. The file's
 comment says what the pinned commit adds and the check on real outputs it was moved with
 (at f06aad6: a 12-run diaPASEF second-pass experiment, and the smoke fixture with
-`quant.fragment_detail`). About 350 MB on Windows.
+`quant.fragment_detail`; at e2010e3: the identification tables of 8.5M- and 31.2M-row
+results). About 350 MB on Windows.
+
+The viewer sizes DuckDB's memory limit to the machine, a quarter of physical memory
+between 1 and 16 GiB, and prints it at start. To set it, the application would pass
+`MUMDIA_VIEWER_MEMORY_LIMIT` in the environment rather than `--memory-limit`: an older
+installed viewer rejects a flag it does not know, which is also why the engine goes to it
+as `MUMDIA_BIN` rather than `--engine`.
 
 The precursor page's mobilogram card (diaPASEF runs) draws the centroids of the run's own
 spectra tables. Its raw-event source runs `mumdia mobilogram`, which the viewer finds
