@@ -306,6 +306,11 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **The documentation no longer says the engine cannot read zstd parquet.** The workspace has
+  built `parquet` with the `zstd` feature for some time, so a zstd table written outside the
+  engine reads; `large_utf8` string columns remain the one Polars default it refuses. The
+  measured footprint of `MUMDIA_PARQUET_COMPRESSION=zstd` on two experiments is in
+  docs/03_io_layer.md.
 - **visDIA no longer runs out of memory on large results.** The viewer's DuckDB limit was a
   fixed 512 MB, and the visDIA that 0.9.0 installs accepts DuckDB 2, which reads whole
   parquet row groups ahead: the precursor, peptide and protein-group tables of a result of

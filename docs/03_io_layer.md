@@ -540,10 +540,11 @@ build. The reader is deliberately narrow, so those files must match it exactly.
 Matching the column names and types is not sufficient.
 
 - **Codec.** The workspace pins `parquet` with `default-features = false,
-  features = ["arrow", "snap"]`, so the reader decodes SNAPPY and uncompressed
-  files only. Any other codec fails at read with a message of the form
-  `"Parquet error: Disabled feature at compile time: zstd"`. Polars writes zstd
-  by default, so an externally produced table must set snappy explicitly.
+  features = ["arrow", "snap", "zstd"]`, so the reader decodes SNAPPY, ZSTD and
+  uncompressed files. Any other codec (gzip, brotli, lz4) fails at read with a
+  message of the form `"Parquet error: Disabled feature at compile time: gzip"`.
+  The helpers write snappy, like the engine's own artifacts; a Polars default
+  (zstd) table reads as it is.
 - **String encoding.** Write string columns as arrow `utf8`. Polars defaults to
   `large_utf8`, which the `str` getter rejects with `"column 'peptidoform' is
   not utf8"` (see the read side above).
@@ -807,21 +808,42 @@ This subsystem reads no `Config` fields. It has no config surface of its own, so
 the recent pruning of dead config fields in `mumdia-core::config` did not touch
 it. Its behaviour is fixed at compile time:
 
-- Compression is `SNAPPY`, hard-coded in `write_table` (`table.rs:204-206`); it
-  is not configurable and there is no other codec path. The read side is equally
-  narrow, so this is a contract on externally written inputs too, not only on
-  this crate's outputs (see "Parquet written outside this crate").
+- Compression is `SNAPPY` by default. `MUMDIA_PARQUET_COMPRESSION=zstd` (or
+  `uncompressed`) changes the codec of every artifact (`table.rs::codec`); it
+  changes every content hash and no decoded value. The read side decodes SNAPPY,
+  ZSTD and uncompressed whoever wrote the file (see "Parquet written outside this
+  crate").
 - The hash read buffer is 64 KiB (`hash.rs:11`).
 - Schema identifiers are the constants in `mumdia-core/src/schema.rs:7-24`; a
   new artifact requires a new tuple there, not a config change.
-- Dependency features are pinned in the workspace `Cargo.toml`: `arrow` v59 with
-  `["prettyprint"]` (needed by `inspect`), `parquet` v59 with
-  `default-features = false, features = ["arrow", "snap"]` (pure-Rust snap, no
-  cmake/C toolchain), `blake3` v1. Do not re-enable Parquet default features;
-  they pull in a C compression backend that breaks the pure-Rust build
-  constraint (see CLAUDE.md environment gotchas). The same pin also bounds what
-  the engine can read: a Parquet file compressed with any other codec is a read
-  error, whoever wrote it.
+- Dependency features are pinned in the workspace `Cargo.toml`: `parquet` with
+  `default-features = false, features = ["arrow", "snap", "zstd"]`. Do not
+  re-enable the Parquet default features, which pull in further compression
+  backends. A Parquet file compressed with any other codec (gzip, brotli, lz4) is
+  a read error, whoever wrote it.
+
+### zstd and byte-stream-split, measured through the engine (2026-11-04)
+
+Both experiments of docs/01 "Output retention", run end to end with
+`MUMDIA_PARQUET_COMPRESSION=zstd` against the default on one host (hippogriff, the
+arms partly concurrent, so the wall times are indicative only). Identifications and
+quantities are identical: every artifact the manifest records decodes to the same
+table (pandas equality, NaN equal to NaN).
+
+| experiment | snappy | zstd | change | wall, snappy -> zstd |
+|---|---|---|---|---|
+| Astral, 6 runs, output directory | 19.53 GB | 17.15 GB | -12.2% | 16:00 -> 16:20 (search only) |
+| diaPASEF, 12 runs, output directory | 49.80 GB | 43.05 GB | -13.6% | 53:59 -> 59:11 |
+
+So zstd is about an eighth of the footprint, much less than the -59% measured on one
+chromatogram table in `table.rs::codec`: the converted spectra (float32 m/z and
+intensity lists) are the largest artifacts and compress by about a tenth, and the
+retention tiers (docs/01) remove far more. A pyarrow rewrite of single artifacts
+with BYTE_STREAM_SPLIT on the float columns (dictionary off) against the engine's
+file gave: spectra_ms2 -0.2% with snappy and -12% with zstd on Astral, 0% and -19% on
+diaPASEF (zstd alone -11% and -21%, so the split adds nothing to the spectra); features
+-2% (snappy) and -15% (zstd); chromatograms -9% / -28% on
+Astral and +7% / -24% on diaPASEF; run_windows -14% / -21%. Neither is a default.
 
 ## Invariants, determinism, gotchas
 
@@ -867,10 +889,10 @@ it. Its behaviour is fixed at compile time:
 - **`record_artifact` hard-codes `format = "parquet"`** (`lib.rs:31`); it is not
   suitable for a non-Parquet artifact without a change there.
 - **Externally written Parquet must match the reader, not just the schema.** A
-  table produced outside `mumdia-io` must be SNAPPY-compressed with arrow `utf8`
-  string columns. zstd and `large_utf8` are both Polars defaults and both are
-  hard read errors (`"Parquet error: Disabled feature at compile time: zstd"`,
-  `"column 'peptidoform' is not utf8"`). A library table must additionally
+  table produced outside `mumdia-io` must use arrow `utf8` string columns and a
+  snappy, zstd or uncompressed codec. `large_utf8`, a Polars default, is a hard
+  read error (`"column 'peptidoform' is not utf8"`); zstd, the other Polars
+  default, reads. A library table must additionally
   satisfy the `candidate_id` contiguity (`index.rs:112-125`) and `precursor_mz`
   ordering (`index.rs:215-231`) preconditions. See "Parquet written outside this
   crate".

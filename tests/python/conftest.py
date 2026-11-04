@@ -202,16 +202,16 @@ def parquet_codecs(path):
 
 
 def assert_engine_readable_parquet(path):
-    """SNAPPY (or uncompressed) only: the engine's parquet has no other codec.
+    """SNAPPY, ZSTD or uncompressed only: the engine's parquet has no other codec.
 
     If this fails the engine rejects the file at read with
-    `Parquet error: Disabled feature at compile time: zstd`, so a library or
+    `Parquet error: Disabled feature at compile time: <codec>`, so a library or
     sidecar output that looks fine locally cannot be loaded at all
     (`CLAUDE.md`, "Sidecar and IO contracts").
     """
     codecs = parquet_codecs(path)
-    assert codecs <= {"SNAPPY", "UNCOMPRESSED"}, (
-        "{} uses codecs {}; the engine's parquet build compiles only snappy, so "
+    assert codecs <= {"SNAPPY", "ZSTD", "UNCOMPRESSED"}, (
+        "{} uses codecs {}; the engine's parquet build compiles snappy and zstd only, so "
         "anything else fails at read".format(Path(path).name, sorted(codecs))
     )
 

@@ -1046,11 +1046,11 @@ MLP. Set it explicitly for the logreg path.
   stderr tail to the error, plus the Visual C++ runtime hint when the text is a torch
   DLL failure (`python::load_failure_hint`, `sidecar::failure_diagnosis`). A worker that
   failed for any other reason gets an unchanged error.
-- **Parquet written outside `mumdia-io` must be SNAPPY plus arrow `utf8`.** The
-  engine's `parquet` dependency is built with `default-features = false,
-  features = ["arrow","snap"]` (`rust/mumdia/Cargo.toml:23-24`), so SNAPPY is the
-  only codec compiled in and a zstd file fails at read with
-  `Parquet error: Disabled feature at compile time: zstd`. `Table::str`
+- **Parquet written outside `mumdia-io` must be arrow `utf8`, in a codec the engine
+  has.** The engine's `parquet` dependency is built with `default-features = false,
+  features = ["arrow", "snap", "zstd"]` (`rust/mumdia/Cargo.toml`), so SNAPPY, ZSTD and
+  uncompressed files read and any other codec fails at read with
+  `Parquet error: Disabled feature at compile time: <codec>`. `Table::str`
   downcasts to arrow `StringArray` only and rejects anything else with
   `column '<name>' is not utf8` (`mumdia-io/src/table.rs:503-511`), so a
   64-bit-offset `large_utf8` string column is also refused. `mumdia-io` itself

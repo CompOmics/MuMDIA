@@ -40,7 +40,7 @@ is the source of truth if it has moved.
 | `OSError: [WinError 1114] ... Error loading "...\torch\lib\c10.dll"` (or `[WinError 126]` on a file under `torch\lib`, or `DLL load failed while importing _C`), and the traceback's first frame is `import deeplc` or `import torch` | The Microsoft Visual C++ 2015-2022 x64 runtime is missing or outdated, or an older `msvcp140.dll`/`vcruntime140.dll` earlier on `PATH` is loaded instead of it; torch cannot initialise its DLLs on this machine | Install the latest runtime (https://aka.ms/vs/17/release/vc_redist.x64.exe), reboot, then re-check (`mumdia doctor --config <config>`, or Re-check in the desktop application, whose MSI carries the runtime and whose Components screen offers **Install Visual C++ runtime** for this failure); `where msvcp140.dll` lists every copy Windows finds. See "The torch DLL crash: two causes" below |
 | The same `WinError 1114` from a DeepLC worker, and the traceback shows numpy or pyarrow imported before torch | numpy/pyarrow were imported before `deeplc`; DeepLC 4.x is torch-backed and the wrong order aborts torch DLL init | Keep `import deeplc` first (`scripts/deeplc_worker.py:26`); the ordering is load-bearing, do not sort those imports |
 | `mumdia doctor` is green, then the run crashes at the DeepLC fine-tune on a missing import | doctor probed only part of what `deeplc_finetune.py` imports, or ran with `--no-import-check` | Current doctor probes `deeplc,numpy,pandas,pyarrow,torch,psm_utils` and imports them for real by default; re-run it after any env change |
-| `Parquet error: Disabled feature at compile time: zstd` | A parquet written outside `mumdia-io` used zstd; the parquet crate is built without that codec | Write SNAPPY (`table.rs:205`); polars defaults to zstd, so pass the compression explicitly |
+| `Parquet error: Disabled feature at compile time: <codec>` | A parquet written outside `mumdia-io` used gzip, brotli or lz4; the parquet crate is built with snappy and zstd only | Write SNAPPY or ZSTD |
 | `column '<name>' is not utf8` (for example `column 'peptidoform' is not utf8`) | The string column is arrow `large_utf8`, the polars default | Cast string columns to arrow `utf8` before writing (`table.rs:511`) |
 | `library precursor row N has candidate_id M but candidate_id must be the contiguous range 0..ncand` | An externally built library has non-row-aligned candidate ids | Reindex so `candidate_id` is `0..ncand` in precursor row order (`index.rs:112-125`) |
 | `library precursors must be ascending by precursor_mz` | The library was not sorted by `precursor_mz`, which the fragment index's candidate-window search assumes | Sort precursors by m/z before assigning `candidate_id` (`index.rs:215-231`); fragments need valid ids but no sorted order |
@@ -451,11 +451,11 @@ ungrouped path is unchanged and still falls back to unbounded windows.
 Anything written outside `mumdia-io` and then read by the engine has to match the
 reader exactly. Two defaults of common Python writers break it:
 
-- **Compression.** `mumdia-io` writes and expects SNAPPY (`table.rs:205`). The
-  parquet crate is built with no default features plus `snap`
-  (`Cargo.toml:23-26`), so a zstd file fails with
-  `Parquet error: Disabled feature at compile time: zstd`. Polars defaults to
-  zstd; pass the compression explicitly.
+- **Compression.** `mumdia-io` writes SNAPPY (`MUMDIA_PARQUET_COMPRESSION=zstd` writes
+  ZSTD) and reads SNAPPY, ZSTD and uncompressed: the parquet crate is built with no
+  default features plus `snap` and `zstd` (`rust/mumdia/Cargo.toml`). Any other codec
+  fails with `Parquet error: Disabled feature at compile time: <codec>`. Polars'
+  default zstd reads.
 - **String type.** String columns must be arrow `utf8`. A `large_utf8` column
   fails with `column '<name>' is not utf8` (`table.rs:511`). Polars produces
   `large_utf8` by default; cast before writing.

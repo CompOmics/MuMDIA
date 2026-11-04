@@ -787,10 +787,11 @@ sections 10-16:
   pay: on the one desktop measured the forward pass dominated and scaled with threads,
   so 4 x 2 threads equalled 1 x 8 (docs/08, "Sharded whole-library prediction"); it stays
   opt-in until measured where one process stops scaling, on two acquisitions.
-- Any parquet written outside `mumdia-io` and read by the engine must be
-  snappy-compressed with arrow `utf8` string columns. Polars defaults to zstd
-  and `large_utf8`, and the engine rejects both ("Disabled feature at compile
-  time: zstd", "column 'peptidoform' is not utf8").
+- Any parquet written outside `mumdia-io` and read by the engine must use arrow
+  `utf8` string columns. Polars defaults to `large_utf8`, which the engine rejects
+  ("column 'peptidoform' is not utf8"). Snappy, zstd and uncompressed files all read:
+  the workspace builds `parquet` with the `zstd` feature. The helpers still write
+  snappy, which is what the engine's own artifacts use.
 - A library must carry `candidate_id` as the contiguous row-aligned range
   `0..ncand` (`index.rs:215-245`) and precursors ascending by `precursor_mz`
   (`index.rs:1288-1299`). Both are hard errors. Fragments are grouped by a

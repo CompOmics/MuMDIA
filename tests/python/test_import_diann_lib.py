@@ -262,11 +262,11 @@ def test_an_empty_protein_is_written_as_unassigned(diann_lib, tmp_path):
 
 
 def test_output_parquet_uses_only_a_codec_the_engine_can_decode(imported):
-    """Snappy (or uncompressed), or the engine cannot open the library at all.
+    """Snappy, zstd or uncompressed, or the engine cannot open the library at all.
 
-    The engine's parquet dependency is built with `features = ["arrow","snap"]`,
-    so any other codec fails at read with "Disabled feature at compile time:
-    zstd" and the library is unusable rather than merely slow.
+    The engine's parquet dependency is built with `features = ["arrow", "snap",
+    "zstd"]`, so any other codec fails at read with "Disabled feature at compile
+    time: <codec>" and the library is unusable rather than merely slow.
     """
     for path in (imported["prec"], imported["frag"]):
         assert_engine_readable_parquet(path)
