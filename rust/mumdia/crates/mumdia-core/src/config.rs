@@ -4445,7 +4445,7 @@ impl Retain {
 }
 
 /// The output directory after a successful run.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
     /// Which files a finished `run` or `run-experiment` keeps: `all` (default), `viewer` or
@@ -4459,6 +4459,13 @@ pub struct OutputConfig {
     /// configuration, so the configuration hash and the bytes of every kept artifact are the
     /// same under every tier.
     pub retain: Retain,
+}
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            retain: Retain::All,
+        }
+    }
 }
 
 impl Config {

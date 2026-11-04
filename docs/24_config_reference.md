@@ -615,11 +615,9 @@ Site localisation of modifications on the identified peptidoforms (the `localise
 
 The output directory after a successful run.
 
-`OutputConfig` has no `impl Default` block in the source.
-
 | Field | Type | Default | Gated | Description |
 |---|---|---|---|---|
-| `retain` | `Retain` | none: must be set |  | Which files a finished `run` or `run-experiment` keeps: `all` (default), `viewer` or `results`. After the manifest is written the engine removes what the tier does not keep, by the rules of `scripts/prune_outputs.py` (`mumdia::retain`), and records each removed path, its size and its content hash under `retention` in the manifest. Under a second pass the first pass's per-run tables, `first_pass/`, the library copies and `rt_bootstrap/` are not read again and go below `all`; without one the first-pass tables are the evidence and stay under `viewer`. Every `.json` sidecar stays in every tier. `--retain` on `run` and `run-experiment` overrides it. Not part of the canonical configuration, so the configuration hash and the bytes of every kept artifact are the same under every tier. |
+| `retain` | `Retain` | `all` |  | Which files a finished `run` or `run-experiment` keeps: `all` (default), `viewer` or `results`. After the manifest is written the engine removes what the tier does not keep, by the rules of `scripts/prune_outputs.py` (`mumdia::retain`), and records each removed path, its size and its content hash under `retention` in the manifest. Under a second pass the first pass's per-run tables, `first_pass/`, the library copies and `rt_bootstrap/` are not read again and go below `all`; without one the first-pass tables are the evidence and stay under `viewer`. Every `.json` sidecar stays in every tier. `--retain` on `run` and `run-experiment` overrides it. Not part of the canonical configuration, so the configuration hash and the bytes of every kept artifact are the same under every tier. |
 
 ## peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]
 
@@ -1374,9 +1372,8 @@ instead of looking like an absent field.
 - `search_seed.widen_tol_below` (`usize`): unresolved expression `DEFAULT_WIDEN_TOL_BELOW`
 - `search_seed.widen_tol_factor` (`f64`): unresolved expression `DEFAULT_WIDEN_TOL_FACTOR`
 
-3 field(s) have no default because the owning struct has no `impl Default`. That is the source's intent, not a parsing gap: a list element must carry every key.
+2 field(s) have no default because the owning struct has no `impl Default`. That is the source's intent, not a parsing gap: a list element must carry every key.
 
-- `output.retain` (`Retain`)
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
@@ -1398,4 +1395,4 @@ instead of looking like an absent field.
 
 26 structs and 345 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 45 enumerations, 1 named profile(s), 108 environment variables read and 27 set.
 
-36 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 3 have none by design.
+36 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.
