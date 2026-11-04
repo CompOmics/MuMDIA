@@ -1049,8 +1049,25 @@ pub fn run(p: RunParams) -> Result<()> {
     }
     crate::stages::rt_health::warn_summary(&man.rt_calibration_missing, 1, &native);
 
+    // `output.retain`: what the tier removes, recorded in the manifest before anything goes,
+    // so the manifest names every file the directory had.
+    let retention = crate::retain::plan(
+        std::path::Path::new(p.out_dir),
+        cfg.output.retain,
+        &crate::retain::Layout::default(),
+        &crate::retain::hashes_by_rel(
+            p.out_dir,
+            man.artifacts
+                .values()
+                .map(|a| (a.path.as_str(), a.content_hash.as_str())),
+        ),
+    )?;
+    man.retention = retention.clone();
     let manifest_path = d("manifest.json");
     mumdia_io::json::write_json(&manifest_path, &man)?;
+    if let Some(r) = &retention {
+        crate::retain::remove(std::path::Path::new(p.out_dir), r)?;
+    }
 
     info!(
         elapsed_ms = t0.elapsed().as_millis(),

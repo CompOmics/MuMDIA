@@ -655,6 +655,11 @@ enum Cmd {
         /// is configured by `search_seed.top_n_peaks`.
         #[arg(long, default_value_t = 0)]
         top_peaks_ms2: usize,
+        /// What the finished output directory keeps: `all` (everything), `viewer` (the
+        /// results, the evidence tables and the converted spectra) or `results`; overrides
+        /// `output.retain` (docs/01, "Output retention").
+        #[arg(long, value_enum)]
+        retain: Option<RetainArg>,
     },
     /// Experiment-wide orchestrator: run the per-file search chain over N runs,
     /// then one combined rescore, optional rescuable MBR transfer, per-run quant,
@@ -682,6 +687,11 @@ enum Cmd {
         max_spectra: usize,
         #[arg(long, default_value_t = 0)]
         top_peaks_ms2: usize,
+        /// What the finished output directory keeps: `all` (everything), `viewer` (the
+        /// results, the evidence tables and the converted spectra) or `results`; overrides
+        /// `output.retain` (docs/01, "Output retention").
+        #[arg(long, value_enum)]
+        retain: Option<RetainArg>,
     },
     /// Build the spectral library of a FASTA search without spectra: digest ->
     /// peptidoforms -> predict-frag, restored from or stored into
@@ -955,6 +965,24 @@ struct DoctorReport {
     /// rename without creating anything. A location a run must write to that cannot be
     /// written fails the report; an unwritable cache root is a warning.
     storage: mumdia::storage::StorageReport,
+}
+
+/// `--retain`: the retention tier of the output directory (`output.retain`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum RetainArg {
+    All,
+    Viewer,
+    Results,
+}
+
+impl From<RetainArg> for mumdia_core::config::Retain {
+    fn from(r: RetainArg) -> Self {
+        match r {
+            RetainArg::All => Self::All,
+            RetainArg::Viewer => Self::Viewer,
+            RetainArg::Results => Self::Results,
+        }
+    }
 }
 
 /// A switch given on the command line.
@@ -2403,10 +2431,14 @@ fn real_main() -> Result<()> {
             profile,
             max_spectra,
             top_peaks_ms2,
+            retain,
         } => {
             let mut cfg = load_config(&config)?;
             if let Some(pf) = &profile {
                 cfg.apply_profile(pf)?;
+            }
+            if let Some(r) = retain {
+                cfg.output.retain = r.into();
             }
             // Vendor files are converted to mzML before anything else happens, so every
             // stage below sees mzML; an mzML path passes through untouched. Several vendor
@@ -2463,10 +2495,14 @@ fn real_main() -> Result<()> {
             profile,
             max_spectra,
             top_peaks_ms2,
+            retain,
         } => {
             let mut cfg = load_config(&config)?;
             if let Some(pf) = &profile {
                 cfg.apply_profile(pf)?;
+            }
+            if let Some(r) = retain {
+                cfg.output.retain = r.into();
             }
             let mzml = mumdia::raw::ensure_mzml_all(
                 &mzml,

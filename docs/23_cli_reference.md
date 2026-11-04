@@ -827,6 +827,11 @@ Options:
           Irreversible conversion-time MS2 cap (0 = all). Seed-only peak limiting is configured by `search_seed.top_n_peaks`
 
           [default: 0]
+
+      --retain <RETAIN>
+          What the finished output directory keeps: `all` (everything), `viewer` (the results, the evidence tables and the converted spectra) or `results`; overrides `output.retain` (docs/01, "Output retention")
+
+          [possible values: all, viewer, results]
 ```
 
 Plus the 7 repeated flags removed above: see "Global flags".
@@ -862,6 +867,11 @@ Options:
 
       --top-peaks-ms2 <TOP_PEAKS_MS2>
           [default: 0]
+
+      --retain <RETAIN>
+          What the finished output directory keeps: `all` (everything), `viewer` (the results, the evidence tables and the converted spectra) or `results`; overrides `output.retain` (docs/01, "Output retention")
+
+          [possible values: all, viewer, results]
 ```
 
 Plus the 7 repeated flags removed above: see "Global flags".

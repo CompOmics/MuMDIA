@@ -25,7 +25,8 @@
     "experiment",
     "groups",
     "retrace",
-    "localise"
+    "localise",
+    "output"
   ],
   "fields": [
     {
@@ -4451,6 +4452,24 @@
       "help": "The temperature of the combined posterior: a number, or `\"auto\"` (also written `0`), fitted on the consensus peaks as `temperature` is on the run peaks, with its prior centred on the run temperature times the square root of the mean number of runs summed. Above the run temperature it discounts the evidence of runs that repeat each other's interferences. Default `\"auto\"`.",
       "gates": [],
       "source_struct": "LocaliseConfig"
+    },
+    {
+      "path": "output.retain",
+      "name": "retain",
+      "section": "output",
+      "rust_type": "Retain",
+      "kind": "enum",
+      "optional": false,
+      "default": null,
+      "default_text": null,
+      "help": "Which files a finished `run` or `run-experiment` keeps: `all` (default), `viewer` or `results`. After the manifest is written the engine removes what the tier does not keep, by the rules of `scripts/prune_outputs.py` (`mumdia::retain`), and records each removed path, its size and its content hash under `retention` in the manifest. Under a second pass the first pass's per-run tables, `first_pass/`, the library copies and `rt_bootstrap/` are not read again and go below `all`; without one the first-pass tables are the evidence and stay under `viewer`. Every `.json` sidecar stays in every tier. `--retain` on `run` and `run-experiment` overrides it. Not part of the canonical configuration, so the configuration hash and the bytes of every kept artifact are the same under every tier.",
+      "gates": [],
+      "source_struct": "OutputConfig",
+      "choices": [
+        "all",
+        "viewer",
+        "results"
+      ]
     }
   ],
   "list_sections": [
