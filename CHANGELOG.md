@@ -269,16 +269,25 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
-- **The desktop application pins visDIA at f06aad6.** Over c674f9f it adds the ion-mobility
+- **The desktop application pins visDIA at e2010e3.** Over c674f9f it adds the ion-mobility
   views (CompOmics/visDIA#8), a mobilogram card on the precursor page of diaPASEF runs (#9)
   and the fragments behind each quantity, read from `quant_fragments.parquet` (#10), and
   caps duckdb below 2 and dash-mantine-components below 3. An existing visDIA environment is
-  reported outdated (`mumdia-viewer c674f9f -> f06aad6`) and the Setup screen offers the
+  reported outdated (`mumdia-viewer c674f9f -> e2010e3`) and the Setup screen offers the
   update. Checked with a fresh install on a 12-run diaPASEF second-pass experiment and on
   the smoke fixture with `quant.fragment_detail` (env/console-visdia-requirements.txt).
 
 ### Fixed
 
+- **visDIA no longer runs out of memory on large results.** The viewer's DuckDB limit was a
+  fixed 512 MB, and the visDIA that 0.9.0 installs accepts DuckDB 2, which reads whole
+  parquet row groups ahead: the precursor, peptide and protein-group tables of a result of
+  8.5M rows or more failed with "Out of Memory Error: could not allocate block". The pinned
+  viewer (CompOmics/visDIA#11) sizes the limit to the machine, a quarter of physical memory
+  between 1 and 16 GiB (`MUMDIA_VIEWER_MEMORY_LIMIT` or `--memory-limit` overrides it),
+  turns off parquet prefetching, makes the grouped tables cheaper and names the setting in
+  an out-of-memory message. Users of 0.9.0 get it through the Setup screen's update offer;
+  until then `pip install "duckdb<2"` in the viewer's environment avoids the failure.
 - **Site localisation treats an N-terminal rule as a placement on the N-terminus.** For a
   modification in `localise.mods` with an N-terminal rule (`position`
   `peptide_n_term` or `protein_n_term`, residue `*`), the stage counted `*` among the candidate
