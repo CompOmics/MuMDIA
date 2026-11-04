@@ -273,6 +273,25 @@ remaining evidence (chromatograms and extracted rows, which the second pass read
 its library and quant reads should it not apply) goes before the second rescore. These
 removals are listed in the same `retention` block.
 
+Measured through the engine on both experiments (hippogriff, 2026-11-04; end state and the
+peak of the output directory sampled every 15 s; the arms ran partly concurrently, so wall
+times are not compared). Every arm's identifications and quantities equal the `all` run's:
+all 23 (Astral) and 53 (diaPASEF) artifacts the manifest records are byte-identical, and the
+Astral `all` run is byte-identical to main of 2026-11-03.
+
+| arm | Astral, 6 runs: end / peak | diaPASEF, 12 runs: end / peak |
+|---|---|---|
+| `all` | 19.53 / 22.38 GB, plus 20.62 GB mzML | 49.80 / 51.88 GB |
+| `viewer` | 10.91 / 21.94 GB | 7.05 / 46.69 GB |
+| `results` | 0.25 / 20.02 GB | 0.13 / 24.85 GB |
+| `results` + `convert.keep_converted_mzml = false` | 0.25 GB; peak with the mzML 21.74 GB (43.00 under `all`) | (no mzML) |
+| `all` + `rt_im_train.run_windows_f32` | 18.79 / 21.65 GB | 38.77 / 40.85 GB |
+
+On the Astral experiment the peak is set before the first rescore (the spectra, the first
+pass's features and the rescore's handoff matrix), which no tier can remove, so the tiers
+mostly change the end state there; on diaPASEF the per-run `run_windows` of a 37.7M-row
+library dominate, and `results` halves the peak.
+
 `scripts/prune_outputs.py <out_dir> --tier results|viewer` applies the same rules to a finished
 directory, for runs made with `all` or by an older engine. It is a dry run unless given `--apply`, prints the size of every tier, refuses a
 directory without its manifest (written last, so its absence means the run did not finish),
