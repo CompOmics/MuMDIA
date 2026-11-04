@@ -31,7 +31,7 @@ policy for tuning and validation.
   - `mumdia-core`: typed config, schemas, manifest, masses/constants.
   - `mumdia-io`: Arrow/Parquet table layer, hashes, JSON, artifact reports.
   - `mumdia`: CLI/library, fragment index, FDR/rescoring, and stages.
-- `scripts/`: nineteen scripts and three shared modules. Nine workers are launched by
+- `scripts/`: twenty scripts and three shared modules. Nine workers are launched by
   the engine (`ms2pip_worker.py`, `peptdeep_worker.py`, `deeplc_worker.py`,
   `deeplc_finetune.py`, `im2deep_worker.py`, `mokapot_worker.py`, `nn_rescore_worker.py`,
   `entrapment_worker.py`, `mbr_worker.py`); five are imported-library helpers
@@ -39,7 +39,8 @@ policy for tuning and validation.
   `make_shift_decoys.py`, `augment_library.py`, which adds the tryptic FASTA peptides an
   imported library is missing); five are library-scale recipes (`sort_fragments.py`,
   `mz_range_survivors.py`, `assemble_survivors.py`, `shard_parquet.py`,
-  `mh_shard_predict.py`). The shared modules are `_lib_io.py`, the writer the helpers use so
+  `mh_shard_predict.py`); one is a post-run tool (`prune_outputs.py`, which reduces a finished
+  output directory to a retention tier, docs/01 "Output retention"). The shared modules are `_lib_io.py`, the writer the helpers use so
   they cannot emit a parquet the engine rejects, `_torch_threads.py`, the torch CPU thread
   policy, and `_unimod.py`, the modification catalogue. Sidecars use positional file
   contracts (`docs/13_sidecars.md`).

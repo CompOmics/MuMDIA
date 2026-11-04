@@ -228,6 +228,49 @@ milliseconds of interpreter discovery, preflight, provenance and the remaining s
 the total since the orchestrator's entry, and the time since process start, which also
 covers the configuration load and any vendor conversion in `main`.
 
+### Output retention
+
+A run writes far more than anyone reads afterwards. On a six-run Astral experiment the output
+directory is about 19.5 GB (plus 20.6 GB of mzML converted beside the vendor files) and on a
+twelve-run diaPASEF experiment about 50 GB, while the results are a quarter of a gigabyte. Most
+of the rest are the first pass's per-run tables, which the second pass of `run-experiment`
+supersedes, and the converted spectra. Three retention tiers name what to keep:
+
+| tier | keeps | who reads it |
+|---|---|---|
+| `results` | the manifest and configuration, `scored_combined.parquet`, each run's `scored.parquet`, `peptide_quant`, `protein_group_quant`, `fragment_quant`, `quant_fragments`, `localisation`, the `lfq_maxlfq*` matrices, `quant_normalisation`, `peptides.tsv`, `proteins.tsv`, `sites.tsv`, `second_pass/library/`, and every `.json` and `.tsv` file (`cal.json`, `*.masscal.json` and the `.report.json` / `.schema.json` / `.summary.json` of every table, removed tables included) | users, `mumdia report --experiment-dir` |
+| `viewer` | `results`, the evidence tables (`run_windows`, `chromatograms`, `features`, `psms_competed`, `psms_extracted` and its `.peaks.parquet`, `seed_psms`) and the converted spectra (`<run>/spectra/`) | a viewer, `quant` and `localise --experiment-dir` re-runs, `mumdia mobilogram` (which also needs the `.d`) |
+| `all` | everything (what the engine writes) | debugging, stage re-runs from intermediates |
+
+Which evidence tables `viewer` keeps depends on the manifest. When `experiment.second_pass` is
+not null, the second pass wrote each run's evidence again under `second_pass/<run>/`, every
+reader (the engine's `quant`, `localise --experiment-dir`, `mobilogram` and the viewer) reads
+those, and the first pass's copies in `<run>/` are removed. Without a second pass (a single
+run, or an experiment where it did not apply) the first-pass tables are the evidence and are
+kept. In no tier are the library copies with recalibrated retention times
+(`fragment_library_precursors_multihead.parquet`, `_ft`, `_deeplc`), `rt_bootstrap/`,
+`first_pass/` and `sidecar_work/` kept below `all`; a FASTA-built library in the output
+directory is kept under `viewer` only when there is no second pass.
+
+`scripts/prune_outputs.py <out_dir> --tier results|viewer` applies a tier to a finished
+directory. It is a dry run unless given `--apply`, prints the size of every tier, refuses a
+directory without its manifest (written last, so its absence means the run did not finish),
+never removes a file the rules do not know (it lists them), counts hard links once
+(`psms_competed.parquet` is a hard link to `features.parquet`), and records every removed
+path, its size and the content hash the manifest gave it, with the SHA-256 of the manifest,
+in `<out_dir>/pruned.json`. `--converted-mzml` also deletes the mzML converted from each vendor
+input, which lives beside the input rather than in the output directory; it is removed only
+when the manifest records it as an input whose command line named a vendor file of the same
+stem, so an mzML the user supplied is never touched.
+
+Measured on the two experiments above (sizes count hard links once):
+
+| tier | Astral, 6 runs | diaPASEF, 12 runs |
+|---|---|---|
+| `all` | 19.53 GB (+ 20.62 GB converted mzML) | 49.98 GB |
+| `viewer` | 10.91 GB | 7.04 GB |
+| `results` | 0.25 GB | 0.13 GB |
+
 ## CLI subcommands
 
 `main.rs` is a thin `clap` layer: the `Cmd` enum (`main.rs:20`) defines one

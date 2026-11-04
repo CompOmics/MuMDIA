@@ -132,6 +132,16 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **`scripts/prune_outputs.py`: reduce a finished output directory to a retention tier.**
+  `results` keeps the manifest, the scored tables, the quantities, the LFQ matrices, the TSV
+  reports, the second pass's empirical library and every JSON sidecar; `viewer` adds the
+  evidence tables a viewer and the `quant`, `localise` and `mobilogram` re-runs read and the
+  converted spectra; `all` is everything. Under a second pass the first pass's per-run tables
+  are not evidence any more and go; without one they are kept under `viewer`. It is a dry run
+  unless given `--apply`, refuses a directory without its manifest, never removes a file its
+  rules do not know, counts hard links once, records each removed path, size and manifest
+  content hash in `pruned.json`, and with `--converted-mzml` also removes the mzML converted
+  beside each vendor input (docs/01_overview_and_dataflow.md, "Output retention").
 - **Protein N-terminal acetylation, and N-terminal modifications in general, as an opt-in
   search option.** A modification rule takes a `position`: `anywhere` (the default and the
   previous behaviour), `peptide_n_term` or `protein_n_term`, with residue `*`, for example
