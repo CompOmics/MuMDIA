@@ -397,8 +397,8 @@ pub fn run(p: PrescanParams) -> Result<u64> {
     let label = |i: usize| label_dict[label_id[i] as usize].as_str();
     let rw = TableFile::open(p.run_windows)?;
     let r_cid = rw.u32("candidate_id")?;
-    let r_lo = rw.f64("rt_lo")?;
-    let r_hi = rw.f64("rt_hi")?;
+    let r_lo = rw.f64_widening("rt_lo")?;
+    let r_hi = rw.f64_widening("rt_hi")?;
     // Join by candidate_id through a dense lookup: both tables are row-aligned in practice, but
     // relying on that silently mismatches RT bounds if either is ever reordered.
     let maxc = cid.iter().copied().max().unwrap_or(0) as usize;

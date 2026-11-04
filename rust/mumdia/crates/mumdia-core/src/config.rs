@@ -405,6 +405,17 @@ pub struct ConvertConfig {
     /// pay for it twice. Turn it off when the neighbouring mzML may have come from
     /// a different converter or a different `.raw` of the same name.
     pub reuse_converted: bool,
+    /// Keep the mzML converted from a vendor input beside it. On by default.
+    ///
+    /// `false` deletes each converted mzML as soon as its spectra (`<run>/spectra/`) are
+    /// written and its input hash is taken: nothing reads it after that, and on a six-run
+    /// Astral experiment the six mzML were larger than the whole output directory. A later
+    /// search of the same vendor file converts it again instead of reusing it
+    /// (`reuse_converted`). An mzML given as the input is never deleted. On Thermo input
+    /// `thermo_native` writes no mzML at all. Not part of the canonical configuration: it
+    /// changes which files stay, not what any stage computes.
+    #[serde(skip_serializing)]
+    pub keep_converted_mzml: bool,
     /// How many vendor files `run` and `run-experiment` convert to mzML at once. Default 4.
     ///
     /// Every vendor input is converted before the first run starts, and the conversions
@@ -482,6 +493,7 @@ impl Default for ConvertConfig {
             msconvert: "auto".to_string(),
             msconvert_args: Vec::new(),
             reuse_converted: true,
+            keep_converted_mzml: true,
             parallel_conversions: 4,
             tdf_mz_ppm: 10.0,
             tdf_im_gap_scans: 30,
@@ -1698,6 +1710,16 @@ pub struct RtImTrainConfig {
     /// window widens on that side only; elsewhere it stays the global window. Default 100
     /// since 2026-10-08; 0 is off. Mutually exclusive with `adaptive_rt_window`.
     pub local_window_anchors: usize,
+    /// Write `run_windows.parquet` with Float32 window columns (`rt_pred_cal`, `rt_lo`,
+    /// `rt_hi`, `im_pred_cal`, `im_lo`, `im_hi`; schema version 2) instead of Float64. Off
+    /// by default. About half the size of the table, which on a large library is the widest
+    /// file of a run (one row per library precursor, targets and decoys). Extract takes the
+    /// fitted windows in memory at full precision, so its candidates are unchanged; the
+    /// readers of the file (retrace, the prescreen, the prescan, `mumdia mobilogram`, a
+    /// standalone `extract`) widen the stored values, which are rounded to float32 (a
+    /// relative 6e-8, far below any window width). Every reader takes both versions.
+    #[serde(skip_serializing_if = "is_false")]
+    pub run_windows_f32: bool,
     /// Multiplier on the local one-sided quantiles of `local_window_anchors`.
     pub local_window_multiplier: f64,
     /// Lower clamp (seconds) for any RT half-window (the existing 1 s floor).
@@ -1969,6 +1991,7 @@ impl Default for RtImTrainConfig {
             adaptive_rt_window: false,
             adaptive_rt_bins: 12,
             local_window_anchors: 100,
+            run_windows_f32: false,
             local_window_multiplier: 1.0,
             rt_window_min_s: 1.0,
             window_holdout_frac: 0.0,

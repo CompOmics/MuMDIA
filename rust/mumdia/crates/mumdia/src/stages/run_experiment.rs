@@ -43,6 +43,9 @@ pub struct RunExperimentParams<'a> {
     pub lib_fragments: Option<&'a str>,
     pub max_spectra: usize,
     pub top_peaks_ms2: usize,
+    /// The entries of `mzmls` that `raw::ensure_mzml` converted from vendor inputs; deleted
+    /// once their spectra are written when `convert.keep_converted_mzml` is false.
+    pub converted_mzml: &'a [String],
 }
 
 fn preflight(p: &RunExperimentParams) -> Result<()> {
@@ -514,7 +517,7 @@ fn convert_run(
         top_peaks_ms2,
         0
     ));
-    convert::run(convert::ConvertParams {
+    let co = convert::run(convert::ConvertParams {
         mzml,
         out_dir: &d("spectra"),
         max_spectra,
@@ -522,7 +525,9 @@ fn convert_run(
         top_peaks_ms1: 0,
         config_hash: &convert_hash,
         tdf: convert::TdfParams::from_config(&cfg.convert),
-    })
+    })?;
+    crate::raw::discard_converted(mzml);
+    Ok(co)
 }
 
 /// Seed one ungrouped run against the base library (the seed is iRT-independent) into
@@ -1197,6 +1202,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         hash_order.push((format!("mzml[{i}]"), m.clone()));
     }
     let input_hashes = crate::prestage::InputHashes::spawn("run-experiment", hash_order);
+    if !cfg.convert.keep_converted_mzml {
+        crate::raw::discard_after_convert(p.converted_mzml, input_hashes.progress());
+    }
     pre.step("provenance");
     // Reject a bad --run-names rather than silently substituting r0..rN-1.
     //
@@ -2054,6 +2062,25 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         }
     }
 
+    // `output.retain` below `all`: every chain is done, so the runs' library copies with
+    // recalibrated retention times (a later run reads the first run's under
+    // `rt_library_scope = first_run_only`) are read by nothing more. No tier keeps them.
+    let retain = cfg.output.retain;
+    if retain != mumdia_core::config::Retain::All {
+        for nm in &names {
+            for lib in [
+                rt_bootstrap::MULTIHEAD_LIBRARY,
+                "fragment_library_precursors_ft.parquet",
+            ] {
+                crate::retain::remove_early(
+                    &format!("{}/{lib}", d(nm)),
+                    crate::retain::Class::Intermediate,
+                    "library copy after the chains",
+                );
+            }
+        }
+    }
+
     // --- one experiment-wide rescore over all competed tables ---
     //
     // Every table of run i carries source i. When each run is one table (every run
@@ -2103,6 +2130,28 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         ),
     })?;
 
+    // `output.retain = results` under a second pass: the first pass's features, competed
+    // rows, seeds and peak sidecars were inputs of the rescore that just ran. The second
+    // pass reads only the first pass's extracted rows and `cal.json`, and should it not
+    // apply, quant reads the chromatograms, so those two stay until the outcome is known.
+    if second_pass_on && retain == mumdia_core::config::Retain::Results {
+        for nm in &names {
+            for t in [
+                "features.parquet",
+                "psms_competed.parquet",
+                "seed_psms.parquet",
+                "psms_extracted.parquet.peaks.parquet",
+                "run_windows.parquet",
+            ] {
+                crate::retain::remove_early(
+                    &format!("{}/{t}", d(nm)),
+                    crate::retain::Class::Intermediate,
+                    "first-pass table after the first rescore",
+                );
+            }
+        }
+    }
+
     // --- match-between-runs: the second pass ---
     let mut second = if second_pass_on {
         let run_dirs: Vec<String> = names.iter().map(|nm| d(nm)).collect();
@@ -2121,6 +2170,19 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     } else {
         None
     };
+    // The second pass applied: the first pass's per-run evidence is superseded, and no tier
+    // below `all` keeps it, so it goes before the second rescore and quant run.
+    if second.is_some() && retain != mumdia_core::config::Retain::All {
+        for nm in &names {
+            for t in crate::retain::RUN_EVIDENCE {
+                crate::retain::remove_early(
+                    &format!("{}/{t}", d(nm)),
+                    crate::retain::Class::Intermediate,
+                    "first-pass evidence after the second pass",
+                );
+            }
+        }
+    }
     if second_pass_on && second.is_none() {
         warn!(
             "run-experiment: the second pass was not applied (see above); the first pass is the \

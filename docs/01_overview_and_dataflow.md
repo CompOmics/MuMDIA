@@ -262,6 +262,17 @@ part of the canonical configuration: it decides which files stay, not what any o
 contains, so the configuration hash and the bytes of every kept artifact are the same under
 every tier, and only the manifest gains the `retention` block.
 
+Below `all` the engine also removes, during the run, the files it would remove at the end
+and that nothing later in the run reads, which lowers the peak disk as well as the end state.
+Under `results` each pass's `run_windows.parquet` goes once extract (and retrace) have read
+it, and under a second pass the first pass's features, competed rows, seeds and peak
+sidecars go after the first rescore. Under either tier the library copies with recalibrated
+retention times go once every run's chain is done, `rt_bootstrap/` keeps only its anchor
+table and JSON records after its refit, and when the second pass applied the first pass's
+remaining evidence (chromatograms and extracted rows, which the second pass reads to build
+its library and quant reads should it not apply) goes before the second rescore. These
+removals are listed in the same `retention` block.
+
 `scripts/prune_outputs.py <out_dir> --tier results|viewer` applies the same rules to a finished
 directory, for runs made with `all` or by an older engine. It is a dry run unless given `--apply`, prints the size of every tier, refuses a
 directory without its manifest (written last, so its absence means the run did not finish),

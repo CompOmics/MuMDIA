@@ -2443,11 +2443,13 @@ fn real_main() -> Result<()> {
             // Vendor files are converted to mzML before anything else happens, so every
             // stage below sees mzML; an mzML path passes through untouched. Several vendor
             // files convert concurrently, `convert.parallel_conversions` at a time.
+            let converted_from = mzml.clone();
             let mzml = mumdia::raw::ensure_mzml_all(
                 &mzml,
                 &cfg.convert,
                 Some(std::path::Path::new(&out_dir)),
             )?;
+            let converted_mzml = mumdia::raw::converted_paths(&converted_from, &mzml);
             if mzml.len() > 1 {
                 // Files provided together are rescored together. Searching them one by
                 // one would give N unrelated FDR estimates and count a peptide found in
@@ -2469,6 +2471,7 @@ fn real_main() -> Result<()> {
                     lib_fragments: lib_fragments.as_deref(),
                     max_spectra,
                     top_peaks_ms2,
+                    converted_mzml: &converted_mzml,
                 })?;
             } else {
                 stages::run::run(stages::run::RunParams {
@@ -2481,6 +2484,7 @@ fn real_main() -> Result<()> {
                     lib_fragments: lib_fragments.as_deref(),
                     max_spectra,
                     top_peaks_ms2,
+                    converted_mzml: &converted_mzml,
                 })?;
             }
         }
@@ -2504,11 +2508,13 @@ fn real_main() -> Result<()> {
             if let Some(r) = retain {
                 cfg.output.retain = r.into();
             }
+            let converted_from = mzml.clone();
             let mzml = mumdia::raw::ensure_mzml_all(
                 &mzml,
                 &cfg.convert,
                 Some(std::path::Path::new(&out_dir)),
             )?;
+            let converted_mzml = mumdia::raw::converted_paths(&converted_from, &mzml);
             let run_names = if run_names.is_empty() {
                 None
             } else {
@@ -2525,6 +2531,7 @@ fn real_main() -> Result<()> {
                 lib_fragments: lib_fragments.as_deref(),
                 max_spectra,
                 top_peaks_ms2,
+                converted_mzml: &converted_mzml,
             })?;
         }
         Cmd::BuildLibrary {

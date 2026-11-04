@@ -15,8 +15,8 @@
 //! discovery, preflight, provenance). It writes one log line and changes nothing else
 //! (perf survey P0 and critic item 15).
 
-use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -50,7 +50,45 @@ fn hash_dir(path: &str) -> Result<(u64, String)> {
     Ok((bytes, mumdia_io::hash::blake3_str(&listing)))
 }
 
-fn hash_all(what: &str, inputs: Vec<(String, String)>) -> Vec<Hashed> {
+/// Which inputs the hash thread has read so far, so a caller can wait for one before it
+/// deletes it (`convert.keep_converted_mzml = false`, [`crate::raw::discard_converted`]).
+#[derive(Default)]
+pub struct HashProgress {
+    state: Mutex<(BTreeSet<String>, bool)>,
+    changed: Condvar,
+}
+
+impl HashProgress {
+    fn mark(&self, path: &str) {
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        g.0.insert(path.to_string());
+        self.changed.notify_all();
+    }
+
+    fn finish(&self) {
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        g.1 = true;
+        self.changed.notify_all();
+    }
+
+    /// Block until `path` has been hashed, or the thread has finished.
+    pub fn wait_for(&self, path: &str) {
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while !g.1 && !g.0.contains(path) {
+            g = self.changed.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Marks the thread finished however it ends, a panic included.
+struct FinishOnDrop(Arc<HashProgress>);
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+fn hash_all(what: &str, inputs: Vec<(String, String)>, progress: &HashProgress) -> Vec<Hashed> {
     let t0 = Instant::now();
     let mut bytes_total = 0u64;
     let out: Vec<Hashed> = inputs
@@ -68,6 +106,7 @@ fn hash_all(what: &str, inputs: Vec<(String, String)>) -> Vec<Hashed> {
             if let Ok((b, _)) = &result {
                 bytes_total += b;
             }
+            progress.mark(&path);
             Hashed { role, path, result }
         })
         .collect();
@@ -97,6 +136,7 @@ fn hash_all(what: &str, inputs: Vec<(String, String)>) -> Vec<Hashed> {
 pub struct InputHashes {
     what: &'static str,
     state: State,
+    progress: Arc<HashProgress>,
 }
 
 enum State {
@@ -109,17 +149,31 @@ impl InputHashes {
     /// Start hashing `(role, path)` pairs. `what` names the orchestrator in the log.
     pub fn spawn(what: &'static str, inputs: Vec<(String, String)>) -> Self {
         let for_thread = inputs.clone();
+        let progress = Arc::new(HashProgress::default());
+        let p = Arc::clone(&progress);
         let state = match std::thread::Builder::new()
             .name("mumdia-input-hash".into())
-            .spawn(move || hash_all(what, for_thread))
-        {
+            .spawn(move || {
+                let done = FinishOnDrop(p);
+                hash_all(what, for_thread, &done.0)
+            }) {
             Ok(h) => State::Running(h),
             Err(e) => {
                 warn!(error = %e, "{what}: cannot start the input-hash thread; hashing inline");
-                State::Done(hash_all(what, inputs))
+                let done = FinishOnDrop(Arc::clone(&progress));
+                State::Done(hash_all(what, inputs, &done.0))
             }
         };
-        Self { what, state }
+        Self {
+            what,
+            state,
+            progress,
+        }
+    }
+
+    /// Which inputs have been hashed so far.
+    pub fn progress(&self) -> Arc<HashProgress> {
+        Arc::clone(&self.progress)
     }
 
     /// Wait for the hashes, record each in `man`, and return the hash of every input that

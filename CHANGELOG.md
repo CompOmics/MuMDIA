@@ -132,6 +132,17 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **Lower peak disk below `output.retain = all`, and two opt-in footprint keys.** Under
+  `viewer` or `results` the engine removes, while the run is still going, the tables it would
+  remove at the end once nothing later reads them: `run_windows` after extract (`results`),
+  the first pass's features, competed rows and seeds after the first rescore (`results`), the
+  recalibrated library copies after the chains, the bootstrap pass's tables after its refit,
+  and the first pass's remaining evidence once the second pass applied; each removal is in the
+  manifest's `retention` block. `convert.keep_converted_mzml = false` deletes the mzML
+  converted from a vendor input once its spectra are written (docs/04_convert.md, "Where the
+  mzML goes"). `rt_im_train.run_windows_f32` writes `run_windows` version 2 with Float32
+  window columns, which every reader widens (docs/15_data_dictionary.md). All three are off
+  by default, and neither key enters the canonical configuration at its default.
 - **`output.retain` and `--retain`: the engine prunes its own output directory.** `run` and
   `run-experiment` take `all` (the default, which removes nothing), `viewer` or `results`, with
   the rules of `scripts/prune_outputs.py`. After a successful run the manifest lists every

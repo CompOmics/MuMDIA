@@ -115,7 +115,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         &mut manifest,
         w.record(
             artifact::RUN_WINDOWS.0,
-            artifact::RUN_WINDOWS,
+            artifact::run_windows(rt_cfg.run_windows_f32),
             &windows,
             "rt-im-train",
             ch,
@@ -211,6 +211,16 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
             out: &chrom,
         },
     )?;
+    // `output.retain = results` keeps no run_windows in any outcome, and nothing after
+    // retrace reads it (extract took the fitted windows in memory), so it goes now rather
+    // than at the end of the run: on a large library it is the widest table of the run.
+    if cfg.output.retain == mumdia_core::config::Retain::Results {
+        crate::retain::remove_early(
+            &windows,
+            crate::retain::Class::Viewer,
+            "run_windows after extract",
+        );
+    }
     // Each table is recorded once, as the later stages read it.
     let (wpsm, wchr, chrom_stage) = match retraced {
         Some(r) => (r.psms_extracted, r.chromatograms, "retrace"),

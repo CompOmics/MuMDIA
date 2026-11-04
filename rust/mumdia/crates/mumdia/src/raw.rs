@@ -844,6 +844,58 @@ fn sweep_stale_partials(out_dir: &Path, out: &Path) {
     }
 }
 
+/// The mzML files `ensure_mzml` converted from vendor inputs (`inputs[i]` became
+/// `converted[i]`): every returned path that differs from its input and is an mzML.
+pub fn converted_paths(inputs: &[String], converted: &[String]) -> Vec<String> {
+    inputs
+        .iter()
+        .zip(converted)
+        .filter(|(i, c)| i != c && c.to_ascii_lowercase().ends_with(".mzml"))
+        .map(|(_, c)| c.clone())
+        .collect()
+}
+
+/// Converted mzML files to delete once their spectra are written
+/// (`convert.keep_converted_mzml = false`), each with the input-hash progress it must wait
+/// for so the manifest still records its hash.
+static DISCARD: std::sync::Mutex<
+    std::collections::BTreeMap<String, std::sync::Arc<crate::prestage::HashProgress>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Register `paths` for deletion after conversion ([`discard_converted`]).
+pub fn discard_after_convert(
+    paths: &[String],
+    progress: std::sync::Arc<crate::prestage::HashProgress>,
+) {
+    let mut g = DISCARD.lock().unwrap_or_else(|e| e.into_inner());
+    for p in paths {
+        g.insert(p.clone(), std::sync::Arc::clone(&progress));
+    }
+}
+
+/// Called by the orchestrators once `mzml`'s spectra are written: when `mzml` was
+/// registered by [`discard_after_convert`], wait for its input hash and delete it. The
+/// deletion is reported, and a failure to delete is a warning, never an error.
+pub fn discard_converted(mzml: &str) {
+    let progress = DISCARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(mzml);
+    let Some(progress) = progress else {
+        return;
+    };
+    progress.wait_for(mzml);
+    let bytes = std::fs::metadata(mzml).map(|m| m.len()).unwrap_or(0);
+    match std::fs::remove_file(mzml) {
+        Ok(()) => info!(
+            mzml,
+            bytes,
+            "convert: deleted the converted mzML now that its spectra are written              (convert.keep_converted_mzml = false)"
+        ),
+        Err(e) => warn!(mzml, error = %e, "convert: could not delete the converted mzML"),
+    }
+}
+
 /// Convert every vendor input among `inputs` to mzML, at most
 /// `cfg.parallel_conversions` at once, and return the mzML paths in input order.
 ///
@@ -1211,6 +1263,47 @@ pub(crate) fn tdf_fixture(dir: &Path, msms_types: &[i64], compression: &str, wit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `convert.keep_converted_mzml = false`: a registered converted mzML is deleted after
+    /// its input hash is taken, and only a registered one.
+    #[test]
+    fn a_registered_converted_mzml_is_deleted_after_its_hash() {
+        let d = std::env::temp_dir().join(format!("mumdia_discard_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let conv = d.join("run.mzML");
+        let user = d.join("user.mzML");
+        std::fs::write(&conv, b"converted").unwrap();
+        std::fs::write(&user, b"given").unwrap();
+        let (conv, user) = (
+            conv.to_string_lossy().into_owned(),
+            user.to_string_lossy().into_owned(),
+        );
+        let inputs = vec![
+            d.join("run.raw").to_string_lossy().into_owned(),
+            user.clone(),
+        ];
+        let out = vec![conv.clone(), user.clone()];
+        assert_eq!(converted_paths(&inputs, &out), vec![conv.clone()]);
+        let hashes = crate::prestage::InputHashes::spawn(
+            "test",
+            vec![
+                ("mzml[0]".into(), conv.clone()),
+                ("mzml[1]".into(), user.clone()),
+            ],
+        );
+        discard_after_convert(std::slice::from_ref(&conv), hashes.progress());
+        discard_converted(&user);
+        discard_converted(&conv);
+        assert!(!std::path::Path::new(&conv).exists());
+        assert!(std::path::Path::new(&user).exists());
+        let mut man = mumdia_core::manifest::Manifest::new(String::new(), String::new());
+        let by_role = hashes.record(&mut man);
+        assert!(
+            by_role.contains_key("mzml[0]"),
+            "hashed before it was deleted"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("mumdia-raw-{name}"));

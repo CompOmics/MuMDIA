@@ -2891,9 +2891,9 @@ pub(crate) fn apex_im_where(
 pub(crate) fn read_run_windows(path: &str, ncand: usize) -> Result<RtWindows> {
     let rw = TableFile::open(path)?;
     let rw_cid = rw.u32("candidate_id")?;
-    let rw_cal = rw.f64("rt_pred_cal")?;
-    let rw_lo = rw.f64("rt_lo")?;
-    let rw_hi = rw.f64("rt_hi")?;
+    let rw_cal = rw.f64_widening("rt_pred_cal")?;
+    let rw_lo = rw.f64_widening("rt_lo")?;
+    let rw_hi = rw.f64_widening("rt_hi")?;
     let mut rt_lo = vec![f64::NEG_INFINITY; ncand];
     let mut rt_hi = vec![f64::INFINITY; ncand];
     // NaN, not 0.0, for a candidate with no `run_windows` row. Stage B already uses NaN
@@ -2956,11 +2956,11 @@ fn read_im_windows(
     if !(rw.has_column("im_lo") && rw.has_column("im_hi") && rw.has_column("im_pred_cal")) {
         return Ok((None, None, None));
     }
-    let (lo, hi) = (rw.opt_f64("im_lo")?, rw.opt_f64("im_hi")?);
+    let (lo, hi) = (rw.opt_f64_widening("im_lo")?, rw.opt_f64_widening("im_hi")?);
     if !lo.iter().zip(&hi).any(|(l, h)| l.is_some() && h.is_some()) {
         return Ok((None, None, None));
     }
-    let pred = rw.opt_f64("im_pred_cal")?;
+    let pred = rw.opt_f64_widening("im_pred_cal")?;
     let mut im_lo = vec![f32::NEG_INFINITY; ncand];
     let mut im_hi = vec![f32::INFINITY; ncand];
     let mut im_cal = vec![None; ncand];
@@ -6933,5 +6933,77 @@ mod ms1_near_tests {
         assert_eq!(support_gate_min(&cfg, false), 1.215);
         cfg.gate_mode = GateMode::ApexPearson;
         assert_eq!(support_gate_min(&cfg, true), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod run_windows_f32_tests {
+    use super::*;
+    use mumdia_io::table::{write_table, Col};
+
+    /// `run_windows` v2 (`rt_im_train.run_windows_f32`) reads back as v1 widened: the same
+    /// rows, each bound within float32 rounding of the f64 it was written from.
+    #[test]
+    fn a_float32_run_windows_table_reads_like_the_float64_one() {
+        let dir = std::env::temp_dir().join(format!("mumdia_rw_f32_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cal, lo, hi) = (
+            vec![123.456789_f64, 2400.5, f64::NAN],
+            vec![100.25_f64, 2380.125, f64::NEG_INFINITY],
+            vec![146.75_f64, 2420.0625, f64::INFINITY],
+        );
+        let im = vec![Some(0.912345_f64), None, Some(1.25)];
+        let write = |path: &str, f32: bool| {
+            let cols = if f32 {
+                let f = |v: &[f64]| v.iter().map(|&x| x as f32).collect::<Vec<f32>>();
+                let o = |v: &[Option<f64>]| v.iter().map(|x| x.map(|y| y as f32)).collect();
+                vec![
+                    Col::U32("candidate_id".into(), vec![0, 1, 2]),
+                    Col::F32("rt_pred_cal".into(), f(&cal)),
+                    Col::F32("rt_lo".into(), f(&lo)),
+                    Col::F32("rt_hi".into(), f(&hi)),
+                    Col::OptF32("im_pred_cal".into(), o(&im)),
+                    Col::OptF32("im_lo".into(), o(&im)),
+                    Col::OptF32("im_hi".into(), o(&im)),
+                ]
+            } else {
+                vec![
+                    Col::U32("candidate_id".into(), vec![0, 1, 2]),
+                    Col::F64("rt_pred_cal".into(), cal.clone()),
+                    Col::F64("rt_lo".into(), lo.clone()),
+                    Col::F64("rt_hi".into(), hi.clone()),
+                    Col::OptF64("im_pred_cal".into(), im.clone()),
+                    Col::OptF64("im_lo".into(), im.clone()),
+                    Col::OptF64("im_hi".into(), im.clone()),
+                ]
+            };
+            write_table(path, cols).unwrap();
+        };
+        let (p64, p32) = (
+            dir.join("w64.parquet").to_string_lossy().into_owned(),
+            dir.join("w32.parquet").to_string_lossy().into_owned(),
+        );
+        write(&p64, false);
+        write(&p32, true);
+        let (a, b) = (
+            read_run_windows(&p64, 3).unwrap(),
+            read_run_windows(&p32, 3).unwrap(),
+        );
+        for i in 0..3 {
+            for (x, y) in [
+                (a.rt_lo[i], b.rt_lo[i]),
+                (a.rt_hi[i], b.rt_hi[i]),
+                (a.rt_cal[i], b.rt_cal[i]),
+            ] {
+                assert!(
+                    (x.is_nan() && y.is_nan()) || x == y || ((x - y) / x).abs() < 1e-7,
+                    "{x} {y}"
+                );
+            }
+        }
+        assert_eq!(a.im_lo, b.im_lo);
+        assert_eq!(a.im_cal.as_ref().unwrap()[1], None);
+        assert_eq!(b.im_cal.as_ref().unwrap()[1], None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

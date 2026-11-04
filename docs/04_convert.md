@@ -738,6 +738,16 @@ because both converters treat the extension as theirs: ThermoRawFileParser appen
 back as `<name>.mzML.partial.mzML` and a 6:48 conversion of a 3.7 GB Astral run was
 discarded as "exited successfully but wrote no file" (doxy, 2026-09-06).
 
+The converted mzML is read by nothing once `convert` has written the run's spectra
+(`<run>/spectra/`), and on a six-run Astral experiment the six mzML (20.6 GB) were larger
+than the whole output directory (19.5 GB). `convert.keep_converted_mzml = false` deletes
+each one as soon as its spectra are written and the background input hash has read it, so
+the manifest still records its hash; an mzML given as the input is never deleted. A later
+search of the same vendor file then converts it again instead of reusing it. The key is
+not part of the canonical configuration. On Thermo input `convert.thermo_native` (below,
+"Native Thermo reading") is the route that writes no mzML at all, and saves the conversion
+time as well.
+
 For a directory input the newest mtime *inside* the directory is used, one level
 deep, because a `.d` directory's own mtime does not necessarily change when a
 contained acquisition file is rewritten.

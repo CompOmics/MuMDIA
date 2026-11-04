@@ -338,7 +338,7 @@ pub fn refit(p: &Refit) -> Result<Outcome> {
     } else {
         pass()
     };
-    match result {
+    let outcome = match result {
         Ok(table) => {
             record_anchor_source(
                 &library,
@@ -383,7 +383,20 @@ pub fn refit(p: &Refit) -> Result<Outcome> {
                 anchors_path: written.then_some(anchors_path),
             })
         }
+    };
+    // Below `output.retain = all` nothing of the pass is kept, and nothing reads it after the
+    // refit: its windows, its scored table and the seed-anchored library copy (moved to the
+    // usual name when the refit failed) go now. The anchor table stays until the end of the
+    // run, which records it in the manifest; the JSON records stay.
+    if p.cfg.output.retain != mumdia_core::config::Retain::All {
+        crate::retain::remove_early_in(
+            &dir(p.out),
+            crate::retain::Class::Intermediate,
+            "rt_bootstrap after the refit",
+            |n| n.ends_with(".parquet") && n != ANCHORS,
+        );
     }
+    outcome
 }
 
 /// The bootstrap pass and the refit; any error means "keep the seed-anchored library".

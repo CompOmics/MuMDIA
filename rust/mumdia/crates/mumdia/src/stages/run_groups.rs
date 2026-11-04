@@ -1279,7 +1279,7 @@ pub fn run(mut g: GroupRun) -> Result<Pooled> {
             if keep_records {
                 recs.push(windows_written.record(
                     &format!("{}[g{:02}]", artifact::RUN_WINDOWS.0, b.index),
-                    artifact::RUN_WINDOWS,
+                    artifact::run_windows(cfg.rt_im_train.run_windows_f32),
                     &windows,
                     "rt-im-train",
                     ch,

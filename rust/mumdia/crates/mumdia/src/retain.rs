@@ -332,21 +332,111 @@ pub fn plan(
             }
         }
     }
+    let mut files: Vec<RemovedFile> = removed
+        .iter()
+        .map(|(rel, c, m)| RemovedFile {
+            content_hash: hashes.get(rel).cloned(),
+            path: rel.clone(),
+            class: c.as_str().to_string(),
+            bytes: m.len(),
+        })
+        .collect();
+    let mut bytes_removed: u64 = files.iter().map(|f| f.bytes).sum();
+    // What the run already removed while it ran ([`remove_early`]).
+    for (f, f_freed) in take_early(out_dir) {
+        bytes_removed += f.bytes;
+        freed += f_freed;
+        files.push(f);
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Some(Retention {
         tier: tier.as_str().to_string(),
         second_pass: layout.second_pass,
-        bytes_removed: removed.iter().map(|(_, _, m)| m.len()).sum(),
+        bytes_removed,
         bytes_freed: freed,
-        removed: removed
-            .into_iter()
-            .map(|(rel, c, m)| RemovedFile {
-                content_hash: hashes.get(&rel).cloned(),
-                path: rel,
-                class: c.as_str().to_string(),
-                bytes: m.len(),
-            })
-            .collect(),
+        removed: files,
     }))
+}
+
+/// Files removed during a run, before the end ([`remove_early`]): absolute path, record and
+/// the bytes the removal released.
+static EARLY: std::sync::Mutex<Vec<(PathBuf, RemovedFile, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn absolute(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// The early removals under `out_dir`, with their paths made relative to it.
+fn take_early(out_dir: &Path) -> Vec<(RemovedFile, u64)> {
+    let base = absolute(out_dir);
+    let mut g = EARLY.lock().unwrap_or_else(|e| e.into_inner());
+    let (mine, rest): (Vec<_>, Vec<_>) = g.drain(..).partition(|(p, _, _)| p.starts_with(&base));
+    *g = rest;
+    mine.into_iter()
+        .map(|(p, mut f, freed)| {
+            f.path = p
+                .strip_prefix(&base)
+                .expect("partitioned on it")
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            (f, freed)
+        })
+        .collect()
+}
+
+/// Remove `path` now, during the run, because the tier will not keep it and nothing later
+/// in the run reads it (`output.retain` below `all`: the run's peak disk, not only its end
+/// state). The removal is recorded and joins the manifest's `retention` block. A missing
+/// file is skipped; a failure to remove is a warning, and the end of the run tries again.
+pub fn remove_early(path: &str, class: Class, why: &str) {
+    let p = Path::new(path);
+    let Ok(m) = std::fs::symlink_metadata(p) else {
+        return;
+    };
+    if !m.is_file() {
+        return;
+    }
+    let freed = match inode(&m) {
+        Some((_, nlink)) if nlink > 1 => 0,
+        _ => m.len(),
+    };
+    match std::fs::remove_file(p) {
+        Ok(()) => {
+            tracing::debug!(path, bytes = m.len(), why, "output.retain: removed early");
+            EARLY.lock().unwrap_or_else(|e| e.into_inner()).push((
+                absolute(p),
+                RemovedFile {
+                    path: String::new(),
+                    class: class.as_str().to_string(),
+                    bytes: m.len(),
+                    content_hash: None,
+                },
+                freed,
+            ));
+        }
+        Err(e) => warn!(path, error = %e, "output.retain: could not remove early"),
+    }
+}
+
+/// [`remove_early`] for every file of `dir` (not recursing) that `keep` rejects, by name.
+pub fn remove_early_in(dir: &str, class: Class, why: &str, remove: impl Fn(&str) -> bool) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut names: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    for n in names {
+        if remove(&n) {
+            remove_early(&format!("{dir}/{n}"), class, why);
+        }
+    }
 }
 
 /// Remove the files of `r` from `out_dir`, then the directories that left empty. A file

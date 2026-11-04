@@ -450,9 +450,9 @@ fn read_im_windows(path: Option<&str>, want: &BTreeSet<u32>) -> Result<BTreeMap<
     for s in candidate_spans(&tf, want)? {
         let cid = s.u32("candidate_id")?;
         let (lo, hi, pred) = (
-            s.opt_f64("im_lo")?,
-            s.opt_f64("im_hi")?,
-            s.opt_f64("im_pred_cal")?,
+            s.opt_f64_widening("im_lo")?,
+            s.opt_f64_widening("im_hi")?,
+            s.opt_f64_widening("im_pred_cal")?,
         );
         for i in 0..cid.len() {
             if want.contains(&cid[i]) {
