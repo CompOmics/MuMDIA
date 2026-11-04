@@ -59,6 +59,9 @@ pub mod artifact {
     /// (`<run>/rt_bootstrap/search_anchors.parquet`, `stages::rt_bootstrap`).
     pub const RT_BOOTSTRAP_ANCHORS: (&str, u32) = ("rt_bootstrap_anchors", 1);
     pub const RUN_WINDOWS: (&str, u32) = ("run_windows", 1);
+    /// v2: the six window columns stored as Float32 (`rt_im_train.run_windows_f32`), the
+    /// columns and their meaning those of v1. Readers widen either.
+    pub const RUN_WINDOWS_F32: (&str, u32) = ("run_windows", 2);
     pub const PSMS_EXTRACTED: (&str, u32) = ("psms_extracted", 2);
     /// v4, written only when the extracted spectra carry per-peak 1/K0: `apex_im` filled
     /// (the intensity-weighted median 1/K0 of the candidate's matched fragment peaks in its
@@ -233,6 +236,15 @@ pub mod artifact {
 
     /// The seed schema a search writes: [`SEED_PSMS_V2`] when the searched spectra carry
     /// per-peak 1/K0, else [`SEED_PSMS`].
+    /// `run_windows` v1 (Float64), or v2 under `rt_im_train.run_windows_f32`.
+    pub fn run_windows(f32: bool) -> (&'static str, u32) {
+        if f32 {
+            RUN_WINDOWS_F32
+        } else {
+            RUN_WINDOWS
+        }
+    }
+
     pub fn seed_psms(has_im: bool) -> (&'static str, u32) {
         if has_im {
             SEED_PSMS_V2

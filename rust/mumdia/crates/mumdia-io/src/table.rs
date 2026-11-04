@@ -2020,6 +2020,17 @@ impl Table {
         Ok(out)
     }
 
+    /// [`Table::opt_f64`] for a column stored as f64 or f32 (widened exactly), such as the
+    /// window columns of `run_windows` v1 and v2.
+    pub fn opt_f64_widening(&self, name: &str) -> Result<Vec<Option<f64>>> {
+        let i = self.idx(name)?;
+        let mut out = Vec::with_capacity(self.nrows);
+        for b in &self.batches {
+            push_opt_f64_widening(&mut out, b.column(i), name)?;
+        }
+        Ok(out)
+    }
+
     /// Read an f32 list column. Accepts both `List` (32-bit offsets) and
     /// `LargeList` (64-bit offsets, written by `Col::LargeListF32`) encodings,
     /// so chromatogram artifacts written by either binary read back the same.
@@ -2262,6 +2273,17 @@ fn push_str_eq(out: &mut Vec<bool>, col: &ArrayRef, name: &str, value: &str) -> 
             }
             out.push(a.value(k) == value);
         }
+    }
+    Ok(())
+}
+
+/// [`push_opt_f64`] that also takes an f32 column, widened exactly.
+fn push_opt_f64_widening(out: &mut Vec<Option<f64>>, col: &ArrayRef, name: &str) -> Result<()> {
+    let Some(a) = col.as_any().downcast_ref::<Float32Array>() else {
+        return push_opt_f64(out, col, name);
+    };
+    for k in 0..a.len() {
+        out.push((!a.is_null(k)).then(|| f64::from(a.value(k))));
     }
     Ok(())
 }
@@ -3842,6 +3864,15 @@ impl TableFile {
         let mut out = Vec::with_capacity(self.nrows);
         for b in self.column(name, SCALAR_BATCH_ROWS)? {
             push_opt_f64(&mut out, b?.column(0), name)?;
+        }
+        Ok(out)
+    }
+
+    /// [`TableFile::opt_f64`] for a column stored as f64 or f32 (widened exactly).
+    pub fn opt_f64_widening(&self, name: &str) -> Result<Vec<Option<f64>>> {
+        let mut out = Vec::with_capacity(self.nrows);
+        for b in self.column(name, SCALAR_BATCH_ROWS)? {
+            push_opt_f64_widening(&mut out, b?.column(0), name)?;
         }
         Ok(out)
     }

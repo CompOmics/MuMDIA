@@ -79,6 +79,42 @@ pub struct Manifest {
     /// before the field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rt_calibration_missing: Vec<RtCalibrationGap>,
+    /// What `output.retain` removed from the output directory after the run
+    /// ([`Retention`]). Written only below `all`, so a manifest of the default keeps its
+    /// bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<Retention>,
+}
+
+/// The record of a retention tier applied to a finished output directory
+/// (`output.retain`, `mumdia::retain`; `scripts/prune_outputs.py` writes the same fields to
+/// `pruned.json`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retention {
+    /// `viewer` or `results`.
+    pub tier: String,
+    /// Whether the second pass applied, so the first-pass per-run tables were not evidence.
+    pub second_pass: bool,
+    /// Every file removed, relative to the output directory, in path order.
+    pub removed: Vec<RemovedFile>,
+    /// The sizes of the removed files, summed.
+    pub bytes_removed: u64,
+    /// The bytes released: a file hard-linked elsewhere in the directory counts once, when
+    /// its last link is removed.
+    pub bytes_freed: u64,
+}
+
+/// One file a retention tier removed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovedFile {
+    /// Relative to the output directory, `/`-separated.
+    pub path: String,
+    /// `results`, `viewer`, `intermediate` or `scratch`: the class that decided it.
+    pub class: String,
+    pub bytes: u64,
+    /// The content hash the manifest recorded for the file, when it recorded one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
 }
 
 impl Manifest {
@@ -97,6 +133,7 @@ impl Manifest {
             inputs: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             rt_calibration_missing: Vec::new(),
+            retention: None,
         }
     }
 

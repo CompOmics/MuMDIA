@@ -122,9 +122,9 @@ consequence in [`CLAUDE.md`](CLAUDE.md) and, in more detail, in the `docs/` guid
   quote third-party source and are deliberately untracked, which is why
   `ci/check_doc_refs.py` refuses citations to documents the repository does not
   ship.
-- **Parquet written outside `mumdia-io`** must be snappy-compressed with Arrow
-  `utf8` string columns. Polars defaults (zstd, `large_utf8`) are rejected by the
-  reader.
+- **Parquet written outside `mumdia-io`** must use Arrow `utf8` string columns
+  (Polars' default `large_utf8` is rejected by the reader) and a snappy, zstd or
+  uncompressed codec. The helpers write snappy, like the engine.
 - **Sidecar output must cover every input row exactly once with finite scores.**
   An in-sample fallback is not an acceptable substitute for out-of-fold scores.
 - **Do not present an identification count as evidence of anything else.** More

@@ -1561,6 +1561,23 @@ fn write_windows(
                 b.im_row(c, im_c[j], imlo_c[j], imhi_c[j]);
             }
         }
+        if p.cfg.run_windows_f32 {
+            let f = |v: Vec<f64>| v.into_iter().map(|x| x as f32).collect::<Vec<f32>>();
+            let o = |v: Vec<Option<f64>>| {
+                v.into_iter()
+                    .map(|x| x.map(|y| y as f32))
+                    .collect::<Vec<Option<f32>>>()
+            };
+            return Ok(vec![
+                Col::U32("candidate_id".into(), cid_c),
+                Col::F32("rt_pred_cal".into(), f(cal_c)),
+                Col::F32("rt_lo".into(), f(lo_c)),
+                Col::F32("rt_hi".into(), f(hi_c)),
+                Col::OptF32("im_pred_cal".into(), o(im_c)),
+                Col::OptF32("im_lo".into(), o(imlo_c)),
+                Col::OptF32("im_hi".into(), o(imhi_c)),
+            ]);
+        }
         Ok(vec![
             Col::U32("candidate_id".into(), cid_c),
             Col::F64("rt_pred_cal".into(), cal_c),
@@ -1698,7 +1715,7 @@ fn write_windows(
     let report = ArtifactReport {
         logical_name: artifact::RUN_WINDOWS.0.to_string(),
         schema_name: artifact::RUN_WINDOWS.0.to_string(),
-        schema_version: artifact::RUN_WINDOWS.1,
+        schema_version: artifact::run_windows(p.cfg.run_windows_f32).1,
         stage: "rt-im-train".to_string(),
         rows,
         // Computed while the table was written.

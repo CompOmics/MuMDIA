@@ -35,6 +35,9 @@ pub struct RunParams<'a> {
     pub lib_fragments: Option<&'a str>,
     pub max_spectra: usize,
     pub top_peaks_ms2: usize,
+    /// `[mzml]` when `raw::ensure_mzml` converted it from a vendor input, else empty;
+    /// deleted once the spectra are written when `convert.keep_converted_mzml` is false.
+    pub converted_mzml: &'a [String],
 }
 
 /// A library-input artifact record waiting for its input hash (see `run`).
@@ -229,6 +232,9 @@ pub fn run(p: RunParams) -> Result<()> {
         .filter_map(|(role, path)| path.map(|x| (role.to_string(), x.to_string())))
         .collect(),
     );
+    if !p.config.convert.keep_converted_mzml {
+        crate::raw::discard_after_convert(p.converted_mzml, input_hashes.progress());
+    }
     // The two library-input records, completed once the input hashes are joined: they are
     // the same files, so their content hash IS the input hash, and hashing them here as
     // well read a multi-GB library a second time before the first stage. A later stage
@@ -1049,8 +1055,25 @@ pub fn run(p: RunParams) -> Result<()> {
     }
     crate::stages::rt_health::warn_summary(&man.rt_calibration_missing, 1, &native);
 
+    // `output.retain`: what the tier removes, recorded in the manifest before anything goes,
+    // so the manifest names every file the directory had.
+    let retention = crate::retain::plan(
+        std::path::Path::new(p.out_dir),
+        cfg.output.retain,
+        &crate::retain::Layout::default(),
+        &crate::retain::hashes_by_rel(
+            p.out_dir,
+            man.artifacts
+                .values()
+                .map(|a| (a.path.as_str(), a.content_hash.as_str())),
+        ),
+    )?;
+    man.retention = retention.clone();
     let manifest_path = d("manifest.json");
     mumdia_io::json::write_json(&manifest_path, &man)?;
+    if let Some(r) = &retention {
+        crate::retain::remove(std::path::Path::new(p.out_dir), r)?;
+    }
 
     info!(
         elapsed_ms = t0.elapsed().as_millis(),
@@ -1090,6 +1113,7 @@ fn convert_and_record(
         config_hash: &convert_hash,
         tdf: convert::TdfParams::from_config(&cfg.convert),
     })?;
+    crate::raw::discard_converted(p.mzml);
     for (name, schema, path, hash) in [
         ("spectra_ms1", co.schemas.ms1, &co.ms1, &co.hashes.ms1),
         ("spectra_ms2", co.schemas.ms2, &co.ms2, &co.hashes.ms2),

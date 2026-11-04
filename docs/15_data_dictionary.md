@@ -252,7 +252,14 @@ so `deeplc_finetune.py` reads it as it reads `seed_psms`. One row per candidate,
 | `im_lo` | Float64 | yes | 1/K0 | `im_pred_cal - w_im`; null where `im_pred_cal` is |
 | `im_hi` | Float64 | yes | 1/K0 | `im_pred_cal + w_im`; null where `im_pred_cal` is |
 
-The table stays version 1 on every run: the three IM columns were always part of it. They are
+Version 2 (`rt_im_train.run_windows_f32`, off by default) stores the six window columns as
+Float32 with the same names, nullability and meaning, at about half the size of the table.
+Extract takes the windows `rt-im-train` fitted in memory at full precision, so its candidates
+do not depend on the version; the readers of the file (`extract::read_run_windows`, which
+retrace and a standalone `extract` use, the prescreen, the prescan and `mumdia mobilogram`)
+widen either version to f64.
+
+Without that key the table stays version 1 on every run: the three IM columns were always part of it. They are
 filled only when the seed carries `observed_im` and the library `predicted_im`. Extract reads
 them through its one `run_windows` reader (`extract::read_run_windows`) for the 1/K0 gate and
 for `psms_extracted`'s `im_pred_cal` (docs/09 section 8). A NaN `im_lo` or `im_hi` is refused

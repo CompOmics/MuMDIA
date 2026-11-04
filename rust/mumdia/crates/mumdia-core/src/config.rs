@@ -405,6 +405,17 @@ pub struct ConvertConfig {
     /// pay for it twice. Turn it off when the neighbouring mzML may have come from
     /// a different converter or a different `.raw` of the same name.
     pub reuse_converted: bool,
+    /// Keep the mzML converted from a vendor input beside it. On by default.
+    ///
+    /// `false` deletes each converted mzML as soon as its spectra (`<run>/spectra/`) are
+    /// written and its input hash is taken: nothing reads it after that, and on a six-run
+    /// Astral experiment the six mzML were larger than the whole output directory. A later
+    /// search of the same vendor file converts it again instead of reusing it
+    /// (`reuse_converted`). An mzML given as the input is never deleted. On Thermo input
+    /// `thermo_native` writes no mzML at all. Not part of the canonical configuration: it
+    /// changes which files stay, not what any stage computes.
+    #[serde(skip_serializing)]
+    pub keep_converted_mzml: bool,
     /// How many vendor files `run` and `run-experiment` convert to mzML at once. Default 4.
     ///
     /// Every vendor input is converted before the first run starts, and the conversions
@@ -482,6 +493,7 @@ impl Default for ConvertConfig {
             msconvert: "auto".to_string(),
             msconvert_args: Vec::new(),
             reuse_converted: true,
+            keep_converted_mzml: true,
             parallel_conversions: 4,
             tdf_mz_ppm: 10.0,
             tdf_im_gap_scans: 30,
@@ -1698,6 +1710,16 @@ pub struct RtImTrainConfig {
     /// window widens on that side only; elsewhere it stays the global window. Default 100
     /// since 2026-10-08; 0 is off. Mutually exclusive with `adaptive_rt_window`.
     pub local_window_anchors: usize,
+    /// Write `run_windows.parquet` with Float32 window columns (`rt_pred_cal`, `rt_lo`,
+    /// `rt_hi`, `im_pred_cal`, `im_lo`, `im_hi`; schema version 2) instead of Float64. Off
+    /// by default. About half the size of the table, which on a large library is the widest
+    /// file of a run (one row per library precursor, targets and decoys). Extract takes the
+    /// fitted windows in memory at full precision, so its candidates are unchanged; the
+    /// readers of the file (retrace, the prescreen, the prescan, `mumdia mobilogram`, a
+    /// standalone `extract`) widen the stored values, which are rounded to float32 (a
+    /// relative 6e-8, far below any window width). Every reader takes both versions.
+    #[serde(skip_serializing_if = "is_false")]
+    pub run_windows_f32: bool,
     /// Multiplier on the local one-sided quantiles of `local_window_anchors`.
     pub local_window_multiplier: f64,
     /// Lower clamp (seconds) for any RT half-window (the existing 1 s floor).
@@ -1969,6 +1991,7 @@ impl Default for RtImTrainConfig {
             adaptive_rt_window: false,
             adaptive_rt_bins: 12,
             local_window_anchors: 100,
+            run_windows_f32: false,
             local_window_multiplier: 1.0,
             rt_window_min_s: 1.0,
             window_holdout_frac: 0.0,
@@ -4382,6 +4405,12 @@ pub struct Config {
     /// configuration while every key is at its default.
     #[serde(default, skip_serializing_if = "LocaliseConfig::is_default")]
     pub localise: LocaliseConfig,
+    /// What a finished `run` or `run-experiment` keeps in its output directory
+    /// ([`OutputConfig`]). Never part of the canonical configuration: it decides which files
+    /// stay, never what any of them contains, so the configuration hash and every kept
+    /// artifact are the same under every tier.
+    #[serde(default, skip_serializing)]
+    pub output: OutputConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -4405,6 +4434,59 @@ impl Default for Config {
             groups: t(),
             retrace: t(),
             localise: t(),
+            output: t(),
+        }
+    }
+}
+
+/// The retention tier of a finished output directory (docs/01_overview_and_dataflow.md,
+/// "Output retention").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Retain {
+    /// Everything the run wrote (default).
+    #[default]
+    All,
+    /// `results`, the evidence tables (the second pass's when one applied, else the
+    /// first pass's) and the converted spectra: what a viewer, `quant`, `localise
+    /// --experiment-dir` and `mobilogram` read.
+    Viewer,
+    /// The manifest, the scored tables, the quantities, the LFQ matrices, the TSV reports,
+    /// the empirical library of a second pass and every `.json` sidecar.
+    Results,
+}
+
+impl Retain {
+    /// The name `--retain` and the configuration take.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Retain::All => "all",
+            Retain::Viewer => "viewer",
+            Retain::Results => "results",
+        }
+    }
+}
+
+/// The output directory after a successful run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutputConfig {
+    /// Which files a finished `run` or `run-experiment` keeps: `all` (default), `viewer` or
+    /// `results`. After the manifest is written the engine removes what the tier does not
+    /// keep, by the rules of `scripts/prune_outputs.py` (`mumdia::retain`), and records each
+    /// removed path, its size and its content hash under `retention` in the manifest.
+    /// Under a second pass the first pass's per-run tables, `first_pass/`, the library copies
+    /// and `rt_bootstrap/` are not read again and go below `all`; without one the first-pass
+    /// tables are the evidence and stay under `viewer`. Every `.json` sidecar stays in every
+    /// tier. `--retain` on `run` and `run-experiment` overrides it. Not part of the canonical
+    /// configuration, so the configuration hash and the bytes of every kept artifact are the
+    /// same under every tier.
+    pub retain: Retain,
+}
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            retain: Retain::All,
         }
     }
 }
@@ -5619,6 +5701,26 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `output.retain` parses, defaults to `all`, and is never part of the canonical
+    /// configuration, so a pruned run keeps the configuration hash of an unpruned one.
+    #[test]
+    fn output_retain_never_reaches_the_canonical_json() {
+        let c = Config::default();
+        assert_eq!(c.output.retain, Retain::All);
+        for (json, tier) in [
+            (r#"{"output": {"retain": "results"}}"#, Retain::Results),
+            (r#"{"output": {"retain": "viewer"}}"#, Retain::Viewer),
+            (r#"{"output": {"retain": "all"}}"#, Retain::All),
+        ] {
+            let parsed: Config = serde_json::from_str(json).unwrap();
+            assert_eq!(parsed.output.retain, tier);
+            assert_eq!(parsed.canonical_json(), c.canonical_json());
+        }
+        assert!(!c.canonical_json().contains("\"output\""));
+        assert!(serde_json::from_str::<Config>(r#"{"output": {"retain": "some"}}"#).is_err());
+        assert!(serde_json::from_str::<Config>(r#"{"output": {"keep": 1}}"#).is_err());
+    }
 
     /// The decoy-corrected 1/K0 window sizing at 1.3x is the default: the seed records
     /// observed 1/K0 up to `im_window_sizing_q`, and the canonical configuration carries

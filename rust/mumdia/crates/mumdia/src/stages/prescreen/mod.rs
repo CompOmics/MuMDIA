@@ -1079,8 +1079,8 @@ pub fn run(p: PrescreenParams) -> Result<PrescreenSummary> {
     if let Some(path) = p.run_windows {
         let rw = TableFile::open(path)?;
         let r_cid = rw.u32("candidate_id")?;
-        let r_lo = rw.f64("rt_lo")?;
-        let r_hi = rw.f64("rt_hi")?;
+        let r_lo = rw.f64_widening("rt_lo")?;
+        let r_hi = rw.f64_widening("rt_hi")?;
         for i in 0..rw.nrows {
             let c = r_cid[i] as usize;
             if c <= maxc {

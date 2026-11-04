@@ -22,6 +22,7 @@ pub mod python;
 pub mod quant_lfq;
 pub mod raw;
 pub mod rescoring;
+pub mod retain;
 pub mod sched;
 pub mod sidecar;
 pub mod solve;
