@@ -252,8 +252,18 @@ kept. In no tier are the library copies with recalibrated retention times
 `first_pass/` and `sidecar_work/` kept below `all`; a FASTA-built library in the output
 directory is kept under `viewer` only when there is no second pass.
 
-`scripts/prune_outputs.py <out_dir> --tier results|viewer` applies a tier to a finished
-directory. It is a dry run unless given `--apply`, prints the size of every tier, refuses a
+The engine applies a tier itself with `output.retain = "all" | "viewer" | "results"` (default
+`all`, which removes nothing) or `--retain` on `run` and `run-experiment`. After a successful
+run it writes the manifest with a `retention` block that lists every file the tier removes
+(relative path, class, size and the content hash the manifest recorded for it, plus
+`bytes_removed`, `bytes_freed` and whether the second pass applied), then removes them and the
+directories they leave empty (`mumdia::retain`). A failed run removes nothing. The key is never
+part of the canonical configuration: it decides which files stay, not what any of them
+contains, so the configuration hash and the bytes of every kept artifact are the same under
+every tier, and only the manifest gains the `retention` block.
+
+`scripts/prune_outputs.py <out_dir> --tier results|viewer` applies the same rules to a finished
+directory, for runs made with `all` or by an older engine. It is a dry run unless given `--apply`, prints the size of every tier, refuses a
 directory without its manifest (written last, so its absence means the run did not finish),
 never removes a file the rules do not know (it lists them), counts hard links once
 (`psms_competed.parquet` is a hard link to `features.parquet`), and records every removed

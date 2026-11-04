@@ -51,7 +51,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 
 | Section | Struct | Fields | Stage document |
 |---|---|---|---|
-| [(top level)](#top-level) | `Config` | 19 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
+| [(top level)](#top-level) | `Config` | 20 | [docs/02_config_and_data_model.md](02_config_and_data_model.md) |
 | [`convert`](#convert) | `ConvertConfig` | 14 |  |
 | [`prescan`](#prescan) | `PrescanConfig` | 7 | [docs/21_prescan.md](21_prescan.md) |
 | [`prescreen`](#prescreen) | `PrescreenConfig` | 31 |  |
@@ -75,6 +75,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | [`groups`](#groups) | `GroupsConfig` | 9 |  |
 | [`retrace`](#retrace) | `RetraceConfig` | 5 | [docs/09_extract.md](09_extract.md) |
 | [`localise`](#localise) | `LocaliseConfig` | 16 | [docs/36_ptm_localisation.md](36_ptm_localisation.md) |
+| [`output`](#output) | `OutputConfig` | 1 |  |
 | [`peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]`](#peptidoformsfixed_mods--peptidoformsvariable_mods) | `ResidueMod` | 3 | [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md) |
 
 ## (top level)
@@ -102,6 +103,7 @@ undocumented on purpose; those fields are counted under "Coverage".
 | `groups` | `GroupsConfig` | the `GroupsConfig` section's own defaults |  |  |
 | `retrace` | `RetraceConfig` | the `RetraceConfig` section's own defaults |  | Raw-event trace rebuild for diaPASEF runs (`RetraceConfig`). Omitted from the canonical configuration while every key is at its default. |
 | `localise` | `LocaliseConfig` | the `LocaliseConfig` section's own defaults |  | Modification site localisation (`LocaliseConfig`). Omitted from the canonical configuration while every key is at its default. |
+| `output` | `OutputConfig` | the `OutputConfig` section's own defaults |  | What a finished `run` or `run-experiment` keeps in its output directory (`OutputConfig`). Never part of the canonical configuration: it decides which files stay, never what any of them contains, so the configuration hash and every kept artifact are the same under every tier. |
 
 ## convert
 
@@ -607,6 +609,18 @@ Site localisation of modifications on the identified peptidoforms (the `localise
 | `combine_runs` | `bool` | `true` |  | `run-experiment`: combine the runs into one site probability per consensus peak, summing the log-likelihoods of the runs whose peak of the same precursor matches it in aligned retention time, and write `localisation_experiment.parquet` and the experiment-level columns of `peptides.tsv` and `sites.tsv`. The per-run tables are the same either way. Default true. |
 | `experiment_temperature` | `f64` | `0.0` |  | The temperature of the combined posterior: a number, or `"auto"` (also written `0`), fitted on the consensus peaks as `temperature` is on the run peaks, with its prior centred on the run temperature times the square root of the mean number of runs summed. Above the run temperature it discounts the evidence of runs that repeat each other's interferences. Default `"auto"`. |
 
+## output
+
+`OutputConfig` (rust/mumdia/crates/mumdia-core/src/config.rs).
+
+The output directory after a successful run.
+
+`OutputConfig` has no `impl Default` block in the source.
+
+| Field | Type | Default | Gated | Description |
+|---|---|---|---|---|
+| `retain` | `Retain` | none: must be set |  | Which files a finished `run` or `run-experiment` keeps: `all` (default), `viewer` or `results`. After the manifest is written the engine removes what the tier does not keep, by the rules of `scripts/prune_outputs.py` (`mumdia::retain`), and records each removed path, its size and its content hash under `retention` in the manifest. Under a second pass the first pass's per-run tables, `first_pass/`, the library copies and `rt_bootstrap/` are not read again and go below `all`; without one the first-pass tables are the evidence and stay under `viewer`. Every `.json` sidecar stays in every tier. `--retain` on `run` and `run-experiment` overrides it. Not part of the canonical configuration, so the configuration hash and the bytes of every kept artifact are the same under every tier. |
+
 ## peptidoforms.fixed_mods[] / peptidoforms.variable_mods[]
 
 `ResidueMod` (rust/mumdia/crates/mumdia-core/src/config.rs). stage document: [docs/05_digest_peptidoforms.md](05_digest_peptidoforms.md).
@@ -1108,6 +1122,18 @@ Which q-value column quant filters candidates on. Peptide- or precursor-level q 
 | `percolator` |  | External percolator.exe over the PIN file. |
 | `entrapment` |  | Spike-in (entrapment) negative rescorer: treat foreign-proteome PSMs (identified by `entrapment_marker`) as real negatives, train a nonlinear GBM sidecar (out-of-fold by base peptide) or a native linear fallback, and report entrapment-calibrated q-values. The chimeric false matches that in-silico decoys under-model appear as real negatives here, so it closes the FDR-validity gap the decoy schemes cannot. |
 
+### `Retain`
+
+(rust/mumdia/crates/mumdia-core/src/config.rs)
+
+The retention tier of a finished output directory (docs/01_overview_and_dataflow.md, "Output retention").
+
+| Value | Default | Description |
+|---|---|---|
+| `all` | yes | Everything the run wrote (default). |
+| `viewer` |  | `results`, the evidence tables (the second pass's when one applied, else the first pass's) and the converted spectra: what a viewer, `quant`, `localise --experiment-dir` and `mobilogram` read. |
+| `results` |  | The manifest, the scored tables, the quantities, the LFQ matrices, the TSV reports, the empirical library of a second pass and every `.json` sidecar. |
+
 ### `RollupMethod`
 
 (rust/mumdia/crates/mumdia-core/src/config.rs)
@@ -1348,8 +1374,9 @@ instead of looking like an absent field.
 - `search_seed.widen_tol_below` (`usize`): unresolved expression `DEFAULT_WIDEN_TOL_BELOW`
 - `search_seed.widen_tol_factor` (`f64`): unresolved expression `DEFAULT_WIDEN_TOL_FACTOR`
 
-2 field(s) have no default because the owning struct has no `impl Default`. That is the source's intent, not a parsing gap: a list element must carry every key.
+3 field(s) have no default because the owning struct has no `impl Default`. That is the source's intent, not a parsing gap: a list element must carry every key.
 
+- `output.retain` (`Retain`)
 - `peptidoforms.fixed_mods[].name` (`String`)
 - `peptidoforms.fixed_mods[].residue` (`char`)
 
@@ -1369,6 +1396,6 @@ instead of looking like an absent field.
 
 ## Coverage
 
-25 structs and 343 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 44 enumerations, 1 named profile(s), 108 environment variables read and 27 set.
+26 structs and 345 fields emitted from `rust/mumdia/crates/mumdia-core/src/config.rs`, plus 45 enumerations, 1 named profile(s), 108 environment variables read and 27 set.
 
-36 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 2 have none by design.
+36 field(s) carry a gating marker in their doc comment. 59 field(s) carry no doc comment at all, so their description is empty above. 2 default(s) could not be resolved and 3 have none by design.

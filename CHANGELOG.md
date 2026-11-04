@@ -132,6 +132,12 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **`output.retain` and `--retain`: the engine prunes its own output directory.** `run` and
+  `run-experiment` take `all` (the default, which removes nothing), `viewer` or `results`, with
+  the rules of `scripts/prune_outputs.py`. After a successful run the manifest lists every
+  removed file with its size and content hash under `retention`, then the files go. The key is
+  not part of the canonical configuration, so the configuration hash and every kept artifact
+  are the same under every tier (docs/01_overview_and_dataflow.md, "Output retention").
 - **`scripts/prune_outputs.py`: reduce a finished output directory to a retention tier.**
   `results` keeps the manifest, the scored tables, the quantities, the LFQ matrices, the TSV
   reports, the second pass's empirical library and every JSON sidecar; `viewer` adds the

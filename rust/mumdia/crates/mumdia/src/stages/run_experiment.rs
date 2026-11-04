@@ -2870,7 +2870,23 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
 
     // The resolved configuration itself, not only its hash: a hash identifies a
     // configuration but cannot replay one (docs/29 #15).
-    let manifest = serde_json::json!({
+    // `output.retain`: what the tier removes, recorded in the manifest before anything goes.
+    let retention = crate::retain::plan(
+        std::path::Path::new(p.out_dir),
+        cfg.output.retain,
+        &crate::retain::Layout {
+            experiment: true,
+            runs: names.iter().cloned().collect(),
+            second_pass: second.is_some(),
+        },
+        &crate::retain::hashes_by_rel(
+            p.out_dir,
+            prov.artifacts
+                .values()
+                .map(|a| (a.path.as_str(), a.content_hash.as_str())),
+        ),
+    )?;
+    let mut manifest = serde_json::json!({
         "mumdia_version": prov.mumdia_version,
         "git_sha": prov.git_sha,
         "commit_date": prov.commit_date,
@@ -2883,7 +2899,13 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         "artifacts": prov.artifacts,
         "experiment": manifest,
     });
+    if let Some(r) = &retention {
+        manifest["retention"] = serde_json::to_value(r)?;
+    }
     mumdia_io::json::write_json(&d("experiment_manifest.json"), &manifest)?;
+    if let Some(r) = &retention {
+        crate::retain::remove(std::path::Path::new(p.out_dir), r)?;
+    }
     info!(
         elapsed_ms = t0.elapsed().as_millis(),
         n_runs,

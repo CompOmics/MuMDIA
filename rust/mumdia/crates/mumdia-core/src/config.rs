@@ -4382,6 +4382,12 @@ pub struct Config {
     /// configuration while every key is at its default.
     #[serde(default, skip_serializing_if = "LocaliseConfig::is_default")]
     pub localise: LocaliseConfig,
+    /// What a finished `run` or `run-experiment` keeps in its output directory
+    /// ([`OutputConfig`]). Never part of the canonical configuration: it decides which files
+    /// stay, never what any of them contains, so the configuration hash and every kept
+    /// artifact are the same under every tier.
+    #[serde(default, skip_serializing)]
+    pub output: OutputConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -4405,8 +4411,54 @@ impl Default for Config {
             groups: t(),
             retrace: t(),
             localise: t(),
+            output: t(),
         }
     }
+}
+
+/// The retention tier of a finished output directory (docs/01_overview_and_dataflow.md,
+/// "Output retention").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Retain {
+    /// Everything the run wrote (default).
+    #[default]
+    All,
+    /// `results`, the evidence tables (the second pass's when one applied, else the
+    /// first pass's) and the converted spectra: what a viewer, `quant`, `localise
+    /// --experiment-dir` and `mobilogram` read.
+    Viewer,
+    /// The manifest, the scored tables, the quantities, the LFQ matrices, the TSV reports,
+    /// the empirical library of a second pass and every `.json` sidecar.
+    Results,
+}
+
+impl Retain {
+    /// The name `--retain` and the configuration take.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Retain::All => "all",
+            Retain::Viewer => "viewer",
+            Retain::Results => "results",
+        }
+    }
+}
+
+/// The output directory after a successful run.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutputConfig {
+    /// Which files a finished `run` or `run-experiment` keeps: `all` (default), `viewer` or
+    /// `results`. After the manifest is written the engine removes what the tier does not
+    /// keep, by the rules of `scripts/prune_outputs.py` (`mumdia::retain`), and records each
+    /// removed path, its size and its content hash under `retention` in the manifest.
+    /// Under a second pass the first pass's per-run tables, `first_pass/`, the library copies
+    /// and `rt_bootstrap/` are not read again and go below `all`; without one the first-pass
+    /// tables are the evidence and stay under `viewer`. Every `.json` sidecar stays in every
+    /// tier. `--retain` on `run` and `run-experiment` overrides it. Not part of the canonical
+    /// configuration, so the configuration hash and the bytes of every kept artifact are the
+    /// same under every tier.
+    pub retain: Retain,
 }
 
 impl Config {
@@ -5619,6 +5671,26 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `output.retain` parses, defaults to `all`, and is never part of the canonical
+    /// configuration, so a pruned run keeps the configuration hash of an unpruned one.
+    #[test]
+    fn output_retain_never_reaches_the_canonical_json() {
+        let c = Config::default();
+        assert_eq!(c.output.retain, Retain::All);
+        for (json, tier) in [
+            (r#"{"output": {"retain": "results"}}"#, Retain::Results),
+            (r#"{"output": {"retain": "viewer"}}"#, Retain::Viewer),
+            (r#"{"output": {"retain": "all"}}"#, Retain::All),
+        ] {
+            let parsed: Config = serde_json::from_str(json).unwrap();
+            assert_eq!(parsed.output.retain, tier);
+            assert_eq!(parsed.canonical_json(), c.canonical_json());
+        }
+        assert!(!c.canonical_json().contains("\"output\""));
+        assert!(serde_json::from_str::<Config>(r#"{"output": {"retain": "some"}}"#).is_err());
+        assert!(serde_json::from_str::<Config>(r#"{"output": {"keep": 1}}"#).is_err());
+    }
 
     /// The decoy-corrected 1/K0 window sizing at 1.3x is the default: the seed records
     /// observed 1/K0 up to `im_window_sizing_q`, and the canonical configuration carries
