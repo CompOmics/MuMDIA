@@ -881,6 +881,62 @@ print(f"    ok: empirical library {lib['entries']} entries + {lib['decoys']} pai
       f"{lib['runs_aligned']} runs aligned; no decoy extracted, so the first pass stands")
 PYEOF
 
+# 5r. `output.retain` (docs/01, "Output retention"): the same experiment at `viewer` and at
+#     `results`, and the single run at `results`. The fixture's second pass does not apply,
+#     so the first pass's tables are the evidence: `viewer` keeps them, `results` drops them
+#     (most of them during the run). Every kept artifact must be byte-identical to the
+#     unpruned run's, the manifest must list what went, and the experiment report must still
+#     run on the pruned directory.
+echo "=== smoke: output.retain"
+for tier in viewer results; do
+    "$BIN" run-experiment --fasta test_data/fixture.fasta         --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML"         --run-names a --run-names b --retain "$tier"         --out-dir "$work/exp_$tier" --config "$work/exp_seq.json" > "$work/exp_$tier.log" 2>&1         || { tail -30 "$work/exp_$tier.log"; echo "run-experiment --retain $tier failed"; exit 1; }
+    for f in scored_combined.parquet a/scored.parquet b/scored.parquet a/peptide_quant.parquet              b/protein_group_quant.parquet lfq_maxlfq.parquet peptides.tsv proteins.tsv; do
+        cmp -s "$work/exp/$f" "$work/exp_$tier/$f"             || { echo "--retain $tier changed $f"; exit 1; }
+    done
+done
+"$BIN" report --experiment-dir "$work/exp_results" --out-dir "$work/exp_results_report" --q 0.05     > "$work/exp_results_report.log" 2>&1 || { tail -20 "$work/exp_results_report.log"; exit 1; }
+cmp -s "$work/exp_report/peptides.tsv" "$work/exp_results_report/peptides.tsv"     || { echo "report --experiment-dir on a pruned experiment differs"; exit 1; }
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" --retain results     --out-dir "$work/out_retain" --config "$cfg" --threads 2 > "$work/out_retain.log" 2>&1     || { tail -20 "$work/out_retain.log"; echo "run --retain results failed"; exit 1; }
+for f in psms_scored.parquet peptide_quant.parquet protein_group_quant.parquet peptides.tsv; do
+    cmp -s "$work/out/$f" "$work/out_retain/$f" || { echo "run --retain results changed $f"; exit 1; }
+done
+"$PY" - "$work" <<'PYEOF'
+import json, os, sys
+w = sys.argv[1]
+def gone(d, rels):
+    for r in rels:
+        assert not os.path.exists(f"{d}/{r}"), f"{d}/{r} should have been removed"
+def kept(d, rels):
+    for r in rels:
+        assert os.path.exists(f"{d}/{r}"), f"{d}/{r} should have been kept"
+ev = ["chromatograms.parquet", "features.parquet", "psms_competed.parquet",
+      "psms_extracted.parquet", "seed_psms.parquet", "run_windows.parquet"]
+for tier in ("viewer", "results"):
+    d = f"{w}/exp_{tier}"
+    m = json.load(open(f"{d}/experiment_manifest.json"))
+    r = m["retention"]
+    assert r["tier"] == tier and r["second_pass"] is False, r
+    removed = {f["path"] for f in r["removed"]}
+    assert "first_pass/scored_combined.parquet" in removed, removed
+    gone(d, ["first_pass/scored_combined.parquet"])
+    kept(d, ["first_pass/scored_combined.parquet.report.json", "a/cal.json",
+             "a/seed_psms.parquet.masscal.json", "a/run_windows.parquet.report.json"])
+    if tier == "viewer":
+        kept(d, [f"{run}/{t}" for run in "ab" for t in ev] + ["a/spectra/spectra_ms2.parquet"])
+    else:
+        gone(d, [f"{run}/{t}" for run in "ab" for t in ev] + ["a/spectra/spectra_ms2.parquet"])
+        assert {f"a/{t}" for t in ev} <= removed, removed
+        kept(d, ["a/spectra/spectra_ms2.parquet.report.json"])
+    assert m["config_hash"] == json.load(open(f"{w}/exp/experiment_manifest.json"))["config_hash"]
+    print(f"    ok: --retain {tier}: {len(removed)} files removed, {r['bytes_freed']} bytes freed")
+s = json.load(open(f"{w}/out_retain/manifest.json"))
+assert s["retention"]["tier"] == "results", s.get("retention")
+gone(f"{w}/out_retain", ev + ["spectra/spectra_ms2.parquet"])
+kept(f"{w}/out_retain", ["psms_scored.parquet", "cal.json", "manifest.json"])
+assert "retention" not in json.load(open(f"{w}/out/manifest.json"))
+print(f"    ok: run --retain results removed {len(s['retention']['removed'])} files")
+PYEOF
+
 # 5q. `quant.fragment_detail`: the single run and the two-run experiment with the key on.
 #     Each run's final quant writes quant_fragments.parquet beside its peptide_quant and the
 #     manifest records it; every other table is the plain search's, byte for byte, and no
