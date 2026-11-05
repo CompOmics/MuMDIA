@@ -528,6 +528,7 @@ echo "    ok: run completed, drop reported, identifications unchanged"
 echo "=== smoke: the grouped orchestrator"
 cat > "$work/grouped.json" <<'JSONEOF'
 {
+  "predict_frag": { "allow_native_predictors": true },
   "features": { "set": "extended" },
   "extract": { "apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2 },
   "groups": { "window_groups": 3, "parallel": 2, "allow_unbounded_rt": true, "calibration": "per_group" }
@@ -590,6 +591,7 @@ if grep -q 'allow_unbounded_rt' "$work/grouped_refused.json"; then
 fi
 cat > "$work/grouped_refused_global.json" <<'JSONEOF'
 {
+  "predict_frag": { "allow_native_predictors": true },
   "features": { "set": "extended" },
   "extract": { "apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2 },
   "rt_im_train": { "q_train": 0.001 },
@@ -702,6 +704,7 @@ echo "    ok: band tables rescored and quantified; psms_scored and the quant tab
 echo "=== smoke: two bands, global calibration, pooled mass calibration"
 cat > "$work/grouped_2b.json" <<'JSONEOF'
 {
+  "predict_frag": { "allow_native_predictors": true },
   "features": { "set": "extended" },
   "extract": { "apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2 },
   "groups": { "window_groups": 2, "calibration": "global" }
@@ -1244,7 +1247,8 @@ with open(os.path.join(scripts, "deeplc_worker.py"), "w", encoding="utf-8") as f
 base = {
     "features": {"set": "extended"},
     "extract": {"apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2},
-    "predict_frag": {"deeplc_python": sys.executable, "sidecar_script_dir": scripts},
+    "predict_frag": {"deeplc_python": sys.executable, "sidecar_script_dir": scripts,
+                     "allow_native_predictors": True},
 }
 def arm(name, **sections):
     cfg = json.loads(json.dumps(base))
