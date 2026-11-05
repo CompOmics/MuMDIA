@@ -237,6 +237,12 @@ code.
   peptidoform, charge, precursor_mz, predicted_irt, label(="target"), protein,
   n_fragments`. `<out_fragments>`: `candidate_id, mz, predicted_intensity, name,
   ion_type, ordinal, frag_charge` (`import_diann_lib.py:59-83`).
+- `protein` is `Protein.Names` for a precursor whose every `;`-separated name is a UniProt
+  entry name (one word with an underscore, `ALBU_HUMAN`), else `Protein.Ids`. DIA-NN fills
+  `Protein.Names` only for headers it parses as UniProt; for `CON_sp|...` contaminants or
+  the `REAL_sp|` / `ENTRAP_sp|` headers of an entrapment FASTA it writes the first
+  description word (`Keratin,`) or nothing, which merged distinct proteins into one group or
+  left mapped precursors UNASSIGNED. Empty in both columns is `UNASSIGNED`.
 - A modification written before the first residue (`(UniMod:1)PEPK`) is N-terminal.
   It is kept as the ProForma group `[Acetyl]-PEPK` when its accession is kept
   (`--keep-unimod 1,4,35` for protein N-terminal acetylation), and the precursor is
