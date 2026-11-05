@@ -132,6 +132,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **Desktop application: a DIA-NN library as the search's library.** The spectral-library
+  tab of the Search screen takes a DIA-NN library (a fragment-level `.parquet`, or a
+  `.speclib`, which the user's DIA-NN re-exports as Parquet first) and an output folder, and
+  converts it into the two engine tables with the library builder's own steps after its
+  prediction: `import_diann_lib.py`, `make_reverse_decoys.py` and `predict_decoys.py`, so
+  the decoys' spectra are DIA-NN predictions. The two tables are then selected for the
+  search. The file is checked before anything runs (the importer's required columns, read
+  from the Parquet footer; a search report, a MuMDIA table and a `.tsv` are refused with
+  what they are). The import is refused, with the reason and the fix, when no working and
+  licence-acknowledged DIA-NN 2.x is available: there is no fallback to decoys that copy
+  their targets' intensities, which made the reported FDR optimistic. Every modification of
+  the catalogue is kept; no FASTA is needed, because the proteins come from the library. The
+  builder and the import share one conversion function (`desktop/README.md`, "Importing a
+  DIA-NN library").
 - **Lower peak disk below `output.retain = all`, and two opt-in footprint keys.** Under
   `viewer` or `results` the engine removes, while the run is still going, the tables it would
   remove at the end once nothing later reads them: `run_windows` after extract (`results`),

@@ -1664,7 +1664,7 @@ fn predict_args(req: &BuildRequest, plan: &ModPlan, out_lib: &Path) -> Result<Ve
 /// population, and `predict_decoys.py` replaces the decoys' copied intensities with
 /// DIA-NN's prediction for their sequences -- the last of which also sorts by precursor
 /// m/z and re-indexes `candidate_id`, both of which the fragment index rejects a library
-/// for lacking.
+/// for lacking. Everything after the prediction is `convert`, which `import` shares.
 pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
     let status = detect();
     if !status.licence_acknowledged {
@@ -1684,18 +1684,7 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
             status.version.unwrap_or_else(|| "this DIA-NN".into())
         ));
     }
-    // The importer and the decoy builder need pandas and pyarrow, which the
-    // primary managed environment has.
-    let python = crate::components::managed_python(crate::components::Env::Primary);
-    if !python.is_file() {
-        return Err(
-            "the analysis components are not installed, and the library \
-                    conversion needs them"
-                .into(),
-        );
-    }
-    let scripts = crate::engine::scripts_dir()
-        .ok_or_else(|| "the conversion scripts were not found".to_string())?;
+    let (python, scripts) = conversion_tools()?;
 
     let fasta = PathBuf::from(&req.fasta);
     if !fasta.is_file() {
@@ -1705,21 +1694,7 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
 
-    {
-        let mut s = builder
-            .state
-            .lock()
-            .map_err(|_| "internal state is poisoned".to_string())?;
-        if s.status == "running" {
-            return Err("a library build is already running".into());
-        }
-        *s = BuildState {
-            status: "running".into(),
-            step: "predicting the library with DIA-NN".into(),
-            ..Default::default()
-        };
-        installer_reset(&builder);
-    }
+    begin(&builder, "predicting the library with DIA-NN")?;
 
     std::thread::spawn(move || {
         let stem = "lib";
@@ -1750,172 +1725,631 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
             return;
         }
 
+        let conversion = Conversion {
+            exe,
+            python,
+            scripts,
+            out_dir,
+            threads: req.threads,
+            keep_unimod: build_keep_unimod(&plan),
+        };
+        let result = convert(&builder, &conversion, Source::Predicted(stem));
+        // The marker last, after both tables are on disk. Anything that dies before
+        // this leaves a directory `cached_library` will not accept, which is the
+        // point: a half-written library must not read as a finished one.
+        finish(&builder, result, |dir| {
+            mark_cache_complete(dir, &req, version_for_cache.as_deref().unwrap_or(""))
+        });
+    });
+
+    Ok(())
+}
+
+/// The accessions a built library's import keeps.
+///
+/// The importer keeps the standard accessions by default; any other selection names
+/// what DIA-NN was asked to place, or the precursors carrying it would be dropped as
+/// unmapped.
+fn build_keep_unimod(plan: &ModPlan) -> Option<Vec<u32>> {
+    (!plan.is_legacy()).then(|| plan.unimod_ids())
+}
+
+// ── the conversion after DIA-NN, shared by `build` and `import` ─────────────
+
+/// The Python interpreter and the scripts directory the conversion runs.
+fn conversion_tools() -> Result<(PathBuf, PathBuf), String> {
+    // The importer and the decoy builder need pandas and pyarrow, which the
+    // primary managed environment has.
+    let python = crate::components::managed_python(crate::components::Env::Primary);
+    if !python.is_file() {
+        return Err(
+            "the analysis components are not installed, and the library \
+                    conversion needs them"
+                .into(),
+        );
+    }
+    let scripts = crate::engine::scripts_dir()
+        .ok_or_else(|| "the conversion scripts were not found".to_string())?;
+    Ok((python, scripts))
+}
+
+/// Claim the builder for a new build or import, refusing while one runs.
+fn begin(builder: &Arc<Builder>, step: &str) -> Result<(), String> {
+    let mut s = builder
+        .state
+        .lock()
+        .map_err(|_| "internal state is poisoned".to_string())?;
+    if s.status == "running" {
+        return Err("a library build is already running".into());
+    }
+    *s = BuildState {
+        status: "running".into(),
+        step: step.into(),
+        ..Default::default()
+    };
+    installer_reset(builder);
+    Ok(())
+}
+
+/// What turning a DIA-NN library into the two engine tables needs.
+struct Conversion {
+    /// The user's DIA-NN: it re-exports a `.speclib` and predicts the decoys.
+    exe: PathBuf,
+    python: PathBuf,
+    scripts: PathBuf,
+    /// Where the intermediate tables and the two final ones are written.
+    out_dir: PathBuf,
+    threads: u32,
+    /// `--keep-unimod` for the importer and the decoy prediction; `None` keeps the
+    /// importer's default set.
+    keep_unimod: Option<Vec<u32>>,
+}
+
+/// A DIA-NN library a user chose, by the format it is in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiannLibrary {
+    /// A fragment-level Parquet library (DIA-NN 1.9 and 2.x), read as it is.
+    Parquet(PathBuf),
+    /// DIA-NN's binary `.speclib`, re-exported as Parquet with the user's DIA-NN first.
+    Speclib(PathBuf),
+}
+
+/// The DIA-NN library the conversion starts from.
+enum Source {
+    /// What `build` predicted under this stem in the output folder: DIA-NN's Parquet
+    /// when it wrote one, otherwise its `.speclib`, re-exported.
+    Predicted(&'static str),
+    /// A library the user chose (`import`).
+    Chosen(DiannLibrary),
+}
+
+/// The stem an imported `.speclib` is re-exported under, in the output folder.
+const IMPORT_REEXPORT_STEM: &str = "diann_library";
+
+/// DIA-NN's command line for writing a `.speclib` as Parquet.
+fn reexport_args(speclib: &Path, target: &Path, threads: u32) -> Vec<String> {
+    vec![
+        "--lib".to_string(),
+        speclib.to_string_lossy().into_owned(),
+        "--gen-spec-lib".to_string(),
+        "--out-lib".to_string(),
+        target.to_string_lossy().into_owned(),
+        "--threads".to_string(),
+        threads.to_string(),
+    ]
+}
+
+/// Re-export a `.speclib` as `<stem>.parquet` in the output folder, and find what
+/// DIA-NN wrote.
+fn reexport(
+    builder: &Arc<Builder>,
+    c: &Conversion,
+    speclib: &Path,
+    stem: &str,
+) -> Result<PathBuf, String> {
+    if let Ok(mut s) = builder.state.lock() {
+        s.step = "re-exporting the library as Parquet".into();
+    }
+    builder.log(format!(
+        "== DIA-NN wrote {}, which MuMDIA cannot read; re-exporting it as \
+         Parquet",
+        speclib.display()
+    ));
+    let target = c.out_dir.join(format!("{stem}.parquet"));
+    let args = reexport_args(speclib, &target, c.threads);
+    builder.log(format!("== {} {}", c.exe.display(), args.join(" ")));
+    if let Err(e) = run_step(builder, &c.exe, &args, Some(&c.out_dir), true) {
+        return Err(format!(
+            "{e}\n\nThe prediction succeeded and {} exists, but converting \
+             it to Parquet failed. Convert it by hand with:\n  {} --lib {} \
+             --gen-spec-lib --out-lib {}\nthen point the search at the \
+             resulting tables.",
+            speclib.display(),
+            c.exe.display(),
+            speclib.display(),
+            target.display()
+        ));
+    }
+    match find_lib_parquet(&c.out_dir, stem) {
+        Some(p) => {
+            builder.log(format!("== re-exported: {}", p.display()));
+            Ok(p)
+        }
+        None => Err(format!(
+            "the re-export ran but produced no Parquet in {}. Your DIA-NN \
+             version may not support Parquet library output; 1.8.x does \
+             not. Use DIA-NN 2.x, or export the library as .tsv and \
+             convert it yourself.",
+            c.out_dir.display()
+        )),
+    }
+}
+
+/// The fragment-level Parquet library the importer reads, re-exporting when needed.
+fn library_parquet(
+    builder: &Arc<Builder>,
+    c: &Conversion,
+    source: Source,
+) -> Result<PathBuf, String> {
+    match source {
         // DIA-NN writes a predicted library as its own binary `.speclib`, so a
         // second DIA-NN run is needed to re-export it as the Parquet the importer
         // reads. Parquet is looked for first anyway: a version that writes one
         // directly, or a `--out-lib` that already named one, needs no re-export and
         // paying for one would be minutes wasted on a large library.
-        let predicted = match find_lib_parquet(&out_dir, stem) {
+        Source::Predicted(stem) => match find_lib_parquet(&c.out_dir, stem) {
             Some(p) => {
                 builder.log(format!("== predicted library (Parquet): {}", p.display()));
-                p
+                Ok(p)
             }
             None => {
-                let Some(speclib) = find_predicted_speclib(&out_dir, stem) else {
-                    builder.fail(format!(
+                let Some(speclib) = find_predicted_speclib(&c.out_dir, stem) else {
+                    return Err(format!(
                         "DIA-NN finished but wrote neither a Parquet nor a .speclib \
                          library in {}. Check the log: a licence or prediction failure \
                          can still exit successfully.",
-                        out_dir.display()
+                        c.out_dir.display()
                     ));
-                    return;
                 };
-                if let Ok(mut s) = builder.state.lock() {
-                    s.step = "re-exporting the library as Parquet".into();
-                }
-                builder.log(format!(
-                    "== DIA-NN wrote {}, which MuMDIA cannot read; re-exporting it as \
-                     Parquet",
-                    speclib.display()
+                reexport(builder, c, &speclib, stem)
+            }
+        },
+        Source::Chosen(DiannLibrary::Parquet(p)) => {
+            builder.log(format!("== DIA-NN library (Parquet): {}", p.display()));
+            Ok(p)
+        }
+        // Always re-exported, never a Parquet already in the folder: one left there by
+        // an earlier import may be of another `.speclib`.
+        Source::Chosen(DiannLibrary::Speclib(s)) => reexport(builder, c, &s, IMPORT_REEXPORT_STEM),
+    }
+}
+
+/// `--keep-unimod <id,id,...>`, or nothing for the importer's default set.
+fn keep_unimod_args(ids: Option<&[u32]>) -> Vec<String> {
+    match ids {
+        Some(ids) => vec![
+            "--keep-unimod".into(),
+            ids.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        ],
+        None => vec![],
+    }
+}
+
+/// The two tables a conversion writes into `out_dir`.
+fn final_tables(out_dir: &Path) -> (PathBuf, PathBuf) {
+    (
+        out_dir.join("lib_precursors.parquet"),
+        out_dir.join("lib_fragments.parquet"),
+    )
+}
+
+/// The three Python steps once the DIA-NN library is Parquet, as (caption, arguments).
+///
+/// A function of its own so that the builder's steps can be asserted, and so that the
+/// import runs exactly these and no copy of them.
+fn conversion_steps(c: &Conversion, predicted: &Path) -> Vec<(&'static str, Vec<String>)> {
+    let out_dir = &c.out_dir;
+    let scripts = &c.scripts;
+    let tgt_prec = out_dir.join("lib_precursors_targets.parquet");
+    let tgt_frag = out_dir.join("lib_fragments_targets.parquet");
+    let rev_prec = out_dir.join("lib_precursors_copied_decoys.parquet");
+    let rev_frag = out_dir.join("lib_fragments_copied_decoys.parquet");
+    let (prec, frag) = final_tables(out_dir);
+    let keep = keep_unimod_args(c.keep_unimod.as_deref());
+
+    vec![
+        ("converting to the MuMDIA schema", {
+            let mut a = vec![
+                scripts.join("import_diann_lib.py").display().to_string(),
+                predicted.display().to_string(),
+                tgt_prec.display().to_string(),
+                tgt_frag.display().to_string(),
+            ];
+            a.extend(keep.iter().cloned());
+            a
+        }),
+        (
+            "adding the decoy population",
+            vec![
+                scripts.join("make_reverse_decoys.py").display().to_string(),
+                tgt_prec.display().to_string(),
+                tgt_frag.display().to_string(),
+                rev_prec.display().to_string(),
+                rev_frag.display().to_string(),
+            ],
+        ),
+        // The reversed decoys above carry their targets' intensities, copied ion for
+        // ion; DIA-NN now predicts their spectra instead. Copied decoys made the
+        // reported FDR optimistic: paired entrapment FDP 1.68% at a reported 1% on the
+        // ProteoBench Astral entrapment module, against 0.85% with predicted decoys.
+        ("predicting the decoy spectra with DIA-NN", {
+            let mut a = vec![
+                scripts.join("predict_decoys.py").display().to_string(),
+                "build".into(),
+                rev_prec.display().to_string(),
+                rev_frag.display().to_string(),
+                prec.display().to_string(),
+                frag.display().to_string(),
+                "--diann".into(),
+                c.exe.display().to_string(),
+                "--threads".into(),
+                c.threads.to_string(),
+                "--work".into(),
+                out_dir.join("decoy_prediction").display().to_string(),
+            ];
+            a.extend(keep);
+            a
+        }),
+    ]
+}
+
+/// Everything after DIA-NN's prediction: the re-export when the library is a
+/// `.speclib`, the import, the decoys and their prediction. Returns the two tables.
+fn convert(
+    builder: &Arc<Builder>,
+    c: &Conversion,
+    source: Source,
+) -> Result<(PathBuf, PathBuf), String> {
+    let predicted = library_parquet(builder, c, source)?;
+    for (title, args) in conversion_steps(c, &predicted) {
+        if let Ok(mut s) = builder.state.lock() {
+            s.step = title.into();
+        }
+        builder.log(format!("== {title}"));
+        run_step(builder, &c.python, &args, Some(&c.scripts), false)?;
+    }
+    Ok(final_tables(&c.out_dir))
+}
+
+/// Record the outcome of `convert`: on success `mark` writes the folder's completion
+/// marker first, then the state reports the two tables.
+fn finish(
+    builder: &Arc<Builder>,
+    result: Result<(PathBuf, PathBuf), String>,
+    mark: impl FnOnce(&Path),
+) {
+    match result {
+        Err(e) => builder.fail(e),
+        Ok((prec, frag)) => {
+            if let Some(dir) = prec.parent() {
+                mark(dir);
+            }
+            if let Ok(mut s) = builder.state.lock() {
+                s.status = "done".into();
+                s.step = "finished".into();
+                s.precursors = Some(prec.display().to_string());
+                s.fragments = Some(frag.display().to_string());
+            }
+        }
+    }
+}
+
+// ── importing a DIA-NN library the user already has ────────────────────────
+//
+// A library-mode search needs the two engine tables, and a DIA-NN library is one
+// fragment-level Parquet (or a `.speclib`). The conversion is the builder's from the
+// step after its prediction. No FASTA is needed: the protein identifiers come from the
+// library's own `Protein.Names` / `Protein.Ids` columns, and the decoys are built from
+// the target sequences. There is deliberately no fallback to copied-intensity decoys
+// when DIA-NN is missing: those made the reported FDR optimistic (paired entrapment
+// FDP 1.68% at a reported 1%, against 0.85% with predicted decoys).
+
+/// A DIA-NN library to convert, and where to write the two tables.
+#[derive(Deserialize, Clone, Debug)]
+pub struct ImportRequest {
+    /// The DIA-NN library: a `.parquet` or a `.speclib`.
+    pub library: String,
+    pub out_dir: String,
+    #[serde(default = "d_threads")]
+    pub threads: u32,
+}
+
+/// The columns `import_diann_lib.py` requires of a DIA-NN library (its `_META_COLS` and
+/// `_FRAG_COLS`). Change both together.
+pub const DIANN_LIBRARY_COLUMNS: &[&str] = &[
+    "Modified.Sequence",
+    "Stripped.Sequence",
+    "Precursor.Charge",
+    "Precursor.Mz",
+    "RT",
+    "Product.Mz",
+    "Relative.Intensity",
+    "Fragment.Type",
+    "Fragment.Series.Number",
+    "Fragment.Charge",
+];
+
+/// The footer of a Parquet file, which holds its schema as Thrift bytes.
+fn parquet_footer(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let not_parquet = || {
+        format!(
+            "{} is not a Parquet file (it does not start and end with the Parquet \
+             magic bytes); a DIA-NN library is a .parquet or a .speclib",
+            path.display()
+        )
+    };
+    let io = |e: std::io::Error| format!("cannot read {}: {e}", path.display());
+    let mut f = std::fs::File::open(path).map_err(io)?;
+    let len = f.metadata().map_err(io)?.len();
+    if len < 12 {
+        return Err(not_parquet());
+    }
+    let mut head = [0u8; 4];
+    f.read_exact(&mut head).map_err(io)?;
+    let mut tail = [0u8; 8];
+    f.seek(SeekFrom::End(-8)).map_err(io)?;
+    f.read_exact(&mut tail).map_err(io)?;
+    if &head != b"PAR1" || &tail[4..] != b"PAR1" {
+        return Err(not_parquet());
+    }
+    let footer_len = u64::from(u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]));
+    if footer_len + 12 > len {
+        return Err(format!(
+            "{} is a truncated Parquet file: its footer is longer than the file",
+            path.display()
+        ));
+    }
+    f.seek(SeekFrom::Start(len - 8 - footer_len)).map_err(io)?;
+    let mut footer = vec![0u8; footer_len as usize];
+    f.read_exact(&mut footer).map_err(io)?;
+    Ok(footer)
+}
+
+/// Whether a Parquet footer names a column, read without a Parquet library.
+///
+/// The schema's names are Thrift binary fields, a varint length and then the bytes, so
+/// a name is matched with its length in front of it: `RT` is not found inside `iRT`.
+fn footer_names(footer: &[u8], name: &str) -> bool {
+    let n = name.as_bytes();
+    let mut needle = Vec::with_capacity(n.len() + 2);
+    let mut len = n.len();
+    loop {
+        let b = (len & 0x7f) as u8;
+        len >>= 7;
+        if len == 0 {
+            needle.push(b);
+            break;
+        }
+        needle.push(b | 0x80);
+    }
+    needle.extend_from_slice(n);
+    footer.windows(needle.len()).any(|w| w == needle.as_slice())
+}
+
+/// Check that `path` looks like a DIA-NN spectral library, before anything expensive.
+///
+/// A `.parquet` must carry every column the importer reads. Only its footer is read for
+/// that, so the check is immediate on a library of any size. A `.speclib` is DIA-NN's
+/// own binary format, which only DIA-NN reads; the re-export is its check. A text
+/// library is refused by name.
+pub fn inspect_library(path: &Path) -> Result<DiannLibrary, String> {
+    if !path.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "speclib" => {
+            let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if len == 0 {
+                return Err(format!("{} is empty", path.display()));
+            }
+            Ok(DiannLibrary::Speclib(path.to_path_buf()))
+        }
+        "parquet" => {
+            let footer = parquet_footer(path)?;
+            if footer_names(&footer, "peptidoform") && footer_names(&footer, "candidate_id") {
+                return Err(format!(
+                    "{} is a MuMDIA library table already, not a DIA-NN library: select \
+                     it and its partner directly as the precursor and fragment tables",
+                    path.display()
                 ));
-                let target = out_dir.join(format!("{stem}.parquet"));
-                let reexport = vec![
-                    "--lib".to_string(),
-                    speclib.to_string_lossy().into_owned(),
-                    "--gen-spec-lib".to_string(),
-                    "--out-lib".to_string(),
-                    target.to_string_lossy().into_owned(),
-                    "--threads".to_string(),
-                    req.threads.to_string(),
-                ];
-                builder.log(format!("== {} {}", exe.display(), reexport.join(" ")));
-                if let Err(e) = run_step(&builder, &exe, &reexport, Some(&out_dir), true) {
-                    builder.fail(format!(
-                        "{e}\n\nThe prediction succeeded and {} exists, but converting \
-                         it to Parquet failed. Convert it by hand with:\n  {} --lib {} \
-                         --gen-spec-lib --out-lib {}\nthen point the search at the \
-                         resulting tables.",
-                        speclib.display(),
-                        exe.display(),
-                        speclib.display(),
-                        target.display()
-                    ));
-                    return;
-                }
-                match find_lib_parquet(&out_dir, stem) {
-                    Some(p) => {
-                        builder.log(format!("== re-exported: {}", p.display()));
-                        p
-                    }
-                    None => {
-                        builder.fail(format!(
-                            "the re-export ran but produced no Parquet in {}. Your DIA-NN \
-                             version may not support Parquet library output; 1.8.x does \
-                             not. Use DIA-NN 2.x, or export the library as .tsv and \
-                             convert it yourself.",
-                            out_dir.display()
-                        ));
-                        return;
-                    }
-                }
+            }
+            let missing: Vec<&str> = DIANN_LIBRARY_COLUMNS
+                .iter()
+                .copied()
+                .filter(|c| !footer_names(&footer, c))
+                .collect();
+            if missing.is_empty() {
+                return Ok(DiannLibrary::Parquet(path.to_path_buf()));
+            }
+            let fragment_level = ["Product.Mz", "Relative.Intensity", "Fragment.Type"];
+            let what = if fragment_level.iter().all(|c| missing.contains(c))
+                && footer_names(&footer, "Precursor.Mz")
+            {
+                "it has precursor columns but no fragment columns, which is what a \
+                 DIA-NN search report looks like; a spectral library has one row per \
+                 fragment"
+            } else {
+                "it is not a DIA-NN fragment-level spectral library"
+            };
+            Err(format!(
+                "{}: {what} (missing {}). Choose the library DIA-NN wrote with \
+                 --gen-spec-lib, as a .parquet or a .speclib.",
+                path.display(),
+                missing.join(", ")
+            ))
+        }
+        "tsv" | "csv" | "txt" | "xls" => Err(format!(
+            "{} is a text library, which this import does not read. Choose the DIA-NN \
+             library as a .parquet or a .speclib; DIA-NN 2.x writes a text library as \
+             Parquet with --lib <library.tsv> --gen-spec-lib --out-lib <name>.parquet.",
+            path.display()
+        )),
+        _ => Err(format!(
+            "{} is neither a .parquet nor a .speclib DIA-NN library",
+            path.display()
+        )),
+    }
+}
+
+/// Why an import cannot run with this DIA-NN, or else the DIA-NN it runs.
+///
+/// Refused rather than degraded: without DIA-NN the decoys could only copy their
+/// targets' fragment intensities, and those make the reported FDR optimistic.
+pub fn import_refusal(status: &Status, library: &DiannLibrary) -> Result<PathBuf, String> {
+    const WHY: &str = "Importing a DIA-NN library needs a working DIA-NN, because MuMDIA \
+         has DIA-NN predict the spectra of the decoys it adds: decoys that copy their \
+         targets' fragment intensities make the reported FDR optimistic, so the import \
+         does not fall back to them.";
+    let exe = match (&status.path, status.runs) {
+        (Some(p), true) => PathBuf::from(p),
+        _ => {
+            let detail = status
+                .error
+                .as_deref()
+                .filter(|e| !e.is_empty() && *e != "no working DIA-NN was found")
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default();
+            return Err(format!(
+                "{WHY} No working DIA-NN was found{detail}. Install DIA-NN 2.x, locate it \
+                 on the Setup screen and acknowledge its licence there."
+            ));
+        }
+    };
+    if !status.licence_acknowledged {
+        return Err(format!(
+            "{WHY} The DIA-NN licence notice has not been acknowledged: acknowledge it on \
+             the Setup screen."
+        ));
+    }
+    if !status.writes_parquet {
+        let version = status.version.as_deref().unwrap_or("this DIA-NN");
+        let what = match library {
+            DiannLibrary::Speclib(_) => {
+                "re-export this .speclib as the Parquet MuMDIA reads nor write its \
+                 prediction of the decoys' spectra"
+            }
+            DiannLibrary::Parquet(_) => {
+                "write its prediction of the decoys' spectra in a form MuMDIA reads, nor \
+                 re-export one"
             }
         };
+        return Err(format!(
+            "{version} cannot write a Parquet spectral library (1.8.x has no Parquet \
+             library output), so it can neither {what}. Install DIA-NN 2.x and locate it \
+             on the Setup screen."
+        ));
+    }
+    Ok(exe)
+}
 
-        let tgt_prec = out_dir.join("lib_precursors_targets.parquet");
-        let tgt_frag = out_dir.join("lib_fragments_targets.parquet");
-        let rev_prec = out_dir.join("lib_precursors_copied_decoys.parquet");
-        let rev_frag = out_dir.join("lib_fragments_copied_decoys.parquet");
-        let prec = out_dir.join("lib_precursors.parquet");
-        let frag = out_dir.join("lib_fragments.parquet");
+/// Refuse an output folder that already holds a converted library, so that two
+/// libraries cannot be mixed in one pair of tables.
+fn check_import_out_dir(out_dir: &Path) -> Result<(), String> {
+    let (p, f) = final_tables(out_dir);
+    let taken: Vec<String> = [p, f]
+        .iter()
+        .filter(|t| t.exists())
+        .map(|t| {
+            t.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    if taken.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} already holds {}; choose an empty folder for the converted library",
+            out_dir.display(),
+            taken.join(" and ")
+        ))
+    }
+}
 
-        let steps: Vec<(&str, Vec<String>)> = vec![
-            ("converting to the MuMDIA schema", {
-                let mut a = vec![
-                    scripts.join("import_diann_lib.py").display().to_string(),
-                    predicted.display().to_string(),
-                    tgt_prec.display().to_string(),
-                    tgt_frag.display().to_string(),
-                ];
-                // The importer keeps the standard accessions by default; any other
-                // selection names what DIA-NN was asked to place, or the precursors
-                // carrying it would be dropped as unmapped.
-                if !plan.is_legacy() {
-                    a.push("--keep-unimod".into());
-                    a.push(
-                        plan.unimod_ids()
-                            .iter()
-                            .map(|i| i.to_string())
-                            .collect::<Vec<_>>()
-                            .join(","),
-                    );
-                }
-                a
-            }),
-            (
-                "adding the decoy population",
-                vec![
-                    scripts.join("make_reverse_decoys.py").display().to_string(),
-                    tgt_prec.display().to_string(),
-                    tgt_frag.display().to_string(),
-                    rev_prec.display().to_string(),
-                    rev_frag.display().to_string(),
-                ],
-            ),
-            // The reversed decoys above carry their targets' intensities, copied ion for
-            // ion; DIA-NN now predicts their spectra instead. Copied decoys made the
-            // reported FDR optimistic: paired entrapment FDP 1.68% at a reported 1% on the
-            // ProteoBench Astral entrapment module, against 0.85% with predicted decoys.
-            ("predicting the decoy spectra with DIA-NN", {
-                let mut a = vec![
-                    scripts.join("predict_decoys.py").display().to_string(),
-                    "build".into(),
-                    rev_prec.display().to_string(),
-                    rev_frag.display().to_string(),
-                    prec.display().to_string(),
-                    frag.display().to_string(),
-                    "--diann".into(),
-                    exe.display().to_string(),
-                    "--threads".into(),
-                    req.threads.to_string(),
-                    "--work".into(),
-                    out_dir.join("decoy_prediction").display().to_string(),
-                ];
-                if !plan.is_legacy() {
-                    a.push("--keep-unimod".into());
-                    a.push(
-                        plan.unimod_ids()
-                            .iter()
-                            .map(|i| i.to_string())
-                            .collect::<Vec<_>>()
-                            .join(","),
-                    );
-                }
-                a
-            }),
-        ];
+/// Every UniMod accession of the modification catalogue, for `--keep-unimod`.
+///
+/// The builder keeps what it asked DIA-NN to place; an imported library's author chose
+/// its modifications, so the import keeps every one the engine can name and drops (in the
+/// importer's count) only precursors that carry a modification outside the catalogue.
+fn catalogue_unimod_ids() -> Vec<u32> {
+    let mut ids: Vec<u32> = crate::mods::catalogue().iter().map(|m| m.unimod).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
 
-        for (title, args) in steps {
-            if let Ok(mut s) = builder.state.lock() {
-                s.step = title.into();
-            }
-            builder.log(format!("== {title}"));
-            if let Err(e) = run_step(&builder, &python, &args, Some(&scripts), false) {
-                builder.fail(e);
-                return;
-            }
-        }
+/// The completion marker of an imported library, with where it came from.
+fn mark_import_complete(dir: &Path, library: &str, version: &str, kept: &[u32]) {
+    let body = serde_json::json!({
+        "source": "diann-import",
+        "diann_library": library,
+        "diann_version": version,
+        "recipe_version": RECIPE_VERSION,
+        "keep_unimod": kept,
+    });
+    if let Ok(text) = serde_json::to_string_pretty(&body) {
+        let _ = std::fs::write(dir.join(CACHE_MARKER), text);
+    }
+}
 
-        // The marker last, after both tables are on disk. Anything that dies before
-        // this leaves a directory `cached_library` will not accept, which is the
-        // point: a half-written library must not read as a finished one.
-        mark_cache_complete(&out_dir, &req, version_for_cache.as_deref().unwrap_or(""));
+/// Convert a DIA-NN library the user already has into the two tables a search reads.
+///
+/// The builder's steps after its prediction (`convert`): a `.speclib` is re-exported as
+/// Parquet with the user's DIA-NN, `import_diann_lib.py` maps it, `make_reverse_decoys.py`
+/// adds the decoys and `predict_decoys.py` has DIA-NN predict their spectra. Progress is
+/// the builder's state, so the interface follows it exactly as it follows a build.
+pub fn import(builder: Arc<Builder>, req: ImportRequest) -> Result<(), String> {
+    // The file first: the check is immediate and says what is wrong with the choice.
+    let library = inspect_library(Path::new(&req.library))?;
+    let status = detect();
+    let exe = import_refusal(&status, &library)?;
+    let (python, scripts) = conversion_tools()?;
+    if req.out_dir.trim().is_empty() {
+        return Err("choose a folder for the converted library".into());
+    }
+    let out_dir = PathBuf::from(&req.out_dir);
+    check_import_out_dir(&out_dir)?;
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
 
-        if let Ok(mut s) = builder.state.lock() {
-            s.status = "done".into();
-            s.step = "finished".into();
-            s.precursors = Some(prec.display().to_string());
-            s.fragments = Some(frag.display().to_string());
-        }
+    begin(&builder, "converting the DIA-NN library")?;
+
+    std::thread::spawn(move || {
+        let version = status.version.clone().unwrap_or_default();
+        builder.log(format!("== DIA-NN: {version}"));
+        builder.log(format!("== importing {}", req.library));
+        let kept = catalogue_unimod_ids();
+        let conversion = Conversion {
+            exe,
+            python,
+            scripts,
+            out_dir,
+            threads: req.threads,
+            keep_unimod: Some(kept.clone()),
+        };
+        let result = convert(&builder, &conversion, Source::Chosen(library));
+        finish(&builder, result, |dir| {
+            mark_import_complete(dir, &req.library, &version, &kept)
+        });
     });
 
     Ok(())
@@ -2806,5 +3240,432 @@ PEPTIDEK
             "lib.predicted.parquet"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── the shared conversion and the import ────────────────────────────────
+
+    fn a_conversion(keep_unimod: Option<Vec<u32>>) -> Conversion {
+        Conversion {
+            exe: PathBuf::from("/opt/diann/diann-linux"),
+            python: PathBuf::from("/py/bin/python"),
+            scripts: PathBuf::from("/app/scripts"),
+            out_dir: PathBuf::from("/cache/lib0"),
+            threads: 6,
+            keep_unimod,
+        }
+    }
+
+    /// The builder's three conversion steps as they were spelled inline in `build`
+    /// before the conversion was shared with the import, argument for argument.
+    fn builder_steps_before_the_refactor(
+        c: &Conversion,
+        predicted: &Path,
+        plan: &ModPlan,
+    ) -> Vec<(&'static str, Vec<String>)> {
+        let (out_dir, scripts) = (&c.out_dir, &c.scripts);
+        let tgt_prec = out_dir.join("lib_precursors_targets.parquet");
+        let tgt_frag = out_dir.join("lib_fragments_targets.parquet");
+        let rev_prec = out_dir.join("lib_precursors_copied_decoys.parquet");
+        let rev_frag = out_dir.join("lib_fragments_copied_decoys.parquet");
+        let prec = out_dir.join("lib_precursors.parquet");
+        let frag = out_dir.join("lib_fragments.parquet");
+        let ids = || {
+            plan.unimod_ids()
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut import = vec![
+            scripts.join("import_diann_lib.py").display().to_string(),
+            predicted.display().to_string(),
+            tgt_prec.display().to_string(),
+            tgt_frag.display().to_string(),
+        ];
+        if !plan.is_legacy() {
+            import.push("--keep-unimod".into());
+            import.push(ids());
+        }
+        let mut decoys = vec![
+            scripts.join("predict_decoys.py").display().to_string(),
+            "build".into(),
+            rev_prec.display().to_string(),
+            rev_frag.display().to_string(),
+            prec.display().to_string(),
+            frag.display().to_string(),
+            "--diann".into(),
+            c.exe.display().to_string(),
+            "--threads".into(),
+            c.threads.to_string(),
+            "--work".into(),
+            out_dir.join("decoy_prediction").display().to_string(),
+        ];
+        if !plan.is_legacy() {
+            decoys.push("--keep-unimod".into());
+            decoys.push(ids());
+        }
+        vec![
+            ("converting to the MuMDIA schema", import),
+            (
+                "adding the decoy population",
+                vec![
+                    scripts.join("make_reverse_decoys.py").display().to_string(),
+                    tgt_prec.display().to_string(),
+                    tgt_frag.display().to_string(),
+                    rev_prec.display().to_string(),
+                    rev_frag.display().to_string(),
+                ],
+            ),
+            ("predicting the decoy spectra with DIA-NN", decoys),
+        ]
+    }
+
+    #[test]
+    fn the_builder_runs_the_same_conversion_steps_as_before_they_were_shared() {
+        let predicted = Path::new("/cache/lib0/lib.parquet");
+        // The standard selection: the importer's default set, no --keep-unimod.
+        let legacy = ModPlan::of(&a_request("x.fasta")).unwrap();
+        let c = a_conversion(build_keep_unimod(&legacy));
+        assert!(c.keep_unimod.is_none());
+        assert_eq!(
+            conversion_steps(&c, predicted),
+            builder_steps_before_the_refactor(&c, predicted, &legacy)
+        );
+        // A wider selection: its accessions reach the importer and the decoy prediction,
+        // and not the reversal, exactly as before.
+        let mut req = a_request("x.fasta");
+        req.variable_mods = vec![site("Oxidation", 'M'), site("Phospho", 'S')];
+        req.fixed_mods = vec![site("Carbamidomethyl", 'C')];
+        let wide = ModPlan::of(&req).unwrap();
+        let c = a_conversion(build_keep_unimod(&wide));
+        let steps = conversion_steps(&c, predicted);
+        assert_eq!(
+            steps,
+            builder_steps_before_the_refactor(&c, predicted, &wide)
+        );
+        assert_eq!(
+            steps[0].1[steps[0].1.len() - 2..],
+            ["--keep-unimod", "4,21,35"]
+        );
+        assert!(!steps[1].1.iter().any(|a| a == "--keep-unimod"));
+        assert_eq!(
+            steps[2].1[steps[2].1.len() - 2..],
+            ["--keep-unimod", "4,21,35"]
+        );
+        // The final tables are the ones `cached_library` and the search screen expect.
+        assert_eq!(
+            final_tables(&c.out_dir),
+            (
+                c.out_dir.join("lib_precursors.parquet"),
+                c.out_dir.join("lib_fragments.parquet")
+            )
+        );
+    }
+
+    #[test]
+    fn the_re_export_is_the_command_line_the_builder_always_ran() {
+        let args = reexport_args(
+            Path::new("/cache/lib0/lib.predicted.speclib"),
+            Path::new("/cache/lib0/lib.parquet"),
+            6,
+        );
+        assert_eq!(
+            args,
+            [
+                "--lib",
+                "/cache/lib0/lib.predicted.speclib",
+                "--gen-spec-lib",
+                "--out-lib",
+                "/cache/lib0/lib.parquet",
+                "--threads",
+                "6"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_import_keeps_every_modification_the_catalogue_names() {
+        let ids = catalogue_unimod_ids();
+        // The importer's default set and the usual variable modifications are all in it.
+        for id in [1, 4, 21, 35, 44, 48, 376] {
+            assert!(ids.contains(&id), "UniMod:{id} is kept");
+        }
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "sorted and unique");
+        let c = a_conversion(Some(ids.clone()));
+        let steps = conversion_steps(&c, Path::new("/in/lib.parquet"));
+        let joined = ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(steps[0].1.last(), Some(&joined));
+        assert_eq!(steps[2].1.last(), Some(&joined));
+        // The import reads the chosen library where it is; it is not copied.
+        assert_eq!(
+            steps[0].1[1],
+            Path::new("/in/lib.parquet").display().to_string()
+        );
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("mumdia-diann-import-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A file with Parquet's framing and a footer naming `columns` the way Thrift's
+    /// compact protocol does (field header, varint length, bytes). Enough for the
+    /// footer check, which reads nothing else.
+    fn fake_parquet(path: &Path, columns: &[&str]) {
+        let mut footer = vec![0x15, 0x02, 0x19, 0x6c];
+        for c in columns {
+            footer.push(0x48);
+            footer.push(c.len() as u8);
+            footer.extend_from_slice(c.as_bytes());
+        }
+        let mut bytes = b"PAR1".to_vec();
+        bytes.extend_from_slice(&[0u8; 64]);
+        bytes.extend_from_slice(&footer);
+        bytes.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(b"PAR1");
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_diann_parquet_library_is_recognised_from_its_footer() {
+        let dir = scratch_dir("ok");
+        let lib = dir.join("report-lib.parquet");
+        let mut cols = DIANN_LIBRARY_COLUMNS.to_vec();
+        cols.extend(["Protein.Ids", "Decoy", "IM"]);
+        fake_parquet(&lib, &cols);
+        assert_eq!(
+            inspect_library(&lib).unwrap(),
+            DiannLibrary::Parquet(lib.clone())
+        );
+        // The extension is matched without regard to case.
+        let upper = dir.join("LIB.PARQUET");
+        fake_parquet(&upper, &cols);
+        assert!(matches!(
+            inspect_library(&upper),
+            Ok(DiannLibrary::Parquet(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_column_name_is_matched_whole_not_inside_another() {
+        let mut footer = vec![0x48, 3];
+        footer.extend_from_slice(b"iRT");
+        assert!(!footer_names(&footer, "RT"));
+        assert!(footer_names(&footer, "iRT"));
+        // A name longer than 127 bytes takes a two-byte varint length.
+        let long = "x".repeat(200);
+        let mut footer = vec![0x48, 0xc8, 0x01];
+        footer.extend_from_slice(long.as_bytes());
+        assert!(footer_names(&footer, &long));
+    }
+
+    #[test]
+    fn what_is_not_a_diann_library_is_refused_before_anything_runs() {
+        let dir = scratch_dir("refused");
+
+        let e = inspect_library(&dir.join("absent.parquet")).unwrap_err();
+        assert!(e.contains("is not a file"), "{e}");
+
+        // A search report: precursor columns, no fragment columns.
+        let report = dir.join("report.parquet");
+        fake_parquet(
+            &report,
+            &[
+                "Modified.Sequence",
+                "Stripped.Sequence",
+                "Precursor.Charge",
+                "Precursor.Mz",
+                "RT",
+            ],
+        );
+        let e = inspect_library(&report).unwrap_err();
+        assert!(e.contains("search report"), "{e}");
+        assert!(e.contains("Product.Mz"), "names what is missing: {e}");
+
+        // MuMDIA's own table is sent where it belongs.
+        let ours = dir.join("lib_precursors.parquet");
+        fake_parquet(
+            &ours,
+            &["candidate_id", "peptidoform", "precursor_mz", "label"],
+        );
+        let e = inspect_library(&ours).unwrap_err();
+        assert!(e.contains("MuMDIA library table"), "{e}");
+
+        // Something else entirely.
+        let other = dir.join("other.parquet");
+        fake_parquet(&other, &["a", "b"]);
+        let e = inspect_library(&other).unwrap_err();
+        assert!(
+            e.contains("not a DIA-NN fragment-level spectral library"),
+            "{e}"
+        );
+
+        // Not Parquet at all, and a Parquet cut short.
+        let text = dir.join("renamed.parquet");
+        std::fs::write(&text, "Modified.Sequence\tPrecursor.Mz\n").unwrap();
+        assert!(inspect_library(&text)
+            .unwrap_err()
+            .contains("not a Parquet file"));
+        let cut = dir.join("cut.parquet");
+        let mut bytes = b"PAR1".to_vec();
+        bytes.extend_from_slice(&1000u32.to_le_bytes());
+        bytes.extend_from_slice(b"PAR1");
+        std::fs::write(&cut, bytes).unwrap();
+        assert!(inspect_library(&cut).unwrap_err().contains("truncated"));
+
+        // A text library is refused by name, with the way to make it Parquet.
+        let tsv = dir.join("lib.tsv");
+        std::fs::write(&tsv, "PrecursorMz\tProductMz\n").unwrap();
+        let e = inspect_library(&tsv).unwrap_err();
+        assert!(
+            e.contains("text library") && e.contains("--gen-spec-lib"),
+            "{e}"
+        );
+
+        // A .speclib is DIA-NN's to check, but an empty one is not a library.
+        let empty = dir.join("lib.predicted.speclib");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(inspect_library(&empty).unwrap_err().contains("empty"));
+        std::fs::write(&empty, b"\x01\x02\x03").unwrap();
+        assert_eq!(
+            inspect_library(&empty).unwrap(),
+            DiannLibrary::Speclib(empty.clone())
+        );
+
+        let e = inspect_library(&tsv.with_extension("msp")).unwrap_err();
+        assert!(e.contains("is not a file"), "{e}");
+        let msp = dir.join("lib.msp");
+        std::fs::write(&msp, b"x").unwrap();
+        assert!(inspect_library(&msp).unwrap_err().contains("neither"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn a_status(runs: bool, ack: bool, version: &str) -> Status {
+        Status {
+            path: runs.then(|| "/opt/diann/diann-linux".to_string()),
+            source: runs.then(|| "path".to_string()),
+            version: (!version.is_empty()).then(|| version.to_string()),
+            runs,
+            licence_acknowledged: ack,
+            licence_assumed: false,
+            writes_parquet: version.is_empty() || writes_parquet_libraries(version),
+            error: (!runs).then(|| "no working DIA-NN was found".to_string()),
+        }
+    }
+
+    #[test]
+    fn an_import_without_a_working_diann_is_refused_and_says_why() {
+        let parquet = DiannLibrary::Parquet(PathBuf::from("lib.parquet"));
+        let speclib = DiannLibrary::Speclib(PathBuf::from("lib.speclib"));
+
+        // No DIA-NN: refused, never converted with copied decoys.
+        for lib in [&parquet, &speclib] {
+            let e = import_refusal(&a_status(false, false, ""), lib).unwrap_err();
+            assert!(e.contains("predict the spectra of the decoys"), "{e}");
+            assert!(e.contains("FDR optimistic"), "{e}");
+            assert!(e.contains("Install DIA-NN 2.x"), "{e}");
+            assert!(e.contains("licence"), "{e}");
+            assert!(
+                !e.contains("(no working DIA-NN was found)"),
+                "no repetition: {e}"
+            );
+        }
+        // A configured DIA-NN that stopped working says what went wrong.
+        let mut broken = a_status(false, true, "");
+        broken.error = Some("/opt/diann is no longer there".into());
+        let e = import_refusal(&broken, &parquet).unwrap_err();
+        assert!(e.contains("(/opt/diann is no longer there)"), "{e}");
+
+        // Licence not acknowledged.
+        let e = import_refusal(&a_status(true, false, "DIA-NN 2.7.0"), &parquet).unwrap_err();
+        assert!(
+            e.contains("licence notice has not been acknowledged"),
+            "{e}"
+        );
+        assert!(e.contains("Setup"), "{e}");
+
+        // 1.8.x writes no Parquet: a .speclib cannot even be re-exported, and the decoy
+        // prediction would fail for either input.
+        let old = a_status(
+            true,
+            true,
+            "DIA-NN 1.8.1 (Data-Independent Acquisition by Neural Networks)",
+        );
+        assert!(!old.writes_parquet);
+        let e = import_refusal(&old, &speclib).unwrap_err();
+        assert!(
+            e.contains("DIA-NN 1.8.1") && e.contains("re-export this .speclib"),
+            "{e}"
+        );
+        assert!(e.contains("Install DIA-NN 2.x"), "{e}");
+        let e = import_refusal(&old, &parquet).unwrap_err();
+        assert!(e.contains("decoys' spectra"), "{e}");
+
+        // A working, acknowledged 2.x is what runs.
+        assert_eq!(
+            import_refusal(&a_status(true, true, "DIA-NN 2.7.0 Academia"), &speclib).unwrap(),
+            PathBuf::from("/opt/diann/diann-linux")
+        );
+    }
+
+    #[test]
+    fn an_import_never_writes_into_a_folder_that_holds_a_library() {
+        let dir = scratch_dir("outdir");
+        check_import_out_dir(&dir).unwrap();
+        check_import_out_dir(&dir.join("not-yet-created")).unwrap();
+        std::fs::write(dir.join("lib_fragments.parquet"), b"x").unwrap();
+        let e = check_import_out_dir(&dir).unwrap_err();
+        assert!(
+            e.contains("lib_fragments.parquet") && e.contains("empty folder"),
+            "{e}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_import_is_refused_for_the_file_before_diann_is_asked() {
+        // The file is checked first, so the refusal names the file whatever DIA-NN state
+        // the machine running the tests is in.
+        let dir = scratch_dir("order");
+        let tsv = dir.join("lib.tsv");
+        std::fs::write(&tsv, "x").unwrap();
+        let e = import(
+            Arc::new(Builder::default()),
+            ImportRequest {
+                library: tsv.display().to_string(),
+                out_dir: dir.join("out").display().to_string(),
+                threads: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("text library"), "{e}");
+        assert!(
+            !dir.join("out").exists(),
+            "nothing is created for a refused import"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The footer check on a real DIA-NN library: `MUMDIA_TEST_DIANN_LIB=<lib.parquet>
+    /// cargo test --lib -- --ignored real_diann_library`.
+    #[test]
+    #[ignore]
+    fn a_real_diann_library_passes_the_footer_check() {
+        let Ok(p) = std::env::var("MUMDIA_TEST_DIANN_LIB") else {
+            return;
+        };
+        let p = PathBuf::from(p);
+        assert_eq!(
+            inspect_library(&p).unwrap(),
+            DiannLibrary::Parquet(p.clone())
+        );
     }
 }

@@ -45,6 +45,8 @@ const state = {
     // `runMode`; a single file is an ordinary search either way.
     mzml: [], fasta: "", lib_precursors: "", lib_fragments: "", out_dir: "",
     lib_fasta: "", lib_out: "",
+    // A DIA-NN library to convert into the two tables, and the folder they go in.
+    diann_lib: "", diann_lib_out: "",
   },
   diannTimer: null,
   diannGetTimer: null,
@@ -55,6 +57,9 @@ const state = {
   // back to "builtin" while DIA-NN is unavailable, unless the user chose one.
   libSrc: "diann",
   libSrcChosen: false,
+  // On the spectral-library tab: two MuMDIA tables ("tables"), or a DIA-NN library to
+  // convert into them first ("diann").
+  libIn: "tables",
   buildingLibrary: false,
   // Whether the in-depth settings were opened, so a re-render keeps them open.
   advancedOpen: false,
@@ -233,6 +238,10 @@ async function init() {
       if (r.value === "diann") refreshLibSrcNote();
     });
   }
+  for (const r of document.querySelectorAll('input[name="libin"]')) {
+    r.addEventListener("change", () => selectLibIn(r.value));
+  }
+  $("diann-import").addEventListener("click", importDiannLibrary);
   // The built-in path's predictors depend on the preset as well as on the files.
   $("preset").addEventListener("change", scheduleBuiltinPlan);
   for (const b of document.querySelectorAll("[data-pick]")) {
@@ -1364,6 +1373,8 @@ const FILTERS = {
   lib_precursors: [{ name: "Parquet", extensions: ["parquet"] }],
   lib_fragments: [{ name: "Parquet", extensions: ["parquet"] }],
   lib_fasta: [{ name: "FASTA", extensions: ["fasta", "fa", "fas"] }],
+  // Parquet (DIA-NN 1.9 and 2.x) or DIA-NN's binary .speclib; a .tsv is not accepted.
+  diann_lib: [{ name: "DIA-NN library", extensions: ["parquet", "speclib"] }],
 };
 const LABEL = {
   mzml: "p-mzml",
@@ -1374,11 +1385,13 @@ const LABEL = {
   mzml_dir: "p-mzml",
   lib_fasta: "p-lib-fasta",
   lib_out: "p-lib-out",
+  diann_lib: "p-diann-lib",
+  diann_lib_out: "p-diann-lib-out",
 };
 // Pickers that choose a folder rather than a file.
 // `mzml_dir` is here because Bruker/Agilent `.d` and Waters `.raw` are
 // directories, and a file dialog cannot select one.
-const DIR_PICKS = new Set(["out_dir", "lib_out", "mzml_dir"]);
+const DIR_PICKS = new Set(["out_dir", "lib_out", "mzml_dir", "diann_lib_out"]);
 
 // Render the selected spectra, with the vendor note each one needs.
 //
@@ -1526,6 +1539,7 @@ async function pick(what) {
   state.picks[what] = path;
   if (what === "fasta") refreshLibSrcNote();
   if (what === "fasta" || what === "lib_precursors") scheduleSpace();
+  if (what === "diann_lib" || what === "diann_lib_out") banner($("diann-import-error"), "");
   const el = $(LABEL[what]);
   // Shown right-to-left so the filename stays visible on a long path; the full
   // path is the tooltip.
@@ -2363,6 +2377,26 @@ async function ensureLibrary(fasta) {
   req.out_dir = plan.cache_dir;
   // The progress screen's own log and subtitle, not the Setup screen's DIA-NN panes:
   // those live inside #screen-setup and would not be visible from here.
+  enterLibraryPhase("Predicting the library", "DIA-NN is predicting the spectral library");
+  try {
+    await invoke("diann_build", { req });
+  } catch (e) {
+    banner($("start-error"), String(e));
+    leaveLibraryPhase();
+    screen("input");
+    return null;
+  }
+  const built = await followLibraryBuild($("start-error"));
+  if (built) {
+    // Hand the screen back to the search, which is about to start on it.
+    $("prog-sub").textContent = "Starting";
+    $("log").textContent = "";
+  }
+  return built;
+}
+
+// Show the progress screen for a library build or import.
+function enterLibraryPhase(title, sub) {
   screen("progress");
   state.buildingLibrary = true;
   // Reachable from the menu for the whole build: it used to be enabled only once the
@@ -2373,19 +2407,15 @@ async function ensureLibrary(fasta) {
   $("stop").textContent = "Stop";
   banner($("run-error"), "");
   $("stages").innerHTML = "";
-  $("prog-title").textContent = "Predicting the library";
-  $("prog-sub").textContent = "DIA-NN is predicting the spectral library";
+  $("prog-title").textContent = title;
+  $("prog-sub").textContent = sub;
   $("log").textContent = "";
   $("cmd").textContent = "";
-  try {
-    await invoke("diann_build", { req });
-  } catch (e) {
-    banner($("start-error"), String(e));
-    leaveLibraryPhase();
-    screen("input");
-    return null;
-  }
+}
 
+// Follow a library build, or a DIA-NN library import (which shares its state), to the
+// end: its two tables, or null after showing its error in `errorEl` on the input screen.
+async function followLibraryBuild(errorEl) {
   // Poll to completion, mirroring the build log onto the progress screen.
   for (;;) {
     await new Promise((r) => setTimeout(r, 1000));
@@ -2407,19 +2437,93 @@ async function ensureLibrary(fasta) {
     if ($("cmd").textContent !== cmds) $("cmd").textContent = cmds;
     $("prog-sub").textContent = b.step || "working";
     if (b.status === "failed") {
-      banner($("start-error"), b.error || "The library build failed.");
+      banner(errorEl, b.error || "The library build failed.");
       leaveLibraryPhase();
       screen("input");
       return null;
     }
     if (b.status === "done" && b.precursors) {
-      // Hand the screen back to the search, which is about to start on it.
       leaveLibraryPhase();
-      $("prog-sub").textContent = "Starting";
-      $("log").textContent = "";
       return [b.precursors, b.fragments];
     }
   }
+}
+
+// -- a DIA-NN library as the search's library ------------------------------
+// A DIA-NN library (.parquet or .speclib) is converted into the two tables by the
+// builder's own steps after its prediction (`diann::import`): re-export, import,
+// reversed decoys, DIA-NN's prediction of the decoys. On success the two tables are
+// selected under "MuMDIA library tables", ready for the search.
+function selectLibIn(which) {
+  state.libIn = which;
+  const r = $(which === "diann" ? "libin-diann" : "libin-tables");
+  if (r) r.checked = true;
+  show($("libin-tables-pane"), which === "tables");
+  show($("libin-diann-pane"), which === "diann");
+  if (which === "diann") refreshImportNote();
+}
+
+// Say, before Convert is pressed, whether the DIA-NN the conversion needs is there.
+async function refreshImportNote() {
+  const note = $("diann-import-note");
+  let d;
+  try {
+    d = (await invoke("diann_status")).status;
+  } catch (e) {
+    note.textContent = String(e);
+    return;
+  }
+  if (!d.runs) {
+    note.textContent =
+      "No working DIA-NN was found: install DIA-NN 2.x and locate it on the Setup screen.";
+  } else if (!d.licence_acknowledged) {
+    note.textContent = "Acknowledge the DIA-NN licence on the Setup screen first.";
+  } else if (!d.writes_parquet) {
+    note.textContent = `${d.version || "This DIA-NN"} cannot write Parquet; DIA-NN 2.x is needed.`;
+  } else {
+    note.textContent = `Uses ${d.version || "DIA-NN"}.`;
+  }
+}
+
+async function importDiannLibrary() {
+  const err = $("diann-import-error");
+  banner(err, "");
+  if (state.buildingLibrary) {
+    banner(err, "A library build is already running.");
+    return;
+  }
+  const library = state.picks.diann_lib;
+  const outDir = state.picks.diann_lib_out;
+  if (!library) return banner(err, "Choose the DIA-NN library (.parquet or .speclib).");
+  if (!outDir) return banner(err, "Choose an empty folder for the converted library.");
+  const threads = parseInt($("d-threads").value, 10);
+  const req = { library, out_dir: outDir };
+  if (Number.isFinite(threads) && threads > 0) req.threads = threads;
+  try {
+    // Refuses at once, with the reason, for a file that is not a DIA-NN library and
+    // without a DIA-NN 2.x whose licence is acknowledged.
+    await invoke("diann_import", { req });
+  } catch (e) {
+    banner(err, String(e));
+    return;
+  }
+  enterLibraryPhase("Converting the library", "Converting the DIA-NN library");
+  const built = await followLibraryBuild(err);
+  screen("input");
+  if (!built) return;
+  for (const [what, path] of [
+    ["lib_precursors", built[0]],
+    ["lib_fragments", built[1]],
+  ]) {
+    state.picks[what] = path;
+    const el = $(LABEL[what]);
+    el.textContent = path;
+    el.title = path;
+    el.classList.add("set");
+  }
+  selectLibIn("tables");
+  scheduleSpace();
+  banner($("start-error"), "");
 }
 
 // One search per file, in sequence.
@@ -2892,6 +2996,14 @@ async function startSearch() {
 
   if (p.mzml.length === 0) {
     banner($("start-error"), "Add at least one spectra file.");
+    return;
+  }
+  // A DIA-NN library is searched through the two tables its conversion writes.
+  if (state.mode === "library" && state.libIn === "diann" && !p.lib_precursors) {
+    banner(
+      $("start-error"),
+      "Convert the DIA-NN library first: the search reads the two tables it writes."
+    );
     return;
   }
 
