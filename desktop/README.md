@@ -532,6 +532,63 @@ automatically, because the alternative is retyping two long paths.
 MuMDIA reads only the library. Invoking DIA-NN is not reading its source, so the
 clean-room boundary is unchanged.
 
+Everything after the prediction (the re-export of a `.speclib`, the import, the decoys and
+their prediction, then the completion marker) is one function, `diann::convert`, and its
+three Python steps are `diann::conversion_steps`. The import of an existing DIA-NN library
+below runs the same function, so the two cannot drift apart; a unit test holds the
+builder's step list to the arguments it ran before the conversion was shared.
+
+### Importing a DIA-NN library
+
+The spectral-library tab takes either the two MuMDIA tables or a **DIA-NN library**: a
+fragment-level Parquet library (DIA-NN 1.9 and 2.x) or DIA-NN's binary `.speclib`. Choose
+the file and an empty output folder and press "Convert the library"; the Progress screen
+shows the steps and their commands as for a library build, Stop cancels it, and on success
+the two tables are filled in under "MuMDIA library tables", ready for the search.
+
+What runs (`diann::import`, the `diann_import` command):
+
+1. **The file is checked first** (`inspect_library`), before DIA-NN or Python is asked
+   for anything. A `.parquet` must carry every column `import_diann_lib.py` reads
+   (`DIANN_LIBRARY_COLUMNS`: modified and stripped sequence, precursor charge and m/z,
+   RT, product m/z, relative intensity, fragment type, series number and charge). Only
+   the Parquet footer is read, so the check is immediate on a library of any size. The
+   refusals say what the file is instead: a DIA-NN search report (precursor columns, no
+   fragment columns), a MuMDIA table already (select it directly), not Parquet at all, or
+   truncated. A `.tsv` library is refused by name with the DIA-NN command that writes it
+   as Parquet. A `.speclib` is only checked for being non-empty; DIA-NN is its check.
+2. **DIA-NN is required, and its absence is a refusal** (`import_refusal`), not a
+   fallback. Decoys built without it could only copy their targets' fragment intensities,
+   which made the reported FDR optimistic (a paired entrapment FDP of 1.68% at a reported
+   1%, against 0.85% with predicted decoys), so there is no copied-decoy path. The message
+   says why and how to fix it: install DIA-NN 2.x, locate it on the Setup screen and
+   acknowledge its licence there. A DIA-NN that cannot write Parquet (1.8.x) is refused
+   for both inputs: it cannot re-export a `.speclib`, and the decoy prediction re-exports
+   DIA-NN's own prediction too.
+3. A folder that already holds `lib_precursors.parquet` or `lib_fragments.parquet` is
+   refused, so two libraries cannot be mixed in one pair of tables.
+4. `convert` runs: a `.speclib` is re-exported as `diann_library.parquet` in the output
+   folder (always, never a Parquet left there earlier, which may be of another library);
+   a `.parquet` is read where it is. Then `import_diann_lib.py`, `make_reverse_decoys.py`
+   and `predict_decoys.py`, and `mumdia-library-complete.json` records the source
+   library, the DIA-NN version and the kept accessions.
+
+**Modifications.** The builder keeps what it asked DIA-NN to place (the importer's default
+set for the standard selection, the selection's accessions otherwise). An imported
+library's author chose its modifications, so the import passes `--keep-unimod` with every
+accession of the modification catalogue (`mods.rs`, the engine's `modifications.json`):
+each modification the engine can name is kept, and only precursors carrying one outside the
+catalogue are dropped, which the importer reports.
+
+**No FASTA is asked for.** The importer takes the protein identifiers from the library's
+own `Protein.Names` / `Protein.Ids` columns, and the decoys are reversed target sequences,
+so neither the import nor the decoy prediction reads a FASTA. A library whose protein
+columns are empty is grouped as `UNASSIGNED` by the engine, as for any imported library.
+
+The output folder is the user's, not the content-addressed library cache: the input is a
+file the user already has, and converting it again is a choice, not a cache miss. The DIA-NN
+threads field of the FASTA tab sets the threads, as for a build.
+
 ### Which predictors the built-in path uses
 
 The built-in path derives the run's configuration from the selected preset, and until

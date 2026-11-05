@@ -71,6 +71,17 @@ fn diann_build(state: tauri::State<'_, AppState>, req: diann::BuildRequest) -> R
     diann::build(Arc::clone(&state.diann), req)
 }
 
+/// Convert a DIA-NN library the user already has (`.parquet` or `.speclib`) into the two
+/// tables a search consumes, with DIA-NN predicting the decoys' spectra. Progress is the
+/// library build's (`diann_build_state`).
+#[tauri::command]
+fn diann_import(
+    state: tauri::State<'_, AppState>,
+    req: diann::ImportRequest,
+) -> Result<(), String> {
+    diann::import(Arc::clone(&state.diann), req)
+}
+
 /// Progress of the library build, polled while it runs.
 #[tauri::command]
 fn diann_build_state(state: tauri::State<'_, AppState>) -> diann::BuildState {
@@ -951,6 +962,7 @@ fn main() {
             diann_set_path,
             diann_acknowledge,
             diann_build,
+            diann_import,
             diann_build_state,
             diann_offer,
             diann_install,

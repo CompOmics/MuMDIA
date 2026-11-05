@@ -429,18 +429,57 @@
       </div>
 
       <div class="mode" id="mode-library" hidden>
-        <div class="picker">
-          <div class="picked" id="p-libp">No precursor table selected</div>
-          <button class="btn quiet" data-pick="lib_precursors">Precursors…</button>
+        <label class="check">
+          <input type="radio" name="libin" id="libin-tables" value="tables" checked />
+          <span><b>MuMDIA library tables</b> — the precursor and fragment tables of a
+            library already converted or built.</span>
+        </label>
+        <label class="check">
+          <input type="radio" name="libin" id="libin-diann" value="diann" />
+          <span><b>DIA-NN library</b> — a spectral library DIA-NN wrote (.parquet or
+            .speclib), converted into the two tables first.</span>
+        </label>
+
+        <div id="libin-tables-pane">
+          <div class="picker">
+            <div class="picked" id="p-libp">No precursor table selected</div>
+            <button class="btn quiet" data-pick="lib_precursors">Precursors…</button>
+          </div>
+          <div class="picker">
+            <div class="picked" id="p-libf">No fragment table selected</div>
+            <button class="btn quiet" data-pick="lib_fragments">Fragments…</button>
+          </div>
+          <p class="hint">
+            Two Parquet tables from an imported library. This is the configuration the
+            published benchmarks use.
+          </p>
         </div>
-        <div class="picker">
-          <div class="picked" id="p-libf">No fragment table selected</div>
-          <button class="btn quiet" data-pick="lib_fragments">Fragments…</button>
+
+        <div id="libin-diann-pane" hidden>
+          <div class="picker">
+            <div class="picked" id="p-diann-lib">No DIA-NN library selected</div>
+            <button class="btn quiet" data-pick="diann_lib">DIA-NN library…</button>
+          </div>
+          <div class="picker">
+            <div class="picked" id="p-diann-lib-out">No folder selected</div>
+            <button class="btn quiet" data-pick="diann_lib_out">Output folder…</button>
+          </div>
+          <div class="actions">
+            <button class="btn" id="diann-import">Convert the library</button>
+            <span class="hint inline" id="diann-import-note"></span>
+          </div>
+          <div id="diann-import-error" class="banner bad" hidden></div>
+          <p class="hint">
+            The library's targets are converted to MuMDIA's schema, reversed decoys are
+            added, and DIA-NN predicts the decoys' spectra, as for a library DIA-NN
+            predicts here. A .speclib is first re-exported as Parquet. This needs a working
+            DIA-NN 2.x with its licence acknowledged on the Setup screen: decoys that copy
+            their targets' intensities make the reported FDR optimistic, so there is no
+            conversion without it. No FASTA is needed, because the proteins come from the
+            library. Use an empty output folder; the two tables are selected for the search
+            when the conversion finishes.
+          </p>
         </div>
-        <p class="hint">
-          Two Parquet tables from an imported library. This is the configuration the
-          published benchmarks use.
-        </p>
       </div>
     </div>
 
