@@ -261,6 +261,89 @@ def test_an_empty_protein_is_written_as_unassigned(diann_lib, tmp_path):
     assert all(pr.strip() for pr in cols["protein"]), "no empty protein reaches the engine"
 
 
+def _with_protein_columns(diann_lib, tmp_path, ids_by_key, names_by_key):
+    """The fixture library with `Protein.Ids` added and `Protein.Names` replaced, both
+    per (modified sequence, charge); precursors not named keep their fixture name as both."""
+    src = pq.read_table(diann_lib)
+    modseq = src.column("Modified.Sequence").to_pylist()
+    charge = src.column("Precursor.Charge").to_pylist()
+    prot = src.column("Protein.Names").to_pylist()
+    ids = [ids_by_key.get((m, z), p) for m, z, p in zip(modseq, charge, prot)]
+    names = [names_by_key.get((m, z), p) for m, z, p in zip(modseq, charge, prot)]
+    i = src.schema.get_field_index("Protein.Names")
+    table = src.set_column(i, "Protein.Names", pa.array(names, pa.string()))
+    table = table.append_column("Protein.Ids", pa.array(ids, pa.string()))
+    lib = tmp_path / "diann_lib_ids.parquet"
+    pq.write_table(table, str(lib), compression="snappy")
+    return lib
+
+
+def test_a_description_word_in_protein_names_falls_back_to_the_ids(diann_lib, tmp_path):
+    """DIA-NN writes a UniProt entry name in `Protein.Names` only for a header it parses
+    as UniProt. For `CON_sp|...` contaminants it writes the first description word, so two
+    different keratins both become `Keratin,` and merge into one protein group, and for the
+    `REAL_sp|...` / `ENTRAP_sp|...` headers of an entrapment FASTA it writes nothing, which
+    made a mapped precursor UNASSIGNED. Those rows must take `Protein.Ids`; rows whose names
+    are entry names keep them, species flag and all."""
+    lib = _with_protein_columns(
+        diann_lib, tmp_path,
+        ids_by_key={
+            ("PEPTIDEK", 2): "P02768",
+            ("PEPTIDEK", 3): "CON_sp|P02444|KRA33_SHEEP;CON_sp|P02445|KRA34_SHEEP",
+            ("SC(UniMod:4)ENICK", 2): "CON_sp|P35908|K22E_HUMAN",
+            ("M(UniMod:35)ELLOWK", 2): "REAL_sp|P0A6P9|ENO_ECOLI",
+            ("K(UniMod:44)ITTENR", 2): "ENTRAP_sp|P0CG40|SP9_HUMAN",
+            ("(UniMod:4)NTERMCK", 2): "CON_sp|P12081|HARS1_HUMAN;P49590",
+        },
+        names_by_key={
+            ("PEPTIDEK", 2): "ALBU_HUMAN",
+            ("PEPTIDEK", 3): "Keratin,",
+            ("SC(UniMod:4)ENICK", 2): "Keratin,",
+            ("M(UniMod:35)ELLOWK", 2): "Enolase",
+            ("K(UniMod:44)ITTENR", 2): "",
+            ("(UniMod:4)NTERMCK", 2): "Histidine--tRNA;SYHM_HUMAN",
+        },
+    )
+    prec = tmp_path / "lib_precursors.parquet"
+    frag = tmp_path / "lib_fragments.parquet"
+    out, _ = run_worker_ok("import_diann_lib.py", lib, prec, frag)
+    cols = read_columns(prec)
+    by_key = {(p, int(z)): pr for p, z, pr in zip(cols["peptidoform"], cols["charge"],
+                                                  cols["protein"])}
+    assert by_key[("PEPTIDEK", 2)] == "ALBU_HUMAN", "a valid entry name is kept"
+    assert by_key[("PEPTIDEK", 3)] == "CON_sp|P02444|KRA33_SHEEP;CON_sp|P02445|KRA34_SHEEP"
+    assert by_key[("SC[Carbamidomethyl]ENICK", 2)] == "CON_sp|P35908|K22E_HUMAN", (
+        "two different keratins must not share the group `Keratin,`"
+    )
+    assert by_key[("M[Oxidation]ELLOWK", 2)] == "REAL_sp|P0A6P9|ENO_ECOLI"
+    assert by_key[("K[Farnesyl]ITTENR", 2)] == "ENTRAP_sp|P0CG40|SP9_HUMAN", (
+        "an empty name with a mapped id is not UNASSIGNED"
+    )
+    assert by_key[("[Carbamidomethyl]-NTERMCK", 2)] == "CON_sp|P12081|HARS1_HUMAN;P49590", (
+        "one description token among entry names takes the whole id list, keeping the "
+        "per-protein alignment"
+    )
+    assert "UNASSIGNED" not in set(cols["protein"])
+    assert not any(" " in p or "," in p for p in cols["protein"])
+    assert "written as their Protein.Ids" in out
+
+
+def test_empty_names_and_ids_are_unassigned(diann_lib, tmp_path):
+    """With nothing in either column the precursor is UNASSIGNED, as before."""
+    lib = _with_protein_columns(
+        diann_lib, tmp_path,
+        ids_by_key={("PEPTIDEK", 3): ""}, names_by_key={("PEPTIDEK", 3): ""},
+    )
+    prec = tmp_path / "lib_precursors.parquet"
+    frag = tmp_path / "lib_fragments.parquet"
+    run_worker_ok("import_diann_lib.py", lib, prec, frag)
+    cols = read_columns(prec)
+    by_key = {(p, int(z)): pr for p, z, pr in zip(cols["peptidoform"], cols["charge"],
+                                                  cols["protein"])}
+    assert by_key[("PEPTIDEK", 3)] == "UNASSIGNED"
+    assert by_key[("PEPTIDEK", 2)] == "ALBU_HUMAN"
+
+
 def test_output_parquet_uses_only_a_codec_the_engine_can_decode(imported):
     """Snappy, zstd or uncompressed, or the engine cannot open the library at all.
 

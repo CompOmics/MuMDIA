@@ -4,6 +4,14 @@ real species-flagged protein identifiers (e.g. ALBU_HUMAN, ..._YEAST, ..._ECOLI)
 needed for the ProteoBench species-ratio metric. Emits lib_precursors +
 lib_fragments; run make_shift_decoys.py afterwards to add the decoy population.
 
+Proteins: `Protein.Names` is used for a precursor when every `;`-separated token is a
+UniProt entry name (one word with an underscore, `ALBU_HUMAN`), else `Protein.Ids`. DIA-NN
+fills `Protein.Names` only for FASTA headers it parses as UniProt; for any other header,
+such as `CON_sp|P02768|ALBU_HUMAN` contaminants or the `REAL_sp|` / `ENTRAP_sp|` proteins of
+an entrapment FASTA, it writes the first description word (`Keratin,`) or nothing, which
+would merge distinct proteins into one group or leave them UNASSIGNED. The import prints how
+many protein entries fell back to their ids.
+
 Kept modifications, by default: Carbamidomethyl (UniMod:4), Oxidation (35), and the
 three cysteine prenylations Farnesyl (44), GeranylGeranyl (48), Hydroxyfarnesyl (376).
 `--keep-unimod 4,35,21,...` names the kept accessions instead; each must be in the
@@ -182,6 +190,62 @@ def _filter_rows(df, charge_by_basic, n_term=None):
     return df, dropped
 
 
+def _is_entry_name(token):
+    """True for a UniProt-style entry name (`ALBU_HUMAN`, `K2C1_HUMAN`): one word with an
+    underscore and nothing a description would carry. DIA-NN writes such a name in
+    `Protein.Names` only for a FASTA header it parses as UniProt; for any other header
+    (`CON_sp|...` contaminants, `REAL_sp|...` / `ENTRAP_sp|...` entrapment proteins) the
+    cell is empty or the first word of the description (`Keratin,`, `Uncharacterized`)."""
+    return bool(token) and "_" in token and not any(c in token for c in " ,|\t")
+
+
+def _resolve_protein(ids, names):
+    """The protein string of one precursor: `Protein.Names` when every `;`-separated token
+    is an entry name, else `Protein.Ids` (the same per-protein list, also `;`-separated).
+
+    A description word is not an identifier: written as the protein it merges every
+    contaminant named `Keratin,` into one group, and an empty name makes the precursor
+    UNASSIGNED although DIA-NN mapped it. The ids keep the proteins apart and still carry
+    the species flag of a `db|accession|ENTRY_SPECIES` header."""
+    names = "" if names is None else str(names).strip()
+    if names and names not in ("nan", "None", "<NA>") and all(
+            _is_entry_name(t.strip()) for t in names.split(";")):
+        return names
+    ids = "" if ids is None else str(ids).strip()
+    return ids if ids not in ("nan", "None", "<NA>") else ""
+
+
+def _resolve_names_only(names):
+    """A library without `Protein.Ids`: the names as written (there is nothing to fall
+    back to), empty when the cell is."""
+    names = "" if names is None else str(names).strip()
+    return names if names not in ("nan", "None", "<NA>") else ""
+
+
+def _protein_strings(df, cache, stats):
+    """`_resolve_protein` over the rows of `df`, once per distinct (ids, names) pair.
+
+    `cache` maps a pair to its protein string across row groups; `stats["fallback"]`
+    collects the pairs whose names were replaced by the ids, for the import report."""
+    has_names = "Protein.Names" in df.columns
+    has_ids = "Protein.Ids" in df.columns
+    if not has_names and not has_ids:
+        return np.full(len(df), "", dtype=object)
+    ids = df["Protein.Ids"].astype(str).to_numpy() if has_ids else np.full(len(df), "", object)
+    names = (df["Protein.Names"].astype(str).to_numpy() if has_names
+             else np.full(len(df), "", object))
+    out = np.empty(len(df), dtype=object)
+    for i, pair in enumerate(zip(ids, names)):
+        got = cache.get(pair)
+        if got is None:
+            got = _resolve_protein(*pair) if has_ids else _resolve_names_only(pair[1])
+            cache[pair] = got
+            if has_names and got != pair[1].strip() and got:
+                stats["fallback"].add(pair)
+        out[i] = got
+    return out
+
+
 def _keys(df):
     """The precursor key the whole import is joined on: ProForma peptidoform / charge."""
     return df["Modified.Sequence"].map(to_proforma) + "/" + df["Precursor.Charge"].astype(str)
@@ -215,7 +279,8 @@ def main():
     if missing:
         raise SystemExit(f"{inp}: not a DIA-NN fragment-level library, missing columns {missing}")
     optional = [c for c in _OPTIONAL_COLS if c in present]
-    prot_col = "Protein.Names" if "Protein.Names" in present else "Protein.Ids"
+    prot_cols = [c for c in ("Protein.Names", "Protein.Ids") if c in present]
+    prot_cache, prot_stats = {}, {"fallback": set()}
     im_col = next((c for c in ("IM", "IonMobility") if c in present), None)
     read_cols = _META_COLS + _FRAG_COLS + optional
 
@@ -255,8 +320,7 @@ def main():
             "RT": df.loc[first, "RT"].astype(np.float32).to_numpy(),
             "IM": df.loc[first, im_col].astype(np.float64).to_numpy() if im_col
             else np.full(int(first.sum()), np.nan),
-            "protein_str": df.loc[first, prot_col].astype(str).to_numpy() if prot_col in df.columns
-            else np.full(int(first.sum()), "", dtype=object),
+            "protein_str": _protein_strings(df.loc[first], prot_cache, prot_stats),
         })
         prec_parts.append(part)
         # Fragment cardinality: how many distinct library precursors share each fragment
@@ -294,6 +358,13 @@ def main():
     keys = keys[~keys["key"].duplicated()].reset_index(drop=True)
     nfrag = pd.concat(count_parts).groupby(level=0).sum()
 
+    if prot_stats["fallback"]:
+        fb = prot_stats["fallback"]
+        n_rows = int(keys["protein_str"].isin({_resolve_protein(*p) for p in fb}).sum())
+        example = sorted(fb)[0]
+        print(f"protein: {len(fb)} protein entr(ies) without a UniProt entry name in "
+              f"Protein.Names, e.g. {example[1]!r} for {example[0]!r}, are written as their "
+              f"Protein.Ids ({n_rows} precursors)")
     # DIA-NN leaves the protein empty for peptides it did not map to the FASTA, the
     # Biognosys iRT-kit standards above all (LGGNEQVTR, GTFIIDPGGVIR, ...). The engine
     # refuses a library with an empty required string, because an empty protein would
@@ -302,7 +373,8 @@ def main():
     unassigned = keys["protein_str"].str.strip().isin(["", "nan", "None", "<NA>"])
     if unassigned.any():
         keys.loc[unassigned, "protein_str"] = "UNASSIGNED"
-        print(f"protein: {int(unassigned.sum())} precursors had no protein in {prot_col}; "
+        src = " or ".join(prot_cols) if prot_cols else "the library (no protein column)"
+        print(f"protein: {int(unassigned.sum())} precursors had no protein in {src}; "
               f"written as UNASSIGNED (typically the iRT-kit standards)")
 
     # Sort precursors by m/z before assigning candidate_id, so the emitted library
