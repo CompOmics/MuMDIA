@@ -385,6 +385,27 @@ if "$BIN" build-library --fasta test_data/fixture.fasta --out-dir test_data/fixt
 fi
 grep -q "the output directory is not writable" "$work/blocked_lib.log" \
     || { tail -5 "$work/blocked_lib.log"; echo "build-library did not name an unwritable output directory"; exit 1; }
+# The engine defaults name the native predictors, which a FASTA search refuses before the
+# digest unless `predict_frag.allow_native_predictors` is set (the smoke configuration sets
+# it). Without --config, `run` and `build-library` must stop with the reason and write nothing.
+echo "=== smoke: a FASTA search on the native predictors is refused without the opt-in"
+for cmd in run build-library; do
+    if [ "$cmd" = run ]; then
+        refused_args=(run --mzml "$work/fixture.mzML")
+    else
+        refused_args=(build-library)
+    fi
+    if "$BIN" "${refused_args[@]}" --fasta test_data/fixture.fasta \
+        --out-dir "$work/out_refused_$cmd" --threads 2 > "$work/refused_$cmd.log" 2>&1; then
+        tail -5 "$work/refused_$cmd.log"
+        echo "$cmd on the native predictors without the opt-in did not fail"; exit 1
+    fi
+    grep -q "$cmd: refusing to build the library of this FASTA search" "$work/refused_$cmd.log" \
+        && grep -q "predict_frag.allow_native_predictors = true" "$work/refused_$cmd.log" \
+        || { tail -5 "$work/refused_$cmd.log"; echo "$cmd did not name the native refusal"; exit 1; }
+    [ ! -e "$work/out_refused_$cmd" ] \
+        || { echo "a refused $cmd wrote its output directory"; exit 1; }
+done
 "$BIN" doctor --config "$cfg" --json --no-import-check --out-dir "$work/out" > "$work/doctor_storage.json"
 "$PY" - "$work/doctor_storage.json" <<'PYEOF'
 import json, sys

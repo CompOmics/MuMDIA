@@ -1363,6 +1363,23 @@ pub struct PredictFragConfig {
     /// and the bound is what removes the old ones. `mumdia doctor` reports the directory
     /// and its size.
     pub library_cache: Option<String>,
+    /// Let a FASTA search build its library with the native fallback models. Default
+    /// `false`: `run`, `run-experiment`, `build-library` and `predict-frag` refuse, before
+    /// the digest, a FASTA library whose fragment intensities are native
+    /// (`predictor = native`) or whose retention times are native (`rt_predictor = native`)
+    /// with nothing that replaces them (`rt_im_train.finetune_deeplc`, or an explicit
+    /// `rt_im_train.multihead_calibration` head count). The native models are a fallback:
+    /// they usually leave the seed search without confident anchors, so the retention-time
+    /// window is unbounded and the search is slow and finds far fewer peptides than one on
+    /// MS2PIP or AlphaPeptDeep with DeepLC, or on an imported library.
+    ///
+    /// `true` runs the native models anyway, with the start-of-search warning; it is for a
+    /// machine without the predictor environments, a test fixture, or a comparison of the
+    /// predictors. Imported-library searches never read it. Never part of the canonical
+    /// configuration: it decides whether a search may start, not what any artifact
+    /// contains, so the configuration hash and every artifact are the same either way.
+    #[serde(default, skip_serializing)]
+    pub allow_native_predictors: bool,
 }
 impl Default for PredictFragConfig {
     fn default() -> Self {
@@ -1384,6 +1401,7 @@ impl Default for PredictFragConfig {
             sidecar_script_dir: "scripts".to_string(),
             defer_deeplc_to_multihead: true,
             library_cache: Some("auto".to_string()),
+            allow_native_predictors: false,
         }
     }
 }

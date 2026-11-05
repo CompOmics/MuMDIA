@@ -19,8 +19,9 @@ is the source of truth if it has moved.
 | rustc crashes with `STATUS_ILLEGAL_INSTRUCTION` while compiling `arrow-ipc` at release opt-level 3 | `arrow-ipc`'s generated FlatBuffer code crashes rustc codegen at opt-level 3 on the Windows toolchain | Keep the `opt-level = 1` pin for `arrow-ipc` (`Cargo.toml:34-35`); do not remove it |
 | Sidecar run fails with "worker not found" / a spawn error naming a script path | `predict_frag.sidecar_script_dir` does not resolve to an existing dir from any of the three candidates | Run from the project root, or set `sidecar_script_dir` to a native absolute path (`c:/...`, not a git-bash `/c/...` path) |
 | `rescore.classifier = nn_torch` (or `mokapot`) produces `native_tda` scores | A compatibility config explicitly set `rescore.strict = false`, then worker resolution/execution failed and fallback ran | Keep the default `strict = true`; inspect `psms_scored.parquet.report.json` for the classifier actually used |
-| `run` aborts with "MS2PIP returned no predictions" | MS2PIP returned an empty map; `predict-frag` has no whole-run native fallback | Fix the MS2PIP env (`mumdia doctor`), or set `predict_frag.predictor = native` |
-| `run` aborts during the DeepLC predict / fine-tune / MBR step | `predict-frag`, the fine-tune, and MBR propagate worker errors with `?`; only `rescore` falls back | Fix the sidecar env, or disable that path (`rt_predictor = native`, `finetune_deeplc = false`, `mbr.strategy = none`) |
+| `run` aborts with "MS2PIP returned no predictions" | MS2PIP returned an empty map; `predict-frag` has no whole-run native fallback | Fix the MS2PIP env (`mumdia doctor`), or switch to AlphaPeptDeep. `predict_frag.predictor = native` also needs `predict_frag.allow_native_predictors = true` and finds far fewer peptides |
+| `run` aborts during the DeepLC predict / fine-tune / MBR step | `predict-frag`, the fine-tune, and MBR propagate worker errors with `?`; only `rescore` falls back | Fix the sidecar env, or disable that path (`finetune_deeplc = false`, `mbr.strategy = none`; `rt_predictor = native` in a FASTA search also needs `predict_frag.allow_native_predictors = true`) |
+| `run: refusing to build the library of this FASTA search with native fragment intensities (predict_frag.predictor = native) and native retention times ...` (or `run-experiment:`, `build-library:`, `predict-frag:`) before the digest | A FASTA search whose fragment intensities, or retention times with no fine-tune or explicit multi-head calibration to replace them, come from the native fallback models; both are the engine defaults, so a FASTA search without `--config` gets it too (`rt_health.rs`, `refuse_native_predictors`) | Predict the library with MS2PIP or AlphaPeptDeep and DeepLC (`configs/examples/fasta-sidecars.json`, `fasta-peptdeep.json`, `diapasef.json`; check with `mumdia doctor --config`), or search a DIA-NN-predicted library imported with `scripts/import_diann_lib.py`. `predict_frag.allow_native_predictors = true` runs the native models anyway (`configs/examples/native.json`). See "Seed: no confident targets" below |
 | A short `--max-spectra` run finds almost nothing | The flag reads the file head and the early gradient is void | Use the full file or externally prepare a mid-gradient mzML slice; `--max-spectra` has no offset |
 | A reused `--out-dir` contains contradictory or stale sidecars | `run` recomputes named outputs but does not clear the directory; optional files can remain and a failed rerun can leave an old manifest | Use a fresh output directory for every `run`; reuse artifacts only through explicit standalone stage commands |
 | Config load fails with an unknown-field parse error | `#[serde(deny_unknown_fields)]` rejects any unknown or misspelled key (including a removed knob) | Fix or remove the key; check it against the current `config.rs`, not an old config |
@@ -385,13 +386,19 @@ runs this way, with native retention times and no 1/K0 predictor as well: every 
 hours and reported a small fraction of the identifications the data hold. The tolerance
 retry cannot help here. Predict the library with MS2PIP or AlphaPeptDeep and DeepLC (with
 IM2Deep for diaPASEF; `configs/examples/fasta-sidecars.json`,
-`configs/examples/diapasef.json`), or search an imported library.
+`configs/examples/diapasef.json`), or search an imported library. Such a FASTA search is
+now refused before the digest unless `predict_frag.allow_native_predictors` is set
+(docs/06, "The native predictor models"). Another desktop FASTA search on the native
+fragment and retention-time models found 33.6k precursors where a DIA-NN-predicted library
+gave 129k with the same engine.
 
-**How it is reported.** A FASTA search on native fragment intensities logs `predict-frag:
-this FASTA search predicts its library with native fragment intensities ...` before its
-first stage. A run that ends `rt-im-train` without a calibration logs `RETENTION-TIME
-CALIBRATION FAILED for <run> (<n> target anchors, status ...)`, with the likely causes; the
-native predictors are named first when the library's own report
+**How it is reported.** A FASTA search on native fragment intensities, or on native
+retention times that nothing replaces, is refused before the digest (`run: refusing to build
+the library of this FASTA search with ...`) unless `predict_frag.allow_native_predictors` is
+set; with it, the search logs `predict-frag: this FASTA search predicts its library with
+native fragment intensities ...` before its first stage. A run that ends `rt-im-train`
+without a calibration logs `RETENTION-TIME CALIBRATION FAILED for <run> (<n> target
+anchors, status ...)`, with the likely causes; the native predictors are named first when the library's own report
 (`fragment_library_fragments.parquet.report.json`, `params.fragment_predictor`) says they
 predicted it. `run` and `run-experiment` end with `SEARCH DEGRADED: N of M run(s) in the
 first pass had no retention-time calibration ...` and record each such run, with its pass,

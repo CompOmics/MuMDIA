@@ -11,19 +11,25 @@
 //! heuristic charge-2 fragments); an instrument m/z offset beyond the seed tolerance and
 //! a library that does not fit the sample are the others.
 //!
-//! This module only reads and reports: the native-predictor warning at the start of a
-//! FASTA search, a prominent warning after `rt-im-train` names the consequence and the
-//! likely causes, and the end of `run` and `run-experiment` records each such run in the
-//! manifest ([`RtCalibrationGap`]) and logs one summary line. Nothing is written for a
-//! calibrated run, so its artifacts, reports and manifest keep their bytes.
+//! One check stops a search, and it runs before the search starts:
+//! [`refuse_native_predictors`] refuses a FASTA library built on the native fallback
+//! models unless `predict_frag.allow_native_predictors` says to build it anyway. The rest
+//! of this module only reads and reports: the native-predictor warning at the start of a
+//! FASTA search that was allowed to use them, a prominent warning after `rt-im-train`
+//! names the consequence and the likely causes, and the end of `run` and `run-experiment`
+//! records each such run in the manifest ([`RtCalibrationGap`]) and logs one summary
+//! line. Nothing is written for a calibrated run, so its artifacts, reports and manifest
+//! keep their bytes.
 //!
-//! It does not stop the search. A stop would change the default behaviour of every
-//! search with an uncalibrated run, and some of those are legitimate: a blank well in a
-//! single-cell plate has no anchors by construction, and the second pass of an experiment
-//! searches such runs again on the consensus retention times of the others. Grouped
-//! searches are the exception and stop already (`run_groups::refuse_unbounded_rt`),
-//! because there unbounded windows multiply the memory by the number of bands.
+//! It does not stop a search whose run ends uncalibrated. That stop would change the
+//! default behaviour of every search with an uncalibrated run, and some of those are
+//! legitimate: a blank well in a single-cell plate has no anchors by construction, and the
+//! second pass of an experiment searches such runs again on the consensus retention times
+//! of the others. Grouped searches are the exception and stop already
+//! (`run_groups::refuse_unbounded_rt`), because there unbounded windows multiply the memory
+//! by the number of bands.
 
+use anyhow::Result;
 use mumdia_core::config::{Config, FragPredictorKind, RtPredictorKind};
 use mumdia_core::manifest::RtCalibrationGap;
 use tracing::warn;
@@ -82,6 +88,64 @@ impl NativePredictions {
             ion_mobility_missing: false,
         }
     }
+}
+
+/// Whether something after the library build replaces a native library retention time
+/// with DeepLC's: a fine-tune (`rt_im_train.finetune_deeplc`) or an explicit multi-head
+/// calibration (`rt_im_train.multihead_calibration` > 0). The automatic multi-head default
+/// is scoped to libraries whose retention times are DeepLC's already, so it never runs on
+/// a native one (`RtImTrainConfig::multihead_heads`).
+pub fn native_rt_is_replaced(cfg: &Config) -> bool {
+    cfg.rt_im_train.finetune_deeplc || cfg.rt_im_train.multihead_calibration.is_some_and(|n| n > 0)
+}
+
+/// Refuse a FASTA library build on the native fallback models, before anything runs.
+///
+/// `fasta_mode` is whether the command predicts a library from a FASTA (`run` and
+/// `run-experiment` with `--fasta`, `build-library`, `predict-frag`); an imported library
+/// reads no `predict_frag` setting and passes. Refused: native fragment intensities, and
+/// native retention times that nothing replaces ([`native_rt_is_replaced`]).
+/// `predict_frag.allow_native_predictors` lets the build run on them anyway. The
+/// engine's default configuration names the native models, so a FASTA search without
+/// `--config` is refused with the same message.
+pub fn refuse_native_predictors(cfg: &Config, fasta_mode: bool, command: &str) -> Result<()> {
+    if !fasta_mode || cfg.predict_frag.allow_native_predictors {
+        return Ok(());
+    }
+    let pf = &cfg.predict_frag;
+    let mut what: Vec<&str> = Vec::new();
+    if pf.predictor == FragPredictorKind::Native {
+        what.push("native fragment intensities (predict_frag.predictor = native)");
+    }
+    if pf.rt_predictor == RtPredictorKind::Native && !native_rt_is_replaced(cfg) {
+        what.push("native retention times (predict_frag.rt_predictor = native)");
+    }
+    if what.is_empty() {
+        return Ok(());
+    }
+    let defaults = if pf.predictor == FragPredictorKind::Native
+        && pf.rt_predictor == RtPredictorKind::Native
+    {
+        " These are the engine defaults, so a FASTA search without --config, or with a \
+         configuration that names no predictor, is refused too."
+    } else {
+        ""
+    };
+    anyhow::bail!(
+        "{command}: refusing to build the library of this FASTA search with {}. The native \
+         models are a fallback for a machine without the predictor environments: they \
+         usually leave the seed search without confident anchors, so the retention-time \
+         window is unbounded and the search is slow and finds far fewer peptides.{defaults} \
+         To fix it, either predict the library with MS2PIP or AlphaPeptDeep for the \
+         fragments and DeepLC for the retention times (predict_frag.predictor = ms2pip or \
+         peptdeep, predict_frag.rt_predictor = deeplc; configs/examples/fasta-sidecars.json, \
+         configs/examples/fasta-peptdeep.json, and configs/examples/diapasef.json for \
+         diaPASEF; `mumdia doctor --config <file>` checks the interpreters), or search a \
+         library predicted by DIA-NN and imported with scripts/import_diann_lib.py \
+         (--lib-precursors / --lib-fragments). To run the native models anyway, set \
+         predict_frag.allow_native_predictors = true.",
+        what.join(" and ")
+    )
 }
 
 /// The warning logged at the start of a FASTA search on native fragment intensities, or
@@ -302,6 +366,98 @@ mod tests {
         let n = NativePredictions::of_config(&ms2pip, true, false);
         assert!(!n.fragments && n.retention_time);
         assert!(native_predictor_warning(&n).is_none());
+    }
+
+    /// A FASTA library on native fragments, or on native retention times that nothing
+    /// replaces, is refused with the reason and the fixes; the engine defaults are such a
+    /// library. An imported library, the opt-in, and a fine-tune or an explicit multi-head
+    /// calibration over native retention times pass.
+    #[test]
+    fn a_fasta_library_on_the_native_models_is_refused() {
+        let cfg = Config::default();
+        let e = refuse_native_predictors(&cfg, true, "run")
+            .unwrap_err()
+            .to_string();
+        for needle in [
+            "run: refusing",
+            "predict_frag.predictor = native",
+            "predict_frag.rt_predictor = native",
+            "engine defaults",
+            "without --config",
+            "configs/examples/fasta-sidecars.json",
+            "configs/examples/diapasef.json",
+            "mumdia doctor",
+            "import_diann_lib.py",
+            "predict_frag.allow_native_predictors = true",
+        ] {
+            assert!(e.contains(needle), "missing {needle:?}: {e}");
+        }
+        // Library-input mode reads no predict_frag setting.
+        refuse_native_predictors(&cfg, false, "run").unwrap();
+        // The explicit opt-in.
+        let mut allowed = cfg.clone();
+        allowed.predict_frag.allow_native_predictors = true;
+        refuse_native_predictors(&allowed, true, "run").unwrap();
+
+        // Native fragments alone are refused, without the defaults clause.
+        let mut frag = cfg.clone();
+        frag.predict_frag.rt_predictor = RtPredictorKind::Deeplc;
+        let e = refuse_native_predictors(&frag, true, "build-library")
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("build-library: refusing"), "{e}");
+        assert!(e.contains("fragment intensities"), "{e}");
+        assert!(!e.contains("rt_predictor = native"), "{e}");
+        assert!(!e.contains("engine defaults"), "{e}");
+
+        // Native retention times under a sidecar fragment predictor are refused, unless a
+        // fine-tune or an explicit multi-head calibration replaces them.
+        let mut rt = cfg.clone();
+        rt.predict_frag.predictor = FragPredictorKind::Ms2pip;
+        let e = refuse_native_predictors(&rt, true, "predict-frag")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("rt_predictor = native"), "{e}");
+        assert!(!e.contains("fragment intensities"), "{e}");
+        assert!(!native_rt_is_replaced(&rt));
+        let mut ft = rt.clone();
+        ft.rt_im_train.finetune_deeplc = true;
+        assert!(native_rt_is_replaced(&ft));
+        refuse_native_predictors(&ft, true, "run").unwrap();
+        let mut mh = rt.clone();
+        mh.rt_im_train.multihead_calibration = Some(80);
+        refuse_native_predictors(&mh, true, "run").unwrap();
+        // `0` turns the calibration off and the automatic default does not run on a native
+        // retention time, so neither replaces it.
+        for heads in [Some(0), None] {
+            let mut off = rt.clone();
+            off.rt_im_train.multihead_calibration = heads;
+            assert!(
+                refuse_native_predictors(&off, true, "run").is_err(),
+                "{heads:?}"
+            );
+        }
+        // A replaced retention time does not excuse native fragments.
+        let mut both = cfg.clone();
+        both.rt_im_train.finetune_deeplc = true;
+        let e = refuse_native_predictors(&both, true, "run")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("fragment intensities"), "{e}");
+        assert!(!e.contains("rt_predictor = native"), "{e}");
+    }
+
+    /// The opt-in never reaches the canonical configuration, so a search allowed to use
+    /// the native models keeps the configuration hash and the artifacts it had before the
+    /// refusal existed.
+    #[test]
+    fn the_opt_in_is_not_part_of_the_canonical_configuration() {
+        let cfg = Config::default();
+        let allowed =
+            Config::from_json(r#"{"predict_frag":{"allow_native_predictors":true}}"#).unwrap();
+        assert!(allowed.predict_frag.allow_native_predictors);
+        assert_eq!(allowed.canonical_json(), cfg.canonical_json());
+        assert!(!cfg.canonical_json().contains("allow_native_predictors"));
     }
 
     /// The library's own report says how it was predicted; an imported or unreadable one

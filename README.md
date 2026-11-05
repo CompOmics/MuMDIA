@@ -86,7 +86,8 @@ non-zero if the configuration cannot run. DeepLC 4.5.0 or newer is required.
 ## Quickstart
 
 ```bash
-# no Python at all: proves the installation and the input files
+# no Python at all: proves the installation and the input files (native.json allows the
+# native predictors, which a FASTA search otherwise refuses; not for real searches)
 mumdia run --fasta proteome.fasta --mzml sample.mzML --out-dir results \
            --config configs/examples/native.json
 

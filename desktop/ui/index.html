@@ -400,9 +400,9 @@
             <b>Built-in predictors</b> — the engine digests the FASTA itself and predicts the
             library with the predictors that are installed: the diaPASEF recipe (AlphaPeptDeep,
             DeepLC and IM2Deep) for a timsTOF diaPASEF .d, otherwise MS2PIP or AlphaPeptDeep
-            with DeepLC. A preset that names its own predictor keeps it. The native predictors
-            are a last resort and usually make the search slow and insensitive. No DIA-NN
-            needed.
+            with DeepLC. A preset that names its own predictor keeps it. The engine's native
+            predictors are not used: with none of these installed, a search on this path
+            cannot start. No DIA-NN needed.
             <span class="hint inline" id="libsrc-builtin-note"></span>
           </span>
         </label>

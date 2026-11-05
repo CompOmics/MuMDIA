@@ -16,9 +16,12 @@
 //! takes the first recipe whose interpreters the engine finds (`mumdia doctor`): the
 //! diaPASEF recipe for a timsTOF diaPASEF `.d`, then MS2PIP with DeepLC, then AlphaPeptDeep
 //! with DeepLC. A preset that names a fragment predictor is the user's choice and is kept.
-//! When the search would still run on native predictions, or on a diaPASEF `.d` without
-//! the diaPASEF settings, [`Plan::warning`] says what that costs, and the interface asks
-//! before it starts.
+//! When the search would still run on native predictions, [`Plan::blocked`] says why and
+//! what to do instead, and the interface does not start it: the engine refuses a FASTA
+//! library on the native models (`rt_health::refuse_native_predictors`), and the
+//! application never passes the engine's opt-in. On a diaPASEF `.d` without the diaPASEF
+//! settings, [`Plan::warning`] says what that costs, and the interface asks before it
+//! starts.
 
 use std::path::{Path, PathBuf};
 
@@ -38,6 +41,10 @@ pub struct Predictors {
     pub fragments: String,
     pub retention_time: String,
     pub ion_mobility: String,
+    /// Whether a native library retention time is replaced after the build, as the engine
+    /// decides it: a fine-tune (`rt_im_train.finetune_deeplc`) or an explicit multi-head
+    /// calibration (`rt_im_train.multihead_calibration` > 0).
+    pub retention_time_replaced: bool,
 }
 
 impl Predictors {
@@ -53,6 +60,7 @@ impl Predictors {
             fragments: get("predictor", "native"),
             retention_time: get("rt_predictor", "native"),
             ion_mobility: get("im_predictor", "none"),
+            retention_time_replaced: rt_replaced(cfg),
         }
     }
 
@@ -67,6 +75,26 @@ impl Predictors {
     pub fn predicts_ion_mobility(&self) -> bool {
         self.ion_mobility != "none"
     }
+
+    /// Whether the engine would refuse to build the library with these predictors: native
+    /// fragment intensities, or native retention times that nothing replaces.
+    pub fn refused(&self) -> bool {
+        self.native_fragments() || (self.native_retention_time() && !self.retention_time_replaced)
+    }
+}
+
+/// `rt_im_train.finetune_deeplc = true` or `rt_im_train.multihead_calibration` > 0.
+fn rt_replaced(cfg: &Value) -> bool {
+    let rt = cfg.get("rt_im_train");
+    let finetune = rt
+        .and_then(|r| r.get("finetune_deeplc"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let heads = rt
+        .and_then(|r| r.get("multihead_calibration"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    finetune || heads > 0
 }
 
 /// Whether a configuration names its fragment predictor, which makes the predictors the
@@ -90,44 +118,62 @@ pub struct Plan {
     /// Whether any selected spectra file is a timsTOF diaPASEF `.d`.
     pub diapasef: bool,
     pub predictors: Predictors,
-    /// Set when the search would run on native predictions, or on a diaPASEF `.d` without
-    /// predicted 1/K0. The interface shows it and asks before starting.
+    /// Set when the search would build its library with the native models, which the
+    /// engine refuses. The interface shows it and does not start the search or the library
+    /// build: there is no override in the application.
+    pub blocked: Option<String>,
+    /// Set when the search would run on a diaPASEF `.d` without predicted 1/K0. The
+    /// interface shows it and asks before starting.
     pub warning: Option<String>,
 }
 
-/// The warning for a search on native fragment intensities, or on diaPASEF spectra without
-/// predicted 1/K0, or `None`.
-pub fn warning(p: &Predictors, diapasef: bool) -> Option<String> {
-    let fix = if diapasef {
-        "Install the analysis components and AlphaPeptDeep (or MS2PIP) on the Setup screen, \
-         so the diaPASEF recipe (AlphaPeptDeep, DeepLC and IM2Deep) can be used, or search \
-         a library predicted by DIA-NN or imported in the Library tab."
-    } else {
-        "Install MS2PIP (Setup screen) or AlphaPeptDeep together with the analysis \
-         components, choose the fasta-sidecars preset, or search a library predicted by \
-         DIA-NN or imported in the Library tab."
-    };
+/// Why a FASTA search on the built-in path cannot start with these predictors, and what
+/// to do instead, or `None` when the engine would build the library.
+pub fn blocked(p: &Predictors, diapasef: bool) -> Option<String> {
+    if !p.refused() {
+        return None;
+    }
+    let mut what = Vec::new();
     if p.native_fragments() {
-        let mut what = String::from("the engine's native fragment intensities");
-        if p.native_retention_time() {
-            what.push_str(" and native retention times");
-        }
-        if diapasef && !p.predicts_ion_mobility() {
-            what.push_str(", with no predicted ion mobility for these diaPASEF spectra");
-        }
-        return Some(format!(
-            "This search would predict its library with {what}. The native models are a \
-             fallback: they usually leave the first-pass search without confident anchors, so \
-             the retention-time window is unbounded and the search is many times slower and \
-             finds far fewer peptides. {fix}"
-        ));
+        what.push("native fragment intensities");
+    }
+    if p.native_retention_time() && !p.retention_time_replaced {
+        what.push("native retention times");
+    }
+    let components = if diapasef {
+        "AlphaPeptDeep (or MS2PIP) with the analysis components, so the diaPASEF recipe \
+         (AlphaPeptDeep, DeepLC and IM2Deep) can be used"
+    } else {
+        "MS2PIP or AlphaPeptDeep with the analysis components (DeepLC)"
+    };
+    Some(format!(
+        "This search cannot start: it would predict its library with the engine's {}. The \
+         engine no longer builds a library with its native models, because they usually \
+         leave the first-pass search without confident anchors, so the search is many \
+         times slower and finds far fewer peptides. To search this FASTA, install \
+         {components} on the Setup screen, choose \"Predict it with DIA-NN\" above to build \
+         the library with DIA-NN, or convert a DIA-NN library on the From a spectral \
+         library tab.",
+        what.join(" and ")
+    ))
+}
+
+/// The warning for a search on diaPASEF spectra without predicted 1/K0, or `None`. A
+/// search the engine would refuse is [`blocked`] instead.
+pub fn warning(p: &Predictors, diapasef: bool) -> Option<String> {
+    if p.refused() {
+        return None;
     }
     if diapasef && !p.predicts_ion_mobility() {
-        return Some(format!(
+        return Some(
             "These are diaPASEF spectra, and this search predicts no ion mobility (1/K0) for \
              its library and does not use the diaPASEF settings, so it uses less of the data \
-             than the diaPASEF recipe. {fix}"
-        ));
+             than the diaPASEF recipe. Install the analysis components and AlphaPeptDeep (or \
+             MS2PIP) on the Setup screen, so the diaPASEF recipe (AlphaPeptDeep, DeepLC and \
+             IM2Deep) can be used, or search a library predicted by DIA-NN or imported in the \
+             Library tab."
+                .to_string(),
+        );
     }
     None
 }
@@ -155,6 +201,7 @@ pub fn plan(
             recipe: None,
             note,
             diapasef,
+            blocked: blocked(&predictors, diapasef),
             warning: warning(&predictors, diapasef),
             predictors,
         }
@@ -168,8 +215,9 @@ pub fn plan(
     }
     if !replaceable {
         return keep(
-            "The selected settings name no fragment predictor, so the engine's native \
-             predictors would be used. Set predict_frag.predictor in Settings, or choose the \
+            "The selected settings name no fragment predictor, so the library would be \
+             predicted with the engine's native models, which it refuses. Set \
+             predict_frag.predictor and predict_frag.rt_predictor in Settings, or choose the \
              fasta-sidecars or diapasef preset."
                 .to_string(),
         );
@@ -211,13 +259,14 @@ pub fn plan(
             recipe: Some(name.to_string()),
             note,
             diapasef,
+            blocked: blocked(&predictors, diapasef),
             warning: warning(&predictors, diapasef),
             predictors,
         };
     }
     keep(
         "No fragment predictor was found (MS2PIP or AlphaPeptDeep, with DeepLC), so the \
-         engine's native predictors would be used."
+         built-in predictors cannot build this library."
             .to_string(),
     )
 }
@@ -315,6 +364,7 @@ mod tests {
         assert_eq!(p.recipe.as_deref(), Some(DIAPASEF_RECIPE));
         assert_eq!(p.predictors.ion_mobility, "im2deep");
         assert!(p.warning.is_none(), "{:?}", p.warning);
+        assert!(p.blocked.is_none(), "{:?}", p.blocked);
 
         let p = plan(
             Some("diann-library.json"),
@@ -326,6 +376,7 @@ mod tests {
         );
         assert_eq!(p.recipe.as_deref(), Some("fasta-sidecars.json"));
         assert!(p.warning.is_none());
+        assert!(p.blocked.is_none());
 
         // No AlphaPeptDeep: the diaPASEF recipe is skipped, MS2PIP is used, and the missing
         // 1/K0 is a warning.
@@ -338,6 +389,10 @@ mod tests {
             p.note
         );
         assert!(p.warning.as_deref().unwrap().contains("1/K0"));
+        assert!(
+            p.blocked.is_none(),
+            "a missing 1/K0 is asked about, not refused"
+        );
 
         // Only AlphaPeptDeep on 3D input: the second FASTA recipe.
         let only_peptdeep = |path: &Path| named(path) == "fasta-peptdeep.json";
@@ -346,10 +401,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Nothing usable: the preset is kept and the search would run on native predictions,
-    /// which is the warning the interface asks about.
+    /// Nothing usable: the preset is kept, it would build the library on the native models,
+    /// and the search is blocked with the reason and the fixes, not asked about.
     #[test]
-    fn nothing_usable_keeps_the_preset_and_warns() {
+    fn nothing_usable_keeps_the_preset_and_blocks_the_search() {
         let dir = recipes("none");
         let none = |_: &Path| false;
         let p = plan(
@@ -363,21 +418,66 @@ mod tests {
         assert_eq!(p.base.as_deref(), Some("diann-library.json"));
         assert_eq!(p.recipe, None);
         assert!(p.predictors.native_fragments());
-        let w = p.warning.expect("native predictions warn");
-        assert!(w.contains("native fragment intensities"), "{w}");
-        assert!(w.contains("unbounded"), "{w}");
-        assert!(w.contains("ion mobility"), "{w}");
-        assert!(w.contains("diaPASEF recipe"), "{w}");
+        let b = p.blocked.expect("native predictions block the search");
+        for needle in [
+            "cannot start",
+            "native fragment intensities and native retention times",
+            "Setup screen",
+            "Predict it with DIA-NN",
+            "From a spectral library",
+            "diaPASEF recipe",
+        ] {
+            assert!(b.contains(needle), "missing {needle:?}: {b}");
+        }
+        assert!(
+            p.warning.is_none(),
+            "a blocked search is not also asked about: {:?}",
+            p.warning
+        );
 
         let p = plan(None, &json!({}), true, false, &dir, &none);
         assert_eq!(p.base, None);
-        let w = p.warning.unwrap();
-        assert!(!w.contains("ion mobility"), "{w}");
+        let b = p.blocked.unwrap();
+        assert!(!b.contains("diaPASEF"), "{b}");
+        assert!(p.warning.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The application blocks what the engine refuses, and nothing else: native fragments,
+    /// or native retention times that no fine-tune or explicit multi-head calibration
+    /// replaces. The engine's opt-in does not unblock a search in the application.
+    #[test]
+    fn the_block_follows_the_engine_refusal() {
+        let blocked_of = |cfg: Value| blocked(&Predictors::of(&cfg), false);
+        assert!(blocked_of(json!({})).is_some());
+        let rt_native = json!({"predict_frag": {"predictor": "ms2pip"}});
+        let b = blocked_of(rt_native).unwrap();
+        assert!(b.contains("native retention times"), "{b}");
+        assert!(!b.contains("fragment intensities"), "{b}");
+        assert!(blocked_of(json!({"predict_frag": {"predictor": "ms2pip"},
+                                  "rt_im_train": {"finetune_deeplc": true}}))
+        .is_none());
+        assert!(blocked_of(json!({"predict_frag": {"predictor": "peptdeep"},
+                                  "rt_im_train": {"multihead_calibration": 80}}))
+        .is_none());
+        for heads in [json!(0), json!(null)] {
+            assert!(blocked_of(json!({"predict_frag": {"predictor": "ms2pip"},
+                                      "rt_im_train": {"multihead_calibration": heads}}))
+            .is_some());
+        }
+        let b = blocked_of(json!({"predict_frag": {"rt_predictor": "deeplc"}})).unwrap();
+        assert!(b.contains("native fragment intensities"), "{b}");
+        assert!(!b.contains("retention times."), "{b}");
+        assert!(blocked_of(json!({"predict_frag": {"predictor": "native",
+                                  "allow_native_predictors": true}}))
+        .is_some());
+        assert!(blocked_of(json!({"predict_frag": {"predictor": "ms2pip",
+                                  "rt_predictor": "deeplc"}}))
+        .is_none());
+    }
+
     /// A preset that names its fragment predictor is the user's choice: kept, never probed,
-    /// and warned about when it is native.
+    /// and blocked when it is native.
     #[test]
     fn a_preset_that_names_its_predictor_is_kept() {
         let dir = recipes("kept");
@@ -394,16 +494,17 @@ mod tests {
 
         let native = json!({"predict_frag": {"predictor": "native"}});
         let p = plan(Some("native.json"), &native, true, false, &dir, &never);
-        assert!(p.warning.unwrap().contains("native fragment intensities"));
+        assert!(p.blocked.unwrap().contains("native fragment intensities"));
+        assert!(p.warning.is_none());
 
-        // A saved settings file that names no predictor is kept, not replaced, and warned
-        // about: replacing it would drop the user's edits.
+        // A saved settings file that names no predictor is kept, not replaced, and blocked:
+        // replacing it would drop the user's edits.
         let saved = json!({"extract": {"gate_min_score": 0.5}});
         let p = plan(Some("saved.json"), &saved, false, false, &dir, &never);
         assert_eq!(p.base.as_deref(), Some("saved.json"));
         assert_eq!(p.recipe, None);
         assert!(p.note.contains("Set predict_frag.predictor"), "{}", p.note);
-        assert!(p.warning.unwrap().contains("native fragment intensities"));
+        assert!(p.blocked.unwrap().contains("native fragment intensities"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -415,6 +516,7 @@ mod tests {
             serde_json::from_str(include_str!("../../../configs/examples/diapasef.json")).unwrap();
         let p = Predictors::of(&diapasef);
         assert!(!p.native_fragments() && !p.native_retention_time() && p.predicts_ion_mobility());
+        assert!(!p.refused());
         for body in [
             include_str!("../../../configs/examples/fasta-sidecars.json"),
             include_str!("../../../configs/examples/fasta-peptdeep.json"),
@@ -423,6 +525,7 @@ mod tests {
             assert!(names_fragment_predictor(&v));
             let p = Predictors::of(&v);
             assert!(!p.native_fragments() && !p.native_retention_time());
+            assert!(!p.refused());
         }
         // The default preset names none, which is why the plan replaces it.
         let lib: Value =

@@ -900,7 +900,8 @@ count for `DeepLc`; `predictor` for `Ms2pip` and `Peptdeep`; `mbr.strategy` for 
 `im_predictor = im2deep` for `Im2deep`. A role can also be wanted without being required
 (`Role::wanted_by`: DeepLC under `library_irt = auto`, IM2Deep under `im_predictor = auto`),
 in which case a miss is a log line, not an error. A default native run therefore
-needs no interpreter, probes nothing, and works on a machine with no Python. A
+needs no interpreter, probes nothing, and works on a machine with no Python (a FASTA search
+on it also needs `predict_frag.allow_native_predictors`, docs/06). A
 role that is needed but unresolvable is a hard error in preflight, naming the
 field, the environment variable, and the modules required.
 

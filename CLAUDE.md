@@ -105,6 +105,17 @@ Key semantics:
   reuse the library it just built. `mumdia build-library` builds (or restores) that library
   without spectra through the same `stages/library_build.rs` as `run` and
   `run-experiment`, so a later FASTA search with the same settings hits the cache.
+- A FASTA search on the native predictors is refused before the digest (`run`,
+  `run-experiment`, `build-library`, `predict-frag`; `rt_health::refuse_native_predictors`):
+  native fragment intensities, or native retention times that no DeepLC fine-tune or
+  explicit `multihead_calibration` head count replaces. Both predictor keys default to
+  `native`, so a FASTA search without `--config` is refused too. The native models leave
+  the seed without confident anchors and find a fraction of the peptides (one desktop
+  search: 33.6k precursors against 129k on a DIA-NN-predicted library, same engine).
+  `predict_frag.allow_native_predictors = true` is the opt-in (`configs/examples/native.json`,
+  the CI smoke, the Python-free tests, `augment_library.py`'s internal predict-frag); it is
+  skipped from `canonical_json`, so hashes and artifacts do not move. The desktop blocks such a
+  search and never passes the opt-in. Imported-library searches are unaffected.
 - Standalone stages can be reused manually because inputs are path-addressable.
 - Both `convert` and `run` default `--top-peaks-ms2` to `0` (uncapped). The cap
   is destructive: `convert.rs:76-79` keeps only the top N peaks per MS2 spectrum

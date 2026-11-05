@@ -436,13 +436,17 @@ fn preflight(
     }
 
     // A FASTA search predicts its library with whatever the configuration names, and the
-    // engine default is the native models. Said here too, not only by `builtin_plan`, so a
-    // configuration from the settings editor or a batch is covered as well.
+    // engine default is the native models, which the engine refuses. Blocked here too, not
+    // only by `builtin_plan`, so a configuration from the settings editor or a batch is
+    // covered as well; the missing-1/K0 warning likewise.
     let mut warnings: Vec<String> = Vec::new();
     if req.fasta.is_some() {
         if let Ok(cfg) = predictors::read_preset(req.config.as_deref()) {
             let diapasef = predictors::any_diapasef(&req.mzml);
-            if let Some(w) = predictors::warning(&predictors::Predictors::of(&cfg), diapasef) {
+            let p = predictors::Predictors::of(&cfg);
+            if let Some(b) = predictors::blocked(&p, diapasef) {
+                blockers.push(b);
+            } else if let Some(w) = predictors::warning(&p, diapasef) {
                 warnings.push(w);
             }
         }

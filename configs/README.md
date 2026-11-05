@@ -6,7 +6,7 @@ edit it, and pass it with `--config`. Every field not mentioned keeps its defaul
 
 | file | needs | what it selects |
 |---|---|---|
-| `examples/native.json` | nothing beyond the binary | Extended features, the DIA apex settings, and the native predictors and `native_tda` rescorer. Runs on a machine with no Python at all. |
+| `examples/native.json` | nothing beyond the binary | Extended features, the DIA apex settings, and the native predictors and `native_tda` rescorer. Runs on a machine with no Python at all. It sets `predict_frag.allow_native_predictors`, because the engine otherwise refuses a FASTA search on the native predictors: they are for proving an installation, and find a fraction of what the other configurations find. |
 | `examples/fasta-sidecars.json` | MS2PIP, DeepLC, nn_torch | Digest a FASTA, predict fragment intensities with MS2PIP and retention time with DeepLC, rescore with `nn_torch`. One environment (`env/mumdia-deeplc.yml`) serves all three. |
 | `examples/diann-library.json` | DeepLC, PyTorch | Consume an imported DIA-NN library, re-predict its retention times once with the DeepLC base model (`rt_im_train.library_irt = auto`; DeepLC >= 4.5.0) and calibrate them per run, rescore with the PyTorch NN. This is the highest-sensitivity workflow measured so far (`docs/20_sensitivity_and_quantification_playbook.md`). |
 | `examples/fasta-peptdeep.json` | AlphaPeptDeep, DeepLC, PyTorch | The FASTA workflow with AlphaPeptDeep fragment intensities (`env/mumdia-peptdeep.yml`) in place of MS2PIP. |

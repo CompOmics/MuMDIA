@@ -337,6 +337,7 @@ pub fn run(p: BuildLibraryParams) -> Result<serde_json::Value> {
              before prediction builds its own library, and does not use the library cache."
         );
     }
+    crate::stages::rt_health::refuse_native_predictors(cfg, true, "build-library")?;
     require_build_interpreters(cfg, p.ion_mobility)?;
     // The placeholder iRT of `defer_deeplc_to_multihead` is filled in by a search's
     // multi-head calibration, so a library built here always carries its predictions.
