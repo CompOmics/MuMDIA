@@ -320,6 +320,18 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **`import_diann_lib.py` keeps proteins apart whose FASTA headers DIA-NN does not parse as
+  UniProt.** It read `Protein.Names` whenever the column existed, and for such headers
+  (`CON_sp|...` contaminants, the `REAL_sp|` / `ENTRAP_sp|` proteins of an entrapment FASTA)
+  DIA-NN writes the first word of the description or nothing: distinct contaminants merged
+  into groups named `Keratin,` or `Uncharacterized`, and mapped entrapment precursors became
+  `UNASSIGNED`. A precursor now takes `Protein.Names` only when every name is an entry name
+  (one word with an underscore) and `Protein.Ids` otherwise; `UNASSIGNED` remains for a
+  precursor with neither. On a DIA-NN library from a FASTA with contaminants, 18,891 of
+  5,895,802 target precursors moved off 155 description-word groups; on one from the
+  entrapment FASTA, 1,036,189 `UNASSIGNED` precursors and 1,365 description-word groups went
+  to 0, and the `_HUMAN` / `_ECOLI` flags the entrapment and species metrics read are now
+  present. Rows whose names are entry names are unchanged.
 - **The documentation no longer says the engine cannot read zstd parquet.** The workspace has
   built `parquet` with the `zstd` feature for some time, so a zstd table written outside the
   engine reads; `large_utf8` string columns remain the one Polars default it refuses. The
