@@ -196,7 +196,7 @@ def _is_entry_name(token):
     `Protein.Names` only for a FASTA header it parses as UniProt; for any other header
     (`CON_sp|...` contaminants, `REAL_sp|...` / `ENTRAP_sp|...` entrapment proteins) the
     cell is empty or the first word of the description (`Keratin,`, `Uncharacterized`)."""
-    return bool(token) and "_" in token and not any(c in token for c in " ,|	")
+    return bool(token) and "_" in token and not any(c in token for c in " ,|\t")
 
 
 def _resolve_protein(ids, names):
