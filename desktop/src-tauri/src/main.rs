@@ -540,20 +540,40 @@ fn preflight(
     }))
 }
 
+/// The output folders of searches this application is running now.
+fn running_dirs(state: &AppState) -> Vec<String> {
+    state
+        .runs
+        .lock()
+        .map(|r| {
+            r.values()
+                .map(|h| h.snapshot())
+                .filter(|s| s.status == "running" || s.status == "starting")
+                .map(|s| s.out_dir)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Past runs, read back from the folders they wrote.
 ///
 /// The interface remembers which folders it has used; the content of each entry
-/// comes from the folder itself, so a run deleted or moved on disk simply stops
-/// appearing rather than lingering as a stale row.
+/// comes from the folder itself. Every remembered folder comes back with a status, so
+/// a search moved on disk, one that failed or one still running is listed with the
+/// reason rather than silently left out (#282): completed searches first, newest first,
+/// then the others.
 #[tauri::command]
-fn history(dirs: Vec<String>) -> Vec<run::HistoryEntry> {
-    let mut out: Vec<run::HistoryEntry> = dirs
-        .iter()
-        .filter_map(|d| run::history_entry(Path::new(d)))
-        .collect();
-    // Newest first.
-    out.sort_by_key(|e| std::cmp::Reverse(e.finished_unix_ms));
-    out
+fn history(state: tauri::State<'_, AppState>, dirs: Vec<String>) -> Vec<run::HistoryItem> {
+    run::history_list(&dirs, &running_dirs(&state))
+}
+
+/// Classify one folder the user picked with "Add an existing output folder", so the
+/// interface can add it to History or say why it does not.
+#[tauri::command]
+fn history_check(state: tauri::State<'_, AppState>, dir: String) -> run::HistoryItem {
+    let key = run::dir_key(&dir);
+    let running = running_dirs(&state).iter().any(|d| run::dir_key(d) == key);
+    run::history_item(Path::new(&dir), running)
 }
 
 /// Peaks per MS2 spectrum for a chosen file, so the peak cap can be set from the
@@ -954,6 +974,7 @@ fn main() {
             config_overrides,
             peak_census,
             history,
+            history_check,
             preflight,
             start_run,
             run_state,

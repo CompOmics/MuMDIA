@@ -393,6 +393,21 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **Desktop: History lists every completed search, and says why a remembered folder is not
+  one (#282).** History recognised only the files a single `run` writes (`manifest.json`,
+  `psms_scored.parquet.report.json`), so every search run in "One experiment" mode, the
+  default for several files, was left out; and any folder it could not read was dropped
+  without a message. It now also reads an experiment folder (`experiment_manifest.json`,
+  `scored_combined.parquet.report.json`), including one pruned with `output.retain` and one
+  whose runs are named after their inputs. Every remembered folder is returned with a
+  status: completed searches first, newest first, then, greyed with the reason and a Remove
+  button, folders that are running, did not finish (no manifest), are not a search (a
+  library build, one run inside an experiment, no search output), or no longer exist. A
+  `build-library` folder, which writes a `manifest.json` too, is no longer listed as a
+  search. "Add an existing output folder…" adds a completed search from any folder and says
+  why when it refuses one. The remembered list keeps the 500 most recent folders instead of
+  50, and History says how many older ones the cap dropped.
+
 - **Desktop: "Open in visDIA" works on a results folder whose path has a non-ASCII
   character in it (Windows, #281).** The application read visDIA's piped output with
   `BufRead::lines`, which fails on the first line that is not UTF-8; Python on Windows writes

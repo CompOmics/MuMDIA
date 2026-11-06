@@ -109,18 +109,50 @@ const state = {
   libraryResult: null,
   // Output folders this application has used. The only thing it remembers; what
   // each one contains is read back from the folder.
-  known: JSON.parse(localStorage.getItem("mumdia.folders") || "[]"),
+  known: readStored("mumdia.folders", []),
+  // How many of the oldest remembered folders the cap has pushed out, so History can
+  // say so instead of losing them silently (#282).
+  knownDropped: readStored("mumdia.folders.dropped", 0),
 };
+
+function readStored(key, fallback) {
+  try {
+    const v = JSON.parse(localStorage.getItem(key) ?? "null");
+    const sameKind = Array.isArray(fallback) ? Array.isArray(v) : typeof v === typeof fallback;
+    return sameKind ? v : fallback;
+  } catch {
+    // A storage that cannot be read, or holds something that is not JSON, must not stop
+    // the application from starting.
+    return fallback;
+  }
+}
+
+// The remembered folders are paths only, so the cap is generous; History says how many
+// older folders it pushed out.
+const KNOWN_FOLDERS_MAX = 500;
+
+function saveKnownFolders() {
+  try {
+    localStorage.setItem("mumdia.folders", JSON.stringify(state.known));
+    localStorage.setItem("mumdia.folders.dropped", JSON.stringify(state.knownDropped));
+  } catch {
+    // A browser storage that refuses to write is not worth failing a search over.
+  }
+}
 
 function rememberFolder(dir) {
   if (!dir || state.known.includes(dir)) return;
   state.known.unshift(dir);
-  state.known = state.known.slice(0, 50);
-  try {
-    localStorage.setItem("mumdia.folders", JSON.stringify(state.known));
-  } catch {
-    // A browser storage that refuses to write is not worth failing a search over.
+  if (state.known.length > KNOWN_FOLDERS_MAX) {
+    state.knownDropped += state.known.length - KNOWN_FOLDERS_MAX;
+    state.known = state.known.slice(0, KNOWN_FOLDERS_MAX);
   }
+  saveKnownFolders();
+}
+
+function forgetFolder(dir) {
+  state.known = state.known.filter((d) => d !== dir);
+  saveKnownFolders();
 }
 
 // ── small helpers ───────────────────────────────────────────────────────────
@@ -298,6 +330,7 @@ async function init() {
   // Setup is the first screen, so its storage and managed-data cards are filled from the
   // start.
   $("storage-change").addEventListener("click", chooseStorage);
+  $("history-add").addEventListener("click", addHistoryFolder);
   $("storage-reset").addEventListener("click", () => setStorage(null));
   // With a folder chosen, the checkbox applies at once; without one, with the next choice.
   $("storage-move-envs").addEventListener("change", () => {
@@ -3320,53 +3353,123 @@ async function openVisdia(dir, btn, errEl, fasta) {
 }
 
 // ── history ─────────────────────────────────────────────────────────────────
+// Every remembered folder comes back from `history` with a status (#282): completed
+// searches first, newest first, then the folders that are not one, greyed, with the
+// reason and a Remove button that forgets the folder (it is never deleted).
+const HISTORY_STATUS = {
+  running: ["Running", "warn"],
+  incomplete: ["Did not finish", "bad"],
+  not_a_search: ["Not a completed search", "mute"],
+  not_found: ["Folder not found", "mute"],
+};
+
+function historyNote() {
+  const n = state.knownDropped;
+  banner(
+    $("history-note"),
+    n
+      ? `${fmtInt(n)} older folder${n === 1 ? " was" : "s were"} dropped from this ` +
+          `list, which keeps the ${fmtInt(KNOWN_FOLDERS_MAX)} most recent. Add one back ` +
+          `with "Add an existing output folder…".`
+      : ""
+  );
+}
+
+function historyCard(i) {
+  const esc = escHtml;
+  const e = i.entry;
+  if (i.status === "completed" && e) {
+    const r = e.results;
+    const when = e.finished_unix_ms ? new Date(e.finished_unix_ms).toLocaleString() : "";
+    const counts = r
+      ? `${fmtInt(r.peptides_1pct)} peptides at peptide_q_value 0.01 · ` +
+        `${fmtInt(r.protein_groups_1pct)} protein groups · ${esc(r.classifier)}` +
+        (e.experiment ? ` · experiment of ${fmtInt(r.n_runs)} runs` : "")
+      : "no scored table in this folder";
+    return (
+      `<div class="card"><div class="card-head"><div>` +
+      `<div class="card-title">${esc(e.name)}</div>` +
+      `<div class="card-sub">${counts}<br>${esc(when)} · ${esc(e.out_dir)}` +
+      (e.engine_version ? ` · ${esc(e.engine_version)}` : "") +
+      `</div></div>` +
+      `<div class="row">` +
+      (r ? `<button class="btn quiet" data-visdia="${esc(e.out_dir)}">Open in visDIA</button>` : "") +
+      `<button class="btn quiet" data-open="${esc(e.out_dir)}">Open folder</button>` +
+      `</div></div></div>`
+    );
+  }
+  const [label, tone] = HISTORY_STATUS[i.status] || [i.status, "mute"];
+  return (
+    `<div class="card dim"><div class="card-head"><div>` +
+    `<div class="card-title">${esc(i.name)} <span class="pill ${tone}">${esc(label)}</span></div>` +
+    `<div class="card-sub">${esc(i.reason || "")}<br>${esc(i.out_dir)}</div></div>` +
+    `<div class="row">` +
+    (i.status !== "not_found"
+      ? `<button class="btn quiet" data-open="${esc(i.out_dir)}">Open folder</button>`
+      : "") +
+    (i.status !== "running"
+      ? `<button class="btn quiet" data-forget="${esc(i.out_dir)}">Remove</button>`
+      : "") +
+    `</div></div></div>`
+  );
+}
+
 async function loadHistory() {
   const list = $("history-list");
-  let entries = [];
+  historyNote();
+  let items = [];
   try {
-    entries = await invoke("history", { dirs: state.known });
+    items = await invoke("history", { dirs: state.known });
   } catch (e) {
-    list.innerHTML = `<p class="hint">Could not read past searches: ${e}</p>`;
+    list.innerHTML = `<p class="hint">Could not read past searches: ${escHtml(e)}</p>`;
     return;
   }
-  if (!entries.length) {
+  if (!items.length) {
     list.innerHTML = `<p class="hint">No past searches yet.</p>`;
     return;
   }
-  const esc = (t) =>
-    String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  list.innerHTML = entries
-    .map((e) => {
-      const r = e.results;
-      const when = e.finished_unix_ms
-        ? new Date(e.finished_unix_ms).toLocaleString()
-        : "";
-      const counts = r
-        ? `${fmtInt(r.peptides_1pct)} peptides at peptide_q_value 0.01 · ` +
-          `${fmtInt(r.protein_groups_1pct)} protein groups · ${esc(r.classifier)}`
-        : "no scored table in this folder";
-      return (
-        `<div class="card"><div class="card-head"><div>` +
-        `<div class="card-title">${esc(e.name)}</div>` +
-        `<div class="card-sub">${counts}<br>${esc(when)} · ${esc(e.out_dir)}` +
-        (e.engine_version ? ` · ${esc(e.engine_version)}` : "") +
-        `</div></div>` +
-        `<div class="row">` +
-        (r
-          ? `<button class="btn quiet" data-visdia="${escHtml(e.out_dir)}">Open in visDIA</button>`
-          : "") +
-        `<button class="btn quiet" data-open="${esc(e.out_dir)}">Open folder</button>` +
-        `</div></div></div>`
-      );
-    })
-    .join("");
+  list.innerHTML = items.map(historyCard).join("");
   for (const b of list.querySelectorAll("[data-open]")) {
-    b.addEventListener("click", () => invoke("reveal", { path: b.dataset.open }));
+    b.addEventListener("click", () =>
+      invoke("reveal", { path: b.dataset.open }).catch((e) =>
+        banner($("history-error"), String(e))
+      )
+    );
+  }
+  for (const b of list.querySelectorAll("[data-forget]")) {
+    b.addEventListener("click", () => {
+      forgetFolder(b.dataset.forget);
+      loadHistory();
+    });
   }
   for (const b of list.querySelectorAll("[data-visdia]")) {
     b.addEventListener("click", () => openVisdia(b.dataset.visdia, b, $("history-error")));
   }
   refreshVisdiaButtons();
+}
+
+// "Add an existing output folder…": a search run elsewhere, or one this list lost. Added
+// only when the folder is a completed search; otherwise the reason is shown.
+async function addHistoryFolder() {
+  banner($("history-error"), "");
+  const chosen = await dialog.open({ directory: true, multiple: false });
+  if (!chosen) return;
+  const dir = Array.isArray(chosen) ? chosen[0] : chosen;
+  let item;
+  try {
+    item = await invoke("history_check", { dir });
+  } catch (e) {
+    banner($("history-error"), String(e));
+    return;
+  }
+  if (item.status !== "completed" && item.status !== "running") {
+    banner($("history-error"), `Not added: ${dir}. ${item.reason || item.status}`);
+    return;
+  }
+  // Already listed: move it to the front.
+  forgetFolder(dir);
+  rememberFolder(dir);
+  loadHistory();
 }
 
 // ── rendering ───────────────────────────────────────────────────────────────

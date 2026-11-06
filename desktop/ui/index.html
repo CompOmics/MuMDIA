@@ -727,12 +727,19 @@
 
   <!-- ─────────────────────────────── History ────────────────────────────── -->
   <section class="screen" id="screen-history">
-    <h1>Past searches</h1>
-    <p class="sub">
-      Read back from the folders themselves, so a search moved or deleted on disk
-      simply stops appearing.
-    </p>
+    <div class="head-row">
+      <div>
+        <h1>Past searches</h1>
+        <p class="sub">
+          Read back from the folders themselves. A remembered folder that is not a
+          completed search (moved, failed, still running) is listed below the searches
+          with the reason, and can be removed from the list.
+        </p>
+      </div>
+      <button class="btn quiet" id="history-add">Add an existing output folder…</button>
+    </div>
     <div id="history-error" class="banner bad" hidden></div>
+    <div id="history-note" class="banner warn" hidden></div>
     <div id="history-list"></div>
   </section>
 
