@@ -598,6 +598,20 @@ def main() -> int:
         c.ok(lfq.is_file() and pq.read_metadata(lfq).num_rows > 0,
              "the cross-run LFQ table is non-empty",
              str(pq.read_metadata(lfq).num_rows) if lfq.is_file() else "missing")
+        # The size factors of the cross-run LFQ (`quant.normalisation_scope`, #275): one row
+        # per run at the default scope `all`, no condition, and the scope in the manifest.
+        sf = exp / "lfq_size_factors.tsv"
+        if c.ok(sf.is_file(), "run-experiment writes lfq_size_factors.tsv"):
+            lines = [r.split("\t") for r in sf.read_text(encoding="utf-8").splitlines()]
+            c.ok(lines[0] == ["run", "condition", "size_factor", "n_features"]
+                 and [r[:2] for r in lines[1:]] == [["a", ""], ["b", ""]]
+                 and all(float(r[2]) > 0 for r in lines[1:]),
+                 "lfq_size_factors.tsv has one row per run and no condition", str(lines))
+            ln = ((m.get("experiment") or {}).get("lfq_normalisation") or {}) if em.is_file() else {}
+            c.ok(ln.get("scope") == "all" and ln.get("method") == "median_ratio"
+                 and str(ln.get("size_factors", "")).endswith("lfq_size_factors.tsv"),
+                 "the manifest records the normalisation scope and the size-factor table",
+                 str(ln))
         # The experiment-wide report: one peptides.tsv and one proteins.tsv at the
         # experiment root, selected on the experiment-wide q columns, with one quantity
         # column per run. There is deliberately no per-run TSV (the grouped q columns are

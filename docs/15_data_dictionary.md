@@ -1044,6 +1044,19 @@ Long-form MaxLFQ (peptide-level) or directLFQ (ion-level) matrix.
 | `quantity` | Float64 | no | intensity | LFQ profile value for that protein in that run |
 | `n_features` | Int32 | no | - | number of features contributing to the protein |
 
+### `lfq_size_factors.tsv` (`run-experiment`, `quant-lfq --size-factors-out`)
+
+The size factor of each run of the cross-run LFQ, at the experiment root, under every
+`quant.normalisation_scope` (docs/12, "Normalisation scope"). Tab-separated, one row per run
+in run-index order, with a header.
+
+| column | type | meaning |
+|---|---|---|
+| `run` | text | run name (`experiment.runs`); the input index for `quant-lfq` |
+| `condition` | text | the run's condition, empty when it has none |
+| `size_factor` | number | what the run's feature intensities were divided by before the MaxLFQ rollup: the median-of-ratios factor over every run (`all`), over the run's condition (`condition`), or 1 (`none`, a condition of one run, no complete feature) |
+| `n_features` | integer | the complete-case features the factor was estimated from (the features of its condition under `condition`); 0 when no factor was estimated |
+
 ---
 
 ## Stage D2: `align` (`stages/align.rs`)
@@ -1204,6 +1217,8 @@ provenance for reproducibility. Top-level `Manifest`:
 | `model_identities` | object | map of role (`rt_predictor`, `fragment_predictor`, `rescorer`, `feature_schema_id`) to identity string |
 | `artifacts` | object | map of logical name to `ArtifactRecord` |
 | `rt_calibration_missing` | array | only when the run had no retention-time calibration: one `{run, pass, calibration_status, n_train, cal_json}` per uncalibrated run (`stages/rt_health.rs`); `run-experiment` writes it in the `experiment` block of `experiment_manifest.json`, with `pass` `first_pass` or `second_pass` |
+| `lfq_normalisation` | object | `experiment_manifest.json` only, in its `experiment` block: `scope` (`all`, `condition`, `none`, `quant.normalisation_scope`), `method` (`median_ratio`, or `none` when no size factor was applied) and `size_factors`, the path of `lfq_size_factors.tsv` |
+| `conditions` | object | `experiment_manifest.json` only, in its `experiment` block, when any run has a condition (`--condition`, `--sample-sheet`, `experiment.conditions`): run name -> condition |
 | `run_inputs` | array | `experiment_manifest.json` only, in its `experiment` block, when the run names were derived from the inputs (no `--run-names`, `experiment.run_naming = "input"`): one `{name, source, input, converted}` per run, in run-index order, with `name` the run's directory and column name, `source` its index in the pooled tables, `input` the path as given and `converted` the mzML converted from a vendor input (null for an mzML input). `experiment.runs` lists the names under every naming |
 
 Each `ArtifactRecord`:

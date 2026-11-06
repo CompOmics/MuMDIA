@@ -597,6 +597,15 @@ enum Cmd {
         /// `quantity_normalised` of `quant-normalise` tables (then with `--normalize none`).
         #[arg(long, default_value = "quantity")]
         quantity_column: String,
+        /// The condition of each input, one per --inputs entry in the same order: the size
+        /// factors are then estimated within each condition's runs
+        /// (`quant.normalisation_scope = condition`). Omitted, over every input.
+        #[arg(long)]
+        condition: Vec<String>,
+        /// Also write each input's size factor as a tab-separated table (run, condition,
+        /// size_factor, n_features), the `lfq_size_factors.tsv` of `run-experiment`.
+        #[arg(long)]
+        size_factors_out: Option<String>,
         #[arg(long)]
         out: String,
     },
@@ -633,6 +642,10 @@ enum Cmd {
         /// together as one experiment rather than searched separately.
         #[arg(long, required = true)]
         mzml: Vec<String>,
+        /// With several --mzml: the condition of each run, one per --mzml in the same
+        /// order, as `run-experiment --condition`.
+        #[arg(long)]
+        condition: Vec<String>,
         #[arg(long)]
         out_dir: String,
         /// Library-input mode: consume a prebuilt precursor library (e.g. an
@@ -673,14 +686,26 @@ enum Cmd {
     RunExperiment {
         #[arg(long)]
         fasta: Option<String>,
-        /// One per run; repeat the flag (>= 2 runs).
-        #[arg(long)]
+        /// One per run; repeat the flag (>= 2 runs). May be left out when --sample-sheet
+        /// lists the inputs.
+        #[arg(long, required_unless_present = "sample_sheet")]
         mzml: Vec<String>,
         /// Optional per-run labels / subdir names, one per --mzml in the same order. Default:
         /// the input file names without their extensions, sanitised to portable directory
         /// names (`experiment.run_naming = "index"` gives r0..rN-1).
         #[arg(long)]
         run_names: Vec<String>,
+        /// The condition of each run, one per --mzml in the same order. Read by
+        /// `quant.normalisation_scope = condition`, which estimates the cross-run size
+        /// factors within each condition; recorded in the manifest under every scope.
+        /// Wins over --sample-sheet and `experiment.conditions`.
+        #[arg(long)]
+        condition: Vec<String>,
+        /// A tab-separated sample sheet with a header: `file` (required; relative to the
+        /// sheet's folder), `name` and `condition` (optional). Without --mzml it lists the
+        /// inputs; with --mzml it names and labels them, matched by path or file name.
+        #[arg(long)]
+        sample_sheet: Option<String>,
         #[arg(long)]
         out_dir: String,
         #[arg(long)]
@@ -2446,6 +2471,7 @@ fn real_main() -> Result<()> {
         Cmd::Run {
             fasta,
             mzml,
+            condition,
             out_dir,
             lib_precursors,
             lib_fragments,
@@ -2496,6 +2522,7 @@ fn real_main() -> Result<()> {
                     fasta: fasta.as_deref(),
                     mzmls: &mzml,
                     run_names: None,
+                    conditions: (!condition.is_empty()).then_some(condition.as_slice()),
                     inputs: &converted_from,
                     out_dir: &out_dir,
                     lib_precursors: lib_precursors.as_deref(),
@@ -2506,6 +2533,12 @@ fn real_main() -> Result<()> {
                     converted_mzml: &converted_mzml,
                 })?;
             } else {
+                if !condition.is_empty() {
+                    tracing::warn!(
+                        "run: --condition is ignored with a single --mzml; conditions group \
+                         the runs of an experiment"
+                    );
+                }
                 stages::run::run(stages::run::RunParams {
                     config: &cfg,
                     config_path: config.as_deref(),
@@ -2525,6 +2558,8 @@ fn real_main() -> Result<()> {
             fasta,
             mzml,
             run_names,
+            condition,
+            sample_sheet,
             out_dir,
             lib_precursors,
             lib_fragments,
@@ -2547,6 +2582,13 @@ fn real_main() -> Result<()> {
                 fasta.is_some() && lib_precursors.is_none(),
                 "run-experiment",
             )?;
+            let sheet = sample_sheet
+                .as_deref()
+                .map(mumdia::sample_sheet::read)
+                .transpose()?;
+            let inputs =
+                mumdia::sample_sheet::resolve(&mzml, &run_names, &condition, sheet.as_deref())?;
+            let (mzml, run_names, conditions) = (inputs.mzml, inputs.run_names, inputs.conditions);
             let converted_from = mzml.clone();
             let mzml = mumdia::raw::ensure_mzml_all(
                 &mzml,
@@ -2554,17 +2596,13 @@ fn real_main() -> Result<()> {
                 Some(std::path::Path::new(&out_dir)),
             )?;
             let converted_mzml = mumdia::raw::converted_paths(&converted_from, &mzml);
-            let run_names = if run_names.is_empty() {
-                None
-            } else {
-                Some(run_names.as_slice())
-            };
             stages::run_experiment::run(stages::run_experiment::RunExperimentParams {
                 config: &cfg,
                 config_path: config.as_deref(),
                 fasta: fasta.as_deref(),
                 mzmls: &mzml,
-                run_names,
+                run_names: run_names.as_deref(),
+                conditions: conditions.as_deref(),
                 inputs: &converted_from,
                 out_dir: &out_dir,
                 lib_precursors: lib_precursors.as_deref(),
@@ -2655,6 +2693,8 @@ fn real_main() -> Result<()> {
             method,
             normalize,
             quantity_column,
+            condition,
+            size_factors_out,
             out,
         } => {
             let by_fragment = method.eq_ignore_ascii_case("directlfq");
@@ -2667,7 +2707,51 @@ fn real_main() -> Result<()> {
                         "--normalize must be median_ratio, median, or none (got {normalize})"
                     )
                 })?;
-            stages::quant::run_lfq_combine(&inputs, by_fragment, norm, &quantity_column, &out)?;
+            let conditions: Vec<Option<String>> = if condition.is_empty() {
+                vec![None; inputs.len()]
+            } else {
+                if condition.len() != inputs.len() {
+                    anyhow::bail!(
+                        "--condition has {} entries for {} --inputs; give one per input",
+                        condition.len(),
+                        inputs.len()
+                    );
+                }
+                for c in &condition {
+                    if let Some(why) = mumdia_core::config::condition_label_problem(c) {
+                        anyhow::bail!("--condition {c:?} is not usable: {why}");
+                    }
+                }
+                condition
+                    .iter()
+                    .map(|c| Some(c.trim().to_string()))
+                    .collect()
+            };
+            let groups: Option<Vec<usize>> = (!condition.is_empty()).then(|| {
+                let mut seen: Vec<&str> = Vec::new();
+                condition
+                    .iter()
+                    .map(|c| {
+                        let c = c.trim();
+                        seen.iter().position(|s| *s == c).unwrap_or_else(|| {
+                            seen.push(c);
+                            seen.len() - 1
+                        })
+                    })
+                    .collect()
+            });
+            let (_, factors) = stages::quant::run_lfq_combine_grouped(
+                &inputs,
+                by_fragment,
+                norm,
+                groups.as_deref(),
+                &quantity_column,
+                &out,
+            )?;
+            if let Some(path) = &size_factors_out {
+                let runs: Vec<String> = (0..inputs.len()).map(|i| i.to_string()).collect();
+                stages::quant::write_size_factors_tsv(path, &runs, &conditions, &factors)?;
+            }
         }
         Cmd::QuantNormalise {
             inputs,

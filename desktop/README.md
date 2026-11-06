@@ -723,6 +723,20 @@ rather than let a user infer:
   by the same derivation (`run.rs`, `default_run_names`, tested against the engine's
   table `ci/run_name_cases.json`).
 
+For an experiment, each file has a **Condition** field and the options below the list
+have a **Normalisation** choice. The conditions are suggested from the file names with the
+rule visDIA's Quant QC page uses (a `Condition_X` / `CondX` token names `X`; otherwise the
+replicate token and the tokens every file shares are removed), until the user types one;
+"Suggest from the file names" restores the suggestions. They go to the engine as one
+`--condition` per file, in the order of the list, whenever any file has one, so the manifest
+records them (`experiment.conditions`). The Normalisation choice sets
+`quant.normalisation_scope` of the run's configuration: **None** (`none`), **All samples**
+(`all`, the default, which leaves the configuration as it is) or **Within each condition**
+(`condition`), which needs a condition for every file and is refused before the search
+starts otherwise. It changes the cross-run quantities (`lfq_<run>`, `normalised_<run>`) and
+`lfq_size_factors.tsv`, not the identifications (docs/12, "Normalisation scope"). The
+results view does not show the size-factor table yet.
+
 A DIA-NN-predicted library is built **once** for the whole selection, not per file:
 the library depends on the FASTA and the digest parameters, not on the spectra.
 

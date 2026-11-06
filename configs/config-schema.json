@@ -3885,6 +3885,24 @@
       "source_struct": "QuantConfig"
     },
     {
+      "path": "quant.normalisation_scope",
+      "name": "normalisation_scope",
+      "section": "quant",
+      "rust_type": "NormalisationScope",
+      "kind": "enum",
+      "optional": false,
+      "default": "all",
+      "default_text": "`all`",
+      "help": "Which runs the cross-run MaxLFQ of `run-experiment` estimates its median-ratio size factors over: `all` (default) over every run of the experiment, one factor per run; `condition` separately within each condition's runs, so replicates of one condition are made comparable to each other and the differences between conditions stay as measured; `none` applies no size factor (the raw per-run quantities). It governs `lfq_maxlfq.parquet` and its `.precursor` / `.peptide` siblings, so `lfq_<run>` of `proteins.tsv` and `normalised_<run>` of `precursors.tsv`; the per-run `quantity_<run>` columns stay raw under every scope. `condition` needs every run's condition (`--condition`, `--sample-sheet` or `experiment.conditions`), and is refused with `normalisation = stable_set`. The factors are written to `lfq_size_factors.tsv` at the experiment root under every scope (docs/12, \"Normalisation scope\"). Omitted from the canonical configuration at its default.",
+      "gates": [],
+      "source_struct": "QuantConfig",
+      "choices": [
+        "all",
+        "condition",
+        "none"
+      ]
+    },
+    {
       "path": "quant.normalisation_rank",
       "name": "normalisation_rank",
       "section": "quant",
@@ -4150,6 +4168,19 @@
         "input",
         "index"
       ]
+    },
+    {
+      "path": "experiment.conditions",
+      "name": "conditions",
+      "section": "experiment",
+      "rust_type": "BTreeMap<String, String>",
+      "kind": "other",
+      "optional": false,
+      "default": "{}",
+      "default_text": "{}",
+      "help": "The condition of each run, by run name: `{\"A01\": \"A\", \"B01\": \"B\"}`. Read by `run-experiment` for `quant.normalisation_scope = condition`; a run's condition from `--condition` or from `--sample-sheet` takes precedence over this map. Recorded in the manifest as `experiment.conditions`. Part of the canonical configuration only under `quant.normalisation_scope = condition`, where `run-experiment` writes every run's resolved condition into it before hashing, so the hash of every other configuration does not depend on it.",
+      "gates": [],
+      "source_struct": "ExperimentConfig"
     },
     {
       "path": "groups.window_groups",

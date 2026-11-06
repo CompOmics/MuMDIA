@@ -68,6 +68,7 @@ fn a_fasta_search_runs_to_completion_and_reports_itself() {
     let req = mumdia_console::run::Request {
         mzml: vec![mzml],
         experiment: false,
+        conditions: Vec::new(),
         out_dir: out.display().to_string(),
         fasta: Some(fasta),
         lib_precursors: None,
@@ -140,6 +141,7 @@ fn stopping_a_run_kills_it_and_leaves_no_temp_files() {
     let req = mumdia_console::run::Request {
         mzml: vec![mzml],
         experiment: false,
+        conditions: Vec::new(),
         out_dir: out.display().to_string(),
         fasta: Some(fasta),
         lib_precursors: None,

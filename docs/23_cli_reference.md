@@ -764,6 +764,12 @@ Options:
 
           [default: quantity]
 
+      --condition <CONDITION>
+          The condition of each input, one per --inputs entry in the same order: the size factors are then estimated within each condition's runs (`quant.normalisation_scope = condition`). Omitted, over every input
+
+      --size-factors-out <SIZE_FACTORS_OUT>
+          Also write each input's size factor as a tab-separated table (run, condition, size_factor, n_features), the `lfq_size_factors.tsv` of `run-experiment`
+
       --out <OUT>
 ```
 
@@ -806,6 +812,9 @@ Options:
 
       --mzml <MZML>
           Spectra file. Repeat the flag for several files; they are then rescored together as one experiment rather than searched separately
+
+      --condition <CONDITION>
+          With several --mzml: the condition of each run, one per --mzml in the same order, as `run-experiment --condition`
 
       --out-dir <OUT_DIR>
 
@@ -850,10 +859,16 @@ Options:
       --fasta <FASTA>
 
       --mzml <MZML>
-          One per run; repeat the flag (>= 2 runs)
+          One per run; repeat the flag (>= 2 runs). May be left out when --sample-sheet lists the inputs
 
       --run-names <RUN_NAMES>
           Optional per-run labels / subdir names, one per --mzml in the same order. Default: the input file names without their extensions, sanitised to portable directory names (`experiment.run_naming = "index"` gives r0..rN-1)
+
+      --condition <CONDITION>
+          The condition of each run, one per --mzml in the same order. Read by `quant.normalisation_scope = condition`, which estimates the cross-run size factors within each condition; recorded in the manifest under every scope. Wins over --sample-sheet and `experiment.conditions`
+
+      --sample-sheet <SAMPLE_SHEET>
+          A tab-separated sample sheet with a header: `file` (required; relative to the sheet's folder), `name` and `condition` (optional). Without --mzml it lists the inputs; with --mzml it names and labels them, matched by path or file name
 
       --out-dir <OUT_DIR>
 

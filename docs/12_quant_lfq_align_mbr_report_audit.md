@@ -131,6 +131,9 @@ unchanged. Unlike `quant` and
 `align`, `run_lfq_combine` writes no `<out>.report.json`: it calls `write_table` and
 logs, with no `ArtifactReport` (`quant.rs:720`). `--quantity-column` names the input
 intensity column (`quantity` by default; `quantity_normalised` for the tables below).
+`--condition`, once per input in input order, estimates the size factors within each
+condition's inputs (the `condition` scope below), and `--size-factors-out` writes them as the
+`lfq_size_factors.tsv` table `run-experiment` writes, with the input index as `run`.
 
 ### quant-normalise (and `run-experiment` with `quant.normalisation` on)
 Consumes one `peptide_quant.parquet` per run, in run order. Produces one
@@ -896,6 +899,94 @@ factors (`1.0`) without estimating a scale correction. Inspect the logged
 `MedianRatio` is blind to sample composition. On a mixed-proteome design every
 complete-case feature of a changed species pulls the median, so the factors shift every
 species, the background included, and the gaps between species do not change.
+
+### Normalisation scope (`quant.normalisation_scope`, `run-experiment`)
+
+`run-experiment` always runs the cross-run MaxLFQ with `MedianRatio` factors.
+`quant.normalisation_scope` chooses the runs they are estimated over:
+
+| scope | size factors | use |
+|---|---|---|
+| `all` (default) | one set over every run: the complete-case features of all runs | most proteins do not change between any two runs |
+| `condition` | one set per condition, over that condition's runs and their complete-case features; a condition with one run keeps 1 | conditions differ in composition (a spike-in, a mixed proteome, a strong perturbation): the replicates of a condition are aligned to each other, and what differs between conditions stays as measured |
+| `none` | 1 for every run | the raw per-run quantities; for data normalised elsewhere |
+
+Within a condition the factors are those `MedianRatio` gives on that condition's runs alone,
+so their geometric mean is 1 and the condition's average level is the measured one. The
+MaxLFQ profile then runs over all runs as before, from the divided features. The scope
+reaches `lfq_maxlfq.parquet` and its `.precursor` / `.peptide` siblings, and so `lfq_<run>`
+in `proteins.tsv` and `normalised_<run>` in `precursors.tsv`; the `quantity_<run>` columns of
+`peptides.tsv` and `precursors.tsv` are each run's raw quantity under every scope. The scope
+acts after quantification, so every scored and per-run quant table is the same under all
+three. `condition` cannot correct a loading difference between conditions: that difference
+and a composition difference look the same to an estimator that is not told which proteins
+are constant.
+
+The condition of each run comes from, in this order: `--condition` (once per `--mzml`, in the
+same order; an empty value leaves the run to the next source), the `condition` column of
+`--sample-sheet`, and `experiment.conditions` in the configuration (run name -> condition).
+Under `condition` every run must have one, and the error names the runs without; a condition
+with one run is warned about. A label must not be empty or hold a tab, a line break or another
+control character. `condition` is refused together with `quant.normalisation = stable_set`,
+whose fit is estimated over every run. The run conditions are recorded under
+`experiment.conditions` of the manifest whenever any run has one, and they are part of the
+configuration hash only under `condition`, where the experiment writes every run's condition
+into `experiment.conditions` of the configuration before hashing it: a configuration at the
+default scope hashes as before, with or without conditions.
+
+`run-experiment` writes `lfq_size_factors.tsv` at the experiment root under every scope (docs/15):
+one row per run with its condition and the factor its features were divided by, so a viewer
+need not derive the factors back from the tables. The manifest records
+`experiment.lfq_normalisation` (`scope`, `method`, `size_factors`). Under
+`quant.normalisation_lfq` the LFQ reads the stable-set quantities without size factors, and
+the table then lists 1 for every run. `mumdia report --experiment-dir` reads the LFQ tables
+the experiment wrote, so a rewritten report keeps the scope it ran with.
+
+The sample sheet (`--sample-sheet FILE`, `mumdia::sample_sheet`) is tab-separated with a
+header: `file` (required; a path relative to the sheet's folder, or absolute), `name` and
+`condition` (optional). Header names are compared without regard to case, blank lines and
+lines starting with `#` are skipped, and a byte-order mark and Windows line ends are accepted;
+another column is ignored with a warning, and a file listed twice is refused. Without `--mzml`
+the sheet lists the inputs in its row order. With `--mzml`, each input is matched to the row
+with the same path, else the same file name without regard to case (two rows of that file
+name are refused as ambiguous), and the sheet supplies names and conditions only; a row no
+input matches is warned about. `name` is all or none: it then works as `--run-names`, under
+the same rules, and an explicit `--run-names` wins over it as `--condition` wins over the
+`condition` column.
+
+Measured on the ProteoBench HYE modules (six runs each, A/B expected log2 human 0, yeast 1,
+E. coli -2), recomputing the cross-run LFQ of one existing experiment per module under each
+scope (`quant-lfq`, which `run-experiment` calls; scope `all` reproduced each experiment's
+three LFQ tables byte for byte). Precursor rows are `normalised_<run>` quantities quantified
+in at least two runs of each condition; CV is the median within-condition CV of the linear
+quantities; protein rows are `lfq_maxlfq.parquet` groups of one species in at least two runs
+of each condition:
+
+| module | scope | precursor median log2 A/B human / yeast / E. coli | equalised median abs. error | median CV | protein median log2 A/B human / yeast / E. coli | protein equalised error | protein median CV |
+|---|---|---|---|---|---|---|---|
+| Orbitrap AIF | none | -0.054 / 0.874 / -1.612 | 0.269 | 0.320 | -0.055 / 0.824 / -1.442 | 0.287 | 0.297 |
+| Orbitrap AIF | all | -0.096 / 0.841 / -1.661 | 0.262 | 0.174 | -0.097 / 0.789 / -1.504 | 0.285 | 0.094 |
+| Orbitrap AIF | condition | -0.044 / 0.892 / -1.612 | 0.263 | 0.172 | -0.046 / 0.841 / -1.450 | 0.279 | 0.093 |
+| Astral | none | -0.025 / 0.795 / -1.632 | 0.280 | 0.139 | -0.023 / 0.734 / -1.372 | 0.330 | 0.073 |
+| Astral | all | -0.072 / 0.748 / -1.679 | 0.280 | 0.138 | -0.071 / 0.687 / -1.420 | 0.336 | 0.071 |
+| Astral | condition | -0.025 / 0.795 / -1.632 | 0.280 | 0.138 | -0.023 / 0.734 / -1.373 | 0.331 | 0.071 |
+| timsTOF diaPASEF | none | 0.030 / 0.893 / -1.820 | 0.178 | 0.085 | 0.030 / 0.881 / -1.769 | 0.151 | 0.048 |
+| timsTOF diaPASEF | all | -0.029 / 0.834 / -1.880 | 0.177 | 0.085 | -0.030 / 0.822 / -1.828 | 0.155 | 0.048 |
+| timsTOF diaPASEF | condition | 0.029 / 0.892 / -1.821 | 0.178 | 0.085 | 0.029 / 0.880 / -1.770 | 0.151 | 0.048 |
+
+On the Orbitrap AIF runs, whose replicates differ in loading by up to 0.85 log2, `none` keeps
+that difference (CV 0.32 against 0.17) and `condition` removes it as well as `all` does. On
+all three modules `all` moves the A/B ratio of every species by one amount, -0.04 to -0.06
+log2, because the species that change pull the median of ratios (above);
+`condition` leaves the between-condition ratio as measured, so the human ratio stays where the
+raw quantities put it. Whether that is closer to the expected ratio then depends on the
+species: the shift of `all` brings E. coli nearer -2 and yeast further from 1, so the
+equalised precursor error is within 0.002 between the two on every module, and the protein
+error is 0.006 lower under `condition` on AIF and Astral and 0.004 lower on diaPASEF. The
+factors of `condition` equal the within-condition median-of-ratios estimate over complete
+ions to 4e-15 log2, and differ by at most 0.023 log2 (AIF) from the alignment of
+`bench/make_proteobench_submission.py --quantity aligned`, which also uses the ions missing in
+some replicates of a condition.
 
 ### Cross-run normalisation (`quant_norm.rs`, `quant.normalisation`, opt-in)
 

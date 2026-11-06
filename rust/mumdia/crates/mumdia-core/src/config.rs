@@ -7,6 +7,7 @@
 //! decoy scheme, the `minimal` feature set.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // Strategy enums
@@ -2985,6 +2986,20 @@ pub struct QuantConfig {
     /// quantities is unmeasured. Omitted from the canonical configuration at its default.
     #[serde(skip_serializing_if = "is_false")]
     pub normalisation_lfq: bool,
+    /// Which runs the cross-run MaxLFQ of `run-experiment` estimates its median-ratio size
+    /// factors over: `all` (default) over every run of the experiment, one factor per run;
+    /// `condition` separately within each condition's runs, so replicates of one condition
+    /// are made comparable to each other and the differences between conditions stay as
+    /// measured; `none` applies no size factor (the raw per-run quantities). It governs
+    /// `lfq_maxlfq.parquet` and its `.precursor` / `.peptide` siblings, so `lfq_<run>` of
+    /// `proteins.tsv` and `normalised_<run>` of `precursors.tsv`; the per-run `quantity_<run>`
+    /// columns stay raw under every scope. `condition` needs every run's condition
+    /// (`--condition`, `--sample-sheet` or `experiment.conditions`), and is refused with
+    /// `normalisation = stable_set`. The factors are written to `lfq_size_factors.tsv` at the
+    /// experiment root under every scope (docs/12, "Normalisation scope"). Omitted from the
+    /// canonical configuration at its default.
+    #[serde(skip_serializing_if = "NormalisationScope::is_all")]
+    pub normalisation_scope: NormalisationScope,
     /// `stable_set` only: the dimension of the subspace of the run space that holds the
     /// composition effects, fixed. Unset (the default), each iteration counts the
     /// eigenvalues of the most abundant complete ions' deviations above 3 times their
@@ -3057,6 +3072,49 @@ impl CrossRunNormalisation {
     pub fn is_off(&self) -> bool {
         *self == CrossRunNormalisation::Off
     }
+}
+
+/// Which runs the cross-run size factors are estimated over. See
+/// [`QuantConfig::normalisation_scope`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalisationScope {
+    /// One median-ratio factor per run over every run of the experiment (default).
+    #[default]
+    All,
+    /// Median-ratio factors estimated within each condition's runs.
+    Condition,
+    /// No size factor: the raw per-run quantities.
+    None,
+}
+
+impl NormalisationScope {
+    /// The default, which the canonical configuration omits.
+    pub fn is_all(&self) -> bool {
+        *self == NormalisationScope::All
+    }
+
+    /// The configuration spelling (`all`, `condition`, `none`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NormalisationScope::All => "all",
+            NormalisationScope::Condition => "condition",
+            NormalisationScope::None => "none",
+        }
+    }
+}
+
+/// Why a condition label is unusable, if it is: empty after trimming, or holding a tab,
+/// a line break or another control character (the label is a column value of
+/// `lfq_size_factors.tsv` and of a sample sheet).
+pub fn condition_label_problem(label: &str) -> Option<&'static str> {
+    if label.trim().is_empty() {
+        return Some("it is empty");
+    }
+    if label.chars().any(|c| c.is_control()) {
+        return Some("it holds a tab, a line break or another control character");
+    }
+    None
 }
 
 impl QuantConfig {
@@ -3171,6 +3229,7 @@ impl Default for QuantConfig {
             fixed_scan_halfwidth_scale: 0.0,
             normalisation: CrossRunNormalisation::Off,
             normalisation_lfq: false,
+            normalisation_scope: NormalisationScope::All,
             normalisation_rank: None,
             window_centre: WindowCentre::Apex,
             fragment_detail: false,
@@ -3878,6 +3937,15 @@ pub struct ExperimentConfig {
     /// a value, and the manifest records the names that were used.
     #[serde(skip_serializing)]
     pub run_naming: RunNaming,
+    /// The condition of each run, by run name: `{"A01": "A", "B01": "B"}`. Read by
+    /// `run-experiment` for `quant.normalisation_scope = condition`; a run's condition from
+    /// `--condition` or from `--sample-sheet` takes precedence over this map. Recorded in the
+    /// manifest as `experiment.conditions`. Part of the canonical configuration only under
+    /// `quant.normalisation_scope = condition`, where `run-experiment` writes every run's
+    /// resolved condition into it before hashing, so the hash of every other configuration
+    /// does not depend on it.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub conditions: BTreeMap<String, String>,
 }
 
 /// How `run-experiment` names its runs when `--run-names` is absent
@@ -3922,6 +3990,7 @@ impl Default for ExperimentConfig {
             rt_library_scope: RtLibraryScope::FirstRunOnly,
             overlap_front_threads: None,
             run_naming: RunNaming::Input,
+            conditions: BTreeMap::new(),
         }
     }
 }
@@ -4749,6 +4818,24 @@ impl Config {
             return Err(Invalid(
                 "quant.normalisation_rank must be >= 1 (unset chooses it per iteration).".into(),
             ));
+        }
+        if self.quant.normalisation_scope == NormalisationScope::Condition
+            && !self.quant.normalisation.is_off()
+        {
+            return Err(Invalid(
+                "quant.normalisation_scope = condition is not supported together with                  quant.normalisation = stable_set: the stable-set fit is estimated over every                  run. Use normalisation_scope = condition with normalisation = off, or                  stable_set with the default scope."
+                    .into(),
+            ));
+        }
+        if let Some((run, label, why)) = self
+            .experiment
+            .conditions
+            .iter()
+            .find_map(|(r, l)| condition_label_problem(l).map(|why| (r, l, why)))
+        {
+            return Err(Invalid(format!(
+                "experiment.conditions: the condition {label:?} of run {run:?} is not usable:                  {why}"
+            )));
         }
         let scan_window =
             self.quant.fixed_scan_halfwidth > 0 && self.quant.fixed_window_s == 0.0 && scale == 0.0;
@@ -5812,6 +5899,15 @@ impl Config {
     /// Canonical JSON of the fully-resolved config, for hashing into the
     /// manifest (docs/02_config_and_data_model.md).
     pub fn canonical_json(&self) -> String {
+        // The run conditions change a value only under `normalisation_scope = condition`;
+        // under any other scope they are left out, so the hash does not depend on them.
+        if !self.experiment.conditions.is_empty()
+            && self.quant.normalisation_scope != NormalisationScope::Condition
+        {
+            let mut c = self.clone();
+            c.experiment.conditions.clear();
+            return serde_json::to_string(&c).expect("config serializes");
+        }
         serde_json::to_string(self).expect("config serializes")
     }
 }
@@ -5932,6 +6028,69 @@ mod tests {
         let json = serde_json::to_string(&old).unwrap();
         assert!(json.contains(r#""im_window_sizing":"anchors""#), "{json}");
         assert!(json.contains(r#""im_window_multiplier":1.0"#), "{json}");
+    }
+
+    /// `quant.normalisation_scope` defaults to `all` and stays out of the canonical
+    /// configuration; `experiment.conditions` reaches it only under `condition`, so a
+    /// condition map changes the hash there and nowhere else. `condition` with
+    /// `stable_set`, and an empty or multi-line label, are refused.
+    #[test]
+    fn normalisation_scope_and_conditions_reach_the_canonical_json_only_under_condition() {
+        let c = Config::default();
+        assert_eq!(c.quant.normalisation_scope, NormalisationScope::All);
+        let base = c.canonical_json();
+        assert!(!base.contains("normalisation_scope"), "{base}");
+        assert!(!base.contains("conditions"), "{base}");
+        let all: Config = serde_json::from_str(
+            r#"{"quant": {"normalisation_scope": "all"},
+                "experiment": {"conditions": {"a": "A", "b": "B"}}}"#,
+        )
+        .unwrap();
+        assert!(all.validate().is_ok());
+        assert_eq!(
+            all.canonical_json(),
+            base,
+            "conditions under `all` change nothing"
+        );
+        let none: Config =
+            serde_json::from_str(r#"{"quant": {"normalisation_scope": "none"}}"#).unwrap();
+        assert!(none
+            .canonical_json()
+            .contains(r#""normalisation_scope":"none""#));
+        let mut cond: Config =
+            serde_json::from_str(r#"{"quant": {"normalisation_scope": "condition"}}"#).unwrap();
+        assert!(cond.validate().is_ok());
+        let bare = cond.canonical_json();
+        assert!(
+            bare.contains(r#""normalisation_scope":"condition""#),
+            "{bare}"
+        );
+        assert!(!bare.contains("conditions"), "{bare}");
+        cond.experiment
+            .conditions
+            .insert("a".to_string(), "A".to_string());
+        let one = cond.canonical_json();
+        assert!(one.contains(r#""conditions":{"a":"A"}"#), "{one}");
+        cond.experiment
+            .conditions
+            .insert("a".to_string(), "B".to_string());
+        assert_ne!(
+            cond.canonical_json(),
+            one,
+            "a changed label changes the hash"
+        );
+        for bad in [
+            r#"{"quant": {"normalisation_scope": "condition", "normalisation": "stable_set"}}"#,
+            r#"{"experiment": {"conditions": {"a": "  "}}}"#,
+            r#"{"experiment": {"conditions": {"a": "x\ty"}}}"#,
+        ] {
+            let c: Config = serde_json::from_str(bad).unwrap();
+            assert!(c.validate().is_err(), "{bad} validated");
+        }
+        assert!(serde_json::from_str::<Config>(
+            r#"{"quant": {"normalisation_scope": "per_condition"}}"#
+        )
+        .is_err());
     }
 
     /// The cross-run normalisation is off by default and none of its keys is part of the
