@@ -22,7 +22,6 @@
 //! application started and one it is merely looking at.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -901,8 +900,10 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
         let run_log = run_log.clone();
         let _ = tag;
         std::thread::spawn(move || {
-            let reader = BufReader::new(stream);
-            for line in reader.lines().map_while(Result::ok) {
+            // Lossy and to the end of the stream: the engine's Python workers inherit
+            // these pipes, and a line that is not UTF-8 (a cp1252 path) used to end the
+            // loop, close the pipe and make the worker's next write fail (issue #281).
+            crate::childio::for_each_line_lossy(stream, |line| {
                 if let Some(f) = &run_log {
                     use std::io::Write;
                     if let Ok(mut f) = f.lock() {
@@ -916,7 +917,7 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
                         s.log.drain(0..drop);
                     }
                 });
-            }
+            });
         });
     }
 

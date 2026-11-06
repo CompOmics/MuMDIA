@@ -4,6 +4,7 @@
 //! `main.rs` is the Tauri shell over this: it owns the window, the command surface
 //! and the run registry, and nothing else.
 
+pub mod childio;
 pub mod components;
 pub mod diann;
 pub mod engine;

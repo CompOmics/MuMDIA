@@ -38,7 +38,6 @@
 //! command line is the one recorded in `README.md`, so what this runs is what a
 //! user following the manual instructions would have typed.
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -1523,7 +1522,11 @@ fn run_step(
     let mut cmd = if is_diann {
         diann_command(exe)
     } else {
-        crate::engine::command(exe)
+        // The library helpers are Python: UTF-8 on the pipes whatever the code page,
+        // so a path with a non-ASCII character reaches the log as written (issue #281).
+        let mut c = crate::engine::command(exe);
+        crate::childio::python_utf8(&mut c);
+        c
     };
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(d) = cwd {
@@ -1562,9 +1565,10 @@ fn run_step(
     {
         let sink = Arc::clone(builder);
         joins.push(std::thread::spawn(move || {
-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                sink.log(line);
-            }
+            // Lossy and to the end: DIA-NN echoes paths in the OEM code page, and the
+            // Python helpers write in the ANSI one; a reader that stopped on such a line
+            // closed the pipe under a still-running child.
+            crate::childio::for_each_line_lossy(stream, |line| sink.log(line));
         }));
     }
     let status = child.wait().map_err(|e| e.to_string())?;

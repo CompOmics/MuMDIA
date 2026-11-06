@@ -12,13 +12,13 @@
 //! when the application closes; nothing else would, because it has no window of its own.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::childio;
 use crate::components::{self, Env};
 
 /// How long to wait for the viewer to print its address. Opening a large experiment
@@ -98,6 +98,32 @@ fn open_in_browser(url: &str) -> Result<(), String> {
         .map_err(|e| format!("could not open {url}: {e}"))
 }
 
+/// The command that starts visDIA on `dir`.
+fn viewer_command(python: &Path, dir: &str, fasta: Option<&str>, engine: Option<&Path>) -> Command {
+    let mut cmd = crate::engine::command(python);
+    cmd.args(["-m", "mumdia_viewer", dir, "--no-browser"]);
+    if let Some(f) = fasta.filter(|f| Path::new(f).is_file()) {
+        cmd.args(["--fasta", f]);
+    }
+    // The engine this application runs, for the raw mobilogram of a diaPASEF run (visDIA
+    // calls `mumdia mobilogram`). Passed as `MUMDIA_BIN` rather than `--engine`, so that a
+    // viewer installed before that option existed still starts.
+    if let Some(engine) = engine {
+        cmd.env("MUMDIA_BIN", engine);
+    }
+    // Python buffers a piped stdout, and the address line would then arrive only when
+    // the buffer filled, which for a quiet server is never.
+    cmd.env("PYTHONUNBUFFERED", "1");
+    // UTF-8 on the pipe whatever the code page. Without it Python on Windows writes the
+    // results path in cp1252, and a folder named with a non-ASCII character (µ) made the
+    // address line invalid UTF-8 (issue #281).
+    childio::python_utf8(&mut cmd);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
 /// Show `dir` in visDIA, starting a viewer if none is running for it, and return the
 /// address. `fasta` gives the protein sequences for the coverage views when the run
 /// did not record one (a search on a library DIA-NN built from that FASTA).
@@ -131,23 +157,8 @@ pub fn open(viewers: &Viewers, dir: &str, fasta: Option<&str>) -> Result<String,
         }
     }
 
-    let mut cmd = crate::engine::command(&python);
-    cmd.args(["-m", "mumdia_viewer", dir, "--no-browser"]);
-    if let Some(f) = fasta.filter(|f| Path::new(f).is_file()) {
-        cmd.args(["--fasta", f]);
-    }
-    // The engine this application runs, for the raw mobilogram of a diaPASEF run (visDIA
-    // calls `mumdia mobilogram`). Passed as `MUMDIA_BIN` rather than `--engine`, so that a
-    // viewer installed before that option existed still starts.
-    if let Ok((engine, _)) = crate::engine::resolve() {
-        cmd.env("MUMDIA_BIN", engine);
-    }
-    // Python buffers a piped stdout, and the address line would then arrive only when
-    // the buffer filled, which for a quiet server is never.
-    cmd.env("PYTHONUNBUFFERED", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let engine = crate::engine::resolve().ok().map(|(e, _)| e);
+    let mut cmd = viewer_command(&python, dir, fasta, engine.as_deref());
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("visDIA did not start ({}): {e}", python.display()))?;
@@ -170,10 +181,12 @@ pub fn open(viewers: &Viewers, dir: &str, fasta: Option<&str>) -> Result<String,
     {
         let tx = tx.clone();
         std::thread::spawn(move || {
-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                // After the address has been read nobody receives; keep draining.
+            // To the end of the stream, whatever it contains: a reader that stops closes
+            // the pipe, and the viewer's next write to it fails (issue #281). After the
+            // address has been read nobody receives; the sends fail and draining goes on.
+            childio::for_each_line_lossy(stream, |line| {
                 let _ = tx.send(line);
-            }
+            });
         });
     }
     drop(tx);
@@ -268,6 +281,55 @@ mod tests {
             serving_url("mumdia-viewer: serving x (run) at file:///etc/passwd"),
             None
         );
+    }
+
+    #[test]
+    fn the_viewer_is_started_with_utf8_output() {
+        let cmd = viewer_command(
+            Path::new("python"),
+            "D:/Données_µ/run",
+            None,
+            Some(Path::new("mumdia")),
+        );
+        let env: BTreeMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(env.get("PYTHONUTF8").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("PYTHONIOENCODING").map(String::as_str),
+            Some("utf-8")
+        );
+        assert_eq!(env.get("PYTHONUNBUFFERED").map(String::as_str), Some("1"));
+        assert_eq!(env.get("MUMDIA_BIN").map(String::as_str), Some("mumdia"));
+        // The folder reaches the child as it is, not as a lossy rendering.
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args[2], std::ffi::OsStr::new("D:/Données_µ/run"));
+    }
+
+    /// The address line of a viewer whose folder name its Python wrote in cp1252 is still
+    /// found, and the lines after it are still read.
+    #[test]
+    fn the_address_is_found_in_a_cp1252_line() {
+        let mut bytes = b"mumdia-viewer: serving C:/Donn".to_vec();
+        bytes.push(0xE9);
+        bytes.extend_from_slice(b"es_");
+        bytes.push(0xB5);
+        bytes.extend_from_slice(b"/run01 (run) at http://127.0.0.1:8050/AbC/\r\n");
+        bytes.extend_from_slice(b" * Serving Flask app\n");
+        let mut lines = Vec::new();
+        childio::for_each_line_lossy(&bytes[..], |l| lines.push(l));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            serving_url(&lines[0]).as_deref(),
+            Some("http://127.0.0.1:8050/AbC/")
+        );
+        assert_eq!(lines[1], " * Serving Flask app");
     }
 
     #[test]

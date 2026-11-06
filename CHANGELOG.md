@@ -390,6 +390,19 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **Desktop: "Open in visDIA" works on a results folder whose path has a non-ASCII
+  character in it (Windows, #281).** The application read visDIA's piped output with
+  `BufRead::lines`, which fails on the first line that is not UTF-8; Python on Windows writes
+  a pipe in the ANSI code page, so a folder such as `Données_µ` printed a cp1252 byte, the
+  reader stopped and closed the pipe, the address was never read, and visDIA died on its next
+  write with `OSError: [Errno 22] Invalid argument`. visDIA is now started with
+  `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8`, and every piped child (visDIA, engine runs,
+  the uv installs, DIA-NN and the library helpers) is read as bytes, decoded lossily and
+  drained to the end of its stream. Engine runs also pass `PYTHONIOENCODING=utf-8` to the
+  Python workers that inherit their output, unless it is already set, since the same closed
+  pipe could stop a worker. Reproduced on Windows with the managed visDIA environment on a
+  folder `Données_µ` before the change; served after it, by either half of the fix alone.
+
 - **`import_diann_lib.py` keeps proteins apart whose FASTA headers DIA-NN does not parse as
   UniProt.** It read `Protein.Names` whenever the column existed, and for such headers
   (`CON_sp|...` contaminants, the `REAL_sp|` / `ENTRAP_sp|` proteins of an entrapment FASTA)
