@@ -16,7 +16,10 @@ with several `--mzml`, which pays the calibration once.
    range; `scripts/assemble_survivors.py` renumbers the library to them and remaps the
    fragments. 41% of the 9-mer library and 29% of the 8-12-mer library were charge-1
    precursors above the top window and could never yield a fragment. Do this before the
-   decoys: every later stage scales with the row count.
+   decoys: every later stage scales with the row count. For a library MuMDIA builds from a
+   FASTA, `peptidoforms.precursor_mz_min` / `precursor_mz_max` set to the run's isolation
+   range do the same during the build, before anything is predicted (docs/05, "Precursor
+   m/z limits"); this recipe remains the route for an imported library.
 3. **Decoys** with `scripts/make_reverse_decoys.py` (8-12-mers: 1:09 h, 225 GB).
 4. **Seed search** as usual (9-mers 2:13 at 30 GB; 8-12-mers 10 min at 96 GB, 951 confident).
 5. **Multi-head RT calibration, sharded.** `deeplc_finetune.py --multihead 80` predicts about

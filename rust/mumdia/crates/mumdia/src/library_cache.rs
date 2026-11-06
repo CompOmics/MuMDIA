@@ -738,6 +738,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The library m/z limits enter the key only when set: at their defaults the key
+    /// material carries neither, so every existing cache entry stays valid, and a set
+    /// precursor or fragment range is a different library and a different key.
+    #[test]
+    fn the_mz_limits_move_the_key_only_when_set() {
+        let root = tmp("mzkey");
+        let fasta = root.join("x.fasta");
+        std::fs::write(&fasta, ">P1\nPEPTIDEK\n").unwrap();
+        let f = fasta.to_string_lossy().into_owned();
+        let m = key_material(&Config::default(), &f, false, false, ("0", "sha")).unwrap();
+        let text = m.to_string();
+        assert!(
+            !text.contains("precursor_mz") && !text.contains("fragment_mz"),
+            "{text}"
+        );
+        let key = |cfg: &mut Config| {
+            cache_for(&root.join("cache"), &fasta, cfg)
+                .key()
+                .to_string()
+        };
+        let base = key(&mut Config::default());
+        let mut prec = Config::default();
+        prec.peptidoforms.precursor_mz_min = Some(400.0);
+        prec.peptidoforms.precursor_mz_max = Some(1000.0);
+        let mut frag = Config::default();
+        frag.predict_frag.fragment_mz_min = Some(150.0);
+        let (k_prec, k_frag) = (key(&mut prec), key(&mut frag));
+        assert_ne!(base, k_prec);
+        assert_ne!(base, k_frag);
+        assert_ne!(k_prec, k_frag);
+        assert_eq!(key(&mut Config::default()), base);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// `build-library --ion-mobility on` passes `run_has_im = true`, as a search of a
     /// diaPASEF `.d` does: under `im_predictor = auto` with an IM2Deep interpreter that is a
     /// different library and a different key, and the two keys a search of either kind

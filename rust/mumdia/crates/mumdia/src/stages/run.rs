@@ -204,6 +204,11 @@ pub fn run(p: RunParams) -> Result<()> {
     if let Some(w) = crate::stages::rt_health::native_predictor_warning(&native) {
         warn!("{w}");
     }
+    if let Some(w) =
+        crate::stages::peptidoforms::mz_limits_ignored_warning(cfg, p.lib_precursors.is_some())
+    {
+        warn!("{w}");
+    }
     pre.step("preflight");
     let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
     // The output directory must take a write and a rename before any compute: the
@@ -370,6 +375,12 @@ pub fn run(p: RunParams) -> Result<()> {
             convert_and_record(&p, cfg, &spectra_dir, &mut man)?
         }
     };
+    if p.lib_precursors.is_none() {
+        crate::stages::peptidoforms::warn_if_windows_outside_range(
+            &cfg.peptidoforms,
+            &co.isolation_windows,
+        );
+    }
 
     // Imported library with the tag prefilter: it runs here, after convert and before the seed
     // search and the multi-head calibration, and its survivors become the library every later

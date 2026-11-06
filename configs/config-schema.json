@@ -1206,6 +1206,32 @@
       "source_struct": "PeptidoformsConfig"
     },
     {
+      "path": "peptidoforms.precursor_mz_min",
+      "name": "precursor_mz_min",
+      "section": "peptidoforms",
+      "rust_type": "Option<f64>",
+      "kind": "float",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Lowest precursor m/z the library keeps (Th, inclusive). Unset by default: every charge state of every peptidoform is emitted, as before. Set, a charge state whose precursor m/z lies below it is not emitted, so it is never predicted, written or searched; set it to the low edge of the acquisition's isolation windows. The decision is made per target/decoy pair (from the target's composition and the form's modifications), so a pair is kept or dropped together. Never part of the canonical configuration while unset, so the configuration hash, the library cache key and every artifact of a search without it stay as they were.",
+      "gates": [],
+      "source_struct": "PeptidoformsConfig"
+    },
+    {
+      "path": "peptidoforms.precursor_mz_max",
+      "name": "precursor_mz_max",
+      "section": "peptidoforms",
+      "rust_type": "Option<f64>",
+      "kind": "float",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Highest precursor m/z the library keeps (Th, inclusive). Unset by default; see `precursor_mz_min`. Set it to the high edge of the acquisition's isolation windows.",
+      "gates": [],
+      "source_struct": "PeptidoformsConfig"
+    },
+    {
       "path": "peptidoforms.unknown_modification",
       "name": "unknown_modification",
       "section": "peptidoforms",
@@ -1469,6 +1495,34 @@
       "default": false,
       "default_text": "false",
       "help": "Let a FASTA search build its library with the native fallback models. Default `false`: `run`, `run-experiment`, `build-library` and `predict-frag` refuse, before the digest, a FASTA library whose fragment intensities are native (`predictor = native`) or whose retention times are native (`rt_predictor = native`) with nothing that replaces them (`rt_im_train.finetune_deeplc`, or an explicit `rt_im_train.multihead_calibration` head count). The native models are a fallback: they usually leave the seed search without confident anchors, so the retention-time window is unbounded and the search is slow and finds far fewer peptides than one on MS2PIP or AlphaPeptDeep with DeepLC, or on an imported library. `true` runs the native models anyway, with the start-of-search warning; it is for a machine without the predictor environments, a test fixture, or a comparison of the predictors. Imported-library searches never read it. Never part of the canonical configuration: it decides whether a search may start, not what any artifact contains, so the configuration hash and every artifact are the same either way.",
+      "gates": [],
+      "source_struct": "PredictFragConfig"
+    },
+    {
+      "path": "predict_frag.fragment_mz_min",
+      "name": "fragment_mz_min",
+      "section": "predict_frag",
+      "rust_type": "Option<f64>",
+      "kind": "float",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Lowest fragment m/z the library keeps (Th, inclusive). Unset by default. Set, a predicted fragment below it is removed after prediction and before the `top_n_fragments` selection, so its slot goes to a fragment the MS2 scan range can record; the kept fragments keep their predicted intensities (no renormalisation). A candidate left with no fragment is dropped together with its target/decoy pair. It changes which fragments are scored, so it is opt-in and benchmark-gated. Never part of the canonical configuration while unset.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "PredictFragConfig"
+    },
+    {
+      "path": "predict_frag.fragment_mz_max",
+      "name": "fragment_mz_max",
+      "section": "predict_frag",
+      "rust_type": "Option<f64>",
+      "kind": "float",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Highest fragment m/z the library keeps (Th, inclusive). Unset by default; see `fragment_mz_min`.",
       "gates": [],
       "source_struct": "PredictFragConfig"
     },

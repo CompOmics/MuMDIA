@@ -80,6 +80,11 @@ fn preflight(p: &RunExperimentParams) -> Result<()> {
         _ => anyhow::bail!("library-input mode requires both --lib-precursors and --lib-fragments"),
     }
     let cfg = p.config;
+    if let Some(w) =
+        crate::stages::peptidoforms::mz_limits_ignored_warning(cfg, p.lib_precursors.is_some())
+    {
+        warn!("{w}");
+    }
     if cfg.rt_im_train.finetune_deeplc && cfg.predict_frag.deeplc_python.is_none() {
         anyhow::bail!("rt_im_train.finetune_deeplc requires predict_frag.deeplc_python");
     }
@@ -448,7 +453,7 @@ fn process_run(
     // (`predict_frag.defer_deeplc_to_multihead`).
     irt_placeholder: bool,
 ) -> Result<(Vec<String>, Vec<ChromTable>, Option<String>)> {
-    let co = convert_run(cfg, mzml, out, top_peaks_ms2, max_spectra)?;
+    let co = convert_run(cfg, mzml, out, top_peaks_ms2, max_spectra, library_input)?;
     let has_deeplc = cfg.predict_frag.deeplc_python.is_some();
     let mh_heads = cfg
         .rt_im_train
@@ -503,6 +508,9 @@ fn convert_run(
     out: &str,
     top_peaks_ms2: usize,
     max_spectra: usize,
+    // A library-input experiment searches its library as it is, so the configured
+    // precursor m/z range is not checked against the run's windows.
+    library_input: bool,
 ) -> Result<convert::ConvertOutputs> {
     let d = |name: &str| format!("{out}/{name}");
     std::fs::create_dir_all(out).ok();
@@ -527,6 +535,12 @@ fn convert_run(
         tdf: convert::TdfParams::from_config(&cfg.convert),
     })?;
     crate::raw::discard_converted(mzml);
+    if !library_input {
+        crate::stages::peptidoforms::warn_if_windows_outside_range(
+            &cfg.peptidoforms,
+            &co.isolation_windows,
+        );
+    }
     Ok(co)
 }
 
@@ -1492,6 +1506,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 &d(&names[i]),
                 p.top_peaks_ms2,
                 p.max_spectra,
+                library_input,
             )
         };
         if plan.is_auto() {
@@ -1633,7 +1648,14 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
              the library's retention times (experiment.overlap_front_threads)"
         );
         let out0 = d(&names[0]);
-        let co0 = convert_run(cfg, &p.mzmls[0], &out0, p.top_peaks_ms2, p.max_spectra)?;
+        let co0 = convert_run(
+            cfg,
+            &p.mzmls[0],
+            &out0,
+            p.top_peaks_ms2,
+            p.max_spectra,
+            library_input,
+        )?;
         let seed0 = seed_run(cfg, &ch, &lib_p_base, &lib_f, &co0, &out0, None)?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(front_threads)
@@ -1670,6 +1692,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                             &d(name),
                             p.top_peaks_ms2,
                             p.max_spectra,
+                            library_input,
                         )?);
                     }
                     if cancel.load(Ordering::SeqCst) {

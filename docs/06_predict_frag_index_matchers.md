@@ -255,6 +255,24 @@ candidate's iRT and every fragment intensity is checked for finiteness and a
 non-finite value is a hard error. A NaN from a misbehaving sidecar would otherwise
 misorder the top-N sort and corrupt every downstream spectral-similarity feature.
 
+**Fragment m/z limits** (opt-in). With `predict_frag.fragment_mz_min` and/or
+`fragment_mz_max` set (Th, inclusive), every fragment outside the range is removed after
+the finite guard and before the top-N selection (`retain_fragments`). The order matters
+both ways: filtering before prediction would change what the models see and how their
+intensities are normalised, and filtering after the top-N would leave a slot to a
+fragment the MS2 scan range cannot record. The kept fragments keep their predicted
+intensities; nothing is renormalised. A candidate left without a fragment is dropped
+together with every candidate sharing its pair key, as an unpredicted one is
+(`drop_unpredicted`), so a target never stays while its decoy leaves; a range that
+leaves no candidate is an error. The report records `fragments_out_of_mz_range`,
+`candidates_dropped_without_fragments_in_range` and
+`pairs_dropped_without_fragments_in_range` (and the two limits under `params`) only when
+a limit is set; without one the code path is the one it always was. The limits change
+which fragments are scored, so they stay off by default until they are measured with
+seeds on two acquisitions and an entrapment pool (CLAUDE.md, acquisition-specific
+fragment caps). The precursor-side counterpart, which changes no identification inside
+its range, is `peptidoforms.precursor_mz_min` / `precursor_mz_max` (docs/05).
+
 **top-N and candidate_id** (`predict_frag.rs:155-173`). For each candidate,
 fragments are ranked by predicted intensity descending, truncated to
 `top_n_fragments`, then re-sorted ascending to restore stored order; an in-place
@@ -723,6 +741,7 @@ so the struct holds exactly these fields and unknown keys are rejected):
 | `charge2_from_precursor_charge` | `2` | precursor charge at/above which charge-2 fragments are added (was 3; lowered to keep the ~16% of charge-2 precursors' doubly-charged transitions) |
 | `charge_by_basic_residues` | `false` | composition cap: keep a fragment at charge z only if `z <= 1 + (#R+#H+#K in that fragment)` and `z <= precursor charge`. Supersedes `charge2_from_precursor_charge`. Benchmark-gated, it changes the scored transition set. Pairs with `peptidoforms.charge_by_basic_residues` (`config.rs:318`) |
 | `top_n_fragments` | `6` | fragments kept per candidate after intensity ranking; the FASTA + sidecar configurations set 12, the count the DIA-NN library ships and the one the HCDch2 measurement used |
+| `fragment_mz_min` / `fragment_mz_max` | unset | fragment m/z limits (inclusive), applied after prediction and before the top-N selection; opt-in and benchmark-gated, see "Fragment m/z limits" |
 | `ms2pip_model` | `"HCDch2"` | MS2PIP model name passed as argv; `*ch2` models predict the doubly charged series too |
 | `ms2pip_python` | `None` | interpreter for the MS2PIP sidecar; required when `predictor=ms2pip`, else the stage errors |
 | `deeplc_python` | `None` | interpreter for the DeepLC sidecar; required when `rt_predictor=deeplc`, else the stage errors |

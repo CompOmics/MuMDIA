@@ -654,6 +654,7 @@ already written at `{:.6}` and the worker casts to f32 regardless.
 | `charge_min` | 2 | lowest precursor charge |
 | `charge_max` | 3 | highest precursor charge |
 | `charge_by_basic_residues` | `false` | when true, ignore `charge_min`/`charge_max` and emit charges `1..=1+(#R+#H+#K)` per peptide (proton capacity: N-terminus plus one per basic residue) |
+| `precursor_mz_min` / `precursor_mz_max` | unset | inclusive precursor m/z limits; a charge state outside them is not emitted, decided per target/decoy pair (docs/05, "Precursor m/z limits") |
 | `unknown_modification` | `error` | `error` or `skip` |
 
 `charge_by_basic_residues` restricts the enumerated precursor charge states to
@@ -689,6 +690,7 @@ modifications", has the behaviour.
 | `charge2_from_precursor_charge` | 2 | add charge-2 fragments for precursor charge >= this |
 | `charge_by_basic_residues` | `false` | when true, keep a b/y fragment at charge z only if `z <= 1+(basic residues within the fragment)` and `z <= precursor charge`; supersedes `charge2_from_precursor_charge` |
 | `top_n_fragments` | 6 | fragments kept per candidate |
+| `fragment_mz_min` / `fragment_mz_max` | unset | inclusive fragment m/z limits applied before the top-N selection; opt-in (docs/06, "Fragment m/z limits") |
 | `ms2pip_model` | `"HCDch2"` | MS2PIP model name; the `*ch2` models predict doubly charged fragments too |
 | `ms2pip_python` | `None` | interpreter for MS2PIP sidecar; `"auto"` discovers one (`docs/13_sidecars.md`) |
 | `deeplc_python` | `None` | interpreter for DeepLC sidecar |

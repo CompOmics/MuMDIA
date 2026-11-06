@@ -468,6 +468,69 @@ grep -q "prescreen.tag_prefilter filters the peptidoforms on a run's spectra" \
     || { tail -5 "$work/buildlib_prescreen.log"; echo "the prefilter refusal does not name it"; exit 1; }
 echo "    ok: build-library wrote the run's library byte for byte, a FASTA run found it, --ion-mobility on kept the key, a prefilter was refused"
 
+# 4m. Precursor m/z limits (`peptidoforms.precursor_mz_min` / `precursor_mz_max`, #276), set
+#     to the middle half of the fixture's isolation-window span. Every library precursor
+#     lies inside, targets and decoys stay equal in number, the library keeps its
+#     contiguous candidate ids and ascending m/z, the run warns that its windows extend
+#     past the range and completes, and the identifications inside the range are those of
+#     the unlimited run (by (peptidoform, charge) on precursors.tsv).
+echo "=== smoke: precursor m/z limits"
+mzl="$work/mzlimits"
+mkdir -p "$mzl"
+"$PY" - "$cfg" "$work/out/spectra/isolation_windows.parquet" "$mzl/cfg.json" "$mzl/range.json" <<'PYEOF'
+import json, sys
+import pyarrow.parquet as pq
+c = json.load(open(sys.argv[1]))
+w = pq.read_table(sys.argv[2]).to_pydict()
+lo, hi = min(w["lower"]), max(w["upper"])
+span = hi - lo
+rlo, rhi = round(lo + span / 4, 3), round(hi - span / 4, 3)
+c.setdefault("peptidoforms", {}).update({"precursor_mz_min": rlo, "precursor_mz_max": rhi})
+json.dump(c, open(sys.argv[3], "w"), indent=2)
+json.dump({"min": rlo, "max": rhi, "windows": [lo, hi]}, open(sys.argv[4], "w"))
+print(f"precursor m/z limits {rlo}-{rhi} inside the windows {lo:.2f}-{hi:.2f}")
+PYEOF
+"$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
+    --out-dir "$mzl/out" --config "$mzl/cfg.json" --threads 2 > "$mzl/run.log" 2>&1 \
+    || { tail -20 "$mzl/run.log"; echo "the run with precursor m/z limits failed"; exit 1; }
+grep -q "does not cover this run's isolation" "$mzl/run.log" \
+    || { echo "the run did not warn that its windows extend past the precursor m/z range"; exit 1; }
+"$PY" - "$mzl/range.json" "$mzl/out" "$work/out" <<'PYEOF'
+import csv, json, os, sys
+import pyarrow.parquet as pq
+r = json.load(open(sys.argv[1]))
+lo, hi, out, ref = r["min"], r["max"], sys.argv[2], sys.argv[3]
+tol = 1e-6
+lib = pq.read_table(os.path.join(out, "fragment_library_precursors.parquet")).to_pydict()
+full = pq.read_table(os.path.join(ref, "fragment_library_precursors.parquet")).to_pydict()
+mz = lib["precursor_mz"]
+assert mz and all(lo - tol <= m <= hi + tol for m in mz), (lo, hi, min(mz), max(mz))
+assert lib["candidate_id"] == list(range(len(mz))), "candidate_id is not 0..n"
+assert all(a <= b for a, b in zip(mz, mz[1:])), "precursor_mz is not ascending"
+labels = lib["label"]
+assert labels.count("target") == labels.count("decoy") > 0, (labels.count("target"), labels.count("decoy"))
+# Exactly the unlimited library's precursors inside the range, no more and no fewer.
+key = lambda t, i: (t["peptidoform"][i], t["charge"][i], t["label"][i])
+want = {key(full, i) for i, m in enumerate(full["precursor_mz"]) if lo - tol <= m <= hi + tol}
+got = {key(lib, i) for i in range(len(mz))}
+assert got == want, (len(got), len(want), sorted(want - got)[:5], sorted(got - want)[:5])
+assert len(got) < len(full["precursor_mz"]), "the limits removed nothing"
+rep = json.load(open(os.path.join(out, "peptidoforms.parquet.report.json")))
+assert rep["stats"]["out_of_mz_range_rows"] > 0, rep["stats"]
+assert rep["params"]["precursor_mz_min"] == lo, rep["params"]
+def ids(d):
+    rows = csv.DictReader(open(os.path.join(d, "precursors.tsv")), delimiter="\t")
+    return {(x["precursor"], x["charge"]) for x in rows
+            if lo - tol <= float(x["precursor_mz"]) <= hi + tol}
+inside, limited = ids(ref), ids(out)
+n = len(inside & limited)
+print(f"precursor m/z limits: library {len(got)} of {len(full['precursor_mz'])} precursors; "
+      f"{n} of the {len(inside)} precursors the unlimited run accepts inside the range, "
+      f"{len(limited)} accepted with the limits")
+assert inside and n >= 0.9 * len(inside), (n, len(inside))
+PYEOF
+echo "    ok: precursor m/z limits kept exactly the in-range precursors, in pairs, and their identifications"
+
 # 4b. A malformed retention time must not abort the run.
 #
 #     Regression test for a reproduced crash: one `NaN` scan start time in one scan of

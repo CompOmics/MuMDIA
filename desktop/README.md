@@ -497,6 +497,20 @@ GlyGly `--no-cut-after-mod` rule is passed only for a rule that cuts after K. Th
 application's rule parser (`enzymes.rs`) mirrors the engine's and is tested on the same
 `test_vectors`.
 
+**Precursor and fragment m/z limits are digest parameters too.** The Digest card has a
+"Precursor m/z" and a "Fragment m/z" range, both empty by default, meaning no limit. A
+set precursor range reaches the built-in path as `peptidoforms.precursor_mz_min` /
+`precursor_mz_max`, the DIA-NN build as `--min-pr-mz` / `--max-pr-mz`, and the
+search-space estimate, which counts only the charge states whose approximate m/z (from
+the peptide length at a mean residue mass) lies inside. A fragment range reaches
+`predict_frag.fragment_mz_min` / `fragment_mz_max` and DIA-NN's `--min-fr-mz` /
+`--max-fr-mz`, and is passed to the decoys' prediction as `predict_decoys.py
+--diann-arg`, so targets and decoys keep fragments from the same range. An empty field is
+neither written into the configuration nor passed to DIA-NN (which then applies its own
+defaults), so a request without limits is the one it always was. The natural precursor
+range is the span of the acquisition's isolation windows; a narrower one loses the
+identifications outside it. There is no automatic range from the selected spectra yet.
+
 **A predicted library is cached, content-addressed.** It depends on the FASTA's bytes
 and the digest parameters and on nothing else: not the mzML, not the thread count. So
 `library_cache_dir` keys it on a digest of the FASTA plus every parameter that changes
@@ -506,7 +520,8 @@ DIA-NN version is in the key because its version changes what it predicts, and r
 a library across versions would silently change results. The thread count is
 deliberately out, because including it would miss the cache for nothing. The cleavage
 rule enters the key only when it is not Trypsin/P, the rule every earlier build used,
-so libraries cached before the choice existed are still found.
+so libraries cached before the choice existed are still found; the m/z limits enter it
+only when set, for the same reason.
 
 `cached_library` requires **both** tables. A build interrupted between writing them
 would otherwise read as a usable cache entry and the search would fail on a missing

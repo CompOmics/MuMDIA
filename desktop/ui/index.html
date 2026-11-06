@@ -342,8 +342,27 @@
             <span class="dash">to</span>
             <input type="number" id="d-maxz" value="3" min="1" max="10" />
           </div>
+          <div class="row">
+            <label for="d-prmin">Precursor m/z</label>
+            <input type="number" id="d-prmin" min="1" step="any" placeholder="any" />
+            <span class="dash">to</span>
+            <input type="number" id="d-prmax" min="1" step="any" placeholder="any" />
+          </div>
+          <div class="row">
+            <label for="d-frmin">Fragment m/z</label>
+            <input type="number" id="d-frmin" min="1" step="any" placeholder="any" />
+            <span class="dash">to</span>
+            <input type="number" id="d-frmax" min="1" step="any" placeholder="any" />
+          </div>
         </div>
         <p class="hint" id="d-enzyme-note"></p>
+        <p class="hint">
+          Empty m/z fields set no limit. A precursor range (for example the span of the
+          acquisition's isolation windows) leaves out precursors the instrument never
+          isolates, which makes the library smaller and its prediction faster; a range
+          narrower than the windows loses the identifications outside it. The fragment
+          range is optional and changes which fragments are scored.
+        </p>
         <p class="hint">
           These decide the search space whichever way the library is built. With the
           built-in predictors they are written into the run's configuration on top of

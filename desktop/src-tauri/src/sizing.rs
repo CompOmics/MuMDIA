@@ -163,6 +163,43 @@ pub struct SpaceRequest {
     /// `--threads`, when the Search tab sets it.
     #[serde(default)]
     pub threads: Option<usize>,
+    /// The precursor m/z limits the Digest card sets (`peptidoforms.precursor_mz_min` /
+    /// `precursor_mz_max`), unset by default. The FASTA estimate then counts only the
+    /// charge states whose approximate m/z lies inside ([`charges_in_range`]).
+    #[serde(default)]
+    pub precursor_mz_min: Option<f64>,
+    #[serde(default)]
+    pub precursor_mz_max: Option<f64>,
+}
+
+/// The mean monoisotopic residue mass of a tryptic proteome, in Da: the estimate's stand-in
+/// for a peptide's composition, which it does not track. An estimate, not the engine's
+/// mass model, which decides the actual library.
+const MEAN_RESIDUE_MASS: f64 = 111.1;
+/// Water plus one proton per charge, rounded: the estimate's terminal and charge masses.
+const TERMINI_MASS: f64 = 18.01;
+const CHARGE_MASS: f64 = 1.007;
+
+/// How many of the charges `min_charge..=max_charge` put a peptide of `len` residues inside
+/// the precursor m/z limits, from its approximate mass (`len` times
+/// [`MEAN_RESIDUE_MASS`]); every charge when no limit is set. Modifications are not
+/// counted: the estimate sizes the search, the engine's mass model draws the line.
+fn charges_in_range(len: usize, req: &SpaceRequest) -> f64 {
+    let all = (req.max_charge.saturating_sub(req.min_charge) + 1) as f64;
+    if req.precursor_mz_min.is_none() && req.precursor_mz_max.is_none() {
+        return all;
+    }
+    let (lo, hi) = (
+        req.precursor_mz_min.unwrap_or(f64::NEG_INFINITY),
+        req.precursor_mz_max.unwrap_or(f64::INFINITY),
+    );
+    let mass = len as f64 * MEAN_RESIDUE_MASS + TERMINI_MASS;
+    (req.min_charge.max(1)..=req.max_charge)
+        .filter(|&z| {
+            let mz = (mass + z as f64 * CHARGE_MASS) / z as f64;
+            mz >= lo && mz <= hi
+        })
+        .count() as f64
 }
 
 fn one() -> usize {
@@ -303,7 +340,6 @@ pub fn fasta_space(path: &Path, req: &SpaceRequest) -> Result<(u64, u64), String
             }
         }
     }
-    let charges = (req.max_charge.saturating_sub(req.min_charge) + 1) as f64;
     // Peptide hash -> whether a protein starts with it. The engine's flag is an OR over
     // every occurrence, so a later occurrence at a protein N-terminus adds the forms the
     // first, internal one did not count.
@@ -323,7 +359,8 @@ pub fn fasta_space(path: &Path, req: &SpaceRequest) -> Result<(u64, u64), String
             if let Some(flag) = seen.get_mut(&key) {
                 if starts && !*flag && n_term_protein > 0 {
                     *flag = true;
-                    forms += forms_of(pep, true) - forms_of(pep, false);
+                    forms += (forms_of(pep, true) - forms_of(pep, false))
+                        * charges_in_range(pep.len(), req);
                 }
                 return;
             }
@@ -333,12 +370,14 @@ pub fn fasta_space(path: &Path, req: &SpaceRequest) -> Result<(u64, u64), String
             }
         }
         peptides += 1;
-        forms += forms_of(pep, starts);
+        forms += forms_of(pep, starts) * charges_in_range(pep.len(), req);
     };
     for seq in proteins(&text) {
         digest(&seq, req, &rule, &mut count);
     }
-    let precursors = (forms * charges * 2.0).round() as u64;
+    // `forms` already counts each form once per charge state the precursor m/z limits
+    // keep; two labels.
+    let precursors = (forms * 2.0).round() as u64;
     Ok((peptides, precursors))
 }
 
@@ -513,7 +552,34 @@ mod tests {
             max_variable_mods: max_var,
             keep_fraction: 1.0,
             threads: None,
+            precursor_mz_min: None,
+            precursor_mz_max: None,
         }
+    }
+
+    /// Precursor m/z limits shrink the FASTA estimate by the charge states they exclude:
+    /// a 10-residue peptide (about 1,129 Da) sits near 565 at 2+ and 377 at 3+, so a limit
+    /// at 400 keeps the 2+ only, and no limit keeps both.
+    #[test]
+    fn the_precursor_mz_limits_shrink_the_estimate() {
+        let mut r = req(&[], 1);
+        assert_eq!(charges_in_range(10, &r), 2.0);
+        r.precursor_mz_min = Some(400.0);
+        assert_eq!(charges_in_range(10, &r), 1.0);
+        r.precursor_mz_max = Some(500.0);
+        assert_eq!(charges_in_range(10, &r), 0.0);
+        let dir = std::env::temp_dir().join(format!("mumdia-sizing-mz-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.fasta");
+        std::fs::write(&f, b">a\nPEPTIDEPEK\n").unwrap();
+        let mut r = req(&[], 1);
+        r.min_len = 7;
+        let (_, all) = fasta_space(&f, &r).unwrap();
+        assert_eq!(all, 4);
+        r.precursor_mz_min = Some(400.0);
+        let (_, kept) = fasta_space(&f, &r).unwrap();
+        assert_eq!(kept, 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

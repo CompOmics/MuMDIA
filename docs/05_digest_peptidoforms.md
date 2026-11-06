@@ -315,6 +315,8 @@ library_build.rs:141).
 | `max_variable_mods` | peptidoforms | `1` | Max simultaneous variable mods per peptidoform |
 | `charge_min` | peptidoforms | `2` | Lowest precursor charge emitted |
 | `charge_max` | peptidoforms | `3` | Highest precursor charge emitted |
+| `precursor_mz_min` | peptidoforms | unset | Lowest precursor m/z emitted (inclusive); see "Precursor m/z limits" |
+| `precursor_mz_max` | peptidoforms | unset | Highest precursor m/z emitted (inclusive); see "Precursor m/z limits" |
 | `unknown_modification` | peptidoforms | `error` | `error` (default) hard-fails on an unknown mod name; `skip` warns and drops the rule. Both branches are wired (see gotchas) |
 
 `rng_seed` is `0` by default (config.rs:991) and only affects the `scramble`
@@ -416,6 +418,57 @@ types elsewhere, not here). `DecoyConfig` (config.rs:172) carries only
   `digest`/`peptidoforms`; the FASTA-build branch is the `_ =>` arm at run.rs:279,
   which calls `library_build::build`.
   Do not assume `peptides.parquet` / `peptidoforms.parquet` exist for every run.
+
+## Precursor m/z limits
+
+`peptidoforms.precursor_mz_min` and `precursor_mz_max` (Th, both inclusive, either one
+alone a half-open limit) restrict the charge states the stage emits. Unset, which is the
+default, nothing changes: both keys stay out of the canonical configuration, so the
+configuration hash, the library cache key and every artifact are what they were.
+
+```json
+{ "peptidoforms": { "precursor_mz_min": 380, "precursor_mz_max": 980 } }
+```
+
+Why it is worth setting: seed search and extract only ever look at the library
+candidates inside an isolation window, so a precursor outside every window is never
+scored. Without the limits it is still digested, predicted (fragment, retention-time and
+ion-mobility sidecars), written, loaded and re-predicted by the multi-head calibration.
+Set the range to the span of the acquisition's isolation windows (the `lower`/`upper`
+columns of `isolation_windows.parquet`, or the method's precursor range) and the library
+loses exactly the precursors the run cannot isolate. Identifications inside the range do
+not change.
+
+How it is applied, in the charge loop of `run_hashed`:
+
+- each charge state is decided on an order-independent m/z: the composition mass of the
+  pair's **target** (residue masses times counts, found through `target_id` for a decoy),
+  plus water and the form's modification masses summed in ascending order. Every row of
+  one target/decoy pair (base peptide, charge and modification multiset, the key
+  predict-frag pairs on) gets the same value, so a pair is kept or dropped together, also
+  under a decoy scheme that does not preserve the composition. The value agrees with
+  predict-frag's `precursor_mz` up to the last bits of the float sum;
+- a form with a residue that has no mass (B, J, O, U, X, Z) is kept and left to
+  predict-frag, as before;
+- a range that excludes every charge state of the input is an error, not an empty
+  library;
+- the report records `params.precursor_mz_min` / `precursor_mz_max` and
+  `stats.out_of_mz_range_rows`, and the log the dropped share, only when a limit is set.
+
+The limits apply wherever this stage runs: `mumdia peptidoforms`, `build-library`,
+the FASTA branch of `run` and `run-experiment`, and `scripts/augment_library.py`, which
+runs the engine's own `peptidoforms` stage with the configuration it is given. With
+spectra (`run`, `run-experiment` in FASTA mode) the engine warns after conversion when
+the run's isolation windows extend past the configured range, because the precursors
+in the uncovered part are not in the library. In library-input mode the keys have no
+effect and the engine says so at start-up; filtering an imported library by m/z is not
+implemented (use `mumdia sub-library`, docs/32).
+
+There is no `"auto"` yet: the range is a number the user takes from the acquisition.
+One interval only; gaps between isolation windows are not cut out.
+
+The fragment-side counterpart is `predict_frag.fragment_mz_min` / `fragment_mz_max`
+(docs/06, "Fragment m/z limits").
 
 ## Terminal modifications
 
