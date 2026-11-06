@@ -3530,10 +3530,19 @@ PEPTIDEK
         let (prec, _) = final_tables(&c.out_dir);
         assert_eq!(prec.parent(), Some(c.out_dir.as_path()));
         // import: <script> <library> <target precursors> <target fragments>
-        assert_eq!(Path::new(&steps[0].1[2]).parent(), Some(c.out_dir.as_path()));
-        assert!(!steps[0].1.iter().any(|a| a == "--no-annotations" || a == "--annotations"));
+        assert_eq!(
+            Path::new(&steps[0].1[2]).parent(),
+            Some(c.out_dir.as_path())
+        );
+        assert!(!steps[0]
+            .1
+            .iter()
+            .any(|a| a == "--no-annotations" || a == "--annotations"));
         // reversal: its output precursors are in the same folder.
-        assert_eq!(Path::new(&steps[1].1[3]).parent(), Some(c.out_dir.as_path()));
+        assert_eq!(
+            Path::new(&steps[1].1[3]).parent(),
+            Some(c.out_dir.as_path())
+        );
         // decoy prediction: the work folder is below the library folder, not the folder.
         let w = steps[2].1.iter().position(|a| a == "--work").unwrap();
         let work = PathBuf::from(&steps[2].1[w + 1]);
