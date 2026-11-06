@@ -385,6 +385,27 @@ if "$BIN" build-library --fasta test_data/fixture.fasta --out-dir test_data/fixt
 fi
 grep -q "the output directory is not writable" "$work/blocked_lib.log" \
     || { tail -5 "$work/blocked_lib.log"; echo "build-library did not name an unwritable output directory"; exit 1; }
+# The engine defaults name the native predictors, which a FASTA search refuses before the
+# digest unless `predict_frag.allow_native_predictors` is set (the smoke configuration sets
+# it). Without --config, `run` and `build-library` must stop with the reason and write nothing.
+echo "=== smoke: a FASTA search on the native predictors is refused without the opt-in"
+for cmd in run build-library; do
+    if [ "$cmd" = run ]; then
+        refused_args=(run --mzml "$work/fixture.mzML")
+    else
+        refused_args=(build-library)
+    fi
+    if "$BIN" "${refused_args[@]}" --fasta test_data/fixture.fasta \
+        --out-dir "$work/out_refused_$cmd" --threads 2 > "$work/refused_$cmd.log" 2>&1; then
+        tail -5 "$work/refused_$cmd.log"
+        echo "$cmd on the native predictors without the opt-in did not fail"; exit 1
+    fi
+    grep -q "$cmd: refusing to build the library of this FASTA search" "$work/refused_$cmd.log" \
+        && grep -q "predict_frag.allow_native_predictors = true" "$work/refused_$cmd.log" \
+        || { tail -5 "$work/refused_$cmd.log"; echo "$cmd did not name the native refusal"; exit 1; }
+    [ ! -e "$work/out_refused_$cmd" ] \
+        || { echo "a refused $cmd wrote its output directory"; exit 1; }
+done
 "$BIN" doctor --config "$cfg" --json --no-import-check --out-dir "$work/out" > "$work/doctor_storage.json"
 "$PY" - "$work/doctor_storage.json" <<'PYEOF'
 import json, sys
@@ -507,6 +528,7 @@ echo "    ok: run completed, drop reported, identifications unchanged"
 echo "=== smoke: the grouped orchestrator"
 cat > "$work/grouped.json" <<'JSONEOF'
 {
+  "predict_frag": { "allow_native_predictors": true },
   "features": { "set": "extended" },
   "extract": { "apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2 },
   "groups": { "window_groups": 3, "parallel": 2, "allow_unbounded_rt": true, "calibration": "per_group" }
@@ -569,6 +591,7 @@ if grep -q 'allow_unbounded_rt' "$work/grouped_refused.json"; then
 fi
 cat > "$work/grouped_refused_global.json" <<'JSONEOF'
 {
+  "predict_frag": { "allow_native_predictors": true },
   "features": { "set": "extended" },
   "extract": { "apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2 },
   "rt_im_train": { "q_train": 0.001 },
@@ -681,6 +704,7 @@ echo "    ok: band tables rescored and quantified; psms_scored and the quant tab
 echo "=== smoke: two bands, global calibration, pooled mass calibration"
 cat > "$work/grouped_2b.json" <<'JSONEOF'
 {
+  "predict_frag": { "allow_native_predictors": true },
   "features": { "set": "extended" },
   "extract": { "apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2 },
   "groups": { "window_groups": 2, "calibration": "global" }
@@ -1223,7 +1247,8 @@ with open(os.path.join(scripts, "deeplc_worker.py"), "w", encoding="utf-8") as f
 base = {
     "features": {"set": "extended"},
     "extract": {"apex_count_window": 5, "apex_rt_prior_s": 120.0, "gate_min_score": 0.2},
-    "predict_frag": {"deeplc_python": sys.executable, "sidecar_script_dir": scripts},
+    "predict_frag": {"deeplc_python": sys.executable, "sidecar_script_dir": scripts,
+                     "allow_native_predictors": True},
 }
 def arm(name, **sections):
     cfg = json.loads(json.dumps(base))

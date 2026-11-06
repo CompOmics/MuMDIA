@@ -101,6 +101,9 @@ const state = {
   // counter: each check runs `mumdia doctor` once per recipe it considers.
   builtinSeq: 0,
   builtinTimer: null,
+  // The built-in path would build its library on the engine's native models, which the
+  // engine refuses: Start and Build library only stay disabled, with the reason shown.
+  builtinBlocked: false,
   // The library on the results screen after "Build library only": its two tables, the
   // folder they are in, and the engine's library.json for a built-in build.
   libraryResult: null,
@@ -2292,8 +2295,8 @@ function selectLibSrc(which) {
 // predictor, which left such searches on the engine's native models. `builtin_plan`
 // replaces a preset that names none with the first recipe whose interpreters the engine
 // finds (the diaPASEF recipe for a timsTOF diaPASEF .d), and says when the search would
-// still run on native predictions. Shown here while the choice is being made, and asked
-// again at Start.
+// still run on native predictions, which blocks Start: the engine refuses them. Shown
+// here while the choice is being made, and checked again at Start.
 function scheduleBuiltinPlan() {
   clearTimeout(state.builtinTimer);
   state.builtinTimer = setTimeout(refreshBuiltinPlan, 400);
@@ -2309,13 +2312,32 @@ async function builtinPlan(diapasef = null) {
   });
 }
 
+// Start and Build library only are enabled when the engine was found, no Start is in
+// progress, and the built-in path is not blocked on the native models.
+function refreshStartButtons() {
+  const off = !state.engineOk || state.starting || state.builtinBlocked;
+  $("start").disabled = off;
+  $("build-library").disabled = off;
+}
+
+// Show the plan's block (red, Start disabled) or its warning (amber, asked at Start).
+function showBuiltinPlan(plan) {
+  const warn = $("builtin-warn");
+  const blocked = Boolean(plan && plan.blocked);
+  warn.classList.toggle("bad", blocked);
+  warn.classList.toggle("warn", !blocked);
+  banner(warn, (plan && (plan.blocked || plan.warning)) || "");
+  state.builtinBlocked = blocked;
+  refreshStartButtons();
+}
+
 async function refreshBuiltinPlan() {
   const note = $("libsrc-builtin-note");
   const warn = $("builtin-warn");
   const seq = ++state.builtinSeq;
   if (state.mode !== "fasta" || state.libSrc !== "builtin") {
     note.textContent = "";
-    banner(warn, "");
+    showBuiltinPlan(null);
     return;
   }
   note.textContent = "Checking which predictors are installed…";
@@ -2329,20 +2351,22 @@ async function refreshBuiltinPlan() {
     if (seq !== state.builtinSeq) return;
     note.textContent = `Could not check the predictors: ${e}`;
     banner(warn, "");
+    state.builtinBlocked = false;
+    refreshStartButtons();
     return;
   }
   if (seq !== state.builtinSeq) return;
   note.textContent = plan.note;
-  banner(warn, plan.warning || "");
+  showBuiltinPlan(plan);
 }
 
-// Ask before a search that would run on native predictions, or on diaPASEF spectra
-// without predicted 1/K0. True to go on.
+// Ask before a search on diaPASEF spectra without predicted 1/K0. True to go on. A search
+// on the native models is not asked about: it is blocked (`plan.blocked`).
 async function confirmPredictors(warning) {
   const message = `${warning}\n\nStart the search anyway?`;
   try {
     return await dialog.ask(message, {
-      title: "This search would be slow and insensitive",
+      title: "This search uses less of the diaPASEF data",
       kind: "warning",
       okLabel: "Start anyway",
       cancelLabel: "Go back",
@@ -2676,8 +2700,7 @@ async function buildLibraryOnly() {
     await startLibraryBuild();
   } finally {
     state.starting = false;
-    $("start").disabled = !state.engineOk;
-    $("build-library").disabled = !state.engineOk;
+    refreshStartButtons();
   }
 }
 
@@ -2748,7 +2771,11 @@ async function startLibraryBuild() {
     return;
   }
   $("libsrc-builtin-note").textContent = plan.note;
-  banner($("builtin-warn"), plan.warning || "");
+  showBuiltinPlan(plan);
+  if (plan.blocked) {
+    banner($("start-error"), plan.blocked);
+    return;
+  }
   if (plan.warning && !(await confirmPredictors(plan.warning))) {
     banner($("start-error"), plan.warning);
     return;
@@ -2974,7 +3001,7 @@ async function start() {
     await startSearch();
   } finally {
     state.starting = false;
-    $("start").disabled = !state.engineOk;
+    refreshStartButtons();
   }
 }
 
@@ -3046,8 +3073,9 @@ async function startSearch() {
   let config = $("preset").value || null;
 
   // The built-in path: the predictors the library is built with, chosen and checked now
-  // (`builtin_plan`). A search that would still run on native predictions, or on a
-  // diaPASEF .d without predicted 1/K0, starts only when the user says so.
+  // (`builtin_plan`). A search that would still build its library on the native models
+  // does not start (the engine refuses it); one on a diaPASEF .d without predicted 1/K0
+  // starts only when the user says so.
   if (state.mode === "fasta" && !built) {
     let plan = null;
     try {
@@ -3059,7 +3087,12 @@ async function startSearch() {
     }
     config = plan.base;
     $("libsrc-builtin-note").textContent = plan.note;
-    banner($("builtin-warn"), plan.warning || "");
+    showBuiltinPlan(plan);
+    if (plan.blocked) {
+      banner($("start-error"), plan.blocked);
+      screen("input");
+      return;
+    }
     if (plan.warning && !(await confirmPredictors(plan.warning))) {
       banner($("start-error"), plan.warning);
       screen("input");

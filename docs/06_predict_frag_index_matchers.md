@@ -284,6 +284,30 @@ predictor traits `RtPredictor` / `FragmentPredictor` (`predict.rs:13-22`) each
 expose `predict*` plus `identity`; only the native structs implement them (the
 sidecar paths bypass the traits and emit their own id strings, above).
 
+**A search refuses them unless told otherwise.** The native models are a fallback, and a
+fallback that runs silently is how a search ends up without retention-time calibration:
+their intensities rarely give the seed a confident target, so every run is extracted over
+the whole gradient, and a FASTA search on them finds a small fraction of what the same
+engine finds on an MS2PIP, AlphaPeptDeep or DIA-NN-predicted library (one desktop search:
+33.6k precursors against 129k). So `run`, `run-experiment`, `build-library` and
+`predict-frag` refuse a FASTA library whose fragment intensities are native
+(`predict_frag.predictor = native`), or whose retention times are native
+(`rt_predictor = native`) with nothing that replaces them: a DeepLC fine-tune
+(`rt_im_train.finetune_deeplc`) or an explicit multi-head head count
+(`rt_im_train.multihead_calibration` > 0; the automatic default never runs on a native
+retention time). The refusal comes before the digest, names what is native and gives the
+fixes: MS2PIP or AlphaPeptDeep with DeepLC (`configs/examples/fasta-sidecars.json`,
+`fasta-peptdeep.json`, `diapasef.json`, checked with `mumdia doctor --config`), or a library
+predicted by DIA-NN and imported. Both predictor keys default to `native`, so a FASTA search
+without `--config` is refused with the same message (`stages/rt_health.rs`,
+`refuse_native_predictors`).
+
+`predict_frag.allow_native_predictors = true` builds the library on them anyway, with the
+start-of-search warning; `configs/examples/native.json`, the CI smoke test and the
+Python-free tests set it. The key is never part of the canonical configuration, so a run that
+sets it keeps the configuration hash and the artifacts of the same run before the refusal
+existed. An imported library reads no `predict_frag` setting and is never refused.
+
 ### The sidecar file contract (`sidecar.rs`)
 
 Sidecars follow a positional-CLI Parquet contract (no JSON request file): write an
@@ -929,7 +953,8 @@ Matcher selection (both stages default to `Fragindex`):
   `FragPredictorKind` / `RtPredictorKind` (`config.rs:90,79`) plus a branch in
   `assign_intensities` / `assign_rt`. Match the existing `identity()` convention;
   the id flows into `model_identity` and the artifact report. Keep the native
-  fallback path intact so the engine still runs with no Python.
+  fallback path intact so the engine still runs with no Python (behind
+  `predict_frag.allow_native_predictors`).
 - **Add a sidecar.** Follow the positional-CLI file contract in `sidecar.rs`:
   write an input Parquet, invoke `run_worker(python, script, &[argv...], utf8)`,
   read an output Parquet keyed by id. Use `resolve_script` so a deployed binary

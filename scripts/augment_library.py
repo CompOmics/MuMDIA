@@ -14,7 +14,8 @@ identical to what the search consumes):
     mumdia digest       FASTA           -> peptides           (Met excision on)
     mumdia peptidoforms peptides        -> peptidoforms       (mods + charges)
     set-diff vs imported target bases   -> missing peptidoforms
-    mumdia predict-frag missing         -> missing target lib (native spectra+iRT)
+    mumdia predict-frag missing         -> missing target lib (native spectra+iRT,
+                                           predict_frag.allow_native_predictors)
     merge imported targets + missing    -> merged target lib
     make_shift_decoys.py merged targets -> augmented library  (paired shift decoys)
 
@@ -85,23 +86,30 @@ def assign_base_ids(imported_base_by_seq, added_seqs, next_id):
 
 
 def predict_frag_config(config, work_dir):
-    """The configuration for the internal predict-frag call: `config` with
-    `predict_frag.im_predictor` at `none`.
+    """The configuration for the internal predict-frag call: `config` (or the engine
+    defaults) with `predict_frag.im_predictor` at `none` and
+    `predict_frag.allow_native_predictors` set.
 
     The added entries take their 1/K0 from nowhere: an imported library's 1/K0 comes from
     the library, and predicting the added rows with another model would give the merged
-    table two 1/K0 sources. A config that already predicts none is used as given; otherwise
-    a copy is written to `work_dir`, with a relative `sidecar_script_dir` pointed at this
-    script's own directory, because the engine resolves that path against the config file.
+    table two 1/K0 sources. The opt-in is needed because the engine refuses a FASTA library
+    on its native models, and an imported-library configuration names no predictor, so the
+    added entries are predicted with them; the search re-predicts their retention times with
+    the rest of the library (`rt_im_train.library_irt`). The opt-in is never part of the
+    engine's canonical configuration, so it changes nothing that is hashed. The copy is
+    written to `work_dir`, with a relative `sidecar_script_dir` pointed at this script's own
+    directory, because the engine resolves that path against the config file.
     """
-    if not config:
-        return config
-    with open(config, encoding="utf-8") as fh:
-        cfg = json.load(fh)
+    cfg = {}
+    if config:
+        with open(config, encoding="utf-8") as fh:
+            cfg = json.load(fh)
     pf = cfg.get("predict_frag") or {}
-    if pf.get("im_predictor", "none") == "none":
-        return config
-    pf["im_predictor"] = "none"
+    if pf.get("im_predictor", "none") != "none":
+        pf["im_predictor"] = "none"
+        print("      predict-frag runs with predict_frag.im_predictor = none: the added entries "
+              "carry no 1/K0", flush=True)
+    pf["allow_native_predictors"] = True
     script_dir = pf.get("sidecar_script_dir", "scripts")
     if not os.path.isabs(script_dir):
         pf["sidecar_script_dir"] = os.path.dirname(os.path.abspath(__file__))
@@ -109,8 +117,6 @@ def predict_frag_config(config, work_dir):
     path = os.path.join(work_dir, "aug_predict_frag_config.json")
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2)
-    print("      predict-frag runs with predict_frag.im_predictor = none: the added entries "
-          "carry no 1/K0", flush=True)
     return path
 
 

@@ -35,6 +35,18 @@ fn wait_for_finish(
     }
 }
 
+/// The engine's Python-free example configuration. It sets
+/// `predict_frag.allow_native_predictors`, without which the engine refuses a FASTA search
+/// on its native models; the application itself never passes it, so this is the test's
+/// own choice of configuration, not one the interface offers.
+fn native_config() -> String {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../configs/examples/native.json"
+    )
+    .to_string()
+}
+
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
@@ -60,7 +72,7 @@ fn a_fasta_search_runs_to_completion_and_reports_itself() {
         fasta: Some(fasta),
         lib_precursors: None,
         lib_fragments: None,
-        config: None,
+        config: Some(native_config()),
         threads: Some(2),
         build_library: false,
         ion_mobility: None,
@@ -132,7 +144,7 @@ fn stopping_a_run_kills_it_and_leaves_no_temp_files() {
         fasta: Some(fasta),
         lib_precursors: None,
         lib_fragments: None,
-        config: None,
+        config: Some(native_config()),
         threads: Some(1),
         build_library: false,
         ion_mobility: None,

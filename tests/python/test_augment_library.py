@@ -62,10 +62,19 @@ def test_the_internal_predict_frag_call_never_predicts_im(tmp_path):
     import json
 
     m = _load()
-    assert m.predict_frag_config(None, str(tmp_path)) is None
+    # No configuration: the engine defaults, with the opt-in for the native models the
+    # engine otherwise refuses for a FASTA library.
+    out = m.predict_frag_config(None, str(tmp_path))
+    cfg = json.loads(open(out, encoding="utf-8").read())
+    assert cfg["predict_frag"]["allow_native_predictors"] is True
+    assert cfg["predict_frag"]["sidecar_script_dir"] == str(SCRIPTS)
+    assert cfg["predict_frag"]["allow_native_predictors"] is True
     plain = tmp_path / "plain.json"
     plain.write_text(json.dumps({"predict_frag": {"top_n_fragments": 12}}))
-    assert m.predict_frag_config(str(plain), str(tmp_path)) == str(plain)
+    out = m.predict_frag_config(str(plain), str(tmp_path))
+    cfg = json.loads(open(out, encoding="utf-8").read())
+    assert cfg["predict_frag"] == {"top_n_fragments": 12, "allow_native_predictors": True,
+                                   "sidecar_script_dir": str(SCRIPTS)}
     im = tmp_path / "im.json"
     im.write_text(json.dumps({"predict_frag": {"im_predictor": "im2deep",
                                                "top_n_fragments": 12}}))
@@ -74,3 +83,4 @@ def test_the_internal_predict_frag_call_never_predicts_im(tmp_path):
     assert cfg["predict_frag"]["im_predictor"] == "none"
     assert cfg["predict_frag"]["top_n_fragments"] == 12
     assert cfg["predict_frag"]["sidecar_script_dir"] == str(SCRIPTS)
+    assert cfg["predict_frag"]["allow_native_predictors"] is True

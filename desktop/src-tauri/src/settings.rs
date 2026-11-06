@@ -68,9 +68,18 @@ pub struct Schema {
 /// the compiled-in copy is the same one the reference document describes.
 const SCHEMA_JSON: &str = include_str!("../../../configs/config-schema.json");
 
+/// Engine settings the application does not offer. `predict_frag.allow_native_predictors`
+/// lets the engine build a FASTA library on its native models, which it otherwise refuses;
+/// the Search screen blocks such a search instead and has no override.
+pub const NOT_OFFERED: &[&str] = &["predict_frag.allow_native_predictors"];
+
 pub fn load_schema() -> Result<Schema, String> {
-    serde_json::from_str(SCHEMA_JSON)
-        .map_err(|e| format!("the compiled-in settings schema could not be parsed: {e}"))
+    let mut schema: Schema = serde_json::from_str(SCHEMA_JSON)
+        .map_err(|e| format!("the compiled-in settings schema could not be parsed: {e}"))?;
+    schema
+        .fields
+        .retain(|f| !NOT_OFFERED.contains(&f.path.as_str()));
+    Ok(schema)
 }
 
 /// Turn `{"extract.gate_min_score": 0.3}` into the nested JSON the engine reads.
@@ -218,12 +227,37 @@ pub fn derive(
         None => serde_json::Value::Object(serde_json::Map::new()),
     };
     merge(&mut root, &nest(&flat));
+    strip_not_offered(&mut root);
     let path = dir.join(format!("{}.json", safe_name(name)));
     let text = serde_json::to_string_pretty(&root)
         .map_err(|e| format!("could not serialise the settings: {e}"))?;
     std::fs::write(&path, text + "\n")
         .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     Ok(path.display().to_string())
+}
+
+/// Remove the settings the application does not offer ([`NOT_OFFERED`]) from a nested
+/// configuration, and a section they leave empty, so a configuration the application
+/// writes never carries the engine's opt-in for its native models.
+fn strip_not_offered(root: &mut serde_json::Value) {
+    for path in NOT_OFFERED {
+        let Some((section, key)) = path.split_once('.') else {
+            continue;
+        };
+        let Some(obj) = root.as_object_mut() else {
+            return;
+        };
+        let emptied = obj
+            .get_mut(section)
+            .and_then(|s| s.as_object_mut())
+            .is_some_and(|s| {
+                s.remove(key);
+                s.is_empty()
+            });
+        if emptied {
+            obj.remove(section);
+        }
+    }
 }
 
 /// Ask the engine whether a configuration file is acceptable.
@@ -393,6 +427,49 @@ mod tests {
     }
 
     #[test]
+    fn a_written_configuration_never_carries_the_native_opt_in() {
+        // From a preset that carries it (the engine's native example does) and from the
+        // overrides alone: the application never passes the engine's opt-in.
+        let dir = std::env::temp_dir().join(format!(
+            "mumdia-console-derive-optin-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let preset = dir.join("preset.json");
+        std::fs::write(
+            &preset,
+            r#"{"predict_frag": {"allow_native_predictors": true, "predictor": "ms2pip"},
+                "features": {"set": "extended"}}"#,
+        )
+        .unwrap();
+        let out = derive(
+            "derive-test-optin",
+            Some(preset.to_str().unwrap()),
+            flat(&[]),
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(
+            v,
+            json!({"predict_frag": {"predictor": "ms2pip"}, "features": {"set": "extended"}})
+        );
+        let _ = std::fs::remove_file(&out);
+
+        let out = derive(
+            "derive-test-optin-flat",
+            None,
+            flat(&[("predict_frag.allow_native_predictors", json!(true))]),
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(v, json!({}), "an emptied section is removed");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_hostile_name_cannot_escape_the_configuration_directory() {
         let dir = config_dir();
         for name in ["../../evil", "a/b", "c:\\d", "..", ""] {
@@ -420,6 +497,13 @@ mod tests {
             "expected the full settings set, got {}",
             s.fields.len()
         );
+        // The engine's opt-in for the native models is not offered (`NOT_OFFERED`), although
+        // the schema the reference is generated from describes it.
+        assert!(SCHEMA_JSON.contains("\"predict_frag.allow_native_predictors\""));
+        assert!(s
+            .fields
+            .iter()
+            .all(|f| !NOT_OFFERED.contains(&f.path.as_str())));
         let gate = s
             .fields
             .iter()

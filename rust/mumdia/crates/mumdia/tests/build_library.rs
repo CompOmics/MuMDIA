@@ -25,10 +25,11 @@ fn scratch(name: &str) -> std::path::PathBuf {
     d
 }
 
-/// Native predictors, the library cache in `cache`, and no DeepLC discovery, so the test
-/// keys the same library on any machine.
+/// Native predictors (explicitly allowed), the library cache in `cache`, and no DeepLC
+/// discovery, so the test keys the same library on any machine.
 fn native_config(cache: &std::path::Path) -> Config {
     let mut cfg = Config::default();
+    cfg.predict_frag.allow_native_predictors = true;
     cfg.predict_frag.library_cache = Some(cache.to_string_lossy().into_owned());
     cfg.rt_im_train.library_irt = LibraryIrt::Library;
     cfg
@@ -207,5 +208,36 @@ fn a_prefilter_before_prediction_is_refused_before_anything_is_written() {
     .unwrap_err()
     .to_string();
     assert!(e.contains("--fasta not found"), "{e}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The engine defaults name the native models, so `build-library` refuses them unless
+/// `predict_frag.allow_native_predictors` is set, before anything is written; the opt-in
+/// does not change the library's cache key.
+#[test]
+fn the_native_models_are_refused_without_the_opt_in() {
+    let root = scratch("native_refused");
+    let mut cfg = native_config(&root.join("cache"));
+    cfg.predict_frag.allow_native_predictors = false;
+    let out = root.join("out");
+    let e = library_build::run(library_build::BuildLibraryParams {
+        config: &cfg,
+        config_path: None,
+        fasta: &fixture_fasta(),
+        out_dir: &out.to_string_lossy(),
+        ion_mobility: false,
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(e.starts_with("build-library: refusing"), "{e}");
+    assert!(
+        e.contains("predict_frag.allow_native_predictors = true"),
+        "{e}"
+    );
+    assert!(!out.exists(), "a refused build wrote its output directory");
+    assert!(
+        !root.join("cache").exists(),
+        "a refused build touched the library cache"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
