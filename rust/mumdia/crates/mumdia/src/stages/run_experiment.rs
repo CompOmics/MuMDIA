@@ -37,7 +37,7 @@ pub struct RunExperimentParams<'a> {
     pub fasta: Option<&'a str>,
     pub mzmls: &'a [String],
     /// Optional per-run labels; also the per-run subdir names. Absent, they are derived
-    /// from `inputs` under `experiment.run_naming` ([`default_run_names`]).
+    /// from `inputs` under `experiment.run_naming` (`default_run_names`).
     pub run_names: Option<&'a [String]>,
     /// The inputs as the user gave them, one per entry of `mzmls`: a vendor file before
     /// `raw::ensure_mzml` converted it, otherwise the same path. Run names are taken from
@@ -1215,7 +1215,7 @@ fn sanitise_run_name(stem: &str) -> String {
 /// has (without regard to case) gets the first free `_2`, `_3`, ..., free against every
 /// name of the experiment, so the result always passes [`check_run_names_distinct`] and
 /// [`run_name_problem`].
-pub fn default_run_names(inputs: &[String], naming: RunNaming) -> Vec<String> {
+fn default_run_names(inputs: &[String], naming: RunNaming) -> Vec<String> {
     if naming == RunNaming::Index {
         return (0..inputs.len()).map(|i| format!("r{i}")).collect();
     }
