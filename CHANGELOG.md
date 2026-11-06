@@ -368,14 +368,14 @@ than a number. Both are recorded in every run's `manifest.json`.
   a `run` given several `--mzml`) were `r0`, `r1`, ...; they are now the input's file name
   without its extensions (`exp/A0_1EX8741FD/`, `quantity_A0_1EX8741FD` in `peptides.tsv`,
   `lfq_A0_1EX8741FD` in `proteins.tsv`), taken from the vendor file rather than the mzML
-  converted from it. Letters, digits, `-`, `_` and `.` are kept and any other run of
-  characters becomes one `_`; names over 64 characters are cut and hashed; a name the
+  converted from it. ASCII letters and digits, `-`, `_` and `.` are kept and any other run
+  of characters, non-ASCII letters included, becomes one `_` (`Données.raw` gives `Donn_es`); names over 64 characters are cut and hashed; a name the
   experiment root uses itself (`first_pass`, `second_pass`, `sidecar_work`, `library`,
   `rt_bootstrap`, `g<N>`) gets `_run`; inputs that give the same name, without regard to
   case, get `_2`, `_3`, ... in input order. The manifest maps each name to its input under
   `experiment.run_inputs`. `experiment.run_naming = "index"` restores `r0..rN-1`, with every
   artifact byte-identical to the previous release, and `--run-names` still wins; it now also
-  refuses those reserved names and `[` / `]`. The key is not part of the configuration hash.
+  refuses those reserved names, `[` / `]` and characters outside ASCII. The key is not part of the configuration hash.
   Readers that take the run names from the manifest (`report --experiment-dir`,
   `localise --experiment-dir`, retention, visDIA) are unaffected; the desktop application
   orders its per-file progress by the derived names; a script that builds `r<i>` paths has

@@ -3864,8 +3864,9 @@ pub struct ExperimentConfig {
     ///
     /// `"input"` takes the ORIGINAL input (the vendor file, not the mzML converted from
     /// it), strips up to three known extensions (`.mzML.gz`, `.d`, `.raw`, `.wiff`, ...),
-    /// keeps letters, digits, `-`, `_` and `.` and replaces every other run of characters
-    /// (whitespace and brackets included) with one `_`. A name longer than 64 characters
+    /// keeps ASCII letters, digits, `-`, `_` and `.` and replaces every other run of
+    /// characters (whitespace, brackets and non-ASCII letters such as `é` or `µ` included)
+    /// with one `_`. A name longer than 64 characters
     /// is cut to 55 and given `_` and its 32-bit FNV-1a hash in 8 hex characters; a name
     /// the experiment root uses itself (`first_pass`, `second_pass`, `sidecar_work`, `library`,
     /// `rt_bootstrap`, `g<N>`) gets a `_run` suffix; a Windows device name a `_`; and two

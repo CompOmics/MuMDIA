@@ -1128,7 +1128,7 @@ fn default_run_names(inputs: &[String]) -> Vec<String> {
         let mut out = String::with_capacity(stem.len());
         let mut replaced = false;
         for c in stem.chars() {
-            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
                 out.push(c);
                 replaced = false;
             } else if !replaced {

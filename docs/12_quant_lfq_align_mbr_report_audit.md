@@ -161,8 +161,10 @@ Without it they are derived from the inputs (`default_run_names` in
 `stages/run_experiment.rs`, `experiment.run_naming = "input"`, the default since 0.10): the
 file name of the input as given, so a vendor file rather than the mzML converted from it,
 without up to three known extensions (`.gz`, `.mzML`, `.mzXML`, `.raw`, `.d`, `.wiff`,
-`.wiff2`, `.mgf`, without regard to case); letters, digits, `-`, `_` and `.` are kept and any
-other run of characters, whitespace and brackets included, becomes one `_`; leading and
+`.wiff2`, `.mgf`, without regard to case); ASCII letters and digits, `-`, `_` and `.` are kept
+and any other run of characters, whitespace, brackets and non-ASCII letters included, becomes
+one `_` (`Données.raw` is `Donn_es`, `A01vs2µl.raw` is `A01vs2_l`), because a run name is also
+a column name of the TSV reports; leading and
 trailing `.` and `_` go; a Windows device name gets a `_` after its first segment; a name over
 64 characters is cut to 55 and given `_` plus the 32-bit FNV-1a hash of the whole name in 8 hex
 characters; a name the experiment root uses itself (`first_pass`, `second_pass`,
@@ -175,7 +177,10 @@ are tested against. The manifest records the mapping under `experiment.run_input
 `experiment.run_naming = "index"` gives `r0..rN-1`, the layout before 0.10, with every
 artifact byte-identical to it; the key is not part of the configuration hash. An explicit
 `--run-names` entry must be a portable directory name, distinct from the others without
-regard to case, without `[` or `]`, and not one of the reserved names. Every reader in the
+regard to case, ASCII only, without `[` or `]`, and not one of the reserved names. Other ASCII
+characters a directory name may hold (a space, `+`, `(`) stay allowed there: an explicit name
+is the user's choice and was accepted before, while a non-ASCII one never was produced by the
+derivation and is refused so that the two kinds of name cannot disagree on a report column. Every reader in the
 engine (`report --experiment-dir`, `localise --experiment-dir`, `output.retain`) takes the
 names from `experiment.runs`, so an experiment written under either naming reads the same.
 

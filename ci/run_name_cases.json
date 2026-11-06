@@ -12,9 +12,9 @@
       "names": ["My_Sample_rep_1", "a_1", "b_c", "hidden", "trail", "x_y_z"]
     },
     {
-      "why": "letters outside ASCII are letters",
-      "inputs": ["échantillon_1.mzML", "Probe_ü.mzML"],
-      "names": ["échantillon_1", "Probe_ü"]
+      "why": "only ASCII letters and digits are kept: a non-ASCII letter is one more character to replace",
+      "inputs": ["Données.raw", "A01vs2µl.raw", "échantillon_1.mzML", "Probe_ü.mzML", "Ωmega 2.mzML"],
+      "names": ["Donn_es", "A01vs2_l", "chantillon_1", "Probe", "mega_2"]
     },
     {
       "why": "Windows device names are broken after their first segment",

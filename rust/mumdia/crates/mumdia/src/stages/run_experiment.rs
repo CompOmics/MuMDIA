@@ -1130,6 +1130,9 @@ fn run_name_problem(name: &str) -> Option<&'static str> {
     if let Some(why) = portable_dir_name_problem(name) {
         return Some(why);
     }
+    if !name.is_ascii() {
+        return Some("it contains a character outside ASCII; a run name is also a column name of the TSV reports, which spreadsheets and scripts decode differently, and a derived name never has one (use letters, digits, `-`, `_` and `.`)");
+    }
     if name.contains('[') || name.contains(']') {
         return Some("it contains `[` or `]`, which delimit the run in the manifest's artifact keys (`scored[<name>]`)");
     }
@@ -1168,8 +1171,9 @@ fn input_stem(input: &str) -> String {
     stem
 }
 
-/// `stem` as a portable directory name: letters, digits, `-`, `_` and `.` are kept, every
-/// run of any other character becomes one `_`, leading and trailing `.` and `_` go, a
+/// `stem` as a portable directory name: ASCII letters and digits, `-`, `_` and `.` are kept,
+/// every run of any other character (a non-ASCII letter such as `é` or `µ` included) becomes
+/// one `_`, leading and trailing `.` and `_` go, a
 /// Windows device name gets a `_` after its first segment, and a name over
 /// [`RUN_NAME_MAX_CHARS`] is cut and given the 32-bit FNV-1a hash of the whole sanitised
 /// name in 8 hex characters (a hash simple enough for the desktop to mirror). Empty when
@@ -1178,7 +1182,7 @@ fn sanitise_run_name(stem: &str) -> String {
     let mut out = String::with_capacity(stem.len());
     let mut replaced = false;
     for c in stem.chars() {
-        if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
             out.push(c);
             replaced = false;
         } else if !replaced {
@@ -3372,6 +3376,8 @@ mod tests {
             "g01",
             "G7",
             "a[1]",
+            "Données",
+            "2µl",
         ] {
             assert!(run_name_problem(bad).is_some(), "{bad:?} must be refused");
         }
