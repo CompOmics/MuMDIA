@@ -169,8 +169,9 @@ pub struct ProteinAnnotations {
 }
 
 impl ProteinAnnotations {
-    /// Read the table at `path`, refusing one without the [`REQUIRED`] columns. A key that
-    /// appears twice has the values of both rows, each once.
+    /// Read the table at `path`, refusing one without the `protein`, `protein_ids`,
+    /// `protein_names` and `genes` columns. A key that appears twice has the values of both
+    /// rows, each once.
     pub fn load(path: &str) -> Result<ProteinAnnotations> {
         let t = TableFile::open(path)
             .with_context(|| format!("reading the protein annotations {path}"))?;
