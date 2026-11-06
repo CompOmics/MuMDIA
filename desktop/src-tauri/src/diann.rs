@@ -934,6 +934,74 @@ pub struct BuildRequest {
     /// Variable modifications per peptide (DIA-NN `--var-mods`).
     #[serde(default = "d_max_var")]
     pub max_variable_mods: u32,
+    /// Precursor m/z limits (DIA-NN `--min-pr-mz` / `--max-pr-mz`). Unset by default, when
+    /// the builder applies its own defaults and the arguments are not passed; set, each one
+    /// is passed and is part of the library's cache key.
+    #[serde(default)]
+    pub min_pr_mz: Option<f64>,
+    #[serde(default)]
+    pub max_pr_mz: Option<f64>,
+    /// Fragment m/z limits (DIA-NN `--min-fr-mz` / `--max-fr-mz`), likewise. They are also
+    /// passed to the decoys' prediction, so targets and decoys keep fragments from the same
+    /// range.
+    #[serde(default)]
+    pub min_fr_mz: Option<f64>,
+    #[serde(default)]
+    pub max_fr_mz: Option<f64>,
+}
+
+impl BuildRequest {
+    /// The precursor and fragment m/z limits as DIA-NN arguments, each only when set;
+    /// refused when an end is not a positive number or a range is empty.
+    fn mz_args(&self) -> Result<Vec<String>, String> {
+        let mut args = Vec::new();
+        for (what, (lo_flag, lo), (hi_flag, hi)) in [
+            (
+                "precursor",
+                ("--min-pr-mz", self.min_pr_mz),
+                ("--max-pr-mz", self.max_pr_mz),
+            ),
+            (
+                "fragment",
+                ("--min-fr-mz", self.min_fr_mz),
+                ("--max-fr-mz", self.max_fr_mz),
+            ),
+        ] {
+            for v in [lo, hi].into_iter().flatten() {
+                if !(v.is_finite() && v > 0.0) {
+                    return Err(format!("the {what} m/z limit {v} is not a positive number"));
+                }
+            }
+            if let (Some(a), Some(b)) = (lo, hi) {
+                if a >= b {
+                    return Err(format!(
+                        "the {what} m/z range {a} to {b} is empty; the lower limit must be \
+                         below the upper"
+                    ));
+                }
+            }
+            for (flag, v) in [(lo_flag, lo), (hi_flag, hi)] {
+                if let Some(v) = v {
+                    args.push(flag.to_string());
+                    args.push(v.to_string());
+                }
+            }
+        }
+        Ok(args)
+    }
+
+    /// The fragment m/z arguments alone, as `predict_decoys.py --diann-arg` values, so the
+    /// decoys' spectra are predicted over the same fragment range as the targets'.
+    fn decoy_diann_args(&self) -> Vec<String> {
+        [
+            ("--min-fr-mz", self.min_fr_mz),
+            ("--max-fr-mz", self.max_fr_mz),
+        ]
+        .into_iter()
+        .filter_map(|(flag, v)| v.map(|v| (flag, v)))
+        .flat_map(|(flag, v)| [format!("--diann-arg={flag}"), format!("--diann-arg={v}")])
+        .collect()
+    }
 }
 
 /// One modification on one residue, by catalogue name, or on a terminus.
@@ -1214,6 +1282,14 @@ pub fn library_cache_dir(req: &BuildRequest, diann_version: &str) -> Result<Path
     if cut != LEGACY_CUT {
         h.update(format!("|cut={cut}").as_bytes());
     }
+    // And the m/z limits: a library built without them keeps the key it always had.
+    let end = |v: Option<f64>| v.map(|v| v.to_string()).unwrap_or_default();
+    if req.min_pr_mz.is_some() || req.max_pr_mz.is_some() {
+        h.update(format!("|prmz={}-{}", end(req.min_pr_mz), end(req.max_pr_mz)).as_bytes());
+    }
+    if req.min_fr_mz.is_some() || req.max_fr_mz.is_some() {
+        h.update(format!("|frmz={}-{}", end(req.min_fr_mz), end(req.max_fr_mz)).as_bytes());
+    }
     let key = crate::components::hex(h.finalize());
     Ok(crate::components::data_dir()
         .join(LIBRARY_CACHE_NAME)
@@ -1253,7 +1329,7 @@ pub const CACHE_MARKER: &str = "mumdia-library-complete.json";
 /// produced a cached library are exactly what someone asks about when a count looks
 /// wrong.
 fn mark_cache_complete(dir: &Path, req: &BuildRequest, version: &str) {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "fasta": req.fasta,
         "diann_version": version,
         "recipe_version": RECIPE_VERSION,
@@ -1265,6 +1341,16 @@ fn mark_cache_complete(dir: &Path, req: &BuildRequest, version: &str) {
         "oxidation": req.oxidation,
         "modifications": ModPlan::of(req).ok().map(|p| p.key()),
     });
+    for (name, v) in [
+        ("min_pr_mz", req.min_pr_mz),
+        ("max_pr_mz", req.max_pr_mz),
+        ("min_fr_mz", req.min_fr_mz),
+        ("max_fr_mz", req.max_fr_mz),
+    ] {
+        if let Some(v) = v {
+            body[name] = serde_json::json!(v);
+        }
+    }
     if let Ok(text) = serde_json::to_string_pretty(&body) {
         let _ = std::fs::write(dir.join(CACHE_MARKER), text);
     }
@@ -1615,6 +1701,9 @@ fn predict_args(req: &BuildRequest, plan: &ModPlan, out_lib: &Path) -> Result<Ve
         "--max-pr-charge".into(),
         req.max_charge.to_string(),
     ];
+    // The m/z limits, only when set, so a request without them is the argument list it
+    // always was.
+    args.extend(req.mz_args()?);
     // Fixed carbamidomethyl on C is DIA-NN's `--unimod4`; every other fixed modification is
     // `--fixed-mod UniMod:<id>,<mass>,<residues>`, and each variable one `--var-mod` in the
     // same form, under one `--var-mods <max per peptide>`. The standard selection produces
@@ -1732,6 +1821,7 @@ pub fn build(builder: Arc<Builder>, req: BuildRequest) -> Result<(), String> {
             out_dir,
             threads: req.threads,
             keep_unimod: build_keep_unimod(&plan),
+            decoy_args: req.decoy_diann_args(),
         };
         let result = convert(&builder, &conversion, Source::Predicted(stem));
         // The marker last, after both tables are on disk. Anything that dies before
@@ -1803,6 +1893,9 @@ struct Conversion {
     /// `--keep-unimod` for the importer and the decoy prediction; `None` keeps the
     /// importer's default set.
     keep_unimod: Option<Vec<u32>>,
+    /// Extra `predict_decoys.py` arguments (`--diann-arg=...`): the fragment m/z limits of
+    /// the build, empty for an import or a build without them.
+    decoy_args: Vec<String>,
 }
 
 /// A DIA-NN library a user chose, by the format it is in.
@@ -2001,6 +2094,7 @@ fn conversion_steps(c: &Conversion, predicted: &Path) -> Vec<(&'static str, Vec<
                 out_dir.join("decoy_prediction").display().to_string(),
             ];
             a.extend(keep);
+            a.extend(c.decoy_args.iter().cloned());
             a
         }),
     ]
@@ -2345,6 +2439,7 @@ pub fn import(builder: Arc<Builder>, req: ImportRequest) -> Result<(), String> {
             out_dir,
             threads: req.threads,
             keep_unimod: Some(kept.clone()),
+            decoy_args: Vec::new(),
         };
         let result = convert(&builder, &conversion, Source::Chosen(library));
         finish(&builder, result, |dir| {
@@ -2414,6 +2509,10 @@ mod tests {
                 fixed_mods: vec![],
                 variable_mods: vec![],
                 max_variable_mods: 1,
+                min_pr_mz: None,
+                max_pr_mz: None,
+                min_fr_mz: None,
+                max_fr_mz: None,
             },
         )
         .unwrap_err();
@@ -2821,7 +2920,55 @@ mod tests {
             fixed_mods: vec![],
             variable_mods: vec![],
             max_variable_mods: 1,
+            min_pr_mz: None,
+            max_pr_mz: None,
+            min_fr_mz: None,
+            max_fr_mz: None,
         }
+    }
+
+    /// The m/z limits reach DIA-NN only when set: without them the argument list is the
+    /// one it always was; set, each one is passed, and the fragment limits also reach the
+    /// decoys' prediction. A reversed or non-positive range is refused.
+    #[test]
+    fn the_mz_limits_reach_the_diann_arguments_only_when_set() {
+        let base = a_request("x.fasta");
+        let plan = ModPlan::of(&base).unwrap();
+        let args = predict_args(&base, &plan, Path::new("o")).unwrap();
+        assert!(!args.iter().any(|a| a.ends_with("-mz")), "{args:?}");
+        assert!(base.decoy_diann_args().is_empty());
+
+        let mut r = a_request("x.fasta");
+        r.min_pr_mz = Some(380.0);
+        r.max_pr_mz = Some(980.5);
+        r.min_fr_mz = Some(150.0);
+        let args = predict_args(&r, &plan, Path::new("o")).unwrap();
+        let value = |flag: &str| -> Option<String> {
+            args.iter()
+                .position(|a| a == flag)
+                .map(|i| args[i + 1].clone())
+        };
+        assert_eq!(value("--min-pr-mz").as_deref(), Some("380"));
+        assert_eq!(value("--max-pr-mz").as_deref(), Some("980.5"));
+        assert_eq!(value("--min-fr-mz").as_deref(), Some("150"));
+        assert_eq!(value("--max-fr-mz"), None);
+        assert_eq!(
+            r.decoy_diann_args(),
+            ["--diann-arg=--min-fr-mz", "--diann-arg=150"]
+        );
+
+        let mut bad = a_request("x.fasta");
+        bad.min_pr_mz = Some(900.0);
+        bad.max_pr_mz = Some(400.0);
+        assert!(predict_args(&bad, &plan, Path::new("o")).is_err());
+        bad.max_pr_mz = None;
+        bad.min_fr_mz = Some(-1.0);
+        assert!(predict_args(&bad, &plan, Path::new("o")).is_err());
+
+        // An old request without the fields reads as no limit.
+        let old: BuildRequest =
+            serde_json::from_str(r#"{"fasta": "x.fasta", "out_dir": "o"}"#).unwrap();
+        assert_eq!((old.min_pr_mz, old.max_fr_mz), (None, None));
     }
 
     /// The cleavage choice reaches DIA-NN's `--cut`; a non-specific rule asks for the
@@ -2899,6 +3046,10 @@ mod tests {
                 r.enzyme = "custom".into();
                 r.cleavage_rule = Some("K*,R*,D*,!*P".into());
             },
+            |r: &mut BuildRequest| r.min_pr_mz = Some(400.0),
+            |r: &mut BuildRequest| r.max_pr_mz = Some(1000.0),
+            |r: &mut BuildRequest| r.min_fr_mz = Some(150.0),
+            |r: &mut BuildRequest| r.max_fr_mz = Some(2000.0),
         ] {
             let mut r = a_request(path);
             mutate(&mut r);
@@ -3252,6 +3403,7 @@ PEPTIDEK
             out_dir: PathBuf::from("/cache/lib0"),
             threads: 6,
             keep_unimod,
+            decoy_args: Vec::new(),
         }
     }
 

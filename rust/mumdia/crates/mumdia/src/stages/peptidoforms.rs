@@ -3,11 +3,12 @@
 //! and charge states, emitted as ProForma strings with UniMod names.
 //! Experiment-wide.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::Result;
-use mumdia_core::config::{ModPosition, PeptidoformsConfig, ResidueMod, UnknownModPolicy};
+use mumdia_core::config::{Config, ModPosition, PeptidoformsConfig, ResidueMod, UnknownModPolicy};
+use mumdia_core::constants::{mass_to_mz, residue_mass, WATER};
 use mumdia_core::mass::unimod_mass;
 use mumdia_core::schema::artifact;
 use mumdia_io::report::{ArtifactReport, Written};
@@ -268,11 +269,143 @@ fn validated_rules(cfg: &PeptidoformsConfig) -> Result<Rules<'_>> {
     })
 }
 
+/// The precursor m/z limits (`peptidoforms.precursor_mz_min` / `precursor_mz_max`), both
+/// inclusive; an unset end is unbounded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MzRange {
+    lo: f64,
+    hi: f64,
+}
+
+impl MzRange {
+    /// The configured range, or `None` when neither end is set (the default, where the
+    /// stage emits every charge state exactly as before).
+    fn of(cfg: &PeptidoformsConfig) -> Option<MzRange> {
+        if cfg.precursor_mz_min.is_none() && cfg.precursor_mz_max.is_none() {
+            return None;
+        }
+        Some(MzRange {
+            lo: cfg.precursor_mz_min.unwrap_or(f64::NEG_INFINITY),
+            hi: cfg.precursor_mz_max.unwrap_or(f64::INFINITY),
+        })
+    }
+
+    fn contains(&self, mz: f64) -> bool {
+        mz >= self.lo && mz <= self.hi
+    }
+}
+
+/// The summed residue mass of a stripped peptide, independent of the residue order (each
+/// residue's mass times its count, in a fixed residue order), so a target and its
+/// composition-preserving decoy give the same number to the last bit. `None` for a residue
+/// without a mass (B, J, O, U, X, Z), whose forms the m/z filter then keeps and leaves to
+/// predict-frag.
+fn composition_mass(peptide: &str) -> Option<f64> {
+    let mut counts = [0u32; 26];
+    for b in peptide.bytes() {
+        let u = b.to_ascii_uppercase();
+        if !u.is_ascii_uppercase() {
+            return None;
+        }
+        counts[(u - b'A') as usize] += 1;
+    }
+    let mut m = 0.0;
+    for (i, &n) in counts.iter().enumerate() {
+        if n > 0 {
+            m += residue_mass(b'A' + i as u8)? * f64::from(n);
+        }
+    }
+    Some(m)
+}
+
+/// The precursor m/z the range is decided on: the composition mass of the pair's TARGET,
+/// plus water and this form's modification masses summed in ascending order, at charge
+/// `z`. Every row of a target/decoy pair (same base peptide, charge and modification
+/// multiset, the key predict-frag pairs on) gets the same value, so the pair is kept or
+/// dropped together even under a decoy scheme that changed the residue composition.
+fn decision_mz(target_composition: f64, mod_masses: &mut [f64], z: i32) -> f64 {
+    mod_masses.sort_by(f64::total_cmp);
+    let neutral = WATER + target_composition + mod_masses.iter().sum::<f64>();
+    mass_to_mz(neutral, z)
+}
+
 pub struct PeptidoformsParams<'a> {
     pub peptides: &'a str,
     pub out: &'a str,
     pub cfg: &'a PeptidoformsConfig,
     pub config_hash: &'a str,
+}
+
+/// The warning for a search on an imported library whose configuration sets library m/z
+/// limits: they act while MuMDIA builds a library (peptidoforms, predict-frag), and an
+/// imported library is used as it is. `None` when no limit is set or the library is built.
+pub fn mz_limits_ignored_warning(cfg: &Config, library_input: bool) -> Option<String> {
+    let set: Vec<&str> = [
+        (
+            "peptidoforms.precursor_mz_min",
+            cfg.peptidoforms.precursor_mz_min,
+        ),
+        (
+            "peptidoforms.precursor_mz_max",
+            cfg.peptidoforms.precursor_mz_max,
+        ),
+        (
+            "predict_frag.fragment_mz_min",
+            cfg.predict_frag.fragment_mz_min,
+        ),
+        (
+            "predict_frag.fragment_mz_max",
+            cfg.predict_frag.fragment_mz_max,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, v)| v.map(|_| name))
+    .collect();
+    (library_input && !set.is_empty()).then(|| {
+        format!(
+            "{} only apply while MuMDIA builds a library from a FASTA; the imported library \
+             is searched as it is (filter it with `mumdia sub-library` first)",
+            set.join(", ")
+        )
+    })
+}
+
+/// Warn when the configured precursor m/z range leaves part of a run's isolation windows
+/// uncovered: a library built with it has no precursor there, so whatever elutes in that
+/// part of the windows cannot be identified. Reads `isolation_windows.parquet` (`lower`,
+/// `upper`); no warning without a limit, or when the range covers every window.
+pub fn warn_if_windows_outside_range(cfg: &PeptidoformsConfig, isolation_windows: &str) {
+    let Some(range) = MzRange::of(cfg) else {
+        return;
+    };
+    let span = TableFile::open(isolation_windows).and_then(|t| {
+        let (lo, hi) = (t.f64("lower")?, t.f64("upper")?);
+        Ok((
+            lo.iter().copied().fold(f64::INFINITY, f64::min),
+            hi.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        ))
+    });
+    match span {
+        Ok((lo, hi)) if lo.is_finite() && hi.is_finite() => {
+            if lo < range.lo || hi > range.hi {
+                warn!(
+                    precursor_mz_min = ?cfg.precursor_mz_min,
+                    precursor_mz_max = ?cfg.precursor_mz_max,
+                    windows_lower = lo,
+                    windows_upper = hi,
+                    "the library's precursor m/z range does not cover this run's isolation \
+                     windows; precursors in the uncovered part are not in a library built \
+                     with it and cannot be identified"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warn!(
+            error = %e,
+            path = isolation_windows,
+            "could not read the isolation windows to check the precursor m/z range"
+        ),
+    }
 }
 
 pub fn run(p: PeptidoformsParams) -> Result<u64> {
@@ -309,6 +442,33 @@ pub fn run_hashed(p: PeptidoformsParams) -> Result<Written> {
     };
     let mut n_term_rows = 0u64;
 
+    // The precursor m/z limits, when set. The decision uses each pair's target
+    // composition, so the targets' composition masses are collected first, by id.
+    let mz_range = MzRange::of(p.cfg);
+    let target_composition: HashMap<u32, Option<f64>> = if mz_range.is_some() {
+        (0..t.nrows)
+            .filter(|&row| target_id[row] < 0)
+            .map(|row| (pep_id[row], composition_mass(&peptide[row])))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let mod_mass: HashMap<&str, f64> = if mz_range.is_some() {
+        rules
+            .fixed
+            .iter()
+            .chain(&rules.variable)
+            .map(|(_, name)| *name)
+            .chain(rules.fixed_n_term.iter().map(|(_, name)| *name))
+            .chain(rules.variable_n_term.iter().map(|(_, name)| *name))
+            .filter_map(|name| unimod_mass(name).map(|m| (name, m)))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let mut n_out_of_range = 0u64;
+    let mut n_enumerated = 0u64;
+
     let (mut id_c, mut pepid_c, mut base_c) = (Vec::new(), Vec::new(), Vec::new());
     let (mut pep_c, mut pform_c, mut charge_c) = (Vec::new(), Vec::new(), Vec::new());
     let (mut label_c, mut prot_c) = (Vec::new(), Vec::new());
@@ -333,6 +493,18 @@ pub fn run_hashed(p: PeptidoformsParams) -> Result<Written> {
             target_id[row] as u32
         } else {
             pep_id[row]
+        };
+
+        // The composition the m/z decision uses: the target's, found by `target_id` for a
+        // decoy (its own when the target is not in the table). `None` without a range, or
+        // for a residue without a mass (the form is then kept).
+        let pair_composition: Option<f64> = match mz_range {
+            None => None,
+            Some(_) if target_id[row] >= 0 => target_composition
+                .get(&(target_id[row] as u32))
+                .copied()
+                .unwrap_or_else(|| composition_mass(pep)),
+            Some(_) => composition_mass(pep),
         };
 
         let row_starts_protein = starts_protein.as_ref().is_some_and(|f| f[row]);
@@ -397,7 +569,23 @@ pub fn run_hashed(p: PeptidoformsParams) -> Result<Written> {
             mods.sort_by_key(|(pos, _)| *pos);
             let form = proforma(pep, &mods);
             let has_n_term = mods.first().is_some_and(|(slot, _)| *slot == N_TERM_SLOT);
+            let mut mod_masses: Vec<f64> = if pair_composition.is_some() {
+                mods.iter()
+                    .map(|(_, name)| mod_mass.get(name).copied().unwrap_or(0.0))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             for z in z_lo..=z_hi {
+                if let Some(range) = mz_range {
+                    n_enumerated += 1;
+                    if let Some(comp) = pair_composition {
+                        if !range.contains(decision_mz(comp, &mut mod_masses, z)) {
+                            n_out_of_range += 1;
+                            continue;
+                        }
+                    }
+                }
                 id_c.push(next);
                 next += 1;
                 pepid_c.push(pep_id[row]);
@@ -410,6 +598,34 @@ pub fn run_hashed(p: PeptidoformsParams) -> Result<Written> {
                 n_term_rows += u64::from(has_n_term);
             }
         }
+    }
+
+    if let Some(range) = mz_range {
+        if id_c.is_empty() && n_enumerated > 0 {
+            anyhow::bail!(
+                "peptidoforms: the precursor m/z range [{}, {}] excludes all {n_enumerated} \
+                 charge states of these peptides (charges {}..={}); widen \
+                 peptidoforms.precursor_mz_min / precursor_mz_max, the charge range or the \
+                 digest length range",
+                range.lo,
+                range.hi,
+                p.cfg.charge_min,
+                p.cfg.charge_max
+            );
+        }
+        let share = if n_enumerated > 0 {
+            n_out_of_range as f64 / n_enumerated as f64
+        } else {
+            0.0
+        };
+        info!(
+            precursor_mz_min = ?p.cfg.precursor_mz_min,
+            precursor_mz_max = ?p.cfg.precursor_mz_max,
+            out_of_range = n_out_of_range,
+            enumerated = n_enumerated,
+            share_dropped = %format!("{:.1}%", share * 100.0),
+            "peptidoforms: charge states outside the precursor m/z range were not emitted"
+        );
     }
 
     let rows = write_table(
@@ -439,6 +655,18 @@ pub fn run_hashed(p: PeptidoformsParams) -> Result<Written> {
         // Recorded only with a terminal rule, so every other report is what it was.
         stats.insert("n_term_modified_rows".to_string(), json!(n_term_rows));
     }
+    let mut params = json!({
+        "fixed_mods": p.cfg.fixed_mods.iter().map(show).collect::<Vec<_>>(),
+        "variable_mods": p.cfg.variable_mods.iter().map(show).collect::<Vec<_>>(),
+        "max_variable_mods": p.cfg.max_variable_mods,
+        "charges": format!("{}..{}", p.cfg.charge_min, p.cfg.charge_max),
+    });
+    if mz_range.is_some() {
+        // Recorded only with a limit, so every other report is what it was.
+        params["precursor_mz_min"] = json!(p.cfg.precursor_mz_min);
+        params["precursor_mz_max"] = json!(p.cfg.precursor_mz_max);
+        stats.insert("out_of_mz_range_rows".to_string(), json!(n_out_of_range));
+    }
     let report = ArtifactReport {
         logical_name: artifact::PEPTIDOFORMS.0.to_string(),
         schema_name: artifact::PEPTIDOFORMS.0.to_string(),
@@ -446,12 +674,7 @@ pub fn run_hashed(p: PeptidoformsParams) -> Result<Written> {
         stage: "peptidoforms".to_string(),
         rows,
         content_hash: mumdia_io::hash::blake3_file(p.out)?,
-        params: json!({
-            "fixed_mods": p.cfg.fixed_mods.iter().map(show).collect::<Vec<_>>(),
-            "variable_mods": p.cfg.variable_mods.iter().map(show).collect::<Vec<_>>(),
-            "max_variable_mods": p.cfg.max_variable_mods,
-            "charges": format!("{}..{}", p.cfg.charge_min, p.cfg.charge_max),
-        }),
+        params,
         stats,
         model_identity: None,
         elapsed_ms: elapsed,
@@ -719,6 +942,17 @@ mod tests {
         cfg: &PeptidoformsConfig,
         with_flag: bool,
     ) -> Result<Vec<(String, String)>> {
+        expand_charged(tag, rows, cfg, with_flag)
+            .map(|v| v.into_iter().map(|(f, l, _, _)| (f, l)).collect())
+    }
+
+    /// [`expand`], returning (peptidoform, label, charge, base_peptide_id) per row.
+    fn expand_charged(
+        tag: &str,
+        rows: &[(&str, &str, bool)],
+        cfg: &PeptidoformsConfig,
+        with_flag: bool,
+    ) -> Result<Vec<(String, String, i32, u32)>> {
         let dir = std::env::temp_dir().join(format!("mumdia_pfx_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -770,7 +1004,12 @@ mod tests {
         .map(|_| {
             let t = TableFile::open(&out).unwrap();
             let (pf, label) = (t.str("peptidoform").unwrap(), t.str("label").unwrap());
-            pf.into_iter().zip(label).collect()
+            let (z, base) = (t.i32("charge").unwrap(), t.u32("base_peptide_id").unwrap());
+            pf.into_iter()
+                .zip(label)
+                .zip(z.into_iter().zip(base))
+                .map(|((f, l), (z, b))| (f, l, z, b))
+                .collect()
         });
         let _ = std::fs::remove_dir_all(&dir);
         result
@@ -899,5 +1138,135 @@ mod tests {
             json.contains(r#"{"residue":"*","name":"Acetyl","position":"protein_n_term"}"#),
             "{json}"
         );
+    }
+
+    /// The precursor m/z of one emitted row, as predict-frag computes it.
+    fn mz_of(form: &str, z: i32) -> f64 {
+        mumdia_core::mass::parse_peptidoform(form)
+            .unwrap()
+            .precursor_mz(z)
+    }
+
+    /// With limits, every emitted charge state lies inside them (inclusive), the ones
+    /// outside are not emitted, and a target and its decoy keep the same charge states
+    /// and forms.
+    #[test]
+    fn precursor_mz_limits_drop_charge_states_outside_and_keep_pairs_together() {
+        let rows = [
+            ("SAMPLEMK", "target", false),
+            ("EMLPMASK", "decoy", false),
+            ("PEPTIDEWWWWR", "target", false),
+            ("WWWWEDITPEPR", "decoy", false),
+        ];
+        let mut cfg = PeptidoformsConfig {
+            charge_min: 1,
+            charge_max: 4,
+            ..PeptidoformsConfig::default()
+        };
+        let all = expand_charged("mzall", &rows, &cfg, false).unwrap();
+        // Bounds chosen from the unfiltered table: the middle of the m/z values.
+        let mut mzs: Vec<f64> = all.iter().map(|(f, _, z, _)| mz_of(f, *z)).collect();
+        mzs.sort_by(f64::total_cmp);
+        let (lo, hi) = (mzs[mzs.len() / 4], mzs[3 * mzs.len() / 4]);
+        cfg.precursor_mz_min = Some(lo - 1e-6);
+        cfg.precursor_mz_max = Some(hi + 1e-6);
+        let kept = expand_charged("mzlim", &rows, &cfg, false).unwrap();
+        assert!(!kept.is_empty() && kept.len() < all.len());
+        for (f, _, z, _) in &kept {
+            let mz = mz_of(f, *z);
+            assert!(mz >= lo - 1e-6 && mz <= hi + 1e-6, "{f} {z}+ at {mz}");
+        }
+        // Exactly the rows of the unfiltered table that lie inside, in the same order.
+        let inside: Vec<_> = all
+            .iter()
+            .filter(|(f, _, z, _)| {
+                let mz = mz_of(f, *z);
+                mz >= lo - 1e-6 && mz <= hi + 1e-6
+            })
+            .cloned()
+            .collect();
+        assert_eq!(kept, inside);
+        // Pairs: per base peptide and charge, as many decoy rows as target rows.
+        let mut count: BTreeMap<(u32, i32, String), i64> = BTreeMap::new();
+        for (_, l, z, b) in &kept {
+            *count.entry((*b, *z, String::new())).or_default() +=
+                if l == "target" { 1 } else { -1 };
+        }
+        assert!(count.values().all(|&c| c == 0), "{count:?}");
+    }
+
+    /// The bounds are inclusive, an open end is unbounded, and a range that excludes every
+    /// charge state is an error rather than an empty library.
+    #[test]
+    fn precursor_mz_limits_are_inclusive_and_an_empty_result_is_refused() {
+        let rows = [("PEPTIDEK", "target", false), ("EDITPEPK", "decoy", false)];
+        let base = PeptidoformsConfig {
+            variable_mods: vec![],
+            ..PeptidoformsConfig::default()
+        };
+        let mz2 = mz_of("PEPTIDEK", 2);
+        let mz3 = mz_of("PEPTIDEK", 3);
+        let at = |lo: Option<f64>, hi: Option<f64>, tag: &str| {
+            let cfg = PeptidoformsConfig {
+                precursor_mz_min: lo,
+                precursor_mz_max: hi,
+                ..base.clone()
+            };
+            expand_charged(tag, &rows, &cfg, false)
+        };
+        let charges = |v: Vec<(String, String, i32, u32)>| -> Vec<i32> {
+            v.into_iter().map(|(_, _, z, _)| z).collect()
+        };
+        // The decision value differs from predict-frag's in the last bits at most.
+        assert_eq!(
+            charges(at(Some(mz2 - 1e-9), None, "lo").unwrap()),
+            vec![2, 2]
+        );
+        assert_eq!(
+            charges(at(None, Some(mz3 + 1e-9), "hi").unwrap()),
+            vec![3, 3]
+        );
+        assert_eq!(
+            charges(at(Some(mz3 - 1e-9), Some(mz2 + 1e-9), "both").unwrap()),
+            vec![2, 3, 2, 3]
+        );
+        let err = at(Some(mz2 + 1.0), None, "none").unwrap_err().to_string();
+        assert!(err.contains("excludes all"), "{err}");
+        // Without limits the table is the one the stage always wrote.
+        assert_eq!(
+            charges(at(None, None, "default").unwrap()),
+            vec![2, 3, 2, 3]
+        );
+    }
+
+    /// The decision is made on the target's composition, so a decoy whose residues were
+    /// changed (a scheme that does not preserve the composition) still follows its target.
+    #[test]
+    fn the_precursor_mz_decision_follows_the_target() {
+        // The "decoy" here is far heavier than its target; it must still be kept exactly
+        // when its target is.
+        let rows = [("PEPTIDEK", "target", false), ("WWWWWWWK", "decoy", false)];
+        let mz2 = mz_of("PEPTIDEK", 2);
+        let cfg = PeptidoformsConfig {
+            variable_mods: vec![],
+            precursor_mz_min: Some(mz2 - 0.01),
+            precursor_mz_max: Some(mz2 + 0.01),
+            ..PeptidoformsConfig::default()
+        };
+        let kept = expand_charged("follow", &rows, &cfg, false).unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|(f, l, z, _)| (f.as_str(), l.as_str(), *z))
+                .collect::<Vec<_>>(),
+            vec![("PEPTIDEK", "target", 2), ("WWWWWWWK", "decoy", 2)]
+        );
+    }
+
+    #[test]
+    fn composition_mass_ignores_order_and_refuses_unknown_residues() {
+        assert_eq!(composition_mass("PEPTIDEK"), composition_mass("KEDITPEP"));
+        assert_eq!(composition_mass("PEPTIDEK"), composition_mass("peptidek"));
+        assert_eq!(composition_mass("PEPXIDEK"), None);
+        assert_eq!(composition_mass("PEP1"), None);
     }
 }

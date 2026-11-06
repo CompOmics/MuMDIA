@@ -509,6 +509,28 @@ impl Default for ConvertConfig {
 
 // The `rt_im_train` ion-mobility keys at their defaults, which the canonical configuration
 // omits.
+/// An m/z limit pair (`<what>_min`, `<what>_max`, either unset): each one set must be finite
+/// and positive, and with both set the lower must lie below the upper.
+fn check_mz_limits(what: &str, lo: Option<f64>, hi: Option<f64>) -> Result<(), String> {
+    for (end, v) in [("min", lo), ("max", hi)] {
+        if let Some(v) = v {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(format!(
+                    "{what}_{end} must be a finite, positive m/z (got {v})"
+                ));
+            }
+        }
+    }
+    if let (Some(lo), Some(hi)) = (lo, hi) {
+        if lo >= hi {
+            return Err(format!(
+                "{what}_min must be below {what}_max (got {lo} and {hi}); the range is                  inclusive at both ends and would keep nothing"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn is_default_im_min_anchors_per_charge(v: &usize) -> bool {
     *v == RtImTrainConfig::default().im_min_anchors_per_charge
 }
@@ -1058,6 +1080,20 @@ pub struct PeptidoformsConfig {
     /// the enumerated charge states changes the search/training/FDR population, so
     /// this remains benchmark-gated.
     pub charge_by_basic_residues: bool,
+    /// Lowest precursor m/z the library keeps (Th, inclusive). Unset by default: every
+    /// charge state of every peptidoform is emitted, as before. Set, a charge state whose
+    /// precursor m/z lies below it is not emitted, so it is never predicted, written or
+    /// searched; set it to the low edge of the acquisition's isolation windows. The
+    /// decision is made per target/decoy pair (from the target's composition and the form's
+    /// modifications), so a pair is kept or dropped together. Never part of the canonical
+    /// configuration while unset, so the configuration hash, the library cache key and every
+    /// artifact of a search without it stay as they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precursor_mz_min: Option<f64>,
+    /// Highest precursor m/z the library keeps (Th, inclusive). Unset by default; see
+    /// `precursor_mz_min`. Set it to the high edge of the acquisition's isolation windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precursor_mz_max: Option<f64>,
     /// `error` (default) or `skip` for unknown modifications.
     pub unknown_modification: UnknownModPolicy,
 }
@@ -1078,6 +1114,8 @@ impl Default for PeptidoformsConfig {
             charge_min: 2,
             charge_max: 3,
             charge_by_basic_residues: false,
+            precursor_mz_min: None,
+            precursor_mz_max: None,
             unknown_modification: UnknownModPolicy::Error,
         }
     }
@@ -1380,6 +1418,19 @@ pub struct PredictFragConfig {
     /// contains, so the configuration hash and every artifact are the same either way.
     #[serde(default, skip_serializing)]
     pub allow_native_predictors: bool,
+    /// Lowest fragment m/z the library keeps (Th, inclusive). Unset by default. Set, a
+    /// predicted fragment below it is removed after prediction and before the
+    /// `top_n_fragments` selection, so its slot goes to a fragment the MS2 scan range can
+    /// record; the kept fragments keep their predicted intensities (no renormalisation). A
+    /// candidate left with no fragment is dropped together with its target/decoy pair. It
+    /// changes which fragments are scored, so it is opt-in and benchmark-gated. Never part
+    /// of the canonical configuration while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_mz_min: Option<f64>,
+    /// Highest fragment m/z the library keeps (Th, inclusive). Unset by default; see
+    /// `fragment_mz_min`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_mz_max: Option<f64>,
 }
 impl Default for PredictFragConfig {
     fn default() -> Self {
@@ -1402,6 +1453,8 @@ impl Default for PredictFragConfig {
             defer_deeplc_to_multihead: true,
             library_cache: Some("auto".to_string()),
             allow_native_predictors: false,
+            fragment_mz_min: None,
+            fragment_mz_max: None,
         }
     }
 }
@@ -5110,6 +5163,20 @@ impl Config {
                 self.peptidoforms.charge_min, self.peptidoforms.charge_max
             )));
         }
+        for (what, lo, hi) in [
+            (
+                "peptidoforms.precursor_mz",
+                self.peptidoforms.precursor_mz_min,
+                self.peptidoforms.precursor_mz_max,
+            ),
+            (
+                "predict_frag.fragment_mz",
+                self.predict_frag.fragment_mz_min,
+                self.predict_frag.fragment_mz_max,
+            ),
+        ] {
+            check_mz_limits(what, lo, hi).map_err(Invalid)?;
+        }
         for (name, value) in [
             (
                 "predict_frag.top_n_fragments",
@@ -5738,6 +5805,52 @@ mod tests {
         assert!(!c.canonical_json().contains("\"output\""));
         assert!(serde_json::from_str::<Config>(r#"{"output": {"retain": "some"}}"#).is_err());
         assert!(serde_json::from_str::<Config>(r#"{"output": {"keep": 1}}"#).is_err());
+    }
+
+    /// The library m/z limits are unset by default and stay out of the canonical
+    /// configuration, so the hash and the library cache key of a search without them do not
+    /// change; set, each one is part of it. Each must be finite and positive, and the lower
+    /// below the upper.
+    #[test]
+    fn library_mz_limits_stay_out_of_the_canonical_json_until_set() {
+        let c = Config::default();
+        assert_eq!(c.peptidoforms.precursor_mz_min, None);
+        assert_eq!(c.predict_frag.fragment_mz_max, None);
+        let json = c.canonical_json();
+        for key in [
+            "precursor_mz_min",
+            "precursor_mz_max",
+            "fragment_mz_min",
+            "fragment_mz_max",
+        ] {
+            assert!(!json.contains(key), "{key} in {json}");
+        }
+        let set: Config = serde_json::from_str(
+            r#"{"peptidoforms": {"precursor_mz_min": 380, "precursor_mz_max": 980.5},
+                "predict_frag": {"fragment_mz_min": 150, "fragment_mz_max": 2000}}"#,
+        )
+        .unwrap();
+        assert!(set.validate().is_ok());
+        let json = set.canonical_json();
+        assert!(json.contains(r#""precursor_mz_min":380.0"#), "{json}");
+        assert!(json.contains(r#""precursor_mz_max":980.5"#), "{json}");
+        assert!(json.contains(r#""fragment_mz_min":150.0"#), "{json}");
+        assert!(json.contains(r#""fragment_mz_max":2000.0"#), "{json}");
+        // One end alone is a valid half-open limit.
+        let one: Config =
+            serde_json::from_str(r#"{"peptidoforms": {"precursor_mz_max": 1200}}"#).unwrap();
+        assert!(one.validate().is_ok());
+        for bad in [
+            r#"{"peptidoforms": {"precursor_mz_min": 900, "precursor_mz_max": 400}}"#,
+            r#"{"peptidoforms": {"precursor_mz_min": 500, "precursor_mz_max": 500}}"#,
+            r#"{"peptidoforms": {"precursor_mz_min": -1}}"#,
+            r#"{"peptidoforms": {"precursor_mz_max": 0}}"#,
+            r#"{"predict_frag": {"fragment_mz_min": 2000, "fragment_mz_max": 150}}"#,
+            r#"{"predict_frag": {"fragment_mz_max": -5}}"#,
+        ] {
+            let c: Config = serde_json::from_str(bad).unwrap();
+            assert!(c.validate().is_err(), "{bad} validated");
+        }
     }
 
     /// The decoy-corrected 1/K0 window sizing at 1.3x is the default: the seed records

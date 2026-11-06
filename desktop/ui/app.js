@@ -1621,6 +1621,12 @@ function libraryParams(fasta) {
     const v = parseInt(el.value, 10);
     return Number.isFinite(v) ? v : dflt;
   };
+  const mz = (id) => {
+    const el = $(id);
+    if (!el || el.value.trim() === "") return null;
+    const v = parseFloat(el.value);
+    return Number.isFinite(v) && v > 0 ? v : null;
+  };
   const enzyme = $("d-enzyme") ? $("d-enzyme").value : "trypsin_p";
   return {
     fasta,
@@ -1632,6 +1638,11 @@ function libraryParams(fasta) {
     max_pep_len: n("d-maxlen", 30),
     min_charge: n("d-minz", 2),
     max_charge: n("d-maxz", 4),
+    // Empty means no limit; only a set limit reaches the build or the configuration.
+    min_pr_mz: mz("d-prmin"),
+    max_pr_mz: mz("d-prmax"),
+    min_fr_mz: mz("d-frmin"),
+    max_fr_mz: mz("d-frmax"),
     threads: n("d-threads", 8),
     carbamidomethyl: state.mods.get(modKey("Carbamidomethyl", "C")) === "fix",
     oxidation: state.mods.get(modKey("Oxidation", "M")) === "var",
@@ -1664,7 +1675,23 @@ function digestOverrides() {
     "peptidoforms.fixed_mods": selectedMods().fixed,
     "peptidoforms.variable_mods": selectedMods().variable,
     "peptidoforms.max_variable_mods": maxVariableMods(),
+    // Only a limit that is set: an unset one stays out of the configuration, and so out
+    // of its hash and the library cache key.
+    ...mzOverrides(d),
   };
+}
+
+function mzOverrides(d) {
+  const out = {};
+  for (const [key, v] of [
+    ["peptidoforms.precursor_mz_min", d.min_pr_mz],
+    ["peptidoforms.precursor_mz_max", d.max_pr_mz],
+    ["predict_frag.fragment_mz_min", d.min_fr_mz],
+    ["predict_frag.fragment_mz_max", d.max_fr_mz],
+  ]) {
+    if (v !== null) out[key] = v;
+  }
+  return out;
 }
 
 // ── modifications ───────────────────────────────────────────────────────────
@@ -2027,7 +2054,7 @@ function initSearchOptions() {
     renderSpace();
   });
   for (const id of ["bands-n", "bands-parallel"]) $(id).addEventListener("input", renderSpace);
-  for (const id of ["d-missed", "d-minlen", "d-maxlen", "d-minz", "d-maxz", "threads"]) {
+  for (const id of ["d-missed", "d-minlen", "d-maxlen", "d-minz", "d-maxz", "d-prmin", "d-prmax", "threads"]) {
     $(id).addEventListener("change", scheduleSpace);
   }
   for (const r of document.querySelectorAll('input[name="runmode"]')) {
@@ -2092,6 +2119,8 @@ function spaceRequest(libPrecursors) {
     max_len: d.max_pep_len,
     min_charge: d.min_charge,
     max_charge: d.max_charge,
+    precursor_mz_min: d.min_pr_mz,
+    precursor_mz_max: d.max_pr_mz,
     variable: selectedMods().variable,
     max_variable_mods: maxVariableMods(),
     keep_fraction: prescreenKeep(),

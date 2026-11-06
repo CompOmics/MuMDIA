@@ -132,6 +132,26 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **Precursor and fragment m/z limits for a library built from a FASTA (#276).**
+  `peptidoforms.precursor_mz_min` / `precursor_mz_max` (inclusive) stop the peptidoform
+  stage from emitting a charge state whose precursor m/z lies outside them, so a library can
+  hold only what the acquisition isolates and every later step (prediction, writing,
+  loading, the multi-head re-prediction) handles fewer rows. The decision is made per
+  target/decoy pair, on the target's composition and the form's modifications, so a pair is
+  kept or dropped together; a range that excludes everything is an error. The limits apply
+  in `peptidoforms`, `build-library`, the FASTA branch of `run` and `run-experiment`, and
+  `scripts/augment_library.py`; with spectra the engine warns when the run's isolation windows
+  extend past the range, and in library-input mode it says the keys have no effect.
+  `predict_frag.fragment_mz_min` / `fragment_mz_max` (opt-in, benchmark-gated) remove the
+  predicted fragments outside a range before the top-N selection and drop a candidate left
+  without one together with its pair. Unset, which is the default, none of the four keys is
+  part of the canonical configuration, so the configuration hash, the library cache key and
+  every artifact are unchanged (docs/05, "Precursor m/z limits"; docs/06, "Fragment m/z
+  limits"). The desktop application's Digest card has the four fields; with DIA-NN as the
+  builder they become `--min-pr-mz` / `--max-pr-mz` / `--min-fr-mz` / `--max-fr-mz`, passed
+  and added to the library cache key only when set, and the fragment limits also reach the
+  decoys' prediction. The search-space estimate counts only the charge states inside the
+  precursor range.
 - **`precursors.tsv`: the precursor-level report.** `run`, `run-experiment` and `mumdia
   report` (also with `--experiment-dir`, which rewrites it at another `--q`) write it beside
   `peptides.tsv` and `proteins.tsv`: one row per target `(peptidoform, charge)` accepted on

@@ -248,6 +248,19 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         }
     }
 
+    // Fragment m/z limits (`predict_frag.fragment_mz_min` / `fragment_mz_max`, opt-in):
+    // a fragment outside them is removed after prediction, so the predicted intensities
+    // are the model's as they were, and before the top-N selection, so its slot goes to a
+    // fragment inside the range.
+    let frag_range = fragment_mz_range(p.cfg);
+    let n_fragments_out_of_range: u64 = match frag_range {
+        Some((lo, hi)) => raws
+            .par_iter_mut()
+            .map(|r| retain_fragments(r, |f| f.mz >= lo && f.mz <= hi) as u64)
+            .sum(),
+        None => 0,
+    };
+
     // Keep top-N fragments by predicted intensity. Each candidate is independent
     // (operates only on its own frags/frag_int), so this parallelizes with no
     // cross-item state; the result per candidate is identical to the serial loop.
@@ -266,7 +279,38 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
         r.frags.truncate(order.len());
         r.frag_int.truncate(order.len());
     });
-    raws.retain(|r| !r.frags.is_empty());
+    // A candidate the fragment limits left without a fragment goes with its pair, as an
+    // unpredicted one does, so a target never stays while its decoy leaves. Without the
+    // limits no candidate can be empty here, and the default path is the one it was.
+    let (n_frag_empty_rows, n_frag_empty_pairs) = if frag_range.is_some() {
+        let empty: Vec<usize> = raws
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.frags.is_empty().then_some(i))
+            .collect();
+        let dropped = drop_unpredicted(&mut raws, &[empty.as_slice()]);
+        info!(
+            fragments_out_of_range = n_fragments_out_of_range,
+            candidates_dropped = dropped.0,
+            pairs_dropped = dropped.1,
+            fragment_mz_min = ?p.cfg.fragment_mz_min,
+            fragment_mz_max = ?p.cfg.fragment_mz_max,
+            "predict-frag: fragments outside the fragment m/z range removed; candidates \
+             left without a fragment were dropped with their pairs"
+        );
+        if raws.is_empty() {
+            bail!(
+                "predict-frag: the fragment m/z range [{}, {}] leaves no candidate with a \
+                 fragment; widen predict_frag.fragment_mz_min / fragment_mz_max",
+                p.cfg.fragment_mz_min.unwrap_or(f64::NEG_INFINITY),
+                p.cfg.fragment_mz_max.unwrap_or(f64::INFINITY)
+            );
+        }
+        dropped
+    } else {
+        raws.retain(|r| !r.frags.is_empty());
+        (0, 0)
+    };
 
     // candidate_id = precursor-m/z sort key (docs/09_extract.md).
     // Parallel STABLE sort: rayon's par_sort_by is stable, so ties keep input order exactly
@@ -389,6 +433,23 @@ pub fn run_hashed(p: PredictFragParams) -> Result<(Written, Written)> {
     let mut params = json!({"top_n": p.cfg.top_n_fragments, "ms2pip_model": p.cfg.ms2pip_model,
                             "rt_predictor": format!("{:?}", p.cfg.rt_predictor),
                             "fragment_predictor": format!("{:?}", p.cfg.predictor)});
+    if frag_range.is_some() {
+        // Recorded only with a fragment limit, so every other report is what it was.
+        stats.insert(
+            "fragments_out_of_mz_range".to_string(),
+            json!(n_fragments_out_of_range),
+        );
+        stats.insert(
+            "candidates_dropped_without_fragments_in_range".to_string(),
+            json!(n_frag_empty_rows),
+        );
+        stats.insert(
+            "pairs_dropped_without_fragments_in_range".to_string(),
+            json!(n_frag_empty_pairs),
+        );
+        params["fragment_mz_min"] = json!(p.cfg.fragment_mz_min);
+        params["fragment_mz_max"] = json!(p.cfg.fragment_mz_max);
+    }
     if has_im {
         // Recorded only when 1/K0 was predicted, so a library without it keeps its report.
         stats.insert("without_im".to_string(), json!(im_missing.len() as u64));
@@ -974,6 +1035,37 @@ fn mod_signature(peptidoform: &str) -> String {
     mods.join(",")
 }
 
+/// The fragment m/z limits as an inclusive (low, high) range, an unset end unbounded, or
+/// `None` when neither is set.
+fn fragment_mz_range(cfg: &PredictFragConfig) -> Option<(f64, f64)> {
+    if cfg.fragment_mz_min.is_none() && cfg.fragment_mz_max.is_none() {
+        return None;
+    }
+    Some((
+        cfg.fragment_mz_min.unwrap_or(f64::NEG_INFINITY),
+        cfg.fragment_mz_max.unwrap_or(f64::INFINITY),
+    ))
+}
+
+/// Keep the fragments of `r` for which `keep` holds, with their intensities, in their
+/// original order. Returns how many were removed.
+fn retain_fragments(r: &mut Raw, keep: impl Fn(&Fragment) -> bool) -> usize {
+    let before = r.frags.len();
+    let mut dst = 0usize;
+    for src in 0..before {
+        if keep(&r.frags[src]) {
+            r.frags.swap(dst, src);
+            if src < r.frag_int.len() {
+                r.frag_int.swap(dst, src);
+            }
+            dst += 1;
+        }
+    }
+    r.frags.truncate(dst);
+    r.frag_int.truncate(dst);
+    before - dst
+}
+
 /// The key under which a target and its paired decoy are one precursor.
 fn pair_key(base_peptide_id: u32, charge: i32, peptidoform: &str) -> (u32, i32, String) {
     (base_peptide_id, charge, mod_signature(peptidoform))
@@ -1413,6 +1505,124 @@ mod im_tests {
             artifact::FRAGMENT_LIBRARY_PRECURSORS
         );
         assert_eq!(artifact::fragment_library_precursors(true).1, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write a peptidoforms table of (base peptide, peptidoform, label) rows at charge 2
+    /// and run predict-frag on the native models with `cfg`; returns the precursor and
+    /// fragment tables' paths and the directory.
+    fn predict(
+        tag: &str,
+        rows: &[(u32, &str, &str)],
+        cfg: &PredictFragConfig,
+    ) -> (Result<(u64, u64)>, String, String, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mumdia_pf_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |n: &str| dir.join(n).to_string_lossy().into_owned();
+        let n = rows.len() as u32;
+        mumdia_io::table::write_table(
+            &path("peptidoforms.parquet"),
+            vec![
+                Col::U32("id".into(), (0..n).collect()),
+                Col::U32("base_peptide_id".into(), rows.iter().map(|r| r.0).collect()),
+                Col::Str(
+                    "peptidoform".into(),
+                    rows.iter().map(|r| r.1.to_string()).collect(),
+                ),
+                Col::I32("charge".into(), vec![2; rows.len()]),
+                Col::Str(
+                    "label".into(),
+                    rows.iter().map(|r| r.2.to_string()).collect(),
+                ),
+                Col::Str("protein".into(), vec!["P1".to_string(); rows.len()]),
+            ],
+        )
+        .unwrap();
+        let (prec, frag) = (path("prec.parquet"), path("frag.parquet"));
+        let result = run(PredictFragParams {
+            peptidoforms: &path("peptidoforms.parquet"),
+            out_precursors: &prec,
+            out_fragments: &frag,
+            cfg,
+            work_dir: &path("work"),
+            config_hash: "h",
+            rt_placeholder: false,
+            run_has_im: false,
+        });
+        (result, prec, frag, dir)
+    }
+
+    /// The fragment m/z limits remove every fragment outside them before the top-N
+    /// selection, and a candidate left without a fragment leaves with its pair: here the
+    /// target PEPTIDEK has no fragment in a narrow window around one of its decoy's, so
+    /// both go, while the second pair, which has that fragment on both sides, stays.
+    #[test]
+    fn fragment_mz_limits_filter_fragments_and_drop_emptied_candidates_with_their_pair() {
+        let frags_of = |s: &str| -> Vec<f64> {
+            parse_peptidoform(s)
+                .unwrap()
+                .fragments(&[1, 2])
+                .iter()
+                .map(|f| f.mz)
+                .collect()
+        };
+        let (target, decoy) = ("PEPTIDEK", "EDITPEPK");
+        let tf = frags_of(target);
+        let f = frags_of(decoy)
+            .into_iter()
+            .find(|m| tf.iter().all(|t| (t - m).abs() > 0.5))
+            .expect("a decoy fragment the target does not share");
+        let rows = [
+            (0, target, "target"),
+            (0, decoy, "decoy"),
+            (1, decoy, "target"),
+            (1, decoy, "decoy"),
+        ];
+        let cfg = PredictFragConfig {
+            fragment_mz_min: Some(f - 0.1),
+            fragment_mz_max: Some(f + 0.1),
+            ..PredictFragConfig::default()
+        };
+        let (result, prec, frag, dir) = predict("fragmz", &rows, &cfg);
+        let (n_prec, n_frag) = result.unwrap();
+        assert_eq!(n_prec, 2);
+        let t = TableFile::open(&prec).unwrap();
+        assert_eq!(t.u32("base_peptide_id").unwrap(), [1, 1]);
+        let ft = TableFile::open(&frag).unwrap();
+        let mz = ft.f64("mz").unwrap();
+        assert_eq!(mz.len() as u64, n_frag);
+        assert!(mz.iter().all(|m| (m - f).abs() <= 0.1), "{mz:?}");
+        let report: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{prec}.report.json")).unwrap();
+        assert_eq!(
+            report["stats"]["candidates_dropped_without_fragments_in_range"],
+            2
+        );
+        assert_eq!(
+            report["stats"]["pairs_dropped_without_fragments_in_range"],
+            1
+        );
+        assert!(report["params"]["fragment_mz_min"].is_number());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Without the limits the report carries none of the new entries.
+        let (result, prec, _, dir) = predict("fragmz_off", &rows, &PredictFragConfig::default());
+        assert_eq!(result.unwrap().0, 4);
+        let report: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{prec}.report.json")).unwrap();
+        assert!(report["stats"].get("fragments_out_of_mz_range").is_none());
+        assert!(report["params"].get("fragment_mz_min").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A range no fragment falls in is an error, not an empty library.
+        let none = PredictFragConfig {
+            fragment_mz_min: Some(90_000.0),
+            ..PredictFragConfig::default()
+        };
+        let (result, _, _, dir) = predict("fragmz_none", &rows, &none);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("leaves no candidate"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
