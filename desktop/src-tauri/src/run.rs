@@ -21,7 +21,7 @@
 //! feed that costs the engine nothing and works identically for a run this
 //! application started and one it is merely looking at.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -971,11 +971,14 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
 
 /// One past run, reconstructed from what it left on disk.
 ///
-/// There is no history database. A finished run already carries a complete record
-/// in its own output folder: `manifest.json` for the engine version, the commit and
-/// the hashed inputs, and `psms_scored.parquet.report.json` for the counts and the
-/// classifier that actually ran. Reading those back is both less code and more
-/// honest than a separate index, which could disagree with the folder it describes.
+/// There is no history database. A finished search already carries a complete record
+/// in its own output folder, written by the engine as its last step: `manifest.json`
+/// (a single `run`) or `experiment_manifest.json` (a `run-experiment`) for the engine
+/// version, the commit and the hashed inputs, and `psms_scored.parquet.report.json` or
+/// `scored_combined.parquet.report.json` for the counts and the classifier that actually
+/// ran. Reading those back is both less code and more honest than a separate index,
+/// which could disagree with the folder it describes. Every one of these files is a
+/// result-tier JSON sidecar, so they survive `output.retain` pruning.
 #[derive(Serialize, Clone, Debug)]
 pub struct HistoryEntry {
     pub out_dir: String,
@@ -984,22 +987,89 @@ pub struct HistoryEntry {
     pub results: Option<Results>,
     /// Present when the run wrote a manifest, which is every completed run.
     pub engine_version: Option<String>,
+    /// True for a pooled `run-experiment` folder.
+    pub experiment: bool,
 }
 
-/// Read one output directory as a history entry, or `None` if it is not one.
-pub fn history_entry(dir: &Path) -> Option<HistoryEntry> {
-    let scored = dir.join("psms_scored.parquet.report.json");
-    let manifest = dir.join("manifest.json");
-    if !scored.is_file() && !manifest.is_file() {
-        return None;
-    }
-    let finished = scored
-        .metadata()
-        .or_else(|_| manifest.metadata())
+/// What a remembered output folder turned out to be when History read it.
+///
+/// Every remembered folder comes back, so that nothing disappears from History without a
+/// reason: a folder that is not (or not yet) a completed search is listed with its
+/// status and why, and the interface offers to forget it. The order of the variants is
+/// the order of the History screen.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryStatus {
+    /// A finished search; `entry` is set.
+    Completed,
+    /// A search started by this application is writing to the folder now.
+    Running,
+    /// Search output, but the engine never wrote its final manifest: the search failed,
+    /// was stopped, or is still running outside this application.
+    Incomplete,
+    /// The folder exists but holds no MuMDIA search (or holds a library build, or one
+    /// run inside an experiment).
+    NotASearch,
+    /// The folder does not exist: moved, renamed or deleted.
+    NotFound,
+}
+
+/// One remembered folder as the History screen lists it.
+#[derive(Serialize, Clone, Debug)]
+pub struct HistoryItem {
+    pub out_dir: String,
+    pub name: String,
+    pub status: HistoryStatus,
+    /// Why the folder is not a completed search, in words for the History screen.
+    pub reason: Option<String>,
+    pub entry: Option<HistoryEntry>,
+}
+
+const SINGLE_MANIFEST: &str = "manifest.json";
+const SINGLE_SCORED: &str = "psms_scored.parquet.report.json";
+const EXPERIMENT_MANIFEST: &str = "experiment_manifest.json";
+const EXPERIMENT_SCORED: &str = "scored_combined.parquet.report.json";
+
+fn mtime_ms(p: &Path) -> Option<u64> {
+    p.metadata()
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64)
+}
+
+fn folder_name(dir: &Path) -> String {
+    dir.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("run")
+        .to_string()
+}
+
+/// Read one output directory as a completed search, or `None` if it is not one.
+///
+/// A folder is a completed search when the engine wrote the manifest that ends a run
+/// (`manifest.json`) or an experiment (`experiment_manifest.json`); both are written
+/// after every other output. The finish time is the scored report's modification time,
+/// or the manifest's when the report is absent. A `build-library` folder writes a
+/// `manifest.json` too, beside its `library.json`; without a scored report it is a
+/// library, not a search.
+pub fn history_entry(dir: &Path) -> Option<HistoryEntry> {
+    let (manifest, scored, experiment) = if dir.join(EXPERIMENT_MANIFEST).is_file() {
+        (
+            dir.join(EXPERIMENT_MANIFEST),
+            dir.join(EXPERIMENT_SCORED),
+            true,
+        )
+    } else if dir.join(SINGLE_MANIFEST).is_file() {
+        (dir.join(SINGLE_MANIFEST), dir.join(SINGLE_SCORED), false)
+    } else {
+        return None;
+    };
+    if !experiment && !scored.is_file() && dir.join("library.json").is_file() {
+        return None;
+    }
+    let finished = mtime_ms(&scored)
+        .or_else(|| mtime_ms(&manifest))
         .unwrap_or(0);
     let engine_version = std::fs::read_to_string(&manifest)
         .ok()
@@ -1010,16 +1080,156 @@ pub fn history_entry(dir: &Path) -> Option<HistoryEntry> {
                 .map(|s| s.to_string())
         });
     Some(HistoryEntry {
-        name: dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("run")
-            .to_string(),
+        name: folder_name(dir),
         out_dir: dir.display().to_string(),
         finished_unix_ms: finished,
         results: read_results(dir),
         engine_version,
+        experiment,
     })
+}
+
+/// True when `dir` or a directory directly below it holds an artifact report: a search
+/// started here. Two levels cover both layouts (`spectra/`, `r0/`, `first_pass/`) and
+/// keep this cheap on a large folder that is not a search at all.
+fn has_search_output(dir: &Path) -> bool {
+    let is_report = |p: &Path| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".report.json"))
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut subdirs = Vec::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        match e.file_type() {
+            Ok(t) if t.is_file() && is_report(&p) => return true,
+            Ok(t) if t.is_dir() => subdirs.push(p),
+            _ => {}
+        }
+    }
+    subdirs.iter().any(|d| {
+        std::fs::read_dir(d)
+            .map(|es| es.flatten().any(|e| is_report(&e.path())))
+            .unwrap_or(false)
+    })
+}
+
+/// A comparable form of a folder path: canonical when it exists, without a trailing
+/// separator, with one kind of slash, and case-folded on Windows.
+pub fn dir_key(p: &str) -> String {
+    let s = std::fs::canonicalize(p)
+        .map(|c| c.display().to_string())
+        .unwrap_or_else(|_| p.to_string());
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s).replace('\\', "/");
+    let s = s.trim_end_matches('/').to_string();
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
+/// Classify one remembered folder. `running` says whether a search started by this
+/// application is writing to it now.
+pub fn history_item(dir: &Path, running: bool) -> HistoryItem {
+    let item = |status, reason: &str, entry| HistoryItem {
+        out_dir: dir.display().to_string(),
+        name: folder_name(dir),
+        status,
+        reason: (!reason.is_empty()).then(|| reason.to_string()),
+        entry,
+    };
+    if !dir.exists() {
+        return item(
+            HistoryStatus::NotFound,
+            "Folder not found: it was moved, renamed or deleted.",
+            None,
+        );
+    }
+    if !dir.is_dir() {
+        return item(
+            HistoryStatus::NotASearch,
+            "This is a file, not an output folder.",
+            None,
+        );
+    }
+    if running {
+        return item(
+            HistoryStatus::Running,
+            "A search is running in this folder now.",
+            None,
+        );
+    }
+    if let Some(e) = history_entry(dir) {
+        return item(HistoryStatus::Completed, "", Some(e));
+    }
+    if dir.join("library.json").is_file() {
+        return item(
+            HistoryStatus::NotASearch,
+            "A library was built here (library.json), not a search.",
+            None,
+        );
+    }
+    // One run of an experiment: `r0/`, a run named after its input, or one under
+    // `first_pass/` / `second_pass/`.
+    for up in [dir.parent(), dir.parent().and_then(|d| d.parent())]
+        .into_iter()
+        .flatten()
+    {
+        if up.join(EXPERIMENT_MANIFEST).is_file() {
+            return item(
+                HistoryStatus::NotASearch,
+                &format!(
+                    "This is one run inside the experiment {}; add that folder instead.",
+                    up.display()
+                ),
+                None,
+            );
+        }
+    }
+    if dir.join(SINGLE_SCORED).is_file() || dir.join(EXPERIMENT_SCORED).is_file() {
+        return item(
+            HistoryStatus::Incomplete,
+            "The search scored its identifications but stopped before it finished \
+             (no manifest): it failed or was stopped during quantification or reporting.",
+            None,
+        );
+    }
+    if has_search_output(dir) {
+        return item(
+            HistoryStatus::Incomplete,
+            "The search did not finish (no manifest): it failed, was stopped, \
+             or is still running outside this window.",
+            None,
+        );
+    }
+    item(
+        HistoryStatus::NotASearch,
+        "No MuMDIA search output in this folder.",
+        None,
+    )
+}
+
+/// Every remembered folder, classified, each once. Completed searches come first, newest
+/// first; the others follow by status (running, incomplete, not a search, not found),
+/// each group in the order the folders were remembered.
+pub fn history_list(dirs: &[String], running: &[String]) -> Vec<HistoryItem> {
+    let running: BTreeSet<String> = running.iter().map(|d| dir_key(d)).collect();
+    let mut seen = BTreeSet::new();
+    let mut out: Vec<HistoryItem> = dirs
+        .iter()
+        .filter(|d| seen.insert(dir_key(d)))
+        .map(|d| history_item(Path::new(d), running.contains(&dir_key(d))))
+        .collect();
+    // A stable sort: equal keys keep the remembered order.
+    out.sort_by_key(|i| {
+        let finished = i.entry.as_ref().map_or(0, |e| e.finished_unix_ms);
+        (i.status, std::cmp::Reverse(finished))
+    });
+    out
 }
 
 /// Fold every `*.report.json` under `dir` into one row per producing stage.
@@ -2038,12 +2248,242 @@ mod history_tests {
     #[test]
     fn a_folder_that_is_not_a_run_is_not_history() {
         // A user picks output folders by hand, so the list will contain directories
-        // that never held a search. They must drop out rather than appear empty.
+        // that never held a search. They are not entries; `history_item` lists them as
+        // not a search, with the reason, rather than as an empty search.
         let dir = std::env::temp_dir().join(format!("mumdia_not_a_run_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("notes.txt"), b"hello").unwrap();
         assert!(history_entry(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mumdia_hist_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(dir: &Path, rel: &str, text: &str) {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    fn scored_report() -> String {
+        serde_json::json!({
+            "logical_name": "psms_scored", "stage": "rescore", "rows": 405651,
+            "params": {"classifier": "nn_torch", "classifier_requested": "NnTorch",
+                       "config_hash": "d7fd"},
+            "stats": {"classifier": "nn_torch", "psms": 405651,
+                      "target_peptides_at_1pct": 97412,
+                      "target_precursors_at_1pct": 120817,
+                      "target_protein_groups_at_1pct": 9702}
+        })
+        .to_string()
+    }
+
+    /// A `run-experiment` folder as the results tier of `output.retain` leaves it: the
+    /// JSON sidecars and the TSVs, no parquet, runs named after their inputs (#274).
+    fn experiment(dir: &Path) {
+        write(
+            dir,
+            "experiment_manifest.json",
+            r#"{"mumdia_version": "0.9.0", "experiment": {"n_runs": 3}}"#,
+        );
+        write(dir, "scored_combined.parquet.report.json", &scored_report());
+        write(dir, "peptides.tsv", "peptidoform\n");
+        write(dir, "proteins.tsv", "protein\n");
+        write(dir, "pruned.json", "{}");
+        for run in ["A0_1EX8741FD", "A0_1EX8745FD", "A0_2EX8749FD"] {
+            write(dir, &format!("{run}/cal.json"), "{}");
+            write(
+                dir,
+                &format!("{run}/psms_competed.parquet.report.json"),
+                "{}",
+            );
+            write(
+                dir,
+                &format!("second_pass/{run}/features.parquet.report.json"),
+                "{}",
+            );
+        }
+        write(
+            dir,
+            "first_pass/scored_combined.parquet.report.json",
+            &scored_report(),
+        );
+    }
+
+    #[test]
+    fn an_experiment_folder_reads_back_as_history() {
+        // #282: every "One experiment" search was missing from History, because only the
+        // files a single `run` writes were recognised.
+        let dir = scratch("experiment");
+        experiment(&dir);
+        let e = history_entry(&dir).expect("a completed experiment is a history entry");
+        assert!(e.experiment);
+        assert_eq!(e.engine_version.as_deref(), Some("0.9.0"));
+        assert!(e.finished_unix_ms > 0);
+        let r = e
+            .results
+            .expect("results come from scored_combined's report");
+        assert!(r.experiment_wide);
+        assert_eq!(
+            (r.peptides_1pct, r.protein_groups_1pct, r.n_runs),
+            (97412, 9702, 3)
+        );
+        assert!(r.has_peptides_tsv && r.has_proteins_tsv);
+        let i = history_item(&dir, false);
+        assert_eq!(i.status, HistoryStatus::Completed);
+        assert!(i.reason.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_single_run_with_only_its_json_sidecars_reads_back_as_history() {
+        let dir = scratch("single");
+        write(&dir, "manifest.json", r#"{"mumdia_version": "0.9.0"}"#);
+        write(&dir, "psms_scored.parquet.report.json", &scored_report());
+        write(&dir, "peptides.tsv", "x\n");
+        let e = history_entry(&dir).expect("a completed run");
+        assert!(!e.experiment);
+        assert_eq!(e.results.unwrap().peptides_1pct, 97412);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_folder_that_is_not_a_completed_search_says_why() {
+        let root = scratch("statuses");
+        let missing = root.join("moved_away");
+        assert_eq!(
+            history_item(&missing, false).status,
+            HistoryStatus::NotFound
+        );
+
+        let empty = root.join("notes");
+        write(&empty, "notes.txt", "hello");
+        let i = history_item(&empty, false);
+        assert_eq!(i.status, HistoryStatus::NotASearch);
+        assert!(i.reason.is_some());
+
+        // Started, then failed or stopped: reports but no manifest.
+        let failed = root.join("failed");
+        write(&failed, "spectra/spectra_ms2.parquet.report.json", "{}");
+        write(&failed, "seed_psms.parquet.report.json", "{}");
+        assert_eq!(
+            history_item(&failed, false).status,
+            HistoryStatus::Incomplete
+        );
+        // The same folder while this application runs a search in it.
+        assert_eq!(history_item(&failed, true).status, HistoryStatus::Running);
+
+        // An experiment that failed after its pooled rescore.
+        let late = root.join("late");
+        write(
+            &late,
+            "scored_combined.parquet.report.json",
+            &scored_report(),
+        );
+        let i = history_item(&late, false);
+        assert_eq!(i.status, HistoryStatus::Incomplete);
+        assert!(i.reason.unwrap().contains("quantification"));
+
+        // A library build writes a manifest too.
+        let lib = root.join("lib");
+        write(&lib, "manifest.json", r#"{"mumdia_version": "0.9.0"}"#);
+        write(&lib, "library.json", "{}");
+        assert!(history_entry(&lib).is_none());
+        assert_eq!(history_item(&lib, false).status, HistoryStatus::NotASearch);
+
+        // One run inside an experiment points at the experiment.
+        let exp = root.join("exp");
+        experiment(&exp);
+        let i = history_item(&exp.join("A0_1EX8741FD"), false);
+        assert_eq!(i.status, HistoryStatus::NotASearch);
+        assert!(i.reason.unwrap().contains("experiment"));
+        let i = history_item(&exp.join("second_pass").join("A0_1EX8741FD"), false);
+        assert_eq!(i.status, HistoryStatus::NotASearch);
+
+        let file = root.join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(history_item(&file, false).status, HistoryStatus::NotASearch);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn history_lists_every_folder_completed_first_newest_first() {
+        let root = scratch("order");
+        let old = root.join("old");
+        let new = root.join("new");
+        let failed = root.join("failed");
+        let busy = root.join("busy");
+        let plain = root.join("plain");
+        let gone = root.join("gone");
+        experiment(&old);
+        // The newer search must carry a later finish time than the older one.
+        std::thread::sleep(Duration::from_millis(30));
+        write(&new, "manifest.json", r#"{"mumdia_version": "0.9.0"}"#);
+        write(&new, "psms_scored.parquet.report.json", &scored_report());
+        write(&failed, "seed_psms.parquet.report.json", "{}");
+        write(&busy, "seed_psms.parquet.report.json", "{}");
+        write(&plain, "x.txt", "x");
+        let s = |p: &Path| p.display().to_string();
+        // Remembered order: most recently used first, as the interface keeps it; the
+        // trailing separator on one copy of `old` must not list it twice.
+        let dirs = vec![
+            s(&gone),
+            s(&plain),
+            s(&failed),
+            s(&old),
+            format!("{}/", s(&old)),
+            s(&busy),
+            s(&new),
+        ];
+        let list = history_list(&dirs, &[format!("{}/", s(&busy))]);
+        let got: Vec<(&str, HistoryStatus)> =
+            list.iter().map(|i| (i.name.as_str(), i.status)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("new", HistoryStatus::Completed),
+                ("old", HistoryStatus::Completed),
+                ("busy", HistoryStatus::Running),
+                ("failed", HistoryStatus::Incomplete),
+                ("plain", HistoryStatus::NotASearch),
+                ("gone", HistoryStatus::NotFound),
+            ]
+        );
+        // The interface switches on these strings.
+        let v = serde_json::to_value(&list).unwrap();
+        assert_eq!(v[0]["status"], "completed");
+        assert_eq!(v[4]["status"], "not_a_search");
+        assert_eq!(v[5]["status"], "not_found");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Real outputs, copied as their JSON sidecars: `MUMDIA_HISTORY_REAL=<dir>[;<dir>...]`
+    /// `cargo test -- --ignored real_outputs`. Every folder must be a completed search.
+    #[test]
+    #[ignore]
+    fn real_outputs_read_back_as_history() {
+        let dirs = std::env::var("MUMDIA_HISTORY_REAL").expect("MUMDIA_HISTORY_REAL");
+        for d in dirs.split(';').filter(|d| !d.is_empty()) {
+            let i = history_item(Path::new(d), false);
+            let e = i.entry.as_ref().unwrap_or_else(|| panic!("{d}: {i:?}"));
+            let r = e.results.as_ref().expect("results");
+            eprintln!(
+                "{d}: {:?} experiment={} version={:?} peptides={} groups={} runs={} classifier={}",
+                i.status,
+                e.experiment,
+                e.engine_version,
+                r.peptides_1pct,
+                r.protein_groups_1pct,
+                r.n_runs,
+                r.classifier
+            );
+            assert_eq!(i.status, HistoryStatus::Completed);
+        }
     }
 }
 

@@ -894,6 +894,36 @@ they drift, the interface either blocks a file the engine would convert or admit
 it will not. The file-versus-directory question is answered in the backend, through
 `vendor_of`, because the webview cannot stat a path.
 
+## History
+
+There is no history database. The interface remembers the output folders it has used
+(`mumdia.folders` in the webview's local storage, the 500 most recent; when the cap pushes
+older folders out, History says how many), and the `history` command reads each folder back
+on every visit. A folder is a completed search when the engine wrote the manifest that ends
+a search: `manifest.json` for a single `run`, `experiment_manifest.json` for a
+`run-experiment` ("One experiment" mode). The counts come from
+`psms_scored.parquet.report.json` or `scored_combined.parquet.report.json`, the engine
+version from the manifest, and the finish time from the scored report's modification time.
+These are all JSON sidecars of the results tier, so a folder pruned with `output.retain`
+still reads back, and the folder name does not matter (runs named after their inputs,
+#274).
+
+Every remembered folder comes back with a status, so nothing leaves the list without a
+reason (#282). Completed searches are listed first, newest first; the others follow, greyed,
+with what was found:
+
+| status | meaning |
+|---|---|
+| running | a search started by this application is writing to the folder now |
+| did not finish | search output but no manifest: the search failed, was stopped, or is still running in another window |
+| not a completed search | no search output, a library build (`library.json`), or one run inside an experiment (add the experiment folder) |
+| folder not found | moved, renamed or deleted |
+
+"Remove" forgets such a folder; it never deletes anything. "Add an existing output folder…"
+picks a folder (a search run from the command line, another machine's results, or one the
+list lost), checks it with `history_check`, and adds it only when it is a completed search;
+otherwise it says why not.
+
 ## Settings
 
 The editor is generated from `configs/config-schema.json`, which
