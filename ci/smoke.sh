@@ -1269,6 +1269,120 @@ for exp_cfg in "$work/exp_seq.json" "$work/exp_par.json" "$work/exp_auto.json"; 
 done
 echo "    ok: $n_tables tables byte-identical under parallel_runs = 2, $n_auto over three runs under auto; a failed conversion stops before any seed"
 
+# 5v. The normalisation scope (`quant.normalisation_scope`, CompOmics/MuMDIA#275). The three-run
+#     experiment above runs at the default scope `all`; here the same three runs come from a
+#     sample sheet that puts a and b in condition A and c in condition B, under `condition`.
+#     The scope acts after quantification, so every scored and per-run quant table is the
+#     default experiment's, byte for byte; the size-factor table lists each run with its
+#     condition, the lone run of B keeps factor 1, the two of A have geometric mean 1, and the
+#     conditions are part of the configuration hash. The fixture's runs are copies of one
+#     file, so the factors are 1 under every scope; the kernel is then checked through
+#     `quant-lfq` on a copy of run c at twice the quantity, where the three scopes differ.
+echo "=== smoke: normalisation scope per condition"
+printf 'file\tname\tcondition\nfixture.mzML\ta\tA\nfixture_b.mzML\tb\tA\nfixture_c.mzML\tc\tB\n' \
+    > "$work/exp_sheet.tsv"
+"$PY" - "$work/exp_seq.json" "$work/exp_cond.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("quant", {})["normalisation_scope"] = "condition"
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+"$BIN" run-experiment --fasta test_data/fixture.fasta --sample-sheet "$work/exp_sheet.tsv" \
+    --out-dir "$work/exp_cond" --config "$work/exp_cond.json" > "$work/exp_cond.log" 2>&1 \
+    || { tail -30 "$work/exp_cond.log"; echo "run-experiment with a sample sheet and normalisation_scope = condition failed"; exit 1; }
+for f in scored_combined.parquet a/scored.parquet c/scored.parquet a/peptide_quant.parquet \
+         b/peptide_quant.parquet c/protein_group_quant.parquet; do
+    cmp -s "$work/exp3/$f" "$work/exp_cond/$f" \
+        || { echo "normalisation_scope = condition changed $f"; exit 1; }
+done
+# Every run must have a condition under `condition`, and --condition takes one per --mzml.
+if "$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" --run-names a --run-names b \
+    --out-dir "$work/exp_cond_fail" --config "$work/exp_cond.json" > "$work/exp_cond_fail.log" 2>&1; then
+    echo "normalisation_scope = condition ran without conditions"; exit 1
+fi
+grep -q "these runs have none" "$work/exp_cond_fail.log" \
+    || { tail -5 "$work/exp_cond_fail.log"; echo "the missing conditions are not named"; exit 1; }
+if "$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" --condition A \
+    --out-dir "$work/exp_cond_fail" --config "$work/exp_seq.json" > "$work/exp_cond_fail.log" 2>&1; then
+    echo "run-experiment accepted one --condition for two runs"; exit 1
+fi
+grep -q "\-\-condition has 1 entries but there are 2 runs" "$work/exp_cond_fail.log" \
+    || { tail -5 "$work/exp_cond_fail.log"; echo "the --condition count is not checked"; exit 1; }
+# The kernel through `quant-lfq`: the cross-run LFQ of the experiment again from its own
+# peptide_quant tables (byte-identical), then run c at twice the quantity under each scope.
+"$BIN" quant-lfq --inputs "$work/exp_cond/a/peptide_quant.parquet" \
+    "$work/exp_cond/b/peptide_quant.parquet" "$work/exp_cond/c/peptide_quant.parquet" \
+    --condition A --condition A --condition B --out "$work/lfq_cond_again.parquet" \
+    > "$work/lfq_cond_again.log" 2>&1 || { tail -20 "$work/lfq_cond_again.log"; exit 1; }
+cmp -s "$work/exp_cond/lfq_maxlfq.parquet" "$work/lfq_cond_again.parquet" \
+    || { echo "quant-lfq --condition differs from the experiment's LFQ under condition"; exit 1; }
+"$PY" - "$work/exp_cond/c/peptide_quant.parquet" "$work/pq_c_x2.parquet" <<'PYEOF'
+import sys
+import pyarrow as pa, pyarrow.compute as pc, pyarrow.parquet as pq
+t = pq.read_table(sys.argv[1])
+i = t.schema.get_field_index("quantity")
+t = t.set_column(i, "quantity", pc.multiply(t.column("quantity"), pa.scalar(2.0)))
+pq.write_table(t, sys.argv[2], compression="snappy")
+PYEOF
+for arm in all condition none; do
+    extra=()
+    norm=median_ratio
+    case "$arm" in
+        condition) extra=(--condition A --condition A --condition B) ;;
+        none) norm=none ;;
+    esac
+    "$BIN" quant-lfq --inputs "$work/exp_cond/a/peptide_quant.parquet" \
+        "$work/exp_cond/b/peptide_quant.parquet" "$work/pq_c_x2.parquet" \
+        --normalize "$norm" ${extra[@]+"${extra[@]}"} \
+        --size-factors-out "$work/sf_$arm.tsv" --out "$work/lfq_$arm.parquet" \
+        > "$work/lfq_$arm.log" 2>&1 || { tail -20 "$work/lfq_$arm.log"; exit 1; }
+done
+"$PY" - "$work" <<'PYEOF'
+import csv, json, math, statistics, sys
+import pyarrow.parquet as pq
+w = sys.argv[1]
+def tsv(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f, delimiter="\t"))
+m = json.load(open(f"{w}/exp_cond/experiment_manifest.json"))
+ref = json.load(open(f"{w}/exp3/experiment_manifest.json"))
+e, re_ = m["experiment"], ref["experiment"]
+assert e["conditions"] == {"a": "A", "b": "A", "c": "B"}, e.get("conditions")
+assert e["lfq_normalisation"]["scope"] == "condition", e["lfq_normalisation"]
+assert re_["lfq_normalisation"]["scope"] == "all" and "conditions" not in re_, re_["lfq_normalisation"]
+assert m["config_hash"] != ref["config_hash"]
+cfg = json.loads(m["config_json"])
+assert cfg["experiment"]["conditions"] == {"a": "A", "b": "A", "c": "B"}, cfg["experiment"]
+assert "conditions" not in json.loads(ref["config_json"]).get("experiment", {})
+rows = tsv(f"{w}/exp_cond/lfq_size_factors.tsv")
+assert [(r["run"], r["condition"]) for r in rows] == [("a", "A"), ("b", "A"), ("c", "B")], rows
+f = {r["run"]: float(r["size_factor"]) for r in rows}
+assert f["c"] == 1.0 and int(rows[2]["n_features"]) == 0, rows
+assert abs(math.log(f["a"]) + math.log(f["b"])) < 1e-9 and int(rows[0]["n_features"]) > 0, rows
+rows3 = tsv(f"{w}/exp3/lfq_size_factors.tsv")
+assert [(r["run"], r["condition"]) for r in rows3] == [("a", ""), ("b", ""), ("c", "")], rows3
+# quant-lfq with run c at twice the quantity: per condition the 2x stays (c is alone in B),
+# over all runs it is taken for loading, and `none` applies no factor.
+def ratio(arm):
+    t = pq.read_table(f"{w}/lfq_{arm}.parquet").to_pydict()
+    by = {}
+    for g, r, q in zip(t["protein_group"], t["run"], t["quantity"]):
+        by.setdefault(g, {})[r] = q
+    rs = [v[2] / v[0] for v in by.values() if v.get(0) and v.get(2)]
+    return statistics.median(rs), len(rs)
+for arm, want in (("condition", 2.0), ("all", 1.0), ("none", 2.0)):
+    got, n = ratio(arm)
+    assert n > 10 and abs(got - want) < 0.02, (arm, got, n)
+sf = {arm: {r["run"]: float(r["size_factor"]) for r in tsv(f"{w}/sf_{arm}.tsv")}
+      for arm in ("all", "condition", "none")}
+assert sf["none"] == {"0": 1.0, "1": 1.0, "2": 1.0}, sf["none"]
+assert sf["condition"]["2"] == 1.0 and abs(sf["all"]["2"] / sf["all"]["0"] - 2.0) < 0.02, sf
+print(f"    ok: conditions {e['conditions']} in the manifest and the hash, factors {f}; "
+      f"run c at 2x keeps 2x per condition and under none, 1x over all runs")
+PYEOF
+
 # 5c. The DeepLC branches of the orchestrators, with a stub worker.
 #
 #     CI has no DeepLC, so every choice `run_groups` and `run-experiment` make about WHICH
@@ -1703,7 +1817,7 @@ echo "=== smoke: assertions"
     --compare-peptides "$work/out2/peptides.tsv" --experiment "$work/exp" \
     --experiment-named "$work/exp_named" --plain-report "$work/report_plain" \
     --annotated-report "$work/report_annotated" --loose-report "$work/report_q1" \
-    --min-assertions 199
+    --min-assertions 202
 
 echo "=== smoke: also check inspect and report run standalone"
 "$BIN" inspect "$work/out/psms_scored.parquet" > /dev/null

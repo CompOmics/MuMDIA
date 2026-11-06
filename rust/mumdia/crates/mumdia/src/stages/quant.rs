@@ -4137,6 +4137,34 @@ pub fn run_lfq_combine(
     quantity_column: &str,
     out: &str,
 ) -> Result<u64> {
+    run_lfq_combine_grouped(inputs, by_fragment, normalize, None, quantity_column, out)
+        .map(|(rows, _)| rows)
+}
+
+/// The size factor of each run of a cross-run LFQ, as [`run_lfq_combine_grouped`] applied
+/// it, and the number of features it was estimated from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SizeFactor {
+    pub factor: f64,
+    /// Complete-case features of the run's group (`median_ratio`), the run's own features
+    /// (`median`), or 0 when no factor was estimated (`none`, a group of one run, or no
+    /// complete feature).
+    pub n_features: usize,
+}
+
+/// [`run_lfq_combine`] with the size factors estimated within groups of runs: `groups`
+/// holds one group index per input (`quant.normalisation_scope = condition`), and each
+/// group's factors are those of `normalize` over that group's runs alone, so a group of one
+/// run keeps factor 1. `None` estimates one set over every run, as `run_lfq_combine`.
+/// Returns the row count and each run's factor.
+pub fn run_lfq_combine_grouped(
+    inputs: &[String],
+    by_fragment: bool,
+    normalize: NormalizeMethod,
+    groups: Option<&[usize]>,
+    quantity_column: &str,
+    out: &str,
+) -> Result<(u64, Vec<SizeFactor>)> {
     use std::collections::BTreeMap;
     let n = inputs.len();
     // protein_group -> feature key -> per-run intensity
@@ -4177,7 +4205,18 @@ pub fn run_lfq_combine(
     // Cross-run normalization: one global size factor per run, estimated from the
     // whole feature-by-run matrix and applied before protein rollup so both the
     // MaxLFQ profile and any downstream ratio inherit the corrected scale.
-    let factors = size_factors(&data, n, normalize);
+    if let Some(g) = groups {
+        anyhow::ensure!(
+            g.len() == n,
+            "quant-lfq: {} condition labels for {n} input tables",
+            g.len()
+        );
+    }
+    let sized = match groups {
+        Some(g) => grouped_size_factors(&data, g, normalize),
+        None => size_factors_counted(&data, &(0..n).collect::<Vec<_>>(), normalize),
+    };
+    let factors: Vec<f64> = sized.iter().map(|s| s.factor).collect();
     if normalize != NormalizeMethod::None {
         for feats in data.values_mut() {
             for vec in feats.values_mut() {
@@ -4281,7 +4320,45 @@ pub fn run_lfq_combine(
         size_factors = ?factors,
         "quant-lfq: done (+ .peptide/.precursor sibling matrices)"
     );
-    Ok(rows)
+    Ok((rows, sized))
+}
+
+/// The file name of the size-factor table `run-experiment` writes at the experiment root.
+pub const LFQ_SIZE_FACTORS_TSV: &str = "lfq_size_factors.tsv";
+
+/// Write the size factor of every run of a cross-run LFQ as a tab-separated table: `run`,
+/// `condition` (empty when the run has none), `size_factor` (what the run's feature
+/// intensities were divided by; 1 when none was applied) and `n_features` (the features it
+/// was estimated from). One row per run, in run order.
+pub fn write_size_factors_tsv(
+    path: &str,
+    runs: &[String],
+    conditions: &[Option<String>],
+    factors: &[SizeFactor],
+) -> Result<()> {
+    use std::io::Write;
+    anyhow::ensure!(
+        runs.len() == factors.len() && conditions.len() == runs.len(),
+        "{path}: {} runs, {} conditions and {} size factors",
+        runs.len(),
+        conditions.len(),
+        factors.len()
+    );
+    let mut w = std::io::BufWriter::new(
+        std::fs::File::create(path).with_context(|| format!("creating {path}"))?,
+    );
+    writeln!(w, "run\tcondition\tsize_factor\tn_features")?;
+    for ((run, cond), f) in runs.iter().zip(conditions).zip(factors) {
+        writeln!(
+            w,
+            "{run}\t{}\t{}\t{}",
+            cond.as_deref().unwrap_or(""),
+            f.factor,
+            f.n_features
+        )?;
+    }
+    w.flush()?;
+    Ok(())
 }
 
 /// Stripped base amino-acid sequence of a peptidoform: drop bracketed or
@@ -4315,33 +4392,56 @@ fn base_sequence(peptidoform: &str) -> String {
 ///
 /// Medians are taken over sorted values and the matrix is iterated in `BTreeMap`
 /// key order, so the result is deterministic (docs/14_build_test_deploy_gotchas.md).
+#[cfg(test)]
 fn size_factors(
     data: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<Option<f64>>>>,
     n: usize,
     method: NormalizeMethod,
 ) -> Vec<f64> {
+    size_factors_counted(data, &(0..n).collect::<Vec<_>>(), method)
+        .into_iter()
+        .map(|s| s.factor)
+        .collect()
+}
+
+/// [`size_factors`] over the runs `runs` of the matrix alone, one entry per entry of `runs`,
+/// with the number of features each factor was estimated from. Over every run (`0..n`) it
+/// is `size_factors` exactly: the same features in the same order, summed in the same order.
+fn size_factors_counted(
+    data: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<Option<f64>>>>,
+    runs: &[usize],
+    method: NormalizeMethod,
+) -> Vec<SizeFactor> {
+    let n = runs.len();
     match method {
-        NormalizeMethod::None => vec![1.0; n],
+        NormalizeMethod::None => vec![
+            SizeFactor {
+                factor: 1.0,
+                n_features: 0
+            };
+            n
+        ],
         NormalizeMethod::MedianRatio => {
             let mut lr: Vec<Vec<f64>> = vec![Vec::new(); n];
             for feats in data.values() {
                 for vec in feats.values() {
-                    if vec.iter().all(|x| x.is_some_and(|v| v > 0.0)) {
-                        let logs: Vec<f64> = vec.iter().map(|x| x.unwrap().log2()).collect();
+                    if runs.iter().all(|&r| vec[r].is_some_and(|v| v > 0.0)) {
+                        let logs: Vec<f64> = runs.iter().map(|&r| vec[r].unwrap().log2()).collect();
                         let refm = logs.iter().sum::<f64>() / n as f64;
-                        for r in 0..n {
-                            lr[r].push(logs[r] - refm);
+                        for k in 0..n {
+                            lr[k].push(logs[k] - refm);
                         }
                     }
                 }
             }
             (0..n)
-                .map(|r| {
-                    if lr[r].is_empty() {
+                .map(|k| SizeFactor {
+                    n_features: lr[k].len(),
+                    factor: if lr[k].is_empty() {
                         1.0
                     } else {
-                        2f64.powf(median_sorted(&mut lr[r]))
-                    }
+                        2f64.powf(median_sorted(&mut lr[k]))
+                    },
                 })
                 .collect()
         }
@@ -4349,21 +4449,22 @@ fn size_factors(
             let mut logs: Vec<Vec<f64>> = vec![Vec::new(); n];
             for feats in data.values() {
                 for vec in feats.values() {
-                    for r in 0..n {
+                    for (k, &r) in runs.iter().enumerate() {
                         if let Some(v) = vec[r] {
                             if v > 0.0 {
-                                logs[r].push(v.log2());
+                                logs[k].push(v.log2());
                             }
                         }
                     }
                 }
             }
+            let counts: Vec<usize> = logs.iter().map(Vec::len).collect();
             let med: Vec<f64> = (0..n)
-                .map(|r| {
-                    if logs[r].is_empty() {
+                .map(|k| {
+                    if logs[k].is_empty() {
                         0.0
                     } else {
-                        median_sorted(&mut logs[r])
+                        median_sorted(&mut logs[k])
                     }
                 })
                 .collect();
@@ -4373,9 +4474,48 @@ fn size_factors(
             } else {
                 median_sorted(&mut m2)
             };
-            (0..n).map(|r| 2f64.powf(med[r] - target)).collect()
+            (0..n)
+                .map(|k| SizeFactor {
+                    factor: 2f64.powf(med[k] - target),
+                    n_features: counts[k],
+                })
+                .collect()
         }
     }
+}
+
+/// Size factors estimated separately within each group of runs (`groups[r]` is run `r`'s
+/// group), scattered back to run order. A group of one run has nothing to be normalised
+/// against and keeps factor 1 (`n_features` 0).
+fn grouped_size_factors(
+    data: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<Option<f64>>>>,
+    groups: &[usize],
+    method: NormalizeMethod,
+) -> Vec<SizeFactor> {
+    let mut members: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (r, &g) in groups.iter().enumerate() {
+        members.entry(g).or_default().push(r);
+    }
+    let mut out = vec![
+        SizeFactor {
+            factor: 1.0,
+            n_features: 0
+        };
+        groups.len()
+    ];
+    for runs in members.values() {
+        if runs.len() < 2 {
+            continue;
+        }
+        for (k, f) in size_factors_counted(data, runs, method)
+            .into_iter()
+            .enumerate()
+        {
+            out[runs[k]] = f;
+        }
+    }
+    out
 }
 
 /// Median of a slice, sorting in place (ascending). Even lengths average the two
@@ -4642,6 +4782,125 @@ mod tests {
             size_factors(&data, 2, NormalizeMethod::None),
             vec![1.0, 1.0]
         );
+    }
+
+    /// A four-run design, two conditions of two replicates, where condition B has a real
+    /// 4x more of every feature and run 1 a 2x loading error within A. Per condition, the
+    /// factors are the factors of each condition's runs alone (geometric mean 1 within a
+    /// condition), so the loading error goes and the difference between conditions stays as
+    /// measured; over all runs that difference is taken for loading and removed. A condition of one
+    /// run keeps factor 1, and the ungrouped kernel equals the subset kernel over `0..n`.
+    #[test]
+    fn size_factors_within_conditions_keep_the_difference_between_them() {
+        use std::collections::BTreeMap;
+        let mut feats: BTreeMap<String, Vec<Option<f64>>> = BTreeMap::new();
+        for i in 0..9 {
+            let a = 100.0 * (i as f64 + 1.0);
+            feats.insert(
+                format!("f{i}"),
+                vec![Some(a), Some(2.0 * a), Some(4.0 * a), Some(4.0 * a)],
+            );
+        }
+        let mut data: BTreeMap<String, BTreeMap<String, Vec<Option<f64>>>> = BTreeMap::new();
+        data.insert("PG".into(), feats);
+        let m = NormalizeMethod::MedianRatio;
+        let by_cond = grouped_size_factors(&data, &[0, 0, 1, 1], m);
+        let f: Vec<f64> = by_cond.iter().map(|s| s.factor).collect();
+        assert!((f[1] / f[0] - 2.0).abs() < 1e-9, "{f:?}");
+        assert!(
+            (f[0] * f[1] - 1.0).abs() < 1e-9,
+            "geometric mean 1 within A: {f:?}"
+        );
+        assert!(
+            (f[2] - 1.0).abs() < 1e-9 && (f[3] - 1.0).abs() < 1e-9,
+            "{f:?}"
+        );
+        assert!(by_cond.iter().all(|s| s.n_features == 9));
+        // Normalised, run 0 and run 1 agree, and B over A is the measured ratio of B to A's
+        // geometric mean, 400 / sqrt(100 x 200).
+        let v = |r: usize, x: f64| x / f[r];
+        assert!((v(1, 200.0) / v(0, 100.0) - 1.0).abs() < 1e-9);
+        assert!((v(2, 400.0) / v(0, 100.0) - 400.0 / 20_000f64.sqrt()).abs() < 1e-9);
+        // Over all runs the 4x between conditions is removed as if it were loading.
+        let all = size_factors(&data, 4, m);
+        assert!(
+            ((400.0 / all[2]) / (100.0 / all[0]) - 4.0).abs() > 1.0,
+            "{all:?}"
+        );
+        // The subset kernel over every run is the ungrouped kernel, bit for bit.
+        let every: Vec<f64> = size_factors_counted(&data, &[0, 1, 2, 3], m)
+            .iter()
+            .map(|s| s.factor)
+            .collect();
+        assert_eq!(every, all);
+        // A condition with one run keeps 1; `none` gives 1 everywhere.
+        let lone = grouped_size_factors(&data, &[0, 0, 0, 1], m);
+        assert_eq!(
+            lone[3],
+            SizeFactor {
+                factor: 1.0,
+                n_features: 0
+            }
+        );
+        assert!(lone[..3].iter().all(|s| s.n_features == 9));
+        let none = grouped_size_factors(&data, &[0, 0, 1, 1], NormalizeMethod::None);
+        assert!(none.iter().all(|s| s.factor == 1.0));
+        // A feature missing in run 3 leaves condition A's complete cases untouched.
+        data.get_mut("PG")
+            .unwrap()
+            .insert("gap".into(), vec![Some(1.0), Some(9.0), Some(5.0), None]);
+        let gap = grouped_size_factors(&data, &[0, 0, 1, 1], m);
+        assert_eq!(gap[0].n_features, 10);
+        assert_eq!(gap[2].n_features, 9);
+    }
+
+    /// End to end through the parquet tables: the grouped combine writes the same LFQ
+    /// table as the ungrouped one when every run is its own group under `none`, and refuses
+    /// a group list that does not match the inputs.
+    #[test]
+    fn grouped_lfq_combine_checks_its_groups() {
+        let dir = std::env::temp_dir().join(format!("mumdia_lfq_groups_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut inputs = Vec::new();
+        for (r, scale) in [1.0f64, 2.0, 8.0].iter().enumerate() {
+            let path = dir
+                .join(format!("pq{r}.parquet"))
+                .to_string_lossy()
+                .to_string();
+            write_table(
+                &path,
+                vec![
+                    Col::Str("peptidoform".into(), vec!["PEPTIDEK".into(), "AAAK".into()]),
+                    Col::I32("charge".into(), vec![2, 2]),
+                    Col::Str("protein_group".into(), vec!["P1".into(), "P1".into()]),
+                    Col::F64("quantity".into(), vec![100.0 * scale, 50.0 * scale]),
+                ],
+            )
+            .unwrap();
+            inputs.push(path);
+        }
+        let out = dir.join("lfq.parquet").to_string_lossy().to_string();
+        let (_, f) = run_lfq_combine_grouped(
+            &inputs,
+            false,
+            NormalizeMethod::MedianRatio,
+            Some(&[0, 0, 1]),
+            "quantity",
+            &out,
+        )
+        .unwrap();
+        assert!((f[1].factor / f[0].factor - 2.0).abs() < 1e-9, "{f:?}");
+        assert_eq!(f[2].factor, 1.0);
+        assert!(run_lfq_combine_grouped(
+            &inputs,
+            false,
+            NormalizeMethod::MedianRatio,
+            Some(&[0, 1]),
+            "quantity",
+            &out,
+        )
+        .is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

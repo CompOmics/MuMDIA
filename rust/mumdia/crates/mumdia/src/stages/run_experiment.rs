@@ -19,7 +19,9 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
-use mumdia_core::config::{Config, MultiheadAnchors, QuantQColumn, RtLibraryScope, RunNaming};
+use mumdia_core::config::{
+    Config, MultiheadAnchors, NormalisationScope, QuantQColumn, RtLibraryScope, RunNaming,
+};
 use mumdia_core::manifest::Manifest;
 use mumdia_core::schema::artifact;
 use mumdia_io::table::Written;
@@ -39,6 +41,11 @@ pub struct RunExperimentParams<'a> {
     /// Optional per-run labels; also the per-run subdir names. Absent, they are derived
     /// from `inputs` under `experiment.run_naming` (`default_run_names`).
     pub run_names: Option<&'a [String]>,
+    /// Optional condition of each run, one per entry of `mzmls` (`--condition`, or the
+    /// `condition` column of `--sample-sheet`); an empty entry has none. A run without one
+    /// takes its condition from `experiment.conditions` by run name. Required for every run
+    /// under `quant.normalisation_scope = condition`.
+    pub conditions: Option<&'a [String]>,
     /// The inputs as the user gave them, one per entry of `mzmls`: a vendor file before
     /// `raw::ensure_mzml` converted it, otherwise the same path. Run names are taken from
     /// these, so a converted run is named after its vendor file, not its converted mzML.
@@ -1304,6 +1311,104 @@ fn portable_dir_name_problem(name: &str) -> Option<&'static str> {
     None
 }
 
+/// The condition of every run, in run order: the run's entry of `given` (`--condition` or
+/// the sample sheet) when it is not empty, else its entry of `experiment.conditions`, else
+/// none. Every label must be usable ([`mumdia_core::config::condition_label_problem`]).
+/// Under `quant.normalisation_scope = condition` every run must have one; a condition with a
+/// single run is warned about, because it has nothing to be normalised against.
+fn resolve_conditions(
+    names: &[String],
+    given: Option<&[String]>,
+    cfg: &Config,
+) -> Result<Vec<Option<String>>> {
+    use mumdia_core::config::condition_label_problem;
+    if let Some(g) = given {
+        if g.len() != names.len() {
+            anyhow::bail!(
+                "--condition has {} entries but there are {} runs; pass one condition per \
+                 --mzml, in the same order",
+                g.len(),
+                names.len()
+            );
+        }
+    }
+    let map = &cfg.experiment.conditions;
+    let mut out = Vec::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        let from_input = given
+            .and_then(|g| g.get(i))
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty());
+        let label = from_input.or_else(|| map.get(name).map(|c| c.trim()));
+        if let Some(l) = label {
+            if let Some(why) = condition_label_problem(l) {
+                anyhow::bail!("the condition {l:?} of run {name:?} is not usable: {why}");
+            }
+        }
+        out.push(label.map(str::to_string));
+    }
+    let unknown: Vec<&String> = map.keys().filter(|k| !names.contains(k)).collect();
+    if !unknown.is_empty() {
+        warn!(
+            runs = ?unknown,
+            "run-experiment: experiment.conditions names runs this experiment does not have; \
+             they are ignored (the runs are {names:?})"
+        );
+    }
+    if cfg.quant.normalisation_scope == NormalisationScope::Condition {
+        let missing: Vec<&String> = names
+            .iter()
+            .zip(&out)
+            .filter(|(_, c)| c.is_none())
+            .map(|(n, _)| n)
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "quant.normalisation_scope = condition needs the condition of every run; \
+                 these runs have none: {missing:?}. Give one --condition per --mzml, a \
+                 condition column in --sample-sheet, or experiment.conditions in the \
+                 configuration (run name -> condition)"
+            );
+        }
+        let mut sizes: std::collections::BTreeMap<&str, usize> = Default::default();
+        for c in out.iter().flatten() {
+            *sizes.entry(c.as_str()).or_default() += 1;
+        }
+        let lone: Vec<&str> = sizes
+            .iter()
+            .filter(|(_, &n)| n == 1)
+            .map(|(c, _)| *c)
+            .collect();
+        if !lone.is_empty() {
+            warn!(
+                conditions = ?lone,
+                "run-experiment: under normalisation_scope = condition a condition with one \
+                 run has nothing to be normalised against, so its size factor is 1"
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Each run's condition as an index, in order of first appearance, for the grouped size
+/// factors of `quant.normalisation_scope = condition`.
+fn condition_groups(conditions: &[Option<String>]) -> Vec<usize> {
+    let mut seen: Vec<&str> = Vec::new();
+    conditions
+        .iter()
+        .map(|c| {
+            let c = c.as_deref().unwrap_or("");
+            match seen.iter().position(|s| *s == c) {
+                Some(i) => i,
+                None => {
+                    seen.push(c);
+                    seen.len() - 1
+                }
+            }
+        })
+        .collect()
+}
+
 pub fn run(p: RunExperimentParams) -> Result<()> {
     let t0 = Instant::now();
     // The time from here to the first stage, by step (`prestage::PreStageTimer`).
@@ -1321,6 +1426,58 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     resolved.resolve_im_features(p.mzmls.iter().any(|m| crate::instrument::input_has_im(m)));
     crate::stages::retrace::refuse_inputs_without_raw_events(&resolved, p.mzmls)?;
     pre.step("resolve_interpreters");
+    // The run names and conditions are resolved before the configuration is hashed: under
+    // `quant.normalisation_scope = condition` every run's condition is part of the hash.
+    let n_runs = p.mzmls.len();
+    // Reject a bad --run-names rather than silently substituting the derived names.
+    //
+    // The old `_ =>` arm swallowed any count mismatch with no warning, and accepted
+    // duplicates outright. Duplicates are the dangerous half: two runs then share
+    // `d(&names[i])`, so above one parallel run two `process_run` calls concurrently
+    // write the same spectra_ms2 / seed_psms / psms_extracted / chromatograms into one
+    // directory, and the split and quant paths collide too. The output is an interleaving
+    // of two runs with no error anywhere. Reachable by naming runs after their basenames
+    // when an experiment spans two directories holding same-named files.
+    let names: Vec<String> = match p.run_names {
+        Some(ns) => {
+            if ns.len() != n_runs {
+                anyhow::bail!(
+                    "--run-names has {} entries but there are {n_runs} runs; pass one name \
+                     per --mzml, in the same order, or omit it to name the runs after their \
+                     input files",
+                    ns.len(),
+                );
+            }
+            check_run_names_distinct(ns)?;
+            if let Some((bad, why)) = ns
+                .iter()
+                .find_map(|n| run_name_problem(n).map(|why| (n, why)))
+            {
+                anyhow::bail!(
+                    "--run-names entry {bad:?} is not usable as a directory name: {why}; each \
+                     name becomes a subdirectory of --out-dir"
+                );
+            }
+            ns.to_vec()
+        }
+        None => {
+            if p.inputs.len() != n_runs {
+                anyhow::bail!(
+                    "run-experiment: {} inputs for {n_runs} runs",
+                    p.inputs.len()
+                );
+            }
+            default_run_names(p.inputs, resolved.experiment.run_naming)
+        }
+    };
+    let conditions = resolve_conditions(&names, p.conditions, &resolved)?;
+    if resolved.quant.normalisation_scope == NormalisationScope::Condition {
+        resolved.experiment.conditions = names
+            .iter()
+            .zip(&conditions)
+            .filter_map(|(n, c)| c.as_ref().map(|c| (n.clone(), c.clone())))
+            .collect();
+    }
     let p = RunExperimentParams {
         config: &resolved,
         ..p
@@ -1362,7 +1519,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // surfaced minutes later as a stage failure naming one artifact (`storage`).
     crate::storage::prepare_output(p.out_dir, cfg)?;
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
-    let n_runs = p.mzmls.len();
     // The library's protein annotation table, which only the report reads, as in `run`.
     let lib_annotations =
         crate::protein_annotations::resolve_input(p.lib_annotations, p.lib_precursors)?;
@@ -1399,47 +1555,6 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         crate::raw::discard_after_convert(p.converted_mzml, input_hashes.progress());
     }
     pre.step("provenance");
-    // Reject a bad --run-names rather than silently substituting the derived names.
-    //
-    // The old `_ =>` arm swallowed any count mismatch with no warning, and accepted
-    // duplicates outright. Duplicates are the dangerous half: two runs then share
-    // `d(&names[i])`, so above one parallel run two `process_run` calls concurrently
-    // write the same spectra_ms2 / seed_psms / psms_extracted / chromatograms into one
-    // directory, and the split and quant paths collide too. The output is an interleaving
-    // of two runs with no error anywhere. Reachable by naming runs after their basenames
-    // when an experiment spans two directories holding same-named files.
-    let names: Vec<String> = match p.run_names {
-        Some(ns) => {
-            if ns.len() != n_runs {
-                anyhow::bail!(
-                    "--run-names has {} entries but there are {n_runs} runs; pass one name \
-                     per --mzml, in the same order, or omit it to name the runs after their \
-                     input files",
-                    ns.len(),
-                );
-            }
-            check_run_names_distinct(ns)?;
-            if let Some((bad, why)) = ns
-                .iter()
-                .find_map(|n| run_name_problem(n).map(|why| (n, why)))
-            {
-                anyhow::bail!(
-                    "--run-names entry {bad:?} is not usable as a directory name: {why}; each \
-                     name becomes a subdirectory of --out-dir"
-                );
-            }
-            ns.to_vec()
-        }
-        None => {
-            if p.inputs.len() != n_runs {
-                anyhow::bail!(
-                    "run-experiment: {} inputs for {n_runs} runs",
-                    p.inputs.len()
-                );
-            }
-            default_run_names(p.inputs, cfg.experiment.run_naming)
-        }
-    };
     // Which input each derived name came from, recorded in the manifest when the names
     // were derived from the inputs. With `--run-names` or `run_naming = index` the
     // manifest keeps its previous bytes; `inputs["mzml[i]"]` still maps index to input.
@@ -2769,22 +2884,44 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     };
     let lfq_reads_normalised = normalised.is_some() && cfg.quant.lfq_reads_normalised();
     let lfq = d("lfq_maxlfq.parquet");
-    let n_lfq = match (&normalised, lfq_reads_normalised) {
-        (Some((tables, _, _)), true) => quant::run_lfq_combine(
+    // `quant.normalisation_scope`: the median-ratio size factors over every run (`all`, the
+    // default), within each condition's runs (`condition`), or none.
+    let scope = cfg.quant.normalisation_scope;
+    let groups = (scope == NormalisationScope::Condition).then(|| condition_groups(&conditions));
+    let lfq_method = match (&normalised, lfq_reads_normalised, scope) {
+        (Some(_), true, _) | (_, _, NormalisationScope::None) => {
+            mumdia_core::config::NormalizeMethod::None
+        }
+        _ => mumdia_core::config::NormalizeMethod::MedianRatio,
+    };
+    let (n_lfq, size_factors) = match (&normalised, lfq_reads_normalised) {
+        (Some((tables, _, _)), true) => quant::run_lfq_combine_grouped(
             tables,
             false,
-            mumdia_core::config::NormalizeMethod::None,
+            lfq_method,
+            None,
             "quantity_normalised",
             &lfq,
         )?,
-        _ => quant::run_lfq_combine(
+        _ => quant::run_lfq_combine_grouped(
             &peptide_quants,
             false,
-            mumdia_core::config::NormalizeMethod::MedianRatio,
+            lfq_method,
+            groups.as_deref(),
             "quantity",
             &lfq,
         )?,
     };
+    // The factors, at the experiment root under every scope, so a viewer reads them rather
+    // than deriving them back from the tables.
+    let size_factors_tsv = d(quant::LFQ_SIZE_FACTORS_TSV);
+    quant::write_size_factors_tsv(&size_factors_tsv, &names, &conditions, &size_factors)?;
+    info!(
+        scope = scope.as_str(),
+        factors = ?size_factors.iter().map(|f| f.factor).collect::<Vec<_>>(),
+        path = %size_factors_tsv,
+        "run-experiment: cross-run LFQ size factors"
+    );
 
     // --- experiment-wide report ---
     // peptides.tsv and proteins.tsv at the experiment root, selected on the
@@ -2882,6 +3019,16 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "effective": format!("{:?}", qcfg.q_filter),
         },
         "lfq": lfq,
+        // The size factors of the cross-run LFQ and the runs they were estimated over
+        // (`quant.normalisation_scope`).
+        "lfq_normalisation": {
+            "scope": scope.as_str(),
+            "method": match lfq_method {
+                mumdia_core::config::NormalizeMethod::None => "none",
+                _ => "median_ratio",
+            },
+            "size_factors": size_factors_tsv,
+        },
         "peptide_quants": peptide_quants,
         "report": {
             "peptides": pep_tsv,
@@ -2910,6 +3057,19 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // other manifest keeps its bytes; `mumdia report --experiment-dir` reads it from here.
     if let (Some(a), Some(m)) = (&annotations, manifest.as_object_mut()) {
         m.insert("protein_annotations".to_string(), json!(a));
+    }
+    // The condition of each run (run name -> condition), only when any run has one, so every
+    // other manifest keeps its keys.
+    if let (true, Some(m)) = (
+        conditions.iter().any(Option::is_some),
+        manifest.as_object_mut(),
+    ) {
+        let map: serde_json::Map<String, serde_json::Value> = names
+            .iter()
+            .zip(&conditions)
+            .filter_map(|(n, c)| c.as_ref().map(|c| (n.clone(), json!(c))))
+            .collect();
+        m.insert("conditions".to_string(), serde_json::Value::Object(map));
     }
     // The input of each run, when the run names were derived from the inputs.
     if let (Some(ri), Some(m)) = (&run_inputs, manifest.as_object_mut()) {
