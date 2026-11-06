@@ -327,7 +327,7 @@ current fragment selection does not remove.
 #    the older scored_src<i> layout); --quantity aligned or maxlfq replaces the raw value.
 bench/make_proteobench_submission.py --fasta ProteoBenchFASTA_MixedSpecies_HYE.fasta \
     --out submission.tsv --condition-gate --quantity aligned \
-    LFQ_Astral_DIA_15min_50ng_Condition_A_REP1=out/r0/peptide_quant.parquet \
+    LFQ_Astral_DIA_15min_50ng_Condition_A_REP1=out/LFQ_Astral_DIA_15min_50ng_Condition_A_REP1/peptide_quant.parquet \
     ...
 
 # 3. Score it offline.

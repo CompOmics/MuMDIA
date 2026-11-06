@@ -670,7 +670,9 @@ enum Cmd {
         /// One per run; repeat the flag (>= 2 runs).
         #[arg(long)]
         mzml: Vec<String>,
-        /// Optional per-run labels / subdir names (default r0..rN-1).
+        /// Optional per-run labels / subdir names, one per --mzml in the same order. Default:
+        /// the input file names without their extensions, sanitised to portable directory
+        /// names (`experiment.run_naming = "index"` gives r0..rN-1).
         #[arg(long)]
         run_names: Vec<String>,
         #[arg(long)]
@@ -2478,6 +2480,7 @@ fn real_main() -> Result<()> {
                     fasta: fasta.as_deref(),
                     mzmls: &mzml,
                     run_names: None,
+                    inputs: &converted_from,
                     out_dir: &out_dir,
                     lib_precursors: lib_precursors.as_deref(),
                     lib_fragments: lib_fragments.as_deref(),
@@ -2543,6 +2546,7 @@ fn real_main() -> Result<()> {
                 fasta: fasta.as_deref(),
                 mzmls: &mzml,
                 run_names,
+                inputs: &converted_from,
                 out_dir: &out_dir,
                 lib_precursors: lib_precursors.as_deref(),
                 lib_fragments: lib_fragments.as_deref(),

@@ -3858,6 +3858,37 @@ pub struct ExperimentConfig {
     /// where the experiment's peak can sit. Measured with `parallel_runs`: see there.
     #[serde(deserialize_with = "de_overlap_front_threads")]
     pub overlap_front_threads: Option<usize>,
+    /// What each run's output subdirectory and report columns are called when
+    /// `--run-names` is not given: `"input"` (default since 0.10) names them after the
+    /// input file, `"index"` restores `r0`, `r1`, ... in input order.
+    ///
+    /// `"input"` takes the ORIGINAL input (the vendor file, not the mzML converted from
+    /// it), strips up to three known extensions (`.mzML.gz`, `.d`, `.raw`, `.wiff`, ...),
+    /// keeps letters, digits, `-`, `_` and `.` and replaces every other run of characters
+    /// (whitespace and brackets included) with one `_`. A name longer than 64 characters
+    /// is cut to 55 and given `_` and its 32-bit FNV-1a hash in 8 hex characters; a name
+    /// the experiment root uses itself (`first_pass`, `second_pass`, `sidecar_work`, `library`,
+    /// `rt_bootstrap`, `g<N>`) gets a `_run` suffix; a Windows device name a `_`; and two
+    /// inputs that give the same name (compared without regard to case) are told apart by
+    /// `_2`, `_3`, ... in input order. The manifest records each derived name with its
+    /// input under `experiment.run_inputs`. Explicit `--run-names` always win.
+    ///
+    /// Not part of the canonical configuration: it decides paths and column labels, never
+    /// a value, and the manifest records the names that were used.
+    #[serde(skip_serializing)]
+    pub run_naming: RunNaming,
+}
+
+/// How `run-experiment` names its runs when `--run-names` is absent
+/// (`experiment.run_naming`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunNaming {
+    /// After the input file's name, sanitised to a portable directory name.
+    #[default]
+    Input,
+    /// `r0`, `r1`, ... in input order, the layout before 0.10.
+    Index,
 }
 
 /// `experiment.overlap_front_threads`: a thread count, or `"auto"` / `null`, which is
@@ -3889,6 +3920,7 @@ impl Default for ExperimentConfig {
             parallel_runs: 0,
             rt_library_scope: RtLibraryScope::FirstRunOnly,
             overlap_front_threads: None,
+            run_naming: RunNaming::Input,
         }
     }
 }
@@ -5851,6 +5883,32 @@ mod tests {
             let c: Config = serde_json::from_str(bad).unwrap();
             assert!(c.validate().is_err(), "{bad} validated");
         }
+    }
+
+    /// `experiment.run_naming` parses, defaults to `input`, and is never part of the
+    /// canonical configuration, so the configuration hash is the same under either naming.
+    #[test]
+    fn experiment_run_naming_never_reaches_the_canonical_json() {
+        let c = Config::default();
+        assert_eq!(c.experiment.run_naming, RunNaming::Input);
+        for (json, naming) in [
+            (
+                r#"{"experiment": {"run_naming": "index"}}"#,
+                RunNaming::Index,
+            ),
+            (
+                r#"{"experiment": {"run_naming": "input"}}"#,
+                RunNaming::Input,
+            ),
+        ] {
+            let parsed: Config = serde_json::from_str(json).unwrap();
+            assert_eq!(parsed.experiment.run_naming, naming);
+            assert_eq!(parsed.canonical_json(), c.canonical_json());
+        }
+        assert!(!c.canonical_json().contains("run_naming"));
+        assert!(
+            serde_json::from_str::<Config>(r#"{"experiment": {"run_naming": "stem"}}"#).is_err()
+        );
     }
 
     /// The decoy-corrected 1/K0 window sizing at 1.3x is the default: the seed records

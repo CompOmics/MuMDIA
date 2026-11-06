@@ -1,0 +1,45 @@
+{
+  "_comment": "Run names run-experiment derives from its inputs when --run-names is absent (experiment.run_naming = input). Read by the engine's tests (stages/run_experiment.rs) and by the desktop's (desktop/src-tauri/src/run.rs), which orders its per-file progress by the same names, so the two derivations cannot drift apart.",
+  "cases": [
+    {
+      "why": "known extensions go, up to three of them, without regard to case",
+      "inputs": ["data/A0_1EX8741FD.mzML", "x/HYE_B01.mzML.gz", "/runs/run.d", "C:\\data\\Q.RAW", "s.wiff", "t.mzXML", "keep.1.mzML", "run.d/"],
+      "names": ["A0_1EX8741FD", "HYE_B01", "run", "Q", "s", "t", "keep.1", "run_2"]
+    },
+    {
+      "why": "every run of other characters, whitespace and brackets included, becomes one _; leading and trailing . and _ go",
+      "inputs": ["My Sample (rep 1).mzML", "a[1].raw", "b  c.mzML", ".hidden.mzML", "trail_.mzML", "x#y%z.mzML"],
+      "names": ["My_Sample_rep_1", "a_1", "b_c", "hidden", "trail", "x_y_z"]
+    },
+    {
+      "why": "letters outside ASCII are letters",
+      "inputs": ["échantillon_1.mzML", "Probe_ü.mzML"],
+      "names": ["échantillon_1", "Probe_ü"]
+    },
+    {
+      "why": "Windows device names are broken after their first segment",
+      "inputs": ["CON.raw", "aux.1.mzML", "com10.mzML"],
+      "names": ["CON_", "aux_.1", "com10"]
+    },
+    {
+      "why": "names the experiment root uses itself get _run",
+      "inputs": ["second_pass.mzML", "g01.mzML", "Library.raw", "g.mzML", "g1a.mzML"],
+      "names": ["second_pass_run", "g01_run", "Library_run", "g", "g1a"]
+    },
+    {
+      "why": "nothing usable left is r<i>",
+      "inputs": ["a.mzML", "###.mzML", "...mzML"],
+      "names": ["a", "r1", "r2"]
+    },
+    {
+      "why": "collisions, without regard to case, get the first free _2, _3 in input order",
+      "inputs": ["A/run1.raw", "B/run1.raw", "C/RUN1.mzML", "run1_2.mzML"],
+      "names": ["run1", "run1_3", "RUN1_4", "run1_2"]
+    },
+    {
+      "why": "a name over 64 characters is cut and given the 8 hex characters of its 32-bit FNV-1a hash",
+      "inputs": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mzML", "b.mzML"],
+      "names": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_e1a8981f", "b"]
+    }
+  ]
+}

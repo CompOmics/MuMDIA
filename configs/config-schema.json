@@ -4135,6 +4135,23 @@
       "source_struct": "ExperimentConfig"
     },
     {
+      "path": "experiment.run_naming",
+      "name": "run_naming",
+      "section": "experiment",
+      "rust_type": "RunNaming",
+      "kind": "enum",
+      "optional": false,
+      "default": "input",
+      "default_text": "`input`",
+      "help": "What each run's output subdirectory and report columns are called when `--run-names` is not given: `\"input\"` (default since 0.10) names them after the input file, `\"index\"` restores `r0`, `r1`, ... in input order. `\"input\"` takes the ORIGINAL input (the vendor file, not the mzML converted from it), strips up to three known extensions (`.mzML.gz`, `.d`, `.raw`, `.wiff`, ...), keeps letters, digits, `-`, `_` and `.` and replaces every other run of characters (whitespace and brackets included) with one `_`. A name longer than 64 characters is cut to 55 and given `_` and its 32-bit FNV-1a hash in 8 hex characters; a name the experiment root uses itself (`first_pass`, `second_pass`, `sidecar_work`, `library`, `rt_bootstrap`, `g<N>`) gets a `_run` suffix; a Windows device name a `_`; and two inputs that give the same name (compared without regard to case) are told apart by `_2`, `_3`, ... in input order. The manifest records each derived name with its input under `experiment.run_inputs`. Explicit `--run-names` always win. Not part of the canonical configuration: it decides paths and column labels, never a value, and the manifest records the names that were used.",
+      "gates": [],
+      "source_struct": "ExperimentConfig",
+      "choices": [
+        "input",
+        "index"
+      ]
+    },
+    {
       "path": "groups.window_groups",
       "name": "window_groups",
       "section": "groups",

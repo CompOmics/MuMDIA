@@ -129,6 +129,9 @@ def main() -> int:
                     help="maximum decoy fraction among accepted PSMs at 1 percent")
     ap.add_argument("--experiment", default=None,
                     help="run-experiment output directory to assert as well")
+    ap.add_argument("--experiment-named", default=None,
+                    help="the --experiment run again without --run-names, on the same two "
+                         "inputs (fixture.mzML, fixture_b.mzML), to assert the derived names")
     ap.add_argument("--min-assertions", type=int, default=0,
                     help="fail if fewer than N assertions ran; keeps the count cited "
                          "in CHANGELOG.md and docs/19 from silently rotting, and "
@@ -587,6 +590,45 @@ def main() -> int:
                  "identical inputs: every precursor of precursors.tsv is identified in both runs")
             c.ok(all(r[11] != "" and r[12] != "" for r in rows),
                  "identical inputs: every precursor of precursors.tsv is quantified in both runs")
+
+    # ---------------------------------------------------- run names from the inputs
+    if a.experiment and a.experiment_named:
+        print()
+        print("run-experiment without --run-names")
+        exp, named = Path(a.experiment), Path(a.experiment_named)
+        names = ["fixture", "fixture_b"]
+        m = json.loads((named / "experiment_manifest.json").read_text(encoding="utf-8"))
+        ref = json.loads((exp / "experiment_manifest.json").read_text(encoding="utf-8"))
+        e = m.get("experiment", {})
+        c.ok(e.get("runs") == names,
+             "the runs are named after their input files", str(e.get("runs")))
+        ri = e.get("run_inputs") or []
+        c.ok([(r.get("name"), r.get("source"), Path(str(r.get("input"))).name, r.get("converted"))
+              for r in ri] == [("fixture", 0, "fixture.mzML", None),
+                               ("fixture_b", 1, "fixture_b.mzML", None)],
+             "the manifest maps each run name to its input (experiment.run_inputs)", str(ri))
+        c.ok(m.get("config_hash") == ref.get("config_hash"),
+             "the run naming is not part of the configuration hash")
+        c.ok(all((named / n / "scored.parquet").is_file() for n in names)
+             and not any((named / n).exists() for n in ("r0", "r1", "a", "b")),
+             "each run's tables are in a folder of its name")
+        same = [f for f in ("scored_combined.parquet", "lfq_maxlfq.parquet")
+                if (exp / f).read_bytes() == (named / f).read_bytes()]
+        same += [f"{n}/{t}" for n, r in zip(names, ("a", "b"))
+                 for t in ("scored.parquet", "peptide_quant.parquet")
+                 if (exp / r / t).read_bytes() == (named / n / t).read_bytes()]
+        c.ok(len(same) == 6, "a name labels paths, not values: the tables are the explicitly "
+             "named experiment's, byte for byte", ", ".join(same))
+        hdr = (named / "peptides.tsv").read_text(encoding="utf-8").splitlines()[0].split("\t")
+        c.ok(hdr[7:9] == ["quantity_fixture", "quantity_fixture_b"],
+             "peptides.tsv has one quantity column per run name", "\t".join(hdr))
+        hdr = (named / "proteins.tsv").read_text(encoding="utf-8").splitlines()[0].split("\t")
+        c.ok(hdr[3:5] == ["lfq_fixture", "lfq_fixture_b"],
+             "proteins.tsv has one LFQ column per run name", "\t".join(hdr))
+        rr = named.parent / "exp_named_report"
+        c.ok(all((rr / f).is_file() and (rr / f).read_bytes() == (named / f).read_bytes()
+                 for f in ("peptides.tsv", "proteins.tsv")),
+             "`mumdia report --experiment-dir` reproduces the derived-name report byte for byte")
 
     print()
     if c.failures:

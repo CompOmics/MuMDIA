@@ -153,6 +153,32 @@ Produces `alignment.parquet` (`align.rs:130`): `run_id` (u32), `source_rt` (f64)
 `reference_rt` (f64), `residual_spread` (f64). The mapping is emitted on a grid of
 `grid_n` points per run (`grid_n = 100`, hardcoded in `main.rs:667`).
 
+### Run names (`run-experiment`)
+`<run>` in this document is the run's name: its subdirectory of the experiment, the label of
+its artifacts in the manifest (`scored[<run>]`, ...) and the suffix of its report columns
+(`quantity_<run>`, `lfq_<run>`). `--run-names` sets them, one per `--mzml` in the same order.
+Without it they are derived from the inputs (`default_run_names` in
+`stages/run_experiment.rs`, `experiment.run_naming = "input"`, the default since 0.10): the
+file name of the input as given, so a vendor file rather than the mzML converted from it,
+without up to three known extensions (`.gz`, `.mzML`, `.mzXML`, `.raw`, `.d`, `.wiff`,
+`.wiff2`, `.mgf`, without regard to case); letters, digits, `-`, `_` and `.` are kept and any
+other run of characters, whitespace and brackets included, becomes one `_`; leading and
+trailing `.` and `_` go; a Windows device name gets a `_` after its first segment; a name over
+64 characters is cut to 55 and given `_` plus the 32-bit FNV-1a hash of the whole name in 8 hex
+characters; a name the experiment root uses itself (`first_pass`, `second_pass`,
+`sidecar_work`, `library`, `rt_bootstrap`, `g<N>`) gets `_run`; nothing left is `r<i>`; and an
+input whose name an earlier input already has, without regard to case, gets the first free
+`_2`, `_3`, ... in input order. So `A0_1EX8741FD.raw` is `A0_1EX8741FD`,
+`My Sample (rep 1).mzML.gz` is `My_Sample_rep_1`, and `A/run1.raw`, `B/run1.raw` are `run1`,
+`run1_2`. `ci/run_name_cases.json` is the table both the engine and the desktop application
+are tested against. The manifest records the mapping under `experiment.run_inputs` (docs/15).
+`experiment.run_naming = "index"` gives `r0..rN-1`, the layout before 0.10, with every
+artifact byte-identical to it; the key is not part of the configuration hash. An explicit
+`--run-names` entry must be a portable directory name, distinct from the others without
+regard to case, without `[` or `]`, and not one of the reserved names. Every reader in the
+engine (`report --experiment-dir`, `localise --experiment-dir`, `output.retain`) takes the
+names from `experiment.runs`, so an experiment written under either naming reads the same.
+
 ### second pass (`run-experiment`, `mbr.strategy = second_pass`)
 Writes, under the experiment directory: `first_pass/scored_combined.parquet` (the pooled
 first pass, schema `psms_scored`, with its `.report.json`); `second_pass/library/` holding
