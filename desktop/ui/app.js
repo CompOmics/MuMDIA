@@ -650,6 +650,105 @@ async function saveSettings() {
 // ── components ──────────────────────────────────────────────────────────────
 // Polled while an installation runs, then left alone. The backend owns the state,
 // so closing and reopening this screen shows the truth rather than a stale copy.
+
+// The three environments, in the order the log pane prefers them, with the labels the
+// banner uses.
+const COMPONENT_ENVS = [
+  ["primary", "Analysis components"],
+  ["ms2pip", "MS2PIP"],
+  ["visdia", "visDIA"],
+];
+
+// The real import of the packages (`loadcheck`), run once an installation ends and the
+// first time a session finds an environment: `find_spec` alone passed a torch that could
+// not load its DLLs.
+function componentTesting(e) {
+  return !!e && e.load_check === "running";
+}
+
+function componentInstalling(e) {
+  return !!e && e.install_status === "installing";
+}
+
+// What an optional environment's card shows: the pill, its class, the button label and
+// whether the button is disabled. Pure, so the state table is tested
+// (`ci/test_desktop_ui.mjs`) without a window.
+function optionalCardView(e, uv) {
+  e = e || {};
+  if (componentInstalling(e)) {
+    return { pill: "installing…", cls: "pill warn", label: "Installing…", disabled: true };
+  }
+  if (componentTesting(e)) {
+    return { pill: "testing…", cls: "pill warn", label: "Testing…", disabled: true };
+  }
+  if (e.load_check === "failed") {
+    // Installed, but a package does not load. Installing again repairs a damaged one.
+    return { pill: "cannot load", cls: "pill bad", label: "Reinstall", disabled: !uv };
+  }
+  if (e.complete) {
+    return { pill: "installed", cls: "pill ok", label: "Installed", disabled: true };
+  }
+  if ((e.outdated || []).length) {
+    // Installed by an older release, or the viewer from another pinned commit: it
+    // imports, but installing again is what brings it to the pins.
+    return { pill: "update needed", cls: "pill warn", label: "Update", disabled: !uv };
+  }
+  if (e.install_status === "failed") {
+    return { pill: "failed", cls: "pill bad", label: "Reinstall", disabled: !uv };
+  }
+  return { pill: "optional", cls: "pill mute", label: "Install", disabled: !uv };
+}
+
+// Whether anything on the Setup screen is still moving, which is what keeps the poll on.
+function componentsBusy(c) {
+  return COMPONENT_ENVS.some(([k]) => componentInstalling(c[k]) || componentTesting(c[k]));
+}
+
+// One log pane, showing whichever installation is talking; otherwise the environment
+// whose last installation failed or whose packages do not load, so the traceback stays
+// readable; otherwise the last finished installation's log. Returns `[key, status, open]`,
+// `open` being whether the card is shown at all.
+function installLogSource(c) {
+  const envs = COMPONENT_ENVS.map(([k]) => [k, c[k] || {}]);
+  const hasLog = (e) => (e.install_log || []).length > 0;
+  const talking = envs.find(([, e]) => componentInstalling(e));
+  if (talking) return [talking[0], talking[1], true];
+  const failed = envs.find(([, e]) => e.install_status === "failed" && hasLog(e));
+  if (failed) return [failed[0], failed[1], true];
+  const unloadable = envs.find(([, e]) => e.load_check === "failed");
+  if (unloadable) return [unloadable[0], unloadable[1], true];
+  const done = envs.find(([, e]) => e.install_status === "done" && hasLog(e));
+  if (done) return [done[0], done[1], true];
+  return ["primary", envs[0][1], false];
+}
+
+// The Setup banner: the first thing that needs the user, across all three environments.
+// The optional environments were once read here before they were declared, which threw
+// on every refresh and left their cards and the poll frozen; this reads only `c`.
+function componentsBannerText(c) {
+  const p = c.primary || {};
+  if (!p.uv && !p.complete) {
+    return (
+      "The installer component `uv` was not found beside the application or on PATH, " +
+      "so components cannot be installed automatically."
+    );
+  }
+  if (p.error) return p.error;
+  for (const [k, label] of COMPONENT_ENVS.slice(1)) {
+    const e = c[k] || {};
+    if (componentInstalling(e)) continue;
+    if (e.error) return `${label}: ${e.error}`;
+    if (e.load_error) return `${label}: ${e.load_error}`;
+  }
+  if ((p.outdated || []).length) {
+    return (
+      `The analysis environment needs an update: ${p.outdated.join(", ")}. ` +
+      "Press Update; it upgrades the installed packages in place."
+    );
+  }
+  return "";
+}
+
 async function refreshComponents() {
   let c;
   try {
@@ -658,19 +757,39 @@ async function refreshComponents() {
     banner($("setup-error"), String(e));
     return;
   }
+  try {
+    renderComponents(c);
+  } catch (e) {
+    // A rendering fault must not freeze the screen silently: an exception here once
+    // left every optional card on its first state and stopped the poll.
+    banner($("setup-error"), `The Setup screen could not show the component state: ${e}`);
+    console.error(e);
+  }
+  // Decided from the status alone, after rendering, so even a rendering fault keeps
+  // polling while an installation runs.
+  const busy = componentsBusy(c);
+  if (busy && !state.setupTimer) {
+    state.setupTimer = setInterval(refreshComponents, 900);
+  } else if (!busy && state.setupTimer) {
+    clearInterval(state.setupTimer);
+    state.setupTimer = null;
+    // An installation just finished, so the managed-data sizes are stale. Once, on
+    // the transition: walking a Python environment is too slow for the poll itself.
+    refreshManaged();
+  }
+}
+
+function renderComponents(c) {
   const p = c.primary;
+  const m = c.ms2pip || {};
+  const v = c.visdia || {};
   state.componentsReady = !!p.complete;
 
   const pill = $("primary-pill");
   const btn = $("install-primary");
-  const installing = p.install_status === "installing";
-  // The real import of the packages (`loadcheck`), run once an installation ends and the
-  // first time a session finds an environment: `find_spec` alone passed a torch that
-  // could not load its DLLs.
-  const testing = (e) => e && e.load_check === "running";
+  const installing = componentInstalling(p);
   const loadFailed = p.load_check === "failed";
-  show($("primary-bar"), installing || testing(p));
-  show($("install-log-card"), installing || p.install_status === "failed");
+  show($("primary-bar"), installing || componentTesting(p));
   show($("recheck-primary"), loadFailed);
   renderVcRuntime(c.vc_runtime);
 
@@ -678,7 +797,7 @@ async function refreshComponents() {
     pill.textContent = "installing…";
     pill.className = "pill warn";
     btn.disabled = true;
-  } else if (testing(p)) {
+  } else if (componentTesting(p)) {
     pill.textContent = "testing…";
     pill.className = "pill warn";
     btn.disabled = true;
@@ -709,98 +828,26 @@ async function refreshComponents() {
     btn.textContent = "Install";
   }
 
-  if (!c.primary.uv && !p.complete) {
-    banner(
-      $("setup-error"),
-      "The installer component `uv` was not found beside the application or on PATH, " +
-        "so components cannot be installed automatically."
-    );
-  } else if (p.error) {
-    banner($("setup-error"), p.error);
-  } else if (m.load_error || v.load_error) {
-    banner($("setup-error"), m.load_error ? `MS2PIP: ${m.load_error}` : `visDIA: ${v.load_error}`);
-  } else if ((p.outdated || []).length) {
-    banner(
-      $("setup-error"),
-      `The analysis environment needs an update: ${p.outdated.join(", ")}. ` +
-        "Press Update; it upgrades the installed packages in place."
-    );
-  } else {
-    banner($("setup-error"), "");
-  }
+  banner($("setup-error"), componentsBannerText(c));
 
-  const m = c.ms2pip;
-  const mpill = $("ms2pip-pill");
-  const mbtn = $("install-ms2pip");
-  if (m.install_status === "installing") {
-    mpill.textContent = "installing…";
-    mpill.className = "pill warn";
-    mbtn.disabled = true;
-  } else if (testing(m)) {
-    mpill.textContent = "testing…";
-    mpill.className = "pill warn";
-    mbtn.disabled = true;
-  } else if (m.load_check === "failed") {
-    mpill.textContent = "cannot load";
-    mpill.className = "pill bad";
-    mbtn.disabled = false;
-    mbtn.textContent = "Reinstall";
-  } else if (m.complete) {
-    mpill.textContent = "installed";
-    mpill.className = "pill ok";
-    mbtn.disabled = true;
-    mbtn.textContent = "Installed";
-  } else {
-    mpill.textContent = "optional";
-    mpill.className = "pill mute";
-    mbtn.disabled = false;
+  const uv = !!c.primary.uv;
+  for (const [e, pillId, btnId] of [
+    [m, "ms2pip-pill", "install-ms2pip"],
+    [v, "visdia-pill", "install-visdia"],
+  ]) {
+    const view = optionalCardView(e, uv);
+    $(pillId).textContent = view.pill;
+    $(pillId).className = view.cls;
+    $(btnId).textContent = view.label;
+    $(btnId).disabled = view.disabled;
   }
-
-  const v = c.visdia || {};
   state.visdiaReady = !!v.complete;
-  const vpill = $("visdia-pill");
-  const vbtn = $("install-visdia");
-  if (v.install_status === "installing") {
-    vpill.textContent = "installing…";
-    vpill.className = "pill warn";
-    vbtn.disabled = true;
-  } else if (testing(v)) {
-    vpill.textContent = "testing…";
-    vpill.className = "pill warn";
-    vbtn.disabled = true;
-  } else if (v.load_check === "failed") {
-    vpill.textContent = "cannot load";
-    vpill.className = "pill bad";
-    vbtn.disabled = !c.primary.uv;
-    vbtn.textContent = "Reinstall";
-  } else if (v.complete) {
-    vpill.textContent = "installed";
-    vpill.className = "pill ok";
-    vbtn.disabled = true;
-    vbtn.textContent = "Installed";
-  } else {
-    vpill.textContent = "optional";
-    vpill.className = "pill mute";
-    vbtn.disabled = !c.primary.uv;
-    vbtn.textContent = "Install";
-  }
   refreshVisdiaButtons();
 
-  // One log pane, showing whichever installation is talking, or the optional
-  // environment whose packages failed to load.
-  const optionalFailed =
-    m.load_check === "failed" ? m : v.load_check === "failed" ? v : null;
-  const active =
-    m.install_status === "installing"
-      ? m
-      : v.install_status === "installing"
-        ? v
-        : !(p.install_log || []).length && optionalFailed
-          ? optionalFailed
-          : p;
-  if (active === optionalFailed) show($("install-log-card"), true);
+  const [, source, open] = installLogSource(c);
+  show($("install-log-card"), open);
   const logEl = $("install-log");
-  const text = (active.install_log || []).join("\n");
+  const text = (source.install_log || []).join("\n");
   if (logEl.textContent !== text) {
     logEl.textContent = text;
     logEl.scrollTop = logEl.scrollHeight;
@@ -810,25 +857,6 @@ async function refreshComponents() {
   $("setup-versions").textContent = versions.length
     ? versions.map(([k, v]) => `${k} ${v}`).join(" · ")
     : "";
-
-  // The DIA-NN card's build button depends on `componentsReady`, which is only
-  // known here.
-  const busy =
-    installing ||
-    m.install_status === "installing" ||
-    v.install_status === "installing" ||
-    testing(p) ||
-    testing(m) ||
-    testing(v);
-  if (busy && !state.setupTimer) {
-    state.setupTimer = setInterval(refreshComponents, 900);
-  } else if (!busy && state.setupTimer) {
-    clearInterval(state.setupTimer);
-    state.setupTimer = null;
-    // An installation just finished, so the managed-data sizes are stale. Once, on
-    // the transition: walking a Python environment is too slow for the poll itself.
-    refreshManaged();
-  }
 }
 
 // Test again whether the packages load, after something outside the application was
@@ -903,13 +931,25 @@ async function installVcRuntime() {
 
 async function installComponents(env) {
   banner($("setup-error"), "");
+  // Feedback before the backend answers. The command returns as soon as the installation
+  // has started (it runs on a thread of its own), and the poll takes over from there.
+  const btn = $(`install-${env}`);
+  const pill = $(`${env}-pill`);
+  btn.disabled = true;
+  btn.textContent = "Installing…";
+  pill.textContent = "installing…";
+  pill.className = "pill warn";
+  let failure = null;
   try {
     await invoke("components_install", { env });
   } catch (e) {
-    banner($("setup-error"), String(e));
-    return;
+    failure = String(e);
   }
-  refreshComponents();
+  // Back to what the backend says the cards are, which also starts the poll.
+  await refreshComponents();
+  // A refusal (no `uv`, an installation already running) is the answer to this click,
+  // so it is shown over whatever the refresh put in the banner.
+  if (failure) banner($("setup-error"), failure);
 }
 
 // -- managed data ------------------------------------------------------------

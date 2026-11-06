@@ -432,9 +432,16 @@ jobs:
         working-directory: desktop/src-tauri
         run: cargo test --lib
 
-      # The frontend has no build step, so this is its whole check.
+      # The frontend has no build step, so these are its whole check: the names it
+      # shares with the backend, and the Setup screen driven in Node (the runner's own;
+      # the test has no dependencies).
       - name: Frontend agrees with the backend
         run: python ci/check_desktop_ui.py
+
+      - name: Frontend behaviour
+        run: |
+          node --check desktop/ui/app.js
+          node ci/test_desktop_ui.mjs
 
   # The desktop application on Windows, the platform its installer and its Visual C++
   # runtime handling exist for. The Linux job above never compiles the `cfg(windows)`
