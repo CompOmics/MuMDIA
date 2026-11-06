@@ -24,5 +24,12 @@
 # Checked on 2026-11-03: a fresh pip install of this file resolved duckdb 1.5.6, the
 # viewer reported a limit of 16.0 GiB on a 755 GiB host, and the precursor, peptide and
 # protein-group tables of an 8.5M-row and a 31.2M-row diaPASEF result loaded.
+# cb8b5bc adds to e2010e3 a note when an output was pruned to a retention tier
+# (CompOmics/visDIA#12), run folders named after their inputs ordered by the recorded
+# input and index-named runs ordered numerically (#13), and Quant QC conditions that stay
+# as the user set them when the page is built again (#14, CompOmics/MuMDIA#283).
+# Checked on 2026-11-06: a fresh pip install of this file resolved duckdb 1.5.6 and the
+# viewer served a three-run experiment with run folders named after their inputs and a
+# twelve-run diaPASEF experiment pruned to the viewer tier.
 # Move the pin together with a check of that kind.
-mumdia-viewer @ https://github.com/CompOmics/visDIA/archive/e2010e3a8c7d78dd0a6a7af83bb4936347e6132f.zip
+mumdia-viewer @ https://github.com/CompOmics/visDIA/archive/cb8b5bcb2e98d223275a52eeb8a8717acf2ca1c3.zip
