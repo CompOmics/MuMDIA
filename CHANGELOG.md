@@ -363,7 +363,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   disabled and a banner offering the fixes (the analysis components on the Setup screen, a
   DIA-NN build, or converting a DIA-NN library); the application has no override, never offers
   the key in Settings and never writes it into a configuration.
-||||||| parent of 7df1535 (feat(experiment): name each run after its input file instead of r<i>)
 - **`run-experiment` names each run's output folder and report columns after its input
   file (breaking output layout).** Without `--run-names`, the runs of an experiment (and of
   a `run` given several `--mzml`) were `r0`, `r1`, ...; they are now the input's file name
