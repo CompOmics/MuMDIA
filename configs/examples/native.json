@@ -1,4 +1,7 @@
 {
+  "predict_frag": {
+    "allow_native_predictors": true
+  },
   "features": {
     "set": "extended"
   },

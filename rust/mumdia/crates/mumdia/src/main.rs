@@ -1917,6 +1917,7 @@ fn real_main() -> Result<()> {
             config,
         } => {
             let cfg = load_config(&config)?;
+            stages::rt_health::refuse_native_predictors(&cfg, true, "predict-frag")?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::predict_frag::run(stages::predict_frag::PredictFragParams {
                 // The standalone stage cannot know that a multi-head calibration follows.
@@ -2444,6 +2445,13 @@ fn real_main() -> Result<()> {
             if let Some(r) = retain {
                 cfg.output.retain = r.into();
             }
+            // Refused before a vendor file is converted, which can take minutes per file;
+            // the orchestrator checks again for its library callers.
+            stages::rt_health::refuse_native_predictors(
+                &cfg,
+                fasta.is_some() && lib_precursors.is_none(),
+                "run",
+            )?;
             // Vendor files are converted to mzML before anything else happens, so every
             // stage below sees mzML; an mzML path passes through untouched. Several vendor
             // files convert concurrently, `convert.parallel_conversions` at a time.
@@ -2512,6 +2520,11 @@ fn real_main() -> Result<()> {
             if let Some(r) = retain {
                 cfg.output.retain = r.into();
             }
+            stages::rt_health::refuse_native_predictors(
+                &cfg,
+                fasta.is_some() && lib_precursors.is_none(),
+                "run-experiment",
+            )?;
             let converted_from = mzml.clone();
             let mzml = mumdia::raw::ensure_mzml_all(
                 &mzml,

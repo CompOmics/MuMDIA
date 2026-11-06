@@ -614,14 +614,21 @@ files:
   (AlphaPeptDeep, DeepLC). The digest and modification fields are merged on top of the
   recipe exactly as they were on top of the preset;
 - a saved settings file that names no predictor is kept, because replacing it would drop
-  the user's edits, and is warned about.
+  the user's edits, and is blocked.
 
-The Search screen shows the plan under the built-in option (`libsrc-builtin-note`), and a
-warning (`builtin-warn`) when the search would still run on native fragment intensities, or
-on a diaPASEF `.d` without predicted 1/K0. Start asks the plan again and, when it carries a
-warning, opens a dialog that says what the search would cost and starts only on "Start
-anyway". `preflight` adds the same warning for any FASTA configuration, so a batch or a
-configuration from the settings editor is covered too. Each recipe considered costs one
+The engine refuses a FASTA library on its native models unless its configuration sets
+`predict_frag.allow_native_predictors`, and the application never sets it: the settings
+editor does not offer the key and a configuration the application writes never carries it
+(`settings::NOT_OFFERED`). So when the plan resolves to native fragment intensities, or to
+native retention times that nothing replaces, the plan carries `blocked`: the Search screen
+shows it in red under the built-in option (`builtin-warn`), with the fixes (install MS2PIP or
+AlphaPeptDeep with the analysis components on the Setup screen, build the library with
+DIA-NN, or convert a DIA-NN library on the From a spectral library tab), and Start and Build
+library only stay disabled. There is no override in the application. Start asks the plan
+again and refuses a blocked one, and `preflight` blocks any FASTA configuration that resolves
+to the native models, so a batch or a configuration from the settings editor is covered too.
+A diaPASEF `.d` without predicted 1/K0 is a warning instead (`builtin-warn` in amber): Start
+opens a dialog that says what the search would cost and starts only on "Start anyway". Each recipe considered costs one
 `mumdia doctor`, which imports the interpreters' packages, so the plan runs off the
 interface thread and a stale answer is dropped.
 

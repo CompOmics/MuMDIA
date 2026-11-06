@@ -60,7 +60,10 @@ This is a functional check. It says the pipeline works, not how well it performs
 ## 1. Local Python sidecar environments
 
 The engine runs end to end with zero external dependencies using the native
-predictors and the native `percolator_lite` rescorer. The real ML predictors and
+predictors and the native `percolator_lite` rescorer, but a FASTA search on the native
+predictors is refused unless the configuration says `predict_frag.allow_native_predictors =
+true` (`configs/examples/native.json` does; `docs/06_predict_frag_index_matchers.md`, "The
+native predictor models"). They are a fallback for proving an installation, not a search. The real ML predictors and
 rescorers are opt-in Python sidecars invoked over a positional-CLI file contract
 (input Parquet/PIN as argv, output Parquet; see `docs/13_sidecars.md`). Each
 sidecar is a separate conda environment, wired into a run purely by pointing a
@@ -278,13 +281,16 @@ clone has neither.
 No Python, no sidecars. `--profile dia` selects the Extended feature set,
 rolling-window apex counting (window 5), and the RT prior
 (`config.rs:1109-1113`). Native predictors and the native rescorer are used
-throughout.
+throughout, which the engine refuses for a FASTA search unless it is told otherwise:
+`configs/examples/native.json` sets `predict_frag.allow_native_predictors = true`. Without
+it, or without `--config` at all, the run stops before the digest and names the fixes.
 
 ```
 mumdia run \
   --fasta   fasta/ecoli_22032024.fasta \
   --mzml    mzml_files/LFQ_Orbitrap_AIF_Ecoli_01.mzML \
   --out-dir out_native \
+  --config  configs/examples/native.json \
   --profile dia \
   --top-peaks-ms2 300
 ```

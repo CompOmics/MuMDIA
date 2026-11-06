@@ -191,6 +191,9 @@ pub fn run(p: RunParams) -> Result<()> {
     pre.step("resolve_interpreters");
     let cfg = &resolved;
     preflight(&p, cfg)?;
+    // A FASTA library on the native fallback models is refused before anything runs,
+    // unless `predict_frag.allow_native_predictors` says otherwise (`rt_health`).
+    crate::stages::rt_health::refuse_native_predictors(cfg, p.lib_precursors.is_none(), "run")?;
     // What the library is predicted with, for the native-model warning now and the causes
     // the end summary names (`rt_health`).
     let native = crate::stages::rt_health::NativePredictions::of_config(

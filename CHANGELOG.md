@@ -323,6 +323,26 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Changed
 
+- **A FASTA search on the native predictors is refused.** `run`, `run-experiment`,
+  `build-library` and `predict-frag` stop before the digest when the library's fragment
+  intensities would come from the native model (`predict_frag.predictor = native`), or its
+  retention times from the native model (`rt_predictor = native`) with no DeepLC fine-tune or
+  explicit `rt_im_train.multihead_calibration` head count to replace them. Both keys default
+  to `native`, so a FASTA search without `--config` is refused with the same message, which
+  names the fixes: MS2PIP or AlphaPeptDeep with DeepLC (`configs/examples/fasta-sidecars.json`,
+  `fasta-peptdeep.json`, `diapasef.json`, checked by `mumdia doctor`), or a DIA-NN-predicted
+  library imported with `import_diann_lib.py`. The native models usually leave the seed
+  without confident anchors: a desktop FASTA search on them found 33.6k precursors where a
+  DIA-NN-predicted library gave 129k with the same engine, and only a warning said so.
+  `predict_frag.allow_native_predictors = true` runs them anyway; it is never part of the
+  canonical configuration, so the configuration hash and every artifact of an allowed run are
+  unchanged. `configs/examples/native.json` sets it (the CI smoke test uses it, and its
+  expectations are unchanged), as does `augment_library.py` for its internal predict-frag.
+  Imported-library searches are unaffected. In the desktop application a built-in FASTA
+  search that resolves to the native models is blocked, with Start and Build library only
+  disabled and a banner offering the fixes (the analysis components on the Setup screen, a
+  DIA-NN build, or converting a DIA-NN library); the application has no override, never offers
+  the key in Settings and never writes it into a configuration.
 - **The desktop application pins visDIA at e2010e3.** Over c674f9f it adds the ion-mobility
   views (CompOmics/visDIA#8), a mobilogram card on the precursor page of diaPASEF runs (#9)
   and the fragments behind each quantity, read from `quant_fragments.parquet` (#10), and
