@@ -48,7 +48,8 @@ import pandas as pd
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import write_engine_parquet
+from _lib_io import (PROTEIN_ANNOTATIONS, annotations_path, read_protein_annotations,
+                    write_engine_parquet, write_protein_annotations)
 
 # A bracketed modification, with the dash of a terminal group (`[Acetyl]-PEPK`).
 STRIP_MODS = re.compile(r"-?\[[^\]]*\]-?")
@@ -251,6 +252,16 @@ def main():
     merged_prec["n_fragments"] = merged_prec["candidate_id"].map(nfrag).fillna(0).astype(np.int32)
     write_engine_parquet(merged_prec, W("aug_merged_prec.parquet"))
     write_engine_parquet(merged_frag, W("aug_merged_frag.parquet"))
+    # Protein annotations for the merged library: the imported library's, plus the FASTA
+    # proteins `mumdia digest` annotated beside its output, which name the added peptides'
+    # `protein` strings. The imported row wins a key both have. The decoy builder below
+    # carries the table from the work directory to the output library.
+    imported_ann = read_protein_annotations(annotations_path(args.imported_precursors))
+    merged_ann = read_protein_annotations(W(PROTEIN_ANNOTATIONS))
+    merged_ann.update(imported_ann)
+    if merged_ann:
+        n_ann = write_protein_annotations(merged_ann, W(PROTEIN_ANNOTATIONS))
+        print(f"      protein annotations: {n_ann} entries ({len(imported_ann)} imported)")
     print(f"      merged target precursors: {len(merged_prec)} (added {len(mprec)})")
     if "predicted_im" in merged_prec.columns:
         n_im = int(merged_prec["predicted_im"].notna().sum())

@@ -18,6 +18,7 @@ pub mod offsets;
 pub mod peaks;
 pub mod predict;
 pub mod prestage;
+pub mod protein_annotations;
 pub mod python;
 pub mod quant_lfq;
 pub mod raw;

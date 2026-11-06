@@ -33,6 +33,9 @@ pub struct RunParams<'a> {
     /// skipped and the FASTA is not read.
     pub lib_precursors: Option<&'a str>,
     pub lib_fragments: Option<&'a str>,
+    /// The library's protein annotation table (`--lib-annotations`); `None` takes the one
+    /// beside `lib_precursors` when there is one (`protein_annotations::find`).
+    pub lib_annotations: Option<&'a str>,
     pub max_spectra: usize,
     pub top_peaks_ms2: usize,
     /// `[mzml]` when `raw::ensure_mzml` converted it from a vendor input, else empty;
@@ -216,6 +219,11 @@ pub fn run(p: RunParams) -> Result<()> {
     // surfaced minutes later as a stage failure naming one artifact (`storage`).
     crate::storage::prepare_output(p.out_dir, cfg)?;
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
+    // The library's protein annotation table, which only the report reads
+    // (`protein_annotations`): `--lib-annotations`, else the one beside `--lib-precursors`,
+    // validated here rather than at the end. A FASTA search writes its own (`digest`).
+    let lib_annotations =
+        crate::protein_annotations::resolve_input(p.lib_annotations, p.lib_precursors)?;
 
     let mut man = Manifest::new(cfg.canonical_json(), ch.clone());
     info!(provenance = %man.provenance(), "run: build provenance");
@@ -235,6 +243,7 @@ pub fn run(p: RunParams) -> Result<()> {
             ("fasta", p.fasta),
             ("lib_precursors", p.lib_precursors),
             ("lib_fragments", p.lib_fragments),
+            ("lib_annotations", lib_annotations.as_deref()),
         ]
         .into_iter()
         .filter_map(|(role, path)| path.map(|x| (role.to_string(), x.to_string())))
@@ -957,6 +966,23 @@ pub fn run(p: RunParams) -> Result<()> {
     info!(stage = %"report", "run: stage start");
     let loc_tables: Vec<String> = localisation.iter().cloned().collect();
     let sites_tsv = d("sites.tsv");
+    // Copied into the output directory, so a later `mumdia report` finds it beside the
+    // scored table, and recorded only when there is one, so a run without it keeps its
+    // manifest.
+    let annotations = match crate::protein_annotations::search_source(
+        lib_annotations.as_deref(),
+        p.lib_precursors,
+        p.out_dir,
+    ) {
+        Some(src) => Some(crate::protein_annotations::publish_recorded(
+            &src,
+            p.out_dir,
+            p.lib_precursors.is_some(),
+            &ch,
+            Some(&mut man),
+        )?),
+        None => None,
+    };
     let loc = localisation.as_ref().map(|_| report::Localisation {
         tables: &loc_tables,
         experiment: None,
@@ -972,6 +998,7 @@ pub fn run(p: RunParams) -> Result<()> {
             out_proteins: &prot_tsv,
             out_precursors: Some(&prec_tsv),
             q_threshold: cfg.quant.q_threshold,
+            protein_annotations: annotations.as_deref(),
         },
         loc.as_ref(),
     )?;

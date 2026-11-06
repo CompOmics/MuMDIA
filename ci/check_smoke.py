@@ -118,6 +118,10 @@ def strip_mods(peptidoform: str) -> str:
     return "".join(out)
 
 
+# The columns the protein annotation table appends to every TSV, after all the others.
+ANNOTATION_COLUMNS = ["protein_ids", "protein_names", "genes"]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", required=True, help="run output directory")
@@ -132,6 +136,12 @@ def main() -> int:
     ap.add_argument("--experiment-named", default=None,
                     help="the --experiment run again without --run-names, on the same two "
                          "inputs (fixture.mzML, fixture_b.mzML), to assert the derived names")
+    ap.add_argument("--plain-report", default=None,
+                    help="the run's TSVs rewritten by `mumdia report` without protein "
+                         "annotations")
+    ap.add_argument("--annotated-report", default=None,
+                    help="the run's TSVs rewritten by `mumdia report` from the scored "
+                         "table in the run directory, which finds the annotations there")
     ap.add_argument("--min-assertions", type=int, default=0,
                     help="fail if fewer than N assertions ran; keeps the count cited "
                          "in CHANGELOG.md and docs/19 from silently rotting, and "
@@ -326,8 +336,9 @@ def main() -> int:
         c.ok(prec_hdr == ["precursor", "stripped_sequence", "charge", "precursor_mz", "protein",
                  "protein_group", "q_value", "peptide_q_value", "protein_group_q_value",
                  "score", "apex_rt", "quantity",
-                         "is_transferred", "transfer_q"],
-             "precursors.tsv has the single-run columns", "\t".join(prec_hdr))
+                         "is_transferred", "transfer_q"] + ANNOTATION_COLUMNS,
+             "precursors.tsv has the single-run columns and the protein annotations",
+             "\t".join(prec_hdr))
         sp = pq.read_table(
             out / "psms_scored.parquet",
             columns=["peptidoform", "charge", "label", "precursor_q"],
@@ -396,6 +407,63 @@ def main() -> int:
          "at least one candidate carried a scored apex into quant",
          str(qstats.get("candidates_with_scored_apex")))
 
+    # ---------------------------------------------------------- protein annotations
+    # A FASTA search writes the proteins' accessions, entry names and genes beside its
+    # library and copies them into the run directory; the report appends them as three
+    # columns after every other one. Nothing else changes: each annotated line is the
+    # unannotated line plus three cells, and a standalone report of the run's scored table
+    # finds the table beside it and reproduces the run's TSVs byte for byte.
+    print()
+    print("protein annotations")
+    ann_path = out / "protein_annotations.parquet"
+    if c.ok(ann_path.is_file(), "run copies protein_annotations.parquet into its directory"):
+        ann = pq.read_table(ann_path).to_pydict()
+        keys = ann["protein"]
+        c.ok(keys == sorted(keys) and len(keys) == len(set(keys)) and len(keys) > 0,
+             "the annotation table has one row per FASTA protein, ascending", str(len(keys)))
+        c.ok(all(i == k.split("|")[1] and n == k.split("|")[2]
+                 for k, i, n in zip(keys, ann["protein_ids"], ann["protein_names"])),
+             "a UniProt header gives its accession and entry name",
+             str(list(zip(keys, ann["protein_ids"], ann["protein_names"]))[:2]))
+        man = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        rec = man.get("artifacts", {}).get("protein_annotations", {})
+        c.ok(rec.get("schema_version") == 1 and rec.get("rows") == len(keys),
+             "the manifest records the annotation table", str(rec))
+
+    def expected_cells(protein):
+        members = [m for m in protein.split(";") if m.count("|") >= 2]
+        ids = ";".join(dict.fromkeys(m.split("|")[1] for m in members))
+        names = ";".join(dict.fromkeys(m.split("|")[2] for m in members))
+        return [ids, names, ""]
+
+    for name, key in (("peptides.tsv", "protein"), ("precursors.tsv", "protein"),
+                      ("proteins.tsv", "protein_group")):
+        with (out / name).open(encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh, delimiter="\t")
+            got = list(reader)
+            hdr = reader.fieldnames or []
+        c.ok(hdr[-3:] == ANNOTATION_COLUMNS and len(got) > 0,
+             f"{name} ends with the protein annotation columns", "\t".join(hdr[-3:]))
+        bad = [r for r in got
+               if [r["protein_ids"], r["protein_names"], r["genes"]] != expected_cells(r[key])]
+        c.ok(not bad, f"{name}: every row carries its proteins' accessions and entry names",
+             str(bad[:1]))
+    if a.plain_report:
+        plain = Path(a.plain_report)
+        for name in ("peptides.tsv", "precursors.tsv", "proteins.tsv"):
+            mine = (out / name).read_text(encoding="utf-8").splitlines()
+            other = (plain / name).read_text(encoding="utf-8").splitlines()
+            c.ok(len(mine) == len(other) and all(
+                    m.rsplit("\t", 3)[0] == o for m, o in zip(mine, other)),
+                 f"{name} without the annotation table is the annotated file minus its three "
+                 "last columns", f"{len(mine)} vs {len(other)} lines")
+    if a.annotated_report:
+        rep = Path(a.annotated_report)
+        same = [n for n in ("peptides.tsv", "precursors.tsv", "proteins.tsv")
+                if (rep / n).read_bytes() == (out / n).read_bytes()]
+        c.ok(len(same) == 3, "`mumdia report --psms-scored` finds the annotation table beside "
+             "the scored table and reproduces the run's TSVs", ", ".join(same))
+
     # ---------------------------------------------------------------- determinism
     if a.compare_peptides:
         print("determinism")
@@ -459,6 +527,10 @@ def main() -> int:
             # two experiment results could not be compared at all.
             c.ok(len(arts) >= 8,
                  "it records one artifact entry per output it wrote", str(len(arts)))
+            ann = (m.get("experiment") or {}).get("protein_annotations")
+            c.ok(bool(ann) and Path(ann).is_file() and Path(ann).parent == exp
+                 and "protein_annotations" in arts,
+                 "the experiment names and records its protein annotation table", str(ann))
             bad_hash = [k for k, v in arts.items() if not v.get("content_hash")]
             c.ok(not bad_hash, "every artifact record carries a content hash",
                  ", ".join(bad_hash))
@@ -521,7 +593,7 @@ def main() -> int:
             # row (docs/29 #19); without MBR they read `false` and empty.
             c.ok(hdr == ["precursor", "stripped_sequence", "charge", "protein", "q_value",
                          "score", "n_runs", "quantity_a", "quantity_b", "is_transferred",
-                         "transfer_q"],
+                         "transfer_q"] + ANNOTATION_COLUMNS,
                  "experiment peptides.tsv has the experiment-wide columns, one quantity "
                  "column per run and the transfer basis", "\t".join(hdr))
         # Rows are asserted on the standalone rewrite at q 0.05 (smoke.sh): the pooled
@@ -540,7 +612,7 @@ def main() -> int:
         if rep_prot.is_file():
             hdr = rep_prot.read_text(encoding="utf-8").splitlines()[0].split("\t")
             c.ok(hdr == ["protein_group", "q_value", "n_runs", "lfq_a", "lfq_b",
-                         "is_transferred", "transfer_q"],
+                         "is_transferred", "transfer_q"] + ANNOTATION_COLUMNS,
                  "experiment proteins.tsv has one LFQ column per run and the transfer "
                  "basis", "\t".join(hdr))
         for r in ("a", "b"):
@@ -555,7 +627,8 @@ def main() -> int:
             c.ok(hdr == ["precursor", "stripped_sequence", "charge", "precursor_mz", "protein",
                  "protein_group", "q_value", "peptide_q_value", "protein_group_q_value",
                  "score", "n_runs", "quantity_a", "quantity_b",
-                         "normalised_a", "normalised_b", "is_transferred", "transfer_q"],
+                         "normalised_a", "normalised_b", "is_transferred", "transfer_q"]
+                 + ANNOTATION_COLUMNS,
                  "experiment precursors.tsv has the experiment-wide columns",
                  "\t".join(hdr))
             em_rep = (m.get("experiment", {}).get("report", {}) if em.is_file() else {})

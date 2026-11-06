@@ -80,6 +80,8 @@ ROOT_RESULTS = {
     "lfq_maxlfq.parquet.precursor.parquet",
     "quant_normalisation.parquet",
     "localisation_experiment.parquet",
+    # The report's protein annotations, read by `mumdia report`.
+    "protein_annotations.parquet",
 }
 # A FASTA-built library written into the output directory: the searched library, which a
 # viewer shows predicted fragments from. Under a second pass the empirical library replaces it.

@@ -815,6 +815,9 @@ Options:
       --lib-fragments <LIB_FRAGMENTS>
           Prebuilt fragment library paired with --lib-precursors
 
+      --lib-annotations <LIB_ANNOTATIONS>
+          The library's protein annotation table (accessions, entry names, genes), which adds `protein_ids`, `protein_names` and `genes` to the TSVs. Default: the `protein_annotations.parquet` beside --lib-precursors when there is one; a FASTA search writes its own
+
       --config <CONFIG>
 
       --profile <PROFILE>
@@ -857,6 +860,9 @@ Options:
       --lib-precursors <LIB_PRECURSORS>
 
       --lib-fragments <LIB_FRAGMENTS>
+
+      --lib-annotations <LIB_ANNOTATIONS>
+          As `run --lib-annotations`
 
       --config <CONFIG>
 
@@ -1053,6 +1059,9 @@ Options:
 
       --fasta <FASTA>
           A FASTA to number the sites of sites.tsv on their proteins
+
+      --protein-annotations <PROTEIN_ANNOTATIONS>
+          The protein annotation table (`protein_annotations.parquet`): adds `protein_ids`, `protein_names` and `genes` to the three TSVs. Default: the one the experiment manifest names, else the one beside --psms-scored or in --experiment-dir when there is one
 
       --q <Q>
           Reported q threshold. Defaults to `quant.q_threshold` from `--config` when that is given, otherwise 0.01. An explicit value always wins

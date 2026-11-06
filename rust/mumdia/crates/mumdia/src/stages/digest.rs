@@ -418,6 +418,12 @@ pub fn run_hashed(p: DigestParams) -> Result<Written> {
     }
     let schema = artifact::peptides(p.protein_n_term);
     let rows = write_table(p.out, columns)?;
+    // The proteins' accessions, entry names and genes, beside the peptides, for the report's
+    // join (`protein_annotations`). The `protein` key above is unchanged.
+    let annotations = crate::protein_annotations::beside(p.out);
+    let n_annotated =
+        crate::protein_annotations::write_from_fasta(p.fasta, &annotations.display().to_string())?;
+    info!(proteins = n_annotated, path = %annotations.display(), "digest: protein annotations");
 
     let elapsed = t0.elapsed().as_millis();
     let mut stats = std::collections::BTreeMap::new();

@@ -643,6 +643,12 @@ enum Cmd {
         /// Prebuilt fragment library paired with --lib-precursors.
         #[arg(long)]
         lib_fragments: Option<String>,
+        /// The library's protein annotation table (accessions, entry names, genes), which
+        /// adds `protein_ids`, `protein_names` and `genes` to the TSVs. Default: the
+        /// `protein_annotations.parquet` beside --lib-precursors when there is one; a FASTA
+        /// search writes its own.
+        #[arg(long)]
+        lib_annotations: Option<String>,
         #[arg(long)]
         config: Option<String>,
         /// Named tuning preset applied on top of --config/defaults. "dia" = the
@@ -681,6 +687,9 @@ enum Cmd {
         lib_precursors: Option<String>,
         #[arg(long)]
         lib_fragments: Option<String>,
+        /// As `run --lib-annotations`.
+        #[arg(long)]
+        lib_annotations: Option<String>,
         #[arg(long)]
         config: Option<String>,
         #[arg(long)]
@@ -833,6 +842,12 @@ enum Cmd {
         /// A FASTA to number the sites of sites.tsv on their proteins.
         #[arg(long)]
         fasta: Option<String>,
+        /// The protein annotation table (`protein_annotations.parquet`): adds
+        /// `protein_ids`, `protein_names` and `genes` to the three TSVs. Default: the one the
+        /// experiment manifest names, else the one beside --psms-scored or in
+        /// --experiment-dir when there is one.
+        #[arg(long)]
+        protein_annotations: Option<String>,
         /// Reported q threshold. Defaults to `quant.q_threshold` from `--config`
         /// when that is given, otherwise 0.01. An explicit value always wins.
         #[arg(long)]
@@ -2434,6 +2449,7 @@ fn real_main() -> Result<()> {
             out_dir,
             lib_precursors,
             lib_fragments,
+            lib_annotations,
             config,
             profile,
             max_spectra,
@@ -2484,6 +2500,7 @@ fn real_main() -> Result<()> {
                     out_dir: &out_dir,
                     lib_precursors: lib_precursors.as_deref(),
                     lib_fragments: lib_fragments.as_deref(),
+                    lib_annotations: lib_annotations.as_deref(),
                     max_spectra,
                     top_peaks_ms2,
                     converted_mzml: &converted_mzml,
@@ -2497,6 +2514,7 @@ fn real_main() -> Result<()> {
                     out_dir: &out_dir,
                     lib_precursors: lib_precursors.as_deref(),
                     lib_fragments: lib_fragments.as_deref(),
+                    lib_annotations: lib_annotations.as_deref(),
                     max_spectra,
                     top_peaks_ms2,
                     converted_mzml: &converted_mzml,
@@ -2510,6 +2528,7 @@ fn real_main() -> Result<()> {
             out_dir,
             lib_precursors,
             lib_fragments,
+            lib_annotations,
             config,
             profile,
             max_spectra,
@@ -2550,6 +2569,7 @@ fn real_main() -> Result<()> {
                 out_dir: &out_dir,
                 lib_precursors: lib_precursors.as_deref(),
                 lib_fragments: lib_fragments.as_deref(),
+                lib_annotations: lib_annotations.as_deref(),
                 max_spectra,
                 top_peaks_ms2,
                 converted_mzml: &converted_mzml,
@@ -2759,6 +2779,7 @@ fn real_main() -> Result<()> {
             protein_quant,
             localisation,
             fasta,
+            protein_annotations,
             q,
             config,
         } => {
@@ -2818,6 +2839,21 @@ fn real_main() -> Result<()> {
                     .get("localisation_experiment")
                     .and_then(|v| v.as_str())
                     .map(String::from);
+                // The protein annotations: --protein-annotations, else the table the
+                // manifest names, else one in the directory (an experiment from before the
+                // manifest named it). None of them leaves the TSVs as they were.
+                let annotations = match protein_annotations.clone() {
+                    Some(a) => Some(a),
+                    None => e
+                        .get("protein_annotations")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .or_else(|| {
+                            let b = std::path::Path::new(&exp)
+                                .join(mumdia::protein_annotations::FILE_NAME);
+                            b.is_file().then(|| b.display().to_string())
+                        }),
+                };
                 let out = out_dir.unwrap_or_else(|| exp.clone());
                 std::fs::create_dir_all(&out)?;
                 let pep = format!("{out}/peptides.tsv");
@@ -2846,6 +2882,7 @@ fn real_main() -> Result<()> {
                         out_proteins: &prot,
                         out_precursors: Some(&prec),
                         q_threshold: q,
+                        protein_annotations: annotations.as_deref(),
                     },
                     loc.as_ref(),
                 )?;
@@ -2869,6 +2906,11 @@ fn real_main() -> Result<()> {
                 let prec = format!("{out_dir}/precursors.tsv");
                 let sites = format!("{out_dir}/sites.tsv");
                 let loc_tables: Vec<String> = localisation.into_iter().collect();
+                // --protein-annotations, else the table `run` left beside the scored table.
+                let annotations = protein_annotations.clone().or_else(|| {
+                    let b = mumdia::protein_annotations::beside(&psms_scored);
+                    b.is_file().then(|| b.display().to_string())
+                });
                 let loc = (!loc_tables.is_empty()).then(|| stages::report::Localisation {
                     tables: &loc_tables,
                     experiment: None,
@@ -2884,6 +2926,7 @@ fn real_main() -> Result<()> {
                         out_proteins: &prot,
                         out_precursors: Some(&prec),
                         q_threshold: q,
+                        protein_annotations: annotations.as_deref(),
                     },
                     loc.as_ref(),
                 )?;

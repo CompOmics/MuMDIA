@@ -73,6 +73,8 @@ pub enum Origin {
 pub struct Library {
     pub precursors: String,
     pub fragments: String,
+    /// The FASTA proteins' annotation table (`protein_annotations`), beside the library.
+    pub annotations: String,
     pub origin: Origin,
     /// The cache entry the library was looked up under, when a cache is configured.
     pub cache: Option<LibraryCache>,
@@ -99,6 +101,10 @@ pub fn build(
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
     let lib_p = d("fragment_library_precursors.parquet");
     let lib_f = d("fragment_library_fragments.parquet");
+    // Written by `digest` beside its output, which is this directory; on a cache hit, from
+    // the FASTA directly. It depends on the FASTA's headers alone and costs one read of
+    // them, so the library cache does not store it.
+    let annotations = d(crate::protein_annotations::FILE_NAME);
     // `predict_frag.library_cache`: a library stored by an earlier command with the same
     // FASTA, build settings, predictor versions and engine is published here instead of
     // being built (`library_cache`).
@@ -112,6 +118,7 @@ pub fn build(
         // A reused output directory may still hold an earlier build's digest and
         // peptidoforms, which did not produce this library.
         crate::library_cache::remove_build_intermediates(p.out_dir);
+        crate::protein_annotations::write_from_fasta(p.fasta, &annotations)?;
         if let Some(m) = man.as_deref_mut() {
             m.record(wp.record(
                 artifact::FRAGMENT_LIBRARY_PRECURSORS.0,
@@ -131,6 +138,7 @@ pub fn build(
         return Ok(Library {
             precursors: lib_p,
             fragments: lib_f,
+            annotations,
             origin: Origin::LibraryCache,
             cache,
         });
@@ -248,6 +256,7 @@ pub fn build(
     Ok(Library {
         precursors: lib_p,
         fragments: lib_f,
+        annotations,
         origin: Origin::Built,
         cache,
     })
@@ -459,6 +468,7 @@ pub fn run(p: BuildLibraryParams) -> Result<serde_json::Value> {
             "decoys": n_prec - targets,
         },
         "fragments": { "path": lib.fragments, "rows": n_frag },
+        "protein_annotations": { "path": lib.annotations },
         "models": models,
         "cache": cache,
         "reuse": {

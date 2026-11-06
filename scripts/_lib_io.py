@@ -207,3 +207,116 @@ def sort_fragments_by_candidate(path, buckets: int = 64, tmp_dir=None) -> int:
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return n_rows
+
+
+# ---------------------------------------------------------------------------------------
+# Protein annotations: the side table beside a library's precursor table.
+#
+# A library's `protein` column is the grouping key every later table inherits (the scored
+# tables' `protein` and `protein_group`, quant, LFQ) and the one the engine reports. It is
+# one string per precursor, `;`-separated for a shared peptide, and for an imported DIA-NN
+# library it holds UniProt entry names (`ALBU_HUMAN`), so the accessions and gene names
+# were lost at import. `protein_annotations.parquet` keeps them without touching the key:
+# one row per distinct `protein` string (or, for a FASTA, per protein), giving its
+# accessions, entry names, genes and description. The engine joins it at report time to add
+# `protein_ids`, `protein_names` and `genes` to the TSVs; every identification and quantity
+# is unchanged. Decoys are never annotated (their `DECOY_` strings are never reported).
+#
+# The engine finds the table by convention next to the precursor table it is given
+# (`--lib-precursors`), or through `--lib-annotations`. So every helper that writes a
+# library into another directory carries the table along (`carry_protein_annotations`).
+# ---------------------------------------------------------------------------------------
+
+PROTEIN_ANNOTATIONS = "protein_annotations.parquet"
+# The columns, in order; all utf8 and non-null (empty when unknown). The key is unique and
+# the rows ascend by it, so the bytes depend only on the content.
+PROTEIN_ANNOTATION_COLUMNS = ("protein", "protein_ids", "protein_names", "genes", "description")
+# The engine's name and version for it (`artifact::PROTEIN_ANNOTATIONS`).
+PROTEIN_ANNOTATIONS_SCHEMA = ("protein_annotations", 1)
+
+
+def annotations_path(precursors_path) -> str:
+    """Where the protein annotation table of the library at `precursors_path` lives."""
+    import os
+
+    return os.path.join(os.path.dirname(os.path.abspath(str(precursors_path))), PROTEIN_ANNOTATIONS)
+
+
+def uniprot_fields(token: str):
+    """(accession, entry name) of one FASTA header token or protein identifier.
+
+    `db|ACCESSION|ENTRY_NAME` (UniProt `sp|` / `tr|`, and the same with a prefix such as
+    `CON_sp|` or `ENTRAP_sp|`) gives its two fields; any other token is its own accession
+    with no entry name. The engine's FASTA reader applies the same rule
+    (`protein_annotations::uniprot_fields`)."""
+    token = token.strip()
+    parts = token.split("|")
+    if len(parts) >= 3 and parts[1]:
+        return parts[1], parts[2]
+    return token, ""
+
+
+def join_unique(values) -> str:
+    """`;`-join of the non-empty values, each once, in first-occurrence order."""
+    seen = []
+    for v in values:
+        v = v.strip()
+        if v and v not in seen:
+            seen.append(v)
+    return ";".join(seen)
+
+
+def write_protein_annotations(rows, path) -> int:
+    """Write the annotation table: `rows` maps a protein key to the dict of its columns
+    (missing ones empty). Rows ascend by key. Returns the row count."""
+    keys = sorted(k for k in rows if k)
+    cols = {c: [] for c in PROTEIN_ANNOTATION_COLUMNS}
+    for k in keys:
+        r = rows[k]
+        cols["protein"].append(k)
+        for c in PROTEIN_ANNOTATION_COLUMNS[1:]:
+            cols[c].append(str(r.get(c, "") or ""))
+    schema = pa.schema([pa.field(c, pa.string(), False) for c in PROTEIN_ANNOTATION_COLUMNS])
+    table = pa.table({c: pa.array(cols[c], pa.string()) for c in PROTEIN_ANNOTATION_COLUMNS},
+                     schema=schema)
+    pq.write_table(table, str(path), compression="snappy")
+    return len(keys)
+
+
+def read_protein_annotations(path) -> dict:
+    """The annotation table at `path` as {protein: {column: value}}, or {} when absent."""
+    import os
+
+    if not os.path.isfile(str(path)):
+        return {}
+    t = pq.read_table(str(path)).to_pydict()
+    out = {}
+    for i, k in enumerate(t.get("protein", [])):
+        out[k] = {c: (t[c][i] if c in t and t[c][i] is not None else "")
+                  for c in PROTEIN_ANNOTATION_COLUMNS[1:]}
+    return out
+
+
+def carry_protein_annotations(src_precursors, dst_precursors) -> str | None:
+    """Copy the annotation table beside `src_precursors` to beside `dst_precursors`.
+
+    Byte for byte, and only when the two directories differ. When the source has none (a
+    library from before the table existed), a table already at the destination belongs to
+    another library and is removed. Returns the destination path when one is there
+    afterwards."""
+    import os
+    import shutil
+
+    src, dst = annotations_path(src_precursors), annotations_path(dst_precursors)
+    if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)):
+        return dst if os.path.isfile(dst) else None
+    if not os.path.isfile(src):
+        if os.path.isfile(dst):
+            # A table left by another library would annotate this one wrongly.
+            os.remove(dst)
+            print(f"protein annotations: {src} is absent; removed the stale {dst}")
+        return None
+    tmp = dst + ".tmp"
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
+    return dst

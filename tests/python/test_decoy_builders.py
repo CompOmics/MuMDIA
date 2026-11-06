@@ -40,6 +40,7 @@ from conftest import (
     stripped,
     fragment_mz,
     library_im,
+    SCRIPTS,
 )
 
 DELTA_CH2 = 14.015650
@@ -473,3 +474,27 @@ def test_reverse_aborts_when_the_library_mz_disagree_with_its_calculator(tmp_pat
     assert rc != 0
     assert "ABORT" in out + err
     assert not (tmp_path / "prec_out.parquet").exists()
+
+
+@pytest.mark.parametrize("script", ["make_shift_decoys.py", "make_reverse_decoys.py"])
+def test_the_protein_annotations_follow_the_library_to_its_new_directory(script, tmp_path):
+    """The protein annotation table beside the target library is copied, byte for byte,
+    beside the decoy library, so the engine finds it next to the library it is given; with
+    no table beside the input, a stale one at the output belongs to another library and is
+    removed."""
+    import sys
+
+    sys.path.insert(0, str(SCRIPTS))
+    from _lib_io import write_protein_annotations
+
+    (tmp_path / "in").mkdir()
+    src = _write_target_library(tmp_path / "in")
+    ann = tmp_path / "in" / "protein_annotations.parquet"
+    write_protein_annotations({"P1": {"protein_ids": "P00001", "genes": "G1"}}, ann)
+    out = _build(script, src, tmp_path / "out")
+    copied = out["prec"].parent / "protein_annotations.parquet"
+    assert copied.read_bytes() == ann.read_bytes()
+
+    ann.unlink()
+    _build(script, src, tmp_path / "out")
+    assert not copied.exists()

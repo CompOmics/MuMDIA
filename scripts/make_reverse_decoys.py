@@ -36,7 +36,8 @@ import pyarrow.parquet as pq
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import narrow_table, sort_fragments_by_candidate, write_engine_parquet
+from _lib_io import (carry_protein_annotations, narrow_table, sort_fragments_by_candidate,
+                    write_engine_parquet)
 from _unimod import MASS_BY_NAME
 
 RES = {
@@ -397,6 +398,8 @@ def main():
     # them; restore candidate order so the engine can read one id range of the table.
     sort_fragments_by_candidate(outf)
 
+    # The targets' protein annotations, beside the output library (decoys have none).
+    carry_protein_annotations(inp, outp)
     print(f"targets_in={len(tprec)} targets_out={len(tprec_out)} decoys={len(dprec)} total_prec={len(allp)} total_frag={n_out}", flush=True)
 
 

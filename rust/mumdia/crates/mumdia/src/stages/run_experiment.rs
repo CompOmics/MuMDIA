@@ -46,6 +46,8 @@ pub struct RunExperimentParams<'a> {
     pub out_dir: &'a str,
     pub lib_precursors: Option<&'a str>,
     pub lib_fragments: Option<&'a str>,
+    /// As `RunParams::lib_annotations`.
+    pub lib_annotations: Option<&'a str>,
     pub max_spectra: usize,
     pub top_peaks_ms2: usize,
     /// The entries of `mzmls` that `raw::ensure_mzml` converted from vendor inputs; deleted
@@ -1361,6 +1363,9 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     crate::storage::prepare_output(p.out_dir, cfg)?;
     let d = |name: &str| format!("{}/{}", p.out_dir, name);
     let n_runs = p.mzmls.len();
+    // The library's protein annotation table, which only the report reads, as in `run`.
+    let lib_annotations =
+        crate::protein_annotations::resolve_input(p.lib_annotations, p.lib_precursors)?;
 
     // Provenance: the identity of the code, of the configuration and of the INPUTS,
     // hashed from the start, before any stage reads them (docs/29 #15). Hashing at the
@@ -1380,6 +1385,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         ("fasta", p.fasta),
         ("lib_precursors", p.lib_precursors),
         ("lib_fragments", p.lib_fragments),
+        ("lib_annotations", lib_annotations.as_deref()),
     ] {
         if let Some(path) = path {
             hash_order.push((role.to_string(), path.to_string()));
@@ -2800,6 +2806,21 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     });
     // The cross-run precursor matrix `quant-lfq` writes next to the protein matrix.
     let prec_lfq = quant::precursor_lfq_sibling(&lfq);
+    // The protein annotations, at the experiment root for `mumdia report --experiment-dir`.
+    let annotations = match crate::protein_annotations::search_source(
+        lib_annotations.as_deref(),
+        p.lib_precursors,
+        p.out_dir,
+    ) {
+        Some(src) => Some(crate::protein_annotations::publish_recorded(
+            &src,
+            p.out_dir,
+            p.lib_precursors.is_some(),
+            &ch,
+            None,
+        )?),
+        None => None,
+    };
     let rep_counts = report::run_experiment_localised(
         report::ExperimentReportParams {
             scored: &scored_for_quant,
@@ -2811,6 +2832,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             out_proteins: &prot_tsv,
             out_precursors: Some(&prec_tsv),
             q_threshold: cfg.quant.q_threshold,
+            protein_annotations: annotations.as_deref(),
         },
         loc.as_ref(),
     )?;
@@ -2883,6 +2905,11 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "precursor_unit".to_string(),
             json!("experiment-wide precursor_q; n_runs on run_psm_q"),
         );
+    }
+    // The protein annotation table the report joined, only when there was one, so every
+    // other manifest keeps its bytes; `mumdia report --experiment-dir` reads it from here.
+    if let (Some(a), Some(m)) = (&annotations, manifest.as_object_mut()) {
+        m.insert("protein_annotations".to_string(), json!(a));
     }
     // The input of each run, when the run names were derived from the inputs.
     if let (Some(ri), Some(m)) = (&run_inputs, manifest.as_object_mut()) {
@@ -3067,6 +3094,19 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             artifact::FRAGMENT_LIBRARY_FRAGMENTS,
             sp.library.fragments.clone(),
             "second-pass",
+            None,
+        ));
+    }
+    if let Some(a) = &annotations {
+        artifacts.push((
+            artifact::PROTEIN_ANNOTATIONS.0.to_string(),
+            artifact::PROTEIN_ANNOTATIONS,
+            a.clone(),
+            if p.lib_precursors.is_some() {
+                "library-input"
+            } else {
+                "digest"
+            },
             None,
         ));
     }
