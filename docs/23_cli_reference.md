@@ -64,7 +64,7 @@ Commands:
   inspect          Print schema, head sample, and row count for any artifact
   peak-census      Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard
   audit            Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). Non-destructive; reruns no compute
-  report           Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory
+  report           Write peptides.tsv + precursors.tsv + proteins.tsv from a scored PSM table, or the experiment-wide three for a `run-experiment` output directory
   cache            Show, trim or clear the engine's caches: FASTA-built libraries and DeepLC's trunk projection (docs/14, "The engine's caches")
   doctor           Check that the configured Python sidecar environments are usable
   help             Print this message or the help of the given subcommand(s)
@@ -187,7 +187,7 @@ first sentence of the description, with the full text in the section below.
 | [`inspect`](#inspect) | no | Print schema, head sample, and row count for any artifact |
 | [`peak-census`](#peak-census) | yes | Peaks per MS2 spectrum for an mzML or a diaPASEF `.d`, as JSON: percentiles plus what each candidate `--top-peaks-ms2` cap would discard |
 | [`audit`](#audit) | no | Candidate audit: reconstruct per-candidate stage flags + earliest rejection reason across the artifact chain and write candidate_audit.parquet (sensitivity program, P0.3/P0.4). |
-| [`report`](#report) | yes | Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory |
+| [`report`](#report) | yes | Write peptides.tsv + precursors.tsv + proteins.tsv from a scored PSM table, or the experiment-wide three for a `run-experiment` output directory |
 | [`cache`](#cache) | yes | Show, trim or clear the engine's caches: FASTA-built libraries and DeepLC's trunk projection (docs/14, "The engine's caches") |
 | [`doctor`](#doctor) | yes | Check that the configured Python sidecar environments are usable |
 | `help` | n/a | Print this message or the help of the given subcommand(s) |
@@ -1028,7 +1028,9 @@ Plus the 7 repeated flags removed above: see "Global flags".
 ## report
 
 ```text
-Write peptides.tsv + proteins.tsv from a scored PSM table, or the experiment-wide pair for a `run-experiment` output directory
+Write peptides.tsv + precursors.tsv + proteins.tsv from a scored PSM table, or the experiment-wide three for a `run-experiment` output directory.
+
+peptides.tsv is selected on peptide_q_value (about one precursor per base peptide), precursors.tsv on precursor_q (every accepted peptidoform + charge), proteins.tsv on pg_q_value.
 
 Usage: mumdia report [OPTIONS]
 
@@ -1037,17 +1039,17 @@ Options:
           A single run's scored table. Either this or --experiment-dir
 
       --experiment-dir <EXPERIMENT_DIR>
-          A `run-experiment` output directory: rewrite its experiment-wide peptides.tsv and proteins.tsv (one quantity column per run) from the pooled scored table, per-run quantities and cross-run LFQ named in its experiment_manifest.json, at another --q if wanted
+          A `run-experiment` output directory: rewrite its experiment-wide peptides.tsv, precursors.tsv and proteins.tsv (one quantity column per run) from the pooled scored table, per-run quantities and cross-run LFQ named in its experiment_manifest.json, at another --q if wanted
 
       --out-dir <OUT_DIR>
-          Where the two TSVs go. Defaults to --experiment-dir in experiment mode
+          Where the three TSVs go. Defaults to --experiment-dir in experiment mode
 
       --peptide-quant <PEPTIDE_QUANT>
 
       --protein-quant <PROTEIN_QUANT>
 
       --localisation <LOCALISATION>
-          A `localise` table of the run: adds the localisation columns to peptides.tsv and writes sites.tsv. In experiment mode the tables the manifest names are used
+          A `localise` table of the run: adds the localisation columns to peptides.tsv and precursors.tsv and writes sites.tsv. In experiment mode the tables the manifest names are used
 
       --fasta <FASTA>
           A FASTA to number the sites of sites.tsv on their proteins

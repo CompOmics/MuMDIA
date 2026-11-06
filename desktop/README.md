@@ -686,9 +686,11 @@ rather than let a user infer:
 - the counts are **experiment-wide**, not per file. The grouped q columns are grouped
   across the whole experiment, so dividing by the number of runs does not give a
   per-file number; the per-file unit is `run_psm_q` in the split tables.
-- its `peptides.tsv` and `proteins.tsv` are **experiment-wide**: selected on the
-  experiment-wide q columns, one quantity column per run (`quantity_<run>` for
-  precursors, `lfq_<run>` for protein groups), no per-run TSVs. `read_results` takes
+- its `peptides.tsv`, `precursors.tsv` and `proteins.tsv` are **experiment-wide**:
+  selected on the experiment-wide q columns, one quantity column per run
+  (`quantity_<run>` and `normalised_<run>` for precursors, `lfq_<run>` for protein
+  groups), no per-run TSVs. The results view lists `precursors.tsv` (every precursor
+  accepted on `precursor_q`), the file behind its precursors count. `read_results` takes
   the counts from `scored_combined.parquet` and flags the result `experiment_wide`,
   which is what drives the banner.
 - per-run artifacts go to `<out_dir>/<name>/`, so the stage list looks sparse until

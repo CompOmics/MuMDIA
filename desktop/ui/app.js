@@ -3490,8 +3490,8 @@ function renderResults(s) {
       "These are EXPERIMENT-WIDE counts, pooled across every run, not per file. " +
         "An experiment-wide rescore groups the q values across the whole experiment, " +
         "so dividing by the number of runs does not give a per-file number; the " +
-        "per-file unit is run_psm_q in the split tables. peptides.tsv and proteins.tsv " +
-        "here are the experiment-wide report, with one quantity column per run."
+        "per-file unit is run_psm_q in the split tables. peptides.tsv, precursors.tsv and " +
+        "proteins.tsv here are the experiment-wide report, with one quantity column per run."
     );
   } else {
     banner($("res-warn"), "");
@@ -3515,6 +3515,7 @@ function renderResults(s) {
 
   const files = [];
   if (r?.has_peptides_tsv) files.push(["peptides.tsv", "one row per (peptidoform, charge), selected by peptide q"]);
+  if (r?.has_precursors_tsv) files.push(["precursors.tsv", "every accepted (peptidoform, charge), selected by precursor q"]);
   if (r?.has_proteins_tsv) files.push(["proteins.tsv", "protein groups"]);
   files.push(["psms_scored.parquet", "every scored match, with all features"]);
   files.push(["manifest.json", "engine version, commit, and a hash of every input"]);

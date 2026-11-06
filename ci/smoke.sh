@@ -296,7 +296,7 @@ for arm in cache_store cache_hit cache_explicit; do
     env "${env_set[@]}" "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" \
         --out-dir "$work/out_$arm" --config "$arm_cfg" --threads 2 \
         > "$work/$arm.log" 2>&1 || { tail -20 "$work/$arm.log"; echo "library-cache arm $arm failed"; exit 1; }
-    for f in peptides.tsv proteins.tsv; do
+    for f in peptides.tsv precursors.tsv proteins.tsv; do
         cmp -s "$work/out/$f" "$work/out_$arm/$f" \
             || { echo "library-cache arm $arm changed $f"; exit 1; }
     done
@@ -353,7 +353,7 @@ else
         > "$work/ro_cache.log" 2>&1 || { tail -20 "$work/ro_cache.log"; echo "a read-only cache root failed the run"; exit 1; }
     grep -q "cache root from MUMDIA_CACHE_DIR is not writable" "$work/ro_cache.log" \
         || { tail -20 "$work/ro_cache.log"; echo "a read-only cache root was not reported"; exit 1; }
-    for f in peptides.tsv proteins.tsv; do
+    for f in peptides.tsv precursors.tsv proteins.tsv; do
         cmp -s "$work/out/$f" "$work/out_ro_cache/$f" \
             || { echo "a read-only cache root changed $f"; exit 1; }
     done
@@ -364,7 +364,7 @@ chmod 755 "$ro"
     --out-dir "$work/out_temp_dir" --config "$cfg" --threads 2 \
     > "$work/temp_dir.log" 2>&1 || { tail -20 "$work/temp_dir.log"; echo "--temp-dir failed the run"; exit 1; }
 [ -d "$work/temp_arm" ] || { echo "--temp-dir did not create its directory"; exit 1; }
-for f in peptides.tsv proteins.tsv; do
+for f in peptides.tsv precursors.tsv proteins.tsv; do
     cmp -s "$work/out/$f" "$work/out_temp_dir/$f" \
         || { echo "--temp-dir changed $f"; exit 1; }
 done
@@ -417,7 +417,7 @@ env "${bl_env[@]}" "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixt
     || { tail -20 "$work/after_buildlib.log"; echo "the run after build-library failed"; exit 1; }
 grep -q "library cache: reusing the stored library" "$work/after_buildlib.log" \
     || { echo "a FASTA run after build-library did not find the library it built"; exit 1; }
-for f in peptides.tsv proteins.tsv; do
+for f in peptides.tsv precursors.tsv proteins.tsv; do
     cmp -s "$work/out/$f" "$work/out_after_buildlib/$f" \
         || { echo "the run on the build-library library changed $f"; exit 1; }
 done
@@ -665,7 +665,7 @@ test ! -e "$work/out_grouped_pool/groups/overlap_losers.parquet" \
     || { echo "the overlap losers were written beside the pooled chromatograms"; exit 1; }
 cmp -s "$work/out_grouped/psms_scored.parquet" "$work/out_grouped_pool/psms_scored.parquet" \
     || { echo "rescoring the pooled competed table changed psms_scored.parquet"; exit 1; }
-for f in peptide_quant.parquet protein_group_quant.parquet fragment_quant.parquet peptides.tsv proteins.tsv; do
+for f in peptide_quant.parquet protein_group_quant.parquet fragment_quant.parquet peptides.tsv precursors.tsv proteins.tsv; do
     cmp -s "$work/out_grouped/$f" "$work/out_grouped_pool/$f" \
         || { echo "quantifying the pooled chromatograms changed $f"; exit 1; }
 done
@@ -741,7 +741,7 @@ grep -q 'chromatogram row groups resized' "$work/chrom_v2_rg1.log" \
 for d in out_chrom_v1 out_chrom_v2_rg1; do
     for f in psms_extracted.parquet features.parquet psms_competed.parquet psms_scored.parquet \
              peptide_quant.parquet protein_group_quant.parquet fragment_quant.parquet \
-             peptides.tsv proteins.tsv; do
+             peptides.tsv precursors.tsv proteins.tsv; do
         cmp -s "$work/out/$f" "$work/$d/$f" \
             || { echo "the chromatogram layout ($d) changed $f"; exit 1; }
     done
@@ -763,7 +763,7 @@ for arm in grouped_v1 grouped_nopool_v1; do
         > "$work/$arm.log" 2>&1 \
         || { tail -30 "$work/$arm.log"; echo "the grouped chromatograms v1 run ($arm) failed"; exit 1; }
     for f in psms_scored.parquet peptide_quant.parquet protein_group_quant.parquet \
-             fragment_quant.parquet peptides.tsv proteins.tsv; do
+             fragment_quant.parquet peptides.tsv precursors.tsv proteins.tsv; do
         cmp -s "$work/out_grouped/$f" "$work/out_$arm/$f" \
             || { echo "the chromatogram layout changed $f of the grouped run ($arm)"; exit 1; }
     done
@@ -890,14 +890,16 @@ PYEOF
 echo "=== smoke: output.retain"
 for tier in viewer results; do
     "$BIN" run-experiment --fasta test_data/fixture.fasta         --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML"         --run-names a --run-names b --retain "$tier"         --out-dir "$work/exp_$tier" --config "$work/exp_seq.json" > "$work/exp_$tier.log" 2>&1         || { tail -30 "$work/exp_$tier.log"; echo "run-experiment --retain $tier failed"; exit 1; }
-    for f in scored_combined.parquet a/scored.parquet b/scored.parquet a/peptide_quant.parquet              b/protein_group_quant.parquet lfq_maxlfq.parquet peptides.tsv proteins.tsv; do
+    for f in scored_combined.parquet a/scored.parquet b/scored.parquet a/peptide_quant.parquet              b/protein_group_quant.parquet lfq_maxlfq.parquet peptides.tsv precursors.tsv proteins.tsv; do
         cmp -s "$work/exp/$f" "$work/exp_$tier/$f"             || { echo "--retain $tier changed $f"; exit 1; }
     done
 done
 "$BIN" report --experiment-dir "$work/exp_results" --out-dir "$work/exp_results_report" --q 0.05     > "$work/exp_results_report.log" 2>&1 || { tail -20 "$work/exp_results_report.log"; exit 1; }
-cmp -s "$work/exp_report/peptides.tsv" "$work/exp_results_report/peptides.tsv"     || { echo "report --experiment-dir on a pruned experiment differs"; exit 1; }
+for f in peptides.tsv precursors.tsv; do
+    cmp -s "$work/exp_report/$f" "$work/exp_results_report/$f"         || { echo "report --experiment-dir on a pruned experiment differs ($f)"; exit 1; }
+done
 "$BIN" run --fasta test_data/fixture.fasta --mzml "$work/fixture.mzML" --retain results     --out-dir "$work/out_retain" --config "$cfg" --threads 2 > "$work/out_retain.log" 2>&1     || { tail -20 "$work/out_retain.log"; echo "run --retain results failed"; exit 1; }
-for f in psms_scored.parquet peptide_quant.parquet protein_group_quant.parquet peptides.tsv; do
+for f in psms_scored.parquet peptide_quant.parquet protein_group_quant.parquet peptides.tsv precursors.tsv; do
     cmp -s "$work/out/$f" "$work/out_retain/$f" || { echo "run --retain results changed $f"; exit 1; }
 done
 "$PY" - "$work" <<'PYEOF'
@@ -959,13 +961,13 @@ PYEOF
     --out-dir "$work/exp_qf" --config "$work/exp_qf.json" > "$work/exp_qf.log" 2>&1 \
     || { tail -30 "$work/exp_qf.log"; echo "run-experiment with quant.fragment_detail failed"; exit 1; }
 for f in psms_scored.parquet peptide_quant.parquet protein_group_quant.parquet \
-         fragment_quant.parquet peptides.tsv proteins.tsv; do
+         fragment_quant.parquet peptides.tsv precursors.tsv proteins.tsv; do
     cmp -s "$work/out/$f" "$work/out_qf/$f" \
         || { echo "quant.fragment_detail changed $f"; exit 1; }
 done
 for f in scored_combined.parquet a/peptide_quant.parquet b/peptide_quant.parquet \
          a/protein_group_quant.parquet b/protein_group_quant.parquet lfq_maxlfq.parquet \
-         peptides.tsv proteins.tsv; do
+         peptides.tsv precursors.tsv proteins.tsv; do
     cmp -s "$work/exp/$f" "$work/exp_qf/$f" \
         || { echo "quant.fragment_detail changed the experiment's $f"; exit 1; }
 done
@@ -1554,6 +1556,7 @@ echo "=== smoke: also check inspect and report run standalone"
 "$BIN" report --psms-scored "$work/out/psms_scored.parquet" --out-dir "$work/report_only" \
     --peptide-quant "$work/out/peptide_quant.parquet" --q 0.05 > /dev/null
 test -s "$work/report_only/peptides.tsv"
+test -s "$work/report_only/precursors.tsv"
 
 # Hashes of the user-facing outputs, for the cross-platform comparison in CI.
 # Measured 2026-08-27: these are IDENTICAL on Windows and Linux, down to the
@@ -1567,7 +1570,7 @@ test -s "$work/report_only/peptides.tsv"
 # other instead.
 hashfile="$repo/smoke_output_hashes.txt"
 : > "$hashfile"
-for f in peptides.tsv proteins.tsv; do
+for f in peptides.tsv precursors.tsv proteins.tsv; do
     if command -v sha256sum >/dev/null 2>&1; then
         h=$(sha256sum "$work/out/$f" | cut -d" " -f1)
     else

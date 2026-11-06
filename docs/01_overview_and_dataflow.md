@@ -213,11 +213,10 @@ protein-by-run matrix (`quant.rs:479`): `protein_group`, `run` i32, `quantity`,
 `passed_peptide_fdr`, `reported`, and `rejection_reason` str (earliest loss
 reason).
 
-Human-readable outputs: `peptides.tsv`, `proteins.tsv` (report), and
-`manifest.json` (orchestrator). The experiment-wide orchestrator
-`run-experiment` writes `experiment_manifest.json`
-(`run_experiment.rs:522-533`) and no TSVs at all, because it never calls the
-report stage (see the CLI notes below).
+Human-readable outputs: `peptides.tsv`, `precursors.tsv`, `proteins.tsv` (report),
+and `manifest.json` (orchestrator). The experiment-wide orchestrator
+`run-experiment` writes `experiment_manifest.json` and one experiment-wide set of the
+three TSVs at the experiment root (see the CLI notes below).
 
 Both orchestrators hash their input files for the manifest on a background thread
 (`prestage::InputHashes`), started before the first stage and joined when the manifest
@@ -349,12 +348,12 @@ order:
 | `quant` (`main.rs:165`) | `--psms-scored`, `--chromatograms`, `--config` | `--out-peptide`, `--out-protein`, `--out-fragment` (opt), `--out-peak-bounds` (opt) |
 | `quant-lfq` (`main.rs:184`) | `--inputs` (1+ per-run tables), `--method` (`maxlfq` default / `directlfq`), `--normalize` (`median_ratio` default / `median` / `none`) | `--out` = protein-by-run matrix; no `--config` |
 | `run` (`main.rs:199`) | `--mzml`, `--out-dir`; `--fasta` xor (`--lib-precursors` + `--lib-fragments`); `--config`, `--profile`, `--max-spectra`, `--top-peaks-ms2` | the full chain + `manifest.json` |
-| `run-experiment` (`main.rs:238`) | `--mzml` once per run (>=2), `--run-names` (opt, default `r0..rN-1`), `--out-dir`; `--fasta` xor (`--lib-precursors` + `--lib-fragments`); `--config`, `--profile`, `--max-spectra`, `--top-peaks-ms2` | per-run chains under `<out-dir>/<run>/`, one `scored_combined.parquet`, optional MBR tables, per-run `scored`/quant splits, `lfq_maxlfq.parquet`, `experiment_manifest.json`; no report TSVs |
+| `run-experiment` (`main.rs:238`) | `--mzml` once per run (>=2), `--run-names` (opt, default `r0..rN-1`), `--out-dir`; `--fasta` xor (`--lib-precursors` + `--lib-fragments`); `--config`, `--profile`, `--max-spectra`, `--top-peaks-ms2` | per-run chains under `<out-dir>/<run>/`, one `scored_combined.parquet`, optional MBR tables, per-run `scored`/quant splits, `lfq_maxlfq.parquet`, `experiment_manifest.json`, the experiment-wide `peptides.tsv`, `precursors.tsv` and `proteins.tsv` |
 | `align` (`main.rs:230`) | `--seed-psms` (1+ `seed_psms`, first = reference), `--config` | `--out` = `alignment.parquet` |
 | `mbr` (`main.rs:240`) | `--psms-scored` (experiment-wide `scored_combined`), `--psms-extracted` (1+ per-run in `source` order), `--frag` (0+ per-run `fragment_quant`), `--config` | `--out` = `transferred.parquet`, `--out-psms-scored` (opt augmented scored) |
 | `inspect` (`main.rs:261`) | positional `artifact` (any parquet) | schema + head + row count to stdout; no `--config` |
 | `audit` (`main.rs:265`) | `--lib-precursors`, `--psms-extracted`, `--competed`, `--psms-scored`, `--q` (0.01), `--run-id` (`run`), `--entrapment-substr` (`""`) | `--out` = `candidate_audit.parquet`; no `--config` |
-| `report` (`main.rs:292`) | `--psms-scored`, `--peptide-quant` (opt), `--protein-quant` (opt), `--q` (0.01), `--config` (opt) | `peptides.tsv` + `proteins.tsv` in `--out-dir` |
+| `report` (`main.rs:292`) | `--psms-scored`, `--peptide-quant` (opt), `--protein-quant` (opt), `--q` (0.01), `--config` (opt) | `peptides.tsv` + `precursors.tsv` + `proteins.tsv` in `--out-dir` |
 | `doctor` (`main.rs:305`) | `--config` (opt) | probes the configured sidecar interpreters; nonzero exit if any FAIL |
 
 Per-subcommand specifics that are easy to miss:
@@ -396,11 +395,11 @@ Per-subcommand specifics that are easy to miss:
   then rescores all competed tables in one pass
   (`run_experiment.rs:428`), then splits the scored table by `source` for per-run
   quant (`run_experiment.rs:474-477`), cross-run LFQ, and then the
-  experiment-wide report (`report::run_experiment`): one `peptides.tsv` and one
-  `proteins.tsv` at the experiment root, selected on the experiment-wide q
-  columns with one quantity column per run. It writes no per-run TSVs; take
+  experiment-wide report (`report::run_experiment`): one `peptides.tsv`, one
+  `precursors.tsv` and one `proteins.tsv` at the experiment root, selected on the
+  experiment-wide q columns with one quantity column per run. It writes no per-run TSVs; take
   per-run counts from the per-run split `scored.parquet` on `run_psm_q`.
-  `mumdia report --experiment-dir` rewrites the pair from the experiment
+  `mumdia report --experiment-dir` rewrites the three from the experiment
   manifest.
 - `align` uses `rt_im_train.q_train` for its training set and a hardcoded 100-knot
   grid (`main.rs:666-667`); it needs >=2 seeds and is not part of the `run` chain.
@@ -467,7 +466,7 @@ Per-subcommand specifics that are easy to miss:
         psms_scored + chromatograms --> quant --> peptide_quant.parquet,
                                                   protein_group_quant.parquet, fragment_quant.parquet
                                                |
-        psms_scored + quant --> report --> peptides.tsv, proteins.tsv
+        psms_scored + quant --> report --> peptides.tsv, precursors.tsv, proteins.tsv
                                            [+ sites.tsv and three peptides.tsv columns
                                             when localise ran]
                                                |
@@ -570,7 +569,7 @@ recording each output in the manifest with `record_artifact` (`run.rs:85-509`):
     protein groups, writing `peptide_quant`, `protein_group_quant`, and
     `fragment_quant`.
 
-11. `report::run` writes `peptides.tsv` and `proteins.tsv` from the scored table
+11. `report::run` writes `peptides.tsv`, `precursors.tsv` and `proteins.tsv` from the scored table
     plus quant, thresholded at `quant.q_threshold`. `run` reads the rescore
     artifact report and uses its actual classifier in stdout and the manifest;
     `psms_scored.parquet.report.json` remains the authoritative record.

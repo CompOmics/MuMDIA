@@ -357,7 +357,8 @@ peptidoform + charge, filtered to targets with peptide q <= the threshold;
 `run.rs:469-472`).
 
 `peptides.tsv` is therefore not a stripped-peptide count and is not controlled by
-`precursor_q`. Confirm the actual classifier and model identity in
+`precursor_q`. The table that is, `precursors.tsv`, is written beside it, and its count is
+printed on the next line (`MuMDIA: <P> precursors at precursor_q <= 0.01`). Confirm the actual classifier and model identity in
 `out_lib/psms_scored.parquet.report.json`; strict mode should make any sidecar
 failure fatal, and the report is the source of truth.
 

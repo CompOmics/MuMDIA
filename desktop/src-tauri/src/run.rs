@@ -237,6 +237,9 @@ pub struct Results {
     pub protein_groups_1pct: u64,
     pub psms: u64,
     pub has_peptides_tsv: bool,
+    /// `precursors.tsv`: every precursor accepted on `precursor_q`, the file behind the
+    /// precursors count.
+    pub has_precursors_tsv: bool,
     pub has_proteins_tsv: bool,
     /// True when these counts came from a pooled `run-experiment`.
     ///
@@ -1138,6 +1141,7 @@ fn read_results(dir: &Path) -> Option<Results> {
         protein_groups_1pct: n(stats, "target_protein_groups_at_1pct"),
         psms: n(stats, "psms"),
         has_peptides_tsv: dir.join("peptides.tsv").is_file(),
+        has_precursors_tsv: dir.join("precursors.tsv").is_file(),
         has_proteins_tsv: dir.join("proteins.tsv").is_file(),
         experiment_wide,
         rt_calibration_missing: gaps,
@@ -1951,7 +1955,7 @@ mod multifile_tests {
         assert_eq!(r.peptides_1pct, 7);
         assert_eq!(r.precursors_1pct, 8);
         // This fixture wrote no TSV, so neither is reported present.
-        assert!(!r.has_peptides_tsv && !r.has_proteins_tsv);
+        assert!(!r.has_peptides_tsv && !r.has_precursors_tsv && !r.has_proteins_tsv);
 
         // A single run's own report wins, and is not labelled experiment-wide.
         std::fs::write(dir.join("psms_scored.parquet.report.json"), body).unwrap();

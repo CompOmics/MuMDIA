@@ -797,8 +797,12 @@ enum Cmd {
         #[arg(long, default_value = "")]
         entrapment_substr: String,
     },
-    /// Write peptides.tsv + proteins.tsv from a scored PSM table, or the
-    /// experiment-wide pair for a `run-experiment` output directory.
+    /// Write peptides.tsv + precursors.tsv + proteins.tsv from a scored PSM table, or
+    /// the experiment-wide three for a `run-experiment` output directory.
+    ///
+    /// peptides.tsv is selected on peptide_q_value (about one precursor per base
+    /// peptide), precursors.tsv on precursor_q (every accepted peptidoform + charge),
+    /// proteins.tsv on pg_q_value.
     Report {
         /// A single run's scored table. Either this or --experiment-dir.
         #[arg(
@@ -808,12 +812,12 @@ enum Cmd {
         )]
         psms_scored: Option<String>,
         /// A `run-experiment` output directory: rewrite its experiment-wide
-        /// peptides.tsv and proteins.tsv (one quantity column per run) from the
+        /// peptides.tsv, precursors.tsv and proteins.tsv (one quantity column per run) from the
         /// pooled scored table, per-run quantities and cross-run LFQ named in its
         /// experiment_manifest.json, at another --q if wanted.
         #[arg(long)]
         experiment_dir: Option<String>,
-        /// Where the two TSVs go. Defaults to --experiment-dir in experiment mode.
+        /// Where the three TSVs go. Defaults to --experiment-dir in experiment mode.
         #[arg(long, required_unless_present = "experiment_dir")]
         out_dir: Option<String>,
         #[arg(long, conflicts_with = "experiment_dir")]
@@ -821,7 +825,7 @@ enum Cmd {
         #[arg(long, conflicts_with = "experiment_dir")]
         protein_quant: Option<String>,
         /// A `localise` table of the run: adds the localisation columns to peptides.tsv and
-        /// writes sites.tsv. In experiment mode the tables the manifest names are used.
+        /// precursors.tsv and writes sites.tsv. In experiment mode the tables the manifest names are used.
         #[arg(long, conflicts_with = "experiment_dir")]
         localisation: Option<String>,
         /// A FASTA to number the sites of sites.tsv on their proteins.
@@ -2801,6 +2805,7 @@ fn real_main() -> Result<()> {
                 std::fs::create_dir_all(&out)?;
                 let pep = format!("{out}/peptides.tsv");
                 let prot = format!("{out}/proteins.tsv");
+                let prec = format!("{out}/precursors.tsv");
                 let sites = format!("{out}/sites.tsv");
                 let loc = (!loc_tables.is_empty()).then(|| stages::report::Localisation {
                     tables: &loc_tables,
@@ -2808,29 +2813,43 @@ fn real_main() -> Result<()> {
                     fasta: fasta.as_deref(),
                     out_sites: &sites,
                 });
-                let (n_pep, n_prot) = stages::report::run_experiment_localised(
+                // The cross-run precursor matrix beside the protein matrix; an experiment
+                // from before it has none, and precursors.tsv then has no normalised_<run>.
+                let prec_lfq = lfq
+                    .as_deref()
+                    .and_then(stages::quant::precursor_lfq_sibling);
+                let counts = stages::report::run_experiment_localised(
                     stages::report::ExperimentReportParams {
                         scored: &scored,
                         run_names: &runs,
                         peptide_quants: &peptide_quants,
                         protein_lfq: lfq.as_deref(),
+                        precursor_lfq: prec_lfq.as_deref(),
                         out_peptides: &pep,
                         out_proteins: &prot,
+                        out_precursors: Some(&prec),
                         q_threshold: q,
                     },
                     loc.as_ref(),
                 )?;
+                let (n_pep, n_prot) = (counts.peptide_rows, counts.protein_groups);
                 println!(
                     "MuMDIA: {n_pep} precursors, {n_prot} protein groups at experiment-wide \
                      q <= {q} over {} runs\n  {pep}\n  {prot}",
                     runs.len()
                 );
+                if let Some(n) = counts.precursor_rows {
+                    println!(
+                        "MuMDIA: {n} precursors at experiment-wide precursor_q <= {q}\n  {prec}"
+                    );
+                }
             } else {
                 let psms_scored = psms_scored.expect("clap: required unless --experiment-dir");
                 let out_dir = out_dir.expect("clap: required unless --experiment-dir");
                 std::fs::create_dir_all(&out_dir)?;
                 let pep = format!("{out_dir}/peptides.tsv");
                 let prot = format!("{out_dir}/proteins.tsv");
+                let prec = format!("{out_dir}/precursors.tsv");
                 let sites = format!("{out_dir}/sites.tsv");
                 let loc_tables: Vec<String> = localisation.into_iter().collect();
                 let loc = (!loc_tables.is_empty()).then(|| stages::report::Localisation {
@@ -2839,20 +2858,25 @@ fn real_main() -> Result<()> {
                     fasta: fasta.as_deref(),
                     out_sites: &sites,
                 });
-                let (n_pep, n_prot) = stages::report::run_localised(
+                let counts = stages::report::run_localised(
                     stages::report::ReportParams {
                         scored: &psms_scored,
                         peptide_quant: peptide_quant.as_deref(),
                         protein_quant: protein_quant.as_deref(),
                         out_peptides: &pep,
                         out_proteins: &prot,
+                        out_precursors: Some(&prec),
                         q_threshold: q,
                     },
                     loc.as_ref(),
                 )?;
+                let (n_pep, n_prot) = (counts.peptide_rows, counts.protein_groups);
                 println!(
                     "MuMDIA: {n_pep} peptides, {n_prot} protein groups at q <= {q}\n  {pep}\n  {prot}"
                 );
+                if let Some(n) = counts.precursor_rows {
+                    println!("MuMDIA: {n} precursors at precursor_q <= {q}\n  {prec}");
+                }
             }
         }
         Cmd::Cache {
