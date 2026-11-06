@@ -1026,6 +1026,50 @@ assert "retention" not in json.load(open(f"{w}/out/manifest.json"))
 print(f"    ok: run --retain results removed {len(s['retention']['removed'])} files")
 PYEOF
 
+# 5n. Run names (`experiment.run_naming`, CompOmics/MuMDIA#274). Every other experiment arm
+#     passes --run-names; this one does not, so the default is exercised: the runs are named
+#     after their input files (`fixture`, `fixture_b`), the manifest maps each name to its
+#     input, and every table is the explicitly named experiment's, byte for byte, because a
+#     name labels paths and columns and never a value. `run_naming = "index"` gives r0, r1
+#     and no `run_inputs`. check_smoke.py asserts the named arm (--experiment-named).
+echo "=== smoke: run names from the inputs"
+"$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" \
+    --out-dir "$work/exp_named" --config "$work/exp_seq.json" > "$work/exp_named.log" 2>&1 \
+    || { tail -30 "$work/exp_named.log"; echo "run-experiment without --run-names failed"; exit 1; }
+"$BIN" report --experiment-dir "$work/exp_named" --out-dir "$work/exp_named_report" \
+    > "$work/exp_named_report.log" 2>&1 || { tail -20 "$work/exp_named_report.log"; exit 1; }
+"$PY" - "$work/exp_seq.json" "$work/exp_index.json" <<'PYEOF'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c.setdefault("experiment", {})["run_naming"] = "index"
+json.dump(c, open(sys.argv[2], "w"), indent=2)
+PYEOF
+"$BIN" run-experiment --fasta test_data/fixture.fasta \
+    --mzml "$work/fixture.mzML" --mzml "$work/fixture_b.mzML" \
+    --out-dir "$work/exp_index" --config "$work/exp_index.json" > "$work/exp_index.log" 2>&1 \
+    || { tail -30 "$work/exp_index.log"; echo "run-experiment with run_naming = index failed"; exit 1; }
+for f in scored_combined.parquet lfq_maxlfq.parquet; do
+    cmp -s "$work/exp/$f" "$work/exp_index/$f" || { echo "run_naming = index changed $f"; exit 1; }
+done
+for r in 0 1; do
+    ab=$([ "$r" = 0 ] && echo a || echo b)
+    for f in scored.parquet peptide_quant.parquet protein_group_quant.parquet; do
+        cmp -s "$work/exp/$ab/$f" "$work/exp_index/r$r/$f" \
+            || { echo "run_naming = index: r$r/$f differs from $ab/$f"; exit 1; }
+    done
+done
+"$PY" - "$work" <<'PYEOF'
+import json, sys
+w = sys.argv[1]
+m = json.load(open(f"{w}/exp_index/experiment_manifest.json"))
+ref = json.load(open(f"{w}/exp/experiment_manifest.json"))
+assert m["experiment"]["runs"] == ["r0", "r1"], m["experiment"]["runs"]
+assert "run_inputs" not in m["experiment"] and "run_inputs" not in ref["experiment"]
+assert m["config_hash"] == ref["config_hash"], (m["config_hash"], ref["config_hash"])
+print("    ok: run_naming = index names the runs r0, r1, same tables and configuration hash")
+PYEOF
+
 # 5q. `quant.fragment_detail`: the single run and the two-run experiment with the key on.
 #     Each run's final quant writes quant_fragments.parquet beside its peptide_quant and the
 #     manifest records it; every other table is the plain search's, byte for byte, and no
@@ -1637,7 +1681,7 @@ echo "=== smoke: assertions"
 # and so reads as a pass.
 "$PY" ci/check_smoke.py --out-dir "$work/out" --planted "$work/planted.json" \
     --compare-peptides "$work/out2/peptides.tsv" --experiment "$work/exp" \
-    --min-assertions 149
+    --experiment-named "$work/exp_named" --min-assertions 157
 
 echo "=== smoke: also check inspect and report run standalone"
 "$BIN" inspect "$work/out/psms_scored.parquet" > /dev/null

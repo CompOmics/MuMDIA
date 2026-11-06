@@ -19,7 +19,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::filter_record_batch;
-use mumdia_core::config::{Config, MultiheadAnchors, QuantQColumn, RtLibraryScope};
+use mumdia_core::config::{Config, MultiheadAnchors, QuantQColumn, RtLibraryScope, RunNaming};
 use mumdia_core::manifest::Manifest;
 use mumdia_core::schema::artifact;
 use mumdia_io::table::Written;
@@ -36,8 +36,13 @@ pub struct RunExperimentParams<'a> {
     pub config_path: Option<&'a str>,
     pub fasta: Option<&'a str>,
     pub mzmls: &'a [String],
-    /// Optional per-run labels (default `r0..rN-1`); also the per-run subdir names.
+    /// Optional per-run labels; also the per-run subdir names. Absent, they are derived
+    /// from `inputs` under `experiment.run_naming` (`default_run_names`).
     pub run_names: Option<&'a [String]>,
+    /// The inputs as the user gave them, one per entry of `mzmls`: a vendor file before
+    /// `raw::ensure_mzml` converted it, otherwise the same path. Run names are taken from
+    /// these, so a converted run is named after its vendor file, not its converted mzML.
+    pub inputs: &'a [String],
     pub out_dir: &'a str,
     pub lib_precursors: Option<&'a str>,
     pub lib_fragments: Option<&'a str>,
@@ -1099,6 +1104,167 @@ fn check_run_names_distinct(ns: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Names the experiment root uses itself, compared without regard to case. A run of
+/// that name would share its directory with the passes, the sidecar work or the library
+/// copies; `g<N>` is what a reader of the output takes for a window band.
+const RESERVED_RUN_NAMES: [&str; 5] = [
+    "first_pass",
+    "second_pass",
+    "sidecar_work",
+    "library",
+    "rt_bootstrap",
+];
+
+/// Whether `name` is one the experiment root reserves ([`RESERVED_RUN_NAMES`], `g<N>`).
+fn is_reserved_run_name(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    if RESERVED_RUN_NAMES.contains(&l.as_str()) {
+        return true;
+    }
+    l.strip_prefix('g')
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Why an explicit `--run-names` entry is refused, beyond a portable directory name.
+fn run_name_problem(name: &str) -> Option<&'static str> {
+    if let Some(why) = portable_dir_name_problem(name) {
+        return Some(why);
+    }
+    if !name.is_ascii() {
+        return Some("it contains a character outside ASCII; a run name is also a column name of the TSV reports, which spreadsheets and scripts decode differently, and a derived name never has one (use letters, digits, `-`, `_` and `.`)");
+    }
+    if name.contains('[') || name.contains(']') {
+        return Some("it contains `[` or `]`, which delimit the run in the manifest's artifact keys (`scored[<name>]`)");
+    }
+    if is_reserved_run_name(name) {
+        return Some("the experiment root uses that name itself (first_pass, second_pass, sidecar_work, library, rt_bootstrap, or g<N> for a window band)");
+    }
+    None
+}
+
+/// The longest derived run name, in characters.
+const RUN_NAME_MAX_CHARS: usize = 64;
+
+/// Extensions stripped from an input's file name, up to three of them, without regard to
+/// case: `x.mzML.gz` is `x`, `run.d` is `run`.
+const INPUT_EXTENSIONS: [&str; 8] = ["gz", "mzml", "mzxml", "raw", "d", "wiff", "wiff2", "mgf"];
+
+/// The file name of `input` without up to three known extensions.
+fn input_stem(input: &str) -> String {
+    let trimmed = input.trim_end_matches(['/', '\\']);
+    let mut stem = trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(trimmed)
+        .to_string();
+    for _ in 0..3 {
+        match stem.rsplit_once('.') {
+            Some((head, ext))
+                if !head.is_empty()
+                    && INPUT_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) =>
+            {
+                stem = head.to_string();
+            }
+            _ => break,
+        }
+    }
+    stem
+}
+
+/// `stem` as a portable directory name: ASCII letters and digits, `-`, `_` and `.` are kept,
+/// every run of any other character (a non-ASCII letter such as `é` or `µ` included) becomes
+/// one `_`, leading and trailing `.` and `_` go, a
+/// Windows device name gets a `_` after its first segment, and a name over
+/// [`RUN_NAME_MAX_CHARS`] is cut and given the 32-bit FNV-1a hash of the whole sanitised
+/// name in 8 hex characters (a hash simple enough for the desktop to mirror). Empty when
+/// nothing is left.
+fn sanitise_run_name(stem: &str) -> String {
+    let mut out = String::with_capacity(stem.len());
+    let mut replaced = false;
+    for c in stem.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+            out.push(c);
+            replaced = false;
+        } else if !replaced {
+            out.push('_');
+            replaced = true;
+        }
+    }
+    let mut out = out.trim_matches(['.', '_']).to_string();
+    if out.is_empty() {
+        return out;
+    }
+    if portable_dir_name_problem(&out).is_some() {
+        // What is left after the filter above is a device name, with or without an
+        // extension (`CON`, `aux.1`): break its first segment.
+        let at = out.find('.').unwrap_or(out.len());
+        out.insert(at, '_');
+    }
+    if out.chars().count() > RUN_NAME_MAX_CHARS {
+        let hash = out.bytes().fold(0x811c_9dc5_u32, |h, b| {
+            (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+        });
+        let keep: String = out.chars().take(RUN_NAME_MAX_CHARS - 9).collect();
+        out = format!("{}_{hash:08x}", keep.trim_end_matches(['.', '_']));
+    }
+    out
+}
+
+/// The run names `run-experiment` uses when `--run-names` is absent, one per input in
+/// input order; deterministic in the input paths and their order.
+///
+/// `Index` gives `r0`, `r1`, .... `Input` names each run after its input file
+/// ([`input_stem`], [`sanitise_run_name`]); an input with nothing usable left is `r<i>`,
+/// a name the experiment root reserves gets `_run`, and a name an earlier input already
+/// has (without regard to case) gets the first free `_2`, `_3`, ..., free against every
+/// name of the experiment, so the result always passes [`check_run_names_distinct`] and
+/// [`run_name_problem`].
+fn default_run_names(inputs: &[String], naming: RunNaming) -> Vec<String> {
+    if naming == RunNaming::Index {
+        return (0..inputs.len()).map(|i| format!("r{i}")).collect();
+    }
+    let bases: Vec<String> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            let mut n = sanitise_run_name(&input_stem(input));
+            if n.is_empty() {
+                n = format!("r{i}");
+            }
+            if is_reserved_run_name(&n) {
+                n.push_str("_run");
+            }
+            n
+        })
+        .collect();
+    let mut taken: std::collections::BTreeSet<String> =
+        bases.iter().map(|n| n.to_lowercase()).collect();
+    let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut names = Vec::with_capacity(bases.len());
+    for base in bases {
+        let name = if used.insert(base.to_lowercase()) {
+            base
+        } else {
+            let mut k = 2usize;
+            loop {
+                let suffix = format!("_{k}");
+                let room = RUN_NAME_MAX_CHARS.saturating_sub(suffix.len());
+                let head: String = base.chars().take(room).collect();
+                let cand = format!("{head}{suffix}");
+                let key = cand.to_lowercase();
+                if !taken.contains(&key) {
+                    taken.insert(key.clone());
+                    used.insert(key);
+                    break cand;
+                }
+                k += 1;
+            }
+        };
+        names.push(name);
+    }
+    names
+}
+
 /// Why `name` cannot be a per-run directory name on every platform, or `None`.
 ///
 /// Syntactic, not probed: Windows's rules are applied everywhere, because an experiment's
@@ -1227,7 +1393,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         crate::raw::discard_after_convert(p.converted_mzml, input_hashes.progress());
     }
     pre.step("provenance");
-    // Reject a bad --run-names rather than silently substituting r0..rN-1.
+    // Reject a bad --run-names rather than silently substituting the derived names.
     //
     // The old `_ =>` arm swallowed any count mismatch with no warning, and accepted
     // duplicates outright. Duplicates are the dangerous half: two runs then share
@@ -1241,15 +1407,15 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             if ns.len() != n_runs {
                 anyhow::bail!(
                     "--run-names has {} entries but there are {n_runs} runs; pass one name \
-                     per --mzml, in the same order, or omit it to get r0..r{}",
+                     per --mzml, in the same order, or omit it to name the runs after their \
+                     input files",
                     ns.len(),
-                    n_runs - 1
                 );
             }
             check_run_names_distinct(ns)?;
             if let Some((bad, why)) = ns
                 .iter()
-                .find_map(|n| portable_dir_name_problem(n).map(|why| (n, why)))
+                .find_map(|n| run_name_problem(n).map(|why| (n, why)))
             {
                 anyhow::bail!(
                     "--run-names entry {bad:?} is not usable as a directory name: {why}; each \
@@ -1258,8 +1424,31 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             }
             ns.to_vec()
         }
-        None => (0..n_runs).map(|i| format!("r{i}")).collect(),
+        None => {
+            if p.inputs.len() != n_runs {
+                anyhow::bail!(
+                    "run-experiment: {} inputs for {n_runs} runs",
+                    p.inputs.len()
+                );
+            }
+            default_run_names(p.inputs, cfg.experiment.run_naming)
+        }
     };
+    // Which input each derived name came from, recorded in the manifest when the names
+    // were derived from the inputs. With `--run-names` or `run_naming = index` the
+    // manifest keeps its previous bytes; `inputs["mzml[i]"]` still maps index to input.
+    let run_inputs: Option<Vec<serde_json::Value>> =
+        (p.run_names.is_none() && cfg.experiment.run_naming == RunNaming::Input).then(|| {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, nm)| {
+                    let input = &p.inputs[i];
+                    let converted = (input != &p.mzmls[i]).then(|| p.mzmls[i].clone());
+                    json!({"name": nm, "source": i, "input": input, "converted": converted})
+                })
+                .collect()
+        });
 
     // A FASTA build may leave DeepLC to the multi-head calibration of each run, which
     // re-predicts every row before anything reads the iRT
@@ -2695,6 +2884,10 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             json!("experiment-wide precursor_q; n_runs on run_psm_q"),
         );
     }
+    // The input of each run, when the run names were derived from the inputs.
+    if let (Some(ri), Some(m)) = (&run_inputs, manifest.as_object_mut()) {
+        m.insert("run_inputs".to_string(), json!(ri));
+    }
     // The runs without a retention-time calibration, only when there were any, so every
     // other manifest keeps its bytes (`rt_health`).
     if let (false, Some(m)) = (rt_gaps.is_empty(), manifest.as_object_mut()) {
@@ -3136,6 +3329,60 @@ mod tests {
                 None,
                 "{ok:?} must be accepted"
             );
+        }
+    }
+
+    /// The derived names of `ci/run_name_cases.json`, the table the desktop's progress
+    /// ordering is tested against as well; every derived name is a valid `--run-names`.
+    #[test]
+    fn run_names_are_derived_from_the_inputs() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../../../ci/run_name_cases.json")).unwrap();
+        for case in cases["cases"].as_array().unwrap() {
+            let s = |k: &str| -> Vec<String> {
+                case[k]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect()
+            };
+            let (inputs, want) = (s("inputs"), s("names"));
+            let got = default_run_names(&inputs, RunNaming::Input);
+            assert_eq!(got, want, "{}", case["why"]);
+            assert_eq!(got, default_run_names(&inputs, RunNaming::Input));
+            check_run_names_distinct(&got).unwrap();
+            for n in &got {
+                assert_eq!(run_name_problem(n), None, "{n:?}");
+                assert!(n.chars().count() <= RUN_NAME_MAX_CHARS, "{n:?}");
+            }
+            assert_eq!(
+                default_run_names(&inputs, RunNaming::Index),
+                (0..inputs.len())
+                    .map(|i| format!("r{i}"))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_run_names_the_root_reserves_or_with_brackets_are_refused() {
+        for bad in [
+            "first_pass",
+            "Second_Pass",
+            "sidecar_work",
+            "library",
+            "rt_bootstrap",
+            "g01",
+            "G7",
+            "a[1]",
+            "Données",
+            "2µl",
+        ] {
+            assert!(run_name_problem(bad).is_some(), "{bad:?} must be refused");
+        }
+        for ok in ["r0", "g", "g1a", "library_run", "first_pass_1", "HYE_A01"] {
+            assert_eq!(run_name_problem(ok), None, "{ok:?}");
         }
     }
 

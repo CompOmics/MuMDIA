@@ -4,7 +4,7 @@ peptide_quant tables.
 
 Usage:
   make_proteobench_submission.py --fasta ProteoBenchFASTA_MixedSpecies_HYE.fasta --out custom_input.tsv \
-      LFQ_Orbitrap_AIF_Condition_A_Sample_Alpha_01=run/r0/peptide_quant.parquet ... (one RUN=parquet pair per run)
+      LFQ_Orbitrap_AIF_Condition_A_Sample_Alpha_01=run/LFQ_Orbitrap_AIF_Condition_A_Sample_Alpha_01/peptide_quant.parquet ... (one RUN=parquet pair per run)
 
 Format (ProteoBench parse_settings_custom.toml for the DIA ion modules): tab-separated, columns
   Sequence, Proteins, Charge, Modified sequence, <one intensity column per run name>
@@ -50,8 +50,8 @@ prints both numbers.
 
 maxlfq and the gate need the experiment run index of each input. It is read from
 `experiment_manifest.json` (`--experiment-dir`, by default the directory two levels above the
-first quant table) by matching each path against `experiment.peptide_quants`, with the parent
-directory name `r<i>` as the fallback. aligned and the gate need the condition of each run:
+first quant table) by matching each path against `experiment.peptide_quants`, then the parent
+directory name against `experiment.runs`, with a parent directory named `r<i>` as the fallback. aligned and the gate need the condition of each run:
 `--conditions A,A,A,B,B,B`, or by default the `Condition_<X>` part of each run name.
 
 The last stderr line is a summary: the ions written, the ProteoBench ion count (not a
@@ -103,17 +103,25 @@ def fasta_entry_map(path: str) -> dict:
 
 
 def experiment_indices(paths, exp_dir):
-    """Experiment run index of each quant table: manifest first, then the r<i> directory name."""
+    """Experiment run index of each quant table: manifest first (its quant paths, then its run
+    names against the parent directory), then the r<i> directory name."""
     man_path = os.path.join(exp_dir, "experiment_manifest.json")
     by_path = {}
+    by_run = {}
     if os.path.exists(man_path):
         with open(man_path) as fh:
             man = json.load(fh)
         for i, p in enumerate(man.get("experiment", {}).get("peptide_quants", [])):
             by_path[os.path.realpath(p)] = i
+        # The run directories are named after the inputs since 0.10 (`experiment.run_naming`);
+        # `experiment.runs` lists them in run-index order.
+        for i, name in enumerate(man.get("experiment", {}).get("runs", [])):
+            by_run[str(name)] = i
     out = []
     for p in paths:
         i = by_path.get(os.path.realpath(p))
+        if i is None:
+            i = by_run.get(os.path.basename(os.path.dirname(os.path.abspath(p))))
         if i is None:
             # the directory as given first, so that a staged tree of links r<i>/peptide_quant.parquet
             # to other tables works; then the resolved directory

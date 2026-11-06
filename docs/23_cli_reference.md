@@ -850,7 +850,7 @@ Options:
           One per run; repeat the flag (>= 2 runs)
 
       --run-names <RUN_NAMES>
-          Optional per-run labels / subdir names (default r0..rN-1)
+          Optional per-run labels / subdir names, one per --mzml in the same order. Default: the input file names without their extensions, sanitised to portable directory names (`experiment.run_naming = "index"` gives r0..rN-1)
 
       --out-dir <OUT_DIR>
 

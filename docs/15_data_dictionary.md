@@ -1157,6 +1157,7 @@ provenance for reproducibility. Top-level `Manifest`:
 | `model_identities` | object | map of role (`rt_predictor`, `fragment_predictor`, `rescorer`, `feature_schema_id`) to identity string |
 | `artifacts` | object | map of logical name to `ArtifactRecord` |
 | `rt_calibration_missing` | array | only when the run had no retention-time calibration: one `{run, pass, calibration_status, n_train, cal_json}` per uncalibrated run (`stages/rt_health.rs`); `run-experiment` writes it in the `experiment` block of `experiment_manifest.json`, with `pass` `first_pass` or `second_pass` |
+| `run_inputs` | array | `experiment_manifest.json` only, in its `experiment` block, when the run names were derived from the inputs (no `--run-names`, `experiment.run_naming = "input"`): one `{name, source, input, converted}` per run, in run-index order, with `name` the run's directory and column name, `source` its index in the pooled tables, `input` the path as given and `converted` the mzML converted from a vendor input (null for an mzML input). `experiment.runs` lists the names under every naming |
 
 Each `ArtifactRecord`:
 

@@ -205,8 +205,9 @@ pub struct Stage {
 
 /// One file's stage progress inside a multi-file experiment.
 ///
-/// `run-experiment` gives each input file its own output subdirectory (`r0`, `r1`, ...,
-/// or the `--run-names` the caller chose) and runs the per-file chain -- convert through
+/// `run-experiment` gives each input file its own output subdirectory, named after the
+/// input file (`default_run_names`; `r0`, `r1`, ... under `experiment.run_naming =
+/// "index"`, or the `--run-names` the caller chose) and runs the per-file chain -- convert through
 /// compete -- in each, then does one pooled rescore/quant/report at the experiment root.
 ///
 /// Without this the progress display could only aggregate by stage NAME across the whole
@@ -322,6 +323,10 @@ pub struct Snapshot {
     /// The `library.json` a finished library build wrote: counts, models, cache key and
     /// how to search with the library (`crate::library`).
     pub library: Option<serde_json::Value>,
+    /// The run names the engine derives for this experiment's inputs, in input order
+    /// ([`default_run_names`]); empty for anything but an experiment. Orders `runs`.
+    #[serde(skip)]
+    pub run_names: Vec<String>,
 }
 
 pub struct Run {
@@ -437,7 +442,7 @@ impl Run {
             sweep_temp_files(out_dir);
         }
         let stages = scan_stages(out_dir);
-        let runs = scan_runs(out_dir);
+        let runs = scan_runs(out_dir, &self.snapshot().run_names);
         let root_stages = scan_root_stages(out_dir);
         let results = read_results(out_dir);
         let library = if self.snapshot().build_library {
@@ -511,6 +516,11 @@ fn new_run(id: &str, req: &Request, command: String, reservation: Option<String>
             cancel_requested: false,
             build_library: req.build_library,
             library: None,
+            run_names: if req.experiment && !req.build_library {
+                default_run_names(&req.mzml)
+            } else {
+                Vec::new()
+            },
         }),
         pid: Mutex::new(None),
         cancelled: AtomicBool::new(false),
@@ -916,9 +926,10 @@ pub fn start(id: String, req: Request) -> Result<Arc<Run>, String> {
         let out_dir = PathBuf::from(&req.out_dir);
         std::thread::spawn(move || {
             let started = Instant::now();
+            let order = run.snapshot().run_names;
             loop {
                 let stages = scan_stages(&out_dir);
-                let runs = scan_runs(&out_dir);
+                let runs = scan_runs(&out_dir, &order);
                 let root_stages = scan_root_stages(&out_dir);
                 // Written only while the run is still active, under the snapshot lock:
                 // once `publish_exit` has published, a scan that was in flight must not
@@ -1014,9 +1025,12 @@ pub fn history_entry(dir: &Path) -> Option<HistoryEntry> {
 /// Per-file progress for an experiment, or an empty list for a single run.
 ///
 /// A subdirectory counts as a run when it holds at least one artifact report. Ordering
-/// is the engine's own: `r0`, `r1`, ... sort numerically rather than lexically, so `r10`
-/// does not land between `r1` and `r2`; any other name sorts by itself.
-fn scan_runs(dir: &Path) -> Vec<RunProgress> {
+/// is the engine's own: the names in `order` (the experiment's run names, in input order)
+/// first, in that order; then `r0`, `r1`, ... numerically rather than lexically, so `r10`
+/// does not land between `r1` and `r2` (an experiment under `experiment.run_naming =
+/// "index"`); then any other name (`first_pass`, `second_pass`) by itself, so the pass that
+/// follows the per-file chains stays last.
+fn scan_runs(dir: &Path, order: &[String]) -> Vec<RunProgress> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -1038,17 +1052,147 @@ fn scan_runs(dir: &Path) -> Vec<RunProgress> {
             stages,
         });
     }
-    runs.sort_by_key(|r| run_order(&r.name));
+    runs.sort_by_key(|r| run_order(&r.name, order));
     runs
 }
 
-/// Sort key for a run directory: the numeric suffix of `r<N>` first, then the name.
-fn run_order(name: &str) -> (u64, String) {
+/// Sort key for a run directory: its position in `order`, then the numeric suffix of
+/// `r<N>`, then the name.
+fn run_order(name: &str, order: &[String]) -> (usize, u64, String) {
+    let at = order.iter().position(|o| o == name).unwrap_or(usize::MAX);
     let n = name
         .strip_prefix('r')
         .and_then(|rest| rest.parse::<u64>().ok())
         .unwrap_or(u64::MAX);
-    (n, name.to_string())
+    (at, n, name.to_string())
+}
+
+/// Names the engine's experiment root reserves; a derived name that matches gets `_run`.
+const RESERVED_RUN_NAMES: [&str; 5] = [
+    "first_pass",
+    "second_pass",
+    "sidecar_work",
+    "library",
+    "rt_bootstrap",
+];
+
+/// The longest derived run name, in characters.
+const RUN_NAME_MAX_CHARS: usize = 64;
+
+/// Extensions stripped from an input's file name, up to three of them.
+const INPUT_EXTENSIONS: [&str; 8] = ["gz", "mzml", "mzxml", "raw", "d", "wiff", "wiff2", "mgf"];
+
+fn is_reserved_run_name(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    RESERVED_RUN_NAMES.contains(&l.as_str())
+        || l.strip_prefix('g')
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn is_windows_device_name(name: &str) -> bool {
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    RESERVED.contains(&stem.as_str())
+}
+
+/// The run names `mumdia run-experiment` derives from its inputs without `--run-names`
+/// (`experiment.run_naming = "input"`): a mirror of the engine's `default_run_names`
+/// (`stages/run_experiment.rs`), tested against the same table, `ci/run_name_cases.json`.
+/// Only the progress display's order depends on it: a name it got wrong would sort
+/// after the others, nothing more.
+fn default_run_names(inputs: &[String]) -> Vec<String> {
+    let stem = |input: &str| -> String {
+        let trimmed = input.trim_end_matches(['/', '\\']);
+        let mut stem = trimmed
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(trimmed)
+            .to_string();
+        for _ in 0..3 {
+            match stem.rsplit_once('.') {
+                Some((head, ext))
+                    if !head.is_empty()
+                        && INPUT_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) =>
+                {
+                    stem = head.to_string();
+                }
+                _ => break,
+            }
+        }
+        stem
+    };
+    let sanitise = |stem: &str| -> String {
+        let mut out = String::with_capacity(stem.len());
+        let mut replaced = false;
+        for c in stem.chars() {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                out.push(c);
+                replaced = false;
+            } else if !replaced {
+                out.push('_');
+                replaced = true;
+            }
+        }
+        let mut out = out.trim_matches(['.', '_']).to_string();
+        if out.is_empty() {
+            return out;
+        }
+        if is_windows_device_name(&out) {
+            let at = out.find('.').unwrap_or(out.len());
+            out.insert(at, '_');
+        }
+        if out.chars().count() > RUN_NAME_MAX_CHARS {
+            let hash = out.bytes().fold(0x811c_9dc5_u32, |h, b| {
+                (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+            });
+            let keep: String = out.chars().take(RUN_NAME_MAX_CHARS - 9).collect();
+            out = format!("{}_{hash:08x}", keep.trim_end_matches(['.', '_']));
+        }
+        out
+    };
+    let bases: Vec<String> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            let mut n = sanitise(&stem(input));
+            if n.is_empty() {
+                n = format!("r{i}");
+            }
+            if is_reserved_run_name(&n) {
+                n.push_str("_run");
+            }
+            n
+        })
+        .collect();
+    let mut taken: std::collections::BTreeSet<String> =
+        bases.iter().map(|n| n.to_lowercase()).collect();
+    let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut names = Vec::with_capacity(bases.len());
+    for base in bases {
+        let name = if used.insert(base.to_lowercase()) {
+            base
+        } else {
+            let mut k = 2usize;
+            loop {
+                let suffix = format!("_{k}");
+                let room = RUN_NAME_MAX_CHARS.saturating_sub(suffix.len());
+                let head: String = base.chars().take(room).collect();
+                let cand = format!("{head}{suffix}");
+                let key = cand.to_lowercase();
+                if !taken.contains(&key) {
+                    taken.insert(key.clone());
+                    used.insert(key);
+                    break cand;
+                }
+                k += 1;
+            }
+        };
+        names.push(name);
+    }
+    names
 }
 
 /// Stages whose reports sit directly in `dir`, not inside a run subdirectory.
@@ -1754,7 +1898,7 @@ mod tests {
         report("r10/a.parquet.report.json", "convert", 9);
         report("scored.parquet.report.json", "rescore", 500);
 
-        let runs = scan_runs(&dir);
+        let runs = scan_runs(&dir, &[]);
         assert_eq!(
             runs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
             vec!["r0", "r1", "r2", "r10"],
@@ -1782,6 +1926,69 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The engine's run names (`experiment.run_naming = "input"`), from the table the
+    /// engine's own test reads, so the two derivations cannot drift apart.
+    #[test]
+    fn run_names_match_the_engines_table() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../../../ci/run_name_cases.json")).unwrap();
+        for case in cases["cases"].as_array().unwrap() {
+            let s = |k: &str| -> Vec<String> {
+                case[k]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect()
+            };
+            assert_eq!(
+                default_run_names(&s("inputs")),
+                s("names"),
+                "{}",
+                case["why"]
+            );
+        }
+    }
+
+    #[test]
+    fn an_experiment_named_after_its_inputs_reports_progress_in_input_order() {
+        // Run folders named after their inputs since #274: input order, not lexical, and
+        // the passes that follow the per-file chains stay last.
+        let dir = scratch("experiment_progress_named");
+        let report = |rel: &str, stage: &str| {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(
+                &p,
+                format!(r#"{{"stage":"{stage}","rows":1,"elapsed_ms":10}}"#),
+            )
+            .unwrap();
+        };
+        report("Z_sample/a.parquet.report.json", "compete");
+        report("A_sample/a.parquet.report.json", "compete");
+        report("M_sample/a.parquet.report.json", "convert");
+        report("first_pass/scored_combined.parquet.report.json", "rescore");
+        report("second_pass/Z_sample/a.parquet.report.json", "extract");
+        let order = default_run_names(&[
+            "d/Z_sample.raw".to_string(),
+            "d/A_sample.mzML".to_string(),
+            "d/M_sample.d".to_string(),
+        ]);
+        let runs = scan_runs(&dir, &order);
+        assert_eq!(
+            runs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec![
+                "Z_sample",
+                "A_sample",
+                "M_sample",
+                "first_pass",
+                "second_pass"
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_temp_sweep_removes_only_temp_files() {
         let dir = std::env::temp_dir().join(format!("mumdia_sweep_{}", std::process::id()));

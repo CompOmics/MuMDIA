@@ -281,11 +281,12 @@ mumdia report --psms-scored run/psms_scored.parquet --localisation run/localisat
 
 # on one run of a finished experiment (after a second pass, its psms_extracted is
 # second_pass/<run>/psms_extracted.parquet)
-mumdia localise --psms-scored exp/r0/scored.parquet --source 0 \
-  --spectra-ms2 exp/r0/spectra/spectra_ms2.parquet \
-  --mass-cal exp/r0/seed_psms.parquet.masscal.json \
-  --psms-extracted exp/second_pass/r0/psms_extracted.parquet \
-  --out exp/r0/localisation.parquet --config search.json
+# (run 0 is HYE_A01 here, named after HYE_A01.raw: experiment.runs in the manifest)
+mumdia localise --psms-scored exp/HYE_A01/scored.parquet --source 0 \
+  --spectra-ms2 exp/HYE_A01/spectra/spectra_ms2.parquet \
+  --mass-cal exp/HYE_A01/seed_psms.parquet.masscal.json \
+  --psms-extracted exp/second_pass/HYE_A01/psms_extracted.parquet \
+  --out exp/HYE_A01/localisation.parquet --config search.json
 
 # on every run of a finished experiment, as run-experiment does it (one temperature for the
 # runs, then the combination); in place, recorded in the manifest for

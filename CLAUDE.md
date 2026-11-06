@@ -545,6 +545,11 @@ fine-tuning also is not guaranteed deterministic.
   to each group's experiment-wide winner only. Per-run counts come from the
   split scored tables on `run_psm_q`; `mumdia report --experiment-dir` rewrites
   the experiment-wide set at another threshold.
+- A run's name (its folder, its manifest keys, the `<run>` of `quantity_<run>`) is the
+  input file's name without its extensions, sanitised (`experiment.run_naming = input`,
+  the default since 0.10; `index` gives the old `r0..rN-1`, byte-identical), unless
+  `--run-names` sets it; `experiment.run_inputs` maps each derived name to its input.
+  Never build `r<i>` paths: read `experiment.runs` (docs/12, "Run names").
 - `run-experiment` overrides the configured `quant.q_filter` and gates per-run
   quant on the pooled `q_value`. It warns rather than doing so silently.
 - `run-experiment` matches between runs by default (`mbr.strategy = second_pass`, since

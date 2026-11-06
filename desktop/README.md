@@ -716,7 +716,12 @@ rather than let a user infer:
   the counts from `scored_combined.parquet` and flags the result `experiment_wide`,
   which is what drives the banner.
 - per-run artifacts go to `<out_dir>/<name>/`, so the stage list looks sparse until
-  the pooled phase.
+  the pooled phase. `<name>` is the input file's name without its extensions, sanitised
+  to a portable directory name (`A0_1EX8741FD.raw` gives `A0_1EX8741FD/` and the columns
+  `quantity_A0_1EX8741FD`, `lfq_A0_1EX8741FD`); the engine derives it, the manifest maps
+  it to its input under `experiment.run_inputs`, and the progress view orders the files
+  by the same derivation (`run.rs`, `default_run_names`, tested against the engine's
+  table `ci/run_name_cases.json`).
 
 A DIA-NN-predicted library is built **once** for the whole selection, not per file:
 the library depends on the FASTA and the digest parameters, not on the spectra.

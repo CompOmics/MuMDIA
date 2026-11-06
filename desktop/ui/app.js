@@ -3380,7 +3380,8 @@ function render(s) {
   // with the display frozen. The counts were a sum across files as well, so they
   // described no file in particular.
   //
-  // So track the file that is actually running: the last one with any stage. Its
+  // So track the file that is actually running: the last one with any stage, in input
+  // order (the backend orders the run folders, which are named after the files). Its
   // per-file stages plus the root's pooled ones are the ladder; the subtitle says
   // which file of how many.
   const active = (s.runs || []).length ? s.runs[s.runs.length - 1] : null;

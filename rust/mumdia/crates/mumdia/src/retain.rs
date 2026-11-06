@@ -490,7 +490,8 @@ mod tests {
     fn exp(second: bool) -> Layout {
         Layout {
             experiment: true,
-            runs: ["r0".to_string(), "r1".to_string()].into(),
+            // An index-named run and one named after its input (`experiment.run_naming`).
+            runs: ["r0".to_string(), "HYE_A01".to_string()].into(),
             second_pass: second,
         }
     }
@@ -531,6 +532,10 @@ mod tests {
             ("r0/rt_bootstrap/run_windows.parquet", Class::Intermediate),
             ("r0/rt_bootstrap/cal.json", Class::Results),
             ("r0/chromatograms.parquet.tmp-12-0", Class::Unknown),
+            ("HYE_A01/scored.parquet", Class::Results),
+            ("HYE_A01/chromatograms.parquet", Class::Intermediate),
+            ("second_pass/HYE_A01/chromatograms.parquet", Class::Viewer),
+            ("HYE_A02/chromatograms.parquet", Class::Unknown),
             ("r9/chromatograms.parquet", Class::Unknown),
             ("notes.txt", Class::Unknown),
         ] {
