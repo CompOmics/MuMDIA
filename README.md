@@ -115,7 +115,7 @@ library (predicted library, import, paired decoys with predicted spectra) is des
 
 | file | contents |
 |---|---|
-| `peptides.tsv`, `precursors.tsv`, `proteins.tsv` | identified peptides, precursors and protein groups, for reading |
+| `peptides.tsv`, `precursors.tsv`, `proteins.tsv` | identified peptides, precursors and protein groups, for reading; their last columns `protein_ids`, `protein_names` and `genes` give the accessions, entry names and gene names when the library has a `protein_annotations.parquet` (a FASTA search, or a library imported since this release) |
 | `psms_scored.parquet` | every scored PSM with all q columns; the unit for analysis |
 | `peptide_quant.parquet`, `protein_group_quant.parquet` | quantities for analysis |
 | `lfq_maxlfq.parquet` | cross-run protein matrix (experiments) |

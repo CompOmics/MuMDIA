@@ -46,7 +46,8 @@ import pyarrow.parquet as pq
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from _lib_io import narrow_table, sort_fragments_by_candidate, write_engine_parquet  # noqa: E402
+from _lib_io import (carry_protein_annotations, narrow_table,  # noqa: E402
+                    sort_fragments_by_candidate, write_engine_parquet)
 from _unimod import MODIFICATIONS  # noqa: E402
 
 TO_UNIMOD = {name: uid for name, uid, _ in MODIFICATIONS}
@@ -217,6 +218,8 @@ def merge(in_prec, in_frag, pred_prec, pred_frag, out_prec, out_frag):
         keep["n_fragments"] = counts.astype(np.int32)
     write_engine_parquet(keep, out_prec)
     n = sort_fragments_by_candidate(out_frag)
+    # The targets' protein annotations, beside the output library (decoys have none).
+    carry_protein_annotations(in_prec, out_prec)
     print(f"merge: {len(keep)} precursors ({int((keep.label == 'decoy').sum())} decoys), "
           f"{n} fragments, dropped {len(drop)} precursors of unpredicted pairs")
 
@@ -259,7 +262,9 @@ def build(a):
         if not os.path.isfile(parquet):
             sys.exit(f"the re-export produced no {parquet}; DIA-NN 2.x is needed")
     pp, pfr = os.path.join(work, "pred_precursors.parquet"), os.path.join(work, "pred_fragments.parquet")
-    imp = [sys.executable, os.path.join(HERE, "import_diann_lib.py"), parquet, pp, pfr]
+    # The decoys' own import annotates nothing: decoys are never reported.
+    imp = [sys.executable, os.path.join(HERE, "import_diann_lib.py"), parquet, pp, pfr,
+           "--no-annotations"]
     if a.keep_unimod:
         imp += ["--keep-unimod", a.keep_unimod]
     run(imp)

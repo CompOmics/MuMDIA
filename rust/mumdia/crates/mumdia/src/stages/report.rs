@@ -20,6 +20,8 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use mumdia_io::table::TableFile;
 
+use crate::protein_annotations::ProteinAnnotations;
+
 pub struct ReportParams<'a> {
     pub scored: &'a str,
     pub peptide_quant: Option<&'a str>,
@@ -29,6 +31,10 @@ pub struct ReportParams<'a> {
     /// Where `precursors.tsv` goes; `None` writes only the two files above.
     pub out_precursors: Option<&'a str>,
     pub q_threshold: f64,
+    /// The protein annotation table (`protein_annotations`): appends `protein_ids`,
+    /// `protein_names` and `genes` to every row of the three files. `None` writes them
+    /// byte for byte as before.
+    pub protein_annotations: Option<&'a str>,
 }
 
 /// What a report wrote: the rows of `peptides.tsv` and `proteins.tsv`, and of
@@ -196,6 +202,31 @@ fn precursor_head_cells(
     Ok(())
 }
 
+/// The protein annotation table of a report, when it has one.
+fn load_annotations(path: Option<&str>) -> Result<Option<ProteinAnnotations>> {
+    path.map(ProteinAnnotations::load).transpose()
+}
+
+/// The annotation columns' header cells, after every other column; nothing without a table.
+fn annotation_header(w: &mut impl Write, ann: &Option<ProteinAnnotations>) -> Result<()> {
+    if ann.is_some() {
+        write!(w, "{}", crate::protein_annotations::TSV_HEADER)?;
+    }
+    Ok(())
+}
+
+/// The annotation cells of a row's `protein` (or `protein_group`) key.
+fn annotation_cells(
+    w: &mut impl Write,
+    ann: &Option<ProteinAnnotations>,
+    protein: &str,
+) -> Result<()> {
+    if let Some(a) = ann {
+        write!(w, "{}", a.cells(protein))?;
+    }
+    Ok(())
+}
+
 /// Stripped amino-acid sequence: drop a DECOY_ prefix and any bracketed/
 /// parenthesized modification blocks, keep the residue letters.
 fn strip(pf: &str) -> String {
@@ -323,6 +354,7 @@ pub fn run(p: ReportParams) -> Result<(u64, u64)> {
 /// the stable sorts keep the relative order of the rows each one prints.
 pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<ReportCounts> {
     let t = TableFile::open(p.scored)?;
+    let ann = load_annotations(p.protein_annotations)?;
     let with_precursors = precursors_writable(&t, p.out_precursors, p.scored);
     // Match-between-runs acceptance, when this table has been through `mumdia mbr`.
     // MBR lowers the three PSM-level q columns and neither of the two grouped columns
@@ -419,6 +451,7 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<Repo
     if let Some(c) = &site_cells {
         write!(w, "{}", c.header())?;
     }
+    annotation_header(&mut w, &ann)?;
     writeln!(w)?;
     let mut npep = 0u64;
     for &j in &order {
@@ -446,6 +479,7 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<Repo
         if let Some(cells) = &site_cells {
             write!(w, "{}", cells.cells(0, &pform[j], charge[j]))?;
         }
+        annotation_cells(&mut w, &ann, &protein[j])?;
         writeln!(w)?;
         npep += 1;
     }
@@ -459,10 +493,12 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<Repo
     let mut pseen: HashSet<String> = HashSet::new();
     let prot_target = mumdia_io::table::AtomicPath::new(p.out_proteins)?;
     let mut w2 = std::io::BufWriter::new(std::fs::File::create(prot_target.tmp())?);
-    writeln!(
+    write!(
         w2,
         "protein_group\tq_value\tquantity\tis_transferred\ttransfer_q"
     )?;
+    annotation_header(&mut w2, &ann)?;
+    writeln!(w2)?;
     let mut nprot = 0u64;
     for &j in &porder {
         if !accepted(j, &pg_q) || pg[j].is_empty() {
@@ -472,7 +508,7 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<Repo
             continue;
         }
         let qv = prot_quant.get(&pg[j]).copied().unwrap_or(f64::NAN);
-        writeln!(
+        write!(
             w2,
             "{}\t{:.6}\t{}{}",
             pg[j],
@@ -480,6 +516,8 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<Repo
             qcell(qv),
             transfer_cells(j)
         )?;
+        annotation_cells(&mut w2, &ann, &pg[j])?;
+        writeln!(w2)?;
         nprot += 1;
     }
     w2.flush()?;
@@ -505,6 +543,7 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<Repo
         if let Some(c) = &site_cells {
             write!(w3, "{}", c.header())?;
         }
+        annotation_header(&mut w3, &ann)?;
         writeln!(w3)?;
         for &j in &order {
             precursor_head_cells(
@@ -531,6 +570,7 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<Repo
             if let Some(cells) = &site_cells {
                 write!(w3, "{}", cells.cells(0, &pform[j], charge[j]))?;
             }
+            annotation_cells(&mut w3, &ann, &protein[j])?;
             writeln!(w3)?;
         }
         w3.flush()?;
@@ -585,6 +625,8 @@ pub struct ExperimentReportParams<'a> {
     /// Where `precursors.tsv` goes; `None` writes only the two files above.
     pub out_precursors: Option<&'a str>,
     pub q_threshold: f64,
+    /// As [`ReportParams::protein_annotations`].
+    pub protein_annotations: Option<&'a str>,
 }
 
 /// The experiment-wide report for a pooled rescore: one `peptides.tsv` and one
@@ -627,6 +669,7 @@ pub fn run_experiment_localised(
         );
     }
     let t = TableFile::open(p.scored)?;
+    let ann = load_annotations(p.protein_annotations)?;
     let with_precursors = precursors_writable(&t, p.out_precursors, p.scored);
     // Two passes, as in `run`: the printable rows (a target, transferred or at the
     // threshold on the experiment-wide peptide or protein-group q, or on its own
@@ -782,6 +825,7 @@ pub fn run_experiment_localised(
     if let Some(c) = &site_cells {
         write!(w, "{}", c.header())?;
     }
+    annotation_header(&mut w, &ann)?;
     writeln!(w)?;
     let mut npep = 0u64;
     for &j in &order {
@@ -823,6 +867,7 @@ pub fn run_experiment_localised(
         if let Some(cells) = &site_cells {
             write!(w, "{}", cells.cells(source[j], &pform[j], charge[j]))?;
         }
+        annotation_cells(&mut w, &ann, &protein[j])?;
         writeln!(w)?;
         npep += 1;
     }
@@ -843,6 +888,7 @@ pub fn run_experiment_localised(
         }
     }
     write!(w2, "\tis_transferred\ttransfer_q")?;
+    annotation_header(&mut w2, &ann)?;
     writeln!(w2)?;
     let mut nprot = 0u64;
     for &j in &porder {
@@ -866,6 +912,7 @@ pub fn run_experiment_localised(
             }
         }
         write!(w2, "{}", transfer_cells(j))?;
+        annotation_cells(&mut w2, &ann, &pg[j])?;
         writeln!(w2)?;
         nprot += 1;
     }
@@ -916,6 +963,7 @@ pub fn run_experiment_localised(
         if let Some(c) = &site_cells {
             write!(w3, "{}", c.header())?;
         }
+        annotation_header(&mut w3, &ann)?;
         writeln!(w3)?;
         let none = vec![f64::NAN; n_runs];
         for &j in &order {
@@ -959,6 +1007,7 @@ pub fn run_experiment_localised(
             if let Some(cells) = &site_cells {
                 write!(w3, "{}", cells.cells(source[j], &pform[j], charge[j]))?;
             }
+            annotation_cells(&mut w3, &ann, &protein[j])?;
             writeln!(w3)?;
         }
         w3.flush()?;
@@ -1883,6 +1932,7 @@ mod tests {
             out_proteins: &proteins,
             out_precursors: None,
             q_threshold: 0.01,
+            protein_annotations: None,
         })
         .unwrap();
         assert_eq!((n_pep, n_prot), (2, 1));
@@ -2011,6 +2061,7 @@ mod tests {
                 out_proteins: &proteins,
                 out_precursors: None,
                 q_threshold: 0.01,
+                protein_annotations: None,
             })
             .unwrap();
             std::fs::read_to_string(&peptides)
@@ -2186,6 +2237,7 @@ mod tests {
             out_proteins: &prot,
             out_precursors: None,
             q_threshold: 0.01,
+            protein_annotations: None,
         };
         run(params()).unwrap();
         let plain = std::fs::read_to_string(&pep).unwrap();
@@ -2410,6 +2462,7 @@ mod tests {
             out_proteins: &proteins,
             out_precursors: None,
             q_threshold: 0.01,
+            protein_annotations: None,
         })
         .unwrap();
 
@@ -2531,6 +2584,7 @@ mod tests {
             out_proteins: &format!("{out}/proteins.tsv"),
             out_precursors: None,
             q_threshold: 0.01,
+            protein_annotations: None,
         })
         .unwrap_err()
         .to_string();
@@ -2552,6 +2606,7 @@ mod tests {
             out_proteins: &format!("{out}/proteins.tsv"),
             out_precursors: None,
             q_threshold: 0.01,
+            protein_annotations: None,
         })
         .unwrap();
         assert_eq!(n_pep, 2);
@@ -2581,6 +2636,7 @@ mod tests {
                 out_proteins: &proteins,
                 out_precursors: None,
                 q_threshold: q,
+                protein_annotations: None,
             })
             .unwrap()
         };
@@ -2649,6 +2705,7 @@ mod tests {
             out_proteins: &proteins,
             out_precursors: None,
             q_threshold: 0.0,
+            protein_annotations: None,
         })
         .unwrap();
         assert_eq!((n_pep, n_prot), (0, 0));
@@ -2685,6 +2742,7 @@ mod tests {
             out_proteins: &proteins,
             out_precursors: None,
             q_threshold: 0.01,
+            protein_annotations: None,
         })
         .unwrap();
         let text = std::fs::read_to_string(&peptides).unwrap();
@@ -2850,6 +2908,7 @@ mod tests {
                     out_proteins: &f("g1.tsv"),
                     out_precursors: Some(&f("c1.tsv")),
                     q_threshold,
+                    protein_annotations: None,
                 })
                 .unwrap();
                 let want = legacy_run(ReportParams {
@@ -2860,6 +2919,7 @@ mod tests {
                     out_proteins: &f("g1_old.tsv"),
                     out_precursors: None,
                     q_threshold,
+                    protein_annotations: None,
                 })
                 .unwrap();
                 assert_eq!(got, want, "single run, mbr {mbr}, threshold {q_threshold}");
@@ -2873,6 +2933,7 @@ mod tests {
                     out_proteins: &f("ge.tsv"),
                     out_precursors: Some(&f("ce.tsv")),
                     q_threshold,
+                    protein_annotations: None,
                 })
                 .unwrap();
                 let want_e = legacy_run_experiment(ExperimentReportParams {
@@ -2885,6 +2946,7 @@ mod tests {
                     out_proteins: &f("ge_old.tsv"),
                     out_precursors: None,
                     q_threshold,
+                    protein_annotations: None,
                 })
                 .unwrap();
                 assert_eq!(
@@ -2956,6 +3018,7 @@ mod tests {
             out_proteins: &tmp("x2.tsv"),
             out_precursors: None,
             q_threshold: 0.01,
+            protein_annotations: None,
         })
         .unwrap_err()
         .to_string();
@@ -2969,6 +3032,7 @@ mod tests {
             out_proteins: &tmp("x4.tsv"),
             out_precursors: None,
             q_threshold: 0.01,
+            protein_annotations: None,
         })
         .unwrap_err()
         .to_string();
@@ -3096,6 +3160,7 @@ mod tests {
                 out_proteins: &f("proteins.tsv"),
                 out_precursors: Some(&f("precursors.tsv")),
                 q_threshold: 0.01,
+                protein_annotations: None,
             },
             None,
         )
@@ -3189,6 +3254,7 @@ mod tests {
                     out_proteins: &f("proteins.tsv"),
                     out_precursors: Some(&f(dst)),
                     q_threshold: 0.01,
+                    protein_annotations: None,
                 },
                 None,
             )
@@ -3249,6 +3315,7 @@ mod tests {
                 out_proteins: &f("proteins.tsv"),
                 out_precursors: Some(&f("precursors.tsv")),
                 q_threshold: 0.01,
+                protein_annotations: None,
             },
             None,
         )
@@ -3256,5 +3323,110 @@ mod tests {
         assert_eq!(c.precursor_rows, None);
         assert!(!std::path::Path::new(&f("precursors.tsv")).exists());
         assert!(c.peptide_rows > 0);
+    }
+
+    /// The protein annotation table appends `protein_ids`, `protein_names` and `genes` to
+    /// every row of the three files, single-run and experiment-wide, and changes nothing
+    /// else: each annotated line is the unannotated line plus three cells. A protein group
+    /// without a row gets empty cells.
+    #[test]
+    fn protein_annotations_append_three_columns_and_change_nothing_else() {
+        let n_runs = 2u32;
+        let names: Vec<String> = (0..n_runs).map(|i| format!("r{i}")).collect();
+        let scored = random_scored(20_000, n_runs, true);
+        let ann = tmp("protein_annotations.parquet");
+        let mut keys: Vec<String> = (0..30).map(|i| format!("P{i}")).collect();
+        keys.extend((0..25).step_by(2).map(|i| format!("PG{i}")));
+        keys.sort();
+        let cell = |k: &str, what: &str| format!("{what}_{k}");
+        write_table(
+            &ann,
+            vec![
+                Col::Str("protein".into(), keys.clone()),
+                Col::Str(
+                    "protein_ids".into(),
+                    keys.iter().map(|k| cell(k, "acc")).collect(),
+                ),
+                Col::Str(
+                    "protein_names".into(),
+                    keys.iter().map(|k| cell(k, "name")).collect(),
+                ),
+                Col::Str(
+                    "genes".into(),
+                    keys.iter().map(|k| cell(k, "gene")).collect(),
+                ),
+                Col::Str("description".into(), vec![String::new(); keys.len()]),
+            ],
+        )
+        .unwrap();
+        let expect = |k: &str| -> String {
+            if keys.iter().any(|x| x == k) {
+                format!(
+                    "\t{}\t{}\t{}",
+                    cell(k, "acc"),
+                    cell(k, "name"),
+                    cell(k, "gene")
+                )
+            } else {
+                "\t\t\t".to_string()
+            }
+        };
+        // (file, column of the key the annotation is joined on)
+        let files = [
+            ("peptides.tsv", 3usize),
+            ("precursors.tsv", 4),
+            ("proteins.tsv", 0),
+        ];
+        let check = |plain: &str, annotated: &str| {
+            for (name, key_col) in files {
+                let a = std::fs::read_to_string(format!("{plain}/{name}")).unwrap();
+                let b = std::fs::read_to_string(format!("{annotated}/{name}")).unwrap();
+                let (a, b): (Vec<&str>, Vec<&str>) = (a.lines().collect(), b.lines().collect());
+                assert_eq!(a.len(), b.len(), "{name}: same rows");
+                assert!(a.len() > 1, "{name}: the fixture prints rows");
+                assert_eq!(
+                    b[0],
+                    format!("{}{}", a[0], crate::protein_annotations::TSV_HEADER)
+                );
+                for (x, y) in a.iter().zip(&b).skip(1) {
+                    let key = x.split('\t').nth(key_col).unwrap();
+                    assert_eq!(*y, format!("{x}{}", expect(key)), "{name}");
+                }
+            }
+        };
+        let dirs = [tmp("ann_plain"), tmp("ann_on")];
+        for (d, a) in dirs.iter().zip([None, Some(ann.as_str())]) {
+            std::fs::create_dir_all(d).unwrap();
+            run(ReportParams {
+                scored: &scored,
+                peptide_quant: None,
+                protein_quant: None,
+                out_peptides: &format!("{d}/peptides.tsv"),
+                out_proteins: &format!("{d}/proteins.tsv"),
+                out_precursors: Some(&format!("{d}/precursors.tsv")),
+                q_threshold: 0.01,
+                protein_annotations: a,
+            })
+            .unwrap();
+        }
+        check(&dirs[0], &dirs[1]);
+        let dirs = [tmp("ann_exp_plain"), tmp("ann_exp_on")];
+        for (d, a) in dirs.iter().zip([None, Some(ann.as_str())]) {
+            std::fs::create_dir_all(d).unwrap();
+            run_experiment(ExperimentReportParams {
+                scored: &scored,
+                run_names: &names,
+                peptide_quants: &[],
+                protein_lfq: None,
+                precursor_lfq: None,
+                out_peptides: &format!("{d}/peptides.tsv"),
+                out_proteins: &format!("{d}/proteins.tsv"),
+                out_precursors: Some(&format!("{d}/precursors.tsv")),
+                q_threshold: 0.01,
+                protein_annotations: a,
+            })
+            .unwrap();
+        }
+        check(&dirs[0], &dirs[1]);
     }
 }

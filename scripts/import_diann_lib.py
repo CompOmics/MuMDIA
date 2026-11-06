@@ -12,6 +12,16 @@ an entrapment FASTA, it writes the first description word (`Keratin,`) or nothin
 would merge distinct proteins into one group or leave them UNASSIGNED. The import prints how
 many protein entries fell back to their ids.
 
+Protein annotations: `protein_annotations.parquet` is written beside the precursor table,
+one row per distinct `protein` string: its accessions (`Protein.Ids`, with the accession
+field of a `db|ACCESSION|ENTRY_NAME` id), its entry names (the entry names in
+`Protein.Names`, then those of such ids) and its genes (`Genes`, without description words),
+each `;`-separated in first-occurrence order. The engine joins it at report time to add
+`protein_ids`, `protein_names` and `genes` to the TSVs; `protein` itself, the grouping key,
+is unchanged. `--annotations <path>` writes it elsewhere, `--no-annotations` not at all
+(the decoy prediction's own import). A library with neither `Protein.Ids` nor
+`Protein.Names` gets none.
+
 Kept modifications, by default: Carbamidomethyl (UniMod:4), Oxidation (35), and the
 three cysteine prenylations Farnesyl (44), GeranylGeranyl (48), Hydroxyfarnesyl (376).
 `--keep-unimod 4,35,21,...` names the kept accessions instead; each must be in the
@@ -30,6 +40,7 @@ instrument without ion mobility, gets no column and is the version-1 table.
 
 Usage: python import_diann_lib.py <diann_lib.parquet> <out_precursors.parquet> <out_fragments.parquet>
               [--charge-by-basic-residues] [--keep-unimod <id,id,...>]
+              [--annotations <out_annotations.parquet> | --no-annotations]
 
 The library is read one parquet row group at a time, twice: a first pass collects the
 precursor table (one row per peptidoform/charge), the fragment counts and the fragment
@@ -45,6 +56,7 @@ peptide can physically carry: a precursor is kept only at charge
 and fragments outside that range are dropped. Off by default (imports DIA-NN's
 charges verbatim).
 """
+import os
 import sys
 
 import numpy as np
@@ -54,7 +66,8 @@ import pyarrow.parquet as pq
 # The engine rejects `large_string` parquet columns ("column 'peptidoform' is not
 # utf8"), and `to_parquet` picks the width itself: pandas 3.x chooses the large
 # variant, so this helper silently emitted libraries the engine would not load.
-from _lib_io import narrow_table, sort_fragments_by_candidate, write_engine_parquet
+from _lib_io import (annotations_path, join_unique, narrow_table, sort_fragments_by_candidate,
+                    uniprot_fields, write_engine_parquet, write_protein_annotations)
 from _unimod import NAME_BY_UNIMOD
 
 
@@ -132,6 +145,8 @@ _FRAG_COLS = ["Product.Mz", "Relative.Intensity", "Fragment.Type", "Fragment.Ser
               "Fragment.Charge"]
 _OPTIONAL_COLS = ["Decoy", "Fragment.Loss.Type", "Protein.Names", "Protein.Ids", "IM",
                   "IonMobility"]
+# Read in the first pass only, for the protein annotation table.
+_ANNOTATION_COLS = ["Genes"]
 # 0.01 Da bins for the fragment cardinality; wide enough for any fragment m/z.
 _MZ_BIN_MAX = 1_000_000
 
@@ -246,6 +261,57 @@ def _protein_strings(df, cache, stats):
     return out
 
 
+def _clean(cell):
+    """A protein cell as a string, empty for a missing value."""
+    cell = "" if cell is None else str(cell).strip()
+    return "" if cell in ("nan", "None", "<NA>") else cell
+
+
+def _is_gene(token):
+    """A gene symbol rather than the description word DIA-NN writes in `Genes` for a
+    header it does not parse as UniProt (`Keratin,`)."""
+    return bool(token) and not any(c in token for c in " ,|\t")
+
+
+def _annotation_of(ids, names, genes):
+    """(accessions, entry names, genes) of one precursor's protein cells, as token lists."""
+    id_tokens = [t.strip() for t in _clean(ids).split(";") if t.strip()]
+    parsed = [uniprot_fields(t) for t in id_tokens]
+    accessions = [acc for acc, _ in parsed]
+    entry_names = [t.strip() for t in _clean(names).split(";") if _is_entry_name(t.strip())]
+    entry_names += [name for _, name in parsed if _is_entry_name(name)]
+    gene_tokens = [t.strip() for t in _clean(genes).split(";") if _is_gene(t.strip())]
+    return accessions, entry_names, gene_tokens
+
+
+class _Annotations:
+    """The protein annotation table, built from the distinct (ids, names, genes) cells of the
+    imported precursors in file order: per `protein` string, the union of their tokens in
+    first-occurrence order. Two cells meet under one string when the names merge isoforms
+    (`ALBU_HUMAN` for `P02768` and for `P02768;P02768-2`)."""
+
+    def __init__(self):
+        self.seen = set()
+        self.rows = {}
+
+    def add(self, df, proteins):
+        cols = [df[c].astype(str).to_numpy() if c in df.columns else np.full(len(df), "", object)
+                for c in ("Protein.Ids", "Protein.Names", "Genes")]
+        for prot, ids, names, genes in zip(proteins, *cols):
+            if not prot or (prot, ids, names, genes) in self.seen:
+                continue
+            self.seen.add((prot, ids, names, genes))
+            acc, nm, gn = _annotation_of(ids, names, genes)
+            row = self.rows.setdefault(prot, ([], [], []))
+            for into, new in zip(row, (acc, nm, gn)):
+                into.extend(t for t in new if t not in into)
+
+    def table(self):
+        return {p: {"protein_ids": join_unique(a), "protein_names": join_unique(n),
+                    "genes": join_unique(g)}
+                for p, (a, n, g) in self.rows.items()}
+
+
 def _keys(df):
     """The precursor key the whole import is joined on: ProForma peptidoform / charge."""
     return df["Modified.Sequence"].map(to_proforma) + "/" + df["Precursor.Charge"].astype(str)
@@ -264,6 +330,14 @@ def main():
     global _KEPT_UNIMOD_IDS
     args = sys.argv[1:]
     charge_by_basic = "--charge-by-basic-residues" in args
+    no_annotations = "--no-annotations" in args
+    out_annotations = None
+    if "--annotations" in args:
+        i = args.index("--annotations")
+        if i + 1 >= len(args):
+            raise SystemExit("--annotations needs a path")
+        out_annotations = args[i + 1]
+        del args[i:i + 2]
     if "--keep-unimod" in args:
         i = args.index("--keep-unimod")
         if i + 1 >= len(args):
@@ -272,6 +346,8 @@ def main():
         del args[i:i + 2]
     args = [a for a in args if not a.startswith("--")]
     inp, outp, outf = args[0:3]
+    if out_annotations is None and not no_annotations:
+        out_annotations = annotations_path(outp)
 
     pf = pq.ParquetFile(inp)
     present = set(pf.schema_arrow.names)
@@ -283,6 +359,9 @@ def main():
     prot_cache, prot_stats = {}, {"fallback": set()}
     im_col = next((c for c in ("IM", "IonMobility") if c in present), None)
     read_cols = _META_COLS + _FRAG_COLS + optional
+    annotate = out_annotations is not None and bool(prot_cols)
+    read_cols_1 = read_cols + ([c for c in _ANNOTATION_COLS if c in present] if annotate else [])
+    annotations = _Annotations()
 
     # ---- pass 1: precursor table, fragment counts, fragment m/z cardinality ----
     # A precursor's fragments are contiguous in a DIA-NN table, so each row group
@@ -300,7 +379,7 @@ def main():
     # whole-table `nunique` would count it.
     carry_key, carry_bins = None, set()
     for rg in range(pf.num_row_groups):
-        df = pf.read_row_group(rg, columns=read_cols).to_pandas()
+        df = pf.read_row_group(rg, columns=read_cols_1).to_pandas()
         df, (dp, dfr) = _filter_rows(df, charge_by_basic, n_term)
         dropped_prec += dp
         dropped_frag += dfr
@@ -311,6 +390,9 @@ def main():
         counts = key.value_counts(sort=False)
         count_parts.append(counts)
         first = ~key.duplicated()
+        proteins = _protein_strings(df.loc[first], prot_cache, prot_stats)
+        if annotate:
+            annotations.add(df.loc[first], proteins)
         part = pd.DataFrame({
             "key": key[first].to_numpy(),
             "peptidoform": df.loc[first, "Modified.Sequence"].map(to_proforma).to_numpy(),
@@ -320,7 +402,7 @@ def main():
             "RT": df.loc[first, "RT"].astype(np.float32).to_numpy(),
             "IM": df.loc[first, im_col].astype(np.float64).to_numpy() if im_col
             else np.full(int(first.sum()), np.nan),
-            "protein_str": _protein_strings(df.loc[first], prot_cache, prot_stats),
+            "protein_str": proteins,
         })
         prec_parts.append(part)
         # Fragment cardinality: how many distinct library precursors share each fragment
@@ -408,6 +490,16 @@ def main():
                                   else "no IM column in the library")
               + "; written without predicted_im")
     write_engine_parquet(prec, outp)
+    if out_annotations is not None:
+        if annotate:
+            n_ann = write_protein_annotations(annotations.table(), out_annotations)
+            print(f"protein annotations: {n_ann} protein entr(ies) with accessions, entry names "
+                  f"and genes -> {out_annotations}")
+        elif os.path.isfile(out_annotations):
+            # Left by another library, it would annotate this one wrongly.
+            os.remove(out_annotations)
+            print(f"protein annotations: none (no Protein.Ids or Protein.Names); removed the "
+                  f"stale {out_annotations}")
     key_index = pd.Index(keys["key"])
     del prec_parts, count_parts, nfrag
 

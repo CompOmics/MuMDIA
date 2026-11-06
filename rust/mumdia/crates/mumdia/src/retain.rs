@@ -72,6 +72,8 @@ const ROOT_RESULTS: &[&str] = &[
     "lfq_maxlfq.parquet.precursor.parquet",
     "quant_normalisation.parquet",
     "localisation_experiment.parquet",
+    // The report's protein annotations (`protein_annotations`), read by `mumdia report`.
+    "protein_annotations.parquet",
 ];
 /// A FASTA-built library in the output directory: the searched library, which a viewer
 /// shows predicted fragments from; the empirical library replaces it under a second pass.

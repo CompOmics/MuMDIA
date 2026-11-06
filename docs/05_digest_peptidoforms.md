@@ -61,6 +61,12 @@ recipe").
   `n_decoys`, `decoy_collision_retries`, and `dropped_target_decoy_pairs`
   (digest.rs:302-311); `params` records enzyme, missed cleavages, length bounds,
   decoy strategy, `rng_seed`, and `max_decoy_attempts` (digest.rs:319-326).
+- Also produces `protein_annotations.parquet` beside `peptides.parquet`: one row per
+  FASTA header, keyed by the header's first word (the `protein` written above), with the
+  accession, UniProt entry name, `GN=` gene and description parsed from a
+  `db|ACCESSION|ENTRY_NAME` header, or the first word as the accession otherwise
+  (`protein_annotations::write_from_fasta`). Only the report reads it, to add
+  `protein_ids`, `protein_names` and `genes` to the TSVs (docs/15, "protein_annotations").
 
 `peptides.parquet` column schema (written at digest.rs:288-297):
 

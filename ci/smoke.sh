@@ -1672,6 +1672,26 @@ print("    ok: once_per_run union, kept re-prediction, per-band slices reused, d
                                      "boot_run", "boot_fallback")))
 PYEOF
 
+# 5p. Protein annotations: the report of the run's scored table without the annotation table
+#     (a copy of the scored table in a directory of its own), and with it (the scored table in
+#     the run directory, which finds the table there). check_smoke.py asserts the first is the
+#     run's TSVs minus their three annotation columns and the second the run's TSVs exactly.
+echo "=== smoke: protein annotations"
+mkdir -p "$work/report_plain"
+cp "$work/out/psms_scored.parquet" "$work/report_plain/psms_scored.parquet"
+for arm in plain annotated; do
+    scored="$work/out/psms_scored.parquet"
+    [ "$arm" = plain ] && scored="$work/report_plain/psms_scored.parquet"
+    "$BIN" report --psms-scored "$scored" --out-dir "$work/report_$arm" --config "$cfg" \
+        --peptide-quant "$work/out/peptide_quant.parquet" \
+        --protein-quant "$work/out/protein_group_quant.parquet" > "$work/report_$arm.log" 2>&1 \
+        || { tail -20 "$work/report_$arm.log"; echo "report ($arm) failed"; exit 1; }
+done
+"$BIN" report --psms-scored "$work/out/psms_scored.parquet" --out-dir "$work/report_q1" --q 1 \
+    > "$work/report_q1.log" 2>&1 || { tail -20 "$work/report_q1.log"; echo "report (q 1) failed"; exit 1; }
+[ ! -e "$work/report_plain/protein_annotations.parquet" ] \
+    || { echo "the plain report arm has an annotation table"; exit 1; }
+
 # 6. Assertions.
 echo "=== smoke: assertions"
 #
@@ -1681,7 +1701,9 @@ echo "=== smoke: assertions"
 # and so reads as a pass.
 "$PY" ci/check_smoke.py --out-dir "$work/out" --planted "$work/planted.json" \
     --compare-peptides "$work/out2/peptides.tsv" --experiment "$work/exp" \
-    --experiment-named "$work/exp_named" --min-assertions 157
+    --experiment-named "$work/exp_named" --plain-report "$work/report_plain" \
+    --annotated-report "$work/report_annotated" --loose-report "$work/report_q1" \
+    --min-assertions 199
 
 echo "=== smoke: also check inspect and report run standalone"
 "$BIN" inspect "$work/out/psms_scored.parquet" > /dev/null

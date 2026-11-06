@@ -2035,7 +2035,11 @@ fn keep_unimod_args(ids: Option<&[u32]>) -> Vec<String> {
     }
 }
 
-/// The two tables a conversion writes into `out_dir`.
+/// The two tables a conversion writes into `out_dir`. The importer also writes the protein
+/// annotation table (`protein_annotations.parquet`: accessions, entry names, genes) there,
+/// beside `lib_precursors.parquet`, where the engine finds it; a library converted before
+/// the table existed has none, and its search reports carry no `protein_ids`,
+/// `protein_names` or `genes` columns.
 fn final_tables(out_dir: &Path) -> (PathBuf, PathBuf) {
     (
         out_dir.join("lib_precursors.parquet"),
@@ -3516,6 +3520,38 @@ PEPTIDEK
                 c.out_dir.join("lib_fragments.parquet")
             )
         );
+    }
+
+    /// The importer writes `protein_annotations.parquet` beside its precursor table, and the
+    /// engine reads it beside the precursor table a search is given. Every step writes into
+    /// the one library folder, so the table is beside `lib_precursors.parquet` without a copy;
+    /// the decoy prediction imports its own DIA-NN library in a subfolder, so its (decoy)
+    /// import never replaces the targets' table.
+    #[test]
+    fn the_protein_annotations_land_beside_the_final_precursor_table() {
+        let c = a_conversion(None);
+        let steps = conversion_steps(&c, Path::new("/in/lib.parquet"));
+        let (prec, _) = final_tables(&c.out_dir);
+        assert_eq!(prec.parent(), Some(c.out_dir.as_path()));
+        // import: <script> <library> <target precursors> <target fragments>
+        assert_eq!(
+            Path::new(&steps[0].1[2]).parent(),
+            Some(c.out_dir.as_path())
+        );
+        assert!(!steps[0]
+            .1
+            .iter()
+            .any(|a| a == "--no-annotations" || a == "--annotations"));
+        // reversal: its output precursors are in the same folder.
+        assert_eq!(
+            Path::new(&steps[1].1[3]).parent(),
+            Some(c.out_dir.as_path())
+        );
+        // decoy prediction: the work folder is below the library folder, not the folder.
+        let w = steps[2].1.iter().position(|a| a == "--work").unwrap();
+        let work = PathBuf::from(&steps[2].1[w + 1]);
+        assert_ne!(work, c.out_dir);
+        assert_eq!(work.parent(), Some(c.out_dir.as_path()));
     }
 
     #[test]

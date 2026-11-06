@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
@@ -74,3 +75,39 @@ def test_sort_fragments_by_candidate_orders_rows_and_keeps_each_candidates_order
     mx = [pf.metadata.row_group(i).column(idx).statistics.max for i in range(pf.num_row_groups)]
     mn = [pf.metadata.row_group(i).column(idx).statistics.min for i in range(pf.num_row_groups)]
     assert all(mx[i] <= mn[i + 1] for i in range(len(mx) - 1))
+
+
+def test_uniprot_fields_follows_the_engines_header_rule():
+    """The importer and the engine (`protein_annotations::uniprot_fields`) split an
+    identifier the same way: `db|ACCESSION|ENTRY_NAME`, prefixed or not, gives its two
+    fields; anything else is its own accession."""
+    from _lib_io import uniprot_fields
+
+    assert uniprot_fields("sp|P02768|ALBU_HUMAN") == ("P02768", "ALBU_HUMAN")
+    assert uniprot_fields("tr|A0A024R161|A0A024R161_HUMAN") == ("A0A024R161", "A0A024R161_HUMAN")
+    assert uniprot_fields("CON_sp|P02769|ALBU_BOVIN") == ("P02769", "ALBU_BOVIN")
+    assert uniprot_fields("CON__P13645") == ("CON__P13645", "")
+    assert uniprot_fields(" P02768 ") == ("P02768", "")
+
+
+def test_protein_annotations_round_trip_sorted_and_carry(tmp_path):
+    """Rows ascend by key whatever order they are given in, read back as written, and
+    `carry_protein_annotations` copies the table between library directories."""
+    from _lib_io import (annotations_path, carry_protein_annotations, read_protein_annotations,
+                         write_protein_annotations)
+
+    a = tmp_path / "a"
+    a.mkdir()
+    path = annotations_path(a / "lib_precursors.parquet")
+    n = write_protein_annotations({"B": {"protein_ids": "P2"}, "A": {"genes": "G1"}}, path)
+    assert n == 2
+    t = pq.read_table(path)
+    assert t.column("protein").to_pylist() == ["A", "B"]
+    rows = read_protein_annotations(path)
+    assert rows["A"]["genes"] == "G1" and rows["B"]["protein_ids"] == "P2"
+    assert rows["A"]["protein_ids"] == "" and rows["B"]["description"] == ""
+    b = tmp_path / "b"
+    b.mkdir()
+    got = carry_protein_annotations(a / "lib_precursors.parquet", b / "x.parquet")
+    assert got and open(got, "rb").read() == open(path, "rb").read()
+    assert carry_protein_annotations(a / "p.parquet", a / "q.parquet") == path

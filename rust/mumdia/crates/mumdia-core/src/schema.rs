@@ -149,6 +149,14 @@ pub mod artifact {
     /// log-likelihoods of the runs that observed it (docs/36_ptm_localisation.md). Written
     /// only when the stage runs on more than one run with `localise.combine_runs`.
     pub const LOCALISATION_EXPERIMENT: (&str, u32) = ("localisation_experiment", 1);
+    /// The protein annotation side table (`protein_annotations.parquet`) beside a library's
+    /// precursor table and in an output directory: one row per `protein` key (a library
+    /// `protein` string, or one FASTA protein) with its `protein_ids`, `protein_names`,
+    /// `genes` and `description`, all utf8, rows ascending by `protein`. Written by the
+    /// library importer and by `digest`; `report` joins it to add the three name columns
+    /// to the TSVs. Nothing else reads it, so every identification and quantity is the same
+    /// with or without it (docs/15).
+    pub const PROTEIN_ANNOTATIONS: (&str, u32) = ("protein_annotations", 1);
 
     /// The `peptides` schema a digest writes: [`PEPTIDES_V2`] when it records the
     /// protein N-terminus flag, else [`PEPTIDES`].

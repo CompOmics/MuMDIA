@@ -132,6 +132,25 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **Protein accessions, entry names and gene names in the TSVs (#285).** `peptides.tsv`,
+  `precursors.tsv` and `proteins.tsv` end with three more columns, `protein_ids`,
+  `protein_names` and `genes` (`;`-separated for a shared peptide or a protein group), from a
+  protein annotation side table, `protein_annotations.parquet` (artifact
+  `protein_annotations` v1), beside the library's precursor table.
+  `scripts/import_diann_lib.py` writes it from DIA-NN's `Protein.Ids`, `Protein.Names` and
+  `Genes`, which the import used to drop, keyed by the library's `protein` string; `digest`
+  writes it from the FASTA headers (`sp|P02768|ALBU_HUMAN ... GN=ALB`; any other header: its
+  first word as the accession). The decoy builders and `augment_library.py` carry it to
+  their output library, so the desktop application's library builder and import leave it
+  beside `lib_precursors.parquet`. `run` and `run-experiment` take it from beside
+  `--lib-precursors` or from `--lib-annotations`, copy it into the output directory and
+  record it in the manifest; `mumdia report` (`--protein-annotations`) finds it there. The
+  `protein` key, protein groups, every identification, q value and quantity are unchanged,
+  and without the table the TSVs keep their bytes; a FASTA search now always has one. A
+  library imported before this release has none; importing its DIA-NN library again (into
+  a scratch folder) writes one, which can be placed beside the existing library or in a
+  finished experiment's directory before `mumdia report --experiment-dir` (docs/15,
+  "protein_annotations"; docs/12, "report").
 - **Precursor and fragment m/z limits for a library built from a FASTA (#276).**
   `peptidoforms.precursor_mz_min` / `precursor_mz_max` (inclusive) stop the peptidoform
   stage from emitting a charge state whose precursor m/z lies outside them, so a library can
