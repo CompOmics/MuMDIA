@@ -621,6 +621,8 @@ def render_default(
         return render_default(m.group(1), inner_type, enums, structs)
     if e in ("Vec::new()", "vec![]", "Vec::default()"):
         return "[]"
+    if e in ("BTreeMap::new()", "BTreeMap::default()", "HashMap::new()"):
+        return "{}"
     if e in ("true", "false"):
         return e
     if re.fullmatch(r'"[^"]*"', e):

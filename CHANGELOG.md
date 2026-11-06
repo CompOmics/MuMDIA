@@ -132,6 +132,28 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **Normalisation per condition (#275).** `quant.normalisation_scope` chooses the runs the
+  median-ratio size factors of `run-experiment`'s cross-run MaxLFQ are estimated over: `all`
+  (the default, unchanged: one set over every run), `condition` (one set within each
+  condition's runs, so replicates are aligned and the difference between conditions stays as
+  measured; a condition of one run keeps factor 1) or `none` (no size factor). It governs
+  `lfq_maxlfq.parquet` and its precursor and peptide siblings, so `lfq_<run>` in
+  `proteins.tsv` and `normalised_<run>` in `precursors.tsv`; the raw `quantity_<run>` columns
+  and every scored and per-run quant table are the same under every scope. The run
+  conditions come from `--condition` (once per `--mzml`, also on a multi-file `run`), from a
+  tab-separated sample sheet (`run-experiment --sample-sheet`, columns `file`, `name`,
+  `condition`, which can also list the inputs and name the runs), or from
+  `experiment.conditions` in the configuration (run name -> condition), in that order; under
+  `condition` every run needs one. The conditions are recorded in the manifest
+  (`experiment.conditions`) and are part of the configuration hash under `condition` only.
+  `condition` is refused with `quant.normalisation = stable_set`. Every experiment now writes
+  `lfq_size_factors.tsv` at its root (run, condition, size factor, features), and the
+  manifest records `experiment.lfq_normalisation`; at the default scope every other artifact
+  keeps its bytes. `quant-lfq` takes `--condition` and `--size-factors-out`. The desktop
+  application's file list has a Condition column, pre-filled from the file names with the
+  rule visDIA's Quant QC page uses, and a Normalisation choice (None, All samples, Within
+  each condition) for an experiment (docs/12, "Normalisation scope"; docs/15,
+  "lfq_size_factors.tsv").
 - **Protein accessions, entry names and gene names in the TSVs (#285).** `peptides.tsv`,
   `precursors.tsv` and `proteins.tsv` end with three more columns, `protein_ids`,
   `protein_names` and `genes` (`;`-separated for a shared peptide or a protein group), from a

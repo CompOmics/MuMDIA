@@ -3586,6 +3586,45 @@ mod tests {
         }
     }
 
+    /// A run's condition from `--condition` / the sample sheet wins over
+    /// `experiment.conditions`, an empty entry falls through to it, and under
+    /// `normalisation_scope = condition` a run without one is an error that names it.
+    #[test]
+    fn run_conditions_resolve_by_precedence_and_are_required_under_condition() {
+        use mumdia_core::config::NormalisationScope;
+        let runs = names(&["a", "b", "c"]);
+        let mut cfg = Config::default();
+        cfg.experiment
+            .conditions
+            .insert("b".to_string(), "B".to_string());
+        cfg.experiment
+            .conditions
+            .insert("c".to_string(), "C".to_string());
+        let given = names(&["A", "", " X "]);
+        let got = resolve_conditions(&runs, Some(&given), &cfg).unwrap();
+        assert_eq!(
+            got,
+            vec![Some("A".into()), Some("B".into()), Some("X".into())]
+        );
+        assert_eq!(
+            resolve_conditions(&runs, None, &cfg).unwrap(),
+            vec![None, Some("B".into()), Some("C".into())]
+        );
+        assert_eq!(condition_groups(&got), vec![0, 1, 2]);
+        assert_eq!(
+            condition_groups(&[Some("B".into()), Some("A".into()), Some("B".into())]),
+            vec![0, 1, 0]
+        );
+        let e = resolve_conditions(&runs, Some(&names(&["A"])), &cfg).unwrap_err();
+        assert!(e.to_string().contains("--condition has 1 entries"), "{e}");
+        let e = resolve_conditions(&runs, Some(&names(&["A\tB", "", ""])), &cfg).unwrap_err();
+        assert!(e.to_string().contains("not usable"), "{e}");
+        cfg.quant.normalisation_scope = NormalisationScope::Condition;
+        let e = resolve_conditions(&runs, None, &cfg).unwrap_err();
+        assert!(e.to_string().contains("[\"a\"]"), "{e}");
+        assert!(resolve_conditions(&runs, Some(&given), &cfg).is_ok());
+    }
+
     #[test]
     fn repeated_run_names_are_rejected_and_distinct_ones_pass() {
         let e = check_run_names_distinct(&names(&["a", "b", "a"]))

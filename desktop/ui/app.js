@@ -47,7 +47,13 @@ const state = {
     lib_fasta: "", lib_out: "",
     // A DIA-NN library to convert into the two tables, and the folder they go in.
     diann_lib: "", diann_lib_out: "",
+    // The condition of each spectra file of an experiment, by path
+    // (`quant.normalisation_scope = condition`, `run-experiment --condition`).
+    conditions: {},
   },
+  // The files whose condition the user typed; the others follow the suggestion from the
+  // file names.
+  conditionTyped: {},
   diannTimer: null,
   diannGetTimer: null,
   thermoTimer: null,
@@ -264,8 +270,16 @@ async function init() {
   await initCleavage();
   initSearchOptions();
   for (const r of document.querySelectorAll('input[name="runmode"]')) {
-    r.addEventListener("change", () => (state.runMode = r.value));
+    r.addEventListener("change", () => {
+      state.runMode = r.value;
+      refreshNormOptions();
+    });
   }
+  $("norm-scope").addEventListener("change", refreshNormOptions);
+  $("suggest-conditions").addEventListener("click", () => {
+    state.conditionTyped = {};
+    renderMzmlList();
+  });
   for (const r of document.querySelectorAll('input[name="libsrc"]')) {
     r.addEventListener("change", () => {
       state.libSrcChosen = true;
@@ -1451,6 +1465,11 @@ async function renderMzmlList() {
   }
 
   list.innerHTML = "";
+  // The condition of each file: what the user typed, else the suggestion from the names.
+  const suggested = suggestConditions(files);
+  for (const [i, f] of files.entries()) {
+    if (!state.conditionTyped[f]) state.picks.conditions[f] = suggested[i];
+  }
   let anyDiapasef = false;
   for (const [i, f] of files.entries()) {
     const li = document.createElement("li");
@@ -1459,6 +1478,23 @@ async function renderMzmlList() {
     name.className = "fname";
     name.textContent = baseName(f);
     li.appendChild(name);
+
+    if (files.length > 1) {
+      const cond = document.createElement("input");
+      cond.type = "text";
+      cond.className = "fcond";
+      cond.setAttribute("list", "condition-labels");
+      cond.placeholder = "Condition";
+      cond.title = "The condition of this run, for normalisation within each condition";
+      cond.setAttribute("aria-label", `Condition of ${baseName(f)}`);
+      cond.value = state.picks.conditions[f] || "";
+      cond.addEventListener("input", () => {
+        state.picks.conditions[f] = cond.value;
+        state.conditionTyped[f] = true;
+        refreshNormOptions();
+      });
+      li.appendChild(cond);
+    }
 
     const path = document.createElement("span");
     path.className = "fpath";
@@ -1492,6 +1528,8 @@ async function renderMzmlList() {
     drop.setAttribute("aria-label", `Remove ${baseName(f)}`);
     drop.addEventListener("click", () => {
       state.picks.mzml.splice(i, 1);
+      delete state.picks.conditions[f];
+      delete state.conditionTyped[f];
       renderMzmlList();
       updateRawNote();
     });
@@ -1499,6 +1537,7 @@ async function renderMzmlList() {
 
     list.appendChild(li);
   }
+  refreshNormOptions();
   // The library is for the spectra that are selected, when there are any; the user may
   // still change it.
   if (files.length) {
@@ -1530,6 +1569,134 @@ function refreshLibForNote() {
   }
   if (state.picks.mzml.length) note += " Chosen from the selected spectra.";
   $("lib-for-note").textContent = note;
+}
+
+// A condition for every file, suggested from the file names: the rule of visDIA's
+// Quant QC page (`suggest_conditions`), so the two agree.
+//
+// 1. The name is cut at its extension (and a compression suffix) and split into tokens at
+//    `_`, `-`, `.` and spaces.
+// 2. A token `Condition` or `Cond` (any case) names the condition with the token after it,
+//    and `ConditionX` / `CondX` names it `X`: `..._Condition_A_REP1.mzML` gives `A`.
+// 3. Otherwise a final replicate token is removed (`REP1`, `rep_2`, `R3`, `run4`, `inj1`, a
+//    bare number), then the tokens every such file shares at the start and at the end.
+//    What is left, joined with `_`, is the condition: `HeLa_ctrl_01` and `HeLa_treat_02`
+//    give `ctrl` and `treat`.
+// 4. A file whose name leaves nothing in step 3 takes its name after the replicate token
+//    is removed.
+const COND_WORDS = new Set(["condition", "cond"]);
+const COND_JOINED = /^(?:condition|cond)([A-Za-z0-9]+)$/i;
+const REP_WORDS = new Set(["rep", "replicate", "r", "run", "inj", "injection", "tech", "techrep", "bio", "biorep"]);
+const REP_TOKEN = /^(?:rep|replicate|r|run|inj|injection|tech|techrep|bio|biorep|br|tr)?\d+$/i;
+
+function conditionTokens(path) {
+  let name = baseName(path).replace(/\.(?:gz|bz2|xz|zst|zip)$/i, "");
+  name = name.replace(/\.[A-Za-z][A-Za-z0-9]{0,5}$/, "");
+  return name.split(/[_\-.\s]+/).filter(Boolean);
+}
+
+function suggestConditions(files) {
+  const out = new Array(files.length).fill("");
+  const cores = [];
+  for (const [i, f] of files.entries()) {
+    const t = conditionTokens(f);
+    if (!t.length) {
+      out[i] = baseName(f);
+      continue;
+    }
+    let named = null;
+    for (const [k, tok] of t.entries()) {
+      if (COND_WORDS.has(tok.toLowerCase()) && k + 1 < t.length) {
+        named = t[k + 1];
+        break;
+      }
+      const m = COND_JOINED.exec(tok);
+      if (m) {
+        named = m[1];
+        break;
+      }
+    }
+    if (named !== null) {
+      out[i] = named;
+      continue;
+    }
+    let core = t;
+    if (t.length >= 3 && REP_WORDS.has(t[t.length - 2].toLowerCase()) && /^\d+$/.test(t[t.length - 1])) {
+      core = t.slice(0, -2);
+    } else if (t.length >= 2 && REP_TOKEN.test(t[t.length - 1])) {
+      core = t.slice(0, -1);
+    }
+    cores.push([i, core]);
+  }
+  if (cores.length) {
+    const lists = cores.map(([, c]) => c);
+    const n = Math.min(...lists.map((x) => x.length));
+    let pre = 0;
+    while (pre < n && lists.every((x) => x[pre] === lists[0][pre])) pre++;
+    let suf = 0;
+    while (
+      suf < n - pre &&
+      lists.every((x) => x[x.length - 1 - suf] === lists[0][lists[0].length - 1 - suf])
+    ) {
+      suf++;
+    }
+    for (const [i, c] of cores) {
+      const rest = c.slice(pre, c.length - suf);
+      out[i] = (rest.length ? rest : c).join("_");
+    }
+  }
+  return out;
+}
+
+// The condition of each selected file, in file order, trimmed ("" when it has none).
+function runConditions() {
+  return state.picks.mzml.map((f) => (state.picks.conditions[f] || "").trim());
+}
+
+const NORM_NOTES = {
+  none:
+    "No normalisation between runs: the cross-run quantities (lfq_<run> in proteins.tsv, " +
+    "normalised_<run> in precursors.tsv) are the runs' own quantities.",
+  all:
+    "One size factor per run, estimated over all runs (median of ratios). It assumes most " +
+    "proteins do not change between any two runs.",
+  condition:
+    "Size factors estimated within each condition's runs only: replicates are made " +
+    "comparable, and the differences between conditions stay as measured. A loading " +
+    "difference between conditions is not corrected.",
+};
+
+// The normalisation choice and its note, shown for an experiment of several files.
+function refreshNormOptions() {
+  const several = experimentWithSeveral();
+  show($("norm-options"), several);
+  for (const el of document.querySelectorAll("#mzml-list .fcond")) show(el, several);
+  if (!several) return;
+  const scope = $("norm-scope").value;
+  const conds = runConditions();
+  const labels = [...new Set(conds.filter(Boolean))];
+  $("condition-labels").innerHTML = labels
+    .map((c) => `<option value="${escHtml(c)}"></option>`)
+    .join("");
+  let note = NORM_NOTES[scope] || "";
+  if (scope === "condition") {
+    const missing = conds.filter((c) => !c).length;
+    if (missing) note += ` ${missing} file(s) have no condition yet.`;
+    else {
+      note += ` Conditions: ${labels
+        .map((c) => `${c} (${conds.filter((x) => x === c).length})`)
+        .join(", ")}.`;
+    }
+  }
+  $("norm-note").textContent = note;
+}
+
+// The configuration the normalisation choice adds: nothing at the default.
+function normOverrides() {
+  const scope = $("norm-scope").value;
+  return experimentWithSeveral() && scope !== "all"
+    ? { "quant.normalisation_scope": scope }
+    : {};
 }
 
 function currentRunMode() {
@@ -2284,6 +2451,15 @@ function searchProblems() {
       "The prescreen before prediction searches one file at a time. Choose \"Search each " +
         "separately\" for these files, or the prescreen after retention-time calibration."
     );
+  }
+  if (experimentWithSeveral() && $("norm-scope").value === "condition") {
+    const missing = state.picks.mzml.filter((f, i) => !runConditions()[i]);
+    if (missing.length) {
+      out.push(
+        "Normalisation within each condition needs the condition of every file. Without " +
+          `one: ${missing.map(baseName).join(", ")}.`
+      );
+    }
   }
   if (pre === "after" && $("bands").value === "custom" && customBands().bands > 1) {
     out.push(
@@ -3184,6 +3360,7 @@ async function startSearch() {
     ...(state.mode === "fasta" && !built ? digestOverrides() : {}),
     ...prescreenOverrides(),
     ...bandOverrides(bands),
+    ...normOverrides(),
     ...(libraryIrt ? { "rt_im_train.library_irt": libraryIrt } : {}),
   };
   if (Object.keys(overrides).length) {
@@ -3211,6 +3388,10 @@ async function startSearch() {
     // it checks element ids and command names, never payload types.
     mzml: p.mzml,
     experiment: currentRunMode() === "experiment",
+    // One per file, recorded in the manifest and read by the normalisation within each
+    // condition; empty when no file has one.
+    conditions:
+      currentRunMode() === "experiment" && runConditions().some(Boolean) ? runConditions() : [],
     out_dir: p.out_dir,
     fasta: state.mode === "fasta" && !built ? p.fasta || null : null,
     lib_precursors: built ? built[0] : state.mode === "library" ? p.lib_precursors || null : null,

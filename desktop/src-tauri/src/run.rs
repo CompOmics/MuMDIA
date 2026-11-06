@@ -172,6 +172,11 @@ pub struct Request {
     /// Ignored for a single file, where there is nothing to pool.
     #[serde(default)]
     pub experiment: bool,
+    /// The condition of each run of an experiment, one per entry of `mzml` (`--condition`);
+    /// an empty entry has none. Empty for no conditions. Read by the engine under
+    /// `quant.normalisation_scope = condition` and recorded in the manifest.
+    #[serde(default)]
+    pub conditions: Vec<String>,
     pub out_dir: String,
     /// FASTA mode. Mutually exclusive with the library pair.
     pub fasta: Option<String>,
@@ -697,6 +702,20 @@ fn argv(req: &Request) -> Result<Vec<String>, String> {
     for m in &req.mzml {
         a.push("--mzml".into());
         a.push(m.clone());
+    }
+    // One `--condition` per run, in the order of the files, when any run has one.
+    if req.experiment && req.conditions.iter().any(|c| !c.trim().is_empty()) {
+        if req.conditions.len() != req.mzml.len() {
+            return Err(format!(
+                "{} conditions were given for {} files; give one per file",
+                req.conditions.len(),
+                req.mzml.len()
+            ));
+        }
+        for c in &req.conditions {
+            a.push("--condition".into());
+            a.push(c.trim().to_string());
+        }
     }
     a.push("--out-dir".into());
     a.push(req.out_dir.clone());
@@ -1512,6 +1531,7 @@ mod tests {
         Request {
             mzml: vec!["a.mzML".into()],
             experiment: false,
+            conditions: Vec::new(),
             out_dir: "out".into(),
             fasta: None,
             lib_precursors: None,
@@ -2497,6 +2517,7 @@ mod multifile_tests {
         Request {
             mzml: vec!["a.mzML".into()],
             experiment: false,
+            conditions: Vec::new(),
             out_dir: "out".into(),
             fasta: Some("f.fasta".into()),
             lib_precursors: None,
@@ -2549,6 +2570,31 @@ mod multifile_tests {
         r.experiment = false;
         let e = argv(&r).unwrap_err();
         assert!(e.contains("search them separately"), "{e}");
+    }
+
+    /// The conditions go to the engine as one `--condition` per file, in file order, and only
+    /// for an experiment where any file has one; a count that does not match is refused.
+    #[test]
+    fn an_experiment_passes_one_condition_per_file() {
+        let mut r = req();
+        r.mzml = vec!["a.mzML".into(), "b.mzML".into(), "c.mzML".into()];
+        r.experiment = true;
+        let plain = argv(&r).unwrap();
+        assert!(!plain.iter().any(|x| x == "--condition"));
+        r.conditions = vec!["".into(), " ".into(), "".into()];
+        assert!(!argv(&r).unwrap().iter().any(|x| x == "--condition"));
+        r.conditions = vec!["A".into(), " A ".into(), "B".into()];
+        let a = argv(&r).unwrap();
+        let conds: Vec<&str> = a
+            .windows(2)
+            .filter(|w| w[0] == "--condition")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(conds, ["A", "A", "B"]);
+        r.conditions = vec!["A".into(), "B".into()];
+        assert!(argv(&r)
+            .unwrap_err()
+            .contains("2 conditions were given for 3 files"));
     }
 
     #[test]

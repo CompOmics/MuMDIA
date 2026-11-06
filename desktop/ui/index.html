@@ -295,6 +295,24 @@
             The files share nothing, and the counts are not additive.
           </span>
         </label>
+        <div id="norm-options">
+          <div class="grid2">
+            <div class="row">
+              <label for="norm-scope">Normalisation</label>
+              <select id="norm-scope">
+                <option value="none">None</option>
+                <option value="all" selected>All samples</option>
+                <option value="condition">Within each condition</option>
+              </select>
+            </div>
+            <div class="row">
+              <label for="suggest-conditions">Conditions</label>
+              <button type="button" class="btn quiet" id="suggest-conditions">Suggest from the file names</button>
+            </div>
+          </div>
+          <p class="hint" id="norm-note"></p>
+          <datalist id="condition-labels"></datalist>
+        </div>
       </div>
       <div class="notice" id="raw-note" hidden>
         <div class="notice-title" id="raw-note-title">Vendor format</div>
