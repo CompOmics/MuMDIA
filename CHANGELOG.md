@@ -382,8 +382,11 @@ than a number. Both are recorded in every run's `manifest.json`.
   to read `experiment.runs` or `experiment.peptide_quants` instead (CompOmics/MuMDIA#274).
 - **The desktop application pins visDIA at cb8b5bc.** Over c674f9f it adds the ion-mobility
   views (CompOmics/visDIA#8), a mobilogram card on the precursor page of diaPASEF runs (#9)
-  and the fragments behind each quantity, read from `quant_fragments.parquet` (#10), and
-  caps duckdb below 2 and dash-mantine-components below 3. An existing visDIA environment is
+  and the fragments behind each quantity, read from `quant_fragments.parquet` (#10), sizes
+  DuckDB's memory limit to the machine (#11), notes an output pruned to a retention tier
+  (#12), orders run folders named after their inputs (#13) and keeps the Quant QC
+  conditions a user set when the page is built again (#14, #283), and caps duckdb below 2
+  and dash-mantine-components below 3. An existing visDIA environment is
   reported outdated (`mumdia-viewer c674f9f -> cb8b5bc`) and the Setup screen offers the
   update. Checked with a fresh install on a 12-run diaPASEF second-pass experiment and on
   the smoke fixture with `quant.fragment_detail` (env/console-visdia-requirements.txt).
