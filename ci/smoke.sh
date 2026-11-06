@@ -1549,7 +1549,7 @@ echo "=== smoke: assertions"
 # and so reads as a pass.
 "$PY" ci/check_smoke.py --out-dir "$work/out" --planted "$work/planted.json" \
     --compare-peptides "$work/out2/peptides.tsv" --experiment "$work/exp" \
-    --min-assertions 136
+    --min-assertions 149
 
 echo "=== smoke: also check inspect and report run standalone"
 "$BIN" inspect "$work/out/psms_scored.parquet" > /dev/null

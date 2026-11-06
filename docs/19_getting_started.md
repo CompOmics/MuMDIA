@@ -30,7 +30,7 @@ ci/smoke.sh
 
 It builds a small synthetic library from `test_data/fixture.fasta`, generates a
 matching mzML, runs the full single-run pipeline over it twice, runs `run-experiment` over two
-copies of it, and asserts 136 things about the result, including that the two
+copies of it, and asserts 149 things about the result, including that the two
 single runs are byte-identical and that the by-run split of the pooled rescore
 accounts for every row. It needs a
 built `mumdia` binary (found automatically, or set `MUMDIA_BIN`) and a Python with
@@ -391,7 +391,7 @@ Verify the requested sidecars through their logs and
 Treat the Section 4 counts as regression targets on
 `LFQ_Orbitrap_AIF_Ecoli_01.mzML`:
 
-- The fixture smoke test (`ci/smoke.sh`), which needs no external data: 136
+- The fixture smoke test (`ci/smoke.sh`), which needs no external data: 149
   assertions. Run this first; it fails faster and more specifically than any count
   below.
 - Native FASTA run (`--profile dia`): approximately 1,213 precursor-shaped
