@@ -862,11 +862,11 @@ must not inherit the winner's q. Deduplicated peptide, precursor, and
 protein-group counts are unaffected because they select the winner anyway.
 
 One further caveat applies to `precursor_q` specifically. It groups on
-`(peptidoform, charge)` over the rows that reach rescore, and under the default
+`(peptidoform, charge)` over the rows that reach rescore. Under the default
+`compete.group_by = peptidoform_charge` that is a genuine precursor unit; under
 `compete.group_by = base_peptide` competition has already collapsed the charge and
 modification siblings by stripped peptide, so the surviving population holds
-roughly one form per peptide and the column then reports a base-peptide count.
-It is a genuine precursor unit only under `compete.group_by = peptidoform_charge`
+roughly one form per peptide and the column then reports a base-peptide count
 (docs/11_compete_rescore_fdr.md).
 
 The consequence for multi-run work is that grouping in an experiment-wide rescore
@@ -1174,17 +1174,21 @@ Each `ArtifactRecord`:
 
 ---
 
-## TSV reports (`peptides.tsv`, `proteins.tsv`)
+## TSV reports (`peptides.tsv`, `precursors.tsv`, `proteins.tsv`)
 
 Not Parquet, but these are the files most users actually read, so they are
 documented here rather than left to the source. Written by `report`
 (`stages/report.rs`): `report::run` inside `run` and the `mumdia report` handler,
 and `report::run_experiment` inside `run-experiment` (also `mumdia report
---experiment-dir`), which writes one experiment-wide pair at the experiment root
+--experiment-dir`), which writes one experiment-wide set at the experiment root
 with an `n_runs` column and one quantity column per run and no per-run TSVs; take
 per-run counts from the per-run split `scored.parquet` tables on `run_psm_q`.
 
-**Acceptance rule, both writers.** A row is written when it is a target and either
+Each file selects on a different q column, and its `q_value` column is that one:
+`peptide_q_value` in `peptides.tsv`, `precursor_q` in `precursors.tsv`, `pg_q_value`
+in `proteins.tsv`. Name the file and the column when quoting a count.
+
+**Acceptance rule, every writer.** A row is written when it is a target and either
 its grouped q is at or under the threshold or it is flagged `is_transferred` by
 `mumdia mbr`. The two columns `is_transferred` and `transfer_q` export that basis
 (docs/29 #19): a transferred row keeps its grouped q, which is usually 1.0, and a
@@ -1221,6 +1225,43 @@ most common misreading of MuMDIA output: rows are precursors
 which is a base-peptide q. A row count is therefore **not** a
 precursor-q-controlled count. The stage logs both numbers, `precursors` and
 `stripped_sequences` (`report.rs:149-154`); quote whichever you mean and name it.
+
+### `precursors.tsv`
+
+One row per confident precursor `(peptidoform, charge)`, the precursor-level counterpart
+of `peptides.tsv`. Targets only, filtered on `precursor_q <= --q` (or transferred), best
+`precursor_q` first, deduplicated on `(peptidoform, charge)`. Every accepted precursor of a
+peptide is listed, not only the peptide's best one. Under an experiment-wide rescore
+`precursor_q` is experiment-wide and written to a single row per precursor across all
+runs, so the experiment table has one row per precursor. Under `compete.group_by =
+base_peptide` competition already deleted the siblings and `precursor_q` counts base
+peptides (docs/11), so the file then has about as many rows as `peptides.tsv`.
+
+| column | source | notes |
+|---|---|---|
+| `precursor` | `peptidoform` | ProForma peptidoform, modifications included |
+| `stripped_sequence` | `strip(peptidoform)` | as in `peptides.tsv` |
+| `charge` | `charge` | precursor charge |
+| `precursor_mz` | computed | theoretical monoisotopic m/z of the peptidoform at its charge from the shared mass model (`mumdia_core::mass`), five decimals; empty when the peptidoform does not parse |
+| `protein` | `protein` | the PSM's protein string |
+| `protein_group` | `protein_group` | accession set as grouped by rescore |
+| `q_value` | `precursor_q` | **precursor** q, six decimals |
+| `peptide_q_value` | `peptide_q_value` of the base peptide's winning row | the q of the base peptide this precursor belongs to, not a per-row value: the stored column is 1.0 on every row but the winner, so it is read from the winner (1.0 when no target row of the peptide won) |
+| `protein_group_q_value` | `pg_q_value` of the protein group's winning row | the q of the group the row belongs to, read the same way |
+| `score` | `score` | rescorer score of the reported row, four decimals |
+| `apex_rt` | `apex_rt` | single run only: apex retention time of the reported row, seconds, two decimals |
+| `quantity` | `peptide_quant.parquet` joined on `(peptidoform, charge)` | single run only; empty when not quantifiable or no `--peptide-quant` was passed |
+| `n_runs` | `run_psm_q` | experiment only: runs in which the precursor has a target PSM at `run_psm_q <= --q` |
+| `quantity_<run>` | each run's `peptide_quant.parquet` | experiment only, one column per run, as in `peptides.tsv` |
+| `normalised_<run>` | `lfq_maxlfq.parquet.precursor.parquet` | experiment only, one column per run: the cross-run normalised precursor quantity, empty where the matrix holds 0 (its value for a run without a quantity); the columns are absent when the experiment has no precursor LFQ matrix |
+| `first_pass_<run>` | each run's `first_pass_id` | experiment only, when every run's `peptide_quant` carries it, as in `peptides.tsv` |
+| `is_transferred`, `transfer_q` | as in `peptides.tsv` | the acceptance basis |
+
+The localisation columns of `peptides.tsv` follow when the `localise` stage ran.
+`run-experiment` records the file as `experiment.report.precursors` and its row count as
+`experiment.report.n_precursor_rows` in `experiment_manifest.json`;
+`experiment.report.n_precursors` is the row count of `peptides.tsv` (precursor-shaped rows
+selected on `peptide_q_value`) and keeps that meaning.
 
 ### `proteins.tsv` (`report.rs:133-146`)
 

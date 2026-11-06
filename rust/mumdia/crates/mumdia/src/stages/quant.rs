@@ -96,6 +96,18 @@ pub struct QuantParams<'a> {
 /// identification in its run (`mbr.first_pass_flag`).
 pub const FIRST_PASS_ID: &str = "first_pass_id";
 
+/// The cross-run precursor matrix `quant-lfq` writes next to the protein matrix at `lfq`.
+pub fn precursor_lfq_path(lfq: &str) -> String {
+    format!("{lfq}.precursor.parquet")
+}
+
+/// [`precursor_lfq_path`] when that file exists (an experiment from before the sibling
+/// matrices has none).
+pub fn precursor_lfq_sibling(lfq: &str) -> Option<String> {
+    let p = precursor_lfq_path(lfq);
+    std::path::Path::new(&p).is_file().then_some(p)
+}
+
 /// The candidate ids of a second-pass run whose precursor the first pass identified in the
 /// same run: every id `c` of the empirical library whose entry `entry_of[c]` is in
 /// `first_pass_accepted` for `source` (`(source, first-pass candidate_id)` pairs at
@@ -4253,7 +4265,7 @@ pub fn run_lfq_combine(
         Ok(())
     };
     write_level(
-        format!("{out}.precursor.parquet"),
+        precursor_lfq_path(out),
         prec.into_iter().map(|((p, z), m)| (p, z, m)).collect(),
     )?;
     write_level(

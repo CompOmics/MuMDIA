@@ -527,22 +527,24 @@ fine-tuning also is not guaranteed deterministic.
   `q_value` -- which is what `run-experiment` gates quant on -- is not.
 - Reported benchmark counts must name their row and q-value unit. `peptides.tsv`
   contains `(peptidoform, charge)` rows but is selected with
-  `peptide_q_value`; it is not a precursor-q report.
+  `peptide_q_value`; it is not a precursor-q report. `precursors.tsv` is: every target
+  `(peptidoform, charge)` at `precursor_q`, with the peptide and protein-group q read
+  from each group's winning row.
 - Validate new sensitivity defaults with entrapment or another empirical null,
   plus at least two datasets/acquisition contexts. Count gains alone are
   insufficient.
 
 ### Experiment-wide rescore
 
-- `run-experiment` writes one experiment-wide `peptides.tsv` and `proteins.tsv`
-  at the experiment root (`report::run_experiment`): rows selected on the
-  experiment-wide `peptide_q_value` / `pg_q_value`, an `n_runs` column counting
+- `run-experiment` writes one experiment-wide `peptides.tsv`, `precursors.tsv` and
+  `proteins.tsv` at the experiment root (`report::run_experiment`): rows selected on the
+  experiment-wide `peptide_q_value` / `precursor_q` / `pg_q_value`, an `n_runs` column counting
   per-run acceptances on `run_psm_q`, and one quantity column per run
   (`quantity_<run>` from each run's quant, `lfq_<run>` from the cross-run MaxLFQ
   matrix). It writes no per-run TSVs, because the grouped q columns are written
   to each group's experiment-wide winner only. Per-run counts come from the
   split scored tables on `run_psm_q`; `mumdia report --experiment-dir` rewrites
-  the experiment-wide pair at another threshold.
+  the experiment-wide set at another threshold.
 - `run-experiment` overrides the configured `quant.q_filter` and gates per-run
   quant on the pooled `q_value`. It warns rather than doing so silently.
 - `run-experiment` matches between runs by default (`mbr.strategy = second_pass`, since

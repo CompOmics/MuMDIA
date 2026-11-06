@@ -115,7 +115,7 @@ library (predicted library, import, paired decoys with predicted spectra) is des
 
 | file | contents |
 |---|---|
-| `peptides.tsv`, `proteins.tsv` | identified precursors and protein groups, for reading |
+| `peptides.tsv`, `precursors.tsv`, `proteins.tsv` | identified peptides, precursors and protein groups, for reading |
 | `psms_scored.parquet` | every scored PSM with all q columns; the unit for analysis |
 | `peptide_quant.parquet`, `protein_group_quant.parquet` | quantities for analysis |
 | `lfq_maxlfq.parquet` | cross-run protein matrix (experiments) |
@@ -124,7 +124,9 @@ library (predicted library, import, paired decoys with predicted spectra) is des
 Use the Parquet tables for analysis; the TSVs are rounded for reading. Each q column
 controls its own row unit (`run_psm_q` per run, `precursor_q` per precursor,
 `peptide_q_value` per peptide, `pg_q_value` per protein group), so name the column with
-any count. `peptides.tsv` lists precursors but is filtered on the peptide-level q. In an
+any count. `peptides.tsv` lists precursors but is filtered on the peptide-level q, so it
+holds about one precursor per peptide; `precursors.tsv` lists every precursor accepted on
+`precursor_q`. In an
 experiment the TSVs are experiment-wide, with one quantity column per run. Details in
 [`docs/11_compete_rescore_fdr.md`](docs/11_compete_rescore_fdr.md) and
 [`docs/15_data_dictionary.md`](docs/15_data_dictionary.md).

@@ -7,6 +7,13 @@
 //! `run_experiment` is the pooled-rescore counterpart: the same two files for a whole
 //! `run-experiment`, selected on the experiment-wide q columns, with one quantity
 //! column per run.
+//!
+//! precursors.tsv: one row per confident (target, `precursor_q` <= threshold)
+//! peptidoform+charge, the precursor-level counterpart of peptides.tsv. peptides.tsv is
+//! selected on the base-peptide `peptide_q_value`, which is written to each base peptide's
+//! single winning row, so it holds about one precursor per peptide; precursors.tsv holds
+//! every accepted precursor, with the peptide and protein-group q of the groups it belongs
+//! to read from their winning rows.
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
@@ -19,7 +26,174 @@ pub struct ReportParams<'a> {
     pub protein_quant: Option<&'a str>,
     pub out_peptides: &'a str,
     pub out_proteins: &'a str,
+    /// Where `precursors.tsv` goes; `None` writes only the two files above.
+    pub out_precursors: Option<&'a str>,
     pub q_threshold: f64,
+}
+
+/// What a report wrote: the rows of `peptides.tsv` and `proteins.tsv`, and of
+/// `precursors.tsv` when it was written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReportCounts {
+    /// Rows of `peptides.tsv`: precursor-shaped rows selected on `peptide_q_value`.
+    pub peptide_rows: u64,
+    pub protein_groups: u64,
+    /// Rows of `precursors.tsv` (selected on `precursor_q`), `None` when it was not
+    /// written (not requested, or a scored table without a `precursor_q` column).
+    pub precursor_rows: Option<u64>,
+}
+
+/// The `precursors.tsv` header cells every mode starts with.
+const PRECURSOR_HEADER_HEAD: &str = "precursor\tstripped_sequence\tcharge\tprecursor_mz\tprotein\t\
+     protein_group\tq_value\tpeptide_q_value\tprotein_group_q_value\tscore";
+
+/// The theoretical monoisotopic precursor m/z of `pf` at `charge`, from the shared mass
+/// model, or an empty cell when the peptidoform does not parse (a modification the
+/// catalogue does not name).
+fn precursor_mz_cell(pf: &str, charge: i32) -> String {
+    if charge <= 0 {
+        return String::new();
+    }
+    mumdia_core::mass::parse_peptidoform(pf)
+        .map(|p| format!("{:.5}", p.precursor_mz(charge)))
+        .unwrap_or_default()
+}
+
+/// The grouped q every target group carries on its winning row, by group key.
+///
+/// `rescore` writes a grouped q (`peptide_q_value`, `pg_q_value`) to the single winning
+/// row of each group and 1.0 to every other row, so copying the stored cell would give
+/// 1.0 to every precursor of an accepted peptide that is not the peptide's winner. This
+/// reads the rows whose stored value is below 1.0 (the winners) once, keyed by the
+/// group, and keeps the smallest; a group with no such row has q 1.0. Only targets are
+/// read: a target and its paired decoy share `base_peptide_id`, and a group a decoy won
+/// leaves its targets at 1.0, which is what they are reported at.
+struct GroupQ {
+    peptide: HashMap<u32, f64>,
+    protein_group: HashMap<String, f64>,
+}
+
+impl GroupQ {
+    fn read(t: &TableFile) -> Result<GroupQ> {
+        let target = t.str_eq("label", "target")?;
+        let winners = |col: &str| -> Result<(Vec<usize>, Vec<f64>)> {
+            let (mut rows, mut qs) = (Vec::new(), Vec::new());
+            t.visit_f64(col, |first, v| {
+                for (k, &q) in v.iter().enumerate() {
+                    let i = first + k;
+                    if q < 1.0 && target.get(i).copied().unwrap_or(false) {
+                        rows.push(i);
+                        qs.push(q);
+                    }
+                }
+                Ok(())
+            })?;
+            Ok((rows, qs))
+        };
+        let (rows, qs) = winners("peptide_q_value")?;
+        let base = t.u32_rows("base_peptide_id", &rows)?;
+        let mut peptide: HashMap<u32, f64> = HashMap::new();
+        for (b, q) in base.into_iter().zip(qs) {
+            let e = peptide.entry(b).or_insert(q);
+            *e = e.min(q);
+        }
+        let (rows, qs) = winners("pg_q_value")?;
+        let pg = t.str_rows("protein_group", &rows)?;
+        let mut protein_group: HashMap<String, f64> = HashMap::new();
+        for (g, q) in pg.into_iter().zip(qs) {
+            let e = protein_group.entry(g).or_insert(q);
+            *e = e.min(q);
+        }
+        Ok(GroupQ {
+            peptide,
+            protein_group,
+        })
+    }
+
+    fn peptide(&self, base: u32) -> f64 {
+        self.peptide.get(&base).copied().unwrap_or(1.0)
+    }
+
+    fn protein_group(&self, pg: &str) -> f64 {
+        self.protein_group.get(pg).copied().unwrap_or(1.0)
+    }
+}
+
+/// The columns of the printable rows `precursors.tsv` needs beyond those of
+/// `peptides.tsv`, read only when it is written.
+struct PrecursorCols {
+    prec_q: Vec<f64>,
+    base: Vec<u32>,
+    groups: GroupQ,
+}
+
+impl PrecursorCols {
+    fn read(t: &TableFile, rows: &[usize]) -> Result<PrecursorCols> {
+        Ok(PrecursorCols {
+            prec_q: t.f64_rows("precursor_q", rows)?,
+            base: t.u32_rows("base_peptide_id", rows)?,
+            groups: GroupQ::read(t)?,
+        })
+    }
+}
+
+/// Whether a report asked for `precursors.tsv` can write it from `t`: a scored table
+/// from before `precursor_q` existed cannot, and is reported without it, loudly.
+fn precursors_writable(t: &TableFile, out: Option<&str>, scored: &str) -> bool {
+    match out {
+        None => false,
+        Some(_) if t.has_column("precursor_q") => true,
+        Some(path) => {
+            tracing::warn!(
+                scored,
+                skipped = path,
+                "report: the scored table has no `precursor_q` column (written before it \
+                 existed); precursors.tsv is not written"
+            );
+            false
+        }
+    }
+}
+
+/// The rows of `precursors.tsv`, in print order: accepted on `precursor_q` (or
+/// transferred, the rule of both other files), best `precursor_q` first (stable, so ties
+/// keep file order), unique by (peptidoform, charge).
+fn precursor_order(
+    pform: &[String],
+    charge: &[i32],
+    prec_q: &[f64],
+    is_transferred: &[bool],
+    q_threshold: f64,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..prec_q.len())
+        .filter(|&j| is_transferred[j] || prec_q[j] <= q_threshold)
+        .collect();
+    order.sort_by(|&a, &b| prec_q[a].total_cmp(&prec_q[b]));
+    let mut seen: HashSet<(&str, i32)> = HashSet::new();
+    order.retain(|&j| seen.insert((pform[j].as_str(), charge[j])));
+    order
+}
+
+/// The ten cells every `precursors.tsv` row starts with (see [`PRECURSOR_HEADER_HEAD`]).
+#[allow(clippy::too_many_arguments)]
+fn precursor_head_cells(
+    w: &mut impl Write,
+    pf: &str,
+    charge: i32,
+    protein: &str,
+    pg: &str,
+    prec_q: f64,
+    pep_q: f64,
+    pg_q: f64,
+    score: f64,
+) -> Result<()> {
+    write!(
+        w,
+        "{pf}\t{}\t{charge}\t{}\t{protein}\t{pg}\t{prec_q:.6}\t{pep_q:.6}\t{pg_q:.6}\t{score:.4}",
+        strip(pf),
+        precursor_mz_cell(pf, charge),
+    )?;
+    Ok(())
 }
 
 /// Stripped amino-acid sequence: drop a DECOY_ prefix and any bracketed/
@@ -135,21 +309,31 @@ fn printable_rows(
 /// that the one-pass report did; the rows it skipped were never written, so both TSVs
 /// are byte-identical to its output.
 pub fn run(p: ReportParams) -> Result<(u64, u64)> {
-    run_localised(p, None)
+    let c = run_localised(p, None)?;
+    Ok((c.peptide_rows, c.protein_groups))
 }
 
 /// [`run`], with the `localise` stage's tables: three more `peptides.tsv` columns
 /// (`site_probability`, `localised`, `best_site_peptidoform`) and `sites.tsv`. `None` writes
 /// exactly what [`run`] writes.
-pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<(u64, u64)> {
+///
+/// With `out_precursors`, also `precursors.tsv`. Its rows are added to the printable set
+/// of pass 1 (`precursor_q` joins the q columns), which leaves both other files
+/// byte-identical: every loop below filters on its own q before it prints or dedups, and
+/// the stable sorts keep the relative order of the rows each one prints.
+pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<ReportCounts> {
     let t = TableFile::open(p.scored)?;
+    let with_precursors = precursors_writable(&t, p.out_precursors, p.scored);
     // Match-between-runs acceptance, when this table has been through `mumdia mbr`.
     // MBR lowers the three PSM-level q columns and neither of the two grouped columns
     // this stage filters on, so without this a `mumdia mbr` followed by `mumdia report`
     // showed no transfers at all. Same contract as `quant`: a transfer has already
     // passed `mbr.q_transfer`, and a decoy is still never reported.
-    let (rows, is_transferred) =
-        printable_rows(&t, &["peptide_q_value", "pg_q_value"], p.q_threshold)?;
+    let mut q_cols = vec!["peptide_q_value", "pg_q_value"];
+    if with_precursors {
+        q_cols.push("precursor_q");
+    }
+    let (rows, is_transferred) = printable_rows(&t, &q_cols, p.q_threshold)?;
     let pform = t.str_rows("peptidoform", &rows)?;
     let charge = t.i32_rows("charge", &rows)?;
     let protein = t.str_rows("protein", &rows)?;
@@ -158,6 +342,11 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<(u64
     let pg_q = t.f64_rows("pg_q_value", &rows)?;
     let score = t.f64_rows("score", &rows)?;
     let transfer_q = transfer_q_rows(&t, &rows)?;
+    let prec_cols = if with_precursors {
+        Some(PrecursorCols::read(&t, &rows)?)
+    } else {
+        None
+    };
     let m = rows.len();
     // Every printable row is a target (pass 1), so this is the one-pass rule
     // `label == "target" && (is_transferred || q <= threshold)` on them.
@@ -297,6 +486,59 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<(u64
     drop(w2);
     prot_target.publish()?;
 
+    // Precursors: every accepted (peptidoform, charge) on `precursor_q`, with the q of
+    // its base peptide and protein group read from their winning rows.
+    let mut nprec: Option<u64> = None;
+    if let (Some(out), Some(pc)) = (p.out_precursors, &prec_cols) {
+        let apex_rt = if t.has_column("apex_rt") {
+            t.f64_rows("apex_rt", &rows)?
+        } else {
+            vec![f64::NAN; m]
+        };
+        let order = precursor_order(&pform, &charge, &pc.prec_q, &is_transferred, p.q_threshold);
+        let target = mumdia_io::table::AtomicPath::new(out)?;
+        let mut w3 = std::io::BufWriter::new(std::fs::File::create(target.tmp())?);
+        write!(
+            w3,
+            "{PRECURSOR_HEADER_HEAD}\tapex_rt\tquantity\tis_transferred\ttransfer_q"
+        )?;
+        if let Some(c) = &site_cells {
+            write!(w3, "{}", c.header())?;
+        }
+        writeln!(w3)?;
+        for &j in &order {
+            precursor_head_cells(
+                &mut w3,
+                &pform[j],
+                charge[j],
+                &protein[j],
+                &pg[j],
+                pc.prec_q[j],
+                pc.groups.peptide(pc.base[j]),
+                pc.groups.protein_group(&pg[j]),
+                score[j],
+            )?;
+            let rt = if apex_rt[j].is_finite() {
+                format!("{:.2}", apex_rt[j])
+            } else {
+                String::new()
+            };
+            let qv = pep_quant
+                .get(&(pform[j].clone(), charge[j]))
+                .copied()
+                .unwrap_or(f64::NAN);
+            write!(w3, "\t{rt}\t{}{}", qcell(qv), transfer_cells(j))?;
+            if let Some(cells) = &site_cells {
+                write!(w3, "{}", cells.cells(0, &pform[j], charge[j]))?;
+            }
+            writeln!(w3)?;
+        }
+        w3.flush()?;
+        drop(w3);
+        target.publish()?;
+        nprec = Some(order.len() as u64);
+    }
+
     if let Some(l) = loc {
         l.write_sites()?;
     }
@@ -308,7 +550,17 @@ pub fn run_localised(p: ReportParams, loc: Option<&Localisation>) -> Result<(u64
         scored_rows = t.nrows,
         "report: done (peptides.tsv rows are precursors, not stripped sequences)"
     );
-    Ok((npep, nprot))
+    if let Some(n) = nprec {
+        tracing::info!(
+            precursors_at_precursor_q = n,
+            "report: precursors.tsv (rows selected on precursor_q)"
+        );
+    }
+    Ok(ReportCounts {
+        peptide_rows: npep,
+        protein_groups: nprot,
+        precursor_rows: nprec,
+    })
 }
 
 /// Inputs for the experiment-wide report `run-experiment` writes at its root.
@@ -324,8 +576,14 @@ pub struct ExperimentReportParams<'a> {
     /// The cross-run protein matrix (`lfq_maxlfq.parquet`: protein_group, run, quantity),
     /// whose normalised MaxLFQ quantities fill the per-run protein columns.
     pub protein_lfq: Option<&'a str>,
+    /// The cross-run precursor matrix (`lfq_maxlfq.parquet.precursor.parquet`: group,
+    /// charge, run, quantity), whose normalised quantities fill the `normalised_<run>`
+    /// columns of `precursors.tsv`. `None` writes no such columns.
+    pub precursor_lfq: Option<&'a str>,
     pub out_peptides: &'a str,
     pub out_proteins: &'a str,
+    /// Where `precursors.tsv` goes; `None` writes only the two files above.
+    pub out_precursors: Option<&'a str>,
     pub q_threshold: f64,
 }
 
@@ -344,17 +602,23 @@ pub struct ExperimentReportParams<'a> {
 ///
 /// Read in two passes, as [`run`] is, with byte-identical output.
 pub fn run_experiment(p: ExperimentReportParams) -> Result<(u64, u64)> {
-    run_experiment_localised(p, None)
+    let c = run_experiment_localised(p, None)?;
+    Ok((c.peptide_rows, c.protein_groups))
 }
 
 /// [`run_experiment`], with each run's `localise` table: the three localisation columns of
 /// `peptides.tsv` come from the run of the row the precursor is reported on (its
 /// experiment-wide winner), and `sites.tsv` pools the runs. `None` writes exactly what
 /// [`run_experiment`] writes.
+///
+/// With `out_precursors`, also the experiment-wide `precursors.tsv`: rows selected on the
+/// experiment-wide `precursor_q`, which `rescore` writes to the single winning row of each
+/// precursor across all runs, so the table has one row per precursor. Both other files
+/// keep their bytes (see [`run_localised`]).
 pub fn run_experiment_localised(
     p: ExperimentReportParams,
     loc: Option<&Localisation>,
-) -> Result<(u64, u64)> {
+) -> Result<ReportCounts> {
     let n_runs = p.run_names.len();
     if !p.peptide_quants.is_empty() && p.peptide_quants.len() != n_runs {
         anyhow::bail!(
@@ -363,14 +627,15 @@ pub fn run_experiment_localised(
         );
     }
     let t = TableFile::open(p.scored)?;
+    let with_precursors = precursors_writable(&t, p.out_precursors, p.scored);
     // Two passes, as in `run`: the printable rows (a target, transferred or at the
     // threshold on the experiment-wide peptide or protein-group q, or on its own
     // `run_psm_q` for `n_runs`), then their printed columns only.
-    let (rows, is_transferred) = printable_rows(
-        &t,
-        &["peptide_q_value", "pg_q_value", "run_psm_q"],
-        p.q_threshold,
-    )?;
+    let mut q_cols = vec!["peptide_q_value", "pg_q_value", "run_psm_q"];
+    if with_precursors {
+        q_cols.push("precursor_q");
+    }
+    let (rows, is_transferred) = printable_rows(&t, &q_cols, p.q_threshold)?;
     let pform = t.str_rows("peptidoform", &rows)?;
     let charge = t.i32_rows("charge", &rows)?;
     let protein = t.str_rows("protein", &rows)?;
@@ -381,6 +646,11 @@ pub fn run_experiment_localised(
     let source = t.u32_rows("source", &rows)?;
     let run_q = t.f64_rows("run_psm_q", &rows)?;
     let transfer_q = transfer_q_rows(&t, &rows)?;
+    let prec_cols = if with_precursors {
+        Some(PrecursorCols::read(&t, &rows)?)
+    } else {
+        None
+    };
     let m = rows.len();
     // Every printable row is a target, so this is the one-pass rule on them.
     let accepted = |j: usize, q: &[f64]| is_transferred[j] || q[j] <= p.q_threshold;
@@ -603,6 +873,100 @@ pub fn run_experiment_localised(
     drop(w2);
     prot_target.publish()?;
 
+    // Precursors: every accepted (peptidoform, charge) on the experiment-wide
+    // `precursor_q`, one row each (its winning row across the runs), with `n_runs` on
+    // `run_psm_q` and the per-run columns of peptides.tsv plus the cross-run normalised
+    // precursor quantity.
+    let mut nprec: Option<u64> = None;
+    if let (Some(out), Some(pc)) = (p.out_precursors, &prec_cols) {
+        let mut prec_lfq: HashMap<(String, i32), Vec<f64>> = HashMap::new();
+        if let Some(path) = p.precursor_lfq {
+            let l = TableFile::open(path)?;
+            let lg = l.str("group")?;
+            let lz = l.i32("charge")?;
+            let lr = l.i32("run")?;
+            let lq = l.f64("quantity")?;
+            for i in 0..l.nrows {
+                if lr[i] < 0 || lr[i] as usize >= n_runs {
+                    continue;
+                }
+                prec_lfq
+                    .entry((lg[i].clone(), lz[i]))
+                    .or_insert_with(|| vec![f64::NAN; n_runs])[lr[i] as usize] = lq[i];
+            }
+        }
+        let order = precursor_order(&pform, &charge, &pc.prec_q, &is_transferred, p.q_threshold);
+        let target = mumdia_io::table::AtomicPath::new(out)?;
+        let mut w3 = std::io::BufWriter::new(std::fs::File::create(target.tmp())?);
+        write!(w3, "{PRECURSOR_HEADER_HEAD}\tn_runs")?;
+        if !pep_quant.is_empty() {
+            for name in p.run_names {
+                write!(w3, "\tquantity_{name}")?;
+            }
+        }
+        if p.precursor_lfq.is_some() {
+            for name in p.run_names {
+                write!(w3, "\tnormalised_{name}")?;
+            }
+        }
+        for name in p.run_names.iter().take(pep_first.len()) {
+            write!(w3, "\tfirst_pass_{name}")?;
+        }
+        write!(w3, "\tis_transferred\ttransfer_q")?;
+        if let Some(c) = &site_cells {
+            write!(w3, "{}", c.header())?;
+        }
+        writeln!(w3)?;
+        let none = vec![f64::NAN; n_runs];
+        for &j in &order {
+            precursor_head_cells(
+                &mut w3,
+                &pform[j],
+                charge[j],
+                &protein[j],
+                &pg[j],
+                pc.prec_q[j],
+                pc.groups.peptide(pc.base[j]),
+                pc.groups.protein_group(&pg[j]),
+                score[j],
+            )?;
+            let key = (pform[j].clone(), charge[j]);
+            write!(w3, "\t{}", count(pep_runs.get(&key)))?;
+            for quant in &pep_quant {
+                write!(
+                    w3,
+                    "\t{}",
+                    qcell(quant.get(&key).copied().unwrap_or(f64::NAN))
+                )?;
+            }
+            if p.precursor_lfq.is_some() {
+                // The matrix stores 0 for a run in which the precursor has no quantity;
+                // that is a missing value, not an abundance of zero, so it prints empty,
+                // as an unquantified `quantity_<run>` does.
+                for &x in prec_lfq.get(&key).unwrap_or(&none) {
+                    let x = if x > 0.0 { x } else { f64::NAN };
+                    write!(w3, "\t{}", qcell(x))?;
+                }
+            }
+            for flags in &pep_first {
+                match flags.get(&key) {
+                    Some(true) => write!(w3, "\ttrue")?,
+                    Some(false) => write!(w3, "\tfalse")?,
+                    None => write!(w3, "\t")?,
+                }
+            }
+            write!(w3, "{}", transfer_cells(j))?;
+            if let Some(cells) = &site_cells {
+                write!(w3, "{}", cells.cells(source[j], &pform[j], charge[j]))?;
+            }
+            writeln!(w3)?;
+        }
+        w3.flush()?;
+        drop(w3);
+        target.publish()?;
+        nprec = Some(order.len() as u64);
+    }
+
     if let Some(l) = loc {
         l.write_sites()?;
     }
@@ -616,7 +980,18 @@ pub fn run_experiment_localised(
         "report: experiment-wide done (rows are precursors selected on the experiment-wide \
          peptide_q_value; n_runs counts per-run acceptances on run_psm_q)"
     );
-    Ok((npep, nprot))
+    if let Some(n) = nprec {
+        tracing::info!(
+            precursors_at_precursor_q = n,
+            "report: experiment-wide precursors.tsv (rows selected on the experiment-wide \
+             precursor_q)"
+        );
+    }
+    Ok(ReportCounts {
+        peptide_rows: npep,
+        protein_groups: nprot,
+        precursor_rows: nprec,
+    })
 }
 
 /// The three `peptides.tsv` columns the `localise` stage adds.
@@ -1503,8 +1878,10 @@ mod tests {
             run_names: &names,
             peptide_quants: &[qa, qb],
             protein_lfq: Some(&lfq),
+            precursor_lfq: None,
             out_peptides: &peptides,
             out_proteins: &proteins,
+            out_precursors: None,
             q_threshold: 0.01,
         })
         .unwrap();
@@ -1629,8 +2006,10 @@ mod tests {
                 run_names: &names,
                 peptide_quants: tables,
                 protein_lfq: None,
+                precursor_lfq: None,
                 out_peptides: &peptides,
                 out_proteins: &proteins,
+                out_precursors: None,
                 q_threshold: 0.01,
             })
             .unwrap();
@@ -1805,6 +2184,7 @@ mod tests {
             protein_quant: None,
             out_peptides: &pep,
             out_proteins: &prot,
+            out_precursors: None,
             q_threshold: 0.01,
         };
         run(params()).unwrap();
@@ -2028,6 +2408,7 @@ mod tests {
             protein_quant: None,
             out_peptides: &peptides,
             out_proteins: &proteins,
+            out_precursors: None,
             q_threshold: 0.01,
         })
         .unwrap();
@@ -2148,6 +2529,7 @@ mod tests {
             protein_quant: None,
             out_peptides: &format!("{out}/peptides.tsv"),
             out_proteins: &format!("{out}/proteins.tsv"),
+            out_precursors: None,
             q_threshold: 0.01,
         })
         .unwrap_err()
@@ -2168,6 +2550,7 @@ mod tests {
             protein_quant: None,
             out_peptides: &format!("{out}/peptides.tsv"),
             out_proteins: &format!("{out}/proteins.tsv"),
+            out_precursors: None,
             q_threshold: 0.01,
         })
         .unwrap();
@@ -2196,6 +2579,7 @@ mod tests {
                 protein_quant: None,
                 out_peptides: &peptides,
                 out_proteins: &proteins,
+                out_precursors: None,
                 q_threshold: q,
             })
             .unwrap()
@@ -2263,6 +2647,7 @@ mod tests {
             protein_quant: None,
             out_peptides: &peptides,
             out_proteins: &proteins,
+            out_precursors: None,
             q_threshold: 0.0,
         })
         .unwrap();
@@ -2298,6 +2683,7 @@ mod tests {
             protein_quant: None,
             out_peptides: &peptides,
             out_proteins: &proteins,
+            out_precursors: None,
             q_threshold: 0.01,
         })
         .unwrap();
@@ -2352,6 +2738,7 @@ mod tests {
         let (mut pf, mut ch, mut prot, mut lab, mut pq, mut pg, mut pgq) =
             (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
         let (mut sc, mut src, mut rq, mut tr, mut tq) = (vec![], vec![], vec![], vec![], vec![]);
+        let (mut prq, mut bp, mut art) = (vec![], vec![], vec![]);
         for i in 0..n {
             let r = next();
             let decoy = r % 5 == 0;
@@ -2376,6 +2763,9 @@ mod tests {
             // Contiguous runs, as rescore writes them.
             src.push((i as u64 * n_runs as u64 / n as u64) as u32);
             rq.push(qs[(next() >> 3) as usize % qs.len()]);
+            prq.push(qs[(next() >> 5) as usize % qs.len()]);
+            bp.push(((r >> 8) as usize % pool.len()) as u32);
+            art.push(((r >> 20) % 3600) as f64 + 0.125);
             let t = mbr && (r >> 52) % 11 == 0;
             tr.push(t);
             tq.push(if t && (r >> 56) % 3 != 0 {
@@ -2396,6 +2786,9 @@ mod tests {
             Col::F64("score".into(), sc),
             Col::U32("source".into(), src),
             Col::F64("run_psm_q".into(), rq),
+            Col::F64("precursor_q".into(), prq),
+            Col::U32("base_peptide_id".into(), bp),
+            Col::F64("apex_rt".into(), art),
         ];
         if mbr {
             cols.push(Col::Bool("is_transferred".into(), tr));
@@ -2455,6 +2848,7 @@ mod tests {
                     protein_quant: None,
                     out_peptides: &f("p1.tsv"),
                     out_proteins: &f("g1.tsv"),
+                    out_precursors: Some(&f("c1.tsv")),
                     q_threshold,
                 })
                 .unwrap();
@@ -2464,6 +2858,7 @@ mod tests {
                     protein_quant: None,
                     out_peptides: &f("p1_old.tsv"),
                     out_proteins: &f("g1_old.tsv"),
+                    out_precursors: None,
                     q_threshold,
                 })
                 .unwrap();
@@ -2473,8 +2868,10 @@ mod tests {
                     run_names: &names,
                     peptide_quants: &quants,
                     protein_lfq: Some(&lfq),
+                    precursor_lfq: None,
                     out_peptides: &f("pe.tsv"),
                     out_proteins: &f("ge.tsv"),
+                    out_precursors: Some(&f("ce.tsv")),
                     q_threshold,
                 })
                 .unwrap();
@@ -2483,8 +2880,10 @@ mod tests {
                     run_names: &names,
                     peptide_quants: &quants,
                     protein_lfq: Some(&lfq),
+                    precursor_lfq: None,
                     out_peptides: &f("pe_old.tsv"),
                     out_proteins: &f("ge_old.tsv"),
+                    out_precursors: None,
                     q_threshold,
                 })
                 .unwrap();
@@ -2508,6 +2907,41 @@ mod tests {
                 if q_threshold == 0.01 {
                     assert!(got.0 > 0 && got.1 > 0 && got_e.0 > 0, "rows are printed");
                 }
+                // precursors.tsv holds exactly the distinct accepted (peptidoform, charge)
+                // of the targets on precursor_q, recomputed here from the whole table.
+                let t = TableFile::open(&scored).unwrap();
+                let (pf, ch, lab, pq) = (
+                    t.str("peptidoform").unwrap(),
+                    t.i32("charge").unwrap(),
+                    t.str("label").unwrap(),
+                    t.f64("precursor_q").unwrap(),
+                );
+                let tr = if mbr {
+                    t.bool("is_transferred").unwrap()
+                } else {
+                    vec![false; t.nrows]
+                };
+                let want: HashSet<(String, i32)> = (0..t.nrows)
+                    .filter(|&i| lab[i] == "target" && (tr[i] || pq[i] <= q_threshold))
+                    .map(|i| (pf[i].clone(), ch[i]))
+                    .collect();
+                for name in ["c1.tsv", "ce.tsv"] {
+                    let text = std::fs::read_to_string(f(name)).unwrap();
+                    let got: HashSet<(String, i32)> = text
+                        .lines()
+                        .skip(1)
+                        .map(|l| {
+                            let c: Vec<&str> = l.split('\t').collect();
+                            (c[0].to_string(), c[2].parse().unwrap())
+                        })
+                        .collect();
+                    assert_eq!(
+                        text.lines().count() - 1,
+                        got.len(),
+                        "{name}: one row per precursor"
+                    );
+                    assert_eq!(got, want, "{name}, mbr {mbr}, threshold {q_threshold}");
+                }
             }
         }
         // A source outside the run names is still refused, at the same row.
@@ -2517,8 +2951,10 @@ mod tests {
             run_names: &names,
             peptide_quants: &[],
             protein_lfq: None,
+            precursor_lfq: None,
             out_peptides: &tmp("x1.tsv"),
             out_proteins: &tmp("x2.tsv"),
+            out_precursors: None,
             q_threshold: 0.01,
         })
         .unwrap_err()
@@ -2528,12 +2964,297 @@ mod tests {
             run_names: &names,
             peptide_quants: &[],
             protein_lfq: None,
+            precursor_lfq: None,
             out_peptides: &tmp("x3.tsv"),
             out_proteins: &tmp("x4.tsv"),
+            out_precursors: None,
             q_threshold: 0.01,
         })
         .unwrap_err()
         .to_string();
         assert_eq!(e_new, e_old);
+    }
+
+    /// The scored table of the precursors.tsv tests: PEPTIDEK at charges 2 and 3 (the
+    /// charge-2 row is the base peptide's winner, the charge-3 row a loser with the stored
+    /// 1.0, both accepted on precursor_q), its paired decoy with the best q of all,
+    /// SECONDK/2 on another protein group whose winner is a row above threshold, and
+    /// LATEK/2 rejected on precursor_q.
+    fn precursor_fixture(with_source: bool) -> String {
+        let scored = tmp("prec_scored.parquet");
+        let mut cols = vec![
+            Col::Str(
+                "peptidoform".into(),
+                vec![
+                    "PEPTIDEK".into(),
+                    "PEPTIDEK".into(),
+                    "DECOY_KEDITPEP".into(),
+                    "SECONDK".into(),
+                    "LATEK".into(),
+                    "M[Oxidation]SECONDK".into(),
+                ],
+            ),
+            Col::I32("charge".into(), vec![2, 3, 2, 2, 2, 3]),
+            Col::Str(
+                "protein".into(),
+                vec![
+                    "P1".into(),
+                    "P1".into(),
+                    "DECOY_P1".into(),
+                    "P2".into(),
+                    "P1".into(),
+                    "P2".into(),
+                ],
+            ),
+            Col::Str(
+                "label".into(),
+                vec![
+                    "target".into(),
+                    "target".into(),
+                    "decoy".into(),
+                    "target".into(),
+                    "target".into(),
+                    "target".into(),
+                ],
+            ),
+            Col::U32("base_peptide_id".into(), vec![7, 7, 7, 9, 11, 9]),
+            Col::F64(
+                "peptide_q_value".into(),
+                vec![0.001, 1.0, 0.0001, 0.02, 0.5, 1.0],
+            ),
+            Col::Str(
+                "protein_group".into(),
+                vec![
+                    "PG1".into(),
+                    "PG1".into(),
+                    "DECOY_PG1".into(),
+                    "PG2".into(),
+                    "PG1".into(),
+                    "PG2".into(),
+                ],
+            ),
+            Col::F64(
+                "pg_q_value".into(),
+                vec![0.002, 1.0, 0.0001, 1.0, 1.0, 0.03],
+            ),
+            Col::F64(
+                "precursor_q".into(),
+                vec![0.001, 0.004, 0.0001, 0.006, 0.5, 0.008],
+            ),
+            Col::F64("score".into(), vec![3.5, 3.0, 9.9, 2.0, 0.1, 1.5]),
+            Col::F64(
+                "apex_rt".into(),
+                vec![600.0, 601.25, 10.0, 900.5, 30.0, 950.0],
+            ),
+        ];
+        if with_source {
+            cols.push(Col::U32("source".into(), vec![0, 1, 0, 1, 0, 0]));
+            cols.push(Col::F64(
+                "run_psm_q".into(),
+                vec![0.001, 0.004, 0.0001, 0.006, 0.5, 0.2],
+            ));
+        }
+        write_table(&scored, cols).unwrap();
+        scored
+    }
+
+    fn rows_of(path: &str) -> (String, Vec<Vec<String>>) {
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut lines = text.lines();
+        let header = lines.next().unwrap().to_string();
+        let rows = lines
+            .map(|l| l.split('\t').map(String::from).collect())
+            .collect();
+        (header, rows)
+    }
+
+    #[test]
+    fn single_run_precursors_list_every_accepted_precursor_with_its_groups_q() {
+        let scored = precursor_fixture(false);
+        let quant = tmp("prec_pq.parquet");
+        write_table(
+            &quant,
+            vec![
+                Col::Str(
+                    "peptidoform".into(),
+                    vec!["PEPTIDEK".into(), "PEPTIDEK".into()],
+                ),
+                Col::I32("charge".into(), vec![2, 3]),
+                Col::F64("quantity".into(), vec![100.0, 40.0]),
+            ],
+        )
+        .unwrap();
+        let out = tmp("prec_single");
+        std::fs::create_dir_all(&out).unwrap();
+        let f = |n: &str| format!("{out}/{n}");
+        let c = run_localised(
+            ReportParams {
+                scored: &scored,
+                peptide_quant: Some(&quant),
+                protein_quant: None,
+                out_peptides: &f("peptides.tsv"),
+                out_proteins: &f("proteins.tsv"),
+                out_precursors: Some(&f("precursors.tsv")),
+                q_threshold: 0.01,
+            },
+            None,
+        )
+        .unwrap();
+        // peptides.tsv has the peptide winner only; precursors.tsv has both charges of
+        // PEPTIDEK, SECONDK (its peptide q is 0.02) and the oxidised form.
+        assert_eq!(c.peptide_rows, 1);
+        assert_eq!(c.precursor_rows, Some(4));
+        let (header, rows) = rows_of(&f("precursors.tsv"));
+        assert_eq!(
+            header,
+            "precursor\tstripped_sequence\tcharge\tprecursor_mz\tprotein\tprotein_group\t\
+             q_value\tpeptide_q_value\tprotein_group_q_value\tscore\tapex_rt\tquantity\t\
+             is_transferred\ttransfer_q"
+        );
+        let keys: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r[0].as_str(), r[2].as_str()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("PEPTIDEK", "2"),
+                ("PEPTIDEK", "3"),
+                ("SECONDK", "2"),
+                ("M[Oxidation]SECONDK", "3")
+            ],
+            "best precursor_q first, no decoy, no LATEK"
+        );
+        // The charge-3 row stores peptide q 1.0 and pg q 1.0; it is reported at its
+        // groups' q, read from the charge-2 winner.
+        assert_eq!(rows[1][6], "0.004000");
+        assert_eq!(rows[1][7], "0.001000");
+        assert_eq!(rows[1][8], "0.002000");
+        // SECONDK: its own peptide q (above the threshold) and the protein group's q from
+        // the oxidised form, which won PG2.
+        assert_eq!(rows[2][7], "0.020000");
+        assert_eq!(rows[2][8], "0.030000");
+        assert_eq!(rows[3][7], "0.020000", "same base peptide as SECONDK");
+        // m/z from the shared mass model.
+        let mz2 = mumdia_core::mass::parse_peptidoform("PEPTIDEK")
+            .unwrap()
+            .precursor_mz(2);
+        assert_eq!(rows[0][3], format!("{mz2:.5}"));
+        assert_eq!(rows[1][10], "601.25");
+        assert_eq!(
+            (rows[0][11].as_str(), rows[1][11].as_str()),
+            ("100.0", "40.0")
+        );
+        assert_eq!(rows[2][11], "", "no quant row: empty, not zero");
+        assert_eq!(&rows[0][12..], ["false", ""]);
+    }
+
+    #[test]
+    fn experiment_precursors_have_one_row_per_precursor_and_normalised_columns() {
+        let scored = precursor_fixture(true);
+        let lfq = tmp("prec_lfq.parquet.precursor.parquet");
+        write_table(
+            &lfq,
+            vec![
+                Col::Str(
+                    "group".into(),
+                    vec![
+                        "PEPTIDEK".into(),
+                        "PEPTIDEK".into(),
+                        "SECONDK".into(),
+                        "SECONDK".into(),
+                    ],
+                ),
+                Col::I32("charge".into(), vec![2, 2, 2, 2]),
+                Col::I32("run".into(), vec![0, 1, 0, 1]),
+                // The matrix's 0 for a run without a quantity prints empty.
+                Col::F64("quantity".into(), vec![11.0, 12.5, 0.0, 7.0]),
+            ],
+        )
+        .unwrap();
+        let out = tmp("prec_exp");
+        std::fs::create_dir_all(&out).unwrap();
+        let f = |n: &str| format!("{out}/{n}");
+        let names = vec!["a".to_string(), "b".to_string()];
+        for with_lfq in [true, false] {
+            let dst = if with_lfq { "p_lfq.tsv" } else { "p_plain.tsv" };
+            let c = run_experiment_localised(
+                ExperimentReportParams {
+                    scored: &scored,
+                    run_names: &names,
+                    peptide_quants: &[],
+                    protein_lfq: None,
+                    precursor_lfq: with_lfq.then_some(lfq.as_str()),
+                    out_peptides: &f("peptides.tsv"),
+                    out_proteins: &f("proteins.tsv"),
+                    out_precursors: Some(&f(dst)),
+                    q_threshold: 0.01,
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(c.precursor_rows, Some(4));
+            let (header, rows) = rows_of(&f(dst));
+            let head = "precursor\tstripped_sequence\tcharge\tprecursor_mz\tprotein\t\
+                        protein_group\tq_value\tpeptide_q_value\tprotein_group_q_value\t\
+                        score\tn_runs";
+            if with_lfq {
+                assert_eq!(
+                    header,
+                    format!("{head}\tnormalised_a\tnormalised_b\tis_transferred\ttransfer_q")
+                );
+                assert_eq!(&rows[0][11..13], ["11.0", "12.5"]);
+                assert_eq!(&rows[2][11..13], ["", "7.0"]);
+                assert_eq!(&rows[3][11..13], ["", ""]);
+            } else {
+                assert_eq!(header, format!("{head}\tis_transferred\ttransfer_q"));
+            }
+            // n_runs on run_psm_q: PEPTIDEK/2 in run 0 only; the oxidised form has an
+            // experiment-wide precursor q of 0.008 but no run where its run_psm_q passes.
+            assert_eq!(rows[0][10], "1");
+            assert_eq!(rows[1][10], "1");
+            assert_eq!(rows[3][10], "0");
+        }
+    }
+
+    #[test]
+    fn a_scored_table_without_precursor_q_is_reported_without_precursors_tsv() {
+        let scored = random_scored(500, 1, false);
+        // Rewrite it without the precursor columns, as a table from before them.
+        let t = TableFile::open(&scored).unwrap();
+        let old = tmp("old_scored.parquet");
+        write_table(
+            &old,
+            vec![
+                Col::Str("peptidoform".into(), t.str("peptidoform").unwrap()),
+                Col::I32("charge".into(), t.i32("charge").unwrap()),
+                Col::Str("protein".into(), t.str("protein").unwrap()),
+                Col::Str("label".into(), t.str("label").unwrap()),
+                Col::F64("peptide_q_value".into(), t.f64("peptide_q_value").unwrap()),
+                Col::Str("protein_group".into(), t.str("protein_group").unwrap()),
+                Col::F64("pg_q_value".into(), t.f64("pg_q_value").unwrap()),
+                Col::F64("score".into(), t.f64("score").unwrap()),
+            ],
+        )
+        .unwrap();
+        let out = tmp("old_out");
+        std::fs::create_dir_all(&out).unwrap();
+        let f = |n: &str| format!("{out}/{n}");
+        let c = run_localised(
+            ReportParams {
+                scored: &old,
+                peptide_quant: None,
+                protein_quant: None,
+                out_peptides: &f("peptides.tsv"),
+                out_proteins: &f("proteins.tsv"),
+                out_precursors: Some(&f("precursors.tsv")),
+                q_threshold: 0.01,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(c.precursor_rows, None);
+        assert!(!std::path::Path::new(&f("precursors.tsv")).exists());
+        assert!(c.peptide_rows > 0);
     }
 }

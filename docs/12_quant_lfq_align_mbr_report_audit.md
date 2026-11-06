@@ -22,9 +22,10 @@ stages that operate across multiple runs.
   fitting a reference LOESS RT map per run and recording the residual spread.
 - **mbr** (Stage D3, `mumdia mbr`): partially wired match-between-runs identification
   transfer. A Rust CLI + config gate that shells out to `scripts/mbr_worker.py`.
-- **report** (`mumdia report`): emit human-readable `peptides.tsv` + `proteins.tsv`
-  from the scored PSM table, joined to quant. Invoked by the single-run `run`
-  chain and by the CLI subcommand only; `run-experiment` never runs it.
+- **report** (`mumdia report`): emit human-readable `peptides.tsv`, `precursors.tsv`
+  and `proteins.tsv` from the scored PSM table, joined to quant. Invoked by the
+  single-run `run` chain, by `run-experiment` (one experiment-wide set at the
+  experiment root) and by the CLI subcommand.
 - **audit** (`mumdia audit`): reconstruct, per candidate, the pipeline stage flags and
   the earliest rejection reason across the artifact chain, without re-running compute.
 
@@ -36,7 +37,7 @@ stages that operate across multiple runs.
 | `rust/mumdia/crates/mumdia/src/stages/quant_norm.rs` | opt-in cross-run normalisation (`quant-normalise`, `quant.normalisation`) |
 | `rust/mumdia/crates/mumdia/src/quant_lfq.rs` | MaxLFQ/directLFQ ratio-alignment core (`lfq_profile`, `maxlfq`, `directlfq`) |
 | `rust/mumdia/crates/mumdia/src/stages/align.rs` | Stage D2 cross-run RT alignment |
-| `rust/mumdia/crates/mumdia/src/stages/report.rs` | `peptides.tsv` + `proteins.tsv` writer |
+| `rust/mumdia/crates/mumdia/src/stages/report.rs` | `peptides.tsv` + `precursors.tsv` + `proteins.tsv` writer |
 | `rust/mumdia/crates/mumdia/src/stages/audit.rs` | candidate identification-loss ladder |
 | `rust/mumdia/crates/mumdia-core/src/rejection.rs` | `RejectionReason` enum + ladder ordering |
 | `rust/mumdia/crates/mumdia-core/src/config.rs` | `QuantConfig`, `MbrConfig`, `RtImTrainConfig`, and the strategy enums |
@@ -221,6 +222,33 @@ follows the quantity columns: `true` or `false` from the run's `first_pass_id`, 
 the run has no quant row for the precursor; otherwise there is no such column. No per-run
 TSV is written, because the grouped q columns are assigned to each group's
 experiment-wide winner only.
+
+Both writers also write `precursors.tsv` beside the other two: one row per target
+`(peptidoform, charge)` with `precursor_q` at or under the threshold (or transferred, the
+same acceptance rule), best `precursor_q` first. It is the precursor-level counterpart of
+`peptides.tsv`, which is selected on the base-peptide `peptide_q_value` and therefore holds
+about one precursor per base peptide; under the default `compete.group_by =
+peptidoform_charge` a peptide's further charge states and modforms are listed only here.
+Header: `precursor`, `stripped_sequence`, `charge`, `precursor_mz` (theoretical
+monoisotopic m/z from the shared mass model, five decimals, empty when the peptidoform does
+not parse), `protein`, `protein_group`, `q_value` (= `precursor_q`), `peptide_q_value`,
+`protein_group_q_value`, `score`, then `apex_rt` and `quantity` for a single run, or
+`n_runs` (on `run_psm_q`), `quantity_<run>`, `normalised_<run>` (from
+`lfq_maxlfq.parquet.precursor.parquet`, when it exists; empty where that matrix holds 0, its
+value for a run without a quantity) and `first_pass_<run>` (as in
+`peptides.tsv`) for an experiment, and finally `is_transferred`, `transfer_q` and the
+localisation columns when the `localise` stage ran. `peptide_q_value` and
+`protein_group_q_value` are the q of the base peptide and protein group the row belongs to,
+read from each group's winning row: the stored columns are 1.0 on every row but the
+winner, so copying them would print 1.0 for every precursor that is not its peptide's best.
+In the experiment table `precursor_q` is experiment-wide and written to one row per
+precursor across all runs, so the table has one row per precursor. Under `compete.group_by
+= base_peptide` the competition already deleted the siblings, `precursor_q` then counts base
+peptides, and `precursors.tsv` has about as many rows as `peptides.tsv`. A scored table from
+before `precursor_q` existed is reported without the file, with a warning.
+`run-experiment` records the file and its row count in its manifest as
+`experiment.report.precursors` and `experiment.report.n_precursor_rows`; the older
+`experiment.report.n_precursors` keeps its meaning, the row count of `peptides.tsv`.
 
 ### audit
 Consumes `library_precursors.parquet` (the full search space) plus `psms`
@@ -1206,7 +1234,10 @@ bytes a row. A NULL in a required column is still refused wherever it is.
 
 This is a hybrid identification report: `peptides.tsv` has precursor-shaped rows
 but is filtered and labeled with peptide-level q. It is neither a stripped-peptide
-table nor a `precursor_q`-controlled precursor table. Report filtering is also
+table nor a `precursor_q`-controlled precursor table; that table is `precursors.tsv`,
+which pass 1 reads by adding `precursor_q` to the fold. Every loop filters on its own q
+before it prints or deduplicates and the sorts are stable, so the other two files keep
+their bytes (the identity test writes `precursors.tsv` too). Report filtering is also
 independent of `quant.q_filter`, so a report row can legitimately have a blank
 quantity when quant excluded it or marked it nonquantifiable. Use
 `peptide_quant.parquet`/`protein_group_quant.parquet` for numerical analysis:
@@ -1401,16 +1432,15 @@ but do not affect the wired `mumdia mbr` path.
   records for `scored[<run>]` differ from an earlier release's; they are computed
   while the tables are written. A table whose `source` column is nullable (the MBR
   worker's pyarrow output) is re-encoded as before, in 131,072-row groups.
-- **`run-experiment` produces no TSV report.** `report::run` is called only from
-  `run.rs:484` and the `mumdia report` handler (`main.rs:798`), so an experiment
-  output tree has scored, per-run split, quant, and LFQ artifacts but no
-  `peptides.tsv` or `proteins.tsv`. Take per-run identification counts from the
-  split `<run>/scored.parquet` tables gated on `run_psm_q`, or run `mumdia report`
-  by hand on a split table.
+- **`run-experiment` writes experiment-wide TSVs only.** `report::run_experiment`
+  writes `peptides.tsv`, `precursors.tsv` and `proteins.tsv` at the experiment root,
+  selected on the experiment-wide grouped q columns, and no per-run TSV. Take per-run
+  identification counts from the split `<run>/scored.parquet` tables gated on
+  `run_psm_q`, or read `n_runs`.
 - **report row unit.** `peptides.tsv` rows are precursors (peptidoform + charge), not
   stripped sequences, but selection is by `peptide_q_value`, not `precursor_q`.
-  A separate stripped-sequence count is only logged. TSV quantity is rounded; use
-  Parquet for quantitative work.
+  `precursors.tsv` is the table selected by `precursor_q`. A separate stripped-sequence
+  count is only logged. TSV quantity is rounded; use Parquet for quantitative work.
 - **`<psms>.audit.parquet` has no producer.** `emit_candidate_audit` (`config.rs:483`)
   documents that extraction "writes `<out-psms>.audit.parquet`", but no stage in the
   current tree writes it (grep: only `compete` writes `<out>.compete_audit.parquet` and

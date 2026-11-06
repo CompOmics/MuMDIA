@@ -2578,6 +2578,7 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // in the split tables.
     let pep_tsv = d("peptides.tsv");
     let prot_tsv = d("proteins.tsv");
+    let prec_tsv = d("precursors.tsv");
     let sites_tsv = d("sites.tsv");
     let loc = (!localisation.is_empty()).then(|| report::Localisation {
         tables: &localisation,
@@ -2585,18 +2586,23 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
         fasta: p.fasta,
         out_sites: &sites_tsv,
     });
-    let (n_rep_pep, n_rep_prot) = report::run_experiment_localised(
+    // The cross-run precursor matrix `quant-lfq` writes next to the protein matrix.
+    let prec_lfq = quant::precursor_lfq_sibling(&lfq);
+    let rep_counts = report::run_experiment_localised(
         report::ExperimentReportParams {
             scored: &scored_for_quant,
             run_names: &names,
             peptide_quants: &peptide_quants,
             protein_lfq: Some(&lfq),
+            precursor_lfq: prec_lfq.as_deref(),
             out_peptides: &pep_tsv,
             out_proteins: &prot_tsv,
+            out_precursors: Some(&prec_tsv),
             q_threshold: cfg.quant.q_threshold,
         },
         loc.as_ref(),
     )?;
+    let (n_rep_pep, n_rep_prot) = (rep_counts.peptide_rows, rep_counts.protein_groups);
 
     // Runs without a retention-time calibration, per pass: each run's own seed (the first
     // pass) and, when it ran, the second pass on the consensus library.
@@ -2652,6 +2658,20 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             "unit": "experiment-wide peptide_q_value / pg_q_value; n_runs on run_psm_q",
         },
     });
+    // precursors.tsv and its row count at the experiment-wide precursor_q. A key of its
+    // own: `n_precursors` above counts the rows of peptides.tsv (selected on
+    // peptide_q_value) and is read under that name downstream.
+    if let (Some(n), Some(r)) = (
+        rep_counts.precursor_rows,
+        manifest.get_mut("report").and_then(|r| r.as_object_mut()),
+    ) {
+        r.insert("precursors".to_string(), json!(prec_tsv));
+        r.insert("n_precursor_rows".to_string(), json!(n));
+        r.insert(
+            "precursor_unit".to_string(),
+            json!("experiment-wide precursor_q; n_runs on run_psm_q"),
+        );
+    }
     // The runs without a retention-time calibration, only when there were any, so every
     // other manifest keeps its bytes (`rt_health`).
     if let (false, Some(m)) = (rt_gaps.is_empty(), manifest.as_object_mut()) {

@@ -132,6 +132,19 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Added
 
+- **`precursors.tsv`: the precursor-level report.** `run`, `run-experiment` and `mumdia
+  report` (also with `--experiment-dir`, which rewrites it at another `--q`) write it beside
+  `peptides.tsv` and `proteins.tsv`: one row per target `(peptidoform, charge)` accepted on
+  `precursor_q`, so every accepted charge state and modform of a peptide is listed, where
+  `peptides.tsv` is selected on the base-peptide q and holds about one precursor per peptide.
+  Each row carries the theoretical `precursor_mz`, its `precursor_q` as `q_value`, and the q
+  of its base peptide and protein group read from their winning rows; a single run adds
+  `apex_rt` and `quantity`, an experiment `n_runs` (on `run_psm_q`), `quantity_<run>`,
+  `normalised_<run>` from the cross-run precursor matrix and the `first_pass_<run>` columns
+  when present. The experiment manifest records it as `report.precursors` and
+  `report.n_precursor_rows`; `report.n_precursors` keeps counting the rows of
+  `peptides.tsv`. The desktop application lists the file in its results. Every other output
+  and the configuration hash are unchanged (docs/15_data_dictionary.md, "TSV reports").
 - **Desktop application: a DIA-NN library as the search's library.** The spectral-library
   tab of the Search screen takes a DIA-NN library (a fragment-level `.parquet`, or a
   `.speclib`, which the user's DIA-NN re-exports as Parquet first) and an output folder, and

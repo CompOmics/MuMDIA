@@ -312,6 +312,48 @@ def main() -> int:
     c.ok(not any(r["precursor"].startswith("DECOY_") for r in rows),
          "peptides.tsv contains no decoy rows")
 
+    # precursors.tsv: every target (peptidoform, charge) accepted on precursor_q, one row
+    # each, with the peptide q of its base peptide read from the peptide's winning row.
+    prec_path = out / "precursors.tsv"
+    if c.ok(prec_path.is_file(), "run writes precursors.tsv"):
+        with prec_path.open(encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh, delimiter="\t")
+            prec_rows = list(reader)
+            prec_hdr = reader.fieldnames or []
+        c.ok(prec_hdr == ["precursor", "stripped_sequence", "charge", "precursor_mz", "protein",
+                 "protein_group", "q_value", "peptide_q_value", "protein_group_q_value",
+                 "score", "apex_rt", "quantity",
+                         "is_transferred", "transfer_q"],
+             "precursors.tsv has the single-run columns", "\t".join(prec_hdr))
+        sp = pq.read_table(
+            out / "psms_scored.parquet",
+            columns=["peptidoform", "charge", "label", "precursor_q"],
+        ).to_pydict()
+        want = {
+            (sp["peptidoform"][i], sp["charge"][i])
+            for i in range(len(sp["label"]))
+            if sp["label"][i] == "target" and sp["precursor_q"][i] is not None
+            and sp["precursor_q"][i] <= 0.01
+        }
+        got = [(r["precursor"], int(r["charge"])) for r in prec_rows]
+        c.ok(len(got) > 0 and len(got) == len(set(got)) and set(got) == want,
+             "precursors.tsv holds exactly the targets at precursor_q <= 0.01, one row each",
+             f"{len(got)} rows, {len(set(got))} distinct, {len(want)} expected")
+        c.ok(not any(r["precursor"].startswith("DECOY_") for r in prec_rows),
+             "precursors.tsv contains no decoy rows")
+        prec_recovered = planted_stripped & {r["stripped_sequence"] for r in prec_rows}
+        c.ok(len(prec_recovered) / max(1, len(planted_stripped)) >= a.min_recovery,
+             f"planted peptide recovery in precursors.tsv >= {a.min_recovery:.0%}",
+             f"{len(prec_recovered)} of {len(planted_stripped)}")
+        # A precursor that is its peptide's winner carries the same peptide q in both files.
+        pep_q_by_key = {(r["precursor"], r["charge"]): r["q_value"] for r in rows}
+        shared = [r for r in prec_rows if (r["precursor"], r["charge"]) in pep_q_by_key]
+        c.ok(len(shared) > 0 and all(
+                r["peptide_q_value"] == pep_q_by_key[(r["precursor"], r["charge"])]
+                for r in shared),
+             "precursors.tsv peptide_q_value equals peptides.tsv q_value on shared rows",
+             f"{len(shared)} shared rows")
+
     # ---------------------------------------------------------------------- quant
     print("quantification")
     pep_q = pq.read_table(
@@ -501,6 +543,50 @@ def main() -> int:
         for r in ("a", "b"):
             c.ok(not (exp / r / "peptides.tsv").exists(),
                  f"no per-run peptides.tsv under {r}: the grouped q is experiment-wide")
+        # The experiment-wide precursors.tsv: selected on the experiment-wide precursor_q,
+        # one row per precursor, n_runs on run_psm_q, the per-run quantity and the cross-run
+        # normalised precursor quantity.
+        rep_prec = exp / "precursors.tsv"
+        if c.ok(rep_prec.is_file(), "run-experiment writes the experiment-wide precursors.tsv"):
+            hdr = rep_prec.read_text(encoding="utf-8").splitlines()[0].split("\t")
+            c.ok(hdr == ["precursor", "stripped_sequence", "charge", "precursor_mz", "protein",
+                 "protein_group", "q_value", "peptide_q_value", "protein_group_q_value",
+                 "score", "n_runs", "quantity_a", "quantity_b",
+                         "normalised_a", "normalised_b", "is_transferred", "transfer_q"],
+                 "experiment precursors.tsv has the experiment-wide columns",
+                 "\t".join(hdr))
+            em_rep = (m.get("experiment", {}).get("report", {}) if em.is_file() else {})
+            c.ok(em_rep.get("n_precursor_rows") ==
+                 len(rep_prec.read_text(encoding="utf-8").splitlines()) - 1
+                 and str(em_rep.get("precursors", "")).endswith("precursors.tsv"),
+                 "the experiment manifest records precursors.tsv and its row count",
+                 str({k: em_rep.get(k) for k in ("precursors", "n_precursor_rows")}))
+        prec05 = exp.parent / "exp_report" / "precursors.tsv"
+        if c.ok(prec05.is_file(),
+                "`mumdia report --experiment-dir` rewrote the experiment-wide precursors.tsv"):
+            rows = [r.split("\t") for r in prec05.read_text(encoding="utf-8").splitlines()[1:]]
+            keys = [(r[0], int(r[2])) for r in rows]
+            scored_for_quant = (m.get("experiment", {}).get("scored_for_quant")
+                                if em.is_file() else None)
+            want = set()
+            if scored_for_quant:
+                sp = pq.read_table(
+                    scored_for_quant, columns=["peptidoform", "charge", "label", "precursor_q"]
+                ).to_pydict()
+                want = {
+                    (sp["peptidoform"][i], sp["charge"][i])
+                    for i in range(len(sp["label"]))
+                    if sp["label"][i] == "target" and sp["precursor_q"][i] is not None
+                    and sp["precursor_q"][i] <= 0.05
+                }
+            c.ok(len(keys) > 0 and len(keys) == len(set(keys)) and set(keys) == want,
+                 "experiment precursors.tsv at q 0.05: one row per target at the "
+                 "experiment-wide precursor_q",
+                 f"{len(keys)} rows, {len(set(keys))} distinct, {len(want)} expected")
+            c.ok(all(r[10] == "2" for r in rows),
+                 "identical inputs: every precursor of precursors.tsv is identified in both runs")
+            c.ok(all(r[11] != "" and r[12] != "" for r in rows),
+                 "identical inputs: every precursor of precursors.tsv is quantified in both runs")
 
     print()
     if c.failures:

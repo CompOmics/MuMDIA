@@ -942,6 +942,7 @@ pub fn run(p: RunParams) -> Result<()> {
     // Human-readable report (peptides.tsv + proteins.tsv) + stdout summary.
     let pep_tsv = d("peptides.tsv");
     let prot_tsv = d("proteins.tsv");
+    let prec_tsv = d("precursors.tsv");
     info!(stage = %"report", "run: stage start");
     let loc_tables: Vec<String> = localisation.iter().cloned().collect();
     let sites_tsv = d("sites.tsv");
@@ -951,21 +952,29 @@ pub fn run(p: RunParams) -> Result<()> {
         fasta: p.fasta,
         out_sites: &sites_tsv,
     });
-    let (n_pep, n_prot) = report::run_localised(
+    let counts = report::run_localised(
         report::ReportParams {
             scored: &scored,
             peptide_quant: Some(&pep_q),
             protein_quant: Some(&pg_q),
             out_peptides: &pep_tsv,
             out_proteins: &prot_tsv,
+            out_precursors: Some(&prec_tsv),
             q_threshold: cfg.quant.q_threshold,
         },
         loc.as_ref(),
     )?;
+    let (n_pep, n_prot) = (counts.peptide_rows, counts.protein_groups);
     println!(
         "MuMDIA: {n_pep} precursor rows, {n_prot} protein groups at peptide/PG q <= {} (rescorer used: {})\n  {}\n  {}",
         cfg.quant.q_threshold, actual_rescorer, pep_tsv, prot_tsv
     );
+    if let Some(n) = counts.precursor_rows {
+        println!(
+            "MuMDIA: {n} precursors at precursor_q <= {}\n  {prec_tsv}",
+            cfg.quant.q_threshold
+        );
+    }
 
     // Model identities reflect the path that produced the downstream artifacts,
     // including imported libraries and per-run RT fine-tuning.
