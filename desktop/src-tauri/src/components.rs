@@ -34,7 +34,6 @@
 //! installed only on request, and it is needed only for FASTA-mode library building
 //! with predicted intensities.
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -258,6 +257,15 @@ pub fn stamp_env(cmd: &mut std::process::Command) {
     // fallback when no ThermoRawFileParser is found".
     if let Some(p) = runnable_thermo_parser() {
         cmd.env("MUMDIA_THERMO_PARSER", p);
+    }
+    // The engine's Python workers inherit its stdout and stderr, which this application
+    // reads. Without this a worker writes them in the ANSI code page on Windows, and a
+    // path with a non-ASCII character in it is not UTF-8 by the time it reaches the log
+    // (issue #281). Only the streams: `PYTHONUTF8` would also change the default
+    // encoding of every `open()` in every worker, which the engine sets per worker where
+    // it is wanted. Never over a value the user set.
+    if std::env::var_os("PYTHONIOENCODING").is_none() {
+        cmd.env("PYTHONIOENCODING", "utf-8");
     }
     // The storage folder's caches, temporary files and model downloads, when one was
     // chosen on the Setup screen; never over a variable the user set.
@@ -902,11 +910,13 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
             {
                 let installer = Arc::clone(&installer);
                 std::thread::spawn(move || {
-                    for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    // Lossy and to the end: a package build's Python writes in the
+                    // code page, and a reader that stopped would close the pipe.
+                    crate::childio::for_each_line_lossy(stream, |line| {
                         if let Ok(mut s) = installer.slot(env).lock() {
                             s.install_log.push(line);
                         }
-                    }
+                    });
                 });
             }
             match child.wait() {

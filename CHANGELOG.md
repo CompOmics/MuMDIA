@@ -399,15 +399,31 @@ than a number. Both are recorded in every run's `manifest.json`.
   `localise --experiment-dir`, retention, visDIA) are unaffected; the desktop application
   orders its per-file progress by the derived names; a script that builds `r<i>` paths has
   to read `experiment.runs` or `experiment.peptide_quants` instead (CompOmics/MuMDIA#274).
-- **The desktop application pins visDIA at e2010e3.** Over c674f9f it adds the ion-mobility
+- **The desktop application pins visDIA at cb8b5bc.** Over c674f9f it adds the ion-mobility
   views (CompOmics/visDIA#8), a mobilogram card on the precursor page of diaPASEF runs (#9)
-  and the fragments behind each quantity, read from `quant_fragments.parquet` (#10), and
-  caps duckdb below 2 and dash-mantine-components below 3. An existing visDIA environment is
-  reported outdated (`mumdia-viewer c674f9f -> e2010e3`) and the Setup screen offers the
+  and the fragments behind each quantity, read from `quant_fragments.parquet` (#10), sizes
+  DuckDB's memory limit to the machine (#11), notes an output pruned to a retention tier
+  (#12), orders run folders named after their inputs (#13) and keeps the Quant QC
+  conditions a user set when the page is built again (#14, #283), and caps duckdb below 2
+  and dash-mantine-components below 3. An existing visDIA environment is
+  reported outdated (`mumdia-viewer c674f9f -> cb8b5bc`) and the Setup screen offers the
   update. Checked with a fresh install on a 12-run diaPASEF second-pass experiment and on
   the smoke fixture with `quant.fragment_detail` (env/console-visdia-requirements.txt).
 
 ### Fixed
+
+- **Desktop: "Open in visDIA" works on a results folder whose path has a non-ASCII
+  character in it (Windows, #281).** The application read visDIA's piped output with
+  `BufRead::lines`, which fails on the first line that is not UTF-8; Python on Windows writes
+  a pipe in the ANSI code page, so a folder such as `Données_µ` printed a cp1252 byte, the
+  reader stopped and closed the pipe, the address was never read, and visDIA died on its next
+  write with `OSError: [Errno 22] Invalid argument`. visDIA is now started with
+  `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8`, and every piped child (visDIA, engine runs,
+  the uv installs, DIA-NN and the library helpers) is read as bytes, decoded lossily and
+  drained to the end of its stream. Engine runs also pass `PYTHONIOENCODING=utf-8` to the
+  Python workers that inherit their output, unless it is already set, since the same closed
+  pipe could stop a worker. Reproduced on Windows with the managed visDIA environment on a
+  folder `Données_µ` before the change; served after it, by either half of the fix alone.
 
 - **`import_diann_lib.py` keeps proteins apart whose FASTA headers DIA-NN does not parse as
   UniProt.** It read `Protein.Names` whenever the column existed, and for such headers
