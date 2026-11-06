@@ -1687,6 +1687,8 @@ for arm in plain annotated; do
         --protein-quant "$work/out/protein_group_quant.parquet" > "$work/report_$arm.log" 2>&1 \
         || { tail -20 "$work/report_$arm.log"; echo "report ($arm) failed"; exit 1; }
 done
+"$BIN" report --psms-scored "$work/out/psms_scored.parquet" --out-dir "$work/report_q1" --q 1 \
+    > "$work/report_q1.log" 2>&1 || { tail -20 "$work/report_q1.log"; echo "report (q 1) failed"; exit 1; }
 [ ! -e "$work/report_plain/protein_annotations.parquet" ] \
     || { echo "the plain report arm has an annotation table"; exit 1; }
 
@@ -1700,7 +1702,8 @@ echo "=== smoke: assertions"
 "$PY" ci/check_smoke.py --out-dir "$work/out" --planted "$work/planted.json" \
     --compare-peptides "$work/out2/peptides.tsv" --experiment "$work/exp" \
     --experiment-named "$work/exp_named" --plain-report "$work/report_plain" \
-    --annotated-report "$work/report_annotated" --min-assertions 157
+    --annotated-report "$work/report_annotated" --loose-report "$work/report_q1" \
+    --min-assertions 199
 
 echo "=== smoke: also check inspect and report run standalone"
 "$BIN" inspect "$work/out/psms_scored.parquet" > /dev/null

@@ -281,6 +281,20 @@ before `precursor_q` existed is reported without the file, with a warning.
 `experiment.report.precursors` and `experiment.report.n_precursor_rows`; the older
 `experiment.report.n_precursors` keeps its meaning, the row count of `peptides.tsv`.
 
+Protein accessions, entry names and gene names come from the protein annotation table
+(`protein_annotations.parquet`, docs/15): with one, each of the three files ends with
+`protein_ids`, `protein_names` and `genes`, joined on the row's `protein` (on
+`protein_group` in `proteins.tsv`), after every other column. The `protein` and
+`protein_group` cells, the grouping and every q value and quantity are the same with and
+without it; without it the three columns are absent and the files keep their bytes. `run`
+and `run-experiment` take the table from `--lib-annotations` or from beside
+`--lib-precursors` (a FASTA search writes its own), copy it into the output directory and
+record it in the manifest; `mumdia report` takes `--protein-annotations`, else the
+experiment manifest's `experiment.protein_annotations`, else the table in
+`--experiment-dir` or beside `--psms-scored`. So an experiment from before the table existed
+gains the columns by placing an imported library's table in its directory and rewriting the
+report (`mumdia report --experiment-dir <dir>`).
+
 ### audit
 Consumes `library_precursors.parquet` (the full search space) plus `psms`
 (extract), `competed` (compete), `scored` (rescore). It also attempts to read

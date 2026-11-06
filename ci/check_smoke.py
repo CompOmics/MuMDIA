@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import json
 import re
@@ -142,6 +143,8 @@ def main() -> int:
     ap.add_argument("--annotated-report", default=None,
                     help="the run's TSVs rewritten by `mumdia report` from the scored "
                          "table in the run directory, which finds the annotations there")
+    ap.add_argument("--loose-report", default=None,
+                    help="the run's TSVs rewritten by `mumdia report --q 1`")
     ap.add_argument("--min-assertions", type=int, default=0,
                     help="fail if fewer than N assertions ran; keeps the count cited "
                          "in CHANGELOG.md and docs/19 from silently rotting, and "
@@ -436,18 +439,33 @@ def main() -> int:
         names = ";".join(dict.fromkeys(m.split("|")[2] for m in members))
         return [ids, names, ""]
 
-    for name, key in (("peptides.tsv", "protein"), ("precursors.tsv", "protein"),
-                      ("proteins.tsv", "protein_group")):
-        with (out / name).open(encoding="utf-8", newline="") as fh:
-            reader = csv.DictReader(fh, delimiter="\t")
-            got = list(reader)
-            hdr = reader.fieldnames or []
-        c.ok(hdr[-3:] == ANNOTATION_COLUMNS and len(got) > 0,
-             f"{name} ends with the protein annotation columns", "\t".join(hdr[-3:]))
-        bad = [r for r in got
-               if [r["protein_ids"], r["protein_names"], r["genes"]] != expected_cells(r[key])]
-        c.ok(not bad, f"{name}: every row carries its proteins' accessions and entry names",
-             str(bad[:1]))
+    # The run's files, the experiment report at q 0.05 and the run's report at q 1, where
+    # proteins.tsv has rows (no protein group of this fixture reaches q 0.05).
+    report_dirs = [out]
+    if a.experiment:
+        report_dirs.append(Path(a.experiment).parent / "exp_report")
+    if a.loose_report:
+        report_dirs.append(Path(a.loose_report))
+    checked = collections.Counter()
+    for d in report_dirs:
+        for name, key in (("peptides.tsv", "protein"), ("precursors.tsv", "protein"),
+                          ("proteins.tsv", "protein_group")):
+            if not (d / name).is_file():
+                continue
+            with (d / name).open(encoding="utf-8", newline="") as fh:
+                reader = csv.DictReader(fh, delimiter="\t")
+                got = list(reader)
+                hdr = reader.fieldnames or []
+            checked[name] += len(got)
+            c.ok(hdr[-3:] == ANNOTATION_COLUMNS,
+                 f"{d.name}/{name} ends with the protein annotation columns",
+                 "\t".join(hdr[-3:]))
+            bad = [r for r in got if [r["protein_ids"], r["protein_names"], r["genes"]]
+                   != expected_cells(r[key])]
+            c.ok(not bad, f"{d.name}/{name}: every row carries its proteins' accessions and "
+                 "entry names", str(bad[:1]))
+    c.ok(all(checked[n] > 0 for n in ("peptides.tsv", "precursors.tsv", "proteins.tsv")),
+         "the annotation cells were checked on rows of all three files", str(dict(checked)))
     if a.plain_report:
         plain = Path(a.plain_report)
         for name in ("peptides.tsv", "precursors.tsv", "proteins.tsv"):
