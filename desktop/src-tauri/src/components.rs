@@ -751,27 +751,54 @@ impl Installer {
             self.with_probe(env, &mut fresh);
         }
         if let Ok(mut s) = self.slot(env).lock() {
-            // Anything an installation put there outlives a refresh. Keeping only
-            // "installing" lost the outcome: the install thread would set "done",
-            // the next refresh would overwrite it with the "idle" a fresh probe
-            // carries, and a caller watching for the transition would wait for ever.
-            // Found by the test that does exactly that.
-            let keep = s.install_status.clone();
-            let log = s.install_log.clone();
-            let err = s.error.clone();
-            *s = fresh;
-            if keep != "idle" {
-                s.install_status = keep;
-                s.install_log = log;
-                // A failure message is part of the outcome and must survive too.
-                if s.error.is_none() {
-                    s.error = err;
-                }
-            }
+            *s = carry_outcome(&s, fresh);
             return s.clone();
         }
         fresh
     }
+
+    /// Mark `env` as installing before `install` returns to the interface, so the first
+    /// status poll after the click already says "installing", for every environment
+    /// alike. Refuses a second installation of the same environment.
+    fn begin(&self, env: Env) -> Result<(), String> {
+        {
+            let mut s = self
+                .slot(env)
+                .lock()
+                .map_err(|_| "internal state is poisoned".to_string())?;
+            if s.install_status == "installing" {
+                return Err("an installation is already running".into());
+            }
+            s.install_status = "installing".into();
+            s.install_log.clear();
+            s.error = None;
+        }
+        // The environment is about to change, so the last real-import result no longer
+        // describes it.
+        if let Ok(mut p) = self.probes.lock() {
+            p.remove(env.dir_name());
+        }
+        Ok(())
+    }
+}
+
+/// A refreshed status, `fresh` from disk, with what an installation put in `prev`.
+///
+/// Anything an installation put there outlives a refresh. Keeping only "installing"
+/// lost the outcome: the install thread would set "done", the next refresh would
+/// overwrite it with the "idle" a fresh probe carries, and a caller watching for the
+/// transition would wait for ever.
+fn carry_outcome(prev: &Status, fresh: Status) -> Status {
+    let mut s = fresh;
+    if prev.install_status != "idle" && !prev.install_status.is_empty() {
+        s.install_status = prev.install_status.clone();
+        s.install_log = prev.install_log.clone();
+        // A failure message is part of the outcome and must survive too.
+        if s.error.is_none() {
+            s.error = prev.error.clone();
+        }
+    }
+    s
 }
 
 /// Create the managed environment and install everything into it.
@@ -788,23 +815,7 @@ pub fn install(installer: Arc<Installer>, env: Env) -> Result<(), String> {
     std::fs::create_dir_all(tools_dir())
         .map_err(|e| format!("cannot create {}: {e}", tools_dir().display()))?;
 
-    {
-        let mut s = installer
-            .slot(env)
-            .lock()
-            .map_err(|_| "internal state is poisoned".to_string())?;
-        if s.install_status == "installing" {
-            return Err("an installation is already running".into());
-        }
-        s.install_status = "installing".into();
-        s.install_log.clear();
-        s.error = None;
-    }
-    // The environment is about to change, so the last real-import result no longer
-    // describes it.
-    if let Ok(mut p) = installer.probes.lock() {
-        p.remove(env.dir_name());
-    }
+    installer.begin(env)?;
 
     std::thread::spawn(move || {
         let log = |installer: &Installer, line: String| {
@@ -1697,6 +1708,101 @@ mod tests {
         };
         s.versions.insert("torch".into(), "2.14.0+cpu".into());
         s
+    }
+
+    #[test]
+    fn every_environment_reports_installing_before_install_returns() {
+        // The optional environments go through the same path as the primary one, so the
+        // first poll after the click sees "installing" for each of them.
+        for env in [Env::Primary, Env::Ms2pip, Env::Visdia] {
+            let installer = Installer::default();
+            {
+                let mut s = installer.slot(env).lock().unwrap();
+                s.install_status = "failed".into();
+                s.install_log = vec!["the previous attempt".into()];
+                s.error = Some("the previous error".into());
+            }
+            installer.probes.lock().unwrap().insert(
+                env.dir_name(),
+                Probe {
+                    key: "old".into(),
+                    outcome: None,
+                },
+            );
+            installer.begin(env).unwrap();
+            let s = installer.slot(env).lock().unwrap().clone();
+            assert_eq!(s.install_status, "installing", "{env:?}");
+            assert!(s.install_log.is_empty(), "{env:?}");
+            assert!(s.error.is_none(), "{env:?}");
+            assert!(installer.busy(env), "{env:?}");
+            assert!(!installer
+                .probes
+                .lock()
+                .unwrap()
+                .contains_key(env.dir_name()));
+            // A second click while it runs is refused, and the other environments are
+            // not affected.
+            assert!(installer
+                .begin(env)
+                .unwrap_err()
+                .contains("already running"));
+            for other in [Env::Primary, Env::Ms2pip, Env::Visdia] {
+                if other != env {
+                    assert!(!installer.busy(other), "{env:?} made {other:?} busy");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_installation_until_its_outcome_and_after() {
+        let disk = || Status {
+            install_status: "idle".into(),
+            ..Default::default()
+        };
+        // Running: the status and the streamed log survive a refresh from disk.
+        let running = Status {
+            install_status: "installing".into(),
+            install_log: vec!["Resolved 42 packages".into()],
+            ..Default::default()
+        };
+        let s = carry_outcome(&running, disk());
+        assert_eq!(s.install_status, "installing");
+        assert_eq!(s.install_log, ["Resolved 42 packages"]);
+
+        // Finished: "done" (or "failed" with its message) outlives every later refresh,
+        // so a poll that missed the moment still sees the outcome.
+        let done = Status {
+            install_status: "done".into(),
+            complete: true,
+            ..running.clone()
+        };
+        let mut fresh = disk();
+        fresh.complete = true;
+        let s = carry_outcome(&done, fresh);
+        assert_eq!(s.install_status, "done");
+        assert!(s.complete);
+        let failed = Status {
+            install_status: "failed".into(),
+            error: Some("uv exited with status 1".into()),
+            ..running
+        };
+        let s = carry_outcome(&carry_outcome(&failed, disk()), disk());
+        assert_eq!(s.install_status, "failed");
+        assert_eq!(s.error.as_deref(), Some("uv exited with status 1"));
+
+        // Nothing installed this session (the slot's initial, empty status): the refresh
+        // is taken as it is, including a load failure it found on its own.
+        let mut found = disk();
+        found.install_status = "failed".into();
+        found.install_log = vec!["Traceback".into()];
+        let s = carry_outcome(&Status::default(), found);
+        assert_eq!(s.install_status, "failed");
+        assert_eq!(s.install_log, ["Traceback"]);
+        assert_eq!(
+            carry_outcome(&Status::default(), disk()).install_status,
+            "idle"
+        );
     }
 
     #[test]

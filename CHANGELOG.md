@@ -434,6 +434,20 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
+- **Desktop: Install on the MS2PIP and visDIA cards shows the installation.** The Setup
+  screen read the optional environments' status before declaring it, so every refresh
+  threw (`Cannot access 'm' before initialization`) once it reached the banner: the MS2PIP
+  and visDIA cards never left their first state, the log pane never showed their output,
+  and the poll that follows an installation never started. Clicking Install looked like
+  nothing happened while the installation ran to the end in the background. The cards now
+  show "installing…" from the click, the log pane streams that installation, the screen
+  polls until it and the load check after it finish, and the card ends on "installed",
+  "failed" or "cannot load" with Reinstall, or "update needed" with Update for an
+  environment behind its pins. An error from the install command, and a failed optional
+  installation, are shown in the banner. A rendering fault on this screen is now reported
+  in the banner rather than freezing it. `ci/test_desktop_ui.mjs` drives the Setup screen
+  in Node and runs in CI.
+
 - **Desktop: History lists every completed search, and says why a remembered folder is not
   one (#282).** History recognised only the files a single `run` writes (`manifest.json`,
   `psms_scored.parquet.report.json`), so every search run in "One experiment" mode, the

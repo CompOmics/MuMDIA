@@ -38,6 +38,7 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `ci/check_doc_refs.py` | Fails when a tracked file cites a Markdown document the repository does not ship |
 | `ci/check_workflows.py` | Rejects workflow YAML GitHub would refuse, notably duplicate mapping keys, which PyYAML accepts silently and which only surface when a workflow is dispatched |
 | `ci/check_desktop_ui.py` | Checks the desktop frontend against its backend: every element id it looks up exists, and the `invoke` names and `generate_handler!` list agree in both directions |
+| `ci/test_desktop_ui.mjs` | Drives the desktop Setup screen in Node (`vm`, a stub document and a fake `invoke`): the component cards, the install log pane and the poll through an installation and its load check. `APP_JS=<file>` runs it against another copy of `app.js` |
 | `ci/smoke.sh` | End-to-end smoke test: builds the fixture, runs `convert` and `run`, then `ci/check_smoke.py`; runnable locally as well as in CI |
 | `ci/make_fixture_mzml.py` | Generates the fixture mzML from `test_data/fixture.fasta` and the library the engine builds from it, so the planted peaks cannot disagree with the mass model |
 | `ci/check_smoke.py` | Asserts the smoke run's artifacts, manifest completeness, and schema versions |
