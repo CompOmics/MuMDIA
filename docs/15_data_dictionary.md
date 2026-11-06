@@ -1253,7 +1253,7 @@ peptides (docs/11), so the file then has about as many rows as `peptides.tsv`.
 | `quantity` | `peptide_quant.parquet` joined on `(peptidoform, charge)` | single run only; empty when not quantifiable or no `--peptide-quant` was passed |
 | `n_runs` | `run_psm_q` | experiment only: runs in which the precursor has a target PSM at `run_psm_q <= --q` |
 | `quantity_<run>` | each run's `peptide_quant.parquet` | experiment only, one column per run, as in `peptides.tsv` |
-| `normalised_<run>` | `lfq_maxlfq.parquet.precursor.parquet` | experiment only, one column per run: the cross-run normalised precursor quantity; absent when the experiment has no precursor LFQ matrix |
+| `normalised_<run>` | `lfq_maxlfq.parquet.precursor.parquet` | experiment only, one column per run: the cross-run normalised precursor quantity, empty where the matrix holds 0 (its value for a run without a quantity); the columns are absent when the experiment has no precursor LFQ matrix |
 | `first_pass_<run>` | each run's `first_pass_id` | experiment only, when every run's `peptide_quant` carries it, as in `peptides.tsv` |
 | `is_transferred`, `transfer_q` | as in `peptides.tsv` | the acceptance basis |
 

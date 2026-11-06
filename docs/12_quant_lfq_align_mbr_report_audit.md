@@ -234,7 +234,8 @@ monoisotopic m/z from the shared mass model, five decimals, empty when the pepti
 not parse), `protein`, `protein_group`, `q_value` (= `precursor_q`), `peptide_q_value`,
 `protein_group_q_value`, `score`, then `apex_rt` and `quantity` for a single run, or
 `n_runs` (on `run_psm_q`), `quantity_<run>`, `normalised_<run>` (from
-`lfq_maxlfq.parquet.precursor.parquet`, when it exists) and `first_pass_<run>` (as in
+`lfq_maxlfq.parquet.precursor.parquet`, when it exists; empty where that matrix holds 0, its
+value for a run without a quantity) and `first_pass_<run>` (as in
 `peptides.tsv`) for an experiment, and finally `is_transferred`, `transfer_q` and the
 localisation columns when the `localise` stage ran. `peptide_q_value` and
 `protein_group_q_value` are the q of the base peptide and protein group the row belongs to,

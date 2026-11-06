@@ -940,8 +940,12 @@ pub fn run_experiment_localised(
                 )?;
             }
             if p.precursor_lfq.is_some() {
-                for x in prec_lfq.get(&key).unwrap_or(&none) {
-                    write!(w3, "\t{}", qcell(*x))?;
+                // The matrix stores 0 for a run in which the precursor has no quantity;
+                // that is a missing value, not an abundance of zero, so it prints empty,
+                // as an unquantified `quantity_<run>` does.
+                for &x in prec_lfq.get(&key).unwrap_or(&none) {
+                    let x = if x > 0.0 { x } else { f64::NAN };
+                    write!(w3, "\t{}", qcell(x))?;
                 }
             }
             for flags in &pep_first {
@@ -3154,11 +3158,17 @@ mod tests {
             vec![
                 Col::Str(
                     "group".into(),
-                    vec!["PEPTIDEK".into(), "PEPTIDEK".into(), "SECONDK".into()],
+                    vec![
+                        "PEPTIDEK".into(),
+                        "PEPTIDEK".into(),
+                        "SECONDK".into(),
+                        "SECONDK".into(),
+                    ],
                 ),
-                Col::I32("charge".into(), vec![2, 2, 2]),
-                Col::I32("run".into(), vec![0, 1, 1]),
-                Col::F64("quantity".into(), vec![11.0, 12.5, 7.0]),
+                Col::I32("charge".into(), vec![2, 2, 2, 2]),
+                Col::I32("run".into(), vec![0, 1, 0, 1]),
+                // The matrix's 0 for a run without a quantity prints empty.
+                Col::F64("quantity".into(), vec![11.0, 12.5, 0.0, 7.0]),
             ],
         )
         .unwrap();
