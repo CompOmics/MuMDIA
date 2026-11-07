@@ -3051,8 +3051,10 @@ pub struct QuantConfig {
     /// `integration_hi_rt` report the shifted window. Needs the scan form of the fixed window
     /// (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`, `fixed_scan_halfwidth_scale = 0`).
     /// Default `profile` since 2026-11-07 (docs/12, "Default quantification recipe"); `apex`
-    /// restores the previous default. A configuration that does not set this key and sets a
-    /// window that is not the scan form gets `apex`, with a warning. Written to the canonical
+    /// restores the previous default. A configuration that does not set this key gets `apex`
+    /// when it sets a fragment rule other than `pattern_fit` / `pattern_profile` (the window
+    /// that rule was chosen with), and, with a warning, when it sets a window that is not the
+    /// scan form. Written to the canonical
     /// configuration except at `apex`, so that a configuration setting `apex` keeps the hash
     /// it had when `apex` was the default.
     #[serde(skip_serializing_if = "WindowCentre::is_apex")]
@@ -4886,6 +4888,15 @@ impl Config {
             && q.fixed_window_s == 0.0
             && q.fixed_scan_halfwidth_scale == 0.0;
         let mut notes: Vec<String> = Vec::new();
+        // A configuration that chose its own fragment rule other than a pattern rule keeps the
+        // window that rule was chosen with, the apex window, unless it sets `window_centre`
+        // as well: the profile centre was validated with the pattern fit.
+        if !q.explicit.window_centre
+            && q.explicit.fragment_selection
+            && !q.fragment_selection.uses_pattern_fit()
+        {
+            q.window_centre = WindowCentre::Apex;
+        }
         if !q.explicit.window_centre && q.window_centre == WindowCentre::Profile && !scan_window {
             q.window_centre = WindowCentre::Apex;
             notes.push(
@@ -7271,6 +7282,17 @@ mod tests {
         assert_eq!(q.fragment_selection, FragmentSelection::ObservedArea);
         let q = r(r#"{"quant":{"normalisation_scope":"condition"}}"#);
         assert!(q.normalisation.is_off());
+        // An explicit rule other than a pattern rule keeps the apex window, silently: a
+        // configuration that chose `observed_area` or the diaPASEF recipe's `cross_run`
+        // quantifies as it did.
+        for rule in ["observed_area", "predicted", "cross_run"] {
+            let q = r(&format!(r#"{{"quant":{{"fragment_selection":"{rule}"}}}}"#));
+            assert_eq!(q.window_centre, WindowCentre::Apex, "{rule}");
+        }
+        let q = r(r#"{"quant":{"fragment_selection":"predicted","window_centre":"profile"}}"#);
+        assert_eq!(q.window_centre, WindowCentre::Profile);
+        let q = r(r#"{"quant":{"fragment_selection":"pattern_profile"}}"#);
+        assert_eq!(q.window_centre, WindowCentre::Profile);
         // Nothing to resolve in the defaults.
         let mut d = Config::default();
         assert!(d.resolve_quant_recipe().is_empty());
