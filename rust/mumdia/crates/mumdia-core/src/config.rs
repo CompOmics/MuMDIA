@@ -2893,16 +2893,16 @@ pub struct QuantConfig {
     /// peak wings. Off by default (identity on a clean peak). Opt-in and
     /// benchmark-gated: it changes reported quantities.
     pub interference_envelope: bool,
-    /// Which fragments enter the top-N sum. `observed_area` (default, legacy) ranks
-    /// by the integrated area itself, which preferentially selects interfered
+    /// Which fragments enter the top-N sum. `observed_area` (the default before 2026-11-07)
+    /// ranks by the integrated area itself, which preferentially selects interfered
     /// fragments (their areas are inflated) and so varies run to run.
     /// `predicted` ranks by the library (predicted or empirical) fragment intensity,
     /// a per-precursor constant, so every run sums the same fragments. Astral HYE
     /// 2026-08-26 (pipeline of that date): CV 0.163 -> 0.112 on 6/6 ions at top-3. That
     /// CV gain does not reproduce with 0.8.0: on fixed ProteoBench Astral identifications,
     /// 6/6 ions, the median CV is 0.136 for `observed_area` and 0.151 for `predicted`.
-    /// Benchmark-gated. `cross_run` weights each fragment by its consistency across the
-    /// runs of an experiment ([`FragmentSelection::CrossRun`]); benchmark-gated as well.
+    /// `cross_run` weights each fragment by its consistency across the runs of an
+    /// experiment ([`FragmentSelection::CrossRun`]). Both are opt-in.
     /// Under interference `observed_area` compresses the ratios of the minor species: with
     /// 0.8.0 on fixed identifications (ProteoBench default view, ions in at least 3 of 6
     /// runs) the E. coli median log2 A/B (expected -2) is -1.43 / -1.68 / -1.71 for
@@ -2911,7 +2911,18 @@ pub struct QuantConfig {
     /// "Fragment selection under interference").
     /// `pattern_fit` and `pattern_profile` fit the window samples to the library pattern with
     /// one dispersion fitted over the runs of an experiment ([`FragmentSelection::PatternFit`],
-    /// [`FragmentSelection::PatternProfile`]); benchmark-gated.
+    /// [`FragmentSelection::PatternProfile`]).
+    ///
+    /// Default `pattern_fit` since 2026-11-07, with `window_centre = profile` and
+    /// `normalisation = stable_set` (the quantification recipe of docs/12, "Default
+    /// quantification recipe"). Where the cross-run step does not run (a single `run`, `quant`
+    /// without `--cross-run-from`, fewer than 3 runs sharing a candidate) it is `predicted`
+    /// with `top_n_fragments`. `observed_area` restores the previous default. A configuration
+    /// that does not set this key and asks for something the pattern fit cannot combine with
+    /// (a window that is not the scan form, `interference_envelope`, the per-run
+    /// `baseline_subtract = true`, `groups.window_groups > 1` or
+    /// `experiment.rt_library_scope = per_run`) gets `observed_area`, with a warning; set
+    /// explicitly, those combinations are refused.
     pub fragment_selection: FragmentSelection,
     /// When > 0, integrate each fragment over the `2k+1` scans centred on the
     /// identification apex instead of the descent-walk window (`bound_peak`
@@ -2939,8 +2950,25 @@ pub struct QuantConfig {
     /// intensities in the two flanks (`baseline_flank_scans` samples on each side
     /// of the integration window); window intensities are clipped at zero after
     /// subtraction. Targets the additive floor that compresses ratios in the
-    /// low-abundance condition. Off by default; benchmark-gated.
-    pub baseline_subtract: bool,
+    /// low-abundance condition.
+    ///
+    /// `true`, `false` or `"auto"`. `"auto"` (the default since 2026-11-07) subtracts the
+    /// experiment background (`baseline_source = experiment`) under the pattern rules, before
+    /// the profile centre, the pattern fit and its dispersion, when the experiment's traces
+    /// carry an additive floor: when the median over the runs of the share of exactly-zero
+    /// flank samples is below `baseline_auto_zero_share`. Centroided Orbitrap traces leave the
+    /// flanks empty (85-93% zeros) and keep it off; diaPASEF traces carry a floor (46%) and
+    /// turn it on. One decision per experiment, recorded per run in the quant report
+    /// (`baseline_auto`) and in the experiment manifest. It needs the cross-run step, so it is
+    /// off in a single `run`, in `quant` without `--cross-run-from` and under a rule other
+    /// than `pattern_fit` / `pattern_profile`. `false` restores the previous default.
+    pub baseline_subtract: BaselineSubtract,
+    /// `baseline_subtract = "auto"`: the experiment background is subtracted when the median
+    /// over the runs of the share of exactly-zero flank samples is below this. 0.7 separates
+    /// the measured Orbitrap runs (0.86-0.93) from diaPASEF (0.46). In `[0, 1]`. Omitted from
+    /// the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_default_zero_share")]
+    pub baseline_auto_zero_share: f64,
     /// Flank length (samples per side) used to estimate the background.
     pub baseline_flank_scans: usize,
     /// Quantile of the flank intensities taken as the background level.
@@ -2970,14 +2998,18 @@ pub struct QuantConfig {
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub fixed_scan_halfwidth_scale: f64,
     /// Cross-run normalisation of the per-run precursor quantities, by `run-experiment`
-    /// after per-run quant and by `mumdia quant-normalise`. `off` (default): none.
+    /// after per-run quant and by `mumdia quant-normalise`. `off`: none.
     /// `stable_set`: one log2 shift per run and retention-time bin, the median deviation of a
     /// stable set of ions, those whose profile across the runs belongs to the largest
     /// population of a principal-component subspace of the run space (docs/12, "Cross-run
     /// normalisation"). The result is a separate table per run,
     /// `peptide_quant_normalised.parquet` (`quantity_normalised`), next to an unchanged
     /// `peptide_quant.parquet`, plus the fitted shifts in `quant_normalisation.parquet`.
-    /// Benchmark-gated. Omitted from the canonical configuration at its default.
+    /// Default `stable_set` since 2026-11-07 (docs/12, "Default quantification recipe"); `off`
+    /// restores the previous default. A configuration that does not set this key and sets
+    /// `normalisation_scope = condition` gets `off`, with a warning. Written to the canonical
+    /// configuration except at `off`, so that a configuration setting `off` keeps the hash it
+    /// had when `off` was the default.
     #[serde(skip_serializing_if = "CrossRunNormalisation::is_off")]
     pub normalisation: CrossRunNormalisation,
     /// The cross-run MaxLFQ of `run-experiment` reads `quantity_normalised` without its own
@@ -3010,7 +3042,7 @@ pub struct QuantConfig {
     /// unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub normalisation_rank: Option<usize>,
-    /// Where the fixed scan window is centred. `apex` (default): on the sample nearest the
+    /// Where the fixed scan window is centred. `apex`: on the sample nearest the
     /// identification apex. `profile`: on the centre of the 3-sample block, within 2 samples
     /// of that sample, with the largest summed raw intensity of the 6 fragments with the
     /// highest library intensity (ties to the smaller shift), one centre for all of the
@@ -3018,7 +3050,13 @@ pub struct QuantConfig {
     /// identification apex and `integration_apex_rt` do not move; `integration_lo_rt` and
     /// `integration_hi_rt` report the shifted window. Needs the scan form of the fixed window
     /// (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`, `fixed_scan_halfwidth_scale = 0`).
-    /// Benchmark-gated. Omitted from the canonical configuration at its default.
+    /// Default `profile` since 2026-11-07 (docs/12, "Default quantification recipe"); `apex`
+    /// restores the previous default. A configuration that does not set this key gets `apex`
+    /// when it sets a fragment rule other than `pattern_fit` / `pattern_profile` (the window
+    /// that rule was chosen with), and, with a warning, when it sets a window that is not the
+    /// scan form. Written to the canonical
+    /// configuration except at `apex`, so that a configuration setting `apex` keeps the hash
+    /// it had when `apex` was the default.
     #[serde(skip_serializing_if = "WindowCentre::is_apex")]
     pub window_centre: WindowCentre,
     /// Write which fragments made each precursor quantity: the final quant of `run` and
@@ -3035,21 +3073,107 @@ pub struct QuantConfig {
     /// canonical configuration at its default.
     #[serde(skip_serializing_if = "is_false")]
     pub fragment_detail: bool,
+    /// Which keys of the quantification recipe the configuration file set. Not part of the
+    /// configuration: [`Config::from_json`] fills it, and [`Config::resolve_quant_recipe`]
+    /// reads it to tell a default that does not fit the rest of the configuration (replaced,
+    /// with a warning) from an explicit request (refused by validation).
+    #[serde(skip)]
+    pub explicit: QuantExplicit,
+}
+
+/// The keys of the quantification recipe a configuration file set explicitly. See
+/// [`QuantConfig::explicit`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuantExplicit {
+    pub fragment_selection: bool,
+    pub window_centre: bool,
+    pub normalisation: bool,
+}
+
+/// `quant.baseline_subtract`: `false`, `true` or `"auto"`. See
+/// [`QuantConfig::baseline_subtract`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BaselineSubtract {
+    /// No background is subtracted (`false`).
+    Off,
+    /// The background of `baseline_source` is subtracted (`true`).
+    On,
+    /// The experiment background is subtracted under the pattern rules when the flanks carry
+    /// a floor (`"auto"`, the default).
+    #[default]
+    Auto,
+}
+
+impl BaselineSubtract {
+    /// `true`: subtracted whatever the data.
+    pub fn is_on(self) -> bool {
+        self == Self::On
+    }
+
+    /// `"auto"`: decided from the share of exactly-zero flank samples.
+    pub fn is_auto(self) -> bool {
+        self == Self::Auto
+    }
+}
+
+impl Serialize for BaselineSubtract {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => s.serialize_bool(false),
+            Self::On => s.serialize_bool(true),
+            Self::Auto => s.serialize_str("auto"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BaselineSubtract {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = BaselineSubtract;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("true, false or \"auto\"")
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(if v {
+                    BaselineSubtract::On
+                } else {
+                    BaselineSubtract::Off
+                })
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "auto" => Ok(BaselineSubtract::Auto),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(v), &self)),
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// The default of [`QuantConfig::baseline_auto_zero_share`].
+pub const BASELINE_AUTO_ZERO_SHARE: f64 = 0.7;
+
+fn is_default_zero_share(v: &f64) -> bool {
+    *v == BASELINE_AUTO_ZERO_SHARE
 }
 
 /// Centre of the fixed scan window. See [`QuantConfig::window_centre`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WindowCentre {
-    /// The sample nearest the identification apex (default).
-    #[default]
+    /// The sample nearest the identification apex (the default before 2026-11-07).
     Apex,
-    /// The largest 3-sample block of the summed top-6 library fragments within 2 samples.
+    /// The largest 3-sample block of the summed top-6 library fragments within 2 samples
+    /// (default).
+    #[default]
     Profile,
 }
 
 impl WindowCentre {
-    /// The default, which the canonical configuration omits.
+    /// The previous default, which the canonical configuration omits so that a configuration
+    /// setting it keeps the hash it had then.
     pub fn is_apex(&self) -> bool {
         *self == WindowCentre::Apex
     }
@@ -3059,16 +3183,17 @@ impl WindowCentre {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CrossRunNormalisation {
-    /// No normalisation table is written (default).
-    #[default]
+    /// No normalisation table is written (the default before 2026-11-07).
     Off,
     /// Per-run, retention-time-binned median of the log2 deviations of a stable set of
-    /// ions, selected by their profile across the runs (`stages::quant_stable`).
+    /// ions, selected by their profile across the runs (`stages::quant_stable`). Default.
+    #[default]
     StableSet,
 }
 
 impl CrossRunNormalisation {
-    /// The default, which the canonical configuration omits.
+    /// The previous default, which the canonical configuration omits so that a configuration
+    /// setting it keeps the hash it had then.
     pub fn is_off(&self) -> bool {
         *self == CrossRunNormalisation::Off
     }
@@ -3118,6 +3243,22 @@ pub fn condition_label_problem(label: &str) -> Option<&'static str> {
 }
 
 impl QuantConfig {
+    /// The quantification defaults before 2026-11-07: the window centred on the
+    /// identification apex, the top-N fragments ranked by observed area, no background and no
+    /// cross-run normalisation. A configuration that sets
+    /// `{"window_centre": "apex", "fragment_selection": "observed_area",
+    /// "baseline_subtract": false, "normalisation": "off"}` quantifies with exactly these
+    /// values, and its canonical configuration is the one the previous default had.
+    pub fn previous_defaults() -> QuantConfig {
+        QuantConfig {
+            fragment_selection: FragmentSelection::ObservedArea,
+            window_centre: WindowCentre::Apex,
+            normalisation: CrossRunNormalisation::Off,
+            baseline_subtract: BaselineSubtract::Off,
+            ..QuantConfig::default()
+        }
+    }
+
     /// Whether quantification needs the cross-run step of `run-experiment`: a first quant
     /// pass over every run, a fit over their fragment tables, and a second pass with it.
     /// The one trigger of that step.
@@ -3139,8 +3280,7 @@ impl QuantConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FragmentSelection {
-    /// Rank fragments by their own integrated area (legacy).
-    #[default]
+    /// Rank fragments by their own integrated area (the default before 2026-11-07).
     ObservedArea,
     /// Rank fragments by library intensity (`predicted_intensity` in the chromatogram table).
     Predicted,
@@ -3162,7 +3302,11 @@ pub enum FragmentSelection {
     /// `run-experiment` and at least 3 runs (docs/12, "Profile-centred window and pattern
     /// fit"). Without the step, or where `phi` cannot be estimated, `predicted` applies,
     /// with `top_n_fragments`. Needs the scan form of the fixed window and refuses the
-    /// baseline and the envelope. Benchmark-gated.
+    /// per-run baseline and the envelope; the experiment background
+    /// (`baseline_source = experiment`, or `baseline_subtract = "auto"` where it applies) is
+    /// subtracted from the samples before the profile centre, the fit and its dispersion.
+    /// Default since 2026-11-07.
+    #[default]
     PatternFit,
     /// As `pattern_fit`, but the quantity is the integral of the rank-1 model's elution
     /// profile over the window (the first level alone), times the pattern scale. Same
@@ -3219,20 +3363,24 @@ impl Default for QuantConfig {
             reliable_q: 0.001,
             q_filter: QuantQColumn::PeptideQ,
             interference_envelope: false, // apex-outward interference envelope off by default
-            fragment_selection: FragmentSelection::ObservedArea,
+            // The quantification recipe (2026-11-07): profile-centred window, pattern fit,
+            // stable-set normalisation and the background chosen from the data.
+            fragment_selection: FragmentSelection::PatternFit,
             fixed_scan_halfwidth: 3, // fixed +/-3-sample window (2026-10-04)
-            baseline_subtract: false,
+            baseline_subtract: BaselineSubtract::Auto,
+            baseline_auto_zero_share: 0.7, // BASELINE_AUTO_ZERO_SHARE
             baseline_flank_scans: 12,
             baseline_quantile: 0.25,
             fixed_window_s: 0.0,
             baseline_source: BaselineSource::Run,
             fixed_scan_halfwidth_scale: 0.0,
-            normalisation: CrossRunNormalisation::Off,
+            normalisation: CrossRunNormalisation::StableSet,
             normalisation_lfq: false,
             normalisation_scope: NormalisationScope::All,
             normalisation_rank: None,
-            window_centre: WindowCentre::Apex,
+            window_centre: WindowCentre::Profile,
             fragment_detail: false,
+            explicit: QuantExplicit::default(),
         }
     }
 }
@@ -4714,12 +4862,100 @@ impl Config {
                 > 0
     }
 
-    /// Parse from a JSON string, rejecting unknown keys, then validate.
+    /// Parse from a JSON string, rejecting unknown keys, record which keys of the
+    /// quantification recipe it sets ([`QuantConfig::explicit`]), resolve the recipe's
+    /// defaults against the rest of it ([`Config::resolve_quant_recipe`]), then validate.
     pub fn from_json(s: &str) -> Result<Self, crate::error::ConfigError> {
-        let c: Config =
+        let mut c: Config =
             serde_json::from_str(s).map_err(|e| crate::error::ConfigError::Parse(e.to_string()))?;
+        c.quant.explicit = quant_explicit_keys(s);
+        c.resolve_quant_recipe();
         c.validate()?;
         Ok(c)
+    }
+
+    /// Replace a default of the quantification recipe (`quant.window_centre = profile`,
+    /// `quant.fragment_selection = pattern_fit`, `quant.normalisation = stable_set`) that the
+    /// rest of the configuration rules out by the previous default, with a warning, and return
+    /// one line per replacement. A key the configuration set itself
+    /// ([`QuantConfig::explicit`]) is left alone, so that validation refuses the combination
+    /// instead of quietly running something else.
+    pub fn resolve_quant_recipe(&mut self) -> Vec<String> {
+        let grouped = self.groups.window_groups > 1;
+        let per_run = self.experiment.rt_library_scope == RtLibraryScope::PerRun;
+        let q = &mut self.quant;
+        let scan_window = q.fixed_scan_halfwidth > 0
+            && q.fixed_window_s == 0.0
+            && q.fixed_scan_halfwidth_scale == 0.0;
+        let mut notes: Vec<String> = Vec::new();
+        // A configuration that chose its own fragment rule other than a pattern rule keeps the
+        // window that rule was chosen with, the apex window, unless it sets `window_centre`
+        // as well: the profile centre was validated with the pattern fit.
+        if !q.explicit.window_centre
+            && q.explicit.fragment_selection
+            && !q.fragment_selection.uses_pattern_fit()
+        {
+            q.window_centre = WindowCentre::Apex;
+        }
+        if !q.explicit.window_centre && q.window_centre == WindowCentre::Profile && !scan_window {
+            q.window_centre = WindowCentre::Apex;
+            notes.push(
+                "quant.window_centre = apex: the profile centre moves the scan window by whole \
+                 samples, and quant.fixed_scan_halfwidth, fixed_window_s or \
+                 fixed_scan_halfwidth_scale chose another window"
+                    .to_string(),
+            );
+        }
+        if !q.explicit.fragment_selection && q.fragment_selection.uses_pattern_fit() {
+            let why = if !scan_window {
+                Some(
+                    "it fits the samples of the scan form of the fixed window, which \
+                      quant.fixed_scan_halfwidth, fixed_window_s or fixed_scan_halfwidth_scale \
+                      replaced",
+                )
+            } else if q.interference_envelope {
+                Some(
+                    "it models the raw window samples, which quant.interference_envelope \
+                      reshapes",
+                )
+            } else if q.baseline_subtract.is_on() && q.baseline_source == BaselineSource::Run {
+                Some(
+                    "it does not combine with the per-run quant.baseline_subtract \
+                      (baseline_source = run)",
+                )
+            } else if grouped {
+                Some("its cross-run step is not supported with groups.window_groups > 1")
+            } else if per_run {
+                Some(
+                    "its cross-run step is not supported with \
+                      experiment.rt_library_scope = per_run",
+                )
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                notes.push(format!(
+                    "quant.fragment_selection = observed_area in place of the default {:?}: {why}",
+                    q.fragment_selection
+                ));
+                q.fragment_selection = FragmentSelection::ObservedArea;
+            }
+        }
+        if !q.explicit.normalisation
+            && !q.normalisation.is_off()
+            && q.normalisation_scope == NormalisationScope::Condition
+        {
+            q.normalisation = CrossRunNormalisation::Off;
+            notes.push(
+                "quant.normalisation = off in place of the default stable_set: \
+                 quant.normalisation_scope = condition does not combine with it"
+                    .to_string(),
+            );
+        }
+        for n in &notes {
+            tracing::warn!("{n}; set the key to keep this choice without the warning");
+        }
+        notes
     }
 
     /// Reject config combinations that would silently produce wrong or invalid
@@ -4791,13 +5027,20 @@ impl Config {
                 "quant.baseline_quantile must be finite and in [0, 1].".into(),
             ));
         }
-        if self.quant.baseline_source == BaselineSource::Experiment && !self.quant.baseline_subtract
+        if self.quant.baseline_source == BaselineSource::Experiment
+            && !self.quant.baseline_subtract.is_on()
         {
             return Err(Invalid(
                 "quant.baseline_source = experiment replaces the level baseline_subtract \
                  subtracts, so it needs quant.baseline_subtract = true."
                     .into(),
             ));
+        }
+        let zs = self.quant.baseline_auto_zero_share;
+        if !zs.is_finite() || !(0.0..=1.0).contains(&zs) {
+            return Err(Invalid(format!(
+                "quant.baseline_auto_zero_share must be finite and in [0, 1] (got {zs})."
+            )));
         }
         let scale = self.quant.fixed_scan_halfwidth_scale;
         if !scale.is_finite() || scale < 0.0 {
@@ -4856,11 +5099,15 @@ impl Config {
                     self.quant.fragment_selection
                 )));
             }
-            if self.quant.baseline_subtract || self.quant.interference_envelope {
+            let run_baseline = self.quant.baseline_subtract.is_on()
+                && self.quant.baseline_source == BaselineSource::Run;
+            if run_baseline || self.quant.interference_envelope {
                 return Err(Invalid(format!(
-                    "quant.fragment_selection = {:?} models the raw window samples, so it \
-                     does not combine with quant.baseline_subtract or \
-                     quant.interference_envelope.",
+                    "quant.fragment_selection = {:?} models the window samples less one \
+                     background per fragment and run, so it does not combine with the per-run \
+                     quant.baseline_subtract (baseline_source = run) or \
+                     quant.interference_envelope. The experiment background \
+                     (baseline_source = experiment) does.",
                     self.quant.fragment_selection
                 )));
             }
@@ -5075,7 +5322,7 @@ impl Config {
                  fixed_scan_halfwidth is ignored"
             );
         }
-        if self.quant.baseline_subtract
+        if self.quant.baseline_subtract.is_on()
             && self.quant.fixed_scan_halfwidth == 0
             && self.quant.fixed_window_s == 0.0
         {
@@ -5912,6 +6159,19 @@ impl Config {
     }
 }
 
+/// Which keys of the quantification recipe the JSON configuration `s` sets
+/// ([`QuantConfig::explicit`]). Called on text that already parsed as a [`Config`].
+fn quant_explicit_keys(s: &str) -> QuantExplicit {
+    let v: serde_json::Value = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
+    let q = v.get("quant");
+    let has = |k: &str| q.and_then(|q| q.get(k)).is_some();
+    QuantExplicit {
+        fragment_selection: has("fragment_selection"),
+        window_centre: has("window_centre"),
+        normalisation: has("normalisation"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6057,8 +6317,11 @@ mod tests {
         assert!(none
             .canonical_json()
             .contains(r#""normalisation_scope":"none""#));
-        let mut cond: Config =
-            serde_json::from_str(r#"{"quant": {"normalisation_scope": "condition"}}"#).unwrap();
+        // The default stable-set normalisation gives way to the condition scope it does not
+        // combine with ([`Config::resolve_quant_recipe`]).
+        let mut cond =
+            Config::from_json(r#"{"quant": {"normalisation_scope": "condition"}}"#).unwrap();
+        assert!(cond.quant.normalisation.is_off());
         assert!(cond.validate().is_ok());
         let bare = cond.canonical_json();
         assert!(
@@ -6098,10 +6361,17 @@ mod tests {
     /// refused.
     #[test]
     fn cross_run_normalisation_defaults_stay_out_of_the_canonical_json() {
+        // `stable_set` is the default since 2026-11-07 and part of the canonical
+        // configuration; `off`, the previous default, is left out of it.
         let c = Config::default();
-        assert_eq!(c.quant.normalisation, CrossRunNormalisation::Off);
+        assert_eq!(c.quant.normalisation, CrossRunNormalisation::StableSet);
         assert!(c.validate().is_ok());
-        assert!(!c.canonical_json().contains("normalisation"));
+        assert!(c
+            .canonical_json()
+            .contains(r#""normalisation":"stable_set""#));
+        let off = Config::from_json(r#"{"quant": {"normalisation": "off"}}"#).unwrap();
+        assert!(!off.canonical_json().contains(r#""normalisation""#));
+        assert!(!off.canonical_json().contains("normalisation_"));
         let on: QuantConfig =
             serde_json::from_str(r#"{"normalisation": "stable_set", "normalisation_lfq": true}"#)
                 .unwrap();
@@ -6306,18 +6576,19 @@ mod tests {
         assert_eq!(c.quant.top_n_fragments, 12);
         assert_eq!(c.quant.fixed_window_s, 5.0);
         assert_eq!(c.quant.fixed_scan_halfwidth, 3);
-        assert!(c.quant.baseline_subtract);
+        assert_eq!(c.quant.baseline_subtract, BaselineSubtract::On);
         assert_eq!(c.quant.baseline_flank_scans, 8);
         assert_eq!(c.quant.baseline_quantile, 0.5);
 
-        // Defaults: the fixed +/-3-sample window since 2026-10-04 (seconds form off),
-        // ranking by observed area, no baseline. `fixed_scan_halfwidth: 0` restores the
-        // walked window a config written before 2026-10-04 quantified with.
+        // Defaults: the fixed +/-3-sample window since 2026-10-04 (seconds form off), the
+        // pattern fit and the background chosen from the data since 2026-11-07.
+        // `fixed_scan_halfwidth: 0` restores the walked window a config written before
+        // 2026-10-04 quantified with.
         let d = QuantConfig::default();
-        assert_eq!(d.fragment_selection, FragmentSelection::ObservedArea);
+        assert_eq!(d.fragment_selection, FragmentSelection::PatternFit);
         assert_eq!(d.fixed_scan_halfwidth, 3);
         assert_eq!(d.fixed_window_s, 0.0);
-        assert!(!d.baseline_subtract);
+        assert_eq!(d.baseline_subtract, BaselineSubtract::Auto);
         assert_eq!(
             Config::default().quant.fragment_selection,
             d.fragment_selection
@@ -6780,7 +7051,7 @@ mod tests {
         for key in ["baseline_source", "fixed_scan_halfwidth_scale"] {
             assert!(!canon.contains(key), "{key} in {canon}");
         }
-        assert!(!d.quant.needs_cross_run_fit());
+        assert!(!QuantConfig::previous_defaults().needs_cross_run_fit());
         let explicit = Config::from_json(
             r#"{"quant":{"baseline_source":"run","fixed_scan_halfwidth_scale":0.0}}"#,
         )
@@ -6820,7 +7091,10 @@ mod tests {
     /// window or their inputs do not exist.
     #[test]
     fn pattern_rules_window_centre_and_stable_set_parse_and_validate() {
-        let d = Config::default();
+        let d = Config {
+            quant: QuantConfig::previous_defaults(),
+            ..Config::default()
+        };
         let canon = d.canonical_json();
         for key in [
             "window_centre",
@@ -6856,7 +7130,8 @@ mod tests {
         let p = Config::from_json(r#"{"quant":{"fragment_selection":"pattern_profile"}}"#).unwrap();
         assert!(p.quant.fragment_selection.uses_pattern_fit());
         assert!(p.quant.needs_cross_run_fit());
-        let off: QuantConfig = serde_json::from_str(r#"{"normalisation_lfq":true}"#).unwrap();
+        let off: QuantConfig =
+            serde_json::from_str(r#"{"normalisation":"off","normalisation_lfq":true}"#).unwrap();
         assert!(!off.lfq_reads_normalised());
         let on: QuantConfig =
             serde_json::from_str(r#"{"normalisation":"stable_set","normalisation_lfq":true}"#)
@@ -6879,21 +7154,164 @@ mod tests {
     #[test]
     fn needs_cross_run_fit_is_any_of_the_three_keys() {
         let mut q = QuantConfig::default();
+        // The default pattern fit is one of them.
+        assert!(q.needs_cross_run_fit());
+        q.fragment_selection = FragmentSelection::ObservedArea;
         assert!(!q.needs_cross_run_fit());
         q.fragment_selection = FragmentSelection::Predicted;
-        q.baseline_subtract = true;
+        q.baseline_subtract = BaselineSubtract::On;
         q.baseline_quantile = 0.6;
         assert!(!q.needs_cross_run_fit());
         q.fragment_selection = FragmentSelection::CrossRun;
         assert!(q.needs_cross_run_fit());
         let mut q = QuantConfig {
             baseline_source: BaselineSource::Experiment,
+            fragment_selection: FragmentSelection::ObservedArea,
             ..QuantConfig::default()
         };
         assert!(q.needs_cross_run_fit());
         q.baseline_source = BaselineSource::Run;
         q.fixed_scan_halfwidth_scale = 2.5;
         assert!(q.needs_cross_run_fit());
+    }
+
+    /// The canonical quant section of the defaults before 2026-11-07, as a manifest of that
+    /// time records it (main 69468bb, with `q_filter` at its default).
+    const PREVIOUS_DEFAULT_QUANT: &str = r#""quant":{"q_threshold":0.01,"top_n_fragments":3,"top_n_peptides":3,"rollup":"top_n_sum","bound_peak":true,"peak_fraction":0.16666666666666666,"peak_grace":1,"peak_window_mode":"per_candidate","reliable_q":0.001,"q_filter":"peptide_q","interference_envelope":false,"fragment_selection":"observed_area","fixed_scan_halfwidth":3,"baseline_subtract":false,"baseline_flank_scans":12,"baseline_quantile":0.25,"fixed_window_s":0.0}"#;
+
+    /// A configuration that sets the four previous defaults explicitly quantifies with the
+    /// previous values and keeps the previous canonical configuration, hence the previous
+    /// config hash, byte for byte.
+    #[test]
+    fn the_previous_quant_defaults_are_reproduced_by_setting_them() {
+        let legacy = Config::from_json(
+            r#"{"quant":{"window_centre":"apex","fragment_selection":"observed_area",
+                "baseline_subtract":false,"normalisation":"off"}}"#,
+        )
+        .unwrap();
+        let prev = QuantConfig::previous_defaults();
+        assert_eq!(
+            serde_json::to_value(&legacy.quant).unwrap(),
+            serde_json::to_value(&prev).unwrap()
+        );
+        assert_eq!(legacy.quant.window_centre, WindowCentre::Apex);
+        assert_eq!(legacy.quant.baseline_subtract, BaselineSubtract::Off);
+        assert!(legacy.quant.normalisation.is_off());
+        assert!(!legacy.quant.needs_cross_run_fit());
+        let canon = legacy.canonical_json();
+        assert!(canon.contains(PREVIOUS_DEFAULT_QUANT), "{canon}");
+        let built = Config {
+            quant: prev,
+            ..Config::default()
+        };
+        assert_eq!(built.canonical_json(), canon);
+        // The new defaults are part of the canonical configuration.
+        let d = Config::default().canonical_json();
+        for key in [
+            r#""fragment_selection":"pattern_fit""#,
+            r#""baseline_subtract":"auto""#,
+            r#""normalisation":"stable_set""#,
+            r#""window_centre":"profile""#,
+        ] {
+            assert!(d.contains(key), "{key} missing from {d}");
+        }
+        assert!(!d.contains("baseline_auto_zero_share"), "{d}");
+        assert!(!d.contains("explicit"), "{d}");
+        let t = Config::from_json(r#"{"quant":{"baseline_auto_zero_share":0.5}}"#).unwrap();
+        assert!(t
+            .canonical_json()
+            .contains(r#""baseline_auto_zero_share":0.5"#));
+    }
+
+    /// `baseline_subtract` reads `true`, `false` and `"auto"`, writes them back, and refuses
+    /// anything else; the threshold of `"auto"` is a share.
+    #[test]
+    fn baseline_subtract_reads_a_bool_or_auto() {
+        for (text, want) in [
+            ("true", BaselineSubtract::On),
+            ("false", BaselineSubtract::Off),
+            (r#""auto""#, BaselineSubtract::Auto),
+        ] {
+            let q: QuantConfig =
+                serde_json::from_str(&format!(r#"{{"baseline_subtract":{text}}}"#)).unwrap();
+            assert_eq!(q.baseline_subtract, want, "{text}");
+            assert_eq!(serde_json::to_string(&want).unwrap(), text);
+        }
+        for bad in [r#""on""#, "1", "null"] {
+            assert!(
+                serde_json::from_str::<QuantConfig>(&format!(r#"{{"baseline_subtract":{bad}}}"#))
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        for bad in ["-0.1", "1.5"] {
+            let j = format!(r#"{{"quant":{{"baseline_auto_zero_share":{bad}}}}}"#);
+            assert!(Config::from_json(&j).is_err(), "{j}");
+        }
+        // The experiment background still needs an explicit true.
+        assert!(Config::from_json(r#"{"quant":{"baseline_source":"experiment"}}"#).is_err());
+        assert!(Config::from_json(
+            r#"{"quant":{"baseline_subtract":"auto","baseline_source":"experiment"}}"#
+        )
+        .is_err());
+    }
+
+    /// A default of the recipe that the rest of the configuration rules out gives way to the
+    /// previous default; the same key set explicitly is refused instead.
+    #[test]
+    fn the_recipe_defaults_give_way_where_the_configuration_rules_them_out() {
+        let r = |j: &str| Config::from_json(j).unwrap().quant;
+        let q = r(r#"{"quant":{"fixed_window_s":5.0}}"#);
+        assert_eq!(q.window_centre, WindowCentre::Apex);
+        assert_eq!(q.fragment_selection, FragmentSelection::ObservedArea);
+        let q = r(r#"{"quant":{"fixed_scan_halfwidth":0}}"#);
+        assert_eq!(q.window_centre, WindowCentre::Apex);
+        assert_eq!(q.fragment_selection, FragmentSelection::ObservedArea);
+        let q = r(r#"{"quant":{"interference_envelope":true}}"#);
+        assert_eq!(q.window_centre, WindowCentre::Profile);
+        assert_eq!(q.fragment_selection, FragmentSelection::ObservedArea);
+        let q = r(r#"{"quant":{"baseline_subtract":true}}"#);
+        assert_eq!(q.fragment_selection, FragmentSelection::ObservedArea);
+        // The experiment background combines with the pattern fit.
+        let q = r(r#"{"quant":{"baseline_subtract":true,"baseline_source":"experiment"}}"#);
+        assert_eq!(q.fragment_selection, FragmentSelection::PatternFit);
+        let q = r(r#"{"groups":{"window_groups":2}}"#);
+        assert_eq!(q.fragment_selection, FragmentSelection::ObservedArea);
+        assert!(!q.needs_cross_run_fit());
+        let q = r(r#"{"experiment":{"rt_library_scope":"per_run"}}"#);
+        assert_eq!(q.fragment_selection, FragmentSelection::ObservedArea);
+        let q = r(r#"{"quant":{"normalisation_scope":"condition"}}"#);
+        assert!(q.normalisation.is_off());
+        // An explicit rule other than a pattern rule keeps the apex window, silently: a
+        // configuration that chose `observed_area` or the diaPASEF recipe's `cross_run`
+        // quantifies as it did.
+        for rule in ["observed_area", "predicted", "cross_run"] {
+            let q = r(&format!(r#"{{"quant":{{"fragment_selection":"{rule}"}}}}"#));
+            assert_eq!(q.window_centre, WindowCentre::Apex, "{rule}");
+        }
+        let q = r(r#"{"quant":{"fragment_selection":"predicted","window_centre":"profile"}}"#);
+        assert_eq!(q.window_centre, WindowCentre::Profile);
+        let q = r(r#"{"quant":{"fragment_selection":"pattern_profile"}}"#);
+        assert_eq!(q.window_centre, WindowCentre::Profile);
+        // Nothing to resolve in the defaults.
+        let mut d = Config::default();
+        assert!(d.resolve_quant_recipe().is_empty());
+        // Explicit keys are left alone, and validation refuses what does not combine.
+        for bad in [
+            r#"{"quant":{"fragment_selection":"pattern_fit","fixed_window_s":5.0}}"#,
+            r#"{"quant":{"window_centre":"profile","fixed_scan_halfwidth":0}}"#,
+            r#"{"quant":{"fragment_selection":"pattern_fit","interference_envelope":true}}"#,
+            r#"{"quant":{"fragment_selection":"pattern_fit","baseline_subtract":true}}"#,
+            r#"{"quant":{"normalisation":"stable_set","normalisation_scope":"condition"}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} accepted");
+        }
+        let g = Config::from_json(
+            r#"{"quant":{"fragment_selection":"pattern_fit"},"groups":{"window_groups":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(g.quant.fragment_selection, FragmentSelection::PatternFit);
+        assert!(g.quant.explicit.fragment_selection);
     }
 
     /// The dependencies between the cross-run keys are refused at load, each naming the key

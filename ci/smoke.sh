@@ -1073,8 +1073,10 @@ PYEOF
 # 5q. `quant.fragment_detail`: the single run and the two-run experiment with the key on.
 #     Each run's final quant writes quant_fragments.parquet beside its peptide_quant and the
 #     manifest records it; every other table is the plain search's, byte for byte, and no
-#     plain search writes the table. Under the default rule (observed_area, top 3) the
-#     selected areas, summed in rank order, are each quantity exactly.
+#     plain search writes the table. The default rule, pattern_fit, needs three runs for its
+#     dispersion, so the single run and the two-run experiment both quantify with its
+#     fallback, `predicted` top 3: the selected areas, summed in rank order, are each
+#     quantity exactly.
 echo "=== smoke: quant.fragment_detail"
 "$PY" - "$cfg" "$work/qf.json" "$work/exp_seq.json" "$work/exp_qf.json" <<'PYEOF'
 import json, sys
@@ -1140,8 +1142,8 @@ for d, rec in cases:
             continue
         rows = by.get(row["candidate_id"])
         check(rows is not None, f"{d}: quantified candidate {row['candidate_id']} has no rows")
-        check(all(r["rule"] == "observed_area" and r["weight"] == 1.0 for r in rows),
-              f"{d}: candidate {row['candidate_id']} is not under observed_area")
+        check(all(r["rule"] == "predicted" and r["weight"] == 1.0 for r in rows),
+              f"{d}: candidate {row['candidate_id']} is not under the predicted fallback")
         sel = sorted((r for r in rows if r["selected"]), key=lambda r: r["rank"])
         check(len(sel) == row["n_fragments_used"],
               f"{d}: candidate {row['candidate_id']} selects {len(sel)} fragments, "
