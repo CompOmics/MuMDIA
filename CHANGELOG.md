@@ -7,6 +7,28 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.10.0` is a minor rather than a patch release: it changes the layout and the content of what
+a search writes, and it refuses a configuration that earlier releases ran. The runs of an
+experiment, and of a `run` given several spectra files, are written to folders named after
+their input files instead of numbered folders, and the per-run report columns carry the same
+names (`experiment.run_naming = "index"` restores the previous names), so a script that builds
+the old run paths has to read them from the manifest. A FASTA search whose fragment
+intensities or retention times would come from the native models is refused before the digest,
+with the fixes in the message (`predict_frag.allow_native_predictors` runs it anyway), so a
+FASTA search without a configuration file no longer starts. Every search now writes
+`precursors.tsv`, a precursor-level report, and every experiment `lfq_size_factors.tsv`;
+`peptides.tsv`, `precursors.tsv` and `proteins.tsv` end with protein accessions, entry names and
+gene names when the library has a protein annotation table, which a library import and a FASTA
+build now write. The Parquet writer moved to a newer release whose files differ from those of
+the previous release in their footers alone, so every recorded content hash changes while
+every decoded value stays the same. New and opt-in are a cross-run normalisation scope
+(within each condition, or none), retention tiers that prune an output directory, precursor
+and fragment m/z limits for a FASTA-built library, protein N-terminal and other terminal
+modifications, modification site localisation, `mumdia build-library`, `mumdia mobilogram`,
+the fragments behind each quantity and movable storage locations. The desktop application
+converts an externally predicted spectral library for a search, lists experiments in its
+History and opens results in visDIA on any path.
+
 `0.9.0` is a minor rather than a patch release: it changes what a search finds on some data
 and the quantities of every 3D match-between-runs experiment. When the seed search finds too
 few confident targets it searches once more at twice the fragment tolerance and keeps the
@@ -128,7 +150,7 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
-## [Unreleased]
+## [0.10.0] - 2026-11-07
 
 ### Added
 
@@ -364,7 +386,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   when there are any). The result card shows the counts, models and paths, and offers
   Search with this library, Copy to folder and Reveal. A library-mode search of a library
   built this way uses the `rt_im_train.library_irt` its `library.json` names.
-
 - **Homocysteinylation in the modification catalogue.** `HCysThiolactone` (UniMod 1270,
   N-homocysteinylation of K, +117.024835) and `HCysteinyl` (UniMod 1271,
   S-homocysteinylation of C, +133.019749) can be searched by name, and the Search screen
@@ -381,6 +402,39 @@ than a number. Both are recorded in every run's `manifest.json`.
   stdout or a long parquet table. Read-only, and no search output changes. visDIA uses it
   for the mobilogram of its precursor page, and the desktop application passes its engine
   to the viewer it starts as `MUMDIA_BIN` (docs/35_diapasef.md section 17).
+- **A search without a retention-time calibration is reported as degraded.** When a run's
+  seed leaves fewer target anchors than `rt_im_train.min_seed_for_calibration`, its
+  retention-time windows are unbounded or the broad fixed fallback, and the search finishes
+  slowly with far fewer identifications than the data hold. Such a run now logs a prominent
+  warning right after `rt-im-train` that names the consequence and the likely causes (native
+  fragment or retention-time predictions, read from the library's own report; a fragment m/z
+  offset beyond the seed tolerance; a library that does not fit the sample; a blank run).
+  `run` and `run-experiment` end with one summary line (for example "12 of 12 run(s) in the
+  first pass had no retention-time calibration") and record each such run under
+  `rt_calibration_missing` in `manifest.json`, or in the `experiment` block of
+  `experiment_manifest.json` with its pass. The field is written only when a run had no
+  calibration, so every calibrated search keeps its artifacts, reports and manifest
+  byte-identical. The search is not stopped: a blank well has no anchors by construction, and
+  the second pass searches such runs again on the consensus retention times of the others; a
+  window-group search still stops, as before (docs/17, "Seed: no confident targets").
+- **A FASTA search on native fragment intensities warns at its start.** `run` and
+  `run-experiment` log one warning before the first stage when `predict_frag.predictor` is
+  `native` in FASTA mode, naming native retention times and, on spectra with ion mobility, a
+  missing 1/K0 predictor as well, and pointing to the predictor sidecars and the recipes
+  (`configs/examples/fasta-sidecars.json`, `configs/examples/diapasef.json`). No artifact
+  changes.
+- **Desktop application: the built-in library path chooses its predictors.** A FASTA search
+  on the built-in predictors derived its configuration from the selected preset, and the
+  preset selected by default, the one for an imported library, names no fragment predictor,
+  so such searches ran on the native models. A preset that names no fragment predictor is
+  now replaced by the first recipe whose interpreters `mumdia doctor` finds: the diaPASEF
+  recipe (AlphaPeptDeep, DeepLC, IM2Deep) for a timsTOF diaPASEF `.d`, then MS2PIP with
+  DeepLC, then AlphaPeptDeep with DeepLC. A preset or saved settings file that names a
+  predictor is kept. The Search screen says which predictors will be used, and a search that
+  would still run on native predictions, or on a diaPASEF `.d` without predicted 1/K0, shows
+  what that costs and starts only after the user confirms. The results screen leads with the
+  engine's `rt_calibration_missing` record when a search had runs without a retention-time
+  calibration. The diaPASEF and AlphaPeptDeep recipes are now offered as presets.
 
 ### Changed
 
@@ -404,23 +458,25 @@ than a number. Both are recorded in every run's `manifest.json`.
   disabled and a banner offering the fixes (the analysis components on the Setup screen, a
   DIA-NN build, or converting a DIA-NN library); the application has no override, never offers
   the key in Settings and never writes it into a configuration.
-- **`run-experiment` names each run's output folder and report columns after its input
-  file (breaking output layout).** Without `--run-names`, the runs of an experiment (and of
-  a `run` given several `--mzml`) were `r0`, `r1`, ...; they are now the input's file name
-  without its extensions (`exp/A0_1EX8741FD/`, `quantity_A0_1EX8741FD` in `peptides.tsv`,
-  `lfq_A0_1EX8741FD` in `proteins.tsv`), taken from the vendor file rather than the mzML
-  converted from it. ASCII letters and digits, `-`, `_` and `.` are kept and any other run
-  of characters, non-ASCII letters included, becomes one `_` (`Données.raw` gives `Donn_es`); names over 64 characters are cut and hashed; a name the
-  experiment root uses itself (`first_pass`, `second_pass`, `sidecar_work`, `library`,
-  `rt_bootstrap`, `g<N>`) gets `_run`; inputs that give the same name, without regard to
-  case, get `_2`, `_3`, ... in input order. The manifest maps each name to its input under
-  `experiment.run_inputs`. `experiment.run_naming = "index"` restores `r0..rN-1`, with every
-  artifact byte-identical to the previous release, and `--run-names` still wins; it now also
-  refuses those reserved names, `[` / `]` and characters outside ASCII. The key is not part of the configuration hash.
-  Readers that take the run names from the manifest (`report --experiment-dir`,
-  `localise --experiment-dir`, retention, visDIA) are unaffected; the desktop application
-  orders its per-file progress by the derived names; a script that builds `r<i>` paths has
-  to read `experiment.runs` or `experiment.peptide_quants` instead (CompOmics/MuMDIA#274).
+- **`run-experiment` names each run's output folder and report columns after its input file
+  (breaking output layout).** Without `--run-names`, the runs of an experiment (and of a `run`
+  given several `--mzml`) were `r0`, `r1`, ...; they are now the input's file name without its
+  extensions (`exp/A0_1EX8741FD/`, `quantity_A0_1EX8741FD` in `peptides.tsv`, `lfq_A0_1EX8741FD`
+  in `proteins.tsv`), taken from the vendor file rather than the mzML converted from it. ASCII
+  letters and digits, `-`, `_` and `.` are kept and any other run of characters, non-ASCII
+  letters included, becomes one `_` (`Données.raw` gives `Donn_es`); names over 64 characters
+  are cut and hashed; a name the experiment root uses itself (`first_pass`, `second_pass`,
+  `sidecar_work`, `library`, `rt_bootstrap`, `g<N>`) gets `_run`; inputs that give the same
+  name, without regard to case, get `_2`, `_3`, ... in input order. The manifest maps each name
+  to its input under `experiment.run_inputs`. `experiment.run_naming = "index"` restores
+  `r0..rN-1`, with every table and report as the previous release wrote it (the Parquet footers
+  aside, see the dependency entry), and `--run-names` still wins; it now also refuses those
+  reserved names, `[` / `]` and characters outside ASCII. The key is not part of the
+  configuration hash. Readers that take the run names from the manifest (`report
+  --experiment-dir`, `localise --experiment-dir`, retention, visDIA) are unaffected; the desktop
+  application orders its per-file progress by the derived names; a script that builds `r<i>`
+  paths has to read `experiment.runs` or `experiment.peptide_quants` instead
+  (CompOmics/MuMDIA#274).
 - **The desktop application pins visDIA at cb8b5bc.** Over c674f9f it adds the ion-mobility
   views (CompOmics/visDIA#8), a mobilogram card on the precursor page of diaPASEF runs (#9)
   and the fragments behind each quantity, read from `quant_fragments.parquet` (#10), sizes
@@ -431,6 +487,17 @@ than a number. Both are recorded in every run's `manifest.json`.
   reported outdated (`mumdia-viewer c674f9f -> cb8b5bc`) and the Setup screen offers the
   update. Checked with a fresh install on a 12-run diaPASEF second-pass experiment and on
   the smoke fixture with `quant.fragment_detail` (env/console-visdia-requirements.txt).
+- **Dependency updates: `arrow` / `parquet` 60.1.0, `mzdata` 0.68; desktop application:
+  `tauri` 2.12.2, `rusqlite` 0.41 (#261).** Every decoded value, row and data page of every
+  Parquet table is unchanged, but the footers are not: `created_by` names `parquet-rs` 60.1.0,
+  and the column-chunk encoding statistics list the dictionary page first. Every Parquet file
+  therefore differs in its bytes from the same table written by 0.9.0, and so does every
+  `content_hash` the manifests and footers record; a comparison across this version has to
+  compare decoded tables. The TSV reports and converted mzML are byte-identical. The desktop
+  application's `rusqlite` reads only the timsTOF routing probe, which uses none of the APIs the
+  intervening releases changed; the engine's own `rusqlite` stays on 0.32. Also updated: the
+  `rust` Docker base image digest, `serde_json`, `actions/setup-python` and
+  `docker/login-action`.
 
 ### Fixed
 
@@ -447,7 +514,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   installation, are shown in the banner. A rendering fault on this screen is now reported
   in the banner rather than freezing it. `ci/test_desktop_ui.mjs` drives the Setup screen
   in Node and runs in CI.
-
 - **Desktop: History lists every completed search, and says why a remembered folder is not
   one (#282).** History recognised only the files a single `run` writes (`manifest.json`,
   `psms_scored.parquet.report.json`), so every search run in "One experiment" mode, the
@@ -462,7 +528,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   search. "Add an existing output folder…" adds a completed search from any folder and says
   why when it refuses one. The remembered list keeps the 500 most recent folders instead of
   50, and History says how many older ones the cap dropped.
-
 - **Desktop: "Open in visDIA" works on a results folder whose path has a non-ASCII
   character in it (Windows, #281).** The application read visDIA's piped output with
   `BufRead::lines`, which fails on the first line that is not UTF-8; Python on Windows writes
@@ -475,7 +540,6 @@ than a number. Both are recorded in every run's `manifest.json`.
   Python workers that inherit their output, unless it is already set, since the same closed
   pipe could stop a worker. Reproduced on Windows with the managed visDIA environment on a
   folder `Données_µ` before the change; served after it, by either half of the fix alone.
-
 - **`import_diann_lib.py` keeps proteins apart whose FASTA headers DIA-NN does not parse as
   UniProt.** It read `Protein.Names` whenever the column existed, and for such headers
   (`CON_sp|...` contaminants, the `REAL_sp|` / `ENTRAP_sp|` proteins of an entrapment FASTA)
@@ -547,41 +611,15 @@ than a number. Both are recorded in every run's `manifest.json`.
   followed by one real import in the same interpreter, whose result and hint are appended
   to the engine's error. Search outputs are unchanged (docs/17_troubleshooting.md, "The
   torch DLL crash: two causes").
-### Added
 
-- **A search without a retention-time calibration is reported as degraded.** When a run's
-  seed leaves fewer target anchors than `rt_im_train.min_seed_for_calibration`, its
-  retention-time windows are unbounded or the broad fixed fallback, and the search finishes
-  slowly with far fewer identifications than the data hold. Such a run now logs a prominent
-  warning right after `rt-im-train` that names the consequence and the likely causes (native
-  fragment or retention-time predictions, read from the library's own report; a fragment m/z
-  offset beyond the seed tolerance; a library that does not fit the sample; a blank run).
-  `run` and `run-experiment` end with one summary line (for example "12 of 12 run(s) in the
-  first pass had no retention-time calibration") and record each such run under
-  `rt_calibration_missing` in `manifest.json`, or in the `experiment` block of
-  `experiment_manifest.json` with its pass. The field is written only when a run had no
-  calibration, so every calibrated search keeps its artifacts, reports and manifest
-  byte-identical. The search is not stopped: a blank well has no anchors by construction, and
-  the second pass searches such runs again on the consensus retention times of the others; a
-  window-group search still stops, as before (docs/17, "Seed: no confident targets").
-- **A FASTA search on native fragment intensities warns at its start.** `run` and
-  `run-experiment` log one warning before the first stage when `predict_frag.predictor` is
-  `native` in FASTA mode, naming native retention times and, on spectra with ion mobility, a
-  missing 1/K0 predictor as well, and pointing to the predictor sidecars and the recipes
-  (`configs/examples/fasta-sidecars.json`, `configs/examples/diapasef.json`). No artifact
+### Security
+
+- **RUSTSEC-2026-0429 (zip 6.0.0) is audited and ignored, with its reason (#263).** `zip`
+  6.0.0 reaches the engine only as a build dependency of `nethost-sys` under the opt-in `thermo`
+  feature, the path of the three advisories the audit already ignores: its build script unpacks
+  the nethost package fetched over TLS, nothing extracts an archive at run time, and release
+  builds do not enable the feature. The fixed `zip` is not reachable in that chain. No output
   changes.
-- **Desktop application: the built-in library path chooses its predictors.** A FASTA search
-  on the built-in predictors derived its configuration from the selected preset, and the
-  preset selected by default, the one for an imported library, names no fragment predictor,
-  so such searches ran on the native models. A preset that names no fragment predictor is
-  now replaced by the first recipe whose interpreters `mumdia doctor` finds: the diaPASEF
-  recipe (AlphaPeptDeep, DeepLC, IM2Deep) for a timsTOF diaPASEF `.d`, then MS2PIP with
-  DeepLC, then AlphaPeptDeep with DeepLC. A preset or saved settings file that names a
-  predictor is kept. The Search screen says which predictors will be used, and a search that
-  would still run on native predictions, or on a diaPASEF `.d` without predicted 1/K0, shows
-  what that costs and starts only after the user confirms. The results screen leads with the
-  engine's `rt_calibration_missing` record when a search had runs without a retention-time
-  calibration. The diaPASEF and AlphaPeptDeep recipes are now offered as presets.
 
 ## [0.9.0] - 2026-10-29
 
