@@ -150,6 +150,15 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Fixed
+
+- **Release notes are written once.** Each of the release workflow's upload jobs asked for
+  generated notes and appended another copy, so a release page listed its changes several
+  times. The uploads no longer write notes; a final `release-notes` job replaces the body with
+  one generated copy after every upload has finished.
+
 ## [0.10.0] - 2026-11-07
 
 ### Added

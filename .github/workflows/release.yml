@@ -339,7 +339,10 @@ jobs:
             rust/mumdia/dist/*.tar.gz
             rust/mumdia/dist/*.zip
             rust/mumdia/dist/*.sha256
-          generate_release_notes: true
+          # The notes are written once, by `release-notes` below. Every upload step that
+          # also asked for generated notes appended another copy: v0.10.0 was published
+          # with the same "What's Changed" list six times, one per upload job.
+          generate_release_notes: false
 
       # The rehearsal's output, so the archives can actually be inspected rather than
       # merely reported as built.
@@ -578,7 +581,10 @@ jobs:
         with:
           files: |
             desktop/dist/*
-          generate_release_notes: true
+          # The notes are written once, by `release-notes` below. Every upload step that
+          # also asked for generated notes appended another copy: v0.10.0 was published
+          # with the same "What's Changed" list six times, one per upload job.
+          generate_release_notes: false
 
       - name: Upload installers as a workflow artifact (rehearsal only)
         if: github.event_name == 'workflow_dispatch'
@@ -588,3 +594,27 @@ jobs:
           path: desktop/dist/*
           if-no-files-found: error
           retention-days: 7
+
+  # One set of release notes, written after every upload has finished. The upload
+  # steps above run in six parallel jobs and each one used to append generated notes to
+  # the release body; this job replaces the body with a single copy, so re-running a
+  # failed upload job cannot duplicate them either.
+  release-notes:
+    name: release notes
+    needs: [release, desktop]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Write the generated notes once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/$REPO/releases/generate-notes" -f tag_name="$TAG" --jq .body > notes.md
+          test -s notes.md
+          gh release edit "$TAG" --repo "$REPO" --notes-file notes.md
+          echo "release notes for $TAG: $(grep -c "^\* " notes.md) entries"
