@@ -43,12 +43,5 @@
   },
   "mbr": {
     "strategy": "second_pass"
-  },
-  "quant": {
-    "fixed_scan_halfwidth": 4,
-    "interference_envelope": true,
-    "fragment_selection": "cross_run",
-    "baseline_subtract": true,
-    "baseline_source": "experiment"
   }
 }

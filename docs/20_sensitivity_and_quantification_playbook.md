@@ -409,6 +409,34 @@ The current quant contract:
 Use Parquet for numerical work. TSV quantities are presentation-rounded to one
 decimal and omit the quant status and integration diagnostics.
 
+Since 2026-11-07 quantification defaults to one recipe: the profile-centred
+window, the pattern fit (`fragment_selection = pattern_fit`), the stable-set
+normalisation and `baseline_subtract = "auto"`, which subtracts the experiment
+background where the run's flanks carry an additive floor (diaPASEF) and not on
+centroided Orbitrap traces (docs/12_quant_lfq_align_mbr_report_audit.md,
+"Default quantification recipe"). In an experiment the recipe's value is
+`quantity_normalised` of each run's `peptide_quant_normalised.parquet`;
+`peptide_quant.quantity`, the per-run TSV columns and MaxLFQ keep reading the
+unnormalised pattern-fit quantity. A single `run` has no cross-run step, so it
+quantifies with the profile window and the `predicted` top-N rule. To compare
+against the previous quantification, set `window_centre = apex`,
+`fragment_selection = observed_area`, `baseline_subtract = false` and
+`normalisation = off`; that configuration reproduces the previous tables and
+config hash byte for byte. Quantification changes leave identifications
+untouched, so a quant A/B needs no entrapment run, but it does need the scored
+tables of both arms compared byte for byte, several acquisitions and seeds, and
+the per-species medians and ion counts, not one summary error.
+
+Measured on the recipe: species-weighted |eps| better on every Orbitrap and
+Astral set (ProteoBench Astral 0.340 -> 0.250, three seeds; AIF 0.324 -> 0.205;
+Low Input 0.604 -> 0.476; Astral 5 min 0.499 -> 0.342) and on ProteoBench
+diaPASEF against its previous recipe (0.204 -> 0.182). Two costs stay visible:
+the Q Exactive AIF human SD rises (0.84 -> 1.03; the bulk tightens, robust SD
+0.26 -> 0.20, and the tail of human ions more than 1 log2 off grows from 14.5% to
+16.5%), and on a 250 pg timsTOF Ultra set, where `auto` finds the flanks empty
+and leaves the background off, the species-weighted error is 0.476 -> 0.499
+against the diaPASEF recipe while global, CV and human SD improve.
+
 For a single-run precursor matrix:
 
 ```json
@@ -456,7 +484,7 @@ IDs so selection effects remain visible.
 | Model-visible top-K peaks | stable `candidate_id + peak_rank`, competition/FDR, and known-ratio quant |
 | `peptidoform_charge` competition as the global default | precursor-level FDR/entrapment plus completeness and ratio accuracy. Not gated for PTM searches or precursor-level counts, where it is required |
 | Adaptive RT windows or tolerance optimization | multiple gradients/instruments with no FDR inflation |
-| Shared consensus peak widths or ion sets | known-ratio bias, CV, and missingness across runs. The opt-in cross-run step (docs/12_quant_lfq_align_mbr_report_audit.md, "Cross-run fragment selection and background") fits shared fragment weights, background and widths; it is measured on one diaPASEF known-ratio set only |
+| Shared consensus peak widths or ion sets | known-ratio bias, CV, and missingness across runs. The cross-run step (docs/12_quant_lfq_align_mbr_report_audit.md, "Cross-run fragment selection and background") runs by default for the pattern fit's dispersion and the automatic background; its fragment weights (`cross_run`) and widths (`fixed_scan_halfwidth_scale`) stay opt-in and are measured on one diaPASEF known-ratio set only |
 | Minimum clean-ion/interference rules | accuracy gain without unacceptable missingness |
 | MBR transfer/requantification | transfer-decoy FDR and known-ratio validation |
 | Any nonzero MS2 conversion cap | the saturation pre-flight plus an end-to-end cap sweep on that acquisition class; `0` is the default and the safe choice |

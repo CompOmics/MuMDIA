@@ -152,6 +152,41 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ## [Unreleased]
 
+### Changed
+
+- **Quantification defaults to the profile window, the pattern fit and the stable-set
+  normalisation, with the background chosen from the data.** `quant.window_centre = profile`,
+  `quant.fragment_selection = pattern_fit` and `quant.normalisation = stable_set` (opt-in since
+  0.9.0) are the defaults, and `quant.baseline_subtract` takes `"auto"` (the new default) besides
+  `true` and `false`: under a pattern rule it subtracts the experiment background, before the
+  profile centre, the fit and its dispersion, when the experiment's median share of
+  exactly-zero flank samples is below `quant.baseline_auto_zero_share` (0.7). It is on for
+  diaPASEF and off for centroided Orbitrap and Astral traces; the decision and every run's
+  share are recorded in the final quant reports (`baseline_auto`) and in the experiment
+  manifest (`experiment.cross_run_quant.baseline_auto`). The pattern rules now accept the
+  experiment background (`baseline_subtract = true`, `baseline_source = experiment`), and
+  `run-experiment` then fits the pattern dispersion on a background-subtracted export
+  (`<run>/fragment_quant_background.parquet`). Identifications do not change: on eight
+  known-ratio sets every scored, competed and feature table was byte-identical between the
+  two quantifications. Species-weighted median |eps| (ProteoBench rules, previous -> new):
+  ProteoBench Astral 0.340 -> 0.250 (three seeds), Q Exactive AIF 0.324 -> 0.205, Low Input
+  0.604 -> 0.476, Generation Beta 50 ng 0.351 -> 0.256 and 250 pg 0.516 -> 0.379, Astral 5 min
+  0.499 -> 0.342, ProteoBench diaPASEF against its previous recipe 0.204 -> 0.182. The AIF
+  human ratio SD rises (0.84 -> 1.03) and a 250 pg timsTOF Ultra set is worse species-weighted
+  against the diaPASEF recipe (0.476 -> 0.499). In an experiment the recipe's value is
+  `quantity_normalised` of `peptide_quant_normalised.parquet`; `peptide_quant.quantity`, the
+  report quantity columns and MaxLFQ read the unnormalised pattern-fit quantity. A single
+  `run` quantifies with the profile window and the `predicted` top-N rule. A configuration
+  that leaves a recipe key unset and sets something it cannot combine with (another window
+  form, the envelope, the per-run baseline, window groups, per-run libraries, the condition
+  normalisation scope) gets that key's previous default with a warning, and one that sets a
+  non-pattern fragment rule keeps the apex window. `{"window_centre": "apex",
+  "fragment_selection": "observed_area", "baseline_subtract": false, "normalisation": "off"}`
+  restores the previous quantification and configuration hash byte for byte.
+  `configs/examples/diapasef.json` no longer sets quant keys. The quant tables, `lfq_*`
+  tables, report quantity columns and the configuration hash of a configuration that does
+  not set these keys change.
+
 ### Fixed
 
 - **Release notes are written once.** Each of the release workflow's upload jobs asked for
