@@ -147,6 +147,81 @@ pub struct CrossRunFit {
     /// observed fragments ([`quant_pattern::fit_pattern`]). `None` also when the rule was
     /// asked for and `phi` could not be estimated, which falls back to `predicted`.
     pub pattern: Option<PatternFit>,
+    /// `baseline_subtract = "auto"` under a pattern rule: the decision, from the share of
+    /// exactly-zero flank samples of every run. `background` is `Some` when it applied.
+    pub baseline_auto: Option<BaselineAuto>,
+}
+
+/// The decision of `quant.baseline_subtract = "auto"` ([`fit_cross_run`]): the experiment
+/// background is subtracted when the median over the runs of the share of exactly-zero flank
+/// samples is below `quant.baseline_auto_zero_share`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BaselineAuto {
+    /// Per first-pass table, in run order: its `flank_zero_share`, `None` where its report
+    /// carries none.
+    pub shares: Vec<Option<f64>>,
+    /// The median of the known shares; `None` without any.
+    pub median: Option<f64>,
+    /// `quant.baseline_auto_zero_share`.
+    pub threshold: f64,
+    /// Whether the experiment background is subtracted.
+    pub applied: bool,
+}
+
+impl BaselineAuto {
+    /// Decide from the shares of the runs, in run order.
+    pub fn decide(shares: Vec<Option<f64>>, threshold: f64) -> BaselineAuto {
+        let mut known: Vec<f64> = shares
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|x| x.is_finite())
+            .collect();
+        let median = (!known.is_empty()).then(|| median_sorted(&mut known));
+        BaselineAuto {
+            applied: median.is_some_and(|m| m < threshold),
+            shares,
+            median,
+            threshold,
+        }
+    }
+
+    /// The record written to the quant reports and the experiment manifest.
+    pub fn to_json(&self) -> serde_json::Value {
+        json!({
+            "applied": self.applied,
+            "experiment_flank_zero_share": self.median,
+            "threshold": self.threshold,
+            "run_flank_zero_shares": self.shares,
+        })
+    }
+}
+
+/// The `flank_zero_share` a first-pass table's report records ([`run_hashed`] under the
+/// cross-run export), `None` when the report or the value is missing.
+pub fn flank_zero_share_of(fragment_table: &str) -> Option<f64> {
+    let v: serde_json::Value =
+        mumdia_io::json::read_json(&format!("{fragment_table}.report.json")).ok()?;
+    v.get("params")?.get("flank_zero_share")?.as_f64()
+}
+
+/// Exactly-zero and finite samples among the `flank` samples either side of `[lo, hi)`: the
+/// counts behind a fragment's share of exactly-zero flank samples, which
+/// `quant.baseline_subtract = "auto"` reads. Centroided Orbitrap traces hold exact zeros
+/// wherever the fragment was not detected; traces with an additive floor do not.
+fn flank_zero_counts(inten: &[f32], lo: usize, hi: usize, flank: usize) -> (u16, u16) {
+    let left = &inten[lo.saturating_sub(flank)..lo];
+    let right = &inten[hi..(hi + flank).min(inten.len())];
+    let (mut z, mut n) = (0u16, 0u16);
+    for &x in left.iter().chain(right) {
+        if x.is_finite() {
+            n = n.saturating_add(1);
+            if x == 0.0 {
+                z = z.saturating_add(1);
+            }
+        }
+    }
+    (z, n)
 }
 
 /// Smallest scan halfwidth `fixed_scan_halfwidth_scale` chooses. The export carries the
@@ -1063,8 +1138,9 @@ fn scan_window_at(len: usize, centre: usize, half: usize) -> Option<(usize, usiz
 
 /// Per candidate, what phase 2 of [`run_hashed`] applied: the integration bounds and apex,
 /// the cross-run export's peak HWHM, the fragments whose experiment background fell back
-/// to the per-run quantile, the pattern rule's quantity (when the pattern fit is applied)
-/// and, under the pattern export, the window's retention times for the spacing fit.
+/// to the per-run quantile, the pattern rule's quantity (when the pattern fit is applied),
+/// under the pattern export the window's retention times for the spacing fit, and the
+/// counts behind the share of exactly-zero flank samples where that share is recorded.
 struct Applied {
     lo_rt: f64,
     hi_rt: f64,
@@ -1073,6 +1149,9 @@ struct Applied {
     bg_fallback: u32,
     pattern: Option<PatternQuantity>,
     window_rt: Vec<f32>,
+    /// Per fragment with flank samples, (exactly-zero, finite) flank samples
+    /// ([`flank_zero_counts`]); empty unless the share is recorded.
+    zero_counts: Vec<(u16, u16)>,
 }
 
 /// True when `rt` is non-decreasing, non-negative and NaN-free, the property
@@ -2641,12 +2720,19 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             "quant: the cross-run step did not run (a single run, or quant without \
              --cross-run-from): fragment_selection = cross_run, pattern_fit or \
              pattern_profile falls back to predicted with top_n_fragments, \
-             baseline_source = experiment to the per-run quantile, and \
+             baseline_source = experiment to the per-run quantile, \
+             baseline_subtract = auto to no background, and \
              fixed_scan_halfwidth_scale to fixed_scan_halfwidth"
         );
     }
     let pattern_fit: Option<&PatternFit> = p.cross_run.and_then(|x| x.pattern.as_ref());
-    if p.cfg.fragment_selection.uses_pattern_fit() && p.cross_run.is_some() && pattern_fit.is_none()
+    // The export pass that follows the background fit (`baseline_subtract = "auto"`, or the
+    // experiment background, under a pattern rule) runs with a fit that holds no dispersion
+    // yet: its tables are what the dispersion is fitted on.
+    if p.cfg.fragment_selection.uses_pattern_fit()
+        && p.cross_run.is_some()
+        && pattern_fit.is_none()
+        && !export
     {
         warn!(
             fragment_selection = ?p.cfg.fragment_selection,
@@ -2803,7 +2889,7 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     // also why the positional pairing the serial fold used to assert is gone: each
     // candidate writes the slice that is its own by construction.
     let want_fixed = p.cfg.fixed_scan_halfwidth > 0 || p.cfg.fixed_window_s > 0.0;
-    let baseline = if p.cfg.baseline_subtract {
+    let baseline = if p.cfg.baseline_subtract.is_on() {
         Some((p.cfg.baseline_flank_scans, p.cfg.baseline_quantile))
     } else {
         None
@@ -2877,6 +2963,15 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
     // fragment) and the halfwidth per candidate.
     let pooled_bg = p.cross_run.and_then(|x| x.background.as_ref());
     let halfwidths = p.cross_run.and_then(|x| x.halfwidth.as_ref());
+    // Under a pattern rule the experiment background is subtracted from every sample the rule
+    // reads: the profile that centres the window, the fitted samples and, through the export,
+    // the areas its dispersion is estimated on. A fragment without an experiment level is read
+    // as it is. Without a pattern rule only the integrated window is corrected, as before.
+    let pattern_bg = pattern_rule && pooled_bg.is_some();
+    // `baseline_subtract = "auto"`: the share of exactly-zero flank samples, recorded by the
+    // cross-run export (the fit decides on it) and by the pass that applies the decision.
+    let auto_decision = p.cross_run.and_then(|x| x.baseline_auto.as_ref());
+    let zero_stat = export || auto_decision.is_some();
     // Per candidate: (lo_rt, hi_rt, integration_apex, peak HWHM for the export, fragments
     // whose experiment background was missing and fell back to the per-run quantile).
     let applied: Vec<Applied> = slices
@@ -2935,6 +3030,14 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
             let mut windows: Vec<Option<Vec<f32>>> = Vec::new();
             let mut summed = [0.0f64; 2 * CROSS_RUN_HALFWIDTH_MAX + 1];
             let mut bg_fallback = 0u32;
+            let mut zero_counts: Vec<(u16, u16)> = Vec::new();
+            // The experiment level of row `i` under `pattern_bg`, 0 without one.
+            let level = |i: usize| -> f32 {
+                pooled_bg
+                    .and_then(|m| m.get(&c))
+                    .and_then(|f| f.get(store.name(i)))
+                    .map_or(0.0, |&b| b as f32)
+            };
             // The profile-centred window and the pattern rules work on the candidate's axis,
             // the axis of its first row with a trace; a row on another axis is centred on its
             // own nearest sample, moved by the same shift, and the pattern rules read it as a
@@ -2961,10 +3064,12 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                             continue;
                         }
                         let it = store.inten(i);
+                        let b = if pattern_bg { level(i) } else { 0.0 };
                         for (j, acc) in prof.iter_mut().enumerate() {
                             if let Some(idx) = (k + j).checked_sub(quant_pattern::PROFILE_SPAN) {
                                 if let Some(&v) = it.get(idx) {
                                     if v.is_finite() {
+                                        let v = if pattern_bg { (v - b).max(0.0) } else { v };
                                         *acc += v as f64;
                                     }
                                 }
@@ -3001,6 +3106,12 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                         Some((lo, hi)) => {
                             flo = flo.min(rt[lo] as f64);
                             fhi = fhi.max(rt[hi - 1] as f64);
+                            if zero_stat {
+                                let zc = flank_zero_counts(it, lo, hi, p.cfg.baseline_flank_scans);
+                                if zc.1 > 0 {
+                                    zero_counts.push(zc);
+                                }
+                            }
                             if export {
                                 let flank = p.cfg.baseline_flank_scans;
                                 fout[slot] = flank_mean(it, lo, hi, flank);
@@ -3106,9 +3217,11 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                             continue;
                         }
                         let it = store.inten(i);
+                        let b = if pattern_bg { level(i) } else { 0.0 };
                         for t in 0..nt {
                             if let Some(&v) = (c + t).checked_sub(half).and_then(|j| it.get(j)) {
                                 if v.is_finite() {
+                                    let v = if pattern_bg { (v - b).max(0.0) } else { v };
                                     x[slot * nt + t] = v as f64;
                                 }
                             }
@@ -3155,10 +3268,23 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
                 bg_fallback,
                 pattern,
                 window_rt,
+                zero_counts,
             }
         })
         .collect();
     drop(slices);
+    // The run's share of exactly-zero flank samples: the median over the fragments with flank
+    // samples of each fragment's share (`quant.baseline_subtract = "auto"`).
+    let flank_zero_share: Option<f64> = zero_stat
+        .then(|| {
+            let mut v: Vec<f64> = applied
+                .iter()
+                .flat_map(|a| a.zero_counts.iter())
+                .map(|&(z, n)| z as f64 / n as f64)
+                .collect();
+            (!v.is_empty()).then(|| median_sorted(&mut v))
+        })
+        .flatten();
     let applied_win: Vec<(f64, f64, f64)> =
         applied.iter().map(|a| (a.lo_rt, a.hi_rt, a.apex)).collect();
     let parea_by_slot = parea_by_slot;
@@ -3644,6 +3770,12 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         if export {
             params.insert("cross_run_export".to_string(), json!(true));
         }
+        if zero_stat {
+            params.insert("flank_zero_share".to_string(), json!(flank_zero_share));
+        }
+        if let Some(a) = auto_decision {
+            params.insert("baseline_auto".to_string(), a.to_json());
+        }
     }
     if !whole_table {
         if let Some(params) = report_params.as_object_mut() {
@@ -3938,7 +4070,36 @@ fn weighted_quantity<'a>(
 /// background then pools the `flank_mean_h<h>` column, the flank beyond that window.
 pub fn fit_cross_run(fragment_tables: &[String], cfg: &QuantConfig) -> Result<CrossRunFit> {
     let want_weights = cfg.fragment_selection == FragmentSelection::CrossRun;
-    let want_background = cfg.baseline_source == BaselineSource::Experiment;
+    // `baseline_subtract = "auto"` decides under a pattern rule, from the first-pass reports.
+    let baseline_auto =
+        (cfg.baseline_subtract.is_auto() && cfg.fragment_selection.uses_pattern_fit()).then(|| {
+            let shares: Vec<Option<f64>> = fragment_tables
+                .iter()
+                .map(|t| flank_zero_share_of(t))
+                .collect();
+            let a = BaselineAuto::decide(shares, cfg.baseline_auto_zero_share);
+            match a.median {
+                Some(m) => info!(
+                    experiment_flank_zero_share = m,
+                    threshold = a.threshold,
+                    applied = a.applied,
+                    "quant: baseline_subtract = auto: the experiment background is {}",
+                    if a.applied {
+                        "subtracted (the flanks carry a floor)"
+                    } else {
+                        "not subtracted (the flanks are mostly exact zeros)"
+                    }
+                ),
+                None => warn!(
+                    "quant: baseline_subtract = auto: no first-pass table records its share of \
+                 exactly-zero flank samples (written by quant --export-cross-run since \
+                 2026-11-07), so no background is subtracted"
+                ),
+            }
+            a
+        });
+    let want_background = cfg.baseline_source == BaselineSource::Experiment
+        || baseline_auto.as_ref().is_some_and(|a| a.applied);
     let scale = cfg.fixed_scan_halfwidth_scale;
     let want_width = scale > 0.0;
     let need = |t: &TableFile, path: &str, col: &str| -> Result<Vec<f64>> {
@@ -4115,6 +4276,7 @@ pub fn fit_cross_run(fragment_tables: &[String], cfg: &QuantConfig) -> Result<Cr
         background,
         halfwidth: half,
         pattern,
+        baseline_auto,
     })
 }
 
@@ -5061,7 +5223,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let cfg = QuantConfig::default();
+        let cfg = QuantConfig::previous_defaults();
         let quant_once = |ids: Option<&BTreeSet<u32>>| -> (String, String) {
             let pep = quant_test_path("fp_peptide.parquet");
             let prot = quant_test_path("fp_protein.parquet");
@@ -5189,7 +5351,7 @@ mod tests {
         // The walked-window contract: pin the window off, which is no longer the default.
         let cfg = QuantConfig {
             fixed_scan_halfwidth: 0,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let rows = run(QuantParams {
             psms_scored: &scored,
@@ -5458,7 +5620,7 @@ mod tests {
             top_n_fragments: 2,
             fragment_selection: FragmentSelection::Predicted,
             fixed_window_s: 1.0,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let rows = run(QuantParams {
             psms_scored: &scored,
@@ -5492,7 +5654,7 @@ mod tests {
     fn adding_predicted_intensity_does_not_move_a_default_quantity() {
         // Compatibility contract: the column's presence must not change a legacy result,
         // and its absence must not stop one. Same traces, same default config, both ways.
-        let cfg = QuantConfig::default();
+        let cfg = QuantConfig::previous_defaults();
         let mut out = Vec::new();
         for with_predicted in [false, true] {
             let (scored, chrom) = selection_fixture(with_predicted);
@@ -5581,10 +5743,10 @@ mod tests {
     fn cross_run_cfg() -> QuantConfig {
         QuantConfig {
             fragment_selection: FragmentSelection::CrossRun,
-            baseline_subtract: true,
+            baseline_subtract: mumdia_core::config::BaselineSubtract::On,
             baseline_source: BaselineSource::Experiment,
             fixed_scan_halfwidth_scale: 2.5,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         }
     }
 
@@ -5631,7 +5793,7 @@ mod tests {
         let input = cross_run_fixture("v1v5", 1.0);
         let plain = QuantConfig {
             fragment_selection: FragmentSelection::Predicted,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let base = cross_run_quant("plain", &input, &plain, None, false);
         let keyed = cross_run_quant("keyed", &input, &cross_run_cfg(), None, false);
@@ -5910,7 +6072,7 @@ mod tests {
                 QuantConfig {
                     top_n_fragments: 2,
                     fixed_window_s: 1.0,
-                    ..QuantConfig::default()
+                    ..QuantConfig::previous_defaults()
                 },
                 ["b2", "y3"],
                 "observed_area",
@@ -5921,7 +6083,7 @@ mod tests {
                     top_n_fragments: 2,
                     fragment_selection: FragmentSelection::Predicted,
                     fixed_window_s: 1.0,
-                    ..QuantConfig::default()
+                    ..QuantConfig::previous_defaults()
                 },
                 ["y3", "y5"],
                 "predicted",
@@ -6138,10 +6300,10 @@ mod tests {
         .unwrap();
         input.1 = chrom;
         let cfg = QuantConfig {
-            baseline_subtract: true,
+            baseline_subtract: mumdia_core::config::BaselineSubtract::On,
             baseline_flank_scans: 3,
             baseline_quantile: 0.5,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let (acc, pep) = quant_with_account("bg", &input, &cfg, None);
         let rows = account_rows(&acc);
@@ -6193,7 +6355,7 @@ mod tests {
 
         let peptide = quant_test_path("empty_peptide.parquet");
         let protein = quant_test_path("empty_protein.parquet");
-        let cfg = QuantConfig::default();
+        let cfg = QuantConfig::previous_defaults();
         let rows = run(QuantParams {
             psms_scored: &scored,
             chromatograms: &[ChromTable::whole(&chrom)],
@@ -6233,7 +6395,7 @@ mod tests {
         let (scored, chrom) = selection_fixture(false);
         let cfg = QuantConfig {
             fragment_selection: FragmentSelection::Predicted,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let err = run(QuantParams {
             psms_scored: &scored,
@@ -6674,7 +6836,7 @@ mod tests {
         // The walked-window contract: pin the window off, which is no longer the default.
         let cfg = QuantConfig {
             fixed_scan_halfwidth: 0,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let rows = run(QuantParams {
             psms_scored: &scored,
@@ -6792,7 +6954,7 @@ mod tests {
         let fixed = QuantConfig {
             bound_peak: false,
             fixed_window_s: 2.0,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         // `bound_peak` with the diagnostic export is the `keep_all` read, which keeps every
         // candidate's apex, so both paths through the apex map are held to the same rows.
@@ -6800,7 +6962,7 @@ mod tests {
             ("fixed", fixed, None),
             (
                 "keep_all",
-                QuantConfig::default(),
+                QuantConfig::previous_defaults(),
                 Some("narrow_bounds.parquet"),
             ),
         ] {
@@ -7699,7 +7861,7 @@ mod tests {
             out_fragment: None,
             out_peak_bounds: None,
             out_quant_fragments: None,
-            cfg: &QuantConfig::default(),
+            cfg: &QuantConfig::previous_defaults(),
             config_hash: "test",
             cross_run: None,
             export_cross_run: false,
@@ -7896,7 +8058,7 @@ mod tests {
                 out("fragment"),
                 out("bounds"),
             );
-            let cfg = QuantConfig::default();
+            let cfg = QuantConfig::previous_defaults();
             run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: tables,
@@ -8032,7 +8194,7 @@ mod tests {
                 out_fragment: Some(&frag),
                 out_peak_bounds: Some(&pb),
                 out_quant_fragments: None,
-                cfg: &QuantConfig::default(),
+                cfg: &QuantConfig::previous_defaults(),
                 config_hash: "test",
                 cross_run: None,
                 export_cross_run: false,
@@ -8172,7 +8334,7 @@ mod tests {
                     out_fragment: Some(&frag),
                     out_peak_bounds: None,
                     out_quant_fragments: None,
-                    cfg: &QuantConfig::default(),
+                    cfg: &QuantConfig::previous_defaults(),
                     config_hash: "test",
                     cross_run: None,
                     export_cross_run: false,
@@ -8360,7 +8522,7 @@ mod tests {
             let peptide = quant_test_path(&format!("{tag}_peptide.parquet"));
             let protein = quant_test_path(&format!("{tag}_protein.parquet"));
             let fragment = quant_test_path(&format!("{tag}_fragment.parquet"));
-            let cfg = QuantConfig::default();
+            let cfg = QuantConfig::previous_defaults();
             run(QuantParams {
                 psms_scored: &scored,
                 chromatograms: &[ChromTable::whole(chrom)],
@@ -8907,9 +9069,9 @@ mod source_guard_tests {
             .collect();
         let cfg = QuantConfig {
             fragment_selection: FragmentSelection::CrossRun,
-            baseline_subtract: true,
+            baseline_subtract: mumdia_core::config::BaselineSubtract::On,
             baseline_source: BaselineSource::Experiment,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let fit = fit_cross_run(&tables, &cfg).unwrap();
         assert!(fit.halfwidth.is_none());
@@ -8930,7 +9092,7 @@ mod source_guard_tests {
         // Weights alone fit no background, and a key that is off reads no column of its own.
         let only = QuantConfig {
             fragment_selection: FragmentSelection::CrossRun,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let fit = fit_cross_run(&tables, &only).unwrap();
         assert!(fit.background.is_none() && fit.halfwidth.is_none());
@@ -8950,7 +9112,7 @@ mod source_guard_tests {
         );
         let cfg = QuantConfig {
             fragment_selection: FragmentSelection::CrossRun,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let err = format!("{:#}", fit_cross_run(&[t], &cfg).unwrap_err());
         assert!(err.contains("apex_corr") && err.contains("export"), "{err}");
@@ -9008,10 +9170,10 @@ mod source_guard_tests {
             })
             .collect();
         let cfg = QuantConfig {
-            baseline_subtract: true,
+            baseline_subtract: mumdia_core::config::BaselineSubtract::On,
             baseline_source: BaselineSource::Experiment,
             fixed_scan_halfwidth_scale: 2.5,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let fit = fit_cross_run(&tables, &cfg).unwrap();
         assert!(fit.weights.is_none());
@@ -9200,6 +9362,12 @@ mod pattern_tests {
 
     /// One run's scored and chromatogram tables.
     fn run_tables(r: usize) -> (String, String) {
+        run_tables_floor(r, 0)
+    }
+
+    /// One run's scored and chromatogram tables, every sample of every trace raised by
+    /// `floor` (an additive background with no exact zeros left).
+    fn run_tables_floor(r: usize, floor: u32) -> (String, String) {
         let scored = path(&format!("scored{r}.parquet"));
         let chrom = path(&format!("chrom{r}.parquet"));
         let here: Vec<&(u32, f64, usize, &[usize])> =
@@ -9232,7 +9400,9 @@ mod pattern_tests {
                 pr.push(pred_of(c.0)[f]);
                 if observed(c.0, r, f) {
                     rt.push(axis.clone());
-                    it.push(intensity(c.0, r, f, c.2));
+                    let mut v = intensity(c.0, r, f, c.2);
+                    v.iter_mut().for_each(|x| *x += floor as f32);
+                    it.push(v);
                 } else {
                     rt.push(Vec::new());
                     it.push(Vec::new());
@@ -9329,12 +9499,119 @@ mod pattern_tests {
         (fit, peps)
     }
 
+    /// The decision of `baseline_subtract = "auto"`: the median of the known shares against
+    /// the threshold, and no background without any share.
+    #[test]
+    fn the_auto_background_decides_on_the_median_zero_share() {
+        let a = BaselineAuto::decide(vec![Some(0.93), Some(0.86), None, Some(0.9)], 0.7);
+        assert_eq!(a.median, Some(0.9));
+        assert!(!a.applied);
+        let a = BaselineAuto::decide(vec![Some(0.46), Some(0.5)], 0.7);
+        assert_eq!(a.median, Some(0.48));
+        assert!(a.applied);
+        let a = BaselineAuto::decide(vec![None, None], 0.7);
+        assert_eq!(a.median, None);
+        assert!(!a.applied);
+        assert_eq!(a.to_json()["run_flank_zero_shares"], json!([null, null]));
+        assert_eq!(
+            flank_zero_counts(&[0.0, 1.0, 5.0, 5.0, 0.0, f32::NAN], 2, 4, 2),
+            (2, 3)
+        );
+    }
+
+    /// Under the pattern rule the experiment background is subtracted from every sample the
+    /// rule reads, so a run whose traces carry a constant floor of exactly that level is
+    /// quantified as the run without it, and `"auto"` turns the background on for traces
+    /// without exact zeros and records the decision.
+    #[test]
+    fn the_experiment_background_is_subtracted_before_the_pattern_fit() {
+        let cfg = QuantConfig {
+            fragment_selection: FragmentSelection::PatternFit,
+            window_centre: WindowCentre::Profile,
+            ..QuantConfig::previous_defaults()
+        };
+        let (fit, peps) = cross_run_experiment(&cfg);
+        let want = quantities(&peps);
+        // The same experiment with a floor of 1,000 on every sample and that floor as the
+        // experiment level of every (candidate, fragment).
+        const FLOOR: u32 = 1000;
+        let floored: Vec<(String, String)> = (0..3).map(|r| run_tables_floor(r, FLOOR)).collect();
+        let mut bg: FragmentLevels = BTreeMap::new();
+        for c in CANDS {
+            for f in 0..8 {
+                bg.entry(c.0)
+                    .or_default()
+                    .insert(format!("f{f}"), FLOOR as f64);
+            }
+        }
+        let with_bg = CrossRunFit {
+            background: Some(bg),
+            pattern: fit.pattern.clone(),
+            ..Default::default()
+        };
+        let got: Vec<String> = floored
+            .iter()
+            .enumerate()
+            .map(|(r, t)| quantify(r, t, &cfg, Some(&with_bg), None))
+            .collect();
+        assert_eq!(quantities(&got), want);
+        // Without the background the floor moves the quantities.
+        let raw: Vec<String> = floored
+            .iter()
+            .enumerate()
+            .map(|(r, t)| quantify(r, t, &cfg, Some(&fit), None))
+            .collect();
+        assert_ne!(quantities(&raw), want);
+
+        // `"auto"`: the floored traces hold no exact zero, the plain ones some.
+        let auto = QuantConfig {
+            baseline_subtract: mumdia_core::config::BaselineSubtract::Auto,
+            ..cfg.clone()
+        };
+        let export = |tables: &[(String, String)], tag: &str| -> Vec<String> {
+            tables
+                .iter()
+                .enumerate()
+                .map(|(r, t)| {
+                    let f = path(&format!("{tag}{r}.parquet"));
+                    quantify(r, t, &auto, None, Some(&f));
+                    f
+                })
+                .collect()
+        };
+        let plain = export(&(0..3).map(run_tables).collect::<Vec<_>>(), "zplain");
+        let fl = export(&floored, "zfloor");
+        assert_eq!(flank_zero_share_of(&fl[0]), Some(0.0));
+        assert!(flank_zero_share_of(&plain[0]).unwrap() > 0.0);
+        // A threshold no share is below keeps it off.
+        let strict = QuantConfig {
+            baseline_auto_zero_share: 0.0,
+            ..auto.clone()
+        };
+        let off = fit_cross_run(&plain, &strict).unwrap();
+        assert!(!off.baseline_auto.as_ref().unwrap().applied);
+        assert!(off.background.is_none());
+        let on = fit_cross_run(&fl, &auto).unwrap();
+        assert!(on.baseline_auto.as_ref().unwrap().applied);
+        assert!(on.background.is_some());
+        // The previous default rule never decides.
+        let prev = fit_cross_run(&fl, &QuantConfig::previous_defaults()).unwrap();
+        assert!(prev.baseline_auto.is_none() && prev.background.is_none());
+        // The pass that applies the decision records it with its own share.
+        let pep = quantify(0, &floored[0], &auto, Some(&on), None);
+        let rep: serde_json::Value =
+            mumdia_io::json::read_json(&format!("{pep}.report.json")).unwrap();
+        assert_eq!(rep["params"]["baseline_auto"]["applied"], true);
+        assert_eq!(rep["params"]["flank_zero_share"], 0.0);
+        assert_eq!(rep["params"]["baseline_subtract"], "auto");
+    }
+
     #[test]
     fn pattern_fit_with_the_profile_window_reproduces_the_prototype() {
         let cfg = QuantConfig {
             fragment_selection: FragmentSelection::PatternFit,
             window_centre: WindowCentre::Profile,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let (fit, peps) = cross_run_experiment(&cfg);
         let pf = fit
@@ -9363,7 +9640,7 @@ mod pattern_tests {
         let cfg = QuantConfig {
             fragment_selection: FragmentSelection::PatternProfile,
             window_centre: WindowCentre::Profile,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let (_, peps) = cross_run_experiment(&cfg);
         assert_close(&quantities(&peps), &C3LF, 1e-9);
@@ -9394,7 +9671,7 @@ mod pattern_tests {
             let cfg = QuantConfig {
                 fragment_selection: sel,
                 window_centre: centre,
-                ..QuantConfig::default()
+                ..QuantConfig::previous_defaults()
             };
             let peps: Vec<String> = tables
                 .iter()
@@ -9406,12 +9683,12 @@ mod pattern_tests {
         // The shift the prototype found moves the reported bounds by as many samples.
         let cfg = QuantConfig {
             window_centre: WindowCentre::Profile,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         for (r, tr) in tables.iter().enumerate() {
             let pep = quantify(r, tr, &cfg, None, None);
             let t = Table::read(&pep).unwrap();
-            let base = quantify(r, tr, &QuantConfig::default(), None, None);
+            let base = quantify(r, tr, &QuantConfig::previous_defaults(), None, None);
             let b = Table::read(&base).unwrap();
             let (lo, blo) = (
                 t.opt_f64("integration_lo_rt").unwrap(),
@@ -9437,7 +9714,7 @@ mod pattern_tests {
         let pred = QuantConfig {
             fragment_selection: FragmentSelection::Predicted,
             window_centre: WindowCentre::Profile,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let pat = QuantConfig {
             fragment_selection: FragmentSelection::PatternFit,
@@ -9474,7 +9751,7 @@ mod pattern_tests {
         let cfg = QuantConfig {
             fragment_selection: FragmentSelection::PatternFit,
             window_centre: WindowCentre::Profile,
-            ..QuantConfig::default()
+            ..QuantConfig::previous_defaults()
         };
         let (fit, peps) = cross_run_experiment(&cfg);
         let tables = run_tables(0);

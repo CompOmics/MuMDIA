@@ -196,7 +196,8 @@ pub struct TracePad {
 impl TracePad {
     /// The pad quantification needs under `quant`: the largest integration half-width
     /// (`fixed_window_s` in seconds when set, else `fixed_scan_halfwidth` scans) plus the
-    /// baseline flanks when `baseline_subtract` is on. `None` when that is 0, which is the
+    /// baseline flanks when `baseline_subtract = true` (`"auto"` adds none: it was measured
+    /// on traces padded by the half-width alone). `None` when that is 0, which is the
     /// walked integration window without a fixed half-width.
     pub fn for_quant(q: &mumdia_core::config::QuantConfig) -> Option<TracePad> {
         let (mut scans, seconds) = if q.fixed_window_s > 0.0 {
@@ -204,7 +205,7 @@ impl TracePad {
         } else {
             (q.fixed_scan_halfwidth, 0.0)
         };
-        if q.baseline_subtract {
+        if q.baseline_subtract.is_on() {
             scans += q.baseline_flank_scans;
         }
         (scans > 0 || seconds > 0.0).then_some(TracePad { scans, seconds })
