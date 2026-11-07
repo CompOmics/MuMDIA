@@ -614,7 +614,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh api -X POST "repos/$REPO/releases/generate-notes" -f tag_name="$TAG" --jq .body > notes.md
-          test -s notes.md
-          gh release edit "$TAG" --repo "$REPO" --notes-file notes.md
-          echo "release notes for $TAG: $(grep -c "^\* " notes.md) entries"
+          gh api -X POST "repos/$REPO/releases/generate-notes" -f tag_name="$TAG" --jq .body > release-notes.txt
+          test -s release-notes.txt
+          gh release edit "$TAG" --repo "$REPO" --notes-file release-notes.txt
+          echo "release notes for $TAG: $(grep -c "^\* " release-notes.txt) entries"
