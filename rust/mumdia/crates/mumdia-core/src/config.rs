@@ -2893,16 +2893,16 @@ pub struct QuantConfig {
     /// peak wings. Off by default (identity on a clean peak). Opt-in and
     /// benchmark-gated: it changes reported quantities.
     pub interference_envelope: bool,
-    /// Which fragments enter the top-N sum. `observed_area` (default, legacy) ranks
-    /// by the integrated area itself, which preferentially selects interfered
+    /// Which fragments enter the top-N sum. `observed_area` (the default before 2026-11-07)
+    /// ranks by the integrated area itself, which preferentially selects interfered
     /// fragments (their areas are inflated) and so varies run to run.
     /// `predicted` ranks by the library (predicted or empirical) fragment intensity,
     /// a per-precursor constant, so every run sums the same fragments. Astral HYE
     /// 2026-08-26 (pipeline of that date): CV 0.163 -> 0.112 on 6/6 ions at top-3. That
     /// CV gain does not reproduce with 0.8.0: on fixed ProteoBench Astral identifications,
     /// 6/6 ions, the median CV is 0.136 for `observed_area` and 0.151 for `predicted`.
-    /// Benchmark-gated. `cross_run` weights each fragment by its consistency across the
-    /// runs of an experiment ([`FragmentSelection::CrossRun`]); benchmark-gated as well.
+    /// `cross_run` weights each fragment by its consistency across the runs of an
+    /// experiment ([`FragmentSelection::CrossRun`]). Both are opt-in.
     /// Under interference `observed_area` compresses the ratios of the minor species: with
     /// 0.8.0 on fixed identifications (ProteoBench default view, ions in at least 3 of 6
     /// runs) the E. coli median log2 A/B (expected -2) is -1.43 / -1.68 / -1.71 for
@@ -2998,7 +2998,7 @@ pub struct QuantConfig {
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub fixed_scan_halfwidth_scale: f64,
     /// Cross-run normalisation of the per-run precursor quantities, by `run-experiment`
-    /// after per-run quant and by `mumdia quant-normalise`. `off` (default): none.
+    /// after per-run quant and by `mumdia quant-normalise`. `off`: none.
     /// `stable_set`: one log2 shift per run and retention-time bin, the median deviation of a
     /// stable set of ions, those whose profile across the runs belongs to the largest
     /// population of a principal-component subspace of the run space (docs/12, "Cross-run
@@ -3042,7 +3042,7 @@ pub struct QuantConfig {
     /// unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub normalisation_rank: Option<usize>,
-    /// Where the fixed scan window is centred. `apex` (default): on the sample nearest the
+    /// Where the fixed scan window is centred. `apex`: on the sample nearest the
     /// identification apex. `profile`: on the centre of the 3-sample block, within 2 samples
     /// of that sample, with the largest summed raw intensity of the 6 fragments with the
     /// highest library intensity (ties to the smaller shift), one centre for all of the
@@ -3366,7 +3366,7 @@ impl Default for QuantConfig {
             fragment_selection: FragmentSelection::PatternFit,
             fixed_scan_halfwidth: 3, // fixed +/-3-sample window (2026-10-04)
             baseline_subtract: BaselineSubtract::Auto,
-            baseline_auto_zero_share: BASELINE_AUTO_ZERO_SHARE,
+            baseline_auto_zero_share: 0.7, // BASELINE_AUTO_ZERO_SHARE
             baseline_flank_scans: 12,
             baseline_quantile: 0.25,
             fixed_window_s: 0.0,
