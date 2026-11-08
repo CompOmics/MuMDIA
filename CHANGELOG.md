@@ -186,6 +186,22 @@ than a number. Both are recorded in every run's `manifest.json`.
   `configs/examples/diapasef.json` no longer sets quant keys. The quant tables, `lfq_*`
   tables, report quantity columns and the configuration hash of a configuration that does
   not set these keys change.
+- **The condition normalisation scope keeps the quantification recipe, and every recipe
+  default that gives way is recorded.** Under `quant.normalisation_scope = condition` (the
+  desktop's "Within each condition") with the recipe keys unset, only the stable-set step is
+  left out, because its fit is estimated over every run; the profile window, the pattern fit
+  and the `"auto"` background stay, and the cross-run MaxLFQ normalises within each
+  condition. On ProteoBench AIF (seed 0) the scope's per-run tables were byte-identical to
+  the default scope's; species-weighted median |eps| 0.208 per run and 0.200 from the
+  condition-scoped precursor MaxLFQ (CV 0.169), against 0.324 and 0.308 for the previous
+  recipe. Each default that `Config::resolve_quant_recipe` replaces is now written to
+  `params.recipe_resolved` of the quant reports and `experiment.quant_recipe_resolved` of the
+  experiment manifest (`{key, value, default, reason}`), only when there is one, so a desktop
+  run whose log nobody read says what it quantified with; nothing else changes for the
+  default and `none` scopes, configuration hash included. The desktop's note for "Within each
+  condition" says so, and the refusal of an explicit `stable_set` with `condition` says how to
+  keep the rest of the recipe. Three refusal messages whose line breaks had become runs of
+  spaces read normally again.
 
 ### Fixed
 

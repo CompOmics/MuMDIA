@@ -95,7 +95,14 @@ function load() {
   assert.notEqual(body, SOURCE, "app.js no longer ends with init(); update this harness");
   // Each name guarded, so an older frontend without the helpers still loads and fails
   // only the tests that need them.
-  const names = ["refreshComponents", "installComponents", "optionalCardView", "state"];
+  const names = [
+    "refreshComponents",
+    "installComponents",
+    "optionalCardView",
+    "state",
+    "refreshNormOptions",
+    "normOverrides",
+  ];
   const exported = names.map((n) => `${n}: typeof ${n} === "undefined" ? undefined : ${n}`);
   const api = vm.runInContext(`${body}\n;({ ${exported.join(", ")} });`, ctx);
   return { api, el: (id) => document.getElementById(id), timers, calls, answers };
@@ -259,6 +266,31 @@ test("an optional environment that cannot load is named in the banner", async ()
   await f.api.refreshComponents();
   assert.equal(f.el("setup-error").textContent, "MS2PIP: torch cannot load");
   assert.equal(f.el("ms2pip-pill").textContent, "cannot load");
+});
+
+test("the normalisation note says what quantification runs under each scope", () => {
+  const f = load();
+  const { state } = f.api;
+  state.picks.mzml = ["/d/a.mzML", "/d/b.mzML", "/d/c.mzML"];
+  state.picks.conditions = { "/d/a.mzML": "A", "/d/b.mzML": "A", "/d/c.mzML": "B" };
+  state.runMode = "experiment";
+  f.el("norm-scope").value = "condition";
+  f.api.refreshNormOptions();
+  const note = f.el("norm-note").textContent;
+  assert.match(note, /pattern-fit recipe/);
+  assert.match(note, /without the stable-set normalisation/);
+  assert.match(note, /MaxLFQ is normalised within each condition/);
+  assert.match(note, /Conditions: A \(2\), B \(1\)\./);
+  assert.deepEqual({ ...f.api.normOverrides() }, { "quant.normalisation_scope": "condition" });
+  // Only the scope is sent: the engine keeps the rest of the recipe itself, and a sent
+  // normalisation key would be an explicit request it refuses under `condition`.
+  for (const scope of ["all", "none"]) {
+    f.el("norm-scope").value = scope;
+    f.api.refreshNormOptions();
+    assert.doesNotMatch(f.el("norm-note").textContent, /stable-set/);
+  }
+  f.el("norm-scope").value = "all";
+  assert.deepEqual({ ...f.api.normOverrides() }, {});
 });
 
 let failed = 0;

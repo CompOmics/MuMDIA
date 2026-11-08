@@ -3148,6 +3148,16 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             m.insert("localisation_experiment".to_string(), json!(x));
         }
     }
+    // The recipe defaults the configuration ruled out (`Config::resolve_quant_recipe`), with
+    // the value each key got and why, only when there were any, so every other manifest keeps
+    // its bytes. Under `normalisation_scope = condition` this is where a run records that the
+    // stable-set step was left out and the rest of the recipe kept.
+    if let (false, Some(m)) = (cfg.quant.resolved.is_empty(), manifest.as_object_mut()) {
+        m.insert(
+            "quant_recipe_resolved".to_string(),
+            json!(cfg.quant.resolved),
+        );
+    }
     // The cross-run normalisation, only when it ran, so every other manifest keeps its bytes.
     if let (Some((tables, shifts, _)), Some(m)) = (&normalised, manifest.as_object_mut()) {
         m.insert(

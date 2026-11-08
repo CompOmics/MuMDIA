@@ -525,7 +525,8 @@ fn check_mz_limits(what: &str, lo: Option<f64>, hi: Option<f64>) -> Result<(), S
     if let (Some(lo), Some(hi)) = (lo, hi) {
         if lo >= hi {
             return Err(format!(
-                "{what}_min must be below {what}_max (got {lo} and {hi}); the range is                  inclusive at both ends and would keep nothing"
+                "{what}_min must be below {what}_max (got {lo} and {hi}); the range is \
+                 inclusive at both ends and would keep nothing"
             ));
         }
     }
@@ -3007,7 +3008,9 @@ pub struct QuantConfig {
     /// `peptide_quant.parquet`, plus the fitted shifts in `quant_normalisation.parquet`.
     /// Default `stable_set` since 2026-11-07 (docs/12, "Default quantification recipe"); `off`
     /// restores the previous default. A configuration that does not set this key and sets
-    /// `normalisation_scope = condition` gets `off`, with a warning. Written to the canonical
+    /// `normalisation_scope = condition` gets `off`, with a warning and a record in the quant
+    /// report and the experiment manifest; the rest of the recipe (window centre, fragment
+    /// rule, background) is kept. Written to the canonical
     /// configuration except at `off`, so that a configuration setting `off` keeps the hash it
     /// had when `off` was the default.
     #[serde(skip_serializing_if = "CrossRunNormalisation::is_off")]
@@ -3026,10 +3029,11 @@ pub struct QuantConfig {
     /// `lfq_maxlfq.parquet` and its `.precursor` / `.peptide` siblings, so `lfq_<run>` of
     /// `proteins.tsv` and `normalised_<run>` of `precursors.tsv`; the per-run `quantity_<run>`
     /// columns stay raw under every scope. `condition` needs every run's condition
-    /// (`--condition`, `--sample-sheet` or `experiment.conditions`), and is refused with
-    /// `normalisation = stable_set`. The factors are written to `lfq_size_factors.tsv` at the
-    /// experiment root under every scope (docs/12, "Normalisation scope"). Omitted from the
-    /// canonical configuration at its default.
+    /// (`--condition`, `--sample-sheet` or `experiment.conditions`). It is refused with an
+    /// explicit `normalisation = stable_set`; with `normalisation` unset it turns the
+    /// stable-set step off and keeps the rest of the quantification recipe. The factors are
+    /// written to `lfq_size_factors.tsv` at the experiment root under every scope (docs/12,
+    /// "Normalisation scope"). Omitted from the canonical configuration at its default.
     #[serde(skip_serializing_if = "NormalisationScope::is_all")]
     pub normalisation_scope: NormalisationScope,
     /// `stable_set` only: the dimension of the subspace of the run space that holds the
@@ -3079,6 +3083,13 @@ pub struct QuantConfig {
     /// with a warning) from an explicit request (refused by validation).
     #[serde(skip)]
     pub explicit: QuantExplicit,
+    /// The recipe defaults [`Config::resolve_quant_recipe`] replaced, in order, each with the
+    /// value it chose and why. Not part of the configuration (so not of its hash): the quant
+    /// report (`params.recipe_resolved`) and the experiment manifest
+    /// (`experiment.quant_recipe_resolved`) record it when it is not empty, so a run whose
+    /// log nobody read still says what it quantified with.
+    #[serde(skip)]
+    pub resolved: Vec<QuantResolved>,
 }
 
 /// The keys of the quantification recipe a configuration file set explicitly. See
@@ -3088,6 +3099,30 @@ pub struct QuantExplicit {
     pub fragment_selection: bool,
     pub window_centre: bool,
     pub normalisation: bool,
+}
+
+/// One default of the quantification recipe that [`Config::resolve_quant_recipe`] replaced.
+/// See [`QuantConfig::resolved`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct QuantResolved {
+    /// The key under `quant`, e.g. `normalisation`.
+    pub key: String,
+    /// The value it was given, as the configuration writes it, e.g. `off`.
+    pub value: String,
+    /// The value it would have had, e.g. `stable_set`.
+    pub default: String,
+    /// Why the default did not apply.
+    pub reason: String,
+}
+
+impl QuantResolved {
+    /// The log line of this replacement.
+    pub fn note(&self) -> String {
+        format!(
+            "quant.{} = {} in place of the default {}: {}",
+            self.key, self.value, self.default, self.reason
+        )
+    }
 }
 
 /// `quant.baseline_subtract`: `false`, `true` or `"auto"`. See
@@ -3381,6 +3416,7 @@ impl Default for QuantConfig {
             window_centre: WindowCentre::Profile,
             fragment_detail: false,
             explicit: QuantExplicit::default(),
+            resolved: Vec::new(),
         }
     }
 }
@@ -4876,10 +4912,14 @@ impl Config {
 
     /// Replace a default of the quantification recipe (`quant.window_centre = profile`,
     /// `quant.fragment_selection = pattern_fit`, `quant.normalisation = stable_set`) that the
-    /// rest of the configuration rules out by the previous default, with a warning, and return
-    /// one line per replacement. A key the configuration set itself
-    /// ([`QuantConfig::explicit`]) is left alone, so that validation refuses the combination
-    /// instead of quietly running something else.
+    /// rest of the configuration rules out by the previous default, with a warning, record
+    /// each replacement in [`QuantConfig::resolved`], and return one line per warning. A key
+    /// the configuration set itself ([`QuantConfig::explicit`]) is left alone, so that
+    /// validation refuses the combination instead of quietly running something else.
+    ///
+    /// Each key gives way on its own: `normalisation_scope = condition` turns the stable-set
+    /// step off and keeps the profile window, the pattern fit and the background of
+    /// `baseline_subtract = "auto"`, which do not depend on it.
     pub fn resolve_quant_recipe(&mut self) -> Vec<String> {
         let grouped = self.groups.window_groups > 1;
         let per_run = self.experiment.rt_library_scope == RtLibraryScope::PerRun;
@@ -4888,22 +4928,54 @@ impl Config {
             && q.fixed_window_s == 0.0
             && q.fixed_scan_halfwidth_scale == 0.0;
         let mut notes: Vec<String> = Vec::new();
+        let mut record = |q: &mut QuantConfig,
+                          key: &str,
+                          value: &str,
+                          default: &str,
+                          reason: &str,
+                          warn: bool| {
+            let r = QuantResolved {
+                key: key.to_string(),
+                value: value.to_string(),
+                default: default.to_string(),
+                reason: reason.to_string(),
+            };
+            if warn {
+                notes.push(r.note());
+            }
+            q.resolved.push(r);
+        };
         // A configuration that chose its own fragment rule other than a pattern rule keeps the
         // window that rule was chosen with, the apex window, unless it sets `window_centre`
-        // as well: the profile centre was validated with the pattern fit.
+        // as well: the profile centre was validated with the pattern fit. Recorded, not
+        // warned: the configuration then quantifies as it did before the recipe.
         if !q.explicit.window_centre
             && q.explicit.fragment_selection
             && !q.fragment_selection.uses_pattern_fit()
+            && q.window_centre != WindowCentre::Apex
         {
             q.window_centre = WindowCentre::Apex;
+            record(
+                q,
+                "window_centre",
+                "apex",
+                "profile",
+                "quant.fragment_selection chose a rule other than pattern_fit or \
+                 pattern_profile, which keeps the window it was chosen with",
+                false,
+            );
         }
         if !q.explicit.window_centre && q.window_centre == WindowCentre::Profile && !scan_window {
             q.window_centre = WindowCentre::Apex;
-            notes.push(
-                "quant.window_centre = apex: the profile centre moves the scan window by whole \
-                 samples, and quant.fixed_scan_halfwidth, fixed_window_s or \
-                 fixed_scan_halfwidth_scale chose another window"
-                    .to_string(),
+            record(
+                q,
+                "window_centre",
+                "apex",
+                "profile",
+                "the profile centre moves the scan window by whole samples, and \
+                 quant.fixed_scan_halfwidth, fixed_window_s or fixed_scan_halfwidth_scale \
+                 chose another window",
+                true,
             );
         }
         if !q.explicit.fragment_selection && q.fragment_selection.uses_pattern_fit() {
@@ -4934,11 +5006,12 @@ impl Config {
                 None
             };
             if let Some(why) = why {
-                notes.push(format!(
-                    "quant.fragment_selection = observed_area in place of the default {:?}: {why}",
-                    q.fragment_selection
-                ));
+                let default = match q.fragment_selection {
+                    FragmentSelection::PatternProfile => "pattern_profile",
+                    _ => "pattern_fit",
+                };
                 q.fragment_selection = FragmentSelection::ObservedArea;
+                record(q, "fragment_selection", "observed_area", default, why, true);
             }
         }
         if !q.explicit.normalisation
@@ -4946,10 +5019,17 @@ impl Config {
             && q.normalisation_scope == NormalisationScope::Condition
         {
             q.normalisation = CrossRunNormalisation::Off;
-            notes.push(
-                "quant.normalisation = off in place of the default stable_set: \
-                 quant.normalisation_scope = condition does not combine with it"
-                    .to_string(),
+            record(
+                q,
+                "normalisation",
+                "off",
+                "stable_set",
+                "quant.normalisation_scope = condition does not combine with it, because its \
+                 fit is estimated over every run. The rest of the recipe is kept (the window \
+                 centre, the fragment rule and the background), the per-run quantities are \
+                 not normalised, and the cross-run MaxLFQ estimates its size factors within \
+                 each condition",
+                true,
             );
         }
         for n in &notes {
@@ -5066,7 +5146,11 @@ impl Config {
             && !self.quant.normalisation.is_off()
         {
             return Err(Invalid(
-                "quant.normalisation_scope = condition is not supported together with                  quant.normalisation = stable_set: the stable-set fit is estimated over every                  run. Use normalisation_scope = condition with normalisation = off, or                  stable_set with the default scope."
+                "quant.normalisation_scope = condition is not supported together with \
+                 quant.normalisation = stable_set: the stable-set fit is estimated over every \
+                 run. Leave quant.normalisation unset (or set it to off) to keep the rest of \
+                 the quantification recipe without it, or use stable_set with the default \
+                 scope."
                     .into(),
             ));
         }
@@ -5077,7 +5161,8 @@ impl Config {
             .find_map(|(r, l)| condition_label_problem(l).map(|why| (r, l, why)))
         {
             return Err(Invalid(format!(
-                "experiment.conditions: the condition {label:?} of run {run:?} is not usable:                  {why}"
+                "experiment.conditions: the condition {label:?} of run {run:?} is not usable: \
+                 {why}"
             )));
         }
         let scan_window =
@@ -5483,7 +5568,8 @@ impl Config {
         }
         if self.digest.cleavage_rule.is_some() && self.digest.enzyme != Enzyme::Custom {
             return Err(Invalid(format!(
-                "digest.cleavage_rule is set but digest.enzyme = \"{}\"; set digest.enzyme =                  \"custom\" to use the rule, or remove it",
+                "digest.cleavage_rule is set but digest.enzyme = \"{}\"; set digest.enzyme = \
+                 \"custom\" to use the rule, or remove it",
                 self.digest.enzyme.name()
             )));
         }
@@ -7312,6 +7398,155 @@ mod tests {
         .unwrap();
         assert_eq!(g.quant.fragment_selection, FragmentSelection::PatternFit);
         assert!(g.quant.explicit.fragment_selection);
+    }
+
+    /// The recipe under each normalisation scope. `all` and `none` resolve nothing and keep
+    /// their canonical configuration; `condition` with the recipe keys unset turns only the
+    /// stable-set step off, keeps the profile window, the pattern fit and the `"auto"`
+    /// background, and records why; explicit keys are kept as given, and an explicit
+    /// `stable_set` with `condition` is refused.
+    #[test]
+    fn the_recipe_under_each_normalisation_scope() {
+        let recipe = |q: &QuantConfig| {
+            (
+                q.window_centre,
+                q.fragment_selection,
+                q.baseline_subtract,
+                q.normalisation,
+            )
+        };
+        let default = recipe(&Config::default().quant);
+        assert_eq!(
+            default,
+            (
+                WindowCentre::Profile,
+                FragmentSelection::PatternFit,
+                BaselineSubtract::Auto,
+                CrossRunNormalisation::StableSet
+            )
+        );
+        for scope in ["all", "none"] {
+            let j = format!(r#"{{"quant":{{"normalisation_scope":"{scope}"}}}}"#);
+            let c = Config::from_json(&j).unwrap();
+            assert_eq!(recipe(&c.quant), default, "{scope}");
+            assert!(c.quant.resolved.is_empty(), "{scope}");
+            // Resolution changes nothing the hash reads: the parsed configuration hashes as
+            // the unresolved one does.
+            let raw: Config = serde_json::from_str(&j).unwrap();
+            assert_eq!(c.canonical_json(), raw.canonical_json(), "{scope}");
+        }
+        assert_eq!(
+            Config::from_json(r#"{"quant":{"normalisation_scope":"all"}}"#)
+                .unwrap()
+                .canonical_json(),
+            Config::default().canonical_json()
+        );
+        // `condition`, recipe keys unset: only the stable-set step gives way.
+        let c = Config::from_json(r#"{"quant":{"normalisation_scope":"condition"}}"#).unwrap();
+        assert_eq!(
+            recipe(&c.quant),
+            (
+                WindowCentre::Profile,
+                FragmentSelection::PatternFit,
+                BaselineSubtract::Auto,
+                CrossRunNormalisation::Off
+            )
+        );
+        assert!(c.quant.needs_cross_run_fit());
+        assert_eq!(c.quant.resolved.len(), 1, "{:?}", c.quant.resolved);
+        let r = &c.quant.resolved[0];
+        assert_eq!(
+            (r.key.as_str(), r.value.as_str(), r.default.as_str()),
+            ("normalisation", "off", "stable_set")
+        );
+        assert!(
+            r.reason.contains("normalisation_scope = condition"),
+            "{r:?}"
+        );
+        assert!(r.reason.contains("within each condition"), "{r:?}");
+        let rec = serde_json::to_value(&c.quant.resolved).unwrap();
+        assert_eq!(rec[0]["key"], "normalisation");
+        assert_eq!(rec[0]["value"], "off");
+        // The record is not configuration.
+        assert!(!c.canonical_json().contains("resolved"));
+        // A second resolution finds nothing more and keeps the record.
+        let mut again = c.clone();
+        assert!(again.resolve_quant_recipe().is_empty());
+        assert_eq!(again.quant.resolved, c.quant.resolved);
+        // `condition` with explicit recipe keys: kept as given, nothing recorded but the
+        // normalisation where it is unset.
+        let c = Config::from_json(
+            r#"{"quant":{"normalisation_scope":"condition","normalisation":"off",
+                "window_centre":"profile","fragment_selection":"pattern_fit",
+                "baseline_subtract":"auto"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            recipe(&c.quant),
+            (
+                WindowCentre::Profile,
+                FragmentSelection::PatternFit,
+                BaselineSubtract::Auto,
+                CrossRunNormalisation::Off
+            )
+        );
+        assert!(c.quant.resolved.is_empty());
+        let c = Config::from_json(
+            r#"{"quant":{"normalisation_scope":"condition","window_centre":"apex",
+                "fragment_selection":"observed_area","baseline_subtract":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            recipe(&c.quant),
+            (
+                WindowCentre::Apex,
+                FragmentSelection::ObservedArea,
+                BaselineSubtract::Off,
+                CrossRunNormalisation::Off
+            )
+        );
+        assert_eq!(c.quant.resolved.len(), 1);
+        assert_eq!(c.quant.resolved[0].key, "normalisation");
+        // Under `all` and `none` explicit keys are kept and nothing is recorded.
+        for scope in ["all", "none"] {
+            let c = Config::from_json(&format!(
+                r#"{{"quant":{{"normalisation_scope":"{scope}","normalisation":"stable_set",
+                    "window_centre":"apex","fragment_selection":"observed_area"}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(c.quant.normalisation, CrossRunNormalisation::StableSet);
+            assert_eq!(c.quant.window_centre, WindowCentre::Apex);
+            assert!(c.quant.resolved.is_empty(), "{scope}");
+        }
+        // An explicit stable-set step under `condition` is refused, and the error says how to
+        // keep the rest of the recipe.
+        let e = Config::from_json(
+            r#"{"quant":{"normalisation_scope":"condition","normalisation":"stable_set"}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("Leave quant.normalisation unset"), "{e}");
+        assert!(!e.contains("  "), "{e}");
+        // The other replacements are recorded as well; the one a non-pattern rule makes of the
+        // window is recorded without a warning.
+        let mut c: Config = serde_json::from_str(r#"{"quant":{"fixed_window_s":5.0}}"#).unwrap();
+        let notes = c.resolve_quant_recipe();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        let keys: Vec<&str> = c.quant.resolved.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["window_centre", "fragment_selection"]);
+        assert!(
+            notes[1].starts_with(
+                "quant.fragment_selection = observed_area in place of the default pattern_fit: "
+            ),
+            "{}",
+            notes[1]
+        );
+        let mut c: Config =
+            serde_json::from_str(r#"{"quant":{"fragment_selection":"predicted"}}"#).unwrap();
+        c.quant.explicit = quant_explicit_keys(r#"{"quant":{"fragment_selection":"predicted"}}"#);
+        assert!(c.resolve_quant_recipe().is_empty());
+        assert_eq!(c.quant.resolved.len(), 1);
+        assert_eq!(c.quant.resolved[0].key, "window_centre");
     }
 
     /// The dependencies between the cross-run keys are refused at load, each naming the key

@@ -798,6 +798,17 @@ that key, with a warning at load (`Config::resolve_quant_recipe`): `window_centr
 per_run` (the last two are where the cross-run step is refused); `normalisation = off` under
 `normalisation_scope = condition`. The same key set explicitly is refused, as before.
 
+Each key gives way on its own. Under `normalisation_scope = condition` only the stable-set
+step is left out, because its fit is estimated over every run; the profile window, the pattern
+fit and the `"auto"` background do not depend on it and stay, so the per-run `peptide_quant`
+and `protein_group_quant` are those of the default scope byte for byte, and the cross-run
+MaxLFQ normalises within each condition (see "Normalisation scope"). Every replacement is
+recorded, not only logged: `params.recipe_resolved` of each quant report and
+`experiment.quant_recipe_resolved` of the experiment manifest list it as `{key, value,
+default, reason}`, only when there is one, so every other report and manifest keeps its
+bytes. The window a non-pattern fragment rule keeps is recorded there as well, without a
+warning.
+
 **Restoring the previous quantification.** Set the four keys:
 
 ```json
@@ -1098,8 +1109,39 @@ same order; an empty value leaves the run to the next source), the `condition` c
 `--sample-sheet`, and `experiment.conditions` in the configuration (run name -> condition).
 Under `condition` every run must have one, and the error names the runs without; a condition
 with one run is warned about. A label must not be empty or hold a tab, a line break or another
-control character. `condition` is refused together with `quant.normalisation = stable_set`,
-whose fit is estimated over every run. The run conditions are recorded under
+control character. `condition` is refused together with an explicit
+`quant.normalisation = stable_set`, whose fit is estimated over every run. With
+`quant.normalisation` unset, `condition` turns the stable-set step off and keeps the rest of
+the default quantification recipe (profile window, pattern fit, the `"auto"` background): the
+per-run quantities are the default scope's, unnormalised, and the condition-scoped MaxLFQ
+factors make the replicates comparable. The manifest records that under
+`experiment.quant_recipe_resolved` ("Default quantification recipe", "Where the recipe gives
+way"); the desktop's "Within each condition" choice says the same.
+
+Measured (2026-11-08) on ProteoBench AIF (six runs, NN seed 0, one host), scored with
+ProteoBench 0.18.6 offline (ions in at least 3 of 6 runs, 99,572 ions in every arm). The
+`condition` run's scored, competed, feature, chromatogram and per-run quant tables (126
+Parquet files) were byte-identical to those of the default scope; only the `lfq_maxlfq`
+tables differ, and the stable-set tables are not written. "Previous recipe" is the
+quantification before the current defaults (apex window, `observed_area`, no background,
+`normalisation = off`), which is what a configuration falling back to the previous defaults
+would quantify with; its per-run quantities do not depend on the scope. The median log2 A/B
+of E. coli (expected -2) is from the same ions, at least 3 runs and both conditions.
+
+| arm | quantity scored | species-weighted | global | CV | E. coli log2 A/B |
+|---|---|---|---|---|---|
+| default, scope `all` | `quantity_normalised` (stable set) | 0.205 | 0.154 | 0.155 | -1.898 |
+| default, scope `condition` | `peptide_quant.quantity` (per run, not normalised) | 0.208 | 0.163 | 0.327 | -1.937 |
+| default, scope `condition` | condition-scoped precursor MaxLFQ (`normalised_<run>` of `precursors.tsv`) | 0.200 | 0.158 | 0.169 | -1.947 |
+| previous recipe | `peptide_quant.quantity` | 0.324 | 0.198 | 0.322 | -1.503 |
+| previous recipe, scope `condition` | condition-scoped precursor MaxLFQ | 0.308 | 0.192 | 0.173 | -1.537 |
+
+Keeping the recipe under `condition` holds the ratio accuracy of the default (0.208 against
+0.324 for the previous recipe on the same per-run unit). The per-run quantities carry each
+run's loading (CV 0.33): within-condition replicate scaling is what the condition-scoped
+MaxLFQ factors do, and its precursor-level output is then as precise as the stable-set
+quantities (CV 0.169 against 0.155) and slightly more accurate. One seed, one dataset. The run conditions are
+recorded under
 `experiment.conditions` of the manifest whenever any run has one, and they are part of the
 configuration hash only under `condition`, where the experiment writes every run's condition
 into `experiment.conditions` of the configuration before hashing it: a configuration at the
