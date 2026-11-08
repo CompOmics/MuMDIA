@@ -1280,6 +1280,10 @@ echo "    ok: $n_tables tables byte-identical under parallel_runs = 2, $n_auto o
 #     conditions are part of the configuration hash. The fixture's runs are copies of one
 #     file, so the factors are 1 under every scope; the kernel is then checked through
 #     `quant-lfq` on a copy of run c at twice the quantity, where the three scopes differ.
+#     Under `condition` the default stable-set normalisation, estimated over every run, is
+#     left out and the rest of the recipe (profile window, pattern fit, background) kept: the
+#     manifest and each quant report record that replacement, and the default experiment
+#     records none.
 echo "=== smoke: normalisation scope per condition"
 printf 'file\tname\tcondition\nfixture.mzML\ta\tA\nfixture_b.mzML\tb\tA\nfixture_c.mzML\tc\tB\n' \
     > "$work/exp_sheet.tsv"
@@ -1358,6 +1362,20 @@ assert m["config_hash"] != ref["config_hash"]
 cfg = json.loads(m["config_json"])
 assert cfg["experiment"]["conditions"] == {"a": "A", "b": "A", "c": "B"}, cfg["experiment"]
 assert "conditions" not in json.loads(ref["config_json"]).get("experiment", {})
+# Under `condition` the default stable-set step is left out and the rest of the quantification
+# recipe kept (the per-run tables above are the default experiment's); the experiment manifest
+# and every quant report record that, and the default experiment records nothing.
+res = e.get("quant_recipe_resolved")
+assert res and [(r["key"], r["value"], r["default"]) for r in res] == [
+    ("normalisation", "off", "stable_set")], res
+assert "quant_recipe_resolved" not in re_, re_.get("quant_recipe_resolved")
+assert "cross_run_normalisation" not in e and "cross_run_normalisation" in re_
+for run in "abc":
+    rp = json.load(open(f"{w}/exp_cond/{run}/peptide_quant.parquet.report.json"))["params"]
+    assert rp.get("recipe_resolved") == res, (run, rp.get("recipe_resolved"))
+    assert rp["fragment_selection"] == "PatternFit" and rp.get("window_centre") == "Profile", rp
+    rp3 = json.load(open(f"{w}/exp3/{run}/peptide_quant.parquet.report.json"))["params"]
+    assert "recipe_resolved" not in rp3, run
 rows = tsv(f"{w}/exp_cond/lfq_size_factors.tsv")
 assert [(r["run"], r["condition"]) for r in rows] == [("a", "A"), ("b", "A"), ("c", "B")], rows
 f = {r["run"]: float(r["size_factor"]) for r in rows}

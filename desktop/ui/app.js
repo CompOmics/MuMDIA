@@ -1703,7 +1703,10 @@ const NORM_NOTES = {
   condition:
     "Size factors estimated within each condition's runs only: replicates are made " +
     "comparable, and the differences between conditions stay as measured. A loading " +
-    "difference between conditions is not corrected.",
+    "difference between conditions is not corrected. Quantification uses the pattern-fit " +
+    "recipe (profile-centred window, pattern fit, background chosen from the data) without " +
+    "the stable-set normalisation, which is estimated over every run: the per-run " +
+    "quantities are not normalised, and MaxLFQ is normalised within each condition.",
 };
 
 // The normalisation choice and its note, shown for an experiment of several files.

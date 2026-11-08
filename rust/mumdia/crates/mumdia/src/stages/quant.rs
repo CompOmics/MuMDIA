@@ -3776,6 +3776,11 @@ pub fn run_hashed(p: QuantParams) -> Result<QuantWritten> {
         if let Some(a) = auto_decision {
             params.insert("baseline_auto".to_string(), a.to_json());
         }
+        // The recipe defaults the configuration ruled out (`Config::resolve_quant_recipe`),
+        // only when there were any, so every other report keeps its bytes.
+        if !p.cfg.resolved.is_empty() {
+            params.insert("recipe_resolved".to_string(), json!(p.cfg.resolved));
+        }
     }
     if !whole_table {
         if let Some(params) = report_params.as_object_mut() {
@@ -5822,6 +5827,7 @@ mod tests {
             "fragment_selection_fallback",
             "baseline_source",
             "fixed_scan_halfwidth_scale",
+            "recipe_resolved",
         ] {
             assert!(!params.contains_key(key), "{key} in a plain report");
         }
@@ -5830,6 +5836,26 @@ mod tests {
         assert_eq!(kp["params"]["fragment_selection_fallback"], "Predicted");
         assert!(kp["params"]["cross_run_fit"].is_null());
         assert_eq!(report_of(&keyed[2])["schema_version"], 1);
+        // A recipe default the configuration ruled out is recorded in every report, and the
+        // tables keep their bytes.
+        let mut resolved = mumdia_core::config::Config::from_json(
+            r#"{"quant":{"normalisation_scope":"condition"}}"#,
+        )
+        .unwrap()
+        .quant;
+        assert_eq!(resolved.resolved.len(), 1);
+        resolved = QuantConfig {
+            resolved: resolved.resolved,
+            ..plain.clone()
+        };
+        let rec = cross_run_quant("resolved", &input, &resolved, None, false);
+        for (a, b) in base.iter().zip(&rec) {
+            assert_eq!(std::fs::read(a).unwrap(), std::fs::read(b).unwrap(), "{b}");
+        }
+        let rp = report_of(&rec[0]);
+        assert_eq!(rp["params"]["recipe_resolved"][0]["key"], "normalisation");
+        assert_eq!(rp["params"]["recipe_resolved"][0]["value"], "off");
+        assert_eq!(rp["params"]["recipe_resolved"][0]["default"], "stable_set");
 
         let ex = cross_run_quant("export", &input, &cross_run_cfg(), None, true);
         let rep = report_of(&ex[2]);
