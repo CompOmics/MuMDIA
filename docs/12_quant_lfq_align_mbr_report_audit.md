@@ -1116,7 +1116,31 @@ the default quantification recipe (profile window, pattern fit, the `"auto"` bac
 per-run quantities are the default scope's, unnormalised, and the condition-scoped MaxLFQ
 factors make the replicates comparable. The manifest records that under
 `experiment.quant_recipe_resolved` ("Default quantification recipe", "Where the recipe gives
-way"); the desktop's "Within each condition" choice says the same. The run conditions are
+way"); the desktop's "Within each condition" choice says the same.
+
+Measured (2026-11-08) on ProteoBench AIF (six runs, NN seed 0, one host), scored with
+ProteoBench 0.18.6 offline (ions in at least 3 of 6 runs, 99,572 ions in every arm). The
+`condition` run's scored, competed, feature, chromatogram and per-run quant tables (126
+Parquet files) were byte-identical to those of the default scope; only the `lfq_maxlfq`
+tables differ, and the stable-set tables are not written. "Previous recipe" is the
+quantification before the current defaults (apex window, `observed_area`, no background,
+`normalisation = off`), which is what a configuration falling back to the previous defaults
+would quantify with; its per-run quantities do not depend on the scope. The median log2 A/B
+of E. coli (expected -2) is from the same ions, at least 3 runs and both conditions.
+
+| arm | quantity scored | species-weighted | global | CV | E. coli log2 A/B |
+|---|---|---|---|---|---|
+| default, scope `all` | `quantity_normalised` (stable set) | 0.205 | 0.154 | 0.155 | -1.898 |
+| default, scope `condition` | `peptide_quant.quantity` (per run, not normalised) | 0.208 | 0.163 | 0.327 | -1.937 |
+| default, scope `condition` | condition-scoped precursor MaxLFQ (`normalised_<run>` of `precursors.tsv`) | 0.200 | 0.158 | 0.169 | -1.947 |
+| previous recipe | `peptide_quant.quantity` | 0.324 | 0.198 | 0.322 | -1.503 |
+| previous recipe, scope `condition` | condition-scoped precursor MaxLFQ | 0.308 | 0.192 | 0.173 | -1.537 |
+
+Keeping the recipe under `condition` holds the ratio accuracy of the default (0.208 against
+0.324 for the previous recipe on the same per-run unit). The per-run quantities carry each
+run's loading (CV 0.33): within-condition replicate scaling is what the condition-scoped
+MaxLFQ factors do, and its precursor-level output is then as precise as the stable-set
+quantities (CV 0.169 against 0.155) and slightly more accurate. One seed, one dataset. The run conditions are
 recorded under
 `experiment.conditions` of the manifest whenever any run has one, and they are part of the
 configuration hash only under `condition`, where the experiment writes every run's condition
