@@ -2762,6 +2762,12 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     // Pass 1 quantifies every run with its per-run settings and writes its
     // `fragment_quant.parquet` as the cross-run export; the fit over those tables is applied
     // by pass 2, below, in every run. Pass 1's peptide and protein tables are temporary.
+    //
+    // Under a pattern rule with an experiment background (`baseline_subtract = "auto"` where
+    // it applies, or `baseline_source = experiment`), a second export pass subtracts the fitted
+    // background and writes `fragment_quant_background.parquet`, and the pattern dispersion is
+    // fitted on those tables: the dispersion of the samples the rule then fits.
+    let mut background_tables: Option<Vec<(String, mumdia_io::report::Written)>> = None;
     let cross_run = if qcfg.needs_cross_run_fit() {
         let frag_tables = quant_plan.map_pooled(&run_idx, |&i| {
             let ft = d(&format!("{}/fragment_quant.parquet", names[i]));
@@ -2789,7 +2795,48 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
             Ok((ft, written.fragment.expect("out_fragment was set")))
         })?;
         let paths: Vec<String> = frag_tables.iter().map(|(p, _)| p.clone()).collect();
-        let fit = quant::fit_cross_run(&paths, &qcfg)?;
+        let mut fit = quant::fit_cross_run(&paths, &qcfg)?;
+        if fit.background.is_some() && qcfg.fragment_selection.uses_pattern_fit() {
+            let bg_only = quant::CrossRunFit {
+                background: fit.background.take(),
+                halfwidth: fit.halfwidth.take(),
+                ..Default::default()
+            };
+            let tables_b = quant_plan.map_pooled(&run_idx, |&i| {
+                let ft = d(&format!("{}/fragment_quant_background.parquet", names[i]));
+                let tmp = |n: &str| d(&format!("{}/{n}.pass1b.parquet", names[i]));
+                let written = quant::run_hashed(quant::QuantParams {
+                    psms_scored: &split_paths[i],
+                    chromatograms: &chroms[i],
+                    out_peptide: &tmp("peptide_quant"),
+                    out_protein: &tmp("protein_group_quant"),
+                    out_fragment: Some(&ft),
+                    out_peak_bounds: None,
+                    out_quant_fragments: None,
+                    cfg: &qcfg,
+                    config_hash: &ch,
+                    cross_run: Some(&bg_only),
+                    export_cross_run: true,
+                    first_pass_ids: None,
+                })?;
+                for n in ["peptide_quant", "protein_group_quant"] {
+                    for path in [tmp(n), format!("{}.report.json", tmp(n))] {
+                        std::fs::remove_file(&path)
+                            .with_context(|| format!("removing the export-pass table {path}"))?;
+                    }
+                }
+                Ok((ft, written.fragment.expect("out_fragment was set")))
+            })?;
+            let paths_b: Vec<String> = tables_b.iter().map(|(p, _)| p.clone()).collect();
+            fit.pattern = crate::stages::quant_pattern::fit_pattern(&paths_b)?;
+            info!(
+                phi = fit.pattern.as_ref().map(|f| f.phi),
+                "run-experiment: pattern dispersion refitted on the background-subtracted export"
+            );
+            fit.background = bg_only.background;
+            fit.halfwidth = bg_only.halfwidth;
+            background_tables = Some(tables_b);
+        }
         info!(
             weights = fit.weights.as_ref().map(|w| w.len()),
             background = fit.background.as_ref().map(|b| b.len()),
@@ -3115,13 +3162,28 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
     }
     // The cross-run quant step and its first-pass fragment tables, only when it ran, so
     // every other manifest keeps its bytes.
-    if let (Some((_, tables)), Some(m)) = (&cross_run, manifest.as_object_mut()) {
-        m.insert(
-            "cross_run_quant".to_string(),
-            json!({
-                "fragment_quants": tables.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
-            }),
-        );
+    if let (Some((fit, tables)), Some(m)) = (&cross_run, manifest.as_object_mut()) {
+        let mut x = json!({
+            "fragment_quants": tables.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+        });
+        if let Some(o) = x.as_object_mut() {
+            if let Some(b) = &background_tables {
+                o.insert(
+                    "fragment_quants_background".to_string(),
+                    json!(b.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()),
+                );
+            }
+            // `quant.baseline_subtract = "auto"`: per run its share of exactly-zero flank
+            // samples, in run order, and the experiment's decision.
+            if let Some(a) = &fit.baseline_auto {
+                let mut v = a.to_json();
+                if let Some(vo) = v.as_object_mut() {
+                    vo.insert("runs".to_string(), json!(names));
+                }
+                o.insert("baseline_auto".to_string(), v);
+            }
+        }
+        m.insert("cross_run_quant".to_string(), x);
     }
     // Provenance parity with the single-run manifest: the identity of the code, of
     // the inputs (hashed at the start of the run, see above), and of every artifact
@@ -3339,6 +3401,16 @@ pub fn run(p: RunExperimentParams) -> Result<()> {
                 Some(tables[i].1.content_hash.clone()),
             ));
         }
+        // The background-subtracted export the pattern dispersion was fitted on.
+        if let Some(tables) = &background_tables {
+            artifacts.push((
+                format!("fragment_quant_background[{name}]"),
+                artifact::fragment_quant(true, true),
+                tables[i].0.clone(),
+                "quant",
+                Some(tables[i].1.content_hash.clone()),
+            ));
+        }
     }
     for (logical, schema, path, stage, known_hash) in artifacts {
         let rows = mumdia_io::table::nrows(&path)
@@ -3456,7 +3528,7 @@ mod tests {
         let mut walked = cfg.clone();
         walked.quant.fixed_scan_halfwidth = 0;
         walked.quant.fixed_window_s = 0.0;
-        walked.quant.baseline_subtract = false;
+        walked.quant.baseline_subtract = mumdia_core::config::BaselineSubtract::Off;
         assert_eq!(
             second_pass_trace_pad(&walked, "a"),
             None,

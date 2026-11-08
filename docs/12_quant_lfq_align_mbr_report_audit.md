@@ -15,7 +15,7 @@ stages that operate across multiple runs.
   into a protein-by-run abundance matrix by MaxLFQ (peptide-level) or directLFQ
   (ion/fragment-level), with optional cross-run median-ratio normalization.
 - **quant-normalise** (`mumdia quant-normalise`, and `run-experiment` under
-  `quant.normalisation = "stable_set"`): opt-in cross-run normalisation of the per-run
+  `quant.normalisation = "stable_set"`, the default since 2026-11-07): cross-run normalisation of the per-run
   precursor quantities by retention-time-binned medians of a stable set of ions, written
   to separate tables.
 - **align** (Stage D2, `mumdia align`): put >=2 runs on a common RT coordinate by
@@ -34,7 +34,7 @@ stages that operate across multiple runs.
 | path | role |
 |---|---|
 | `rust/mumdia/crates/mumdia/src/stages/quant.rs` | `quant` stage + `run_lfq_combine`/`size_factors` for `quant-lfq` |
-| `rust/mumdia/crates/mumdia/src/stages/quant_norm.rs` | opt-in cross-run normalisation (`quant-normalise`, `quant.normalisation`) |
+| `rust/mumdia/crates/mumdia/src/stages/quant_norm.rs` | cross-run normalisation (`quant-normalise`, `quant.normalisation`, default `stable_set`) |
 | `rust/mumdia/crates/mumdia/src/quant_lfq.rs` | MaxLFQ/directLFQ ratio-alignment core (`lfq_profile`, `maxlfq`, `directlfq`) |
 | `rust/mumdia/crates/mumdia/src/stages/align.rs` | Stage D2 cross-run RT alignment |
 | `rust/mumdia/crates/mumdia/src/stages/report.rs` | `peptides.tsv` + `precursors.tsv` + `proteins.tsv` writer |
@@ -506,7 +506,7 @@ the read returns empty and refinement is inert. Writes `candidate_audit.parquet`
 6. **Top-N sum:** for each accepted target (`passes_quant_filter`),
    `select_fragment_areas` retains only positive finite fragment areas and sums the
    top `top_n_fragments`. `fragment_selection` chooses the ranking:
-   `observed_area` (default) ranks by the measured area and delegates to
+   `observed_area` (the default before 2026-11-07) ranks by the measured area and delegates to
    `summarize_fragment_areas`, byte-identically to the legacy path;
    `predicted` ranks by the library's predicted intensity instead, so the same
    fragments are summed across runs regardless of which happened to be brightest,
@@ -719,12 +719,178 @@ minimum-clean-ion rule. Peak-window and fragment-selection policies are single-r
 choices unless the opt-in cross-run step above runs. Evaluate changes on
 known-ratio data rather than identification count alone.
 
-#### Profile-centred window and pattern fit
+#### Default quantification recipe
+
+Since 2026-11-07 four quant keys default to one recipe:
+
+| key | default | previous default |
+|---|---|---|
+| `window_centre` | `profile` | `apex` |
+| `fragment_selection` | `pattern_fit` | `observed_area` |
+| `normalisation` | `stable_set` | `off` |
+| `baseline_subtract` | `"auto"` | `false` |
+
+The pieces are described below ([Profile-centred window and pattern
+fit](#profile-centred-window-and-pattern-fit), [Cross-run
+normalisation](#cross-run-normalisation-quant_normrs-quantnormalisation)). What the default
+does depends on how many runs are quantified together:
+
+- **`run-experiment`, or `run` with several `--mzml`.** Every run is quantified over the
+  profile-centred window. The cross-run step fits the pattern dispersion and, where the
+  background applies, the experiment background. Each run's `peptide_quant.parquet`
+  carries the pattern fit's `quantity`. The stable-set normalisation then writes
+  `peptide_quant_normalised.parquet` beside it, whose `quantity_normalised` is the recipe's
+  final value and the value the recipe was validated on. The per-run `quantity_<run>`
+  columns of the reports and the cross-run MaxLFQ (`lfq_<run>`, `normalised_<run>`) read
+  `quantity`, as before; `quant.normalisation_lfq = true` makes MaxLFQ read
+  `quantity_normalised` instead, which is not measured on protein quantities.
+- **A single `run`, or `quant` without `--cross-run-from`.** There is no cross-run step and
+  no normalisation. The window is still profile-centred, and `pattern_fit` falls back to
+  `predicted` with `top_n_fragments` (the report records `"fragment_selection_fallback":
+  "Predicted"`). `"auto"` subtracts nothing.
+- **Fewer than 3 runs sharing a candidate.** The dispersion cannot be estimated and
+  `pattern_fit` falls back to `predicted` for the whole experiment, with a warning.
+
+**`baseline_subtract = "auto"`.** Pass 1 of the cross-run step records, per run, the share of
+flank samples that are exactly zero (`flank_zero_share` in the pass-1 `fragment_quant`
+report): for every fragment with a trace, the finite samples in the
+`baseline_flank_scans` samples either side of its fixed window, the share of them that are
+0, and the median of that share over the fragments. Centroided Orbitrap traces hold exact
+zeros wherever the fragment was not detected, so an additive floor is absent; diaPASEF
+traces carry one. `fit_cross_run` takes the median over the runs and applies the experiment
+background (`baseline_source = experiment`: per candidate and fragment, the mean over the
+runs of the raw flank mean) when it is below `baseline_auto_zero_share` (0.7). The decision
+is one per experiment, because the background is an experiment quantity and a ratio between
+runs needs the same treatment in both. It is recorded in every final quant report
+(`baseline_auto`: `applied`, `experiment_flank_zero_share`, `threshold` and
+`run_flank_zero_shares` in run order, plus the run's own `flank_zero_share`) and in the
+experiment manifest (`experiment.cross_run_quant.baseline_auto`, with the run names). `"auto"` acts
+only under `pattern_fit` / `pattern_profile`; under any other rule it subtracts nothing.
+
+Under a pattern rule the background is subtracted from every sample the rule reads: the
+profile that centres the window, the fitted samples and the areas the dispersion is fitted
+on. `run-experiment` therefore runs a second export pass once the background is known,
+writes it as `<run>/fragment_quant_background.parquet` (recorded in the manifest as
+`experiment.cross_run_quant.fragment_quants_background` and `fragment_quant_background[<run>]`), and
+fits the dispersion on those tables. A fragment without an experiment level is read as it
+is. The same holds for an explicit `baseline_subtract = true, baseline_source = experiment`
+under a pattern rule, which validation now accepts; the per-run quantile
+(`baseline_source = run`) still does not combine with a pattern rule. Standalone, the same
+sequence is `quant --export-cross-run` (pass 1), `quant --export-cross-run --cross-run-from
+<pass-1 tables>` (the background-subtracted export), and the final `quant --cross-run-from`;
+a final call fitted on pass-1 tables alone estimates the dispersion on unsubtracted areas.
+The trace pad of the second pass (`TracePad::for_quant`) adds the flanks only under
+`baseline_subtract = true`, as before: `"auto"` was measured on traces padded by the
+half-width alone, so the second pass extracts what it extracted before and the
+identifications do not move.
+
+**Where the recipe gives way.** A configuration that sets its own fragment rule other than
+`pattern_fit` / `pattern_profile` and leaves `window_centre` unset keeps the apex window, the
+window that rule was chosen with: such a configuration quantifies, `peptide_quant` and
+`protein_group_quant` byte for byte, as it did before (checked end to end with the diaPASEF
+recipe on an 18-run experiment against the previous engine). A configuration that leaves a
+recipe key unset and sets something the key cannot combine with gets the previous default for
+that key, with a warning at load (`Config::resolve_quant_recipe`): `window_centre = apex` and
+`fragment_selection = observed_area` under a window that is not the scan form
+(`fixed_scan_halfwidth = 0`, `fixed_window_s > 0` or `fixed_scan_halfwidth_scale > 0`);
+`fragment_selection = observed_area` under `interference_envelope`, the per-run
+`baseline_subtract = true`, `groups.window_groups > 1` or `experiment.rt_library_scope =
+per_run` (the last two are where the cross-run step is refused); `normalisation = off` under
+`normalisation_scope = condition`. The same key set explicitly is refused, as before.
+
+**Restoring the previous quantification.** Set the four keys:
+
+```json
+{ "quant": { "window_centre": "apex", "fragment_selection": "observed_area",
+             "baseline_subtract": false, "normalisation": "off" } }
+```
+
+That configuration quantifies with the previous defaults and keeps their canonical
+configuration and config hash; on fixed inputs its `peptide_quant` and
+`protein_group_quant` are the previous release's byte for byte
+(`config::tests::the_previous_quant_defaults_are_reproduced_by_setting_them`; checked
+against the previous engine on a ProteoBench Astral run). `QuantConfig::previous_defaults`
+is the same set in code. Setting only `"fragment_selection": "observed_area"` restores the
+previous `peptide_quant` and `protein_group_quant` as well (the window stays at the apex, and
+`"auto"` acts only under a pattern rule); the normalisation then still writes its own table
+beside them, and the configuration hash differs.
+
+**Identifications do not move.** The recipe changes quantification only. The scored tables,
+q values, reports' identification columns and the second pass's extraction are those of the
+previous defaults, byte for byte, on every dataset below.
+
+**Measured (2026-11-07), end to end.** Each dataset was searched twice by one engine build on
+one host, with the previous quantification set explicitly and with the defaults, from the
+same NN seed; ProteoBench Astral and AIF with three seeds each. The ProteoBench modules are
+scored with ProteoBench 0.18.6 offline (default view: ions in at least 3 of 6 runs,
+species-weighted median |eps|). The other sets are scored on their condition A against B
+(expected log2 A/B human 0, yeast +1, E. coli -2; ions in at least 3 of the 12 runs and in
+both conditions), with the same metric definitions. The previous arm's value is
+`peptide_quant.quantity`; the default arm's is `quantity_normalised`. On the diaPASEF sets
+the previous arm is the previous engine with the quantification recipe that
+`configs/examples/diapasef.json` set until 2026-11-07 (`cross_run` with the experiment
+background and the envelope, `fixed_scan_halfwidth` 4); that example now leaves quant at the
+defaults. Every scored, competed, feature and extracted-PSM table, first and second pass, and
+the identification columns of every report were byte-identical between the two arms of each
+set (the diaPASEF recipe's chromatograms differ, because its `baseline_subtract = true` pads
+the second pass's traces by the flanks).
+
+Previous quantification -> default. Species-weighted and global are the median |eps|; CV is the
+median per-condition CV; human SD is the standard deviation of the human log2 ratios, with the
+robust one (1.4826 x MAD) in parentheses. Astral and AIF are means over three NN seeds, whose
+spread was at most 0.0017 species-weighted. `auto` is the background decision and the
+experiment's median share of exactly-zero flank samples.
+
+| set (runs) | species-weighted | global | CV | human SD | `auto` |
+|---|---|---|---|---|---|
+| ProteoBench Astral (6), 3 seeds | 0.340 -> 0.250 | 0.227 -> 0.191 | 0.141 -> 0.135 | 0.432 (0.301) -> 0.369 (0.263) | off (0.96) |
+| ProteoBench AIF (6), 3 seeds | 0.324 -> 0.205 | 0.198 -> 0.154 | 0.321 -> 0.152 | 0.840 (0.259) -> 1.030 (0.202) | off (0.87) |
+| ProteoBench Low Input (6) | 0.604 -> 0.476 | 0.478 -> 0.337 | 0.179 -> 0.135 | 0.467 (0.355) -> 0.381 (0.257) | off (0.89) |
+| Generation Beta Astral 15 min 50 ng, A/B (18) | 0.351 -> 0.256 | 0.202 -> 0.164 | 0.170 -> 0.161 | 0.392 (0.261) -> 0.327 (0.219) | off (0.94) |
+| Generation Beta Astral 15 min 250 pg, A/B (18) | 0.516 -> 0.379 | 0.394 -> 0.235 | 0.226 -> 0.211 | 0.537 (0.401) -> 0.453 (0.322) | off (0.93) |
+| Astral 5 min 50 ng, A/B (18) | 0.499 -> 0.342 | 0.225 -> 0.182 | 0.168 -> 0.164 | 0.399 (0.263) -> 0.340 (0.235) | off (1.00) |
+| ProteoBench diaPASEF (6), previous = diaPASEF recipe | 0.204 -> 0.182 | 0.136 -> 0.126 | 0.086 -> 0.086 | 0.304 (0.176) -> 0.251 (0.167) | on (0.47) |
+| timsTOF Ultra diaPASEF 5 min 250 pg, A/B (18), previous = recipe | 0.476 -> 0.499 | 0.338 -> 0.274 | 0.132 -> 0.113 | 0.395 (0.412) -> 0.316 (0.342) | off (1.00) |
+
+Median log2 A/B per species and ions with a ratio (the same ions in both arms):
+
+| set | human (0) | yeast (+1) | E. coli (-2) | ions human / yeast / E. coli |
+|---|---|---|---|---|
+| ProteoBench Astral | -0.028 -> -0.027 | 0.766 -> 0.881 | -1.498 -> -1.705 | 93,305 / 28,201 / 6,285 |
+| ProteoBench AIF | -0.044 -> -0.009 | 0.864 -> 1.093 | -1.502 -> -1.895 | 60,461 / 18,394 / 2,878 |
+| ProteoBench Low Input (human +0.263, yeast -2.322) | -0.176 -> -0.034 | -1.568 -> -1.682 | | 36,037 / 5,655 / - |
+| Generation Beta 50 ng | -0.031 -> -0.030 | 0.744 -> 0.848 | -1.417 -> -1.601 | 99,350 / 29,387 / 7,199 |
+| Generation Beta 250 pg | -0.298 -> -0.006 | 0.407 -> 0.808 | -1.547 -> -1.406 | 16,648 / 4,258 / 1,012 |
+| Astral 5 min 50 ng | -0.063 -> -0.038 | 0.595 -> 0.765 | -1.103 -> -1.396 | 88,670 / 24,200 / 6,173 |
+| ProteoBench diaPASEF | 0.028 -> -0.009 | 0.882 -> 0.861 | -1.785 -> -1.845 | 76,196 / 15,025 / 4,961 |
+| Ultra diaPASEF 250 pg | 0.312 -> 0.247 | 1.156 -> 0.990 | -1.186 -> -1.001 | 4,689 / 1,165 / 281 |
+
+The ProteoBench modules scored with the modules' own code (seed 0, default view, ions in at
+least 3 of 6 runs): Astral 131,541 ions, species-weighted 0.340 -> 0.250, global 0.228 ->
+0.191, CV 0.143 -> 0.137; AIF 99,572 ions, 0.324 -> 0.205, 0.198 -> 0.154, CV 0.322 -> 0.155;
+Low Input 43,410 ions, 0.604 -> 0.476, 0.478 -> 0.337, CV 0.180 -> 0.137; diaPASEF 98,824
+ions, 0.204 -> 0.182, 0.136 -> 0.126, CV 0.087 -> 0.087.
+
+Where it is worse:
+
+- **Q Exactive AIF, human SD** 0.84 -> 1.03 on every seed. The bulk of the human ratios is
+  tighter (robust SD 0.259 -> 0.202), and the tail is heavier: the share of human ions more
+  than 1 log2 from 0 rises from 14.5% to 16.5%. The 2026-10-26 study placed that tail in human
+  ions whose MS1 isotope trace also changes 3 to 8 fold between the conditions, that is in
+  identifications or assignments the previous rule happened to compress.
+- **Ultra diaPASEF 250 pg, species-weighted** 0.476 -> 0.499 against the diaPASEF recipe,
+  from the E. coli ratio (-1.19 -> -1.00, 281 ions); global, CV and human SD improve. At that
+  load the flanks are mostly empty (share 1.00), so `auto` does not subtract the background;
+  forcing it (`baseline_subtract = true`, `baseline_source = experiment`) gives 0.462 / 0.292 /
+  0.122 / 0.342. Generation Beta 250 pg shows the same E. coli direction (-1.55 -> -1.41) while
+  every other metric improves.
+
 
 Two keys change where the fixed window sits and how its samples become a quantity. Both are
-off by default and benchmark-gated. The code is `stages/quant_pattern.rs`.
+the default since 2026-11-07 ([Default quantification recipe](#default-quantification-recipe)).
+The code is `stages/quant_pattern.rs`.
 
-**`window_centre = "profile"`** (default `apex`). Per candidate and run, quant sums the raw
+**`window_centre = "profile"`** (the default; previously `apex`). Per candidate and run, quant sums the raw
 traces of the 6 fragments with the highest `predicted_intensity` (ties in row order; a
 fragment without a trace adds nothing) sample by sample, around the sample `k` nearest the
 identification apex. It then tries the shifts `0, -1, +1, -2, +2` in that order. A shift is
@@ -783,10 +949,12 @@ candidate, or a `phi` of 0 from runs that do not vary), both rules rank as `pred
 kept. They log that, and the reports record `"fragment_selection_fallback": "Predicted"`.
 When the fit ran, the reports record `pattern_fit` (`phi`, `dt_s`, the cells that estimated
 `phi`) and `candidates_pattern`. A candidate whose `S` is empty is not quantified
-(`no_pattern_fragments`). The rules model raw samples, so validation refuses them with
-`baseline_subtract` and `interference_envelope`, and they need the scan form of the fixed
-window. `run-experiment` refuses them where it refuses the other cross-run keys (grouped
-runs, per-run libraries).
+(`no_pattern_fragments`). The rules model the window samples less the experiment
+background where one applies, so validation refuses them with the per-run
+`baseline_subtract` (`baseline_source = run`) and with `interference_envelope`, and they
+need the scan form of the fixed window. `run-experiment` refuses them, when set
+explicitly, where it refuses the other cross-run keys (grouped runs, per-run libraries); left
+at the default they give way to `observed_area` there.
 
 **Measured (2026-10-26), confirmation stage of a preregistered study.** These numbers come
 from the label-free pipelines: profile window, pattern rule and `normalisation =
@@ -823,8 +991,10 @@ the global error and the CV most (below).
 What the table does not show:
 
 - Neither pipeline met the preregistered decision rules. Both fail the AIF human SD unit,
-  and against the recipe they fail the diaPASEF species-weighted unit, so neither is a
-  default.
+  and against the recipe they fail the diaPASEF species-weighted unit. That was the state on
+  2026-10-26; the experiment background on top of the pattern fit, chosen from the data,
+  closed the diaPASEF gap, and the recipe became the default on 2026-11-07 after the
+  end-to-end validation in [Default quantification recipe](#default-quantification-recipe).
 - The AIF human SD rises. A later check on the same identifications placed the increase in
   the human ions whose MS1 isotope trace also changes 3 to 8 fold between the conditions:
   identification or assignment outliers, which the default compresses. On human ions with
@@ -835,8 +1005,9 @@ What the table does not show:
   that mismatch, smaller under `pattern_profile` than under `pattern_fit`. `predicted`
   carries it too.
 - The diaPASEF recipe keeps the better species-weighted error through its experiment
-  background. The pattern rules refuse a baseline. A background on top of the pattern fit
-  was an unregistered lead that closed the gap on diaPASEF and cost precision on Astral.
+  background. The pattern rules then refused a baseline. A background on top of the pattern
+  fit was an unregistered lead that closed the gap on diaPASEF and cost precision on Astral
+  and AIF; `baseline_subtract = "auto"` now applies it where the flanks carry a floor.
 - The Generation Beta 250 pg compression of transferred low-load values remains.
 - A censored condition mean that the study also confirmed was not ported. It needs the
   condition labels, and in data with no true change it creates ratios of about 0.2 log2 on
@@ -988,11 +1159,12 @@ ions to 4e-15 log2, and differ by at most 0.023 log2 (AIF) from the alignment of
 `bench/make_proteobench_submission.py --quantity aligned`, which also uses the ions missing in
 some replicates of a condition.
 
-### Cross-run normalisation (`quant_norm.rs`, `quant.normalisation`, opt-in)
+### Cross-run normalisation (`quant_norm.rs`, `quant.normalisation`)
 
 `peptide_quant.quantity` is a raw area. A run that was loaded or sprayed more carries
 larger quantities for every precursor, and the deviation depends on retention time.
-`quant.normalisation = "stable_set"` (default `off`) estimates one log2 shift per run as a
+`quant.normalisation = "stable_set"` (the default since 2026-11-07; previously `off`)
+estimates one log2 shift per run as a
 function of retention time, after per-run quant in `run-experiment`, or on existing
 tables with `mumdia quant-normalise --inputs ... --outputs ... --shifts-out ...`. The
 estimator (`quant_stable.rs`) follows the per-run retention-time curve of a stable set of
@@ -1476,12 +1648,17 @@ FDR/reporting).
   winners only (`rescore.rs:721-728`). For experiment-wide rescoring, slice by
   `source` and normally use `RunPsmQ`; `q_filter` alone does not select the run.
   `run-experiment` ignores this field and forces `PsmQ` (`run_experiment.rs:498`).
-- `fragment_selection` (`ObservedArea`): `ObservedArea`, `Predicted`, `CrossRun`,
-  `PatternFit` or `PatternProfile`.
-- `window_centre` (`Apex`): `Apex` or `Profile`, the profile-centred fixed window
+- `fragment_selection` (`PatternFit` since 2026-11-07, previously `ObservedArea`):
+  `ObservedArea`, `Predicted`, `CrossRun`, `PatternFit` or `PatternProfile`.
+- `window_centre` (`Profile` since 2026-11-07, previously `Apex`): `Apex` or `Profile`, the
+  profile-centred fixed window
   ([Profile-centred window and pattern fit](#profile-centred-window-and-pattern-fit));
-  omitted from the canonical configuration at its default.
-- `baseline_source` (`Run`): `Run` or `Experiment` (needs `baseline_subtract`).
+  omitted from the canonical configuration at `Apex`, so a configuration setting the
+  previous default keeps its hash.
+- `baseline_subtract` (`"auto"` since 2026-11-07, previously `false`): `true`, `false` or
+  `"auto"`, with `baseline_auto_zero_share` (0.7, omitted from the canonical configuration
+  at its default) ([Default quantification recipe](#default-quantification-recipe)).
+- `baseline_source` (`Run`): `Run` or `Experiment` (needs `baseline_subtract = true`).
 - `fixed_scan_halfwidth_scale` (0, off): the per-candidate width of the cross-run step.
   The last two are omitted from the canonical configuration at their defaults, and all
   three cross-run values are described in
@@ -1491,11 +1668,11 @@ FDR/reporting).
 (median_ratio/median/none, parsed by `NormalizeMethod::from_token`, `config.rs:754`)
 are CLI args. Default normalize is `median_ratio`.
 
-**Cross-run normalisation** (`quant.normalisation`, default `off`, or `stable_set`) and its
-settings `normalisation_rank` (unset, automatic) and `normalisation_lfq` (false) are read by
-`run-experiment` and `quant-normalise`; all three are omitted from the canonical
-configuration at their defaults. See
-[Cross-run normalisation](#cross-run-normalisation-quant_normrs-quantnormalisation-opt-in).
+**Cross-run normalisation** (`quant.normalisation`, default `stable_set` since 2026-11-07,
+or `off`) and its settings `normalisation_rank` (unset, automatic) and `normalisation_lfq`
+(false) are read by `run-experiment` and `quant-normalise`; `normalisation` is omitted from
+the canonical configuration at `off`, the other two at their defaults. See
+[Cross-run normalisation](#cross-run-normalisation-quant_normrs-quantnormalisation).
 
 **align** reads `rt_im_train.q_train` (0.01, `config.rs:326`) as the anchor cutoff;
 `grid_n` is hardcoded to 100 in `main.rs:667` and the LOESS span to 0.4 in `align.rs:93`.

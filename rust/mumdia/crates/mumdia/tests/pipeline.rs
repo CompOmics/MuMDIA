@@ -2912,7 +2912,7 @@ fn the_trace_pad_follows_the_quant_integration_window() {
             seconds: 0.0
         })
     );
-    q.baseline_subtract = true;
+    q.baseline_subtract = mumdia_core::config::BaselineSubtract::On;
     assert_eq!(
         TracePad::for_quant(&q).unwrap().scans,
         3 + q.baseline_flank_scans
@@ -2927,6 +2927,6 @@ fn the_trace_pad_follows_the_quant_integration_window() {
     );
     q.fixed_window_s = 0.0;
     q.fixed_scan_halfwidth = 0;
-    q.baseline_subtract = false;
+    q.baseline_subtract = mumdia_core::config::BaselineSubtract::Off;
     assert_eq!(TracePad::for_quant(&q), None);
 }

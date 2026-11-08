@@ -878,6 +878,26 @@ synthetic phosphopeptides with known sites, 6.7% by the decoy residue on Arabido
 `site_flr_model` was 1.5-3x optimistic there. A peptidoform's site is unvalidated unless the
 stage localised it.
 
+Default quantification recipe (since 2026-11-07; docs/12, "Default quantification recipe"):
+`quant.window_centre = profile`, `fragment_selection = pattern_fit`, `normalisation =
+stable_set`, `baseline_subtract = "auto"`. `"auto"` subtracts the experiment background before
+the pattern fit when the experiment's median share of exactly-zero flank samples is below
+`baseline_auto_zero_share` (0.7): on for diaPASEF (0.47), off for centroided Orbitrap and Astral
+traces (0.87-0.96) and for a 250 pg timsTOF Ultra set (1.00). One decision per experiment,
+recorded in every final quant report and in `experiment.cross_run_quant.baseline_auto` of the
+manifest. The recipe's value is `quantity_normalised` (`peptide_quant_normalised.parquet`);
+`peptide_quant.quantity`, the TSV quantity columns and MaxLFQ read the unnormalised pattern fit.
+A single `run` has no cross-run step: profile window plus `predicted` top-N. Identifications
+are untouched (scored, competed and feature tables byte-identical on eight sets). Measured
+against the previous quantification: species-weighted |eps| ProteoBench Astral 0.340 -> 0.250
+(three seeds), AIF 0.324 -> 0.205, Low Input 0.604 -> 0.476, Generation Beta 50 ng 0.351 ->
+0.256 and 250 pg 0.516 -> 0.379, Astral 5 min 0.499 -> 0.342, ProteoBench diaPASEF against its
+previous recipe 0.204 -> 0.182. Known costs: the AIF human SD rises 0.84 -> 1.03 (heavier tail,
+tighter bulk), and the 250 pg diaPASEF set is 0.476 -> 0.499 species-weighted against the
+recipe. `{"window_centre": "apex", "fragment_selection": "observed_area", "baseline_subtract":
+false, "normalisation": "off"}` restores the previous quantification and config hash byte for
+byte; an explicitly chosen non-pattern rule keeps the apex window by itself.
+
 Use Parquet quantities for analysis; TSV values are rounded for presentation.
 Cross-run consensus ions, interference-aware ion selection, minimum clean-ion
 rules, connected-component LFQ diagnostics, and the ratio compression of the

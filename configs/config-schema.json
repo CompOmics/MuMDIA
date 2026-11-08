@@ -3736,12 +3736,10 @@
       "rust_type": "FragmentSelection",
       "kind": "enum",
       "optional": false,
-      "default": "observed_area",
-      "default_text": "`observed_area`",
-      "help": "Which fragments enter the top-N sum. `observed_area` (default, legacy) ranks by the integrated area itself, which preferentially selects interfered fragments (their areas are inflated) and so varies run to run. `predicted` ranks by the library (predicted or empirical) fragment intensity, a per-precursor constant, so every run sums the same fragments. Astral HYE 2026-08-26 (pipeline of that date): CV 0.163 -> 0.112 on 6/6 ions at top-3. That CV gain does not reproduce with 0.8.0: on fixed ProteoBench Astral identifications, 6/6 ions, the median CV is 0.136 for `observed_area` and 0.151 for `predicted`. Benchmark-gated. `cross_run` weights each fragment by its consistency across the runs of an experiment (`FragmentSelection::CrossRun`); benchmark-gated as well. Under interference `observed_area` compresses the ratios of the minor species: with 0.8.0 on fixed identifications (ProteoBench default view, ions in at least 3 of 6 runs) the E. coli median log2 A/B (expected -2) is -1.43 / -1.68 / -1.71 for `observed_area` / `predicted` / `cross_run` on Astral and -1.50 / -1.75 / -1.79 on Q Exactive AIF, while the global |eps| and the CV get worse on Astral (docs/12, \"Fragment selection under interference\"). `pattern_fit` and `pattern_profile` fit the window samples to the library pattern with one dispersion fitted over the runs of an experiment (`FragmentSelection::PatternFit`, `FragmentSelection::PatternProfile`); benchmark-gated.",
-      "gates": [
-        "benchmark-gated"
-      ],
+      "default": "pattern_fit",
+      "default_text": "`pattern_fit`",
+      "help": "Which fragments enter the top-N sum. `observed_area` (the default before 2026-11-07) ranks by the integrated area itself, which preferentially selects interfered fragments (their areas are inflated) and so varies run to run. `predicted` ranks by the library (predicted or empirical) fragment intensity, a per-precursor constant, so every run sums the same fragments. Astral HYE 2026-08-26 (pipeline of that date): CV 0.163 -> 0.112 on 6/6 ions at top-3. That CV gain does not reproduce with 0.8.0: on fixed ProteoBench Astral identifications, 6/6 ions, the median CV is 0.136 for `observed_area` and 0.151 for `predicted`. `cross_run` weights each fragment by its consistency across the runs of an experiment (`FragmentSelection::CrossRun`). Both are opt-in. Under interference `observed_area` compresses the ratios of the minor species: with 0.8.0 on fixed identifications (ProteoBench default view, ions in at least 3 of 6 runs) the E. coli median log2 A/B (expected -2) is -1.43 / -1.68 / -1.71 for `observed_area` / `predicted` / `cross_run` on Astral and -1.50 / -1.75 / -1.79 on Q Exactive AIF, while the global |eps| and the CV get worse on Astral (docs/12, \"Fragment selection under interference\"). `pattern_fit` and `pattern_profile` fit the window samples to the library pattern with one dispersion fitted over the runs of an experiment (`FragmentSelection::PatternFit`, `FragmentSelection::PatternProfile`). Default `pattern_fit` since 2026-11-07, with `window_centre = profile` and `normalisation = stable_set` (the quantification recipe of docs/12, \"Default quantification recipe\"). Where the cross-run step does not run (a single `run`, `quant` without `--cross-run-from`, fewer than 3 runs sharing a candidate) it is `predicted` with `top_n_fragments`. `observed_area` restores the previous default. A configuration that does not set this key and asks for something the pattern fit cannot combine with (a window that is not the scan form, `interference_envelope`, the per-run `baseline_subtract = true`, `groups.window_groups > 1` or `experiment.rt_library_scope = per_run`) gets `observed_area`, with a warning; set explicitly, those combinations are refused.",
+      "gates": [],
       "source_struct": "QuantConfig",
       "choices": [
         "observed_area",
@@ -3768,15 +3766,31 @@
       "path": "quant.baseline_subtract",
       "name": "baseline_subtract",
       "section": "quant",
-      "rust_type": "bool",
-      "kind": "bool",
+      "rust_type": "BaselineSubtract",
+      "kind": "enum",
       "optional": false,
-      "default": false,
-      "default_text": "false",
-      "help": "Subtract a per-fragment local background before integrating (fixed-scan window only). The background is the `baseline_quantile` quantile of the intensities in the two flanks (`baseline_flank_scans` samples on each side of the integration window); window intensities are clipped at zero after subtraction. Targets the additive floor that compresses ratios in the low-abundance condition. Off by default; benchmark-gated.",
-      "gates": [
-        "benchmark-gated"
-      ],
+      "default": "auto",
+      "default_text": "`auto`",
+      "help": "Subtract a per-fragment local background before integrating (fixed-scan window only). The background is the `baseline_quantile` quantile of the intensities in the two flanks (`baseline_flank_scans` samples on each side of the integration window); window intensities are clipped at zero after subtraction. Targets the additive floor that compresses ratios in the low-abundance condition. `true`, `false` or `\"auto\"`. `\"auto\"` (the default since 2026-11-07) subtracts the experiment background (`baseline_source = experiment`) under the pattern rules, before the profile centre, the pattern fit and its dispersion, when the experiment's traces carry an additive floor: when the median over the runs of the share of exactly-zero flank samples is below `baseline_auto_zero_share`. Centroided Orbitrap traces leave the flanks empty (85-93% zeros) and keep it off; diaPASEF traces carry a floor (46%) and turn it on. One decision per experiment, recorded per run in the quant report (`baseline_auto`) and in the experiment manifest. It needs the cross-run step, so it is off in a single `run`, in `quant` without `--cross-run-from` and under a rule other than `pattern_fit` / `pattern_profile`. `false` restores the previous default.",
+      "gates": [],
+      "source_struct": "QuantConfig",
+      "choices": [
+        "false",
+        "true",
+        "auto"
+      ]
+    },
+    {
+      "path": "quant.baseline_auto_zero_share",
+      "name": "baseline_auto_zero_share",
+      "section": "quant",
+      "rust_type": "f64",
+      "kind": "float",
+      "optional": false,
+      "default": 0.7,
+      "default_text": "0.7",
+      "help": "`baseline_subtract = \"auto\"`: the experiment background is subtracted when the median over the runs of the share of exactly-zero flank samples is below this. 0.7 separates the measured Orbitrap runs (0.86-0.93) from diaPASEF (0.46). In `[0, 1]`. Omitted from the canonical configuration at its default.",
+      "gates": [],
       "source_struct": "QuantConfig"
     },
     {
@@ -3859,12 +3873,10 @@
       "rust_type": "CrossRunNormalisation",
       "kind": "enum",
       "optional": false,
-      "default": "off",
-      "default_text": "`off`",
-      "help": "Cross-run normalisation of the per-run precursor quantities, by `run-experiment` after per-run quant and by `mumdia quant-normalise`. `off` (default): none. `stable_set`: one log2 shift per run and retention-time bin, the median deviation of a stable set of ions, those whose profile across the runs belongs to the largest population of a principal-component subspace of the run space (docs/12, \"Cross-run normalisation\"). The result is a separate table per run, `peptide_quant_normalised.parquet` (`quantity_normalised`), next to an unchanged `peptide_quant.parquet`, plus the fitted shifts in `quant_normalisation.parquet`. Benchmark-gated. Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
+      "default": "stable_set",
+      "default_text": "`stable_set`",
+      "help": "Cross-run normalisation of the per-run precursor quantities, by `run-experiment` after per-run quant and by `mumdia quant-normalise`. `off`: none. `stable_set`: one log2 shift per run and retention-time bin, the median deviation of a stable set of ions, those whose profile across the runs belongs to the largest population of a principal-component subspace of the run space (docs/12, \"Cross-run normalisation\"). The result is a separate table per run, `peptide_quant_normalised.parquet` (`quantity_normalised`), next to an unchanged `peptide_quant.parquet`, plus the fitted shifts in `quant_normalisation.parquet`. Default `stable_set` since 2026-11-07 (docs/12, \"Default quantification recipe\"); `off` restores the previous default. A configuration that does not set this key and sets `normalisation_scope = condition` gets `off`, with a warning. Written to the canonical configuration except at `off`, so that a configuration setting `off` keeps the hash it had when `off` was the default.",
+      "gates": [],
       "source_struct": "QuantConfig",
       "choices": [
         "off",
@@ -3922,12 +3934,10 @@
       "rust_type": "WindowCentre",
       "kind": "enum",
       "optional": false,
-      "default": "apex",
-      "default_text": "`apex`",
-      "help": "Where the fixed scan window is centred. `apex` (default): on the sample nearest the identification apex. `profile`: on the centre of the 3-sample block, within 2 samples of that sample, with the largest summed raw intensity of the 6 fragments with the highest library intensity (ties to the smaller shift), one centre for all of the candidate's fragments (docs/12, \"Profile-centred window and pattern fit\"). The identification apex and `integration_apex_rt` do not move; `integration_lo_rt` and `integration_hi_rt` report the shifted window. Needs the scan form of the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`, `fixed_scan_halfwidth_scale = 0`). Benchmark-gated. Omitted from the canonical configuration at its default.",
-      "gates": [
-        "benchmark-gated"
-      ],
+      "default": "profile",
+      "default_text": "`profile`",
+      "help": "Where the fixed scan window is centred. `apex`: on the sample nearest the identification apex. `profile`: on the centre of the 3-sample block, within 2 samples of that sample, with the largest summed raw intensity of the 6 fragments with the highest library intensity (ties to the smaller shift), one centre for all of the candidate's fragments (docs/12, \"Profile-centred window and pattern fit\"). The identification apex and `integration_apex_rt` do not move; `integration_lo_rt` and `integration_hi_rt` report the shifted window. Needs the scan form of the fixed window (`fixed_scan_halfwidth > 0`, `fixed_window_s = 0`, `fixed_scan_halfwidth_scale = 0`). Default `profile` since 2026-11-07 (docs/12, \"Default quantification recipe\"); `apex` restores the previous default. A configuration that does not set this key gets `apex` when it sets a fragment rule other than `pattern_fit` / `pattern_profile` (the window that rule was chosen with), and, with a warning, when it sets a window that is not the scan form. Written to the canonical configuration except at `apex`, so that a configuration setting `apex` keeps the hash it had when `apex` was the default.",
+      "gates": [],
       "source_struct": "QuantConfig",
       "choices": [
         "apex",

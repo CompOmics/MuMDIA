@@ -624,7 +624,7 @@ The recipe is `configs/examples/diapasef.json`. It derives from
 | `retrace` | `enabled true`, `repick true` | section 6 |
 | `rescore` | `nn_torch`, `strict true` | |
 | `mbr` | `strategy second_pass` | the default of `run-experiment`, written out; supported on 4D since section 7 |
-| `quant` | `fixed_scan_halfwidth 4`, `interference_envelope true`, `baseline_subtract true`, `fragment_selection cross_run`, `baseline_source experiment` | the measured base and the first two cross-run selectors (section 8) |
+| `quant` | none: the defaults since 2026-11-07 (profile-centred window, `pattern_fit`, `stable_set`, `baseline_subtract = "auto"`, which subtracts the experiment background on diaPASEF) | ProteoBench diaPASEF species-weighted \|eps\| 0.204 -> 0.182 against the previous recipe (docs/12, "Default quantification recipe"). The previous recipe was `fixed_scan_halfwidth 4`, `interference_envelope true`, `baseline_subtract true`, `fragment_selection cross_run`, `baseline_source experiment` (section 8); set those keys to keep it, which also keeps the apex window |
 
 `rt_window_multiplier` stays at 1.0, the engine default. The 1.5 of the Orbitrap and Astral
 examples (`diann-library.json`, the prescreen examples) must not be carried over: on

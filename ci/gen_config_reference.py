@@ -322,6 +322,7 @@ class Struct:
         self.name = name
         self.doc = doc
         self.fields: list[Field] = []
+        self.skipped: set[str] = set()  # `#[serde(skip)]` fields, which a file cannot set
         self.has_default_impl = False
 
 
@@ -332,6 +333,13 @@ class EnumVariant:
         self.is_default = is_default
 
 
+# Enums with a hand-written Serialize/Deserialize instead of a derive: the spelling of each
+# variant in a configuration file.
+CUSTOM_SERDE_SPELLING = {
+    "BaselineSubtract": {"Off": "false", "On": "true", "Auto": "auto"},
+}
+
+
 class Enum:
     def __init__(self, name: str, doc: str, rename_all: str | None):
         self.name = name
@@ -340,6 +348,9 @@ class Enum:
         self.variants: list[EnumVariant] = []
 
     def serde_name(self, variant: str) -> str:
+        custom = CUSTOM_SERDE_SPELLING.get(self.name)
+        if custom and variant in custom:
+            return custom[variant]
         if self.rename_all == "snake_case":
             return snake_case(variant)
         return variant
@@ -432,7 +443,7 @@ def parse_config_rs(text: str) -> tuple[dict[str, Struct], dict[str, Enum], list
                 )
             else:
                 struct.has_default_impl = True
-                known = {f.name for f in struct.fields}
+                known = {f.name for f in struct.fields} | struct.skipped
                 for name, expr in assignments.items():
                     if name not in known:
                         warnings.append(
@@ -473,7 +484,9 @@ def parse_struct_body(
             i += 1
             continue
         m = FIELD_RE.match(strip_comments(raw))
-        if m:
+        if m and any(re.fullmatch(r"#\[serde\(skip\)\]", a) for a in attrs):
+            struct.skipped.add(m.group(1))  # not part of the configuration file
+        elif m:
             struct.fields.append(
                 Field(m.group(1), m.group(2).strip(), doc_paragraph(doc), attrs)
             )
@@ -2306,7 +2319,7 @@ def build_schema(config_text: str) -> dict:
             "source_struct": struct.name,
         }
         if base in enums:
-            entry["choices"] = [snake_case(v.name) for v in enums[base].variants]
+            entry["choices"] = [enums[base].serde_name(v.name) for v in enums[base].variants]
         return entry
 
     fields: list[dict] = []
