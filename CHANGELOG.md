@@ -7,6 +7,21 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.11.0` is a minor rather than a patch release: every quantity changes under the default
+configuration while every identification stays the same. Quantification now centres its
+window on the elution profile, fits each precursor's fragments to their shared pattern,
+normalises the runs of an experiment on a stable set of precursors, and decides from the
+data whether to subtract the experiment background (`quant.baseline_subtract = "auto"`:
+on for diaPASEF, off for centroided Orbitrap and Astral traces). The per-run and cross-run
+quant tables, the `lfq_*` tables, the quantity columns of the reports and the configuration
+hash of a configuration that does not set these keys change; the scored tables, their q
+values and the identifications in the reports do not. `{"window_centre": "apex",
+"fragment_selection": "observed_area", "baseline_subtract": false, "normalisation": "off"}`
+under `quant` restores the previous quantification, and its configuration hash, byte for
+byte. Under the condition normalisation scope the recipe is kept except for the stable-set
+step, and every recipe default that gives way is recorded in the quant reports and the
+experiment manifest. The release workflow writes the release notes once.
+
 `0.10.0` is a minor rather than a patch release: it changes the layout and the content of what
 a search writes, and it refuses a configuration that earlier releases ran. The runs of an
 experiment, and of a `run` given several spectra files, are written to folders named after
@@ -150,12 +165,12 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
-## [Unreleased]
+## [0.11.0] - 2026-11-09
 
 ### Changed
 
 - **Quantification defaults to the profile window, the pattern fit and the stable-set
-  normalisation, with the background chosen from the data.** `quant.window_centre = profile`,
+  normalisation, with the background chosen from the data (#294).** `quant.window_centre = profile`,
   `quant.fragment_selection = pattern_fit` and `quant.normalisation = stable_set` (opt-in since
   0.9.0) are the defaults, and `quant.baseline_subtract` takes `"auto"` (the new default) besides
   `true` and `false`: under a pattern rule it subtracts the experiment background, before the
@@ -187,7 +202,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   tables, report quantity columns and the configuration hash of a configuration that does
   not set these keys change.
 - **The condition normalisation scope keeps the quantification recipe, and every recipe
-  default that gives way is recorded.** Under `quant.normalisation_scope = condition` (the
+  default that gives way is recorded (#295).** Under `quant.normalisation_scope = condition` (the
   desktop's "Within each condition") with the recipe keys unset, only the stable-set step is
   left out, because its fit is estimated over every run; the profile window, the pattern fit
   and the `"auto"` background stay, and the cross-run MaxLFQ normalises within each
@@ -205,7 +220,7 @@ than a number. Both are recorded in every run's `manifest.json`.
 
 ### Fixed
 
-- **Release notes are written once.** Each of the release workflow's upload jobs asked for
+- **Release notes are written once (#293).** Each of the release workflow's upload jobs asked for
   generated notes and appended another copy, so a release page listed its changes several
   times. The uploads no longer write notes; a final `release-notes` job replaces the body with
   one generated copy after every upload has finished.
