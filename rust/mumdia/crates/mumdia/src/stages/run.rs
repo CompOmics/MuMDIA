@@ -1162,6 +1162,7 @@ fn convert_and_record(
         top_peaks_ms1: 0,
         config_hash: &convert_hash,
         tdf: convert::TdfParams::from_config(&cfg.convert),
+        isolation_half_width: cfg.convert.isolation_half_width,
     })?;
     crate::raw::discard_converted(p.mzml);
     for (name, schema, path, hash) in [

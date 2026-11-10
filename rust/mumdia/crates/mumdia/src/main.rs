@@ -1923,6 +1923,7 @@ fn real_main() -> Result<()> {
                 top_peaks_ms1,
                 config_hash: &config_hash,
                 tdf: stages::convert::TdfParams::from_config(&cfg.convert),
+                isolation_half_width: cfg.convert.isolation_half_width,
             })?;
         }
         Cmd::Digest { fasta, out, config } => {

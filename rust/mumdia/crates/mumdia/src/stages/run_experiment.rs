@@ -547,6 +547,7 @@ fn convert_run(
         top_peaks_ms1: 0,
         config_hash: &convert_hash,
         tdf: convert::TdfParams::from_config(&cfg.convert),
+        isolation_half_width: cfg.convert.isolation_half_width,
     })?;
     crate::raw::discard_converted(mzml);
     if !library_input {
