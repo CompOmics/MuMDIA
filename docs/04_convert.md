@@ -583,7 +583,11 @@ an SQLite index plus zstd-compressed frames. timsrust 0.4.2 (with only its `tdf`
 feature) brings a bundled SQLite, which is C, like the `zstd-sys` that parquet already
 compiles, so no new toolchain is required. The graph keeps one `zstd-sys` and one
 `libsqlite3-sys` (both are `links` crates); `rusqlite` is pinned to timsrust's minor
-version for that reason.
+version for that reason. The timsrust that builds is a vendored copy,
+`rust/mumdia/vendor/timsrust`, wired in through `[patch.crates-io]`: the published 0.4.2
+requires `rusqlite` 0.32, whose bundled SQLite carries RUSTSEC-2026-0459, and the copy
+differs from it only in its manifest, which asks for `rusqlite` 0.41. The header of that
+manifest lists every change.
 
 ### The native diaPASEF reader
 

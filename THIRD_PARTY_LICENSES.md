@@ -24,13 +24,13 @@ Licence identifiers by crate count:
 
 | SPDX identifier | crates |
 |---|---|
-| `MIT` | 175 |
-| `Apache-2.0` | 164 |
+| `MIT` | 174 |
+| `Apache-2.0` | 163 |
 | `BSD-3-Clause` | 6 |
 | `Apache-2.0 WITH LLVM-exception` | 4 |
 | `Unlicense` | 4 |
+| `Zlib` | 4 |
 | `CC0-1.0` | 3 |
-| `Zlib` | 3 |
 | `BSD-2-Clause` | 2 |
 | `LGPL-2.1-or-later` | 2 |
 | `0BSD` | 1 |
@@ -112,6 +112,7 @@ Licence identifiers by crate count:
 | `find-msvc-tools` | 0.1.9 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/cc-rs](https://github.com/rust-lang/cc-rs) |
 | `flatbuffers` | 25.12.19 | Apache-2.0 | - | [https://github.com/google/flatbuffers](https://github.com/google/flatbuffers) |
 | `flate2` | 1.1.9 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/flate2-rs](https://github.com/rust-lang/flate2-rs) |
+| `foldhash` | 0.2.0 | Zlib | - | [https://github.com/orlp/foldhash](https://github.com/orlp/foldhash) |
 | `futures-core` | 0.3.32 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
 | `futures-task` | 0.3.32 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
 | `futures-util` | 0.3.32 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
@@ -119,9 +120,8 @@ Licence identifiers by crate count:
 | `getrandom` | 0.3.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-random/getrandom](https://github.com/rust-random/getrandom) |
 | `getrandom` | 0.4.3 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-random/getrandom](https://github.com/rust-random/getrandom) |
 | `half` | 2.7.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/VoidStarKat/half-rs](https://github.com/VoidStarKat/half-rs) |
-| `hashbrown` | 0.14.5 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/hashbrown](https://github.com/rust-lang/hashbrown) |
 | `hashbrown` | 0.17.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/hashbrown](https://github.com/rust-lang/hashbrown) |
-| `hashlink` | 0.9.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/kyren/hashlink](https://github.com/kyren/hashlink) |
+| `hashlink` | 0.12.2 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/djc/hashlink](https://github.com/djc/hashlink) |
 | `heck` | 0.5.0 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/withoutboats/heck](https://github.com/withoutboats/heck) |
 | `hex` | 0.4.3 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/KokaKiwi/rust-hex](https://github.com/KokaKiwi/rust-hex) |
 | `hybrid-array` | 0.4.15 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/RustCrypto/hybrid-array](https://github.com/RustCrypto/hybrid-array) |
@@ -143,7 +143,7 @@ Licence identifiers by crate count:
 | `libc` | 0.2.186 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/libc](https://github.com/rust-lang/libc) |
 | `libm` | 0.2.16 | MIT | - | [https://github.com/rust-lang/compiler-builtins](https://github.com/rust-lang/compiler-builtins) |
 | `libmimalloc-sys` | 0.1.49 | MIT | - | [https://github.com/purpleprotocol/mimalloc_rust/tree/master/libmimalloc-sys](https://github.com/purpleprotocol/mimalloc_rust/tree/master/libmimalloc-sys) |
-| `libsqlite3-sys` | 0.30.1 | MIT | - | [https://github.com/rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) |
+| `libsqlite3-sys` | 0.39.1 | MIT | - | [https://github.com/rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) |
 | `linreg` | 0.2.0 | MIT | - | [https://github.com/49nord/linreg-rs.git](https://github.com/49nord/linreg-rs.git) |
 | `log` | 0.4.33 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/log](https://github.com/rust-lang/log) |
 | `matchers` | 0.2.0 | MIT | - | [https://github.com/hawkw/matchers](https://github.com/hawkw/matchers) |
@@ -182,7 +182,7 @@ Licence identifiers by crate count:
 | `regex` | 1.12.4 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
 | `regex-automata` | 0.4.14 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
 | `regex-syntax` | 0.8.11 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
-| `rusqlite` | 0.32.1 | MIT | - | [https://github.com/rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) |
+| `rusqlite` | 0.41.1 | MIT | - | [https://github.com/rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) |
 | `rustc_version` | 0.4.1 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/djc/rustc-version-rs](https://github.com/djc/rustc-version-rs) |
 | `rustversion` | 1.0.22 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/rustversion](https://github.com/dtolnay/rustversion) |
 | `ryu` | 1.0.23 | Apache-2.0 OR BSL-1.0 | `Apache-2.0` | [https://github.com/dtolnay/ryu](https://github.com/dtolnay/ryu) |
@@ -210,7 +210,7 @@ Licence identifiers by crate count:
 | `thiserror-impl` | 1.0.69 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
 | `thiserror-impl` | 2.0.21 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
 | `thread_local` | 1.1.9 | MIT OR Apache-2.0 | `Apache-2.0` | [https://github.com/Amanieu/thread_local-rs](https://github.com/Amanieu/thread_local-rs) |
-| `timsrust` | 0.4.2 | Apache-2.0 | - | [https://github.com/mannlabs/timsrust](https://github.com/mannlabs/timsrust) |
+| `timsrust` | 0.4.2 | Apache-2.0 | - | [https://github.com/mannlabs/timsrust](https://github.com/mannlabs/timsrust), patched copy in `rust/mumdia/vendor/timsrust` |
 | `tiny-keccak` | 2.0.2 | CC0-1.0 | - | - |
 | `tracing` | 0.1.44 | MIT | - | [https://github.com/tokio-rs/tracing](https://github.com/tokio-rs/tracing) |
 | `tracing-attributes` | 0.1.31 | MIT | - | [https://github.com/tokio-rs/tracing](https://github.com/tokio-rs/tracing) |
@@ -250,6 +250,15 @@ Licence identifiers by crate count:
 | `zstd-safe` | 7.3.0 | BSD-3-Clause | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
 | `zstd-safe` | 8.2.0 | BSD-3-Clause | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
 | `zstd-sys` | 2.1.2+zstd.1.5.7 | BSD-3-Clause | - | [https://github.com/gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) |
+
+## Patched crates
+
+Built from a modified copy carried in this repository instead of the package
+published on crates.io. Each remains the upstream authors' work under the licence
+listed above, and its notices below are read from that copy; the modification is
+MuMDIA's, and the modified files say so.
+
+- `timsrust` 0.4.2 (`rust/mumdia/vendor/timsrust`): Vendored copy of timsrust 0.4.2 from crates.io (upstream commit 50d5c5ce); MuMDIA changed only its Cargo.toml, raising rusqlite from 0.32 to 0.41 (with fallible_uint) so the bundled SQLite is fixed for RUSTSEC-2026-0459. The Rust sources are unmodified.
 
 ## Licence texts
 
@@ -565,6 +574,10 @@ Notices recovered for 149 of 208 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2014-2026 Alex Crichton
 
+**foldhash 0.2.0**
+
+- Copyright (c) 2024 Orson Peters
+
 **futures-core 0.3.32**
 
 - Copyright (c) 2016 Alex Crichton
@@ -594,10 +607,6 @@ Notices recovered for 149 of 208 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2018-2026 The rust-random Project Developers
 - Copyright (c) 2014 The Rust Project Developers
-
-**hashbrown 0.14.5**
-
-- Copyright (c) 2016 Amanieu d'Antras
 
 **hashbrown 0.17.1**
 
@@ -700,9 +709,9 @@ Notices recovered for 149 of 208 crates (the remainder ship no copyright line in
 
 - Copyright 2019 Octavian Oncescu
 
-**libsqlite3-sys 0.30.1**
+**libsqlite3-sys 0.39.1**
 
-- Copyright (c) 2014-2021 The rusqlite developers
+- Copyright (c) 2014 The rusqlite developers
 
 **linreg 0.2.0**
 
@@ -822,9 +831,9 @@ Notices recovered for 149 of 208 crates (the remainder ship no copyright line in
 
 - Copyright (c) 2014 The Rust Project Developers
 
-**rusqlite 0.32.1**
+**rusqlite 0.41.1**
 
-- Copyright (c) 2014-2021 The rusqlite developers
+- Copyright (c) 2014 The rusqlite developers
 
 **rustc_version 0.4.1**
 

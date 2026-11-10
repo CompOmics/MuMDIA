@@ -165,6 +165,25 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Security
+
+- **RUSTSEC-2026-0459 (`libsqlite3-sys` 0.30.1, SQLite CVE-2026-119375) is fixed by patching
+  the diaPASEF reader (#301).** The engine linked SQLite 3.46.0, bundled by `libsqlite3-sys`
+  0.30.1, which reads uninitialised page-cache memory when a database is opened alongside a
+  crafted `-wal` file of another page size; it now links SQLite 3.54.1 through
+  `libsqlite3-sys` 0.39.1 and `rusqlite` 0.41.1. The old SQLite came in through timsrust
+  0.4.2, which requires `rusqlite` 0.32, and no timsrust release MuMDIA can take requires a
+  fixed one, so timsrust 0.4.2 is vendored in `rust/mumdia/vendor/timsrust` and wired in
+  through `[patch.crates-io]`, with one change to its manifest: `rusqlite` 0.41 with
+  `fallible_uint`, the feature behind which 0.41 keeps the `u64` and `usize` conversions 0.32
+  had built in. Its Rust sources are unmodified, and the engine's own `rusqlite` moves to 0.41
+  with it (only one `libsqlite3-sys` can be linked). `THIRD_PARTY_LICENSES.md` lists the copy
+  under "Patched crates" and `sbom.cdx.json` records it with a CycloneDX `pedigree`.
+  Converted diaPASEF spectra and search results are byte-identical. No advisory is ignored
+  for it.
+
 ## [0.11.0] - 2026-11-09
 
 ### Changed

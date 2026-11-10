@@ -737,6 +737,19 @@ still has to pass the full gate, and a dependency change must commit the updated
 `Cargo.lock` in the same pull request because both CI and the Docker build use
 `--locked`.
 
+**Vendored crates.** `rust/mumdia/vendor/` holds third-party crates that build from a
+patched copy instead of from crates.io, wired in through `[patch.crates-io]` and kept out
+of the workspace (`exclude = ["vendor"]`), so `--workspace` does not lint, test or
+document them. The one today is timsrust 0.4.2, whose manifest asks for `rusqlite` 0.41
+instead of 0.32 (RUSTSEC-2026-0459); the header of `vendor/timsrust/Cargo.toml` lists
+every difference from the published crate, and its sources are unmodified. Dependabot
+does not update a path crate, and because `libsqlite3-sys` is a `links` crate a
+`rusqlite` bump in `[workspace.dependencies]` has to move the vendored manifest's
+`rusqlite` with it. The two generators below read a vendored crate's notices from the
+copy rather than from the registry, and record its `package.metadata.mumdia` note: as a
+"Patched crates" section in `THIRD_PARTY_LICENSES.md`, and as a CycloneDX `pedigree` in
+`sbom.cdx.json`. A vendored crate without that note fails both generators.
+
 **The Python side has no Dependabot coverage, by construction.** The sidecar pins
 live in the `pip:` sections of the conda specifications under `env/`, and
 Dependabot's pip ecosystem reads `requirements.txt`, `pyproject.toml`, `Pipfile` or
