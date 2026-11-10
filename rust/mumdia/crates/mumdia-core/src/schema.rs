@@ -22,6 +22,13 @@ pub mod artifact {
     /// `window_im_upper`. A 3D source writes v1. Readers select columns by name, so both
     /// versions load everywhere.
     pub const SPECTRA_MS2_V2: (&str, u32) = ("spectra_ms2", 2);
+    /// v3, written only when `convert.isolation_half_width` widened the target-only spectra
+    /// of a scanning-quadrupole acquisition (SCIEX ZT Scan DIA): v1 plus `q1_cycle` and
+    /// `q1_step` (UInt32), appended last: the sweep a spectrum belongs to and its position
+    /// in that sweep, in acquisition order. The window columns stay as read. Every other
+    /// source writes v1 or v2, byte for byte. Readers select columns by name, so every
+    /// version loads everywhere.
+    pub const SPECTRA_MS2_V3: (&str, u32) = ("spectra_ms2", 3);
     pub const ISOLATION_WINDOWS: (&str, u32) = ("isolation_windows", 1);
     /// v2, written only for a source with ion mobility: each window's 1/K0 bounds
     /// `im_lower` and `im_upper`, so slots sharing an m/z range are separate rows. A 3D
@@ -192,6 +199,16 @@ pub mod artifact {
         }
     }
 
+    /// [`spectra_ms2`], or [`SPECTRA_MS2_V3`] when the conversion recorded the Q1 sweep
+    /// (`q1`), which only a source without ion mobility does.
+    pub fn spectra_ms2_q1(has_im: bool, q1: bool) -> (&'static str, u32) {
+        if q1 && !has_im {
+            SPECTRA_MS2_V3
+        } else {
+            spectra_ms2(has_im)
+        }
+    }
+
     /// The `isolation_windows` schema a conversion writes: [`ISOLATION_WINDOWS_V2`] when
     /// the source carries ion mobility, else [`ISOLATION_WINDOWS`].
     pub fn isolation_windows(has_im: bool) -> (&'static str, u32) {
@@ -306,6 +323,10 @@ mod tests {
         assert_eq!(seed_psms(false), SEED_PSMS);
         assert_eq!(seed_psms(false), ("seed_psms", 1));
         assert_eq!(seed_psms(true), ("seed_psms", 2));
+        assert_eq!(spectra_ms2_q1(false, false), ("spectra_ms2", 1));
+        assert_eq!(spectra_ms2_q1(false, true), ("spectra_ms2", 3));
+        assert_eq!(spectra_ms2_q1(true, false), ("spectra_ms2", 2));
+        assert_eq!(spectra_ms2_q1(true, true), ("spectra_ms2", 2));
     }
 
     /// Extraction keeps main's 3D versions; 1/K0 moves psms_extracted to v4 and each

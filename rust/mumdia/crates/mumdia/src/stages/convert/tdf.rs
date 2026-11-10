@@ -463,6 +463,7 @@ impl Ctx {
                             im_lo: Some(a.min(b) as f32),
                             im_hi: Some(a.max(b) as f32),
                             target_only: None,
+                            widened: false,
                         }))
                     })
                     .collect()

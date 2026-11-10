@@ -63,7 +63,7 @@ pub struct Ms1Scan {
 /// through `ListArray::value(k)` built an `Arc`'d `ArrayRef` per row per column and threw
 /// it away after the copy (2x per row, measured in mumdia-io's
 /// `bench_list_view_against_the_per_row_arrayref`).
-fn list_col<'a>(b: &'a RecordBatch, name: &str) -> Result<ListF32<'a>> {
+pub(crate) fn list_col<'a>(b: &'a RecordBatch, name: &str) -> Result<ListF32<'a>> {
     let i = b
         .schema()
         .index_of(name)
@@ -127,6 +127,31 @@ pub fn load_ms2(path: &str) -> Result<Vec<Ms2Scan>> {
         "spectra: decoded MS2"
     );
     Ok(out)
+}
+
+/// The Q1 sweep a spectra_ms2 v3 table records (`convert.isolation_half_width` on a
+/// scanning-quadrupole acquisition): per MS2 row, in file order, its `scan_index`, the cycle
+/// (sweep) it belongs to and its step in that sweep.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Q1SweepCols {
+    pub scan_index: Vec<u32>,
+    pub cycle: Vec<u32>,
+    pub step: Vec<u32>,
+}
+
+/// [`Q1SweepCols`] of `path`, or `None` for a v1 or v2 table, which records no sweep. Only
+/// the three scalar columns are decoded. [`load_ms2`] ignores both columns, so every
+/// spectra_ms2 version loads there.
+pub fn load_q1_sweep(path: &str) -> Result<Option<Q1SweepCols>> {
+    let t = TableFile::open(path).with_context(|| format!("loading ms2 {path}"))?;
+    if !(t.has_column("q1_cycle") && t.has_column("q1_step")) {
+        return Ok(None);
+    }
+    Ok(Some(Q1SweepCols {
+        scan_index: t.u32("scan_index")?,
+        cycle: t.u32("q1_cycle")?,
+        step: t.u32("q1_step")?,
+    }))
 }
 
 /// The MS2 scans of one part, in file order.
