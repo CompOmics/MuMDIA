@@ -774,10 +774,12 @@ more co-isolated interference, the seed finds fewer confident anchors (21,934 ag
 an entrapment library (human with yeast and E. coli entries, r = 0.397) the +-1.9 m/z
 rewrite measured a combined entrapment FDP of 1.31% at a reported precursor q of 1%, a
 measured FDP above the reported q as on the Astral HeLa entrapment pool, so compare at a
-measured FDP. A three-run experiment of the rewritten files (`run --mzml` three times)
-took 55 min at a 93.8 GB peak on 64 threads (about 107,000 precursors per run, 8,958
-protein groups), the peak from three concurrent second-pass extracts; a single run about
-40 GB.
+measured FDP; read natively, the entrapment run measured 95,050 human against 365
+entrapment precursors, 1.35%. The three runs searched as one experiment (`run --mzml`
+three times) with the key gave 110,433 precursors, 88,958 peptides and 8,981 protein
+groups at 1%, about 106,500 precursors per run on `run_psm_q`, in 40 min at an 89.4 GB
+peak on 64 threads (the rewritten files: 110,581 / 89,032 / 8,958), the peak from three
+concurrent second-pass extracts; a single run takes about 36-40 GB.
 
 What the engine does not do: model the quadrupole sweep. Each bin is an independent fixed
 window, its spectra a chromatogram cadence of their own, and the transmission profile of a
