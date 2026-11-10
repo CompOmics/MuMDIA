@@ -1510,6 +1510,9 @@ async function renderMzmlList() {
   for (const [i, f] of files.entries()) {
     if (!state.conditionTyped[f]) state.picks.conditions[f] = suggested[i];
   }
+  // The experiment's options follow the file count now, not after each file's vendor
+  // check below; the call after the list also shows its new condition fields.
+  refreshNormOptions();
   let anyDiapasef = false;
   for (const [i, f] of files.entries()) {
     const li = document.createElement("li");
@@ -1709,10 +1712,15 @@ const NORM_NOTES = {
     "quantities are not normalised, and MaxLFQ is normalised within each condition.",
 };
 
-// The normalisation choice and its note, shown for an experiment of several files.
+// The normalisation choice and its note, shown for an experiment of several files: they
+// sit under "One experiment" and are hidden and disabled for "Search each separately" and
+// for a single file. `normOverrides` checks the same condition, so a hidden choice is
+// never sent.
 function refreshNormOptions() {
   const several = experimentWithSeveral();
   show($("norm-options"), several);
+  $("norm-scope").disabled = !several;
+  $("suggest-conditions").disabled = !several;
   for (const el of document.querySelectorAll("#mzml-list .fcond")) show(el, several);
   if (!several) return;
   const scope = $("norm-scope").value;
