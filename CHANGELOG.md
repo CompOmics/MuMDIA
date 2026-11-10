@@ -228,6 +228,36 @@ than a number. Both are recorded in every run's `manifest.json`.
   -0.06 m/z at 900 m/z, and the window is wider and softer than its nominal 3.8 m/z: whole
   within 0.57 m/z of its centre and nothing beyond 4.56 m/z (docs/08_rt_im_train.md, section
   4h). Off by default and omitted from the canonical configuration.
+- **Per-fragment Q1 decisions for scanning-quadrupole spectra, opt-in
+  (`extract.q1_fragments`).** For every library fragment of every accepted row of a SCIEX ZT
+  Scan DIA run, extract reads an RT x step patch (the seven cycles around the apex, the steps
+  the calibrated Q1 window reaches plus two either side, every step kept apart), fits one Q1
+  centre and width shared by the fragments, and calls each fragment `belongs`, `interfered`
+  or `absent` by its own centre, residual and 2D correlation against tolerances that
+  `rt_im_train.q1_calibrate` learns from the confident seed PSMs (`cal.json`
+  `q1_calibration.fragment_decision`), iterating the consensus once. psms_extracted v6 carries
+  a summary (`q1f_*`) and the per-fragment classes, offsets, residuals and 2D correlations
+  (`q1f_frag_*` lists in library order). Needs `rt_im_train.q1_calibrate` and spectra_ms2 v3;
+  `mumdia extract` takes the calibration as `--q1-cal` (docs/09_extract.md, section 12).
+- **`features.q1_fragment_features`, opt-in**: eight features from the decision (fragments
+  that belong and their predicted-intensity share, the interfered intensity share, the
+  median and spread of the fragments' Q1 offsets, the 2D correlation of the fragments that
+  belong, the shared fit's residual and centre), appended last under `extended`; the
+  feature schema id changes only with it on (docs/10_features.md).
+- **`retrace.q1_repick`, opt-in**: the ZT Scan analogue of `retrace.repick`, run inside
+  extract: the apex moves to the 2D apex (cycle, and the step nearest the fitted Q1 centre) of
+  the peak whose fragments that belong agree best with the library, among extract's apex and
+  the next peaks of its count profile, when at least three belong there.
+- **`rescore.shadow_q1`, opt-in**: the shadow test on a sweep co-isolates by precursor m/z
+  (closer than twice the calibrated window's reach) and counts each shared fragment by where
+  its Q1 signal sits: nothing when absent or centred on the candidate, all of it when centred
+  on the lender or when Q1 cannot separate the two, the two-component split in between
+  (docs/11_compete_rescore_fdr.md). On a ZenoTOF 8600 K562 run the four keys together gave
+  +3.0% precursors (four NN seeds) and +3.2% human precursors on an entrapment library at the
+  base arm's measured FDP, whose value at a reported 1% fell from 1.39% to 1.22%, and +2.3%
+  in a three-run experiment; the decision with its features +1.5%, the re-pick +1.5 points on
+  top, the shadow term nothing beyond the seed spread. Every key is off by default and
+  omitted from the canonical configuration, so every other search is byte-identical.
 - **`extract.ms1_calibrate = "surface"` and `extract.prec_tol_auto`, opt-in.** The surface fits
   the seed anchors' MS1 error as an additive smooth function of precursor m/z and retention time
   and centres every MS1 read on the offset at its own m/z and retention time; `prec_tol_auto`

@@ -160,6 +160,9 @@ production schema stays byte-identical):
 - `emit_demix_features` -> `deconv_explained_frac`, `deconv_active`,
   `deconv_share`, `deconv_max_collinearity`, `shadow_kept_frac` (all F32,
   `extract.rs:2517`), from the spectrum-centric NNLS demix at the apex scan.
+- `q1_profile` -> v5: `q1_corr`, `q1_offset`, `q1_frag_sd`, `q1_bin_frac` (F64, section 10).
+- `q1_fragments` -> v6: the `q1f_*` summary and the `q1f_frag_*` per-fragment lists of the
+  Q1 decision (section 12).
 
 The three soft-competition columns are all derived from the per-candidate
 `Contested` accumulator (`extract.rs:130`), whose fields are `won`/`lost`
@@ -1147,6 +1150,180 @@ nearly all. `prec_tol_auto` sets 7.17 ppm after the surface (robust SD 2.39 ppm 
 refinement) and 7.38 ppm after the one offset. What that does to identifications is in the
 table of docs/04_convert.md, "SCIEX ZT Scan DIA".
 
+### 12. Per-fragment Q1 decisions (scanning quadrupole, default off)
+
+On a ZT Scan DIA run every Q1 step is an isolation window of its own (section 10), so a
+fragment m/z that a candidate's library predicts is seen in the run of steps around the
+candidate's precursor, and so is the same m/z of any other precursor within the window's
+reach. Where in the sweep a fragment's signal is centred says which precursor it came from.
+`extract.q1_fragments` (`stages::q1frag`, psms_extracted v6) decides that for every library
+fragment of every accepted row, after the gate, from the spectra directly. It needs the
+window that `rt_im_train.q1_calibrate` fits (docs/08_rt_im_train.md, section 4h) and the
+decision tolerances the same calibration learns from the confident seed PSMs under this key,
+which `run` and `run-experiment` read from the run's `cal.json` (`mumdia extract` takes it as
+`--q1-cal`), and the sweep spectra_ms2 v3 records (`q1_cycle`, `q1_step`, docs/04): a
+cycle x step grid of the stage's scans (`Q1Grid`; a recorded step that is not the rank of
+its target, or a step twice in a cycle, is refused). Refused with `extract.q1_cycles`, which
+sums the steps this keeps apart, on spectra with 1/K0, and, through `q1_calibrate`, with
+`groups.window_groups > 1`.
+
+**The patch.** For a row with its apex at a scan of cycle `c0`: the cycles `c0 - 3 ..= c0 + 3`
+whose scan at the patch's middle step lies inside the candidate's RT window (the apex cycle
+always), and the steps whose target lies within the window's reach (`h + e/2`, 4.56 m/z on
+ZT Scan) plus two steps of the precursor's expected Q1 centre (the isotope envelope's centre
+minus the fitted window offset): 17 steps on ZT Scan, 119 cells a fragment. Each cell is the
+intensity of the nearest peak within the fragment tolerance of the mass-corrected library
+fragment m/z in that scan, the rule of the seed and of the calibration. Every step stays a
+cell of its own: the steps of a cycle are never summed (summing them lost 13.7% of the
+identifications in section 10).
+
+**The decision** (`q1frag::decide`). The expected profile of a fragment is the calibrated
+trapezoid summed over the precursor's isotopes, weighted by abundance times the chance the
+fragment stays monoisotopic (its centre therefore depends on the fragment). Then, in two
+rounds:
+
+- *Present*: at least three coherent cells within the window's reach of the fragment's
+  expected centre, cells with signal whose neighbouring step in the same cycle has signal too.
+  The spectra are dense (about 1,550 peaks a spectrum, so a 20 ppm window at 600 m/z holds a
+  peak in roughly 2% of the cells by chance), so a fragment of a precursor that is not there
+  still has a few isolated matches in its 119 cells, and a count of cells with signal would
+  call nearly every fragment present; a precursor is transmitted through several consecutive
+  steps. On REP01 the coherence rule calls 2.7% of the extracted rows' fragments absent
+  (0.1% of the confident seed anchors'), a count of two cells with signal 1.6%.
+- *2D apex*: the cycle where the round's fragments, each normalised to its own total over the
+  patch, sum highest. The Q1 profile of a fragment is its patch summed over the five cycles
+  around it, every step apart.
+- *Shared centre*: one centre (a shift of the expected profile, in steps, on a 0.25-step grid
+  from -6 to +6 refined by a parabola) and, in round 2, one width (0.85, 1 or 1.2 times the
+  calibrated `h` and `e`) shared by the round's fragments with a Q1 profile, by least squares
+  of their normalised profiles against the expected ones with a scale (the fragment's height)
+  and a floor each.
+- *Per fragment*: its own centre (the same fit, alone, at the shared width), its residual
+  (`1 - R^2` of its profile under the shared fit) and its 2D correlation: the Pearson
+  correlation over the 119 cells of its patch with the elution of the round's other fragments
+  times its own expected transmission at the shared centre.
+- *Class*: `belongs` when its own centre lies within the offset tolerance of the shared
+  centre, the shared centre clamped to within the centre tolerance of the expected one (so a
+  candidate whose fragments all sit at another precursor has none that belong), and its 2D
+  correlation reaches the floor; `interfered` when present otherwise; `absent` when not
+  present.
+
+Round 1 fits over every present fragment; round 2 repeats the fit, the 2D apex and the
+correlations over the fragments round 1 says belong (when at least two do), which is the
+consensus iterated once. Deterministic: every sum runs in fragment, cycle and step order,
+and ties keep the first.
+
+**The tolerances** are learned per run (docs/08 section 4h): from the confident seed
+anchors' own patches, the median plus three robust SD of their fragments' offsets from the
+shared centre (offset tolerance) and of the shared centres from the expected one (centre
+tolerance), and the 5th percentile of the 2D correlation of the fragments within the offset
+tolerance (the floor).
+
+**What it writes** (psms_extracted v6, appended last; the report's `params.q1_fragments`
+records the window, the tolerances and the patch shape, its `stats.q1_fragments` the
+fragments of each class):
+
+| column | type | meaning |
+|---|---|---|
+| `q1f_n_present`, `q1f_n_belong`, `q1f_n_interfered` | F64 | fragments of each kind |
+| `q1f_belong_share` | F64 | predicted-intensity share of the fragments that belong |
+| `q1f_interfered_share` | F64 | observed-intensity share of the interfered fragments among the present ones |
+| `q1f_offset_median`, `q1f_offset_mad` | F64 | median and MAD of the fragments' own Q1 centres against their expected ones (steps) |
+| `q1f_corr2d` | F64 | mean 2D correlation of the fragments that belong |
+| `q1f_fit_resid` | F64 | mean `1 - R^2` of the shared fit over its fragments; 1 without a fit |
+| `q1f_centre`, `q1f_width` | F64 | the shared centre (steps against the expected one) and width scale |
+| `q1f_apex_shift_cycles` | F64 | the 2D apex cycle minus the apex scan's cycle |
+| `q1f_apex_moved_s` | F64 | only under `retrace.q1_repick`: how far the apex moved (s) |
+| `q1f_frag_class` | List F32 | per library fragment, in the library's order: 0 absent, 1 belongs, 2 interfered |
+| `q1f_frag_offset`, `q1f_frag_resid`, `q1f_frag_corr2d` | List F32 | per library fragment: its own centre (steps), residual and 2D correlation; NaN where there is none |
+
+The per-fragment lists sit in `psms_extracted` itself rather than in a sidecar table: a
+decision belongs to one row (one apex, one `peak_rank`), every consumer joins rows of that
+table on `(candidate_id, peak_rank)` already (the shadow test's 1/K0 term does), and a table
+of its own would be one more file each orchestrator, pool and retention tier has to carry.
+Readers select columns by name, so every other stage reads v6 as v2, and `features` reads the
+summary under `features.q1_fragment_features` (docs/10_features.md).
+
+**`retrace.q1_repick`** (default false; needs `q1_fragments`) is the scanning-quadrupole
+analogue of `retrace.repick` (section 9). ZT Scan has no raw events beyond the centroids
+extract reads, so it runs inside extract and needs neither `retrace.enabled` nor a `.d`. Its
+candidates are extract's apex and the next peaks of the count profile whose envelope does not
+hold it (`enumerate_peaks`, up to five, as `retain_top_peaks` enumerates them). Each is
+decided as above and scored like `retrace.repick`'s joint score: the cosine of the
+square-rooted intensities of the fragments that belong (summed over the five profile cycles,
+every other fragment 0) against the square-rooted predictions, times `ln(1 + I)`, `I` their
+prediction-weighted mean intensity. The apex moves to the best peak's 2D apex (its cycle, at
+the step nearest the fitted Q1 centre whose window as read covers the precursor, a scan of the
+candidate's own grid) when at least three fragments belong there; the apex intensity, the MS1
+values and the decision are read again at the new apex. Refused with
+`extract.promote_top_peaks > 1` (it moves the rank-0 apex), `extract.apex_refine_intensity`
+and `retrace.repick` (each re-chooses the apex).
+
+`rescore.shadow_q1` reads the lists (docs/11_compete_rescore_fdr.md, "shadow demotion and its
+Q1 term").
+
+**Measured** on the ZenoTOF 8600 K562 REP01 run (the original mzML read with
+`isolation_half_width = 1.9`, imported library with predicted decoys, the shipped `nn_torch`
+recipe, 64 threads; seeds 1-3 rescore the run's competed table with `MUMDIA_NN_SEED`;
+precursors at `precursor_q` 1%; the human-library arms on one host, the entrapment arms
+(human + yeast + E. coli library, r = 0.397, combined FDP = N_E (1 + 1/r) / (N_H + N_E)) on
+another, every arm of a library with one binary on one host). Every arm sets
+`rt_im_train.q1_calibrate`, which alone changes no table (section 10). "Matched FDP" is the
+human precursors where the arm's combined FDP reaches the base arm's mean at 1% (1.386%),
+interpolated along the `precursor_q` thresholds.
+
+| arm | precursors, mean of seeds 0-3 (range) | vs base | entrapment: human precursors at 1%, mean | combined FDP at 1%, mean (range) | human precursors at matched FDP, mean (range) | vs base |
+|---|---|---|---|---|---|---|
+| base (no key) | 97,317 (96,873-97,541) | | 95,115 | 1.39% (1.35-1.44%) | 95,135 (94,877-95,342) | |
+| `q1_fragments` + `features.q1_fragment_features` | 98,728 (98,352-99,086) | +1.45% | 95,829 | 1.31% (1.28-1.36%) | 96,337 (95,885-96,496) | +1.26% |
+| the same + `retrace.q1_repick` | 100,194 (100,067-100,329) | +2.96% | 97,254 | 1.29% (1.24-1.31%) | 97,915 (97,705-98,222) | +2.92% |
+| the same + `rescore.shadow_q1` | 98,705 (98,356-99,046) | +1.43% | 95,996 | 1.29% (1.25-1.33%) | 96,624 (96,037-96,946) | +1.57% |
+| all four | 100,257 (100,132-100,520) | +3.02% | 97,272 | 1.22% (1.20-1.24%) | 98,155 (97,933-98,392) | +3.17% |
+
+- **The decision and its features** (+1.3 to +1.5%): the accepted targets of the
+  `q1_fragments` arm have 5.35 of their 12 library fragments that belong on average (75.6%
+  at least three), 6.5 interfered and 0.2 absent; the decoys 0.09 that belong (0.8% at least
+  three). In the learning pass 79% of the confident seed anchors' fragments belong. Learned
+  on REP01: offset tolerance 1.15 steps, centre tolerance 0.69 steps, 2D-correlation floor
+  0.556 (the entrapment run: 1.10, 0.68, 0.578).
+- **The re-pick** is the largest single lever (+1.5 pp over the decision alone, at a lower
+  FDP): it moved 128,123 apexes (3.1% of the rows), 60,164 of them of targets accepted at 1%
+  (60% of them), by a median of exactly one cycle (1.0 s); 1,518 accepted rows moved more than
+  5 s, to another peak. So extract's count apex (the rolling count over the interleaved
+  steps) sits a cycle off the cycle where the fragments that belong peak, on most of the
+  identified precursors.
+- **The shadow test's Q1 term** changes the count by nothing measurable (-0.02% and +0.06%
+  precursors against the arms without it; +0.3 and +0.25 pp at matched FDP, inside the seed
+  ranges). It demotes five times as many rows of the first pass (14,880 targets and 14,168
+  decoys on REP01 under all four keys, against 2,644 and 2,448 for the window test), label
+  for label, and lowers the entrapment precursors at 1% (339 against 357 with the re-pick
+  alone), so the reported 1% moves closer to the measured FDP.
+- **The reported 1%**: 1.39% measured FDP for the base, 1.22% with all four keys.
+- **Three runs as one experiment** (REP01-03, second pass on, one seed, one host): base
+  110,433 precursors, 88,958 peptides, 8,981 protein groups (per run on `run_psm_q`
+  106,485 / 106,561 / 106,583; first pass 98,441 / 98,435 / 98,265); all four keys 113,013
+  (+2.3%), 90,739 (+2.0%), 9,027 (+0.5%) (per run 109,028 / 109,185 / 109,093, +2.4%; first
+  pass 101,104 / 101,212 / 100,449, +2.6%).
+- **Cost** (shared hosts; walls indicative): extract 341 s on the human-library host
+  against 267-305 s for two base runs with the decision, 463-470 s with the re-pick, which
+  decides up to six times per candidate; on the entrapment host 548-551 s against 528-538 s,
+  and 758-766 s. `q1_calibrate` with the learning pass took 66 s (the learning itself 4 s);
+  the peak memory stays at 35-41 GB (base 37 GB). In the three-run experiment, whose three
+  extracts ran at the same time on a loaded host, extract took 1,372-1,447 s per run against
+  390-545 s, and the whole run 3,941 s against 2,401 s.
+
+**Label blindness.** Every decision reads the spectra and the library only. Among the rows
+whose untrained `prelim_score` is below the decoys' median (where targets are
+overwhelmingly false), decoys and targets carry the same distributions: the two-sample
+Kolmogorov-Smirnov statistic of each `q1f_*` feature is 0.004-0.005 (all four keys, REP01;
+1.03 M decoys against 0.99 M targets), as for features the vector already has (`frag_corr`
+0.004, `coelution_mean` 0.003, `rt_error_abs` 0.006), while the accepted targets differ
+(`q1f_n_belong` median 5 against 0, `q1f_corr2d` 0.82 against 0, `q1f_fit_resid` 0.11
+against 0.77).
+
+All four keys stay off and benchmark-gated: one acquisition, and CLAUDE.md asks for a second
+one (docs/04_convert.md, "SCIEX ZT Scan DIA") before any default changes.
+
 ## Key types and functions
 
 | Name | file:line | What it does |
@@ -1226,6 +1403,8 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `emit_gate_diagnostics` | false | Adds the four `gate_*` diagnostic columns |
 | `gate_mode` | `ApexPearson` | Which score `gate_min_score` thresholds (`GateMode`, `config.rs:735`) |
 | `gate_coelution_min` | 0.5 | Second threshold for `GateMode::Combined` |
+| `q1_cycles`, `q1_profile`, `q1_gate_max_offset` | off | The scanning-quadrupole sweep model (section 10) |
+| `q1_fragments` | false | The per-fragment Q1 decision of every accepted row (psms_extracted v6); needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (section 12) |
 | `im_gate` | `off` | The 1/K0 gate on fragment peaks (`off`, `fragments`, `auto`; section 8). Inert on 3D data. Omitted from the canonical configuration at its default |
 
 Note: `emit_candidate_audit` is a declared knob but the candidate-audit write is
@@ -1262,7 +1441,10 @@ here for one index.
 | `extract.q1_cycles` (default false, scanning quadrupole only) | none; a candidate's Q1 bins of one cycle become one chromatogram point (section 10) | ZT Scan REP01: -13.7% precursors (one seed); keep off |
 | `extract.q1_profile` + `features.q1_features` (default false) | psms_extracted v5: 4 F64 cols `q1_corr`, `q1_offset`, `q1_frag_sd`, `q1_bin_frac`; four features | ZT Scan REP01: +0.4% precursors (mean of four NN seeds, inside the seed range), +0.4% in a three-run experiment, +0.1% human precursors on an entrapment library at a combined FDP of 1.32% against 1.39%; one acquisition |
 | `extract.q1_gate_max_offset` (unset) | none; rejects on `q1_offset` | not useful at any threshold measured (section 10) |
-| `rt_im_train.q1_calibrate` (default false, scanning quadrupole only) | none; a `q1_calibration` block in `cal.json` (docs/08 section 4h) | diagnostic: every other artifact unchanged (scored table byte-identical on ZT Scan REP01) |
+| `rt_im_train.q1_calibrate` (default false, scanning quadrupole only) | none; a `q1_calibration` block in `cal.json` (docs/08 section 4h), with `fragment_decision` under `extract.q1_fragments` | diagnostic: every other artifact unchanged (scored table byte-identical on ZT Scan REP01) |
+| `extract.q1_fragments` + `features.q1_fragment_features` (default false, scanning quadrupole only) | psms_extracted v6: the `q1f_*` summary (F64) and four `q1f_frag_*` per-fragment lists; eight features (section 12) | ZT Scan REP01: +1.45% precursors (four NN seeds, beyond the seed range), +1.26% human precursors at a matched entrapment FDP, combined FDP at 1% 1.31% against 1.39%; one acquisition |
+| `retrace.q1_repick` (default false, needs `extract.q1_fragments`) | `q1f_apex_moved_s`; moves the rank-0 apex to the 2D apex of the fragments that belong (section 12) | ZT Scan REP01, on top of the decision: +2.96% precursors, +2.92% human precursors at a matched FDP (four NN seeds); 60% of the accepted targets' apexes move, by one cycle; extract +40-75% |
+| `rescore.shadow_q1` (default false, needs `extract.q1_fragments`) | none; the shadow test co-isolates by m/z and counts shared fragments by their Q1 centre (docs/11) | ZT Scan REP01: no count change (inside the seed range), fewer entrapment precursors at 1%; with the other three keys +3.02% precursors, +3.17% at a matched FDP, measured FDP at 1% 1.22% against 1.39%, +2.3% in a three-run experiment |
 | `extract.ms1_calibrate = "surface"` (default `true`) | none; MS1 reads at a per-m/z, per-retention-time offset (section 11) | ZT Scan REP01: +0.2% precursors, +0.2% human precursors on an entrapment library at a combined FDP of 1.39% (one seed); with `prec_tol_auto` and `q1_calibrate` +0.46% (four NN seeds), +0.19% at 1.40% against 1.39%; one acquisition |
 | `extract.prec_tol_auto` (default false) | none; sets `prec_tol_ppm` from the calibrated MS1 residuals (section 11) | ZT Scan REP01: 7.1-7.4 ppm, +0.45% precursors, -0.1% human precursors on the entrapment library at 1.37% (one seed); one acquisition |
 | `compete.mode` (`CompetitionMode`, `config.rs:840`, default `winner_take_all`) | retains more rows in `competed`; optional `<out>.compete_audit.parquet` via `emit_competition_audit` (`config.rs:850`) | not measured; gate pending |

@@ -636,6 +636,51 @@ per library candidate and one pass, where the map took about 35 bytes per row
 repeated pair, or a source that decreases along the rows, builds the map as
 before.
 
+### rescore: shadow demotion and its Q1 term
+
+`rescore.shadow_min_shared` (default 3, `stages::shadow`): after a first-pass precursor q
+selects the accepted targets (the possible lenders), a row of either label among the top
+`shadow_region x accepted` of its run by first-pass score is demoted below every other
+score when at least `shadow_min_shared` of its library fragments lie within `shadow_ppm`
+of a fragment of a higher-scoring accepted target of the same run and isolation window
+whose apex is within `shadow_rt_s`; its own base peptide never lends. On diaPASEF a lender
+can be required to share the apex 1/K0 (`shadow_im_tolerance`, docs/35_diapasef.md).
+
+The isolation window is the one the precursor m/z falls in (the last window starting at
+or below it). On a scanning-quadrupole sweep every step is a window of its own, 0.76 m/z
+apart on ZT Scan, so that test pairs only precursors within one step of each other, which
+are also the ones a Q1 test cannot tell apart. **`rescore.shadow_q1`** (default false;
+needs `extract.q1_fragments` and `shadow_min_shared > 0`) replaces it on the runs whose
+`psms_extracted` carries the per-fragment Q1 decisions (docs/09_extract.md, section 12):
+
+- **co-isolation by m/z**: a lender counts when the two precursor m/z are closer than twice
+  the calibrated window's reach (`h + e/2`, 4.56 m/z on ZT Scan, so 9.13 m/z), the distance
+  at which some step transmits both, read with the step and the decision's offset tolerance
+  from the run's extract report (`params.q1_fragments`);
+- **each shared fragment by where its signal sits in Q1**, from the candidate's own decision
+  (`q1f_frag_class`, `q1f_frag_offset`, joined on `(candidate_id, selected_peak_rank)`), with
+  `mu` the fragment's Q1 offset from the candidate's expected centre and `d` the lender's
+  precursor m/z minus the candidate's, both in steps: 0 when the candidate's patch has no
+  signal for it (absent: nothing was borrowed); 0 when `mu` matches the candidate's centre
+  and 1 when it matches the lender's, within the offset tolerance; otherwise the
+  two-component split of its centre, `clamp(mu / d, 0, 1)`; and 1 when the two precursors
+  are closer than the offset tolerance, where Q1 cannot tell them apart, or when the
+  fragment has no Q1 profile (as the window test counts it). The largest over the lenders
+  that share the fragment;
+- the row is demoted when these add up to `shadow_min_shared`.
+
+A run without the decisions (no lists in its `psms_extracted`, or no table passed: a
+standalone `rescore` without `--psms-extracted`) keeps the window test, with a warning.
+
+Measured on one ZT Scan run (docs/09_extract.md, section 12): the Q1 term demotes about five
+times as many first-pass rows as the window test (14,880 targets and 14,168 decoys against
+2,644 and 2,448), label for label, without a count change beyond the seed spread, and with
+fewer entrapment precursors at 1% (339 against 357, mean of four seeds), so the reported 1%
+moves closer to the measured FDP. Benchmark-gated; off by default.
+The library fragments are read in the library's order, the order of the decision lists; the
+window test's count does not depend on it. Deterministic: rows are examined independently
+and the pools are sorted.
+
 ### rescore: the multi-context q columns
 
 The q columns are computed without per-row staging copies: the pooled PSM q reads
@@ -860,6 +905,8 @@ unless a knob is set.
 | `entrapment_contaminant_markers` | `[]` | substrings marking genuine contaminants inside the spike-in proteome; matching PSMs stay real targets |
 | `entrapment_ratio` | `1.0` | `N_real_lib / N_entrap_lib`, scales the entrapment FDR estimate |
 | `strict` | `true` | production default: any sidecar failure / misconfiguration is a hard error; false explicitly enables compatibility fallback |
+| `shadow_min_shared` | `3` | shadow demotion: demote a row with at least this many library fragments shared with a better first-pass-accepted target of its run and isolation window co-eluting within `shadow_rt_s` (see "shadow demotion and its Q1 term"); 0 is off |
+| `shadow_q1` | `false` | the Q1 term of shadow demotion on scanning-quadrupole runs: co-isolation by precursor m/z and each shared fragment counted by where its Q1 signal sits; needs `extract.q1_fragments`. Omitted from the canonical configuration at its default |
 | `handoff` | `raw` | how the feature matrix reaches a sidecar (`Handoff`): `tsv` writes the Percolator PIN, `parquet` writes an f32 Parquet feature table, `raw` (the default since 2026-09-28) a row-major f32 `.npy` matrix with a metadata parquet and a `.raw.json` description. `parquet` and `raw` apply to `nn_torch` only; a mokapot run warns and falls back to `tsv` (`sidecar_paths`) |
 
 ## Invariants, determinism, gotchas

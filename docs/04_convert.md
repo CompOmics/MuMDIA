@@ -840,6 +840,16 @@ library, +0.19% human precursors on the entrapment library at the same combined 
 single key moves seed 0 by -0.1% to +0.5%, inside the seed spread. All three stay off
 (benchmark-gated, one acquisition).
 
+The per-fragment Q1 decisions read the recorded sweep (spectra_ms2 v3 is required:
+`extract.q1_fragments`, docs/09_extract.md, section 12): for every library fragment of every
+accepted row, whether its signal is centred in the sweep where the calibrated window puts the
+candidate's precursor, with three consumers (`features.q1_fragment_features`,
+`retrace.q1_repick`, `rescore.shadow_q1`). On REP01 the four keys together gave +3.0%
+precursors over four seeds and +3.2% human precursors on the entrapment library at the base
+arm's measured FDP, whose value at a reported 1% fell from 1.39% to 1.22%; three runs as one
+experiment +2.3% (113,013 against 110,433). All four stay off (benchmark-gated, one
+acquisition).
+
 ### The two extension collisions
 
 Both are real and both are handled in `raw::detect`:

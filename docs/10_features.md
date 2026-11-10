@@ -729,6 +729,35 @@ a label. Measured on one ZT Scan run: +0.4% precursors (mean of four NN seeds, i
 the seed range), +0.4% in a three-run experiment, +0.1% human precursors on an
 entrapment library at a combined FDP of 1.32% against 1.39%.
 
+### q1_fragments (8; `features.q1_fragment_features`)
+
+Scanning-quadrupole spectra (SCIEX ZT Scan DIA) only. In the battery only when
+`features.q1_fragment_features` is on (`false` by default), which needs
+`extract.q1_fragments`: the per-candidate summary of the per-fragment Q1 decision
+(docs/09_extract.md, section 12), read under the same names from psms_extracted v6 and
+appended after every other column of the `extended` set, after the `q1_profile` family when
+both are on (`Q1F_FEATURES`); `minimal` and `rich` ignore the switch.
+
+| feature | meaning |
+|---|---|
+| `q1f_n_belong` | library fragments that belong to the candidate's precursor |
+| `q1f_belong_share` | their share of the predicted intensity of all its library fragments |
+| `q1f_interfered_share` | the observed-intensity share of the interfered fragments among the present ones |
+| `q1f_offset_median` | median of the present fragments' own Q1 centres against their expected ones, in steps |
+| `q1f_offset_mad` | their median absolute deviation, steps |
+| `q1f_corr2d` | mean 2D (RT x step) correlation of the fragments that belong |
+| `q1f_fit_resid` | mean `1 - R^2` of the shared-centre fit over its fragments (1 without a fit) |
+| `q1f_centre` | the shared Q1 centre against the expected one, steps |
+
+The switch comes from the configuration, as the schema id the orchestrators record does,
+so a psms_extracted table without the columns is an error rather than zeros, and the
+schema id changes only with the family on. Every value is read from the spectra and the
+library; nothing reads a label, and the decoys and the low-scoring targets of a run carry
+the same distributions (docs/09_extract.md, section 12, "Label blindness"). Measured on one ZT
+Scan run with `extract.q1_fragments`: +1.45% precursors (mean of four NN seeds, beyond the
+seed range), +1.26% human precursors on an entrapment library at the base arm's measured FDP;
+with `retrace.q1_repick` +2.96%.
+
 ## The Percolator PIN (`write_pin`, `features.rs:1537`)
 
 Streamed row-by-row through a `BufWriter` (not materialized as one String).
@@ -845,6 +874,7 @@ variant no longer exists).
 | `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
 | `chrom_loaders` | 3 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
 | `q1_features` | false | the `q1_profile` family of scanning-quadrupole spectra, which needs `extract.q1_profile`; appended last under `extended`. Omitted from the canonical configuration at its default |
+| `q1_fragment_features` | false | the `q1_fragments` family (eight `q1f_*` features of the per-fragment Q1 decision), which needs `extract.q1_fragments`; appended last under `extended`, after `q1_profile`. Omitted from the canonical configuration at its default |
 | `im_features` | `off` | the `ion_mobility` family (`off`, `on`, `auto` = on when the spectra carry 1/K0). `run` and `run-experiment` resolve it once (`Config::resolve_im_features`) and hand every stage `on` or `off`; a standalone `mumdia features` resolves `auto` from the reader extract recorded in the chromatograms report. On a 4D run it also makes extract write the chromatograms' per-point 1/K0 (v3/v4). Omitted from the canonical configuration at its default |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded

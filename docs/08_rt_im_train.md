@@ -952,6 +952,33 @@ target: the window's centre (`delta = 0`), its lower edge (`delta = +h`, the win
 `[target, target + 2h]`) and its upper edge (`delta = -h`); `target_marks` names the one of
 least squares.
 
+**The fragment decision tolerances** (`fragment_decision`, only under
+`extract.q1_fragments`, which reads them). With the window just fitted
+(`q1frag::model_from_calibration` of this block), every anchor's RT x step patch of every
+library fragment is read from the spectra (at most 20,000 anchors, every k-th): the seven
+cycles around the seed scan's cycle, the steps within the window's reach plus two either
+side of the precursor's expected Q1 centre, the nearest peak of each cell within the
+fragment tolerance. `q1frag::learn` decides on them as extract does (docs/09_extract.md,
+section 12) and sets the tolerances from what the confident anchors' fragments look like:
+the offset tolerance is the median plus three robust SD (1.4826 MAD) of the fragments'
+own Q1 centres minus their candidate's shared centre, the centre tolerance the same of the
+shared centres against the expected one, and the 2D-correlation floor the 5th percentile
+of the correlation of the fragments within the offset tolerance, with guards for a
+degenerate anchor set (tolerances at least half a step, the floor at most 0.8). They are
+learned once without tolerances (one round over every present fragment), then again from
+the two-round decisions under the first. The block records the tolerances, the first
+tolerances, and for each of the three passes the shares of present, belonging and
+interfered fragments and the distributions of the offsets, the shared centres and the 2D
+correlation; the log line `q1-calibrate: per-fragment decision tolerances learned from the
+seed` carries the tolerances. The bootstrap pass, which skips the calibration otherwise,
+runs it when extract decides per fragment there too. On REP01 (12,653 anchors, every second
+one, 151,567 fragments, 4 s): the fragments' offsets from their shared centre have a robust
+SD of 0.44 steps in the learning pass and 0.38 under the tolerances, the shared centres 0.27
+and 0.22 steps around +0.01; the tolerances are 1.15 steps (offset), 0.69 steps (centre) and
+a 2D-correlation floor of 0.556 (first pass 1.31, 0.82 and 0.519), under which 79.1% of the
+anchors' fragments belong, 20.8% are interfered and 0.1% are absent. The entrapment-library
+run learns 1.10, 0.68 and 0.578.
+
 **`cal.json` `q1_calibration`.** `status` (`fitted`, or `too_few_profiles` under 200),
 `anchors`, `profiles`, `sweep` (`recorded`, `cycles`, `step_mz`, `half_width_as_read_mz`),
 `isotope_model`, `target_marks`, `hypotheses` (sum of squares and median residual of each
