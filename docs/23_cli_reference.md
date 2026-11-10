@@ -462,6 +462,9 @@ Options:
       --fragment-offset <FRAGMENT_OFFSET>
           The library row that `--lib-precursors` row 0 came from, when that table is one isolation-window band of a larger library (`groups.window_groups` writes such bands, with ids rebased to `0..n`). The band's fragments are then read from the shared `--lib-fragments` table by that id range, selectively when the table is sorted by `candidate_id`, so a band needs no fragment table of its own
 
+      --q1-cal <Q1_CAL>
+          The run's `cal.json` with its Q1 calibration (`rt_im_train.q1_calibrate`), which `extract.q1_fragments` decides with
+
       --config <CONFIG>
 ```
 
