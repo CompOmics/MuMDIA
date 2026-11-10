@@ -12,8 +12,12 @@ on:
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
+# A newer push to a pull request supersedes the run in flight. A push to `main` is its own
+# group, so a second merge does not cancel the first one's run: the release gate needs a
+# successful run for the exact tagged commit, and `main` is the only ref that saves the
+# caches every pull request restores.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: true
 
 # Nothing in this workflow needs a token beyond checkout. Without this block every
@@ -21,6 +25,40 @@ concurrency:
 # all scopes.
 permissions:
   contents: read
+
+# The dev and test profiles only, i.e. `cargo test`, clippy and the desktop unit tests.
+# Nothing here reaches `[profile.release]`, so the smoke job still builds the binary that
+# ships, with the shipped profile.
+#
+# - No incremental compilation. Every run starts from a fresh checkout, so the
+#   incremental state is never reused, only stored in the caches.
+# - Line tables instead of full debug info. Backtraces still name file and line, and the
+#   test build is smaller; on Windows it also compiled and ran faster (docs/14, "CI
+#   workflow", has the measurements).
+# - crates.io downloads retried ten times rather than cargo's default three.
+#
+# The cargo cache keys below carry a `v1`; bump it with any change to these settings, or
+# the caches keep artifacts built under the old ones until Cargo.lock next changes.
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_NET_RETRY: "10"
+
+# Two rules shape every Rust job below.
+#
+# Scope. A job first asks `ci/ci_scope.sh` whether the change touches anything it checks,
+# and skips its steps when it does not: a documentation-only change, for example, builds
+# nothing. The job still runs and reports, because eight of the checks are required on
+# `main`. Scheduled and dispatched runs always do everything; the script's header has the
+# rules, and an unrecognised path runs everything.
+#
+# Caches. Each job has its own cargo cache (lint, test and release artifacts no longer
+# overwrite one another), keyed on the toolchain and Cargo.lock. Only `main` saves them,
+# after removing the workspace's own crates, which every run rebuilds anyway because a
+# checkout makes them newer than any cache; pull requests restore. `main` restores the
+# exact key only, so a new lockfile saves a clean cache rather than the old one plus the
+# new crates.
 
 jobs:
   # The gate CLAUDE.md states, which CI did not previously enforce: formatting and
@@ -34,31 +72,47 @@ jobs:
         working-directory: rust/mumdia
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The merge commit and the base it merges into, for ci/ci_scope.sh.
+          fetch-depth: 2
+
+      - name: Does this change touch what this job checks?
+        id: scope
+        shell: bash
+        working-directory: .
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: bash ci/ci_scope.sh lint
 
       # rust-toolchain.toml (in rust/mumdia) pins the exact toolchain and requests
       # the rustfmt and clippy components; rustup installs them on first use.
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore the cargo cache
+        id: cache
+        if: steps.scope.outputs.run == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/mumdia/target
-          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('rust/mumdia/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-lint-
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            rust/mumdia/target/
+          key: engine-lint-v1-${{ runner.os }}-${{ hashFiles('rust/mumdia/rust-toolchain.toml') }}-${{ hashFiles('rust/mumdia/Cargo.lock') }}
+          restore-keys: ${{ github.ref != 'refs/heads/main' && format('engine-lint-v1-{0}-{1}-', runner.os, hashFiles('rust/mumdia/rust-toolchain.toml')) || '' }}
 
       - name: Format
+        if: steps.scope.outputs.run == 'true'
         run: cargo fmt --check
 
       # --all-targets so tests and benches are linted too: dead code reachable only
       # from a test module still fails the build under -D warnings.
       - name: Clippy
+        if: steps.scope.outputs.run == 'true'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # The opt-in native Thermo reader (`--features thermo`, docs/04_convert.md) is not in
       # any release build, so lint it here or it can rot unnoticed. Downloads the .NET host
       # library at build time; needs no .NET runtime.
       - name: Clippy (thermo feature)
+        if: steps.scope.outputs.run == 'true'
         run: cargo clippy -p mumdia --all-targets --locked --features thermo -- -D warnings
 
       # Rustdoc, warnings as errors. Not previously run anywhere, and it was failing:
@@ -67,9 +121,29 @@ jobs:
       # linked to private items. Cheap to keep green, and the docs are this project's
       # contract.
       - name: Rustdoc
+        if: steps.scope.outputs.run == 'true'
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --locked
+
+      # Only the dependencies: the workspace crates (and the vendored timsrust, a path
+      # dependency) are rebuilt on every run, so caching them only made the cache bigger.
+      - name: Keep only the dependencies in the cache
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        run: |
+          cargo clean -p mumdia -p mumdia-io -p mumdia-core -p timsrust
+          rm -rf target/*/incremental target/doc
+
+      - name: Save the cargo cache
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            rust/mumdia/target/
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # Dependency advisories. SECURITY.md declares these in scope and invites pin-bump
   # pull requests, so the project needs a way to see them: without this job, two
@@ -79,6 +153,12 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    env:
+      # Pinned, and the cache is keyed on it. The key used to be a constant, so the binary
+      # was whatever version happened to be current when the cache was first written, and
+      # once the multi-gigabyte target caches evicted it, every run compiled cargo-audit
+      # again (143 s). Bump this to take a new release.
+      CARGO_AUDIT_VERSION: 0.22.2
     defaults:
       run:
         working-directory: rust/mumdia
@@ -86,13 +166,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Cache cargo-audit
+        id: audit-bin
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-audit
-          key: ${{ runner.os }}-cargo-audit-bin
+          key: cargo-audit-${{ runner.os }}-${{ env.CARGO_AUDIT_VERSION }}
 
       - name: Install cargo-audit
-        run: command -v cargo-audit || cargo install cargo-audit --locked
+        if: steps.audit-bin.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked --force
 
       # Vulnerabilities fail the build. Unmaintained-crate warnings do not: `paste`
       # is a compile-time proc macro whose 1.0.15 is its final release, so there is
@@ -156,24 +238,60 @@ jobs:
         working-directory: rust/mumdia
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The merge commit and the base it merges into, for ci/ci_scope.sh.
+          fetch-depth: 2
 
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Does this change touch what this job checks?
+        id: scope
+        shell: bash
+        working-directory: .
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: bash ci/ci_scope.sh build-test
+
+      - name: Restore the cargo cache
+        id: cache
+        if: steps.scope.outputs.run == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/mumdia/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/mumdia/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            rust/mumdia/target/
+          key: engine-test-v1-${{ runner.os }}-${{ hashFiles('rust/mumdia/rust-toolchain.toml') }}-${{ hashFiles('rust/mumdia/Cargo.lock') }}
+          restore-keys: ${{ github.ref != 'refs/heads/main' && format('engine-test-v1-{0}-{1}-', runner.os, hashFiles('rust/mumdia/rust-toolchain.toml')) || '' }}
 
-      - name: Build (release)
-        run: cargo build --release --locked
-
+      # The test build only. This job used to run `cargo build --release` first, which on
+      # Windows took longer than the tests (560 s against 529 s) and produced a binary
+      # nothing here used: the smoke job builds the shipped binary with the release
+      # profile on Linux and Windows and runs it, and release.yml builds and smoke-tests
+      # every target, macOS included, before anything is published.
+      #
       # --workspace is explicit: the release binary is only one member, and the
       # config and IO contracts live in the other two.
       - name: Test
+        if: steps.scope.outputs.run == 'true'
         run: cargo test --workspace --locked
+
+      # Only the dependencies: the workspace crates (and the vendored timsrust, a path
+      # dependency) are rebuilt on every run, so caching them only made the cache bigger.
+      - name: Keep only the dependencies in the cache
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        run: |
+          cargo clean -p mumdia -p mumdia-io -p mumdia-core -p timsrust
+          rm -rf target/*/incremental
+
+      - name: Save the cargo cache
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            rust/mumdia/target/
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # The only end-to-end coverage there is. The Rust suite builds its inputs in
   # process and starts at `extract`, so mzML parsing, the library build, the `run`
@@ -190,25 +308,42 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The merge commit and the base it merges into, for ci/ci_scope.sh.
+          fetch-depth: 2
+
+      - name: Does this change touch what this job checks?
+        id: scope
+        shell: bash
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: bash ci/ci_scope.sh smoke
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: steps.scope.outputs.run == 'true'
         with:
           python-version: "3.12"
 
       - name: Install pyarrow
+        if: steps.scope.outputs.run == 'true'
         run: python -m pip install --quiet pyarrow
 
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore the cargo cache
+        id: cache
+        if: steps.scope.outputs.run == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/mumdia/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/mumdia/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            rust/mumdia/target/
+          key: engine-release-v1-${{ runner.os }}-${{ hashFiles('rust/mumdia/rust-toolchain.toml') }}-${{ hashFiles('rust/mumdia/Cargo.lock') }}
+          restore-keys: ${{ github.ref != 'refs/heads/main' && format('engine-release-v1-{0}-{1}-', runner.os, hashFiles('rust/mumdia/rust-toolchain.toml')) || '' }}
 
+      # The shipped profile, unchanged ([profile.release]: thin LTO, one codegen unit), so
+      # this is the one place a pull request builds the binary that ships.
       - name: Build the binary
+        if: steps.scope.outputs.run == 'true'
         working-directory: rust/mumdia
         run: cargo build --release --locked --bin mumdia
 
@@ -217,6 +352,7 @@ jobs:
       # cross-platform check on the help text: the generator normalises the
       # binary name, so a Windows and a Linux build must produce identical output.
       - name: CLI reference is current
+        if: steps.scope.outputs.run == 'true'
         shell: bash
         run: python ci/gen_cli_reference.py --check
 
@@ -225,15 +361,37 @@ jobs:
       # is meaningless on the Windows runner, and a checkout that loses it would
       # otherwise fail here with "Permission denied" rather than with a test result.
       - name: Smoke test
+        if: steps.scope.outputs.run == 'true'
         shell: bash
         run: bash ci/smoke.sh
 
       - name: Upload output hashes
+        if: steps.scope.outputs.run == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: smoke-hashes-${{ matrix.os }}
           path: smoke_output_hashes.txt
           if-no-files-found: error
+
+      # Only the dependencies: the workspace crates (and the vendored timsrust, a path
+      # dependency) are rebuilt on every run, so caching them only made the cache bigger.
+      - name: Keep only the dependencies in the cache
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        working-directory: rust/mumdia
+        run: |
+          cargo clean --release -p mumdia -p mumdia-io -p mumdia-core -p timsrust
+          rm -rf target/*/incremental
+
+      - name: Save the cargo cache
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            rust/mumdia/target/
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # The native pipeline is byte-reproducible across operating systems, not only
   # across runs on one machine: measured 2026-08-27, `peptides.tsv` and
@@ -410,18 +568,53 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The merge commit and the base it merges into, for ci/ci_scope.sh.
+          fetch-depth: 2
+
+      - name: Does this change touch what this job checks?
+        id: scope
+        shell: bash
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: bash ci/ci_scope.sh desktop
 
       # Tauri links WebKitGTK, whose development headers the runner does not carry.
       - name: Install the build dependencies
+        if: steps.scope.outputs.run == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
+      # The desktop workspace has no rust-toolchain.toml and builds with the runner's
+      # stable Rust, which moves with the runner image; a cache built by another rustc
+      # is rebuilt from scratch, so the version is part of the key.
+      - name: Which Rust builds the application?
+        id: rustc
+        if: steps.scope.outputs.run == 'true'
+        shell: bash
+        working-directory: desktop
+        run: echo "version=$(rustc -V | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the cargo cache
+        id: cache
+        if: steps.scope.outputs.run == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            desktop/target/
+          key: desktop-v1-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('desktop/Cargo.lock') }}
+          restore-keys: ${{ github.ref != 'refs/heads/main' && format('desktop-v1-{0}-{1}-', runner.os, steps.rustc.outputs.version) || '' }}
+
       - name: Format
+        if: steps.scope.outputs.run == 'true'
         working-directory: desktop/src-tauri
         run: cargo fmt --check
 
       - name: Clippy
+        if: steps.scope.outputs.run == 'true'
         working-directory: desktop/src-tauri
         run: cargo clippy --all-targets -- -D warnings
 
@@ -429,6 +622,7 @@ jobs:
       # binary, which would make this job look like it covered more than it does; a
       # real bundle is exercised by the release rehearsal instead.
       - name: Unit tests
+        if: steps.scope.outputs.run == 'true'
         working-directory: desktop/src-tauri
         run: cargo test --lib
 
@@ -436,63 +630,101 @@ jobs:
       # shares with the backend, and the Setup screen driven in Node (the runner's own;
       # the test has no dependencies).
       - name: Frontend agrees with the backend
+        if: steps.scope.outputs.run == 'true'
         run: python ci/check_desktop_ui.py
 
       - name: Frontend behaviour
+        if: steps.scope.outputs.run == 'true'
         run: |
           node --check desktop/ui/app.js
           node ci/test_desktop_ui.mjs
+
+      - name: Keep only the dependencies in the cache
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        working-directory: desktop
+        run: |
+          cargo clean -p mumdia-console
+          rm -rf target/*/incremental
+
+      - name: Save the cargo cache
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            desktop/target/
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # The desktop application on Windows, the platform its installer and its Visual C++
   # runtime handling exist for. The Linux job above never compiles the `cfg(windows)`
   # code (`vcruntime::win`: the elevated launch and the signature check), and nothing
   # else builds the MSI before a release rehearsal does.
   #
-  # Gated on a change under desktop/ (or this workflow, or the two MSI scripts), as the
-  # sidecar jobs are on theirs: a cold Windows build of the application and the bundler
-  # costs about twenty minutes, which a change to the engine alone should not pay.
+  # Gated on a change under desktop/ or to what the application compiles in (or this
+  # workflow, or the two MSI scripts; ci/ci_scope.sh): a cold Windows build of the
+  # application and the bundler costs about twenty minutes, which a change to the engine
+  # alone should not pay.
   desktop-windows:
     name: desktop app (windows)
     runs-on: windows-latest
+    env:
+      # The bundler, pinned so its cache can be keyed on it. release.yml installs the newest
+      # 2.x; move this with it. Before, the job reused whichever cargo-tauri.exe its cache
+      # held, so its version was an accident of when the cache was written.
+      TAURI_CLI_VERSION: 2.12.4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          # The merge commit and the base it merges into, for ci/ci_scope.sh.
+          fetch-depth: 2
 
-      - name: Does the desktop application or its installer change?
-        id: touched
+      - name: Does this change touch what this job checks?
+        id: scope
         shell: bash
         env:
-          EVENT: ${{ github.event_name }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT" = "schedule" ] || [ "$EVENT" = "workflow_dispatch" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          base="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
-          if git diff --name-only "$base" HEAD \
-             | grep -Eq '^(desktop/|ci/check_msi_runtime\.ps1$|ci/find_vc_merge_module\.ps1$|\.github/workflows/ci\.yml$)'; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "no desktop change; skipping"
-          fi
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: bash ci/ci_scope.sh desktop-windows
 
-      - name: Cache cargo
-        if: steps.touched.outputs.run == 'true'
+      # The desktop workspace has no rust-toolchain.toml and builds with the runner's
+      # stable Rust, which moves with the runner image; a cache built by another rustc
+      # is rebuilt from scratch, so the version is part of the key.
+      - name: Which Rust builds the application?
+        id: rustc
+        if: steps.scope.outputs.run == 'true'
+        shell: bash
+        working-directory: desktop
+        run: echo "version=$(rustc -V | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the cargo cache
+        id: cache
+        if: steps.scope.outputs.run == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            desktop/target/
+          key: desktop-v1-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('desktop/Cargo.lock') }}
+          restore-keys: ${{ github.ref != 'refs/heads/main' && format('desktop-v1-{0}-{1}-', runner.os, steps.rustc.outputs.version) || '' }}
+
+      # The bundler, and the WiX toolset it downloads into %LOCALAPPDATA%\tauri on first
+      # use. That download, from the WiX GitHub release, is what failed this job with
+      # `http status: 503` / `504` on several pull requests; cached, it happens once per
+      # bundler version.
+      - name: Cache the Tauri bundler and its WiX tools
+        if: steps.scope.outputs.run == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
             ~/.cargo/bin/cargo-tauri.exe
-            desktop/target
-          key: ${{ runner.os }}-desktop-${{ hashFiles('desktop/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-desktop-
+            ~/AppData/Local/tauri
+          key: tauri-tools-${{ runner.os }}-${{ env.TAURI_CLI_VERSION }}
+          restore-keys: tauri-tools-${{ runner.os }}-
 
       - name: Clippy (windows)
-        if: steps.touched.outputs.run == 'true'
+        if: steps.scope.outputs.run == 'true'
         working-directory: desktop/src-tauri
         run: cargo clippy --all-targets -- -D warnings
 
@@ -500,7 +732,7 @@ jobs:
       # system binary passes, an unsigned file does not) and the hold on the downloaded
       # file (it can be checked and run, not replaced).
       - name: Unit tests (windows)
-        if: steps.touched.outputs.run == 'true'
+        if: steps.scope.outputs.run == 'true'
         working-directory: desktop/src-tauri
         run: cargo test --lib
 
@@ -509,7 +741,7 @@ jobs:
       # runtime at least as new, so this exercises "this or a newer version is already
       # installed" (1638) or a repair (0) without changing what the steps below rely on.
       - name: The Visual C++ runtime installer runs end to end
-        if: steps.touched.outputs.run == 'true'
+        if: steps.scope.outputs.run == 'true'
         # A permission prompt nobody can answer would otherwise hold the job for hours.
         # The hosted runners do not show one; this bounds the case where they start to.
         timeout-minutes: 10
@@ -517,7 +749,7 @@ jobs:
         run: cargo test --lib -- --ignored real_runtime_install --nocapture
 
       - name: Locate the Visual C++ runtime merge module
-        if: steps.touched.outputs.run == 'true'
+        if: steps.scope.outputs.run == 'true'
         shell: pwsh
         run: |
           $msm = & ./ci/find_vc_merge_module.ps1
@@ -531,32 +763,47 @@ jobs:
       # built, because this job is about the installer, and the release rehearsal builds
       # and runs the real bundle.
       - name: Stage the bundled files
-        if: steps.touched.outputs.run == 'true'
+        if: steps.scope.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p desktop/src-tauri/binaries/scripts
           cp scripts/*.py desktop/src-tauri/binaries/scripts/
 
-      # The cache above restores cargo-tauri.exe but not cargo's install records, so a plain
-      # `cargo install` on a cache hit refuses with "binary already exists in destination".
+      # The cache restores cargo-tauri.exe but not cargo's install records, so a plain
+      # `cargo install` on a cache hit would refuse with "binary already exists in
+      # destination"; --force also replaces a cached binary of another version.
       - name: Install the Tauri bundler
-        if: steps.touched.outputs.run == 'true'
+        if: steps.scope.outputs.run == 'true'
         shell: bash
         run: |
-          if cargo tauri --version 2>/dev/null | grep -q '^tauri-cli 2\.'; then
+          if [ "$(cargo tauri --version 2>/dev/null)" = "tauri-cli $TAURI_CLI_VERSION" ]; then
             echo "cargo-tauri from the cache: $(cargo tauri --version)"
           else
-            cargo install tauri-cli --version "^2" --locked --force
+            cargo install tauri-cli --version "=$TAURI_CLI_VERSION" --locked --force
           fi
 
+      # Retried only when the bundler's own download failed (the WiX toolset, on a cache
+      # miss), never on a build or bundling error, which fails at once.
       - name: Build the MSI with the Visual C++ runtime
-        if: steps.touched.outputs.run == 'true'
+        if: steps.scope.outputs.run == 'true'
         working-directory: desktop
-        run: cargo tauri build --bundles msi --config src-tauri/tauri.vcruntime.conf.json
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/msi-build.log"
+          for attempt in 1 2 3; do
+            cargo tauri build --bundles msi --config src-tauri/tauri.vcruntime.conf.json 2>&1 | tee "$log"
+            rc=${PIPESTATUS[0]}
+            [ "$rc" -eq 0 ] && exit 0
+            grep -q "http status" "$log" || exit "$rc"
+            echo "::warning::the bundler's download failed (attempt $attempt of 3); retrying"
+            sleep $((attempt * 30))
+          done
+          exit 1
 
       - name: The MSI carries the Visual C++ runtime
-        if: steps.touched.outputs.run == 'true'
+        if: steps.scope.outputs.run == 'true'
         shell: pwsh
         run: |
           $msi = (Get-ChildItem desktop/target/release/bundle/msi/*.msi | Select-Object -First 1).FullName
@@ -568,7 +815,7 @@ jobs:
       # newer files and the installation succeeds. Uninstalling must leave the runtime
       # in place, because other programs installed it too.
       - name: The MSI installs over a newer runtime and uninstalls cleanly
-        if: steps.touched.outputs.run == 'true'
+        if: steps.scope.outputs.run == 'true'
         timeout-minutes: 15
         shell: pwsh
         run: |
@@ -599,7 +846,7 @@ jobs:
           }
 
       - name: Upload the MSI
-        if: steps.touched.outputs.run == 'true'
+        if: steps.scope.outputs.run == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desktop-msi-ci
@@ -607,17 +854,50 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Keep only the dependencies in the cache
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        working-directory: desktop
+        run: |
+          cargo clean -p mumdia-console
+          cargo clean --release -p mumdia-console
+          rm -rf target/*/incremental target/release/bundle target/release/wix
+
+      - name: Save the cargo cache
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            desktop/target/
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
   smoke-cross-platform:
     name: cross-platform byte equality
     runs-on: ubuntu-latest
     needs: smoke
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The merge commit and the base it merges into, for ci/ci_scope.sh.
+          fetch-depth: 2
+
+      - name: Does this change touch what this job checks?
+        id: scope
+        shell: bash
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: bash ci/ci_scope.sh smoke-cross-platform
+
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: steps.scope.outputs.run == 'true'
         with:
           pattern: smoke-hashes-*
           path: hashes
 
       - name: Compare
+        if: steps.scope.outputs.run == 'true'
         run: |
           set -euo pipefail
           echo "--- collected ---"

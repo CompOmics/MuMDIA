@@ -53,8 +53,10 @@ changes. `--check` also regenerates both from copies of every input with blank l
 inserted and fails if the result differs, which keeps a line dependency from coming
 back; `--self-test` runs that check alone.
 
-CI runs all of the above on Linux, and the build and tests also on macOS and
-Windows. A pull request that fails any of them will not be merged.
+CI runs all of the above on Linux, the tests also on macOS and Windows, and the
+release build also on Windows, where the smoke test runs it; a job skips its steps when
+the change touches nothing it checks (docs/14, "CI workflow"). A pull request that
+fails any of them will not be merged.
 
 If you develop on a synced filesystem (OneDrive, Dropbox), redirect the Cargo
 target directory off it first. Copy `rust/mumdia/.cargo/config.toml.example` to
