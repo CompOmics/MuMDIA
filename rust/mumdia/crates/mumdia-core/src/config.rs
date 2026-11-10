@@ -2189,6 +2189,35 @@ pub struct ExtractConfig {
     /// finite and > 0. Benchmark-gated. Omitted from the canonical configuration while unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub q1_gate_max_offset: Option<f64>,
+    /// Scanning-quadrupole spectra: decide for every library fragment of an accepted
+    /// candidate whether its signal belongs to the candidate's precursor (`stages::q1frag`,
+    /// psms_extracted v6). For each fragment the matched intensity is read in every Q1 step
+    /// whose calibrated window reaches the precursor (plus two steps either side) over the
+    /// seven cycles around the apex: an RT x step patch, with every step kept apart. One Q1
+    /// centre and width shared by the candidate's fragments are fitted to the patch with a
+    /// height per fragment, each fragment's own centre and residual are read against it, and
+    /// its 2D correlation with the other fragments' elution times the expected transmission;
+    /// a fragment is then `belongs`, `interfered` or `absent` by tolerances
+    /// `rt_im_train.q1_calibrate` learns from the confident seed PSMs, and the fit is
+    /// repeated once on the fragments that belong. Writes per row the decision of every
+    /// library fragment (`q1f_frag_*` lists) and its summary (`q1f_*`), which
+    /// `features.q1_fragment_features`, `retrace.q1_repick` and `rescore.shadow_q1` read.
+    /// Needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (a run converted with
+    /// `convert.isolation_half_width`); refused with `q1_cycles`, on any other layout and on
+    /// spectra that carry 1/K0. Default false. Benchmark-gated (docs/09_extract.md,
+    /// "Per-fragment Q1 decisions"). Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub q1_fragments: bool,
+    /// What `stages::q1frag` read from the run's `cal.json` (`q1_calibration`) under
+    /// `q1_fragments`: the calibrated window and the decision tolerances, set by `run` /
+    /// `run-experiment` (and `mumdia extract --q1-cal`) before extract. Never read from a
+    /// configuration file.
+    #[serde(skip)]
+    pub q1_model: Option<Q1FragModel>,
+    /// `retrace.q1_repick`, handed to extract by the same callers (the re-pick runs inside
+    /// extract, where the Q1 patches are read). Never read from a configuration file.
+    #[serde(skip)]
+    pub q1_repick: bool,
     pub fixed_scan_window: usize,
     pub frag_tol_ppm: f64,
     pub prec_tol_ppm: f64,
@@ -2650,6 +2679,42 @@ pub struct Ms1Cal {
     pub prec_tol_ppm: Option<f64>,
 }
 
+/// The calibrated Q1 window and the per-fragment decision tolerances of a scanning-
+/// quadrupole run (`extract.q1_fragments`, [`ExtractConfig::q1_model`]), as
+/// `rt_im_train.q1_calibrate` wrote them to `cal.json` (`q1_calibration`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Q1FragModel {
+    /// m/z between consecutive Q1 steps.
+    pub step_mz: f64,
+    /// The fitted half-width and edge width (m/z) of the trapezoid transmission.
+    pub half_width_mz: f64,
+    pub edge_width_mz: f64,
+    /// The window-centre offset (m/z, the window centred that far above its target): the
+    /// sum of these terms, each interpolated over its grid and held at its ends.
+    pub offset_terms: Vec<Q1OffsetTerm>,
+    /// The decision tolerances learned from the seed.
+    pub tolerances: Q1FragTolerances,
+}
+
+/// One term of [`Q1FragModel::offset_terms`]: its variable (`precursor_mz`, `fragment_mz`
+/// or `rt`), grid and offset (m/z) at each grid point.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Q1OffsetTerm {
+    pub var: String,
+    pub grid: Vec<f64>,
+    pub offset_mz: Vec<f64>,
+}
+
+/// The per-fragment decision tolerances (`stages::q1frag`), in Q1 steps: a fragment belongs
+/// when its own centre lies within `offset_steps` of the shared centre (clamped to within
+/// `centre_steps` of the expected one) and its 2D correlation is at least `corr2d_min`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Q1FragTolerances {
+    pub offset_steps: f64,
+    pub centre_steps: f64,
+    pub corr2d_min: f64,
+}
+
 impl ExtractConfig {
     /// The factor an MS1 read of library m/z `mz` near retention time `rt` multiplies the
     /// m/z by: `1 + ppm * 1e-6`, ppm from the fitted surface under `ms1_calibrate =
@@ -2709,6 +2774,9 @@ impl Default for ExtractConfig {
             q1_cycles: false,
             q1_profile: false,
             q1_gate_max_offset: None,
+            q1_fragments: false,
+            q1_model: None,
+            q1_repick: false,
             fixed_scan_window: 2,
             frag_tol_ppm: 20.0,
             prec_tol_ppm: 3.0,
@@ -2927,6 +2995,18 @@ pub struct FeaturesConfig {
     /// canonical configuration at its default.
     #[serde(skip_serializing_if = "is_false")]
     pub q1_features: bool,
+    /// The per-fragment Q1 decision family of scanning-quadrupole spectra: `q1f_n_belong`,
+    /// `q1f_belong_share` (predicted-intensity share of the fragments that belong),
+    /// `q1f_interfered_share` (observed-intensity share of the interfered ones),
+    /// `q1f_offset_median` and `q1f_offset_mad` (the fragments' Q1 centres against the
+    /// expected one, in steps), `q1f_corr2d` (2D correlation of the fragments that belong),
+    /// `q1f_fit_resid` (residual of the shared-centre fit) and `q1f_centre` (the shared
+    /// centre, steps), from psms_extracted v6 (`extract.q1_fragments`, which it needs),
+    /// appended after every other column of the `extended` set. Default false.
+    /// Benchmark-gated (docs/10_features.md). Omitted from the canonical configuration at
+    /// its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub q1_fragment_features: bool,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -2949,6 +3029,7 @@ impl Default for FeaturesConfig {
             chrom_loaders: 3,
             im_features: ImFeatures::Off,
             q1_features: false,
+            q1_fragment_features: false,
         }
     }
 }
@@ -4016,6 +4097,18 @@ pub struct RescoreConfig {
     /// Omitted from the canonical configuration at its default.
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub shadow_im_tolerance: f64,
+    /// The Q1 term of the shadow test on scanning-quadrupole spectra (`extract.q1_fragments`,
+    /// which it needs, with `shadow_min_shared > 0`). A lender is co-isolated when the two
+    /// precursors share a Q1 step (their m/z closer than twice the calibrated window's reach)
+    /// instead of when both fall in one isolation window, and each shared fragment counts by
+    /// where its signal sits in Q1: nothing when the candidate's patch has no signal for it,
+    /// nothing when its Q1 centre is the candidate's, all of it when it is the lender's, a
+    /// share in between (a two-component split of its centre), and all of it when the two
+    /// precursors are closer than the decision's offset tolerance, where Q1 cannot tell
+    /// them apart. Default false. Benchmark-gated (docs/11_compete_rescore_fdr.md). Omitted
+    /// from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub shadow_q1: bool,
     /// Fewest decoys the classifier is trained with. Below this the learned classifier
     /// is not trained (a handful of decoys lets it overfit, one decoy then outranks every
     /// target and nothing passes 1%): the candidates are ranked by their untrained
@@ -4070,6 +4163,7 @@ impl Default for RescoreConfig {
             shadow_rt_s: 3.0,
             shadow_region: 8,
             shadow_im_tolerance: 0.0,
+            shadow_q1: false,
             classifier: t(),
             folds: 3,
             train_fdr: 0.01,
@@ -4732,12 +4826,24 @@ pub struct RetraceConfig {
     /// peptides carried about 2.7% FDP.
     #[serde(skip_serializing_if = "is_false")]
     pub apex_features: bool,
+    /// The scanning-quadrupole analogue of `repick` (ZT Scan has no raw events beyond its
+    /// centroids, so it needs neither `enabled` nor a `.d`): extract re-chooses each
+    /// candidate's apex in RT x Q1 among its own apex and the next peaks of its count
+    /// profile, by the agreement of the fragments that belong (`extract.q1_fragments`, which
+    /// it needs) with the library, and moves it to that peak's 2D apex: the cycle where the
+    /// fragments that belong peak, at the step nearest their fitted Q1 centre. The apex
+    /// scalars are read again there. Refused with `extract.promote_top_peaks > 1`,
+    /// `extract.apex_refine_intensity` and `repick`. Default false. Benchmark-gated
+    /// (docs/09_extract.md, "Per-fragment Q1 decisions").
+    #[serde(skip_serializing_if = "is_false")]
+    pub q1_repick: bool,
 }
 impl Default for RetraceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             repick: false,
+            q1_repick: false,
             im_half_width: 0.015,
             ms1: true,
             apex_features: false,
@@ -5968,6 +6074,45 @@ impl Config {
                     .into(),
             ));
         }
+        if ex.q1_fragments {
+            if !self.rt_im_train.q1_calibrate {
+                return Err(Invalid(
+                    "extract.q1_fragments decides with the calibrated Q1 window and the \
+                     tolerances rt_im_train.q1_calibrate learns from the seed; set it as well"
+                        .into(),
+                ));
+            }
+            if ex.q1_cycles {
+                return Err(Invalid(
+                    "extract.q1_fragments keeps every Q1 step of a cycle apart, and \
+                     extract.q1_cycles sums them; unset q1_cycles"
+                        .into(),
+                ));
+            }
+        }
+        if self.features.q1_fragment_features && !ex.q1_fragments {
+            return Err(Invalid(
+                "features.q1_fragment_features reads the per-fragment Q1 decision columns \
+                 that extract.q1_fragments writes; set it as well"
+                    .into(),
+            ));
+        }
+        if self.rescore.shadow_q1 {
+            if !ex.q1_fragments {
+                return Err(Invalid(
+                    "rescore.shadow_q1 reads the per-fragment Q1 decisions that \
+                     extract.q1_fragments writes; set it as well"
+                        .into(),
+                ));
+            }
+            if self.rescore.shadow_min_shared == 0 {
+                return Err(Invalid(
+                    "rescore.shadow_q1 is a term of the shadow test, which \
+                     rescore.shadow_min_shared = 0 turns off"
+                        .into(),
+                ));
+            }
+        }
         if let Some(h) = cv.isolation_half_width {
             if !(h.is_finite() && h > 0.0) {
                 return Err(Invalid(format!(
@@ -6461,6 +6606,29 @@ impl Config {
                 "retrace.im_half_width must be finite and > 0 (got {})",
                 r.im_half_width
             )));
+        }
+        if r.q1_repick {
+            if !self.extract.q1_fragments {
+                return Err(Invalid(
+                    "retrace.q1_repick re-chooses the apex on the per-fragment Q1 decisions \
+                     that extract.q1_fragments makes; set it as well"
+                        .into(),
+                ));
+            }
+            if self.extract.promote_top_peaks > 1 {
+                return Err(Invalid(format!(
+                    "retrace.q1_repick moves the selected apex (peak_rank 0), so it cannot be \
+                     combined with extract.promote_top_peaks = {}; set promote_top_peaks = 1",
+                    self.extract.promote_top_peaks
+                )));
+            }
+            if self.extract.apex_refine_intensity || r.repick {
+                return Err(Invalid(
+                    "retrace.q1_repick, retrace.repick and extract.apex_refine_intensity each \
+                     re-choose the apex; enable one of them"
+                        .into(),
+                ));
+            }
         }
         if !r.enabled {
             for (on, key) in [
@@ -7551,6 +7719,61 @@ mod tests {
             r#"{"extract":{"q1_gate_max_offset":0.5}}"#,
             r#"{"extract":{"q1_profile":true,"q1_gate_max_offset":0}}"#,
             r#"{"features":{"q1_features":true}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// The per-fragment Q1 decision keys (phase 2 of the ZT Scan plan) are omitted at their
+    /// defaults, part of the identity when set, and refused without what they read; the
+    /// runtime model and the re-pick switch extract is handed never reach the configuration.
+    #[test]
+    fn the_q1_fragment_keys_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        let canon = d.canonical_json();
+        for key in [
+            "q1_fragments",
+            "q1_fragment_features",
+            "q1_repick",
+            "shadow_q1",
+            "q1_model",
+        ] {
+            assert!(!canon.contains(key), "{key}: {canon}");
+        }
+        let on = Config::from_json(
+            r#"{"rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true},
+                "features":{"q1_fragment_features":true},"retrace":{"q1_repick":true},
+                "rescore":{"shadow_q1":true}}"#,
+        )
+        .unwrap();
+        let c = on.canonical_json();
+        for key in [
+            r#""q1_fragments":true"#,
+            r#""q1_fragment_features":true"#,
+            r#""q1_repick":true"#,
+            r#""shadow_q1":true"#,
+        ] {
+            assert!(c.contains(key), "{key}: {c}");
+        }
+        let mut with_model = on.clone();
+        with_model.extract.q1_model = Some(Q1FragModel {
+            step_mz: 0.76,
+            ..Default::default()
+        });
+        with_model.extract.q1_repick = true;
+        assert_eq!(with_model.canonical_json(), c);
+        for bad in [
+            r#"{"extract":{"q1_fragments":true}}"#,
+            r#"{"rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true,"q1_cycles":true}}"#,
+            r#"{"features":{"q1_fragment_features":true}}"#,
+            r#"{"rescore":{"shadow_q1":true}}"#,
+            r#"{"rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true},
+                "rescore":{"shadow_q1":true,"shadow_min_shared":0}}"#,
+            r#"{"retrace":{"q1_repick":true}}"#,
+            r#"{"rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true,
+                "promote_top_peaks":2,"retain_top_peaks":2},"retrace":{"q1_repick":true}}"#,
+            r#"{"rt_im_train":{"q1_calibrate":true},"extract":{"q1_fragments":true,
+                "apex_refine_intensity":true},"retrace":{"q1_repick":true}}"#,
         ] {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }

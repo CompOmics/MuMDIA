@@ -126,8 +126,9 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
     crate::stages::rt_health::warn_after_fit(&d("cal.json"), out_dir, lib_f);
     // The Q1 calibration of a scanning-quadrupole run (`rt_im_train.q1_calibrate`), added to
     // the `cal.json` just written. Like retrace, the RT bootstrap pass, which only collects
-    // anchors, skips it.
-    if cfg.rt_im_train.q1_calibrate && retrace_allowed {
+    // anchors, skips it, unless that pass's extract decides per fragment
+    // (`extract.q1_fragments`), which reads the calibration and the tolerances it learns.
+    if cfg.rt_im_train.q1_calibrate && (retrace_allowed || cfg.extract.q1_fragments) {
         info!(stage = %"q1-calibrate", "run: stage start");
         let mass_cal = format!("{seed}.masscal.json");
         crate::stages::q1cal::run(crate::stages::q1cal::Q1CalParams {
@@ -138,6 +139,7 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
             q_max: rt_cfg.q_train,
             frag_tol_fallback_ppm: cfg.extract.frag_tol_ppm,
             out_cal: &d("cal.json"),
+            fragment_decision: cfg.extract.q1_fragments,
         })?;
     }
 
@@ -170,8 +172,15 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
         chrom.clone()
     };
     info!(stage = %"extract", "run: stage start");
-    let ext_cfg =
+    let mut ext_cfg =
         crate::stages::ms1cal::extract_cfg(&cfg.extract, seed, &co.ms1, cfg.rt_im_train.q_train)?;
+    // The per-fragment Q1 decision (`extract.q1_fragments`) reads the calibrated window and
+    // the tolerances the Q1 calibration just wrote; the re-pick (`retrace.q1_repick`) runs
+    // inside extract.
+    if cfg.extract.q1_fragments {
+        ext_cfg.q1_model = Some(crate::stages::q1frag::read_model(&d("cal.json"))?);
+        ext_cfg.q1_repick = cfg.retrace.q1_repick;
+    }
     let (wpsm, wchr) = extract::run_hashed(extract::ExtractParams {
         precursor_span: None,
         fragment_offset: None,

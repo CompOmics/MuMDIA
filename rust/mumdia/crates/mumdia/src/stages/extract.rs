@@ -38,6 +38,7 @@ use crate::matchers::binning::LogBins;
 use crate::matchers::fragindex::NarrowedProbe;
 use crate::matchers::fragindex::{BinnedProbe, FragIndex, LocalIndex, WindowNarrow};
 use crate::spectra::{load_ms1, load_ms2, Ms1Scan};
+use crate::stages::q1frag;
 use crate::stages::rt_im_train::RtWindows;
 use mumdia_core::config::MatcherKind;
 use mumdia_core::types::{Ms2Scan, WindowKey};
@@ -1736,6 +1737,44 @@ pub(crate) const Q1_MIN_OVERLAP: f64 = 1.5;
 /// Cycles on each side of the apex cycle the Q1 profile reads: the five cycles around it, as
 /// the window gates read the apex +-2 scans.
 const Q1_PROFILE_CYCLES: u32 = 2;
+/// Peaks of a candidate's count profile `retrace.q1_repick` compares beside extract's apex
+/// (the `enumerate_peaks` that `retain_top_peaks` writes; 5 is the setting `retrace.repick`
+/// was measured with).
+const Q1_REPICK_PEAKS: usize = 5;
+/// Fewest fragments that belong at the chosen peak for `retrace.q1_repick` to move the apex:
+/// a candidate with fewer has no 2D apex of its own to move to.
+const Q1_REPICK_MIN_BELONG: usize = 3;
+
+/// The scan at retention time `rt` (exactly) whose isolation window covers `pm`, or the
+/// first scan at that RT. The scans are RT-sorted.
+fn scan_at_rt(scans: &[Ms2Scan], rt: f64, pm: f64) -> Option<usize> {
+    let a = scans.partition_point(|s| s.rt_seconds < rt);
+    let mut first = None;
+    for (i, s) in scans.iter().enumerate().skip(a) {
+        if s.rt_seconds.to_bits() != rt.to_bits() {
+            break;
+        }
+        first.get_or_insert(i);
+        if s.window.lower_mz <= pm && pm <= s.window.upper_mz {
+            return Some(i);
+        }
+    }
+    first
+}
+
+/// The scan group at retention time `rt` (exactly), on RT-ascending groups.
+fn group_at(groups: &ScanGroups, rt: f64) -> Option<usize> {
+    let (mut lo, mut hi) = (0usize, groups.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if groups.rt(mid) < rt {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    (lo < groups.len() && groups.rt(lo).to_bits() == rt.to_bits()).then_some(lo)
+}
 
 /// The Q1 sweep of scanning-quadrupole spectra (`extract.q1_cycles`, `extract.q1_profile`):
 /// every distinct isolation window is one Q1 bin, the windows in [`WindowKey`] order (by
@@ -3426,7 +3465,8 @@ pub fn psms_schema(path: &str) -> Result<(&'static str, u32)> {
     let cols = mumdia_io::table::column_names(path)?;
     let has_im = cols.iter().any(|c| c == "ms1_apex_im");
     let q1 = cols.iter().any(|c| c == "q1_corr");
-    Ok(artifact::psms_extracted_q1(has_im, q1))
+    let q1f = cols.iter().any(|c| c == "q1f_n_belong");
+    Ok(artifact::psms_extracted_q1f(has_im, q1, q1f))
 }
 
 /// The apex 1/K0 of every row of a `psms_extracted` table that has one, keyed by
@@ -3716,6 +3756,8 @@ struct CandOut {
     im: ApexIm,
     /// The Q1-profile evidence (psms_extracted v5, `extract.q1_profile`); zero otherwise.
     q1: Q1Profile,
+    /// The per-fragment Q1 decision (psms_extracted v6, `extract.q1_fragments`).
+    q1f: Option<q1frag::Q1fRow>,
     /// (cid, frag_name, frag_mz, frag_obs_mz, predicted_intensity, rt, intensity, im)
     chrom: Vec<ChromOutputRow>,
     /// Top-K retained peak groups (sensitivity_plan P1.1/P1.2), populated only
@@ -3781,6 +3823,8 @@ struct PsmRows {
     deconv_shadow: Vec<f32>,
     /// One per row under `extract.q1_profile`, empty otherwise.
     q1: Vec<Q1Profile>,
+    /// One per row under `extract.q1_fragments`, empty otherwise.
+    q1f: Vec<q1frag::Q1fRow>,
 }
 
 impl PsmRows {
@@ -3837,6 +3881,9 @@ impl PsmRows {
         }
         if cfg.q1_profile {
             self.q1.push(r.q1);
+        }
+        if cfg.q1_fragments {
+            self.q1f.push(r.q1f.unwrap_or_default());
         }
     }
 
@@ -3952,6 +3999,68 @@ impl PsmRows {
             cols.push(Col::F64("q1_offset".into(), col(|q| q.offset)));
             cols.push(Col::F64("q1_frag_sd".into(), col(|q| q.frag_sd)));
             cols.push(Col::F64("q1_bin_frac".into(), col(|q| q.bin_frac)));
+        }
+        // psms_extracted v6: the per-fragment Q1 decision, appended last, only under
+        // `extract.q1_fragments`: the row's summary, then one list per decision with an entry
+        // per library fragment.
+        if cfg.q1_fragments {
+            let q = take(&mut self.q1f);
+            let col = |f: fn(&q1frag::Q1fRow) -> f64| -> Vec<f64> { q.iter().map(f).collect() };
+            cols.push(Col::F64(
+                "q1f_n_present".into(),
+                col(|r| r.summary.n_present),
+            ));
+            cols.push(Col::F64("q1f_n_belong".into(), col(|r| r.summary.n_belong)));
+            cols.push(Col::F64(
+                "q1f_n_interfered".into(),
+                col(|r| r.summary.n_interfered),
+            ));
+            cols.push(Col::F64(
+                "q1f_belong_share".into(),
+                col(|r| r.summary.belong_share),
+            ));
+            cols.push(Col::F64(
+                "q1f_interfered_share".into(),
+                col(|r| r.summary.interfered_share),
+            ));
+            cols.push(Col::F64(
+                "q1f_offset_median".into(),
+                col(|r| r.summary.offset_median),
+            ));
+            cols.push(Col::F64(
+                "q1f_offset_mad".into(),
+                col(|r| r.summary.offset_mad),
+            ));
+            cols.push(Col::F64("q1f_corr2d".into(), col(|r| r.summary.corr2d)));
+            cols.push(Col::F64(
+                "q1f_fit_resid".into(),
+                col(|r| r.summary.fit_resid),
+            ));
+            cols.push(Col::F64("q1f_centre".into(), col(|r| r.summary.centre)));
+            cols.push(Col::F64("q1f_width".into(), col(|r| r.summary.width)));
+            cols.push(Col::F64(
+                "q1f_apex_shift_cycles".into(),
+                col(|r| r.apex_shift_cycles),
+            ));
+            if cfg.q1_repick {
+                cols.push(Col::F64("q1f_apex_moved_s".into(), col(|r| r.moved_s)));
+            }
+            let (mut cl, mut of, mut rs, mut cr) = (
+                Vec::with_capacity(q.len()),
+                Vec::with_capacity(q.len()),
+                Vec::with_capacity(q.len()),
+                Vec::with_capacity(q.len()),
+            );
+            for r in q {
+                cl.push(r.class);
+                of.push(r.offset);
+                rs.push(r.resid);
+                cr.push(r.corr2d);
+            }
+            cols.push(Col::ListF32("q1f_frag_class".into(), cl));
+            cols.push(Col::ListF32("q1f_frag_offset".into(), of));
+            cols.push(Col::ListF32("q1f_frag_resid".into(), rs));
+            cols.push(Col::ListF32("q1f_frag_corr2d".into(), cr));
         }
         cols
     }
@@ -4377,6 +4486,53 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             );
         }
     }
+
+    // The per-fragment Q1 decision (`extract.q1_fragments`): the sweep spectra_ms2 v3
+    // recorded as a cycle x step grid of this stage's scans, and the run's calibrated model.
+    let q1f_grid: Option<q1frag::Q1Grid> = if p.cfg.q1_fragments {
+        if has_im {
+            anyhow::bail!(
+                "extract: extract.q1_fragments decides on a scanning quadrupole's Q1 steps, and \
+                 these spectra carry 1/K0 (diaPASEF); unset it for them"
+            );
+        }
+        if p.cfg.q1_model.is_none() {
+            anyhow::bail!(
+                "extract: extract.q1_fragments needs the run's Q1 calibration (cal.json \
+                 q1_calibration with its fragment_decision, from rt_im_train.q1_calibrate); \
+                 `mumdia run` reads it, `mumdia extract` takes it as --q1-cal"
+            );
+        }
+        let sweep = crate::spectra::load_q1_sweep(p.ms2)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "extract: extract.q1_fragments needs the Q1 sweep spectra_ms2 v3 records \
+                 (q1_cycle, q1_step), and {} has none: convert it again with \
+                 convert.isolation_half_width",
+                p.ms2
+            )
+        })?;
+        let g = q1frag::Q1Grid::build(scans, &sweep)?;
+        let m = p.cfg.q1_model.as_ref().expect("checked above");
+        info!(
+            cycles = g.n_cycles,
+            steps = g.n_steps,
+            reach_mz = q1frag::reach_mz(m),
+            offset_tol_steps = m.tolerances.offset_steps,
+            centre_tol_steps = m.tolerances.centre_steps,
+            corr2d_min = m.tolerances.corr2d_min,
+            q1_repick = p.cfg.q1_repick,
+            "extract: per-fragment Q1 decisions"
+        );
+        Some(g)
+    } else {
+        None
+    };
+    let q1f_ctx: Option<q1frag::DecideAt> = q1f_grid.as_ref().map(|grid| q1frag::DecideAt {
+        grid,
+        model: p.cfg.q1_model.as_ref().expect("checked above"),
+        scans,
+        tol_ppm: frag_tol,
+    });
 
     // The fragment index, built with the library above at this same learned tolerance,
     // when a path needs the global one; and the geometry the streamed path's task-local
@@ -5362,6 +5518,105 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             }
         }
 
+        // The per-fragment Q1 decision (`extract.q1_fragments`, `stages::q1frag`): the
+        // candidate's library fragments as the decision reads them, and the decision of a row
+        // with its apex at `rt` (the patch, the decision and the apex scan). `None` with the
+        // key off.
+        let q1f_cand: Option<q1frag::CandQ1> = q1f_ctx.as_ref().map(|x| {
+            let (fm, fi, fnm) = lib.cand_frags(cid);
+            let mzs: Vec<f64> = fm.iter().map(|&v| v as f64).collect();
+            let preds: Vec<f64> = fi.iter().map(|&v| v as f64).collect();
+            let zs: Vec<i32> = fnm
+                .iter()
+                .map(|&n| q1frag::frag_charge_of(lib.frag_name_str(n)))
+                .collect();
+            q1frag::CandQ1::new(
+                x.model,
+                c.precursor_mz,
+                c.charge,
+                apex_rt,
+                &mzs,
+                &zs,
+                &preds,
+                &|mz| mass_off.factor_at(mz),
+            )
+        });
+        type Q1fAt = (q1frag::Patch, q1frag::Decision, usize);
+        let q1f_at = |rt: f64| -> Option<Q1fAt> {
+            let (x, cand) = (q1f_ctx.as_ref()?, q1f_cand.as_ref()?);
+            let si = scan_at_rt(scans, rt, c.precursor_mz)?;
+            let (pt, d) = x.at(cand, si, lo_c, hi_c)?;
+            Some((pt, d, si))
+        };
+        let q1f_row = |r: Option<&Q1fAt>| -> Option<q1frag::Q1fRow> {
+            let x = q1f_ctx.as_ref()?;
+            let cand = q1f_cand.as_ref()?;
+            Some(match r {
+                Some((pt, d, si)) => q1frag::Q1fRow::of(d, cand, pt, x.grid.scan_cycle[*si]),
+                None => q1frag::Q1fRow::empty(cand.frags.len(), cand),
+            })
+        };
+        let q1f_0 = q1f_at(apex_rt);
+        // `retrace.q1_repick`: extract's apex and the next peaks of the count profile (those
+        // whose envelope does not hold the apex) are scored by the fragments that belong at
+        // each (`q1frag::repick_score`), and the apex moves to the best one's 2D apex: the
+        // cycle where its fragments that belong peak, at the step nearest their fitted Q1
+        // centre whose window covers the precursor, when at least `Q1_REPICK_MIN_BELONG` of
+        // them belong there. The apex scalars are read again there.
+        let (mut row_apex_rt, mut row_apex_sum) = (apex_rt, apex_sum);
+        let mut row_ms1 = (o_ms1_m1, o_ms1_mono, o_ms1_i1, o_ms1_i2);
+        let mut row_q1 = q1_0;
+        let mut q1f_out = q1f_row(q1f_0.as_ref());
+        if p.cfg.q1_repick {
+            if let (Some(x), Some(cand), Some(gi0), Some(own)) =
+                (q1f_ctx.as_ref(), q1f_cand.as_ref(), apex_gi, q1f_0.as_ref())
+            {
+                let count_prof: Vec<f32> = counts.iter().map(|&n| n as f32).collect();
+                let alts =
+                    crate::peaks::enumerate_peaks(&count_prof, Q1_REPICK_PEAKS, 1.0 / 3.0, 0.1);
+                let mut best_score = q1frag::repick_score(&own.0, &own.1, cand);
+                let mut best: Option<Q1fAt> = None;
+                for pk in &alts {
+                    if pk.start_idx <= gi0 && gi0 <= pk.end_idx {
+                        continue;
+                    }
+                    if let Some(r) = q1f_at(groups.rt(pk.apex_idx)) {
+                        let sc = q1frag::repick_score(&r.0, &r.1, cand);
+                        if sc > best_score {
+                            best_score = sc;
+                            best = Some(r);
+                        }
+                    }
+                }
+                let chosen = best.as_ref().unwrap_or(own);
+                let belong = chosen
+                    .1
+                    .class
+                    .iter()
+                    .filter(|&&k| k == q1frag::BELONGS)
+                    .count();
+                let target = (belong >= Q1_REPICK_MIN_BELONG)
+                    .then(|| x.apex_scan(cand, &chosen.0, &chosen.1, c.precursor_mz))
+                    .flatten()
+                    .map(|si| scans[si].rt_seconds)
+                    .and_then(|rt| group_at(&groups, rt).map(|gi| (rt, gi)));
+                if let Some((rt, gi)) = target {
+                    if rt.to_bits() != apex_rt.to_bits() {
+                        row_apex_rt = rt;
+                        row_apex_sum = groups.sum(gi);
+                        row_ms1 = ms1_at(rt);
+                        row_q1 = q1_at(rt);
+                        // The decision at the new apex (the patch centred on it).
+                        let at_new = q1f_at(rt);
+                        q1f_out = q1f_row(at_new.as_ref().or(Some(chosen)));
+                        if let Some(r) = q1f_out.as_mut() {
+                            r.moved_s = rt - apex_rt;
+                        }
+                    }
+                }
+            }
+        }
+
         // Diagnostic scores (all four metrics, for the offline gate-metric
         // comparison). Computed and emitted ONLY when `emit_gate_diagnostics` is set,
         // so the default psms.parquet schema and per-candidate compute are unchanged
@@ -5663,8 +5918,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         let rank0 = CandOut {
             cid,
             peak_rank: 0, // selected apex; ranks >= 1 added when promote_top_peaks > 1
-            apex_rt,
-            apex_int: apex_sum,
+            apex_rt: row_apex_rt,
+            apex_int: row_apex_sum,
             n_match: n_distinct as i32,
             corun: best_run as i32,
             npred: fmzs0.len() as i32,
@@ -5681,10 +5936,10 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             pform: c.peptidoform.to_string(),
             prot: c.protein.to_string(),
             irt: c.predicted_irt,
-            ms1_m1: o_ms1_m1,
-            ms1_mono: o_ms1_mono,
-            ms1_i1: o_ms1_i1,
-            ms1_i2: o_ms1_i2,
+            ms1_m1: row_ms1.0,
+            ms1_mono: row_ms1.1,
+            ms1_i1: row_ms1.2,
+            ms1_i2: row_ms1.3,
             gate_apex: gate_apex as f32,
             gate_peak_spectral: gate_peak_spectral as f32,
             gate_coelution: gate_coelution as f32,
@@ -5696,7 +5951,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             deconv_collin: deconv_collin as f32,
             deconv_shadow: deconv_shadow as f32,
             im: im0,
-            q1: q1_0,
+            q1: row_q1,
+            q1f: q1f_out,
             chrom: chrom_rows,
             peaks,
         };
@@ -5791,6 +6047,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 deconv_shadow: 0.0,
                 im: im_at(alt_apex_rt),
                 q1: q1_at(alt_apex_rt),
+                q1f: q1f_row(q1f_at(alt_apex_rt).as_ref()),
                 chrom: Vec::new(), // shared per-candidate via the rank-0 row
                 peaks: Vec::new(),
             });
@@ -5807,6 +6064,10 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     // copy in the Arrow builders) being resident at one final write. The bounded channel
     // keeps at most a few chunks in flight between the extraction threads and the encoder.
     let mut n_accepted = 0u64;
+    // The per-fragment Q1 decisions written (`extract.q1_fragments`): fragments by class, and
+    // the rows whose apex `retrace.q1_repick` moved.
+    let mut q1f_classes = [0u64; 3];
+    let mut q1f_moved = 0u64;
     // Candidates that had at least one hit; counted as they are flushed on the streamed
     // path, where no whole-run accumulator exists to size.
     let mut n_materialized = 0u64;
@@ -5866,6 +6127,16 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         pk_end.push(*end);
                         pk_ev.push(*ev);
                         pk_area.push(*area);
+                    }
+                    if let Some(q) = &r.q1f {
+                        for &c in &q.class {
+                            if let Some(n) = q1f_classes.get_mut(c as usize) {
+                                *n += 1;
+                            }
+                        }
+                        if q.moved_s != 0.0 {
+                            q1f_moved += 1;
+                        }
                     }
                     let chrom = std::mem::take(&mut r.chrom);
                     if let Err(e) = psms.push(r, p.cfg) {
@@ -6194,12 +6465,30 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     let mut stats = std::collections::BTreeMap::new();
     stats.insert("accepted".to_string(), json!(n_accepted));
     stats.insert("scan_window".to_string(), json!(scan_window));
+    if q1f_ctx.is_some() {
+        stats.insert(
+            "q1_fragments".to_string(),
+            json!({
+                "fragments_absent": q1f_classes[q1frag::ABSENT as usize],
+                "fragments_belong": q1f_classes[q1frag::BELONGS as usize],
+                "fragments_interfered": q1f_classes[q1frag::INTERFERED as usize],
+                "rows_repicked": q1f_moved,
+            }),
+        );
+        info!(
+            absent = q1f_classes[0],
+            belong = q1f_classes[1],
+            interfered = q1f_classes[2],
+            repicked_rows = q1f_moved,
+            "extract: per-fragment Q1 decisions written"
+        );
+    }
     let n_chrom = chrom_written.rows;
     let mut written: Vec<Written> = Vec::with_capacity(2);
     for (path, schema, file) in [
         (
             p.out_psms,
-            artifact::psms_extracted_q1(has_im, p.cfg.q1_profile),
+            artifact::psms_extracted_q1f(has_im, p.cfg.q1_profile, p.cfg.q1_fragments),
             psms_written,
         ),
         (
@@ -6241,6 +6530,29 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 obj.insert("q1_windows".into(), json!(l.win.len()));
                 obj.insert("q1_cycles_found".into(), json!(l.n_cycles));
                 obj.insert("q1_step_mz".into(), json!(l.step));
+            }
+        }
+        // The per-fragment Q1 decision's model, only under `extract.q1_fragments`, so a report
+        // without it is unchanged; rescore's `shadow_q1` reads the reach, the step and the
+        // offset tolerance from here.
+        if let Some(x) = &q1f_ctx {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert(
+                    "q1_fragments".into(),
+                    json!({
+                        "step_mz": x.model.step_mz,
+                        "half_width_mz": x.model.half_width_mz,
+                        "edge_width_mz": x.model.edge_width_mz,
+                        "reach_mz": q1frag::reach_mz(x.model),
+                        "offset_terms": x.model.offset_terms,
+                        "tolerances": x.model.tolerances,
+                        "patch_cycles": 2 * q1frag::PATCH_CYCLES + 1,
+                        "profile_cycles": 2 * q1frag::PROFILE_CYCLES + 1,
+                        "margin_steps": q1frag::MARGIN_STEPS,
+                        "q1_repick": p.cfg.q1_repick,
+                        "repick_peaks": Q1_REPICK_PEAKS,
+                    }),
+                );
             }
         }
         // The MS1 calibration of `ms1_calibrate = "surface"` / `prec_tol_auto`, only then,
@@ -7497,6 +7809,7 @@ mod psms_stream_tests {
                 im_pred_cal: (!i.is_multiple_of(13)).then_some(1.0 + f * 1e-6),
             },
             q1: Q1Profile::default(),
+            q1f: None,
             chrom: Vec::new(),
             peaks: Vec::new(),
         }
@@ -7921,6 +8234,29 @@ mod q1_tests {
             (m[2].scan as usize, m[2].frag, m[2].inten),
             (s(2, 20), 0, 3.0)
         );
+    }
+
+    /// The re-pick's lookups: the scan at an exact retention time whose window covers the
+    /// precursor (the first at that time otherwise, none off the axis), and the scan group at
+    /// an exact retention time.
+    #[test]
+    fn the_repick_finds_its_scan_and_group_by_exact_rt() {
+        let mut scans = sweep(2, 60);
+        // A second scan at the RT of scan 70 whose window does not cover 420.
+        let mut twin = scans[70].clone();
+        twin.window.lower_mz = 300.0;
+        twin.window.upper_mz = 301.0;
+        scans.insert(70, twin);
+        let rt = scans[71].rt_seconds;
+        let pm = scans[71].window.target_mz;
+        assert_eq!(scan_at_rt(&scans, rt, pm), Some(71));
+        assert_eq!(scan_at_rt(&scans, rt, 1.0), Some(70));
+        assert_eq!(scan_at_rt(&scans, rt + 1e-7, pm), None);
+        let g = ScanGroups::empty_on(&[1.0, 2.0, 3.5], 4);
+        assert_eq!(group_at(&g, 2.0), Some(1));
+        assert_eq!(group_at(&g, 3.5), Some(2));
+        assert_eq!(group_at(&g, 2.5), None);
+        assert_eq!(group_at(&g, 9.0), None);
     }
 
     #[test]

@@ -325,6 +325,10 @@ enum Cmd {
         /// sorted by `candidate_id`, so a band needs no fragment table of its own.
         #[arg(long)]
         fragment_offset: Option<u32>,
+        /// The run's `cal.json` with its Q1 calibration (`rt_im_train.q1_calibrate`), which
+        /// `extract.q1_fragments` decides with.
+        #[arg(long)]
+        q1_cal: Option<String>,
         #[arg(long)]
         config: Option<String>,
     },
@@ -2090,10 +2094,23 @@ fn real_main() -> Result<()> {
             out_chromatograms,
             restrict_candidates,
             fragment_offset,
+            q1_cal,
             config,
         } => {
             let cfg = load_config(&config)?;
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
+            // The per-fragment Q1 decision reads the run's calibration; the re-pick runs
+            // inside extract.
+            let mut ext_cfg = cfg.extract.clone();
+            if ext_cfg.q1_fragments {
+                let cal = q1_cal.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "extract.q1_fragments needs the run's cal.json with its Q1 calibration:                          pass --q1-cal"
+                    )
+                })?;
+                ext_cfg.q1_model = Some(stages::q1frag::read_model(cal)?);
+                ext_cfg.q1_repick = cfg.retrace.q1_repick;
+            }
             stages::extract::run(stages::extract::ExtractParams {
                 precursor_span: None,
                 fragment_offset,
@@ -2121,7 +2138,7 @@ fn real_main() -> Result<()> {
                 out_psms: &out_psms,
                 out_chrom: &out_chromatograms,
                 restrict_candidates: restrict_candidates.as_deref(),
-                cfg: &cfg.extract,
+                cfg: &ext_cfg,
                 config_hash: &ch,
             })?;
         }

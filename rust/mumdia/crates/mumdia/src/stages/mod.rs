@@ -19,6 +19,7 @@ pub mod predict_frag;
 pub mod prescan;
 pub mod prescreen;
 pub mod q1cal;
+pub mod q1frag;
 pub mod quant;
 pub mod quant_norm;
 pub mod quant_pattern;

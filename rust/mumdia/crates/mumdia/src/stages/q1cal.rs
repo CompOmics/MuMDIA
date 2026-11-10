@@ -48,12 +48,17 @@
 //! 0.158 steps; the offset falls from +0.24 m/z at 395 m/z to -0.06 m/z at 900 m/z; and the
 //! window is wider and softer than 3.8 m/z: whole within 0.57 m/z of its centre, nothing
 //! beyond 4.56 m/z (h 2.57, e 4.00 m/z).
+//!
+//! Under `extract.q1_fragments` the calibration also learns the per-fragment decision
+//! tolerances (`stages::q1frag::learn`) from the same anchors' RT x step patches of every
+//! library fragment, read with the window it just fitted, and adds them to the block as
+//! `fragment_decision`; extract decides with them.
 
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use mumdia_core::config::interp_held;
-use mumdia_core::constants::{averagine_isotopes, ISOTOPE_SPACING, PROTON};
+use mumdia_core::constants::ISOTOPE_SPACING;
 use mumdia_io::table::TableFile;
 use rayon::prelude::*;
 use serde_json::json;
@@ -61,6 +66,10 @@ use tracing::{info, warn};
 
 use crate::calibrate::{percentile, Loess};
 use crate::stages::extract::{Q1_MAX_STEP, Q1_MIN_OVERLAP, Q1_MIN_WINDOWS};
+use crate::stages::q1frag;
+#[cfg(test)]
+use crate::stages::q1frag::transmission;
+use crate::stages::q1frag::{profile_sse, step_key};
 
 /// Strongest library fragments read per anchor.
 const FRAGMENTS: usize = 6;
@@ -68,8 +77,6 @@ const FRAGMENTS: usize = 6;
 const CYCLES_EACH_SIDE: u32 = 2;
 /// Steps read around a precursor: targets within this many half-widths of its m/z.
 const RANGE_HALF_WIDTHS: f64 = 2.0;
-/// Isotopes of the precursor envelope.
-const ISOTOPES: usize = 6;
 /// Fewest profiles a calibration is fitted from.
 const MIN_PROFILES: usize = 200;
 /// Most anchors read: the best by seed score above it.
@@ -89,6 +96,8 @@ const LOESS_PROFILES: usize = 20_000;
 /// The robust standard deviation of a normal sample per unit of its median absolute
 /// deviation.
 const MAD_TO_SIGMA: f64 = 1.4826;
+/// Most anchors the fragment-decision tolerances are learned from (every k-th above it).
+const LEARN_ANCHORS: usize = 20_000;
 
 /// The inputs of [`run`].
 pub struct Q1CalParams<'a> {
@@ -104,6 +113,9 @@ pub struct Q1CalParams<'a> {
     pub frag_tol_fallback_ppm: f64,
     /// The run's `cal.json`, which gains `q1_calibration`.
     pub out_cal: &'a str,
+    /// Also learn the per-fragment decision tolerances (`extract.q1_fragments`) and add
+    /// them as `fragment_decision`.
+    pub fragment_decision: bool,
 }
 
 /// The Q1 sweep of a run's MS2 spectra, in file (acquisition) order.
@@ -117,6 +129,10 @@ struct Sweep {
     half_width: f64,
     /// Whether the cycles came from spectra_ms2 v3 rather than from the targets.
     recorded: bool,
+    /// The steps: the distinct targets (1e-4 m/z) ascending, and every row's step (the rank
+    /// of its target, which spectra_ms2 v3 records on a regular sweep).
+    step_target: Vec<f64>,
+    row_step: Vec<u32>,
 }
 
 impl Sweep {
@@ -203,6 +219,11 @@ fn read_sweep(ms2: &str) -> Result<Sweep> {
             d.len()
         );
     }
+    let keys: Vec<i64> = d.iter().map(|&x| step_key(x)).collect();
+    let row_step: Vec<u32> = target
+        .iter()
+        .map(|&x| keys.partition_point(|&k| k < step_key(x)) as u32)
+        .collect();
     Ok(Sweep {
         scan_index,
         target,
@@ -211,6 +232,8 @@ fn read_sweep(ms2: &str) -> Result<Sweep> {
         step_mz,
         half_width: 0.5 * width,
         recorded,
+        step_target: d,
+        row_step,
     })
 }
 
@@ -480,40 +503,9 @@ fn read_profiles(
     Ok((step_t, profiles))
 }
 
-/// The neutral mass of an ion of m/z `mz` and charge `z`.
-fn neutral(mz: f64, z: i32) -> f64 {
-    (mz - PROTON) * z as f64
-}
-
-/// The precursor isotopes' weights for a fragment: Poisson-averagine abundance times the
-/// chance `(1 - f)^i` that the fragment stays monoisotopic, `f` its share of the precursor
-/// mass, normalised.
+/// The precursor isotopes' weights for a fragment ([`q1frag::isotope_weights`]).
 fn isotope_weights(a: &Anchor, f: Frag) -> Vec<f64> {
-    let m = neutral(a.pm, a.z);
-    let frac = (neutral(f.mz, f.z) / m).clamp(0.0, 1.0);
-    let mut w = averagine_isotopes(m, ISOTOPES);
-    let mut keep = 1.0;
-    for x in w.iter_mut() {
-        *x *= keep;
-        keep *= 1.0 - frac;
-    }
-    let s: f64 = w.iter().sum();
-    if s > 0.0 {
-        for x in w.iter_mut() {
-            *x /= s;
-        }
-    }
-    w
-}
-
-/// The share of a precursor ion at distance `x` from a window's centre that it transmits:
-/// whole within `h - e/2`, nothing beyond `h + e/2`, linear in between.
-fn transmission(x: f64, h: f64, e: f64) -> f64 {
-    let ax = x.abs();
-    if e <= 0.0 {
-        return if ax <= h { 1.0 } else { 0.0 };
-    }
-    ((h + 0.5 * e - ax) / e).clamp(0.0, 1.0)
+    q1frag::isotope_weights(a.pm, a.z, f.mz, f.z)
 }
 
 /// The expected profile over the step targets `t` of a precursor of m/z `pm` and charge
@@ -524,7 +516,7 @@ fn expected(t: &[f64], pm: f64, z: i32, w: &[f64], delta: f64, h: f64, e: f64) -
         .map(|&tk| {
             w.iter()
                 .enumerate()
-                .map(|(i, wi)| wi * transmission(pm + i as f64 * sp - (tk + delta), h, e))
+                .map(|(i, wi)| wi * q1frag::transmission(pm + i as f64 * sp - (tk + delta), h, e))
                 .sum()
         })
         .collect()
@@ -534,36 +526,6 @@ fn expected(t: &[f64], pm: f64, z: i32, w: &[f64], delta: f64, h: f64, e: f64) -
 fn centroid(y: &[f64], t: &[f64]) -> Option<f64> {
     let s: f64 = y.iter().sum();
     (s > 0.0).then(|| y.iter().zip(t).map(|(a, b)| a * b).sum::<f64>() / s)
-}
-
-/// Sum of squares of `y / sum(y)` against `s E + b` with the per-profile scale `s` and
-/// floor `b >= 0` that fit best (a floor that would come out negative is 0).
-fn profile_sse(y: &[f64], e: &[f64]) -> f64 {
-    let tot: f64 = y.iter().sum();
-    let n = y.len() as f64;
-    let (mut see, mut se, mut sey, mut sy, mut syy) = (0.0, 0.0, 0.0, 0.0, 0.0);
-    for (&yk, &ek) in y.iter().zip(e) {
-        let yn = yk / tot;
-        see += ek * ek;
-        se += ek;
-        sey += ek * yn;
-        sy += yn;
-        syy += yn * yn;
-    }
-    let det = see * n - se * se;
-    let (s, b) = if det.abs() > 1e-12 {
-        let s = (sey * n - se * sy) / det;
-        let b = (see * sy - se * sey) / det;
-        if s >= 0.0 && b >= 0.0 {
-            (s, b)
-        } else {
-            (if see > 0.0 { sey / see } else { 0.0 }, 0.0)
-        }
-    } else {
-        (if see > 0.0 { sey / see } else { 0.0 }, 0.0)
-    };
-    // sum (yn - s e - b)^2, expanded.
-    syy + s * s * see + b * b * n - 2.0 * s * sey - 2.0 * b * sy + 2.0 * s * b * se
 }
 
 /// A variable the window-centre offset can depend on.
@@ -989,6 +951,229 @@ fn fit(sweep: &Sweep, d: &Data) -> serde_json::Value {
     })
 }
 
+/// One library fragment row of an anchor for the decision: its m/z, predicted intensity and
+/// charge (from the name, as extract reads it).
+type DecisionFrag = (f64, f64, i32);
+
+/// Every library fragment of the anchors, in the file's order (the library's order, which
+/// extract's decision lists keep); the charge from the fragment name (`y7^2`), 1 without
+/// one.
+fn read_all_fragments(path: &str, anchors: &[Anchor]) -> Result<Vec<Vec<DecisionFrag>>> {
+    let max_cid = anchors.iter().map(|a| a.cid).max().unwrap_or(0) as usize;
+    let mut slot = vec![u32::MAX; max_cid + 1];
+    for (i, a) in anchors.iter().enumerate() {
+        slot[a.cid as usize] = i as u32;
+    }
+    let t = TableFile::open(path).with_context(|| format!("q1-calibrate: reading {path}"))?;
+    let has_name = t.has_column("name");
+    let parts = t.row_group_parts()?;
+    let found: Vec<Result<Vec<(u32, DecisionFrag)>>> = parts
+        .par_iter()
+        .map(|p| {
+            let cid = p.u32("candidate_id")?;
+            let mz = p.f64_widening("mz")?;
+            let pi = p.f64_widening("predicted_intensity")?;
+            let names = if has_name {
+                p.str("name")?
+            } else {
+                vec![String::new(); cid.len()]
+            };
+            Ok((0..cid.len())
+                .filter_map(|i| {
+                    let s = *slot.get(cid[i] as usize)?;
+                    (s != u32::MAX).then(|| (s, (mz[i], pi[i], q1frag::frag_charge_of(&names[i]))))
+                })
+                .collect())
+        })
+        .collect();
+    let mut per: Vec<Vec<DecisionFrag>> = vec![Vec::new(); anchors.len()];
+    for f in found {
+        for (s, fr) in f? {
+            per[s as usize].push(fr);
+        }
+    }
+    Ok(per)
+}
+
+/// The `fragment_decision` block: the anchors' RT x step patches of every library fragment,
+/// read with the window `block` describes, and the tolerances [`q1frag::learn`] finds on
+/// them. At most [`LEARN_ANCHORS`] anchors (every k-th).
+#[allow(clippy::too_many_arguments)]
+fn learn_decision(
+    ms2: &str,
+    sweep: &Sweep,
+    anchors: &[Anchor],
+    library_fragments: &str,
+    factor: &(dyn Fn(f64) -> f64 + Sync),
+    tol_ppm: f64,
+    block: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let model = q1frag::model_from_calibration(block, false)?;
+    let k = anchors.len().div_ceil(LEARN_ANCHORS).max(1);
+    let anchors: Vec<Anchor> = anchors.iter().step_by(k).copied().collect();
+    let frags = read_all_fragments(library_fragments, &anchors)?;
+    let n_cycles = sweep.n_cycles();
+    let n_steps = sweep.step_target.len();
+    // cycle x step -> row.
+    let mut cell = vec![u32::MAX; n_cycles * n_steps];
+    for (row, (&c, &st)) in sweep.row_cycle.iter().zip(&sweep.row_step).enumerate() {
+        cell[c as usize * n_steps + st as usize] = row as u32;
+    }
+    let reach = q1frag::reach_mz(&model) + q1frag::MARGIN_STEPS * model.step_mz;
+    // Each anchor's candidate, cycles and steps.
+    struct Spec {
+        cand: q1frag::CandQ1,
+        cycles: Vec<u32>,
+        s0: u32,
+        ns: usize,
+        start_ci: usize,
+    }
+    let specs: Vec<Spec> = anchors
+        .iter()
+        .zip(&frags)
+        .map(|(a, fs)| {
+            let mzs: Vec<f64> = fs.iter().map(|f| f.0).collect();
+            let preds: Vec<f64> = fs.iter().map(|f| f.1).collect();
+            let zs: Vec<i32> = fs.iter().map(|f| f.2).collect();
+            let cand = q1frag::CandQ1::new(&model, a.pm, a.z, a.rt, &mzs, &zs, &preds, factor);
+            let lo = a.c0.saturating_sub(q1frag::PATCH_CYCLES);
+            let hi = (a.c0 + q1frag::PATCH_CYCLES).min(n_cycles.saturating_sub(1) as u32);
+            let cycles: Vec<u32> = (lo..=hi).collect();
+            let start_ci = (a.c0 - lo) as usize;
+            let s0 = sweep
+                .step_target
+                .partition_point(|&t| t < cand.centre - reach) as u32;
+            let s1 = sweep
+                .step_target
+                .partition_point(|&t| t <= cand.centre + reach);
+            Spec {
+                cand,
+                cycles,
+                s0,
+                ns: s1.saturating_sub(s0 as usize),
+                start_ci,
+            }
+        })
+        .collect();
+    // The rows each anchor reads.
+    let mut requests: Vec<(u32, u32)> = Vec::new();
+    for (ai, sp) in specs.iter().enumerate() {
+        if sp.cand.frags.is_empty() {
+            continue;
+        }
+        for &c in &sp.cycles {
+            for si in 0..sp.ns {
+                let row = cell[c as usize * n_steps + sp.s0 as usize + si];
+                if row != u32::MAX {
+                    requests.push((row, ai as u32));
+                }
+            }
+        }
+    }
+    requests.sort_unstable();
+    let targets: Vec<Vec<f64>> = specs
+        .iter()
+        .map(|sp| sp.cand.frags.iter().map(|f| f.target_mz).collect())
+        .collect();
+    let matches = gather(ms2, &requests, &targets, tol_ppm)?;
+    let mut patches: Vec<q1frag::Patch> = specs
+        .iter()
+        .map(|sp| {
+            let t = sweep.step_target[sp.s0 as usize..sp.s0 as usize + sp.ns].to_vec();
+            q1frag::Patch::new(sp.cycles.clone(), sp.s0, t, sp.cand.frags.len())
+        })
+        .collect();
+    for (ai, f, row, v) in matches {
+        let sp = &specs[ai as usize];
+        let (c, st) = (sweep.row_cycle[row as usize], sweep.row_step[row as usize]);
+        let (ci, si) = ((c - sp.cycles[0]) as usize, (st - sp.s0) as usize);
+        patches[ai as usize].set(f as usize, ci, si, v as f32);
+    }
+    let learn: Vec<q1frag::LearnAnchor> = specs
+        .into_iter()
+        .zip(patches)
+        .filter(|(sp, _)| !sp.cand.frags.is_empty() && sp.ns > 0)
+        .map(|(sp, patch)| q1frag::LearnAnchor {
+            cand: sp.cand,
+            patch,
+            start_ci: sp.start_ci,
+        })
+        .collect();
+    let (tol, out) = q1frag::learn(&learn, &model);
+    info!(
+        anchors = learn.len(),
+        offset_tol_steps = tol.offset_steps,
+        centre_tol_steps = tol.centre_steps,
+        corr2d_min = tol.corr2d_min,
+        belong_share = %out["under_tolerances"]["belong_share"],
+        interfered_share = %out["under_tolerances"]["interfered_share"],
+        "q1-calibrate: per-fragment decision tolerances learned from the seed"
+    );
+    Ok(out)
+}
+
+/// A fragment match of the decision's patches: anchor, fragment, spectrum row, intensity.
+type PatchMatch = (u32, u16, u32, f64);
+
+/// Every (anchor, fragment, row, intensity) match of `requests` (rows ascending, each with
+/// its anchor) against the anchors' fragment `targets`: the nearest peak of the row within
+/// `tol_ppm`. Sorted by anchor, fragment and row.
+fn gather(
+    ms2: &str,
+    requests: &[(u32, u32)],
+    targets: &[Vec<f64>],
+    tol_ppm: f64,
+) -> Result<Vec<PatchMatch>> {
+    let t = TableFile::open(ms2)?;
+    let parts = t.row_group_parts()?;
+    let mut first = Vec::with_capacity(parts.len());
+    let mut acc = 0usize;
+    for p in &parts {
+        first.push(acc);
+        acc += p.nrows;
+    }
+    let hits: Vec<Result<Vec<PatchMatch>>> = parts
+        .par_iter()
+        .zip(first.par_iter())
+        .map(|(p, &f0)| {
+            let a = requests.partition_point(|q| (q.0 as usize) < f0);
+            let b = requests.partition_point(|q| (q.0 as usize) < f0 + p.nrows);
+            let mut out = Vec::new();
+            if a == b {
+                return Ok(out);
+            }
+            let mut k = a;
+            let mut row = f0;
+            p.for_each_batch(Some(&["mz", "intensity"]), 1024, |batch| {
+                let mza = crate::spectra::list_col(batch, "mz")?;
+                let ina = crate::spectra::list_col(batch, "intensity")?;
+                for i in 0..mza.len() {
+                    while k < b && (requests[k].0 as usize) == row {
+                        let ai = requests[k].1;
+                        let (mz, inten) = (mza.row_slice(i, "mz")?, ina.row_slice(i, "intensity")?);
+                        let n = mz.len().min(inten.len());
+                        for (fi, &tg) in targets[ai as usize].iter().enumerate() {
+                            if let Some(j) = nearest(&mz[..n], tg, tol_ppm) {
+                                out.push((ai, fi as u16, row as u32, inten[j] as f64));
+                            }
+                        }
+                        k += 1;
+                    }
+                    row += 1;
+                }
+                Ok(())
+            })?;
+            Ok(out)
+        })
+        .collect();
+    let mut all = Vec::new();
+    for h in hits {
+        all.extend(h?);
+    }
+    all.sort_by_key(|x| (x.0, x.1, x.2));
+    Ok(all)
+}
+
 /// Run the Q1 calibration and add `q1_calibration` to `cal.json`. A run with too few
 /// profiles gets `status: "too_few_profiles"` and a warning.
 pub fn run(p: Q1CalParams) -> Result<()> {
@@ -999,7 +1184,7 @@ pub fn run(p: Q1CalParams) -> Result<()> {
     let (mass_off, tol) = crate::masscal::read_mass_cal(p.mass_cal, p.frag_tol_fallback_ppm)?;
     let factor = |mz: f64| mass_off.factor_at(mz);
     let (step_t, profiles) = read_profiles(p.ms2, &sweep, &anchors, &frags, &factor, tol)?;
-    let block = if profiles.len() < MIN_PROFILES {
+    let mut block = if profiles.len() < MIN_PROFILES {
         warn!(
             anchors = anchors.len(),
             profiles = profiles.len(),
@@ -1021,6 +1206,20 @@ pub fn run(p: Q1CalParams) -> Result<()> {
             },
         )
     };
+    if p.fragment_decision && block["status"] == "fitted" {
+        let d = learn_decision(
+            p.ms2,
+            &sweep,
+            &anchors,
+            p.library_fragments,
+            &factor,
+            tol,
+            &block,
+        )?;
+        if let Some(obj) = block.as_object_mut() {
+            obj.insert("fragment_decision".into(), d);
+        }
+    }
     let mut cal: serde_json::Value = mumdia_io::json::read_json(p.out_cal)
         .with_context(|| format!("q1-calibrate: reading {}", p.out_cal))?;
     if let Some(obj) = cal.as_object_mut() {
@@ -1081,6 +1280,7 @@ mod tests {
             q_max: 0.01,
             frag_tol_fallback_ppm: 20.0,
             out_cal: cal,
+            fragment_decision: std::env::var("MUMDIA_BENCH_Q1CAL_DECISION").is_ok(),
         })
         .unwrap();
     }
@@ -1109,10 +1309,17 @@ mod tests {
         };
         let light = isotope_weights(&a, Frag { mz: 147.11, z: 1 });
         let heavy = isotope_weights(&a, Frag { mz: 1500.0, z: 1 });
-        let avg = averagine_isotopes(neutral(1000.0, 2), ISOTOPES);
+        let neutral = |mz: f64, z: i32| (mz - mumdia_core::constants::PROTON) * z as f64;
+        let avg = mumdia_core::constants::averagine_isotopes(neutral(1000.0, 2), q1frag::ISOTOPES);
         assert!(heavy[0] > light[0] && light[0] > avg[0] - 1e-12);
         assert!((light.iter().sum::<f64>() - 1.0).abs() < 1e-12);
-        let none = isotope_weights(&a, Frag { mz: PROTON, z: 1 });
+        let none = isotope_weights(
+            &a,
+            Frag {
+                mz: mumdia_core::constants::PROTON,
+                z: 1,
+            },
+        );
         for (x, y) in none.iter().zip(&avg) {
             assert!((x - y).abs() < 1e-12);
         }
@@ -1265,6 +1472,7 @@ mod tests {
             q_max: 0.01,
             frag_tol_fallback_ppm: 10.0,
             out_cal: &path("cal.json"),
+            fragment_decision: true,
         })
         .unwrap();
         let cal: serde_json::Value = mumdia_io::json::read_json(&path("cal.json")).unwrap();
@@ -1288,6 +1496,21 @@ mod tests {
             (h - hw).abs() < 0.1 && (e - step).abs() < 0.2,
             "h {h} e {e}"
         );
+        // The decision tolerances, learned on the same anchors under the fitted window: their
+        // three fragments are all theirs, so nearly every present one belongs, and the
+        // tolerances are a few tenths of a step.
+        let fd = &q["fragment_decision"];
+        let t = &fd["tolerances"];
+        let off = t["offset_steps"].as_f64().unwrap();
+        let cen = t["centre_steps"].as_f64().unwrap();
+        assert!((0.25..1.0).contains(&off), "{fd}");
+        assert!((0.25..1.0).contains(&cen), "{fd}");
+        assert!(t["corr2d_min"].as_f64().unwrap() > 0.5, "{fd}");
+        let b = fd["under_tolerances"]["belong_share"].as_f64().unwrap();
+        assert!(b > 0.85, "{fd}");
+        // Extract reads the same block back as its model.
+        let m = q1frag::model_from_calibration(q, true).unwrap();
+        assert_eq!(m.tolerances.offset_steps, off);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
