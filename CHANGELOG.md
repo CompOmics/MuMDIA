@@ -7,6 +7,13 @@ All notable changes to MuMDIA are recorded here. The format follows
 `0.1.0` is the first tagged release of the Rust engine. The superseded
 Python implementation remains available at the tag `legacy-python-v1`.
 
+`0.11.1` is a patch release that ships what `0.11.0` should have shipped. `0.11.0` was
+tagged but produced no binaries, because a new SQLite advisory failed the release gate.
+`0.11.1` patches the SQLite the engine uses to read timsTOF data and contains everything in
+`0.11.0`, whose notes below describe this release as well, plus the fixes listed under it:
+the desktop application's Normalisation choice now sits under "One experiment".
+Identifications and quantities are the same as with `0.11.0`.
+
 `0.11.0` is a minor rather than a patch release: every quantity changes under the default
 configuration while every identification stays the same. Quantification now centres its
 window on the elution profile, fits each precursor's fragments to their shared pattern,
@@ -165,7 +172,18 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
-## [Unreleased]
+## [0.11.1] - 2026-11-10
+
+### Changed
+
+- **CI takes less time per push (#302).** The `build + test` jobs only test: the shipped
+  profile is still built by the smoke job on Linux and Windows and, for every target, by the
+  release workflow before it publishes. Each job keeps its own dependency cache, keyed on the
+  toolchain as well as the lockfile, and `ci/ci_scope.sh` lets a job skip its steps when a
+  change touches nothing it checks while it still reports under its name, so the required
+  checks are unchanged. `cargo audit` and the desktop bundler are pinned and cached, the MSI
+  build is retried when only the bundler's download failed, and pushes to `main` no longer
+  cancel one another. Nothing that is built or shipped changes.
 
 ### Fixed
 
@@ -176,6 +194,7 @@ than a number. Both are recorded in every run's `manifest.json`.
   separately, indented as that option's settings, and shown and enabled only while One
   experiment is selected for several files. No normalisation setting is sent for separate
   searches, as before.
+
 ### Security
 
 - **RUSTSEC-2026-0459 (`libsqlite3-sys` 0.30.1, SQLite CVE-2026-119375) is fixed by patching
