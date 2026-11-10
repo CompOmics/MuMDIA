@@ -21,10 +21,15 @@
 //! [`spectra_has_im`] for a stage that reads converted spectra.
 //!
 //! The header is read as text, as `convert`'s declared spectrum count is: the instrument
-//! description sits in the first few KiB of every mzML, and mzdata does not expose the
-//! `referenceableParamGroup` an instrument configuration refers to. ThermoRawFileParser
-//! writes the model there (`MS:1003378` "Orbitrap Astral"), ProteoWizard `msconvert` in
-//! the same place or directly in the `instrumentConfiguration`.
+//! description precedes `<run>` (the first few KiB of a Thermo or Bruker mzML, 559 KB into
+//! a SCIEX MS Data Converter file), and mzdata does not expose the `referenceableParamGroup`
+//! an instrument configuration refers to. ThermoRawFileParser writes the model there
+//! (`MS:1003378` "Orbitrap Astral"), ProteoWizard `msconvert` in the same place or directly
+//! in the `instrumentConfiguration`, and the SCIEX MS Data Converter directly in the
+//! configuration (`MS:1003443` "ZenoTOF 8600"). Only the configurations and the groups they
+//! name are read: the same list holds the groups spectra refer to ([`parse_header`]).
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -41,9 +46,35 @@ const SERIAL_NUMBER: &str = "MS:1000529";
 /// instrument method.
 const CUSTOMIZATION: &str = "MS:1000032";
 
-/// How much of the file the header is looked for in. The instrument description precedes
-/// `<run>`; 1 MiB is what `convert` already reads for the spectrum count.
-const HEADER_BYTES: usize = 1 << 20;
+/// Spectrum-level terms, which describe a spectrum and never an instrument: "MS1 spectrum",
+/// "MSn spectrum", "ms level", "centroid spectrum", "profile spectrum", "negative scan",
+/// "positive scan", and the scan window limits. They live in the parameter groups a
+/// spectrum refers to, and the SCIEX MS Data Converter writes 1,328 such groups ahead of
+/// the instrument configuration, the first of them starting with "MS1 spectrum". Only the
+/// groups an instrument configuration refers to are read, so none of these should reach the
+/// model test; they are skipped all the same, for a converter that mixes the two.
+const SPECTRUM_TERMS: [&str; 9] = [
+    "MS:1000579",
+    "MS:1000580",
+    "MS:1000511",
+    "MS:1000127",
+    "MS:1000128",
+    "MS:1000129",
+    "MS:1000130",
+    "MS:1000500",
+    "MS:1000501",
+];
+
+/// How much of the file the header is looked for in, at most. The instrument description
+/// precedes `<run>`, which the read stops at. It sits in the first few KiB of a Thermo or
+/// Bruker mzML, but the SCIEX MS Data Converter writes two parameter groups per experiment
+/// of the method before it (559 KB into a 664-experiment ZT Scan DIA run), so a method
+/// with a few thousand experiments puts it past the 1 MiB `convert` reads for the spectrum
+/// count.
+const HEADER_BYTES: usize = 16 << 20;
+
+/// The header is read in pieces of this size, and the read stops at the first `<run`.
+const HEADER_STEP: usize = 1 << 20;
 
 /// The instrument model a file declares, and whether it lists an Astral analyzer.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,18 +181,25 @@ pub fn from_configurations<'a>(
 /// names no instrument.
 pub fn from_mzml(path: &str) -> Option<Instrument> {
     use std::io::Read as _;
-    let mut head = vec![0u8; HEADER_BYTES];
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut n = 0;
-    // `read` may return less than asked before the end of the file.
-    while n < head.len() {
-        match f.read(&mut head[n..]) {
+    let mut f = std::fs::File::open(path).ok()?.take(HEADER_BYTES as u64);
+    let mut head: Vec<u8> = Vec::with_capacity(HEADER_STEP);
+    let mut buf = vec![0u8; HEADER_STEP];
+    loop {
+        // `read` may return less than asked before the end of the file.
+        let k = match f.read(&mut buf) {
             Ok(0) => break,
-            Ok(k) => n += k,
+            Ok(k) => k,
             Err(_) => return None,
+        };
+        // A `<run` split across two reads is found once the second arrives: the search
+        // starts a few bytes before the new piece.
+        let from = head.len().saturating_sub(4);
+        head.extend_from_slice(&buf[..k]);
+        if head[from..].windows(4).any(|w| w == b"<run") {
+            break;
         }
     }
-    parse_header(&String::from_utf8_lossy(&head[..n]))
+    parse_header(&String::from_utf8_lossy(&head))
 }
 
 /// Which reader wrote a spectra artifact (`params.reader`).
@@ -259,9 +297,20 @@ pub fn recorded(spectra_path: &str) -> Option<Instrument> {
 
 /// Parse the instrument from the text of an mzML header.
 ///
-/// The model is the first cvParam of the `referenceableParamGroupList` or of an
-/// `instrumentConfiguration` outside its `componentList` (the source, analyzer and detector
-/// live there), other than the serial number.
+/// The model is the first cvParam of an `instrumentConfiguration`, read in document order
+/// from the configuration's own cvParams outside its `componentList` (the source, analyzer
+/// and detector live there) and from the `referenceableParamGroup`s it refers to, other
+/// than the serial number, a `customization` text and any spectrum-level term
+/// ([`SPECTRUM_TERMS`]). ThermoRawFileParser puts the model in a group the configuration
+/// refers to, msconvert and the SCIEX MS Data Converter in the configuration itself. When
+/// no configuration names one, the first such term of the parameter group list is taken,
+/// which is where tdf2mzml writes a timsTOF model without referring to it.
+///
+/// Until 2026-11-10 the first cvParam of the WHOLE `referenceableParamGroupList` was taken
+/// before any configuration was looked at. That list also holds the groups spectra refer
+/// to, and on a SCIEX MS Data Converter file it is 1,328 of them ahead of the
+/// configuration, so the instrument read as "MS1 spectrum (MS:1000579)" instead of
+/// "ZenoTOF 8600 (MS:1003443)".
 pub fn parse_header(text: &str) -> Option<Instrument> {
     // Only the header: nothing after `<run` describes the instrument.
     let text = match text.find("<run") {
@@ -269,33 +318,111 @@ pub fn parse_header(text: &str) -> Option<Instrument> {
         None => text,
     };
     let mut inst = Instrument::default();
-    let mut regions: Vec<&str> = Vec::new();
-    if let Some(r) = element_body(text, "referenceableParamGroupList") {
-        regions.push(r);
-    }
-    let configs = element_body(text, "instrumentConfigurationList");
-    if let Some(c) = configs {
-        inst.astral_analyzer = c.contains(&format!("\"{ASTRAL_ANALYZER}\""));
-        regions.push(c);
-    }
-    for region in regions {
-        let stripped = strip_elements(region, "componentList");
-        for param in stripped.split("<cvParam").skip(1) {
-            let end = param.find('>').unwrap_or(param.len());
-            let tag = &param[..end];
-            let accession = attr(tag, "accession").unwrap_or_default();
-            if accession == SERIAL_NUMBER || accession.is_empty() {
-                continue;
-            }
+    let configs = element_body(text, "instrumentConfigurationList").unwrap_or("");
+    inst.astral_analyzer = configs.contains(&format!("\"{ASTRAL_ANALYZER}\""));
+    // The parameter groups in document order, and by id for the configurations' references.
+    let group_list: Vec<(&str, &str)> = element_body(text, "referenceableParamGroupList")
+        .map(|list| elements(list, "referenceableParamGroup"))
+        .unwrap_or_default();
+    let groups: BTreeMap<String, &str> = group_list
+        .iter()
+        .filter_map(|&(tag, body)| Some((attr(tag, "id")?, body)))
+        .collect();
+    let model = |tag: &str| -> Option<(String, String)> {
+        let accession = attr(tag, "accession").unwrap_or_default();
+        let skip = accession.is_empty()
+            || accession == SERIAL_NUMBER
+            || accession == CUSTOMIZATION
+            || SPECTRUM_TERMS.contains(&accession.as_str());
+        (!skip).then(|| (accession, attr(tag, "name").unwrap_or_default()))
+    };
+    let found = elements(configs, "instrumentConfiguration")
+        .into_iter()
+        .find_map(|(_, config)| {
+            let own = strip_elements(config, "componentList");
+            config_params(&own, &groups).into_iter().find_map(model)
+        })
+        // A group no configuration refers to: tdf2mzml writes the timsTOF model in a
+        // `CommonInstrumentParams` group and never names it. The first instrument term of
+        // the list, in document order, as before 2026-11-10, minus the spectrum terms.
+        .or_else(|| {
+            group_list
+                .iter()
+                .find_map(|&(_, body)| cv_params(body).into_iter().find_map(model))
+        });
+    match found {
+        Some((accession, name)) => {
             inst.accession = accession;
-            inst.name = attr(tag, "name").unwrap_or_default();
-            return Some(inst);
+            inst.name = name;
+            Some(inst)
         }
+        None => inst.astral_analyzer.then_some(inst),
     }
-    if inst.astral_analyzer {
-        return Some(inst);
+}
+
+/// The inside of every `<cvParam ...>` tag of a configuration body, in document order, with
+/// each `<referenceableParamGroupRef ref="..."/>` replaced by the cvParams of that group.
+/// A reference to a group the header does not define contributes nothing.
+fn config_params<'a>(body: &'a str, groups: &BTreeMap<String, &'a str>) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find('<') {
+        rest = &rest[at + 1..];
+        let end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..end];
+        if let Some(inner) = tag.strip_prefix("cvParam") {
+            out.push(inner);
+        } else if let Some(inner) = tag.strip_prefix("referenceableParamGroupRef") {
+            if let Some(group) = attr(inner, "ref").and_then(|id| groups.get(&id)) {
+                out.extend(cv_params(group));
+            }
+        }
+        rest = &rest[end..];
     }
-    None
+    out
+}
+
+/// The inside of every `<cvParam ...>` tag of `text`, in document order.
+fn cv_params(text: &str) -> Vec<&str> {
+    text.split("<cvParam")
+        .skip(1)
+        .map(|p| &p[..p.find('>').unwrap_or(p.len())])
+        .collect()
+}
+
+/// Every `<name ...>...</name>` element of `text`, not nested: the inside of its opening
+/// tag and its body (empty for a self-closing `<name .../>`). `name` must be followed by
+/// whitespace, `>` or `/`, so `instrumentConfiguration` does not match
+/// `instrumentConfigurationList`, nor `referenceableParamGroup` its `Ref`.
+fn elements<'a>(text: &'a str, name: &str) -> Vec<(&'a str, &'a str)> {
+    let (open, close) = (format!("<{name}"), format!("</{name}>"));
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(&open) {
+        let after = &rest[at + open.len()..];
+        let boundary = after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_whitespace() || c == '>' || c == '/');
+        if !boundary {
+            rest = after;
+            continue;
+        }
+        let Some(tag_end) = after.find('>') else {
+            break;
+        };
+        let tag = &after[..tag_end];
+        let body_start = &after[tag_end + 1..];
+        if tag.ends_with('/') {
+            out.push((tag, ""));
+            rest = body_start;
+            continue;
+        }
+        let body_end = body_start.find(&close).unwrap_or(body_start.len());
+        out.push((tag, &body_start[..body_end]));
+        rest = &body_start[(body_end + close.len()).min(body_start.len())..];
+    }
+    out
 }
 
 /// The text between `<name ...>` and `</name>`, or `None`.
@@ -418,6 +545,162 @@ mod tests {
         let i = parse_header(t).unwrap();
         assert_eq!(i.accession, "MS:1000122");
         assert!(!i.is_astral());
+    }
+
+    /// The SCIEX MS Data Converter 2.0.1.0 (SCIEX OS 5.0) header of a ZT Scan DIA run on a
+    /// ZenoTOF 8600, abridged: two parameter groups per experiment of the method (1,328 in
+    /// the real file, 559 KB of them), every one a spectrum's, ahead of the instrument
+    /// configuration, which carries the model itself and refers to no group.
+    fn sciex_header(experiments: usize) -> String {
+        let mut groups = String::new();
+        for e in 1..=experiments {
+            let (term, level, lo) = if e == 1 {
+                ("MS:1000579\" name=\"MS1 spectrum", 1, 400)
+            } else {
+                ("MS:1000580\" name=\"MSn spectrum", 2, 140)
+            };
+            groups.push_str(&format!(
+                r#"
+      <referenceableParamGroup id="sample1experiment{e}SpectrumParams">
+        <cvParam cvRef="MS" accession="{term}" />
+        <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="{level}" />
+        <cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum" />
+        <cvParam cvRef="MS" accession="MS:1000130" name="positive scan" />
+      </referenceableParamGroup>
+      <referenceableParamGroup id="sample1experiment{e}ScanWindowParams">
+        <cvParam cvRef="MS" accession="MS:1000501" name="scan window lower limit" unitAccession="MS:1000040" unitCvRef="MS" unitName="m/z" value="{lo}" />
+        <cvParam cvRef="MS" accession="MS:1000500" name="scan window upper limit" unitAccession="MS:1000040" unitCvRef="MS" unitName="m/z" value="1750" />
+      </referenceableParamGroup>"#
+            ));
+        }
+        format!(
+            r#"<?xml version="1.0" encoding="iso-8859-1"?>
+<indexedmzML xmlns="http://psi.hupo.org/ms/mzml">
+  <mzML version="1.1.0">
+    <fileDescription>
+      <fileContent>
+        <cvParam cvRef="MS" accession="MS:1000579" name="MS1 spectrum" />
+        <cvParam cvRef="MS" accession="MS:1000580" name="MSn spectrum" />
+      </fileContent>
+    </fileDescription>
+    <referenceableParamGroupList count="{n}">{groups}
+    </referenceableParamGroupList>
+    <softwareList count="2">
+      <software version="5.0.0.1539" id="SCIEXsoftware">
+        <cvParam cvRef="MS" accession="MS:1003446" name="SCIEX OS" />
+      </software>
+      <software version="2.0.1.0" id="SCIEXMSDataConverter">
+        <cvParam cvRef="MS" accession="MS:1003447" name="SCIEX MS Data Converter" />
+      </software>
+    </softwareList>
+    <instrumentConfigurationList count="1">
+      <instrumentConfiguration id="instrumentConfiguration1">
+        <cvParam cvRef="MS" accession="MS:1003443" name="ZenoTOF 8600" />
+        <cvParam cvRef="MS" accession="MS:1000529" name="instrument serial number" value="FR20062502PL" />
+        <componentList count="3">
+          <source order="1"><cvParam cvRef="MS" accession="MS:1000008" name="ionization type" /></source>
+          <analyzer order="2"><cvParam cvRef="MS" accession="MS:1000084" name="time-of-flight" /></analyzer>
+          <detector order="3"><cvParam cvRef="MS" accession="MS:1000117" name="analog-digital converter" /></detector>
+        </componentList>
+        <softwareRef ref="SCIEXsoftware" />
+      </instrumentConfiguration>
+    </instrumentConfigurationList>
+    <run defaultInstrumentConfigurationRef="instrumentConfiguration1" id="run1">
+      <spectrumList defaultDataProcessingRef="dataProcessing1" count="2150032">"#,
+            n = 2 * experiments
+        )
+    }
+
+    #[test]
+    fn a_sciex_ms_data_converter_header_names_the_zenotof_not_a_spectrum_term() {
+        // 664 experiments, as the ZT Scan DIA method (1 MS1 + 663 Q1 bins): 1,328 groups.
+        let t = sciex_header(664);
+        assert!(t.matches("<referenceableParamGroup ").count() == 1328);
+        let i = parse_header(&t).unwrap();
+        assert_eq!(i.accession, "MS:1003443");
+        assert_eq!(i.name, "ZenoTOF 8600");
+        assert!(!i.astral_analyzer && !i.is_astral());
+    }
+
+    #[test]
+    fn a_header_past_one_mebibyte_is_still_read() {
+        // A method with 3,000 experiments puts the configuration about 2.5 MB in.
+        let t = sciex_header(3000);
+        assert!(t.find("<instrumentConfigurationList").unwrap() > 1 << 20);
+        let dir = std::env::temp_dir().join(format!("mumdia_instr_big_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.mzML");
+        // The spectra follow the header; the read stops at `<run`.
+        let mut body = t.clone();
+        body.push_str(&"<spectrum/>".repeat(100_000));
+        std::fs::write(&path, body).unwrap();
+        let i = from_mzml(path.to_str().unwrap()).unwrap();
+        assert_eq!(i.name, "ZenoTOF 8600");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spectrum_groups_a_configuration_does_not_name_are_not_read() {
+        // ThermoRawFileParser's shape, with a spectrum group FIRST in the list: the model
+        // still comes from the group the configuration refers to.
+        let t = TRFP_ASTRAL.replace(
+            r#"<referenceableParamGroupList count="1">"#,
+            r#"<referenceableParamGroupList count="2">
+      <referenceableParamGroup id="spectrumGroup">
+        <cvParam cvRef="MS" accession="MS:1000579" name="MS1 spectrum" />
+      </referenceableParamGroup>"#,
+        );
+        let i = parse_header(&t).unwrap();
+        assert_eq!(i.accession, ORBITRAP_ASTRAL);
+        // A configuration that refers to a spectrum group skips its spectrum terms.
+        let t = r#"<referenceableParamGroupList count="2">
+          <referenceableParamGroup id="s"><cvParam cvRef="MS" accession="MS:1000580" name="MSn spectrum" />
+            <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2" /></referenceableParamGroup>
+          <referenceableParamGroup id="i"><cvParam cvRef="MS" accession="MS:1002533" name="TripleTOF 6600" /></referenceableParamGroup>
+        </referenceableParamGroupList>
+        <instrumentConfigurationList count="1"><instrumentConfiguration id="IC1">
+          <referenceableParamGroupRef ref="s"/><referenceableParamGroupRef ref="i"/>
+        </instrumentConfiguration></instrumentConfigurationList><run id="x">"#;
+        let i = parse_header(t).unwrap();
+        assert_eq!(i.accession, "MS:1002533");
+        assert_eq!(i.name, "TripleTOF 6600");
+    }
+
+    #[test]
+    fn a_model_in_a_group_no_configuration_names_is_still_found() {
+        // tdf2mzml 0.3 on a timsTOF Pro diaPASEF run, abridged.
+        let t = r#"<referenceableParamGroupList count="1">
+          <referenceableParamGroup id="CommonInstrumentParams">
+            <cvParam cvRef="PSI-MS" accession="MS:1000122" name="Bruker Daltonics instrument model" value=""/>
+          </referenceableParamGroup>
+        </referenceableParamGroupList>
+        <instrumentConfigurationList count="1"><instrumentConfiguration id="IC1">
+          <cvParam cvRef="PSI-MS" accession="MS:1000529" name="instrument serial number" value="1854399.193"/>
+          <userParam name="dia_window" value="{'Group': 1, 'mz_center': 813.0, 'width': 26.0}"/>
+          <componentList count="1"><analyzer order="2"><cvParam cvRef="PSI-MS" accession="MS:1000084" name="time-of-flight" value=""/></analyzer></componentList>
+        </instrumentConfiguration></instrumentConfigurationList><run id="x">"#;
+        let i = parse_header(t).unwrap();
+        assert_eq!(i.accession, "MS:1000122");
+    }
+
+    #[test]
+    fn msconvert_writes_the_sciex_model_in_the_configuration() {
+        // ProteoWizard 3.0.23339 (ABI reader) on a TripleTOF 6600 Scanning SWATH run.
+        let t = r#"<softwareList count="2"><software id="Analyst" version="unknown">
+            <cvParam cvRef="MS" accession="MS:1000551" name="Analyst" value=""/></software></softwareList>
+          <instrumentConfigurationList count="1">
+            <instrumentConfiguration id="IC1">
+              <cvParam cvRef="MS" accession="MS:1002533" name="TripleTOF 6600" value=""/>
+              <cvParam cvRef="MS" accession="MS:1000529" name="instrument serial number" value="BR20921502"/>
+              <componentList count="4">
+                <source order="1"><cvParam cvRef="MS" accession="MS:1000073" name="electrospray ionization" value=""/></source>
+                <analyzer order="2"><cvParam cvRef="MS" accession="MS:1000081" name="quadrupole" value=""/></analyzer>
+              </componentList>
+              <softwareRef ref="Analyst"/>
+            </instrumentConfiguration>
+          </instrumentConfigurationList><run id="x">"#;
+        let i = parse_header(t).unwrap();
+        assert_eq!(i.accession, "MS:1002533");
     }
 
     #[test]
