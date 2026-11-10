@@ -2145,6 +2145,33 @@ pub struct ExtractConfig {
     /// changes whether the stage runs, not what it computes.
     #[serde(skip_serializing)]
     pub max_footprint_gib: Option<f64>,
+    /// Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with
+    /// `convert.isolation_half_width`): sum a candidate's matches in the Q1 bins of one cycle
+    /// into one chromatogram point, placed at the bin whose target is nearest its precursor
+    /// m/z, instead of keeping every bin a point of its own. The about five bins that
+    /// transmit a precursor are 1.3 ms apart, so without it the traces interleave them, each
+    /// at its own transmission. Refused on any other isolation layout and on spectra that
+    /// carry 1/K0. Default false. Benchmark-gated (docs/09_extract.md, "Scanning-quadrupole
+    /// data"). Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub q1_cycles: bool,
+    /// Scanning-quadrupole spectra: write each accepted candidate's Q1-profile evidence
+    /// (psms_extracted v5): how the matched fragment intensity of its apex cycles is spread
+    /// over the Q1 bins that cover its precursor, against the trapezoid the quadrupole's
+    /// window, swept across a bin, transmits a precursor at that m/z with. `q1_corr` is their
+    /// Pearson correlation, `q1_offset` the shift of the observed centroid from the expected
+    /// one in half-widths, `q1_frag_sd` the spread of the fragments' own centroids in
+    /// half-widths, `q1_bin_frac` the share of covering bins with signal. A fragment shared
+    /// with a precursor at another m/z pulls its centroid that way. `features.q1_features`
+    /// gives them to the classifier. Refused as `q1_cycles` is. Default false.
+    /// Benchmark-gated. Omitted from the canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub q1_profile: bool,
+    /// Reject a candidate whose Q1-profile centroid is further than this many half-widths
+    /// from the expected one (`|q1_offset|`). Needs `q1_profile`. Unset: no gate. Must be
+    /// finite and > 0. Benchmark-gated. Omitted from the canonical configuration while unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q1_gate_max_offset: Option<f64>,
     pub fixed_scan_window: usize,
     pub frag_tol_ppm: f64,
     pub prec_tol_ppm: f64,
@@ -2491,6 +2518,9 @@ impl Default for ExtractConfig {
         Self {
             windows_in_flight: None,
             max_footprint_gib: None,
+            q1_cycles: false,
+            q1_profile: false,
+            q1_gate_max_offset: None,
             fixed_scan_window: 2,
             frag_tol_ppm: 20.0,
             prec_tol_ppm: 3.0,
@@ -2700,6 +2730,13 @@ pub struct FeaturesConfig {
     /// (docs/35_diapasef.md). Omitted from the canonical configuration at its default.
     #[serde(skip_serializing_if = "ImFeatures::is_off")]
     pub im_features: ImFeatures,
+    /// The Q1-profile family of scanning-quadrupole spectra: `q1_corr`, `q1_offset`,
+    /// `q1_frag_sd` and `q1_bin_frac` from psms_extracted v5 (`extract.q1_profile`, which it
+    /// needs), appended after every other column of the `extended` set. Default false.
+    /// Benchmark-gated (docs/09_extract.md, "Scanning-quadrupole data"). Omitted from the
+    /// canonical configuration at its default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub q1_features: bool,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -2721,6 +2758,7 @@ impl Default for FeaturesConfig {
             ms1_precursor_features: false, // opt-in; overlaps ms1_isotope_cosine_apex
             chrom_loaders: 3,
             im_features: ImFeatures::Off,
+            q1_features: false,
         }
     }
 }
@@ -5717,6 +5755,29 @@ impl Config {
                 "convert.tdf_mz_ppm must be finite and > 0, and convert.tdf_min_points >= 1".into(),
             ));
         }
+        let ex = &self.extract;
+        if let Some(g) = ex.q1_gate_max_offset {
+            if !(g.is_finite() && g > 0.0) {
+                return Err(Invalid(format!(
+                    "extract.q1_gate_max_offset must be finite and > 0 (got {g}), in \
+                     half-widths of the Q1 window"
+                )));
+            }
+            if !ex.q1_profile {
+                return Err(Invalid(
+                    "extract.q1_gate_max_offset gates on the Q1-profile evidence, which only \
+                     extract.q1_profile computes; set it as well"
+                        .into(),
+                ));
+            }
+        }
+        if self.features.q1_features && !ex.q1_profile {
+            return Err(Invalid(
+                "features.q1_features reads the Q1-profile columns that extract.q1_profile \
+                 writes; set it as well"
+                    .into(),
+            ));
+        }
         if let Some(h) = cv.isolation_half_width {
             if !(h.is_finite() && h > 0.0) {
                 return Err(Invalid(format!(
@@ -7182,6 +7243,35 @@ mod tests {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }
         assert!(Config::from_json(r#"{"convert":{"bruker_reader":"native"}}"#).is_err());
+    }
+
+    /// The scanning-quadrupole keys change what extract and features write, so a set value
+    /// is part of the configuration's identity; at their defaults they are omitted.
+    #[test]
+    fn the_q1_keys_leave_the_default_config_hash_alone() {
+        let canon = Config::default().canonical_json();
+        assert!(!canon.contains("q1_"), "{canon}");
+        let on = Config::from_json(
+            r#"{"extract":{"q1_cycles":true,"q1_profile":true,"q1_gate_max_offset":0.5},
+                "features":{"q1_features":true}}"#,
+        )
+        .unwrap();
+        let c = on.canonical_json();
+        for key in [
+            r#""q1_cycles":true"#,
+            r#""q1_profile":true"#,
+            r#""q1_gate_max_offset":0.5"#,
+            r#""q1_features":true"#,
+        ] {
+            assert!(c.contains(key), "{key}");
+        }
+        for bad in [
+            r#"{"extract":{"q1_gate_max_offset":0.5}}"#,
+            r#"{"extract":{"q1_profile":true,"q1_gate_max_offset":0}}"#,
+            r#"{"features":{"q1_features":true}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+        }
     }
 
     /// `convert.isolation_half_width` changes the spectra, so a set value is part of the

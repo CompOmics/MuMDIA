@@ -1725,6 +1725,315 @@ fn window_groups(lib: &Library, scans: &[Ms2Scan]) -> Vec<WinGroup> {
         .collect()
 }
 
+/// Fewest distinct isolation windows a scanning-quadrupole layout has (a ZT Scan DIA method
+/// writes 663), the widest median step between consecutive window targets, in m/z (0.76
+/// there; the narrowest fixed-window methods step 2), and how much wider than the step a
+/// window must be (3.8 against 0.76 there): the windows of a sweep overlap. The thresholds
+/// of `convert`'s scanning-quadrupole diagnosis.
+const Q1_MIN_WINDOWS: usize = 50;
+const Q1_MAX_STEP: f64 = 1.5;
+const Q1_MIN_OVERLAP: f64 = 1.5;
+/// Cycles on each side of the apex cycle the Q1 profile reads: the five cycles around it, as
+/// the window gates read the apex +-2 scans.
+const Q1_PROFILE_CYCLES: u32 = 2;
+
+/// The Q1 sweep of scanning-quadrupole spectra (`extract.q1_cycles`, `extract.q1_profile`):
+/// every distinct isolation window is one Q1 bin, the windows in [`WindowKey`] order (by
+/// lower m/z), and a cycle is one sweep over them.
+///
+/// Cycles are read off the scans in acquisition (RT) order: a new cycle starts where a bin's
+/// target falls back by more than half a step below the bin before it, which is where the
+/// sweep restarts. Each window has at most one scan in a cycle; a second one in the same
+/// cycle (which a regular sweep never writes) starts a new cycle as well.
+struct Q1Layout {
+    /// Window index of every scan.
+    scan_win: Vec<u32>,
+    /// Cycle of every scan.
+    scan_cycle: Vec<u32>,
+    n_cycles: usize,
+    /// Per window: lower and upper m/z and target.
+    win: Vec<(f64, f64, f64)>,
+    /// `win_scan[w * n_cycles + c]`: the scan of window `w` in cycle `c`, `u32::MAX` where it
+    /// has none.
+    win_scan: Vec<u32>,
+    /// Per window, the RT of its scans, ascending.
+    win_rts: Vec<Vec<f64>>,
+    /// Median step between consecutive targets, and the widest window, m/z.
+    step: f64,
+    max_width: f64,
+}
+
+/// What [`Q1Layout::build`] found when the windows are not a scanning quadrupole's.
+fn q1_layout_refusal(n: usize, step: f64, width: f64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "extract: extract.q1_cycles and extract.q1_profile model a scanning quadrupole (SCIEX \
+         ZT Scan DIA read with convert.isolation_half_width): at least {Q1_MIN_WINDOWS} \
+         overlapping isolation windows whose targets step less than {Q1_MAX_STEP} m/z. These \
+         spectra have {n} windows, a median step of {step:.4} m/z and a median width of \
+         {width:.4} m/z; unset both keys for them"
+    )
+}
+
+impl Q1Layout {
+    fn build(scans: &[Ms2Scan]) -> Result<Q1Layout> {
+        let mut keys: BTreeMap<WindowKey, u32> = BTreeMap::new();
+        for s in scans {
+            keys.entry(s.window.key()).or_insert(0);
+        }
+        let mut win: Vec<(f64, f64, f64)> = Vec::with_capacity(keys.len());
+        for (i, (_, v)) in keys.iter_mut().enumerate() {
+            *v = i as u32;
+        }
+        // The target of a window is the target of its first scan.
+        let mut seen = vec![false; keys.len()];
+        win.resize(keys.len(), (0.0, 0.0, 0.0));
+        let scan_win: Vec<u32> = scans
+            .iter()
+            .map(|s| {
+                let w = keys[&s.window.key()];
+                if !seen[w as usize] {
+                    seen[w as usize] = true;
+                    win[w as usize] = (s.window.lower_mz, s.window.upper_mz, s.window.target_mz);
+                }
+                w
+            })
+            .collect();
+        let median = |mut v: Vec<f64>| -> f64 {
+            v.sort_by(f64::total_cmp);
+            v.get(v.len() / 2).copied().unwrap_or(0.0)
+        };
+        let step = median(win.windows(2).map(|p| p[1].2 - p[0].2).collect());
+        let width = median(win.iter().map(|w| w.1 - w.0).collect());
+        if win.len() < Q1_MIN_WINDOWS
+            || !(step > 0.0 && step < Q1_MAX_STEP)
+            || width < Q1_MIN_OVERLAP * step
+        {
+            return Err(q1_layout_refusal(win.len(), step, width));
+        }
+        let max_width = win.iter().map(|w| w.1 - w.0).fold(0.0f64, f64::max);
+        // Cycles, in acquisition order (the loaders sort the scans by RT).
+        let mut scan_cycle = vec![0u32; scans.len()];
+        let mut in_cycle = vec![u32::MAX; win.len()];
+        let mut cycle = 0u32;
+        let mut prev_target = f64::NEG_INFINITY;
+        for si in 0..scans.len() {
+            let w = scan_win[si] as usize;
+            let t = win[w].2;
+            if (si > 0 && t < prev_target - 0.5 * step) || in_cycle[w] == cycle {
+                cycle += 1;
+            }
+            in_cycle[w] = cycle;
+            scan_cycle[si] = cycle;
+            prev_target = t;
+        }
+        let n_cycles = if scans.is_empty() {
+            0
+        } else {
+            cycle as usize + 1
+        };
+        let mut win_scan = vec![u32::MAX; win.len() * n_cycles];
+        let mut win_rts: Vec<Vec<f64>> = vec![Vec::new(); win.len()];
+        for (si, s) in scans.iter().enumerate() {
+            let (w, c) = (scan_win[si] as usize, scan_cycle[si] as usize);
+            win_scan[w * n_cycles + c] = si as u32;
+            win_rts[w].push(s.rt_seconds);
+        }
+        Ok(Q1Layout {
+            scan_win,
+            scan_cycle,
+            n_cycles,
+            win,
+            win_scan,
+            win_rts,
+            step,
+            max_width,
+        })
+    }
+
+    /// The windows whose m/z range covers `pm`, ascending.
+    fn covering(&self, pm: f64) -> Vec<u32> {
+        let s = self.win.partition_point(|w| w.0 < pm - self.max_width);
+        let e = self.win.partition_point(|w| w.0 <= pm);
+        (s..e)
+            .filter(|&w| self.win[w].0 <= pm && pm <= self.win[w].1)
+            .map(|w| w as u32)
+            .collect()
+    }
+
+    /// The covering window whose target is nearest `pm` (the lower on a tie): where a
+    /// candidate's cycle points sit.
+    fn anchor_for(&self, pm: f64, cover: &[u32]) -> Option<u32> {
+        cover.iter().copied().min_by(|&a, &b| {
+            let da = (self.win[a as usize].2 - pm).abs();
+            let db = (self.win[b as usize].2 - pm).abs();
+            da.total_cmp(&db).then(a.cmp(&b))
+        })
+    }
+
+    /// The share of a precursor at `pm` a bin transmits: a window of half-width `h` swept
+    /// over one step `s` during the bin passes it whole while `|pm - target| <= h - s / 2`,
+    /// not at all beyond `h + s / 2`, and linearly in between.
+    fn transmission(&self, w: u32, pm: f64) -> f64 {
+        let (lo, hi, t) = self.win[w as usize];
+        let h = 0.5 * (hi - lo);
+        let d = (pm - t).abs();
+        let s = self.step;
+        if d <= h - 0.5 * s {
+            1.0
+        } else if d >= h + 0.5 * s {
+            0.0
+        } else {
+            (h + 0.5 * s - d) / s
+        }
+    }
+}
+
+/// A candidate's hits with its Q1 bins of one cycle summed into one point
+/// (`extract.q1_cycles`): each hit moves to the scan of window `anchor` in its own cycle, the
+/// intensities of one fragment at one point are summed (in f64, in hit order, so the sum is
+/// deterministic), and its observed m/z is their intensity-weighted mean. A hit in a cycle
+/// where the anchor window has no scan, which a regular sweep has only at its ends, is
+/// dropped. The result is ascending in scan, then fragment.
+fn q1_merge(hits: &[Hit], layout: &Q1Layout, anchor: u32) -> Vec<Hit> {
+    let base = anchor as usize * layout.n_cycles;
+    let mut keyed: Vec<(u32, u16, usize)> = hits
+        .iter()
+        .enumerate()
+        .filter_map(|(i, h)| {
+            let c = layout.scan_cycle[h.scan as usize] as usize;
+            let rep = layout.win_scan[base + c];
+            (rep != u32::MAX).then_some((rep, h.frag, i))
+        })
+        .collect();
+    keyed.sort_by_key(|&(rep, frag, i)| (rep, frag, i));
+    let mut out: Vec<Hit> = Vec::with_capacity(keyed.len());
+    let mut k = 0;
+    while k < keyed.len() {
+        let (rep, frag, _) = keyed[k];
+        let (mut sum, mut wmz) = (0.0f64, 0.0f64);
+        let first_mz = hits[keyed[k].2].obs_mz;
+        while k < keyed.len() && keyed[k].0 == rep && keyed[k].1 == frag {
+            let h = &hits[keyed[k].2];
+            sum += h.inten as f64;
+            wmz += h.inten as f64 * h.obs_mz as f64;
+            k += 1;
+        }
+        out.push(Hit {
+            scan: rep,
+            frag,
+            inten: sum as f32,
+            obs_mz: if sum > 0.0 {
+                (wmz / sum) as f32
+            } else {
+                first_mz
+            },
+            im: 0,
+        });
+    }
+    out
+}
+
+/// The Q1-profile evidence of one row (`extract.q1_profile`, psms_extracted v5). Zero for a
+/// row without signal in its apex cycles.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Q1Profile {
+    /// Pearson correlation, over the covering windows, of the matched intensity in each and
+    /// the transmission expected for the precursor.
+    corr: f64,
+    /// Observed minus expected intensity-weighted centroid of the window targets, in
+    /// half-widths of the Q1 window.
+    offset: f64,
+    /// Intensity-weighted spread of the fragments' own centroids around the observed one, in
+    /// half-widths.
+    frag_sd: f64,
+    /// Share of the covering windows with signal.
+    bin_frac: f64,
+}
+
+/// [`Q1Profile`] from a candidate's unmerged hits over the cycles `c0 - 2 ..= c0 + 2`.
+fn q1_profile_of(hits: &[Hit], layout: &Q1Layout, cover: &[u32], pm: f64, c0: u32) -> Q1Profile {
+    if cover.is_empty() {
+        return Q1Profile::default();
+    }
+    let (lo_c, hi_c) = (c0.saturating_sub(Q1_PROFILE_CYCLES), c0 + Q1_PROFILE_CYCLES);
+    let mut per_win = vec![0.0f64; cover.len()];
+    // Per fragment: summed intensity and intensity-weighted target. An ordered map, so the
+    // spread is summed in fragment order.
+    let mut per_frag: BTreeMap<u16, (f64, f64)> = BTreeMap::new();
+    for h in hits {
+        let si = h.scan as usize;
+        let c = layout.scan_cycle[si];
+        if c < lo_c || c > hi_c {
+            continue;
+        }
+        let w = layout.scan_win[si];
+        let Ok(k) = cover.binary_search(&w) else {
+            continue;
+        };
+        let (v, t) = (h.inten as f64, layout.win[w as usize].2);
+        per_win[k] += v;
+        let e = per_frag.entry(h.frag).or_default();
+        e.0 += v;
+        e.1 += v * t;
+    }
+    let expected: Vec<f64> = cover.iter().map(|&w| layout.transmission(w, pm)).collect();
+    let targets: Vec<f64> = cover.iter().map(|&w| layout.win[w as usize].2).collect();
+    let total: f64 = per_win.iter().sum();
+    let e_total: f64 = expected.iter().sum();
+    if total <= 0.0 || e_total <= 0.0 {
+        return Q1Profile::default();
+    }
+    let half = {
+        let a = layout.anchor_for(pm, cover).unwrap_or(cover[0]) as usize;
+        0.5 * (layout.win[a].1 - layout.win[a].0)
+    };
+    let centroid: f64 = per_win
+        .iter()
+        .zip(&targets)
+        .map(|(v, t)| v * t)
+        .sum::<f64>()
+        / total;
+    let expected_centroid: f64 = expected
+        .iter()
+        .zip(&targets)
+        .map(|(v, t)| v * t)
+        .sum::<f64>()
+        / e_total;
+    let corr = if cover.len() >= 3 {
+        let r = crate::stats::pearson(&per_win, &expected);
+        if r.is_finite() {
+            r
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    let (mut ss, mut sw) = (0.0f64, 0.0f64);
+    for &(v, vt) in per_frag.values() {
+        if v > 0.0 {
+            let d = vt / v - centroid;
+            ss += v * d * d;
+            sw += v;
+        }
+    }
+    let frag_sd = if sw > 0.0 && half > 0.0 {
+        (ss / sw).sqrt() / half
+    } else {
+        0.0
+    };
+    Q1Profile {
+        corr,
+        offset: if half > 0.0 {
+            (centroid - expected_centroid) / half
+        } else {
+            0.0
+        },
+        frag_sd,
+        bin_frac: per_win.iter().filter(|&&v| v > 0.0).count() as f64 / cover.len() as f64,
+    }
+}
+
 /// Bytes a fragment-peak match costs while a probing task holds it: the 16-byte [`Hit`]
 /// and its 4-byte candidate id, which the task keeps beside it until it groups its hits.
 const FOOTPRINT_HIT_BYTES: f64 = 20.0;
@@ -3114,10 +3423,10 @@ fn decode_unlent(p: &ExtractParams) -> Result<(Option<Vec<Ms2Scan>>, Option<Vec<
 /// 1/K0 evidence (`ms1_apex_im`), else v2 (`artifact::psms_extracted`). Read from the
 /// parquet footer, so an orchestrator records the version the stage actually wrote.
 pub fn psms_schema(path: &str) -> Result<(&'static str, u32)> {
-    let has_im = mumdia_io::table::column_names(path)?
-        .iter()
-        .any(|c| c == "ms1_apex_im");
-    Ok(artifact::psms_extracted(has_im))
+    let cols = mumdia_io::table::column_names(path)?;
+    let has_im = cols.iter().any(|c| c == "ms1_apex_im");
+    let q1 = cols.iter().any(|c| c == "q1_corr");
+    Ok(artifact::psms_extracted_q1(has_im, q1))
 }
 
 /// The apex 1/K0 of every row of a `psms_extracted` table that has one, keyed by
@@ -3405,6 +3714,8 @@ struct CandOut {
     deconv_shadow: f32,
     /// The 1/K0 evidence (psms_extracted v4); all `None` on 3D data.
     im: ApexIm,
+    /// The Q1-profile evidence (psms_extracted v5, `extract.q1_profile`); zero otherwise.
+    q1: Q1Profile,
     /// (cid, frag_name, frag_mz, frag_obs_mz, predicted_intensity, rt, intensity, im)
     chrom: Vec<ChromOutputRow>,
     /// Top-K retained peak groups (sensitivity_plan P1.1/P1.2), populated only
@@ -3468,6 +3779,8 @@ struct PsmRows {
     deconv_share: Vec<f32>,
     deconv_collin: Vec<f32>,
     deconv_shadow: Vec<f32>,
+    /// One per row under `extract.q1_profile`, empty otherwise.
+    q1: Vec<Q1Profile>,
 }
 
 impl PsmRows {
@@ -3521,6 +3834,9 @@ impl PsmRows {
             self.deconv_share.push(r.deconv_share);
             self.deconv_collin.push(r.deconv_collin);
             self.deconv_shadow.push(r.deconv_shadow);
+        }
+        if cfg.q1_profile {
+            self.q1.push(r.q1);
         }
     }
 
@@ -3626,6 +3942,16 @@ impl PsmRows {
                 "shadow_kept_frac".into(),
                 take(&mut self.deconv_shadow),
             ));
+        }
+        // psms_extracted v5: the Q1-profile evidence, appended last, only under
+        // `extract.q1_profile`.
+        if cfg.q1_profile {
+            let q1 = take(&mut self.q1);
+            let col = |f: fn(&Q1Profile) -> f64| -> Vec<f64> { q1.iter().map(f).collect() };
+            cols.push(Col::F64("q1_corr".into(), col(|q| q.corr)));
+            cols.push(Col::F64("q1_offset".into(), col(|q| q.offset)));
+            cols.push(Col::F64("q1_frag_sd".into(), col(|q| q.frag_sd)));
+            cols.push(Col::F64("q1_bin_frac".into(), col(|q| q.bin_frac)));
         }
         cols
     }
@@ -3966,6 +4292,28 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     };
     // The per-point 1/K0 of the traces is written only on 4D data with a consumer on.
     let chrom_im = has_im && p.chrom_im;
+    // Scanning-quadrupole spectra (`extract.q1_cycles`, `extract.q1_profile`): the Q1 sweep,
+    // read off the scans' isolation windows. With both keys off nothing below reads it.
+    let q1_layout: Option<Q1Layout> = if p.cfg.q1_cycles || p.cfg.q1_profile {
+        if has_im {
+            anyhow::bail!(
+                "extract: extract.q1_cycles and extract.q1_profile model a scanning quadrupole, \
+                 and these spectra carry 1/K0 (diaPASEF); unset both keys for them"
+            );
+        }
+        let l = Q1Layout::build(scans)?;
+        info!(
+            windows = l.win.len(),
+            cycles = l.n_cycles,
+            step_mz = l.step,
+            q1_cycles = p.cfg.q1_cycles,
+            q1_profile = p.cfg.q1_profile,
+            "extract: scanning-quadrupole layout"
+        );
+        Some(l)
+    } else {
+        None
+    };
 
     // Isolation-window -> sorted scan RTs, for zero-filled chromatogram grids. An ordered
     // map on the window key ([`IsolationWindow::key`]), so the windows come out ascending
@@ -4409,7 +4757,25 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             // the co-elution run see MISSING acquisition scans (count 0, and they
             // break a run) rather than only scans that happened to carry a hit. When
             // no covering-window grid is available, fall back to the sparse groups.
-            let grid: Vec<f64> = if !windows.is_empty() {
+            // Merged cycles (`extract.q1_cycles`): one point a cycle, at the anchor window's
+            // scans, which every merged hit sits on.
+            let q1_grid = match (&q1_layout, p.cfg.q1_cycles && !windows.is_empty()) {
+                (Some(l), true) => {
+                    let pm = lib.prec_mz[cid as usize];
+                    l.anchor_for(pm, &l.covering(pm)).map(|a| {
+                        let rts = &l.win_rts[a as usize];
+                        let (i, j) = (
+                            rts.partition_point(|&r| r < lo),
+                            rts.partition_point(|&r| r <= hi),
+                        );
+                        rts[i..j].to_vec()
+                    })
+                }
+                _ => None,
+            };
+            let grid: Vec<f64> = if let Some(g) = q1_grid {
+                g
+            } else if !windows.is_empty() {
                 let pm = lib.prec_mz[cid as usize];
                 // `windows` is sorted by lower m/z, so a covering window has
                 // `lower_mz <= pm` AND, since its width is at most `window_max_width`,
@@ -4493,6 +4859,37 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             (&mut inner[..], Some(hits))
         } else {
             (hits, None)
+        };
+        // Scanning-quadrupole spectra: the windows covering the precursor, its anchor bin, the
+        // unmerged hits the Q1 profile reads, and under `q1_cycles` the merged hits every
+        // score and trace below reads instead.
+        let q1_cover: Vec<u32> = match &q1_layout {
+            Some(l) => l.covering(lib.prec_mz[cid as usize]),
+            None => Vec::new(),
+        };
+        let q1_anchor = q1_layout
+            .as_ref()
+            .and_then(|l| l.anchor_for(lib.prec_mz[cid as usize], &q1_cover));
+        let q1_raw: Vec<Hit> = if p.cfg.q1_profile {
+            hits.to_vec()
+        } else {
+            Vec::new()
+        };
+        let mut q1_merged: Vec<Hit>;
+        let mut q1_merged_pad: Vec<Hit>;
+        let (hits, padded_hits): (&mut [Hit], Option<&mut [Hit]>) = match (&q1_layout, q1_anchor) {
+            (Some(l), Some(a)) if p.cfg.q1_cycles => {
+                q1_merged = q1_merge(hits, l, a);
+                let pad = match padded_hits {
+                    Some(h) => {
+                        q1_merged_pad = q1_merge(h, l, a);
+                        Some(&mut q1_merged_pad[..])
+                    }
+                    None => None,
+                };
+                (&mut q1_merged[..], pad)
+            }
+            _ => (hits, padded_hits),
         };
         // distinct matched fragments (tier b), as a bitmask over the candidate's local
         // fragment ordinals rather than a sorted, deduplicated `u16` per hit.
@@ -4931,6 +5328,39 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             }
         }
 
+        // The Q1-profile evidence of a row with its apex at `rt` (`extract.q1_profile`): the
+        // cycle of the unmerged hit nearest the apex, and the unmerged hits of the five cycles
+        // around it. Zero with the key off.
+        let q1_at = |rt: f64| -> Q1Profile {
+            match &q1_layout {
+                Some(l) if p.cfg.q1_profile => {
+                    let c0 = q1_raw
+                        .iter()
+                        .min_by(|a, b| {
+                            (hit_rt(scans, a) - rt)
+                                .abs()
+                                .total_cmp(&(hit_rt(scans, b) - rt).abs())
+                        })
+                        .map(|h| l.scan_cycle[h.scan as usize]);
+                    match c0 {
+                        Some(c0) => {
+                            q1_profile_of(&q1_raw, l, &q1_cover, lib.prec_mz[cid as usize], c0)
+                        }
+                        None => Q1Profile::default(),
+                    }
+                }
+                _ => Q1Profile::default(),
+            }
+        };
+        let q1_0 = q1_at(apex_rt);
+        // The Q1 gate (`extract.q1_gate_max_offset`): the profile's centroid too far from
+        // where the precursor m/z puts it.
+        if let Some(g) = p.cfg.q1_gate_max_offset {
+            if q1_0.offset.abs() > g {
+                return Vec::new();
+            }
+        }
+
         // Diagnostic scores (all four metrics, for the offline gate-metric
         // comparison). Computed and emitted ONLY when `emit_gate_diagnostics` is set,
         // so the default psms.parquet schema and per-candidate compute are unchanged
@@ -5257,6 +5687,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             deconv_collin: deconv_collin as f32,
             deconv_shadow: deconv_shadow as f32,
             im: im0,
+            q1: q1_0,
             chrom: chrom_rows,
             peaks,
         };
@@ -5350,6 +5781,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 deconv_collin: 0.0,
                 deconv_shadow: 0.0,
                 im: im_at(alt_apex_rt),
+                q1: q1_at(alt_apex_rt),
                 chrom: Vec::new(), // shared per-candidate via the rank-0 row
                 peaks: Vec::new(),
             });
@@ -5756,7 +6188,11 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     let n_chrom = chrom_written.rows;
     let mut written: Vec<Written> = Vec::with_capacity(2);
     for (path, schema, file) in [
-        (p.out_psms, artifact::psms_extracted(has_im), psms_written),
+        (
+            p.out_psms,
+            artifact::psms_extracted_q1(has_im, p.cfg.q1_profile),
+            psms_written,
+        ),
         (
             p.out_chrom,
             artifact::chromatograms(chrom_layout.version(), chrom_im),
@@ -5784,6 +6220,18 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             if let Some(obj) = params.as_object_mut() {
                 obj.insert("reader".into(), json!(crate::instrument::READER_TIMSRUST));
                 obj.insert("im_gate".into(), json!(im_gate));
+            }
+        }
+        // The scanning-quadrupole keys, only when one is on, so a report without them is
+        // unchanged.
+        if let Some(l) = &q1_layout {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert("q1_cycles".into(), json!(p.cfg.q1_cycles));
+                obj.insert("q1_profile".into(), json!(p.cfg.q1_profile));
+                obj.insert("q1_gate_max_offset".into(), json!(p.cfg.q1_gate_max_offset));
+                obj.insert("q1_windows".into(), json!(l.win.len()));
+                obj.insert("q1_cycles_found".into(), json!(l.n_cycles));
+                obj.insert("q1_step_mz".into(), json!(l.step));
             }
         }
         // The support gate, only when it is on, so a report without it is unchanged.
@@ -7030,6 +7478,7 @@ mod psms_stream_tests {
                 ms1_apex_im: (!i.is_multiple_of(6)).then_some(0.9 - f * 1e-5),
                 im_pred_cal: (!i.is_multiple_of(13)).then_some(1.0 + f * 1e-6),
             },
+            q1: Q1Profile::default(),
             chrom: Vec::new(),
             peaks: Vec::new(),
         }
@@ -7313,5 +7762,192 @@ mod run_windows_f32_tests {
         assert_eq!(a.im_cal.as_ref().unwrap()[1], None);
         assert_eq!(b.im_cal.as_ref().unwrap()[1], None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod q1_tests {
+    use super::*;
+    use mumdia_core::types::{IsolationWindow, Peak};
+
+    const STEP: f64 = 0.7614;
+    const HW: f64 = 1.9;
+
+    fn target(b: usize) -> f64 {
+        394.256 + STEP * b as f64
+    }
+
+    /// `cycles` sweeps of `bins` ZT Scan bins (targets `STEP` apart, +-`HW`), 1 s a cycle,
+    /// the bins 1.3 ms apart, in acquisition order.
+    fn sweep(cycles: usize, bins: usize) -> Vec<Ms2Scan> {
+        let mut out = Vec::new();
+        for c in 0..cycles {
+            for b in 0..bins {
+                let t = target(b);
+                out.push(Ms2Scan {
+                    scan_index: out.len() as u32,
+                    rt_seconds: c as f64 + 0.0013 * b as f64,
+                    window: IsolationWindow {
+                        target_mz: t,
+                        lower_mz: t - HW,
+                        upper_mz: t + HW,
+                        im_lower: None,
+                        im_upper: None,
+                    },
+                    peaks: vec![Peak {
+                        mz: 500.0,
+                        intensity: 1.0,
+                    }],
+                    im: None,
+                });
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_sweep_is_recognised_and_its_cycles_counted() {
+        let scans = sweep(4, 60);
+        let l = Q1Layout::build(&scans).unwrap();
+        assert_eq!(l.win.len(), 60);
+        assert_eq!(l.n_cycles, 4);
+        assert!((l.step - STEP).abs() < 1e-9);
+        for (si, &c) in l.scan_cycle.iter().enumerate() {
+            assert_eq!(c as usize, si / 60);
+            assert_eq!(l.scan_win[si] as usize, si % 60);
+        }
+        // Every window has one scan a cycle, its own.
+        for w in 0..60 {
+            for c in 0..4 {
+                assert_eq!(l.win_scan[w * 4 + c] as usize, c * 60 + w);
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_windows_are_refused() {
+        // 40 windows of 25 m/z: a fixed-window method.
+        let mut scans = Vec::new();
+        for c in 0..3 {
+            for w in 0..40 {
+                let t = 412.5 + 25.0 * w as f64;
+                scans.push(Ms2Scan {
+                    scan_index: scans.len() as u32,
+                    rt_seconds: 3.0 * c as f64 + 0.05 * w as f64,
+                    window: IsolationWindow {
+                        target_mz: t,
+                        lower_mz: t - 12.5,
+                        upper_mz: t + 12.5,
+                        im_lower: None,
+                        im_upper: None,
+                    },
+                    peaks: Vec::new(),
+                    im: None,
+                });
+            }
+        }
+        let e = Q1Layout::build(&scans).err().expect("refused").to_string();
+        assert!(e.contains("40 windows"), "{e}");
+    }
+
+    #[test]
+    fn covering_anchor_and_transmission() {
+        let l = Q1Layout::build(&sweep(2, 60)).unwrap();
+        let pm = target(20) + 0.1;
+        let cover = l.covering(pm);
+        // +-1.9 m/z around 0.7614 m/z steps: five bins, 18 to 22.
+        assert_eq!(cover, vec![18, 19, 20, 21, 22]);
+        assert_eq!(l.anchor_for(pm, &cover), Some(20));
+        // Whole transmission at the centre, a ramp at the edges, nothing beyond.
+        assert_eq!(l.transmission(20, pm), 1.0);
+        let edge = l.transmission(18, pm);
+        assert!(edge > 0.0 && edge < 1.0, "{edge}");
+        assert_eq!(l.transmission(10, pm), 0.0);
+    }
+
+    fn hit(scan: usize, frag: u16, inten: f32, mz: f32) -> Hit {
+        Hit {
+            scan: scan as u32,
+            frag,
+            inten,
+            obs_mz: mz,
+            im: 0,
+        }
+    }
+
+    #[test]
+    fn the_bins_of_one_cycle_merge_into_the_anchor_point() {
+        let l = Q1Layout::build(&sweep(3, 60)).unwrap();
+        // Fragment 0 in bins 19, 20, 21 of cycle 1 and bin 20 of cycle 2; fragment 1 in bin 18
+        // of cycle 1.
+        let s = |c: usize, b: usize| c * 60 + b;
+        let hits = vec![
+            hit(s(1, 19), 0, 1.0, 300.0),
+            hit(s(1, 20), 0, 2.0, 300.2),
+            hit(s(1, 21), 0, 1.0, 300.0),
+            hit(s(1, 18), 1, 5.0, 400.0),
+            hit(s(2, 20), 0, 3.0, 300.0),
+        ];
+        let m = q1_merge(&hits, &l, 20);
+        assert_eq!(m.len(), 3);
+        assert_eq!(
+            (m[0].scan as usize, m[0].frag, m[0].inten),
+            (s(1, 20), 0, 4.0)
+        );
+        assert!((m[0].obs_mz - 300.1).abs() < 1e-4, "{}", m[0].obs_mz);
+        assert_eq!(
+            (m[1].scan as usize, m[1].frag, m[1].inten),
+            (s(1, 20), 1, 5.0)
+        );
+        assert_eq!(
+            (m[2].scan as usize, m[2].frag, m[2].inten),
+            (s(2, 20), 0, 3.0)
+        );
+    }
+
+    #[test]
+    fn the_profile_centres_on_its_own_precursor_and_off_on_a_neighbour() {
+        let l = Q1Layout::build(&sweep(5, 60)).unwrap();
+        let pm = target(20);
+        let cover = l.covering(pm);
+        let s = |c: usize, b: usize| c * 60 + b;
+        // Own precursor: intensity across the covering bins as the transmission has it.
+        let own: Vec<Hit> = cover
+            .iter()
+            .map(|&w| {
+                hit(
+                    s(2, w as usize),
+                    0,
+                    100.0 * l.transmission(w, pm) as f32,
+                    300.0,
+                )
+            })
+            .collect();
+        let q = q1_profile_of(&own, &l, &cover, pm, 2);
+        assert!(q.corr > 0.99, "{q:?}");
+        assert!(q.offset.abs() < 1e-9, "{q:?}");
+        assert_eq!(q.bin_frac, 1.0);
+        // A fragment shared with a precursor 1.5 m/z higher: its signal sits in the upper
+        // bins, so the centroid moves up by most of a half-width.
+        let other = pm + 1.5;
+        let shared: Vec<Hit> = cover
+            .iter()
+            .map(|&w| {
+                hit(
+                    s(2, w as usize),
+                    0,
+                    100.0 * l.transmission(w, other) as f32,
+                    300.0,
+                )
+            })
+            .collect();
+        let q = q1_profile_of(&shared, &l, &cover, pm, 2);
+        assert!(q.offset > 0.3, "{q:?}");
+        // Hits outside the five cycles around the apex cycle are not read.
+        assert_eq!(q1_profile_of(&own, &l, &cover, pm, 0).bin_frac, 1.0);
+        assert_eq!(
+            q1_profile_of(&own, &l, &cover, pm, 4 + Q1_PROFILE_CYCLES as u32 + 1),
+            Q1Profile::default()
+        );
     }
 }

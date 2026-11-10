@@ -69,6 +69,10 @@ pub mod artifact {
     /// and meaning are the IM branch's v4; v3 (`apex_im` filled alone) is never written. A
     /// 3D extract writes v2, byte for byte. Readers select columns by name.
     pub const PSMS_EXTRACTED_V4: (&str, u32) = ("psms_extracted", 4);
+    /// v5, written only under `extract.q1_profile` (scanning-quadrupole spectra, which carry
+    /// no 1/K0): v2 plus the Q1-profile evidence `q1_corr`, `q1_offset`, `q1_frag_sd` and
+    /// `q1_bin_frac` (Float64), appended last. Readers select columns by name.
+    pub const PSMS_EXTRACTED_V5: (&str, u32) = ("psms_extracted", 5);
     /// v1: every row stores its whole `rt` axis and its whole `intensity` trace.
     pub const CHROMATOGRAMS: (&str, u32) = ("chromatograms", 1);
     /// v2, the default (`extract.chromatogram_schema = 2`): the axis once per candidate
@@ -242,6 +246,16 @@ pub mod artifact {
         }
     }
 
+    /// [`psms_extracted`], or [`PSMS_EXTRACTED_V5`] when the table carries the Q1-profile
+    /// evidence (`q1`), which extract refuses on spectra with 1/K0.
+    pub fn psms_extracted_q1(has_im: bool, q1: bool) -> (&'static str, u32) {
+        if q1 && !has_im {
+            PSMS_EXTRACTED_V5
+        } else {
+            psms_extracted(has_im)
+        }
+    }
+
     /// The seed schema a search writes: [`SEED_PSMS_V2`] when the searched spectra carry
     /// per-peak 1/K0, else [`SEED_PSMS`].
     /// `run_windows` v1 (Float64), or v2 under `rt_im_train.run_windows_f32`.
@@ -301,6 +315,9 @@ mod tests {
         assert_eq!(psms_extracted(false), PSMS_EXTRACTED);
         assert_eq!(psms_extracted(false), ("psms_extracted", 2));
         assert_eq!(psms_extracted(true), ("psms_extracted", 4));
+        assert_eq!(psms_extracted_q1(false, false), ("psms_extracted", 2));
+        assert_eq!(psms_extracted_q1(false, true), ("psms_extracted", 5));
+        assert_eq!(psms_extracted_q1(true, false), ("psms_extracted", 4));
         assert_eq!(chromatograms(1, false), CHROMATOGRAMS);
         assert_eq!(chromatograms(2, false), CHROMATOGRAMS_V2);
         assert_eq!(chromatograms(1, true), ("chromatograms", 3));
