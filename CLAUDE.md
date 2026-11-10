@@ -141,6 +141,17 @@ Key semantics:
   decided by a read-only probe of `analysis.tdf`): `convert` reads it natively and
   keeps the 1/K0 (`docs/35_diapasef.md`); every other Bruker `.d` goes to
   msconvert.
+- SCIEX ZT Scan DIA (scanning quadrupole) as the SCIEX MS Data Converter writes
+  it carries each Q1 bin's target and no window offsets. `convert` refuses an MS2
+  target without offsets once the file names more than one (it used to read them
+  as one all-ion window, and extract then grew past 521 GB) and names the
+  scanning-quadrupole layout; `convert.isolation_half_width` (half the Q1 window,
+  1.9 for 3.8 m/z; unset and hash-neutral by default) reads each bin as
+  `[target - h, target + h]`, byte-identical to a rewrite that adds the offsets.
+  msconvert 3.0.25036 writes such a `.wiff2` with no precursor at all, which only
+  extract's footprint guard (`extract.max_footprint_gib`, auto = the machine's
+  memory) stops. The engine does not model the Q1 sweep across bins;
+  `docs/04_convert.md` "SCIEX ZT Scan DIA" has the measured recipe.
 - An imported library row with an empty `protein` is grouped as `UNASSIGNED` at
   load, with a warning that counts the rows (DIA-NN writes the iRT-kit standards
   without a protein); `scripts/import_diann_lib.py` writes the same group at

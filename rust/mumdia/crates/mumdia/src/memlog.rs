@@ -48,9 +48,82 @@ pub fn report(what: &str, parts: &[(&str, usize)]) {
     );
 }
 
+/// The machine's physical memory in bytes, or the cgroup limit when a container imposes a
+/// smaller one; `None` when it cannot be read. The ceiling `extract.max_footprint_gib`
+/// falls back to when it is unset.
+///
+/// The workspace forbids `unsafe` and has no `sysinfo` dependency, so this reads
+/// `/proc/meminfo` (and the cgroup v2 `memory.max`) on Linux and asks the platform's own
+/// tool elsewhere: `sysctl -n hw.memsize` on macOS, Windows PowerShell's
+/// `Win32_ComputerSystem.TotalPhysicalMemory` on Windows, as `storage::free_space` asks for
+/// free space. A tool that is missing or refuses gives `None`.
+pub fn total_memory() -> Option<u64> {
+    if cfg!(target_os = "linux") {
+        let total = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|m| parse_meminfo_total(&m));
+        let limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        return match (total, limit) {
+            (Some(t), Some(l)) => Some(t.min(l)),
+            (t, _) => t,
+        };
+    }
+    let out = if cfg!(windows) {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[uint64](Get-CimInstance -ClassName Win32_ComputerSystem).TotalPhysicalMemory",
+            ])
+            .output()
+            .ok()?
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?
+    } else {
+        return None;
+    };
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|&b| b > 0)
+}
+
+/// `MemTotal` of `/proc/meminfo`, in bytes.
+fn parse_meminfo_total(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meminfo_total_is_read_in_bytes() {
+        assert_eq!(
+            parse_meminfo_total("MemTotal:       16318408 kB\nMemFree: 1 kB\n"),
+            Some(16318408 * 1024)
+        );
+        assert_eq!(parse_meminfo_total("MemFree: 1 kB\n"), None);
+    }
+
+    #[test]
+    fn the_machine_memory_is_readable_here() {
+        // Every platform CI and the fleet run on answers; the value only has to be sane.
+        let b = total_memory().expect("physical memory is readable");
+        assert!(b > (256 << 20), "{b}");
+    }
 
     #[test]
     fn nested_counts_spine_and_values() {

@@ -485,6 +485,23 @@ pub struct ConvertConfig {
     /// `false` restores the unfiltered MS1.
     #[serde(skip_serializing_if = "is_true")]
     pub tdf_ms1_denoise: bool,
+    /// Half-width in m/z of the quadrupole isolation window, for MS2 spectra that name an
+    /// isolation window target but no lower or upper offset. Unset (the default), such a
+    /// spectrum is refused when the file has more than one distinct target, because the
+    /// m/z range it isolated is unknown (docs/04_convert.md, "SCIEX ZT Scan DIA").
+    ///
+    /// Set, each such spectrum is read as the window `[target - h, target + h]`, computed in
+    /// the same f32 arithmetic the mzML reader applies to explicit offsets, so a file with
+    /// offsets of `h` and the same file without them read with `h` give the same windows.
+    /// The case it is for is SCIEX ZT Scan DIA (scanning-quadrupole DIA) as the SCIEX MS
+    /// Data Converter writes it: every Q1 bin of a cycle is a spectrum carrying only its
+    /// target, and `h` is half of the method's Q1 window (1.9 for a 3.8 m/z window). On a
+    /// ZenoTOF 8600 K562 run, 1.5, 1.9 and 2.3 were equal within one-seed noise. Spectra
+    /// that carry offsets keep them. Must be finite and > 0; omitted from the canonical
+    /// configuration while unset, so it changes no config hash then, and recorded in the
+    /// spectra reports (`params.isolation_half_width`) when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation_half_width: Option<f64>,
 }
 impl Default for ConvertConfig {
     fn default() -> Self {
@@ -504,6 +521,7 @@ impl Default for ConvertConfig {
             tdf_im_valley: 0.0,
             tdf_im_smooth_scans: 8.0,
             tdf_ms1_denoise: true,
+            isolation_half_width: None,
         }
     }
 }
@@ -2102,6 +2120,31 @@ pub struct ExtractConfig {
     /// settings.
     #[serde(default)]
     pub windows_in_flight: Option<usize>,
+    /// Refuse an extraction whose hit store is estimated, before anything is probed, to
+    /// hold more than this many GiB at once. Unset (the default) is `auto`: the machine's
+    /// physical memory (the cgroup limit when a container sets a smaller one), checked only
+    /// once the estimate passes 4 GiB, and no check when the memory cannot be read. `0`
+    /// turns the check off; a number is a ceiling of your own. Under `groups.parallel` each
+    /// band in flight gets its share of the ceiling.
+    ///
+    /// The estimate is the stage's largest structure, the fragment-peak matches each window
+    /// collects, for the windows held at once: a batch of `windows_in_flight` on the
+    /// streamed path, the whole run under a two-pass peak claim, the contested features or
+    /// the bucketed matcher. Per window it sums, over (a sample of) the candidates the
+    /// window reaches, their fragments times the peaks of the window's scans inside their
+    /// RT (and 1/K0) windows times the chance that a peak falls within the fragment
+    /// tolerance, with the peaks spread evenly over the log m/z span of the scans, at 20
+    /// bytes a match. It is an order-of-magnitude estimate, logged on every run
+    /// (`extract: estimated hit store`), not a prediction of the peak RSS.
+    ///
+    /// The case it exists for is an all-ion layout: spectra whose isolation window is the
+    /// whole m/z range, so that every spectrum reaches every candidate and nothing can be
+    /// written before the end of the run. A SCIEX ZT Scan DIA run converted without
+    /// isolation offsets was such a layout (one window, 2.15 million spectra) and grew past
+    /// 521 GB in extract before it was killed. Not part of the canonical configuration: it
+    /// changes whether the stage runs, not what it computes.
+    #[serde(skip_serializing)]
+    pub max_footprint_gib: Option<f64>,
     pub fixed_scan_window: usize,
     pub frag_tol_ppm: f64,
     pub prec_tol_ppm: f64,
@@ -2447,6 +2490,7 @@ impl Default for ExtractConfig {
     fn default() -> Self {
         Self {
             windows_in_flight: None,
+            max_footprint_gib: None,
             fixed_scan_window: 2,
             frag_tol_ppm: 20.0,
             prec_tol_ppm: 3.0,
@@ -5556,6 +5600,10 @@ impl Config {
                 "rescore.max_feature_matrix_gib",
                 self.rescore.max_feature_matrix_gib,
             ),
+            (
+                "extract.max_footprint_gib",
+                self.extract.max_footprint_gib.unwrap_or(0.0),
+            ),
             ("rescore.train_neg_ratio", self.rescore.train_neg_ratio),
             ("rescore.train_subsample", self.rescore.train_subsample),
         ] {
@@ -5668,6 +5716,15 @@ impl Config {
             return Err(Invalid(
                 "convert.tdf_mz_ppm must be finite and > 0, and convert.tdf_min_points >= 1".into(),
             ));
+        }
+        if let Some(h) = cv.isolation_half_width {
+            if !(h.is_finite() && h > 0.0) {
+                return Err(Invalid(format!(
+                    "convert.isolation_half_width must be finite and > 0 (got {h}): it is \
+                     half the quadrupole isolation window in m/z, for example 1.9 for the \
+                     3.8 m/z Q1 window of a ZT Scan DIA method"
+                )));
+            }
         }
         if !(frac(cv.tdf_mz_valley)
             && frac(cv.tdf_im_valley)
@@ -7125,6 +7182,34 @@ mod tests {
             assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
         }
         assert!(Config::from_json(r#"{"convert":{"bruker_reader":"native"}}"#).is_err());
+    }
+
+    /// `convert.isolation_half_width` changes the spectra, so a set value is part of the
+    /// configuration's identity; unset it is omitted, so every existing configuration keeps
+    /// its hash. `extract.max_footprint_gib` only decides whether extract runs, so it is
+    /// never part of it.
+    #[test]
+    fn the_ztscan_keys_leave_the_default_config_hash_alone() {
+        let d = Config::default();
+        let canon = d.canonical_json();
+        assert!(!canon.contains("isolation_half_width"), "{canon}");
+        assert!(!canon.contains("max_footprint_gib"), "{canon}");
+        let hw = Config::from_json(r#"{"convert":{"isolation_half_width":1.9}}"#).unwrap();
+        assert_eq!(hw.convert.isolation_half_width, Some(1.9));
+        assert!(hw
+            .canonical_json()
+            .contains(r#""isolation_half_width":1.9"#));
+        let fp = Config::from_json(r#"{"extract":{"max_footprint_gib":64}}"#).unwrap();
+        assert_eq!(fp.extract.max_footprint_gib, Some(64.0));
+        assert_eq!(fp.canonical_json(), canon);
+        assert!(Config::from_json(r#"{"extract":{"max_footprint_gib":0}}"#).is_ok());
+        for bad in [
+            r#"{"convert":{"isolation_half_width":0}}"#,
+            r#"{"convert":{"isolation_half_width":-1.9}}"#,
+            r#"{"extract":{"max_footprint_gib":-1}}"#,
+        ] {
+            assert!(Config::from_json(bad).is_err(), "{bad} must be refused");
+        }
     }
 
     /// The cross-run quant keys are omitted from the canonical configuration at their

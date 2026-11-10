@@ -190,21 +190,33 @@ reader plus four table writes.
    matching, f32 m/z (~7 significant digits) is adequate for observed peaks;
    library/theoretical m/z stay f64.
 
-6. **Isolation window and precursor resolution** (`convert.rs:136-148`): read
-   `spec.precursor()` and clone its `isolation_window`. If a real window is
-   present (not both bounds zero), use `(target, lower_bound, upper_bound)`
-   (`convert.rs:139-141`); mzdata exposes these three window fields as `f32`, and
-   each is widened with `as f64` before storage, so the stored window columns are
-   f64 even though the source precision is f32. Otherwise, the AIF / all-ion path
-   synthesizes a
-   full-range window `(target=0.0, lower=0.0, upper=1.0e6)` (`convert.rs:142-143`).
-   This `_` arm fires both when the quadrupole reported a zero-width window
-   (AIF/all-ion acquisition) and when there is no precursor at all, so any MS2
-   with no usable window is treated as covering the entire m/z range. The
-   downstream `IsolationWindow::covers` (inclusive on both bounds) then returns
-   true for every fragment (`types.rs:27`). The precursor m/z and charge come from
-   the first precursor ion
-   or are `None` (`convert.rs:145-148`). Window synthesis and precursor extraction
+6. **Isolation window and precursor resolution** (`isolation_bounds`): read
+   `spec.precursor()` and its `isolation_window`. mzdata resolves the offsets against
+   the target in f32 (`lower = target - lower offset`) and exposes the three fields as
+   `f32`; each is widened with `as f64` before storage, so the stored window columns
+   are f64 even though the source precision is f32. Four cases:
+   - **Offsets present** (not both bounds zero): `(target, lower_bound, upper_bound)`.
+   - **No isolation**: no precursor, no target, or "no isolation" (`MS:1003159`). The
+     all-ion path synthesizes the full-range window `(target=0.0, lower=0.0,
+     upper=1.0e6)` (`ALL_ION_WINDOW`), so the spectrum covers the entire m/z range and
+     the downstream `IsolationWindow::covers` (inclusive on both bounds) returns true
+     for every fragment (`types.rs:27`).
+   - **A target and no offsets, with `convert.isolation_half_width = h`**: the window
+     `[target - h, target + h]`, computed in the same f32 arithmetic mzdata applies to
+     explicit offsets, so a file with offsets of `h` and the same file without them read
+     with `h` give the same windows bit for bit (`the_half_width_reproduces_explicit_offsets`).
+     Offsets a spectrum carries win over the key.
+   - **A target and no offsets, without the key**: written as the all-ion window, as
+     every such spectrum was until 2026-11-10, and counted by `Fold` (`TargetOnly`). A
+     file whose target-only spectra name more than one target is refused, once 10,000
+     of them have been seen (`TARGET_ONLY_SAMPLE`) or at the end of the file, and the
+     refusal says whether the targets look like a scanning quadrupole (section "SCIEX ZT
+     Scan DIA" below). A file in which they all name the same target keeps the all-ion
+     reading, with a warning: that is what an all-ion acquisition recording a nominal
+     target looks like, and it is the one case the previous reading cannot be told
+     apart from.
+
+   The precursor m/z and charge come from the first precursor ion or are `None`. Window synthesis and precursor extraction
    are independent code paths: a scan that reports a zero-width window but still
    carries a precursor ion gets the synthesized full-range window
    (`window_target = 0.0`) together with a non-null `precursor_mz`/
@@ -330,10 +342,12 @@ acquisition does not inflate them.
 
 ## Configuration
 
-For an mzML, convert reads no `Config` field: the `config_hash` it receives is only
-recorded for provenance, `config_hash = blake3(cfg.canonical_json() + separators +
-caps)`, so the config's canonical JSON is embedded in the hash even though no field
-alters the output. The native diaPASEF reader reads the seven `convert.tdf_*` keys
+For an mzML, convert reads one `Config` field, `convert.isolation_half_width` (unset by
+default; step 6 above and "SCIEX ZT Scan DIA" below). It is omitted from the canonical
+configuration while unset, and recorded in the spectra reports as
+`params.isolation_half_width` when set. The `config_hash` convert receives is recorded
+for provenance, `config_hash = blake3(cfg.canonical_json() + separators + caps)`, so the
+config's canonical JSON is embedded in the hash. The native diaPASEF reader reads the seven `convert.tdf_*` keys
 (`TdfParams::from_config`): the centroiding tolerance, gap and floor, and the two valley
 splits with their smoothing (docs/35_diapasef.md, section 2). Each is omitted from the
 canonical configuration at its default, so the config hash of a configuration that
@@ -382,10 +396,18 @@ only.
 
 ### The instrument record
 
-`convert` reads the instrument model from the mzML header (`instrument.rs`): the first
-cvParam of the `referenceableParamGroupList` or of an `instrumentConfiguration` outside its
-`componentList`, other than the serial number, and whether any configuration lists the
-Astral analyzer (`MS:1003379`). Every spectra report carries it as `params.instrument`
+`convert` reads the instrument model from the mzML header (`instrument.rs`, read up to
+`<run>`, at most 16 MiB): the first cvParam of an `instrumentConfiguration`, from its own
+cvParams outside its `componentList` and the `referenceableParamGroup`s it refers to, in
+document order, other than the serial number, a `customization` text and any
+spectrum-level term (MS1/MSn spectrum, ms level, centroid/profile, polarity, scan window
+limits); when no configuration names one, the first such term of the group list (where
+tdf2mzml writes a timsTOF model without referring to it); and whether any configuration
+lists the Astral analyzer (`MS:1003379`). Until 2026-11-10 the first cvParam of the whole
+group list was taken first. That list also holds the groups spectra refer to, and the
+SCIEX MS Data Converter writes 1,328 of them ahead of the configuration, so a ZenoTOF 8600
+run read as "MS1 spectrum (MS:1000579)". One header of each of the 17 mzML layouts of the
+benchmark collection reads the same as before; only that one changed. Every spectra report carries it as `params.instrument`
 (`{accession, name, astral_analyzer}`, or `null` when the header names no model), and the
 log says what was found. Settings left to the engine are resolved from this record, so a
 standalone `extract` on converted spectra and every orchestrator agree. One setting uses it
@@ -393,7 +415,9 @@ today: `extract.apex_count_window = "auto"`, 1 on an Orbitrap Astral (`MS:100337
 name containing "Astral", or the Astral analyzer) and 5 elsewhere. Spectra converted
 before the record existed resolve as "not an Astral". Measured headers: ThermoRawFileParser
 1.4.5 writes `MS:1003378` "Orbitrap Astral" and `MS:1002877` "Q Exactive HF-X"; Bruker
-timsTOF mzML names only `MS:1000122` "Bruker Daltonics instrument model".
+timsTOF mzML names only `MS:1000122` "Bruker Daltonics instrument model"; msconvert writes
+`MS:1002533` "TripleTOF 6600" and `MS:1003293` "ZenoTOF 7600", the SCIEX MS Data Converter
+`MS:1003443` "ZenoTOF 8600".
 
 ### Choosing `--top-peaks-ms2`
 
@@ -490,11 +514,14 @@ to 2,286,840 (12.2x) and extract wall clock from 57.9 s to 91.9 s.
   still advance the range-derived counter (`convert.rs:120`), so the MS1 and MS2 tables
   have unique but non-contiguous indices. Do not assume contiguity; use
   `ms2_to_ms1.parquet` to relate MS2 to its parent MS1.
-- **AIF and no-precursor collapse to the same full-range window.** The `_` arm at
-  `convert.rs:143` handles both a zero-width reported window (AIF/all-ion) and a
-  missing precursor. If a future non-AIF format reports a genuinely absent window,
-  it will be silently treated as full-range. `window_target = 0.0` is the marker
-  for a synthesized window.
+- **AIF and no-precursor collapse to the same full-range window.** No precursor, no
+  target and "no isolation" all give the full-range window. A format that reports no
+  window at all is therefore treated as full-range: ProteoWizard msconvert 3.0.25036
+  writes a ZenoTOF 7600 ZT Scan DIA `.wiff2` with no `precursorList`, and convert reads
+  it as one all-ion window, which only extract's footprint guard then stops
+  (docs/09_extract.md, "The footprint guard"). `window_target = 0.0` is the marker for a
+  synthesized window. A target without offsets is no longer collapsed silently: see
+  step 6.
 - **`--top-peaks-ms2` is destructive and acquisition-specific.** The truncation
   at `convert.rs:76-79` is written into `spectra_ms2.parquet`, and `extract`
   applies no peak cap of its own, so this flag sets the MS2 peak budget for the
@@ -552,7 +579,7 @@ vendor file was involved.
 | Bruker timsTOF `.d` (dir) with diaPASEF frames | none: native reader (timsrust), ion mobility kept | supported; the 1/K0 calibration, gate, features, retrace and cross-run quant are opt-in (`configs/examples/diapasef.json`, docs/35_diapasef.md) |
 | Thermo `.raw` (file) | ThermoRawFileParser, or msconvert; or none under `convert.thermo_native` in a build with the `thermo` feature (opt-in, below) | **exercised end to end** (doxy, 2026-09-06: a 3.7 GB Astral `.raw` through `mumdia convert --mzml x.raw`, ThermoRawFileParser 2.0.0 found by `auto`, 6:40 and 4.4 GB for the converter, 3.4 GB mzML renamed into place beside the input, reused by the next run in 1.3 s; `peak-census` on the same `.raw` likewise) |
 | Bruker `.d` (dir), any other | msconvert | wired, unverified; **ion mobility is discarded** |
-| SCIEX `.wiff` / `.wiff2` | msconvert | wired, unverified; a `.wiff` needs its `.wiff.scan` companion beside it, and the engine names that file when msconvert fails without it |
+| SCIEX `.wiff` / `.wiff2` | msconvert | wired, unverified; a `.wiff` needs its `.wiff.scan` companion beside it, and the engine names that file when msconvert fails without it. ZT Scan DIA (scanning quadrupole): see "SCIEX ZT Scan DIA" below; an mzML from the SCIEX MS Data Converter needs `convert.isolation_half_width` |
 | Agilent `.d` (dir) | msconvert | wired, unverified |
 | Waters `.raw` (dir) | msconvert | wired, unverified |
 
@@ -682,6 +709,82 @@ msconvert is invoked with `--combineIonMobilitySpectra` for Bruker, which is wha
 turns a mobility-resolved frame into the 3D spectra this pipeline reads. Without it
 the output is one spectrum per mobility scan, which is both enormous and not what
 any downstream stage expects.
+
+### SCIEX ZT Scan DIA
+
+ZT Scan DIA (ZenoTOF 7600 and 8600) does not step a quadrupole through fixed windows:
+Q1 sweeps the precursor range continuously and the TOF records a spectrum every few
+milliseconds. On the K562 runs this was written against (ZenoTOF 8600, 100 ng, 15 min
+gradient) a cycle is 1 MS1 and 663 Q1 bins with targets from 394.256 to 898.271 m/z in
+steps of 0.7614 m/z, 1.345 ms a bin and 1.00 s a cycle; the method's 3.8 m/z Q1 window
+transmits a precursor through about 5 consecutive bins of every cycle; a run is 54 min,
+2.15 million spectra and 3.34 billion MS2 centroids.
+
+How converters write it, as measured:
+
+| converter | what an MS2 spectrum carries | what convert does |
+|---|---|---|
+| SCIEX MS Data Converter 2.0.1.0 (SCIEX OS 5.0) | `isolation window target m/z` = `selected ion m/z` of its bin, no offsets | refuses the file without `convert.isolation_half_width`; with it, reads each bin as `[target - h, target + h]` |
+| ProteoWizard msconvert 3.0.25036 (ABI reader), ZenoTOF 7600 `.wiff2` | no `precursorList` at all | one all-ion window; extract's footprint guard refuses it (docs/09_extract.md, "The footprint guard"). Not searchable: the bin of each spectrum is not recorded |
+| ProteoWizard msconvert 3.0.23339, TripleTOF 6600 Scanning SWATH | target and offsets of +-0.513 m/z: the bin, not the Q1 window | read as 505 windows of 1.03 m/z. Not measured; the Q1 window is wider than the bin, so each window then holds a fraction of the precursor's signal |
+
+Until 2026-11-10 a target without offsets was read as an all-ion spectrum: the whole run
+became one isolation window from 0 to 1e6 m/z. Convert took 1:46 and the seed 33 min, and
+then extract, which holds every candidate's evidence until no later window can add to it,
+held the whole run at once and grew past 521 GB in 3.5 minutes before it was killed.
+Nothing was written.
+
+The refusal names the layout: many distinct targets (at least 50), repeating cycle after
+cycle (at least twice in the sample), in steps under 1.5 m/z, far finer than any
+fixed-window method (the narrowest step 2 m/z), is called a scanning quadrupole. The fix
+is the method's Q1 half-width:
+
+```json
+{"convert": {"isolation_half_width": 1.9}}
+```
+
+With it every bin is a window of its own (663 windows of 3.8 m/z here), adjacent windows
+overlap, and extract pools a candidate's fragment evidence over every window that covers
+its precursor, so the about five bins that transmit it each contribute. Measured on
+REP01 (imported library restricted to the scanned 392-900 m/z, predicted decoys, the
+shipped `nn_torch` recipe, one seed), each value precursors / peptides / protein groups
+at 1%:
+
+| reading | precursors | peptides | protein groups |
+|---|---|---|---|
+| a rewrite of the mzML that adds +-1.9 m/z offsets to every bin | 97,171 | 78,503 | 7,670 |
+| the same rewrite at +-1.5 / +-2.3 m/z | 97,875 / 96,114 | 78,986 / 77,759 | 7,733 / 7,696 |
+| the original mzML with `convert.isolation_half_width = 1.9` | 97,401 | 78,612 | 7,742 |
+| bins summed in groups of 3 / 5 / 10 into wider windows | 91,848 / 80,972 / 66,643 | 74,524 / 65,784 / 54,683 | 7,488 / 7,068 / 6,500 |
+
+The native reading and the rewrite differ only where the rewrite rounded: 5 of the 663
+window bounds by one f32 step (6.1e-5 m/z, from targets written to six decimals), every
+retention time by at most 3e-7 s and the precursor m/z by at most 5e-7; all 3.34 billion
+peaks are the same. Given the same RT windows, extract accepts the same 4,166,551
+candidates from both. The native run is reproducible bit for bit (a second run wrote the
+same scored table); the 0.2% between it and the rewrite enters through the retention-time
+calibration, whose anchors moved by the rewrite's rounding: the multi-head calibration's
+predictions differ by a median 0.06 s, the local RT windows at their edges by up to a
+minute, and the extracted candidates by 0.36%.
+
+Summing neighbouring bins into wider windows only loses: each summed spectrum carries
+more co-isolated interference, the seed finds fewer confident anchors (21,934 against
+25,305 for groups of 5) and the RT windows widen (22.6 against 13.5 s). The half-widths
+1.5 to 2.3 are within one-seed noise of each other; take half the method's Q1 window. On
+an entrapment library (human with yeast and E. coli entries, r = 0.397) the +-1.9 m/z
+rewrite measured a combined entrapment FDP of 1.31% at a reported precursor q of 1%, a
+measured FDP above the reported q as on the Astral HeLa entrapment pool, so compare at a
+measured FDP; read natively, the entrapment run measured 95,050 human against 365
+entrapment precursors, 1.35%. The three runs searched as one experiment (`run --mzml`
+three times) with the key gave 110,433 precursors, 88,958 peptides and 8,981 protein
+groups at 1%, about 106,500 precursors per run on `run_psm_q`, in 40 min at an 89.4 GB
+peak on 64 threads (the rewritten files: 110,581 / 89,032 / 8,958), the peak from three
+concurrent second-pass extracts; a single run takes about 36-40 GB.
+
+What the engine does not do: model the quadrupole sweep. Each bin is an independent fixed
+window, its spectra a chromatogram cadence of their own, and the transmission profile of a
+precursor across the bins of one cycle is not used. Search the precursor range the method
+scanned with a library restricted to it.
 
 ### The two extension collisions
 

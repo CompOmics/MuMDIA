@@ -1725,6 +1725,280 @@ fn window_groups(lib: &Library, scans: &[Ms2Scan]) -> Vec<WinGroup> {
         .collect()
 }
 
+/// Bytes a fragment-peak match costs while a probing task holds it: the 16-byte [`Hit`]
+/// and its 4-byte candidate id, which the task keeps beside it until it groups its hits.
+const FOOTPRINT_HIT_BYTES: f64 = 20.0;
+/// Candidates per window the footprint estimate reads at most; past it every k-th is read
+/// and the sum scaled by k.
+const FOOTPRINT_CANDIDATES: usize = 1 << 16;
+/// Scans per window whose peaks the footprint estimate matches against the fragment sample.
+const FOOTPRINT_SAMPLE_SCANS: usize = 16;
+/// Candidates per window whose fragments the footprint estimate matches against the peaks.
+const FOOTPRINT_FRAG_CANDIDATES: usize = 2048;
+
+/// The chance that one peak of a scan falls within `tol_ppm` of one fragment, counted: every
+/// peak of a sample of scans against the sorted fragment m/z of a sample of candidates.
+/// `(matches, pairs)`; the rate is their ratio. A model of evenly spread peaks
+/// (`2 tol / ln(hi / lo)` per peak) read 3 to 8 times low on real spectra, and one of two
+/// log m/z histograms at 0.5% still 3 times: library fragments repeat exact values (the
+/// y1 ions of every tryptic peptide, the b2 ions of each residue pair), and real spectra
+/// carry peaks at those values.
+fn sampled_collision_rate(frags: &mut [f32], peaks: &[f32], tol_ppm: f64) -> (u64, f64) {
+    frags.sort_by(f32::total_cmp);
+    let mut matches = 0u64;
+    for &q in peaks {
+        let (lo, hi) = ppm_bounds(q as f64, tol_ppm);
+        let a = frags.partition_point(|&f| (f as f64) < lo);
+        let b = frags.partition_point(|&f| (f as f64) <= hi);
+        matches += (b - a) as u64;
+    }
+    (matches, frags.len() as f64 * peaks.len() as f64)
+}
+/// Below this estimate the `auto` ceiling is not looked up: no machine that runs a search
+/// has less memory, and on Windows the lookup starts a process.
+const FOOTPRINT_AUTO_FLOOR_GIB: f64 = 4.0;
+/// A window holding more MS2 spectra than this is called out in the refusal as an all-ion
+/// layout: a DIA window is sampled once a cycle, and 100,000 cycles are a day of gradient at
+/// one second a cycle.
+const FOOTPRINT_ALL_ION_SCANS: usize = 100_000;
+const GIB: f64 = (1u64 << 30) as f64;
+
+/// One isolation window's share of the footprint estimate ([`window_loads`]).
+#[derive(Clone, Debug, PartialEq)]
+struct WindowLoad {
+    lower_mz: f64,
+    upper_mz: f64,
+    scans: usize,
+    candidates: u32,
+    /// Estimated fragment-peak matches the window collects over the run.
+    hits: f64,
+}
+
+/// The estimated fragment-peak matches of each window group, in group order: for every
+/// candidate the window reaches (every k-th past [`FOOTPRINT_CANDIDATES`], scaled by k), its
+/// fragment count times the peaks of the window's scans inside its RT window (widened by the
+/// trace pad) times the chance that one peak falls within the tolerance of one fragment.
+///
+/// That chance is counted on the peaks of a sample of [`FOOTPRINT_SAMPLE_SCANS`] scans and
+/// the fragments of a sample of [`FOOTPRINT_FRAG_CANDIDATES`] candidates
+/// ([`sampled_collision_rate`]). Under the 1/K0 gate only the share of the slot's
+/// 1/K0 range the candidate's window overlaps counts. An allowlist drops the candidates it
+/// excludes. The fragments of the peptides present match their own peaks more often than
+/// chance, so this still reads low on a dense run, which is the side a guard for 100-fold
+/// excesses can afford.
+fn window_loads(
+    groups: &[WinGroup],
+    scans: &[Ms2Scan],
+    lib: &Library,
+    guard: Guard<'_>,
+    restrict: Option<&CandMask>,
+    frag_tol_ppm: f64,
+) -> Vec<WindowLoad> {
+    let win = guard.win;
+    groups
+        .par_iter()
+        .map(|g| {
+            let w = &scans[g.scans[0]].window;
+            // The window's scans on the RT axis, with the peaks before each.
+            let mut by_rt: Vec<(f64, usize)> = g
+                .scans
+                .iter()
+                .map(|&si| (scans[si].rt_seconds, scans[si].peaks.len()))
+                .collect();
+            if !by_rt.windows(2).all(|p| p[0].0 <= p[1].0) {
+                by_rt.sort_by(|a, b| a.0.total_cmp(&b.0));
+            }
+            let rts: Vec<f64> = by_rt.iter().map(|x| x.0).collect();
+            let mut cum: Vec<u64> = Vec::with_capacity(by_rt.len() + 1);
+            cum.push(0);
+            for &(_, n) in &by_rt {
+                cum.push(cum.last().copied().unwrap_or(0) + n as u64);
+            }
+            // The chance that a peak meets a fragment, counted on samples of both.
+            let step = (g.scans.len() / FOOTPRINT_SAMPLE_SCANS).max(1);
+            let peaks: Vec<f32> = g
+                .scans
+                .iter()
+                .step_by(step)
+                .flat_map(|&si| scans[si].peaks.iter().map(|pk| pk.mz))
+                .collect();
+            let fstep = ((g.hi_cid - g.lo_cid) as usize / FOOTPRINT_FRAG_CANDIDATES).max(1);
+            let mut frags: Vec<f32> = (g.lo_cid..g.hi_cid)
+                .step_by(fstep)
+                .flat_map(|c| lib.cand_frag_mz(c).iter().copied())
+                .collect();
+            let (matches, pairs) = sampled_collision_rate(&mut frags, &peaks, frag_tol_ppm);
+            let rate = if pairs > 0.0 {
+                matches as f64 / pairs
+            } else {
+                0.0
+            };
+            let slot_im = match (w.im_lower, w.im_upper, &win.im_lo, &win.im_hi) {
+                (Some(a), Some(b), Some(lo), Some(hi)) if guard.im_gate && b > a => {
+                    Some((a, b, lo, hi))
+                }
+                _ => None,
+            };
+            let n = (g.hi_cid - g.lo_cid) as usize;
+            let stride = n.div_ceil(FOOTPRINT_CANDIDATES).max(1);
+            let mut hits = 0.0f64;
+            for c in (g.lo_cid..g.hi_cid).step_by(stride) {
+                if restrict.is_some_and(|m| !m.contains(c)) {
+                    continue;
+                }
+                let ci = c as usize;
+                let (t0, t1) = (win.rt_lo[ci] - guard.pad, win.rt_hi[ci] + guard.pad);
+                let a = rts.partition_point(|&t| t < t0);
+                let b = rts.partition_point(|&t| t <= t1);
+                if b <= a {
+                    continue;
+                }
+                let im_share = match slot_im {
+                    Some((s0, s1, lo, hi)) if lo[ci].is_finite() && hi[ci].is_finite() => {
+                        let o = hi[ci].min(s1) - lo[ci].max(s0);
+                        (o.max(0.0) / (s1 - s0)) as f64
+                    }
+                    _ => 1.0,
+                };
+                let peaks = (cum[b] - cum[a]) as f64;
+                hits += lib.frag_range(c).len() as f64 * peaks * rate * im_share;
+            }
+            WindowLoad {
+                lower_mz: w.lower_mz,
+                upper_mz: w.upper_mz,
+                scans: g.scans.len(),
+                candidates: g.hi_cid - g.lo_cid,
+                hits: hits * stride as f64,
+            }
+        })
+        .collect()
+}
+
+/// What extract's hit store is estimated to hold ([`window_loads`]).
+#[derive(Clone, Debug)]
+struct Footprint {
+    loads: Vec<WindowLoad>,
+    /// Matches held at once: the largest batch of `in_flight` consecutive windows on the
+    /// streamed path, every window's on the paths that accumulate the whole run.
+    resident_hits: f64,
+    total_hits: f64,
+    streamed: bool,
+    in_flight: usize,
+    ms2_scans: usize,
+}
+
+impl Footprint {
+    fn of(loads: Vec<WindowLoad>, streamed: bool, in_flight: usize, ms2_scans: usize) -> Self {
+        let total_hits: f64 = loads.iter().map(|l| l.hits).sum();
+        // The batches the streamed driver probes: `in_flight` consecutive window groups.
+        let resident_hits = if streamed {
+            loads
+                .chunks(in_flight.max(1))
+                .map(|b| b.iter().map(|l| l.hits).sum::<f64>())
+                .fold(0.0, f64::max)
+        } else {
+            total_hits
+        };
+        Footprint {
+            loads,
+            resident_hits,
+            total_hits,
+            streamed,
+            in_flight,
+            ms2_scans,
+        }
+    }
+
+    fn resident_bytes(&self) -> f64 {
+        self.resident_hits * FOOTPRINT_HIT_BYTES
+    }
+
+    /// The window that holds the most MS2 spectra.
+    fn busiest(&self) -> Option<&WindowLoad> {
+        self.loads.iter().max_by_key(|l| l.scans)
+    }
+}
+
+/// The ceiling `extract.max_footprint_gib` sets, in bytes, and how to name it: `None` when
+/// the check is off (0), or under `auto` while the estimate is below
+/// [`FOOTPRINT_AUTO_FLOOR_GIB`] or the machine's memory cannot be read.
+fn footprint_ceiling(cfg: &ExtractConfig, estimate: f64) -> Option<(f64, String)> {
+    match cfg.max_footprint_gib {
+        Some(v) if v <= 0.0 => None,
+        Some(v) => Some((v * GIB, format!("extract.max_footprint_gib ({v} GiB)"))),
+        None if estimate < FOOTPRINT_AUTO_FLOOR_GIB * GIB => None,
+        None => crate::memlog::total_memory().map(|b| {
+            (
+                b as f64,
+                format!(
+                    "this machine's memory ({:.1} GiB; extract.max_footprint_gib unset)",
+                    b as f64 / GIB
+                ),
+            )
+        }),
+    }
+}
+
+/// Log the estimate, and refuse when it passes the ceiling (divided among `sibling_bands`
+/// bands in flight).
+fn check_footprint(fp: &Footprint, cfg: &ExtractConfig, sibling_bands: usize) -> Result<()> {
+    let busiest = fp.busiest();
+    info!(
+        resident_gib = format!("{:.2}", fp.resident_bytes() / GIB),
+        run_gib = format!("{:.2}", fp.total_hits * FOOTPRINT_HIT_BYTES / GIB),
+        resident_hits = fp.resident_hits.round() as u64,
+        windows = fp.loads.len(),
+        streamed = fp.streamed,
+        windows_in_flight = fp.in_flight,
+        busiest_window_scans = busiest.map_or(0, |l| l.scans),
+        "extract: estimated hit store"
+    );
+    let bands = sibling_bands.max(1) as f64;
+    let Some((ceiling, what)) = footprint_ceiling(cfg, fp.resident_bytes() * bands) else {
+        return Ok(());
+    };
+    let share = ceiling / bands;
+    if fp.resident_bytes() <= share {
+        return Ok(());
+    }
+    let why = match busiest {
+        Some(l) if l.scans > FOOTPRINT_ALL_ION_SCANS || fp.loads.len() == 1 => format!(
+            "One isolation window, m/z {:.1} to {:.1}, holds {} of the run's {} MS2 spectra and \
+             reaches {} candidates: an all-ion layout, in which every spectrum reaches every \
+             candidate and nothing can be written before the end of the run. A SCIEX ZT Scan \
+             DIA run converted without isolation offsets looks like this; convert such a run \
+             again with convert.isolation_half_width set (docs/04_convert.md, \"SCIEX ZT Scan \
+             DIA\").",
+            l.lower_mz, l.upper_mz, l.scans, fp.ms2_scans, l.candidates
+        ),
+        _ => format!(
+            "Lower extract.windows_in_flight (now {}), or search the run in isolation-window \
+             groups (groups.window_groups), each of which holds a band of the library.",
+            fp.in_flight
+        ),
+    };
+    let band_note = if sibling_bands > 1 {
+        format!(", this band's share of {sibling_bands} bands in flight")
+    } else {
+        String::new()
+    };
+    anyhow::bail!(
+        "extract: the fragment-peak matches this extraction holds at once are estimated at \
+         {:.1} GiB ({:.1} GiB over the run, {} windows{}), more than {what}{band_note}. {why} \
+         The estimate is an order of magnitude, not a prediction (docs/09_extract.md, \"The \
+         footprint guard\"); set extract.max_footprint_gib to a ceiling of your own, or to 0 \
+         to run without the check.",
+        fp.resident_bytes() / GIB,
+        fp.total_hits * FOOTPRINT_HIT_BYTES / GIB,
+        fp.loads.len(),
+        if fp.streamed {
+            format!(", {} in flight", fp.in_flight)
+        } else {
+            ", the whole run at once".to_string()
+        },
+    )
+}
+
 /// One probing task of the streamed accumulation: the scans of one window against the
 /// candidates of one sub-range `[lo, hi)`.
 #[derive(Clone, Copy)]
@@ -1944,6 +2218,8 @@ struct LocalIndexStats {
     tasks: std::sync::atomic::AtomicU64,
     postings: std::sync::atomic::AtomicU64,
     largest_bytes: std::sync::atomic::AtomicUsize,
+    /// Fragment-peak matches the tasks returned, which the footprint estimate predicts.
+    hits: std::sync::atomic::AtomicU64,
 }
 
 impl LocalIndexStats {
@@ -2111,7 +2387,12 @@ fn accumulate_groups(
                 } => {
                     let mut ix = LocalIndex::build(lib, bins, tol_ppm, lo, hi);
                     stats.record(&ix);
-                    task.run(&mut ix)
+                    let store = task.run(&mut ix);
+                    stats.hits.fetch_add(
+                        store.hits.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    store
                 }
                 #[cfg(test)]
                 TaskProbe::Global(idx) => task.run(&mut NarrowedProbe {
@@ -3767,6 +4048,26 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     };
     let local_stats = LocalIndexStats::default();
 
+    // The window groups, for the footprint guard and, on the streamed path, for the driver.
+    let mut wgroups = Some(window_groups(&lib, scans));
+    let streamed = !two_pass && stream_bins.is_some();
+    // The footprint guard (`extract.max_footprint_gib`): estimate what the hit store will
+    // hold at once, and refuse a layout that cannot fit before anything is probed.
+    {
+        let groups = wgroups.as_deref().expect("just built");
+        let loads = window_loads(groups, scans, &lib, guard, restrict.as_ref(), frag_tol);
+        let fp = Footprint::of(
+            loads,
+            streamed,
+            groups_in_flight(p.cfg, has_im),
+            scans.len(),
+        );
+        check_footprint(&fp, p.cfg, p.sibling_bands)?;
+    }
+    if !streamed {
+        wgroups = None;
+    }
+
     // Peak-major accumulation. The fast path (single pass, fragment index, no candidate
     // allowlist) leaves `acc` empty and fills `stream_groups` instead; every other path
     // materialises the whole run here and is handed to the driver as one batch.
@@ -3794,7 +4095,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             // candidate out as soon as no later window can add a hit to it, so the whole
             // run's hits are never resident. Measured at 1.6 billion hits (35.9 GiB of
             // payload) on the HYE benchmark, which was 60% of extract's 61.3 GiB peak.
-            stream_groups = Some(window_groups(&lib, scans));
+            stream_groups = wgroups.take();
         } else {
             let pr = Prober {
                 fidx: fidx.as_ref(),
@@ -5204,6 +5505,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         let mut acc_stream = HitAcc::default();
         let mut chunk = HitStore::default();
         let mut open_hits_max = 0usize;
+        let mut batch_hits_max = 0u64;
         if let Some(groups) = stream_groups.as_ref() {
             // Counting the flushed candidates here rather than inside `emit_batch` keeps
             // the eager path below able to borrow `emit_batch` on its own.
@@ -5221,6 +5523,7 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 // flushes each candidate sub-range as soon as every window has passed it,
                 // so the accumulator holds a sub-range of the band rather than the band.
                 let bound = groups.get(upto).map(|g| g.lo_cid).unwrap_or(u32::MAX);
+                let hits_before = local_stats.hits.load(std::sync::atomic::Ordering::Relaxed);
                 let mut stopped = accumulate_groups(
                     TaskProbe::Local {
                         lib: &lib,
@@ -5244,6 +5547,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 );
                 gi = upto;
                 open_hits_max = open_hits_max.max(acc_stream.n_hits());
+                batch_hits_max = batch_hits_max
+                    .max(local_stats.hits.load(std::sync::atomic::Ordering::Relaxed) - hits_before);
                 // Candidates past the batch's own sub-range grid (a window of this batch
                 // can reach past the last window's range when the windows differ in width)
                 // are final too, and the sub-range loop cannot have reached them.
@@ -5281,6 +5586,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 use std::sync::atomic::Ordering::Relaxed;
                 info!(
                     tasks = local_stats.tasks.load(Relaxed),
+                    hits = local_stats.hits.load(Relaxed),
+                    largest_batch_hits = batch_hits_max,
                     postings = local_stats.postings.load(Relaxed),
                     library_fragments = lib.frag_mz.len(),
                     largest_task_index_bytes = local_stats.largest_bytes.load(Relaxed),

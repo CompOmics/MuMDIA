@@ -173,6 +173,10 @@ pub struct ConvertParams<'a> {
     pub config_hash: &'a str,
     /// Native diaPASEF reading (`convert.tdf_*`); unused for mzML input.
     pub tdf: TdfParams,
+    /// `convert.isolation_half_width`: the m/z half-width read for an MS2 spectrum that
+    /// names an isolation window target and no offsets (`isolation_bounds`). `None`
+    /// refuses a file with more than one such target.
+    pub isolation_half_width: Option<f64>,
 }
 
 /// Result paths for chaining.
@@ -423,9 +427,71 @@ struct Ms2Row {
     im: Option<Vec<f32>>,
     im_lo: Option<f32>,
     im_hi: Option<f32>,
+    /// The isolation window target of a spectrum that named one and no offsets, read
+    /// without `convert.isolation_half_width` ([`Isolation::TargetOnly`]); [`Fold`] decides
+    /// whether the file is refused. `None` for every other spectrum.
+    target_only: Option<f64>,
 }
 
-fn decode_one<S: SpectrumLike>(spec: &S, top_ms1: usize, top_ms2: usize) -> Decoded {
+/// How an MS2 spectrum's isolation window is read (`isolation_bounds`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Isolation {
+    /// `(target, lower, upper)` m/z: explicit offsets, or a target widened by
+    /// `convert.isolation_half_width`.
+    Window(f64, f64, f64),
+    /// No isolation: no precursor, no window, or "no isolation" (MS:1003159). The whole
+    /// m/z range, as for an all-ion acquisition: [`ALL_ION_WINDOW`].
+    AllIon,
+    /// A target m/z and no offsets, read without `convert.isolation_half_width`. Written as
+    /// [`ALL_ION_WINDOW`], as every such spectrum was until 2026-11-10, and counted, so a
+    /// file whose targets differ is refused once its layout has been seen.
+    TargetOnly(f64),
+}
+
+/// `(target, lower, upper)` of a spectrum without isolation: the whole m/z range.
+/// `search_seed::FULL_RANGE_WINDOW` reads the same bounds.
+const ALL_ION_WINDOW: (f64, f64, f64) = (0.0, 0.0, 1.0e6);
+
+/// The isolation window of an MS2 spectrum, from mzdata's reading of its `isolationWindow`.
+///
+/// mzdata resolves the offsets against the target in f32 (`lower = target - lower offset`)
+/// and leaves both bounds 0 when the spectrum names a target and no offset, which is how
+/// the SCIEX MS Data Converter writes the Q1 bins of a ZT Scan DIA run. Such a target is
+/// widened by `half_width` here in the same f32 arithmetic, so a file that carries offsets
+/// of `h` and the same file without them, read with `half_width = h`, have identical
+/// windows. Spectra that carry offsets keep them whatever `half_width` is.
+fn isolation_bounds(
+    iw: Option<&mzdata::spectrum::IsolationWindow>,
+    half_width: Option<f64>,
+) -> Isolation {
+    let Some(w) = iw else {
+        return Isolation::AllIon;
+    };
+    if !(w.lower_bound == 0.0 && w.upper_bound == 0.0) {
+        return Isolation::Window(w.target as f64, w.lower_bound as f64, w.upper_bound as f64);
+    }
+    if w.target == 0.0 || matches!(w.flags, mzdata::spectrum::IsolationWindowState::NoIsolation) {
+        return Isolation::AllIon;
+    }
+    match half_width {
+        Some(h) => {
+            let h = h as f32;
+            Isolation::Window(
+                w.target as f64,
+                (w.target - h) as f64,
+                (w.target + h) as f64,
+            )
+        }
+        None => Isolation::TargetOnly(w.target as f64),
+    }
+}
+
+fn decode_one<S: SpectrumLike>(
+    spec: &S,
+    top_ms1: usize,
+    top_ms2: usize,
+    half_width: Option<f64>,
+) -> Decoded {
     let rt_s = spec.start_time() * 60.0; // mzdata returns minutes
     if !rt_s.is_finite() {
         return Decoded::BadRt {
@@ -447,13 +513,15 @@ fn decode_one<S: SpectrumLike>(spec: &S, top_ms1: usize, top_ms2: usize) -> Deco
         2 => {
             let (mz, inten, nonfinite_peaks) = peaks_of(spec, top_ms2);
             let prec = spec.precursor();
-            let iw = prec.map(|pr| pr.isolation_window.clone());
-            let (wt, wl, wu) = match &iw {
-                Some(w) if !(w.lower_bound == 0.0 && w.upper_bound == 0.0) => {
-                    (w.target as f64, w.lower_bound as f64, w.upper_bound as f64)
-                }
+            let isolation = isolation_bounds(prec.map(|pr| &pr.isolation_window), half_width);
+            let (wt, wl, wu) = match isolation {
+                Isolation::Window(t, l, u) => (t, l, u),
                 // AIF / all-ion: no quad isolation -> full-range window.
-                _ => (0.0, 0.0, 1.0e6),
+                Isolation::AllIon | Isolation::TargetOnly(_) => ALL_ION_WINDOW,
+            };
+            let target_only = match isolation {
+                Isolation::TargetOnly(t) => Some(t),
+                _ => None,
             };
             let (pmz, pz) = match prec.and_then(|pr| pr.ions.first()) {
                 Some(ion) => (Some(ion.mz), ion.charge),
@@ -473,10 +541,124 @@ fn decode_one<S: SpectrumLike>(spec: &S, top_ms1: usize, top_ms2: usize) -> Deco
                 im: None,
                 im_lo: None,
                 im_hi: None,
+                target_only,
             }))
         }
         _ => Decoded::Other,
     }
+}
+
+/// Target-only spectra [`Fold`] keeps, in file order, to describe the file's layout.
+/// 10,000 spectra are 15 cycles of a 663-bin ZT Scan DIA method.
+const TARGET_ONLY_SAMPLE: usize = 10_000;
+
+/// The MS2 spectra that named an isolation window target and no offsets
+/// ([`Isolation::TargetOnly`]), as [`Fold`] saw them.
+#[derive(Default)]
+struct TargetOnly {
+    n: usize,
+    first_id: Option<String>,
+    /// The first [`TARGET_ONLY_SAMPLE`] targets, in file order.
+    sample: Vec<f64>,
+    /// A target other than the first was seen: the file is refused.
+    differ: bool,
+}
+
+impl TargetOnly {
+    fn record(&mut self, id: &str, target: f64) {
+        self.n += 1;
+        if self.first_id.is_none() {
+            self.first_id = Some(id.to_string());
+        }
+        if let Some(&first) = self.sample.first() {
+            self.differ |= target != first;
+        }
+        if self.sample.len() < TARGET_ONLY_SAMPLE {
+            self.sample.push(target);
+        }
+    }
+
+    /// Seen enough to describe the layout: a second target and a full sample.
+    fn decided(&self) -> bool {
+        self.differ && self.sample.len() >= TARGET_ONLY_SAMPLE
+    }
+}
+
+/// What the targets of [`TargetOnly`] say about the acquisition.
+#[derive(Debug, Clone, PartialEq)]
+struct TargetLayout {
+    distinct: usize,
+    lo: f64,
+    hi: f64,
+    /// Median gap between consecutive distinct targets, m/z.
+    median_step: f64,
+    /// Spectra per distinct target in the sample: about the cycles it covers.
+    repeats: f64,
+}
+
+/// The layout of a sample of targets (distinct at 1e-4 m/z).
+fn target_layout(sample: &[f64]) -> TargetLayout {
+    let mut d: Vec<f64> = sample.iter().map(|t| (t * 1e4).round() / 1e4).collect();
+    d.sort_by(f64::total_cmp);
+    d.dedup();
+    let mut steps: Vec<f64> = d.windows(2).map(|w| w[1] - w[0]).collect();
+    steps.sort_by(f64::total_cmp);
+    TargetLayout {
+        distinct: d.len(),
+        lo: d.first().copied().unwrap_or(0.0),
+        hi: d.last().copied().unwrap_or(0.0),
+        median_step: steps.get(steps.len() / 2).copied().unwrap_or(0.0),
+        repeats: sample.len() as f64 / d.len().max(1) as f64,
+    }
+}
+
+impl TargetLayout {
+    /// A scanning quadrupole (SCIEX ZT Scan DIA, Scanning SWATH): many distinct targets,
+    /// repeating cycle after cycle, in steps far finer than any isolation window. A ZT Scan
+    /// DIA method writes 663 targets 0.761 m/z apart; the narrowest fixed-window DIA
+    /// methods step 2 m/z with a few hundred windows.
+    fn is_scanning_quadrupole(&self) -> bool {
+        self.distinct >= 50
+            && self.median_step > 0.0
+            && self.median_step < 1.5
+            && self.repeats >= 2.0
+    }
+}
+
+/// The refusal of a file whose MS2 spectra name differing isolation targets and no offsets.
+fn target_only_refusal(mzml: &str, t: &TargetOnly) -> anyhow::Error {
+    let l = target_layout(&t.sample);
+    let what = if l.is_scanning_quadrupole() {
+        format!(
+            "The targets are those of a scanning-quadrupole acquisition (SCIEX ZT Scan DIA, or \
+             Scanning SWATH): {} distinct targets from {:.3} to {:.3} m/z in steps of {:.4} m/z, \
+             repeating every cycle, far finer than any isolation window, so each spectrum is \
+             one position of a quadrupole sweeping the precursor range and the window it \
+             transmitted is the method's Q1 width, which the file does not state.",
+            l.distinct, l.lo, l.hi, l.median_step
+        )
+    } else {
+        format!(
+            "The file has {} distinct targets from {:.3} to {:.3} m/z (median step {:.4} m/z): \
+             a converter that did not write the window offsets is the likely cause; converting \
+             the vendor file again with one that does is the better fix.",
+            l.distinct, l.lo, l.hi, l.median_step
+        )
+    };
+    anyhow::anyhow!(
+        "convert: {mzml}: MS2 spectra name an isolation window target m/z but no lower or upper \
+         offset ({} such spectra in the part of the file read; the first is {:?}, target \
+         {:.4} m/z), so the m/z range each one isolated is unknown. Such a spectrum used to be read as an all-ion \
+         scan over the whole m/z range, which put every spectrum of the run into one isolation \
+         window: extract then holds every candidate's evidence for the whole run at once and \
+         grows until the machine runs out of memory. {what} Set convert.isolation_half_width \
+         to half the quadrupole isolation window in m/z (1.9 for the 3.8 m/z Q1 window of a \
+         ZT Scan DIA method) to read each spectrum as [target - half-width, target + \
+         half-width]; docs/04_convert.md, \"SCIEX ZT Scan DIA\".",
+        t.n,
+        t.first_id.as_deref().unwrap_or("?"),
+        t.sample.first().copied().unwrap_or(0.0),
+    )
 }
 
 /// The order-dependent half of the conversion: the accumulators, the parquet
@@ -502,6 +684,10 @@ struct Fold {
     nonfinite_peaks: usize,
     nonfinite_rt: usize,
     first_bad_rt: Option<String>,
+    /// Spectra that named an isolation target and no offsets ([`Isolation::TargetOnly`]).
+    target_only: TargetOnly,
+    /// The input, for the refusal of a target-only file.
+    source: String,
 }
 
 impl Fold {
@@ -526,7 +712,15 @@ impl Fold {
             nonfinite_peaks: 0,
             nonfinite_rt: 0,
             first_bad_rt: None,
+            target_only: TargetOnly::default(),
+            source: String::new(),
         }
+    }
+
+    /// The input path the refusal of a target-only file names.
+    fn with_source(mut self, source: &str) -> Self {
+        self.source = source.to_string();
+        self
     }
 
     fn absorb(&mut self, scan_index: u32, d: Decoded) -> Result<()> {
@@ -572,8 +766,17 @@ impl Fold {
                     im,
                     im_lo,
                     im_hi,
+                    target_only,
                 } = *r;
                 self.nonfinite_peaks += nonfinite_peaks;
+                // A target and no offsets: refused once a second target and enough of the
+                // file to describe its layout have been seen, not at the end of a 42 GB read.
+                if let Some(t) = target_only {
+                    self.target_only.record(&id, t);
+                    if self.target_only.decided() {
+                        return Err(target_only_refusal(&self.source, &self.target_only));
+                    }
+                }
                 // A key on a NaN bound would make every such scan a window of its own.
                 if [im_lo, im_hi].into_iter().flatten().any(|v| !v.is_finite()) {
                     anyhow::bail!(
@@ -666,7 +869,7 @@ fn drive_thermo(
         for batch in rx.iter() {
             let decoded: Vec<Decoded> = batch
                 .par_iter()
-                .map(|s| decode_one(s, p.top_peaks_ms1, p.top_peaks_ms2))
+                .map(|s| decode_one(s, p.top_peaks_ms1, p.top_peaks_ms2, p.isolation_half_width))
                 .collect();
             for d in decoded {
                 fold.absorb(read as u32, d)?;
@@ -711,7 +914,12 @@ fn drive_sequential<S: SpectrumLike>(
         read = count + 1;
         fold.absorb(
             scan_index,
-            decode_one(&spec, p.top_peaks_ms1, p.top_peaks_ms2),
+            decode_one(
+                &spec,
+                p.top_peaks_ms1,
+                p.top_peaks_ms2,
+                p.isolation_half_width,
+            ),
         )?;
     }
     Ok(read)
@@ -875,7 +1083,12 @@ fn produce_chunk(
                 spec.index()
             );
         }
-        rows.push(decode_one(&spec, p.top_peaks_ms1, p.top_peaks_ms2));
+        rows.push(decode_one(
+            &spec,
+            p.top_peaks_ms1,
+            p.top_peaks_ms2,
+            p.isolation_half_width,
+        ));
     }
     Ok(ChunkOut {
         rows,
@@ -1211,7 +1424,7 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
     // not a reason to refuse a run, and a spectrum with no retention time cannot be placed
     // in a chromatogram. The "no MS2 spectra" bail below is the backstop for a file whose
     // retention times are ALL unusable.
-    let mut fold = Fold::new(&ms1_path, &ms2_path, native_tdf);
+    let mut fold = Fold::new(&ms1_path, &ms2_path, native_tdf).with_source(p.mzml);
 
     let read = match source {
         Source::Mzml(reader) => drive_mzml(*reader, declared, &p, force_threads, &mut fold)?,
@@ -1242,8 +1455,27 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         nonfinite_peaks,
         nonfinite_rt,
         first_bad_rt,
+        target_only,
         ..
     } = fold;
+    // Target-only spectra (`Isolation::TargetOnly`) in a file shorter than the sample, or
+    // whose second target came late: refused here. A file in which every one names the SAME
+    // target keeps the all-ion reading it always had, which is what an all-ion acquisition
+    // that records a nominal target looks like.
+    if target_only.differ {
+        return Err(target_only_refusal(p.mzml, &target_only));
+    }
+    if target_only.n > 0 {
+        warn!(
+            spectra = target_only.n,
+            target = target_only.sample.first().copied().unwrap_or(0.0),
+            mzml = p.mzml,
+            "convert: every MS2 spectrum that names an isolation window target names the same \
+             one and no offsets; reading them as all-ion spectra over the whole m/z range, as \
+             before. If the acquisition isolated a narrow window around that target, set \
+             convert.isolation_half_width to its half-width in m/z"
+        );
+    }
     ms1_w.write_cols(ms1.cols(native_tdf))?;
     ms2_w.write_cols(ms2.cols(native_tdf))?;
 
@@ -1347,6 +1579,13 @@ fn run_inner(p: ConvertParams, force_threads: Option<usize>) -> Result<ConvertOu
         "config_hash": p.config_hash,
         "instrument": instrument,
     });
+    // Only when set, so a report of a conversion without it keeps exactly its fields.
+    if let Some(h) = p.isolation_half_width {
+        params
+            .as_object_mut()
+            .expect("params is an object")
+            .insert("isolation_half_width".into(), json!(h));
+    }
     // The reader and its centroiding settings, for a native diaPASEF run only: an mzML
     // report keeps exactly the fields it always had, and an absent `reader` reads as mzML
     // (`instrument::provenance`).
@@ -1757,6 +1996,7 @@ mod tests {
                     top_peaks_ms1: 0,
                     config_hash: "test",
                     tdf: TdfParams::default(),
+                    isolation_half_width: None,
                 },
                 Some(4),
             )
@@ -1809,6 +2049,7 @@ mod tests {
                     top_peaks_ms1: 0,
                     config_hash: "bench",
                     tdf: TdfParams::default(),
+                    isolation_half_width: None,
                 },
                 Some(threads),
             )
@@ -1864,6 +2105,7 @@ mod tests {
             top_peaks_ms1: 0,
             config_hash: "test",
             tdf: TdfParams::default(),
+            isolation_half_width: None,
         })
         .expect("a zlib-compressed mzML must convert");
 
@@ -1907,6 +2149,7 @@ mod tests {
                     top_peaks_ms1: 0,
                     config_hash: "test",
                     tdf: TdfParams::default(),
+                    isolation_half_width: None,
                 },
                 Some(threads),
             )
@@ -1968,6 +2211,7 @@ mod tests {
                     top_peaks_ms1: 0,
                     config_hash: "test",
                     tdf: TdfParams::default(),
+                    isolation_half_width: None,
                 },
                 Some(threads),
             )
@@ -2011,6 +2255,7 @@ mod tests {
                 top_peaks_ms1: 0,
                 config_hash: "test",
                 tdf: TdfParams::default(),
+                isolation_half_width: None,
             },
             Some(4),
         )
@@ -2047,6 +2292,7 @@ mod tests {
             top_peaks_ms1: 0,
             config_hash: "test",
             tdf: TdfParams::default(),
+            isolation_half_width: None,
         })
         .expect("a whole file with one unusable retention time must convert");
 
@@ -2082,6 +2328,7 @@ mod tests {
             top_peaks_ms1: 0,
             config_hash: "test",
             tdf: TdfParams::default(),
+            isolation_half_width: None,
         })
         .unwrap();
         assert_eq!(out.schemas, ConvertSchemas::for_source(false));
@@ -2195,6 +2442,7 @@ mod tests {
                     top_peaks_ms1: 3,
                     config_hash: "test",
                     tdf: TdfParams::default(),
+                    isolation_half_width: None,
                 },
                 Some(1),
             )
@@ -2246,6 +2494,7 @@ mod tests {
                 im: Some(vec![lo, hi]),
                 im_lo: Some(lo),
                 im_hi: Some(hi),
+                target_only: None,
             };
             fold.absorb(k as u32 + 1, Decoded::Ms2(Box::new(row)))
                 .unwrap();
@@ -2305,6 +2554,7 @@ mod tests {
             im: Some(vec![0.7]),
             im_lo: Some(f32::NAN),
             im_hi: Some(1.0),
+            target_only: None,
         };
         let e = fold
             .absorb(0, Decoded::Ms2(Box::new(row)))
@@ -2331,6 +2581,7 @@ mod tests {
             top_peaks_ms1: 0,
             config_hash: "test",
             tdf: TdfParams::default(),
+            isolation_half_width: None,
         })
         .unwrap();
         for (path, hash) in [
@@ -2368,6 +2619,7 @@ mod tests {
             top_peaks_ms1: 0,
             config_hash: "test",
             tdf: TdfParams::default(),
+            isolation_half_width: None,
         })
         .expect("a mid-file bad retention time was never a truncation");
         assert_eq!(rows_in_report(&out.ms1), 2);
@@ -2395,6 +2647,7 @@ mod tests {
             top_peaks_ms1: 0,
             config_hash: "test",
             tdf: TdfParams::default(),
+            isolation_half_width: None,
         });
         let Err(err) = res else {
             panic!("a file shorter than its own header must be refused");
@@ -2425,10 +2678,235 @@ mod tests {
             top_peaks_ms1: 0,
             config_hash: "test",
             tdf: TdfParams::default(),
+            isolation_half_width: None,
         })
         .expect("--max-spectra is a deliberate short read");
         assert_eq!(rows_in_report(&out.ms1), 1);
         assert_eq!(rows_in_report(&out.ms2), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The isolation block of `spectrum`, which every MS2 spectrum it writes carries.
+    const FIXED_ISOLATION: &str = concat!(
+        r#"<cvParam cvRef="MS" accession="MS:1000827" name="isolation window target m/z" value="500.0"/>"#,
+        r#"<cvParam cvRef="MS" accession="MS:1000828" name="isolation window lower offset" value="5.0"/>"#,
+        r#"<cvParam cvRef="MS" accession="MS:1000829" name="isolation window upper offset" value="5.0"/>"#,
+    );
+
+    /// A scanning-quadrupole run as the SCIEX MS Data Converter writes ZT Scan DIA: each
+    /// cycle one MS1 and `bins` MS2 spectra whose targets step 0.7614 m/z up from 394.2558,
+    /// written at full precision, with no offsets (`offsets = None`) or with offsets of
+    /// `h` m/z on both sides.
+    fn scanning_run(cycles: usize, bins: usize, offsets: Option<f64>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut index = 0usize;
+        for c in 0..cycles {
+            let rt = format!("{:.6}", 0.0167 * c as f64);
+            out.push(spectrum(index, 1, &rt, &[400.0, 500.0], &[10.0, 20.0]));
+            index += 1;
+            for b in 0..bins {
+                let t = 394.25579223504104 + 0.761_407_16 * b as f64;
+                let mut iso = format!(
+                    r#"<cvParam cvRef="MS" accession="MS:1000827" name="isolation window target m/z" value="{t}"/>"#
+                );
+                if let Some(h) = offsets {
+                    iso.push_str(&format!(
+                        r#"<cvParam cvRef="MS" accession="MS:1000828" name="isolation window lower offset" value="{h:.6}"/><cvParam cvRef="MS" accession="MS:1000829" name="isolation window upper offset" value="{h:.6}"/>"#
+                    ));
+                }
+                let mz = [150.0 + b as f64, 300.0 + 0.5 * c as f64];
+                let s = spectrum(index, 2, &rt, &mz, &[5.0, 6.0]).replace(FIXED_ISOLATION, &iso);
+                out.push(s);
+                index += 1;
+            }
+        }
+        out
+    }
+
+    fn convert_with(
+        path: &std::path::Path,
+        out: &std::path::Path,
+        hw: Option<f64>,
+    ) -> Result<ConvertOutputs> {
+        std::fs::create_dir_all(out).unwrap();
+        run(ConvertParams {
+            mzml: path.to_str().unwrap(),
+            out_dir: out.to_str().unwrap(),
+            max_spectra: 0,
+            top_peaks_ms2: 0,
+            top_peaks_ms1: 0,
+            config_hash: "test",
+            tdf: TdfParams::default(),
+            isolation_half_width: hw,
+        })
+    }
+
+    #[test]
+    fn isolation_bounds_reads_offsets_targets_and_their_absence() {
+        use mzdata::spectrum::{IsolationWindow as Iw, IsolationWindowState as St};
+        assert_eq!(isolation_bounds(None, Some(1.9)), Isolation::AllIon);
+        let explicit = Iw::new(500.0, 495.0, 505.0, St::Complete);
+        assert_eq!(
+            isolation_bounds(Some(&explicit), Some(1.9)),
+            Isolation::Window(500.0, 495.0, 505.0),
+            "offsets the spectrum carries win over the half-width"
+        );
+        let t = 394.255_8f32;
+        let target = Iw::new(t, 0.0, 0.0, St::Complete);
+        assert_eq!(
+            isolation_bounds(Some(&target), None),
+            Isolation::TargetOnly(t as f64)
+        );
+        assert_eq!(
+            isolation_bounds(Some(&target), Some(1.9)),
+            Isolation::Window(t as f64, (t - 1.9f32) as f64, (t + 1.9f32) as f64)
+        );
+        let none = Iw::new(0.0, 0.0, 0.0, St::Unknown);
+        assert_eq!(isolation_bounds(Some(&none), Some(1.9)), Isolation::AllIon);
+        let mse = Iw::new(500.0, 0.0, 0.0, St::NoIsolation);
+        assert_eq!(isolation_bounds(Some(&mse), Some(1.9)), Isolation::AllIon);
+    }
+
+    #[test]
+    fn a_scanning_quadrupole_layout_is_recognised_and_fixed_windows_are_not() {
+        let zt: Vec<f64> = (0..15)
+            .flat_map(|_| (0..663).map(|b| 394.256 + 0.7614 * b as f64))
+            .collect();
+        let l = target_layout(&zt);
+        assert_eq!(l.distinct, 663);
+        assert!((l.median_step - 0.7614).abs() < 1e-3, "{l:?}");
+        assert!((l.lo - 394.256).abs() < 1e-9, "{l:?}");
+        assert!((l.hi - 898.3028).abs() < 1e-3, "{l:?}");
+        assert!(l.is_scanning_quadrupole());
+        // 24 fixed 25 m/z windows, many cycles: fixed-window DIA that lost its offsets.
+        let fixed: Vec<f64> = (0..400)
+            .flat_map(|_| (0..24).map(|w| 412.5 + 25.0 * w as f64))
+            .collect();
+        assert!(!target_layout(&fixed).is_scanning_quadrupole());
+        // 300 narrow 2 m/z windows: steps of 2 m/z are a fixed-window method.
+        let narrow: Vec<f64> = (0..30)
+            .flat_map(|_| (0..300).map(|w| 381.0 + 2.0 * w as f64))
+            .collect();
+        assert!(!target_layout(&narrow).is_scanning_quadrupole());
+        // One cycle seen: nothing repeats yet.
+        let once: Vec<f64> = (0..663).map(|b| 394.256 + 0.7614 * b as f64).collect();
+        assert!(!target_layout(&once).is_scanning_quadrupole());
+    }
+
+    /// The SCIEX MS Data Converter's ZT Scan DIA layout, targets without offsets, used to be
+    /// read as one all-ion window holding every spectrum. It is refused, naming the key, and
+    /// leaves no spectra artifact behind.
+    #[test]
+    fn target_only_spectra_are_refused_naming_the_half_width() {
+        let d = tmpdir("ztscan_refused");
+        let path = d.join("zt.mzML");
+        let spectra = scanning_run(4, 120, None);
+        std::fs::write(&path, mzml(spectra.len(), &spectra)).unwrap();
+        let out = d.join("out");
+        let msg = format!(
+            "{:#}",
+            convert_with(&path, &out, None).err().expect("refused")
+        );
+        assert!(msg.contains("no lower or upper offset"), "{msg}");
+        assert!(msg.contains("scanning-quadrupole"), "{msg}");
+        assert!(msg.contains("120 distinct targets"), "{msg}");
+        assert!(msg.contains("convert.isolation_half_width"), "{msg}");
+        assert!(!out.join("spectra_ms2.parquet").exists());
+        assert!(!out.join("isolation_windows.parquet").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A long target-only run is refused once its layout has been seen, not after the
+    /// whole file: 12,000 target-only spectra, refused at the 10,000th.
+    #[test]
+    fn a_long_target_only_run_is_refused_early() {
+        let d = tmpdir("ztscan_early");
+        let path = d.join("zt.mzML");
+        let spectra = scanning_run(20, 600, None);
+        std::fs::write(&path, mzml(spectra.len(), &spectra)).unwrap();
+        let msg = format!(
+            "{:#}",
+            convert_with(&path, &d.join("out"), None)
+                .err()
+                .expect("refused")
+        );
+        assert!(
+            msg.contains(&format!("({TARGET_ONLY_SAMPLE} such spectra")),
+            "{msg}"
+        );
+        assert!(msg.contains("600 distinct targets"), "{msg}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `convert.isolation_half_width = h` on a target-only file writes exactly what the same
+    /// file with explicit offsets of `h` writes: every spectra artifact byte for byte, so the
+    /// key reproduces a rewrite that only adds the offsets. Offsets a file carries win over
+    /// the key.
+    #[test]
+    fn the_half_width_reproduces_explicit_offsets() {
+        let d = tmpdir("ztscan_hw");
+        let (bare, explicit) = (d.join("bare.mzML"), d.join("explicit.mzML"));
+        let a = scanning_run(3, 50, None);
+        let b = scanning_run(3, 50, Some(1.9));
+        std::fs::write(&bare, mzml(a.len(), &a)).unwrap();
+        std::fs::write(&explicit, mzml(b.len(), &b)).unwrap();
+        let o_bare = convert_with(&bare, &d.join("bare"), Some(1.9)).unwrap();
+        let o_explicit = convert_with(&explicit, &d.join("explicit"), None).unwrap();
+        let o_both = convert_with(&explicit, &d.join("both"), Some(5.0)).unwrap();
+        for (x, y, z) in [
+            (&o_bare.ms1, &o_explicit.ms1, &o_both.ms1),
+            (&o_bare.ms2, &o_explicit.ms2, &o_both.ms2),
+            (
+                &o_bare.isolation_windows,
+                &o_explicit.isolation_windows,
+                &o_both.isolation_windows,
+            ),
+            (
+                &o_bare.ms2_to_ms1,
+                &o_explicit.ms2_to_ms1,
+                &o_both.ms2_to_ms1,
+            ),
+        ] {
+            let bx = std::fs::read(x).unwrap();
+            assert_eq!(bx, std::fs::read(y).unwrap(), "{x}");
+            assert_eq!(bx, std::fs::read(z).unwrap(), "{z}");
+        }
+        let t = mumdia_io::table::TableFile::open(&o_bare.isolation_windows).unwrap();
+        let (lo, hi) = (t.f64("lower").unwrap(), t.f64("upper").unwrap());
+        assert_eq!(lo.len(), 50);
+        for (l, h) in lo.iter().zip(&hi) {
+            assert!((h - l - 3.8).abs() < 1e-3, "{l} {h}");
+        }
+        // The key is in the report of the conversion that used it, and only there.
+        let params = |o: &ConvertOutputs| -> serde_json::Value {
+            let text = std::fs::read_to_string(format!("{}.report.json", o.ms2)).unwrap();
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["params"].clone()
+        };
+        assert_eq!(
+            params(&o_bare)["isolation_half_width"],
+            serde_json::json!(1.9)
+        );
+        assert!(params(&o_explicit).get("isolation_half_width").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Every MS2 spectrum naming the SAME target and no offsets is what an all-ion
+    /// acquisition that records a nominal target looks like: read as before, one all-ion
+    /// window.
+    #[test]
+    fn a_single_target_without_offsets_stays_all_ion() {
+        let d = tmpdir("ztscan_single");
+        let path = d.join("aif.mzML");
+        let target_only = r#"<cvParam cvRef="MS" accession="MS:1000827" name="isolation window target m/z" value="500.0"/>"#;
+        let spectra: Vec<String> = four_spectra(["0.10", "0.11", "0.20", "0.21"])
+            .into_iter()
+            .map(|s| s.replace(FIXED_ISOLATION, target_only))
+            .collect();
+        std::fs::write(&path, mzml(spectra.len(), &spectra)).unwrap();
+        let o = convert_with(&path, &d.join("out"), None).unwrap();
+        let t = mumdia_io::table::TableFile::open(&o.isolation_windows).unwrap();
+        assert_eq!(t.f64("lower").unwrap(), vec![ALL_ION_WINDOW.1]);
+        assert_eq!(t.f64("upper").unwrap(), vec![ALL_ION_WINDOW.2]);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

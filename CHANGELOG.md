@@ -172,6 +172,47 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Added
+
+- **`convert.isolation_half_width` reads SCIEX ZT Scan DIA.** The SCIEX MS Data Converter
+  writes every Q1 bin of a ZT Scan DIA (scanning-quadrupole) run as an MS2 spectrum that names
+  its target m/z and no window offsets. With the key set to half the method's Q1 window (1.9
+  m/z for 3.8), each such spectrum is read as `[target - h, target + h]`, in the f32
+  arithmetic the mzML reader applies to explicit offsets, so the spectra are the ones a rewrite
+  of the file that only adds the offsets gives. On a ZenoTOF 8600 K562 run that is 663
+  overlapping windows and 97,401 precursors at 1% (97,171 from such a rewrite). Unset by
+  default and then omitted from the canonical configuration; recorded in the spectra reports
+  when set (docs/04_convert.md, "SCIEX ZT Scan DIA").
+- **A footprint guard in extract (`extract.max_footprint_gib`).** Before anything is probed,
+  extract estimates the fragment-peak matches its hit store will hold at once, from a counted
+  sample of peaks against fragments for every window, and refuses an extraction that passes
+  the ceiling, naming an all-ion layout when one window holds the run. Unset is `auto`, the
+  machine's physical memory (looked up once the estimate passes 4 GiB); `0` turns it off. The
+  estimate is logged on every run and was 0.48 to 0.99 of the matches collected on Orbitrap,
+  Astral, diaPASEF, banded immunopeptidomics and ZT Scan layouts, at most 4.1 GiB on them, and
+  7,226 GiB for a ZT Scan run read as one all-ion window (docs/09_extract.md, "The footprint
+  guard"). Not part of the canonical configuration.
+
+### Fixed
+
+- **An MS2 spectrum with an isolation target and no offsets is no longer read as all-ion.**
+  convert used to give such a spectrum the window 0 to 1e6 m/z, so a ZT Scan DIA run became one
+  isolation window holding every spectrum, and extract grew past 521 GB before it was killed. A
+  file whose target-only spectra name more than one target is now refused, once 10,000 of them
+  have been read or at the end of the file, with the layout described (a scanning quadrupole:
+  many distinct targets repeating every cycle in steps finer than any window) and the key that
+  reads it. A file in which they all name one target keeps the all-ion reading, with a warning.
+  Every file with offsets converts byte-identically (checked on an Orbitrap DIA mzML).
+- **The instrument is read from the instrument configuration.** The header parser took the
+  first parameter of the whole parameter group list, which on a SCIEX MS Data Converter file is
+  one of 1,328 spectrum groups, so a ZenoTOF 8600 read as "MS1 spectrum (MS:1000579)". The model
+  now comes from the configurations and the groups they refer to, spectrum-level terms are
+  skipped, a model in a group no configuration names is still found, and the header is read
+  up to `<run>` (at most 16 MiB). The 17 other mzML layouts of the benchmark collection read as
+  before.
+
 ## [0.11.1] - 2026-11-10
 
 ### Changed

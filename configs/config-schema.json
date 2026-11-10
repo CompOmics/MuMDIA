@@ -244,6 +244,19 @@
       "source_struct": "ConvertConfig"
     },
     {
+      "path": "convert.isolation_half_width",
+      "name": "isolation_half_width",
+      "section": "convert",
+      "rust_type": "Option<f64>",
+      "kind": "float",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Half-width in m/z of the quadrupole isolation window, for MS2 spectra that name an isolation window target but no lower or upper offset. Unset (the default), such a spectrum is refused when the file has more than one distinct target, because the m/z range it isolated is unknown (docs/04_convert.md, \"SCIEX ZT Scan DIA\"). Set, each such spectrum is read as the window `[target - h, target + h]`, computed in the same f32 arithmetic the mzML reader applies to explicit offsets, so a file with offsets of `h` and the same file without them read with `h` give the same windows. The case it is for is SCIEX ZT Scan DIA (scanning-quadrupole DIA) as the SCIEX MS Data Converter writes it: every Q1 bin of a cycle is a spectrum carrying only its target, and `h` is half of the method's Q1 window (1.9 for a 3.8 m/z window). On a ZenoTOF 8600 K562 run, 1.5, 1.9 and 2.3 were equal within one-seed noise. Spectra that carry offsets keep them. Must be finite and > 0; omitted from the canonical configuration while unset, so it changes no config hash then, and recorded in the spectra reports (`params.isolation_half_width`) when set.",
+      "gates": [],
+      "source_struct": "ConvertConfig"
+    },
+    {
       "path": "prescan.tol_da",
       "name": "tol_da",
       "section": "prescan",
@@ -2179,6 +2192,19 @@
       "default": "null",
       "default_text": "null",
       "help": "Isolation windows probed per batch before the candidates no later window can touch are scored and written. `None` (the default) uses the rayon thread count capped at 16, and at 4 on spectra that carry 1/K0 (diaPASEF). The hit accumulator holds the windows in flight, so this sets the stage's peak almost linearly: on the HYE benchmark at 32 threads, 32 in flight is 24.65 GiB, 16 is 16.57 GiB and 8 is 12.31 GiB, with identical output (docs/27 section 3.10). A diaPASEF run has few, dense window groups, and one 60 min HYE run at 20 threads took 45.1 GiB at 16, 31.9 at 8 and 21.4 at 4, fastest at 4, with identical output (docs/35_diapasef.md section 16). It is a memory knob only: each window is probed in parallel over sub-ranges of its candidates, so a small batch still uses every thread. Set 8 or 4 on a memory-bound machine. Not a sensitivity knob. It does move the chromatogram table's parquet row group boundaries, which follow the flush batches, so two runs at different settings produce files that differ byte for byte while holding the same rows in the same order with the same values (measured on one band: 29,028,466 rows, 10.4 billion trace elements, every per-column sum equal). Compare values, not bytes, across settings.",
+      "gates": [],
+      "source_struct": "ExtractConfig"
+    },
+    {
+      "path": "extract.max_footprint_gib",
+      "name": "max_footprint_gib",
+      "section": "extract",
+      "rust_type": "Option<f64>",
+      "kind": "float",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Refuse an extraction whose hit store is estimated, before anything is probed, to hold more than this many GiB at once. Unset (the default) is `auto`: the machine's physical memory (the cgroup limit when a container sets a smaller one), checked only once the estimate passes 4 GiB, and no check when the memory cannot be read. `0` turns the check off; a number is a ceiling of your own. Under `groups.parallel` each band in flight gets its share of the ceiling. The estimate is the stage's largest structure, the fragment-peak matches each window collects, for the windows held at once: a batch of `windows_in_flight` on the streamed path, the whole run under a two-pass peak claim, the contested features or the bucketed matcher. Per window it sums, over (a sample of) the candidates the window reaches, their fragments times the peaks of the window's scans inside their RT (and 1/K0) windows times the chance that a peak falls within the fragment tolerance, with the peaks spread evenly over the log m/z span of the scans, at 20 bytes a match. It is an order-of-magnitude estimate, logged on every run (`extract: estimated hit store`), not a prediction of the peak RSS. The case it exists for is an all-ion layout: spectra whose isolation window is the whole m/z range, so that every spectrum reaches every candidate and nothing can be written before the end of the run. A SCIEX ZT Scan DIA run converted without isolation offsets was such a layout (one window, 2.15 million spectra) and grew past 521 GB in extract before it was killed. Not part of the canonical configuration: it changes whether the stage runs, not what it computes.",
       "gates": [],
       "source_struct": "ExtractConfig"
     },
