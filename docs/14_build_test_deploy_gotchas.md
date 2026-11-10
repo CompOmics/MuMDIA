@@ -714,20 +714,23 @@ that download fails.
 *Timings.* Job durations in seconds, measured on pull request #302 (a change to
 `ci.yml`, so every job does its work) against run 42813996334, the last green run before
 it. "Cold" had no cache at all; "warm" restored the caches the cold run saved, which is
-the steady state of a pull request whose Cargo.lock matches `main`:
+the steady state of a pull request whose Cargo.lock matches `main`, and "warm again" is
+the next push. The spread between the two warm runs is the runners': the same cached
+build ran the engine's library tests on Linux in 109 s once and 190 s the next time, and
+the desktop job's `apt-get` took 41 s and then 192 s:
 
-| job | before | cold | warm |
-|---|---|---|---|
-| build + test (windows-latest) | 1184 | 465 | 329 |
-| build + test (macos-latest) | 838 | 419 | 373 |
-| build + test (ubuntu-latest) | 448 | 318 | 175 |
-| end-to-end smoke (windows-latest) | 625 | 423 | 460 |
-| end-to-end smoke (ubuntu-latest) | 269 | 386 | 262 |
-| fmt + clippy | 115 | 135 | 78 |
-| cargo audit | 155 | 149 | 20 |
-| desktop app | 213 | 202 | 94 |
-| desktop app (windows) | 329 | 1263 | 264 |
-| whole run (wall clock) | 1203 | 1267 | 476 |
+| job | before | cold | warm | warm again |
+|---|---|---|---|---|
+| build + test (windows-latest) | 1184 | 465 | 329 | 374 |
+| build + test (macos-latest) | 838 | 419 | 373 | 402 |
+| build + test (ubuntu-latest) | 448 | 318 | 175 | 284 |
+| end-to-end smoke (windows-latest) | 625 | 423 | 460 | 482 |
+| end-to-end smoke (ubuntu-latest) | 269 | 386 | 262 | 198 |
+| fmt + clippy | 115 | 135 | 78 | 66 |
+| cargo audit | 155 | 149 | 20 | 16 |
+| desktop app | 213 | 202 | 94 | 224 |
+| desktop app (windows) | 329 | 1263 | 264 | 265 |
+| whole run (wall clock) | 1203 | 1267 | 476 | 501 |
 
 First attempts of the runs just before this change took 926 to 1203 s. The critical path
 is now the Windows smoke job, almost all of it the shipped-profile build of the
