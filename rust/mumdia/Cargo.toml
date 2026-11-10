@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/mumdia-core", "crates/mumdia-io", "crates/mumdia"]
+# Third-party sources patched in through `[patch.crates-io]` below. A path dependency under
+# the workspace directory would otherwise become a member, and `--workspace` would then
+# lint, test and document someone else's crate as if it were ours.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.11.0"
@@ -68,11 +72,25 @@ mimalloc = { version = "0.1", default-features = false }
 # `filemanager` with default features, which pulls object_store, tokio and a second
 # arrow/parquet; 0.4 with `tdf` adds rusqlite, zstd 0.13, memmap2 and linreg. Its SQLite is
 # bundled C, like the zstd-sys that parquet already builds, so no new toolchain is needed.
+# The timsrust that builds is the patched copy in `vendor/timsrust` (`[patch.crates-io]`
+# below), not the crates.io package.
 # `rusqlite` is named to read `TimsCalibration` and the routing probe, which timsrust does
-# not expose. It must stay on timsrust's minor version, so the graph keeps one
+# not expose. It must stay on the vendored timsrust's minor version, so the graph keeps one
 # `libsqlite3-sys` (a `links` crate).
 timsrust = { version = "0.4.2", default-features = false, features = ["tdf"] }
-rusqlite = { version = "0.32", default-features = false }
+rusqlite = { version = "0.41", default-features = false }
+
+# timsrust 0.4.2 requires rusqlite 0.32, whose libsqlite3-sys 0.30 bundles a C SQLite older
+# than 3.54.0 (RUSTSEC-2026-0459, CVE-2026-119375: uninitialised page-cache memory when a
+# database is opened alongside a crafted `-wal` file of another page size). No 0.4 release
+# raises it, and timsrust 0.6.8 does not fix it either: its `filemanager` requires rusqlite
+# ^0.35, still short of the libsqlite3-sys 0.39 that carries the fixed SQLite. So the reader
+# is vendored with its manifest's rusqlite raised to 0.41; the header of
+# `vendor/timsrust/Cargo.toml` lists exactly what differs from the published crate, and the
+# Rust sources are unmodified. Remove this entry and the directory when a timsrust release
+# MuMDIA can take requires libsqlite3-sys >= 0.39.
+[patch.crates-io]
+timsrust = { path = "vendor/timsrust" }
 
 [profile.release]
 opt-level = 3

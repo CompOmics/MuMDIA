@@ -1380,6 +1380,25 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/foldhash@0.2.0",
+      "name": "foldhash",
+      "version": "0.2.0",
+      "purl": "pkg:cargo/foldhash@0.2.0",
+      "description": "A fast, non-cryptographic, minimally DoS-resistant hashing algorithm.",
+      "licenses": [
+        {
+          "expression": "Zlib"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/orlp/foldhash"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/futures-core@0.3.32",
       "name": "futures-core",
       "version": "0.3.32",
@@ -1525,25 +1544,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/hashbrown@0.14.5",
-      "name": "hashbrown",
-      "version": "0.14.5",
-      "purl": "pkg:cargo/hashbrown@0.14.5",
-      "description": "A Rust port of Google's SwissTable hash map",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/rust-lang/hashbrown"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "pkg:cargo/hashbrown@0.17.1",
       "name": "hashbrown",
       "version": "0.17.1",
@@ -1563,10 +1563,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/hashlink@0.9.1",
+      "bom-ref": "pkg:cargo/hashlink@0.12.2",
       "name": "hashlink",
-      "version": "0.9.1",
-      "purl": "pkg:cargo/hashlink@0.9.1",
+      "version": "0.12.2",
+      "purl": "pkg:cargo/hashlink@0.12.2",
       "description": "HashMap-like containers that hold their key-value pairs in a user controllable order",
       "licenses": [
         {
@@ -1576,7 +1576,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/kyren/hashlink"
+          "url": "https://github.com/djc/hashlink"
         }
       ]
     },
@@ -1985,10 +1985,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/libsqlite3-sys@0.30.1",
+      "bom-ref": "pkg:cargo/libsqlite3-sys@0.39.1",
       "name": "libsqlite3-sys",
-      "version": "0.30.1",
-      "purl": "pkg:cargo/libsqlite3-sys@0.30.1",
+      "version": "0.39.1",
+      "purl": "pkg:cargo/libsqlite3-sys@0.39.1",
       "description": "Native bindings to the libsqlite3 library",
       "licenses": [
         {
@@ -2780,10 +2780,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/rusqlite@0.32.1",
+      "bom-ref": "pkg:cargo/rusqlite@0.41.1",
       "name": "rusqlite",
-      "version": "0.32.1",
-      "purl": "pkg:cargo/rusqlite@0.32.1",
+      "version": "0.41.1",
+      "purl": "pkg:cargo/rusqlite@0.41.1",
       "description": "Ergonomic wrapper for SQLite",
       "licenses": [
         {
@@ -3343,7 +3343,33 @@
           "type": "vcs",
           "url": "https://github.com/mannlabs/timsrust"
         }
-      ]
+      ],
+      "pedigree": {
+        "ancestors": [
+          {
+            "type": "library",
+            "name": "timsrust",
+            "version": "0.4.2",
+            "purl": "pkg:cargo/timsrust@0.4.2"
+          }
+        ],
+        "patches": [
+          {
+            "type": "unofficial",
+            "resolves": [
+              {
+                "type": "security",
+                "id": "RUSTSEC-2026-0459",
+                "source": {
+                  "name": "RustSec",
+                  "url": "https://rustsec.org/advisories/RUSTSEC-2026-0459"
+                }
+              }
+            ]
+          }
+        ],
+        "notes": "Vendored copy of timsrust 0.4.2 from crates.io (upstream commit 50d5c5ce); MuMDIA changed only its Cargo.toml, raising rusqlite from 0.32 to 0.41 (with fallible_uint) so the bundled SQLite is fixed for RUSTSEC-2026-0459. The Rust sources are unmodified."
+      }
     },
     {
       "type": "library",
@@ -4639,6 +4665,10 @@
       ]
     },
     {
+      "ref": "pkg:cargo/foldhash@0.2.0",
+      "dependsOn": []
+    },
+    {
       "ref": "pkg:cargo/futures-core@0.3.32",
       "dependsOn": []
     },
@@ -4690,19 +4720,15 @@
       ]
     },
     {
-      "ref": "pkg:cargo/hashbrown@0.14.5",
+      "ref": "pkg:cargo/hashbrown@0.17.1",
       "dependsOn": [
-        "pkg:cargo/ahash@0.8.12"
+        "pkg:cargo/foldhash@0.2.0"
       ]
     },
     {
-      "ref": "pkg:cargo/hashbrown@0.17.1",
-      "dependsOn": []
-    },
-    {
-      "ref": "pkg:cargo/hashlink@0.9.1",
+      "ref": "pkg:cargo/hashlink@0.12.2",
       "dependsOn": [
-        "pkg:cargo/hashbrown@0.14.5"
+        "pkg:cargo/hashbrown@0.17.1"
       ]
     },
     {
@@ -4832,7 +4858,7 @@
       ]
     },
     {
-      "ref": "pkg:cargo/libsqlite3-sys@0.30.1",
+      "ref": "pkg:cargo/libsqlite3-sys@0.39.1",
       "dependsOn": [
         "pkg:cargo/cc@1.2.65",
         "pkg:cargo/pkg-config@0.3.34",
@@ -4919,7 +4945,7 @@
         "pkg:cargo/mzdata@0.68.0",
         "pkg:cargo/parquet@60.1.0",
         "pkg:cargo/rayon@1.12.0",
-        "pkg:cargo/rusqlite@0.32.1",
+        "pkg:cargo/rusqlite@0.41.1",
         "pkg:cargo/serde@1.0.229",
         "pkg:cargo/serde_json@1.0.154",
         "pkg:cargo/thiserror@2.0.21",
@@ -5176,13 +5202,13 @@
       ]
     },
     {
-      "ref": "pkg:cargo/rusqlite@0.32.1",
+      "ref": "pkg:cargo/rusqlite@0.41.1",
       "dependsOn": [
         "pkg:cargo/bitflags@2.13.0",
         "pkg:cargo/fallible-iterator@0.3.0",
         "pkg:cargo/fallible-streaming-iterator@0.1.9",
-        "pkg:cargo/hashlink@0.9.1",
-        "pkg:cargo/libsqlite3-sys@0.30.1",
+        "pkg:cargo/hashlink@0.12.2",
+        "pkg:cargo/libsqlite3-sys@0.39.1",
         "pkg:cargo/smallvec@1.15.2"
       ]
     },
@@ -5350,7 +5376,7 @@
         "pkg:cargo/linreg@0.2.0",
         "pkg:cargo/memmap2@0.9.11",
         "pkg:cargo/rayon@1.12.0",
-        "pkg:cargo/rusqlite@0.32.1",
+        "pkg:cargo/rusqlite@0.41.1",
         "pkg:cargo/thiserror@1.0.69",
         "pkg:cargo/zstd@0.13.3"
       ]

@@ -173,20 +173,53 @@ def collect() -> list[dict]:
     for p in meta["packages"]:
         if p["name"] in OURS:
             continue
-        pkgs.append({
+        entry = {
             "name": p["name"],
             "version": p["version"],
             "license": p.get("license") or "",
             "repository": p.get("repository") or "",
-        })
+        }
+        if p.get("source") is None:
+            entry.update(vendored(p))
+        pkgs.append(entry)
     pkgs.sort(key=lambda p: (p["name"].lower(), p["version"]))
     srcdirs = registry_src_dirs()
     tarballs = registry_tarballs()
     for p in pkgs:
-        p["copyrights"], p["notices"] = notices_for(
-            p["name"], p["version"], srcdirs, tarballs
-        )
+        if "vendored" in p:
+            # From the copy in this repository, never from the registry: a fresh runner's
+            # registry does not hold the crates.io original of a patched crate (the lockfile
+            # no longer names it), while a developer's may, and the document must not
+            # depend on which machine generated it.
+            p["copyrights"], p["notices"] = _scan(_from_src(ROOT / p["vendored"]))
+        else:
+            p["copyrights"], p["notices"] = notices_for(
+                p["name"], p["version"], srcdirs, tarballs
+            )
     return pkgs
+
+
+def vendored(p: dict) -> dict:
+    """Where a third-party PATH package lives in this repository, and how it was changed.
+
+    A path package that is not one of ours is upstream source carried in the repository
+    (`rust/mumdia/vendor/`, wired in through `[patch.crates-io]`). It is still third-party
+    code under its own licence, so it stays in the inventory with its upstream name,
+    version and licence, and its `package.metadata.mumdia.patched` note says what differs
+    from the published crate. A vendored crate without that note is an error rather than
+    an unexplained copy.
+    """
+    note = ((p.get("metadata") or {}).get("mumdia") or {}).get("patched", "")
+    if not note.strip():
+        raise SystemExit(
+            f"{p['name']} {p['version']} is a path dependency outside the workspace with no "
+            f"[package.metadata.mumdia] patched note in {p['manifest_path']}"
+        )
+    crate_dir = Path(p["manifest_path"]).parent
+    return {
+        "vendored": os.path.relpath(crate_dir, ROOT).replace(os.sep, "/"),
+        "patched": " ".join(note.split()),
+    }
 
 
 def registry_src_dirs() -> list[Path]:
@@ -408,9 +441,24 @@ def render(pkgs: list[dict]) -> str:
         choice = permissive_choice(p["license"])
         repo = p["repository"]
         src = f"[{repo}]({repo})" if repo.startswith("http") else (repo or "-")
+        if "vendored" in p:
+            src += f", patched copy in `{p['vendored']}`"
         a(f"| `{p['name']}` | {p['version']} | {p['license']} | "
           f"{('`' + choice + '`') if choice else '-'} | {src} |")
     a("")
+
+    patched = [p for p in pkgs if "vendored" in p]
+    if patched:
+        a("## Patched crates")
+        a("")
+        a("Built from a modified copy carried in this repository instead of the package")
+        a("published on crates.io. Each remains the upstream authors' work under the licence")
+        a("listed above, and its notices below are read from that copy; the modification is")
+        a("MuMDIA's, and the modified files say so.")
+        a("")
+        for p in patched:
+            a(f"- `{p['name']}` {p['version']} (`{p['vendored']}`): {p['patched']}")
+        a("")
 
     a("## Licence texts")
     a("")
