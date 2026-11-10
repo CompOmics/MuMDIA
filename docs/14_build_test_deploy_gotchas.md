@@ -31,12 +31,13 @@ configurations in `configs/`, the container definition in `Dockerfile` +
 | `rust/mumdia/crates/mumdia-io/Cargo.toml` | I/O crate; adds `arrow`/`parquet`/`blake3` over `mumdia-core`, plus `rayon` for the dedicated parquet codec pool (`codec.rs`) and `bytes` for the `SpanCache` `ChunkReader` (`span_cache.rs`) |
 | `rust/mumdia/crates/mumdia/tests/pipeline.rs` | The only integration test file: extract -> features -> compete -> rescore on crafted Parquet |
 | `rust/mumdia/crates/mumdia-core/build.rs` | Stamps the git commit and build date into the crate so `manifest.json` can record them |
-| `.github/workflows/ci.yml` | Eight jobs: `lint` (fmt + clippy `-D warnings` + rustdoc), `audit` (`cargo audit` on both lockfiles, engine and desktop), `build-test` matrix on ubuntu/macos/windows, `smoke` (end-to-end `run` and `run-experiment` on a generated fixture, ubuntu + windows), `sidecar-imports` (a real conda env per sidecar, matrixed, plus `pip-audit`), `smoke-cross-platform` (asserts the two platforms produced byte-identical `peptides.tsv` and `proteins.tsv`), `desktop` (the console's own workspace: fmt, clippy, unit tests, and a frontend/backend consistency check), `sidecars` (compileall + JSON/YAML parse + doc-reference check + generated-document freshness); on push-to-`main`, every PR, weekly, and on demand |
+| `.github/workflows/ci.yml` | Nine jobs: `lint` (fmt + clippy `-D warnings` + rustdoc), `audit` (`cargo audit` on both lockfiles, engine and desktop), `build-test` (`cargo test --workspace`) matrix on ubuntu/macos/windows, `smoke` (release build of the binary, then end-to-end `run` and `run-experiment` on a generated fixture, ubuntu + windows), `sidecar-imports` (a real conda env per sidecar, matrixed, plus `pip-audit`), `smoke-cross-platform` (asserts the two platforms produced byte-identical `peptides.tsv` and `proteins.tsv`), `desktop` (the console's own workspace: fmt, clippy, unit tests, and a frontend/backend consistency check), `desktop-windows` (the console on Windows and its MSI, installed and uninstalled), `sidecars` (compileall + JSON/YAML parse + doc-reference check + generated-document freshness); on push-to-`main`, every PR, weekly, and on demand. The Rust jobs skip their steps when `ci/ci_scope.sh` finds nothing they check in the change |
 | `.github/workflows/release.yml` | Dormant until a `v*` tag; `validate-tag` gates on tag-equals-workspace-version, ancestry from `main` and a green `ci.yml` for that exact SHA, then builds three target binaries, smoke-tests each, unpacks each archive into a clean directory and runs that archive's own `ci/smoke.sh`, and attaches archives + `.sha256` to the Release. `workflow_dispatch` rehearses everything except the upload |
 | `.github/workflows/docker.yml` | Builds the image into the local daemon, smoke-tests it, then pushes to GHCR only on a `v*` tag; build-and-smoke-only on `workflow_dispatch` |
 | `.github/dependabot.yml` | Monthly grouped Cargo + GitHub Actions + Docker base-image updates; `arrow*`/`parquet*` grouped apart because they carry the on-disk contract. No `pip` entry: the Python pins live in the pip sections of the `env/` conda specifications, which Dependabot cannot parse |
 | `ci/check_doc_refs.py` | Fails when a tracked file cites a Markdown document the repository does not ship |
 | `ci/check_workflows.py` | Rejects workflow YAML GitHub would refuse, notably duplicate mapping keys, which PyYAML accepts silently and which only surface when a workflow is dispatched |
+| `ci/ci_scope.sh` | Tells a CI job whether the change touches anything it checks (`run=true`/`false`): classifies every changed path, treats an unknown one as the engine, and runs everything on a schedule or dispatch. `CI_SCOPE_FILES=<paths>` shows the decision for a list of paths locally |
 | `ci/check_desktop_ui.py` | Checks the desktop frontend against its backend: every element id it looks up exists, and the `invoke` names and `generate_handler!` list agree in both directions |
 | `ci/test_desktop_ui.mjs` | Drives the desktop Setup screen in Node (`vm`, a stub document and a fake `invoke`): the component cards, the install log pane and the poll through an installation and its load check. `APP_JS=<file>` runs it against another copy of `app.js` |
 | `ci/smoke.sh` | End-to-end smoke test: builds the fixture, runs `convert` and `run`, then `ci/check_smoke.py`; runnable locally as well as in CI |
@@ -588,49 +589,154 @@ leaving their scientific-Python graph to pip (`docker-rescore.yml:16-21`). The
 `numpy<2`, which 4.5.0 does not require, and the multitask model weight ships
 inside the DeepLC package, so nothing is downloaded at run time.
 
-**CI workflow.** `ci.yml` triggers on push to `main` and on every pull request
-(`ci.yml:3-6`), with a `concurrency` group per ref and `cancel-in-progress: true`
-(`ci.yml:8-10`) so a newer push supersedes an in-flight run on the same ref. It
-runs five jobs, and together they are the full gate `CLAUDE.md` states plus the
+**CI workflow.** `ci.yml` triggers on push to `main`, on every pull request, weekly
+(Monday 06:00 UTC) and on `workflow_dispatch`. Runs of one pull request share a
+`concurrency` group with `cancel-in-progress: true`, so a newer push supersedes the run
+in flight; each push to `main` is a group of its own, so a quick second merge does not
+cancel the first merge's run. That matters twice: the release gate wants a successful
+run for the exact tagged commit, and `main` is the only ref that saves the caches pull
+requests restore. Together the jobs are the full gate `CLAUDE.md` states plus the
 end-to-end and non-Rust checks:
 
-- `lint` (`ci.yml:16-43`), one `ubuntu-latest` runner under
-  `working-directory: rust/mumdia`: `cargo fmt --check` (`ci.yml:37-38`) and
-  `cargo clippy --workspace --all-targets --locked -- -D warnings`
-  (`ci.yml:42-43`). `--all-targets` is deliberate, so dead code reachable only
-  from a test module still fails. Formatting and clippy were previously a local
-  responsibility and `main` could carry a tree that failed them; when this job was
-  added it immediately caught two unformatted hunks and two dead functions on a
-  branch treated as ready.
-- `build-test` (`ci.yml:45-74`): `cargo build --release --locked` then
-  `cargo test --workspace --locked` on `ubuntu-latest`, `macos-latest` and
-  `windows-latest` with `fail-fast: false`. `--workspace` is explicit because the
-  release binary is only one of the three members. `--locked` forces the committed
-  `Cargo.lock`, so lockfile drift fails CI.
-- `smoke` (`ci.yml:82-116`), on `ubuntu-latest` and `windows-latest` with Python
-  3.12 plus `pyarrow`: build `--bin mumdia`, then `ci/smoke.sh` under bash on both
-  platforms (`ci.yml:114-116`). This is the only end-to-end coverage there is. The
-  Rust integration test builds its inputs in process and starts at `extract`, so
-  mzML parsing, the `digest -> peptidoforms -> predict-frag` library build, the
-  `run` orchestrator, `manifest.json`, RT calibration on real anchors, and `quant`
-  and `report` writing files were all untested before it. The fixture is
-  generated rather than committed: `ci/make_fixture_mzml.py` builds the mzML from
-  `test_data/fixture.fasta` and from the library the engine itself derives from
-  it, so the planted peaks cannot disagree with the engine's own mass model, and
-  the repository still contains no mzML or Parquet. It uses
-  `configs/examples/native.json`, so it needs no sidecar and no network.
-- `sidecars` (`ci.yml:118-164`), one `ubuntu-latest` runner with Python 3.12:
-  `python -m compileall -q scripts ci` (`ci.yml:132-133`), a JSON parse of every
-  tracked `*.json` from `git ls-files` (`ci.yml:139-146`), a YAML parse of every
-  tracked `env/*.yml` and `docker/*.yml` (`ci.yml:150-158`), and
-  `python ci/check_doc_refs.py` (`ci.yml:163-164`), which fails when a tracked
-  file cites a Markdown document the repository does not ship.
+- `lint` (fmt + clippy), one `ubuntu-latest` runner under
+  `working-directory: rust/mumdia`: `cargo fmt --check`,
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`, the same clippy
+  with `--features thermo`, and `cargo doc` with `RUSTDOCFLAGS=-D warnings`.
+  `--all-targets` is deliberate, so dead code reachable only from a test module still
+  fails. Formatting and clippy were previously a local responsibility and `main` could
+  carry a tree that failed them; when this job was added it immediately caught two
+  unformatted hunks and two dead functions on a branch treated as ready.
+- `audit`: `cargo audit` over both lockfiles, with the ignores and their reasons in the
+  workflow. `cargo-audit` is pinned (`CARGO_AUDIT_VERSION`) and its binary cached under
+  that version.
+- `build-test` (build + test): `cargo test --workspace --locked` on `ubuntu-latest`,
+  `macos-latest` and `windows-latest` with `fail-fast: false`. `--workspace` is explicit
+  because the release binary is only one of the three members. `--locked` forces the
+  committed `Cargo.lock`, so lockfile drift fails CI. Until 2026-11-10 the job ran
+  `cargo build --release --locked` first, which on Windows took longer than the tests
+  and built a binary nothing in the job used; the release profile is now compiled by
+  `smoke` (Linux and Windows) and by `release.yml` (every target, macOS included).
+- `smoke` (end-to-end smoke), on `ubuntu-latest` and `windows-latest` with Python 3.12
+  plus `pyarrow`: `cargo build --release --locked --bin mumdia` with the shipped
+  `[profile.release]`, `ci/gen_cli_reference.py --check`, then `ci/smoke.sh` under bash
+  on both platforms. This is the only end-to-end coverage there is. The Rust
+  integration test builds its inputs in process and starts at `extract`, so mzML
+  parsing, the `digest -> peptidoforms -> predict-frag` library build, the `run`
+  orchestrator, `manifest.json`, RT calibration on real anchors, and `quant` and
+  `report` writing files were all untested before it. The fixture is generated rather
+  than committed: `ci/make_fixture_mzml.py` builds the mzML from
+  `test_data/fixture.fasta` and from the library the engine itself derives from it, so
+  the planted peaks cannot disagree with the engine's own mass model, and the
+  repository still contains no mzML or Parquet. It uses `configs/examples/native.json`,
+  so it needs no sidecar and no network. `smoke-cross-platform` then compares the two
+  legs' output hashes.
+- `desktop` and `desktop-windows`: the console's own workspace on Linux (fmt, clippy,
+  unit tests, the frontend checks) and on Windows (clippy, unit tests, the Visual C++
+  runtime installer end to end, then the MSI built, checked, installed and
+  uninstalled).
+- `sidecar-imports`: a real conda environment per sidecar, only when the sidecars,
+  their environments or the Dockerfile change, and always on the schedule.
+- `sidecars` (python sidecars + configs), one `ubuntu-latest` runner with Python 3.12:
+  `python -m compileall -q scripts ci`, a JSON parse of every tracked `*.json`, the
+  desktop Python environments resolved with uv, `ci/check_workflows.py`, a YAML parse
+  of the environment specifications, the sidecar contract tests, the freshness of the
+  generated config reference, licence notice and SBOM, and `ci/check_doc_refs.py`,
+  which fails when a tracked file cites a Markdown document the repository does not
+  ship.
 
-All three cargo jobs cache `~/.cargo/registry`, `~/.cargo/git` and
-`rust/mumdia/target` keyed on `Cargo.lock` with a per-OS restore-key prefix
-(`ci.yml:27-35`, `ci.yml:58-66`, `ci.yml:99-107`); the lint job uses a distinct
-key prefix so its artifacts do not collide with the matrix builds, and `smoke`
-shares the `build-test` key deliberately, since it builds the same binary.
+The branch protection on `main` requires eight of these by name: `fmt + clippy`,
+`cargo audit`, `build + test` on each of the three platforms, `end-to-end smoke` on
+both, and `python sidecars + configs`.
+
+*Scope.* Each Rust job's first step is `bash ci/ci_scope.sh <job>`, which classifies
+every path the change touches and writes `run=true` or `run=false`; with `false` the
+job skips its remaining steps, leaves a notice saying so, and still reports success
+under its usual name. Skipping steps rather than the job is what keeps the required
+checks working: a matrix job skipped by a job-level `if:` reports under its unexpanded
+name, never as `build + test (windows-latest)`, and the pull request would wait for it
+forever. The classes:
+
+| change touches | jobs that do their work |
+|---|---|
+| `docs/` (except docs/23), Markdown outside `rust/` and `desktop/`, `LICENSE`, `.github` metadata | `audit`, `sidecars` |
+| Python-only files: `tests/python/`, `bench/`, the conda specifications, the Python checks in `ci/`, `release.yml` / `docker.yml` | as above, plus `sidecar-imports` where it applies |
+| `docs/23_cli_reference.md` | as above, plus the Linux smoke, which checks it against `--help` |
+| `scripts/` | as above, plus the Linux build + test (the engine's tests `include_str!` workers), the Linux smoke, the Linux desktop job and `sidecar-imports` |
+| `desktop/`, `env/console-*`, `configs/config-schema.json` | the desktop jobs, plus the Linux build + test and smoke |
+| `ci/check_desktop_ui.py`, `ci/test_desktop_ui.mjs` / the two MSI scripts in `ci/` | the Linux / the Windows desktop job |
+| anything else (`rust/`, `configs/examples/`, `test_data/`, the smoke scripts, any path the script does not know) | everything, including the Linux desktop job, but not the MSI |
+| `.github/workflows/ci.yml` or `ci/ci_scope.sh` | everything |
+
+A pull request is diffed as its merge commit against the first parent (hence
+`fetch-depth: 2` on those checkouts), a push against `github.event.before`; a
+scheduled or dispatched run, or any run whose base cannot be established, does
+everything.
+`CI_SCOPE_FILES=$'docs/04_convert.md\nscripts/mbr_worker.py' bash ci/ci_scope.sh smoke`
+prints the decision for a list of paths. A path that belongs to no class is treated as
+the engine, so a new directory costs a full run until it is classified, never a skipped
+check.
+
+*Build settings.* The workflow sets `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only`, `CARGO_PROFILE_TEST_DEBUG=line-tables-only`
+and `CARGO_NET_RETRY=10`. None of them reaches `[profile.release]`, so `smoke` still
+builds and runs the binary that ships. Every run starts from a fresh checkout, so
+incremental state was never reused. Line tables against full debug info, measured once
+per platform on a cold build (2026-11-10): Windows compiled the test build in 165 s
+against 293 s and ran the suite in 128 s against 292 s, Linux 109 s against 122 s and
+124 s against 203 s, macOS within its run-to-run noise (255 / 299 s against
+228 / 330 s). The suite's run time is set by one test,
+`both_feature_layouts_compete_and_score_identically` (110 to 150 s alone), so running it
+under cargo-nextest, even with the slow tests started first, gained nothing on Windows
+and Linux and 10 to 20% on macOS, which is not on the critical path; nextest is not
+used. Raising the test profile's opt-level was measured and rejected: `opt-level = 1` cut
+the suite's run time to a quarter but cost more than that in compile time on a warm
+cache, and it changes float results on Windows, where two tests that pin a per-platform
+feature digest then fail.
+
+*Caches.* Each cargo job restores its own cache (`engine-lint-`, `engine-test-`,
+`engine-release-`, `desktop-` plus the OS), so lint, test and release artifacts no longer
+overwrite one another under one key. The key carries the toolchain (the
+`rust-toolchain.toml` hash, or the runner's `rustc -V` for the desktop workspace, which
+pins none) and the lockfile, and a manual `v1` to bump when the build settings above
+change. The cache holds `~/.cargo/registry/index`, `~/.cargo/registry/cache` and the
+target directory minus the workspace's own crates and the vendored `timsrust`: a
+checkout makes those sources newer than any cached artifact, so they are rebuilt on every
+run, and caching them (with incremental state and full debug info) was most of an entry
+of up to 1.9 GB (macOS); an entry is now 165 to 225 MB for the engine. Only `main` saves,
+and `main` restores its exact key only, so a new lockfile produces a clean cache instead
+of the previous one plus the new crates; pull requests restore, falling back to the
+newest cache for their toolchain. The Windows MSI job also
+caches `cargo-tauri.exe` (pinned, `TAURI_CLI_VERSION`) and the WiX toolset the bundler
+downloads into `%LOCALAPPDATA%\tauri`, whose download from GitHub had failed the job with
+HTTP 503 and 504 on several pull requests; the MSI build is retried when, and only when,
+that download fails.
+
+*Timings.* Job durations in seconds, measured on pull request #302 (a change to
+`ci.yml`, so every job does its work) against run 42813996334, the last green run before
+it. "Cold" had no cache at all; "warm" restored the caches the cold run saved, which is
+the steady state of a pull request whose Cargo.lock matches `main`:
+
+| job | before | cold | warm |
+|---|---|---|---|
+| build + test (windows-latest) | 1184 | 465 | 329 |
+| build + test (macos-latest) | 838 | 419 | 373 |
+| build + test (ubuntu-latest) | 448 | 318 | 175 |
+| end-to-end smoke (windows-latest) | 625 | 423 | 460 |
+| end-to-end smoke (ubuntu-latest) | 269 | 386 | 262 |
+| fmt + clippy | 115 | 135 | 78 |
+| cargo audit | 155 | 149 | 20 |
+| desktop app | 213 | 202 | 94 |
+| desktop app (windows) | 329 | 1263 | 264 |
+| whole run (wall clock) | 1203 | 1267 | 476 |
+
+First attempts of the runs just before this change took 926 to 1203 s. The critical path
+is now the Windows smoke job, almost all of it the shipped-profile build of the
+workspace's own crates (250 to 375 s with every dependency cached: thin LTO and one
+codegen unit leave the 4-core runner little to parallelise). Overriding LTO and codegen
+units for that one build measured about 80 s faster, and was not done, because the smoke
+job is the one place a pull request builds the binary that ships. The cold desktop
+figure is a `cargo install tauri-cli` from source (620 s) that the bundler cache now
+holds.
 
 What CI still does not do: run the Python sidecars. `compileall` is a syntax
 floor, not validation. Real DeepLC, mokapot, `nn_torch`, entrapment and MBR

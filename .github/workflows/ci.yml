@@ -31,10 +31,10 @@ permissions:
 # ships, with the shipped profile.
 #
 # - No incremental compilation. Every run starts from a fresh checkout, so the
-#   incremental state is never reused; it was a large part of what the caches carried.
-# - Line tables instead of full debug info. Backtraces still name file and line. The test
-#   build compiled 1.5x faster on Windows and the suite RAN 2x faster there and 1.6x on
-#   Linux, measured 2026-11-10 (docs/14, "CI workflow").
+#   incremental state is never reused, only stored in the caches.
+# - Line tables instead of full debug info. Backtraces still name file and line, and the
+#   test build is smaller; on Windows it also compiled and ran faster (docs/14, "CI
+#   workflow", has the measurements).
 # - crates.io downloads retried ten times rather than cargo's default three.
 #
 # The cargo cache keys below carry a `v1`; bump it with any change to these settings, or
@@ -49,7 +49,7 @@ env:
 #
 # Scope. A job first asks `ci/ci_scope.sh` whether the change touches anything it checks,
 # and skips its steps when it does not: a documentation-only change, for example, builds
-# nothing. The job still runs and reports, because eight of them are required checks on
+# nothing. The job still runs and reports, because eight of the checks are required on
 # `main`. Scheduled and dispatched runs always do everything; the script's header has the
 # rules, and an unrecognised path runs everything.
 #
