@@ -195,6 +195,20 @@ than a number. Both are recorded in every run's `manifest.json`.
   7,226 GiB for a ZT Scan run read as one all-ion window (docs/09_extract.md, "The footprint
   guard"). Not part of the canonical configuration.
 
+- **A model of the quadrupole sweep for scanning-quadrupole spectra, opt-in.** For SCIEX ZT
+  Scan DIA read with `convert.isolation_half_width`, where every Q1 bin is a window of its own:
+  `extract.q1_cycles` sums a candidate's bins of one cycle into one chromatogram point at the bin
+  nearest its precursor; `extract.q1_profile` writes the Q1-profile evidence of every accepted
+  row (psms_extracted v5: `q1_corr`, `q1_offset`, `q1_frag_sd`, `q1_bin_frac`, the matched
+  intensity across the covering bins of the apex cycles against the trapezoid a window swept
+  over one step transmits); `extract.q1_gate_max_offset` gates on the profile centroid; and
+  `features.q1_features` gives the four columns to the classifier. Refused on any other
+  isolation layout and on spectra with 1/K0; every key is off by default and omitted from the
+  canonical configuration, so every other search is byte-identical. On one ZenoTOF 8600 run
+  the profile features gained 0.4% precursors (four NN seeds), and 0.1% human precursors on an
+  entrapment library at a combined FDP of 1.32% against 1.39%, while summing the bins lost
+  about 14%, so all of them stay off (docs/09_extract.md, section 10).
+
 ### Fixed
 
 - **An MS2 spectrum with an isolation target and no offsets is no longer read as all-ion.**

@@ -781,10 +781,12 @@ groups at 1%, about 106,500 precursors per run on `run_psm_q`, in 40 min at an 8
 peak on 64 threads (the rewritten files: 110,581 / 89,032 / 8,958), the peak from three
 concurrent second-pass extracts; a single run takes about 36-40 GB.
 
-What the engine does not do: model the quadrupole sweep. Each bin is an independent fixed
-window, its spectra a chromatogram cadence of their own, and the transmission profile of a
-precursor across the bins of one cycle is not used. Search the precursor range the method
-scanned with a library restricted to it.
+By default the engine does not model the quadrupole sweep: each bin is an independent
+fixed window, and a candidate's chromatogram interleaves the bins that cover its precursor.
+Search the precursor range the method scanned with a library restricted to it. Three
+opt-in keys model the sweep (`extract.q1_cycles`, `extract.q1_profile`,
+`features.q1_features`; docs/09_extract.md, section 10): summing the bins of a cycle lost
+about 14%, and the Q1-profile features gained 0.4%, so all three stay off.
 
 ### The two extension collisions
 

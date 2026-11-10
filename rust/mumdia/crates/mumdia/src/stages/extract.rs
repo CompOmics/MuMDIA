@@ -7946,7 +7946,7 @@ mod q1_tests {
         // Hits outside the five cycles around the apex cycle are not read.
         assert_eq!(q1_profile_of(&own, &l, &cover, pm, 0).bin_frac, 1.0);
         assert_eq!(
-            q1_profile_of(&own, &l, &cover, pm, 4 + Q1_PROFILE_CYCLES as u32 + 1),
+            q1_profile_of(&own, &l, &cover, pm, 4 + Q1_PROFILE_CYCLES + 1),
             Q1Profile::default()
         );
     }

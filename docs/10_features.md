@@ -714,6 +714,19 @@ branch's 1/K0 width and peak-shape block (P7) lost 0.9% and is not ported, and a
 shared-Gaussian co-elution fit separated no better than `xcorr_shape` (docs/35 section 12).
 The diaPASEF recipe (`configs/examples/diapasef.json`) sets `im_features = on`.
 
+### q1_profile (4; `features.q1_features`)
+
+Scanning-quadrupole spectra (SCIEX ZT Scan DIA) only. In the battery only when
+`features.q1_features` is on (`false` by default), which needs `extract.q1_profile`:
+`q1_corr`, `q1_offset`, `q1_frag_sd` and `q1_bin_frac`, read under the same names from
+psms_extracted v5 and appended after every other column of the `extended` set
+(`Q1_FEATURES`); `minimal` and `rich` ignore the switch. They describe how the matched
+intensity of the five apex cycles is spread over the Q1 bins that cover the precursor,
+against the transmission profile its m/z predicts (docs/09_extract.md, section 10). The
+switch comes from the configuration, as the schema id the orchestrators record does, so a
+psms_extracted table without the columns is an error rather than zeros. Nothing reads a
+label. Measured on one ZT Scan run: +0.4% precursors (mean of four NN seeds, inside the seed range), +0.4% in a three-run experiment, +0.1% human precursors on an entrapment library at a combined FDP of 1.32% against 1.39%.
+
 ## The Percolator PIN (`write_pin`, `features.rs:1537`)
 
 Streamed row-by-row through a `BufWriter` (not materialized as one String).
@@ -829,6 +842,7 @@ variant no longer exists).
 | `bound_from_confident` | false | true = learn one global left/right half-width from the confident seed set and apply it to every candidate; false (default since 2026-10-04) = per-candidate detection |
 | `bound_confident_pct` | 50.0 | percentile of the confident-set half-widths taken as the global half-width (50 = median) |
 | `chrom_loaders` | 3 | chromatogram decode threads in the main pass, an upper bound that `--threads` and the chunk count also cap (see "The chunked pass" below); changes time and memory only, never a value or a byte of the features table |
+| `q1_features` | false | the `q1_profile` family of scanning-quadrupole spectra, which needs `extract.q1_profile`; appended last under `extended`. Omitted from the canonical configuration at its default |
 | `im_features` | `off` | the `ion_mobility` family (`off`, `on`, `auto` = on when the spectra carry 1/K0). `run` and `run-experiment` resolve it once (`Config::resolve_im_features`) and hand every stage `on` or `off`; a standalone `mumdia features` resolves `auto` from the reader extract recorded in the chromatograms report. On a 4D run it also makes extract write the chromatograms' per-point 1/K0 (v3/v4). Omitted from the canonical configuration at its default |
 
 Note that the fragment tolerance used inside `mass_accuracy` is a hardcoded

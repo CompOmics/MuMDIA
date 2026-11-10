@@ -1002,6 +1002,86 @@ carry the rebuilt and copied row counts, the frames decoded, the readers, the ra
 summed, the fragment grid points without a frame, the MS1 residual and the time of each
 phase.
 
+### 10. Scanning-quadrupole data (SCIEX ZT Scan DIA, default off)
+
+A ZT Scan DIA run read with `convert.isolation_half_width` (docs/04_convert.md, "SCIEX ZT
+Scan DIA") has one isolation window per Q1 bin: 663 windows of 3.8 m/z whose targets step
+0.7614 m/z, each sampled once a 1 s cycle, the bins 1.345 ms apart. A precursor falls in
+about five of them, so its candidate's chromatogram grid (the scans of every covering
+window) interleaves five bins a cycle, each at its own transmission. Three keys model the
+sweep instead. All three are off by default and omitted from the canonical configuration,
+so a 3D or 4D search without them is byte-identical; each is refused on any other layout.
+
+- The layout (`Q1Layout`): the distinct windows in `WindowKey` order, and a cycle per sweep,
+  read off the scans in acquisition order (a new cycle where a bin's target falls back by
+  more than half a step, or where a window repeats). It must have at least 50 windows
+  stepping less than 1.5 m/z and at least 1.5 steps wide, the thresholds of convert's
+  scanning-quadrupole diagnosis; anything else, and spectra with 1/K0, is refused with the
+  layout named. The extract log and reports record the windows, cycles and step.
+- `extract.q1_cycles` sums a candidate's matches in the bins of one cycle into one point
+  (`q1_merge`): every hit moves to the scan of the candidate's anchor bin (the covering
+  window whose target is nearest the precursor m/z) in its own cycle, one fragment's
+  intensities at one point are summed in hit order (in f64, so deterministically), its
+  observed m/z is their intensity-weighted mean, and the chromatogram grid is the anchor
+  bin's scans. Hits in a cycle where the anchor bin has no scan (only at the ends of a
+  regular sweep) are dropped. Every score, gate and trace after it reads the merged hits.
+- `extract.q1_profile` writes each accepted row's Q1-profile evidence (psms_extracted v5,
+  four Float64 columns appended last, `q1_profile_of`). Over the unmerged hits of the five
+  cycles around the apex cycle, the matched intensity in each covering window is compared
+  with the share of the precursor that window transmits: a window of half-width `h` swept
+  over one step `s` during its bin passes a precursor at distance `d` from its target
+  whole while `d <= h - s / 2`, not at all beyond `h + s / 2`, and linearly between.
+  `q1_corr` is their Pearson correlation; `q1_offset` the intensity-weighted centroid of
+  the window targets minus the expected one, in half-widths; `q1_frag_sd` the
+  intensity-weighted spread of each fragment's own centroid around the observed one, in
+  half-widths; `q1_bin_frac` the share of covering windows with signal. A fragment shared
+  with a precursor at another m/z sits in the bins that transmit that one, which pulls
+  its centroid away. Promoted alternative peaks carry their own.
+- `extract.q1_gate_max_offset` rejects a row whose `|q1_offset|` passes it; it needs
+  `q1_profile`. `features.q1_features` appends the four columns, under their own names,
+  after every other column of the `extended` set (`features::Q1_FEATURES`); it needs
+  `extract.q1_profile`, and a table without the columns is an error.
+
+Measured on the ZenoTOF 8600 K562 REP01 run (`isolation_half_width = 1.9`, imported
+library with predicted decoys, the shipped `nn_torch` recipe; precursors at
+`precursor_q`, peptides at `peptide_q_value`, protein groups at `pg_q_value`, 1%; seed 0
+unless noted, seeds 1-3 rescoring the same competed table):
+
+| arm | precursors | peptides | protein groups | precursors vs base |
+|---|---|---|---|---|
+| base (no Q1 key), seed 0 | 97,401 | 78,612 | 7,742 | |
+| base, mean of seeds 0-3 (precursor range) | 97,317 (96,873-97,541) | 78,627 | 7,721 | |
+| `q1_profile` + `features.q1_features`, seed 0 | 97,805 | 78,951 | 7,660 | +0.4% |
+| the same, mean of seeds 0-3 (precursor range) | 97,724 (97,203-98,037) | 78,920 | 7,708 | +0.4% |
+| `q1_cycles` | 84,043 | 68,675 | 7,187 | -13.7% |
+| `q1_cycles`, `apex_count_window = 1` | 86,340 | 70,442 | 7,346 | -11.4% |
+| `q1_cycles` + `q1_profile` + `features.q1_features` | 85,898 | 69,832 | 7,263 | -11.8% |
+| three runs as one experiment, base | 110,433 | 88,958 | 8,981 | |
+| three runs as one experiment, `q1_profile` + `features.q1_features` | 110,860 | 89,381 | 9,012 | +0.4% |
+
+| arm (entrapment library, mean of seeds 0-3 and range) | human precursors | entrapment precursors | combined FDP |
+|---|---|---|---|
+| base | 95,115 (95,050-95,191) | 376 (365-391) | 1.39% (1.35-1.44%) |
+| `q1_profile` + `features.q1_features` | 95,223 (95,002-95,438) | 359 (345-369) | 1.32% (1.27-1.36%) |
+
+The Q1 profile separates (profile arm, seed 0): its correlation has a median of 0.68 for
+the targets accepted at 1% against 0.13 for all extracted targets and 0.07 for the decoys,
+and the fragments' centroid spread 0.08 against 0.16 half-widths for both. It adds little,
+most likely because the interleaved grid already carries the same evidence: every fragment
+of a precursor rises and falls with the same transmission across the bins of a cycle,
+which the trace correlations read, and an interfering fragment does not. `q1_bin_frac` is
+1 for every row (some peak matches in every covering bin), so the rescorer drops it as a
+constant column. Summing the bins removes the modulation and leaves a fifth of the
+points; with the shipped extraction settings 28% more candidates pass extract and 12-14%
+fewer precursors are identified. The gate is no use at any threshold measured: the
+centroid offset of 90% of the accepted targets lies within -0.11 to +0.11 half-widths,
+and `|q1_offset| > 0.3` removes 4.0% of the extracted targets and 4.1% of the decoys
+alike.
+
+All three keys stay off and benchmark-gated: a second ZT Scan acquisition could not be
+converted with its isolation targets for this measurement (docs/04_convert.md, "SCIEX ZT
+Scan DIA"), and CLAUDE.md asks for one before any default changes.
+
 ## Key types and functions
 
 | Name | file:line | What it does |
@@ -1112,6 +1192,9 @@ here for one index.
 | `retrace.repick` (default false) | none; patches `apex_rt` / `apex_im` | IM branch: +7.4% peptides E. coli (3 seeds), entrapment +5.4% real peptides at an FDP of 0.37-0.47%, HYE +8.4% (seed 0); main: +8.0% E. coli (one seed); gate pending on main |
 | `extract.im_gate` (default `off`, diaPASEF only) | none; fragment peaks outside the 1/K0 window are not matched (section 8) | IM branch: +5.7% E. coli (3 seeds); main, with `features.im_features`: +5.0% (one seed); gate: paired entrapment and HYE seeds (docs/35 arm T12) |
 | `retrace.apex_features` (default false) | 1 F64 col `imc_ref_w` in `psms_extracted`; the tenth ion-mobility feature | IM branch: +1.3% alone, about 2.7% FDP on the added peptides; gate pending |
+| `extract.q1_cycles` (default false, scanning quadrupole only) | none; a candidate's Q1 bins of one cycle become one chromatogram point (section 10) | ZT Scan REP01: -13.7% precursors (one seed); keep off |
+| `extract.q1_profile` + `features.q1_features` (default false) | psms_extracted v5: 4 F64 cols `q1_corr`, `q1_offset`, `q1_frag_sd`, `q1_bin_frac`; four features | ZT Scan REP01: +0.4% precursors (mean of four NN seeds, inside the seed range), +0.4% in a three-run experiment, +0.1% human precursors on an entrapment library at a combined FDP of 1.32% against 1.39%; one acquisition |
+| `extract.q1_gate_max_offset` (unset) | none; rejects on `q1_offset` | not useful at any threshold measured (section 10) |
 | `compete.mode` (`CompetitionMode`, `config.rs:840`, default `winner_take_all`) | retains more rows in `competed`; optional `<out>.compete_audit.parquet` via `emit_competition_audit` (`config.rs:850`) | not measured; gate pending |
 
 ## Invariants, determinism, gotchas

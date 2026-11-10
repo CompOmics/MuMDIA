@@ -2209,6 +2209,51 @@
       "source_struct": "ExtractConfig"
     },
     {
+      "path": "extract.q1_cycles",
+      "name": "q1_cycles",
+      "section": "extract",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with `convert.isolation_half_width`): sum a candidate's matches in the Q1 bins of one cycle into one chromatogram point, placed at the bin whose target is nearest its precursor m/z, instead of keeping every bin a point of its own. The about five bins that transmit a precursor are 1.3 ms apart, so without it the traces interleave them, each at its own transmission. Refused on any other isolation layout and on spectra that carry 1/K0. Default false. Benchmark-gated (docs/09_extract.md, \"Scanning-quadrupole data\"). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ExtractConfig"
+    },
+    {
+      "path": "extract.q1_profile",
+      "name": "q1_profile",
+      "section": "extract",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Scanning-quadrupole spectra: write each accepted candidate's Q1-profile evidence (psms_extracted v5): how the matched fragment intensity of its apex cycles is spread over the Q1 bins that cover its precursor, against the trapezoid the quadrupole's window, swept across a bin, transmits a precursor at that m/z with. `q1_corr` is their Pearson correlation, `q1_offset` the shift of the observed centroid from the expected one in half-widths, `q1_frag_sd` the spread of the fragments' own centroids in half-widths, `q1_bin_frac` the share of covering bins with signal. A fragment shared with a precursor at another m/z pulls its centroid that way. `features.q1_features` gives them to the classifier. Refused as `q1_cycles` is. Default false. Benchmark-gated. Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ExtractConfig"
+    },
+    {
+      "path": "extract.q1_gate_max_offset",
+      "name": "q1_gate_max_offset",
+      "section": "extract",
+      "rust_type": "Option<f64>",
+      "kind": "float",
+      "optional": true,
+      "default": "null",
+      "default_text": "null",
+      "help": "Reject a candidate whose Q1-profile centroid is further than this many half-widths from the expected one (`|q1_offset|`). Needs `q1_profile`. Unset: no gate. Must be finite and > 0. Benchmark-gated. Omitted from the canonical configuration while unset.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "ExtractConfig"
+    },
+    {
       "path": "extract.fixed_scan_window",
       "name": "fixed_scan_window",
       "section": "extract",
@@ -3075,6 +3120,21 @@
         "on",
         "auto"
       ]
+    },
+    {
+      "path": "features.q1_features",
+      "name": "q1_features",
+      "section": "features",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "The Q1-profile family of scanning-quadrupole spectra: `q1_corr`, `q1_offset`, `q1_frag_sd` and `q1_bin_frac` from psms_extracted v5 (`extract.q1_profile`, which it needs), appended after every other column of the `extended` set. Default false. Benchmark-gated (docs/09_extract.md, \"Scanning-quadrupole data\"). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
+      "source_struct": "FeaturesConfig"
     },
     {
       "path": "compete.group_by",
