@@ -208,6 +208,38 @@ than a number. Both are recorded in every run's `manifest.json`.
   the profile features gained 0.4% precursors (four NN seeds), and 0.1% human precursors on an
   entrapment library at a combined FDP of 1.32% against 1.39%, while summing the bins lost
   about 14%, so all of them stay off (docs/09_extract.md, section 10).
+- **spectra_ms2 v3: the Q1 sweep of a scanning-quadrupole run.** When
+  `convert.isolation_half_width` widens the spectra of a SCIEX ZT Scan DIA run, convert records
+  each MS2 spectrum's cycle and its step in the cycle (`q1_cycle`, `q1_step`, appended last);
+  the window columns stay as read. Every other source, and a file that carries its offsets
+  whatever the key, is written byte for byte as before (v1 or v2). On a ZenoTOF 8600 K562 run:
+  3,238 cycles of 663 steps, every step with one target in every cycle. Readers select columns
+  by name; `spectra::load_q1_sweep` reads the two (docs/04_convert.md, `spectra_ms2.parquet`).
+- **`rt_im_train.q1_calibrate`: the Q1 calibration of scanning-quadrupole spectra, opt-in.**
+  From the confident seed PSMs, each strong fragment's Q1 centre over the steps around its
+  elution apex against the centre of the quadrupole's transmission summed over the precursor's
+  isotopes (Poisson-averagine abundance times the chance the fragment stays monoisotopic); the
+  window-centre offset fitted as a smooth function of precursor m/z (and of fragment m/z and
+  retention time when they narrow the residuals), with the effective half-width and edge
+  width, written to `cal.json` (`q1_calibration`, version 1) with the residual distribution in
+  steps. Nothing reads it yet, so every other artifact is unchanged. On the ZenoTOF run the
+  target is the window's centre (not an edge), the residual median moved from -0.108 to +0.003
+  steps and the MAD from 0.188 to 0.158 steps, the offset falls from +0.24 m/z at 395 m/z to
+  -0.06 m/z at 900 m/z, and the window is wider and softer than its nominal 3.8 m/z: whole
+  within 0.57 m/z of its centre and nothing beyond 4.56 m/z (docs/08_rt_im_train.md, section
+  4h). Off by default and omitted from the canonical configuration.
+- **`extract.ms1_calibrate = "surface"` and `extract.prec_tol_auto`, opt-in.** The surface fits
+  the seed anchors' MS1 error as an additive smooth function of precursor m/z and retention time
+  and centres every MS1 read on the offset at its own m/z and retention time; `prec_tol_auto`
+  sets `extract.prec_tol_ppm` to three robust standard deviations of the calibrated residuals
+  (1-15 ppm). `true` and `false` keep their meaning and the configuration hash. On the ZenoTOF
+  run the MS1 error was +2.84 ppm with a robust SD of 2.67 ppm, drifting by about 1 ppm over
+  the gradient and 0.8 ppm over m/z; the surface removed the drift (2.61 ppm) and the tolerance
+  came out at 7.2 ppm, against the 3 ppm default that holds two thirds of the anchors' MS1 peaks
+  there (an Orbitrap AIF run: 0.93 -> 0.80 ppm, 2.2 ppm). Together with the Q1 calibration they
+  gave +0.46% precursors (mean of four NN seeds, 97,317 -> 97,765) and +0.19% human precursors
+  on an entrapment library at a combined FDP of 1.40% against 1.39% (docs/09_extract.md, section
+  11). Recorded in the extract report when set.
 
 ### Fixed
 

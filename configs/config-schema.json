@@ -2183,6 +2183,22 @@
       "source_struct": "RtImTrainConfig"
     },
     {
+      "path": "rt_im_train.q1_calibrate",
+      "name": "q1_calibrate",
+      "section": "rt_im_train",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Scanning-quadrupole spectra (SCIEX ZT Scan DIA read with `convert.isolation_half_width`): calibrate the Q1 dimension on the confident seed PSMs (`stages::q1cal`). For each anchor's strongest library fragments, the matched intensity in every Q1 step near its precursor over the cycles around its seed scan gives the fragment's observed Q1 centre; the expected centre is that of the transmission, summed over the precursor's isotopes weighted by their abundance. The window-centre offset is fitted as a smooth function of precursor m/z (and of fragment m/z and retention time when they reduce the residuals), with the effective half-width and edge width, and written to `cal.json` (`q1_calibration`), with the residual distribution in steps before and after and which reading of the target (centre or edge) fits. Diagnostic: nothing reads it back yet, so every other artifact is unchanged. Refused on any other layout, on spectra with 1/K0 and with `groups.window_groups > 1`. Default false. Benchmark-gated (docs/08_rt_im_train.md, section 4h). Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated",
+        "diagnostic"
+      ],
+      "source_struct": "RtImTrainConfig"
+    },
+    {
       "path": "extract.windows_in_flight",
       "name": "windows_in_flight",
       "section": "extract",
@@ -2638,14 +2654,19 @@
       "path": "extract.ms1_calibrate",
       "name": "ms1_calibrate",
       "section": "extract",
-      "rust_type": "bool",
-      "kind": "bool",
+      "rust_type": "Ms1Calibrate",
+      "kind": "enum",
       "optional": false,
-      "default": true,
-      "default_text": "true",
-      "help": "Learn the MS1 precursor mass offset from the confident seed anchors before extract and centre every MS1 isotope read on it (`stages::ms1cal`). On by default since 2026-10-08.",
+      "default": "true",
+      "default_text": "`true`",
+      "help": "Learn the MS1 precursor mass offset from the confident seed anchors before extract and centre every MS1 isotope read on it (`stages::ms1cal`). On by default since 2026-10-08. `true` (the default) learns one offset, the median signed ppm error of the anchors; `false` reads at the library m/z. `\"surface\"` fits the error as a smooth function of precursor m/z and retention time instead (an additive robust LOESS of the anchors' errors, sampled on grids), and every MS1 read of extract takes the offset at its own m/z and retention time; the residuals before and after are logged and recorded in the extract report. Measured on a ZenoTOF 8600 run: the error drifted by about 1 ppm over the gradient and 0.8 ppm over m/z (docs/09_extract.md, \"MS1 mass calibration\"). `\"surface\"` is opt-in until it is measured on entrapment and a second acquisition. `true` and `false` keep the configuration hash they had.",
       "gates": [],
-      "source_struct": "ExtractConfig"
+      "source_struct": "ExtractConfig",
+      "choices": [
+        "false",
+        "true",
+        "surface"
+      ]
     },
     {
       "path": "extract.ms1_ppm_offset",
@@ -2658,6 +2679,21 @@
       "default_text": "0.0",
       "help": "MS1 precursor mass offset in ppm (observed - theoretical) applied to every MS1 isotope read. Set by `ms1_calibrate` in `run` / `run-experiment`; 0 by default.",
       "gates": [],
+      "source_struct": "ExtractConfig"
+    },
+    {
+      "path": "extract.prec_tol_auto",
+      "name": "prec_tol_auto",
+      "section": "extract",
+      "rust_type": "bool",
+      "kind": "bool",
+      "optional": false,
+      "default": false,
+      "default_text": "false",
+      "help": "Set `prec_tol_ppm` from the anchors' MS1 errors after the calibration of `ms1_calibrate` (its offset or its surface): `3` times their robust standard deviation (1.4826 times the median absolute deviation, refined once on the residuals within four of them), clamped to 1-15 ppm. The fixed 3 ppm default suits an Orbitrap, whose residuals sit near 1 ppm; a ZenoTOF's are about 2.5 ppm. Needs `ms1_calibrate`; with too few anchors the configured `prec_tol_ppm` stays. Default false. Benchmark-gated. Omitted from the canonical configuration at its default.",
+      "gates": [
+        "benchmark-gated"
+      ],
       "source_struct": "ExtractConfig"
     },
     {
