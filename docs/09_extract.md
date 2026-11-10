@@ -278,6 +278,67 @@ scans, build the matcher, accumulate peak-candidate hits (peak-major), then per
 candidate run the acceptance cascade and apex selection, emit chromatograms and
 MS1 XICs, and write the tables.
 
+### The footprint guard
+
+Before anything is probed, `run_hashed` estimates what the hit store will hold at once
+(`window_loads`, `Footprint`, `check_footprint`) and refuses an extraction that cannot fit,
+instead of growing until the operating system kills it. The estimate is the stage's largest
+structure, the fragment-peak matches (16-byte `Hit`s, plus the 4-byte candidate id a probing
+task keeps beside each until it groups them: 20 bytes a match):
+
+- per isolation window group (`window_groups`), the sum over the candidates the window
+  reaches (every k-th past 65,536, scaled by k) of the candidate's fragment count times the
+  peaks of the window's scans inside its RT window (widened by the trace pad) times the
+  chance that one peak falls within the fragment tolerance of one fragment;
+- that chance takes the window's peaks as spread evenly over the log m/z span of its scans
+  (a sample of 64): `2 * tol_ppm * 1e-6 / ln(hi / lo)` per peak. Under the 1/K0 gate only
+  the share of the slot's 1/K0 range the candidate's window overlaps counts, and an
+  allowlist drops the candidates it excludes;
+- held at once: the largest batch of `windows_in_flight` consecutive windows on the streamed
+  path, every window on the paths that accumulate the whole run (a two-pass peak claim, the
+  contested features, the bucketed matcher).
+
+The ceiling is `extract.max_footprint_gib`: unset (`auto`), the machine's physical memory
+(the cgroup limit when a container sets a smaller one, read by `memlog::total_memory`),
+looked up only once the estimate passes 4 GiB; a number is a ceiling of your own; `0` turns
+the check off. Under `groups.parallel` each band in flight gets its share. The refusal names
+the estimate, the ceiling and, when one window holds more than 100,000 MS2 spectra or the
+run has a single window, the all-ion layout and the convert key that undoes the case it was
+written for. The key is not part of the canonical configuration.
+
+Every run logs the estimate (`extract: estimated hit store`, `resident_gib`, `run_gib`,
+`busiest_window_scans`) and, on the streamed path, the matches the tasks actually returned
+(`extract: task-local fragment indexes`, `hits`, `largest_batch_hits`), so the two can be
+compared. It is an order of magnitude, not a prediction of the peak RSS: real peaks crowd
+where fragments crowd, the batch total overstates what the sub-range flush keeps at once,
+and the library, the spectra and the chromatogram buffers come on top. Measured, estimate
+against the matches collected (largest batch, streamed path):
+
+| layout | windows | in flight | estimated | collected | ratio |
+|---|---|---|---|---|---|
+| Q Exactive HF-X DIA (E. coli entrapment run) | 152 | 16 | 7.46 M | 8.40 M | 0.89 |
+| Orbitrap Astral DIA (HYE, 15 min) | 250 | 16 | 17.7 M | 20.6 M | 0.86 |
+| timsTOF Ultra 2 diaPASEF, native reader (HYE, 15 min) | 24 | 4 | 220 M | 462 M | 0.48 |
+| Astral immunopeptidomics, 63 isolation-window groups (largest band) | 2 | 1 | 153 M | 155 M | 0.99 |
+| ZenoTOF 8600 ZT Scan DIA, `isolation_half_width = 1.9` | 663 | 16 | 112 M | 166 M | 0.67 |
+| the same run read as one all-ion window | 1 | 1 | 388,000 M (7,226 GiB) | killed past 521 GB | |
+
+Over whole runs the estimate is 0.43 to 0.95 of the matches collected. The largest
+estimate of the five ordinary layouts is 4.1 GiB (diaPASEF), far below the memory of any
+machine that searches them; the all-ion layout is refused everywhere. A sample of peaks
+against a sample of fragments, counted, is what gets within a factor of two: peaks spread
+evenly over the m/z span of a scan read 3.4 to 8.5 times low, and two log m/z histograms
+at 0.5% still 3.1 times, because library fragments repeat exact values (the y1 ion of
+every tryptic peptide, the b2 ion of each residue pair) and spectra carry peaks there.
+The estimate took 0.2 s at the start of the ZT Scan extract (663 windows, 5.9 million
+candidates) and 0.04 s on an immunopeptidomics band.
+
+The case it exists for is an all-ion layout: spectra whose isolation window is the whole
+m/z range, which every spectrum then shares, so that every spectrum reaches every candidate
+and no candidate can be written before the end of the run. A SCIEX ZT Scan DIA run read
+without isolation offsets was such a layout (one window, 2.15 million spectra) and grew past
+521 GB in 3.5 minutes; docs/04_convert.md, "SCIEX ZT Scan DIA".
+
 ### 1. Matcher and mass recalibration
 
 The fragment tolerance and a systematic ppm offset come from `mass_cal`
@@ -982,6 +1043,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 
 | Field | Default | Effect |
 |---|---|---|
+| `max_footprint_gib` | unset (`auto`) | Refuse an extraction whose estimated hit store passes this many GiB; `auto` is the machine's memory, `0` is off. See "The footprint guard" |
 | `fixed_scan_window` | 2 (3 before 2026-10-08) | Minimum co-elution run length (`scan_window` floor); `.max(1)` at `extract.rs:1591` |
 | `frag_tol_ppm` | 20.0 | Fragment match tolerance (overridden by `mass_cal`) |
 | `prec_tol_ppm` | 3.0 (20.0 before 2026-10-08) | MS1 isotope integration tolerance, centred on the offset `ms1_calibrate` learns from the seed |

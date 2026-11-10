@@ -22,6 +22,9 @@ is the source of truth if it has moved.
 | `run` aborts with "MS2PIP returned no predictions" | MS2PIP returned an empty map; `predict-frag` has no whole-run native fallback | Fix the MS2PIP env (`mumdia doctor`), or switch to AlphaPeptDeep. `predict_frag.predictor = native` also needs `predict_frag.allow_native_predictors = true` and finds far fewer peptides |
 | `run` aborts during the DeepLC predict / fine-tune / MBR step | `predict-frag`, the fine-tune, and MBR propagate worker errors with `?`; only `rescore` falls back | Fix the sidecar env, or disable that path (`finetune_deeplc = false`, `mbr.strategy = none`; `rt_predictor = native` in a FASTA search also needs `predict_frag.allow_native_predictors = true`) |
 | `run: refusing to build the library of this FASTA search with native fragment intensities (predict_frag.predictor = native) and native retention times ...` (or `run-experiment:`, `build-library:`, `predict-frag:`) before the digest | A FASTA search whose fragment intensities, or retention times with no fine-tune or explicit multi-head calibration to replace them, come from the native fallback models; both are the engine defaults, so a FASTA search without `--config` gets it too (`rt_health.rs`, `refuse_native_predictors`) | Predict the library with MS2PIP or AlphaPeptDeep and DeepLC (`configs/examples/fasta-sidecars.json`, `fasta-peptdeep.json`, `diapasef.json`; check with `mumdia doctor --config`), or search a DIA-NN-predicted library imported with `scripts/import_diann_lib.py`. `predict_frag.allow_native_predictors = true` runs the native models anyway (`configs/examples/native.json`). See "Seed: no confident targets" below |
+| `convert: ...: MS2 spectra name an isolation window target m/z but no lower or upper offset ...` | The converter wrote each MS2 spectrum's target and no window offsets; the SCIEX MS Data Converter writes every Q1 bin of a ZT Scan DIA run that way. Read as before, every spectrum would share one all-ion window and extract would grow until the machine runs out of memory | Set `convert.isolation_half_width` to half the method's Q1 window (1.9 for a 3.8 m/z window). See "Scanning-quadrupole spectra (SCIEX ZT Scan DIA)" below |
+| `extract: the fragment-peak matches this extraction holds at once are estimated at ... GiB ..., more than ...` before any probing | The footprint guard: one isolation window holds the run (an all-ion layout), or the windows in flight with this library and these RT windows cannot fit the machine | For an all-ion layout from a scanning-quadrupole run, convert again with `convert.isolation_half_width`; otherwise lower `extract.windows_in_flight` or search in isolation-window groups. `extract.max_footprint_gib` sets the ceiling, `0` skips the check. See "Scanning-quadrupole spectra (SCIEX ZT Scan DIA)" below |
+| The log names the instrument `MS1 spectrum (MS:1000579)` | An engine before 2026-11-10 took the first parameter of the header's parameter group list, which on a SCIEX MS Data Converter file is a spectrum group | Harmless for the search (only `extract.apex_count_window = auto` reads it, and only for an Astral); fixed: the instrument configuration and the groups it names are read |
 | A short `--max-spectra` run finds almost nothing | The flag reads the file head and the early gradient is void | Use the full file or externally prepare a mid-gradient mzML slice; `--max-spectra` has no offset |
 | A reused `--out-dir` contains contradictory or stale sidecars | `run` recomputes named outputs but does not clear the directory; optional files can remain and a failed rerun can leave an old manifest | Use a fresh output directory for every `run`; reuse artifacts only through explicit standalone stage commands |
 | Config load fails with an unknown-field parse error | `#[serde(deny_unknown_fields)]` rejects any unknown or misspelled key (including a removed knob) | Fix or remove the key; check it against the current `config.rs`, not an old config |
@@ -232,6 +235,37 @@ If any of these fails, fix the sidecar env (`mumdia doctor` probes the configure
 interpreters) or switch that path back to native (`predict_frag.predictor =
 native`, `predict_frag.rt_predictor = native`, `rt_im_train.finetune_deeplc =
 false`, `mbr.strategy = none`).
+
+## Scanning-quadrupole spectra (SCIEX ZT Scan DIA)
+
+Symptom, before 2026-11-10: `convert` reports one isolation window for a ZT Scan DIA run, the
+seed runs normally (half an hour on a 42 GB run), and extract then grows past several
+hundred GB within minutes and is killed, with nothing written. Since then convert refuses
+the file instead, with a message naming the layout:
+
+```text
+convert: ...: MS2 spectra name an isolation window target m/z but no lower or upper offset
+(10000 such spectra in the part of the file read; ...) ... The targets are those of a
+scanning-quadrupole acquisition (SCIEX ZT Scan DIA, or Scanning SWATH): 663 distinct targets
+from 394.256 to 898.271 m/z in steps of 0.7614 m/z ...
+```
+
+Cause: the SCIEX MS Data Converter writes every Q1 bin of the sweep as an MS2 spectrum
+carrying its target and no offsets, and the engine read a window without offsets as
+all-ion, the whole m/z range, so the run had one window that every candidate shared.
+
+Fix: give the half-width of the method's Q1 window,
+
+```json
+{"convert": {"isolation_half_width": 1.9}}
+```
+
+and search with a library restricted to the precursor range the method scanned. Each bin
+is then a window of its own; docs/04_convert.md, "SCIEX ZT Scan DIA", has the measured
+recipe. A ZT Scan `.wiff2` converted by ProteoWizard msconvert 3.0.25036 carries no
+isolation information at all: convert reads it as one all-ion window, and extract's
+footprint guard refuses it before probing (docs/09_extract.md, "The footprint guard").
+Convert such a run with the SCIEX MS Data Converter instead.
 
 ## Truncated-run void
 
