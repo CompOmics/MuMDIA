@@ -1731,8 +1731,29 @@ const FOOTPRINT_HIT_BYTES: f64 = 20.0;
 /// Candidates per window the footprint estimate reads at most; past it every k-th is read
 /// and the sum scaled by k.
 const FOOTPRINT_CANDIDATES: usize = 1 << 16;
-/// Scans per window whose peak m/z span the footprint estimate reads.
-const FOOTPRINT_SPAN_SCANS: usize = 64;
+/// Scans per window whose peaks the footprint estimate matches against the fragment sample.
+const FOOTPRINT_SAMPLE_SCANS: usize = 16;
+/// Candidates per window whose fragments the footprint estimate matches against the peaks.
+const FOOTPRINT_FRAG_CANDIDATES: usize = 2048;
+
+/// The chance that one peak of a scan falls within `tol_ppm` of one fragment, counted: every
+/// peak of a sample of scans against the sorted fragment m/z of a sample of candidates.
+/// `(matches, pairs)`; the rate is their ratio. A model of evenly spread peaks
+/// (`2 tol / ln(hi / lo)` per peak) read 3 to 8 times low on real spectra, and one of two
+/// log m/z histograms at 0.5% still 3 times: library fragments repeat exact values (the
+/// y1 ions of every tryptic peptide, the b2 ions of each residue pair), and real spectra
+/// carry peaks at those values.
+fn sampled_collision_rate(frags: &mut [f32], peaks: &[f32], tol_ppm: f64) -> (u64, f64) {
+    frags.sort_by(f32::total_cmp);
+    let mut matches = 0u64;
+    for &q in peaks {
+        let (lo, hi) = ppm_bounds(q as f64, tol_ppm);
+        let a = frags.partition_point(|&f| (f as f64) < lo);
+        let b = frags.partition_point(|&f| (f as f64) <= hi);
+        matches += (b - a) as u64;
+    }
+    (matches, frags.len() as f64 * peaks.len() as f64)
+}
 /// Below this estimate the `auto` ceiling is not looked up: no machine that runs a search
 /// has less memory, and on Windows the lookup starts a process.
 const FOOTPRINT_AUTO_FLOOR_GIB: f64 = 4.0;
@@ -1758,12 +1779,12 @@ struct WindowLoad {
 /// fragment count times the peaks of the window's scans inside its RT window (widened by the
 /// trace pad) times the chance that one peak falls within the tolerance of one fragment.
 ///
-/// That chance takes the peaks as spread evenly over the log m/z span of the window's scans
-/// (a sample of [`FOOTPRINT_SPAN_SCANS`]): `n` peaks over `ln(hi / lo)` put
-/// `n * 2 * tol_ppm * 1e-6 / ln(hi / lo)` within +-`tol_ppm` of any fragment. Under the 1/K0
-/// gate only the share of the slot's 1/K0 range the candidate's window overlaps counts. An
-/// allowlist drops the candidates it excludes. Real peaks crowd where fragments crowd, so
-/// this reads low by a small factor on a dense run, which is the side a guard for 100-fold
+/// That chance is counted on the peaks of a sample of [`FOOTPRINT_SAMPLE_SCANS`] scans and
+/// the fragments of a sample of [`FOOTPRINT_FRAG_CANDIDATES`] candidates
+/// ([`sampled_collision_rate`]). Under the 1/K0 gate only the share of the slot's
+/// 1/K0 range the candidate's window overlaps counts. An allowlist drops the candidates it
+/// excludes. The fragments of the peptides present match their own peaks more often than
+/// chance, so this still reads low on a dense run, which is the side a guard for 100-fold
 /// excesses can afford.
 fn window_loads(
     groups: &[WinGroup],
@@ -1793,25 +1814,25 @@ fn window_loads(
             for &(_, n) in &by_rt {
                 cum.push(cum.last().copied().unwrap_or(0) + n as u64);
             }
-            let step = (g.scans.len() / FOOTPRINT_SPAN_SCANS).max(1);
-            let (mut sum_ln, mut n_ln) = (0.0f64, 0usize);
-            for &si in g.scans.iter().step_by(step) {
-                let pk = &scans[si].peaks;
-                if let (Some(a), Some(b)) = (pk.first(), pk.last()) {
-                    let (a, b) = (a.mz as f64, b.mz as f64);
-                    if a > 0.0 && b > a {
-                        sum_ln += (b / a).ln();
-                        n_ln += 1;
-                    }
-                }
-            }
-            // One peak a scan, or none: any span gives the same handful of matches.
-            let span_ln = if n_ln > 0 {
-                (sum_ln / n_ln as f64).max(1e-3)
+            // The chance that a peak meets a fragment, counted on samples of both.
+            let step = (g.scans.len() / FOOTPRINT_SAMPLE_SCANS).max(1);
+            let peaks: Vec<f32> = g
+                .scans
+                .iter()
+                .step_by(step)
+                .flat_map(|&si| scans[si].peaks.iter().map(|pk| pk.mz))
+                .collect();
+            let fstep = ((g.hi_cid - g.lo_cid) as usize / FOOTPRINT_FRAG_CANDIDATES).max(1);
+            let mut frags: Vec<f32> = (g.lo_cid..g.hi_cid)
+                .step_by(fstep)
+                .flat_map(|c| lib.cand_frag_mz(c).iter().copied())
+                .collect();
+            let (matches, pairs) = sampled_collision_rate(&mut frags, &peaks, frag_tol_ppm);
+            let rate = if pairs > 0.0 {
+                matches as f64 / pairs
             } else {
-                1.0
+                0.0
             };
-            let rate = 2.0 * frag_tol_ppm * 1e-6 / span_ln;
             let slot_im = match (w.im_lower, w.im_upper, &win.im_lo, &win.im_hi) {
                 (Some(a), Some(b), Some(lo), Some(hi)) if guard.im_gate && b > a => {
                     Some((a, b, lo, hi))
