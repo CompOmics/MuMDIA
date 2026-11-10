@@ -723,9 +723,11 @@ psms_extracted v5 and appended after every other column of the `extended` set
 (`Q1_FEATURES`); `minimal` and `rich` ignore the switch. They describe how the matched
 intensity of the five apex cycles is spread over the Q1 bins that cover the precursor,
 against the transmission profile its m/z predicts (docs/09_extract.md, section 10). The
-switch comes from the configuration, as the schema id the orchestrators record does, so a
-psms_extracted table without the columns is an error rather than zeros. Nothing reads a
-label. Measured on one ZT Scan run: +0.4% precursors (mean of four NN seeds, inside the seed range), +0.4% in a three-run experiment, +0.1% human precursors on an entrapment library at a combined FDP of 1.32% against 1.39%.
+switch comes from the configuration, as the schema id the orchestrators record does, so
+a psms_extracted table without the columns is an error rather than zeros. Nothing reads
+a label. Measured on one ZT Scan run: +0.4% precursors (mean of four NN seeds, inside
+the seed range), +0.4% in a three-run experiment, +0.1% human precursors on an
+entrapment library at a combined FDP of 1.32% against 1.39%.
 
 ## The Percolator PIN (`write_pin`, `features.rs:1537`)
 
