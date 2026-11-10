@@ -23,6 +23,42 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 // `APP_JS` points the harness at another copy of the frontend, to show a test failing
 // on the code it was written against.
 const SOURCE = readFileSync(process.env.APP_JS || join(ROOT, "desktop", "ui", "app.js"), "utf8");
+// `INDEX_HTML` does the same for the markup.
+const HTML = readFileSync(
+  process.env.INDEX_HTML || join(ROOT, "desktop", "ui", "index.html"),
+  "utf8"
+);
+
+// Enough of a parse of `index.html` to say where an element sits: the elements that
+// enclose each element with an id (outermost first, as tag and id), and the order in
+// which the ids appear. The markup closes its elements explicitly; an end tag closes the
+// nearest open element of its name and whatever is still open inside it.
+function htmlTree(html) {
+  const VOID = new Set([
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source",
+    "track", "wbr",
+  ]);
+  const stack = [];
+  const ancestors = new Map();
+  const order = [];
+  const text = html.replace(/<!--[\s\S]*?-->/g, "");
+  for (const [, close, name, attrs] of text.matchAll(/<(\/?)([a-zA-Z][\w-]*)([^>]*)>/g)) {
+    const tag = name.toLowerCase();
+    if (close) {
+      const at = stack.map((e) => e.tag).lastIndexOf(tag);
+      assert.notEqual(at, -1, `index.html: </${tag}> closes nothing`);
+      stack.length = at;
+      continue;
+    }
+    const id = /(?:^|\s)id="([^"]+)"/.exec(attrs)?.[1] ?? null;
+    if (id) {
+      ancestors.set(id, stack.map((e) => ({ ...e })));
+      order.push(id);
+    }
+    if (!VOID.has(tag) && !/\/\s*$/.test(attrs)) stack.push({ tag, id });
+  }
+  return { ancestors, order };
+}
 
 function element(id) {
   const attrs = new Map();
@@ -102,6 +138,7 @@ function load() {
     "state",
     "refreshNormOptions",
     "normOverrides",
+    "searchProblems",
   ];
   const exported = names.map((n) => `${n}: typeof ${n} === "undefined" ? undefined : ${n}`);
   const api = vm.runInContext(`${body}\n;({ ${exported.join(", ")} });`, ctx);
@@ -291,6 +328,88 @@ test("the normalisation note says what quantification runs under each scope", ()
   }
   f.el("norm-scope").value = "all";
   assert.deepEqual({ ...f.api.normOverrides() }, {});
+});
+
+// The normalisation options belong to "One experiment". Placed after both run-mode
+// options, they read as options of "Search each separately" (#298).
+test("the normalisation options sit inside the One experiment choice, above the other", () => {
+  const { ancestors, order } = htmlTree(HTML);
+  const inside = (id) => {
+    assert.ok(ancestors.has(id), `index.html has no element ${id}`);
+    return ancestors.get(id).some((e) => e.id === "runmode-experiment-choice");
+  };
+  for (const id of [
+    "runmode-experiment",
+    "norm-options",
+    "norm-scope",
+    "suggest-conditions",
+    "norm-note",
+    "condition-labels",
+  ]) {
+    assert.ok(inside(id), `${id} is not inside the One experiment choice`);
+  }
+  assert.ok(!inside("runmode-separate"), "Search each separately is inside the experiment choice");
+  // Beside the radio's label, not in it: a label holds one control, and a click on the
+  // selector would select the radio as well.
+  assert.ok(
+    !ancestors.get("norm-options").some((e) => e.tag === "label"),
+    "the normalisation options are inside a label"
+  );
+  const at = (id) => order.indexOf(id);
+  assert.ok(at("runmode-experiment") < at("norm-options"), "under One experiment");
+  assert.ok(at("norm-options") < at("runmode-separate"), "above Search each separately");
+});
+
+test("the normalisation options show only for one experiment of several files", () => {
+  const f = load();
+  const { state } = f.api;
+  const two = ["/d/a.mzML", "/d/b.mzML"];
+  for (const [files, mode, shown] of [
+    [two, "experiment", true],
+    [two, "separate", false],
+    [["/d/a.mzML"], "experiment", false],
+    [["/d/a.mzML"], "separate", false],
+    [[], "experiment", false],
+    [two, "experiment", true],
+  ]) {
+    state.picks.mzml = files;
+    state.runMode = mode;
+    f.api.refreshNormOptions();
+    const what = `${files.length} file(s), ${mode}`;
+    assert.equal(f.el("norm-options").hidden, !shown, what);
+    assert.equal(f.el("norm-scope").disabled, !shown, what);
+    assert.equal(f.el("suggest-conditions").disabled, !shown, what);
+  }
+});
+
+test("a normalisation choice hidden by Search each separately is not sent", () => {
+  const f = load();
+  const { state } = f.api;
+  state.mode = "library";
+  state.picks.mzml = ["/d/a.mzML", "/d/b.mzML"];
+  // b has no condition, which blocks "Within each condition" for an experiment.
+  state.picks.conditions = { "/d/a.mzML": "A" };
+  for (const scope of ["none", "condition"]) {
+    f.el("norm-scope").value = scope;
+    state.runMode = "experiment";
+    f.api.refreshNormOptions();
+    assert.deepEqual({ ...f.api.normOverrides() }, { "quant.normalisation_scope": scope });
+    state.runMode = "separate";
+    f.api.refreshNormOptions();
+    assert.deepEqual({ ...f.api.normOverrides() }, {}, `${scope}, separate`);
+  }
+  // The start-time check of a condition per file follows the same choice.
+  const blocked = () =>
+    [...f.api.searchProblems()].some((s) => /Normalisation within each condition/.test(s));
+  state.runMode = "experiment";
+  assert.ok(blocked(), "an experiment without every condition must be refused");
+  state.runMode = "separate";
+  assert.ok(!blocked(), "separate searches have no normalisation to refuse");
+  // One file is a plain search whatever the radio says.
+  state.runMode = "experiment";
+  state.picks.mzml = ["/d/a.mzML"];
+  assert.deepEqual({ ...f.api.normOverrides() }, {});
+  assert.ok(!blocked());
 });
 
 let failed = 0;

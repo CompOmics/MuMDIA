@@ -165,6 +165,18 @@ results: the per-artifact Parquet schema versions in
 `classifier_feature_schema_id`, which is a hash of the active feature list rather
 than a number. Both are recorded in every run's `manifest.json`.
 
+## [Unreleased]
+
+### Fixed
+
+- **The desktop's Normalisation choice sits under "One experiment" (#298).** With several
+  spectra files selected, the Normalisation selector, its note and the Conditions button came
+  after both run-mode options, under the text of "Search each separately", and read as part of
+  it. They are now inside the One experiment option, directly under it and above Search each
+  separately, indented as that option's settings, and shown and enabled only while One
+  experiment is selected for several files. No normalisation setting is sent for separate
+  searches, as before.
+
 ## [0.11.0] - 2026-11-09
 
 ### Changed

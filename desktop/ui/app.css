@@ -262,6 +262,13 @@ details.advanced > summary .hint { font-weight: 400; margin-left: 8px; }
   margin-top: 8px; cursor: pointer;
 }
 .check input { margin: 3px 0 0; flex: none; accent-color: var(--accent); }
+/* The options of one radio choice, directly under it: a rule under the radio and the
+   content indented to the choice's text, so they read as part of that choice and not
+   of the one after it. */
+.choice-options {
+  margin: 8px 0 4px 6px; padding-left: 14px;
+  border-left: 2px solid var(--rule);
+}
 
 .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0 20px; }
 .grid2 .row label { width: 108px; }

@@ -275,19 +275,41 @@
       <div id="multi-mode" hidden>
         <div class="rule"></div>
         <div class="card-title">Several files selected</div>
-        <label class="check">
-          <input type="radio" name="runmode" id="runmode-experiment" value="experiment" checked />
-          <span>
-            <b>One experiment</b> (default) — a single pooled rescore across all runs, with
-            match-between-runs and cross-run quantification.
-            <span class="hint inline">
-              The FDR is estimated across the whole experiment rather than per file, so
-              the reported counts are experiment-wide; the per-file unit is
-              <code>run_psm_q</code> in the split tables. It writes one experiment-wide
-              report with a quantity column per run, not per-file reports.
+        <!-- The options of an experiment sit inside its own choice, above the next one,
+             so they cannot be read as options of "Search each separately". -->
+        <div id="runmode-experiment-choice">
+          <label class="check">
+            <input type="radio" name="runmode" id="runmode-experiment" value="experiment" checked />
+            <span>
+              <b>One experiment</b> (default) — a single pooled rescore across all runs, with
+              match-between-runs and cross-run quantification.
+              <span class="hint inline">
+                The FDR is estimated across the whole experiment rather than per file, so
+                the reported counts are experiment-wide; the per-file unit is
+                <code>run_psm_q</code> in the split tables. It writes one experiment-wide
+                report with a quantity column per run, not per-file reports.
+              </span>
             </span>
-          </span>
-        </label>
+          </label>
+          <div class="choice-options" id="norm-options" hidden>
+            <div class="grid2">
+              <div class="row">
+                <label for="norm-scope">Normalisation</label>
+                <select id="norm-scope">
+                  <option value="none">None</option>
+                  <option value="all" selected>All samples</option>
+                  <option value="condition">Within each condition</option>
+                </select>
+              </div>
+              <div class="row">
+                <label for="suggest-conditions">Conditions</label>
+                <button type="button" class="btn quiet" id="suggest-conditions">Suggest from the file names</button>
+              </div>
+            </div>
+            <p class="hint" id="norm-note"></p>
+            <datalist id="condition-labels"></datalist>
+          </div>
+        </div>
         <label class="check">
           <input type="radio" name="runmode" id="runmode-separate" value="separate" />
           <span>
@@ -295,24 +317,6 @@
             The files share nothing, and the counts are not additive.
           </span>
         </label>
-        <div id="norm-options">
-          <div class="grid2">
-            <div class="row">
-              <label for="norm-scope">Normalisation</label>
-              <select id="norm-scope">
-                <option value="none">None</option>
-                <option value="all" selected>All samples</option>
-                <option value="condition">Within each condition</option>
-              </select>
-            </div>
-            <div class="row">
-              <label for="suggest-conditions">Conditions</label>
-              <button type="button" class="btn quiet" id="suggest-conditions">Suggest from the file names</button>
-            </div>
-          </div>
-          <p class="hint" id="norm-note"></p>
-          <datalist id="condition-labels"></datalist>
-        </div>
       </div>
       <div class="notice" id="raw-note" hidden>
         <div class="notice-title" id="raw-note-title">Vendor format</div>
