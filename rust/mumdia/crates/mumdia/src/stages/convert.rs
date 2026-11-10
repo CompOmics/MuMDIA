@@ -174,7 +174,7 @@ pub struct ConvertParams<'a> {
     /// Native diaPASEF reading (`convert.tdf_*`); unused for mzML input.
     pub tdf: TdfParams,
     /// `convert.isolation_half_width`: the m/z half-width read for an MS2 spectrum that
-    /// names an isolation window target and no offsets ([`isolation_bounds`]). `None`
+    /// names an isolation window target and no offsets (`isolation_bounds`). `None`
     /// refuses a file with more than one such target.
     pub isolation_half_width: Option<f64>,
 }
@@ -433,7 +433,7 @@ struct Ms2Row {
     target_only: Option<f64>,
 }
 
-/// How an MS2 spectrum's isolation window is read ([`isolation_bounds`]).
+/// How an MS2 spectrum's isolation window is read (`isolation_bounds`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Isolation {
     /// `(target, lower, upper)` m/z: explicit offsets, or a target widened by

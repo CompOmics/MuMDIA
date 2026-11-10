@@ -301,7 +301,7 @@ pub fn recorded(spectra_path: &str) -> Option<Instrument> {
 /// from the configuration's own cvParams outside its `componentList` (the source, analyzer
 /// and detector live there) and from the `referenceableParamGroup`s it refers to, other
 /// than the serial number, a `customization` text and any spectrum-level term
-/// ([`SPECTRUM_TERMS`]). ThermoRawFileParser puts the model in a group the configuration
+/// (`SPECTRUM_TERMS`). ThermoRawFileParser puts the model in a group the configuration
 /// refers to, msconvert and the SCIEX MS Data Converter in the configuration itself. When
 /// no configuration names one, the first such term of the parameter group list is taken,
 /// which is where tdf2mzml writes a timsTOF model without referring to it.
