@@ -100,9 +100,10 @@ fn neutral_mass(e: &Evidence) -> f64 {
     fin(e.precursor_mz * z - z * PROTON)
 }
 
-/// Poisson-averagine isotope weights [T0,T1,T2] (unnormalized), lambda=0.000594*M.
+/// Poisson-averagine isotope weights [T0,T1,T2] (unnormalized), lambda=0.000594*M
+/// (`mumdia_core::constants::AVERAGINE_LAMBDA_PER_DA`).
 fn averagine3(mass: f64) -> [f64; 3] {
-    let lambda = (0.000_594 * mass).max(0.0);
+    let lambda = (mumdia_core::constants::AVERAGINE_LAMBDA_PER_DA * mass).max(0.0);
     let e0 = (-lambda).exp();
     let t0 = fin(e0);
     let t1 = fin(lambda * e0);

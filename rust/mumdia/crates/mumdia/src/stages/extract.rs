@@ -1730,9 +1730,9 @@ fn window_groups(lib: &Library, scans: &[Ms2Scan]) -> Vec<WinGroup> {
 /// there; the narrowest fixed-window methods step 2), and how much wider than the step a
 /// window must be (3.8 against 0.76 there): the windows of a sweep overlap. The thresholds
 /// of `convert`'s scanning-quadrupole diagnosis.
-const Q1_MIN_WINDOWS: usize = 50;
-const Q1_MAX_STEP: f64 = 1.5;
-const Q1_MIN_OVERLAP: f64 = 1.5;
+pub(crate) const Q1_MIN_WINDOWS: usize = 50;
+pub(crate) const Q1_MAX_STEP: f64 = 1.5;
+pub(crate) const Q1_MIN_OVERLAP: f64 = 1.5;
 /// Cycles on each side of the apex cycle the Q1 profile reads: the five cycles around it, as
 /// the window gates read the apex +-2 scans.
 const Q1_PROFILE_CYCLES: u32 = 2;
@@ -3652,7 +3652,7 @@ fn apex_im_stats(
         None
     } else {
         let s1 = &ms1_scans[nearest_index(ms1_rts, apex_rt)];
-        let target = prec_mz * (1.0 + cfg.ms1_ppm_offset * 1e-6);
+        let target = prec_mz * cfg.ms1_shift(prec_mz, apex_rt);
         crate::spectra::ms1_peak_near(s1, target, cfg.prec_tol_ppm, med)
             .and_then(|k| s1.im.as_ref().map(|v| v[k] as f64))
     };
@@ -5091,8 +5091,9 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             let z = c.charge as f64;
             let sp = ISOTOPE_SPACING / z;
             let tol = p.cfg.prec_tol_ppm;
-            let shift = 1.0 + p.cfg.ms1_ppm_offset * 1e-6;
-            let at = |mz: f64| Some(ms1_near(ms1_scans, j, h, mz * shift, tol) as f64);
+            // The one offset, or the surface's at this m/z and retention time.
+            let at =
+                |mz: f64| Some(ms1_near(ms1_scans, j, h, mz * p.cfg.ms1_shift(mz, rt), tol) as f64);
             (
                 at(c.precursor_mz - sp),
                 at(c.precursor_mz),
@@ -5573,9 +5574,12 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         if !ms1_scans.is_empty() && !t_grid.is_empty() {
             let sp = ISOTOPE_SPACING / c.charge as f64;
             let tol = p.cfg.prec_tol_ppm;
-            let shift = 1.0 + p.cfg.ms1_ppm_offset * 1e-6;
+            // Under `ms1_calibrate = "surface"` each point reads at the offset of its own
+            // retention time, and the row's m/z is the one at the apex.
+            let varies = p.cfg.ms1_shift_varies();
             for (nm, dmz) in [("ms1_mono", 0.0), ("ms1_iso1", sp), ("ms1_iso2", 2.0 * sp)] {
-                let mz = (c.precursor_mz + dmz) * shift;
+                let lib_mz = c.precursor_mz + dmz;
+                let mz = lib_mz * p.cfg.ms1_shift(lib_mz, apex_rt);
                 // A row the retrace skeleton zeroes is rebuilt by retrace from the raw events
                 // and its centroid values are never read, so they are not summed: the MS1
                 // reads of these XICs were about half of extract's busy time on a HYE
@@ -5601,7 +5605,12 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                             // an error after, though which of the lint's heuristics
                             // distinguishes `Vec` indexing from slice indexing was not
                             // established.
-                            ms1_near(ms1_scans, j, p.cfg.ms1_scan_halfwidth, mz, tol)
+                            let at = if varies {
+                                lib_mz * p.cfg.ms1_shift(lib_mz, r)
+                            } else {
+                                mz
+                            };
+                            ms1_near(ms1_scans, j, p.cfg.ms1_scan_halfwidth, at, tol)
                         })
                         .collect()
                 };
@@ -6232,6 +6241,15 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 obj.insert("q1_windows".into(), json!(l.win.len()));
                 obj.insert("q1_cycles_found".into(), json!(l.n_cycles));
                 obj.insert("q1_step_mz".into(), json!(l.step));
+            }
+        }
+        // The MS1 calibration of `ms1_calibrate = "surface"` / `prec_tol_auto`, only then,
+        // so a report without either is unchanged.
+        if let Some(cal) = &p.cfg.ms1_cal {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert("ms1_calibration".into(), json!(cal));
+                obj.insert("ms1_ppm_offset".into(), json!(p.cfg.ms1_ppm_offset));
+                obj.insert("prec_tol_ppm".into(), json!(p.cfg.prec_tol_ppm));
             }
         }
         // The support gate, only when it is on, so a report without it is unchanged.

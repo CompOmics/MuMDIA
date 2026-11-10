@@ -2029,6 +2029,12 @@ fn real_main() -> Result<()> {
                      is still optimistic"
                 );
             }
+            if cfg.rt_im_train.q1_calibrate {
+                tracing::warn!(
+                    "rt_im_train.q1_calibrate is set but `mumdia rt-im-train` reads no spectra; \
+                     only `run`/`run-experiment` calibrate the Q1 sweep"
+                );
+            }
             let ch = mumdia_io::hash::blake3_str(&cfg.canonical_json());
             stages::rt_im_train::run(stages::rt_im_train::RtImTrainParams {
                 precursor_span: None,

@@ -124,6 +124,22 @@ pub fn extract_to_compete(p: ChainParams) -> Result<ChainOutputs> {
     // A run left without a calibration is extracted over the whole gradient; say so now,
     // with the causes the library points to, rather than only in the end summary.
     crate::stages::rt_health::warn_after_fit(&d("cal.json"), out_dir, lib_f);
+    // The Q1 calibration of a scanning-quadrupole run (`rt_im_train.q1_calibrate`), added to
+    // the `cal.json` just written. Like retrace, the RT bootstrap pass, which only collects
+    // anchors, skips it.
+    if cfg.rt_im_train.q1_calibrate && retrace_allowed {
+        info!(stage = %"q1-calibrate", "run: stage start");
+        let mass_cal = format!("{seed}.masscal.json");
+        crate::stages::q1cal::run(crate::stages::q1cal::Q1CalParams {
+            seed_psms: seed,
+            ms2: &co.ms2,
+            library_fragments: lib_f,
+            mass_cal: Some(&mass_cal),
+            q_max: rt_cfg.q_train,
+            frag_tol_fallback_ppm: cfg.extract.frag_tol_ppm,
+            out_cal: &d("cal.json"),
+        })?;
+    }
 
     let survivors =
         prescreen::run_if_enabled(cfg, ch, &co.ms2, Some(&co.ms1), lib_p, &windows, out_dir)?;
