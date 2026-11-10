@@ -16,6 +16,8 @@ What it contains:
   SPDX licence expression, and the upstream repository;
 - the dependency GRAPH from `cargo metadata`'s resolve section, not just a flat list,
   so a scanner can tell a direct dependency from something pulled in four levels down;
+- for a third-party crate built from a patched copy under `rust/mumdia/vendor/`, a
+  `pedigree` naming the published release it derives from and what the patch is for;
 - the workspace's own version as the metadata component.
 
 Deliberately absent: a timestamp and a serial number. Both are optional in CycloneDX,
@@ -114,7 +116,49 @@ def component(p: dict) -> dict:
         refs.append({"type": "website", "url": p["homepage"]})
     if refs:
         c["externalReferences"] = refs
+    if p.get("source") is None and p["name"] not in OURS:
+        c["pedigree"] = pedigree(p)
     return c
+
+
+def pedigree(p: dict) -> dict:
+    """CycloneDX pedigree of a third-party crate built from a patched copy in this tree.
+
+    A path package that is not one of ours is upstream source vendored under
+    `rust/mumdia/vendor/` and wired in through `[patch.crates-io]`. It keeps the upstream
+    name, version and purl, because the code is still that release and an advisory against
+    it still applies; the pedigree says it was modified, from what, and why, from the
+    crate's `package.metadata.mumdia` table. A vendored crate without a `patched` note
+    is an error rather than an unexplained copy.
+    """
+    mumdia = (p.get("metadata") or {}).get("mumdia") or {}
+    note = " ".join(str(mumdia.get("patched", "")).split())
+    if not note:
+        raise SystemExit(
+            f"{p['name']} {p['version']} is a path dependency outside the workspace with no "
+            f"[package.metadata.mumdia] patched note in {p['manifest_path']}"
+        )
+    patch: dict = {"type": "unofficial"}
+    resolves = [
+        {
+            "type": "security",
+            "id": adv,
+            "source": {"name": "RustSec", "url": f"https://rustsec.org/advisories/{adv}"},
+        }
+        for adv in mumdia.get("resolves", [])
+    ]
+    if resolves:
+        patch["resolves"] = resolves
+    return {
+        "ancestors": [{
+            "type": "library",
+            "name": p["name"],
+            "version": p["version"],
+            "purl": bom_ref(p["name"], p["version"]),
+        }],
+        "patches": [patch],
+        "notes": note,
+    }
 
 
 def render(meta: dict) -> str:

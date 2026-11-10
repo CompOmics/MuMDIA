@@ -1,0 +1,80 @@
+# MODIFIED BY MUMDIA. This is timsrust 0.4.2 as published on crates.io (upstream commit
+# 50d5c5cecd8ac8173ab52ce497c148c06b899399, https://github.com/mannlabs/timsrust), vendored
+# into MuMDIA and wired in through `[patch.crates-io]` in `rust/mumdia/Cargo.toml`. Apache-2.0
+# section 4(b): this file is the one file changed, and the changes are:
+#
+# 1. `rusqlite` 0.32 -> 0.41. rusqlite 0.32 links libsqlite3-sys 0.30, whose bundled C SQLite
+#    is older than 3.54.0 and carries CVE-2026-119375 (RUSTSEC-2026-0459: uninitialised
+#    page-cache memory when a database is opened alongside a crafted `-wal` file of another
+#    page size). rusqlite 0.41 links libsqlite3-sys 0.39, which bundles a fixed SQLite.
+#    `libsqlite3-sys` is a `links = "sqlite3"` crate, so the graph can hold only one version:
+#    timsrust and MuMDIA's own `rusqlite` move together.
+# 2. `fallible_uint` turned on. rusqlite 0.41 puts `FromSql` for `u64` and `usize` behind
+#    it; the reader's `Sql*` row types decode into both. The implementation it enables is
+#    the one 0.32 had unconditionally (an `i64` checked into the target type, out of range
+#    an error), so no Rust source had to change.
+# 3. rusqlite's default features off, `cache` named instead. In 0.32 the statement cache
+#    was not optional; in 0.41 the defaults are `cache` plus an FFI for
+#    `wasm32-unknown-unknown`, which MuMDIA never builds and which would only add crates to
+#    the lockfile, the SBOM and THIRD_PARTY_LICENSES.md. `bundled` is kept, as upstream had
+#    it, so no system SQLite is needed on any platform.
+# 4. `[dev-dependencies]` and `[[bench]]` removed, because `tests/`, `benches/` and the
+#    upstream CI files are not vendored (only `src/`, `LICENSE`, `README.md` and
+#    `rustfmt.toml`, all unmodified); `publish = false` added.
+# 5. `[lints]` added, allowing `dead_code`. Cargo caps the lints of registry dependencies but
+#    not of path dependencies, so as a vendored copy the crate's one unused error enum
+#    (`IndexedTdfBlobReaderError`) printed a warning in every MuMDIA build.
+#
+# Drop this directory and the `[patch.crates-io]` entry when the reader moves to a timsrust
+# release whose SQLite is fixed. 0.6.8 is not one: it no longer names rusqlite itself, but
+# its `filemanager` 0.6.8 requires rusqlite ^0.35 (`bundled`), whose libsqlite3-sys is
+# older than 0.39.
+
+[package]
+name = "timsrust"
+version = "0.4.2"
+edition = "2021"
+description = "A crate to read Bruker timsTOF data"
+license = "Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/timsrust"
+repository = "https://github.com/mannlabs/timsrust"
+homepage = "https://github.com/mannlabs/timsrust"
+categories = ["accessibility", "data-structures", "parsing", "science"]
+keywords = ["MS", "LC-TIMS-TOF", "PASEF"]
+publish = false
+
+# Read by ci/gen_third_party_licenses.py and ci/gen_sbom.py, which record this crate as a
+# patched third-party component rather than as the crates.io package.
+[package.metadata.mumdia]
+patched = "Vendored copy of timsrust 0.4.2 from crates.io (upstream commit 50d5c5ce); MuMDIA changed only its Cargo.toml, raising rusqlite from 0.32 to 0.41 (with fallible_uint) so the bundled SQLite is fixed for RUSTSEC-2026-0459. The Rust sources are unmodified."
+# The advisories the patch exists for, recorded in the SBOM as what the patch resolves.
+resolves = ["RUSTSEC-2026-0459"]
+
+[dependencies]
+zstd = "0.13.2"
+rayon = "1.10.0"
+linreg = "0.2.0"
+bytemuck = "1.18.0"
+thiserror = "1.0.0"
+memmap2 = "0.9.3"
+# MuMDIA: was `{ version = "0.32.0", features = ["bundled"], optional = true }`.
+rusqlite = { version = "0.41", default-features = false, features = [
+  "bundled",
+  "cache",
+  "fallible_uint",
+], optional = true }
+parquet = { version = "53.0.0", optional = true }
+serde = { version = "1.0.210", features = ["derive"], optional = true }
+serde_json = { version = "1.0.128", optional = true }
+timscompress = { version = "0.1.0", optional = true }
+
+[features]
+tdf = ["rusqlite"]
+minitdf = ["parquet"]
+default = ["tdf", "minitdf", "serialize"]
+serialize = ["serde", "serde_json"]
+
+# MuMDIA: added (see the header).
+[lints.rust]
+dead_code = "allow"
