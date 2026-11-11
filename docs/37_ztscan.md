@@ -367,7 +367,9 @@ the same host:
 The alternative peaks are worth about 1% of the identifications, and the strongest one beside
 the apex's own carries most of it: at 2 the entrapment library is within the seed spread and
 the human library half a percent lower, outside it, for 28% less extract time (about 12% of a
-run). The recipe keeps 5, the setting phase 2 measured and the one it reproduces byte for
+run). The three runs as one experiment at 2 (one seed) gave 113,051 precursors, 90,573
+peptides and 9,056 protein groups (per run 108,892 / 109,219 / 108,998) against 113,013,
+90,739 and 9,027 at 5, and the same replicate CV (0.1025 against 0.1023). The recipe keeps 5, the setting phase 2 measured and the one it reproduces byte for
 byte; 2 is the setting to take when extract's time matters more than half a percent.
 
 ## 9. What is refused
