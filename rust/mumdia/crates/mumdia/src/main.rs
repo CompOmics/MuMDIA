@@ -326,7 +326,8 @@ enum Cmd {
         #[arg(long)]
         fragment_offset: Option<u32>,
         /// The run's `cal.json` with its Q1 calibration (`rt_im_train.q1_calibrate`), which
-        /// `extract.q1_fragments` decides with.
+        /// `extract.q1_fragments` decides with and `extract.q1_deconvolved` /
+        /// `features.q1_deconvolved` read their tolerance from.
         #[arg(long)]
         q1_cal: Option<String>,
         #[arg(long)]
@@ -2131,19 +2132,31 @@ fn real_main() -> Result<()> {
             // The per-fragment Q1 decision reads the run's calibration; the re-pick runs
             // inside extract.
             let mut ext_cfg = cfg.extract.clone();
-            if ext_cfg.q1_fragments {
+            let q1_dec = ext_cfg.q1_deconvolved || cfg.features.q1_deconvolved;
+            if ext_cfg.q1_fragments || q1_dec {
                 let cal = q1_cal.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "extract.q1_fragments needs the run's cal.json with its Q1 calibration: \
-                         pass --q1-cal"
+                        "extract.q1_fragments and extract.q1_deconvolved need the run's \
+                         cal.json with its Q1 calibration: pass --q1-cal"
                     )
                 })?;
-                ext_cfg.q1_model = Some(stages::q1frag::read_model(cal)?);
-                ext_cfg.q1_repick = cfg.retrace.q1_repick;
-                ext_cfg.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
+                ext_cfg.q1_model =
+                    Some(stages::q1frag::read_model_opts(cal, ext_cfg.q1_fragments)?);
+                if ext_cfg.q1_fragments {
+                    ext_cfg.q1_repick = cfg.retrace.q1_repick;
+                    ext_cfg.q1_repick_peaks = cfg.retrace.q1_repick_peaks;
+                }
+                if q1_dec {
+                    ext_cfg.q1_dec_tol_steps = Some(stages::q1frag::read_deconvolution_tol(cal)?);
+                }
             }
             // `features.ms1_envelope`: extract reads the MS1 isotope-envelope evidence.
             ext_cfg.ms1_envelope = cfg.features.ms1_envelope;
+            // `features.q1_precursor` / `features.q1_multiscale`: extract reads the scores on
+            // the per-fragment decision's patches.
+            ext_cfg.q1_precursor = cfg.features.q1_precursor;
+            ext_cfg.q1_multiscale = cfg.features.q1_multiscale;
+            ext_cfg.q1_dec_features = cfg.features.q1_deconvolved;
             stages::extract::run(stages::extract::ExtractParams {
                 precursor_span: None,
                 fragment_offset,

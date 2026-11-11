@@ -1046,6 +1046,56 @@ impl SeedScratch {
         }
     }
 
+    /// [`SeedScratch::accumulate`], counting peak `k` for a candidate only when its Q1
+    /// centroid `cen[k]` lies within `tol` of the candidate's expected Q1 centre
+    /// (`centre[cid]`, `search_seed.q1_deconvolved`, `stages::q1dec`). The order of the sums
+    /// is [`SeedScratch::accumulate`]'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accumulate_q1(
+        &mut self,
+        idx: &FragIndex,
+        peaks: &[(f64, f32)],
+        cen: &[f64],
+        centre: &[f32],
+        tol: f64,
+        cand_lo: u32,
+        cand_hi: u32,
+    ) {
+        self.epoch += 1;
+        self.touched.clear();
+        self.qualified.clear();
+        self.base = cand_lo;
+        self.ensure((cand_hi.saturating_sub(cand_lo)) as usize + 1);
+        let (epoch, base, min_count) = (self.epoch, self.base, self.min_count);
+        let SeedScratch {
+            slots,
+            touched,
+            qualified,
+            ..
+        } = self;
+        for (&(mz, inten), &x) in peaks.iter().zip(cen) {
+            idx.probe_peak_cand(mz, cand_lo, cand_hi, |cid| {
+                if (x - centre[cid as usize] as f64).abs() > tol {
+                    return;
+                }
+                let s = &mut slots[(cid - base) as usize];
+                if s.stamp != epoch {
+                    *s = SeedSlot {
+                        stamp: epoch,
+                        count: 0,
+                        obs_sum: 0.0,
+                    };
+                    touched.push(cid);
+                }
+                s.count += 1;
+                s.obs_sum += inten as f64;
+                if s.count == min_count {
+                    qualified.push(cid);
+                }
+            });
+        }
+    }
+
     /// [`SeedScratch::accumulate`] with each predicted fragment of a candidate counted at
     /// most once per scan, with the intensity of its most intense matching peak, instead of
     /// once per matching peak (`search_seed.count_fragments_once`). Two peaks at one m/z (the

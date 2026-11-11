@@ -220,6 +220,24 @@ index via `page_search` and needs no separate build.
   from 5,200 to 3,331, and counting once brought them to 5,534, +3.8% peptides with the
   split (three seeds). The diaPASEF recipe (`configs/examples/diapasef.json`) sets it
   with both valley fractions.
+- *Q1-deconvolved evidence* (`q1_deconvolved`, default false, scanning-quadrupole spectra
+  only). Every MS2 peak is given the Q1 centroid of its trace along the sweep before the
+  probe (`stages::q1dec::Q1Dec::build`, docs/09_extract.md, section 14: mutual-nearest peaks
+  of adjacent steps of one cycle within `fragment_tol_ppm`, split at valleys; about 6 s and
+  one byte a peak), and a peak counts for a candidate only when its centroid lies within
+  `q1dec::SEED_TOL_STEPS` (2) steps of the candidate's nominal expected centre, the mean m/z
+  of its averagine isotope envelope with no window offset (the seed runs before the Q1
+  calibration). `SeedScratch::accumulate_q1` is `accumulate` with that test inside the probe
+  callback; the bucketed path applies it in its `page_search` callback; the tolerance retry
+  searches with it too. The report records `params.q1_deconvolved` only when on. Needs
+  spectra_ms2 v3 (refused without the sweep and on 1/K0 spectra); refused with
+  `count_fragments_once` and with `groups.window_groups > 1`. Measured on ZT Scan REP01 with
+  the search alone on the run's spectra and library: 25,305 confident targets without it,
+  14,544 / 18,909 / 21,482 / 23,681 at 1 / 1.5 / 2 / 3 steps, fewer at every tolerance tried:
+  the peaks it removes include a real fragment's whenever another ion of its m/z merges into
+  its trace, and the hyperscore of a true seed PSM loses about as much as a decoy's at the
+  1% tail. End to end it costs identifications (docs/37_ztscan.md, section 10). Off by
+  default; benchmark-gated.
 - *Bucketed path* (serial, `search_seed.rs:66-107`): per scan, `candidate_range` on
   the Library, `select_peaks`, then `page_search` for each probed peak accumulates
   `(count, obs_sum)` into a `HashMap`. Same `min_matched_peaks` filter, hyperscore,
@@ -427,6 +445,7 @@ tolerance (falling back to the config value if the file is absent,
 | `FragIndex::probe_peak` / `probe_peak_cand` | `fragindex.rs:396` / `:425` | matched postings for one peak in a candidate range; `probe_peak_cand` reports the candidate only and is what the seed probes through (it also serves an m/z-only index) |
 | `SeedScratch::with_min_count` / `accumulate` / `qualified` | `fragindex.rs:667` / `:691` / `:741` | epoch-stamped `(count, obs_sum)` accumulator, one 16-byte slot per candidate; `qualified` lists the candidates that reached `min_matched_peaks`, in first-reached order |
 | `SeedScratch::accumulate_count_once` / `FragIndex::probe_peak_cand_frag` / `build_mz_only_with_ordinals` | `fragindex.rs` | `count_fragments_once`: each (candidate, fragment) counted once per scan at its most intense peak, through an m/z-only index that also holds the fragment ordinals |
+| `SeedScratch::accumulate_q1` | `fragindex.rs` | `q1_deconvolved`: `accumulate` counting a peak for a candidate only when its Q1 centroid lies within the tolerance of the candidate's centre |
 | `spectra::nearest_peak` | `spectra.rs` | nearest peak within a ppm window, ties to the first; serves the calibrant deviations and the 1/K0 points |
 | `stats::weighted_median` | `stats.rs` | the observed 1/K0 of a confident target |
 | `seed_schema` | `search_seed.rs` | the `seed_psms` version a table on disk records (v2 when it has `observed_im`) |
@@ -458,6 +477,7 @@ on load.
 | `matcher` | `Fragindex` | backend; `MatcherKind::Bucketed` (`config.rs:38`) uses the serial `page_search` path |
 | `two_pass_mass_cal` | `true` | robust second-pass mass fit on the in-window inliers (sensitivity_plan P3.1); default true since 2026-10-11 |
 | `count_fragments_once` | `false` | count each predicted fragment once per spectrum at its most intense matching peak (step 3); fragindex only; omitted from the canonical configuration at the default |
+| `q1_deconvolved` | `false` | scanning-quadrupole spectra: count a peak for a candidate only when its Q1 centroid lies within 2 steps of the candidate's nominal Q1 centre (step 3, "Q1-deconvolved evidence"); fewer confident seeds at every tolerance measured; omitted from the canonical configuration at the default; benchmark-gated |
 | `frag_tol_floor_ppm` | `5.0` | floor of the learned tolerance, in both passes |
 | `frag_tol_mad_k` | `0.0` | `> 0`: the learned tolerance is `frag_tol_mad_k * 1.4826 * MAD` instead of `1.5 * P95`, and the second pass refits the offset only (step 6); omitted from the canonical configuration at the default; benchmark-gated |
 | `widen_tol_below` | `50` | fewer confident targets than this at `fragment_tol_ppm`: search once more at `fragment_tol_ppm * widen_tol_factor` and keep the wider search when it finds more ("Tolerance retry" above); not applied to the bands of a grouped run; `0` = off; omitted from the canonical configuration at the default |

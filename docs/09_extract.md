@@ -1361,6 +1361,85 @@ The features stage derives the nine `ms1e_*` features from it (docs/10_features.
 scans, isotopes). Off, nothing is read and the table, its report and every later artifact
 keep their bytes.
 
+### 14. The unfragmented precursor, multi-scale Q1 scores and Q1-deconvolved evidence (scanning quadrupole, default off)
+
+Three opt-in additions read the sweep further. Each has its own key, off by default and
+omitted from the canonical configuration; with all of them off nothing below is computed and
+every artifact keeps its bytes. What they measured is in docs/37_ztscan.md, section 10.
+
+**The unfragmented precursor** (`features.q1_precursor`, `stages/q1score.rs`). Part of a
+precursor survives the collision cell, and in a ZT Scan MS2 spectrum it shows up at its own m/z
+in the steps whose window transmits it. Each isotope (M0, M+1, M+2) is one ion, so its Q1
+profile is the calibrated window centred on that isotope's own m/z, not the envelope a fragment
+inherits. Under the key (`ExtractConfig::q1_precursor`, set by `run`, `run-experiment` and
+`mumdia extract` from it; it needs `extract.q1_fragments`) every row's precursor isotopes are
+read as fragments of their own (`CandQ1::precursor`: each at `pm + k sp` times the mass-offset
+factor, its expected centre `pm + k sp - delta`, its weight the Poisson-averagine abundance) on
+the cells of the decision's patch (section 12), and `q1score::precursor_scores` writes:
+
+| column | meaning |
+|---|---|
+| `q1p_n_iso` | isotopes present by the decision's coherent-cell rule (0 to 3) |
+| `q1p_share` | the precursor's share of the precursor plus all library fragment intensity at the 2D apex (the five profile cycles, every patch step) |
+| `q1p_offset` | one shift of the present isotopes' Q1 profiles from where the calibrated window puts them, steps, fitted on the decision's centre grid at the calibrated width (0 without a fit) |
+| `q1p_resid` | their mean `1 - R^2` under that shift (1 without a fit) |
+| `q1p_frag_corr_mean`, `q1p_frag_corr_max` | mean and largest Pearson correlation of the present fragments' Q1 profiles with the precursor's (its isotopes summed); 0 without precursor signal |
+| `q1p_n_belong` | fragments whose own Q1 centre lies within the decision's offset tolerance of the precursor's shift and whose 2D correlation reaches the floor: the belonging count referenced to the precursor instead of the fragments' shared centre (0 without a fit) |
+| `q1p_centre_agree` | the distance between the precursor's shift and the fragments' shared centre, steps (6 without both fits) |
+
+**Multi-scale Q1 scores** (`features.q1_multiscale`, `q1score::multiscale`, needs
+`extract.q1_fragments`). Over the 3, 7 and 11 steps centred on the step nearest the fragments'
+fitted Q1 centre (`q1score::SCALES`), with the fragments' Q1 profiles of the decision at its 2D
+apex, for each scale `K`: `q1mK_corr_best`, the mean correlation of every present fragment's
+profile with the most intense fragment's (over the window); `q1mK_shape`, the `1 - R^2` (with a
+scale and a floor) of the present fragments' consensus profile, each normalised to its own
+total, against their mean expected transmission at the fitted centre and width;
+`q1mK_centroid`, the most intense fragment's intensity-weighted Q1 centroid against its expected
+centre, steps; and with `features.q1_precursor` on as well `q1mK_corr_prec`, the mean
+correlation of the fragments' profiles with the precursor's. The narrow scale reads the
+transmission's flat top, the wide one its edges; on three steps the centroid is the middle
+step's target to within half a step. None duplicates a `q1f_*` value: those are fits of every
+fragment over the whole patch, these are model-free statistics of one window.
+
+**Q1-deconvolved evidence** (`stages/q1dec.rs`). Every MS2 peak is given a Q1 position of its
+own, before any candidate is considered: within one cycle, a peak of step `s` and a peak of step
+`s + 1` are linked when each is the other's nearest within the fragment tolerance (mutual
+nearest neighbours, so a trace never branches), a chain is split after each local minimum
+below half the smaller of the maxima either side (`q1dec::VALLEY`), and every peak of a segment
+gets the segment's intensity-weighted mean step target; a peak linked to nothing is at its own
+step. `Q1Dec::build` does that for the whole run in parallel over cycles at the stage's load
+(about 6 s and one signed byte a peak, 3.3 GB for the 3.34 billion peaks of a K562 run, held
+beside the scans and never written, so no spectra artifact changes). A peak is consistent with
+a fragment of a candidate when its centroid lies within the tolerance of the fragment's
+expected Q1 centre (`q1dec::fragment_centre`, the decision's: the precursor isotopes that keep
+the fragment monoisotopic weigh more, so a large fragment's centre lies up to about a step below
+the envelope's), stored per library fragment as its shift from the candidate's centre in
+1/16 step. The tolerance is learned by the Q1 calibration (docs/08_rt_im_train.md, section 4h,
+`deconvolution`) and handed to extract with the model (`ExtractConfig::q1_dec_tol_steps`;
+`mumdia extract --q1-cal`). Two consumers:
+
+- `extract.q1_deconvolved` counts only the consistent peaks: every probe site asks
+  `Guard::q1_admits` beside the RT window, so the hits, the presence rules, the apex, the gate
+  and the traces see only them (`search_seed.q1_deconvolved` does the same in the seed against
+  the precursor's nominal envelope centre within `q1dec::SEED_TOL_STEPS`, docs/07). Needs
+  `rt_im_train.q1_calibrate`; refused with `extract.q1_cycles`, with window groups and on
+  spectra with 1/K0.
+- `features.q1_deconvolved` leaves the extraction as it is and reads, at each row's apex scan,
+  for every library fragment the nearest peak in every scan of the apex cycle and the two either
+  side whose window covers the precursor (`q1dec::row_evidence`): `q1d_n_frag` (fragments with
+  a consistent match), `q1d_n_incons` (fragments matched only inconsistently), `q1d_share`
+  (the consistent share of the matched intensity), `q1d_pred_share` (the predicted-intensity
+  share of the fragments with a consistent match) and `q1d_apex_share` (the consistent share in
+  the apex cycle alone). Needs `extract.q1_fragments`.
+
+All three families write psms_extracted v8 (`artifact::psms_extracted_q1s`): the table of v6
+or v7 plus, appended last, the `q1p_*`, then the `q1m*`, then the `q1d_*` columns (F64), each
+only under its key; the features stage reads them by name (docs/10_features.md). The extract
+report records `params.q1_fragments.q1_scores` (which families, the isotopes, the scales) and
+`params.q1_deconvolved` (gate or features, the tolerance, the step, the valley share, the
+cycles read), each only when on. Every value is read from the spectra and the library; nothing
+reads a label (docs/37, section 10, has the decoy against low-target comparison).
+
 ## Key types and functions
 
 | Name | file:line | What it does |
@@ -1442,6 +1521,7 @@ declutter" commit: `extract.scan_window_mode` (and the `ScanWindowMode` enum),
 | `gate_coelution_min` | 0.5 | Second threshold for `GateMode::Combined` |
 | `q1_cycles`, `q1_profile`, `q1_gate_max_offset` | off | The scanning-quadrupole sweep model (section 10) |
 | `q1_fragments` | false | The per-fragment Q1 decision of every accepted row (psms_extracted v6); needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (section 12) |
+| `q1_deconvolved` | false | Count only the peaks whose Q1 centroid sits where the matched fragment is expected, within the tolerance the Q1 calibration learns; needs `rt_im_train.q1_calibrate` and spectra_ms2 v3 (section 14) |
 | `im_gate` | `off` | The 1/K0 gate on fragment peaks (`off`, `fragments`, `auto`; section 8). Inert on 3D data. Omitted from the canonical configuration at its default |
 
 Note: `emit_candidate_audit` is a declared knob but the candidate-audit write is
@@ -1482,6 +1562,8 @@ here for one index.
 | `extract.q1_fragments` + `features.q1_fragment_features` (default false, scanning quadrupole only) | psms_extracted v6: the `q1f_*` summary (F64) and four `q1f_frag_*` per-fragment lists; eight features (section 12) | ZT Scan REP01: +1.45% precursors (four NN seeds, beyond the seed range), +1.26% human precursors at a matched entrapment FDP, combined FDP at 1% 1.31% against 1.39%; one acquisition |
 | `retrace.q1_repick` (default false, needs `extract.q1_fragments`) | `q1f_apex_moved_s`; moves the rank-0 apex to the 2D apex of the fragments that belong (section 12) | ZT Scan REP01, on top of the decision: +2.96% precursors, +2.92% human precursors at a matched FDP (four NN seeds); 60% of the accepted targets' apexes move, by one cycle; extract +40-75% |
 | `features.ms1_envelope` (default false) | psms_extracted v7: 16 F64 cols `ms1e_*`; nine features (section 13) | ZT Scan REP01, four NN seeds: human precursors at a matched entrapment FDP +0.01%, precursors on the human library +0.05%, both inside the seed range; label-blind (decoy against low-target KS at most 0.005); keep off |
+| `features.q1_precursor`, `features.q1_multiscale`, `features.q1_deconvolved` (default false, need `extract.q1_fragments`) | psms_extracted v8: 8 `q1p_*`, 9 or 12 `q1m*`, 5 `q1d_*` F64 cols; as many features (section 14) | ZT Scan REP01, four NN seeds, the three on top of the recipe: +0.76% precursors, +1.38% human precursors at a matched entrapment FDP, beyond the seed spread on both libraries; each alone inside it except `q1_deconvolved`; in `configs/examples/ztscan.json`; one acquisition |
+| `extract.q1_deconvolved`, `search_seed.q1_deconvolved` (default false) | none; only Q1-consistent peaks are counted (section 14) | ZT Scan REP01: -25.6% precursors (extract, learned 1.0-step tolerance), -8.4% at 2 steps, -2.5% (seed), -38% (both); keep off |
 | `rescore.shadow_q1` (default false, needs `extract.q1_fragments`) | none; the shadow test co-isolates by m/z and counts shared fragments by their Q1 centre (docs/11) | ZT Scan REP01: no count change (inside the seed range), fewer entrapment precursors at 1%; with the other three keys +3.02% precursors, +3.17% at a matched FDP, measured FDP at 1% 1.22% against 1.39%, +2.3% in a three-run experiment |
 | `extract.ms1_calibrate = "surface"` (default `true`) | none; MS1 reads at a per-m/z, per-retention-time offset (section 11) | ZT Scan REP01: +0.2% precursors, +0.2% human precursors on an entrapment library at a combined FDP of 1.39% (one seed); with `prec_tol_auto` and `q1_calibrate` +0.46% (four NN seeds), +0.19% at 1.40% against 1.39%; one acquisition |
 | `extract.prec_tol_auto` (default false) | none; sets `prec_tol_ppm` from the calibrated MS1 residuals (section 11) | ZT Scan REP01: 7.1-7.4 ppm, +0.45% precursors, -0.1% human precursors on the entrapment library at 1.37% (one seed); one acquisition |

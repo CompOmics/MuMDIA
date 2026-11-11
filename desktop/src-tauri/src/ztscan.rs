@@ -156,7 +156,10 @@ mod tests {
             [
                 "convert.isolation_half_width",
                 "extract.q1_fragments",
+                "features.q1_deconvolved",
                 "features.q1_fragment_features",
+                "features.q1_multiscale",
+                "features.q1_precursor",
                 "quant.q1_cycle_halfwidth",
                 "rescore.shadow_q1",
                 "retrace.q1_repick",

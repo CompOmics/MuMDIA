@@ -66,6 +66,7 @@ use tracing::{info, warn};
 
 use crate::calibrate::{percentile, Loess};
 use crate::stages::extract::{Q1_MAX_STEP, Q1_MIN_OVERLAP, Q1_MIN_WINDOWS};
+use crate::stages::q1dec;
 use crate::stages::q1frag;
 #[cfg(test)]
 use crate::stages::q1frag::transmission;
@@ -116,6 +117,9 @@ pub struct Q1CalParams<'a> {
     /// Also learn the per-fragment decision tolerances (`extract.q1_fragments`) and add
     /// them as `fragment_decision`.
     pub fragment_decision: bool,
+    /// Also learn the tolerance of the Q1-deconvolved evidence (`extract.q1_deconvolved`,
+    /// `stages::q1dec`) and add it as `deconvolution`.
+    pub deconvolution: bool,
 }
 
 /// The Q1 sweep of a run's MS2 spectra, in file (acquisition) order.
@@ -297,6 +301,53 @@ fn read_anchors(seed: &str, sweep: &Sweep, q_max: f64) -> Result<Vec<Anchor>> {
         v.sort_by_key(|a| a.1.cid);
     }
     Ok(v.into_iter().map(|(_, a)| a).collect())
+}
+
+/// Decoy seed PSMs whose seed scan is in the sweep, one per candidate (its best scan), at
+/// most `max` (every k-th by candidate), ordered by candidate: the null the Q1-deconvolution
+/// tolerance is learned against.
+fn read_decoys(seed: &str, sweep: &Sweep, max: usize) -> Result<Vec<Anchor>> {
+    let t = TableFile::open(seed)?;
+    let label = t.str("label")?;
+    let cid = t.u32("candidate_id")?;
+    let pm = t.f64("precursor_mz")?;
+    let z = t.i32("charge")?;
+    let rt = t.f64("observed_rt")?;
+    let scan = t.u32("scan_index")?;
+    let score = t.f64("score")?;
+    let sorted = sweep.scan_index.windows(2).all(|w| w[0] < w[1]);
+    let row_of = |s: u32| -> Option<usize> {
+        if sorted {
+            sweep.scan_index.binary_search(&s).ok()
+        } else {
+            sweep.scan_index.iter().position(|&x| x == s)
+        }
+    };
+    let mut best: BTreeMap<u32, (f64, Anchor)> = BTreeMap::new();
+    for i in 0..t.nrows {
+        if label[i] != "decoy" || !pm[i].is_finite() || z[i] <= 0 {
+            continue;
+        }
+        let Some(row) = row_of(scan[i]) else {
+            continue;
+        };
+        let a = Anchor {
+            cid: cid[i],
+            pm: pm[i],
+            z: z[i],
+            rt: rt[i],
+            c0: sweep.row_cycle[row],
+        };
+        match best.get(&cid[i]) {
+            Some((s, _)) if *s >= score[i] => {}
+            _ => {
+                best.insert(cid[i], (score[i], a));
+            }
+        }
+    }
+    let v: Vec<Anchor> = best.into_values().map(|(_, a)| a).collect();
+    let k = v.len().div_ceil(max.max(1)).max(1);
+    Ok(v.into_iter().step_by(k).collect())
 }
 
 /// A library fragment row of an anchor: the anchor's slot, m/z, predicted intensity and
@@ -1112,6 +1163,205 @@ fn learn_decision(
     Ok(out)
 }
 
+/// The full peak lists of `rows` (ascending, distinct) of `ms2`, in that order.
+fn read_rows(ms2: &str, rows: &[u32]) -> Result<Vec<Vec<mumdia_core::types::Peak>>> {
+    let t = TableFile::open(ms2)?;
+    let parts = t.row_group_parts()?;
+    let mut first = Vec::with_capacity(parts.len());
+    let mut acc = 0usize;
+    for p in &parts {
+        first.push(acc);
+        acc += p.nrows;
+    }
+    let got: Vec<Result<Vec<Vec<mumdia_core::types::Peak>>>> = parts
+        .par_iter()
+        .zip(first.par_iter())
+        .map(|(p, &f0)| {
+            let a = rows.partition_point(|&r| (r as usize) < f0);
+            let b = rows.partition_point(|&r| (r as usize) < f0 + p.nrows);
+            let mut out = Vec::with_capacity(b - a);
+            if a == b {
+                return Ok(out);
+            }
+            let mut k = a;
+            let mut row = f0;
+            p.for_each_batch(Some(&["mz", "intensity"]), 1024, |batch| {
+                let mza = crate::spectra::list_col(batch, "mz")?;
+                let ina = crate::spectra::list_col(batch, "intensity")?;
+                for i in 0..mza.len() {
+                    if k < b && rows[k] as usize == row {
+                        let (mz, inten) = (mza.row_slice(i, "mz")?, ina.row_slice(i, "intensity")?);
+                        let n = mz.len().min(inten.len());
+                        out.push(
+                            mz[..n]
+                                .iter()
+                                .zip(&inten[..n])
+                                .map(|(&mz, &intensity)| mumdia_core::types::Peak { mz, intensity })
+                                .collect(),
+                        );
+                        k += 1;
+                    }
+                    row += 1;
+                }
+                Ok(())
+            })?;
+            Ok(out)
+        })
+        .collect();
+    let mut all = Vec::with_capacity(rows.len());
+    for g in got {
+        all.extend(g?);
+    }
+    Ok(all)
+}
+
+/// The centroid offsets (steps) of the Q1-deconvolved evidence for `psms` (at most
+/// [`q1dec::LEARN_ANCHORS`], every k-th): over the steps of each one's seed-scan cycle within
+/// the calibrated window's reach plus [`q1dec::LEARN_MARGIN_STEPS`] of its expected centre,
+/// every peak's trace centroid ([`q1dec::annotate_run`]); for each library fragment, the
+/// nearest peak within the tolerance in each step whose window as read covers the precursor,
+/// its centroid against the fragment's calibrated expected centre
+/// ([`q1dec::fragment_centre`]), which is what extract compares.
+#[allow(clippy::too_many_arguments)]
+fn deconvolution_offsets(
+    ms2: &str,
+    sweep: &Sweep,
+    psms: &[Anchor],
+    library_fragments: &str,
+    factor: &(dyn Fn(f64) -> f64 + Sync),
+    tol_ppm: f64,
+    model: &mumdia_core::config::Q1FragModel,
+) -> Result<(usize, Vec<f64>)> {
+    let k = psms.len().div_ceil(q1dec::LEARN_ANCHORS).max(1);
+    let psms: Vec<Anchor> = psms.iter().step_by(k).copied().collect();
+    let frags = read_all_fragments(library_fragments, &psms)?;
+    let n_cycles = sweep.n_cycles();
+    let n_steps = sweep.step_target.len();
+    let mut cell = vec![u32::MAX; n_cycles * n_steps];
+    for (row, (&c, &st)) in sweep.row_cycle.iter().zip(&sweep.row_step).enumerate() {
+        cell[c as usize * n_steps + st as usize] = row as u32;
+    }
+    let step = q1dec::grid_step(&sweep.step_target);
+    let reach = q1frag::reach_mz(model) + q1dec::LEARN_MARGIN_STEPS * model.step_mz;
+    let specs: Vec<(usize, usize)> = psms
+        .iter()
+        .map(|a| {
+            let c = q1dec::expected_centre(Some(model), a.pm, a.z, a.rt);
+            let s0 = sweep.step_target.partition_point(|&t| t < c - reach);
+            let s1 = sweep.step_target.partition_point(|&t| t <= c + reach);
+            (s0, s1)
+        })
+        .collect();
+    let mut rows: Vec<u32> = Vec::new();
+    for (a, &(s0, s1)) in psms.iter().zip(&specs) {
+        for s in s0..s1 {
+            let r = cell[a.c0 as usize * n_steps + s];
+            if r != u32::MAX {
+                rows.push(r);
+            }
+        }
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    let peaks = read_rows(ms2, &rows)?;
+    let empty: Vec<mumdia_core::types::Peak> = Vec::new();
+    let peaks_of = |r: u32| -> &[mumdia_core::types::Peak] {
+        match rows.binary_search(&r) {
+            Ok(i) => &peaks[i],
+            Err(_) => &empty,
+        }
+    };
+    let per: Vec<Vec<f64>> = psms
+        .par_iter()
+        .zip(specs.par_iter())
+        .zip(frags.par_iter())
+        .map(|((a, &(s0, s1)), fs)| {
+            let rr: Vec<u32> = (s0..s1)
+                .map(|s| cell[a.c0 as usize * n_steps + s])
+                .collect();
+            let pk: Vec<&[mumdia_core::types::Peak]> = rr
+                .iter()
+                .map(|&r| {
+                    if r == u32::MAX {
+                        &empty[..]
+                    } else {
+                        peaks_of(r)
+                    }
+                })
+                .collect();
+            let t = &sweep.step_target[s0..s1];
+            let off = q1dec::annotate_run(&pk, t, step, tol_ppm);
+            let cf: Vec<f64> = fs
+                .iter()
+                .map(|f| q1dec::fragment_centre(model, a.pm, a.z, f.0, f.2, a.rt))
+                .collect();
+            let mut d = Vec::new();
+            for (si, &r) in rr.iter().enumerate() {
+                if r == u32::MAX || (t[si] - a.pm).abs() > sweep.half_width {
+                    continue;
+                }
+                let mzs: Vec<f32> = pk[si].iter().map(|x| x.mz).collect();
+                for (f, c) in fs.iter().zip(&cf) {
+                    let target = f.0 * factor(f.0);
+                    if let Some(j) = nearest(&mzs, target, tol_ppm) {
+                        let cen = t[si] + off[si][j] as f64 / q1dec::UNITS_PER_STEP * step;
+                        d.push((cen - c) / step);
+                    }
+                }
+            }
+            d
+        })
+        .collect();
+    Ok((psms.len(), per.into_iter().flatten().collect()))
+}
+
+/// The `deconvolution` block (`extract.q1_deconvolved`): the centroid offsets of the
+/// anchors' fragment peaks and of decoy seed PSMs' ([`deconvolution_offsets`]), and the
+/// tolerance [`q1dec::learn_tolerance`] separates them at.
+#[allow(clippy::too_many_arguments)]
+fn learn_deconvolution(
+    ms2: &str,
+    sweep: &Sweep,
+    anchors: &[Anchor],
+    decoys: &[Anchor],
+    library_fragments: &str,
+    factor: &(dyn Fn(f64) -> f64 + Sync),
+    tol_ppm: f64,
+    block: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let model = q1frag::model_from_calibration(block, false)?;
+    let (na, da) = deconvolution_offsets(
+        ms2,
+        sweep,
+        anchors,
+        library_fragments,
+        factor,
+        tol_ppm,
+        &model,
+    )?;
+    let (nd, dd) = deconvolution_offsets(
+        ms2,
+        sweep,
+        decoys,
+        library_fragments,
+        factor,
+        tol_ppm,
+        &model,
+    )?;
+    let (tol, out) = q1dec::learn_tolerance(&da, &dd, na, nd);
+    info!(
+        anchors = na,
+        decoys = nd,
+        anchor_peaks = da.len(),
+        decoy_peaks = dd.len(),
+        tol_steps = tol,
+        anchor_kept = %out["kept_at_tol"]["anchor"],
+        decoy_kept = %out["kept_at_tol"]["decoy"],
+        "q1-calibrate: Q1-deconvolution tolerance learned from the seed"
+    );
+    Ok(out)
+}
+
 /// A fragment match of the decision's patches: anchor, fragment, spectrum row, intensity.
 type PatchMatch = (u32, u16, u32, f64);
 
@@ -1206,6 +1456,22 @@ pub fn run(p: Q1CalParams) -> Result<()> {
             },
         )
     };
+    if p.deconvolution && block["status"] == "fitted" {
+        let decoys = read_decoys(p.seed_psms, &sweep, q1dec::LEARN_ANCHORS)?;
+        let d = learn_deconvolution(
+            p.ms2,
+            &sweep,
+            &anchors,
+            &decoys,
+            p.library_fragments,
+            &factor,
+            tol,
+            &block,
+        )?;
+        if let Some(obj) = block.as_object_mut() {
+            obj.insert("deconvolution".into(), d);
+        }
+    }
     if p.fragment_decision && block["status"] == "fitted" {
         let d = learn_decision(
             p.ms2,
@@ -1281,6 +1547,7 @@ mod tests {
             frag_tol_fallback_ppm: 20.0,
             out_cal: cal,
             fragment_decision: std::env::var("MUMDIA_BENCH_Q1CAL_DECISION").is_ok(),
+            deconvolution: std::env::var("MUMDIA_BENCH_Q1CAL_DECONV").is_ok(),
         })
         .unwrap();
     }
@@ -1473,6 +1740,7 @@ mod tests {
             frag_tol_fallback_ppm: 10.0,
             out_cal: &path("cal.json"),
             fragment_decision: true,
+            deconvolution: true,
         })
         .unwrap();
         let cal: serde_json::Value = mumdia_io::json::read_json(&path("cal.json")).unwrap();
