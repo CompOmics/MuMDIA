@@ -736,6 +736,15 @@ Options:
       --cross-run-from <CROSS_RUN_FROM>...
           The second pass of the cross-run step: the first-pass `--out-fragment` tables of every run of the experiment, written with `--export-cross-run`, in run order. The fit follows `quant.fragment_selection = cross_run`, `pattern_fit` or `pattern_profile`, `quant.baseline_source = experiment` and `quant.fixed_scan_halfwidth_scale`. Without it those keys fall back to the per-run quant
 
+      --cross-run-pattern-from <CROSS_RUN_PATTERN_FROM>...
+          The tables the pattern dispersion of `--cross-run-from` is fitted on instead: the background-subtracted exports of every run (`--export-cross-run` with `--cross-run-from` the first-pass tables), in run order. `run-experiment` fits the background on the first-pass tables and the dispersion on these, which this reproduces; without it both come from `--cross-run-from`. Needs a pattern rule
+
+      --psms-extracted <PSMS_EXTRACTED>
+          `quant.q1_fragments`: the run's psms_extracted v6 (`extract.q1_fragments`), whose per-fragment Q1 decisions select the fragments and whose report records the Q1 model. Required with the key on, read only then
+
+      --spectra-ms2 <SPECTRA_MS2>
+          `quant.q1_fragments`: the run's spectra_ms2 v3 (the Q1 step and cycle of every sample). Required with the key on, read only then
+
       --config <CONFIG>
 ```
 

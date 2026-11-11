@@ -363,7 +363,8 @@ impl SweepScans {
 
     /// The cycle and the window target of the scan an axis point at `rt` was sampled from:
     /// the nearest scan (ties to the earlier) whose window as read covers the precursor m/z
-    /// `pm`, within [`SweepScans::tol`]. `None` when there is none.
+    /// `pm`, within the sweep's matching tolerance (0.45 of the median scan spacing). `None`
+    /// when there is none.
     pub fn locate(&self, rt: f32, pm: f64) -> Option<(u32, f64)> {
         let x = rt as f64;
         let j = self.rt.partition_point(|&r| r < x - self.tol);

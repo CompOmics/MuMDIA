@@ -582,6 +582,13 @@ enum Cmd {
         /// quant.
         #[arg(long, num_args = 1..)]
         cross_run_from: Vec<String>,
+        /// The tables the pattern dispersion of `--cross-run-from` is fitted on instead: the
+        /// background-subtracted exports of every run (`--export-cross-run` with
+        /// `--cross-run-from` the first-pass tables), in run order. `run-experiment` fits the
+        /// background on the first-pass tables and the dispersion on these, which this
+        /// reproduces; without it both come from `--cross-run-from`. Needs a pattern rule.
+        #[arg(long, num_args = 1.., requires = "cross_run_from")]
+        cross_run_pattern_from: Vec<String>,
         /// `quant.q1_fragments`: the run's psms_extracted v6 (`extract.q1_fragments`), whose
         /// per-fragment Q1 decisions select the fragments and whose report records the Q1
         /// model. Required with the key on, read only then.
@@ -2678,6 +2685,7 @@ fn real_main() -> Result<()> {
             out_quant_fragments,
             export_cross_run,
             cross_run_from,
+            cross_run_pattern_from,
             psms_extracted,
             spectra_ms2,
             config,
@@ -2714,7 +2722,16 @@ fn real_main() -> Result<()> {
                          quant.fixed_scan_halfwidth_scale > 0"
                     );
                 }
-                Some(stages::quant::fit_cross_run(&cross_run_from, &cfg.quant)?)
+                let mut fit = stages::quant::fit_cross_run(&cross_run_from, &cfg.quant)?;
+                if !cross_run_pattern_from.is_empty() {
+                    if !cfg.quant.fragment_selection.uses_pattern_fit() {
+                        anyhow::bail!(
+                            "--cross-run-pattern-from refits the pattern dispersion, and                              quant.fragment_selection is not pattern_fit or pattern_profile"
+                        );
+                    }
+                    fit.pattern = stages::quant_pattern::fit_pattern(&cross_run_pattern_from)?;
+                }
+                Some(fit)
             };
             let losers = match &overlap_losers {
                 Some(path) => stages::pool::read_losers(path, &chromatograms)?,
