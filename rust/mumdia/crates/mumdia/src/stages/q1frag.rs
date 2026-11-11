@@ -82,7 +82,7 @@ pub const MU_STEP: f64 = 0.25;
 /// Grid points per step and on each side of 0.
 const MU_Q: usize = 4;
 const MU_K: usize = 24;
-const MU_N: usize = 2 * MU_K + 1;
+pub(crate) const MU_N: usize = 2 * MU_K + 1;
 /// The width scales round 2 fits (of `h` and `e` together).
 pub const WIDTHS: [f64; 3] = [0.85, 1.0, 1.2];
 /// The tolerance rule: median plus this many robust standard deviations.
@@ -162,7 +162,7 @@ pub(crate) fn profile_sse(y: &[f64], e: &[f64]) -> f64 {
 
 /// [`profile_sse`] from its sums.
 #[inline]
-fn sse_of(n: f64, see: f64, se: f64, sey: f64, sy: f64, syy: f64) -> f64 {
+pub(crate) fn sse_of(n: f64, see: f64, se: f64, sey: f64, sy: f64, syy: f64) -> f64 {
     let det = see * n - se * se;
     let (s, b) = if det.abs() > 1e-12 {
         let s = (sey * n - se * sy) / det;
@@ -285,16 +285,49 @@ pub fn model_from_calibration(
 
 /// The decision model of a run: `q1_calibration` of its `cal.json`, with the tolerances.
 pub fn read_model(cal_json: &str) -> Result<Q1FragModel> {
+    read_model_opts(cal_json, true)
+}
+
+/// [`read_model`], with the decision tolerances only when `decision` (`extract.q1_fragments`;
+/// `extract.q1_deconvolved` alone needs the window and its offsets, not them).
+pub fn read_model_opts(cal_json: &str, decision: bool) -> Result<Q1FragModel> {
     let cal: serde_json::Value = mumdia_io::json::read_json(cal_json)
         .with_context(|| format!("extract.q1_fragments: reading {cal_json}"))?;
     let block = &cal["q1_calibration"];
     if block.is_null() {
         bail!(
-            "extract.q1_fragments: {cal_json} has no q1_calibration; it is written by \
-             rt_im_train.q1_calibrate"
+            "extract.q1_fragments / extract.q1_deconvolved: {cal_json} has no q1_calibration; \
+             it is written by rt_im_train.q1_calibrate"
         );
     }
-    model_from_calibration(block, true).with_context(|| format!("extract.q1_fragments: {cal_json}"))
+    model_from_calibration(block, decision)
+        .with_context(|| format!("extract.q1_fragments: {cal_json}"))
+}
+
+/// The tolerance (steps) of the Q1-deconvolved evidence the Q1 calibration learned
+/// (`q1_calibration.deconvolution.tol_steps` of `cal.json`, `extract.q1_deconvolved`).
+pub fn read_deconvolution_tol(cal_json: &str) -> Result<f64> {
+    let cal: serde_json::Value = mumdia_io::json::read_json(cal_json)
+        .with_context(|| format!("extract.q1_deconvolved: reading {cal_json}"))?;
+    let block = &cal["q1_calibration"];
+    if block["status"].as_str() != Some("fitted") {
+        bail!(
+            "extract.q1_deconvolved: the Q1 calibration of {cal_json} has status {}, so there \
+             is no calibrated window to place the peaks with; unset extract.q1_deconvolved for \
+             this run",
+            block["status"]
+        );
+    }
+    block["deconvolution"]["tol_steps"]
+        .as_f64()
+        .filter(|t| t.is_finite() && *t > 0.0)
+        .with_context(|| {
+            format!(
+                "extract.q1_deconvolved: {cal_json} has no q1_calibration.deconvolution \
+                 tolerance: rt_im_train.q1_calibrate learns it only when \
+                 extract.q1_deconvolved is on"
+            )
+        })
 }
 
 /// The charge of a fragment named like `y7` or `b3^2` (1 without a suffix).
@@ -481,9 +514,46 @@ impl CandQ1 {
         CandQ1 { sp, centre, frags }
     }
 
+    /// The unfragmented precursor as the decision reads it (`features.q1_precursor`): its
+    /// first `n_iso` isotopes M0, M+1, ... as fragments of their own, each matched at its own
+    /// m/z (`pm + k sp`, times the mass-offset factor) and transmitted at its own Q1 position
+    /// (a precursor isotope in an MS2 spectrum is one ion, so its expected profile is one
+    /// window centred on it, not the isotope envelope a fragment inherits), with its
+    /// Poisson-averagine abundance as the prediction. The candidate-level centre is the
+    /// fragments' ([`CandQ1::new`]), so a patch read for it covers the same steps.
+    pub fn precursor(
+        m: &Q1FragModel,
+        pm: f64,
+        z: i32,
+        rt: f64,
+        n_iso: usize,
+        factor: &dyn Fn(f64) -> f64,
+    ) -> CandQ1 {
+        let z = z.max(1);
+        let sp = ISOTOPE_SPACING / z as f64;
+        let pre = averagine_isotopes(neutral(pm, z), ISOTOPES);
+        let ipre: f64 = pre.iter().enumerate().map(|(i, w)| i as f64 * w).sum();
+        let centre = pm + sp * ipre - offset_mz(m, pm, None, rt);
+        let frags = (0..n_iso.min(ISOTOPES))
+            .map(|k| {
+                let mz = pm + sp * k as f64;
+                let mut w = vec![0.0; ISOTOPES];
+                w[k] = 1.0;
+                FragQ1 {
+                    target_mz: mz * factor(mz),
+                    pred: pre[k],
+                    w,
+                    ibar: k as f64,
+                    centre: mz - offset_mz(m, pm, Some(mz), rt),
+                }
+            })
+            .collect();
+        CandQ1 { sp, centre, frags }
+    }
+
     /// The expected profile value of fragment `f` at target `t`, shifted by `mu` steps of
     /// `step` m/z, at width scale `omega`.
-    fn expected_at(
+    pub(crate) fn expected_at(
         &self,
         m: &Q1FragModel,
         f: usize,
@@ -553,7 +623,7 @@ impl Patch {
 
     /// The step spacing of the patch (m/z): its targets' span over its steps, or `fallback`
     /// for a patch of one step.
-    fn step(&self, fallback: f64) -> f64 {
+    pub(crate) fn step(&self, fallback: f64) -> f64 {
         let n = self.t.len();
         if n >= 2 && self.t[n - 1] > self.t[0] {
             (self.t[n - 1] - self.t[0]) / (n - 1) as f64
@@ -744,7 +814,7 @@ impl Decision {
 /// The parabola through the grid values around the minimum at `k`, as a refined grid
 /// position (in grid units, within half a point of `k`); `k` itself at the grid's ends or
 /// on a flat stretch.
-fn refine(v: &[f64], k: usize) -> f64 {
+pub(crate) fn refine(v: &[f64], k: usize) -> f64 {
     if k == 0 || k + 1 >= v.len() {
         return k as f64;
     }
@@ -758,8 +828,59 @@ fn refine(v: &[f64], k: usize) -> f64 {
 
 /// The grid value `k` of the centre grid, in steps.
 #[inline]
-fn mu_of(k: f64) -> f64 {
+pub(crate) fn mu_of(k: f64) -> f64 {
     -MU_MAX + k * MU_STEP
+}
+
+/// Per fragment of `cand` on its patch `p`: its observed total over the patch, and whether
+/// it is present: at least [`MIN_CELLS`] coherent cells inside the calibrated window's reach
+/// of its expected centre, cells with signal whose neighbouring step in the same cycle has
+/// signal too. The quadrupole transmits a precursor through several consecutive steps, and a
+/// random match stands alone (a 20 ppm window finds a peak by chance in roughly 2% of the
+/// cells of ZT Scan spectra, so most fragments have a few).
+pub(crate) fn presence(p: &Patch, cand: &CandQ1, m: &Q1FragModel) -> (Vec<f64>, Vec<bool>) {
+    let (nf, nc, ns) = (p.nf, p.cycles.len(), p.ns());
+    let reach = reach_mz(m);
+    let mut tot = vec![0.0f64; nf];
+    let mut coherent = vec![0usize; nf];
+    for f in 0..nf {
+        let centre = cand.frags[f].centre;
+        for ci in 0..nc {
+            for si in 0..ns {
+                let v = p.get(f, ci, si);
+                if v <= 0.0 {
+                    continue;
+                }
+                tot[f] += v;
+                let near = (si > 0 && p.get(f, ci, si - 1) > 0.0)
+                    || (si + 1 < ns && p.get(f, ci, si + 1) > 0.0);
+                if near && (p.t[si] - centre).abs() <= reach {
+                    coherent[f] += 1;
+                }
+            }
+        }
+    }
+    let present = coherent.iter().map(|&c| c >= MIN_CELLS).collect();
+    (tot, present)
+}
+
+/// Each fragment's Q1 profile on `p` at the patch cycle `apex_ci`: its cells summed over the
+/// [`PROFILE_CYCLES`] cycles either side, every step apart (what [`decide`] fits).
+pub(crate) fn profiles(p: &Patch, apex_ci: usize) -> Vec<Vec<f64>> {
+    let (nc, ns) = (p.cycles.len(), p.ns());
+    if nc == 0 {
+        return vec![vec![0.0; ns]; p.nf];
+    }
+    let apex_ci = apex_ci.min(nc - 1);
+    let lo = apex_ci.saturating_sub(PROFILE_CYCLES);
+    let hi = (apex_ci + PROFILE_CYCLES).min(nc - 1);
+    (0..p.nf)
+        .map(|f| {
+            (0..ns)
+                .map(|si| (lo..=hi).map(|ci| p.get(f, ci, si)).sum())
+                .collect()
+        })
+        .collect()
 }
 
 /// One round of [`decide`] over the fitted `set`.
@@ -792,33 +913,7 @@ pub fn decide(
         return Decision::empty(nf);
     }
     let step = p.step(m.step_mz);
-    // Per fragment: its observed total over the patch, and its coherent cells inside the
-    // calibrated window's reach of its expected centre: cells with signal whose neighbouring
-    // step in the same cycle has signal too. The quadrupole transmits a precursor through
-    // several consecutive steps, and a random match stands alone (a 20 ppm window finds a
-    // peak by chance in roughly 2% of the cells of ZT Scan spectra, so most fragments have a
-    // few).
-    let reach = reach_mz(m);
-    let mut tot = vec![0.0f64; nf];
-    let mut coherent = vec![0usize; nf];
-    for f in 0..nf {
-        let centre = cand.frags[f].centre;
-        for ci in 0..nc {
-            for si in 0..ns {
-                let v = p.get(f, ci, si);
-                if v <= 0.0 {
-                    continue;
-                }
-                tot[f] += v;
-                let near = (si > 0 && p.get(f, ci, si - 1) > 0.0)
-                    || (si + 1 < ns && p.get(f, ci, si + 1) > 0.0);
-                if near && (p.t[si] - centre).abs() <= reach {
-                    coherent[f] += 1;
-                }
-            }
-        }
-    }
-    let present: Vec<bool> = coherent.iter().map(|&c| c >= MIN_CELLS).collect();
+    let (tot, present) = presence(p, cand, m);
     // Each fragment's elution, normalised to its own total over the patch.
     let elution: Vec<Vec<f64>> = (0..nf)
         .map(|f| {
@@ -1103,6 +1198,15 @@ pub struct Q1fRow {
     pub moved_s: f64,
     /// The 2D apex cycle minus the cycle of the apex scan.
     pub apex_shift_cycles: f64,
+    /// `features.q1_precursor`: the row's `q1p_*` values ([`super::q1score::Q1P_COLUMNS`]);
+    /// empty with the key off.
+    pub q1p: Vec<f64>,
+    /// `features.q1_multiscale`: the row's `q1m*` values ([`super::q1score::q1m_columns`]);
+    /// empty with the key off.
+    pub q1m: Vec<f64>,
+    /// `features.q1_deconvolved`: the row's `q1d_*` values ([`super::q1dec::Q1D_COLUMNS`]);
+    /// empty with the key off.
+    pub q1d: Vec<f64>,
 }
 
 impl Q1fRow {
@@ -1118,6 +1222,9 @@ impl Q1fRow {
             corr2d: f32s(&d.corr2d),
             moved_s: 0.0,
             apex_shift_cycles: c2d as f64 - apex_cycle as f64,
+            q1p: Vec::new(),
+            q1m: Vec::new(),
+            q1d: Vec::new(),
         }
     }
 
@@ -1132,6 +1239,9 @@ impl Q1fRow {
             corr2d: vec![f32::NAN; n],
             moved_s: 0.0,
             apex_shift_cycles: 0.0,
+            q1p: Vec::new(),
+            q1m: Vec::new(),
+            q1d: Vec::new(),
         }
     }
 }

@@ -338,6 +338,9 @@ struct Guard<'a> {
     im_gate: bool,
     /// The trace pad in seconds (`ExtractParams::trace_pad`), 0 without one.
     pad: f64,
+    /// `extract.q1_deconvolved`: the per-peak Q1 centroids and each candidate's expected
+    /// centre (`stages::q1dec`); `None` with the key off, when every peak passes.
+    q1: Option<&'a crate::stages::q1dec::Q1Gate>,
 }
 
 impl<'a> Guard<'a> {
@@ -356,6 +359,14 @@ impl<'a> Guard<'a> {
     #[inline]
     fn admits(&self, c: usize, rt: f64, pim: Option<f32>) -> bool {
         self.win.admits(c, rt, pim)
+    }
+
+    /// `extract.q1_deconvolved`: whether peak `j` of `scan` sits on the Q1 sweep where
+    /// fragment `frag` of candidate `c` is expected (its trace's centroid within the learned
+    /// tolerance of the fragment's calibrated centre). Always true with the key off.
+    #[inline]
+    fn q1_admits(&self, c: usize, frag: u16, scan: &Ms2Scan, j: usize) -> bool {
+        self.q1.is_none_or(|g| g.admits_frag(c, frag, scan, j))
     }
 
     /// A peak the window does not admit but the trace pad does: it goes into the candidate's
@@ -1335,6 +1346,9 @@ fn demix_solve_scan(
             let mut push = |c: u32, frag: u16, pi: f32| {
                 let cc = c as usize;
                 if !guard.admits(cc, apex_rt, pim) {
+                    return;
+                }
+                if !guard.q1_admits(cc, frag, scan, j) {
                     return;
                 }
                 claimants.push((c, frag, pi));
@@ -2429,6 +2443,9 @@ impl ProbeTask<'_> {
                 trace_only.clear();
                 ix.probe_binned(q_mz, bin, |cid, _pmz, pint, frag| {
                     let c = cid as usize;
+                    if !guard.q1_admits(c, frag, scan, j) {
+                        return;
+                    }
                     let inside = guard.admits(c, rt, pim);
                     if !inside && !guard.pads(c, rt, pim) {
                         return;
@@ -2926,6 +2943,9 @@ fn extract_twopass_windows(
                             if !guard.admits(c, rt, pim) {
                                 return;
                             }
+                            if !guard.q1_admits(c, frag, scan, j) {
+                                return;
+                            }
                             if let Some(s) = restrict {
                                 if !s.contains(cid) {
                                     return;
@@ -2981,6 +3001,9 @@ fn extract_twopass_windows(
                             let mut push = |cid: u32, frag: u16, pi: f32| {
                                 let c = cid as usize;
                                 if !guard.admits(c, rt, pim) {
+                                    return;
+                                }
+                                if !guard.q1_admits(c, frag, scan, j) {
                                     return;
                                 }
                                 if let Some(s) = restrict {
@@ -3057,6 +3080,9 @@ fn extract_twopass_windows(
                             let mut push = |cid: u32, frag: u16, pi: f32| {
                                 let c = cid as usize;
                                 if !guard.admits(c, rt, pim) {
+                                    return;
+                                }
+                                if !guard.q1_admits(c, frag, scan, j) {
                                     return;
                                 }
                                 if let Some(s) = restrict {
@@ -3174,6 +3200,9 @@ fn extract_twopass_windows(
                                 if !guard.admits(c, rt, pim) {
                                     return;
                                 }
+                                if !guard.q1_admits(c, frag, scan, j) {
+                                    return;
+                                }
                                 if let Some(s) = restrict {
                                     if !s.contains(cid) {
                                         return;
@@ -3248,6 +3277,9 @@ fn extract_twopass_windows(
                         let mut push = |cid: u32, frag: u16, pi: f32| {
                             let c = cid as usize;
                             if !guard.admits(c, rt, pim) {
+                                return;
+                            }
+                            if !guard.q1_admits(c, frag, scan, j) {
                                 return;
                             }
                             if let Some(s) = restrict {
@@ -3463,7 +3495,10 @@ pub fn psms_schema(path: &str) -> Result<(&'static str, u32)> {
     let q1 = cols.iter().any(|c| c == "q1_corr");
     let q1f = cols.iter().any(|c| c == "q1f_n_belong");
     let ms1e = cols.iter().any(|c| c == "ms1e_i_0");
-    Ok(artifact::psms_extracted_ms1e(has_im, q1, q1f, ms1e))
+    let q1s = cols
+        .iter()
+        .any(|c| c == "q1p_n_iso" || c == "q1m3_corr_best" || c == "q1d_n_frag");
+    Ok(artifact::psms_extracted_q1s(has_im, q1, q1f, ms1e, q1s))
 }
 
 /// The apex 1/K0 of every row of a `psms_extracted` table that has one, keyed by
@@ -4004,6 +4039,11 @@ impl PsmRows {
             cols.push(Col::F64("q1_frag_sd".into(), col(|q| q.frag_sd)));
             cols.push(Col::F64("q1_bin_frac".into(), col(|q| q.bin_frac)));
         }
+        // The unfragmented-precursor and multi-scale Q1 values of the rows (v8), taken out of
+        // the decision rows below and written last.
+        let mut q1p_rows: Vec<Vec<f64>> = Vec::new();
+        let mut q1m_rows: Vec<Vec<f64>> = Vec::new();
+        let mut q1d_rows: Vec<Vec<f64>> = Vec::new();
         // psms_extracted v6: the per-fragment Q1 decision, appended last, only under
         // `extract.q1_fragments`: the row's summary, then one list per decision with an entry
         // per library fragment.
@@ -4060,6 +4100,15 @@ impl PsmRows {
                 of.push(r.offset);
                 rs.push(r.resid);
                 cr.push(r.corr2d);
+                if cfg.q1_precursor {
+                    q1p_rows.push(r.q1p);
+                }
+                if cfg.q1_multiscale {
+                    q1m_rows.push(r.q1m);
+                }
+                if cfg.q1_dec_features {
+                    q1d_rows.push(r.q1d);
+                }
             }
             cols.push(Col::ListF32("q1f_frag_class".into(), cl));
             cols.push(Col::ListF32("q1f_frag_offset".into(), of));
@@ -4074,6 +4123,33 @@ impl PsmRows {
                 cols.push(Col::F64(
                     (*name).into(),
                     e.iter().map(|x| x.columns()[k]).collect(),
+                ));
+            }
+        }
+        // psms_extracted v8: the unfragmented-precursor evidence and the multi-scale Q1
+        // scores, appended last, each only under its key (`stages::q1score`).
+        if cfg.q1_precursor && cfg.q1_fragments {
+            for (k, name) in crate::stages::q1score::Q1P_COLUMNS.iter().enumerate() {
+                cols.push(Col::F64(
+                    (*name).into(),
+                    q1p_rows.iter().map(|v| v[k]).collect(),
+                ));
+            }
+        }
+        if cfg.q1_multiscale && cfg.q1_fragments {
+            let names = crate::stages::q1score::q1m_columns(cfg.q1_precursor);
+            for (k, name) in names.iter().enumerate() {
+                cols.push(Col::F64(
+                    (*name).into(),
+                    q1m_rows.iter().map(|v| v[k]).collect(),
+                ));
+            }
+        }
+        if cfg.q1_dec_features && cfg.q1_fragments {
+            for (k, name) in crate::stages::q1dec::Q1D_COLUMNS.iter().enumerate() {
+                cols.push(Col::F64(
+                    (*name).into(),
+                    q1d_rows.iter().map(|v| v[k]).collect(),
                 ));
             }
         }
@@ -4409,10 +4485,103 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
              where each candidate's RT window ends"
         );
     }
+    // `extract.q1_deconvolved`: every MS2 peak's Q1 centroid (`stages::q1dec`) and each
+    // candidate's calibrated expected centre; a hit counts only within the learned tolerance.
+    let q1_gate: Option<crate::stages::q1dec::Q1Gate> = if p.cfg.q1_deconvolved
+        || (p.cfg.q1_dec_features && p.cfg.q1_fragments)
+    {
+        if has_im {
+            anyhow::bail!(
+                "extract: extract.q1_deconvolved and features.q1_deconvolved read a scanning \
+                 quadrupole's Q1 steps, and these spectra carry 1/K0 (diaPASEF); unset them"
+            );
+        }
+        let (Some(m), Some(tol_steps)) = (p.cfg.q1_model.as_ref(), p.cfg.q1_dec_tol_steps) else {
+            anyhow::bail!(
+                "extract: extract.q1_deconvolved needs the run's Q1 calibration with its \
+                 deconvolution tolerance (cal.json q1_calibration.deconvolution, from \
+                 rt_im_train.q1_calibrate); `mumdia run` reads it, `mumdia extract` takes it \
+                 as --q1-cal"
+            );
+        };
+        let sweep = crate::spectra::load_q1_sweep(p.ms2)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "extract: extract.q1_deconvolved needs the Q1 sweep spectra_ms2 v3 records \
+                 (q1_cycle, q1_step), and {} has none: convert it again with \
+                 convert.isolation_half_width",
+                p.ms2
+            )
+        })?;
+        let t0 = std::time::Instant::now();
+        let grid = q1frag::Q1Grid::build(scans, &sweep)?;
+        // Peaks of adjacent steps link within the run's learned fragment tolerance (the
+        // mass calibration is resolved below; an error there is reported there).
+        let link_tol = match &mass {
+            Ok((_, t)) => *t,
+            Err(_) => p.cfg.frag_tol_ppm,
+        };
+        let dec = crate::stages::q1dec::Q1Dec::build(scans, &grid, link_tol);
+        let centre: Vec<f32> = (0..ncand)
+            .map(|c| {
+                let cd = lib.cand(c as u32);
+                crate::stages::q1dec::expected_centre(
+                    Some(m),
+                    cd.precursor_mz,
+                    cd.charge,
+                    win.rt_cal[c],
+                ) as f32
+            })
+            .collect();
+        // Each library fragment's expected centre against its candidate's (the isotopes that
+        // keep it monoisotopic), so a hit is compared with where that fragment is expected.
+        let step = dec.step_mz;
+        let frag_first: Vec<u32> = (0..ncand)
+            .map(|c| lib.frag_range(c as u32).start as u32)
+            .collect();
+        let frag_shift: Vec<i8> = (0..ncand)
+            .into_par_iter()
+            .flat_map_iter(|c| {
+                let cd = lib.cand(c as u32);
+                let (pm, z, rt) = (cd.precursor_mz, cd.charge, win.rt_cal[c]);
+                let cc = crate::stages::q1dec::expected_centre(Some(m), pm, z, rt);
+                let (fm, _, fnm) = lib.cand_frags(c as u32);
+                fm.iter()
+                    .zip(fnm)
+                    .map(|(&fmz, &n)| {
+                        let fz = q1frag::frag_charge_of(lib.frag_name_str(n));
+                        let cf =
+                            crate::stages::q1dec::fragment_centre(m, pm, z, fmz as f64, fz, rt);
+                        crate::stages::q1dec::encode_shift(cf - cc, step)
+                    })
+                    .collect::<Vec<i8>>()
+            })
+            .collect();
+        let tol_mz = tol_steps * dec.step_mz;
+        info!(
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            bytes = dec.bytes(),
+            moved_share = dec.moved_share(),
+            tol_steps,
+            tol_mz,
+            "extract: Q1-deconvolved evidence (per-peak Q1 centroids)"
+        );
+        Some(crate::stages::q1dec::Q1Gate {
+            dec,
+            centre,
+            frag_first,
+            frag_shift,
+            tol_mz,
+        })
+    } else {
+        None
+    };
     let guard = Guard {
         win: &win,
         im_gate,
         pad: trace_pad_s,
+        // Only `extract.q1_deconvolved` gates the hits; `features.q1_deconvolved` reads the
+        // centroids at each row's apex instead.
+        q1: q1_gate.as_ref().filter(|_| p.cfg.q1_deconvolved),
     };
     // The per-point 1/K0 of the traces is written only on 4D data with a consumer on.
     let chrom_im = has_im && p.chrom_im;
@@ -4509,6 +4678,14 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
              1/K0, and these carry it (diaPASEF); unset it for them"
         );
     }
+    // The unfragmented-precursor and multi-scale Q1 scores (`features.q1_precursor`,
+    // `features.q1_multiscale`) are read on the per-fragment decision's patches.
+    if (p.cfg.q1_precursor || p.cfg.q1_multiscale) && !p.cfg.q1_fragments {
+        anyhow::bail!(
+            "extract: features.q1_precursor and features.q1_multiscale are read on the RT x \
+             step patches of extract.q1_fragments; set it as well"
+        );
+    }
     // The per-fragment Q1 decision (`extract.q1_fragments`): the sweep spectra_ms2 v3
     // recorded as a cycle x step grid of this stage's scans, and the run's calibrated model.
     let q1f_grid: Option<q1frag::Q1Grid> = if p.cfg.q1_fragments {
@@ -4543,6 +4720,8 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
             centre_tol_steps = m.tolerances.centre_steps,
             corr2d_min = m.tolerances.corr2d_min,
             q1_repick = p.cfg.q1_repick,
+            q1_precursor = p.cfg.q1_precursor,
+            q1_multiscale = p.cfg.q1_multiscale,
             "extract: per-fragment Q1 decisions"
         );
         Some(g)
@@ -4650,6 +4829,9 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                     {
                         let mut push = |cid: u32, frag: u16, pi: f32| {
                             let c = cid as usize;
+                            if !guard.q1_admits(c, frag, scan, j) {
+                                return;
+                            }
                             let inside = guard.admits(c, rt, pim);
                             if !inside && !guard.pads(c, rt, pim) {
                                 return;
@@ -5563,6 +5745,19 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                 &|mz| mass_off.factor_at(mz),
             )
         });
+        // `features.q1_precursor`: the unfragmented precursor's isotopes as the decision reads
+        // them (`stages::q1score`).
+        let q1p_cand: Option<q1frag::CandQ1> =
+            q1f_ctx.as_ref().filter(|_| p.cfg.q1_precursor).map(|x| {
+                q1frag::CandQ1::precursor(
+                    x.model,
+                    c.precursor_mz,
+                    c.charge,
+                    apex_rt,
+                    crate::stages::q1score::PREC_ISOTOPES,
+                    &|mz| mass_off.factor_at(mz),
+                )
+            });
         type Q1fAt = (q1frag::Patch, q1frag::Decision, usize);
         let q1f_at = |rt: f64| -> Option<Q1fAt> {
             let (x, cand) = (q1f_ctx.as_ref()?, q1f_cand.as_ref()?);
@@ -5573,9 +5768,59 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
         let q1f_row = |r: Option<&Q1fAt>| -> Option<q1frag::Q1fRow> {
             let x = q1f_ctx.as_ref()?;
             let cand = q1f_cand.as_ref()?;
+            use crate::stages::q1score;
             Some(match r {
-                Some((pt, d, si)) => q1frag::Q1fRow::of(d, cand, pt, x.grid.scan_cycle[*si]),
-                None => q1frag::Q1fRow::empty(cand.frags.len(), cand),
+                Some((pt, d, si)) => {
+                    let mut row = q1frag::Q1fRow::of(d, cand, pt, x.grid.scan_cycle[*si]);
+                    // The precursor's isotopes on the patch's own cells, then the scores.
+                    let env = q1p_cand.as_ref().map(|pc| {
+                        let pp = q1frag::read_patch(
+                            x.grid,
+                            x.scans,
+                            pc,
+                            pt.cycles.clone(),
+                            pt.s0,
+                            pt.ns(),
+                            x.tol_ppm,
+                        );
+                        let (v, env) = q1score::precursor_scores(pt, d, &pp, pc, x.model);
+                        row.q1p = v;
+                        env
+                    });
+                    if p.cfg.q1_multiscale {
+                        row.q1m = q1score::multiscale(pt, cand, d, x.model, env.as_deref());
+                    }
+                    // `features.q1_deconvolved`: the deconvolved evidence at the apex scan.
+                    if let (true, Some(g)) = (p.cfg.q1_dec_features, q1_gate.as_ref()) {
+                        let targets: Vec<f64> = cand.frags.iter().map(|f| f.target_mz).collect();
+                        let preds: Vec<f64> = cand.frags.iter().map(|f| f.pred).collect();
+                        row.q1d = crate::stages::q1dec::row_evidence(
+                            g,
+                            x.grid,
+                            x.scans,
+                            cid as usize,
+                            *si,
+                            c.precursor_mz,
+                            &targets,
+                            &preds,
+                            x.tol_ppm,
+                        );
+                    }
+                    row
+                }
+                None => {
+                    let mut row = q1frag::Q1fRow::empty(cand.frags.len(), cand);
+                    if p.cfg.q1_precursor {
+                        row.q1p = q1score::empty_precursor();
+                    }
+                    if p.cfg.q1_multiscale {
+                        row.q1m = q1score::empty_multiscale(p.cfg.q1_precursor);
+                    }
+                    if p.cfg.q1_dec_features {
+                        row.q1d = crate::stages::q1dec::empty_evidence();
+                    }
+                    row
+                }
             })
         };
         let q1f_0 = q1f_at(apex_rt);
@@ -6558,11 +6803,13 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
     for (path, schema, file) in [
         (
             p.out_psms,
-            artifact::psms_extracted_ms1e(
+            artifact::psms_extracted_q1s(
                 has_im,
                 p.cfg.q1_profile,
                 p.cfg.q1_fragments,
                 p.cfg.ms1_envelope,
+                p.cfg.q1_fragments
+                    && (p.cfg.q1_precursor || p.cfg.q1_multiscale || p.cfg.q1_dec_features),
             ),
             psms_written,
         ),
@@ -6626,6 +6873,36 @@ pub fn run_hashed(p: ExtractParams) -> Result<(Written, Written)> {
                         "margin_steps": q1frag::MARGIN_STEPS,
                         "q1_repick": p.cfg.q1_repick,
                         "repick_peaks": p.cfg.q1_repick_peaks,
+                    }),
+                );
+                // The unfragmented-precursor and multi-scale scores, only when one is on.
+                if p.cfg.q1_precursor || p.cfg.q1_multiscale || p.cfg.q1_dec_features {
+                    obj.insert(
+                        "q1_scores".into(),
+                        json!({
+                            "precursor": p.cfg.q1_precursor,
+                            "precursor_isotopes": crate::stages::q1score::PREC_ISOTOPES,
+                            "multiscale": p.cfg.q1_multiscale,
+                            "scales_steps": crate::stages::q1score::SCALES,
+                            "deconvolved_evidence": p.cfg.q1_dec_features,
+                        }),
+                    );
+                }
+            }
+        }
+        // The Q1-deconvolved evidence (`extract.q1_deconvolved`, `features.q1_deconvolved`),
+        // only then.
+        if let Some(g) = &q1_gate {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert(
+                    "q1_deconvolved".into(),
+                    json!({
+                        "gate": p.cfg.q1_deconvolved,
+                        "features": p.cfg.q1_dec_features,
+                        "tol_mz": g.tol_mz,
+                        "step_mz": g.dec.step_mz,
+                        "valley": crate::stages::q1dec::VALLEY,
+                        "evidence_cycles": 2 * crate::stages::q1dec::EVIDENCE_CYCLES + 1,
                     }),
                 );
             }
@@ -7305,6 +7582,7 @@ mod accumulate_tests {
                 win: &win,
                 im_gate,
                 pad: 0.0,
+                q1: None,
             };
             pool.install(|| {
                 // `bound = 0` flushes nothing, so the comparison is over the accumulator.
@@ -7418,6 +7696,7 @@ mod accumulate_tests {
             win: &win,
             im_gate: false,
             pad: 0.0,
+            q1: None,
         };
         let mass_off = MassOffset {
             scalar_ppm: 0.0,
