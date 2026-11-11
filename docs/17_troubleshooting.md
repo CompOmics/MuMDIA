@@ -261,8 +261,11 @@ Fix: give the half-width of the method's Q1 window,
 ```
 
 and search with a library restricted to the precursor range the method scanned. Each bin
-is then a window of its own; docs/04_convert.md, "SCIEX ZT Scan DIA", has the measured
-recipe. A ZT Scan `.wiff2` converted by ProteoWizard msconvert 3.0.25036 carries no
+is then a window of its own; docs/04_convert.md, "SCIEX ZT Scan DIA", has the measurements,
+and docs/37_ztscan.md the guide and the recipe (`configs/examples/ztscan.json`). To know
+before a run, `mumdia peak-census --mzml <run> --max-spectra 10000` prints an `isolation`
+block (`convert_refuses`, `scanning_quadrupole`, a `suggested_half_width`); the desktop
+application asks it of every selected mzML and fills the half-width in. A ZT Scan `.wiff2` converted by ProteoWizard msconvert 3.0.25036 carries no
 isolation information at all: convert reads it as one all-ion window, and extract's
 footprint guard refuses it before probing (docs/09_extract.md, "The footprint guard").
 Convert such a run with the SCIEX MS Data Converter instead.

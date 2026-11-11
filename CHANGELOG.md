@@ -304,6 +304,51 @@ than a number. Both are recorded in every run's `manifest.json`.
 - **`mumdia quant --cross-run-pattern-from`.** Refits the pattern dispersion on the given tables
   (the background-subtracted exports), which is what `run-experiment` does, so a quantification
   repeated with `mumdia quant` on an experiment's scored tables reproduces the experiment's.
+- **The quantification window in Q1 cycles, opt-in (`quant.q1_cycle_halfwidth`).** On spectra
+  that record a scanning quadrupole's sweep (spectra_ms2 v3), the fixed window's half-width is
+  the key's cycles times each candidate's samples per cycle (the median count of its trace's
+  samples in one cycle, located in the sweep by retention time), or the key itself on the cycle
+  traces of `quant.q1_fragments`; every rule that reads the window reads it. On any other run
+  `fixed_scan_halfwidth` applies, and the quant report records which (`q1_cycle_window`). On
+  three ZenoTOF 8600 K562 replicates (the same identifications in every arm) the median replicate
+  CV of the normalised precursor quantity is 0.273 at the default window and 0.116 / 0.107 /
+  0.102 / 0.101 / 0.094 at 2 / 3 / 4 / 5 / 6 cycles; 4 cycles reproduce a 20-sample window to
+  the last digit. Off by default, omitted from the canonical configuration, refused without the
+  scan form of the fixed window and with `fixed_scan_halfwidth_scale`; `run` and
+  `run-experiment` pass the spectra, `mumdia quant` takes `--spectra-ms2`. Whether the wider
+  span adds interference bias needs known-ratio ZT Scan data (docs/37_ztscan.md, section 6).
+- **`retrace.q1_repick_peaks`, a bound on the peaks the ZT Scan re-pick compares, opt-in.**
+  `retrace.q1_repick` decides every count-profile peak it compares in full, which is most of
+  the extraction time it adds. The key (default 5, the setting it was measured with) bounds
+  them, strongest first; 0 only moves the apex to its own peak's 2D apex. Measured on the
+  ZenoTOF 8600 K562 run with four NN seeds per arm: at 2, extract takes 28% less time for 0.16%
+  fewer human precursors at a matched entrapment FDP and 0.50% fewer on the human library; at
+  0, 37% less for 1.2% and 1.1% fewer. Omitted from the canonical configuration at its default
+  (docs/37_ztscan.md, section 8).
+- **`mumdia peak-census` says how convert reads each MS2 isolation window.** For an mzML the
+  census now carries an `isolation` block: spectra with offsets, without isolation and with a
+  target and no offsets; whether `convert` refuses the file without
+  `convert.isolation_half_width`, the targets' layout (count, range, step, cycle time) and, for
+  a scanning quadrupole such as SCIEX ZT Scan DIA, a half-width to start from (five steps: 1.9
+  m/z for the 0.7614 m/z steps of the measured method), by the rule `convert` refuses with
+  (docs/37_ztscan.md, section 2).
+- **The desktop application recognises SCIEX ZT Scan DIA files.** Every selected mzML is checked
+  with the engine's isolation census when it is added. A file `convert` would refuse for want of
+  a Q1 half-width gets a card on the Search screen that says what the file is and why, fills in
+  the suggested half-width (a typed value is kept) and offers the ZT Scan recipe on top of the
+  chosen preset when every selected file is a ZT Scan run; a search with such a file and no
+  half-width is not started, and the recipe is refused with bands.
+- **A ZT Scan recipe and guide (`configs/examples/ztscan.json`, docs/37_ztscan.md).** The
+  imported-library recipe plus the keys that measured positive on the K562 runs:
+  `convert.isolation_half_width` 1.9, `rt_im_train.q1_calibrate`, `extract.q1_fragments`,
+  `features.q1_fragment_features`, `retrace.q1_repick`, `rescore.shadow_q1` and
+  `quant.q1_cycle_halfwidth` 4. Measured on REP01 with four NN seeds: +3.0% precursors and
+  +3.2% human precursors at a matched entrapment FDP, whose value at a reported 1% falls from
+  1.39% to 1.22%; replicate CV 0.102 against 0.273. The guide routes every layer to its
+  mechanism, records what each measured, the gate on the fragments that belong that was
+  measured and not added (it removes 11-26% of the accepted precursors, mostly real ones),
+  where time and memory go, the refusals and what is open: a second acquisition, which needs a
+  vendor-licence decision, and known-ratio data. No default changes.
 
 ### Fixed
 

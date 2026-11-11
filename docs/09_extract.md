@@ -1250,7 +1250,9 @@ summary under `features.q1_fragment_features` (docs/10_features.md).
 analogue of `retrace.repick` (section 9). ZT Scan has no raw events beyond the centroids
 extract reads, so it runs inside extract and needs neither `retrace.enabled` nor a `.d`. Its
 candidates are extract's apex and the next peaks of the count profile whose envelope does not
-hold it (`enumerate_peaks`, up to five, as `retain_top_peaks` enumerates them). Each is
+hold it (`enumerate_peaks`, up to `retrace.q1_repick_peaks`, default five, as
+`retain_top_peaks` enumerates them; 0 compares none and only refines the apex to its own
+peak's 2D apex, docs/37_ztscan.md, section 8, has what that saves and costs). Each is
 decided as above and scored like `retrace.repick`'s joint score: the cosine of the
 square-rooted intensities of the fragments that belong (summed over the five profile cycles,
 every other fragment 0) against the square-rooted predictions, times `ln(1 + I)`, `I` their
@@ -1309,7 +1311,9 @@ interpolated along the `precursor_q` thresholds.
 - **Cost** (shared hosts; walls indicative): extract 341 s on the human-library host
   against 267-305 s for two base runs with the decision, 463-470 s with the re-pick, which
   decides up to six times per candidate; on the entrapment host 548-551 s against 528-538 s,
-  and 758-766 s. `q1_calibrate` with the learning pass took 66 s (the learning itself 4 s);
+  and 758-766 s (where that time goes, and what bounding the alternatives saves:
+  docs/37_ztscan.md, section 8). `q1_calibrate` with the learning pass took 66 s (the
+  learning itself 4 s);
   the peak memory stays at 35-41 GB (base 37 GB). In the three-run experiment, whose three
   extracts ran at the same time on a loaded host, extract took 1,372-1,447 s per run against
   390-545 s, and the whole run 3,941 s against 2,401 s.

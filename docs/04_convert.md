@@ -756,8 +756,11 @@ Nothing was written.
 
 The refusal names the layout: many distinct targets (at least 50), repeating cycle after
 cycle (at least twice in the sample), in steps under 1.5 m/z, far finer than any
-fixed-window method (the narrowest step 2 m/z), is called a scanning quadrupole. The fix
-is the method's Q1 half-width:
+fixed-window method (the narrowest step 2 m/z), is called a scanning quadrupole.
+`mumdia peak-census` applies the same rule to the spectra it counts and reports it in its
+`isolation` block before a run, with a half-width to start from (five steps; the file does
+not record the window), and the desktop application shows it for every selected mzML
+(docs/37_ztscan.md, section 2). The fix is the method's Q1 half-width:
 
 ```json
 {"convert": {"isolation_half_width": 1.9}}
