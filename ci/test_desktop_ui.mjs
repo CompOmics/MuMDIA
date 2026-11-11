@@ -91,7 +91,12 @@ function load() {
   const els = new Map();
   const timers = new Set();
   const calls = [];
-  const answers = { components_status: () => status() };
+  // A working, acknowledged DIA-NN: the Search screen asks for it whenever the library
+  // settings change (the ZT Scan recipe sets them).
+  const answers = {
+    components_status: () => status(),
+    diann_status: () => ({ status: { runs: true, licence_acknowledged: true } }),
+  };
   const document = {
     getElementById(id) {
       if (!els.has(id)) els.set(id, element(id));
@@ -459,7 +464,16 @@ test("a ZT Scan mzML is explained, its half-width filled and the recipe offered"
   assert.match(f.el("ztscan-body").textContent, /663 positions from 394\.3 to 898\.3 m\/z/);
   assert.equal(f.el("ztscan-hw").value, "1.9");
   assert.equal(f.el("ztscan-recipe").disabled, false);
-  // The half-width alone without the recipe; with it, the recipe and the confirmed width.
+  // The recipe is ticked for ZT Scan files until the user changes it: the recipe and the
+  // confirmed width.
+  assert.equal(f.el("ztscan-recipe").checked, true);
+  assert.deepEqual({ ...f.api.ztscanOverrides() }, { ...RECIPE, "convert.isolation_half_width": 1.9 });
+  // What the checkbox listener records when the user clears it: the half-width alone, and a
+  // re-render keeps their choice.
+  f.el("ztscan-recipe").checked = false;
+  state.ztscan.recipeTouched = true;
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-recipe").checked, false);
   assert.deepEqual({ ...f.api.ztscanOverrides() }, { "convert.isolation_half_width": 1.9 });
   f.el("ztscan-recipe").checked = true;
   // What the input listener records when the user types.
@@ -503,6 +517,76 @@ test("the ZT Scan recipe is held back for a mixed selection, and other files nee
   assert.equal(f.el("ztscan-note").hidden, true);
   assert.deepEqual({ ...f.api.ztscanOverrides() }, {});
   assert.ok(![...f.api.searchProblems()].some((s) => /Q1 half-width/.test(s)));
+});
+
+test("the ZT Scan recipe sets the library's search space and takes back what it set", async () => {
+  const f = load();
+  const { state } = f.api;
+  f.answers.scanning_probe = ({ mzml }) =>
+    mzml.map((p) =>
+      p.includes("orbi")
+        ? ztProbe(p, { convert_refuses: false, scanning_quadrupole: false, target_only: 0 })
+        : ztProbe(p)
+    );
+  f.answers.ztscan_recipe = () => RECIPE;
+  // The Search space card as the page starts it, with the default modifications.
+  const start = { "d-minlen": "7", "d-maxlen": "30", "d-minz": "2", "d-maxz": "3", "d-maxvar": "1", "d-prmin": "", "d-prmax": "" };
+  const fields = () => Object.fromEntries(Object.keys(start).map((id) => [id, f.el(id).value]));
+  for (const [id, v] of Object.entries(start)) f.el(id).value = v;
+  state.mods = new Map([["Carbamidomethyl|C", "fix"], ["Oxidation|M", "var"]]);
+  const acetyl = "Acetyl|*|protein_n_term";
+  // A selection without ZT Scan files changes nothing.
+  state.picks.mzml = ["/d/orbi.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.deepEqual(fields(), start);
+  assert.equal(state.ztscan.lib, null);
+  // A ZT Scan file: the recipe is ticked, and with it the measured search space, the
+  // precursors inside the swept range (394.256 - 1.9 to 898.271 + 1.9, rounded outward).
+  state.picks.mzml = ["/d/REP01.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-recipe").checked, true);
+  assert.deepEqual(fields(), {
+    "d-minlen": "6", "d-maxlen": "40", "d-minz": "1", "d-maxz": "4", "d-maxvar": "2", "d-prmin": "392", "d-prmax": "901",
+  });
+  assert.equal(state.mods.get(acetyl), "var");
+  assert.equal(state.mods.get("Oxidation|M"), "var");
+  assert.equal(state.mods.get("Carbamidomethyl|C"), "fix");
+  assert.match(f.el("ztscan-library-note").textContent, /charges 1 to 4, lengths 6 to 40/);
+  assert.match(f.el("ztscan-library-note").textContent, /from 392 to 901 m\/z/);
+  // The range follows the half-width while the recipe set it.
+  f.el("ztscan-hw").value = "3.0";
+  state.ztscan.hwTyped = true;
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("d-prmin").value, "391");
+  assert.equal(f.el("d-prmax").value, "902");
+  // A value the user edits is theirs: it is neither replaced nor taken back.
+  f.el("d-maxlen").value = "35";
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("d-maxlen").value, "35");
+  // Clearing the recipe takes back the rest, and the modification it added.
+  f.el("ztscan-recipe").checked = false;
+  state.ztscan.recipeTouched = true;
+  await f.api.refreshZtscanNote();
+  assert.deepEqual(fields(), { ...start, "d-maxlen": "35" });
+  assert.equal(state.mods.has(acetyl), false);
+  assert.equal(state.mods.get("Oxidation|M"), "var");
+  assert.equal(f.el("ztscan-library-note").textContent, "");
+  // Ticking it again applies it again; removing the ZT Scan file takes it back.
+  f.el("ztscan-recipe").checked = true;
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("d-minz").value, "1");
+  assert.equal(state.mods.get(acetyl), "var");
+  state.picks.mzml = ["/d/orbi.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("d-minz").value, "2");
+  assert.equal(state.mods.has(acetyl), false);
+  // A modification the user had chosen before is left alone when the recipe goes.
+  state.mods.set(acetyl, "var");
+  state.picks.mzml = ["/d/REP01.mzML"];
+  await f.api.refreshZtscanNote();
+  state.picks.mzml = ["/d/orbi.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(state.mods.get(acetyl), "var");
 });
 
 let failed = 0;

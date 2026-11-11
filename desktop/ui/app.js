@@ -121,8 +121,10 @@ const state = {
   knownDropped: readStored("mumdia.folders.dropped", 0),
   // SCIEX ZT Scan DIA files (`refreshZtscanNote`): the engine's isolation census of each
   // selected mzML by path (null when it could not be read), whether the user typed the
-  // half-width, and the recipe's overrides once read.
-  ztscan: { probes: {}, hwTyped: false, recipe: null },
+  // half-width, the recipe's overrides once read, whether the user changed the recipe
+  // checkbox (until then it is ticked whenever the recipe is allowed), and what the recipe's
+  // library settings changed in the Search space card (`syncZtscanLibrary`).
+  ztscan: { probes: {}, hwTyped: false, recipe: null, recipeTouched: false, lib: null },
 };
 
 function readStored(key, fallback) {
@@ -280,9 +282,16 @@ async function init() {
     });
   }
   $("norm-scope").addEventListener("change", refreshNormOptions);
-  // A half-width the user typed is theirs: a later probe no longer replaces it.
+  // A half-width the user typed is theirs: a later probe no longer replaces it. The precursor
+  // range the recipe sets follows it.
   $("ztscan-hw").addEventListener("input", () => {
     state.ztscan.hwTyped = true;
+    syncZtscanLibrary();
+  });
+  // Once the user ticks or clears the recipe, the choice is theirs.
+  $("ztscan-recipe").addEventListener("change", () => {
+    state.ztscan.recipeTouched = true;
+    renderZtscanNote();
   });
   $("suggest-conditions").addEventListener("click", () => {
     state.conditionTyped = {};
@@ -1655,7 +1664,10 @@ function ztscanRecipeOn() {
 function renderZtscanNote() {
   const refused = ztscanFiles();
   show($("ztscan-note"), refused.length > 0);
-  if (!refused.length) return;
+  if (!refused.length) {
+    syncZtscanLibrary();
+    return;
+  }
   const scanning = ztscanScanning();
   const other = refused.filter((f) => !scanning.includes(f));
   const n = state.picks.mzml.length;
@@ -1697,9 +1709,12 @@ function renderZtscanNote() {
     const hw = first?.suggested_half_width;
     $("ztscan-hw").value = Number.isFinite(hw) ? String(hw) : "";
   }
+  // The recipe is the best measured configuration for these files, so it is ticked whenever
+  // it is allowed, until the user ticks or clears it themselves.
   const allowed = ztscanRecipeAllowed();
   $("ztscan-recipe").disabled = !allowed;
   if (!allowed) $("ztscan-recipe").checked = false;
+  else if (!state.ztscan.recipeTouched) $("ztscan-recipe").checked = true;
   $("ztscan-recipe-note").textContent = allowed
     ? "Measured on one ZT Scan acquisition: about 3% more precursors at a lower measured " +
       "false discovery proportion, and about a third of the replicate CV of the default " +
@@ -1707,6 +1722,106 @@ function renderZtscanNote() {
       "second acquisition."
     : "The recipe's settings need every selected file to be a ZT Scan run; select only " +
       "those to use it.";
+  syncZtscanLibrary();
+}
+
+// The search space a library built from a FASTA takes under the ZT Scan recipe: the library
+// settings measured on the K562 ZT Scan runs (docs/37_ztscan.md, "The library for a ZT Scan
+// search"): charges 1 to 4, lengths 6 to 40, methionine oxidation and protein N-terminal
+// acetylation as variable modifications, at most two a peptide, and precursors inside the
+// swept Q1 range (`ztscanPrecursorRange`).
+const ZTSCAN_LIBRARY = {
+  fields: { "d-minlen": "6", "d-maxlen": "40", "d-minz": "1", "d-maxz": "4", "d-maxvar": "2" },
+  variable: [modKey("Oxidation", "M"), modKey("Acetyl", "*", "protein_n_term")],
+};
+
+// The precursor m/z the selected ZT Scan files sweep: the lowest target minus the half-width
+// to the highest plus it, rounded outward to whole m/z; null while either is unknown. A
+// precursor outside it is never isolated, so leaving it out of the library loses nothing.
+function ztscanPrecursorRange() {
+  const hw = parseFloat($("ztscan-hw").value);
+  if (!(hw > 0)) return null;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const f of ztscanScanning()) {
+    const l = state.ztscan.probes[f]?.layout || {};
+    if (Number.isFinite(l.lowest_target)) lo = Math.min(lo, l.lowest_target);
+    if (Number.isFinite(l.highest_target)) hi = Math.max(hi, l.highest_target);
+  }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return null;
+  return { min: Math.floor(lo - hw), max: Math.ceil(hi + hw) };
+}
+
+// The values the recipe sets in the Search space card, by element id.
+function ztscanLibraryFields() {
+  const out = { ...ZTSCAN_LIBRARY.fields };
+  const r = ztscanPrecursorRange();
+  if (r) {
+    out["d-prmin"] = String(r.min);
+    out["d-prmax"] = String(r.max);
+  }
+  return out;
+}
+
+// While the recipe is on, the Search space card holds the ZT Scan library settings, so a
+// library built from a FASTA (by DIA-NN or the built-in predictors), the size estimate and
+// the cache key all follow them; when it goes off they are taken back. Only what the recipe
+// set and the user has not changed since is taken back: a value edited after is the user's,
+// and stays. The two modifications are added to the user's choice (the default one,
+// carbamidomethyl fixed and oxidation variable, becomes the measured one) and are not saved
+// as the user's preference.
+function syncZtscanLibrary() {
+  const z = state.ztscan;
+  let changed = false;
+  if (ztscanRecipeOn()) {
+    if (!z.lib) z.lib = { before: {}, set: {}, mods: [] };
+    for (const [id, v] of Object.entries(ztscanLibraryFields())) {
+      const el = $(id);
+      if (!(id in z.lib.set)) z.lib.before[id] = el.value;
+      else if (el.value !== z.lib.set[id]) continue;
+      if (el.value !== v) {
+        el.value = v;
+        changed = true;
+      }
+      z.lib.set[id] = v;
+    }
+    for (const key of ZTSCAN_LIBRARY.variable) {
+      if (!state.mods.has(key) && !z.lib.mods.includes(key)) {
+        state.mods.set(key, "var");
+        z.lib.mods.push(key);
+        changed = true;
+      }
+    }
+  } else if (z.lib) {
+    for (const [id, v] of Object.entries(z.lib.set)) {
+      const el = $(id);
+      if (el.value === v) {
+        el.value = z.lib.before[id] ?? "";
+        changed = true;
+      }
+    }
+    for (const key of z.lib.mods) {
+      if (state.mods.get(key) === "var") {
+        state.mods.delete(key);
+        changed = true;
+      }
+    }
+    z.lib = null;
+  }
+  const r = z.lib ? ztscanPrecursorRange() : null;
+  $("ztscan-library-note").textContent = z.lib
+    ? "A library built from a FASTA for this search covers the ZT Scan search space, set " +
+      "under Search space: charges 1 to 4, lengths 6 to 40, methionine oxidation and protein " +
+      "N-terminal acetylation as variable modifications, at most two a peptide" +
+      (r ? `, and precursors from ${r.min} to ${r.max} m/z, the range the files sweep.` : ".")
+    : "";
+  if (!changed) return;
+  if (state.catalogue) {
+    renderMods();
+    summariseMods();
+  }
+  if (state.libSrc === "diann") refreshLibSrcNote();
+  scheduleSpace();
 }
 
 // What the ZT Scan card adds to the run's configuration: the half-width for the files that
