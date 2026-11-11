@@ -589,6 +589,34 @@ test("the ZT Scan recipe sets the library's search space and takes back what it 
   assert.equal(state.mods.get(acetyl), "var");
 });
 
+test("a deamidation choice for a ZT Scan run is warned about on the card", async () => {
+  const f = load();
+  const { state } = f.api;
+  f.answers.scanning_probe = ({ mzml }) =>
+    mzml.map((p) =>
+      p.includes("orbi")
+        ? ztProbe(p, { convert_refuses: false, scanning_quadrupole: false, target_only: 0 })
+        : ztProbe(p)
+    );
+  f.answers.ztscan_recipe = () => RECIPE;
+  state.mods = new Map([["Carbamidomethyl|C", "fix"], ["Oxidation|M", "var"]]);
+  state.picks.mzml = ["/d/REP01.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-mods-note").textContent, "");
+  state.mods.set("Deamidated|N", "var");
+  await f.api.refreshZtscanNote();
+  assert.match(f.el("ztscan-mods-note").textContent, /13C isotope/);
+  // Deamidation of R is not the N/Q alias; another instrument's file needs no warning.
+  state.mods.delete("Deamidated|N");
+  state.mods.set("Deamidated|R", "var");
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-mods-note").textContent, "");
+  state.mods.set("Deamidated|Q", "var");
+  state.picks.mzml = ["/d/orbi.mzML"];
+  await f.api.refreshZtscanNote();
+  assert.equal(f.el("ztscan-mods-note").textContent, "");
+});
+
 let failed = 0;
 for (const [name, fn] of tests) {
   try {
